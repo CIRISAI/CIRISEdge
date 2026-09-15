@@ -169,6 +169,7 @@ fn build_bridge(
         .with_self_provider(self_provider)
         .with_convergence(Some(convergence))
         .with_local_key_id(config.local_key_id.clone())
+        .with_engine(config.engine.clone())
         .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
         // legs live (leg A ∧ leg B against this node's own trust base), the
@@ -513,6 +514,20 @@ pub struct ReplicationRuntimeConfig {
     /// Falls back to `local_key_id` when unset — correct for every deployment
     /// where the two identities coincide.
     pub serve_tier_subject_key_id: Option<String>,
+    /// CIRISPersist#848 / CIRISEdge#601 — the Engine that owns the
+    /// key-grant door. A `key_grant:*` attestation row arriving on the
+    /// Attestation cursor is routed to `Engine::apply_replicated_key_grant`,
+    /// which admits the carrier AND projects the wraps addressed to this
+    /// node's occurrences. The general attestation door admits the carrier
+    /// and projects nothing — every member then stays `NotGranted` with the
+    /// row present, which is exactly the symptom #601 reported.
+    ///
+    /// `None` keeps the pre-v24.1.0 behaviour and LOGS AN ERROR per
+    /// key-grant row naming this field; a node that seals or reads encrypted
+    /// group content must install one (an `Engine::from_shared_with_local`
+    /// view over the same substrate — see
+    /// `PersistGroupContentStore::from_shared_hybrid`, which builds it).
+    pub engine: Option<super::bridge::BridgeEngine>,
     /// Workstream F — does this node ENFORCE the `accord:*` relay predicate?
     /// `true` installs the
     /// [`AccordRelayGate`](crate::replication::accord_relay_gate::AccordRelayGate)

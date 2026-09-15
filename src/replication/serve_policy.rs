@@ -66,6 +66,11 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // content-hash Summary/Diff/Fetch flow (`persist_index_kind` → None). The
         // bundle is a public `FederationOnly`-tier record — no capability gate.
         EnvelopeKind::AccordQuorumEvidence => ("cursor:evidence_at", "public"),
+        // CIRISPersist#848 — a key_grant SET is an attestation row: it is
+        // advertised and served through the Attestation plane (per-record,
+        // `SelfOwn` on persist's side), never as a plane of its own. Stated
+        // here so the manifest names where the wraps travel.
+        EnvelopeKind::KeyGrant => ("rides:attestation", "public"),
     };
     // CIRISEdge#462 — `receive`: whether this kind answers a subject-scoped Pull
     // (the RECEIVE axis), and under what rule. The FIVE replicated kinds are
@@ -113,7 +118,11 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         | EnvelopeKind::CommunityMembershipRevocation
         | EnvelopeKind::Organization
         | EnvelopeKind::OrgMembership
-        | EnvelopeKind::PartnerRecord => "none",
+        | EnvelopeKind::PartnerRecord
+        // #848 — a key_grant set rides the Attestation cursor and is routed by
+        // its `key_grant:` prefix to `apply_replicated_key_grant`; it never
+        // answers a subject-scoped Pull of its own.
+        | EnvelopeKind::KeyGrant => "none",
         // CIRISEdge#474 — NOT a subject-scoped Pull. It is received over the
         // dedicated cursor path and its RECEIVE gate re-tallies against the
         // receiver's own roster rather than trusting the sender's verdict; the
@@ -121,6 +130,9 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         EnvelopeKind::AccordQuorumEvidence => {
             "cursor_pull:evidence_at; re-tally admit (apply_replicated_accord_evidence)"
         }
+        // CIRISPersist#848 — not subject-pullable; received on the Attestation
+        // cursor and ROUTED by `attestation_type` prefix to the key-grant door,
+        // which projects only the wraps this node holds a private half for.
     };
     serde_json::json!({
         "kind": kind.as_wire_str(),
@@ -207,7 +219,7 @@ pub fn serve_advertise_policy_sha256() -> String {
 // carve). **CIRISServer must mirror this pin** (supersedes e8216fec…,
 // e54c5677… and 75ceef58…, none of which shipped server-side).
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "c0a13e031815163ac6972538a0597aff3d3396373f2e1f7d4fdbe3aa28e7d4b3";
+    "8249e30b5a0b48a8c309252c99eafdef86f3de04faf238d297143c443599c4ab";
 
 #[cfg(test)]
 mod tests {

@@ -343,6 +343,8 @@ pub use protocol::{
 #[doc(inline)]
 pub use refusal_backoff::{RefusalBackoff, RetryDisposition};
 
+#[doc(inline)]
+pub use bridge::BridgeEngine;
 pub use registry::{RegistryError, ReplicationRegistry, RouteOutcome};
 #[doc(inline)]
 pub use runtime::{
@@ -352,7 +354,6 @@ pub use runtime::{
 pub use scheduler::{ReplicationScheduler, RoundEvent, SchedulerConfig};
 #[doc(inline)]
 pub use session::{ReplicationOutcome, Session, SessionRole};
-#[doc(inline)]
 pub use summary::{ApplyOutcome, LocalState, StalenessSignal, StateApplier, StateProvider};
 #[doc(inline)]
 pub use wire_frame::{

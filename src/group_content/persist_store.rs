@@ -56,13 +56,25 @@ impl PersistGroupContentStore {
         Self { engine, directory }
     }
 
-    /// Build over a backend + signer the caller already opened (sovereign).
-    /// Shares the connection pool; runs no migrations.
-    #[must_use]
+    /// Build over a backend + a CLASSICAL-ONLY signer the caller already
+    /// opened. Shares the connection pool; runs no migrations.
+    ///
+    /// # This store cannot write ENCRYPTED content on persist ≥ v44.3.0
+    ///
+    /// CIRISPersist#848: every write at an encrypted tier now emits the
+    /// `key_grant` set as a federated attestation, and the federation tier is
+    /// verified under `HybridPolicy::Strict` — so an engine with no PQC half
+    /// gets `AttestationEmissionFailed` on the first community / self /
+    /// family seal (the bytes are stored; the key cannot follow them). Commons
+    /// writes are unaffected. Use [`Self::from_shared_hybrid`] for anything
+    /// that seals; this constructor stays for commons-only stores and for
+    /// hardware-rooted hosts that supply the PQC half another way.
+    ///
     /// `directory` is the same substrate `backend` wraps — passed rather
     /// than destructured out of `BackendDispatch`, whose arms are cargo-
     /// feature-gated on persist's side and so cannot be matched
     /// exhaustively from here without edge mirroring those features.
+    #[must_use]
     pub fn from_shared(
         backend: ciris_persist::BackendDispatch,
         directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
@@ -72,6 +84,59 @@ impl PersistGroupContentStore {
             ciris_persist::Engine::from_shared(backend, signer),
             directory,
         )
+    }
+
+    /// Build over a backend the caller already opened, with the FULL hybrid
+    /// identity — the constructor a node that seals group content needs
+    /// (CIRISPersist#848).
+    ///
+    /// The engine's federation signer is `signer.classical`; its
+    /// `LocalSigner` carries the ML-DSA-65 half so the emitted `key_grant`
+    /// set is hybrid-signed and admissible on every peer. persist's
+    /// `LocalSigner::from_hardware_parts` keeps the classical key behind the
+    /// `HardwareSigner` seal — nothing is unsealed to build this.
+    ///
+    /// The same engine is what the replication bridge must route
+    /// `key_grant:*` rows to ([`Self::engine`] →
+    /// `ReplicationRuntimeConfig::engine`), so one node has ONE view of the
+    /// substrate that both seals and projects.
+    ///
+    /// # Errors
+    /// The classical signer could not report its public key, or reports a
+    /// non-Ed25519 length.
+    pub async fn from_shared_hybrid(
+        backend: ciris_persist::BackendDispatch,
+        directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
+        signer: &crate::identity::LocalSigner,
+    ) -> Result<Self, String> {
+        // The PQC key id is the identity's own: edge registers ONE hybrid
+        // `KeyRecord` carrying both pubkeys under `key_id`, so the row a
+        // verifier resolves the ML-DSA pubkey from is the same row.
+        let local = ciris_persist::signing::LocalSigner::from_hardware_parts(
+            signer.classical.clone(),
+            signer.key_id.clone(),
+            signer.pqc.clone(),
+            signer.pqc.as_ref().map(|_| signer.key_id.clone()),
+        )
+        .await
+        .map_err(|e| format!("hybrid local signer for {}: {e}", signer.key_id))?;
+        Ok(Self::new(
+            ciris_persist::Engine::from_shared_with_local(
+                backend,
+                signer.classical.clone(),
+                Some(Arc::new(local)),
+            ),
+            directory,
+        ))
+    }
+
+    /// The engine this store seals through — hand a clone to
+    /// `ReplicationRuntimeConfig::engine` so the bridge projects the
+    /// `key_grant` sets this node receives into the same tables this store
+    /// reads (CIRISPersist#848).
+    #[must_use]
+    pub fn engine(&self) -> &ciris_persist::Engine {
+        &self.engine
     }
 }
 

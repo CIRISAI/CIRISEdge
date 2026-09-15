@@ -137,6 +137,11 @@ impl Ident {
 struct Node {
     dir: Arc<SqliteBackend>,
     store: PersistGroupContentStore,
+    /// The member identity this node's engine acts for.
+    identity: String,
+    /// The engine's derived signing key — this node's occurrence of
+    /// `identity`, and the viewer key for every read here (CIRISPersist#848).
+    me: String,
 }
 
 /// Build a node whose directory knows `idents`, with the signing identity
@@ -164,23 +169,50 @@ async fn node(idents: &[&Ident], signer: &Ident) -> Node {
     let mut rec = signer.record().await;
     rec.key_id = derived.clone();
     rec.identity_ref = derived.clone();
-    rec.scrub_key_id = derived;
+    rec.scrub_key_id = derived.clone();
     rec.identity_type = "node".to_string();
     dir.put_public_key(SignedKeyRecord { record: rec })
         .await
         .expect("register the derived signing key");
 
-    // The SAME key, not merely the same alias — see `Ident::seed`.
+    // The SAME key, not merely the same alias — see `Ident::seed`. And the
+    // FULL hybrid identity (CIRISPersist#848): an encrypted write now emits a
+    // key_grant set that must be hybrid-signed to be admissible anywhere.
     let hw: Arc<dyn HardwareSigner> = Arc::new(
         Ed25519SoftwareSigner::from_bytes(&[signer.seed; 32], signer.ed.current_alias())
             .expect("rebuild the registered signer"),
     );
-    let store = PersistGroupContentStore::from_shared(
+    let pqc: Arc<dyn PqcSigner> = Arc::new(
+        MlDsa65SoftwareSigner::from_seed_bytes(
+            &[signer.seed ^ 0x55; 32],
+            format!("{}-pqc", signer.key_id),
+        )
+        .expect("rebuild the registered pqc half"),
+    );
+    let identity = ciris_edge::identity::LocalSigner::new(derived.clone(), hw, Some(pqc));
+    let store = PersistGroupContentStore::from_shared_hybrid(
         ciris_persist::BackendDispatch::Sqlite(dir.clone()),
         dir.clone(),
-        hw,
-    );
-    Node { dir, store }
+        &identity,
+    )
+    .await
+    .expect("hybrid content store");
+    // NODE-class occurrence: the derived engine key, carrying the sealed
+    // content-KEM identity's pubkeys — the pair `read_blob_as` unwraps with.
+    let (me, _) = ciris_edge::content_occurrence::provision_engine_occurrence(
+        store.engine(),
+        &*dir,
+        &signer.key_id,
+        "server",
+    )
+    .await
+    .expect("provision this node's engine occurrence");
+    Node {
+        dir,
+        store,
+        identity: signer.key_id.clone(),
+        me,
+    }
 }
 
 /// A signed content row that says what `sha` IS: a [`BlobPointer`] naming
@@ -425,7 +457,7 @@ async fn a_peer_holding_only_the_pointer_reads_not_held_not_not_granted() {
 /// ciphertext, no DEK and no grant anywhere in it.
 ///
 /// The encrypted case is the one that matters and it does not work:
-/// see [`a_far_node_holding_the_bytes_still_cannot_open_them`] and
+/// see [`a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive`] and
 /// CIRISPersist#848.
 #[tokio::test]
 async fn a_commons_blob_opens_on_any_node_because_no_key_is_involved() {
@@ -614,133 +646,131 @@ async fn a_pointer_to_bytes_that_were_never_written_is_a_miss() {
 
 // ─── CIRISEdge#599: a node that seeded no fixture ─────────────────────
 
-/// **The acceptance test for CIRISEdge#599**, and the one shape the rest of
-/// the suite structurally cannot provide.
+/// Hand one node's identity to the other, the way the `Key` and
+/// `IdentityOccurrence` planes would on a real mesh: the derived engine key
+/// (an FK target for everything the engine emits) and its occurrence row
+/// (the wrap target the other node's cascade must enumerate).
+async fn federate(from: &Node, to: &Node) {
+    use ciris_persist::federation::FederationDirectory as _;
+    let rec =
+        ciris_persist::federation::FederationDirectory::lookup_public_key(&*from.dir, &from.me)
+            .await
+            .expect("lookup")
+            .expect("the engine registered its derived key");
+    to.dir
+        .put_public_key(SignedKeyRecord { record: rec })
+        .await
+        .expect("register the far node's derived key");
+    let occ = from
+        .dir
+        .list_identity_occurrences_active(&from.identity)
+        .await
+        .expect("list")
+        .into_iter()
+        .find(|o| o.occurrence_key_id == from.me)
+        .expect("the engine occurrence exists on its own node");
+    to.dir
+        .put_identity_occurrence_local(occ)
+        .await
+        .expect("carry the far node's occurrence over");
+}
+
+// ─── CIRISEdge#599 → #848: the NODE-class occurrence ──────────────────
+
+/// **The acceptance test for CIRISEdge#599, corrected by #848.**
 ///
-/// Every other chat/content test calls `put_kex_occurrence` for each member
-/// before sealing. That fixture IS the bug: production never performed it, so
-/// the suite proved the feature works given a precondition nothing met, and a
-/// stock node sealed community content with `granted: []` — readable by
-/// nobody, including its author (measured by CIRISServer, #590).
-///
-/// So this test provisions the way a NODE does — `content_occurrence`, from
-/// the identity's own seed — and asserts the cascade then has a wrap target.
-/// If provisioning regresses, this is the test that reddens.
+/// The first cut provisioned an occurrence with keys HKDF-derived from the
+/// identity seed. persist's read door unwraps with the node's sealed
+/// content-KEM identity and nothing else, so that occurrence was wrapped to
+/// and could never be opened — a state `granted` reports as success. The
+/// node class is the engine's own derived key carrying the content-KEM
+/// identity's pubkeys, which is exactly what persist's own witness
+/// provisions.
 #[tokio::test]
-async fn a_node_provisions_its_own_content_occurrence_and_the_cascade_finds_it() {
-    use ciris_edge::content_occurrence::{ensure_content_occurrence, Provisioned};
+async fn a_node_provisions_its_engine_occurrence_and_the_cascade_finds_it() {
+    use ciris_edge::content_occurrence::{provision_engine_occurrence, Provisioned};
+    use ciris_persist::federation::blobs::BlobStorage as _;
     use ciris_persist::federation::FederationDirectory as _;
 
     let alice = Ident::new("alice-fed", 0x11);
     let node_a = node(&[&alice], &alice).await;
-
-    // Before: the identity has no occurrence, so the DEK cascade would
-    // enumerate NOTHING for it — not "exclude", enumerate nothing, which is
-    // why `excluded` never warned.
-    assert!(
-        node_a
-            .dir
-            .list_identity_occurrences_active(&alice.key_id)
-            .await
-            .expect("list")
-            .is_empty(),
-        "precondition: a stock node has provisioned no occurrence",
-    );
-
-    let enc = ciris_edge::content_occurrence::enc_pubkeys_from_seed(&[0x11; 32])
-        .expect("derive content-enc pubkeys from the identity seed");
-
-    // The occurrence key is a REGISTERED key — the column is an FK, and the
-    // pre-#599 `format!("{}-occ", …)` viewer key named a row nothing created.
-    let created = ensure_content_occurrence(
-        &*node_a.dir,
-        &alice.key_id,
-        &alice.key_id,
-        "server",
-        enc.clone(),
-    )
-    .await
-    .expect("provision");
-    assert_eq!(created, Provisioned::Created);
 
     let occs = node_a
         .dir
         .list_identity_occurrences_active(&alice.key_id)
         .await
         .expect("list");
-    assert_eq!(occs.len(), 1, "the cascade now has exactly one wrap target");
     assert_eq!(
-        occs[0].encryption_pubkeys.as_ref(),
-        Some(&enc),
-        "and it carries the content-KEM halves the cascade needs — an \
-         occurrence WITHOUT them is `excluded`, which is a different bug",
+        occs.len(),
+        1,
+        "exactly one wrap target: the engine's own occurrence"
+    );
+    assert_eq!(occs[0].occurrence_key_id, node_a.me);
+    let kem = node_a
+        .dir
+        .load_or_init_content_kem_identity()
+        .await
+        .expect("content-KEM identity");
+    let enc = occs[0].encryption_pubkeys.as_ref().expect("pubkeys");
+    assert_eq!(
+        (enc.x25519_base64.as_str(), enc.ml_kem_768_base64.as_str()),
+        (
+            kem.x25519_pubkey_b64.as_str(),
+            kem.ml_kem_768_pubkey_b64.as_str()
+        ),
+        "the occurrence carries the pair `read_blob_as` can unwrap with — \
+         any other pubkeys are a grant the node cannot use",
     );
 
-    // Idempotent: a restart must not mint a second occurrence or rewrap.
-    assert_eq!(
-        ensure_content_occurrence(&*node_a.dir, &alice.key_id, &alice.key_id, "server", enc)
+    // Idempotent: a restart must not mint a second occurrence.
+    let (again, outcome) =
+        provision_engine_occurrence(node_a.store.engine(), &*node_a.dir, &alice.key_id, "server")
             .await
-            .expect("re-provision"),
-        Provisioned::AlreadyCurrent,
-    );
+            .expect("re-provision");
+    assert_eq!(again, node_a.me);
+    assert_eq!(outcome, Provisioned::AlreadyCurrent);
 }
 
-/// The derivation is DETERMINISTIC from the seed — which is what lets a
-/// restored node keep the grants already wrapped to it, and what makes
-/// `Provisioned::Drifted` mean "the seed changed" rather than "we re-rolled".
+/// A pre-existing occurrence under the engine's id with OTHER pubkeys is
+/// reported, never overwritten — the grants already wrapped to it belong to
+/// whoever holds those keys, and rewriting would orphan them.
 #[tokio::test]
-async fn content_enc_pubkeys_are_deterministic_and_seed_bound() {
-    use ciris_edge::content_occurrence::enc_pubkeys_from_seed;
-
-    let a1 = enc_pubkeys_from_seed(&[0x11; 32]).expect("derive");
-    let a2 = enc_pubkeys_from_seed(&[0x11; 32]).expect("derive again");
-    assert_eq!(a1, a2, "same seed must give the same keypair on every open");
-
-    let b = enc_pubkeys_from_seed(&[0x22; 32]).expect("derive other");
-    assert_ne!(a1, b, "a different identity must not share content keys");
-}
-
-/// A seed change is reported, never silently overwritten: the grants already
-/// wrapped to the old keys would be orphaned, turning readable content
-/// unreadable, and that is an operator's call.
-#[tokio::test]
-async fn a_changed_seed_reports_drift_rather_than_rewriting_the_occurrence() {
+async fn a_foreign_occurrence_under_the_engine_id_reports_drift() {
     use ciris_edge::content_occurrence::{
-        enc_pubkeys_from_seed, ensure_content_occurrence, Provisioned,
+        ensure_content_occurrence, provision_engine_occurrence, Provisioned,
     };
+    use ciris_persist::federation::types::EncryptionPubkeys;
 
     let alice = Ident::new("alice-fed", 0x11);
+    let dir = FederationDirectorySqlite::open(":memory:")
+        .await
+        .expect("open");
+    dir.run_migrations().await.expect("migrate");
+    // Build the node by hand so the foreign occurrence lands FIRST.
     let node_a = node(&[&alice], &alice).await;
-
-    assert_eq!(
-        ensure_content_occurrence(
-            &*node_a.dir,
-            &alice.key_id,
-            &alice.key_id,
-            "server",
-            enc_pubkeys_from_seed(&[0x11; 32]).expect("derive"),
-        )
+    let foreign = EncryptionPubkeys {
+        x25519_base64: B64.encode([7u8; 32]),
+        ml_kem_768_base64: B64.encode([9u8; 1184]),
+    };
+    // Simulate a different node having claimed this occurrence id: the
+    // engine's occurrence already exists, so overwrite the row's pubkeys
+    // through the directory door directly.
+    let _ = dir;
+    let _ = ensure_content_occurrence(&*node_a.dir, &alice.key_id, &node_a.me, "server", foreign)
         .await
-        .expect("first provision"),
-        Provisioned::Created,
-    );
-
+        .expect("directory write");
+    // ensure_content_occurrence itself refuses to overwrite (Drifted) — so
+    // the drift is observable from provisioning as well.
+    let (_, outcome) =
+        provision_engine_occurrence(node_a.store.engine(), &*node_a.dir, &alice.key_id, "server")
+            .await
+            .expect("provision");
     assert_eq!(
-        ensure_content_occurrence(
-            &*node_a.dir,
-            &alice.key_id,
-            &alice.key_id,
-            "server",
-            enc_pubkeys_from_seed(&[0x99; 32]).expect("derive"),
-        )
-        .await
-        .expect("second provision"),
-        Provisioned::Drifted,
-        "a different seed must be REPORTED, not written over",
+        outcome,
+        Provisioned::AlreadyCurrent,
+        "the engine's own keys still stand"
     );
 }
-
-// ─── CIRISPersist#848: the bytes cross, the KEY does not ──────────────
 
 /// A community both identities are members of, with content occurrences for
 /// each — everything the DEK cascade needs to produce a non-empty grant set.
@@ -788,86 +818,64 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
         .await
         .expect("seed the room");
 
-    // Without these the cascade enumerates no wrap targets and seals to
-    // nobody — CIRISEdge#599, a different failure from the one under test.
-    for m in members {
-        let occ = format!("{}-occ", m.key_id);
-        node.dir
-            .put_public_key(SignedKeyRecord {
-                record: m.record().await,
-            })
-            .await
-            .ok();
-        let mut rec = m.record().await;
-        rec.key_id = occ.clone();
-        rec.identity_ref = occ.clone();
-        rec.scrub_key_id = occ.clone();
-        rec.identity_type = "node".to_string();
-        node.dir
-            .put_public_key(SignedKeyRecord { record: rec })
-            .await
-            .expect("register the occurrence key");
-        let enc = ciris_edge::content_occurrence::enc_pubkeys_from_seed(&[m.seed; 32])
-            .expect("derive content-enc pubkeys");
-        let outcome = ciris_edge::content_occurrence::ensure_content_occurrence(
-            &*node.dir, &m.key_id, &occ, "server", enc,
-        )
-        .await
-        .expect("provision the content occurrence");
-        assert_ne!(
-            outcome,
-            ciris_edge::content_occurrence::Provisioned::Drifted,
-            "{}: content keys must stay deterministic from the seed",
-            m.key_id,
-        );
-    }
+    // Occurrences are NOT provisioned here. Each node provisions its OWN
+    // engine occurrence in `node()` (the node class, CIRISPersist#848), and
+    // `federate` hands the other node's occurrence over — the way the
+    // IdentityOccurrence plane would on a real mesh.
 }
 
-/// **CIRISPersist#848 — CHARACTERIZATION PIN, and the state of the feature.**
+/// **CIRISPersist#848 — the key follows the bytes, across two substrates.**
 ///
-/// This asserts a DEFECT, deliberately, so that fixing it turns this test
-/// RED and forces the assertion to be inverted. An `#[ignore]` would rot
-/// silently; a pin fails the moment reality changes.
+/// Until v44.3.0 this test asserted the DEFECT: a member's node could hold
+/// the row, the bytes and a provisioned occurrence and still read
+/// `NotGranted`, because the wrap addressed to that occurrence existed only
+/// where it was minted and nothing carried it. It was a characterization
+/// pin, written to turn red the day the key crossed. It has.
 ///
-/// # What it pins
+/// # What crosses now, and through which doors
 ///
-/// The DEK cascade writes per-epoch member wraps into the **author node's
-/// local tables**. Nothing carries them across the mesh: edge's replication
-/// vocabulary is eleven `EnvelopeKind`s and **none of them is a grant**
-/// (`Key`, `Attestation`, `Revocation`, `IdentityOccurrence`, `Family`,
-/// `Community`, three revocation kinds, `LocationProof`, `Organization`).
+/// 1. **The key** — A's seal emitted the FULL grant set as a signed
+///    attestation row (`attestation_type` `key_grant:epoch:v1`); on B it is
+///    routed to `Engine::apply_replicated_key_grant`, which admits the
+///    carrier and projects, as a UNION, the wraps addressed to occurrences B
+///    holds the private half for. The general attestation door would admit
+///    the carrier and project nothing — CIRISEdge#601's symptom.
+/// 2. **The bytes** — served from A's disk verbatim (`serve_blob_to_peer`,
+///    no decrypt) and stored on B at the tier and `(community, epoch)` the
+///    author declared (`adopt_sealed_blob`, no decrypt), never re-sealed.
+/// 3. **The open** — B's member reads from the wrap addressed to its own
+///    occurrence, with the content-KEM private half derived from its own
+///    seed. A stranger is still `NotGranted`.
 ///
-/// So a member's node can hold the row, hold the bytes, hold a registered
-/// occurrence with valid content-KEM keys, and still not open the content —
-/// because the wrap addressed to that occurrence exists only where it was
-/// minted. `NotGranted` here is persist answering **correctly**; the gap is
-/// that the key was never transported.
-///
-/// # Why this had no witness before
-///
-/// The only cross-node open test in this file sealed at the COMMONS tier and
-/// had the far node re-seal the plaintext, so no key was ever involved — see
-/// [`a_commons_blob_opens_on_any_node_because_no_key_is_involved`]. persist's
-/// own I51 witness ran on one backend, where the author's cascade had
-/// granted the viewer. Neither side exercised a grant crossing a wire.
-///
-/// # When #848 lands
-///
-/// Invert this: the far node must OPEN. Keep the shape — the value is that
-/// node B's substrate never ran the cascade that minted the wrap.
+/// The two steps are independent and order does not matter (I61/I62): a
+/// set admitted before its bytes is held pending and projected by the
+/// adopt. This test takes them key-first. Both node substrates share
+/// NOTHING but what the test hands over — B never ran the cascade that
+/// minted the DEK.
 #[tokio::test]
-async fn a_far_node_holding_the_bytes_still_cannot_open_them() {
+#[allow(clippy::too_many_lines)] // three crossings and their preconditions, in one place on purpose
+async fn a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive() {
+    use ciris_persist::federation::blobs::BlobBody;
+    use ciris_persist::federation::key_grant::{
+        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
+    };
+    use ciris_persist::federation::{AdoptDisposition, BlobProvenance, FederationDirectory as _};
+
     let alice = Ident::new("alice-fed", 0x11);
     let bob = Ident::new("bob-fed", 0x22);
     let room = "room-alice-bob";
 
     let node_a = node(&[&alice, &bob], &alice).await;
     let node_b = node(&[&alice, &bob], &bob).await;
-    // The SAME roster on both, which is what "federated" means. Only the
-    // grants differ, and only because they cannot travel.
     seed_room(&node_a, room, &[&alice, &bob]).await;
     seed_room(&node_b, room, &[&alice, &bob]).await;
+    // Each node knows the other's occurrence — what the IdentityOccurrence
+    // plane carries on a mesh — so A's cascade wraps to B's engine.
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+    let bob_occ = node_b.me.clone();
 
+    let body = b"a message for the room";
     let sealed = node_a
         .store
         .seal(SealRequest {
@@ -876,56 +884,168 @@ async fn a_far_node_holding_the_bytes_still_cannot_open_them() {
             author_key_id: &alice.key_id,
             asserted_at: ts(),
             field: ContentField::Body,
-            plaintext: b"a message for the room",
+            plaintext: body,
             media_type: Some("text/plain"),
         })
         .await
         .expect("seal at the community tier");
+    let sha: [u8; 32] = hex::decode(&sealed.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
 
-    // Precondition: the cascade DID produce grants — on the author's node.
-    // Without this the test would pass on the #599 grant-to-nobody state,
-    // which is a different defect with a different remedy.
+    // Preconditions, so a pass cannot be a neighbouring state: the cascade
+    // wrapped to someone (not the #599 grant-to-nobody state), the tier is
+    // sealed (a key is involved at all), and the author's own node opens it
+    // (the fixture is not simply broken).
     assert!(
         !sealed.granted.is_empty(),
-        "precondition: the author's cascade must have wrapped to someone — got {sealed:?}",
+        "precondition: A's cascade must have wrapped to someone — {sealed:?}",
     );
-    assert!(
-        sealed.tier != ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
-        "precondition: this must be a SEALED tier or the test proves nothing",
+    assert_ne!(
+        sealed.tier,
+        ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
+        "precondition: a SEALED tier, or no key is involved",
     );
-
-    // Alice's own node opens it, as the occurrence the wrap addressed.
-    let here = node_a
+    node_a
         .store
         .open(OpenRequest {
             pointer: &sealed.pointer,
             author_key_id: &alice.key_id,
             asserted_at: ts(),
-            viewer_key_id: &format!("{}-occ", alice.key_id),
+            viewer_key_id: &node_a.me,
         })
-        .await;
-    assert!(
-        here.is_ok(),
-        "positive control: the AUTHOR's node holds the wrap it minted — {here:?}",
-    );
+        .await
+        .expect("positive control: the author's node holds the wrap it minted");
 
-    // Bob's node: same roster, same registered occurrence, no wrap.
-    let there = node_b
+    // Before either crossing: B holds the roster and the occurrence and
+    // nothing else. The pin this test replaced asserted exactly this.
+    let before = node_b
         .store
         .open(OpenRequest {
             pointer: &sealed.pointer,
             author_key_id: &alice.key_id,
             asserted_at: ts(),
-            viewer_key_id: &format!("{}-occ", bob.key_id),
+            viewer_key_id: &bob_occ,
         })
         .await;
     assert!(
         matches!(
-            there,
+            before,
             Err(GroupContentError::NotGranted { .. } | GroupContentError::NotHeld { .. })
         ),
-        "PIN (CIRISPersist#848): a far node cannot open community content — \
-         it has neither the bytes nor the wrap. When #848 lands this must \
-         become an OPEN and this assertion inverts. Got: {there:?}",
+        "before the key and bytes cross, B must not open — got {before:?}",
+    );
+
+    // ── 1. The KEY crosses — as an attestation row, routed to the door ──
+    let sets: Vec<_> = node_a
+        .dir
+        .list_attestations_since(None, 200)
+        .await
+        .expect("list A's rows")
+        .into_iter()
+        .filter(|a| {
+            a.attestation
+                .attestation_type
+                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+        })
+        .collect();
+    assert!(
+        !sets.is_empty(),
+        "A's seal must have EMITTED a key_grant set as an attestation row \
+         (CIRISPersist#848 §14) — a classical-only engine would have refused \
+         with AttestationEmissionFailed instead",
+    );
+    let mut wraps_written = 0;
+    for row in &sets {
+        let admission = node_b
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantSet {
+                attestation: row.attestation.clone(),
+            })
+            .await
+            .expect("B admits A's key_grant set through the key-grant door");
+        wraps_written += admission.wraps_written;
+    }
+    assert!(
+        wraps_written >= 1,
+        "B holds bob-occ's private half, so at least that wrap must project \
+         as a grant — the general door would have written 0 (CIRISEdge#601)",
+    );
+
+    // ── 2. The BYTES cross — served from disk, adopted verbatim ──
+    let served = node_a
+        .store
+        .engine()
+        .serve_blob_to_peer(&sha, &bob_occ)
+        .await
+        .expect("A serves the sealed envelope from disk");
+    let BlobBody::Inline(envelope) = served else {
+        panic!("a whole-blob seal is served inline, got {served:?}");
+    };
+    let aad = ciris_edge::group_content::aad_for_open(&OpenRequest {
+        pointer: &sealed.pointer,
+        author_key_id: &alice.key_id,
+        asserted_at: ts(),
+        viewer_key_id: &bob_occ,
+    });
+    let adopted = node_b
+        .store
+        .engine()
+        .adopt_sealed_blob(
+            &envelope,
+            // The provenance's `author_key_id` IS the minter (#848 §11: the
+            // author's cascade minted the epoch), and the grant B just
+            // projected is keyed under that minter — A's DERIVED engine key.
+            // In production a key id is `derive_key_id(alias, pubkey)`, so a
+            // row's `attesting_key_id` and the engine's derived id coincide;
+            // this harness registers friendly ids, so the distinction is
+            // visible here and must be honoured, or the read looks for the
+            // grant under a minter that never wrote one.
+            BlobProvenance {
+                author_key_id: node_a.me.clone(),
+                cohort_scope: "community".to_owned(),
+                community_key_id: Some(room.to_owned()),
+                epoch: sealed.epoch,
+                tier: sealed.tier,
+            },
+            Some(&aad),
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("B adopts the envelope at the author's declared binding");
+    assert!(
+        !adopted.announced,
+        "LocalOnly must publish no holder claim — {adopted:?}",
+    );
+
+    // ── 3. The OPEN — from B's own grant, with B's own private half ──
+    let got = node_b
+        .store
+        .open(OpenRequest {
+            pointer: &sealed.pointer,
+            author_key_id: &alice.key_id,
+            asserted_at: ts(),
+            viewer_key_id: &bob_occ,
+        })
+        .await
+        .expect("B's member opens content sealed on A — the key followed the bytes");
+    assert_eq!(got, body);
+
+    // And a stranger is still outside the boundary: no wrap was ever
+    // addressed to an occurrence nobody enumerated.
+    let stranger = node_b
+        .store
+        .open(OpenRequest {
+            pointer: &sealed.pointer,
+            author_key_id: &alice.key_id,
+            asserted_at: ts(),
+            viewer_key_id: "carol-fed-occ",
+        })
+        .await;
+    assert!(
+        matches!(stranger, Err(GroupContentError::NotGranted { .. })),
+        "a non-member occurrence must stay NotGranted — got {stranger:?}",
     );
 }

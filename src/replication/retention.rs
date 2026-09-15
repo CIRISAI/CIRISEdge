@@ -105,6 +105,9 @@ pub const fn retention_for(kind: EnvelopeKind, configured: Retention) -> Retenti
         // the content-hash index by construction — its hash moves as votes land
         // — so a hash of it is not even a stable name for the thing.
         | EnvelopeKind::AccordQuorumEvidence
+        // #848 — a key_grant set is an attestation row; keep its body, the
+        // wraps are the payload and nothing resolves one by hash.
+        | EnvelopeKind::KeyGrant
 
         // ── LocationProof. Bodies until there is something that resolves it.
         //
@@ -154,7 +157,7 @@ mod tests {
     /// * it is a ROSTER its members read locally and unprompted. A chat room is
     ///   a 2-member `Community`, and reading it goes through the roster in the
     ///   body. Holding the hash of your own chat room is not being in it.
-    const MUST_HOLD_BODIES: [EnvelopeKind; 12] = [
+    const MUST_HOLD_BODIES: [EnvelopeKind; 13] = [
         EnvelopeKind::Revocation,
         EnvelopeKind::IdentityOccurrenceRevocation,
         EnvelopeKind::FamilyMembershipRevocation,
@@ -168,6 +171,8 @@ mod tests {
         EnvelopeKind::Family,
         // Carries withdrawal evidence, and its hash moves as votes land.
         EnvelopeKind::AccordQuorumEvidence,
+        // A key_grant set: the wraps are the payload (#848).
+        EnvelopeKind::KeyGrant,
         // Nothing resolves a location proof by hash yet.
         EnvelopeKind::LocationProof,
     ];

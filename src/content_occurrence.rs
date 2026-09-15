@@ -29,6 +29,28 @@
 //! occurrence. That is the shape of the bug: not an untested path, a tested
 //! path with a precondition production never met.
 //!
+//! # Two occurrence classes — and a node needs the NODE class
+//!
+//! CIRISPersist v44.3.0 (#848) made the distinction load-bearing:
+//!
+//! | class | pubkeys come from | who decrypts | door |
+//! |---|---|---|---|
+//! | **node** | persist's sealed content-KEM identity (`load_or_init_content_kem_identity`, minted fresh, privates sealed under the content master) | **persist**, in `read_blob_as` | [`provision_engine_occurrence`] |
+//! | **device** | `SelfEncKeys` / `self_enc` HKDF from the device's own seed | **the device**, in its own custody (`kex_respond`) | [`provision_from_seed`] |
+//!
+//! `read_blob_as` unwraps a grant with the node's content-KEM private pair
+//! and nothing else, so a node can open exactly one occurrence's wraps: the
+//! one whose pubkeys ARE that identity's, keyed by the engine's derived
+//! signer id. A seed-derived occurrence on a node reads `NotGranted` forever
+//! — the wrap exists, the node holds no key for it. That is the trap the
+//! first cut of this module walked into, and why the device-class helpers
+//! below are deprecated for node use.
+//!
+//! The same derived id is what persist admits a `key_grant` set FROM: the
+//! emitter must resolve to a roster member, and a bare derived key resolves
+//! to nobody. Registering it as an occurrence of the member is what makes
+//! the node's seals emit at all.
+//!
 //! # Nothing here is new key material
 //!
 //! The content-enc keypair is **HKDF-derived from the identity's existing
@@ -58,6 +80,7 @@
 //! node has no counterparty for; calling it to get an occurrence would emit
 //! three attestations nobody asked for.
 
+use ciris_persist::federation::blobs::BlobStorage;
 use ciris_persist::federation::types::{EncryptionPubkeys, IdentityOccurrence};
 use ciris_persist::federation::FederationDirectory;
 
@@ -82,6 +105,8 @@ pub enum Provisioned {
     Drifted,
 }
 
+/// **Device class — not for a node that reads through `read_blob_as`.**
+///
 /// The content-enc public halves for an identity holding a **raw** Ed25519
 /// seed — the software-signer shape (the mesh harness, tests, a node whose
 /// seed is not sealed).
@@ -92,6 +117,11 @@ pub enum Provisioned {
 ///
 /// # Errors
 /// ML-KEM-768 key generation failure.
+#[deprecated(
+    since = "24.1.0",
+    note = "device-class keys: persist's read door cannot decrypt for them (CIRISPersist#848); \
+            a node reading through `read_blob_as` needs `provision_engine_occurrence`"
+)]
 pub fn enc_pubkeys_from_seed(ed25519_seed: &[u8; 32]) -> Result<EncryptionPubkeys, String> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -173,6 +203,12 @@ pub async fn ensure_content_occurrence(
 ///
 /// # Errors
 /// Derivation or directory failure.
+#[deprecated(
+    since = "24.1.0",
+    note = "provisions a DEVICE-class occurrence a node cannot decrypt for (CIRISPersist#848); \
+            use `provision_engine_occurrence`"
+)]
+#[allow(deprecated)]
 pub async fn provision_from_seed(
     directory: &dyn FederationDirectory,
     identity_key_id: &str,
@@ -211,4 +247,87 @@ pub async fn provision_from_seed(
         ),
     }
     Ok(out)
+}
+
+/// **The node class.** Register this engine's own signing key as a
+/// content-only occurrence of `identity_key_id`, carrying the pubkeys of the
+/// node's sealed content-KEM identity — the one pair `read_blob_as` can
+/// unwrap with (CIRISPersist#848).
+///
+/// Three things, idempotent together, and each is load-bearing:
+///
+/// 1. `me = engine.local_derived_key_id()` — the id persist stamps as
+///    `attesting_key_id` on everything this engine emits, including the
+///    `key_grant` set every encrypted seal now carries.
+/// 2. `me` is registered in `federation_keys` (both pubkeys, via
+///    `register_self_federation_key`) if it is not already — the occurrence
+///    column is an FK, and the `holds_bytes` claim a seal emits points here.
+/// 3. `me` becomes an occurrence of `identity_key_id` with
+///    `load_or_init_content_kem_identity()`'s pubkeys. This is what makes
+///    the node **both** an admissible emitter (persist resolves `me` → a
+///    roster member) **and** a grant recipient it can actually decrypt for.
+///
+/// Returns `(me, outcome)`; `me` is the viewer key for every read on this
+/// node. This is the pattern persist's own two-node witness uses
+/// (`key_grant_invariants.rs`, I61).
+///
+/// # Errors
+/// The derived id could not be computed, registration failed, the content-KEM
+/// identity could not be loaded or minted, or the directory write failed.
+pub async fn provision_engine_occurrence<B>(
+    engine: &ciris_persist::Engine,
+    backend: &B,
+    identity_key_id: &str,
+    device_class: &str,
+) -> Result<(String, Provisioned), String>
+where
+    B: FederationDirectory + BlobStorage,
+{
+    let me = engine
+        .local_derived_key_id()
+        .await
+        .map_err(|e| format!("derive this engine's federation key id: {e}"))?;
+
+    if backend
+        .lookup_public_key(&me)
+        .await
+        .map_err(|e| format!("lookup {me}: {e}"))?
+        .is_none()
+    {
+        engine
+            .register_self_federation_key("node", &me, None, serde_json::json!({}), Vec::new())
+            .await
+            .map_err(|e| format!("register {me} as this node's federation key: {e}"))?;
+    }
+
+    let kem = backend
+        .load_or_init_content_kem_identity()
+        .await
+        .map_err(|e| format!("load or mint the content-KEM identity: {e}"))?;
+    let enc = EncryptionPubkeys {
+        x25519_base64: kem.x25519_pubkey_b64,
+        ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
+    };
+
+    let outcome =
+        ensure_content_occurrence(backend, identity_key_id, &me, device_class, enc).await?;
+    match &outcome {
+        Provisioned::Created => tracing::info!(
+            identity = identity_key_id,
+            occurrence = %me,
+            "engine occurrence registered — this node emits key_grant sets as a member \
+             and decrypts the wraps addressed to it (CIRISPersist#848)"
+        ),
+        Provisioned::AlreadyCurrent => {
+            tracing::debug!(identity = identity_key_id, occurrence = %me, "engine occurrence current");
+        }
+        Provisioned::Drifted => tracing::warn!(
+            identity = identity_key_id,
+            occurrence = %me,
+            "engine occurrence exists with DIFFERENT pubkeys than this node's content-KEM \
+             identity — reads for it will be NotGranted. NOT overwritten: an operator decides \
+             (CIRISPersist#848)"
+        ),
+    }
+    Ok((me, outcome))
 }
