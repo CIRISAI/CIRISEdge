@@ -1639,6 +1639,15 @@ struct Occurrence {
     /// This node's persist directory — what `contact::PersistLens` reads, so
     /// the discovery leg resolves against the SAME state replication feeds.
     directory: Arc<SqliteBackend>,
+    /// CIRISPersist#848 — the ONE hybrid Engine view over `directory` that
+    /// both seals this node's group content and projects the `key_grant`
+    /// sets it receives. The replication runtime routes `key_grant:*` rows
+    /// to it; the chat legs seal and open through it. Two views would be two
+    /// sets of grant tables that never meet.
+    engine: ciris_edge::replication::BridgeEngine,
+    /// The engine's derived signing key — this node's occurrence of its
+    /// owner, and therefore the viewer key for every read here.
+    me: String,
 }
 
 /// The only two planes the harness replicates.
@@ -1810,6 +1819,23 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         emit_owner_binding(&directory, &owner_key_id, &owner_signer, subject).await?;
     }
 
+    // CIRISPersist#848 — the hybrid Engine this node seals AND projects
+    // through, built ONCE and shared by the replication runtime (which routes
+    // `key_grant:*` rows to it) and the chat legs (which seal and open through
+    // it). The OWNER's identity, not the node's: the key_grant set a seal
+    // emits is signed by the minter, and persist admits it only from an
+    // active member of the room — which the owner is and the node key is not.
+    // Hybrid, because a classical-only engine gets `AttestationEmissionFailed`
+    // at the first encrypted seal (the bytes stored, the key never carried).
+    let content_store = ciris_edge::group_content::PersistGroupContentStore::from_shared_hybrid(
+        ciris_persist::BackendDispatch::Sqlite(directory.clone()),
+        directory.clone(),
+        &owner_signer,
+    )
+    .await
+    .map_err(|e| format!("hybrid content engine: {e}"))?;
+    let engine = ciris_edge::replication::BridgeEngine(content_store.engine().clone());
+
     // CIRISEdge#599 — this node as a CONTENT OCCURRENCE of its owner.
     //
     // Without it the community-DEK cascade has no wrap target for the owner
@@ -1828,18 +1854,20 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     //    own seed. Deriving from the OWNER's seed would work only on a
     //    harness that happens to hold the human's key, which is precisely
     //    the thing a real node never does.
-    match ciris_edge::content_occurrence::provision_from_seed(
+    // The NODE-class occurrence (CIRISPersist#848): the engine's own derived
+    // signing key, carrying persist's sealed content-KEM identity — the one
+    // pair `read_blob_as` can unwrap with. This is what makes this node an
+    // admissible key_grant emitter (persist resolves the derived key to the
+    // owner, a room member) AND a recipient it can decrypt for. A seed-
+    // derived occurrence would be wrapped to and never opened.
+    let (me, _) = ciris_edge::content_occurrence::provision_engine_occurrence(
+        content_store.engine(),
         &*directory,
         &owner_key_id,
-        &cfg.node_id,
         "server",
-        &fed.seed,
     )
     .await
-    {
-        Ok(_) => {}
-        Err(e) => return Err(format!("provision this node's content occurrence: {e}")),
-    }
+    .map_err(|e| format!("provision this node's engine occurrence: {e}"))?;
 
     let roster = read_roster(&cfg.mesh_dir);
 
@@ -2065,16 +2093,32 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
                     round_timeout: Duration::from_secs(10),
                 },
                 local_key_id: Some(cfg.node_id.clone()),
+                // CIRISPersist#848 — route key_grant rows to the engine that
+                // owns this node's grant tables; without it every member reads
+                // NotGranted with the carrier row present (CIRISEdge#601).
+                engine: Some(engine.clone()),
                 ..Default::default()
             },
-            // THE SELF-PUBLISH SET — the three identities this node speaks
-            // for. Built by the library helper so the harness and the server
+            // THE SELF-PUBLISH SET — the identities this node speaks for.
+            // Built by the library helper so the harness and the server
             // construct it the same way.
+            //
+            // CIRISPersist#848 — `me` (the engine's derived signing key) is a
+            // FOURTH entry, and it is load-bearing: the IdentityOccurrence
+            // plane advertises rows by OCCURRENCE key id (`list_identity_
+            // occurrences_page` filters on `occurrence_key_id ∈ publish set`),
+            // so the engine occurrence `provision_engine_occurrence` registered
+            // never leaves this node unless `me` is here. Without it every
+            // peer refuses this node's key_grant sets as
+            // `signer_not_active_member` — the minter is not an occurrence
+            // its roster fold can see — and no member opens anything. The Key
+            // plane advertises `me`'s record for the same reason.
             Some({
                 let publish = [
                     cfg.node_id.as_str(),
                     agent_key_id.as_str(),
                     owner_key_id.as_str(),
+                    me.as_str(),
                 ];
                 tracing::info!(
                     node = %cfg.node_id,
@@ -2082,7 +2126,8 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
                     "self-publish set installed — these identities' Key / \
                      IdentityOccurrence / TransportDestination rows are advertised \
                      to peers. TransportDestination is the transport hint peers \
-                     need for #393 item 2"
+                     need for #393 item 2; the engine key is what carries this \
+                     node's occurrence, and with it its key_grant sets (#848)"
                 );
                 ciris_edge::replication::self_publish_set(publish)
             }),
@@ -2112,6 +2157,8 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         node_signer,
         owner_signer,
         directory,
+        engine,
+        me,
     })
 }
 
@@ -2837,10 +2884,9 @@ async fn run_chat_legs(occ: &Occurrence) {
             // substrate this node already opened (`Engine::from_shared`
             // runs no migrations and shares the pool), so a mesh node gets
             // group content without a second connection.
-            let content_store = ciris_edge::group_content::PersistGroupContentStore::from_shared(
-                ciris_persist::BackendDispatch::Sqlite(occ.directory.clone()),
+            let content_store = ciris_edge::group_content::PersistGroupContentStore::new(
+                occ.engine.0.clone(),
                 occ.directory.clone(),
-                occ.owner_signer.classical.clone(),
             );
             let (msg, sealed_content) = chat::chat_message_attestation(
                 &occ.owner_signer,
@@ -2933,10 +2979,9 @@ async fn run_chat_legs(occ: &Occurrence) {
     // The receiver's own content store — the same substrate, viewed as an
     // Engine. Built once outside the poll so a convergence loop does not
     // rebuild it on every tick.
-    let reader_store = ciris_edge::group_content::PersistGroupContentStore::from_shared(
-        ciris_persist::BackendDispatch::Sqlite(occ.directory.clone()),
+    let reader_store = ciris_edge::group_content::PersistGroupContentStore::new(
+        occ.engine.0.clone(),
         occ.directory.clone(),
-        occ.owner_signer.classical.clone(),
     );
     // The DEK is wrapped per active OCCURRENCE, so a reader presents its
     // occurrence key — an identity key is refused as NotGranted even for a
@@ -2946,7 +2991,7 @@ async fn run_chat_legs(occ: &Occurrence) {
     // This used to be `format!("{}-occ", owner)`, a string naming a row
     // nothing created — so the read was `NotGranted` on every node that had
     // not seeded a test fixture, which is every real node.
-    let viewer = occ.cfg.node_id.clone();
+    let viewer = occ.me.clone();
     let outcome = occ
         .replication
         .sync_and_await(&peer_node, budget, || async {

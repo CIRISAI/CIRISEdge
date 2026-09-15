@@ -76,6 +76,7 @@ use serde::{Deserialize, Serialize};
 /// | `FamilyMembershipRevocation`     | `put_family_membership_revocation(...)`             | v4.8.0 (#161)  |
 /// | `CommunityMembershipRevocation`  | `put_community_membership_revocation(...)`          | v4.8.0 (#161)  |
 /// | `LocationProof`                  | `put_location_proof(SignedLocationProof)`           | v4.10.0 (#154) |
+/// | `KeyGrant`                       | `Engine::apply_replicated_key_grant(SignedKeyGrantSet)` — routed by `attestation_type` prefix `key_grant:`; rides the Attestation cursor | v44.3.0 (#848) |
 ///
 /// Adding a variant going forward bumps `WIRE_PROTOCOL_VERSION` (see
 /// `wire_frame.rs`). Anticipated v2 additions (operational-data CEG
@@ -177,6 +178,25 @@ pub enum EnvelopeKind {
     /// trusting the sender's verdict. A NEW post-v1 tag: v1-only peers serde-reject
     /// it (`min_wire_version` → V2). `list_signed_accord_quorum_evidence_since`.
     AccordQuorumEvidence,
+    /// CIRISPersist v44.3.0 (#848) — the **sixteenth** kind, appended: one
+    /// CC 3 `key_grant` **set** — every recipient wrap for one minter's
+    /// epoch (community / affiliations) or one blob (self / family). This is
+    /// what makes the key follow the bytes: the wraps are opaque to everyone
+    /// but their recipient, so they ride the attestation plane and each node
+    /// projects, on admit, only the wraps addressed to an occurrence it holds
+    /// the private half for.
+    ///
+    /// **Not a separately-pulled plane on edge.** Persist emits the set as an
+    /// attestation row (`attestation_type` `key_grant:epoch:v1` /
+    /// `key_grant:content:v1`), so it arrives on the `Attestation` cursor
+    /// this node already pulls — no new fetch. The kind exists here so the
+    /// vocabulary mirrors persist's sixteen in order (`WIRE_VOCABULARY_KINDS.md`)
+    /// and so a peer that frames one under this tag still lands on the
+    /// right door. The one thing only edge can do is the ROUTING: a
+    /// `key_grant:*` row must reach `Engine::apply_replicated_key_grant`, not
+    /// the general attestation door, which admits the carrier and projects
+    /// NO wraps (CIRISEdge#601's exact symptom, with the row present).
+    KeyGrant,
 }
 
 impl EnvelopeKind {
@@ -185,7 +205,7 @@ impl EnvelopeKind {
     /// `REPLICATION_POLICY_HASH`). Basis for the serve/advertise manifest
     /// (CIRISEdge#393 item 3). `AccordQuorumEvidence` (CIRISEdge#474) is appended
     /// last — order is hashed, so it MUST stay at the end.
-    pub const ALL: [EnvelopeKind; 15] = [
+    pub const ALL: [EnvelopeKind; 16] = [
         Self::Key,
         Self::Attestation,
         Self::Revocation,
@@ -201,6 +221,8 @@ impl EnvelopeKind {
         Self::PartnerRecord,
         Self::TransportDestination,
         Self::AccordQuorumEvidence,
+        // CIRISPersist#848 — appended; order is hashed.
+        Self::KeyGrant,
     ];
 
     /// CIRISEdge#402/#406 — the finite, self-authenticating **bootstrap** kinds a
@@ -369,6 +391,7 @@ impl EnvelopeKind {
             Self::PartnerRecord => "partner_record",
             Self::TransportDestination => "transport_destination",
             Self::AccordQuorumEvidence => "accord_quorum_evidence",
+            Self::KeyGrant => "key_grant",
         }
     }
 
@@ -386,7 +409,10 @@ impl EnvelopeKind {
     pub fn persist_index_kind(self) -> Option<&'static str> {
         Some(match self {
             Self::Key => "Key",
-            Self::Attestation => "Attestation",
+            // #848 — a key_grant set IS an attestation row: it is point-read
+            // through persist's Attestation content-hash index, never one of
+            // its own. Declared so the kind has exactly one serve basis.
+            Self::Attestation | Self::KeyGrant => "Attestation",
             // Both are absent from persist's content-hash `signed_wire_index`:
             // Revocation rides `persist_row_hash` (`is_row_hash_served`);
             // AccordQuorumEvidence rides the cursor path (`is_cursor_served`,
@@ -438,7 +464,9 @@ impl EnvelopeKind {
             | Self::TransportDestination
             // #474 — the accord-quorum-evidence plane is likewise a new post-v1
             // tag; v1-only peers serde-reject it, so it rides at V2 framing.
-            | Self::AccordQuorumEvidence => {
+            | Self::AccordQuorumEvidence
+            // #848 — post-v1 tag; v1-only peers serde-reject it.
+            | Self::KeyGrant => {
                 crate::replication::wire_frame::WIRE_PROTOCOL_VERSION_V2
             }
         }
@@ -945,6 +973,7 @@ mod tests {
                 EnvelopeKind::PartnerRecord => "partner_record",
                 EnvelopeKind::TransportDestination => "transport_destination",
                 EnvelopeKind::AccordQuorumEvidence => "accord_quorum_evidence",
+                EnvelopeKind::KeyGrant => "key_grant",
             };
             // The serde rename, the manifest key, and the pin all agree.
             assert_eq!(kind.as_wire_str(), wire, "{kind:?}: as_wire_str drifted");

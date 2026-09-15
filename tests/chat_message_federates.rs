@@ -385,7 +385,7 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
         &["alice-fed".to_string()],
         &w.room,
         &content_store(&w).await,
-        &format!("{}-occ", w.bob.key_id),
+        &me_of(&w).await,
     )
     .await
     .expect("read the room");
@@ -553,7 +553,7 @@ async fn a_widening_carries_the_claims_instant_and_records_its_own() {
         &["alice-fed".to_string()],
         &w.room,
         &content_store(&w).await,
-        &format!("{}-occ", w.bob.key_id),
+        &me_of(&w).await,
     )
     .await
     .unwrap();
@@ -630,7 +630,7 @@ async fn a_forged_on_behalf_of_claim_projects_the_attester() {
         &["bob-fed".to_string()],
         &w.room,
         &content_store(&w).await,
-        &format!("{}-occ", w.bob.key_id),
+        &me_of(&w).await,
     )
     .await
     .unwrap();
@@ -666,7 +666,7 @@ async fn a_message_for_another_room_does_not_appear_here() {
         &["alice-fed".to_string()],
         &other_room,
         &content_store(&w).await,
-        &format!("{}-occ", w.bob.key_id),
+        &me_of(&w).await,
     )
     .await
     .unwrap();
@@ -1353,11 +1353,71 @@ async fn content_store_maybe_provisioned(
         }
     }
 
-    ciris_edge::group_content::PersistGroupContentStore::from_shared(
+    // CIRISPersist#848 — the store must be HYBRID: every encrypted write now
+    // emits the key_grant set as a federated attestation, and a
+    // classical-only engine gets `AttestationEmissionFailed` at the first
+    // community seal. `signer` (the classical half) is still what the
+    // directory registered above.
+    let _ = signer;
+    let store = ciris_edge::group_content::PersistGroupContentStore::from_shared_hybrid(
         ciris_persist::BackendDispatch::Sqlite(w.dir.clone()),
         w.dir.clone(),
-        signer,
+        &w.alice_node,
     )
+    .await
+    .expect("hybrid content store");
+    if provision {
+        // The NODE-class occurrence (CIRISPersist#848): the engine's derived
+        // key as an occurrence of alice, with the content-KEM identity's
+        // pubkeys — the pair `read_blob_as` unwraps with, and what makes this
+        // engine an admissible key_grant emitter for the room.
+        let (_, outcome) = ciris_edge::content_occurrence::provision_engine_occurrence(
+            store.engine(),
+            &*w.dir,
+            &w.alice.key_id,
+            "server",
+        )
+        .await
+        .expect("provision the engine's own occurrence");
+        // `Created` on the first store over this world, `AlreadyCurrent` on
+        // a second; `Drifted` would mean the engine's content-KEM identity
+        // no longer matches its own occurrence — every read then NotGranted.
+        assert_ne!(
+            outcome,
+            ciris_edge::content_occurrence::Provisioned::Drifted,
+            "the engine's occurrence must carry its own content-KEM pubkeys",
+        );
+    }
+    store
+}
+
+/// The viewer key for reads on THIS world's node: the engine's derived
+/// signing key, i.e. its own occurrence (CIRISPersist#848). Bob has no
+/// engine in this single-directory world; a reader that opens across nodes
+/// is witnessed in `blob_federation_e2e` on two substrates, which is the
+/// honest home for that claim (CIRISEdge#601 gap 3).
+async fn me(store: &ciris_edge::group_content::PersistGroupContentStore) -> String {
+    store
+        .engine()
+        .local_derived_key_id()
+        .await
+        .expect("derived key id")
+}
+
+/// [`me`] without a store in hand: the derived id is a function of the
+/// SIGNER alone, so any engine over `alice_node` yields the same one.
+async fn me_of(w: &World) -> String {
+    let store = content_store(w).await;
+    me(&store).await
+}
+
+#[allow(dead_code)]
+async fn me_unused(store: &ciris_edge::group_content::PersistGroupContentStore) -> String {
+    store
+        .engine()
+        .local_derived_key_id()
+        .await
+        .expect("derived key id")
 }
 
 /// Give `identity` a content-tier KEX occurrence — **through the same door
@@ -1380,6 +1440,12 @@ async fn content_store_maybe_provisioned(
 /// The occurrence key stays DISTINCT from the identity key — a device acting
 /// for a person, which is the shape the grants are wrapped for — and is
 /// registered first because the column is an FK onto `federation_keys`.
+// Bob's occurrence here is deliberately DEVICE-class (seed-derived): this
+// single-directory world has no bob engine, so it is a second wrap target
+// the cascade enumerates — which is what keeps `granted`/`excluded`
+// non-trivial — and one no node in this world can open. Cross-node opens are
+// witnessed in `blob_federation_e2e` on two substrates (CIRISEdge#601 gap 3).
+#[allow(deprecated)]
 async fn put_kex_occurrence(
     dir: &Arc<SqliteBackend>,
     identity: &str,
@@ -1473,8 +1539,7 @@ async fn a_chat_message_stores_its_content_as_a_group_blob_and_reads_back() {
     // The reader's OCCURRENCE key — grants are wrapped per occurrence, so
     // the identity key would be refused as NotGranted despite full
     // membership.
-    msg.resolve_content(&store, &format!("{}-occ", w.alice.key_id))
-        .await;
+    msg.resolve_content(&store, &me(&store).await).await;
     assert_eq!(
         msg.body,
         Body::Text(text.to_owned()),
@@ -1525,8 +1590,7 @@ async fn a_pointer_copied_onto_another_authors_row_does_not_open() {
     };
 
     let mut msg = ChatMessage::from_row(&stolen, &w.room).expect("recognise the stolen row");
-    msg.resolve_content(&store, &format!("{}-occ", w.bob.key_id))
-        .await;
+    msg.resolve_content(&store, &me(&store).await).await;
 
     match msg.body {
         Body::Unopened { reason } => assert!(

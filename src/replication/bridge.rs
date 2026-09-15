@@ -1231,6 +1231,9 @@ const MISSING_SIGNER_CAP: usize = 1024;
 pub struct FederationDirectoryReplicationBridge {
     directory: Arc<dyn FederationDirectory>,
     cohort: CohortProvider,
+    /// CIRISPersist#848 / CIRISEdge#601 — the Engine that owns
+    /// `apply_replicated_key_grant`. See [`BridgeEngine`].
+    engine: Option<BridgeEngine>,
     /// CIRISEdge#311 — the SELF-plane publish set. Collapses the #257
     /// `key_selector` + #305 `occurrence_selector` into ONE provider: both were
     /// the same `Projection::SelfOwn` re-implemented per plane. When `Some`, the
@@ -1519,6 +1522,29 @@ const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(10);
 /// of which are time-driven, so a TTL is the only thing that can observe them.
 const OWNER_BINDING_MEMO_TTL: Duration = Duration::from_secs(30);
 
+/// CIRISPersist#848 / CIRISEdge#601 — a `ciris_persist::Engine` the bridge
+/// routes `key_grant:*` rows to.
+///
+/// A newtype for one reason: `Engine` does not implement `Debug`, and this
+/// rides inside `ReplicationRuntimeConfig`, which does. The engine holds a
+/// signer and a connection pool; neither belongs in a log line, so `Debug`
+/// here prints nothing but the type.
+///
+/// Build it over the SAME substrate the bridge's directory reads — an
+/// `Engine::from_shared_with_local` view, no second connection, no
+/// migrations — and with a HYBRID signer: the key-grant door verifies the
+/// carrier row under `HybridPolicy::Strict`, and a node whose own encrypted
+/// writes must emit sets needs the PQC half to sign them
+/// (`AttestationEmissionFailed` otherwise).
+#[derive(Clone)]
+pub struct BridgeEngine(pub ciris_persist::Engine);
+
+impl std::fmt::Debug for BridgeEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BridgeEngine").finish_non_exhaustive()
+    }
+}
+
 impl FederationDirectoryReplicationBridge {
     /// Construct with default [`BridgeConfig`], **v1-only** (no v2
     /// operational-kind admission). For v2 operational admission, use
@@ -1536,6 +1562,7 @@ impl FederationDirectoryReplicationBridge {
         Self {
             directory,
             cohort,
+            engine: None,
             self_provider: None,
             local_key_id: None,
             config,
@@ -1609,6 +1636,7 @@ impl FederationDirectoryReplicationBridge {
         Self {
             directory,
             cohort,
+            engine: None,
             self_provider: None,
             local_key_id: None,
             config,
@@ -1670,6 +1698,14 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_self_provider(mut self, selector: Option<CohortProvider>) -> Self {
         self.self_provider = selector;
+        self
+    }
+
+    /// CIRISPersist#848 / CIRISEdge#601 — install the Engine that owns the
+    /// key-grant door. See [`BridgeEngine`] and [`Self::apply_key_grant`].
+    #[must_use]
+    pub fn with_engine(mut self, engine: Option<BridgeEngine>) -> Self {
+        self.engine = engine;
         self
     }
 
@@ -3398,7 +3434,10 @@ impl FederationDirectoryReplicationBridge {
             // `cursor_arm_set_equals_the_predicate_over_all` asserts the arm-set
             // equals the predicate over `ALL` — widening one without the other
             // reds there, not on the wire.
-            EnvelopeKind::AccordQuorumEvidence => Vec::new(),
+            // #848 — a key_grant set is an attestation row and is advertised
+            // by the Attestation arm above; listing it under its own kind
+            // would offer every row twice.
+            EnvelopeKind::AccordQuorumEvidence | EnvelopeKind::KeyGrant => Vec::new(),
         }
     }
 
@@ -3855,7 +3894,11 @@ impl FederationDirectoryReplicationBridge {
     ) -> ApplyOutcome {
         match kind {
             EnvelopeKind::Key => self.apply_key(envelope_bytes).await,
-            EnvelopeKind::Attestation => self.apply_attestation(envelope_bytes, source_peer).await,
+            // #848 — a key_grant set framed under its own tag lands on the same
+            // door; the `key_grant:` prefix router inside decides.
+            EnvelopeKind::Attestation | EnvelopeKind::KeyGrant => {
+                self.apply_attestation(envelope_bytes, source_peer).await
+            }
             EnvelopeKind::Revocation => {
                 let outcome = self.apply_revocation(envelope_bytes).await;
                 // CIRISEdge#430 — an ADMITTED revocation is the event-driven
@@ -6687,6 +6730,94 @@ impl FederationDirectoryReplicationBridge {
 
     /// persist v41.0.0 (CIRISPersist#804) — `source_peer` selects the write
     /// door. See the `put_attestation*` call below for why it is safe to pass.
+    /// CIRISPersist#848 / CIRISEdge#601 — the key-grant door.
+    ///
+    /// The one thing only edge can do for #848: a `key_grant:*` row that
+    /// reaches `Engine::apply_replicated_key_grant` is admitted AND has its
+    /// wraps projected — every wrap addressed to an occurrence this node holds
+    /// the private half for becomes a grant, in one transaction, as a UNION (a
+    /// re-applied set is a no-op; a subset removes nothing; CC 3 "cannot
+    /// retroactively un-share"). The same row through the general door is
+    /// admitted with NO projection, and the member reads `NotGranted` with the
+    /// row sitting right there — #601's exact symptom.
+    ///
+    /// Persist verifies the carrier (signer is the epoch's minter or the blob's
+    /// author, resolved from OUR directory; active member; v2 wraps; hybrid
+    /// signature) and refuses typed (`KeyGrantRefused { reason }`). Nothing is
+    /// re-derived here; `source_peer` is carried for the trace.
+    async fn apply_key_grant(
+        &self,
+        record: SignedAttestation,
+        source_peer: Option<&str>,
+    ) -> ApplyOutcome {
+        use ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome;
+        use ciris_persist::federation::key_grant::{KeyGrantSet, SignedKeyGrantSet};
+
+        let Some(engine) = self.engine.as_ref() else {
+            // Unreachable by the guard in `apply_attestation`; refuse loudly
+            // rather than panic if a future caller routes here directly.
+            return ApplyOutcome::refused(
+                "key_grant: routed with no engine installed (CIRISEdge#601)".to_owned(),
+            );
+        };
+
+        // Parse under persist's own reading FIRST so a malformed set is
+        // refused TERMINAL — the bytes will not become well-formed on retry
+        // — rather than surfacing as a transient refusal from the door.
+        if let Err(e) = KeyGrantSet::from_attestation(&record.attestation) {
+            return ApplyOutcome::refused_terminal(format!(
+                "key_grant: not a well-formed set ({e}) — attestation_id={} type={}",
+                record.attestation.attestation_id, record.attestation.attestation_type
+            ));
+        }
+        let attestation_id = record.attestation.attestation_id.clone();
+        let attestation_type = record.attestation.attestation_type.clone();
+        let minter = record.attestation.attesting_key_id.clone();
+        let set = SignedKeyGrantSet {
+            attestation: record.attestation,
+        };
+
+        match engine.0.apply_replicated_key_grant(set).await {
+            Ok(admission) => {
+                tracing::info!(
+                    axis = ?admission.axis,
+                    wraps_offered = admission.wraps_offered,
+                    wraps_written = admission.wraps_written,
+                    pending = admission.pending,
+                    carrier = ?admission.attestation,
+                    source_peer = source_peer.unwrap_or("<unattributed>"),
+                    "key_grant set admitted — wraps addressed to this node's occurrences \
+                     projected as grants (CIRISPersist#848)"
+                );
+                match admission.attestation {
+                    ReplicatedAttestationOutcome::Inserted => ApplyOutcome::Admitted,
+                    // The carrier was already held (or deduplicated by hash).
+                    // Wraps may STILL have been written — a newly provisioned
+                    // occurrence, a late device — union semantics — but for
+                    // the sweep's accounting the row did not change.
+                    ReplicatedAttestationOutcome::Unchanged
+                    | ReplicatedAttestationOutcome::Deduplicated => ApplyOutcome::Duplicate,
+                    // The door admitted the SET (wraps projected) but the
+                    // carrier row was refused at the attestation plane. Say so
+                    // with persist's reason; the refusal is the row's, the
+                    // grants this node could use are already on disk.
+                    ReplicatedAttestationOutcome::Refused { reason } => {
+                        ApplyOutcome::refused(format!(
+                            "key_grant: carrier row refused at the attestation plane ({reason:?}) \
+                             — attestation_id={attestation_id} type={attestation_type} \
+                             minter={minter}; wraps_written={}",
+                            admission.wraps_written
+                        ))
+                    }
+                }
+            }
+            Err(e) => ApplyOutcome::refused(format!(
+                "key_grant: persist refused the set ({e}) — attestation_id={attestation_id} \
+                 type={attestation_type} minter={minter}"
+            )),
+        }
+    }
+
     async fn apply_attestation(&self, bytes: &[u8], source_peer: Option<&str>) -> ApplyOutcome {
         // CIRISEdge#397 — the wire is now the BARE `Attestation` (the shape
         // persist's content-hash index/point-read serves), so deserialize that
@@ -6696,7 +6827,44 @@ impl FederationDirectoryReplicationBridge {
             .map(|attestation| SignedAttestation { attestation })
             .or_else(|_| serde_json::from_slice::<SignedAttestation>(bytes));
         match signed {
+            // CIRISPersist#848 / CIRISEdge#601 — THE ROUTE. A key-grant set is
+            // an attestation row and arrives on this cursor like any other; it
+            // must not reach the general door below, which admits the carrier
+            // and projects no wraps. Decided on `attestation_type` alone —
+            // persist's own routing key — before anything else reads the row.
+            Ok(record)
+                if self.engine.is_some()
+                    && record.attestation.attestation_type.starts_with(
+                        ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX,
+                    ) =>
+            {
+                self.apply_key_grant(record, source_peer).await
+            }
             Ok(record) => {
+                if record.attestation.attestation_type.starts_with(
+                    ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX,
+                ) {
+                    // Reached only with NO engine installed (the arm above
+                    // took every other key_grant row). Stored through the
+                    // general door rather than refused: admission is a
+                    // UNION, so once an engine exists a re-apply of the
+                    // same set projects it — nothing is lost, only late.
+                    // Refusing would drop the carrier and make the wraps
+                    // unrecoverable until the minter re-emits.
+                    tracing::error!(
+                        attestation_id = %record.attestation.attestation_id,
+                        attestation_type = %record.attestation.attestation_type,
+                        minter = %record.attestation.attesting_key_id,
+                        source_peer = source_peer.unwrap_or("<unattributed>"),
+                        "key_grant row received with NO ENGINE installed — the carrier is \
+                         stored through the general attestation door and its wraps are NOT \
+                         projected, so every member reads NotGranted with the row present. \
+                         Install `ReplicationRuntimeConfig::engine` (an \
+                         `Engine::from_shared_with_local` view over this substrate; \
+                         `PersistGroupContentStore::from_shared_hybrid` builds it) and the \
+                         next re-apply projects it (CIRISPersist#848 / CIRISEdge#601)"
+                    );
+                }
                 // Hash the BARE attestation — the value persist's content-hash
                 // index (and edge's `advertise_since`) keys on (#397), so the reason
                 // correlates with the offered `EnvelopeRef` AND a direct
