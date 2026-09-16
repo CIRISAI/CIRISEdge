@@ -249,6 +249,66 @@ pub async fn provision_from_seed(
     Ok(out)
 }
 
+/// Is `(identity_key_id, occurrence_key_id)` present on the **signed**
+/// occurrence plane — the one a peer replicates from?
+///
+/// This is the only discriminator edge has between a row published through
+/// the gated door and one written through the trusted-local door: both read
+/// back from `list_identity_occurrences_active` as a bare
+/// [`IdentityOccurrence`] with no signature, but only signed-put rows are
+/// SERVED (`list_signed_identity_occurrences_since` — "signed-put rows
+/// only"). A node whose row is absent here is invisible to every peer's
+/// `key_grant` membership fold, which is CIRISPersist#851.
+///
+/// Walks the cursor to exhaustion rather than reading one page: the plane
+/// carries every identity's occurrences on this node, and this node's own row
+/// is not necessarily in the first page. Bounded by `MAX_PAGES` so a large or
+/// adversarial plane cannot turn node start-up into an unbounded scan — the
+/// bound failing closed means "republish", which is idempotent, not harmful.
+///
+/// # Errors
+/// Directory failure.
+async fn occurrence_is_on_signed_plane<B>(
+    backend: &B,
+    identity_key_id: &str,
+    occurrence_key_id: &str,
+) -> Result<bool, String>
+where
+    B: FederationDirectory,
+{
+    const PAGE: u32 = 256;
+    const MAX_PAGES: usize = 64;
+
+    let mut cursor: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
+    for _ in 0..MAX_PAGES {
+        let page = backend
+            .list_signed_identity_occurrences_since(cursor.clone(), PAGE)
+            .await
+            .map_err(|e| format!("list the signed occurrence plane: {e}"))?;
+        if page.is_empty() {
+            return Ok(false);
+        }
+        if page.iter().any(|served| {
+            let o = &served.occurrence.identity_occurrence;
+            o.identity_key_id == identity_key_id && o.occurrence_key_id == occurrence_key_id
+        }) {
+            return Ok(true);
+        }
+        let next = page
+            .last()
+            .map(ciris_persist::federation::ServedIdentityOccurrence::resume_pair);
+        if next == cursor {
+            // The cursor stopped advancing — stop rather than spin.
+            return Ok(false);
+        }
+        cursor = next;
+        if page.len() < PAGE as usize {
+            return Ok(false);
+        }
+    }
+    Ok(false)
+}
+
 /// **The node class.** Register this engine's own signing key as a
 /// content-only occurrence of `identity_key_id`, carrying the pubkeys of the
 /// node's sealed content-KEM identity — the one pair `read_blob_as` can
@@ -273,7 +333,8 @@ pub async fn provision_from_seed(
 ///
 /// # Errors
 /// The derived id could not be computed, registration failed, the content-KEM
-/// identity could not be loaded or minted, or the directory write failed.
+/// identity could not be loaded or minted, the occurrence could not be
+/// published, or the directory write failed.
 pub async fn provision_engine_occurrence<B>(
     engine: &ciris_persist::Engine,
     backend: &B,
@@ -318,27 +379,67 @@ where
     // content-only envelope with this node's LocalSigner and admits it through
     // the GATED door, so it is born on the plane.
     //
-    // Drift is still the operator's call, so a drifted row is classified and
-    // NOT republished — publishing would overwrite the pubkeys a peer may
-    // already hold grants against. Everything else publishes, including
-    // `AlreadyCurrent`: a node upgrading from v24.1.0 has a local-door row
-    // that is invisible to the plane, and edge cannot tell one from a signed
-    // row (both read back as a bare `IdentityOccurrence`). The signed put is a
-    // last-signed-wins upsert on `(identity_key_id, occurrence_key_id)`, so
-    // republishing is what heals that row — at the cost of one signature per
-    // provision call, which happens once per node start-up.
+    // # When this republishes, and when it deliberately does not
+    //
+    // The signed put is a last-signed-wins UPSERT on `(identity_key_id,
+    // occurrence_key_id)`, and `publish_self_occurrence` builds its envelope
+    // from scratch with `valid_until: null`. So a republish is not a no-op: it
+    // overwrites whatever metadata the stored row carries. Three refusals
+    // follow from that, each for a different reason:
+    //
+    //  * DRIFTED — different pubkeys. Never touched: a peer may already hold
+    //    grants wrapped to the stored keys, and which one is authoritative is
+    //    the operator's call, not ours.
+    //  * ALREADY ON THE PLANE — a signed row is already replicable, so there
+    //    is nothing to heal and re-signing would only bump `asserted_at` and
+    //    re-advertise the row to every peer on every boot.
+    //  * CARRIES AN EXPIRY — a `valid_until` is an operator-selected lifetime.
+    //    `publish_self_occurrence` takes no expiry argument, so healing such a
+    //    row would silently extend this node's grant membership past the
+    //    moment the operator chose to end it. Refused and named instead.
+    //
+    // What remains is the case the heal exists for: a node upgrading from
+    // v24.1.0, whose local-door row is invisible to the plane. Edge cannot
+    // tell a local row from a signed one by reading it (both come back as a
+    // bare `IdentityOccurrence`), so the discriminator is the plane itself.
     let existing = backend
         .list_identity_occurrences_active(identity_key_id)
         .await
         .map_err(|e| format!("list occurrences for {identity_key_id}: {e}"))?
         .into_iter()
         .find(|o| o.occurrence_key_id == me);
-    let outcome = match existing {
+
+    let outcome = match &existing {
         Some(found) if found.encryption_pubkeys.as_ref() != Some(&enc) => Provisioned::Drifted,
         Some(_) => Provisioned::AlreadyCurrent,
         None => Provisioned::Created,
     };
-    if outcome != Provisioned::Drifted {
+
+    let publish = match &existing {
+        // Drifted: never.
+        Some(found) if found.encryption_pubkeys.as_ref() != Some(&enc) => false,
+        Some(found) => {
+            if occurrence_is_on_signed_plane(backend, identity_key_id, &me).await? {
+                false
+            } else if found.valid_until.is_some() {
+                tracing::warn!(
+                    identity = identity_key_id,
+                    occurrence = %me,
+                    valid_until = ?found.valid_until,
+                    "this node's occurrence is NOT on the signed plane (a pre-v24.2.0 \
+                     trusted-local row) but carries an expiry, and republishing would drop \
+                     it — left as it is. A far peer cannot fold this node's key_grant sets \
+                     until the row is re-issued WITH its expiry (CIRISPersist#851)"
+                );
+                false
+            } else {
+                true
+            }
+        }
+        None => true,
+    };
+
+    if publish {
         engine
             .publish_self_occurrence(identity_key_id, device_class)
             .await
@@ -358,8 +459,8 @@ where
             tracing::debug!(
                 identity = identity_key_id,
                 occurrence = %me,
-                "engine occurrence current — republished so a pre-v24.2.0 local-door row \
-                 reaches the plane (CIRISPersist#851)"
+                republished = publish,
+                "engine occurrence current"
             );
         }
         Provisioned::Drifted => tracing::warn!(

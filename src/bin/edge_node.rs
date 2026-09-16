@@ -1860,6 +1860,35 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     // admissible key_grant emitter (persist resolves the derived key to the
     // owner, a room member) AND a recipient it can decrypt for. A seed-
     // derived occurrence would be wrapped to and never opened.
+    // The ENGINE's derived key needs its own owner binding, and it is not one
+    // of the two emitted above.
+    //
+    // The engine is built over `owner_signer`, so the key it publishes its
+    // occurrence under is `derive_key_id(<owner alias>, <owner pubkey>)` —
+    // `{node_id}-owner-<fp>` — which is neither `cfg.node_id` nor
+    // `agent_key_id`. persist v44.4.0's gated occurrence door lifts a signing
+    // key to an identity only through a live owner binding naming THAT key, so
+    // without this the publish is refused and node standup aborts. Before
+    // v44.4.0 the occurrence went through the trusted-local door, which
+    // checked nothing — which is exactly why this was never needed and is
+    // needed now.
+    //
+    // Registered first: the binding's `attested_key_id` FKs onto
+    // `federation_keys`, and this is the same registration
+    // `provision_engine_occurrence` would do a moment later (it finds the key
+    // present and skips).
+    let engine_key = content_store
+        .engine()
+        .local_derived_key_id()
+        .await
+        .map_err(|e| format!("derive this engine's federation key id: {e}"))?;
+    content_store
+        .engine()
+        .register_self_federation_key("node", &engine_key, None, serde_json::json!({}), Vec::new())
+        .await
+        .map_err(|e| format!("register {engine_key} as this node's federation key: {e}"))?;
+    emit_owner_binding(&directory, &owner_key_id, &owner_signer, &engine_key).await?;
+
     let (me, _) = ciris_edge::content_occurrence::provision_engine_occurrence(
         content_store.engine(),
         &*directory,
