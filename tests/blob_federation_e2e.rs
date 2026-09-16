@@ -189,7 +189,43 @@ async fn node(idents: &[&Ident], signer: &Ident) -> Node {
         )
         .expect("rebuild the registered pqc half"),
     );
-    let identity = ciris_edge::identity::LocalSigner::new(derived.clone(), hw, Some(pqc));
+    let identity =
+        ciris_edge::identity::LocalSigner::new(derived.clone(), hw.clone(), Some(pqc.clone()));
+
+    // The OWNER BINDING, without which this node cannot publish its own
+    // occurrence (persist v44.4.0 §20.2).
+    //
+    // A roster names PERSONS; the key on the wire is this NODE's derived key.
+    // The gated occurrence door therefore asks `check_signer_acts_for`, and a
+    // node signing for a person satisfies it exactly one way: an owner-signed,
+    // replicated binding that lifts the node key to the identity. The node
+    // cannot mint this for itself — self-appointment is the thing the gate
+    // exists to refuse — so it is a PRECONDITION of provisioning, established
+    // here by the same producer `edge_node` uses in production, in the same
+    // order (bind, then provision).
+    //
+    // The binding is signed under the OWNER's key id, not the derived one: the
+    // row's `attesting_key_id` is `signer.key_id`, and persist resolves the
+    // verifying pubkeys from THAT record. Same hardware halves, different id.
+    let owner_signer = ciris_edge::identity::LocalSigner::new(
+        signer.key_id.clone(),
+        hw.clone(),
+        Some(pqc.clone()),
+    );
+    let binding = ciris_edge::replication::attestation_bind::owner_binding_attestation(
+        &signer.key_id,
+        &derived,
+        ts(),
+        &owner_signer,
+    )
+    .await
+    .expect("build this node's owner binding");
+    dir.put_attestation_authored(ciris_persist::federation::SignedAttestation {
+        attestation: binding,
+    })
+    .await
+    .expect("admit this node's owner binding");
+
     let store = PersistGroupContentStore::from_shared_hybrid(
         ciris_persist::BackendDispatch::Sqlite(dir.clone()),
         dir.clone(),
@@ -661,18 +697,67 @@ async fn federate(from: &Node, to: &Node) {
         .put_public_key(SignedKeyRecord { record: rec })
         .await
         .expect("register the far node's derived key");
-    let occ = from
+    // The owner binding crosses FIRST. §20.1: the binding is "a replicated
+    // attestation the mesh already carries", and it is what lifts the far
+    // node's key to the identity on THIS node — without it the gated door
+    // refuses the occurrence with the same `signer_acts_for` refusal a fresh
+    // node gets locally. Selected with persist's OWN predicate rather than by
+    // the producer's id format, so a reworded id cannot silently stop carrying
+    // it, and delivered on the cursor plane the mesh actually uses.
+    let rows = ciris_persist::federation::FederationDirectory::list_attestations_since(
+        &*from.dir, None, 256,
+    )
+    .await
+    .expect("list the attestation plane");
+    for row in rows {
+        let att = row.attestation;
+        if att.attested_key_id == from.me
+            && ciris_persist::federation::admission::is_owner_binding_envelope(
+                &att.attestation_envelope,
+            )
+        {
+            to.dir
+                .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+                    attestation: att,
+                })
+                .await
+                .expect("carry the far node's owner binding");
+        }
+    }
+
+    // #851 (persist v44.4.0) — the occurrence crosses on the REPLICATION
+    // PLANE, not by hand. Before v44.4.0 this had to be a
+    // `put_identity_occurrence_local` copy: a node's own occurrence was
+    // written through the trusted-local door, which stores its signature
+    // columns NULL, and the plane serves signed-put rows only — so the row
+    // key_grant admission needs on the FAR node had no replicable form and
+    // every receiving node refused every set with `signer_not_active_member`.
+    //
+    // Reading it off `list_signed_identity_occurrences_since` and admitting it
+    // through the GATED `put_identity_occurrence` is therefore the assertion,
+    // not the plumbing: it passes only because the occurrence was PUBLISHED
+    // (`Engine::publish_self_occurrence`, via `provision_engine_occurrence`).
+    // Revert edge to the local door and this line finds nothing to carry.
+    let served = from
         .dir
-        .list_identity_occurrences_active(&from.identity)
+        .list_signed_identity_occurrences_since(None, 64)
         .await
-        .expect("list")
+        .expect("list the signed occurrence plane");
+    let occ = served
         .into_iter()
-        .find(|o| o.occurrence_key_id == from.me)
-        .expect("the engine occurrence exists on its own node");
+        .map(|s| s.occurrence)
+        .find(|o| {
+            o.identity_occurrence.occurrence_key_id == from.me
+                && o.identity_occurrence.identity_key_id == from.identity
+        })
+        .expect(
+            "the engine occurrence is ON the signed plane — if this is None the node wrote it \
+             through the trusted-local door and CIRISPersist#851 is back",
+        );
     to.dir
-        .put_identity_occurrence_local(occ)
+        .put_identity_occurrence(occ)
         .await
-        .expect("carry the far node's occurrence over");
+        .expect("admit the far node's published occurrence through the gated door");
 }
 
 // ─── CIRISEdge#599 → #848: the NODE-class occurrence ──────────────────

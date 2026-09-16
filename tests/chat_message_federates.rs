@@ -1291,6 +1291,7 @@ async fn content_store_maybe_provisioned(
     // opaque "FOREIGN KEY constraint failed" from inside the door.
     let pubkey = signer.public_key().await.expect("pubkey");
     let derived = ciris_verify_core::fedcode::derive_key_id(signer.current_alias(), &pubkey);
+    let derived_for_binding = derived.clone();
     let pqc_b64 = {
         b64(&w
             .alice_node
@@ -1332,6 +1333,31 @@ async fn content_store_maybe_provisioned(
         })
         .await
         .expect("register the engine's derived signing key");
+
+    // The OWNER BINDING — alice the PERSON binds alice's NODE.
+    //
+    // persist v44.4.0 §20.2: a node publishes its own occurrence through the
+    // GATED door, and `check_signer_acts_for` lifts a node key to an identity
+    // only through a live owner-signed binding. Here the two are visibly
+    // different keys (`alice-fed` the roster member, `alice-node-<fp>` the
+    // engine), which is the production shape — a roster names persons and the
+    // key on the wire is a node — so without this the engine cannot publish,
+    // and before v44.4.0 nothing asked because the row went through the
+    // trusted-local door and never reached the plane at all.
+    let binding = ciris_edge::replication::attestation_bind::owner_binding_attestation(
+        &w.alice.key_id,
+        &derived_for_binding,
+        ts(),
+        &w.alice,
+    )
+    .await
+    .expect("build alice's owner binding for her node");
+    w.dir
+        .put_attestation_authored(ciris_persist::federation::SignedAttestation {
+            attestation: binding,
+        })
+        .await
+        .expect("admit alice's owner binding");
 
     // The DEK cascade wraps the content key to every ACTIVE OCCURRENCE of
     // every roster member — `resolve_community_members` →

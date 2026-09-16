@@ -309,17 +309,58 @@ where
         ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
     };
 
-    let outcome =
-        ensure_content_occurrence(backend, identity_key_id, &me, device_class, enc).await?;
+    // #851 / persist v44.4.0 §20.3 — the occurrence is PUBLISHED, not written
+    // through the trusted-local door. A local-door row stores its signature
+    // columns NULL and `list_signed_identity_occurrences_since` serves
+    // signed-put rows only, so the row this node needs a far peer to hold —
+    // the one `key_grant` admission folds the minter's membership over — had
+    // no replicable form at all. `publish_self_occurrence` signs the
+    // content-only envelope with this node's LocalSigner and admits it through
+    // the GATED door, so it is born on the plane.
+    //
+    // Drift is still the operator's call, so a drifted row is classified and
+    // NOT republished — publishing would overwrite the pubkeys a peer may
+    // already hold grants against. Everything else publishes, including
+    // `AlreadyCurrent`: a node upgrading from v24.1.0 has a local-door row
+    // that is invisible to the plane, and edge cannot tell one from a signed
+    // row (both read back as a bare `IdentityOccurrence`). The signed put is a
+    // last-signed-wins upsert on `(identity_key_id, occurrence_key_id)`, so
+    // republishing is what heals that row — at the cost of one signature per
+    // provision call, which happens once per node start-up.
+    let existing = backend
+        .list_identity_occurrences_active(identity_key_id)
+        .await
+        .map_err(|e| format!("list occurrences for {identity_key_id}: {e}"))?
+        .into_iter()
+        .find(|o| o.occurrence_key_id == me);
+    let outcome = match existing {
+        Some(found) if found.encryption_pubkeys.as_ref() != Some(&enc) => Provisioned::Drifted,
+        Some(_) => Provisioned::AlreadyCurrent,
+        None => Provisioned::Created,
+    };
+    if outcome != Provisioned::Drifted {
+        engine
+            .publish_self_occurrence(identity_key_id, device_class)
+            .await
+            .map_err(|e| {
+                format!("publish this node's content-only occurrence {me} (CIRISPersist#851): {e}")
+            })?;
+    }
     match &outcome {
         Provisioned::Created => tracing::info!(
             identity = identity_key_id,
             occurrence = %me,
-            "engine occurrence registered — this node emits key_grant sets as a member \
-             and decrypts the wraps addressed to it (CIRISPersist#848)"
+            "engine occurrence PUBLISHED — this node emits key_grant sets as a member, \
+             decrypts the wraps addressed to it (CIRISPersist#848), and the row now rides \
+             the signed occurrence plane so a far peer can fold it (CIRISPersist#851)"
         ),
         Provisioned::AlreadyCurrent => {
-            tracing::debug!(identity = identity_key_id, occurrence = %me, "engine occurrence current");
+            tracing::debug!(
+                identity = identity_key_id,
+                occurrence = %me,
+                "engine occurrence current — republished so a pre-v24.2.0 local-door row \
+                 reaches the plane (CIRISPersist#851)"
+            );
         }
         Provisioned::Drifted => tracing::warn!(
             identity = identity_key_id,
