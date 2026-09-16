@@ -109,12 +109,38 @@ impl PersistGroupContentStore {
         directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
         signer: &crate::identity::LocalSigner,
     ) -> Result<Self, String> {
-        // The PQC key id is the identity's own: edge registers ONE hybrid
-        // `KeyRecord` carrying both pubkeys under `key_id`, so the row a
-        // verifier resolves the ML-DSA pubkey from is the same row.
+        // The two `key_id` arguments are NOT the same identifier, and passing
+        // edge's `signer.key_id` for both is a double derivation.
+        //
+        // persist's `LocalSigner::derived_key_id()` is
+        // `derive_key_id(self.key_id, ed25519_pubkey)`, so the `key_id`
+        // argument is the keystore ALIAS — `derive_key_id`'s INPUT. Edge's
+        // `signer.key_id` is already the OUTPUT (`<alias>-<fingerprint>`), so
+        // handing it over derived a second time and produced
+        // `<alias>-<fp>-<fp>`. Meanwhile `Engine::local_derived_key_id()`
+        // resolves the composed classical signer through
+        // `federation_key_id_of` = `derive_key_id(current_alias(), pubkey)`,
+        // which is the singly-derived id every federation row is keyed by. The
+        // two disagreed on every node.
+        //
+        // Nothing compared them until persist v44.4.0: `publish_self_occurrence`
+        // (§20.3, PR #852 review round five) requires the LocalSigner to BE this
+        // node's identity, so the mismatch surfaced as a refusal to publish this
+        // node's own occurrence. It was never harmless — a LocalSigner that
+        // cannot name itself is not the claimed attester, which is the same
+        // predicate persist's claim signer uses to decide whether to attach the
+        // PQC half at all — it was only invisible, because no gate asked.
+        //
+        // Deriving through `current_alias()` makes the two agree BY
+        // CONSTRUCTION: same alias, same pubkey, same `derive_key_id`.
+        //
+        // The PQC key id is a different thing again and stays as it was: it is
+        // stored verbatim (never re-derived), and names the ONE hybrid
+        // `KeyRecord` edge registers carrying both pubkeys — the row a verifier
+        // resolves the ML-DSA pubkey from — which is keyed by the DERIVED id.
         let local = ciris_persist::signing::LocalSigner::from_hardware_parts(
             signer.classical.clone(),
-            signer.key_id.clone(),
+            ciris_keyring::HardwareSigner::current_alias(&*signer.classical).to_owned(),
             signer.pqc.clone(),
             signer.pqc.as_ref().map(|_| signer.key_id.clone()),
         )

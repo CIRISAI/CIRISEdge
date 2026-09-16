@@ -74,6 +74,7 @@ async fn store() -> PersistGroupContentStore {
     // so the row we insert is the row the FK looks for.
     let pubkey = ed.public_key().await.expect("pubkey");
     let key_id = ciris_verify_core::fedcode::derive_key_id(ALIAS, &pubkey);
+    let signing_key_id = key_id.clone();
 
     let pqc =
         ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&[9u8; 32], format!("{ALIAS}-pqc"))
@@ -128,12 +129,27 @@ async fn store() -> PersistGroupContentStore {
         .await
         .expect("register the signing key");
 
-    let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(ed);
-    PersistGroupContentStore::from_shared(
+    // HYBRID, matching the hybrid record registered above.
+    //
+    // persist v44.4.0 §20.5 removed the classical claim path outright rather
+    // than deprecating it: `put_blob*` announces a federation-tier
+    // `holds_bytes` claim, the federation tier is PQC-mandatory (CC
+    // 5.3.2.4.3.1), and a classical-only claim is refused by every peer. So an
+    // engine that cannot hybrid-sign now refuses BEFORE storing anything it
+    // means to announce, rather than storing bytes whose announcement no one
+    // will accept. This fixture already had the PQC half — it was building the
+    // record with it and then constructing a classical-only engine.
+    let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(ed);
+    let pqc_half: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(pqc);
+    let identity =
+        ciris_edge::identity::LocalSigner::new(signing_key_id, classical, Some(pqc_half));
+    PersistGroupContentStore::from_shared_hybrid(
         ciris_persist::BackendDispatch::Sqlite(backend.clone()),
         backend,
-        signer,
+        &identity,
     )
+    .await
+    .expect("hybrid content store")
 }
 
 fn instant() -> chrono::DateTime<chrono::Utc> {

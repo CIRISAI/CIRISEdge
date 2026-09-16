@@ -147,6 +147,15 @@ struct Node {
 /// Build a node whose directory knows `idents`, with the signing identity
 /// `signer` registered under the key id persist DERIVES for it.
 async fn node(idents: &[&Ident], signer: &Ident) -> Node {
+    build_node(idents, signer, true).await
+}
+
+/// [`node`], with provisioning optional — a node built with `provision:
+/// false` is a pre-v24.2.0 node before its first occurrence exists, which is
+/// the only honest way to simulate one: persist's trusted-local door carries
+/// `WHERE signature IS NULL`, so it CANNOT downgrade a row that was published,
+/// and a legacy row can only be made by never publishing in the first place.
+async fn build_node(idents: &[&Ident], signer: &Ident, provision: bool) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -189,7 +198,43 @@ async fn node(idents: &[&Ident], signer: &Ident) -> Node {
         )
         .expect("rebuild the registered pqc half"),
     );
-    let identity = ciris_edge::identity::LocalSigner::new(derived.clone(), hw, Some(pqc));
+    let identity =
+        ciris_edge::identity::LocalSigner::new(derived.clone(), hw.clone(), Some(pqc.clone()));
+
+    // The OWNER BINDING, without which this node cannot publish its own
+    // occurrence (persist v44.4.0 §20.2).
+    //
+    // A roster names PERSONS; the key on the wire is this NODE's derived key.
+    // The gated occurrence door therefore asks `check_signer_acts_for`, and a
+    // node signing for a person satisfies it exactly one way: an owner-signed,
+    // replicated binding that lifts the node key to the identity. The node
+    // cannot mint this for itself — self-appointment is the thing the gate
+    // exists to refuse — so it is a PRECONDITION of provisioning, established
+    // here by the same producer `edge_node` uses in production, in the same
+    // order (bind, then provision).
+    //
+    // The binding is signed under the OWNER's key id, not the derived one: the
+    // row's `attesting_key_id` is `signer.key_id`, and persist resolves the
+    // verifying pubkeys from THAT record. Same hardware halves, different id.
+    let owner_signer = ciris_edge::identity::LocalSigner::new(
+        signer.key_id.clone(),
+        hw.clone(),
+        Some(pqc.clone()),
+    );
+    let binding = ciris_edge::replication::attestation_bind::owner_binding_attestation(
+        &signer.key_id,
+        &derived,
+        ts(),
+        &owner_signer,
+    )
+    .await
+    .expect("build this node's owner binding");
+    dir.put_attestation_authored(ciris_persist::federation::SignedAttestation {
+        attestation: binding,
+    })
+    .await
+    .expect("admit this node's owner binding");
+
     let store = PersistGroupContentStore::from_shared_hybrid(
         ciris_persist::BackendDispatch::Sqlite(dir.clone()),
         dir.clone(),
@@ -199,14 +244,23 @@ async fn node(idents: &[&Ident], signer: &Ident) -> Node {
     .expect("hybrid content store");
     // NODE-class occurrence: the derived engine key, carrying the sealed
     // content-KEM identity's pubkeys — the pair `read_blob_as` unwraps with.
-    let (me, _) = ciris_edge::content_occurrence::provision_engine_occurrence(
-        store.engine(),
-        &*dir,
-        &signer.key_id,
-        "server",
-    )
-    .await
-    .expect("provision this node's engine occurrence");
+    let me = if provision {
+        let (me, _) = ciris_edge::content_occurrence::provision_engine_occurrence(
+            store.engine(),
+            &*dir,
+            &signer.key_id,
+            "server",
+        )
+        .await
+        .expect("provision this node's engine occurrence");
+        me
+    } else {
+        store
+            .engine()
+            .local_derived_key_id()
+            .await
+            .expect("derive this engine's federation key id")
+    };
     Node {
         dir,
         store,
@@ -661,18 +715,196 @@ async fn federate(from: &Node, to: &Node) {
         .put_public_key(SignedKeyRecord { record: rec })
         .await
         .expect("register the far node's derived key");
-    let occ = from
+    // The owner binding crosses FIRST. §20.1: the binding is "a replicated
+    // attestation the mesh already carries", and it is what lifts the far
+    // node's key to the identity on THIS node — without it the gated door
+    // refuses the occurrence with the same `signer_acts_for` refusal a fresh
+    // node gets locally. Selected with persist's OWN predicate rather than by
+    // the producer's id format, so a reworded id cannot silently stop carrying
+    // it, and delivered on the cursor plane the mesh actually uses.
+    let rows = ciris_persist::federation::FederationDirectory::list_attestations_since(
+        &*from.dir, None, 256,
+    )
+    .await
+    .expect("list the attestation plane");
+    for row in rows {
+        let att = row.attestation;
+        if att.attested_key_id == from.me
+            && ciris_persist::federation::admission::is_owner_binding_envelope(
+                &att.attestation_envelope,
+            )
+        {
+            to.dir
+                .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+                    attestation: att,
+                })
+                .await
+                .expect("carry the far node's owner binding");
+        }
+    }
+
+    // #851 (persist v44.4.0) — the occurrence crosses on the REPLICATION
+    // PLANE, not by hand. Before v44.4.0 this had to be a
+    // `put_identity_occurrence_local` copy: a node's own occurrence was
+    // written through the trusted-local door, which stores its signature
+    // columns NULL, and the plane serves signed-put rows only — so the row
+    // key_grant admission needs on the FAR node had no replicable form and
+    // every receiving node refused every set with `signer_not_active_member`.
+    //
+    // Reading it off `list_signed_identity_occurrences_since` and admitting it
+    // through the GATED `put_identity_occurrence` is therefore the assertion,
+    // not the plumbing: it passes only because the occurrence was PUBLISHED
+    // (`Engine::publish_self_occurrence`, via `provision_engine_occurrence`).
+    // Revert edge to the local door and this line finds nothing to carry.
+    let served = from
         .dir
-        .list_identity_occurrences_active(&from.identity)
+        .list_signed_identity_occurrences_since(None, 64)
+        .await
+        .expect("list the signed occurrence plane");
+    let occ = served
+        .into_iter()
+        .map(|s| s.occurrence)
+        .find(|o| {
+            o.identity_occurrence.occurrence_key_id == from.me
+                && o.identity_occurrence.identity_key_id == from.identity
+        })
+        .expect(
+            "the engine occurrence is ON the signed plane — if this is None the node wrote it \
+             through the trusted-local door and CIRISPersist#851 is back",
+        );
+    to.dir
+        .put_identity_occurrence(occ)
+        .await
+        .expect("admit the far node's published occurrence through the gated door");
+}
+
+// ─── #851 / PR #607 review: what a republish is allowed to overwrite ──
+
+/// **A heal reaches a legacy row, and stops at an operator's expiry.**
+///
+/// `publish_self_occurrence` builds its envelope from scratch with
+/// `valid_until: null`, and the signed put is a last-signed-wins UPSERT — so
+/// republishing is never a no-op. It has to be aimed at exactly the rows that
+/// need it.
+///
+/// Both legs simulate a pre-v24.2.0 node the way the substrate itself makes
+/// one: `put_identity_occurrence_local` stores the signature columns NULL, so
+/// the row drops off the signed plane while `list_identity_occurrences_active`
+/// still returns it — which is precisely the state edge cannot distinguish by
+/// reading the row, and CIRISPersist#851's whole shape.
+#[tokio::test]
+async fn a_legacy_occurrence_is_healed_onto_the_plane_but_an_expiry_is_never_dropped() {
+    use ciris_edge::content_occurrence::provision_engine_occurrence;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::{EncryptionPubkeys, FederationDirectory as _};
+
+    // The plane membership question, asked the way a peer asks it.
+    async fn on_plane(dir: &Arc<SqliteBackend>, identity: &str, occ: &str) -> bool {
+        ciris_persist::federation::FederationDirectory::list_signed_identity_occurrences_since(
+            &**dir, None, 256,
+        )
+        .await
+        .expect("list the signed plane")
+        .into_iter()
+        .any(|s| {
+            let o = &s.occurrence.identity_occurrence;
+            o.identity_key_id == identity && o.occurrence_key_id == occ
+        })
+    }
+
+    async fn enc_of(dir: &Arc<SqliteBackend>) -> EncryptionPubkeys {
+        let kem = dir
+            .load_or_init_content_kem_identity()
+            .await
+            .expect("content-KEM identity");
+        EncryptionPubkeys {
+            x25519_base64: kem.x25519_pubkey_b64,
+            ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
+        }
+    }
+
+    // Write back the SAME occurrence through the legacy door, optionally with
+    // an operator's expiry. Same pubkeys, so this is `AlreadyCurrent` — the
+    // case the heal is about, not drift.
+    async fn make_it_legacy(
+        dir: &Arc<SqliteBackend>,
+        identity: &str,
+        occ: &str,
+        valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        let enc = enc_of(dir).await;
+        dir.put_identity_occurrence_local(ciris_persist::federation::IdentityOccurrence {
+            identity_key_id: identity.to_owned(),
+            occurrence_key_id: occ.to_owned(),
+            device_class: "server".to_owned(),
+            hardware_attestation: None,
+            asserted_at: chrono::Utc::now(),
+            valid_until,
+            encryption_pubkeys: Some(enc),
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        })
+        .await
+        .expect("write the pre-v24.2.0 trusted-local row");
+    }
+
+    let alice = Ident::new("alice-fed", 0x11);
+
+    // ── (a) a legacy row with no expiry is HEALED onto the plane ──────
+    let n = build_node(&[&alice], &alice, false).await;
+    make_it_legacy(&n.dir, &alice.key_id, &n.me, None).await;
+    assert!(
+        !on_plane(&n.dir, &alice.key_id, &n.me).await,
+        "a trusted-local row is not on the plane — if this fails the simulation is \
+         wrong and the rest of this test proves nothing",
+    );
+
+    let (_, outcome) =
+        provision_engine_occurrence(n.store.engine(), &*n.dir, &alice.key_id, "server")
+            .await
+            .expect("re-provision over the legacy row");
+    assert_eq!(
+        outcome,
+        ciris_edge::content_occurrence::Provisioned::AlreadyCurrent,
+        "same pubkeys: this is a heal, not drift",
+    );
+    assert!(
+        on_plane(&n.dir, &alice.key_id, &n.me).await,
+        "an upgrading node's local-door row must be republished onto the plane, or it \
+         stays invisible to every peer's key_grant fold (CIRISPersist#851)",
+    );
+
+    // ── (b) a legacy row carrying an EXPIRY is left alone ─────────────
+    let n2 = build_node(&[&alice], &alice, false).await;
+    let expiry = chrono::Utc::now() + chrono::Duration::days(30);
+    make_it_legacy(&n2.dir, &alice.key_id, &n2.me, Some(expiry)).await;
+
+    let (_, outcome) =
+        provision_engine_occurrence(n2.store.engine(), &*n2.dir, &alice.key_id, "server")
+            .await
+            .expect("re-provision over the legacy row with an expiry");
+    assert_eq!(
+        outcome,
+        ciris_edge::content_occurrence::Provisioned::AlreadyCurrent
+    );
+    let row = n2
+        .dir
+        .list_identity_occurrences_active(&alice.key_id)
         .await
         .expect("list")
         .into_iter()
-        .find(|o| o.occurrence_key_id == from.me)
-        .expect("the engine occurrence exists on its own node");
-    to.dir
-        .put_identity_occurrence_local(occ)
-        .await
-        .expect("carry the far node's occurrence over");
+        .find(|o| o.occurrence_key_id == n2.me)
+        .expect("the occurrence is still there");
+    assert!(
+        row.valid_until.is_some(),
+        "republishing would have replaced the row with one carrying `valid_until: null`, \
+         silently extending this node's grant membership past the lifetime an operator \
+         chose. The heal must decline rather than drop it (PR #607 review)",
+    );
+    assert!(
+        !on_plane(&n2.dir, &alice.key_id, &n2.me).await,
+        "and it stays off the plane — declining is a REFUSAL to heal, not a silent heal",
+    );
 }
 
 // ─── CIRISEdge#599 → #848: the NODE-class occurrence ──────────────────
