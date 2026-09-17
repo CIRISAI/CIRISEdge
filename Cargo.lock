@@ -969,8 +969,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-crypto"
-version = "15.1.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.1.0#cbd75fed3e7513eed53a0c34a0b232a6430105ad"
+version = "15.2.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.2.0#3c7115e6782f432f9d4a03dde9bd0d93767f5923"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "24.2.0"
+version = "24.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1059,8 +1059,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-keyring"
-version = "15.1.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.1.0#cbd75fed3e7513eed53a0c34a0b232a6430105ad"
+version = "15.2.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.2.0#3c7115e6782f432f9d4a03dde9bd0d93767f5923"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1095,8 +1095,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "44.4.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v44.4.0#2136da8b49052cb37c250af07a2d54551c4f9845"
+version = "44.6.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v44.6.0#bb084188330e8f55181a0ae0470089996d5fa4ef"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1134,8 +1134,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-verify-core"
-version = "15.1.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.1.0#cbd75fed3e7513eed53a0c34a0b232a6430105ad"
+version = "15.2.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.2.0#3c7115e6782f432f9d4a03dde9bd0d93767f5923"
 dependencies = [
  "android_system_properties",
  "async-trait",
@@ -6083,7 +6083,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.5.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",

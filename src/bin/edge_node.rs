@@ -1809,15 +1809,16 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     // Nothing is seeded into a peer: a peer learns this the same way it learns
     // any other signed row, which is the point of testing discovery rather
     // than testing a fixture.
-    // Bind BOTH the node and the agent to the same human.
     //
-    // `owner_of` walks owner bindings for a node OR an agent alike, so the
-    // agent needs its own binding or `resolve(agentID)` finds no owner and the
-    // walk stops before it ever reaches a dialable node.
+    // The NODE is owner-bound. The AGENT is not — it used to be, and that was
+    // the wrong relation: CC 3.2 has a human OWN a node and STEWARD an agent.
+    // The agent's anchor is the login ceremony below (`self_at_login`), which
+    // admits it as an occurrence of the human's identity and emits the
+    // human-signed `delegates_to` that `steward_bindings_of(agent)` resolves.
+    // Nothing on the ladder resolves the agent through `owner_of`; the rung
+    // that names a row names `owner_of(peer_node)`.
     let owner_signer = Arc::new(owner.local_signer(&owner_key_id)?);
-    for subject in [&cfg.node_id, &agent_key_id] {
-        emit_owner_binding(&directory, &owner_key_id, &owner_signer, subject).await?;
-    }
+    emit_owner_binding(&directory, &owner_key_id, &owner_signer, &cfg.node_id).await?;
 
     // CIRISPersist#848 — the hybrid Engine this node seals AND projects
     // through, built ONCE and shared by the replication runtime (which routes
@@ -1897,6 +1898,92 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
     )
     .await
     .map_err(|e| format!("provision this node's engine occurrence: {e}"))?;
+
+    // ── The agent's stewardship anchor: the login ceremony ───────────
+    //
+    // persist v44.5.0/v44.6.0 (CIRISPersist#856, #857; CIRISEdge#610 item 5).
+    // On a split home the human owns the node and STEWARDS the agent, and the
+    // ceremony is what says so on the wire: `self_at_login` with the human's
+    // signer admits the agent as an occurrence of the human's identity
+    // through the GATED door (so it replicates — a local-door row never
+    // leaves this node) and emits the human-signed `delegates_to(human →
+    // agent)` that `steward_bindings_of(agent)` resolves everywhere. CC
+    // 3.4.7.3 Clause D. This is NOT a second owner-binding.
+    //
+    // The ceremony takes an app and an agent. This node's "device" is the
+    // engine occurrence `provision_engine_occurrence` just published — same
+    // key, same content-KEM pubkeys — so persist sees the same row and the
+    // drift rule is satisfied by construction. The agent carries seed-derived
+    // device-class pubkeys: it is a wrap target the harness never reads
+    // through (persist's read door unwraps only with the content-KEM
+    // identity — CIRISPersist#848), which is exactly the device-occurrence
+    // shape #856 describes and the publish arm requires. With `None` here
+    // the ceremony would write the agent through the local door and it
+    // would never reach a peer.
+    //
+    // The identity signer is a persist `LocalSigner` over the OWNER's halves,
+    // built the way `from_shared_hybrid` builds the engine's: `key_id` is the
+    // keystore ALIAS (`current_alias()`), never the derived id — passing the
+    // derived id derives twice (PR #607). Its `derived_key_id()` is therefore
+    // `me`, which is an active occurrence of the owner, so the gated door's
+    // `signer_acts_for` admits the rows it signs.
+    //
+    // Runs AFTER provisioning: the door checks the signer against the
+    // identity's ACTIVE occurrences, and `me` is one only once it exists.
+    {
+        use ciris_persist::federation::blobs::BlobStorage as _;
+        let kem = directory
+            .load_or_init_content_kem_identity()
+            .await
+            .map_err(|e| format!("content-KEM identity for the login ceremony: {e}"))?;
+        let app_enc = ciris_persist::federation::EncryptionPubkeys {
+            x25519_base64: kem.x25519_pubkey_b64,
+            ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
+        };
+        #[allow(deprecated)] // the DEVICE class is the right class for an agent
+        let agent_enc = ciris_edge::content_occurrence::enc_pubkeys_from_seed(&agent.seed)?;
+        let identity_signer = ciris_persist::signing::LocalSigner::from_hardware_parts(
+            owner_signer.classical.clone(),
+            ciris_keyring::HardwareSigner::current_alias(&*owner_signer.classical).to_owned(),
+            owner_signer.pqc.clone(),
+            owner_signer.pqc.as_ref().map(|_| owner_key_id.clone()),
+        )
+        .await
+        .map_err(|e| format!("identity signer for the login ceremony: {e}"))?;
+        let outcome = content_store
+            .engine()
+            .self_at_login(ciris_persist::engine::SelfAtLoginInput {
+                identity_key_id: owner_key_id.clone(),
+                identity_signer: Some(Arc::new(identity_signer)),
+                app: ciris_persist::engine::SelfAtLoginOccurrence {
+                    occurrence_key_id: me.clone(),
+                    device_class: ciris_persist::federation::types::device_class::SERVER.to_owned(),
+                    hardware_attestation: None,
+                    encryption_pubkeys: Some(app_enc),
+                    transport_destinations: Vec::new(),
+                },
+                agent: ciris_persist::engine::SelfAtLoginOccurrence {
+                    occurrence_key_id: agent_key_id.clone(),
+                    device_class: ciris_persist::federation::types::device_class::AGENT.to_owned(),
+                    hardware_attestation: None,
+                    encryption_pubkeys: Some(agent_enc),
+                    transport_destinations: Vec::new(),
+                },
+                bilateral_pair_id: uuid::Uuid::new_v4().to_string(),
+                delegation_scope: None,
+            })
+            .await
+            .map_err(|e| format!("login ceremony (agent stewardship anchor): {e}"))?;
+        tracing::info!(
+            human = %owner_key_id,
+            agent = %agent_key_id,
+            app = %me,
+            ?outcome,
+            "login ceremony complete — the agent is an occurrence of its human and the \
+             human-signed delegation is its stewardship anchor (CC 3.4.7.3 Clause D; \
+             CIRISPersist#856/#857)"
+        );
+    }
 
     let roster = read_roster(&cfg.mesh_dir);
 

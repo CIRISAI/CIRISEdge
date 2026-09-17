@@ -206,7 +206,7 @@ mod replication_policy_hash_tests {
 // ceremony trust root confers (#665). Edge's consent handling is UNCHANGED (no
 // consent test regressed), so this is a clean witness re-pin (CIRISEdge#397 §5).
 pub const PERSIST_CONSENT_GRAMMAR_HASH: &str =
-    "79c74e4d4d04aeb624a7139d705d4882c25f32f6654e5bf017e2f5b99eec38ac";
+    "ed2b0f2c8b5d3fc54450c180abce14f3d619074c24d5b8669663ff048d8bc482";
 
 #[cfg(test)]
 mod consent_grammar_hash_tests {

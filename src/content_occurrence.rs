@@ -393,10 +393,12 @@ where
     //  * ALREADY ON THE PLANE — a signed row is already replicable, so there
     //    is nothing to heal and re-signing would only bump `asserted_at` and
     //    re-advertise the row to every peer on every boot.
-    //  * CARRIES AN EXPIRY — a `valid_until` is an operator-selected lifetime.
-    //    `publish_self_occurrence` takes no expiry argument, so healing such a
-    //    row would silently extend this node's grant membership past the
-    //    moment the operator chose to end it. Refused and named instead.
+    //  * CARRIES AN EXPIRY — a `valid_until` is an operator-selected lifetime,
+    //    and a republish that dropped it would silently extend this node's
+    //    grant membership past the moment the operator chose to end it. Since
+    //    persist v44.5.0 (CIRISPersist#855) the publish door takes the expiry,
+    //    so the row is re-issued WITH it — the heal reaches these rows now,
+    //    and the refusal this arm used to be is gone.
     //
     // What remains is the case the heal exists for: a node upgrading from
     // v24.1.0, whose local-door row is invisible to the plane. Edge cannot
@@ -415,33 +417,27 @@ where
         None => Provisioned::Created,
     };
 
-    let publish = match &existing {
+    // `Some(expiry)` = publish, carrying the stored row's expiry (`None` for a
+    // fresh row, or a legacy row that never had one). `None` = do not publish.
+    let publish: Option<Option<chrono::DateTime<chrono::Utc>>> = match &existing {
         // Drifted: never.
-        Some(found) if found.encryption_pubkeys.as_ref() != Some(&enc) => false,
+        Some(found) if found.encryption_pubkeys.as_ref() != Some(&enc) => None,
         Some(found) => {
             if occurrence_is_on_signed_plane(backend, identity_key_id, &me).await? {
-                false
-            } else if found.valid_until.is_some() {
-                tracing::warn!(
-                    identity = identity_key_id,
-                    occurrence = %me,
-                    valid_until = ?found.valid_until,
-                    "this node's occurrence is NOT on the signed plane (a pre-v24.2.0 \
-                     trusted-local row) but carries an expiry, and republishing would drop \
-                     it — left as it is. A far peer cannot fold this node's key_grant sets \
-                     until the row is re-issued WITH its expiry (CIRISPersist#851)"
-                );
-                false
+                None
             } else {
-                true
+                // The heal. The upsert is last-signed-wins on `valid_until` too
+                // (`excluded.valid_until`), so what the row carries is what
+                // must be passed — a `None` here would drop it.
+                Some(found.valid_until)
             }
         }
-        None => true,
+        None => Some(None),
     };
 
-    if publish {
+    if let Some(valid_until) = publish {
         engine
-            .publish_self_occurrence(identity_key_id, device_class)
+            .publish_self_occurrence(identity_key_id, device_class, valid_until)
             .await
             .map_err(|e| {
                 format!("publish this node's content-only occurrence {me} (CIRISPersist#851): {e}")
@@ -459,7 +455,7 @@ where
             tracing::debug!(
                 identity = identity_key_id,
                 occurrence = %me,
-                republished = publish,
+                republished = publish.is_some(),
                 "engine occurrence current"
             );
         }

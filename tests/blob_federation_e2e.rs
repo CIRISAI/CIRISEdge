@@ -780,12 +780,16 @@ async fn federate(from: &Node, to: &Node) {
 
 // ─── #851 / PR #607 review: what a republish is allowed to overwrite ──
 
-/// **A heal reaches a legacy row, and stops at an operator's expiry.**
+/// **A heal reaches a legacy row, and carries an operator's expiry with it.**
 ///
-/// `publish_self_occurrence` builds its envelope from scratch with
-/// `valid_until: null`, and the signed put is a last-signed-wins UPSERT — so
-/// republishing is never a no-op. It has to be aimed at exactly the rows that
-/// need it.
+/// The signed put is a last-signed-wins UPSERT on `valid_until` too, so a
+/// republish is never a no-op: whatever the heal passes is what the row ends
+/// up with. Before persist v44.5.0 the publish door took no expiry and the
+/// heal had to REFUSE an expiring row rather than drop it (PR #607 review);
+/// since CIRISPersist#855 it passes the stored expiry through, so the row
+/// reaches the plane AND keeps the lifetime the operator chose. Leg (b) pins
+/// both halves — a heal that dropped the expiry, or a refusal that left the
+/// row off the plane, each fail one assertion.
 ///
 /// Both legs simulate a pre-v24.2.0 node the way the substrate itself makes
 /// one: `put_identity_occurrence_local` stores the signature columns NULL, so
@@ -793,7 +797,7 @@ async fn federate(from: &Node, to: &Node) {
 /// still returns it — which is precisely the state edge cannot distinguish by
 /// reading the row, and CIRISPersist#851's whole shape.
 #[tokio::test]
-async fn a_legacy_occurrence_is_healed_onto_the_plane_but_an_expiry_is_never_dropped() {
+async fn a_legacy_occurrence_is_healed_onto_the_plane_and_keeps_its_expiry() {
     use ciris_edge::content_occurrence::provision_engine_occurrence;
     use ciris_persist::federation::blobs::BlobStorage as _;
     use ciris_persist::federation::{EncryptionPubkeys, FederationDirectory as _};
@@ -874,7 +878,7 @@ async fn a_legacy_occurrence_is_healed_onto_the_plane_but_an_expiry_is_never_dro
          stays invisible to every peer's key_grant fold (CIRISPersist#851)",
     );
 
-    // ── (b) a legacy row carrying an EXPIRY is left alone ─────────────
+    // ── (b) a legacy row carrying an EXPIRY is healed WITH it ─────────
     let n2 = build_node(&[&alice], &alice, false).await;
     let expiry = chrono::Utc::now() + chrono::Duration::days(30);
     make_it_legacy(&n2.dir, &alice.key_id, &n2.me, Some(expiry)).await;
@@ -895,15 +899,17 @@ async fn a_legacy_occurrence_is_healed_onto_the_plane_but_an_expiry_is_never_dro
         .into_iter()
         .find(|o| o.occurrence_key_id == n2.me)
         .expect("the occurrence is still there");
-    assert!(
-        row.valid_until.is_some(),
-        "republishing would have replaced the row with one carrying `valid_until: null`, \
-         silently extending this node's grant membership past the lifetime an operator \
-         chose. The heal must decline rather than drop it (PR #607 review)",
+    assert_eq!(
+        row.valid_until.map(|t| t.timestamp_millis()),
+        Some(expiry.timestamp_millis()),
+        "the heal must carry the stored expiry through `publish_self_occurrence` — a `None` \
+         there is an upsert to `valid_until: null`, silently extending this node's grant \
+         membership past the lifetime an operator chose (PR #607 review, CIRISPersist#855)",
     );
     assert!(
-        !on_plane(&n2.dir, &alice.key_id, &n2.me).await,
-        "and it stays off the plane — declining is a REFUSAL to heal, not a silent heal",
+        on_plane(&n2.dir, &alice.key_id, &n2.me).await,
+        "and it IS on the plane now — with the door taking the expiry there is nothing left \
+         to refuse over, and a row left off the plane is #851 again",
     );
 }
 
