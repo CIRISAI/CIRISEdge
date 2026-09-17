@@ -298,8 +298,10 @@ only row a peer ever receives, since a `self` row is structurally
 undiscoverable (CC 5.2) — asserted its *placement* time and the claim's own
 instant was unrecoverable off-node. It is now carried verbatim off the prior,
 and the placement records its own signed `widened_at`. Callers pass ONE `now`
-to `build_widening` and `stamp_and_canonicalize`. Edge's chat seal binds the
-claim instant because of this guarantee (`chat::RoomKey::body_key`).
+to `build_widening` and `stamp_and_canonicalize`. Edge's chat AAD binds the
+claim instant because of this guarantee (`chat::chat_message_attestation`'s
+AAD over the signed `asserted_at`; the pre-v24 `RoomKey::body_key` seal did
+the same and is retired, CIRISEdge#604).
 
 `share` is `share_plan` → `enter_mesh` → `widen_audience`, and passes the
 **actor's** signer (`Signers.actor`) alongside the node's. Who signs is

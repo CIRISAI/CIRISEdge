@@ -11,15 +11,11 @@
 //! survives the crossing — the node only ever co-scrubs — because a share is
 //! two operations (`enter_mesh` over the same bytes, then a `supersedes` the
 //! actor signs at the wider audience). And the seal: community tier is
-//! encrypted, so the body on the wire is ciphertext under the room's MLS
-//! record secret, and the MLS handshake that produces that secret rides the
-//! room as ordinary rows.
+//! encrypted, so the body on the wire is a pointer to a blob sealed under
+//! persist's community DEK, wrapped per member occurrence — one key layer,
+//! the substrate's (CIRISEdge#604 retired chat's own MLS group).
 
-use ciris_edge::chat::{self, Body, PairRole, RoomKey};
-use ciris_edge::mls::cohort_group::{
-    key_package_from_bytes, key_package_to_bytes, mint_cohort_key_material,
-};
-use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
+use ciris_edge::chat::{self, Body};
 use ciris_edge::replication::attestation_bind::{
     custody_for, describe_crossing, keep_local, publish, share, share_encrypted_privately,
     share_plan, Audience, ClearCohort, CrossingBasis, Custody, DataSubject, EncryptedCohort,
@@ -27,7 +23,6 @@ use ciris_edge::replication::attestation_bind::{
     TierPromotionCustody, With,
 };
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
-use ciris_persist::encrypted_kv::XChaChaKvStore;
 use ciris_persist::federation::{FederationDirectory, SignedAttestation, SignedKeyRecord};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord};
 use ciris_persist::store::sqlite::SqliteBackend;
@@ -56,12 +51,6 @@ fn signer(key_id: &str, seed: u8) -> ciris_edge::identity::LocalSigner {
             .unwrap(),
     );
     ciris_edge::identity::LocalSigner::new(key_id, classical, Some(pqc))
-}
-
-fn store(seed: &str) -> ScopeStateProvider {
-    ScopeStateProvider::new(Arc::new(
-        XChaChaKvStore::open_in_memory(seed.as_bytes()).unwrap(),
-    ))
 }
 
 async fn record(
@@ -219,15 +208,13 @@ fn is_canonical_instant(s: &str) -> bool {
 }
 
 /// **The room is derived, order-free.** Both ends compute the same id from
-/// public inputs, having exchanged nothing — and the same ROLE.
+/// public inputs, having exchanged nothing.
 #[test]
-fn both_ends_derive_the_same_room_and_opposite_roles() {
+fn both_ends_derive_the_same_room() {
     let a = chat::pair_community_key_id("alice-fed", "bob-fed");
     let b = chat::pair_community_key_id("bob-fed", "alice-fed");
     assert_eq!(a, b, "the room id must not depend on who asks");
     assert!(a.starts_with(chat::PAIR_COMMUNITY_PREFIX));
-    assert_eq!(PairRole::of("alice-fed", "bob-fed"), PairRole::Creator);
-    assert_eq!(PairRole::of("bob-fed", "alice-fed"), PairRole::Joiner);
 }
 
 /// **The author signs at write (full hybrid), the body is SEALED, the row is
@@ -410,99 +397,6 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
     // the row (CIRISEdge#586 §7).
 }
 
-/// **The MLS handshake rides the room.** Bob's KeyPackage and Alice's
-/// Welcome are ordinary community-scoped rows each of them signs; read back
-/// through the room, the far end joins and both hold the same key.
-#[tokio::test]
-async fn the_mls_handshake_rides_the_room_as_signed_rows() {
-    let w = world().await;
-    let room = w.room.clone();
-
-    // Bob (the joiner) mints and shares his KeyPackage.
-    let (material, kp) = mint_cohort_key_material("bob-fed").unwrap();
-    let kp_bytes = key_package_to_bytes(kp).unwrap();
-    let kp_row = chat::key_package_attestation(&w.bob, "alice-fed", &kp_bytes, ts())
-        .await
-        .unwrap();
-    assert_eq!(kp_row.attesting_key_id, "bob-fed");
-    assert!(kp_row.scrub_signature_pqc.is_some(), "full hybrid");
-    w.dir
-        .put_attestation(SignedAttestation {
-            attestation: kp_row.clone(),
-        })
-        .await
-        .unwrap();
-    let placed = share(
-        &*w.dir,
-        &kp_row,
-        w.room_with(),
-        CrossingBasis::ProducerAuthority,
-        w.bobs_signers(),
-    )
-    .await
-    .unwrap();
-    assert!(matches!(placed.shared, Shared::Placed { .. }), "{placed:?}");
-
-    // Alice (the creator) reads it off the room, admits Bob, shares the Welcome.
-    let got = chat::key_package_from(&*w.dir, "bob-fed", &room)
-        .await
-        .unwrap()
-        .expect("the KeyPackage row is in the room");
-    assert_eq!(got, kp_bytes, "byte-exact through the row");
-    let a = CohortGroup::create(store("alice-wire"), &room, "alice-fed", 16)
-        .await
-        .unwrap();
-    let commit = a
-        .add_member("bob-fed", key_package_from_bytes(&got).unwrap())
-        .await
-        .unwrap();
-    let welcome = commit.welcome().unwrap().to_vec();
-    let w_row = chat::welcome_attestation(&w.alice, "bob-fed", &welcome, commit.epoch(), ts())
-        .await
-        .unwrap();
-    w.dir
-        .put_attestation(SignedAttestation {
-            attestation: w_row.clone(),
-        })
-        .await
-        .unwrap();
-    share(
-        &*w.dir,
-        &w_row,
-        w.room_with(),
-        CrossingBasis::ProducerAuthority,
-        w.signers(),
-    )
-    .await
-    .unwrap();
-
-    // Bob reads the Welcome off the room and joins.
-    let (got_welcome, epoch) = chat::welcome_from(&*w.dir, "alice-fed", &room)
-        .await
-        .unwrap()
-        .expect("the Welcome row is in the room");
-    assert_eq!(got_welcome, welcome);
-    assert_eq!(epoch, commit.epoch());
-    let b = CohortGroup::join(store("bob-wire"), &room, material, &got_welcome, 16)
-        .await
-        .unwrap();
-
-    // Both sides now hold the room's record secret at the same epoch.
-    //
-    // The old assertion here was "what Alice seals, Bob opens", through the
-    // inline body seal. That seal is gone (CIRISEdge#586) — content lives in
-    // the group's blob store and its binding is the AAD, exercised by
-    // `a_pointer_copied_onto_another_authors_row_does_not_open` with a
-    // positive control. What this test still proves, and is the only test
-    // that does, is that the HANDSHAKE converges: both ends derived the same
-    // group at the same epoch.
-    assert_eq!(
-        RoomKey::of(&a).await.unwrap().epoch(),
-        RoomKey::of(&b).await.unwrap().epoch(),
-        "both ends must land on the same MLS epoch",
-    );
-}
-
 /// **A widening carries the CLAIM's instant** (persist v40.0.0 /
 /// CIRISPersist#801) — the guarantee the seal now rests on. The widened row
 /// is the only one a peer receives, so if its `asserted_at` were the
@@ -682,16 +576,11 @@ fn the_default_grant_covers_the_chat_namespace() {
             .contains(&chat::CHAT_ATTESTATION_PREFIX),
         "a grant that does not cover `chat:` silently withholds every message"
     );
-    for d in [
-        chat::CHAT_MESSAGE_DIMENSION,
-        chat::KEY_PACKAGE_DIMENSION,
-        chat::WELCOME_DIMENSION,
-    ] {
-        assert!(
-            d.starts_with(chat::CHAT_ATTESTATION_PREFIX),
-            "{d} rides the same grant"
-        );
-    }
+    assert!(
+        chat::CHAT_MESSAGE_DIMENSION.starts_with(chat::CHAT_ATTESTATION_PREFIX),
+        "{} rides the same grant",
+        chat::CHAT_MESSAGE_DIMENSION
+    );
 }
 
 /// **The encrypted/clear split is persist's, not ours.**

@@ -387,8 +387,19 @@ and read what you need afterwards.
 ## 6d. The two-person chat, rung by rung
 
 `tests/chat_two_person_community.rs` walks the whole flow on real substrate —
-real hybrid signatures, a real persist directory, real MLS. It is the reference
-to copy; every call below is exercised there.
+real hybrid signatures, a real persist directory, persist's own admission as
+the oracle. It is the reference to copy; every call below is exercised there.
+
+> **v24.4.0 (CIRISEdge#604): the per-room MLS handshake is retired.** There
+> is no KeyPackage/Welcome exchange and no `RoomKey` any more. The room is the
+> `Community` record; the key is persist's community DEK, wrapped per member
+> occurrence when a body is sealed. A server that still runs
+> `chat::key_package_attestation` / `welcome_attestation` / `RoomKey::of` as a
+> send-readiness gate is gating on a key that keys nothing — the surface is
+> `#[deprecated]` for one release and deleted the next. Delete the handshake
+> state machine and send when the room record and the peer's occurrence
+> exist; a body no member can open is refused at the door
+> (`SealedContent::readable_by_nobody`), which is the readiness signal.
 
 | your UI | the call | who owns it |
 |---|---|---|
@@ -397,10 +408,10 @@ to copy; every call below is exercised there.
 | "Send request to join chat community" | your `POST /v1/contacts` | **server** |
 | "Request received from X" + optional note | your transport of choice; edge carries the bytes | **server** |
 | accept → consent | your consent grant | **server** |
-| "Joined community with X" | `chat::signed_pair_community` (the room record, both people `founder`s) then the MLS handshake OVER THE ROOM: joiner `key_package_attestation` → creator `CohortGroup::create` + `add_member` + `welcome_attestation` → joiner `CohortGroup::join`; roles from `chat::PairRole::of` | edge |
-| "Chat with Y" | `contact::the_other_member(&group.member_key_ids().await, own_key_id)` | edge |
-| send a message | `chat::RoomKey::of(&group)` then `chat::chat_message_attestation(&author, &peer, body, now, &key)` — the body SEALED under the room's record secret — stored, then `share(.., With::Community { room }, ProducerAuthority, Signers { node, actor: Some(&author) })` | edge |
-| read the room | `chat::messages_in_room(&*dir, &[peer_fed_id], &room, &key)` — opened; a row that will not open is `Body::Unopened { reason }` | edge |
+| "Joined community with X" | `chat::signed_pair_community` (the room record, both people `founder`s), `put_community` on your directory. That is the whole of it — the room is derived from the two fed-IDs, so both ends author the same record having exchanged nothing; the second put is a `Conflict`, which is the same room | edge |
+| "Chat with Y" | `contact::the_other_member(&members, own_key_id)` over the record's member key ids | edge |
+| send a message | `chat::chat_message_attestation(&author, &peer, body, now, &store)` — the body goes to the room's blob store under persist's community DEK, the row carries the pointer; the returned `SealedContent` says who can open it, and a body nobody can open is REFUSED before it is sent | edge |
+| read the room | `chat::messages_in_room(&*dir, &[peer_fed_id], &room, &store, viewer_occurrence_key)` — opened through the viewer's occurrence wrap; a row that will not open is `Body::Unopened { reason }` | edge |
 
 Four things worth knowing before you build on it:
 
@@ -408,39 +419,41 @@ Four things worth knowing before you build on it:
    and cannot be a contact, so pasting either into one search box is correct and
    supported — `resolve` walks a node to its owner. Do not create two contact
    entries for one human.
-2. **The invitee is a moderator, not a guest.** MLS has no owner role: whoever
-   was invited can change membership, and the founder applies their commit like
-   anyone else's. If your UI implies the creator is privileged, it is describing
-   a rule the substrate does not enforce.
+2. **The invitee is a moderator, not a guest.** Both members of a pair room
+   are `founder`s in the record and the protocol is `unanimous`: persist
+   refuses to federate a room with no live named moderator (CC 4.5.4), and a
+   founder is one. If your UI implies the creator is privileged, it is
+   describing a rule the substrate does not enforce.
 3. **"Chat with Y" is derived, never stored.** `the_other_member` returns `None`
    unless the room is exactly two people *and* you are one of them — so a group
    chat cannot silently render under one participant's name. Decide what an
    unnamed room shows; do not unwrap.
-4. **The conversation key moves when membership does.** `record_secret()` (and
-   `RoomKey::of`) changes on every membership commit, which is what stops a
-   removed member from reading on. Re-derive after applying a commit rather
-   than caching it; a message sealed at an older epoch reports
-   `Body::Unopened { reason: ".. the room rotated" }` rather than opening.
+4. **The key moves when membership does — and persist moves it.** A
+   community-membership revocation admitted at persist rotates the DEK epoch
+   (CIRISPersist#848 §15); the removed member's occurrence gets no wrap in the
+   next seal and reads later messages as `Body::Unopened`, while earlier
+   ones still open. Rotation is not recall (CC 4.5.12.1 Option A). Nothing to
+   cache or re-derive on your side: the viewer's occurrence is the key.
 5. **Community tier is encrypted, always.** There is no plaintext producer:
-   `chat_message_attestation` takes the `RoomKey`, the wire carries ciphertext
-   plus a `sealed { alg, epoch, nonce }` header, and the seal is keyed through
-   HKDF over the room, the author and the epoch — a ciphertext moved to
-   another author's row or another room does not open. The MLS handshake that
-   makes the key is two ordinary rows in the room (`chat:key_package:v1`,
-   `chat:welcome:v1`), each signed by the person with the FULL hybrid key
-   (there is no classical-only fallback anywhere in edge from v19.0.0), and
-   served by the audience gate to exactly the other member's nodes. Both
-   humans are `founder`s of the pair room, so it federates (§11.11) without
-   anyone appointing anyone.
+   `chat_message_attestation` writes the body to the room's encrypted blob
+   store and puts only a `BlobPointer` on the row. The DEK is wrapped per
+   active identity occurrence of each roster member (X25519 + ML-KEM-768),
+   and the AAD binds the domain, author, signed instant and field — a
+   ciphertext moved to another author's row or another room does not open.
+   Every row is signed by the person with the FULL hybrid key (there is no
+   classical-only fallback anywhere in edge from v19.0.0). Both humans are
+   `founder`s of the pair room, so it federates (§11.11) without anyone
+   appointing anyone.
 
 Every rung above is proven over the real mesh, not just in unit tests:
 `bench-mesh`'s `ladder.discover_by_fedid` resolves a PEER's owner from a
 binding it learned over the Attestation plane, having seeded nothing;
-`ladder.open_chat` runs the MLS handshake over the room between two nodes
-through a relay; `ladder.send_message` seals on one side and OPENS on the
-other, and fails the leg on a leaked `self` copy or any chat row carrying the
-plaintext. `tests/chat_message_federates.rs` is the second reference: the same
-rows on real sqlite, including the handshake rows read back through the room.
+`ladder.open_chat` authors the room record on both nodes through a relay;
+`ladder.send_message` seals on one side and OPENS on the other through the
+reader's occurrence wrap, and fails the leg on a leaked `self` copy or any
+chat row carrying the plaintext. `tests/chat_message_federates.rs` is the
+second reference: the same rows on real sqlite, sealed and opened across two
+stores.
 
 ---
 

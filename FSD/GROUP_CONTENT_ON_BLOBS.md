@@ -35,15 +35,28 @@ policy layered on top, and is explicitly *not* fixed here.
 
 ---
 
-## 2. What this replaces, and why
+## 2. What this replaced, and why — DONE (v24.0.0 the seal, v24.4.0 the group)
 
-Chat today seals its own bodies: `body_key` is HKDF from a `RoomKey`, the
-ciphertext goes in `FIELD_BODY`, and a `FIELD_SEALED` header says how it
-opens. That was correct when it shipped (v19.0.0) — persist had no encrypted
+Chat used to seal its own bodies: `body_key` was HKDF from a `RoomKey`, the
+ciphertext went in `FIELD_BODY`, and a `FIELD_SEALED` header said how it
+opened. That was correct when it shipped (v19.0.0) — persist had no encrypted
 blob tier, and a room needed confidentiality that the substrate could not
 give it.
 
-Three things have changed:
+**Status.** The seal moved to the blob store in v24.0.0 (#586/#596). The
+room's own MLS group — the two-row handshake (`chat:key_package:v1`,
+`chat:welcome:v1`) that minted the `RoomKey` — was retired in v24.4.0
+(#604): after v24.0.0 it keyed nothing, and edge's harness ran it only to
+report an epoch. Its public surface (`RoomKey`, `PairRole`,
+`key_package_attestation`, `welcome_attestation`, the two readers and the two
+dimensions) is `#[deprecated]` for one release because CIRISServer still
+drives it as a send-readiness gate (`contacts_chat.rs::room_key`), and is
+deleted the release after. `src/mls/` itself stays: it is the A/V realtime
+plane's group (`realtime_av_mls`) and the exporter behind scope-native
+addressing (`cohort_addressing`, #499) — neither is chat, and neither is
+this design's concern.
+
+Three things had changed:
 
 - **persist v43 gave content a cohort-keyed DEK cascade**, so encrypted
   storage is a substrate property rather than an application one.
@@ -59,6 +72,22 @@ under a key persist cannot derive is content persist cannot **recall** — an
 epoch destroy sweeps the DEK, and bytes sealed outside that cascade survive
 it. A right-to-be-forgotten guarantee that a layer above can silently opt out
 of is not a guarantee.
+
+### 2.1 Which layer answers CC 5.1 for chat
+
+CC 5.1 says rekey "conforms to MLS TreeKEM (RFC 9420, normative)", and #604
+asked which of edge's two key layers that sentence was about. With the
+room's MLS group retired there is one: **persist's community-DEK cascade is
+the key-agreement layer for chat content**, and its relationship to CC 5.1 is
+settled on CIRISPersist#848, not here — a flat per-member re-wrap rather than
+a ratchet tree, membership driven by the roster rather than by commits,
+concurrent removals resolved by convergent merge (earliest `claimed_at`,
+lowest key id) rather than by a delivery service, and forward secrecy on
+this axis provided by rotation (CC 4.5.12.1 Option A), never by recall
+(§10.6). Edge does not claim CC 5.1 conformance for chat on its own account:
+it seals through persist's doors and inherits whatever #848 establishes. The
+MLS that remains in edge (`src/mls/`) answers CC 5.1 for the A/V session
+plane, which is a different content class with a different design.
 
 ---
 
