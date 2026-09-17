@@ -5695,7 +5695,23 @@ impl FederationDirectoryReplicationBridge {
                 }
             }
         }
-        let peers = match self.directory.list_consent_peers(local).await {
+        // CIRISEdge#609 / CIRISPersist#857 (v44.6.0) — consent is authored by
+        // the HUMAN, for THIS machine. A node key holds topology, not consent:
+        // the owner's opt-in is the owner's act, so the grant row is keyed by
+        // the owner's fedID and `list_consent_peers(local)` returns nothing
+        // for it. `consent_peers_by_principals(local)` is persist's one
+        // definition of the send set: `local`'s own machine-authored grants ∪
+        // every steward's grants whose `for_key_id == local`. A steward's
+        // grant for a sibling agent contributes nothing, and there is no
+        // blanket form — the human names the machine. The pre-#609
+        // machine-authored rows keep working through the first half of the
+        // union until the server's migration re-signs them.
+        let peers = match ciris_persist::federation::consent_by_humans::consent_peers_by_principals(
+            &*self.directory,
+            local,
+        )
+        .await
+        {
             Ok(peers) => peers,
             Err(e) => {
                 tracing::debug!(error = %e, "consent send-set read failed (fail-closed)");
