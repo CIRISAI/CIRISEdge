@@ -1704,3 +1704,453 @@ async fn the_same_message_sends_once_the_occurrences_are_provisioned() {
         "and the grant set must be non-empty: {sealed:?}",
     );
 }
+
+// ─── CIRISEdge#608 — N-member rooms ──────────────────────────────────────
+
+/// **The pair record is byte-identical over the general builder.**
+///
+/// Every pair room on the mesh is a DERIVED id whose far end re-derives the
+/// same bytes independently; a changed byte in `pair_community` is a
+/// `CommunityRosterFork` on every one of them. So the record the general
+/// builder now produces for a pair is pinned against the shape the pair
+/// builder produced before the general one existed — hand-built here, the
+/// way it was written then.
+#[test]
+fn the_pair_room_is_byte_identical_over_the_general_builder() {
+    use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
+    use ciris_persist::federation::types::{consensus_protocol, Community, CommunityMember};
+
+    let (a, b) = ("zed-fed", "amy-fed"); // deliberately unsorted input
+    let mut members = [a, b];
+    members.sort_unstable();
+    let before = Community {
+        community_key_id: chat::pair_community_key_id(a, b),
+        community_name: format!("{} <-> {}", members[0], members[1]),
+        members: members
+            .iter()
+            .map(|k| CommunityMember {
+                key_id: (*k).to_owned(),
+                joined_at: ts(),
+                role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
+            })
+            .collect(),
+        founded_at: ts(),
+        consensus_protocol: consensus_protocol::UNANIMOUS.to_owned(),
+        policy_blob: None,
+        persist_row_hash: String::new(),
+    };
+    let after = chat::pair_community(a, b, ts());
+    assert_eq!(after, before, "the typed record must not have moved");
+    let canon = |c: &Community| {
+        ciris_persist::prelude::ceg_produce_canonicalize(&c.signing_envelope()).unwrap()
+    };
+    assert_eq!(
+        canon(&after),
+        canon(&before),
+        "the SIGNED bytes must not have moved — this is what the far end re-derives",
+    );
+    // And the general builder refuses what the pair shape rules out.
+    assert!(
+        chat::community(
+            "chat:room:v1:x",
+            "no founder",
+            &[("a", None)],
+            "founder_only",
+            ts()
+        )
+        .is_err(),
+        "a roster with no founder has no authority root (CC 4.5.4)",
+    );
+    assert!(chat::community("chat:room:v1:x", "empty", &[], "founder_only", ts()).is_err(),);
+    assert!(chat::community(
+        "chat:room:v1:x",
+        "dup",
+        &[("a", Some(MEMBER_ROLE_FOUNDER)), ("a", None)],
+        "founder_only",
+        ts()
+    )
+    .is_err());
+    assert!(chat::new_room_community_key_id().starts_with(chat::ROOM_COMMUNITY_PREFIX));
+    assert_ne!(
+        chat::new_room_community_key_id(),
+        chat::new_room_community_key_id(),
+        "an allocated id is fresh each time",
+    );
+}
+
+/// One member's node in the three-node witness: its own substrate, its own
+/// hybrid engine, its own PUBLISHED, owner-bound engine occurrence. Nothing
+/// is shared with any other peer except what the test carries over.
+struct Peer {
+    dir: Arc<SqliteBackend>,
+    store: ciris_edge::group_content::PersistGroupContentStore,
+    /// The engine's derived key — this node's occurrence of its human, and
+    /// the viewer key for every read here.
+    me: String,
+}
+
+/// The same order `node()` in `blob_federation_e2e` uses, because the order
+/// is load-bearing: register the derived key → owner binding → hybrid store
+/// → publish the occurrence (the gated door checks the signer against the
+/// identity's ACTIVE occurrences and its live owner binding).
+async fn peer(humans: &[&ciris_edge::identity::LocalSigner], mine: (&str, u8)) -> Peer {
+    let (human_id, seed) = mine;
+    let dir = FederationDirectorySqlite::open(":memory:").await.unwrap();
+    dir.run_migrations().await.unwrap();
+    for h in humans {
+        dir.put_public_key(SignedKeyRecord {
+            record: record(&h.key_id, h, h, "user").await,
+        })
+        .await
+        .expect("register a human");
+    }
+    let human = signer(human_id, seed);
+    let ed_pub = human.classical.public_key().await.unwrap();
+    let derived = ciris_verify_core::fedcode::derive_key_id(human_id, &ed_pub);
+    let mut rec = record(&derived, &human, &human, "node").await;
+    rec.identity_ref = derived.clone();
+    dir.put_public_key(SignedKeyRecord { record: rec })
+        .await
+        .expect("register the engine's derived key");
+
+    let identity = ciris_edge::identity::LocalSigner::new(
+        derived.clone(),
+        human.classical.clone(),
+        human.pqc.clone(),
+    );
+    let binding = ciris_edge::replication::attestation_bind::owner_binding_attestation(
+        human_id,
+        &derived,
+        ts(),
+        &human,
+    )
+    .await
+    .expect("build the owner binding");
+    dir.put_attestation_authored(SignedAttestation {
+        attestation: binding,
+    })
+    .await
+    .expect("admit the owner binding");
+
+    let store = ciris_edge::group_content::PersistGroupContentStore::from_shared_hybrid(
+        ciris_persist::BackendDispatch::Sqlite(dir.clone()),
+        dir.clone(),
+        &identity,
+    )
+    .await
+    .expect("hybrid content store");
+    let (me, _) = ciris_edge::content_occurrence::provision_engine_occurrence(
+        store.engine(),
+        &*dir,
+        human_id,
+        "server",
+    )
+    .await
+    .expect("publish this node's engine occurrence");
+    Peer { dir, store, me }
+}
+
+/// What the IdentityOccurrence / Attestation planes carry on a mesh, by
+/// hand: `from`'s derived key, its owner binding, its published occurrence.
+async fn carry_identity(from: &Peer, to: &Peer) {
+    let rec = FederationDirectory::lookup_public_key(&*from.dir, &from.me)
+        .await
+        .unwrap()
+        .expect("the engine registered its derived key");
+    to.dir
+        .put_public_key(SignedKeyRecord { record: rec })
+        .await
+        .expect("carry the derived key");
+    for row in from.dir.list_attestations_since(None, 256).await.unwrap() {
+        let att = row.attestation;
+        if att.attested_key_id == from.me
+            && ciris_persist::federation::admission::is_owner_binding_envelope(
+                &att.attestation_envelope,
+            )
+        {
+            to.dir
+                .apply_replicated_attestation(SignedAttestation { attestation: att })
+                .await
+                .expect("carry the owner binding");
+        }
+    }
+    let occ = from
+        .dir
+        .list_signed_identity_occurrences_since(None, 64)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.occurrence)
+        .find(|o| o.identity_occurrence.occurrence_key_id == from.me)
+        .expect("the occurrence is ON the signed plane (CIRISPersist#851)");
+    to.dir
+        .put_identity_occurrence(occ)
+        .await
+        .expect("admit the occurrence through the gated door");
+}
+
+/// What the Attestation cursor carries after a seal: every `key_grant:*`
+/// row `from` emitted, admitted through `to`'s key-grant door.
+async fn carry_key_grants(from: &Peer, to: &Peer) -> usize {
+    use ciris_persist::federation::key_grant::{
+        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
+    };
+    let mut wraps = 0;
+    for row in from.dir.list_attestations_since(None, 512).await.unwrap() {
+        if row
+            .attestation
+            .attestation_type
+            .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+        {
+            wraps += to
+                .store
+                .engine()
+                .apply_replicated_key_grant(SignedKeyGrantSet {
+                    attestation: row.attestation,
+                })
+                .await
+                .expect("admit the key_grant set")
+                .wraps_written;
+        }
+    }
+    wraps
+}
+
+/// What a blob pull carries (CIRISEdge#601 is the hook; this is the hand
+/// version the far-node test uses): the sealed envelope, served from
+/// `from`'s disk and adopted on `to` at the author's declared binding.
+async fn carry_bytes(
+    from: &Peer,
+    to: &Peer,
+    room: &str,
+    author: &str,
+    sealed: &ciris_edge::group_content::SealedContent,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), ciris_persist::federation::BlobError> {
+    use ciris_persist::federation::blobs::BlobBody;
+    use ciris_persist::federation::{AdoptDisposition, BlobProvenance};
+    let sha: [u8; 32] = hex::decode(&sealed.pointer.content_sha256)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let served = from
+        .store
+        .engine()
+        .serve_blob_to_peer(&sha, &to.me)
+        .await
+        .expect("serve the sealed envelope");
+    let BlobBody::Inline(envelope) = served else {
+        panic!("a whole-blob seal is served inline");
+    };
+    let aad = ciris_edge::group_content::aad_for_open(&ciris_edge::group_content::OpenRequest {
+        pointer: &sealed.pointer,
+        author_key_id: author,
+        asserted_at: at,
+        viewer_key_id: &to.me,
+    });
+    to.store
+        .engine()
+        .adopt_sealed_blob(
+            &envelope,
+            BlobProvenance {
+                // The MINTER is the author's engine (derived id), not the
+                // friendly identity — memory trap 6.
+                author_key_id: from.me.clone(),
+                cohort_scope: "community".to_owned(),
+                community_key_id: Some(room.to_owned()),
+                epoch: sealed.epoch,
+                tier: sealed.tier,
+            },
+            Some(&aad),
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .map(|_| ())
+}
+
+/// Read a message the way a consumer does — `ChatMessage::resolve_content`
+/// as `viewer` — and return what it became.
+async fn read_as(
+    peer: &Peer,
+    row: &ciris_persist::federation::Attestation,
+    room: &str,
+    viewer: &str,
+) -> Body {
+    let mut msg = chat::ChatMessage::from_row(row, room).expect("a chat row for this room");
+    msg.resolve_content(&peer.store, viewer).await;
+    msg.body
+}
+
+/// **Three members, one node each; a fourth who is not on the roster; and a
+/// removal that rotates the key.**
+///
+/// The roster is created ONCE with all three on it (that record replicates
+/// cleanly — a later widening does not, see `community_roster`), the
+/// crossings are the planes' shapes carried by hand, and the assertions are
+/// the issue's: every member's body opens for every member; none for a
+/// non-member; after one revocation the removed member reads `Unopened` for
+/// every LATER message and still opens the EARLIER one — forward secrecy on
+/// this axis is rotation, not recall (CC 4.5.12.1 Option A).
+///
+/// Mutation: skip the revocation and the "carol reads `Unopened` for the
+/// later message" assertion fails — carol's occurrence is still on the
+/// active roster, so alice's cascade wraps to it.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // three nodes, two messages, one revocation — in one place on purpose
+async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
+    use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
+    use ciris_persist::federation::types::consensus_protocol;
+
+    let alice = signer("alice-fed", 1);
+    let bob = signer("bob-fed", 3);
+    let carol = signer("carol-fed", 5);
+    let humans = [&alice, &bob, &carol];
+    let a = peer(&humans, ("alice-fed", 1)).await;
+    let b = peer(&humans, ("bob-fed", 3)).await;
+    let c = peer(&humans, ("carol-fed", 5)).await;
+
+    // ── The room, created once with its full roster, on every node ──
+    let room = chat::new_room_community_key_id();
+    let roster = chat::community(
+        &room,
+        "the trio",
+        &[
+            ("alice-fed", Some(MEMBER_ROLE_FOUNDER)),
+            ("bob-fed", None),
+            ("carol-fed", None),
+        ],
+        consensus_protocol::FOUNDER_ONLY,
+        ts(),
+    )
+    .expect("alice is the founder");
+    let signed_room = chat::signed_community(roster, &alice).await.expect("sign");
+    for p in [&a, &b, &c] {
+        p.dir
+            .put_community(signed_room.clone())
+            .await
+            .expect("every node admits the same record");
+        // persist's revocation table FKs the community id onto
+        // `federation_keys` (see `community_roster`); persist's own fixtures
+        // satisfy it by registering the community id as a key, and so does
+        // this one. Throwaway material — nothing signs AS the room.
+        p.dir
+            .put_public_key(SignedKeyRecord {
+                record: record(&room, &signer(&room, 9), &signer(&room, 9), "user").await,
+            })
+            .await
+            .expect("register the room id as a key (persist fixture convention)");
+    }
+    // ── The planes: everyone knows everyone's engine ──
+    for (from, to) in [(&a, &b), (&a, &c), (&b, &a), (&b, &c), (&c, &a), (&c, &b)] {
+        carry_identity(from, to).await;
+    }
+
+    // ── Message 1: alice → the room ──
+    let t1 = ts();
+    let (row1, sealed1) = chat::chat_message_attestation_in(&alice, &room, "one", t1, &a.store)
+        .await
+        .expect("alice sends into the room by its id");
+    assert!(
+        sealed1.granted.contains(&b.me) && sealed1.granted.contains(&c.me),
+        "the cascade wraps to every member's engine: {:?}",
+        sealed1.granted,
+    );
+    for to in [&b, &c] {
+        carry_key_grants(&a, to).await;
+        carry_bytes(&a, to, &room, "alice-fed", &sealed1, t1)
+            .await
+            .expect("a member's node adopts the bytes");
+    }
+    for (p, who) in [(&a, "alice"), (&b, "bob"), (&c, "carol")] {
+        assert_eq!(
+            read_as(p, &row1, &room, &p.me).await,
+            Body::Text("one".to_owned()),
+            "{who} opens message 1",
+        );
+    }
+    // A non-member: holds the row, the set and the bytes, has no wrap.
+    assert!(
+        matches!(
+            read_as(&b, &row1, &room, "dave-fed-occ").await,
+            Body::Unopened { .. }
+        ),
+        "a viewer nobody enumerated stays outside the boundary",
+    );
+
+    // ── The removal: alice (founder) revokes carol, on alice's node ──
+    ciris_edge::community_roster::revoke_community_member(
+        &*a.dir,
+        &room,
+        "carol-fed",
+        chrono::Utc::now(),
+        Some("asked to leave"),
+        &[],
+        &alice,
+    )
+    .await
+    .expect("persist admits the founder's removal and rotates the epoch");
+    // …and it replicates: the CommunityMembershipRevocation plane.
+    for to in [&b, &c] {
+        for rev in a
+            .dir
+            .list_signed_community_membership_revocations_since(None, 64)
+            .await
+            .unwrap()
+        {
+            to.dir
+                .put_community_membership_revocation(rev.revocation)
+                .await
+                .expect("a peer admits the replicated revocation");
+        }
+    }
+
+    // ── Message 2: sealed AFTER the removal ──
+    let t2 = ts() + chrono::Duration::seconds(1);
+    let (row2, sealed2) = chat::chat_message_attestation_in(&alice, &room, "two", t2, &a.store)
+        .await
+        .expect("alice sends again");
+    let (e1, e2) = (
+        sealed1.epoch.expect("a sealed tier carries an epoch"),
+        sealed2.epoch.expect("a sealed tier carries an epoch"),
+    );
+    assert!(e2 > e1, "the removal rotated the epoch: {e1} → {e2}");
+    assert!(
+        sealed2.granted.contains(&b.me) && !sealed2.granted.contains(&c.me),
+        "the new epoch wraps to the remaining member and not the removed one: {:?}",
+        sealed2.granted,
+    );
+    carry_key_grants(&a, &b).await;
+    carry_bytes(&a, &b, &room, "alice-fed", &sealed2, t2)
+        .await
+        .expect("bob's node adopts the bytes");
+    assert_eq!(
+        read_as(&b, &row2, &room, &b.me).await,
+        Body::Text("two".to_owned()),
+        "bob, still a member, opens message 2",
+    );
+    // Carol's node: the set carries no wrap for her, and persist REFUSES to
+    // store the bytes at all — a node never holds content it is not party
+    // to (persist #846 §4, `NotPartyTo`), and she is no longer party to the
+    // room. Stronger than "cannot open": nothing lands.
+    carry_key_grants(&a, &c).await;
+    let refused = carry_bytes(&a, &c, &room, "alice-fed", &sealed2, t2).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ciris_persist::federation::BlobError::NotPartyTo { .. })
+        ),
+        "carol's node refuses to hold bytes of a room she was removed from — got {refused:?}",
+    );
+    assert!(
+        matches!(
+            read_as(&c, &row2, &room, &c.me).await,
+            Body::Unopened { .. }
+        ),
+        "carol, removed, reads Unopened for a message sealed after the removal",
+    );
+    assert_eq!(
+        read_as(&c, &row1, &room, &c.me).await,
+        Body::Text("one".to_owned()),
+        "and still opens the message from before it — rotation, not recall (CC 4.5.12.1 Option A)",
+    );
+}
