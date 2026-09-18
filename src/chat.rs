@@ -120,6 +120,15 @@ pub const CHAT_ATTESTATION_PREFIX: &str = "chat:";
 
 /// The derived-id prefix for a two-party chat community.
 pub const PAIR_COMMUNITY_PREFIX: &str = "chat:pair:v1:";
+/// The allocated-id prefix for an N-member chat room (CIRISEdge#608).
+///
+/// A pair room's id is a FUNCTION of its two members, so both ends derive it
+/// having exchanged nothing. An N-member room has no such function — its
+/// roster is whatever its creator declared, and two creators declaring the
+/// same three people are two rooms, not one — so its id is ALLOCATED at
+/// creation ([`new_room_community_key_id`]) and the signed `Community` record
+/// is the only source of truth for who is in it.
+pub const ROOM_COMMUNITY_PREFIX: &str = "chat:room:v1:";
 
 /// Envelope member naming the community a row belongs to — persist's
 /// canonical cohort-target alias, so the author's row and the `supersedes`
@@ -169,6 +178,108 @@ pub fn pair_community_key_id(a: &str, b: &str) -> String {
     format!("{PAIR_COMMUNITY_PREFIX}{}", hex::encode(h.finalize()))
 }
 
+/// **A fresh id for an N-member room** — `chat:room:v1:<uuid>`, lowercase, so
+/// it satisfies the same canonical-id rule every other key id does (CC 2.6.3)
+/// and cannot collide with a derived pair id.
+#[must_use]
+pub fn new_room_community_key_id() -> String {
+    format!("{ROOM_COMMUNITY_PREFIX}{}", uuid::Uuid::new_v4().simple())
+}
+
+/// The roster shape every community record built here satisfies — spelled
+/// once so the general builder and the pair convenience cannot drift.
+fn build_community(
+    community_key_id: &str,
+    community_name: &str,
+    members: &[(&str, Option<&str>)],
+    consensus_protocol: &str,
+    founded_at: chrono::DateTime<chrono::Utc>,
+) -> ciris_persist::federation::types::Community {
+    use ciris_persist::federation::types::{Community, CommunityMember};
+    Community {
+        community_key_id: community_key_id.to_owned(),
+        community_name: community_name.to_owned(),
+        members: members
+            .iter()
+            .map(|(k, role)| CommunityMember {
+                key_id: (*k).to_owned(),
+                joined_at: founded_at,
+                role: role.map(str::to_owned),
+            })
+            .collect(),
+        founded_at,
+        consensus_protocol: consensus_protocol.to_owned(),
+        policy_blob: None,
+        persist_row_hash: String::new(),
+    }
+}
+
+/// **An N-member room, as a record** (CIRISEdge#608).
+///
+/// `members` is the roster in the order given — `(identity key, role)`; the
+/// roster names PERSONS (identity keys), never nodes or occurrences, and the
+/// DEK cascade resolves each person to their active occurrences at seal time.
+/// `joined_at` is `founded_at` for every founding member.
+///
+/// # What is refused, and why it is refused HERE
+///
+/// CC 4.5.4 / §11.11: no unmoderated federated space. Persist refuses to
+/// federate any content keyed on a community with no live named moderator,
+/// and a named moderator exists iff the community's authority set has a
+/// steward-bound root. The authority set is every `founder`, plus — under
+/// any protocol but `founder_only` — every member. So a roster with no
+/// `founder` under `founder_only` is a room whose messages persist will
+/// admit locally and never carry, and the failure surfaces as silence at the
+/// far end. This builder refuses that roster, and an empty or duplicated
+/// one, at construction — where the caller still holds the roster — rather
+/// than at some reader's screen.
+///
+/// Whether the founder is steward-bound (a `user`-role identity, an
+/// occurrence of one, or delegated from one) is a directory fact the caller
+/// establishes; this builder can only guarantee the roster's shape.
+///
+/// # Errors
+/// An empty roster, a duplicated member, or no `founder`.
+pub fn community(
+    community_key_id: &str,
+    community_name: &str,
+    members: &[(&str, Option<&str>)],
+    consensus_protocol: &str,
+    founded_at: chrono::DateTime<chrono::Utc>,
+) -> Result<ciris_persist::federation::types::Community, String> {
+    use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
+    if members.is_empty() {
+        return Err(format!(
+            "room {community_key_id}: a roster with nobody on it"
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (k, _) in members {
+        if !seen.insert(*k) {
+            return Err(format!(
+                "room {community_key_id}: {k} is on the roster twice"
+            ));
+        }
+    }
+    if !members
+        .iter()
+        .any(|(_, role)| *role == Some(MEMBER_ROLE_FOUNDER))
+    {
+        return Err(format!(
+            "room {community_key_id}: no member is tagged `{MEMBER_ROLE_FOUNDER}` — a room \
+             with no founder has no authority root, so it has no named moderator and \
+             persist will refuse to federate anything keyed on it (CC 4.5.4)"
+        ));
+    }
+    Ok(build_community(
+        community_key_id,
+        community_name,
+        members,
+        consensus_protocol,
+        founded_at,
+    ))
+}
+
 /// **The two-person room, as a record — both people founders, and therefore
 /// both moderators.**
 ///
@@ -183,7 +294,12 @@ pub fn pair_community_key_id(a: &str, b: &str) -> String {
 ///
 /// Everything that opens a pair room — the mesh harness, the tests, a
 /// consumer — builds it here, so the roster shape cannot drift between them.
-/// Sign it with [`signed_pair_community`].
+/// Sign it with [`signed_pair_community`]. The record is BYTE-IDENTICAL to
+/// what this function produced before the N-member builder existed
+/// (CIRISEdge#608) — pinned by `the_pair_room_is_byte_identical_over_the_general_builder`
+/// — because every pair room on the mesh is a derived id whose far end
+/// re-derives the same bytes, and a changed byte is a `CommunityRosterFork`
+/// on every one of them.
 #[must_use]
 pub fn pair_community(
     a: &str,
@@ -191,25 +307,51 @@ pub fn pair_community(
     founded_at: chrono::DateTime<chrono::Utc>,
 ) -> ciris_persist::federation::types::Community {
     use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
-    use ciris_persist::federation::types::{consensus_protocol, Community, CommunityMember};
-    let mut members = [a, b];
-    members.sort_unstable();
-    Community {
-        community_key_id: pair_community_key_id(a, b),
-        community_name: format!("{} <-> {}", members[0], members[1]),
-        members: members
-            .iter()
-            .map(|k| CommunityMember {
-                key_id: (*k).to_owned(),
-                joined_at: founded_at,
-                role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
-            })
-            .collect(),
+    use ciris_persist::federation::types::consensus_protocol;
+    let mut pair = [a, b];
+    pair.sort_unstable();
+    // Two founders satisfy `community`'s roster rule by construction, so the
+    // validating door is not consulted — the pair shape IS the rule.
+    build_community(
+        &pair_community_key_id(a, b),
+        &format!("{} <-> {}", pair[0], pair[1]),
+        &[
+            (pair[0], Some(MEMBER_ROLE_FOUNDER)),
+            (pair[1], Some(MEMBER_ROLE_FOUNDER)),
+        ],
+        consensus_protocol::UNANIMOUS,
         founded_at,
-        consensus_protocol: consensus_protocol::UNANIMOUS.to_owned(),
-        policy_blob: None,
-        persist_row_hash: String::new(),
-    }
+    )
+}
+
+/// A [`Community`](ciris_persist::federation::types::Community) record,
+/// hybrid-signed by `authority` — the key that vouches for it. Persist's
+/// `put_community` verifies this signature (hybrid-Strict) against
+/// `authority`'s REGISTERED pubkeys over
+/// [`Community::signing_envelope`](ciris_persist::federation::types::Community::signing_envelope)
+/// before any write, so `authority` must be a registered hybrid key.
+///
+/// A record admitted once is idempotent on identical bytes and a `Conflict`
+/// on differing ones under the same id — a room is created ONCE; later
+/// membership changes go through [`crate::community_roster`], not through a
+/// second record.
+///
+/// # Errors
+/// Canonicalization or signing failure.
+pub async fn signed_community(
+    community: ciris_persist::federation::types::Community,
+    authority: &crate::identity::LocalSigner,
+) -> Result<ciris_persist::federation::types::SignedCommunity, String> {
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
+        .map_err(|e| format!("canonicalize room: {e}"))?;
+    let (scrub_signature_classical, scrub_signature_pqc) =
+        crate::identity::sign_bound_hybrid(authority, &canonical, "community").await?;
+    Ok(ciris_persist::federation::types::SignedCommunity {
+        community,
+        authority_key_id: authority.key_id.clone(),
+        scrub_signature_classical,
+        scrub_signature_pqc,
+    })
 }
 
 /// [`pair_community`], hybrid-signed by `authority` — the key that vouches
@@ -225,17 +367,7 @@ pub async fn signed_pair_community(
     founded_at: chrono::DateTime<chrono::Utc>,
     authority: &crate::identity::LocalSigner,
 ) -> Result<ciris_persist::federation::types::SignedCommunity, String> {
-    let community = pair_community(a, b, founded_at);
-    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
-        .map_err(|e| format!("canonicalize room: {e}"))?;
-    let (scrub_signature_classical, scrub_signature_pqc) =
-        crate::identity::sign_bound_hybrid(authority, &canonical, "pair community").await?;
-    Ok(ciris_persist::federation::types::SignedCommunity {
-        community,
-        authority_key_id: authority.key_id.clone(),
-        scrub_signature_classical,
-        scrub_signature_pqc,
-    })
+    signed_community(pair_community(a, b, founded_at), authority).await
 }
 
 /// Which side of the MLS handshake a person is in a pair room — decided
@@ -422,8 +554,34 @@ pub async fn chat_message_attestation(
     asserted_at: chrono::DateTime<chrono::Utc>,
     store: &dyn crate::group_content::GroupContentStore,
 ) -> Result<(Attestation, crate::group_content::SealedContent), String> {
-    use crate::replication::attestation_bind::truncate_to_substrate_resolution;
     let room = pair_community_key_id(&author.key_id, recipient_key_id);
+    chat_message_attestation_in(author, &room, body, asserted_at, store).await
+}
+
+/// **A message into a room named by its community id** (CIRISEdge#608) —
+/// the general form [`chat_message_attestation`] is the two-person
+/// convenience over.
+///
+/// `community_key_id` is any community the author is a member of: a derived
+/// pair id ([`pair_community_key_id`]) or an allocated room id
+/// ([`new_room_community_key_id`]). The body is sealed under that room's
+/// DEK — the cascade resolves the roster through persist and wraps to every
+/// member's active occurrences — and the row names the room by
+/// [`FIELD_COMMUNITY_ID`]. Nothing about the row or the seal knows how many
+/// people are in the room.
+///
+/// # Errors
+/// Seal failure, a seal nobody could open (CIRISEdge#599), canonicalization
+/// or signing failure.
+pub async fn chat_message_attestation_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    body: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    store: &dyn crate::group_content::GroupContentStore,
+) -> Result<(Attestation, crate::group_content::SealedContent), String> {
+    use crate::replication::attestation_bind::truncate_to_substrate_resolution;
+    let room = community_key_id;
 
     // One truncation, feeding both the row's column and the AAD. Deriving
     // them separately is how they drift.
@@ -432,7 +590,7 @@ pub async fn chat_message_attestation(
     let sealed = store
         .seal(crate::group_content::SealRequest {
             cohort_scope: ciris_persist::federation::types::cohort_scope::COMMUNITY,
-            community_key_id: Some(&room),
+            community_key_id: Some(room),
             author_key_id: &author.key_id,
             asserted_at: at,
             field: crate::group_content::ContentField::Body,
@@ -481,7 +639,7 @@ pub async fn chat_message_attestation(
         serde_json::json!("text/plain"),
     );
 
-    let row = chat_row(author, &room, CHAT_MESSAGE_DIMENSION, members, at).await?;
+    let row = chat_row(author, room, CHAT_MESSAGE_DIMENSION, members, at).await?;
     // `sealed` is returned rather than dropped so the caller can see
     // `excluded` — who, of this room, cannot read what was just written.
     // persist: "a caller that ignores this is ignoring who cannot read what

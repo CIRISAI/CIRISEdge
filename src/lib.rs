@@ -52,6 +52,9 @@ pub mod blob_swarm;
 pub mod bundle_gate;
 pub mod chat;
 pub mod cohort_scope;
+/// CIRISEdge#608 — who is in a room, as signed records: the widening and
+/// revocation producers over persist's roster doors.
+pub mod community_roster;
 /// CIRISEdge#552/#554 — the contact ladder: announce → discover → request →
 /// consent → chat, with one greppable log shape per rung.
 pub mod contact;
