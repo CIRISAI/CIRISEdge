@@ -390,15 +390,17 @@ and read what you need afterwards.
 real hybrid signatures, a real persist directory, persist's own admission as
 the oracle. It is the reference to copy; every call below is exercised there.
 
-> **v24.4.0 (CIRISEdge#604): the per-room MLS handshake is retired.** There
-> is no KeyPackage/Welcome exchange and no `RoomKey` any more. The room is the
-> `Community` record; the key is persist's community DEK, wrapped per member
-> occurrence when a body is sealed. A server that still runs
-> `chat::key_package_attestation` / `welcome_attestation` / `RoomKey::of` as a
-> send-readiness gate is gating on a key that keys nothing — the surface is
-> `#[deprecated]` for one release and deleted the next. Delete the handshake
-> state machine and send when the room record and the peer's occurrence
-> exist; a body no member can open is refused at the door
+> **v25.0.0 (CIRISEdge#604): the per-room MLS handshake is DELETED.** There
+> is no KeyPackage/Welcome exchange and no `RoomKey` any more — `RoomKey`,
+> `PairRole`, `key_package_attestation`, `welcome_attestation`,
+> `key_package_from`, `welcome_from`, `KEY_PACKAGE_DIMENSION`,
+> `WELCOME_DIMENSION`, `FIELD_MLS_BYTES` and `FIELD_MLS_EPOCH` no longer
+> exist; a rider loses them at compile time. The room is the `Community`
+> record; the key is persist's community DEK, wrapped per member occurrence
+> when a body is sealed. A send-readiness gate built on the derived key was
+> gating on a key that keys nothing. Delete the handshake state machine and
+> send when the room record exists: **room record → seal → share.** A body
+> no member can open is refused at the door
 > (`SealedContent::readable_by_nobody`), which is the readiness signal.
 
 | your UI | the call | who owns it |

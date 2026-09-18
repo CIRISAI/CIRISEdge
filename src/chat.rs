@@ -43,11 +43,13 @@
 //! and two key layers with two convergence rules under one room is exactly the
 //! fork #604 named. Membership is the community roster; agreement is the
 //! cascade; forward secrecy on this axis is rotation (CC 4.5.12.1 Option A).
-//! The handshake surface ([`RoomKey`], [`PairRole`],
-//! [`key_package_attestation`], [`welcome_attestation`], the two readers and
-//! the two dimensions) is kept for ONE release, deprecated, because
-//! CIRISServer still drives it as a send-readiness gate; nothing in edge calls
-//! it. See the FSD §2 for what answers CC 5.1 now.
+//! The handshake surface — `RoomKey`, `PairRole`, `key_package_attestation`,
+//! `welcome_attestation`, the two readers, the two dimensions and the two
+//! `mls_*` envelope members — is DELETED, not deprecated: it keyed nothing,
+//! and a gate built on it gated sends on a key that was never used. A rider
+//! sends when the room record exists and seals through
+//! [`chat_message_attestation`]; the roster is the membership. See the FSD
+//! §2 for what answers CC 5.1 now.
 //!
 //! # Who signs — the ACTOR, at write, with the full hybrid key
 //!
@@ -103,18 +105,6 @@ use sha2::{Digest as _, Sha256};
 /// prefix is NOT reserved by `default_reserved_prefix_rules` — an ordinary
 /// `user` identity may emit it.
 pub const CHAT_MESSAGE_DIMENSION: &str = "chat:message:v1";
-/// The joiner's MLS KeyPackage for a room — step 1 of the RETIRED handshake.
-#[deprecated(
-    since = "24.4.0",
-    note = "chat's MLS group is retired (CIRISEdge#604): the body is sealed under persist's community DEK and the handshake keys nothing; kept one release for CIRISServer's send-readiness gate"
-)]
-pub const KEY_PACKAGE_DIMENSION: &str = "chat:key_package:v1";
-/// The creator's MLS Welcome for the joiner — step 2 of the RETIRED handshake.
-#[deprecated(
-    since = "24.4.0",
-    note = "chat's MLS group is retired (CIRISEdge#604): the body is sealed under persist's community DEK and the handshake keys nothing; kept one release for CIRISServer's send-readiness gate"
-)]
-pub const WELCOME_DIMENSION: &str = "chat:welcome:v1";
 
 /// The replication-consent prefix a grant MUST cover for chat to federate.
 ///
@@ -152,18 +142,6 @@ pub const FIELD_CONTENT_TYPE: &str = "content_type";
 /// the point content is actually backfilled (`FSD/GROUP_CONTENT_ON_BLOBS.md`
 /// §8).
 pub const FIELD_CONTENT: &str = "content";
-/// The MLS handshake payload on a KeyPackage / Welcome row: base64 bytes.
-#[deprecated(
-    since = "24.4.0",
-    note = "chat's MLS group is retired (CIRISEdge#604): the body is sealed under persist's community DEK and the handshake keys nothing; kept one release for CIRISServer's send-readiness gate"
-)]
-pub const FIELD_MLS_BYTES: &str = "mls_bytes";
-/// On a Welcome row: the group epoch the Welcome joins the joiner at.
-#[deprecated(
-    since = "24.4.0",
-    note = "chat's MLS group is retired (CIRISEdge#604): the body is sealed under persist's community DEK and the handshake keys nothing; kept one release for CIRISServer's send-readiness gate"
-)]
-pub const FIELD_MLS_EPOCH: &str = "mls_epoch";
 
 /// **The room two people share, derived from their fed-IDs alone.**
 ///
@@ -249,103 +227,6 @@ pub async fn signed_pair_community(
         scrub_signature_classical,
         scrub_signature_pqc,
     })
-}
-
-/// Which side of the RETIRED MLS handshake a person was in a pair room —
-/// decided from the two fed-IDs alone, like the room id.
-#[deprecated(
-    since = "24.4.0",
-    note = "chat's MLS group is retired (CIRISEdge#604): the body is sealed under persist's community DEK and the handshake keys nothing; kept one release for CIRISServer's send-readiness gate"
-)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PairRole {
-    /// The lexicographically smaller fed-ID: creates the group, admits the
-    /// joiner from their KeyPackage row, shares the Welcome.
-    Creator,
-    /// The other: mints key material, shares a KeyPackage, joins from the
-    /// Welcome.
-    Joiner,
-}
-
-#[allow(deprecated)]
-impl PairRole {
-    /// `me`'s role in the room with `peer`.
-    #[must_use]
-    pub fn of(me: &str, peer: &str) -> Self {
-        if me < peer {
-            PairRole::Creator
-        } else {
-            PairRole::Joiner
-        }
-    }
-}
-
-/// **The RETIRED room key** — the MLS group's record secret at an epoch.
-///
-/// Nothing is sealed under it any more (the body is a blob under persist's
-/// community DEK); it survives one release because CIRISServer derives it as
-/// a send-readiness gate. Zeroed on drop; never printed.
-#[deprecated(
-    since = "24.4.0",
-    note = "chat's MLS group is retired (CIRISEdge#604): the body is sealed under persist's community DEK and the handshake keys nothing; kept one release for CIRISServer's send-readiness gate"
-)]
-#[derive(Clone)]
-pub struct RoomKey {
-    secret: [u8; 32],
-    epoch: u64,
-}
-
-#[allow(deprecated)]
-impl std::fmt::Debug for RoomKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RoomKey")
-            .field("epoch", &self.epoch)
-            .field("secret", &"<redacted>")
-            .finish()
-    }
-}
-
-#[allow(deprecated)]
-impl Drop for RoomKey {
-    fn drop(&mut self) {
-        // Safe scrub (this crate denies `unsafe`): zero, then pin the write
-        // with `black_box` so the optimizer keeps it.
-        for b in &mut self.secret {
-            *b = 0;
-        }
-        std::hint::black_box(&self.secret);
-    }
-}
-
-#[allow(deprecated)]
-impl RoomKey {
-    /// The record secret of a live group, at its current epoch.
-    ///
-    /// # Errors
-    /// The group cannot export (not active, or the exporter failed).
-    pub async fn of(group: &crate::mls::CohortGroup) -> Result<Self, String> {
-        let secret = group
-            .record_secret()
-            .await
-            .map_err(|e| format!("record_secret: {e}"))?;
-        Ok(Self {
-            secret: *secret.as_bytes(),
-            epoch: group.epoch().await,
-        })
-    }
-
-    /// A key from its parts — for a consumer that already holds the MLS
-    /// exporter (a server whose group lives elsewhere), and for tests.
-    #[must_use]
-    pub fn from_parts(secret: [u8; 32], epoch: u64) -> Self {
-        Self { secret, epoch }
-    }
-
-    /// The MLS epoch this key belongs to.
-    #[must_use]
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
 }
 
 /// The ONE producer every chat row goes through: authored `tier: local` /
@@ -513,62 +394,6 @@ pub async fn chat_message_attestation(
     Ok((row, sealed))
 }
 
-/// Step 1 of the RETIRED handshake: the JOINER's KeyPackage for the room, as
-/// a row the joiner signs. `key_package` is the wire form
-/// ([`key_package_to_bytes`](crate::mls::cohort_group::key_package_to_bytes)).
-///
-/// # Errors
-/// Canonicalization or signing failure.
-#[deprecated(
-    since = "24.4.0",
-    note = "chat's MLS group is retired (CIRISEdge#604): the body is sealed under persist's community DEK and the handshake keys nothing; kept one release for CIRISServer's send-readiness gate"
-)]
-#[allow(deprecated)]
-pub async fn key_package_attestation(
-    author: &crate::identity::LocalSigner,
-    recipient_key_id: &str,
-    key_package: &[u8],
-    asserted_at: chrono::DateTime<chrono::Utc>,
-) -> Result<Attestation, String> {
-    use base64::Engine as _;
-    let room = pair_community_key_id(&author.key_id, recipient_key_id);
-    let mut members = serde_json::Map::new();
-    members.insert(
-        FIELD_MLS_BYTES.to_owned(),
-        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(key_package)),
-    );
-    chat_row(author, &room, KEY_PACKAGE_DIMENSION, members, asserted_at).await
-}
-
-/// Step 2 of the RETIRED handshake: the CREATOR's Welcome for the joiner, as
-/// a row the creator signs. The Welcome is HPKE-sealed to the joiner's
-/// KeyPackage by MLS itself; the row only carries it.
-///
-/// # Errors
-/// Canonicalization or signing failure.
-#[deprecated(
-    since = "24.4.0",
-    note = "chat's MLS group is retired (CIRISEdge#604): the body is sealed under persist's community DEK and the handshake keys nothing; kept one release for CIRISServer's send-readiness gate"
-)]
-#[allow(deprecated)]
-pub async fn welcome_attestation(
-    author: &crate::identity::LocalSigner,
-    recipient_key_id: &str,
-    welcome: &[u8],
-    epoch: u64,
-    asserted_at: chrono::DateTime<chrono::Utc>,
-) -> Result<Attestation, String> {
-    use base64::Engine as _;
-    let room = pair_community_key_id(&author.key_id, recipient_key_id);
-    let mut members = serde_json::Map::new();
-    members.insert(
-        FIELD_MLS_BYTES.to_owned(),
-        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(welcome)),
-    );
-    members.insert(FIELD_MLS_EPOCH.to_owned(), serde_json::json!(epoch));
-    chat_row(author, &room, WELCOME_DIMENSION, members, asserted_at).await
-}
-
 /// The room a stored row names, through persist's cohort-target resolver
 /// (every alias; a split-brain row naming two is `None`).
 fn room_of(a: &Attestation) -> Option<String> {
@@ -719,69 +544,6 @@ pub async fn messages_in_room(
     }
 
     Ok(out)
-}
-
-/// The KeyPackage `from` shared in `room`, if it has arrived — step 1 of the
-/// RETIRED handshake, as the creator reads it.
-///
-/// # Errors
-/// A directory read failure.
-#[deprecated(
-    since = "24.4.0",
-    note = "chat's MLS group is retired (CIRISEdge#604): the body is sealed under persist's community DEK and the handshake keys nothing; kept one release for CIRISServer's send-readiness gate"
-)]
-#[allow(deprecated)]
-pub async fn key_package_from(
-    directory: &dyn ciris_persist::federation::FederationDirectory,
-    from: &str,
-    room: &str,
-) -> Result<Option<Vec<u8>>, String> {
-    use base64::Engine as _;
-    Ok(rows_in_room(directory, &[from.to_owned()], room)
-        .await?
-        .iter()
-        .filter(|a| dimension_of(a) == Some(KEY_PACKAGE_DIMENSION))
-        .filter_map(|a| {
-            a.attestation_envelope
-                .get(FIELD_MLS_BYTES)
-                .and_then(serde_json::Value::as_str)
-                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-        })
-        .next_back())
-}
-
-/// The Welcome `from` shared in `room`, with its epoch, if it has arrived —
-/// step 2 of the RETIRED handshake, as the joiner reads it.
-///
-/// # Errors
-/// A directory read failure.
-#[deprecated(
-    since = "24.4.0",
-    note = "chat's MLS group is retired (CIRISEdge#604): the body is sealed under persist's community DEK and the handshake keys nothing; kept one release for CIRISServer's send-readiness gate"
-)]
-#[allow(deprecated)]
-pub async fn welcome_from(
-    directory: &dyn ciris_persist::federation::FederationDirectory,
-    from: &str,
-    room: &str,
-) -> Result<Option<(Vec<u8>, u64)>, String> {
-    use base64::Engine as _;
-    Ok(rows_in_room(directory, &[from.to_owned()], room)
-        .await?
-        .iter()
-        .filter(|a| dimension_of(a) == Some(WELCOME_DIMENSION))
-        .filter_map(|a| {
-            let env = &a.attestation_envelope;
-            let bytes = env
-                .get(FIELD_MLS_BYTES)
-                .and_then(serde_json::Value::as_str)
-                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())?;
-            let epoch = env
-                .get(FIELD_MLS_EPOCH)
-                .and_then(serde_json::Value::as_u64)?;
-            Some((bytes, epoch))
-        })
-        .next_back())
 }
 
 /// A message body as read back: opened text, or why it did not open.

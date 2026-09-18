@@ -35,7 +35,7 @@ policy layered on top, and is explicitly *not* fixed here.
 
 ---
 
-## 2. What this replaced, and why — DONE (v24.0.0 the seal, v24.4.0 the group)
+## 2. What this replaced, and why — DONE (v24.0.0 the seal, v25.0.0 the group)
 
 Chat used to seal its own bodies: `body_key` was HKDF from a `RoomKey`, the
 ciphertext went in `FIELD_BODY`, and a `FIELD_SEALED` header said how it
@@ -45,16 +45,17 @@ give it.
 
 **Status.** The seal moved to the blob store in v24.0.0 (#586/#596). The
 room's own MLS group — the two-row handshake (`chat:key_package:v1`,
-`chat:welcome:v1`) that minted the `RoomKey` — was retired in v24.4.0
+`chat:welcome:v1`) that minted the `RoomKey` — was deleted in v25.0.0
 (#604): after v24.0.0 it keyed nothing, and edge's harness ran it only to
 report an epoch. Its public surface (`RoomKey`, `PairRole`,
-`key_package_attestation`, `welcome_attestation`, the two readers and the two
-dimensions) is `#[deprecated]` for one release because CIRISServer still
-drives it as a send-readiness gate (`contacts_chat.rs::room_key`), and is
-deleted the release after. `src/mls/` itself stays: it is the A/V realtime
-plane's group (`realtime_av_mls`) and the exporter behind scope-native
-addressing (`cohort_addressing`, #499) — neither is chat, and neither is
-this design's concern.
+`key_package_attestation`, `welcome_attestation`, the two readers, the two
+dimensions, the two `mls_*` envelope members) is gone — a hard cut, not a
+deprecation, because the one rider that drove it (CIRISServer's
+`contacts_chat.rs::room_key`) gated sends on a key that was never used, and
+a shim would have kept that gate alive. `src/mls/` itself stays: it is the
+A/V realtime plane's group (`realtime_av_mls`) and the exporter behind
+scope-native addressing (`cohort_addressing`, #499) — neither is chat, and
+neither is this design's concern.
 
 Three things had changed:
 
