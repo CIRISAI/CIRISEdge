@@ -32,3 +32,6 @@ coverage/
 *.profraw
 *.profdata
 .claude/
+
+# per-agent cargo target dirs (a shared CARGO_TARGET_DIR across worktrees is unsafe)
+target-*/
