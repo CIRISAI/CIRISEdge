@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1789701675869,
+  "lastUpdate": 1789707624753,
   "repoUrl": "https://github.com/CIRISAI/CIRISEdge",
   "entries": {
     "ciris-edge transport / A-V-mesh / replication benchmarks": [
@@ -231203,6 +231203,2370 @@ window.BENCHMARK_DATA = {
             "name": "fountain_reconstruction/encode_n20_k6",
             "value": 940,
             "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain/reconstruction/avail80pct_x100000",
+            "value": 84514,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain/reconstruction/avail85pct_x100000",
+            "value": 95738,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain/reconstruction/avail90pct_x100000",
+            "value": 99508,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain/reconstruction/avail95pct_x100000",
+            "value": 99988,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/antientropy_rounds_loss2pct_mean_x1000",
+            "value": 1015,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/reassembly_delivery_ratio_loss3pct_x100000",
+            "value": 100000,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/convergence_rounds/N1_x1000",
+            "value": 1050,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/convergence_rounds/N8_x1000",
+            "value": 1000,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/convergence_rounds/N32_x1000",
+            "value": 1050,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "replication/convergence_rounds/N128_x1000",
+            "value": 1025,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m1_rtt_stretch_p95_x1000",
+            "value": 1000,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m2_reparent_p99_ms",
+            "value": 1997,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m8_continuity_first_delivery_loss5pct_x100000",
+            "value": 99989,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth/N10",
+            "value": 2,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth_bound/N10",
+            "value": 4,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth/N100",
+            "value": 4,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth_bound/N100",
+            "value": 6,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth/N1000",
+            "value": 5,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/depth_bound/N1000",
+            "value": 7,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/continuity/loss0pct_x100000",
+            "value": 100000,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/continuity/loss5pct_x100000",
+            "value": 99988,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/continuity/loss10pct_x100000",
+            "value": 99899,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/continuity/loss15pct_x100000",
+            "value": 99673,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/continuity/loss20pct_x100000",
+            "value": 99207,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m3_heal_gap_p95/churn0pct_ms",
+            "value": 100,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m3_heal_gap_p95/churn5pct_ms",
+            "value": 100,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m3_heal_gap_p95/churn10pct_ms",
+            "value": 100,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m3_heal_gap_p95/churn15pct_ms",
+            "value": 100,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh/m3_heal_gap_p95/churn20pct_ms",
+            "value": 100,
+            "range": "± 0",
+            "unit": "ns/iter"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mooreericnyc@gmail.com",
+            "name": "Eric",
+            "username": "emooreatx"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e4fcd79d0cd48d1eb16140d57554f09157c88ea7",
+          "message": "feat(604): concurrent MLS commits converge by CC 3 — commits cross as chat:commit:v1 rows, earliest claim wins, the loser re-proposes (#618)\n\nCloses #604.\n\nFinding zero: no commit had ever crossed the mesh for a chat room — only KeyPackage/Welcome rode the plane; every later rotate/Add/Remove stayed on the node that made it, so the fork was unreachable because the other node never heard. Now `chat:commit:v1` rows carry commits (`commit_attestation_in`, reader `commits_from`), the row's `asserted_at` + `attesting_key_id` are the claim, and the producer refuses a commit claimed by anyone but the author.\n\nThe rule is CC 3 verbatim — earliest `claimed_at`, ties to the lowest key id, convergent from either arrival order, no coordination round-trip: `CommitClaim { at_ms, committer_key_id }` with derived `Ord`; `apply_remote_commit_claimed` contests a framed-past commit against the persisted ledger's incumbent — incumbent wins → `Discarded`, arrival wins → rollback to the retained snapshot at the fork epoch, apply the winner, RE-PROPOSE own discarded intents → `Superseded { reproposed }`. Bounded by `retained_epochs` (`ForkBeyondWindow`, surfaced never resolved). No coordinator, no lock, no vote.\n\n`chat::apply_room_commits` folds a peer's rows; `edge_node` emits and applies them and gains the `ladder.rotate_converges` rung (cross-node criterion: equal exporter fingerprints). Witness converges THROUGH THE ROWS with hand-delivery removed; mutations die at the lines naming \"the EARLIER claim must win\" / \"must be RE-PROPOSED, not lost\". A/V `Control::Commit` untouched; A/V lib modules unchanged.\n\nServer: emit `commit_attestation_in` at `contacts_chat.rs:873-878` and widen as the Welcome is at `:886`; apply beside `welcome_from` at `:927` via `apply_room_commits` and carry `reproposed`.\n\nCo-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>\nClaude-Session: https://claude.ai/code/session_01GLATGXybNAg7sGLqSgM2Jm\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+          "timestamp": "2026-09-17T22:00:02-05:00",
+          "tree_id": "472d0143fe8ef8ad4714303e1e15e193ec6dac39",
+          "url": "https://github.com/CIRISAI/CIRISEdge/commit/e4fcd79d0cd48d1eb16140d57554f09157c88ea7"
+        },
+        "date": 1789707622069,
+        "tool": "cargo",
+        "benches": [
+          {
+            "name": "envelope_verify_single/256",
+            "value": 76,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_verify_single/1024",
+            "value": 171,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_verify_single/4096",
+            "value": 548,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_verify_single/16384",
+            "value": 2061,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_verify_single/65536",
+            "value": 8143,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_verify_bulk/1k_256B",
+            "value": 77752,
+            "range": "± 422",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_canonicalize/256",
+            "value": 119,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_canonicalize/1024",
+            "value": 148,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_canonicalize/4096",
+            "value": 193,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_canonicalize/16384",
+            "value": 349,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "envelope_canonicalize/65536",
+            "value": 1038,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch_inbound/OpaqueEvent",
+            "value": 84,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch_inbound/FederationAnnouncement",
+            "value": 58,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch_inbound/ContentFetch",
+            "value": 59,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "dispatch_inbound/StewardDirective",
+            "value": 56,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_loopback/256",
+            "value": 41577,
+            "range": "± 676",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_loopback/1024",
+            "value": 41843,
+            "range": "± 307",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_loopback/4096",
+            "value": 43834,
+            "range": "± 390",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_loopback/16384",
+            "value": 52831,
+            "range": "± 352",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_loopback/65536",
+            "value": 87299,
+            "range": "± 611",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_http_loopback/256",
+            "value": 5078,
+            "range": "± 84",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_http_loopback/1024",
+            "value": 5094,
+            "range": "± 63",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_http_loopback/4096",
+            "value": 5177,
+            "range": "± 116",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_http_loopback/16384",
+            "value": 5378,
+            "range": "± 58",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_http_loopback/65536",
+            "value": 6777,
+            "range": "± 97",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_inbound_contention/inbound_drain/quiescent",
+            "value": 4133020,
+            "range": "± 149276",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "transport_reticulum_inbound_contention/inbound_drain/while_sending",
+            "value": 4934892,
+            "range": "± 243400",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/2",
+            "value": 123,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/8",
+            "value": 537,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/16",
+            "value": 1075,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/32",
+            "value": 2060,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/64",
+            "value": 4270,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/128",
+            "value": 8524,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame1024B/200",
+            "value": 13450,
+            "range": "± 38",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/2",
+            "value": 239,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/8",
+            "value": 948,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/16",
+            "value": 1954,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/32",
+            "value": 3881,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/64",
+            "value": 7656,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/128",
+            "value": 14674,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame4096B/200",
+            "value": 22948,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/2",
+            "value": 672,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/8",
+            "value": 2682,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/16",
+            "value": 5435,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/32",
+            "value": 10858,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/64",
+            "value": 21730,
+            "range": "± 34",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/128",
+            "value": 43477,
+            "range": "± 84",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame16384B/200",
+            "value": 67927,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/2",
+            "value": 2589,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/8",
+            "value": 10355,
+            "range": "± 13",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/16",
+            "value": 20713,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/32",
+            "value": 41431,
+            "range": "± 52",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/64",
+            "value": 82840,
+            "range": "± 131",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/128",
+            "value": 165741,
+            "range": "± 73",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "naive_seal_chunk_n_recipients/frame65536B/200",
+            "value": 258824,
+            "range": "± 191",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/2",
+            "value": 102,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/8",
+            "value": 304,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/16",
+            "value": 582,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/32",
+            "value": 1127,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/64",
+            "value": 2209,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/128",
+            "value": 4395,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame1024B/200",
+            "value": 6815,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/2",
+            "value": 171,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/8",
+            "value": 512,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/16",
+            "value": 962,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/32",
+            "value": 1866,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/64",
+            "value": 3670,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/128",
+            "value": 7539,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame4096B/200",
+            "value": 11841,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/2",
+            "value": 514,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/8",
+            "value": 1526,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/16",
+            "value": 2873,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/32",
+            "value": 5575,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/64",
+            "value": 10967,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/128",
+            "value": 21746,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame16384B/200",
+            "value": 33873,
+            "range": "± 30",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/2",
+            "value": 1994,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/8",
+            "value": 6172,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/16",
+            "value": 11744,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/32",
+            "value": 20120,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/64",
+            "value": 39625,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/128",
+            "value": 78665,
+            "range": "± 374",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "inner_once_outer_n_recipients/frame65536B/200",
+            "value": 122595,
+            "range": "± 180",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/2",
+            "value": 135,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/8",
+            "value": 447,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/16",
+            "value": 912,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/32",
+            "value": 1868,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/64",
+            "value": 3979,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/128",
+            "value": 9455,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame1024B/200",
+            "value": 16865,
+            "range": "± 102",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/2",
+            "value": 211,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/8",
+            "value": 659,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/16",
+            "value": 1352,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/32",
+            "value": 2713,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/64",
+            "value": 5657,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/128",
+            "value": 12397,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame4096B/200",
+            "value": 21435,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/2",
+            "value": 547,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/8",
+            "value": 1709,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/16",
+            "value": 3264,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/32",
+            "value": 6324,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/64",
+            "value": 12809,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/128",
+            "value": 25739,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame16384B/200",
+            "value": 41042,
+            "range": "± 125",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/2",
+            "value": 2096,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/8",
+            "value": 6340,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/16",
+            "value": 12030,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/32",
+            "value": 23445,
+            "range": "± 24",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/64",
+            "value": 46536,
+            "range": "± 33",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/128",
+            "value": 93651,
+            "range": "± 286",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/1-layer-opaque-frame65536B/200",
+            "value": 148162,
+            "range": "± 144",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/2",
+            "value": 334,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/8",
+            "value": 1076,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/16",
+            "value": 2178,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/32",
+            "value": 4428,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/64",
+            "value": 9877,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/128",
+            "value": 23504,
+            "range": "± 51",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame1024B/200",
+            "value": 43254,
+            "range": "± 74",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/2",
+            "value": 522,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/8",
+            "value": 1599,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/16",
+            "value": 3045,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/32",
+            "value": 6320,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/64",
+            "value": 13234,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/128",
+            "value": 31436,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame4096B/200",
+            "value": 53506,
+            "range": "± 99",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/2",
+            "value": 1286,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/8",
+            "value": 3632,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/16",
+            "value": 6782,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/32",
+            "value": 13366,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/64",
+            "value": 27130,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/128",
+            "value": 57814,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame16384B/200",
+            "value": 91869,
+            "range": "± 196",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/2",
+            "value": 4885,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/8",
+            "value": 13437,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/16",
+            "value": 24891,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/32",
+            "value": 48159,
+            "range": "± 19",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/64",
+            "value": 95148,
+            "range": "± 87",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/128",
+            "value": 192298,
+            "range": "± 110",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/3-spatial-av1-svc-frame65536B/200",
+            "value": 306358,
+            "range": "± 335",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/2",
+            "value": 730,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/8",
+            "value": 2277,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/16",
+            "value": 4461,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/32",
+            "value": 9638,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/64",
+            "value": 20742,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/128",
+            "value": 52043,
+            "range": "± 69",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame1024B/200",
+            "value": 94535,
+            "range": "± 662",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/2",
+            "value": 1121,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/8",
+            "value": 3353,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/16",
+            "value": 6249,
+            "range": "± 12",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/32",
+            "value": 12990,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/64",
+            "value": 27944,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/128",
+            "value": 63851,
+            "range": "± 172",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame4096B/200",
+            "value": 116320,
+            "range": "± 104",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/2",
+            "value": 2839,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/8",
+            "value": 7705,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/16",
+            "value": 14274,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/32",
+            "value": 28124,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/64",
+            "value": 52359,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/128",
+            "value": 121255,
+            "range": "± 155",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame16384B/200",
+            "value": 194512,
+            "range": "± 237",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/2",
+            "value": 10487,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/8",
+            "value": 27676,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/16",
+            "value": 50672,
+            "range": "± 105",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/32",
+            "value": 97594,
+            "range": "± 205",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/64",
+            "value": 192767,
+            "range": "± 128",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/128",
+            "value": 390269,
+            "range": "± 361",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "layered_inner_once_outer_admitted/7-cell-full-svc-frame65536B/200",
+            "value": 622833,
+            "range": "± 1152",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_4096B/2",
+            "value": 119,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_4096B/8",
+            "value": 554,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_4096B/32",
+            "value": 2222,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_4096B/128",
+            "value": 8997,
+            "range": "± 199",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_4096B/500",
+            "value": 40020,
+            "range": "± 222",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_16384B/2",
+            "value": 330,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_16384B/8",
+            "value": 1406,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_16384B/32",
+            "value": 5762,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_16384B/128",
+            "value": 26656,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_16384B/500",
+            "value": 292088,
+            "range": "± 8998",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_65536B/2",
+            "value": 1387,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_65536B/8",
+            "value": 5600,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_65536B/32",
+            "value": 24283,
+            "range": "± 244",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_65536B/128",
+            "value": 251225,
+            "range": "± 8162",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_uncapped/frame_65536B/500",
+            "value": 1056723,
+            "range": "± 8851",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_4096B/2",
+            "value": 135,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_4096B/2",
+            "value": 12,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_4096B/2",
+            "value": 71,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_4096B/8",
+            "value": 582,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_4096B/8",
+            "value": 41,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_4096B/8",
+            "value": 302,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_4096B/32",
+            "value": 2246,
+            "range": "± 71",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_4096B/32",
+            "value": 183,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_4096B/32",
+            "value": 1230,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_4096B/128",
+            "value": 9200,
+            "range": "± 106",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_4096B/128",
+            "value": 814,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_4096B/128",
+            "value": 5122,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_4096B/500",
+            "value": 39860,
+            "range": "± 493",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_4096B/500",
+            "value": 3228,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_4096B/500",
+            "value": 21210,
+            "range": "± 223",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_16384B/2",
+            "value": 364,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_16384B/2",
+            "value": 12,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_16384B/2",
+            "value": 185,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_16384B/8",
+            "value": 1476,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_16384B/8",
+            "value": 41,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_16384B/8",
+            "value": 758,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_16384B/32",
+            "value": 5852,
+            "range": "± 6",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_16384B/32",
+            "value": 182,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_16384B/32",
+            "value": 3096,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_16384B/128",
+            "value": 25745,
+            "range": "± 27",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_16384B/128",
+            "value": 810,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_16384B/128",
+            "value": 13690,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_16384B/500",
+            "value": 279256,
+            "range": "± 10021",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_16384B/500",
+            "value": 3250,
+            "range": "± 46",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_16384B/500",
+            "value": 53861,
+            "range": "± 198",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_65536B/2",
+            "value": 1400,
+            "range": "± 7",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_65536B/2",
+            "value": 12,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_65536B/2",
+            "value": 705,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_65536B/8",
+            "value": 5636,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_65536B/8",
+            "value": 46,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_65536B/8",
+            "value": 2846,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_65536B/32",
+            "value": 24942,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_65536B/32",
+            "value": 183,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_65536B/32",
+            "value": 11492,
+            "range": "± 18",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_65536B/128",
+            "value": 244934,
+            "range": "± 3182",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_65536B/128",
+            "value": 810,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_65536B/128",
+            "value": 51051,
+            "range": "± 383",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_uncapped/frame_65536B/500",
+            "value": 1114053,
+            "range": "± 6345",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/all_blinking_dot/frame_65536B/500",
+            "value": 3231,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_forward_n_subscribers_with_layer_filter/mixed_50_50/frame_65536B/500",
+            "value": 518913,
+            "range": "± 7992",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_set_policy_overhead/2",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_set_policy_overhead/8",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_set_policy_overhead/32",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_set_policy_overhead/128",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_set_policy_overhead/500",
+            "value": 3,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_4096B/2",
+            "value": 227,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_4096B/2",
+            "value": 60,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_4096B/2",
+            "value": 124,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_4096B/2",
+            "value": 120,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_4096B/8",
+            "value": 972,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_4096B/8",
+            "value": 62,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_4096B/8",
+            "value": 557,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_4096B/8",
+            "value": 478,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_4096B/32",
+            "value": 3869,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_4096B/32",
+            "value": 61,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_4096B/32",
+            "value": 2205,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_4096B/32",
+            "value": 1903,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_4096B/128",
+            "value": 15169,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_4096B/128",
+            "value": 61,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_4096B/128",
+            "value": 9004,
+            "range": "± 137",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_4096B/128",
+            "value": 7437,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_4096B/500",
+            "value": 60673,
+            "range": "± 57",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_4096B/500",
+            "value": 61,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_4096B/500",
+            "value": 39932,
+            "range": "± 594",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_4096B/500",
+            "value": 29746,
+            "range": "± 37",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_16384B/2",
+            "value": 639,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_16384B/2",
+            "value": 154,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_16384B/2",
+            "value": 334,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_16384B/2",
+            "value": 310,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_16384B/8",
+            "value": 2557,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_16384B/8",
+            "value": 154,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_16384B/8",
+            "value": 1459,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_16384B/8",
+            "value": 1239,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_16384B/32",
+            "value": 10232,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_16384B/32",
+            "value": 154,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_16384B/32",
+            "value": 6005,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_16384B/32",
+            "value": 4962,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_16384B/128",
+            "value": 41001,
+            "range": "± 21",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_16384B/128",
+            "value": 154,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_16384B/128",
+            "value": 26675,
+            "range": "± 44",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_16384B/128",
+            "value": 19849,
+            "range": "± 14",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_16384B/500",
+            "value": 168900,
+            "range": "± 76",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_16384B/500",
+            "value": 170,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_16384B/500",
+            "value": 279063,
+            "range": "± 6723",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_16384B/500",
+            "value": 84693,
+            "range": "± 39",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_65536B/2",
+            "value": 2413,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_65536B/2",
+            "value": 596,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_65536B/2",
+            "value": 1219,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_65536B/2",
+            "value": 1217,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_65536B/8",
+            "value": 9654,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_65536B/8",
+            "value": 597,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_65536B/8",
+            "value": 4897,
+            "range": "± 22",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_65536B/8",
+            "value": 4867,
+            "range": "± 5",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_65536B/32",
+            "value": 38612,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_65536B/32",
+            "value": 597,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_65536B/32",
+            "value": 21716,
+            "range": "± 189",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_65536B/32",
+            "value": 19466,
+            "range": "± 36",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_65536B/128",
+            "value": 154392,
+            "range": "± 119",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_65536B/128",
+            "value": 597,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_65536B/128",
+            "value": 229925,
+            "range": "± 14450",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_65536B/128",
+            "value": 78133,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/mesh_publisher/frame_65536B/500",
+            "value": 604372,
+            "range": "± 859",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_publisher/frame_65536B/500",
+            "value": 597,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_relay/frame_65536B/500",
+            "value": 1125150,
+            "range": "± 32333",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_vs_relay_comparison/relay_outer_only/frame_65536B/500",
+            "value": 305057,
+            "range": "± 267",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_400kbps/N_8",
+            "value": 374,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_400kbps/N_32",
+            "value": 1700,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_400kbps/N_128",
+            "value": 6741,
+            "range": "± 317",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_400kbps/N_500",
+            "value": 26826,
+            "range": "± 786",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_2500kbps/N_8",
+            "value": 1007,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_2500kbps/N_32",
+            "value": 4151,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_2500kbps/N_128",
+            "value": 17262,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_2500kbps/N_500",
+            "value": 192810,
+            "range": "± 1895",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_5000kbps/N_8",
+            "value": 1804,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_5000kbps/N_32",
+            "value": 7585,
+            "range": "± 405",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_5000kbps/N_128",
+            "value": 35050,
+            "range": "± 214",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_sustained_throughput/br_5000kbps/N_500",
+            "value": 355541,
+            "range": "± 10028",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_32/S_1",
+            "value": 3953,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_32/S_4",
+            "value": 16110,
+            "range": "± 15",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_32/S_16",
+            "value": 64434,
+            "range": "± 67",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_32/S_64",
+            "value": 259429,
+            "range": "± 1509",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_100/S_1",
+            "value": 12853,
+            "range": "± 47",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_100/S_4",
+            "value": 50803,
+            "range": "± 56",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_100/S_16",
+            "value": 206500,
+            "range": "± 1419",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_streams_per_core/N_100/S_64",
+            "value": 800636,
+            "range": "± 12574",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_uncapped/layer_BASE/64",
+            "value": 8447,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_blinking_dot/layer_BASE/64",
+            "value": 8450,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_mixed_50_50/layer_BASE/64",
+            "value": 8137,
+            "range": "± 9",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_uncapped/layer_mid_1_1_1/64",
+            "value": 8140,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_blinking_dot/layer_mid_1_1_1/64",
+            "value": 411,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_mixed_50_50/layer_mid_1_1_1/64",
+            "value": 4365,
+            "range": "± 70",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_uncapped/layer_high_2_2_2/64",
+            "value": 8131,
+            "range": "± 42",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_all_blinking_dot/layer_high_2_2_2/64",
+            "value": 410,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "relay_layered_bandwidth_saving/policy_mixed_50_50/layer_high_2_2_2/64",
+            "value": 4250,
+            "range": "± 11",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/2",
+            "value": 4808,
+            "range": "± 8",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/2",
+            "value": 4824,
+            "range": "± 3",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/8",
+            "value": 19726,
+            "range": "± 40",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/8",
+            "value": 19735,
+            "range": "± 20",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/32",
+            "value": 80103,
+            "range": "± 61",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/32",
+            "value": 80145,
+            "range": "± 29",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/128",
+            "value": 320739,
+            "range": "± 342",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/128",
+            "value": 320775,
+            "range": "± 185",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/512",
+            "value": 1283584,
+            "range": "± 1996",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/512",
+            "value": 1283582,
+            "range": "± 2115",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Join/2048",
+            "value": 5128006,
+            "range": "± 3154",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "flat_unicast_rewrap/Leave/2048",
+            "value": 5132307,
+            "range": "± 4276",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/2",
+            "value": 124582,
+            "range": "± 1060",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/2",
+            "value": 56035,
+            "range": "± 178",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/8",
+            "value": 187467,
+            "range": "± 1283",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/8",
+            "value": 130521,
+            "range": "± 788",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/32",
+            "value": 433082,
+            "range": "± 2787",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/32",
+            "value": 343535,
+            "range": "± 3039",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/128",
+            "value": 1303485,
+            "range": "± 6620",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/128",
+            "value": 1101356,
+            "range": "± 12475",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/512",
+            "value": 4658537,
+            "range": "± 34763",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/512",
+            "value": 4037791,
+            "range": "± 38299",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Join/2048",
+            "value": 18000407,
+            "range": "± 167194",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mls_rekey/Leave/2048",
+            "value": 15636506,
+            "range": "± 96346",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_round_trip_correctness/full_64KiB_frame",
+            "value": 2887,
+            "range": "± 25",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_multi_parent_dedup/dual_parent_64KiB_frame",
+            "value": 3697,
+            "range": "± 49",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_degraded_quality/subscribed_substreams/1",
+            "value": 1356,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_degraded_quality/subscribed_substreams/2",
+            "value": 1889,
+            "range": "± 10",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_degraded_quality/subscribed_substreams/3",
+            "value": 2422,
+            "range": "± 17",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_degraded_quality/subscribed_substreams/4",
+            "value": 2943,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_planner_picks_distinct_parents/plan_4_substreams",
+            "value": 102,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_full_round_trip_cost_decomposition/step_inner_seal_4x",
+            "value": 783,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_full_round_trip_cost_decomposition/step_outer_seal_4x",
+            "value": 702,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_full_round_trip_cost_decomposition/step_dedup_observe_4x",
+            "value": 29,
+            "range": "± 1",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_full_round_trip_cost_decomposition/step_aead_open_4x",
+            "value": 1230,
+            "range": "± 2",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "mesh_e2e_full_round_trip_cost_decomposition/step_reassemble_4x",
+            "value": 88,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain_reconstruction/decode/m20",
+            "value": 1453,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain_reconstruction/decode/m23",
+            "value": 1576,
+            "range": "± 4",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain_reconstruction/decode/m26",
+            "value": 475,
+            "range": "± 0",
+            "unit": "ns/iter"
+          },
+          {
+            "name": "fountain_reconstruction/encode_n20_k6",
+            "value": 1045,
+            "range": "± 0",
             "unit": "ns/iter"
           },
           {
