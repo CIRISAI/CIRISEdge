@@ -5806,6 +5806,7 @@ impl Transport for ReticulumTransport {
                         matches!(event, NodeEvent::LinkEstablished { .. });
                     let ctx = EventCtx {
                         node: &self.node,
+                        local_key_id: &self.config.local_key_id,
                         peers: &self.peers,
                         established_links: &self.established_links,
                         sent_resource_progress: &self.sent_resource_progress,
@@ -6128,6 +6129,10 @@ struct AnnounceCtx {
 /// Shared handles the event loop hands to [`handle_event`].
 struct EventCtx<'a> {
     node: &'a ReticulumNode,
+    /// CIRISEdge#621 — this node's own key id, so inbound attribution can
+    /// refuse to resolve a link to ourselves regardless of what the peers map
+    /// holds (see [`LinkAttribution::ResolvedToSelf`]).
+    local_key_id: &'a str,
     peers: &'a Mutex<HashMap<String, RootedPeer>>,
     established_links: &'a Mutex<HashSet<LinkId>>,
     /// CIRISEdge#353b/v13.6.1 — sender-side resource transfer progress (see the
@@ -6227,23 +6232,55 @@ enum LinkAttribution {
     /// A destination IS known but matches no rooted peer in the map (e.g. the peer
     /// has not rooted yet).
     DestUnmatched(DestinationHash),
+    /// CIRISEdge#621 — the attribution resolved to THIS node's own key. An
+    /// inbound link is, by construction, a link someone else holds the far end
+    /// of; its source is never us. This arm fires when the peers map carries a
+    /// self-entry (CIRISServer#607: the canonical primed itself as a peer, so
+    /// every link dialed TO it — whose dest is its own announced destination —
+    /// resolved to its own key, and the bootstrap carve-out then built a
+    /// responder that replied to itself). Dropped, named; never a candidate.
+    ResolvedToSelf(String),
+}
+
+/// CIRISEdge#621 — the one drop for [`LinkAttribution::ResolvedToSelf`], through
+/// the #425 choke point with its own reason tag. Split out so the arm in
+/// `attribute_and_deliver` stays one call (that fn is at clippy's line cap).
+fn drop_resolved_to_self(link_id: LinkId, key_id: &str) {
+    let detail = format!(
+        "inbound link resolved to THIS node's own key {key_id} — the peers map holds a \
+         self-entry (CIRISServer#607); an inbound link's source is never us, so no \
+         responder is built for it (CIRISEdge#621)"
+    );
+    drop_inbound(Some(link_id), "attribution_resolved_to_self", &detail);
 }
 
 /// Pure attribution decision (unit-tested — the layer the server's loopback round
 /// harness cannot reach, per CIRISEdge#424). The `LinkIdentified` table wins; else
 /// the link's known destination is mapped back to a rooted peer; else a CLASSIFIED
 /// miss (never an unlabelled `None`). `peer_for_dest` closes over the live peer map.
+///
+/// `local_key_id` is THIS node's key (CIRISEdge#621): whichever branch answers,
+/// an answer equal to it is [`LinkAttribution::ResolvedToSelf`] — a peers-map
+/// self-entry must not be able to make an inbound link look like our own. The
+/// invariant is on the RESULT, not on the map's contents: the map is the
+/// consumer's to populate (CIRISServer#607 removes its self-entry at the
+/// source); this makes its contents unable to produce the failure.
 fn resolve_link_attribution(
     identified: Option<String>,
     dest: Option<DestinationHash>,
+    local_key_id: &str,
     peer_for_dest: impl FnOnce(DestinationHash) -> Option<String>,
 ) -> LinkAttribution {
     if let Some(key_id) = identified {
+        if key_id == local_key_id {
+            return LinkAttribution::ResolvedToSelf(key_id);
+        }
         return LinkAttribution::ViaIdentified(key_id);
     }
     match dest {
         None => LinkAttribution::NoDest,
         Some(d) => match peer_for_dest(d) {
+            Some(key_id) if key_id == local_key_id => LinkAttribution::ResolvedToSelf(key_id),
             Some(key_id) => LinkAttribution::ViaDialedDest(key_id),
             None => LinkAttribution::DestUnmatched(d),
         },
@@ -6381,7 +6418,7 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     };
     let candidate_key_id = {
         let peers = ctx.peers.lock().await;
-        let outcome = resolve_link_attribution(identified, dest, |d| {
+        let outcome = resolve_link_attribution(identified, dest, ctx.local_key_id, |d| {
             peers
                 .iter()
                 .find(|(_, rooted)| rooted.peer.dest_hash == d)
@@ -6389,6 +6426,16 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         });
         drop(peers);
         match outcome {
+            // CIRISEdge#621 — never our own key. A frame attributed to
+            // ourselves cannot be delivered even unattributed: its
+            // `link_key_id` would be self, and the bootstrap carve-out would
+            // build a responder that replies to itself (CIRISServer#607's 0
+            // rounds served). Dropped through the one choke point, named.
+            LinkAttribution::ResolvedToSelf(key_id) => {
+                drop_resolved_to_self(link_id, &key_id);
+                // choke-ok: `drop_resolved_to_self` IS a `drop_inbound` call (#621).
+                return;
+            }
             LinkAttribution::ViaIdentified(key_id) => Some(key_id),
             LinkAttribution::ViaDialedDest(key_id) => {
                 tracing::debug!(
@@ -9985,6 +10032,9 @@ mod tests {
     mod initiator_attribution {
         use super::*;
 
+        /// This node's own key id, for the CIRISEdge#621 self checks.
+        const SELF: &str = "self-node";
+
         fn dh(b: u8) -> DestinationHash {
             DestinationHash::new([b; 16])
         }
@@ -9993,7 +10043,7 @@ mod tests {
         fn identified_table_wins_even_with_a_dest() {
             // A peer dialed us: the `LinkIdentified` table is authoritative and the
             // dest map is not even consulted.
-            let out = resolve_link_attribution(Some("peer-a".into()), Some(dh(1)), |_| {
+            let out = resolve_link_attribution(Some("peer-a".into()), Some(dh(1)), SELF, |_| {
                 panic!("peer_for_dest must not be consulted when identified")
             });
             assert_eq!(out, LinkAttribution::ViaIdentified("peer-a".into()));
@@ -10004,7 +10054,7 @@ mod tests {
             // THE #424 FIX: no `LinkIdentified` (we dialed the link), but the dest
             // edge recorded at connect maps back to the peer — attribution now
             // succeeds where leviculum's `link_destination`=None used to drop it.
-            let out = resolve_link_attribution(None, Some(dh(7)), |d| {
+            let out = resolve_link_attribution(None, Some(dh(7)), SELF, |d| {
                 (d == dh(7)).then(|| "canonical-1".to_string())
             });
             assert_eq!(out, LinkAttribution::ViaDialedDest("canonical-1".into()));
@@ -10014,7 +10064,7 @@ mod tests {
         fn no_dest_is_classified_not_a_silent_else() {
             // THE #424 BUG CONDITION, now a NAMED outcome: `link_destination`=None
             // AND no dialed-dest record. Must never again be an unlabelled `None`.
-            let out = resolve_link_attribution(None, None, |_| {
+            let out = resolve_link_attribution(None, None, SELF, |_| {
                 panic!("peer_for_dest must not be consulted with no dest")
             });
             assert_eq!(out, LinkAttribution::NoDest);
@@ -10024,8 +10074,91 @@ mod tests {
         fn known_dest_with_no_rooted_peer_is_dest_unmatched() {
             // A dest is known but no peer matches it (not yet rooted) — a distinct,
             // logged outcome from "no dest at all".
-            let out = resolve_link_attribution(None, Some(dh(9)), |_| None);
+            let out = resolve_link_attribution(None, Some(dh(9)), SELF, |_| None);
             assert_eq!(out, LinkAttribution::DestUnmatched(dh(9)));
+        }
+
+        // ── CIRISEdge#621 — attribution never resolves to the local key ──
+
+        /// (a) THE #621 CONDITION: the peers map holds a self-entry under our own
+        /// announced destination, and a peer dialed a link TO us. Branch B must
+        /// not answer "us".
+        #[test]
+        fn a_self_entry_in_the_peers_map_resolves_to_self_not_to_a_peer() {
+            let out = resolve_link_attribution(None, Some(dh(3)), SELF, |d| {
+                (d == dh(3)).then(|| SELF.to_string())
+            });
+            assert_eq!(
+                out,
+                LinkAttribution::ResolvedToSelf(SELF.into()),
+                "a self-entry must produce the NAMED self outcome, never ViaDialedDest(self)"
+            );
+        }
+
+        /// (b) The same frame with the self-entry ABSENT is exactly today's
+        /// verdict — the fix is additive.
+        #[test]
+        fn without_a_self_entry_the_same_link_is_dest_unmatched_as_before() {
+            let out = resolve_link_attribution(None, Some(dh(3)), SELF, |_| None);
+            assert_eq!(out, LinkAttribution::DestUnmatched(dh(3)));
+        }
+
+        /// (c) A genuine peer still attributes on both branches.
+        #[test]
+        fn a_genuine_peer_still_attributes_on_both_branches() {
+            let via_dest = resolve_link_attribution(None, Some(dh(4)), SELF, |d| {
+                (d == dh(4)).then(|| "peer-b".to_string())
+            });
+            assert_eq!(via_dest, LinkAttribution::ViaDialedDest("peer-b".into()));
+            let via_ident = resolve_link_attribution(Some("peer-b".into()), None, SELF, |_| None);
+            assert_eq!(via_ident, LinkAttribution::ViaIdentified("peer-b".into()));
+        }
+
+        /// Branch A closes the same door: an identified-table entry naming us is
+        /// self, not a peer.
+        #[test]
+        fn an_identified_entry_naming_us_is_self() {
+            let out = resolve_link_attribution(Some(SELF.into()), Some(dh(5)), SELF, |_| {
+                panic!("peer_for_dest must not be consulted when identified")
+            });
+            assert_eq!(out, LinkAttribution::ResolvedToSelf(SELF.into()));
+        }
+
+        proptest::proptest! {
+            /// The universal invariant: over any identified entry, any dest, and
+            /// any peers-map answer, the attribution NEVER carries the local key
+            /// in a peer-shaped arm.
+            #[test]
+            fn attribution_never_resolves_to_the_local_key_as_a_peer(
+                // Each id slot draws SELF with real probability, or the map
+                // would practically never answer "us" and the invariant would
+                // be exercised by luck.
+                identified in proptest::option::of(proptest::prop_oneof![
+                    proptest::strategy::Just(SELF.to_string()),
+                    proptest::string::string_regex("[a-z0-9-]{1,12}").unwrap(),
+                ]),
+                dest_byte in proptest::option::of(0u8..=255),
+                mapped in proptest::option::of(proptest::prop_oneof![
+                    proptest::strategy::Just(SELF.to_string()),
+                    proptest::string::string_regex("[a-z0-9-]{1,12}").unwrap(),
+                ]),
+            ) {
+                let out = resolve_link_attribution(
+                    identified,
+                    dest_byte.map(dh),
+                    SELF,
+                    |_| mapped.clone(),
+                );
+                match out {
+                    LinkAttribution::ViaIdentified(k) | LinkAttribution::ViaDialedDest(k) => {
+                        proptest::prop_assert_ne!(k, SELF.to_string());
+                    }
+                    LinkAttribution::ResolvedToSelf(k) => {
+                        proptest::prop_assert_eq!(k, SELF.to_string());
+                    }
+                    LinkAttribution::NoDest | LinkAttribution::DestUnmatched(_) => {}
+                }
+            }
         }
     }
 

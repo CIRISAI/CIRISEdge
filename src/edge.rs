@@ -5045,6 +5045,10 @@ async fn route_attributed_frame(
             true
         }
         Ok(RouteOutcome::NotAReplicationFrame) => false, // → envelope dispatch
+        // CIRISEdge#621 — consumed (dropped, named by the registry's WARN), never
+        // handed to envelope dispatch: a frame attributed to ourselves has no
+        // legitimate route anywhere.
+        Ok(RouteOutcome::RefusedSelf) => true,
         Ok(RouteOutcome::NoCoordinatorRegistered { kind }) => {
             tracing::warn!(
                 peer = %source,
@@ -9121,6 +9125,45 @@ mod inbound_ingest_tests {
                 refs: vec![],
             }));
         assert!(!route_replication_frame(None, &frame(crpl, Some("agent-peer")), None).await);
+    }
+
+    /// CIRISEdge#621 — the bootstrap carve-out must not build a responder for
+    /// ourselves. A self-authenticating `Key` frame arriving on a link whose
+    /// transport identity resolved to THIS node (the CIRISServer#607 shape: a
+    /// peers-map self-entry) is consumed and refused; no coordinator appears,
+    /// and the responder factory is never invoked.
+    #[tokio::test]
+    async fn a_bootstrap_frame_on_a_link_attributed_to_ourselves_builds_no_responder() {
+        let registry = std::sync::Arc::new(ReplicationRegistry::new());
+        registry.set_local_key_id("self-node");
+        registry.set_responder_factory(std::sync::Arc::new(|peer: &str, kind| {
+            panic!(
+                "a responder must never be built for {peer} ({kind:?}) — that is the \
+                 CIRISServer#607 reply-to-self (CIRISEdge#621)"
+            )
+        }));
+        let crpl =
+            crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            }));
+        let mut f = frame(crpl.clone(), None);
+        f.link_key_id = Some("self-node".into());
+        assert!(
+            route_replication_frame(Some(&registry), &f, None).await,
+            "the frame is consumed (refused), never envelope-dispatched",
+        );
+        assert!(
+            registry.registered_keys().await.is_empty(),
+            "no coordinator may exist for our own key",
+        );
+        // And a genuine peer on the same path still bootstraps (no factory ⇒
+        // `NoCoordinatorRegistered`, consumed — the pre-#621 verdict, unchanged).
+        let registry = std::sync::Arc::new(ReplicationRegistry::new());
+        registry.set_local_key_id("self-node");
+        let mut g = frame(crpl, None);
+        g.link_key_id = Some("fresh-peer".into());
+        assert!(route_replication_frame(Some(&registry), &g, None).await);
     }
 
     /// CIRISEdge#402 — the bootstrap attribution carve-out truth table, tested at
