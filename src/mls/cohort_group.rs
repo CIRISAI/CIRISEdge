@@ -64,15 +64,28 @@
 //! written **before** the head pointer moves to N, so a crash between
 //! the two leaves the head at N-1 whose snapshot is still retained.
 //!
-//! # Single writer per `community_id`
+//! # Single writer per process, convergent merge across the mesh
 //!
-//! Two concurrent commits against the same group fork the epoch (both
-//! committers believe they own N+1; one of them is wrong and its
-//! peers will reject its subsequent messages). Every mutating method
-//! here takes an async mutex, and [`CohortGroups`] hands out clones
-//! of the *same* [`CohortGroup`] handle per `community_id` so two
-//! independently-obtained handles share one lock rather than racing
-//! two in-memory copies of the same group.
+//! Within one process, every mutating method takes an async mutex and
+//! [`CohortGroups`] hands out clones of the *same* [`CohortGroup`]
+//! handle per `community_id`, so two independently-obtained handles
+//! share one lock rather than racing two in-memory copies.
+//!
+//! Across nodes there is no lock to take. Two members committing
+//! against epoch N inside one replication round both believe they own
+//! N+1, and RFC 9420 delegates that ordering to a Delivery Service the
+//! Constitution has none of by design. The serialization discipline
+//! this group declares (ledger clause 3) is CC 3's **convergent
+//! merge**: every commit carries a [`CommitClaim`] — its instant and
+//! its committer — and two commits framed in the same epoch settle on
+//! the *earliest instant, ties to the lowest key id*, from either
+//! arrival order, with no coordination round-trip. A node that applied
+//! the loser rolls back to the fork point (bounded by the retention
+//! window), applies the winner, and re-proposes its own discarded
+//! commits against the winner's line
+//! ([`CohortGroup::apply_remote_commit_claimed`], CIRISEdge#604). The
+//! same rule governs persist's DEK layer (CIRISPersist#848); this is
+//! the agreement-layer lease persist's FSD §11 places here.
 //!
 //! # Relationship to `transport::realtime_av_mls`
 //!
@@ -101,6 +114,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, PoisonError};
 
+use chrono::{DateTime, Utc};
 use openmls::group::GroupId;
 use openmls::prelude::{
     BasicCredential, Ciphersuite, ContentType, CredentialWithKey, KeyPackage, KeyPackageBundle,
@@ -111,6 +125,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_libcrux_crypto::Provider as LibcruxProvider;
 use openmls_traits::types::SignatureScheme;
 use openmls_traits::OpenMlsProvider;
+use serde::{Deserialize, Serialize};
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use tokio::sync::Mutex;
 use zeroize::Zeroize;
@@ -174,6 +189,12 @@ pub const SNAPSHOT_VERSION: u8 = 0x01;
 /// [`CohortGroupInner::persist_and_seal`] refuses the collision
 /// explicitly rather than trusting the arithmetic.
 const HEAD_SLOT: u64 = u64::MAX;
+
+/// Reserved slot for the epoch ledger — the per-epoch [`CommitClaim`]s
+/// and this node's own commit intents (CIRISEdge#604). Written beside
+/// every snapshot, BEFORE the head pointer moves, so a contest after a
+/// restart sees the same incumbents its peers do.
+const LEDGER_SLOT: u64 = u64::MAX - 1;
 
 /// Version byte on the head-pointer value (independent of
 /// [`SNAPSHOT_VERSION`]: the pointer encoding can change without the
@@ -312,6 +333,26 @@ pub enum CohortGroupError {
     EpochExhausted,
     /// The bytes handed to [`CohortGroup::join`] decoded as MLS but
     /// were not a Welcome.
+    /// A contested commit WON against a line this node can no longer
+    /// roll back to: the fork point's snapshot has left the retention
+    /// window ([`DEFAULT_RETAINED_EPOCHS`]). A mesh that forks deeper
+    /// than the window is partitioned or hostile, not merely slow —
+    /// surfaced, never silently resolved (CIRISEdge#604).
+    #[error(
+        "cohort group fork at epoch {framed_epoch} is beyond the rollback window \
+         (current {current}, retained {retained}) — re-delivery or a fresh Welcome is the path"
+    )]
+    ForkBeyondWindow {
+        /// The epoch both commits were framed in.
+        framed_epoch: u64,
+        /// This node's epoch when the contest arrived.
+        current: u64,
+        /// The retention window that bounds rollback.
+        retained: u64,
+    },
+    /// The epoch ledger slot did not decode.
+    #[error("cohort group epoch ledger: malformed ({0})")]
+    LedgerMalformed(String),
     #[error("expected a Welcome message, got a different MLS content type")]
     NotAWelcome,
     /// [`StagedWelcome::new_from_welcome`] refused the Welcome — most
@@ -416,6 +457,7 @@ pub struct CohortCommit {
     epoch: u64,
     commit: Vec<u8>,
     welcome: Option<Vec<u8>>,
+    claim: CommitClaim,
 }
 
 impl CohortCommit {
@@ -437,6 +479,14 @@ impl CohortCommit {
         self.welcome.as_deref()
     }
 
+    /// The claim this commit makes on the epoch it was framed in —
+    /// WHEN and BY WHOM (CIRISEdge#604). A carrier row MUST bind it
+    /// (the row's `asserted_at` is the claim's instant, its author the
+    /// committer) so every peer contests the same tuple.
+    pub fn claim(&self) -> &CommitClaim {
+        &self.claim
+    }
+
     /// Consume into `(epoch, commit_bytes, welcome_bytes)`.
     pub fn into_parts(self) -> (u64, Vec<u8>, Option<Vec<u8>>) {
         (self.epoch, self.commit, self.welcome)
@@ -449,8 +499,167 @@ impl std::fmt::Debug for CohortCommit {
             .field("epoch", &self.epoch)
             .field("commit_len", &self.commit.len())
             .field("welcome_len", &self.welcome.as_ref().map(Vec::len))
+            .field("claim", &self.claim)
             .finish()
     }
+}
+
+// ─── Convergent merge of concurrent commits (CIRISEdge#604) ─────────
+
+/// The claim a commit makes on the epoch it was framed in: WHEN it was
+/// committed and BY WHOM.
+///
+/// **The derived `Ord` IS the rule.** CC 3 (composition): *"concurrent
+/// claims are expected rather than prevented and MUST settle on earliest
+/// `claimed_at`, ties broken on the lowest occurrence `key_id`"*. Fields
+/// are ordered `(at_ms, committer_key_id)` so `a < b` means `a` wins —
+/// convergent from either arrival order, with no coordination round-trip.
+/// The instant is millisecond-exact so a claim compares byte-equal on
+/// every node that binds it into a signed row.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CommitClaim {
+    at_ms: i64,
+    committer_key_id: String,
+}
+
+impl CommitClaim {
+    /// A claim at `at` (truncated to the millisecond) by `committer_key_id`.
+    #[must_use]
+    pub fn new(at: DateTime<Utc>, committer_key_id: impl Into<String>) -> Self {
+        Self {
+            at_ms: at.timestamp_millis(),
+            committer_key_id: committer_key_id.into(),
+        }
+    }
+
+    /// The claimed instant, millisecond-exact.
+    #[must_use]
+    pub fn asserted_at(&self) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(self.at_ms).unwrap_or(DateTime::UNIX_EPOCH)
+    }
+
+    /// The committer's CIRIS `key_id`.
+    #[must_use]
+    pub fn committer_key_id(&self) -> &str {
+        &self.committer_key_id
+    }
+
+    /// Does this claim take the epoch from `other`? Earliest instant,
+    /// then lowest key id. Equal claims are the same commit.
+    #[must_use]
+    pub fn wins_over(&self, other: &Self) -> bool {
+        self < other
+    }
+}
+
+/// What this node MEANT by a commit it authored — kept so a commit that
+/// loses a contest can be re-proposed against the winner's epoch.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum CommitIntent {
+    Rotate,
+    Add {
+        key_id: String,
+        key_package: Vec<u8>,
+    },
+    Remove {
+        key_id: String,
+    },
+}
+
+/// The per-community epoch ledger, persisted in [`LEDGER_SLOT`]: which
+/// claim holds each framed epoch, and this node's own intents for the
+/// commits it authored. Both maps are pruned to the retention window.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct EpochLedger {
+    claims: BTreeMap<u64, CommitClaim>,
+    intents: BTreeMap<u64, CommitIntent>,
+}
+
+/// Claims are kept this many times longer than snapshots. A claim is a
+/// few dozen bytes; a snapshot is the whole group. Keeping claims past
+/// the rollback window is what lets a fork DEEPER than the window be
+/// named ([`CohortGroupError::ForkBeyondWindow`]) rather than mistaken
+/// for a stale replay: with the incumbent still on record the contest
+/// can see that a winning claim arrived for an epoch it can no longer
+/// roll back to. Beyond even this horizon an arrival has nothing to be
+/// contested against and reads as already-applied, which for a commit
+/// that old is what it is.
+const CLAIM_RETENTION_FACTOR: u64 = 8;
+
+impl EpochLedger {
+    fn prune(&mut self, current: u64, retained: u64) {
+        if let Some(floor) = current.checked_sub(retained) {
+            self.intents.retain(|e, _| *e >= floor);
+        }
+        if let Some(floor) = current.checked_sub(retained.saturating_mul(CLAIM_RETENTION_FACTOR)) {
+            self.claims.retain(|e, _| *e >= floor);
+        }
+    }
+}
+
+/// A future-epoch commit held until its predecessors land, with the
+/// claim its carrier row bound (if any) so the contest can run when
+/// its turn comes.
+struct HeldCommit {
+    bytes: Vec<u8>,
+    claim: Option<CommitClaim>,
+}
+
+/// What [`CohortGroup::apply_remote_commit_claimed`] did with a commit
+/// whose carrier row bound a [`CommitClaim`].
+#[derive(Debug, Clone)]
+#[must_use = "Superseded carries commits that MUST be fanned out; Discarded names the claim that kept the epoch"]
+pub enum ClaimedApplyOutcome {
+    /// Merged and persisted; the group is now at this epoch.
+    Applied(u64),
+    /// Framed in a future epoch; held (see [`CommitApplyOutcome::Deferred`]).
+    Deferred {
+        /// The epoch the held commit advances to once applicable.
+        held_for_epoch: u64,
+    },
+    /// Already reached — a duplicate, a replay, or a contest this node
+    /// cannot adjudicate (no claim on either side). No state change.
+    AlreadyApplied(u64),
+    /// The arrival contested an epoch and LOST: the incumbent claim is
+    /// earlier (or equal-instant with a lower key id). No state change;
+    /// the arrival's author will see the incumbent and re-propose.
+    Discarded {
+        /// This node's epoch, unchanged.
+        kept_epoch: u64,
+        /// The claim that holds the contested epoch.
+        kept_by: CommitClaim,
+    },
+    /// The arrival contested an epoch and WON: this node rolled back to
+    /// the fork point, applied the winner, and re-proposed every commit
+    /// of its own that the rollback discarded. `reproposed` are the
+    /// re-issued commits, in order — each MUST be fanned out.
+    Superseded {
+        /// The group's epoch after the winner and the re-proposals.
+        epoch: u64,
+        /// This node's re-proposed commits against the winner's line.
+        reproposed: Vec<CohortCommit>,
+    },
+}
+
+impl ClaimedApplyOutcome {
+    /// The claim-blind projection [`CohortGroup::apply_remote_commit`]
+    /// reports: a lost contest reads as `AlreadyApplied`, a won one as
+    /// `Applied` — which is all a caller that bound no claim can act on.
+    fn into_legacy(self, framed_epoch: u64) -> CommitApplyOutcome {
+        match self {
+            Self::Applied(e) => CommitApplyOutcome::Applied(e),
+            Self::Deferred { held_for_epoch } => CommitApplyOutcome::Deferred { held_for_epoch },
+            Self::AlreadyApplied(e) => CommitApplyOutcome::AlreadyApplied(e),
+            Self::Discarded { .. } => CommitApplyOutcome::AlreadyApplied(framed_epoch + 1),
+            Self::Superseded { epoch, .. } => CommitApplyOutcome::Applied(epoch),
+        }
+    }
+}
+
+/// `now`, millisecond-exact — the resolution a claim carries.
+fn now_ms() -> DateTime<Utc> {
+    let now = Utc::now();
+    DateTime::from_timestamp_millis(now.timestamp_millis()).unwrap_or(now)
 }
 
 /// What [`CohortGroup::apply_remote_commit`] did with the commit it
@@ -773,7 +982,13 @@ struct CohortGroupInner {
     /// a held commit is a transient wire artifact, and after a
     /// restart the recovery path is re-delivery or a fresh Welcome,
     /// exactly as for a commit lost in flight.
-    held_commits: BTreeMap<u64, Vec<u8>>,
+    held_commits: BTreeMap<u64, HeldCommit>,
+    /// This node's CIRIS `key_id` — the committer named in every claim
+    /// it makes (CIRISEdge#604).
+    own_key_id: String,
+    /// The epoch ledger — see [`EpochLedger`]. Persisted in
+    /// [`LEDGER_SLOT`] on every persist, before the head moves.
+    ledger: EpochLedger,
 }
 
 impl CohortGroupInner {
@@ -824,18 +1039,28 @@ impl CohortGroupInner {
         &self,
         commit: Vec<u8>,
         welcome: Option<Vec<u8>>,
+        claim: CommitClaim,
     ) -> impl std::future::Future<Output = Result<CohortCommit, CohortGroupError>> + '_ {
         let blob = self.snapshot();
+        let ledger = serde_json::to_vec(&self.ledger)
+            .map_err(|e| CohortGroupError::LedgerMalformed(format!("encode: {e}")));
         async move {
             let epoch = self.epoch();
-            if epoch == HEAD_SLOT {
+            if epoch >= LEDGER_SLOT {
                 return Err(CohortGroupError::EpochExhausted);
             }
             let blob = blob?;
-
+            let ledger = ledger?;
             // (1) snapshot first.
             self.store
                 .group_state_put(&self.community_id, epoch, &blob)
+                .await?;
+            // (1b) the epoch ledger, still before the head moves: a
+            // restart that sees the new head must also see the claim
+            // that holds it, or its next contest disagrees with its
+            // peers (CIRISEdge#604).
+            self.store
+                .group_state_put(&self.community_id, LEDGER_SLOT, &ledger)
                 .await?;
             // (2) then the head pointer.
             self.store
@@ -849,6 +1074,7 @@ impl CohortGroupInner {
                 epoch,
                 commit,
                 welcome,
+                claim,
             })
         }
     }
@@ -953,8 +1179,14 @@ impl CohortGroupInner {
     /// lowest-epoch held commit is dropped — loudly, because every
     /// drop is a hole the apply chain cannot cross without
     /// re-delivery.
-    fn hold_commit(&mut self, framed_epoch: u64, commit: Vec<u8>) {
-        self.held_commits.insert(framed_epoch, commit);
+    fn hold_commit(&mut self, framed_epoch: u64, commit: Vec<u8>, claim: Option<CommitClaim>) {
+        self.held_commits.insert(
+            framed_epoch,
+            HeldCommit {
+                bytes: commit,
+                claim,
+            },
+        );
         while self.held_commits.len() > MAX_HELD_COMMITS {
             if let Some((dropped, _)) = self.held_commits.pop_first() {
                 tracing::warn!(
@@ -966,6 +1198,132 @@ impl CohortGroupInner {
                 );
             }
         }
+    }
+
+    /// Record this node's claim on the epoch it is about to advance
+    /// FROM, and what it meant by it. Called after the merge, before
+    /// the persist, so the ledger the persist writes names the commit.
+    fn claim_local(&mut self, framed: u64, at: DateTime<Utc>, intent: CommitIntent) -> CommitClaim {
+        let claim = CommitClaim::new(at, self.own_key_id.clone());
+        self.ledger.claims.insert(framed, claim.clone());
+        self.ledger.intents.insert(framed, intent);
+        self.ledger.prune(self.epoch(), self.retained_epochs);
+        claim
+    }
+
+    /// Add a member: the committer's half of [`CohortGroup::add_member_at`].
+    async fn commit_add(
+        &mut self,
+        key_id: &str,
+        key_package: KeyPackage,
+        at: DateTime<Utc>,
+    ) -> Result<CohortCommit, CohortGroupError> {
+        let key_package_bytes = key_package_to_bytes(key_package.clone())?;
+        let framed = self.epoch();
+        let (commit_msg, welcome_msg, _group_info) = self
+            .group
+            .add_members(self.provider.as_ref(), &self.signer, &[key_package])
+            .map_err(|e| CohortGroupError::AddFailed(format!("{e:?}")))?;
+        self.group
+            .merge_pending_commit(self.provider.as_ref())
+            .map_err(|e| CohortGroupError::AddFailed(format!("merge_pending_commit: {e:?}")))?;
+        let commit = serialize_mls_message(&commit_msg)?;
+        let welcome = Some(serialize_mls_message(&welcome_msg)?);
+        let claim = self.claim_local(
+            framed,
+            at,
+            CommitIntent::Add {
+                key_id: key_id.to_string(),
+                key_package: key_package_bytes,
+            },
+        );
+        self.persist_and_seal(commit, welcome, claim).await
+    }
+
+    /// Remove a member: the committer's half of [`CohortGroup::remove_member_at`].
+    async fn commit_remove(
+        &mut self,
+        key_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<CohortCommit, CohortGroupError> {
+        let idx = self.leaf_of(key_id)?;
+        let framed = self.epoch();
+        let (commit_msg, welcome_msg, _group_info) = self
+            .group
+            .remove_members(self.provider.as_ref(), &self.signer, &[idx])
+            .map_err(|e| CohortGroupError::RemoveFailed(format!("{e:?}")))?;
+        self.group
+            .merge_pending_commit(self.provider.as_ref())
+            .map_err(|e| CohortGroupError::RemoveFailed(format!("merge_pending_commit: {e:?}")))?;
+        let commit = serialize_mls_message(&commit_msg)?;
+        let welcome = welcome_msg.map(|m| serialize_mls_message(&m)).transpose()?;
+        let claim = self.claim_local(
+            framed,
+            at,
+            CommitIntent::Remove {
+                key_id: key_id.to_string(),
+            },
+        );
+        self.persist_and_seal(commit, welcome, claim).await
+    }
+
+    /// Rotate the own leaf: the committer's half of [`CohortGroup::rotate_at`].
+    async fn commit_rotate(&mut self, at: DateTime<Utc>) -> Result<CohortCommit, CohortGroupError> {
+        let framed = self.epoch();
+        let bundle = self
+            .group
+            .self_update(
+                self.provider.as_ref(),
+                &self.signer,
+                LeafNodeParameters::default(),
+            )
+            .map_err(|e| CohortGroupError::RotateFailed(format!("{e:?}")))?;
+        self.group
+            .merge_pending_commit(self.provider.as_ref())
+            .map_err(|e| CohortGroupError::RotateFailed(format!("merge_pending_commit: {e:?}")))?;
+        let commit = serialize_mls_message(bundle.commit())?;
+        let welcome = bundle
+            .to_welcome_msg()
+            .map(|m| serialize_mls_message(&m))
+            .transpose()?;
+        let claim = self.claim_local(framed, at, CommitIntent::Rotate);
+        self.persist_and_seal(commit, welcome, claim).await
+    }
+
+    /// Roll the group back to the state it had AT `epoch` — the
+    /// retained snapshot written when the group reached it — rebuilding
+    /// the MLS group and signer from it exactly as [`CohortGroup::load`]
+    /// does after a restart. The caller has already checked the epoch
+    /// is inside the retention window.
+    async fn restore_epoch(&mut self, epoch: u64) -> Result<(), CohortGroupError> {
+        let Some(blob) = self
+            .store
+            .group_state_get(&self.community_id, epoch)
+            .await?
+        else {
+            return Err(CohortGroupError::HeadDangling(epoch));
+        };
+        let map = decode_snapshot(&blob)?;
+        restore_storage(self.provider.storage(), map);
+        let group_id = cohort_group_id(&self.community_id);
+        let group = MlsGroup::load(self.provider.storage(), &group_id)
+            .map_err(|e| CohortGroupError::ApplyFailed(format!("MlsGroup::load: {e:?}")))?
+            .ok_or_else(|| CohortGroupError::GroupMissing(self.community_id.clone()))?;
+        let own_sig_pub = group
+            .own_leaf_node()
+            .ok_or_else(|| CohortGroupError::SignerMissing(self.community_id.clone()))?
+            .signature_key()
+            .as_slice()
+            .to_vec();
+        let signer = SignatureKeyPair::read(
+            self.provider.storage(),
+            &own_sig_pub,
+            SignatureScheme::ED25519,
+        )
+        .ok_or_else(|| CohortGroupError::SignerMissing(self.community_id.clone()))?;
+        self.group = group;
+        self.signer = signer;
+        Ok(())
     }
 
     /// Resolve a CIRIS `key_id` to its MLS leaf index.
@@ -1075,6 +1433,8 @@ impl CohortGroup {
             store,
             retained_epochs: retained_epochs.max(1),
             held_commits: BTreeMap::new(),
+            own_key_id: own_key_id.to_string(),
+            ledger: EpochLedger::default(),
         };
 
         // Persist the genesis epoch before handing out a handle: a
@@ -1215,12 +1575,14 @@ impl CohortGroup {
 
         let inner = CohortGroupInner {
             community_id: community_id.to_string(),
+            own_key_id: key_material.key_id.clone(),
             provider: key_material.provider,
             signer: key_material.signer,
             group,
             store,
             retained_epochs: retained_epochs.max(1),
             held_commits: BTreeMap::new(),
+            ledger: EpochLedger::default(),
         };
 
         // Persist the joined epoch before handing out a handle — same
@@ -1296,7 +1658,22 @@ impl CohortGroup {
         let signer =
             SignatureKeyPair::read(provider.storage(), &own_sig_pub, SignatureScheme::ED25519)
                 .ok_or_else(|| CohortGroupError::SignerMissing(community_id.to_string()))?;
-
+        // The own key id is the credential this node stamped at create /
+        // join — read back from the same snapshot, so a reload names
+        // itself the way its peers do.
+        let own_key_id = group
+            .own_leaf_node()
+            .ok_or_else(|| CohortGroupError::SignerMissing(community_id.to_string()))?
+            .credential()
+            .serialized_content()
+            .to_vec();
+        let own_key_id = String::from_utf8(own_key_id)
+            .map_err(|e| CohortGroupError::SnapshotMalformed(format!("own credential: {e}")))?;
+        let ledger = match store.group_state_get(community_id, LEDGER_SLOT).await? {
+            Some(blob) => serde_json::from_slice(&blob)
+                .map_err(|e| CohortGroupError::LedgerMalformed(format!("decode: {e}")))?,
+            None => EpochLedger::default(),
+        };
         Ok(Some(Self {
             community_id: Arc::from(community_id),
             inner: Arc::new(Mutex::new(CohortGroupInner {
@@ -1307,6 +1684,8 @@ impl CohortGroup {
                 store,
                 retained_epochs: retained_epochs.max(1),
                 held_commits: BTreeMap::new(),
+                own_key_id,
+                ledger,
             })),
         }))
     }
@@ -1391,6 +1770,20 @@ impl CohortGroup {
         key_id: &str,
         key_package: KeyPackage,
     ) -> Result<CohortCommit, CohortGroupError> {
+        self.add_member_at(key_id, key_package, now_ms()).await
+    }
+
+    /// [`Self::add_member`] with an explicit claim instant (CIRISEdge#604).
+    ///
+    /// The instant is what a concurrent commit is contested on, so a
+    /// node that stamps its rows from one clock passes that clock here;
+    /// [`Self::add_member`] uses `now`. Truncated to the millisecond.
+    pub async fn add_member_at(
+        &self,
+        key_id: &str,
+        key_package: KeyPackage,
+        at: DateTime<Utc>,
+    ) -> Result<CohortCommit, CohortGroupError> {
         let got = u16::from(key_package.ciphersuite());
         if got != CIPHERSUITE_ID {
             return Err(CohortGroupError::CiphersuiteMismatch {
@@ -1398,46 +1791,24 @@ impl CohortGroup {
                 got,
             });
         }
-
         let mut guard = self.inner.lock().await;
-        // Reborrow through the guard so `group` / `provider` /
-        // `signer` are *disjoint* field borrows. Calling
-        // `guard.group.add_members(guard.provider…)` directly would
-        // borrow the whole `MutexGuard` twice via `DerefMut`.
-        let inner = &mut *guard;
-        let (commit_msg, welcome_msg, _group_info) = inner
-            .group
-            .add_members(inner.provider.as_ref(), &inner.signer, &[key_package])
-            .map_err(|e| CohortGroupError::AddFailed(format!("{e:?}")))?;
-        inner
-            .group
-            .merge_pending_commit(inner.provider.as_ref())
-            .map_err(|e| CohortGroupError::AddFailed(format!("merge_pending_commit: {e:?}")))?;
-
-        let commit = serialize_mls_message(&commit_msg)?;
-        let welcome = Some(serialize_mls_message(&welcome_msg)?);
-        inner.persist_and_seal(commit, welcome).await
+        guard.commit_add(key_id, key_package, at).await
     }
 
     /// Remove a member by CIRIS `key_id`, advance the epoch, persist,
     /// and *then* return the wire artifacts.
     pub async fn remove_member(&self, key_id: &str) -> Result<CohortCommit, CohortGroupError> {
-        let mut guard = self.inner.lock().await;
-        let idx = guard.leaf_of(key_id)?;
-        // Disjoint field borrows — see `add_member`.
-        let inner = &mut *guard;
-        let (commit_msg, welcome_msg, _group_info) = inner
-            .group
-            .remove_members(inner.provider.as_ref(), &inner.signer, &[idx])
-            .map_err(|e| CohortGroupError::RemoveFailed(format!("{e:?}")))?;
-        inner
-            .group
-            .merge_pending_commit(inner.provider.as_ref())
-            .map_err(|e| CohortGroupError::RemoveFailed(format!("merge_pending_commit: {e:?}")))?;
+        self.remove_member_at(key_id, now_ms()).await
+    }
 
-        let commit = serialize_mls_message(&commit_msg)?;
-        let welcome = welcome_msg.map(|m| serialize_mls_message(&m)).transpose()?;
-        inner.persist_and_seal(commit, welcome).await
+    /// [`Self::remove_member`] with an explicit claim instant (CIRISEdge#604).
+    pub async fn remove_member_at(
+        &self,
+        key_id: &str,
+        at: DateTime<Utc>,
+    ) -> Result<CohortCommit, CohortGroupError> {
+        let mut guard = self.inner.lock().await;
+        guard.commit_remove(key_id, at).await
     }
 
     /// Rotate this node's own leaf (an MLS self-update commit),
@@ -1448,28 +1819,13 @@ impl CohortGroup {
     /// `k_record_id` / `k_symbol` are not readable from the new
     /// epoch's derivation, which is what §3.5 `rotate-forward` wants.
     pub async fn rotate(&self) -> Result<CohortCommit, CohortGroupError> {
-        let mut guard = self.inner.lock().await;
-        // Disjoint field borrows — see `add_member`.
-        let inner = &mut *guard;
-        let bundle = inner
-            .group
-            .self_update(
-                inner.provider.as_ref(),
-                &inner.signer,
-                LeafNodeParameters::default(),
-            )
-            .map_err(|e| CohortGroupError::RotateFailed(format!("{e:?}")))?;
-        inner
-            .group
-            .merge_pending_commit(inner.provider.as_ref())
-            .map_err(|e| CohortGroupError::RotateFailed(format!("merge_pending_commit: {e:?}")))?;
+        self.rotate_at(now_ms()).await
+    }
 
-        let commit = serialize_mls_message(bundle.commit())?;
-        let welcome = bundle
-            .to_welcome_msg()
-            .map(|m| serialize_mls_message(&m))
-            .transpose()?;
-        inner.persist_and_seal(commit, welcome).await
+    /// [`Self::rotate`] with an explicit claim instant (CIRISEdge#604).
+    pub async fn rotate_at(&self, at: DateTime<Utc>) -> Result<CohortCommit, CohortGroupError> {
+        let mut guard = self.inner.lock().await;
+        guard.commit_rotate(at).await
     }
 
     /// Apply a Commit produced by another member, advance to its
@@ -1505,23 +1861,71 @@ impl CohortGroup {
         &self,
         commit: &[u8],
     ) -> Result<CommitApplyOutcome, CohortGroupError> {
+        let framed = peek_commit_epoch(commit)?;
+        self.apply_remote_commit_claimed(commit, None)
+            .await
+            .map(|o| o.into_legacy(framed))
+    }
+
+    /// Apply a Commit produced by another member, contesting the epoch
+    /// it is framed in by the [`CommitClaim`] its carrier row bound
+    /// (CIRISEdge#604).
+    ///
+    /// # The rule — CC 3, composition (normative)
+    ///
+    /// *"There is no compare-and-swap across a mesh, so concurrent claims
+    /// are expected rather than prevented and MUST settle on earliest
+    /// `claimed_at`, ties broken on the lowest occurrence `key_id` …
+    /// convergent from either arrival order … no coordination
+    /// round-trip."* Two commits framed in the same epoch `N` are such a
+    /// pair of claims. The winner is the smaller [`CommitClaim`]. On a
+    /// node that already applied the loser:
+    ///
+    /// 1. roll back to the retained snapshot of epoch `N` (the fork
+    ///    point) — bounded by the retention window, beyond which the
+    ///    fork is surfaced as [`CohortGroupError::ForkBeyondWindow`];
+    /// 2. apply the winner;
+    /// 3. re-propose, in order, every commit of THIS node's own that the
+    ///    rollback discarded (an Add/Remove already satisfied by the
+    ///    winner's line is skipped), and hand the re-issued commits back
+    ///    in [`ClaimedApplyOutcome::Superseded`] to be fanned out.
+    ///
+    /// On a node that holds the winner already, the loser is
+    /// [`ClaimedApplyOutcome::Discarded`] with no state change. Held
+    /// (future-epoch) commits are dropped on a rollback: they chained
+    /// off a line that no longer exists, and re-delivery is the path.
+    /// With no claim on the arrival, or none recorded for the incumbent
+    /// (a pre-#604 line), nothing can be adjudicated and the outcome is
+    /// the claim-blind `AlreadyApplied`.
+    ///
+    /// Idempotent per commit: an arrival whose claim equals the
+    /// incumbent's is the same commit, already applied.
+    pub async fn apply_remote_commit_claimed(
+        &self,
+        commit: &[u8],
+        claim: Option<CommitClaim>,
+    ) -> Result<ClaimedApplyOutcome, CohortGroupError> {
         let mut guard = self.inner.lock().await;
-        // Disjoint field borrows — see `add_member`.
         let inner = &mut *guard;
 
         let framed_epoch = peek_commit_epoch(commit)?;
         let current = inner.epoch();
-        if framed_epoch < current {
-            return Ok(CommitApplyOutcome::AlreadyApplied(framed_epoch + 1));
-        }
+
         if framed_epoch > current {
-            inner.hold_commit(framed_epoch, commit.to_vec());
-            return Ok(CommitApplyOutcome::Deferred {
+            inner.hold_commit(framed_epoch, commit.to_vec(), claim);
+            return Ok(ClaimedApplyOutcome::Deferred {
                 held_for_epoch: framed_epoch + 1,
             });
         }
 
+        if framed_epoch < current {
+            return inner.contest(commit, framed_epoch, current, claim).await;
+        }
+
         inner.process_and_merge_commit(commit)?;
+        if let Some(c) = &claim {
+            inner.ledger.claims.insert(framed_epoch, c.clone());
+        }
 
         // Drain successors that arrived ahead of their predecessor.
         loop {
@@ -1529,7 +1933,7 @@ impl CohortGroup {
             let Some(held) = inner.held_commits.remove(&next) else {
                 break;
             };
-            if let Err(e) = inner.process_and_merge_commit(&held) {
+            if let Err(e) = inner.process_and_merge_commit(&held.bytes) {
                 tracing::warn!(
                     community_id = %inner.community_id,
                     epoch = next,
@@ -1537,6 +1941,9 @@ impl CohortGroup {
                     "held cohort commit failed to apply when its turn came; dropped"
                 );
                 break;
+            }
+            if let Some(c) = held.claim {
+                inner.ledger.claims.insert(next, c);
             }
         }
 
@@ -1547,8 +1954,111 @@ impl CohortGroup {
         // advanced. One persist covers the whole drained chain: the
         // snapshot is of the final state, and intermediate epochs
         // were never observable to the caller.
-        let sealed = inner.persist_and_seal(Vec::new(), None).await?;
-        Ok(CommitApplyOutcome::Applied(sealed.epoch()))
+        inner.ledger.prune(inner.epoch(), inner.retained_epochs);
+        let observer =
+            claim.unwrap_or_else(|| CommitClaim::new(now_ms(), inner.own_key_id.clone()));
+        let sealed = inner.persist_and_seal(Vec::new(), None, observer).await?;
+        Ok(ClaimedApplyOutcome::Applied(sealed.epoch()))
+    }
+}
+
+impl CohortGroupInner {
+    /// The contest: a commit framed in an epoch this node has already
+    /// advanced past. See [`CohortGroup::apply_remote_commit_claimed`].
+    async fn contest(
+        &mut self,
+        commit: &[u8],
+        framed_epoch: u64,
+        current: u64,
+        claim: Option<CommitClaim>,
+    ) -> Result<ClaimedApplyOutcome, CohortGroupError> {
+        let Some(arrival) = claim else {
+            return Ok(ClaimedApplyOutcome::AlreadyApplied(framed_epoch + 1));
+        };
+        let Some(incumbent) = self.ledger.claims.get(&framed_epoch).cloned() else {
+            return Ok(ClaimedApplyOutcome::AlreadyApplied(framed_epoch + 1));
+        };
+        if arrival == incumbent {
+            return Ok(ClaimedApplyOutcome::AlreadyApplied(framed_epoch + 1));
+        }
+        if !arrival.wins_over(&incumbent) {
+            return Ok(ClaimedApplyOutcome::Discarded {
+                kept_epoch: current,
+                kept_by: incumbent,
+            });
+        }
+
+        // The arrival wins. Rollback is bounded by the retention window:
+        // the snapshot AT the fork point must still be held.
+        if current - framed_epoch >= self.retained_epochs {
+            return Err(CohortGroupError::ForkBeyondWindow {
+                framed_epoch,
+                current,
+                retained: self.retained_epochs,
+            });
+        }
+        let lost: Vec<CommitIntent> = self
+            .ledger
+            .intents
+            .range(framed_epoch..)
+            .map(|(_, i)| i.clone())
+            .collect();
+        if !self.held_commits.is_empty() {
+            tracing::info!(
+                community_id = %self.community_id,
+                dropped = self.held_commits.len(),
+                "rolling back past a fork; held commits chained off the discarded line are \
+                 dropped (re-delivery heals)"
+            );
+            self.held_commits.clear();
+        }
+        tracing::info!(
+            community_id = %self.community_id,
+            fork_epoch = framed_epoch,
+            from_epoch = current,
+            winner = %arrival.committer_key_id(),
+            loser = %incumbent.committer_key_id(),
+            reproposing = lost.len(),
+            "concurrent commit contest: the earlier claim wins; rolling back and re-proposing \
+             (CC 3 convergent merge, CIRISEdge#604)"
+        );
+
+        self.restore_epoch(framed_epoch).await?;
+        self.ledger.claims.retain(|e, _| *e < framed_epoch);
+        self.ledger.intents.retain(|e, _| *e < framed_epoch);
+        self.process_and_merge_commit(commit)?;
+        self.ledger.claims.insert(framed_epoch, arrival.clone());
+        self.ledger.prune(self.epoch(), self.retained_epochs);
+        let _ = self.persist_and_seal(Vec::new(), None, arrival).await?;
+
+        let mut reproposed = Vec::new();
+        for intent in lost {
+            let at = now_ms();
+            let commit = match intent {
+                CommitIntent::Rotate => self.commit_rotate(at).await?,
+                CommitIntent::Add {
+                    key_id,
+                    key_package,
+                } => {
+                    if self.leaf_of(&key_id).is_ok() {
+                        continue; // the winner's line already added them
+                    }
+                    let kp = key_package_from_bytes(&key_package)?;
+                    self.commit_add(&key_id, kp, at).await?
+                }
+                CommitIntent::Remove { key_id } => {
+                    if self.leaf_of(&key_id).is_err() {
+                        continue; // the winner's line already removed them
+                    }
+                    self.commit_remove(&key_id, at).await?
+                }
+            };
+            reproposed.push(commit);
+        }
+        Ok(ClaimedApplyOutcome::Superseded {
+            epoch: self.epoch(),
+            reproposed,
+        })
     }
 }
 
@@ -2862,5 +3372,351 @@ mod tests {
             a.destination_secret().await.unwrap().as_bytes(),
             b.destination_secret().await.unwrap().as_bytes()
         );
+    }
+}
+
+// ─── CIRISEdge#604 — convergent merge of concurrent commits ──────────
+#[cfg(test)]
+#[allow(clippy::too_many_lines)]
+mod convergence_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use ciris_persist::encrypted_kv::XChaChaKvStore;
+
+    fn store() -> ScopeStateProvider {
+        let kv = XChaChaKvStore::open_in_memory(b"cohort-convergence-test").unwrap();
+        ScopeStateProvider::new(Arc::new(kv))
+    }
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    async fn secret(g: &CohortGroup) -> [u8; 32] {
+        *g.destination_secret().await.unwrap().as_bytes()
+    }
+
+    /// A founds; B and C join; B applies the Add of C so all three are
+    /// at one epoch, each over its OWN store — three nodes.
+    async fn three(community: &str) -> (CohortGroup, CohortGroup, CohortGroup) {
+        let a = CohortGroup::create(store(), community, "node-a", 16)
+            .await
+            .unwrap();
+        let (mb, kpb) = mint_cohort_key_material("node-b").unwrap();
+        let add_b = a.add_member("node-b", kpb).await.unwrap();
+        let b = CohortGroup::join(store(), community, mb, add_b.welcome().unwrap(), 16)
+            .await
+            .unwrap();
+        let (mc, kpc) = mint_cohort_key_material("node-c").unwrap();
+        let add_c = a.add_member("node-c", kpc).await.unwrap();
+        let c = CohortGroup::join(store(), community, mc, add_c.welcome().unwrap(), 16)
+            .await
+            .unwrap();
+        let _ = b
+            .apply_remote_commit_claimed(add_c.commit(), Some(add_c.claim().clone()))
+            .await
+            .unwrap();
+        assert_eq!(a.epoch().await, b.epoch().await);
+        assert_eq!(a.epoch().await, c.epoch().await);
+        assert_eq!(secret(&a).await, secret(&b).await);
+        assert_eq!(secret(&a).await, secret(&c).await);
+        (a, b, c)
+    }
+
+    fn expect_superseded(o: ClaimedApplyOutcome) -> (u64, Vec<CohortCommit>) {
+        match o {
+            ClaimedApplyOutcome::Superseded { epoch, reproposed } => (epoch, reproposed),
+            other => panic!(
+                "the EARLIER claim must win the contest and the loser must roll back — \
+                 CC 3: \"earliest claimed_at, ties broken on the lowest key_id\"; got {other:?}"
+            ),
+        }
+    }
+
+    /// **The witness.** A and B commit against the same epoch; A's claim is
+    /// earlier. Every node — A, B, and a bystander C receiving A-then-B —
+    /// converges to the same epoch AND the same exporter secret, the loser
+    /// having re-proposed against the winner's line.
+    #[tokio::test]
+    async fn two_nodes_committing_at_one_epoch_converge_on_the_earliest_claim() {
+        let (a, b, c) = three("c-conv").await;
+        let base = a.epoch().await;
+
+        let ca = a.rotate_at(at(10)).await.unwrap(); // (10, node-a) — the winner
+        let cb = b.rotate_at(at(20)).await.unwrap(); // (20, node-b) — the loser
+        assert_eq!(ca.claim().committer_key_id(), "node-a");
+        assert!(ca.claim().wins_over(cb.claim()));
+
+        // B hears A: rolls back its own rotate, applies A's, re-rotates.
+        let (epoch_b, reproposed) = expect_superseded(
+            b.apply_remote_commit_claimed(ca.commit(), Some(ca.claim().clone()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(epoch_b, base + 2, "winner (n+1) then the re-proposal (n+2)");
+        assert_eq!(
+            reproposed.len(),
+            1,
+            "the loser's rotate must be RE-PROPOSED against the winner's epoch, not lost"
+        );
+        let cb2 = reproposed.into_iter().next().unwrap();
+        assert_eq!(cb2.claim().committer_key_id(), "node-b");
+
+        // A hears B's original: it lost, and A says who kept the epoch.
+        match a
+            .apply_remote_commit_claimed(cb.commit(), Some(cb.claim().clone()))
+            .await
+            .unwrap()
+        {
+            ClaimedApplyOutcome::Discarded {
+                kept_epoch,
+                kept_by,
+            } => {
+                assert_eq!(kept_epoch, base + 1);
+                assert_eq!(&kept_by, ca.claim());
+            }
+            other => panic!("the later claim must be DISCARDED on the winner's node: {other:?}"),
+        }
+        // A hears B's re-proposal: plain apply.
+        match a
+            .apply_remote_commit_claimed(cb2.commit(), Some(cb2.claim().clone()))
+            .await
+            .unwrap()
+        {
+            ClaimedApplyOutcome::Applied(e) => assert_eq!(e, base + 2),
+            other => panic!("re-proposal is framed at the winner's epoch and applies: {other:?}"),
+        }
+
+        // C, a bystander, hears A then B then B's re-proposal.
+        assert!(matches!(
+            c.apply_remote_commit_claimed(ca.commit(), Some(ca.claim().clone()))
+                .await
+                .unwrap(),
+            ClaimedApplyOutcome::Applied(_)
+        ));
+        assert!(matches!(
+            c.apply_remote_commit_claimed(cb.commit(), Some(cb.claim().clone()))
+                .await
+                .unwrap(),
+            ClaimedApplyOutcome::Discarded { .. }
+        ));
+        assert!(matches!(
+            c.apply_remote_commit_claimed(cb2.commit(), Some(cb2.claim().clone()))
+                .await
+                .unwrap(),
+            ClaimedApplyOutcome::Applied(_)
+        ));
+
+        assert_eq!(a.epoch().await, base + 2);
+        assert_eq!(b.epoch().await, base + 2);
+        assert_eq!(c.epoch().await, base + 2);
+        let sa = secret(&a).await;
+        assert_eq!(
+            sa,
+            secret(&b).await,
+            "CONVERGENCE: the loser's node must derive the winner's exporter secret — the \
+             CC 5.4 addressing root every member resolves the room's destination from"
+        );
+        assert_eq!(sa, secret(&c).await, "the bystander converges too");
+        for g in [&a, &b, &c] {
+            assert_eq!(g.member_count().await, 3);
+        }
+    }
+
+    /// The same contest delivered to the bystander in the OPPOSITE order —
+    /// the loser first, then the winner, then the re-proposal — lands on
+    /// the same secret. "Convergent from either arrival order."
+    #[tokio::test]
+    async fn the_opposite_arrival_order_converges_to_the_same_secret() {
+        let (a, b, c) = three("c-conv-rev").await;
+        let base = a.epoch().await;
+        let ca = a.rotate_at(at(10)).await.unwrap();
+        let cb = b.rotate_at(at(20)).await.unwrap();
+        let (_, reproposed) = expect_superseded(
+            b.apply_remote_commit_claimed(ca.commit(), Some(ca.claim().clone()))
+                .await
+                .unwrap(),
+        );
+        let cb2 = reproposed.into_iter().next().unwrap();
+        let _ = a
+            .apply_remote_commit_claimed(cb2.commit(), Some(cb2.claim().clone()))
+            .await
+            .unwrap();
+
+        // C: loser first — applies cleanly, C is now on B's dead line.
+        assert!(matches!(
+            c.apply_remote_commit_claimed(cb.commit(), Some(cb.claim().clone()))
+                .await
+                .unwrap(),
+            ClaimedApplyOutcome::Applied(e) if e == base + 1
+        ));
+        // Then the winner arrives, framed at n < n+1: contest, A wins, C
+        // rolls back with nothing of its own to re-propose.
+        let (epoch_c, reproposed_c) = expect_superseded(
+            c.apply_remote_commit_claimed(ca.commit(), Some(ca.claim().clone()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(epoch_c, base + 1);
+        assert!(
+            reproposed_c.is_empty(),
+            "a bystander authored nothing to re-propose"
+        );
+        // Then the re-proposal.
+        assert!(matches!(
+            c.apply_remote_commit_claimed(cb2.commit(), Some(cb2.claim().clone()))
+                .await
+                .unwrap(),
+            ClaimedApplyOutcome::Applied(e) if e == base + 2
+        ));
+        assert_eq!(
+            secret(&c).await,
+            secret(&a).await,
+            "either arrival order, one secret — the rule is convergent"
+        );
+        assert_eq!(secret(&c).await, secret(&b).await);
+    }
+
+    /// Equal instants settle on the lowest key id: `node-a` < `node-b`.
+    #[tokio::test]
+    async fn equal_instants_settle_on_the_lowest_key_id() {
+        let (a, b, _c) = three("c-tie").await;
+        let ca = a.rotate_at(at(10)).await.unwrap();
+        let cb = b.rotate_at(at(10)).await.unwrap();
+        assert_eq!(ca.claim().asserted_at(), cb.claim().asserted_at());
+        assert!(ca.claim().wins_over(cb.claim()), "tie → lowest key id wins");
+        let _ = expect_superseded(
+            b.apply_remote_commit_claimed(ca.commit(), Some(ca.claim().clone()))
+                .await
+                .unwrap(),
+        );
+        assert!(matches!(
+            a.apply_remote_commit_claimed(cb.commit(), Some(cb.claim().clone()))
+                .await
+                .unwrap(),
+            ClaimedApplyOutcome::Discarded { kept_by, .. } if &kept_by == ca.claim()
+        ));
+    }
+
+    /// A lost Add is re-proposed: the member the loser meant to admit ends
+    /// up on the winner's line, on both nodes.
+    #[tokio::test]
+    async fn a_lost_add_is_reproposed_against_the_winners_line() {
+        let (a, b, _c) = three("c-lost-add").await;
+        let ca = a.rotate_at(at(10)).await.unwrap();
+        let (_md, kpd) = mint_cohort_key_material("node-d").unwrap();
+        let cb = b.add_member_at("node-d", kpd, at(20)).await.unwrap();
+        assert!(b.member_key_ids().await.contains(&"node-d".to_string()));
+
+        let (_, reproposed) = expect_superseded(
+            b.apply_remote_commit_claimed(ca.commit(), Some(ca.claim().clone()))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            b.member_key_ids().await.contains(&"node-d".to_string()),
+            "the rollback discarded the Add; the re-proposal must restore it on the loser"
+        );
+        assert_eq!(reproposed.len(), 1);
+        assert!(
+            reproposed[0].welcome().is_some(),
+            "a re-proposed Add carries a Welcome"
+        );
+        let _ = a
+            .apply_remote_commit_claimed(cb.commit(), Some(cb.claim().clone()))
+            .await
+            .unwrap();
+        let _ = a
+            .apply_remote_commit_claimed(
+                reproposed[0].commit(),
+                Some(reproposed[0].claim().clone()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            a.member_key_ids().await.contains(&"node-d".to_string()),
+            "the member the LOSER admitted must reach the winner's roster through the \
+             re-proposal — without it the Add is silently lost"
+        );
+        assert_eq!(secret(&a).await, secret(&b).await);
+    }
+
+    /// The ledger survives a restart: a reloaded loser still knows who
+    /// holds the contested epoch.
+    #[tokio::test]
+    async fn a_won_contest_survives_a_restart() {
+        let store_b = store();
+        let a = CohortGroup::create(store(), "c-restart", "node-a", 16)
+            .await
+            .unwrap();
+        let (mb, kpb) = mint_cohort_key_material("node-b").unwrap();
+        let add_b = a.add_member("node-b", kpb).await.unwrap();
+        let b = CohortGroup::join(
+            store_b.clone(),
+            "c-restart",
+            mb,
+            add_b.welcome().unwrap(),
+            16,
+        )
+        .await
+        .unwrap();
+        let ca = a.rotate_at(at(10)).await.unwrap();
+        let cb = b.rotate_at(at(20)).await.unwrap();
+        let (epoch_before, _) = expect_superseded(
+            b.apply_remote_commit_claimed(ca.commit(), Some(ca.claim().clone()))
+                .await
+                .unwrap(),
+        );
+        drop(b);
+        let b = CohortGroup::load(store_b, "c-restart", 16)
+            .await
+            .unwrap()
+            .expect("reload");
+        assert_eq!(b.epoch().await, epoch_before);
+        // The loser's own commit replayed after the restart is still a
+        // loser — only a persisted ledger can say so.
+        assert!(matches!(
+            b.apply_remote_commit_claimed(cb.commit(), Some(cb.claim().clone()))
+                .await
+                .unwrap(),
+            ClaimedApplyOutcome::Discarded { kept_by, .. } if &kept_by == ca.claim()
+        ));
+    }
+
+    /// A fork deeper than the retention window is surfaced, not resolved.
+    #[tokio::test]
+    async fn a_fork_beyond_the_retention_window_is_surfaced_not_resolved() {
+        let a = CohortGroup::create(store(), "c-deep", "node-a", 2)
+            .await
+            .unwrap();
+        let (mb, kpb) = mint_cohort_key_material("node-b").unwrap();
+        let add_b = a.add_member("node-b", kpb).await.unwrap();
+        let b = CohortGroup::join(store(), "c-deep", mb, add_b.welcome().unwrap(), 2)
+            .await
+            .unwrap();
+        let ca = a.rotate_at(at(10)).await.unwrap();
+        for i in 0..3 {
+            let _ = b.rotate_at(at(20 + i)).await.unwrap();
+        }
+        let err = b
+            .apply_remote_commit_claimed(ca.commit(), Some(ca.claim().clone()))
+            .await
+            .expect_err("three epochs past the fork with a two-epoch window cannot roll back");
+        assert!(
+            matches!(err, CohortGroupError::ForkBeyondWindow { .. }),
+            "named, never silently resolved: {err}"
+        );
+    }
+
+    /// No claim, no contest: the legacy door is unchanged.
+    #[tokio::test]
+    async fn without_a_claim_the_legacy_door_reports_already_applied() {
+        let (a, b, _c) = three("c-legacy").await;
+        let ca = a.rotate().await.unwrap();
+        let _cb = b.rotate().await.unwrap();
+        assert!(matches!(
+            b.apply_remote_commit(ca.commit()).await.unwrap(),
+            CommitApplyOutcome::AlreadyApplied(_)
+        ));
     }
 }

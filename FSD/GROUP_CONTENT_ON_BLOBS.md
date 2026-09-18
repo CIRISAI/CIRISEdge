@@ -112,14 +112,21 @@ directory-only group with no commit lease, so it is the addressing root and
 the agreement *substrate*, not yet the TreeKEM commit discipline — that is
 #604's remaining work, below.
 
-**#604 itself — the concurrent-commit fork — is NOT closed by the
-`RoomKey` deletion.** It closes by the CC 3 composition rule: "concurrent
-claims are expected rather than prevented and MUST settle on earliest
-`claimed_at`, ties broken on the lowest occurrence `key_id` … convergent
-from either arrival order … no coordination round-trip". Two commits at
-epoch N → a deterministic winner by that rule, the loser re-proposes at
-N+1. That is a separate build on `CohortGroup::apply_remote_commit`, and
-#604 stays open for it.
+**#604 — the concurrent-commit fork — closes by the CC 3 composition
+rule, built.** "Concurrent claims are expected rather than prevented and
+MUST settle on earliest `claimed_at`, ties broken on the lowest occurrence
+`key_id` … convergent from either arrival order … no coordination
+round-trip." The room's group now carries the agreement-layer lease by
+convergent merge: every commit carries a `CommitClaim` (its millisecond
+instant and its committer), a chat room's commits cross the mesh as
+`chat:commit:v1` rows whose `asserted_at` and author ARE that claim, and
+`CohortGroup::apply_remote_commit_claimed` settles two commits framed in
+one epoch on the smaller claim — the loser rolls back to the fork point
+(bounded by the snapshot retention window; beyond it the fork is surfaced
+as `ForkBeyondWindow`, never silently resolved), applies the winner, and
+re-proposes its own discarded commits against the winner's line. This is
+the lease persist's FSD §11 places at the agreement layer, and it is the
+same rule persist applies one layer down (#848).
 
 ---
 

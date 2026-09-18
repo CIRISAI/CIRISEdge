@@ -2867,7 +2867,7 @@ async fn run_chat_legs(occ: &Occurrence) {
     // BOTH nodes; wiring it into the #499 scope address table is follow-on.
     let role = PairRole::of(&my_owner, &peer_owner);
     let handshake_start = Instant::now();
-    let handshake: Result<(u64, serde_json::Value), String> = async {
+    let handshake: Result<(u64, serde_json::Value, CohortGroup), String> = async {
         let kv = XChaChaKvStore::open_in_memory(room.as_bytes())
             .map_err(|e| format!("open_in_memory: {e}"))?;
         let store = ScopeStateProvider::new(Arc::new(kv));
@@ -2926,6 +2926,7 @@ async fn run_chat_legs(occ: &Occurrence) {
                         "welcome_shared": shared,
                         "epoch": epoch,
                     }),
+                    group,
                 ))
             }
             PairRole::Joiner => {
@@ -2973,13 +2974,14 @@ async fn run_chat_legs(occ: &Occurrence) {
                         "welcome_bytes": welcome.len(),
                         "epoch": epoch,
                     }),
+                    group,
                 ))
             }
         }
     }
     .await;
     let handshake_ms = handshake_start.elapsed().as_millis();
-    let (group_epoch, mls) = match handshake {
+    let (group_epoch, mls, group) = match handshake {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(%room, ?role, error = %e, handshake_ms, "open_chat: the MLS handshake failed");
@@ -2989,6 +2991,7 @@ async fn run_chat_legs(occ: &Occurrence) {
                 serde_json::json!({ "room": room, "role": format!("{role:?}"), "handshake_ms": handshake_ms, "error": e }),
             );
             rep.not_run("ladder.send_message", "the MLS handshake failed");
+            rep.not_run("ladder.rotate_converges", "the MLS handshake failed");
             return;
         }
     };
@@ -3013,6 +3016,122 @@ async fn run_chat_legs(occ: &Occurrence) {
         }),
     );
 
+    // ── rotate_converges (CIRISEdge#604) ─────────────────────────────
+    //
+    // BOTH ends rotate against the same epoch, on purpose — the fork #604
+    // names, forced. Each carries its commit as a `chat:commit:v1` row whose
+    // `asserted_at` + author ARE the claim, reads the other's off the room,
+    // and contests it by CC 3 (earliest claim wins, ties to the lowest key
+    // id). The loser rolls back, applies the winner, re-proposes its rotate
+    // as a second row; the winner discards the loser's original and applies
+    // the re-proposal. Both end two epochs up from where they started, on one
+    // exporter secret — the CC 5.4 addressing root — reported as a
+    // domain-separated fingerprint so the two reports can be compared without
+    // either node revealing the secret.
+    let converge_start = Instant::now();
+    let epoch_before = group.epoch().await;
+    let converged: Result<serde_json::Value, String> = async {
+        let mine = group
+            .rotate()
+            .await
+            .map_err(|e| format!("rotate: {e}"))?;
+        let row = chat::commit_attestation_in(&occ.owner_signer, &room, &mine).await?;
+        let shared = share_in_room(dir, row, &room, signers).await?;
+        let waited = occ
+            .replication
+            .sync_and_await(&peer_node, budget, || async {
+                chat::commits_from(dir, &peer_owner, &room)
+                    .await
+                    .is_ok_and(|c| !c.is_empty())
+            })
+            .await
+            .map_err(|e| format!("sync_and_await: {e}"))?;
+        let first = chat::apply_room_commits(&group, dir, &peer_owner, &room).await?;
+        let mut reproposal_rows = Vec::new();
+        for commit in &first.reproposed {
+            let row = chat::commit_attestation_in(&occ.owner_signer, &room, commit).await?;
+            reproposal_rows.push(share_in_room(dir, row, &room, signers).await?);
+        }
+        // If the peer's commit was DISCARDED, this node won and the peer
+        // re-proposes: wait for its second row and apply it.
+        let mut second = serde_json::Value::Null;
+        if first.discarded > 0 {
+            let w = occ
+                .replication
+                .sync_and_await(&peer_node, budget, || async {
+                    chat::commits_from(dir, &peer_owner, &room)
+                        .await
+                        .is_ok_and(|c| c.len() >= 2)
+                })
+                .await
+                .map_err(|e| format!("sync_and_await: {e}"))?;
+            let again = chat::apply_room_commits(&group, dir, &peer_owner, &room).await?;
+            second = serde_json::json!({
+                "waited_ms": w.waited().as_millis(),
+                "checks": w.checks(),
+                "applied": again.applied,
+            });
+        }
+        let epoch_after = group.epoch().await;
+        // The in-node criterion: winner's commit + the loser's re-proposal =
+        // exactly two epochs, on EITHER side. A node that skipped the apply
+        // sits one epoch up, on its own line.
+        if epoch_after != epoch_before + 2 {
+            return Err(format!(
+                "did not converge: epoch {epoch_before} → {epoch_after}, expected {} \
+                 (the winner's commit plus the loser's re-proposal)",
+                epoch_before + 2
+            ));
+        }
+        let secret = group
+            .destination_secret()
+            .await
+            .map_err(|e| format!("destination_secret: {e}"))?;
+        let fingerprint = {
+            let mut h = Sha256::new();
+            h.update(b"ciris-edge/604-convergence-witness/v1\0");
+            h.update(secret.as_bytes());
+            hex::encode(h.finalize())[..16].to_owned()
+        };
+        Ok(serde_json::json!({
+            "outcome": if first.discarded > 0 { "won" } else { "lost" },
+            "my_commit_shared": shared,
+            "peer_commit_waited_ms": waited.waited().as_millis(),
+            "peer_commit_checks": waited.checks(),
+            "first_apply": { "applied": first.applied, "discarded": first.discarded, "other": first.other },
+            "reproposals_shared": reproposal_rows,
+            "second_apply": second,
+            "epoch_before": epoch_before,
+            "epoch_after": epoch_after,
+            "secret_fingerprint": fingerprint,
+        }))
+    }
+    .await;
+    let converge_ms = converge_start.elapsed().as_millis();
+    match converged {
+        Ok(v) => rep.ran(
+            "ladder.rotate_converges",
+            true,
+            serde_json::json!({
+                "room": room,
+                "converge_ms": converge_ms,
+                "convergence": v,
+                "covers": "both ends rotated against ONE epoch — the #604 fork, forced — \
+                           carried their commits as chat:commit:v1 rows, contested them by \
+                           CC 3 (earliest claim, lowest key id), the loser rolled back and \
+                           re-proposed, and both stand two epochs up; `secret_fingerprint` \
+                           must be EQUAL across the two reports",
+            }),
+        ),
+        Err(e) => {
+            tracing::error!(%room, error = %e, converge_ms, "rotate_converges: the fork did not converge");
+            rep.ran(
+                "ladder.rotate_converges",
+                false,
+                serde_json::json!({ "room": room, "converge_ms": converge_ms, "error": e }),
+            );
+        }
+    }
     // ── send_message ─────────────────────────────────────────────────
     if i_send {
         let sent = async {

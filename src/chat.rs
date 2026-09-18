@@ -124,6 +124,18 @@ pub const KEY_PACKAGE_DIMENSION: &str = "chat:key_package:v1";
 /// The creator's MLS Welcome for the joiner — step 2 of the handshake.
 pub const WELCOME_DIMENSION: &str = "chat:welcome:v1";
 
+/// A room's MLS **Commit** as a signed community row (CIRISEdge#604).
+///
+/// Until v25.1.0 no commit ever crossed the mesh for a chat room: the
+/// KeyPackage/Welcome handshake rode the plane and every later commit
+/// (a rotate, an Add, a Remove) stayed on the node that made it, so the
+/// fork #604 names could not even be reached — the other node simply
+/// never heard. This dimension carries the commit, and the row's
+/// `asserted_at` + `attesting_key_id` ARE the [`crate::mls::CommitClaim`]
+/// the receiver contests it on: bound into the signed bytes, so every
+/// peer adjudicates the same tuple.
+pub const COMMIT_DIMENSION: &str = "chat:commit:v1";
+
 /// The replication-consent prefix a grant MUST cover for chat to federate.
 ///
 /// Omit it and messages are authored, admitted locally, and never offered to
@@ -650,6 +662,66 @@ pub async fn welcome_attestation(
     chat_row(author, &room, WELCOME_DIMENSION, members, asserted_at).await
 }
 
+/// **A commit into a room named by its community id** (CIRISEdge#604) —
+/// the room's MLS Commit as a signed community row, carrying its claim.
+///
+/// The row's `asserted_at` is the commit's claimed instant and its author
+/// is the committer, so the claim rides in the signed bytes rather than as
+/// a member a peer could disagree about. The producer REFUSES a commit
+/// whose claim names a different committer than `author`: a row that
+/// mislabelled the claim would make two nodes order the same contest
+/// differently, which is the one thing CC 3's rule cannot survive.
+///
+/// # Errors
+/// The claim's committer is not `author`, or signing failed.
+pub async fn commit_attestation_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    commit: &crate::mls::CohortCommit,
+) -> Result<Attestation, String> {
+    use base64::Engine as _;
+    let claim = commit.claim();
+    if claim.committer_key_id() != author.key_id {
+        return Err(format!(
+            "commit claimed by {} cannot be carried by {}: the row's author IS the claim's \
+             committer, and a mislabelled claim would fork the contest (CIRISEdge#604)",
+            claim.committer_key_id(),
+            author.key_id
+        ));
+    }
+    let mut members = serde_json::Map::new();
+    members.insert(
+        FIELD_MLS_BYTES.to_owned(),
+        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(commit.commit())),
+    );
+    members.insert(
+        FIELD_MLS_EPOCH.to_owned(),
+        serde_json::json!(commit.epoch()),
+    );
+    chat_row(
+        author,
+        community_key_id,
+        COMMIT_DIMENSION,
+        members,
+        claim.asserted_at(),
+    )
+    .await
+}
+
+/// [`commit_attestation_in`] for the two-person room derived from the
+/// pair (the convenience every other pair producer here offers).
+///
+/// # Errors
+/// As [`commit_attestation_in`].
+pub async fn commit_attestation(
+    author: &crate::identity::LocalSigner,
+    recipient_key_id: &str,
+    commit: &crate::mls::CohortCommit,
+) -> Result<Attestation, String> {
+    let room = pair_community_key_id(&author.key_id, recipient_key_id);
+    commit_attestation_in(author, &room, commit).await
+}
+
 /// The room a stored row names, through persist's cohort-target resolver
 /// (every alias; a split-brain row naming two is `None`).
 fn room_of(a: &Attestation) -> Option<String> {
@@ -853,6 +925,96 @@ pub async fn welcome_from(
             Some((bytes, epoch))
         })
         .next_back())
+}
+
+/// Every commit `from` placed in `room`, oldest claim first, each with the
+/// [`crate::mls::CommitClaim`] its row binds — the input to
+/// [`crate::mls::CohortGroup::apply_remote_commit_claimed`] (CIRISEdge#604).
+///
+/// The claim is rebuilt from the row's `asserted_at` and `attesting_key_id`,
+/// which is exactly what the producer bound, so the receiver contests the
+/// tuple the committer signed.
+///
+/// # Errors
+/// A directory read failure.
+pub async fn commits_from(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    from: &str,
+    room: &str,
+) -> Result<Vec<(Vec<u8>, crate::mls::CommitClaim)>, String> {
+    use base64::Engine as _;
+    Ok(rows_in_room(directory, &[from.to_owned()], room)
+        .await?
+        .iter()
+        .filter(|a| dimension_of(a) == Some(COMMIT_DIMENSION))
+        .filter_map(|a| {
+            let bytes = a
+                .attestation_envelope
+                .get(FIELD_MLS_BYTES)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())?;
+            Some((
+                bytes,
+                crate::mls::CommitClaim::new(a.asserted_at, a.attesting_key_id.clone()),
+            ))
+        })
+        .collect())
+}
+
+/// What [`apply_room_commits`] did with the commit rows it read (CIRISEdge#604).
+#[derive(Debug, Default)]
+#[must_use = "`reproposed` carries commits that MUST be emitted as rows and shared"]
+pub struct AppliedCommits {
+    /// Rows whose commit merged (a plain apply, or the winner of a contest
+    /// after a rollback).
+    pub applied: usize,
+    /// Rows that contested an epoch and LOST against the claim this node
+    /// holds — their author will re-propose.
+    pub discarded: usize,
+    /// Rows this node could not act on: framed ahead of its epoch (held), or
+    /// already reached.
+    pub other: usize,
+    /// This node's own commits, re-issued against a winner's line after a
+    /// rollback. Each MUST be carried as a [`commit_attestation_in`] row and
+    /// shared, or the node's re-proposals exist nowhere but here.
+    pub reproposed: Vec<crate::mls::CohortCommit>,
+}
+
+/// Apply every commit row `from` placed in `room` to `group`, in claim order,
+/// contesting each by the claim its row binds — the receive half of
+/// CIRISEdge#604. Idempotent: rows already applied read as `other`, rows
+/// already discarded read as `discarded` again, and no state moves.
+///
+/// # Errors
+/// A directory read failure, or a contest this node cannot resolve
+/// ([`crate::mls::CohortGroupError::ForkBeyondWindow`] — surfaced, never
+/// silently absorbed).
+pub async fn apply_room_commits(
+    group: &crate::mls::CohortGroup,
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    from: &str,
+    room: &str,
+) -> Result<AppliedCommits, String> {
+    use crate::mls::ClaimedApplyOutcome;
+    let mut out = AppliedCommits::default();
+    for (bytes, claim) in commits_from(directory, from, room).await? {
+        match group
+            .apply_remote_commit_claimed(&bytes, Some(claim))
+            .await
+            .map_err(|e| format!("apply commit from {from} in {room}: {e}"))?
+        {
+            ClaimedApplyOutcome::Applied(_) => out.applied += 1,
+            ClaimedApplyOutcome::Discarded { .. } => out.discarded += 1,
+            ClaimedApplyOutcome::Superseded { reproposed, .. } => {
+                out.applied += 1;
+                out.reproposed.extend(reproposed);
+            }
+            ClaimedApplyOutcome::Deferred { .. } | ClaimedApplyOutcome::AlreadyApplied(_) => {
+                out.other += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A message body as read back: opened text, or why it did not open.
