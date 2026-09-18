@@ -11,11 +11,13 @@
 //! survives the crossing — the node only ever co-scrubs — because a share is
 //! two operations (`enter_mesh` over the same bytes, then a `supersedes` the
 //! actor signs at the wider audience). And the seal: community tier is
-//! encrypted, so the body on the wire is ciphertext under the room's MLS
-//! record secret, and the MLS handshake that produces that secret rides the
-//! room as ordinary rows.
+//! encrypted, so the body on the wire is a pointer to a blob under persist's
+//! community DEK, wrapped per member occurrence. The MLS handshake still
+//! rides the room as ordinary rows — not to key the body (the pre-v24
+//! `RoomKey` is deleted, CIRISEdge#604) but because the room's group is its
+//! CC 5.4 addressing root, and both ends must come to stand on it.
 
-use ciris_edge::chat::{self, Body, PairRole, RoomKey};
+use ciris_edge::chat::{self, Body, PairRole};
 use ciris_edge::mls::cohort_group::{
     key_package_from_bytes, key_package_to_bytes, mint_cohort_key_material,
 };
@@ -412,7 +414,8 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
 
 /// **The MLS handshake rides the room.** Bob's KeyPackage and Alice's
 /// Welcome are ordinary community-scoped rows each of them signs; read back
-/// through the room, the far end joins and both hold the same key.
+/// through the room, the far end joins and both stand on the same group at
+/// the same epoch — the room's CC 5.4 addressing root (CIRISEdge#604).
 #[tokio::test]
 async fn the_mls_handshake_rides_the_room_as_signed_rows() {
     let w = world().await;
@@ -487,7 +490,7 @@ async fn the_mls_handshake_rides_the_room_as_signed_rows() {
         .await
         .unwrap();
 
-    // Both sides now hold the room's record secret at the same epoch.
+    // Both sides now stand on the same group at the same epoch — the CC 5.4 root.
     //
     // The old assertion here was "what Alice seals, Bob opens", through the
     // inline body seal. That seal is gone (CIRISEdge#586) — content lives in
@@ -497,8 +500,8 @@ async fn the_mls_handshake_rides_the_room_as_signed_rows() {
     // that does, is that the HANDSHAKE converges: both ends derived the same
     // group at the same epoch.
     assert_eq!(
-        RoomKey::of(&a).await.unwrap().epoch(),
-        RoomKey::of(&b).await.unwrap().epoch(),
+        a.epoch().await,
+        b.epoch().await,
         "both ends must land on the same MLS epoch",
     );
 }

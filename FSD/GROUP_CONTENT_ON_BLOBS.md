@@ -35,15 +35,26 @@ policy layered on top, and is explicitly *not* fixed here.
 
 ---
 
-## 2. What this replaces, and why
+## 2. What this replaced, and why — DONE (v24.0.0 the seal, v25.0.0 the `RoomKey`)
 
-Chat today seals its own bodies: `body_key` is HKDF from a `RoomKey`, the
-ciphertext goes in `FIELD_BODY`, and a `FIELD_SEALED` header says how it
-opens. That was correct when it shipped (v19.0.0) — persist had no encrypted
+Chat used to seal its own bodies: `body_key` was HKDF from a `RoomKey`, the
+ciphertext went in `FIELD_BODY`, and a `FIELD_SEALED` header said how it
+opened. That was correct when it shipped (v19.0.0) — persist had no encrypted
 blob tier, and a room needed confidentiality that the substrate could not
 give it.
 
-Three things have changed:
+**Status.** The seal moved to the blob store in v24.0.0 (#586/#596). The
+`RoomKey` — the group's exporter HKDF'd per message, the thing that used to
+seal the body — is deleted in v25.0.0 (#604), with the two `FIELD_MLS_*`
+symbols it shared an envelope with made crate-private. **The room's MLS
+group and its two-row handshake stay**, un-deprecated: the group is not a
+second content key and not a second membership oracle, it is the room's
+**CC 5.4 addressing root** (§2.1), and the handshake is how that root comes
+to exist on both nodes. A first cut of #604 deleted the group too; that went
+one layer too deep — `cohort_addressing::snapshot(&CohortGroup)` (#499) is
+the CC 5.4 derivation and had nothing left to derive from.
+
+Three things had changed:
 
 - **persist v43 gave content a cohort-keyed DEK cascade**, so encrypted
   storage is a substrate property rather than an application one.
@@ -52,13 +63,63 @@ Three things have changed:
   than merely redundant — see §5.
 - **Membership is a community roster.** Chat's parallel MLS group is a second
   answer to a question the federation already answers, and two membership
-  systems that can disagree will.
+  systems that can disagree will. (That retires the group as a membership
+  oracle and as a body-seal key. It does not retire the group: the roster
+  decides WHO, persist's DEK decides the BODY, and the group decides the
+  ADDRESS — §2.1.)
 
 The cost of keeping a private seal is not just duplication. Content sealed
 under a key persist cannot derive is content persist cannot **recall** — an
 epoch destroy sweeps the DEK, and bytes sealed outside that cascade survive
 it. A right-to-be-forgotten guarantee that a layer above can silently opt out
 of is not a guarantee.
+
+### 2.1 Which layer answers which clause
+
+Two layers, each answering the clause the Constitution assigns it.
+
+**Content: persist's community-DEK cascade.** A flat per-member re-wrap —
+one DEK per `(community, minter, epoch)`, wrapped to every active identity
+occurrence of every roster member, per-minter epochs, concurrent removals
+settled by convergent merge (CIRISPersist#848). This is conformant under
+**CC 5.1 "Delivery is decisive"**: over unicast the flat O(N) cascade is
+competitive-to-better than a ratchet tree, and the choice is wire-invisible,
+so the clause admits it per deployment. The body is sealed here and nowhere
+else.
+
+**Addressing and agreement: the room's MLS group.** The group is the **CC
+5.4 addressing root** — `K_record_id = HKDF-SHA256-Expand(PRK = raw group
+exporter_secret, info = "ciris-edge/scope-privacy/record-id/v1")` (CC 5.4.1,
+normative and byte-pinned in `src/scope_privacy.rs`); `K_symbol` /
+`K_record_id` are bound to the group epoch and MUST rebind on Add/Remove (CC
+5.4.3); the Welcome is HPKE mode_base under the invitee's static X-Wing key
+with the inviter's ML-DSA-65 over the encap bytes (CC 5.4.4,
+`mls::welcome_wrap`); and a below-federation destination MUST NOT announce —
+members resolve it from a cached directory entry plus the same
+group-and-epoch-bound schedule (CC 5.4.6). `cohort_addressing::snapshot`
+over the room's `CohortGroup` is the edge implementation, and the KeyPackage
+/ Welcome handshake over the room is how both nodes come to hold it. The
+same group is the **CC 5.1 TreeKEM agreement layer** for the room.
+
+**What the CC does not say.** Persist's FSD/BLOB_REPLICATION.md §11 reads
+"in the Constitution's steady state, where the content DEK derives from the
+MLS exporter (CC 5.4)". That is persist's projection, not the text: CC 5.4
+derives *addressing* keys from the exporter and contains no DEK-from-exporter
+derivation; CC 5.1 requires TreeKEM-shaped rekey OR the flat cascade per
+deployment, never a DEK derived from the exporter. Edge does not build the
+projection. Nor does edge overclaim the other way: `CohortGroup` today is a
+directory-only group with no commit lease, so it is the addressing root and
+the agreement *substrate*, not yet the TreeKEM commit discipline — that is
+#604's remaining work, below.
+
+**#604 itself — the concurrent-commit fork — is NOT closed by the
+`RoomKey` deletion.** It closes by the CC 3 composition rule: "concurrent
+claims are expected rather than prevented and MUST settle on earliest
+`claimed_at`, ties broken on the lowest occurrence `key_id` … convergent
+from either arrival order … no coordination round-trip". Two commits at
+epoch N → a deterministic winner by that rule, the loser re-proposes at
+N+1. That is a separate build on `CohortGroup::apply_remote_commit`, and
+#604 stays open for it.
 
 ---
 

@@ -2701,7 +2701,7 @@ async fn share_in_room(
 }
 
 async fn run_chat_legs(occ: &Occurrence) {
-    use ciris_edge::chat::{self, Body, PairRole, RoomKey};
+    use ciris_edge::chat::{self, Body, PairRole};
     use ciris_edge::mls::cohort_group::{
         key_package_from_bytes, key_package_to_bytes, mint_cohort_key_material,
     };
@@ -2857,9 +2857,17 @@ async fn run_chat_legs(occ: &Occurrence) {
     // ── open_chat: the MLS handshake, OVER THE ROOM ──────────────────
     // Both rows are ordinary community-scoped attestations the owner signs;
     // the audience gate serves each to exactly the other member's nodes.
+    //
+    // CIRISEdge#604 / v25.0.0 — the group this builds does NOT key the
+    // body (that is persist's community DEK, sealed by the send leg below).
+    // It is the room's CC 5.4 addressing root: K_record_id / K_symbol are
+    // HKDF over its exporter_secret (5.4.1), rebind on Add/Remove (5.4.3),
+    // and a below-federation destination is resolved from it rather than
+    // announced (5.4.6). This leg witnesses that the root comes to exist on
+    // BOTH nodes; wiring it into the #499 scope address table is follow-on.
     let role = PairRole::of(&my_owner, &peer_owner);
     let handshake_start = Instant::now();
-    let handshake: Result<(RoomKey, serde_json::Value), String> = async {
+    let handshake: Result<(u64, serde_json::Value), String> = async {
         let kv = XChaChaKvStore::open_in_memory(room.as_bytes())
             .map_err(|e| format!("open_in_memory: {e}"))?;
         let store = ScopeStateProvider::new(Arc::new(kv));
@@ -2906,9 +2914,9 @@ async fn run_chat_legs(occ: &Occurrence) {
                 )
                 .await?;
                 let shared = share_in_room(dir, row, &room, signers).await?;
-                let key = RoomKey::of(&group).await?;
+                let group_epoch = group.epoch().await;
                 Ok((
-                    key,
+                    group_epoch,
                     serde_json::json!({
                         "role": "creator",
                         "key_package_waited_ms": waited.waited().as_millis(),
@@ -2953,9 +2961,9 @@ async fn run_chat_legs(occ: &Occurrence) {
                 let group = CohortGroup::join(store, &room, material, &welcome, 16)
                     .await
                     .map_err(|e| format!("CohortGroup::join: {e}"))?;
-                let key = RoomKey::of(&group).await?;
+                let group_epoch = group.epoch().await;
                 Ok((
-                    key,
+                    group_epoch,
                     serde_json::json!({
                         "role": "joiner",
                         "key_package_bytes": kp_bytes.len(),
@@ -2971,7 +2979,7 @@ async fn run_chat_legs(occ: &Occurrence) {
     }
     .await;
     let handshake_ms = handshake_start.elapsed().as_millis();
-    let (key, mls) = match handshake {
+    let (group_epoch, mls) = match handshake {
         Ok(v) => v,
         Err(e) => {
             tracing::error!(%room, ?role, error = %e, handshake_ms, "open_chat: the MLS handshake failed");
@@ -2995,12 +3003,13 @@ async fn run_chat_legs(occ: &Occurrence) {
             "role": format!("{role:?}"),
             "mls": mls,
             "handshake_ms": handshake_ms,
-            "epoch": key.epoch(),
+            "group_epoch": group_epoch,
             "covers": "both ends derive the same two-person room from the two owner \
                        fed-IDs (both FOUNDERS, so both moderators); the MLS handshake \
                        (KeyPackage, Welcome; X-Wing 0x004D) rode the room as ordinary \
-                       community-scoped rows the owners signed, and both ends now hold \
-                       the room's record secret",
+                       community-scoped rows the owners signed, and both ends now stand \
+                       on the same group at the same epoch — the room's CC 5.4 \
+                       addressing root, not its content key (CIRISEdge#604)",
         }),
     );
 
@@ -3081,8 +3090,9 @@ async fn run_chat_legs(occ: &Occurrence) {
                         "attested_by": my_owner,
                         "custody": cfg.node_id,
                         "with": "community",
-                        "covers": "the body SEALED under the room's MLS record secret (XChaCha20-Poly1305, \
-                                   HKDF per message), authored tier:local / cohort:self by the OWNER \
+                        "covers": "the body written to the room's blob store under persist's community \
+                                   DEK (wrapped per member occurrence, CIRISPersist#848) with only the \
+                                   pointer on the row, authored tier:local / cohort:self by the OWNER \
                                    (sign-at-write, full hybrid), then share(With::Community): enter_mesh \
                                    over the same bytes with the node's co-scrub, then the owner's own \
                                    supersedes at community (CC 5.3.2.4.2 + 4.4.3.3.1)",
@@ -3206,15 +3216,16 @@ async fn run_chat_legs(occ: &Occurrence) {
             })).collect::<Vec<_>>(),
             "expected_author": peer_owner,
             "expected_attested_by": peer_owner,
-            "opened_with_room_key": opened,
+            "opened": opened,
             "leaked_self_rows": leaked_self_rows,
             "plaintext_on_wire": plaintext_on_wire,
             "peer_node": peer_node,
             "inbound": occ.inbound_stats.as_json(),
             "covers": "a community-scoped, SEALED chat row attested and signed by the peer's \
                        human — the supersedes their share wrote — arrived over RNS through \
-                       the relay, was read back by room, and OPENED with the room's MLS \
-                       record secret; no self copy and no plaintext reached this node",
+                       the relay, was read back by room, and its BODY OPENED through this \
+                       node's occurrence wrap in the room's key_grant set (persist's \
+                       community DEK); no self copy and no plaintext reached this node",
         }),
     );
 }

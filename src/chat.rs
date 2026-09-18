@@ -16,27 +16,30 @@
 //! and no roster to disagree about. [`pair_community`] is the room as a
 //! record: both people `founder`s, so both are moderators by construction.
 //!
-//! # Community tier is ENCRYPTED — the body is sealed under the room's key
+//! # Community tier is ENCRYPTED — the body is a blob under the room's DEK
 //!
 //! A `community` placement is cohort-filtered visibility, and its bytes are
 //! encrypted at rest (CC 4.4.3.2.1). For chat that is not a substrate promise
-//! about storage; it is the message. The body of every message is sealed
-//! under the room's MLS **record secret** ([`RoomKey`], the group's exporter
-//! for records) with XChaCha20-Poly1305, keyed through HKDF over the room,
-//! the author, the claim's signed instant and the epoch — so a ciphertext
-//! lifted onto any other row does not open. (The instant became bindable in
-//! persist v40.0.0, which carries the CLAIM's `asserted_at` verbatim onto a
-//! widening and gives the placement its own `widened_at`; under v39.0.0 the
-//! widening re-stamped it, so the far end — which only ever receives the
-//! widening — could not have opened a message keyed on it.) What crosses the
-//! wire, and what the
-//! relay and every node that is not a member holds, is ciphertext inside a
-//! signed envelope. There is no plaintext producer.
+//! about storage; it is the message. The body of every message is written to
+//! the room's encrypted blob store ([`chat_message_attestation`] →
+//! [`GroupContentStore`](crate::group_content::GroupContentStore)) and the
+//! row carries only a [`BlobPointer`](crate::group_content::BlobPointer). The
+//! key is persist's **community DEK** — minted per `(community, minter,
+//! epoch)`, wrapped per active identity occurrence of each roster member
+//! (X25519 + ML-KEM-768 hybrid, CIRISPersist#848), and rotated by the
+//! substrate when a member is revoked. The AAD binds the domain, the author,
+//! the claim's signed instant and the field, so a ciphertext lifted onto any
+//! other row does not open. What crosses the wire, and what the relay and
+//! every node that is not a member holds, is ciphertext inside a signed
+//! envelope. There is no plaintext producer, and there is no second seal:
+//! the pre-v24 `RoomKey` (the group's exporter, HKDF'd per message) is
+//! deleted (CIRISEdge#604, v25.0.0). `FSD/GROUP_CONTENT_ON_BLOBS.md` §2.1
+//! says which layer answers which clause.
 //!
-//! # The MLS handshake rides the room — directory-only MLS
+//! # The MLS handshake rides the room — the room's ADDRESSING root
 //!
-//! The room's key is an MLS group between the two people (ciphersuite
-//! `0x004D`, X-Wing). The handshake needs two messages, and both are ordinary
+//! Every room still has an MLS group between its people (ciphersuite
+//! `0x004D`, X-Wing), and the handshake that builds it is two ordinary
 //! community-scoped rows in the room, shared like any other:
 //!
 //! 1. the **joiner** (the lexicographically greater fed-ID, [`PairRole`])
@@ -44,13 +47,23 @@
 //!    ([`key_package_attestation`], `chat:key_package:v1`);
 //! 2. the **creator** creates the group, admits the joiner from that row, and
 //!    shares the Welcome ([`welcome_attestation`], `chat:welcome:v1`);
-//! 3. the joiner joins from the Welcome; both derive the same record secret.
+//! 3. the joiner joins from the Welcome; both stand on the same group at the
+//!    same epoch.
 //!
-//! The KeyPackage's own credential is a fresh MLS signing key; what binds it
-//! to the PERSON is the row it rides in, signed by their FedID hybrid key and
-//! admitted at the put door against their directory record. No side channel,
-//! no extra plane, and the audience gate serves each row to exactly the other
-//! member's nodes.
+//! The group does NOT key the body (above). It is the room's **CC 5.4
+//! addressing root**: `K_record_id` and `K_symbol` are HKDF-Expand over the
+//! group's raw `exporter_secret` (CC 5.4.1, byte-pinned in
+//! [`scope_privacy`](crate::scope_privacy)), they rebind on every Add/Remove
+//! (CC 5.4.3), and a below-federation destination never announces — members
+//! resolve it from a cached directory entry plus that group-and-epoch-bound
+//! schedule (CC 5.4.6). [`cohort_addressing::snapshot`](crate::cohort_addressing::snapshot)
+//! is that derivation over a room's [`CohortGroup`](crate::mls::CohortGroup),
+//! and the Welcome wrap is the CC 5.4.4 shape
+//! ([`mls::welcome_wrap`](crate::mls::welcome_wrap)). The KeyPackage's own
+//! credential is a fresh MLS signing key; what binds it to the PERSON is the
+//! row it rides in, signed by their FedID hybrid key and admitted at the put
+//! door against their directory record. No side channel, no extra plane, and
+//! the audience gate serves each row to exactly the other member's nodes.
 //!
 //! # Who signs — the ACTOR, at write, with the full hybrid key
 //!
@@ -157,9 +170,13 @@ pub const FIELD_CONTENT_TYPE: &str = "content_type";
 /// §8).
 pub const FIELD_CONTENT: &str = "content";
 /// The MLS handshake payload on a KeyPackage / Welcome row: base64 bytes.
-pub const FIELD_MLS_BYTES: &str = "mls_bytes";
+/// Crate-private since v25.0.0 (CIRISEdge#604): the member is wire contract
+/// for the two handshake rows, read and written only by the producers and
+/// readers below; nothing outside this module has a reason to name it.
+const FIELD_MLS_BYTES: &str = "mls_bytes";
 /// On a Welcome row: the group epoch the Welcome joins the joiner at.
-pub const FIELD_MLS_EPOCH: &str = "mls_epoch";
+/// Crate-private, as above.
+const FIELD_MLS_EPOCH: &str = "mls_epoch";
 
 /// **The room two people share, derived from their fed-IDs alone.**
 ///
@@ -372,6 +389,8 @@ pub async fn signed_pair_community(
 
 /// Which side of the MLS handshake a person is in a pair room — decided
 /// from the two fed-IDs alone, like the room id, so neither has to be told.
+/// The handshake builds the room's group, the CC 5.4 addressing root (module
+/// doc); it does not key the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairRole {
     /// The lexicographically smaller fed-ID: creates the group, admits the
@@ -391,68 +410,6 @@ impl PairRole {
         } else {
             PairRole::Joiner
         }
-    }
-}
-
-/// **The room's key** — the MLS group's record secret at an epoch.
-///
-/// Obtained from a live [`CohortGroup`](crate::mls::CohortGroup) with
-/// [`RoomKey::of`]; every message sealed under it names the epoch, so a
-/// message from before a rotation is refused rather than mis-opened.
-/// Zeroed on drop; never printed.
-#[derive(Clone)]
-pub struct RoomKey {
-    secret: [u8; 32],
-    epoch: u64,
-}
-
-impl std::fmt::Debug for RoomKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RoomKey")
-            .field("epoch", &self.epoch)
-            .field("secret", &"<redacted>")
-            .finish()
-    }
-}
-
-impl Drop for RoomKey {
-    fn drop(&mut self) {
-        // Safe scrub (this crate denies `unsafe`): zero, then pin the write
-        // with `black_box` so the optimizer keeps it.
-        for b in &mut self.secret {
-            *b = 0;
-        }
-        std::hint::black_box(&self.secret);
-    }
-}
-
-impl RoomKey {
-    /// The record secret of a live group, at its current epoch.
-    ///
-    /// # Errors
-    /// The group cannot export (not active, or the exporter failed).
-    pub async fn of(group: &crate::mls::CohortGroup) -> Result<Self, String> {
-        let secret = group
-            .record_secret()
-            .await
-            .map_err(|e| format!("record_secret: {e}"))?;
-        Ok(Self {
-            secret: *secret.as_bytes(),
-            epoch: group.epoch().await,
-        })
-    }
-
-    /// A key from its parts — for a consumer that already holds the MLS
-    /// exporter (a server whose group lives elsewhere), and for tests.
-    #[must_use]
-    pub fn from_parts(secret: [u8; 32], epoch: u64) -> Self {
-        Self { secret, epoch }
-    }
-
-    /// The MLS epoch this key belongs to.
-    #[must_use]
-    pub fn epoch(&self) -> u64 {
-        self.epoch
     }
 }
 
