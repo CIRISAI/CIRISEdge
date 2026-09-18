@@ -142,6 +142,10 @@ struct Node {
     /// The engine's derived signing key — this node's occurrence of
     /// `identity`, and the viewer key for every read here (CIRISPersist#848).
     me: String,
+    /// The signer for `me` — what an `Edge` on this node signs the wire with,
+    /// and what a row authored by THIS NODE (attester == minter, the
+    /// production shape) is signed with.
+    signer: Arc<ciris_edge::identity::LocalSigner>,
 }
 
 /// Build a node whose directory knows `idents`, with the signing identity
@@ -266,6 +270,7 @@ async fn build_node(idents: &[&Ident], signer: &Ident, provision: bool) -> Node 
         store,
         identity: signer.key_id.clone(),
         me,
+        signer: Arc::new(identity),
     }
 }
 
@@ -683,6 +688,7 @@ async fn a_pointer_to_bytes_that_were_never_written_is_a_miss() {
         content_field: ContentField::Body,
         media_type: Some("text/plain".into()),
         stream_id: None,
+        epoch: None,
     };
 
     let err = node_a
@@ -1832,5 +1838,591 @@ async fn a_withdraws_revokes_the_bytes_on_a_holder_and_an_unauthorized_one_is_in
     assert!(
         matches!(after, Err(GroupContentError::NotHeld { .. })),
         "a member who could open it a moment ago cannot now: {after:?}",
+    );
+}
+
+// ─── CIRISEdge#601: pull on attestation ────────────────────────────────
+
+/// One end of an in-process wire between two `Edge`s: `send` to the one
+/// peer this end knows lands on that peer's inbound; `listen` forwards this
+/// end's inbound to the edge's dispatch loop. Frames carry NO attribution
+/// (`source_key_id: None`, federation arrival) — the shape a plain HTTP
+/// transport delivers, so every gate on the receive side runs at its
+/// strictest.
+struct WireEnd {
+    peer_key_id: String,
+    to_peer: tokio::sync::mpsc::Sender<Vec<u8>>,
+    inbound: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+}
+
+fn wire(a_key: &str, b_key: &str) -> (Arc<WireEnd>, Arc<WireEnd>) {
+    let (a_to_b, b_inbound) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (b_to_a, a_inbound) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    (
+        Arc::new(WireEnd {
+            peer_key_id: b_key.to_owned(),
+            to_peer: a_to_b,
+            inbound: tokio::sync::Mutex::new(Some(a_inbound)),
+        }),
+        Arc::new(WireEnd {
+            peer_key_id: a_key.to_owned(),
+            to_peer: b_to_a,
+            inbound: tokio::sync::Mutex::new(Some(b_inbound)),
+        }),
+    )
+}
+
+#[async_trait::async_trait]
+impl ciris_edge::transport::Transport for WireEnd {
+    fn id(&self) -> ciris_edge::transport::TransportId {
+        ciris_edge::transport::TransportId::HTTP
+    }
+
+    async fn send(
+        &self,
+        destination_key_id: &str,
+        bytes: &[u8],
+    ) -> Result<ciris_edge::transport::TransportSendOutcome, ciris_edge::transport::TransportError>
+    {
+        if destination_key_id != self.peer_key_id {
+            return Err(ciris_edge::transport::TransportError::Unreachable(format!(
+                "this wire reaches only {}, not {destination_key_id}",
+                self.peer_key_id
+            )));
+        }
+        self.to_peer
+            .send(bytes.to_vec())
+            .await
+            .map_err(|e| ciris_edge::transport::TransportError::Io(e.to_string()))?;
+        Ok(ciris_edge::transport::TransportSendOutcome::Delivered)
+    }
+
+    async fn listen(
+        &self,
+        sink: tokio::sync::mpsc::Sender<ciris_edge::transport::InboundFrame>,
+    ) -> Result<(), ciris_edge::transport::TransportError> {
+        let mut rx =
+            self.inbound.lock().await.take().ok_or_else(|| {
+                ciris_edge::transport::TransportError::Config("listen twice".into())
+            })?;
+        while let Some(envelope_bytes) = rx.recv().await {
+            let frame = ciris_edge::transport::InboundFrame {
+                envelope_bytes,
+                transport: ciris_edge::transport::TransportId::HTTP,
+                received_at: chrono::Utc::now(),
+                source_key_id: None,
+                link_key_id: None,
+                arrival_scope: None,
+            };
+            if sink.send(frame).await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An `Edge` on `node`, over `transport`, serving this node's blobs through
+/// the persist-backed chunk source, running.
+async fn spawn_edge(
+    node: &Node,
+    transport: Arc<WireEnd>,
+) -> (Arc<ciris_edge::Edge>, tokio::sync::watch::Sender<bool>) {
+    use ciris_persist::federation::FederationDirectory;
+    let edge = ciris_edge::Edge::builder()
+        .directory(node.dir.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+        .federation_directory(node.dir.clone() as Arc<dyn FederationDirectory>)
+        .queue(node.dir.clone())
+        .signer(node.signer.clone())
+        .transport(transport as Arc<dyn ciris_edge::transport::Transport>)
+        .blob_chunk_source(Arc::new(
+            ciris_edge::blob_swarm::PersistBlobChunkSource::new(node.store.engine().clone()),
+        ))
+        .config(ciris_edge::EdgeConfig::default())
+        .build()
+        .expect("build edge");
+    let edge = Arc::new(edge);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let runner = Arc::clone(&edge);
+    tokio::spawn(async move {
+        let _ = runner.run(shutdown_rx).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    (edge, shutdown_tx)
+}
+
+/// A community-scoped, federation-tier content row authored by THIS NODE'S
+/// key and bound-hybrid-signed — the wire shape a peer receives after the
+/// author's `share` widened a chat message to the room. Mirrors
+/// `chat::chat_row` on the fields that matter to admission and to the pull:
+/// `dimension`, `community_id`, the `content` pointer (with the sealed-under
+/// `epoch`), the bound columns, and a signature persist verifies against
+/// the author's registered hybrid record.
+async fn federation_content_row(
+    author: &ciris_edge::identity::LocalSigner,
+    room: &str,
+    pointer: &BlobPointer,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> ciris_persist::federation::Attestation {
+    use ciris_edge::replication::attestation_bind::{
+        bind_attestation_envelope, render_signed_instant, truncate_to_substrate_resolution,
+        AttestationColumns,
+    };
+    use sha2::Digest as _;
+    let author_key_id = author.key_id.as_str();
+    let asserted_at = truncate_to_substrate_resolution(asserted_at);
+    let dimension = ciris_edge::chat::CHAT_MESSAGE_DIMENSION;
+    let mut envelope = serde_json::json!({
+        "dimension": dimension,
+        ciris_edge::chat::FIELD_COMMUNITY_ID: room,
+        "score": 1.0,
+        ciris_edge::chat::FIELD_CONTENT: pointer,
+    });
+    let attestation_id = {
+        let mut h = sha2::Sha256::new();
+        h.update(dimension.as_bytes());
+        h.update(room.as_bytes());
+        h.update(author_key_id.as_bytes());
+        h.update(render_signed_instant(asserted_at).as_bytes());
+        h.update(ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon"));
+        format!("chat-{}", &hex::encode(h.finalize())[..32])
+    };
+    let subjects = vec![author_key_id.to_owned()];
+    bind_attestation_envelope(
+        &mut envelope,
+        asserted_at,
+        &AttestationColumns {
+            attestation_id: &attestation_id,
+            attesting_key_id: author_key_id,
+            attestation_type: "scores",
+            attested_key_id: author_key_id,
+            subject_key_ids: &subjects,
+            cohort_scope: ciris_persist::federation::types::cohort_scope::COMMUNITY,
+            weight: None,
+        },
+    );
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
+    let digest = sha2::Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) =
+        ciris_edge::identity::sign_bound_hybrid(author, &canonical, dimension)
+            .await
+            .expect("hybrid sign");
+    ciris_persist::federation::Attestation {
+        attestation_id,
+        attesting_key_id: author_key_id.to_owned(),
+        attested_key_id: author_key_id.to_owned(),
+        attestation_type: "scores".to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: author_key_id.to_owned(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: ciris_persist::federation::types::cohort_scope::COMMUNITY.to_owned(),
+        tier: ciris_persist::federation::types::attestation_tier::FEDERATION.to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    }
+}
+
+/// A federation-tier row that references `sha` by `evidence_refs` — the
+/// manifest / evidence-bundle shape, commons scope — authored and
+/// bound-hybrid-signed by THIS NODE's key.
+async fn commons_evidence_row(
+    author: &ciris_edge::identity::LocalSigner,
+    sha: &[u8; 32],
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> ciris_persist::federation::Attestation {
+    use ciris_edge::replication::attestation_bind::{
+        bind_attestation_envelope, truncate_to_substrate_resolution, AttestationColumns,
+    };
+    use sha2::Digest as _;
+    let author_key_id = author.key_id.as_str();
+    let asserted_at = truncate_to_substrate_resolution(asserted_at);
+    let dimension = "provenance:evidence_bundle:v1";
+    let mut envelope = serde_json::json!({
+        "dimension": dimension,
+        "score": 1.0,
+        "evidence_refs": [hex::encode(sha)],
+    });
+    let attestation_id = format!("evidence-{}", &hex::encode(sha)[..16]);
+    let subjects = vec![author_key_id.to_owned()];
+    bind_attestation_envelope(
+        &mut envelope,
+        asserted_at,
+        &AttestationColumns {
+            attestation_id: &attestation_id,
+            attesting_key_id: author_key_id,
+            attestation_type: "scores",
+            attested_key_id: author_key_id,
+            subject_key_ids: &subjects,
+            cohort_scope: ciris_persist::federation::types::cohort_scope::FEDERATION,
+            weight: None,
+        },
+    );
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
+    let digest = sha2::Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) =
+        ciris_edge::identity::sign_bound_hybrid(author, &canonical, dimension)
+            .await
+            .expect("hybrid sign");
+    ciris_persist::federation::Attestation {
+        attestation_id,
+        attesting_key_id: author_key_id.to_owned(),
+        attested_key_id: author_key_id.to_owned(),
+        attestation_type: "scores".to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: author_key_id.to_owned(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: ciris_persist::federation::types::cohort_scope::FEDERATION.to_owned(),
+        tier: ciris_persist::federation::types::attestation_tier::FEDERATION.to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    }
+}
+
+/// A's rows of one attestation-type prefix, as B's bridge would receive
+/// them over the cursor: BARE `Attestation` JSON.
+async fn rows_of(node: &Node, type_prefix: &str) -> Vec<Vec<u8>> {
+    use ciris_persist::federation::FederationDirectory;
+    node.dir
+        .list_attestations_since(None, 200)
+        .await
+        .expect("list rows")
+        .into_iter()
+        .filter(|a| a.attestation.attestation_type.starts_with(type_prefix))
+        .map(|a| serde_json::to_vec(&a.attestation).expect("wire"))
+        .collect()
+}
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ciris_edge=warn")),
+        )
+        .with_test_writer()
+        .try_init();
+}
+
+/// **CIRISEdge#601 — the bytes crossed ONLY through the pull.**
+///
+/// Two nodes, two substrates, two running `Edge`s on a wire that carries
+/// nothing but signed frames. A stores a commons blob and signs the row
+/// that references it. The row reaches B through B's replication bridge —
+/// the same door every attestation arrives by — and that is the LAST thing
+/// this test hands over. Nothing copies the bytes. B's bridge offers the
+/// admitted row to the pull sink; the puller projects the meaning, runs the
+/// store gate (A is on B's commons allowlist; B's operator consented to
+/// hold commons), asks persist who holds the blob, fetches it from A over
+/// the wire through the swarm, and stores it. Then B holds what A had.
+///
+/// The holder plane crosses AFTER the row, so the first pull finds nobody
+/// and the RETRY is what completes it — "retried on the next round if no
+/// holder is fresh" is asserted, not assumed.
+///
+/// **Mutation:** with the bridge's `pull_sink.offer` removed, the bytes
+/// never leave A and this fails at the assertion that names #601.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one crossing and every precondition in one place
+async fn a_far_node_holds_what_the_pull_brought_home() {
+    use ciris_edge::blob_swarm::{BlobPuller, PullConfig};
+    use ciris_edge::replication::{
+        ApplyOutcome, BridgeConfig, BridgeEngine, EnvelopeKind,
+        FederationDirectoryReplicationBridge, ReplicationDirectory as _,
+    };
+    use ciris_persist::federation::blobs::{BlobBody, BlobStorage as _};
+    use ciris_persist::federation::{FederationDirectory, SignedAttestation};
+    init_tracing();
+
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let node_a = node(&[&alice, &bob], &alice).await;
+    let node_b = node(&[&alice, &bob], &bob).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+
+    let (wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (_edge_a, _stop_a) = spawn_edge(&node_a, wire_a).await;
+    let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
+
+    // B's puller: A is a blessed commons sender, and B's operator holds
+    // commons. Both are OPT-INS — the defaults refuse.
+    let (sink, _puller) = BlobPuller::spawn(
+        Arc::clone(&edge_b),
+        node_b.store.engine().clone(),
+        node_b.dir.clone(),
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        node_b.me.clone(),
+        PullConfig {
+            retry_backoff: std::time::Duration::from_millis(200),
+            commons_allowlist: vec![node_a.me.clone()],
+            consent: ciris_edge::blob_swarm::OperatorStoreConsent {
+                commons: ciris_edge::blob_swarm::ConsentDisposition::Announce,
+                ..ciris_edge::blob_swarm::OperatorStoreConsent::default()
+            },
+            ..PullConfig::default()
+        },
+    );
+    let bridge = FederationDirectoryReplicationBridge::with_config(
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        Arc::new(Vec::new),
+        BridgeConfig::default(),
+    )
+    .with_engine(Some(BridgeEngine(node_b.store.engine().clone())))
+    .with_pull_sink(Some(sink))
+    .with_local_key_id(Some(node_b.me.clone()));
+
+    // A stores a commons blob through the commons door (announces a holder
+    // claim) and signs the row that references it.
+    let body = b"a public artifact, parked here, referenced there";
+    let sha: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(body).into();
+    node_a
+        .store
+        .engine()
+        .put_blob_signing(
+            &sha,
+            BlobBody::Inline(body.to_vec()),
+            Some("application/octet-stream"),
+            &node_a.me,
+            // NOW, not the fixture's fixed instant: the holder claim carries
+            // this as `asserted_at`, and B's `list_holders` drops a claim
+            // older than the 24h TTL as stale (CEG §10.1.2) — correctly.
+            chrono::Utc::now(),
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .expect("A stores the commons blob and announces it");
+    let row = commons_evidence_row(&node_a.signer, &sha, ts()).await;
+    node_a
+        .dir
+        .put_attestation_authored(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("A holds the row it authored");
+    assert!(
+        !node_b.dir.has_blob(&sha).await.expect("has_blob"),
+        "precondition: B holds nothing"
+    );
+
+    // ── The ROW crosses, through B's bridge — the last thing handed over. ──
+    let outcome = bridge
+        .apply_envelope_bytes(
+            EnvelopeKind::Attestation,
+            &serde_json::to_vec(&row).expect("wire"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        outcome,
+        ApplyOutcome::Admitted,
+        "B admits A's referencing row"
+    );
+
+    // ── The HOLDER plane crosses after it, so the retry completes the pull. ──
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let holders = rows_of(&node_a, "holds_bytes:").await;
+    assert!(
+        !holders.is_empty(),
+        "precondition: put_blob announced a holder claim"
+    );
+    for bytes in &holders {
+        let o = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, bytes, None)
+            .await;
+        assert_eq!(o, ApplyOutcome::Admitted, "B admits A's holder claim");
+    }
+
+    // ── The PULL: nothing else moves the bytes. ──
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if node_b.dir.has_blob(&sha).await.expect("has_blob") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the bytes never arrived on B: the pull-on-attestation hook did not fire, or \
+             the fetch/store failed (CIRISEdge#601). Nothing in this test copies bytes; \
+             only the puller can put them here"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let held = node_b
+        .dir
+        .get_blob(&sha)
+        .await
+        .expect("get_blob")
+        .expect("held");
+    let BlobBody::Inline(got) = held else {
+        panic!("a whole blob is held inline, got {held:?}");
+    };
+    assert_eq!(got, body, "B holds byte-for-byte what A stored");
+}
+
+/// **CIRISEdge#601 vs #499 — the community leg, pinned where it stops.**
+///
+/// Everything up to the wire works for a sealed community blob: the row is
+/// admitted, the hook fires, the meaning projects, the store gate clears
+/// (A's key hops to alice, a member of a room B joined), the holder is
+/// found. Then `resolve_holder_routes` refuses: the content is scoped to a
+/// cohort, this node has no [`ScopeAddressTable`], and #499 forbids
+/// shipping a scoped request on the federation address. No deployment has
+/// a table today, and the only scoped send is Reticulum's. So on every
+/// current node a community blob cannot be pulled — a design collision
+/// between #499 and #601 that this pin states rather than papers over.
+///
+/// Meanwhile the transcript reads `NotFetched` — the state a reader waits
+/// through — by TYPE, and a stranger reads `NotGranted` once bytes exist.
+/// The first is asserted here; the second is asserted on the commons leg's
+/// sibling in `chat_message_federates`.
+///
+/// This test turns red the day the router routes cohort content on a
+/// legacy node, or a table is installed on the test transport — either of
+/// which is the moment to promote it into the end-to-end open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // every crossing and the pin, in one place on purpose
+async fn a_community_pull_stops_at_the_scope_router_on_a_legacy_node() {
+    use ciris_edge::blob_swarm::{BlobPuller, PullConfig, PullOutcome};
+    use ciris_edge::chat::{Body, ChatMessage, UnopenedReason};
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::key_grant::{
+        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
+    };
+    use ciris_persist::federation::{FederationDirectory, SignedAttestation};
+    init_tracing();
+
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let room = "room-alice-bob";
+    let node_a = node(&[&alice, &bob], &alice).await;
+    let node_b = node(&[&alice, &bob], &bob).await;
+    seed_room(&node_a, room, &[&alice, &bob]).await;
+    seed_room(&node_b, room, &[&alice, &bob]).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+    let (wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (_edge_a, _stop_a) = spawn_edge(&node_a, wire_a).await;
+    let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
+
+    // A seals as THIS NODE (attester == minter) and signs the row.
+    let body = b"the bytes crossed on their own";
+    let sealed = node_a
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(room),
+            author_key_id: &node_a.me,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: body,
+            media_type: Some("text/plain"),
+        })
+        .await
+        .expect("seal at the community tier");
+    assert!(
+        sealed.pointer.epoch.is_some(),
+        "precondition: the pointer carries the sealed-under epoch (CIRISEdge#601)"
+    );
+    let sha: [u8; 32] = hex::decode(&sealed.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let row = federation_content_row(&node_a.signer, room, &sealed.pointer, ts()).await;
+    node_a
+        .dir
+        .put_attestation_authored(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("A holds the row it authored");
+
+    // The key and the holder plane cross (the doors #605 and the commons leg
+    // witnessed); the row is what the pull is about.
+    for set in node_a
+        .dir
+        .list_attestations_since(None, 200)
+        .await
+        .expect("list A's rows")
+        .into_iter()
+        .filter(|a| {
+            a.attestation
+                .attestation_type
+                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+        })
+    {
+        node_b
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantSet {
+                attestation: set.attestation.clone(),
+            })
+            .await
+            .expect("B admits A's key_grant set");
+    }
+    for bytes in rows_of(&node_a, "holds_bytes:").await {
+        let h: ciris_persist::federation::Attestation =
+            serde_json::from_slice(&bytes).expect("row");
+        node_b
+            .dir
+            .put_attestation(SignedAttestation { attestation: h })
+            .await
+            .expect("B admits A's holder claim");
+    }
+
+    // Before the bytes: NotFetched, by type.
+    let mut msg = ChatMessage::from_row(&row, room).expect("a chat row");
+    msg.resolve_content(&node_b.store, &node_b.me).await;
+    match &msg.body {
+        Body::Unopened {
+            reason: UnopenedReason::NotFetched { .. },
+        } => {}
+        other => panic!(
+            "before the bytes arrive the body reads NotFetched — a state to wait through, \
+             distinct from NotGranted (CIRISEdge#601) — got {other:?}"
+        ),
+    }
+
+    // The pull, driven directly so its verdict is observable.
+    let puller = BlobPuller::new(
+        Arc::clone(&edge_b),
+        node_b.store.engine().clone(),
+        node_b.dir.clone(),
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        node_b.me.clone(),
+        PullConfig::default(),
+    );
+    let verdict = puller.pull_one(&row, sha, 0).await;
+    match &verdict {
+        PullOutcome::FetchFailed { reason, .. } if reason.contains("NO scope address table") => {}
+        other => panic!(
+            "the community pull is expected to stop at the SCOPE ROUTER on a node with no \
+             address table (CIRISEdge#499 forbids a scoped request on the federation \
+             address). `Stored` means #499's rule changed or a table exists — promote this \
+             pin into the end-to-end open. `Refused` means the pull stopped EARLIER, at the \
+             store gate, for a member's blob whose holders are all members — the \
+             `Allowlisted` stand-in regression #601 fixed in `store_admission`. Got {other:?}"
+        ),
+    }
+    assert!(
+        !node_b.dir.has_blob(&sha).await.expect("has_blob"),
+        "nothing was stored past the router's refusal"
     );
 }

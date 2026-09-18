@@ -318,6 +318,7 @@ async fn an_unknown_pointer_is_not_held_rather_than_a_bare_error() {
         content_field: ContentField::Body,
         media_type: None,
         stream_id: None,
+        epoch: None,
     };
     let err = s
         .open(OpenRequest {

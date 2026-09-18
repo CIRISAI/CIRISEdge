@@ -912,10 +912,105 @@ pub enum Body {
     /// never pays for content it is not going to show, and a caller that
     /// does calls [`ChatMessage::resolve_content`].
     Pointer(crate::group_content::BlobPointer),
-    /// Sealed, and this key does not open it (rotated epoch, foreign
-    /// algorithm, tampered, or not a member's key) — or not sealed at all,
-    /// which a community row must never be.
-    Unopened { reason: String },
+    /// The content did not open, and [`UnopenedReason`] says which of the
+    /// distinct states that is. CIRISEdge#601: "the bytes are not here yet"
+    /// and "this key does not open them" used to share one string, and a
+    /// reader could not tell a state to wait through from the
+    /// confidentiality boundary working.
+    Unopened { reason: UnopenedReason },
+}
+
+/// CIRISEdge#601 — **why a body did not open**, as an arm rather than a
+/// sentence.
+///
+/// The two that matter are the first two. [`Self::NotFetched`] is a state a
+/// reader waits through: the row arrived, the bytes have not, and the pull
+/// (`blob_swarm::pull`) is what changes it. [`Self::NotGranted`] is the
+/// boundary working: the bytes are here and this viewer holds no grant, and
+/// no amount of waiting changes it. CIRISServer's contact view asserts on
+/// exactly this difference; before the split it string-matched persist's
+/// prose.
+///
+/// Every arm carries `detail` — the substrate's own sentence — because a
+/// refusal that cannot be followed back is one nobody can act on. `Display`
+/// renders it, so a caller that only wants text gets what it got before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnopenedReason {
+    /// Not held on this node yet. A pull may be in flight, queued, or not
+    /// yet triggered; the state to wait through.
+    NotFetched { detail: String },
+    /// Held, and this viewer's occurrence holds no grant for it — the
+    /// confidentiality boundary, working as designed.
+    NotGranted { detail: String },
+    /// Held once, swept: the epoch was destroyed or the bytes evicted.
+    Evicted { detail: String },
+    /// The seal did not open under the AAD rebuilt from this row — the
+    /// row and the bytes disagree, or the bytes were tampered with.
+    SealMismatch { detail: String },
+    /// The row itself is not a well-formed chat message (no pointer, an
+    /// unreadable pointer), so there was nothing to open.
+    MalformedRow { detail: String },
+    /// The bytes opened but are not UTF-8 text.
+    NotText { detail: String },
+    /// A substrate fault while opening; retrying may or may not help.
+    Substrate { detail: String },
+}
+
+impl UnopenedReason {
+    /// Stable lower-case label for the arm, for logs and metrics.
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotFetched { .. } => "not_fetched",
+            Self::NotGranted { .. } => "not_granted",
+            Self::Evicted { .. } => "evicted",
+            Self::SealMismatch { .. } => "seal_mismatch",
+            Self::MalformedRow { .. } => "malformed_row",
+            Self::NotText { .. } => "not_text",
+            Self::Substrate { .. } => "substrate",
+        }
+    }
+
+    /// The substrate's own sentence.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::NotFetched { detail }
+            | Self::NotGranted { detail }
+            | Self::Evicted { detail }
+            | Self::SealMismatch { detail }
+            | Self::MalformedRow { detail }
+            | Self::NotText { detail }
+            | Self::Substrate { detail } => detail,
+        }
+    }
+
+    /// Is this a state a reader should wait through (the bytes may still
+    /// arrive), as opposed to a verdict?
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        matches!(self, Self::NotFetched { .. })
+    }
+
+    /// The one mapping from the store's typed error. Kept here, once, so
+    /// `resolve_content` and any future opener agree on the arms.
+    fn from_store_error(e: &crate::group_content::GroupContentError) -> Self {
+        use crate::group_content::GroupContentError as E;
+        let detail = e.to_string();
+        match e {
+            E::NotHeld { .. } => Self::NotFetched { detail },
+            E::NotGranted { .. } => Self::NotGranted { detail },
+            E::Evicted { .. } => Self::Evicted { detail },
+            E::SealMismatch { .. } => Self::SealMismatch { detail },
+            E::Substrate(_) => Self::Substrate { detail },
+        }
+    }
+}
+
+impl std::fmt::Display for UnopenedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind(), self.detail())
+    }
 }
 
 /// One message, as read back off the plane.
@@ -974,16 +1069,20 @@ impl ChatMessage {
                 a,
                 env,
                 Body::Unopened {
-                    reason: "row carries no `content` pointer — chat content lives in \
-                             the group's blob store (CIRISEdge#586)"
-                        .to_owned(),
+                    reason: UnopenedReason::MalformedRow {
+                        detail: "row carries no `content` pointer — chat content lives in \
+                                 the group's blob store (CIRISEdge#586)"
+                            .to_owned(),
+                    },
                 },
             ));
         };
         let body = match serde_json::from_value::<crate::group_content::BlobPointer>(raw.clone()) {
             Ok(pointer) => Body::Pointer(pointer),
             Err(e) => Body::Unopened {
-                reason: format!("row carries an unreadable `content` pointer: {e}"),
+                reason: UnopenedReason::MalformedRow {
+                    detail: format!("row carries an unreadable `content` pointer: {e}"),
+                },
             },
         };
         Some(Self::from_parts(a, env, body))
@@ -1034,8 +1133,12 @@ impl ChatMessage {
     /// permissions failure and is really a wrong-handle one.
     ///
     /// # Errors
-    /// Never — a failure to open becomes [`Body::Unopened`] with the reason,
-    /// because one unreadable message must not fail a room's whole read.
+    /// Never — a failure to open becomes [`Body::Unopened`] with a typed
+    /// [`UnopenedReason`], because one unreadable message must not fail a
+    /// room's whole read. The two arms a reader must tell apart:
+    /// [`UnopenedReason::NotFetched`] (the bytes are not here yet — wait, the
+    /// pull is what changes it) and [`UnopenedReason::NotGranted`] (the bytes
+    /// are here and this viewer may not open them — the boundary working).
     pub async fn resolve_content(
         &mut self,
         store: &dyn crate::group_content::GroupContentStore,
@@ -1054,11 +1157,13 @@ impl ChatMessage {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(text) => Body::Text(text),
                 Err(e) => Body::Unopened {
-                    reason: format!("content is not UTF-8: {e}"),
+                    reason: UnopenedReason::NotText {
+                        detail: format!("content is not UTF-8: {e}"),
+                    },
                 },
             },
             Err(e) => Body::Unopened {
-                reason: e.to_string(),
+                reason: UnopenedReason::from_store_error(&e),
             },
         };
     }

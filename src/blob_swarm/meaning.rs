@@ -176,6 +176,11 @@ pub struct BlobMeaning {
     attestation_id: String,
     sha256: [u8; 32],
     media_type: Option<String>,
+    /// The typed pointer the row carried, when the reference was one (a
+    /// chat row); `None` when the reference was an `evidence_refs` entry
+    /// (a manifest). CIRISEdge#601 — the pull adopts through it: tier,
+    /// field and sealed-under epoch are all the author's declared facts.
+    pointer: Option<BlobPointer>,
 }
 
 impl BlobMeaning {
@@ -285,8 +290,70 @@ impl BlobMeaning {
             attesting_key_id: row.attesting_key_id.clone(),
             attestation_id: row.attestation_id.clone(),
             sha256: *blob_sha256,
-            media_type: pointer.and_then(|p| p.media_type),
+            media_type: pointer.as_ref().and_then(|p| p.media_type.clone()),
+            pointer,
         })
+    }
+
+    /// CIRISEdge#601 — every blob `row` references, in the two shapes
+    /// [`Self::project`] accepts: a top-level [`BlobPointer`] object, or an
+    /// `evidence_refs` entry that is a 64-hex sha. Deduplicated, in envelope
+    /// order.
+    ///
+    /// A `holds_bytes` row returns **nothing**, by name: it references its
+    /// blob too, but as possession, and a puller that fetched on possession
+    /// claims would fetch every blob every peer announced. The full
+    /// projection refuses it as `PossessionIsNotMeaning`; this pre-check
+    /// keeps the apply path from cloning a row it would then refuse.
+    ///
+    /// Signature is NOT checked here — that is `project`'s job, per sha,
+    /// and it runs before any byte moves. This is the cheap "should the
+    /// apply path even hand this row to the puller" question.
+    #[must_use]
+    pub fn referenced_shas(row: &Attestation) -> Vec<[u8; 32]> {
+        if row.attestation_type.starts_with(HOLDS_BYTES_TYPE_PREFIX)
+            || row
+                .attestation_envelope
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                == Some(HOLDS_BYTES_KIND)
+        {
+            return Vec::new();
+        }
+        let Some(obj) = row.attestation_envelope.as_object() else {
+            return Vec::new();
+        };
+        let mut out: Vec<[u8; 32]> = Vec::new();
+        let mut push = |hex_sha: &str| {
+            if let Ok(bytes) = hex::decode(hex_sha) {
+                if let Ok(arr) = <[u8; 32]>::try_from(bytes) {
+                    if !out.contains(&arr) {
+                        out.push(arr);
+                    }
+                }
+            }
+        };
+        for v in obj.values().filter(|v| v.is_object()) {
+            if let Ok(p) = serde_json::from_value::<BlobPointer>(v.clone()) {
+                push(&p.content_sha256);
+            }
+        }
+        if let Some(refs) = obj
+            .get("evidence_refs")
+            .and_then(serde_json::Value::as_array)
+        {
+            for r in refs.iter().filter_map(serde_json::Value::as_str) {
+                push(r);
+            }
+        }
+        out
+    }
+
+    /// The typed pointer this meaning was projected through, if the
+    /// reference was one. `None` for an `evidence_refs` reference.
+    #[must_use]
+    pub fn pointer(&self) -> Option<&BlobPointer> {
+        self.pointer.as_ref()
     }
 
     /// The cohort this content was placed in, by the party that signed it.
@@ -535,6 +602,57 @@ mod tests {
 
     const SHA: [u8; 32] = [9u8; 32];
     const OTHER: [u8; 32] = [8u8; 32];
+
+    /// CIRISEdge#601 — the apply path's pre-check finds both reference
+    /// shapes, dedupes, and returns nothing for a possession claim.
+    #[test]
+    fn referenced_shas_finds_pointers_and_evidence_refs_and_never_possession() {
+        // A typed pointer.
+        let row = content_row(ps(), "g-1", &SHA);
+        assert_eq!(BlobMeaning::referenced_shas(&row), vec![SHA]);
+
+        // An evidence_refs entry, and a pointer to another blob, deduped
+        // against a repeat of the first.
+        let mut both = content_row(ps(), "g-1", &SHA);
+        both.attestation_envelope["evidence_refs"] =
+            serde_json::json!([hex::encode(OTHER), hex::encode(SHA)]);
+        assert_eq!(BlobMeaning::referenced_shas(&both), vec![SHA, OTHER]);
+
+        // Nothing referenced.
+        assert!(BlobMeaning::referenced_shas(&bare_row(ps())).is_empty());
+
+        // A holds_bytes row references its blob as POSSESSION; the pre-check
+        // returns nothing, matching `project`'s `PossessionIsNotMeaning`.
+        let mut holds = bare_row(ps());
+        holds.attestation_type = format!("holds_bytes:sha256:{}", &hex::encode(SHA)[..16]);
+        holds.attestation_envelope = serde_json::json!({ "evidence_refs": [hex::encode(SHA)] });
+        assert!(BlobMeaning::referenced_shas(&holds).is_empty());
+        let mut holds_by_kind = bare_row(ps());
+        holds_by_kind.attestation_envelope =
+            serde_json::json!({ "kind": "holds_bytes", "evidence_refs": [hex::encode(SHA)] });
+        assert!(BlobMeaning::referenced_shas(&holds_by_kind).is_empty());
+
+        // A malformed sha (wrong length) is not a reference.
+        let mut short = bare_row(ps());
+        short.attestation_envelope = serde_json::json!({ "evidence_refs": ["abcd"] });
+        assert!(BlobMeaning::referenced_shas(&short).is_empty());
+    }
+
+    /// The projection keeps the pointer it came through, and none for an
+    /// evidence_refs reference.
+    #[test]
+    fn project_retains_the_pointer_it_came_through() {
+        let row = content_row(ps(), "g-1", &SHA);
+        let m = BlobMeaning::project(&row, &SHA).expect("named");
+        assert_eq!(
+            m.pointer().map(|p| p.content_sha256.as_str()),
+            Some(hex::encode(SHA).as_str())
+        );
+        let mut ev = bare_row(ps());
+        ev.attestation_envelope = serde_json::json!({ ENVELOPE_COMMUNITY_ID: "g-1", "evidence_refs": [hex::encode(SHA)] });
+        let m = BlobMeaning::project(&ev, &SHA).expect("named by evidence");
+        assert!(m.pointer().is_none());
+    }
 
     fn ps() -> &'static str {
         ciris_persist::federation::types::cohort_scope::COMMUNITY
