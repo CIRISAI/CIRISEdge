@@ -182,6 +182,75 @@ fn store() -> ScopeStateProvider {
     ))
 }
 
+/// The room as a federated community record — both humans FOUNDERS, so both
+/// are zero-hop moderators and persist lets either widen a row into it.
+/// `open_two_person_community` builds the MLS group under a bespoke id; this
+/// registers that same id as the community persist checks membership against
+/// when a commit row is widened to the room.
+async fn register_room(dir: &SqliteBackend, room: &str, alice: &Party, bob: &Party) {
+    use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
+    use ciris_persist::federation::types::consensus_protocol;
+    let record = ciris_edge::chat::community(
+        room,
+        "Chat",
+        &[
+            (&alice.fed_id, Some(MEMBER_ROLE_FOUNDER)),
+            (&bob.fed_id, Some(MEMBER_ROLE_FOUNDER)),
+        ],
+        consensus_protocol::UNANIMOUS,
+        ts(),
+    )
+    .expect("a two-founder roster");
+    let signed = ciris_edge::chat::signed_community(record, &alice.node_signer)
+        .await
+        .expect("sign the room");
+    dir.put_community(signed)
+        .await
+        .expect("the room is admitted");
+}
+
+/// Carry a commit the way the mesh does (CIRISEdge#604): as a signed
+/// `chat:commit:v1` row admitted into the directory, never as the
+/// `CohortCommit` object handed across. The far side reads it off the room.
+async fn carry_commit(
+    dir: &SqliteBackend,
+    author: &Party,
+    room: &str,
+    commit: &ciris_edge::mls::CohortCommit,
+) {
+    use ciris_edge::replication::attestation_bind::{share, CrossingBasis, Shared, Signers, With};
+    let row = ciris_edge::chat::commit_attestation_in(&author.signer, room, commit)
+        .await
+        .expect("commit row");
+    // Authored `self` placement, then WIDENED to the room: the widening is the
+    // federation-tier row a peer receives, and the only one a room read
+    // returns — a `self` row never leaves the node that wrote it.
+    dir.put_attestation(SignedAttestation {
+        attestation: row.clone(),
+    })
+    .await
+    .expect("a commit row admits like any other room row");
+    let crossing = share(
+        dir,
+        &row,
+        With::Community {
+            community_key_id: room.to_owned(),
+        },
+        CrossingBasis::ProducerAuthority,
+        Signers {
+            node: &author.node_signer,
+            actor: Some(&author.signer),
+        },
+    )
+    .await
+    .expect("widen the commit row to the room");
+    assert!(
+        matches!(crossing.shared, Shared::Placed { .. }),
+        "{:?}",
+        crossing.shared
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Rung 2 — "search for a fedID or a NodeCode" → "Contact Found"
 // ═══════════════════════════════════════════════════════════════════
@@ -326,7 +395,7 @@ async fn the_community_is_exactly_the_two_of_them_on_both_sides() {
 #[tokio::test]
 async fn the_invitee_is_a_moderator_not_a_guest() {
     let (alice, bob) = (Party::new("alice", 1), Party::new("bob", 2));
-    let (a, b, _id) = open_two_person_community(&alice, &bob).await;
+    let (a, b, room) = open_two_person_community(&alice, &bob).await;
     let carol = Party::new("carol", 3);
 
     // BOB — the invitee — adds a third party.
@@ -337,16 +406,18 @@ async fn the_invitee_is_a_moderator_not_a_guest() {
                  'both are mods' means operationally",
     );
 
-    // And ALICE, the founder, accepts that change. Assert it APPLIED: a
-    // `Deferred` outcome persists nothing and advances no epoch, so a test
-    // that ignored this would pass while the membership change sat in a
-    // holding pen.
-    let applied = a
-        .apply_remote_commit(commit.commit())
+    // And ALICE, the founder, accepts that change — read off the room as a
+    // row, the way it reaches her over the mesh. Assert it APPLIED: a held
+    // commit persists nothing and advances no epoch, so a test that ignored
+    // this would pass while the membership change sat in a holding pen.
+    let dir = directory_of(&[&alice, &bob]).await;
+    register_room(&dir, &room, &alice, &bob).await;
+    carry_commit(&dir, &bob, &room, &commit).await;
+    let applied = ciris_edge::chat::apply_room_commits(&a, &*dir, &bob.fed_id, &room)
         .await
         .expect("the founder must accept the invitee's commit");
-    assert!(
-        matches!(applied, ciris_edge::mls::CommitApplyOutcome::Applied(_)),
+    assert_eq!(
+        applied.applied, 1,
         "the founder must MERGE the invitee's commit, not hold it: {applied:?}"
     );
 
@@ -424,7 +495,7 @@ async fn a_group_that_is_not_a_pair_has_no_other_member() {
 #[tokio::test]
 async fn both_sides_derive_the_same_conversation_key() {
     let (alice, bob) = (Party::new("alice", 1), Party::new("bob", 2));
-    let (a, b, _id) = open_two_person_community(&alice, &bob).await;
+    let (a, b, room) = open_two_person_community(&alice, &bob).await;
 
     let ka = a.destination_secret().await.expect("alice's secret");
     let kb = b.destination_secret().await.expect("bob's secret");
@@ -439,12 +510,14 @@ async fn both_sides_derive_the_same_conversation_key() {
     let carol = Party::new("carol", 3);
     let (_m, kp) = mint_cohort_key_material(&carol.fed_id).unwrap();
     let commit = a.add_member(&carol.fed_id, kp).await.expect("add carol");
-    let applied = b
-        .apply_remote_commit(commit.commit())
+    let dir = directory_of(&[&alice, &bob]).await;
+    register_room(&dir, &room, &alice, &bob).await;
+    carry_commit(&dir, &alice, &room, &commit).await;
+    let applied = ciris_edge::chat::apply_room_commits(&b, &*dir, &alice.fed_id, &room)
         .await
         .expect("bob applies");
-    assert!(
-        matches!(applied, ciris_edge::mls::CommitApplyOutcome::Applied(_)),
+    assert_eq!(
+        applied.applied, 1,
         "the key only moves for a commit that actually merged: {applied:?}"
     );
 

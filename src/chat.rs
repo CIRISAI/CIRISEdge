@@ -961,6 +961,62 @@ pub async fn commits_from(
         .collect())
 }
 
+/// What [`apply_room_commits`] did with the commit rows it read (CIRISEdge#604).
+#[derive(Debug, Default)]
+#[must_use = "`reproposed` carries commits that MUST be emitted as rows and shared"]
+pub struct AppliedCommits {
+    /// Rows whose commit merged (a plain apply, or the winner of a contest
+    /// after a rollback).
+    pub applied: usize,
+    /// Rows that contested an epoch and LOST against the claim this node
+    /// holds — their author will re-propose.
+    pub discarded: usize,
+    /// Rows this node could not act on: framed ahead of its epoch (held), or
+    /// already reached.
+    pub other: usize,
+    /// This node's own commits, re-issued against a winner's line after a
+    /// rollback. Each MUST be carried as a [`commit_attestation_in`] row and
+    /// shared, or the node's re-proposals exist nowhere but here.
+    pub reproposed: Vec<crate::mls::CohortCommit>,
+}
+
+/// Apply every commit row `from` placed in `room` to `group`, in claim order,
+/// contesting each by the claim its row binds — the receive half of
+/// CIRISEdge#604. Idempotent: rows already applied read as `other`, rows
+/// already discarded read as `discarded` again, and no state moves.
+///
+/// # Errors
+/// A directory read failure, or a contest this node cannot resolve
+/// ([`crate::mls::CohortGroupError::ForkBeyondWindow`] — surfaced, never
+/// silently absorbed).
+pub async fn apply_room_commits(
+    group: &crate::mls::CohortGroup,
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    from: &str,
+    room: &str,
+) -> Result<AppliedCommits, String> {
+    use crate::mls::ClaimedApplyOutcome;
+    let mut out = AppliedCommits::default();
+    for (bytes, claim) in commits_from(directory, from, room).await? {
+        match group
+            .apply_remote_commit_claimed(&bytes, Some(claim))
+            .await
+            .map_err(|e| format!("apply commit from {from} in {room}: {e}"))?
+        {
+            ClaimedApplyOutcome::Applied(_) => out.applied += 1,
+            ClaimedApplyOutcome::Discarded { .. } => out.discarded += 1,
+            ClaimedApplyOutcome::Superseded { reproposed, .. } => {
+                out.applied += 1;
+                out.reproposed.extend(reproposed);
+            }
+            ClaimedApplyOutcome::Deferred { .. } | ClaimedApplyOutcome::AlreadyApplied(_) => {
+                out.other += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// A message body as read back: opened text, or why it did not open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Body {

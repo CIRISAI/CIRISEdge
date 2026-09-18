@@ -506,6 +506,131 @@ async fn the_mls_handshake_rides_the_room_as_signed_rows() {
     );
 }
 
+/// Carry a commit as the mesh does (CIRISEdge#604): a `chat:commit:v1` row,
+/// admitted and WIDENED to the room — the row a peer receives.
+async fn carry_commit(
+    w: &World,
+    author: &ciris_edge::identity::LocalSigner,
+    signers: Signers<'_>,
+    commit: &ciris_edge::mls::CohortCommit,
+) {
+    let row = chat::commit_attestation_in(author, &w.room, commit)
+        .await
+        .expect("commit row");
+    assert_eq!(row.attesting_key_id, commit.claim().committer_key_id());
+    assert_eq!(
+        row.asserted_at,
+        commit.claim().asserted_at(),
+        "the claim IS the row"
+    );
+    w.dir
+        .put_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("a commit row admits like any other room row");
+    let placed = share(
+        &*w.dir,
+        &row,
+        w.room_with(),
+        CrossingBasis::ProducerAuthority,
+        signers,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(placed.shared, Shared::Placed { .. }), "{placed:?}");
+}
+
+/// **Two nodes that both commit against one epoch converge THROUGH THE
+/// ROWS** (CIRISEdge#604). Alice and Bob each rotate at epoch 1; each carries
+/// its commit as a `chat:commit:v1` row the other reads off the room — no
+/// hand-delivery of `CohortCommit` objects. Alice's claim is earlier, so Bob
+/// rolls back, applies hers, and re-proposes as a second row; Alice discards
+/// his original and applies the re-proposal. Both land on one epoch and ONE
+/// exporter secret — the CC 5.4 addressing root.
+#[tokio::test]
+async fn concurrent_rotates_converge_through_the_rows() {
+    let w = world().await;
+    let room = w.room.clone();
+    let (material, kp) = mint_cohort_key_material("bob-fed").unwrap();
+    let a = CohortGroup::create(store("alice-conv"), &room, "alice-fed", 16)
+        .await
+        .unwrap();
+    let add = a.add_member("bob-fed", kp).await.unwrap();
+    let b = CohortGroup::join(
+        store("bob-conv"),
+        &room,
+        material,
+        add.welcome().unwrap(),
+        16,
+    )
+    .await
+    .unwrap();
+    let base = a.epoch().await;
+    assert_eq!(base, b.epoch().await);
+
+    // Both rotate against `base`. Alice's claim is 10 s earlier — she wins.
+    let ca = a
+        .rotate_at(ts() + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    let cb = b
+        .rotate_at(ts() + chrono::Duration::seconds(20))
+        .await
+        .unwrap();
+    assert!(ca.claim().wins_over(cb.claim()));
+    carry_commit(&w, &w.alice, w.signers(), &ca).await;
+    carry_commit(&w, &w.bob, w.bobs_signers(), &cb).await;
+    assert_ne!(
+        a.destination_secret().await.unwrap().as_bytes(),
+        b.destination_secret().await.unwrap().as_bytes(),
+        "the fork: two lines, two secrets"
+    );
+
+    // Bob reads Alice's row off the room: he lost, rolls back, re-proposes.
+    let bobs = chat::apply_room_commits(&b, &*w.dir, "alice-fed", &room)
+        .await
+        .unwrap();
+    assert_eq!(
+        bobs.applied, 1,
+        "the winner's commit merged after the rollback"
+    );
+    assert_eq!(
+        bobs.reproposed.len(),
+        1,
+        "the loser's rotate must be RE-PROPOSED against the winner's line, not lost"
+    );
+    for c in &bobs.reproposed {
+        carry_commit(&w, &w.bob, w.bobs_signers(), c).await;
+    }
+
+    // Alice reads Bob's rows: his original is discarded, his re-proposal applies.
+    let alices = chat::apply_room_commits(&a, &*w.dir, "bob-fed", &room)
+        .await
+        .unwrap();
+    assert_eq!(
+        alices.discarded, 1,
+        "the later claim is DISCARDED on the winner's node"
+    );
+    assert_eq!(alices.applied, 1, "and the re-proposal applies");
+
+    assert_eq!(a.epoch().await, base + 2);
+    assert_eq!(b.epoch().await, base + 2);
+    assert_eq!(
+        a.destination_secret().await.unwrap().as_bytes(),
+        b.destination_secret().await.unwrap().as_bytes(),
+        "CONVERGENCE THROUGH THE ROWS: both ends derive one exporter secret — the CC 5.4 \
+         addressing root — with every commit read off the room, none hand-delivered"
+    );
+
+    // Idempotent: a second read of the same rows moves nothing.
+    let again = chat::apply_room_commits(&a, &*w.dir, "bob-fed", &room)
+        .await
+        .unwrap();
+    assert_eq!((again.applied, again.reproposed.len()), (0, 0));
+    assert_eq!(a.epoch().await, base + 2);
+}
+
 /// **A widening carries the CLAIM's instant** (persist v40.0.0 /
 /// CIRISPersist#801) — the guarantee the seal now rests on. The widened row
 /// is the only one a peer receives, so if its `asserted_at` were the
