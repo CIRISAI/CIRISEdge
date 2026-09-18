@@ -728,7 +728,7 @@ impl ReplicationRuntime {
             Arc::clone(&convergence),
         );
 
-        let registry = Arc::new(ReplicationRegistry::new());
+        let registry = Arc::new(ReplicationRegistry::for_config(&config));
 
         // CIRISEdge#370 — ONE shared applier for every coordinator (initial
         // initiators, the #312 responder factory, hot-adds). The adapter is a

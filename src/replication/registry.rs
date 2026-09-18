@@ -74,6 +74,12 @@ pub enum RouteOutcome {
     /// the transport's source-identification layer; the wire frame
     /// itself does NOT carry it — it's transport-medium-identified.)
     NoCoordinatorRegistered { kind: EnvelopeKind },
+    /// CIRISEdge#621 — `peer_key_id` is THIS node's own key. No coordinator is
+    /// looked up and no responder is built: a responder keyed on our own id
+    /// replies to itself (CIRISServer#607 — 0 rounds served on the canonical).
+    /// Only reachable when [`ReplicationRegistry::set_local_key_id`] was called;
+    /// a registry that does not know its own key cannot refuse by it.
+    RefusedSelf,
 }
 
 /// Errors from registry routing.
@@ -106,6 +112,11 @@ pub struct ReplicationRegistry {
     /// pre-#312 behavior: an inbound round with no coordinator returns
     /// [`RouteOutcome::NoCoordinatorRegistered`].
     responder_factory: OnceLock<ResponderFactory>,
+    /// CIRISEdge#621 — this node's own key id, once known. The last line of
+    /// defence against a responder for ourselves: the transport refuses the
+    /// attribution first (`LinkAttribution::ResolvedToSelf`), but this door is
+    /// public and an operator's own listener may hand it anything.
+    local_key_id: OnceLock<String>,
 }
 
 impl ReplicationRegistry {
@@ -113,7 +124,52 @@ impl ReplicationRegistry {
         Self {
             by_peer_kind: RwLock::new(HashMap::new()),
             responder_factory: OnceLock::new(),
+            local_key_id: OnceLock::new(),
         }
+    }
+
+    /// CIRISEdge#621 — a registry that already knows which key is THIS node
+    /// (`None` = not known; it then cannot refuse by it). The runtime builds
+    /// with `config.local_key_id`.
+    #[must_use]
+    pub fn with_local_key_id(local_key_id: Option<String>) -> Self {
+        let r = Self::new();
+        if let Some(k) = local_key_id {
+            r.set_local_key_id(k);
+        }
+        r
+    }
+
+    /// CIRISEdge#621 — the runtime's constructor: a registry that knows THIS
+    /// node's key from `config.local_key_id`.
+    #[must_use]
+    pub fn for_config(config: &super::runtime::ReplicationRuntimeConfig) -> Self {
+        Self::with_local_key_id(config.local_key_id.clone())
+    }
+
+    /// CIRISEdge#621 — tell the registry which key is THIS node, so
+    /// [`Self::route_inbound_bytes`] can refuse to build a responder for it.
+    /// First caller wins; a later call with a different id is ignored and
+    /// logged, because a registry whose notion of "self" moves at runtime is
+    /// worse than one that never learned it.
+    pub fn set_local_key_id(&self, key_id: impl Into<String>) {
+        let key_id = key_id.into();
+        if let Err(unset) = self.local_key_id.set(key_id) {
+            if self.local_key_id.get().map(String::as_str) != Some(unset.as_str()) {
+                tracing::warn!(
+                    held = ?self.local_key_id.get(),
+                    offered = %unset,
+                    "ReplicationRegistry::set_local_key_id called twice with different ids; \
+                     keeping the first (CIRISEdge#621)"
+                );
+            }
+        }
+    }
+
+    /// The key id this registry treats as itself, if it was told one.
+    #[must_use]
+    pub fn local_key_id(&self) -> Option<&str> {
+        self.local_key_id.get().map(String::as_str)
     }
 
     /// CIRISEdge#312 — install the [`ResponderFactory`] (once). Called by
@@ -232,6 +288,18 @@ impl ReplicationRegistry {
             Ok(None) => return Ok(RouteOutcome::NotAReplicationFrame),
             Err(e) => return Err(RegistryError::Protocol(e.into())),
         };
+        // CIRISEdge#621 — refuse BEFORE any coordinator lookup or responder
+        // construction: a responder keyed on our own id would send its reply to
+        // ourselves ("no route to peer: key_id=<self>"), and the requester sees
+        // only a timeout.
+        if self.local_key_id() == Some(peer_key_id) {
+            tracing::warn!(
+                peer = %peer_key_id,
+                "CRPL frame REFUSED — attributed to THIS node's own key; no responder is \
+                 built for ourselves (CIRISEdge#621 / CIRISServer#607)"
+            );
+            return Ok(RouteOutcome::RefusedSelf);
+        }
         // ReplicationMessage carries a `kind` field on every variant
         // — that's our dispatch key alongside peer_key_id.
         let kind = match &msg {

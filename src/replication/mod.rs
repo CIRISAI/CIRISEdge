@@ -259,6 +259,9 @@ impl InboundRouter {
             .await
         {
             Ok(RouteOutcome::NotAReplicationFrame) => RouteDisposition::NotReplication,
+            // CIRISEdge#621 — attributed to ourselves: no legitimate source, so
+            // the same disposition an un-attributed frame gets.
+            Ok(RouteOutcome::RefusedSelf) => RouteDisposition::Unattributed,
             Ok(_) => RouteDisposition::Routed,
             Err(e) => RouteDisposition::Failed(e.to_string()),
         }
