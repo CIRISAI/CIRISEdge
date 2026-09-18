@@ -1389,6 +1389,15 @@ pub struct EdgeBuilder {
     /// table uninstalled and every scope-native path declining.
     #[cfg(feature = "_reticulum-module")]
     scope_native_convergence: Option<std::time::Duration>,
+    /// CIRISEdge#616 — a pre-built [`ScopeLifecycle`] over ANY
+    /// [`ScopedDestinationSink`], for a node that derives scoped addresses
+    /// without a Reticulum transport owning the table. Takes precedence
+    /// over [`EdgeBuilder::scope_native_addressing`]'s arming.
+    ///
+    /// [`ScopeLifecycle`]: crate::scope_lifecycle::ScopeLifecycle
+    /// [`ScopedDestinationSink`]: crate::scope_lifecycle::ScopedDestinationSink
+    #[cfg(feature = "_reticulum-module")]
+    scope_lifecycle: Option<Arc<crate::scope_lifecycle::ScopeLifecycle>>,
     /// CIRISEdge#34 (v0.14.0 wiring) — optionally pre-built
     /// reachability tracker so a Reticulum transport constructed BEFORE
     /// Edge (the pyo3 cohabitation init order) can share the same
@@ -1656,6 +1665,8 @@ impl Edge {
             reticulum_transport: None,
             #[cfg(feature = "_reticulum-module")]
             scope_native_convergence: None,
+            #[cfg(feature = "_reticulum-module")]
+            scope_lifecycle: None,
             reachability: None,
             derived_schema: None,
             canonical_bootstrap_peers: Vec::new(),
@@ -3796,10 +3807,16 @@ impl Edge {
     pub fn blob_scope_router(&self) -> crate::blob_swarm::BlobScopeRouter {
         #[cfg(feature = "_reticulum-module")]
         {
+            // The transport's table when a Reticulum transport owns one;
+            // otherwise the lifecycle's (CIRISEdge#616). When both exist
+            // they are the SAME `Arc` — `arm_scope_native` hands the one
+            // table to both — so this is one source of truth either way,
+            // not a second one.
             crate::blob_swarm::BlobScopeRouter::new(
                 self.reticulum_transport
                     .as_ref()
-                    .and_then(|t| t.scope_address_table().cloned()),
+                    .and_then(|t| t.scope_address_table().cloned())
+                    .or_else(|| self.scope_lifecycle.as_ref().map(|l| Arc::clone(l.table()))),
             )
         }
         #[cfg(not(feature = "_reticulum-module"))]
@@ -7057,6 +7074,25 @@ impl EdgeBuilder {
         self.scope_native_convergence = Some(convergence);
         self
     }
+    /// CIRISEdge#616 — install a pre-built scope lifecycle, whose table the
+    /// blob router reads (`Edge::blob_scope_router`) and whose sink is
+    /// whatever the caller registers scoped destinations on. Arms the
+    /// scope-native gates exactly as `scope_native_addressing` does; the
+    /// difference is only who owns the table. A node with no Reticulum
+    /// transport can RESOLVE a community holder to its scoped address this
+    /// way — the scoped SEND still needs Reticulum, and refuses without it
+    /// (`fetch_blob_chunk_scoped`, CIRISEdge#499): HTTP has no scope-derived
+    /// destination plane, and the router choosing a scoped address is not
+    /// permission to ship the request on the federation endpoint.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn scope_lifecycle(
+        mut self,
+        lifecycle: Arc<crate::scope_lifecycle::ScopeLifecycle>,
+    ) -> Self {
+        self.scope_lifecycle = Some(lifecycle);
+        self
+    }
 
     #[cfg(feature = "_reticulum-module")]
     #[must_use]
@@ -7305,11 +7341,16 @@ impl EdgeBuilder {
         let (verified_envelope_tx, _) =
             broadcast::channel(self.config.event_channel_capacity.max(1));
         #[cfg(feature = "_reticulum-module")]
-        let scope_lifecycle = Self::arm_scope_native(
-            self.scope_native_convergence,
-            self.reticulum_transport.as_ref(),
-            &signer.key_id,
-        )?;
+        let scope_lifecycle = match self.scope_lifecycle.clone() {
+            // CIRISEdge#616 — a caller-built lifecycle wins; it already
+            // owns a table and a sink.
+            Some(lifecycle) => Some(lifecycle),
+            None => Self::arm_scope_native(
+                self.scope_native_convergence,
+                self.reticulum_transport.as_ref(),
+                &signer.key_id,
+            )?,
+        };
 
         let content_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
         // CIRISEdge#55 — sibling pending-map for chunk fetches.

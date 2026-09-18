@@ -101,6 +101,16 @@ pub struct SwarmConfig {
     /// primitive's strongest signal of dishonesty; no benefit of the
     /// doubt.
     pub dishonest_strike_limit: u32,
+    /// CIRISEdge#616 — how many transport ERRORS (not misses, not
+    /// mismatches) from one peer before the scheduler stops dispatching to
+    /// it for this session. Before this bound an erroring peer was only
+    /// re-timed and re-queued, never retired, so a holder whose dispatch
+    /// fails INSTANTLY — a scoped send refused before any I/O, the case a
+    /// community pull hits on a node with the room's group but no
+    /// Reticulum transport — was re-dispatched forever: a busy-spin with
+    /// nothing to wait on, and the pull never reached a verdict. 3 —
+    /// a transient error gets two retries; a structural one is retired.
+    pub error_strike_limit: u32,
     /// Per-request timeout. A holder that doesn't respond in this
     /// window is penalized via EWMA but not demoted (could be
     /// transient network) — chunk is re-queued elsewhere.
@@ -114,6 +124,7 @@ impl Default for SwarmConfig {
             ewma_alpha: 0.3,
             endgame_threshold: 2,
             dishonest_strike_limit: 1,
+            error_strike_limit: 3,
             per_request_timeout: Duration::from_secs(30),
         }
     }
@@ -148,6 +159,8 @@ pub struct PeerState {
     /// Demoted peers are skipped during pick-fastest-with-capacity;
     /// their existing in-flight requests are allowed to complete
     /// (canceling would just discard work).
+    /// CIRISEdge#616 — transport errors from this peer this session.
+    pub error_strikes: u32,
     pub demoted: bool,
 }
 
@@ -168,6 +181,17 @@ impl PeerState {
     pub fn record_dishonest_strike(&mut self, limit: u32) {
         self.dishonest_strikes = self.dishonest_strikes.saturating_add(1);
         if self.dishonest_strikes >= limit {
+            self.demoted = true;
+        }
+    }
+
+    /// CIRISEdge#616 — a dispatch to this peer ERRORED (a transport
+    /// refusal or failure, not a miss). At `limit` the peer is retired for
+    /// the session, so the scheduler reaches `ChunkUnreachable` instead of
+    /// re-dispatching forever to a peer that fails on every attempt.
+    pub fn record_error_strike(&mut self, limit: u32) {
+        self.error_strikes = self.error_strikes.saturating_add(1);
+        if self.error_strikes >= limit {
             self.demoted = true;
         }
     }
@@ -1028,6 +1052,16 @@ impl SwarmScheduler {
         // they're picked up promptly.
         let mut pending: VecDeque<[u8; 32]> = manifest.chunks.iter().map(|(sha, _)| *sha).collect();
         let total_chunks = pending.len();
+        // CIRISEdge#616 — every `(peer, chunk)` currently dispatched. The
+        // endgame pass consults it so it never re-dispatches a chunk to a
+        // peer that already has THAT chunk in flight: the edge's pending
+        // map is keyed on `(blob, chunk)` and a second fetch of the same key
+        // replaces the first waiter's oneshot, which closes it under that
+        // waiter as "channel closed before response" — a self-inflicted
+        // error the unbounded loop used to absorb and the error-strike
+        // bound would otherwise count against the peer.
+        let mut dispatched: std::collections::HashSet<(String, [u8; 32])> =
+            std::collections::HashSet::new();
 
         // Assembly buffer keyed by chunk-SHA. Filled as each fetch
         // completes; final assembly walks the manifest in order.
@@ -1054,6 +1088,7 @@ impl SwarmScheduler {
                     break;
                 };
                 self.dispatch_chunk_fetch(&routes, &peer, blob_sha256, chunk_sha, &tx);
+                dispatched.insert((peer.clone(), chunk_sha));
                 if let Some(state) = peers.get_mut(&peer) {
                     state.in_flight = state.in_flight.saturating_add(1);
                 }
@@ -1084,6 +1119,7 @@ impl SwarmScheduler {
                     &mut peers,
                     &tx,
                     &mut total_in_flight,
+                    &mut dispatched,
                 );
             }
 
@@ -1108,6 +1144,7 @@ impl SwarmScheduler {
                 state.in_flight = state.in_flight.saturating_sub(1);
             }
             total_in_flight = total_in_flight.saturating_sub(1);
+            dispatched.remove(&(outcome.peer_key_id.clone(), outcome.chunk_sha));
 
             match outcome.result {
                 FetchResultBody::Bytes(bytes) => {
@@ -1177,12 +1214,25 @@ impl SwarmScheduler {
                         pending.push_back(outcome.chunk_sha);
                     }
                 }
-                FetchResultBody::Error(_) => {
+                FetchResultBody::Error(reason) => {
                     // Transport/timeout — penalize via a synthetic
                     // RTT sample of the configured per-request timeout
                     // (worst plausible), then re-queue.
                     if let Some(state) = peers.get_mut(&outcome.peer_key_id) {
                         state.record_rtt(self.config.per_request_timeout, self.config.ewma_alpha);
+                        // CIRISEdge#616 — and BOUND it: at the strike
+                        // limit the peer is retired, so a holder that
+                        // refuses every dispatch cannot spin this loop.
+                        state.record_error_strike(self.config.error_strike_limit);
+                        if state.demoted {
+                            tracing::warn!(
+                                holder = %outcome.peer_key_id,
+                                strikes = state.error_strikes,
+                                %reason,
+                                "swarm: holder retired for this fetch after repeated \
+                                 dispatch errors (CIRISEdge#616)"
+                            );
+                        }
                     }
                     if !chunk_bytes.contains_key(&outcome.chunk_sha) {
                         pending.push_back(outcome.chunk_sha);
@@ -1286,11 +1336,12 @@ impl SwarmScheduler {
     /// `chunk_bytes.contains_key` check on the verifier path.
     #[allow(
         clippy::too_many_arguments,
-        reason = "CIRISEdge#499 added the pre-resolved `routes` map; every other \
-                  argument is pre-existing scheduler state this endgame pass must \
-                  read or mutate. Bundling them into a struct would put the \
-                  scheduler's mutable loop state behind an indirection for one \
-                  call site and hide which fields this pass actually touches."
+        reason = "CIRISEdge#499 added the pre-resolved `routes` map and CIRISEdge#616 \
+                  the `dispatched` set; every other argument is pre-existing \
+                  scheduler state this endgame pass must read or mutate. Bundling \
+                  them into a struct would put the scheduler's mutable loop state \
+                  behind an indirection for one call site and hide which fields \
+                  this pass actually touches."
     )]
     fn maybe_endgame_dispatch(
         &self,
@@ -1301,21 +1352,28 @@ impl SwarmScheduler {
         peers: &mut HashMap<String, PeerState>,
         tx: &tokio::sync::mpsc::Sender<FetchOutcome>,
         total_in_flight: &mut usize,
+        dispatched: &mut std::collections::HashSet<(String, [u8; 32])>,
     ) {
         for (chunk_sha, _) in &manifest.chunks {
             if chunk_bytes.contains_key(chunk_sha) {
                 continue;
             }
-            // Pick any peer with capacity. (Could iterate by ewma_rtt
-            // for the fastest; endgame is a coverage primitive, not a
-            // latency primitive — any-capacity is fine.)
+            // Pick any peer with capacity that does NOT already have this
+            // chunk in flight (CIRISEdge#616): endgame is a race between
+            // DIFFERENT peers for the same chunk; a duplicate to the same
+            // peer only clobbers the edge's pending oneshot for that key.
+            // (Could iterate by ewma_rtt for the fastest; endgame is a
+            // coverage primitive, not a latency primitive — any-capacity is
+            // fine.)
             let candidate = peers
                 .iter()
                 .filter(|(_, p)| p.can_accept(self.config.max_in_flight_per_peer))
+                .filter(|(k, _)| !dispatched.contains(&((*k).clone(), *chunk_sha)))
                 .map(|(k, _)| k.clone())
                 .next();
             if let Some(peer) = candidate {
                 self.dispatch_chunk_fetch(routes, &peer, blob_sha256, *chunk_sha, tx);
+                dispatched.insert((peer.clone(), *chunk_sha));
                 if let Some(state) = peers.get_mut(&peer) {
                     state.in_flight = state.in_flight.saturating_add(1);
                 }
@@ -1558,6 +1616,24 @@ mod tests {
         assert!(pick_peer(&peers, 4).is_none());
     }
 
+    /// CIRISEdge#616 — an erroring peer is RETIRED at the strike limit, so
+    /// a session whose only holder fails every dispatch reaches
+    /// `ChunkUnreachable` instead of re-dispatching forever.
+    #[test]
+    fn error_strikes_demote_at_the_limit() {
+        let mut p = PeerState::default();
+        p.record_error_strike(3);
+        p.record_error_strike(3);
+        assert!(
+            !p.demoted,
+            "two strikes: still a candidate (transient errors get retries)"
+        );
+        p.record_error_strike(3);
+        assert!(p.demoted, "third strike: retired for the session");
+        assert!(!p.can_accept(4));
+        assert_eq!(SwarmConfig::default().error_strike_limit, 3);
+    }
+
     // ── CIRISEdge#499: holder routing ────────────────────────────────
 
     mod scope_native_holder_routing {
@@ -1577,8 +1653,14 @@ mod tests {
         /// alice + bob are members of community group `com-1`; mallory is not.
         fn table() -> Arc<ScopeAddressTable> {
             let t = ScopeAddressTable::new(Arc::new(StubDeriver));
-            t.install_group(&neighbourhood(), "com-1", 3, &[0xB2; 32], &[ALICE, BOB])
-                .expect("install com-1");
+            t.install_group(
+                &neighbourhood(),
+                &crate::cohort_addressing::group_id_for("com-1"),
+                3,
+                &[0xB2; 32],
+                &[ALICE, BOB],
+            )
+            .expect("install com-1");
             Arc::new(t)
         }
 
@@ -1613,7 +1695,11 @@ mod tests {
                     .expect("a community blob must not ride the federation address")
                     .as_bytes();
                 let want = t
-                    .send_address(&neighbourhood(), "com-1", member)
+                    .send_address(
+                        &neighbourhood(),
+                        &crate::cohort_addressing::group_id_for("com-1"),
+                        member,
+                    )
                     .expect("table has the member");
                 assert_eq!(
                     got,
