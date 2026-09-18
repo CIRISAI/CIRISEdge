@@ -394,6 +394,13 @@ pub struct SwarmRuntimeOptions {
     /// converger's per-tick `redundancy.*` re-resolution; `None` leaves the
     /// operator's configured values as the only input (pre-#546).
     pub mesh_config: Option<Arc<MeshConfigReader>>,
+    /// CIRISEdge#606 — the revocation register the replication apply path
+    /// writes AUTHORIZED withdrawals to. `Some` is `register_revocation`, the
+    /// door the converger's consent comment promised since v5.2.0: a content
+    /// whose every reference was withdrawn reads `ConsentState::Revoked` and
+    /// routes to `EjectHardDelete` regardless of rarity. `None` keeps the
+    /// retention-favouring `Active` for everything, exactly as before.
+    pub revocations: Option<Arc<crate::blob_swarm::RevocationRegister>>,
 }
 
 impl std::fmt::Debug for SwarmRuntimeOptions {
@@ -404,6 +411,7 @@ impl std::fmt::Debug for SwarmRuntimeOptions {
             .field("scope_native", &self.scope_table.is_some())
             .field("metrics_present", &self.metrics.is_some())
             .field("mesh_config_armed", &self.mesh_config.is_some())
+            .field("revocations_armed", &self.revocations.is_some())
             .finish()
     }
 }
@@ -708,6 +716,7 @@ impl FountainSwarmRuntime {
             let local_peer = local_peer_id.clone();
             let rtt = Arc::clone(&rtt_observer);
             let mesh_config = options.mesh_config.clone();
+            let revocations = options.revocations.clone();
             tokio::spawn(async move {
                 run_converger(
                     observed,
@@ -719,6 +728,7 @@ impl FountainSwarmRuntime {
                     sink,
                     local_peer,
                     rtt,
+                    revocations,
                 )
                 .await;
             })
@@ -1135,6 +1145,7 @@ async fn run_converger(
     sink: Option<SwarmRuntimeEventSink>,
     local_peer_id: String,
     rtt: Arc<dyn PeerRttObserver>,
+    revocations: Option<Arc<crate::blob_swarm::RevocationRegister>>,
 ) {
     // CIRISEdge#546 — the ceiling, re-read whenever `set_config` fires; the
     // `watch::Ref` is cloned out immediately and never held across an await.
@@ -1186,6 +1197,7 @@ async fn run_converger(
                     sink.as_ref(),
                     &local_peer_id,
                     rtt.as_ref(),
+                    revocations.as_deref(),
                 )
                 .await;
             }
@@ -1202,6 +1214,7 @@ async fn converger_tick(
     sink: Option<&SwarmRuntimeEventSink>,
     local_peer_id: &str,
     rtt: &dyn PeerRttObserver,
+    revocations: Option<&crate::blob_swarm::RevocationRegister>,
 ) {
     // Prune stale claims first so the rarity math sees a live view.
     let dropped = observed
@@ -1308,15 +1321,20 @@ async fn converger_tick(
         // directions, and closing this needs the revocation envelope, not
         // a different literal.
         //
-        // Determine consent state. v5.2.0 defaults to Active —
-        // revocation routing rides the inbound dispatch path
-        // (when a `consent:state:revoked` envelope arrives, edge
-        // calls into `register_revocation` on the runtime; that
-        // wiring lands in v5.3.0 when the consent envelope shape
-        // is normative). For the v5.2.0 cut, the converger acts on
-        // the substrate-tier verdicts driven by `holders_observed`
-        // alone.
-        let consent = ConsentState::Active;
+        // CIRISEdge#606 — THE WIRE, at last. `Active` is still the only
+        // honest default (the paragraph above stands), but it is now the
+        // default and not the answer: when a revocation register is
+        // installed, a content whose every referencing row was withdrawn by
+        // an AUTHORIZED withdrawal — the register recomputed persist's
+        // admission rule against the local target before recording it, so a
+        // replicated `withdraws` stored with rule=None is never an authority
+        // here — reads `Revoked`, and `should_eject_above_target` routes it
+        // to `EjectHardDelete` regardless of rarity or holder count. Every
+        // other content, and every content on a node with no register, reads
+        // `Active` exactly as it did. The `Unknown` arm is still unreachable
+        // from this site on purpose: it would be the #582 mass-deletion
+        // direction.
+        let consent = revocations.map_or(ConsentState::Active, |r| r.consent_for(&content_id));
 
         // Local-symbol rarity: compute over the merged claim set
         // including the local peer's view if it holds a symbol for
@@ -2430,6 +2448,91 @@ mod tests {
             }
         }
         (repaired, kept)
+    }
+
+    /// **CIRISEdge#606 — the wire, at the converger.** A content the
+    /// revocation register has REVOKED reads `ConsentState::Revoked` and
+    /// hard-deletes regardless of rarity or holder count: one holder is the
+    /// rarest a symbol can be, and it still goes. The same rig with no
+    /// register, and the same rig with a register that has NOT revoked the
+    /// content, keeps it — so wiring the register makes nothing evict-eligible
+    /// that was not withdrawn (the #582 mass-deletion direction).
+    #[tokio::test]
+    async fn a_revoked_content_hard_deletes_at_the_converger_and_nothing_else_does() {
+        use crate::blob_swarm::RevocationRegister;
+
+        async fn hard_deleted(
+            rx: &mut tokio::sync::mpsc::UnboundedReceiver<SwarmEvent>,
+            content_id: &str,
+        ) -> bool {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let mut hit = false;
+            while let Ok(ev) = rx.try_recv() {
+                if let SwarmEvent::HardDeleted { content_id: c } = ev {
+                    if c == content_id {
+                        hit = true;
+                    }
+                }
+            }
+            hit
+        }
+
+        let sha = [0x5Au8; 32];
+        let content_id = hex::encode(sha);
+
+        // (1) No register: the pre-#606 behaviour, retained.
+        let (mut rt, mut rx) = converger_rig(
+            fast_config(),
+            SwarmRuntimeOptions::default(),
+            &content_id,
+            1,
+        )
+        .await;
+        assert!(
+            !hard_deleted(&mut rx, &content_id).await,
+            "no register installed: consent is Active, one holder is rare, nothing deletes"
+        );
+        rt.shutdown().await;
+
+        // (2) A register that knows the content and has NOT revoked it.
+        let live = Arc::new(RevocationRegister::default());
+        live.note_reference(sha, "row-live");
+        let (mut rt, mut rx) = converger_rig(
+            fast_config(),
+            SwarmRuntimeOptions {
+                revocations: Some(Arc::clone(&live)),
+                ..SwarmRuntimeOptions::default()
+            },
+            &content_id,
+            1,
+        )
+        .await;
+        assert!(
+            !hard_deleted(&mut rx, &content_id).await,
+            "a live reference reads Active: installing the register evicts nothing on its own"
+        );
+        rt.shutdown().await;
+
+        // (3) Revoked: every known reference withdrawn. Hard-deleted, rarity
+        // and holder count notwithstanding.
+        let revoked = Arc::new(RevocationRegister::default());
+        assert_eq!(revoked.note_withdrawn("row-gone", &[sha]), vec![sha]);
+        let (mut rt, mut rx) = converger_rig(
+            fast_config(),
+            SwarmRuntimeOptions {
+                revocations: Some(Arc::clone(&revoked)),
+                ..SwarmRuntimeOptions::default()
+            },
+            &content_id,
+            1,
+        )
+        .await;
+        assert!(
+            hard_deleted(&mut rx, &content_id).await,
+            "Revoked routes to EjectHardDelete regardless of rarity — the converger half of \
+             CC 2.3 at the bytes plane (CIRISEdge#606)"
+        );
+        rt.shutdown().await;
     }
 
     /// **THE setter test.** A `SwarmRuntimeConfig` filed AFTER `start`

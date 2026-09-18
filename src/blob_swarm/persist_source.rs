@@ -50,6 +50,11 @@ use super::{serve_result_to_chunk, BlobChunkSource, ChunkSourceRefusal, ContentS
 /// + signer a sovereign node opened for itself.
 pub struct PersistBlobChunkSource {
     engine: ciris_persist::Engine,
+    /// CIRISEdge#606 — the register a `withdraws` writes to. `Some` ARMS the
+    /// serve-side refusal: a blob whose every known reference has been
+    /// withdrawn answers [`ChunkSourceRefusal::Withdrawn`] instead of being
+    /// served. `None` is pre-#606 behaviour.
+    revocations: Option<Arc<super::RevocationRegister>>,
 }
 
 impl std::fmt::Debug for PersistBlobChunkSource {
@@ -66,7 +71,18 @@ impl PersistBlobChunkSource {
     /// persist engine is already resident in-process.
     #[must_use]
     pub fn new(engine: ciris_persist::Engine) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            revocations: None,
+        }
+    }
+
+    /// Arm the serve-side revocation check (CIRISEdge#606): hand this source
+    /// the SAME register the replication apply path writes withdrawals to.
+    #[must_use]
+    pub fn with_revocations(mut self, register: Option<Arc<super::RevocationRegister>>) -> Self {
+        self.revocations = register;
+        self
     }
 
     /// Serve from a backend + signer the caller already opened — the
@@ -89,6 +105,27 @@ impl BlobChunkSource for PersistBlobChunkSource {
         chunk_sha256: [u8; 32],
         requesting_peer_key_id: &str,
     ) -> Result<Option<Vec<u8>>, ChunkSourceRefusal> {
+        // CIRISEdge#606 — CC 2.3 at the bytes plane. Before anything is read
+        // from disk: if every row known to reference this BLOB has been
+        // withdrawn by an authorized withdrawal (the register recomputed the
+        // rule against the local target when it recorded it), the answer is
+        // `Withdrawn`, not the bytes and not `NotHeld`. `Withdrawn` is the
+        // one refusal the fetcher ABORTS on rather than walking to the next
+        // holder — which is the point: the next holder was told the same
+        // thing. Asked about the blob, not the chunk, because the reference
+        // names the blob. `Unknown` and `Live` fall through to today's path.
+        if let Some(register) = self.revocations.as_deref() {
+            if register.verdict(&blob_sha256) == super::BytesVerdict::Revoked {
+                tracing::info!(
+                    blob = %hex::encode(blob_sha256),
+                    chunk = %hex::encode(chunk_sha256),
+                    peer = %requesting_peer_key_id,
+                    "PersistBlobChunkSource: every reference to this blob was withdrawn — \
+                     refusing Withdrawn (CC 2.3 at the bytes plane, CIRISEdge#606)",
+                );
+                return Err(ChunkSourceRefusal::Withdrawn);
+            }
+        }
         // Serve the CHUNK's sha, not the blob's. Persist stores each
         // chunk as its own content-addressed `federation_blobs` row
         // (`ChunkManifest` is a one-level DAG of leaves), so the chunk sha

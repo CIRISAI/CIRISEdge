@@ -1234,6 +1234,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// CIRISPersist#848 / CIRISEdge#601 — the Engine that owns
     /// `apply_replicated_key_grant`. See [`BridgeEngine`].
     engine: Option<BridgeEngine>,
+    /// CIRISEdge#606 — CC 2.3 at the bytes plane. `Some` ARMS the withdraws
+    /// observer on the apply path: every admitted row that references a blob
+    /// is indexed, and every admitted `withdraws` is re-verified against the
+    /// local target and, if authorized, revokes the bytes it references.
+    /// See [`crate::blob_swarm::revocation`].
+    revocations: Option<RevocationWiring>,
     /// CIRISEdge#311 — the SELF-plane publish set. Collapses the #257
     /// `key_selector` + #305 `occurrence_selector` into ONE provider: both were
     /// the same `Projection::SelfOwn` re-implemented per plane. When `Some`, the
@@ -1539,6 +1545,27 @@ const OWNER_BINDING_MEMO_TTL: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct BridgeEngine(pub ciris_persist::Engine);
 
+/// CIRISEdge#606 — what the apply path needs to act on a `withdraws`: the
+/// shared [`RevocationRegister`](crate::blob_swarm::RevocationRegister) and the
+/// door that deletes a blob's bytes on this node. `evictor` is optional: with
+/// `None` an authorized withdrawal still marks the blob revoked (serve refuses
+/// `Withdrawn`, the converger sees `Revoked`) and the bytes wait for the
+/// converger's `EjectHardDelete`.
+#[derive(Clone)]
+pub struct RevocationWiring {
+    pub register: Arc<crate::blob_swarm::RevocationRegister>,
+    pub evictor: Option<Arc<dyn crate::blob_swarm::BlobEvictor>>,
+}
+
+impl std::fmt::Debug for RevocationWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RevocationWiring")
+            .field("register", &self.register)
+            .field("evictor_present", &self.evictor.is_some())
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for BridgeEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BridgeEngine").finish_non_exhaustive()
@@ -1563,6 +1590,7 @@ impl FederationDirectoryReplicationBridge {
             directory,
             cohort,
             engine: None,
+            revocations: None,
             self_provider: None,
             local_key_id: None,
             config,
@@ -1637,6 +1665,7 @@ impl FederationDirectoryReplicationBridge {
             directory,
             cohort,
             engine: None,
+            revocations: None,
             self_provider: None,
             local_key_id: None,
             config,
@@ -1706,6 +1735,16 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_engine(mut self, engine: Option<BridgeEngine>) -> Self {
         self.engine = engine;
+        self
+    }
+
+    /// CIRISEdge#606 — arm the withdraws observer (builder). Hand the SAME
+    /// register to [`crate::blob_swarm::PersistBlobChunkSource::with_revocations`]
+    /// and to the swarm converger's options so the serve side, the converger
+    /// and the apply path share one verdict per blob.
+    #[must_use]
+    pub fn with_revocations(mut self, wiring: Option<RevocationWiring>) -> Self {
+        self.revocations = wiring;
         self
     }
 
@@ -6449,6 +6488,32 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    /// CIRISEdge#606 — act on an ADMITTED row for the revocation register:
+    /// index a blob reference, or resolve and re-verify a `withdraws`. Only
+    /// reached with a register installed and only for rows
+    /// [`observe`](crate::blob_swarm::revocation::observe) found relevant.
+    /// The recompute-against-the-local-target rule lives in
+    /// [`apply_observation`](crate::blob_swarm::revocation::apply_observation);
+    /// this is plumbing.
+    async fn observe_revocation(&self, observation: crate::blob_swarm::revocation::Observation) {
+        let Some(wiring) = self.revocations.as_ref() else {
+            return;
+        };
+        let evicted = crate::blob_swarm::revocation::apply_observation(
+            &wiring.register,
+            &*self.directory,
+            wiring.evictor.as_deref(),
+            observation,
+        )
+        .await;
+        if !evicted.is_empty() {
+            tracing::info!(
+                evicted = evicted.len(),
+                "bridge: an admitted withdraws revoked blob bytes on this node (CIRISEdge#606)"
+            );
+        }
+    }
+
     /// CIRISEdge#523 — the node whose `owner_of` an ADMITTED attestation could
     /// have moved, if any. Three shapes, and the split is deliberate:
     ///
@@ -6905,6 +6970,15 @@ impl FederationDirectoryReplicationBridge {
                 // so the high-volume `scores` plane pays one string compare.
                 let owner_invalidation: Option<String> =
                     Self::owner_binding_touched(&record.attestation).map(ToOwned::to_owned);
+                // CIRISEdge#606 — what the revocation register needs from this
+                // row, captured before the move. `None` for every row that
+                // neither references a blob nor is a `withdraws`; the row is
+                // cloned only for a `withdraws` (a rare plane), never for the
+                // high-volume `scores` traffic.
+                let revocation_observation = self
+                    .revocations
+                    .as_ref()
+                    .and_then(|_| crate::blob_swarm::revocation::observe(&record.attestation));
                 // persist v38.5.0 (CIRISPersist#771) — the Attestation plane's
                 // typed outcome, the twin of the Key plane's #565
                 // `ReplicatedKeyOutcome` that `key_outcome_to_apply` above has
@@ -6956,6 +7030,9 @@ impl FederationDirectoryReplicationBridge {
                         }
                         if let Some(node) = owner_invalidation {
                             self.invalidate_owner_memo(&node);
+                        }
+                        if let Some(observation) = revocation_observation {
+                            self.observe_revocation(observation).await;
                         }
                         ApplyOutcome::Admitted
                     }
