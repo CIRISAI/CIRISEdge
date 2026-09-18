@@ -345,6 +345,7 @@ pub use refusal_backoff::{RefusalBackoff, RetryDisposition};
 
 #[doc(inline)]
 pub use bridge::BridgeEngine;
+pub use bridge::RevocationWiring;
 pub use registry::{RegistryError, ReplicationRegistry, RouteOutcome};
 #[doc(inline)]
 pub use runtime::{

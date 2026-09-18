@@ -1287,3 +1287,550 @@ async fn a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive() {
         "a non-member occurrence must stay NotGranted — got {stranger:?}",
     );
 }
+
+// ─── CIRISEdge#606 — CC 2.3 at the bytes plane ────────────────────────
+
+/// An edge `LocalSigner` over the SAME halves `Ident` registered, under the
+/// friendly key id — the signer a person signs rows with.
+fn edge_signer_for(id: &Ident) -> ciris_edge::identity::LocalSigner {
+    let hw: Arc<dyn HardwareSigner> = Arc::new(
+        Ed25519SoftwareSigner::from_bytes(&[id.seed; 32], &id.key_id)
+            .expect("rebuild the registered signer"),
+    );
+    let pqc: Arc<dyn PqcSigner> = Arc::new(
+        MlDsa65SoftwareSigner::from_seed_bytes(&[id.seed ^ 0x55; 32], format!("{}-pqc", id.key_id))
+            .expect("rebuild the registered pqc half"),
+    );
+    ciris_edge::identity::LocalSigner::new(id.key_id.clone(), hw, Some(pqc))
+}
+
+/// A signed, admissible content row: what a chat message IS on the wire — a
+/// `scores` row at community scope carrying a `BlobPointer` to the sealed
+/// body, producer-only subjects (AV-84), born federation-tier so it crosses.
+/// Built with the same binder and signer every edge producer uses.
+async fn signed_content_row(
+    author: &Ident,
+    room: &str,
+    pointer: &BlobPointer,
+) -> ciris_persist::federation::Attestation {
+    use ciris_edge::replication::attestation_bind::{
+        bind_attestation_envelope, truncate_to_substrate_resolution, AttestationColumns,
+    };
+    use sha2::Digest as _;
+
+    let signer = edge_signer_for(author);
+    let asserted_at = truncate_to_substrate_resolution(ts());
+    let attestation_id = format!("msg-{}-{}", author.key_id, &pointer.content_sha256[..12]);
+    let mut envelope = serde_json::json!({
+        "dimension": ciris_edge::chat::CHAT_MESSAGE_DIMENSION,
+        ciris_edge::chat::FIELD_COMMUNITY_ID: room,
+        "score": 1.0,
+        "content": serde_json::to_value(pointer).expect("pointer"),
+    });
+    let subjects = vec![author.key_id.clone()];
+    bind_attestation_envelope(
+        &mut envelope,
+        asserted_at,
+        &AttestationColumns {
+            attestation_id: &attestation_id,
+            attesting_key_id: &author.key_id,
+            attestation_type: "scores",
+            attested_key_id: &author.key_id,
+            subject_key_ids: &subjects,
+            cohort_scope: "community",
+            weight: None,
+        },
+    );
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
+    let digest = sha2::Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) =
+        ciris_edge::identity::sign_bound_hybrid(&signer, &canonical, "chat row")
+            .await
+            .expect("sign the row");
+    ciris_persist::federation::Attestation {
+        attestation_id,
+        attesting_key_id: author.key_id.clone(),
+        attested_key_id: author.key_id.clone(),
+        attestation_type: "scores".to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: author.key_id.clone(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: "community".to_owned(),
+        tier: "federation".to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    }
+}
+
+/// Carry A's sealed blob to B the #848 way — every key_grant set through the
+/// key-grant door, the envelope served from A's disk and adopted on B at the
+/// author's declared binding — and prove B opens it. The crossing every
+/// #606 leg starts from.
+async fn cross_key_and_bytes(
+    node_a: &Node,
+    node_b: &Node,
+    sealed: &ciris_edge::group_content::SealedContent,
+    author: &Ident,
+    room: &str,
+    body: &[u8],
+) -> [u8; 32] {
+    use ciris_persist::federation::blobs::BlobBody;
+    use ciris_persist::federation::key_grant::{
+        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
+    };
+    use ciris_persist::federation::{AdoptDisposition, BlobProvenance};
+
+    let sha: [u8; 32] = hex::decode(&sealed.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    for row in node_a
+        .dir
+        .list_attestations_since(None, 400)
+        .await
+        .expect("list A's rows")
+        .into_iter()
+        .filter(|a| {
+            a.attestation
+                .attestation_type
+                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+        })
+    {
+        node_b
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantSet {
+                attestation: row.attestation,
+            })
+            .await
+            .expect("B admits A's key_grant set");
+    }
+    let BlobBody::Inline(envelope) = node_a
+        .store
+        .engine()
+        .serve_blob_to_peer(&sha, &node_b.me)
+        .await
+        .expect("A serves")
+    else {
+        panic!("inline");
+    };
+    let aad = ciris_edge::group_content::aad_for_open(&OpenRequest {
+        pointer: &sealed.pointer,
+        author_key_id: &author.key_id,
+        asserted_at: ts(),
+        viewer_key_id: &node_b.me,
+    });
+    node_b
+        .store
+        .engine()
+        .adopt_sealed_blob(
+            &envelope,
+            BlobProvenance {
+                author_key_id: node_a.me.clone(),
+                cohort_scope: "community".to_owned(),
+                community_key_id: Some(room.to_owned()),
+                epoch: sealed.epoch,
+                tier: sealed.tier,
+            },
+            Some(&aad),
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("B adopts");
+    assert_eq!(
+        node_b
+            .store
+            .open(OpenRequest {
+                pointer: &sealed.pointer,
+                author_key_id: &author.key_id,
+                asserted_at: ts(),
+                viewer_key_id: &node_b.me,
+            })
+            .await
+            .expect("positive control: B opens before any withdrawal"),
+        body
+    );
+    sha
+}
+
+/// **An AUTHORIZED withdrawal that arrived before its target evicts on
+/// replay.** persist admitted it with `rule = None`; that column is never
+/// read. When the row lands, the pending withdrawal is replayed through the
+/// recompute, resolves to rule 1 against the local target, and the bytes go
+/// — the out-of-order half of the same guarantee the in-order leg pins.
+#[tokio::test]
+async fn an_authorized_withdraws_that_arrived_first_evicts_when_its_target_lands() {
+    use ciris_edge::blob_swarm::revocation::{apply_observation, observe};
+    use ciris_edge::blob_swarm::{
+        BlobChunkSource as _, BlobEvictor, BytesVerdict, ChunkSourceRefusal,
+        PersistBlobChunkSource, RevocationRegister,
+    };
+    use ciris_edge::replication::attestation_bind::withdraws_attestation;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
+
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let room = "room-alice-bob";
+    let node_a = node(&[&alice, &bob], &alice).await;
+    let node_b = node(&[&alice, &bob], &bob).await;
+    seed_room(&node_a, room, &[&alice, &bob]).await;
+    seed_room(&node_b, room, &[&alice, &bob]).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+
+    let body = b"withdrawn before the row even arrived";
+    let sealed = node_a
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(room),
+            author_key_id: &alice.key_id,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: body,
+            media_type: Some("text/plain"),
+        })
+        .await
+        .expect("seal");
+    let sha = cross_key_and_bytes(&node_a, &node_b, &sealed, &alice, room, body).await;
+
+    let register = Arc::new(RevocationRegister::default());
+    let serve = PersistBlobChunkSource::new(node_b.store.engine().clone())
+        .with_revocations(Some(Arc::clone(&register)));
+    let evictor: &dyn BlobEvictor = &*node_b.dir;
+
+    let row = signed_content_row(&alice, room, &sealed.pointer).await;
+    node_a
+        .dir
+        .put_attestation_authored(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("A admits the row");
+
+    // The withdrawal crosses FIRST. Admitted rule=None; held pending.
+    let withdraws = withdraws_attestation(&row, "gone", ts(), &edge_signer_for(&alice))
+        .await
+        .expect("build");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: withdraws.clone(),
+        })
+        .await
+        .expect("admitted with rule=None: the target is not here yet");
+    assert!(apply_observation(
+        &register,
+        &*node_b.dir,
+        Some(evictor),
+        observe(&withdraws).expect("observed"),
+    )
+    .await
+    .is_empty());
+    assert_eq!(register.verdict(&sha), BytesVerdict::Unknown);
+    assert!(
+        matches!(serve.read_chunk(sha, sha, &node_b.me).await, Ok(Some(_))),
+        "nothing decided yet: B serves",
+    );
+
+    // The row lands: the pending withdrawal is replayed and RESOLVES.
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("B admits the row");
+    let evicted = apply_observation(
+        &register,
+        &*node_b.dir,
+        Some(evictor),
+        observe(&row).expect("observed"),
+    )
+    .await;
+    assert_eq!(
+        evicted,
+        vec![sha],
+        "the replayed withdrawal passes the recompute against the now-local target (rule 1) \
+         and evicts — the column persist stored (None) was never consulted",
+    );
+    let (_, _, pending, _, _) = register.stats();
+    assert_eq!(pending, 0, "consumed on replay, not left to replay twice");
+    assert_eq!(register.verdict(&sha), BytesVerdict::Revoked);
+    assert!(matches!(
+        serve.read_chunk(sha, sha, &node_b.me).await,
+        Err(ChunkSourceRefusal::Withdrawn)
+    ));
+    assert!(node_b.dir.get_blob(&sha).await.expect("get_blob").is_none());
+}
+
+/// **CC 2.3 reaches the bytes.** A subject's `withdraws` is admitted on a
+/// holder, RE-VERIFIED against the row the holder has, and the bytes go:
+/// the serve door answers `Withdrawn` (the one refusal the fetcher aborts
+/// on), the blob row is deleted, and the converger's consent input reads
+/// `Revoked`. An unauthorized `withdraws` — admitted by persist with
+/// `rule = None` because its target had not landed — is replayed when the
+/// target lands, fails the recompute, and touches nothing.
+///
+/// # What the three legs pin
+///
+/// - **(b, out of order)** an unentitled withdrawal admitted BEFORE its
+///   target (rule `None`, "authority is a read-side concern") is held
+///   pending and replayed when the target lands; the recompute refuses it;
+///   the bytes stay served. Remove the recompute and this leg deletes real
+///   copies on the strength of a row nobody authorized — the remote-delete
+///   primitive the operator's constraint names.
+/// - **(b, in order)** persist's own write door refuses the same withdrawal
+///   once the target is local. That is persist's half of the constraint,
+///   asserted here so a regression there is seen here.
+/// - **(a)** the subject's withdrawal — here the author, because AV-84
+///   makes a community row's only subject its producer; the non-author
+///   case of CC 2.3 lives on federation-tier subject-bearing dimensions —
+///   passes the recompute and revokes: `Withdrawn`, bytes gone, `Revoked`.
+///
+/// The register is driven through [`observe`] / [`apply_observation`]
+/// directly — the same two calls the replication bridge makes around its
+/// put door — so this witnesses the decision, not the plumbing.
+///
+/// [`observe`]: ciris_edge::blob_swarm::revocation::observe
+/// [`apply_observation`]: ciris_edge::blob_swarm::revocation::apply_observation
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // three legs, one blob, in order on purpose
+async fn a_withdraws_revokes_the_bytes_on_a_holder_and_an_unauthorized_one_is_inert() {
+    use ciris_edge::blob_swarm::revocation::{apply_observation, observe};
+    use ciris_edge::blob_swarm::{
+        BlobChunkSource as _, BlobEvictor, BytesVerdict, ChunkSourceRefusal,
+        PersistBlobChunkSource, RevocationRegister,
+    };
+    use ciris_edge::holonomic::swarm_rarity::ConsentState;
+    use ciris_edge::replication::attestation_bind::withdraws_attestation;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
+
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    // Carol: a registered identity with NO standing over alice's row — not
+    // its producer, not a subject, no delegation, not even a room member.
+    let carol = Ident::new("carol-fed", 0x33);
+    let room = "room-alice-bob";
+
+    let node_a = node(&[&alice, &bob, &carol], &alice).await;
+    let node_b = node(&[&alice, &bob, &carol], &bob).await;
+    seed_room(&node_a, room, &[&alice, &bob]).await;
+    seed_room(&node_b, room, &[&alice, &bob]).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+    let bob_occ = node_b.me.clone();
+
+    // ── A seals; the KEY and the BYTES cross to B (the #848 path) ─────
+    let body = b"a message the subject will later withdraw";
+    let sealed = node_a
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(room),
+            author_key_id: &alice.key_id,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: body,
+            media_type: Some("text/plain"),
+        })
+        .await
+        .expect("seal at the community tier");
+    let sha = cross_key_and_bytes(&node_a, &node_b, &sealed, &alice, room, body).await;
+
+    // ── B's revocation register, chunk source, and evictor ───────────
+    // The same three handles production wires: the register the bridge
+    // writes, the serve door that consults it, the substrate that deletes.
+    let register = Arc::new(RevocationRegister::default());
+    let serve = PersistBlobChunkSource::new(node_b.store.engine().clone())
+        .with_revocations(Some(Arc::clone(&register)));
+    let evictor: &dyn BlobEvictor = &*node_b.dir;
+    let sha_hex = hex::encode(sha);
+    assert_eq!(register.verdict(&sha), BytesVerdict::Unknown);
+    assert!(
+        matches!(serve.read_chunk(sha, sha, &bob_occ).await, Ok(Some(_))),
+        "precondition: B serves the bytes it holds"
+    );
+
+    // The referencing row, authored on A. Alice is its producer and its
+    // only subject (AV-84 at community scope).
+    let row = signed_content_row(&alice, room, &sealed.pointer).await;
+    node_a
+        .dir
+        .put_attestation_authored(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("A admits the row alice signed");
+
+    // ── (b) out of order: carol's withdraws lands on B BEFORE the row ──
+    let carol_withdraws =
+        withdraws_attestation(&row, "no standing", ts(), &edge_signer_for(&carol))
+            .await
+            .expect("build carol's withdraws");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: carol_withdraws.clone(),
+        })
+        .await
+        .expect(
+            "persist ADMITS a withdraws whose target it does not hold, with rule=None — \
+             'authority is a read-side concern'. This is the row the constraint is about.",
+        );
+    let held = node_b
+        .dir
+        .get_attestation(&carol_withdraws.attestation_id)
+        .await
+        .expect("get")
+        .expect("carol's withdraws is stored on B");
+    assert_eq!(
+        held.withdraws_admission_rule, None,
+        "precondition: stored with NO resolved authority — the value a naive hook would \
+         read as permission",
+    );
+    let evicted = apply_observation(
+        &register,
+        &*node_b.dir,
+        Some(evictor),
+        observe(&carol_withdraws).expect("a withdraws is always observed"),
+    )
+    .await;
+    assert!(
+        evicted.is_empty(),
+        "target absent: pending, nothing acted on"
+    );
+    let (_, _, pending, _, _) = register.stats();
+    assert_eq!(pending, 1, "carol's withdrawal waits for its target");
+
+    // ── The row lands on B; carol's pending withdrawal is REPLAYED ────
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("B admits alice's row");
+    let evicted = apply_observation(
+        &register,
+        &*node_b.dir,
+        Some(evictor),
+        observe(&row).expect("a row with a pointer is observed"),
+    )
+    .await;
+    assert!(
+        evicted.is_empty(),
+        "carol's replayed withdrawal must fail the recompute against the local target and \
+         touch nothing — a hook that trusted the stored rule (None) or skipped the \
+         recompute would have deleted real copies on the strength of a row nobody \
+         authorized (CIRISEdge#606 / CIRISPersist#853, the operator's constraint)",
+    );
+    assert_eq!(
+        register.verdict(&sha),
+        BytesVerdict::Live,
+        "the row is indexed and live; carol's withdrawal counted for nothing",
+    );
+    assert_eq!(register.consent_for(&sha_hex), ConsentState::Active);
+    assert!(
+        matches!(serve.read_chunk(sha, sha, &bob_occ).await, Ok(Some(_))),
+        "B still serves: an unauthorized withdrawal is inert on the serve side too",
+    );
+    assert!(
+        node_b.dir.get_blob(&sha).await.expect("get_blob").is_some(),
+        "and the bytes are still on disk",
+    );
+
+    // ── (b) in order: persist's own door refuses carol now the target is local ──
+    let mut carol_again =
+        withdraws_attestation(&row, "still no standing", ts(), &edge_signer_for(&carol))
+            .await
+            .expect("build");
+    // The producer's id is deterministic per (issuer, target); make this a
+    // distinct row carrying the same claim.
+    carol_again.attestation_id.push_str("-again");
+    let refused = node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: carol_again,
+        })
+        .await;
+    assert!(
+        refused.is_err(),
+        "with the target LOCAL, persist's write door refuses an unentitled withdraws \
+         outright — persist's half of the constraint, asserted here so a regression \
+         there shows up here: {refused:?}",
+    );
+
+    // ── (a) the subject withdraws: admitted, re-verified, the bytes go ──
+    let alice_withdraws = withdraws_attestation(
+        &row,
+        "I withdraw this message",
+        ts(),
+        &edge_signer_for(&alice),
+    )
+    .await
+    .expect("build alice's withdraws");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: alice_withdraws.clone(),
+        })
+        .await
+        .expect("B admits the subject's withdraws (persist resolves rule 1 at the door)");
+    let evicted = apply_observation(
+        &register,
+        &*node_b.dir,
+        Some(evictor),
+        observe(&alice_withdraws).expect("observed"),
+    )
+    .await;
+    assert_eq!(
+        evicted,
+        vec![sha],
+        "every reference to the blob is withdrawn by an AUTHORIZED withdrawal: the bytes \
+         are evicted — once, and exactly these",
+    );
+    assert_eq!(register.verdict(&sha), BytesVerdict::Revoked);
+    assert_eq!(
+        register.consent_for(&sha_hex),
+        ConsentState::Revoked,
+        "the converger's consent input — EjectHardDelete regardless of rarity",
+    );
+    assert!(
+        matches!(
+            serve.read_chunk(sha, sha, &bob_occ).await,
+            Err(ChunkSourceRefusal::Withdrawn)
+        ),
+        "the serve door answers Withdrawn — the refusal the fetcher aborts on, not NotHeld \
+         which would send it to the next holder",
+    );
+    assert!(
+        node_b.dir.get_blob(&sha).await.expect("get_blob").is_none(),
+        "the blob row and its satellites are gone from B's substrate",
+    );
+    let after = node_b
+        .store
+        .open(OpenRequest {
+            pointer: &sealed.pointer,
+            author_key_id: &alice.key_id,
+            asserted_at: ts(),
+            viewer_key_id: &bob_occ,
+        })
+        .await;
+    assert!(
+        matches!(after, Err(GroupContentError::NotHeld { .. })),
+        "a member who could open it a moment ago cannot now: {after:?}",
+    );
+}

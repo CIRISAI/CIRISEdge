@@ -375,6 +375,65 @@ fn references_as_evidence(envelope: &serde_json::Value, sha_hex: &str) -> bool {
         })
 }
 
+/// Every blob this row REFERENCES — the inverse of [`BlobMeaning::project`],
+/// over exactly the same two shapes and nothing else.
+///
+/// [`project`](BlobMeaning::project) answers "does this row give THESE bytes
+/// meaning"; this answers "which bytes does this row give meaning to", for the
+/// side that starts from the row — a `withdraws` landing against it
+/// (CIRISEdge#606) needs to know which bytes just lost a reference. Same
+/// top-level-only pointer scan, same `evidence_refs` read, so the two can
+/// never disagree about what counts as a reference. A `holds_bytes` row is
+/// possession and references nothing — the caller checks that by type, as
+/// `project` does, before asking.
+///
+/// Entries that are not 64 lowercase-or-uppercase hex characters are
+/// skipped: `evidence_refs` may carry other kinds of evidence, and a pointer
+/// with a malformed hash is a row the store gate would refuse anyway.
+#[must_use]
+pub fn referenced_shas(envelope: &serde_json::Value) -> Vec<[u8; 32]> {
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    let mut push = |hex_str: &str| {
+        if let Ok(bytes) = hex::decode(hex_str) {
+            if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                if !out.contains(&arr) {
+                    out.push(arr);
+                }
+            }
+        }
+    };
+    if let Some(obj) = envelope.as_object() {
+        for v in obj.values().filter(|v| v.is_object()) {
+            if let Ok(p) = serde_json::from_value::<BlobPointer>(v.clone()) {
+                push(&p.content_sha256);
+            }
+        }
+    }
+    if let Some(refs) = envelope
+        .get("evidence_refs")
+        .and_then(serde_json::Value::as_array)
+    {
+        for r in refs.iter().filter_map(serde_json::Value::as_str) {
+            push(r);
+        }
+    }
+    out
+}
+
+/// Is this row a `holds_bytes` claim — possession, never a reference?
+///
+/// The same two checks [`BlobMeaning::project`] step (2) makes, exposed so
+/// the revocation side asks the identical question.
+#[must_use]
+pub fn is_holds_bytes_row(row: &Attestation) -> bool {
+    row.attestation_type.starts_with(HOLDS_BYTES_TYPE_PREFIX)
+        || row
+            .attestation_envelope
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            == Some(HOLDS_BYTES_KIND)
+}
+
 /// Row fixtures shared by this module's tests and the store gate's.
 ///
 /// There is deliberately **no** non-test constructor for [`BlobMeaning`]:

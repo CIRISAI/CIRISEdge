@@ -337,6 +337,9 @@ pub use store_gate::{
 pub mod persist_source;
 pub use persist_source::PersistBlobChunkSource;
 
+pub mod revocation;
+pub use revocation::{BlobEvictor, BytesVerdict, RevocationRegister};
+
 /// Server-side hook: trait edge consults when an inbound
 /// [`crate::MessageType::BlobChunkFetch`] envelope arrives, asking
 /// "do you hold this blob's chunk; if so, what bytes?"

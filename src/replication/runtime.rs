@@ -170,6 +170,7 @@ fn build_bridge(
         .with_convergence(Some(convergence))
         .with_local_key_id(config.local_key_id.clone())
         .with_engine(config.engine.clone())
+        .with_revocations(config.revocations.clone())
         .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
         // legs live (leg A ∧ leg B against this node's own trust base), the
@@ -528,6 +529,11 @@ pub struct ReplicationRuntimeConfig {
     /// view over the same substrate — see
     /// `PersistGroupContentStore::from_shared_hybrid`, which builds it).
     pub engine: Option<super::bridge::BridgeEngine>,
+    /// CIRISEdge#606 — CC 2.3 at the bytes plane. `Some` ARMS the withdraws
+    /// observer on the apply path (see
+    /// [`RevocationWiring`](super::bridge::RevocationWiring)). Hand the same
+    /// register to the blob chunk source and the swarm converger.
+    pub revocations: Option<super::bridge::RevocationWiring>,
     /// Workstream F — does this node ENFORCE the `accord:*` relay predicate?
     /// `true` installs the
     /// [`AccordRelayGate`](crate::replication::accord_relay_gate::AccordRelayGate)

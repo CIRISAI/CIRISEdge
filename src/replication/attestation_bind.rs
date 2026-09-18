@@ -215,6 +215,107 @@ pub async fn owner_binding_attestation(
     })
 }
 
+/// Build a **`withdraws`** against `target` — the CC 2.4.1 structural
+/// composer that retracts a prior attestation without claiming it was false.
+///
+/// CC 2.3's promise is that a person who appears in someone else's data can
+/// pull it; this is the row that pulls. Admissible when `signer` is the
+/// target's producer (rule 1), a name in its `subject_key_ids` (rule 2), or a
+/// delegate of either (rules 3–4) — persist decides at its write door for a
+/// locally-held target, and edge's revocation register re-decides against the
+/// target it holds before any bytes go (CIRISEdge#606). It is also what a
+/// holder emits when it evicts, because eviction is never silent (CC 4.4.2).
+///
+/// # Why it lives in the library
+///
+/// It is a PRODUCER, like [`owner_binding_attestation`], and for the same
+/// reason: a hand-rolled withdraws is one `references_attestation_id`
+/// misspelling away from a row persist treats as un-grouped — admitted,
+/// retracting nothing, and reported to the emitter as success. The envelope
+/// here is persist's OWN builder
+/// ([`withdraws_attestation_envelope`](ciris_persist::federation::replication::withdraws_attestation_envelope)),
+/// the one its holder-eviction sweep emits with, so the two fields the
+/// precedence fold and `list_holders` join on are spelled by the authority.
+///
+/// Signed **bound-hybrid** ([`crate::identity::sign_bound_hybrid`]); born
+/// federation-tier, because a retraction that rests local retracts nothing
+/// anywhere else (CC 5.3.2.2, [`keep_local`]).
+///
+/// # Errors
+/// Canonicalization or signing failure.
+pub async fn withdraws_attestation(
+    target: &ciris_persist::federation::Attestation,
+    withdrawal_reason: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    signer: &crate::identity::LocalSigner,
+) -> Result<ciris_persist::federation::Attestation, String> {
+    use sha2::Digest as _;
+
+    let asserted_at = truncate_to_substrate_resolution(asserted_at);
+    let issuer = signer.key_id.as_str();
+    // Deterministic per (issuer, target): a retry is idempotent rather than a
+    // second tombstone, and two nodes forwarding the same retraction dedup.
+    let attestation_id = format!("withdraws-{}-{}", issuer, target.attestation_id);
+
+    let mut envelope = ciris_persist::federation::replication::withdraws_attestation_envelope(
+        &target.attestation_id,
+        &target.attestation_type,
+    );
+    if let Some(obj) = envelope.as_object_mut() {
+        obj.insert(
+            ciris_persist::federation::envelope::paths::WITHDRAWAL_REASON.to_owned(),
+            serde_json::json!(withdrawal_reason),
+        );
+    }
+    let subjects: Vec<String> = Vec::new();
+    bind_attestation_envelope(
+        &mut envelope,
+        asserted_at,
+        &AttestationColumns {
+            attestation_id: &attestation_id,
+            attesting_key_id: issuer,
+            attestation_type: "withdraws",
+            // The party whose claim is retracted — persist's own emitter names
+            // the issuer here for a self-retraction; naming the target's
+            // producer keeps a subject's withdrawal legible on the row itself.
+            attested_key_id: &target.attesting_key_id,
+            subject_key_ids: &subjects,
+            cohort_scope: "federation",
+            weight: None,
+        },
+    );
+
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope)
+        .map_err(|e| format!("canonicalize: {e}"))?;
+    let digest = sha2::Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) =
+        crate::identity::sign_bound_hybrid(signer, &canonical, "withdraws").await?;
+
+    Ok(ciris_persist::federation::Attestation {
+        attestation_id,
+        attesting_key_id: issuer.to_owned(),
+        attested_key_id: target.attesting_key_id.clone(),
+        attestation_type: "withdraws".to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: issuer.to_owned(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: "federation".to_owned(),
+        tier: "federation".to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    })
+}
+
 /// The default namespace prefixes a node consents to replicate.
 ///
 /// **Byte-identical to CIRISServer's `DEFAULT_GRANT_ATTESTATION_PREFIXES`**,
