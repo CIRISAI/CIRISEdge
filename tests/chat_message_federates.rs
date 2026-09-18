@@ -1622,14 +1622,19 @@ async fn a_pointer_copied_onto_another_authors_row_does_not_open() {
     msg.resolve_content(&store, &me(&store).await).await;
 
     match msg.body {
-        Body::Unopened { reason } => assert!(
-            // Name the ARM, not merely that a reason exists. `NotGranted`
-            // here would mean the grant failed rather than the binding —
-            // green for the wrong reason, and indistinguishable without
-            // this.
-            reason.contains("rebuilt AAD") || reason.contains("seal did not open"),
-            "the refusal must be the SEAL failing to open, not a grant or \
-             lookup problem — got: {reason}",
+        // Name the ARM, not merely that a reason exists. `NotGranted` here
+        // would mean the grant failed rather than the binding — green for the
+        // wrong reason. Since CIRISEdge#601 the arm IS the type: this used to
+        // string-match persist's prose for "rebuilt AAD" / "seal did not
+        // open", and a reworded message would have turned it green for
+        // nothing.
+        Body::Unopened {
+            reason: ciris_edge::chat::UnopenedReason::SealMismatch { .. },
+        } => {}
+        Body::Unopened { reason } => panic!(
+            "the refusal must be the SEAL failing to open, not a grant or lookup \
+             problem — got {} ({reason})",
+            reason.kind()
         ),
         other => panic!("a pointer on another author's row MUST NOT open — got {other:?}"),
     }

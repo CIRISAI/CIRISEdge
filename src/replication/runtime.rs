@@ -171,6 +171,7 @@ fn build_bridge(
         .with_local_key_id(config.local_key_id.clone())
         .with_engine(config.engine.clone())
         .with_revocations(config.revocations.clone())
+        .with_pull_sink(config.pull_sink.clone())
         .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
         // legs live (leg A ∧ leg B against this node's own trust base), the
@@ -534,6 +535,12 @@ pub struct ReplicationRuntimeConfig {
     /// [`RevocationWiring`](super::bridge::RevocationWiring)). Hand the same
     /// register to the blob chunk source and the swarm converger.
     pub revocations: Option<super::bridge::RevocationWiring>,
+    /// CIRISEdge#601 — the pull sink. An admitted attestation that
+    /// references a blob is offered here; the `BlobPuller` behind it
+    /// projects the meaning, runs the store gate and fetches. `None` = rows
+    /// arrive and bytes never do; every non-author member reads
+    /// `NotFetched`. Build one with `blob_swarm::BlobPuller::spawn`.
+    pub pull_sink: Option<crate::blob_swarm::PullSink>,
     /// Workstream F — does this node ENFORCE the `accord:*` relay predicate?
     /// `true` installs the
     /// [`AccordRelayGate`](crate::replication::accord_relay_gate::AccordRelayGate)

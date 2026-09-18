@@ -379,13 +379,30 @@ that ignores them has not used the substrate.
   This makes #581 a **prerequisite for narrowing the ceiling**, not only for
   claiming recall — the wide ceiling is the interim cost of not having it.
 
-  **Status:** the gate itself now exists
-  ([`blob_swarm::store_gate`](../src/blob_swarm/store_gate.rs)) and is wired
-  into the swarm's fetch path ahead of any byte transfer. It is UNARMED by
-  default and says so once per process, because arming it changes what a
-  running deployment accepts. Narrowing the ceiling to `Cohort` waits on the
-  gate being armed in the field AND on the converger's push path being
-  covered, not merely on the gate compiling.
+  **Status (CIRISEdge#601):** the gate exists
+  ([`blob_swarm::store_gate`](../src/blob_swarm/store_gate.rs)), is wired
+  into the swarm's fetch path ahead of any byte transfer, and is ARMED
+  unconditionally on the one edge door that stores bytes it did not author —
+  the pull ([`blob_swarm::pull`](../src/blob_swarm/pull.rs)), which takes its
+  facts from persist's rosters and the consumer's commons allowlist. The only
+  scheduler left unarmed is the pyo3 `fetch_blob_swarm` pass-through, which
+  stores nothing (it hands bytes to Python), so a possession gate has nothing
+  to decide there. There is no converger push path for bytes in edge: bytes
+  move by pull only (persist's `BLOB_REPLICATION.md` §1), and the RaptorQ
+  symbol plane is not wired (CIRISPersist#821 Q2). The ceiling itself is
+  persist's: `tombstone_ceiling(FountainContent, non-root)` already resolves
+  `Cohort` and edge holds no override, so "narrow to Cohort" was never an
+  edge-side value to change — the gate being armed on the only ingress is
+  what makes `Cohort` sufficient.
+
+  **Open under #499:** on a node with no scope address table — every
+  deployment today — `resolve_holder_routes` refuses to fetch cohort-scoped
+  content at all (a scoped request must not ride the federation address, and
+  the only scoped send is Reticulum's). The pull mechanism is complete and
+  witnessed end to end for commons content; for community content it runs to
+  the router and stops there, pinned by
+  `a_community_pull_stops_at_the_scope_router_on_a_legacy_node`. Resolving
+  that is a decision between #499 and #601, not an implementation.
 
   What a private application seal opts out of is therefore not "recall" in
   the absolute — it is *persist's* half of it, which is the half that is
@@ -414,14 +431,30 @@ that reveals the content.
 | `content_field` | which field this blob is; **AAD input** |
 | `media_type` | so a reader knows what it got before opening it |
 | `stream_id` | present iff chunked — the DAG's stream (§5.5) |
+| `epoch` | the community epoch the bytes were **sealed under**; `CommunityDek` only. NOT an AAD input. See below. |
 
 `author_key_id` and `asserted_at` are already envelope members and are the
 other two **AAD inputs**; they are not duplicated.
 
-The **epoch is deliberately absent**. It is recorded on the blob row's own
-binding, it is not an AAD input, and carrying it on the referencing row would
-create a second copy that a rotation can make stale. A reader asks the blob,
-not the pointer.
+**The epoch is carried (CIRISEdge#601, reversing this section's first cut).**
+The first cut kept it off on the reasoning that "carrying it on the
+referencing row would create a second copy that a rotation can make stale —
+a reader asks the blob, not the pointer." That conflated two numbers. A
+rotation moves the community's *current* epoch, which is what NEW content
+seals under; the epoch a given blob was *sealed under* never changes for
+that blob. It is exactly the one fact persist's adopt door requires of the
+author — `adopt_sealed_blob` records "the epoch the bytes were sealed under,
+which may be past … the binding is the author's fact, not ours"
+(`BLOB_REPLICATION.md` §3) — and a reader who already holds the blob can ask
+it, but the reader #601 exists for, a member whose node never asked for the
+bytes, has nothing to ask: the at-rest envelope is `nonce ‖ ciphertext` and
+carries no binding, and no other row a far node holds names it. So the
+sealed-under epoch rides the referencing attestation, signed by the author
+with the rest of the row, which is the provenance the adopt door was
+specified to read. It is still not an AAD input (§5.1.1 stands): a wrong
+epoch can only cause a failed open, never a leak. A `CommunityDek` pointer
+with `None` predates this member; the pull refuses to adopt such a blob
+rather than guess.
 
 Whether the content is chunked is answered by `stream_id`'s presence rather
 than by a separate boolean — one fact, one member, no way for the two to

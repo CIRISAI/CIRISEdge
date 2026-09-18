@@ -251,6 +251,7 @@ mod tests {
             content_field: field,
             media_type: None,
             stream_id: None,
+            epoch: None,
         }
     }
 

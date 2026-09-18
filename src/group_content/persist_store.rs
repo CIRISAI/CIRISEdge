@@ -259,6 +259,13 @@ impl GroupContentStore for PersistGroupContentStore {
                 // call, because "does a reader want part of this" is a
                 // decision the content type makes, not the store.
                 stream_id: None,
+                // CIRISEdge#601 — the sealed-under epoch, on the row, so a
+                // far node can adopt these bytes at the binding the author
+                // declares (BLOB_REPLICATION.md §3). The same value as
+                // `SealedContent::epoch` below; carried twice because the
+                // pointer is what goes on the wire and the struct is what
+                // the caller sees.
+                epoch: out.epoch,
             },
             epoch: out.epoch,
             granted: out.granted,
@@ -339,6 +346,7 @@ mod tests {
             content_field: ContentField::Body,
             media_type: None,
             stream_id: None,
+            epoch: None,
         }
     }
 

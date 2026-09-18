@@ -1240,6 +1240,15 @@ pub struct FederationDirectoryReplicationBridge {
     /// local target and, if authorized, revokes the bytes it references.
     /// See [`crate::blob_swarm::revocation`].
     revocations: Option<RevocationWiring>,
+    /// CIRISEdge#601 — **pull on attestation.** When an attestation that
+    /// references a blob is ADMITTED (`Inserted`, never `AlreadyHeld`), the
+    /// row is OFFERED here — a bounded `try_send`, never awaited, so the
+    /// apply path pays one cheap envelope scan and one clone for a
+    /// referencing row and nothing for any other. The puller behind the
+    /// sink projects the meaning, runs the store gate and fetches. `None`
+    /// keeps the pre-v24.4.0 behaviour: rows arrive, bytes never do, and
+    /// every non-author member reads `NotFetched`.
+    pull_sink: Option<crate::blob_swarm::PullSink>,
     /// CIRISEdge#311 — the SELF-plane publish set. Collapses the #257
     /// `key_selector` + #305 `occurrence_selector` into ONE provider: both were
     /// the same `Projection::SelfOwn` re-implemented per plane. When `Some`, the
@@ -1591,6 +1600,7 @@ impl FederationDirectoryReplicationBridge {
             cohort,
             engine: None,
             revocations: None,
+            pull_sink: None,
             self_provider: None,
             local_key_id: None,
             config,
@@ -1666,6 +1676,7 @@ impl FederationDirectoryReplicationBridge {
             cohort,
             engine: None,
             revocations: None,
+            pull_sink: None,
             self_provider: None,
             local_key_id: None,
             config,
@@ -1745,6 +1756,14 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_revocations(mut self, wiring: Option<RevocationWiring>) -> Self {
         self.revocations = wiring;
+        self
+    }
+
+    /// CIRISEdge#601 — install the pull sink an admitted referencing row is
+    /// offered to. See the field doc and [`crate::blob_swarm::pull`].
+    #[must_use]
+    pub fn with_pull_sink(mut self, sink: Option<crate::blob_swarm::PullSink>) -> Self {
+        self.pull_sink = sink;
         self
     }
 
@@ -6979,6 +6998,19 @@ impl FederationDirectoryReplicationBridge {
                     .revocations
                     .as_ref()
                     .and_then(|_| crate::blob_swarm::revocation::observe(&record.attestation));
+                // CIRISEdge#601 — decided BEFORE the move into the put, fired
+                // only on `Inserted`. The pre-check is the same envelope scan
+                // `BlobMeaning::referenced_shas` runs; a row that references
+                // nothing (the high-volume planes) is a few `is_object` tests
+                // and no clone. Nothing here awaits.
+                let pull: Option<ciris_persist::federation::Attestation> = self
+                    .pull_sink
+                    .as_ref()
+                    .filter(|_| {
+                        !crate::blob_swarm::BlobMeaning::referenced_shas(&record.attestation)
+                            .is_empty()
+                    })
+                    .map(|_| record.attestation.clone());
                 // persist v38.5.0 (CIRISPersist#771) — the Attestation plane's
                 // typed outcome, the twin of the Key plane's #565
                 // `ReplicatedKeyOutcome` that `key_outcome_to_apply` above has
@@ -7033,6 +7065,12 @@ impl FederationDirectoryReplicationBridge {
                         }
                         if let Some(observation) = revocation_observation {
                             self.observe_revocation(observation).await;
+                        }
+                        // CIRISEdge#601 — the row is admitted; its bytes are
+                        // now this node's to pull if the gate agrees. Offered,
+                        // never awaited; a full queue drops loudly.
+                        if let (Some(sink), Some(row)) = (self.pull_sink.as_ref(), pull) {
+                            let _ = sink.offer(&row);
                         }
                         ApplyOutcome::Admitted
                     }

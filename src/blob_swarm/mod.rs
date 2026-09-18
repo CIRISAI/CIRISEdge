@@ -325,6 +325,8 @@ pub trait BlobChunkVerifier: Send + Sync {
 
 pub mod meaning;
 pub use meaning::{BlobMeaning, MeaningRefusal};
+pub mod pull;
+pub use pull::{BlobPuller, PullConfig, PullOffer, PullOutcome, PullRequest, PullSink};
 
 pub mod persist_store_policy;
 pub use persist_store_policy::PersistBlobStorePolicy;
@@ -565,6 +567,28 @@ pub struct ChunkManifestLite {
 }
 
 impl ChunkManifestLite {
+    /// CIRISEdge#601 — the manifest of a blob that IS its one chunk.
+    ///
+    /// A whole-blob seal (`put_blob_scoped`) is stored as a single
+    /// content-addressed row, and the serve door hands it back as one
+    /// inline body; the responder resolves a request for `(sha, sha)` to
+    /// that row (`persist_source.rs`). So its manifest is one chunk whose
+    /// sha is the blob's.
+    ///
+    /// The size is `0`, and that is honest rather than a placeholder: a
+    /// referencing attestation carries the content address and never the
+    /// ciphertext length, so a puller has no size to declare. The scheduler
+    /// uses sizes only to check `Σ == total_size` (both zero here) and as an
+    /// allocation hint; every chunk is verified by HASH, so an unknown size
+    /// changes nothing about what is accepted.
+    #[must_use]
+    pub fn whole_blob(sha256: [u8; 32]) -> Self {
+        Self {
+            chunks: vec![(sha256, 0)],
+            total_size: 0,
+        }
+    }
+
     /// Construct from a persist `ChunkManifest` by projecting away the
     /// `v` field, `chunk_tier` (persist v44.0.0 / #832), and `stream_id`
     /// plus each chunk's `seq` (persist v44.1.0 / #838).
@@ -779,6 +803,7 @@ impl SwarmScheduler {
         // (signed but not blessed) have different remedies and must not be
         // collapsed.
         let mut worst: Option<store_gate::SenderStanding> = None;
+        let mut cleared: Option<store_gate::SenderStanding> = None;
         for h in holders {
             let s = policy.sender_standing(h, meaning.scope()).await;
             let authorised = store_gate::admit_blob_store(
@@ -797,18 +822,30 @@ impl SwarmScheduler {
                 worst = Some(s);
                 break;
             }
+            cleared.get_or_insert(s);
         }
         // An EMPTY holder set authorises nothing: there is no peer to
         // transact with, so there is no sender to approve.
+        //
+        // CIRISEdge#601 — when every holder cleared, the standing handed to
+        // the re-run below is ONE THAT ACTUALLY CLEARED, not a stand-in.
+        // The first cut substituted `Allowlisted` here as shorthand for
+        // "axis 1 passed", and `Allowlisted` is the COMMONS standing:
+        // `sender_authorised(Cohort | Family, Allowlisted)` is false, so the
+        // re-run refused every community and family blob whose holders were
+        // all current members — `SenderNotApprovedForTier { cohort,
+        // Allowlisted }` — after the loop had just admitted each of them.
+        // A gate wrong in the refusing direction files no bug: the swarm's
+        // gate had only ever been armed against commons content, and the
+        // first community fetch through it (the pull) is what found this.
+        // Any cleared holder's standing is a faithful representative,
+        // because the loop proved each one satisfies axis 1 for this scope.
         let sender = match worst {
             Some(s) => s,
-            None if holders.is_empty() => store_gate::SenderStanding::Undeterminable,
-            None => store_gate::SenderStanding::Allowlisted,
+            None => cleared.unwrap_or(store_gate::SenderStanding::Undeterminable),
         };
-        // `Allowlisted` above is a stand-in meaning "every holder cleared
-        // axis 1 for this scope"; the real per-holder verdicts were checked
-        // in the loop. Re-running the gate below with it re-applies axes 2
-        // and 3, which is what this call is for.
+        // Re-running the gate below with it re-applies axes 2 and 3, which
+        // is what this call is for.
 
         let audience = policy.audience_standing(meaning.scope()).await;
         let verdict = store_gate::admit_blob_store(meaning, sender, audience, &policy.consent());
@@ -908,8 +945,6 @@ impl SwarmScheduler {
     /// # Errors
     /// Every error [`Self::fetch_blob`] returns, plus
     /// [`SwarmError::ScopeUnroutable`].
-    #[allow(clippy::too_many_lines)] // the driver loop is the load-bearing composition site
-    #[allow(clippy::cast_possible_truncation)] // assembled blob size is bounded by AV-13 family caps
     pub async fn fetch_blob_scoped(
         &self,
         blob_sha256: [u8; 32],
@@ -917,6 +952,33 @@ impl SwarmScheduler {
         holders: Vec<String>,
         meaning: Option<meaning::BlobMeaning>,
     ) -> Result<Vec<u8>, SwarmError> {
+        self.fetch_blob_scoped_with_disposition(blob_sha256, manifest, holders, meaning)
+            .await
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// CIRISEdge#601 — [`Self::fetch_blob_scoped`], returning the store
+    /// gate's verdict alongside the bytes.
+    ///
+    /// The scheduler's own verifier is handed the disposition per chunk, but
+    /// a caller that stores the ASSEMBLED blob through a persist door of its
+    /// own — the pull adopts through `adopt_sealed_blob`, which is async and
+    /// whole-blob, neither of which the per-chunk verifier is — needs the
+    /// same verdict, because storing is announcing and the door it picks
+    /// (`Announce` / `LocalOnly`) must be the one the gate decided. Returning
+    /// it is what keeps one gate deciding both writes.
+    ///
+    /// # Errors
+    /// As [`Self::fetch_blob_scoped`].
+    #[allow(clippy::too_many_lines)] // the driver loop is the load-bearing composition site
+    #[allow(clippy::cast_possible_truncation)] // assembled blob size is bounded by AV-13 family caps
+    pub async fn fetch_blob_scoped_with_disposition(
+        &self,
+        blob_sha256: [u8; 32],
+        manifest: ChunkManifestLite,
+        holders: Vec<String>,
+        meaning: Option<meaning::BlobMeaning>,
+    ) -> Result<(Vec<u8>, store_gate::StoreDisposition), SwarmError> {
         let blob_hex = hex::encode(blob_sha256);
 
         // CIRISEdge#581 — the store gate, BEFORE a byte moves. A gate that
@@ -1163,7 +1225,7 @@ impl SwarmScheduler {
             }
         }
 
-        Ok(assembled)
+        Ok((assembled, disposition))
     }
 
     /// Spawn a single fetch_blob_chunk call against `peer_key_id` for

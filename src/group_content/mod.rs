@@ -144,10 +144,33 @@ pub fn content_aad(
 ///
 /// `author_key_id` and `asserted_at` are **not** duplicated here — they are
 /// already envelope members, and a second copy is one that can disagree with
-/// the first. The **epoch is deliberately absent** for the same reason: it
-/// lives on the blob row's own binding, it is not an AAD input, and a copy
-/// on the pointer is one a rotation can make stale. A reader asks the blob,
-/// not the pointer.
+/// the first.
+///
+/// # The epoch IS here (CIRISEdge#601, reversing §7's first cut)
+///
+/// The first cut kept the epoch off the pointer on the reasoning that "a
+/// copy on the pointer is one a rotation can make stale — a reader asks the
+/// blob, not the pointer." That conflated two different numbers. A rotation
+/// moves the community's *current* epoch, which is what NEW content seals
+/// under; the epoch a given blob was *sealed under* never changes for that
+/// blob, and it is the one fact persist's adopt door requires of the author
+/// (`adopt_sealed_blob`: "the binding is the author's fact, not ours" —
+/// BLOB_REPLICATION.md §3, recorded as declared, may be past). A reader who
+/// already holds the blob can ask it; the reader #601 exists for — a member
+/// whose node never asked for the bytes — has nothing to ask. The at-rest
+/// envelope is `nonce ‖ ciphertext` and carries no binding, and no other
+/// row a far node holds names it. So the sealed-under epoch rides the
+/// referencing attestation, signed by the author with the rest of the row,
+/// which is exactly the provenance the adopt door was specified to read.
+///
+/// It is still **not an AAD input** (§5.1.1 stands): the AAD binds author,
+/// instant and field; the epoch is what the ciphertext is *under*, and a
+/// wrong one can only cause a failed open, never a leak.
+///
+/// `None` on a `CommunityDek` pointer means the row predates this member;
+/// the pull refuses to adopt such a blob rather than guess (`NotFetched`,
+/// naming the reason), because a guessed epoch is a row that reads
+/// `NotGranted` forever with no way to tell it from a real refusal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobPointer {
     /// Which community to read as. NOT an AAD input — see the module docs,
@@ -180,6 +203,12 @@ pub struct BlobPointer {
     /// "is this chunked" — one fact, one member, no way for two to disagree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_id: Option<String>,
+    /// CIRISEdge#601 — the community epoch the bytes were sealed under.
+    /// `CommunityDek` only; `None` at every other tier, and on a
+    /// `CommunityDek` row written before this member existed. See the type
+    /// docs for why it is here and why it is not an AAD input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 /// Serde default for [`BlobPointer::tier`] — a pointer written before the
@@ -347,6 +376,7 @@ mod tests {
             content_field: ContentField::Body,
             media_type: None,
             stream_id: None,
+            epoch: None,
         };
         let after_widening = BlobPointer {
             community_key_id: "community-b".into(),
@@ -379,6 +409,7 @@ mod tests {
             content_field: ContentField::Body,
             media_type: Some("text/plain".into()),
             stream_id: None,
+            epoch: None,
         };
         assert!(!whole.is_chunked());
 
@@ -400,6 +431,7 @@ mod tests {
             content_field: ContentField::Body,
             media_type: None,
             stream_id: None,
+            epoch: None,
         };
         let json = serde_json::to_string(&p).expect("serialize");
         for forbidden in ["epoch", "author", "asserted_at"] {
@@ -419,6 +451,7 @@ mod tests {
             content_field: ContentField::Attachment,
             media_type: Some("video/mp4".into()),
             stream_id: Some("w-01JBQ".into()),
+            epoch: None,
         };
         let json = serde_json::to_string(&p).expect("serialize");
         let back: BlobPointer = serde_json::from_str(&json).expect("deserialize");
