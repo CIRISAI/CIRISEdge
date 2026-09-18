@@ -19,26 +19,19 @@
 //! the server can build on it without discovering the gaps itself.
 //!
 //! `tests/chat_harness_dx.rs` pins the documented call SHAPES (they exist and
-//! typecheck). This walks the flow with real signatures and a real persist
-//! directory — the questions a compile-pin cannot answer: does the lookup
-//! actually resolve, is the community really two people on BOTH sides, is the
-//! invitee a founder rather than a guest, and is the room the same record
-//! from either end.
-//!
-//! The room is the persist `Community` record, and the conversation key is
-//! persist's community DEK derived from it (CIRISEdge#604 retired chat's own
-//! MLS group, whose exporter secret this file used to call "the conversation
-//! key"). "Both sides derive the same key" is therefore witnessed where the
-//! key lives: `tests/chat_message_federates.rs` seals and opens a body across
-//! two stores; "the key moves when membership changes" is persist's rotation
-//! on an admitted revocation (CIRISPersist#848 I63) and the revocation leg of
-//! CIRISEdge#608.
+//! typecheck). This walks the flow with real signatures, a real persist
+//! directory, and real MLS — the questions a compile-pin cannot answer:
+//! does the lookup actually resolve, is the community really two people, can
+//! the invitee act as a peer rather than a guest, and do both sides derive the
+//! same conversation key.
 
 use std::sync::Arc;
 
+use ciris_edge::mls::cohort_group::mint_cohort_key_material;
+use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
 use ciris_edge::replication::attestation_bind::owner_binding_attestation;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
-use ciris_persist::federation::types::Community;
+use ciris_persist::encrypted_kv::XChaChaKvStore;
 use ciris_persist::federation::{FederationDirectory, SignedAttestation, SignedKeyRecord};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord};
 use ciris_persist::store::sqlite::SqliteBackend;
@@ -183,6 +176,12 @@ async fn directory_of(parties: &[&Party]) -> Arc<SqliteBackend> {
     dir
 }
 
+fn store() -> ScopeStateProvider {
+    ScopeStateProvider::new(Arc::new(
+        XChaChaKvStore::open_in_memory(b"two-person-chat-test").unwrap(),
+    ))
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Rung 2 — "search for a fedID or a NodeCode" → "Contact Found"
 // ═══════════════════════════════════════════════════════════════════
@@ -255,61 +254,37 @@ async fn searching_an_unknown_id_stalls_rather_than_inventing_a_contact() {
 // them, both able to act
 // ═══════════════════════════════════════════════════════════════════
 
-/// Alice opens the community; Bob's node authors the SAME derived record.
+/// Alice opens the community and admits Bob; Bob joins from the Welcome.
 ///
-/// Returns the room as each side holds it — two INDEPENDENT directories,
-/// which is the real deployment shape. Sharing one would let a bug pass by
-/// reading state the other node wrote. There is no handshake: the record is
-/// derived from the two fed-IDs, so both ends author it having exchanged
-/// nothing, and persist's `Community` admission is the oracle on each side.
-async fn open_two_person_community(alice: &Party, bob: &Party) -> (Community, Community, String) {
-    let community_id = ciris_edge::chat::pair_community_key_id(&alice.fed_id, &bob.fed_id);
+/// Returns both live groups — two INDEPENDENT stores, which is the real
+/// deployment shape. Sharing one would let a bug pass by reading state the
+/// other node wrote.
+async fn open_two_person_community(
+    alice: &Party,
+    bob: &Party,
+) -> (CohortGroup, CohortGroup, String) {
+    let community_id = format!("chat-{}-{}", alice.fed_id, bob.fed_id);
 
-    let dir_a = directory_of(&[alice, bob]).await;
-    let dir_b = directory_of(&[alice, bob]).await;
+    let a = CohortGroup::create(store(), &community_id, &alice.fed_id, 16)
+        .await
+        .expect("create the community");
 
-    // Each side authors the room under ITS node's authority — the shape the
-    // harness and the server both use. The bytes of the `Community` are the
-    // same on both sides by derivation; only the authority signature differs.
-    let row_a = ciris_edge::chat::signed_pair_community(
-        &alice.fed_id,
-        &bob.fed_id,
-        ts(),
-        &alice.node_signer,
-    )
-    .await
-    .expect("alice's node signs the room");
-    let row_b =
-        ciris_edge::chat::signed_pair_community(&bob.fed_id, &alice.fed_id, ts(), &bob.node_signer)
-            .await
-            .expect("bob's node signs the room");
-    dir_a
-        .put_community(row_a)
+    // Bob mints key material and hands over a KeyPackage — the invitee's half
+    // of the handshake.
+    let (material, kp) = mint_cohort_key_material(&bob.fed_id).expect("bob key material");
+    let commit = a
+        .add_member(&bob.fed_id, kp)
         .await
-        .expect("persist admits the room on alice's node");
-    dir_b
-        .put_community(row_b)
-        .await
-        .expect("persist admits the room on bob's node");
+        .expect("admit Bob to the community");
+    let welcome = commit
+        .welcome()
+        .expect("admitting a member yields a Welcome");
 
-    let a = dir_a
-        .lookup_community(&community_id)
+    let b = CohortGroup::join(store(), &community_id, material, welcome, 16)
         .await
-        .expect("lookup")
-        .expect("the room exists on alice's node");
-    let b = dir_b
-        .lookup_community(&community_id)
-        .await
-        .expect("lookup")
-        .expect("the room exists on bob's node");
+        .expect("Bob joins from the Welcome");
+
     (a, b, community_id)
-}
-
-/// The member key ids of a room, sorted — what every rung below compares.
-fn member_ids(c: &Community) -> Vec<String> {
-    let mut m: Vec<String> = c.members.iter().map(|m| m.key_id.clone()).collect();
-    m.sort();
-    m
 }
 
 /// "Joined community with Alice" — membership is EXACTLY the two of them, and
@@ -319,59 +294,68 @@ async fn the_community_is_exactly_the_two_of_them_on_both_sides() {
     let (alice, bob) = (Party::new("alice", 1), Party::new("bob", 2));
     let (a, b, _id) = open_two_person_community(&alice, &bob).await;
 
-    for (who, room) in [("alice", &a), ("bob", &b)] {
+    for (who, group) in [("alice", &a), ("bob", &b)] {
         assert_eq!(
-            room.members.len(),
+            group.member_count().await,
             2,
             "{who} sees the wrong size — a 'chat with one person' that contains \
              three is a privacy failure, not a cosmetic one"
         );
+        let mut members = group.member_key_ids().await;
+        members.sort();
         assert_eq!(
-            member_ids(room),
+            members,
             vec![alice.fed_id.clone(), bob.fed_id.clone()],
             "{who} sees the wrong membership"
         );
     }
-    // The SAME record on both sides — id, name, roster, protocol, founding
-    // instant. The DEK is derived from this record by persist, so two sides
-    // that disagree here would derive two keys; agreeing here is what
-    // "both sides stand on the same epoch" used to assert of the MLS group.
-    assert_eq!(a, b, "the room must be the same record from either end");
+    assert_eq!(
+        a.epoch().await,
+        b.epoch().await,
+        "both sides must stand on the same epoch, or their keys diverge"
+    );
 }
 
-/// **Both are moderators.** The concrete meaning: the INVITEE holds the same
-/// authority root as the founder, not a guest's.
+/// **Both are moderators.** The concrete meaning: the INVITEE can change
+/// membership, not just the founder.
 ///
-/// persist refuses to federate any content keyed on a community with no live
-/// named moderator (CC 4.5.4 / §11.11), and a named moderator exists iff the
-/// member is a steward-bound authority root — a `founder`. So the property is
-/// in the RECORD: both members are `founder`, on both sides, and the protocol
-/// is `unanimous` so nothing decides without both. The operational half —
-/// a founder-signed membership change admitting — is the widen/revoke
-/// producers of CIRISEdge#608, witnessed there against persist's door.
+/// MLS has no "owner" role — every member may commit — but that is a property
+/// of the protocol, not evidence about this wiring. So Bob (who was invited)
+/// performs a membership change and Alice (who created the group) applies it.
+/// If the invitee were a guest, this is the assertion that would fail.
 #[tokio::test]
 async fn the_invitee_is_a_moderator_not_a_guest() {
-    use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
-    use ciris_persist::federation::types::consensus_protocol;
     let (alice, bob) = (Party::new("alice", 1), Party::new("bob", 2));
     let (a, b, _id) = open_two_person_community(&alice, &bob).await;
+    let carol = Party::new("carol", 3);
 
-    for (who, room) in [("alice", &a), ("bob", &b)] {
-        for m in &room.members {
-            assert_eq!(
-                m.role.as_deref(),
-                Some(MEMBER_ROLE_FOUNDER),
-                "{who}'s copy: {} must be a FOUNDER — a member without an authority \
-                 root is a guest, and a room with only one founder has one moderator",
-                m.key_id
-            );
-        }
-        assert_eq!(
-            room.consensus_protocol,
-            consensus_protocol::UNANIMOUS,
-            "{who}'s copy: two equals decide together or not at all"
-        );
-    }
+    // BOB — the invitee — adds a third party.
+    let (_carol_material, carol_kp) =
+        mint_cohort_key_material(&carol.fed_id).expect("carol key material");
+    let commit = b.add_member(&carol.fed_id, carol_kp).await.expect(
+        "the INVITEE must be able to change membership — that is what \
+                 'both are mods' means operationally",
+    );
+
+    // And ALICE, the founder, accepts that change. Assert it APPLIED: a
+    // `Deferred` outcome persists nothing and advances no epoch, so a test
+    // that ignored this would pass while the membership change sat in a
+    // holding pen.
+    let applied = a
+        .apply_remote_commit(commit.commit())
+        .await
+        .expect("the founder must accept the invitee's commit");
+    assert!(
+        matches!(applied, ciris_edge::mls::CommitApplyOutcome::Applied(_)),
+        "the founder must MERGE the invitee's commit, not hold it: {applied:?}"
+    );
+
+    assert_eq!(a.member_count().await, 3);
+    assert_eq!(
+        a.epoch().await,
+        b.epoch().await,
+        "an applied commit must land both sides on the same epoch"
+    );
 }
 
 /// "Chat with Y" — a two-person community names itself by THE OTHER MEMBER.
@@ -384,8 +368,9 @@ async fn a_two_person_community_is_named_by_the_other_member() {
     let (alice, bob) = (Party::new("alice", 1), Party::new("bob", 2));
     let (a, b, _id) = open_two_person_community(&alice, &bob).await;
 
-    let alice_sees = ciris_edge::contact::the_other_member(&member_ids(&a), &alice.fed_id);
-    let bob_sees = ciris_edge::contact::the_other_member(&member_ids(&b), &bob.fed_id);
+    let alice_sees =
+        ciris_edge::contact::the_other_member(&a.member_key_ids().await, &alice.fed_id);
+    let bob_sees = ciris_edge::contact::the_other_member(&b.member_key_ids().await, &bob.fed_id);
 
     assert_eq!(
         alice_sees.as_deref(),
@@ -427,10 +412,60 @@ async fn a_group_that_is_not_a_pair_has_no_other_member() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// Rung 6 — the conversation key
+// ═══════════════════════════════════════════════════════════════════
+
+/// Both sides derive the SAME conversation secret, and it changes when
+/// membership does.
+///
+/// This is what makes the room a room: messages are carried under a key both
+/// parties hold and nobody else does. Deriving it independently on each side —
+/// rather than one side sending it — is the property worth testing.
+#[tokio::test]
+async fn both_sides_derive_the_same_conversation_key() {
+    let (alice, bob) = (Party::new("alice", 1), Party::new("bob", 2));
+    let (a, b, _id) = open_two_person_community(&alice, &bob).await;
+
+    let ka = a.destination_secret().await.expect("alice's secret");
+    let kb = b.destination_secret().await.expect("bob's secret");
+    assert_eq!(
+        ka.as_bytes(),
+        kb.as_bytes(),
+        "the two sides must derive the same key or no message can be read"
+    );
+
+    // A membership change must move it — otherwise a removed member keeps
+    // reading.
+    let carol = Party::new("carol", 3);
+    let (_m, kp) = mint_cohort_key_material(&carol.fed_id).unwrap();
+    let commit = a.add_member(&carol.fed_id, kp).await.expect("add carol");
+    let applied = b
+        .apply_remote_commit(commit.commit())
+        .await
+        .expect("bob applies");
+    assert!(
+        matches!(applied, ciris_edge::mls::CommitApplyOutcome::Applied(_)),
+        "the key only moves for a commit that actually merged: {applied:?}"
+    );
+
+    let after = a.destination_secret().await.expect("alice after");
+    assert_ne!(
+        ka.as_bytes(),
+        after.as_bytes(),
+        "the conversation key MUST move when membership changes"
+    );
+    assert_eq!(
+        after.as_bytes(),
+        b.destination_secret().await.unwrap().as_bytes(),
+        "and both sides must still agree afterwards"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // The whole ladder, in order
 // ═══════════════════════════════════════════════════════════════════
 
-/// Search → found → open → named → the same record on both sides, in one pass.
+/// Search → found → open → named → keyed, in one pass.
 ///
 /// The per-rung tests above can all pass while the sequence does not compose —
 /// this is the walk a server implements, in the order it implements it.
@@ -450,25 +485,24 @@ async fn the_whole_flow_composes_in_order() {
     // that the accepted contact is a resolvable person with nodes, which is
     // exactly `found` above.
 
-    // 4. Open the community that carries the conversation — derived, not
-    //    negotiated: the id is a hash of the two fed-IDs, never their text.
+    // 4. Open the community that carries the conversation.
     let (a, b, community_id) = open_two_person_community(&alice, &bob).await;
-    assert_eq!(
-        community_id,
-        ciris_edge::chat::pair_community_key_id(&bob.fed_id, &alice.fed_id),
-        "the room's id is the same from either end"
+    assert!(
+        community_id.contains(&alice.fed_id) && community_id.contains(&bob.fed_id),
+        "the room's id should name its parties"
     );
 
     // 5. Both see the same two-person room, named from each side.
-    assert_eq!(a.members.len(), 2);
+    assert_eq!(a.member_count().await, 2);
     assert_eq!(
-        ciris_edge::contact::the_other_member(&member_ids(&a), &alice.fed_id).as_deref(),
+        ciris_edge::contact::the_other_member(&a.member_key_ids().await, &alice.fed_id).as_deref(),
         Some(bob.fed_id.as_str()),
         "Alice's room reads 'Chat with Bob'"
     );
 
-    // 6. And they hold the same RECORD, so persist derives the same DEK on
-    //    both sides and a message can actually cross — the crossing itself
-    //    is `tests/chat_message_federates.rs`.
-    assert_eq!(a, b, "the same room from either end");
+    // 6. And they hold the same key, so a message can actually cross.
+    assert_eq!(
+        a.destination_secret().await.unwrap().as_bytes(),
+        b.destination_secret().await.unwrap().as_bytes()
+    );
 }

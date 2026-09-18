@@ -31,25 +31,39 @@
 //! the claim's signed instant and the field, so a ciphertext lifted onto any
 //! other row does not open. What crosses the wire, and what the relay and
 //! every node that is not a member holds, is ciphertext inside a signed
-//! envelope. There is no plaintext producer. `FSD/GROUP_CONTENT_ON_BLOBS.md`
-//! is the design.
+//! envelope. There is no plaintext producer, and there is no second seal:
+//! the pre-v24 `RoomKey` (the group's exporter, HKDF'd per message) is
+//! deleted (CIRISEdge#604, v25.0.0). `FSD/GROUP_CONTENT_ON_BLOBS.md` §2.1
+//! says which layer answers which clause.
 //!
-//! # There is ONE key layer, and it is persist's (CIRISEdge#604)
+//! # The MLS handshake rides the room — the room's ADDRESSING root
 //!
-//! Chat used to run its own MLS group per room — a two-row handshake over the
-//! room (`chat:key_package:v1`, `chat:welcome:v1`) whose exporter secret
-//! sealed the body. That layer is **retired**: the body moved to the DEK
-//! cascade in v24.0.0 (#586/#596), which left the handshake keying nothing,
-//! and two key layers with two convergence rules under one room is exactly the
-//! fork #604 named. Membership is the community roster; agreement is the
-//! cascade; forward secrecy on this axis is rotation (CC 4.5.12.1 Option A).
-//! The handshake surface — `RoomKey`, `PairRole`, `key_package_attestation`,
-//! `welcome_attestation`, the two readers, the two dimensions and the two
-//! `mls_*` envelope members — is DELETED, not deprecated: it keyed nothing,
-//! and a gate built on it gated sends on a key that was never used. A rider
-//! sends when the room record exists and seals through
-//! [`chat_message_attestation`]; the roster is the membership. See the FSD
-//! §2 for what answers CC 5.1 now.
+//! Every room still has an MLS group between its people (ciphersuite
+//! `0x004D`, X-Wing), and the handshake that builds it is two ordinary
+//! community-scoped rows in the room, shared like any other:
+//!
+//! 1. the **joiner** (the lexicographically greater fed-ID, [`PairRole`])
+//!    mints key material and shares its KeyPackage
+//!    ([`key_package_attestation`], `chat:key_package:v1`);
+//! 2. the **creator** creates the group, admits the joiner from that row, and
+//!    shares the Welcome ([`welcome_attestation`], `chat:welcome:v1`);
+//! 3. the joiner joins from the Welcome; both stand on the same group at the
+//!    same epoch.
+//!
+//! The group does NOT key the body (above). It is the room's **CC 5.4
+//! addressing root**: `K_record_id` and `K_symbol` are HKDF-Expand over the
+//! group's raw `exporter_secret` (CC 5.4.1, byte-pinned in
+//! [`scope_privacy`](crate::scope_privacy)), they rebind on every Add/Remove
+//! (CC 5.4.3), and a below-federation destination never announces — members
+//! resolve it from a cached directory entry plus that group-and-epoch-bound
+//! schedule (CC 5.4.6). [`cohort_addressing::snapshot`](crate::cohort_addressing::snapshot)
+//! is that derivation over a room's [`CohortGroup`](crate::mls::CohortGroup),
+//! and the Welcome wrap is the CC 5.4.4 shape
+//! ([`mls::welcome_wrap`](crate::mls::welcome_wrap)). The KeyPackage's own
+//! credential is a fresh MLS signing key; what binds it to the PERSON is the
+//! row it rides in, signed by their FedID hybrid key and admitted at the put
+//! door against their directory record. No side channel, no extra plane, and
+//! the audience gate serves each row to exactly the other member's nodes.
 //!
 //! # Who signs — the ACTOR, at write, with the full hybrid key
 //!
@@ -105,6 +119,10 @@ use sha2::{Digest as _, Sha256};
 /// prefix is NOT reserved by `default_reserved_prefix_rules` — an ordinary
 /// `user` identity may emit it.
 pub const CHAT_MESSAGE_DIMENSION: &str = "chat:message:v1";
+/// The joiner's MLS KeyPackage for a room — step 1 of the handshake.
+pub const KEY_PACKAGE_DIMENSION: &str = "chat:key_package:v1";
+/// The creator's MLS Welcome for the joiner — step 2 of the handshake.
+pub const WELCOME_DIMENSION: &str = "chat:welcome:v1";
 
 /// The replication-consent prefix a grant MUST cover for chat to federate.
 ///
@@ -142,6 +160,14 @@ pub const FIELD_CONTENT_TYPE: &str = "content_type";
 /// the point content is actually backfilled (`FSD/GROUP_CONTENT_ON_BLOBS.md`
 /// §8).
 pub const FIELD_CONTENT: &str = "content";
+/// The MLS handshake payload on a KeyPackage / Welcome row: base64 bytes.
+/// Crate-private since v25.0.0 (CIRISEdge#604): the member is wire contract
+/// for the two handshake rows, read and written only by the producers and
+/// readers below; nothing outside this module has a reason to name it.
+const FIELD_MLS_BYTES: &str = "mls_bytes";
+/// On a Welcome row: the group epoch the Welcome joins the joiner at.
+/// Crate-private, as above.
+const FIELD_MLS_EPOCH: &str = "mls_epoch";
 
 /// **The room two people share, derived from their fed-IDs alone.**
 ///
@@ -227,6 +253,32 @@ pub async fn signed_pair_community(
         scrub_signature_classical,
         scrub_signature_pqc,
     })
+}
+
+/// Which side of the MLS handshake a person is in a pair room — decided
+/// from the two fed-IDs alone, like the room id, so neither has to be told.
+/// The handshake builds the room's group, the CC 5.4 addressing root (module
+/// doc); it does not key the body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairRole {
+    /// The lexicographically smaller fed-ID: creates the group, admits the
+    /// joiner from their KeyPackage row, shares the Welcome.
+    Creator,
+    /// The other: mints key material, shares a KeyPackage, joins from the
+    /// Welcome.
+    Joiner,
+}
+
+impl PairRole {
+    /// `me`'s role in the room with `peer`.
+    #[must_use]
+    pub fn of(me: &str, peer: &str) -> Self {
+        if me < peer {
+            PairRole::Creator
+        } else {
+            PairRole::Joiner
+        }
+    }
 }
 
 /// The ONE producer every chat row goes through: authored `tier: local` /
@@ -394,6 +446,52 @@ pub async fn chat_message_attestation(
     Ok((row, sealed))
 }
 
+/// Step 1 of the handshake: the JOINER's KeyPackage for the room, as a row
+/// the joiner signs. `key_package` is the wire form
+/// ([`key_package_to_bytes`](crate::mls::cohort_group::key_package_to_bytes)).
+///
+/// # Errors
+/// Canonicalization or signing failure.
+pub async fn key_package_attestation(
+    author: &crate::identity::LocalSigner,
+    recipient_key_id: &str,
+    key_package: &[u8],
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Attestation, String> {
+    use base64::Engine as _;
+    let room = pair_community_key_id(&author.key_id, recipient_key_id);
+    let mut members = serde_json::Map::new();
+    members.insert(
+        FIELD_MLS_BYTES.to_owned(),
+        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(key_package)),
+    );
+    chat_row(author, &room, KEY_PACKAGE_DIMENSION, members, asserted_at).await
+}
+
+/// Step 2 of the handshake: the CREATOR's Welcome for the joiner, as a row
+/// the creator signs. The Welcome is HPKE-sealed to the joiner's KeyPackage
+/// by MLS itself; the row only carries it.
+///
+/// # Errors
+/// Canonicalization or signing failure.
+pub async fn welcome_attestation(
+    author: &crate::identity::LocalSigner,
+    recipient_key_id: &str,
+    welcome: &[u8],
+    epoch: u64,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Attestation, String> {
+    use base64::Engine as _;
+    let room = pair_community_key_id(&author.key_id, recipient_key_id);
+    let mut members = serde_json::Map::new();
+    members.insert(
+        FIELD_MLS_BYTES.to_owned(),
+        serde_json::json!(base64::engine::general_purpose::STANDARD.encode(welcome)),
+    );
+    members.insert(FIELD_MLS_EPOCH.to_owned(), serde_json::json!(epoch));
+    chat_row(author, &room, WELCOME_DIMENSION, members, asserted_at).await
+}
+
 /// The room a stored row names, through persist's cohort-target resolver
 /// (every alias; a split-brain row naming two is `None`).
 fn room_of(a: &Attestation) -> Option<String> {
@@ -544,6 +642,59 @@ pub async fn messages_in_room(
     }
 
     Ok(out)
+}
+
+/// The KeyPackage `from` shared in `room`, if it has arrived — step 1 of the
+/// handshake, as the creator reads it.
+///
+/// # Errors
+/// A directory read failure.
+pub async fn key_package_from(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    from: &str,
+    room: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    use base64::Engine as _;
+    Ok(rows_in_room(directory, &[from.to_owned()], room)
+        .await?
+        .iter()
+        .filter(|a| dimension_of(a) == Some(KEY_PACKAGE_DIMENSION))
+        .filter_map(|a| {
+            a.attestation_envelope
+                .get(FIELD_MLS_BYTES)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+        })
+        .next_back())
+}
+
+/// The Welcome `from` shared in `room`, with its epoch, if it has arrived —
+/// step 2 of the handshake, as the joiner reads it.
+///
+/// # Errors
+/// A directory read failure.
+pub async fn welcome_from(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    from: &str,
+    room: &str,
+) -> Result<Option<(Vec<u8>, u64)>, String> {
+    use base64::Engine as _;
+    Ok(rows_in_room(directory, &[from.to_owned()], room)
+        .await?
+        .iter()
+        .filter(|a| dimension_of(a) == Some(WELCOME_DIMENSION))
+        .filter_map(|a| {
+            let env = &a.attestation_envelope;
+            let bytes = env
+                .get(FIELD_MLS_BYTES)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())?;
+            let epoch = env
+                .get(FIELD_MLS_EPOCH)
+                .and_then(serde_json::Value::as_u64)?;
+            Some((bytes, epoch))
+        })
+        .next_back())
 }
 
 /// A message body as read back: opened text, or why it did not open.
