@@ -77,6 +77,31 @@ pub enum CohortAddressError {
 ///
 /// # Errors
 /// [`CohortAddressError::Exporter`] on corrupted group state.
+/// **The room's key in the address table — one definition.**
+///
+/// A community's addresses are installed under `(scope_for(id),
+/// group_id_for(id))`. The blob router (`blob_swarm::scope`) looks a
+/// community blob's holders up under the SAME pair, so the two cannot
+/// drift: CIRISEdge#616 found `BlobMeaning` naming the room by its bare
+/// `community_key_id` while the lifecycle had installed it under the
+/// `cohort:` namespace — every lookup missed and every community pull was
+/// refused as `HolderNotInGroup`. The namespace exists so a community and a
+/// call running inside it cannot collide in the table; it is not optional,
+/// and it is spelled here and nowhere else.
+#[must_use]
+pub fn group_id_for(community_id: &str) -> String {
+    format!("cohort:{community_id}")
+}
+
+/// The scope a community's addresses are installed under — the same
+/// `CohortScope::Cohort` the meaning projection names a community blob by.
+#[must_use]
+pub fn scope_for(community_id: &str) -> crate::cohort_scope::CohortScope {
+    crate::cohort_scope::CohortScope::Cohort {
+        cohort_id: community_id.to_owned(),
+    }
+}
+
 pub async fn snapshot(group: &CohortGroup) -> Result<ScopeGroupSnapshot, CohortAddressError> {
     // Three separate reads rather than one lock: a concurrent commit
     // could in principle land between them, which is harmless HERE —
@@ -90,7 +115,7 @@ pub async fn snapshot(group: &CohortGroup) -> Result<ScopeGroupSnapshot, CohortA
     // and never the A/V DEK seed.
     let secret = group.destination_secret().await?;
     Ok(ScopeGroupSnapshot {
-        group_id: format!("cohort:{}", group.community_id()),
+        group_id: group_id_for(group.community_id()),
         epoch,
         members,
         destination_secret: *secret.as_bytes(),
@@ -125,6 +150,33 @@ mod tests {
         ScopeStateProvider::new(Arc::new(
             XChaChaKvStore::open_in_memory(b"cohort-addressing-test").unwrap(),
         ))
+    }
+
+    /// CIRISEdge#616 — the router looks a community up under
+    /// `(scope_for, group_id_for)`; the lifecycle installs a snapshot under
+    /// `snapshot.group_id`. If these ever disagree every community pull is
+    /// refused as `HolderNotInGroup`, silently. Pinned here, once.
+    #[tokio::test]
+    async fn the_router_key_and_the_installed_key_are_one_definition() {
+        let a = CohortGroup::create(store(), "c-key", "node-a", 16)
+            .await
+            .unwrap();
+        let snap = snapshot(&a).await.unwrap();
+        assert_eq!(snap.group_id, group_id_for("c-key"));
+        assert_eq!(
+            scope_for("c-key"),
+            CohortScope::Cohort {
+                cohort_id: "c-key".to_owned()
+            }
+        );
+        let (life, table) = node("node-a");
+        life.install(&scope_for("c-key"), &snap).unwrap();
+        assert!(
+            table
+                .send_address(&scope_for("c-key"), &group_id_for("c-key"), "node-a")
+                .is_some(),
+            "what the lifecycle installed is found under the router's key",
+        );
     }
 
     fn node(own: &str) -> (ScopeLifecycle, Arc<ScopeAddressTable>) {

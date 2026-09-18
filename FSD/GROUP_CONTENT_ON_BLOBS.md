@@ -395,14 +395,36 @@ that ignores them has not used the substrate.
   edge-side value to change — the gate being armed on the only ingress is
   what makes `Cohort` sufficient.
 
-  **Open under #499:** on a node with no scope address table — every
-  deployment today — `resolve_holder_routes` refuses to fetch cohort-scoped
-  content at all (a scoped request must not ride the federation address, and
-  the only scoped send is Reticulum's). The pull mechanism is complete and
-  witnessed end to end for commons content; for community content it runs to
-  the router and stops there, pinned by
-  `a_community_pull_stops_at_the_scope_router_on_a_legacy_node`. Resolving
-  that is a decision between #499 and #601, not an implementation.
+  **#499 × #601, resolved by CC 5.4 (#616).** A community blob's holders
+  resolve through the room's MLS group. CC 5.4.1: `K_record_id` is
+  "HKDF-SHA256-Expand(PRK = raw group exporter_secret, …)". CC 5.4.6: a
+  below-federation destination is "resolved DETERMINISTICALLY from (cached
+  directory entry + per-group HKDF) — every member derives the same
+  destination; outsiders, lacking the group key, cannot", and it "MUST NOT
+  emit a Reticulum announce". CC 5.4.3: "On any MLS Add or Remove the group
+  epoch advances, so the fragment set MUST rebind". The implementation was
+  already `cohort_addressing::snapshot` → `ScopeLifecycle::install`/`advance`
+  → `ScopeAddressTable`, and the router already read that table. What #616
+  fixed was the KEY: the meaning projection names a room by its bare
+  `community_key_id`, the lifecycle installs it under the `cohort:`
+  namespace, so every lookup missed (`HolderNotInGroup`) — and the router
+  only saw a table a Reticulum transport owned.
+  `cohort_addressing::{scope_for, group_id_for}` is now the one definition
+  both sides use, and `Edge::blob_scope_router` reads the lifecycle's table
+  when no transport owns one (`EdgeBuilder::scope_lifecycle`). The router
+  resolves; the table rebinds on advance; both are pinned.
+
+  **What still needs Reticulum: the scoped SEND.** `fetch_blob_chunk_scoped`
+  ships a scoped fetch only through
+  `ReticulumTransport::send_to_scoped_destination` and refuses on any other
+  transport, because HTTP and packet radio have no scope-derived destination
+  plane and a scoped request on the federation endpoint is the context
+  collapse #499 exists to prevent. On a node without Reticulum a community
+  pull therefore resolves at the router and stops at the send seam — pinned
+  by `a_community_pull_resolves_through_the_rooms_group_and_stops_at_the_scoped_send`,
+  beside the legacy pin (no group at all → refused at the router). The
+  cross-node open over a scoped route is a Reticulum rung for the mesh
+  harness, not an in-process one.
 
   What a private application seal opts out of is therefore not "recall" in
   the absolute — it is *persist's* half of it, which is the half that is

@@ -2426,3 +2426,330 @@ async fn a_community_pull_stops_at_the_scope_router_on_a_legacy_node() {
         "nothing was stored past the router's refusal"
     );
 }
+
+// ─── CIRISEdge#616: the room's group is the router's source ────────────
+
+/// A destination sink that LISTENS and never announces — CC 5.4.6: a
+/// below-federation destination "MUST NOT emit a Reticulum announce"; members
+/// resolve it "from (cached directory entry + per-group HKDF)". The
+/// `Transport` trait has no announce verb at all, so the in-process wire
+/// cannot announce even by accident; this sink records what it was asked to
+/// listen on, and nothing else.
+#[derive(Default)]
+struct ListenOnly(std::sync::Mutex<Vec<[u8; 16]>>);
+impl ciris_edge::scope_lifecycle::ScopedDestinationSink for ListenOnly {
+    fn register(
+        &self,
+        a: &ciris_edge::scope_addressing::MemberAddress,
+        _: &ciris_edge::cohort_scope::CohortScope,
+    ) -> Result<(), String> {
+        self.0.lock().expect("sink").push(*a.as_bytes());
+        Ok(())
+    }
+    fn retire(
+        &self,
+        _: &ciris_edge::scope_addressing::MemberAddress,
+        _: &ciris_edge::cohort_scope::CohortScope,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// `spawn_edge`, with a caller-built scope lifecycle installed — the #616
+/// door: the router reads the lifecycle's table when no Reticulum transport
+/// owns one.
+async fn spawn_edge_with_lifecycle(
+    node: &Node,
+    transport: Arc<WireEnd>,
+    lifecycle: Arc<ciris_edge::scope_lifecycle::ScopeLifecycle>,
+) -> (Arc<ciris_edge::Edge>, tokio::sync::watch::Sender<bool>) {
+    use ciris_persist::federation::FederationDirectory;
+    let edge = ciris_edge::Edge::builder()
+        .directory(node.dir.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+        .federation_directory(node.dir.clone() as Arc<dyn FederationDirectory>)
+        .queue(node.dir.clone())
+        .signer(node.signer.clone())
+        .transport(transport as Arc<dyn ciris_edge::transport::Transport>)
+        .blob_chunk_source(Arc::new(
+            ciris_edge::blob_swarm::PersistBlobChunkSource::new(node.store.engine().clone()),
+        ))
+        .scope_lifecycle(lifecycle)
+        .config(ciris_edge::EdgeConfig::default())
+        .build()
+        .expect("build edge");
+    let edge = Arc::new(edge);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let runner = Arc::clone(&edge);
+    tokio::spawn(async move {
+        let _ = runner.run(shutdown_rx).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    (edge, shutdown_tx)
+}
+
+/// **The community pull resolves through the room's group — and stops at
+/// the scoped send, which is Reticulum's.**
+///
+/// Same room, same seal, same row and holder claims as the legacy pin above.
+/// The difference is that both nodes hold the room's MLS `CohortGroup` and a
+/// scope lifecycle installed from it (`cohort_addressing::snapshot`), so
+/// `Edge::blob_scope_router` has a table. Three things are asserted:
+///
+/// 1. the router RESOLVES node A as a holder to the address the lifecycle
+///    derived from the group's exporter — under the table key the installer
+///    used (`group_id_for`), which is the mismatch #616 fixed;
+/// 2. the pull is therefore no longer refused at `resolve_holder_routes`; it
+///    reaches `fetch_blob_chunk_scoped` and is refused THERE, by name, for
+///    lack of a Reticulum transport — HTTP has no scope-derived destination
+///    plane, and shipping a scoped request on the federation endpoint is the
+///    context collapse #499 forbids. The in-process wire is not made to
+///    pretend otherwise: that seam is the honest edge of what a non-Reticulum
+///    node can do, and this rung pins it as exactly that;
+/// 3. the sink was asked to LISTEN on this node's own address and nothing
+///    announced (CC 5.4.6).
+///
+/// Mutation: build the edge without the lifecycle (`spawn_edge`) and (1)
+/// fails at the router; the pull's reason reverts to "NO scope address
+/// table".
+#[allow(clippy::too_many_lines)] // the room's group, both lifecycles, the seam and the pull — one place on purpose
+#[tokio::test]
+async fn a_community_pull_resolves_through_the_rooms_group_and_stops_at_the_scoped_send() {
+    use ciris_edge::blob_swarm::{BlobPuller, PullConfig, PullOutcome};
+    use ciris_edge::cohort_addressing::{group_id_for, scope_for, snapshot};
+    use ciris_edge::mls::cohort_group::mint_cohort_key_material;
+    use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
+    use ciris_edge::scope_addressing::{MemberAddress, ScopeAddressTable, ScopePrivacyDeriver};
+    use ciris_edge::scope_lifecycle::ScopeLifecycle;
+    use ciris_persist::encrypted_kv::XChaChaKvStore;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::key_grant::{
+        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
+    };
+    use ciris_persist::federation::{FederationDirectory, SignedAttestation};
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let room = "room-alice-bob";
+    let node_a = node(&[&alice, &bob], &alice).await;
+    let node_b = node(&[&alice, &bob], &bob).await;
+    seed_room(&node_a, room, &[&alice, &bob]).await;
+    seed_room(&node_b, room, &[&alice, &bob]).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+
+    // The room's MLS group on each node — the CC 5.4 addressing root. A
+    // creates, adds B's key package, B joins from the Welcome; the members
+    // are the NODE keys, because those are the holders `list_holders` names.
+    let store_for = |tag: &[u8]| {
+        ScopeStateProvider::new(Arc::new(
+            XChaChaKvStore::open_in_memory(tag).expect("in-memory scope state"),
+        ))
+    };
+    let group_a = CohortGroup::create(store_for(b"616-a"), room, &node_a.me, 16)
+        .await
+        .expect("A creates the room's group");
+    let (material_b, kp_b) = mint_cohort_key_material(&node_b.me).expect("B's key material");
+    let add = group_a
+        .add_member(&node_b.me, kp_b)
+        .await
+        .expect("A adds B");
+    let group_b = CohortGroup::join(
+        store_for(b"616-b"),
+        room,
+        material_b,
+        add.welcome().expect("welcome"),
+        16,
+    )
+    .await
+    .expect("B joins from the Welcome");
+
+    // A lifecycle per node over a listen-only sink, installed from the group.
+    let lifecycle_for = |own: &str, sink: Arc<ListenOnly>| {
+        let table = Arc::new(ScopeAddressTable::new(Arc::new(ScopePrivacyDeriver)));
+        (
+            Arc::new(ScopeLifecycle::new(
+                Arc::clone(&table),
+                sink,
+                own,
+                std::time::Duration::from_secs(300),
+            )),
+            table,
+        )
+    };
+    let sink_a = Arc::new(ListenOnly::default());
+    let sink_b = Arc::new(ListenOnly::default());
+    let (life_a, table_a) = lifecycle_for(&node_a.me, Arc::clone(&sink_a));
+    let (life_b, table_b) = lifecycle_for(&node_b.me, Arc::clone(&sink_b));
+    life_a
+        .install(
+            &scope_for(room),
+            &snapshot(&group_a).await.expect("snapshot A"),
+        )
+        .expect("A installs the room's addresses");
+    life_b
+        .install(
+            &scope_for(room),
+            &snapshot(&group_b).await.expect("snapshot B"),
+        )
+        .expect("B installs the room's addresses");
+
+    // (3) CC 5.4.6: each node LISTENS on exactly its own address; nothing
+    // announced (the wire has no announce verb; the sink saw only register).
+    assert_eq!(
+        sink_a.0.lock().expect("sink").len(),
+        1,
+        "A listens on its own address only"
+    );
+    assert_eq!(
+        sink_b.0.lock().expect("sink").len(),
+        1,
+        "B listens on its own address only"
+    );
+    // Both members derive the SAME address for A from their own group state.
+    assert_eq!(
+        table_a
+            .send_address(&scope_for(room), &group_id_for(room), &node_a.me)
+            .map(|m| *m.as_bytes()),
+        table_b
+            .send_address(&scope_for(room), &group_id_for(room), &node_a.me)
+            .map(|m| *m.as_bytes()),
+        "every member derives the same destination (CC 5.4.6)",
+    );
+
+    let (wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (_edge_a, _stop_a) = spawn_edge_with_lifecycle(&node_a, wire_a, Arc::clone(&life_a)).await;
+    let (edge_b, _stop_b) = spawn_edge_with_lifecycle(&node_b, wire_b, Arc::clone(&life_b)).await;
+
+    // (1) The router on B resolves A, a holder, to the room-derived address.
+    let content = ciris_edge::blob_swarm::ContentScope::Group {
+        scope: scope_for(room),
+        group_id: room.to_owned(),
+    };
+    let route = edge_b
+        .blob_scope_router()
+        .route(Some(&content), &node_a.me)
+        .expect("B's router resolves A through the room's group (CIRISEdge#616)");
+    assert_eq!(
+        route.scoped_address().map(MemberAddress::as_bytes),
+        table_b
+            .send_address(&scope_for(room), &group_id_for(room), &node_a.me)
+            .as_ref()
+            .map(MemberAddress::as_bytes),
+        "the route is the table's derived bytes for A under the room's key",
+    );
+
+    // A seals and authors the row; key and holder planes cross as in the pin.
+    let body = b"the bytes would cross on the scoped route";
+    let sealed = node_a
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(room),
+            author_key_id: &node_a.me,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: body,
+            media_type: Some("text/plain"),
+        })
+        .await
+        .expect("seal at the community tier");
+    let sha: [u8; 32] = hex::decode(&sealed.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let row = federation_content_row(&node_a.signer, room, &sealed.pointer, ts()).await;
+    node_a
+        .dir
+        .put_attestation_authored(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("A holds the row it authored");
+    for set in node_a
+        .dir
+        .list_attestations_since(None, 200)
+        .await
+        .expect("list A's rows")
+        .into_iter()
+        .filter(|a| {
+            a.attestation
+                .attestation_type
+                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+        })
+    {
+        node_b
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantSet {
+                attestation: set.attestation.clone(),
+            })
+            .await
+            .expect("B admits A's key_grant set");
+    }
+    for bytes in rows_of(&node_a, "holds_bytes:").await {
+        let h: ciris_persist::federation::Attestation =
+            serde_json::from_slice(&bytes).expect("row");
+        node_b
+            .dir
+            .put_attestation(SignedAttestation { attestation: h })
+            .await
+            .expect("B admits A's holder claim");
+    }
+
+    // (2) The pull passes the router and stops at the scoped SEND.
+    let puller = BlobPuller::new(
+        Arc::clone(&edge_b),
+        node_b.store.engine().clone(),
+        node_b.dir.clone(),
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        node_b.me.clone(),
+        PullConfig::default(),
+    );
+    // (2a) The send seam, by name: the resolved scoped route reaches
+    // `fetch_blob_chunk_scoped` and is refused there for lack of a
+    // Reticulum transport — never shipped on the federation endpoint.
+    let seam = edge_b
+        .fetch_blob_chunk_scoped(&route, sha, sha, std::time::Duration::from_secs(2))
+        .await;
+    match &seam {
+        Err(e) if e.to_string().contains("no Reticulum transport") => {}
+        other => panic!(
+            "a scoped route on a node without Reticulum must be refused BY NAME at \
+             `fetch_blob_chunk_scoped` (CIRISEdge#499: HTTP has no scope-derived destination \
+             plane; a scoped request on the federation endpoint is the context collapse the \
+             address exists to prevent). Got {other:?}"
+        ),
+    }
+    // (2b) The pull terminates. The router resolves (so it is NOT "NO scope
+    // address table" — #616's regression signature), the seam refuses every
+    // dispatch, the scheduler retires the holder at the error-strike limit
+    // and reports the chunk unreachable. Bounded by a deadline: before the
+    // strike bound an instantly-failing holder was re-dispatched forever.
+    let verdict = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        puller.pull_one(&row, sha, 0),
+    )
+    .await
+    .expect(
+        "the pull must reach a verdict within the deadline — a holder whose dispatch fails \
+         instantly is retired at `SwarmConfig::error_strike_limit`, never re-dispatched \
+         forever (CIRISEdge#616)",
+    );
+    match &verdict {
+        PullOutcome::FetchFailed { reason, .. }
+            if reason.contains("no holders left") && !reason.contains("NO scope address table") => {
+        }
+        other => panic!(
+            "with the room's group installed the community pull passes \
+             `resolve_holder_routes` and ends at the send seam: every dispatch to the one \
+             holder is refused, the holder is retired, and the chunk is unreachable. \
+             \"NO scope address table\" means the router never saw the lifecycle's table \
+             (#616 regressed); `Stored` means a scoped send exists on this transport — \
+             promote this pin into the cross-node open. Got {other:?}"
+        ),
+    }
+    assert!(
+        !node_b.dir.has_blob(&sha).await.expect("has_blob"),
+        "nothing was stored past the send seam's refusal"
+    );
+}

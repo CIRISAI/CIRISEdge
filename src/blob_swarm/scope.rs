@@ -399,7 +399,10 @@ impl BlobScopeRouter {
         // (that is the invariant `scope_addressing`'s
         // `lookup_never_calls_the_deriver` test pins). Address derivation
         // is CIRISVerify#259's; edge reproduces its bytes, never its math.
-        match table.send_address(scope, group_id, peer_key_id) {
+        // CIRISEdge#616 — look up under the key the INSTALLER used (see
+        // `table_group_id`), or every community holder reads not-in-group.
+        let table_group_id = table_group_id(scope, group_id);
+        match table.send_address(scope, &table_group_id, peer_key_id) {
             Some(address) => Ok(BlobRecipient {
                 peer_key_id: peer_key_id.to_owned(),
                 route: BlobRoute::Scoped(address),
@@ -604,9 +607,14 @@ pub fn admit_blob_serve(
     // belongs to exactly one group, and possession of it says nothing
     // about any other. `Federation` content names no group and needs no
     // such check — `(Public, _) => true` already admitted it above.
+    //
+    // CIRISEdge#616 — compared under the TABLE's key for the group, which for
+    // a community is the `cohort:` namespace the lifecycle installed it under,
+    // not the bare `community_key_id` the content names (`table_group_id`).
     if let Some(group_id) = content.group_id() {
+        let expected = table_group_id(content_scope, group_id);
         let arrival_group = arrival.map(|a| a.group().group_id());
-        if arrival_group != Some(group_id) {
+        if arrival_group != Some(expected.as_str()) {
             return ServeAdmission::Refuse(ServeRefusal::GroupMismatch {
                 content_kind: content_scope.kind_token(),
             });
@@ -614,6 +622,24 @@ pub fn admit_blob_serve(
     }
 
     ServeAdmission::Admit
+}
+
+/// The key a group is installed under in the [`ScopeAddressTable`], from
+/// what a blob's content names (CIRISEdge#616).
+///
+/// A community blob names its room by the bare `community_key_id` — what the
+/// row carries — while the room's addresses are installed by the lifecycle
+/// under the `cohort:` namespace (`cohort_addressing::group_id_for`, one
+/// definition). The send router and the serve gate both look the group up
+/// through this, so neither can drift from the installer: before this, every
+/// community holder read as not-in-group on send and every community
+/// arrival as a group mismatch on serve, and both refusals were silent.
+/// Family groups are installed under the id the content names.
+fn table_group_id(scope: &CohortScope, group_id: &str) -> String {
+    match scope {
+        CohortScope::Cohort { .. } => crate::cohort_addressing::group_id_for(group_id),
+        _ => group_id.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -637,8 +663,14 @@ mod tests {
         let t = ScopeAddressTable::new(Arc::new(StubDeriver));
         t.install_group(&CohortScope::Family, "fam-1", 1, &[0xA1; 32], &MEMBERS)
             .expect("family install");
-        t.install_group(&cohort("neighbourhood"), "com-1", 1, &[0xB2; 32], &MEMBERS)
-            .expect("community install");
+        t.install_group(
+            &cohort("neighbourhood"),
+            &crate::cohort_addressing::group_id_for("com-1"),
+            1,
+            &[0xB2; 32],
+            &MEMBERS,
+        )
+        .expect("community install");
         Arc::new(t)
     }
 
@@ -905,7 +937,11 @@ mod tests {
         // The no-regression case, restated at the gate: `(Public, _) => true`.
         let t = table();
         let fam = arrival_for(&t, &CohortScope::Family, "fam-1");
-        let com = arrival_for(&t, &cohort("neighbourhood"), "com-1");
+        let com = arrival_for(
+            &t,
+            &cohort("neighbourhood"),
+            &crate::cohort_addressing::group_id_for("com-1"),
+        );
         for arrival in [None, Some(&fam), Some(&com)] {
             assert_eq!(
                 admit_blob_serve(true, arrival, Some(&ContentScope::Federation)),
@@ -959,7 +995,11 @@ mod tests {
     #[test]
     fn a_community_address_does_not_unlock_family_content() {
         let t = table();
-        let com = arrival_for(&t, &cohort("neighbourhood"), "com-1");
+        let com = arrival_for(
+            &t,
+            &cohort("neighbourhood"),
+            &crate::cohort_addressing::group_id_for("com-1"),
+        );
         assert_eq!(
             admit_blob_serve(true, Some(&com), Some(&family_content())),
             ServeAdmission::Refuse(ServeRefusal::ArrivalScopeInsufficient {
@@ -972,12 +1012,28 @@ mod tests {
     #[test]
     fn a_different_cohort_id_does_not_unlock_community_content() {
         let t = ScopeAddressTable::new(Arc::new(StubDeriver));
-        t.install_group(&cohort("neighbourhood"), "com-1", 1, &[0xB2; 32], &MEMBERS)
-            .expect("com-1");
-        t.install_group(&cohort("book-club"), "com-2", 1, &[0xD4; 32], &MEMBERS)
-            .expect("com-2");
+        t.install_group(
+            &cohort("neighbourhood"),
+            &crate::cohort_addressing::group_id_for("com-1"),
+            1,
+            &[0xB2; 32],
+            &MEMBERS,
+        )
+        .expect("com-1");
+        t.install_group(
+            &cohort("book-club"),
+            &crate::cohort_addressing::group_id_for("com-2"),
+            1,
+            &[0xD4; 32],
+            &MEMBERS,
+        )
+        .expect("com-2");
 
-        let other = arrival_for(&t, &cohort("book-club"), "com-2");
+        let other = arrival_for(
+            &t,
+            &cohort("book-club"),
+            &crate::cohort_addressing::group_id_for("com-2"),
+        );
         assert_eq!(
             admit_blob_serve(true, Some(&other), Some(&community_content())),
             ServeAdmission::Refuse(ServeRefusal::ArrivalScopeInsufficient {
@@ -988,7 +1044,11 @@ mod tests {
              community is refused at the scope predicate, before the group check",
         );
 
-        let own = arrival_for(&t, &cohort("neighbourhood"), "com-1");
+        let own = arrival_for(
+            &t,
+            &cohort("neighbourhood"),
+            &crate::cohort_addressing::group_id_for("com-1"),
+        );
         assert!(admit_blob_serve(true, Some(&own), Some(&community_content())).is_admitted());
     }
 
@@ -1054,5 +1114,140 @@ mod tests {
         ];
         let uniq: std::collections::HashSet<_> = reasons.iter().collect();
         assert_eq!(uniq.len(), reasons.len());
+    }
+
+    // ─── CIRISEdge#616 — the room's group is the router's source ──────
+    mod room_group {
+        use super::*;
+        use crate::cohort_addressing::{group_id_for, scope_for, snapshot};
+        use crate::cohort_scope::CohortScope;
+        use crate::mls::cohort_group::mint_cohort_key_material;
+        use crate::mls::{CohortGroup, ScopeStateProvider};
+        use crate::scope_addressing::{MemberAddress, ScopeAddressTable, ScopePrivacyDeriver};
+        use crate::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
+        use ciris_persist::encrypted_kv::XChaChaKvStore;
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+
+        /// A sink that LISTENS and never announces — the only verbs CC 5.4.6
+        /// leaves a scoped destination ("MUST NOT emit a Reticulum announce").
+        #[derive(Default)]
+        struct Listen(Mutex<Vec<[u8; 16]>>);
+        impl ScopedDestinationSink for Listen {
+            fn register(&self, a: &MemberAddress, _: &CohortScope) -> Result<(), String> {
+                self.0.lock().unwrap().push(*a.as_bytes());
+                Ok(())
+            }
+            fn retire(&self, _: &MemberAddress, _: &CohortScope) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        fn store() -> ScopeStateProvider {
+            ScopeStateProvider::new(Arc::new(
+                XChaChaKvStore::open_in_memory(b"blob-scope-room-group").unwrap(),
+            ))
+        }
+        fn lifecycle(own: &str) -> (ScopeLifecycle, Arc<ScopeAddressTable>) {
+            let table = Arc::new(ScopeAddressTable::new(Arc::new(ScopePrivacyDeriver)));
+            let life = ScopeLifecycle::new(
+                Arc::clone(&table),
+                Arc::new(Listen::default()),
+                own,
+                Duration::from_secs(300),
+            );
+            (life, table)
+        }
+        /// Two members of one room; node-a's lifecycle installed from ITS group.
+        async fn room() -> (CohortGroup, ScopeLifecycle, Arc<ScopeAddressTable>) {
+            let a = CohortGroup::create(store(), "room-1", "node-a", 16)
+                .await
+                .unwrap();
+            let (material, kp) = mint_cohort_key_material("node-b").unwrap();
+            let add = a.add_member("node-b", kp).await.unwrap();
+            let _b = CohortGroup::join(store(), "room-1", material, add.welcome().unwrap(), 16)
+                .await
+                .unwrap();
+            let (life_a, table_a) = lifecycle("node-a");
+            life_a
+                .install(&scope_for("room-1"), &snapshot(&a).await.unwrap())
+                .unwrap();
+            (a, life_a, table_a)
+        }
+        /// What `BlobMeaning::project` yields for a community blob in this
+        /// room: the BARE community id, in both positions.
+        fn content() -> ContentScope {
+            ContentScope::Group {
+                scope: CohortScope::Cohort {
+                    cohort_id: "room-1".to_owned(),
+                },
+                group_id: "room-1".to_owned(),
+            }
+        }
+
+        /// **CC 5.4.6** — "A group destination is resolved DETERMINISTICALLY
+        /// from (cached directory entry + per-group HKDF) — every member
+        /// derives the same destination". The router, given the room's group
+        /// through the lifecycle, resolves a member holder to the address the
+        /// table derived from the group's exporter — under the SAME table key
+        /// the installer used.
+        #[tokio::test]
+        async fn a_room_installed_through_the_lifecycle_routes_its_members() {
+            let (_a, _life, table) = room().await;
+            let router = BlobScopeRouter::new(Some(Arc::clone(&table)));
+            let route = router.route(Some(&content()), "node-b").expect("routes");
+            let expected = table
+                .send_address(&scope_for("room-1"), &group_id_for("room-1"), "node-b")
+                .expect("the table holds node-b under the room's key");
+            assert_eq!(
+                route.scoped_address().map(MemberAddress::as_bytes),
+                Some(expected.as_bytes()),
+                "the router must resolve a community holder to the address the lifecycle \
+                 installed from the room's group (CIRISEdge#616)",
+            );
+            // A stranger to the room is not a route — and never federation.
+            assert!(matches!(
+                router.route(Some(&content()), "node-c"),
+                Err(ScopeRouteRefusal::HolderNotInGroup { .. })
+            ));
+        }
+
+        /// **CC 5.4.3** — "On any MLS Add or Remove the group epoch advances,
+        /// so the fragment set MUST rebind". The router reads the live table,
+        /// so an advance re-addresses what it resolves — there is no stale
+        /// entry to invalidate.
+        #[tokio::test]
+        async fn an_epoch_advance_rebinds_what_the_router_resolves() {
+            let (a, life, table) = room().await;
+            let router = BlobScopeRouter::new(Some(Arc::clone(&table)));
+            let before = *router
+                .route(Some(&content()), "node-b")
+                .unwrap()
+                .scoped_address()
+                .unwrap()
+                .as_bytes();
+            let epoch_before = a.epoch().await;
+            let _commit = a.rotate().await.unwrap();
+            assert!(
+                a.epoch().await > epoch_before,
+                "precondition: the epoch advanced"
+            );
+            life.advance(
+                &scope_for("room-1"),
+                &snapshot(&a).await.unwrap(),
+                Instant::now(),
+            )
+            .unwrap();
+            let after = *router
+                .route(Some(&content()), "node-b")
+                .unwrap()
+                .scoped_address()
+                .unwrap()
+                .as_bytes();
+            assert_ne!(
+                before, after,
+                "the address the router resolves must change with the epoch — a table that \
+                 kept the old entry would leave a removed member's address routable (CC 5.4.3)",
+            );
+        }
     }
 }
