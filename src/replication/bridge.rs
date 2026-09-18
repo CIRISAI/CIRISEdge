@@ -390,7 +390,26 @@ fn key_refusal_retry(reason: KeyRefusalReason) -> RetryDisposition {
     match reason {
         KeyRefusalReason::PubkeySwap
         | KeyRefusalReason::Downgrade
-        | KeyRefusalReason::ConflictingVersion => RetryDisposition::Terminal,
+        | KeyRefusalReason::ConflictingVersion
+        // persist v44.7.0 (#864) — `RebindChangesRecord`: the offered
+        // self-signed record wears the rebind shape (same key, same pubkeys,
+        // bound envelope over an unbound stored row) but its CLAIM differs
+        // from the stored row's. The verdict compares fixed bytes with a
+        // stored claim replication cannot move in this direction: if the
+        // stored row later becomes anchored the same offer is a `Downgrade`,
+        // if it is rebound by its holder the same offer is `ConflictingVersion`
+        // — refused in every successor state, the `ConflictingVersion`
+        // argument verbatim.
+        | KeyRefusalReason::RebindChangesRecord => RetryDisposition::Terminal,
+        // v44.7.0 (#864) — `NotSelfSigned` / `RecordAbsent` are verdicts of the
+        // LOCAL rebind door (`rebind_key_record`), which the replication plane
+        // never runs: a fresh node INSERTS a bound record, a holder REBINDS.
+        // Unreachable here, and if a future door did surface one, "no row yet"
+        // is exactly the bootstrap-ordering shape — so by the rule for
+        // ambiguous tokens they stay transient.
+        KeyRefusalReason::NotSelfSigned | KeyRefusalReason::RecordAbsent => {
+            RetryDisposition::Transient
+        }
         KeyRefusalReason::ReScrub
         | KeyRefusalReason::AlreadyAnchoredIdentical
         | KeyRefusalReason::UnverifiableSignature
@@ -426,6 +445,14 @@ fn key_outcome_to_apply(
         Ok(
             ReplicatedKeyOutcome::Inserted
             | ReplicatedKeyOutcome::Upgraded
+            // persist v44.7.0 (#864) — a stored self-signed UNBOUND record
+            // healed to its holder's bound bytes over the same pubkeys and
+            // the same claim. The row this node holds CHANGED (persist moves
+            // `mutated_at`, so cursors re-serve it), which is an admission,
+            // not a duplicate: a peer that counted it as held-already would
+            // keep serving the pre-#659 bytes every verify v15.2.0 node
+            // refuses — the exact stall #864 names.
+            | ReplicatedKeyOutcome::Rebound
             | ReplicatedKeyOutcome::Superseded,
         ) => (ApplyOutcome::Admitted, None),
         Ok(
@@ -7834,6 +7861,60 @@ pub(crate) mod tests {
         }
     }
 
+    /// A key record minted the way production mints one — persist v44.7.0 (#864)
+    /// made the memory backend a faithful door: `apply_replicated_key_record`
+    /// runs the ONE key plan there too, so a record must Strict-verify its
+    /// hybrid self-signature and bind its subject, or it is refused by name.
+    /// [`fixture_key_record`] (fake signature, unbound envelope) is still right
+    /// for every test that hashes or advertises a row; a test that APPLIES one
+    /// through the plane needs this. Minted over a throwaway in-memory Engine
+    /// by `register_self_federation_key`, read back from its own directory —
+    /// the `key_id` is the DERIVED id (`<alias>-<fp>`), never the alias.
+    pub(crate) async fn minted_key_record(
+        alias: &str,
+        identity_type_: &str,
+        seed: u8,
+    ) -> KeyRecord {
+        use ciris_keyring::{
+            Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner,
+        };
+        let classical: Arc<dyn HardwareSigner> = Arc::new(
+            Ed25519SoftwareSigner::from_bytes(&[seed; 32], alias).expect("ed25519 from seed"),
+        );
+        let pqc: Arc<dyn PqcSigner> = Arc::new(
+            MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{alias}-pqc"))
+                .expect("ml-dsa-65 from seed"),
+        );
+        let signer = ciris_persist::prelude::LocalSigner::from_hardware_parts(
+            classical,
+            alias.to_owned(),
+            Some(pqc),
+            Some(format!("{alias}-pqc")),
+        )
+        .await
+        .expect("hybrid local signer");
+        let engine = ciris_persist::Engine::with_signer(Arc::new(signer), "sqlite::memory:")
+            .await
+            .expect("throwaway engine");
+        let key_id = engine
+            .register_self_federation_key(
+                identity_type_,
+                alias,
+                None,
+                serde_json::json!({}),
+                Vec::new(),
+            )
+            .await
+            .expect("mint a self-signed, subject-bound key record");
+        ciris_persist::federation::FederationDirectory::lookup_public_key(
+            &*engine.federation_directory(),
+            &key_id,
+        )
+        .await
+        .expect("read back")
+        .expect("the minted record exists")
+    }
+
     /// persist v32/#682 belt: the Key-plane advertise row must hash byte-identically
     /// to the v31 `SignedKeyRecord { record }` shape (persist's `signed_wire_index`
     /// basis), and the node-local `admitted_at` must NOT enter that hash. If serde
@@ -7913,9 +7994,9 @@ pub(crate) mod tests {
     /// (idempotent on matching content per persist's contract).
     #[tokio::test]
     async fn key_round_trips_through_bridge() {
-        let key_id = "agent-alice";
+        let record = minted_key_record("agent-alice", identity_type::AGENT, 0x11).await;
+        let key_id = record.key_id.as_str();
         let (backend, bridge) = make_bridge(&[key_id.to_string()]);
-        let record = fixture_key_record(key_id, identity_type::AGENT);
         backend
             .put_public_key(SignedKeyRecord {
                 record: record.clone(),
@@ -7940,17 +8021,17 @@ pub(crate) mod tests {
         assert_eq!(decoded.record.key_id, key_id);
 
         // apply_envelope_bytes routes the Key plane through
-        // apply_replicated_key_record (#277). On MemoryBackend (the trait
-        // default) a matching-content apply is a first-seen Ok ⇒ Inserted
-        // ⇒ admitted; the Unchanged/Refused ⇒ false distinction only
-        // surfaces on the scrub-upgrade-aware SqliteBackend (persist owns
-        // that classification test).
-        let admitted = bridge
+        // apply_replicated_key_record (#277). Since persist v44.7.0 (#864)
+        // the memory backend runs the same key plan sqlite does, so a
+        // byte-identical re-apply of a row this node already holds is
+        // `Unchanged` ⇒ `Duplicate` — the honest verdict (before v44.7.0 the
+        // plan-less default reported it as a first-seen Inserted).
+        let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::Key, &bytes, None)
             .await;
         assert!(
-            admitted.is_admitted(),
-            "matching-content apply admits on MemoryBackend, got {admitted:?}"
+            matches!(outcome, ApplyOutcome::Duplicate),
+            "a byte-identical re-apply of a held row is a Duplicate, got {outcome:?}"
         );
     }
 
@@ -8535,6 +8616,7 @@ pub(crate) mod tests {
         for o in [
             ReplicatedKeyOutcome::Inserted,
             ReplicatedKeyOutcome::Upgraded,
+            ReplicatedKeyOutcome::Rebound,
             ReplicatedKeyOutcome::Superseded,
         ] {
             let (a, t) = key_outcome_to_apply(Ok(o), "h");
@@ -8592,6 +8674,9 @@ pub(crate) mod tests {
             KeyRefusalReason::PubkeySwap,
             KeyRefusalReason::Downgrade,
             KeyRefusalReason::ConflictingVersion,
+            // v44.7.0 — a rebind-shaped offer whose claim moved: the same
+            // fixed-bytes-vs-stored-claim argument as `ConflictingVersion`.
+            KeyRefusalReason::RebindChangesRecord,
         ];
         for &reason in KeyRefusalReason::ALL {
             // Drive the mapping the field drives, not the private fn alone.
@@ -8694,8 +8779,8 @@ pub(crate) mod tests {
     /// a row but can never withhold one.
     #[tokio::test]
     async fn a_suppressed_row_is_still_applied_when_a_peer_pushes_it_anyway() {
-        let (_backend, bridge) = make_bridge(&["k1".into()]);
-        let record = fixture_key_record("k1", identity_type::NODE);
+        let record = minted_key_record("k1", identity_type::NODE, 0x21).await;
+        let (_backend, bridge) = make_bridge(std::slice::from_ref(&record.key_id));
         let bytes = serde_json::to_vec(&SignedKeyRecord { record }).expect("serialize offer");
         let hash: [u8; 32] = Sha256::digest(&bytes).into();
         // Pre-load the memory as if a previous round had refused these bytes.
@@ -8957,7 +9042,7 @@ pub(crate) mod tests {
             "an idle node books no accepted applies"
         );
         // (b) Apply a FRESH (never-seeded) Key row → Admitted → applied_total.
-        let rec = fixture_key_record("fresh-457", identity_type::NODE);
+        let rec = minted_key_record("fresh-457", identity_type::NODE, 0x31).await;
         let bytes = serde_json::to_vec(&SignedKeyRecord {
             record: rec.clone(),
         })

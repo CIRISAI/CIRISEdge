@@ -217,14 +217,19 @@ async fn key_round_trips_across_combinator_refactor() {
     let decoded: SignedKeyRecord = serde_json::from_slice(&bytes).expect("decode");
     assert_eq!(decoded.record.key_id, key_id);
 
-    // 4. apply_envelope_bytes is idempotent on matching content
-    //    (persist returns Ok on dedup).
-    let admitted = bridge
+    // 4. apply_envelope_bytes is idempotent on matching content: a
+    //    byte-identical re-apply of a row this node already holds is the
+    //    receiver holding what was offered — `Unchanged` ⇒ `Duplicate`, never
+    //    an error and never a refusal. Since persist v44.7.0 (#864) the memory
+    //    backend runs the same key plan sqlite does, so this is the verdict
+    //    on every backend (before, the plan-less memory default reported a
+    //    first-seen Inserted for the same bytes).
+    let outcome = bridge
         .apply_envelope_bytes(EnvelopeKind::Key, &bytes, Some("self"))
         .await;
     assert!(
-        admitted.is_admitted(),
-        "idempotent re-apply succeeds, got {admitted:?}"
+        matches!(outcome, ciris_edge::replication::ApplyOutcome::Duplicate),
+        "idempotent re-apply is a Duplicate, got {outcome:?}"
     );
 }
 
