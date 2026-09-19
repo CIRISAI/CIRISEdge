@@ -83,13 +83,14 @@ const RESPONDER_REPLY_SEND_TIMEOUT: std::time::Duration = std::time::Duration::f
 /// no other driver — so this task IS its round engine: pull each inbound
 /// replication message, step the round, and emit every reply on the transport.
 ///
-/// Without it, `route_inbound_bytes` `deliver_inbound`'s the round-open into the
-/// coordinator's channel and it is NEVER processed — the responder never
+/// Without it, `route_inbound_bytes` queues the round-open into the
+/// responder's inbox and it is NEVER processed — the responder never
 /// replies, the initiator times out forever, and (the seam that cost the mesh
 /// weeks — #348) NOTHING logs. This was the missing half of #312: it spun up +
 /// registered the Responder but never ran the drive loop. Spawned ONCE per
-/// (peer, kind) — `get_or_register_with` invokes the factory only on first
-/// insert. Every terminal / error path logs; there is no silent discard.
+/// (peer, kind) — the registry invokes the factory only on first insert into
+/// its RESPONDERS table (CIRISEdge#634: a responder's slot is never the
+/// initiator's). Every terminal / error path logs; there is no silent discard.
 /// CIRISEdge#397 — bring persist's `signed_wire_index` (V111) current so the
 /// content-hash point-read fetch resolves pre-existing rows. Run ONCE at
 /// startup: idempotent, and fail-soft — a backend that doesn't implement the
@@ -364,11 +365,15 @@ fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
         tracing::debug!(peer = %peer, ?kind, "responder driver started (CIRISEdge#348)");
         loop {
             // Channel closed ⇒ the coordinator was dropped; end the driver.
-            let Some(msg) = coord.recv_inbound().await else {
+            // CIRISEdge#634 — take the frame WITH its round metadata so the
+            // step can rebind (a new round resets a stuck session) and the
+            // replies below echo the round; a legacy frame (`meta: None`)
+            // gets a legacy reply.
+            let Some(inbound) = coord.recv_inbound_framed().await else {
                 tracing::debug!(peer = %peer, ?kind, "responder driver ending (channel closed)");
                 break;
             };
-            match coord.drive_round_step(Some(msg)).await {
+            match coord.drive_round_step_framed(Some(inbound)).await {
                 Ok(DriveStep::SendThenWait(msgs)) => {
                     for m in &msgs {
                         // CIRISEdge#373 — BOUND the reply send. This loop is the
@@ -774,8 +779,8 @@ impl ReplicationRuntime {
                 );
                 // CIRISEdge#348 — DRIVE the responder. The registry only stores
                 // the coordinator; the scheduler drives INITIATORS only. Without
-                // a driver here the round-open is `deliver_inbound`'d into the
-                // coordinator's channel and NEVER processed — the responder never
+                // a driver here the round-open is queued into the responder's
+                // inbox and NEVER processed — the responder never
                 // replies, the initiator times out forever, and (the seam that
                 // cost weeks) NOTHING logs. This was the missing half of the #312
                 // responder factory: it spun up + registered the Responder but
@@ -1130,7 +1135,7 @@ impl ReplicationRuntime {
             // Idempotent — installs (or reuses) the scheduled drive loop that
             // consumes the Pull's Summary reply.
             self.register_initiator_peer(peer_key_id, kind).await?;
-            if let Some(coord) = self.registry.get(peer_key_id, kind).await {
+            if let Some(coord) = self.registry.get_initiator(peer_key_id, kind).await {
                 if let Err(e) = coord.start_pull(subject_key_id).await {
                     tracing::warn!(
                         peer = %peer_key_id,
@@ -1361,7 +1366,7 @@ mod tests {
     /// and REPLY on the transport — with NO Initiator, NO scheduler entry, and NO
     /// manual drive. Before the fix the #312 factory registered the coordinator
     /// but never ran its `recv_inbound → drive_round_step → send_message` loop, so
-    /// `deliver_inbound` enqueued the Summary and it was never processed: the
+    /// the routed Summary sat in its inbox and was never processed: the
     /// responder never replied and the initiator timed out forever (the #348
     /// silent stall). This asserts a reply is emitted back to the initiator.
     // multi_thread: `DirectoryStateAdapter` uses `block_in_place` (directory.rs),
@@ -1401,7 +1406,7 @@ mod tests {
             .await
             .expect("route_inbound_bytes");
         assert!(
-            matches!(outcome, RouteOutcome::Routed),
+            matches!(outcome, RouteOutcome::RoutedToResponder { built: true, .. }),
             "the factory must spin up + route to a Responder, got {outcome:?}",
         );
 
@@ -1469,7 +1474,9 @@ mod tests {
         .await;
         let registry = rt.registry();
         assert_eq!(registry.len().await, 1);
-        let coord = registry.get("agent-alice", EnvelopeKind::Key).await;
+        let coord = registry
+            .get_initiator("agent-alice", EnvelopeKind::Key)
+            .await;
         assert!(coord.is_some());
         rt.shutdown().await;
     }
@@ -1517,7 +1524,10 @@ mod tests {
             .await
             .expect("hot-add succeeds while runtime is live");
         assert_eq!(rt.registry().len().await, 1);
-        let coord = rt.registry().get("agent-carol", EnvelopeKind::Key).await;
+        let coord = rt
+            .registry()
+            .get_initiator("agent-carol", EnvelopeKind::Key)
+            .await;
         assert!(coord.is_some());
         assert_eq!(coord.unwrap().role(), SessionRole::Initiator);
         // Idempotent: re-add is a no-op.
@@ -1603,17 +1613,17 @@ mod tests {
         assert_eq!(rt.registry().len().await, 2);
         assert!(rt
             .registry()
-            .get("peer-keep", EnvelopeKind::Key)
+            .get_initiator("peer-keep", EnvelopeKind::Key)
             .await
             .is_some());
         assert!(rt
             .registry()
-            .get("peer-new", EnvelopeKind::Attestation)
+            .get_initiator("peer-new", EnvelopeKind::Attestation)
             .await
             .is_some());
         assert!(rt
             .registry()
-            .get("peer-drop", EnvelopeKind::Key)
+            .get_initiator("peer-drop", EnvelopeKind::Key)
             .await
             .is_none());
         rt.shutdown().await;
@@ -1635,5 +1645,249 @@ mod tests {
         .await;
         rt.shutdown().await;
         rt.shutdown().await; // no panic, no hang
+    }
+
+    // ── CIRISEdge#634 — the reproduction at runtime level ─────────────────
+    //
+    // Two runtimes, each an INITIATOR toward the other for the same kind (the
+    // mesh norm: mutual peers). Pre-#634 every round-open from one side landed
+    // in the other side's initiator channel, undrained between rounds; the
+    // responder factory never ran; rounds timed out. Post-#634 both sides'
+    // rounds COMPLETE, both sides route both directions, and nothing is
+    // dropped as a stale reply or back-pressure.
+    mod mutual_initiators_634 {
+        use super::*;
+        use crate::observability::{EdgeMetrics, RoundOutcome};
+        use crate::replication::registry::{ReplicationRegistry, RouteOutcome};
+        use std::collections::HashMap;
+        use std::sync::Mutex as StdMutex;
+
+        type Registries = Arc<StdMutex<HashMap<String, Arc<ReplicationRegistry>>>>;
+        type Ledger = Arc<StdMutex<Vec<(String, String)>>>; // (receiver, outcome label)
+
+        /// `send(dest, bytes)` becomes `dest_registry.route_inbound_bytes(me, bytes)`
+        /// on a spawned task — the shape of the real listen loop, minus the
+        /// transport. Every route outcome is recorded per receiver.
+        struct Loopback {
+            me: String,
+            registries: Registries,
+            ledger: Ledger,
+        }
+        #[async_trait]
+        impl Transport for Loopback {
+            fn id(&self) -> TransportId {
+                TransportId::HTTP
+            }
+            async fn send(
+                &self,
+                destination_key_id: &str,
+                envelope_bytes: &[u8],
+            ) -> Result<TransportSendOutcome, TransportError> {
+                let dest = self
+                    .registries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(destination_key_id)
+                    .cloned();
+                let Some(dest) = dest else {
+                    return Err(TransportError::Io(format!(
+                        "no such node {destination_key_id}"
+                    )));
+                };
+                let me = self.me.clone();
+                let ledger = Arc::clone(&self.ledger);
+                let bytes = envelope_bytes.to_vec();
+                let receiver = destination_key_id.to_string();
+                tokio::spawn(async move {
+                    let label = match dest.route_inbound_bytes(&me, &bytes).await {
+                        Ok(RouteOutcome::RoutedToResponder { .. }) => "to_responder".to_string(),
+                        Ok(RouteOutcome::RoutedToInitiator { .. }) => "to_initiator".to_string(),
+                        Ok(other) => format!("other:{other:?}"),
+                        Err(e) => format!("err:{e}"),
+                    };
+                    ledger
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((receiver, label));
+                });
+                Ok(TransportSendOutcome::Delivered)
+            }
+            async fn listen(
+                &self,
+                _sink: tokio::sync::mpsc::Sender<InboundFrame>,
+            ) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        async fn node(
+            name: &str,
+            peer: &str,
+            registries: &Registries,
+            ledger: &Ledger,
+        ) -> (ReplicationRuntime, EdgeMetrics) {
+            let backend = Arc::new(MemoryBackend::new());
+            let directory: Arc<dyn FederationDirectory> = backend;
+            let transport: Arc<dyn Transport> = Arc::new(Loopback {
+                me: name.to_string(),
+                registries: Arc::clone(registries),
+                ledger: Arc::clone(ledger),
+            });
+            let metrics = EdgeMetrics::new();
+            let config = ReplicationRuntimeConfig {
+                scheduler: SchedulerConfig {
+                    cadence: std::time::Duration::from_secs(3600),
+                    round_timeout: std::time::Duration::from_secs(5),
+                },
+                metrics: Some(metrics.clone()),
+                local_key_id: Some(name.to_string()),
+                ..ReplicationRuntimeConfig::default()
+            };
+            let rt = ReplicationRuntime::start(
+                directory,
+                transport,
+                vec![ReplicationPeer {
+                    peer_key_id: peer.to_string(),
+                    kind: EnvelopeKind::Key,
+                }],
+                config,
+                None,
+            )
+            .await;
+            registries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(name.to_string(), rt.registry());
+            (rt, metrics)
+        }
+
+        fn completed(m: &EdgeMetrics) -> u64 {
+            m.replication_round_outcomes_total
+                .read()
+                .get(&RoundOutcome::Completed)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn mutual_initiators_both_complete_rounds_634() {
+            let registries: Registries = Arc::new(StdMutex::new(HashMap::new()));
+            let ledger: Ledger = Arc::new(StdMutex::new(Vec::new()));
+            let (mut alice, alice_m) = node("alice", "bob", &registries, &ledger).await;
+            let (mut bob, bob_m) = node("bob", "alice", &registries, &ledger).await;
+
+            // Both sides are initiators toward each other; neither has a
+            // responder yet.
+            assert!(alice
+                .registry()
+                .get_initiator("bob", EnvelopeKind::Key)
+                .await
+                .is_some());
+            assert!(alice
+                .registry()
+                .get_responder("bob", EnvelopeKind::Key)
+                .await
+                .is_none());
+            assert!(bob
+                .registry()
+                .get_initiator("alice", EnvelopeKind::Key)
+                .await
+                .is_some());
+
+            let alice_before = completed(&alice_m);
+            let bob_before = completed(&bob_m);
+
+            // The #634 shape: ONE side opens a round while the other side's
+            // initiator toward it is IDLE. Pre-#634 the round-open queued into
+            // that idle initiator's channel and the opener timed out (verified
+            // against v25.4.0: `alice={TimedOut: 1}`). Now bob's responder is
+            // built on first contact and alice's round completes.
+            alice.round_now("bob").await.expect("kick alice");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if completed(&alice_m) > alice_before {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "alice's round toward an idle-initiator peer must COMPLETE: alice={:?} \
+                     bob={:?} ledger={:?}",
+                    alice_m.replication_round_outcomes_total.read(),
+                    bob_m.replication_round_outcomes_total.read(),
+                    ledger.lock().unwrap()
+                )
+            });
+
+            // The mirror image.
+            bob.round_now("alice").await.expect("kick bob");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if completed(&bob_m) > bob_before {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("bob's round toward alice completes too");
+
+            // Both at once — the simultaneous case, which the direction bit
+            // keeps apart from the replies now in flight on both sides.
+            let (a2, b2) = (completed(&alice_m), completed(&bob_m));
+            alice.round_now("bob").await.expect("kick alice 2");
+            bob.round_now("alice").await.expect("kick bob 2");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if completed(&alice_m) > a2 && completed(&bob_m) > b2 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("simultaneous rounds complete on both sides");
+
+            // Both sides built a responder for the other, and both directions
+            // were routed on both sides. Nothing was dropped or back-pressured.
+            assert!(alice
+                .registry()
+                .get_responder("bob", EnvelopeKind::Key)
+                .await
+                .is_some());
+            assert!(bob
+                .registry()
+                .get_responder("alice", EnvelopeKind::Key)
+                .await
+                .is_some());
+            let entries = ledger.lock().unwrap().clone();
+            for who in ["alice", "bob"] {
+                let mine: Vec<&str> = entries
+                    .iter()
+                    .filter(|(r, _)| r == who)
+                    .map(|(_, l)| l.as_str())
+                    .collect();
+                assert!(mine.contains(&"to_responder"), "{who}: {mine:?}");
+                assert!(mine.contains(&"to_initiator"), "{who}: {mine:?}");
+                assert!(
+                    mine.iter()
+                        .all(|l| *l == "to_responder" || *l == "to_initiator"),
+                    "{who} saw a drop or an error: {mine:?}"
+                );
+            }
+            for m in [&alice_m, &bob_m] {
+                let outcomes = m.replication_round_outcomes_total.read().clone();
+                assert!(
+                    !outcomes.contains_key(&RoundOutcome::TimedOut)
+                        && !outcomes.contains_key(&RoundOutcome::Error),
+                    "{outcomes:?}"
+                );
+            }
+            alice.shutdown().await;
+            bob.shutdown().await;
+        }
     }
 }

@@ -2537,6 +2537,22 @@ impl PyEdge {
             bundle.replication_inbound_backpressure_drops,
         )?;
 
+        // CIRISEdge#634 — the route choke's three counters. On a healthy mutual
+        // pair both `routed_to_*` climb; `reply_dropped` counts replies that
+        // answered no round we were driving (late replies to timed-out rounds).
+        root.set_item(
+            "replication_routed_to_responder_total",
+            bundle.replication_routed_to_responder_total,
+        )?;
+        root.set_item(
+            "replication_routed_to_initiator_total",
+            bundle.replication_routed_to_initiator_total,
+        )?;
+        root.set_item(
+            "replication_reply_dropped_total",
+            bundle.replication_reply_dropped_total,
+        )?;
+
         // CIRISEdge#433 — the WITHHOLD LEDGER. A serving-path gate that declines
         // to serve a row now emits a counted event keyed by the BRANCH that
         // decided, so an operator can finally distinguish "nothing to send" from

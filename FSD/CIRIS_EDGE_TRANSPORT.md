@@ -400,6 +400,15 @@ stateDiagram-v2
         HijackRefused: a non-owning announce can
         NEVER supersede a Rooted route (#337 CRITICAL-1)
     end note
+    note left of Rooted
+        Replication runs HERE (and bootstrap kinds
+        from Advisory). Beneath this state sits the
+        round layer of §5.4.2 (#634): every CRPL v3
+        frame names its round and its side, and the
+        registry keeps initiators and responders in
+        two tables so a peer's round-open can never
+        queue into our initiator.
+    end note
 ```
 
 **Identification is not attribution.** Two questions, answered by two
@@ -497,6 +506,56 @@ Two invariants the table encodes, and the proptest holds:
    (`link_key_id: Some(..)` as a literal — the *test-field-provenance* trap:
    the witness proved the door opens when the field is `Some`, never asked who
    produces `Some` for a fresh peer).
+
+#### 5.4.2 The round layer under an attributed row — which coordinator, by round metadata (`#634`)
+
+§5.4.1 says what a link in each state may *cause*. For the two rows that may
+carry replication at all (**Advisory** for bootstrap kinds, **Rooted ∧ owns_key**
+for everything), the frame then meets a second table: *which coordinator* it
+reaches. Before `#634` that table had one column — `(peer, kind)` — and an
+initiator we ran toward the peer occupied it, so the peer's own round-open
+queued into a channel nobody drained between rounds and no responder was ever
+built (CIRISServer#607's fourth layer; the chat ladder's `sent` stage). The
+CRPL v3 preamble (`FSD/REPLICATION_ROUND_CORRELATION.md` §3) carries the two
+facts the wire lacked — *which round* and *which side* — and the registry
+routes on them:
+
+| attributed frame (§5.4.1 row admits it) | round metadata | goes to | outcome (`RouteOutcome`) | proven by (file::test) |
+|---|---|---|---|---|
+| CRPL **v1/v2** (a pre-v26 initiator) | none — LEGACY | `responders[(peer, kind)]`, factory-built on first contact; replies go out legacy | `RoutedToResponder` | `registry.rs::round_routing_634::an_inbound_round_open_never_queues_into_an_initiator` |
+| CRPL v3, `FROM_RESPONDER = 0` | the peer's round `R` | `responders[(peer, kind)]`, even while OUR round toward that peer is in flight; replies echo `R` | `RoutedToResponder` | `…::a_v3_round_open_routes_to_the_responder_even_while_our_round_is_in_flight` |
+| CRPL v3, `FROM_RESPONDER = 1`, `R` = our driven round | the reply to our round | that round's inbox on `initiators[(peer, kind)]` | `RoutedToInitiator` | `…::a_reply_to_the_driven_round_reaches_its_inbox` |
+| CRPL v3, `FROM_RESPONDER = 1`, `R` = our pull round | the reply to our on-demand `Pull` | the on-demand inbox on our initiator | `RoutedToInitiator` | `…::a_pull_reply_routes_by_the_pull_round` |
+| CRPL v3, `FROM_RESPONDER = 1`, our initiator idle | a reply to a round that ended | **dropped**, counted | `ReplyDropped{NoRoundInFlight}` | `…::a_stale_reply_is_dropped_visibly_and_builds_no_responder` |
+| CRPL v3, `FROM_RESPONDER = 1`, `R` ≠ ours | a late reply to a superseded round | **dropped**, counted, both ids named | `ReplyDropped{RoundMismatch}` | `…::a_reply_to_a_superseded_round_is_dropped` |
+| CRPL v3, `FROM_RESPONDER = 1`, no initiator for `(peer, kind)` | a reply to a round we never ran | **dropped**; the factory is never consulted | `ReplyDropped{NoInitiator}` | `…::a_reply_frame_can_never_build_a_responder` |
+| two nodes, each an initiator toward the other, rounds kicked simultaneously | both | both sides build a responder; both sides' rounds **complete**; nothing dropped | — | `runtime.rs::tests::mutual_initiators_634::mutual_initiators_both_complete_rounds_634` |
+
+The rows encode two invariants that hold by type, not by check:
+
+1. **A reply can never reach or build a responder.** `FROM_RESPONDER = 1` is
+   routed through `deliver_reply`, which only an initiator implements; the
+   responder factory is not on that path. Two nodes that each took the other's
+   stale reply for a round-open would otherwise answer each other forever.
+2. **A round-open can never reach an initiator.** An initiator has no standing
+   inbox — only a round inbox that exists while a round is driven and dies
+   with it (`end_round` / `abandon_round`) — so there is nothing for a peer's
+   `Summary` to queue into. The `initiators` table is not consulted for
+   `FROM_RESPONDER = 0` or legacy frames at all.
+
+Every row is counted where it lands: `replication_routed_to_responder_total`,
+`replication_routed_to_initiator_total`, `replication_reply_dropped_total` (the
+reason rides the throttled WARN), and `replication_inbound_backpressure_drops`
+now names the ROLE whose inbox was full. On a healthy mutual pair both
+`routed_to_*` climb on both nodes; `reply_dropped` climbing while
+`round_outcomes_total[completed]` does not is a peer answering too late.
+
+And one reliability fact this layer *does not* re-implement: every CRPL frame
+already rides leviculum's Channel (`send_on_link`: per-link sequence numbers,
+window, proof-acked retransmit). The round id and the direction are what no
+leviculum primitive gives an above-MDU, multi-frame exchange over a pool of
+links; see `FSD/REPLICATION_ROUND_CORRELATION.md` §2 for the primitives read
+at the pin and why request/response and Resource were not the answer.
 
 ### 5.5 The node transport identity (`#541`)
 

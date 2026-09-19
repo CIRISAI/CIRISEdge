@@ -855,11 +855,33 @@ pub struct EdgeMetrics {
     /// because the target coordinator's bounded inbound channel was full
     /// (`RegistryError::BackPressure`). Before this counter the drop was a bare
     /// `tracing::warn!` — 100% of a churning mobile's Attestation trace was
-    /// destroyed *silently*. A non-zero value means a responder reply stalled
-    /// long enough to park the inbound drain (pairs with #370: the round would
-    /// also show `timed_out`). Single `Arc<AtomicU64>`; the offending peer + kind
-    /// ride the matching throttled WARN.
+    /// destroyed *silently*. CIRISEdge#634: the WARN names the ROLE whose inbox
+    /// was full — a responder's means its driver stalled on a reply send long
+    /// enough to park the drain (pairs with #370: the round would also show
+    /// `timed_out`); an initiator's means replies outran the round being
+    /// driven. Pre-#634 every drop read as the former while most were a
+    /// peer's round-open queuing into an initiator nobody was draining.
+    /// Single `Arc<AtomicU64>`; the offending peer + kind + role ride the
+    /// matching throttled WARN.
     pub replication_inbound_backpressure_drops: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#634 — cumulative inbound CRPL frames routed to a RESPONDER
+    /// (the peer's round: an initiator-marked v3 frame or a legacy v1/v2 one).
+    /// Pairs with `replication_routed_to_initiator_total`: on a healthy mutual
+    /// pair BOTH climb; a node that only ever sees one side has the other
+    /// direction dark.
+    pub replication_routed_to_responder_total: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#634 — cumulative inbound CRPL replies routed into one of our
+    /// INITIATORS' round inboxes (a responder-marked v3 frame naming a round
+    /// we are driving).
+    pub replication_routed_to_initiator_total: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#634 — cumulative CRPL replies DROPPED at the registry because
+    /// they answered no round we are driving (`ReplyDropReason`: no initiator /
+    /// no round in flight / round mismatch). Pre-#634 these frames queued into
+    /// an initiator's channel and read as "a responder reply stalled". One per
+    /// timed-out round from a slow peer is the honest steady state; a value
+    /// climbing while `round_outcomes_total[completed]` does not is a peer
+    /// answering rounds too late to count.
+    pub replication_reply_dropped_total: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
     /// the live announce-intake map under **capacity backpressure** (the
     /// `MAX_PEERS` cap in `transport::reticulum`).
@@ -1096,6 +1118,36 @@ impl EdgeMetrics {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// CIRISEdge#634 — a frame was routed to a responder.
+    pub fn inc_routed_to_responder(&self) {
+        self.replication_routed_to_responder_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#634 — a reply was routed into an initiator's round inbox.
+    pub fn inc_routed_to_initiator(&self) {
+        self.replication_routed_to_initiator_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#634 — a reply answered no driven round and was dropped.
+    pub fn inc_reply_dropped(&self) {
+        self.replication_reply_dropped_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#634 — read the three route counters as
+    /// `(to_responder, to_initiator, reply_dropped)`.
+    #[must_use]
+    pub fn route_counters(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.replication_routed_to_responder_total.load(Relaxed),
+            self.replication_routed_to_initiator_total.load(Relaxed),
+            self.replication_reply_dropped_total.load(Relaxed),
+        )
+    }
+
     /// CIRISEdge#530 — increment the announce-intake pressure-eviction counter.
     /// Called once per evicted UNRETAINED binding at the `MAX_PEERS` cap, so the
     /// previously `debug!`-only eviction is countable in production.
@@ -1304,6 +1356,9 @@ impl EdgeMetrics {
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
+            replication_routed_to_responder_total: self.route_counters().0,
+            replication_routed_to_initiator_total: self.route_counters().1,
+            replication_reply_dropped_total: self.route_counters().2,
             announce_intake_evictions: self.announce_intake_evictions(),
             link_before_binding: self.link_before_binding(),
             announce_queue_drop_first_seen: self.announce_queue_drop_first_seen(),
@@ -1348,6 +1403,13 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#373 — cumulative inbound frames dropped on coordinator
     /// channel back-pressure (previously a silent WARN).
     pub replication_inbound_backpressure_drops: u64,
+    /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
+    pub replication_routed_to_responder_total: u64,
+    /// CIRISEdge#634 — replies routed into an initiator's round inbox.
+    pub replication_routed_to_initiator_total: u64,
+    /// CIRISEdge#634 — replies dropped at the registry: no round we are
+    /// driving answers to them.
+    pub replication_reply_dropped_total: u64,
     /// CIRISEdge#530 — cumulative UNRETAINED peer bindings evicted from the live
     /// announce-intake map under capacity backpressure. Zero on a node with room;
     /// climbing on one at cap. `Rooted` bindings are pinned and never counted.

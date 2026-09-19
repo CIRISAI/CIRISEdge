@@ -14,23 +14,26 @@
 //! are:
 //!
 //! - **Inbound** — [`Transport::listen`](crate::transport::Transport::listen)
-//!   delivers framed bytes; the listen loop calls
-//!   [`ReplicationCoordinator::parse_inbound_bytes`] (or the trichotomy
-//!   variant) and routes the [`ReplicationMessage`] to the matching
-//!   coordinator via [`ReplicationCoordinator::deliver_inbound`].
-//!   That works for BOTH the Initiator-side (mid-round replies) and
-//!   the Responder-side (round-starting Summary from a remote peer).
+//!   delivers framed bytes; the listen loop hands them to
+//!   `ReplicationRegistry::route_inbound_bytes`, which reads the frame's
+//!   v3 round metadata (CIRISEdge#634): a reply to a round WE opened goes
+//!   into that round's inbox on our Initiator (`deliver_reply`); the
+//!   peer's own round goes to the Responder for `(peer, kind)`
+//!   (`deliver_inbound_framed`), built on first contact. One frame can
+//!   never reach the wrong role.
 //!
 //! - **Outbound timer** — for each Initiator-side coordinator, a
 //!   tokio task fires `interval.tick()` at the configured cadence and
-//!   runs one round to completion (or timeout). That's this module.
+//!   runs one round to completion (or timeout). That's this module. Every
+//!   round is bracketed: opened by `drive_round_step(None)` (which mints
+//!   the round id and its inbox) and closed by [`finish_round`] on every
+//!   exit path — completed rounds `end_round`, everything else
+//!   `abandon_round` (inbox dropped, session reset).
 //!
-//! Responder-side rounds need no scheduler: the Responder's
-//! `drive_round_step` runs synchronously inside the listen loop's
-//! dispatch path, returning `SendThenWait { Summary, Diff }` which
-//! the listen loop sends via the coordinator's transport, then
-//! `Deliver` arrives on the inbound channel and the next
-//! `drive_round_step(Some(...))` finishes the round.
+//! Responder-side rounds need no scheduler: the runtime's
+//! `spawn_responder_drive` task drains the responder's inbox, steps the
+//! session (`drive_round_step_framed`, which rebinds and resets on a new
+//! round) and sends each reply stamped with the round it answers.
 //!
 //! ## Cancellation
 //!
@@ -681,8 +684,12 @@ async fn run_one_round(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,
 ) -> Result<DriveStep, RoundError> {
+    // `drive_round_step(None)` opens the round (mints its id, creates its
+    // inbox); `finish_round` closes it on every exit path (CIRISEdge#634).
     let first = coord.drive_round_step(None).await?;
-    drive_exchange_to_completion(coord, round_timeout, first).await
+    let outcome = drive_exchange_to_completion(coord, round_timeout, first).await;
+    finish_round(coord, &outcome).await;
+    outcome
 }
 
 /// Signer-key recovery: send ONE `Pull` and drive **only its reply** to
@@ -710,22 +717,48 @@ async fn run_one_recovery_round(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,
 ) -> Result<Option<DriveStep>, RoundError> {
-    let Some(signer) = coord
-        .send_recovery_pull()
-        .await
-        .map_err(RoundError::Coordinator)?
-    else {
-        return Ok(None);
+    // CIRISEdge#634 — the Pull is a round-open too: mint the round FIRST so
+    // the Pull is stamped with it and its Summary reply routes into this
+    // round's inbox rather than the on-demand one.
+    let round = coord.begin_round().await;
+    let signer = match coord.send_recovery_pull().await {
+        Ok(Some(signer)) => signer,
+        Ok(None) => {
+            coord.end_round().await;
+            return Ok(None);
+        }
+        Err(e) => {
+            coord.abandon_round().await;
+            return Err(RoundError::Coordinator(e));
+        }
     };
     tracing::debug!(
         signer = %signer,
+        round,
         "recovery round: asked this peer for its own Key (FSD-SIGNER-RECOVERY)"
     );
     // `SendThenWait(∅)`: send nothing, wait. The Pull is already on the wire and
     // this node must NOT put a Summary beside it.
-    drive_exchange_to_completion(coord, round_timeout, DriveStep::SendThenWait(Vec::new()))
-        .await
-        .map(Some)
+    let outcome =
+        drive_exchange_to_completion(coord, round_timeout, DriveStep::SendThenWait(Vec::new()))
+            .await;
+    finish_round(coord, &outcome).await;
+    outcome.map(Some)
+}
+
+/// Close the driven round after [`drive_exchange_to_completion`] returns
+/// (CIRISEdge#634 §5.1): a completed round is ended (its inbox dropped, the
+/// id cleared) and any other exit — timeout, closed inbox, transport error,
+/// a step that refused — is ABANDONED, which also resets the session so
+/// nothing of the dead round is inherited. Either way a late reply naming
+/// this round is dropped VISIBLY at the registry instead of parking in a
+/// channel nobody reads.
+async fn finish_round(coord: &ReplicationCoordinator, outcome: &Result<DriveStep, RoundError>) {
+    match outcome {
+        Ok(DriveStep::Complete(_)) => coord.end_round().await,
+        Ok(DriveStep::SendThenWait(_) | DriveStep::SendThenComplete(_, _) | DriveStep::Refused)
+        | Err(_) => coord.abandon_round().await,
+    }
 }
 
 /// The send-and-wait loop shared by both round types, given its first step.
@@ -1108,6 +1141,49 @@ mod tests {
 
     /// Cancellation: the scheduler exits cleanly when `cancel` flips
     /// to true.
+    /// CIRISEdge#634 §5.1 — a round that times out is ABANDONED: its inbox is
+    /// gone, its id cleared, its session reset. Nothing is parked for the next
+    /// round to mistake for its own reply.
+    #[tokio::test]
+    async fn a_timed_out_round_is_abandoned_not_parked() {
+        let (alice_to_bob_tx, mut alice_to_bob_rx) = tokio::sync::mpsc::unbounded_channel();
+        let alice_transport = Arc::new(InMemTransport {
+            peer_inbox: HashMap::from([("bob".to_string(), alice_to_bob_tx)]),
+        });
+        // Silent bob: swallow everything.
+        tokio::spawn(async move { while alice_to_bob_rx.recv().await.is_some() {} });
+        let provider = Arc::new(StaticProvider {
+            state: LocalState::new(),
+            envelopes: HashMap::new(),
+        });
+        let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
+        let coord = ReplicationCoordinator::new(
+            alice_transport,
+            "bob",
+            EnvelopeKind::Key,
+            SessionRole::Initiator,
+            provider,
+            applier,
+        );
+
+        let outcome = run_one_round(&coord, Duration::from_millis(50)).await;
+        assert!(matches!(outcome, Err(RoundError::Timeout)), "{outcome:?}");
+        assert_eq!(coord.current_round(), 0, "the dead round's id is cleared");
+        assert_eq!(coord.inbound_depth(), 0, "no inbox survives the round");
+        assert!(
+            !coord.is_round_in_flight(),
+            "a late reply now finds no round and is dropped at the registry"
+        );
+
+        // The next round is a fresh one — its own id, its own inbox.
+        let first = coord.drive_round_step(None).await.unwrap();
+        assert!(matches!(first, DriveStep::SendThenWait(_)));
+        let fresh = coord.current_round();
+        assert_ne!(fresh, 0);
+        coord.abandon_round().await;
+        assert_eq!(coord.current_round(), 0);
+    }
+
     #[tokio::test]
     async fn scheduler_exits_on_cancel() {
         let sched = ReplicationScheduler::new(fast_config());

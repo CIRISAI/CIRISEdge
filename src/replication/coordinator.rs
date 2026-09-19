@@ -38,8 +38,10 @@
 //!   per-medium port mapping) and hands them to
 //!   [`ReplicationCoordinator::feed_inbound_bytes`].
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 
 use crate::transport::{Transport, TransportError};
@@ -47,6 +49,62 @@ use crate::transport::{Transport, TransportError};
 use super::protocol::{EnvelopeKind, FetchMessage, ProtocolError, PullMessage, ReplicationMessage};
 use super::session::{ReplicationOutcome, Session, SessionRole};
 use super::summary::{StalenessSignal, StateApplier, StateProvider};
+use super::wire_frame::{RoundMeta, RoundSide};
+
+/// An inbound replication message together with the round metadata its
+/// frame carried (`None` for a LEGACY v1/v2 frame from a pre-v26 peer).
+/// The responder's inbox carries these so its reply can echo the round
+/// (CIRISEdge#634, `FSD/REPLICATION_ROUND_CORRELATION.md` §5.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inbound {
+    pub msg: ReplicationMessage,
+    pub meta: Option<RoundMeta>,
+}
+
+/// Why an initiator refused a reply frame handed to it by the registry.
+/// Every variant is a VISIBLE drop: counted and logged at the route
+/// choke, never queued (CIRISEdge#634 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyRefusal {
+    /// The coordinator is a responder; replies never go to responders.
+    WrongRole,
+    /// No driven round and no on-demand pull is in flight — the round this
+    /// answers ended (completed or timed out) before the reply arrived.
+    NoRoundInFlight,
+    /// A round is in flight but the reply names a different one.
+    RoundMismatch { expected: u64, got: u64 },
+    /// The round's inbox is full.
+    BackPressure,
+}
+
+/// The role-specific inbox. The type encodes the #634 invariant: an
+/// initiator has NO standing inbox that a peer's round-open could queue
+/// into; it has a round inbox that exists exactly while a round is driven,
+/// plus a bounded on-demand inbox for `Pull` replies.
+enum RoleInbox {
+    Initiator {
+        /// The driven round's id; 0 = idle.
+        current_round: AtomicU64,
+        /// Sender for the driven round's inbox — `Some` only while a round
+        /// is in flight. A `std` mutex: the critical section is a clone.
+        round_tx: std::sync::Mutex<Option<mpsc::Sender<ReplicationMessage>>>,
+        /// Receiver for the driven round's inbox; the driver holds the lock
+        /// for the round.
+        round_rx: Mutex<Option<mpsc::Receiver<ReplicationMessage>>>,
+        /// The on-demand pull round's id (#462 / #474); 0 = none minted.
+        pull_round: AtomicU64,
+        on_demand_tx: mpsc::Sender<ReplicationMessage>,
+        on_demand_rx: Mutex<mpsc::Receiver<ReplicationMessage>>,
+    },
+    Responder {
+        /// The standing inbox the responder driver drains continuously.
+        inbound_tx: mpsc::Sender<Inbound>,
+        inbound_rx: Mutex<mpsc::Receiver<Inbound>>,
+        /// The round this responder is currently answering (0 = unbound /
+        /// legacy). Set when a framed message is stepped; replies echo it.
+        bound_round: AtomicU64,
+    },
+}
 
 /// What an anti-entropy round produced. Surfaced to the application's
 /// metrics + τ_partial signal pipelines.
@@ -127,16 +185,11 @@ pub struct ReplicationCoordinator {
     /// tasks; the mutex serializes them — anti-entropy is sequential
     /// per peer-pair by protocol).
     session: Mutex<Session>,
-    /// Sender half of the inbound-message channel. The application's
-    /// [`Transport::listen`] loop calls
-    /// [`Self::deliver_inbound`] which routes here; the
-    /// [`super::scheduler::ReplicationScheduler`] reads the other
-    /// end via [`Self::recv_inbound`] to step a round between
-    /// `SendThenWait` and the next inbound. Bounded capacity 8 —
-    /// enough to absorb the few in-flight Summary / Diff / Deliver
-    /// messages without blocking the listen loop on a slow round.
-    inbound_tx: tokio::sync::mpsc::Sender<ReplicationMessage>,
-    inbound_rx: Mutex<tokio::sync::mpsc::Receiver<ReplicationMessage>>,
+    /// CIRISEdge#634 — the role-specific inbox. A responder has a standing
+    /// bounded inbox its driver drains continuously; an initiator has a
+    /// round inbox that lives exactly as long as the driven round, plus an
+    /// on-demand inbox for `Pull` replies. See [`RoleInbox`].
+    inbox: RoleInbox,
 }
 
 impl ReplicationCoordinator {
@@ -153,7 +206,27 @@ impl ReplicationCoordinator {
         provider: Arc<dyn StateProvider>,
         applier: Arc<dyn StateApplier>,
     ) -> Self {
-        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(Self::INBOUND_CHANNEL_CAPACITY);
+        let inbox = match role {
+            SessionRole::Initiator => {
+                let (on_demand_tx, on_demand_rx) = mpsc::channel(Self::INBOUND_CHANNEL_CAPACITY);
+                RoleInbox::Initiator {
+                    current_round: AtomicU64::new(0),
+                    round_tx: std::sync::Mutex::new(None),
+                    round_rx: Mutex::new(None),
+                    pull_round: AtomicU64::new(0),
+                    on_demand_tx,
+                    on_demand_rx: Mutex::new(on_demand_rx),
+                }
+            }
+            SessionRole::Responder => {
+                let (inbound_tx, inbound_rx) = mpsc::channel(Self::INBOUND_CHANNEL_CAPACITY);
+                RoleInbox::Responder {
+                    inbound_tx,
+                    inbound_rx: Mutex::new(inbound_rx),
+                    bound_round: AtomicU64::new(0),
+                }
+            }
+        };
         Self {
             metrics: None,
             transport,
@@ -163,8 +236,18 @@ impl ReplicationCoordinator {
             provider,
             applier,
             session: Mutex::new(Session::new(role, kind)),
-            inbound_tx,
-            inbound_rx: Mutex::new(inbound_rx),
+            inbox,
+        }
+    }
+
+    /// Mint a round id: random, never zero (CIRISEdge#634 §3).
+    fn mint_round_id() -> u64 {
+        use rand::RngCore;
+        loop {
+            let r = rand::rngs::OsRng.next_u64();
+            if r != 0 {
+                return r;
+            }
         }
     }
 
@@ -179,27 +262,283 @@ impl ReplicationCoordinator {
         Self { session, ..self }
     }
 
-    /// Deliver an inbound replication message into this coordinator's
-    /// queue. Called by the application's [`Transport::listen`] loop
-    /// after [`Self::parse_inbound_bytes`] yields a
-    /// [`ReplicationMessage`].
+    /// Deliver a LEGACY-shaped inbound message (no round metadata).
     ///
-    /// Returns `Err(NoRoundInProgress)` if the inbound channel is full
-    /// (the scheduler isn't keeping up; back-pressure surfaces). The
-    /// listen loop typically logs + drops the frame.
+    /// - Responder: queued into the standing inbox as a legacy frame; the
+    ///   reply goes out on the v1/v2 raw path.
+    /// - Initiator: accepted only into the DRIVEN round's inbox (a test /
+    ///   in-process harness stepping both sides by hand); a peer's frame
+    ///   never reaches an initiator this way — the registry routes replies
+    ///   through [`Self::deliver_reply`] and everything else to a responder.
+    ///
+    /// Returns `Err(NoRoundInProgress)` when the inbox is full, or when an
+    /// initiator has no round in flight.
     pub fn deliver_inbound(&self, msg: ReplicationMessage) -> Result<(), CoordinatorError> {
-        self.inbound_tx
-            .try_send(msg)
-            .map_err(|_| CoordinatorError::NoRoundInProgress)
+        match &self.inbox {
+            RoleInbox::Responder { inbound_tx, .. } => inbound_tx
+                .try_send(Inbound { msg, meta: None })
+                .map_err(|_| CoordinatorError::NoRoundInProgress),
+            RoleInbox::Initiator { round_tx, .. } => {
+                let tx = round_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let Some(tx) = tx else {
+                    return Err(CoordinatorError::NoRoundInProgress);
+                };
+                tx.try_send(msg)
+                    .map_err(|_| CoordinatorError::NoRoundInProgress)
+            }
+        }
     }
 
-    /// Wait for the next inbound replication message from the
-    /// listen-loop-fed queue. Returns `None` if the channel is
-    /// permanently closed (the coordinator is being dropped). The
-    /// scheduler awaits on this between `SendThenWait` and the
-    /// next round step.
+    /// Deliver an inbound message WITH its frame's round metadata into a
+    /// RESPONDER's standing inbox (CIRISEdge#634). The registry calls this
+    /// for every initiator-marked (`FROM_RESPONDER = 0`) or legacy frame.
+    ///
+    /// # Errors
+    ///
+    /// `NoRoundInProgress` when the inbox is full (back-pressure) or when
+    /// called on an initiator — an initiator is never handed a round-open.
+    pub fn deliver_inbound_framed(
+        &self,
+        msg: ReplicationMessage,
+        meta: Option<RoundMeta>,
+    ) -> Result<(), CoordinatorError> {
+        match &self.inbox {
+            RoleInbox::Responder { inbound_tx, .. } => inbound_tx
+                .try_send(Inbound { msg, meta })
+                .map_err(|_| CoordinatorError::NoRoundInProgress),
+            RoleInbox::Initiator { .. } => Err(CoordinatorError::NoRoundInProgress),
+        }
+    }
+
+    /// Deliver a REPLY (`FROM_RESPONDER = 1`) to this initiator: into the
+    /// driven round's inbox when `round` is the driven round, into the
+    /// on-demand inbox when it is the pull round, refused otherwise.
+    /// Every refusal is a visible drop at the registry (CIRISEdge#634 §4).
+    ///
+    /// # Errors
+    ///
+    /// [`ReplyRefusal`] — see its variants.
+    pub fn deliver_reply(&self, msg: ReplicationMessage, round: u64) -> Result<(), ReplyRefusal> {
+        let RoleInbox::Initiator {
+            current_round,
+            round_tx,
+            pull_round,
+            on_demand_tx,
+            ..
+        } = &self.inbox
+        else {
+            return Err(ReplyRefusal::WrongRole);
+        };
+        let current = current_round.load(Ordering::Acquire);
+        let pull = pull_round.load(Ordering::Acquire);
+        if current != 0 && round == current {
+            let tx = round_tx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            // `current_round` is set after `round_tx`, and cleared before it,
+            // so a live `current` always finds its sender.
+            let Some(tx) = tx else {
+                return Err(ReplyRefusal::NoRoundInFlight);
+            };
+            return tx.try_send(msg).map_err(|_| ReplyRefusal::BackPressure);
+        }
+        if pull != 0 && round == pull {
+            return on_demand_tx
+                .try_send(msg)
+                .map_err(|_| ReplyRefusal::BackPressure);
+        }
+        if current == 0 && pull == 0 {
+            return Err(ReplyRefusal::NoRoundInFlight);
+        }
+        Err(ReplyRefusal::RoundMismatch {
+            expected: if current != 0 { current } else { pull },
+            got: round,
+        })
+    }
+
+    /// Wait for the next inbound replication message.
+    ///
+    /// - Responder: pops the standing inbox and remembers the frame's round
+    ///   so the reply echoes it ([`Self::send_message`]).
+    /// - Initiator: `select!`s over the driven round's inbox and the
+    ///   on-demand inbox. With no round in flight only the on-demand inbox
+    ///   is polled.
+    ///
+    /// Returns `None` when the inbox is permanently closed (the coordinator
+    /// is being dropped) or, for an initiator, when the driven round was
+    /// abandoned under the driver.
     pub async fn recv_inbound(&self) -> Option<ReplicationMessage> {
-        self.inbound_rx.lock().await.recv().await
+        match &self.inbox {
+            RoleInbox::Responder { .. } => self.recv_inbound_framed().await.map(|i| i.msg),
+            RoleInbox::Initiator {
+                round_rx,
+                on_demand_rx,
+                ..
+            } => {
+                let mut round_guard = round_rx.lock().await;
+                let mut on_demand = on_demand_rx.lock().await;
+                match round_guard.as_mut() {
+                    Some(rx) => tokio::select! {
+                        biased;
+                        m = rx.recv() => m,
+                        m = on_demand.recv() => m,
+                    },
+                    None => on_demand.recv().await,
+                }
+            }
+        }
+    }
+
+    /// Responder only: pop the next inbound WITH its round metadata. The
+    /// binding to that round happens in [`Self::drive_round_step_framed`],
+    /// which is where a NEW round is told apart from the bound one. Returns
+    /// `None` when the inbox is closed, or on an initiator.
+    pub async fn recv_inbound_framed(&self) -> Option<Inbound> {
+        let RoleInbox::Responder { inbound_rx, .. } = &self.inbox else {
+            return None;
+        };
+        inbound_rx.lock().await.recv().await
+    }
+
+    /// How many messages sit unread in this coordinator's inboxes. For an
+    /// initiator that is the driven round's inbox (if any) plus the on-demand
+    /// inbox — the #634 acceptance test asserts it stays 0 while a peer's
+    /// round-open is routed past it.
+    #[must_use]
+    pub fn inbound_depth(&self) -> usize {
+        fn depth<T>(tx: &mpsc::Sender<T>) -> usize {
+            tx.max_capacity().saturating_sub(tx.capacity())
+        }
+        match &self.inbox {
+            RoleInbox::Responder { inbound_tx, .. } => depth(inbound_tx),
+            RoleInbox::Initiator {
+                round_tx,
+                on_demand_tx,
+                ..
+            } => {
+                let round = round_tx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+                    .map_or(0, depth);
+                round + depth(on_demand_tx)
+            }
+        }
+    }
+
+    /// The driven round's id (0 = idle). Initiator only; a responder reports
+    /// the round it is currently bound to.
+    #[must_use]
+    pub fn current_round(&self) -> u64 {
+        match &self.inbox {
+            RoleInbox::Initiator { current_round, .. } => current_round.load(Ordering::Acquire),
+            RoleInbox::Responder { bound_round, .. } => bound_round.load(Ordering::Acquire),
+        }
+    }
+
+    /// The on-demand pull round's id (0 = none). Initiator only.
+    #[must_use]
+    pub fn pull_round(&self) -> u64 {
+        match &self.inbox {
+            RoleInbox::Initiator { pull_round, .. } => pull_round.load(Ordering::Acquire),
+            RoleInbox::Responder { .. } => 0,
+        }
+    }
+
+    /// Whether a driven round is in flight (initiator only).
+    #[must_use]
+    pub fn is_round_in_flight(&self) -> bool {
+        matches!(&self.inbox, RoleInbox::Initiator { .. }) && self.current_round() != 0
+    }
+
+    /// Open a driven round (CIRISEdge#634 §5.1): mint its id and create its
+    /// inbox. Idempotent while a round is in flight — returns the live id.
+    /// The scheduler brackets every round with this and
+    /// [`Self::end_round`] / [`Self::abandon_round`];
+    /// [`Self::drive_round_step`]`(None)` calls it too, so a harness that
+    /// steps by hand needs no bracket.
+    pub async fn begin_round(&self) -> u64 {
+        let RoleInbox::Initiator {
+            current_round,
+            round_tx,
+            round_rx,
+            ..
+        } = &self.inbox
+        else {
+            return 0;
+        };
+        let live = current_round.load(Ordering::Acquire);
+        if live != 0 {
+            return live;
+        }
+        let (tx, rx) = mpsc::channel(Self::INBOUND_CHANNEL_CAPACITY);
+        // Receiver first, then sender, then the id: `deliver_reply` reads the
+        // id before it clones the sender, so a live id always finds one.
+        *round_rx.lock().await = Some(rx);
+        *round_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+        let id = Self::mint_round_id();
+        current_round.store(id, Ordering::Release);
+        id
+    }
+
+    /// Close the driven round: clear the id, then drop its inbox (a late
+    /// reply now finds no round and is dropped VISIBLY at the registry).
+    pub async fn end_round(&self) {
+        let RoleInbox::Initiator {
+            current_round,
+            round_tx,
+            round_rx,
+            ..
+        } = &self.inbox
+        else {
+            return;
+        };
+        current_round.store(0, Ordering::Release);
+        *round_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *round_rx.lock().await = None;
+    }
+
+    /// Abandon the driven round after a timeout / closed inbox / send error:
+    /// [`Self::end_round`] plus a session reset, so nothing of the dead round
+    /// — not its inbox, not `last_summary_sent`, not the expectation window —
+    /// is inherited by the next one (CIRISEdge#634 §5.1).
+    pub async fn abandon_round(&self) {
+        self.end_round().await;
+        self.session.lock().await.reset();
+    }
+
+    /// The pull round's id, minting one when none is live and no driven
+    /// round is in flight (the driven round's id is used instead while one
+    /// is). Called by the on-demand senders so their reply has a round to
+    /// route by.
+    fn on_demand_round(&self) -> u64 {
+        let RoleInbox::Initiator {
+            current_round,
+            pull_round,
+            ..
+        } = &self.inbox
+        else {
+            return 0;
+        };
+        let live = current_round.load(Ordering::Acquire);
+        if live != 0 {
+            return live;
+        }
+        let pull = pull_round.load(Ordering::Acquire);
+        if pull != 0 {
+            return pull;
+        }
+        let id = Self::mint_round_id();
+        pull_round.store(id, Ordering::Release);
+        id
     }
 
     /// Step the held [`Session`] one transition forward.
@@ -223,15 +562,58 @@ impl ReplicationCoordinator {
         &self,
         msg: Option<ReplicationMessage>,
     ) -> Result<DriveStep, CoordinatorError> {
+        self.drive_round_step_framed(msg.map(|msg| Inbound { msg, meta: None }))
+            .await
+    }
+
+    /// [`Self::drive_round_step`] with the inbound frame's round metadata
+    /// (CIRISEdge#634). On a responder, a message from a NEW round — a v3
+    /// round id different from the bound one, or a legacy `Summary`, which
+    /// is always a round-open — resets the session first: a responder never
+    /// inherits a stuck round (§5.2). On an initiator, `None` opens the
+    /// driven round ([`Self::begin_round`]) and a completing step closes it.
+    ///
+    /// # Errors
+    ///
+    /// Never today; the `Result` is the API's room for a transport-bound
+    /// step.
+    pub async fn drive_round_step_framed(
+        &self,
+        inbound: Option<Inbound>,
+    ) -> Result<DriveStep, CoordinatorError> {
         let mut session = self.session.lock().await;
-        let outcome = match msg {
-            None => session.start_round(self.provider.as_ref()),
-            Some(m) => {
-                // CIRISEdge#441 — a peer's Summary on a removal-class kind is
-                // its own statement of holdings: fold every advertised hash
-                // into the removal-receipt ledger as an ACK before the session
-                // consumes the message. Zero new wire; the pull plane's
-                // missing arrival instrument.
+        let outcome = match inbound {
+            None => {
+                // A round left open (a by-hand harness with no scheduler
+                // bracket, or a driver that died mid-round) is CLOSED, never
+                // reused: its id must not be answerable by a late reply.
+                if self.is_round_in_flight() {
+                    self.end_round().await;
+                }
+                self.begin_round().await;
+                session.start_round(self.provider.as_ref())
+            }
+            Some(Inbound { msg: m, meta }) => {
+                if let RoleInbox::Responder { bound_round, .. } = &self.inbox {
+                    let incoming = meta.map_or(0, |r| r.round);
+                    let bound = bound_round.load(Ordering::Acquire);
+                    let legacy_open = incoming == 0 && matches!(m, ReplicationMessage::Summary(_));
+                    let new_round = incoming != 0 && incoming != bound;
+                    if new_round || legacy_open {
+                        if bound != 0 || !session.is_fresh() {
+                            tracing::debug!(
+                                peer = %self.peer_key_id,
+                                kind = ?self.kind,
+                                prior_round = bound,
+                                round = incoming,
+                                "responder rebinding to a new round — prior round state dropped, \
+                                 not inherited (CIRISEdge#634)"
+                            );
+                        }
+                        session.reset();
+                        bound_round.store(incoming, Ordering::Release);
+                    }
+                }
                 if let (Some(metrics), ReplicationMessage::Summary(sm)) = (&self.metrics, &m) {
                     if crate::replication::bridge::is_removal_kind(sm.kind) {
                         let hashes: Vec<[u8; 32]> =
@@ -244,11 +626,6 @@ impl ReplicationCoordinator {
                         );
                     }
                 }
-                // CIRISEdge#426 — this coordinator IS per-peer, so its `peer_key_id`
-                // is the authenticated sender of anything it applies this round.
-                // Forward it so the apply path can make a per-peer receive decision.
-                // CIRISEdge#370 — no applier lock: `apply_envelope` is `&self`;
-                // another peer's round can apply concurrently with this one.
                 session.on_message(
                     m,
                     self.provider.as_ref(),
@@ -258,16 +635,19 @@ impl ReplicationCoordinator {
             }
         };
         let step = Self::outcome_to_step(outcome);
-        // Auto-reset on round completion so the next call can drive
-        // a fresh round without the caller threading state.
-        // (#380: `reset` preserves the cross-round knowledge — the peer's
-        // last Summary + the proactive-push ledger — so an initiator-final
-        // session keeps completing instead of re-blasting.)
-        if matches!(
-            step,
-            DriveStep::Complete(_) | DriveStep::SendThenComplete(_, _)
-        ) {
-            session.reset();
+        match step {
+            // Nothing left to send: the round is over here and now.
+            DriveStep::Complete(_) => {
+                session.reset();
+                self.end_round().await;
+            }
+            // The final sends still need the round's id on their frames (a
+            // responder echoes its bound round; an initiator stamps the
+            // driven round). The driver sends them and then closes the round
+            // — the scheduler via `end_round`, a responder by rebinding on
+            // its next inbound.
+            DriveStep::SendThenComplete(_, _) => session.reset(),
+            DriveStep::SendThenWait(_) | DriveStep::Refused => {}
         }
         Ok(step)
     }
@@ -343,6 +723,21 @@ impl ReplicationCoordinator {
             // have DISGUISED unknown staleness as a cleanly completed round had
             // anything ever produced it. Deleted; `Applied` and
             // `SendAndComplete` are the only completion outcomes.)
+            ReplicationOutcome::SendThenApplied {
+                msgs,
+                kind,
+                admitted,
+                refused,
+                staleness,
+            } => DriveStep::SendThenComplete(
+                msgs,
+                RoundReport {
+                    kind,
+                    admitted,
+                    refused,
+                    staleness,
+                },
+            ),
             ReplicationOutcome::UnexpectedMessage => DriveStep::Refused,
         }
     }
@@ -356,12 +751,22 @@ impl ReplicationCoordinator {
     /// loop route inbound bytes to the replication path without
     /// parsing every byte as every possible payload kind.
     pub async fn send_message(&self, msg: &ReplicationMessage) -> Result<(), CoordinatorError> {
-        // v2.0.0 (FSD §3.7) — pick the wire version automatically from
-        // the message's EnvelopeKind. v1 trust kinds emit at 0x01; v2
-        // operational kinds emit at 0x02. The receiver's try_unwrap
-        // accepts both, so v2-capable peers exchange both versions and
-        // v1-only peers reject 0x02 frames at UnknownVersion (FSD §3.5).
-        let bytes = super::wire_frame::wrap_for_kind(msg);
+        // CIRISEdge#634 — every frame an INITIATOR sends is v3, stamped with
+        // the round it belongs to (the driven round, else the pull round,
+        // minted on demand): its reply must route by that id, and a legacy
+        // reply would route to OUR responder. A RESPONDER echoes the round
+        // it is bound to; unbound (a pre-v26 initiator's legacy round) it
+        // answers on the v1/v2 raw path exactly as before — the wire version
+        // then follows the message's EnvelopeKind (FSD §3.7).
+        let bytes = match &self.inbox {
+            RoleInbox::Initiator { .. } => {
+                super::wire_frame::wrap_v3(msg, RoundSide::Initiator, self.on_demand_round())
+            }
+            RoleInbox::Responder { bound_round, .. } => match bound_round.load(Ordering::Acquire) {
+                0 => super::wire_frame::wrap_for_kind(msg),
+                round => super::wire_frame::wrap_v3(msg, RoundSide::Responder, round),
+            },
+        };
         self.transport
             .send(&self.peer_key_id, &bytes)
             .await
@@ -1507,5 +1912,255 @@ mod tests {
             "both peers' applies were inside the store simultaneously — \
              the shared applier imposes no serialization of its own (#370)"
         );
+    }
+
+    // ── CIRISEdge#634 — round stamping and the responder's rebinding ─────
+    mod round_stamping_634 {
+        use super::*;
+        use crate::replication::wire_frame::{self, RoundSide};
+
+        fn empty_pair() -> (
+            Arc<InMemTransport>,
+            Arc<InMemTransport>,
+            Arc<StaticProvider>,
+            Arc<dyn StateApplier>,
+        ) {
+            let (a, b) = alice_bob_transports();
+            let provider = Arc::new(StaticProvider {
+                state: LocalState::new(),
+                envelopes: HashMap::new(),
+            });
+            let applier =
+                RecordingApplier::with(HashMap::new(), std::collections::HashSet::default());
+            (Arc::new(a), Arc::new(b), provider, applier)
+        }
+
+        async fn next_frame(t: &InMemTransport) -> wire_frame::Framed {
+            let bytes = t.my_inbox.lock().await.recv().await.expect("frame");
+            wire_frame::try_unwrap_framed(&bytes).unwrap().unwrap()
+        }
+
+        /// An initiator's every send is v3, stamped with the driven round.
+        #[tokio::test]
+        async fn an_initiator_stamps_its_round_on_every_frame() {
+            let (alice_t, bob_t, provider, applier) = empty_pair();
+            let alice = ReplicationCoordinator::new(
+                alice_t.clone(),
+                "bob",
+                EnvelopeKind::Key,
+                SessionRole::Initiator,
+                provider,
+                applier,
+            );
+            assert_eq!(alice.current_round(), 0);
+            let step = alice.drive_round_step(None).await.unwrap();
+            let round = alice.current_round();
+            assert_ne!(round, 0, "drive_round_step(None) opens the round");
+            let DriveStep::SendThenWait(msgs) = step else {
+                panic!("{step:?}")
+            };
+            for m in &msgs {
+                alice.send_message(m).await.unwrap();
+            }
+            let framed = next_frame(&bob_t).await;
+            assert_eq!(
+                framed.meta,
+                Some(wire_frame::RoundMeta {
+                    from: RoundSide::Initiator,
+                    round
+                })
+            );
+            alice.end_round().await;
+            assert_eq!(alice.current_round(), 0);
+            assert_eq!(alice.inbound_depth(), 0);
+        }
+
+        /// A responder echoes the round of the frame it is answering, and
+        /// answers a LEGACY frame with a legacy frame.
+        #[tokio::test]
+        async fn a_responder_echoes_the_round_or_goes_legacy() {
+            let (alice_t, bob_t, provider, applier) = empty_pair();
+            let bob = ReplicationCoordinator::new(
+                bob_t.clone(),
+                "alice",
+                EnvelopeKind::Key,
+                SessionRole::Responder,
+                provider,
+                applier,
+            );
+            let open = ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            });
+
+            // v3 round-open → v3 replies echoing the round.
+            bob.deliver_inbound_framed(
+                open.clone(),
+                Some(wire_frame::RoundMeta {
+                    from: RoundSide::Initiator,
+                    round: 4242,
+                }),
+            )
+            .unwrap();
+            let inbound = bob.recv_inbound_framed().await.unwrap();
+            let DriveStep::SendThenWait(msgs) =
+                bob.drive_round_step_framed(Some(inbound)).await.unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(msgs.len(), 2, "Summary_R + Diff_R");
+            for m in &msgs {
+                bob.send_message(m).await.unwrap();
+            }
+            for _ in 0..2 {
+                let f = next_frame(&alice_t).await;
+                assert_eq!(
+                    f.meta,
+                    Some(wire_frame::RoundMeta {
+                        from: RoundSide::Responder,
+                        round: 4242
+                    })
+                );
+            }
+
+            // Legacy round-open → legacy replies (a pre-v26 initiator reads
+            // its channel exactly as before).
+            bob.deliver_inbound(open).unwrap();
+            let inbound = bob.recv_inbound_framed().await.unwrap();
+            assert_eq!(inbound.meta, None);
+            let DriveStep::SendThenWait(msgs) =
+                bob.drive_round_step_framed(Some(inbound)).await.unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(
+                msgs.len(),
+                2,
+                "the legacy open RESET the session: Summary_R again"
+            );
+            for m in &msgs {
+                bob.send_message(m).await.unwrap();
+            }
+            for _ in 0..2 {
+                assert_eq!(next_frame(&alice_t).await.meta, None);
+            }
+        }
+
+        /// A responder whose initiator vanished mid-round (no Deliver_I ever
+        /// came) answers the NEXT round with a full Summary_R — it never
+        /// inherits the stuck `last_summary_sent`.
+        #[tokio::test]
+        async fn a_responder_never_inherits_a_stuck_round() {
+            let (_alice_t, bob_t, provider, applier) = empty_pair();
+            let bob = ReplicationCoordinator::new(
+                bob_t.clone(),
+                "alice",
+                EnvelopeKind::Key,
+                SessionRole::Responder,
+                provider,
+                applier,
+            );
+            let open = |round| {
+                Some(wire_frame::RoundMeta {
+                    from: RoundSide::Initiator,
+                    round,
+                })
+            };
+            let summary = ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            });
+            // Round 1 opens, bob replies; the initiator then dies (no Diff, no Deliver).
+            bob.deliver_inbound_framed(summary.clone(), open(1))
+                .unwrap();
+            let i = bob.recv_inbound_framed().await.unwrap();
+            let DriveStep::SendThenWait(first) =
+                bob.drive_round_step_framed(Some(i)).await.unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(first.len(), 2);
+            assert_eq!(bob.current_round(), 1);
+
+            // Round 2 opens. Pre-#634 the stuck `last_summary_sent` suppressed
+            // Summary_R and the initiator got a Diff only — one wasted round.
+            bob.deliver_inbound_framed(summary, open(2)).unwrap();
+            let i = bob.recv_inbound_framed().await.unwrap();
+            let DriveStep::SendThenWait(second) =
+                bob.drive_round_step_framed(Some(i)).await.unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(
+                second.len(),
+                2,
+                "Summary_R + Diff_R again: nothing inherited"
+            );
+            assert!(matches!(second[0], ReplicationMessage::Summary(_)));
+            assert_eq!(bob.current_round(), 2);
+        }
+
+        /// `abandon_round` drops the inbox and resets the session; a reply to
+        /// the dead round is then refused, not parked.
+        #[tokio::test]
+        async fn abandon_round_leaves_nothing_for_a_late_reply_to_land_in() {
+            let (alice_t, _bob_t, provider, applier) = empty_pair();
+            let alice = ReplicationCoordinator::new(
+                alice_t,
+                "bob",
+                EnvelopeKind::Key,
+                SessionRole::Initiator,
+                provider,
+                applier,
+            );
+            let round = alice.begin_round().await;
+            let msg = ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            });
+            alice.deliver_reply(msg.clone(), round).unwrap();
+            assert_eq!(alice.inbound_depth(), 1);
+            alice.abandon_round().await;
+            assert_eq!(alice.current_round(), 0);
+            assert_eq!(
+                alice.inbound_depth(),
+                0,
+                "the parked reply died with the round"
+            );
+            assert_eq!(
+                alice.deliver_reply(msg, round),
+                Err(ReplyRefusal::NoRoundInFlight)
+            );
+            assert!(alice.session.lock().await.is_fresh());
+        }
+
+        /// The round id is never reused: opening after an un-closed round
+        /// mints a fresh one, and the old id is refused.
+        #[tokio::test]
+        async fn a_reopened_round_gets_a_fresh_id() {
+            let (alice_t, _bob_t, provider, applier) = empty_pair();
+            let alice = ReplicationCoordinator::new(
+                alice_t,
+                "bob",
+                EnvelopeKind::Key,
+                SessionRole::Initiator,
+                provider,
+                applier,
+            );
+            alice.drive_round_step(None).await.unwrap();
+            let first = alice.current_round();
+            alice.drive_round_step(None).await.unwrap();
+            let second = alice.current_round();
+            assert_ne!(first, 0);
+            assert_ne!(first, second);
+            let msg = ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            });
+            assert!(matches!(
+                alice.deliver_reply(msg, first),
+                Err(ReplyRefusal::RoundMismatch { .. })
+            ));
+        }
     }
 }

@@ -4899,6 +4899,19 @@ fn inbound_backpressure_drop_log() -> &'static crate::log_throttle::LogThrottle 
     })
 }
 
+static INBOUND_REPLY_DROPPED_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#634 — a reply frame answered no round this node is driving and was
+/// dropped at the registry. Keyed on peer key_id (attacker-influenceable ⇒
+/// capped map); one late reply per timed-out round is the honest steady state
+/// of a slow peer, so the WARN is throttled and the counter carries the count.
+fn inbound_reply_dropped_log() -> &'static crate::log_throttle::LogThrottle {
+    INBOUND_REPLY_DROPPED_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 256)
+    })
+}
+
 /// A frame CROSSED transport→replication ingest. Keyed on transport id (a handful
 /// of values). Makes the previously-invisible hop VISIBLE at `ciris_edge=debug`.
 fn inbound_ingest_log() -> &'static crate::log_throttle::LogThrottle {
@@ -5022,6 +5035,34 @@ async fn route_replication_frame(
 /// "frame consumed?" bool. Extracted so the ingest fn stays within clippy's line
 /// budget; the attribution decision (incl. the CIRISEdge#402 bootstrap carve-out)
 /// is resolved by the caller, so `source` here is always a vetted attribution.
+/// CIRISEdge#634 — a reply to a round we are not driving. Consumed here,
+/// visibly: counted, named, never queued anywhere. Pre-#634 this frame sat in
+/// an initiator's channel and read as "a responder reply stalled".
+fn note_reply_dropped(
+    source: &str,
+    kind: crate::replication::EnvelopeKind,
+    round: u64,
+    reason: crate::replication::registry::ReplyDropReason,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+) {
+    use crate::log_throttle::ThrottleDecision;
+    if let Some(m) = metrics {
+        m.inc_reply_dropped();
+    }
+    if let ThrottleDecision::Emit { suppressed_prev } = inbound_reply_dropped_log().check(source) {
+        tracing::warn!(
+            peer = %source,
+            ?kind,
+            round,
+            reason = reason.as_str(),
+            detail = ?reason,
+            suppressed_prev,
+            "CRPL reply DROPPED — answers no round this node is driving; counted in \
+             EdgeMetrics.replication_reply_dropped_total (CIRISEdge#634)"
+        );
+    }
+}
+
 async fn route_attributed_frame(
     registry: &std::sync::Arc<crate::replication::registry::ReplicationRegistry>,
     source: &str,
@@ -5034,14 +5075,43 @@ async fn route_attributed_frame(
         .route_inbound_bytes(source, &frame.envelope_bytes)
         .await
     {
-        Ok(RouteOutcome::Routed) => {
+        Ok(RouteOutcome::RoutedToResponder { kind, built }) => {
+            if let Some(m) = metrics {
+                m.inc_routed_to_responder();
+            }
             if let ThrottleDecision::Emit { suppressed_prev } = inbound_routed_log().check(source) {
                 tracing::debug!(
                     peer = %source,
+                    ?kind,
+                    built,
                     suppressed_prev,
-                    "CRPL frame ROUTED to replication responder (CIRISEdge#348)"
+                    "CRPL frame ROUTED to the replication RESPONDER for (peer, kind) — the \
+                     peer's round (CIRISEdge#348 / #634)"
                 );
             }
+            true
+        }
+        Ok(RouteOutcome::RoutedToInitiator { kind, round }) => {
+            if let Some(m) = metrics {
+                m.inc_routed_to_initiator();
+            }
+            if let ThrottleDecision::Emit { suppressed_prev } = inbound_routed_log().check(source) {
+                tracing::debug!(
+                    peer = %source,
+                    ?kind,
+                    round,
+                    suppressed_prev,
+                    "CRPL reply ROUTED into our INITIATOR's round inbox (CIRISEdge#634)"
+                );
+            }
+            true
+        }
+        Ok(RouteOutcome::ReplyDropped {
+            kind,
+            round,
+            reason,
+        }) => {
+            note_reply_dropped(source, kind, round, reason, metrics);
             true
         }
         Ok(RouteOutcome::NotAReplicationFrame) => false, // → envelope dispatch
@@ -5058,13 +5128,17 @@ async fn route_attributed_frame(
             );
             true
         }
-        Err(e @ RegistryError::BackPressure { .. }) => {
-            // CIRISEdge#373 — the coordinator's bounded inbound channel is full:
-            // a responder reply stalled and parked the drain. This was a SILENT
-            // 100%-loss WARN; now it is counted (so the field sees the magnitude)
-            // and throttled (so a multi-round stall doesn't flood the log). With
-            // #353a/#353b/#373's send bound the stall itself is bounded, but the
-            // count stays as the tripwire.
+        Err(e @ RegistryError::BackPressure { role, .. }) => {
+            // CIRISEdge#373 — a coordinator's bounded inbox is full. This was a
+            // SILENT 100%-loss WARN; now it is counted (so the field sees the
+            // magnitude) and throttled (so a multi-round stall doesn't flood
+            // the log). CIRISEdge#634 — and it names the ROLE whose inbox it
+            // is: the old text said "a responder reply stalled" for every drop
+            // and sent the CIRISServer#607 RCA to the wrong place twice, while
+            // the frames were queuing into an initiator that was never
+            // listening. A responder's full inbox means its driver is stalled
+            // on a reply send (#373); an initiator's means replies outran the
+            // round being driven.
             if let Some(m) = metrics {
                 m.inc_inbound_backpressure_drop();
             }
@@ -5073,11 +5147,11 @@ async fn route_attributed_frame(
             {
                 tracing::warn!(
                     peer = %source,
+                    ?role,
                     error = %e,
                     suppressed_prev,
-                    "replication inbound frame DROPPED — coordinator channel full (a responder \
-                     reply stalled and the round can't drain); counted in \
-                     EdgeMetrics.replication_inbound_backpressure_drops (CIRISEdge#373)"
+                    "replication inbound frame DROPPED — {role:?} inbox full; counted in \
+                     EdgeMetrics.replication_inbound_backpressure_drops (CIRISEdge#373 / #634)"
                 );
             }
             true

@@ -262,7 +262,16 @@ impl InboundRouter {
             // CIRISEdge#621 — attributed to ourselves: no legitimate source, so
             // the same disposition an un-attributed frame gets.
             Ok(RouteOutcome::RefusedSelf) => RouteDisposition::Unattributed,
-            Ok(_) => RouteDisposition::Routed,
+            // CIRISEdge#634 — a deliberately dropped reply is CONSUMED by the
+            // replication layer (counted at the registry), not a failure.
+            Ok(
+                RouteOutcome::RoutedToResponder { .. }
+                | RouteOutcome::RoutedToInitiator { .. }
+                | RouteOutcome::ReplyDropped { .. },
+            ) => RouteDisposition::Routed,
+            Ok(RouteOutcome::NoCoordinatorRegistered { kind }) => {
+                RouteDisposition::Failed(format!("no coordinator for kind {kind:?}"))
+            }
             Err(e) => RouteDisposition::Failed(e.to_string()),
         }
     }

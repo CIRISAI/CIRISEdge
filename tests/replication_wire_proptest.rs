@@ -13,8 +13,11 @@
 //!    start with `CRPL`, `try_unwrap` returns `Ok(None)`. (Non-
 //!    replication bytes route to the non-replication dispatcher.)
 //! 3. **Unknown version surfaces typed error** — for any version byte
-//!    other than `WIRE_PROTOCOL_VERSION`, `try_unwrap` returns
-//!    `Err(UnknownVersion(v))`.
+//!    outside the recognized set (0x01 / 0x02 / 0x03), `try_unwrap`
+//!    returns `Err(UnknownVersion(v))`.
+//! 5. **v3 round metadata round-trips** — for any message, side and
+//!    non-zero round id, `try_unwrap_framed(wrap_v3(..))` yields the
+//!    same message and the same `RoundMeta` (CIRISEdge#634).
 //! 4. **`EnvelopeKind` JSON tag round-trips** — every variant
 //!    serialises + deserialises to itself.
 //!
@@ -35,7 +38,8 @@
 
 use ciris_edge::replication::protocol::ProtocolError;
 use ciris_edge::replication::wire_frame::{
-    try_unwrap, wrap, wrap_at_version, WIRE_PROTOCOL_VERSION, WIRE_PROTOCOL_VERSION_V2,
+    try_unwrap, try_unwrap_framed, wrap, wrap_at_version, wrap_v3, RoundMeta, RoundSide,
+    WIRE_PROTOCOL_VERSION, WIRE_PROTOCOL_VERSION_V2, WIRE_PROTOCOL_VERSION_V3,
 };
 use ciris_edge::replication::{
     DeliverMessage, DiffMessage, EnvelopeKind, EnvelopeRef, FetchMessage, ReplicationMessage,
@@ -140,15 +144,19 @@ proptest! {
 
     /// Property 3: any version byte other than the recognized set
     /// (`WIRE_PROTOCOL_VERSION` = 0x01, `WIRE_PROTOCOL_VERSION_V2` =
-    /// 0x02 as of CIRISEdge v2.0.0 per CEG 1.0-RC2 §5.6.8.13) surfaces
-    /// as `UnknownVersion(v)`, regardless of body content. Anchors the
-    /// v2→v3+ transition story: a v2 receiver seeing a v3 frame fails
-    /// cleanly with a typed error the scheduler can act on (drop the
-    /// peer, downgrade, etc.).
+    /// 0x02 as of CIRISEdge v2.0.0 per CEG 1.0-RC2 §5.6.8.13,
+    /// `WIRE_PROTOCOL_VERSION_V3` = 0x03 as of v26.0.0 / CIRISEdge#634)
+    /// surfaces as `UnknownVersion(v)`, regardless of body content.
+    /// Anchors the transition story: a receiver seeing a newer frame
+    /// fails cleanly with a typed error the scheduler can act on (drop
+    /// the peer, downgrade, etc.) — exactly what a pre-v26 node does
+    /// with a v3 round-open.
     #[test]
     fn unknown_version_byte_always_surfaces_typed_error(
         version in any::<u8>().prop_filter("unrecognized version", |v| {
-            *v != WIRE_PROTOCOL_VERSION && *v != WIRE_PROTOCOL_VERSION_V2
+            *v != WIRE_PROTOCOL_VERSION
+                && *v != WIRE_PROTOCOL_VERSION_V2
+                && *v != WIRE_PROTOCOL_VERSION_V3
         }),
         body in prop::collection::vec(any::<u8>(), 0..256),
     ) {
@@ -162,6 +170,24 @@ proptest! {
                 "expected UnknownVersion({}), got {:?}", version, other
             ),
         }
+    }
+
+    /// Property 5 (CIRISEdge#634): a v3 frame round-trips its message AND
+    /// its round metadata for any side and any non-zero round id, and
+    /// `try_unwrap` (message only) still reads it.
+    #[test]
+    fn v3_round_metadata_round_trips(
+        msg in arb_replication_message(),
+        from_responder in any::<bool>(),
+        round in 1u64..,
+    ) {
+        let from = if from_responder { RoundSide::Responder } else { RoundSide::Initiator };
+        let framed = wrap_v3(&msg, from, round);
+        prop_assert_eq!(framed[4], WIRE_PROTOCOL_VERSION_V3);
+        let out = try_unwrap_framed(&framed).unwrap().unwrap();
+        prop_assert_eq!(&out.msg, &msg);
+        prop_assert_eq!(out.meta, Some(RoundMeta { from, round }));
+        prop_assert_eq!(try_unwrap(&framed).unwrap().unwrap(), msg);
     }
 
     /// Property 4: every `EnvelopeKind` variant serialises +
