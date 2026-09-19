@@ -445,40 +445,64 @@ variable, two jobs (#541's lesson, one layer down).
 | `IgnoreStale` | same/lower epoch, no upgrade or reroute | Cached binding stands |
 | `HijackRefused` (**#337**) | announce that **cannot prove ownership** over a Rooted route | Refused *first*, epoch-independent — the anti-spoof invariant |
 
-### 5.4 The bootstrap carve-out (`#402`, keyed correctly by `#624`)
+### 5.4 The bootstrap carve-out (`#402`, keyed on the link's identity by `#624`, on the right key by `#636`)
 
 A fresh peer is `UnknownKeyId` until its `Key` is admitted — but that `Key` frame is
 exactly what admits it. To break the deadlock, a CRPL frame whose kind
 `is_bootstrap` (`{Key, IdentityOccurrence, TransportDestination}`) arriving on an
-**identified** link is routed on the link's **proven transport identity** — never
-on the attribution result, which is what `#624` corrected. **The transport
-identity is a derivative of the node key** (operator's ruling): a node's RNS
-identity is the dual key `x25519 ‖ ed25519` whose ed25519 half IS the node's
-federation Ed25519 public key (`#436` builds a peer's `transport_pubkey64` with
-`pk[32..] = signing_key_ed25519`; `#541` opens the sealed node Ed25519 identity
-for the transport), and the link handshake hands the receiver the peer's full
-`Identity` (`get_remote_identity(link)` → `public_key_bytes()`, 64 bytes). So a
-bootstrap frame on an identified link is attributed by **one equality, not a
-lookup**: the record's `pubkey_ed25519` must equal the link identity's ed25519
-half. The handshake proved possession of that identity's private keys; the
-record's self-signature (verified at persist admission) proves the key. The
-output is the record's federation key id — there is no other attribution
-output shape. Mismatch drops by name (`bootstrap_key_not_this_link`); an
-`IdentityOccurrence` / `TransportDestination` whose signer's record is not yet
-held is refused by name (the `Key` frame precedes). A legacy peer whose
-transport ed25519 is not its federation key cannot pass the equality and is
-attributed only through its signed announce binding. **Safe by construction:**
-these kinds self-authenticate at persist admission (`signer_acts_for`), grant no
-trust, and are served no `trace:*` — the trace-serve gate stays strictly
-`Rooted ∧ owns_key`. Every non-bootstrap frame on a non-rooted link still drops
-(`#317`). On `main` the proptest proves one direction over kind × link presence: the
-carve-out admits *exactly* the bootstrap kinds
-(`inbound_ingest_tests::bootstrap_carve_out_source_holds_over_all_kinds` and
-`bootstrap_carve_out_admits_only_self_authenticating_bootstrap_kinds`,
-[`edge.rs`](../src/edge.rs)). The admitting direction from `Identified` and
-`Advisory` — by ed25519 equality, not by attribution — is the `#624` build
-(PR #626) and is proven there; until it merges this sentence describes the
-design, not `main`.
+**identified** link is admitted **un-attributed** (the carve-out): these kinds
+self-authenticate at persist admission (`signer_acts_for`), grant no trust, and
+are served no `trace:*` — the trace-serve gate stays strictly `Rooted ∧ owns_key`.
+
+#### 5.4.0 The key objects (`#636`) — read this before touching attribution
+
+Every node holds **two keypairs**. They are bound by a signed row, and they are
+never equal:
+
+| object | what it is | where it shows up | code |
+|---|---|---|---|
+| **FederationKey** | `key_id` + Ed25519 pubkey (+ ML-DSA-65); signs every record; `key_id = <label>-<fingerprint(pubkey)>` | `federation_keys`, the announce's claimed pubkey, the `Key` record | `ciris_verify_core::fedcode::derive_key_id`, `identity_model::key_id_binds_pubkey` |
+| **TransportIdentity** | the RNS identity `x25519 ‖ ed25519`, minted by the transport keystore (`load_or_generate_identity` / the keystore alias), hash = `sha256(pub64)[:16]`; **proven by the link handshake** | `get_remote_identity(link)`, `link_proven_identity_hash` | `identity_model::TransportIdentityPub` |
+| **TransportBinding** | *FederationKey ↔ TransportIdentity*, asserted under the federation key's signature | the announce attestation (`{transport_identity_pubkey, key_id, epoch}` signed by F); the `SignedTransportDestination` row (`occurrence_key_id → transport_{x25519,ed25519}_pubkey`) | `identity_model::TransportBinding`; resolver `reticulum::transport_binding_of` (peers map, then stored TD row) |
+
+`#626` (v25.3.0) wrote the bootstrap door as `record.federation_pubkey ==
+link.transport_ed25519`, and `#627`'s Stage 1 wrote ownership as
+`transport_ed25519 == federation_pubkey`. Both compared a FederationKey to a
+TransportIdentity. They are never equal on any node (CIRISServer's rows: key
+record `94GA…`, TD row `Q1y2…`, on all three nodes), so the peer's *own* record
+on its *own* attributed link was a `Mismatch` and dropped, every third-party
+record relayed on an un-attributed link was a `Mismatch` and dropped, and those
+links never attributed — `bound=0` from v25.3.0 through v26.0.0. The premise
+("the transport identity derives from the node key") was read off a **test
+injector** (`inject_rooted_peer_for_test` builds `transport_pubkey64` from a
+signing key) — the test-field-provenance trap, one layer down from `#624`'s.
+
+The door, corrected (`identity_model::decide_bootstrap_door`, pure):
+
+- **Attributed link** (Advisory or Rooted) ⇒ `NotApplicable`. Attribution *was* a
+  TransportBinding match; there is no belt to apply and never was.
+- **Un-attributed identified link** ⇒ resolve every key the Deliver names
+  (`bootstrap_key_ids_named`: a `Key` record's `key_id`, an occurrence's / TD's
+  `attesting_key_id`) through the ONE resolver `transport_binding_of` — the live
+  peers map (announce-verified) first, then the stored TD row (persist-admitted).
+  A binding whose transport identity hash **is the link's** ⇒ `Attributed{key_id,
+  source}` and the link joins the identified table. Otherwise ⇒ `Unbound`: the
+  frame is delivered un-attributed and admitted on its own signatures; the
+  binding it may carry attributes the *next* frame once persist has verified it.
+- **Nothing inside the Deliver is trusted before admission** — not a Key
+  record's pubkey, not a TD row's transport halves. The door **never drops**;
+  the `bootstrap_key_not_this_link` / `bootstrap_record_not_held` reasons are
+  gone. Its decisions are counted in `bootstrap_door_outcomes`
+  (`attributed` / `unbound` / `not_applicable`) and logged with every operand
+  (`link_transport_identity_hash`, `named_keys`, `bindings_held`, `decision`).
+
+Ownership at Stage 1 (`#627`, corrected): `owns_key = key_id_binds_pubkey(key_id,
+claimed_pubkey) ∧ attestation self-verifies under claimed_pubkey`. The
+fingerprint proves the id names that pubkey; the signature proves possession;
+the attestation's signed payload binds that key to the announcer's transport
+identity. An id without a fingerprint (legacy / test ids) is `owns_key: false`
+until Stage 2's directory walk. Every non-bootstrap frame on a non-rooted link
+still drops (`#317`).
 
 #### 5.4.1 The link-state × frame-kind table — what each state may do
 
@@ -487,9 +511,9 @@ a row is what a link in that state can cause on this node, nothing more.
 
 | link state | bootstrap kind (`Key` / `IdentityOccurrence` / `TransportDestination`) | any other kind | `trace:*` / consent-gated planes served | attribution recorded | proven by (file::test) |
 |---|---|---|---|---|---|
-| **Unidentified** — no remote identity proven | drop, `#317` (transport identity is the precondition, not a default) | drop | no | none | `edge.rs::inbound_ingest_tests::bootstrap_carve_out_admits_only_self_authenticating_bootstrap_kinds` (link `None` ⇒ `None` for every kind); `bootstrap_carve_out_source_holds_over_all_kinds` (proptest); `reticulum.rs::bootstrap_equality_624::summaries_non_bootstrap_kinds_and_unidentified_links_are_not_this_door` (an unidentified link with a bootstrap kind is still refused) |
-| **Identified, announce pending** — remote identity proven, binding not yet installed. *Transient; bounded by one announce verification; `link_before_binding` counts arrivals here and must read 0* | **attributed by equality**: the record's `pubkey_ed25519` == the link identity's ed25519 half ⇒ the record's key id (#624/#626); else drop by name. The record self-authenticates at admission | drop | no | none — the frame may CREATE the binding, it never assumes one | equality attribution (#626): `reticulum.rs::bootstrap_equality_624::a_fresh_peer_is_attributed_to_the_record_whose_pubkey_is_the_links`, `…::a_record_under_a_key_the_link_does_not_hold_is_a_mismatch`, `…::an_occurrence_before_its_key_is_record_not_held`, proptest `…::attributed_iff_bootstrap_key_deliver_identified_and_equal`; the transient is bounded by Stage 1 (#630): `reticulum.rs::announce_stage1_627::a_first_seen_peer_is_bound_inline_with_no_directory_and_owns_its_key`; `link_before_binding` reads 0 in the mesh harness (next mesh run — not an in-process witness) |
-| **Advisory** — announce arrived, not steward-rooted or `!owns_key` | routed on the transport identity (`#624` second case) | drop | no | Advisory (transport-not-trust) | attribution half: `reticulum.rs::initiator_attribution::a_genuine_peer_still_attributes_on_both_branches`; "not served": `mod.rs::source_key_id_tests::from_rooted_binding_admits_only_rooted_and_owns_key`. bootstrap column (#626): `reticulum.rs::bootstrap_equality_624::an_attributed_link_is_belted_on_its_own_record_only` (an attributed link — Advisory included — still passes the equality belt); Advisory installed inline with `owns_key: true` (#630): `reticulum.rs::announce_stage1_627::a_first_seen_peer_is_bound_inline_with_no_directory_and_owns_its_key`, and `…::a_legacy_peer_whose_transport_key_is_not_its_federation_key_binds_without_owns_key` for the split-key case |
+| **Unidentified** — no remote identity proven | drop, `#317` (transport identity is the precondition, not a default) | drop | no | none | `edge.rs::inbound_ingest_tests::bootstrap_carve_out_admits_only_self_authenticating_bootstrap_kinds` (link `None` ⇒ `None` for every kind); `bootstrap_carve_out_source_holds_over_all_kinds` (proptest); `reticulum.rs::bootstrap_door_636::summaries_and_non_bootstrap_kinds_name_nobody`; `identity_model::tests::no_identity_or_no_bindings_is_not_this_door` (no proven identity ⇒ the door has no job) |
+| **Identified, announce pending** — remote identity proven, binding not yet installed. *Transient; bounded by one announce verification; `link_before_binding` counts arrivals here and must read 0* | **the bootstrap door** (`#636`): the keys the Deliver names are resolved through `transport_binding_of`; a verified binding holding THIS link's transport identity ⇒ attributed to that key; else `Unbound` — delivered un-attributed, admitted on its own signature, **never dropped** | drop | no | none — the frame may CREATE the binding (via admission), it never assumes one | `reticulum.rs::bootstrap_door_636::a_link_is_attributed_through_the_stored_binding_never_the_record_pubkey`, `…::a_third_partys_record_on_an_unattributed_link_passes_unbound`, `…::a_record_pubkey_equal_to_the_link_half_attributes_nothing_by_itself`, proptest `…::attributed_iff_bootstrap_deliver_identified_and_bound`; `identity_model::tests::*` |
+| **Advisory** — announce arrived, not steward-rooted or `!owns_key` | attributed (the binding IS the transport-identity match); the door is `NotApplicable` — no belt (`#636`) | drop | no | Advisory (transport-not-trust) | attribution half: `reticulum.rs::initiator_attribution::a_genuine_peer_still_attributes_on_both_branches`; "not served": `mod.rs::source_key_id_tests::from_rooted_binding_admits_only_rooted_and_owns_key`. bootstrap column (#636): `reticulum.rs::bootstrap_door_636::a_peers_own_record_on_its_attributed_link_is_admitted`; `identity_model::tests::an_attributed_link_is_never_belted_on_federation_pubkeys`; ownership at Stage 1: `reticulum.rs::announce_stage1_627::a_first_seen_peer_is_bound_inline_with_no_directory_and_owns_its_key` (transport identity ≠ federation key), `…::a_claim_on_another_keys_id_never_owns_it` |
 | **Rooted ∧ owns_key ∧ hybrid binding** (`#393` items 1+2) | attributed (`from_rooted_binding`) | attributed | **yes** — the E3 gate | Rooted | `mod.rs::source_key_id_tests::from_rooted_binding_admits_only_rooted_and_owns_key`; `reticulum.rs::…::owns_key_is_a_post_pubkey_match_allowlist` (v16 route-hijack fix) |
 | **ResolvedToSelf** — the answer is our own key (`#623`) | drop, `attribution_resolved_to_self` | drop | no | none; no responder is ever built for self | `reticulum.rs::initiator_attribution::a_self_entry_in_the_peers_map_resolves_to_self_not_to_a_peer`, `an_identified_entry_naming_us_is_self`, proptest `attribution_never_resolves_to_the_local_key_as_a_peer`; responder: `edge.rs::inbound_ingest_tests::a_bootstrap_frame_on_a_link_attributed_to_ourselves_builds_no_responder` |
 
@@ -498,14 +522,16 @@ Two invariants the table encodes, and the proptest holds:
 1. **Nothing below `Rooted ∧ owns_key` is ever served a consent-gated plane.** The
    first three rows and the last can only *deliver* self-authenticating
    records; they can never *ask*. This is E3, unchanged since `#393`.
-2. **The bootstrap door opens on the link's own key, never on a lookup.** The
-   transport identity derives from the node key, so the frame that introduces
-   a key can be checked against the channel that carried it. Keying the door on
-   the attribution result (`#402`'s implementation, corrected by `#624`) closed it
-   to exactly the fresh peer while every test fed it an already-attributed link
-   (`link_key_id: Some(..)` as a literal — the *test-field-provenance* trap:
-   the witness proved the door opens when the field is `Some`, never asked who
-   produces `Some` for a fresh peer).
+2. **The bootstrap door opens on the link's proven transport identity resolved
+   through a verified TransportBinding — never on a federation-pubkey compare,
+   never on the attribution result, and never by dropping.** Keying the door on
+   the attribution result (`#402`'s implementation, corrected by `#624`) closed
+   it to exactly the fresh peer while every test fed it an already-attributed
+   link (`link_key_id: Some(..)` as a literal); keying it on `record.pubkey ==
+   link.ed25519` (`#626`, corrected by `#636`) closed it to every real node while
+   every test minted a transport identity FROM the federation seed. Both are the
+   *test-field-provenance* trap: the witness proved the door opens on the input
+   the test built, never asked what produces that input in the field.
 
 #### 5.4.2 The round layer under an attributed row — which coordinator, by round metadata (`#634`)
 
@@ -560,15 +586,17 @@ at the pin and why request/response and Resource were not the answer.
 ### 5.5 The node transport identity (`#541`)
 
 The carve-out above attributes a bootstrap frame on **the link's transport
-identity**. That identity is therefore the one that walks through the lightnet
-door, publicly visible to anyone on the interface — and it also resolves
-§5.2's item 2 `SignedTransportDestination` and the de-admission self.
+identity**, resolved through a binding. The federation key that binding names
+is the one that walks through the lightnet door, publicly visible to anyone on
+the interface — and it also resolves §5.2's item 2 `SignedTransportDestination`
+and the de-admission self. (The transport identity itself is a separate
+keypair — §5.4.0; `#541` is about WHICH federation key the node binds to it.)
 
 CC **3.4.7.3** makes `node` non-cohabitable with `agent`/`user`: persist's agency
 gate constrains a recipient resolving to a **node-only** identity, so fusing the
 roles onto one key does not blur "infrastructure must not have agency" — it
-switches the rule off. Historically `init_edge_runtime` derived the transport
-identity from the engine with no override, so the key at this door was
+switches the rule off. Historically `init_edge_runtime` bound the transport
+identity to the engine's federation key with no override, so the key at this door was
 agency-bearing and **no caller could change it**: the caller is Python, the
 node signer has no `#[pyfunction]`, and CIRISServer folds onto an
 already-running edge.

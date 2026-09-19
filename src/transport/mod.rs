@@ -140,8 +140,10 @@ pub mod packet_radio;
 pub mod attestation;
 
 /// CIRISEdge#627 — the announce-on-link (`CANN`) frame: this node's signed
-/// announce attestation pushed FIRST on every link, bound to the link's proven
-/// remote identity by equality. Read the module docs before touching the wire.
+/// announce attestation pushed FIRST on every link; the receiver checks the
+/// frame's transport identity IS the link's proven remote identity (an
+/// identity-hash equality — the transport keypair on both sides, never the
+/// federation key; see `identity_model`). Read the module docs before touching the wire.
 ///
 /// Gated with `attestation` and `reticulum`: its size budget is
 /// `leviculum_core::announce_app_data_budget`, an optional dependency, and the
@@ -152,6 +154,12 @@ pub mod announce_frame;
 /// CIRISEdge#436 — the link-borne build-attestation-bundle frame (`CBND`):
 /// the arrival transport that feeds the #437 bundle gate.
 pub mod peer_bundle_frame;
+
+/// CIRISEdge#636 — the key objects of a node (federation key, transport
+/// identity, the signed binding between them) and the one bootstrap-door
+/// decision built on them. Read this before touching attribution.
+#[cfg(feature = "_reticulum-module")]
+pub mod identity_model;
 
 /// Reticulum-native transport (OQ-07 first impl). Backed by Leviculum
 /// (`reticulum-core` + `reticulum-std`). Canonical wire per

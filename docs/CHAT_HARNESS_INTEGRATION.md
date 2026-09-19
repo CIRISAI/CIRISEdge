@@ -314,6 +314,16 @@ eight releases moving zero traces).
 subscriber emits nothing, and its silence is indistinguishable from a code path
 that never ran. That cost us five of the six runs.
 
+**And kick after you publish (v26.1.0, CIRISEdge#636).** Anti-entropy runs on
+a 30 s cadence per (peer, plane). A row you just authored — the claim/announce,
+a consent grant, an owner-binding, a chat KeyPackage — crosses on the next
+*tick* unless you kick: `handle.kick()` (Python `ReplicationHandle.kick(
+peer_key_id=None)`; Rust `ReplicationRuntime::round_now_all()`) fires a round
+toward every peer now, coalesced per coordinator, so the row crosses on the
+next round-trip. Receive-side propagation is automatic: a round that ADMITS
+rows kicks every other peer on that plane (`propagation kick` in the log), so
+a row hops A→B→C in round-trips, not cadences. A quiet mesh stays quiet.
+
 ---
 
 ## 6c. Waiting for the mesh — use the helper, do not write a poll loop

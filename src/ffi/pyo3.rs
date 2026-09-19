@@ -2540,6 +2540,13 @@ impl PyEdge {
         // CIRISEdge#634 — the route choke's three counters. On a healthy mutual
         // pair both `routed_to_*` climb; `reply_dropped` counts replies that
         // answered no round we were driving (late replies to timed-out rounds).
+        // CIRISEdge#636 — how bootstrap-kind Delivers on identified links were
+        // attributed: attributed / unbound / not_applicable. Never a drop.
+        let door = pyo3::types::PyDict::new(py);
+        for (label, n) in &bundle.bootstrap_door_outcomes {
+            door.set_item(label.as_str(), *n)?;
+        }
+        root.set_item("bootstrap_door_outcomes", door)?;
         root.set_item(
             "replication_routed_to_responder_total",
             bundle.replication_routed_to_responder_total,
@@ -2912,6 +2919,36 @@ impl PyReplicationHandle {
                         "replication runtime is stopped",
                     )),
                 }
+            })
+        })
+    }
+
+    /// CIRISEdge#636 (production speed) — kick anti-entropy NOW: a round
+    /// toward `peer_key_id` on every plane this node initiates with it, or
+    /// toward EVERY peer when `peer_key_id` is `None`. Call it right after
+    /// authoring rows the federation should see (claim/announce, a consent
+    /// grant, an owner-binding, a chat KeyPackage) so they cross on the next
+    /// round-trip instead of the next 30 s cadence tick. Coalesced per
+    /// coordinator; a burst of kicks costs at most one round per (peer, kind).
+    /// Raises `RuntimeError` if the runtime has stopped.
+    #[pyo3(signature = (peer_key_id=None))]
+    fn kick(&self, py: Python<'_>, peer_key_id: Option<&str>) -> PyResult<()> {
+        let peer = peer_key_id.map(str::to_owned);
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                let guard = inner.lock().await;
+                let Some(rt) = guard.as_ref() else {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "replication runtime is stopped",
+                    ));
+                };
+                match peer.as_deref() {
+                    Some(p) => rt.round_now(p).await,
+                    None => rt.round_now_all().await,
+                }
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
             })
         })
     }

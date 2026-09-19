@@ -45,7 +45,7 @@
 //! wires it. A v1.7 follow-up may add an opt-in
 //! `Edge::install_replication_routing(runtime)` helper.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ciris_persist::federation::FederationDirectory;
@@ -338,24 +338,44 @@ fn build_mesh_config_reader(
 /// from [`ReplicationRuntime::start`] verbatim for the clippy line ceiling.)
 fn spawn_scheduler_task(
     scheduler: ReplicationScheduler,
+    handle: &SchedulerHandle,
     cancel_rx: watch::Receiver<bool>,
-    metrics: Option<crate::observability::EdgeMetrics>,
+    config: &ReplicationRuntimeConfig,
 ) -> JoinHandle<()> {
-    if let Some(metrics) = metrics {
-        let (evt_tx, mut evt_rx) = mpsc::channel::<(String, RoundEvent)>(256);
-        tokio::spawn(async move {
-            while let Some((_peer, event)) = evt_rx.recv().await {
-                metrics.inc_round_outcome(round_outcome_of(&event));
+    let metrics = config.metrics.clone();
+    let handle = handle.clone();
+    // The round-event sink always runs: it feeds the outcome counters when
+    // metrics are configured AND (CIRISEdge#636) turns every round that admitted
+    // rows into a propagation kick toward the other peers on that plane.
+    let (evt_tx, mut evt_rx) = mpsc::channel::<(String, RoundEvent)>(256);
+    tokio::spawn(async move {
+        // Debounce per plane: a burst of admitting rounds on one plane fires
+        // ONE fan-out per window; the kicks coalesce per coordinator anyway,
+        // this just keeps the command channel quiet under a flood.
+        const PROPAGATE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
+        let mut last_propagate: HashMap<EnvelopeKind, std::time::Instant> = HashMap::new();
+        while let Some((peer, event)) = evt_rx.recv().await {
+            if let Some(m) = &metrics {
+                m.inc_round_outcome(round_outcome_of(&event));
             }
-        });
-        tokio::spawn(async move {
-            scheduler.run_with_events(cancel_rx, Some(evt_tx)).await;
-        })
-    } else {
-        tokio::spawn(async move {
-            scheduler.run_until_cancelled(cancel_rx).await;
-        })
-    }
+            if let RoundEvent::Completed(report) = &event {
+                if report.admitted > 0 {
+                    let due = last_propagate
+                        .get(&report.kind)
+                        .map_or(true, |at| at.elapsed() >= PROPAGATE_DEBOUNCE);
+                    if due {
+                        last_propagate.insert(report.kind, std::time::Instant::now());
+                        if handle.propagate(&peer, report.kind).await.is_err() {
+                            break; // the scheduler is gone; so is this sink's job
+                        }
+                    }
+                }
+            }
+        }
+    });
+    tokio::spawn(async move {
+        scheduler.run_with_events(cancel_rx, Some(evt_tx)).await;
+    })
 }
 
 fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
@@ -838,9 +858,8 @@ impl ReplicationRuntime {
         }
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        // CIRISEdge#370 — see [`spawn_scheduler_task`] for the event-sink /
-        // round-outcome-counter wiring.
-        let scheduler_task = spawn_scheduler_task(scheduler, cancel_rx, config.metrics.clone());
+        // CIRISEdge#370/#636 — see [`spawn_scheduler_task`] for the event sink.
+        let scheduler_task = spawn_scheduler_task(scheduler, &scheduler_handle, cancel_rx, &config);
 
         // `directory` is consumed by the bridge above (held inside
         // `bridge`'s Arc<dyn FederationDirectory>). Drop the local
@@ -1046,6 +1065,23 @@ impl ReplicationRuntime {
     /// The scheduler has shut down.
     pub async fn round_now(&self, peer_key_id: &str) -> Result<(), ReplicationRuntimeError> {
         self.scheduler_handle.round_now(Some(peer_key_id)).await?;
+        Ok(())
+    }
+
+    /// CIRISEdge#636 (production speed) — fire a round NOW toward EVERY peer on
+    /// every plane this node initiates. The publish-side kick: a caller that
+    /// just authored rows (an owner-binding, a consent grant, a KeyPackage)
+    /// calls this instead of waiting for the 30 s cadence, so the rows cross on
+    /// the next round-trip rather than the next tick. Idempotent and cheap —
+    /// the scheduler coalesces kicks per coordinator (`Notify`) and a kicked
+    /// round pushes the next scheduled one a full cadence out, so a burst of
+    /// kicks is at most one round per (peer, kind).
+    ///
+    /// # Errors
+    ///
+    /// The scheduler's run loop has exited.
+    pub async fn round_now_all(&self) -> Result<(), ReplicationRuntimeError> {
+        self.scheduler_handle.round_now(None).await?;
         Ok(())
     }
 
