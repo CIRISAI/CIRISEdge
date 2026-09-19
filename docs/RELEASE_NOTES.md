@@ -2,7 +2,7 @@
 
 # v26.1.1 — adopt CIRISPersist v44.8.1: holder claims index with the row
 
-**2026-09-19** (PR #638). persist v44.8.1 (#870/#872): `put_blob_with_scope` and
+**2026-09-19** (PR #639). persist v44.8.1 (#870/#872): `put_blob_with_scope` and
 `adopt_sealed_blob_at` wrote the `holds_bytes` holder claim without the post-write
 `signed_wire_index` hook, so the claim was advertised (the summary reads the row) but
 unfetchable (the packer resolves through the index) until the holder's next restart — edge's
