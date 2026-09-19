@@ -442,6 +442,18 @@ pub struct InboundFrame {
     /// frame (`Key`/`IdentityOccurrence`), verified at persist admission. `None`
     /// for transports that don't carry an advisory-link identity (HTTP, packet
     /// radio, FFI — those attribute via `source_key_id` or not at all).
+    ///
+    /// CIRISEdge#624 — when attribution misses entirely (a peer whose announce
+    /// has not reached us: no peers-map entry at all) but the link PROVED a
+    /// remote identity via LINKIDENTIFY, the transport attributes a bootstrap
+    /// `Deliver` by EQUALITY: the delivered Key record whose Ed25519 pubkey is
+    /// the link identity's Ed25519 half names the peer, and this carries that
+    /// record's `key_id`. The transport identity IS a derivative of the node
+    /// key (its Ed25519 half is the federation signing key, #436/#541), so the
+    /// only output of attribution is ever a federation `key_id`. The same
+    /// equality is a belt on every attributed bootstrap Deliver: a link
+    /// carrying "its own" record under a key the link does not hold is dropped
+    /// whatever the peers map says.
     pub link_key_id: Option<String>,
     /// CIRISEdge#499 — the SCOPE-DERIVED address this frame arrived on, resolved
     /// by the transport against its installed

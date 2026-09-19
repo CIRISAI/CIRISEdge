@@ -5096,7 +5096,13 @@ async fn route_attributed_frame(
 /// CIRISEdge#402 — the bootstrap attribution carve-out. `Some(key_id)` iff the
 /// frame is a self-authenticating bootstrap kind (`Key`/`IdentityOccurrence`,
 /// [`crate::replication::EnvelopeKind::is_bootstrap`]) AND the link carried a
-/// transport-level identity (`link_key_id`). The kind is peeked from the CRPL
+/// transport-level identity (`link_key_id`). CIRISEdge#624: that hint is the
+/// attribution result when there is one (an Advisory peer's key) and, for a
+/// fresh peer whose announce has not arrived, the federation `key_id` the
+/// transport derived by EQUALITY — the delivered Key record whose pubkey is
+/// the link identity's Ed25519 half (`reticulum::decide_bootstrap_equality`).
+/// Either way the hint is a federation key id; an unidentified link has
+/// none, so the door stays shut on it. The kind is peeked from the CRPL
 /// frame; a non-bootstrap kind, an unparseable frame, or an absent link identity
 /// ⇒ `None` (the frame drops; E3's `Rooted ∧ owns_key` trace-serve gate is
 /// untouched). The returned id is the link's transport identity promoted through
@@ -9164,6 +9170,157 @@ mod inbound_ingest_tests {
         let mut g = frame(crpl, None);
         g.link_key_id = Some("fresh-peer".into());
         assert!(route_replication_frame(Some(&registry), &g, None).await);
+    }
+
+    /// CIRISEdge#624 — the case #402's door was built for and never opened: a
+    /// FRESH peer (announce not yet arrived, in no map, both branches miss) whose
+    /// link proved its identity. The transport attributes its Key `Deliver` by
+    /// equality to the record's own `key_id` (tested at the pure decision in
+    /// `reticulum::bootstrap_equality_624`); here, that hint routes the frame and
+    /// a responder is built for it, so the identity round can be served. (b) an
+    /// admitted-ADVISORY peer (announce arrived, owner binding not yet;
+    /// `Rooted∧owns_key` false) takes the same door on its key. (c) a
+    /// non-bootstrap kind on the very same identified link never routes — the
+    /// responder factory is never invoked. (d) an UNIDENTIFIED link carries no
+    /// hint at all and drops even a bootstrap kind.
+    // Four legs over ONE fixture (the responder-factory recorder) plus the three
+    // no-op impls that fixture needs; splitting them would repeat the fixture
+    // four times for no extra assertion.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn a_fresh_peer_bootstraps_on_its_link_proven_identity_and_advisory_takes_the_same_door()
+    {
+        use crate::replication::coordinator::ReplicationCoordinator;
+        use crate::replication::protocol::EnvelopeRef;
+        use crate::replication::session::SessionRole;
+        use crate::replication::summary::{ApplyOutcome, StateApplier, StateProvider};
+        use crate::transport::{Transport, TransportError, TransportSendOutcome};
+        use std::sync::{Arc, Mutex};
+
+        // A responder that never sends and never applies: the ROUTING decision —
+        // whether a responder is BUILT for this source at all — is what is under
+        // test, not the round it would serve.
+        struct NoopTransport;
+        #[async_trait::async_trait]
+        impl Transport for NoopTransport {
+            fn id(&self) -> TransportId {
+                TransportId::RETICULUM_RS
+            }
+            async fn send(
+                &self,
+                _d: &str,
+                _b: &[u8],
+            ) -> Result<TransportSendOutcome, TransportError> {
+                Ok(TransportSendOutcome::Delivered)
+            }
+            async fn listen(
+                &self,
+                _s: tokio::sync::mpsc::Sender<InboundFrame>,
+            ) -> Result<(), TransportError> {
+                unimplemented!("this test never drives listen")
+            }
+        }
+        struct NoProvider;
+        impl StateProvider for NoProvider {
+            fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+                vec![]
+            }
+            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+        }
+        struct NoApplier;
+        impl StateApplier for NoApplier {
+            fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _source_peer: Option<&str>,
+            ) -> ApplyOutcome {
+                ApplyOutcome::refused("no-op applier (test)")
+            }
+        }
+
+        let built: Arc<Mutex<Vec<(String, EnvelopeKind)>>> = Arc::new(Mutex::new(Vec::new()));
+        let make_registry = |built: Arc<Mutex<Vec<(String, EnvelopeKind)>>>| {
+            let registry = Arc::new(ReplicationRegistry::new());
+            registry.set_local_key_id("self-node");
+            registry.set_responder_factory(Arc::new(move |peer: &str, kind| {
+                built.lock().unwrap().push((peer.to_string(), kind));
+                Arc::new(ReplicationCoordinator::new(
+                    Arc::new(NoopTransport),
+                    peer,
+                    kind,
+                    SessionRole::Responder,
+                    Arc::new(NoProvider) as Arc<dyn StateProvider>,
+                    Arc::new(NoApplier) as Arc<dyn StateApplier>,
+                ))
+            }));
+            registry
+        };
+        let key_frame =
+            crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            }));
+        // The id the transport's equality path derives for a fresh peer: the
+        // delivered record's own federation key id — never anything link-shaped.
+        let transport_id = "fresh-peer-cjgfikxxd5".to_string();
+
+        // (a) fresh peer: no attribution, link-proven identity only.
+        let registry = make_registry(built.clone());
+        let mut f = frame(key_frame.clone(), None);
+        f.link_key_id = Some(transport_id.clone());
+        assert!(route_replication_frame(Some(&registry), &f, None).await);
+        assert_eq!(
+            built.lock().unwrap().as_slice(),
+            &[(transport_id.clone(), EnvelopeKind::Key)],
+            "a fresh peer's Key frame must reach a responder keyed on the federation key id \
+             its record proved against the link — the first-contact identity round \
+             (CIRISEdge#624)",
+        );
+
+        // (b) Advisory peer: attribution resolved to its key, trust gate refused it.
+        built.lock().unwrap().clear();
+        let registry = make_registry(built.clone());
+        let mut g = frame(key_frame.clone(), None);
+        g.link_key_id = Some("advisory-peer-cjgfikxxd5".into());
+        assert!(route_replication_frame(Some(&registry), &g, None).await);
+        assert_eq!(
+            built.lock().unwrap().as_slice(),
+            &[("advisory-peer-cjgfikxxd5".to_string(), EnvelopeKind::Key)],
+            "an admitted-Advisory peer's bootstrap frame takes the same door on its key",
+        );
+
+        // (c) a non-bootstrap kind on the SAME identified link never routes (E3).
+        built.lock().unwrap().clear();
+        let registry = make_registry(built.clone());
+        let att =
+            crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Attestation,
+                refs: vec![],
+            }));
+        let mut h = frame(att, None);
+        h.link_key_id = Some(transport_id.clone());
+        assert!(
+            route_replication_frame(Some(&registry), &h, None).await,
+            "consumed (dropped loudly), never envelope-dispatched"
+        );
+        assert!(
+            built.lock().unwrap().is_empty(),
+            "an Attestation frame on a link-proven-identity link must NEVER reach a \
+             responder — the trace-serve gate stays strictly Rooted∧owns_key (E3)",
+        );
+
+        // (d) an unidentified link: no hint at all ⇒ even a Key frame drops.
+        built.lock().unwrap().clear();
+        let registry = make_registry(built.clone());
+        let d = frame(key_frame, None);
+        assert!(route_replication_frame(Some(&registry), &d, None).await);
+        assert!(
+            built.lock().unwrap().is_empty(),
+            "no proven identity, no door: transport identity is the precondition, not a default",
+        );
     }
 
     /// CIRISEdge#402 — the bootstrap attribution carve-out truth table, tested at
