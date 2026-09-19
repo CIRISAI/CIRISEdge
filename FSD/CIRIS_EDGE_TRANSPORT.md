@@ -441,17 +441,23 @@ A fresh peer is `UnknownKeyId` until its `Key` is admitted — but that `Key` fr
 exactly what admits it. To break the deadlock, a CRPL frame whose kind
 `is_bootstrap` (`{Key, IdentityOccurrence, TransportDestination}`) arriving on an
 **identified** link is routed on the link's **proven transport identity** — never
-on the attribution result, which is what `#624` corrected. The routing hint a
-frame carries is `routing_hint_for_link(candidate, remote_identity)`: the
-attribution result when there is one, else the link's `get_remote_identity` hash
-as `SourceKeyId::transport_identity` — the wire form `rns-identity:<hex16>`. That
-string can be mistaken for nothing: a federation key id never contains `:`, it
-resolves in no directory, `from_rooted_binding` refuses the prefix **by name**
-(so it can never reach the trace-serve constructor even through a corrupted
-peers map), and the carve-out promotes it only through `transport_authenticated`
-and only for `is_bootstrap` kinds. A reply to such a peer rides the live inbound
-link whose remote identity is that hash (`live_attributed_link_to`) and is
-otherwise `Unreachable` — never a dial, never store-and-forward. **Safe by construction:**
+on the attribution result, which is what `#624` corrected. **The transport
+identity is a derivative of the node key** (operator's ruling): a node's RNS
+identity is the dual key `x25519 ‖ ed25519` whose ed25519 half IS the node's
+federation Ed25519 public key (`#436` builds a peer's `transport_pubkey64` with
+`pk[32..] = signing_key_ed25519`; `#541` opens the sealed node Ed25519 identity
+for the transport), and the link handshake hands the receiver the peer's full
+`Identity` (`get_remote_identity(link)` → `public_key_bytes()`, 64 bytes). So a
+bootstrap frame on an identified link is attributed by **one equality, not a
+lookup**: the record's `pubkey_ed25519` must equal the link identity's ed25519
+half. The handshake proved possession of that identity's private keys; the
+record's self-signature (verified at persist admission) proves the key. The
+output is the record's federation key id — there is no other attribution
+output shape. Mismatch drops by name (`bootstrap_key_not_this_link`); an
+`IdentityOccurrence` / `TransportDestination` whose signer's record is not yet
+held is refused by name (the `Key` frame precedes). A legacy peer whose
+transport ed25519 is not its federation key cannot pass the equality and is
+attributed only through its signed announce binding. **Safe by construction:**
 these kinds self-authenticate at persist admission (`signer_acts_for`), grant no
 trust, and are served no `trace:*` — the trace-serve gate stays strictly
 `Rooted ∧ owns_key`. Every non-bootstrap frame on a non-rooted link still drops
@@ -468,7 +474,7 @@ a row is what a link in that state can cause on this node, nothing more.
 | link state | bootstrap kind (`Key` / `IdentityOccurrence` / `TransportDestination`) | any other kind | `trace:*` / consent-gated planes served | attribution recorded |
 |---|---|---|---|---|
 | **Unidentified** — no remote identity proven | drop, `#317` (transport identity is the precondition, not a default) | drop | no | none |
-| **Identified, announce pending** — remote identity proven, binding not yet installed. *Transient; bounded by one announce verification; `link_before_binding` counts arrivals here and must read 0* | **routed on `rns-identity:<hex16>`** (the link's proven identity) — the last-resort guarantee (#624/#626), not the design path; the record self-authenticates at admission | drop | no | none — the frame may CREATE the binding, it never assumes one |
+| **Identified, announce pending** — remote identity proven, binding not yet installed. *Transient; bounded by one announce verification; `link_before_binding` counts arrivals here and must read 0* | **attributed by equality**: the record's `pubkey_ed25519` == the link identity's ed25519 half ⇒ the record's key id (#624/#626); else drop by name. The record self-authenticates at admission | drop | no | none — the frame may CREATE the binding, it never assumes one |
 | **Advisory** — announce arrived, not steward-rooted or `!owns_key` | routed on the transport identity (`#624` second case) | drop | no | Advisory (transport-not-trust) |
 | **Rooted ∧ owns_key ∧ hybrid binding** (`#393` items 1+2) | attributed (`from_rooted_binding`) | attributed | **yes** — the E3 gate | Rooted |
 | **ResolvedToSelf** — the answer is our own key (`#623`) | drop, `attribution_resolved_to_self` | drop | no | none; no responder is ever built for self |
@@ -478,10 +484,11 @@ Two invariants the table encodes, and the proptest holds:
 1. **Nothing below `Rooted ∧ owns_key` is ever served a consent-gated plane.** The
    first three rows and the last can only *deliver* self-authenticating
    records; they can never *ask*. This is E3, unchanged since `#393`.
-2. **The bootstrap door opens on identification, never on attribution.** An
-   `Identified` peer is the door's reason to exist; keying the door on the
-   attribution result (`#402`'s implementation, corrected by `#624`) closed it
-   to exactly that peer while every test fed it an already-attributed link
+2. **The bootstrap door opens on the link's own key, never on a lookup.** The
+   transport identity derives from the node key, so the frame that introduces
+   a key can be checked against the channel that carried it. Keying the door on
+   the attribution result (`#402`'s implementation, corrected by `#624`) closed it
+   to exactly the fresh peer while every test fed it an already-attributed link
    (`link_key_id: Some(..)` as a literal — the *test-field-provenance* trap:
    the witness proved the door opens when the field is `Some`, never asked who
    produces `Some` for a fresh peer).
