@@ -1,5 +1,21 @@
 # CIRISEdge Release Notes
 
+# v26.1.1 — adopt CIRISPersist v44.8.1: holder claims index with the row
+
+**2026-09-19** (PR #639). persist v44.8.1 (#870/#872): `put_blob_with_scope` and
+`adopt_sealed_blob_at` wrote the `holds_bytes` holder claim without the post-write
+`signed_wire_index` hook, so the claim was advertised (the summary reads the row) but
+unfetchable (the packer resolves through the index) until the holder's next restart — edge's
+`#429 advertised-then-unfetchable` lines on the sender, `NoHolders` on every puller, chat bodies
+`not_fetched` across nodes. Both doors now index the claim after commit on sqlite and postgres,
+with a from-disk gate (I114) on every `INSERT INTO federation_attestations`. Edge changes nothing
+but the pin: the `#429` packer warning and the puller's `NoHolders` back-off were the correct
+reads of a row that was not there.
+
+All four persist ABI constants unmoved (`DIRECTORY 5`, `SIGNER 1`, `OUTBOUND_QUEUE 1`,
+`ASYNC_EXECUTOR 1`); wheel floor `>=44,<45` stands; one copy each of verify/keyring/crypto.
+Pins: persist **v44.8.1**, verify v15.2.0, leviculum v0.26.0+ciris.1. Wire unchanged (v3).
+
 # v26.1.0 — the keys are the keys: attribution on the transport identity, through the binding (CIRISEdge#636) — and production speed
 
 **2026-09-19** (PR #637). CIRISServer#612's chat ladder on v26.0.0 read `bound=0`. The server's
