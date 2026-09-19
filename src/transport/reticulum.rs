@@ -5008,14 +5008,32 @@ impl ReticulumTransport {
     }
 
     async fn live_attributed_link_to(&self, destination_key_id: &str) -> Option<LinkId> {
-        let candidates: Vec<LinkId> = self
-            .link_to_peer_key_id
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, peer)| peer.as_str() == destination_key_id)
-            .map(|(id, _)| *id)
-            .collect();
+        // CIRISEdge#624 — a `rns-identity:<hash>` destination is a peer known
+        // ONLY by the identity its link proved: its links are the established
+        // ones whose remote identity IS that hash, not any peers-map entry.
+        let candidates: Vec<LinkId> = if let Some(wanted) =
+            crate::transport::SourceKeyId::transport_identity_hash(destination_key_id)
+        {
+            self.established_links
+                .lock()
+                .await
+                .iter()
+                .filter(|id| {
+                    self.node
+                        .get_remote_identity(id)
+                        .is_some_and(|ident| *ident.hash() == wanted)
+                })
+                .copied()
+                .collect()
+        } else {
+            self.link_to_peer_key_id
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, peer)| peer.as_str() == destination_key_id)
+                .map(|(id, _)| *id)
+                .collect()
+        };
         let last_inbound = self.link_last_inbound_at.lock().await;
         let established_at = self.link_established_at.lock().await;
         // CIRISEdge#353 — build the (link, last_inbound, established_at) tuples
@@ -5436,6 +5454,23 @@ impl Transport for ReticulumTransport {
         // set; the dial target is chosen by ROUTABILITY further down, after the
         // reverse-path attempt. See `resolve_dial_candidates` /
         // `select_dial_candidate` for the holistic-fix rationale.
+        // CIRISEdge#624 — a `rns-identity:<hash>` destination is a fresh peer
+        // known only by the identity its link proved (no announce, so nothing to
+        // dial and nothing to resolve). The reply rides that live inbound link or
+        // it does not go: never a dial, never store-and-forward — both would be
+        // sending to an identity we have no address for.
+        if crate::transport::SourceKeyId::transport_identity_hash(destination_key_id).is_some() {
+            if self
+                .send_via_reverse_path(destination_key_id, envelope_bytes)
+                .await
+            {
+                return Ok(TransportSendOutcome::Delivered);
+            }
+            return Err(TransportError::Unreachable(format!(
+                "destination {destination_key_id} is a link-proven transport identity with no \
+                 live inbound link; it is never dialed (CIRISEdge#624)"
+            )));
+        }
         let candidates = self.resolve_dial_candidates(destination_key_id).await;
         if candidates.is_empty() {
             // CIRISEdge#292 (CIRISServer#205) — an admitted replication
@@ -6347,6 +6382,32 @@ async fn binding_exists_cached(
 // landed. Each new arm is a small typed routing of one NodeEvent
 // variant onto a side-effect (record / emit); extracting would
 // fragment the event-loop verdict across multiple helpers.
+/// CIRISEdge#624 — the `link_key_id` routing hint for an inbound frame, from
+/// the attribution result and the link's LINKIDENTIFY-proven remote identity.
+///
+/// - `Some(candidate)` — the link resolved to a peer key (Branch A or B, any
+///   provenance): the hint is that key, as before #624.
+/// - `None` + a proven remote identity — the hint is
+///   [`SourceKeyId::transport_identity`](crate::transport::SourceKeyId::transport_identity)
+///   over that hash: a fresh peer, known only by what its link proved. The
+///   bootstrap carve-out fires on it for `is_bootstrap` kinds; nothing else
+///   routes on it.
+/// - `None` + no remote identity — no hint: an unidentified link proves
+///   nothing, so even a bootstrap kind drops. Transport identity is the
+///   PRECONDITION, not a default.
+///
+/// Pure so the truth table is tested against the exact inputs the event loop
+/// produces.
+fn routing_hint_for_link(
+    candidate_key_id: Option<String>,
+    remote_identity_hash: Option<[u8; 16]>,
+) -> Option<String> {
+    candidate_key_id.or_else(|| {
+        remote_identity_hash
+            .map(|h| crate::transport::SourceKeyId::transport_identity(&h).into_string())
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 /// CIRISEdge#353/#365 — attribute an inbound link frame to its source peer and
 /// hand it to the inbound sink. Shared by BOTH the resource path
@@ -6459,8 +6520,9 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                         "inbound frame's link has NO known destination — not \
                          LinkIdentified (no peer dialed us) and no dialed-dest record \
                          (leviculum `link_destination`=None for own-dialed links). The \
-                         #353 initiator arm cannot resolve a source; frame dropped \
-                         unattributed (CIRISEdge#424)"
+                         #353 initiator arm cannot resolve a source; the frame is \
+                         unattributed — a self-authenticating bootstrap kind may still \
+                         route on the link's proven identity (CIRISEdge#424/#624)"
                     );
                 }
                 None
@@ -6477,9 +6539,11 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                         link = ?link_id,
                         dest = %hex::encode(d.into_bytes()),
                         suppressed_prev,
-                        "inbound frame DROPPED unattributed — the link's destination \
-                         matches NO rooted peer (dest resolved, peers-map lookup missed; \
-                         peer not yet rooted, or rooted under a different dest) (CIRISEdge#425)"
+                        "inbound frame UNATTRIBUTED — the link's destination matches NO \
+                         rooted peer (dest resolved, peers-map lookup missed; peer not yet \
+                         rooted, or rooted under a different dest). A non-bootstrap kind \
+                         drops; a self-authenticating Key/IdentityOccurrence may still route \
+                         on the link's proven identity (CIRISEdge#425/#624)"
                     );
                 }
                 None
@@ -6508,7 +6572,18 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // below narrows it to `None`. A routing hint only (see `InboundFrame::link_key_id`);
     // the E3 attacker (`PubkeyMismatch`) never reaches `link_to_peer_key_id`, so
     // this is `Some` only for a self-consistent binding.
-    let link_key_id = candidate_key_id.clone();
+    // CIRISEdge#624 — the hint is the ATTRIBUTION RESULT when there is one, else
+    // the identity the link itself PROVED. A fresh peer whose announce has not
+    // reached us is in no map (both branches miss ⇒ `candidate_key_id = None`),
+    // yet its link completed LINKIDENTIFY — that identity is self-authenticating
+    // at the transport tier and is exactly what #402's door was built for.
+    // Keying the hint on the attribution result made the door open only for a
+    // peer that was already attributable, i.e. never for the one it exists for
+    // (CIRISServer#609: 0 rounds served on a ten-minute install).
+    let link_key_id = routing_hint_for_link(
+        candidate_key_id.clone(),
+        ctx.node.get_remote_identity(&link_id).map(|id| *id.hash()),
+    );
     let source_key_id = match candidate_key_id {
         Some(key_id) => {
             // Item 1 — Rooted ∧ owns_key, plus capture the peer's dest for the
@@ -10027,6 +10102,88 @@ mod tests {
              or a `tracing::` log, or annotate `// choke-ok: <why it is not a silent drop>`:\n{}",
             violations.join("\n")
         );
+    }
+
+    /// CIRISEdge#624 — the `link_key_id` routing hint, tested at the pure
+    /// decision fn against the exact `(attribution result, link-proven
+    /// identity)` inputs `attribute_and_deliver` produces.
+    mod routing_hint_624 {
+        use super::super::routing_hint_for_link;
+        use crate::transport::SourceKeyId;
+        use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
+
+        /// (a) THE #624 CONDITION: both branches missed (no announce yet) but
+        /// the link proved an identity ⇒ the hint is that identity, in the
+        /// `rns-identity:` shape — the fresh peer's door.
+        #[test]
+        fn a_fresh_peer_hints_its_link_proven_identity() {
+            let hint = routing_hint_for_link(None, Some([0xa2; 16]));
+            assert_eq!(
+                hint.as_deref(),
+                Some(SourceKeyId::transport_identity(&[0xa2; 16]).as_str()),
+                "no attribution + proven identity ⇒ the transport-identity hint"
+            );
+            assert_eq!(
+                SourceKeyId::transport_identity_hash(hint.as_deref().unwrap()),
+                Some([0xa2; 16])
+            );
+        }
+
+        /// (b) An attributed link (Advisory or Rooted — provenance is the trust
+        /// gate's business, not the hint's) keeps its key as the hint, exactly
+        /// as before #624.
+        #[test]
+        fn an_attributed_link_keeps_its_key_whatever_the_identity() {
+            assert_eq!(
+                routing_hint_for_link(Some("advisory-peer".into()), Some([1; 16])).as_deref(),
+                Some("advisory-peer")
+            );
+            assert_eq!(
+                routing_hint_for_link(Some("advisory-peer".into()), None).as_deref(),
+                Some("advisory-peer")
+            );
+        }
+
+        /// (d) An UNIDENTIFIED link (LINKIDENTIFY never completed) proves
+        /// nothing: no hint, so even a bootstrap kind drops downstream. The
+        /// proven identity is the precondition, never a default.
+        #[test]
+        fn an_unidentified_unattributed_link_hints_nothing() {
+            assert_eq!(routing_hint_for_link(None, None), None);
+        }
+
+        proptest::proptest! {
+            /// The universal invariant behind E3 for this door: whatever the
+            /// hint is, it is NEVER a trust attribution. A transport-identity
+            /// hint cannot pass `from_rooted_binding` even when `Rooted ∧
+            /// owns_key` is claimed for it, and the hint exists iff the link
+            /// proved SOMETHING (an attributed key or a remote identity).
+            #[test]
+            fn the_hint_exists_iff_something_was_proven_and_never_attributes(
+                candidate in proptest::option::of(
+                    proptest::string::string_regex("[a-z0-9-]{1,16}").unwrap()
+                ),
+                identity in proptest::option::of(proptest::array::uniform16(0u8..=255)),
+            ) {
+                let hint = routing_hint_for_link(candidate.clone(), identity);
+                proptest::prop_assert_eq!(
+                    hint.is_some(),
+                    candidate.is_some() || identity.is_some()
+                );
+                if candidate.is_none() {
+                    if let Some(h) = &hint {
+                        proptest::prop_assert_eq!(
+                            SourceKeyId::transport_identity_hash(h),
+                            identity
+                        );
+                        proptest::prop_assert!(
+                            SourceKeyId::from_rooted_binding(h.clone(), Rooted, true).is_none(),
+                            "a transport-identity hint must never become a trust attribution"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     mod initiator_attribution {
