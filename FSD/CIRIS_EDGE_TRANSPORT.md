@@ -429,9 +429,18 @@ variable, two jobs (#541's lesson, one layer down).
 A fresh peer is `UnknownKeyId` until its `Key` is admitted — but that `Key` frame is
 exactly what admits it. To break the deadlock, a CRPL frame whose kind
 `is_bootstrap` (`{Key, IdentityOccurrence, TransportDestination}`) arriving on an
-**identified** link is routed on the link's **proven transport identity**
-(`transport_authenticated` over `get_remote_identity(link)`) — never on the
-attribution result, which is what `#624` corrected. **Safe by construction:**
+**identified** link is routed on the link's **proven transport identity** — never
+on the attribution result, which is what `#624` corrected. The routing hint a
+frame carries is `routing_hint_for_link(candidate, remote_identity)`: the
+attribution result when there is one, else the link's `get_remote_identity` hash
+as `SourceKeyId::transport_identity` — the wire form `rns-identity:<hex16>`. That
+string can be mistaken for nothing: a federation key id never contains `:`, it
+resolves in no directory, `from_rooted_binding` refuses the prefix **by name**
+(so it can never reach the trace-serve constructor even through a corrupted
+peers map), and the carve-out promotes it only through `transport_authenticated`
+and only for `is_bootstrap` kinds. A reply to such a peer rides the live inbound
+link whose remote identity is that hash (`live_attributed_link_to`) and is
+otherwise `Unreachable` — never a dial, never store-and-forward. **Safe by construction:**
 these kinds self-authenticate at persist admission (`signer_acts_for`), grant no
 trust, and are served no `trace:*` — the trace-serve gate stays strictly
 `Rooted ∧ owns_key`. Every non-bootstrap frame on a non-rooted link still drops
@@ -448,7 +457,7 @@ a row is what a link in that state can cause on this node, nothing more.
 | link state | bootstrap kind (`Key` / `IdentityOccurrence` / `TransportDestination`) | any other kind | `trace:*` / consent-gated planes served | attribution recorded |
 |---|---|---|---|---|
 | **Unidentified** — no remote identity proven | drop, `#317` (transport identity is the precondition, not a default) | drop | no | none |
-| **Identified, unannounced** — remote identity proven, no binding | **routed on the transport identity**; the record self-authenticates at admission | drop | no | none — the frame may CREATE the binding, it never assumes one |
+| **Identified, unannounced** — remote identity proven, no binding | **routed on `rns-identity:<hex16>`** (the link's proven identity); the record self-authenticates at admission | drop | no | none — the frame may CREATE the binding, it never assumes one |
 | **Advisory** — announce arrived, not steward-rooted or `!owns_key` | routed on the transport identity (`#624` second case) | drop | no | Advisory (transport-not-trust) |
 | **Rooted ∧ owns_key ∧ hybrid binding** (`#393` items 1+2) | attributed (`from_rooted_binding`) | attributed | **yes** — the E3 gate | Rooted |
 | **ResolvedToSelf** — the answer is our own key (`#623`) | drop, `attribution_resolved_to_self` | drop | no | none; no responder is ever built for self |
