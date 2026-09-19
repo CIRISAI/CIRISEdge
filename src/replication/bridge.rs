@@ -1299,11 +1299,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// identity there is no "I" whose trust could be evaluated. Supplied by
     /// `ReplicationRuntimeConfig::local_key_id`.
     local_key_id: Option<String>,
-    /// CIRISEdge#400 — memoized consent send-set (`list_consent_peers(local)`),
+    /// CIRISEdge#400 — memoized consent send-set (`consent_peers_by_principals(local)`;
+    /// `list_consent_peers(local)` before CIRISEdge#609),
     /// with the [`Instant`] it was resolved. The item-1 fan-out bound must
     /// re-resolve *per round* but NOT *per envelope*: v14.2.0 called
     /// `resolve_attestation_recipient` inside `fetch_envelope_bytes_for_peer`,
-    /// so an N-envelope Deliver did N `list_consent_peers` reads inside the
+    /// so an N-envelope Deliver did N consent-set reads inside the
     /// unbounded reply assembly and blew the 10 s round budget (100% round
     /// timeouts). This memo collapses a round's advertise + N fetches to ONE
     /// read; the [`CONSENT_SEND_SET_MEMO_TTL`] window sits under the anti-entropy
@@ -5285,7 +5286,7 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#396 item 1 — resolve `peer` against this node's live consent
-    /// send-set (persist's `list_consent_peers` E7 projection, revocation-folded).
+    /// send-set (persist's `consent_peers_by_principals` E7 projection, revocation-folded).
     /// `Some(ResolvedRecipient)` iff consent includes it; `None` (fail-closed)
     /// when there is no `local_key_id` to resolve against, the consent view
     /// won't resolve, or the peer is not consent-included. The Attestation plane
@@ -5740,7 +5741,7 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#400 — the memoized consent send-set. Returns the live
-    /// `list_consent_peers(local)` projection, re-reading persist only when the
+    /// `consent_peers_by_principals(local)` projection, re-reading persist only when the
     /// memo is empty or older than [`CONSENT_SEND_SET_MEMO_TTL`]. A round's
     /// advertise + N `fetch_envelope_bytes_for_peer` calls therefore share ONE
     /// read instead of N (the v14.2.0 regression that blew the round budget),
@@ -6520,7 +6521,7 @@ impl FederationDirectoryReplicationBridge {
     ///   grant subject. There is no key to evict, because the answer that
     ///   changed is the SET.
     ///
-    /// Dropping the whole send-set memo costs one `list_consent_peers` plus one
+    /// Dropping the whole send-set memo costs one consent-set read plus one
     /// walk per subject on the next resolve, and only on an ownership event
     /// (rare); keeping it would leave a newly bound node dark for up to
     /// [`CONSENT_SEND_SET_MEMO_TTL`]. Same trade the #523 memo took, made in

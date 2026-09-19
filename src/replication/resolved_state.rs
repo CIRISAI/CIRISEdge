@@ -16,20 +16,23 @@
 //!
 //! Nissenbaum's *recipient* parameter (who receives a flow) must never exceed
 //! its *transmission principle* (the consent grant). Edge's replication fan-out
-//! is therefore `operator-addressed peers ∩ list_consent_peers(local)`:
+//! is therefore `operator-addressed peers ∩ consent_peers_by_principals(local)`:
 //! consent can only **narrow** the operator's addressing, never widen it. The
 //! intersection is realized at serve time — only an operator-connected peer
 //! ever reaches the serve path, and there it must clear consent membership —
 //! so the two constraints compose to the same set without materializing it.
 //!
-//! Persist's [`list_consent_peers`](ciris_persist::federation::FederationDirectory::list_consent_peers)
-//! is the E7 `consent_peer_set` projection, **revocation-folded at write time**:
+//! Persist's [`consent_peers_by_principals`](ciris_persist::federation::consent_by_humans::consent_peers_by_principals)
+//! (v44.6.0, CIRISPersist#857 / CIRISEdge#609 — `local`'s own machine-authored
+//! grants ∪ every steward's grants whose `for_key_id == local`; before v25.x the
+//! read was `list_consent_peers(local)`, the machine-authored half alone) is the
+//! E7 `consent_peer_set` projection, **revocation-folded at write time**:
 //! a `withdraws`/`recants` admitted between rounds has already dropped the peer,
 //! so re-resolving each round makes un-trust nuclear — *"the authority to say
 //! stop stays in human hands"* (<https://ciris.ai/vision/>) enforced at the wire.
 //!
 //! **The recipient set is resolved, not literal** (CIRISEdge#524, v18.5.0).
-//! `list_consent_peers` returns the SUBJECTS the live grants name, and a
+//! The consent read returns the SUBJECTS the live grants name, and a
 //! consent object naturally names a PERSON. A person's key carries no
 //! transport binding, so the literal set is not a routable set: the measured
 //! field state was a whole attestation plane dark under a valid grant. The
@@ -80,7 +83,7 @@ pub(crate) struct ResolvedPeerSet {
 }
 
 impl ResolvedPeerSet {
-    /// Build from persist's `list_consent_peers(local)` result. The
+    /// Build from persist's `consent_peers_by_principals(local)` result. The
     /// operator-addressing half of the intersection is applied by the caller's
     /// serve path (only a connected peer is ever tested), so this holds the
     /// consent side alone. The `Arc` makes [`Clone`] O(1) for the memo.

@@ -141,8 +141,10 @@ on request.
    opt-in for *identity* records only.
 
 **What it actually is, in CI terms:** the data subject's **transmission
-principle** for the identity plane, set once — consent to `share` your
-identity records at federation scope. The identity plane is the degenerate
+principle** for the identity plane, set once — consent for your identity
+records to be served at federation scope. (Not the `consent:scope:share`
+token: that is a stance scope on `consent:state:granted` a processor consults
+per record; the identity plane's principle is the announce itself, Axis 4.) The identity plane is the degenerate
 case where subject = sender = the identity itself, which is why one wizard
 choice can cover it and no per-request consent check exists on a promoted Key.
 
@@ -251,7 +253,7 @@ predicts every gate in the codebase.**
 | flow | data subject | sender | recipient | info type | transmission principle | ⇒ gate |
 |---|---|---|---|---|---|---|
 | serve a promoted `Key` / `IdentityOccurrence` / `TransportDestination` to an attributed requester | the identity itself | the identity itself (`SelfOwn` / `OwnerOf` binding, persist `policy_for`) | any attributed peer | identity plane (public, no anonymity claim) | **set once at announce** (Axis 4 = the consent) | plane-level: any mesh server answers; no per-request consent check exists *because the principle already resolved* |
-| serve an `Attestation` | the subject(s) named in the row — **≠ sender** | the attesting key (`SignerActsFor`) | consent-gated peer | per-`dimension` | **per-record** `consent:scope` grants (`retain`/`share`/`analyze`/`train`/`publish`) | per-row: producer's grant ∧ recipient `infra:serve` (blessed) ∧ `recipient_capability` — the one plane where the five cannot collapse |
+| serve an `Attestation` | the subject(s) named in the row — **≠ sender** | the attesting key (`SignerActsFor`) | consent-gated peer | per-`dimension` | **two grammars, two questions.** Per-principal `consent:replication:v1` grants decide WHO is a peer — the send set, persist's `consent_peers_by_principals` (a separate, hash-pinned grammar: `CONSENT_GRAMMAR_HASH`). Per-record `consent:scope` on `consent:state:granted` decides WHAT a subject permitted (`retain`/`share`/`analyze`/`train`/`publish`, persist `types.rs::transmission_principle::ALL`), consulted by the *processor* through `resolve_scoped_consent*` (`consent.rs::named_scopes` / `matches_scoped_query`) — never by the send-set read. Edge enforces `retain` (the store gate's operator axis) and consumes the peer projection; `analyze`/`train`/`publish` govern continued processing (CC 2.3.5) and are the processor's duty — no layer enforces them today (CIRISPersist#867). CC's sub-scoped tokens (`retain:90d`, `share:cohort:family`) are not what persist's fold parses (CIRISPersist#866) | per-row: producer's grant ∧ recipient `infra:serve` (blessed) ∧ `recipient_capability` — the one plane where the five cannot collapse |
 | serve a `Revocation` / tombstone | the revoked identity | quorum from the receiver's own directory | everyone (`Global`, tombstone ceiling) | anti-rollback | mandatory flow — CC 5.3.2.2: consent revocations MUST promote, never local | never hash-first, never withheld: the flow is obligatory, so no gate may be able to stop it |
 | answer a data-subject Pull ("what do you hold about me") | the requester | various | **the subject themselves** | any subject-pullable kind | subject access is not a disclosure | `requester == subject`, on every node (#462) |
 | group traffic | members | members | derived destination — **never announced** | group planes | membership itself is the consent | no directory flow exists to gate: invisibility is structural, not policy (CC 5.4.6) |
