@@ -1,5 +1,45 @@
 # CIRISEdge Release Notes
 
+# v26.0.0 — one round, one id, one direction: the replication registry un-fused (CIRISEdge#634)
+
+**2026-09-19** (PR #635). CIRISServer#607's fourth layer, found by the chat ladder's in-process
+probe (CIRISServer#612 / CIRISEdge#634): the registry keyed coordinators by `(peer, kind)` with
+no role, so a peer's round-open was delivered into OUR initiator's channel — drained only while
+the scheduler was driving a round — and no responder was ever built. The joiner's KeyPackage
+never reached the creator; the `BackPressure` log blamed "a responder reply". Every mutual peer
+pair had this; v25.2.0 passed only because slower attribution landed the frame mid-round.
+
+**Wire — CRPL v3 (`0x03`).** `MAG ‖ 0x03 ‖ FLAGS ‖ ROUND(8, BE)`: bit 0 says whether the
+sender is the round's initiator or its responder; `ROUND` is minted by the initiator and echoed
+by the responder. v1/v2 frames are still decoded and served as LEGACY. Sequence numbers and
+retransmission are NOT new here — every frame already rides leviculum's Channel; v3 adds the two
+facts no leviculum primitive gives an above-MDU multi-frame exchange over pooled links.
+`FSD/REPLICATION_ROUND_CORRELATION.md` is the spec; `FSD/CIRIS_EDGE_TRANSPORT.md` §5.4.2 is the
+round layer under the link-state table, every row with its proving test.
+
+**Registry — two tables.** `responders[(peer, kind)]` and `initiators[(peer, kind)]`. A reply
+(`FROM_RESPONDER = 1`) goes only to the initiator's live round inbox or is dropped VISIBLY
+(`RouteOutcome::ReplyDropped { reason }`: `no_initiator` / `no_round_in_flight` /
+`round_mismatch`); an initiator-marked or legacy frame goes only to the responder, built on first
+contact. `RoutedToResponder` / `RoutedToInitiator` replace `Routed`. Three counters:
+`replication_routed_to_responder_total`, `replication_routed_to_initiator_total`,
+`replication_reply_dropped_total`; `BackPressure` names the ROLE whose inbox is full.
+
+**Coordinator.** An initiator has no standing inbox: a round inbox that lives from `begin_round`
+to `end_round` / `abandon_round` (timeout ⇒ inbox dropped + session reset — nothing parks for the
+next round), plus an on-demand inbox for `Pull` replies. A responder rebinds on a new round id
+(or a legacy `Summary`) and resets — it never inherits a stuck round. An initiator round completes
+only on `Deliver_R ∧ Diff_R`, in either order (frames of one round may ride different links).
+
+**Floor.** `0x03` is refused by pre-v26 receivers, so a v26 node *initiates* only to v26 peers
+(the round times out, counted) while it *answers* every pre-v26 initiator as before. No data is
+isolated — a pre-v26 node keeps pulling on its own rounds; the floor is on who opens. The server
+release carries edge on every node it runs.
+
+Verified: the runtime-level reproduction (`mutual_initiators_both_complete_rounds_634`) fails on
+v25.4.0 with `alice={TimedOut: 1}` and passes here. Pins unchanged: persist v44.8.0, verify
+v15.2.0, leviculum v0.26.0+ciris.1.
+
 # v25.2.0 — adopt CIRISPersist v44.7.0 — the same-key rebind; attribution never resolves to self
 
 **2026-09-18** (`b520bcb`, PRs #622 + #623). persist v44.7.0 (#864): a holder heals its own

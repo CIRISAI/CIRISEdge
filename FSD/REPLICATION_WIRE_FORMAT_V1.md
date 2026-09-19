@@ -394,11 +394,18 @@ match version {
 }
 ```
 
-Future versions:
-- `0x02` — when CEG-native operational-data envelopes (orgs / users /
-  licenses / partners per #58 Phase 2) land and need new
-  `EnvelopeKind`s. Currently expected for CIRIS 2.0.
-- `0x03+` — reserve.
+Assigned versions:
+- `0x02` — the CEG-native operational-data envelopes (orgs / users /
+  licenses / partners per #58 Phase 2): new `EnvelopeKind`s, same
+  message shapes. Shipped in v2.0.0.
+- `0x03` — **round correlation** (CIRISEdge#634, v26.0.0): the same
+  message shapes with a `FLAGS ‖ ROUND` preamble naming which round
+  a frame belongs to and which side sent it. Specified in
+  [`REPLICATION_ROUND_CORRELATION.md`](REPLICATION_ROUND_CORRELATION.md)
+  §3. Every frame a v26 initiator or a v26 responder answering a v3
+  round sends is `0x03`; a v26 responder answering a `0x01`/`0x02`
+  round answers in kind.
+- `0x04+` — reserve.
 
 The single-byte version field gives us 255 future versions before
 needing a multi-byte version extension. Plenty.

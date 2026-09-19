@@ -103,6 +103,16 @@ pub enum ReplicationOutcome {
         refused: usize,
         staleness: StalenessSignal,
     },
+    /// CIRISEdge#634 §5.1 — the initiator's `Deliver_R` was already applied
+    /// (report carried here) and the responder's late `Diff_R` has now been
+    /// served: send `msgs`, then the round is complete.
+    SendThenApplied {
+        msgs: Vec<ReplicationMessage>,
+        kind: EnvelopeKind,
+        admitted: usize,
+        refused: usize,
+        staleness: StalenessSignal,
+    },
     /// The peer sent a message this session refuses — in practice a message
     /// whose `kind` mismatches this `(peer, kind)` session (the only refusal
     /// the `on_*` arms produce), or a `start_round` on a Responder. NOT a
@@ -212,6 +222,26 @@ pub struct Session {
     /// it without the per-round unsolicited-WARN, and an empty cursor result still
     /// completes the round cleanly. Per-round state, cleared by [`Self::reset`].
     awaiting_cursor_deliver: bool,
+    /// CIRISEdge#634 §5.1 — an INITIATOR round opened with a `Summary` is
+    /// answered with `Summary_R` + `Diff_R` (always, `want` possibly empty)
+    /// and later `Deliver_R`. Those frames may ride different pooled links,
+    /// so `Deliver_R` can overtake `Diff_R`; completing on the first
+    /// `Deliver` would close the round's inbox with the peer's wants still
+    /// unserved. `true` from `start_round` until `on_diff` sees the peer's
+    /// Diff; a `Deliver` applied while it is still `true` parks its report in
+    /// `held_report` and the round completes when the Diff lands.
+    awaiting_remote_diff: bool,
+    /// The applied `Deliver_R`'s report, held until `Diff_R` arrives.
+    held_report: Option<HeldReport>,
+}
+
+/// A `Deliver` already applied by an initiator that is still waiting for the
+/// responder's `Diff` (CIRISEdge#634 §5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldReport {
+    admitted: usize,
+    refused: usize,
+    staleness: StalenessSignal,
 }
 
 /// CIRISEdge#380 — per-round byte budget for the proactive Deliver. The
@@ -243,7 +273,22 @@ impl Session {
             proactive_sent: std::collections::BTreeMap::new(),
             round_counter: 0,
             awaiting_cursor_deliver: false,
+            awaiting_remote_diff: false,
+            held_report: None,
         }
+    }
+
+    /// Whether this session carries no per-round state — nothing sent, nothing
+    /// wanted, nothing held. A responder that is NOT fresh when a new round
+    /// opens is a responder inheriting a stuck round (CIRISEdge#634 §5.2).
+    #[must_use]
+    pub fn is_fresh(&self) -> bool {
+        self.last_summary_sent.is_none()
+            && self.diff_want_count.is_none()
+            && !self.completed
+            && !self.awaiting_cursor_deliver
+            && !self.awaiting_remote_diff
+            && self.held_report.is_none()
     }
 
     /// CIRISEdge#927 — enable initiator-first proactive publish (see the
@@ -270,6 +315,8 @@ impl Session {
         self.diff_want_count = None;
         self.completed = false;
         self.awaiting_cursor_deliver = false;
+        self.awaiting_remote_diff = false;
+        self.held_report = None;
         // CIRISEdge#552 — DECREMENT, never clear. A Pull issued during an
         // ordinary scheduled round must not have its exemption killed by THAT
         // round completing: the subject-scoped reply had not arrived yet, and
@@ -335,6 +382,12 @@ impl Session {
             refs: refs.clone(),
         };
         self.last_summary_sent = Some(summary.clone());
+        // A Summary-opened round is answered with Summary_R + Diff_R; the
+        // round is not over until the Diff has been served (#634 §5.1). A
+        // Pull-opened round (recovery / testimony) gets a Summary only, so it
+        // never sets this.
+        self.awaiting_remote_diff = true;
+        self.held_report = None;
         let mut outbound = vec![ReplicationMessage::Summary(summary)];
         // CIRISEdge#927 — initiator-first push. A carrier-NAT'd initiator's round
         // can't complete responder-reply-first: the responder's Diff can't
@@ -816,10 +869,27 @@ impl Session {
                 "Deliver ships short — the requester's want was only partially served (#429)"
             );
         }
-        ReplicationOutcome::Send(vec![ReplicationMessage::Deliver(DeliverMessage {
+        let deliver = ReplicationMessage::Deliver(DeliverMessage {
             kind: self.kind,
             envelopes,
-        })])
+        });
+        if self.role == SessionRole::Initiator && self.awaiting_remote_diff {
+            self.awaiting_remote_diff = false;
+            if let Some(held) = self.held_report.take() {
+                // Deliver_R overtook Diff_R across pooled links (#634 §5.1):
+                // the bodies are applied, the peer's wants are served now,
+                // and THEN the round is complete.
+                self.completed = true;
+                return ReplicationOutcome::SendThenApplied {
+                    msgs: vec![deliver],
+                    kind: self.kind,
+                    admitted: held.admitted,
+                    refused: held.refused,
+                    staleness: held.staleness,
+                };
+            }
+        }
+        ReplicationOutcome::Send(vec![deliver])
     }
 
     fn on_fetch(
@@ -1072,6 +1142,24 @@ impl Session {
                 }
             }
         };
+        if self.role == SessionRole::Initiator && self.awaiting_remote_diff {
+            // The responder's Diff has not landed yet (reordered across pooled
+            // links, #634 §5.1): keep the round open for it and hand the
+            // report over when it arrives. The bodies ARE applied already.
+            self.held_report = Some(HeldReport {
+                admitted,
+                refused,
+                staleness,
+            });
+            tracing::debug!(
+                kind = ?self.kind,
+                admitted,
+                refused,
+                "Deliver applied before the peer's Diff — holding the round open for it \
+                 (CIRISEdge#634)"
+            );
+            return ReplicationOutcome::Send(Vec::new());
+        }
         self.completed = true;
         ReplicationOutcome::Applied {
             kind: self.kind,
@@ -1929,6 +2017,90 @@ mod tests {
     /// remote summary's envelopes (the applier refused some — e.g.
     /// signature validation failed in a hypothetical production
     /// scenario).
+    /// CIRISEdge#634 §5.1 — a Summary-opened initiator round completes only
+    /// when BOTH the responder's Deliver and its Diff have been seen, in either
+    /// order. Frames of one round may ride different pooled links, so
+    /// `Deliver_R` can overtake `Diff_R`; completing on the first Deliver would
+    /// close the round with the peer's wants unserved.
+    #[test]
+    fn initiator_completes_on_deliver_and_diff_in_either_order() {
+        let provider = provider_with(&[(EnvelopeKind::Key, h(9), b"e9".to_vec(), 9)]);
+        let applier = applier_for(&[(h(1), b"e1".to_vec())]);
+        let bob_summary = || {
+            ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![super::super::protocol::EnvelopeRef {
+                    envelope_hash: h(1),
+                    seq: 1,
+                }],
+            })
+        };
+        let bob_diff = || {
+            ReplicationMessage::Diff(DiffMessage {
+                kind: EnvelopeKind::Key,
+                want: vec![h(9)],
+            })
+        };
+        let bob_deliver = || {
+            ReplicationMessage::Deliver(DeliverMessage {
+                kind: EnvelopeKind::Key,
+                envelopes: vec![b"e1".to_vec()],
+            })
+        };
+
+        // Wire order: Summary_R, Diff_R, Deliver_R.
+        let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        alice.start_round(&provider);
+        assert!(!alice.is_fresh());
+        let _ = alice.on_message(bob_summary(), &provider, &applier, None);
+        match alice.on_message(bob_diff(), &provider, &applier, None) {
+            ReplicationOutcome::Send(msgs) => {
+                assert!(
+                    matches!(msgs[0], ReplicationMessage::Deliver(_)),
+                    "serves the want"
+                );
+            }
+            o => panic!("{o:?}"),
+        }
+        assert!(!alice.is_complete());
+        match alice.on_message(bob_deliver(), &provider, &applier, None) {
+            ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
+            o => panic!("{o:?}"),
+        }
+        assert!(alice.is_complete());
+
+        // Reordered: Summary_R, Deliver_R, Diff_R — the Deliver is applied but
+        // the round HOLDS; the Diff is served and THEN the round completes,
+        // carrying the held report.
+        let applier = applier_for(&[(h(1), b"e1".to_vec())]);
+        let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        alice.start_round(&provider);
+        let _ = alice.on_message(bob_summary(), &provider, &applier, None);
+        match alice.on_message(bob_deliver(), &provider, &applier, None) {
+            ReplicationOutcome::Send(msgs) => assert!(msgs.is_empty(), "wait, nothing to send"),
+            o => panic!("expected the round to hold, got {o:?}"),
+        }
+        assert!(
+            !alice.is_complete(),
+            "not complete until the peer's Diff is served"
+        );
+        match alice.on_message(bob_diff(), &provider, &applier, None) {
+            ReplicationOutcome::SendThenApplied {
+                msgs,
+                admitted,
+                refused,
+                ..
+            } => {
+                assert!(matches!(msgs[0], ReplicationMessage::Deliver(_)));
+                assert_eq!((admitted, refused), (1, 0), "the held report rides out");
+            }
+            o => panic!("expected SendThenApplied, got {o:?}"),
+        }
+        assert!(alice.is_complete());
+        alice.reset();
+        assert!(alice.is_fresh());
+    }
+
     #[test]
     fn bounded_by_staleness_when_some_envelopes_refused() {
         // Bob's summary advertises 3 envelopes; Alice's applier
@@ -1957,6 +2129,13 @@ mod tests {
         });
         alice.start_round(&a_provider);
         let _ = alice.on_message(bob_summary, &a_provider, &a_applier, None);
+        // CIRISEdge#634 — the responder always sends its Diff; the round is
+        // not complete until it has been served, so feed it as the wire does.
+        let bob_diff = ReplicationMessage::Diff(DiffMessage {
+            kind: EnvelopeKind::Key,
+            want: vec![],
+        });
+        let _ = alice.on_message(bob_diff, &a_provider, &a_applier, None);
         let bob_deliver = ReplicationMessage::Deliver(DeliverMessage {
             kind: EnvelopeKind::Key,
             envelopes: vec![

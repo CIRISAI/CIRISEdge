@@ -84,6 +84,37 @@
 //! framing), but the receiver's defense-in-depth catches a
 //! misconfigured peer.
 //!
+//! ## v3 — round correlation (CIRISEdge#634, `FSD/REPLICATION_ROUND_CORRELATION.md`)
+//!
+//! v1/v2 frames say neither which ROUND a message belongs to nor which SIDE
+//! of that round the sender is on, and the anti-entropy exchange is a
+//! request/reply: the responder's answer to our round-open is a `Summary`,
+//! and the peer's own round-open is a `Summary`. One registry slot per
+//! `(peer, kind)` could not tell them apart, so a peer's round-open queued
+//! into our initiator's channel and no responder was ever built (#634).
+//!
+//! v3 puts the two missing facts in the preamble:
+//!
+//! ```text
+//!   ┌────┬────┬───────┬──────────┬───────────────────────────────────┐
+//!   │MAG │VER │ FLAGS │  ROUND   │  ReplicationMessage::to_bytes()   │
+//!   │ 4B │0x03│  1B   │ 8B BE u64│                                   │
+//!   └────┴────┴───────┴──────────┴───────────────────────────────────┘
+//! ```
+//!
+//! - `FLAGS` bit 0 is [`FLAG_FROM_RESPONDER`]: clear = the sender is the
+//!   round's initiator, set = the sender is its responder. Reserved bits
+//!   must be zero; a frame with any set is refused (`ProtocolError::Decode`).
+//! - `ROUND` is the round id, minted by the initiator at round-open and
+//!   echoed by the responder on every reply of that round. Never zero.
+//!
+//! Sequence numbers and retransmission are NOT here: every frame already
+//! rides leviculum's Channel (`send_on_link`), which sequences, windows and
+//! retransmits per link. v3 adds only what no leviculum primitive gives a
+//! multi-frame, above-MDU exchange over a pool of links — the round id and
+//! the direction. v1/v2 frames stay decodable and are routed as LEGACY
+//! (responder side only); see `registry::route_inbound_bytes`.
+//!
 //! ## v2 envelope_hash basis is JCS — at the bridge layer, not here
 //!
 //! Per FSD §3.2.2, v2's `envelope_hash` is `sha256(JCS(Signed*Record))`
@@ -124,6 +155,53 @@ pub const WIRE_PROTOCOL_VERSION: u8 = 0x01;
 /// concern, not a wire-frame concern; this module just routes the
 /// version byte).
 pub const WIRE_PROTOCOL_VERSION_V2: u8 = 0x02;
+
+/// Replication wire-protocol version for v3 — the v2 kind namespace plus a
+/// round-correlation preamble (`FLAGS` ‖ `ROUND`) so the receiver can route
+/// a frame by which round it belongs to and which side sent it
+/// (CIRISEdge#634, `FSD/REPLICATION_ROUND_CORRELATION.md` §3).
+pub const WIRE_PROTOCOL_VERSION_V3: u8 = 0x03;
+
+/// v3 `FLAGS` bit 0 — set when the sender is the round's RESPONDER (the
+/// frame is a reply to a round the receiver opened); clear when the sender
+/// is the round's INITIATOR (the frame opens or drives a round on the
+/// receiver's responder).
+pub const FLAG_FROM_RESPONDER: u8 = 0b0000_0001;
+
+/// v3 `FLAGS` bits that carry no meaning yet. A receiver refuses a frame
+/// with any of them set rather than guessing what a newer sender meant.
+pub const FLAGS_RESERVED_MASK: u8 = !FLAG_FROM_RESPONDER;
+
+/// Length of the v3 preamble: `MAG` + `VER` + `FLAGS` + `ROUND`.
+pub const PREAMBLE_LEN_V3: usize = PREAMBLE_LEN + 1 + 8;
+
+/// Which side of a round sent a v3 frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundSide {
+    /// The sender opened / is driving the round; the receiver answers it
+    /// with its RESPONDER for `(peer, kind)`.
+    Initiator,
+    /// The sender is answering a round the receiver opened; the receiver
+    /// routes it into that round's inbox on its INITIATOR, or drops it.
+    Responder,
+}
+
+/// The v3 round metadata carried in a frame's preamble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundMeta {
+    pub from: RoundSide,
+    /// The round id — minted by the initiator, echoed by the responder.
+    /// Never zero on the wire.
+    pub round: u64,
+}
+
+/// A decoded frame: the message plus, for v3, the round it belongs to.
+/// `meta: None` is a LEGACY (v1/v2) frame from a pre-v26 peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Framed {
+    pub msg: ReplicationMessage,
+    pub meta: Option<RoundMeta>,
+}
 
 /// Length of the wire-frame preamble (`MAG` + `VER`). The body
 /// follows starting at offset `PREAMBLE_LEN`.
@@ -193,7 +271,54 @@ pub fn wrap_at_version(msg: &ReplicationMessage, version: u8) -> Vec<u8> {
 /// unknown-version frame IS an error (the magic promised replication-
 /// shaped bytes but we can't speak that version yet); a malformed body
 /// IS an error (sender broke its own contract).
+/// Wrap a message in a v3 frame carrying its round metadata
+/// (CIRISEdge#634). `round` must be non-zero — zero is the "no round"
+/// sentinel on the coordinator side and is never a valid wire value.
+///
+/// # Panics
+///
+/// Debug-asserts `round != 0`; a zero round is a programming error at the
+/// caller (a send outside any round must go through the legacy wrappers).
+#[must_use]
+pub fn wrap_v3(msg: &ReplicationMessage, from: RoundSide, round: u64) -> Vec<u8> {
+    debug_assert!(round != 0, "a v3 frame carries a minted round id, never 0");
+    let body = msg.to_bytes();
+    let mut out = Vec::with_capacity(PREAMBLE_LEN_V3 + body.len());
+    out.extend_from_slice(&REPLICATION_FRAME_MAGIC);
+    out.push(WIRE_PROTOCOL_VERSION_V3);
+    out.push(match from {
+        RoundSide::Initiator => 0,
+        RoundSide::Responder => FLAG_FROM_RESPONDER,
+    });
+    out.extend_from_slice(&round.to_be_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Decode a frame to its message only. Callers that peek at a frame's kind
+/// (the listen loop's bootstrap gate, the DST sim) use this; the registry
+/// uses [`try_unwrap_framed`] because routing needs the round metadata.
+///
+/// # Errors
+///
+/// As [`try_unwrap_framed`].
 pub fn try_unwrap(bytes: &[u8]) -> Result<Option<ReplicationMessage>, ProtocolError> {
+    Ok(try_unwrap_framed(bytes)?.map(|f| f.msg))
+}
+
+/// Decode a frame to its message and, for v3, its round metadata.
+///
+/// Returns `Ok(None)` when the bytes are not a replication frame at all
+/// (no `CRPL` magic) so the caller can fall through to envelope dispatch.
+///
+/// # Errors
+///
+/// - `ProtocolError::Decode` — magic present but the preamble is truncated,
+///   a v3 frame sets a reserved flag bit or carries `ROUND = 0`, or the body
+///   is not a valid `ReplicationMessage`.
+/// - `ProtocolError::UnknownVersion` — a version byte this node does not
+///   speak.
+pub fn try_unwrap_framed(bytes: &[u8]) -> Result<Option<Framed>, ProtocolError> {
     if bytes.len() < REPLICATION_FRAME_MAGIC.len() {
         return Ok(None);
     }
@@ -201,25 +326,44 @@ pub fn try_unwrap(bytes: &[u8]) -> Result<Option<ReplicationMessage>, ProtocolEr
         return Ok(None);
     }
     if bytes.len() < PREAMBLE_LEN {
-        // Magic present but no version byte — caller's framing is
-        // broken or this is a pre-v1 dev frame. Treat as a protocol
-        // error since the magic asserted "this is replication."
         return Err(ProtocolError::Decode(
             "replication frame truncated — magic present but version byte missing".into(),
         ));
     }
     let version = bytes[REPLICATION_FRAME_MAGIC.len()];
-    // v2.0.0 (CEG 1.0-RC2 §5.6.8.13 / FSD §5.2) — accept both v1 and v2
-    // framing. The message body decode is version-agnostic; the version
-    // byte gates which kind-tag namespace the receiver expects. A
-    // mismatched body (e.g. a v2 kind tag in a v1 frame, which a
-    // well-behaved sender never emits but a misconfigured peer might)
-    // surfaces as `ProtocolError::Decode` at the serde layer below.
-    if version != WIRE_PROTOCOL_VERSION && version != WIRE_PROTOCOL_VERSION_V2 {
-        return Err(ProtocolError::UnknownVersion(version));
-    }
-    let body = &bytes[PREAMBLE_LEN..];
-    ReplicationMessage::from_bytes(body).map(Some)
+    let (meta, body) = match version {
+        WIRE_PROTOCOL_VERSION | WIRE_PROTOCOL_VERSION_V2 => (None, &bytes[PREAMBLE_LEN..]),
+        WIRE_PROTOCOL_VERSION_V3 => {
+            if bytes.len() < PREAMBLE_LEN_V3 {
+                return Err(ProtocolError::Decode(
+                    "v3 replication frame truncated — FLAGS/ROUND preamble missing".into(),
+                ));
+            }
+            let flags = bytes[PREAMBLE_LEN];
+            if flags & FLAGS_RESERVED_MASK != 0 {
+                return Err(ProtocolError::Decode(format!(
+                    "v3 replication frame sets reserved FLAGS bits ({flags:#010b}) — refused"
+                )));
+            }
+            let mut round_be = [0u8; 8];
+            round_be.copy_from_slice(&bytes[PREAMBLE_LEN + 1..PREAMBLE_LEN_V3]);
+            let round = u64::from_be_bytes(round_be);
+            if round == 0 {
+                return Err(ProtocolError::Decode(
+                    "v3 replication frame carries ROUND = 0 — a round id is never zero".into(),
+                ));
+            }
+            let from = if flags & FLAG_FROM_RESPONDER != 0 {
+                RoundSide::Responder
+            } else {
+                RoundSide::Initiator
+            };
+            (Some(RoundMeta { from, round }), &bytes[PREAMBLE_LEN_V3..])
+        }
+        other => return Err(ProtocolError::UnknownVersion(other)),
+    };
+    let msg = ReplicationMessage::from_bytes(body)?;
+    Ok(Some(Framed { msg, meta }))
 }
 
 #[cfg(test)]
@@ -299,11 +443,12 @@ mod tests {
     #[test]
     fn unknown_version_byte_is_typed_error() {
         // v3 — reserved for a future cut beyond CEG 1.0-RC2.
-        let mut v3_bytes = REPLICATION_FRAME_MAGIC.to_vec();
-        v3_bytes.push(0x03);
-        v3_bytes.extend_from_slice(br#"{"type":"summary","kind":"key","refs":[]}"#);
-        let r = try_unwrap(&v3_bytes);
-        assert!(matches!(r, Err(ProtocolError::UnknownVersion(0x03))));
+        // 0x03 is v3 since #634; the first unassigned version is 0x04.
+        let mut v4_bytes = REPLICATION_FRAME_MAGIC.to_vec();
+        v4_bytes.push(0x04);
+        v4_bytes.extend_from_slice(br#"{"type":"summary","kind":"key","refs":[]}"#);
+        let r = try_unwrap(&v4_bytes);
+        assert!(matches!(r, Err(ProtocolError::UnknownVersion(0x04))));
 
         // Same for a future v0xFF — caps at u8 max.
         let mut vff_bytes = REPLICATION_FRAME_MAGIC.to_vec();
@@ -342,11 +487,95 @@ mod tests {
         let v2 = wrap_at_version(&msg, WIRE_PROTOCOL_VERSION_V2);
         assert_eq!(try_unwrap(&v2).unwrap().unwrap(), msg);
         // Forged v3 — surfaces UnknownVersion.
-        let v3 = wrap_at_version(&msg, 0x03);
+        let v4 = wrap_at_version(&msg, 0x04);
         assert!(matches!(
-            try_unwrap(&v3),
-            Err(ProtocolError::UnknownVersion(0x03))
+            try_unwrap(&v4),
+            Err(ProtocolError::UnknownVersion(0x04))
         ));
+    }
+
+    // ── CIRISEdge#634 — the v3 round preamble ────────────────────────────
+    mod v3_tests {
+        use super::*;
+        use crate::replication::protocol::{DiffMessage, EnvelopeKind, SummaryMessage};
+
+        fn summary() -> ReplicationMessage {
+            ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Community,
+                refs: vec![],
+            })
+        }
+
+        #[test]
+        fn v3_round_trips_both_sides_and_the_round_id() {
+            for (from, flag) in [
+                (RoundSide::Initiator, 0u8),
+                (RoundSide::Responder, FLAG_FROM_RESPONDER),
+            ] {
+                let framed = wrap_v3(&summary(), from, 0xDEAD_BEEF_CAFE_F00D);
+                assert_eq!(&framed[..4], &REPLICATION_FRAME_MAGIC);
+                assert_eq!(framed[4], WIRE_PROTOCOL_VERSION_V3);
+                assert_eq!(framed[5], flag);
+                let out = try_unwrap_framed(&framed).expect("decode").expect("magic");
+                assert_eq!(out.msg, summary());
+                assert_eq!(
+                    out.meta,
+                    Some(RoundMeta {
+                        from,
+                        round: 0xDEAD_BEEF_CAFE_F00D
+                    })
+                );
+            }
+        }
+
+        #[test]
+        fn legacy_frames_decode_with_no_round_meta() {
+            let msg = ReplicationMessage::Diff(DiffMessage {
+                kind: EnvelopeKind::Key,
+                want: vec![],
+            });
+            for v in [WIRE_PROTOCOL_VERSION, WIRE_PROTOCOL_VERSION_V2] {
+                let out = try_unwrap_framed(&wrap_at_version(&msg, v))
+                    .expect("decode")
+                    .expect("magic");
+                assert_eq!(out.msg, msg);
+                assert_eq!(out.meta, None, "v{v} carries no round metadata");
+            }
+        }
+
+        #[test]
+        fn try_unwrap_still_yields_the_message_of_a_v3_frame() {
+            // The kind-peeking callers (listen-loop bootstrap gate, sim) must
+            // not go blind on the new version.
+            let framed = wrap_v3(&summary(), RoundSide::Responder, 7);
+            assert_eq!(try_unwrap(&framed).unwrap().unwrap(), summary());
+        }
+
+        #[test]
+        fn reserved_flag_bits_are_refused_not_guessed() {
+            let mut framed = wrap_v3(&summary(), RoundSide::Initiator, 7);
+            framed[5] |= 0b0000_0010;
+            let r = try_unwrap_framed(&framed);
+            assert!(matches!(r, Err(ProtocolError::Decode(_))), "got {r:?}");
+        }
+
+        #[test]
+        fn a_zero_round_id_is_refused_on_the_wire() {
+            let mut framed = wrap_v3(&summary(), RoundSide::Initiator, 7);
+            framed[6..14].copy_from_slice(&[0u8; 8]);
+            let r = try_unwrap_framed(&framed);
+            assert!(matches!(r, Err(ProtocolError::Decode(_))), "got {r:?}");
+        }
+
+        #[test]
+        fn a_truncated_v3_preamble_is_a_decode_error() {
+            let mut bytes = REPLICATION_FRAME_MAGIC.to_vec();
+            bytes.push(WIRE_PROTOCOL_VERSION_V3);
+            bytes.push(0);
+            bytes.extend_from_slice(&[0, 0, 0]); // ROUND cut short
+            let r = try_unwrap_framed(&bytes);
+            assert!(matches!(r, Err(ProtocolError::Decode(_))), "got {r:?}");
+        }
     }
 
     /// All four `ReplicationMessage` variants round-trip through
