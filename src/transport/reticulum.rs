@@ -590,6 +590,10 @@ const EVENT_ANNOUNCE_MIN_INTERVAL: Duration = Duration::from_secs(10);
 /// (CIRISEdge#425). RNS announces are periodic + idempotent, so a dropped one
 /// self-heals on the peer's next re-announce.
 const ANNOUNCE_QUEUE_DEPTH: usize = 256;
+/// CIRISEdge#627 — depth of the first-seen priority lane to the announce
+/// worker. A fresh peer's Stage 2 (rooting walk) rides here; sized for a burst
+/// of first contacts, not for churn — churn is the ordinary lane's job.
+const ANNOUNCE_PRIORITY_QUEUE_DEPTH: usize = 64;
 
 /// CIRISEdge#482 item 5 — window a `check_blackhole` deny-list snapshot stays
 /// valid before the next dial re-reads `blackhole_list()` from persist. Short
@@ -1309,6 +1313,18 @@ struct RootedPeer {
     /// authority composed downstream). Read by the epoch/upgrade guard so
     /// a same-epoch re-announce that finally roots upgrades an existing
     /// advisory binding instead of being ignored as stale.
+    ///
+    /// **`Advisory` is a TRUST verdict, not an ownership one** (CIRISEdge#627).
+    /// Since #627 the binding is installed inline from the announce (Stage 1,
+    /// directory-free) as `Advisory`, and under the operator's ruling that the
+    /// transport identity derives from the node key it carries `owns_key:
+    /// true` whenever the announce's transport ed25519 half equals its claimed
+    /// federation key and the self-signature verified under it. So an
+    /// `Advisory ∧ owns_key` binding means: *this announcer provably controls
+    /// its key and the transport identity derived from it; the directory has
+    /// not yet chained that key to a steward.* Authority-unestablished, not
+    /// identity-unestablished. Stage 2 (the rooting walk) is what moves it to
+    /// `Rooted`; nothing is served before that.
     provenance: ciris_persist::federation::self_at_login::BindingProvenance,
     /// CIRISEdge#314 — the peer's 16-byte transport identity hash
     /// (`Identity::from_public_keys(x25519, ed25519).hash()`), captured from the
@@ -1328,7 +1344,12 @@ struct RootedPeer {
     /// the directory binds to `key_id`? Captured at admit from the announce
     /// verdict (`Confirmed ⇒ true`; an Advisory admit ⇒ true only when the
     /// rejection was neither `UnknownKeyId` nor `PubkeyMismatch`, i.e. the pubkey
-    /// matched and the self-signature verified). This is the load-bearing signal
+    /// matched and the self-signature verified). CIRISEdge#627 adds the
+    /// directory-free proof for a first-seen peer: the announce's transport
+    /// ed25519 half (identity bytes 32..64) equals the claimed
+    /// `federation_pubkey_ed25519` and the signature verified under it — the
+    /// announcer controls the key and the identity derived from it. A legacy
+    /// peer whose two keys differ stays `false` until Stage 2. This is the load-bearing signal
     /// — alongside `provenance == Rooted` — that
     /// [`crate::transport::SourceKeyId::from_rooted_binding`] gates trace-serve
     /// attribution on: an Advisory or non-owning binding is never attributed, so
@@ -2103,6 +2124,12 @@ pub struct ReticulumTransport {
     /// (announce commitment + link-up `CBND` push). `None` → v1 announces
     /// byte-identical to pre-#436, nothing served.
     own_bundle: Option<OwnBuildBundle>,
+    /// CIRISEdge#627 — this node's own announce, pre-wrapped as a `CANN` frame
+    /// (encode once): the same signed attestation `local_attestation` carries
+    /// on the RNS plane, plus our 64-byte transport key and named dest. Pushed
+    /// FIRST on every link, before the `CBND` bundle. `None` only when no
+    /// attestation exists, which #333 already makes a construction error.
+    own_announce_frame: Option<Vec<u8>>,
     /// CIRISEdge#34 — shared event bus. Drives the AsyncIterator
     /// surface (`subscribe_announces` / `subscribe_interface_events`)
     /// in `crate::ffi::pyo3`. `None` means a transport built with no
@@ -2506,6 +2533,7 @@ impl ReticulumTransport {
             node: Arc::clone(&self.node),
             local_identity: self.local_identity.clone(),
             own_bundle: self.own_bundle.clone(),
+            own_announce_frame: self.own_announce_frame.clone(),
             dialed_link_dest: Arc::clone(&self.dialed_link_dest),
             reusable_dialed_link: Arc::clone(&self.reusable_dialed_link),
             link_in_flight: Arc::clone(&self.link_in_flight),
@@ -3068,6 +3096,15 @@ impl ReticulumTransport {
             congestion: Arc::new(crate::transport::av_backpressure::CongestionRegistry::default()),
             #[cfg(feature = "lxmf")]
             lxmf_serve: OnceLock::new(),
+            // CIRISEdge#627 — the announce that will ride every link. Same
+            // bytes as the RNS announce's app-data; framed once here.
+            own_announce_frame: local_attestation.as_ref().map(|app| {
+                crate::transport::announce_frame::encode(
+                    &local_transport_pubkey,
+                    local_named_dest_hash.into_bytes(),
+                    app,
+                )
+            }),
             local_attestation,
             local_signer,
             self_route,
@@ -4188,6 +4225,13 @@ impl ReticulumTransport {
             .identify_link(&link_id, &self.local_identity)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
+        // CIRISEdge#627 — the announce rides the link FIRST: after the
+        // LINKIDENTIFY (so the responder binds it to the identity it proved),
+        // before anything else on this link. Same task, same handle: nothing
+        // can reorder ahead of it.
+        if let Some(frame) = self.own_announce_frame.as_deref() {
+            push_own_announce_frame(&self.node, frame, &link_id).await;
+        }
         // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
         // LINKIDENTIFY so the responder can attribute the frame.
         if let Some(own) = self.own_bundle.as_ref() {
@@ -5754,10 +5798,21 @@ impl Transport for ReticulumTransport {
             // CIRISEdge#530 — cheap clone (every `EdgeMetrics` field is an `Arc`).
             metrics: self.metrics.clone(),
         };
-        let (announce_tx, mut announce_rx) =
-            mpsc::channel::<leviculum_core::ReceivedAnnounce>(ANNOUNCE_QUEUE_DEPTH);
+        let (announce_tx, mut announce_rx) = mpsc::channel::<AnnounceView>(ANNOUNCE_QUEUE_DEPTH);
+        // CIRISEdge#627 — the PRIORITY lane: announces whose Stage 1 installed a
+        // never-seen key. Drained first (`biased`), sized for a burst of fresh
+        // peers, so a re-announce flood can fill the ordinary lane without a
+        // first-contact peer ever being the one shed.
+        let (announce_priority_tx, mut announce_priority_rx) =
+            mpsc::channel::<AnnounceView>(ANNOUNCE_PRIORITY_QUEUE_DEPTH);
         tokio::spawn(async move {
-            while let Some(announce) = announce_rx.recv().await {
+            loop {
+                let next = tokio::select! {
+                    biased;
+                    v = announce_priority_rx.recv() => v,
+                    v = announce_rx.recv() => v,
+                };
+                let Some(announce) = next else { break };
                 resolve_announce_cold_start(announce, &announce_ctx).await;
             }
             tracing::debug!("announce cold-start worker exiting (channel closed)");
@@ -5815,9 +5870,13 @@ impl Transport for ReticulumTransport {
                         hybrid_policy: self.hybrid_policy,
                         binding_cache: &self.binding_cache,
                         announce_tx: &announce_tx,
+                        announce_priority_tx: &announce_priority_tx,
+                        transport_binding_enforcement: self.transport_binding_enforcement,
+                        metrics: self.metrics.as_ref(),
                         bundle_save_gate: self.bundle_save_gate,
                         peer_bundles: &self.peer_bundles,
                         own_bundle: self.own_bundle.as_ref(),
+                        own_announce_frame: self.own_announce_frame.as_deref(),
                         event_bus: self.event_bus.as_deref(),
                         link_established_at: &self.link_established_at,
                         reusable_dialed_link: &self.reusable_dialed_link,
@@ -5896,6 +5955,8 @@ struct DialCtx {
     node: Arc<ReticulumNode>,
     local_identity: Identity,
     own_bundle: Option<OwnBuildBundle>,
+    /// CIRISEdge#627 — see `ReticulumTransport::own_announce_frame`.
+    own_announce_frame: Option<Vec<u8>>,
     dialed_link_dest: Arc<Mutex<HashMap<LinkId, DestinationHash>>>,
     reusable_dialed_link: Arc<Mutex<HashMap<DestinationHash, Vec<LinkId>>>>,
     link_in_flight: Arc<Mutex<HashSet<LinkId>>>,
@@ -6052,6 +6113,10 @@ impl DialCtx {
             .await
             .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
 
+        // CIRISEdge#627 — announce FIRST (see `link_open`).
+        if let Some(frame) = self.own_announce_frame.as_deref() {
+            push_own_announce_frame(&self.node, frame, &link_id).await;
+        }
         // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
         // LINKIDENTIFY (so the responder attributes it) and BEFORE the
         // resource ship (the fragments ride the link Channel, which never
@@ -6151,7 +6216,16 @@ struct EventCtx<'a> {
     /// CIRISEdge#482 item 3 — hand-off channel to the announce cold-start
     /// worker. The `AnnounceReceived` arm `try_send`s here instead of running
     /// [`resolve_announce_cold_start`] inline on the EventReceiver task.
-    announce_tx: &'a mpsc::Sender<leviculum_core::ReceivedAnnounce>,
+    announce_tx: &'a mpsc::Sender<AnnounceView>,
+    /// CIRISEdge#627 — the PRIORITY lane to the same worker, for announces
+    /// whose Stage 1 installed a never-seen key. Drained before `announce_tx`.
+    announce_priority_tx: &'a mpsc::Sender<AnnounceView>,
+    /// CIRISEdge#627 — the destination-hash enforcement Stage 1 applies inline
+    /// (the same value the worker's `AnnounceCtx` carries).
+    transport_binding_enforcement: TransportBindingEnforcement,
+    /// CIRISEdge#627 — counters for `link_before_binding`,
+    /// `announce_queue_drop_first_seen`, `announce_to_binding_ms`.
+    metrics: Option<&'a crate::observability::EdgeMetrics>,
     /// CIRISEdge#437 — bundle-gate posture on the DURABLE Rooted save,
     /// applied to the write-through in [`resolve_announce_cold_start`].
     bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
@@ -6161,6 +6235,8 @@ struct EventCtx<'a> {
     /// CIRISEdge#436 — this node's own validated build bundle, served as a
     /// `CBND` frame on responder-side link-up. `None` → nothing served.
     own_bundle: Option<&'a OwnBuildBundle>,
+    /// CIRISEdge#627 — see `ReticulumTransport::own_announce_frame`.
+    own_announce_frame: Option<&'a [u8]>,
     /// CIRISEdge#34 — shared event bus for announce / interface
     /// emissions. `None` → no events emitted (the transport was
     /// constructed without `ReticulumAuth::event_bus`).
@@ -6265,6 +6341,12 @@ fn drop_resolved_to_self(link_id: LinkId, key_id: &str) {
 /// invariant is on the RESULT, not on the map's contents: the map is the
 /// consumer's to populate (CIRISServer#607 removes its self-entry at the
 /// source); this makes its contents unable to produce the failure.
+/// CIRISEdge#627 — a link's binding is installed inline from the announce it
+/// carries (`CANN`, Stage 1) before any frame is read on it, and every
+/// already-identified link is bound the moment its announcer's binding lands.
+/// A miss here on an identified link is therefore `link_before_binding`:
+/// counted, and it must read 0 — it is the alarm that the announce-before-link
+/// ordering broke, not a state a peer is designed to sit in.
 fn resolve_link_attribution(
     identified: Option<String>,
     dest: Option<DestinationHash>,
@@ -6640,6 +6722,16 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // the RAW candidate attribution, BEFORE the E3 `Rooted∧owns_key∧hybrid`
     // gate below: its whole purpose is to upgrade a peer that is still
     // Advisory — the very peers the gate (correctly) nulls.
+    // CIRISEdge#627 — the announce that rode the link. Consumed FIRST, before
+    // the bundle and before any attribution gate: its job is to make this link
+    // attributable, so it must not depend on attribution. Every outcome speaks
+    // inside `handle_announce_frame`.
+    if crate::transport::announce_frame::is_announce_frame(&data) {
+        handle_announce_frame(ctx, link_id, &data).await;
+        // choke-ok: consumed as a transport control frame; every refusal
+        // inside goes through `drop_inbound` by name.
+        return;
+    }
     if crate::transport::peer_bundle_frame::is_peer_bundle_frame(&data) {
         handle_peer_bundle_frame(ctx, link_id, candidate_key_id, &data).await;
         // choke-ok: consumed as a transport control frame, not a drop — every
@@ -6912,35 +7004,11 @@ fn select_reply_link(
 async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
     match event {
         NodeEvent::AnnounceReceived { announce, .. } => {
-            // The announce app-data carries the peer's signed attestation; the
-            // authenticated cold-start path roots the federation key, verifies
-            // the attestation signature, and applies the hybrid policy before
-            // the peer is recorded as resolvable (replaces v0.3.1 TOFU —
-            // CIRISEdge#15, AV-42). CIRISEdge#482 item 3 — that work is now
-            // handed to a dedicated worker (non-blocking `try_send`) so its DB
-            // round-trips don't head-of-line every other node event. Both drop
-            // paths are LOUD (never silent — CIRISEdge#425), but split so a DEAD
-            // worker (channel Closed) is diagnosable rather than masked as
-            // ordinary backpressure (queue Full).
-            match ctx.announce_tx.try_send(announce) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!(
-                        "announce DROPPED — cold-start worker queue FULL \
-                         (backpressure); RNS re-announce will retry (CIRISEdge#482 item 3)"
-                    );
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // The worker task is gone (exited or panicked). This is NOT
-                    // routine backpressure — every subsequent announce will be
-                    // dropped until the transport is rebuilt, so it is an ERROR.
-                    tracing::error!(
-                        "announce DROPPED — cold-start worker is GONE (channel \
-                         closed: the worker task exited); announces are no longer \
-                         being processed (CIRISEdge#482 item 3)"
-                    );
-                }
-            }
+            // CIRISEdge#627 — Stage 1 inline (directory-free; a parse, a
+            // signature verify and a map insert — no DB round-trip, so #482
+            // item 3's reason for offloading does not apply), then Stage 2
+            // (the rooting walk) to the worker on the lane its outcome earns.
+            receive_announce(ctx, AnnounceView::from_rns(&announce), None).await;
         }
         // v7.2.0: Leviculum v0.8.x upstream auto-accepts inbound link
         // requests internally — the v0.7.x `NodeEvent::LinkRequest` +
@@ -6981,10 +7049,18 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // ordering hazard). For links WE dialed the push happens on the
             // dial paths right after `identify_link`, so the bundle frame can
             // never outrun the LINKIDENTIFY the receiver attributes it by.
-            if let Some(own) = ctx.own_bundle {
+            {
                 let own_dialed = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
                 if !own_dialed {
-                    push_own_bundle_frames(ctx.node, own, &link_id).await;
+                    // CIRISEdge#627 — responder side: our announce rides the
+                    // peer's link back to it, FIRST, so the dialer binds us
+                    // without waiting for our RNS announce either.
+                    if let Some(frame) = ctx.own_announce_frame {
+                        push_own_announce_frame(ctx.node, frame, &link_id).await;
+                    }
+                    if let Some(own) = ctx.own_bundle {
+                        push_own_bundle_frames(ctx.node, own, &link_id).await;
+                    }
                 }
             }
         }
@@ -7101,6 +7177,16 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             }
             let matched_key = matched.map(|(k, _)| k);
             drop(peers_guard);
+            // CIRISEdge#627 — `link_before_binding`: a link came up IDENTIFIED
+            // and its announcer has no binding yet. Under the announce-on-link
+            // path this reads 0 in steady state (the CANN frame is the first
+            // thing on the link and Stage 1 binds it inline); a nonzero count
+            // is the alarm that the ordering broke, not a state to serve from.
+            if matched_key.is_none() && remote_identity_present {
+                if let Some(m) = ctx.metrics {
+                    m.inc_link_before_binding();
+                }
+            }
             if let Some(key_id) = matched_key {
                 ctx.link_to_peer_key_id.lock().await.insert(link_id, key_id);
             }
@@ -8111,6 +8197,54 @@ fn report_attribution_miss(
 /// transfer) and let the receiver's `attribute_and_deliver` reassemble it. A
 /// lost/backpressured push is recoverable (the next link-up re-serves) but
 /// never silent (throttled WARN).
+/// CIRISEdge#627 — push this node's `CANN` announce frame on a link, fragmented
+/// like the bundle (`CFRG`), through the same channel `try_send` so it rides the
+/// same lane in the same order. A lost push is recoverable (the RNS announce
+/// still exists; the next link-up re-serves) and never silent.
+async fn push_own_announce_frame(node: &ReticulumNode, frame: &[u8], link_id: &LinkId) {
+    let mdu = node.link_mdu(link_id).unwrap_or(0);
+    let Some(fragments) = crate::transport::frame_fragment::fragment(frame, mdu) else {
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            own_bundle_push_log().check("announce-degenerate-mdu")
+        {
+            tracing::warn!(
+                link = ?link_id,
+                mdu,
+                bytes = frame.len(),
+                suppressed_prev,
+                "own announce push skipped — link MDU too small to fragment; the peer must \
+                 bind us from the RNS announce instead (CIRISEdge#627)"
+            );
+        }
+        return;
+    };
+    let total = fragments.len();
+    let mut sent = 0usize;
+    for frag in &fragments {
+        if node.link_handle(link_id).try_send(frag).await.is_ok() {
+            sent += 1;
+        } else {
+            break;
+        }
+    }
+    if sent == total {
+        tracing::debug!(link = ?link_id, bytes = frame.len(), fragments = total,
+            "own announce served on link-up, first on the link (CIRISEdge#627)");
+    } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        own_bundle_push_log().check("announce-channel-backpressure")
+    {
+        tracing::warn!(
+            link = ?link_id,
+            fragments = total,
+            fragments_sent = sent,
+            suppressed_prev,
+            "own announce push incomplete ({sent}/{total} fragments) — link Channel \
+             backpressured; the peer binds us from the RNS announce or the next link-up \
+             (CIRISEdge#627)"
+        );
+    }
+}
+
 async fn push_own_bundle_frames(node: &ReticulumNode, own: &OwnBuildBundle, link_id: &LinkId) {
     let mdu = node.link_mdu(link_id).unwrap_or(0);
     let Some(fragments) = crate::transport::frame_fragment::fragment(&own.frame, mdu) else {
@@ -8468,6 +8602,155 @@ async fn commit_one_motion_upgrade(
 /// operands from the event context, run [`process_peer_bundle_frame`], and
 /// speak every refusal loudly (throttled on the fixed refusal tag — a refused
 /// package must never look like a stored/verified one).
+/// CIRISEdge#627 — receive an announce that rode the link (`CANN`).
+///
+/// Bound to the link by **equality, not trust**: the frame's 64-byte
+/// transport key must equal the link's proven remote `Identity`
+/// (`get_remote_identity(link).public_key_bytes()`), else it is dropped by
+/// name — a relayed or replayed announce from any other identity cannot bind
+/// this link. Then it is exactly an announce: Stage 1 inline (directory-free
+/// bind, links bound), Stage 2 queued (the rooting walk). The announce is the
+/// same signed attestation the RNS plane carries; nothing here grants trust
+/// the broadcast path would not.
+async fn handle_announce_frame(ctx: &EventCtx<'_>, link_id: LinkId, frame: &[u8]) {
+    let Some(decoded) = crate::transport::announce_frame::decode(frame) else {
+        drop_inbound(
+            Some(link_id),
+            "announce_frame_malformed",
+            "CANN frame did not decode (magic/version/length) — dropped (CIRISEdge#627)",
+        );
+        return;
+    };
+    let Some(remote) = ctx.node.get_remote_identity(&link_id) else {
+        drop_inbound(
+            Some(link_id),
+            "announce_frame_link_unidentified",
+            "CANN frame on a link with no proven remote identity — dropped; an announce \
+             binds only the identity the link proved (CIRISEdge#627)",
+        );
+        return;
+    };
+    let link_pubkey: [u8; 64] = remote.public_key_bytes()[..64]
+        .try_into()
+        .unwrap_or([0u8; 64]);
+    let Some(view) = announce_view_bound_to_link(&decoded, &link_pubkey) else {
+        drop_inbound(
+            Some(link_id),
+            "announce_frame_identity_mismatch",
+            "CANN frame's transport key is not this link's proven remote identity — \
+             dropped by name (a relayed/replayed announce cannot bind a link it did not \
+             come from; CIRISEdge#627)",
+        );
+        return;
+    };
+    receive_announce(ctx, view, Some(link_id)).await;
+}
+
+/// CIRISEdge#627 — the equality that binds a `CANN` frame to its link: the
+/// frame's 64-byte transport key must equal the link's proven remote identity
+/// (`x25519 ‖ ed25519`, all 64 bytes). `None` = not this link's announce.
+/// Pure, so the refusal is testable without a node.
+fn announce_view_bound_to_link(
+    decoded: &crate::transport::announce_frame::AnnounceOnLink<'_>,
+    link_pubkey64: &[u8; 64],
+) -> Option<AnnounceView> {
+    (decoded.transport_public_key == link_pubkey64).then(|| AnnounceView::from_on_link(decoded))
+}
+
+/// CIRISEdge#627 — which lane a Stage-2 hand-off rides. First-seen identities
+/// go to the priority lane; everything else to the ordinary one, so at capacity
+/// a re-announce is what gets shed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage2Lane {
+    Priority,
+    Ordinary,
+}
+
+fn stage2_lane(outcome: Stage1Outcome) -> Stage2Lane {
+    match outcome {
+        Stage1Outcome::InstalledNew => Stage2Lane::Priority,
+        Stage1Outcome::Refreshed | Stage1Outcome::Skipped(_) => Stage2Lane::Ordinary,
+    }
+}
+
+/// CIRISEdge#627 — the two-stage receipt shared by both carriers.
+///
+/// Stage 1 runs INLINE and never touches the directory: it makes the peer
+/// attributable now and binds every identified link that is this announcer.
+/// Stage 2 is the cold-start worker (the rooting walk that upgrades the
+/// binding to `Rooted ∧ owns_key`), reached through two lanes: a first-seen
+/// identity rides the PRIORITY lane, a re-announce the ordinary one, so at
+/// capacity a re-announce is what gets shed and a first-seen identity is never
+/// the one dropped (`announce_queue_drop_first_seen` counts the residual).
+async fn receive_announce(ctx: &EventCtx<'_>, view: AnnounceView, link: Option<LinkId>) {
+    let started = std::time::Instant::now();
+    let (outcome, key_id) =
+        stage1_bind_announce(&view, ctx.peers, ctx.transport_binding_enforcement).await;
+    let carrier = view.carrier;
+    if let (Stage1Outcome::InstalledNew, Some(key_id)) = (outcome, key_id.as_deref()) {
+        let bound = bind_identified_links_to(
+            ctx.node,
+            ctx.established_links,
+            ctx.link_to_peer_key_id,
+            view.transport_identity_hash(),
+            key_id,
+        )
+        .await;
+        let ms = started.elapsed().as_millis();
+        if let Some(m) = ctx.metrics {
+            m.record_announce_to_binding_ms(u64::try_from(ms).unwrap_or(u64::MAX));
+        }
+        tracing::info!(
+            key_id = %key_id,
+            ?carrier,
+            link = ?link,
+            links_bound = bound,
+            stage1_ms = ms,
+            "announce Stage 1: first-seen peer bound (Advisory) before any directory \
+             read — attributable now; Stage 2 (rooting) queued (CIRISEdge#627)"
+        );
+    } else {
+        tracing::debug!(key_id = ?key_id, ?carrier, ?outcome, "announce Stage 1");
+    }
+    // Stage 2 — the directory walk, off the event task (#482 item 3 kept).
+    let lane = stage2_lane(outcome);
+    let tx = match lane {
+        Stage2Lane::Priority => ctx.announce_priority_tx,
+        Stage2Lane::Ordinary => ctx.announce_tx,
+    };
+    match tx.try_send(view) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            if lane == Stage2Lane::Priority {
+                // The one thing this lane exists to prevent. Counted; must be 0.
+                if let Some(m) = ctx.metrics {
+                    m.inc_announce_queue_drop_first_seen();
+                }
+                tracing::error!(
+                    key_id = ?key_id,
+                    ?carrier,
+                    "announce Stage 2 DROPPED for a FIRST-SEEN peer — priority lane full. \
+                     The peer is attributable (Stage 1 bound it) but will not root until its \
+                     next announce (CIRISEdge#627)"
+                );
+            } else {
+                tracing::warn!(
+                    key_id = ?key_id,
+                    "announce Stage 2 shed — re-announce of a bound peer, worker queue full \
+                     (backpressure); RNS re-announce will retry (CIRISEdge#482 item 3)"
+                );
+            }
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::error!(
+                "announce Stage 2 DROPPED — cold-start worker is GONE (channel closed: the \
+                 worker task exited); rooting is no longer being processed (CIRISEdge#482 \
+                 item 3)"
+            );
+        }
+    }
+}
+
 async fn handle_peer_bundle_frame(
     ctx: &EventCtx<'_>,
     link_id: LinkId,
@@ -8543,11 +8826,245 @@ async fn handle_peer_bundle_frame(
     }
 }
 
+/// CIRISEdge#627 — what Stage 1 did with an announce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage1Outcome {
+    /// A binding for a key this node had NEVER seen was installed — the
+    /// first-seen case the whole issue is about. Stage 2 gets the priority lane.
+    InstalledNew,
+    /// The same announcer (same 64-byte transport key) re-announced; the route
+    /// fields were refreshed in place, trust untouched.
+    Refreshed,
+    /// Stage 1 declined to decide: the key is bound to a DIFFERENT transport
+    /// key (a re-key, an owner heal over a Rooted route, or a spoof — the
+    /// existing supersession rules in Stage 2 own every one of those verdicts),
+    /// or the announce failed a directory-free check. Nothing was written.
+    Skipped(&'static str),
+}
+
+/// CIRISEdge#627 — **Stage 1: attribution never waits on the directory.**
+///
+/// Everything here is decidable from the announce bytes and the peers map:
+/// parse, the RNS §5.6.8.8.1.1 destination recompute (under the configured
+/// enforcement), the attestation's self-signature, and — under the operator's
+/// ruling that *the transport identity is a derivative of the node key* — the
+/// ownership proof: the claimed `federation_pubkey_ed25519` equals the
+/// transport ed25519 half (bytes 32..64 of the announcer's identity), and the
+/// signature verified under that same key. An announcer that satisfies both
+/// controls the federation key AND the transport identity derived from it;
+/// that is `owns_key`. A legacy peer whose two keys differ gets `owns_key:
+/// false` here and is lifted only by Stage 2's directory walk.
+///
+/// # What Stage 1 will and will not write
+///
+/// It installs a binding only when the map has NO entry for the key
+/// (first-seen — the case #624 measured as 0 rounds served) or when the entry
+/// carries the SAME 64-byte transport key (the same node re-announcing: route
+/// refresh, trust untouched). Any other shape — the key bound to a different
+/// transport key — is left to Stage 2 unchanged, so #337 `HijackRefused`,
+/// #404 `AdmitRouteKeepTrust` and #336's owner heal keep their single
+/// implementation in [`route_supersession_decision`]. Stage 1 therefore
+/// cannot reroute or re-trust an existing binding; it can only make a
+/// never-seen peer attributable, at `Advisory`.
+///
+/// # Security
+///
+/// A Stage-1 binding is `Advisory` and never satisfies
+/// [`SourceKeyId::from_rooted_binding`] (`Rooted ∧ owns_key`), so nothing is
+/// SERVED on its strength — E3 is untouched. What it buys is exactly what the
+/// bootstrap carve-out (#402/#624) allows an identified link: the peer's own
+/// self-authenticating `Key` / `IdentityOccurrence` / `TransportDestination`
+/// rows are attributed and admitted, and the identity round completes.
+async fn stage1_bind_announce(
+    view: &AnnounceView,
+    peers: &Mutex<HashMap<String, RootedPeer>>,
+    enforcement: TransportBindingEnforcement,
+) -> (Stage1Outcome, Option<String>) {
+    use ciris_persist::federation::self_at_login::BindingProvenance;
+    let Ok(attestation) = AnnounceAttestation::from_app_data(view.app_data()) else {
+        return (Stage1Outcome::Skipped("not a CIRIS attestation"), None);
+    };
+    let key_id = attestation.federation_key_id.clone();
+    if !view.verify_destination_hash()
+        && matches!(
+            enforcement,
+            TransportBindingEnforcement::RequireTransportBinding
+        )
+    {
+        return (
+            Stage1Outcome::Skipped("destination_hash mismatch"),
+            Some(key_id),
+        );
+    }
+    if !attestation_self_verifies(&attestation, &key_id, view.public_key()) {
+        return (Stage1Outcome::Skipped("self-signature"), Some(key_id));
+    }
+    // The ruling: transport identity derives from the node key. Bytes
+    // compared: the announce's transport ed25519 half (identity bytes 32..64)
+    // against the attestation's claimed federation Ed25519 public key.
+    let transport_ed25519: [u8; 32] = view.public_key()[32..].try_into().unwrap_or([0u8; 32]);
+    let owns_key = transport_ed25519 == attestation.federation_pubkey_ed25519;
+    let transport_pubkey64 = *view.public_key();
+    let transport_identity_hash = view.transport_identity_hash();
+    let resolved = ResolvedPeer {
+        dest_hash: *view.destination_hash(),
+        signing_key: transport_ed25519,
+    };
+    let mut peers = peers.lock().await;
+    match peers.get_mut(&key_id) {
+        None => {
+            peers.insert(
+                key_id.clone(),
+                RootedPeer {
+                    peer: resolved,
+                    epoch: attestation.epoch,
+                    chain: None,
+                    provenance: BindingProvenance::Advisory,
+                    transport_identity_hash,
+                    owns_key,
+                    transport_pubkey64,
+                    last_seen: std::time::Instant::now(),
+                    manifest_commitment: attestation.manifest_commitment,
+                },
+            );
+            (Stage1Outcome::InstalledNew, Some(key_id))
+        }
+        Some(existing) if existing.transport_pubkey64 == transport_pubkey64 => {
+            // Same node, same keys: refresh the route and the clock, never the
+            // trust. A newer epoch moves the dest; an older one does not.
+            if attestation.epoch >= existing.epoch {
+                existing.peer = resolved;
+                existing.epoch = attestation.epoch;
+            }
+            existing.last_seen = std::time::Instant::now();
+            (Stage1Outcome::Refreshed, Some(key_id))
+        }
+        Some(_) => (
+            Stage1Outcome::Skipped("key bound to a different transport key — Stage 2 decides"),
+            Some(key_id),
+        ),
+    }
+}
+
+/// CIRISEdge#627 — after Stage 1 installs a binding, bind every link that is
+/// ALREADY identified as this announcer. `link_to_peer_key_id` is otherwise
+/// populated only at `LinkIdentified`, so a link that came up before its
+/// announce was applied would stay unattributed until it closed — which is the
+/// "links beat the announce" ordering this issue exists to make harmless.
+async fn bind_identified_links_to(
+    node: &ReticulumNode,
+    established: &Mutex<HashSet<LinkId>>,
+    link_to_peer_key_id: &Mutex<HashMap<LinkId, String>>,
+    transport_identity_hash: [u8; 16],
+    key_id: &str,
+) -> usize {
+    let links: Vec<LinkId> = established.lock().await.iter().copied().collect();
+    let mut bound = 0usize;
+    for link_id in links {
+        let matches = node
+            .get_remote_identity(&link_id)
+            .is_some_and(|id| *id.hash() == transport_identity_hash);
+        if matches {
+            link_to_peer_key_id
+                .lock()
+                .await
+                .insert(link_id, key_id.to_owned());
+            bound += 1;
+        }
+    }
+    bound
+}
+
+/// CIRISEdge#627 — **one announce, two carriers.** Everything the cold-start
+/// resolver reads from an announce, decoupled from `leviculum_core::
+/// ReceivedAnnounce` so the SAME resolver runs for an announce that arrived
+/// on the RNS broadcast plane and for one that rode a link as a `CANN` frame
+/// ([`crate::transport::announce_frame`]). The four accessors mirror
+/// `ReceivedAnnounce`'s by name and return type, so the resolver body is
+/// carrier-blind.
+///
+/// `dest_verified` is computed at construction by the carrier: leviculum's
+/// `verify_destination_hash()` for the RNS packet; the identical recompute
+/// (`truncated_hash(name_hash ‖ identity_hash)`) for the on-link frame, under
+/// the SAME edge app name/aspect the node announces on.
+#[derive(Debug, Clone)]
+struct AnnounceView {
+    destination_hash: DestinationHash,
+    public_key: [u8; 64],
+    app_data: Vec<u8>,
+    dest_verified: bool,
+    /// How this announce reached us — the log/metric discriminator only;
+    /// verification is identical on both paths.
+    carrier: AnnounceCarrier,
+}
+
+/// CIRISEdge#627 — which plane carried an announce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnounceCarrier {
+    /// The RNS broadcast announce (`NodeEvent::AnnounceReceived`).
+    Rns,
+    /// A `CANN` frame on an established link whose remote identity equals the
+    /// announcer's transport key (bound by equality at receipt).
+    OnLink,
+}
+
+impl AnnounceView {
+    fn from_rns(announce: &leviculum_core::ReceivedAnnounce) -> Self {
+        Self {
+            destination_hash: *announce.destination_hash(),
+            public_key: *announce.public_key(),
+            app_data: announce.app_data().to_vec(),
+            dest_verified: announce.verify_destination_hash(),
+            carrier: AnnounceCarrier::Rns,
+        }
+    }
+
+    /// Build the view for an on-link announce. `dest_verified` is the same
+    /// RNS §5.6.8.8.1.1 recompute leviculum applies to a broadcast announce.
+    fn from_on_link(frame: &crate::transport::announce_frame::AnnounceOnLink<'_>) -> Self {
+        let x25519: [u8; 32] = frame.transport_public_key[..32]
+            .try_into()
+            .unwrap_or([0u8; 32]);
+        let ed25519: [u8; 32] = frame.transport_public_key[32..]
+            .try_into()
+            .unwrap_or([0u8; 32]);
+        let announced = DestinationHash::new(frame.announced_dest);
+        let dest_verified = Identity::from_public_keys(&x25519, &ed25519).is_ok_and(|id| {
+            let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
+            Destination::compute_destination_hash(&name_hash, id.hash()) == announced
+        });
+        Self {
+            destination_hash: announced,
+            public_key: *frame.transport_public_key,
+            app_data: frame.app_data.to_vec(),
+            dest_verified,
+            carrier: AnnounceCarrier::OnLink,
+        }
+    }
+
+    fn destination_hash(&self) -> &DestinationHash {
+        &self.destination_hash
+    }
+    fn public_key(&self) -> &[u8; 64] {
+        &self.public_key
+    }
+    fn app_data(&self) -> &[u8] {
+        &self.app_data
+    }
+    fn verify_destination_hash(&self) -> bool {
+        self.dest_verified
+    }
+    /// The identity hash a link's LINKIDENTIFY proves for this announcer:
+    /// `truncated_hash(x25519 ‖ ed25519)`.
+    fn transport_identity_hash(&self) -> [u8; 16] {
+        let x25519: [u8; 32] = self.public_key[..32].try_into().unwrap_or([0u8; 32]);
+        let ed25519: [u8; 32] = self.public_key[32..].try_into().unwrap_or([0u8; 32]);
+        Identity::from_public_keys(&x25519, &ed25519).map_or([0u8; 16], |id| *id.hash())
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-async fn resolve_announce_cold_start(
-    announce: leviculum_core::ReceivedAnnounce,
-    ctx: &AnnounceCtx,
-) {
+async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) {
     use ciris_persist::federation::self_at_login::BindingProvenance;
     // Step 0 — the cold-start path needs the persist directory. With
     // no rooting backend the announce cannot be authenticated; drop
@@ -10495,6 +11012,340 @@ mod tests {
                     proptest::prop_assert_eq!(verdict, BootstrapEquality::NotApplicable);
                 }
             }
+        }
+    }
+
+    /// CIRISEdge#627 — Stage 1 of announce receipt, witnessed with a REAL
+    /// signed attestation and NO directory anywhere in the test: the binding a
+    /// first-seen peer gets is decided from the announce bytes alone.
+    mod announce_stage1_627 {
+        use super::*;
+        use ciris_persist::federation::self_at_login::BindingProvenance;
+
+        fn ed_seed(tag: u8) -> [u8; 32] {
+            let mut s = [0u8; 32];
+            for (i, b) in s.iter_mut().enumerate() {
+                *b = u8::try_from(i % 251).expect("in range") ^ tag;
+            }
+            s
+        }
+
+        /// A hybrid federation signer over `ed_seed`.
+        fn signer(key_id: &str, ed: [u8; 32]) -> LocalSigner {
+            let mut pqc = ed;
+            pqc[0] ^= 0x55;
+            let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+                ciris_keyring::Ed25519SoftwareSigner::from_bytes(&ed, key_id).expect("ed25519"),
+            );
+            let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+                ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                    &pqc,
+                    format!("{key_id}-pqc"),
+                )
+                .expect("ml_dsa_65"),
+            );
+            LocalSigner::new(key_id, classical, Some(pqc))
+        }
+
+        /// The RNS transport identity `x25519_priv ‖ ed25519_priv`. Under the
+        /// operator's ruling the ed25519 half IS the federation key, so the
+        /// ruled shape passes the signer's own seed as the ed25519 half.
+        fn transport_identity(x_seed: [u8; 32], ed: [u8; 32]) -> Identity {
+            let mut prv = [0u8; 64];
+            prv[..32].copy_from_slice(&x_seed);
+            prv[32..].copy_from_slice(&ed);
+            Identity::from_private_key_bytes(&prv).expect("identity")
+        }
+
+        fn named_dest(identity: &Identity) -> DestinationHash {
+            let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
+            Destination::compute_destination_hash(&name_hash, identity.hash())
+        }
+
+        /// An announce as it would ride a link (`CANN`), decoded into the
+        /// carrier-blind view.
+        async fn announce(
+            signer: &LocalSigner,
+            identity: &Identity,
+            key_id: &str,
+            epoch: u64,
+            dest: DestinationHash,
+        ) -> AnnounceView {
+            let pk64 = identity.public_key_bytes();
+            let ed: [u8; 32] = pk64[32..].try_into().expect("ed half");
+            let x: [u8; 32] = pk64[..32].try_into().expect("x half");
+            let app = build_local_attestation(signer, &ed, &x, key_id, epoch, None)
+                .await
+                .expect("attestation");
+            let frame = crate::transport::announce_frame::encode(&pk64, dest.into_bytes(), &app);
+            let decoded = crate::transport::announce_frame::decode(&frame).expect("decodes");
+            AnnounceView::from_on_link(&decoded)
+        }
+
+        fn empty_peers() -> Mutex<HashMap<String, RootedPeer>> {
+            Mutex::new(HashMap::new())
+        }
+
+        /// **The issue's case.** A never-seen peer, no announce ever applied, no
+        /// directory in sight: Stage 1 binds it from the announce alone, and —
+        /// because its transport ed25519 half IS its federation key — with
+        /// `owns_key: true`. E3 is untouched: the binding is `Advisory` and
+        /// `from_rooted_binding` still says no.
+        #[tokio::test]
+        async fn a_first_seen_peer_is_bound_inline_with_no_directory_and_owns_its_key() {
+            let ed = ed_seed(0x11);
+            let signer = signer("fresh-peer", ed);
+            let identity = transport_identity(ed_seed(0x22), ed);
+            let view = announce(&signer, &identity, "fresh-peer", 1, named_dest(&identity)).await;
+            assert!(
+                view.verify_destination_hash(),
+                "the on-link dest recompute matches"
+            );
+            let peers = empty_peers();
+
+            let (outcome, key) = stage1_bind_announce(
+                &view,
+                &peers,
+                TransportBindingEnforcement::RequireTransportBinding,
+            )
+            .await;
+
+            assert_eq!(
+                outcome,
+                Stage1Outcome::InstalledNew,
+                "first-seen ⇒ installed inline"
+            );
+            assert_eq!(key.as_deref(), Some("fresh-peer"));
+            let map = peers.lock().await;
+            let rp = map.get("fresh-peer").expect("bound");
+            assert_eq!(
+                rp.provenance,
+                BindingProvenance::Advisory,
+                "Stage 1 is Advisory"
+            );
+            assert!(
+                rp.owns_key,
+                "transport ed25519 half == federation key ∧ self-signature verified ⇒ owns_key"
+            );
+            assert_eq!(rp.transport_identity_hash, *identity.hash());
+            assert_eq!(rp.peer.dest_hash, named_dest(&identity));
+            assert!(
+                crate::transport::SourceKeyId::from_rooted_binding(
+                    "fresh-peer",
+                    rp.provenance,
+                    rp.owns_key
+                )
+                .is_none(),
+                "E3: a Stage-1 binding can never reach the trace-serve constructor"
+            );
+        }
+
+        /// A legacy peer whose transport identity is NOT derived from its
+        /// federation key is still bound (attributable for its bootstrap
+        /// kinds) but proves no ownership here — Stage 2 lifts it.
+        #[tokio::test]
+        async fn a_legacy_peer_whose_transport_key_is_not_its_federation_key_binds_without_owns_key(
+        ) {
+            let signer = signer("legacy-peer", ed_seed(0x31));
+            let identity = transport_identity(ed_seed(0x32), ed_seed(0x33)); // ≠ federation key
+            let view = announce(&signer, &identity, "legacy-peer", 1, named_dest(&identity)).await;
+            let peers = empty_peers();
+            let (outcome, _) =
+                stage1_bind_announce(&view, &peers, TransportBindingEnforcement::Advisory).await;
+            assert_eq!(outcome, Stage1Outcome::InstalledNew);
+            let map = peers.lock().await;
+            let rp = map.get("legacy-peer").expect("bound");
+            assert!(
+                !rp.owns_key,
+                "no directory-free proof of ownership for a split key"
+            );
+            assert_eq!(rp.provenance, BindingProvenance::Advisory);
+        }
+
+        /// The same node re-announcing (same 64-byte transport key) refreshes
+        /// its route and its clock and touches NOTHING about trust — a Rooted
+        /// binding stays Rooted.
+        #[tokio::test]
+        async fn a_same_key_re_announce_refreshes_the_route_and_never_the_trust() {
+            let ed = ed_seed(0x41);
+            let signer = signer("known-peer", ed);
+            let identity = transport_identity(ed_seed(0x42), ed);
+            let first = announce(&signer, &identity, "known-peer", 1, named_dest(&identity)).await;
+            let peers = empty_peers();
+            stage1_bind_announce(&first, &peers, TransportBindingEnforcement::Advisory).await;
+            // Stage 2 rooted it in the meantime.
+            peers
+                .lock()
+                .await
+                .get_mut("known-peer")
+                .expect("bound")
+                .provenance = BindingProvenance::Rooted;
+
+            let new_dest = DestinationHash::new([0xAB; 16]);
+            let again = announce(&signer, &identity, "known-peer", 2, new_dest).await;
+            let (outcome, _) =
+                stage1_bind_announce(&again, &peers, TransportBindingEnforcement::Advisory).await;
+
+            assert_eq!(outcome, Stage1Outcome::Refreshed);
+            let map = peers.lock().await;
+            let rp = map.get("known-peer").expect("still bound");
+            assert_eq!(rp.provenance, BindingProvenance::Rooted, "trust untouched");
+            assert_eq!(rp.epoch, 2);
+            assert_eq!(rp.peer.dest_hash, new_dest, "route refreshed");
+        }
+
+        /// **The hijack pin.** A key already bound to a DIFFERENT transport key
+        /// is never rebound by Stage 1 — that verdict (#337 HijackRefused, #404
+        /// heal, #336 owner heal) has exactly one implementation, in Stage 2's
+        /// `route_supersession_decision`. Stage 1 writes nothing.
+        #[tokio::test]
+        async fn stage1_never_rebinds_a_key_to_a_different_transport_key() {
+            let ed = ed_seed(0x51);
+            let owner = signer("victim", ed);
+            let owner_identity = transport_identity(ed_seed(0x52), ed);
+            let peers = empty_peers();
+            let genuine = announce(
+                &owner,
+                &owner_identity,
+                "victim",
+                5,
+                named_dest(&owner_identity),
+            )
+            .await;
+            stage1_bind_announce(&genuine, &peers, TransportBindingEnforcement::Advisory).await;
+            peers
+                .lock()
+                .await
+                .get_mut("victim")
+                .expect("bound")
+                .provenance = BindingProvenance::Rooted;
+            let before = peers.lock().await.get("victim").expect("bound").clone();
+
+            // An attacker with its OWN keypair claims `key_id = "victim"`; the
+            // self-signature verifies under the attacker's key, so the only thing
+            // standing between it and a reroute is this rule.
+            let attacker = signer("victim", ed_seed(0x61));
+            let attacker_identity = transport_identity(ed_seed(0x62), ed_seed(0x61));
+            let forged = announce(
+                &attacker,
+                &attacker_identity,
+                "victim",
+                99,
+                named_dest(&attacker_identity),
+            )
+            .await;
+            let (outcome, _) =
+                stage1_bind_announce(&forged, &peers, TransportBindingEnforcement::Advisory).await;
+
+            assert!(
+                matches!(outcome, Stage1Outcome::Skipped(_)),
+                "Stage 2 decides: {outcome:?}"
+            );
+            let after = peers
+                .lock()
+                .await
+                .get("victim")
+                .expect("still bound")
+                .clone();
+            assert_eq!(
+                after.transport_pubkey64, before.transport_pubkey64,
+                "not rerouted"
+            );
+            assert_eq!(after.peer.dest_hash, before.peer.dest_hash);
+            assert_eq!(after.provenance, BindingProvenance::Rooted);
+            assert_eq!(after.epoch, before.epoch);
+        }
+
+        /// A forged self-signature writes nothing.
+        #[tokio::test]
+        async fn a_forged_self_signature_writes_nothing() {
+            let ed = ed_seed(0x71);
+            let signer = signer("forger", ed);
+            let identity = transport_identity(ed_seed(0x72), ed);
+            let mut view = announce(&signer, &identity, "forger", 1, named_dest(&identity)).await;
+            // Flip one byte of the app-data (inside the signed payload/signature).
+            let last = view.app_data.len() - 1;
+            view.app_data[last] ^= 0x01;
+            let peers = empty_peers();
+            let (outcome, _) =
+                stage1_bind_announce(&view, &peers, TransportBindingEnforcement::Advisory).await;
+            assert!(matches!(outcome, Stage1Outcome::Skipped(_)), "{outcome:?}");
+            assert!(peers.lock().await.is_empty(), "nothing written");
+        }
+
+        /// A `CANN` frame binds only the link whose proven identity it names:
+        /// the frame's 64-byte transport key must equal the link's.
+        #[tokio::test]
+        async fn an_on_link_announce_from_another_identity_does_not_bind_the_link() {
+            let ed = ed_seed(0x81);
+            let signer = signer("announcer", ed);
+            let identity = transport_identity(ed_seed(0x82), ed);
+            let pk64 = identity.public_key_bytes();
+            let x: [u8; 32] = pk64[..32].try_into().expect("x");
+            let e: [u8; 32] = pk64[32..].try_into().expect("e");
+            let app = build_local_attestation(&signer, &e, &x, "announcer", 1, None)
+                .await
+                .expect("attestation");
+            let frame = crate::transport::announce_frame::encode(
+                &pk64,
+                named_dest(&identity).into_bytes(),
+                &app,
+            );
+            let decoded = crate::transport::announce_frame::decode(&frame).expect("decodes");
+
+            let other = transport_identity(ed_seed(0x91), ed_seed(0x92)).public_key_bytes();
+            assert!(
+                announce_view_bound_to_link(&decoded, &other).is_none(),
+                "a relayed/replayed announce cannot bind a link it did not come from"
+            );
+            assert!(announce_view_bound_to_link(&decoded, &pk64).is_some());
+        }
+
+        /// The on-link carrier runs the SAME RNS §5.6.8.8.1.1 recompute the
+        /// broadcast carrier does; a wrong announced dest fails it and, under
+        /// `RequireTransportBinding`, Stage 1 declines.
+        #[tokio::test]
+        async fn a_wrong_announced_dest_fails_the_recompute() {
+            let ed = ed_seed(0xA1);
+            let signer = signer("liar", ed);
+            let identity = transport_identity(ed_seed(0xA2), ed);
+            let view = announce(
+                &signer,
+                &identity,
+                "liar",
+                1,
+                DestinationHash::new([0xEE; 16]),
+            )
+            .await;
+            assert!(!view.verify_destination_hash());
+            let peers = empty_peers();
+            let (outcome, _) = stage1_bind_announce(
+                &view,
+                &peers,
+                TransportBindingEnforcement::RequireTransportBinding,
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                Stage1Outcome::Skipped("destination_hash mismatch")
+            ));
+            assert!(peers.lock().await.is_empty());
+        }
+
+        /// A first-seen identity rides the priority lane; a re-announce or a
+        /// declined announce rides the ordinary one — so at capacity a
+        /// re-announce is what gets shed, never a first contact.
+        #[test]
+        fn first_seen_rides_the_priority_lane() {
+            assert_eq!(
+                stage2_lane(Stage1Outcome::InstalledNew),
+                Stage2Lane::Priority
+            );
+            assert_eq!(stage2_lane(Stage1Outcome::Refreshed), Stage2Lane::Ordinary);
+            assert_eq!(
+                stage2_lane(Stage1Outcome::Skipped("x")),
+                Stage2Lane::Ordinary
+            );
         }
     }
 

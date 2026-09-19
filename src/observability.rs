@@ -880,6 +880,18 @@ pub struct EdgeMetrics {
     /// rides on the matching throttled DEBUG line, and keying by peer would make
     /// cardinality grow with exactly the pollution this counts.
     pub announce_intake_evictions: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#627 — links that came up IDENTIFIED before their announcer had
+    /// a binding. Under announce-on-link + inline Stage 1 this is 0 in steady
+    /// state; nonzero means the ordering the design guarantees broke.
+    pub link_before_binding: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#627 — first-seen announces whose Stage 2 (rooting walk) was
+    /// dropped at a full priority lane. Must read 0 in every harness run.
+    pub announce_queue_drop_first_seen: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#627 — Stage-1 latency of the most recent first-seen bind
+    /// (announce receipt → binding installed + links bound), milliseconds.
+    /// A gauge of the last value, not a histogram: the question it answers is
+    /// "is Stage 1 still directory-free?" — it should sit at 0–2 ms.
+    pub announce_to_binding_ms_last: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#547 — unix seconds at which the last anti-entropy round
     /// TERMINATED. `0` means "no round has completed since boot".
     ///
@@ -1100,6 +1112,40 @@ impl EdgeMetrics {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// CIRISEdge#627 — a link came up identified before its announcer was bound.
+    pub fn inc_link_before_binding(&self) {
+        self.link_before_binding
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// CIRISEdge#627 — read `link_before_binding`.
+    #[must_use]
+    pub fn link_before_binding(&self) -> u64 {
+        self.link_before_binding
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// CIRISEdge#627 — a first-seen announce's Stage 2 was dropped at capacity.
+    pub fn inc_announce_queue_drop_first_seen(&self) {
+        self.announce_queue_drop_first_seen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// CIRISEdge#627 — read `announce_queue_drop_first_seen`.
+    #[must_use]
+    pub fn announce_queue_drop_first_seen(&self) -> u64 {
+        self.announce_queue_drop_first_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// CIRISEdge#627 — record the latest Stage-1 announce→binding latency.
+    pub fn record_announce_to_binding_ms(&self, ms: u64) {
+        self.announce_to_binding_ms_last
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// CIRISEdge#627 — read the latest Stage-1 latency.
+    #[must_use]
+    pub fn announce_to_binding_ms_last(&self) -> u64 {
+        self.announce_to_binding_ms_last
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// CIRISEdge#48-B (v0.19.6) — increment the
     /// `inbound_dropped_low_trust` counter. Called from
     /// `dispatch_inbound` once per drop.
@@ -1259,6 +1305,9 @@ impl EdgeMetrics {
             replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
             announce_intake_evictions: self.announce_intake_evictions(),
+            link_before_binding: self.link_before_binding(),
+            announce_queue_drop_first_seen: self.announce_queue_drop_first_seen(),
+            announce_to_binding_ms_last: self.announce_to_binding_ms_last(),
             withholds_by_reason: self.withholds_by_reason.read().clone(),
             recent_withholds: self.recent_withholds.read().iter().cloned().collect(),
             replication_envelopes_served_total: self
@@ -1303,6 +1352,13 @@ pub struct EdgeMetricsBundle {
     /// announce-intake map under capacity backpressure. Zero on a node with room;
     /// climbing on one at cap. `Rooted` bindings are pinned and never counted.
     pub announce_intake_evictions: u64,
+    /// CIRISEdge#627 — links identified before their announcer was bound.
+    /// 0 in steady state; nonzero = the announce-before-link ordering broke.
+    pub link_before_binding: u64,
+    /// CIRISEdge#627 — first-seen announces shed at a full priority lane. 0.
+    pub announce_queue_drop_first_seen: u64,
+    /// CIRISEdge#627 — latest Stage-1 announce→binding latency, ms (0–2 expected).
+    pub announce_to_binding_ms_last: u64,
     /// CIRISEdge#433 — cumulative per-reason withhold count. Empty on an IDLE
     /// node; non-empty on a WITHHOLDING one. That difference is the whole point.
     pub withholds_by_reason: HashMap<WithholdReason, u64>,

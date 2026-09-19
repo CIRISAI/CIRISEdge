@@ -96,17 +96,19 @@ mod tests {
         assert_eq!(decode(b""), None);
     }
 
-    /// The four link-frame magics stay pairwise distinct — the dispatch
-    /// invariant the module docs promise.
+    /// The five link-frame magics stay pairwise distinct — the dispatch
+    /// invariant the module docs promise (`CANN` joined in CIRISEdge#627).
     #[test]
     fn magic_is_distinct_from_every_other_link_frame_magic() {
         use crate::replication::wire_frame::REPLICATION_FRAME_MAGIC;
+        use crate::transport::announce_frame::ANNOUNCE_FRAME_MAGIC;
         use crate::transport::frame_fragment::{FRAGMENT_MAGIC, NAK_MAGIC};
         let magics = [
             PEER_BUNDLE_MAGIC,
             REPLICATION_FRAME_MAGIC,
             FRAGMENT_MAGIC,
             NAK_MAGIC,
+            ANNOUNCE_FRAME_MAGIC,
         ];
         for (i, a) in magics.iter().enumerate() {
             for b in magics.iter().skip(i + 1) {

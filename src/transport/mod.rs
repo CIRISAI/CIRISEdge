@@ -139,6 +139,10 @@ pub mod packet_radio;
 #[cfg(feature = "_reticulum-module")]
 pub mod attestation;
 
+/// CIRISEdge#627 — the announce-on-link (`CANN`) frame: this node's signed
+/// announce attestation pushed FIRST on every link, bound to the link's proven
+/// remote identity by equality. Read the module docs before touching the wire.
+pub mod announce_frame;
 /// CIRISEdge#436 — the link-borne build-attestation-bundle frame (`CBND`):
 /// the arrival transport that feeds the #437 bundle gate.
 pub mod peer_bundle_frame;
