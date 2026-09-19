@@ -252,7 +252,7 @@ pub enum WithholdReason {
     /// send-set resolution and the #386 leg-B trust-root walk. A wiring fault,
     /// not a policy decision — the `detail` names which site observed it.
     LocalIdentityMissing,
-    /// The consent send-set (`list_consent_peers(local)`, persist's E7
+    /// The consent send-set (`consent_peers_by_principals(local)`, persist's E7
     /// projection) could not be read. Fail-closed: a transient directory error
     /// is NOT a statement that the peer is unconsented (#396 item 1).
     SendSetUnresolved,
