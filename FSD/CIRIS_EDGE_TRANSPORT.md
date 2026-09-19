@@ -378,15 +378,44 @@ announces under `route_supersession_decision` (a pure, exhaustively-tested fn):
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Advisory: self-consistent announce (owns_key, not steward-rooted)
+    [*] --> Unidentified: link up, no remote identity proven
+    Unidentified --> Identified: transport proves the remote identity (Reticulum link identity)
+    Identified --> Advisory: self-consistent announce (owns_key, not steward-rooted)
     Advisory --> Rooted: roots to a trusted steward (advisory→rooted upgrade)
     Rooted --> Rooted: owner re-announce (Admit / AdmitRouteKeepTrust)
     Advisory --> Advisory: owner re-announce (Admit)
+    note right of Identified
+        The state #624 found missing: the link is
+        IDENTIFIED (a transport fact, from the first
+        packet) but not yet ATTRIBUTABLE (needs the
+        announce). A fresh peer lives here for the
+        whole first contact.
+    end note
     note right of Rooted
         HijackRefused: a non-owning announce can
         NEVER supersede a Rooted route (#337 CRITICAL-1)
     end note
 ```
+
+**Identification is not attribution.** Two questions, answered by two
+different facts, at two different times:
+
+- *Is this link identified?* — a **transport** fact: the Reticulum link
+  handshake proved a remote identity (`get_remote_identity(link)`). Known from
+  the first packet, before any announce.
+- *Which federation key does this link belong to, and how much do we trust
+  that?* — an **attribution** fact: the peers map / rooting directory, fed by
+  the peer's announce and its owner-binding. `Advisory`, then `Rooted`.
+
+The two coincide for every peer whose announce arrived before its links, and
+diverge for exactly the peer the bootstrap door exists for. **#624 (2026-09-18):**
+the carve-out below was keyed on `link_key_id`, which is the *output* of
+attribution (`candidate_key_id`) — `None` in `Identified`, so the door built
+for the fresh peer could only open for a peer that was already attributable.
+On a ten-minute agent install the links beat the announce every time; the
+production canonical served 0 identity rounds. The field's name and this
+document said "transport identity"; its value was the attributed key. One
+variable, two jobs (#541's lesson, one layer down).
 
 | Verdict | When | Effect |
 |---|---|---|
@@ -395,19 +424,47 @@ stateDiagram-v2
 | `IgnoreStale` | same/lower epoch, no upgrade or reroute | Cached binding stands |
 | `HijackRefused` (**#337**) | announce that **cannot prove ownership** over a Rooted route | Refused *first*, epoch-independent — the anti-spoof invariant |
 
-### 5.4 The bootstrap carve-out (`#402`)
+### 5.4 The bootstrap carve-out (`#402`, keyed correctly by `#624`)
 
 A fresh peer is `UnknownKeyId` until its `Key` is admitted — but that `Key` frame is
-exactly what admits it. To break the deadlock, an *un-attributed* CRPL frame whose
-kind `is_bootstrap` (`{Key, IdentityOccurrence, TransportDestination}`) is routed on
-the link's transport identity (`transport_authenticated`) instead of dropping.
-**Safe by construction:** these kinds self-authenticate at persist admission
-(`signer_acts_for`), grant no trust, and are served no `trace:*` — the trace-serve
-gate stays strictly `Rooted ∧ owns_key`. Every non-bootstrap unattributed frame
-still drops (`#317`). A proptest over all 15 kinds × link presence proves the
-carve-out admits *exactly* the three
-(`bootstrap_carve_out_source_holds_over_all_kinds`,
-[`edge.rs:8488`](../src/edge.rs)).
+exactly what admits it. To break the deadlock, a CRPL frame whose kind
+`is_bootstrap` (`{Key, IdentityOccurrence, TransportDestination}`) arriving on an
+**identified** link is routed on the link's **proven transport identity**
+(`transport_authenticated` over `get_remote_identity(link)`) — never on the
+attribution result, which is what `#624` corrected. **Safe by construction:**
+these kinds self-authenticate at persist admission (`signer_acts_for`), grant no
+trust, and are served no `trace:*` — the trace-serve gate stays strictly
+`Rooted ∧ owns_key`. Every non-bootstrap frame on a non-rooted link still drops
+(`#317`). The proptest proves both directions over kind × link state: the
+carve-out admits *exactly* the bootstrap kinds, and admits them from `Identified`
+and `Advisory` alike (`bootstrap_carve_out_source_holds_over_all_kinds`,
+[`edge.rs`](../src/edge.rs)).
+
+#### 5.4.1 The link-state × frame-kind table — what each state may do
+
+This is the table `#624` was found by not having. Read it as the contract:
+a row is what a link in that state can cause on this node, nothing more.
+
+| link state | bootstrap kind (`Key` / `IdentityOccurrence` / `TransportDestination`) | any other kind | `trace:*` / consent-gated planes served | attribution recorded |
+|---|---|---|---|---|
+| **Unidentified** — no remote identity proven | drop, `#317` (transport identity is the precondition, not a default) | drop | no | none |
+| **Identified, unannounced** — remote identity proven, no binding | **routed on the transport identity**; the record self-authenticates at admission | drop | no | none — the frame may CREATE the binding, it never assumes one |
+| **Advisory** — announce arrived, not steward-rooted or `!owns_key` | routed on the transport identity (`#624` second case) | drop | no | Advisory (transport-not-trust) |
+| **Rooted ∧ owns_key ∧ hybrid binding** (`#393` items 1+2) | attributed (`from_rooted_binding`) | attributed | **yes** — the E3 gate | Rooted |
+| **ResolvedToSelf** — the answer is our own key (`#623`) | drop, `attribution_resolved_to_self` | drop | no | none; no responder is ever built for self |
+
+Two invariants the table encodes, and the proptest holds:
+
+1. **Nothing below `Rooted ∧ owns_key` is ever served a consent-gated plane.** The
+   first three rows and the last can only *deliver* self-authenticating
+   records; they can never *ask*. This is E3, unchanged since `#393`.
+2. **The bootstrap door opens on identification, never on attribution.** An
+   `Identified` peer is the door's reason to exist; keying the door on the
+   attribution result (`#402`'s implementation, corrected by `#624`) closed it
+   to exactly that peer while every test fed it an already-attributed link
+   (`link_key_id: Some(..)` as a literal — the *test-field-provenance* trap:
+   the witness proved the door opens when the field is `Some`, never asked who
+   produces `Some` for a fresh peer).
 
 ### 5.5 The node transport identity (`#541`)
 
