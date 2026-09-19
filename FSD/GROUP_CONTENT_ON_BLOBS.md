@@ -1,12 +1,17 @@
 # FSD: Group Content on Blobs — CIRISEdge
 
-**Status:** **LOCKED** — every open question answered on CIRISPersist#836.
-Not implemented; CIRISEdge#586 is the first consumer, and the design is
-deliberately not chat's.
+**Status:** **LOCKED and SHIPPED** — every open question answered on
+CIRISPersist#836; implemented across v24.0.0 (the seal, #596/#598), v24.1.0
+(key transport, #605), v25.0.0 (pull-on-attestation #615, N-member rooms #613,
+evict-on-withdraws #614, `RoomKey` deleted #612) and v25.1.0 (commit
+convergence #618, router #619). CIRISEdge#586 was the first consumer and the
+design is deliberately not chat's. Still open under it: the chunk-DAG door
+(§4's second door — CIRISPersist#821), the live mesh witness of a cross-node
+community open (#601's last rung), persist#853 (the bytes-plane read door).
 
-**Substrate:** CIRISPersist **v44.1.0** (`FSD/BLOB_ENCRYPTION_AT_REST.md`
-§11–§12, §12.9–§12.10, I41–I42), CIRISVerify v15.1.0
-(`aes_gcm::{encrypt_aad, decrypt_aad}`).
+**Substrate:** CIRISPersist **v44.7.0** (`FSD/BLOB_ENCRYPTION_AT_REST.md`
+§11–§12, §12.9–§12.10, I41–I42; `FSD/BLOB_REPLICATION.md` Part II for key
+transport), CIRISVerify v15.2.0 (`aes_gcm::{encrypt_aad, decrypt_aad}`).
 
 ---
 
