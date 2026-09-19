@@ -882,6 +882,14 @@ pub struct EdgeMetrics {
     /// climbing while `round_outcomes_total[completed]` does not is a peer
     /// answering rounds too late to count.
     pub replication_reply_dropped_total: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#636 — bootstrap-door decisions per outcome label
+    /// (`attributed` / `unbound` / `not_applicable`): how each bootstrap-kind
+    /// Deliver on an identified link was attributed. A healthy first contact
+    /// shows a few `unbound` (the records that carry the binding, before persist
+    /// admits it) then `attributed`; `not_applicable` is the steady state (the
+    /// link was attributed by its announce before any Deliver). The door never
+    /// drops, so there is no drop label.
+    pub bootstrap_door_outcomes: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
     /// the live announce-intake map under **capacity backpressure** (the
     /// `MAX_PEERS` cap in `transport::reticulum`).
@@ -1148,6 +1156,15 @@ impl EdgeMetrics {
         )
     }
 
+    /// CIRISEdge#636 — count one bootstrap-door decision by its label.
+    pub fn inc_bootstrap_door(&self, decision: &'static str) {
+        *self
+            .bootstrap_door_outcomes
+            .write()
+            .entry(decision)
+            .or_insert(0) += 1;
+    }
+
     /// CIRISEdge#530 — increment the announce-intake pressure-eviction counter.
     /// Called once per evicted UNRETAINED binding at the `MAX_PEERS` cap, so the
     /// previously `debug!`-only eviction is countable in production.
@@ -1356,6 +1373,12 @@ impl EdgeMetrics {
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
+            bootstrap_door_outcomes: self
+                .bootstrap_door_outcomes
+                .read()
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
             replication_routed_to_responder_total: self.route_counters().0,
             replication_routed_to_initiator_total: self.route_counters().1,
             replication_reply_dropped_total: self.route_counters().2,
@@ -1403,6 +1426,9 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#373 — cumulative inbound frames dropped on coordinator
     /// channel back-pressure (previously a silent WARN).
     pub replication_inbound_backpressure_drops: u64,
+    /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
+    /// `unbound` / `not_applicable`). The door never drops.
+    pub bootstrap_door_outcomes: HashMap<String, u64>,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
     pub replication_routed_to_responder_total: u64,
     /// CIRISEdge#634 — replies routed into an initiator's round inbox.

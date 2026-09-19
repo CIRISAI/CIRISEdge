@@ -168,6 +168,15 @@ pub enum SchedulerCommand {
     /// second kick meanwhile coalesces (one permit). The scheduled tick is
     /// reset after a kicked round, so a kick never doubles a round.
     RoundNow { peer_key_id: Option<String> },
+    /// CIRISEdge#636 (production speed) — a round toward `from_peer` on
+    /// `kind` just ADMITTED rows: fire a round on `kind` toward every OTHER
+    /// peer now, so the rows hop on within a round-trip instead of a cadence
+    /// tick (epidemic propagation). Coalesces like `RoundNow`; a round that
+    /// admits nothing propagates nothing, so a quiet mesh stays quiet.
+    Propagate {
+        from_peer: String,
+        kind: EnvelopeKind,
+    },
 }
 
 impl std::fmt::Debug for SchedulerCommand {
@@ -186,6 +195,11 @@ impl std::fmt::Debug for SchedulerCommand {
             Self::RoundNow { peer_key_id } => f
                 .debug_struct("RoundNow")
                 .field("peer_key_id", peer_key_id)
+                .finish(),
+            Self::Propagate { from_peer, kind } => f
+                .debug_struct("Propagate")
+                .field("from_peer", from_peer)
+                .field("kind", kind)
                 .finish(),
         }
     }
@@ -246,6 +260,23 @@ impl SchedulerHandle {
         self.command_tx
             .send(SchedulerCommand::RoundNow {
                 peer_key_id: peer_key_id.map(str::to_owned),
+            })
+            .await
+            .map_err(|_| SchedulerCommandError::SchedulerStopped)
+    }
+
+    /// CIRISEdge#636 — rows just admitted from `from_peer` on `kind`: fire a
+    /// round on `kind` toward every other peer. See
+    /// [`SchedulerCommand::Propagate`].
+    pub async fn propagate(
+        &self,
+        from_peer: &str,
+        kind: EnvelopeKind,
+    ) -> Result<(), SchedulerCommandError> {
+        self.command_tx
+            .send(SchedulerCommand::Propagate {
+                from_peer: from_peer.to_owned(),
+                kind,
             })
             .await
             .map_err(|_| SchedulerCommandError::SchedulerStopped)
@@ -431,6 +462,9 @@ impl ReplicationScheduler {
                                 kicked,
                                 "scheduler: RoundNow — rounds fired ahead of the cadence"
                             );
+                        }
+                        SchedulerCommand::Propagate { from_peer, kind } => {
+                            propagate_kick(&per_coord, &from_peer, kind);
                         }
                     }
                 }
@@ -680,6 +714,32 @@ impl From<CoordinatorError> for RoundError {
 /// ([`run_one_recovery_round`]) deliberately omits it — see
 /// `docs/FSD_SIGNER_RECOVERY.md` §3, where sending a second Summary alongside a
 /// Pull is the single fact that broke three earlier attempts.
+/// CIRISEdge#636 — the `Propagate` arm: kick every coordinator on `kind` whose
+/// peer is not `from_peer`. A row admitted FROM a peer is offered to every
+/// OTHER peer on its plane now, not at the next cadence tick.
+fn propagate_kick(
+    per_coord: &HashMap<(String, EnvelopeKind), CoordControl>,
+    from_peer: &str,
+    kind: EnvelopeKind,
+) {
+    let mut kicked = 0usize;
+    for ((peer, k), c) in per_coord {
+        if *k == kind && peer != from_peer {
+            c.kick.notify_one();
+            kicked += 1;
+        }
+    }
+    if kicked > 0 {
+        tracing::info!(
+            from_peer = %from_peer,
+            ?kind,
+            kicked,
+            "propagation kick — rows admitted from a peer are offered to every other peer \
+             now, not at the next cadence tick (CIRISEdge#636)"
+        );
+    }
+}
+
 async fn run_one_round(
     coord: &ReplicationCoordinator,
     round_timeout: Duration,
@@ -1182,6 +1242,91 @@ mod tests {
         assert_ne!(fresh, 0);
         coord.abandon_round().await;
         assert_eq!(coord.current_round(), 0);
+    }
+
+    /// CIRISEdge#636 — `Propagate { from_peer, kind }` kicks every OTHER peer on
+    /// that plane, and only that plane: with a long cadence, the kicked
+    /// coordinators produce a round event and the excluded ones stay quiet.
+    #[tokio::test]
+    async fn propagate_kicks_every_other_peer_on_the_plane_and_nobody_else() {
+        let mut sched = ReplicationScheduler::new(SchedulerConfig {
+            cadence: Duration::from_secs(3600),
+            round_timeout: Duration::from_millis(80),
+        });
+        let control = sched.install_control_channel();
+        let (event_tx, mut event_rx) = mpsc::channel::<(String, RoundEvent)>(64);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let sched_handle =
+            tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
+
+        let mk = |peer: &str, kind: EnvelopeKind| {
+            let transport: Arc<dyn Transport> = Arc::new(InMemTransport {
+                peer_inbox: HashMap::new(),
+            });
+            let provider: Arc<dyn StateProvider> = Arc::new(StaticProvider {
+                state: LocalState::new(),
+                envelopes: HashMap::new(),
+            });
+            let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
+            Arc::new(ReplicationCoordinator::new(
+                transport,
+                peer,
+                kind,
+                SessionRole::Initiator,
+                provider,
+                applier,
+            ))
+        };
+        for (peer, kind) in [
+            ("alice", EnvelopeKind::Key),
+            ("carol", EnvelopeKind::Key),
+            ("carol", EnvelopeKind::Attestation),
+        ] {
+            control.add_initiator(mk(peer, kind)).await.expect("add");
+        }
+        // Drain the start-up rounds (each coordinator's first tick fires at once).
+        let mut startup = 0;
+        while startup < 3 {
+            let (_, _) = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
+                .await
+                .expect("startup round")
+                .expect("open");
+            startup += 1;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), event_rx.recv())
+                .await
+                .is_err(),
+            "quiet once the start-up rounds are done"
+        );
+
+        // Rows admitted from alice on Key ⇒ carol/Key is kicked; alice/Key (the
+        // source) and carol/Attestation (another plane) are not.
+        control
+            .propagate("alice", EnvelopeKind::Key)
+            .await
+            .expect("propagate");
+        let (peer, event) = tokio::time::timeout(Duration::from_secs(3), event_rx.recv())
+            .await
+            .expect("the propagation round")
+            .expect("open");
+        assert_eq!(peer, "carol");
+        assert!(
+            matches!(event, RoundEvent::TimedOut | RoundEvent::Error(_)),
+            "an unreachable in-mem peer: {event:?}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), event_rx.recv())
+                .await
+                .is_err(),
+            "no round toward the source peer or on another plane"
+        );
+
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sched_handle)
+            .await
+            .expect("shutdown")
+            .expect("join");
     }
 
     #[tokio::test]

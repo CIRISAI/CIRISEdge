@@ -109,6 +109,10 @@ use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendO
 use crate::identity::LocalSigner;
 use crate::reachability::{AttemptOutcome, ReachabilityTracker};
 use crate::scope_addressing::{InboundAddress, MemberAddress, ScopeAddressTable};
+use crate::transport::identity_model::{
+    decide_bootstrap_door, key_id_binds_pubkey, BindingSource, BootstrapDoor, TransportBinding,
+    TransportIdentityPub,
+};
 #[cfg(feature = "lxmf")]
 use crate::transport::lxmf_serve::ServeOutcome;
 use crate::verify::{
@@ -366,6 +370,97 @@ impl ShipError {
 /// Transfers are seconds; 8 s fits inside the 10 s anti-entropy round timeout
 /// so a drained link still completes the SAME round instead of the next one.
 const REVERSE_PATH_BUSY_RETRY_WINDOW: Duration = Duration::from_secs(8);
+
+/// CIRISEdge#636 (finding 2) — per-fragment bound on a link-Channel send that
+/// ABSORBS the channel's pacing. leviculum's Channel paces the sender to its
+/// window (`CHANNEL_WINDOW_INITIAL = 2`, growing with proofs), so under a burst
+/// the non-blocking `try_send` answers `PacingDelay` / `Busy` for a fragment that
+/// would land a few hundred ms later. Treating that as failure was the server's
+/// `fragments=1 fragments_sent=0` signature and ½–⅚ of all rounds timing out.
+/// `LinkHandle::send` sleeps until the channel is ready (leviculum's own
+/// pacing wait — the machinery we already pay for); this bounds ONE fragment's
+/// wait so a dead link cannot pin the round.
+const CHANNEL_FRAGMENT_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+/// CIRISEdge#636 — overall bound on one frame's fragment sequence on a Channel.
+/// Generous: a 20 KB Attestation Deliver at the 431 B RNS MDU is ~47 fragments
+/// and paces at window×RTT, which is seconds, not tens of seconds.
+const CHANNEL_FRAME_SEND_BUDGET: Duration = Duration::from_secs(15);
+/// CIRISEdge#636 (production speed) — a reverse-path reply that fragments into
+/// at most this many pieces rides the link Channel FIRST (reliable, sequenced,
+/// interleaves any in-flight resource transfer) instead of opening a Resource
+/// transfer (advertise → accept → transfer → proof, ONE at a time per link).
+/// The anti-entropy control plane — Summary / Diff / a small Deliver — is a
+/// handful of packets; serialising three planes' replies behind the
+/// one-resource gate was where the server's rounds went to time out. Bigger
+/// frames keep the Resource path with the Channel as the busy fallback.
+const CHANNEL_FIRST_MAX_FRAGMENTS: usize = 8;
+
+/// What [`send_fragments_on_channel`] achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FragmentSendOutcome {
+    sent: usize,
+    total: usize,
+    /// Why the sequence stopped short, when it did.
+    stalled: Option<&'static str>,
+}
+
+impl FragmentSendOutcome {
+    const fn complete(&self) -> bool {
+        self.sent == self.total
+    }
+}
+
+/// CIRISEdge#636 — **the one way a frame's fragments go onto a link Channel**
+/// (reverse-path replies, the `CANN` announce, the `CBND` bundle). Each
+/// fragment rides `LinkHandle::send`, which absorbs leviculum's pacing and busy
+/// signals by waiting for the channel (its documented contract), under a
+/// per-fragment and a per-frame bound. The Channel then sequences and
+/// retransmits every fragment; the receiver reassembles in order.
+async fn send_fragments_on_channel(
+    node: &ReticulumNode,
+    link_id: &LinkId,
+    fragments: &[Vec<u8>],
+) -> FragmentSendOutcome {
+    let total = fragments.len();
+    let started = tokio::time::Instant::now();
+    let mut sent = 0usize;
+    for frag in fragments {
+        if started.elapsed() > CHANNEL_FRAME_SEND_BUDGET {
+            return FragmentSendOutcome {
+                sent,
+                total,
+                stalled: Some("frame_budget_exhausted"),
+            };
+        }
+        match tokio::time::timeout(
+            CHANNEL_FRAGMENT_SEND_TIMEOUT,
+            node.link_handle(link_id).send(frag),
+        )
+        .await
+        {
+            Ok(Ok(())) => sent += 1,
+            Ok(Err(_)) => {
+                return FragmentSendOutcome {
+                    sent,
+                    total,
+                    stalled: Some("link_send_error"),
+                }
+            }
+            Err(_elapsed) => {
+                return FragmentSendOutcome {
+                    sent,
+                    total,
+                    stalled: Some("fragment_pacing_timeout"),
+                }
+            }
+        }
+    }
+    FragmentSendOutcome {
+        sent,
+        total,
+        stalled: None,
+    }
+}
 /// Pause between busy-retries on the reverse path.
 const REVERSE_PATH_BUSY_BACKOFF: Duration = Duration::from_millis(500);
 /// CIRISEdge#353b/v13.6.1 — PROGRESS-AWARE reverse-path resource wait.
@@ -1171,12 +1266,39 @@ pub async fn filter_holders_with_policy(
     normal
 }
 
-/// A resolved peer — its Reticulum destination hash plus the ed25519
-/// verifying key required by `ReticulumNode::connect`.
+#[cfg(test)]
+impl RootedPeer {
+    /// CIRISEdge#636 test seam — an Advisory, non-owning peer bound to
+    /// `transport_pubkey64` (its identity hash derived from it), for door and
+    /// resolver tests that need a real peers-map entry and nothing else.
+    fn advisory_for_test(transport_pubkey64: [u8; 64]) -> Self {
+        let t = TransportIdentityPub::from_pub64(&transport_pubkey64);
+        Self {
+            peer: ResolvedPeer {
+                dest_hash: DestinationHash::new([0u8; 16]),
+                transport_ed25519: t.ed25519,
+            },
+            epoch: 0,
+            chain: None,
+            provenance: ciris_persist::federation::self_at_login::BindingProvenance::Advisory,
+            transport_identity_hash: t.hash(),
+            owns_key: false,
+            last_seen: std::time::Instant::now(),
+            transport_pubkey64,
+            manifest_commitment: None,
+        }
+    }
+}
+
+/// A resolved peer — its Reticulum destination hash plus the TRANSPORT
+/// identity's ed25519 half, the verifying key `ReticulumNode::connect` needs
+/// to establish a link. This is the transport keypair (CIRISEdge#636
+/// `identity_model`), never the federation signing key; the field was named
+/// `signing_key` until #636 and read as the latter more than once.
 #[derive(Debug, Clone, Copy)]
 struct ResolvedPeer {
     dest_hash: DestinationHash,
-    signing_key: [u8; 32],
+    transport_ed25519: [u8; 32],
 }
 
 /// CIRISEdge#336 (v13.8.0) — provenance of a dial-candidate destination.
@@ -1207,7 +1329,7 @@ impl DialSource {
 #[derive(Debug, Clone, Copy)]
 struct DialCandidate {
     dest_hash: DestinationHash,
-    signing_key: [u8; 32],
+    transport_ed25519: [u8; 32],
     source: DialSource,
 }
 
@@ -1345,15 +1467,14 @@ struct RootedPeer {
     /// verdict (`Confirmed ⇒ true`; an Advisory admit ⇒ true only when the
     /// rejection was neither `UnknownKeyId` nor `PubkeyMismatch`, i.e. the pubkey
     /// matched and the self-signature verified). CIRISEdge#627 adds the
-    /// directory-free proof for a first-seen peer: the announce's transport
-    /// ed25519 half (identity bytes 32..64) equals the claimed
-    /// `federation_pubkey_ed25519` and the signature verified under it — the
-    /// announcer controls the key and the identity derived from it. A legacy
-    /// peer whose two keys differ stays `false` until Stage 2. This is the load-bearing signal
-    /// — alongside `provenance == Rooted` — that
-    /// [`crate::transport::SourceKeyId::from_rooted_binding`] gates trace-serve
-    /// attribution on: an Advisory or non-owning binding is never attributed, so
-    /// it can never be served a peer's `trace:*` corpus.
+    /// directory-free proof for a first-seen peer, corrected by CIRISEdge#636:
+    /// the claimed `federation_key_id`'s fingerprint IS the claimed pubkey's
+    /// (`identity_model::key_id_binds_pubkey`) and the attestation self-verified
+    /// under it — the announcer controls the key it names, and the signed
+    /// attestation binds that key to this transport identity. (The pre-#636
+    /// form compared the transport ed25519 half to the federation pubkey — two
+    /// different keypairs on every real node.) The v16 review's rule stands:
+    /// this is a post-pubkey-match ALLOWLIST, never a route-hijack lever.
     owns_key: bool,
     /// CIRISEdge#530 — when this binding was last CONFIRMED BY AN ANNOUNCE
     /// (insert, route/trust update, or a same-epoch re-announce that changed
@@ -3709,11 +3830,11 @@ impl ReticulumTransport {
         // carries it (they differ in ROUTING hash, not in signing key), so take
         // the first. The candidate's own dest_hash is deliberately discarded:
         // routing here is the derived address, never a federation one.
-        let Some(signing_key) = self
+        let Some(transport_ed25519) = self
             .resolve_dial_candidates(destination_key_id)
             .await
             .first()
-            .map(|c| c.signing_key)
+            .map(|c| c.transport_ed25519)
         else {
             return Err(TransportError::Unreachable(format!(
                 "scope-native send: no transport identity resolved for \
@@ -3724,7 +3845,7 @@ impl ReticulumTransport {
 
         let (link, established) = self
             .node
-            .connect_awaited(&dest_hash, &signing_key)
+            .connect_awaited(&dest_hash, &transport_ed25519)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect (scoped): {e}")))?;
         let link_id = *link.link_id();
@@ -3891,7 +4012,7 @@ impl ReticulumTransport {
     /// up in the test fixture.
     ///
     /// `dest_hash` should be the peer's explicit-hash
-    /// (`sha256(fed_pubkey)[..16]`) and `signing_key_ed25519` the
+    /// (`sha256(fed_pubkey)[..16]`) and `transport_ed25519` the
     /// peer's transport-tier Ed25519 verifying key (the 32 bytes that
     /// sign link proofs). After this call, `knows_peer(key_id)` returns
     /// true and `link_open(dest_hash, ..)` finds the entry.
@@ -3908,7 +4029,7 @@ impl ReticulumTransport {
         &self,
         destination_key_id: &str,
         dest_hash: [u8; 16],
-        signing_key_ed25519: [u8; 32],
+        transport_ed25519: [u8; 32],
     ) {
         let mut peers = self.peers.lock().await;
         peers.insert(
@@ -3916,7 +4037,7 @@ impl ReticulumTransport {
             RootedPeer {
                 peer: ResolvedPeer {
                     dest_hash: DestinationHash::new(dest_hash),
-                    signing_key: signing_key_ed25519,
+                    transport_ed25519,
                 },
                 epoch: 0,
                 // Primed bindings carry no walked provenance chain; the operator
@@ -3936,7 +4057,7 @@ impl ReticulumTransport {
                 // half mirrors the zero identity-hash sentinel above.
                 transport_pubkey64: {
                     let mut pk = [0u8; 64];
-                    pk[32..].copy_from_slice(&signing_key_ed25519);
+                    pk[32..].copy_from_slice(&transport_ed25519);
                     pk
                 },
                 // #530 — a primed binding is `Rooted`, so it is pinned and can
@@ -3972,7 +4093,7 @@ impl ReticulumTransport {
             RootedPeer {
                 peer: ResolvedPeer {
                     dest_hash: DestinationHash::new(dest_hash),
-                    signing_key: ed25519,
+                    transport_ed25519: ed25519,
                 },
                 epoch: 0,
                 chain: None,
@@ -4018,7 +4139,7 @@ impl ReticulumTransport {
             RootedPeer {
                 peer: ResolvedPeer {
                     dest_hash: DestinationHash::new(dest_hash),
-                    signing_key: ed25519,
+                    transport_ed25519: ed25519,
                 },
                 epoch: 0,
                 chain: None,
@@ -4159,7 +4280,7 @@ impl ReticulumTransport {
         destination_hash: &[u8],
         timeout: Duration,
     ) -> Result<[u8; 16], TransportError> {
-        // Resolve the signing_key from rooted peers — we look up by
+        // Resolve the transport_ed25519 from rooted peers — we look up by
         // destination_hash (the rooted-peer map keys on key_id but
         // each entry carries the dest_hash). Linear scan; the rooted
         // map is small (federation member count).
@@ -4170,14 +4291,14 @@ impl ReticulumTransport {
             ))
         })?;
         let dest_hash = DestinationHash::new(dest_hash_array);
-        let signing_key = {
+        let transport_ed25519 = {
             let peers = self.peers.lock().await;
             peers
                 .values()
                 .find(|p| p.peer.dest_hash == dest_hash)
-                .map(|p| p.peer.signing_key)
+                .map(|p| p.peer.transport_ed25519)
         };
-        let Some(signing_key) = signing_key else {
+        let Some(transport_ed25519) = transport_ed25519 else {
             return Err(TransportError::Unreachable(format!(
                 "no rooted peer known for destination_hash={dest_hash} \
                  (link_open requires a rooted announce; call link_open after \
@@ -4200,7 +4321,7 @@ impl ReticulumTransport {
         // if the link dies first, so it never hangs; the caller owns the timeout.
         let (link, established) = self
             .node
-            .connect_awaited(&dest_hash, &signing_key)
+            .connect_awaited(&dest_hash, &transport_ed25519)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
@@ -4944,7 +5065,7 @@ impl ReticulumTransport {
         if let Some(rooted) = self.peers.lock().await.get(destination_key_id) {
             out.push(DialCandidate {
                 dest_hash: rooted.peer.dest_hash,
-                signing_key: rooted.peer.signing_key,
+                transport_ed25519: rooted.peer.transport_ed25519,
                 source: DialSource::Cached,
             });
         }
@@ -4967,7 +5088,7 @@ impl ReticulumTransport {
                                 &fed_pubkey,
                             ),
                         ),
-                        signing_key: ed25519,
+                        transport_ed25519: ed25519,
                         source: DialSource::ExplicitHash,
                     });
                 }
@@ -4984,7 +5105,7 @@ impl ReticulumTransport {
                             &name_hash,
                             identity.hash(),
                         ),
-                        signing_key: ed25519,
+                        transport_ed25519: ed25519,
                         source: DialSource::ComputedNamed,
                     });
                 }
@@ -5019,7 +5140,7 @@ impl ReticulumTransport {
             if let Some(c) = candidates.iter().find(|c| c.source == source) {
                 return Some(ResolvedPeer {
                     dest_hash: c.dest_hash,
-                    signing_key: c.signing_key,
+                    transport_ed25519: c.transport_ed25519,
                 });
             }
         }
@@ -5136,6 +5257,38 @@ impl ReticulumTransport {
                 return false;
             };
             attempts += 1;
+            // CIRISEdge#636 — Channel-first for small replies (see
+            // `CHANNEL_FIRST_MAX_FRAGMENTS`). A stall falls through to the
+            // Resource path below exactly as before.
+            if attempts == 1 {
+                let mdu = self.node.link_mdu(&link_id).unwrap_or(0);
+                if let Some(fragments) =
+                    crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
+                        .filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
+                {
+                    let outcome = send_fragments_on_channel(&self.node, &link_id, &fragments).await;
+                    if outcome.complete() {
+                        tracing::debug!(
+                            destination_key_id,
+                            link = ?link_id,
+                            mdu,
+                            bytes = envelope_bytes.len(),
+                            fragments = outcome.total,
+                            "delivered over the peer's live inbound link as link PACKET(s), \
+                             Channel-first (CIRISEdge#636)"
+                        );
+                        return true;
+                    }
+                    tracing::debug!(
+                        destination_key_id,
+                        link = ?link_id,
+                        fragments = outcome.total,
+                        fragments_sent = outcome.sent,
+                        stalled = outcome.stalled.unwrap_or("-"),
+                        "Channel-first send stalled; trying the Resource path (CIRISEdge#636)"
+                    );
+                }
+            }
             match self
                 .ship_resource_on_link(
                     &link_id,
@@ -5172,11 +5325,13 @@ impl ReticulumTransport {
                     //
                     // CIRISEdge#371 — since leviculum v0.10.0 the fork-only
                     // `driver::send_on_link` wrapper is folded into upstream's
-                    // `LinkHandle`; `link_handle(&id).try_send(..)` is the same
-                    // core `send_on_link` (Channel / `RawBytesMessage`) and still
-                    // returns `Busy` non-blocking, so the interleave semantics are
-                    // unchanged. `try_send` (not `send`) keeps the one-shot
-                    // behaviour — this call is already inside the busy-retry path.
+                    // `LinkHandle`; `link_handle(&id).send(..)` is the same
+                    // core `send_on_link` (Channel / `RawBytesMessage`). CIRISEdge#636
+                    // moved this from `try_send` to `send`: the one-shot form read
+                    // the Channel's PACING as failure and the reply fell to the
+                    // resource busy-retry (the server's `fragments_sent=0` /
+                    // ½–⅚ timed-out rounds); `send` waits for the window, bounded
+                    // by `send_fragments_on_channel`.
                     //
                     // CIRISEdge#414 / CIRISAgent#932 — FRAGMENT the reply so it
                     // ALWAYS rides the packet path, not just when it fits the MDU.
@@ -5197,16 +5352,12 @@ impl ReticulumTransport {
                     if let Some(fragments) =
                         crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
                     {
-                        let total = fragments.len();
-                        let mut sent = 0usize;
-                        for frag in &fragments {
-                            if self.node.link_handle(&link_id).try_send(frag).await.is_ok() {
-                                sent += 1;
-                            } else {
-                                break;
-                            }
-                        }
-                        if sent == total {
+                        // CIRISEdge#636 — absorb the Channel's pacing instead of
+                        // reading it as failure (the `fragments_sent=0` signature).
+                        let outcome =
+                            send_fragments_on_channel(&self.node, &link_id, &fragments).await;
+                        let (sent, total) = (outcome.sent, outcome.total);
+                        if outcome.complete() {
                             tracing::debug!(
                                 destination_key_id,
                                 link = ?link_id,
@@ -5235,10 +5386,12 @@ impl ReticulumTransport {
                                 bytes = envelope_bytes.len(),
                                 fragments = total,
                                 fragments_sent = sent,
+                                stalled = outcome.stalled.unwrap_or("-"),
                                 suppressed_prev,
-                                "reverse-path link Channel backpressured mid-fragment-send \
-                                 ({sent}/{total} landed); frame will re-fragment next round \
-                                 (CIRISEdge#414/#932) — falling back to resource busy-retry"
+                                "reverse-path link Channel send stalled mid-frame ({sent}/{total} \
+                                 landed after absorbing pacing, CIRISEdge#636); frame will \
+                                 re-fragment next round (CIRISEdge#414/#932) — falling back to \
+                                 resource busy-retry"
                             );
                         }
                     } else {
@@ -5571,7 +5724,7 @@ impl Transport for ReticulumTransport {
         let has_path = flags[chosen_idx].1;
         let peer = ResolvedPeer {
             dest_hash: candidates[chosen_idx].dest_hash,
-            signing_key: candidates[chosen_idx].signing_key,
+            transport_ed25519: candidates[chosen_idx].transport_ed25519,
         };
         {
             // The candidate set + winner, always visible at debug; INFO when
@@ -6044,7 +6197,7 @@ impl DialCtx {
         // `Err(LinkClosed)` on link death. Caller owns the wall-clock bound.
         let (link, established) = self
             .node
-            .connect_awaited(&peer.dest_hash, &peer.signing_key)
+            .connect_awaited(&peer.dest_hash, &peer.transport_ed25519)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
@@ -6429,47 +6582,16 @@ async fn binding_exists_cached(
 // landed. Each new arm is a small typed routing of one NodeEvent
 // variant onto a side-effect (record / emit); extracting would
 // fragment the event-loop verdict across multiple helpers.
-/// CIRISEdge#624 — what a bootstrap `Deliver` says about who is on the link.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapPeek {
-    /// A `Key` Deliver: every record whose Ed25519 pubkey decodes, as
-    /// `(key_id, pubkey)`. A record that does not decode cannot name a link
-    /// and is left out here (persist refuses it at admission regardless).
-    Keys(Vec<(String, [u8; 32])>),
-    /// An `IdentityOccurrence` / `TransportDestination` Deliver: each
-    /// envelope's claimed signer (`attesting_key_id`), to be resolved against
-    /// the directory's registered pubkey.
-    Signers(Vec<String>),
-}
-
-/// The verdict of [`decide_bootstrap_equality`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BootstrapEquality {
-    /// Not a bootstrap Deliver, or no proven link identity, or nothing in the
-    /// frame speaks about the attributed peer — attribution stands as it was.
-    NotApplicable,
-    /// The frame names its peer by equality. `newly` = the link was not
-    /// attributed before and is now (enter it in the identified table).
-    Attributed { key_id: String, newly: bool },
-    /// The record the link delivers as its own is under a key the link does
-    /// not hold. Dropped by name.
-    Mismatch { key_id: String },
-    /// An un-attributed link's occurrence/destination is signed by a key this
-    /// node holds no record for: the Key frame must precede. Dropped by name.
-    RecordNotHeld { key_id: String },
-}
-
-fn decode_ed25519_b64(b64: &str) -> Option<[u8; 32]> {
-    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-    <[u8; 32]>::try_from(bytes).ok()
-}
-
-/// CIRISEdge#624 — peek a CRPL frame for a bootstrap-kind `Deliver`
-/// ([`EnvelopeKind::is_bootstrap`](crate::replication::protocol::EnvelopeKind::is_bootstrap)).
-/// Any other verb or kind is `None`: a round-open `Summary` carries refs, not
-/// records, so it cannot name its peer — the #927 initiator-first push sends
-/// the Key `Deliver` right behind it on the same link, and THAT frame does.
-fn peek_bootstrap_deliver(data: &[u8]) -> Option<BootstrapPeek> {
+/// CIRISEdge#636 — the federation key ids a bootstrap-kind `Deliver`
+/// ([`EnvelopeKind::is_bootstrap`](crate::replication::protocol::EnvelopeKind::is_bootstrap))
+/// names: a `Key` Deliver's `record.key_id`s, an `IdentityOccurrence` /
+/// `TransportDestination` Deliver's `attesting_key_id`s. Any other verb or
+/// kind is `None`: a round-open `Summary` carries refs, not records, so it
+/// cannot name a peer. The ids are only ever used to LOOK UP a verified
+/// [`TransportBinding`] (peers map / stored TD row); nothing inside the
+/// Deliver — not a Key record's pubkey, not a TD row's transport halves — is
+/// trusted before persist admits it.
+fn bootstrap_key_ids_named(data: &[u8]) -> Option<Vec<String>> {
     use crate::replication::protocol::{EnvelopeKind, ReplicationMessage};
     let ReplicationMessage::Deliver(d) = crate::replication::wire_frame::try_unwrap(data)
         .ok()
@@ -6480,98 +6602,66 @@ fn peek_bootstrap_deliver(data: &[u8]) -> Option<BootstrapPeek> {
     if !d.kind.is_bootstrap() {
         return None;
     }
-    if matches!(d.kind, EnvelopeKind::Key) {
-        // Only the two members the equality needs — no dependence on the full
-        // record shape, which persist owns and verifies at admission.
+    let mut ids: Vec<String> = if matches!(d.kind, EnvelopeKind::Key) {
         #[derive(serde::Deserialize)]
         struct RecordPeek {
             key_id: String,
-            pubkey_ed25519_base64: String,
         }
         #[derive(serde::Deserialize)]
         struct KeyPeek {
             record: RecordPeek,
         }
-        Some(BootstrapPeek::Keys(
-            d.envelopes
-                .iter()
-                .filter_map(|e| serde_json::from_slice::<KeyPeek>(e).ok())
-                .filter_map(|k| {
-                    decode_ed25519_b64(&k.record.pubkey_ed25519_base64)
-                        .map(|pk| (k.record.key_id, pk))
-                })
-                .collect(),
-        ))
+        d.envelopes
+            .iter()
+            .filter_map(|e| serde_json::from_slice::<KeyPeek>(e).ok())
+            .map(|k| k.record.key_id)
+            .collect()
     } else {
         #[derive(serde::Deserialize)]
         struct SignerPeek {
             attesting_key_id: String,
         }
-        Some(BootstrapPeek::Signers(
-            d.envelopes
-                .iter()
-                .filter_map(|e| serde_json::from_slice::<SignerPeek>(e).ok())
-                .map(|s| s.attesting_key_id)
-                .collect(),
-        ))
-    }
+        d.envelopes
+            .iter()
+            .filter_map(|e| serde_json::from_slice::<SignerPeek>(e).ok())
+            .map(|s| s.attesting_key_id)
+            .collect()
+    };
+    ids.sort();
+    ids.dedup();
+    Some(ids)
 }
 
-/// CIRISEdge#624 — the equality decision, pure. The bytes compared are the
-/// link identity's Ed25519 half (`Identity::public_key_bytes()[32..64]`) and
-/// the record's `pubkey_ed25519_base64` decoded (32 bytes); for an
-/// occurrence/destination, the signer's REGISTERED pubkey from the directory
-/// stands in for the record's (`resolved`, `None` = not held).
-///
-/// - No link identity, or not a bootstrap Deliver ⇒ `NotApplicable`.
-/// - Attributed link (`candidate = Some`): the belt. If the frame carries the
-///   peer's OWN record (`key_id == candidate`), its pubkey must be the link's;
-///   third-party records a rooted peer relays (#257 publish-own + anchored) are
-///   not compared — persist verifies each at admission. An own record the
-///   directory does not hold cannot be belted ⇒ `NotApplicable`.
-/// - Un-attributed link: the record whose pubkey IS the link's names the peer
-///   ⇒ `Attributed { newly: true }`. Records held/decoded but all ≠ the link ⇒
-///   `Mismatch`. Signers none of which are held ⇒ `RecordNotHeld`. An empty
-///   or unparseable Deliver names nobody ⇒ `NotApplicable` (drops downstream
-///   as before).
-fn decide_bootstrap_equality(
-    candidate: Option<&str>,
-    link_ed25519: Option<[u8; 32]>,
-    peek: Option<&BootstrapPeek>,
-    resolved: &[(String, Option<[u8; 32]>)],
-) -> BootstrapEquality {
-    let (Some(link), Some(peek)) = (link_ed25519, peek) else {
-        return BootstrapEquality::NotApplicable;
-    };
-    let records: Vec<(&str, Option<[u8; 32]>)> = match peek {
-        BootstrapPeek::Keys(ks) => ks.iter().map(|(k, pk)| (k.as_str(), Some(*pk))).collect(),
-        BootstrapPeek::Signers(_) => resolved.iter().map(|(k, pk)| (k.as_str(), *pk)).collect(),
-    };
-    if let Some(c) = candidate {
-        return match records.iter().find(|(k, _)| *k == c) {
-            Some((_, Some(pk))) if *pk != link => BootstrapEquality::Mismatch {
-                key_id: c.to_owned(),
-            },
-            _ => BootstrapEquality::NotApplicable,
-        };
+/// CIRISEdge#636 — **the one resolver** from a federation key id to the
+/// transport identity it holds, in trust order: the live peers map (installed
+/// from a verified announce) first, then the stored `SignedTransportDestination`
+/// row (admitted by persist). `None` when this node holds no verified binding
+/// for `key_id` — the door then says [`BootstrapDoor::Unbound`], never
+/// "mismatch". A peers-map entry whose transport key is the `[0; 64]`
+/// test-injection sentinel is skipped so it can never match a real link.
+async fn transport_binding_of(
+    peers: &Mutex<HashMap<String, RootedPeer>>,
+    rooting: Option<&dyn RootingDirectory>,
+    key_id: &str,
+) -> Option<TransportBinding> {
+    {
+        let map = peers.lock().await;
+        if let Some(rp) = map.get(key_id) {
+            if rp.transport_pubkey64 != [0u8; 64] {
+                return Some(TransportBinding {
+                    key_id: key_id.to_owned(),
+                    transport: TransportIdentityPub::from_pub64(&rp.transport_pubkey64),
+                    source: BindingSource::PeersMap,
+                });
+            }
+        }
     }
-    if let Some((k, _)) = records.iter().find(|(_, pk)| *pk == Some(link)) {
-        return BootstrapEquality::Attributed {
-            key_id: (*k).to_owned(),
-            newly: true,
-        };
-    }
-    if let Some((k, _)) = records.iter().find(|(_, pk)| pk.is_some()) {
-        return BootstrapEquality::Mismatch {
-            key_id: (*k).to_owned(),
-        };
-    }
-    match records.first() {
-        Some((k, None)) => BootstrapEquality::RecordNotHeld {
-            key_id: (*k).to_owned(),
-        },
-        _ => BootstrapEquality::NotApplicable,
-    }
+    let stored = rooting?.stored_reticulum_binding(key_id).await?;
+    Some(TransportBinding {
+        key_id: key_id.to_owned(),
+        transport: TransportIdentityPub::from_pub64(&stored.transport_pubkey64),
+        source: BindingSource::StoredTransportDestination,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6763,74 +6853,85 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // equality is a belt on an ATTRIBUTED bootstrap Deliver: a link carrying
     // "its own" record under a key the link does not hold is dropped by name,
     // whatever the peers map says (#621's cousin).
+    // CIRISEdge#636 — the bootstrap door, on the key OBJECTS (see
+    // `transport::identity_model`): the link's PROVEN transport identity is
+    // resolved through a VERIFIED TransportBinding for a key the Deliver names.
+    // Never a federation-pubkey compare (#624/#626's defect: the federation key
+    // and the transport identity are different keypairs on every node), never a
+    // drop (a third-party record on an un-attributed link is the normal case).
     let candidate_key_id = {
-        let link_ed25519 = ctx.node.get_remote_identity(&link_id).map(|id| {
-            let pk = id.public_key_bytes();
-            let mut half = [0u8; 32];
-            half.copy_from_slice(&pk[32..64]);
-            half
-        });
-        let peek = link_ed25519.and_then(|_| peek_bootstrap_deliver(&data));
-        let resolved: Vec<(String, Option<[u8; 32]>)> = match (&peek, ctx.rooting) {
-            (Some(BootstrapPeek::Signers(ids)), rooting) => {
+        let link_identity = ctx
+            .node
+            .get_remote_identity(&link_id)
+            .map(|id| TransportIdentityPub::from_identity(&id));
+        let named = link_identity
+            .as_ref()
+            .and_then(|_| bootstrap_key_ids_named(&data));
+        let bindings: Option<Vec<TransportBinding>> = match &named {
+            Some(ids) if candidate_key_id.is_none() => {
                 let mut out = Vec::with_capacity(ids.len());
                 for id in ids {
-                    let held = match rooting {
-                        Some(r) => r
-                            .registered_pubkey_ed25519_base64(id)
-                            .await
-                            .and_then(|b64| decode_ed25519_b64(&b64)),
-                        None => None,
-                    };
-                    out.push((id.clone(), held));
+                    if let Some(b) = transport_binding_of(ctx.peers, ctx.rooting, id).await {
+                        out.push(b);
+                    }
                 }
-                out
+                Some(out)
             }
-            _ => Vec::new(),
+            Some(_) => Some(Vec::new()),
+            None => None,
         };
-        match decide_bootstrap_equality(
+        let door = decide_bootstrap_door(
             candidate_key_id.as_deref(),
-            link_ed25519,
-            peek.as_ref(),
-            &resolved,
-        ) {
-            BootstrapEquality::NotApplicable => candidate_key_id,
-            BootstrapEquality::Attributed { key_id, newly } => {
-                if newly {
-                    ctx.link_to_peer_key_id
-                        .lock()
-                        .await
-                        .insert(link_id, key_id.clone());
-                    tracing::info!(
-                        link = ?link_id,
-                        peer = %key_id,
-                        "first-contact link ATTRIBUTED by equality — the delivered bootstrap \
-                         record's Ed25519 pubkey is the link identity's Ed25519 half; the link \
-                         now attributes through the identified table (CIRISEdge#624)"
-                    );
-                }
+            link_identity.as_ref(),
+            bindings.as_deref(),
+        );
+        if let (Some(named), Some(link)) = (&named, &link_identity) {
+            if let Some(m) = ctx.metrics {
+                m.inc_bootstrap_door(door.as_str());
+            }
+            // One line per bootstrap Deliver with every operand the server team
+            // needs to validate attribution from the log alone. The steady state
+            // (link already attributed ⇒ `not_applicable`) is DEBUG; the two
+            // decisions that MOVE something (`attributed`, `unbound`) are INFO.
+            if matches!(door, BootstrapDoor::NotApplicable) {
+                tracing::debug!(
+                    link = ?link_id,
+                    link_transport_identity_hash = %hex::encode(link.hash()),
+                    candidate = ?candidate_key_id,
+                    named_keys = ?named,
+                    decision = door.as_str(),
+                    "bootstrap door (CIRISEdge#636): link already attributed — no belt, no drop"
+                );
+            } else {
+                tracing::info!(
+                    link = ?link_id,
+                    link_transport_identity_hash = %hex::encode(link.hash()),
+                    named_keys = ?named,
+                    bindings_held = bindings.as_ref().map_or(0, Vec::len),
+                    decision = door.as_str(),
+                    "bootstrap door (CIRISEdge#636): the link's transport identity vs the verified \
+                     bindings of the keys this Deliver names — `attributed` binds the link now; \
+                     `unbound` delivers un-attributed (admitted on its own signature) and the \
+                     binding it carries attributes the next frame"
+                );
+            }
+        }
+        match door {
+            BootstrapDoor::NotApplicable | BootstrapDoor::Unbound => candidate_key_id,
+            BootstrapDoor::Attributed { key_id, source } => {
+                ctx.link_to_peer_key_id
+                    .lock()
+                    .await
+                    .insert(link_id, key_id.clone());
+                tracing::info!(
+                    link = ?link_id,
+                    peer = %key_id,
+                    binding_source = source.as_str(),
+                    "link ATTRIBUTED at the bootstrap door — a verified TransportBinding for \
+                     this key holds the link's proven transport identity; the link now \
+                     attributes through the identified table (CIRISEdge#636)"
+                );
                 Some(key_id)
-            }
-            BootstrapEquality::Mismatch { key_id } => {
-                let detail = format!(
-                    "bootstrap Deliver on an identified link carries record {key_id} whose \
-                     Ed25519 pubkey is NOT the link identity's Ed25519 half — the link does \
-                     not hold the key it delivers as its own; dropped (CIRISEdge#624)"
-                );
-                drop_inbound(Some(link_id), "bootstrap_key_not_this_link", &detail);
-                // choke-ok: `drop_inbound` IS the choke point (#425).
-                return;
-            }
-            BootstrapEquality::RecordNotHeld { key_id } => {
-                let detail = format!(
-                    "bootstrap Deliver on an un-attributed identified link is signed by \
-                     {key_id}, whose Key record this node does not hold — the Key frame must \
-                     precede its IdentityOccurrence/TransportDestination; dropped \
-                     (CIRISEdge#624)"
-                );
-                drop_inbound(Some(link_id), "bootstrap_record_not_held", &detail);
-                // choke-ok: `drop_inbound` IS the choke point (#425).
-                return;
             }
         }
     };
@@ -8192,13 +8293,13 @@ fn report_attribution_miss(
 
 /// CIRISEdge#436 — serve this node's own build-attestation bundle over an
 /// established link, best-effort: `CFRG`-fragment the pre-encoded `CBND` frame
-/// onto the link's packet path (`try_send` — the same non-contending Channel
-/// the reverse-path replies ride, so it interleaves any in-flight resource
-/// transfer) and let the receiver's `attribute_and_deliver` reassemble it. A
-/// lost/backpressured push is recoverable (the next link-up re-serves) but
-/// never silent (throttled WARN).
+/// onto the link's packet path (`send_fragments_on_channel` — the same
+/// non-contending Channel the reverse-path replies ride, so it interleaves any
+/// in-flight resource transfer, absorbing the Channel's pacing) and let the
+/// receiver's `attribute_and_deliver` reassemble it. A stalled push is
+/// recoverable (the next link-up re-serves) but never silent (throttled WARN).
 /// CIRISEdge#627 — push this node's `CANN` announce frame on a link, fragmented
-/// like the bundle (`CFRG`), through the same channel `try_send` so it rides the
+/// like the bundle (`CFRG`), through the same Channel helper so it rides the
 /// same lane in the same order. A lost push is recoverable (the RNS announce
 /// still exists; the next link-up re-serves) and never silent.
 async fn push_own_announce_frame(node: &ReticulumNode, frame: &[u8], link_id: &LinkId) {
@@ -8218,16 +8319,9 @@ async fn push_own_announce_frame(node: &ReticulumNode, frame: &[u8], link_id: &L
         }
         return;
     };
-    let total = fragments.len();
-    let mut sent = 0usize;
-    for frag in &fragments {
-        if node.link_handle(link_id).try_send(frag).await.is_ok() {
-            sent += 1;
-        } else {
-            break;
-        }
-    }
-    if sent == total {
+    let outcome = send_fragments_on_channel(node, link_id, &fragments).await;
+    let (sent, total) = (outcome.sent, outcome.total);
+    if outcome.complete() {
         tracing::debug!(link = ?link_id, bytes = frame.len(), fragments = total,
             "own announce served on link-up, first on the link (CIRISEdge#627)");
     } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
@@ -8237,10 +8331,11 @@ async fn push_own_announce_frame(node: &ReticulumNode, frame: &[u8], link_id: &L
             link = ?link_id,
             fragments = total,
             fragments_sent = sent,
+            stalled = outcome.stalled.unwrap_or("-"),
             suppressed_prev,
             "own announce push incomplete ({sent}/{total} fragments) — link Channel \
-             backpressured; the peer binds us from the RNS announce or the next link-up \
-             (CIRISEdge#627)"
+             stalled past its pacing budget; the peer binds us from the RNS announce or \
+             the next link-up (CIRISEdge#627/#636)"
         );
     }
 }
@@ -8262,16 +8357,9 @@ async fn push_own_bundle_frames(node: &ReticulumNode, own: &OwnBuildBundle, link
         }
         return;
     };
-    let total = fragments.len();
-    let mut sent = 0usize;
-    for frag in &fragments {
-        if node.link_handle(link_id).try_send(frag).await.is_ok() {
-            sent += 1;
-        } else {
-            break;
-        }
-    }
-    if sent == total {
+    let outcome = send_fragments_on_channel(node, link_id, &fragments).await;
+    let (sent, total) = (outcome.sent, outcome.total);
+    if outcome.complete() {
         tracing::debug!(
             link = ?link_id,
             bytes = own.frame.len(),
@@ -8285,9 +8373,11 @@ async fn push_own_bundle_frames(node: &ReticulumNode, own: &OwnBuildBundle, link
             link = ?link_id,
             fragments = total,
             fragments_sent = sent,
+            stalled = outcome.stalled.unwrap_or("-"),
             suppressed_prev,
             "own build-bundle push incomplete ({sent}/{total} fragments) — link Channel \
-             backpressured; the peer re-receives on the next link-up (CIRISEdge#436)"
+             stalled past its pacing budget; the peer re-receives on the next link-up \
+             (CIRISEdge#436/#636)"
         );
     }
 }
@@ -8846,14 +8936,17 @@ enum Stage1Outcome {
 ///
 /// Everything here is decidable from the announce bytes and the peers map:
 /// parse, the RNS §5.6.8.8.1.1 destination recompute (under the configured
-/// enforcement), the attestation's self-signature, and — under the operator's
-/// ruling that *the transport identity is a derivative of the node key* — the
-/// ownership proof: the claimed `federation_pubkey_ed25519` equals the
-/// transport ed25519 half (bytes 32..64 of the announcer's identity), and the
-/// signature verified under that same key. An announcer that satisfies both
-/// controls the federation key AND the transport identity derived from it;
-/// that is `owns_key`. A legacy peer whose two keys differ gets `owns_key:
-/// false` here and is lifted only by Stage 2's directory walk.
+/// enforcement), the attestation's self-signature, and the ownership proof
+/// (CIRISEdge#636): the claimed `federation_key_id`'s fingerprint is the
+/// claimed `federation_pubkey_ed25519`'s (`identity_model::key_id_binds_pubkey`),
+/// and the signature verified under that pubkey. An announcer that satisfies
+/// both controls the federation key it names, and the attestation it signed
+/// (`{transport_identity_pubkey, key_id, epoch}`) binds that key to the
+/// announcer's transport identity; that is `owns_key`. The federation key and
+/// the transport identity are DIFFERENT keypairs on every node — the pre-#636
+/// test compared them for equality and was false everywhere. A key id with
+/// no fingerprint (legacy / test ids) gets `owns_key: false` here and is
+/// lifted only by Stage 2's directory walk.
 ///
 /// # What Stage 1 will and will not write
 ///
@@ -8899,16 +8992,20 @@ async fn stage1_bind_announce(
     if !attestation_self_verifies(&attestation, &key_id, view.public_key()) {
         return (Stage1Outcome::Skipped("self-signature"), Some(key_id));
     }
-    // The ruling: transport identity derives from the node key. Bytes
-    // compared: the announce's transport ed25519 half (identity bytes 32..64)
-    // against the attestation's claimed federation Ed25519 public key.
+    // CIRISEdge#636 — ownership, directory-free: the claimed key id's
+    // fingerprint IS the claimed pubkey's (`key_id_binds_pubkey`) and the
+    // attestation self-verified under that pubkey (above). The announcer
+    // therefore controls the federation key it names, and the attestation it
+    // signed binds that key to THIS transport identity. The pre-#636 test
+    // (`transport_ed25519 == federation_pubkey`) compared two different
+    // keypairs and was false for every real node.
     let transport_ed25519: [u8; 32] = view.public_key()[32..].try_into().unwrap_or([0u8; 32]);
-    let owns_key = transport_ed25519 == attestation.federation_pubkey_ed25519;
+    let owns_key = key_id_binds_pubkey(&key_id, &attestation.federation_pubkey_ed25519);
     let transport_pubkey64 = *view.public_key();
     let transport_identity_hash = view.transport_identity_hash();
     let resolved = ResolvedPeer {
         dest_hash: *view.destination_hash(),
-        signing_key: transport_ed25519,
+        transport_ed25519,
     };
     let mut peers = peers.lock().await;
     match peers.get_mut(&key_id) {
@@ -9293,7 +9390,7 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
     };
     let resolved = ResolvedPeer {
         dest_hash: *announce.destination_hash(),
-        signing_key: transport_pubkey,
+        transport_ed25519: transport_pubkey,
     };
     // The identity hash the link's LINKIDENTIFY proves:
     // `truncated_hash(x25519 ‖ ed25519)`.
@@ -10435,7 +10532,7 @@ mod tests {
             RootedPeer {
                 peer: ResolvedPeer {
                     dest_hash: DestinationHash::new([7u8; 16]),
-                    signing_key: [9u8; 32],
+                    transport_ed25519: [9u8; 32],
                 },
                 epoch: 0,
                 chain: None,
@@ -10784,15 +10881,47 @@ mod tests {
     /// against the exact inputs the event loop hands them: the CRPL bytes, the
     /// link identity's Ed25519 half, the attribution result, and the
     /// directory's answer for a signer.
-    mod bootstrap_equality_624 {
+    /// CIRISEdge#636 — the bootstrap door on the key OBJECTS. The three cases
+    /// the server's rows make concrete (federation key ≠ transport identity on
+    /// every node), exercised through the REAL resolver (`transport_binding_of`
+    /// over a peers map and a stored-TD directory double) and the pure door.
+    mod bootstrap_door_636 {
         use super::super::{
-            decide_bootstrap_equality, peek_bootstrap_deliver, BootstrapEquality, BootstrapPeek,
+            bootstrap_key_ids_named, transport_binding_of, RootedPeer, RootingDirectory,
         };
         use crate::replication::protocol::{
             DeliverMessage, EnvelopeKind, ReplicationMessage, SummaryMessage,
         };
+        use crate::transport::identity_model::{
+            decide_bootstrap_door, BindingSource, BootstrapDoor, TransportIdentityPub,
+        };
+        use crate::verify::{
+            ProvenanceChain, RootingRejection, RootingVerdict, StoredTransportBinding,
+        };
         use base64::Engine as _;
+        use leviculum_core::Identity;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
 
+        /// A real RNS transport identity from a deterministic private key.
+        fn transport(tag: u8) -> TransportIdentityPub {
+            let mut prv = [0u8; 64];
+            for (i, b) in prv.iter_mut().enumerate() {
+                *b = u8::try_from(i % 251).expect("in range") ^ tag;
+            }
+            TransportIdentityPub::from_identity(
+                &Identity::from_private_key_bytes(&prv).expect("identity"),
+            )
+        }
+        /// A federation pubkey that is NOT any transport identity's ed25519 half.
+        fn fed_pubkey(tag: u8) -> [u8; 32] {
+            let mut pk = [0u8; 32];
+            for (i, b) in pk.iter_mut().enumerate() {
+                *b = u8::try_from(i).expect("in range").wrapping_mul(13) ^ tag;
+            }
+            pk
+        }
         fn key_envelope(key_id: &str, pk: [u8; 32]) -> Vec<u8> {
             serde_json::to_vec(&serde_json::json!({
                 "record": {
@@ -10803,218 +10932,272 @@ mod tests {
             }))
             .expect("json")
         }
+        fn signed_envelope(attesting_key_id: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "attesting_key_id": attesting_key_id,
+                "subject": "x",
+            }))
+            .expect("json")
+        }
         fn deliver(kind: EnvelopeKind, envelopes: Vec<Vec<u8>>) -> Vec<u8> {
             crate::replication::wire_frame::wrap(&ReplicationMessage::Deliver(DeliverMessage {
                 kind,
                 envelopes,
             }))
         }
-        const LINK: [u8; 32] = [0xa2; 32];
-        const OTHER: [u8; 32] = [0x5c; 32];
 
-        /// (a) THE #624 CONDITION: no attribution, identified link, a Key
-        /// Deliver whose record pubkey IS the link's Ed25519 half ⇒ attributed
-        /// to that record's key id, newly.
-        #[test]
-        fn a_fresh_peer_is_attributed_to_the_record_whose_pubkey_is_the_links() {
-            let peek = peek_bootstrap_deliver(&deliver(
+        /// A directory double that holds stored TD rows only — the walk is
+        /// never reached by the door (it resolves bindings, never roots).
+        struct StoredTds(HashMap<String, [u8; 64]>);
+        #[async_trait::async_trait]
+        impl RootingDirectory for StoredTds {
+            async fn root_binding(&self, _key_id: &str, _claimed: &str) -> RootingVerdict {
+                unreachable!("the door never roots")
+            }
+            async fn provenance_chain(
+                &self,
+                _key_id: &str,
+            ) -> Result<ProvenanceChain, RootingRejection> {
+                unreachable!("the door never roots")
+            }
+            async fn stored_reticulum_binding(
+                &self,
+                key_id: &str,
+            ) -> Option<StoredTransportBinding> {
+                self.0.get(key_id).map(|pk| StoredTransportBinding {
+                    provenance: ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
+                    transport_pubkey64: *pk,
+                    epoch: 1,
+                })
+            }
+        }
+
+        fn peers_with(
+            entries: &[(&str, TransportIdentityPub)],
+        ) -> Mutex<HashMap<String, RootedPeer>> {
+            let mut map = HashMap::new();
+            for (key_id, t) in entries {
+                map.insert(
+                    (*key_id).to_owned(),
+                    RootedPeer::advisory_for_test(t.pub64()),
+                );
+            }
+            Mutex::new(map)
+        }
+
+        async fn bindings_for(
+            peers: &Mutex<HashMap<String, RootedPeer>>,
+            rooting: Option<&dyn RootingDirectory>,
+            frame: &[u8],
+        ) -> (
+            Option<Vec<String>>,
+            Option<Vec<crate::transport::identity_model::TransportBinding>>,
+        ) {
+            let named = bootstrap_key_ids_named(frame);
+            let mut out = Vec::new();
+            if let Some(ids) = &named {
+                for id in ids {
+                    if let Some(b) = transport_binding_of(peers, rooting, id).await {
+                        out.push(b);
+                    }
+                }
+            }
+            (named.clone(), named.map(|_| out))
+        }
+
+        const CANONICAL: &str = "ciris-canonical-1-bm7v4wdpgk";
+        const NODE_A: &str = "ciris-node-a-3yr5psjdy4";
+        const NODE_B: &str = "ciris-node-b-w3yueqf4ok";
+
+        /// Server case 1 (node-a, ×25): the canonical's OWN Key record arrives
+        /// on a link already attributed to the canonical. Its federation pubkey
+        /// is not its transport identity's ed25519 half — and that is fine:
+        /// the door has no job on an attributed link. Pre-#636: `Mismatch`.
+        #[tokio::test]
+        async fn a_peers_own_record_on_its_attributed_link_is_admitted() {
+            let link = transport(0x10);
+            let peers = peers_with(&[(CANONICAL, link)]);
+            let frame = deliver(
                 EnvelopeKind::Key,
-                vec![key_envelope("fresh-peer-cjgfikxxd5", LINK)],
-            ));
-            assert_eq!(
-                peek,
-                Some(BootstrapPeek::Keys(vec![(
-                    "fresh-peer-cjgfikxxd5".into(),
-                    LINK
-                )]))
+                vec![key_envelope(CANONICAL, fed_pubkey(0x10))],
             );
+            let (named, bindings) = bindings_for(&peers, None, &frame).await;
+            assert_eq!(named.as_deref(), Some(&[CANONICAL.to_owned()][..]));
+            let door = decide_bootstrap_door(Some(CANONICAL), Some(&link), bindings.as_deref());
+            assert_eq!(door, BootstrapDoor::NotApplicable);
+        }
+
+        /// Server case 2 (node-b, ×21): a THIRD PARTY's record (node-a's,
+        /// relayed by the canonical) on a link node-b has not attributed. The
+        /// binding node-b holds for node-a names node-a's transport identity,
+        /// not this link's ⇒ `Unbound`: the frame passes un-attributed and is
+        /// admitted on its own signature. Pre-#636: `Mismatch` → dropped, the
+        /// link never attributed, `bound=0`.
+        #[tokio::test]
+        async fn a_third_partys_record_on_an_unattributed_link_passes_unbound() {
+            let link = transport(0x20); // the canonical's link
+            let peers = peers_with(&[(NODE_A, transport(0x21))]);
+            let frame = deliver(
+                EnvelopeKind::Key,
+                vec![key_envelope(NODE_A, fed_pubkey(0x21))],
+            );
+            let (_, bindings) = bindings_for(&peers, None, &frame).await;
             assert_eq!(
-                decide_bootstrap_equality(None, Some(LINK), peek.as_ref(), &[]),
-                BootstrapEquality::Attributed {
-                    key_id: "fresh-peer-cjgfikxxd5".into(),
-                    newly: true
-                },
-                "the record's Ed25519 pubkey equals the link identity's Ed25519 half ⇒ \
-                 attribution is that record's federation key id (CIRISEdge#624)"
+                bindings.as_ref().map(Vec::len),
+                Some(1),
+                "node-a's binding is held"
+            );
+            let door = decide_bootstrap_door(None, Some(&link), bindings.as_deref());
+            assert_eq!(
+                door,
+                BootstrapDoor::Unbound,
+                "not a drop, not an attribution"
             );
         }
 
-        /// The same frame with a record whose pubkey differs ⇒ dropped by name.
-        #[test]
-        fn a_record_under_a_key_the_link_does_not_hold_is_a_mismatch() {
-            let peek = peek_bootstrap_deliver(&deliver(
-                EnvelopeKind::Key,
-                vec![key_envelope("liar-cjgfikxxd5", OTHER)],
-            ));
+        /// Server case 3 / the #624 first-contact case done right: the Deliver
+        /// names a key whose VERIFIED binding (stored TD row) holds THIS link's
+        /// transport identity ⇒ attributed to that key through the binding.
+        #[tokio::test]
+        async fn a_link_is_attributed_through_the_stored_binding_never_the_record_pubkey() {
+            let link = transport(0x30);
+            let peers = peers_with(&[]);
+            let rooting: Arc<dyn RootingDirectory> = Arc::new(StoredTds(HashMap::from([(
+                NODE_B.to_owned(),
+                link.pub64(),
+            )])));
+            // An IdentityOccurrence signed by node-b, plus a third party's.
+            let frame = deliver(
+                EnvelopeKind::IdentityOccurrence,
+                vec![signed_envelope(NODE_A), signed_envelope(NODE_B)],
+            );
+            let (named, bindings) = bindings_for(&peers, Some(rooting.as_ref()), &frame).await;
             assert_eq!(
-                decide_bootstrap_equality(None, Some(LINK), peek.as_ref(), &[]),
-                BootstrapEquality::Mismatch {
-                    key_id: "liar-cjgfikxxd5".into()
+                named.as_deref(),
+                Some(&[NODE_A.to_owned(), NODE_B.to_owned()][..]),
+                "sorted, deduped"
+            );
+            let door = decide_bootstrap_door(None, Some(&link), bindings.as_deref());
+            assert_eq!(
+                door,
+                BootstrapDoor::Attributed {
+                    key_id: NODE_B.into(),
+                    source: BindingSource::StoredTransportDestination
                 }
             );
         }
 
-        /// An IdentityOccurrence before its Key: the signer is not held ⇒
-        /// refused by name ("Key frame must precede").
-        #[test]
-        fn an_occurrence_before_its_key_is_record_not_held() {
-            let env = serde_json::to_vec(&serde_json::json!({
-                "attesting_key_id": "fresh-peer-cjgfikxxd5", "identity_occurrence": {}
-            }))
-            .unwrap();
-            let peek =
-                peek_bootstrap_deliver(&deliver(EnvelopeKind::IdentityOccurrence, vec![env]));
+        /// The peers map outranks the stored row (trust order), and a
+        /// test-injected `[0; 64]` entry never matches a real link.
+        #[tokio::test]
+        async fn the_resolver_prefers_the_peers_map_and_skips_the_zero_sentinel() {
+            let link = transport(0x40);
+            let peers = peers_with(&[(NODE_A, link)]);
+            let rooting: Arc<dyn RootingDirectory> = Arc::new(StoredTds(HashMap::from([(
+                NODE_A.to_owned(),
+                transport(0x41).pub64(),
+            )])));
+            let b = transport_binding_of(&peers, Some(rooting.as_ref()), NODE_A)
+                .await
+                .expect("bound");
+            assert_eq!(b.source, BindingSource::PeersMap);
+            assert_eq!(b.transport, link);
+
+            let zero = Mutex::new(HashMap::from([(
+                NODE_A.to_owned(),
+                RootedPeer::advisory_for_test([0u8; 64]),
+            )]));
+            let b = transport_binding_of(&zero, Some(rooting.as_ref()), NODE_A)
+                .await
+                .expect("falls through to the stored row");
+            assert_eq!(b.source, BindingSource::StoredTransportDestination);
+            assert!(transport_binding_of(&zero, None, NODE_B).await.is_none());
+        }
+
+        /// A record whose pubkey HAPPENS to equal the link's ed25519 half is
+        /// NOT attributed on that basis: only a verified binding attributes.
+        /// (The pre-#636 door would have; this pins that the compare is gone.)
+        #[tokio::test]
+        async fn a_record_pubkey_equal_to_the_link_half_attributes_nothing_by_itself() {
+            let link = transport(0x50);
+            let peers = peers_with(&[]);
+            let frame = deliver(EnvelopeKind::Key, vec![key_envelope(NODE_A, link.ed25519)]);
+            let (_, bindings) = bindings_for(&peers, None, &frame).await;
             assert_eq!(
-                peek,
-                Some(BootstrapPeek::Signers(vec!["fresh-peer-cjgfikxxd5".into()]))
-            );
-            assert_eq!(
-                decide_bootstrap_equality(
-                    None,
-                    Some(LINK),
-                    peek.as_ref(),
-                    &[("fresh-peer-cjgfikxxd5".into(), None)]
-                ),
-                BootstrapEquality::RecordNotHeld {
-                    key_id: "fresh-peer-cjgfikxxd5".into()
-                }
-            );
-            // …and once the Key is held and equal, the occurrence attributes.
-            assert_eq!(
-                decide_bootstrap_equality(
-                    None,
-                    Some(LINK),
-                    peek.as_ref(),
-                    &[("fresh-peer-cjgfikxxd5".into(), Some(LINK))]
-                ),
-                BootstrapEquality::Attributed {
-                    key_id: "fresh-peer-cjgfikxxd5".into(),
-                    newly: true
-                }
+                decide_bootstrap_door(None, Some(&link), bindings.as_deref()),
+                BootstrapDoor::Unbound
             );
         }
 
-        /// The belt on an ATTRIBUTED link (Advisory or Rooted alike): its own
-        /// record under a key the link does not hold ⇒ Mismatch, whatever the
-        /// map said; a relayed third-party record is not compared.
         #[test]
-        fn an_attributed_link_is_belted_on_its_own_record_only() {
-            let own_wrong = peek_bootstrap_deliver(&deliver(
-                EnvelopeKind::Key,
-                vec![key_envelope("advisory-peer-cjgfikxxd5", OTHER)],
-            ));
-            assert_eq!(
-                decide_bootstrap_equality(
-                    Some("advisory-peer-cjgfikxxd5"),
-                    Some(LINK),
-                    own_wrong.as_ref(),
-                    &[]
-                ),
-                BootstrapEquality::Mismatch {
-                    key_id: "advisory-peer-cjgfikxxd5".into()
-                },
-                "#621's cousin: the map names a peer whose key this link does not hold"
-            );
-            let relay = peek_bootstrap_deliver(&deliver(
-                EnvelopeKind::Key,
-                vec![key_envelope("someone-else-cjgfikxxd5", OTHER)],
-            ));
-            assert_eq!(
-                decide_bootstrap_equality(
-                    Some("advisory-peer-cjgfikxxd5"),
-                    Some(LINK),
-                    relay.as_ref(),
-                    &[]
-                ),
-                BootstrapEquality::NotApplicable,
-                "a rooted/advisory peer relaying another's record is persist's to verify"
-            );
-            let own_right = peek_bootstrap_deliver(&deliver(
-                EnvelopeKind::Key,
-                vec![key_envelope("advisory-peer-cjgfikxxd5", LINK)],
-            ));
-            assert_eq!(
-                decide_bootstrap_equality(
-                    Some("advisory-peer-cjgfikxxd5"),
-                    Some(LINK),
-                    own_right.as_ref(),
-                    &[]
-                ),
-                BootstrapEquality::NotApplicable,
-                "an Advisory peer's own record under the link's key passes the belt"
-            );
-        }
-
-        /// A round-open Summary carries no record; a non-bootstrap Deliver is
-        /// not this door; an unidentified link proves nothing — all
-        /// NotApplicable, so attribution stands as it was (and an un-attributed
-        /// frame still drops downstream).
-        #[test]
-        fn summaries_non_bootstrap_kinds_and_unidentified_links_are_not_this_door() {
+        fn summaries_and_non_bootstrap_kinds_name_nobody() {
             let summary = crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
                 SummaryMessage {
                     kind: EnvelopeKind::Key,
                     refs: vec![],
                 },
             ));
-            assert_eq!(peek_bootstrap_deliver(&summary), None);
+            assert_eq!(bootstrap_key_ids_named(&summary), None);
             assert_eq!(
-                peek_bootstrap_deliver(&deliver(
+                bootstrap_key_ids_named(&deliver(
                     EnvelopeKind::Attestation,
-                    vec![key_envelope("x-cjgfikxxd5", LINK)]
+                    vec![signed_envelope(NODE_A)]
                 )),
                 None,
                 "an Attestation Deliver is never peeked — E3's kinds stay outside this door"
             );
-            let peek = peek_bootstrap_deliver(&deliver(
-                EnvelopeKind::Key,
-                vec![key_envelope("fresh-peer-cjgfikxxd5", LINK)],
-            ));
             assert_eq!(
-                decide_bootstrap_equality(None, None, peek.as_ref(), &[]),
-                BootstrapEquality::NotApplicable,
-                "no proven link identity ⇒ no equality ⇒ no attribution"
+                bootstrap_key_ids_named(&deliver(
+                    EnvelopeKind::TransportDestination,
+                    vec![signed_envelope(NODE_B), signed_envelope(NODE_B)]
+                )),
+                Some(vec![NODE_B.to_owned()])
             );
         }
 
         proptest::proptest! {
             /// The universal invariant: over every kind, an identified-or-not
-            /// link, and a record whose pubkey equals the link's or not, an
-            /// un-attributed frame is attributed IFF it is a bootstrap `Key`
-            /// Deliver on an identified link whose record pubkey equals the
-            /// link's Ed25519 half — and the attributed id is ALWAYS that
-            /// record's key id, never anything derived from the link.
+            /// link, and a held binding that matches the link or not, an
+            /// un-attributed frame is attributed IFF it is a bootstrap Deliver on
+            /// an identified link naming a key whose VERIFIED binding holds the
+            /// link's transport identity — and never dropped.
             #[test]
-            fn attributed_iff_bootstrap_key_deliver_identified_and_equal(
+            fn attributed_iff_bootstrap_deliver_identified_and_bound(
                 kind_idx in 0usize..EnvelopeKind::ALL.len(),
                 identified in proptest::bool::ANY,
-                equal in proptest::bool::ANY,
-                key_id in proptest::string::string_regex("[a-z0-9-]{1,16}").unwrap(),
+                bound_here in proptest::bool::ANY,
+                held in proptest::bool::ANY,
             ) {
-                let kind = EnvelopeKind::ALL[kind_idx];
-                let record_pk = if equal { LINK } else { OTHER };
-                let frame = deliver(kind, vec![key_envelope(&key_id, record_pk)]);
-                let peek = peek_bootstrap_deliver(&frame);
-                let link = identified.then_some(LINK);
-                let verdict = decide_bootstrap_equality(None, link, peek.as_ref(), &[]);
-                let expect_attributed =
-                    matches!(kind, EnvelopeKind::Key) && identified && equal;
-                proptest::prop_assert_eq!(
-                    matches!(verdict, BootstrapEquality::Attributed { .. }),
-                    expect_attributed
-                );
-                if let BootstrapEquality::Attributed { key_id: got, newly } = &verdict {
-                    proptest::prop_assert_eq!(got, &key_id);
-                    proptest::prop_assert!(*newly);
-                }
-                // A non-bootstrap kind never produces ANY verdict but NotApplicable.
-                if !kind.is_bootstrap() {
-                    proptest::prop_assert_eq!(verdict, BootstrapEquality::NotApplicable);
-                }
+                let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+                rt.block_on(async {
+                    let kind = EnvelopeKind::ALL[kind_idx];
+                    let link = transport(0x60);
+                    let peer_transport = if bound_here { link } else { transport(0x61) };
+                    let peers = if held { peers_with(&[(NODE_A, peer_transport)]) } else { peers_with(&[]) };
+                    let frame = if matches!(kind, EnvelopeKind::Key) {
+                        deliver(kind, vec![key_envelope(NODE_A, fed_pubkey(0x60))])
+                    } else {
+                        deliver(kind, vec![signed_envelope(NODE_A)])
+                    };
+                    let (_, bindings) = bindings_for(&peers, None, &frame).await;
+                    let link_opt = identified.then_some(link);
+                    let door = decide_bootstrap_door(None, link_opt.as_ref(), bindings.as_deref());
+                    let expect_attributed = kind.is_bootstrap() && identified && held && bound_here;
+                    proptest::prop_assert_eq!(
+                        matches!(door, BootstrapDoor::Attributed { .. }),
+                        expect_attributed
+                    );
+                    if let BootstrapDoor::Attributed { key_id, .. } = &door {
+                        proptest::prop_assert_eq!(key_id, NODE_A);
+                    }
+                    if !kind.is_bootstrap() || !identified {
+                        proptest::prop_assert_eq!(door, BootstrapDoor::NotApplicable);
+                    }
+                    Ok(())
+                })?;
             }
         }
     }
-
     /// CIRISEdge#627 — Stage 1 of announce receipt, witnessed with a REAL
     /// signed attestation and NO directory anywhere in the test: the binding a
     /// first-seen peer gets is decided from the announce bytes alone.
@@ -11047,16 +11230,21 @@ mod tests {
             LocalSigner::new(key_id, classical, Some(pqc))
         }
 
-        /// The RNS transport identity `x25519_priv ‖ ed25519_priv`. Under the
-        /// operator's ruling the ed25519 half IS the federation key, so the
-        /// ruled shape passes the signer's own seed as the ed25519 half.
+        /// The RNS transport identity `x25519_priv ‖ ed25519_priv` — its own
+        /// keypair, minted by the transport keystore on a real node and NEVER
+        /// the federation key (CIRISEdge#636 `identity_model`).
         fn transport_identity(x_seed: [u8; 32], ed: [u8; 32]) -> Identity {
             let mut prv = [0u8; 64];
             prv[..32].copy_from_slice(&x_seed);
             prv[32..].copy_from_slice(&ed);
             Identity::from_private_key_bytes(&prv).expect("identity")
         }
-
+        /// A federation key id as every real node has one: `<label>-<fp>` with
+        /// the fingerprint recomputed from the signer's pubkey.
+        async fn fed_key_id(label: &str, signer: &LocalSigner) -> String {
+            let pk = signer.classical.public_key().await.expect("pubkey");
+            ciris_verify_core::fedcode::derive_key_id(label, &pk)
+        }
         fn named_dest(identity: &Identity) -> DestinationHash {
             let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
             Destination::compute_destination_hash(&name_hash, identity.hash())
@@ -11088,36 +11276,36 @@ mod tests {
 
         /// **The issue's case.** A never-seen peer, no announce ever applied, no
         /// directory in sight: Stage 1 binds it from the announce alone, and —
-        /// because its transport ed25519 half IS its federation key — with
-        /// `owns_key: true`. E3 is untouched: the binding is `Advisory` and
-        /// `from_rooted_binding` still says no.
+        /// because the claimed key id's fingerprint is the claimed pubkey's and
+        /// the attestation self-verified under it — with `owns_key: true`. The
+        /// transport identity is a DIFFERENT keypair from the federation key,
+        /// as on every real node (CIRISEdge#636). E3 is untouched: the binding
+        /// is `Advisory` and `from_rooted_binding` still says no.
         #[tokio::test]
         async fn a_first_seen_peer_is_bound_inline_with_no_directory_and_owns_its_key() {
-            let ed = ed_seed(0x11);
-            let signer = signer("fresh-peer", ed);
-            let identity = transport_identity(ed_seed(0x22), ed);
-            let view = announce(&signer, &identity, "fresh-peer", 1, named_dest(&identity)).await;
+            let signer = signer("fresh-peer", ed_seed(0x11));
+            let key_id = fed_key_id("fresh-peer", &signer).await;
+            let identity = transport_identity(ed_seed(0x22), ed_seed(0x23)); // ≠ federation key
+            let view = announce(&signer, &identity, &key_id, 1, named_dest(&identity)).await;
             assert!(
                 view.verify_destination_hash(),
                 "the on-link dest recompute matches"
             );
             let peers = empty_peers();
-
             let (outcome, key) = stage1_bind_announce(
                 &view,
                 &peers,
                 TransportBindingEnforcement::RequireTransportBinding,
             )
             .await;
-
             assert_eq!(
                 outcome,
                 Stage1Outcome::InstalledNew,
                 "first-seen ⇒ installed inline"
             );
-            assert_eq!(key.as_deref(), Some("fresh-peer"));
+            assert_eq!(key.as_deref(), Some(key_id.as_str()));
             let map = peers.lock().await;
-            let rp = map.get("fresh-peer").expect("bound");
+            let rp = map.get(&key_id).expect("bound");
             assert_eq!(
                 rp.provenance,
                 BindingProvenance::Advisory,
@@ -11125,13 +11313,15 @@ mod tests {
             );
             assert!(
                 rp.owns_key,
-                "transport ed25519 half == federation key ∧ self-signature verified ⇒ owns_key"
+                "key id fingerprint == claimed pubkey ∧ self-signature verified ⇒ owns_key, \
+                 with a transport identity that is NOT the federation key"
             );
             assert_eq!(rp.transport_identity_hash, *identity.hash());
+            assert_eq!(rp.transport_pubkey64, identity.public_key_bytes());
             assert_eq!(rp.peer.dest_hash, named_dest(&identity));
             assert!(
                 crate::transport::SourceKeyId::from_rooted_binding(
-                    "fresh-peer",
+                    &key_id,
                     rp.provenance,
                     rp.owns_key
                 )
@@ -11139,15 +11329,13 @@ mod tests {
                 "E3: a Stage-1 binding can never reach the trace-serve constructor"
             );
         }
-
-        /// A legacy peer whose transport identity is NOT derived from its
-        /// federation key is still bound (attributable for its bootstrap
-        /// kinds) but proves no ownership here — Stage 2 lifts it.
+        /// A key id with NO fingerprint (legacy / test ids) proves nothing
+        /// directory-free: bound (attributable for its bootstrap kinds) but
+        /// `owns_key: false` — Stage 2's directory walk lifts it.
         #[tokio::test]
-        async fn a_legacy_peer_whose_transport_key_is_not_its_federation_key_binds_without_owns_key(
-        ) {
+        async fn a_key_id_without_a_fingerprint_binds_without_owns_key() {
             let signer = signer("legacy-peer", ed_seed(0x31));
-            let identity = transport_identity(ed_seed(0x32), ed_seed(0x33)); // ≠ federation key
+            let identity = transport_identity(ed_seed(0x32), ed_seed(0x33));
             let view = announce(&signer, &identity, "legacy-peer", 1, named_dest(&identity)).await;
             let peers = empty_peers();
             let (outcome, _) =
@@ -11157,11 +11345,36 @@ mod tests {
             let rp = map.get("legacy-peer").expect("bound");
             assert!(
                 !rp.owns_key,
-                "no directory-free proof of ownership for a split key"
+                "no fingerprint ⇒ no directory-free proof of ownership"
             );
             assert_eq!(rp.provenance, BindingProvenance::Advisory);
         }
-
+        /// A claimed key id whose fingerprint is ANOTHER key's pubkey is a claim
+        /// about someone else's key: it self-verifies (the signature is under
+        /// the announcer's own pubkey) but never owns the key it names. The
+        /// pre-#636 test could not see this — it compared the transport half.
+        #[tokio::test]
+        async fn a_claim_on_another_keys_id_never_owns_it() {
+            let imposter = signer("imposter", ed_seed(0x34));
+            let victim = signer("victim", ed_seed(0x35));
+            let victim_id = fed_key_id("victim", &victim).await;
+            let identity = transport_identity(ed_seed(0x36), ed_seed(0x37));
+            let view = announce(&imposter, &identity, &victim_id, 1, named_dest(&identity)).await;
+            let peers = empty_peers();
+            let (outcome, _) =
+                stage1_bind_announce(&view, &peers, TransportBindingEnforcement::Advisory).await;
+            assert_eq!(
+                outcome,
+                Stage1Outcome::InstalledNew,
+                "bound Advisory, as any announcer"
+            );
+            let map = peers.lock().await;
+            let rp = map.get(&victim_id).expect("bound");
+            assert!(
+                !rp.owns_key,
+                "the id's fingerprint is not the announcer's pubkey"
+            );
+        }
         /// The same node re-announcing (same 64-byte transport key) refreshes
         /// its route and its clock and touches NOTHING about trust — a Rooted
         /// binding stays Rooted.
@@ -12615,7 +12828,7 @@ mod tests {
                 RootedPeer {
                     peer: ResolvedPeer {
                         dest_hash: DestinationHash::new(DEST),
-                        signing_key: ed25519,
+                        transport_ed25519: ed25519,
                     },
                     epoch: 0,
                     chain: None,

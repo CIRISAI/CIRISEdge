@@ -130,12 +130,16 @@ impl RetryDisposition {
     }
 }
 
-/// First transient window — two anti-entropy rounds at the 30 s default cadence
-/// (`antientropy.round_secs`, `mesh_config`). A roster-ordering refusal that
-/// clears immediately therefore costs at most one skipped round, which is the
-/// price of not asking 120 times an hour for something the node already knows
-/// it cannot admit yet.
-pub const TRANSIENT_BASE: Duration = Duration::from_secs(60);
+/// First transient window. CIRISEdge#636 (production speed): 20 s — under
+/// the 30 s cadence, and with propagation kicks a round-trip away. The common
+/// transient is an ORDERING refusal (an attestation before its attesting key,
+/// an occurrence before its owner-binding) whose missing row arrives on the
+/// next round; the first re-ask should land right after it, not two cadences
+/// later. The doubling below (20 → 40 → 80 → 160 → cap) still bounds a row
+/// that keeps failing to a handful of asks an hour. (Was 60 s; the server's
+/// timeline read a first re-ask at +601 s — most of that was rounds not
+/// completing, but the base was the floor.)
+pub const TRANSIENT_BASE: Duration = Duration::from_secs(20);
 /// Transient ceiling. Deliberately SHORT: the transient classes converge on
 /// state that is actively replicating, and worst-case added convergence latency
 /// is this value. 5 minutes turns the flat-out 120 asks/hour into at most 12

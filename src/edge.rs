@@ -5170,12 +5170,13 @@ async fn route_attributed_frame(
 /// CIRISEdge#402 — the bootstrap attribution carve-out. `Some(key_id)` iff the
 /// frame is a self-authenticating bootstrap kind (`Key`/`IdentityOccurrence`,
 /// [`crate::replication::EnvelopeKind::is_bootstrap`]) AND the link carried a
-/// transport-level identity (`link_key_id`). CIRISEdge#624: that hint is the
+/// transport-level identity (`link_key_id`). CIRISEdge#624/#636: that hint is the
 /// attribution result when there is one (an Advisory peer's key) and, for a
-/// fresh peer whose announce has not arrived, the federation `key_id` the
-/// transport derived by EQUALITY — the delivered Key record whose pubkey is
-/// the link identity's Ed25519 half (`reticulum::decide_bootstrap_equality`).
-/// Either way the hint is a federation key id; an unidentified link has
+/// fresh peer whose announce has not arrived, the federation `key_id` whose
+/// VERIFIED TransportBinding (peers map / stored TD row) holds the link's proven
+/// transport identity (`identity_model::decide_bootstrap_door`) — never a
+/// federation-pubkey compare, and `None` (un-attributed, still admitted) when
+/// no binding is held yet. Either way the hint is a federation key id; an unidentified link has
 /// none, so the door stays shut on it. The kind is peeked from the CRPL
 /// frame; a non-bootstrap kind, an unparseable frame, or an absent link identity
 /// ⇒ `None` (the frame drops; E3's `Rooted ∧ owns_key` trace-serve gate is
@@ -9248,9 +9249,9 @@ mod inbound_ingest_tests {
 
     /// CIRISEdge#624 — the case #402's door was built for and never opened: a
     /// FRESH peer (announce not yet arrived, in no map, both branches miss) whose
-    /// link proved its identity. The transport attributes its Key `Deliver` by
-    /// equality to the record's own `key_id` (tested at the pure decision in
-    /// `reticulum::bootstrap_equality_624`); here, that hint routes the frame and
+    /// link proved its identity. The transport attributes its Deliver through a
+    /// verified TransportBinding for a key it names (tested at the pure decision
+    /// in `reticulum::bootstrap_door_636` / `identity_model`); here, that hint routes the frame and
     /// a responder is built for it, so the identity round can be served. (b) an
     /// admitted-ADVISORY peer (announce arrived, owner binding not yet;
     /// `Rooted∧owns_key` false) takes the same door on its key. (c) a

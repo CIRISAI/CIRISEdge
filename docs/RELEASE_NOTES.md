@@ -1,5 +1,56 @@
 # CIRISEdge Release Notes
 
+# v26.1.0 — the keys are the keys: attribution on the transport identity, through the binding (CIRISEdge#636) — and production speed
+
+**2026-09-19** (PR #637). CIRISServer#612's chat ladder on v26.0.0 read `bound=0`. The server's
+rows made the defect exact: every node holds **two keypairs** — the **federation key**
+(`federation_keys.pubkey_ed25519`, what the announce and the Key record carry) and the **RNS
+transport identity** (`x25519 ‖ ed25519`, minted by the transport keystore, what the link
+handshake proves) — bound only by the signed `SignedTransportDestination` row. #626's bootstrap
+door compared `record.federation_pubkey == link.transport_ed25519`, and #627's Stage 1 compared
+the same two objects for ownership. Never equal on any node (`94GA…` vs `Q1y2…`): a peer's own
+record on its own attributed link was a `Mismatch` and dropped, every third-party record relayed
+on an un-attributed link was dropped, those links never attributed, and every non-bootstrap frame
+on them died — `bound=0` since v25.3.0. The premise had been read off a **test injector**.
+
+**The model, named once** — `transport::identity_model`: `TransportIdentityPub` (the RNS keypair's
+public halves, hash = `sha256(pub64)[:16]`), `key_id_binds_pubkey` (a federation key id's
+fingerprint IS its pubkey's — `derive_key_id`), `TransportBinding` (*federation key ↔ transport
+identity*, from a verified announce or an admitted TD row), and the pure `decide_bootstrap_door`.
+**One resolver**, `reticulum::transport_binding_of(key_id)`: peers map (announce-verified) first,
+then the stored TD row (persist-admitted). `ResolvedPeer.signing_key` is now `transport_ed25519` —
+it was the transport half all along and read as the federation key more than once.
+
+**The door, corrected.** Attributed link ⇒ `NotApplicable` (attribution *was* a binding match; no
+belt). Un-attributed identified link ⇒ resolve the keys the Deliver names; a verified binding
+holding THIS link's transport identity ⇒ `Attributed{key_id, source}`; else `Unbound` — delivered
+un-attributed, admitted on its own signature, the binding it carries attributes the *next* frame.
+**The door never drops** (`bootstrap_key_not_this_link` / `bootstrap_record_not_held` are gone);
+nothing inside a Deliver is trusted before admission. Stage 1 ownership: `key_id_binds_pubkey ∧
+self-signature`. Decisions counted in `bootstrap_door_outcomes` (`attributed`/`unbound`/
+`not_applicable`) and logged with every operand (`link_transport_identity_hash`, `named_keys`,
+`bindings_held`, `decision`).
+
+**Production speed** (the timeline's findings 2–3, CIRISServer#612 §5):
+- **Channel sends absorb pacing.** Every fragment on a link Channel now rides
+  `LinkHandle::send` (leviculum's own pacing wait) under a 3 s/fragment, 15 s/frame bound, through
+  ONE helper (`send_fragments_on_channel`) for reverse-path replies, the `CANN` announce and the
+  `CBND` bundle. `try_send` read the Channel's `PacingDelay` as failure — the `fragments=1
+  fragments_sent=0` signature behind ½–⅚ of rounds timing out.
+- **Channel-first for small replies.** A reverse-path reply of ≤ 8 fragments goes straight on the
+  Channel (reliable, sequenced, interleaving) instead of a one-per-link Resource transfer; bigger
+  frames keep the Resource path with the Channel as busy fallback.
+- **Kick and propagate.** `ReplicationHandle.kick(peer_key_id=None)` / `round_now_all()` fires
+  rounds now after you publish; a round that admits rows kicks every other peer on that plane
+  (`SchedulerCommand::Propagate`, 500 ms debounce per plane) so rows hop in round-trips, not
+  cadences. A quiet mesh stays quiet.
+- **First transient back-off 60 s → 20 s** (`refusal_backoff::TRANSIENT_BASE`): an ordering refusal
+  re-asks right after the missing row lands. (The +601 s in the timeline was mostly rounds not
+  completing — finding 2 — with the 60 s base as the floor.)
+
+Pins unchanged: persist v44.8.0, verify v15.2.0, leviculum v0.26.0+ciris.1. Wire unchanged (v3).
+FSD: `CIRIS_EDGE_TRANSPORT.md` §5.4.0 (the key objects), §5.4/§5.4.1/§5.5 corrected.
+
 # v26.0.0 — one round, one id, one direction: the replication registry un-fused (CIRISEdge#634)
 
 **2026-09-19** (PR #635). CIRISServer#607's fourth layer, found by the chat ladder's in-process
