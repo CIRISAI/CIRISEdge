@@ -1775,6 +1775,37 @@ mod advertise_tests {
             .with_self_provider(Some(provider))
     }
 
+    /// **persist v44.8.0 C2 (CIRISPersist#867) — the promoter READS the
+    /// transfer grant's `principle`, and only `share` / `publish` propagate.**
+    /// A grant edge authored with `retain` / `analyze` / `train` would be
+    /// admitted by every gate and then silently declined at persist's consent
+    /// sweep (`declined_by_principle`) — zero traces shipped, every gate
+    /// green, the exact #482-era failure shape. Pinned through persist's OWN
+    /// parser on the row edge produces, not on a string edge happens to write.
+    #[tokio::test]
+    async fn the_transfer_grant_edge_authors_carries_a_propagating_principle() {
+        let local = hybrid("local-node");
+        let grant = replication_consent_attestation(
+            "local-node",
+            "peer-1",
+            &DEFAULT_CONSENT_PREFIXES,
+            chrono::Utc::now(),
+            &local,
+        )
+        .await
+        .expect("build consent grant");
+        let policy = ciris_persist::federation::consent_grammar::parse_grant_payload(
+            &grant.attestation_envelope,
+        )
+        .expect("edge's grant parses under persist's closed grammar");
+        assert!(
+            policy.principle.propagates(),
+            "the principle edge writes must propagate, or persist's sweep declines the grant \
+             and nothing ships: got {}",
+            policy.principle.as_str()
+        );
+    }
+
     /// How many attestations this peer is offered, with and without the
     /// binding in the store. The DELTA is the binding's own contribution — the
     /// consent grant is itself an attestation and is advertised too, so a bare
