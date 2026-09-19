@@ -98,6 +98,9 @@ mod tests {
 
     /// The five link-frame magics stay pairwise distinct — the dispatch
     /// invariant the module docs promise (`CANN` joined in CIRISEdge#627).
+    /// Gated because `announce_frame` is: a default-feature build has four
+    /// magics, and the four-way check lives in the ungated modules' own tests.
+    #[cfg(feature = "_reticulum-module")]
     #[test]
     fn magic_is_distinct_from_every_other_link_frame_magic() {
         use crate::replication::wire_frame::REPLICATION_FRAME_MAGIC;

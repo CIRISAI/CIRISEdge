@@ -142,6 +142,12 @@ pub mod attestation;
 /// CIRISEdge#627 — the announce-on-link (`CANN`) frame: this node's signed
 /// announce attestation pushed FIRST on every link, bound to the link's proven
 /// remote identity by equality. Read the module docs before touching the wire.
+///
+/// Gated with `attestation` and `reticulum`: its size budget is
+/// `leviculum_core::announce_app_data_budget`, an optional dependency, and the
+/// frame only ever rides a Reticulum link. A default-feature build (the icount
+/// bench lane) must not need it — CIRISEdge#630's first Bench run proved it.
+#[cfg(feature = "_reticulum-module")]
 pub mod announce_frame;
 /// CIRISEdge#436 — the link-borne build-attestation-bundle frame (`CBND`):
 /// the arrival transport that feeds the #437 bundle gate.
