@@ -385,11 +385,15 @@ stateDiagram-v2
     Rooted --> Rooted: owner re-announce (Admit / AdmitRouteKeepTrust)
     Advisory --> Advisory: owner re-announce (Admit)
     note right of Identified
-        The state #624 found missing: the link is
-        IDENTIFIED (a transport fact, from the first
-        packet) but not yet ATTRIBUTABLE (needs the
-        announce). A fresh peer lives here for the
-        whole first contact.
+        The state #624 found missing: IDENTIFIED (a
+        transport fact, from the first packet) but not
+        yet ATTRIBUTABLE (the announce not yet applied).
+        TRANSIENT BY DESIGN: a peer that links has
+        announced, so this state must last one announce
+        verification and no longer. A link whose first
+        frame arrives here is COUNTED
+        (link_before_binding) — nonzero is a defect in
+        announce handling, never a state to serve from.
     end note
     note right of Rooted
         HijackRefused: a non-owning announce can
@@ -407,8 +411,15 @@ different facts, at two different times:
   that?* — an **attribution** fact: the peers map / rooting directory, fed by
   the peer's announce and its owner-binding. `Advisory`, then `Rooted`.
 
-The two coincide for every peer whose announce arrived before its links, and
-diverge for exactly the peer the bootstrap door exists for. **#624 (2026-09-18):**
+The two coincide for every peer whose announce was APPLIED before its links —
+and the operator's ruling is that this must be every peer: *if we are linking, we
+announced.* Both ends are ours, so the announce rides the link as its first
+message and its receipt installs the binding inline, directory-free (the
+announce-handling fix filed alongside #624); the rooting walk upgrades the
+binding afterwards without ever gating attribution. The row below for
+"Identified, announce pending" is therefore a bounded transient with a counter
+that must read zero, not a phase a fresh peer is designed to sit in.
+**#624 (2026-09-18):**
 the carve-out below was keyed on `link_key_id`, which is the *output* of
 attribution (`candidate_key_id`) — `None` in `Identified`, so the door built
 for the fresh peer could only open for a peer that was already attributable.
@@ -457,7 +468,7 @@ a row is what a link in that state can cause on this node, nothing more.
 | link state | bootstrap kind (`Key` / `IdentityOccurrence` / `TransportDestination`) | any other kind | `trace:*` / consent-gated planes served | attribution recorded |
 |---|---|---|---|---|
 | **Unidentified** — no remote identity proven | drop, `#317` (transport identity is the precondition, not a default) | drop | no | none |
-| **Identified, unannounced** — remote identity proven, no binding | **routed on `rns-identity:<hex16>`** (the link's proven identity); the record self-authenticates at admission | drop | no | none — the frame may CREATE the binding, it never assumes one |
+| **Identified, announce pending** — remote identity proven, binding not yet installed. *Transient; bounded by one announce verification; `link_before_binding` counts arrivals here and must read 0* | **routed on `rns-identity:<hex16>`** (the link's proven identity) — the last-resort guarantee (#624/#626), not the design path; the record self-authenticates at admission | drop | no | none — the frame may CREATE the binding, it never assumes one |
 | **Advisory** — announce arrived, not steward-rooted or `!owns_key` | routed on the transport identity (`#624` second case) | drop | no | Advisory (transport-not-trust) |
 | **Rooted ∧ owns_key ∧ hybrid binding** (`#393` items 1+2) | attributed (`from_rooted_binding`) | attributed | **yes** — the E3 gate | Rooted |
 | **ResolvedToSelf** — the answer is our own key (`#623`) | drop, `attribution_resolved_to_self` | drop | no | none; no responder is ever built for self |
