@@ -1,5 +1,85 @@
 # CIRISEdge Release Notes
 
+# v25.2.0 — adopt CIRISPersist v44.7.0 — the same-key rebind; attribution never resolves to self
+
+**2026-09-18** (`b520bcb`, PRs #622 + #623). persist v44.7.0 (#864): a holder heals its own
+pre-#659 key record in place; edge routes `ReplicatedKeyOutcome::Rebound` → `Admitted`,
+`RebindChangesRecord` → Terminal, `NotSelfSigned`/`RecordAbsent` → Transient. persist's memory
+backend now runs the real key plan, so four bridge tests moved onto a production-minted fixture
+(`minted_key_record`). #621/#623: `LinkAttribution::ResolvedToSelf` — inbound attribution never
+resolves to the local key; `RouteOutcome::RefusedSelf` — no responder is ever built for self
+(defence-in-depth to CIRISServer#607). Neither persist ABI hash moved; verify stays v15.2.0.
+
+# v25.1.0 — commits converge across the mesh; the room's group feeds the scope router
+
+**2026-09-17** (`b3f7d0e`, release PR #620 over #618 + #619). **#604 closed**: chat commits had
+never crossed the mesh (only KeyPackage/Welcome rode the plane) — now `chat:commit:v1` rows carry
+them and concurrent commits converge by CC 3 (earliest `claimed_at`, lowest key id; the loser
+re-proposes; no coordinator). **#616 closed**: one key definition for a room's address-table entry
+(a silent mismatch — `cohort:{id}` vs the bare `community_key_id` — had every community lookup
+missing on send and serve); the router reads the lifecycle's live table and rebinds on epoch
+change (CC 5.4.3); two swarm scheduler defects fixed (error strikes; endgame self-race). MINOR.
+
+# v25.0.0 — pull on attestation, N-member rooms, evict-on-withdraws, chat's seal leaves MLS
+
+**2026-09-17** (`60771b1`, release PR #617 over #613/#614/#612/#615). **BREAKING**:
+`chat::Body::Unopened { reason: String }` → typed `UnopenedReason`; `BlobPointer` gains `epoch`;
+`chat::RoomKey` deleted (content is sealed by persist's community DEK; the per-room MLS group
+STAYS as the CC 5.4 addressing root — the hard cut was narrowed after checking CC 5.4.1/5.4.3/5.4.6).
+#601: an admitted referencing row becomes a bounded, gated fetch (`BlobPuller`); commons pulls
+end-to-end, community pulls stop at #499's router until v25.1.0. #606: a `withdraws` reaches bytes
+on edge's side — the register re-derives `check_withdraws_admission` against the local target at
+act time, serve says `Withdrawn`, the converger reads consent. #608: send-by-room, roster
+constructor, widen/revoke producers (invite/revoke gated on CIRISPersist#860). Rider note:
+CIRISServer#602.
+
+# v24.3.0 — adopt CIRISPersist v44.5.0 + v44.6.0
+
+**2026-09-17** (`ea34fa3`, PR #611). `publish_self_occurrence` takes `valid_until`, so the heal for a
+plane-absent legacy row carries the operator's expiry through (persist#855). The bridge send set is
+`consent_peers_by_principals(local)` — consent is authored by the human, for THIS machine
+(persist#857 / #609). `edge_node` stewards its agent via `self_at_login` instead of owner-binding
+it (CC 3.2). `CONSENT_GRAMMAR_HASH` re-pinned (`for_key_id`); verify → v15.2.0 in lockstep.
+
+# v24.2.0 — adopt CIRISPersist v44.4.0 — the occurrence is PUBLISHED
+
+**2026-09-16** (`647271e`, PR #607). Closes persist#851: `provision_engine_occurrence` publishes the
+node's occurrence through the gated door (`Engine::publish_self_occurrence`) so a far peer can fold
+it into `key_grant` admission; the e2e `federate()` reads it off the signed plane, no hand-copy.
+Fixed a latent double derivation: `LocalSigner::from_hardware_parts`'s `key_id` is the keystore
+ALIAS (`derive_key_id`'s input), edge passed its derived id. The owner binding is a precondition of
+publishing; `edge_node` binds the engine key. Carries the never-tagged v24.1.0 (`d684227`, PR #605,
+persist v44.3.0: `EnvelopeKind::KeyGrant`, `key_grant:*` rows on the Attestation cursor).
+
+# v24.0.0 — the secure blob surface, end to end
+
+**2026-09-11** (`f4f72f0`, PR #598; #596 + #595 + #597). Chat is blob-native: every body is sealed
+under the room's community DEK and referenced by a `BlobPointer` on the row. **`BlobMeaning`**: no
+blob without a signed referencing attestation; `holds_bytes` is possession and is refused as
+meaning by name (#597). The store gate on three axes (provenance → audience → consent), armed via
+`PersistBlobStorePolicy` (#581/#595). Revocation revokes delivery. BREAKING for riders
+(CIRISServer#590).
+
+# v23.1.1 — adopt CIRISPersist v44.1.1 — edge was pinned to a BRICKING release
+
+**2026-09-11** (`c9a6e72`). Persist v44.1.0 could brick a directory; v44.1.1 is the fix. Carries the
+never-tagged v23.1.0 (`173de32`, persist v44.1.0 — stream ownership and position-bound chunks).
+
+# v23.0.0 — adopt CIRISPersist v44.0.0 + CIRISVerify v15.1.0 — the secure blob surface
+
+**2026-09-10** (`681d599`, PR #593). MAJOR upstream: community-scope video writable (each chunk its
+own CRBLOB envelope under the DAG's DEK, content-addressed by ciphertext sha). Verify → v15.1.0 in
+lockstep; all four FFI ABI constants unchanged; wheel floor `>=44,<45`. The v44 manifest-size break
+does not reach edge (checked: `total_size == Σ ChunkRef::size` holds by construction).
+
+# v22.0.0 — adopt CIRISPersist v43.0.0; the first blob's serve half
+
+**2026-09-10** (`5d24cbe`, PR #588). Persist v43: encrypted blobs at rest behind a `StorageFloor`;
+edge exposure nil (no blob writes yet). #587 serve half: `BlobChunkSource` had zero implementations
+and three seam faults (ungated `get_blob_range`, a `block_on` that panics in-runtime, no requester);
+now `Engine::serve_blob_to_peer` via `serve_result_to_chunk`, async, with the verified envelope's
+`signing_key_id`. Writer half blocked on CIRISServer#25 step 1 (blessed CI keys). Floor `>=43,<44`.
+
 # v21.1.0 — adopt CIRISPersist v42.1.0
 
 **2026-09-08** — Currency, and a read-path speedup edge actually uses. A
