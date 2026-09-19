@@ -5097,10 +5097,12 @@ async fn route_attributed_frame(
 /// frame is a self-authenticating bootstrap kind (`Key`/`IdentityOccurrence`,
 /// [`crate::replication::EnvelopeKind::is_bootstrap`]) AND the link carried a
 /// transport-level identity (`link_key_id`). CIRISEdge#624: that hint is the
-/// attribution result when there is one (an Advisory peer's key) and otherwise
-/// the identity the link itself PROVED (`rns-identity:<hash>`, a fresh peer
-/// whose announce has not arrived) — so the door opens for the peer it was
-/// built for, and stays shut on an unidentified link. The kind is peeked from the CRPL
+/// attribution result when there is one (an Advisory peer's key) and, for a
+/// fresh peer whose announce has not arrived, the federation `key_id` the
+/// transport derived by EQUALITY — the delivered Key record whose pubkey is
+/// the link identity's Ed25519 half (`reticulum::decide_bootstrap_equality`).
+/// Either way the hint is a federation key id; an unidentified link has
+/// none, so the door stays shut on it. The kind is peeked from the CRPL
 /// frame; a non-bootstrap kind, an unparseable frame, or an absent link identity
 /// ⇒ `None` (the frame drops; E3's `Rooted ∧ owns_key` trace-serve gate is
 /// untouched). The returned id is the link's transport identity promoted through
@@ -9172,13 +9174,15 @@ mod inbound_ingest_tests {
 
     /// CIRISEdge#624 — the case #402's door was built for and never opened: a
     /// FRESH peer (announce not yet arrived, in no map, both branches miss) whose
-    /// link proved its identity. Its `Key` frame routes on the link-proven
-    /// transport identity and a responder is built for it; the identity round
-    /// can be served. (b) an admitted-ADVISORY peer (announce arrived, owner
-    /// binding not yet; `Rooted∧owns_key` false) takes the same door on its key.
-    /// (c) a non-bootstrap kind on the very same identified link never routes —
-    /// the responder factory is never invoked. (d) an UNIDENTIFIED link drops
-    /// even a bootstrap kind: the proven identity is the precondition.
+    /// link proved its identity. The transport attributes its Key `Deliver` by
+    /// equality to the record's own `key_id` (tested at the pure decision in
+    /// `reticulum::bootstrap_equality_624`); here, that hint routes the frame and
+    /// a responder is built for it, so the identity round can be served. (b) an
+    /// admitted-ADVISORY peer (announce arrived, owner binding not yet;
+    /// `Rooted∧owns_key` false) takes the same door on its key. (c) a
+    /// non-bootstrap kind on the very same identified link never routes — the
+    /// responder factory is never invoked. (d) an UNIDENTIFIED link carries no
+    /// hint at all and drops even a bootstrap kind.
     // Four legs over ONE fixture (the responder-factory recorder) plus the three
     // no-op impls that fixture needs; splitting them would repeat the fixture
     // four times for no extra assertion.
@@ -9259,8 +9263,9 @@ mod inbound_ingest_tests {
                 kind: EnvelopeKind::Key,
                 refs: vec![],
             }));
-        let transport_id =
-            crate::transport::SourceKeyId::transport_identity(&[0xa2; 16]).into_string();
+        // The id the transport's equality path derives for a fresh peer: the
+        // delivered record's own federation key id — never anything link-shaped.
+        let transport_id = "fresh-peer-cjgfikxxd5".to_string();
 
         // (a) fresh peer: no attribution, link-proven identity only.
         let registry = make_registry(built.clone());
@@ -9270,8 +9275,9 @@ mod inbound_ingest_tests {
         assert_eq!(
             built.lock().unwrap().as_slice(),
             &[(transport_id.clone(), EnvelopeKind::Key)],
-            "a fresh peer's Key frame must reach a responder keyed on its link-proven \
-             transport identity — this is the first-contact identity round (CIRISEdge#624)",
+            "a fresh peer's Key frame must reach a responder keyed on the federation key id \
+             its record proved against the link — the first-contact identity round \
+             (CIRISEdge#624)",
         );
 
         // (b) Advisory peer: attribution resolved to its key, trust gate refused it.
@@ -9403,16 +9409,7 @@ mod inbound_ingest_tests {
         #[test]
         fn bootstrap_carve_out_source_holds_over_all_kinds(
             kind_idx in 0usize..EnvelopeKind::ALL.len(),
-            // CIRISEdge#624 — the hint is now one of TWO shapes: an attributed
-            // federation key, or a link-proven `rns-identity:<hash>`. The
-            // invariant holds identically over both: the carve-out is a function
-            // of (kind, hint present), never of what the hint says.
-            link in prop::option::of(prop_oneof![
-                "[a-z0-9-]{1,32}".prop_map(String::from),
-                any::<[u8; 16]>().prop_map(|h| {
-                    crate::transport::SourceKeyId::transport_identity(&h).into_string()
-                }),
-            ]),
+            link in prop::option::of("[a-z0-9-]{1,32}"),
         ) {
             let kind = EnvelopeKind::ALL[kind_idx];
             let frame = InboundFrame {

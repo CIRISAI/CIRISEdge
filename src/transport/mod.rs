@@ -334,15 +334,7 @@ impl SourceKeyId {
         owns_key: bool,
     ) -> Option<Self> {
         use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
-        let key_id = key_id.into();
-        // CIRISEdge#624 — a link-proven transport identity is never a trust
-        // attribution, whatever binding a caller claims for it. Structural:
-        // the trace-serve gate cannot be reached through this id even if a
-        // peers-map entry were ever keyed by one.
-        if key_id.starts_with(Self::TRANSPORT_IDENTITY_PREFIX) {
-            return None;
-        }
-        (matches!(provenance, Rooted) && owns_key).then_some(SourceKeyId(key_id))
+        (matches!(provenance, Rooted) && owns_key).then(|| SourceKeyId(key_id.into()))
     }
 
     /// Attribution from a transport whose CHANNEL itself authenticates the peer
@@ -353,46 +345,6 @@ impl SourceKeyId {
     #[must_use]
     pub fn transport_authenticated(key_id: impl Into<String>) -> Self {
         SourceKeyId(key_id.into())
-    }
-
-    /// CIRISEdge#624 — the prefix that marks a routing id as a **link-proven
-    /// Reticulum transport identity**, not a federation `key_id`. A federation
-    /// key id is `<label>-<fingerprint>` and never contains `:`, so an id
-    /// carrying this prefix cannot collide with one, cannot resolve in any
-    /// directory, and cannot satisfy [`Self::from_rooted_binding`] (which
-    /// refuses it by name below).
-    pub const TRANSPORT_IDENTITY_PREFIX: &'static str = "rns-identity:";
-
-    /// CIRISEdge#624 — the routing id for a peer known ONLY by the identity its
-    /// link proved (`get_remote_identity`): a fresh peer whose announce has not
-    /// reached us yet. Says exactly what is known — the LINKIDENTIFY-proven
-    /// 16-byte identity hash — and nothing more: not a federation key, not an
-    /// attribution, not trust. The only legitimate consumer is the replication
-    /// ingest's bootstrap carve-out, for the self-authenticating
-    /// `is_bootstrap` kinds persist re-verifies at admission; the reply rides
-    /// the same link back (`live_attributed_link_to`), never a dial.
-    #[must_use]
-    pub fn transport_identity(identity_hash: &[u8; 16]) -> Self {
-        SourceKeyId(format!(
-            "{}{}",
-            Self::TRANSPORT_IDENTITY_PREFIX,
-            hex::encode(identity_hash)
-        ))
-    }
-
-    /// CIRISEdge#624 — the identity hash a [`Self::transport_identity`] id
-    /// carries, or `None` for any other id (a federation `key_id`, or a
-    /// malformed prefix). The ONE parser, so a consumer can tell "the link
-    /// proved this identity" from "a peer we know by key" without string
-    /// heuristics of its own.
-    #[must_use]
-    pub fn transport_identity_hash(id: &str) -> Option<[u8; 16]> {
-        let hex_part = id.strip_prefix(Self::TRANSPORT_IDENTITY_PREFIX)?;
-        if hex_part.len() != 32 {
-            return None;
-        }
-        let bytes = hex::decode(hex_part).ok()?;
-        bytes.try_into().ok()
     }
 
     /// The attributed federation `key_id`.
@@ -445,35 +397,6 @@ mod source_key_id_tests {
              pubkey (owns_key=false) — is refused (CIRISEdge#393 E3)",
         );
     }
-
-    /// CIRISEdge#624 — a link-proven transport identity is a routing id, never
-    /// a trust attribution: even `Rooted ∧ owns_key` claimed FOR it is refused.
-    /// This is what keeps the bootstrap door structurally off the trace-serve
-    /// path — the id cannot pass the sole trace-serve constructor.
-    #[test]
-    fn a_transport_identity_id_never_becomes_a_trust_attribution() {
-        let id = SourceKeyId::transport_identity(&[7u8; 16]).into_string();
-        assert!(id.starts_with(SourceKeyId::TRANSPORT_IDENTITY_PREFIX));
-        assert!(
-            SourceKeyId::from_rooted_binding(id.clone(), Rooted, true).is_none(),
-            "a transport identity cannot be promoted to a trace-serve attribution (#624)",
-        );
-        assert_eq!(
-            SourceKeyId::transport_identity_hash(&id),
-            Some([7u8; 16]),
-            "the one parser round-trips the hash"
-        );
-        assert_eq!(
-            SourceKeyId::transport_identity_hash("agent-alice-cjgfikxxd5"),
-            None,
-            "a federation key id is not a transport identity"
-        );
-        assert_eq!(
-            SourceKeyId::transport_identity_hash("rns-identity:zz"),
-            None,
-            "a malformed prefix parses to nothing, never to a partial hash"
-        );
-    }
 }
 
 /// One inbound frame from a transport — raw envelope bytes plus the
@@ -522,13 +445,15 @@ pub struct InboundFrame {
     ///
     /// CIRISEdge#624 — when attribution misses entirely (a peer whose announce
     /// has not reached us: no peers-map entry at all) but the link PROVED a
-    /// remote identity via LINKIDENTIFY, this carries
-    /// [`SourceKeyId::transport_identity`] — a `rns-identity:<hash>` routing id
-    /// that names the proven transport identity and nothing else. The
-    /// carve-out fires on it for bootstrap kinds exactly as for an advisory
-    /// key, and the responder's reply rides the same link back. The prefix
-    /// makes it unmistakable for a federation key: it resolves in no directory
-    /// and [`SourceKeyId::from_rooted_binding`] refuses it by name.
+    /// remote identity via LINKIDENTIFY, the transport attributes a bootstrap
+    /// `Deliver` by EQUALITY: the delivered Key record whose Ed25519 pubkey is
+    /// the link identity's Ed25519 half names the peer, and this carries that
+    /// record's `key_id`. The transport identity IS a derivative of the node
+    /// key (its Ed25519 half is the federation signing key, #436/#541), so the
+    /// only output of attribution is ever a federation `key_id`. The same
+    /// equality is a belt on every attributed bootstrap Deliver: a link
+    /// carrying "its own" record under a key the link does not hold is dropped
+    /// whatever the peers map says.
     pub link_key_id: Option<String>,
     /// CIRISEdge#499 — the SCOPE-DERIVED address this frame arrived on, resolved
     /// by the transport against its installed

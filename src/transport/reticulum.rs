@@ -5008,32 +5008,14 @@ impl ReticulumTransport {
     }
 
     async fn live_attributed_link_to(&self, destination_key_id: &str) -> Option<LinkId> {
-        // CIRISEdge#624 — a `rns-identity:<hash>` destination is a peer known
-        // ONLY by the identity its link proved: its links are the established
-        // ones whose remote identity IS that hash, not any peers-map entry.
-        let candidates: Vec<LinkId> = if let Some(wanted) =
-            crate::transport::SourceKeyId::transport_identity_hash(destination_key_id)
-        {
-            self.established_links
-                .lock()
-                .await
-                .iter()
-                .filter(|id| {
-                    self.node
-                        .get_remote_identity(id)
-                        .is_some_and(|ident| *ident.hash() == wanted)
-                })
-                .copied()
-                .collect()
-        } else {
-            self.link_to_peer_key_id
-                .lock()
-                .await
-                .iter()
-                .filter(|(_, peer)| peer.as_str() == destination_key_id)
-                .map(|(id, _)| *id)
-                .collect()
-        };
+        let candidates: Vec<LinkId> = self
+            .link_to_peer_key_id
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, peer)| peer.as_str() == destination_key_id)
+            .map(|(id, _)| *id)
+            .collect();
         let last_inbound = self.link_last_inbound_at.lock().await;
         let established_at = self.link_established_at.lock().await;
         // CIRISEdge#353 — build the (link, last_inbound, established_at) tuples
@@ -5454,23 +5436,6 @@ impl Transport for ReticulumTransport {
         // set; the dial target is chosen by ROUTABILITY further down, after the
         // reverse-path attempt. See `resolve_dial_candidates` /
         // `select_dial_candidate` for the holistic-fix rationale.
-        // CIRISEdge#624 — a `rns-identity:<hash>` destination is a fresh peer
-        // known only by the identity its link proved (no announce, so nothing to
-        // dial and nothing to resolve). The reply rides that live inbound link or
-        // it does not go: never a dial, never store-and-forward — both would be
-        // sending to an identity we have no address for.
-        if crate::transport::SourceKeyId::transport_identity_hash(destination_key_id).is_some() {
-            if self
-                .send_via_reverse_path(destination_key_id, envelope_bytes)
-                .await
-            {
-                return Ok(TransportSendOutcome::Delivered);
-            }
-            return Err(TransportError::Unreachable(format!(
-                "destination {destination_key_id} is a link-proven transport identity with no \
-                 live inbound link; it is never dialed (CIRISEdge#624)"
-            )));
-        }
         let candidates = self.resolve_dial_candidates(destination_key_id).await;
         if candidates.is_empty() {
             // CIRISEdge#292 (CIRISServer#205) — an admitted replication
@@ -6382,30 +6347,149 @@ async fn binding_exists_cached(
 // landed. Each new arm is a small typed routing of one NodeEvent
 // variant onto a side-effect (record / emit); extracting would
 // fragment the event-loop verdict across multiple helpers.
-/// CIRISEdge#624 — the `link_key_id` routing hint for an inbound frame, from
-/// the attribution result and the link's LINKIDENTIFY-proven remote identity.
+/// CIRISEdge#624 — what a bootstrap `Deliver` says about who is on the link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootstrapPeek {
+    /// A `Key` Deliver: every record whose Ed25519 pubkey decodes, as
+    /// `(key_id, pubkey)`. A record that does not decode cannot name a link
+    /// and is left out here (persist refuses it at admission regardless).
+    Keys(Vec<(String, [u8; 32])>),
+    /// An `IdentityOccurrence` / `TransportDestination` Deliver: each
+    /// envelope's claimed signer (`attesting_key_id`), to be resolved against
+    /// the directory's registered pubkey.
+    Signers(Vec<String>),
+}
+
+/// The verdict of [`decide_bootstrap_equality`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootstrapEquality {
+    /// Not a bootstrap Deliver, or no proven link identity, or nothing in the
+    /// frame speaks about the attributed peer — attribution stands as it was.
+    NotApplicable,
+    /// The frame names its peer by equality. `newly` = the link was not
+    /// attributed before and is now (enter it in the identified table).
+    Attributed { key_id: String, newly: bool },
+    /// The record the link delivers as its own is under a key the link does
+    /// not hold. Dropped by name.
+    Mismatch { key_id: String },
+    /// An un-attributed link's occurrence/destination is signed by a key this
+    /// node holds no record for: the Key frame must precede. Dropped by name.
+    RecordNotHeld { key_id: String },
+}
+
+fn decode_ed25519_b64(b64: &str) -> Option<[u8; 32]> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    <[u8; 32]>::try_from(bytes).ok()
+}
+
+/// CIRISEdge#624 — peek a CRPL frame for a bootstrap-kind `Deliver`
+/// ([`EnvelopeKind::is_bootstrap`](crate::replication::protocol::EnvelopeKind::is_bootstrap)).
+/// Any other verb or kind is `None`: a round-open `Summary` carries refs, not
+/// records, so it cannot name its peer — the #927 initiator-first push sends
+/// the Key `Deliver` right behind it on the same link, and THAT frame does.
+fn peek_bootstrap_deliver(data: &[u8]) -> Option<BootstrapPeek> {
+    use crate::replication::protocol::{EnvelopeKind, ReplicationMessage};
+    let ReplicationMessage::Deliver(d) = crate::replication::wire_frame::try_unwrap(data)
+        .ok()
+        .flatten()?
+    else {
+        return None;
+    };
+    if !d.kind.is_bootstrap() {
+        return None;
+    }
+    if matches!(d.kind, EnvelopeKind::Key) {
+        // Only the two members the equality needs — no dependence on the full
+        // record shape, which persist owns and verifies at admission.
+        #[derive(serde::Deserialize)]
+        struct RecordPeek {
+            key_id: String,
+            pubkey_ed25519_base64: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct KeyPeek {
+            record: RecordPeek,
+        }
+        Some(BootstrapPeek::Keys(
+            d.envelopes
+                .iter()
+                .filter_map(|e| serde_json::from_slice::<KeyPeek>(e).ok())
+                .filter_map(|k| {
+                    decode_ed25519_b64(&k.record.pubkey_ed25519_base64)
+                        .map(|pk| (k.record.key_id, pk))
+                })
+                .collect(),
+        ))
+    } else {
+        #[derive(serde::Deserialize)]
+        struct SignerPeek {
+            attesting_key_id: String,
+        }
+        Some(BootstrapPeek::Signers(
+            d.envelopes
+                .iter()
+                .filter_map(|e| serde_json::from_slice::<SignerPeek>(e).ok())
+                .map(|s| s.attesting_key_id)
+                .collect(),
+        ))
+    }
+}
+
+/// CIRISEdge#624 — the equality decision, pure. The bytes compared are the
+/// link identity's Ed25519 half (`Identity::public_key_bytes()[32..64]`) and
+/// the record's `pubkey_ed25519_base64` decoded (32 bytes); for an
+/// occurrence/destination, the signer's REGISTERED pubkey from the directory
+/// stands in for the record's (`resolved`, `None` = not held).
 ///
-/// - `Some(candidate)` — the link resolved to a peer key (Branch A or B, any
-///   provenance): the hint is that key, as before #624.
-/// - `None` + a proven remote identity — the hint is
-///   [`SourceKeyId::transport_identity`](crate::transport::SourceKeyId::transport_identity)
-///   over that hash: a fresh peer, known only by what its link proved. The
-///   bootstrap carve-out fires on it for `is_bootstrap` kinds; nothing else
-///   routes on it.
-/// - `None` + no remote identity — no hint: an unidentified link proves
-///   nothing, so even a bootstrap kind drops. Transport identity is the
-///   PRECONDITION, not a default.
-///
-/// Pure so the truth table is tested against the exact inputs the event loop
-/// produces.
-fn routing_hint_for_link(
-    candidate_key_id: Option<String>,
-    remote_identity_hash: Option<[u8; 16]>,
-) -> Option<String> {
-    candidate_key_id.or_else(|| {
-        remote_identity_hash
-            .map(|h| crate::transport::SourceKeyId::transport_identity(&h).into_string())
-    })
+/// - No link identity, or not a bootstrap Deliver ⇒ `NotApplicable`.
+/// - Attributed link (`candidate = Some`): the belt. If the frame carries the
+///   peer's OWN record (`key_id == candidate`), its pubkey must be the link's;
+///   third-party records a rooted peer relays (#257 publish-own + anchored) are
+///   not compared — persist verifies each at admission. An own record the
+///   directory does not hold cannot be belted ⇒ `NotApplicable`.
+/// - Un-attributed link: the record whose pubkey IS the link's names the peer
+///   ⇒ `Attributed { newly: true }`. Records held/decoded but all ≠ the link ⇒
+///   `Mismatch`. Signers none of which are held ⇒ `RecordNotHeld`. An empty
+///   or unparseable Deliver names nobody ⇒ `NotApplicable` (drops downstream
+///   as before).
+fn decide_bootstrap_equality(
+    candidate: Option<&str>,
+    link_ed25519: Option<[u8; 32]>,
+    peek: Option<&BootstrapPeek>,
+    resolved: &[(String, Option<[u8; 32]>)],
+) -> BootstrapEquality {
+    let (Some(link), Some(peek)) = (link_ed25519, peek) else {
+        return BootstrapEquality::NotApplicable;
+    };
+    let records: Vec<(&str, Option<[u8; 32]>)> = match peek {
+        BootstrapPeek::Keys(ks) => ks.iter().map(|(k, pk)| (k.as_str(), Some(*pk))).collect(),
+        BootstrapPeek::Signers(_) => resolved.iter().map(|(k, pk)| (k.as_str(), *pk)).collect(),
+    };
+    if let Some(c) = candidate {
+        return match records.iter().find(|(k, _)| *k == c) {
+            Some((_, Some(pk))) if *pk != link => BootstrapEquality::Mismatch {
+                key_id: c.to_owned(),
+            },
+            _ => BootstrapEquality::NotApplicable,
+        };
+    }
+    if let Some((k, _)) = records.iter().find(|(_, pk)| *pk == Some(link)) {
+        return BootstrapEquality::Attributed {
+            key_id: (*k).to_owned(),
+            newly: true,
+        };
+    }
+    if let Some((k, _)) = records.iter().find(|(_, pk)| pk.is_some()) {
+        return BootstrapEquality::Mismatch {
+            key_id: (*k).to_owned(),
+        };
+    }
+    match records.first() {
+        Some((k, None)) => BootstrapEquality::RecordNotHeld {
+            key_id: (*k).to_owned(),
+        },
+        _ => BootstrapEquality::NotApplicable,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6572,18 +6656,93 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // below narrows it to `None`. A routing hint only (see `InboundFrame::link_key_id`);
     // the E3 attacker (`PubkeyMismatch`) never reaches `link_to_peer_key_id`, so
     // this is `Some` only for a self-consistent binding.
-    // CIRISEdge#624 — the hint is the ATTRIBUTION RESULT when there is one, else
-    // the identity the link itself PROVED. A fresh peer whose announce has not
-    // reached us is in no map (both branches miss ⇒ `candidate_key_id = None`),
-    // yet its link completed LINKIDENTIFY — that identity is self-authenticating
-    // at the transport tier and is exactly what #402's door was built for.
-    // Keying the hint on the attribution result made the door open only for a
-    // peer that was already attributable, i.e. never for the one it exists for
-    // (CIRISServer#609: 0 rounds served on a ten-minute install).
-    let link_key_id = routing_hint_for_link(
-        candidate_key_id.clone(),
-        ctx.node.get_remote_identity(&link_id).map(|id| *id.hash()),
-    );
+    // CIRISEdge#624 — attribute a bootstrap `Deliver` by EQUALITY against the
+    // identity the link PROVED. A fresh peer whose announce has not reached us
+    // is in no map (both branches miss ⇒ `candidate_key_id = None`), yet its
+    // link completed LINKIDENTIFY and the transport identity's Ed25519 half IS
+    // its federation signing key (#436/#541). So a delivered Key record whose
+    // pubkey equals that half names the peer — a federation `key_id`, the one
+    // and only attribution output — and the link is entered in the identified
+    // table so every later frame on it (the next round's Summary/Diff/Fetch,
+    // and the reply's reverse path) attributes through Branch A. #402's door
+    // used to key on the attribution RESULT, which opened it only for a peer
+    // that was already attributable, i.e. never for the one it exists for
+    // (CIRISServer#609: 0 rounds served on a ten-minute install). The same
+    // equality is a belt on an ATTRIBUTED bootstrap Deliver: a link carrying
+    // "its own" record under a key the link does not hold is dropped by name,
+    // whatever the peers map says (#621's cousin).
+    let candidate_key_id = {
+        let link_ed25519 = ctx.node.get_remote_identity(&link_id).map(|id| {
+            let pk = id.public_key_bytes();
+            let mut half = [0u8; 32];
+            half.copy_from_slice(&pk[32..64]);
+            half
+        });
+        let peek = link_ed25519.and_then(|_| peek_bootstrap_deliver(&data));
+        let resolved: Vec<(String, Option<[u8; 32]>)> = match (&peek, ctx.rooting) {
+            (Some(BootstrapPeek::Signers(ids)), rooting) => {
+                let mut out = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let held = match rooting {
+                        Some(r) => r
+                            .registered_pubkey_ed25519_base64(id)
+                            .await
+                            .and_then(|b64| decode_ed25519_b64(&b64)),
+                        None => None,
+                    };
+                    out.push((id.clone(), held));
+                }
+                out
+            }
+            _ => Vec::new(),
+        };
+        match decide_bootstrap_equality(
+            candidate_key_id.as_deref(),
+            link_ed25519,
+            peek.as_ref(),
+            &resolved,
+        ) {
+            BootstrapEquality::NotApplicable => candidate_key_id,
+            BootstrapEquality::Attributed { key_id, newly } => {
+                if newly {
+                    ctx.link_to_peer_key_id
+                        .lock()
+                        .await
+                        .insert(link_id, key_id.clone());
+                    tracing::info!(
+                        link = ?link_id,
+                        peer = %key_id,
+                        "first-contact link ATTRIBUTED by equality — the delivered bootstrap \
+                         record's Ed25519 pubkey is the link identity's Ed25519 half; the link \
+                         now attributes through the identified table (CIRISEdge#624)"
+                    );
+                }
+                Some(key_id)
+            }
+            BootstrapEquality::Mismatch { key_id } => {
+                let detail = format!(
+                    "bootstrap Deliver on an identified link carries record {key_id} whose \
+                     Ed25519 pubkey is NOT the link identity's Ed25519 half — the link does \
+                     not hold the key it delivers as its own; dropped (CIRISEdge#624)"
+                );
+                drop_inbound(Some(link_id), "bootstrap_key_not_this_link", &detail);
+                // choke-ok: `drop_inbound` IS the choke point (#425).
+                return;
+            }
+            BootstrapEquality::RecordNotHeld { key_id } => {
+                let detail = format!(
+                    "bootstrap Deliver on an un-attributed identified link is signed by \
+                     {key_id}, whose Key record this node does not hold — the Key frame must \
+                     precede its IdentityOccurrence/TransportDestination; dropped \
+                     (CIRISEdge#624)"
+                );
+                drop_inbound(Some(link_id), "bootstrap_record_not_held", &detail);
+                // choke-ok: `drop_inbound` IS the choke point (#425).
+                return;
+            }
+        }
+    };
+    let link_key_id = candidate_key_id.clone();
     let source_key_id = match candidate_key_id {
         Some(key_id) => {
             // Item 1 — Rooted ∧ owns_key, plus capture the peer's dest for the
@@ -10104,83 +10263,236 @@ mod tests {
         );
     }
 
-    /// CIRISEdge#624 — the `link_key_id` routing hint, tested at the pure
-    /// decision fn against the exact `(attribution result, link-proven
-    /// identity)` inputs `attribute_and_deliver` produces.
-    mod routing_hint_624 {
-        use super::super::routing_hint_for_link;
-        use crate::transport::SourceKeyId;
-        use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
+    /// CIRISEdge#624 — attribution by EQUALITY, tested at the pure pieces
+    /// against the exact inputs the event loop hands them: the CRPL bytes, the
+    /// link identity's Ed25519 half, the attribution result, and the
+    /// directory's answer for a signer.
+    mod bootstrap_equality_624 {
+        use super::super::{
+            decide_bootstrap_equality, peek_bootstrap_deliver, BootstrapEquality, BootstrapPeek,
+        };
+        use crate::replication::protocol::{
+            DeliverMessage, EnvelopeKind, ReplicationMessage, SummaryMessage,
+        };
+        use base64::Engine as _;
 
-        /// (a) THE #624 CONDITION: both branches missed (no announce yet) but
-        /// the link proved an identity ⇒ the hint is that identity, in the
-        /// `rns-identity:` shape — the fresh peer's door.
+        fn key_envelope(key_id: &str, pk: [u8; 32]) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "record": {
+                    "key_id": key_id,
+                    "pubkey_ed25519_base64": base64::engine::general_purpose::STANDARD.encode(pk),
+                    "pubkey_ml_dsa_65_base64": "",
+                }
+            }))
+            .expect("json")
+        }
+        fn deliver(kind: EnvelopeKind, envelopes: Vec<Vec<u8>>) -> Vec<u8> {
+            crate::replication::wire_frame::wrap(&ReplicationMessage::Deliver(DeliverMessage {
+                kind,
+                envelopes,
+            }))
+        }
+        const LINK: [u8; 32] = [0xa2; 32];
+        const OTHER: [u8; 32] = [0x5c; 32];
+
+        /// (a) THE #624 CONDITION: no attribution, identified link, a Key
+        /// Deliver whose record pubkey IS the link's Ed25519 half ⇒ attributed
+        /// to that record's key id, newly.
         #[test]
-        fn a_fresh_peer_hints_its_link_proven_identity() {
-            let hint = routing_hint_for_link(None, Some([0xa2; 16]));
+        fn a_fresh_peer_is_attributed_to_the_record_whose_pubkey_is_the_links() {
+            let peek = peek_bootstrap_deliver(&deliver(
+                EnvelopeKind::Key,
+                vec![key_envelope("fresh-peer-cjgfikxxd5", LINK)],
+            ));
             assert_eq!(
-                hint.as_deref(),
-                Some(SourceKeyId::transport_identity(&[0xa2; 16]).as_str()),
-                "no attribution + proven identity ⇒ the transport-identity hint"
+                peek,
+                Some(BootstrapPeek::Keys(vec![(
+                    "fresh-peer-cjgfikxxd5".into(),
+                    LINK
+                )]))
             );
             assert_eq!(
-                SourceKeyId::transport_identity_hash(hint.as_deref().unwrap()),
-                Some([0xa2; 16])
+                decide_bootstrap_equality(None, Some(LINK), peek.as_ref(), &[]),
+                BootstrapEquality::Attributed {
+                    key_id: "fresh-peer-cjgfikxxd5".into(),
+                    newly: true
+                },
+                "the record's Ed25519 pubkey equals the link identity's Ed25519 half ⇒ \
+                 attribution is that record's federation key id (CIRISEdge#624)"
             );
         }
 
-        /// (b) An attributed link (Advisory or Rooted — provenance is the trust
-        /// gate's business, not the hint's) keeps its key as the hint, exactly
-        /// as before #624.
+        /// The same frame with a record whose pubkey differs ⇒ dropped by name.
         #[test]
-        fn an_attributed_link_keeps_its_key_whatever_the_identity() {
+        fn a_record_under_a_key_the_link_does_not_hold_is_a_mismatch() {
+            let peek = peek_bootstrap_deliver(&deliver(
+                EnvelopeKind::Key,
+                vec![key_envelope("liar-cjgfikxxd5", OTHER)],
+            ));
             assert_eq!(
-                routing_hint_for_link(Some("advisory-peer".into()), Some([1; 16])).as_deref(),
-                Some("advisory-peer")
-            );
-            assert_eq!(
-                routing_hint_for_link(Some("advisory-peer".into()), None).as_deref(),
-                Some("advisory-peer")
+                decide_bootstrap_equality(None, Some(LINK), peek.as_ref(), &[]),
+                BootstrapEquality::Mismatch {
+                    key_id: "liar-cjgfikxxd5".into()
+                }
             );
         }
 
-        /// (d) An UNIDENTIFIED link (LINKIDENTIFY never completed) proves
-        /// nothing: no hint, so even a bootstrap kind drops downstream. The
-        /// proven identity is the precondition, never a default.
+        /// An IdentityOccurrence before its Key: the signer is not held ⇒
+        /// refused by name ("Key frame must precede").
         #[test]
-        fn an_unidentified_unattributed_link_hints_nothing() {
-            assert_eq!(routing_hint_for_link(None, None), None);
+        fn an_occurrence_before_its_key_is_record_not_held() {
+            let env = serde_json::to_vec(&serde_json::json!({
+                "attesting_key_id": "fresh-peer-cjgfikxxd5", "identity_occurrence": {}
+            }))
+            .unwrap();
+            let peek =
+                peek_bootstrap_deliver(&deliver(EnvelopeKind::IdentityOccurrence, vec![env]));
+            assert_eq!(
+                peek,
+                Some(BootstrapPeek::Signers(vec!["fresh-peer-cjgfikxxd5".into()]))
+            );
+            assert_eq!(
+                decide_bootstrap_equality(
+                    None,
+                    Some(LINK),
+                    peek.as_ref(),
+                    &[("fresh-peer-cjgfikxxd5".into(), None)]
+                ),
+                BootstrapEquality::RecordNotHeld {
+                    key_id: "fresh-peer-cjgfikxxd5".into()
+                }
+            );
+            // …and once the Key is held and equal, the occurrence attributes.
+            assert_eq!(
+                decide_bootstrap_equality(
+                    None,
+                    Some(LINK),
+                    peek.as_ref(),
+                    &[("fresh-peer-cjgfikxxd5".into(), Some(LINK))]
+                ),
+                BootstrapEquality::Attributed {
+                    key_id: "fresh-peer-cjgfikxxd5".into(),
+                    newly: true
+                }
+            );
+        }
+
+        /// The belt on an ATTRIBUTED link (Advisory or Rooted alike): its own
+        /// record under a key the link does not hold ⇒ Mismatch, whatever the
+        /// map said; a relayed third-party record is not compared.
+        #[test]
+        fn an_attributed_link_is_belted_on_its_own_record_only() {
+            let own_wrong = peek_bootstrap_deliver(&deliver(
+                EnvelopeKind::Key,
+                vec![key_envelope("advisory-peer-cjgfikxxd5", OTHER)],
+            ));
+            assert_eq!(
+                decide_bootstrap_equality(
+                    Some("advisory-peer-cjgfikxxd5"),
+                    Some(LINK),
+                    own_wrong.as_ref(),
+                    &[]
+                ),
+                BootstrapEquality::Mismatch {
+                    key_id: "advisory-peer-cjgfikxxd5".into()
+                },
+                "#621's cousin: the map names a peer whose key this link does not hold"
+            );
+            let relay = peek_bootstrap_deliver(&deliver(
+                EnvelopeKind::Key,
+                vec![key_envelope("someone-else-cjgfikxxd5", OTHER)],
+            ));
+            assert_eq!(
+                decide_bootstrap_equality(
+                    Some("advisory-peer-cjgfikxxd5"),
+                    Some(LINK),
+                    relay.as_ref(),
+                    &[]
+                ),
+                BootstrapEquality::NotApplicable,
+                "a rooted/advisory peer relaying another's record is persist's to verify"
+            );
+            let own_right = peek_bootstrap_deliver(&deliver(
+                EnvelopeKind::Key,
+                vec![key_envelope("advisory-peer-cjgfikxxd5", LINK)],
+            ));
+            assert_eq!(
+                decide_bootstrap_equality(
+                    Some("advisory-peer-cjgfikxxd5"),
+                    Some(LINK),
+                    own_right.as_ref(),
+                    &[]
+                ),
+                BootstrapEquality::NotApplicable,
+                "an Advisory peer's own record under the link's key passes the belt"
+            );
+        }
+
+        /// A round-open Summary carries no record; a non-bootstrap Deliver is
+        /// not this door; an unidentified link proves nothing — all
+        /// NotApplicable, so attribution stands as it was (and an un-attributed
+        /// frame still drops downstream).
+        #[test]
+        fn summaries_non_bootstrap_kinds_and_unidentified_links_are_not_this_door() {
+            let summary = crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
+                SummaryMessage {
+                    kind: EnvelopeKind::Key,
+                    refs: vec![],
+                },
+            ));
+            assert_eq!(peek_bootstrap_deliver(&summary), None);
+            assert_eq!(
+                peek_bootstrap_deliver(&deliver(
+                    EnvelopeKind::Attestation,
+                    vec![key_envelope("x-cjgfikxxd5", LINK)]
+                )),
+                None,
+                "an Attestation Deliver is never peeked — E3's kinds stay outside this door"
+            );
+            let peek = peek_bootstrap_deliver(&deliver(
+                EnvelopeKind::Key,
+                vec![key_envelope("fresh-peer-cjgfikxxd5", LINK)],
+            ));
+            assert_eq!(
+                decide_bootstrap_equality(None, None, peek.as_ref(), &[]),
+                BootstrapEquality::NotApplicable,
+                "no proven link identity ⇒ no equality ⇒ no attribution"
+            );
         }
 
         proptest::proptest! {
-            /// The universal invariant behind E3 for this door: whatever the
-            /// hint is, it is NEVER a trust attribution. A transport-identity
-            /// hint cannot pass `from_rooted_binding` even when `Rooted ∧
-            /// owns_key` is claimed for it, and the hint exists iff the link
-            /// proved SOMETHING (an attributed key or a remote identity).
+            /// The universal invariant: over every kind, an identified-or-not
+            /// link, and a record whose pubkey equals the link's or not, an
+            /// un-attributed frame is attributed IFF it is a bootstrap `Key`
+            /// Deliver on an identified link whose record pubkey equals the
+            /// link's Ed25519 half — and the attributed id is ALWAYS that
+            /// record's key id, never anything derived from the link.
             #[test]
-            fn the_hint_exists_iff_something_was_proven_and_never_attributes(
-                candidate in proptest::option::of(
-                    proptest::string::string_regex("[a-z0-9-]{1,16}").unwrap()
-                ),
-                identity in proptest::option::of(proptest::array::uniform16(0u8..=255)),
+            fn attributed_iff_bootstrap_key_deliver_identified_and_equal(
+                kind_idx in 0usize..EnvelopeKind::ALL.len(),
+                identified in proptest::bool::ANY,
+                equal in proptest::bool::ANY,
+                key_id in proptest::string::string_regex("[a-z0-9-]{1,16}").unwrap(),
             ) {
-                let hint = routing_hint_for_link(candidate.clone(), identity);
+                let kind = EnvelopeKind::ALL[kind_idx];
+                let record_pk = if equal { LINK } else { OTHER };
+                let frame = deliver(kind, vec![key_envelope(&key_id, record_pk)]);
+                let peek = peek_bootstrap_deliver(&frame);
+                let link = identified.then_some(LINK);
+                let verdict = decide_bootstrap_equality(None, link, peek.as_ref(), &[]);
+                let expect_attributed =
+                    matches!(kind, EnvelopeKind::Key) && identified && equal;
                 proptest::prop_assert_eq!(
-                    hint.is_some(),
-                    candidate.is_some() || identity.is_some()
+                    matches!(verdict, BootstrapEquality::Attributed { .. }),
+                    expect_attributed
                 );
-                if candidate.is_none() {
-                    if let Some(h) = &hint {
-                        proptest::prop_assert_eq!(
-                            SourceKeyId::transport_identity_hash(h),
-                            identity
-                        );
-                        proptest::prop_assert!(
-                            SourceKeyId::from_rooted_binding(h.clone(), Rooted, true).is_none(),
-                            "a transport-identity hint must never become a trust attribution"
-                        );
-                    }
+                if let BootstrapEquality::Attributed { key_id: got, newly } = &verdict {
+                    proptest::prop_assert_eq!(got, &key_id);
+                    proptest::prop_assert!(*newly);
+                }
+                // A non-bootstrap kind never produces ANY verdict but NotApplicable.
+                if !kind.is_bootstrap() {
+                    proptest::prop_assert_eq!(verdict, BootstrapEquality::NotApplicable);
                 }
             }
         }
