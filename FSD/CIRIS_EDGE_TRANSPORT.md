@@ -81,7 +81,8 @@ stream, so a partition on one kind never gates convergence on another.
   (`is_bootstrap`, [`protocol.rs:228`](../src/replication/protocol.rs)) — the
   self-authenticating kinds a fresh peer must deliver to introduce itself, exempt
   from the attribution gate (§5.4). A proptest asserts this set is *exactly*
-  those three over all 15 kinds (§5.4).
+  those three over all 16 kinds (§5.4; `EnvelopeKind::ALL` is 16 since
+  `KeyGrant` in v24.1.0).
 - **`cursor-served`** = **only `AccordQuorumEvidence`** (`is_cursor_served`,
   `protocol.rs:263`, pinned over `ALL` by
   `cursor_served_is_exactly_accord_quorum_evidence`, `protocol.rs:672`). A bundle
@@ -354,7 +355,7 @@ before any serve gate is consulted. Attribution is a private, unforgeable newtyp
 | Constructor | Yields `Some` iff | Used by |
 |---|---|---|
 | `from_rooted_binding(key_id, provenance, owns_key)` | `provenance == Rooted ∧ owns_key` | Reticulum (the E3 trust gate) |
-| `transport_authenticated(key_id)` | always — the *channel* vouches | HTTPS mTLS/bearer, packet radio, FFI, the §5.4 carve-out |
+| `transport_authenticated(key_id)` | always — the *channel* vouches | HTTPS (`http.rs`, after the bearer/mTLS check), the §5.4 carve-out (`edge.rs`, `replication/mod.rs`). Packet radio and the FFI construct none — they carry no attributable channel identity and their frames arrive `None` |
 
 ### 5.2 The two-item gate (`#393`, Reticulum)
 
@@ -461,23 +462,27 @@ attributed only through its signed announce binding. **Safe by construction:**
 these kinds self-authenticate at persist admission (`signer_acts_for`), grant no
 trust, and are served no `trace:*` — the trace-serve gate stays strictly
 `Rooted ∧ owns_key`. Every non-bootstrap frame on a non-rooted link still drops
-(`#317`). The proptest proves both directions over kind × link state: the
-carve-out admits *exactly* the bootstrap kinds, and admits them from `Identified`
-and `Advisory` alike (`bootstrap_carve_out_source_holds_over_all_kinds`,
-[`edge.rs`](../src/edge.rs)).
+(`#317`). On `main` the proptest proves one direction over kind × link presence: the
+carve-out admits *exactly* the bootstrap kinds
+(`inbound_ingest_tests::bootstrap_carve_out_source_holds_over_all_kinds` and
+`bootstrap_carve_out_admits_only_self_authenticating_bootstrap_kinds`,
+[`edge.rs`](../src/edge.rs)). The admitting direction from `Identified` and
+`Advisory` — by ed25519 equality, not by attribution — is the `#624` build
+(PR #626) and is proven there; until it merges this sentence describes the
+design, not `main`.
 
 #### 5.4.1 The link-state × frame-kind table — what each state may do
 
 This is the table `#624` was found by not having. Read it as the contract:
 a row is what a link in that state can cause on this node, nothing more.
 
-| link state | bootstrap kind (`Key` / `IdentityOccurrence` / `TransportDestination`) | any other kind | `trace:*` / consent-gated planes served | attribution recorded |
-|---|---|---|---|---|
-| **Unidentified** — no remote identity proven | drop, `#317` (transport identity is the precondition, not a default) | drop | no | none |
-| **Identified, announce pending** — remote identity proven, binding not yet installed. *Transient; bounded by one announce verification; `link_before_binding` counts arrivals here and must read 0* | **attributed by equality**: the record's `pubkey_ed25519` == the link identity's ed25519 half ⇒ the record's key id (#624/#626); else drop by name. The record self-authenticates at admission | drop | no | none — the frame may CREATE the binding, it never assumes one |
-| **Advisory** — announce arrived, not steward-rooted or `!owns_key` | routed on the transport identity (`#624` second case) | drop | no | Advisory (transport-not-trust) |
-| **Rooted ∧ owns_key ∧ hybrid binding** (`#393` items 1+2) | attributed (`from_rooted_binding`) | attributed | **yes** — the E3 gate | Rooted |
-| **ResolvedToSelf** — the answer is our own key (`#623`) | drop, `attribution_resolved_to_self` | drop | no | none; no responder is ever built for self |
+| link state | bootstrap kind (`Key` / `IdentityOccurrence` / `TransportDestination`) | any other kind | `trace:*` / consent-gated planes served | attribution recorded | proven by (file::test) |
+|---|---|---|---|---|---|
+| **Unidentified** — no remote identity proven | drop, `#317` (transport identity is the precondition, not a default) | drop | no | none | `edge.rs::inbound_ingest_tests::bootstrap_carve_out_admits_only_self_authenticating_bootstrap_kinds` (link `None` ⇒ `None` for every kind); `bootstrap_carve_out_source_holds_over_all_kinds` (proptest) |
+| **Identified, announce pending** — remote identity proven, binding not yet installed. *Transient; bounded by one announce verification; `link_before_binding` counts arrivals here and must read 0* | **attributed by equality**: the record's `pubkey_ed25519` == the link identity's ed25519 half ⇒ the record's key id (#624/#626); else drop by name. The record self-authenticates at admission | drop | no | none — the frame may CREATE the binding, it never assumes one | **No test on `main`.** The equality attribution is PR #626 (`inbound_ingest_tests`, fresh-peer leg + `routing_hint_624`/proptest); the `link_before_binding` counter is #627's PR. Until both merge this row is the ruled design, unproven on `main` |
+| **Advisory** — announce arrived, not steward-rooted or `!owns_key` | routed on the transport identity (`#624` second case) | drop | no | Advisory (transport-not-trust) | attribution half: `reticulum.rs::initiator_attribution::a_genuine_peer_still_attributes_on_both_branches`; "not served": `mod.rs::source_key_id_tests::from_rooted_binding_admits_only_rooted_and_owns_key`. **The bootstrap column has no test on `main`** — it is PR #626's four-leg test (`inbound_ingest_tests`, Advisory leg). Flagged, not invented |
+| **Rooted ∧ owns_key ∧ hybrid binding** (`#393` items 1+2) | attributed (`from_rooted_binding`) | attributed | **yes** — the E3 gate | Rooted | `mod.rs::source_key_id_tests::from_rooted_binding_admits_only_rooted_and_owns_key`; `reticulum.rs::…::owns_key_is_a_post_pubkey_match_allowlist` (v16 route-hijack fix) |
+| **ResolvedToSelf** — the answer is our own key (`#623`) | drop, `attribution_resolved_to_self` | drop | no | none; no responder is ever built for self | `reticulum.rs::initiator_attribution::a_self_entry_in_the_peers_map_resolves_to_self_not_to_a_peer`, `an_identified_entry_naming_us_is_self`, proptest `attribution_never_resolves_to_the_local_key_as_a_peer`; responder: `edge.rs::inbound_ingest_tests::a_bootstrap_frame_on_a_link_attributed_to_ourselves_builds_no_responder` |
 
 Two invariants the table encodes, and the proptest holds:
 
