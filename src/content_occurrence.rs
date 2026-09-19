@@ -141,7 +141,13 @@ pub fn enc_pubkeys_from_seed(ed25519_seed: &[u8; 32]) -> Result<EncryptionPubkey
 
 /// Register `occurrence_key_id` as a **content-only** occurrence of
 /// `identity_key_id`, so the DEK cascade has a wrap target for that identity
-/// on this node. Idempotent.
+/// on this node. Idempotent. **Trusted-local door: the row never leaves this
+/// node.** Since persist v44.3.0/v44.4.0 (CIRISPersist#851) a NODE's own
+/// occurrence must be *published* so a far peer can fold it into `key_grant`
+/// admission — that is [`provision_engine_occurrence`], which calls
+/// `Engine::publish_self_occurrence`. This door remains right for a
+/// DEVICE-class occurrence a node holds for someone else (a phone's, an
+/// agent's — the `#856` shape) and for tests that need a local-only row.
 ///
 /// `occurrence_key_id` must already exist in `federation_keys` — an
 /// occurrence is a key that acts for an identity, not a bare label, and the
@@ -149,10 +155,11 @@ pub fn enc_pubkeys_from_seed(ed25519_seed: &[u8; 32]) -> Result<EncryptionPubkey
 /// the node's own federation key, which is registered by construction.
 ///
 /// `transport_binding` is `None` by design: this is a DEK-cascade KEX
-/// target, which is exactly the shape persist documents the trusted-local
-/// door for. A transport binding would take the signature-gated door, which
-/// exists to stop a PEER forging someone else's content keys — not a gate a
-/// node needs against itself.
+/// target. Before v44.4.0 the trusted-local door was the only door a node
+/// could write its own occurrence through (the signature-gated door required
+/// a `transport_destination`); persist §20.2 added the content-only signed
+/// form, and a node's own row now goes through that gated door (published)
+/// rather than this one.
 ///
 /// # Errors
 /// Directory read or write failure.
