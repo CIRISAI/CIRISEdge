@@ -71,6 +71,19 @@ lifecycle is `[]`. `scope_lifecycle().groups()` is the same fact as a read.
 `roster.unresolved` names members whose nodes the directory does not know
 yet; they become addressable on the next `advance` after their announce.
 
+**And a scope-native node must serve scope, not just route it (v26.3.0).**
+The responder decides entitlement from the blob's scope, which edge never
+infers: `BlobChunkSource::chunk_scope` is the seam, and persist's
+`PersistBlobChunkSource` answers `None` (it does not know). On a scope-native
+node that `None` withholds every scoped fetch (`blob_serve_scope_undeterminable`).
+Wrap it: delegate `read_chunk`, answer `chunk_scope` with
+`BlobMeaning::project` over any row that references the blob — the same
+projection the puller routes with, so serve and pull agree by construction —
+and declare it with `fn answers_scope(&self) -> bool { true }`. The builder
+refuses `scope_native_addressing` without a source that declares it; the
+unwired and half-wired states are not constructible. Both sides are counted
+by branch: `blob_route_refusals` (pull) and `blob_serve_refusals` (serve).
+
 ---
 
 ## 1. The ladder, and who owns each rung

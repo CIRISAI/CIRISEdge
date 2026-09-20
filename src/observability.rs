@@ -898,6 +898,12 @@ pub struct EdgeMetrics {
     /// re-keyed), `blob_no_address_table`, `blob_scope_undeterminable`,
     /// `blob_public_is_not_scoped`. Pre-#640 the first three were one number.
     pub blob_route_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#640 — `BlobChunkFetch`es this node received and did not
+    /// serve, by branch: the scope-admission tags (`blob_serve_scope_undeterminable`,
+    /// `blob_serve_arrival_scope_insufficient`, `blob_serve_group_mismatch`, …)
+    /// and `no_chunk_source_wired`. The serve-side twin of `blob_route_refusals`;
+    /// the withhold ledger carries the same events keyed coarser.
+    pub blob_serve_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
     /// the live announce-intake map under **capacity backpressure** (the
     /// `MAX_PEERS` cap in `transport::reticulum`).
@@ -1164,6 +1170,15 @@ impl EdgeMetrics {
         )
     }
 
+    /// CIRISEdge#640 — count one unserved `BlobChunkFetch` by its branch tag.
+    pub fn inc_blob_serve_refusal(&self, reason_tag: &'static str) {
+        *self
+            .blob_serve_refusals
+            .write()
+            .entry(reason_tag)
+            .or_insert(0) += 1;
+    }
+
     /// CIRISEdge#640 — count one blob-route refusal by its branch tag.
     pub fn inc_blob_route_refusal(&self, reason_tag: &'static str) {
         *self
@@ -1390,6 +1405,12 @@ impl EdgeMetrics {
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
+            blob_serve_refusals: self
+                .blob_serve_refusals
+                .read()
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
             blob_route_refusals: self
                 .blob_route_refusals
                 .read()
@@ -1451,6 +1472,8 @@ pub struct EdgeMetricsBundle {
     pub replication_inbound_backpressure_drops: u64,
     /// CIRISEdge#640 — blob holders dropped from a pull by refusal branch.
     pub blob_route_refusals: HashMap<String, u64>,
+    /// CIRISEdge#640 — `BlobChunkFetch`es received and not served, by branch.
+    pub blob_serve_refusals: HashMap<String, u64>,
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
     /// `unbound` / `not_applicable`). The door never drops.
     pub bootstrap_door_outcomes: HashMap<String, u64>,

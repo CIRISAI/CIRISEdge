@@ -1,5 +1,26 @@
 # CIRISEdge Release Notes
 
+# v26.3.0 — a scope-native node must serve scope: the half-wired state is unconstructible (CIRISEdge#640, second and third gaps)
+
+**2026-09-20** (PR #642). The ladder on v26.2.0 got the holder routed and dialed, and the
+creator dropped the fetch twice over: first `BlobChunkFetch received but no BlobChunkSource
+wired` (an optional builder hook left unset — DEBUG, counted nowhere), then, once wired,
+`blob_serve_scope_undeterminable` (persist's source answers `chunk_scope = None` by design). Three
+of the four host gaps in this arc were optional hooks with no observable but a dropped frame.
+
+- **`BlobChunkSource::answers_scope() -> bool`** (default `false`): a source that overrides
+  `chunk_scope` with a real projection declares it. **`scope_native_chunk_source_gate`** at build:
+  `scope_native_addressing` without a chunk source, or with one whose `answers_scope()` is false,
+  is refused with the hook and the override named. `PersistBlobChunkSource` stays `false` — a
+  scope-native host wraps it (`BlobMeaning::project` over a referencing row, the same projection
+  the puller routes with).
+- **`blob_serve_refusals`** by branch (`blob_serve_scope_undeterminable`, …,
+  `no_chunk_source_wired`) beside `blob_route_refusals` in the snapshot and pyo3 dict; the
+  unwired drop is WARN and counted.
+- `docs/CHAT_HARNESS_INTEGRATION.md` §0: the serve-side duty beside the three lifecycle verbs.
+
+Pins unchanged: persist v44.8.1, verify v15.2.0, leviculum v0.26.0+ciris.1. Wire unchanged (v3).
+
 # v26.2.0 — scope-native blob routing: the refusal is the branch; members are nodes (CIRISEdge#640)
 
 **2026-09-20** (PR #641). The chat ladder on v26.1.1 / persist v44.8.1 reached the last rung

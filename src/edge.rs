@@ -5827,6 +5827,10 @@ async fn dispatch_inbound(
                             &envelope.signing_key_id,
                             reason.reason_tag(),
                         );
+                        // CIRISEdge#640 — by BRANCH, beside `blob_route_refusals`,
+                        // so the serve side and the pull side are two maps with
+                        // the same shape.
+                        metrics.inc_blob_serve_refusal(reason.reason_tag());
                         if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                             blob_scope_withheld_log().check(reason.reason_tag())
                         {
@@ -6046,10 +6050,16 @@ async fn dispatch_inbound(
                 );
             }
         } else {
-            tracing::debug!(
+            // CIRISEdge#640 — counted (`blob_serve_refusals["no_chunk_source_wired"]`)
+            // and WARN, no longer a DEBUG that vanished at default levels: a
+            // node that receives fetches it cannot answer is a host gap, and a
+            // scope-native node cannot reach here (the builder refuses).
+            metrics.inc_blob_serve_refusal("no_chunk_source_wired");
+            tracing::warn!(
                 transport = ?transport,
                 signing_key_id = %envelope.signing_key_id,
-                "BlobChunkFetch received but no BlobChunkSource wired; dropping (CIRISEdge#55)",
+                "BlobChunkFetch received but no BlobChunkSource wired; dropping unanswered — \
+                 wire EdgeBuilder::blob_chunk_source (CIRISEdge#55/#640)",
             );
         }
     }
@@ -6928,6 +6938,45 @@ async fn ship_typed_ephemeral_reply(
 
 // ─── Builder ────────────────────────────────────────────────────────
 
+/// CIRISEdge#640 — the build-time rule that a scope-native node has a chunk
+/// source that ANSWERS `chunk_scope`. Pure, so the three shapes are unit
+/// tests: not armed (anything goes), armed with no source, armed with a source
+/// that does not answer scope, armed with one that does. The chunk source is
+/// an optional hook, and three of the four host gaps in the #640 arc were
+/// optional hooks left unset with no observable but a dropped frame; this
+/// makes the half-wired state unconstructible.
+///
+/// # Errors
+///
+/// `EdgeError::Config` naming the hook to wire and what to override.
+pub fn scope_native_chunk_source_gate(
+    scope_native_armed: bool,
+    source: Option<&dyn crate::blob_swarm::BlobChunkSource>,
+) -> Result<(), EdgeError> {
+    if !scope_native_armed {
+        return Ok(());
+    }
+    match source {
+        Some(source) if source.answers_scope() => Ok(()),
+        Some(_) => Err(EdgeError::Config(
+            "scope_native_addressing is armed but the wired BlobChunkSource does not answer \
+             chunk_scope (answers_scope() is false) — every scoped BlobChunkFetch this node \
+             received would be withheld (blob_serve_scope_undeterminable) and every scoped \
+             blob it authored would be unservable. Override chunk_scope with a real \
+             projection (BlobMeaning::project over a row that references the blob) and \
+             answers_scope() -> true (CIRISEdge#640)"
+                .into(),
+        )),
+        None => Err(EdgeError::Config(
+            "scope_native_addressing is armed but no BlobChunkSource is wired — every \
+             BlobChunkFetch this node received would be dropped unanswered. Wire \
+             EdgeBuilder::blob_chunk_source with a source whose chunk_scope answers \
+             (answers_scope() -> true) (CIRISEdge#640)"
+                .into(),
+        )),
+    }
+}
+
 impl EdgeBuilder {
     /// CIRISEdge#499 — arm scope-native addressing, if the operator asked.
     ///
@@ -7436,6 +7485,14 @@ impl EdgeBuilder {
                 &signer.key_id,
             )?,
         };
+        // CIRISEdge#640 — a scope-native node MUST be able to say what scope
+        // a blob it serves lives in, or the responder withholds every scoped
+        // fetch. Refused at build rather than discovered on the ladder.
+        #[cfg(feature = "_reticulum-module")]
+        scope_native_chunk_source_gate(
+            scope_lifecycle.is_some(),
+            self.blob_chunk_source.as_deref(),
+        )?;
 
         let content_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
         // CIRISEdge#55 — sibling pending-map for chunk fetches.
@@ -9132,6 +9189,59 @@ mod delegation_gate_tests {
             out,
             Err(crate::messages::DelegationRefusalSubReason::MissingScope),
         );
+    }
+}
+
+#[cfg(test)]
+mod scope_native_gate_640 {
+    use super::scope_native_chunk_source_gate;
+    use crate::blob_swarm::{BlobChunkSource, ChunkSourceRefusal};
+
+    struct Blind;
+    #[async_trait::async_trait]
+    impl BlobChunkSource for Blind {
+        async fn read_chunk(
+            &self,
+            _b: [u8; 32],
+            _c: [u8; 32],
+            _p: &str,
+        ) -> Result<Option<Vec<u8>>, ChunkSourceRefusal> {
+            Ok(None)
+        }
+    }
+    struct Sighted;
+    #[async_trait::async_trait]
+    impl BlobChunkSource for Sighted {
+        async fn read_chunk(
+            &self,
+            _b: [u8; 32],
+            _c: [u8; 32],
+            _p: &str,
+        ) -> Result<Option<Vec<u8>>, ChunkSourceRefusal> {
+            Ok(None)
+        }
+        async fn chunk_scope(&self, _b: [u8; 32]) -> Option<crate::blob_swarm::ContentScope> {
+            Some(crate::blob_swarm::ContentScope::Federation)
+        }
+        fn answers_scope(&self) -> bool {
+            true
+        }
+    }
+
+    /// The half-wired states are unconstructible: armed + no source, and
+    /// armed + a source that does not answer scope, both refuse at build
+    /// naming the hook; armed + a sighted source passes; unarmed passes
+    /// whatever is wired (the legacy blob plane is untouched).
+    #[test]
+    fn a_scope_native_node_needs_a_chunk_source_that_answers_scope() {
+        assert!(scope_native_chunk_source_gate(false, None).is_ok());
+        assert!(scope_native_chunk_source_gate(false, Some(&Blind)).is_ok());
+        assert!(scope_native_chunk_source_gate(true, Some(&Sighted)).is_ok());
+        let e = scope_native_chunk_source_gate(true, None).expect_err("no source");
+        assert!(e.to_string().contains("blob_chunk_source"), "{e}");
+        let e = scope_native_chunk_source_gate(true, Some(&Blind)).expect_err("blind source");
+        assert!(e.to_string().contains("answers_scope"), "{e}");
+        assert!(e.to_string().contains("BlobMeaning::project"), "{e}");
     }
 }
 

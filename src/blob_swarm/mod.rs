@@ -439,6 +439,22 @@ pub trait BlobChunkSource: Send + Sync + 'static {
     async fn chunk_scope(&self, _blob_sha256: [u8; 32]) -> Option<ContentScope> {
         None
     }
+
+    /// CIRISEdge#640 — does this source ANSWER [`Self::chunk_scope`] for the
+    /// blobs it holds? A scope-native node (one that armed
+    /// `EdgeBuilder::scope_native_addressing`) is refused at build time unless
+    /// its chunk source says `true`: otherwise every scoped `BlobChunkFetch`
+    /// it receives is withheld (`blob_serve_scope_undeterminable`) and every
+    /// scoped blob it authored is unservable — a node that was held, announced,
+    /// routed to, and never served, found by running the ladder rather than by
+    /// reading this doc. The default is `false` because the default
+    /// `chunk_scope` is `None`; an implementation that overrides `chunk_scope`
+    /// with a real projection (`BlobMeaning::project` over a row that
+    /// references the blob) overrides this to `true`. Declaring the
+    /// capability is what makes the half-wired state unconstructible.
+    fn answers_scope(&self) -> bool {
+        false
+    }
 }
 
 /// Refusal reasons surfaced by a [`BlobChunkSource::read_chunk`]
