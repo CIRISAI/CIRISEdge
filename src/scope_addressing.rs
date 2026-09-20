@@ -285,6 +285,38 @@ pub struct LiveEpochs {
     pub next: Option<u64>,
 }
 
+/// CIRISEdge#640 — one member's standing in one group, as the branch it is.
+/// Every variant is a different situation to an operator: a group that was
+/// never installed is the host's lifecycle not being driven; a member absent
+/// at every live epoch is roster policy; a member sealed out is a rotation
+/// that closed before they re-keyed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberStatus {
+    /// No epoch of this group is installed at all.
+    GroupNotInstalled,
+    /// The member holds an address at `epoch` (`role` says which slot).
+    Addressable { epoch: u64, role: EpochRole },
+    /// The group is installed and the member is at none of its live epochs,
+    /// and was not at the last sealed one either.
+    NotAMember { live: LiveEpochs },
+    /// The member WAS addressable at `sealed_epoch`, which a rotation sealed;
+    /// they did not re-key before the convergence window closed.
+    SealedOut { sealed_epoch: u64, live: LiveEpochs },
+}
+
+/// CIRISEdge#640 — one installed group, as [`ScopeAddressTable::groups`]
+/// lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupSummary {
+    pub scope_kind: &'static str,
+    pub group_id: String,
+    pub epochs: LiveEpochs,
+    /// Members addressable at the current (send) epoch.
+    pub members_current: usize,
+    /// The most recently sealed epoch, if any rotation has sealed.
+    pub last_sealed_epoch: Option<u64>,
+}
+
 /// What [`ScopeAddressTable::activate_next`] did.
 ///
 /// `evicted` is `Some` when a previous rotation was never sealed and
@@ -407,12 +439,24 @@ struct EpochSlot {
     members: HashMap<Arc<str>, MemberAddress>,
 }
 
-/// A group's three rotation slots.
+/// A group's three rotation slots — plus the ONE fact a seal leaves behind
+/// (CIRISEdge#640): which epoch was sealed and who was addressable at it, so
+/// a holder refused after a rotation can be named as SEALED OUT rather than
+/// folded into "not a member". Bounded: one sealed epoch per group, replaced
+/// by the next seal.
 struct GroupEpochs {
     group: Arc<ScopeGroup>,
     current: EpochSlot,
     next: Option<EpochSlot>,
     previous: Option<EpochSlot>,
+    last_sealed: Option<SealedEpoch>,
+}
+
+/// The memory a seal leaves (CIRISEdge#640): the epoch and the members that
+/// were addressable at it. Addresses are NOT kept — the seal retired them.
+struct SealedEpoch {
+    epoch: u64,
+    members: HashSet<Arc<str>>,
 }
 
 impl GroupEpochs {
@@ -522,6 +566,7 @@ impl ScopeAddressTable {
                 current: slot,
                 next: None,
                 previous: None,
+                last_sealed: None,
             },
         );
 
@@ -638,6 +683,10 @@ impl ScopeAddressTable {
 
         Ok(group_state.previous.take().map(|sealed| {
             retract_slot(reverse, &sealed);
+            group_state.last_sealed = Some(SealedEpoch {
+                epoch: sealed.epoch,
+                members: sealed.members.keys().cloned().collect(),
+            });
             sealed.epoch
         }))
     }
@@ -757,6 +806,80 @@ impl ScopeAddressTable {
             current: group_state.current.epoch,
             next: group_state.next.as_ref().map(|s| s.epoch),
         })
+    }
+
+    /// CIRISEdge#640 — **why** a member can or cannot be addressed in a
+    /// group, as one branch each. This is the diagnostic read the blob router
+    /// turns into a refusal reason; it is never a fallback and never derives.
+    #[must_use]
+    pub fn member_status(
+        &self,
+        scope: &CohortScope,
+        group_id: &str,
+        member_key_id: &str,
+    ) -> MemberStatus {
+        let guard = self.inner.read();
+        let Some(group_state) = lookup_group(&guard.groups, scope, group_id) else {
+            return MemberStatus::GroupNotInstalled;
+        };
+        let live = LiveEpochs {
+            previous: group_state.previous.as_ref().map(|s| s.epoch),
+            current: group_state.current.epoch,
+            next: group_state.next.as_ref().map(|s| s.epoch),
+        };
+        for (slot, role) in [
+            (Some(&group_state.current), EpochRole::Current),
+            (group_state.next.as_ref(), EpochRole::Next),
+            (group_state.previous.as_ref(), EpochRole::Previous),
+        ] {
+            if let Some(slot) = slot {
+                if slot.members.contains_key(member_key_id) {
+                    return MemberStatus::Addressable {
+                        epoch: slot.epoch,
+                        role,
+                    };
+                }
+            }
+        }
+        if let Some(sealed) = group_state
+            .last_sealed
+            .as_ref()
+            .filter(|sealed| sealed.members.contains(member_key_id))
+        {
+            return MemberStatus::SealedOut {
+                sealed_epoch: sealed.epoch,
+                live,
+            };
+        }
+        MemberStatus::NotAMember { live }
+    }
+
+    /// CIRISEdge#640 — every installed group with its live epochs and
+    /// current-epoch member count: the one read that makes "the table is
+    /// empty" a fact rather than an inference from a refusal. Sorted by
+    /// `(scope kind, group id)` so two snapshots diff cleanly.
+    #[must_use]
+    pub fn groups(&self) -> Vec<GroupSummary> {
+        let guard = self.inner.read();
+        let mut out: Vec<GroupSummary> = guard
+            .groups
+            .iter()
+            .flat_map(|(scope, by_id)| {
+                by_id.iter().map(move |(group_id, state)| GroupSummary {
+                    scope_kind: scope.kind_token(),
+                    group_id: group_id.clone(),
+                    epochs: LiveEpochs {
+                        previous: state.previous.as_ref().map(|s| s.epoch),
+                        current: state.current.epoch,
+                        next: state.next.as_ref().map(|s| s.epoch),
+                    },
+                    members_current: state.current.members.len(),
+                    last_sealed_epoch: state.last_sealed.as_ref().map(|s| s.epoch),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| (a.scope_kind, &a.group_id).cmp(&(b.scope_kind, &b.group_id)));
+        out
     }
 
     /// Total number of live addresses across every group and epoch —
@@ -1017,6 +1140,112 @@ mod tests {
         t.install_group(&family(), "g-1", 7, &secret(0xA1), &MEMBERS)
             .expect("seed install");
         t
+    }
+
+    // ── CIRISEdge#640 — member_status and groups(): the diagnostic reads ──
+
+    #[test]
+    fn member_status_names_the_branch_never_a_disjunction() {
+        let t = seeded();
+        // Installed, member: addressable at the send epoch.
+        assert_eq!(
+            t.member_status(&family(), "g-1", "ed25519:alice"),
+            MemberStatus::Addressable {
+                epoch: 7,
+                role: EpochRole::Current
+            }
+        );
+        // Installed, never a member.
+        assert!(matches!(
+            t.member_status(&family(), "g-1", "ed25519:mallory"),
+            MemberStatus::NotAMember { live } if live.current == 7
+        ));
+        // Not installed at all — the branch the host's missing install is.
+        assert_eq!(
+            t.member_status(&family(), "g-9", "ed25519:alice"),
+            MemberStatus::GroupNotInstalled
+        );
+        assert_eq!(
+            t.member_status(&CohortScope::Public, "g-1", "ed25519:alice"),
+            MemberStatus::GroupNotInstalled
+        );
+    }
+
+    #[test]
+    fn a_seal_remembers_who_it_sealed_out() {
+        let t = seeded();
+        // Rotate to epoch 2 without carol, activate, then seal epoch 1.
+        t.install_next(
+            &family(),
+            "g-1",
+            8,
+            &secret(8),
+            &["ed25519:alice", "ed25519:bob"],
+        )
+        .unwrap();
+        t.activate_next(&family(), "g-1").unwrap();
+        // Straggler window: carol is still addressable at the previous epoch.
+        assert_eq!(
+            t.member_status(&family(), "g-1", "ed25519:carol"),
+            MemberStatus::Addressable {
+                epoch: 7,
+                role: EpochRole::Previous
+            }
+        );
+        assert_eq!(t.seal_rotation(&family(), "g-1").unwrap(), Some(7));
+        assert!(matches!(
+            t.member_status(&family(), "g-1", "ed25519:carol"),
+            MemberStatus::SealedOut { sealed_epoch: 7, live } if live.current == 8 && live.previous.is_none()
+        ));
+        // Someone who was never in ANY epoch stays NotAMember.
+        assert!(matches!(
+            t.member_status(&family(), "g-1", "ed25519:mallory"),
+            MemberStatus::NotAMember { .. }
+        ));
+        // A second seal replaces the memory: carol is now merely absent.
+        t.install_next(&family(), "g-1", 9, &secret(9), &["ed25519:alice"])
+            .unwrap();
+        t.activate_next(&family(), "g-1").unwrap();
+        assert_eq!(t.seal_rotation(&family(), "g-1").unwrap(), Some(8));
+        assert!(matches!(
+            t.member_status(&family(), "g-1", "ed25519:bob"),
+            MemberStatus::SealedOut {
+                sealed_epoch: 8,
+                ..
+            }
+        ));
+        assert!(matches!(
+            t.member_status(&family(), "g-1", "ed25519:carol"),
+            MemberStatus::NotAMember { .. }
+        ));
+    }
+
+    #[test]
+    fn groups_lists_every_installed_group_and_nothing_on_an_empty_table() {
+        let empty = table();
+        assert!(empty.groups().is_empty(), "the fact, not an inference");
+        let t = seeded();
+        t.install_group(
+            &CohortScope::Cohort {
+                cohort_id: "nbhd".into(),
+            },
+            "cohort:room-1",
+            7,
+            &secret(7),
+            &["ed25519:alice"],
+        )
+        .unwrap();
+        let groups = t.groups();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].scope_kind, "cohort");
+        assert_eq!(groups[0].group_id, "cohort:room-1");
+        assert_eq!(groups[0].epochs.current, 7);
+        assert_eq!(groups[0].members_current, 1);
+        assert_eq!(groups[0].last_sealed_epoch, None);
+        assert_eq!(groups[1].scope_kind, "family");
+        assert_eq!(groups[1].group_id, "g-1");
+        assert_eq!(groups[1].epochs.current, 7);
+        assert_eq!(groups[1].members_current, MEMBERS.len());
     }
 
     // ── lookup purity ────────────────────────────────────────────────

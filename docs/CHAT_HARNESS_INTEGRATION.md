@@ -42,6 +42,35 @@ Until CIRISPersist#788 ships the owner-conferred resolver, only the canonical
 rung resolves; a node whose row claims `infra:serve` without a verifiable
 blessing logs a WARN naming that issue and serves conservatively.
 
+**Scope-native addressing is armed by you AND driven by you (CIRISEdge#640).**
+`EdgeBuilder::scope_native_addressing(convergence)` installs the address
+table and makes every group-scoped blob pull refuse the federation address —
+by design. It does NOT install any group: that is the lifecycle, and its
+three verbs are the host's to call, because only the host knows when a room
+is keyed, when its epoch moved, and when stragglers have had long enough:
+
+```rust
+// The room's MLS roster names PERSONS; the table's members are NODES (the
+// keys that sign holds_bytes claims, the key this node listens on). Walk
+// persons to nodes through the one resolution the contact ladder uses:
+let roster = cohort_addressing::snapshot_for_nodes(&room_group, &lens).await?;
+let scope = cohort_addressing::scope_for(&room_id);
+
+// 1. RoomState::Keyed  → install
+edge.scope_lifecycle().unwrap().install(&scope, &roster.snapshot)?;
+// 2. epoch advanced    → advance (make-before-break; the old epoch stays live)
+edge.scope_lifecycle().unwrap().advance(&scope, &roster.snapshot, Instant::now())?;
+// 3. on a cadence      → seal what is due (the convergence window you armed)
+edge.scope_lifecycle().unwrap().seal_due(Instant::now());
+```
+
+Skip step 1 and every holder of that room's blobs is refused
+`blob_group_not_installed` — named as such since v26.2.0, and the WARN prints
+what the table DOES hold (`installed_groups=[…]`), which for an undriven
+lifecycle is `[]`. `scope_lifecycle().groups()` is the same fact as a read.
+`roster.unresolved` names members whose nodes the directory does not know
+yet; they become addressable on the next `advance` after their announce.
+
 ---
 
 ## 1. The ladder, and who owns each rung
