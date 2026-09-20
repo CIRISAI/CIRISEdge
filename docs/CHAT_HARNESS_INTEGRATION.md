@@ -42,6 +42,27 @@ Until CIRISPersist#788 ships the owner-conferred resolver, only the canonical
 rung resolves; a node whose row claims `infra:serve` without a verifiable
 blessing logs a WARN naming that issue and serves conservatively.
 
+**The sealed-content door is one value (v27.0.0, CIRISEdge#640).** A node that
+opens sealed bytes it did not seal needs the engine that projects `key_grant`
+wraps into grants for its occurrences; sealed bytes arrive only through the
+puller and their withdrawals only through the revocation register. So the
+config carries them as one struct, and a puller or a register without the
+engine is not constructible:
+
+```rust
+config.sealed_content = Some(ciris_edge::replication::SealedContentWiring {
+    engine: BridgeEngine(engine.clone()),          // Engine::from_shared_with_local
+    pull_sink: Some(pull_sink),                    // BlobPuller::spawn
+    revocations: Some(RevocationWiring { register, evictor }),
+});
+```
+
+Leave it `None` only for a node that neither pulls nor opens sealed content.
+A node that SEALS for a room must also be able to open what the room sends
+back: install this wherever you install the puller. The runtime's start line
+prints `sealed_content=SealedContentWiring { engine: true, pull_sink: …,
+revocations: … }` — edge's own truth about which doors it has.
+
 **Scope-native addressing is armed by you AND driven by you (CIRISEdge#640).**
 `EdgeBuilder::scope_native_addressing(convergence)` installs the address
 table and makes every group-scoped blob pull refuse the federation address —

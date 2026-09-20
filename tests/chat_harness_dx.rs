@@ -45,6 +45,17 @@ fn the_wiring_the_guide_says_is_mandatory_exists() {
     // AgentMode still exists — on the Edge, for listener/queue. Its absence
     // from BridgeConfig is the point: the v18.12.1 mis-key is unrepresentable.
     assert!(matches!(AgentMode::default(), AgentMode::Proxy));
+
+    // CIRISEdge#640 — the sealed-content door is ONE value, and it is `None`
+    // by default: a puller or a revocation register with no engine (the
+    // 0.5.207–0.5.213 shape) has no field to be written into.
+    assert!(
+        config.sealed_content.is_none(),
+        "§0: a default config neither pulls nor opens sealed content"
+    );
+    let _: fn(
+        &ciris_edge::replication::SealedContentWiring,
+    ) -> &ciris_edge::replication::BridgeEngine = |w| &w.engine;
 }
 
 /// §6 — the stranger-contact surface the guide's code block calls, and the

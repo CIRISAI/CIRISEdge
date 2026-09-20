@@ -6938,6 +6938,7 @@ async fn ship_typed_ephemeral_reply(
 
 // ─── Builder ────────────────────────────────────────────────────────
 
+#[cfg(feature = "_reticulum-module")]
 /// CIRISEdge#640 — the build-time rule that a scope-native node has a chunk
 /// source that ANSWERS `chunk_scope`. Pure, so the three shapes are unit
 /// tests: not armed (anything goes), armed with no source, armed with a source
@@ -9192,7 +9193,7 @@ mod delegation_gate_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "_reticulum-module"))]
 mod scope_native_gate_640 {
     use super::scope_native_chunk_source_gate;
     use crate::blob_swarm::{BlobChunkSource, ChunkSourceRefusal};
