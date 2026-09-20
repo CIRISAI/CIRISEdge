@@ -2458,10 +2458,43 @@ impl ciris_edge::scope_lifecycle::ScopedDestinationSink for ListenOnly {
 /// `spawn_edge`, with a caller-built scope lifecycle installed — the #616
 /// door: the router reads the lifecycle's table when no Reticulum transport
 /// owns one.
+/// CIRISEdge#640 — what a scope-native host wires: persist's source for the
+/// bytes, and a `chunk_scope` answer the host actually knows. Here the room is
+/// the only scoped content, so the answer is the room's scope; a real host
+/// projects it with `BlobMeaning::project` over a row that references the
+/// blob. `answers_scope` declares it, which is what the builder gate reads.
+struct RoomScopedSource {
+    inner: ciris_edge::blob_swarm::PersistBlobChunkSource,
+    scope: ciris_edge::blob_swarm::ContentScope,
+}
+#[async_trait::async_trait]
+impl ciris_edge::blob_swarm::BlobChunkSource for RoomScopedSource {
+    async fn read_chunk(
+        &self,
+        blob_sha256: [u8; 32],
+        chunk_sha256: [u8; 32],
+        requesting_peer_key_id: &str,
+    ) -> Result<Option<Vec<u8>>, ciris_edge::blob_swarm::ChunkSourceRefusal> {
+        self.inner
+            .read_chunk(blob_sha256, chunk_sha256, requesting_peer_key_id)
+            .await
+    }
+    async fn chunk_scope(
+        &self,
+        _blob_sha256: [u8; 32],
+    ) -> Option<ciris_edge::blob_swarm::ContentScope> {
+        Some(self.scope.clone())
+    }
+    fn answers_scope(&self) -> bool {
+        true
+    }
+}
+
 async fn spawn_edge_with_lifecycle(
     node: &Node,
     transport: Arc<WireEnd>,
     lifecycle: Arc<ciris_edge::scope_lifecycle::ScopeLifecycle>,
+    room: &str,
 ) -> (Arc<ciris_edge::Edge>, tokio::sync::watch::Sender<bool>) {
     use ciris_persist::federation::FederationDirectory;
     let edge = ciris_edge::Edge::builder()
@@ -2470,9 +2503,13 @@ async fn spawn_edge_with_lifecycle(
         .queue(node.dir.clone())
         .signer(node.signer.clone())
         .transport(transport as Arc<dyn ciris_edge::transport::Transport>)
-        .blob_chunk_source(Arc::new(
-            ciris_edge::blob_swarm::PersistBlobChunkSource::new(node.store.engine().clone()),
-        ))
+        .blob_chunk_source(Arc::new(RoomScopedSource {
+            inner: ciris_edge::blob_swarm::PersistBlobChunkSource::new(node.store.engine().clone()),
+            scope: ciris_edge::blob_swarm::ContentScope::Group {
+                scope: ciris_edge::cohort_addressing::scope_for(room),
+                group_id: room.to_owned(),
+            },
+        }))
         .scope_lifecycle(lifecycle)
         .config(ciris_edge::EdgeConfig::default())
         .build()
@@ -2617,8 +2654,10 @@ async fn a_community_pull_resolves_through_the_rooms_group_and_stops_at_the_scop
     );
 
     let (wire_a, wire_b) = wire(&node_a.me, &node_b.me);
-    let (_edge_a, _stop_a) = spawn_edge_with_lifecycle(&node_a, wire_a, Arc::clone(&life_a)).await;
-    let (edge_b, _stop_b) = spawn_edge_with_lifecycle(&node_b, wire_b, Arc::clone(&life_b)).await;
+    let (_edge_a, _stop_a) =
+        spawn_edge_with_lifecycle(&node_a, wire_a, Arc::clone(&life_a), room).await;
+    let (edge_b, _stop_b) =
+        spawn_edge_with_lifecycle(&node_b, wire_b, Arc::clone(&life_b), room).await;
 
     // (1) The router on B resolves A, a holder, to the room-derived address.
     let content = ciris_edge::blob_swarm::ContentScope::Group {

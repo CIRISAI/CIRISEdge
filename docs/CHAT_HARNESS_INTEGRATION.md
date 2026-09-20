@@ -42,6 +42,27 @@ Until CIRISPersist#788 ships the owner-conferred resolver, only the canonical
 rung resolves; a node whose row claims `infra:serve` without a verifiable
 blessing logs a WARN naming that issue and serves conservatively.
 
+**The sealed-content door is one value (v27.0.0, CIRISEdge#640).** A node that
+opens sealed bytes it did not seal needs the engine that projects `key_grant`
+wraps into grants for its occurrences; sealed bytes arrive only through the
+puller and their withdrawals only through the revocation register. So the
+config carries them as one struct, and a puller or a register without the
+engine is not constructible:
+
+```rust
+config.sealed_content = Some(ciris_edge::replication::SealedContentWiring {
+    engine: BridgeEngine(engine.clone()),          // Engine::from_shared_with_local
+    pull_sink: Some(pull_sink),                    // BlobPuller::spawn
+    revocations: Some(RevocationWiring { register, evictor }),
+});
+```
+
+Leave it `None` only for a node that neither pulls nor opens sealed content.
+A node that SEALS for a room must also be able to open what the room sends
+back: install this wherever you install the puller. The runtime's start line
+prints `sealed_content=SealedContentWiring { engine: true, pull_sink: …,
+revocations: … }` — edge's own truth about which doors it has.
+
 **Scope-native addressing is armed by you AND driven by you (CIRISEdge#640).**
 `EdgeBuilder::scope_native_addressing(convergence)` installs the address
 table and makes every group-scoped blob pull refuse the federation address —
@@ -70,6 +91,19 @@ what the table DOES hold (`installed_groups=[…]`), which for an undriven
 lifecycle is `[]`. `scope_lifecycle().groups()` is the same fact as a read.
 `roster.unresolved` names members whose nodes the directory does not know
 yet; they become addressable on the next `advance` after their announce.
+
+**And a scope-native node must serve scope, not just route it (v26.3.0).**
+The responder decides entitlement from the blob's scope, which edge never
+infers: `BlobChunkSource::chunk_scope` is the seam, and persist's
+`PersistBlobChunkSource` answers `None` (it does not know). On a scope-native
+node that `None` withholds every scoped fetch (`blob_serve_scope_undeterminable`).
+Wrap it: delegate `read_chunk`, answer `chunk_scope` with
+`BlobMeaning::project` over any row that references the blob — the same
+projection the puller routes with, so serve and pull agree by construction —
+and declare it with `fn answers_scope(&self) -> bool { true }`. The builder
+refuses `scope_native_addressing` without a source that declares it; the
+unwired and half-wired states are not constructible. Both sides are counted
+by branch: `blob_route_refusals` (pull) and `blob_serve_refusals` (serve).
 
 ---
 

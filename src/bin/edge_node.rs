@@ -2209,21 +2209,26 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
                     round_timeout: Duration::from_secs(10),
                 },
                 local_key_id: Some(cfg.node_id.clone()),
-                // CIRISPersist#848 — route key_grant rows to the engine that
-                // owns this node's grant tables; without it every member reads
-                // NotGranted with the carrier row present (CIRISEdge#601).
-                engine: Some(engine.clone()),
-                // CIRISEdge#606 — CC 2.3 at the bytes plane: an admitted
+                // CIRISEdge#640 — the sealed-content door as ONE value: the
+                // engine that routes key_grant rows to this node's grant tables
+                // (CIRISPersist#848; without it every member reads NotGranted
+                // with the carrier row present, CIRISEdge#601), and beside it
+                // the CC 2.3 withdraws observer (CIRISEdge#606: an admitted
                 // `withdraws` is re-verified against the row this node holds,
                 // and if authorized the bytes it references are deleted here
-                // and refused `Withdrawn` to every peer. The evictor is this
-                // node's own substrate (persist's `delete_blob`, "the floor
-                // every eviction path ends at").
-                revocations: Some(ciris_edge::replication::RevocationWiring {
-                    register: Arc::new(ciris_edge::blob_swarm::RevocationRegister::default()),
-                    evictor: Some(
-                        Arc::clone(&directory) as Arc<dyn ciris_edge::blob_swarm::BlobEvictor>
-                    ),
+                // and refused `Withdrawn` to every peer; the evictor is this
+                // node's own substrate). This harness pulls no blobs, so no
+                // pull sink — the type makes "a puller with no engine"
+                // unconstructible either way.
+                sealed_content: Some(ciris_edge::replication::SealedContentWiring {
+                    engine: engine.clone(),
+                    pull_sink: None,
+                    revocations: Some(ciris_edge::replication::RevocationWiring {
+                        register: Arc::new(ciris_edge::blob_swarm::RevocationRegister::default()),
+                        evictor: Some(
+                            Arc::clone(&directory) as Arc<dyn ciris_edge::blob_swarm::BlobEvictor>
+                        ),
+                    }),
                 }),
                 ..Default::default()
             },

@@ -362,6 +362,7 @@ pub use registry::{RegistryError, ReplicationRegistry, RouteOutcome};
 #[doc(inline)]
 pub use runtime::{
     self_publish_set, ReplicationPeer, ReplicationRuntime, ReplicationRuntimeConfig,
+    SealedContentWiring,
 };
 #[doc(inline)]
 pub use scheduler::{ReplicationScheduler, RoundEvent, SchedulerConfig};

@@ -2554,6 +2554,11 @@ impl PyEdge {
             route_refusals.set_item(label.as_str(), *n)?;
         }
         root.set_item("blob_route_refusals", route_refusals)?;
+        let serve_refusals = pyo3::types::PyDict::new(py);
+        for (label, n) in &bundle.blob_serve_refusals {
+            serve_refusals.set_item(label.as_str(), *n)?;
+        }
+        root.set_item("blob_serve_refusals", serve_refusals)?;
         root.set_item(
             "replication_routed_to_responder_total",
             bundle.replication_routed_to_responder_total,

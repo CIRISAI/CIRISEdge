@@ -170,9 +170,19 @@ fn build_bridge(
         .with_self_provider(self_provider)
         .with_convergence(Some(convergence))
         .with_local_key_id(config.local_key_id.clone())
-        .with_engine(config.engine.clone())
-        .with_revocations(config.revocations.clone())
-        .with_pull_sink(config.pull_sink.clone())
+        .with_engine(config.sealed_content.as_ref().map(|w| w.engine.clone()))
+        .with_revocations(
+            config
+                .sealed_content
+                .as_ref()
+                .and_then(|w| w.revocations.clone()),
+        )
+        .with_pull_sink(
+            config
+                .sealed_content
+                .as_ref()
+                .and_then(|w| w.pull_sink.clone()),
+        )
         .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
         // legs live (leg A ∧ leg B against this node's own trust base), the
@@ -336,6 +346,20 @@ fn build_mesh_config_reader(
 /// consumer's `recv()` returns `None` when the scheduler task ends and drops
 /// the sender, so the consumer winds down without its own cancel. (Extracted
 /// from [`ReplicationRuntime::start`] verbatim for the clippy line ceiling.)
+/// CIRISEdge#640 — the start line says which doors this runtime has, as
+/// edge's own truth (the host logs its intent; this is what it got).
+fn log_started(config: &ReplicationRuntimeConfig, peers: usize, proactive_publish: bool) {
+    tracing::info!(
+        peers,
+        local_key_id = ?config.local_key_id,
+        sealed_content = ?config.sealed_content,
+        proactive_publish,
+        "replication runtime STARTED — sealed_content: None means this node neither pulls \
+         nor opens sealed content; a puller or a revocation register cannot exist without \
+         the engine (SealedContentWiring, CIRISEdge#640)"
+    );
+}
+
 fn spawn_scheduler_task(
     scheduler: ReplicationScheduler,
     handle: &SchedulerHandle,
@@ -500,6 +524,53 @@ pub struct ReplicationPeer {
     pub kind: EnvelopeKind,
 }
 
+/// CIRISEdge#640 — the sealed-content door, as one value.
+///
+/// The engine's job is to project the wraps a `key_grant` row carries into
+/// grants for THIS node's occurrences (`Engine::apply_replicated_key_grant`,
+/// CIRISPersist#848). The only node that ever needs a projected wrap is one
+/// that will OPEN sealed bytes it did not seal — and sealed bytes arrive only
+/// through the puller; withdrawals of the sets it projects arrive only
+/// through the revocation register. So `pull_sink ⇒ engine` and
+/// `revocations ⇒ engine`, and this struct is that rule spelled as a type:
+/// there is no way to hold a puller or a register without the engine they
+/// depend on. The receive-side twin of `BlobChunkSource::answers_scope`.
+///
+/// Build the engine with `Engine::from_shared_with_local` over the same
+/// substrate (`PersistGroupContentStore::from_shared_hybrid` builds it); the
+/// sink with `blob_swarm::BlobPuller::spawn`; hand the same
+/// [`RevocationRegister`](crate::blob_swarm::RevocationRegister) to the blob
+/// chunk source and the swarm converger. A node that SEALS for a room must
+/// also be able to open what the room sends back: install this wherever you
+/// install the puller.
+#[derive(Clone)]
+pub struct SealedContentWiring {
+    /// CIRISPersist#848 / CIRISEdge#601 — the key-grant door. A `key_grant:*`
+    /// attestation row arriving on the Attestation cursor is routed to
+    /// `Engine::apply_replicated_key_grant`, which admits the carrier AND
+    /// projects the wraps addressed to this node's occurrences.
+    pub engine: super::bridge::BridgeEngine,
+    /// CIRISEdge#601 — the pull sink. An admitted attestation that references
+    /// a blob is offered here; the `BlobPuller` behind it projects the
+    /// meaning, runs the store gate and fetches. `None` = rows arrive and
+    /// bytes never do; every non-author member reads `NotFetched`.
+    pub pull_sink: Option<crate::blob_swarm::PullSink>,
+    /// CIRISEdge#606 — CC 2.3 at the bytes plane. `Some` ARMS the withdraws
+    /// observer on the apply path (see
+    /// [`RevocationWiring`](super::bridge::RevocationWiring)).
+    pub revocations: Option<super::bridge::RevocationWiring>,
+}
+
+impl std::fmt::Debug for SealedContentWiring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedContentWiring")
+            .field("engine", &true)
+            .field("pull_sink", &self.pull_sink.is_some())
+            .field("revocations", &self.revocations.is_some())
+            .finish()
+    }
+}
+
 /// Configuration for [`ReplicationRuntime::start`].
 #[derive(Debug, Clone, Default)]
 pub struct ReplicationRuntimeConfig {
@@ -541,31 +612,17 @@ pub struct ReplicationRuntimeConfig {
     /// Falls back to `local_key_id` when unset — correct for every deployment
     /// where the two identities coincide.
     pub serve_tier_subject_key_id: Option<String>,
-    /// CIRISPersist#848 / CIRISEdge#601 — the Engine that owns the
-    /// key-grant door. A `key_grant:*` attestation row arriving on the
-    /// Attestation cursor is routed to `Engine::apply_replicated_key_grant`,
-    /// which admits the carrier AND projects the wraps addressed to this
-    /// node's occurrences. The general attestation door admits the carrier
-    /// and projects nothing — every member then stays `NotGranted` with the
-    /// row present, which is exactly the symptom #601 reported.
-    ///
-    /// `None` keeps the pre-v24.1.0 behaviour and LOGS AN ERROR per
-    /// key-grant row naming this field; a node that seals or reads encrypted
-    /// group content must install one (an `Engine::from_shared_with_local`
-    /// view over the same substrate — see
-    /// `PersistGroupContentStore::from_shared_hybrid`, which builds it).
-    pub engine: Option<super::bridge::BridgeEngine>,
-    /// CIRISEdge#606 — CC 2.3 at the bytes plane. `Some` ARMS the withdraws
-    /// observer on the apply path (see
-    /// [`RevocationWiring`](super::bridge::RevocationWiring)). Hand the same
-    /// register to the blob chunk source and the swarm converger.
-    pub revocations: Option<super::bridge::RevocationWiring>,
-    /// CIRISEdge#601 — the pull sink. An admitted attestation that
-    /// references a blob is offered here; the `BlobPuller` behind it
-    /// projects the meaning, runs the store gate and fetches. `None` = rows
-    /// arrive and bytes never do; every non-author member reads
-    /// `NotFetched`. Build one with `blob_swarm::BlobPuller::spawn`.
-    pub pull_sink: Option<crate::blob_swarm::PullSink>,
+    /// CIRISEdge#640 — everything a node needs to OPEN sealed content it did
+    /// not seal, wired as ONE value (see [`SealedContentWiring`]): the engine
+    /// that projects key-grant wraps into grants for this node's occurrences,
+    /// with the puller and the revocation register that only make sense
+    /// beside it. `None` is a node that neither pulls nor opens sealed
+    /// content (pre-v24.1.0 behaviour: a `key_grant:*` row is admitted as a
+    /// carrier and LOGS AN ERROR naming this field). The half-wired states —
+    /// a puller with no engine (bytes arrive that nobody can open: every
+    /// member reads `NotGranted` with the row present, 0.5.207–0.5.213's
+    /// shape), a register with no engine — are not constructible.
+    pub sealed_content: Option<SealedContentWiring>,
     /// Workstream F — does this node ENFORCE the `accord:*` relay predicate?
     /// `true` installs the
     /// [`AccordRelayGate`](crate::replication::accord_relay_gate::AccordRelayGate)
@@ -861,10 +918,9 @@ impl ReplicationRuntime {
         // CIRISEdge#370/#636 — see [`spawn_scheduler_task`] for the event sink.
         let scheduler_task = spawn_scheduler_task(scheduler, &scheduler_handle, cancel_rx, &config);
 
-        // `directory` is consumed by the bridge above (held inside
-        // `bridge`'s Arc<dyn FederationDirectory>). Drop the local
-        // binding to make the lifecycle explicit.
-        drop(directory);
+        // `directory` was cloned into the bridge above; the local binding ends
+        // with this scope.
+        log_started(&config, peers.len(), proactive_publish);
 
         Self {
             transport,

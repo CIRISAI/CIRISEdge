@@ -177,7 +177,11 @@ impl BlobChunkSource for PersistBlobChunkSource {
     /// mapping to make here, and inventing one would arm the #499 scope
     /// gate with a guess. `None` refuses the serve on a scope-native node,
     /// which is the correct posture: a deployment that installs an address
-    /// table overrides this with the scope it actually knows.
+    /// table overrides this with the scope it actually knows — and declares
+    /// it with `answers_scope() -> true`, which this source deliberately does
+    /// NOT: a scope-native node that wires this source bare is refused at
+    /// build (`scope_native_chunk_source_gate`, CIRISEdge#640) instead of
+    /// withholding every scoped fetch at runtime.
     async fn chunk_scope(&self, _blob_sha256: [u8; 32]) -> Option<ContentScope> {
         None
     }
