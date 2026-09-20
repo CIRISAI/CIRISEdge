@@ -2547,6 +2547,13 @@ impl PyEdge {
             door.set_item(label.as_str(), *n)?;
         }
         root.set_item("bootstrap_door_outcomes", door)?;
+        // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
+        // a missing install and a membership refusal are two numbers.
+        let route_refusals = pyo3::types::PyDict::new(py);
+        for (label, n) in &bundle.blob_route_refusals {
+            route_refusals.set_item(label.as_str(), *n)?;
+        }
+        root.set_item("blob_route_refusals", route_refusals)?;
         root.set_item(
             "replication_routed_to_responder_total",
             bundle.replication_routed_to_responder_total,

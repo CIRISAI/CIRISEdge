@@ -1,5 +1,34 @@
 # CIRISEdge Release Notes
 
+# v26.2.0 — scope-native blob routing: the refusal is the branch; members are nodes (CIRISEdge#640)
+
+**2026-09-20** (PR #641). The chat ladder on v26.1.1 / persist v44.8.1 reached the last rung
+before `arrived=1`: the holder was found and refused `blob_holder_not_in_group` — because the
+host had never driven the scope lifecycle (no `install` on the keyed room) and the router folded
+"the group was never installed" into "not a member" (#433: a refusal reason is the branch, never
+a disjunction).
+
+- **`ScopeRouteRefusal`** splits: `GroupNotInstalled { scope_kind, group_id }` /
+  `HolderNotInGroup { …, current, previous, next }` / `HolderSealedOut { …, sealed_epoch,
+  current }`, decided by ONE diagnostic read, `ScopeAddressTable::member_status`
+  (`GroupNotInstalled` / `Addressable{epoch, role}` / `NotAMember{live}` / `SealedOut{sealed_epoch,
+  live}`; a seal now remembers whom it sealed out). A straggler addressable at a non-send epoch is
+  **routed at that epoch** instead of refused. Tags: `blob_group_not_installed`,
+  `blob_holder_not_in_group`, `blob_holder_sealed_out`; counted by branch in
+  `blob_route_refusals` (snapshot + pyo3 dict); the pull-side WARN prints `installed_groups=[…]`
+  beside a missing-install refusal.
+- **Members are nodes.** `cohort_addressing::snapshot_for_nodes(&group, &lens)` walks a room's
+  person roster to nodes through the contact ladder's one resolution and returns the snapshot the
+  lifecycle takes plus `unresolved` (members whose nodes are not known yet). `snapshot` is
+  documented as the raw MLS roster.
+- **A read for diagnosis.** `ScopeAddressTable::groups()` / `ScopeLifecycle::groups()` /
+  `BlobScopeRouter::installed_groups()`: every installed group with its live epochs, current
+  member count and last sealed epoch. The lifecycle logs `INSTALLED` / `ADVANCED` with operands.
+- `docs/CHAT_HARNESS_INTEGRATION.md` §0: arming scope-native addressing is not driving it — the
+  three verbs the host owns, with the persons→nodes step.
+
+Pins unchanged: persist v44.8.1, verify v15.2.0, leviculum v0.26.0+ciris.1. Wire unchanged (v3).
+
 # v26.1.1 — adopt CIRISPersist v44.8.1: holder claims index with the row
 
 **2026-09-19** (PR #639). persist v44.8.1 (#870/#872): `put_blob_with_scope` and

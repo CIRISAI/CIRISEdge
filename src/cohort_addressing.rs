@@ -59,11 +59,13 @@ pub enum CohortAddressError {
 ///
 /// Identical in form to [`crate::av_addressing::snapshot`] — that is the
 /// point. Downstream writes the same two lines whether it is standing up
-/// a community or a call inside one:
+/// a community or a call inside one — for a community, through
+/// [`snapshot_for_nodes`] (CIRISEdge#640: the MLS roster names persons,
+/// the table's members are nodes):
 ///
 /// ```ignore
-/// let snap = cohort_addressing::snapshot(&community).await?;
-/// lifecycle.install(&scope, &snap)?;
+/// let roster = cohort_addressing::snapshot_for_nodes(&community, &lens).await?;
+/// lifecycle.install(&scope, &roster.snapshot)?;
 /// ```
 ///
 /// `async` only because a `CohortGroup`'s state lives behind the async
@@ -102,6 +104,80 @@ pub fn scope_for(community_id: &str) -> crate::cohort_scope::CohortScope {
     }
 }
 
+/// **The adapter, as the lifecycle needs it (CIRISEdge#640): members are
+/// NODES.** A community's MLS roster names PERSONS — the owners' fed-IDs
+/// that consent and converse — while everything the address table is for
+/// is a node: the lifecycle requires this node's own key in the roster
+/// (`SelfNotInRoster`), the blob router looks a holder up by the key that
+/// signed its `holds_bytes` claim (persist §6.1 (4): the node), and a derived
+/// destination is something a node listens on. Handing [`snapshot`]'s roster
+/// to `install` therefore cannot work for a community; this is the variant
+/// that can.
+///
+/// Every roster entry is walked to *the person, then their nodes* through
+/// the ONE resolution the contact ladder uses ([`crate::contact::resolve`]),
+/// so a roster that already names nodes and one that names persons produce
+/// the same node set. Entries the directory cannot resolve yet are reported
+/// in `unresolved`, not silently dropped: they become addressable on the
+/// next [`crate::scope_lifecycle::ScopeLifecycle::advance`] after their
+/// announce lands, and the host decides whether to wait or install now.
+///
+/// ```ignore
+/// let members = cohort_addressing::snapshot_for_nodes(&community, &lens).await?;
+/// lifecycle.install(&scope, &members.snapshot)?;
+/// ```
+///
+/// # Errors
+/// [`CohortAddressError::Exporter`] on corrupted group state.
+pub async fn snapshot_for_nodes(
+    group: &CohortGroup,
+    lens: &dyn crate::contact::DirectoryLens,
+) -> Result<NodeRoster, CohortAddressError> {
+    let mut snap = snapshot(group).await?;
+    let persons = std::mem::take(&mut snap.members);
+    let mut nodes: Vec<String> = Vec::with_capacity(persons.len());
+    let mut unresolved: Vec<(String, crate::contact::LadderStall)> = Vec::new();
+    for member in persons {
+        match crate::contact::resolve(lens, &member).await {
+            Ok(subject) => nodes.extend(subject.nodes),
+            Err(stall) => unresolved.push((member, stall)),
+        }
+    }
+    nodes.sort();
+    nodes.dedup();
+    if !unresolved.is_empty() {
+        tracing::warn!(
+            group = %snap.group_id,
+            epoch = snap.epoch,
+            resolved_nodes = nodes.len(),
+            unresolved = ?unresolved,
+            "cohort roster: some members resolve to no node yet — they are NOT in this \
+             epoch's address set and become addressable on the next advance after their \
+             announce lands (CIRISEdge#640)"
+        );
+    }
+    snap.members = nodes;
+    Ok(NodeRoster {
+        snapshot: snap,
+        unresolved,
+    })
+}
+
+/// [`snapshot_for_nodes`]'s answer: the node-membered snapshot the lifecycle
+/// takes, plus the roster entries that resolved to no node yet.
+#[derive(Debug)]
+pub struct NodeRoster {
+    pub snapshot: ScopeGroupSnapshot,
+    /// Roster entries (persons) the directory could not walk to a node, with
+    /// why. Empty on a converged directory.
+    pub unresolved: Vec<(String, crate::contact::LadderStall)>,
+}
+
+/// **The raw adapter.** Reduce a group to the one shape the lifecycle takes,
+/// with the members EXACTLY as the MLS roster names them. For a community
+/// that is persons, which the lifecycle refuses (`SelfNotInRoster`) — use
+/// [`snapshot_for_nodes`] for a community. This form is right when the
+/// roster already names nodes (a test group keyed by node ids).
 pub async fn snapshot(group: &CohortGroup) -> Result<ScopeGroupSnapshot, CohortAddressError> {
     // Three separate reads rather than one lock: a concurrent commit
     // could in principle land between them, which is harmless HERE —
@@ -150,6 +226,87 @@ mod tests {
         ScopeStateProvider::new(Arc::new(
             XChaChaKvStore::open_in_memory(b"cohort-addressing-test").unwrap(),
         ))
+    }
+
+    /// CIRISEdge#640 — a community's MLS roster names PERSONS; the table's
+    /// members are NODES. `snapshot_for_nodes` walks each person to their
+    /// nodes through the contact ladder's one resolution, so the lifecycle
+    /// (which requires THIS NODE in the roster) installs, and the blob router
+    /// (which looks a holder up by its node key) routes. A person the
+    /// directory cannot resolve yet is reported, not dropped silently.
+    #[tokio::test]
+    async fn a_community_of_persons_installs_as_its_nodes() {
+        struct Lens;
+        #[async_trait::async_trait]
+        impl crate::contact::DirectoryLens for Lens {
+            async fn identity_type_of(&self, key_id: &str) -> Option<String> {
+                match key_id {
+                    "alice-fed" | "bob-fed" | "carol-fed" => Some("user".into()),
+                    "node-a" | "node-b1" | "node-b2" => Some("node".into()),
+                    _ => None,
+                }
+            }
+            async fn owner_of(&self, key_id: &str) -> Option<String> {
+                match key_id {
+                    "node-a" => Some("alice-fed".into()),
+                    "node-b1" | "node-b2" => Some("bob-fed".into()),
+                    _ => None,
+                }
+            }
+            async fn nodes_owned_by(&self, fed_id: &str) -> Vec<String> {
+                match fed_id {
+                    "alice-fed" => vec!["node-a".into()],
+                    "bob-fed" => vec!["node-b1".into(), "node-b2".into()],
+                    _ => Vec::new(), // carol has announced no node yet
+                }
+            }
+        }
+        // The MLS group is keyed by PERSONS, as a chat room's is.
+        let group = CohortGroup::create(store(), "room-1", "alice-fed", 16)
+            .await
+            .unwrap();
+        let raw = snapshot(&group).await.unwrap();
+        assert_eq!(
+            raw.members,
+            vec!["alice-fed".to_owned()],
+            "the raw roster is persons"
+        );
+
+        let roster = snapshot_for_nodes(&group, &Lens).await.unwrap();
+        assert_eq!(roster.snapshot.members, vec!["node-a".to_owned()]);
+        assert!(roster.unresolved.is_empty());
+        assert_eq!(roster.snapshot.group_id, group_id_for("room-1"));
+
+        // The lifecycle on node-a installs it: node-a IS in the roster.
+        let (life, table) = node("node-a");
+        life.install(&scope_for("room-1"), &roster.snapshot)
+            .unwrap();
+        assert!(table
+            .send_address(&scope_for("room-1"), &group_id_for("room-1"), "node-a")
+            .is_some());
+        // The raw (person) snapshot is refused by the same lifecycle.
+        let (life2, _) = node("node-a");
+        assert!(matches!(
+            life2.install(&scope_for("room-1"), &raw),
+            Err(crate::scope_lifecycle::ScopeLifecycleError::SelfNotInRoster { .. })
+        ));
+
+        // A person with no announced node is reported, not silently dropped.
+        let mut snap = snapshot(&group).await.unwrap();
+        snap.members = vec!["bob-fed".into(), "carol-fed".into()];
+        // Drive the walk over a hand-built roster through the same function
+        // shape: resolve each member.
+        let mut nodes = Vec::new();
+        let mut unresolved = Vec::new();
+        for m in &snap.members {
+            match crate::contact::resolve(&Lens, m).await {
+                Ok(s) => nodes.extend(s.nodes),
+                Err(e) => unresolved.push((m.clone(), e)),
+            }
+        }
+        assert_eq!(nodes, vec!["node-b1".to_owned(), "node-b2".to_owned()]);
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].0, "carol-fed");
     }
 
     /// CIRISEdge#616 — the router looks a community up under

@@ -69,7 +69,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::cohort_scope::CohortScope;
-use crate::scope_addressing::{InboundAddress, MemberAddress, ScopeAddressTable};
+use crate::scope_addressing::{InboundAddress, MemberAddress, MemberStatus, ScopeAddressTable};
 
 /// v18 — has the unarmed-gate staging WARN fired this process?
 static BLOB_SCOPE_GATE_UNARMED_WARNED: AtomicBool = AtomicBool::new(false);
@@ -251,15 +251,31 @@ pub enum ScopeRouteRefusal {
         /// The MLS group id the content is bound to.
         group_id: String,
     },
-    /// A table is installed but this holder has no derived address in the
-    /// content's group — it is not a member at any live epoch, or it was
-    /// excluded at a rotation seal. Either way we cannot address it for
+    /// A table is installed but THIS GROUP was never installed in it — no
+    /// epoch, no member, nothing to look a holder up in (CIRISEdge#640). This
+    /// is the host's scope lifecycle not being driven for the group
+    /// (`ScopeLifecycle::install` on a keyed room), not roster policy: the
+    /// remedy is an install, and no holder can be addressed until one lands.
+    /// Pre-#640 this was folded into `HolderNotInGroup` — a disjunction that
+    /// sent a missing install to be read as a membership refusal.
+    #[error(
+        "blob scope routing: '{scope_kind}' group '{group_id}' is NOT INSTALLED in \
+         the scope address table — no epoch exists to address any holder at; the \
+         host's scope lifecycle has not installed this group (CIRISEdge#640)"
+    )]
+    GroupNotInstalled {
+        /// [`CohortScope::kind_token`] of the content's scope.
+        scope_kind: &'static str,
+        /// The MLS group id the content is bound to.
+        group_id: String,
+    },
+    /// The group is installed but this holder is not a member at any live
+    /// epoch (and was not at the last sealed one). We cannot address it for
     /// this content, and must not address it for this content.
     #[error(
-        "blob scope routing: holder '{peer_key_id}' has NO derived address in \
-         '{scope_kind}' group '{group_id}' (not a member at any live epoch, or \
-         excluded at a rotation seal) — this holder cannot be asked for this \
-         blob (CIRISEdge#499)"
+        "blob scope routing: holder '{peer_key_id}' is NOT A MEMBER of '{scope_kind}' \
+         group '{group_id}' at any live epoch (current={current}, previous={previous:?}, \
+         next={next:?}) — this holder cannot be asked for this blob (CIRISEdge#499/#640)"
     )]
     HolderNotInGroup {
         /// The holder we could not address.
@@ -268,6 +284,34 @@ pub enum ScopeRouteRefusal {
         scope_kind: &'static str,
         /// The MLS group id the content is bound to.
         group_id: String,
+        /// The send epoch.
+        current: u64,
+        /// The superseded epoch still accepted, if a rotation is unsealed.
+        previous: Option<u64>,
+        /// The installed-not-yet-primary epoch, if a rotation is under way.
+        next: Option<u64>,
+    },
+    /// The holder WAS a member at an epoch a rotation has since sealed, and
+    /// did not re-key before the convergence window closed. Distinct from
+    /// never having been a member: the remedy is readmission at the live
+    /// epoch, not a roster change (CIRISEdge#640).
+    #[error(
+        "blob scope routing: holder '{peer_key_id}' was SEALED OUT of '{scope_kind}' \
+         group '{group_id}' — addressable at epoch {sealed_epoch}, which the rotation \
+         sealed before it re-keyed (current epoch {current}); readmission needs a fresh \
+         install at the live epoch (CIRISEdge#640)"
+    )]
+    HolderSealedOut {
+        /// The holder we could not address.
+        peer_key_id: String,
+        /// [`CohortScope::kind_token`] of the content's scope.
+        scope_kind: &'static str,
+        /// The MLS group id the content is bound to.
+        group_id: String,
+        /// The epoch the holder was last addressable at.
+        sealed_epoch: u64,
+        /// The send epoch now.
+        current: u64,
     },
     /// The content declared [`ContentScope::Group`] with a `Public`
     /// cohort scope. Refused for exactly the reason
@@ -297,7 +341,9 @@ impl ScopeRouteRefusal {
         match self {
             Self::ScopeUndeterminable => "blob_scope_undeterminable",
             Self::NoAddressTable { .. } => "blob_no_address_table",
+            Self::GroupNotInstalled { .. } => "blob_group_not_installed",
             Self::HolderNotInGroup { .. } => "blob_holder_not_in_group",
+            Self::HolderSealedOut { .. } => "blob_holder_sealed_out",
             Self::PublicIsNotScoped { .. } => "blob_public_is_not_scoped",
         }
     }
@@ -339,6 +385,14 @@ impl BlobScopeRouter {
     #[must_use]
     pub fn is_scope_native(&self) -> bool {
         self.table.is_some()
+    }
+
+    /// CIRISEdge#640 — every group installed in this node's address table,
+    /// or an empty list on a legacy (table-less) node. The one-line fact a
+    /// `GroupNotInstalled` refusal is printed beside.
+    #[must_use]
+    pub fn installed_groups(&self) -> Vec<crate::scope_addressing::GroupSummary> {
+        self.table.as_ref().map(|t| t.groups()).unwrap_or_default()
     }
 
     /// Resolve `peer_key_id` to the address this content's bytes must
@@ -402,15 +456,49 @@ impl BlobScopeRouter {
         // CIRISEdge#616 — look up under the key the INSTALLER used (see
         // `table_group_id`), or every community holder reads not-in-group.
         let table_group_id = table_group_id(scope, group_id);
-        match table.send_address(scope, &table_group_id, peer_key_id) {
-            Some(address) => Ok(BlobRecipient {
+        if let Some(address) = table.send_address(scope, &table_group_id, peer_key_id) {
+            return Ok(BlobRecipient {
                 peer_key_id: peer_key_id.to_owned(),
                 route: BlobRoute::Scoped(address),
+            });
+        }
+        // CIRISEdge#640 — the refusal is the BRANCH (#433): ask the table WHY
+        // there is no send address, and say exactly that. `member_status` is
+        // the one diagnostic read; this arm adds no rule of its own. A member
+        // addressable at a NON-send epoch (a straggler on `previous`, a peer
+        // that advanced to `next` before us) is still reachable at that epoch
+        // — the table's make-before-break window exists for exactly them.
+        match table.member_status(scope, &table_group_id, peer_key_id) {
+            MemberStatus::Addressable { epoch, .. } => table
+                .address_at(scope, &table_group_id, epoch, peer_key_id)
+                .map(|address| BlobRecipient {
+                    peer_key_id: peer_key_id.to_owned(),
+                    route: BlobRoute::Scoped(address),
+                })
+                .ok_or_else(|| ScopeRouteRefusal::GroupNotInstalled {
+                    scope_kind: scope.kind_token(),
+                    group_id: group_id.clone(),
+                }),
+            MemberStatus::GroupNotInstalled => Err(ScopeRouteRefusal::GroupNotInstalled {
+                scope_kind: scope.kind_token(),
+                group_id: group_id.clone(),
             }),
-            None => Err(ScopeRouteRefusal::HolderNotInGroup {
+            MemberStatus::SealedOut { sealed_epoch, live } => {
+                Err(ScopeRouteRefusal::HolderSealedOut {
+                    peer_key_id: peer_key_id.to_owned(),
+                    scope_kind: scope.kind_token(),
+                    group_id: group_id.clone(),
+                    sealed_epoch,
+                    current: live.current,
+                })
+            }
+            MemberStatus::NotAMember { live } => Err(ScopeRouteRefusal::HolderNotInGroup {
                 peer_key_id: peer_key_id.to_owned(),
                 scope_kind: scope.kind_token(),
                 group_id: group_id.clone(),
+                current: live.current,
+                previous: live.previous,
+                next: live.next,
             }),
         }
     }
@@ -805,18 +893,112 @@ mod tests {
         let err = router
             .route(Some(&family_content()), "ed25519:mallory")
             .expect_err("mallory is not in fam-1");
+        assert!(
+            matches!(
+                &err,
+                ScopeRouteRefusal::HolderNotInGroup {
+                    peer_key_id,
+                    scope_kind: "family",
+                    group_id,
+                    ..
+                } if peer_key_id == "ed25519:mallory" && group_id == "fam-1"
+            ),
+            "{err:?}"
+        );
+        assert!(
+            router.route(Some(&family_content()), BOB).is_ok(),
+            "a member is still routable — the refusal is holder-specific",
+        );
+    }
+
+    // ── CIRISEdge#640 — the refusal is the branch ─────────────────────
+
+    /// The server's case: the table is installed (the node is scope-native)
+    /// but THIS room was never installed by the host's lifecycle. Every
+    /// holder used to read "not a member" — a disjunction that sent the RCA
+    /// to roster policy. Now it names the missing install.
+    #[test]
+    fn a_group_that_was_never_installed_is_named_as_such_not_as_a_membership_refusal() {
+        let router = BlobScopeRouter::new(Some(table()));
+        let uninstalled = ContentScope::Group {
+            scope: cohort("neighbourhood"),
+            group_id: "chat:pair:v1:34c1afee".to_owned(),
+        };
+        for holder in [ALICE, BOB, "ed25519:mallory"] {
+            let err = router
+                .route(Some(&uninstalled), holder)
+                .expect_err("no epoch to address at");
+            assert_eq!(
+                err,
+                ScopeRouteRefusal::GroupNotInstalled {
+                    scope_kind: "cohort",
+                    group_id: "chat:pair:v1:34c1afee".to_owned(),
+                },
+                "holder {holder}"
+            );
+            assert_eq!(err.reason_tag(), "blob_group_not_installed");
+        }
+        // ...and an installed group in the same table is untouched.
+        assert!(router.route(Some(&community_content()), BOB).is_ok());
+    }
+
+    /// A holder that was a member at an epoch a rotation has sealed is
+    /// SEALED OUT — its own branch, with the sealed epoch named — while a
+    /// holder that was never a member stays `HolderNotInGroup` with the
+    /// live epochs named.
+    #[test]
+    fn a_sealed_out_holder_and_a_never_member_are_different_refusals() {
+        let t = ScopeAddressTable::new(Arc::new(StubDeriver));
+        t.install_group(&CohortScope::Family, "fam-1", 1, &[0xA1; 32], &MEMBERS)
+            .expect("install");
+        // Rotate to epoch 2 with bob dropped from the roster, then seal.
+        t.install_next(&CohortScope::Family, "fam-1", 2, &[0xA2; 32], &[ALICE])
+            .expect("install_next");
+        t.activate_next(&CohortScope::Family, "fam-1")
+            .expect("activate");
+        let router = BlobScopeRouter::new(Some(Arc::new(t)));
+        // Before the seal bob is a straggler on the previous epoch: still
+        // addressable there (make-before-break), so still routable.
+        assert!(
+            router.route(Some(&family_content()), BOB).is_ok(),
+            "a straggler on the superseded epoch is addressed at that epoch"
+        );
+        let table = router.table.clone().expect("table");
+        assert_eq!(
+            table
+                .seal_rotation(&CohortScope::Family, "fam-1")
+                .expect("seal"),
+            Some(1)
+        );
+        let err = router
+            .route(Some(&family_content()), BOB)
+            .expect_err("sealed out");
+        assert_eq!(
+            err,
+            ScopeRouteRefusal::HolderSealedOut {
+                peer_key_id: BOB.to_owned(),
+                scope_kind: "family",
+                group_id: "fam-1".to_owned(),
+                sealed_epoch: 1,
+                current: 2,
+            }
+        );
+        assert_eq!(err.reason_tag(), "blob_holder_sealed_out");
+        let err = router
+            .route(Some(&family_content()), "ed25519:mallory")
+            .expect_err("never a member");
         assert_eq!(
             err,
             ScopeRouteRefusal::HolderNotInGroup {
                 peer_key_id: "ed25519:mallory".to_owned(),
                 scope_kind: "family",
                 group_id: "fam-1".to_owned(),
-            },
+                current: 2,
+                previous: None,
+                next: None,
+            }
         );
-        assert!(
-            router.route(Some(&family_content()), BOB).is_ok(),
-            "a member is still routable — the refusal is holder-specific",
-        );
+        assert!(router.route(Some(&family_content()), ALICE).is_ok());
     }
 
     #[test]
@@ -871,10 +1053,26 @@ mod tests {
                 group_id: "g".into(),
             }
             .reason_tag(),
+            ScopeRouteRefusal::GroupNotInstalled {
+                scope_kind: "family",
+                group_id: "g".into(),
+            }
+            .reason_tag(),
             ScopeRouteRefusal::HolderNotInGroup {
                 peer_key_id: "p".into(),
                 scope_kind: "family",
                 group_id: "g".into(),
+                current: 1,
+                previous: None,
+                next: None,
+            }
+            .reason_tag(),
+            ScopeRouteRefusal::HolderSealedOut {
+                peer_key_id: "p".into(),
+                scope_kind: "family",
+                group_id: "g".into(),
+                sealed_epoch: 1,
+                current: 2,
             }
             .reason_tag(),
             ScopeRouteRefusal::PublicIsNotScoped {

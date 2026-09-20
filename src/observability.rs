@@ -890,6 +890,14 @@ pub struct EdgeMetrics {
     /// link was attributed by its announce before any Deliver). The door never
     /// drops, so there is no drop label.
     pub bootstrap_door_outcomes: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#640 — blob holders dropped from a pull's candidate set, by the
+    /// router's refusal BRANCH (`ScopeRouteRefusal::reason_tag`):
+    /// `blob_group_not_installed` (the host's lifecycle never installed the
+    /// room — the remedy is an install), `blob_holder_not_in_group` (roster
+    /// policy), `blob_holder_sealed_out` (a rotation closed before the holder
+    /// re-keyed), `blob_no_address_table`, `blob_scope_undeterminable`,
+    /// `blob_public_is_not_scoped`. Pre-#640 the first three were one number.
+    pub blob_route_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
     /// the live announce-intake map under **capacity backpressure** (the
     /// `MAX_PEERS` cap in `transport::reticulum`).
@@ -1156,6 +1164,15 @@ impl EdgeMetrics {
         )
     }
 
+    /// CIRISEdge#640 — count one blob-route refusal by its branch tag.
+    pub fn inc_blob_route_refusal(&self, reason_tag: &'static str) {
+        *self
+            .blob_route_refusals
+            .write()
+            .entry(reason_tag)
+            .or_insert(0) += 1;
+    }
+
     /// CIRISEdge#636 — count one bootstrap-door decision by its label.
     pub fn inc_bootstrap_door(&self, decision: &'static str) {
         *self
@@ -1373,6 +1390,12 @@ impl EdgeMetrics {
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
+            blob_route_refusals: self
+                .blob_route_refusals
+                .read()
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
             bootstrap_door_outcomes: self
                 .bootstrap_door_outcomes
                 .read()
@@ -1426,6 +1449,8 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#373 — cumulative inbound frames dropped on coordinator
     /// channel back-pressure (previously a silent WARN).
     pub replication_inbound_backpressure_drops: u64,
+    /// CIRISEdge#640 — blob holders dropped from a pull by refusal branch.
+    pub blob_route_refusals: HashMap<String, u64>,
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
     /// `unbound` / `not_applicable`). The door never drops.
     pub bootstrap_door_outcomes: HashMap<String, u64>,

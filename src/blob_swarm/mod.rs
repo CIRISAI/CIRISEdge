@@ -1028,11 +1028,13 @@ impl SwarmScheduler {
         // The router reads its table from the transport, so "is this node
         // scope-native" has one source of truth (see `Edge::blob_scope_router`).
         let scope_router = self.edge.blob_scope_router();
+        let metrics = self.edge.metrics();
         let routes = resolve_holder_routes(
             &scope_router,
             meaning.as_ref().map(meaning::BlobMeaning::scope),
             &holders,
             &blob_hex,
+            Some(&metrics),
         )
         .map_err(|reason| SwarmError::ScopeUnroutable {
             blob_sha: blob_hex.clone(),
@@ -1407,6 +1409,7 @@ fn resolve_holder_routes(
     content_scope: Option<&ContentScope>,
     holders: &[String],
     blob_hex: &str,
+    metrics: Option<&crate::observability::EdgeMetrics>,
 ) -> Result<HashMap<String, BlobRecipient>, String> {
     let mut routes: HashMap<String, BlobRecipient> = HashMap::with_capacity(holders.len());
     let mut first_refusal: Option<String> = None;
@@ -1416,13 +1419,34 @@ fn resolve_holder_routes(
                 routes.insert(holder.clone(), recipient);
             }
             Err(refusal) => {
+                // CIRISEdge#640 — counted by BRANCH (`reason_tag`), so a
+                // missing install and a membership refusal are two numbers.
+                if let Some(m) = metrics {
+                    m.inc_blob_route_refusal(refusal.reason_tag());
+                }
                 // Loud, never a bare `continue` (CIRISEdge#425). One line per
                 // unroutable holder; the holder set is caller-supplied and small
-                // (persist's `list_holders`), so this is bounded.
+                // (persist's `list_holders`), so this is bounded. A missing
+                // install prints WHAT the table does hold, so "the table is
+                // empty" is a fact on the line, not an inference (#640).
+                let installed: Vec<String> = match &refusal {
+                    ScopeRouteRefusal::GroupNotInstalled { .. } => scope_router
+                        .installed_groups()
+                        .into_iter()
+                        .map(|g| {
+                            format!(
+                                "{}/{}@{}({} members)",
+                                g.scope_kind, g.group_id, g.epochs.current, g.members_current
+                            )
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
                 tracing::warn!(
                     blob_sha = %blob_hex,
                     holder = %holder,
                     reason = refusal.reason_tag(),
+                    installed_groups = ?installed,
                     "blob holder DROPPED from the swarm candidate set — no address for \
                      this content's scope. NOT retried at the federation address: {refusal}",
                 );
@@ -1685,6 +1709,7 @@ mod tests {
                 Some(&community_blob()),
                 &holders(&[ALICE, BOB]),
                 "deadbeef",
+                None,
             )
             .expect("both holders are members");
 
@@ -1725,6 +1750,7 @@ mod tests {
                 Some(&ContentScope::Federation),
                 &holders(&[ALICE, BOB, "ed25519:mallory"]),
                 "deadbeef",
+                None,
             )
             .expect("public content always routes");
 
@@ -1745,9 +1771,14 @@ mod tests {
             // production deployment today. `None` scope is what the pre-#499
             // `fetch_blob` entry point supplies.
             let scope_router = BlobScopeRouter::default();
-            let routes =
-                resolve_holder_routes(&scope_router, None, &holders(&[ALICE, BOB]), "deadbeef")
-                    .expect("legacy nodes route unconditionally");
+            let routes = resolve_holder_routes(
+                &scope_router,
+                None,
+                &holders(&[ALICE, BOB]),
+                "deadbeef",
+                None,
+            )
+            .expect("legacy nodes route unconditionally");
             assert_eq!(routes.len(), 2);
             for r in routes.values() {
                 assert!(!r.is_scoped(), "byte-identical to pre-#499");
@@ -1762,6 +1793,7 @@ mod tests {
                 Some(&community_blob()),
                 &holders(&[ALICE, "ed25519:mallory", BOB]),
                 "deadbeef",
+                None,
             )
             .expect("two of three holders are members");
 
@@ -1783,6 +1815,7 @@ mod tests {
                 Some(&community_blob()),
                 &holders(&["ed25519:mallory", "ed25519:trudy"]),
                 "deadbeef",
+                None,
             )
             .expect_err("no holder is a member");
             assert!(
@@ -1797,6 +1830,7 @@ mod tests {
                     Some(&community_blob()),
                     &holders(&[ALICE]),
                     "deadbeef",
+                    None,
                 )
                 .is_ok(),
                 "a legitimate member must still route under the identical call",
@@ -1806,8 +1840,9 @@ mod tests {
         #[test]
         fn an_undeterminable_scope_is_refused_on_a_scope_native_node_only() {
             let native = BlobScopeRouter::new(Some(table()));
-            let err = resolve_holder_routes(&native, None, &holders(&[ALICE, BOB]), "deadbeef")
-                .expect_err("unknown scope on a scope-native node");
+            let err =
+                resolve_holder_routes(&native, None, &holders(&[ALICE, BOB]), "deadbeef", None)
+                    .expect_err("unknown scope on a scope-native node");
             assert!(
                 err.contains("UNDETERMINABLE"),
                 "the refusal must name the undeterminable scope: {err}",
@@ -1819,14 +1854,16 @@ mod tests {
                 &native,
                 Some(&community_blob()),
                 &holders(&[ALICE]),
-                "deadbeef"
+                "deadbeef",
+                None
             )
             .is_ok());
             assert!(resolve_holder_routes(
                 &native,
                 Some(&ContentScope::Federation),
                 &holders(&[ALICE]),
-                "deadbeef"
+                "deadbeef",
+                None
             )
             .is_ok());
 
@@ -1836,7 +1873,8 @@ mod tests {
                     &BlobScopeRouter::default(),
                     None,
                     &holders(&[ALICE]),
-                    "deadbeef"
+                    "deadbeef",
+                    None
                 )
                 .is_ok(),
                 "arming the gate on a node that cannot derive addresses would break \

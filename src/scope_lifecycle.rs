@@ -299,6 +299,14 @@ impl ScopeLifecycle {
         &self.table
     }
 
+    /// CIRISEdge#640 — every installed group with its live epochs and
+    /// member count. The diagnostic read: an empty list on a keyed room is
+    /// the host not having driven [`Self::install`], stated as a fact.
+    #[must_use]
+    pub fn groups(&self) -> Vec<crate::scope_addressing::GroupSummary> {
+        self.table.groups()
+    }
+
     /// How long a superseded epoch stays reachable after being
     /// superseded.
     ///
@@ -434,6 +442,19 @@ impl ScopeLifecycle {
             self.leave(scope, group_id);
             return Err(ScopeLifecycleError::Register(e));
         }
+        // CIRISEdge#640 — the install is the fact the blob router's
+        // `GroupNotInstalled` refusal points at; say it once, with the
+        // operands, so "the table is empty" is never inferred from a refusal.
+        tracing::info!(
+            scope = scope.kind_token(),
+            group = %group_id,
+            epoch,
+            members = members.len(),
+            derived,
+            own_address = %hex::encode(own.as_bytes()),
+            "scope lifecycle INSTALLED a group — its members are addressable at this epoch \
+             and this node listens on its own derived address (CIRISEdge#499/#640)"
+        );
         Ok(TransitionOutcome {
             derived,
             epoch,
@@ -482,6 +503,16 @@ impl ScopeLifecycle {
             // Surfacing the failure is the honest move.
             return Err(ScopeLifecycleError::Register(e));
         }
+        tracing::info!(
+            scope = scope.kind_token(),
+            group = %group_id,
+            epoch,
+            members = members.len(),
+            derived,
+            convergence_secs = self.convergence.as_secs(),
+            "scope lifecycle ADVANCED a group to a new epoch — make-before-break; the \
+             superseded epoch stays addressable until the seal (CIRISEdge#499/#640)"
+        );
 
         if let Some(retiring) = outgoing {
             let displaced = self
