@@ -683,11 +683,14 @@ mod tests {
     /// must never reach, arrived at by accident.
     #[test]
     fn a_holds_bytes_row_is_possession_and_never_meaning() {
+        // v45.0.0 (CIRISPersist#871, AV-89) — the claim carries the blob's
+        // byte length; any value serves a projection test that never stores.
         let real = ciris_persist::federation::blobs::holds_bytes_attestation_row(
             &SHA,
             "alice",
             "hb-1",
             chrono::DateTime::from_timestamp(1_767_225_296, 0).expect("ts"),
+            42,
         );
         // It genuinely references the blob, and its column genuinely says
         // `federation` — so only the by-name refusal stands between this row

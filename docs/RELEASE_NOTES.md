@@ -1,5 +1,33 @@
 # CIRISEdge Release Notes
 
+# v28.0.0 — adopt CIRISPersist v45.0.1: an occurrence resolves to its principal; size on every holder claim
+
+**2026-09-20** (PR #643). MAJOR because persist is: the wheel floor moves to `ciris-persist>=45,<46`.
+
+**v45.0.1 (#873 / #875) — the last inch of `arrived`.** `lookup_identity_for_occurrence` was `LIMIT 1`
+with no order, so a claimed node (its boot self-occurrence AND its owner's login anchor both correct)
+resolved to *itself*, `would_hold` saw a node "not party" to a room its owner founded, and every
+community blob a non-author pulled was refused at adopt (`StoreFailed(NotPartyTo)` in the puller).
+Now `active_identities_for_occurrence` (plural, newest binding first), ordered lookups on all three
+backends, `audience_memberships` unioning every principal. Edge has no code on this path — the refusal
+surfaced from persist's adopt door, which is where it belongs; it should not surface at all now.
+
+**v45.0.0 (#871 / #874) — the multimedia Source struct.** The `holds_bytes` claim carries `size`,
+bound into the signed bytes (CC 5.3.2.5 / AV-89): both blob doors pass the length they store and
+refuse a claim declaring another; **the ingest door refuses a claim without one** — a mixed fleet's
+pre-v45 holder claims are refused by a v45 node, so cross the fleet together. `paths::MEDIA`,
+`ENVELOPE_VOCABULARY_SHA256` re-pin (persist's; edge's CC 0.7 `WIRE_VOCABULARY_HASH` is a separate
+pin and unmoved), V149 `blob_renditions`, `list_holders_sized`, `store_plaintext_local`, PyO3
+mirrors. Edge's only touch: the two hand-built holder-row fixtures pass the length (edge mints no
+holder claims of its own; persist's doors do).
+
+All four ABI constants unmoved (`DIRECTORY 5`, `SIGNER 1`, `OUTBOUND_QUEUE 1`, `ASYNC_EXECUTOR 1`);
+one copy each of verify/keyring/crypto. Pins: persist **v45.0.1**, verify v15.2.0, leviculum
+v0.26.0+ciris.1. Wire unchanged (v3). Ladder pair: **edge v28.0.0 + persist v45.0.1**.
+
+Follow-on worth taking: the puller can bound each fetch by the claim's `size` before hashing
+(`list_holders_sized`), as CC 5.3.2.5 asks of every consumer.
+
 # v27.0.0 — the half-wired states are unconstructible: `answers_scope` (serve) and `SealedContentWiring` (receive) (CIRISEdge#640, the third and fourth hooks)
 
 **2026-09-20** (PR #642). The ladder on v26.2.0 got the holder routed and dialed, and the creator

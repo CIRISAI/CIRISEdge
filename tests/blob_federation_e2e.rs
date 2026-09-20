@@ -650,11 +650,16 @@ async fn holds_bytes_says_possession_and_never_meaning() {
     // CONTENT and hand the store gate an audience to be inside of. Every
     // blob on the node would classify that way, since persist emits one of
     // these for each.
+    // v45.0.0 (CIRISPersist#871, AV-89) — the claim carries the blob's
+    // byte length, bound into the signed bytes; this fixture is a hand-built
+    // row for a meaning-projection assertion, never a door write, so the
+    // length is the one true value for the bytes above.
     let mut holder_row = ciris_persist::federation::blobs::holds_bytes_attestation_row(
         &sha,
         &alice.key_id,
         "hb-1",
         ts(),
+        u64::try_from(b"\x00\x01\x02 unexplained bytes".len()).expect("len"),
     );
     assert_eq!(
         holder_row.cohort_scope,
