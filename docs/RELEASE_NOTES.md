@@ -24,13 +24,25 @@ for authorship and placement, the POINTER for the key plane (community, epoch, *
 pin both. (The three harness fixtures that hand-build a provenance now NAME the minter — the sealing
 engine — the same distinction seen from the producer side.)
 
+**Chat blobs are not special (CIRISEdge#646).** Every chat row now carries its blob's sha in
+`evidence_refs` beside the typed `BlobPointer` — the pointer says how to OPEN the bytes (tier,
+epoch, community, field), the citation is the RELATION every consumer reads: persist's
+`attestations_binding_content` / `envelope_binds_content`, and edge's own revocation register,
+whose module docs had already named this residual and its closure ("producers carry the sha in
+`evidence_refs`", as CIRISVerify#281 did for manifests). A pointer-only row was invisible to all of
+them. `chat_row` cites structurally — any envelope member that deserializes as a `BlobPointer` — so
+attachments and any future blob-bearing chat row are covered by construction, and a row with no
+blob gains no empty array. Producer-side only; existing rows stay valid and the pointer is
+unchanged.
+
 `BlobProvenance::from_attestation` is **not** used yet, and that is a finding, not a preference:
 it requires the sha in `evidence_refs` while every edge producer references its blob with a typed
 `BlobPointer`, and it resolves the tier from the ROW's `cohort_scope` while a chat row sits at
 `self` scope with its body sealed under the room's DEK. Using it refused every chat row after the
 bytes were already downloaded, and where it did not, adopted community-DEK ciphertext as
-`InvisibleEncrypted`. Filed as **CIRISPersist#878**; edge switches to the constructor when it
-accepts a pointer reference. (Both caught by Codex review on PR #644 — two P1s, both real.)
+`InvisibleEncrypted`. #646 closes the first half — edge's rows now cite — but the tier axis is
+persist's: filed as **CIRISPersist#878**, and edge switches to the constructor when it resolves the
+tier from the pointer. (Both P1s caught by Codex review on PR #644; both real.)
 
 All four ABI constants unmoved (`DIRECTORY 5`, `SIGNER 1`, `OUTBOUND_QUEUE 1`, `ASYNC_EXECUTOR 1`);
 one copy each of verify/keyring/crypto; JSON wire compatible (the break is the Rust struct literal).

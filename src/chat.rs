@@ -429,6 +429,37 @@ impl PairRole {
 /// `cohort_scope: self` by `author`, bound (canonical instant + row mirror),
 /// hybrid-signed at write. `members` is the row's own payload, on top of the
 /// dimension, the room and the `score` a `scores` row carries.
+/// CIRISEdge#646 — the content sha a typed [`BlobPointer`](crate::group_content::BlobPointer)
+/// member cites, if this envelope member IS one. Deliberately structural
+/// (deserialize into the type) rather than a `content_sha256` key probe, so a
+/// member that merely happens to carry that key is not mistaken for a
+/// reference — the same test `BlobMeaning::referenced_shas` applies.
+fn pointer_sha(member: &serde_json::Value) -> Option<String> {
+    if !member.is_object() {
+        return None;
+    }
+    serde_json::from_value::<crate::group_content::BlobPointer>(member.clone())
+        .ok()
+        .map(|p| p.content_sha256)
+}
+
+/// CIRISEdge#646 — add `sha` to the envelope's `evidence_refs`, creating the
+/// array if absent and never duplicating. This is the CEG-native relation
+/// between an attestation and a blob (CEG RC27 §11.10); persist's binding
+/// predicate reads nothing else.
+fn cite_evidence(envelope: &mut serde_json::Value, sha: &str) {
+    let refs = envelope
+        .as_object_mut()
+        .expect("chat envelopes are objects")
+        .entry("evidence_refs")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    if let Some(arr) = refs.as_array_mut() {
+        if !arr.iter().any(|r| r.as_str() == Some(sha)) {
+            arr.push(serde_json::Value::String(sha.to_owned()));
+        }
+    }
+}
+
 async fn chat_row(
     author: &crate::identity::LocalSigner,
     room: &str,
@@ -449,7 +480,21 @@ async fn chat_row(
         // for chat, and a positive constant is the honest "this was said".
         "score": 1.0,
     });
+    // CIRISEdge#646 — **a blob is cited the blob-native way, always.** A typed
+    // `BlobPointer` carries the key-plane facts needed to OPEN the bytes (tier,
+    // epoch, community, field); `evidence_refs` is the RELATION persist indexes
+    // and every consumer reads: `attestations_binding_content`,
+    // `envelope_binds_content`, `BlobProvenance::from_attestation`, and the
+    // revocation register's "every known reference" set. A pointer-only row is
+    // invisible to all of them — `blob_swarm::revocation`'s own module docs
+    // named this residual and its closure ("producers carry the sha in
+    // `evidence_refs`", as CIRISVerify#281 did for manifests). Chat blobs are
+    // not special, so a chat row carries BOTH: the pointer to open, the
+    // citation to be found.
     for (k, v) in members {
+        if let Some(sha) = pointer_sha(&v) {
+            cite_evidence(&mut envelope, &sha);
+        }
         envelope[k] = v;
     }
     // Deterministic per (dimension, room, author, instant, payload) so a retry
