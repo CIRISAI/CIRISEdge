@@ -1,5 +1,36 @@
 # CIRISEdge Release Notes
 
+# v29.1.0 — adopt CIRISPersist v46.1.0: the provenance reads the key plane from the pointer, and edge deletes its builder
+
+**2026-09-21** (PR #645). MINOR: the wheel floor stays `>=46,<47`; no edge API moves.
+
+v46.1.0 (CIRISPersist#878/#883) implements the rule the #878 discussion settled, with the guards a
+caller could not write:
+
+- a typed `BlobPointer` at the bytes **is** a reference, so a row that cites by pointer is accepted;
+- the **POINTER is authoritative for the key plane** (tier, community, epoch) — the owner's own
+  second node holds a `self` row pointing at community-DEK ciphertext, and reading the tier off the
+  scope answered `InvisibleEncrypted` for it;
+- the **ROW's placement stands** as the access grant. The pointer never widens a cohort: reading a
+  wider audience off it would grant party-to the signer never signed for. A `community` row's
+  pointer must name the cohort the row is **signed** for, a pointer persist cannot read is a
+  refusal rather than absence, conflicting pointers at one sha are refused, and the floor check
+  binds tier to placement.
+
+**Edge deletes `sealed_provenance`.** The pull path calls
+`BlobProvenance::from_attestation(row, &sha, pointer.epoch, None)`; persist now owns the one
+spelling of a rule edge had implemented privately, and adds three checks edge could not. `minter`
+stays `None` — the minter is the SEALING node, and a puller neither minted the epoch nor is told
+who did, so persist derives it from the admitted `key_grant` set. The two tests that pinned the
+axes now exercise persist's constructor.
+
+This closes the arc that began with v29.0.0's two review P1s: edge's half (chat rows cite their
+blob, CIRISEdge#646) shipped there; persist's half (the key plane comes from the pointer) is here.
+
+ABI constants unmoved (`DIRECTORY 5`, `SIGNER 1`, `OUTBOUND_QUEUE 1`, `ASYNC_EXECUTOR 1`); one copy
+each of verify/keyring/crypto. Pins: persist **v46.1.0**, verify v15.2.0, leviculum v0.26.0+ciris.1.
+Wire unchanged (v3). Ladder pair: **edge v29.1.0 + persist v46.1.0**.
+
 # v29.0.0 — adopt CIRISPersist v46.0.0: the epoch's minter is named, and the puller reads provenance off the row
 
 **2026-09-21** (PR #644). MAJOR because persist is: the wheel floor moves to `ciris-persist>=46,<47`.
