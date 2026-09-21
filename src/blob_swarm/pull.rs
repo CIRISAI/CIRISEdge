@@ -59,7 +59,6 @@ use super::{
     BlobChunkVerifier, ChunkManifestLite, ChunkVerifyError, PersistBlobStorePolicy, SwarmConfig,
     SwarmError, SwarmScheduler,
 };
-use crate::group_content::BlobPointer;
 
 /// An ADMITTED attestation that references at least one blob. The bridge
 /// offers one per admitted row; the puller works out which shas.
@@ -623,7 +622,35 @@ where
                 "sealed tier without a typed pointer — cannot form a provenance".into(),
             );
         };
-        let provenance = sealed_provenance(row, pointer, tier);
+        // v46.1.0 (CIRISPersist#878) — the provenance is READ OFF the row the
+        // bytes flowed from, and the constructor now sees edge's reference
+        // shape: a typed `BlobPointer` at these bytes is a reference, and it
+        // is AUTHORITATIVE for the key plane (tier, community, epoch) while
+        // the ROW's placement stands as the access grant. That is the rule
+        // edge's own builder implemented; persist owns the one spelling now,
+        // and adds what a caller could not: the row must reference the bytes,
+        // a `community` row's pointer must name the cohort the row is signed
+        // for, and the floor check binds tier to placement.
+        //
+        // `minter` is `None`: the minter is the key whose cascade MINTED the
+        // epoch — the SEALING NODE that signed the `key_grant` set, not the
+        // author (for a chat row the author is the person). This node neither
+        // minted it nor is told who did, so persist derives it from the one
+        // admitted set that granted this node a wrap, and rebinds a row
+        // stored against a wrong minter when the next set arrives.
+        let provenance = match BlobProvenance::from_attestation(row, &sha, pointer.epoch, None) {
+            Ok(p) => p,
+            Err(e) => {
+                return PullOutcome::StoreFailed(format!(
+                    "provenance from the referencing row {}: {e}",
+                    row.attestation_id
+                ))
+            }
+        };
+        debug_assert_eq!(
+            provenance.tier, tier,
+            "the pointer persist read is the pointer the meaning projection read"
+        );
         let aad = crate::group_content::content_aad(
             &row.attesting_key_id,
             row.asserted_at,
@@ -649,40 +676,6 @@ where
             }
             Err(e) => PullOutcome::StoreFailed(e.to_string()),
         }
-    }
-}
-
-/// CIRISPersist#878 / #876 — **the provenance a pull declares for
-/// sealed bytes, built once.** Two axes, two sources, and mixing them is the
-/// #876 defect:
-///
-/// - the **ROW** is authoritative for authorship and placement: its attester
-///   (for a chat row, the PERSON) and its `cohort_scope`;
-/// - the **POINTER** is authoritative for the key plane: the community whose
-///   DEK sealed the bytes, the epoch, and the TIER the write door resolved.
-///   A chat row sits at `self` scope while its body is sealed under the room's
-///   DEK, so the row's scope is not the bytes' tier.
-///
-/// `minter_key_id` is `None` on purpose: the minter is the key whose cascade
-/// minted the epoch — the SEALING NODE that signed the `key_grant` set, not
-/// the author — and this node neither minted it nor is told who did. persist
-/// derives it from the one admitted set that granted this node a wrap, and
-/// rebinds a row stored against a wrong minter when the next set arrives.
-/// Writing `author_key_id` here is exactly the defect CIRISPersist#876 closed.
-///
-/// Not `BlobProvenance::from_attestation`: that constructor requires the sha
-/// in `evidence_refs` (edge's producers reference a blob with a typed
-/// `BlobPointer`, which persist's own §5 counts as the reference) and resolves
-/// the tier from the row's scope. See CIRISPersist#878.
-fn sealed_provenance(row: &Attestation, pointer: &BlobPointer, tier: CryptoTier) -> BlobProvenance {
-    BlobProvenance {
-        author_key_id: row.attesting_key_id.clone(),
-        cohort_scope: row.cohort_scope.clone(),
-        community_key_id: (!pointer.community_key_id.is_empty())
-            .then(|| pointer.community_key_id.clone()),
-        epoch: pointer.epoch,
-        tier,
-        minter_key_id: None,
     }
 }
 
@@ -762,7 +755,8 @@ mod tests {
         let pointer = meaning.pointer().expect("typed pointer");
         assert_eq!(pointer.tier, CryptoTier::CommunityDek);
 
-        let p = sealed_provenance(&row, pointer, pointer.tier);
+        let p = BlobProvenance::from_attestation(&row, &SHA, pointer.epoch, None)
+            .expect("the row references the bytes by pointer");
         assert_eq!(p.author_key_id, "alice", "the ROW's attester authors");
         assert_eq!(
             p.cohort_scope,
@@ -793,7 +787,8 @@ mod tests {
             row.attestation_envelope["content"]["tier"] = serde_json::json!("community_dek");
             let meaning = BlobMeaning::project(&row, &SHA).expect("pointer");
             let pointer = meaning.pointer().expect("typed pointer");
-            let p = sealed_provenance(&row, pointer, CryptoTier::CommunityDek);
+            let p = BlobProvenance::from_attestation(&row, &SHA, pointer.epoch, None)
+                .expect("the row references the bytes by pointer");
             assert_eq!(p.author_key_id, author);
             assert_eq!(
                 p.minter_key_id, None,
