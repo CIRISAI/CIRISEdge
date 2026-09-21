@@ -1,5 +1,54 @@
 # CIRISEdge Release Notes
 
+# v29.0.0 — adopt CIRISPersist v46.0.0: the epoch's minter is named, and the puller reads provenance off the row
+
+**2026-09-21** (PR #644). MAJOR because persist is: the wheel floor moves to `ciris-persist>=46,<47`.
+
+**v46.0.0 (#876 / #877).** The adopt door recorded the referencing row's AUTHOR as the epoch's
+minter, while the seal path and the `key_grant` set key everything by the SEALING NODE. For a chat
+row — authored by a person, sealed by their node — the two halves of `(community, minter, epoch)`
+were written from different axes, so every cross-node community body read `NotGranted` with the
+viewer and its wrap both correct. `BlobProvenance` gains `minter_key_id: Option<String>`: named by
+the producer, else derived from the one admitted `key_grant` set that granted this node a wrap, and
+never guessed when two minters are live. Admitting a set also REBINDS a row whose recorded minter
+holds neither DEK state nor grants, so bytes already stored heal without a re-send.
+
+**Edge takes the fix at the one call site that would have written the same defect.** The puller's
+sealed-adopt path built its provenance inline with `author_key_id: row.attesting_key_id` and a
+comment reasoning that the author's cascade minted the epoch — #876's premise exactly. It is now
+one private builder, `blob_swarm::pull::sealed_provenance`, with **`minter_key_id: None`**: this
+node did not mint the epoch and is never told who did, so persist derives the minter from the one
+admitted `key_grant` set that granted it a wrap, and a row already stored against a wrong minter
+heals on the next set. Two axes, two sources, named in the builder's docs: the ROW is authoritative
+for authorship and placement, the POINTER for the key plane (community, epoch, **tier**). Two tests
+pin both. (The three harness fixtures that hand-build a provenance now NAME the minter — the sealing
+engine — the same distinction seen from the producer side.)
+
+**Chat blobs are not special (CIRISEdge#646).** Every chat row now carries its blob's sha in
+`evidence_refs` beside the typed `BlobPointer` — the pointer says how to OPEN the bytes (tier,
+epoch, community, field), the citation is the RELATION every consumer reads: persist's
+`attestations_binding_content` / `envelope_binds_content`, and edge's own revocation register,
+whose module docs had already named this residual and its closure ("producers carry the sha in
+`evidence_refs`", as CIRISVerify#281 did for manifests). A pointer-only row was invisible to all of
+them. `chat_row` cites structurally — any envelope member that deserializes as a `BlobPointer` — so
+attachments and any future blob-bearing chat row are covered by construction, and a row with no
+blob gains no empty array. Producer-side only; existing rows stay valid and the pointer is
+unchanged.
+
+`BlobProvenance::from_attestation` is **not** used yet, and that is a finding, not a preference:
+it requires the sha in `evidence_refs` while every edge producer references its blob with a typed
+`BlobPointer`, and it resolves the tier from the ROW's `cohort_scope` while a chat row sits at
+`self` scope with its body sealed under the room's DEK. Using it refused every chat row after the
+bytes were already downloaded, and where it did not, adopted community-DEK ciphertext as
+`InvisibleEncrypted`. #646 closes the first half — edge's rows now cite — but the tier axis is
+persist's: filed as **CIRISPersist#878**, and edge switches to the constructor when it resolves the
+tier from the pointer. (Both P1s caught by Codex review on PR #644; both real.)
+
+All four ABI constants unmoved (`DIRECTORY 5`, `SIGNER 1`, `OUTBOUND_QUEUE 1`, `ASYNC_EXECUTOR 1`);
+one copy each of verify/keyring/crypto; JSON wire compatible (the break is the Rust struct literal).
+Pins: persist **v46.0.0**, verify v15.2.0, leviculum v0.26.0+ciris.1. Wire unchanged (v3).
+Ladder pair: **edge v29.0.0 + persist v46.0.0**.
+
 # v28.0.0 — adopt CIRISPersist v45.0.1: an occurrence resolves to its principal; size on every holder claim
 
 **2026-09-20** (PR #643). MAJOR because persist is: the wheel floor moves to `ciris-persist>=45,<46`.

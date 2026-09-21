@@ -1244,20 +1244,19 @@ async fn a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive() {
         .engine()
         .adopt_sealed_blob(
             &envelope,
-            // The provenance's `author_key_id` IS the minter (#848 §11: the
-            // author's cascade minted the epoch), and the grant B just
-            // projected is keyed under that minter — A's DERIVED engine key.
-            // In production a key id is `derive_key_id(alias, pubkey)`, so a
-            // row's `attesting_key_id` and the engine's derived id coincide;
-            // this harness registers friendly ids, so the distinction is
-            // visible here and must be honoured, or the read looks for the
-            // grant under a minter that never wrote one.
+            // v46.0.0 (CIRISPersist#876) — the MINTER is named, never inferred
+            // from the author: it is the key whose cascade minted the epoch and
+            // signed the `key_grant` set, which is A's sealing engine. Here the
+            // two coincide (this harness seals under the same key it authors
+            // with); in production a chat row is authored by a person and sealed
+            // by their node, which is the defect #876 closed.
             BlobProvenance {
                 author_key_id: node_a.me.clone(),
                 cohort_scope: "community".to_owned(),
                 community_key_id: Some(room.to_owned()),
                 epoch: sealed.epoch,
                 tier: sealed.tier,
+                minter_key_id: Some(node_a.me.clone()),
             },
             Some(&aad),
             AdoptDisposition::LocalOnly,
@@ -1452,6 +1451,8 @@ async fn cross_key_and_bytes(
                 community_key_id: Some(room.to_owned()),
                 epoch: sealed.epoch,
                 tier: sealed.tier,
+                // v46.0.0 — the sealing engine minted this epoch (#876).
+                minter_key_id: Some(node_a.me.clone()),
             },
             Some(&aad),
             AdoptDisposition::LocalOnly,

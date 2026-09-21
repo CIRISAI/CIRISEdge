@@ -61,6 +61,12 @@
 //! sha in `evidence_refs` so persist's predicate is complete
 //! (CIRISVerify#281 did this for manifests).
 //!
+//! **CIRISEdge#646 (v29.0.0) closes edge's half of that**: every chat row
+//! now carries its blob's sha in `evidence_refs` beside the typed pointer
+//! (`chat::chat_row`), so persist's predicate finds it and the known set is
+//! complete for edge-authored content. The residual that remains is a row
+//! authored by some OTHER producer that still cites only a pointer.
+//!
 //! # Out-of-order arrival
 //!
 //! A `withdraws` that lands before its target is held as PENDING (bounded);

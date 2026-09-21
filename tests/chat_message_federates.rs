@@ -2086,13 +2086,16 @@ async fn carry_bytes(
         .adopt_sealed_blob(
             &envelope,
             BlobProvenance {
-                // The MINTER is the author's engine (derived id), not the
-                // friendly identity — memory trap 6.
                 author_key_id: from.me.clone(),
                 cohort_scope: "community".to_owned(),
                 community_key_id: Some(room.to_owned()),
                 epoch: sealed.epoch,
                 tier: sealed.tier,
+                // v46.0.0 (CIRISPersist#876) — the MINTER is the SEALING
+                // engine's derived id, named rather than inferred from the
+                // author. They coincide in this harness; in production a chat
+                // row's author is the person and its sealer is their node.
+                minter_key_id: Some(from.me.clone()),
             },
             Some(&aad),
             AdoptDisposition::LocalOnly,
@@ -2285,5 +2288,84 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
         read_as(&c, &row1, &room, &c.me).await,
         Body::Text("one".to_owned()),
         "and still opens the message from before it — rotation, not recall (CC 4.5.12.1 Option A)",
+    );
+}
+
+/// CIRISEdge#646 — **a chat blob is cited the blob-native way.** The typed
+/// `BlobPointer` says how to OPEN the bytes; `evidence_refs` is the relation
+/// every consumer reads — persist's `attestations_binding_content` and
+/// `envelope_binds_content` (and therefore `BlobProvenance::from_attestation`),
+/// and edge's revocation register's "every known reference" set, whose module
+/// docs named this residual and its closure. A pointer-only row is invisible to
+/// all of them, so chat rows carry both.
+#[tokio::test]
+async fn a_chat_message_cites_its_blob_in_evidence_refs_and_keeps_the_pointer() {
+    use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
+    use ciris_persist::federation::types::consensus_protocol;
+    let alice = signer("alice-fed", 1);
+    let humans = [&alice];
+    let a = peer(&humans, ("alice-fed", 1)).await;
+
+    let room = chat::new_room_community_key_id();
+    let roster = chat::community(
+        &room,
+        "solo",
+        &[("alice-fed", Some(MEMBER_ROLE_FOUNDER))],
+        consensus_protocol::FOUNDER_ONLY,
+        ts(),
+    )
+    .expect("alice is the founder");
+    let signed_room = chat::signed_community(roster, &alice).await.expect("sign");
+    a.dir
+        .put_community(signed_room)
+        .await
+        .expect("the node admits the room");
+    a.dir
+        .put_public_key(SignedKeyRecord {
+            record: record(&room, &signer(&room, 9), &signer(&room, 9), "user").await,
+        })
+        .await
+        .expect("register the room id as a key (persist fixture convention)");
+
+    let at = ts();
+    let (row, sealed) = chat::chat_message_attestation_in(&alice, &room, "hello", at, &a.store)
+        .await
+        .expect("a sealed chat message");
+
+    let sha = &sealed.pointer.content_sha256;
+    let refs = row.attestation_envelope["evidence_refs"]
+        .as_array()
+        .expect("a chat row cites its blob");
+    assert!(
+        refs.iter().any(|r| r.as_str() == Some(sha.as_str())),
+        "the body's sha must be in evidence_refs — persist's binding predicate reads \
+         nothing else: {refs:?}"
+    );
+    assert_eq!(refs.len(), 1, "one blob, one citation, no duplicates");
+
+    // The pointer is NOT replaced by the citation: it carries the key-plane
+    // facts (tier, epoch, community, field) that evidence_refs cannot express.
+    let pointer = &row.attestation_envelope[chat::FIELD_CONTENT];
+    assert_eq!(pointer["content_sha256"].as_str(), Some(sha.as_str()));
+    assert_eq!(pointer["tier"].as_str(), Some("community_dek"));
+
+    // And persist's own predicate now finds the row.
+    assert!(
+        ciris_persist::federation::admission::envelope_binds_content(
+            &row.attestation_envelope,
+            sha
+        ),
+        "the row a blob flowed from must be findable by the predicate every \
+         consumer uses (CIRISPersist#878)"
+    );
+
+    // A row with no blob gains no empty array: the KeyPackage row carries
+    // wire bytes as a member, not a blob pointer.
+    let kp = chat::key_package_attestation(&alice, &room, b"key-package-bytes", at)
+        .await
+        .expect("a key-package row");
+    assert!(
+        kp.attestation_envelope.get("evidence_refs").is_none(),
+        "a row that references no blob cites nothing"
     );
 }

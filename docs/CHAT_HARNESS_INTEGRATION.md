@@ -486,6 +486,25 @@ to copy; every call below is exercised there.
 | send a message | `chat::chat_message_attestation(&author, &peer, body, now, &store)` — the body goes to the room's blob store under persist's community DEK, the row carries the pointer; the returned `SealedContent` says who can open it, and a body nobody can open is REFUSED before it is sent | edge |
 | read the room | `chat::messages_in_room(&*dir, &[peer_fed_id], &room, &store, viewer_occurrence_key)` — opened through the viewer's occurrence wrap; a row that will not open is `Body::Unopened { reason }` | edge |
 
+**A chat message is two rows, like every other crossing (CIRISEdge#646).** The
+producer authors at `self` and the room sees a WIDENING, not the original:
+
+```rust
+let (row, sealed) = chat::chat_message_attestation(&author, &peer, body, now, &store).await?;
+dir.put_attestation_authored(SignedAttestation { attestation: row.clone() }).await?;   // (local, self) → (federation, self): the author's OWN nodes
+share(dir, &row, With::Community { community_key_id: room.clone() },
+      CrossingBasis::ProducerAuthority, signers).await?;                               // the supersedes a room member receives
+```
+
+Skip the `share` and the message is correct, sealed, replicated — and refused
+by every member's node as `NotPartyTo`, because the row it holds says `self`
+and a member is not the author's device. **The row is the access grant; the
+pointer only says which key opened the bytes** (tier, community, epoch), and
+persist will not read audience from the pointer — deliberately, since that
+would grant membership no attestation signed for. A `self` row pointing at
+community-DEK ciphertext is legitimate on the *owner's own* second node and
+nowhere else.
+
 Four things worth knowing before you build on it:
 
 1. **A nodeID and a fedID must land on the same person.** A node cannot consent
