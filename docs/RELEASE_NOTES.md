@@ -1,5 +1,32 @@
 # CIRISEdge Release Notes
 
+# v29.0.0 — adopt CIRISPersist v46.0.0: the epoch's minter is named, and the puller reads provenance off the row
+
+**2026-09-21** (PR #644). MAJOR because persist is: the wheel floor moves to `ciris-persist>=46,<47`.
+
+**v46.0.0 (#876 / #877).** The adopt door recorded the referencing row's AUTHOR as the epoch's
+minter, while the seal path and the `key_grant` set key everything by the SEALING NODE. For a chat
+row — authored by a person, sealed by their node — the two halves of `(community, minter, epoch)`
+were written from different axes, so every cross-node community body read `NotGranted` with the
+viewer and its wrap both correct. `BlobProvenance` gains `minter_key_id: Option<String>`: named by
+the producer, else derived from the one admitted `key_grant` set that granted this node a wrap, and
+never guessed when two minters are live. Admitting a set also REBINDS a row whose recorded minter
+holds neither DEK state nor grants, so bytes already stored heal without a re-send.
+
+**Edge's adopt path now reads the provenance off the row** rather than transcribing it:
+`BlobProvenance::from_attestation(row, &sha, epoch, minter)` takes the author, cohort scope, named
+community and tier from the signed envelope and refuses a row that does not cite the bytes in
+`evidence_refs`. Edge passes `minter: None` — this node did not mint the epoch and is not told who
+did, so persist derives it from the admitted set; a mis-recorded row heals on the next one. The
+transcription that wrote the defect is no longer expressible here. (The three harness fixtures that
+hand-build a provenance now NAME the minter — the sealing engine — which is the same distinction
+seen from the producer side.)
+
+All four ABI constants unmoved (`DIRECTORY 5`, `SIGNER 1`, `OUTBOUND_QUEUE 1`, `ASYNC_EXECUTOR 1`);
+one copy each of verify/keyring/crypto; JSON wire compatible (the break is the Rust struct literal).
+Pins: persist **v46.0.0**, verify v15.2.0, leviculum v0.26.0+ciris.1. Wire unchanged (v3).
+Ladder pair: **edge v29.0.0 + persist v46.0.0**.
+
 # v28.0.0 — adopt CIRISPersist v45.0.1: an occurrence resolves to its principal; size on every holder claim
 
 **2026-09-20** (PR #643). MAJOR because persist is: the wheel floor moves to `ciris-persist>=45,<46`.

@@ -2086,13 +2086,16 @@ async fn carry_bytes(
         .adopt_sealed_blob(
             &envelope,
             BlobProvenance {
-                // The MINTER is the author's engine (derived id), not the
-                // friendly identity — memory trap 6.
                 author_key_id: from.me.clone(),
                 cohort_scope: "community".to_owned(),
                 community_key_id: Some(room.to_owned()),
                 epoch: sealed.epoch,
                 tier: sealed.tier,
+                // v46.0.0 (CIRISPersist#876) — the MINTER is the SEALING
+                // engine's derived id, named rather than inferred from the
+                // author. They coincide in this harness; in production a chat
+                // row's author is the person and its sealer is their node.
+                minter_key_id: Some(from.me.clone()),
             },
             Some(&aad),
             AdoptDisposition::LocalOnly,

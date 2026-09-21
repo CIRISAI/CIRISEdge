@@ -622,22 +622,32 @@ where
                 "sealed tier without a typed pointer — cannot form a provenance".into(),
             );
         };
-        let provenance = BlobProvenance {
-            // persist's contract (`BlobProvenance::author_key_id`): "the
-            // attesting_key_id of the attestation the blob is a projection
-            // of". For a community_dek blob it is also the epoch's minter
-            // (#848 §11) — which holds because a row's attester IS the
-            // engine's derived key in production; a harness registering
-            // friendly ids must author its rows under the derived key or
-            // the read looks for the grant under a minter that never wrote
-            // one (memory trap 6).
-            author_key_id: row.attesting_key_id.clone(),
-            cohort_scope: row.cohort_scope.clone(),
-            community_key_id: (!pointer.community_key_id.is_empty())
-                .then(|| pointer.community_key_id.clone()),
-            epoch: pointer.epoch,
-            tier,
+        // v46.0.0 (CIRISPersist#876) — the provenance is READ OFF the row the
+        // bytes flowed from, never transcribed: `from_attestation` takes the
+        // author, the cohort scope, the named community and the tier from the
+        // signed envelope, and refuses a row that does not cite these bytes in
+        // `evidence_refs`. The key-plane facts stay explicit arguments, which is
+        // what makes the #876 defect inexpressible here: `minter_key_id` is the
+        // key whose cascade MINTED the epoch (the SEALING NODE, which for a chat
+        // row is not the author — the author is the person). This node did not
+        // mint it and is not told who did, so it passes `None` and persist
+        // derives the minter from the one admitted `key_grant` set that granted
+        // this node a wrap at `(community, epoch)`; a row already stored against
+        // a mis-recorded minter heals when the next set is admitted.
+        let provenance = match BlobProvenance::from_attestation(row, &sha, pointer.epoch, None) {
+            Ok(p) => p,
+            Err(e) => {
+                return PullOutcome::StoreFailed(format!(
+                    "provenance from the referencing row {}: {e}",
+                    row.attestation_id
+                ))
+            }
         };
+        debug_assert_eq!(
+            provenance.tier, tier,
+            "the tier persist resolves from the row's scope is the tier the meaning \
+             projection resolved (CIRISPersist#876)"
+        );
         let aad = crate::group_content::content_aad(
             &row.attesting_key_id,
             row.asserted_at,
