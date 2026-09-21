@@ -583,6 +583,15 @@ leviculum primitive gives an above-MDU, multi-frame exchange over a pool of
 links; see `FSD/REPLICATION_ROUND_CORRELATION.md` §2 for the primitives read
 at the pin and why request/response and Resource were not the answer.
 
+#### 5.4.3 The content layer under a correlated round — which cohort, which rung
+
+What a round *carries* — rows, keys, bytes, addressing — at every cohort, from the producer's write
+to the reader's open, is the third table: [`CONTENT_TRANSFER.md`](CONTENT_TRANSFER.md) §5. It sits
+under §5.4.2 exactly as §5.4.2 sits under §5.4.1: nothing there is reachable except through an
+attributed link and a correlated round, and nothing here knows what a row means. A ladder run reads
+the three top-down — `bound` is §5.4.1/§5.4.2, `sent` is the content table's R1–R2, `arrived` is
+R3–R8, and the self/family row set adds `mine_on_b`.
+
 ### 5.5 The node transport identity (`#541`)
 
 The carve-out above attributes a bootstrap frame on **the link's transport
