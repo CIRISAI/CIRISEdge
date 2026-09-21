@@ -13,14 +13,24 @@ the producer, else derived from the one admitted `key_grant` set that granted th
 never guessed when two minters are live. Admitting a set also REBINDS a row whose recorded minter
 holds neither DEK state nor grants, so bytes already stored heal without a re-send.
 
-**Edge's adopt path now reads the provenance off the row** rather than transcribing it:
-`BlobProvenance::from_attestation(row, &sha, epoch, minter)` takes the author, cohort scope, named
-community and tier from the signed envelope and refuses a row that does not cite the bytes in
-`evidence_refs`. Edge passes `minter: None` — this node did not mint the epoch and is not told who
-did, so persist derives it from the admitted set; a mis-recorded row heals on the next one. The
-transcription that wrote the defect is no longer expressible here. (The three harness fixtures that
-hand-build a provenance now NAME the minter — the sealing engine — which is the same distinction
-seen from the producer side.)
+**Edge takes the fix at the one call site that would have written the same defect.** The puller's
+sealed-adopt path built its provenance inline with `author_key_id: row.attesting_key_id` and a
+comment reasoning that the author's cascade minted the epoch — #876's premise exactly. It is now
+one private builder, `blob_swarm::pull::sealed_provenance`, with **`minter_key_id: None`**: this
+node did not mint the epoch and is never told who did, so persist derives the minter from the one
+admitted `key_grant` set that granted it a wrap, and a row already stored against a wrong minter
+heals on the next set. Two axes, two sources, named in the builder's docs: the ROW is authoritative
+for authorship and placement, the POINTER for the key plane (community, epoch, **tier**). Two tests
+pin both. (The three harness fixtures that hand-build a provenance now NAME the minter — the sealing
+engine — the same distinction seen from the producer side.)
+
+`BlobProvenance::from_attestation` is **not** used yet, and that is a finding, not a preference:
+it requires the sha in `evidence_refs` while every edge producer references its blob with a typed
+`BlobPointer`, and it resolves the tier from the ROW's `cohort_scope` while a chat row sits at
+`self` scope with its body sealed under the room's DEK. Using it refused every chat row after the
+bytes were already downloaded, and where it did not, adopted community-DEK ciphertext as
+`InvisibleEncrypted`. Filed as **CIRISPersist#878**; edge switches to the constructor when it
+accepts a pointer reference. (Both caught by Codex review on PR #644 — two P1s, both real.)
 
 All four ABI constants unmoved (`DIRECTORY 5`, `SIGNER 1`, `OUTBOUND_QUEUE 1`, `ASYNC_EXECUTOR 1`);
 one copy each of verify/keyring/crypto; JSON wire compatible (the break is the Rust struct literal).
