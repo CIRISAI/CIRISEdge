@@ -38,6 +38,9 @@
 //! joined         install + register own address
 //! epoch advanced install_next + activate + register the NEW own address
 //!                (the superseded one stays registered and accepted)
+//! members        refresh_current on the SAME epoch: admit the members the
+//!   refreshed    slot lacks, drop the departed, touch nothing else — our
+//!                own registration is among the untouched (CIRISEdge#648)
 //! seal due       drop the superseded epoch + retire its destination
 //! ```
 //!
@@ -143,7 +146,9 @@ pub trait ScopedDestinationSink: Send + Sync {
 /// than infer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionOutcome {
-    /// Addresses derived and stored for this group-epoch (all members).
+    /// Addresses derived and stored by this transition: every member on
+    /// an install or advance, only the newly admitted members on a
+    /// [`ScopeLifecycle::refresh_members`].
     pub derived: usize,
     /// The epoch now live for sending.
     pub epoch: u64,
@@ -412,6 +417,39 @@ impl ScopeLifecycle {
         )
     }
 
+    /// **The refresh verb** (CIRISEdge#648). Same epoch, different
+    /// members: the roster changed without MLS moving — in practice a
+    /// member whose person → node resolution completed late (its
+    /// occurrence announce reached this node after the room was
+    /// installed). Derives and admits the members the current epoch
+    /// lacks, drops the ones the snapshot no longer names, and leaves
+    /// every other address — including the one this node listens on —
+    /// untouched. Make-before-break with nothing to break: at no instant
+    /// is a member who was addressable unaddressed.
+    ///
+    /// Neither [`Self::install`] (refuses a held group) nor
+    /// [`Self::advance`] (needs a new epoch) covers this, and
+    /// `remove_group` + `install` drops every live address to repair a
+    /// table that was merely incomplete.
+    ///
+    /// # Errors
+    /// See [`ScopeLifecycleError`]. A snapshot that omits this node is
+    /// refused **before** the table moves: that is not a refresh but a
+    /// removal, and the caller says so with [`Self::leave`].
+    pub fn refresh_members(
+        &self,
+        scope: &CohortScope,
+        snapshot: &ScopeGroupSnapshot,
+    ) -> Result<TransitionOutcome, ScopeLifecycleError> {
+        self.members_refreshed(
+            scope,
+            &snapshot.group_id,
+            snapshot.epoch,
+            &snapshot.destination_secret,
+            &snapshot.members,
+        )
+    }
+
     /// The raw install, for callers that already hold the parts. Prefer
     /// [`Self::install`], which is what the group-kind adapters use.
     ///
@@ -564,6 +602,67 @@ impl ScopeLifecycle {
 
         Ok(TransitionOutcome {
             derived,
+            epoch,
+            own_address: own,
+        })
+    }
+
+    /// The raw refresh, for callers that already hold the parts. Prefer
+    /// [`Self::refresh_members`].
+    ///
+    /// No sink call happens here by construction: our own address at
+    /// this epoch is the one already registered, and the table proves it
+    /// byte-for-byte (a foreign secret is refused as
+    /// [`ScopeAddressError::ExporterSecretMismatch`]) before it admits
+    /// anyone.
+    ///
+    /// # Errors
+    /// See [`ScopeLifecycleError`].
+    pub fn members_refreshed(
+        &self,
+        scope: &CohortScope,
+        group_id: &str,
+        epoch: u64,
+        exporter_secret: &[u8; 32],
+        members: &[impl AsRef<str>],
+    ) -> Result<TransitionOutcome, ScopeLifecycleError> {
+        // Checked BEFORE the table moves. `own_address_or_rollback` is the
+        // wrong shape here: it tears the group down, and a roster that
+        // merely forgot us is not a reason to go deaf on a working room.
+        if !members.iter().any(|m| m.as_ref() == self.own_key_id) {
+            return Err(ScopeLifecycleError::SelfNotInRoster {
+                own_key_id: self.own_key_id.clone(),
+                group_id: group_id.to_owned(),
+            });
+        }
+        let refresh =
+            self.table
+                .refresh_current(scope, group_id, epoch, exporter_secret, members)?;
+        // Present by construction: we are in `members`, and the table just
+        // re-derived and kept our slot entry. Refused rather than unwrapped
+        // so a future table change cannot turn this into a panic.
+        let own = self
+            .table
+            .address_at(scope, group_id, epoch, &self.own_key_id)
+            .ok_or_else(|| ScopeLifecycleError::SelfNotInRoster {
+                own_key_id: self.own_key_id.clone(),
+                group_id: group_id.to_owned(),
+            })?;
+        tracing::info!(
+            scope = scope.kind_token(),
+            group = %group_id,
+            epoch,
+            members = members.len(),
+            added = ?refresh.added,
+            removed = ?refresh.removed,
+            unchanged = refresh.unchanged,
+            own_address = %hex::encode(own.as_bytes()),
+            "scope lifecycle REFRESHED a group's members at the same epoch — the late \
+             members are addressable now; nothing that was addressable moved, and this \
+             node's own registration is untouched (CIRISEdge#648)"
+        );
+        Ok(TransitionOutcome {
+            derived: refresh.added.len(),
             epoch,
             own_address: own,
         })
@@ -1191,5 +1290,124 @@ mod tests {
             ),
             "expected an AddressCollision, got {err:?}",
         );
+    }
+
+    // ── CIRISEdge#648 — same epoch, different members ──
+
+    #[test]
+    fn refreshing_members_admits_the_late_node_without_touching_our_registration() {
+        // A member resolved late; MLS did not move. After the refresh the
+        // late node is addressable, every prior address is byte-identical,
+        // exactly one destination is registered and it is the same one.
+        let (life, table, sink) = fixture();
+        let joined = life
+            .joined(&scope(), "g", 1, &[7u8; 32], &["node-self", "peer-a"])
+            .expect("join");
+        let peer_a_before = table.send_address(&scope(), "g", "peer-a").unwrap();
+        assert!(table.send_address(&scope(), "g", "peer-b").is_none());
+
+        let snap = ScopeGroupSnapshot {
+            group_id: "g".to_owned(),
+            epoch: 1,
+            members: vec!["node-self".into(), "peer-a".into(), "peer-b".into()],
+            destination_secret: [7u8; 32],
+        };
+        let out = life.refresh_members(&scope(), &snap).expect("refresh");
+        assert_eq!(out.derived, 1, "only the late member is derived");
+        assert_eq!(out.epoch, 1);
+        assert_eq!(
+            out.own_address, joined.own_address,
+            "our address did not move"
+        );
+        assert!(table.send_address(&scope(), "g", "peer-b").is_some());
+        assert_eq!(
+            table.send_address(&scope(), "g", "peer-a").unwrap(),
+            peer_a_before,
+            "an existing member's address is untouched"
+        );
+        assert_eq!(
+            sink.registered_hashes(),
+            vec![*joined.own_address.as_bytes()],
+            "no re-registration: the one registered address is still ours"
+        );
+        assert!(
+            sink.retired.lock().unwrap().is_empty(),
+            "nothing was retired"
+        );
+    }
+
+    #[test]
+    fn a_refresh_whose_roster_omits_us_is_refused_before_the_table_moves() {
+        // Not a refresh but a removal — and the caller says that with
+        // `leave`. The working room stays working: nothing admitted,
+        // nothing dropped, registration intact.
+        let (life, table, sink) = fixture();
+        life.joined(&scope(), "g", 1, &[7u8; 32], &["node-self", "peer-a"])
+            .expect("join");
+        let snap = ScopeGroupSnapshot {
+            group_id: "g".to_owned(),
+            epoch: 1,
+            members: vec!["peer-a".into(), "peer-b".into()],
+            destination_secret: [7u8; 32],
+        };
+        let err = life.refresh_members(&scope(), &snap).unwrap_err();
+        assert!(
+            matches!(err, ScopeLifecycleError::SelfNotInRoster { ref own_key_id, .. } if own_key_id == "node-self"),
+            "{err}"
+        );
+        assert!(
+            table.send_address(&scope(), "g", "peer-b").is_none(),
+            "nothing admitted"
+        );
+        assert!(
+            table.send_address(&scope(), "g", "peer-a").is_some(),
+            "nothing dropped"
+        );
+        assert!(
+            table.send_address(&scope(), "g", "node-self").is_some(),
+            "we are still in"
+        );
+        assert_eq!(sink.registered_hashes().len(), 1, "registration untouched");
+        assert!(
+            sink.retired.lock().unwrap().is_empty(),
+            "the group was NOT torn down"
+        );
+    }
+
+    #[test]
+    fn a_refresh_at_a_superseded_epoch_is_refused_as_not_current() {
+        // A refresh never rotates: after an advance to 2, a snapshot at 1
+        // is refused by the table, and the group is exactly as it was.
+        let (life, table, _sink) = fixture();
+        life.joined(&scope(), "g", 1, &[7u8; 32], &["node-self", "peer-a"])
+            .expect("join");
+        life.epoch_advanced(
+            &scope(),
+            "g",
+            2,
+            &[8u8; 32],
+            &["node-self", "peer-a"],
+            Instant::now(),
+        )
+        .expect("advance");
+        let snap = ScopeGroupSnapshot {
+            group_id: "g".to_owned(),
+            epoch: 1,
+            members: vec!["node-self".into(), "peer-a".into(), "peer-b".into()],
+            destination_secret: [7u8; 32],
+        };
+        let err = life.refresh_members(&scope(), &snap).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ScopeLifecycleError::Table(ScopeAddressError::EpochNotCurrent {
+                    current: 2,
+                    requested: 1
+                })
+            ),
+            "{err}"
+        );
+        assert!(table.address_at(&scope(), "g", 1, "peer-b").is_none());
+        assert!(table.address_at(&scope(), "g", 2, "peer-b").is_none());
     }
 }
