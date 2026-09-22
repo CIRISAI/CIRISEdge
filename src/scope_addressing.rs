@@ -333,6 +333,23 @@ pub struct EpochTransition {
     pub evicted: Option<u64>,
 }
 
+/// What [`ScopeAddressTable::refresh_current`] did (CIRISEdge#648).
+///
+/// Every member the roster named and the slot already held is in
+/// `unchanged` — its address bytes were re-derived, compared, and left
+/// exactly where they were. Nothing that was addressable before the
+/// call stopped being addressable during it.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct MembershipRefresh {
+    /// Members the current epoch lacked: derived and admitted by this call.
+    pub added: Vec<String>,
+    /// Members the roster no longer names: dropped from the CURRENT
+    /// epoch only (an older epoch's slot keeps them until its seal).
+    pub removed: Vec<String>,
+    /// Members present before and after, addresses untouched.
+    pub unchanged: usize,
+}
+
 /// Errors from the install / rotation surface. All are programming or
 /// sequencing errors on a cold path — nothing here is a packet-path
 /// outcome.
@@ -348,7 +365,8 @@ pub enum ScopeAddressError {
     },
     /// [`ScopeAddressTable::install_group`] on a group that already has
     /// state. Re-seeding would drop the live accept window; rotate with
-    /// [`ScopeAddressTable::install_next`] instead, or
+    /// [`ScopeAddressTable::install_next`] instead, bring the SAME epoch's
+    /// roster up to date with [`ScopeAddressTable::refresh_current`], or
     /// [`ScopeAddressTable::remove_group`] first.
     #[error("scope_addressing: group '{group_id}' already installed at epoch {epoch}")]
     GroupAlreadyInstalled {
@@ -381,6 +399,31 @@ pub enum ScopeAddressError {
     /// [`ScopeAddressTable::activate_next`] with nothing installed.
     #[error("scope_addressing: no pending epoch to activate")]
     NoPendingEpoch,
+    /// [`ScopeAddressTable::refresh_current`] named an epoch that is not
+    /// the group's current one. A refresh is *same epoch, different
+    /// members*; a different epoch is a rotation and goes through
+    /// [`ScopeAddressTable::install_next`] (CIRISEdge#648).
+    #[error("scope_addressing: epoch {requested} is not the current epoch {current} — refresh_current does not rotate")]
+    EpochNotCurrent {
+        /// The group's current (primary) epoch.
+        current: u64,
+        /// The epoch the caller asked to refresh.
+        requested: u64,
+    },
+    /// [`ScopeAddressTable::refresh_current`] was handed an exporter
+    /// secret that does not reproduce the epoch's existing addresses.
+    /// Refused before anything moves: admitting the new members under
+    /// one secret while the old ones stand under another would be a
+    /// group half-addressable under two keys, with every lookup reading
+    /// healthy (CIRISEdge#648).
+    #[error("scope_addressing: exporter secret does not reproduce member '{member_key_id}' at epoch {epoch} — not this epoch's secret")]
+    ExporterSecretMismatch {
+        /// The already-held member whose stored address the secret failed
+        /// to reproduce.
+        member_key_id: String,
+        /// The current epoch.
+        epoch: u64,
+    },
     /// An install with an empty member list. An epoch with no addresses
     /// is a group nobody can reach — refused loudly rather than
     /// installed as a silent black hole.
@@ -571,6 +614,130 @@ impl ScopeAddressTable {
         );
 
         Ok(count)
+    }
+
+    /// **Same epoch, different members** (CIRISEdge#648). Bring the
+    /// group's CURRENT epoch into line with `members` without rotating:
+    /// derive and admit the members the slot lacks, drop the ones the
+    /// roster no longer names, and leave every member present on both
+    /// sides exactly where it was. There is no instant at which an
+    /// address that was attributable stops being attributable, and this
+    /// node's own address — the one it listens on — is among the ones
+    /// left untouched.
+    ///
+    /// The realistic way here is a roster whose person → node resolution
+    /// completed late: a member's occurrence announce arrives after the
+    /// room was installed, MLS did not move, so there is no new epoch to
+    /// [`Self::install_next`], and `remove_group` + `install_group`
+    /// would drop every live address to repair a table that is merely
+    /// incomplete.
+    ///
+    /// `exporter_secret` must be the current epoch's, and that is
+    /// **checked, not trusted**: every member the slot already holds is
+    /// re-derived and compared byte-for-byte, and a mismatch refuses the
+    /// whole call before anything is mutated. A derive is cheap; a group
+    /// silently standing under two secrets is not.
+    ///
+    /// Atomic under the table's write lock: every addition and removal
+    /// lands, or none does, and every refusal leaves the slot as found.
+    ///
+    /// # Errors
+    /// - [`ScopeAddressError::UnknownGroup`] — nothing installed; that is
+    ///   [`Self::install_group`].
+    /// - [`ScopeAddressError::EpochNotCurrent`] — `epoch` is not the
+    ///   group's current epoch; a new epoch is [`Self::install_next`].
+    /// - [`ScopeAddressError::ExporterSecretMismatch`] — the secret does
+    ///   not reproduce the epoch's existing addresses.
+    /// - [`ScopeAddressError::EmptyMembership`],
+    ///   [`ScopeAddressError::DuplicateMember`],
+    ///   [`ScopeAddressError::AddressCollision`] — as for an install.
+    pub fn refresh_current(
+        &self,
+        scope: &CohortScope,
+        group_id: &str,
+        epoch: u64,
+        exporter_secret: &[u8; 32],
+        members: &[impl AsRef<str>],
+    ) -> Result<MembershipRefresh, ScopeAddressError> {
+        if members.is_empty() {
+            return Err(ScopeAddressError::EmptyMembership { epoch });
+        }
+        let mut guard = self.inner.write();
+        let Inner { groups, reverse } = &mut *guard;
+        let group_state = lookup_group_mut(groups, scope, group_id)
+            .ok_or_else(|| unknown_group(scope, group_id))?;
+        let current = group_state.current.epoch;
+        if epoch != current {
+            return Err(ScopeAddressError::EpochNotCurrent {
+                current,
+                requested: epoch,
+            });
+        }
+        let group = Arc::clone(&group_state.group);
+        let slot = &mut group_state.current;
+
+        // Plan first, mutate second: every refusal below returns with the
+        // slot and the reverse map exactly as they were.
+        let mut wanted: HashSet<&str> = HashSet::with_capacity(members.len());
+        let mut additions: Vec<(Arc<str>, MemberAddress)> = Vec::new();
+        let mut seen: HashSet<[u8; 16]> = HashSet::new();
+        for member in members {
+            let member_key_id = member.as_ref();
+            if !wanted.insert(member_key_id) {
+                return Err(ScopeAddressError::DuplicateMember {
+                    member_key_id: member_key_id.to_owned(),
+                });
+            }
+            let raw = self.deriver.derive(exporter_secret, member_key_id);
+            match slot.members.get(member_key_id) {
+                Some(held) if held.0 == raw => {}
+                Some(_) => {
+                    return Err(ScopeAddressError::ExporterSecretMismatch {
+                        member_key_id: member_key_id.to_owned(),
+                        epoch,
+                    });
+                }
+                None => {
+                    if !seen.insert(raw) || reverse.contains_key(&raw) {
+                        return Err(ScopeAddressError::AddressCollision {
+                            member_key_id: member_key_id.to_owned(),
+                            epoch,
+                        });
+                    }
+                    additions.push((Arc::from(member_key_id), MemberAddress(raw)));
+                }
+            }
+        }
+        let departed: Vec<Arc<str>> = slot
+            .members
+            .keys()
+            .filter(|held| !wanted.contains(held.as_ref()))
+            .cloned()
+            .collect();
+        let unchanged = slot.members.len() - departed.len();
+
+        for member_key_id in &departed {
+            if let Some(addr) = slot.members.remove(member_key_id) {
+                reverse.remove(&addr.0);
+            }
+        }
+        for (member_key_id, addr) in &additions {
+            slot.members.insert(Arc::clone(member_key_id), *addr);
+            reverse.insert(
+                addr.0,
+                InboundAddress {
+                    group: Arc::clone(&group),
+                    member_key_id: Arc::clone(member_key_id),
+                    epoch,
+                    role: EpochRole::Current,
+                },
+            );
+        }
+        Ok(MembershipRefresh {
+            added: additions.iter().map(|(k, _)| k.to_string()).collect(),
+            removed: departed.iter().map(ToString::to_string).collect(),
+            unchanged,
+        })
     }
 
     /// Phase 1 — derive and register the NEXT epoch's addresses while
@@ -1140,6 +1307,174 @@ mod tests {
         t.install_group(&family(), "g-1", 7, &secret(0xA1), &MEMBERS)
             .expect("seed install");
         t
+    }
+
+    // ── CIRISEdge#648 — refresh_current: same epoch, different members ──
+
+    #[test]
+    fn refresh_admits_the_late_member_and_leaves_every_existing_address_in_place() {
+        let t = seeded();
+        let before: Vec<MemberAddress> = MEMBERS
+            .iter()
+            .map(|m| t.address_at(&family(), "g-1", 7, m).unwrap())
+            .collect();
+        let roster = [
+            "ed25519:alice",
+            "ed25519:bob",
+            "ed25519:carol",
+            "ed25519:dave",
+        ];
+        let out = t
+            .refresh_current(&family(), "g-1", 7, &secret(0xA1), &roster)
+            .expect("refresh");
+        assert_eq!(out.added, vec!["ed25519:dave".to_owned()]);
+        assert!(out.removed.is_empty());
+        assert_eq!(out.unchanged, 3);
+        for (m, was) in MEMBERS.iter().zip(before) {
+            assert_eq!(
+                t.address_at(&family(), "g-1", 7, m).unwrap(),
+                was,
+                "{m} moved"
+            );
+        }
+        let dave = t
+            .address_at(&family(), "g-1", 7, "ed25519:dave")
+            .expect("dave addressable");
+        let inbound = t.accepts_inbound(dave.as_bytes()).expect("attributed");
+        assert_eq!(inbound.member_key_id(), "ed25519:dave");
+        assert_eq!(inbound.epoch(), 7);
+        assert_eq!(inbound.role(), EpochRole::Current);
+        assert_eq!(
+            t.live_epochs(&family(), "g-1").unwrap().current,
+            7,
+            "no rotation"
+        );
+        // Idempotent: the same roster again is a no-op with the same view.
+        let again = t
+            .refresh_current(&family(), "g-1", 7, &secret(0xA1), &roster)
+            .expect("refresh again");
+        assert_eq!(
+            again,
+            MembershipRefresh {
+                added: vec![],
+                removed: vec![],
+                unchanged: 4
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_drops_a_departed_member_from_the_current_epoch_only() {
+        // The previous epoch keeps its roster until its seal: a straggler
+        // still addressing the old epoch is attributed as before.
+        let t = seeded();
+        t.install_next(&family(), "g-1", 8, &secret(0xB2), &MEMBERS)
+            .expect("next");
+        t.activate_next(&family(), "g-1").expect("activate");
+        let out = t
+            .refresh_current(
+                &family(),
+                "g-1",
+                8,
+                &secret(0xB2),
+                &["ed25519:alice", "ed25519:bob"],
+            )
+            .expect("refresh");
+        assert_eq!(out.removed, vec!["ed25519:carol".to_owned()]);
+        assert!(out.added.is_empty());
+        assert_eq!(out.unchanged, 2);
+        assert!(t.address_at(&family(), "g-1", 8, "ed25519:carol").is_none());
+        let carol_7 = t
+            .address_at(&family(), "g-1", 7, "ed25519:carol")
+            .expect("carol keeps her previous-epoch address");
+        assert_eq!(
+            t.accepts_inbound(carol_7.as_bytes()).unwrap().role(),
+            EpochRole::Previous
+        );
+    }
+
+    #[test]
+    fn refresh_refuses_a_non_current_epoch_and_changes_nothing() {
+        let t = seeded();
+        for requested in [6u64, 8] {
+            let err = t
+                .refresh_current(
+                    &family(),
+                    "g-1",
+                    requested,
+                    &secret(0xA1),
+                    &[
+                        "ed25519:alice",
+                        "ed25519:bob",
+                        "ed25519:carol",
+                        "ed25519:dave",
+                    ],
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, ScopeAddressError::EpochNotCurrent { current: 7, requested: r } if r == requested),
+                "{err}"
+            );
+        }
+        assert!(t.address_at(&family(), "g-1", 7, "ed25519:dave").is_none());
+        assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn refresh_refuses_a_foreign_secret_before_mutating() {
+        // The secret is checked against the held addresses, not trusted:
+        // a mismatch admits nobody and drops nobody.
+        let t = seeded();
+        let err = t
+            .refresh_current(
+                &family(),
+                "g-1",
+                7,
+                &secret(0xFF),
+                &["ed25519:alice", "ed25519:bob", "ed25519:dave"],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ScopeAddressError::ExporterSecretMismatch { epoch: 7, .. }
+            ),
+            "{err}"
+        );
+        assert!(
+            t.address_at(&family(), "g-1", 7, "ed25519:dave").is_none(),
+            "nobody admitted"
+        );
+        assert!(
+            t.address_at(&family(), "g-1", 7, "ed25519:carol").is_some(),
+            "nobody dropped"
+        );
+        assert_eq!(t.len(), 3);
+    }
+
+    #[test]
+    fn refresh_shares_the_install_refusals() {
+        let t = seeded();
+        let none: [&str; 0] = [];
+        assert!(matches!(
+            t.refresh_current(&family(), "g-1", 7, &secret(0xA1), &none),
+            Err(ScopeAddressError::EmptyMembership { epoch: 7 })
+        ));
+        assert!(matches!(
+            t.refresh_current(
+                &family(),
+                "g-1",
+                7,
+                &secret(0xA1),
+                &["ed25519:alice", "ed25519:alice"]
+            ),
+            Err(ScopeAddressError::DuplicateMember { .. })
+        ));
+        assert!(matches!(
+            t.refresh_current(&family(), "g-9", 7, &secret(0xA1), &MEMBERS),
+            Err(ScopeAddressError::UnknownGroup { .. })
+        ));
+        assert_eq!(t.len(), 3, "every refusal left the table as found");
     }
 
     // ── CIRISEdge#640 — member_status and groups(): the diagnostic reads ──

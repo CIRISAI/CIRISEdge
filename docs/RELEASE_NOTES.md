@@ -1,5 +1,40 @@
 # CIRISEdge Release Notes
 
+# v29.2.0 — `ScopeLifecycle::refresh_members`: same epoch, more members, nothing unaddressed
+
+**2026-09-22** (PR #649, CIRISEdge#648). MINOR: one additive verb on the lifecycle, one on the table.
+
+A room's roster is installed from `snapshot_for_nodes`, which resolves persons to nodes through
+the directory. A member whose occurrence announce has not reached this node yet lands in
+`unresolved`; the resolved subset is installed and the room works for everyone who resolved. When
+that announce arrives later, **MLS has not moved**: same epoch, one more member. Neither existing
+verb covers that — `install` refuses a held group, `advance` needs a new epoch — and
+`remove_group` + `install` drops every live address and this node's own registration to repair a
+table that was merely incomplete. The late member stayed unaddressed for the life of the epoch,
+with every log line reading healthy (the CIRISEdge#646 shape, again).
+
+- **`ScopeAddressTable::refresh_current(scope, group, epoch, secret, members) -> MembershipRefresh`**:
+  derives and admits the members the CURRENT slot lacks, drops the ones the roster no longer names
+  (current epoch only — an older epoch keeps its roster until its seal), and leaves every member
+  present on both sides byte-for-byte where it was. The secret is **checked, not trusted**: every
+  held member is re-derived and compared, and a mismatch (`ExporterSecretMismatch`) refuses the
+  whole call before anything moves. A non-current epoch is `EpochNotCurrent` — a refresh never
+  rotates. Atomic under the write lock.
+- **`ScopeLifecycle::refresh_members(scope, snapshot) -> TransitionOutcome`** (and the raw
+  `members_refreshed`): refuses a snapshot that omits this node **before** the table moves (that is
+  a `leave`, not a refresh), then calls `refresh_current`. **No sink call**: our own address at this
+  epoch is the one already registered, and the table proved it byte-for-byte. `TransitionOutcome.derived`
+  counts only the newly admitted members. INFO line `scope lifecycle REFRESHED …` with
+  `added` / `removed` / `unchanged`.
+- Composition for a host: on a roster re-resolution at an unchanged epoch, call `refresh_members`;
+  on an epoch change, `advance` as before. The same verb is what the self room needs when an
+  occurrence resolves late (`FSD/CONTENT_TRANSFER.md` §6.3).
+
+Tests: `scope_addressing` (admit-and-keep, current-epoch-only drop, non-current refused, foreign
+secret refused before mutation, shared install refusals) and `scope_lifecycle` (late node admitted
+with registration untouched, roster omitting us refused before the table moves, superseded epoch
+refused). Pins and wire unchanged. Ladder pair: **edge v29.2.0 + persist v46.1.0**.
+
 # v29.1.0 — adopt CIRISPersist v46.1.0: the provenance reads the key plane from the pointer, and edge deletes its builder
 
 **2026-09-21** (PR #645). MINOR: the wheel floor stays `>=46,<47`; no edge API moves.
