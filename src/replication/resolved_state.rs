@@ -59,6 +59,59 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use ciris_persist::federation::Audience;
+
+/// **How a peer came to be in the send set** — and therefore which rows it
+/// may be handed (CIRISPersist#884 / CIRISEdge#646, v29.3.0).
+///
+/// Persist's `send_set_for(k, cohort_scope)` is per scope: the consent set
+/// reaches every scope; the owner's own nodes are added for `self` and
+/// `family` rows; the family members' nodes for `family` rows only. Edge
+/// resolves one set per node and carries the basis with each recipient, so
+/// the per-row audience gate can refuse a row the basis does not cover.
+/// Without this a family member's node — in the set for family rows — would
+/// receive every `Global`-projected row this node advertises, which is not
+/// the set persist ruled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// A consent grant names the peer (or the person it is the bound
+    /// instrument of, CIRISEdge#524): every scope, as before.
+    Consent,
+    /// The peer is one of the owner's OWN nodes (persist `send_set_for(self)`,
+    /// the CC 3.3.6 self-collective, resolved to nodes): `self` and `family`
+    /// rows only.
+    SelfCollective,
+    /// The peer is a family member's node (persist `send_set_for(family)`):
+    /// `family` rows only.
+    Family,
+}
+
+impl Reach {
+    /// May a peer reached this way be handed a row that names `audience`?
+    /// The row's own audience gate (principal equality, membership) still
+    /// runs after this — this is the send-set half, that is the row half.
+    #[must_use]
+    pub(crate) fn admits(self, audience: &Audience) -> bool {
+        match self {
+            Self::Consent => true,
+            Self::SelfCollective => {
+                matches!(audience, Audience::SelfOnly | Audience::Family { .. })
+            }
+            Self::Family => matches!(audience, Audience::Family { .. }),
+        }
+    }
+
+    /// Stable tag for logs and withhold text.
+    #[must_use]
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::Consent => "consent",
+            Self::SelfCollective => "self_collective",
+            Self::Family => "family",
+        }
+    }
+}
+
 /// The consent-resolved set of peers this node may SEND consentable claims to
 /// this round — persist's live `consent:replication` peer projection for
 /// `local_key_id` (E7, revocation-folded). `Arc`-backed so the bridge can
@@ -80,6 +133,12 @@ pub(crate) struct ResolvedPeerSet {
     /// Recorded rather than hidden: a fail-closed narrowing is still a
     /// narrowing, and the withhold line must be able to say which one this is.
     owner_walk_complete: bool,
+    /// CIRISPersist#884 (v46.3.0) — the owner's OWN nodes beyond the consent
+    /// set (`send_set_for(local, self)`): [`Reach::SelfCollective`].
+    collective: Arc<HashSet<String>>,
+    /// CIRISPersist#884 — family members' nodes beyond the self set
+    /// (`send_set_for(local, family)`): [`Reach::Family`].
+    family_nodes: Arc<HashSet<String>>,
 }
 
 impl ResolvedPeerSet {
@@ -96,7 +155,36 @@ impl ResolvedPeerSet {
             send_set: Arc::new(peers.into_iter().collect()),
             owned_nodes: Arc::new(HashSet::new()),
             owner_walk_complete: true,
+            collective: Arc::new(HashSet::new()),
+            family_nodes: Arc::new(HashSet::new()),
         }
+    }
+
+    /// CIRISPersist#884 (v46.3.0) — widen by the self-collective: persist's
+    /// `send_set_for(local, self)` and `send_set_for(local, family)`, each a
+    /// superset of the consent set. What the consent set already names keeps
+    /// its [`Reach::Consent`]; the owner's own nodes beyond it become
+    /// [`Reach::SelfCollective`]; family members' nodes beyond THAT become
+    /// [`Reach::Family`]. No grant is read for either — CC 3.2 makes an
+    /// owner's consent to their own node a category error, and CC 3.3.6
+    /// makes the collective a cryptographic fact. The sets are NODES: persist
+    /// resolves each occurrence to the node that hosts it (CC 4.4.3.2.4.1(b)).
+    pub(crate) fn widened_by_self_collective(
+        mut self,
+        self_set: Vec<String>,
+        family_set: Vec<String>,
+    ) -> Self {
+        let collective: HashSet<String> = self_set
+            .into_iter()
+            .filter(|k| !self.send_set.contains(k))
+            .collect();
+        let family_nodes: HashSet<String> = family_set
+            .into_iter()
+            .filter(|k| !self.send_set.contains(k) && !collective.contains(k))
+            .collect();
+        self.collective = Arc::new(collective);
+        self.family_nodes = Arc::new(family_nodes);
+        self
     }
 
     /// **CIRISEdge#524 — the routing half, closed against persist v38.3.0's
@@ -152,8 +240,39 @@ impl ResolvedPeerSet {
     /// path can serve a consentable claim to a peer persist's consent
     /// projection did not authorize.
     pub(crate) fn recipient(&self, peer_key_id: &str) -> Option<ResolvedRecipient> {
-        (self.send_set.contains(peer_key_id) || self.owned_nodes.contains(peer_key_id))
-            .then(|| ResolvedRecipient(peer_key_id.to_owned()))
+        let reach = if self.send_set.contains(peer_key_id) || self.owned_nodes.contains(peer_key_id)
+        {
+            Reach::Consent
+        } else if self.collective.contains(peer_key_id) {
+            Reach::SelfCollective
+        } else if self.family_nodes.contains(peer_key_id) {
+            Reach::Family
+        } else {
+            return None;
+        };
+        Some(ResolvedRecipient {
+            key_id: peer_key_id.to_owned(),
+            reach,
+        })
+    }
+
+    /// Is `key_id` in the set ONLY because it is one of the owner's own
+    /// nodes, or a family member's (CIRISPersist#884)? Diagnostic, not a
+    /// capability — the capability is [`Self::recipient`].
+    pub(crate) fn routes_by_self_collective(&self, key_id: &str) -> Option<Reach> {
+        if self.collective.contains(key_id) {
+            Some(Reach::SelfCollective)
+        } else if self.family_nodes.contains(key_id) {
+            Some(Reach::Family)
+        } else {
+            None
+        }
+    }
+
+    /// How many peers the self-collective widening added beyond consent
+    /// (own nodes + family nodes).
+    pub(crate) fn collective_routed_len(&self) -> usize {
+        self.collective.len() + self.family_nodes.len()
     }
 
     /// **CIRISEdge#524 — DIAGNOSTIC ONLY.** Does the send-set NAME `key_id`?
@@ -214,13 +333,108 @@ impl ResolvedPeerSet {
 /// [`ResolvedPeerSet::recipient`], so possessing one is proof the consent
 /// membership check passed. Holding a raw `&str` peer id grants no such right:
 /// serving to it is unrepresentable without first resolving.
-pub(crate) struct ResolvedRecipient(String);
+///
+/// Carries the [`Reach`] that minted it: the per-row audience gate refuses a
+/// row the reach does not cover (a family member's node is not handed this
+/// node's `Global` rows), so the basis travels with the proof instead of
+/// being re-derived at the row.
+pub(crate) struct ResolvedRecipient {
+    key_id: String,
+    reach: Reach,
+}
 
 impl ResolvedRecipient {
     /// The peer key id this authorization is for — feed the per-record serve
     /// gates (#379 `infra:serve`, #396 item 6 `recipient_capability`), which
     /// further narrow WHAT this already-consent-included peer receives.
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        &self.key_id
+    }
+
+    /// How the peer came to be a recipient (CIRISPersist#884).
+    pub(crate) fn reach(&self) -> Reach {
+        self.reach
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// CIRISPersist#884 — the reach is the send-set half of the audience
+    /// question: consent reaches every scope, the owner's own nodes reach
+    /// `self` and `family`, a family member's node reaches `family` only.
+    #[test]
+    fn a_reach_admits_exactly_the_scopes_persist_puts_the_peer_in_the_set_for() {
+        let fam = Audience::Family {
+            family_key_id: "fam-1".to_owned(),
+        };
+        let com = Audience::Community {
+            community_key_id: "c-1".to_owned(),
+        };
+        for a in [&Audience::SelfOnly, &fam, &com, &Audience::Federation] {
+            assert!(
+                Reach::Consent.admits(a),
+                "consent reaches {}",
+                a.cohort_scope()
+            );
+        }
+        assert!(Reach::SelfCollective.admits(&Audience::SelfOnly));
+        assert!(Reach::SelfCollective.admits(&fam));
+        assert!(
+            !Reach::SelfCollective.admits(&com),
+            "own nodes get community rows from the community"
+        );
+        assert!(!Reach::SelfCollective.admits(&Audience::Federation));
+        assert!(Reach::Family.admits(&fam));
+        assert!(
+            !Reach::Family.admits(&Audience::SelfOnly),
+            "a family node never sees a self row"
+        );
+        assert!(!Reach::Family.admits(&Audience::Federation));
+    }
+
+    /// The widening classifies each peer by the NARROWEST axis that admits
+    /// it, and the consent set is never re-labelled: a consented peer that is
+    /// also the owner's node keeps its full reach.
+    #[test]
+    fn the_collective_widening_labels_each_node_by_its_axis_and_adds_nothing_else() {
+        let set = ResolvedPeerSet::from_consent_peers(v(&["peer-consented"]))
+            .widened_by_self_collective(
+                v(&["peer-consented", "my-laptop"]),
+                v(&["peer-consented", "my-laptop", "sister-phone"]),
+            );
+        assert_eq!(
+            set.recipient("peer-consented").unwrap().reach(),
+            Reach::Consent
+        );
+        assert_eq!(
+            set.recipient("my-laptop").unwrap().reach(),
+            Reach::SelfCollective
+        );
+        assert_eq!(
+            set.recipient("sister-phone").unwrap().reach(),
+            Reach::Family
+        );
+        assert!(set.recipient("stranger").is_none(), "no side door");
+        assert_eq!(set.collective_routed_len(), 2);
+        assert!(
+            !set.names("my-laptop"),
+            "`names` stays the DIRECT consent projection"
+        );
+        assert_eq!(
+            set.routes_by_self_collective("my-laptop"),
+            Some(Reach::SelfCollective)
+        );
+        assert_eq!(set.routes_by_self_collective("peer-consented"), None);
+        assert_eq!(
+            set.len(),
+            1,
+            "the consent count is untouched by the widening"
+        );
     }
 }

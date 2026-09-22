@@ -1,5 +1,49 @@
 # CIRISEdge Release Notes
 
+# v29.3.0 — adopt CIRISPersist v46.3.0: a self row reaches the owner's second device (R2), and the send set learns its reach
+
+**2026-09-22** (PR #650, CIRISPersist#884 / CIRISEdge#646). MINOR: persist v46.3.0 is additive; the
+wheel floor stays `>=46,<47` (all four ABI constants unmoved). Carries **CIRISVerify v16.1.0**
+(v16.0.0 removed the orphan `hw_token::get_token_signer` stub, which edge never called; v16.1.0
+adds `create_federation_identity_in`) — edge's three verify pins move in lockstep, one copy each of
+verify/keyring/crypto.
+
+**Rung R2 of `FSD/CONTENT_TRANSFER.md` §5.3 — the rung under every other rung.** A `self` row
+authored on one of the owner's nodes never reached the owner's other node: the send set was the
+consent projection alone, and an owner's consent to their own node is a CC 3.2 category error, so
+no grant ever named it. Persist v46.3.0 ships `send_set_for(k, cohort_scope)` — the consent set ∪
+the **nodes** hosting every occurrence of `k`'s principals (self), ∪ the nodes of every active
+family member (family) — resolved by persist from the occurrence plane to nodes, never occurrence
+keys (CC 4.4.3.2.4.1(b)).
+
+Edge consumes it in the one place recipients are minted:
+
+- `ResolvedPeerSet` is widened by `send_set_for(local, self)` and `send_set_for(local, family)`
+  (`widened_by_self_collective`), and every `ResolvedRecipient` now carries its **`Reach`** —
+  `Consent` (every scope, as before), `SelfCollective` (the owner's own nodes: `self`/`family` rows),
+  `Family` (family members' nodes: `family` rows only). `recipient()` stays the only minting door.
+- The per-row audience gate (`audience_withholds`, advertise AND fetch twin) checks
+  `reach.admits(audience)` before the principal/membership walk: a family member's node is never
+  handed this node's `Global` rows, and a family node never sees a `self` row. Withheld as
+  `RecipientNotInSendSet` with the axis named. On the fetch twin the recipient is now resolved
+  before the audience gate so both twins see the same reach.
+- `collective_routed_recipients` counter + DEBUG `attestation plane served by the SELF-COLLECTIVE`;
+  the send-set resolution logs `consent / owner_routed / collective_routed / complete`.
+
+Witnesses: `the_owners_second_node_is_a_recipient_with_no_grant_between_them` (the R2 row), the
+reach matrix, the widening's labelling, and `a_collective_routed_recipient_is_refused_rows_outside_its_reach`.
+
+**What persist v46.3.0 also fixed, which edge only needed to stop assuming:** the content-axis
+`key_grant` set is signed by the sealing NODE while the adopted row names the PERSON, so every
+second device retired the set as "not the author" — now `speaks_for(signer, author)` (shared
+principal), and `is_audience`'s self arm compares principals. `minter_of_blob(sha)` exists for the
+community source rule; the self/family source rule (§6.2) reads the author off the row and is the
+next edge cut, with the self room (§6.3) behind it.
+
+ABI constants unmoved (`DIRECTORY 5`, `SIGNER 1`, `OUTBOUND_QUEUE 1`, `ASYNC_EXECUTOR 1`). Pins:
+persist **v46.3.0**, verify **v16.1.0**, leviculum v0.26.0+ciris.1. Wire unchanged (v3). Ladder
+pair: **edge v29.3.0 + persist v46.3.0**.
+
 # v29.2.0 — `ScopeLifecycle::refresh_members`: same epoch, more members, nothing unaddressed
 
 **2026-09-22** (PR #649, CIRISEdge#648). MINOR: one additive verb on the lifecycle, one on the table.

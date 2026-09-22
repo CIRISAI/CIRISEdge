@@ -94,7 +94,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use super::refusal_backoff::{RefusalBackoff, RetryDisposition};
-use super::resolved_state::{ResolvedPeerSet, ResolvedRecipient};
+use super::resolved_state::{Reach, ResolvedPeerSet, ResolvedRecipient};
 use ciris_persist::federation::admission::has_accord_conferred_role;
 use ciris_persist::federation::consent_grammar::{self, ConsentTransferPolicy};
 use ciris_persist::federation::namespace::{self, Projection};
@@ -1375,6 +1375,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// of #524 actually firing. Stays zero on a fleet whose grants all name
     /// nodes. `Relaxed`.
     owner_routed_recipients: std::sync::atomic::AtomicUsize,
+    /// CIRISPersist#884 (v29.3.0) — recipients minted by the SELF-COLLECTIVE
+    /// axis: no grant names the peer, but it is one of the owner's own nodes
+    /// or a family member's (persist `send_set_for`). The line the field
+    /// could not previously see happen: a `self` row leaving for a second
+    /// device.
+    collective_routed_recipients: std::sync::atomic::AtomicUsize,
     /// CIRISEdge#531 — the node-wide bound on SIMULTANEOUS bulk sweeps. Built
     /// from [`BridgeConfig::advertise_sweep_permits`]. Lives on the bridge
     /// rather than on `BridgeConfig` so the config stays `Copy`, and because
@@ -1643,6 +1649,7 @@ impl FederationDirectoryReplicationBridge {
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
+            collective_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
             lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
@@ -1719,6 +1726,7 @@ impl FederationDirectoryReplicationBridge {
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
+            collective_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
             lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
@@ -3281,8 +3289,12 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     }
                     // CC 5.2 (v19.0.0) — the AUDIENCE gate's fetch twin: agrees
                     // with the advertise, so a row is never offered-then-refused
-                    // nor fetchable-when-unoffered.
+                    // nor fetchable-when-unoffered. The recipient is resolved
+                    // FIRST (memoized; the same mint the consent bound below
+                    // repeats) so its reach feeds the gate exactly as on the
+                    // advertise (CIRISPersist#884).
                     if let Some(peer) = peer_key_id {
+                        let resolved = self.resolve_attestation_recipient(peer).await?;
                         if self
                             .audience_withholds(
                                 Self::audience_of_row_value(inner),
@@ -3291,6 +3303,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                                     .and_then(serde_json::Value::as_str)
                                     .unwrap_or(""),
                                 peer,
+                                resolved.reach(),
                                 &mut AudienceMemo::default(),
                                 "fetch",
                             )
@@ -5396,6 +5409,7 @@ impl FederationDirectoryReplicationBridge {
         audience: Result<ciris_persist::federation::Audience, String>,
         attester: &str,
         peer: &str,
+        reach: Reach,
         memo: &mut AudienceMemo,
         site: &str,
     ) -> bool {
@@ -5412,6 +5426,31 @@ impl FederationDirectoryReplicationBridge {
                 return true;
             }
         };
+        // CIRISPersist#884 — the SEND-SET half of the audience question. A peer
+        // the self-collective axis admitted is in the set for `self`/`family`
+        // rows (own nodes) or `family` rows (family members' nodes) and for
+        // nothing wider; the row half below still runs on what passes.
+        if !reach.admits(&audience) {
+            self.withhold(
+                WithholdReason::RecipientNotInSendSet,
+                peer,
+                &format!(
+                    "{site}: peer reached by the `{}` axis, which carries no `{}` rows",
+                    reach.tag(),
+                    audience.cohort_scope()
+                ),
+            );
+            tracing::debug!(
+                peer,
+                attester,
+                audience = audience.cohort_scope(),
+                reach = reach.tag(),
+                site,
+                "attestation withheld — the recipient's send-set reach does not cover the \
+                 row's scope (persist `send_set_for` is per scope; CIRISPersist#884)"
+            );
+            return true;
+        }
         let served = match &audience {
             Audience::SelfOnly => {
                 let row_owner = self.principal_of(attester, memo).await;
@@ -5604,6 +5643,23 @@ impl FederationDirectoryReplicationBridge {
                     "attestation plane served by OWNER-BINDING: no grant names this peer, \
                      but a grant names the person it is the bound instrument of \
                      (persist `nodes_owned_by`, CIRISEdge#524)"
+                );
+            }
+            // CIRISPersist#884 — the SELF-COLLECTIVE axis: no grant, no owner
+            // of a grant subject — the peer is one of the owner's own nodes, or
+            // a family member's. Named here because "a self row left for the
+            // second device" is the rung persist#884 could find no witness of.
+            Some(_) if set.routes_by_self_collective(peer).is_some() => {
+                self.collective_routed_recipients
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    peer = peer_label,
+                    reach = set.routes_by_self_collective(peer).map_or("", Reach::tag),
+                    send_set_size = set.len(),
+                    collective_routed = set.collective_routed_len(),
+                    "attestation plane served by the SELF-COLLECTIVE: no grant names this \
+                     peer — it is one of the owner's own nodes, or a family member's; only \
+                     rows of that reach may follow (persist `send_set_for`, CIRISPersist#884)"
                 );
             }
             Some(_) => {}
@@ -5807,8 +5863,24 @@ impl FederationDirectoryReplicationBridge {
         // CIRISEdge#524 — resolve the grant subjects' bound nodes BEFORE the
         // set is minted, so `recipient` stays the one door and stays pure.
         let (owned_nodes, complete) = self.nodes_owned_by_grant_subjects(&peers).await;
+        // CIRISPersist#884 (v46.3.0) — the self-collective axis, in NODES.
+        // `send_set_for(local, self)` ⊇ consent ∪ the owner's own nodes;
+        // `send_set_for(local, family)` ⊇ that ∪ family members' nodes. A read
+        // that fails narrows (fail-closed, like the owner walk) and is memoized
+        // narrower rather than re-read per envelope — the #400 lesson.
+        let (self_set, family_set, collective_complete) =
+            self.self_collective_send_sets(local).await;
         let set = ResolvedPeerSet::from_consent_peers(peers)
-            .widened_by_owner_binding(owned_nodes, complete);
+            .widened_by_owner_binding(owned_nodes, complete && collective_complete)
+            .widened_by_self_collective(self_set, family_set);
+        tracing::debug!(
+            consent = set.len(),
+            owner_routed = set.owner_routed_len(),
+            collective_routed = set.collective_routed_len(),
+            complete = set.owner_walk_complete(),
+            "attestation send-set resolved (consent ∪ owner-bound ∪ self-collective; \
+             CIRISEdge#396/#524, CIRISPersist#884)"
+        );
         if let Ok(mut memo) = self.consent_memo.lock() {
             *memo = Some((set.clone(), Instant::now()));
         }
@@ -5840,6 +5912,40 @@ impl FederationDirectoryReplicationBridge {
     /// identity type here would be edge re-deriving a rule it does not own —
     /// and would silently narrow routing if the rule ever widened. A node
     /// subject's walk is simply empty.
+    /// Persist's `send_set_for(local, self)` and `(local, family)`
+    /// (CIRISPersist#884, v46.3.0): the owner's own nodes and the family
+    /// members' nodes, resolved by persist from the occurrence plane to the
+    /// NODES that host them — never occurrence keys. Returns the two sets and
+    /// whether both reads answered.
+    async fn self_collective_send_sets(&self, local: &str) -> (Vec<String>, Vec<String>, bool) {
+        use ciris_persist::federation::self_collective::send_set_for;
+        use ciris_persist::federation::types::cohort_scope;
+        let dir = &*self.directory as &dyn ciris_persist::federation::FederationDirectory;
+        let mut complete = true;
+        let mut read = |scope: &'static str, r: Result<Vec<String>, _>| match r {
+            Ok(v) => v,
+            Err(e) => {
+                complete = false;
+                tracing::debug!(
+                    scope,
+                    error = %e,
+                    "self-collective send-set read failed — the set is NARROWER than persist's \
+                     (fail-closed; CIRISPersist#884)"
+                );
+                Vec::new()
+            }
+        };
+        let self_set = read(
+            cohort_scope::SELF,
+            send_set_for(dir, local, cohort_scope::SELF).await,
+        );
+        let family_set = read(
+            cohort_scope::FAMILY,
+            send_set_for(dir, local, cohort_scope::FAMILY).await,
+        );
+        (self_set, family_set, complete)
+    }
+
     async fn nodes_owned_by_grant_subjects(&self, subjects: &[String]) -> (Vec<String>, bool) {
         let mut owned = Vec::new();
         let mut complete = true;
@@ -6112,6 +6218,7 @@ impl FederationDirectoryReplicationBridge {
     /// The sweep permit covers the read AND the gate loop, and is released
     /// before returning: the loop is where the `serde_json::Value` per row is
     /// built, so it is part of the materialisation the width bound is about.
+    #[allow(clippy::too_many_lines)] // one gate loop; every gate is a named helper already
     async fn attestation_page(
         &self,
         since: Option<ResumeCursor>,
@@ -6268,6 +6375,7 @@ impl FederationDirectoryReplicationBridge {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or(""),
                         peer.as_str(),
+                        peer.reach(),
                         &mut ctx.audience,
                         "advertise",
                     )
@@ -16052,7 +16160,14 @@ pub(crate) mod tests {
         let mut memo = AudienceMemo::default();
         assert!(
             bridge
-                .audience_withholds(Err(err), "person-alice", "node-bob", &mut memo, "test")
+                .audience_withholds(
+                    Err(err),
+                    "person-alice",
+                    "node-bob",
+                    Reach::Consent,
+                    &mut memo,
+                    "test"
+                )
                 .await,
             "unreadable audience ⇒ withheld"
         );
@@ -16534,6 +16649,126 @@ pub(crate) mod tests {
             set.owner_routed_len(),
             1,
             "exactly the one bound node, not a widening to everything"
+        );
+    }
+
+    // ─── CIRISPersist#884 (v29.3.0) — the SELF-COLLECTIVE axis, in nodes ──
+
+    /// **The R2 witness** (`FSD/CONTENT_TRANSFER.md` §5.3): a `self` row
+    /// authored on one of the owner's nodes reaches the owner's OTHER node
+    /// with no grant between them. Before v29.3.0 the send set was the
+    /// consent projection alone, an owner's consent to their own node is a
+    /// CC 3.2 category error, and so the row never left. Persist v46.3.0's
+    /// `send_set_for(local, self)` resolves the self-collective to NODES;
+    /// the one minting door labels the peer with its reach.
+    #[tokio::test]
+    async fn the_owners_second_node_is_a_recipient_with_no_grant_between_them() {
+        let local = "this-node";
+        let backend = owner_axis_backend(true).await; // person-bob owns node-bob
+        register_fixture_keys(&backend, &[(local, identity_type::NODE)]).await;
+        seed_owner_binding(&backend, "person-bob", local).await; // …and owns us
+        let bridge = bridge_over(&backend, &["node-bob", "node-stranger"])
+            .with_local_key_id(Some(local.to_string()));
+        // NO consent grant of any kind.
+        let set = bridge
+            .resolved_peer_set(local)
+            .await
+            .expect("the send-set resolves");
+        assert_eq!(set.len(), 0, "no grant names anyone (the field's shape)");
+        let bob = set
+            .recipient("node-bob")
+            .expect("the owner's other node is a recipient with no grant (CIRISPersist#884)");
+        assert_eq!(
+            bob.reach(),
+            Reach::SelfCollective,
+            "…by the self-collective axis"
+        );
+        assert!(
+            set.recipient("node-stranger").is_none(),
+            "a node nobody owns is still withheld — the widening is the owner's own nodes, \
+             not everyone"
+        );
+        assert!(set.recipient(local).is_none(), "never ourselves");
+        assert_eq!(set.collective_routed_len(), 1);
+        assert!(set.owner_walk_complete(), "both persist reads answered");
+
+        // The mint through the bridge's one door books the axis, not a withhold.
+        let resolved = bridge
+            .resolve_attestation_recipient("node-bob")
+            .await
+            .expect("minted through resolve_attestation_recipient");
+        assert_eq!(resolved.as_str(), "node-bob");
+        assert_eq!(
+            bridge
+                .collective_routed_recipients
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the self-collective route is counted, so a run can say it happened"
+        );
+    }
+
+    /// The reach is the SEND-SET half of the audience gate: a peer the
+    /// collective axis admitted is handed `self`/`family` rows (own node) or
+    /// `family` rows (family member's node) and never this node's `Global`
+    /// rows — persist's `send_set_for` is per scope, and this is the edge
+    /// half that keeps it so. Checked before any principal walk, so it needs
+    /// no roster.
+    #[tokio::test]
+    async fn a_collective_routed_recipient_is_refused_rows_outside_its_reach() {
+        use ciris_persist::federation::Audience;
+        let backend = owner_axis_backend(true).await;
+        let metrics = crate::observability::EdgeMetrics::default();
+        let bridge = audience_bridge(&backend).with_metrics(Some(metrics.clone()));
+        let mut memo = AudienceMemo::default();
+        for reach in [Reach::SelfCollective, Reach::Family] {
+            assert!(
+                bridge
+                    .audience_withholds(
+                        Ok(Audience::Federation),
+                        "person-bob",
+                        "node-bob",
+                        reach,
+                        &mut memo,
+                        "test",
+                    )
+                    .await,
+                "a `{}`-reached peer is not handed a federation row",
+                reach.tag()
+            );
+        }
+        assert!(
+            bridge
+                .audience_withholds(
+                    Ok(Audience::SelfOnly),
+                    "person-bob",
+                    "node-bob",
+                    Reach::Family,
+                    &mut memo,
+                    "test",
+                )
+                .await,
+            "a family member's node is never handed a self row"
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.withholds_by_reason.len(),
+            1,
+            "one reason, the send-set branch: {:?}",
+            snap.withholds_by_reason
+        );
+        // Consent reach: the reach check passes and the row half runs — a
+        // federation row is served to anyone consent-included.
+        assert!(
+            !bridge
+                .audience_withholds(
+                    Ok(Audience::Federation),
+                    "person-bob",
+                    "node-bob",
+                    Reach::Consent,
+                    &mut memo,
+                    "test",
+                )
+                .await
         );
     }
 

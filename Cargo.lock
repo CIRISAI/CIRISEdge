@@ -969,8 +969,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-crypto"
-version = "15.2.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.2.0#3c7115e6782f432f9d4a03dde9bd0d93767f5923"
+version = "16.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v16.1.0#d99da1c24d69ecaab2d0bd7c858aa606a608c778"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "29.2.0"
+version = "29.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1059,8 +1059,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-keyring"
-version = "15.2.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.2.0#3c7115e6782f432f9d4a03dde9bd0d93767f5923"
+version = "16.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v16.1.0#d99da1c24d69ecaab2d0bd7c858aa606a608c778"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1095,8 +1095,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "46.1.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v46.1.0#f49c6c2d2459cd49ad627bd87a42cc1c042118d4"
+version = "46.3.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v46.3.0#25e41f43ebc54e8d6c62db144b64ef75c0691c7f"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1134,8 +1134,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-verify-core"
-version = "15.2.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v15.2.0#3c7115e6782f432f9d4a03dde9bd0d93767f5923"
+version = "16.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v16.1.0#d99da1c24d69ecaab2d0bd7c858aa606a608c778"
 dependencies = [
  "android_system_properties",
  "async-trait",
