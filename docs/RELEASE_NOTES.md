@@ -1,5 +1,22 @@
 # CIRISEdge Release Notes
 
+# v29.3.1 — repin CIRISPersist v46.3.1: a claimed node reads its own config again
+
+**2026-09-22** (PR #653, CIRISEdge#652 / CIRISPersist#888 / CIRISServer#624). PATCH: a pin move only —
+no edge source changes, ABI constants unmoved, verify stays v16.1.0, wheel floor `>=46,<47`.
+
+persist v46.3.1 (CIRISPersist#889) fixes the read-side `self` gate: since #873 a **claimed** node
+could not read its own `self`-scoped rows (`config:*`) because the gate compared the caller's
+*resolved* identity to the row's *raw* target. On the server that was `GET /v1/config → {}` on a
+claimed node and a 500 on the second announce (CIRISServer#624, blocking CIRISAgent#1184). The
+server's persist pin is capped by edge's exact `tag =`, so the fix reaches it only through this tag.
+
+Persist's crate-level `admits` gained a `dimension` parameter; edge does not call it (edge's own
+`swarm::scope` gate of the same name is unrelated), so the bump is source-compatible — verified by
+`cargo check --all-targets` and CI's three clippy combos against v46.3.1.
+
+Ladder pair: **edge v29.3.1 + persist v46.3.1** (verify v16.1.0, leviculum v0.26.0+ciris.1).
+
 # v29.3.0 — adopt CIRISPersist v46.3.0: a self row reaches the owner's second device (R2), and the send set learns its reach
 
 **2026-09-22** (PR #650, CIRISPersist#884 / CIRISEdge#646). MINOR: persist v46.3.0 is additive; the
