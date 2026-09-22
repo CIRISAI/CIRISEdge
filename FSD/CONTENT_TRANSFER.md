@@ -183,7 +183,7 @@ is the allowlist. Inheriting the community rows would demand a widening (R1) and
 |---|---|---|---|---|
 | **R0** producer writes | seal under a per-write DEK wrapped to **every active occurrence**; pointer (`tier: InvisibleEncrypted`, `epoch: None`) + citation; **no holder claim** (I52). The row names its author; the self group id is a **function of the author** (§6.2), not a field | persist `put_blob_scoped` (self branch) | `readable_by_nobody` | persist I52 ✓; `store_gate::an_invisible_scope_cannot_be_announced_however_the_operator_asks` ✓ |
 | **R1** — | no widening: the authored row IS the row | — | — | — |
-| **R2** row reaches every node of the identity | the **nodes hosting** the identity's active occurrences are **implicit** send-set members for `SelfOwn` planes — no grant (CC 3.3.6 / 3.2); occurrence → node by CC 4.4.3.2.4.1(b) | **persist** `consent_peers_by_principals` (§6.1) | `RecipientNotInSendSet` (today: silent — the row never leaves) | — *(persist: "a self row authored on A is held on B with no grant between them")* |
+| **R2** row reaches every node of the identity | the **nodes hosting** the identity's active occurrences are **implicit** send-set members for `SelfOwn` planes — no grant (CC 3.3.6 / 3.2); occurrence → node by CC 4.4.3.2.4.1(b) | **persist** `send_set_for(k, self)` (v46.3.0); edge `ResolvedPeerSet::widened_by_self_collective` + `Reach` (v29.3.0) | `RecipientNotInSendSet` (names the axis: `peer reached by the self_collective axis, which carries no federation rows`) | persist I137–I140 ✓; edge `bridge::the_owners_second_node_is_a_recipient_with_no_grant_between_them` ✓, `resolved_state::a_reach_admits_exactly_the_scopes…` ✓ |
 | **R3** key reaches every occurrence | the content-axis set travels with the row (`key_grant:*` at self ⇒ `SelfOwn`); **retroactive on new occurrence** (CC 8.1.12.4) | persist cascade (write ✓); persist retroactive (§6.5) | `NotGranted` | write: cascade tests ✓; retroactive: — *(persist: "a device admitted after the write opens the write")* |
 | **R4** holder known | **no discovery, no minter read.** Holders = `contact::resolve(row.author_key_id).nodes` — the author's nodes; the sealing node is among them, and on the content axis the minter *is* the author (admission rule) | edge `pull_one_inner` source rule (§6.2) | `NoOtherNode` (terminal, honest) — never `NoHolders` for these scopes | — *(edge: "a self row's pull asks the author's nodes, never list_holders")* |
 | **R5** holder addressed | `BlobMeaning::project` yields `Group { SelfOnly, group_id = identity }` (today: `GroupWithoutId`); the **self room** installed: members = the identity's nodes (§6.3) | edge `meaning.rs` self arm; `self_addressing::snapshot`; host drives install / advance / refresh | `blob_group_not_installed { scope: self }` | — *(edge: "two nodes of one identity derive each other's self addresses"; "a self row projects its identity as the group id")* |
@@ -228,16 +228,24 @@ occurrences**: an occurrence is a KEM target (CC 3.3.6.1), and the runtime hosts
 occurrences with no destination and, under `use_node_identity` (#541), an actor occurrence whose
 node is a different key. The occurrence → node step is CC 4.4.3.2.4.1(b) — the occurrence's signed
 `transport_destination` — which is the resolution `contact::resolve` and `snapshot_for_nodes`
-already perform for community members; persist's send set is already in node key ids. Persist's
-proposed `send_set_for(k, cohort_scope)` (persist#884) is the right door — with the union taken over
-the **nodes hosting** each occurrence (`nodes_owned_by` the principal), not the occurrence keys. No
-grant is authored or read for this set: CC 3.2 makes an owner's consent to their own node a category error,
+already perform for community members; persist's send set is already in node key ids. Persist
+v46.3.0 ships it as `send_set_for(k, cohort_scope)`, the union taken over the **nodes hosting** each
+occurrence (`nodes_owned_by` over `principals_of(k)`), never the occurrence keys. Edge v29.3.0
+consumes it in the one minting door: `ResolvedPeerSet` is widened by the `self` and `family` sets and
+each recipient carries its `Reach` (`Consent` / `SelfCollective` / `Family`), which the per-row
+audience gate checks before the principal walk — so a family member's node is in the set for
+`family` rows and for nothing wider, exactly persist's per-scope rule. No grant is authored or read
+for this set: CC 3.2 makes an owner's consent to their own node a category error,
 CC 3.3.6 makes membership a cryptographic fact. Edge consumes it through the existing
 `resolved_peer_set`; nothing on edge changes at this rung except that the rows arrive.
 
-**Today** the set is explicit grants only, the server authors none between an owner's nodes, and
-persist#884's own report could find no witness of a self row on a second device. This is the rung
-under every other rung, and it is the one persist's reading on #884 assumed rather than measured.
+**Before v46.3.0 / v29.3.0** the set was explicit grants only, the server authored none between an
+owner's nodes, and persist#884's own report could find no witness of a self row on a second device.
+This was the rung under every other rung, and the one persist's reading on #884 assumed rather than
+measured. Persist v46.3.0 also closed the defect under §6.2's premise: the content-axis set is signed
+by the sealing NODE while the adopted row names the PERSON, so `signer == author` retired every set on
+a second device — now `speaks_for(signer, author)` (shared principal), and `is_audience`'s self arm
+compares principals.
 
 ### 6.2 The holder is known by construction — the source rule (edge; no new persist read)
 
