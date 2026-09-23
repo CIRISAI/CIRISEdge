@@ -192,14 +192,14 @@ pub fn decide(
                 };
             }
         }
-        let missing: Vec<String> = roster
-            .iter()
-            .filter(|n| !mine.members.iter().any(|m| m == *n))
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            return SelfRoomAction::Add(missing);
-        }
+        // REMOVAL FIRST (CIRISEdge#646 review). An add cannot be performed
+        // until the new device's KeyPackage row arrives, and that is an
+        // asynchronous wait on another node; a removal needs nothing but this
+        // node. Ordering additions first therefore lets one device's pending
+        // bootstrap hold a REVOKED device inside the tree — deriving every
+        // epoch that follows — for as long as the KeyPackage is late. Forward
+        // secrecy must not be blocked by an unrelated wait, so the departed
+        // leave first and the newcomer joins on a later tick.
         let departed: Vec<String> = mine
             .members
             .iter()
@@ -208,6 +208,14 @@ pub fn decide(
             .collect();
         if !departed.is_empty() {
             return SelfRoomAction::Remove(departed);
+        }
+        let missing: Vec<String> = roster
+            .iter()
+            .filter(|n| !mine.members.iter().any(|m| m == *n))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return SelfRoomAction::Add(missing);
         }
         return SelfRoomAction::Idle;
     }
@@ -361,6 +369,33 @@ mod tests {
             ),
             SelfRoomAction::Remove(vec!["node-gone".to_owned()]),
             "a revoked occurrence leaves the tree, not just the directory"
+        );
+    }
+
+    /// **Revocation is never blocked by a bootstrap wait** (CIRISEdge#646
+    /// review). When the roster gains a device and loses one in the same
+    /// tick, the ADD cannot be performed until the newcomer's KeyPackage row
+    /// arrives — an asynchronous wait on another node — while the REMOVE
+    /// needs nothing but this node. Ordering additions first would hold a
+    /// revoked device inside the tree, deriving every epoch that follows,
+    /// for as long as the KeyPackage is late.
+    #[test]
+    fn a_revoked_device_leaves_before_a_new_one_is_waited_on() {
+        let r = roster(&["node-a", "node-new"]);
+        assert_eq!(
+            decide(
+                "node-a",
+                &r,
+                Some(&held(&["node-a", "node-revoked"], 1, "node-a")),
+                None
+            ),
+            SelfRoomAction::Remove(vec!["node-revoked".to_owned()]),
+            "forward secrecy first; the newcomer joins on a later tick"
+        );
+        // And once it has left, the newcomer is added as before.
+        assert_eq!(
+            decide("node-a", &r, Some(&held(&["node-a"], 1, "node-a")), None),
+            SelfRoomAction::Add(vec!["node-new".to_owned()])
         );
     }
 

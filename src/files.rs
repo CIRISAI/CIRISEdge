@@ -51,7 +51,7 @@ use crate::group_content::{BlobPointer, ContentField, GroupContentStore, SealReq
 use crate::replication::attestation_bind::{share, CrossingBasis, Shared, Signers};
 use crate::scope_room::ScopeRoom;
 use ciris_persist::federation::types::cohort_scope::CryptoTier;
-use ciris_persist::federation::{Attestation, FederationDirectory};
+use ciris_persist::federation::{Attestation, FederationDirectory, ServedAttestation};
 
 /// The dimension a file row carries. Distinct from `chat:message:v1` so a
 /// drive can enumerate files without walking every content row, and so a
@@ -79,6 +79,58 @@ pub struct FileWrite<'a> {
     pub asserted_at: DateTime<Utc>,
 }
 
+/// Why a file was not published. A door that returns one string for
+/// "persist refused the seal" and "nobody can read this" makes the caller
+/// parse prose to find out which; each arm here has a different remedy.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FileError {
+    /// The seal itself was refused.
+    #[error("seal into {room}: {detail}")]
+    Seal {
+        /// The room the write was for.
+        room: String,
+        /// Persist's refusal.
+        detail: String,
+    },
+    /// **Sealed and readable by nobody** — an encrypted tier resolved NO
+    /// grantable occurrence, so the bytes are unopenable by every party
+    /// including their author (`SealedContent::readable_by_nobody`).
+    ///
+    /// Refused rather than reported as success: the row would cross, the
+    /// bytes would replicate, and every reader — the author's own second
+    /// device first — would read `NotGranted` forever. The remedy is an
+    /// occurrence with content-KEM keys (CC 3.3.6.1), not a retry.
+    #[error(
+        "{room}: sealed and readable by NOBODY — no grantable occurrence resolved          (excluded: {excluded:?}); publish refused rather than crossing bytes no one can open"
+    )]
+    ReadableByNobody {
+        /// The room the write was for.
+        room: String,
+        /// Occurrences persist excluded fail-secure, if any.
+        excluded: Vec<String>,
+    },
+    /// The authored row could not be stored locally.
+    #[error("author {attestation_id}: {detail}")]
+    Author {
+        /// The row's id.
+        attestation_id: String,
+        /// The store's error.
+        detail: String,
+    },
+    /// The crossing into the room's audience failed, so the row exists here
+    /// and nowhere else.
+    #[error("cross into {room}: {detail}")]
+    Cross {
+        /// The room the write was for.
+        room: String,
+        /// The crossing's error.
+        detail: String,
+    },
+    /// The row was built but could not be signed or canonicalized.
+    #[error("build the file row: {0}")]
+    Row(String),
+}
+
 /// What [`publish`] did.
 #[derive(Debug, Clone)]
 pub struct PublishedFile {
@@ -90,6 +142,15 @@ pub struct PublishedFile {
     pub tier: CryptoTier,
     /// Where the crossing placed the row that others receive.
     pub shared: Shared,
+    /// Occurrence key ids that hold a grant — who can open it. Empty for
+    /// commons-tier content, which needs none.
+    pub granted: Vec<String>,
+    /// Occurrence key ids persist excluded **fail-secure** for carrying no
+    /// usable encryption keys. Non-empty means a PARTIAL readability loss:
+    /// the file crossed, and those parties cannot open it. Surfaced rather
+    /// than dropped — a caller that does not look still gets the file, but a
+    /// caller that does can say who is missing it and why.
+    pub excluded: Vec<String>,
 }
 
 /// **Write a file into a room** — seal, author, cross.
@@ -106,15 +167,22 @@ pub struct PublishedFile {
 ///    replicates nowhere until it crosses, so skipping this is precisely
 ///    "correct here, invisible everywhere else".
 ///
+/// Sealed-and-readable-by-nobody is **refused** (`FileError::ReadableByNobody`):
+/// crossing bytes no party can open — the author's own second device
+/// included — is a success report for a permanent `NotGranted`. A PARTIAL
+/// loss is not refused (one member without content-KEM keys must not block
+/// everyone else, which is persist's fail-secure exclusion working as
+/// designed) but it is reported, in [`PublishedFile::excluded`].
+///
 /// # Errors
-/// The seal's refusal, the store's, or the crossing's, as a string naming
-/// which of the three failed.
+/// [`FileError`], naming which of seal / readability / author / crossing
+/// failed.
 pub async fn publish(
     directory: &dyn FederationDirectory,
     store: &dyn GroupContentStore,
     signers: Signers<'_>,
     write: &FileWrite<'_>,
-) -> Result<PublishedFile, String> {
+) -> Result<PublishedFile, FileError> {
     let author_key_id = signers.node.key_id.clone();
     // Persist's group slot per cohort: the community at `community`, the
     // OWNER at `self`, the family at `family` — which is exactly the id the
@@ -131,15 +199,41 @@ pub async fn publish(
             media_type: Some(write.media_type),
         })
         .await
-        .map_err(|e| format!("seal into {}: {e}", write.room))?;
+        .map_err(|e| FileError::Seal {
+            room: write.room.to_string(),
+            detail: e.to_string(),
+        })?;
 
-    let row = file_row(signers.node, write, &sealed.pointer).await?;
+    // Checked BEFORE the row is authored, so a file nobody can open never
+    // becomes a row somebody has to revoke.
+    if sealed.readable_by_nobody() {
+        return Err(FileError::ReadableByNobody {
+            room: write.room.to_string(),
+            excluded: sealed.excluded.clone(),
+        });
+    }
+    if !sealed.excluded.is_empty() {
+        tracing::warn!(
+            room = %write.room,
+            granted = sealed.granted.len(),
+            excluded = ?sealed.excluded,
+            "file sealed with PARTIAL readability — these occurrences carry no usable \
+             content-KEM keys and will read NotGranted (CC 3.3.6.1)"
+        );
+    }
+
+    let row = file_row(signers.node, write, &sealed.pointer)
+        .await
+        .map_err(FileError::Row)?;
     directory
         .put_attestation_authored(ciris_persist::federation::SignedAttestation {
             attestation: row.clone(),
         })
         .await
-        .map_err(|e| format!("author {}: {e}", row.attestation_id))?;
+        .map_err(|e| FileError::Author {
+            attestation_id: row.attestation_id.clone(),
+            detail: e.to_string(),
+        })?;
 
     let crossing = share(
         directory,
@@ -149,13 +243,18 @@ pub async fn publish(
         signers,
     )
     .await
-    .map_err(|e| format!("cross into {}: {e}", write.room))?;
+    .map_err(|e| FileError::Cross {
+        room: write.room.to_string(),
+        detail: e,
+    })?;
 
     Ok(PublishedFile {
         row,
         pointer: sealed.pointer,
         tier: sealed.tier,
         shared: crossing.shared,
+        granted: sealed.granted,
+        excluded: sealed.excluded,
     })
 }
 
@@ -312,40 +411,101 @@ impl FileRow {
     }
 }
 
-/// **The drive read** — every file row this node holds for `room`, newest
-/// last (CIRISServer#615 §3).
+/// How many directory pages [`in_room`] will walk before giving up. A
+/// drive listing must not turn into an unbounded scan of the attestation
+/// plane on a node that holds millions of rows.
+const MAX_LISTING_PAGES: usize = 64;
+
+/// The directory page size [`in_room`] reads while looking for `limit`
+/// matching files.
+const LISTING_PAGE: u32 = 256;
+
+/// **The drive read** — up to `limit` file rows this node holds for `room`,
+/// oldest first by serve position (CIRISServer#615 §3).
 ///
-/// Filters on the room's own facts: the dimension, the row's cohort scope,
-/// and the cohort target when the room has one. A self room's files are the
-/// `self`-scoped file rows — which on a second device are exactly the ones
-/// that arrived over the row plane, bytes or no bytes.
+/// # Why this pages
+///
+/// The directory's listing is over the WHOLE attestation plane, and the
+/// room-and-dimension filter runs here. Asking it for `limit` rows and
+/// filtering afterwards returns however many of that global page happened to
+/// be this room's files — which on a busy node is none, and, because every
+/// call restarts at the beginning, the files on later pages are invisible
+/// FOREVER rather than merely late. So the cursor is walked until `limit`
+/// matching files are collected or the plane is exhausted
+/// (`MAX_LISTING_PAGES` caps the walk).
+///
+/// A directory that could filter by `cohort_scope` and dimension would make
+/// this one query; `AttestationFilter` has no such axis today
+/// (CIRISEdge#352), which is why the walk is here and bounded.
+///
+/// # What counts as this room's file
+///
+/// The dimension, the row's cohort scope, AND the room's identity — the
+/// last of which differs by kind: a community or family row names its
+/// target in the envelope, while a `self` row names none (the owner IS the
+/// target), so a self listing matches on the POINTER's group slot, which
+/// persist fills with the owner at that tier. A self row whose pointer
+/// names nobody is skipped rather than shown: a node that holds more than
+/// one identity's self rows — any server — would otherwise return every
+/// identity's file metadata for every identity's drive.
 ///
 /// # Errors
 /// The directory's, unchanged.
 pub async fn in_room(
     directory: &dyn FederationDirectory,
     room: &ScopeRoom,
-    limit: u32,
+    limit: usize,
 ) -> Result<Vec<FileRow>, String> {
-    let rows = directory
-        .list_attestations_since(None, limit)
-        .await
-        .map_err(|e| format!("list files in {room}: {e}"))?;
-    Ok(rows
-        .into_iter()
-        .map(|signed| signed.attestation)
-        .filter(|row| row.cohort_scope == room.row_scope_token())
-        .filter(|row| match room.cohort_target_field() {
-            None => true,
-            Some(field) => {
-                row.attestation_envelope
-                    .get(field)
-                    .and_then(serde_json::Value::as_str)
-                    == Some(room.content_group_id())
+    let mut out: Vec<FileRow> = Vec::new();
+    let mut cursor: Option<(DateTime<Utc>, String)> = None;
+    for _ in 0..MAX_LISTING_PAGES {
+        if out.len() >= limit {
+            break;
+        }
+        let page = directory
+            .list_attestations_since(cursor.clone(), LISTING_PAGE)
+            .await
+            .map_err(|e| format!("list files in {room}: {e}"))?;
+        if page.is_empty() {
+            break;
+        }
+        cursor = page.last().map(ServedAttestation::resume_pair);
+        let exhausted = page.len() < LISTING_PAGE as usize;
+        for served in page {
+            if out.len() >= limit {
+                break;
             }
-        })
-        .filter_map(|row| FileRow::from_row(&row))
-        .collect())
+            if let Some(file) = belongs_to(room, &served.attestation) {
+                out.push(file);
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Is `row` one of `room`'s files? See [`in_room`] for why the identity
+/// check differs per kind.
+fn belongs_to(room: &ScopeRoom, row: &Attestation) -> Option<FileRow> {
+    if row.cohort_scope != room.row_scope_token() {
+        return None;
+    }
+    let file = FileRow::from_row(row)?;
+    let names_this_room = match room.cohort_target_field() {
+        Some(field) => {
+            row.attestation_envelope
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                == Some(room.content_group_id())
+        }
+        // Self: the pointer's group slot carries the owner. Absent ⇒ skipped,
+        // never shown — an unattributable self row must not appear in
+        // somebody's drive.
+        None => file.pointer.community_key_id == room.content_group_id(),
+    };
+    names_this_room.then_some(file)
 }
 
 #[cfg(test)]
@@ -395,6 +555,53 @@ mod tests {
         ))
         .is_none());
         assert!(FileRow::from_row(&row_with(FILE_DIMENSION, serde_json::json!({}))).is_none());
+    }
+
+    /// CIRISEdge#646 review — a self listing must name ITS identity. A node
+    /// that holds more than one identity's self rows (any server) would
+    /// otherwise hand every identity's file metadata to every drive.
+    #[test]
+    fn a_self_listing_matches_the_identity_and_never_another_persons_rows() {
+        let sha = "cc".repeat(32);
+        let mine = row_with(
+            FILE_DIMENSION,
+            serde_json::json!({ crate::chat::FIELD_CONTENT: pointer(&sha) }),
+        );
+        let alice = ScopeRoom::self_collective("alice-fed");
+        assert!(
+            belongs_to(&alice, &mine).is_some(),
+            "the pointer's group slot carries the owner at the self tier"
+        );
+        // Bob's drive must not show alice's file, though both rows are
+        // `self`-scoped and both are files.
+        assert!(belongs_to(&ScopeRoom::self_collective("bob-fed"), &mine).is_none());
+        // A self row whose pointer names nobody is unattributable: skipped,
+        // never shown in somebody's drive.
+        let mut orphan = mine.clone();
+        orphan.attestation_envelope[crate::chat::FIELD_CONTENT]["community_key_id"] =
+            serde_json::json!("");
+        assert!(belongs_to(&alice, &orphan).is_none());
+    }
+
+    /// A community or family listing matches on the envelope target the
+    /// cohort's write gate reads — and a row of the WRONG cohort scope is
+    /// not this room's file whatever it names.
+    #[test]
+    fn a_cohort_listing_matches_its_target_field_and_its_scope() {
+        let sha = "dd".repeat(32);
+        let mut fam = row_with(
+            FILE_DIMENSION,
+            serde_json::json!({
+                crate::chat::FIELD_CONTENT: pointer(&sha),
+                "family_key_id": "fam-7",
+            }),
+        );
+        fam.cohort_scope = ciris_persist::federation::types::cohort_scope::FAMILY.to_owned();
+        assert!(belongs_to(&ScopeRoom::family("fam-7"), &fam).is_some());
+        assert!(belongs_to(&ScopeRoom::family("fam-8"), &fam).is_none());
+        // Same row, read as a self room: the scope token disagrees, so it is
+        // not that room's file even though a self room asks no target.
+        assert!(belongs_to(&ScopeRoom::self_collective("alice-fed"), &fam).is_none());
     }
 
     /// The row a file door writes carries what each cohort's gate reads —

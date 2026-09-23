@@ -2131,6 +2131,33 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         .expect("hex")
         .try_into()
         .expect("32 bytes");
+
+    // THE DRIVE READ (CIRISServer#615 §3): the file A just wrote is in
+    // alice's drive, and in nobody else's. The self listing matches on the
+    // POINTER's group slot, so this also pins persist's convention that a
+    // `self` write carries the OWNER there (CIRISEdge#646 review).
+    let alice_room = ciris_edge::self_room::room(&alice.key_id);
+    let drive = ciris_edge::files::in_room(&*node_a.dir, &alice_room, 10)
+        .await
+        .expect("list alice's drive");
+    assert_eq!(drive.len(), 1, "alice's drive holds the file she wrote");
+    assert_eq!(drive[0].filename.as_deref(), Some("my-file.txt"));
+    assert_eq!(
+        drive[0].pointer.content_sha256,
+        published.pointer.content_sha256
+    );
+    assert!(
+        ciris_edge::files::in_room(
+            &*node_a.dir,
+            &ciris_edge::self_room::room("someone-else-fed"),
+            10
+        )
+        .await
+        .expect("list a stranger's drive")
+        .is_empty(),
+        "one identity's self rows never appear in another's drive"
+    );
+
     // The row B receives is the CROSSED one, not the authored local-tier copy.
     let crossed_id = match &published.shared {
         ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }

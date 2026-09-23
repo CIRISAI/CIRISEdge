@@ -226,6 +226,15 @@ pub enum PullOutcome {
     /// resolved is this one — a device coming online is a retry, not a
     /// terminal miss.
     NoOtherNode { attempts: u32, retrying: bool },
+    /// CIRISEdge#646 — a self/family row whose group id needs the author's
+    /// identity (`FSD/CONTENT_TRANSFER.md` §6.2) arrived before the
+    /// directory converged on that author. Distinct from
+    /// [`Self::NoMeaning`]'s `GroupWithoutId`, which is a row that names no
+    /// group at all: this one names it through a fact this node does not
+    /// hold YET, so it is retried rather than refused. Distinct from
+    /// [`Self::NoOtherNode`] too, which is the rung below — a group we could
+    /// name but no node to ask.
+    AuthorUnresolved { attempts: u32, retrying: bool },
     /// The fetch failed for a reason that may clear (timeout, transport,
     /// a dishonest holder); queued for retry or given up.
     FetchFailed { reason: String, retrying: bool },
@@ -550,7 +559,16 @@ where
         }
         let nodes = match author {
             Some(Ok(subject)) => subject.nodes.clone(),
-            Some(Err(stall)) => {
+            // A local backend failure is OUR fault, not the content's: naming
+            // it a holder-rung refusal would hide a broken directory behind a
+            // row's diagnosis (CIRISEdge#646 review).
+            Some(Err(stall @ crate::contact::LadderStall::DirectoryUnreadable { .. })) => {
+                return Err(PullOutcome::StoreFailed(format!(
+                    "author resolution: {stall:?} — {}",
+                    stall.remedy()
+                )));
+            }
+            Some(Err(stall)) if stall.is_self_resolving() => {
                 tracing::debug!(
                     blob = %hex::encode(sha),
                     author = %row.attesting_key_id,
@@ -559,6 +577,22 @@ where
                      on the directory, never asking the claim index (CIRISEdge#646)"
                 );
                 Vec::new()
+            }
+            // Terminal: convergence will not produce a node, so spending a
+            // retry slot would both fail and evict a wait that could succeed.
+            Some(Err(stall)) => {
+                tracing::warn!(
+                    blob = %hex::encode(sha),
+                    author = %row.attesting_key_id,
+                    stall = ?stall,
+                    remedy = %stall.remedy(),
+                    "self/family pull REFUSED at the holder rung: the row's author does not \
+                     resolve to any node and no amount of waiting changes that (CIRISEdge#646)"
+                );
+                return Err(PullOutcome::NoOtherNode {
+                    attempts,
+                    retrying: false,
+                });
             }
             // Unreachable by construction: a self/family row resolved its author.
             None => Vec::new(),
@@ -601,6 +635,27 @@ where
             .map(|subject| subject.fed_id.clone());
         let meaning = match BlobMeaning::project_with(row, &sha, author_identity.as_deref()) {
             Ok(m) => m,
+            // A self/family row's group id can come from the author's
+            // identity, so "no group" while the author is still converging is
+            // a WAIT, not a refusal — refusing it terminally leaves the blob
+            // unfetched forever after convergence, since nothing re-applies
+            // the row (CIRISEdge#646 review).
+            Err(MeaningRefusal::GroupWithoutId { .. })
+                if author
+                    .as_ref()
+                    .and_then(|r| r.as_ref().err())
+                    .is_some_and(crate::contact::LadderStall::is_self_resolving) =>
+            {
+                let retrying = self.book_retry(row, sha, attempts);
+                tracing::debug!(
+                    blob = %blob_hex,
+                    author = %row.attesting_key_id,
+                    retrying,
+                    "self/family pull: the row's group id waits on the author's directory \
+                     records, which are still converging (CIRISEdge#646)"
+                );
+                return PullOutcome::AuthorUnresolved { attempts, retrying };
+            }
             Err(r) => return PullOutcome::NoMeaning(r),
         };
 

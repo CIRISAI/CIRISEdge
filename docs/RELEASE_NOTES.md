@@ -68,7 +68,39 @@ publishes through `files::publish` and pulls the **crossed** row, instead of the
 60-line producer it carried in v29.4.0. That the test could not have been written without hand-rolling
 one is what said the DX was missing.
 
-Tests: `scope_room` (4), `self_room` (6, the creator rule's contest and convergence), `files` (2),
+## Review fixes (PR #654, six findings — all real)
+
+- **Revocation is never blocked by a bootstrap wait.** `decide` returns `Remove` before `Add`: an add
+  waits on the newcomer's KeyPackage row (another node, asynchronously) while a removal needs only
+  this node, so the old order let a late KeyPackage hold a **revoked device inside the tree**,
+  deriving every epoch that followed.
+- **`publish` refuses a seal readable by nobody.** An encrypted tier that resolves no grantable
+  occurrence produced a row that crossed and bytes that replicated and a permanent `NotGranted` for
+  everyone including the author — reported as success. Now `FileError::ReadableByNobody`, checked
+  before the row is authored; a PARTIAL loss is not refused (one member without content-KEM keys must
+  not block the rest) but is surfaced in `PublishedFile::excluded` and a WARN. The door's errors are
+  typed throughout (`FileError::{Seal, ReadableByNobody, Author, Cross, Row}`).
+- **The drive read pages to its limit.** `list_attestations_since` limits the GLOBAL plane before the
+  room filter runs, so on a busy node a drive showed too few files — or none — and files past the
+  first page were invisible *forever*, since every call restarted at the beginning. `in_room` now
+  walks the `(admitted_at, attestation_id)` cursor until `limit` matches or the plane is exhausted
+  (bounded at 64 pages).
+- **A self listing matches its identity.** `self` rows carry no cohort target, so the filter accepted
+  every self-scoped file — on any node holding more than one identity's rows (any server) that is one
+  person's file metadata in another's drive. Now matched on the pointer's group slot, which persist
+  fills with the owner at that tier (pinned by the e2e), and an unattributable row is skipped.
+- **The stall kind decides the retry.** `LadderStall::is_self_resolving()` — each arm answering its
+  own doc's promise — so a terminal stall no longer consumes the bounded retry ledger while reporting
+  "still waiting", and `DirectoryUnreadable` surfaces as `StoreFailed` (a broken local directory is
+  this node's fault, not the row's) instead of a holder-rung refusal.
+- **A self row that outruns its author's directory records is retried.** Its group id comes from the
+  author's identity, so "no group id" while the author is still converging is a wait, not a refusal —
+  the terminal `NoMeaning` left the blob unfetched forever after convergence, since nothing re-applies
+  the row. New `PullOutcome::AuthorUnresolved { attempts, retrying }`, distinct from both
+  `NoMeaning(GroupWithoutId)` (a row that names no group at all) and `NoOtherNode` (the rung below).
+
+Tests: `scope_room` (4), `self_room` (7, the creator rule's contest, convergence and revocation
+ordering), `files` (4), `contact::a_stall_says_whether_waiting_repairs_it`,
 17/17 blob e2e legs, `chat_message_federates` 29/29, clippy `-D warnings` on CI's three feature sets.
 
 Ladder pair: **edge v29.5.0 + persist v46.3.1** (verify v16.1.0, leviculum v0.26.0+ciris.1).

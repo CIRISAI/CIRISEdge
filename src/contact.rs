@@ -940,6 +940,43 @@ pub enum LadderStall {
 }
 
 impl LadderStall {
+    /// **Does waiting fix this?** (CIRISEdge#646 review.)
+    ///
+    /// A caller with a bounded retry ledger has to tell a stall that
+    /// convergence repairs from one that it never will: retrying a terminal
+    /// stall spends a slot that a repairable one needed, and — worse —
+    /// reports the terminal fault as "still waiting", which is the shape
+    /// [`feedback: self-resolving is not resolved`] exists to prevent. Every
+    /// arm's answer is its own doc comment's promise, restated once here so
+    /// no caller has to re-derive it.
+    ///
+    /// Exhaustive, no wildcard: a new stall must answer this question.
+    #[must_use]
+    pub fn is_self_resolving(&self) -> bool {
+        match self {
+            // "Resolves itself as replication converges."
+            Self::NotYetDiscovered { .. }
+            // "Self-resolving … only on this node's next Key round."
+            | Self::BodyFetchQueued { .. }
+            // "The peer may be offline; RNS will route when it returns."
+            | Self::Unreachable { .. } => true,
+            // "no amount of retrying changes that" — both consent arms wait
+            // on a human, which is a different wait with a different remedy.
+            Self::AwaitingConsent { .. }
+            | Self::ConsentNotGranted { .. }
+            // "TERMINAL" by their own docs.
+            | Self::MalformedCode { .. }
+            | Self::CodeIdentityMismatch { .. }
+            | Self::NotContactable { .. }
+            // "NOT self-resolving: no peer reply repairs a local backend
+            // failure, so retrying is the one thing that cannot help."
+            | Self::DirectoryUnreadable { .. }
+            // Not produced by `resolve`: a caller holding one has a
+            // sequencing bug, and spending retries on it would hide that.
+            | Self::PriorRungIncomplete { .. } => false,
+        }
+    }
+
     /// What an operator should do. Every arm answers it — a stall with no
     /// remedy is a bug report, not a diagnostic.
     #[must_use]
@@ -1291,6 +1328,47 @@ impl DirectoryLens for PersistLens<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// CIRISEdge#646 review — every stall answers "does waiting fix this?",
+    /// and the answer is its own doc's promise. A caller with a bounded
+    /// retry ledger spends it on the first group only.
+    #[test]
+    fn a_stall_says_whether_waiting_repairs_it() {
+        use super::LadderStall;
+        for repairable in [
+            LadderStall::NotYetDiscovered {
+                fed_id: "alice".into(),
+            },
+            LadderStall::BodyFetchQueued {
+                key_id: "alice".into(),
+            },
+            LadderStall::Unreachable {
+                fed_id: "alice".into(),
+            },
+        ] {
+            assert!(repairable.is_self_resolving(), "{repairable:?}");
+        }
+        for terminal in [
+            LadderStall::DirectoryUnreadable {
+                key_id: "alice".into(),
+            },
+            LadderStall::NotContactable {
+                key_id: "fam-1".into(),
+                identity_type: "family".into(),
+            },
+            LadderStall::AwaitingConsent {
+                fed_id: "alice".into(),
+            },
+            LadderStall::MalformedCode {
+                detail: "truncated".into(),
+            },
+        ] {
+            assert!(
+                !terminal.is_self_resolving(),
+                "{terminal:?} retried forever is the bug this answers"
+            );
+        }
+    }
+
     use super::{LadderStall, Rung};
 
     /// A fake directory. The resolution RULES are what get this wrong, not the
