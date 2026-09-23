@@ -1,10 +1,24 @@
 # CIRISEdge Release Notes
 
-# v29.6.0 — adopt CIRISPersist v46.4.0: the drive read becomes a gated query
+# v30.0.0 — adopt CIRISPersist v46.4.0: the drive read becomes a gated query, and the handshake goes into the room it names
 
-**2026-09-23** (PR #657, CIRISEdge#646 §6.8). MINOR: persist v46.4.0 is additive — all four ABI
-constants unmoved, verify stays v16.1.0, wheel floor unchanged. One edge signature moves:
-`files::in_room`.
+**2026-09-23** (PR #657, CIRISEdge#646 §6.8 + CIRISEdge#656). **MAJOR**, and the reason is a fact
+rather than a diff shape: **CIRISServer 0.5.215 has adopted v29.5.0** (`tag = "v29.5.0"` in its
+`Cargo.toml`), so `files::in_room`'s contract has a holder, and its signature moves here. The house
+rule is to pick the bump from who adopted the version being amended — checked this time by grepping
+the downstream pin rather than assuming, which is what caught it.
+
+Upstream is additive: persist v46.4.0 moves no ABI constant, verify stays v16.1.0, the wheel floor is
+unchanged.
+
+**Breaking, for a Rust consumer:**
+
+| was | is |
+|---|---|
+| `files::in_room(dir, &room, limit) -> Result<_, String>` | `files::in_room(engine, &room, caller_occurrence_key_id, limit) -> Result<_, FileError>` |
+
+`FileError` gains `Drive`, `DriveGateUnavailable` and `TooLargeForInline`; it is not
+`#[non_exhaustive]`, so an exhaustive match needs the new arms.
 
 ## The drive read
 
@@ -53,9 +67,40 @@ contradiction with both shipped spellings at once.
 Also in v46.4.0: `adopt_sealed_chunk_json`, which **edge does not need** (it calls the `Engine` door
 in Rust); a Python consumer adopting a chunk DAG does.
 
+## The handshake goes into the room it names (CIRISEdge#656)
+
+`self_room::decide` returns `PublishKeyPackage` and `Add`, and **neither could be executed through
+the public API**: `key_package_attestation` and `welcome_attestation` derive a *pair* room from
+`(author, recipient)`, while a self collective's group id is the owner's key id. So the KeyPackage
+landed in `chat:pair:v1:<hash>`, the adder looked in the self room, and the creator held a row it
+could not see — `Added(0)` forever, the room stuck at one member, **every step logging success**.
+Measured on CIRISServer's `selffiles` ladder, where it is the one thing between `mine_on_b` (green)
+and `opened_on_b`.
+
+- **`key_package_attestation_in(author, community_key_id, key_package, asserted_at)`** — the twin of
+  `commit_attestation_in`.
+- **`welcome_attestation_in(author, community_key_id, recipient_key_id, welcome, epoch, asserted_at)`**
+  — takes **both** facts. One parameter answered "which room" and "for whom" only because a pair room
+  IS its two members; a room with three cannot express it that way, and the creator places one Welcome
+  per joiner into the same room. The recipient now rides the signed envelope.
+- **`welcome_for(dir, from, room, recipient)`** — picks the Welcome addressed to you.
+  `welcome_from` returns the *last* one in the room, which is right for a pair and wrong for a
+  collective. A pair-era Welcome carries no recipient member and is matched only when the room IS
+  that pair, so legacy handshakes keep working and a wider room never hands a joiner someone else's.
+
+The pair-deriving producers stay, as wrappers, so every current caller compiles.
+
+## Review fixes (PR #657)
+
+- **The page budget scales with `limit`.** A fixed 64-page ceiling silently returned only the newest
+  16,384 rows for any larger limit — contradicting the property the gated query was adopted for, that
+  the limit bounds the answer and not the plane. The budget is now derived from `limit`, and a listing
+  that stops on it with rows still unread says so (WARN) rather than looking complete.
+
 Witness: `a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index` reads the drive back
 through the gated door, gets nothing for a stranger's room, and is refused by name for a community
-room. Pins: persist **v46.4.0**, verify v16.1.0, leviculum v0.26.0+ciris.1.
+room; `a_handshake_row_is_placed_in_the_room_it_names_not_a_derived_pair` pins #656. Pins: persist
+**v46.4.0**, verify v16.1.0, leviculum v0.26.0+ciris.1.
 
 # v29.5.0 — the self room's rule, one name for every room, and one door for a file at any cohort
 

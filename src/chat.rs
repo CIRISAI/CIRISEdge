@@ -189,6 +189,14 @@ const FIELD_MLS_BYTES: &str = "mls_bytes";
 /// On a Welcome row: the group epoch the Welcome joins the joiner at.
 /// Crate-private, as above.
 const FIELD_MLS_EPOCH: &str = "mls_epoch";
+/// On a Welcome row: **whom** the Welcome is for (CIRISEdge#656).
+///
+/// A pair room needed no such member — the room id WAS the pair, so "which
+/// room" and "for whom" were one fact. A room with more than two members
+/// (a self collective of three devices, a family) breaks that: the creator
+/// places one Welcome per joiner into the SAME room, and a joiner must be
+/// able to tell which one is theirs. Crate-private, like its siblings.
+const FIELD_MLS_FOR: &str = "mls_for_key_id";
 
 /// **The room two people share, derived from their fed-IDs alone.**
 ///
@@ -673,14 +681,45 @@ pub async fn key_package_attestation(
     key_package: &[u8],
     asserted_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<Attestation, String> {
-    use base64::Engine as _;
     let room = pair_community_key_id(&author.key_id, recipient_key_id);
+    key_package_attestation_in(author, &room, key_package, asserted_at).await
+}
+
+/// **A KeyPackage into a room named by its community id** (CIRISEdge#656) —
+/// the twin of [`commit_attestation_in`], and what any room that is not a
+/// PAIR needs.
+///
+/// [`key_package_attestation`] derives a pair room from `(author,
+/// recipient)`, which has no meaning for a self collective (whose group id
+/// is the owner's key id) or a family. `self_room::decide` returns
+/// `PublishKeyPackage` and `Add`, and before this neither could be executed
+/// through the public API: the row landed in `chat:pair:v1:<hash>` while
+/// the adder looked in the self room, so the creator held a KeyPackage it
+/// could not see and the room stayed at one member — every step logging
+/// success.
+///
+/// # Errors
+/// Canonicalization or signing failure.
+pub async fn key_package_attestation_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    key_package: &[u8],
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Attestation, String> {
+    use base64::Engine as _;
     let mut members = serde_json::Map::new();
     members.insert(
         FIELD_MLS_BYTES.to_owned(),
         serde_json::json!(base64::engine::general_purpose::STANDARD.encode(key_package)),
     );
-    chat_row(author, &room, KEY_PACKAGE_DIMENSION, members, asserted_at).await
+    chat_row(
+        author,
+        community_key_id,
+        KEY_PACKAGE_DIMENSION,
+        members,
+        asserted_at,
+    )
+    .await
 }
 
 /// Step 2 of the handshake: the CREATOR's Welcome for the joiner, as a row
@@ -696,15 +735,50 @@ pub async fn welcome_attestation(
     epoch: u64,
     asserted_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<Attestation, String> {
-    use base64::Engine as _;
     let room = pair_community_key_id(&author.key_id, recipient_key_id);
+    welcome_attestation_in(author, &room, recipient_key_id, welcome, epoch, asserted_at).await
+}
+
+/// **A Welcome into a room named by its community id, for a named joiner**
+/// (CIRISEdge#656).
+///
+/// Takes **both** the room and the recipient, because they are two facts.
+/// [`welcome_attestation`]'s single `recipient_key_id` answered "which
+/// room" *and* "for whom" at once — true only for a pair, where the room
+/// IS the pair — and a room with three members needs one Welcome per
+/// joiner in the same room, which that shape cannot express. The recipient
+/// rides the signed envelope so a joiner can find its own
+/// ([`welcome_for`]).
+///
+/// # Errors
+/// Canonicalization or signing failure.
+pub async fn welcome_attestation_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    recipient_key_id: &str,
+    welcome: &[u8],
+    epoch: u64,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Attestation, String> {
+    use base64::Engine as _;
     let mut members = serde_json::Map::new();
     members.insert(
         FIELD_MLS_BYTES.to_owned(),
         serde_json::json!(base64::engine::general_purpose::STANDARD.encode(welcome)),
     );
     members.insert(FIELD_MLS_EPOCH.to_owned(), serde_json::json!(epoch));
-    chat_row(author, &room, WELCOME_DIMENSION, members, asserted_at).await
+    members.insert(
+        FIELD_MLS_FOR.to_owned(),
+        serde_json::json!(recipient_key_id),
+    );
+    chat_row(
+        author,
+        community_key_id,
+        WELCOME_DIMENSION,
+        members,
+        asserted_at,
+    )
+    .await
 }
 
 /// **A commit into a room named by its community id** (CIRISEdge#604) —
@@ -958,6 +1032,58 @@ pub async fn welcome_from(
         .await?
         .iter()
         .filter(|a| dimension_of(a) == Some(WELCOME_DIMENSION))
+        .filter_map(|a| {
+            let env = &a.attestation_envelope;
+            let bytes = env
+                .get(FIELD_MLS_BYTES)
+                .and_then(serde_json::Value::as_str)
+                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())?;
+            let epoch = env
+                .get(FIELD_MLS_EPOCH)
+                .and_then(serde_json::Value::as_u64)?;
+            Some((bytes, epoch))
+        })
+        .next_back())
+}
+
+/// **The Welcome addressed to `recipient_key_id`** in `room` (CIRISEdge#656).
+///
+/// [`welcome_from`] returns the LAST Welcome in the room, which is right
+/// for a pair and wrong for anything wider: a self collective's creator
+/// places one Welcome per device into one room, so "the last one" is
+/// whichever device joined most recently. This picks the one whose signed
+/// envelope names `recipient_key_id`.
+///
+/// A Welcome written by the pair-era producer carries no recipient member.
+/// Those are matched only when the room IS the pair of `(from,
+/// recipient)` — so a legacy pair handshake keeps working and a wider
+/// room never hands a joiner somebody else's Welcome.
+///
+/// # Errors
+/// The directory read.
+pub async fn welcome_for(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    from: &str,
+    room: &str,
+    recipient_key_id: &str,
+) -> Result<Option<(Vec<u8>, u64)>, String> {
+    use base64::Engine as _;
+    let pair_room = pair_community_key_id(from, recipient_key_id);
+    Ok(rows_in_room(directory, &[from.to_owned()], room)
+        .await?
+        .iter()
+        .filter(|a| dimension_of(a) == Some(WELCOME_DIMENSION))
+        .filter(|a| {
+            match a
+                .attestation_envelope
+                .get(FIELD_MLS_FOR)
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(named) => named == recipient_key_id,
+                // Pair-era: the room was the address.
+                None => room == pair_room,
+            }
+        })
         .filter_map(|a| {
             let env = &a.attestation_envelope;
             let bytes = env

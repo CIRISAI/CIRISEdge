@@ -494,14 +494,20 @@ impl FileRow {
     }
 }
 
-/// A safety bound on the drive query's paging. Since persist filters
-/// server-side (CIRISPersist#891) the loop is bounded by the ANSWER rather
-/// than by the plane, so this is a guard against a pathological cursor, not
-/// the load-bearing limit the pre-v46.4.0 client-side walk needed.
-const MAX_LISTING_PAGES: usize = 64;
+/// Slack on the drive query's page budget, over the pages `limit` itself
+/// needs. Covers rows the gate admits that are not THIS room's (a caller
+/// with more than one self room), so a listing can still reach its limit
+/// after some are dropped by [`belongs_to`].
+///
+/// The budget SCALES with `limit` (see [`in_room`]) rather than being a
+/// fixed ceiling: a fixed one silently truncates any limit above
+/// `ceiling × page`, which would contradict the property this query was
+/// adopted for — that the limit bounds the answer and not the plane.
+const LISTING_PAGE_SLACK: usize = 8;
 
-/// The page size [`in_room`] asks the drive query for.
-const LISTING_PAGE: i64 = 256;
+/// The page size [`in_room`] asks the drive query for. `usize` because the
+/// budget arithmetic is in rows; widened to the door's `i64` at the call.
+const LISTING_PAGE: usize = 256;
 
 /// **The drive read** — up to `limit` of this room's file rows, newest
 /// first (CIRISServer#615 §3).
@@ -567,7 +573,15 @@ pub async fn in_room(
 
     let mut out: Vec<FileRow> = Vec::new();
     let mut cursor = None;
-    for _ in 0..MAX_LISTING_PAGES {
+    // Bounded by what was ASKED FOR, plus slack for rows the gate admits
+    // that are not this room's — never by a constant, which would cap the
+    // answer below a larger limit and call it done.
+    let budget = (limit / LISTING_PAGE)
+        .saturating_add(1)
+        .saturating_add(LISTING_PAGE_SLACK);
+    let mut pages = 0usize;
+    while pages < budget {
+        pages += 1;
         if out.len() >= limit {
             break;
         }
@@ -583,7 +597,7 @@ pub async fn in_room(
                     f
                 },
                 cursor,
-                LISTING_PAGE,
+                i64::try_from(LISTING_PAGE).unwrap_or(i64::MAX),
                 scope.clone(),
             )
             .await
@@ -606,6 +620,20 @@ pub async fn in_room(
         if cursor.is_none() {
             break;
         }
+    }
+    // Reached only if the cursor kept producing pages that yielded almost
+    // nothing for this room — a pathological shape, not an ordinary drive.
+    // Said out loud: a short list that is silently short is the failure this
+    // query was adopted to remove.
+    if out.len() < limit && cursor.is_some() {
+        tracing::warn!(
+            room = %room,
+            returned = out.len(),
+            limit,
+            pages,
+            "drive listing stopped on its page budget with rows still unread — the answer is \
+             SHORT, not complete (CIRISEdge#646)"
+        );
     }
     Ok(out)
 }
