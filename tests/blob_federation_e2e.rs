@@ -2143,7 +2143,10 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
     // POINTER's group slot, so this also pins persist's convention that a
     // `self` write carries the OWNER there (CIRISEdge#646 review).
     let alice_room = ciris_edge::self_room::room(&alice.key_id);
-    let drive = ciris_edge::files::in_room(&*node_a.dir, &alice_room, 10)
+    // Persist's GATED drive query (CIRISPersist#891, v46.4.0): the
+    // cohort_scope + dimension axes select server-side and the §4.3
+    // caller-visibility predicate runs in the same statement.
+    let drive = ciris_edge::files::in_room(node_a.store.engine(), &alice_room, &node_a.me, 10)
         .await
         .expect("list alice's drive");
     assert_eq!(drive.len(), 1, "alice's drive holds the file she wrote");
@@ -2154,14 +2157,30 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
     );
     assert!(
         ciris_edge::files::in_room(
-            &*node_a.dir,
+            node_a.store.engine(),
             &ciris_edge::self_room::room("someone-else-fed"),
+            &node_a.me,
             10
         )
         .await
         .expect("list a stranger's drive")
         .is_empty(),
         "one identity's self rows never appear in another's drive"
+    );
+    // A targeted room is REFUSED by name rather than returned empty, until
+    // the §4.3 gate's community/family arms stop contradicting AV-84
+    // (CIRISPersist#893).
+    let refused = ciris_edge::files::in_room(
+        node_a.store.engine(),
+        &ciris_edge::scope_room::ScopeRoom::community("room-1"),
+        &node_a.me,
+        10,
+    )
+    .await
+    .expect_err("a community drive is refused, never silently empty");
+    assert!(
+        format!("{refused}").contains("CIRISPersist#893"),
+        "the refusal names what it waits on: {refused}"
     );
 
     // The row B receives is the CROSSED one, not the authored local-tier copy.

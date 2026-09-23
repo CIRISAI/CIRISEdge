@@ -1,5 +1,62 @@
 # CIRISEdge Release Notes
 
+# v29.6.0 — adopt CIRISPersist v46.4.0: the drive read becomes a gated query
+
+**2026-09-23** (PR #657, CIRISEdge#646 §6.8). MINOR: persist v46.4.0 is additive — all four ABI
+constants unmoved, verify stays v16.1.0, wheel floor unchanged. One edge signature moves:
+`files::in_room`.
+
+## The drive read
+
+v29.5.0 listed a drive by walking `list_attestations_since` — persist's **replication** cursor — and
+filtering client-side, because `AttestationFilter` had no `cohort_scope` axis. Two consequences, both
+now gone:
+
+- **The limit bounded the wrong set.** Ask for 50 and filter afterwards and you get however many of
+  that global page happened to be this room's files; on a busy node, none. And since every call
+  restarted at the beginning, files on later pages were invisible *permanently* rather than late.
+- **The read was caller-ungated.** The replication cursor composes no §4.3 visibility predicate —
+  correct for replication, wrong for a reader's door — so on a shared device a caller naming another
+  person's identity could enumerate their file rows. v29.5.0 carried that as a documented host
+  precondition.
+
+persist v46.4.0 (CIRISPersist#891) adds the axis to the **gated** door, which had been filtered,
+cursor-paged and §4.3-gated since v4.0. The door was never missing; the axis was.
+
+```rust
+files::in_room(engine, &room, caller_occurrence_key_id, limit)   // was (dir, &room, limit)
+```
+
+The limit now bounds the answer, the substrate gates the caller in one spelling, and the filter can
+never widen: persist composes §4.3 *after* it, so naming a room you are not in returns nothing. The
+64-page walk and the host precondition are both deleted.
+
+## Targeted rooms are refused by name (CIRISPersist#893)
+
+The gate's `self` arm compares by principal and works. Its `community` and `family` arms **cannot
+match any row edge can write**: AV-84 requires a targeted row to name its own PRODUCER in
+`attested_key_id`, the gate compares that column against the caller's room set, and the intersection
+is empty by construction — so no member can read their own room's rows.
+
+`files::in_room` returns **`FileError::DriveGateUnavailable`** for those rooms rather than the empty
+list the gate produces (a silently empty drive is indistinguishable from a room with no files), and
+rather than falling back to the ungated cursor (a function that takes a caller must not hand back
+rows it did not gate).
+
+Edge's ruling, posted on #893: give the read gate the envelope's cohort target. **The correct
+predicate is already shipped twice and both spellings key on the row's community** — persist's own
+`is_audience_of` and edge's CC 5.2 serve gate. The §4.3 gate is the one asking a different question.
+Admitting on "shares a room with the producer" instead would be a transitive widening — a member of
+any one of my rooms would see rows from all of them — and would put the local read door in
+contradiction with both shipped spellings at once.
+
+Also in v46.4.0: `adopt_sealed_chunk_json`, which **edge does not need** (it calls the `Engine` door
+in Rust); a Python consumer adopting a chunk DAG does.
+
+Witness: `a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index` reads the drive back
+through the gated door, gets nothing for a stranger's room, and is refused by name for a community
+room. Pins: persist **v46.4.0**, verify v16.1.0, leviculum v0.26.0+ciris.1.
+
 # v29.5.0 — the self room's rule, one name for every room, and one door for a file at any cohort
 
 **2026-09-22** (PR #655, CIRISEdge#646 §6.3 + §9). MINOR: three new modules, no pin move
