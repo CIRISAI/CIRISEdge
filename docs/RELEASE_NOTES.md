@@ -38,7 +38,8 @@ persist v46.4.0 (CIRISPersist#891) adds the axis to the **gated** door, which ha
 cursor-paged and §4.3-gated since v4.0. The door was never missing; the axis was.
 
 ```rust
-files::in_room(engine, &room, caller_occurrence_key_id, limit)   // was (dir, &room, limit)
+files::in_room(engine, &room, caller_occurrence_key_id, limit, after) -> DrivePage
+//                                                          was (dir, &room, limit) -> Vec<FileRow>
 ```
 
 The limit now bounds the answer, the substrate gates the caller in one spelling, and the filter can
@@ -77,12 +78,25 @@ could not see — `Added(0)` forever, the room stuck at one member, **every step
 Measured on CIRISServer's `selffiles` ladder, where it is the one thing between `mine_on_b` (green)
 and `opened_on_b`.
 
-- **`key_package_attestation_in(author, community_key_id, key_package, asserted_at)`** — the twin of
-  `commit_attestation_in`.
-- **`welcome_attestation_in(author, community_key_id, recipient_key_id, welcome, epoch, asserted_at)`**
-  — takes **both** facts. One parameter answered "which room" and "for whom" only because a pair room
-  IS its two members; a room with three cannot express it that way, and the creator places one Welcome
-  per joiner into the same room. The recipient now rides the signed envelope.
+- **`key_package_attestation_in(author, &room, key_package, asserted_at)`** and
+  **`welcome_attestation_in(author, &room, recipient_key_id, welcome, epoch, asserted_at)`**, where
+  `room` is a **`ScopeRoom`** — not a bare id:
+
+  ```rust
+  let room = self_room::room(&owner_fed_id);          // or ScopeRoom::family(fid) / ::community(id)
+  let kp = chat::key_package_attestation_in(&node_signer, &room, &kp_bytes, Utc::now()).await?;
+  let w  = chat::welcome_attestation_in(&node_signer, &room, joiner, &welcome, epoch, Utc::now()).await?;
+  ```
+
+  The kind has to survive into the row, because each one names its room under a different envelope
+  member: a family row must carry `family_key_id`, which is what persist's widen door and write gate
+  read. A bare string would have been written as `community_key_id` for every room — two spellings of
+  one fact, which is what `ScopeRoom` exists to end.
+
+  `welcome_attestation_in` takes **both** the room and the joiner. One parameter answered "which room"
+  and "for whom" only because a pair room IS its two members; a room with three cannot express it that
+  way, and the creator places one Welcome per joiner into the same room. The recipient rides the
+  signed envelope.
 - **`welcome_for(dir, from, room, recipient)`** — picks the Welcome addressed to you.
   `welcome_from` returns the *last* one in the room, which is right for a pair and wrong for a
   collective. A pair-era Welcome carries no recipient member and is matched only when the room IS

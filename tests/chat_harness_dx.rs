@@ -291,3 +291,92 @@ fn the_production_route_lens_exists_under_its_feature() {
     let routes: ciris_edge::contact::ReticulumRoutes<'_> = unreachable!();
     pin::<&dyn ciris_edge::contact::RouteLens>(&routes);
 }
+
+/// **CIRISEdge#657 review — the file and self-room surface the RELEASE NOTES
+/// and `FSD/CONTENT_TRANSFER.md` §9 tell a host to call.**
+///
+/// Two review rounds on #657 found documented signatures that no longer
+/// compiled: the note advertised `key_package_attestation_in(author,
+/// community_key_id, …)` after the parameter became a `&ScopeRoom`, and
+/// `files::in_room(engine, &room, caller, limit)` after it grew `after`. Both
+/// were my own churn outrunning the prose, and a host copying either would
+/// have written code that does not build.
+///
+/// This module exists so that cannot recur: the shapes the documents promise
+/// are pinned HERE, so the next signature change breaks this file in the same
+/// commit instead of shipping a wrong example. Compile-only — exercising them
+/// needs a live engine, but their SHAPES are the contract.
+#[allow(
+    dead_code,
+    unreachable_code,
+    unused_variables,
+    clippy::diverging_sub_expression
+)]
+async fn the_documented_file_and_self_room_shapes_typecheck() {
+    use ciris_edge::files::{DrivePage, FileError, FileRow, FileWrite};
+    use ciris_edge::scope_room::ScopeRoom;
+    use ciris_edge::self_room::{self, HeldRoom, SelfRoomAction};
+
+    // §6.3 / §9 — the room is named once, by kind, and every downstream fact
+    // is derived from it rather than spelled again.
+    let room: ScopeRoom = self_room::room("alice-fed");
+    pin::<ciris_edge::CohortScope>(room.scope());
+    pin::<&str>(room.content_group_id());
+    pin::<String>(room.table_group_id());
+    pin::<Option<&'static str>>(room.cohort_target_field());
+    pin::<&'static str>(room.row_scope_token());
+
+    // §9 — one door writes a file at any cohort.
+    let engine: &ciris_persist::Engine = unreachable!();
+    let store: &dyn ciris_edge::group_content::GroupContentStore = unreachable!();
+    let dir: &dyn ciris_persist::federation::FederationDirectory = unreachable!();
+    let signers: ciris_edge::replication::attestation_bind::Signers<'_> = unreachable!();
+    let published = ciris_edge::files::publish(
+        dir,
+        store,
+        signers,
+        &FileWrite {
+            room: &room,
+            bytes: b"bytes",
+            media_type: "text/plain",
+            filename: Some("boat.jpg"),
+            asserted_at: chrono::Utc::now(),
+        },
+    )
+    .await;
+    pin::<Result<ciris_edge::files::PublishedFile, FileError>>(published);
+
+    // §6.8 — the drive read: gated, resumable, and a partial answer is a VALUE.
+    let page: Result<DrivePage, FileError> =
+        ciris_edge::files::in_room(engine, &room, "node-a", 50, None).await;
+    let page: DrivePage = page.unwrap();
+    pin::<&Vec<FileRow>>(&page.files);
+    pin::<&Option<ciris_persist::ceg::AttestationCursor>>(&page.resume);
+
+    // §6.3 — edge decides, the host drives.
+    let roster: Vec<String> = self_room::roster("alice-fed", unreachable!()).await;
+    let held: Option<HeldRoom> = None;
+    pin::<SelfRoomAction>(self_room::decide("node-a", &roster, held.as_ref(), None));
+
+    // §6.3 — the handshake rows take the ROOM, not a bare id, because each
+    // kind names its room under a different envelope member.
+    let node_signer: &ciris_edge::identity::LocalSigner = unreachable!();
+    pin::<Result<ciris_persist::federation::Attestation, String>>(
+        ciris_edge::chat::key_package_attestation_in(node_signer, &room, b"kp", chrono::Utc::now())
+            .await,
+    );
+    pin::<Result<ciris_persist::federation::Attestation, String>>(
+        ciris_edge::chat::welcome_attestation_in(
+            node_signer,
+            &room,
+            "node-c",
+            b"welcome",
+            7,
+            chrono::Utc::now(),
+        )
+        .await,
+    );
+    pin::<Result<Option<(Vec<u8>, u64)>, String>>(
+        ciris_edge::chat::welcome_for(dir, "node-a", "alice-fed", "node-c").await,
+    );
+}

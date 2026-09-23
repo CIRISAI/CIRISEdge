@@ -192,7 +192,7 @@ is the allowlist. Inheriting the community rows would demand a widening (R1) and
 | **R7** bytes adopted | `is_audience` self arm (principal equality, after #873) ✓; adopt `LocalOnly` (never announce) ✓ | persist `would_hold` / `adopt_sealed_blob` | `NotPartyTo` (correct for a non-owner) | persist I135 ✓ (a self row keeps self; a non-owner is `NotPartyTo`) |
 | **R8** reader opens | wrap for **this device's** occurrence | edge `group_content` ✓ | `Body::Unopened` | — *(e2e: "the owner's second device opens what the first wrote")* |
 | **R9** withdraw reaches the nodes | `withdraws` is a **tombstone**: it projects at the Attestation plane's ceiling (`Global` / `Cohort` / `Capability` / `Subject` — never `SelfOwn`; transport FSD §3.2, persist `tombstone_ceiling`), so a withdrawal authored on B for A's row is relayed, not suppressed; the audience gate at admission stays the self arm; the register evicts locally | persist projection; edge `revocation` ✓ | `Revoked` | — *(edge: "a withdraws for a self row projects at the ceiling and evicts on every node of the identity")* |
-| **R10** the drive lists it | every self file row held on any node, with **row-held / bytes-absent** as a first-class state | edge `files::in_room` ✓ v29.6.0 — persist's **gated** query (`cohort_scope` + `dimension_exact` on `Engine::list_attestations`, §4.3 composed after the filter); server `GET /v1/drive` over it (CIRISServer#615 §3) | `not_fetched` shown as "on another device" (`UnopenedReason`) | edge: `a_self_rows_pull_asks…` reads the drive back through the gated door ✓; server: — |
+| **R10** the drive lists it | every self file row held on any node, with **row-held / bytes-absent** as a first-class state | edge `files::in_room` ✓ v30.0.0 — persist's **gated** query (`cohort_scope` + `dimension_exact` on `Engine::list_attestations`, §4.3 composed after the filter); server `GET /v1/drive` over it (CIRISServer#615 §3) | `not_fetched` shown as "on another device" (`UnopenedReason`) | edge: `a_self_rows_pull_asks…` reads the drive back through the gated door ✓; server: — |
 
 Rungs R2 and R3-retroactive are prerequisites for everything beneath them; a ladder that reaches R4
 with R2 red is testing the wrong thing.
@@ -479,7 +479,7 @@ replicate" and "files". A drive that cannot hold a video is a notes app.
 (Persist will ship a PyO3 binding for `adopt_sealed_chunk` in v46.4.0. Edge does not need it — edge
 calls the `Engine` door in Rust — but a **Python** consumer adopting a chunk DAG does.)
 
-### 6.8 The drive read is a gated query (CIRISPersist#891 — shipped v46.4.0, adopted v29.6.0)
+### 6.8 The drive read is a gated query (CIRISPersist#891 — shipped v46.4.0, adopted v30.0.0)
 
 R10 is a query: *this room's file rows, resumable*. Until persist v46.4.0 the only door edge had was
 `list_attestations_since`, so the room-and-dimension predicate ran client-side and the limit bounded
@@ -490,7 +490,7 @@ rather than merely late.
 **The door was never missing; the axis was.** `list_attestations` has been filtered, cursor-paged and
 §4.3-gated since persist v4.0; what it lacked was a `cohort_scope` axis on `AttestationFilter`
 (CIRISEdge#352's verdict). v46.4.0 adds it — the column was already indexed for exactly this query
-(V056, a partial index on non-`federation` scopes) — and edge v29.6.0 consumes it:
+(V056, a partial index on non-`federation` scopes) — and edge v30.0.0 consumes it:
 
 ```rust
 files::in_room(engine, &room, caller_occurrence_key_id, limit, after) -> DrivePage
@@ -624,7 +624,7 @@ the self row set adds `mine_on_b` = "a self row written on A opened on B", with 
    content set is not retired as "not the author" on every second device (v46.3.0), the `family_key_id`
    carrier confirmed (CIRISPersist#887), and the read-side self gate (v46.3.1). **Nothing here blocks
    self row or self byte replication.**
-2. **persist — both asks shipped in v46.4.0**, adopted by edge v29.6.0: the §6.8 `cohort_scope` axis
+2. **persist — both asks shipped in v46.4.0**, adopted by edge v30.0.0: the §6.8 `cohort_scope` axis
    on the gated reader door (**CIRISPersist#891**), and `adopt_sealed_chunk_json` (**#821**, which
    edge does not itself need — it calls the `Engine` door in Rust; a Python consumer adopting a chunk
    DAG does). **One persist item remains and it is a ruling, not a build: CIRISPersist#893** — the
