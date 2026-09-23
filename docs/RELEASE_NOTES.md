@@ -1,5 +1,78 @@
 # CIRISEdge Release Notes
 
+# v29.5.0 — the self room's rule, one name for every room, and one door for a file at any cohort
+
+**2026-09-22** (PR #655, CIRISEdge#646 §6.3 + §9). MINOR: three new modules, no pin move
+(persist v46.3.1, verify v16.1.0), ABI constants unmoved, no behaviour change to any existing path.
+
+## `scope_room::ScopeRoom` — the names, once
+
+Three facts have to agree for a cohort's bytes to move: the scope the content names, the group id
+the content names, and the group id the lifecycle installs under. The last two are not the same
+string (a community's addresses live under `cohort:`), and when the router spelled one and the
+installer the other, every community holder read as not-in-group and every arrival as a group
+mismatch — silently, both sides (CIRISEdge#616/#619). That is a naming disagreement, so the fix is a
+single name: `ScopeRoom::{Community, SelfCollective, Family}` answers `scope()`,
+`content_group_id()`, `table_group_id()`, `cohort_target_field()`, `row_scope_token()` and
+`widen_to()`, and `blob_swarm::scope` and `cohort_addressing` now delegate to it. **The table's key
+is the pair `(CohortScope, group_id)`**, so the scope already discriminates and only communities
+carry a prefix — settled here rather than left to each caller.
+
+## `self_room` — the rule nobody could write twice
+
+A community room is created by a person inviting another. A self room must appear the moment an
+identity has a second device, with **no human act** — and if two devices each create one they derive
+different secrets and address each other at destinations nobody registered: correct by every local
+check, dark on the wire, the CIRISEdge#646 shape.
+
+- `roster(identity, lens)` — the directory's answer (`nodes_owned_by`, the same walk the send set's
+  node half uses). The MLS tree is what this node has converged to; the difference is the work.
+- `decide(own, roster, held, rival) -> SelfRoomAction` — **pure and total**: `Create` (the
+  canonical-first node, lowest key id), `PublishKeyPackage`, `Add`/`Remove` (the tree is driven
+  toward the directory in both directions), `Abandon{in_favour_of}`, `Idle`, `SoleDevice`,
+  `NotInRoster`. The host performs the IO the decision names — the same split `ScopeLifecycle`'s
+  verbs use, and what keeps two hosts from disagreeing about who creates.
+- **Concurrent creation is settled, not prevented.** In an unconverged directory two rooms appear;
+  preventing that needs a coordination round the substrate has no way to run. Settling it needs only
+  a total order, and `CommitClaim` already is one (earliest instant, ties on the lowest committer key
+  id — the CIRISEdge#604 rule one level up). Both nodes abandon the same room from either arrival
+  order, and a losing room is abandoned *before* it spends an epoch adding anyone.
+- `snapshot(group, identity)` — the lifecycle's install, keyed by the room. No person-to-node walk
+  and so no `unresolved` set: a self room's tree already holds nodes.
+- The bootstrap needs no room: KeyPackage, Welcome and Commit are ordinary `self`-placed rows, which
+  since v29.3.0 reach the owner's own nodes with no grant between them. Only the bytes need the room.
+
+## `files` — one door, any cohort
+
+A file is a row that cites bytes, and every piece already existed — but the composition differs per
+cohort in ways that are silent when wrong: a `self` row carries no cohort target while a `family` row
+must carry `family_key_id`; persist's group slot takes the community at `community` and the **owner**
+at `self`; a local-tier authored row replicates nowhere until it crosses. Get one wrong and you have
+a file that is correct on the writer's node and unreachable everywhere else.
+
+```rust
+files::publish(&*dir, &store, signers, &FileWrite {
+    room: &self_room::room(&owner),        // or ScopeRoom::community(room_id)
+    bytes, media_type, filename, asserted_at,
+}).await?;                                  // seals, authors (citing), crosses
+```
+
+Read side: `files::in_room(dir, room, limit)` is the drive listing (CIRISServer#615 §3) and
+`FileRow::open(store, viewer)` returns the bytes or an `UnopenedReason` — with **`NotFetched` as a
+first-class state**, which is what a drive shows as "on another device". Commons stays its own verb
+(`attestation_bind::publish`): this door takes a room, so it cannot be the thing that accidentally
+publishes a family photo.
+
+**The R4 witness now uses the door end to end** — `a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index`
+publishes through `files::publish` and pulls the **crossed** row, instead of the hand-rolled
+60-line producer it carried in v29.4.0. That the test could not have been written without hand-rolling
+one is what said the DX was missing.
+
+Tests: `scope_room` (4), `self_room` (6, the creator rule's contest and convergence), `files` (2),
+17/17 blob e2e legs, `chat_message_federates` 29/29, clippy `-D warnings` on CI's three feature sets.
+
+Ladder pair: **edge v29.5.0 + persist v46.3.1** (verify v16.1.0, leviculum v0.26.0+ciris.1).
+
 # v29.4.0 — a self row's pull asks the author's nodes (R4), and the projector names the self room and the family (R5)
 
 **2026-09-22** (PR #654, CIRISEdge#646 §6.2 of `FSD/CONTENT_TRANSFER.md`). MINOR: additive API; pins

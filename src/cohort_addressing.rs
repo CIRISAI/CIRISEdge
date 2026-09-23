@@ -92,16 +92,14 @@ pub enum CohortAddressError {
 /// and it is spelled here and nowhere else.
 #[must_use]
 pub fn group_id_for(community_id: &str) -> String {
-    format!("cohort:{community_id}")
+    crate::scope_room::ScopeRoom::community(community_id).table_group_id()
 }
 
 /// The scope a community's addresses are installed under — the same
 /// `CohortScope::Cohort` the meaning projection names a community blob by.
 #[must_use]
 pub fn scope_for(community_id: &str) -> crate::cohort_scope::CohortScope {
-    crate::cohort_scope::CohortScope::Cohort {
-        cohort_id: community_id.to_owned(),
-    }
+    crate::scope_room::ScopeRoom::community(community_id).scope()
 }
 
 /// **The adapter, as the lifecycle needs it (CIRISEdge#640): members are

@@ -447,7 +447,7 @@ fn pointer_sha(member: &serde_json::Value) -> Option<String> {
 /// array if absent and never duplicating. This is the CEG-native relation
 /// between an attestation and a blob (CEG RC27 §11.10); persist's binding
 /// predicate reads nothing else.
-fn cite_evidence(envelope: &mut serde_json::Value, sha: &str) {
+pub(crate) fn cite_evidence(envelope: &mut serde_json::Value, sha: &str) {
     let refs = envelope
         .as_object_mut()
         .expect("chat envelopes are objects")
@@ -1158,7 +1158,7 @@ impl UnopenedReason {
 
     /// The one mapping from the store's typed error. Kept here, once, so
     /// `resolve_content` and any future opener agree on the arms.
-    fn from_store_error(e: &crate::group_content::GroupContentError) -> Self {
+    pub(crate) fn from_store_error(e: &crate::group_content::GroupContentError) -> Self {
         use crate::group_content::GroupContentError as E;
         let detail = e.to_string();
         match e {

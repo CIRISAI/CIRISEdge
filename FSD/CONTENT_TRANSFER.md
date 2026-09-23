@@ -304,52 +304,64 @@ so the pull sink's re-ask keeps its cadence.
 CC 5.4.6 lists `self` among the group-scoped tiers whose destinations are "resolved DETERMINISTICALLY
 from (cached directory entry + per-group HKDF) — every member derives the same destination", using
 "the same group-and-epoch-bound key schedule the substrate already uses" — the MLS exporter. So the
-self room is a **per-identity MLS group** (`CohortGroup`), not a derivation from the occurrence list:
-an occurrence roster alone yields no shared secret, and two nodes that each `create` would derive
-different secrets and address each other at destinations nobody registered. The fetch-over-
-federation-address alternative the first draft left open is closed by this reading — it is not the
-CC 5.4.6 construction for a group-scoped tier.
+self room is an ordinary `CohortGroup` whose members are the identity's **nodes**; nothing about it is
+new machinery. The fetch-over-federation-address alternative the first draft left open is closed by
+this reading — it is not the CC 5.4.6 construction for a group-scoped tier.
 
-**Members are nodes** (the lifecycle listens on `own_key_id`, the node key): the self room's roster is
-`nodes(occurrences(identity))`, exactly §6.1's set. **Group id** = `self:<identity_key_id>`.
+**Naming (shipped v29.5.0).** Every question about a room's identity is asked of one type,
+`scope_room::ScopeRoom` — `Community{community_key_id}` / `SelfCollective{identity_key_id}` /
+`Family{family_key_id}` — which answers: the cohort `scope()`, the `content_group_id()` a row and
+pointer carry, the `table_group_id()` the lifecycle installs under, the `cohort_target_field()` a row
+places itself with (`community_key_id` / `family_key_id` / none), the `row_scope_token()`, and the
+`widen_to()` audience. Before it, the first three were spelled in three files and a disagreement was
+silent on both sides of the wire (CIRISEdge#616/#619). **The table's key is the pair
+`(CohortScope, group_id)`**, so the scope already discriminates: a community keeps its `cohort:`
+namespace (installed under it today), and self and family take the bare id. An earlier draft of this
+section said `self:<identity_key_id>`; the pair is the key, so a prefix would buy a migration and
+nothing else.
 
-**Bootstrap — everything rides the row plane, which needs no self room.** KeyPackage, Welcome and
-Commit are `SelfOwn` rows (the community rooms already carry them as rows: `chat::KEY_PACKAGE_DIMENSION`,
-`WELCOME_DIMENSION`); they reach every node of the identity by R2 over ordinary federation-addressed
-links (the lightnet facts CC 1.13.3.1 concedes). Only the bytes (R5–R8) need the room.
+**Members are nodes**; the roster is the DIRECTORY's answer (`self_room::roster` → `nodes_owned_by`,
+the same walk the send set's node half uses), and the MLS tree is the state this node has converged
+to. The difference between them is the work.
 
-```
-creator      the canonical-first node of the identity (lowest node key_id among the nodes hosting
-             active occurrences, CC 4.4.3.2.4.1(a) ordering) that holds no self-room state creates
-             the group; every other node publishes a KeyPackage row and WAITS. A CreationClaim
-             (at_ms, creator_key_id) rides the first Commit; a node that created and then admits a
-             Welcome for the same group id with an earlier claim abandons its own group and joins
-             (the #604 CommitClaim rule, applied one level up)
-new node B   B announces its occurrence → B publishes KeyPackage(self) → any member (the creator,
-             or whichever member admits the KeyPackage first) commits Add(B): Commit row +
-             Welcome row, the Welcome HPKE-wrapped under B's occurrence X-Wing key (CC 5.4.4)
-             → B admits the Welcome → CohortGroup::join → self_addressing::snapshot → install
-             → the epoch advanced on every member → advance (make-before-break, seal on cadence)
-concurrent   two members commit at once → #604 convergent merge (earliest claimed_at, lowest
-             committer key_id), rollback within the retention window — nothing new
-late member  a node whose occurrence announce reached this node AFTER the room was installed at
-             the same epoch → ScopeLifecycle::refresh_members (CIRISEdge#648): admit it without
-             rotating and without a window in which anyone is unaddressed
-revocation   IdentityOccurrenceRevocation → any member commits Remove → epoch advances → advance;
-             the removed node's addresses seal out on cadence
-creator lost the group lives in every member; there is no creator role after creation. An identity
-             whose every node lost state is a single-node identity again and the rule above recreates
-```
+**Nobody creates it.** A community room is created by a person inviting another; a self room must
+appear the moment an identity has a second device, with no human act — and if two devices each
+create one they derive different secrets and address each other at destinations nobody registered.
+So the rule is edge's, as a pure total function (`self_room::decide`, shipped v29.5.0), and the IO is
+the host's — the same split `ScopeLifecycle`'s verbs already use, which is what keeps two hosts from
+disagreeing about who creates:
 
-`self_addressing::snapshot(identity, lens)` is the twin of `cohort_addressing::snapshot_for_nodes`:
-it reads the identity's active occurrences, resolves them to nodes, and hands the lifecycle a
-`ScopeGroupSnapshot` from the self room's `destination_secret`. **Family** is the same shape with the
-roster from `list_families_for_member_active` and group id `family:<family_id>`; the creator rule
-orders over the members' nodes.
+| this node's state | decision | the host does |
+|---|---|---|
+| not in the directory's roster | `NotInRoster` | fix the owner binding; never derive |
+| roster is just me | `SoleDevice` | nothing; it ends when a second device announces |
+| no room, I am canonical-first (lowest key id) | `Create` | `CohortGroup::create`, stamp the `CommitClaim` |
+| no room, someone else is first (or a rival room is known) | `PublishKeyPackage` | publish a KeyPackage row at `self` |
+| hold the room, directory has devices the tree lacks | `Add(nodes)` | `add_member` per published KeyPackage → Commit + Welcome rows |
+| hold the room, tree has devices the directory dropped | `Remove(nodes)` | `remove_member` → the epoch advances, forward-securing what follows |
+| hold the room, a rival claim wins | `Abandon{in_favour_of}` | drop it and join the winner's |
+| converged | `Idle` | `seal_due` on the cadence |
+
+**Concurrent creation is settled, not prevented.** In an unconverged directory B cannot see A, so B
+believes it is first and a second room appears. Preventing that needs a coordination round the
+substrate has no way to run; settling it needs only a total order, which `CommitClaim` already is
+(earliest `asserted_at`, ties on the lowest committer key id — the CIRISEdge#604 rule one level up,
+applied to creation itself). Both nodes abandon the same room from either arrival order.
+
+**The bootstrap needs no room.** KeyPackage, Welcome and Commit are ordinary `self`-placed rows, so
+they reach the identity's other nodes over the row plane — which since v29.3.0 carries a `self` row
+to the owner's own nodes with no grant between them (R2). Only the BYTES need the room, so there is
+no chicken-and-egg. Welcome is HPKE-wrapped under the invitee's X-Wing key (CC 5.4.4).
+
+`self_room::snapshot(group, identity)` is the twin of `cohort_addressing::snapshot`, differing only
+in the key; there is no person-to-node walk and so no `unresolved` set, because the tree already
+holds nodes. **Family** is the same shape with the roster from `list_families_for_member_active`
+(§6.4).
 
 This reuses the CC 5.4.6 substrate — derived addresses are transport privacy for *any* non-public
 cohort — without being the community approach: no holder claim, no swarm discovery, no community
-roster, no widening; the roster IS the occurrence list, and the room's only job is the address.
+roster, no widening of the room itself; the roster IS the occurrence list, and the room's only job is
+the address.
 
 ### 6.4 Family (persist ruling on #884 Q2, agreed)
 
@@ -432,7 +444,7 @@ C joins         as B; C runs R4–R8 against A or B — both are the author's no
 | `blob_route_refusals` (`blob_group_not_installed` / `…not_in_group` / `…sealed_out`) | R5 | ✓ v26.2.0 |
 | `blob_serve_refusals` | R6 | ✓ v27.0.0 |
 | `scope lifecycle INSTALLED / ADVANCED / REFRESHED` (scope, group, epoch, members, added/removed) | R5 | ✓ v26.2.0 / v29.2.0 (#648); self room: — |
-| `self room CREATED / JOINED / ABANDONED(claim)` (identity, creator, claim) | R5 | — |
+| `self room CREATED / JOINED / ABANDONED(claim)` (identity, creator, claim) | R5 | — (the host logs what `self_room::decide` named; the decision itself is a pure value) |
 | `blob meaning projected` with `group_id` provenance (`identity` / `family_id` / `community`) | R5 | — |
 | `chat: body opened` / `Body::Unopened { reason }` | R8 | ✓ |
 | ladder stages: `bound`, `sent`, `arrived`, `hamburger` | community | ✓ (server); **`mine_on_b`** for self — |
@@ -446,7 +458,8 @@ the self row set adds `mine_on_b` = "a self row written on A opened on B", with 
 |---|---|---|
 | **all** | `ReplicationRuntimeConfig::local_key_id`; `sealed_content: SealedContentWiring { engine, pull_sink, revocations }`; a `BlobChunkSource` with `answers_scope() -> true` if scope-native; `kick()` after publishing | rounds, propagation kicks, key-grant projection, pull on admitted rows, revocation eviction |
 | **community** | the widen (`share(.., With::Community, ..)`); `ScopeLifecycle::install` on `Keyed` with `snapshot_for_nodes`, `advance` on epoch change, `seal_due` on a cadence | holder claim, discovery, swarm pull, serve, adopt, announce |
-| **self / family** | nothing new in the config; the self-room drive beside the chat-room drive: `self_addressing::snapshot` → `install` on join, `advance` on every Commit, `refresh_members` (#648) when an occurrence resolves late, `seal_due` on the cadence; publish the KeyPackage row on first start | the creator rule, Welcome/Commit rows, the implicit send set (persist), author's-nodes fetch, `LocalOnly` adopt, retroactive re-grant (persist) |
+| **self / family** | tick `self_room::decide` and perform the action it names (§6.3's table); `self_room::snapshot` → `install` on join, `advance` on every Commit, `refresh_members` (#648) when an occurrence resolves late, `seal_due` on the cadence | the creator rule ITSELF (`decide` is edge's), the implicit send set (persist), author's-nodes fetch, `LocalOnly` adopt, retroactive re-grant (persist) |
+| **files, every cohort** | `files::publish(dir, store, signers, &FileWrite { room, bytes, media_type, filename, asserted_at })` — one call | the seal at the room's tier, persist's group slot, the citing row, the cohort target field, and the crossing to the room's audience. Read: `files::in_room` (the drive) + `FileRow::open` → bytes or `UnopenedReason` (`NotFetched` = "on another device") |
 | **commons** | the allowlist (`SenderStanding::Allowlisted`) | everything else |
 | **client** (CIRISServer#615) | create: descriptor + bytes with `size`; read: verify → sniff → policy; enumerate: `GET /v1/drive` over the row plane, cursor `since`, row-held/bytes-absent as a state | — |
 
@@ -486,6 +499,12 @@ template: it is green because each rung has a witness, not because a run passed.
 
 ## 13. Changelog
 
+- **2026-09-22 (v29.5.0, CIRISEdge#646 §6.3 + the file door).** `ScopeRoom` — one type answering every
+  question about a room's identity, replacing three spellings; the self room specified as an ordinary
+  `CohortGroup` with `self_room::{roster, snapshot, decide}` (the creator rule pure and total, the IO
+  the host's); `files::publish` / `files::in_room` / `FileRow::open` — one door for a file at any
+  cohort, which the R4 witness now uses end to end instead of a hand-rolled producer. The group-id
+  namespace question is settled above. Open in #646: the host-side drive.
 - **2026-09-22 (v29.4.0, CIRISEdge#646 §6.2 cut).** R4 source rule + R5 projector rule shipped with
   witnesses; the two-facet rule (`scope()` placement / `key_plane()` pointer) written into §6.2; the
   group-id order corrected to persist's convention (the pointer's slot carries the owner at `self`,

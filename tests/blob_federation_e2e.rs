@@ -2067,81 +2067,6 @@ async fn federation_content_row(
     }
 }
 
-/// CIRISEdge#646 — a row placed at `self` that references `pointer`: the
-/// owner's own file, sealed at the invisible tier, naming no community.
-/// Bound-hybrid-signed by the AUTHOR node's key (the shape `put_blob_scoped`
-/// at `self` produces: the sealing node is the attester).
-async fn self_content_row(
-    author: &ciris_edge::identity::LocalSigner,
-    pointer: &BlobPointer,
-    asserted_at: chrono::DateTime<chrono::Utc>,
-) -> ciris_persist::federation::Attestation {
-    use ciris_edge::replication::attestation_bind::{
-        bind_attestation_envelope, render_signed_instant, truncate_to_substrate_resolution,
-        AttestationColumns,
-    };
-    use sha2::Digest as _;
-    let author_key_id = author.key_id.as_str();
-    let asserted_at = truncate_to_substrate_resolution(asserted_at);
-    let dimension = "file:attachment:v1";
-    let mut envelope = serde_json::json!({
-        "dimension": dimension,
-        "score": 1.0,
-        ciris_edge::chat::FIELD_CONTENT: pointer,
-    });
-    let attestation_id = {
-        let mut h = sha2::Sha256::new();
-        h.update(dimension.as_bytes());
-        h.update(author_key_id.as_bytes());
-        h.update(render_signed_instant(asserted_at).as_bytes());
-        h.update(ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon"));
-        format!("file-{}", &hex::encode(h.finalize())[..32])
-    };
-    let subjects = vec![author_key_id.to_owned()];
-    bind_attestation_envelope(
-        &mut envelope,
-        asserted_at,
-        &AttestationColumns {
-            attestation_id: &attestation_id,
-            attesting_key_id: author_key_id,
-            attestation_type: "scores",
-            attested_key_id: author_key_id,
-            subject_key_ids: &subjects,
-            cohort_scope: ciris_persist::federation::types::cohort_scope::SELF,
-            weight: None,
-        },
-    );
-    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
-    let digest = sha2::Sha256::digest(&canonical);
-    let (sig_classical, sig_pqc) =
-        ciris_edge::identity::sign_bound_hybrid(author, &canonical, dimension)
-            .await
-            .expect("hybrid sign");
-    ciris_persist::federation::Attestation {
-        attestation_id,
-        attesting_key_id: author_key_id.to_owned(),
-        attested_key_id: author_key_id.to_owned(),
-        attestation_type: "scores".to_owned(),
-        weight: None,
-        asserted_at,
-        expires_at: None,
-        attestation_envelope: envelope,
-        original_content_hash: hex::encode(digest),
-        scrub_signature_classical: sig_classical,
-        scrub_signature_pqc: sig_pqc,
-        scrub_key_id: author_key_id.to_owned(),
-        scrub_timestamp: asserted_at,
-        pqc_completed_at: None,
-        persist_row_hash: String::new(),
-        subject_key_ids: subjects,
-        withdraws_admission_rule: None,
-        cohort_scope: ciris_persist::federation::types::cohort_scope::SELF.to_owned(),
-        tier: ciris_persist::federation::types::attestation_tier::FEDERATION.to_owned(),
-        promoted_at: None,
-        additional_scrubs: Vec::new(),
-    }
-}
-
 /// **`FSD/CONTENT_TRANSFER.md` §5.3 R4 — a self row's pull asks the author's
 /// nodes, never `list_holders`** (CIRISEdge#646).
 ///
@@ -2154,10 +2079,11 @@ async fn self_content_row(
 /// (no scope-address table) refuses by name. The counter says where the
 /// holders came from.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // the whole flow — write, cross, pull — in one place on purpose
 async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
     use ciris_edge::blob_swarm::{BlobPuller, PullConfig, PullOutcome};
     use ciris_persist::federation::blobs::BlobStorage as _;
-    use ciris_persist::federation::{FederationDirectory, SignedAttestation};
+    use ciris_persist::federation::FederationDirectory;
     init_tracing();
     let alice = Ident::new("alice-fed", 0x11);
     let alice_phone = Ident::new("alice-phone", 0x33);
@@ -2172,23 +2098,28 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
     let (_edge_a, _stop_a) = spawn_edge(&node_a, wire_a).await;
     let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
 
-    let sealed = node_a
-        .store
-        .seal(SealRequest {
-            cohort_scope: ciris_persist::federation::types::cohort_scope::SELF,
-            // Persist's own convention: at `self` the group slot carries the
-            // OWNER's key id — the self-collective's identity (CC 3.3.6).
-            community_key_id: Some(&alice.key_id),
-            author_key_id: &node_a.me,
+    // THE FILE DOOR, as a host uses it (CIRISEdge#646 §9): one call seals at
+    // the room's cohort, authors the citing row, and crosses it. Writing this
+    // by hand is what every host would otherwise do differently.
+    let published = ciris_edge::files::publish(
+        &*node_a.dir,
+        &node_a.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &ciris_edge::files::FileWrite {
+            room: &ciris_edge::self_room::room(&alice.key_id),
+            bytes: b"my file, on my other device",
+            media_type: "text/plain",
+            filename: Some("my-file.txt"),
             asserted_at: ts(),
-            field: ContentField::Body,
-            plaintext: b"my file, on my other device",
-            media_type: Some("text/plain"),
-        })
-        .await
-        .expect("seal at the invisible tier");
+        },
+    )
+    .await
+    .expect("publish a file into alice's self room");
     assert_eq!(
-        sealed.tier,
+        published.tier,
         ciris_persist::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
         "precondition: a self write seals at the invisible tier"
     );
@@ -2196,18 +2127,33 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         rows_of(&node_a, "holds_bytes:").await.is_empty(),
         "precondition (CC 5.2): a self write emits NO holder claim anywhere"
     );
-    let sha: [u8; 32] = hex::decode(&sealed.pointer.content_sha256)
+    let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
         .expect("hex")
         .try_into()
         .expect("32 bytes");
-    let row = self_content_row(&node_a.signer, &sealed.pointer, ts()).await;
-    node_a
-        .dir
-        .put_attestation_authored(SignedAttestation {
-            attestation: row.clone(),
-        })
-        .await
-        .expect("A holds the row it authored");
+    // The row B receives is the CROSSED one, not the authored local-tier copy.
+    let crossed_id = match &published.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        awaiting @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!(
+                "the file did not cross into the self room — a node's own self row is its \
+                 own producer, so ProducerAuthority must place it without an actor: {awaiting:?}"
+            )
+        }
+    };
+    let row =
+        ciris_persist::federation::FederationDirectory::get_attestation(&*node_a.dir, &crossed_id)
+            .await
+            .expect("read the crossed row")
+            .expect("the crossing placed a row");
+    assert_eq!(
+        row.cohort_scope,
+        ciris_persist::federation::types::cohort_scope::SELF,
+        "the crossed row is placed at self — the owner's devices, nobody else"
+    );
 
     let puller = BlobPuller::new(
         Arc::clone(&edge_b),

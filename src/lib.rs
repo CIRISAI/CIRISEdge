@@ -123,7 +123,10 @@ pub mod family_gates;
 pub mod scope_addressing;
 pub mod scope_lifecycle;
 // v6.0.0 (CIRISEdge#175) — CC 1.13.3.4 substrate.
+pub mod files;
 pub mod scope_privacy;
+pub mod scope_room;
+pub mod self_room;
 pub mod swarm;
 pub mod touch_claim;
 pub mod transport;
