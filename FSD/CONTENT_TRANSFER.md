@@ -455,14 +455,29 @@ strategy. Self and family content is excluded from fountain retention by CC 6.1.
 the CC 5.2 suppression anyway: no `FountainHoldingClaim` exists for it, and a 2–5-device collective
 cannot place the 26 distinct symbols the shipped tuple's feasibility floor needs.
 
-**Not built.** Edge's `GroupContentStore` has no chunk-DAG door, so `files::publish` refuses anything
-over the bound by name — `FileError::TooLargeForInline { size, cap }`, which says which door is
-missing and what it waits on, rather than passing through an argument error from a layer the caller
-did not call. The file door works at every cohort, and only up to 1 MiB. It is
-gated on **CIRISPersist#821 Q1/Q2** (per-chunk serve vs proxy shedding under the stop tier — the
-self-file driver is recorded on that issue; whether a
-scoped chunked put is one door or two) and tracked as **CIRISEdge#633**. A drive that cannot hold a
-video is a notes app, so this is the difference between "self files replicate" and "files".
+**Not built — and not blocked** (corrected 2026-09-22 against the pinned tree). `files::publish`
+refuses anything over the bound by name, `FileError::TooLargeForInline { size, cap }`. An earlier
+draft of this section said that refusal was waiting on **CIRISPersist#821 Q1/Q2**. It is not: Q1
+shipped in persist v44.5.0 (`serve_blob_range_to_peer` — the ranged serve with the same proxy-shedding
+and quarantine gates as the whole-blob path), Q2 is settled, and the **scoped chunk DAG shipped whole**
+(persist #832/#838). At the version edge pins today, v46.3.1, every door exists as an `Engine` call:
+
+| door | what it does |
+|---|---|
+| `put_blob_chunk_scoped(scope, stream_id, seq, plaintext, epoch, community_key_id, aad)` | append one segment to a live stream, sealed where the tier requires — the chunk twin of `put_blob_scoped` |
+| `seal_stream_scoped(scope, stream_id, community_key_id, media_type, aad)` | seal the live stream into a `chunk_dag` at that cohort |
+| `read_blob_range_as(sha, viewer, start, end, aad)` | the ranged read; the whole-read door refuses above 64 MiB and names this one |
+| `read_stream_chunk_as(stream_id, seq, viewer, aad)` | one chunk by position |
+| `adopt_sealed_chunk` | the receiver's adopt, gated by `would_hold` + the §4.3 adopt path |
+
+Per-chunk AEAD with position-bound AAD (`ChunkManifest` v2), `MAX_CHUNKS_PER_EPOCH = 2²⁴` as the
+nonce-safety cap. **Edge wires none of them**, which is the whole of the gap: the write path above the
+bound is `put_blob_chunk_scoped` × N → `seal_stream_scoped`, and the read path is `read_blob_range_as`.
+That is **CIRISEdge#633**, unblocked on the current pin, and it is the difference between "self files
+replicate" and "files". A drive that cannot hold a video is a notes app.
+
+(Persist will ship a PyO3 binding for `adopt_sealed_chunk` in v46.4.0. Edge does not need it — edge
+calls the `Engine` door in Rust — but a **Python** consumer adopting a chunk DAG does.)
 
 ### 6.8 The drive read needs a filter, not a scan (persist ask — CIRISPersist#891)
 
@@ -489,11 +504,31 @@ That bound is a stopgap standing in for a query, and the gap is narrower than "p
   drive through, `list_attestations_since`, takes a cursor and **no filter at all**.
 
 **The ask**, therefore, is one axis and one composition: `cohort_scope` (and, if it is cheap, the
-cohort target) on `AttestationFilter`, plus a cursor-paged filtered read over the attestation plane —
-either `list_attestations_since` gaining an optional filter, or a sibling of `list_scores` that is not
-subject-projection-bound. Persist owns which shape; edge needs only that one query answers *"this
-room's file rows, resumable"*. Nothing in the data model moves: `cohort_scope` is a column the write
-gate already reads.
+cohort target) on `AttestationFilter`, plus a cursor-paged filtered read over the attestation plane.
+**Persist's answer (CIRISPersist#891), landing in v46.4.0:** the axis goes on the filter — the column
+is already indexed for exactly this query (V056, a partial index on non-`federation` scopes) — and the
+read ships as a **sibling door, not a parameter on `list_attestations_since`**, for a reason edge could
+not see from outside and should record:
+
+> `list_attestations_since` is the **replication** cursor. It composes **no §4.3 caller-visibility
+> predicate**, which is correct for what it is — the audience question is answered by the send set and
+> the per-row gates, not by the listing — and wrong for a reader's door. Giving it a filter would dress
+> the ungated door as a reader's.
+
+The sibling composes the §4.3 gate (`cohort_scope_sql_predicate_with_dimension`, dimension-aware since
+v46.3.1 so a sensitive `config:*` leaf stays node-local) and the local-tier gate, at one
+`build_caller_admission` per call rather than per row.
+
+**Until edge adopts it, `files::in_room` is caller-ungated, and that is the host's to enforce.** It
+takes a room and returns that room's files; it does not ask *whether this caller may see that room*.
+On a one-human node the distinction is invisible. On a shared device — two humans, one node, the shape
+CIRISPersist#873/#888 exist for — a caller that can name another person's identity can enumerate their
+file rows. Edge cannot compose the gate itself without duplicating the predicate persist is about to
+ship, so the honest position is: **the host gates the drive read until v46.4.0**, and edge adopts the
+gated door and deletes the precondition. Persist's ruling on the question edge asked — *should a local
+drive read carry the gate at all, since the reader is the owner?* — is **yes**: the gate is about who
+is asking, not where the bytes are, and "the reader is the owner" is a deployment assumption the shared
+device breaks.
 
 ## 7. Invariants — and the mutant each must kill
 
@@ -569,17 +604,20 @@ the self row set adds `mine_on_b` = "a self row written on A opened on B", with 
    content set is not retired as "not the author" on every second device (v46.3.0), the `family_key_id`
    carrier confirmed (CIRISPersist#887), and the read-side self gate (v46.3.1). **Nothing here blocks
    self row or self byte replication.**
-2. **persist — open, two asks, both narrow**: **(a)** the §6.8 listing filter (**CIRISPersist#891**) — a
-   `cohort_scope` axis on `AttestationFilter` plus a cursor-paged filtered read, so R10 is a query
-   rather than a bounded walk; it is on `GET /v1/drive`'s critical path, not the replication path.
-   **(b)** **CIRISPersist#821** Q1/Q2 → the §6.7 chunk-DAG door, without which every cohort's files
-   stop at 1 MiB.
+2. **persist — open, two asks, both narrow**: **(a)** the §6.8 gated reader door
+   (**CIRISPersist#891**, landing in v46.4.0) — `cohort_scope` on `AttestationFilter` plus a
+   cursor-paged read composing the §4.3 gate. Until edge adopts it the drive read is caller-ungated
+   and the host must gate it. **(b)** a PyO3 binding for `adopt_sealed_chunk` (v46.4.0) — **edge does
+   not need it**, it calls the `Engine` door in Rust; a Python consumer adopting a chunk DAG does.
+   **CIRISPersist#821 is discharged**: Q1 shipped in v44.5.0, Q2 is settled, and the scoped chunk DAG
+   shipped whole — see §6.7.
 3. **edge — done**: the projector's group-id rule and the two facets (§6.2, v29.4.0); the source rule
    and `blob_pull_sources` (§6.2); `announce_is_possible` asks the substrate (#646 ask 1); `ScopeRoom`,
    `self_room::{roster, snapshot, decide}` and the file door (§6.3/§9, v29.5.0); `refresh_members`
    (#648, v29.2.0).
-4. **edge — open**: the §6.7 DAG door when persist's answer lands; the CC 5.4 wire profile
-   (CIRISEdge#651), which is orthogonal to all of the above.
+4. **edge — open**: the §6.7 DAG door (**CIRISEdge#633 — unblocked on the current pin**, every persist
+   door exists; this is edge's unbuilt work, not a dependency), then the §6.8 gated reader door when
+   v46.4.0 lands; the CC 5.4 wire profile (CIRISEdge#651), orthogonal to all of the above.
 5. **server — open, and it is the whole remaining path**: drive `self_room::decide` and perform the
    action it names (§6.3's table) beside the chat-room drive; the `mine_on_b` ladder stage, red by
    design at first; `GET /v1/drive` over `files::in_room`. Bytes do not move end to end until (5),
