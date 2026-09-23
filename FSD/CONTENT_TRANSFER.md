@@ -121,7 +121,7 @@ row, always; `tier` / `community_key_id` / `epoch` from the pointer; the floor b
 
 ## 4. The transfer rule per cohort — one table
 
-| | **self** | **family** | **community / affiliations** | **commons** (species / biosphere / federation) |
+| | **self** | **family** | **community / affiliations** ¹ | **commons** (species / biosphere / federation) |
 |---|---|---|---|---|
 | tier (CC 4.4.3.2.1) | per-write DEK, `InvisibleEncrypted` | per-write DEK, `InvisibleEncrypted` | shared epoch DEK, `CommunityDek` | `Plaintext` |
 | row projection (persist `namespace`) | `SelfOwn` | `SelfOwn` | `Cohort` | `Cohort` / `Global` (trust root) |
@@ -137,10 +137,73 @@ row, always; `tier` / `community_key_id` / `epoch` from the pointer; the floor b
 | announce after adopt | never (`LocalOnly`) | never | `Announce` — the adopter becomes a holder | `Announce` |
 | revocation reach (`withdraws`) | the identity's nodes — the row is a **tombstone** and projects at the Attestation plane's ceiling, never `SelfOwn` (transport FSD §3.2; persist `tombstone_ceiling`) | the family's nodes, same projection | every holder, via the claim index + the register | every holder |
 
+¹ CC puts `affiliations` in the same tier as `community`, with the same machinery, so the column is
+right *as a design*. It is **not proven** for affiliations: four gates still read it as a broad tier
+with no room (§4.1, CIRISPersist#897), and no witness exercises an affiliations row. "Proven" below
+means community.
+
 The right-hand two columns are proven. The left-hand two are the design in §6; every cell there
 is a rung in §5 with a witness named and, today, absent. The commons column is not "community
 minus a key": it has no room, no widening, no scope group and no serve-side scope duty, which is
 why §5.2 gives it its own rows.
+
+### 4.1 Needful and rightful — one predicate per scope, many consumers
+
+Every scope answers two questions about a row, and several gates ask them:
+
+- **Needful.** Which nodes must *receive* the row, or its key, for the people entitled to it to have
+  it? persist's hold path (`replication/hold.rs`) and edge's send set answer this, plus the key
+  cascade for keys.
+- **Rightful.** Who may *read* it? persist's §4.3 read gate (`scope/sql.rs`, `scope/caller.rs`) and
+  edge's serve gate (`bridge.rs`, `admit_blob_serve`) answer this. Behind them sits the gate that
+  decides who may *place* a row there at all: persist's AV-45 write gate.
+
+**The rule: for each scope, needful and rightful come from one predicate, with several consumers.**
+They must not be several predicates that happen to agree today. Where they differ, the stack fails
+in one of two ways, and both have happened:
+
+| split | what fails | who notices | instance |
+|---|---|---|---|
+| rightful ⊊ needful: sent, then refused on read | **closed**: members receive rows they can't list | loud; a host files the bug | **CIRISPersist#893**: the read gate's targeted arms matched the *producer's* rooms, never the row's, so every community and family drive came back empty |
+| needful ⊊ rightful: withheld, then served to anyone | **open**: non-members read rows they were never sent | **nobody**; no test asks and no host complains | **CIRISPersist#897**: `affiliations` was room-gated on hold and broad on read, write, widen and edge serve |
+
+The second row is the dangerous one. A gate that's too tight produces a bug report. A gate that's too
+loose produces nothing: no failing call, no refusal in a log, nobody to file it. So a test that proves
+one gate against a constant doesn't prove anything about the stack. The witness has to be **one row
+asked of every gate**, with each answer compared against the others.
+
+**One legitimate asymmetry, and it's about bytes, not rows.** CC 4.4.3.2.1 lets *non-members* hold
+community ciphertext: `holds_bytes` carries *"cleartext provenance … so non-member holders can make an
+informed keep/evict decision without reading content"*. Holding sealed bytes isn't reading them, since
+the DEK is the boundary. That covers **blob ciphertext at the Community tier only**. It never covers
+the row, a self/family byte (CC 5.2), or a key.
+
+#### The census: every gate × every scope
+
+"Named room" means the gate keys on the cohort the **row** names (`envelope_cohort_target` or V150
+`cohort_target`), never on the producer's or the caller's rooms. `✗` marks a gate that disagrees
+with CC. As of CIRISPersist v46.5.0 (#893) and edge v30.1.0:
+
+| gate (owner) | `self` | `family` | `community` | `affiliations` | commons |
+|---|---|---|---|---|---|
+| **CC** (4.4.3.2.1, .8; 5.2) | owner's occurrences | the named family | the named room's roster | **the named affiliation's roster** | anyone |
+| write: AV-45 (persist) | writer = owner | writer ∈ named family | writer ∈ named room | ✗ any authenticated writer, no target | any authenticated writer |
+| widen: `crossing::Audience` (persist) | `SelfOnly` | `Family{id}` | `Community{id}` | ✗ `Affiliations`, no target | unit |
+| at-rest tier (persist `resolve_write_tier`) | per-write DEK | per-write DEK | the room's DEK; refuses without an id | the room's DEK; refuses without an id | plaintext |
+| **needful**: hold / send (persist `hold.rs`) | principal equality | named family | named room | named room | anyone |
+| **rightful**: read §4.3 (persist) | principal | named family (#893 ✓) | named room (#893 ✓) | ✗ **anyone, incl. unauthenticated** | anyone |
+| **rightful**: serve (edge `bridge.rs`) | principal equality | `families.contains` | `communities.contains` | ✗ `true` → **fail-closed** in v30.1.0 | `true` |
+| blob meaning (edge `blob_swarm::meaning`) | owner's group | named family | named room | named room | — |
+
+Edge's rulings on both issues are posted: #893 was **(1): the row's room, per arm**, and #897 is
+**room-gated everywhere**. For the second, CC 4.4.3.2.8 gives affiliations *"all the community
+machinery"*, makes `compartments[]` *"membership ⊆ roster"*, and handles public records by
+**promoting them to Commons** (`disclosure_posture: transparency-seeking`), never by reading
+`affiliations` broadly. The `✗` cells close in the order the ruling gives. persist's `Audience` gets
+its target first, since every other gate needs a room to key on.
+
+**Adding a scope, or changing one, means filling a whole column of this table**, not one cell. A
+change that moves one gate and leaves the others alone is how both issues were introduced.
 
 ## 5. The rung table — cohort × rung, owner, refusal, witness
 
@@ -149,7 +212,7 @@ everywhere. A rung's **owner** is the repo whose code decides it; its **refusal*
 log and the counter carry when it fails; its **witness** is the test that proves it. "—" in the
 witness column is the work.
 
-### 5.1 Community / affiliations — DONE, the reference row set
+### 5.1 Community — DONE, the reference row set (affiliations: NOT done, §4.1)
 
 | rung | what must be true | owner | refusal by name | witness |
 |---|---|---|---|---|
@@ -693,6 +756,11 @@ template: it is green because each rung has a witness, not because a run passed.
 
 ## 13. Changelog
 
+- **2026-09-23 (§4.1, CIRISPersist#897).** Added the needful/rightful rule and the gate × scope census
+  after persist found `affiliations` room-gated on hold and broad on read. The census found **four more
+  gates** with the broad spelling (AV-45 write, `Audience::Affiliations`, edge's serve arm, and the
+  read gate itself). It also found that §5.1 had called affiliations "DONE" with no witness for it.
+  §5.1 is retitled and §4's column footnoted. Edge's serve arm fails closed in v30.1.0.
 - **2026-09-23 (v30.0.0, adopt persist v46.4.0 + CIRISEdge#656).** The drive read became a gated
   query (§6.8): `files::in_room(engine, &room, caller, limit, after) -> DrivePage`, on persist's
   `Engine::list_attestations` with the new `cohort_scope` axis, so the §4.3 visibility predicate runs

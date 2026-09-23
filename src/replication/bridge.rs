@@ -5465,10 +5465,24 @@ impl FederationDirectoryReplicationBridge {
                 self.peer_in_cohort(peer, memo, |c| c.communities.contains(community_key_id))
                     .await
             }
-            Audience::Affiliations
-            | Audience::Species
-            | Audience::Biosphere
-            | Audience::Federation => true,
+            // CIRISPersist#897 — FAIL-CLOSED until the row can name its room.
+            //
+            // CC 4.4.3.2.1 puts `affiliations` in the Community tier ("reader:
+            // community members"), and 4.4.3.2.8 gives it "all the community
+            // machinery". It is room-gated like `community`, not a broad tier,
+            // and public affiliation records are PROMOTED to a commons row
+            // instead (`disclosure_posture: transparency-seeking`). This arm
+            // was `true`, so edge served an affiliations row to any peer that
+            // asked, while persist's hold path refused to send it anywhere:
+            // the needful ⊊ rightful split of FSD/CONTENT_TRANSFER.md §4.1.
+            //
+            // persist's `Audience::Affiliations` carries no room yet, so there
+            // is nothing to key a membership check on. Refusing is the only
+            // answer that doesn't leak. Nothing in-org produces these rows,
+            // so this costs nothing today. When persist's audience gains
+            // `community_key_id`, this becomes the `Community` arm's check.
+            Audience::Affiliations => false,
+            Audience::Species | Audience::Biosphere | Audience::Federation => true,
         };
         if !served {
             self.withhold(
@@ -16769,6 +16783,53 @@ pub(crate) mod tests {
                     "test",
                 )
                 .await
+        );
+    }
+
+    /// CIRISPersist#897 — an `affiliations` row is served to NOBODY until it
+    /// can name its room, and the same peer is still served a commons row.
+    ///
+    /// The second half is the control. It proves the refusal comes from the
+    /// scope, not from a peer the gate would have refused anyway. The pre-fix
+    /// arm was `true`, and this test fails on it.
+    #[tokio::test]
+    async fn an_affiliations_row_is_withheld_until_it_names_its_room() {
+        use ciris_persist::federation::Audience;
+        let backend = owner_axis_backend(true).await;
+        let metrics = crate::observability::EdgeMetrics::default();
+        let bridge = audience_bridge(&backend).with_metrics(Some(metrics.clone()));
+        let mut memo = AudienceMemo::default();
+        assert!(
+            bridge
+                .audience_withholds(
+                    Ok(Audience::Affiliations),
+                    "person-bob",
+                    "node-bob",
+                    Reach::Consent,
+                    &mut memo,
+                    "test",
+                )
+                .await,
+            "CC 4.4.3.2.1: affiliations is the Community tier, readable by the affiliation's \
+             roster, and a row that names no affiliation has no roster to be in"
+        );
+        assert!(
+            !bridge
+                .audience_withholds(
+                    Ok(Audience::Species),
+                    "person-bob",
+                    "node-bob",
+                    Reach::Consent,
+                    &mut memo,
+                    "test",
+                )
+                .await,
+            "the control: the same consent-reached peer is served a commons row"
+        );
+        assert_eq!(
+            metrics.snapshot().withholds_by_reason.values().sum::<u64>(),
+            1,
+            "the refusal is booked, so the narrowing is never silent"
         );
     }
 

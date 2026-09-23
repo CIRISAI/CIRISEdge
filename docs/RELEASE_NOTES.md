@@ -30,6 +30,22 @@ is chunked and the tier is still `InvisibleEncrypted`, that **no holder claim ex
 not care how many chunks it took), that the drive lists it as an ordinary file, and that it opens
 **byte for byte**.
 
+## Also: edge's `affiliations` serve arm fails closed (CIRISPersist#897)
+
+`bridge.rs` served an `affiliations` row to **any** peer, while persist's hold path refused to send it
+anywhere. CC 4.4.3.2.1 puts `affiliations` in the Community tier ("reader: community members"), and
+4.4.3.2.8 gives it "all the community machinery". It is room-gated, and public affiliation records
+are **promoted to a commons row** instead. persist's `Audience::Affiliations` doesn't carry a room
+yet, so the only non-leaking answer is to withhold it from everyone. Nothing in-org produces these
+rows, so nothing changes in practice. Witness:
+`bridge::an_affiliations_row_is_withheld_until_it_names_its_room`, which fails on the old arm and
+includes a commons control on the same peer.
+
+`FSD/CONTENT_TRANSFER.md` §4.1 is new: the **needful/rightful** rule. For each scope, who is sent a
+row and who may read it must be one predicate with several consumers. It includes a gate × scope
+census, which found four gates spelling `affiliations` as a broad tier. §5.1 had also claimed
+affiliations was "DONE" with no witness for it, and is corrected.
+
 **What remains on #633:** the cross-node fetch. The puller adopts a whole blob; a DAG needs
 `adopt_sealed_chunk` per chunk against the manifest, under the same store gate. Until then a DAG is
 written, listed and opened on the node that sealed it, and a far node reads `not_fetched` — the

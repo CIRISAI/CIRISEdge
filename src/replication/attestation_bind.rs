@@ -536,7 +536,8 @@ pub enum With {
         /// [`crate::chat::pair_community_key_id`].
         community_key_id: String,
     },
-    /// `affiliations` — organisations the subject is attached to. Same tier
+    /// `affiliations` — ONE named institutional cohort (CC 4.4.3.2.8), the
+    /// row placed in that affiliation's roster. Same tier
     /// as `community` (CC 4.4.3.2.1).
     Affiliations,
     /// `species` — narrower AUDIENCE than the federation, but **plaintext**
@@ -641,7 +642,7 @@ pub enum EncryptedCohort {
         /// The community the row is placed in.
         community_key_id: String,
     },
-    /// `affiliations` — organisations the subject is attached to.
+    /// `affiliations` — ONE named institutional cohort (CC 4.4.3.2.8).
     Affiliations,
 }
 
@@ -831,7 +832,9 @@ pub enum RoutesTo {
     FamilyNodes { family_key_id: String },
     /// `community` — members, served on discovery.
     CommunityMembers { community_key_id: String },
-    /// `affiliations` — served on discovery.
+    /// `affiliations` — the named affiliation's members, served on discovery.
+    /// The audience carries no room yet, so edge's serve gate withholds these
+    /// from everyone until CIRISPersist#897 gives it one.
     Affiliations,
     /// `species` — served on discovery, plaintext.
     Species,
