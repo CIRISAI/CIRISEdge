@@ -2559,6 +2559,13 @@ impl PyEdge {
             serve_refusals.set_item(label.as_str(), *n)?;
         }
         root.set_item("blob_serve_refusals", serve_refusals)?;
+        // CIRISEdge#646 — where each pull found its holders: a self/family
+        // pull reads `author_nodes`, never `claim_index`.
+        let pull_sources = pyo3::types::PyDict::new(py);
+        for (label, n) in &bundle.blob_pull_sources {
+            pull_sources.set_item(label.as_str(), *n)?;
+        }
+        root.set_item("blob_pull_sources", pull_sources)?;
         root.set_item(
             "replication_routed_to_responder_total",
             bundle.replication_routed_to_responder_total,

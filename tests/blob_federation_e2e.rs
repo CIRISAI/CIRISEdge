@@ -160,6 +160,25 @@ async fn node(idents: &[&Ident], signer: &Ident) -> Node {
 /// `WHERE signature IS NULL`, so it CANNOT downgrade a row that was published,
 /// and a legacy row can only be made by never publishing in the first place.
 async fn build_node(idents: &[&Ident], signer: &Ident, provision: bool) -> Node {
+    build_node_with(idents, signer, signer, provision).await
+}
+
+/// CIRISEdge#646 — a SECOND device of `owner`: the node's own signing key
+/// comes from `device` (a distinct `Ident`), while the owner binding is
+/// signed by `owner` and the engine occurrence is provisioned under the
+/// owner's identity — so two nodes built with the same `owner` are the
+/// same person's self-collective (CC 3.3.6), and `contact::resolve` on
+/// either yields the other.
+async fn device_of(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
+    build_node_with(idents, owner, device, true).await
+}
+
+async fn build_node_with(
+    idents: &[&Ident],
+    owner: &Ident,
+    signer: &Ident,
+    provision: bool,
+) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -220,13 +239,23 @@ async fn build_node(idents: &[&Ident], signer: &Ident, provision: bool) -> Node 
     // The binding is signed under the OWNER's key id, not the derived one: the
     // row's `attesting_key_id` is `signer.key_id`, and persist resolves the
     // verifying pubkeys from THAT record. Same hardware halves, different id.
-    let owner_signer = ciris_edge::identity::LocalSigner::new(
-        signer.key_id.clone(),
-        hw.clone(),
-        Some(pqc.clone()),
+    // The owner signs the binding with the OWNER's key — the same key as the
+    // node's only when the node is the owner's first device (CIRISEdge#646).
+    let owner_hw: Arc<dyn HardwareSigner> = Arc::new(
+        Ed25519SoftwareSigner::from_bytes(&[owner.seed; 32], owner.ed.current_alias())
+            .expect("rebuild the owner's signer"),
     );
+    let owner_pqc: Arc<dyn PqcSigner> = Arc::new(
+        MlDsa65SoftwareSigner::from_seed_bytes(
+            &[owner.seed ^ 0x55; 32],
+            format!("{}-pqc", owner.key_id),
+        )
+        .expect("rebuild the owner's pqc half"),
+    );
+    let owner_signer =
+        ciris_edge::identity::LocalSigner::new(owner.key_id.clone(), owner_hw, Some(owner_pqc));
     let binding = ciris_edge::replication::attestation_bind::owner_binding_attestation(
-        &signer.key_id,
+        &owner.key_id,
         &derived,
         ts(),
         &owner_signer,
@@ -252,7 +281,7 @@ async fn build_node(idents: &[&Ident], signer: &Ident, provision: bool) -> Node 
         let (me, _) = ciris_edge::content_occurrence::provision_engine_occurrence(
             store.engine(),
             &*dir,
-            &signer.key_id,
+            &owner.key_id,
             "server",
         )
         .await
@@ -268,7 +297,7 @@ async fn build_node(idents: &[&Ident], signer: &Ident, provision: bool) -> Node 
     Node {
         dir,
         store,
-        identity: signer.key_id.clone(),
+        identity: owner.key_id.clone(),
         me,
         signer: Arc::new(identity),
     }
@@ -2036,6 +2065,197 @@ async fn federation_content_row(
         promoted_at: None,
         additional_scrubs: Vec::new(),
     }
+}
+
+/// CIRISEdge#646 — a row placed at `self` that references `pointer`: the
+/// owner's own file, sealed at the invisible tier, naming no community.
+/// Bound-hybrid-signed by the AUTHOR node's key (the shape `put_blob_scoped`
+/// at `self` produces: the sealing node is the attester).
+async fn self_content_row(
+    author: &ciris_edge::identity::LocalSigner,
+    pointer: &BlobPointer,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> ciris_persist::federation::Attestation {
+    use ciris_edge::replication::attestation_bind::{
+        bind_attestation_envelope, render_signed_instant, truncate_to_substrate_resolution,
+        AttestationColumns,
+    };
+    use sha2::Digest as _;
+    let author_key_id = author.key_id.as_str();
+    let asserted_at = truncate_to_substrate_resolution(asserted_at);
+    let dimension = "file:attachment:v1";
+    let mut envelope = serde_json::json!({
+        "dimension": dimension,
+        "score": 1.0,
+        ciris_edge::chat::FIELD_CONTENT: pointer,
+    });
+    let attestation_id = {
+        let mut h = sha2::Sha256::new();
+        h.update(dimension.as_bytes());
+        h.update(author_key_id.as_bytes());
+        h.update(render_signed_instant(asserted_at).as_bytes());
+        h.update(ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon"));
+        format!("file-{}", &hex::encode(h.finalize())[..32])
+    };
+    let subjects = vec![author_key_id.to_owned()];
+    bind_attestation_envelope(
+        &mut envelope,
+        asserted_at,
+        &AttestationColumns {
+            attestation_id: &attestation_id,
+            attesting_key_id: author_key_id,
+            attestation_type: "scores",
+            attested_key_id: author_key_id,
+            subject_key_ids: &subjects,
+            cohort_scope: ciris_persist::federation::types::cohort_scope::SELF,
+            weight: None,
+        },
+    );
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
+    let digest = sha2::Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) =
+        ciris_edge::identity::sign_bound_hybrid(author, &canonical, dimension)
+            .await
+            .expect("hybrid sign");
+    ciris_persist::federation::Attestation {
+        attestation_id,
+        attesting_key_id: author_key_id.to_owned(),
+        attested_key_id: author_key_id.to_owned(),
+        attestation_type: "scores".to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: author_key_id.to_owned(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: ciris_persist::federation::types::cohort_scope::SELF.to_owned(),
+        tier: ciris_persist::federation::types::attestation_tier::FEDERATION.to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    }
+}
+
+/// **`FSD/CONTENT_TRANSFER.md` §5.3 R4 — a self row's pull asks the author's
+/// nodes, never `list_holders`** (CIRISEdge#646).
+///
+/// A's node seals a file at `self` (invisible tier: no `holds_bytes` exists
+/// anywhere, by construction — CC 5.2 / persist I52). The row reaches B's
+/// node. Before this cut B's pull consulted the claim index and read
+/// `NoHolders` — the wrong rung, and a silent one. Now the puller resolves
+/// the row's author to the person and their nodes (CC 4.4.3.2.4.1(b)), asks
+/// those, and the pull proceeds to the ROUTER, which on this legacy node
+/// (no scope-address table) refuses by name. The counter says where the
+/// holders came from.
+#[tokio::test]
+async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
+    use ciris_edge::blob_swarm::{BlobPuller, PullConfig, PullOutcome};
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::{FederationDirectory, SignedAttestation};
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let alice_phone = Ident::new("alice-phone", 0x33);
+    let node_a = node(&[&alice], &alice).await;
+    // B is alice's SECOND device: its own node key, alice's owner binding.
+    let node_b = device_of(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    assert_ne!(node_a.me, node_b.me, "two devices, two node keys");
+    assert_eq!(node_a.identity, node_b.identity, "one owner");
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+    let (wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (_edge_a, _stop_a) = spawn_edge(&node_a, wire_a).await;
+    let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
+
+    let sealed = node_a
+        .store
+        .seal(SealRequest {
+            cohort_scope: ciris_persist::federation::types::cohort_scope::SELF,
+            // Persist's own convention: at `self` the group slot carries the
+            // OWNER's key id — the self-collective's identity (CC 3.3.6).
+            community_key_id: Some(&alice.key_id),
+            author_key_id: &node_a.me,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: b"my file, on my other device",
+            media_type: Some("text/plain"),
+        })
+        .await
+        .expect("seal at the invisible tier");
+    assert_eq!(
+        sealed.tier,
+        ciris_persist::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
+        "precondition: a self write seals at the invisible tier"
+    );
+    assert!(
+        rows_of(&node_a, "holds_bytes:").await.is_empty(),
+        "precondition (CC 5.2): a self write emits NO holder claim anywhere"
+    );
+    let sha: [u8; 32] = hex::decode(&sealed.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let row = self_content_row(&node_a.signer, &sealed.pointer, ts()).await;
+    node_a
+        .dir
+        .put_attestation_authored(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("A holds the row it authored");
+
+    let puller = BlobPuller::new(
+        Arc::clone(&edge_b),
+        node_b.store.engine().clone(),
+        node_b.dir.clone(),
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        node_b.me.clone(),
+        PullConfig::default(),
+    );
+    let verdict = puller.pull_one(&row, sha, 0).await;
+    match &verdict {
+        PullOutcome::NoHolders { .. } => panic!(
+            "the claim index was consulted for an invisible-tier blob — the CC 5.2 source \
+             rule (FSD §6.2) is gone: a self pull asks the author's nodes, never list_holders"
+        ),
+        PullOutcome::NoOtherNode { .. } => panic!(
+            "the author's nodes did not resolve on B: B holds A's owner binding (federate), so \
+             contact::resolve(A) must yield alice and A's node — got {verdict:?}"
+        ),
+        PullOutcome::Refused(r) => panic!(
+            "the store gate refused the owner's OWN node: B is alice's second device, so A has \
+             `OwnNode` standing for a `self` key plane (trust first — FSD §5.3 R6/R7). Got {r}"
+        ),
+        PullOutcome::NoMeaning(r) => panic!(
+            "the projector refused a self row — the author's identity feeds its group id \
+             (FSD §6.2), so `GroupWithoutId` here means the identity was not passed: {r}"
+        ),
+        PullOutcome::FetchFailed { reason, .. } if reason.contains("NO scope address table") => {}
+        other => panic!(
+            "expected the pull to reach the ROUTER and stop there on this legacy node (no \
+             address table) — the self room is the next rung (FSD §6.3), and its absence is \
+             refused by name, never as NoHolders. Got {other:?}"
+        ),
+    }
+    let sources = edge_b.metrics().snapshot().blob_pull_sources;
+    assert_eq!(
+        sources.get("self:author_nodes").copied(),
+        Some(1),
+        "the holders came from the author's nodes: {sources:?}"
+    );
+    assert!(
+        !sources.keys().any(|k| k.ends_with(":claim_index")),
+        "no pull consulted the claim index: {sources:?}"
+    );
+    assert!(
+        !node_b.dir.has_blob(&sha).await.expect("has_blob"),
+        "nothing was stored past the router's refusal"
+    );
 }
 
 /// A federation-tier row that references `sha` by `evidence_refs` — the

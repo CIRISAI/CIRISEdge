@@ -217,6 +217,15 @@ pub enum PullOutcome {
     /// persist knows no fresh holder; queued for retry (or given up, if
     /// `attempts` reached the ceiling).
     NoHolders { attempts: u32, retrying: bool },
+    /// CIRISEdge#646 — a self/family pull found no node of the author to
+    /// ask. These tiers never consult the claim index (CC 5.2: no
+    /// `holds_bytes` exists for them by construction); the holders are the
+    /// author's nodes, resolved through the directory
+    /// (`FSD/CONTENT_TRANSFER.md` §6.2). `retrying` when the directory has
+    /// not converged on the author yet (`NotYetDiscovered`) or every node
+    /// resolved is this one — a device coming online is a retry, not a
+    /// terminal miss.
+    NoOtherNode { attempts: u32, retrying: bool },
     /// The fetch failed for a reason that may clear (timeout, transport,
     /// a dishonest holder); queued for retry or given up.
     FetchFailed { reason: String, retrying: bool },
@@ -275,6 +284,24 @@ pub struct BlobPuller<B> {
     config: PullConfig,
     in_flight: Mutex<HashSet<[u8; 32]>>,
     retries: Mutex<HashMap<[u8; 32], Retry>>,
+}
+
+/// CIRISEdge#646 — the `scope:source` label for `blob_pull_sources`. A
+/// closed set (four scope kinds × two sources) so the counter's keys are
+/// enumerable; `author_nodes` is the CC 5.2 path, `claim_index` is
+/// `list_holders`.
+fn pull_source_tag(scope: &crate::CohortScope, author_nodes: bool) -> &'static str {
+    use crate::CohortScope;
+    match (scope, author_nodes) {
+        (CohortScope::SelfOnly, true) => "self:author_nodes",
+        (CohortScope::SelfOnly, false) => "self:claim_index",
+        (CohortScope::Family, true) => "family:author_nodes",
+        (CohortScope::Family, false) => "family:claim_index",
+        (CohortScope::Cohort { .. }, true) => "community:author_nodes",
+        (CohortScope::Cohort { .. }, false) => "community:claim_index",
+        (CohortScope::Public, true) => "federation:author_nodes",
+        (CohortScope::Public, false) => "federation:claim_index",
+    }
 }
 
 impl<B> BlobPuller<B>
@@ -470,6 +497,86 @@ where
         outcome
     }
 
+    /// CIRISEdge#646 / `FSD/CONTENT_TRANSFER.md` §6.2 — for a self or
+    /// family row the author's identity is the self room's id and the
+    /// author's NODES are the holders, so the one directory walk
+    /// (`contact::resolve`: key → person → their nodes, CC 4.4.3.2.4.1(b))
+    /// is done up front and feeds both the projector and the source rule.
+    /// Community and commons rows never need it.
+    async fn resolve_author(
+        &self,
+        row: &Attestation,
+    ) -> Option<Result<crate::contact::Subject, crate::contact::LadderStall>> {
+        if matches!(
+            row.cohort_scope.as_str(),
+            ciris_persist::federation::types::cohort_scope::SELF
+                | ciris_persist::federation::types::cohort_scope::FAMILY
+        ) {
+            let lens = crate::contact::PersistLens::new(&*self.backend);
+            Some(crate::contact::resolve(&lens, &row.attesting_key_id).await)
+        } else {
+            None
+        }
+    }
+
+    /// **The source rule** (CIRISEdge#646, FSD §6.2). The holder SOURCE
+    /// follows the key plane's tier, not the row's placement (persist#878):
+    /// `InvisibleEncrypted` bytes are never claimed anywhere (CC 5.2,
+    /// persist I52), so the claim index is not consulted and `NoHolders` is
+    /// not a possible outcome — the holders are the author's nodes, the
+    /// sealing node among them. Every other tier is discovered through
+    /// `list_holders` as before. `Err` carries the outcome to return.
+    async fn holders_for(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        attempts: u32,
+        meaning: &BlobMeaning,
+        author: Option<&Result<crate::contact::Subject, crate::contact::LadderStall>>,
+    ) -> Result<Vec<String>, PullOutcome> {
+        let key_plane = meaning.key_plane();
+        // The tier is the POINTER's (persist#878), which is also what
+        // `key_plane` reads — one source, so the branch and the label cannot
+        // disagree about which plane this blob is on.
+        let tier = meaning.pointer().map_or(CryptoTier::Plaintext, |p| p.tier);
+        if tier != CryptoTier::InvisibleEncrypted {
+            self.edge
+                .metrics()
+                .inc_blob_pull_source(pull_source_tag(key_plane.cohort_scope(), false));
+            return match self.backend.list_holders(&sha).await {
+                Ok(h) => Ok(h.into_iter().filter(|k| *k != self.local_key_id).collect()),
+                Err(e) => Err(PullOutcome::StoreFailed(format!("list_holders: {e}"))),
+            };
+        }
+        let nodes = match author {
+            Some(Ok(subject)) => subject.nodes.clone(),
+            Some(Err(stall)) => {
+                tracing::debug!(
+                    blob = %hex::encode(sha),
+                    author = %row.attesting_key_id,
+                    stall = ?stall,
+                    "self/family pull: the author's nodes are not resolvable yet — retrying \
+                     on the directory, never asking the claim index (CIRISEdge#646)"
+                );
+                Vec::new()
+            }
+            // Unreachable by construction: a self/family row resolved its author.
+            None => Vec::new(),
+        };
+        self.edge
+            .metrics()
+            .inc_blob_pull_source(pull_source_tag(key_plane.cohort_scope(), true));
+        let others: Vec<String> = nodes
+            .into_iter()
+            .filter(|k| *k != self.local_key_id)
+            .collect();
+        if others.is_empty() {
+            let retrying = self.book_retry(row, sha, attempts);
+            return Err(PullOutcome::NoOtherNode { attempts, retrying });
+        }
+        Ok(others)
+    }
+
     async fn pull_one_inner(&self, row: &Attestation, sha: [u8; 32], attempts: u32) -> PullOutcome {
         let blob_hex = hex::encode(sha);
 
@@ -481,7 +588,18 @@ where
         }
 
         // TRUST — what the signed row says these bytes are.
-        let meaning = match BlobMeaning::project(row, &sha) {
+        // CIRISEdge#646 / `FSD/CONTENT_TRANSFER.md` §6.2 — for a self or
+        // family row the author's identity is the self room's id and the
+        // author's NODES are the holders, so the one directory walk
+        // (`contact::resolve`: key → person → their nodes, CC 4.4.3.2.4.1(b))
+        // is done up front and feeds both the projector and the source rule.
+        // Community and commons rows never need it.
+        let author = self.resolve_author(row).await;
+        let author_identity = author
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .map(|subject| subject.fed_id.clone());
+        let meaning = match BlobMeaning::project_with(row, &sha, author_identity.as_deref()) {
             Ok(m) => m,
             Err(r) => return PullOutcome::NoMeaning(r),
         };
@@ -501,9 +619,12 @@ where
         }
 
         // Who has it — persist's holder plane, minus ourselves.
-        let holders: Vec<String> = match self.backend.list_holders(&sha).await {
-            Ok(h) => h.into_iter().filter(|k| *k != self.local_key_id).collect(),
-            Err(e) => return PullOutcome::StoreFailed(format!("list_holders: {e}")),
+        let holders = match self
+            .holders_for(row, sha, attempts, &meaning, author.as_ref())
+            .await
+        {
+            Ok(h) => h,
+            Err(outcome) => return outcome,
         };
         if holders.is_empty() {
             let retrying = self.book_retry(row, sha, attempts);
@@ -699,6 +820,30 @@ mod tests {
 
     /// The sink is the apply path's one door, and it must never block or
     /// grow: a full queue drops, counts, and reports it.
+    /// CIRISEdge#646 — the counter's keys are a closed set, and the
+    /// self/family arms name `author_nodes`: the label a run greps for to
+    /// prove a self pull never touched the claim index.
+    #[test]
+    fn pull_source_tags_are_a_closed_set() {
+        use crate::CohortScope;
+        let cohort = CohortScope::Cohort {
+            cohort_id: "c".into(),
+        };
+        assert_eq!(
+            pull_source_tag(&CohortScope::SelfOnly, true),
+            "self:author_nodes"
+        );
+        assert_eq!(
+            pull_source_tag(&CohortScope::Family, true),
+            "family:author_nodes"
+        );
+        assert_eq!(pull_source_tag(&cohort, false), "community:claim_index");
+        assert_eq!(
+            pull_source_tag(&CohortScope::Public, false),
+            "federation:claim_index"
+        );
+    }
+
     #[tokio::test]
     async fn a_full_sink_drops_and_counts_rather_than_blocking() {
         let (sink, _rx) = sink_with(1);

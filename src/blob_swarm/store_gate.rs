@@ -315,10 +315,18 @@ impl OperatorStoreConsent {
 /// resolves to local-only rather than being treated as a conflict: the
 /// operator asked for something the tier does not offer, and the tier wins.
 fn announce_is_possible(scope: &CohortScope) -> bool {
-    match scope {
-        CohortScope::Public | CohortScope::Cohort { .. } => true,
-        CohortScope::SelfOnly | CohortScope::Family => false,
-    }
+    // CIRISEdge#646 ask 1 — the substrate's predicate, not a restatement
+    // of it: CC 5.2 is persist's rule (`suppresses_holds_bytes`), and edge
+    // asking it means the two cannot drift. The token mapping is the one
+    // `CohortScope::crypto_tier` already performs against persist's lattice.
+    use ciris_persist::federation::types::cohort_scope as ps;
+    let token = match scope {
+        CohortScope::Public => ps::FEDERATION,
+        CohortScope::SelfOnly => ps::SELF,
+        CohortScope::Family => ps::FAMILY,
+        CohortScope::Cohort { .. } => ps::COMMUNITY,
+    };
+    !ps::suppresses_holds_bytes(token)
 }
 
 /// Whether a sender's standing authorises placing content of this scope.
@@ -376,10 +384,17 @@ pub fn admit_blob_store(
 
     // ── Axis 1 — TRUST. Cheapest and most fundamental; a sender with no
     //    standing gets no further, whatever the content says about itself.
+    //    Asked of the KEY PLANE (CIRISEdge#646 / persist#878): who may hand
+    //    us these bytes is a fact about the group that sealed them — the
+    //    owner's own copy of a room message is handed over by a room member,
+    //    and the room, not the `self` placement, is what that member has
+    //    standing in. Axes 2 and 3 stay on the placement: party-to and
+    //    announce are the row's.
+    let key_plane = content.key_plane();
     if sender == SenderStanding::Undeterminable {
         return StoreAdmission::Refuse(StoreRefusal::SenderUndeterminable { content_kind });
     }
-    if !sender_authorised(scope, sender) {
+    if !sender_authorised(key_plane.cohort_scope(), sender) {
         return StoreAdmission::Refuse(StoreRefusal::SenderNotApprovedForTier {
             content_kind,
             sender,
@@ -444,6 +459,65 @@ mod tests {
     }
 
     /// The load-bearing case of axis 1, and the whole reason the axis exists.
+    /// CIRISEdge#646 — the TRUST axis is asked of the key plane. The
+    /// owner's own copy of a room message (placed `self`, sealed under the
+    /// room's DEK) is handed over by a room MEMBER; the room is where that
+    /// member has standing, so `MemberOfJoinedGroup` clears axis 1 even
+    /// though the placement is `self`. Axes 2 and 3 stay on the placement:
+    /// the store is `LocalOnly` because a `self` row never announces.
+    #[test]
+    fn trust_is_asked_of_the_key_plane_and_announce_of_the_placement() {
+        use super::super::meaning::fixture::bare_row;
+        use ciris_persist::federation::types::cohort_scope as ps;
+        let mut row = bare_row(ps::SELF);
+        row.attestation_envelope = serde_json::json!({
+            "dimension": "chat.message",
+            "content": {
+                "community_key_id": "room-1",
+                "tier": "community_dek",
+                "epoch": 3,
+                "content_sha256": hex::encode(SHA),
+                "content_field": "body",
+            },
+        });
+        let own_copy = BlobMeaning::project(&row, &SHA).expect("projects");
+        let everything = OperatorStoreConsent {
+            commons: ConsentDisposition::Announce,
+            community: ConsentDisposition::Announce,
+            family: ConsentDisposition::Announce,
+            own: ConsentDisposition::Announce,
+        };
+        assert_eq!(
+            admit_blob_store(
+                &own_copy,
+                SenderStanding::MemberOfJoinedGroup,
+                AudienceStanding::In,
+                &everything,
+            ),
+            StoreAdmission::StoreLocalOnly,
+            "a room member may hand over the room's bytes; a self placement never announces"
+        );
+        assert!(
+            matches!(
+                admit_blob_store(
+                    &own_copy,
+                    SenderStanding::OwnNode,
+                    AudienceStanding::In,
+                    &everything
+                ),
+                StoreAdmission::Refuse(StoreRefusal::SenderNotApprovedForTier { .. })
+            ),
+            "standing is in the group that SEALED the bytes — `OwnNode` is not a room member"
+        );
+        // The substrate's predicate decides announceability (CIRISEdge#646 ask 1).
+        assert!(announce_is_possible(&CohortScope::Public));
+        assert!(announce_is_possible(&CohortScope::Cohort {
+            cohort_id: "c".into()
+        }));
+        assert!(!announce_is_possible(&CohortScope::SelfOnly));
+        assert!(!announce_is_possible(&CohortScope::Family));
+    }
+
     #[test]
     fn a_verified_signature_is_not_authorization() {
         let a = admit_blob_store(

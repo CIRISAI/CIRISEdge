@@ -76,7 +76,7 @@
 //! There is deliberately no "unknown" [`ContentScope`] and no arm that
 //! guesses.
 
-use ciris_persist::federation::types::cohort_scope as ps;
+use ciris_persist::federation::types::cohort_scope::{self as ps, CryptoTier};
 use ciris_persist::federation::Attestation;
 
 use super::scope::ContentScope;
@@ -120,11 +120,24 @@ pub enum MeaningRefusal {
     },
     /// A scoped (non-commons) row must say WHICH group, because
     /// [`CohortScope`] names a kind and a node may belong to several. The
-    /// pointer's `community_key_id` and the envelope's `community_key_id`
-    /// were both absent or empty.
+    /// id comes, in order, from the pointer's `community_key_id`, the
+    /// envelope's cohort target (persist's four aliases, `family_key_id`
+    /// among them — CIRISPersist#887), and for a `self` row the author's
+    /// identity the caller resolved (`FSD/CONTENT_TRANSFER.md` §6.2). None
+    /// was present.
     GroupWithoutId {
         /// The scope token that required an id.
         scope: String,
+    },
+    /// The envelope names its cohort target under two aliases that
+    /// disagree (persist `envelope_cohort_target`, PR #759). Refused
+    /// rather than picking one: the row is malformed, and the group we
+    /// would route to is the one the writer did not sign for.
+    GroupIdAmbiguous {
+        /// The scope token.
+        scope: String,
+        /// Persist's description of the disagreement.
+        detail: String,
     },
 }
 
@@ -138,6 +151,7 @@ impl MeaningRefusal {
             Self::DoesNotReference { .. } => "does_not_reference",
             Self::UnknownScope { .. } => "unknown_scope",
             Self::GroupWithoutId { .. } => "group_without_id",
+            Self::GroupIdAmbiguous { .. } => "group_id_ambiguous",
         }
     }
 }
@@ -157,6 +171,9 @@ impl std::fmt::Display for MeaningRefusal {
             Self::UnknownScope { scope } => write!(f, "unmapped cohort_scope {scope:?}"),
             Self::GroupWithoutId { scope } => {
                 write!(f, "scope {scope:?} names no group to belong to")
+            }
+            Self::GroupIdAmbiguous { scope, detail } => {
+                write!(f, "scope {scope:?} names its group ambiguously: {detail}")
             }
         }
     }
@@ -200,6 +217,33 @@ impl BlobMeaning {
     ///
     /// [`MeaningRefusal`], which names which of the four failed.
     pub fn project(row: &Attestation, blob_sha256: &[u8; 32]) -> Result<Self, MeaningRefusal> {
+        Self::project_with(row, blob_sha256, None)
+    }
+
+    /// [`Self::project`] with the author's **identity** in hand, which is
+    /// what a `self`-placed row that names no community needs for its group
+    /// id (`FSD/CONTENT_TRANSFER.md` §6.2, CIRISEdge#646): the self room is
+    /// keyed by the identity (CC 3.3.6 `identity_key_id`), a function of the
+    /// row's author that the caller resolves through the directory
+    /// (`contact::resolve(author).fed_id`) — never a new signed field, so the
+    /// installer and the projector compute one id from one fact. A `family`
+    /// row needs nothing extra: its `family_key_id` rides the signed
+    /// envelope (CIRISPersist#887) and is read through persist's own
+    /// cohort-target reader, aliases and all.
+    ///
+    /// `author_identity` is consulted only for a `self` row with no
+    /// community pointer and no envelope target; `None` there refuses
+    /// `GroupWithoutId`, the honest answer for a caller that could not
+    /// resolve the author.
+    ///
+    /// # Errors
+    ///
+    /// [`MeaningRefusal`], which names which check failed.
+    pub fn project_with(
+        row: &Attestation,
+        blob_sha256: &[u8; 32],
+        author_identity: Option<&str>,
+    ) -> Result<Self, MeaningRefusal> {
         // (1) Signed by someone. Note the AND: a signature with no key id
         // names nobody, and a key id with no signature proves nothing —
         // either alone is a row that clears no part of "signed by someone".
@@ -241,16 +285,31 @@ impl BlobMeaning {
         // a row that has not been through admission yet, is free to
         // disagree with the one that actually decides where the row goes.
         let scope_token = row.cohort_scope.as_str();
-        let group_id = || {
-            pointer
+        // The group id, in order: the pointer's community (the key plane
+        // names it), then the envelope's cohort target through persist's OWN
+        // reader — four aliases, first non-empty wins, a disagreement is
+        // refused (CIRISPersist#887) — so `family_key_id` on a family row
+        // and `community_key_id` on a community row are one code path.
+        let envelope_target = || -> Result<Option<String>, MeaningRefusal> {
+            ciris_persist::federation::admission::envelope_cohort_target(&row.attestation_envelope)
+                .map(|t| t.and_then(non_empty))
+                .map_err(|e| MeaningRefusal::GroupIdAmbiguous {
+                    scope: scope_token.to_owned(),
+                    detail: e.to_string(),
+                })
+        };
+        let group_id = |fallback: Option<&str>| -> Result<String, MeaningRefusal> {
+            if let Some(c) = pointer
                 .as_ref()
                 .and_then(|p| non_empty(&p.community_key_id))
-                .or_else(|| {
-                    row.attestation_envelope
-                        .get(ENVELOPE_COMMUNITY_ID)
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(non_empty)
-                })
+            {
+                return Ok(c);
+            }
+            if let Some(t) = envelope_target()? {
+                return Ok(t);
+            }
+            fallback
+                .and_then(non_empty)
                 .ok_or_else(|| MeaningRefusal::GroupWithoutId {
                     scope: scope_token.to_owned(),
                 })
@@ -258,19 +317,23 @@ impl BlobMeaning {
 
         let scope = match scope_token {
             ps::FEDERATION => ContentScope::Federation,
+            // A self row's group is the self-collective: the author's
+            // identity, resolved by the caller — unless the pointer names a
+            // community, in which case the bytes are that room's (the
+            // owner's own copy of a chat message) and the id is the room's.
             ps::SELF => ContentScope::Group {
                 scope: CohortScope::SelfOnly,
-                group_id: group_id()?,
+                group_id: group_id(author_identity)?,
             },
             ps::FAMILY => ContentScope::Group {
                 scope: CohortScope::Family,
-                group_id: group_id()?,
+                group_id: group_id(None)?,
             },
             // `affiliations` is a community scope with a wider audience, not
             // a different KIND of group — both derive addresses from the
             // named community's exporter secret.
             ps::COMMUNITY | ps::AFFILIATIONS => {
-                let id = group_id()?;
+                let id = group_id(None)?;
                 ContentScope::Group {
                     scope: CohortScope::Cohort {
                         cohort_id: id.clone(),
@@ -356,7 +419,45 @@ impl BlobMeaning {
         self.pointer.as_ref()
     }
 
-    /// The cohort this content was placed in, by the party that signed it.
+    /// **The key plane** — the group whose secret sealed the bytes, from
+    /// the POINTER (persist#878: `tier` / `community_key_id` / `epoch` are
+    /// the pointer's; `cohort_scope` is the row's). This is the scope that
+    /// answers *where the bytes are and who may hand them over*: the holder
+    /// source, the scope-address route, and the store gate's TRUST axis.
+    /// [`Self::scope`] (the placement) answers *who is party to the row*:
+    /// the audience axis, the adopt disposition, the announce decision.
+    ///
+    /// The two differ on exactly one shape today: a row placed at `self`
+    /// (the owner's own copy) whose pointer names a community — the bytes
+    /// are the room's, sealed under the room's DEK, held by the room's
+    /// members and reached on the room's derived address. Routing the
+    /// owner's second device to a `self` table entry keyed by the room's id
+    /// would ask for a group nobody installs; routing it to the room asks
+    /// the members who hold it. For every other row the two coincide.
+    #[must_use]
+    pub fn key_plane(&self) -> ContentScope {
+        match (&self.scope, self.pointer.as_ref()) {
+            (
+                ContentScope::Group {
+                    scope: CohortScope::SelfOnly | CohortScope::Family,
+                    ..
+                },
+                Some(p),
+            ) if p.tier == CryptoTier::CommunityDek && !p.community_key_id.is_empty() => {
+                ContentScope::Group {
+                    scope: CohortScope::Cohort {
+                        cohort_id: p.community_key_id.clone(),
+                    },
+                    group_id: p.community_key_id.clone(),
+                }
+            }
+            _ => self.scope.clone(),
+        }
+    }
+
+    /// The cohort this content was placed in, by the party that signed it —
+    /// the row's placement. See [`Self::key_plane`] for which questions
+    /// each facet answers.
     #[must_use]
     pub fn scope(&self) -> &ContentScope {
         &self.scope
@@ -395,6 +496,7 @@ const HOLDS_BYTES_TYPE_PREFIX: &str = "holds_bytes:";
 /// The `kind` a `holds_bytes` envelope carries.
 const HOLDS_BYTES_KIND: &str = "holds_bytes";
 /// The envelope member a chat/content row puts its community on.
+#[cfg(test)]
 const ENVELOPE_COMMUNITY_ID: &str = crate::chat::FIELD_COMMUNITY_ID;
 
 fn non_empty(s: &str) -> Option<String> {
@@ -592,6 +694,137 @@ pub(crate) mod fixture {
             sha,
         );
         BlobMeaning::project(&row, sha).expect("a signed family row names its blob")
+    }
+}
+
+#[cfg(test)]
+mod facets_646 {
+    //! CIRISEdge#646 / `FSD/CONTENT_TRANSFER.md` §6.2 — the group-id rule
+    //! for self and family rows, and the two facets (placement from the
+    //! row, key plane from the pointer).
+    use super::fixture::bare_row;
+    use super::*;
+    use ciris_persist::federation::types::cohort_scope as ps;
+
+    const SHA: [u8; 32] = [9u8; 32];
+
+    /// A row placed at `self` whose pointer names NO community: an
+    /// `InvisibleEncrypted` blob of the owner's own.
+    fn self_row() -> Attestation {
+        let mut row = bare_row(ps::SELF);
+        row.attestation_envelope = serde_json::json!({
+            "dimension": "file:attachment:v1",
+            "content": {
+                "community_key_id": "",
+                "tier": "invisible_encrypted",
+                "content_sha256": hex::encode(SHA),
+                "content_field": "body",
+            },
+        });
+        row
+    }
+
+    #[test]
+    fn a_self_row_without_a_community_projects_the_authors_identity_as_its_group() {
+        let row = self_row();
+        // The caller resolved the author (a node key) to the person it is
+        // an occurrence of — that identity IS the self room's id.
+        let m = BlobMeaning::project_with(&row, &SHA, Some("alice-fed")).expect("projects");
+        assert_eq!(
+            m.scope(),
+            &ContentScope::Group {
+                scope: CohortScope::SelfOnly,
+                group_id: "alice-fed".to_owned(),
+            }
+        );
+        assert_eq!(
+            m.key_plane(),
+            *m.scope(),
+            "an invisible blob's key plane is its placement"
+        );
+        // Without the identity there is no group to name: refused by name,
+        // never defaulted — the honest answer for an unresolved author.
+        assert!(matches!(
+            BlobMeaning::project(&row, &SHA),
+            Err(MeaningRefusal::GroupWithoutId { scope }) if scope == ps::SELF
+        ));
+        assert!(matches!(
+            BlobMeaning::project_with(&row, &SHA, Some("")),
+            Err(MeaningRefusal::GroupWithoutId { .. })
+        ));
+    }
+
+    #[test]
+    fn a_family_row_reads_family_key_id_through_persists_cohort_target_reader() {
+        let mut row = bare_row(ps::FAMILY);
+        row.attestation_envelope = serde_json::json!({
+            "dimension": "file:attachment:v1",
+            "family_key_id": "fam-7",
+            "content": {
+                "community_key_id": "",
+                "tier": "invisible_encrypted",
+                "content_sha256": hex::encode(SHA),
+                "content_field": "body",
+            },
+        });
+        // No identity needed: the family's id rides the signed envelope
+        // (CIRISPersist#887), under the canonical member.
+        let m = BlobMeaning::project(&row, &SHA).expect("projects");
+        assert_eq!(
+            m.scope(),
+            &ContentScope::Group {
+                scope: CohortScope::Family,
+                group_id: "fam-7".to_owned(),
+            }
+        );
+        // Two populated aliases that disagree are refused by name — the
+        // reader is persist's, so the rule is not re-spelled here.
+        row.attestation_envelope["community_key_id"] = serde_json::json!("fam-8");
+        assert!(matches!(
+            BlobMeaning::project(&row, &SHA),
+            Err(MeaningRefusal::GroupIdAmbiguous { scope, .. }) if scope == ps::FAMILY
+        ));
+    }
+
+    #[test]
+    fn the_key_plane_follows_the_pointer_and_the_placement_follows_the_row() {
+        // The owner's OWN copy of a room message: placed at `self`, sealed
+        // under the room's DEK. The placement stays `self` (audience,
+        // adopt, announce are the row's); the key plane is the room
+        // (holders, route, trust are the room's).
+        let mut row = bare_row(ps::SELF);
+        row.attestation_envelope = serde_json::json!({
+            "dimension": "chat.message",
+            "content": {
+                "community_key_id": "room-1",
+                "tier": "community_dek",
+                "epoch": 3,
+                "content_sha256": hex::encode(SHA),
+                "content_field": "body",
+            },
+        });
+        let m = BlobMeaning::project(&row, &SHA).expect("the pointer names the room");
+        assert_eq!(
+            m.scope(),
+            &ContentScope::Group {
+                scope: CohortScope::SelfOnly,
+                group_id: "room-1".to_owned(),
+            },
+            "placement: the owner's own copy"
+        );
+        assert_eq!(
+            m.key_plane(),
+            ContentScope::Group {
+                scope: CohortScope::Cohort {
+                    cohort_id: "room-1".to_owned(),
+                },
+                group_id: "room-1".to_owned(),
+            },
+            "key plane: the room that sealed the bytes"
+        );
+        // A community row's two facets coincide.
+        let c = super::fixture::community(&SHA);
+        assert_eq!(c.key_plane(), *c.scope());
     }
 }
 

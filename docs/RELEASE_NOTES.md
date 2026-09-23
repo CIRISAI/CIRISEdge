@@ -1,5 +1,49 @@
 # CIRISEdge Release Notes
 
+# v29.4.0 — a self row's pull asks the author's nodes (R4), and the projector names the self room and the family (R5)
+
+**2026-09-22** (PR #654, CIRISEdge#646 §6.2 of `FSD/CONTENT_TRANSFER.md`). MINOR: additive API; pins
+unchanged (persist v46.3.1, verify v16.1.0); ABI constants unmoved.
+
+Before this cut a self/family row that reached the owner's second device stopped at the first rung
+it met: `BlobMeaning::project` refused it `GroupWithoutId` (it looked for a community id), and had
+it projected, `pull_one_inner` would have asked `list_holders` — which holds nothing for these
+tiers by construction (CC 5.2, persist I52) — and read `NoHolders`, the wrong rung.
+
+- **R5 — the group-id rule.** `BlobMeaning::project` reads the group, in order, from the pointer's
+  group slot (persist's own convention: the **owner's** key id at `self`, the **family's** at
+  `family`), then the envelope's cohort target through persist's `envelope_cohort_target` (four
+  aliases; `family_key_id` canonical, CIRISPersist#887; a disagreement is the new
+  `MeaningRefusal::GroupIdAmbiguous`), then for a `self` row the author's identity the puller
+  resolved (`project_with(row, sha, Some(identity))`). No new signed field.
+- **Two facets.** `BlobMeaning::key_plane()` — the pointer's group — beside `scope()`, the row's
+  placement (persist#878 applied to edge's gates). Holder source, the scope-address route and the
+  store gate's **trust** axis follow the key plane; audience, adopt disposition and announce follow
+  the placement. The one shape where they differ: the owner's own copy of a room message, placed
+  `self`, sealed under the room's DEK — a room member may hand it over, and it is reached on the
+  room's address, not a `self` table entry nobody installs.
+- **R4 — the source rule.** For an `InvisibleEncrypted` key plane the puller resolves the row's
+  author to the person and their nodes (`contact::resolve`, CC 4.4.3.2.4.1(b)) and asks those;
+  `list_holders` is never consulted. None resolved, or the directory not converged on the author, is
+  `PullOutcome::NoOtherNode { retrying }` — a device coming online is a retry. Counter
+  `blob_pull_sources{scope:source}` (`self:author_nodes` … `federation:claim_index`) in the metrics
+  snapshot and the PyO3 dict.
+- `store_gate::announce_is_possible` now asks persist's `suppresses_holds_bytes` (#646 ask 1).
+- #443: `multiplicity.rs` doc block reads CC-governed (ratified, CC 1.0-rc4 part 6) — no value change.
+
+**Witness:** `blob_federation_e2e::a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index`
+— alice's phone (a second device: own node key, alice's owner binding, alice's occurrence) pulls a
+file alice's first node sealed at the invisible tier: no holder claim exists anywhere, the source is
+the author's nodes, `OwnNode` clears the trust axis, and the pull reaches the router, which on a
+legacy node refuses by name. Plus `meaning::facets_646` (three), `store_gate::trust_is_asked_of_the_key_plane_and_announce_of_the_placement`,
+`pull::pull_source_tags_are_a_closed_set`. The e2e harness gains `device_of(owner, device)`.
+
+**What `mine_on_b` reads now:** on a legacy node `FetchFailed("NO scope address table")`; on a
+scope-native node `blob_group_not_installed { scope: self }` — R5, until the self room (§6.3) lands.
+Never `NoHolders`, never `GroupWithoutId`.
+
+Ladder pair: **edge v29.4.0 + persist v46.3.1** (verify v16.1.0, leviculum v0.26.0+ciris.1).
+
 # v29.3.1 — repin CIRISPersist v46.3.1: a claimed node reads its own config again
 
 **2026-09-22** (PR #653, CIRISEdge#652 / CIRISPersist#888 / CIRISServer#624). PATCH: a pin move only —

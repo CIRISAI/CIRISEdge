@@ -185,8 +185,8 @@ is the allowlist. Inheriting the community rows would demand a widening (R1) and
 | **R1** — | no widening: the authored row IS the row | — | — | — |
 | **R2** row reaches every node of the identity | the **nodes hosting** the identity's active occurrences are **implicit** send-set members for `SelfOwn` planes — no grant (CC 3.3.6 / 3.2); occurrence → node by CC 4.4.3.2.4.1(b) | **persist** `send_set_for(k, self)` (v46.3.0); edge `ResolvedPeerSet::widened_by_self_collective` + `Reach` (v29.3.0) | `RecipientNotInSendSet` (names the axis: `peer reached by the self_collective axis, which carries no federation rows`) | persist I137–I140 ✓; edge `bridge::the_owners_second_node_is_a_recipient_with_no_grant_between_them` ✓, `resolved_state::a_reach_admits_exactly_the_scopes…` ✓ |
 | **R3** key reaches every occurrence | the content-axis set travels with the row (`key_grant:*` at self ⇒ `SelfOwn`); **retroactive on new occurrence** (CC 8.1.12.4) | persist cascade (write ✓); persist retroactive (§6.5) | `NotGranted` | write: cascade tests ✓; retroactive: — *(persist: "a device admitted after the write opens the write")* |
-| **R4** holder known | **no discovery, no minter read.** Holders = `contact::resolve(row.author_key_id).nodes` — the author's nodes; the sealing node is among them, and on the content axis the minter *is* the author (admission rule) | edge `pull_one_inner` source rule (§6.2) | `NoOtherNode` (terminal, honest) — never `NoHolders` for these scopes | — *(edge: "a self row's pull asks the author's nodes, never list_holders")* |
-| **R5** holder addressed | `BlobMeaning::project` yields `Group { SelfOnly, group_id = identity }` (today: `GroupWithoutId`); the **self room** installed: members = the identity's nodes (§6.3) | edge `meaning.rs` self arm; `self_addressing::snapshot`; host drives install / advance / refresh | `blob_group_not_installed { scope: self }` | — *(edge: "two nodes of one identity derive each other's self addresses"; "a self row projects its identity as the group id")* |
+| **R4** holder known | **no discovery, no minter read.** Holders = `contact::resolve(row.author_key_id).nodes` — the author's nodes; the sealing node is among them, and on the content axis the minter *is* the author (admission rule). The source follows the **key plane's tier** (`InvisibleEncrypted` ⇒ author's nodes; else the claim index) | edge `pull_one_inner` source rule (§6.2) ✓ v29.4.0; counter `blob_pull_sources{self:author_nodes}` | `NoOtherNode { retrying }` — never `NoHolders` for these tiers | `blob_federation_e2e::a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index` ✓ (alice's phone pulls alice's file: source = author's nodes, `OwnNode` clears the gate, the router refuses R5 by name) |
+| **R5** holder addressed | `BlobMeaning::project` yields `Group { SelfOnly, group_id = identity }` ✓ v29.4.0 (the pointer's group slot carries the OWNER at `self` — persist's own convention; else the author's identity the puller resolved); the **self room** installed: members = the identity's nodes (§6.3) | edge `meaning.rs` self arm ✓; `self_addressing::snapshot` —; host drives install / advance / refresh | `blob_group_not_installed { scope: self }` / `NO scope address table` | projector: `meaning::facets_646::a_self_row_without_a_community_projects_the_authors_identity_as_its_group` ✓; room: — *(edge: "two nodes of one identity derive each other's self addresses")* |
 | **R6** holder serves | arrival on the self group ∧ requester `OwnNode` (principal equality) | edge `admit_blob_serve` ✓ + `SenderStanding::OwnNode` ✓ | `blob_serve_arrival_scope_insufficient` | `scope.rs` serve tests cover the gate shape ✓; self-specific: — |
 | **R7** bytes adopted | `is_audience` self arm (principal equality, after #873) ✓; adopt `LocalOnly` (never announce) ✓ | persist `would_hold` / `adopt_sealed_blob` | `NotPartyTo` (correct for a non-owner) | persist I135 ✓ (a self row keeps self; a non-owner is `NotPartyTo`) |
 | **R8** reader opens | wrap for **this device's** occurrence | edge `group_content` ✓ | `Body::Unopened` | — *(e2e: "the owner's second device opens what the first wrote")* |
@@ -208,7 +208,7 @@ prove a family branch — each row below names its own.
 | **R2** row reaches every member's nodes | send set ∪= the nodes hosting each active member's occurrences (implicit) | persist §6.1 | `RecipientNotInSendSet` | — *(persist: "a family row authored by A is held on member B's node with no grant")* |
 | **R3** key reaches every member | wrapped per member at write; **retroactive on new member** (CC 8.1.12.4) | persist §6.5 | `NotGranted` | — *(persist: "a member admitted after the write opens the write")* |
 | **R4** holder known | the author's nodes (as self); a member's node that adopted may serve but **nothing points at it** (§6.4) | edge §6.2 | `NoOtherNode` | — *(edge: "a family row's pull asks the author's nodes, never list_holders")* |
-| **R5** holder addressed | `BlobMeaning::project` yields `Group { Family, group_id = family_id }`; the **family group** installed: members = the nodes of every active member | edge `meaning.rs` family arm; `family_addressing::snapshot`; host drives on roster change | `blob_group_not_installed { scope: family }` | — *(edge: "two members' nodes derive each other's family addresses"; "a family row projects its family_id as the group id")* |
+| **R5** holder addressed | `BlobMeaning::project` yields `Group { Family, group_id = family_key_id }` ✓ v29.4.0 (read through persist's `envelope_cohort_target`, four aliases, disagreement refused `GroupIdAmbiguous` — CIRISPersist#887); the **family group** installed: members = the nodes of every active member | edge `meaning.rs` family arm ✓; `family_addressing::snapshot` —; host drives on roster change | `blob_group_not_installed { scope: family }` | projector: `meaning::facets_646::a_family_row_reads_family_key_id_through_persists_cohort_target_reader` ✓; group: — |
 | **R6** holder serves | arrival on the family group ∧ requester is an active member's node (`SenderStanding::MemberOfJoinedGroup` at family) | edge `admit_blob_serve` | `blob_serve_arrival_scope_insufficient` | — *(edge: "a member's node is served on the family address; a non-member's node is refused by name")* |
 | **R7** bytes adopted | `is_audience` family arm (`author_is_local_or_family`); adopt `LocalOnly` | persist | `NotPartyTo` | — *(persist: "a family row adopts on a member's node and is `NotPartyTo` on a non-member's")* |
 | **R8** reader opens | wrap for this device's occurrence, as a member | edge `group_content` | `Body::Unopened` | — *(e2e: "a member's device opens what another member wrote")* |
@@ -262,29 +262,37 @@ Two facts make the holder a function of the row:
    (owner → nodes) is both sufficient and bounded: the sealing node is in it, the rest are the
    opportunistic fallback.
 
-`pull_one_inner` branches on `meaning.scope()`:
+`pull_one_inner` branches on the **key plane's tier** (shipped v29.4.0):
 
 ```
-Federation        → holders = list_holders(sha)                        (unchanged; §5.2 R4)
-Cohort            → holders = list_holders(sha)                        (unchanged; §5.1 R4)
-SelfOnly | Family → holders = contact::resolve(row.author_key_id).nodes  // the author's nodes,
-                    ordered with the node whose TransportBinding holds the author occurrence's
-                    transport_destination first; list_holders is NEVER consulted; NoHolders is not
-                    a possible outcome; empty → NoOtherNode (terminal, refused by name)
+Plaintext | CommunityDek → holders = list_holders(sha)                     (unchanged; §5.1/§5.2 R4)
+InvisibleEncrypted       → holders = contact::resolve(row.author_key_id).nodes \ {self}
+                           // the author's nodes; list_holders is NEVER consulted; NoHolders is not
+                           // a possible outcome; none resolved / directory not converged →
+                           // NoOtherNode { retrying } (a device coming online is a retry)
 ```
+Counter `blob_pull_sources{scope:source}` (`self:author_nodes` … `federation:claim_index`) is the
+line a run greps to prove a self pull never touched the directory.
 
 The row's **sender** is not the holder by construction — device B re-advertises A's rows to C, so
 C's sender may be row-held / bytes-absent. Sender-as-holder is a first-hop coincidence;
 author's-nodes-as-holders is the invariant. (Correction to persist's reading on #884.)
 
-**The group id is a function of the row, never a new field.** `BlobMeaning::project` maps `self` and
-`family` to `ContentScope::Group` and today refuses both as `GroupWithoutId` because it looks for a
-community id. The rule: **self** → `identity_key_id` of the author's self-collective (CC 3.3.6; the
-principal `#873` already resolves — the projector takes it from the lens the puller holds);
-**family** → the row's `family_id` (CC 5.2 names it on the Contribution; persist confirms the
-envelope carrier, §12.2). The installer (§6.3) names its group by the same function of the same
-directory fact, which is what makes "the projected id matches the installed id" true by construction
-rather than by a write-time field kept in sync.
+**The group id is a function of the row, never a new field** (shipped v29.4.0). `BlobMeaning::project`
+reads it in order: the pointer's group slot — which at `self` carries the **owner's** key id and at
+`family` the family's, by persist's own `put_blob_scoped` convention — then the envelope's cohort
+target through persist's `envelope_cohort_target` (four aliases, first non-empty, a disagreement
+refused `GroupIdAmbiguous`; `family_key_id` is the canonical member, CIRISPersist#887), then for a
+`self` row the author's identity the puller resolved (`project_with(row, sha, identity)`). The
+installer (§6.3) names its group by the same function of the same directory fact, which is what
+makes "the projected id matches the installed id" true by construction.
+
+**Two facets, one meaning** (v29.4.0). `BlobMeaning::scope()` is the row's **placement**; `key_plane()`
+is the pointer's group (persist#878). They differ on one shape: the owner's own copy of a room
+message — placed `self`, sealed under the room's DEK. Holder source, route and the store gate's
+**trust** axis follow the key plane (a room member hands over the room's bytes); audience, adopt
+disposition and announce follow the placement. Routing that copy to a `self` table keyed by the room
+would ask for a group nobody installs; routing it to the room asks the members who hold it.
 
 The fetch itself is `fetch_blob_scoped_with_disposition(sha, manifest, holders, meaning)`, which
 already takes a caller-supplied holder list and routes each through `BlobScopeRouter` — so R5's
@@ -420,7 +428,7 @@ C joins         as B; C runs R4–R8 against A or B — both are the author's no
 | `replication_routed_to_{responder,initiator}_total`, `replication_reply_dropped_total` | §5.4.2 | ✓ v26.0.0 |
 | `key_grant set admitted — wraps … projected as grants` | R3 | ✓ (persist INFO) |
 | `pull … outcome=` (`NoHolders` / `NoOtherOccurrence` / `FetchFailed` / `StoreFailed` / `Stored`) | R4–R7 | ✓; `NoOtherOccurrence` — |
-| **`blob_pull_sources`** by scope kind × source (`list_holders` / `author_nodes` / `pushed`) | R4 | — (new; the one line that proves self never touched the directory) |
+| **`blob_pull_sources`** `scope:source` (`author_nodes` / `claim_index`) | R4 | ✓ v29.4.0 (metrics snapshot + PyO3 dict) |
 | `blob_route_refusals` (`blob_group_not_installed` / `…not_in_group` / `…sealed_out`) | R5 | ✓ v26.2.0 |
 | `blob_serve_refusals` | R6 | ✓ v27.0.0 |
 | `scope lifecycle INSTALLED / ADVANCED / REFRESHED` (scope, group, epoch, members, added/removed) | R5 | ✓ v26.2.0 / v29.2.0 (#648); self room: — |
@@ -478,6 +486,11 @@ template: it is green because each rung has a witness, not because a run passed.
 
 ## 13. Changelog
 
+- **2026-09-22 (v29.4.0, CIRISEdge#646 §6.2 cut).** R4 source rule + R5 projector rule shipped with
+  witnesses; the two-facet rule (`scope()` placement / `key_plane()` pointer) written into §6.2; the
+  group-id order corrected to persist's convention (the pointer's slot carries the owner at `self`,
+  the family at `family`); `family_key_id` per CIRISPersist#887; `announce_is_possible` asks the
+  substrate (#646 ask 1). Open in #646: §6.3 the self room.
 - **2026-09-22 (PR #647 review).** Nine findings, each checked against code and CC before the text
   moved: §2 is a fork (bytes ride envelope dispatch, never a round); §3 gains Node and the two key-grant
   axes; §5.2 has its own rows; §5.3 R4 drops the `minter_of(scope, epoch)` read (`epoch: None` at the
