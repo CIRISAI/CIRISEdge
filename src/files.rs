@@ -51,7 +51,7 @@ use crate::group_content::{BlobPointer, ContentField, GroupContentStore, SealReq
 use crate::replication::attestation_bind::{share, CrossingBasis, Shared, Signers};
 use crate::scope_room::ScopeRoom;
 use ciris_persist::federation::types::cohort_scope::CryptoTier;
-use ciris_persist::federation::{Attestation, FederationDirectory, ServedAttestation};
+use ciris_persist::federation::{Attestation, FederationDirectory};
 
 /// The dimension a file row carries. Distinct from `chat:message:v1` so a
 /// drive can enumerate files without walking every content row, and so a
@@ -129,6 +129,32 @@ pub enum FileError {
     /// The row was built but could not be signed or canonicalized.
     #[error("build the file row: {0}")]
     Row(String),
+    /// The drive query failed in the substrate.
+    #[error("list files in {room}: {detail}")]
+    Drive {
+        /// The room asked for.
+        room: String,
+        /// The substrate's error.
+        detail: String,
+    },
+    /// **The §4.3 read gate cannot serve a targeted room** — its `community`
+    /// and `family` arms are mutually unsatisfiable with AV-84 on the
+    /// attestation plane (CIRISPersist#893): the write rule makes
+    /// `attested_key_id` the row's PRODUCER, the read gate compares that
+    /// column against the caller's room set, and the intersection is empty
+    /// by construction, so no member can read their own room's rows.
+    ///
+    /// Refused rather than returned empty: a drive that silently shows
+    /// nothing is indistinguishable from a room with no files. Lifts when
+    /// CIRISPersist#893 lands.
+    #[error(
+        "{room}: the §4.3 read gate cannot serve a targeted room yet — its community/family \
+         arms are unsatisfiable with AV-84 (CIRISPersist#893), so this would be silently empty"
+    )]
+    DriveGateUnavailable {
+        /// The room asked for.
+        room: String,
+    },
     /// **Bigger than one envelope.** Content above CC 2.6.1.3's 1 MiB bound
     /// must be a sealed chunk DAG (CC 5.3.3.1), and **edge has not wired one
     /// yet** — `FSD/CONTENT_TRANSFER.md` §6.7, tracked as CIRISEdge#633.
@@ -468,99 +494,173 @@ impl FileRow {
     }
 }
 
-/// How many directory pages [`in_room`] will walk before giving up. A
-/// drive listing must not turn into an unbounded scan of the attestation
-/// plane on a node that holds millions of rows.
+/// How many queries [`in_room`] will issue for one call before handing back
+/// what it has.
+///
+/// A pure bound on **work per call**, not on correctness: reaching it is
+/// reported in [`DrivePage::resume`] like any other partial page, so a
+/// caller loops rather than mistaking it for the end of the room. It exists
+/// because a node holding millions of rows this caller may see but this
+/// room does not own would otherwise make one listing walk for minutes.
 const MAX_LISTING_PAGES: usize = 64;
 
-/// The directory page size [`in_room`] reads while looking for `limit`
-/// matching files.
-const LISTING_PAGE: u32 = 256;
+/// The largest backing query [`in_room`] will issue at once.
+///
+/// `limit` is the CALLER's number and may be large or accidental; the
+/// backing page is edge's, and forwarding the former as the latter lets one
+/// call ask the substrate to materialize an arbitrary result set. The chunk
+/// is `min(still wanted, this)` — never more than is wanted, so the whole
+/// chunk is always consumed and the resume cursor stays exact, and never
+/// more than this, so no single query is unbounded.
+const MAX_BACKING_PAGE: usize = 256;
 
-/// **The drive read** — up to `limit` file rows this node holds for `room`,
-/// oldest first by serve position (CIRISServer#615 §3).
+/// One page of a drive listing.
 ///
-/// # Why this pages
+/// `resume` is the whole contract: **`None` means the room is exhausted**,
+/// and anything else means there is more — whether the walk stopped because
+/// `limit` was reached or because it spent its page budget. A caller that
+/// wants everything loops until `resume` is `None`; a caller that wanted one
+/// screenful ignores it. Neither can mistake a short page for a small drive,
+/// which a bare `Vec` could not express.
+#[derive(Debug, Clone)]
+#[must_use = "a drive page may be partial — check `resume` before treating it as the whole room"]
+pub struct DrivePage {
+    /// The files, newest first.
+    pub files: Vec<FileRow>,
+    /// Where to continue from, or `None` when nothing is left.
+    pub resume: Option<ciris_persist::ceg::AttestationCursor>,
+}
+
+/// **The drive read** — up to `limit` of this room's file rows, newest
+/// first, resumable (CIRISServer#615 §3).
 ///
-/// The directory's listing is over the WHOLE attestation plane, and the
-/// room-and-dimension filter runs here. Asking it for `limit` rows and
-/// filtering afterwards returns however many of that global page happened to
-/// be this room's files — which on a busy node is none, and, because every
-/// call restarts at the beginning, the files on later pages are invisible
-/// FOREVER rather than merely late. So the cursor is walked until `limit`
-/// matching files are collected or the plane is exhausted
-/// (`MAX_LISTING_PAGES` caps the walk).
+/// Runs on persist's **gated** reader door (`Engine::list_attestations`,
+/// CIRISPersist#891 / v46.4.0): the `cohort_scope` and `dimension_exact`
+/// axes select server-side, and the §4.3 caller-visibility predicate runs
+/// in the same query. Two things follow, and both are improvements on what
+/// v29.5.0 shipped:
 ///
-/// A directory that could filter by `cohort_scope` and dimension would make
-/// this one query; `AttestationFilter` has no such axis today
-/// (CIRISEdge#352), which is why the walk is here and bounded.
+/// - **The limit bounds the answer, not the plane.** Before this, the only
+///   door was `list_attestations_since` — persist's *replication* cursor —
+///   so edge filtered client-side and `limit` bounded a global page; on a
+///   busy node a drive showed too few files, and later pages were invisible
+///   permanently rather than merely late.
+/// - **The caller is gated by the substrate**, in one spelling, rather than
+///   by a precondition the host had to remember. A caller naming another
+///   person's identity gets their rows refused by the gate, not filtered by
+///   a predicate edge wrote twice.
 ///
-/// # ⚠️ Caller gating is the HOST's, until CIRISPersist#891
+/// The filter can never WIDEN: persist composes the gate after it, so a
+/// filter naming a room the caller is not in returns nothing (their I142).
 ///
-/// This takes a room and returns that room's files. It does **not** ask
-/// whether the caller may see that room — `list_attestations_since` is
-/// persist's *replication* cursor and composes no §4.3 caller-visibility
-/// predicate, which is right for a replication door and wrong for a
-/// reader's. On a one-human node the distinction is invisible; on a shared
-/// device (two humans, one node — the shape CIRISPersist#873/#888 exist for)
-/// a caller that can name another person's identity can enumerate their file
-/// rows through this.
+/// Pass `after: None` for the newest page, then feed back
+/// [`DrivePage::resume`] until it is `None`. Every page is consumed whole —
+/// the query asks for exactly what is still wanted — so a resumed listing
+/// never steps over a file.
 ///
-/// So a host exposing this over an API MUST check that the requester is
-/// entitled to `room` — for a self room, that the requester's principal IS
-/// that identity. Persist ships the gated reader door in v46.4.0
-/// (`cohort_scope` on `AttestationFilter` + the §4.3 gate composed in SQL);
-/// edge adopts it and this precondition goes away. Edge does not compose
-/// the gate here in the meantime because that would duplicate the predicate
-/// about to ship, and two spellings of a visibility rule is the failure this
-/// crate keeps removing.
+/// # Targeted rooms are refused until CIRISPersist#893
 ///
-/// # What counts as this room's file
-///
-/// The dimension, the row's cohort scope, AND the room's identity — the
-/// last of which differs by kind: a community or family row names its
-/// target in the envelope, while a `self` row names none (the owner IS the
-/// target), so a self listing matches on the POINTER's group slot, which
-/// persist fills with the owner at that tier. A self row whose pointer
-/// names nobody is skipped rather than shown: a node that holds more than
-/// one identity's self rows — any server — would otherwise return every
-/// identity's file metadata for every identity's drive.
+/// `community` and `family` return [`FileError::DriveGateUnavailable`]. Not
+/// a limitation of this function — the §4.3 gate's two targeted arms are
+/// mutually unsatisfiable with AV-84 on the attestation plane: a
+/// community/family row must name its PRODUCER in `attested_key_id` (the
+/// write rule), and the read gate compares that column against the caller's
+/// room set, so no member can read their own room's rows. Edge refuses
+/// rather than returning the empty list the gate produces, because a
+/// silently empty drive is the failure this whole arc exists to remove, and
+/// rather than falling back to the ungated cursor, because a function that
+/// takes a caller must not hand back rows it did not gate.
 ///
 /// # Errors
-/// The directory's, unchanged.
+/// [`FileError::Drive`] from the substrate;
+/// [`FileError::DriveGateUnavailable`] for a targeted room.
 pub async fn in_room(
-    directory: &dyn FederationDirectory,
+    engine: &ciris_persist::Engine,
     room: &ScopeRoom,
+    caller_occurrence_key_id: &str,
     limit: usize,
-) -> Result<Vec<FileRow>, String> {
-    let mut out: Vec<FileRow> = Vec::new();
-    let mut cursor: Option<(DateTime<Utc>, String)> = None;
+    after: Option<ciris_persist::ceg::AttestationCursor>,
+) -> Result<DrivePage, FileError> {
+    use ciris_persist::ceg::AttestationFilter;
+    use ciris_persist::scope::CallerScope;
+
+    if room.cohort_target_field().is_some() {
+        return Err(FileError::DriveGateUnavailable {
+            room: room.to_string(),
+        });
+    }
+
+    let caller = caller_occurrence_key_id.to_owned();
+    let admission = ciris_persist::scope::admission::build_caller_admission(engine, &caller)
+        .await
+        .map_err(|e| FileError::Drive {
+            room: room.to_string(),
+            detail: e.to_string(),
+        })?;
+    let scope = CallerScope::Authenticated { admission };
+
+    let mut files: Vec<FileRow> = Vec::new();
+    let mut cursor = after;
     for _ in 0..MAX_LISTING_PAGES {
-        if out.len() >= limit {
+        // Ask for EXACTLY what is still wanted, so the whole page is always
+        // consumed and `next_cursor` means what it says.
+        //
+        // The alternative — a fixed 256-row page, stopping mid-page once
+        // `limit` matches are collected — resumes from the END of a page
+        // whose tail was never returned, so every remaining match in it is
+        // skipped for good. Edge will not mint persist's cursor to work
+        // around that either: a cursor edge builds is a second spelling of
+        // persist's ordering, and it would page wrongly and silently the day
+        // that ordering changed. Only cursors persist handed us are passed
+        // back.
+        let need = limit.saturating_sub(files.len());
+        if need == 0 {
             break;
         }
-        let page = directory
-            .list_attestations_since(cursor.clone(), LISTING_PAGE)
+        // Bounded BOTH ways: never more than is still wanted (so the page is
+        // consumed whole and `next_cursor` is exact), never more than edge's
+        // own page (so a huge `limit` cannot turn one call into an unbounded
+        // scan).
+        let chunk = need.min(MAX_BACKING_PAGE);
+        let page = engine
+            .list_attestations(
+                {
+                    // `#[non_exhaustive]` by design (a new axis must not break
+                    // old consumers), so it is built from the default rather
+                    // than a struct literal.
+                    let mut f = AttestationFilter::default();
+                    f.cohort_scope = Some(room.row_scope_token().to_owned());
+                    f.dimension_exact = Some(FILE_DIMENSION.to_owned());
+                    f
+                },
+                cursor,
+                i64::try_from(chunk).unwrap_or(i64::MAX),
+                scope.clone(),
+            )
             .await
-            .map_err(|e| format!("list files in {room}: {e}"))?;
-        if page.is_empty() {
-            break;
-        }
-        cursor = page.last().map(ServedAttestation::resume_pair);
-        let exhausted = page.len() < LISTING_PAGE as usize;
-        for served in page {
-            if out.len() >= limit {
-                break;
+            .map_err(|e| FileError::Drive {
+                room: room.to_string(),
+                detail: e.to_string(),
+            })?;
+        for row in &page.items {
+            // The gate answered "may this caller see it"; this answers "is it
+            // THIS room's" — the pointer's owner slot for a self room. Kept
+            // after the gate rather than trusted instead of it. It can DROP
+            // rows, which is why a page yielding nothing is not evidence the
+            // room is empty.
+            if let Some(file) = belongs_to(room, row) {
+                files.push(file);
             }
-            if let Some(file) = belongs_to(room, &served.attestation) {
-                out.push(file);
-            }
         }
-        if exhausted {
+        cursor = page.next_cursor;
+        if cursor.is_none() {
             break;
         }
     }
-    Ok(out)
+    Ok(DrivePage {
+        files,
+        resume: cursor,
+    })
 }
 
 /// Is `row` one of `room`'s files? See [`in_room`] for why the identity
@@ -632,6 +732,38 @@ mod tests {
         ))
         .is_none());
         assert!(FileRow::from_row(&row_with(FILE_DIMENSION, serde_json::json!({}))).is_none());
+    }
+
+    /// CIRISEdge#657 review — a short page is a VALUE, not a log line.
+    ///
+    /// `belongs_to` drops rows the gate admitted that are not this room's,
+    /// so a caller admitted to more than one self room can spend the page
+    /// budget on the other room's newer rows before reaching this room's
+    /// older ones. That is legitimate; returning a short `Vec` and warning
+    /// about it is not, because a caller cannot branch on a WARN. `resume`
+    /// makes the two cases distinguishable in the type.
+    #[test]
+    fn a_drive_page_says_whether_the_room_is_exhausted() {
+        let exhausted = DrivePage {
+            files: vec![],
+            resume: None,
+        };
+        assert!(
+            exhausted.resume.is_none(),
+            "no files AND nothing left = the room really is empty"
+        );
+        // The shape a caller must be able to tell apart from the above: a
+        // page that yielded nothing for THIS room but has not reached the
+        // end — loop, do not conclude "empty".
+        let more = DrivePage {
+            files: vec![],
+            resume: Some(ciris_persist::ceg::AttestationCursor {
+                version: "v1".into(),
+                last_asserted_at: chrono::DateTime::from_timestamp(1_767_225_296, 0).expect("ts"),
+                last_attestation_id: "file-abc".into(),
+            }),
+        };
+        assert!(more.resume.is_some());
     }
 
     /// §6.9 — the two columns that both say "self". A drive listing reads

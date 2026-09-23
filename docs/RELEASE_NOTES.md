@@ -1,5 +1,140 @@
 # CIRISEdge Release Notes
 
+# v30.0.0 — adopt CIRISPersist v46.4.0: the drive read becomes a gated query, and the handshake goes into the room it names
+
+**2026-09-23** (PR #657, CIRISEdge#646 §6.8 + CIRISEdge#656). **MAJOR**, and the reason is a fact
+rather than a diff shape: **CIRISServer 0.5.215 has adopted v29.5.0** (`tag = "v29.5.0"` in its
+`Cargo.toml`), so `files::in_room`'s contract has a holder, and its signature moves here. The house
+rule is to pick the bump from who adopted the version being amended — checked this time by grepping
+the downstream pin rather than assuming, which is what caught it.
+
+Upstream is additive: persist v46.4.0 moves no ABI constant, verify stays v16.1.0, the wheel floor is
+unchanged.
+
+**Breaking, for a Rust consumer:**
+
+| was | is |
+|---|---|
+| `files::in_room(dir, &room, limit) -> Result<Vec<FileRow>, String>` | `files::in_room(engine, &room, caller_occurrence_key_id, limit, after) -> Result<DrivePage, FileError>` |
+
+`FileError` gains `Drive`, `DriveGateUnavailable` and `TooLargeForInline`; it is not
+`#[non_exhaustive]`, so an exhaustive match needs the new arms.
+
+## The drive read
+
+v29.5.0 listed a drive by walking `list_attestations_since` — persist's **replication** cursor — and
+filtering client-side, because `AttestationFilter` had no `cohort_scope` axis. Two consequences, both
+now gone:
+
+- **The limit bounded the wrong set.** Ask for 50 and filter afterwards and you get however many of
+  that global page happened to be this room's files; on a busy node, none. And since every call
+  restarted at the beginning, files on later pages were invisible *permanently* rather than late.
+- **The read was caller-ungated.** The replication cursor composes no §4.3 visibility predicate —
+  correct for replication, wrong for a reader's door — so on a shared device a caller naming another
+  person's identity could enumerate their file rows. v29.5.0 carried that as a documented host
+  precondition.
+
+persist v46.4.0 (CIRISPersist#891) adds the axis to the **gated** door, which had been filtered,
+cursor-paged and §4.3-gated since v4.0. The door was never missing; the axis was.
+
+```rust
+files::in_room(engine, &room, caller_occurrence_key_id, limit, after) -> DrivePage
+//                                                          was (dir, &room, limit) -> Vec<FileRow>
+```
+
+The limit now bounds the answer, the substrate gates the caller in one spelling, and the filter can
+never widen: persist composes §4.3 *after* it, so naming a room you are not in returns nothing. The
+64-page walk and the host precondition are both deleted.
+
+## Targeted rooms are refused by name (CIRISPersist#893)
+
+The gate's `self` arm compares by principal and works. Its `community` and `family` arms **cannot
+match any row edge can write**: AV-84 requires a targeted row to name its own PRODUCER in
+`attested_key_id`, the gate compares that column against the caller's room set, and the intersection
+is empty by construction — so no member can read their own room's rows.
+
+`files::in_room` returns **`FileError::DriveGateUnavailable`** for those rooms rather than the empty
+list the gate produces (a silently empty drive is indistinguishable from a room with no files), and
+rather than falling back to the ungated cursor (a function that takes a caller must not hand back
+rows it did not gate).
+
+Edge's ruling, posted on #893: give the read gate the envelope's cohort target. **The correct
+predicate is already shipped twice and both spellings key on the row's community** — persist's own
+`is_audience_of` and edge's CC 5.2 serve gate. The §4.3 gate is the one asking a different question.
+Admitting on "shares a room with the producer" instead would be a transitive widening — a member of
+any one of my rooms would see rows from all of them — and would put the local read door in
+contradiction with both shipped spellings at once.
+
+Also in v46.4.0: `adopt_sealed_chunk_json`, which **edge does not need** (it calls the `Engine` door
+in Rust); a Python consumer adopting a chunk DAG does.
+
+## The handshake goes into the room it names (CIRISEdge#656)
+
+`self_room::decide` returns `PublishKeyPackage` and `Add`, and **neither could be executed through
+the public API**: `key_package_attestation` and `welcome_attestation` derive a *pair* room from
+`(author, recipient)`, while a self collective's group id is the owner's key id. So the KeyPackage
+landed in `chat:pair:v1:<hash>`, the adder looked in the self room, and the creator held a row it
+could not see — `Added(0)` forever, the room stuck at one member, **every step logging success**.
+Measured on CIRISServer's `selffiles` ladder, where it is the one thing between `mine_on_b` (green)
+and `opened_on_b`.
+
+- **`key_package_attestation_in(author, &room, key_package, asserted_at)`** and
+  **`welcome_attestation_in(author, &room, recipient_key_id, welcome, epoch, asserted_at)`**, where
+  `room` is a **`ScopeRoom`** — not a bare id:
+
+  ```rust
+  let room = self_room::room(&owner_fed_id);          // or ScopeRoom::family(fid) / ::community(id)
+  let kp = chat::key_package_attestation_in(&node_signer, &room, &kp_bytes, Utc::now()).await?;
+  let w  = chat::welcome_attestation_in(&node_signer, &room, joiner, &welcome, epoch, Utc::now()).await?;
+  ```
+
+  The kind has to survive into the row, because each one names its room under a different envelope
+  member: a family row must carry `family_key_id`, which is what persist's widen door and write gate
+  read. A bare string would have been written as `community_key_id` for every room — two spellings of
+  one fact, which is what `ScopeRoom` exists to end.
+
+  `welcome_attestation_in` takes **both** the room and the joiner. One parameter answered "which room"
+  and "for whom" only because a pair room IS its two members; a room with three cannot express it that
+  way, and the creator places one Welcome per joiner into the same room. The recipient rides the
+  signed envelope.
+- **`welcome_for(dir, from, room, recipient)`** — picks the Welcome addressed to you.
+  `welcome_from` returns the *last* one in the room, which is right for a pair and wrong for a
+  collective. A pair-era Welcome carries no recipient member and is matched only when the room IS
+  that pair, so legacy handshakes keep working and a wider room never hands a joiner someone else's.
+
+The pair-deriving producers stay, as wrappers, so every current caller compiles.
+
+## Review fixes (PR #657)
+
+- **A short page is a value, not a log line** (two rounds of review, and the second was the one that
+  mattered). The first fix replaced a fixed 64-page ceiling — which silently returned the newest
+  16,384 rows for any larger limit — with a budget derived from `limit` plus fixed slack, and a WARN
+  when it was spent. That is still wrong, because **a caller cannot branch on a WARN**: `belongs_to`
+  drops rows the gate admitted that are not this room's, so a caller admitted to more than one self
+  room can spend the budget on another room's newer rows and get a short `Ok` back with no way to
+  tell it from a small drive.
+
+  **And the resume cursor must be the last row CONSUMED.** Taking `limit` matches out of a larger
+  backing page and then resuming from the end of that page skips every unreturned match in it —
+  silently, and permanently, because pagination never goes back. The query therefore asks for exactly
+  what is still wanted, so the whole page is always consumed and persist's `next_cursor` means what it
+  says. Edge will not mint a cursor of its own to work around it: a cursor edge builds is a second
+  spelling of persist's ordering, and it would page wrongly the day that ordering changed. Witness —
+  `a_resumed_drive_listing_never_steps_over_a_file` pages a three-file drive one file at a time;
+  against the pre-fix shape it returns **1 of 3**.
+
+  `in_room` now returns **`DrivePage { files, resume }`**. `resume` is the contract: **`None` means
+  the room is exhausted**, anything else means there is more — whether the walk stopped at `limit` or
+  at its budget. A caller wanting everything loops until it is `None`; one wanting a screenful ignores
+  it; neither can mistake a short page for a small drive. `after` takes the cursor back, so the drive
+  paginates. The page budget stays as a bound on work per call, and is no longer load-bearing for
+  correctness.
+
+Witness: `a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index` reads the drive back
+through the gated door, gets nothing for a stranger's room, and is refused by name for a community
+room; `a_handshake_row_is_placed_in_the_room_it_names_not_a_derived_pair` pins #656. Pins: persist
+**v46.4.0**, verify v16.1.0, leviculum v0.26.0+ciris.1.
+
 # v29.5.0 — the self room's rule, one name for every room, and one door for a file at any cohort
 
 **2026-09-22** (PR #655, CIRISEdge#646 §6.3 + §9). MINOR: three new modules, no pin move
