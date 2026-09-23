@@ -3029,3 +3029,68 @@ async fn a_community_pull_resolves_through_the_rooms_group_and_stops_at_the_scop
         "nothing was stored past the send seam's refusal"
     );
 }
+
+/// **CIRISEdge#657 review — a resumed drive listing never steps over a file.**
+///
+/// The drive query's backing page and the caller's `limit` are different
+/// numbers. Taking `limit` matches out of a larger page and then resuming
+/// from the END of that page skips every unreturned match in it — silently,
+/// and permanently, because pagination never goes back. This pages a
+/// three-file drive one file at a time and asserts the set comes back whole.
+#[tokio::test]
+async fn a_resumed_drive_listing_never_steps_over_a_file() {
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let node_a = node(&[&alice], &alice).await;
+    let room = ciris_edge::self_room::room(&alice.key_id);
+
+    let mut written: Vec<String> = Vec::new();
+    for (i, name) in ["one.txt", "two.txt", "three.txt"].iter().enumerate() {
+        let nth = i64::try_from(i).expect("three files fit in an i64");
+        let published = ciris_edge::files::publish(
+            &*node_a.dir,
+            &node_a.store,
+            ciris_edge::replication::attestation_bind::Signers {
+                node: &node_a.signer,
+                actor: None,
+            },
+            &ciris_edge::files::FileWrite {
+                room: &room,
+                bytes: format!("contents of {name}").as_bytes(),
+                media_type: "text/plain",
+                filename: Some(name),
+                // Distinct instants: the drive is ordered newest-first on
+                // (asserted_at, attestation_id).
+                asserted_at: ts() + chrono::Duration::seconds(nth),
+            },
+        )
+        .await
+        .expect("publish");
+        written.push(published.pointer.content_sha256);
+    }
+
+    // One file per page — the shape that makes the bug visible. A page size
+    // equal to the whole drive would hide it.
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor = None;
+    for _ in 0..10 {
+        let page = ciris_edge::files::in_room(node_a.store.engine(), &room, &node_a.me, 1, cursor)
+            .await
+            .expect("page the drive");
+        seen.extend(page.files.iter().map(|f| f.pointer.content_sha256.clone()));
+        match page.resume {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    seen.sort();
+    seen.dedup();
+    let mut expected = written.clone();
+    expected.sort();
+    assert_eq!(
+        seen, expected,
+        "every file the drive holds came back across the pages — a resume that \
+         jumps to the end of a backing page loses the ones it did not return"
+    );
+}

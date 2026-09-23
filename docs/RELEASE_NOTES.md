@@ -100,6 +100,15 @@ The pair-deriving producers stay, as wrappers, so every current caller compiles.
   room can spend the budget on another room's newer rows and get a short `Ok` back with no way to
   tell it from a small drive.
 
+  **And the resume cursor must be the last row CONSUMED.** Taking `limit` matches out of a larger
+  backing page and then resuming from the end of that page skips every unreturned match in it —
+  silently, and permanently, because pagination never goes back. The query therefore asks for exactly
+  what is still wanted, so the whole page is always consumed and persist's `next_cursor` means what it
+  says. Edge will not mint a cursor of its own to work around it: a cursor edge builds is a second
+  spelling of persist's ordering, and it would page wrongly the day that ordering changed. Witness —
+  `a_resumed_drive_listing_never_steps_over_a_file` pages a three-file drive one file at a time;
+  against the pre-fix shape it returns **1 of 3**.
+
   `in_room` now returns **`DrivePage { files, resume }`**. `resume` is the contract: **`None` means
   the room is exhausted**, anything else means there is more — whether the walk stopped at `limit` or
   at its budget. A caller wanting everything loops until it is `None`; one wanting a screenful ignores

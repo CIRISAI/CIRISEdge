@@ -494,19 +494,15 @@ impl FileRow {
     }
 }
 
-/// Pages of work [`in_room`] will do beyond the ones `limit` itself needs,
-/// covering rows the gate admits that are not THIS room's.
+/// How many queries [`in_room`] will issue for one call before handing back
+/// what it has.
 ///
-/// It is a work bound, **not** a correctness one: exhausting it is reported
-/// in [`DrivePage::resume`], never swallowed. An earlier version had only a
-/// fixed ceiling and a WARN, which meant a caller admitted to more than one
-/// self room could get a short list with no way to know — a log line is not
-/// a return value.
-const LISTING_PAGE_SLACK: usize = 8;
-
-/// The page size [`in_room`] asks the drive query for. `usize` because the
-/// budget arithmetic is in rows; widened to the door's `i64` at the call.
-const LISTING_PAGE: usize = 256;
+/// A pure bound on **work per call**, not on correctness: reaching it is
+/// reported in [`DrivePage::resume`] like any other partial page, so a
+/// caller loops rather than mistaking it for the end of the room. It exists
+/// because a node holding millions of rows this caller may see but this
+/// room does not own would otherwise make one listing walk for minutes.
+const MAX_LISTING_PAGES: usize = 64;
 
 /// One page of a drive listing.
 ///
@@ -548,7 +544,9 @@ pub struct DrivePage {
 /// filter naming a room the caller is not in returns nothing (their I142).
 ///
 /// Pass `after: None` for the newest page, then feed back
-/// [`DrivePage::resume`] until it is `None`.
+/// [`DrivePage::resume`] until it is `None`. Every page is consumed whole —
+/// the query asks for exactly what is still wanted — so a resumed listing
+/// never steps over a file.
 ///
 /// # Targeted rooms are refused until CIRISPersist#893
 ///
@@ -593,14 +591,20 @@ pub async fn in_room(
 
     let mut files: Vec<FileRow> = Vec::new();
     let mut cursor = after;
-    // Bounded by what was ASKED FOR, plus slack for rows the gate admits
-    // that are not this room's. Hitting it is not silent: whatever is left
-    // rides back in `resume`.
-    let budget = (limit / LISTING_PAGE)
-        .saturating_add(1)
-        .saturating_add(LISTING_PAGE_SLACK);
-    for _ in 0..budget {
-        if files.len() >= limit {
+    for _ in 0..MAX_LISTING_PAGES {
+        // Ask for EXACTLY what is still wanted, so the whole page is always
+        // consumed and `next_cursor` means what it says.
+        //
+        // The alternative — a fixed 256-row page, stopping mid-page once
+        // `limit` matches are collected — resumes from the END of a page
+        // whose tail was never returned, so every remaining match in it is
+        // skipped for good. Edge will not mint persist's cursor to work
+        // around that either: a cursor edge builds is a second spelling of
+        // persist's ordering, and it would page wrongly and silently the day
+        // that ordering changed. Only cursors persist handed us are passed
+        // back.
+        let need = limit.saturating_sub(files.len());
+        if need == 0 {
             break;
         }
         let page = engine
@@ -615,7 +619,7 @@ pub async fn in_room(
                     f
                 },
                 cursor,
-                i64::try_from(LISTING_PAGE).unwrap_or(i64::MAX),
+                i64::try_from(need).unwrap_or(i64::MAX),
                 scope.clone(),
             )
             .await
@@ -624,12 +628,11 @@ pub async fn in_room(
                 detail: e.to_string(),
             })?;
         for row in &page.items {
-            if files.len() >= limit {
-                break;
-            }
             // The gate answered "may this caller see it"; this answers "is it
             // THIS room's" — the pointer's owner slot for a self room. Kept
-            // after the gate rather than trusted instead of it.
+            // after the gate rather than trusted instead of it. It can DROP
+            // rows, which is why a page yielding nothing is not evidence the
+            // room is empty.
             if let Some(file) = belongs_to(room, row) {
                 files.push(file);
             }
