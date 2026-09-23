@@ -2448,10 +2448,10 @@ impl PyEdge {
     ///   "apply_refusals_by_kind": {"key": 3, ...},
     ///   "key_apply_refusals_by_reason": {"pubkey_swap": 3, ...},
     ///   # CIRISEdge#522 / persist v38.2.0 — the apply-DOOR class axis:
-    ///   # "retry_after_community_roster" (transient, converges once the
+    ///   # "retry_after_roster" (transient, converges once the
     ///   # roster applies), "third_party_row" (AV-84 verdict about the row),
     ///   # "community_roster_fork" (two authorities, one community id).
-    ///   "apply_refusals_by_class": {"retry_after_community_roster": 4, ...},
+    ///   "apply_refusals_by_class": {"retry_after_roster": 4, ...},
     /// }
     /// ```
     // A flat projection of EdgeMetricsBundle into a PyDict — one block per

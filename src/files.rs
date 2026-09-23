@@ -137,24 +137,6 @@ pub enum FileError {
         /// The substrate's error.
         detail: String,
     },
-    /// **The §4.3 read gate cannot serve a targeted room** — its `community`
-    /// and `family` arms are mutually unsatisfiable with AV-84 on the
-    /// attestation plane (CIRISPersist#893): the write rule makes
-    /// `attested_key_id` the row's PRODUCER, the read gate compares that
-    /// column against the caller's room set, and the intersection is empty
-    /// by construction, so no member can read their own room's rows.
-    ///
-    /// Refused rather than returned empty: a drive that silently shows
-    /// nothing is indistinguishable from a room with no files. Lifts when
-    /// CIRISPersist#893 lands.
-    #[error(
-        "{room}: the §4.3 read gate cannot serve a targeted room yet — its community/family \
-         arms are unsatisfiable with AV-84 (CIRISPersist#893), so this would be silently empty"
-    )]
-    DriveGateUnavailable {
-        /// The room asked for.
-        room: String,
-    },
     /// **Bigger than one envelope, with no chunk door to take it.**
     ///
     /// Unreachable from [`publish`] since CIRISEdge#633: content above CC
@@ -557,22 +539,18 @@ pub struct DrivePage {
 /// the query asks for exactly what is still wanted — so a resumed listing
 /// never steps over a file.
 ///
-/// # Targeted rooms are refused until CIRISPersist#893
+/// # Every room kind, one gate
 ///
-/// `community` and `family` return [`FileError::DriveGateUnavailable`]. Not
-/// a limitation of this function — the §4.3 gate's two targeted arms are
-/// mutually unsatisfiable with AV-84 on the attestation plane: a
-/// community/family row must name its PRODUCER in `attested_key_id` (the
-/// write rule), and the read gate compares that column against the caller's
-/// room set, so no member can read their own room's rows. Edge refuses
-/// rather than returning the empty list the gate produces, because a
-/// silently empty drive is the failure this whole arc exists to remove, and
-/// rather than falling back to the ungated cursor, because a function that
-/// takes a caller must not hand back rows it did not gate.
+/// `self`, `family`, `community` and `affiliations` all go through persist's
+/// §4.3 read gate. Until persist v46.5.0 (CIRISPersist#893) the targeted
+/// arms compared the row's PRODUCER against the caller's room set, so no
+/// member could read their own room, and this function refused targeted
+/// rooms by name rather than return the empty list the gate produced. V150's
+/// `cohort_target` column keys the gate on the room the row names, and the
+/// refusal went with its cause.
 ///
 /// # Errors
-/// [`FileError::Drive`] from the substrate;
-/// [`FileError::DriveGateUnavailable`] for a targeted room.
+/// [`FileError::Drive`] from the substrate.
 pub async fn in_room(
     engine: &ciris_persist::Engine,
     room: &ScopeRoom,
@@ -582,12 +560,6 @@ pub async fn in_room(
 ) -> Result<DrivePage, FileError> {
     use ciris_persist::ceg::AttestationFilter;
     use ciris_persist::scope::CallerScope;
-
-    if room.cohort_target_field().is_some() {
-        return Err(FileError::DriveGateUnavailable {
-            room: room.to_string(),
-        });
-    }
 
     let caller = caller_occurrence_key_id.to_owned();
     let admission = ciris_persist::scope::admission::build_caller_admission(engine, &caller)

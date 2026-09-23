@@ -537,9 +537,14 @@ pub enum With {
         community_key_id: String,
     },
     /// `affiliations` — ONE named institutional cohort (CC 4.4.3.2.8), the
-    /// row placed in that affiliation's roster. Same tier
-    /// as `community` (CC 4.4.3.2.1).
-    Affiliations,
+    /// row placed in that affiliation's roster. Same tier and machinery as
+    /// `community` (CC 4.4.3.2.1); persist v47.0.0 (CIRISPersist#897) names
+    /// the room on the audience, and a room-less placement is refused.
+    Affiliations {
+        /// The affiliation the row is placed in. Persist keys the roster by
+        /// its community record, so this IS a `community_key_id`.
+        community_key_id: String,
+    },
     /// `species` — narrower AUDIENCE than the federation, but **plaintext**
     /// (Commons). Check [`Self::is_encrypted_at_rest`] before assuming
     /// otherwise.
@@ -560,7 +565,9 @@ impl With {
             With::Community { community_key_id } => Audience::Community {
                 community_key_id: community_key_id.clone(),
             },
-            With::Affiliations => Audience::Affiliations,
+            With::Affiliations { community_key_id } => Audience::Affiliations {
+                community_key_id: community_key_id.clone(),
+            },
             With::Species => Audience::Species,
             With::Biosphere => Audience::Biosphere,
         }
@@ -643,7 +650,10 @@ pub enum EncryptedCohort {
         community_key_id: String,
     },
     /// `affiliations` — ONE named institutional cohort (CC 4.4.3.2.8).
-    Affiliations,
+    Affiliations {
+        /// The affiliation the row is placed in (its community record's id).
+        community_key_id: String,
+    },
 }
 
 /// **A cohort whose content is PLAINTEXT at rest**, despite naming an audience
@@ -674,7 +684,9 @@ impl EncryptedCohort {
             EncryptedCohort::Community { community_key_id } => With::Community {
                 community_key_id: community_key_id.clone(),
             },
-            EncryptedCohort::Affiliations => With::Affiliations,
+            EncryptedCohort::Affiliations { community_key_id } => With::Affiliations {
+                community_key_id: community_key_id.clone(),
+            },
         }
     }
 
@@ -833,9 +845,9 @@ pub enum RoutesTo {
     /// `community` — members, served on discovery.
     CommunityMembers { community_key_id: String },
     /// `affiliations` — the named affiliation's members, served on discovery.
-    /// The audience carries no room yet, so edge's serve gate withholds these
-    /// from everyone until CIRISPersist#897 gives it one.
-    Affiliations,
+    /// The same routing as a community: the affiliation IS a community record
+    /// (CC 4.4.3.2.8; CIRISPersist#897).
+    Affiliations { community_key_id: String },
     /// `species` — served on discovery, plaintext.
     Species,
     /// `biosphere` — served on discovery, plaintext.
@@ -856,7 +868,9 @@ impl RoutesTo {
             Audience::Community { community_key_id } => RoutesTo::CommunityMembers {
                 community_key_id: community_key_id.clone(),
             },
-            Audience::Affiliations => RoutesTo::Affiliations,
+            Audience::Affiliations { community_key_id } => RoutesTo::Affiliations {
+                community_key_id: community_key_id.clone(),
+            },
             Audience::Species => RoutesTo::Species,
             Audience::Biosphere => RoutesTo::Biosphere,
             Audience::Federation => RoutesTo::Everyone,

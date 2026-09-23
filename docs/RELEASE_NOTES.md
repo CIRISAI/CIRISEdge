@@ -1,9 +1,46 @@
 # CIRISEdge Release Notes
 
-# v30.1.0 — a file over 1 MiB is a sealed chunk DAG
+# v30.1.0 — adopt persist v46.5.0 + v47.0.0 (the drives open), and a file over 1 MiB is a chunk DAG
 
-**2026-09-23** (PR #658, CIRISEdge#633, `FSD/CONTENT_TRANSFER.md` §6.7). MINOR: one required method
-on `GroupContentStore` (one implementor in-tree), no pin move, no signature change to `files`.
+**2026-09-23** (PR #658; CIRISEdge#633, CIRISPersist#893/#897/#797). MINOR from v30.0.0, which no
+host adopted (CIRISServer stayed on v29.5.0), so the shape changes below cost nobody a second adopt.
+Ladder triple: **edge v30.1.0 · persist v47.0.0 · verify v16.1.0**. All four persist ABI constants
+and `CONSENT_GRAMMAR_HASH` are unchanged; the wheel floor moves to `ciris-persist>=47,<48` because
+persist's cut is a MAJOR.
+
+## Adopt: the community and family drives are open (CIRISPersist#893, persist v46.5.0)
+
+The §4.3 read gate's targeted arms compared the row's PRODUCER against the caller's room set, so no
+member could read their own room, and v30.0.0 refused targeted rooms by name. V150 adds
+`cohort_target`, a generated column over the same envelope aliases the write gate validates, and
+both gate twins key on it per arm. **`FileError::DriveGateUnavailable` is deleted** — an exhaustive
+match on `FileError` loses an arm. `files::in_room` takes every room kind through one gate.
+Witness: the community leg of `a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index`
+(R10: the room's file, only the room's file, and not in the owner's self drive).
+
+## Adopt: `affiliations` is a room at every gate (CIRISPersist#897, persist v47.0.0)
+
+- **`With::Affiliations { community_key_id }`**, `EncryptedCohort::Affiliations { .. }` and
+  `RoutesTo::Affiliations { .. }` name the affiliation (BREAKING shape; the unit variants are gone).
+  persist's `Audience::Affiliations` did the same, and refuses a room-less placement.
+- Edge's serve arm keys on the row's room, exactly as `Community`. Witness:
+  `bridge::an_affiliations_row_is_served_to_the_named_affiliations_members_only` (member served,
+  other affiliation withheld, commons control served; fails on both the pre-v47 `true` arm and
+  the interim fail-closed arm).
+- `FSD/CONTENT_TRANSFER.md` §4.1 (needful/rightful) census: every cell ✓.
+
+## Adopt: a roster not held yet is not "not a member" (CIRISPersist#797)
+
+persist now refuses a targeted write as `MembershipUnresolved` when this node does not HOLD the
+cohort's roster, and as `NoCommunityMembership` / `NoFamilyMembership` only when the held roster
+excludes the writer. Edge's #522 refusal ledger had ridden both as one transient class. Now:
+`retry_after_roster` (transient, any scope) and `not_a_community_member` / `not_a_family_member`
+(terminal). **Metric token change**: `retry_after_community_roster` / `retry_after_family_roster`
+are gone; a dashboard keyed on them reads the two new terminal tokens plus `retry_after_roster`.
+
+## A file over 1 MiB is a sealed chunk DAG (CIRISEdge#633, `FSD/CONTENT_TRANSFER.md` §6.7)
+
+One required method on `GroupContentStore` (one implementor in-tree), no signature change to `files`.
 
 CC 2.6.1.3 bounds a signed envelope at 1 MiB, and persist's `DEFAULT_INLINE_BYTES_CAP` is the same
 number for the same reason — the signed thing is the sized thing. Above it the bytes cannot ride
@@ -30,18 +67,11 @@ is chunked and the tier is still `InvisibleEncrypted`, that **no holder claim ex
 not care how many chunks it took), that the drive lists it as an ordinary file, and that it opens
 **byte for byte**.
 
-## Also: edge's `affiliations` serve arm fails closed (CIRISPersist#897)
+## Also: `FSD/CONTENT_TRANSFER.md` §4.1, the needful/rightful rule
 
-`bridge.rs` served an `affiliations` row to **any** peer, while persist's hold path refused to send it
-anywhere. CC 4.4.3.2.1 puts `affiliations` in the Community tier ("reader: community members"), and
-4.4.3.2.8 gives it "all the community machinery". It is room-gated, and public affiliation records
-are **promoted to a commons row** instead. persist's `Audience::Affiliations` doesn't carry a room
-yet, so the only non-leaking answer is to withhold it from everyone. Nothing in-org produces these
-rows, so nothing changes in practice. Witness:
-`bridge::an_affiliations_row_is_withheld_until_it_names_its_room`, which fails on the old arm and
-includes a commons control on the same peer.
-
-`FSD/CONTENT_TRANSFER.md` §4.1 is new: the **needful/rightful** rule. For each scope, who is sent a
+Found on the way to #897: `bridge.rs` served an `affiliations` row to **any** peer, while persist's
+hold path refused to send it anywhere. That is the fail-OPEN direction, and nothing reports it. §4.1
+is new: the **needful/rightful** rule. For each scope, who is sent a
 row and who may read it must be one predicate with several consumers. It includes a gate × scope
 census, which found four gates spelling `affiliations` as a broad tier. §5.1 had also claimed
 affiliations was "DONE" with no witness for it, and is corrected.

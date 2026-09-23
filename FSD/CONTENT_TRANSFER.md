@@ -7,8 +7,8 @@ witnesses, and CIRISServer 0.5.215's `selffiles` ladder reads `mine_on_b=1` (a f
 device, listed on the owner's other). What remains for self BYTES (`opened_on_b`) is the host-side
 room driver, which is the server's (CIRISServer#622/#626), and files above 1 MiB (§6.7, CIRISEdge#633).
 **Family is the open cohort**: the machinery is shared and the rungs are specified, but its roster
-function, its trigger and its witnesses are unbuilt, and a family DRIVE additionally waits on
-CIRISPersist#893 (§6.8.1). Commons files are a separate verb by design (§6.7).
+function, its trigger and its witnesses are unbuilt. The community drive is witnessed (R10, edge
+v30.1.0 on persist v46.5.0/v47.0.0). Commons files are a separate verb by design (§6.7).
 **Author:** Eric Moore (CIRIS Team) with Claude Fable 5.1
 **Created:** 2026-09-22 · **Revised:** 2026-09-23 (edge v30.0.0; see the §13 changelog — every
 revision since has come from a review finding checked against the pinned tree before the text moved)
@@ -182,17 +182,18 @@ the row, a self/family byte (CC 5.2), or a key.
 
 "Named room" means the gate keys on the cohort the **row** names (`envelope_cohort_target` or V150
 `cohort_target`), never on the producer's or the caller's rooms. `✗` marks a gate that disagrees
-with CC. As of CIRISPersist v46.5.0 (#893) and edge v30.1.0:
+with CC. The `✗` cells were the state at persist v46.4.0; **persist v47.0.0 and edge v30.1.0 close all of
+them** — the cells below say which release did:
 
 | gate (owner) | `self` | `family` | `community` | `affiliations` | commons |
 |---|---|---|---|---|---|
 | **CC** (4.4.3.2.1, .8; 5.2) | owner's occurrences | the named family | the named room's roster | **the named affiliation's roster** | anyone |
-| write: AV-45 (persist) | writer = owner | writer ∈ named family | writer ∈ named room | ✗ any authenticated writer, no target | any authenticated writer |
-| widen: `crossing::Audience` (persist) | `SelfOnly` | `Family{id}` | `Community{id}` | ✗ `Affiliations`, no target | unit |
+| write: AV-45 (persist) | writer = owner | writer ∈ named family | writer ∈ named room | writer ∈ named affiliation (v47.0.0 ✓) | any authenticated writer |
+| widen: `crossing::Audience` (persist) | `SelfOnly` | `Family{id}` | `Community{id}` | `Affiliations{community_key_id}` (v47.0.0 ✓) | unit |
 | at-rest tier (persist `resolve_write_tier`) | per-write DEK | per-write DEK | the room's DEK; refuses without an id | the room's DEK; refuses without an id | plaintext |
 | **needful**: hold / send (persist `hold.rs`) | principal equality | named family | named room | named room | anyone |
-| **rightful**: read §4.3 (persist) | principal | named family (#893 ✓) | named room (#893 ✓) | ✗ **anyone, incl. unauthenticated** | anyone |
-| **rightful**: serve (edge `bridge.rs`) | principal equality | `families.contains` | `communities.contains` | ✗ `true` → **fail-closed** in v30.1.0 | `true` |
+| **rightful**: read §4.3 (persist) | principal | named family (#893 ✓) | named room (#893 ✓) | named room (v47.0.0 ✓, one classifier) | anyone |
+| **rightful**: serve (edge `bridge.rs`) | principal equality | `families.contains` | `communities.contains` | `communities.contains` on the row's room (v30.1.0 ✓) | `true` |
 | blob meaning (edge `blob_swarm::meaning`) | owner's group | named family | named room | named room | — |
 
 Edge's rulings on both issues are posted: #893 was **(1): the row's room, per arm**, and #897 is
@@ -273,7 +274,7 @@ is the allowlist. Inheriting the community rows would demand a widening (R1) and
 | **R7** bytes adopted | sha+size verified; **store gate = the allowlist** (`SenderStanding::Allowlisted`, nothing substitutes); `is_audience` commons arm = everyone | edge `store_gate`; persist `would_hold` | `SenderNotAllowlisted` | `store_gate::commons_content_needs_the_allowlist_and_nothing_else_substitutes` ✓ |
 | **R8** reader opens | plaintext | — | — | `blob_federation_e2e::a_commons_blob_opens_on_any_node_because_no_key_is_involved` ✓ |
 | **R9** withdraw reaches holders | tombstone at the plane's ceiling (`Global` for a trust root); every holder evicts | edge `revocation` | `Revoked` | `revocation.rs` ✓ |
-| **R10** listed | the room's file rows, by `community_key_id` | **blocked on CIRISPersist#893** (§6.8.1): the §4.3 gate's community arm cannot match a row AV-84 admits | `DriveGateUnavailable` — refused by name, never silently empty | — |
+| **R10** listed | the room's file rows, by `community_key_id`; the §4.3 gate keys on the ROW's room (V150 `cohort_target`, persist v46.5.0) | persist `list_attestations`; edge `files::in_room` | `Drive` | `blob_federation_e2e::a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index` (community leg) ✓; persist I144/I145 |
 
 ### 5.3 Self — the open row set (CIRISPersist#884 / CIRISEdge#646)
 
@@ -311,7 +312,7 @@ prove a family branch — each row below names its own.
 | **R7** bytes adopted | `is_audience` family arm (`author_is_local_or_family`); adopt `LocalOnly` | persist | `NotPartyTo` | — *(persist: "a family row adopts on a member's node and is `NotPartyTo` on a non-member's")* |
 | **R8** reader opens | wrap for this device's occurrence, as a member | edge `group_content` | `Body::Unopened` | — *(e2e: "a member's device opens what another member wrote")* |
 | **R9** withdraw | tombstone ceiling projection, as self; evicts on every member's node | persist; edge | `Revoked` | — |
-| **R10** listed | the family's file rows, by `family_key_id` | **blocked on CIRISPersist#893** (§6.8.1): the §4.3 gate's family arm cannot match a row AV-84 admits | `DriveGateUnavailable` — refused by name, never silently empty | — |
+| **R10** listed | the family's file rows, by `family_key_id`; same gate, same column (persist v46.5.0) | persist; edge `files::in_room` | `Drive` | — *(persist I144 has the family leg; edge's e2e needs a family fixture)* |
 
 Open question §12.1 (serve-from-non-author preference) stands.
 
@@ -639,24 +640,26 @@ Persist's ruling on the question edge asked — *should a local drive read carry
 the reader is the owner?* — is **yes**: the gate is about who is asking, not where the bytes are, and
 "the reader is the owner" is a deployment assumption the shared device breaks.
 
-#### 6.8.1 Targeted rooms are refused until CIRISPersist#893
+#### 6.8.1 Targeted rooms — refused by name until CIRISPersist#893, open since persist v46.5.0 / edge v30.1.0
 
-The `self` arm of the gate compares by principal and is witnessed. The **`community` and `family`
-arms cannot match any row edge can write**, and the reason is a contradiction between two rules that
-are each correct alone (CIRISPersist#893):
+The `self` arm of the gate compares by principal and was witnessed first. The **`community` and
+`family` arms could not match any row edge can write**, and the reason was a contradiction between
+two rules that are each correct alone (CIRISPersist#893):
 
 - **AV-84 (write):** a targeted-cohort placement is a producer self-declaration, so a `community` /
   `family` row MUST name its own **producer** in `attested_key_id`; naming the room is refused.
 - **§4.3 (read):** a row is admitted iff its **target** is in the caller's admitted set — and the
-  target column passed on `federation_attestations` is `attested_key_id`.
+  target column passed on `federation_attestations` was `attested_key_id`.
 
-`attested_key_id` is the producer; `community_key_ids` holds room keys; the intersection is empty by
-construction. So no member can read their own room's rows through this door.
+`attested_key_id` is the producer; `community_key_ids` holds room keys; the intersection was empty by
+construction. So no member could read their own room's rows through this door, and edge v30.0.0
+**refused** a targeted room by name (`FileError::DriveGateUnavailable`) rather than return the
+empty list the gate produced.
 
-`files::in_room` therefore **refuses** a targeted room by name
-(`FileError::DriveGateUnavailable`) rather than returning the empty list the gate produces — a
-silently empty drive is indistinguishable from a room with no files — and rather than falling back to
-the ungated cursor, because a function that takes a caller must not hand back rows it did not gate.
+**Shipped in persist v46.5.0, adopted in edge v30.1.0.** V150 adds `cohort_target`, a generated
+column over the same envelope aliases the write gate validates, and both gate twins take the row's
+room per arm; `affiliations` joins the targeted arms in v47.0.0 (§4.1). `DriveGateUnavailable` is
+gone with its cause, and R10 for community is witnessed on edge's e2e.
 
 **Edge's ruling on the fix** (posted on #893): give the read gate the envelope's cohort target, as a
 generated column over the value the write gate already validated. The argument is that **the correct
@@ -745,9 +748,8 @@ the self row set adds `mine_on_b` = "a self row written on A opened on B", with 
 2. **persist — both asks shipped in v46.4.0**, adopted by edge v30.0.0: the §6.8 `cohort_scope` axis
    on the gated reader door (**CIRISPersist#891**), and `adopt_sealed_chunk_json` (**#821**, which
    edge does not itself need — it calls the `Engine` door in Rust; a Python consumer adopting a chunk
-   DAG does). **One persist item remains and it is a ruling, not a build: CIRISPersist#893** — the
-   §4.3 gate's targeted arms are unsatisfiable with AV-84, so a community or family drive is refused
-   by name until it lands (§6.8.1). Edge's ruling is posted there.
+   DAG does). CIRISPersist#893 shipped in v46.5.0 and #897 in v47.0.0; edge v30.1.0 adopts both
+   (§6.8.1, §4.1). **No persist item remains open for the file story.**
 3. **edge — done**: the projector's group-id rule and the two facets (§6.2, v29.4.0); the source rule
    and `blob_pull_sources` (§6.2); `announce_is_possible` asks the substrate (#646 ask 1); `ScopeRoom`,
    `self_room::{roster, snapshot, decide}` and the file door (§6.3/§9, v29.5.0); `refresh_members`
@@ -784,6 +786,12 @@ template: it is green because each rung has a witness, not because a run passed.
 
 ## 13. Changelog
 
+- **2026-09-23 (v30.1.0: adopt persist v46.5.0 + v47.0.0).** The community drive is open and
+  witnessed (R10, §6.8.1); `DriveGateUnavailable` is deleted with its cause. `affiliations` is a
+  room at every gate (§4.1 census all ✓): `With::Affiliations { community_key_id }`, and edge's
+  serve arm keys on the row's room. persist#797's `MembershipUnresolved` splits "roster not held
+  yet" (transient, `retry_after_roster`) from "not a member" (terminal, `not_a_*_member`), which
+  edge had ridden as one transient class since #522.
 - **2026-09-23 (§4.1, CIRISPersist#897).** Added the needful/rightful rule and the gate × scope census
   after persist found `affiliations` room-gated on hold and broad on read. The census found **four more
   gates** with the broad spelling (AV-45 write, `Audience::Affiliations`, edge's serve arm, and the

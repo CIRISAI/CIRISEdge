@@ -2179,21 +2179,55 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         .is_empty(),
         "one identity's self rows never appear in another's drive"
     );
-    // A targeted room is REFUSED by name rather than returned empty, until
-    // the §4.3 gate's community/family arms stop contradicting AV-84
-    // (CIRISPersist#893).
-    let refused = ciris_edge::files::in_room(
-        node_a.store.engine(),
-        &ciris_edge::scope_room::ScopeRoom::community("room-1"),
-        &node_a.me,
-        10,
-        None,
+    // A COMMUNITY drive, through the same gate (persist v46.5.0, #893: the
+    // §4.3 targeted arms key on the room the ROW names via V150's
+    // `cohort_target`; until then no member could read their own room and
+    // edge refused targeted rooms by name). Alice's node is a member through
+    // the owner axis; the file lands in the room's drive and in no other.
+    let room = ciris_edge::scope_room::ScopeRoom::community("room-1");
+    seed_room(&node_a, "room-1", &[&alice]).await;
+    let in_room = ciris_edge::files::publish(
+        &*node_a.dir,
+        &node_a.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &ciris_edge::files::FileWrite {
+            room: &room,
+            bytes: b"a file for the room",
+            media_type: "text/plain",
+            filename: Some("room-file.txt"),
+            asserted_at: ts(),
+        },
     )
     .await
-    .expect_err("a community drive is refused, never silently empty");
+    .expect("publish a file into the community room");
+    assert_eq!(
+        in_room.tier,
+        ciris_persist::federation::types::cohort_scope::CryptoTier::CommunityDek
+    );
+    let drive = ciris_edge::files::in_room(node_a.store.engine(), &room, &node_a.me, 10, None)
+        .await
+        .expect("a member lists the room's drive");
+    assert_eq!(
+        drive
+            .files
+            .iter()
+            .map(|f| f.filename.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("room-file.txt")],
+        "R10 (community): the room's file, and only the room's file"
+    );
+    assert!(drive.resume.is_none(), "one file, one page");
     assert!(
-        format!("{refused}").contains("CIRISPersist#893"),
-        "the refusal names what it waits on: {refused}"
+        ciris_edge::files::in_room(node_a.store.engine(), &alice_room, &node_a.me, 10, None)
+            .await
+            .expect("list")
+            .files
+            .iter()
+            .all(|f| f.filename.as_deref() != Some("room-file.txt")),
+        "the community file is not in alice's self drive: the gate keys on the row's room"
     );
 
     // The row B receives is the CROSSED one, not the authored local-tier copy.

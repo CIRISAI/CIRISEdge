@@ -1012,7 +1012,7 @@ pub struct EdgeMetrics {
     /// [`Self::apply_refusals_by_kind`] answers "how many Attestation applies
     /// were refused". After v38.2.0 that number silently mixes three
     /// different situations: a node mid-sync whose community roster has not
-    /// landed yet (self-healing, expected, `retry_after_community_roster`), a
+    /// landed yet (self-healing, expected, `retry_after_roster`), a
     /// peer pushing rows about third parties into a cohort plane
     /// (`third_party_row`, a policy verdict someone should read), and two
     /// authorities disagreeing about one `community_key_id`
