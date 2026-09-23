@@ -73,10 +73,10 @@ Tests: `scope_room` (4), `self_room` (6, the creator rule's contest and converge
 
 Ladder pair: **edge v29.5.0 + persist v46.3.1** (verify v16.1.0, leviculum v0.26.0+ciris.1).
 
-# v29.4.0 — a self row's pull asks the author's nodes (R4), and the projector names the self room and the family (R5)
+## Also in this cut — R4 and R5, the source rule and the projector (§6.2)
 
-**2026-09-22** (PR #654, CIRISEdge#646 §6.2 of `FSD/CONTENT_TRANSFER.md`). MINOR: additive API; pins
-unchanged (persist v46.3.1, verify v16.1.0); ABI constants unmoved.
+Developed as v29.4.0 and folded in here rather than tagged separately, so no release note describes a
+version nobody can consume.
 
 Before this cut a self/family row that reached the owner's second device stopped at the first rung
 it met: `BlobMeaning::project` refused it `GroupWithoutId` (it looked for a community id), and had
@@ -114,8 +114,6 @@ legacy node refuses by name. Plus `meaning::facets_646` (three), `store_gate::tr
 **What `mine_on_b` reads now:** on a legacy node `FetchFailed("NO scope address table")`; on a
 scope-native node `blob_group_not_installed { scope: self }` — R5, until the self room (§6.3) lands.
 Never `NoHolders`, never `GroupWithoutId`.
-
-Ladder pair: **edge v29.4.0 + persist v46.3.1** (verify v16.1.0, leviculum v0.26.0+ciris.1).
 
 # v29.3.1 — repin CIRISPersist v46.3.1: a claimed node reads its own config again
 
