@@ -68,7 +68,14 @@ pub struct SealRequest<'a> {
     /// `affiliations`, `family`, `self`. Edge names the scope; **persist
     /// resolves the tier** and writes it on the row.
     pub cohort_scope: &'a str,
-    /// The community whose DEK seals it. `None` for a commons write.
+    /// The group the write belongs to, in persist's own convention for the
+    /// slot: the community whose DEK seals it at `community` /
+    /// `affiliations`; the **owner's** key id at `self` (the
+    /// self-collective's identity, CC 3.3.6); the **family's** key id at
+    /// `family`. `None` for a commons write. Persist refuses a `self` /
+    /// `family` write without it, and the pointer carries it — which is how
+    /// `BlobMeaning::project` names the self room and the family group
+    /// (`FSD/CONTENT_TRANSFER.md` §6.2).
     pub community_key_id: Option<&'a str>,
     /// Who authored it — an AAD input.
     pub author_key_id: &'a str,

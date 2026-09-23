@@ -904,6 +904,12 @@ pub struct EdgeMetrics {
     /// and `no_chunk_source_wired`. The serve-side twin of `blob_route_refusals`;
     /// the withhold ledger carries the same events keyed coarser.
     pub blob_serve_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#646 — where a pull found its holders, by `scope:source`:
+    /// `self:author_nodes` / `family:author_nodes` (the row's author's nodes,
+    /// no discovery — CC 5.2) vs `community:claim_index` /
+    /// `federation:claim_index` (`list_holders`). The one line that proves a
+    /// self/family pull never touched the directory.
+    pub blob_pull_sources: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
     /// the live announce-intake map under **capacity backpressure** (the
     /// `MAX_PEERS` cap in `transport::reticulum`).
@@ -1179,6 +1185,11 @@ impl EdgeMetrics {
             .or_insert(0) += 1;
     }
 
+    /// CIRISEdge#646 — count one pull's holder source by its `scope:source` tag.
+    pub fn inc_blob_pull_source(&self, tag: &'static str) {
+        *self.blob_pull_sources.write().entry(tag).or_insert(0) += 1;
+    }
+
     /// CIRISEdge#640 — count one blob-route refusal by its branch tag.
     pub fn inc_blob_route_refusal(&self, reason_tag: &'static str) {
         *self
@@ -1411,6 +1422,12 @@ impl EdgeMetrics {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
+            blob_pull_sources: self
+                .blob_pull_sources
+                .read()
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
             blob_route_refusals: self
                 .blob_route_refusals
                 .read()
@@ -1474,6 +1491,8 @@ pub struct EdgeMetricsBundle {
     pub blob_route_refusals: HashMap<String, u64>,
     /// CIRISEdge#640 — `BlobChunkFetch`es received and not served, by branch.
     pub blob_serve_refusals: HashMap<String, u64>,
+    /// CIRISEdge#646 — where each pull found its holders, `scope:source`.
+    pub blob_pull_sources: HashMap<String, u64>,
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
     /// `unbound` / `not_applicable`). The door never drops.
     pub bootstrap_door_outcomes: HashMap<String, u64>,

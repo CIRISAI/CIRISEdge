@@ -1,5 +1,177 @@
 # CIRISEdge Release Notes
 
+# v29.5.0 — the self room's rule, one name for every room, and one door for a file at any cohort
+
+**2026-09-22** (PR #655, CIRISEdge#646 §6.3 + §9). MINOR: three new modules, no pin move
+(persist v46.3.1, verify v16.1.0), ABI constants unmoved, no behaviour change to any existing path.
+
+## `scope_room::ScopeRoom` — the names, once
+
+Three facts have to agree for a cohort's bytes to move: the scope the content names, the group id
+the content names, and the group id the lifecycle installs under. The last two are not the same
+string (a community's addresses live under `cohort:`), and when the router spelled one and the
+installer the other, every community holder read as not-in-group and every arrival as a group
+mismatch — silently, both sides (CIRISEdge#616/#619). That is a naming disagreement, so the fix is a
+single name: `ScopeRoom::{Community, SelfCollective, Family}` answers `scope()`,
+`content_group_id()`, `table_group_id()`, `cohort_target_field()`, `row_scope_token()` and
+`widen_to()`, and `blob_swarm::scope` and `cohort_addressing` now delegate to it. **The table's key
+is the pair `(CohortScope, group_id)`**, so the scope already discriminates and only communities
+carry a prefix — settled here rather than left to each caller.
+
+## `self_room` — the rule nobody could write twice
+
+A community room is created by a person inviting another. A self room must appear the moment an
+identity has a second device, with **no human act** — and if two devices each create one they derive
+different secrets and address each other at destinations nobody registered: correct by every local
+check, dark on the wire, the CIRISEdge#646 shape.
+
+- `roster(identity, lens)` — the directory's answer (`nodes_owned_by`, the same walk the send set's
+  node half uses). The MLS tree is what this node has converged to; the difference is the work.
+- `decide(own, roster, held, rival) -> SelfRoomAction` — **pure and total**: `Create` (the
+  canonical-first node, lowest key id), `PublishKeyPackage`, `Add`/`Remove` (the tree is driven
+  toward the directory in both directions), `Abandon{in_favour_of}`, `Idle`, `SoleDevice`,
+  `NotInRoster`. The host performs the IO the decision names — the same split `ScopeLifecycle`'s
+  verbs use, and what keeps two hosts from disagreeing about who creates.
+- **Concurrent creation is settled, not prevented.** In an unconverged directory two rooms appear;
+  preventing that needs a coordination round the substrate has no way to run. Settling it needs only
+  a total order, and `CommitClaim` already is one (earliest instant, ties on the lowest committer key
+  id — the CIRISEdge#604 rule one level up). Both nodes abandon the same room from either arrival
+  order, and a losing room is abandoned *before* it spends an epoch adding anyone.
+- `snapshot(group, identity)` — the lifecycle's install, keyed by the room. No person-to-node walk
+  and so no `unresolved` set: a self room's tree already holds nodes.
+- The bootstrap needs no room: KeyPackage, Welcome and Commit are ordinary `self`-placed rows, which
+  since v29.3.0 reach the owner's own nodes with no grant between them. Only the bytes need the room.
+
+## `files` — one door, any cohort
+
+A file is a row that cites bytes, and every piece already existed — but the composition differs per
+cohort in ways that are silent when wrong: a `self` row carries no cohort target while a `family` row
+must carry `family_key_id`; persist's group slot takes the community at `community` and the **owner**
+at `self`; a local-tier authored row replicates nowhere until it crosses. Get one wrong and you have
+a file that is correct on the writer's node and unreachable everywhere else.
+
+```rust
+files::publish(&*dir, &store, signers, &FileWrite {
+    room: &self_room::room(&owner),        // or ScopeRoom::community(room_id)
+    bytes, media_type, filename, asserted_at,
+}).await?;                                  // seals, authors (citing), crosses
+```
+
+Read side: `files::in_room(dir, room, limit)` is the drive listing (CIRISServer#615 §3) and
+`FileRow::open(store, viewer)` returns the bytes or an `UnopenedReason` — with **`NotFetched` as a
+first-class state**, which is what a drive shows as "on another device". Commons stays its own verb
+(`attestation_bind::publish`): this door takes a room, so it cannot be the thing that accidentally
+publishes a family photo.
+
+**The R4 witness now uses the door end to end** — `a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index`
+publishes through `files::publish` and pulls the **crossed** row, instead of the hand-rolled
+60-line producer it carried in v29.4.0. That the test could not have been written without hand-rolling
+one is what said the DX was missing.
+
+## Local vs crossed — written down (FSD §6.9)
+
+Two columns both say "self" and they answer different questions: `cohort_scope` says *who may hold
+it*, `tier` says *whether it is in the stream at all*. Persist's **E5 invariant** settles it
+structurally — `list_attestations_since` is `… AND tier = 'federation'`, so a local-tier row never
+appears in any federation stream — which means **a `self` row replicates iff it has crossed.** Every
+content producer authors at `(self, local)` and crosses; that is not a self-only rule (a community
+message authors at `(self, local)` too), the self room's only difference being that its crossing
+target is the owner's own devices. Consequences now stated rather than assumed: skipping the crossing
+is a lost file, not a local one; the drive lists crossed files only; and every device re-advertises
+the collective's rows, so B re-offers A's self rows to C rather than star-routing through the author.
+`PublishedFile::crossed` reports a crossing that PARKED awaiting an actor signature — authored,
+reaching nobody, recoverable — with a WARN, because `Ok` alone would read as shipped. Files over the
+1 MiB inline bound are refused by name (`FileError::TooLargeForInline`) naming the door they wait on.
+
+## The two persist asks, in context (FSD §6.7, §6.8)
+
+Written into the design rather than carried in conversation: **§6.7** the sealed chunk DAG for
+content above CC 2.6.1.3's 1 MiB envelope bound (CIRISPersist#821 Q1/Q2 → CIRISEdge#633) — until it
+lands the file door works at every cohort and only up to 1 MiB; **§6.8** a `cohort_scope` + dimension
+axis on `AttestationFilter` (CIRISEdge#352) so the drive read is a bounded query rather than a walk
+whose cost scales with everything else the node holds. §10 now separates what persist has **done**
+(the send set, the re-grant, `speaks_for`, the `family_key_id` carrier, the read-side self gate —
+none of which blocks self replication) from those two.
+
+## Review fixes (PR #654, six findings — all real)
+
+- **Revocation is never blocked by a bootstrap wait.** `decide` returns `Remove` before `Add`: an add
+  waits on the newcomer's KeyPackage row (another node, asynchronously) while a removal needs only
+  this node, so the old order let a late KeyPackage hold a **revoked device inside the tree**,
+  deriving every epoch that followed.
+- **`publish` refuses a seal readable by nobody.** An encrypted tier that resolves no grantable
+  occurrence produced a row that crossed and bytes that replicated and a permanent `NotGranted` for
+  everyone including the author — reported as success. Now `FileError::ReadableByNobody`, checked
+  before the row is authored; a PARTIAL loss is not refused (one member without content-KEM keys must
+  not block the rest) but is surfaced in `PublishedFile::excluded` and a WARN. The door's errors are
+  typed throughout (`FileError::{Seal, ReadableByNobody, Author, Cross, Row}`).
+- **The drive read pages to its limit.** `list_attestations_since` limits the GLOBAL plane before the
+  room filter runs, so on a busy node a drive showed too few files — or none — and files past the
+  first page were invisible *forever*, since every call restarted at the beginning. `in_room` now
+  walks the `(admitted_at, attestation_id)` cursor until `limit` matches or the plane is exhausted
+  (bounded at 64 pages).
+- **A self listing matches its identity.** `self` rows carry no cohort target, so the filter accepted
+  every self-scoped file — on any node holding more than one identity's rows (any server) that is one
+  person's file metadata in another's drive. Now matched on the pointer's group slot, which persist
+  fills with the owner at that tier (pinned by the e2e), and an unattributable row is skipped.
+- **The stall kind decides the retry.** `LadderStall::is_self_resolving()` — each arm answering its
+  own doc's promise — so a terminal stall no longer consumes the bounded retry ledger while reporting
+  "still waiting", and `DirectoryUnreadable` surfaces as `StoreFailed` (a broken local directory is
+  this node's fault, not the row's) instead of a holder-rung refusal.
+- **A self row that outruns its author's directory records is retried.** Its group id comes from the
+  author's identity, so "no group id" while the author is still converging is a wait, not a refusal —
+  the terminal `NoMeaning` left the blob unfetched forever after convergence, since nothing re-applies
+  the row. New `PullOutcome::AuthorUnresolved { attempts, retrying }`, distinct from both
+  `NoMeaning(GroupWithoutId)` (a row that names no group at all) and `NoOtherNode` (the rung below).
+
+Tests: `scope_room` (4), `self_room` (7, the creator rule's contest, convergence and revocation
+ordering), `files` (4), `contact::a_stall_says_whether_waiting_repairs_it`,
+17/17 blob e2e legs, `chat_message_federates` 29/29, clippy `-D warnings` on CI's three feature sets.
+
+Ladder pair: **edge v29.5.0 + persist v46.3.1** (verify v16.1.0, leviculum v0.26.0+ciris.1).
+
+## Also in this cut — R4 and R5, the source rule and the projector (§6.2)
+
+Developed as v29.4.0 and folded in here rather than tagged separately, so no release note describes a
+version nobody can consume.
+
+Before this cut a self/family row that reached the owner's second device stopped at the first rung
+it met: `BlobMeaning::project` refused it `GroupWithoutId` (it looked for a community id), and had
+it projected, `pull_one_inner` would have asked `list_holders` — which holds nothing for these
+tiers by construction (CC 5.2, persist I52) — and read `NoHolders`, the wrong rung.
+
+- **R5 — the group-id rule.** `BlobMeaning::project` reads the group, in order, from the pointer's
+  group slot (persist's own convention: the **owner's** key id at `self`, the **family's** at
+  `family`), then the envelope's cohort target through persist's `envelope_cohort_target` (four
+  aliases; `family_key_id` canonical, CIRISPersist#887; a disagreement is the new
+  `MeaningRefusal::GroupIdAmbiguous`), then for a `self` row the author's identity the puller
+  resolved (`project_with(row, sha, Some(identity))`). No new signed field.
+- **Two facets.** `BlobMeaning::key_plane()` — the pointer's group — beside `scope()`, the row's
+  placement (persist#878 applied to edge's gates). Holder source, the scope-address route and the
+  store gate's **trust** axis follow the key plane; audience, adopt disposition and announce follow
+  the placement. The one shape where they differ: the owner's own copy of a room message, placed
+  `self`, sealed under the room's DEK — a room member may hand it over, and it is reached on the
+  room's address, not a `self` table entry nobody installs.
+- **R4 — the source rule.** For an `InvisibleEncrypted` key plane the puller resolves the row's
+  author to the person and their nodes (`contact::resolve`, CC 4.4.3.2.4.1(b)) and asks those;
+  `list_holders` is never consulted. None resolved, or the directory not converged on the author, is
+  `PullOutcome::NoOtherNode { retrying }` — a device coming online is a retry. Counter
+  `blob_pull_sources{scope:source}` (`self:author_nodes` … `federation:claim_index`) in the metrics
+  snapshot and the PyO3 dict.
+- `store_gate::announce_is_possible` now asks persist's `suppresses_holds_bytes` (#646 ask 1).
+- #443: `multiplicity.rs` doc block reads CC-governed (ratified, CC 1.0-rc4 part 6) — no value change.
+
+**Witness:** `blob_federation_e2e::a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index`
+— alice's phone (a second device: own node key, alice's owner binding, alice's occurrence) pulls a
+file alice's first node sealed at the invisible tier: no holder claim exists anywhere, the source is
+the author's nodes, `OwnNode` clears the trust axis, and the pull reaches the router, which on a
+legacy node refuses by name. Plus `meaning::facets_646` (three), `store_gate::trust_is_asked_of_the_key_plane_and_announce_of_the_placement`,
+`pull::pull_source_tags_are_a_closed_set`. The e2e harness gains `device_of(owner, device)`.
+
+**What `mine_on_b` reads now:** on a legacy node `FetchFailed("NO scope address table")`; on a
+scope-native node `blob_group_not_installed { scope: self }` — R5, until the self room (§6.3) lands.
+Never `NoHolders`, never `GroupWithoutId`.
+
 # v29.3.1 — repin CIRISPersist v46.3.1: a claimed node reads its own config again
 
 **2026-09-22** (PR #653, CIRISEdge#652 / CIRISPersist#888 / CIRISServer#624). PATCH: a pin move only —

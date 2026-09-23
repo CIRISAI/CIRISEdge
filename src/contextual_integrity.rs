@@ -408,9 +408,12 @@ pub fn parameter_of_meaning_refusal(refusal: &MeaningRefusal) -> CiParameter {
         // a recipient gate must never default. Two variants because the
         // remedies differ (teach edge the scope vs. fix the producer),
         // one parameter because both leave the same question unanswered.
-        MeaningRefusal::UnknownScope { .. } | MeaningRefusal::GroupWithoutId { .. } => {
-            CiParameter::Recipient
-        }
+        // `GroupIdAmbiguous` sits with these: the row names its group twice
+        // and disagrees, so the recipient set is as unnameable as with no
+        // group at all (CIRISPersist#887).
+        MeaningRefusal::UnknownScope { .. }
+        | MeaningRefusal::GroupWithoutId { .. }
+        | MeaningRefusal::GroupIdAmbiguous { .. } => CiParameter::Recipient,
     }
 }
 

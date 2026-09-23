@@ -845,7 +845,9 @@ impl SwarmScheduler {
         let mut worst: Option<store_gate::SenderStanding> = None;
         let mut cleared: Option<store_gate::SenderStanding> = None;
         for h in holders {
-            let s = policy.sender_standing(h, meaning.scope()).await;
+            // Trust is asked of the KEY PLANE (CIRISEdge#646): the holder's
+            // standing is in the group that sealed the bytes.
+            let s = policy.sender_standing(h, &meaning.key_plane()).await;
             let authorised = store_gate::admit_blob_store(
                 meaning,
                 s,
@@ -1045,9 +1047,12 @@ impl SwarmScheduler {
         // scope-native" has one source of truth (see `Edge::blob_scope_router`).
         let scope_router = self.edge.blob_scope_router();
         let metrics = self.edge.metrics();
+        // The route follows the KEY PLANE (CIRISEdge#646): the bytes live on
+        // the derived address of the group that sealed them.
+        let key_plane = meaning.as_ref().map(meaning::BlobMeaning::key_plane);
         let routes = resolve_holder_routes(
             &scope_router,
-            meaning.as_ref().map(meaning::BlobMeaning::scope),
+            key_plane.as_ref(),
             &holders,
             &blob_hex,
             Some(&metrics),

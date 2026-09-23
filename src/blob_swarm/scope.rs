@@ -724,10 +724,11 @@ pub fn admit_blob_serve(
 /// arrival as a group mismatch on serve, and both refusals were silent.
 /// Family groups are installed under the id the content names.
 fn table_group_id(scope: &CohortScope, group_id: &str) -> String {
-    match scope {
-        CohortScope::Cohort { .. } => crate::cohort_addressing::group_id_for(group_id),
-        _ => group_id.to_owned(),
-    }
+    crate::scope_room::ScopeRoom::from_content_scope(&ContentScope::Group {
+        scope: scope.clone(),
+        group_id: group_id.to_owned(),
+    })
+    .map_or_else(|| group_id.to_owned(), |room| room.table_group_id())
 }
 
 #[cfg(test)]
