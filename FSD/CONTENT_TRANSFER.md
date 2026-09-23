@@ -475,12 +475,24 @@ invisible **permanently** rather than merely late. `files::in_room` therefore wa
 bounded at 64 pages so a drive listing cannot become an unbounded scan of a node holding millions of
 rows.
 
-That bound is a stopgap standing in for a query. `AttestationFilter` gained set-valued key axes in
-persist v30.9.0 but still has **no `cohort_scope` axis** (the verdict recorded at CIRISEdge#352), and
-none for the envelope's `dimension`. **The ask:** those two axes on the existing filter, composed with
-the existing resume pair, so a drive open is one bounded query instead of a walk whose cost scales
-with everything else the node holds. Nothing about the data model changes — both fields are already
-columns or indexed envelope members the write gate reads.
+That bound is a stopgap standing in for a query, and the gap is narrower than "persist cannot filter":
+
+- **`AttestationFilter` already carries the dimension axes** (`dimension_exact`, `dimension_prefixes`)
+  and `tier`, `window`, `lifecycle` and the key sets. What it has **no** axis for is **`cohort_scope`**
+  — the verdict recorded at CIRISEdge#352 — nor the cohort target. The sibling key filter already has
+  a `cohort_scope` field, so the axis is precedented, and the type is `#[non_exhaustive]` with every
+  field optional precisely so "a new query axis is a new optional field defaulting to today's
+  behavior" (its own doc).
+- **The filter and the resumable listing are different doors.** `list_scores` takes the filter and is
+  cursor-paged, but it seeks the V106 subject projection for the scores plane; the door edge lists a
+  drive through, `list_attestations_since`, takes a cursor and **no filter at all**.
+
+**The ask**, therefore, is one axis and one composition: `cohort_scope` (and, if it is cheap, the
+cohort target) on `AttestationFilter`, plus a cursor-paged filtered read over the attestation plane —
+either `list_attestations_since` gaining an optional filter, or a sibling of `list_scores` that is not
+subject-projection-bound. Persist owns which shape; edge needs only that one query answers *"this
+room's file rows, resumable"*. Nothing in the data model moves: `cohort_scope` is a column the write
+gate already reads.
 
 ## 7. Invariants — and the mutant each must kill
 
