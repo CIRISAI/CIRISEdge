@@ -199,8 +199,36 @@ Edge's rulings on both issues are posted: #893 was **(1): the row's room, per ar
 **room-gated everywhere**. For the second, CC 4.4.3.2.8 gives affiliations *"all the community
 machinery"*, makes `compartments[]` *"membership ⊆ roster"*, and handles public records by
 **promoting them to Commons** (`disclosure_posture: transparency-seeking`), never by reading
-`affiliations` broadly. The `✗` cells close in the order the ruling gives. persist's `Audience` gets
-its target first, since every other gate needs a room to key on.
+`affiliations` broadly. persist accepted the ruling and checked every row against its tree. The
+`✗` cells close in **CIRISPersist v47.0.0**, one MAJOR cut:
+
+- `Audience::Affiliations { community_key_id }`, with `from_cohort_scope` refusing the room-less form;
+- AV-45 moves `affiliations` to the membership arm (`NoCommunityMembership`);
+- the read gate moves it beside `community` on V150's column. No migration and no grammar change.
+  `sweep_widen` already passes the grant's target through, so a room-less `affiliations` grant is
+  skipped with a warning, the same way a room-less `community` grant already is.
+
+v46.5.0 (#893) ships first and unchanged. Edge follows the same order:
+
+| edge | persist | what changes |
+|---|---|---|
+| v30.1.0 | v46.5.0 | community/family drives open; edge's `affiliations` serve arm **fails closed** |
+| next | v47.0.0 | `With::Affiliations { community_key_id }` and `RoutesTo` likewise; the serve arm keys on `communities.contains(id)`, exactly like `Community` |
+
+The edge release after v30.1.0 is a MAJOR if a host has adopted v30.1.0 by then, since `With`
+changes shape. Otherwise it's a minor. Decide by grepping the hosts' pins at the time, not by
+the size of the diff.
+
+**The witness is shared, and it is the one the rule demands.** Use one `affiliations` row in
+affiliation A. Callers: a member of A; a member of *only* B, where the producer is also in B (the
+#893 trap, where a gate answers from the producer's rooms instead of the row's); and an
+unauthenticated caller. Every gate answers for every caller, and **the answer sets must be equal
+to each other**, not only to constants. That covers write, widen, hold, both read doors on all
+three backends, and, on edge's side, the serve arm.
+
+**Census before v47.0.0:** `SELECT count(*) FROM federation_attestations WHERE cohort_scope =
+'affiliations' AND cohort_target IS NULL` has to run on a real node. No in-org producer exists, so
+the expected answer is zero, but that should be checked, not assumed. CIRISServer runs it.
 
 **Adding a scope, or changing one, means filling a whole column of this table**, not one cell. A
 change that moves one gate and leaves the others alone is how both issues were introduced.
