@@ -130,12 +130,13 @@ pub enum FileError {
     #[error("build the file row: {0}")]
     Row(String),
     /// **Bigger than one envelope.** Content above CC 2.6.1.3's 1 MiB bound
-    /// must be a sealed chunk DAG (CC 5.3.3.1), and that door is not built
-    /// yet — `FSD/CONTENT_TRANSFER.md` §6.7, gated on CIRISPersist#821
-    /// Q1/Q2, tracked as CIRISEdge#633.
+    /// must be a sealed chunk DAG (CC 5.3.3.1), and **edge has not wired one
+    /// yet** — `FSD/CONTENT_TRANSFER.md` §6.7, tracked as CIRISEdge#633.
     ///
-    /// Named here rather than left to persist's string so the boundary is
-    /// stated where a caller meets it, with what it is waiting on.
+    /// Not an upstream dependency: persist's doors all exist at the version
+    /// edge pins (`put_blob_chunk_scoped` × N → `seal_stream_scoped`, read
+    /// by `read_blob_range_as`). Named here rather than left to persist's
+    /// argument error so the boundary is stated where a caller meets it.
     #[error(
         "{size} bytes exceeds the {cap}-byte inline bound (CC 2.6.1.3); files above it need the \
          sealed chunk DAG door, which is not built yet (CIRISEdge#633 / CIRISPersist#821)"
@@ -194,7 +195,9 @@ pub struct PublishedFile {
 ///
 /// Content above the 1 MiB inline bound is refused by name
 /// (`FileError::TooLargeForInline`): the chunk-DAG door it needs is not
-/// built (§6.7). Sealed-and-readable-by-nobody is **refused** (`FileError::ReadableByNobody`):
+/// built **on edge's side** — every persist door exists on the current pin
+/// (`put_blob_chunk_scoped` → `seal_stream_scoped`); wiring them is
+/// CIRISEdge#633. Sealed-and-readable-by-nobody is **refused** (`FileError::ReadableByNobody`):
 /// crossing bytes no party can open — the author's own second device
 /// included — is a success report for a permanent `NotGranted`. A PARTIAL
 /// loss is not refused (one member without content-KEM keys must not block
@@ -492,6 +495,26 @@ const LISTING_PAGE: u32 = 256;
 /// this one query; `AttestationFilter` has no such axis today
 /// (CIRISEdge#352), which is why the walk is here and bounded.
 ///
+/// # ⚠️ Caller gating is the HOST's, until CIRISPersist#891
+///
+/// This takes a room and returns that room's files. It does **not** ask
+/// whether the caller may see that room — `list_attestations_since` is
+/// persist's *replication* cursor and composes no §4.3 caller-visibility
+/// predicate, which is right for a replication door and wrong for a
+/// reader's. On a one-human node the distinction is invisible; on a shared
+/// device (two humans, one node — the shape CIRISPersist#873/#888 exist for)
+/// a caller that can name another person's identity can enumerate their file
+/// rows through this.
+///
+/// So a host exposing this over an API MUST check that the requester is
+/// entitled to `room` — for a self room, that the requester's principal IS
+/// that identity. Persist ships the gated reader door in v46.4.0
+/// (`cohort_scope` on `AttestationFilter` + the §4.3 gate composed in SQL);
+/// edge adopts it and this precondition goes away. Edge does not compose
+/// the gate here in the meantime because that would duplicate the predicate
+/// about to ship, and two spellings of a visibility rule is the failure this
+/// crate keeps removing.
+///
 /// # What counts as this room's file
 ///
 /// The dimension, the row's cohort scope, AND the room's identity — the
@@ -647,7 +670,8 @@ mod tests {
         assert!(text.contains("chunk DAG"), "{text}");
         assert!(
             text.contains("CIRISEdge#633"),
-            "names what it waits on: {text}"
+            "names the EDGE work it waits on — not an upstream dependency, since persist's \
+             chunk doors all exist on the pinned version: {text}"
         );
     }
 
