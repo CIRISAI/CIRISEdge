@@ -277,6 +277,12 @@ pub enum WithholdReason {
     /// #386 leg B — the trust-root walk itself errored. Same Exhibit C split as
     /// [`Self::ServeCapabilityReadError`]: transient, not a trust verdict.
     TrustRootWalkError,
+    /// CIRISEdge#659 — the recipient is ATTRIBUTED but not ROOTED: this node and
+    /// the peer hold no valid trust root in common through their owner-bindings
+    /// (`FSD/CIRIS_EDGE_TRANSPORT.md` §5.3). Nothing is served below Rooted; the
+    /// peer may still deliver. Not a read error: an unreadable directory is
+    /// [`Self::TrustRootWalkError`].
+    RecipientNotRooted,
     /// #396 item 6 — the DATA PRODUCER attached a `recipient_capability`
     /// restriction to its own `consent:replication:v1` grant covering this row's
     /// dimension, and the recipient does not hold that capability.
@@ -559,6 +565,7 @@ impl WithholdReason {
             Self::ServeCapabilityReadError => "serve_capability_read_error",
             Self::ServeCapabilityNotRooted => "serve_capability_not_rooted",
             Self::TrustRootWalkError => "trust_root_walk_error",
+            Self::RecipientNotRooted => "recipient_not_rooted",
             Self::RecipientCapabilityRestriction => "recipient_capability_restriction",
             Self::RowNotSerializable => "row_not_serializable",
             Self::RowHashUndecodable => "row_hash_undecodable",

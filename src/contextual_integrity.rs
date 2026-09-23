@@ -205,6 +205,12 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         // not reached". Carriage narrowed to the accord's own roster is
         // a recipient bound, not an information-type one: the dimension
         // is admitted, the audience is not.
+        // CIRISEdge#659 — the same commitment one level down: a peer that
+        // holds no VALID trust root in common with this node (through the
+        // owner-bindings) is outside the context; it may deliver, it is
+        // served nothing. A recipient bound, not an information-type one.
+        WithholdReason::RecipientNotRooted => CiParameter::Recipient,
+
         WithholdReason::AccordRelayRosterUnresolvable
         | WithholdReason::AccordRelaySignerNotSeated
         | WithholdReason::AccordRelayNoTrustEdge

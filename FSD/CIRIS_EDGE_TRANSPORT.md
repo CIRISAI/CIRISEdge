@@ -491,21 +491,35 @@ and the accord relay gate. Renaming that field is out of scope; the FSD calls it
 
 **Open, pending rulings (posted on CIRISEdge#659):**
 
-1. *"hardware-backed holder keys"* has no substrate field: CC 4.2.2's `hardware_class`
-   is unimplemented in persist; hardware is enforced only at admission of
-   `accord_holder`-typed keys (`HardwareAttestationPolicy`). Proposed: a valid root's
-   charter holders must be `accord_holder` keys — enforced by the door that already does,
-   no new field.
-2. The walk's first hop — the owner-binding — is written at cohort `self` and withheld
-   from non-owner nodes, so the receiver never holds it. Server is bringing a ruling on
-   whether the binding row or its `ownership:responsible_party:node:v1` projection
-   crosses. Edge recommends the **row**, on the bootstrap plane at federation tier: it is
-   what `owner_of` reads; a projection is a second spelling.
+1. **Resolved (2026-09-23): the PROPERTY, evaluated where the root is judged.** The
+   premise was wrong — CC 4.2.2's `hardware_class` rides inside the key record's
+   `attestation_evidence` (`PlatformAttestation`), gated by persist's
+   `HardwareAttestationPolicy` (Layer A: evidence present, canonical, accepted
+   `HardwareType`, nonce ≤ 24 h — today only for `accord_holder` rows) and by the server's
+   chain walk (Layer B, YubiKey PIV to Yubico's root). **The rule:** R is valid at N iff,
+   besides the existing legs, *every charter holder's key record carries evidence that
+   passes Layer A, and Layer B for any class N holds a pinned attestation root for* —
+   evaluated in `trust_root_valid` on N from N's records. **Persist ask** (filed): the
+   holder-hardware leg in `trust_root_valid`, and Layer A on replicated key records
+   regardless of type. Edge composes; nothing is re-derived here. Nonce freshness stays an
+   admission-time check (re-checking it at validity time would expire every real root a
+   day after its holders registered).
+2. **Resolved (2026-09-23, no new rule).** Announcing *is* the participation act: the
+   owner re-signs the node's owner-binding at `cohort_scope: federation`
+   (`promote_owner_binding_to_federation`), and the production canonical already holds
+   13 such rows — the row itself crosses, and it is the row `owner_of` reads. The defect
+   was which key it names: on a split install the announce promoted the **actor** key's
+   binding (13 of 13), never the node key's. Server fixes that (the announce promotes the
+   wire identity's binding; the boot move re-authors it at `federation`). Edge's walk
+   expects `delegates_to(owner → node_key, infra:*)` at `federation`, arriving with the
+   peer's Key / TransportDestination / IdentityOccurrence rows; `self` copies stay
+   withheld exactly as now.
 3. *"live lifecycle"* is read as *the charter rows are live* (drill freshness has been a
    signal, not a gate, since persist v23).
-4. Whether `trace:*` widens from *conferred* to *any Rooted peer*. Until ruled, the
-   `trace:*` gate keeps its stricter conferral ∧ trusted-root form (`peer_has_serve_capability`)
-   and Rooted is the **floor** below which nothing is served.
+4. **Resolved by the threat check (2026-09-23): it does not widen.** `Rooted` changes in
+   kind — from *conferral* (unforgeable) to *allegiance* (the peer's owner signed an
+   acceptance of a root we also accept; anyone can sign that). It is **standing**, never
+   authority or trust weight. See §5.4.1 invariant 1.
 
 The two coincide for every peer whose announce was APPLIED before its links —
 and the operator's ruling is that this must be every peer: *if we are linking, we
@@ -602,18 +616,43 @@ a row is what a link in that state can cause on this node, nothing more.
 |---|---|---|---|---|---|
 | **Unidentified** — no remote identity proven | drop, `#317` (transport identity is the precondition, not a default) | drop | no | none | `edge.rs::inbound_ingest_tests::bootstrap_carve_out_admits_only_self_authenticating_bootstrap_kinds` (link `None` ⇒ `None` for every kind); `bootstrap_carve_out_source_holds_over_all_kinds` (proptest); `reticulum.rs::bootstrap_door_636::summaries_and_non_bootstrap_kinds_name_nobody`; `identity_model::tests::no_identity_or_no_bindings_is_not_this_door` (no proven identity ⇒ the door has no job) |
 | **Identified, announce pending** — remote identity proven, binding not yet installed. *Transient; bounded by one announce verification; `link_before_binding` counts arrivals here and must read 0* | **the bootstrap door** (`#636`): the keys the Deliver names are resolved through `transport_binding_of`; a verified binding holding THIS link's transport identity ⇒ attributed to that key; else `Unbound` — delivered un-attributed, admitted on its own signature, **never dropped** | drop | no | none — the frame may CREATE the binding (via admission), it never assumes one | `reticulum.rs::bootstrap_door_636::a_link_is_attributed_through_the_stored_binding_never_the_record_pubkey`, `…::a_third_partys_record_on_an_unattributed_link_passes_unbound`, `…::a_record_pubkey_equal_to_the_link_half_attributes_nothing_by_itself`, proptest `…::attributed_iff_bootstrap_deliver_identified_and_bound`; `identity_model::tests::*` |
-| **Attributed** (`#659`) — `owns_key` ∧ hybrid transport binding stored (§5.2); *not yet* a valid root in common | attributed | **attributed and delivered** — persist's gates decide admission (AV-45/AV-84, `Strict` hybrid verify); this is how the allegiance rows cross | **no** — nothing is served below Rooted | Attributed | — *(CIRISEdge#659: a genesis-shaped, self-signed, split-installed, owned peer that no test root scrubs; `root_binding` on it must return `NotRootedAtSteward` as the precondition)* |
-| **Rooted** (`#659`) — Attributed ∧ a valid root in common through the owner-binding (§5.3) | attributed | attributed and delivered | **yes** — the E3 gate; `trace:*` additionally under `peer_has_serve_capability` (open ruling 4) | Rooted (computed, re-evaluated) | — *(CIRISEdge#659: the same peer, both sides accepting R; the reverse direction; withdrawn acceptance drops to Attributed on the next evaluation)* |
+| **Attributed** (`#659`) — `owns_key` ∧ hybrid transport binding stored (§5.2); *not yet* a valid root in common | attributed | **attributed and delivered** — persist's gates decide admission (AV-45/AV-84, `Strict` hybrid verify); this is how the allegiance rows cross | **no** — nothing is served below Rooted | Attributed | attribution half: `route_table_e2e::identified_link_from_an_advisory_key_owning_peer_is_attributed_659` (a real two-node link; B scrubbed by a steward outside the pinned anchor ⇒ `NotRootedAtSteward` ⇒ Advisory; attributed `Some(B)`); `mod.rs::source_key_id_tests::from_attributed_binding_admits_owns_key_and_only_owns_key`. Served-nothing half: `bridge.rs::an_attributed_but_unrooted_peer_in_the_send_set_is_served_nothing` (a consented, attributed peer with no root in common is served nothing and every withhold is booked `recipient_not_rooted`; the same row reaches the same peer once both subjects accept one valid root). The split-installed, owned, genesis-shaped first-contact ladder: — *(CIRISEdge#659 §4)* |
+| **Rooted** (`#659`) — Attributed ∧ a valid root in common through the owner-binding (§5.3) | attributed | attributed and delivered | **yes** — the E3 gate; `trace:*` additionally under `peer_has_serve_capability` (open ruling 4) | Rooted (computed, re-evaluated) | `bridge.rs::rooted_with_holds_only_for_a_valid_root_in_common_through_the_owners` (different roots → no; the same valid root through both owner-bindings → yes; withdrawn → no on the next evaluation; unowned stranger → no). End-to-end on a live link: — *(CIRISEdge#659 §4)* |
 | **ResolvedToSelf** — the answer is our own key (`#623`) | drop, `attribution_resolved_to_self` | drop | no | none; no responder is ever built for self | `reticulum.rs::initiator_attribution::a_self_entry_in_the_peers_map_resolves_to_self_not_to_a_peer`, `an_identified_entry_naming_us_is_self`, proptest `attribution_never_resolves_to_the_local_key_as_a_peer`; responder: `edge.rs::inbound_ingest_tests::a_bootstrap_frame_on_a_link_attributed_to_ourselves_builds_no_responder` |
 
 Two invariants the table encodes, and the proptest holds:
 
-1. **Nothing below `Rooted` is ever served.** Identified delivers only
-   self-authenticating bootstrap records; **Attributed delivers any kind and persist
-   decides admission, but is served nothing**; Rooted is served. Attribution ("who
-   sent this") and entitlement ("what may they be served") are two questions with two
-   answers, and `#659` is what fusing them cost: five days of a dark trace plane.
-   E3 stays — as the serve floor, no longer as the attribution gate.
+1. **Nothing below `Rooted` is ever served — and `Rooted` is never SUFFICIENT.** Identified
+   delivers only self-authenticating bootstrap records; **Attributed delivers any kind and
+   persist decides admission, but is served nothing**; Rooted is the *floor* for being
+   served. Because `Rooted` is allegiance (self-declarable), **no serve, score, vouch or
+   audience decision may take `Rooted` as sufficient; conferral or consent remains the
+   gate**: `trace:*` needs the recipient's `infra:serve` *conferred* by a root the sender
+   trusts (`capability_roots_to_trusted_root`, `has_accord_conferred_role`); trust
+   weighting (CC 4.4.3.8 Policy A) keys on the attester being pinned; audience keys on
+   consent and cohort rows. The old "stays strictly Rooted ∧ owns_key (E3)" wording is
+   retired for "attributed ∧ conferred". Attribution ("who sent this") and entitlement
+   ("what may they be served") are two questions with two answers, and `#659` is what
+   fusing them cost: five days of a dark trace plane.
+
+   Four more, from the same threat check (CIRISEdge#659):
+   - **Nothing durably Rooted.** Rooted is recomputed per sweep from persist rows
+     (`rooted_with`) and never written to the peers map or the durable binding store, so
+     a restart cannot reload a peer as Rooted whose owner has since withdrawn — the
+     invariant "a durable Rooted must carry its basis and be re-walked on load" holds by
+     construction. The durable store's `Rooted` is *conferral* and keeps its own rules.
+   - **No new bootstrap shape.** The owner-binding and the acceptance cross as ordinary
+     Attestation deliveries from an Attributed peer; persist refuses an unregistered
+     attester, so they are admitted only once the owner key has crossed, under the same
+     per-peer quota (AV-76) and the same bounds (`ANNOUNCE_QUEUE_DEPTH`, `MAX_PEERS`,
+     the deliver cap). The fake-peer cost rises by a bounded amount in the existing
+     AV-42 class; no new DoS class.
+   - **Unchanged and load-bearing:** `HijackRefused` (#337, keyed on conferral), the
+     `ResolvedToSelf` drop (#623), E2 proof-of-possession, the single-owner rule (actor
+     and node bindings name the same owner), persist's `accord:*` asymmetry.
+   - **The one widening is the point:** an attributed-but-unrooted peer's rows are now
+     *admitted* (persist verifies each) where the transport had been doing admission's
+     job by refusing everyone (CC 5.3.2.4.3.1, 3.4).
 2. **The bootstrap door opens on the link's proven transport identity resolved
    through a verified TransportBinding — never on a federation-pubkey compare,
    never on the attribution result, and never by dropping.** Keying the door on

@@ -243,7 +243,8 @@ impl EnvelopeKind {
     /// `put_identity_occurrence` + `put_signed_transport_destination`,
     /// `signer_acts_for`), so an un-attributed delivery is *verified* at the apply
     /// layer where verification belongs; each grants no trust and is served no
-    /// `trace:*` (that plane stays strictly `Rooted ∧ owns_key`-attributed).
+    /// `trace:*` (that plane is served only to an ATTRIBUTED ∧ CONFERRED recipient —
+    /// `peer_has_serve_capability`; CIRISEdge#659: Rooted is standing, never sufficient).
     /// Consentable/other-structural planes are NOT bootstrap kinds — the
     /// exemption is exactly these three, a deliberate compile-fenced edit to widen.
     #[must_use]
