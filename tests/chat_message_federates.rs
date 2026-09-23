@@ -2387,8 +2387,10 @@ async fn a_handshake_row_is_placed_in_the_room_it_names_not_a_derived_pair() {
         key_package_attestation, key_package_attestation_in, pair_community_key_id,
         welcome_attestation_in, FIELD_COMMUNITY_ID,
     };
+    use ciris_edge::scope_room::ScopeRoom;
     let author = signer("node-a", 0x21);
     let self_room = "alice-fed"; // a self room's group id IS the owner's key
+    let room = ScopeRoom::self_collective(self_room);
     let at = chrono::DateTime::from_timestamp(1_767_225_296, 0).expect("ts");
     let room_of = |a: &ciris_persist::federation::Attestation| {
         a.attestation_envelope
@@ -2397,7 +2399,7 @@ async fn a_handshake_row_is_placed_in_the_room_it_names_not_a_derived_pair() {
             .map(ToOwned::to_owned)
     };
 
-    let kp = key_package_attestation_in(&author, self_room, b"kp-bytes", at)
+    let kp = key_package_attestation_in(&author, &room, b"kp-bytes", at)
         .await
         .expect("key package into the named room");
     assert_eq!(room_of(&kp).as_deref(), Some(self_room));
@@ -2411,7 +2413,7 @@ async fn a_handshake_row_is_placed_in_the_room_it_names_not_a_derived_pair() {
     // A Welcome takes BOTH facts — the room it is placed in and the joiner it
     // is for. One parameter answered both only because a pair room IS its two
     // members; a room with three cannot express it that way.
-    let w = welcome_attestation_in(&author, self_room, "node-c", b"welcome", 7, at)
+    let w = welcome_attestation_in(&author, &room, "node-c", b"welcome", 7, at)
         .await
         .expect("welcome into the named room");
     assert_eq!(room_of(&w).as_deref(), Some(self_room));
@@ -2420,6 +2422,38 @@ async fn a_handshake_row_is_placed_in_the_room_it_names_not_a_derived_pair() {
             .expect("envelope")
             .contains("node-c"),
         "the joiner is named in the SIGNED envelope, so it can find its own Welcome"
+    );
+
+    // CIRISEdge#657 review — a FAMILY handshake names its room under the
+    // member persist's family arm writes and reads (`family_key_id`), not
+    // under `community_key_id`. Two spellings of one fact is what
+    // `ScopeRoom` exists to end, and a family bootstrap widened to
+    // `With::MyFamily` would otherwise carry the id under a member the
+    // family arm does not write.
+    let fam = ScopeRoom::family("fam-7");
+    let fam_kp = key_package_attestation_in(&author, &fam, b"kp-bytes", at)
+        .await
+        .expect("key package into the family room");
+    assert_eq!(
+        fam_kp
+            .attestation_envelope
+            .get("family_key_id")
+            .and_then(serde_json::Value::as_str),
+        Some("fam-7")
+    );
+    assert!(
+        fam_kp
+            .attestation_envelope
+            .get(FIELD_COMMUNITY_ID)
+            .is_none(),
+        "exactly one alias carries the room, so none can disagree with another: {:?}",
+        fam_kp.attestation_envelope
+    );
+    // And it is still findable by the one reader every lookup goes through.
+    assert_eq!(
+        ciris_persist::federation::admission::envelope_cohort_target(&fam_kp.attestation_envelope)
+            .expect("one alias, no conflict"),
+        Some("fam-7")
     );
 
     // The pair-era producers keep working, and keep deriving the pair.

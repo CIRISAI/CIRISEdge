@@ -504,6 +504,16 @@ impl FileRow {
 /// room does not own would otherwise make one listing walk for minutes.
 const MAX_LISTING_PAGES: usize = 64;
 
+/// The largest backing query [`in_room`] will issue at once.
+///
+/// `limit` is the CALLER's number and may be large or accidental; the
+/// backing page is edge's, and forwarding the former as the latter lets one
+/// call ask the substrate to materialize an arbitrary result set. The chunk
+/// is `min(still wanted, this)` — never more than is wanted, so the whole
+/// chunk is always consumed and the resume cursor stays exact, and never
+/// more than this, so no single query is unbounded.
+const MAX_BACKING_PAGE: usize = 256;
+
 /// One page of a drive listing.
 ///
 /// `resume` is the whole contract: **`None` means the room is exhausted**,
@@ -607,6 +617,11 @@ pub async fn in_room(
         if need == 0 {
             break;
         }
+        // Bounded BOTH ways: never more than is still wanted (so the page is
+        // consumed whole and `next_cursor` is exact), never more than edge's
+        // own page (so a huge `limit` cannot turn one call into an unbounded
+        // scan).
+        let chunk = need.min(MAX_BACKING_PAGE);
         let page = engine
             .list_attestations(
                 {
@@ -619,7 +634,7 @@ pub async fn in_room(
                     f
                 },
                 cursor,
-                i64::try_from(need).unwrap_or(i64::MAX),
+                i64::try_from(chunk).unwrap_or(i64::MAX),
                 scope.clone(),
             )
             .await
