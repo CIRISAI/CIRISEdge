@@ -15077,11 +15077,18 @@ pub(crate) mod tests {
         )
         .await;
         let in_affil = "att-352-in-affiliations";
+        // The room id is itself a registered key (as `chat-room` is in the
+        // owner-axis backend): persist checks `community_key_id` against
+        // `federation_keys` at `put_community`.
+        register_fixture_keys(backend, &[("aff-352", identity_type::AGENT)]).await;
+        // `other` founds it: a founder is a zero-hop moderator, and persist
+        // federates content keyed on a room only if the room has one
+        // (`CommunityHasNoModerator`).
+        let mut affiliation = fixture_community("aff-352", other);
+        affiliation.members[0].role =
+            Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_string());
         backend
-            .put_community(sign_community_fixture(
-                other,
-                fixture_community("aff-352", other),
-            ))
+            .put_community(sign_community_fixture(other, affiliation))
             .await
             .expect("seed the affiliation's roster");
         let mut affil_row = identity_scores(in_affil, other);
@@ -15176,10 +15183,13 @@ pub(crate) mod tests {
         let publish_set = vec![node.to_string()];
         let selector: CohortProvider = Arc::new(move || publish_set.clone());
         let bridge = bridge.with_self_provider(Some(selector));
-        for key_id in [node, other] {
+        // `other` is a USER: it sits on the affiliation roster row 2 names,
+        // and persist admits an agent to a community only under a steward
+        // (`UnstewardedCommunityMember`).
+        for (key_id, kind) in [(node, identity_type::AGENT), (other, identity_type::USER)] {
             backend
                 .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(key_id, identity_type::AGENT),
+                    record: fixture_key_record(key_id, kind),
                 })
                 .await
                 .expect("seed key");
