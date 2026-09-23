@@ -493,10 +493,15 @@ rather than merely late.
 (V056, a partial index on non-`federation` scopes) — and edge v29.6.0 consumes it:
 
 ```rust
-files::in_room(engine, &room, caller_occurrence_key_id, limit)
+files::in_room(engine, &room, caller_occurrence_key_id, limit, after) -> DrivePage
 // → AttestationFilter { cohort_scope, dimension_exact: FILE_DIMENSION }
 //   on Engine::list_attestations, newest-first, cursor-paged
 ```
+
+`DrivePage { files, resume }` makes a partial answer representable: **`resume: None` means the room
+is exhausted**, anything else means there is more. The room-identity predicate (`belongs_to`) runs
+after the gate and can drop rows, so a page that yielded nothing for this room is not evidence the
+room is empty — and a caller cannot branch on a log line.
 
 Two properties come from the substrate rather than from edge remembering:
 

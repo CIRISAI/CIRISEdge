@@ -494,23 +494,39 @@ impl FileRow {
     }
 }
 
-/// Slack on the drive query's page budget, over the pages `limit` itself
-/// needs. Covers rows the gate admits that are not THIS room's (a caller
-/// with more than one self room), so a listing can still reach its limit
-/// after some are dropped by [`belongs_to`].
+/// Pages of work [`in_room`] will do beyond the ones `limit` itself needs,
+/// covering rows the gate admits that are not THIS room's.
 ///
-/// The budget SCALES with `limit` (see [`in_room`]) rather than being a
-/// fixed ceiling: a fixed one silently truncates any limit above
-/// `ceiling × page`, which would contradict the property this query was
-/// adopted for — that the limit bounds the answer and not the plane.
+/// It is a work bound, **not** a correctness one: exhausting it is reported
+/// in [`DrivePage::resume`], never swallowed. An earlier version had only a
+/// fixed ceiling and a WARN, which meant a caller admitted to more than one
+/// self room could get a short list with no way to know — a log line is not
+/// a return value.
 const LISTING_PAGE_SLACK: usize = 8;
 
 /// The page size [`in_room`] asks the drive query for. `usize` because the
 /// budget arithmetic is in rows; widened to the door's `i64` at the call.
 const LISTING_PAGE: usize = 256;
 
+/// One page of a drive listing.
+///
+/// `resume` is the whole contract: **`None` means the room is exhausted**,
+/// and anything else means there is more — whether the walk stopped because
+/// `limit` was reached or because it spent its page budget. A caller that
+/// wants everything loops until `resume` is `None`; a caller that wanted one
+/// screenful ignores it. Neither can mistake a short page for a small drive,
+/// which a bare `Vec` could not express.
+#[derive(Debug, Clone)]
+#[must_use = "a drive page may be partial — check `resume` before treating it as the whole room"]
+pub struct DrivePage {
+    /// The files, newest first.
+    pub files: Vec<FileRow>,
+    /// Where to continue from, or `None` when nothing is left.
+    pub resume: Option<ciris_persist::ceg::AttestationCursor>,
+}
+
 /// **The drive read** — up to `limit` of this room's file rows, newest
-/// first (CIRISServer#615 §3).
+/// first, resumable (CIRISServer#615 §3).
 ///
 /// Runs on persist's **gated** reader door (`Engine::list_attestations`,
 /// CIRISPersist#891 / v46.4.0): the `cohort_scope` and `dimension_exact`
@@ -530,6 +546,9 @@ const LISTING_PAGE: usize = 256;
 ///
 /// The filter can never WIDEN: persist composes the gate after it, so a
 /// filter naming a room the caller is not in returns nothing (their I142).
+///
+/// Pass `after: None` for the newest page, then feed back
+/// [`DrivePage::resume`] until it is `None`.
 ///
 /// # Targeted rooms are refused until CIRISPersist#893
 ///
@@ -552,7 +571,8 @@ pub async fn in_room(
     room: &ScopeRoom,
     caller_occurrence_key_id: &str,
     limit: usize,
-) -> Result<Vec<FileRow>, FileError> {
+    after: Option<ciris_persist::ceg::AttestationCursor>,
+) -> Result<DrivePage, FileError> {
     use ciris_persist::ceg::AttestationFilter;
     use ciris_persist::scope::CallerScope;
 
@@ -571,18 +591,16 @@ pub async fn in_room(
         })?;
     let scope = CallerScope::Authenticated { admission };
 
-    let mut out: Vec<FileRow> = Vec::new();
-    let mut cursor = None;
+    let mut files: Vec<FileRow> = Vec::new();
+    let mut cursor = after;
     // Bounded by what was ASKED FOR, plus slack for rows the gate admits
-    // that are not this room's — never by a constant, which would cap the
-    // answer below a larger limit and call it done.
+    // that are not this room's. Hitting it is not silent: whatever is left
+    // rides back in `resume`.
     let budget = (limit / LISTING_PAGE)
         .saturating_add(1)
         .saturating_add(LISTING_PAGE_SLACK);
-    let mut pages = 0usize;
-    while pages < budget {
-        pages += 1;
-        if out.len() >= limit {
+    for _ in 0..budget {
+        if files.len() >= limit {
             break;
         }
         let page = engine
@@ -606,14 +624,14 @@ pub async fn in_room(
                 detail: e.to_string(),
             })?;
         for row in &page.items {
-            if out.len() >= limit {
+            if files.len() >= limit {
                 break;
             }
             // The gate answered "may this caller see it"; this answers "is it
             // THIS room's" — the pointer's owner slot for a self room. Kept
             // after the gate rather than trusted instead of it.
             if let Some(file) = belongs_to(room, row) {
-                out.push(file);
+                files.push(file);
             }
         }
         cursor = page.next_cursor;
@@ -621,21 +639,10 @@ pub async fn in_room(
             break;
         }
     }
-    // Reached only if the cursor kept producing pages that yielded almost
-    // nothing for this room — a pathological shape, not an ordinary drive.
-    // Said out loud: a short list that is silently short is the failure this
-    // query was adopted to remove.
-    if out.len() < limit && cursor.is_some() {
-        tracing::warn!(
-            room = %room,
-            returned = out.len(),
-            limit,
-            pages,
-            "drive listing stopped on its page budget with rows still unread — the answer is \
-             SHORT, not complete (CIRISEdge#646)"
-        );
-    }
-    Ok(out)
+    Ok(DrivePage {
+        files,
+        resume: cursor,
+    })
 }
 
 /// Is `row` one of `room`'s files? See [`in_room`] for why the identity
@@ -707,6 +714,38 @@ mod tests {
         ))
         .is_none());
         assert!(FileRow::from_row(&row_with(FILE_DIMENSION, serde_json::json!({}))).is_none());
+    }
+
+    /// CIRISEdge#657 review — a short page is a VALUE, not a log line.
+    ///
+    /// `belongs_to` drops rows the gate admitted that are not this room's,
+    /// so a caller admitted to more than one self room can spend the page
+    /// budget on the other room's newer rows before reaching this room's
+    /// older ones. That is legitimate; returning a short `Vec` and warning
+    /// about it is not, because a caller cannot branch on a WARN. `resume`
+    /// makes the two cases distinguishable in the type.
+    #[test]
+    fn a_drive_page_says_whether_the_room_is_exhausted() {
+        let exhausted = DrivePage {
+            files: vec![],
+            resume: None,
+        };
+        assert!(
+            exhausted.resume.is_none(),
+            "no files AND nothing left = the room really is empty"
+        );
+        // The shape a caller must be able to tell apart from the above: a
+        // page that yielded nothing for THIS room but has not reached the
+        // end — loop, do not conclude "empty".
+        let more = DrivePage {
+            files: vec![],
+            resume: Some(ciris_persist::ceg::AttestationCursor {
+                version: "v1".into(),
+                last_asserted_at: chrono::DateTime::from_timestamp(1_767_225_296, 0).expect("ts"),
+                last_attestation_id: "file-abc".into(),
+            }),
+        };
+        assert!(more.resume.is_some());
     }
 
     /// §6.9 — the two columns that both say "self". A drive listing reads

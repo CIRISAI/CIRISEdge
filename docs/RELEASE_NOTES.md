@@ -15,7 +15,7 @@ unchanged.
 
 | was | is |
 |---|---|
-| `files::in_room(dir, &room, limit) -> Result<_, String>` | `files::in_room(engine, &room, caller_occurrence_key_id, limit) -> Result<_, FileError>` |
+| `files::in_room(dir, &room, limit) -> Result<Vec<FileRow>, String>` | `files::in_room(engine, &room, caller_occurrence_key_id, limit, after) -> Result<DrivePage, FileError>` |
 
 `FileError` gains `Drive`, `DriveGateUnavailable` and `TooLargeForInline`; it is not
 `#[non_exhaustive]`, so an exhaustive match needs the new arms.
@@ -92,10 +92,20 @@ The pair-deriving producers stay, as wrappers, so every current caller compiles.
 
 ## Review fixes (PR #657)
 
-- **The page budget scales with `limit`.** A fixed 64-page ceiling silently returned only the newest
-  16,384 rows for any larger limit — contradicting the property the gated query was adopted for, that
-  the limit bounds the answer and not the plane. The budget is now derived from `limit`, and a listing
-  that stops on it with rows still unread says so (WARN) rather than looking complete.
+- **A short page is a value, not a log line** (two rounds of review, and the second was the one that
+  mattered). The first fix replaced a fixed 64-page ceiling — which silently returned the newest
+  16,384 rows for any larger limit — with a budget derived from `limit` plus fixed slack, and a WARN
+  when it was spent. That is still wrong, because **a caller cannot branch on a WARN**: `belongs_to`
+  drops rows the gate admitted that are not this room's, so a caller admitted to more than one self
+  room can spend the budget on another room's newer rows and get a short `Ok` back with no way to
+  tell it from a small drive.
+
+  `in_room` now returns **`DrivePage { files, resume }`**. `resume` is the contract: **`None` means
+  the room is exhausted**, anything else means there is more — whether the walk stopped at `limit` or
+  at its budget. A caller wanting everything loops until it is `None`; one wanting a screenful ignores
+  it; neither can mistake a short page for a small drive. `after` takes the cursor back, so the drive
+  paginates. The page budget stays as a bound on work per call, and is no longer load-bearing for
+  correctness.
 
 Witness: `a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index` reads the drive back
 through the gated door, gets nothing for a stranger's room, and is refused by name for a community

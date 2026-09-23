@@ -2146,13 +2146,23 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
     // Persist's GATED drive query (CIRISPersist#891, v46.4.0): the
     // cohort_scope + dimension axes select server-side and the §4.3
     // caller-visibility predicate runs in the same statement.
-    let drive = ciris_edge::files::in_room(node_a.store.engine(), &alice_room, &node_a.me, 10)
-        .await
-        .expect("list alice's drive");
-    assert_eq!(drive.len(), 1, "alice's drive holds the file she wrote");
-    assert_eq!(drive[0].filename.as_deref(), Some("my-file.txt"));
+    let drive =
+        ciris_edge::files::in_room(node_a.store.engine(), &alice_room, &node_a.me, 10, None)
+            .await
+            .expect("list alice's drive");
     assert_eq!(
-        drive[0].pointer.content_sha256,
+        drive.files.len(),
+        1,
+        "alice's drive holds the file she wrote"
+    );
+    assert!(
+        drive.resume.is_none(),
+        "the room is exhausted, and a caller can tell — a short page is never \
+         mistaken for a small drive"
+    );
+    assert_eq!(drive.files[0].filename.as_deref(), Some("my-file.txt"));
+    assert_eq!(
+        drive.files[0].pointer.content_sha256,
         published.pointer.content_sha256
     );
     assert!(
@@ -2160,10 +2170,12 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
             node_a.store.engine(),
             &ciris_edge::self_room::room("someone-else-fed"),
             &node_a.me,
-            10
+            10,
+            None
         )
         .await
         .expect("list a stranger's drive")
+        .files
         .is_empty(),
         "one identity's self rows never appear in another's drive"
     );
@@ -2175,6 +2187,7 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         &ciris_edge::scope_room::ScopeRoom::community("room-1"),
         &node_a.me,
         10,
+        None,
     )
     .await
     .expect_err("a community drive is refused, never silently empty");
