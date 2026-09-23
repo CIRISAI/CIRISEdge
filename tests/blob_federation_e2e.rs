@@ -2132,6 +2132,12 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         .try_into()
         .expect("32 bytes");
 
+    assert!(
+        published.crossed,
+        "a node's own self file crosses on ProducerAuthority — uncrossed means local-tier, \
+         which persist's E5 invariant keeps out of every federation stream (FSD §6.9)"
+    );
+
     // THE DRIVE READ (CIRISServer#615 §3): the file A just wrote is in
     // alice's drive, and in nobody else's. The self listing matches on the
     // POINTER's group slot, so this also pins persist's convention that a

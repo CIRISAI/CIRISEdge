@@ -129,6 +129,23 @@ pub enum FileError {
     /// The row was built but could not be signed or canonicalized.
     #[error("build the file row: {0}")]
     Row(String),
+    /// **Bigger than one envelope.** Content above CC 2.6.1.3's 1 MiB bound
+    /// must be a sealed chunk DAG (CC 5.3.3.1), and that door is not built
+    /// yet — `FSD/CONTENT_TRANSFER.md` §6.7, gated on CIRISPersist#821
+    /// Q1/Q2, tracked as CIRISEdge#633.
+    ///
+    /// Named here rather than left to persist's string so the boundary is
+    /// stated where a caller meets it, with what it is waiting on.
+    #[error(
+        "{size} bytes exceeds the {cap}-byte inline bound (CC 2.6.1.3); files above it need the \
+         sealed chunk DAG door, which is not built yet (CIRISEdge#633 / CIRISPersist#821)"
+    )]
+    TooLargeForInline {
+        /// The file's size.
+        size: usize,
+        /// The inline bound (persist's `DEFAULT_INLINE_BYTES_CAP`).
+        cap: usize,
+    },
 }
 
 /// What [`publish`] did.
@@ -145,6 +162,14 @@ pub struct PublishedFile {
     /// Occurrence key ids that hold a grant — who can open it. Empty for
     /// commons-tier content, which needs none.
     pub granted: Vec<String>,
+    /// Whether the crossing actually placed the row (`Shared::Placed` /
+    /// `AlreadyThere`). `false` means it PARKED awaiting the actor's
+    /// signature: the file is authored locally and has reached nobody — it
+    /// is not in the federation stream, so it is invisible to every other
+    /// device AND to [`in_room`] until the actor signs. Recoverable, not a
+    /// failure, which is why it is a field and not an error; but a caller
+    /// that never reads it would believe the file shipped.
+    pub crossed: bool,
     /// Occurrence key ids persist excluded **fail-secure** for carrying no
     /// usable encryption keys. Non-empty means a PARTIAL readability loss:
     /// the file crossed, and those parties cannot open it. Surfaced rather
@@ -167,7 +192,9 @@ pub struct PublishedFile {
 ///    replicates nowhere until it crosses, so skipping this is precisely
 ///    "correct here, invisible everywhere else".
 ///
-/// Sealed-and-readable-by-nobody is **refused** (`FileError::ReadableByNobody`):
+/// Content above the 1 MiB inline bound is refused by name
+/// (`FileError::TooLargeForInline`): the chunk-DAG door it needs is not
+/// built (§6.7). Sealed-and-readable-by-nobody is **refused** (`FileError::ReadableByNobody`):
 /// crossing bytes no party can open — the author's own second device
 /// included — is a success report for a permanent `NotGranted`. A PARTIAL
 /// loss is not refused (one member without content-KEM keys must not block
@@ -183,6 +210,15 @@ pub async fn publish(
     signers: Signers<'_>,
     write: &FileWrite<'_>,
 ) -> Result<PublishedFile, FileError> {
+    // The inline bound, checked here so the refusal names the door that is
+    // missing rather than surfacing as persist's argument error (§6.7).
+    let cap = ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP;
+    if write.bytes.len() > cap {
+        return Err(FileError::TooLargeForInline {
+            size: write.bytes.len(),
+            cap,
+        });
+    }
     let author_key_id = signers.node.key_id.clone();
     // Persist's group slot per cohort: the community at `community`, the
     // OWNER at `self`, the family at `family` — which is exactly the id the
@@ -248,11 +284,29 @@ pub async fn publish(
         detail: e,
     })?;
 
+    let crossed = matches!(
+        crossing.shared,
+        Shared::Placed { .. } | Shared::AlreadyThere { .. }
+    );
+    if !crossed {
+        // E5: a local-tier row is excluded from the federation stream, so a
+        // parked crossing means this file has reached NOBODY — not the
+        // owner's other devices, not this node's own drive listing.
+        tracing::warn!(
+            room = %write.room,
+            attestation_id = %row.attestation_id,
+            shared = ?crossing.shared,
+            "file authored but NOT crossed — it is local-tier, so it is in no federation \
+             stream and no drive until the actor signs (FSD/CONTENT_TRANSFER.md §6.9)"
+        );
+    }
+
     Ok(PublishedFile {
         row,
         pointer: sealed.pointer,
         tier: sealed.tier,
         shared: crossing.shared,
+        crossed,
         granted: sealed.granted,
         excluded: sealed.excluded,
     })
@@ -555,6 +609,46 @@ mod tests {
         ))
         .is_none());
         assert!(FileRow::from_row(&row_with(FILE_DIMENSION, serde_json::json!({}))).is_none());
+    }
+
+    /// §6.9 — the two columns that both say "self". A drive listing reads
+    /// the federation stream, which persist's E5 invariant excludes
+    /// local-tier rows from, so `belongs_to` never needs a tier check: an
+    /// authored row cannot reach it. Pinned so a future listing that reads
+    /// a different source remembers to exclude them itself.
+    #[test]
+    fn an_authored_row_and_a_crossed_row_are_the_same_shape_to_the_listing() {
+        let sha = "ee".repeat(32);
+        let authored = row_with(
+            FILE_DIMENSION,
+            serde_json::json!({ crate::chat::FIELD_CONTENT: pointer(&sha) }),
+        );
+        assert_eq!(
+            authored.tier,
+            ciris_persist::federation::types::attestation_tier::FEDERATION,
+            "fixture note: `bare_row` is federation-tier, so this asserts the SHAPE match only"
+        );
+        let room = ScopeRoom::self_collective("alice-fed");
+        assert!(
+            belongs_to(&room, &authored).is_some(),
+            "the listing matches on room facts, never on tier — the federation stream has \
+             already excluded local-tier rows before this predicate runs (E5)"
+        );
+    }
+
+    /// §6.7 — the boundary a caller meets is named at the door, with what
+    /// it waits on, rather than surfacing as an argument error from a layer
+    /// the caller never called.
+    #[test]
+    fn a_file_over_the_inline_bound_is_refused_by_name() {
+        let cap = ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP;
+        let err = FileError::TooLargeForInline { size: cap + 1, cap };
+        let text = err.to_string();
+        assert!(text.contains("chunk DAG"), "{text}");
+        assert!(
+            text.contains("CIRISEdge#633"),
+            "names what it waits on: {text}"
+        );
     }
 
     /// CIRISEdge#646 review — a self listing must name ITS identity. A node

@@ -68,6 +68,31 @@ publishes through `files::publish` and pulls the **crossed** row, instead of the
 60-line producer it carried in v29.4.0. That the test could not have been written without hand-rolling
 one is what said the DX was missing.
 
+## Local vs crossed — written down (FSD §6.9)
+
+Two columns both say "self" and they answer different questions: `cohort_scope` says *who may hold
+it*, `tier` says *whether it is in the stream at all*. Persist's **E5 invariant** settles it
+structurally — `list_attestations_since` is `… AND tier = 'federation'`, so a local-tier row never
+appears in any federation stream — which means **a `self` row replicates iff it has crossed.** Every
+content producer authors at `(self, local)` and crosses; that is not a self-only rule (a community
+message authors at `(self, local)` too), the self room's only difference being that its crossing
+target is the owner's own devices. Consequences now stated rather than assumed: skipping the crossing
+is a lost file, not a local one; the drive lists crossed files only; and every device re-advertises
+the collective's rows, so B re-offers A's self rows to C rather than star-routing through the author.
+`PublishedFile::crossed` reports a crossing that PARKED awaiting an actor signature — authored,
+reaching nobody, recoverable — with a WARN, because `Ok` alone would read as shipped. Files over the
+1 MiB inline bound are refused by name (`FileError::TooLargeForInline`) naming the door they wait on.
+
+## The two persist asks, in context (FSD §6.7, §6.8)
+
+Written into the design rather than carried in conversation: **§6.7** the sealed chunk DAG for
+content above CC 2.6.1.3's 1 MiB envelope bound (CIRISPersist#821 Q1/Q2 → CIRISEdge#633) — until it
+lands the file door works at every cohort and only up to 1 MiB; **§6.8** a `cohort_scope` + dimension
+axis on `AttestationFilter` (CIRISEdge#352) so the drive read is a bounded query rather than a walk
+whose cost scales with everything else the node holds. §10 now separates what persist has **done**
+(the send set, the re-grant, `speaks_for`, the `family_key_id` carrier, the read-side self gate —
+none of which blocks self replication) from those two.
+
 ## Review fixes (PR #654, six findings — all real)
 
 - **Revocation is never blocked by a bootstrap wait.** `decide` returns `Remove` before `Add`: an add
