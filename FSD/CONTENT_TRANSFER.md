@@ -1,11 +1,17 @@
 # FSD: Content transfer at every cohort — rows, keys, bytes, addressing: the state table under the link-state table
 
 **Status:** Normative for edge; proposed to persist and server. Community and commons rows are
-DONE (edge v29.1.0 / persist v46.1.0, proven on CIRISServer#612's ladder 2026-09-21). Self and
-family rows are the open work (CIRISPersist#884 / CIRISEdge#646).
+DONE (edge v29.1.0 / persist v46.1.0, proven on CIRISServer#612's ladder 2026-09-21).
+**Self rows are DONE end to end** as of edge v30.0.0 / persist v46.4.0 — R2–R5 and R10 all have
+witnesses, and CIRISServer 0.5.215's `selffiles` ladder reads `mine_on_b=1` (a file published on one
+device, listed on the owner's other). What remains for self BYTES (`opened_on_b`) is the host-side
+room driver, which is the server's (CIRISServer#622/#626), and files above 1 MiB (§6.7, CIRISEdge#633).
+**Family is the open cohort**: the machinery is shared and the rungs are specified, but its roster
+function, its trigger and its witnesses are unbuilt, and a family DRIVE additionally waits on
+CIRISPersist#893 (§6.8.1). Commons files are a separate verb by design (§6.7).
 **Author:** Eric Moore (CIRIS Team) with Claude Fable 5.1
-**Created:** 2026-09-22 · **Revised:** 2026-09-22 (PR #647 review: nine findings, each verified
-against code and CC before the text moved — see the §13 changelog)
+**Created:** 2026-09-22 · **Revised:** 2026-09-23 (edge v30.0.0; see the §13 changelog — every
+revision since has come from a review finding checked against the pinned tree before the text moved)
 **Owner spec:** CIRISEdge (the integrating side, as for `CIRIS_EDGE_TRANSPORT.md`); persist owns
 the substrate rules it cites, the Constitution owns the rulings.
 **Companions:**
@@ -124,7 +130,7 @@ row, always; `tier` / `community_key_id` / `epoch` from the pointer; the floor b
 | **holder discovery** | **none** (CC 5.2) | **none** (CC 5.2) | `holds_bytes` at community visibility, 24 h TTL (CC 5.3.2.1) | `holds_bytes`, plaintext provenance |
 | **holder set** | **known by construction**: the author's nodes (`contact::resolve(author_key_id).nodes` — the sealing node is among them; on the content axis author = minter by admission rule) | the author's nodes, as self; the family's other nodes only opportunistically | `list_holders` (+ `list_holders_sized`, v45) | `list_holders` |
 | byte movement | **delivery**: addressed fetch from the author's nodes; push-on-write optional | delivery, as self | discovery + swarm pull (`BlobPuller`, up to 2 holders) | discovery + swarm pull |
-| **file shape** (§6.7) | inline ≤ 1 MiB (CC 2.6.1.3), else a sealed **chunk DAG** (CC 5.3.3.1) — **the DAG door is not built: CIRISPersist#821 Q1/Q2, CIRISEdge#633** | same | same | same |
+| **file shape** (§6.7) | inline ≤ 1 MiB (CC 2.6.1.3), else a sealed **chunk DAG** (CC 5.3.3.1) — persist's doors all exist; **edge wires none: CIRISEdge#633**, unblocked | same | same | same |
 | addressing (CC 5.4.6) | `SelfOnly` group whose members are the identity's **nodes** — the **self room**, a per-identity MLS group with a specified bootstrap (§6.3); group id = the identity (`identity_key_id`, CC 3.3.6) | `Family` group of the members' nodes; group id = `family_id` (CC 5.2) | `Cohort` group from the room's MLS exporter (`cohort_addressing`) | federation address (no group, no table) |
 | serve gate (edge `admit_blob_serve`) | arrival `SelfOnly` (same group) ∧ requester `OwnNode` | arrival `Family` (same group) ∧ requester member | arrival same `Cohort` group; `chunk_scope` answered | any arrival (`allows_recipient_scope(Public, _)`) |
 | adopt gate (persist `would_hold`) | `is_audience` self arm: principal equality | family arm: roster | community arm: active member of the named community | commons: allowlist |
@@ -337,11 +343,21 @@ disagreeing about who creates:
 | not in the directory's roster | `NotInRoster` | fix the owner binding; never derive |
 | roster is just me | `SoleDevice` | nothing; it ends when a second device announces |
 | no room, I am canonical-first (lowest key id) | `Create` | `CohortGroup::create`, stamp the `CommitClaim` |
-| no room, someone else is first (or a rival room is known) | `PublishKeyPackage` | publish a KeyPackage row at `self` |
-| hold the room, directory has devices the tree lacks | `Add(nodes)` | `add_member` per published KeyPackage → Commit + Welcome rows |
+| no room, someone else is first (or a rival room is known) | `PublishKeyPackage` | `chat::key_package_attestation_in(signer, &room, &kp, now)` → cross with `room.widen_to()` |
+| hold the room, directory has devices the tree lacks | `Add(nodes)` | `chat::key_package_from` to collect, `add_member`, then `chat::commit_attestation_in` + `chat::welcome_attestation_in(signer, &room, joiner, ..)` per joiner |
 | hold the room, tree has devices the directory dropped | `Remove(nodes)` | `remove_member` → the epoch advances, forward-securing what follows |
 | hold the room, a rival claim wins | `Abandon{in_favour_of}` | drop it and join the winner's |
 | converged | `Idle` | `seal_due` on the cadence |
+
+**The handshake rows take the ROOM, not a derived pair** (CIRISEdge#656, edge v30.0.0). The
+pair-deriving `key_package_attestation` / `welcome_attestation` compute `pair_community_key_id(author,
+recipient)`, which for a self collective is a hash of two nodes nobody installs: the row lands in
+`chat:pair:v1:<hash>` while the adder looks in the self room, so the creator holds a KeyPackage it
+cannot see — `Added(0)` forever, with every step logging success. The `_in` twins take a
+[`ScopeRoom`] so each kind writes its room under the member persist reads for it
+(`family_key_id` for a family), and `welcome_attestation_in` takes the room **and** the joiner,
+because one parameter answered both only while a room was its two members. `chat::welcome_for`
+picks the Welcome addressed to you, which `welcome_from` cannot once a room has three members.
 
 **Concurrent creation is settled, not prevented.** In an unconverged directory B cannot see A, so B
 believes it is first and a second room appears. Preventing that needs a coordination round the
@@ -613,7 +629,7 @@ the self row set adds `mine_on_b` = "a self row written on A opened on B", with 
 | **all** | `ReplicationRuntimeConfig::local_key_id`; `sealed_content: SealedContentWiring { engine, pull_sink, revocations }`; a `BlobChunkSource` with `answers_scope() -> true` if scope-native; `kick()` after publishing | rounds, propagation kicks, key-grant projection, pull on admitted rows, revocation eviction |
 | **community** | the widen (`share(.., With::Community, ..)`); `ScopeLifecycle::install` on `Keyed` with `snapshot_for_nodes`, `advance` on epoch change, `seal_due` on a cadence | holder claim, discovery, swarm pull, serve, adopt, announce |
 | **self / family** | tick `self_room::decide` and perform the action it names (§6.3's table); `self_room::snapshot` → `install` on join, `advance` on every Commit, `refresh_members` (#648) when an occurrence resolves late, `seal_due` on the cadence | the creator rule ITSELF (`decide` is edge's), the implicit send set (persist), author's-nodes fetch, `LocalOnly` adopt, retroactive re-grant (persist) |
-| **files, every cohort** | `files::publish(dir, store, signers, &FileWrite { room, bytes, media_type, filename, asserted_at })` — one call, ≤ 1 MiB until §6.7 | the seal at the room's tier, persist's group slot, the citing row, the cohort target field, and the crossing to the room's audience; every refusal typed (`FileError::{TooLargeForInline, ReadableByNobody, Seal, Author, Cross, Row}`). Read: `files::in_room` (the drive — a bounded walk until §6.8) + `FileRow::open` → bytes or `UnopenedReason` (`NotFetched` = "on another device") |
+| **files, every cohort** | `files::publish(dir, store, signers, &FileWrite { room, bytes, media_type, filename, asserted_at })` — one call, ≤ 1 MiB until §6.7 | the seal at the room's tier, persist's group slot, the citing row, the cohort target field, and the crossing to the room's audience; every refusal typed (`FileError::{TooLargeForInline, ReadableByNobody, Seal, Author, Cross, Row}`). Read: `files::in_room(engine, &room, caller, limit, after) -> DrivePage` — persist's gated query (§6.8), resumable, `resume: None` meaning the room is exhausted — + `FileRow::open` → bytes or `UnopenedReason` (`NotFetched` = "on another device") |
 | **commons** | the allowlist (`SenderStanding::Allowlisted`) | everything else |
 | **client** (CIRISServer#615) | create: descriptor + bytes with `size`; read: verify → sniff → policy; enumerate: `GET /v1/drive` over the row plane, cursor `since`, row-held/bytes-absent as a state | — |
 
@@ -666,6 +682,18 @@ template: it is green because each rung has a witness, not because a run passed.
 
 ## 13. Changelog
 
+- **2026-09-23 (v30.0.0, adopt persist v46.4.0 + CIRISEdge#656).** The drive read became a gated
+  query (§6.8): `files::in_room(engine, &room, caller, limit, after) -> DrivePage`, on persist's
+  `Engine::list_attestations` with the new `cohort_scope` axis, so the §4.3 visibility predicate runs
+  in the same statement and v29.5.0's host precondition is deleted. Targeted rooms refuse
+  `DriveGateUnavailable` until CIRISPersist#893 (§6.8.1), where edge's ruling is posted. The
+  handshake builders take a `ScopeRoom` (§6.3) so a self or family room's rows land where the adder
+  looks. §6.7 corrected: the chunk-DAG door is **edge's unbuilt work, not a persist gate** — every
+  persist door exists on the pinned version. Five review findings fixed on the way, three of them in
+  the drive query alone (a fixed page ceiling, a partial answer that was a log line rather than a
+  value, and a resume cursor that stepped over every unreturned row in a backing page); the
+  documented surface is now compile-pinned in `tests/chat_harness_dx.rs` so a stale signature breaks
+  CI rather than a downstream build.
 - **2026-09-22 (v29.5.0 review).** Six findings on PR #654, all real, all fixed with witnesses:
   removal before addition in `decide` (an `Add` waits on another node's KeyPackage while a `Remove`
   does not, so the old order held a REVOKED device in the tree); `publish` refuses a seal readable by
