@@ -4,9 +4,18 @@
 
 **2026-09-23** (PR #658; CIRISEdge#633, CIRISPersist#893/#897/#797). MINOR from v30.0.0, which no
 host adopted (CIRISServer stayed on v29.5.0), so the shape changes below cost nobody a second adopt.
-Ladder triple: **edge v30.1.0 · persist v47.0.0 · verify v16.1.0**. All four persist ABI constants
+Ladder triple: **edge v30.1.0 · persist v47.1.0 · verify v16.1.0**. All four persist ABI constants
 and `CONSENT_GRAMMAR_HASH` are unchanged; the wheel floor moves to `ciris-persist>=47,<48` because
 persist's cut is a MAJOR.
+
+## Adopt: persist v47.1.0 — the adopters' asks (CIRISPersist#861, #842)
+
+- **`BlobError::SealDidNotOpen`** (#842, edge's ask) — "did not open" is typed. `PersistGroupContentStore::map_err`
+  string-matched persist's prose (`contains("decrypt")`) to keep `SealMismatch` distinct from
+  `NotGranted`; it now matches the variant. The substitution witness still binds.
+- **Both membership-removal doors are idempotent** on every backend (#861): a repeat community removal
+  is a no-op with **no second DEK rotation**; a repeat family removal is a no-op unless it moves the
+  removal earlier. Nothing in edge worked around the old `UNIQUE` failure, so nothing is removed here.
 
 ## Adopt: the community and family drives are open (CIRISPersist#893, persist v46.5.0)
 

@@ -8,7 +8,7 @@ device, listed on the owner's other). What remains for self BYTES (`opened_on_b`
 room driver, which is the server's (CIRISServer#622/#626), and files above 1 MiB (§6.7, CIRISEdge#633).
 **Family is the open cohort**: the machinery is shared and the rungs are specified, but its roster
 function, its trigger and its witnesses are unbuilt. The community drive is witnessed (R10, edge
-v30.1.0 on persist v46.5.0/v47.0.0). Commons files are a separate verb by design (§6.7).
+v30.1.0 on persist v47.1.0 (carrying v46.5.0's #893 and v47.0.0's #897)). Commons files are a separate verb by design (§6.7).
 **Author:** Eric Moore (CIRIS Team) with Claude Fable 5.1
 **Created:** 2026-09-22 · **Revised:** 2026-09-23 (edge v30.0.0; see the §13 changelog — every
 revision since has come from a review finding checked against the pinned tree before the text moved)

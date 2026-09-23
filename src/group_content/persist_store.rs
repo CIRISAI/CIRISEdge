@@ -179,24 +179,15 @@ fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> Grou
         // between "you may not read this" and "this did not open" — two
         // findings with nothing in common.
         //
-        // # This arm string-matches persist's PROSE, and that is a known cost
-        //
-        // `BlobError` has no typed variant for "the AEAD tag did not verify"
-        // (CIRISPersist#842 asks for one), so the only signal available is
-        // the message. A reword upstream would silently drop every AAD
-        // mismatch into `Substrate` — the failure would still be a failure,
-        // but the distinction this function exists to preserve would be
-        // gone, with nothing red.
-        //
-        // It is not left to luck. `chat_message_federates::
-        // a_pointer_copied_onto_another_authors_row_does_not_open` performs
-        // a REAL substitution against a real community DEK and asserts on
-        // `SealMismatch`'s own wording, so a persist reword turns that test
-        // red rather than degrading this arm quietly. Do not "simplify" the
-        // match without checking that witness still binds.
-        B::Backend(msg) if msg.contains("decrypt") || msg.contains("seal") => {
-            GroupContentError::SealMismatch { sha256_hex }
-        }
+        // persist v47.1.0 (CIRISPersist#842, edge's ask): the variant is TYPED.
+        // Until then this arm string-matched persist's prose (`contains("decrypt")`),
+        // and a reword upstream would have dropped every AAD mismatch into
+        // `Substrate` with nothing going red. `SealDidNotOpen` is raised only by
+        // the body open; a DEK that will not unwrap stays a key/grant fault. The
+        // witness `chat_message_federates::
+        // a_pointer_copied_onto_another_authors_row_does_not_open` performs a
+        // real substitution against a real community DEK and still binds here.
+        B::SealDidNotOpen { .. } => GroupContentError::SealMismatch { sha256_hex },
         other => GroupContentError::Substrate(other.to_string()),
     }
 }
