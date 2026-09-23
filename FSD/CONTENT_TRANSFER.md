@@ -459,11 +459,12 @@ cannot place the 26 distinct symbols the shipped tuple's feasibility floor needs
 over the bound by name — `FileError::TooLargeForInline { size, cap }`, which says which door is
 missing and what it waits on, rather than passing through an argument error from a layer the caller
 did not call. The file door works at every cohort, and only up to 1 MiB. It is
-gated on **CIRISPersist#821 Q1/Q2** (per-chunk serve vs proxy shedding under the stop tier; whether a
+gated on **CIRISPersist#821 Q1/Q2** (per-chunk serve vs proxy shedding under the stop tier — the
+self-file driver is recorded on that issue; whether a
 scoped chunked put is one door or two) and tracked as **CIRISEdge#633**. A drive that cannot hold a
 video is a notes app, so this is the difference between "self files replicate" and "files".
 
-### 6.8 The drive read needs a filter, not a scan (persist ask)
+### 6.8 The drive read needs a filter, not a scan (persist ask — CIRISPersist#891)
 
 R10 is a query: *every file row in this room, newest last*. The directory offers
 `list_attestations_since(cursor, limit)` over the **whole attestation plane**, and the room-and-
@@ -568,10 +569,11 @@ the self row set adds `mine_on_b` = "a self row written on A opened on B", with 
    content set is not retired as "not the author" on every second device (v46.3.0), the `family_key_id`
    carrier confirmed (CIRISPersist#887), and the read-side self gate (v46.3.1). **Nothing here blocks
    self row or self byte replication.**
-2. **persist — open, two asks, both narrow**: **(a)** the §6.8 listing filter — `cohort_scope` and
-   `dimension` axes on `AttestationFilter`, so R10 is a query rather than a bounded walk; it is on
-   `GET /v1/drive`'s critical path. **(b)** CIRISPersist#821 Q1/Q2 → the §6.7 chunk-DAG door, without
-   which every cohort's files stop at 1 MiB.
+2. **persist — open, two asks, both narrow**: **(a)** the §6.8 listing filter (**CIRISPersist#891**) — a
+   `cohort_scope` axis on `AttestationFilter` plus a cursor-paged filtered read, so R10 is a query
+   rather than a bounded walk; it is on `GET /v1/drive`'s critical path, not the replication path.
+   **(b)** **CIRISPersist#821** Q1/Q2 → the §6.7 chunk-DAG door, without which every cohort's files
+   stop at 1 MiB.
 3. **edge — done**: the projector's group-id rule and the two facets (§6.2, v29.4.0); the source rule
    and `blob_pull_sources` (§6.2); `announce_is_possible` asks the substrate (#646 ask 1); `ScopeRoom`,
    `self_room::{roster, snapshot, decide}` and the file door (§6.3/§9, v29.5.0); `refresh_members`
