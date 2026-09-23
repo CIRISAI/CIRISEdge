@@ -212,6 +212,32 @@ pub trait GroupContentStore: Send + Sync + 'static {
     /// Substrate failure, or a refusal the tier imposes.
     async fn seal(&self, req: SealRequest<'_>) -> Result<SealedContent, GroupContentError>;
 
+    /// **Seal as a chunk DAG** (CC 5.3.3.1) — the door for content above the
+    /// inline bound (`FSD/CONTENT_TRANSFER.md` §6.7, CIRISEdge#633).
+    ///
+    /// CC 2.6.1.3 bounds a signed envelope at 1 MiB, and persist's
+    /// `DEFAULT_INLINE_BYTES_CAP` is the same number for the same reason —
+    /// the signed thing is the sized thing. Above it the bytes cannot ride
+    /// inside the row, so they become a sealed chunk DAG: per-chunk AEAD
+    /// with position-bound AAD, a manifest pinning the chunk shas and the
+    /// total size, and a read that can ask for a range instead of the whole.
+    ///
+    /// The returned [`SealedContent::pointer`] carries `stream_id: Some(..)`,
+    /// and **its presence is the answer to "is this chunked"** — one fact,
+    /// one member, no way for two to disagree. `content_sha256` is the
+    /// MANIFEST's, which is what a reader opens and what a row cites.
+    ///
+    /// # This is a one-shot file, not a live stream
+    ///
+    /// The whole plaintext is written in one pass as `seq = 0..n` under a
+    /// single stream epoch label. An appendable stream (A/V) manages its own
+    /// epochs and counters against CC 5.3.3.1's `MAX_CHUNKS_PER_EPOCH`; a
+    /// file does not, because it is complete when it is written.
+    ///
+    /// # Errors
+    /// [`GroupContentError`], as [`Self::seal`].
+    async fn seal_chunked(&self, req: SealRequest<'_>) -> Result<SealedContent, GroupContentError>;
+
     /// Open content a row points at.
     ///
     /// # Errors
@@ -227,6 +253,15 @@ pub trait GroupContentStore: Send + Sync + 'static {
 pub fn aad_for_seal(req: &SealRequest<'_>) -> Vec<u8> {
     content_aad(req.author_key_id, req.asserted_at, req.field)
 }
+
+/// The plaintext bytes edge puts in one chunk of a DAG (CIRISEdge#633).
+///
+/// Not a CC constant — CC bounds the ENVELOPE (2.6.1.3) and the chunk COUNT
+/// per epoch (5.3.3.1's `MAX_CHUNKS_PER_EPOCH = 2²⁴`), and leaves the chunk
+/// size to the producer. 256 KiB is chosen for range granularity: a reader
+/// asking for a few seconds of a video should not pull a megabyte, and at
+/// this size the per-epoch ceiling is still 4 TiB of one stream.
+pub const CHUNK_BYTES: usize = 256 * 1024;
 
 /// Build the AAD for an open request.
 ///

@@ -130,7 +130,7 @@ row, always; `tier` / `community_key_id` / `epoch` from the pointer; the floor b
 | **holder discovery** | **none** (CC 5.2) | **none** (CC 5.2) | `holds_bytes` at community visibility, 24 h TTL (CC 5.3.2.1) | `holds_bytes`, plaintext provenance |
 | **holder set** | **known by construction**: the author's nodes (`contact::resolve(author_key_id).nodes` — the sealing node is among them; on the content axis author = minter by admission rule) | the author's nodes, as self; the family's other nodes only opportunistically | `list_holders` (+ `list_holders_sized`, v45) | `list_holders` |
 | byte movement | **delivery**: addressed fetch from the author's nodes; push-on-write optional | delivery, as self | discovery + swarm pull (`BlobPuller`, up to 2 holders) | discovery + swarm pull |
-| **file shape** (§6.7) | inline ≤ 1 MiB (CC 2.6.1.3), else a sealed **chunk DAG** (CC 5.3.3.1) — persist's doors all exist; **edge wires none: CIRISEdge#633**, unblocked | same | same | same |
+| **file shape** (§6.7) | inline ≤ 1 MiB (CC 2.6.1.3), else a sealed **chunk DAG** (CC 5.3.3.1) ✓ v30.1.0 — `files::publish` routes at the bound; the pointer's `stream_id` says which | same | same | same |
 | addressing (CC 5.4.6) | `SelfOnly` group whose members are the identity's **nodes** — the **self room**, a per-identity MLS group with a specified bootstrap (§6.3); group id = the identity (`identity_key_id`, CC 3.3.6) | `Family` group of the members' nodes; group id = `family_id` (CC 5.2) | `Cohort` group from the room's MLS exporter (`cohort_addressing`) | federation address (no group, no table) |
 | serve gate (edge `admit_blob_serve`) | arrival `SelfOnly` (same group) ∧ requester `OwnNode` | arrival `Family` (same group) ∧ requester member | arrival same `Cohort` group; `chunk_scope` answered | any arrival (`allows_recipient_scope(Public, _)`) |
 | adopt gate (persist `would_hold`) | `is_audience` self arm: principal equality | family arm: roster | community arm: active member of the named community | commons: allowlist |
@@ -471,29 +471,40 @@ strategy. Self and family content is excluded from fountain retention by CC 6.1.
 the CC 5.2 suppression anyway: no `FountainHoldingClaim` exists for it, and a 2–5-device collective
 cannot place the 26 distinct symbols the shipped tuple's feasibility floor needs.
 
-**Not built — and not blocked** (corrected 2026-09-22 against the pinned tree). `files::publish`
-refuses anything over the bound by name, `FileError::TooLargeForInline { size, cap }`. An earlier
-draft of this section said that refusal was waiting on **CIRISPersist#821 Q1/Q2**. It is not: Q1
-shipped in persist v44.5.0 (`serve_blob_range_to_peer` — the ranged serve with the same proxy-shedding
-and quarantine gates as the whole-blob path), Q2 is settled, and the **scoped chunk DAG shipped whole**
-(persist #832/#838). At the version edge pins today, v46.3.1, every door exists as an `Engine` call:
+**Built in v30.1.0** (CIRISEdge#633). `files::publish` routes at the bound — one call, either shape —
+and `GroupContentStore::seal_chunked` is the door: `put_blob_chunk_scoped` per 256 KiB segment, then
+`seal_stream_scoped`. The returned pointer carries **`stream_id: Some(..)`, and its presence IS the
+answer to "is this chunked"** — one fact, one member, no way for two to disagree — while
+`content_sha256` is the MANIFEST's, which is what a reader opens and what the row cites. A reader
+opens it through the same door as an inline blob (persist's whole-read caps at 64 MiB and names the
+range door above that).
+
+Every persist door already existed at the pinned version — Q1 shipped in v44.5.0
+(`serve_blob_range_to_peer`), Q2 is settled, the scoped DAG shipped in #832/#838 — so this was never
+gated on **CIRISPersist#821**, only on edge wiring it. An earlier draft of this section said
+otherwise; the correction stands as a reminder to grep the resolved source before recording a
+dependency.
 
 | door | what it does |
 |---|---|
-| `put_blob_chunk_scoped(scope, stream_id, seq, plaintext, epoch, community_key_id, aad)` | append one segment to a live stream, sealed where the tier requires — the chunk twin of `put_blob_scoped` |
-| `seal_stream_scoped(scope, stream_id, community_key_id, media_type, aad)` | seal the live stream into a `chunk_dag` at that cohort |
+| `put_blob_chunk_scoped(scope, community, stream_id, seq, plaintext, epoch, aad)` | append one segment, sealed where the tier requires |
+| `seal_stream_scoped(scope, community, stream_id, media_type, aad)` | seal the live stream into a `chunk_dag` at that cohort |
 | `read_blob_range_as(sha, viewer, start, end, aad)` | the ranged read; the whole-read door refuses above 64 MiB and names this one |
-| `read_stream_chunk_as(stream_id, seq, viewer, aad)` | one chunk by position |
 | `adopt_sealed_chunk` | the receiver's adopt, gated by `would_hold` + the §4.3 adopt path |
 
-Per-chunk AEAD with position-bound AAD (`ChunkManifest` v2), `MAX_CHUNKS_PER_EPOCH = 2²⁴` as the
-nonce-safety cap. **Edge wires none of them**, which is the whole of the gap: the write path above the
-bound is `put_blob_chunk_scoped` × N → `seal_stream_scoped`, and the read path is `read_blob_range_as`.
-That is **CIRISEdge#633**, unblocked on the current pin, and it is the difference between "self files
-replicate" and "files". A drive that cannot hold a video is a notes app.
+**The epoch is a label, not a key.** persist §12.3: it is "the producer's stream epoch label
+(recorded as given)", and which DEK sealed a community chunk is the chunk row's own binding. A file
+is complete when it is written, so it is one epoch; an appendable stream (A/V) rolls its own against
+CC 5.3.3.1's `MAX_CHUNKS_PER_EPOCH = 2²⁴`. At 256 KiB per chunk that ceiling is 4 TiB of one stream.
 
-(Persist will ship a PyO3 binding for `adopt_sealed_chunk` in v46.4.0. Edge does not need it — edge
-calls the `Engine` door in Rust — but a **Python** consumer adopting a chunk DAG does.)
+**Chunk size is the producer's** and 256 KiB is edge's choice, for range granularity — a reader
+asking for a few seconds of a video should not pull a megabyte. CC bounds the envelope and the chunk
+COUNT, never the chunk size.
+
+**What remains: the cross-node fetch.** The puller adopts a whole blob (`adopt_sealed_blob`); a DAG
+needs `adopt_sealed_chunk` per chunk against the manifest, under the same store gate. Until that
+lands a DAG is written, listed and opened on the node that sealed it, and a far node reads
+`not_fetched` — the honest state, not a silent gap. Tracked on CIRISEdge#633.
 
 ### 6.8 The drive read is a gated query (CIRISPersist#891 — shipped v46.4.0, adopted v30.0.0)
 

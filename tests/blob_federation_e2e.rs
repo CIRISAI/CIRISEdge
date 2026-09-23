@@ -3094,3 +3094,76 @@ async fn a_resumed_drive_listing_never_steps_over_a_file() {
          jumps to the end of a backing page loses the ones it did not return"
     );
 }
+
+/// **CIRISEdge#633 — a file over the inline bound is a sealed chunk DAG, and
+/// it opens.**
+///
+/// CC 2.6.1.3 bounds a signed envelope at 1 MiB, so above it the bytes
+/// cannot ride inside the row. Before this, `files::publish` refused by name
+/// (`TooLargeForInline`) and a drive could hold notes but not a video. The
+/// same call now seals a DAG: the pointer carries `stream_id`, its
+/// `content_sha256` is the MANIFEST's, and a reader opens it through the
+/// same door as any other blob.
+#[tokio::test]
+async fn a_file_over_the_inline_bound_is_chunked_and_still_opens() {
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let node_a = node(&[&alice], &alice).await;
+    let room = ciris_edge::self_room::room(&alice.key_id);
+
+    // Comfortably over the 1 MiB bound, and not a round number of chunks —
+    // the tail chunk is where an off-by-one in the split would land.
+    let cap = ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP;
+    let big: Vec<u8> = (0..(cap + 4096 + 137))
+        .map(|i| u8::try_from(i % 251).expect("a byte"))
+        .collect();
+
+    let published = ciris_edge::files::publish(
+        &*node_a.dir,
+        &node_a.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &ciris_edge::files::FileWrite {
+            room: &room,
+            bytes: &big,
+            media_type: "video/mp4",
+            filename: Some("boat.mp4"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("a file over the inline bound publishes as a chunk DAG");
+
+    assert!(
+        published.pointer.stream_id.is_some(),
+        "the pointer's stream_id IS the answer to 'is this chunked' — one fact, one member"
+    );
+    assert_eq!(
+        published.tier,
+        ciris_persist::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
+        "a self file is sealed whatever its shape"
+    );
+    assert!(published.crossed, "and it crosses like any other row");
+    assert!(
+        rows_of(&node_a, "holds_bytes:").await.is_empty(),
+        "CC 5.2 does not care how many chunks it took: still no holder claim"
+    );
+
+    // It is a FILE to the drive, not a special case.
+    let drive = ciris_edge::files::in_room(node_a.store.engine(), &room, &node_a.me, 10, None)
+        .await
+        .expect("list");
+    assert_eq!(drive.files.len(), 1);
+    assert_eq!(drive.files[0].filename.as_deref(), Some("boat.mp4"));
+    assert!(drive.files[0].pointer.stream_id.is_some());
+
+    // And it opens, byte for byte, through the same door as an inline blob.
+    let opened = drive.files[0]
+        .open(&node_a.store, &node_a.me)
+        .await
+        .expect("the author opens what it sealed");
+    assert_eq!(opened.len(), big.len(), "every chunk came back");
+    assert_eq!(opened, big, "and in order, with the tail chunk intact");
+}

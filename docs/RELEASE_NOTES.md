@@ -1,5 +1,40 @@
 # CIRISEdge Release Notes
 
+# v30.1.0 — a file over 1 MiB is a sealed chunk DAG
+
+**2026-09-23** (PR #658, CIRISEdge#633, `FSD/CONTENT_TRANSFER.md` §6.7). MINOR: one required method
+on `GroupContentStore` (one implementor in-tree), no pin move, no signature change to `files`.
+
+CC 2.6.1.3 bounds a signed envelope at 1 MiB, and persist's `DEFAULT_INLINE_BYTES_CAP` is the same
+number for the same reason — the signed thing is the sized thing. Above it the bytes cannot ride
+inside the row, and `files::publish` refused by name: the file door worked at every cohort and only
+up to a megabyte, which is a notes app rather than a drive.
+
+- **`GroupContentStore::seal_chunked`** — `put_blob_chunk_scoped` per 256 KiB segment, then
+  `seal_stream_scoped`. The pointer carries **`stream_id: Some(..)`, whose presence IS the answer to
+  "is this chunked"**, and `content_sha256` is the MANIFEST's — what a reader opens and what the row
+  cites.
+- **`files::publish` routes at the bound.** One call, either shape, same `SealedContent`. A caller
+  writes a note and a video the same way.
+- An empty DAG is refused rather than sealed: a manifest over no chunks is content that opens to
+  nothing.
+
+**Nothing upstream was ever blocking this.** Every persist door existed at the version edge already
+pinned — Q1 shipped in v44.5.0, Q2 is settled, the scoped DAG in #832/#838 — so CIRISPersist#821 was
+never the gate, only edge's wiring. The FSD carried that wrong attribution for a day; grepping the
+resolved source is what corrected it.
+
+Witness: `a_file_over_the_inline_bound_is_chunked_and_still_opens` publishes ~1 MiB + 4 KiB + 137
+bytes (a deliberately ragged tail, where an off-by-one in the split would land), asserts the pointer
+is chunked and the tier is still `InvisibleEncrypted`, that **no holder claim exists** (CC 5.2 does
+not care how many chunks it took), that the drive lists it as an ordinary file, and that it opens
+**byte for byte**.
+
+**What remains on #633:** the cross-node fetch. The puller adopts a whole blob; a DAG needs
+`adopt_sealed_chunk` per chunk against the manifest, under the same store gate. Until then a DAG is
+written, listed and opened on the node that sealed it, and a far node reads `not_fetched` — the
+honest state, not a silent gap.
+
 # v30.0.0 — adopt CIRISPersist v46.4.0: the drive read becomes a gated query, and the handshake goes into the room it names
 
 **2026-09-23** (PR #657, CIRISEdge#646 §6.8 + CIRISEdge#656). **MAJOR**, and the reason is a fact
