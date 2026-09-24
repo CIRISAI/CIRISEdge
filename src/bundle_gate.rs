@@ -10,7 +10,8 @@
 //! in the live map per the announce verdict); what it does not get, when the
 //! gate is ON, is a **durably-Rooted** binding — the row a restart reloads as
 //! authoritative and the CIRISEdge#432 divergence heal upgrades from. Advisory
-//! saves are never gated (CC 3.3.6.2 admit-not-drop stands untouched).
+//! saves are never gated (admit-not-drop stands untouched — CC 3.3, authorization
+//! is consumer-policy, not wire; CC 3.3.6.2 is the authenticated binding itself).
 //!
 //! ## The verification seam (fail-closed chain)
 //!
