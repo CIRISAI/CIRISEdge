@@ -6893,12 +6893,26 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             // needs to validate attribution from the log alone. The steady state
             // (link already attributed ⇒ `not_applicable`) is DEBUG; the two
             // decisions that MOVE something (`attributed`, `unbound`) are INFO.
+            // CIRISEdge#659 observability ask 3 — BOTH identities on the line: the
+            // link's, and every verified binding it was compared against. A door
+            // that logs only the link's identity leaves "which identity did it
+            // NOT match" to inference, which is what sent CIRISServer#632's first
+            // read the wrong way.
+            let compared: Vec<String> = bindings
+                .as_deref()
+                .map(|bs| {
+                    bs.iter()
+                        .map(|b| format!("{}={}", b.key_id, hex::encode(b.transport.hash())))
+                        .collect()
+                })
+                .unwrap_or_default();
             if matches!(door, BootstrapDoor::NotApplicable) {
                 tracing::debug!(
                     link = ?link_id,
                     link_transport_identity_hash = %hex::encode(link.hash()),
                     candidate = ?candidate_key_id,
                     named_keys = ?named,
+                    compared_bindings = ?compared,
                     decision = door.as_str(),
                     "bootstrap door (CIRISEdge#636): link already attributed — no belt, no drop"
                 );
@@ -6908,6 +6922,7 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                     link_transport_identity_hash = %hex::encode(link.hash()),
                     named_keys = ?named,
                     bindings_held = bindings.as_ref().map_or(0, Vec::len),
+                    compared_bindings = ?compared,
                     decision = door.as_str(),
                     "bootstrap door (CIRISEdge#636): the link's transport identity vs the verified \
                      bindings of the keys this Deliver names — `attributed` binds the link now; \
@@ -7004,6 +7019,26 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                 }
                 _ => None,
             };
+            // CIRISEdge#659 observability ask 2 — the operands of EVERY drop, on
+            // an unthrottled DEBUG line. The WARN below is throttled per key (5 per
+            // minute, by design: an attacker-chosen flood must not own the log),
+            // which meant that after the first miss every further drop from a
+            // peer was invisible — `suppressed_prev=22` on a canonical dropping
+            // every frame. DEBUG is off in production by default and on in the
+            // harness (`RUST_LOG=ciris_edge=debug`), which is where the count
+            // has to be readable frame by frame.
+            if gated.is_none() {
+                tracing::debug!(
+                    link = ?link_id,
+                    peer = %key_id,
+                    resolved_binding = ?resolved,
+                    item1_owns_key = resolved.is_some_and(|(_, owns_key, _)| owns_key),
+                    dest = ?dest.map(hex::encode),
+                    rooting_directory_wired = ctx.rooting.is_some(),
+                    "inbound frame NOT attributed — operands (every drop; the WARN is per-key \
+                     throttled) (CIRISEdge#659)"
+                );
+            }
             let gated = if gated.is_some() {
                 gated
             } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
