@@ -6938,19 +6938,19 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     let link_key_id = candidate_key_id.clone();
     let source_key_id = match candidate_key_id {
         Some(key_id) => {
-            // Item 1 — Rooted ∧ owns_key, plus capture the peer's dest for the
-            // item-2 lookup. `dest` is `None` when the peer isn't in the map.
-            // CIRISEdge#404 — ALSO snapshot the RESOLVED binding's operands
-            // (provenance, owns_key, epoch) so the attribution-miss log can name
-            // WHICH conjunct failed (a `provenance=Advisory ∧ owns_key=true` is a
-            // churn downgrade, indistinguishable from an owns_key failure without it).
+            // Item 1 — owns_key (CIRISEdge#659: provenance is NOT consulted; a
+            // self-signed production agent that owns its key is attributable, and
+            // whether it is SERVED is the bridge's `rooted_with`), plus capture
+            // the peer's dest for the item-2 lookup. `dest` is `None` when the
+            // peer isn't in the map. CIRISEdge#404 — ALSO snapshot the RESOLVED
+            // binding's operands (provenance, owns_key, epoch) so the
+            // attribution-miss log can name the actual operands.
             let (item1, dest, resolved) = {
                 let peers = ctx.peers.lock().await;
                 match peers.get(&key_id) {
                     Some(rooted) => (
-                        crate::transport::SourceKeyId::from_rooted_binding(
+                        crate::transport::SourceKeyId::from_attributed_binding(
                             key_id.clone(),
-                            rooted.provenance,
                             rooted.owns_key,
                         ),
                         Some(rooted.peer.dest_hash.into_bytes()),
@@ -6973,7 +6973,7 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                             peer = %key_id,
                             dest = %hex::encode(d),
                             suppressed_prev,
-                            "inbound frame DROPPED — item 1 PASSED (Rooted∧owns_key) but \
+                            "inbound frame DROPPED — item 1 PASSED (owns_key) but \
                              item 2 FAILED: no hybrid-verified SignedTransportDestination \
                              binds this (peer, dest) pair (CIRISEdge#393 item 2). This is \
                              the ONLY failing conjunct"
@@ -8170,9 +8170,8 @@ async fn heal_or_report_attribution_miss(
                 // Item 2 still applies — the heal upgrades item 1 only.
                 if let (Some(d), Some(rooting)) = (dest16, ctx.rooting) {
                     if binding_exists_cached(ctx.binding_cache, rooting, key_id, d).await {
-                        return crate::transport::SourceKeyId::from_rooted_binding(
+                        return crate::transport::SourceKeyId::from_attributed_binding(
                             key_id.to_string(),
-                            Rooted,
                             true,
                         );
                     }
@@ -8248,21 +8247,30 @@ fn report_attribution_miss(
 ) {
     use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
     if let Some((provenance, owns_key, epoch)) = resolved {
-        let hint = match (provenance, owns_key) {
-            (Advisory, true) => {
-                "a churn downgrade (owner reroute overwrote a Rooted binding), not an \
-                 owns_key failure"
-            }
-            (Advisory, false) => {
-                "a first-contact Advisory admit whose binding never rooted in this \
-                 process (CIRISEdge#432); stored_provenance names whether the durable \
-                 store diverges"
-            }
-            (Rooted, false) => {
+        // CIRISEdge#659 — item 1 is `owns_key` alone, so a live binding misses
+        // item 1 ONLY when the announce could not prove control of the key
+        // (`UnknownKeyId` / `PubkeyMismatch` / a pre-match rejection). The old
+        // "(Advisory, owns_key=true) ⇒ churn downgrade" hint is gone with the
+        // gate that made it possible: it printed for every never-conferred peer
+        // (`stored_provenance=None`) and sent the first read of CIRISServer#632
+        // the wrong way. A conferred binding overwritten by an owner reroute is
+        // named only when the STORE actually held `Rooted`.
+        let hint = match (owns_key, stored_provenance) {
+            (false, _) => {
                 "an owns_key failure — the announce could not prove control of the \
-                 federation key"
+                 federation key (UnknownKeyId / PubkeyMismatch / pre-match rejection)"
             }
-            (Rooted, true) => "unreachable: a passing binding does not miss",
+            (true, Some(Rooted)) if matches!(provenance, Advisory) => {
+                "item 1 passes (owns_key); the durable store held a CONFERRED binding \
+                 the live map lost to an owner reroute — a churn downgrade of \
+                 conferral, not of attribution. If this frame was dropped, item 2 \
+                 failed and was reported above"
+            }
+            (true, _) => {
+                "unreachable for item 1 (owns_key passes, CIRISEdge#659); if this \
+                 frame was dropped, item 2 (the hybrid transport binding) failed and \
+                 was reported above"
+            }
         };
         tracing::warn!(
             link = ?link_id,
@@ -8272,8 +8280,8 @@ fn report_attribution_miss(
             resolved_epoch = epoch,
             stored_provenance = ?stored_provenance,
             suppressed_prev,
-            "inbound frame NOT attributed — resolved binding fails Rooted∧owns_key; \
-             these are the ACTUAL operands (CIRISEdge#404). {hint}"
+            "inbound frame NOT attributed — these are the ACTUAL operands \
+             (CIRISEdge#404). {hint}"
         );
     } else {
         tracing::warn!(
@@ -9356,9 +9364,29 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                 key_id = %key_id,
                 reason = rejection.kind(),
                 owns_key,
-                "announce ADMITTED as advisory (CC 3.3.6.2: routing hint, authority not \
-                 established — recorded + KEX'd, not dropped)"
+                "announce ADMITTED as advisory (authenticated binding per CC 3.3.6.2; \
+                 not conferred — recorded + KEX'd, not dropped)"
             );
+            // CIRISEdge#659 observability ask 1 — an operator never learned WHY a
+            // peer is Advisory (`UnknownKeyId` vs `NotRootedAtSteward` is the whole
+            // story of CIRISServer#632). One throttled WARN per key names the
+            // rejection kind; the per-key throttle keeps a self-signed-key flood
+            // (CIRISEdge#337 §4) from turning it into one line per announce.
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                link_attribution_miss_log().check(&format!("advisory:{key_id}"))
+            {
+                tracing::warn!(
+                    av = "AV-42",
+                    key_id = %key_id,
+                    rooting_rejection = rejection.kind(),
+                    owns_key,
+                    suppressed_prev,
+                    "peer admitted ADVISORY — not conferred at this node. owns_key=true \
+                     means it is still ATTRIBUTABLE (CIRISEdge#659: attribution is not \
+                     trust); whether it is SERVED is decided by a valid root in common \
+                     (FSD §5.3). owns_key=false means its frames are dropped"
+                );
+            }
             (
                 None,
                 ciris_persist::federation::self_at_login::BindingProvenance::Advisory,
@@ -11320,13 +11348,11 @@ mod tests {
             assert_eq!(rp.transport_pubkey64, identity.public_key_bytes());
             assert_eq!(rp.peer.dest_hash, named_dest(&identity));
             assert!(
-                crate::transport::SourceKeyId::from_rooted_binding(
-                    &key_id,
-                    rp.provenance,
-                    rp.owns_key
-                )
-                .is_none(),
-                "E3: a Stage-1 binding can never reach the trace-serve constructor"
+                crate::transport::SourceKeyId::from_attributed_binding(&key_id, rp.owns_key)
+                    .is_some(),
+                "CIRISEdge#659: a Stage-1 binding that owns its key passes item 1 — it is \
+                 ATTRIBUTABLE; item 2 (the hybrid transport binding) and the bridge's \
+                 `rooted_with` (what it may be served) are separate questions"
             );
         }
         /// A key id with NO fingerprint (legacy / test ids) proves nothing
@@ -12887,9 +12913,8 @@ mod tests {
             assert_eq!(entry.provenance, Rooted);
             assert!(entry.owns_key);
             assert!(
-                crate::transport::SourceKeyId::from_rooted_binding(
+                crate::transport::SourceKeyId::from_attributed_binding(
                     PRESENTER.to_string(),
-                    entry.provenance,
                     entry.owns_key,
                 )
                 .is_some(),

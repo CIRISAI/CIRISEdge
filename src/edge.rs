@@ -9602,7 +9602,8 @@ mod inbound_ingest_tests {
         assert!(
             built.lock().unwrap().is_empty(),
             "an Attestation frame on a link-proven-identity link must NEVER reach a \
-             responder — the trace-serve gate stays strictly Rooted∧owns_key (E3)",
+             responder — the trace-serve gate stays attributed ∧ CONFERRED (E3; \
+             CIRISEdge#659: Rooted is standing, never sufficient)",
         );
 
         // (d) an unidentified link: no hint at all ⇒ even a Key frame drops.
@@ -9822,7 +9823,8 @@ mod inbound_ingest_tests {
             "TransportDestination is the item-2 bootstrap kind (CIRISEdge#406)",
         );
         // (c) THE E3 INVARIANT: an Attestation (consentable/trace) frame is NEVER
-        //     carved out — the trace-serve gate stays strictly Rooted∧owns_key.
+        //     carved out — the trace-serve gate stays attributed ∧ conferred
+        //     (CIRISEdge#659: Rooted is standing, never sufficient for a serve).
         assert!(
             bootstrap_carve_out_source(&with_link(EnvelopeKind::Attestation, Some("fresh-peer")))
                 .is_none(),

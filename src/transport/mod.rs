@@ -330,29 +330,37 @@ pub enum TransportError {
 /// Advisory or non-key-owning binding (an attacker announcing a serve-capable
 /// victim's `key_id` under its own transport identity, `owns_key=false`) was
 /// attributed as the victim → `peer_has_serve_capability(victim)` → the attacker
-/// was served the victim's `trace:*` corpus. Now the Reticulum constructor
-/// ([`Self::from_rooted_binding`]) yields `Some` ONLY for a `Rooted ∧ owns_key`
-/// binding; everything else is `None`, so the frame carries no attribution and
-/// the replication router drops it (`SkippedNoSourceKeyId`) before the serve
-/// gate is ever consulted.
+/// was served the victim's `trace:*` corpus. The Reticulum constructor
+/// ([`Self::from_attributed_binding`]) yields `Some` ONLY for a binding that
+/// proved control of the key (`owns_key`); the spoof above is `PubkeyMismatch ⇒
+/// owns_key=false` and stays `None`, so the frame carries no attribution and the
+/// replication router drops it (`SkippedNoSourceKeyId`).
+///
+/// **CIRISEdge#659 — attribution is not trust.** Until v30.2.0 this constructor
+/// also required `provenance == Rooted`, which persist's `root_binding` decides
+/// by walking the key's scrub chain to a hard-coded anchor: *conferral*, true only
+/// of canonicals. Every production agent answered `NotRootedAtSteward`, correctly,
+/// and could never be attributed; the self-attribution hole that hid it closed on
+/// 2026-09-18 and the trace plane went dark (CIRISServer#632). CC 5.3.3.5 E3 reads
+/// *fan-out = entitled ∧ reachable: persist owns entitlement, edge owns
+/// reachability* — attribution is reachability. Whether a peer is ROOTED is a pair
+/// property (a valid root in common, `FSD/CIRIS_EDGE_TRANSPORT.md` §5.3) evaluated
+/// by the bridge's `rooted_with`, and it gates what is *served*, never who *sent*.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SourceKeyId(String);
 
 impl SourceKeyId {
-    /// Reticulum attribution gate. `Some` iff the peer binding is BOTH
-    /// directory-`Rooted` AND proved control of the federation key
-    /// (`owns_key`) — the two signals that separate an authenticated owner from
-    /// a self-consistent Advisory hint or an outright announce-spoof. Any other
-    /// provenance/ownership → `None` (the frame is left unattributed and dropped
-    /// downstream, never served).
+    /// Reticulum attribution gate (item 1 of the §5.2 gate). `Some` iff the peer
+    /// binding *proved control* of the federation key (`owns_key`): the claimed
+    /// pubkey matched the registered one at cold start — any `RootingRejection`
+    /// AFTER the pubkey match still owns it — or Stage 1's `key_id_binds_pubkey`
+    /// held. `UnknownKeyId` / `PubkeyMismatch` (the announce-spoof) → `None`: the
+    /// frame is left unattributed and dropped downstream.
+    ///
+    /// Provenance is deliberately NOT an input (CIRISEdge#659; see the type doc).
     #[must_use]
-    pub fn from_rooted_binding(
-        key_id: impl Into<String>,
-        provenance: ciris_persist::federation::self_at_login::BindingProvenance,
-        owns_key: bool,
-    ) -> Option<Self> {
-        use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
-        (matches!(provenance, Rooted) && owns_key).then(|| SourceKeyId(key_id.into()))
+    pub fn from_attributed_binding(key_id: impl Into<String>, owns_key: bool) -> Option<Self> {
+        owns_key.then(|| SourceKeyId(key_id.into()))
     }
 
     /// Attribution from a transport whose CHANNEL itself authenticates the peer
@@ -381,38 +389,25 @@ impl SourceKeyId {
 #[cfg(test)]
 mod source_key_id_tests {
     use super::SourceKeyId;
-    use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
 
-    /// CIRISEdge#393 (E3) — the attribution gate truth table, tested against the
-    /// EXACT inputs the admit path produces (`BindingProvenance` × `owns_key`),
-    /// not convenient ones. The one admitting case is `Rooted ∧ owns_key`; the
-    /// three refusing cases are each a real field/attack shape:
-    ///   - `Rooted ∧ ¬owns_key`   — cannot occur post-admit, but the type must
-    ///     still refuse it (defense in depth against a future admit bug).
-    ///   - `Advisory ∧ owns_key`  — the fresh-federation owner not steward-rooted
-    ///     HERE; §4.3 refuses it for trace attribution by design.
-    ///   - `Advisory ∧ ¬owns_key` — THE ATTACK: an attacker announcing a
-    ///     serve-capable victim's key_id under its own pubkey (PubkeyMismatch ⇒
-    ///     owns_key=false). Refusing it is what closes E3.
+    /// CIRISEdge#393 (E3) / #659 — the attribution gate truth table, tested
+    /// against the EXACT input the admit path produces (`owns_key`). The one
+    /// admitting condition is key ownership; the one refusing case is THE
+    /// ATTACK: an attacker announcing a serve-capable victim's key_id under its
+    /// own pubkey (`PubkeyMismatch ⇒ owns_key=false`). Refusing it is what
+    /// closes E3. Provenance is not consulted (#659): a self-signed, never
+    /// conferred production agent that owns its key IS attributable — whether it
+    /// is *served* is the bridge's `rooted_with`, a different question.
     #[test]
-    fn from_rooted_binding_admits_only_rooted_and_owns_key() {
+    fn from_attributed_binding_admits_owns_key_and_only_owns_key() {
         assert_eq!(
-            SourceKeyId::from_rooted_binding("victim", Rooted, true).map(SourceKeyId::into_string),
-            Some("victim".to_string()),
-            "Rooted ∧ owns_key is the sole attributable binding",
+            SourceKeyId::from_attributed_binding("peer", true).map(SourceKeyId::into_string),
+            Some("peer".to_string()),
+            "owns_key ⇒ attributed, with no provenance in the question (#659)"
         );
         assert!(
-            SourceKeyId::from_rooted_binding("victim", Rooted, false).is_none(),
-            "Rooted but non-owning must never attribute",
-        );
-        assert!(
-            SourceKeyId::from_rooted_binding("victim", Advisory, true).is_none(),
-            "an Advisory (not-steward-rooted-here) owner is not attributable for trace (§4.3)",
-        );
-        assert!(
-            SourceKeyId::from_rooted_binding("victim", Advisory, false).is_none(),
-            "THE ATTACK — advisory admit of a victim's key_id under the attacker's own \
-             pubkey (owns_key=false) — is refused (CIRISEdge#393 E3)",
+            SourceKeyId::from_attributed_binding("victim", false).is_none(),
+            "PubkeyMismatch / UnknownKeyId ⇒ owns_key=false ⇒ never attributed (E3)"
         );
     }
 }

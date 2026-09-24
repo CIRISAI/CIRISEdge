@@ -69,7 +69,7 @@ These do not move. Every row in §4 and §5 traces to one of them.
 
 ```
   CIRIS_EDGE_TRANSPORT §5.4.1   link state × frame kind      "may this link cause this?"
-            │ Rooted ∧ owns_key (or Advisory for bootstrap kinds)
+            │ Attributed = owns_key ∧ hybrid binding (bootstrap kinds from Identified); served only when Rooted (#659)
             ▼
   CIRIS_EDGE_TRANSPORT §5.4.2   round metadata × role         "which coordinator, which round?"
             │ RoutedToResponder / RoutedToInitiator

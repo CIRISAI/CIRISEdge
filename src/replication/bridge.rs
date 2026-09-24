@@ -1133,6 +1133,11 @@ struct AttestationSweepCtx {
 struct AudienceMemo {
     principals: HashMap<String, Option<String>>,
     cohorts: HashMap<String, Option<CohortsOf>>,
+    /// CIRISEdge#659 — `rooted_with` per peer, for one sweep. Sweep-scoped on
+    /// purpose: the verdict is never cached past a `withdraws`, a halt or
+    /// persist's `bounded_until`, because a sweep is seconds and the next one
+    /// asks again.
+    rooted: HashMap<String, bool>,
 }
 
 /// The cohorts one identity is a member of, by id.
@@ -4791,6 +4796,132 @@ impl FederationDirectoryReplicationBridge {
     /// two sides cannot drift again.
     pub const SERVE_CAPABILITY: &'static str = delegation_scope::INFRA_SERVE;
 
+    /// CIRISEdge#659 — is `peer` ROOTED with this node: do the two hold a
+    /// **valid** trust root in common, through their owner-bindings?
+    ///
+    /// Eric's ruling (2026-09-23): both sides must trust a mutual root — not
+    /// necessarily the accord root, but a *valid* one, and several may be pinned
+    /// at once. Trust lives on the OWNER (CC 4.4.3.8's own shape:
+    /// `delegates_to(user → root)`, the node inheriting via the owner-binding),
+    /// so each side is walked from its owner; an unowned node is its own subject
+    /// (an unclaimed node keeps `node → R` as bootstrap default trust).
+    ///
+    /// ```text
+    /// Rooted(P) ⇔ ∃ R ∈ roots_of(subject(N)) ∩ roots_of(subject(P))
+    ///               ∧ trust_root_valid(subject(N), R).valid
+    ///               ∧ trust_root_valid(subject(P), R).valid
+    /// ```
+    ///
+    /// Every leg is persist's: `owner_of`, `trusted_roots_of` (live
+    /// `delegates_to(k → R, infra:*)` at federation tier) and `trust_root_valid`
+    /// (the edge exists; R self-declares with BOTH `infra:serve` and
+    /// `infra:attest` and carries the recovery pre-commitment; no halt latched;
+    /// family/threshold roots included). Edge only composes them. `R` is compared
+    /// by key id — both sides' rows live in THIS directory and `R` is a registered
+    /// key here, so key-id equality within one directory IS anchor-pubkey
+    /// equality; a peer cannot name a root by label.
+    ///
+    /// **Not a link state and not stored.** Recomputed per sweep (memo) and
+    /// therefore re-evaluated on every announce epoch, `withdraws`, halt change
+    /// and past `bounded_until` for free. This is the *trust* half of E3
+    /// (persist owns entitlement); attribution (edge's half) no longer consults
+    /// it — `SourceKeyId::from_attributed_binding`.
+    ///
+    /// Fail-closed: no local identity, an unresolvable owner, or a read error
+    /// → `false`.
+    ///
+    /// Open ruling (FSD §5.3 item 1): "hardware-backed holder keys" — persist has
+    /// no `hardware_class`; pending Eric's confirmation this gains the predicate
+    /// *R's charter holders are `accord_holder`-typed keys*.
+    async fn rooted_with(&self, peer_key_id: &str, memo: &mut AudienceMemo) -> bool {
+        if let Some(hit) = memo.rooted.get(peer_key_id) {
+            return *hit;
+        }
+        let verdict = self.rooted_with_uncached(peer_key_id).await;
+        memo.rooted.insert(peer_key_id.to_owned(), verdict);
+        verdict
+    }
+
+    /// The trust subject a key is walked from: its owner if it has one, itself
+    /// if it is unowned, `None` (fail-closed) if ownership cannot be resolved.
+    async fn trust_subject_of(&self, key_id: &str) -> Option<String> {
+        match self.owner_of_cached(key_id).await {
+            OwnerLookup::Owner(owner) => Some(owner),
+            OwnerLookup::Unowned => Some(key_id.to_owned()),
+            OwnerLookup::Unresolved => None,
+        }
+    }
+
+    async fn rooted_with_uncached(&self, peer_key_id: &str) -> bool {
+        use ciris_persist::federation::trust_root::{trust_root_valid, trusted_roots_of};
+        let Some(local) = self.local_key_id.as_deref() else {
+            tracing::warn!(
+                peer = %peer_key_id,
+                "rooted_with: no local_key_id wired — nothing can be Rooted with a node \
+                 that has no identity (fail-closed; wire ReplicationRuntimeConfig::local_key_id)"
+            );
+            return false;
+        };
+        let (Some(mine), Some(theirs)) = (
+            self.trust_subject_of(local).await,
+            self.trust_subject_of(peer_key_id).await,
+        ) else {
+            tracing::debug!(peer = %peer_key_id, "rooted_with: an owner could not be resolved — not Rooted");
+            return false;
+        };
+        let dir: &dyn ciris_persist::federation::FederationDirectory = &*self.directory;
+        let now = chrono::Utc::now();
+        let (my_roots, their_roots) = match (
+            trusted_roots_of(dir, &mine, now).await,
+            trusted_roots_of(dir, &theirs, now).await,
+        ) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::warn!(peer = %peer_key_id, error = %e, "rooted_with: trusted_roots_of failed — not Rooted (read error, not a verdict)");
+                return false;
+            }
+        };
+        for root in my_roots.iter().filter(|r| their_roots.contains(r)) {
+            let ours = trust_root_valid(dir, &mine, root).await;
+            let theirs_v = trust_root_valid(dir, &theirs, root).await;
+            match (ours, theirs_v) {
+                (Ok(a), Ok(b)) if a.valid && b.valid => {
+                    tracing::debug!(
+                        peer = %peer_key_id,
+                        root = %root,
+                        my_subject = %mine,
+                        peer_subject = %theirs,
+                        bounded_until = ?a.bounded_until.min(b.bounded_until),
+                        "rooted_with: a valid root in common — Rooted (CIRISEdge#659)"
+                    );
+                    return true;
+                }
+                (Ok(a), Ok(b)) => {
+                    tracing::debug!(
+                        peer = %peer_key_id,
+                        root = %root,
+                        ours_valid = a.valid,
+                        theirs_valid = b.valid,
+                        halt_latched = ?a.halt_latched,
+                        "rooted_with: a root in common is not valid for both sides"
+                    );
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!(peer = %peer_key_id, root = %root, error = %e, "rooted_with: trust_root_valid failed — skipping this root");
+                }
+            }
+        }
+        tracing::debug!(
+            peer = %peer_key_id,
+            my_subject = %mine,
+            peer_subject = %theirs,
+            my_roots = my_roots.len(),
+            peer_roots = their_roots.len(),
+            "rooted_with: no valid root in common — Attributed at most, served nothing (CIRISEdge#659)"
+        );
+        false
+    }
+
     /// Do this node and `peer` share a trust root?
     ///
     /// The entitlement for a federation-cohort identifier lookup. CC 4: two
@@ -5505,8 +5636,33 @@ impl FederationDirectoryReplicationBridge {
                 "attestation withheld — the recipient is not in the row's audience \
                  (CC 5.2: self = the owner's own nodes; family/community = members' nodes)"
             );
+            return true;
         }
-        !served
+        // CIRISEdge#659 — THE SERVE FLOOR. A peer that clears the send set and
+        // the row's audience is still handed nothing until the two of us hold a
+        // valid trust root in common through our owner-bindings (`rooted_with`,
+        // FSD §5.3). An Attributed peer may DELIVER (persist admits its rows);
+        // it is SERVED only when Rooted. This is the row-level shape of the gate
+        // that used to drop every Advisory frame at the transport; it moved here
+        // because attribution no longer asks about trust. Evaluated last so a
+        // refusal that has a more specific cause keeps its own name; Rooted is a
+        // floor, never sufficient (§5.4.1 invariant 1).
+        if !self.rooted_with(peer, memo).await {
+            self.withhold(
+                WithholdReason::RecipientNotRooted,
+                peer,
+                &format!("{site}: no valid trust root in common with this peer (CIRISEdge#659)"),
+            );
+            tracing::debug!(
+                peer,
+                attester,
+                site,
+                "attestation withheld — the recipient is Attributed but not Rooted: no valid \
+                 trust root in common through the owner-bindings (CIRISEdge#659)"
+            );
+            return true;
+        }
+        false
     }
 
     /// The principal behind `key`, memoized: a person is their own, a node's
@@ -10570,7 +10726,9 @@ pub(crate) mod tests {
     /// (CEG §3.2, read by `precedence::references_attestation_id_from_envelope`)
     /// and is attested BY the issuer ABOUT itself, since same-attester authority
     /// is what admits a withdrawal of one's own edge.
-    #[cfg(feature = "test-anchor")]
+    /// (Un-`cfg`d for CIRISEdge#659: the `rooted_with` witness withdraws an
+    /// acceptance on the default feature set, as `seed_trace_attestation` was
+    /// un-`cfg`d for #433.)
     async fn seed_withdraws(backend: &MemoryBackend, attester: &str, target_id: &str) {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = serde_json::json!({
@@ -10690,8 +10848,34 @@ pub(crate) mod tests {
         subject: &str,
         attestation_type: &str,
         cohort_scope: &str,
-        mut envelope: serde_json::Value,
+        envelope: serde_json::Value,
     ) {
+        try_seed_scoped_attestation(
+            backend,
+            id,
+            attester,
+            subject,
+            attestation_type,
+            cohort_scope,
+            envelope,
+        )
+        .await
+        .expect("seed trust-graph attestation");
+    }
+
+    /// [`seed_scoped_attestation`] that hands the put's verdict back instead of
+    /// panicking — for a seeder that may legitimately be refused (CIRISEdge#659:
+    /// `seed_common_root` signs with the deterministic fixture signer, and a
+    /// subject registered under other keys cannot be signed for).
+    async fn try_seed_scoped_attestation(
+        backend: &MemoryBackend,
+        id: &str,
+        attester: &str,
+        subject: &str,
+        attestation_type: &str,
+        cohort_scope: &str,
+        mut envelope: serde_json::Value,
+    ) -> Result<(), String> {
         // CIRISPersist#598 (v31.0.0): truncate to MICROSECONDS — postgres TIMESTAMPTZ
         // can't store sub-µs, so a producer that mints ns precision makes an op
         // sequence a strict order on sqlite/memory but a TIE on postgres. The fold
@@ -10738,7 +10922,8 @@ pub(crate) mod tests {
         backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
-            .expect("seed trust-graph attestation");
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
     }
 
     /// CIRISEdge#523 — [`seed_scoped_attestation`]'s row WITHOUT the put: the
@@ -12058,6 +12243,8 @@ pub(crate) mod tests {
         prefix: &str,
         capability: &str,
     ) {
+        // CIRISEdge#659 — see `seed_consent_membership`.
+        seed_common_root(backend, &[producer, recipient]).await;
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = serde_json::json!({
             "id": id,
@@ -12081,6 +12268,17 @@ pub(crate) mod tests {
     /// trip item 6. Use when a test needs a peer to be consent-included but is
     /// exercising a DIFFERENT gate.
     async fn seed_consent_membership(backend: &MemoryBackend, granter: &str, peer: &str) {
+        // CIRISEdge#659 — a consented peer in these fixtures is also ROOTED with
+        // the granter: in the field the two hold a valid root in common, and the
+        // serve floor (`rooted_with`) is evaluated after the send set. A test
+        // about the floor itself seeds the raw membership below.
+        seed_common_root(backend, &[granter, peer]).await;
+        seed_consent_membership_unrooted(backend, granter, peer).await;
+    }
+
+    /// The consent membership row alone — a peer in the send set that holds
+    /// NO root in common with the granter. Attributed at most.
+    async fn seed_consent_membership_unrooted(backend: &MemoryBackend, granter: &str, peer: &str) {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = serde_json::json!({
             "id": id,
@@ -12837,7 +13035,6 @@ pub(crate) mod tests {
         // (pubkeys) into the envelope before signing, so a signature can no longer
         // be lifted onto a different key_id. This fixture doesn't spoof, so the
         // placeholder subject + no-PQC is the byte-preserving update.
-        use ciris_persist::federation::operational::test_support::PLACEHOLDER_SUBJECT_ED25519_BASE64;
         // The roster key_ids `has_accord_conferred_role` resolves against. Persist's
         // own `accord_holder_roster_key_ids` is private, but it is derived from
         // this public genesis accessor — so we mint identities under exactly
@@ -12910,11 +13107,17 @@ pub(crate) mod tests {
         // Both candidate recipients carry a GENUINE 2-of-3 accord co-scrub
         // conferring `infra:serve` — leg A holds for both.
         for peer in [full_peer, blessed_only] {
+            // CIRISEdge#659 — registered under the FIXTURE signer's own hybrid
+            // pubkeys, so the acceptance `seed_consent_membership` roots each
+            // peer with verifies under Strict. (A placeholder pubkey with no
+            // PQC half left them un-signable, hence unrooted, hence served
+            // nothing — the serve floor in action, on the wrong peer.)
+            let (ed_pk, mldsa_pk) = hybrid_pubkeys(peer);
             let rec = signed_canonical_record_with_roles(
                 peer,
                 identity_type::NODE,
-                PLACEHOLDER_SUBJECT_ED25519_BASE64,
-                None,
+                &ed_pk,
+                mldsa_pk.as_deref(),
                 vec![FederationDirectoryReplicationBridge::SERVE_CAPABILITY.to_string()],
                 serde_json::json!({ "key_id": peer }),
                 &scrubbers,
@@ -15754,6 +15957,65 @@ pub(crate) mod tests {
         })
     }
 
+    /// CIRISEdge#659 — give `subjects` (persons, or unowned nodes) one VALID
+    /// root in common, `root-r`: a self-declared charter with a recovery
+    /// pre-commitment and an `infra:*` acceptance by each subject. The shared
+    /// fixtures call this so the peers they mean to be SERVED are Rooted with
+    /// the local node's owner; whoever is left out (`node-stranger`, an unowned
+    /// node with no acceptance) is Attributed at most and served nothing.
+    pub(crate) async fn seed_common_root(backend: &MemoryBackend, subjects: &[&str]) {
+        // Idempotent: the consent helpers call this per pair, so the root's
+        // key record is registered once (a re-register is a `Conflict`, which
+        // is the expected answer here) and acceptances accumulate. A second
+        // charter row is harmless — the walk needs any live one.
+        for (key_id, kind) in [
+            ("root-r", identity_type::USER),
+            ("succ-1", identity_type::USER),
+        ] {
+            match backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, kind),
+                })
+                .await
+            {
+                Ok(()) | Err(ciris_persist::federation::Error::Conflict(_)) => {}
+                Err(e) => panic!("register common-root fixture key {key_id}: {e:?}"),
+            }
+        }
+        seed_root_charter(backend, "root-r", &["succ-1".to_string()]).await;
+        let scope = serde_json::json!(["infra:attest", "infra:serve"]);
+        for subject in subjects {
+            // A subject registered under keys the fixture signer does not hold
+            // (persist's test-support `Identity`, a canonical record with a
+            // placeholder pubkey) cannot be signed for: it stays UNROOTED, and
+            // the test that needs it Rooted must seed the acceptance itself.
+            // Loud, not silent.
+            let id = uuid::Uuid::new_v4().to_string();
+            let envelope = serde_json::json!({
+                "id": id,
+                "attesting_key_id": subject,
+                "attested_key_id": "root-r",
+                "attestation_type": "delegates_to",
+                "scope": scope,
+            });
+            if let Err(e) = try_seed_scoped_attestation(
+                backend,
+                &id,
+                subject,
+                "root-r",
+                "delegates_to",
+                "federation",
+                envelope,
+            )
+            .await
+            {
+                eprintln!(
+                    "seed_common_root: no acceptance signed for {subject} (not rooted): {e:?}"
+                );
+            }
+        }
+    }
+
     async fn seed_owner_binding(backend: &MemoryBackend, owner: &str, node: &str) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = owner_binding_envelope(&id, owner, node);
@@ -15782,6 +16044,9 @@ pub(crate) mod tests {
         if bind {
             seed_owner_binding(&backend, "person-bob", "node-bob").await;
         }
+        // CIRISEdge#659 — alice and bob accept one valid root, so a local node
+        // owned by either is Rooted with bob's node once the binding is live.
+        seed_common_root(&backend, &["person-alice", "person-bob"]).await;
         backend
     }
 
@@ -15978,6 +16243,10 @@ pub(crate) mod tests {
         for peer in ["node-alice-b", "node-bob", "node-carol", "node-stranger"] {
             seed_consent_membership(&backend, "node-alice-a", peer).await;
         }
+        // CIRISEdge#659 — the three persons accept one valid root; the local
+        // node (node-alice-a) is alice's, so every OWNED peer here is Rooted
+        // with it. `node-stranger` is unowned and accepts nothing.
+        seed_common_root(&backend, &["person-alice", "person-bob", "person-carol"]).await;
         backend
     }
 
@@ -16780,6 +17049,11 @@ pub(crate) mod tests {
     async fn a_collective_routed_recipient_is_refused_rows_outside_its_reach() {
         use ciris_persist::federation::Audience;
         let backend = owner_axis_backend(true).await;
+        // CIRISEdge#659 — the local node here is unowned, so it is its own
+        // trust subject: an unclaimed node keeps `node → R` as bootstrap
+        // default trust, and that makes it Rooted with bob's node.
+        register_fixture_keys(&backend, &[("node-alice-a", identity_type::NODE)]).await;
+        seed_common_root(&backend, &["node-alice-a"]).await;
         let metrics = crate::observability::EdgeMetrics::default();
         let bridge = audience_bridge(&backend).with_metrics(Some(metrics.clone()));
         let mut memo = AudienceMemo::default();
@@ -16835,6 +17109,130 @@ pub(crate) mod tests {
         );
     }
 
+    /// CIRISEdge#659 — THE SERVE FLOOR: a peer in the send set that holds no
+    /// valid root in common with this node is served NOTHING, and the refusal
+    /// is booked as `recipient_not_rooted`; the same peer is served once its
+    /// subject accepts the root ours does. The positive control first, on the
+    /// same row and the same peer, so the refusal is the floor and not a peer
+    /// the gate would have refused anyway.
+    #[tokio::test]
+    async fn an_attributed_but_unrooted_peer_in_the_send_set_is_served_nothing() {
+        use crate::observability::WithholdReason;
+        let local = "local-node";
+        let producer = "producer";
+        let peer = "attributed-peer";
+        let (backend, bridge, metrics) =
+            make_metered_bridge(&[local.to_string(), producer.to_string(), peer.to_string()]);
+        let bridge = bridge.with_local_key_id(Some(local.to_string()));
+        register_fixture_keys(
+            &backend,
+            &[
+                (local, identity_type::NODE),
+                (producer, identity_type::USER),
+                (peer, identity_type::NODE),
+            ],
+        )
+        .await;
+        seed_advertised_attestation(&backend, producer).await;
+        // In the send set, and NOT rooted with us.
+        seed_consent_membership_unrooted(&backend, local, peer).await;
+
+        assert!(
+            bridge
+                .list_attestations_for_peer(Some(peer))
+                .await
+                .is_empty(),
+            "Attributed but not Rooted ⇒ served nothing (CIRISEdge#659)"
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.withholds_by_reason.keys().collect::<Vec<_>>(),
+            vec![&WithholdReason::RecipientNotRooted],
+            "every withhold is the floor, booked under its own name (one per row \
+             advertised); the peer IS in the send set, so nothing else refused: {:?}",
+            snap.withholds_by_reason
+        );
+
+        // Both subjects accept one valid root: the same row now reaches the same peer.
+        seed_common_root(&backend, &[local, peer]).await;
+        assert!(
+            !bridge
+                .list_attestations_for_peer(Some(peer))
+                .await
+                .is_empty(),
+            "a valid root in common ⇒ Rooted ⇒ served; nothing else changed"
+        );
+    }
+
+    /// CIRISEdge#659 — `Rooted` is a valid root in common, walked from each
+    /// side's OWNER. The peer is a genesis-shaped node: self-signed, never
+    /// conferred, owned; nothing injects it as Rooted and no test root scrubs
+    /// it. The four legs: different roots → not Rooted; the same valid root →
+    /// Rooted; the acceptance withdrawn → not Rooted on the next evaluation;
+    /// an unowned stranger with no acceptance → not Rooted.
+    #[tokio::test]
+    async fn rooted_with_holds_only_for_a_valid_root_in_common_through_the_owners() {
+        // A backend of its own: the shared fixtures seed a common root on
+        // purpose, and this witness is about NOT having one.
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-alice", identity_type::USER),
+                ("person-bob", identity_type::USER),
+                ("node-alice", identity_type::NODE),
+                ("node-bob", identity_type::NODE),
+                ("node-stranger", identity_type::NODE),
+                ("root-x", identity_type::USER),
+                ("root-y", identity_type::USER),
+                ("succ-x", identity_type::USER),
+            ],
+        )
+        .await;
+        seed_owner_binding(&backend, "person-alice", "node-alice").await;
+        seed_owner_binding(&backend, "person-bob", "node-bob").await;
+        seed_root_charter(&backend, "root-x", &["succ-x".to_string()]).await;
+        seed_root_charter(&backend, "root-y", &["succ-x".to_string()]).await;
+        let scope = serde_json::json!(["infra:attest", "infra:serve"]);
+        seed_delegates_to(&backend, "person-alice", "root-x", &scope).await;
+        // Bob's owner accepts a DIFFERENT valid root.
+        seed_delegates_to(&backend, "person-bob", "root-y", &scope).await;
+        let bridge = bridge_over(&backend, &["node-bob", "node-stranger"])
+            .with_local_key_id(Some("node-alice".to_string()));
+
+        let mut memo = AudienceMemo::default();
+        assert!(
+            !bridge.rooted_with("node-bob", &mut memo).await,
+            "two valid roots, none in common: Attributed at most"
+        );
+
+        // Bob's owner also accepts root-x — the intersection is on it.
+        let bob_accepts_x = seed_delegates_to(&backend, "person-bob", "root-x", &scope).await;
+        let mut memo = AudienceMemo::default();
+        assert!(
+            bridge.rooted_with("node-bob", &mut memo).await,
+            "a valid root in common through both owner-bindings ⇒ Rooted"
+        );
+        assert_eq!(
+            memo.rooted.get("node-bob"),
+            Some(&true),
+            "memoized for the sweep, and only the sweep"
+        );
+
+        // Withdrawn: the next evaluation drops it. Never cached past this.
+        seed_withdraws(&backend, "person-bob", &bob_accepts_x).await;
+        let mut memo = AudienceMemo::default();
+        assert!(
+            !bridge.rooted_with("node-bob", &mut memo).await,
+            "a withdrawn acceptance is not live: Rooted → Attributed on the next evaluation"
+        );
+
+        assert!(
+            !bridge.rooted_with("node-stranger", &mut memo).await,
+            "an unowned node with no acceptance of its own is not Rooted"
+        );
+    }
+
     /// CIRISPersist#897 / persist v47.0.0 — an `affiliations` row is served to
     /// the members of the affiliation the ROW names, exactly as a community
     /// row is, and to nobody else.
@@ -16849,6 +17247,10 @@ pub(crate) mod tests {
         let backend = owner_axis_backend(true).await;
         // The roster names person-bob; node-bob is bob's node (the owner axis).
         seed_community_with_member(&backend, "person-bob").await;
+        // CIRISEdge#659 — the serve floor: the local node here is unowned, so
+        // it is its own trust subject and accepts the fixture root directly.
+        register_fixture_keys(&backend, &[("node-alice-a", identity_type::NODE)]).await;
+        seed_common_root(&backend, &["node-alice-a"]).await;
         let metrics = crate::observability::EdgeMetrics::default();
         let bridge = audience_bridge(&backend).with_metrics(Some(metrics.clone()));
         let mut memo = AudienceMemo::default();
