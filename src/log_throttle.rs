@@ -4,7 +4,9 @@
 //! ## Why this exists
 //!
 //! Announces and link establishment are unauthenticated / advisory-admitted
-//! (CC 3.3.6.2 — an unauthenticated announce is a routing hint, never dropped),
+//! (CC 3.3, authorization is consumer-policy, not wire — an unauthenticated
+//! announce is a routing hint, never dropped; CC 3.3.6.2 is the authenticated
+//! identity↔address binding, a different clause — CIRISEdge#659),
 //! so a peer can flood a node with them. The library installs **no** tracing
 //! subscriber (the embedding binary does — see [`crate::observability`]), and
 //! the common `fmt::init()` default ships INFO-and-above to storage. So any
