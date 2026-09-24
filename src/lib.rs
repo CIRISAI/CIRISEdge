@@ -179,7 +179,7 @@ mod wire_vocabulary_hash_tests {
 // SERVE_ADVERTISE_POLICY_HASH test + all 815 behavioral tests still pass — so this
 // is a clean witness re-pin of the persist-internal apply policy (CIRISEdge#393).
 pub const PERSIST_REPLICATION_POLICY_HASH: &str =
-    "c1082c12db13b6d0f2240b910da2c0008a85b363df4f9b9b73a013ab28cb389d";
+    "9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19";
 
 #[cfg(test)]
 mod replication_policy_hash_tests {
@@ -212,7 +212,7 @@ mod replication_policy_hash_tests {
 // ceremony trust root confers (#665). Edge's consent handling is UNCHANGED (no
 // consent test regressed), so this is a clean witness re-pin (CIRISEdge#397 §5).
 pub const PERSIST_CONSENT_GRAMMAR_HASH: &str =
-    "ed2b0f2c8b5d3fc54450c180abce14f3d619074c24d5b8669663ff048d8bc482";
+    "07a677bbcdff236e2018f0786e8d9b0d0ef6b5b7cc2b871d41459e26ff8864a9";
 
 #[cfg(test)]
 mod consent_grammar_hash_tests {

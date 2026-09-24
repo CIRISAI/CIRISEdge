@@ -188,6 +188,8 @@ before — minus the four rows that now cross.
 | I7 | **The bootstrap kinds cross an Identified link and nothing else does.** | transport §5.4.1 proptest |
 | I8 | **Both directions are first contacts.** Production's topology (one-directional consent) converges to Rooted at both ends and to `trace:*` flowing one way. | `first_contact_ladder_659::…_shared_root…` with one-directional consent (#671) |
 | I9 | **Never ourselves.** | `resolved_state` test "never ourselves" |
+| I10 | **Deployment precondition — the self-publish set names the owner.** First contact carries only rows *authored by* a self-publish identity, and an owned node is judged through its **owner's** acceptance; a set of `[node]` alone hands a peer the node's own acceptance and no root for the trust subject, and the pair never Roots. The server's `self_publish_set` for a production node is `[node_key, owner_key]`. | ladder: `Node` publishes `[key, owner]`; `bridge::a_peer_outside_the_send_set_…_671` publishes `[local, owner]` and asserts the OWNER's acceptance crosses |
+| I11 | **Deployment precondition — a root is judged from the judge's own records.** `trust_root_valid` reads the charter and every holder's evidence-carrying key record from the judging node's directory; nothing at first contact carries a *third party's* charter (rung R2′). For the accord these rows are genesis-seeded on every node; for any other root they must have replicated (or been chartered locally) before acceptance can Root anyone. | ladder: `Node::new(.., roots, chartered)` — the different-roots rung withholds R's charter until the roots meet, and a peer that lacks a root's KEY refuses its charter at admission |
 
 ---
 
@@ -205,6 +207,11 @@ before — minus the four rows that now cross.
 ---
 
 ## 8. The six First-Contact Protocols, and where each one is mechanism here
+
+*Non-normative.* This section is the rationale a reviewer checks the contract against, not a
+source of gates: the normative rules are §2–§6 and the Constitution clauses they cite. Two of the
+six are structural here (**Look Before You Leap** is the rung order itself; **Treat Others** is the
+symmetry rule that #668/#671 implement); the rest name a disposition the mechanism honours.
 
 Quoted from [ciris.ai/first-contact](https://ciris.ai/first-contact); the right-hand column is
 the load-bearing rule in this document that realises it.

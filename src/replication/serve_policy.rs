@@ -57,7 +57,11 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         EnvelopeKind::IdentityOccurrenceRevocation
         | EnvelopeKind::Revocation
         | EnvelopeKind::FamilyMembershipRevocation
-        | EnvelopeKind::CommunityMembershipRevocation => ("global", "public"),
+        | EnvelopeKind::CommunityMembershipRevocation
+        // #860 — the widening is the revocation's append-plane mirror and rides
+        // its projection: every node that holds the room's record must fold the
+        // same events, or rosters diverge (the fork class the plane replaces).
+        | EnvelopeKind::CommunityMembershipWidening => ("global", "public"),
         EnvelopeKind::Organization | EnvelopeKind::OrgMembership | EnvelopeKind::PartnerRecord => {
             ("bulk_since", "public")
         }
@@ -116,6 +120,7 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         | EnvelopeKind::LocationProof
         | EnvelopeKind::FamilyMembershipRevocation
         | EnvelopeKind::CommunityMembershipRevocation
+        | EnvelopeKind::CommunityMembershipWidening
         | EnvelopeKind::Organization
         | EnvelopeKind::OrgMembership
         | EnvelopeKind::PartnerRecord
@@ -219,7 +224,7 @@ pub fn serve_advertise_policy_sha256() -> String {
 // carve). **CIRISServer must mirror this pin** (supersedes e8216fec…,
 // e54c5677… and 75ceef58…, none of which shipped server-side).
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "8249e30b5a0b48a8c309252c99eafdef86f3de04faf238d297143c443599c4ab";
+    "d6e4f0dfccbf02d274b7c76a70f8b3af8548d177fffaeed699efe3bd423b1df0";
 
 #[cfg(test)]
 mod tests {
