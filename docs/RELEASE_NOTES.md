@@ -1,5 +1,42 @@
 # CIRISEdge Release Notes
 
+# v30.3.1 — first contact: a node's own allegiance facts cross the consent gate too (CIRISEdge#671)
+
+**2026-09-24** (CIRISEdge#671, split from #659; measured by CIRISServer on the production-shaped
+ladder against v30.3.0). PATCH from v30.3.0 (adopted by nobody yet). Ladder triple unchanged:
+**edge v30.3.1 · persist v47.3.0 · verify v16.1.0**; no pin, ABI, hash or wheel-floor move.
+
+**The bug.** #668 exempted a node's own allegiance facts (owner-binding, acceptances) from the
+Rooted floor so two fresh peers could come to Root each other. That exemption sits *behind* the
+#396 item-1 send-set gate, which withheld the **whole** Attestation plane from any peer the node
+had not consented to. Production's canonical consents to no agent, so it never handed any agent
+its own owner-binding and acceptance; no agent could read it as Rooted; nobody served it
+`trace:*` — `peer_roots=0` at the agent, `recipient_not_in_send_set: 4` at the canonical.
+
+**The fix — `Reach::FirstContact`.** A peer in no send set is no longer refused a
+`ResolvedRecipient`; it is minted one whose reach the audience gate confines to **exactly this
+node's allegiance facts**: authored by a self-publish identity, `delegates_to`, and either
+persist's owner-binding shape (`is_owner_binding_envelope`) or a `trust:accepts:v1` edge, at
+`federation` audience. Every other row toward that peer still books `recipient_not_in_send_set`
+(same token, same counter, minus the four rows). The advertise gate view now carries
+`delegation_purpose` so the advertise and the fetch twin judge the same envelope. Never minted for
+the node itself. Counter `first_contact_recipients` on the bridge. **Rooted is still not consent**:
+a Rooted pair with no grant is served nothing about others (CC 3.3.7).
+
+**`FSD/FIRST_CONTACT.md` (new)** — the complete pair-level state space: the two axes (link ×
+consent), the closed sets that cross at each rung, the pair state machine with every regression,
+production's topology walked step by step, the gate order, nine invariants each with a witness,
+the certification rungs still owed, and the six ciris.ai First-Contact Protocols mapped to the
+mechanism that realises each.
+
+Witnesses: `bridge::a_peer_outside_the_send_set_is_served_exactly_this_nodes_allegiance_facts_671`
+(advertise + fetch twin; the self-authored non-allegiance row and a third party's row withheld;
+then Rooted without a grant — the set does not widen). The ladder's shared-root rung now builds
+**production's topology** (B consents to A, A consents to nobody): A's allegiance lands on B with
+no consent, B reads A as Rooted and serves A a row it holds about another, A serves B nothing
+about others and its `recipient_not_in_send_set` ledger moved. `consent_membership_fan_out_bound`
+keeps its assertion under the amended contract.
+
 # v30.3.0 — the end-to-end: a valid root is as attested as its holders (persist v47.3.0, CIRISPersist#901)
 
 **2026-09-24** (CIRISEdge#659, CIRISPersist#901 / #903; RCA CIRISServer#632). MINOR from v30.2.0.

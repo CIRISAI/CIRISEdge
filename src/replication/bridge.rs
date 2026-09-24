@@ -1138,6 +1138,10 @@ struct AudienceMemo {
     /// persist's `bounded_until`, because a sweep is seconds and the next one
     /// asks again.
     rooted: HashMap<String, bool>,
+    /// CIRISEdge#671 — persist's `trusted_roots_of(key)` fold per attester, for
+    /// one sweep: the allegiance predicate asks it once per self-publish
+    /// identity, not once per row.
+    roots: HashMap<String, Vec<String>>,
 }
 
 /// The cohorts one identity is a member of, by id.
@@ -1396,6 +1400,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// could not previously see happen: a `self` row leaving for a second
     /// device.
     collective_routed_recipients: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#671 — recipients minted at FIRST CONTACT: no grant, no owner
+    /// route, no collective — an Attributed stranger handed exactly this node's
+    /// allegiance facts so it can judge us. The number production's canonical
+    /// reads as "agents that can now Root me". `Relaxed`.
+    first_contact_recipients: std::sync::atomic::AtomicUsize,
     /// CIRISEdge#531 — the node-wide bound on SIMULTANEOUS bulk sweeps. Built
     /// from [`BridgeConfig::advertise_sweep_permits`]. Lives on the bridge
     /// rather than on `BridgeConfig` so the config stays `Copy`, and because
@@ -1665,6 +1674,7 @@ impl FederationDirectoryReplicationBridge {
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             collective_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
+            first_contact_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
             lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
@@ -1742,6 +1752,7 @@ impl FederationDirectoryReplicationBridge {
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
             collective_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
+            first_contact_recipients: std::sync::atomic::AtomicUsize::new(0),
             sweep_gate: SweepGate::new(config.advertise_sweep_permits),
             known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
             lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
@@ -3313,10 +3324,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                         if self
                             .audience_withholds(
                                 Self::audience_of_row_value(inner),
-                                inner
-                                    .get("attesting_key_id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or(""),
+                                inner,
                                 peer,
                                 resolved.reach(),
                                 &mut AudienceMemo::default(),
@@ -4726,11 +4734,17 @@ impl FederationDirectoryReplicationBridge {
         };
         serde_json::json!({
             "attesting_key_id": att.attesting_key_id,
+            // CIRISEdge#671 — the allegiance predicate reads the edge's far end.
+            "attested_key_id": att.attested_key_id,
             "attestation_type": att.attestation_type,
             "cohort_scope": att.cohort_scope,
             "cohort_target": cohort_target,
             "attestation_envelope": {
                 "dimension": att.attestation_envelope.get("dimension"),
+                // CIRISEdge#671 — the CC 2.4.1.2 owner-binding marker, so the
+                // allegiance predicate reads the same envelope on the advertise
+                // as the fetch twin reads off the wire row.
+                "delegation_purpose": att.attestation_envelope.get("delegation_purpose"),
             },
         })
     }
@@ -5514,64 +5528,92 @@ impl FederationDirectoryReplicationBridge {
         .map_err(|e| e.to_string())
     }
 
-    /// **CC 5.2 — the AUDIENCE gate, per recipient (v19.0.0).** Is `peer` in
-    /// the audience this row NAMES?
+    /// CIRISEdge#671 — is `row` one of THIS node's **allegiance facts**
+    /// (`FSD/FIRST_CONTACT.md` §0)? Authored by a self-publish identity (the
+    /// node key or its owner), a `delegates_to`, and one of exactly three
+    /// shapes, each decided by PERSIST's reading of the row, never by a local
+    /// rule about labels:
     ///
-    /// | `cohort_scope` | served to `peer` iff |
-    /// |---|---|
-    /// | `self` | the principal behind the attester == the principal behind the peer — the owner's OWN node set (CIRISConstitution#23) |
-    /// | `family` | the peer, or its principal, is a member of the family the row names |
-    /// | `community` | the peer, or its principal, is a member of the community the row names |
-    /// | `affiliations` / `species` / `biosphere` / `federation` | always (the consent bound already applied) |
+    /// - the CC 3.2 **owner-binding** — persist's `is_owner_binding_envelope`
+    ///   (the versioned dimension OR the CC 2.4.1.2 `delegation_purpose`);
+    /// - an **acceptance** of a root — the far end is in persist's own
+    ///   `trusted_roots_of(attester)` fold (direction inference, tombstones,
+    ///   expiry, the job-label rule: a dimension-less `delegates_to` IS an
+    ///   acceptance to persist, so it is one here);
+    /// - a **self-charter** — a self-loop `delegates_to(R → R)` (CC 4.4.3.8
+    ///   item 2; whether it is a VALID charter is the reader's
+    ///   `trust_root_valid` question, not this gate's).
     ///
-    /// # Why this exists
-    ///
-    /// Persist v39 admits `(federation, self)` at the crossing, so a
-    /// self-scoped row now EXISTS on the wire. The projection filter
-    /// ([`Self::attestation_is_advertised`], `SelfOwn`) decides whether THIS
-    /// node is the publisher of a row — producer-keyed and peer-blind, which is
-    /// right for the publish-own planes it was written for (a node's own key
-    /// record) and silent about WHO may receive a self row. Measured on the
-    /// first v19 mesh run: the owner's `self` copy of a chat message landed on
-    /// another person's node, because the owner's key is in this node's
-    /// publish set. The roster planes had this test since CIRISEdge#523
-    /// ([`Self::cohort_set_with_owners`]); the attestation rows did not.
-    ///
-    /// The walks are persist's — `admission_identity_for_writer` (the ONE
-    /// spelling of "the principal behind a key", the same AV-45 uses for a
-    /// writer) and `list_*_for_member` (the §4.3 predicate's own fan-out) —
-    /// memoized per sweep. Fail-closed: an unresolvable principal or
-    /// membership withholds, and every withhold is booked
-    /// (`RecipientNotInSendSet`) so the narrowing is never silent. Applied on
-    /// the advertise AND the direct-fetch twin, which must agree (the v18.2.0
-    /// lesson); the subject-Pull is first-party by construction and untouched.
-    async fn audience_withholds(
+    /// The set is closed under this predicate, not under "self-authored": a
+    /// self-authored consent grant, score or content row is not in it. Reads
+    /// the same keys on the advertise gate view and on the wire row.
+    async fn attestation_is_allegiance_fact(
         &self,
-        audience: Result<ciris_persist::federation::Audience, String>,
-        attester: &str,
-        peer: &str,
+        row: &serde_json::Value,
+        memo: &mut AudienceMemo,
+    ) -> bool {
+        use ciris_persist::federation::admission::is_owner_binding_envelope;
+        let field = |k: &str| row.get(k).and_then(serde_json::Value::as_str);
+        let (Some(attester), Some(far_end)) = (field("attesting_key_id"), field("attested_key_id"))
+        else {
+            return false;
+        };
+        let self_authored = self
+            .self_provider
+            .as_ref()
+            .is_some_and(|p| p().iter().any(|id| id == attester));
+        if !self_authored
+            || field("attestation_type")
+                != Some(ciris_persist::federation::types::attestation_type::DELEGATES_TO)
+        {
+            return false;
+        }
+        let env = row
+            .get("attestation_envelope")
+            .unwrap_or(&serde_json::Value::Null);
+        if is_owner_binding_envelope(env) || far_end == attester {
+            return true;
+        }
+        if !memo.roots.contains_key(attester) {
+            let roots = ciris_persist::federation::trust_root::trusted_roots_of(
+                &*self.directory,
+                attester,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap_or_default();
+            memo.roots.insert(attester.to_owned(), roots);
+        }
+        memo.roots
+            .get(attester)
+            .is_some_and(|roots| roots.iter().any(|r| r == far_end))
+    }
+
+    /// The REACH half of the audience question, per recipient: which rows the
+    /// axis that admitted this peer may carry at all. CIRISPersist#884 — the
+    /// self-collective / family reaches carry only rows of their scope;
+    /// CIRISEdge#671 — the first-contact reach carries only this node's own
+    /// allegiance facts. Both book `RecipientNotInSendSet`, the token the send
+    /// set already answers with, so the ledger reads one axis.
+    async fn reach_withholds(
+        &self,
         reach: Reach,
+        audience: &ciris_persist::federation::Audience,
+        row: &serde_json::Value,
+        peer: &str,
         memo: &mut AudienceMemo,
         site: &str,
     ) -> bool {
         use crate::observability::WithholdReason;
-        use ciris_persist::federation::Audience;
-        let audience = match audience {
-            Ok(a) => a,
-            Err(e) => {
-                self.withhold(
-                    WithholdReason::RecipientNotInSendSet,
-                    peer,
-                    &format!("{site}: audience unreadable — {e}"),
-                );
-                return true;
-            }
-        };
+        let attester = row
+            .get("attesting_key_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         // CIRISPersist#884 — the SEND-SET half of the audience question. A peer
         // the self-collective axis admitted is in the set for `self`/`family`
         // rows (own nodes) or `family` rows (family members' nodes) and for
         // nothing wider; the row half below still runs on what passes.
-        if !reach.admits(&audience) {
+        if !reach.admits(audience) {
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
@@ -5590,6 +5632,75 @@ impl FederationDirectoryReplicationBridge {
                 "attestation withheld — the recipient's send-set reach does not cover the \
                  row's scope (persist `send_set_for` is per scope; CIRISPersist#884)"
             );
+            return true;
+        }
+        // CIRISEdge#671 — FIRST CONTACT carries this node's allegiance facts and
+        // nothing else (`FSD/FIRST_CONTACT.md` §2, invariant I1). The reach
+        // already confined the audience to `federation`; this is the SHAPE
+        // half: a self-authored row that is not an allegiance fact (a consent
+        // grant, a score, content) stays behind the send set exactly as before,
+        // under the same ledger token, so a run reads the same counter it read
+        // before minus the four rows that now cross.
+        if reach == Reach::FirstContact && !self.attestation_is_allegiance_fact(row, memo).await {
+            self.withhold(
+                WithholdReason::RecipientNotInSendSet,
+                peer,
+                &format!(
+                    "{site}: attestation: not consent-included — first-contact reach carries \
+                     only this node's allegiance facts (CIRISEdge#671)"
+                ),
+            );
+            tracing::debug!(
+                peer,
+                attester,
+                site,
+                "attestation withheld — the recipient is an Attributed stranger (first \
+                 contact) and this row is not one of this node's allegiance facts \
+                 (CIRISEdge#671, FSD/FIRST_CONTACT.md §2)"
+            );
+            return true;
+        }
+        false
+    }
+
+    /// The walks are persist's — `admission_identity_for_writer` (the ONE
+    /// spelling of "the principal behind a key", the same AV-45 uses for a
+    /// writer) and `list_*_for_member` (the §4.3 predicate's own fan-out) —
+    /// memoized per sweep. Fail-closed: an unresolvable principal or
+    /// membership withholds, and every withhold is booked
+    /// (`RecipientNotInSendSet`) so the narrowing is never silent. Applied on
+    /// the advertise AND the direct-fetch twin, which must agree (the v18.2.0
+    /// lesson); the subject-Pull is first-party by construction and untouched.
+    async fn audience_withholds(
+        &self,
+        audience: Result<ciris_persist::federation::Audience, String>,
+        row: &serde_json::Value,
+        peer: &str,
+        reach: Reach,
+        memo: &mut AudienceMemo,
+        site: &str,
+    ) -> bool {
+        use crate::observability::WithholdReason;
+        use ciris_persist::federation::Audience;
+        let attester = row
+            .get("attesting_key_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let audience = match audience {
+            Ok(a) => a,
+            Err(e) => {
+                self.withhold(
+                    WithholdReason::RecipientNotInSendSet,
+                    peer,
+                    &format!("{site}: audience unreadable — {e}"),
+                );
+                return true;
+            }
+        };
+        if self
+            .reach_withholds(reach, &audience, row, peer, memo, site)
+            .await
+        {
             return true;
         }
         let served = match &audience {
@@ -5852,6 +5963,28 @@ impl FederationDirectoryReplicationBridge {
                 );
             }
             Some(_) => {}
+            // CIRISEdge#671 (`FSD/FIRST_CONTACT.md` §2 rung R2, §4 step 5) — an
+            // Attributed stranger: no grant names it, no axis widened to it. It
+            // is NOT withheld wholesale any more. Before this, the whole plane
+            // was, and the #668 floor exemption behind it was unreachable: a
+            // canonical that consents to nobody could never hand an agent its
+            // own owner-binding and acceptance, so no agent could ever read it
+            // as Rooted (CIRISServer#632, `recipient_not_in_send_set: 4`). The
+            // peer is minted a FIRST-CONTACT recipient, whose reach the audience
+            // gate confines to this node's allegiance facts; every other row
+            // toward it still books `recipient_not_in_send_set`, per row.
+            None if peer != local && !peer.is_empty() => {
+                self.first_contact_recipients
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    peer = peer_label,
+                    send_set_size = set.len(),
+                    "attestation plane narrowed to FIRST CONTACT — no consent:replication \
+                     grant names this peer; only this node's own allegiance facts \
+                     (owner-binding, acceptances, charter) may follow, so the peer can \
+                     judge us under Policy A (CIRISEdge#671, FSD/FIRST_CONTACT.md §2)"
+                );
+            }
             None => {
                 // CIRISEdge#524 — the line that must NAME the peer. See
                 // [`Self::log_send_set_withhold`].
@@ -5863,7 +5996,10 @@ impl FederationDirectoryReplicationBridge {
                 );
             }
         }
-        resolved
+        resolved.or_else(|| {
+            (peer != local && !peer.is_empty())
+                .then(|| ResolvedPeerSet::first_contact_recipient(peer))
+        })
     }
 
     /// **CIRISEdge#524 — a withhold that can name its peer.**
@@ -6559,10 +6695,7 @@ impl FederationDirectoryReplicationBridge {
                 if self
                     .audience_withholds(
                         Self::audience_of_view(&canonical_json),
-                        canonical_json
-                            .get("attesting_key_id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or(""),
+                        &canonical_json,
                         peer.as_str(),
                         peer.reach(),
                         &mut ctx.audience,
@@ -12704,11 +12837,15 @@ pub(crate) mod tests {
             "a consent-included peer receives the advertised attestations"
         );
 
-        // (b) consent-EXCLUDED peer → the WHOLE plane is withheld (item 1).
+        // (b) consent-EXCLUDED peer → nothing but this node's own allegiance
+        // facts (CIRISEdge#671 first contact), of which this fixture has none:
+        // the producer's row is about a third party, and `local` authored no
+        // owner-binding or acceptance. So: nothing (item 1).
         let excluded = bridge.list_attestations_for_peer(Some(peer_out)).await;
         assert!(
             excluded.is_empty(),
-            "a peer absent from the consent send-set receives no attestations (CIRISEdge#396 item 1)"
+            "a peer absent from the consent send-set receives nothing but the node's own \
+             allegiance facts — none here (CIRISEdge#396 item 1, #671)"
         );
     }
 
@@ -15093,7 +15230,11 @@ pub(crate) mod tests {
             "the consented peer's plane is not a withhold"
         );
 
-        // The consent-EXCLUDED peer loses the WHOLE plane — and it is counted.
+        // The consent-EXCLUDED peer is served nothing (no allegiance fact of
+        // `local` exists here) — and every row it was denied is counted, one
+        // withhold per row (CIRISEdge#671: the bound is per row at first
+        // contact, no longer one plane-wide refusal).
+        let denied = bridge.list_attestations_for_peer(None).await.len();
         assert!(bridge
             .list_attestations_for_peer(Some(peer_out))
             .await
@@ -15104,8 +15245,8 @@ pub(crate) mod tests {
                 .get(&WithholdReason::RecipientNotInSendSet)
                 .copied()
                 .unwrap_or(0),
-            1,
-            "the item-1 bound books ONE plane-wide withhold, got {:?}",
+            denied as u64,
+            "the item-1 bound books one withhold per denied row ({denied}), got {:?}",
             snap.withholds_by_reason
         );
         // The reason is the BRANCH: no other reason fired.
@@ -16514,7 +16655,7 @@ pub(crate) mod tests {
             bridge
                 .audience_withholds(
                     Err(err),
-                    "person-alice",
+                    &serde_json::json!({ "attesting_key_id": "person-alice" }),
                     "node-bob",
                     Reach::Consent,
                     &mut memo,
@@ -16918,9 +17059,20 @@ pub(crate) mod tests {
         let bridge = bridge
             .with_local_key_id(Some(local.to_string()))
             .with_metrics(Some(metrics.clone()));
-        register_fixture_keys(&backend, &[(local, identity_type::AGENT)]).await;
+        register_fixture_keys(
+            &backend,
+            &[
+                (local, identity_type::AGENT),
+                ("agent-producer", identity_type::AGENT),
+            ],
+        )
+        .await;
+        // A third party's row: at first contact (CIRISEdge#671) a real peer is
+        // denied it PER ROW, under its own id; an EMPTY peer id is a wiring
+        // fault and keeps the plane-wide, named refusal.
+        seed_advertised_attestation(&backend, "agent-producer").await;
 
-        // No consent grant at all → every peer is withheld (item 1, fail-closed).
+        // No consent grant at all → nothing is served (item 1, fail-closed).
         assert!(bridge.list_attestations_for_peer(Some("")).await.is_empty());
         assert!(bridge
             .list_attestations_for_peer(Some("node-bob"))
@@ -17082,7 +17234,7 @@ pub(crate) mod tests {
                 bridge
                     .audience_withholds(
                         Ok(Audience::Federation),
-                        "person-bob",
+                        &serde_json::json!({ "attesting_key_id": "person-bob" }),
                         "node-bob",
                         reach,
                         &mut memo,
@@ -17097,7 +17249,7 @@ pub(crate) mod tests {
             bridge
                 .audience_withholds(
                     Ok(Audience::SelfOnly),
-                    "person-bob",
+                    &serde_json::json!({ "attesting_key_id": "person-bob" }),
                     "node-bob",
                     Reach::Family,
                     &mut memo,
@@ -17119,7 +17271,7 @@ pub(crate) mod tests {
             !bridge
                 .audience_withholds(
                     Ok(Audience::Federation),
-                    "person-bob",
+                    &serde_json::json!({ "attesting_key_id": "person-bob" }),
                     "node-bob",
                     Reach::Consent,
                     &mut memo,
@@ -17335,6 +17487,168 @@ pub(crate) mod tests {
         );
     }
 
+    /// The wire hash a stored row advertises under (`put_attestation` stamps
+    /// `persist_row_hash`, so the hash is taken from the row as READ BACK).
+    async fn wire_hash_of(backend: &MemoryBackend, attestation_id: &str) -> [u8; 32] {
+        let rows = backend
+            .list_attestations_since(None, 4096)
+            .await
+            .expect("list");
+        let row = rows
+            .iter()
+            .find(|r| r.attestation.attestation_id == attestation_id)
+            .expect("the row was stored");
+        content_hash_of(&row.attestation).expect("hashable").0
+    }
+
+    /// CIRISEdge#671 — `FSD/FIRST_CONTACT.md` invariants I1 + I2, rung R2. A peer
+    /// this node has NOT consented to (empty cohort, no grant, no owner route)
+    /// is served EXACTLY this node's allegiance facts — its owner-binding, its
+    /// owner's acceptance, its own acceptance — on the advertise and on the
+    /// fetch twin; a self-authored row of any other shape and a third party's
+    /// row are withheld under `recipient_not_in_send_set`. Then the pair is
+    /// made Rooted and the set does not widen: Rooted is not consent.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_peer_outside_the_send_set_is_served_exactly_this_nodes_allegiance_facts_671() {
+        use crate::observability::WithholdReason;
+        let backend = Arc::new(MemoryBackend::new());
+        let (local, owner, peer, peer_owner) =
+            ("node-local", "person-local", "node-peer", "person-peer");
+        register_fixture_keys(
+            &backend,
+            &[
+                (local, identity_type::NODE),
+                (owner, identity_type::USER),
+                (peer, identity_type::NODE),
+                (peer_owner, identity_type::USER),
+                ("root-r", identity_type::USER),
+                ("succ-1", identity_type::USER),
+                ("person-third", identity_type::USER),
+            ],
+        )
+        .await;
+        let owner_binding = seed_owner_binding(&backend, owner, local).await;
+        seed_root_charter(&backend, "root-r", &["succ-1".to_string()]).await;
+        let scope = serde_json::json!(["infra:attest", "infra:serve"]);
+        let owner_accepts = seed_delegates_to(&backend, owner, "root-r", &scope).await;
+        let node_accepts = seed_delegates_to(&backend, local, "root-r", &scope).await;
+        // Self-authored but NOT an allegiance fact — the owner's own
+        // `consent:replication:v1` grant naming a third party (CC 3.3.7: the
+        // consent object itself; a self-loop `delegates_to` would be a
+        // self-charter shape and IS an allegiance fact). The narrowness control
+        // for I1: consent rows never ride first contact.
+        let self_other = uuid::Uuid::new_v4().to_string();
+        seed_raw_attestation(
+            &backend,
+            &self_other,
+            owner,
+            "person-third",
+            "scores",
+            serde_json::json!({
+                "id": self_other,
+                "attesting_key_id": owner,
+                "attested_key_id": "person-third",
+                "attestation_type": "scores",
+                "dimension": "consent:replication:v1",
+                "payload": { "grants": "transfer", "attestation_prefixes": ["trace:"] },
+            }),
+        )
+        .await;
+        let third_party = seed_advertised_attestation(&backend, "person-third").await;
+
+        let publish = vec![local.to_string(), owner.to_string()];
+        let metrics = crate::observability::EdgeMetrics::new();
+        // NO consent to `peer`: empty cohort, no grant, and `peer` is not owned by
+        // `owner` — the send set is empty and every axis is dark.
+        let bridge = bridge_over(&backend, &[])
+            .with_local_key_id(Some(local.to_string()))
+            .with_self_provider(Some(Arc::new(move || publish.clone())))
+            .with_metrics(Some(metrics.clone()));
+
+        let allegiance: std::collections::BTreeSet<[u8; 32]> = [
+            wire_hash_of(&backend, &owner_binding).await,
+            wire_hash_of(&backend, &owner_accepts).await,
+            wire_hash_of(&backend, &node_accepts).await,
+        ]
+        .into_iter()
+        .collect();
+        let served: std::collections::BTreeSet<[u8; 32]> = bridge
+            .list_attestations_for_peer(Some(peer))
+            .await
+            .into_iter()
+            .map(|r| r.envelope_hash)
+            .collect();
+        assert_eq!(
+            served, allegiance,
+            "first contact serves EXACTLY the owner-binding + the two acceptances (I1)"
+        );
+        assert!(
+            metrics.withholds(WithholdReason::RecipientNotInSendSet) >= 2,
+            "the self-authored non-allegiance row and the third party's row are withheld under \
+             the unchanged token: {:?}",
+            metrics.snapshot().withholds_by_reason
+        );
+        // The fetch twin agrees, both ways.
+        let self_other_hash = wire_hash_of(&backend, &self_other).await;
+        let third_hash = wire_hash_of(&backend, &third_party).await;
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &self_other_hash,
+                    Some(peer)
+                )
+                .await
+                .is_none(),
+            "a self-authored non-allegiance row is not fetchable out-of-band at first contact"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &third_hash, Some(peer))
+                .await
+                .is_none(),
+            "a third party's row is not fetchable at first contact"
+        );
+        let accept_hash = wire_hash_of(&backend, &owner_accepts).await;
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &accept_hash, Some(peer))
+                .await
+                .is_some(),
+            "an allegiance fact IS fetchable at first contact (advertise and fetch agree)"
+        );
+        assert!(
+            bridge
+                .first_contact_recipients
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 1,
+            "the first-contact mint is counted (once per resolution — the advertise and each \
+             fetch resolve the recipient through the same door)"
+        );
+
+        // I2 — Rooted is not consent. The peer's owner accepts the same valid
+        // root; the pair is Rooted at this node; the served set does not widen.
+        seed_owner_binding(&backend, peer_owner, peer).await;
+        seed_delegates_to(&backend, peer_owner, "root-r", &scope).await;
+        let mut memo = AudienceMemo::default();
+        assert!(
+            bridge.rooted_with(peer, &mut memo).await,
+            "a valid root in common through both owner-bindings ⇒ Rooted"
+        );
+        let served_rooted: std::collections::BTreeSet<[u8; 32]> = bridge
+            .list_attestations_for_peer(Some(peer))
+            .await
+            .into_iter()
+            .map(|r| r.envelope_hash)
+            .collect();
+        assert_eq!(
+            served_rooted, allegiance,
+            "Rooted without a consent:replication grant is still first contact: the same \
+             allegiance facts and nothing about others (I2, CC 3.3.7)"
+        );
+    }
+
     /// CIRISPersist#897 / persist v47.0.0 — an `affiliations` row is served to
     /// the members of the affiliation the ROW names, exactly as a community
     /// row is, and to nobody else.
@@ -17362,7 +17676,7 @@ pub(crate) mod tests {
                     Ok(Audience::Affiliations {
                         community_key_id: "chat-room".into(),
                     }),
-                    "person-bob",
+                    &serde_json::json!({ "attesting_key_id": "person-bob" }),
                     "node-bob",
                     Reach::Consent,
                     &mut memo,
@@ -17377,7 +17691,7 @@ pub(crate) mod tests {
                     Ok(Audience::Affiliations {
                         community_key_id: "some-other-affiliation".into(),
                     }),
-                    "person-bob",
+                    &serde_json::json!({ "attesting_key_id": "person-bob" }),
                     "node-bob",
                     Reach::Consent,
                     &mut memo,
@@ -17391,7 +17705,7 @@ pub(crate) mod tests {
             !bridge
                 .audience_withholds(
                     Ok(Audience::Species),
-                    "person-bob",
+                    &serde_json::json!({ "attesting_key_id": "person-bob" }),
                     "node-bob",
                     Reach::Consent,
                     &mut memo,

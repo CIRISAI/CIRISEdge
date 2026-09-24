@@ -641,7 +641,9 @@ Two invariants the table encodes, and the proptest holds:
    "the peer delivers its allegiance" *is* "we let it pull those rows"; a floor over them
    deadlocked two fresh peers in the first-contact ladder, each withholding what would have
    made it Rooted with the other. Rooted is the *floor* for everything the node holds ABOUT
-   OTHERS. Because `Rooted` is allegiance (self-declarable), **no serve, score, vouch or
+   OTHERS. The same four rows cross the CONSENT gate too (`#671`, reach `FirstContact`) —
+   the complete pair-level state space, both axes, is `FSD/FIRST_CONTACT.md`. Because
+   `Rooted` is allegiance (self-declarable), **no serve, score, vouch or
    audience decision may take `Rooted` as sufficient; conferral or consent remains the
    gate**: `trace:*` needs the recipient's `infra:serve` *conferred* by a root the sender
    trusts (`capability_roots_to_trusted_root`, `has_accord_conferred_role`); trust
@@ -819,7 +821,7 @@ projection (§3). Three gates compose, narrowest question last
 
 | Gate | Question | Mechanism |
 |---|---|---|
-| **`#396` item 1 — consent membership** | May *any* consentable claim flow to this peer? | `list_consent_peers(local)` → `ResolvedPeerSet`; a `ResolvedRecipient` exists **iff** consent includes the peer. Fail-closed → no advertise, no fetch. |
+| **`#396` item 1 — consent membership** | May *any* consentable claim flow to this peer? | `list_consent_peers(local)` → `ResolvedPeerSet`; a `ResolvedRecipient` with reach `Consent` exists **iff** consent includes the peer (or the owner-binding / self-collective axes widen to it). Fail-closed → no advertise, no fetch — **except first contact (`#671`, `FSD/FIRST_CONTACT.md` §2)**: a peer in no set is minted reach `FirstContact`, which carries only this node's own allegiance facts at `federation` audience, so the peer can judge us under Policy A (CC 4.4.3.8); everything else still books `recipient_not_in_send_set`. |
 | **`#379` `infra:serve`** | May a `trace:*` attestation be served at all? | `peer_has_serve_capability` = accord-conferred `infra:serve` (`has_effective_role`) **AND** roots to a root *this node* trusts (`capability_roots_to_trusted_root`). |
 | **`#396` item 6 — `recipient_capability`** | Which serve-eligible peer still gets *this* row? | The row owner's live consent grant may attach `recipient_capability` restrictions covering the row's `dimension`; the recipient must hold each. |
 

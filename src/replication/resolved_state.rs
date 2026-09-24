@@ -84,6 +84,14 @@ pub(crate) enum Reach {
     /// The peer is a family member's node (persist `send_set_for(family)`):
     /// `family` rows only.
     Family,
+    /// CIRISEdge#671 (`FSD/FIRST_CONTACT.md` §2, rung R2) — no grant names the
+    /// peer, no axis widened to it: it is an Attributed stranger. The recipient
+    /// exists so that this node's OWN allegiance facts (owner-binding,
+    /// acceptances, charter) can reach a peer that has not been consented to —
+    /// the rows a reader needs before Policy A (CC 4.4.3.8) can be evaluated
+    /// about us at all. It carries nothing else: `admits` allows only
+    /// `federation`, and the audience gate narrows it to the allegiance shape.
+    FirstContact,
 }
 
 impl Reach {
@@ -98,6 +106,7 @@ impl Reach {
                 matches!(audience, Audience::SelfOnly | Audience::Family { .. })
             }
             Self::Family => matches!(audience, Audience::Family { .. }),
+            Self::FirstContact => matches!(audience, Audience::Federation),
         }
     }
 
@@ -108,6 +117,7 @@ impl Reach {
             Self::Consent => "consent",
             Self::SelfCollective => "self_collective",
             Self::Family => "family",
+            Self::FirstContact => "first_contact",
         }
     }
 }
@@ -254,6 +264,20 @@ impl ResolvedPeerSet {
             key_id: peer_key_id.to_owned(),
             reach,
         })
+    }
+
+    /// CIRISEdge#671 — the recipient for a peer in NONE of the sets: reach
+    /// `FirstContact`, which the audience gate confines to this node's own
+    /// allegiance facts. Minted by the bridge's one door
+    /// (`resolve_attestation_recipient`) only after `recipient` answered
+    /// `None`, and never for the node itself. It is a `ResolvedRecipient` so the
+    /// serve and fetch paths need no second key type: the narrowing lives in
+    /// the reach, not in a bypass.
+    pub(crate) fn first_contact_recipient(peer_key_id: &str) -> ResolvedRecipient {
+        ResolvedRecipient {
+            key_id: peer_key_id.to_owned(),
+            reach: Reach::FirstContact,
+        }
     }
 
     /// Is `key_id` in the set ONLY because it is one of the owner's own
