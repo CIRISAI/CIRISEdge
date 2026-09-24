@@ -624,8 +624,13 @@ Two invariants the table encodes, and the proptest holds:
 
 1. **Nothing below `Rooted` is ever served — and `Rooted` is never SUFFICIENT.** Identified
    delivers only self-authenticating bootstrap records; **Attributed delivers any kind and
-   persist decides admission, but is served nothing**; Rooted is the *floor* for being
-   served. Because `Rooted` is allegiance (self-declarable), **no serve, score, vouch or
+   persist decides admission, but is served nothing** except the serving node's OWN
+   self-authenticating facts — rows authored by its self-publish identities (its node key,
+   its owner): the owner-binding and the owner's acceptance. Replication is pull-based, so
+   "the peer delivers its allegiance" *is* "we let it pull those rows"; a floor over them
+   deadlocked two fresh peers in the first-contact ladder, each withholding what would have
+   made it Rooted with the other. Rooted is the *floor* for everything the node holds ABOUT
+   OTHERS. Because `Rooted` is allegiance (self-declarable), **no serve, score, vouch or
    audience decision may take `Rooted` as sufficient; conferral or consent remains the
    gate**: `trace:*` needs the recipient's `infra:serve` *conferred* by a root the sender
    trusts (`capability_roots_to_trusted_root`, `has_accord_conferred_role`); trust

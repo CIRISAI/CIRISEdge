@@ -5647,7 +5647,22 @@ impl FederationDirectoryReplicationBridge {
         // because attribution no longer asks about trust. Evaluated last so a
         // refusal that has a more specific cause keeps its own name; Rooted is a
         // floor, never sufficient (§5.4.1 invariant 1).
-        if !self.rooted_with(peer, memo).await {
+        //
+        // ONE exemption, found by the first-contact ladder: replication is
+        // pull-based, so "the peer delivers its allegiance rows" MEANS "we let
+        // the peer pull the rows we authored about ourselves" — our owner-binding
+        // and our owner's acceptance, the rows that establish Rooted in the
+        // first place. A floor over those deadlocks two fresh peers forever (each
+        // waits for the other's allegiance, each withholds its own). Rows authored
+        // by this node's SELF-PUBLISH identities (the node key, its owner) are the
+        // node's own self-authenticating facts, the Attestation-plane twins of the
+        // bootstrap kinds, and cross to an Attributed peer. Everything this node
+        // holds ABOUT OTHERS stays behind the floor.
+        let self_authored = self
+            .self_provider
+            .as_ref()
+            .is_some_and(|p| p().iter().any(|id| id == attester));
+        if !self_authored && !self.rooted_with(peer, memo).await {
             self.withhold(
                 WithholdReason::RecipientNotRooted,
                 peer,
@@ -17127,7 +17142,9 @@ pub(crate) mod tests {
         register_fixture_keys(
             &backend,
             &[
-                (local, identity_type::NODE),
+                // `local` is a USER here so it can author the self-authored row the
+                // exemption serves (persist refuses agency rows from a node key).
+                (local, identity_type::USER),
                 (producer, identity_type::USER),
                 (peer, identity_type::NODE),
             ],
@@ -17153,14 +17170,36 @@ pub(crate) mod tests {
             snap.withholds_by_reason
         );
 
-        // Both subjects accept one valid root: the same row now reaches the same peer.
+        // The exemption the first-contact ladder found: a row THIS NODE authored
+        // (its own allegiance-shaped fact) reaches the unrooted peer — that is
+        // how the peer can ever come to hold what makes us Rooted with it.
+        let publish = vec![local.to_string()];
+        let bridge = bridge.with_self_provider(Some(Arc::new(move || publish.clone())));
+        seed_advertised_attestation(&backend, local).await;
+        let served = bridge.list_attestations_for_peer(Some(peer)).await;
+        assert_eq!(
+            served.len(),
+            2,
+            "exactly the self-authored rows cross to an Attributed peer — the row `local` \
+             just authored AND the consent row `local` authored about the peer; the third \
+             party's stays behind the floor: {served:?}"
+        );
+
+        // Both subjects accept one valid root: the third party's row now reaches the peer too.
         seed_common_root(&backend, &[local, peer]).await;
+        let after = bridge.list_attestations_for_peer(Some(peer)).await;
+        let before: std::collections::HashSet<[u8; 32]> =
+            served.iter().map(|r| r.envelope_hash).collect();
+        let newly: Vec<_> = after
+            .iter()
+            .filter(|r| !before.contains(&r.envelope_hash))
+            .collect();
         assert!(
-            !bridge
-                .list_attestations_for_peer(Some(peer))
-                .await
-                .is_empty(),
-            "a valid root in common ⇒ Rooted ⇒ served; nothing else changed"
+            !newly.is_empty(),
+            "a valid root in common ⇒ Rooted ⇒ rows this node holds ABOUT OTHERS (the third \
+             party's, the root's charter, the acceptances) are served too; before={} after={}",
+            served.len(),
+            after.len()
         );
     }
 
