@@ -472,7 +472,11 @@ roots_of(k)  = persist trusted_roots_of(k): live delegates_to(k → R, infra:*),
 owner_of(P)  = the live owner-binding delegates_to(owner → P, infra:*) — persist owner_of
 valid        = persist trust_root_valid: the edge exists; R self-declares with BOTH
                infra:serve and infra:attest and carries the recovery pre-commitment;
-               no halt latched. Family (threshold) roots included (persist v24, #557).
+               no halt latched; and EVERY charter holder's key record (the self-charter's
+               signer on a Key root, the verified seated scrubs on a Family root) carries
+               hardware evidence passing Layer A, and Layer B for any class N pins a root
+               for (persist v47.3.0, #901 — holders_hardware_attested folded into valid).
+               Family (threshold) roots included (persist v24, #557).
 ```
 
 Persist already implements every leg; edge composes them (`shares_a_trust_root_with`
@@ -499,11 +503,18 @@ and the accord relay gate. Renaming that field is out of scope; the FSD calls it
    chain walk (Layer B, YubiKey PIV to Yubico's root). **The rule:** R is valid at N iff,
    besides the existing legs, *every charter holder's key record carries evidence that
    passes Layer A, and Layer B for any class N holds a pinned attestation root for* —
-   evaluated in `trust_root_valid` on N from N's records. **Persist ask** (filed): the
-   holder-hardware leg in `trust_root_valid`, and Layer A on replicated key records
-   regardless of type. Edge composes; nothing is re-derived here. Nonce freshness stays an
-   admission-time check (re-checking it at validity time would expire every real root a
-   day after its holders registered).
+   evaluated in `trust_root_valid` on N from N's records. **Landed:** persist v47.3.0
+   (CIRISPersist#901 / #903, `FSD/TRUST_ROOT_HOLDER_HARDWARE.md`) — the holder-hardware
+   leg in `trust_root_valid` (`TrustRootVerdict.holders_hardware`, one entry per holder
+   with the layer that failed; `holders_hardware_attested` folded into `valid`), and Layer
+   A on any replicated key record that carries evidence, whatever its type (a row with
+   none is admitted, never downgraded). Edge v30.3.0 adopts; `rooted_with` reads `.valid`
+   and re-derives nothing — witness
+   `bridge::a_common_root_whose_holder_is_unattested_is_not_rooted_901` (the evidence
+   column is the only difference between not-Rooted and Rooted), and the first-contact
+   ladder (`tests/first_contact_ladder_659.rs`) runs green over evidence-carrying holders.
+   Nonce freshness stays an admission-time check (re-checking it at validity time would
+   expire every real root a day after its holders registered).
 2. **Resolved (2026-09-23, no new rule).** Announcing *is* the participation act: the
    owner re-signs the node's owner-binding at `cohort_scope: federation`
    (`promote_owner_binding_to_federation`), and the production canonical already holds

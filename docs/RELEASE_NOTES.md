@@ -1,5 +1,55 @@
 # CIRISEdge Release Notes
 
+# v30.3.0 — the end-to-end: a valid root is as attested as its holders (persist v47.3.0, CIRISPersist#901)
+
+**2026-09-24** (CIRISEdge#659, CIRISPersist#901 / #903; RCA CIRISServer#632). MINOR from v30.2.0.
+Ladder triple: **edge v30.3.0 · persist v47.3.0 · verify v16.1.0** — all four persist ABI constants
+and `CONSENT_GRAMMAR_HASH` unchanged from v47.1.0; wheel floor `ciris-persist>=47,<48` unchanged.
+
+## The leg edge composes over
+
+persist `trust_root_valid` now judges every charter holder's key record where the root is judged:
+**Layer A** = the structural hardware-evidence check with no clock; **Layer B** = the YubiKey PIV
+chain walk where the judging node pins a root (`layer_b: None` for TPM / Secure Enclave /
+StrongBox — never a refusal); `holders_hardware_attested` is folded into `valid`. Edge's
+`rooted_with` reads `.valid` and re-derives nothing, so the ruling lands in the serve floor by
+construction. **Consequence:** a Key-kind root whose holder's record carries no hardware evidence
+is not valid ⇒ two peers accepting only it are Attributed, never Rooted ⇒ each is served nothing
+but the other's self-authored facts. Replicated key records that *carry* evidence are
+structurally checked where they land (persist §3.5); a row with none is admitted, never
+downgraded — edge's Key plane needs no change.
+
+- Witness: `bridge::a_common_root_whose_holder_is_unattested_is_not_rooted_901` — same walk, same
+  charter shape, same acceptances; the evidence column is the only difference (unattested ⇒ not
+  Rooted, attested ⇒ Rooted). Persist's I154–I158 prove the leg itself.
+- **The first-contact ladder is green against v47.3.0** with evidence-carrying holder records —
+  the end-to-end for #659: a self-signed, owned peer is Attributed on its announce, its rows are
+  admitted, the owners accept a root whose holder is attested, the pair is Rooted, and it is
+  served.
+
+## Fixture consequence (test code only)
+
+Every edge fixture key record now carries persist's own Layer-A-valid mock evidence
+(`hardware_attestation::test_support::fresh_accord_holder_evidence`): `bridge::tests::fixture_key_record`
+and the ladder's `Ident::mint_record`. That helper is gated on persist's `test-anchor` feature, so
+the **dev-dependency** on `ciris-persist` now enables it — cargo unifies dev-dependency features
+into `cargo test` / `--all-targets` builds only, so no release artifact changes and edge's own
+`test-anchor` feature is untouched.
+
+## Also in persist v47.2.0 (adopted; no edge code change)
+
+- CC 2.3 at the bytes plane: `BlobError::Withdrawn { sha256_hex, attestation_id, withdraws_id }`
+  (kind `blob_withdrawn`) from `read_blob_as` / `read_blob_range_as` / `serve_blob_to_peer` —
+  edge's `MissReason::Withdrawn` / `ChunkSourceRefusal::Withdrawn` are now reachable from
+  persist's serve door; `Engine::evict_blob(sha)`; the resolver sees both reference shapes
+  (`evidence_refs` or a typed `BlobPointer`). Python: `RuntimeError("blob_withdrawn: <sha>")`.
+- `TrustRootVerdict` gains `holders_hardware` / `holders_hardware_attested` (additive,
+  `serde(default)`).
+
+Gates: bridge module 152/152; ladder 2/2 (63 s); `rooting_chain_walk`; the test-anchor ALLOW
+path; `accord_carrier_verify` / `agent_mode_init` / `delegation_reads_e2e` /
+`conformance_vectors_v19`; `check --all-targets`; clippy `-D warnings` on the CI combos.
+
 # v30.2.0 — attribution is not trust: the trace plane relights
 
 **2026-09-24** (PRs #660, #663, #664, #666, #667, #668; CIRISEdge#659, #661, #662; RCA CIRISServer#632). MINOR from
