@@ -10,8 +10,13 @@
 //!
 //! Two witnesses:
 //! - **`a_self_signed_owned_peer_under_a_shared_root_is_attributed_and_served`** —
-//!   B's rows land on A (delivery: Attributed), and A's rows land on B (served:
-//!   Rooted), in both directions.
+//!   production's topology (CIRISEdge#671, `FSD/FIRST_CONTACT.md` §4): B (the
+//!   agent) consents to A (the canonical); A consents to NOBODY. B's rows land
+//!   on A (delivery: Attributed). A's allegiance facts land on B although A
+//!   never consented (first contact, rung R2) — so B reads A as Rooted and
+//!   serves it what B holds about others (rung R4, B → A). A serves B nothing
+//!   about others (rung R2′: Rooted is not consent) and its
+//!   `recipient_not_in_send_set` ledger moved.
 //! - **`under_different_roots_a_peer_delivers_but_is_served_nothing_until_the_roots_meet`** —
 //!   B's owner accepts a different valid root: A still admits B's rows; A's OWN
 //!   allegiance facts (the rows its self-publish identities authored) cross to
@@ -591,16 +596,41 @@ async fn a_self_signed_owned_peer_under_a_shared_root_is_attributed_and_served()
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = Root::new("root-r", 0x70).await;
+    // Two more valid roots nobody accepts: their charters are rows a node holds
+    // ABOUT ANOTHER. Both directories know every root's KEY (a charter is
+    // self-signed, so its admission needs the signer's record); Q's charter is
+    // held only at B, S's only at A.
+    let root_q = Root::new("root-q", 0x74).await;
+    let root_s = Root::new("root-s", 0x78).await;
     let key_a = Arc::new(Ident::new("node-a", 0x0a).await);
     let key_b = Arc::new(Ident::new("node-b", 0x0b).await);
-    let a = Node::new("a", Arc::clone(&key_a), 0x0a, &[&key_b], &[&root], &[&root]).await;
-    let b = Node::new("b", Arc::clone(&key_b), 0x0b, &[&key_a], &[&root], &[&root]).await;
+    let a = Node::new(
+        "a",
+        Arc::clone(&key_a),
+        0x0a,
+        &[&key_b],
+        &[&root, &root_q, &root_s],
+        &[&root, &root_s],
+    )
+    .await;
+    let b = Node::new(
+        "b",
+        Arc::clone(&key_b),
+        0x0b,
+        &[&key_a],
+        &[&root, &root_q, &root_s],
+        &[&root, &root_q],
+    )
+    .await;
     assert_not_rooted_at_steward(&a.dir, &b.key).await;
     assert_not_rooted_at_steward(&b.dir, &a.key).await;
-    // Both owners accept the same valid root; each node consents the other.
+    let charter_q = root_q.charter().await.attestation_id;
+    let charter_s = root_s.charter().await.attestation_id;
+    // Both owners accept the same valid root. Production's consent topology
+    // (CIRISEdge#671): the agent B consents to the canonical A; A consents to
+    // nobody.
     let a_accepts = a.accept(&root).await;
     let b_accepts = b.accept(&root).await;
-    a.consent(&b.key).await;
     b.consent(&a.key).await;
 
     let (ta, tb) = transports(&a, &b, tmp.path()).await;
@@ -627,15 +657,46 @@ async fn a_self_signed_owned_peer_under_a_shared_root_is_attributed_and_served()
         "B's owner-binding and acceptance must land on A: an Attributed peer delivers"
     );
 
-    // SERVING (Rooted): A's acceptance lands on B — A serves B only with a valid
-    // root in common, and it has one.
+    // FIRST CONTACT (rung R2): A's allegiance facts land on B although A never
+    // consented to B — before CIRISEdge#671 the send-set gate withheld A's whole
+    // plane here and B could never read A as Rooted (CIRISServer#632).
     let served = drive_until(&[&rt_b, &rt_a], Duration::from_secs(180), || async {
-        b.holds(&a_accepts).await
+        b.holds(&a_accepts).await && b.holds(&format!("owner-binding-{}", a.key.key_id)).await
     })
     .await;
     assert!(
         served,
-        "A's acceptance must land on B: a Rooted peer is served (both directions)"
+        "A's owner-binding and acceptance must land on B with NO consent from A: first \
+         contact carries a node's own allegiance facts (CIRISEdge#671)"
+    );
+
+    // RUNG R4, B → A: B consented to A and now reads A as Rooted, so what B holds
+    // about ANOTHER (Q's charter) is served to A.
+    let b_serves = drive_until(&[&rt_b, &rt_a], Duration::from_secs(180), || async {
+        a.holds(&charter_q).await
+    })
+    .await;
+    assert!(
+        b_serves,
+        "once B reads A as Rooted, B (consented to A) serves A what it holds about others"
+    );
+
+    // RUNG R2′, A → B: Rooted is not consent. What A holds about another (S's
+    // charter) never reaches B, and A's send-set ledger says why.
+    let leaked = drive_until(&[&rt_b, &rt_a], Duration::from_secs(20), || async {
+        b.holds(&charter_s).await
+    })
+    .await;
+    assert!(
+        !leaked,
+        "A never consented to B: a row A holds about another stays behind the send set even \
+         though the pair is Rooted (FSD/FIRST_CONTACT.md rung R2′)"
+    );
+    let narrowed = a.metrics.withholds(WithholdReason::RecipientNotInSendSet);
+    assert!(
+        narrowed > 0,
+        "the send-set gate itself withheld at A (RecipientNotInSendSet={narrowed}) — an absence \
+         alone is not a witness"
     );
     std::mem::forget(tmp);
 }
