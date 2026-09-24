@@ -1,5 +1,95 @@
 # CIRISEdge Release Notes
 
+# v30.1.0 — adopt persist v46.5.0 + v47.0.0 (the drives open), and a file over 1 MiB is a chunk DAG
+
+**2026-09-23** (PR #658; CIRISEdge#633, CIRISPersist#893/#897/#797). MINOR from v30.0.0, which no
+host adopted (CIRISServer stayed on v29.5.0), so the shape changes below cost nobody a second adopt.
+Ladder triple: **edge v30.1.0 · persist v47.1.0 · verify v16.1.0**. All four persist ABI constants
+and `CONSENT_GRAMMAR_HASH` are unchanged; the wheel floor moves to `ciris-persist>=47,<48` because
+persist's cut is a MAJOR.
+
+## Adopt: persist v47.1.0 — the adopters' asks (CIRISPersist#861, #842)
+
+- **`BlobError::SealDidNotOpen`** (#842, edge's ask) — "did not open" is typed. `PersistGroupContentStore::map_err`
+  string-matched persist's prose (`contains("decrypt")`) to keep `SealMismatch` distinct from
+  `NotGranted`; it now matches the variant. The substitution witness still binds.
+- **Both membership-removal doors are idempotent** on every backend (#861): a repeat community removal
+  is a no-op with **no second DEK rotation**; a repeat family removal is a no-op unless it moves the
+  removal earlier. Nothing in edge worked around the old `UNIQUE` failure, so nothing is removed here.
+
+## Adopt: the community and family drives are open (CIRISPersist#893, persist v46.5.0)
+
+The §4.3 read gate's targeted arms compared the row's PRODUCER against the caller's room set, so no
+member could read their own room, and v30.0.0 refused targeted rooms by name. V150 adds
+`cohort_target`, a generated column over the same envelope aliases the write gate validates, and
+both gate twins key on it per arm. **`FileError::DriveGateUnavailable` is deleted** — an exhaustive
+match on `FileError` loses an arm. `files::in_room` takes every room kind through one gate.
+Witness: the community leg of `a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index`
+(R10: the room's file, only the room's file, and not in the owner's self drive).
+
+## Adopt: `affiliations` is a room at every gate (CIRISPersist#897, persist v47.0.0)
+
+- **`With::Affiliations { community_key_id }`**, `EncryptedCohort::Affiliations { .. }` and
+  `RoutesTo::Affiliations { .. }` name the affiliation (BREAKING shape; the unit variants are gone).
+  persist's `Audience::Affiliations` did the same, and refuses a room-less placement.
+- Edge's serve arm keys on the row's room, exactly as `Community`. Witness:
+  `bridge::an_affiliations_row_is_served_to_the_named_affiliations_members_only` (member served,
+  other affiliation withheld, commons control served; fails on both the pre-v47 `true` arm and
+  the interim fail-closed arm).
+- `FSD/CONTENT_TRANSFER.md` §4.1 (needful/rightful) census: every cell ✓.
+
+## Adopt: a roster not held yet is not "not a member" (CIRISPersist#797)
+
+persist now refuses a targeted write as `MembershipUnresolved` when this node does not HOLD the
+cohort's roster, and as `NoCommunityMembership` / `NoFamilyMembership` only when the held roster
+excludes the writer. Edge's #522 refusal ledger had ridden both as one transient class. Now:
+`retry_after_roster` (transient, any scope) and `not_a_community_member` / `not_a_family_member`
+(terminal). **Metric token change**: `retry_after_community_roster` / `retry_after_family_roster`
+are gone; a dashboard keyed on them reads the two new terminal tokens plus `retry_after_roster`.
+
+## A file over 1 MiB is a sealed chunk DAG (CIRISEdge#633, `FSD/CONTENT_TRANSFER.md` §6.7)
+
+One required method on `GroupContentStore` (one implementor in-tree), no signature change to `files`.
+
+CC 2.6.1.3 bounds a signed envelope at 1 MiB, and persist's `DEFAULT_INLINE_BYTES_CAP` is the same
+number for the same reason — the signed thing is the sized thing. Above it the bytes cannot ride
+inside the row, and `files::publish` refused by name: the file door worked at every cohort and only
+up to a megabyte, which is a notes app rather than a drive.
+
+- **`GroupContentStore::seal_chunked`** — `put_blob_chunk_scoped` per 256 KiB segment, then
+  `seal_stream_scoped`. The pointer carries **`stream_id: Some(..)`, whose presence IS the answer to
+  "is this chunked"**, and `content_sha256` is the MANIFEST's — what a reader opens and what the row
+  cites.
+- **`files::publish` routes at the bound.** One call, either shape, same `SealedContent`. A caller
+  writes a note and a video the same way.
+- An empty DAG is refused rather than sealed: a manifest over no chunks is content that opens to
+  nothing.
+
+**Nothing upstream was ever blocking this.** Every persist door existed at the version edge already
+pinned — Q1 shipped in v44.5.0, Q2 is settled, the scoped DAG in #832/#838 — so CIRISPersist#821 was
+never the gate, only edge's wiring. The FSD carried that wrong attribution for a day; grepping the
+resolved source is what corrected it.
+
+Witness: `a_file_over_the_inline_bound_is_chunked_and_still_opens` publishes ~1 MiB + 4 KiB + 137
+bytes (a deliberately ragged tail, where an off-by-one in the split would land), asserts the pointer
+is chunked and the tier is still `InvisibleEncrypted`, that **no holder claim exists** (CC 5.2 does
+not care how many chunks it took), that the drive lists it as an ordinary file, and that it opens
+**byte for byte**.
+
+## Also: `FSD/CONTENT_TRANSFER.md` §4.1, the needful/rightful rule
+
+Found on the way to #897: `bridge.rs` served an `affiliations` row to **any** peer, while persist's
+hold path refused to send it anywhere. That is the fail-OPEN direction, and nothing reports it. §4.1
+is new: the **needful/rightful** rule. For each scope, who is sent a
+row and who may read it must be one predicate with several consumers. It includes a gate × scope
+census, which found four gates spelling `affiliations` as a broad tier. §5.1 had also claimed
+affiliations was "DONE" with no witness for it, and is corrected.
+
+**What remains on #633:** the cross-node fetch. The puller adopts a whole blob; a DAG needs
+`adopt_sealed_chunk` per chunk against the manifest, under the same store gate. Until then a DAG is
+written, listed and opened on the node that sealed it, and a far node reads `not_fetched` — the
+honest state, not a silent gap.
+
 # v30.0.0 — adopt CIRISPersist v46.4.0: the drive read becomes a gated query, and the handshake goes into the room it names
 
 **2026-09-23** (PR #657, CIRISEdge#646 §6.8 + CIRISEdge#656). **MAJOR**, and the reason is a fact

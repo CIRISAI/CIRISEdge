@@ -7,8 +7,8 @@ witnesses, and CIRISServer 0.5.215's `selffiles` ladder reads `mine_on_b=1` (a f
 device, listed on the owner's other). What remains for self BYTES (`opened_on_b`) is the host-side
 room driver, which is the server's (CIRISServer#622/#626), and files above 1 MiB (§6.7, CIRISEdge#633).
 **Family is the open cohort**: the machinery is shared and the rungs are specified, but its roster
-function, its trigger and its witnesses are unbuilt, and a family DRIVE additionally waits on
-CIRISPersist#893 (§6.8.1). Commons files are a separate verb by design (§6.7).
+function, its trigger and its witnesses are unbuilt. The community drive is witnessed (R10, edge
+v30.1.0 on persist v47.1.0 (carrying v46.5.0's #893 and v47.0.0's #897)). Commons files are a separate verb by design (§6.7).
 **Author:** Eric Moore (CIRIS Team) with Claude Fable 5.1
 **Created:** 2026-09-22 · **Revised:** 2026-09-23 (edge v30.0.0; see the §13 changelog — every
 revision since has come from a review finding checked against the pinned tree before the text moved)
@@ -121,7 +121,7 @@ row, always; `tier` / `community_key_id` / `epoch` from the pointer; the floor b
 
 ## 4. The transfer rule per cohort — one table
 
-| | **self** | **family** | **community / affiliations** | **commons** (species / biosphere / federation) |
+| | **self** | **family** | **community / affiliations** ¹ | **commons** (species / biosphere / federation) |
 |---|---|---|---|---|
 | tier (CC 4.4.3.2.1) | per-write DEK, `InvisibleEncrypted` | per-write DEK, `InvisibleEncrypted` | shared epoch DEK, `CommunityDek` | `Plaintext` |
 | row projection (persist `namespace`) | `SelfOwn` | `SelfOwn` | `Cohort` | `Cohort` / `Global` (trust root) |
@@ -130,17 +130,109 @@ row, always; `tier` / `community_key_id` / `epoch` from the pointer; the floor b
 | **holder discovery** | **none** (CC 5.2) | **none** (CC 5.2) | `holds_bytes` at community visibility, 24 h TTL (CC 5.3.2.1) | `holds_bytes`, plaintext provenance |
 | **holder set** | **known by construction**: the author's nodes (`contact::resolve(author_key_id).nodes` — the sealing node is among them; on the content axis author = minter by admission rule) | the author's nodes, as self; the family's other nodes only opportunistically | `list_holders` (+ `list_holders_sized`, v45) | `list_holders` |
 | byte movement | **delivery**: addressed fetch from the author's nodes; push-on-write optional | delivery, as self | discovery + swarm pull (`BlobPuller`, up to 2 holders) | discovery + swarm pull |
-| **file shape** (§6.7) | inline ≤ 1 MiB (CC 2.6.1.3), else a sealed **chunk DAG** (CC 5.3.3.1) — persist's doors all exist; **edge wires none: CIRISEdge#633**, unblocked | same | same | same |
+| **file shape** (§6.7) | inline ≤ 1 MiB (CC 2.6.1.3), else a sealed **chunk DAG** (CC 5.3.3.1) ✓ v30.1.0 — `files::publish` routes at the bound; the pointer's `stream_id` says which | same | same | same |
 | addressing (CC 5.4.6) | `SelfOnly` group whose members are the identity's **nodes** — the **self room**, a per-identity MLS group with a specified bootstrap (§6.3); group id = the identity (`identity_key_id`, CC 3.3.6) | `Family` group of the members' nodes; group id = `family_id` (CC 5.2) | `Cohort` group from the room's MLS exporter (`cohort_addressing`) | federation address (no group, no table) |
 | serve gate (edge `admit_blob_serve`) | arrival `SelfOnly` (same group) ∧ requester `OwnNode` | arrival `Family` (same group) ∧ requester member | arrival same `Cohort` group; `chunk_scope` answered | any arrival (`allows_recipient_scope(Public, _)`) |
 | adopt gate (persist `would_hold`) | `is_audience` self arm: principal equality | family arm: roster | community arm: active member of the named community | commons: allowlist |
 | announce after adopt | never (`LocalOnly`) | never | `Announce` — the adopter becomes a holder | `Announce` |
 | revocation reach (`withdraws`) | the identity's nodes — the row is a **tombstone** and projects at the Attestation plane's ceiling, never `SelfOwn` (transport FSD §3.2; persist `tombstone_ceiling`) | the family's nodes, same projection | every holder, via the claim index + the register | every holder |
 
+¹ CC puts `affiliations` in the same tier as `community`, with the same machinery, so the column is
+right *as a design*. It is **not proven** for affiliations: four gates still read it as a broad tier
+with no room (§4.1, CIRISPersist#897), and no witness exercises an affiliations row. "Proven" below
+means community.
+
 The right-hand two columns are proven. The left-hand two are the design in §6; every cell there
 is a rung in §5 with a witness named and, today, absent. The commons column is not "community
 minus a key": it has no room, no widening, no scope group and no serve-side scope duty, which is
 why §5.2 gives it its own rows.
+
+### 4.1 Needful and rightful — one predicate per scope, many consumers
+
+Every scope answers two questions about a row, and several gates ask them:
+
+- **Needful.** Which nodes must *receive* the row, or its key, for the people entitled to it to have
+  it? persist's hold path (`replication/hold.rs`) and edge's send set answer this, plus the key
+  cascade for keys.
+- **Rightful.** Who may *read* it? persist's §4.3 read gate (`scope/sql.rs`, `scope/caller.rs`) and
+  edge's serve gate (`bridge.rs`, `admit_blob_serve`) answer this. Behind them sits the gate that
+  decides who may *place* a row there at all: persist's AV-45 write gate.
+
+**The rule: for each scope, needful and rightful come from one predicate, with several consumers.**
+They must not be several predicates that happen to agree today. Where they differ, the stack fails
+in one of two ways, and both have happened:
+
+| split | what fails | who notices | instance |
+|---|---|---|---|
+| rightful ⊊ needful: sent, then refused on read | **closed**: members receive rows they can't list | loud; a host files the bug | **CIRISPersist#893**: the read gate's targeted arms matched the *producer's* rooms, never the row's, so every community and family drive came back empty |
+| needful ⊊ rightful: withheld, then served to anyone | **open**: non-members read rows they were never sent | **nobody**; no test asks and no host complains | **CIRISPersist#897**: `affiliations` was room-gated on hold and broad on read, write, widen and edge serve |
+
+The second row is the dangerous one. A gate that's too tight produces a bug report. A gate that's too
+loose produces nothing: no failing call, no refusal in a log, nobody to file it. So a test that proves
+one gate against a constant doesn't prove anything about the stack. The witness has to be **one row
+asked of every gate**, with each answer compared against the others.
+
+**One legitimate asymmetry, and it's about bytes, not rows.** CC 4.4.3.2.1 lets *non-members* hold
+community ciphertext: `holds_bytes` carries *"cleartext provenance … so non-member holders can make an
+informed keep/evict decision without reading content"*. Holding sealed bytes isn't reading them, since
+the DEK is the boundary. That covers **blob ciphertext at the Community tier only**. It never covers
+the row, a self/family byte (CC 5.2), or a key.
+
+#### The census: every gate × every scope
+
+"Named room" means the gate keys on the cohort the **row** names (`envelope_cohort_target` or V150
+`cohort_target`), never on the producer's or the caller's rooms. `✗` marks a gate that disagrees
+with CC. The `✗` cells were the state at persist v46.4.0; **persist v47.0.0 and edge v30.1.0 close all of
+them** — the cells below say which release did:
+
+| gate (owner) | `self` | `family` | `community` | `affiliations` | commons |
+|---|---|---|---|---|---|
+| **CC** (4.4.3.2.1, .8; 5.2) | owner's occurrences | the named family | the named room's roster | **the named affiliation's roster** | anyone |
+| write: AV-45 (persist) | writer = owner | writer ∈ named family | writer ∈ named room | writer ∈ named affiliation (v47.0.0 ✓) | any authenticated writer |
+| widen: `crossing::Audience` (persist) | `SelfOnly` | `Family{id}` | `Community{id}` | `Affiliations{community_key_id}` (v47.0.0 ✓) | unit |
+| at-rest tier (persist `resolve_write_tier`) | per-write DEK | per-write DEK | the room's DEK; refuses without an id | the room's DEK; refuses without an id | plaintext |
+| **needful**: hold / send (persist `hold.rs`) | principal equality | named family | named room | named room | anyone |
+| **rightful**: read §4.3 (persist) | principal | named family (#893 ✓) | named room (#893 ✓) | named room (v47.0.0 ✓, one classifier) | anyone |
+| **rightful**: serve (edge `bridge.rs`) | principal equality | `families.contains` | `communities.contains` | `communities.contains` on the row's room (v30.1.0 ✓) | `true` |
+| blob meaning (edge `blob_swarm::meaning`) | owner's group | named family | named room | named room | — |
+
+Edge's rulings on both issues are posted: #893 was **(1): the row's room, per arm**, and #897 is
+**room-gated everywhere**. For the second, CC 4.4.3.2.8 gives affiliations *"all the community
+machinery"*, makes `compartments[]` *"membership ⊆ roster"*, and handles public records by
+**promoting them to Commons** (`disclosure_posture: transparency-seeking`), never by reading
+`affiliations` broadly. persist accepted the ruling and checked every row against its tree. The
+`✗` cells close in **CIRISPersist v47.0.0**, one MAJOR cut:
+
+- `Audience::Affiliations { community_key_id }`, with `from_cohort_scope` refusing the room-less form;
+- AV-45 moves `affiliations` to the membership arm (`NoCommunityMembership`);
+- the read gate moves it beside `community` on V150's column. No migration and no grammar change.
+  `sweep_widen` already passes the grant's target through, so a room-less `affiliations` grant is
+  skipped with a warning, the same way a room-less `community` grant already is.
+
+v46.5.0 (#893) ships first and unchanged. Edge follows the same order:
+
+| edge | persist | what changes |
+|---|---|---|
+| v30.1.0 | v46.5.0 | community/family drives open; edge's `affiliations` serve arm **fails closed** |
+| next | v47.0.0 | `With::Affiliations { community_key_id }` and `RoutesTo` likewise; the serve arm keys on `communities.contains(id)`, exactly like `Community` |
+
+The edge release after v30.1.0 is a MAJOR if a host has adopted v30.1.0 by then, since `With`
+changes shape. Otherwise it's a minor. Decide by grepping the hosts' pins at the time, not by
+the size of the diff.
+
+**The witness is shared, and it is the one the rule demands.** Use one `affiliations` row in
+affiliation A. Callers: a member of A; a member of *only* B, where the producer is also in B (the
+#893 trap, where a gate answers from the producer's rooms instead of the row's); and an
+unauthenticated caller. Every gate answers for every caller, and **the answer sets must be equal
+to each other**, not only to constants. That covers write, widen, hold, both read doors on all
+three backends, and, on edge's side, the serve arm.
+
+**Census before v47.0.0:** `SELECT count(*) FROM federation_attestations WHERE cohort_scope =
+'affiliations' AND cohort_target IS NULL` has to run on a real node. No in-org producer exists, so
+the expected answer is zero, but that should be checked, not assumed. CIRISServer runs it.
+
+**Adding a scope, or changing one, means filling a whole column of this table**, not one cell. A
+change that moves one gate and leaves the others alone is how both issues were introduced.
 
 ## 5. The rung table — cohort × rung, owner, refusal, witness
 
@@ -149,7 +241,7 @@ everywhere. A rung's **owner** is the repo whose code decides it; its **refusal*
 log and the counter carry when it fails; its **witness** is the test that proves it. "—" in the
 witness column is the work.
 
-### 5.1 Community / affiliations — DONE, the reference row set
+### 5.1 Community — DONE, the reference row set (affiliations: NOT done, §4.1)
 
 | rung | what must be true | owner | refusal by name | witness |
 |---|---|---|---|---|
@@ -182,7 +274,7 @@ is the allowlist. Inheriting the community rows would demand a widening (R1) and
 | **R7** bytes adopted | sha+size verified; **store gate = the allowlist** (`SenderStanding::Allowlisted`, nothing substitutes); `is_audience` commons arm = everyone | edge `store_gate`; persist `would_hold` | `SenderNotAllowlisted` | `store_gate::commons_content_needs_the_allowlist_and_nothing_else_substitutes` ✓ |
 | **R8** reader opens | plaintext | — | — | `blob_federation_e2e::a_commons_blob_opens_on_any_node_because_no_key_is_involved` ✓ |
 | **R9** withdraw reaches holders | tombstone at the plane's ceiling (`Global` for a trust root); every holder evicts | edge `revocation` | `Revoked` | `revocation.rs` ✓ |
-| **R10** listed | the room's file rows, by `community_key_id` | **blocked on CIRISPersist#893** (§6.8.1): the §4.3 gate's community arm cannot match a row AV-84 admits | `DriveGateUnavailable` — refused by name, never silently empty | — |
+| **R10** listed | the room's file rows, by `community_key_id`; the §4.3 gate keys on the ROW's room (V150 `cohort_target`, persist v46.5.0) | persist `list_attestations`; edge `files::in_room` | `Drive` | `blob_federation_e2e::a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index` (community leg) ✓; persist I144/I145 |
 
 ### 5.3 Self — the open row set (CIRISPersist#884 / CIRISEdge#646)
 
@@ -220,7 +312,7 @@ prove a family branch — each row below names its own.
 | **R7** bytes adopted | `is_audience` family arm (`author_is_local_or_family`); adopt `LocalOnly` | persist | `NotPartyTo` | — *(persist: "a family row adopts on a member's node and is `NotPartyTo` on a non-member's")* |
 | **R8** reader opens | wrap for this device's occurrence, as a member | edge `group_content` | `Body::Unopened` | — *(e2e: "a member's device opens what another member wrote")* |
 | **R9** withdraw | tombstone ceiling projection, as self; evicts on every member's node | persist; edge | `Revoked` | — |
-| **R10** listed | the family's file rows, by `family_key_id` | **blocked on CIRISPersist#893** (§6.8.1): the §4.3 gate's family arm cannot match a row AV-84 admits | `DriveGateUnavailable` — refused by name, never silently empty | — |
+| **R10** listed | the family's file rows, by `family_key_id`; same gate, same column (persist v46.5.0) | persist; edge `files::in_room` | `Drive` | — *(persist I144 has the family leg; edge's e2e needs a family fixture)* |
 
 Open question §12.1 (serve-from-non-author preference) stands.
 
@@ -471,29 +563,40 @@ strategy. Self and family content is excluded from fountain retention by CC 6.1.
 the CC 5.2 suppression anyway: no `FountainHoldingClaim` exists for it, and a 2–5-device collective
 cannot place the 26 distinct symbols the shipped tuple's feasibility floor needs.
 
-**Not built — and not blocked** (corrected 2026-09-22 against the pinned tree). `files::publish`
-refuses anything over the bound by name, `FileError::TooLargeForInline { size, cap }`. An earlier
-draft of this section said that refusal was waiting on **CIRISPersist#821 Q1/Q2**. It is not: Q1
-shipped in persist v44.5.0 (`serve_blob_range_to_peer` — the ranged serve with the same proxy-shedding
-and quarantine gates as the whole-blob path), Q2 is settled, and the **scoped chunk DAG shipped whole**
-(persist #832/#838). At the version edge pins today, v46.3.1, every door exists as an `Engine` call:
+**Built in v30.1.0** (CIRISEdge#633). `files::publish` routes at the bound — one call, either shape —
+and `GroupContentStore::seal_chunked` is the door: `put_blob_chunk_scoped` per 256 KiB segment, then
+`seal_stream_scoped`. The returned pointer carries **`stream_id: Some(..)`, and its presence IS the
+answer to "is this chunked"** — one fact, one member, no way for two to disagree — while
+`content_sha256` is the MANIFEST's, which is what a reader opens and what the row cites. A reader
+opens it through the same door as an inline blob (persist's whole-read caps at 64 MiB and names the
+range door above that).
+
+Every persist door already existed at the pinned version — Q1 shipped in v44.5.0
+(`serve_blob_range_to_peer`), Q2 is settled, the scoped DAG shipped in #832/#838 — so this was never
+gated on **CIRISPersist#821**, only on edge wiring it. An earlier draft of this section said
+otherwise; the correction stands as a reminder to grep the resolved source before recording a
+dependency.
 
 | door | what it does |
 |---|---|
-| `put_blob_chunk_scoped(scope, stream_id, seq, plaintext, epoch, community_key_id, aad)` | append one segment to a live stream, sealed where the tier requires — the chunk twin of `put_blob_scoped` |
-| `seal_stream_scoped(scope, stream_id, community_key_id, media_type, aad)` | seal the live stream into a `chunk_dag` at that cohort |
+| `put_blob_chunk_scoped(scope, community, stream_id, seq, plaintext, epoch, aad)` | append one segment, sealed where the tier requires |
+| `seal_stream_scoped(scope, community, stream_id, media_type, aad)` | seal the live stream into a `chunk_dag` at that cohort |
 | `read_blob_range_as(sha, viewer, start, end, aad)` | the ranged read; the whole-read door refuses above 64 MiB and names this one |
-| `read_stream_chunk_as(stream_id, seq, viewer, aad)` | one chunk by position |
 | `adopt_sealed_chunk` | the receiver's adopt, gated by `would_hold` + the §4.3 adopt path |
 
-Per-chunk AEAD with position-bound AAD (`ChunkManifest` v2), `MAX_CHUNKS_PER_EPOCH = 2²⁴` as the
-nonce-safety cap. **Edge wires none of them**, which is the whole of the gap: the write path above the
-bound is `put_blob_chunk_scoped` × N → `seal_stream_scoped`, and the read path is `read_blob_range_as`.
-That is **CIRISEdge#633**, unblocked on the current pin, and it is the difference between "self files
-replicate" and "files". A drive that cannot hold a video is a notes app.
+**The epoch is a label, not a key.** persist §12.3: it is "the producer's stream epoch label
+(recorded as given)", and which DEK sealed a community chunk is the chunk row's own binding. A file
+is complete when it is written, so it is one epoch; an appendable stream (A/V) rolls its own against
+CC 5.3.3.1's `MAX_CHUNKS_PER_EPOCH = 2²⁴`. At 256 KiB per chunk that ceiling is 4 TiB of one stream.
 
-(Persist will ship a PyO3 binding for `adopt_sealed_chunk` in v46.4.0. Edge does not need it — edge
-calls the `Engine` door in Rust — but a **Python** consumer adopting a chunk DAG does.)
+**Chunk size is the producer's** and 256 KiB is edge's choice, for range granularity — a reader
+asking for a few seconds of a video should not pull a megabyte. CC bounds the envelope and the chunk
+COUNT, never the chunk size.
+
+**What remains: the cross-node fetch.** The puller adopts a whole blob (`adopt_sealed_blob`); a DAG
+needs `adopt_sealed_chunk` per chunk against the manifest, under the same store gate. Until that
+lands a DAG is written, listed and opened on the node that sealed it, and a far node reads
+`not_fetched` — the honest state, not a silent gap. Tracked on CIRISEdge#633.
 
 ### 6.8 The drive read is a gated query (CIRISPersist#891 — shipped v46.4.0, adopted v30.0.0)
 
@@ -537,24 +640,26 @@ Persist's ruling on the question edge asked — *should a local drive read carry
 the reader is the owner?* — is **yes**: the gate is about who is asking, not where the bytes are, and
 "the reader is the owner" is a deployment assumption the shared device breaks.
 
-#### 6.8.1 Targeted rooms are refused until CIRISPersist#893
+#### 6.8.1 Targeted rooms — refused by name until CIRISPersist#893, open since persist v46.5.0 / edge v30.1.0
 
-The `self` arm of the gate compares by principal and is witnessed. The **`community` and `family`
-arms cannot match any row edge can write**, and the reason is a contradiction between two rules that
-are each correct alone (CIRISPersist#893):
+The `self` arm of the gate compares by principal and was witnessed first. The **`community` and
+`family` arms could not match any row edge can write**, and the reason was a contradiction between
+two rules that are each correct alone (CIRISPersist#893):
 
 - **AV-84 (write):** a targeted-cohort placement is a producer self-declaration, so a `community` /
   `family` row MUST name its own **producer** in `attested_key_id`; naming the room is refused.
 - **§4.3 (read):** a row is admitted iff its **target** is in the caller's admitted set — and the
-  target column passed on `federation_attestations` is `attested_key_id`.
+  target column passed on `federation_attestations` was `attested_key_id`.
 
-`attested_key_id` is the producer; `community_key_ids` holds room keys; the intersection is empty by
-construction. So no member can read their own room's rows through this door.
+`attested_key_id` is the producer; `community_key_ids` holds room keys; the intersection was empty by
+construction. So no member could read their own room's rows through this door, and edge v30.0.0
+**refused** a targeted room by name (`FileError::DriveGateUnavailable`) rather than return the
+empty list the gate produced.
 
-`files::in_room` therefore **refuses** a targeted room by name
-(`FileError::DriveGateUnavailable`) rather than returning the empty list the gate produces — a
-silently empty drive is indistinguishable from a room with no files — and rather than falling back to
-the ungated cursor, because a function that takes a caller must not hand back rows it did not gate.
+**Shipped in persist v46.5.0, adopted in edge v30.1.0.** V150 adds `cohort_target`, a generated
+column over the same envelope aliases the write gate validates, and both gate twins take the row's
+room per arm; `affiliations` joins the targeted arms in v47.0.0 (§4.1). `DriveGateUnavailable` is
+gone with its cause, and R10 for community is witnessed on edge's e2e.
 
 **Edge's ruling on the fix** (posted on #893): give the read gate the envelope's cohort target, as a
 generated column over the value the write gate already validated. The argument is that **the correct
@@ -643,9 +748,8 @@ the self row set adds `mine_on_b` = "a self row written on A opened on B", with 
 2. **persist — both asks shipped in v46.4.0**, adopted by edge v30.0.0: the §6.8 `cohort_scope` axis
    on the gated reader door (**CIRISPersist#891**), and `adopt_sealed_chunk_json` (**#821**, which
    edge does not itself need — it calls the `Engine` door in Rust; a Python consumer adopting a chunk
-   DAG does). **One persist item remains and it is a ruling, not a build: CIRISPersist#893** — the
-   §4.3 gate's targeted arms are unsatisfiable with AV-84, so a community or family drive is refused
-   by name until it lands (§6.8.1). Edge's ruling is posted there.
+   DAG does). CIRISPersist#893 shipped in v46.5.0 and #897 in v47.0.0; edge v30.1.0 adopts both
+   (§6.8.1, §4.1). **No persist item remains open for the file story.**
 3. **edge — done**: the projector's group-id rule and the two facets (§6.2, v29.4.0); the source rule
    and `blob_pull_sources` (§6.2); `announce_is_possible` asks the substrate (#646 ask 1); `ScopeRoom`,
    `self_room::{roster, snapshot, decide}` and the file door (§6.3/§9, v29.5.0); `refresh_members`
@@ -682,6 +786,17 @@ template: it is green because each rung has a witness, not because a run passed.
 
 ## 13. Changelog
 
+- **2026-09-23 (v30.1.0: adopt persist v46.5.0 + v47.0.0).** The community drive is open and
+  witnessed (R10, §6.8.1); `DriveGateUnavailable` is deleted with its cause. `affiliations` is a
+  room at every gate (§4.1 census all ✓): `With::Affiliations { community_key_id }`, and edge's
+  serve arm keys on the row's room. persist#797's `MembershipUnresolved` splits "roster not held
+  yet" (transient, `retry_after_roster`) from "not a member" (terminal, `not_a_*_member`), which
+  edge had ridden as one transient class since #522.
+- **2026-09-23 (§4.1, CIRISPersist#897).** Added the needful/rightful rule and the gate × scope census
+  after persist found `affiliations` room-gated on hold and broad on read. The census found **four more
+  gates** with the broad spelling (AV-45 write, `Audience::Affiliations`, edge's serve arm, and the
+  read gate itself). It also found that §5.1 had called affiliations "DONE" with no witness for it.
+  §5.1 is retitled and §4's column footnoted. Edge's serve arm fails closed in v30.1.0.
 - **2026-09-23 (v30.0.0, adopt persist v46.4.0 + CIRISEdge#656).** The drive read became a gated
   query (§6.8): `files::in_room(engine, &room, caller, limit, after) -> DrivePage`, on persist's
   `Engine::list_attestations` with the new `cohort_scope` axis, so the §4.3 visibility predicate runs

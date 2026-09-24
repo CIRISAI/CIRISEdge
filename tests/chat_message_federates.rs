@@ -835,7 +835,9 @@ fn every_encrypted_cohort_actually_encrypts_and_every_clear_one_does_not() {
         EncryptedCohort::Community {
             community_key_id: "room".into(),
         },
-        EncryptedCohort::Affiliations,
+        EncryptedCohort::Affiliations {
+            community_key_id: "aff".into(),
+        },
     ] {
         assert!(
             !matches!(crypto_tier(c.cohort_scope(), None), CryptoTier::Plaintext),
@@ -871,7 +873,9 @@ fn only_self_and_family_are_structurally_invisible() {
         EncryptedCohort::Community {
             community_key_id: "room".into(),
         },
-        EncryptedCohort::Affiliations,
+        EncryptedCohort::Affiliations {
+            community_key_id: "aff".into(),
+        },
     ] {
         assert!(
             !c.is_structurally_invisible(),
@@ -894,7 +898,10 @@ fn no_cohort_variant_is_the_public_tier() {
             community_key_id: "room".into(),
         }
         .cohort_scope(),
-        EncryptedCohort::Affiliations.cohort_scope(),
+        EncryptedCohort::Affiliations {
+            community_key_id: "aff".into(),
+        }
+        .cohort_scope(),
         ClearCohort::Species.cohort_scope(),
         ClearCohort::Biosphere.cohort_scope(),
     ] {
@@ -1120,7 +1127,9 @@ fn with_answers_both_questions_from_persist() {
         With::Community {
             community_key_id: "room".into(),
         },
-        With::Affiliations,
+        With::Affiliations {
+            community_key_id: "aff".into(),
+        },
         With::Species,
         With::Biosphere,
     ] {

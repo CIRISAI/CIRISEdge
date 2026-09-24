@@ -179,27 +179,27 @@ fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> Grou
         // between "you may not read this" and "this did not open" — two
         // findings with nothing in common.
         //
-        // # This arm string-matches persist's PROSE, and that is a known cost
-        //
-        // `BlobError` has no typed variant for "the AEAD tag did not verify"
-        // (CIRISPersist#842 asks for one), so the only signal available is
-        // the message. A reword upstream would silently drop every AAD
-        // mismatch into `Substrate` — the failure would still be a failure,
-        // but the distinction this function exists to preserve would be
-        // gone, with nothing red.
-        //
-        // It is not left to luck. `chat_message_federates::
-        // a_pointer_copied_onto_another_authors_row_does_not_open` performs
-        // a REAL substitution against a real community DEK and asserts on
-        // `SealMismatch`'s own wording, so a persist reword turns that test
-        // red rather than degrading this arm quietly. Do not "simplify" the
-        // match without checking that witness still binds.
-        B::Backend(msg) if msg.contains("decrypt") || msg.contains("seal") => {
-            GroupContentError::SealMismatch { sha256_hex }
-        }
+        // persist v47.1.0 (CIRISPersist#842, edge's ask): the variant is TYPED.
+        // Until then this arm string-matched persist's prose (`contains("decrypt")`),
+        // and a reword upstream would have dropped every AAD mismatch into
+        // `Substrate` with nothing going red. `SealDidNotOpen` is raised only by
+        // the body open; a DEK that will not unwrap stays a key/grant fault. The
+        // witness `chat_message_federates::
+        // a_pointer_copied_onto_another_authors_row_does_not_open` performs a
+        // real substitution against a real community DEK and still binds here.
+        B::SealDidNotOpen { .. } => GroupContentError::SealMismatch { sha256_hex },
         other => GroupContentError::Substrate(other.to_string()),
     }
 }
+
+/// The stream epoch label a one-shot file is written under.
+///
+/// persist §12.3: the epoch is "the producer's stream epoch label (recorded
+/// as given)", **not** a DEK selector — which DEK sealed a community chunk
+/// is the chunk row's own binding. A file is complete when it is written, so
+/// it is one epoch; an appendable stream (A/V) rolls its own against CC
+/// 5.3.3.1's `MAX_CHUNKS_PER_EPOCH`.
+const STREAM_EPOCH: u64 = 0;
 
 #[async_trait::async_trait]
 impl GroupContentStore for PersistGroupContentStore {
@@ -270,6 +270,92 @@ impl GroupContentStore for PersistGroupContentStore {
             epoch: out.epoch,
             granted: out.granted,
             excluded: out.excluded,
+        })
+    }
+
+    async fn seal_chunked(&self, req: SealRequest<'_>) -> Result<SealedContent, GroupContentError> {
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        let aad = aad_for_seal(&req);
+        // The tier is the DIRECTORY's answer, exactly as `seal` asks it — not
+        // re-derived from the scope, which would drop the axis the write door
+        // applies (an infrastructure community resolves plaintext whatever
+        // its scope says).
+        let tier = ciris_persist::federation::at_rest_cascade::resolve_write_tier(
+            &*self.directory,
+            req.cohort_scope,
+            req.community_key_id,
+        )
+        .await
+        .map_err(|e| map_err(String::new(), &e))?;
+        let aad_arg = match tier {
+            CryptoTier::Plaintext => None,
+            _ => Some(aad.as_slice()),
+        };
+
+        // One stream per file. A random id rather than a content hash: the
+        // stream is keyed before its content is known, and two files with
+        // identical bytes are still two writes.
+        let stream_id = format!("file-{}", uuid::Uuid::new_v4());
+        let mut written = 0usize;
+        for (seq, chunk) in req
+            .plaintext
+            .chunks(crate::group_content::store::CHUNK_BYTES)
+            .enumerate()
+        {
+            self.engine
+                .put_blob_chunk_scoped(
+                    req.cohort_scope,
+                    req.community_key_id,
+                    &stream_id,
+                    seq as u64,
+                    chunk,
+                    STREAM_EPOCH,
+                    aad_arg,
+                )
+                .await
+                .map_err(|e| map_err(String::new(), &e))?;
+            written += 1;
+        }
+        // An empty file would seal a stream with no chunks, which is a
+        // manifest pinning nothing — refused here rather than stored as a
+        // blob that opens to nothing.
+        if written == 0 {
+            return Err(GroupContentError::Substrate(
+                "refusing to seal an empty chunk DAG: a manifest over no chunks is content \
+                 that opens to nothing"
+                    .to_owned(),
+            ));
+        }
+
+        let sealed = self
+            .engine
+            .seal_stream_scoped(
+                req.cohort_scope,
+                req.community_key_id,
+                &stream_id,
+                req.media_type,
+                aad_arg,
+            )
+            .await
+            .map_err(|e| map_err(String::new(), &e))?;
+
+        Ok(SealedContent {
+            pointer: crate::group_content::BlobPointer {
+                community_key_id: req.community_key_id.unwrap_or_default().to_owned(),
+                tier: sealed.tier,
+                content_sha256: hex::encode(sealed.manifest_sha256),
+                content_field: req.field,
+                media_type: req.media_type.map(ToOwned::to_owned),
+                // The presence of this IS the answer to "is this chunked".
+                stream_id: Some(stream_id),
+                epoch: sealed.epoch,
+            },
+            tier: sealed.tier,
+            epoch: sealed.epoch,
+            // The seal's grant split is the stream's, taken from the SEAL
+            // rather than a chunk: the manifest is what a reader opens.
+            granted: sealed.granted,
+            excluded: sealed.excluded,
         })
     }
 

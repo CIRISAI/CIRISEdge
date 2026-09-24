@@ -182,8 +182,9 @@ pub fn gates_for(dimension: &str) -> FamilyGates {
         // `Chat` (persist v38.2.0, CIRISPersist#757) joins them by persist's
         // OWN registry row, not by taste. Read from `projection_for`: the
         // `chat:*` arm answers `SelfOwn` at `self`/`family` and `Cohort` at
-        // EVERY commons tier (`community | affiliations | species |
-        // biosphere | federation`), with NO `authority` branch — "a trust
+        // every cohort tier (`community | affiliations` — the Community
+        // tier — and the commons `species | biosphere | federation`), with
+        // NO `authority` branch — "a trust
         // root is not a party to someone else's conversation". There is no
         // `Projection::Capability` cell anywhere in the row, which is the
         // shape that would have implied edge's E3 serve-capability gate

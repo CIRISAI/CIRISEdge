@@ -137,35 +137,16 @@ pub enum FileError {
         /// The substrate's error.
         detail: String,
     },
-    /// **The §4.3 read gate cannot serve a targeted room** — its `community`
-    /// and `family` arms are mutually unsatisfiable with AV-84 on the
-    /// attestation plane (CIRISPersist#893): the write rule makes
-    /// `attested_key_id` the row's PRODUCER, the read gate compares that
-    /// column against the caller's room set, and the intersection is empty
-    /// by construction, so no member can read their own room's rows.
+    /// **Bigger than one envelope, with no chunk door to take it.**
     ///
-    /// Refused rather than returned empty: a drive that silently shows
-    /// nothing is indistinguishable from a room with no files. Lifts when
-    /// CIRISPersist#893 lands.
+    /// Unreachable from [`publish`] since CIRISEdge#633: content above CC
+    /// 2.6.1.3's 1 MiB bound is now sealed as a chunk DAG rather than
+    /// refused. Kept because a `GroupContentStore` that implements only
+    /// `seal` can still say so by name, which is a better answer than an
+    /// argument error from a layer the caller never called.
     #[error(
-        "{room}: the §4.3 read gate cannot serve a targeted room yet — its community/family \
-         arms are unsatisfiable with AV-84 (CIRISPersist#893), so this would be silently empty"
-    )]
-    DriveGateUnavailable {
-        /// The room asked for.
-        room: String,
-    },
-    /// **Bigger than one envelope.** Content above CC 2.6.1.3's 1 MiB bound
-    /// must be a sealed chunk DAG (CC 5.3.3.1), and **edge has not wired one
-    /// yet** — `FSD/CONTENT_TRANSFER.md` §6.7, tracked as CIRISEdge#633.
-    ///
-    /// Not an upstream dependency: persist's doors all exist at the version
-    /// edge pins (`put_blob_chunk_scoped` × N → `seal_stream_scoped`, read
-    /// by `read_blob_range_as`). Named here rather than left to persist's
-    /// argument error so the boundary is stated where a caller meets it.
-    #[error(
-        "{size} bytes exceeds the {cap}-byte inline bound (CC 2.6.1.3); files above it need the \
-         sealed chunk DAG door, which is not built yet (CIRISEdge#633 / CIRISPersist#821)"
+        "{size} bytes exceeds the {cap}-byte inline bound (CC 2.6.1.3) and this store has no \
+         chunk-DAG door; `publish` seals content above the bound as a DAG (CIRISEdge#633)"
     )]
     TooLargeForInline {
         /// The file's size.
@@ -219,11 +200,10 @@ pub struct PublishedFile {
 ///    replicates nowhere until it crosses, so skipping this is precisely
 ///    "correct here, invisible everywhere else".
 ///
-/// Content above the 1 MiB inline bound is refused by name
-/// (`FileError::TooLargeForInline`): the chunk-DAG door it needs is not
-/// built **on edge's side** — every persist door exists on the current pin
-/// (`put_blob_chunk_scoped` → `seal_stream_scoped`); wiring them is
-/// CIRISEdge#633. Sealed-and-readable-by-nobody is **refused** (`FileError::ReadableByNobody`):
+/// Content above the 1 MiB inline bound is sealed as a **chunk DAG** rather
+/// than refused (CIRISEdge#633, §6.7): same request, same `SealedContent`,
+/// and the pointer's `stream_id` tells a reader which shape it got.
+/// Sealed-and-readable-by-nobody is **refused** (`FileError::ReadableByNobody`):
 /// crossing bytes no party can open — the author's own second device
 /// included — is a success report for a permanent `NotGranted`. A PARTIAL
 /// loss is not refused (one member without content-KEM keys must not block
@@ -239,35 +219,36 @@ pub async fn publish(
     signers: Signers<'_>,
     write: &FileWrite<'_>,
 ) -> Result<PublishedFile, FileError> {
-    // The inline bound, checked here so the refusal names the door that is
-    // missing rather than surfacing as persist's argument error (§6.7).
-    let cap = ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP;
-    if write.bytes.len() > cap {
-        return Err(FileError::TooLargeForInline {
-            size: write.bytes.len(),
-            cap,
-        });
-    }
     let author_key_id = signers.node.key_id.clone();
     // Persist's group slot per cohort: the community at `community`, the
     // OWNER at `self`, the family at `family` — which is exactly the id the
     // room names, so the seal and the projector cannot disagree about which
     // group these bytes belong to (`FSD/CONTENT_TRANSFER.md` §6.2).
-    let sealed = store
-        .seal(SealRequest {
-            cohort_scope: write.room.row_scope_token(),
-            community_key_id: Some(write.room.content_group_id()),
-            author_key_id: &author_key_id,
-            asserted_at: write.asserted_at,
-            field: ContentField::Body,
-            plaintext: write.bytes,
-            media_type: Some(write.media_type),
-        })
-        .await
-        .map_err(|e| FileError::Seal {
-            room: write.room.to_string(),
-            detail: e.to_string(),
-        })?;
+    // **Shape follows size at exactly one boundary** (§6.7). CC 2.6.1.3
+    // bounds a signed envelope at 1 MiB and persist's inline cap is the same
+    // number for the same reason, so above it the bytes cannot ride inside
+    // the row and become a sealed chunk DAG (CC 5.3.3.1). Both doors take
+    // the same request and return the same `SealedContent`; the pointer's
+    // `stream_id` is what tells a reader which it got.
+    let req = SealRequest {
+        cohort_scope: write.room.row_scope_token(),
+        community_key_id: Some(write.room.content_group_id()),
+        author_key_id: &author_key_id,
+        asserted_at: write.asserted_at,
+        field: ContentField::Body,
+        plaintext: write.bytes,
+        media_type: Some(write.media_type),
+    };
+    let chunked = write.bytes.len() > ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP;
+    let sealed = if chunked {
+        store.seal_chunked(req).await
+    } else {
+        store.seal(req).await
+    }
+    .map_err(|e| FileError::Seal {
+        room: write.room.to_string(),
+        detail: e.to_string(),
+    })?;
 
     // Checked BEFORE the row is authored, so a file nobody can open never
     // becomes a row somebody has to revoke.
@@ -558,22 +539,18 @@ pub struct DrivePage {
 /// the query asks for exactly what is still wanted — so a resumed listing
 /// never steps over a file.
 ///
-/// # Targeted rooms are refused until CIRISPersist#893
+/// # Every room kind, one gate
 ///
-/// `community` and `family` return [`FileError::DriveGateUnavailable`]. Not
-/// a limitation of this function — the §4.3 gate's two targeted arms are
-/// mutually unsatisfiable with AV-84 on the attestation plane: a
-/// community/family row must name its PRODUCER in `attested_key_id` (the
-/// write rule), and the read gate compares that column against the caller's
-/// room set, so no member can read their own room's rows. Edge refuses
-/// rather than returning the empty list the gate produces, because a
-/// silently empty drive is the failure this whole arc exists to remove, and
-/// rather than falling back to the ungated cursor, because a function that
-/// takes a caller must not hand back rows it did not gate.
+/// `self`, `family`, `community` and `affiliations` all go through persist's
+/// §4.3 read gate. Until persist v46.5.0 (CIRISPersist#893) the targeted
+/// arms compared the row's PRODUCER against the caller's room set, so no
+/// member could read their own room, and this function refused targeted
+/// rooms by name rather than return the empty list the gate produced. V150's
+/// `cohort_target` column keys the gate on the room the row names, and the
+/// refusal went with its cause.
 ///
 /// # Errors
-/// [`FileError::Drive`] from the substrate;
-/// [`FileError::DriveGateUnavailable`] for a targeted room.
+/// [`FileError::Drive`] from the substrate.
 pub async fn in_room(
     engine: &ciris_persist::Engine,
     room: &ScopeRoom,
@@ -583,12 +560,6 @@ pub async fn in_room(
 ) -> Result<DrivePage, FileError> {
     use ciris_persist::ceg::AttestationFilter;
     use ciris_persist::scope::CallerScope;
-
-    if room.cohort_target_field().is_some() {
-        return Err(FileError::DriveGateUnavailable {
-            room: room.to_string(),
-        });
-    }
 
     let caller = caller_occurrence_key_id.to_owned();
     let admission = ciris_persist::scope::admission::build_caller_admission(engine, &caller)
@@ -791,19 +762,23 @@ mod tests {
         );
     }
 
-    /// §6.7 — the boundary a caller meets is named at the door, with what
-    /// it waits on, rather than surfacing as an argument error from a layer
-    /// the caller never called.
+    /// §6.7 — the bound still exists; what changed is what happens at it.
+    ///
+    /// `publish` seals above the inline bound as a chunk DAG rather than
+    /// refusing (CIRISEdge#633), so this arm is unreachable from that door.
+    /// It stays for a `GroupContentStore` that implements only `seal`, and
+    /// its message names the shape rather than a missing door.
     #[test]
-    fn a_file_over_the_inline_bound_is_refused_by_name() {
+    fn the_inline_bound_names_the_shape_above_it() {
         let cap = ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP;
-        let err = FileError::TooLargeForInline { size: cap + 1, cap };
-        let text = err.to_string();
-        assert!(text.contains("chunk DAG"), "{text}");
+        let text = FileError::TooLargeForInline { size: cap + 1, cap }.to_string();
         assert!(
-            text.contains("CIRISEdge#633"),
-            "names the EDGE work it waits on — not an upstream dependency, since persist's \
-             chunk doors all exist on the pinned version: {text}"
+            text.contains("DAG"),
+            "names the shape above the bound: {text}"
+        );
+        assert!(
+            text.contains("CC 2.6.1.3"),
+            "the bound is the ENVELOPE's, and saying so is what stops someone tuning it: {text}"
         );
     }
 

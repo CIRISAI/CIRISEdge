@@ -193,8 +193,8 @@ fn apply_refusal_reason(
 ///   retry.** A differing roster under an occupied `community_key_id`
 ///   (persist#758's typed `Error::Conflict`). Retrying spins; logging and
 ///   dropping hides a fork.
-/// - [`RetryAfterCommunityRoster`](Self::RetryAfterCommunityRoster) /
-///   [`RetryAfterFamilyRoster`](Self::RetryAfterFamilyRoster) — **transient,
+/// - [`NotACommunityMember`](Self::NotACommunityMember) /
+///   [`NotAFamilyMember`](Self::NotAFamilyMember) — **transient,
 ///   converges on its own.** AV-45 at the put door (persist#757) refuses a
 ///   member's cohort-scoped row that arrives before this node applied the
 ///   cohort's roster. Correct and temporary. The REMOVED-member half of the
@@ -217,13 +217,21 @@ pub enum ApplyRefusalClass {
     /// persist#758 — a DIFFERING community roster under an occupied
     /// `community_key_id`. The fork signal.
     CommunityRosterFork,
-    /// persist#757 (AV-45) — a `community`-scoped row whose writer this node
-    /// cannot yet see as a member, because it has not applied that
-    /// community's roster.
-    RetryAfterCommunityRoster,
+    /// persist#757 (AV-45), split by persist v47.0.0 (CIRISPersist#797) — a
+    /// targeted row whose cohort roster this node does not HOLD yet. The row
+    /// arrived ahead of its roster; the next round re-offers it and it lands
+    /// once the roster does. Scope-agnostic: persist produces it only when
+    /// the roster is structurally absent, never inferred from another error.
+    RetryAfterRoster,
+    /// persist#757 (AV-45) — a `community`-scoped row whose writer is NOT in
+    /// the roster this node holds. Until persist v47.0.0 this and "roster not
+    /// held yet" were one refusal, and edge called both transient; persist
+    /// now tells them apart, and this one is terminal — nothing about it
+    /// changes by waiting.
+    NotACommunityMember,
     /// persist#757 (AV-45) — the family mirror of
-    /// [`Self::RetryAfterCommunityRoster`].
-    RetryAfterFamilyRoster,
+    /// [`Self::NotACommunityMember`].
+    NotAFamilyMember,
     /// persist#757 (AV-84) — a targeted-cohort row naming a party other than
     /// its own producer.
     ThirdPartyRow,
@@ -234,8 +242,9 @@ impl ApplyRefusalClass {
     /// key space without traffic.
     pub const ALL: &'static [Self] = &[
         Self::CommunityRosterFork,
-        Self::RetryAfterCommunityRoster,
-        Self::RetryAfterFamilyRoster,
+        Self::RetryAfterRoster,
+        Self::NotACommunityMember,
+        Self::NotAFamilyMember,
         Self::ThirdPartyRow,
     ];
 
@@ -246,8 +255,9 @@ impl ApplyRefusalClass {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CommunityRosterFork => "community_roster_fork",
-            Self::RetryAfterCommunityRoster => "retry_after_community_roster",
-            Self::RetryAfterFamilyRoster => "retry_after_family_roster",
+            Self::RetryAfterRoster => "retry_after_roster",
+            Self::NotACommunityMember => "not_a_community_member",
+            Self::NotAFamilyMember => "not_a_family_member",
             Self::ThirdPartyRow => "third_party_row",
         }
     }
@@ -255,17 +265,16 @@ impl ApplyRefusalClass {
     /// Is this refusal expected to resolve itself once more state lands, with
     /// no operator action?
     ///
-    /// TRUE for the two roster-ordering classes and **only** those: a refused
-    /// row is not stored, so this node still lacks its hash and the next
+    /// TRUE for the roster-ordering class and **only** that: a refused row is
+    /// not stored, so this node still lacks its hash and the next
     /// Summary/Diff re-offers it — convergence is by construction, not by a
-    /// retry queue. FALSE for a fork and for a third-party row: neither
-    /// changes on its own, and both are decisions someone has to see.
+    /// retry queue. FALSE for a fork, a third-party row, and a writer the
+    /// HELD roster excludes: none changes on its own, and each is a decision
+    /// someone has to see. (Before persist v47.0.0 the last was
+    /// indistinguishable from "roster not held yet" and rode as transient.)
     #[must_use]
     pub fn is_transient(self) -> bool {
-        matches!(
-            self,
-            Self::RetryAfterCommunityRoster | Self::RetryAfterFamilyRoster
-        )
+        matches!(self, Self::RetryAfterRoster)
     }
 
     /// CIRISEdge#544 — the same disposition, in the vocabulary the RETRY loop
@@ -300,8 +309,9 @@ impl ApplyRefusalClass {
         use ciris_persist::federation::Error as E;
         use ciris_persist::scope::ScopeRefusalReason as R;
         match err {
-            E::WriteScopeRefused(R::NoCommunityMembership) => Some(Self::RetryAfterCommunityRoster),
-            E::WriteScopeRefused(R::NoFamilyMembership) => Some(Self::RetryAfterFamilyRoster),
+            E::WriteScopeRefused(R::MembershipUnresolved) => Some(Self::RetryAfterRoster),
+            E::WriteScopeRefused(R::NoCommunityMembership) => Some(Self::NotACommunityMember),
+            E::WriteScopeRefused(R::NoFamilyMembership) => Some(Self::NotAFamilyMember),
             E::CohortStandingRefused { .. } => Some(Self::ThirdPartyRow),
             _ => None,
         }
@@ -604,7 +614,7 @@ impl BridgeConfig {
     /// watermark catches up, every row is re-offered once per
     /// `ceil(corpus / page)` rounds (see [`SweepCursors`]). At 52k rows and
     /// the 30 s default cadence that is ~51 rounds ≈ 25 min — the outer bound
-    /// on how long a TRANSIENTLY-refused row (AV-45 `retry_after_community_roster`)
+    /// on how long a TRANSIENTLY-refused row (AV-45 `retry_after_roster`)
     /// can wait for its next offer. Halving the page halves the memory and
     /// doubles that wait. 1024 keeps both defensible without tuning; an
     /// operator on a big corpus who cares more about re-offer latency than
@@ -876,7 +886,7 @@ type ResumeCursor = (chrono::DateTime<chrono::Utc>, String);
 /// them:
 ///
 ///   1. a row the peer refused TRANSIENTLY (v18.4.0's AV-45
-///      `retry_after_community_roster`: correctly refused now, admissible once
+///      `retry_after_roster`: correctly refused now, admissible once
 ///      the roster lands). The refusal happens on the RECEIVER and is never
 ///      reported back, so the sender cannot keep a "recently refused" replay
 ///      set — it does not know. `ApplyRefusalClass::is_transient`'s documented
@@ -5465,10 +5475,18 @@ impl FederationDirectoryReplicationBridge {
                 self.peer_in_cohort(peer, memo, |c| c.communities.contains(community_key_id))
                     .await
             }
-            Audience::Affiliations
-            | Audience::Species
-            | Audience::Biosphere
-            | Audience::Federation => true,
+            // CIRISPersist#897 / persist v47.0.0 — an affiliation is a room.
+            // CC 4.4.3.2.1 puts `affiliations` in the Community tier (reader:
+            // community members) and 4.4.3.2.8 gives it "all the community
+            // machinery"; persist keys its roster by the community record, so
+            // this is the `Community` arm's check on the room the ROW names.
+            // Public affiliation records are promoted to a commons row
+            // (`disclosure_posture: transparency-seeking`), never read here.
+            Audience::Affiliations { community_key_id } => {
+                self.peer_in_cohort(peer, memo, |c| c.communities.contains(community_key_id))
+                    .await
+            }
+            Audience::Species | Audience::Biosphere | Audience::Federation => true,
         };
         if !served {
             self.withhold(
@@ -9594,18 +9612,28 @@ pub(crate) mod tests {
         use ciris_persist::federation::Error as E;
         use ciris_persist::scope::ScopeRefusalReason as R;
 
-        // AV-45 (persist#757) — the two roster-ordering classes. TRANSIENT:
-        // the roster simply has not landed on this node yet.
+        // AV-45 (persist#757, split by persist v47.0.0 / #797). TRANSIENT:
+        // the roster has not landed on this node yet — one class, any scope.
+        assert_eq!(
+            ApplyRefusalClass::classify(&E::WriteScopeRefused(R::MembershipUnresolved)),
+            Some(ApplyRefusalClass::RetryAfterRoster),
+        );
+        assert!(ApplyRefusalClass::RetryAfterRoster.is_transient());
+        // TERMINAL: the roster IS held and the writer is not in it. Before
+        // v47 persist could not tell these from the transient case, and
+        // edge rode both as "retry after the roster" — a permanent refusal
+        // wearing a transient label, in the direction this ledger exists to
+        // prevent.
         assert_eq!(
             ApplyRefusalClass::classify(&E::WriteScopeRefused(R::NoCommunityMembership)),
-            Some(ApplyRefusalClass::RetryAfterCommunityRoster),
+            Some(ApplyRefusalClass::NotACommunityMember),
         );
         assert_eq!(
             ApplyRefusalClass::classify(&E::WriteScopeRefused(R::NoFamilyMembership)),
-            Some(ApplyRefusalClass::RetryAfterFamilyRoster),
+            Some(ApplyRefusalClass::NotAFamilyMember),
         );
-        assert!(ApplyRefusalClass::RetryAfterCommunityRoster.is_transient());
-        assert!(ApplyRefusalClass::RetryAfterFamilyRoster.is_transient());
+        assert!(!ApplyRefusalClass::NotACommunityMember.is_transient());
+        assert!(!ApplyRefusalClass::NotAFamilyMember.is_transient());
 
         // AV-84 (persist#757) — a policy verdict about the ROW's content, and
         // NOT a delivery problem. Terminal: nothing about it changes by
@@ -9687,20 +9715,31 @@ pub(crate) mod tests {
     fn a_classified_refusal_names_persists_verdict_and_then_edges_class() {
         use ciris_persist::federation::Error as E;
         use ciris_persist::scope::ScopeRefusalReason as R;
-        let err = E::WriteScopeRefused(R::NoCommunityMembership);
+        let err = E::WriteScopeRefused(R::MembershipUnresolved);
         let msg = classified_refusal_reason(
             "Attestation",
             "deadbeef",
             &err,
-            ApplyRefusalClass::RetryAfterCommunityRoster,
+            ApplyRefusalClass::RetryAfterRoster,
         );
         assert!(
             msg.starts_with(&apply_refusal_reason("Attestation", "deadbeef", &err)),
             "persist's message + kind() token lead: {msg}",
         );
         assert!(msg.contains("federation_write_scope_refused"), "{msg}");
-        assert!(msg.contains("class=retry_after_community_roster"), "{msg}");
+        assert!(msg.contains("class=retry_after_roster"), "{msg}");
         assert!(msg.contains("TRANSIENT"), "{msg}");
+        // persist v47.0.0 (#797): a HELD roster that excludes the writer is
+        // the other answer, and it is terminal.
+        let err = E::WriteScopeRefused(R::NoCommunityMembership);
+        let msg = classified_refusal_reason(
+            "Attestation",
+            "deadbeef",
+            &err,
+            ApplyRefusalClass::NotACommunityMember,
+        );
+        assert!(msg.contains("class=not_a_community_member"), "{msg}");
+        assert!(msg.contains("TERMINAL"), "{msg}");
         let terminal = classified_refusal_reason(
             "Community",
             "deadbeef",
@@ -9855,8 +9894,10 @@ pub(crate) mod tests {
         let ApplyOutcome::Refused { reason: msg, .. } = &outcome else {
             panic!("AV-45 must refuse a row ahead of its roster, got {outcome:?}");
         };
+        // persist v47.0.0 (#797): a roster this node does not HOLD is
+        // `MembershipUnresolved`, not "not a member" — the transient one.
         assert!(
-            msg.contains(ApplyRefusalClass::RetryAfterCommunityRoster.as_str()),
+            msg.contains(ApplyRefusalClass::RetryAfterRoster.as_str()),
             "the refusal must NAME itself retry-after-roster: {msg}",
         );
         assert!(
@@ -9871,7 +9912,7 @@ pub(crate) mod tests {
         let snap = metrics.snapshot();
         assert_eq!(
             snap.apply_refusals_by_class
-                .get(ApplyRefusalClass::RetryAfterCommunityRoster.as_str())
+                .get(ApplyRefusalClass::RetryAfterRoster.as_str())
                 .copied(),
             Some(1),
             "a transient refusal no counter sees is the silent-narrowing class: {:?}",
@@ -14996,7 +15037,10 @@ pub(crate) mod tests {
     /// below and return the ids in seeding order:
     ///
     /// 1. federation-scoped scores by OTHER → Cohort/Global      → IN
-    /// 2. affiliations-scoped scores by OTHER → Cohort           → IN
+    /// 2. affiliations-scoped scores by OTHER, in an affiliation OTHER
+    ///    belongs to → Cohort                                    → IN
+    ///    (persist v47.0.0 / CIRISPersist#897: an affiliation is a room, so
+    ///    the row names it and the writer must be on its roster)
     /// 3. self-scoped scores by NODE (publish-own)               → IN
     /// 4. self-scoped scores by OTHER (foreign producer — the
     ///    structural-invisibility case)                          → OUT
@@ -15033,6 +15077,22 @@ pub(crate) mod tests {
         )
         .await;
         let in_affil = "att-352-in-affiliations";
+        // The room id is itself a registered key (as `chat-room` is in the
+        // owner-axis backend): persist checks `community_key_id` against
+        // `federation_keys` at `put_community`.
+        register_fixture_keys(backend, &[("aff-352", identity_type::AGENT)]).await;
+        // `other` founds it: a founder is a zero-hop moderator, and persist
+        // federates content keyed on a room only if the room has one
+        // (`CommunityHasNoModerator`).
+        let mut affiliation = fixture_community("aff-352", other);
+        affiliation.members[0].role =
+            Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_string());
+        backend
+            .put_community(sign_community_fixture(other, affiliation))
+            .await
+            .expect("seed the affiliation's roster");
+        let mut affil_row = identity_scores(in_affil, other);
+        affil_row["community_id"] = serde_json::json!("aff-352");
         seed_scoped_attestation(
             backend,
             in_affil,
@@ -15040,7 +15100,7 @@ pub(crate) mod tests {
             other,
             "scores",
             "affiliations",
-            identity_scores(in_affil, other),
+            affil_row,
         )
         .await;
         let in_self_own = "att-352-in-self-own";
@@ -15123,10 +15183,13 @@ pub(crate) mod tests {
         let publish_set = vec![node.to_string()];
         let selector: CohortProvider = Arc::new(move || publish_set.clone());
         let bridge = bridge.with_self_provider(Some(selector));
-        for key_id in [node, other] {
+        // `other` is a USER: it sits on the affiliation roster row 2 names,
+        // and persist admits an agent to a community only under a steward
+        // (`UnstewardedCommunityMember`).
+        for (key_id, kind) in [(node, identity_type::AGENT), (other, identity_type::USER)] {
             backend
                 .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(key_id, identity_type::AGENT),
+                    record: fixture_key_record(key_id, kind),
                 })
                 .await
                 .expect("seed key");
@@ -16772,6 +16835,74 @@ pub(crate) mod tests {
         );
     }
 
+    /// CIRISPersist#897 / persist v47.0.0 — an `affiliations` row is served to
+    /// the members of the affiliation the ROW names, exactly as a community
+    /// row is, and to nobody else.
+    ///
+    /// One row, one peer, three audiences: the affiliation the peer's owner
+    /// belongs to (served), a different affiliation (withheld), and a commons
+    /// row as the control (served). The pre-v47 arm was `true` and the
+    /// v30.1.0 interim arm was `false`; both fail the first two asserts.
+    #[tokio::test]
+    async fn an_affiliations_row_is_served_to_the_named_affiliations_members_only() {
+        use ciris_persist::federation::Audience;
+        let backend = owner_axis_backend(true).await;
+        // The roster names person-bob; node-bob is bob's node (the owner axis).
+        seed_community_with_member(&backend, "person-bob").await;
+        let metrics = crate::observability::EdgeMetrics::default();
+        let bridge = audience_bridge(&backend).with_metrics(Some(metrics.clone()));
+        let mut memo = AudienceMemo::default();
+        assert!(
+            !bridge
+                .audience_withholds(
+                    Ok(Audience::Affiliations {
+                        community_key_id: "chat-room".into(),
+                    }),
+                    "person-bob",
+                    "node-bob",
+                    Reach::Consent,
+                    &mut memo,
+                    "test",
+                )
+                .await,
+            "CC 4.4.3.2.8: the affiliation's roster reads it, through the owner axis"
+        );
+        assert!(
+            bridge
+                .audience_withholds(
+                    Ok(Audience::Affiliations {
+                        community_key_id: "some-other-affiliation".into(),
+                    }),
+                    "person-bob",
+                    "node-bob",
+                    Reach::Consent,
+                    &mut memo,
+                    "test",
+                )
+                .await,
+            "a row in an affiliation the peer's owner is not in is withheld — keyed on the \
+             ROW's room, never on the producer's or the peer's other rooms (#893's trap)"
+        );
+        assert!(
+            !bridge
+                .audience_withholds(
+                    Ok(Audience::Species),
+                    "person-bob",
+                    "node-bob",
+                    Reach::Consent,
+                    &mut memo,
+                    "test",
+                )
+                .await,
+            "the control: the same peer is served a commons row"
+        );
+        assert_eq!(
+            metrics.snapshot().withholds_by_reason.values().sum::<u64>(),
+            1,
+            "exactly the one refusal is booked"
+        );
+    }
+
     /// The negative controls, on the SAME backend as the pin above: the
     /// widening reaches the grant subject's bound node and NOTHING else. An
     /// unowned node, and a node owned by a person NO grant names, are both
@@ -16951,7 +17082,7 @@ pub(crate) mod tests {
     /// **The convergence arm: roster applies → the row lands.**
     ///
     /// v18.4.0 classified `WriteScopeRefused(NoCommunityMembership)` as
-    /// `retry_after_community_roster` — TRANSIENT, re-offered next round — and
+    /// `retry_after_roster` — TRANSIENT, re-offered next round — and
     /// pinned that reading with a pure classifier test, but could not pin the
     /// second half ("…and then it converges") for two reasons, both now gone:
     ///
@@ -17002,8 +17133,9 @@ pub(crate) mod tests {
         match &outcome {
             ApplyOutcome::Refused { reason, .. } => {
                 assert!(
-                    reason.contains("class=retry_after_community_roster"),
-                    "the roster has not landed — this is the transient class: {reason}"
+                    reason.contains("class=retry_after_roster"),
+                    "the roster has not landed — this is the transient class (persist \
+                     v47.0.0 tells 'not held yet' from 'not a member'): {reason}"
                 );
                 assert!(reason.contains("TRANSIENT"), "{reason}");
             }
@@ -17013,7 +17145,7 @@ pub(crate) mod tests {
             metrics
                 .snapshot()
                 .apply_refusals_by_class
-                .get("retry_after_community_roster"),
+                .get("retry_after_roster"),
             Some(&1),
             "…and it is COUNTED on the closed-set axis, not mixed into `by_kind`"
         );
@@ -17082,10 +17214,11 @@ pub(crate) mod tests {
             .await;
         match &outcome {
             ApplyOutcome::Refused { reason, .. } => assert!(
-                reason.contains("class=retry_after_community_roster"),
+                reason.contains("class=not_a_community_member"),
                 "an unbound node must not inherit anyone's membership — the principal \
                  fold widens to the single live owner and NEVER past it, and the door it \
-                 refuses at is still the MEMBERSHIP door: {reason}"
+                 refuses at is still the MEMBERSHIP door. The roster IS held here, so \
+                 persist v47.0.0 names it terminal, not 'roster not held yet': {reason}"
             ),
             other => panic!("an unbound node must not inherit anyone's membership; got {other:?}"),
         }
@@ -17432,7 +17565,7 @@ pub(crate) mod tests {
         }
 
         /// **The transient-refusal door-stop.** v18.4.0's AV-45
-        /// `retry_after_community_roster` is refused on the RECEIVER and never
+        /// `retry_after_roster` is refused on the RECEIVER and never
         /// reported back, so the sender cannot keep a replay set — its
         /// documented guarantee is literally *"the next Summary/Diff re-offers
         /// it"*. A purely monotonic watermark can never re-offer a row it has

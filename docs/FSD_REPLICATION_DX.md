@@ -177,7 +177,7 @@ Two traps live in that table:
 | `federation` × `self` | **replicates to the owner's OWN device set.** A node has exactly one owner (CIRISConstitution#23), and recipient admission resolves through `owner_of`, so "self" spans your devices — not one machine. |
 | `federation` × `family` | replicates to the family cohort; emits no `holds_bytes`. |
 | `federation` × `community` | replicates to the room; discoverable, encrypted under the room DEK. |
-| `federation` × `affiliations` | replicates to the organisations you are attached to; discoverable, encrypted under a shared DEK — the same tier as `community` (CC 4.4.3.2.1 groups them). |
+| `federation` × `affiliations` | replicates to **one named affiliation's roster** (the institution the row is placed in), not to every organisation you belong to. Encrypted under that affiliation's DEK, the same tier and machinery as `community` (CC 4.4.3.2.1, 4.4.3.2.8). Public records are **promoted to a commons row**, not read from `affiliations`. ⚠ Not yet expressible: the audience carries no room, so edge withholds these rows from every peer until CIRISPersist#897 lands (`CONTENT_TRANSFER.md` §4.1). |
 | `federation` × `species` / `biosphere` | replicates to a narrower AUDIENCE than the whole federation — **but plaintext**, with a discoverable `holds_bytes`. Commons tier. |
 | `federation` × `federation` | **published.** World-readable, plaintext. |
 
