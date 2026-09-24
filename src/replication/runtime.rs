@@ -402,12 +402,17 @@ fn spawn_scheduler_task(
     })
 }
 
-fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
+pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
+    use crate::replication::coordinator::DriverPhase;
     tokio::spawn(async move {
         let peer = coord.peer_key_id().to_string();
         let kind = coord.kind();
         tracing::debug!(peer = %peer, ?kind, "responder driver started (CIRISEdge#348)");
         loop {
+            // CIRISEdge#662 — the phase gauge: this loop is the responder's ONE
+            // drain, and when its inbox fills the drop site reads which of the
+            // three awaits below it was parked in, and for how long.
+            coord.set_driver_phase(DriverPhase::Idle);
             // Channel closed ⇒ the coordinator was dropped; end the driver.
             // CIRISEdge#634 — take the frame WITH its round metadata so the
             // step can rebind (a new round resets a stuck session) and the
@@ -417,8 +422,10 @@ fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                 tracing::debug!(peer = %peer, ?kind, "responder driver ending (channel closed)");
                 break;
             };
+            coord.set_driver_phase(DriverPhase::Stepping);
             match coord.drive_round_step_framed(Some(inbound)).await {
                 Ok(DriveStep::SendThenWait(msgs)) => {
+                    coord.set_driver_phase(DriverPhase::Sending);
                     for m in &msgs {
                         // CIRISEdge#373 — BOUND the reply send. This loop is the
                         // responder's only inbound drain; a reply that blocks here
@@ -488,12 +495,18 @@ fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                          — dropped, NOT silently (CIRISEdge#348)"
                     );
                 }
+                // CIRISEdge#662 — a step error ends the ROUND, never the driver.
+                // The responder's slot stays registered for as long as the peer
+                // keeps sending, so a driver that ended here left an inbox nobody
+                // drained: eight frames, then "inbox full" for every frame after,
+                // forever. (`drive_round_step_framed` cannot return `Err` today —
+                // this arm is defensive — but the trap is structural.)
                 Err(e) => {
                     tracing::warn!(
                         peer = %peer, ?kind, error = %e,
-                        "responder drive_round_step failed; ending driver (CIRISEdge#348)"
+                        "responder drive_round_step failed; the frame is dropped and the \
+                         driver keeps draining (CIRISEdge#348 / #662)"
                     );
-                    break;
                 }
             }
         }

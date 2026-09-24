@@ -2536,6 +2536,16 @@ impl PyEdge {
             "replication_inbound_backpressure_drops",
             bundle.replication_inbound_backpressure_drops,
         )?;
+        // CIRISEdge#662 — the same drops by ROLE; `responder` is the one that
+        // means "a peer kept sending while our single drain was busy".
+        let backpressure_by_role = pyo3::types::PyDict::new(py);
+        for (role, n) in &bundle.replication_inbound_backpressure_drops_by_role {
+            backpressure_by_role.set_item(role, *n)?;
+        }
+        root.set_item(
+            "replication_inbound_backpressure_drops_by_role",
+            backpressure_by_role,
+        )?;
 
         // CIRISEdge#634 — the route choke's three counters. On a healthy mutual
         // pair both `routed_to_*` climb; `reply_dropped` counts replies that
