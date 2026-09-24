@@ -10848,8 +10848,34 @@ pub(crate) mod tests {
         subject: &str,
         attestation_type: &str,
         cohort_scope: &str,
-        mut envelope: serde_json::Value,
+        envelope: serde_json::Value,
     ) {
+        try_seed_scoped_attestation(
+            backend,
+            id,
+            attester,
+            subject,
+            attestation_type,
+            cohort_scope,
+            envelope,
+        )
+        .await
+        .expect("seed trust-graph attestation");
+    }
+
+    /// [`seed_scoped_attestation`] that hands the put's verdict back instead of
+    /// panicking — for a seeder that may legitimately be refused (CIRISEdge#659:
+    /// `seed_common_root` signs with the deterministic fixture signer, and a
+    /// subject registered under other keys cannot be signed for).
+    async fn try_seed_scoped_attestation(
+        backend: &MemoryBackend,
+        id: &str,
+        attester: &str,
+        subject: &str,
+        attestation_type: &str,
+        cohort_scope: &str,
+        mut envelope: serde_json::Value,
+    ) -> Result<(), String> {
         // CIRISPersist#598 (v31.0.0): truncate to MICROSECONDS — postgres TIMESTAMPTZ
         // can't store sub-µs, so a producer that mints ns precision makes an op
         // sequence a strict order on sqlite/memory but a TIE on postgres. The fold
@@ -10896,7 +10922,8 @@ pub(crate) mod tests {
         backend
             .put_attestation(SignedAttestation { attestation: att })
             .await
-            .expect("seed trust-graph attestation");
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"))
     }
 
     /// CIRISEdge#523 — [`seed_scoped_attestation`]'s row WITHOUT the put: the
@@ -13008,7 +13035,6 @@ pub(crate) mod tests {
         // (pubkeys) into the envelope before signing, so a signature can no longer
         // be lifted onto a different key_id. This fixture doesn't spoof, so the
         // placeholder subject + no-PQC is the byte-preserving update.
-        use ciris_persist::federation::operational::test_support::PLACEHOLDER_SUBJECT_ED25519_BASE64;
         // The roster key_ids `has_accord_conferred_role` resolves against. Persist's
         // own `accord_holder_roster_key_ids` is private, but it is derived from
         // this public genesis accessor — so we mint identities under exactly
@@ -13081,11 +13107,17 @@ pub(crate) mod tests {
         // Both candidate recipients carry a GENUINE 2-of-3 accord co-scrub
         // conferring `infra:serve` — leg A holds for both.
         for peer in [full_peer, blessed_only] {
+            // CIRISEdge#659 — registered under the FIXTURE signer's own hybrid
+            // pubkeys, so the acceptance `seed_consent_membership` roots each
+            // peer with verifies under Strict. (A placeholder pubkey with no
+            // PQC half left them un-signable, hence unrooted, hence served
+            // nothing — the serve floor in action, on the wrong peer.)
+            let (ed_pk, mldsa_pk) = hybrid_pubkeys(peer);
             let rec = signed_canonical_record_with_roles(
                 peer,
                 identity_type::NODE,
-                PLACEHOLDER_SUBJECT_ED25519_BASE64,
-                None,
+                &ed_pk,
+                mldsa_pk.as_deref(),
                 vec![FederationDirectoryReplicationBridge::SERVE_CAPABILITY.to_string()],
                 serde_json::json!({ "key_id": peer }),
                 &scrubbers,
@@ -15931,7 +15963,7 @@ pub(crate) mod tests {
     /// fixtures call this so the peers they mean to be SERVED are Rooted with
     /// the local node's owner; whoever is left out (`node-stranger`, an unowned
     /// node with no acceptance) is Attributed at most and served nothing.
-    async fn seed_common_root(backend: &MemoryBackend, subjects: &[&str]) {
+    pub(crate) async fn seed_common_root(backend: &MemoryBackend, subjects: &[&str]) {
         // Idempotent: the consent helpers call this per pair, so the root's
         // key record is registered once (a re-register is a `Conflict`, which
         // is the expected answer here) and acceptances accumulate. A second
@@ -15953,7 +15985,34 @@ pub(crate) mod tests {
         seed_root_charter(backend, "root-r", &["succ-1".to_string()]).await;
         let scope = serde_json::json!(["infra:attest", "infra:serve"]);
         for subject in subjects {
-            seed_delegates_to(backend, subject, "root-r", &scope).await;
+            // A subject registered under keys the fixture signer does not hold
+            // (persist's test-support `Identity`, a canonical record with a
+            // placeholder pubkey) cannot be signed for: it stays UNROOTED, and
+            // the test that needs it Rooted must seed the acceptance itself.
+            // Loud, not silent.
+            let id = uuid::Uuid::new_v4().to_string();
+            let envelope = serde_json::json!({
+                "id": id,
+                "attesting_key_id": subject,
+                "attested_key_id": "root-r",
+                "attestation_type": "delegates_to",
+                "scope": scope,
+            });
+            if let Err(e) = try_seed_scoped_attestation(
+                backend,
+                &id,
+                subject,
+                "root-r",
+                "delegates_to",
+                "federation",
+                envelope,
+            )
+            .await
+            {
+                eprintln!(
+                    "seed_common_root: no acceptance signed for {subject} (not rooted): {e:?}"
+                );
+            }
         }
     }
 

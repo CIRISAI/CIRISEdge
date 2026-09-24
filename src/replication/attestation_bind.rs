@@ -1770,6 +1770,12 @@ mod advertise_tests {
             })
             .await
             .expect("seed local key record");
+        // CIRISEdge#659 — the serve floor: a peer is handed nothing until the
+        // two hold a valid root in common. The consent grant below is the
+        // gate this module is about; the root is the precondition it now sits
+        // behind.
+        crate::replication::bridge::tests::seed_common_root(&backend, &["local-node", "peer-1"])
+            .await;
         let grant = replication_consent_attestation(
             "local-node",
             "peer-1",
