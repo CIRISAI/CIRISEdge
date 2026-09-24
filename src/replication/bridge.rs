@@ -8153,7 +8153,12 @@ pub(crate) mod tests {
             pqc_completed_at: None,
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // persist v47.3.0 (CIRISPersist#901): a valid root is as attested as its
+            // holders, and any fixture key may stand as a Key-kind root — every
+            // fixture row carries persist's own Layer-A-valid mock evidence.
+            attestation_evidence: Some(
+                ciris_persist::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         }
@@ -17269,6 +17274,64 @@ pub(crate) mod tests {
         assert!(
             !bridge.rooted_with("node-stranger", &mut memo).await,
             "an unowned node with no acceptance of its own is not Rooted"
+        );
+    }
+
+    /// CIRISPersist#901 (persist v47.3.0) — a valid root is as attested as its
+    /// holders. Edge composes `rooted_with` from persist's `trust_root_valid`
+    /// and re-derives nothing, so the leg lands here by construction: the same
+    /// walk, the same charter shape, the same acceptances, and the ONLY
+    /// difference between the two roots below is whether the holder's key
+    /// record carries hardware evidence. Persist's I154 proves the leg; this
+    /// proves edge CONSUMES it — a root that was valid at v47.1.0 is not
+    /// Rooted now.
+    #[tokio::test]
+    async fn a_common_root_whose_holder_is_unattested_is_not_rooted_901() {
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-alice", identity_type::USER),
+                ("person-bob", identity_type::USER),
+                ("node-alice", identity_type::NODE),
+                ("node-bob", identity_type::NODE),
+                ("root-x", identity_type::USER),
+                ("succ-x", identity_type::USER),
+            ],
+        )
+        .await;
+        // root-z: identical to every fixture key but the evidence column.
+        let mut unattested = fixture_key_record("root-z", identity_type::USER);
+        unattested.attestation_evidence = None;
+        backend
+            .put_public_key(SignedKeyRecord { record: unattested })
+            .await
+            .expect("a row with no evidence is admitted, never downgraded");
+        seed_owner_binding(&backend, "person-alice", "node-alice").await;
+        seed_owner_binding(&backend, "person-bob", "node-bob").await;
+        seed_root_charter(&backend, "root-z", &["succ-x".to_string()]).await;
+        let scope = serde_json::json!(["infra:attest", "infra:serve"]);
+        seed_delegates_to(&backend, "person-alice", "root-z", &scope).await;
+        seed_delegates_to(&backend, "person-bob", "root-z", &scope).await;
+        let bridge =
+            bridge_over(&backend, &["node-bob"]).with_local_key_id(Some("node-alice".to_string()));
+
+        let mut memo = AudienceMemo::default();
+        assert!(
+            !bridge.rooted_with("node-bob", &mut memo).await,
+            "a root in common whose holder carries no hardware evidence is not VALID \
+             (persist v47.3.0 holder-hardware leg) ⇒ the pair is not Rooted"
+        );
+
+        // The positive control: the same pair, the same walk, over an attested holder.
+        seed_root_charter(&backend, "root-x", &["succ-x".to_string()]).await;
+        seed_delegates_to(&backend, "person-alice", "root-x", &scope).await;
+        seed_delegates_to(&backend, "person-bob", "root-x", &scope).await;
+        let mut memo = AudienceMemo::default();
+        assert!(
+            bridge.rooted_with("node-bob", &mut memo).await,
+            "the same walk over an attested holder ⇒ Rooted; the evidence column was the only \
+             difference"
         );
     }
 

@@ -162,7 +162,12 @@ impl Ident {
             pqc_completed_at: Some(now),
             persist_row_hash: String::new(),
             capability_roles: Vec::new(),
-            attestation_evidence: None,
+            // persist v47.3.0 (CIRISPersist#901): a Key-kind root is valid only if
+            // its holder's record carries attested hardware evidence — persist's own
+            // Layer-A-valid mock (the wire door checks structure where it lands).
+            attestation_evidence: Some(
+                ciris_persist::federation::hardware_attestation::test_support::fresh_accord_holder_evidence(),
+            ),
             consent_role: None,
             additional_scrubs: Vec::new(),
         }
