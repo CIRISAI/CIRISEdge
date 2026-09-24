@@ -279,6 +279,7 @@ jobs:
               --test leviculum_interface_diversity \
               --test reachability_integration \
               --test route_table_e2e \
+              --test first_contact_ladder_659 \
               --test explicit_hash_addressing \
               --test realtime_av_spine_e2e
 
