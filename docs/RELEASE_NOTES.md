@@ -2,7 +2,7 @@
 
 # v30.2.0 — attribution is not trust: the trace plane relights
 
-**2026-09-24** (PRs #660, #663, #664, #667, #668; CIRISEdge#659, #661, #662; RCA CIRISServer#632). MINOR from
+**2026-09-24** (PRs #660, #663, #664, #666, #667, #668; CIRISEdge#659, #661, #662; RCA CIRISServer#632). MINOR from
 v30.1.0, which no host adopted (CIRISServer pins v29.5.0 → this). Ladder triple: **edge v30.2.0 ·
 persist v47.1.0 · verify v16.1.0** — no pin move, no ABI move.
 
@@ -59,8 +59,9 @@ owners accept a common root — today's status quo for agents, so no regression,
 (this cut) and "the mesh serves" (server step 2 + the canonical owner's acceptance) are two
 milestones. Persist's part of ruling (1) is CIRISPersist#901 (holder-hardware leg), accepted.
 
-**Still owed on #659, next cut:** the CC 3.3.6.2 comment sweep; the genesis-shaped /
-split-installed rungs of the ladder (the two-node rungs are in).
+**Still owed on #659, next cut:** the genesis-shaped / split-installed rungs of the ladder (the
+two-node rungs are in; #666 did the CC 3.3.6.2 comment sweep — it names the authenticated
+binding, not an admit-not-drop doctrine).
 
 ## #661 — no baked production canonical dial while a test trust root is active
 
