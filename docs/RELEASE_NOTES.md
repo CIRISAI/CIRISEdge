@@ -1,5 +1,89 @@
 # CIRISEdge Release Notes
 
+# v30.2.0 — attribution is not trust: the trace plane relights
+
+**2026-09-24** (PRs #660, #663, #664, #666, #667, #668; CIRISEdge#659, #661, #662; RCA CIRISServer#632). MINOR from
+v30.1.0, which no host adopted (CIRISServer pins v29.5.0 → this). Ladder triple: **edge v30.2.0 ·
+persist v47.1.0 · verify v16.1.0** — no pin move, no ABI move.
+
+## #659 — attribution = `owns_key ∧ hybrid binding`; `Rooted` is a valid root in common; nothing is served below it
+
+Since 2026-09-18 no production agent's row landed on the canonical. Item 1 of the attribution gate
+required `Rooted`, which persist's `root_binding` decides by walking the key's scrub chain to a
+hard-coded anchor — *conferral*, true only of canonicals — so every agent answered
+`NotRootedAtSteward` and was never attributed; the self-attribution hole that had stood in for the
+path (CIRISServer#607) closed that day.
+
+- **`SourceKeyId::from_attributed_binding(key_id, owns_key)`** replaces `from_rooted_binding(key_id,
+  provenance, owns_key)` (BREAKING for a direct caller; the FFI and every in-tree transport are
+  updated). Provenance is not an input. The E3 spoof stays refused: `PubkeyMismatch ⇒ owns_key=false`.
+- **`Rooted` is a pair property, computed** — `rooted_with(peer)` in the bridge: owner-binding →
+  owner's acceptance → a valid root in common (persist `owner_of` / `trusted_roots_of` /
+  `trust_root_valid`), memoized per sweep and **never stored**, so `withdraws`, halts,
+  `bounded_until` and a restart all re-evaluate it. An unowned node is its own trust subject.
+- **The serve floor**: an Attributed peer delivers (persist admits its rows) and is served nothing
+  until Rooted — `WithholdReason::RecipientNotRooted` (`recipient_not_rooted`), the last gate in
+  `audience_withholds` so a more specific refusal keeps its name. `Rooted` is standing, never
+  sufficient: `trace:*` keeps its conferral gate; trust weighting and audience are untouched
+  (`FSD/CIRIS_EDGE_TRANSPORT.md` §5.4.1 invariant 1 and the four from the threat check).
+  **One exemption, found by the ladder (#668):** replication is pull-based, so "the peer delivers
+  its allegiance rows" *means* "we let it pull the rows we authored about ourselves" — the
+  owner-binding and the owner's acceptance, the rows that establish Rooted. A floor over those
+  deadlocked two fresh peers forever (each withheld what would have made it Rooted with the
+  other). Rows authored by the node's **self-publish identities** cross to an Attributed peer;
+  everything the node holds **about others** stays behind the floor.
+- **Observability**: the cold-start rooting rejection kind at a throttled `warn` per key; the
+  attribution-miss hint no longer claims a "churn downgrade" for a peer that was never conferred;
+  (#667) every dropped frame logs its attribution operands unthrottled at `debug`, and the
+  bootstrap door logs both identities (federation key, transport destination).
+- **FSD**: §5.1–§5.4.1 — the three-state machine (Identified → Attributed → Rooted), the Rooted
+  walk, the allegiance objects, the rulings and their resolutions.
+
+Witnesses: `route_table_e2e::identified_link_from_an_advisory_key_owning_peer_is_attributed_659`
+and `reply_to_a_nat_d_initiator_rides_the_live_inbound_link` (real two-node links; a peer scrubbed
+by a steward outside the anchor is attributed `Some(B)` — both assertions were `None`);
+`bridge::rooted_with_holds_only_for_a_valid_root_in_common_through_the_owners`;
+`bridge::an_attributed_but_unrooted_peer_in_the_send_set_is_served_nothing` (the exemption, and a
+set-based "newly served" once a common root lands). Fourteen "served to P" tests went red on the
+floor and pass with the fixtures rooting the pairs they consent — the contract change, not
+collateral. **The first-contact ladder as an edge e2e** — `tests/first_contact_ladder_659.rs`, two
+nodes on real Reticulum links, the peer shaped like every production agent (self-signed, owned,
+subject-bound records, #406 route): under a shared root B's rows land on A (Attributed) and A's on
+B (Rooted), both directions; under different roots A's own facts cross, what A holds about ANOTHER
+is withheld across N rounds **with A's `RecipientNotRooted` ledger moved** (the floor fired — an
+absence alone is not a witness), and it arrives the moment B's owner also accepts A's root. In the
+CI Reticulum lane next to `route_table_e2e`.
+
+**Consequence to state plainly:** under the floor the canonical serves nothing to a peer until their
+owners accept a common root — today's status quo for agents, so no regression, but "traces flow"
+(this cut) and "the mesh serves" (server step 2 + the canonical owner's acceptance) are two
+milestones. Persist's part of ruling (1) is CIRISPersist#901 (holder-hardware leg), accepted.
+
+**Still owed on #659, next cut:** the genesis-shaped / split-installed rungs of the ladder (the
+two-node rungs are in; #666 did the CC 3.3.6.2 comment sweep — it names the authenticated
+binding, not an admit-not-drop doctrine).
+
+## #661 — no baked production canonical dial while a test trust root is active
+
+`init_edge_runtime` fell back to the baked genesis dial set whenever the engine had no canonical
+hints — which a fresh test node never has — with no check of the test anchor; harness agents dialed
+the production canonical and registered on the real directory. The dial set now follows persist's
+own condition (`ciris_verify_core::test_anchor::test_trust_root_override`, behind `test-anchor`):
+`baked_canonical_dials_allowed(explicit, test_anchor_active)`, with a new kwarg
+`init_edge_runtime(..., baked_canonical_dials: Optional[bool] = None)`. A skipped fallback is
+logged at WARN. Truth table pinned.
+
+## #662 — a full responder inbox names the driver's phase, is counted by role, and the driver never ends
+
+The canonical dropped attributed peers' Attestation frames with "Responder inbox full" (76/day) and
+the log could not say why. A responder has one drain and its inbox fills while that drain is busy —
+in a reply send to a churned peer, or inside an apply that hybrid-verifies every row of a peer whose
+rows are all refused and re-offered each round. **`DriverPhase {idle, stepping, sending}`** is read
+at the drop site with its duration; **`replication_inbound_backpressure_drops_by_role`** (Python:
+same key) counts under the role. The driver's `Err` arm — unreachable today, but a driver that ends
+leaves a registered slot nobody drains — no longer ends the driver. Inbox depth deliberately
+unchanged: the next canonical log says which mechanism.
+
 # v30.1.0 — adopt persist v46.5.0 + v47.0.0 (the drives open), and a file over 1 MiB is a chunk DAG
 
 **2026-09-23** (PR #658; CIRISEdge#633, CIRISPersist#893/#897/#797). MINOR from v30.0.0, which no
