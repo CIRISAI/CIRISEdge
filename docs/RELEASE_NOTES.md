@@ -1,5 +1,75 @@
 # CIRISEdge Release Notes
 
+# v31.0.0 — a room's roster converges both ways: persist v48.0.0 (CIRISPersist#860 / #905), the 17th kind
+
+**2026-09-24** (CIRISPersist#860 — edge's ask from #608/#613 — and #905; CIRISEdge#672). **MAJOR**
+from v30.3.1: a new replicated kind moves `REPLICATION_POLICY_HASH` and edge's serve/advertise
+manifest, so every rider re-pins. Ladder triple: **edge v31.0.0 · persist v48.0.0 · verify v16.1.0**.
+
+## The pins (riders re-pin all three; no ABI move)
+
+| Pin | v30.3.1 | v31.0.0 |
+|---|---|---|
+| persist `REPLICATION_POLICY_HASH` | `c1082c12…` | `9d62d3a86f7a0ab955969256a10c8160da73a390953ba3c87167a2da96828a19` |
+| persist `CONSENT_GRAMMAR_HASH` (kind list is in the hash; grammar unchanged) | `ed2b0f2c…` | `07a677bbcdff236e2018f0786e8d9b0d0ef6b5b7cc2b871d41459e26ff8864a9` |
+| edge `SERVE_ADVERTISE_POLICY_HASH` (new plane row) | `8249e30b…` | `d6e4f0dfccbf02d274b7c76a70f8b3af8548d177fffaeed699efe3bd423b1df0` |
+| wheel floor | `ciris-persist>=47,<48` | **`ciris-persist>=48,<49`** |
+
+All four persist ABI constants unchanged (`DIRECTORY_ABI_VERSION` 5); verify/keyring stay v16.1.0.
+
+## #860 — the widening plane (`CommunityMembershipWidening`, the 17th `EnvelopeKind`)
+
+The community record is not a principal. A roster grown through `add_community_member` used to
+rewrite the record in place — a fork at every peer (`CommunityRosterFork`), so a widening was a
+*local truth*; and a room with no key row of its own (every pair room edge makes) could not be
+revoked from (the revocation FK named `federation_keys`). Persist v48.0.0 fixes both: **V151**
+re-points the membership-revocation FKs at the group tables (rooms and families are keyless
+identifiers), and adds **`federation_community_membership_widenings`**, the append-plane mirror
+of the revocation. A roster is now the fold of record + widenings − revocations by
+`effective_at` (a removal wins a tie; a record member counts from the record).
+
+- **Edge wires the plane exactly like the revocation it mirrors**: appended LAST in
+  `EnvelopeKind::ALL` (order is hashed); structural (`KindPolicy`, peer-blind — never behind the
+  send set, audience or Rooted floor); `Global` projection (every holder of the room's record
+  must fold the same events); bodies held (`retention_for`: a member folds the roster locally);
+  V2 framing; content-hash-indexed (`persist_index_kind` → `CommunityMembershipWidening`) with
+  `list_signed_community_membership_widenings_since` as the sweep read, resumed on the three-part
+  `(community, member, effective_at)` id (`ServedCommunityMembershipWidening::resume_pair`);
+  applied through `put_community_membership_widening`. The revocation's resume id is the same
+  triple now (its PK gained `effective_at`: a re-added member can be removed again).
+- **`community_roster::community_membership_widening` signs the WIDENING ROW** —
+  `{community_key_id, member_key_id, joined_at, effective_at = joined_at, role}` via persist's
+  `CommunityMembershipWidening::signing_envelope` — never the grown record (the v47 shape is
+  refused with the signature reason). A roster that moved between read and write no longer
+  invalidates a widening; a re-add of an active member is `Ok(false)` and writes nothing.
+- **`revoke_community_member`**: the "room must be a registered key" pre-check is gone (V151);
+  the already-removed short-circuit asks persist's one fold (`is_active_community_member`), so a
+  re-added member is removable again. `a_room_that_is_not_a_registered_key_cannot_revoke_yet`
+  (the v44.6.0 characterization) is replaced by
+  `a_keyless_room_can_revoke_and_a_re_added_member_can_be_removed_again`;
+  `a_widening_signed_over_the_row_survives_a_moved_roster` inverts the v47 stale-roster pin.
+- **E4 forward-path pins** seed the group row on both nodes (V151: a membership plane's row
+  needs its room/family to exist); the widening gets its own pin.
+
+## #905 — the promotion sweep sees a claimed machine's consent (persist-side; server-facing)
+
+`Engine::load_active_egress_grants` and the crossing's `check_grant_covers` now take a grant by
+PRINCIPALS (the machine's own, or its bound steward's naming it in `for_key_id`); V152 keys
+`consent_peer_set` by `for_key_id`. No edge code change; the server's production ladder should
+read `offerable>0` for an owned agent.
+
+## #672 — the test-anchor block minter is persist's
+
+`tests/anchor_block_generate.rs` deleted; re-mint with
+`cargo run --example mint_test_anchor --features test-anchor` in persist (byte-identical Ed25519
+values for the shared seed; a seventh `CIRIS_TEST_TRUST_ROOT_MINTED_BY` line).
+
+Gates: `replication::` + `community_roster::` + manifest pins 439/439 (and under `test-anchor`);
+`active_roster_e2e`, `bridge_combinator_e2e`, `replication_wire_proptest`,
+`chat_message_federates`, `group_content_end_to_end`, `conformance_vectors_v19`; the first-contact
+ladder 2/2; `field_conformance` 5/5; `check --all-targets`; clippy `-D warnings` on the five CI
+combos.
+
 # v30.3.1 — first contact: a node's own allegiance facts cross the consent gate too (CIRISEdge#671)
 
 **2026-09-24** (CIRISEdge#671, split from #659; measured by CIRISServer on the production-shaped

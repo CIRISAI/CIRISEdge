@@ -3,24 +3,34 @@
 //! own signing envelope, hybrid-signed over exactly the bytes the door
 //! verifies, admit-tested against a real backend (CIRISEdge#608).
 //!
-//! # The two doors, and why they are not symmetric
+//! # The two doors, now symmetric (persist v48.0.0, CIRISPersist#860)
 //!
 //! persist keeps a community roster as ONE record (`Community.members`) plus
-//! an APPEND-ONLY revocation table. Growing the roster and shrinking it are
-//! therefore different shapes on the wire:
+//! TWO append-only planes — widenings and revocations — folded at read time
+//! by `effective_at` (`active_community_members`; a removal wins a tie). The
+//! record is never rewritten to grow. Both changes are the same shape on the
+//! wire: a hybrid-signed row under an authority.
 //!
-//! - **Widening** is [`add_community_member`]: the roster mutates in place,
-//!   and the caller's authority signs the **grown** record
-//!   ([`AdmitSpec`]) — every field the gate verifies over is caller-known in
-//!   advance (persist #502 E4), so if the stored roster moved between the
-//!   read and the write, the signature simply does not verify and the add
-//!   fails closed.
+//! - **Widening** is [`add_community_member`]: the caller's authority signs
+//!   the **widening row** `{community_key_id, member_key_id, joined_at,
+//!   effective_at = joined_at, role}` ([`AdmitSpec`]) and persist appends it
+//!   as a `CommunityMembershipWidening` — the 17th replicated kind. A re-add
+//!   of a member already active at `effective_at` is `Ok(false)` and writes
+//!   nothing; only a genuine change writes. (Before v48 the spec was a scrub
+//!   over the GROWN record, which rewrote the roster in place — a fork at
+//!   every peer.)
 //! - **Revocation** is [`put_community_membership_revocation`]: a signed
-//!   append-only row. It is also the **DEK-rotation trigger** — the door
-//!   verifies the signature, then bumps the community DEK epoch in the same
-//!   transaction (CC 4.4.3.2.2), so the next seal wraps only to the remaining
-//!   members. Blobs already sealed keep their grants: forward secrecy on this
-//!   axis is rotation, not recall (CC 4.5.12.1 Option A).
+//!   append-only row, keyed `(community, member, effective_at)` so a re-added
+//!   member can be removed again. It is also the **DEK-rotation trigger** —
+//!   the door verifies the signature, then bumps the community DEK epoch in
+//!   the same transaction (CC 4.4.3.2.2), so the next seal wraps only to the
+//!   remaining members. Blobs already sealed keep their grants: forward
+//!   secrecy on this axis is rotation, not recall (CC 4.5.12.1 Option A). A
+//!   widening does NOT rotate: the minter wraps the member at its next seal.
+//!
+//! A room is a keyless identifier (V151): neither door needs the room to be a
+//! registered key — every pair room and allocated room edge produces can now
+//! be revoked from.
 //!
 //! # What the substrate does NOT adjudicate here
 //!
@@ -33,20 +43,12 @@
 //! moderator); this module guarantees only that what it signs is what the
 //! door admits.
 //!
-//! # A limit the caller must know: widening does not replicate (yet)
+//! # Both changes replicate
 //!
-//! A grown roster is a `Community` record with a different `persist_row_hash`
-//! under an occupied id. A peer that holds the ORIGINAL roster refuses it as
-//! `Conflict` — edge's bridge classifies that `CommunityRosterFork`, and it
-//! is correct to: silently accepting a different roster under an occupied id
-//! is the one thing a community's identity must never permit. There is no
-//! signed append plane for additions the way there is for revocations. So
-//! [`widen_community`] is a LOCAL truth today: the node that widened sees the
-//! new member, and every other node keeps the roster it admitted first. A
-//! room whose roster must be shared is created with its full roster
-//! ([`crate::chat::community`]); a widening after creation reaches only the
-//! widening node until persist grows a replicable form for it. Revocations
-//! DO replicate (`CommunityMembershipRevocation` is its own envelope kind).
+//! `CommunityMembershipWidening` and `CommunityMembershipRevocation` are each
+//! their own envelope kind; the bridge sweeps and applies them like every
+//! structural plane, and every node folds the same events into the same
+//! roster. There is no longer a "local truth" widening.
 //!
 //! [`owner_binding_attestation`]: crate::replication::attestation_bind::owner_binding_attestation
 //! [`add_community_member`]: FederationDirectory::add_community_member
@@ -54,26 +56,28 @@
 
 use ciris_persist::federation::cohort::AdmitSpec;
 use ciris_persist::federation::types::{
-    CommunityMember, CommunityMembershipRevocation, SignedCommunityMembershipRevocation,
+    CommunityMember, CommunityMembershipRevocation, CommunityMembershipWidening,
+    SignedCommunityMembershipRevocation,
 };
 use ciris_persist::federation::FederationDirectory;
 
 /// **The signed widening** — the [`AdmitSpec`] persist's
-/// `add_community_member` verifies, over the roster AS IT WILL BE.
+/// `add_community_member` verifies (v48.0.0, CIRISPersist#860): the
+/// authority's hybrid scrub over the **widening row**
+/// `{community_key_id, member_key_id, joined_at, effective_at = joined_at,
+/// role}` — [`CommunityMembershipWidening::signing_envelope`], the same
+/// signing discipline as a revocation — never over the grown record. Returns
+/// the member row and the spec; apply them with [`widen_community`] or hand
+/// them to the door directly.
 ///
-/// Reads `community_key_id`'s current record from `directory`, appends
-/// `member` (with `role` and `joined_at`), and hybrid-signs the grown
-/// record's [`signing_envelope`](ciris_persist::federation::types::Community::signing_envelope)
-/// as `authority`. Returns the member row and the spec; apply them with
-/// [`widen_community`] or hand them to the door directly.
-///
-/// A member already on the roster is not an error here: the grown record
-/// equals the stored one, and the door reports it as an idempotent no-op
-/// (`Ok(false)`) before consulting the signature at all.
+/// The roster the door holds does not enter the signature, so a roster that
+/// moved between the read and the write does not invalidate it. A member
+/// already active at `joined_at` is not an error: the door reports the
+/// idempotent no-op (`Ok(false)`) and writes no row.
 ///
 /// # Errors
-/// The community is unknown to this directory, a directory read failed,
-/// canonicalization or signing failed.
+/// The community is unknown to this directory (a named refusal before the
+/// door's), a directory read failed, canonicalization or signing failed.
 pub async fn community_membership_widening(
     directory: &dyn FederationDirectory,
     community_key_id: &str,
@@ -84,16 +88,17 @@ pub async fn community_membership_widening(
 ) -> Result<(CommunityMember, AdmitSpec), String> {
     use crate::replication::attestation_bind::truncate_to_substrate_resolution;
 
-    let mut community = directory
+    if directory
         .lookup_community(community_key_id)
         .await
         .map_err(|e| format!("lookup room {community_key_id}: {e}"))?
-        .ok_or_else(|| {
-            format!(
-                "room {community_key_id} is not on this directory — a widening signs the \
-                 GROWN roster, so there must be a roster to grow"
-            )
-        })?;
+        .is_none()
+    {
+        return Err(format!(
+            "room {community_key_id} is not on this directory — a widening names a roster \
+             that must exist to be folded"
+        ));
+    }
 
     let member = CommunityMember {
         key_id: member_key_id.to_owned(),
@@ -103,19 +108,19 @@ pub async fn community_membership_widening(
         joined_at: truncate_to_substrate_resolution(joined_at),
         role: role.map(str::to_owned),
     };
-    // The door compares by `key_id` and treats a present member as a no-op
-    // BEFORE the gate, so the grown record it verifies against is the stored
-    // one in that case. Mirror that exactly: append only if absent, so the
-    // signature is over what the door will actually hash.
-    if !community.members.iter().any(|m| m.key_id == member.key_id) {
-        community.members.push(member.clone());
-    }
-    // The stored hash is server-computed and stripped by `signing_envelope`;
-    // clearing it here is belt-and-braces against a lookup that returned it.
-    community.persist_row_hash = String::new();
-
-    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
-        .map_err(|e| format!("canonicalize the grown roster: {e}"))?;
+    // Exactly persist's own `widening_admit_spec` shape: `effective_at` is the
+    // member's `joined_at`, `persist_row_hash` is server-computed and stripped
+    // by `signing_envelope`.
+    let widening = CommunityMembershipWidening {
+        community_key_id: community_key_id.to_owned(),
+        member_key_id: member.key_id.clone(),
+        joined_at: member.joined_at,
+        effective_at: member.joined_at,
+        role: member.role.clone(),
+        persist_row_hash: String::new(),
+    };
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&widening.signing_envelope())
+        .map_err(|e| format!("canonicalize the widening row: {e}"))?;
     let (scrub_signature_classical, scrub_signature_pqc) =
         crate::identity::sign_bound_hybrid(authority, &canonical, "community widening").await?;
     Ok((
@@ -132,13 +137,12 @@ pub async fn community_membership_widening(
 /// `community_key_id`'s roster on THIS directory when this returns `Ok`.
 /// `Ok(true)` is a genuine add, `Ok(false)` the idempotent no-op.
 ///
-/// See the module doc for why this is a local truth and not a replicated
-/// one.
+/// The widening replicates as its own kind; every node folds it.
 ///
 /// # Errors
 /// [`community_membership_widening`]'s, or the door's refusal — a signature
-/// that does not verify (the roster moved under the caller, or `authority`
-/// is not the registered hybrid key it claims), an unknown community.
+/// that does not verify (`authority` is not the registered hybrid key it
+/// claims), an unknown community.
 pub async fn widen_community(
     directory: &dyn FederationDirectory,
     community_key_id: &str,
@@ -244,33 +248,18 @@ pub async fn revoke_community_member(
     witness_set: &[&str],
     authority: &crate::identity::LocalSigner,
 ) -> Result<(), String> {
-    if directory
-        .lookup_public_key(community_key_id)
-        .await
-        .map_err(|e| format!("lookup room key {community_key_id}: {e}"))?
-        .is_none()
-    {
-        return Err(format!(
-            "room {community_key_id} is not a registered federation key, and persist's \
-             community-membership-revocation table references `federation_keys` — a member \
-             cannot be removed from a room whose id is derived or allocated until persist \
-             gives communities an identity type or re-points that FK at \
-             `federation_communities` (CIRISEdge#608)"
-        ));
-    }
-    // The door's contract is "idempotent on the (community, member) PK"; its
-    // sqlite implementation raises a UNIQUE violation on a repeat instead
-    // (persist v44.6.0 — the same doc-vs-door gap `attestation_reput_verdict`
-    // closed for attestations). A member already revoked is already off the
-    // roster and the epoch already moved, which is what the caller asked
-    // for, so honour the documented contract here rather than surface the
-    // constraint.
-    if directory
-        .list_community_membership_revocations_for(community_key_id)
-        .await
-        .map_err(|e| format!("list revocations for room {community_key_id}: {e}"))?
-        .iter()
-        .any(|r| r.removed_identity_key_id == removed_identity_key_id)
+    // The door's contract is "idempotent on the (community, member,
+    // effective_at) PK" (v48.0.0: a re-added member can be removed again).
+    // A member who is not on the ACTIVE roster now — by persist's one fold of
+    // record + widenings − revocations — is already what the caller asked
+    // for, so honour that here rather than surface a constraint.
+    if !ciris_persist::federation::is_active_community_member(
+        directory,
+        community_key_id,
+        removed_identity_key_id,
+    )
+    .await
+    .map_err(|e| format!("active roster of room {community_key_id}: {e}"))?
     {
         return Ok(());
     }
@@ -499,24 +488,42 @@ mod admit_tests {
         );
     }
 
-    /// **A widening over a roster that moved is refused** — the signature is
-    /// over the grown record the caller computed, and a different stored
-    /// roster is a different record.
+    /// **A widening is signed over the ROW, so a roster that moved does not
+    /// invalidate it** (v48.0.0, #860 — the inverse of the v47 pin, which
+    /// signed the grown record and failed closed on any move).
     #[tokio::test]
-    async fn a_widening_over_a_stale_roster_fails_closed() {
+    async fn a_widening_signed_over_the_row_survives_a_moved_roster() {
         let (dir, alice, room, _carol) = room_of_two(false).await;
-        // Alice signs a widening for carol against the roster [alice, bob]…
+        // A widening's member is a `federation_keys` FK: dave must be a key.
+        dir.put_public_key(SignedKeyRecord {
+            record: user_record(&signer("dave-fed", 4)).await,
+        })
+        .await
+        .expect("register dave");
         let (member, spec) =
             community_membership_widening(&*dir, &room, "carol-fed", None, ts(), &alice)
                 .await
                 .expect("build");
-        // …but the roster grows under her first.
         widen_community(&*dir, &room, "dave-fed", None, ts(), &alice)
             .await
             .expect("first add");
-        dir.add_community_member(&room, member, &spec)
-            .await
-            .expect_err("the grown record alice signed is not the one the door computes now");
+        assert!(
+            dir.add_community_member(&room, member, &spec).await.expect(
+                "the row alice signed is the row the door verifies, whatever the roster did"
+            ),
+            "a genuine add writes"
+        );
+        assert_eq!(
+            active(&dir, &room).await,
+            ["alice-fed", "bob-fed", "carol-fed", "dave-fed"],
+        );
+        // Idempotent on the plane: a re-add of an active member writes nothing.
+        assert!(
+            !widen_community(&*dir, &room, "carol-fed", None, ts(), &alice)
+                .await
+                .expect("re-add is not an error"),
+            "a member already active at effective_at is Ok(false)"
+        );
     }
 
     /// **The removal persist actually admits, the active roster shrinks, and
@@ -600,43 +607,37 @@ mod admit_tests {
         );
     }
 
-    /// **CHARACTERIZATION — a room whose id is not a registered key cannot
-    /// revoke a member, and the producer says why.** This is every pair room
-    /// and every allocated room edge produces. It pins persist v44.6.0's
-    /// `federation_community_membership_revocations.community_key_id
-    /// REFERENCES federation_keys(key_id)` from the caller's side: the
-    /// refusal is edge's named one, and the door underneath would have said
-    /// "FOREIGN KEY constraint failed". When persist lifts the FK (an
-    /// identity type for communities, or the FK re-pointed at
-    /// `federation_communities`), delete the pre-check in
-    /// `revoke_community_member` and this test goes with it.
+    /// **A keyless room can revoke (V151), and a re-added member can be
+    /// removed again (the PK carries `effective_at`).** The inverse of the
+    /// v47 pin `a_room_that_is_not_a_registered_key_cannot_revoke_yet`, which
+    /// went red on persist v48.0.0 — the signal the ruling named.
     #[tokio::test]
-    async fn a_room_that_is_not_a_registered_key_cannot_revoke_yet() {
+    async fn a_keyless_room_can_revoke_and_a_re_added_member_can_be_removed_again() {
         let (dir, alice, room, _carol) = room_of_two(false).await;
-        let err = revoke_community_member(&*dir, &room, "bob-fed", ts(), None, &[], &alice)
+        let t1 = ts() + chrono::Duration::seconds(1);
+        let t2 = ts() + chrono::Duration::seconds(2);
+        let t3 = ts() + chrono::Duration::seconds(3);
+        revoke_community_member(&*dir, &room, "bob-fed", t1, None, &[], &alice)
             .await
-            .expect_err("an unregistered room id cannot satisfy persist's FK");
-        assert!(
-            err.contains("not a registered federation key") && err.contains("federation_keys"),
-            "the refusal names persist's constraint, not a bare FK error: {err}",
-        );
+            .expect("a room that is not a registered key can revoke now");
+        assert_eq!(active(&dir, &room).await, ["alice-fed"]);
+        // Re-add, later than the removal: the fold takes the latest event.
+        assert!(widen_community(&*dir, &room, "bob-fed", None, t2, &alice)
+            .await
+            .expect("re-add"));
+        assert_eq!(active(&dir, &room).await, ["alice-fed", "bob-fed"]);
+        // …and remove again: a second revocation row, a different PK.
+        revoke_community_member(&*dir, &room, "bob-fed", t3, None, &[], &alice)
+            .await
+            .expect("a re-added member can be removed again");
+        assert_eq!(active(&dir, &room).await, ["alice-fed"]);
         assert_eq!(
-            active(&dir, &room).await,
-            ["alice-fed", "bob-fed"],
-            "and nothing was written",
-        );
-        // The door itself, for the record — the pre-check is a translation of
-        // this refusal, not a different rule.
-        let signed = community_membership_revocation(&room, "bob-fed", ts(), None, &[], &alice)
-            .await
-            .expect("build");
-        let raw = dir
-            .put_community_membership_revocation(signed)
-            .await
-            .expect_err("the door refuses on the FK");
-        assert!(
-            raw.to_string().contains("FOREIGN KEY"),
-            "the door's own refusal is the FK: {raw}",
+            dir.list_community_membership_revocations_for(&room)
+                .await
+                .expect("list")
+                .len(),
+            2,
+            "two revocations, two instants"
         );
     }
 }

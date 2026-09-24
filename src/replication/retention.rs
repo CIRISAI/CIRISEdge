@@ -98,6 +98,10 @@ pub const fn retention_for(kind: EnvelopeKind, configured: Retention) -> Retenti
         // chat room is not a smaller copy of it — it is not being in it.
         | EnvelopeKind::Community
         | EnvelopeKind::Family
+        // #860 — the roster is the FOLD of the record and the widening plane;
+        // a member folds it locally, unprompted, so the widening's body is as
+        // load-bearing as the record's.
+        | EnvelopeKind::CommunityMembershipWidening
 
         // ── Accord quorum evidence. Bodies, because it carries WITHDRAWAL
         // evidence: a participation can retract a vote, and the aggregate is
@@ -157,7 +161,7 @@ mod tests {
     /// * it is a ROSTER its members read locally and unprompted. A chat room is
     ///   a 2-member `Community`, and reading it goes through the roster in the
     ///   body. Holding the hash of your own chat room is not being in it.
-    const MUST_HOLD_BODIES: [EnvelopeKind; 13] = [
+    const MUST_HOLD_BODIES: [EnvelopeKind; 14] = [
         EnvelopeKind::Revocation,
         EnvelopeKind::IdentityOccurrenceRevocation,
         EnvelopeKind::FamilyMembershipRevocation,
@@ -169,6 +173,8 @@ mod tests {
         // Roster planes: a member reads these locally, unprompted.
         EnvelopeKind::Community,
         EnvelopeKind::Family,
+        // #860 — a member folds the widening plane into the roster locally.
+        EnvelopeKind::CommunityMembershipWidening,
         // Carries withdrawal evidence, and its hash moves as votes land.
         EnvelopeKind::AccordQuorumEvidence,
         // A key_grant set: the wraps are the payload (#848).

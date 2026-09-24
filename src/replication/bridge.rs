@@ -106,9 +106,9 @@ use ciris_persist::federation::trust_root::capability_roots_to_trusted_root;
 use ciris_persist::federation::types::delegation_scope;
 use ciris_persist::federation::types::{
     Attestation, KeyRecord, SignedAttestation, SignedCommunity,
-    SignedCommunityMembershipRevocation, SignedFamily, SignedFamilyMembershipRevocation,
-    SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation, SignedKeyRecord,
-    SignedLocationProof, SignedRevocation,
+    SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening, SignedFamily,
+    SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
+    SignedKeyRecord, SignedLocationProof, SignedRevocation,
 };
 use ciris_persist::federation::{AttestationOutcome, FederationDirectory};
 use ciris_verify_core::threshold::ThresholdMember;
@@ -3543,6 +3543,9 @@ impl FederationDirectoryReplicationBridge {
             EnvelopeKind::CommunityMembershipRevocation => {
                 self.list_community_membership_revocations(window).await
             }
+            EnvelopeKind::CommunityMembershipWidening => {
+                self.list_community_membership_widenings(window).await
+            }
             EnvelopeKind::LocationProof => self.list_location_proofs(window).await,
             // CIRISEdge#474 — the accord-quorum-evidence plane is NEVER advertised
             // by content-hash: it has no `signed_wire_index` entry
@@ -4093,6 +4096,12 @@ impl FederationDirectoryReplicationBridge {
             }
             EnvelopeKind::CommunityMembershipRevocation => {
                 self.apply_community_membership_revocation(envelope_bytes)
+                    .await
+            }
+            // #860 — applied exactly like the revocation: the row lands, the
+            // roster is a read-time fold, nothing is rewritten.
+            EnvelopeKind::CommunityMembershipWidening => {
+                self.apply_community_membership_widening(envelope_bytes)
                     .await
             }
             EnvelopeKind::LocationProof => self.apply_location_proof(envelope_bytes).await,
@@ -7123,6 +7132,30 @@ impl FederationDirectoryReplicationBridge {
         .await
     }
 
+    /// persist v48.0.0 (CIRISPersist#860) — the widening plane, swept exactly
+    /// like the revocation it mirrors: `Global` projection, resumed on the
+    /// three-part `(community, member, effective_at)` id.
+    async fn list_community_membership_widenings(
+        &self,
+        window: SweepWindow<'_>,
+    ) -> Vec<EnvelopeRef> {
+        self.sweep_paged(
+            EnvelopeKind::CommunityMembershipWidening,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_community_membership_widenings_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedCommunityMembershipWidening::resume_pair,
+            |_| true,
+            |s| Self::ms_seq(s.widening.community_membership_widening.effective_at),
+            |s| &s.widening,
+        )
+        .await
+    }
+
     async fn list_location_proofs(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // CIRISEdge#523 — plane 3 of 3. A LocationProof's `subject_key_id` is
         // whoever the proof is ABOUT, which for a person's presence claim is a
@@ -7721,6 +7754,16 @@ impl FederationDirectoryReplicationBridge {
             bytes,
             SignedCommunityMembershipRevocation,
             put_community_membership_revocation
+        )
+    }
+
+    async fn apply_community_membership_widening(&self, bytes: &[u8]) -> ApplyOutcome {
+        apply_signed_plane!(
+            self,
+            "CommunityMembershipWidening",
+            bytes,
+            SignedCommunityMembershipWidening,
+            put_community_membership_widening
         )
     }
 
@@ -9692,6 +9735,22 @@ pub(crate) mod tests {
         }
     }
 
+    /// Hybrid-sign a [`CommunityMembershipWidening`] — mirrors
+    /// [`sign_community_membership_revocation_fixture`] (#860).
+    fn sign_community_membership_widening_fixture(
+        authority_key_id: &str,
+        widening: ciris_persist::federation::CommunityMembershipWidening,
+    ) -> SignedCommunityMembershipWidening {
+        let (_h, classical, pqc) =
+            sign_attestation_envelope(authority_key_id, &widening.signing_envelope());
+        SignedCommunityMembershipWidening {
+            community_membership_widening: widening,
+            authority_key_id: authority_key_id.to_string(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+        }
+    }
+
     /// Hybrid-sign a [`LocationProof`] — mirrors [`sign_family_fixture`].
     fn sign_location_proof_fixture(
         authority_key_id: &str,
@@ -9768,10 +9827,17 @@ pub(crate) mod tests {
     /// signed it. Every other E4 kind admits a distinct authority by design
     /// (an authority legitimately speaks about parties who are not itself) and
     /// passes `&[]`.
+    // A test fixture: V151 (#860) added the two group-seeding slices.
+    #[allow(clippy::too_many_arguments)]
     async fn pin_e4_forward_path<T>(
         kind: EnvelopeKind,
         cohort: &[&str],
         registered_keys: &[(&str, &str)],
+        // persist v48.0.0 (V151) — a membership plane's group FK names the
+        // GROUP table, so a room/family must exist on BOTH nodes before a
+        // widening or revocation about it can admit. Seeded after the keys.
+        communities: &[SignedCommunity],
+        families: &[SignedFamily],
         delegations: &[(&str, &str)],
         signed: &T,
         wrapper_fields_of: impl Fn(&T) -> (String, String, Option<String>),
@@ -9784,6 +9850,18 @@ pub(crate) mod tests {
         // Node A — the forwarding edge.
         let (backend_a, bridge_a) = make_bridge(&cohort);
         register_fixture_keys(&backend_a, registered_keys).await;
+        for c in communities {
+            backend_a
+                .put_community(c.clone())
+                .await
+                .expect("seed the E4 pin's room (V151 group FK)");
+        }
+        for f in families {
+            backend_a
+                .put_family(f.clone())
+                .await
+                .expect("seed the E4 pin's family (V151 group FK)");
+        }
         for (granter, delegate) in delegations {
             seed_delegates_to(
                 &backend_a,
@@ -9830,6 +9908,18 @@ pub(crate) mod tests {
         // Node B — re-admission of what A served IS the lockstep property.
         let (backend_b, bridge_b) = make_bridge(&cohort);
         register_fixture_keys(&backend_b, registered_keys).await;
+        for c in communities {
+            backend_b
+                .put_community(c.clone())
+                .await
+                .expect("seed the E4 pin's room (V151 group FK)");
+        }
+        for f in families {
+            backend_b
+                .put_family(f.clone())
+                .await
+                .expect("seed the E4 pin's family (V151 group FK)");
+        }
         for (granter, delegate) in delegations {
             seed_delegates_to(
                 &backend_b,
@@ -9856,6 +9946,8 @@ pub(crate) mod tests {
                 ("e4-authority", identity_type::AGENT),
                 ("e4-member", identity_type::AGENT),
             ],
+            &[],
+            &[],
             &[], // an authority speaks about others BY DESIGN on this plane
             &signed,
             |s: &SignedFamily| {
@@ -9888,6 +9980,8 @@ pub(crate) mod tests {
                 ("e4-community", identity_type::AGENT),
                 ("e4-member", identity_type::USER),
             ],
+            &[],
+            &[],
             &[],
             &signed,
             |s: &SignedCommunity| {
@@ -10315,6 +10409,11 @@ pub(crate) mod tests {
                 ("e4-member", identity_type::AGENT),
             ],
             &[],
+            &[sign_family_fixture(
+                "e4-authority",
+                fixture_family("e4-family", "e4-member"),
+            )],
+            &[],
             &signed,
             |s: &SignedFamilyMembershipRevocation| {
                 (
@@ -10350,8 +10449,14 @@ pub(crate) mod tests {
             &[
                 ("e4-authority", identity_type::AGENT),
                 ("e4-community", identity_type::AGENT),
-                ("e4-member", identity_type::AGENT),
+                // CC 3.2 — a room member roots in a human; a `user` self-anchors.
+                ("e4-member", identity_type::USER),
             ],
+            &[sign_community_fixture(
+                "e4-authority",
+                fixture_community("e4-community", "e4-member"),
+            )],
+            &[],
             &[],
             &signed,
             |s: &SignedCommunityMembershipRevocation| {
@@ -10362,6 +10467,50 @@ pub(crate) mod tests {
                 )
             },
             |s| s.community_membership_revocation.signing_envelope(),
+        )
+        .await;
+    }
+
+    /// #860 — the widening plane's E4 forward path: the authority signature
+    /// survives the wire byte-for-byte, exactly as the revocation's does.
+    #[tokio::test]
+    async fn e4_community_membership_widening_forward_path_preserves_authority_signature() {
+        let signed = sign_community_membership_widening_fixture(
+            "e4-authority",
+            ciris_persist::federation::CommunityMembershipWidening {
+                community_key_id: "e4-community".to_string(),
+                member_key_id: "e4-newcomer".to_string(),
+                joined_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                effective_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        pin_e4_forward_path(
+            EnvelopeKind::CommunityMembershipWidening,
+            &[],
+            &[
+                ("e4-authority", identity_type::AGENT),
+                ("e4-community", identity_type::AGENT),
+                // CC 3.2 — room members root in a human; `user` self-anchors.
+                ("e4-member", identity_type::USER),
+                ("e4-newcomer", identity_type::USER),
+            ],
+            &[sign_community_fixture(
+                "e4-authority",
+                fixture_community("e4-community", "e4-member"),
+            )],
+            &[],
+            &[],
+            &signed,
+            |s: &SignedCommunityMembershipWidening| {
+                (
+                    s.authority_key_id.clone(),
+                    s.scrub_signature_classical.clone(),
+                    s.scrub_signature_pqc.clone(),
+                )
+            },
+            |s| s.community_membership_widening.signing_envelope(),
         )
         .await;
     }
@@ -10391,6 +10540,8 @@ pub(crate) mod tests {
                 ("e4-authority", identity_type::AGENT),
                 ("e4-subject", identity_type::AGENT),
             ],
+            &[],
+            &[],
             // CIRISPersist#734 — location is SELF-KNOWLEDGE, so a distinct
             // `authority_key_id` is admissible only as a LIVE delegate of the
             // subject. The edge is seeded on BOTH nodes, through the real
