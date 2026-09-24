@@ -864,6 +864,11 @@ pub struct EdgeMetrics {
     /// Single `Arc<AtomicU64>`; the offending peer + kind + role ride the
     /// matching throttled WARN.
     pub replication_inbound_backpressure_drops: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#662 — the same drops, by the ROLE whose inbox was full
+    /// (`"responder"` / `"initiator"`). The total could not say which; the
+    /// canonical's 76-a-day were all responder-side, and that is the question
+    /// the issue asked.
+    pub replication_inbound_backpressure_drops_by_role: Arc<RwLock<HashMap<String, u64>>>,
     /// CIRISEdge#634 — cumulative inbound CRPL frames routed to a RESPONDER
     /// (the peer's round: an initiator-marked v3 frame or a legacy v1/v2 one).
     /// Pairs with `replication_routed_to_initiator_total`: on a healthy mutual
@@ -1136,6 +1141,12 @@ impl EdgeMetrics {
     pub fn inc_inbound_backpressure_drop(&self) {
         self.replication_inbound_backpressure_drops
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#662 — count an inbound-backpressure drop under its role.
+    pub fn inc_inbound_backpressure_drop_by_role(&self, role: &str) {
+        let mut guard = self.replication_inbound_backpressure_drops_by_role.write();
+        *guard.entry(role.to_owned()).or_insert(0) += 1;
     }
 
     /// CIRISEdge#373 — read the inbound-backpressure-drop counter (tests +
@@ -1416,6 +1427,10 @@ impl EdgeMetrics {
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
             replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
+            replication_inbound_backpressure_drops_by_role: self
+                .replication_inbound_backpressure_drops_by_role
+                .read()
+                .clone(),
             blob_serve_refusals: self
                 .blob_serve_refusals
                 .read()
@@ -1487,6 +1502,8 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#373 — cumulative inbound frames dropped on coordinator
     /// channel back-pressure (previously a silent WARN).
     pub replication_inbound_backpressure_drops: u64,
+    /// CIRISEdge#662 — the same, by role (`"responder"` / `"initiator"`).
+    pub replication_inbound_backpressure_drops_by_role: HashMap<String, u64>,
     /// CIRISEdge#640 — blob holders dropped from a pull by refusal branch.
     pub blob_route_refusals: HashMap<String, u64>,
     /// CIRISEdge#640 — `BlobChunkFetch`es received and not served, by branch.

@@ -5063,6 +5063,72 @@ fn note_reply_dropped(
     }
 }
 
+/// CIRISEdge#373 / #634 / #662 — a coordinator's bounded inbox is full. Counted
+/// (total and by ROLE), throttled, and the WARN names what the role's driver
+/// was doing and for how long — the question a full inbox actually poses.
+async fn note_backpressure_drop(
+    registry: &std::sync::Arc<crate::replication::registry::ReplicationRegistry>,
+    source: &str,
+    kind: crate::replication::EnvelopeKind,
+    role: crate::replication::session::SessionRole,
+    e: &crate::replication::RegistryError,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+) {
+    use crate::log_throttle::ThrottleDecision;
+    // CIRISEdge#373 — a coordinator's bounded inbox is full. This was a
+    // SILENT 100%-loss WARN; now it is counted (so the field sees the
+    // magnitude) and throttled (so a multi-round stall doesn't flood
+    // the log). CIRISEdge#634 — and it names the ROLE whose inbox it
+    // is: the old text said "a responder reply stalled" for every drop
+    // and sent the CIRISServer#607 RCA to the wrong place twice, while
+    // the frames were queuing into an initiator that was never
+    // listening. A responder's full inbox means its driver is stalled
+    // on a reply send (#373); an initiator's means replies outran the
+    // round being driven.
+    let role_tag = match role {
+        crate::replication::session::SessionRole::Initiator => "initiator",
+        crate::replication::session::SessionRole::Responder => "responder",
+    };
+    if let Some(m) = metrics {
+        m.inc_inbound_backpressure_drop();
+        m.inc_inbound_backpressure_drop_by_role(role_tag);
+    }
+    if let ThrottleDecision::Emit { suppressed_prev } =
+        inbound_backpressure_drop_log().check(source)
+    {
+        // CIRISEdge#662 — a full inbox means the coordinator's ONE drain
+        // was busy while the peer kept sending; say what it was busy
+        // with. For a responder: `stepping` = inside the round step
+        // (an apply that hybrid-verifies every row of a peer whose rows
+        // are all refused and re-offered each round), `sending` = a
+        // reply send to a churned peer (#373's stall), `idle` = the
+        // driver is not running at all (a registered slot nobody
+        // drains — the trap the driver no longer falls into).
+        let (driver_phase, driver_phase_for_ms) = match registry.get(source, kind, role).await {
+            Some(coord) => {
+                let (p, d) = coord.driver_phase();
+                (p.as_str(), d.as_millis())
+            }
+            None => ("unregistered", 0),
+        };
+        tracing::warn!(
+            peer = %source,
+            ?role,
+            ?kind,
+            driver_phase,
+            driver_phase_for_ms,
+            inbox_capacity =
+                crate::replication::coordinator::ReplicationCoordinator::INBOUND_CHANNEL_CAPACITY,
+            error = %e,
+            suppressed_prev,
+            "replication inbound frame DROPPED — {role:?} inbox full while its driver \
+             was `{driver_phase}` for {driver_phase_for_ms} ms; counted in \
+             EdgeMetrics.replication_inbound_backpressure_drops[_by_role] \
+             (CIRISEdge#373 / #634 / #662)"
+        );
+    }
+}
+
 async fn route_attributed_frame(
     registry: &std::sync::Arc<crate::replication::registry::ReplicationRegistry>,
     source: &str,
@@ -5128,32 +5194,8 @@ async fn route_attributed_frame(
             );
             true
         }
-        Err(e @ RegistryError::BackPressure { role, .. }) => {
-            // CIRISEdge#373 — a coordinator's bounded inbox is full. This was a
-            // SILENT 100%-loss WARN; now it is counted (so the field sees the
-            // magnitude) and throttled (so a multi-round stall doesn't flood
-            // the log). CIRISEdge#634 — and it names the ROLE whose inbox it
-            // is: the old text said "a responder reply stalled" for every drop
-            // and sent the CIRISServer#607 RCA to the wrong place twice, while
-            // the frames were queuing into an initiator that was never
-            // listening. A responder's full inbox means its driver is stalled
-            // on a reply send (#373); an initiator's means replies outran the
-            // round being driven.
-            if let Some(m) = metrics {
-                m.inc_inbound_backpressure_drop();
-            }
-            if let ThrottleDecision::Emit { suppressed_prev } =
-                inbound_backpressure_drop_log().check(source)
-            {
-                tracing::warn!(
-                    peer = %source,
-                    ?role,
-                    error = %e,
-                    suppressed_prev,
-                    "replication inbound frame DROPPED — {role:?} inbox full; counted in \
-                     EdgeMetrics.replication_inbound_backpressure_drops (CIRISEdge#373 / #634)"
-                );
-            }
+        Err(e @ RegistryError::BackPressure { role, kind, .. }) => {
+            note_backpressure_drop(registry, source, kind, role, &e, metrics).await;
             true
         }
         Err(e) => {
@@ -9507,6 +9549,165 @@ mod inbound_ingest_tests {
             built.lock().unwrap().is_empty(),
             "no proven identity, no door: transport identity is the precondition, not a default",
         );
+    }
+
+    /// CIRISEdge#662 — a full responder inbox is counted under its ROLE and
+    /// the drop line names the driver's PHASE and how long it has been there.
+    ///
+    /// The responder's provider parks inside the round step (the shape of a
+    /// long apply), so the driver sits in `stepping` while the peer keeps
+    /// sending: eight frames queue (the inbox capacity), the ninth is dropped —
+    /// counted once, under `responder`, with the phase readable at the drop
+    /// site. The first frame is the positive control: routed, and it is what
+    /// parks the driver.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)] // three doubles + the three-stage scenario, one witness
+    async fn a_full_responder_inbox_is_counted_by_role_and_names_the_drivers_phase() {
+        use crate::replication::coordinator::{DriverPhase, ReplicationCoordinator};
+        use crate::replication::protocol::EnvelopeRef;
+        use crate::replication::registry::ReplicationRegistry;
+        use crate::replication::session::SessionRole;
+        use crate::replication::summary::ApplyOutcome;
+        use crate::replication::summary::StateApplier;
+        use crate::replication::summary::StateProvider;
+        use std::sync::{Arc, Condvar, Mutex};
+
+        struct Gate(Mutex<bool>, Condvar);
+        struct ParkingProvider(Arc<Gate>);
+        impl StateProvider for ParkingProvider {
+            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                let mut open = self.0 .0.lock().unwrap();
+                while !*open {
+                    open = self.0 .1.wait(open).unwrap();
+                }
+                vec![]
+            }
+            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+            fn subject_refs(&self, _kind: EnvelopeKind, _subject: &str) -> Vec<EnvelopeRef> {
+                vec![]
+            }
+        }
+        struct NoApply;
+        impl StateApplier for NoApply {
+            fn apply_envelope(
+                &self,
+                _k: EnvelopeKind,
+                _b: &[u8],
+                _s: Option<&str>,
+            ) -> ApplyOutcome {
+                ApplyOutcome::Admitted
+            }
+        }
+        struct NullTransport;
+        #[async_trait::async_trait]
+        impl crate::transport::Transport for NullTransport {
+            fn id(&self) -> TransportId {
+                TransportId::HTTP
+            }
+            async fn send(
+                &self,
+                _to: &str,
+                _bytes: &[u8],
+            ) -> Result<crate::transport::TransportSendOutcome, crate::transport::TransportError>
+            {
+                Ok(crate::transport::TransportSendOutcome::Delivered)
+            }
+            async fn listen(
+                &self,
+                _sink: tokio::sync::mpsc::Sender<InboundFrame>,
+            ) -> Result<(), crate::transport::TransportError> {
+                Ok(())
+            }
+        }
+
+        let gate = Arc::new(Gate(Mutex::new(false), Condvar::new()));
+        let registry = Arc::new(ReplicationRegistry::new());
+        let factory_gate = Arc::clone(&gate);
+        registry.set_responder_factory(Arc::new(move |peer: &str, kind| {
+            let coord = Arc::new(ReplicationCoordinator::new(
+                Arc::new(NullTransport),
+                peer,
+                kind,
+                SessionRole::Responder,
+                Arc::new(ParkingProvider(Arc::clone(&factory_gate))),
+                Arc::new(NoApply),
+            ));
+            crate::replication::runtime::spawn_responder_drive(Arc::clone(&coord));
+            coord
+        }));
+        let metrics = crate::observability::EdgeMetrics::default();
+        let frame = || InboundFrame {
+            envelope_bytes: crate::replication::wire_frame::wrap(&ReplicationMessage::Summary(
+                SummaryMessage {
+                    kind: EnvelopeKind::Attestation,
+                    refs: vec![],
+                },
+            )),
+            transport: TransportId::HTTP,
+            received_at: chrono::Utc::now(),
+            source_key_id: Some(crate::transport::SourceKeyId::transport_authenticated(
+                "peer-x",
+            )),
+            link_key_id: None,
+            arrival_scope: None,
+        };
+        let route = |f: InboundFrame| {
+            let r = Arc::clone(&registry);
+            let m = metrics.clone();
+            async move { route_replication_frame(Some(&r), &f, Some(&m)).await }
+        };
+
+        // (1) The round-open is routed and parks the driver inside the step.
+        assert!(
+            route(frame()).await,
+            "the first frame is consumed by replication ingest"
+        );
+        let coord = registry
+            .get("peer-x", EnvelopeKind::Attestation, SessionRole::Responder)
+            .await
+            .expect("the factory built a responder");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while coord.driver_phase().0 != DriverPhase::Stepping {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the driver never entered the step"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // (2) The inbox absorbs exactly its capacity while the drain is parked.
+        for _ in 0..ReplicationCoordinator::INBOUND_CHANNEL_CAPACITY {
+            assert!(route(frame()).await);
+        }
+        assert_eq!(
+            metrics.inbound_backpressure_drops(),
+            0,
+            "capacity is not a drop"
+        );
+        // (3) One more is the drop: counted, by role, with the phase readable.
+        assert!(
+            route(frame()).await,
+            "a dropped frame is still consumed (never envelope-dispatched)"
+        );
+        assert_eq!(metrics.inbound_backpressure_drops(), 1);
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.replication_inbound_backpressure_drops_by_role
+                .get("responder"),
+            Some(&1),
+            "the drop is booked under the ROLE whose inbox was full: {:?}",
+            snap.replication_inbound_backpressure_drops_by_role
+        );
+        assert_eq!(
+            coord.driver_phase().0,
+            DriverPhase::Stepping,
+            "the drain was busy in the step"
+        );
+
+        // Release the driver so the task ends cleanly.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
     }
 
     /// CIRISEdge#402 — the bootstrap attribution carve-out truth table, tested at

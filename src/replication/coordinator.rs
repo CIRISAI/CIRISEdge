@@ -160,6 +160,14 @@ pub enum CoordinatorError {
 /// round, or `drive_round_step(Some(inbound))` (responder) on the
 /// next inbound Summary.
 pub struct ReplicationCoordinator {
+    /// CIRISEdge#662 — what the DRIVER of this coordinator is doing right now
+    /// (`DriverPhase` as `u8`), and since when (unix ms). A responder has ONE
+    /// drain; when its inbox fills, the operator's only question is what that
+    /// drain was busy with — a reply send to a churned peer, or an apply that
+    /// hybrid-verifies every row of a peer whose rows are all refused. Read at
+    /// the drop site so the "inbox full" line answers it.
+    driver_phase: std::sync::atomic::AtomicU8,
+    driver_phase_since_ms: AtomicU64,
     /// CIRISEdge#441 — optional metrics handle; when present, every inbound
     /// Summary on a removal-class kind folds into the removal-receipt
     /// ledger (the peer's Summary IS the protocol-native delivery ack).
@@ -197,6 +205,29 @@ impl ReplicationCoordinator {
     /// 3 messages queued (Summary + Diff + Deliver); 8 gives slack
     /// for a slightly-late deliver while the scheduler is mid-step.
     pub const INBOUND_CHANNEL_CAPACITY: usize = 8;
+
+    /// CIRISEdge#662 — the driver records what it is doing. Called by the
+    /// responder driver around its three awaits; a coordinator nobody drives
+    /// reads `Idle` since `0`.
+    pub fn set_driver_phase(&self, phase: DriverPhase) {
+        self.driver_phase.store(phase as u8, Ordering::Release);
+        self.driver_phase_since_ms.store(
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+            Ordering::Release,
+        );
+    }
+
+    /// CIRISEdge#662 — the driver's phase and how long it has been in it.
+    #[must_use]
+    pub fn driver_phase(&self) -> (DriverPhase, std::time::Duration) {
+        let phase = DriverPhase::from_u8(self.driver_phase.load(Ordering::Acquire));
+        let since = self.driver_phase_since_ms.load(Ordering::Acquire);
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+        (
+            phase,
+            std::time::Duration::from_millis(now.saturating_sub(since)),
+        )
+    }
 
     pub fn new(
         transport: Arc<dyn Transport>,
@@ -237,6 +268,8 @@ impl ReplicationCoordinator {
             applier,
             session: Mutex::new(Session::new(role, kind)),
             inbox,
+            driver_phase: std::sync::atomic::AtomicU8::new(DriverPhase::Idle as u8),
+            driver_phase_since_ms: AtomicU64::new(0),
         }
     }
 
@@ -928,6 +961,42 @@ impl ReplicationCoordinator {
 
 /// Step the [`ReplicationCoordinator::drive_round_step`] driver
 /// returns. The caller threads these to make progress on the round.
+/// CIRISEdge#662 — where a coordinator's driver is, as a closed set. The
+/// responder driver is one loop with three awaits, and an inbox that fills
+/// fills because that loop is parked in one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DriverPhase {
+    /// Waiting on the inbox — the healthy state; an inbox cannot fill here.
+    Idle = 0,
+    /// Inside `drive_round_step`: folding a Summary/Diff, or APPLYING a
+    /// Deliver's rows (persist hybrid-verifies each; a peer whose rows are all
+    /// refused re-offers the same maximal Deliver every round).
+    Stepping = 1,
+    /// Inside a reply `send_message` — the #373 stall: a reverse-path send to a
+    /// churned peer, bounded by `RESPONDER_REPLY_SEND_TIMEOUT`.
+    Sending = 2,
+}
+
+impl DriverPhase {
+    #[must_use]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Stepping,
+            2 => Self::Sending,
+            _ => Self::Idle,
+        }
+    }
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Stepping => "stepping",
+            Self::Sending => "sending",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum DriveStep {
     /// The session wants to send these messages out + then wait for
