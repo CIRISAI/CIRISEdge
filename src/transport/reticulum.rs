@@ -1430,9 +1430,10 @@ struct RootedPeer {
     /// routing hint that did not root against the directory).
     #[allow(dead_code)]
     chain: Option<ProvenanceChain>,
-    /// CIRISEdge#301 (CC 3.3.6.2) — `Rooted` (authoritative, chained to a
-    /// pinned steward) vs `Advisory` (self-consistent routing hint;
-    /// authority composed downstream). Read by the epoch/upgrade guard so
+    /// CIRISEdge#301 — `Rooted` (conferral: authoritative, chained to a
+    /// pinned steward) vs `Advisory` (self-consistent routing hint; authority
+    /// composed downstream — CC 3.3, authorization is consumer-policy, not
+    /// wire). Not an attribution input since CIRISEdge#659. Read by the epoch/upgrade guard so
     /// a same-epoch re-announce that finally roots upgrades an existing
     /// advisory binding instead of being ignored as stale.
     ///
@@ -9286,11 +9287,11 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                 .encode(attestation.federation_pubkey_ed25519),
         )
         .await;
-    // CIRISEdge#301 (CC 3.3.6.2) — `root_binding` CLASSIFIES the binding, it
-    // does NOT gate it. The AV-42 `dest_hash` crypto check already ran upstream
+    // CIRISEdge#301 — `root_binding` CLASSIFIES the binding, it does NOT gate
+    // it (CC 3.3: authorization is consumer-policy, not wire). The AV-42 `dest_hash` crypto check already ran upstream
     // (`verify_destination_hash`, terminal); a `Rejected` here is a TRUST verdict
     // (unknown key / not-rooted-at-steward / genesis-unseeded / transient
-    // directory error), never a crypto failure. Per CC 3.3.6.2 a self-consistent
+    // directory error), never a crypto failure. Per CC 3.3 a self-consistent
     // announce is ADMITTED + recorded + KEX'd as a routing hint (`advisory`),
     // NEVER dropped — only genuine crypto/structural failures are terminal. This
     // is where a fresh peer FIRST-ROOTS: the binding is recorded on connect and
@@ -9328,7 +9329,7 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
             )
         }
         RootingVerdict::Rejected { rejection } => {
-            // ADVISORY admit (CC 3.3.6.2). The federation key did not root in the
+            // ADVISORY admit (CC 3.3, admit-not-drop). The federation key did not root in the
             // local directory, but the announce is self-consistent. Verify the
             // attestation SELF-signature against the CLAIMED federation key — the
             // crypto floor (proves the announcer controls the key it claims); a

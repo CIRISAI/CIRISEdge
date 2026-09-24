@@ -248,8 +248,10 @@ pub trait RootingDirectory: Send + Sync + 'static {
     /// CIRISEdge#301 — `provenance` tags the durable row `Rooted`
     /// (authoritative, chained to a pinned steward) or `Advisory` (a
     /// self-consistent routing hint that did not root against the local
-    /// directory, CC 3.3.6.2). Both are persisted (admit-not-drop); the
-    /// consumer composes trust from the tag downstream.
+    /// directory). Both are persisted — admit-not-drop is CC 3.3's
+    /// "authorization is consumer-policy, not wire"; CC 3.3.6.2 is the
+    /// authenticated identity↔address binding the announce carries (#659) —
+    /// and the consumer composes trust from the tag downstream.
     async fn persist_transport_binding(
         &self,
         _key_id: &str,
@@ -646,8 +648,9 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             last_seen_at: None,
             transport_ed25519_pubkey_base64: Some(b64.encode(&transport_pubkey[32..64])),
             transport_x25519_pubkey_base64: Some(b64.encode(&transport_pubkey[0..32])),
-            // CIRISEdge#301 — Rooted (Confirmed verdict) or Advisory (CC 3.3.6.2
-            // admit-as-routing-hint); the caller decides from the verdict.
+            // CIRISEdge#301 — Rooted (Confirmed verdict) or Advisory (admitted as
+            // a routing hint: CC 3.3, authorization is consumer-policy, not
+            // wire); the caller decides from the verdict.
             binding_provenance: provenance,
             // CIRISEdge#336 / CIRISPersist#443 (v17.0.0) — the durable monotonic
             // supersession counter (the announce attestation's epoch, which is
