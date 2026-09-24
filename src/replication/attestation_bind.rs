@@ -1865,12 +1865,17 @@ mod advertise_tests {
     }
 
     /// **The consent gate, stated as a test.** Strip the grant and the peer
-    /// does not resolve, so the WHOLE plane is withheld — not just the binding.
+    /// resolves only as FIRST CONTACT (CIRISEdge#671, `FSD/FIRST_CONTACT.md`
+    /// rung R2): the owner-binding — an allegiance fact authored by a
+    /// self-publish identity — is the ONE thing offered, and it is offered
+    /// precisely so the peer can judge us; nothing else of the plane is.
     ///
-    /// This is the fault the mesh actually hit: fail-closed, silent, and
-    /// indistinguishable from slow convergence unless you know to look.
+    /// Before #671 this pinned "the WHOLE plane is withheld", which was the
+    /// fault the mesh actually hit twice: fail-closed, silent, and — for a
+    /// canonical that consents to nobody — a peer that could never become
+    /// Rooted with it.
     #[tokio::test]
-    async fn without_a_consent_grant_the_entire_plane_is_withheld() {
+    async fn without_a_consent_grant_only_the_allegiance_facts_are_offered() {
         let (backend, bridge) = make_bridge(&["peer-1".to_string()]);
         for (kid, ity) in [
             ("owner-a", ciris_persist::federation::identity_type::USER),
@@ -1902,10 +1907,11 @@ mod advertise_tests {
             .with_self_provider(Some(provider))
             .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some("peer-1"))
             .await;
-        assert!(
-            refs.is_empty(),
-            "with no consent grant the recipient does not resolve and the whole \
-             plane is withheld, fail-closed: {refs:?}"
+        assert_eq!(
+            refs.len(),
+            1,
+            "with no consent grant the peer is a first-contact recipient: the owner-binding \
+             (an allegiance fact) is offered and nothing else is (CIRISEdge#671): {refs:?}"
         );
     }
 }
