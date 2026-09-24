@@ -17109,75 +17109,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// CIRISPersist#897 / persist v47.0.0 — an `affiliations` row is served to
-    /// the members of the affiliation the ROW names, exactly as a community
-    /// row is, and to nobody else.
-    ///
-    /// One row, one peer, three audiences: the affiliation the peer's owner
-    /// belongs to (served), a different affiliation (withheld), and a commons
-    /// row as the control (served). The pre-v47 arm was `true` and the
-    /// v30.1.0 interim arm was `false`; both fail the first two asserts.
-    #[tokio::test]
-    async fn an_affiliations_row_is_served_to_the_named_affiliations_members_only() {
-        use ciris_persist::federation::Audience;
-        let backend = owner_axis_backend(true).await;
-        // The roster names person-bob; node-bob is bob's node (the owner axis).
-        seed_community_with_member(&backend, "person-bob").await;
-        // CIRISEdge#659 — the serve floor: the local node here is unowned, so
-        // it is its own trust subject and accepts the fixture root directly.
-        register_fixture_keys(&backend, &[("node-alice-a", identity_type::NODE)]).await;
-        seed_common_root(&backend, &["node-alice-a"]).await;
-        let metrics = crate::observability::EdgeMetrics::default();
-        let bridge = audience_bridge(&backend).with_metrics(Some(metrics.clone()));
-        let mut memo = AudienceMemo::default();
-        assert!(
-            !bridge
-                .audience_withholds(
-                    Ok(Audience::Affiliations {
-                        community_key_id: "chat-room".into(),
-                    }),
-                    "person-bob",
-                    "node-bob",
-                    Reach::Consent,
-                    &mut memo,
-                    "test",
-                )
-                .await,
-            "CC 4.4.3.2.8: the affiliation's roster reads it, through the owner axis"
-        );
-        assert!(
-            bridge
-                .audience_withholds(
-                    Ok(Audience::Affiliations {
-                        community_key_id: "some-other-affiliation".into(),
-                    }),
-                    "person-bob",
-                    "node-bob",
-                    Reach::Consent,
-                    &mut memo,
-                    "test",
-                )
-                .await,
-            "a row in an affiliation the peer's owner is not in is withheld — keyed on the \
-             ROW's room, never on the producer's or the peer's other rooms (#893's trap)"
-        );
-        assert!(
-            !bridge
-                .audience_withholds(
-                    Ok(Audience::Species),
-                    "person-bob",
-                    "node-bob",
-                    Reach::Consent,
-                    &mut memo,
-                    "test",
-                )
-                .await,
-            "the control: the same peer is served a commons row"
-        );
-        assert_eq!(
-            metrics.snapshot().withholds_by_reason.values().sum::<u64>(),
-            1,
-            "exactly the one refusal is booked"
     /// CIRISEdge#659 — THE SERVE FLOOR: a peer in the send set that holds no
     /// valid root in common with this node is served NOTHING, and the refusal
     /// is booked as `recipient_not_rooted`; the same peer is served once its
@@ -17299,6 +17230,78 @@ pub(crate) mod tests {
         assert!(
             !bridge.rooted_with("node-stranger", &mut memo).await,
             "an unowned node with no acceptance of its own is not Rooted"
+        );
+    }
+
+    /// CIRISPersist#897 / persist v47.0.0 — an `affiliations` row is served to
+    /// the members of the affiliation the ROW names, exactly as a community
+    /// row is, and to nobody else.
+    ///
+    /// One row, one peer, three audiences: the affiliation the peer's owner
+    /// belongs to (served), a different affiliation (withheld), and a commons
+    /// row as the control (served). The pre-v47 arm was `true` and the
+    /// v30.1.0 interim arm was `false`; both fail the first two asserts.
+    #[tokio::test]
+    async fn an_affiliations_row_is_served_to_the_named_affiliations_members_only() {
+        use ciris_persist::federation::Audience;
+        let backend = owner_axis_backend(true).await;
+        // The roster names person-bob; node-bob is bob's node (the owner axis).
+        seed_community_with_member(&backend, "person-bob").await;
+        // CIRISEdge#659 — the serve floor: the local node here is unowned, so
+        // it is its own trust subject and accepts the fixture root directly.
+        register_fixture_keys(&backend, &[("node-alice-a", identity_type::NODE)]).await;
+        seed_common_root(&backend, &["node-alice-a"]).await;
+        let metrics = crate::observability::EdgeMetrics::default();
+        let bridge = audience_bridge(&backend).with_metrics(Some(metrics.clone()));
+        let mut memo = AudienceMemo::default();
+        assert!(
+            !bridge
+                .audience_withholds(
+                    Ok(Audience::Affiliations {
+                        community_key_id: "chat-room".into(),
+                    }),
+                    "person-bob",
+                    "node-bob",
+                    Reach::Consent,
+                    &mut memo,
+                    "test",
+                )
+                .await,
+            "CC 4.4.3.2.8: the affiliation's roster reads it, through the owner axis"
+        );
+        assert!(
+            bridge
+                .audience_withholds(
+                    Ok(Audience::Affiliations {
+                        community_key_id: "some-other-affiliation".into(),
+                    }),
+                    "person-bob",
+                    "node-bob",
+                    Reach::Consent,
+                    &mut memo,
+                    "test",
+                )
+                .await,
+            "a row in an affiliation the peer's owner is not in is withheld — keyed on the \
+             ROW's room, never on the producer's or the peer's other rooms (#893's trap)"
+        );
+        assert!(
+            !bridge
+                .audience_withholds(
+                    Ok(Audience::Species),
+                    "person-bob",
+                    "node-bob",
+                    Reach::Consent,
+                    &mut memo,
+                    "test",
+                )
+                .await,
+            "the control: the same peer is served a commons row"
+        );
+        assert_eq!(
+            metrics.snapshot().withholds_by_reason.values().sum::<u64>(),
+            1,
+            "exactly the one refusal is booked"
         );
     }
 
