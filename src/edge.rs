@@ -1576,6 +1576,71 @@ pub fn baked_canonical_genesis_ids() -> Vec<String> {
         .collect()
 }
 
+/// CIRISEdge#661 — may this runtime seed the BAKED production canonical dials?
+///
+/// The harness's agents were opening TCP to the production canonical and
+/// registering on the real directory: `init_edge_runtime` fell back to the
+/// baked genesis dial set whenever the engine had no canonical hints yet — a
+/// fresh test node never has any, its trust root arrives by import or
+/// ceremony AFTER the edge is up — with no check of the test anchor. Persist
+/// already skips the baked genesis under the same condition
+/// (`CIRIS_TESTING_MODE: test trust root active — skipping the baked 2-of-3
+/// canonical genesis seed`); the dial set now follows that decision, so a node
+/// whose DIRECTORY holds no production canonical does not DIAL one either.
+///
+/// `explicit` is the caller's word (`init_edge_runtime(baked_canonical_dials=…)`)
+/// and wins when given; `None` means "the same condition persist uses": no
+/// baked dials while a test trust-root override is active. On a build without
+/// the `test-anchor` feature no override can exist, so the answer is the
+/// production one.
+#[must_use]
+pub fn baked_canonical_dials_allowed(explicit: Option<bool>, test_anchor_active: bool) -> bool {
+    explicit.unwrap_or(!test_anchor_active)
+}
+
+/// The live answer to "is a test trust-root override active?" — the SAME
+/// predicate persist's genesis seed consults (`test_anchor_override_active`,
+/// `pub(crate)` there), evaluated here against the pinned verify.
+#[must_use]
+pub fn test_trust_root_override_active() -> bool {
+    #[cfg(feature = "test-anchor")]
+    {
+        ciris_verify_core::test_anchor::test_trust_root_override().is_some()
+    }
+    #[cfg(not(feature = "test-anchor"))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+mod baked_dial_gate_tests {
+    use super::baked_canonical_dials_allowed;
+
+    /// CIRISEdge#661 — the truth table. The one case that was wrong in the
+    /// field is `(None, true)`: no explicit word, a test anchor live, and the
+    /// runtime dialed production anyway.
+    #[test]
+    fn a_test_anchor_forbids_baked_dials_unless_the_caller_says_otherwise() {
+        assert!(
+            baked_canonical_dials_allowed(None, false),
+            "production: dial"
+        );
+        assert!(
+            !baked_canonical_dials_allowed(None, true),
+            "a test trust root is active ⇒ no baked production dial (the #661 case)"
+        );
+        assert!(
+            baked_canonical_dials_allowed(Some(true), true),
+            "an explicit True is the caller's word — and their responsibility"
+        );
+        assert!(
+            !baked_canonical_dials_allowed(Some(false), false),
+            "an explicit False forbids the fallback on any build"
+        );
+    }
+}
+
 /// CIRISEdge#281 — the **accord-attested TCP dial set** carried by
 /// persist's baked canonical genesis bundle: every `kind == "ip"`
 /// [`TransportHint`](ciris_persist::federation::types::TransportHint)

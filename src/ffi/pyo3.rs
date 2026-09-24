@@ -4959,6 +4959,10 @@ enum LocalInstanceRole {
     node_identity_dir = None,
     // CIRISEdge#548 — the minted key's name, from whoever minted it.
     node_keystore_alias = None,
+    // CIRISEdge#661 — `None` = the same condition persist uses (no baked
+    // production dials while a test trust root is active); an explicit
+    // bool is the caller's word.
+    baked_canonical_dials = None,
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -5166,6 +5170,7 @@ pub fn init_edge_runtime(
     // by a component that does not own the rule. Absent, edge falls back to
     // `node_alias(host_keystore_alias)` and existing deployments are unaffected.
     node_keystore_alias: Option<&str>,
+    baked_canonical_dials: Option<bool>,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -6102,8 +6107,27 @@ pub fn init_edge_runtime(
         // records out of the seeded directory), but it keeps the cold
         // dial alive when the engine pyfn is unavailable or the
         // directory is unseeded. Same retirement filter.
-        for (key_id, addr) in crate::edge::baked_canonical_ip_dials() {
-            seed_dial(&key_id, addr, "baked_canonical_genesis");
+        // CIRISEdge#661 — and it follows persist's own decision: under a live
+        // test trust-root override the baked genesis is not seeded, so the
+        // baked production DIAL is not either. Harness agents had been opening
+        // TCP to the production canonical and registering on the real
+        // directory because this fallback fired on every first boot (a fresh
+        // test node has no hints yet). Loud, not silent: a skipped fallback is
+        // logged at WARN with the reason, exactly as persist logs its skip.
+        let test_anchor = crate::edge::test_trust_root_override_active();
+        if crate::edge::baked_canonical_dials_allowed(baked_canonical_dials, test_anchor) {
+            for (key_id, addr) in crate::edge::baked_canonical_ip_dials() {
+                seed_dial(&key_id, addr, "baked_canonical_genesis");
+            }
+        } else {
+            tracing::warn!(
+                explicit = ?baked_canonical_dials,
+                test_trust_root_override = test_anchor,
+                "init_edge_runtime: baked PRODUCTION canonical dials NOT seeded — a test trust \
+                 root is active (or the caller said no). A node under a test anchor must not \
+                 open TCP to a production address (CIRISEdge#661). This MUST NOT appear in \
+                 production."
+            );
         }
         if seeded == 0 {
             tracing::warn!(
@@ -10582,7 +10606,8 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None, // CIRISEdge#661 baked_canonical_dials: auto
             )?;
             Ok(edge.signer_key_id())
         });
@@ -10704,7 +10729,8 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None, // CIRISEdge#661 baked_canonical_dials: auto
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -10865,7 +10891,8 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None, // CIRISEdge#661 baked_canonical_dials: auto
             )?;
             Ok(())
         });
@@ -10979,7 +11006,8 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None, // CIRISEdge#661 baked_canonical_dials: auto
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -11159,7 +11187,8 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None, // CIRISEdge#661 baked_canonical_dials: auto
             )?;
             Ok(edge.signer_key_id())
         });
@@ -11326,7 +11355,8 @@ mod pyo3_tier2_tests {
                 None,       // ifac_size
                 false,      // use_node_identity (CIRISEdge#541 — default)
                 None,       // node_identity_dir
-                None,       // node_keystore_alias (CIRISEdge#548)
+                None,       // node_keystore_alias (CIRISEdge#548),
+                None,       // CIRISEdge#661 baked_canonical_dials: auto
             );
             // Cleanup: drop OUR engine from the singleton so the next real-engine
             // sibling test constructs cleanly (one persist engine per process).
@@ -11454,7 +11484,8 @@ mod pyo3_tier2_tests {
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
                 None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation)
+                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None, // CIRISEdge#661 baked_canonical_dials: auto
             )?;
             Ok(edge.signer_key_id())
         });
