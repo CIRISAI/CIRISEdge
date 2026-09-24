@@ -2,7 +2,7 @@
 
 # v30.2.0 — attribution is not trust: the trace plane relights
 
-**2026-09-24** (PRs #660, #663, #664; CIRISEdge#659, #661, #662; RCA CIRISServer#632). MINOR from
+**2026-09-24** (PRs #660, #663, #664, #667, #668; CIRISEdge#659, #661, #662; RCA CIRISServer#632). MINOR from
 v30.1.0, which no host adopted (CIRISServer pins v29.5.0 → this). Ladder triple: **edge v30.2.0 ·
 persist v47.1.0 · verify v16.1.0** — no pin move, no ABI move.
 
@@ -26,8 +26,16 @@ path (CIRISServer#607) closed that day.
   `audience_withholds` so a more specific refusal keeps its name. `Rooted` is standing, never
   sufficient: `trace:*` keeps its conferral gate; trust weighting and audience are untouched
   (`FSD/CIRIS_EDGE_TRANSPORT.md` §5.4.1 invariant 1 and the four from the threat check).
+  **One exemption, found by the ladder (#668):** replication is pull-based, so "the peer delivers
+  its allegiance rows" *means* "we let it pull the rows we authored about ourselves" — the
+  owner-binding and the owner's acceptance, the rows that establish Rooted. A floor over those
+  deadlocked two fresh peers forever (each withheld what would have made it Rooted with the
+  other). Rows authored by the node's **self-publish identities** cross to an Attributed peer;
+  everything the node holds **about others** stays behind the floor.
 - **Observability**: the cold-start rooting rejection kind at a throttled `warn` per key; the
-  attribution-miss hint no longer claims a "churn downgrade" for a peer that was never conferred.
+  attribution-miss hint no longer claims a "churn downgrade" for a peer that was never conferred;
+  (#667) every dropped frame logs its attribution operands unthrottled at `debug`, and the
+  bootstrap door logs both identities (federation key, transport destination).
 - **FSD**: §5.1–§5.4.1 — the three-state machine (Identified → Attributed → Rooted), the Rooted
   walk, the allegiance objects, the rulings and their resolutions.
 
@@ -35,18 +43,24 @@ Witnesses: `route_table_e2e::identified_link_from_an_advisory_key_owning_peer_is
 and `reply_to_a_nat_d_initiator_rides_the_live_inbound_link` (real two-node links; a peer scrubbed
 by a steward outside the anchor is attributed `Some(B)` — both assertions were `None`);
 `bridge::rooted_with_holds_only_for_a_valid_root_in_common_through_the_owners`;
-`bridge::an_attributed_but_unrooted_peer_in_the_send_set_is_served_nothing`. Fourteen "served to
-P" tests went red on the floor and pass with the fixtures rooting the pairs they consent — the
-contract change, not collateral.
+`bridge::an_attributed_but_unrooted_peer_in_the_send_set_is_served_nothing` (the exemption, and a
+set-based "newly served" once a common root lands). Fourteen "served to P" tests went red on the
+floor and pass with the fixtures rooting the pairs they consent — the contract change, not
+collateral. **The first-contact ladder as an edge e2e** — `tests/first_contact_ladder_659.rs`, two
+nodes on real Reticulum links, the peer shaped like every production agent (self-signed, owned,
+subject-bound records, #406 route): under a shared root B's rows land on A (Attributed) and A's on
+B (Rooted), both directions; under different roots A's own facts cross, what A holds about ANOTHER
+is withheld across N rounds **with A's `RecipientNotRooted` ledger moved** (the floor fired — an
+absence alone is not a witness), and it arrives the moment B's owner also accepts A's root. In the
+CI Reticulum lane next to `route_table_e2e`.
 
 **Consequence to state plainly:** under the floor the canonical serves nothing to a peer until their
 owners accept a common root — today's status quo for agents, so no regression, but "traces flow"
 (this cut) and "the mesh serves" (server step 2 + the canonical owner's acceptance) are two
 milestones. Persist's part of ruling (1) is CIRISPersist#901 (holder-hardware leg), accepted.
 
-**Still owed on #659, next cut:** the first-contact ladder as an edge e2e (genesis-shaped,
-split-installed, owned peer, both directions, the negatives); unthrottled per-drop operands; the
-bootstrap door logging both identities; the CC 3.3.6.2 comment sweep.
+**Still owed on #659, next cut:** the CC 3.3.6.2 comment sweep; the genesis-shaped /
+split-installed rungs of the ladder (the two-node rungs are in).
 
 ## #661 — no baked production canonical dial while a test trust root is active
 
