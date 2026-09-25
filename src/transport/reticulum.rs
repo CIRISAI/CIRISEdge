@@ -7734,9 +7734,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         // trace arm and the `request_responses` / `timed_out_requests` maps are gone.
         // CIRISEdge#508 — the control-plane loss marker, consumed. leviculum
         // drops lossless-plane events with try_send when the channel is full,
-        // then delivers ONE ControlPlaneOverflow carrying the aggregate count
-        // once the channel has room — the marker is the designed observable
-        // and is itself never dropped. Before this arm it fell into the
+        // and since v0.27 (upstream Codeberg #419) the EventReceiver mints ONE
+        // ControlPlaneOverflow carrying the aggregate count AHEAD of the queued
+        // backlog, at most once per second — the marker is the designed
+        // observable and is itself never dropped (CIRISEdge#680). Before this arm it fell into the
         // `other =>` TRACE catch-all: the single line an operator needed was
         // invisible while ~1000 per-drop EVENT_CHANNEL_FULL warns (buried
         // 30:1 on the canonical) said nothing actionable. WARN with the
