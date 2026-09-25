@@ -506,10 +506,15 @@ impl LxmfPropagationClient {
     pub fn generate_propagation_stamp(&self, unstamped_lxmf: &[u8], cost: u8) -> Result<[u8; 32]> {
         let transient_id: TransientId = full_hash(unstamped_lxmf);
         let mut engine = CooperativeStamper::new(rand::rngs::OsRng, ReadyYield);
+        // leviculum v0.27 (Codeberg #185) made the search cancellable. Nothing
+        // here can cancel it yet, so this grind runs to completion as before
+        // (CIRISEdge#680).
+        let cancel = leviculum_lxmf::stamp::StampCancel::new();
         futures::executor::block_on(engine.generate(
             &transient_id,
             cost,
             WORKBLOCK_EXPAND_ROUNDS_PN,
+            &cancel,
         ))
         .map_err(|e| LxmfPropagationError::Stamp(format!("{e:?}")))
     }

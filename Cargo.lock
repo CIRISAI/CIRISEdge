@@ -1784,7 +1784,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1978,7 +1978,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3078,7 +3078,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3291,18 +3291,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
+name = "leviculum-announce-policy"
+version = "0.1.0"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.27.0+ciris.1#c2f8d3fda950096f954b0b18f8c90bb275487652"
+dependencies = [
+ "leviculum-telemetry-policy",
+]
+
+[[package]]
 name = "leviculum-ble-tx"
 version = "0.1.0"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.26.0+ciris.1#85fb1eaa82350490b06070e63f233303f27a9bcb"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.27.0+ciris.1#c2f8d3fda950096f954b0b18f8c90bb275487652"
 dependencies = [
  "embassy-sync",
  "leviculum-core",
 ]
 
 [[package]]
+name = "leviculum-channel-access"
+version = "0.1.0"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.27.0+ciris.1#c2f8d3fda950096f954b0b18f8c90bb275487652"
+
+[[package]]
 name = "leviculum-core"
-version = "0.26.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.26.0+ciris.1#85fb1eaa82350490b06070e63f233303f27a9bcb"
+version = "0.27.0+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.27.0+ciris.1#c2f8d3fda950096f954b0b18f8c90bb275487652"
 dependencies = [
  "aes",
  "cbc",
@@ -3319,8 +3332,8 @@ dependencies = [
 
 [[package]]
 name = "leviculum-lxmf"
-version = "0.26.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.26.0+ciris.1#85fb1eaa82350490b06070e63f233303f27a9bcb"
+version = "0.27.0+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.27.0+ciris.1#c2f8d3fda950096f954b0b18f8c90bb275487652"
 dependencies = [
  "leviculum-core",
  "rand_core 0.6.4",
@@ -3330,8 +3343,8 @@ dependencies = [
 
 [[package]]
 name = "leviculum-std"
-version = "0.26.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.26.0+ciris.1#85fb1eaa82350490b06070e63f233303f27a9bcb"
+version = "0.27.0+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.27.0+ciris.1#c2f8d3fda950096f954b0b18f8c90bb275487652"
 dependencies = [
  "bluer",
  "clap",
@@ -3340,7 +3353,9 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "if-addrs",
+ "leviculum-announce-policy",
  "leviculum-ble-tx",
+ "leviculum-channel-access",
  "leviculum-core",
  "leviculum-lxmf",
  "libc",
@@ -3360,6 +3375,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "leviculum-telemetry-policy"
+version = "0.1.0"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.27.0+ciris.1#c2f8d3fda950096f954b0b18f8c90bb275487652"
 
 [[package]]
 name = "libbz2-rs-sys"
@@ -3870,7 +3890,7 @@ dependencies = [
  "mio",
  "nix 0.31.3",
  "serialport",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4014,7 +4034,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4882,7 +4902,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5421,7 +5441,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6083,10 +6103,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.5.0",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7107,7 +7127,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
