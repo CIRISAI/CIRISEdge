@@ -21,8 +21,9 @@
 //! │ mls/                                                        │
 //! │  ├── archive_mode      — §3.5 per-community config          │
 //! │  ├── welcome_wrap      — §3.3 HPKE-Base + ML-DSA-65 Welcome │
-//! │  ├── scope_state       — substrate-tier StorageProvider     │
-//! │  │                      (openmls 0.8) over EncryptedKVStore │
+//! │  ├── scope_state       — the sealed-KV store every group    │
+//! │  │                      snapshots into (FSD/MLS_STATE_AT_REST) │
+//! │  ├── boot              — re-address every persisted room once │
 //! │  ├── cohort_group      — persistent per-cohort MLS group    │
 //! │  │                      (CIRISEdge#499): real exporter_     │
 //! │  │                      secret for community/affiliations,  │
@@ -31,16 +32,21 @@
 //! ```
 
 pub mod archive_mode;
+pub mod boot;
 pub mod cohort_group;
 pub mod scope_state;
 pub mod welcome_wrap;
 
 pub use archive_mode::{ArchiveMode, ArchiveModeError, DEFAULT_ROTATE_FORWARD_WINDOW_DAYS};
+pub use boot::{readdress_persisted_rooms, InstalledRoom, ReaddressReport};
+pub use cohort_group::{key_material_from_bytes, key_material_to_bytes, CohortKeyMaterial};
 pub use cohort_group::{
     ClaimedApplyOutcome, CohortCommit, CohortGroup, CohortGroupError, CohortGroups, CohortSecret,
     CommitApplyOutcome, CommitClaim,
 };
-pub use scope_state::{ScopeStateProvider, ScopeStateProviderError};
+pub use scope_state::{
+    open_mls_state, MlsStateUnavailable, ScopeStateProvider, ScopeStateProviderError,
+};
 pub use welcome_wrap::{
     unwrap_welcome, wrap_welcome, FederationDirectoryEntry, WelcomeWrapError, WrappedWelcome,
 };

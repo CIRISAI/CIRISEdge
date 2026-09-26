@@ -1050,6 +1050,27 @@ pub async fn messages_in_room(
     Ok(out)
 }
 
+/// CIRISEdge#676 — when `from` LAST published a KeyPackage in `room`
+/// (`asserted_at` of its newest `chat:key_package:v1` row), if ever. The
+/// restart signal's input: a member of the tree publishing a KeyPackage
+/// AFTER it was added is asking to be re-Welcomed
+/// (`FSD/MLS_STATE_AT_REST.md` §4).
+///
+/// # Errors
+/// A directory read failure, as a string.
+pub async fn latest_key_package_at(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    from: &str,
+    room: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    Ok(rows_in_room(directory, &[from.to_owned()], room)
+        .await?
+        .iter()
+        .filter(|a| dimension_of(a) == Some(KEY_PACKAGE_DIMENSION))
+        .map(|a| a.asserted_at)
+        .max())
+}
+
 /// The KeyPackage `from` shared in `room`, if it has arrived — step 1 of the
 /// handshake, as the creator reads it.
 ///

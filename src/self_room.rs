@@ -34,6 +34,8 @@
 //! between them (persist `send_set_for`, CC 3.2/3.3.6). Only the BYTES need
 //! the room. There is no chicken-and-egg.
 
+use std::collections::HashMap;
+
 use crate::mls::CommitClaim;
 use crate::scope_lifecycle::ScopeGroupSnapshot;
 use crate::scope_room::ScopeRoom;
@@ -126,6 +128,14 @@ pub enum SelfRoomAction {
     /// longer does (a revoked occurrence): remove them, which advances the
     /// epoch and forward-secures what follows.
     Remove(Vec<String>),
+    /// CIRISEdge#676 (`FSD/MLS_STATE_AT_REST.md` §4) — this node holds the
+    /// room and a member of the TREE has published a fresh KeyPackage after
+    /// it was added: a restart or a restored device whose leaf is stale.
+    /// Remove it, then add it back with the fresh KeyPackage (two commits,
+    /// removal first — the same order [`Self::Remove`] mandates), so its
+    /// Welcome reaches material it still holds. Ranked after `Abandon` and
+    /// `Remove`, before `Add`.
+    Rejoin(Vec<String>),
     /// Two rooms exist for one identity and this node's loses the claim
     /// contest. Abandon it and join the winner's — the same convergent
     /// rule concurrent COMMITS settle by (CIRISEdge#604), applied one level
@@ -178,6 +188,21 @@ pub fn decide(
     held: Option<&HeldRoom>,
     rival: Option<&CommitClaim>,
 ) -> SelfRoomAction {
+    decide_with_republished(own_key_id, roster, held, rival, &[])
+}
+
+/// [`decide`] with the restart signal (CIRISEdge#676, `FSD/MLS_STATE_AT_REST.md`
+/// §4): `republished` names tree members whose newest KeyPackage row is
+/// later than their recorded add ([`republished_members`]). Everything
+/// else is [`decide`]; a host that does not yet compute the signal passes
+/// an empty slice and gets the pre-#676 rule exactly.
+pub fn decide_with_republished(
+    own_key_id: &str,
+    roster: &[String],
+    held: Option<&HeldRoom>,
+    rival: Option<&CommitClaim>,
+    republished: &[String],
+) -> SelfRoomAction {
     if !roster.iter().any(|n| n == own_key_id) {
         return SelfRoomAction::NotInRoster;
     }
@@ -209,6 +234,23 @@ pub fn decide(
         if !departed.is_empty() {
             return SelfRoomAction::Remove(departed);
         }
+        // REJOIN before ADD (CIRISEdge#676): a stale leaf is a member the
+        // tree already holds, so `missing` will never name it — without this
+        // arm a restarted device with lost state is never re-Welcomed
+        // (CIRISServer#630). Only tree members the directory still names,
+        // and never this node (it cannot re-Welcome itself).
+        let stale: Vec<String> = republished
+            .iter()
+            .filter(|m| {
+                *m != own_key_id
+                    && mine.members.iter().any(|t| t == *m)
+                    && roster.iter().any(|n| n == *m)
+            })
+            .cloned()
+            .collect();
+        if !stale.is_empty() {
+            return SelfRoomAction::Rejoin(stale);
+        }
         let missing: Vec<String> = roster
             .iter()
             .filter(|n| !mine.members.iter().any(|m| m == *n))
@@ -233,6 +275,56 @@ pub fn decide(
     } else {
         SelfRoomAction::PublishKeyPackage
     }
+}
+
+/// CIRISEdge#676 — clock slop tolerated between a member's recorded add
+/// instant and a KeyPackage row's `asserted_at` before the row counts as a
+/// RE-publication: the substrate's millisecond stamps plus ordinary skew.
+/// A KeyPackage published *before* the add is the one the add consumed and
+/// is never a restart signal.
+pub const REPUBLISH_SKEW: chrono::Duration = chrono::Duration::seconds(5);
+
+/// **The restart signal, pure** (`FSD/MLS_STATE_AT_REST.md` §4.1): the
+/// members in `added_at` whose newest KeyPackage in `latest_key_package_at`
+/// is later than their add by more than [`REPUBLISH_SKEW`]. Sorted, so every
+/// node computes the same list. A member with no recorded add (a leaf that
+/// predates the record) is never flagged — the rule fails towards Idle, and
+/// the member's next genuine restart records the instant.
+#[must_use]
+pub fn republished_from<S: std::hash::BuildHasher>(
+    added_at: &HashMap<String, chrono::DateTime<chrono::Utc>, S>,
+    latest_key_package_at: &HashMap<String, chrono::DateTime<chrono::Utc>, S>,
+) -> Vec<String> {
+    let mut out: Vec<String> = added_at
+        .iter()
+        .filter_map(|(member, added)| {
+            let latest = latest_key_package_at.get(member)?;
+            (*latest > *added + REPUBLISH_SKEW).then(|| member.clone())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// [`republished_from`] over what this node holds: the group's recorded add
+/// instants and the newest KeyPackage row each tree member placed in
+/// `room_id` ([`crate::chat::latest_key_package_at`]).
+///
+/// # Errors
+/// A directory read failure, as a string.
+pub async fn republished_members(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    room_id: &str,
+    group: &crate::mls::CohortGroup,
+) -> Result<Vec<String>, String> {
+    let added_at = group.member_joins().await;
+    let mut latest = HashMap::with_capacity(added_at.len());
+    for member in added_at.keys() {
+        if let Some(at) = crate::chat::latest_key_package_at(directory, member, room_id).await? {
+            latest.insert(member.clone(), at);
+        }
+    }
+    Ok(republished_from(&added_at, &latest))
 }
 
 #[cfg(test)]
@@ -442,6 +534,73 @@ mod tests {
             ),
             SelfRoomAction::NotInRoster,
             "checked before any tree work, held room or not"
+        );
+    }
+
+    /// CIRISEdge#676 / FSD §7 S4 — a tree member that re-published a
+    /// KeyPackage is REJOINED: after Abandon and Remove, before Add, never
+    /// this node, never a device the directory no longer names.
+    #[test]
+    fn a_re_published_key_package_from_a_tree_member_is_a_rejoin() {
+        let r = roster(&["node-a", "node-b", "node-c"]);
+        let mine = held(&["node-a", "node-b", "node-c"], 1, "node-a");
+        assert_eq!(
+            decide_with_republished("node-a", &r, Some(&mine), None, &["node-b".into()]),
+            SelfRoomAction::Rejoin(vec!["node-b".into()])
+        );
+        // Not this node.
+        assert_eq!(
+            decide_with_republished("node-a", &r, Some(&mine), None, &["node-a".into()]),
+            SelfRoomAction::Idle
+        );
+        // A departed device is removed, not rejoined.
+        let r2 = roster(&["node-a", "node-c"]);
+        assert_eq!(
+            decide_with_republished("node-a", &r2, Some(&mine), None, &["node-b".into()]),
+            SelfRoomAction::Remove(vec!["node-b".into()])
+        );
+        // Rejoin ranks before Add: b is stale AND d is missing → Rejoin first.
+        let r3 = roster(&["node-a", "node-b", "node-c", "node-d"]);
+        assert_eq!(
+            decide_with_republished("node-a", &r3, Some(&mine), None, &["node-b".into()]),
+            SelfRoomAction::Rejoin(vec!["node-b".into()])
+        );
+        // A losing claim is abandoned before anything is rejoined.
+        let theirs = claim(0, "node-0");
+        assert!(matches!(
+            decide_with_republished("node-a", &r, Some(&mine), Some(&theirs), &["node-b".into()]),
+            SelfRoomAction::Abandon { .. }
+        ));
+        // The empty signal is the pre-#676 rule exactly.
+        assert_eq!(
+            decide("node-a", &r, Some(&mine), None),
+            SelfRoomAction::Idle
+        );
+    }
+
+    /// CIRISEdge#676 / FSD §7 S5 — only a KeyPackage NEWER than the add (by
+    /// more than the skew) is a signal; an older one is the add's own; a
+    /// member with no recorded add is never flagged; the list is sorted.
+    #[test]
+    fn republished_is_only_a_key_package_newer_than_the_add() {
+        let t = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).expect("ts");
+        let mut added = HashMap::new();
+        added.insert("node-b".to_owned(), t(10_000));
+        added.insert("node-c".to_owned(), t(10_000));
+        added.insert("node-d".to_owned(), t(10_000));
+        let mut latest = HashMap::new();
+        latest.insert("node-b".to_owned(), t(9_000)); // the add consumed it
+        latest.insert("node-c".to_owned(), t(14_000)); // inside the skew
+        latest.insert("node-d".to_owned(), t(20_000)); // a re-publication
+        latest.insert("node-z".to_owned(), t(99_000)); // no recorded add
+        assert_eq!(republished_from(&added, &latest), vec!["node-d".to_owned()]);
+        let mut added2 = added.clone();
+        added2.insert("node-a".to_owned(), t(0));
+        latest.insert("node-a".to_owned(), t(50_000));
+        assert_eq!(
+            republished_from(&added2, &latest),
+            vec!["node-a".to_owned(), "node-d".to_owned()],
+            "sorted"
         );
     }
 }
