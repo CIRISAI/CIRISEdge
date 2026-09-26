@@ -499,6 +499,74 @@ fn key_outcome_to_apply(
     }
 }
 
+/// CIRISEdge#459 — the retry disposition of a typed Attestation-plane refusal,
+/// decided on persist's reason (the `key_refusal_retry` twin).
+fn attestation_refusal_retry(
+    reason: ciris_persist::federation::attestation_apply::AttestationRefusalReason,
+) -> RetryDisposition {
+    use ciris_persist::federation::attestation_apply::AttestationRefusalReason as R;
+    match reason {
+        // Two producers minted one id; first-seen wins and a re-offer of THIS
+        // row can never succeed. Retrying it is the storm #459 measured.
+        // `AlreadyPresentIdentical` is never a refusal on the apply side
+        // (mapped to `Duplicate` below); it is named here so the closed set
+        // stays exhaustive, and it is Terminal for the same reason: nothing
+        // about a re-offer changes the answer.
+        R::ConflictingAttestation | R::AlreadyPresentIdentical => RetryDisposition::Terminal,
+        // A lost plan/act race or a directory that cannot plan: the existing
+        // row is untouched and the record is safe to re-offer — the next
+        // round's plan names the conflict precisely (persist's own note).
+        R::StoreConflict => RetryDisposition::Transient,
+    }
+}
+
+/// CIRISEdge#459 (persist v36.0.0 / CIRISPersist#624) — map persist's typed
+/// Attestation-plane apply outcome onto the #425 [`ApplyOutcome`], the exact
+/// twin of [`key_outcome_to_apply`]. Pure, and tested over
+/// `AttestationRefusalReason::ALL` without a backend.
+///
+/// - `Inserted` ⇒ `Admitted`; `Unchanged` / `Deduplicated` /
+///   `Refused { AlreadyPresentIdentical }` ⇒ `Duplicate` (the receiver already
+///   holds exactly what was offered — the baked-genesis re-offer case that
+///   used to read as 88 distinct "conflicts" in six minutes). None of these
+///   count on the refusal ledger.
+/// - `Refused { reason }` ⇒ `Refused` carrying persist's STABLE token in the
+///   message and the disposition from [`attestation_refusal_retry`]; the token
+///   is returned so the caller books it on
+///   `attestation_apply_refusals_by_reason`. Consumers key on the constant,
+///   never on message prose.
+fn attestation_outcome_to_apply(
+    outcome: ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome,
+    content_hash: &str,
+) -> (ApplyOutcome, Option<&'static str>) {
+    use ciris_persist::federation::attestation_apply::{
+        AttestationRefusalReason as R, ReplicatedAttestationOutcome as O,
+    };
+    match outcome {
+        O::Inserted => (ApplyOutcome::Admitted, None),
+        O::Unchanged
+        | O::Deduplicated
+        | O::Refused {
+            reason: R::AlreadyPresentIdentical,
+        } => (ApplyOutcome::Duplicate, None),
+        O::Refused { reason } => {
+            let retry = attestation_refusal_retry(reason);
+            (
+                ApplyOutcome::Refused {
+                    reason: format!(
+                        "Attestation: admission refused ({}; content_hash={content_hash}) \
+                         [retry={}]",
+                        reason.as_str(),
+                        retry.as_str(),
+                    ),
+                    retry,
+                },
+                Some(reason.as_str()),
+            )
+        }
+    }
+}
+
 static SERVE_GATE_WITHHELD_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
 
@@ -7409,6 +7477,10 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    // The two-door apply (attributed SYNC door / unattributed typed door,
+    // #459) is one decision with two persist entry points; splitting it would
+    // hide that the mapping must agree.
+    #[allow(clippy::too_many_lines)]
     async fn apply_attestation(&self, bytes: &[u8], source_peer: Option<&str>) -> ApplyOutcome {
         // CIRISEdge#397 — the wire is now the BARE `Attestation` (the shape
         // persist's content-hash index/point-read serves), so deserialize that
@@ -7540,67 +7612,88 @@ impl FederationDirectoryReplicationBridge {
                 //
                 // An UNATTRIBUTED receive keeps the stranger door. Absence of
                 // attribution is not a reason to reach for a cheaper meter.
-                let put = match source_peer {
-                    Some(peer) => self.directory.put_attestation_synced(record, peer).await,
-                    None => self.directory.put_attestation(record).await,
+                // CIRISEdge#459 (persist v36.0.0 / CIRISPersist#624) — the
+                // TYPED outcome, mapped by `attestation_outcome_to_apply`
+                // exactly as the Key plane maps `ReplicatedKeyOutcome`.
+                //
+                // An UNATTRIBUTED receive goes through persist's typed
+                // pre-write door `apply_replicated_attestation` (it meters as
+                // the stranger `put_attestation` does — no origin regression):
+                // same id + different signed content ⇒ `conflicting_attestation`
+                // (terminal: first-seen wins), same assertion + unsigned
+                // decoration ⇒ `already_present_identical` (a Duplicate), a lost
+                // plan/act race ⇒ `store_conflict` (transient).
+                //
+                // An ATTRIBUTED receive keeps the privileged SYNC door naming the
+                // peer (v41 origin, see above). That door decides the same id
+                // pre-write too (`attestation_reput_verdict`: equal
+                // `persist_row_hash` ⇒ `AlreadyHeld`, else `Error::Conflict`) but
+                // has no typed outcome and cannot tell decoration-only from a
+                // true conflict — so its `Conflict` is mapped to the SAME
+                // `conflicting_attestation` token (first-seen still wins;
+                // terminal). An origin-aware typed door is the persist ask that
+                // would let the synced path name `already_present_identical`.
+                let (outcome, refusal_token) = match source_peer {
+                    Some(peer) => match self.directory.put_attestation_synced(record, peer).await {
+                        Ok(AttestationOutcome::Inserted) => (ApplyOutcome::Admitted, None),
+                        // Byte-identical row already held: routine non-progress,
+                        // exactly like `ReplicatedKeyOutcome::Unchanged`. COUNTED
+                        // (`inc_duplicate(Attestation)` at the #425 choke) and QUIET.
+                        Ok(AttestationOutcome::AlreadyHeld) => (ApplyOutcome::Duplicate, None),
+                        // `AttestationOutcome` is `#[non_exhaustive]` — the
+                        // MAXIMAL_UNKNOWN trap: a future variant must NOT land as a
+                        // quiet `Admitted`/`Duplicate`. LOUD and TERMINAL (#544): the
+                        // verdict is a property of THIS BUILD's vocabulary.
+                        Ok(other) => (
+                            ApplyOutcome::refused_terminal(format!(
+                                "Attestation: persist returned an AttestationOutcome this edge \
+                                 build does not know ({other:?}); adopt the persist cut that \
+                                 added it — CIRISPersist#771 (content_hash={content_hash})"
+                            )),
+                            None,
+                        ),
+                        Err(ciris_persist::federation::Error::Conflict(_)) => {
+                            attestation_outcome_to_apply(
+                                ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome::Refused {
+                                    reason: ciris_persist::federation::attestation_apply::AttestationRefusalReason::ConflictingAttestation,
+                                },
+                                &content_hash,
+                            )
+                        }
+                        // persist v38.2.0 (CIRISEdge#522) — the door classes (AV-45
+                        // membership, AV-84 third-party rows) arrive as typed persist
+                        // variants and `refuse` names + counts them.
+                        Err(e) => (self.refuse("Attestation", &content_hash, &e), None),
+                    },
+                    None => match self.directory.apply_replicated_attestation(record).await {
+                        Ok(o) => attestation_outcome_to_apply(o, &content_hash),
+                        Err(e) => (self.refuse("Attestation", &content_hash, &e), None),
+                    },
                 };
-                match put {
-                    Ok(AttestationOutcome::Inserted) => {
-                        // A NEW row — the only outcome that can have moved a
-                        // cached verdict, so the only one that invalidates.
-                        if let Some((author, subject)) = relay_invalidation {
-                            self.invalidate_accord_relay(&[&author, &subject]);
-                        }
-                        if let Some(node) = owner_invalidation {
-                            self.invalidate_owner_memo(&node);
-                        }
-                        if let Some(observation) = revocation_observation {
-                            self.observe_revocation(observation).await;
-                        }
-                        // CIRISEdge#601 — the row is admitted; its bytes are
-                        // now this node's to pull if the gate agrees. Offered,
-                        // never awaited; a full queue drops loudly.
-                        if let (Some(sink), Some(row)) = (self.pull_sink.as_ref(), pull) {
-                            let _ = sink.offer(&row);
-                        }
-                        ApplyOutcome::Admitted
+                if let Some(token) = refusal_token {
+                    if let Some(m) = &self.metrics {
+                        m.inc_attestation_apply_refusal(token);
                     }
-                    // Byte-identical row already held: routine non-progress,
-                    // exactly like `ReplicatedKeyOutcome::Unchanged`. COUNTED
-                    // (`inc_duplicate(Attestation)` at the #425 choke, so it is
-                    // never a silent drop) and QUIET (`on_deliver` logs
-                    // Duplicate at DEBUG). No invalidation: nothing changed, so
-                    // no memoized verdict can have moved.
-                    Ok(AttestationOutcome::AlreadyHeld) => ApplyOutcome::Duplicate,
-                    // `AttestationOutcome` is `#[non_exhaustive]`, so this arm
-                    // is compulsory — and it is the MAXIMAL_UNKNOWN trap in a
-                    // second location (`family_gates.rs` is the first). A
-                    // future persist minor adding an outcome must NOT land here
-                    // as a quiet `Admitted` (a false convergence-progress
-                    // signal) or a quiet `Duplicate` (a false already-held).
-                    // It is LOUD instead: a refusal naming the variant, which
-                    // is the correct reading of "this node's persist told it
-                    // something it was not built to understand".
-                    // CIRISEdge#544 — TERMINAL: the verdict is a property of THIS
-                    // BUILD's vocabulary, and the identical bytes will produce the
-                    // identical unknown variant every round. The event that fixes
-                    // it (adopting the persist cut) restarts the process and empties
-                    // the refusal memory, so "terminal" here means exactly
-                    // "until this node runs a build that understands it".
-                    Ok(other) => ApplyOutcome::refused_terminal(format!(
-                        "Attestation: persist returned an AttestationOutcome this edge \
-                         build does not know ({other:?}); adopt the persist cut that \
-                         added it — CIRISPersist#771 (content_hash={content_hash})"
-                    )),
-                    // persist v38.2.0 (CIRISEdge#522) — THIS is the door the
-                    // cut moved. AV-45 membership now gates community/family
-                    // -scoped rows here (target resolved from the producer's
-                    // SIGNED envelope, no replicated-row bypass) and AV-84
-                    // refuses a targeted row naming a third party. Both arrive
-                    // as typed persist variants and `refuse` names + counts
-                    // them; everything else keeps the pre-#522 shape.
-                    Err(e) => self.refuse("Attestation", &content_hash, &e),
                 }
+                if outcome == ApplyOutcome::Admitted {
+                    // A NEW row — the only outcome that can have moved a cached
+                    // verdict, so the only one that invalidates.
+                    if let Some((author, subject)) = relay_invalidation {
+                        self.invalidate_accord_relay(&[&author, &subject]);
+                    }
+                    if let Some(node) = owner_invalidation {
+                        self.invalidate_owner_memo(&node);
+                    }
+                    if let Some(observation) = revocation_observation {
+                        self.observe_revocation(observation).await;
+                    }
+                    // CIRISEdge#601 — the row is admitted; its bytes are now this
+                    // node's to pull if the gate agrees. Offered, never awaited.
+                    if let (Some(sink), Some(row)) = (self.pull_sink.as_ref(), pull) {
+                        let _ = sink.offer(&row);
+                    }
+                }
+                outcome
             }
             Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Attestation", bytes, &e)),
         }
@@ -9285,6 +9378,188 @@ pub(crate) mod tests {
         assert!(
             !bridge.retry_suppressed(EnvelopeKind::Key, &hash),
             "an admitted row's refusal history is obsolete"
+        );
+    }
+
+    /// CIRISEdge#459 — the pure mapping over persist's CLOSED
+    /// `AttestationRefusalReason::ALL` (no backend): every variant lands on
+    /// exactly one `ApplyOutcome`, carries persist's stable token in the
+    /// message when it is a refusal, and its retry disposition is decided on
+    /// the reason. The duplicate halves never produce a token.
+    #[test]
+    fn attestation_outcome_to_apply_maps_the_closed_reason_set() {
+        use ciris_persist::federation::attestation_apply::{
+            AttestationRefusalReason as R, ReplicatedAttestationOutcome as O,
+        };
+        assert_eq!(
+            attestation_outcome_to_apply(O::Inserted, "h"),
+            (ApplyOutcome::Admitted, None)
+        );
+        for o in [O::Unchanged, O::Deduplicated] {
+            assert_eq!(
+                attestation_outcome_to_apply(o, "h"),
+                (ApplyOutcome::Duplicate, None),
+                "{o:?}: the receiver already holds what was offered"
+            );
+        }
+        for reason in R::ALL.iter().copied() {
+            let (outcome, token) = attestation_outcome_to_apply(O::Refused { reason }, "h");
+            match reason {
+                R::AlreadyPresentIdentical => {
+                    assert_eq!(outcome, ApplyOutcome::Duplicate, "{reason}: a Duplicate");
+                    assert_eq!(token, None, "{reason}: never on the refusal ledger");
+                }
+                R::ConflictingAttestation | R::StoreConflict => {
+                    let ApplyOutcome::Refused { reason: msg, retry } = &outcome else {
+                        panic!("{reason}: must be Refused, got {outcome:?}");
+                    };
+                    assert_eq!(token, Some(reason.as_str()), "{reason}: booked by token");
+                    assert!(
+                        msg.contains(reason.as_str()),
+                        "{reason}: the message names the SAME branch the ledger books: {msg}"
+                    );
+                    let expected = match reason {
+                        R::ConflictingAttestation => RetryDisposition::Terminal,
+                        _ => RetryDisposition::Transient,
+                    };
+                    assert_eq!(
+                        *retry, expected,
+                        "{reason}: retry disposition follows the reason"
+                    );
+                }
+            }
+        }
+    }
+
+    /// CIRISEdge#459 — the wire drive: a same-`attestation_id` row carrying
+    /// DIFFERENT signed content is refused BY NAME on both doors — the synced
+    /// door an attributed peer is applied through (persist's
+    /// `attestation_reput_verdict` ⇒ `Error::Conflict`) and the typed door an
+    /// unattributed receive uses (`apply_replicated_attestation` ⇒
+    /// `Refused { ConflictingAttestation }`) — terminal (first-seen wins), the
+    /// message carries persist's stable token, and it books on BOTH
+    /// receive-plane mirror axes (kind + `attestation_apply_refusals_by_reason`).
+    /// Before this a conflict read `federation_backend: UNIQUE constraint
+    /// failed` — a storage fault, uncountable. A byte-identical re-offer stays
+    /// a quiet Duplicate and books nothing.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_same_id_row_with_different_bytes_is_refused_by_name_on_both_doors_459() {
+        use ciris_persist::federation::attestation_apply::AttestationRefusalReason;
+        let backend = owner_axis_backend(false).await;
+        let metrics = crate::observability::EdgeMetrics::new();
+        let bridge = bridge_over(&backend, &["node-bob"]).with_metrics(Some(metrics.clone()));
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let first_row = build_federation_attestation(
+            &id,
+            "person-bob",
+            "node-bob",
+            "delegates_to",
+            owner_binding_envelope(&id, "person-bob", "node-bob"),
+        );
+        let first = serde_json::to_vec(&first_row).expect("serialize");
+        assert_eq!(
+            bridge
+                .apply_envelope_bytes(EnvelopeKind::Attestation, &first, Some("node-bob"))
+                .await,
+            ApplyOutcome::Admitted
+        );
+        // The SAME id, a different signed assertion (another scope): two
+        // producers minted one id — the #459 live case.
+        let mut other_envelope = owner_binding_envelope(&id, "person-bob", "node-bob");
+        other_envelope["scope"] = serde_json::json!(["infra:attest"]);
+        let conflicting = build_federation_attestation(
+            &id,
+            "person-bob",
+            "node-bob",
+            "delegates_to",
+            other_envelope,
+        );
+        assert_ne!(
+            conflicting.original_content_hash, first_row.original_content_hash,
+            "precondition: the offered row asserts different signed content"
+        );
+        let wire = serde_json::to_vec(&conflicting).expect("serialize");
+        let token = AttestationRefusalReason::ConflictingAttestation.as_str();
+
+        // Door 1 — attributed (the synced door, v41 origin).
+        let attributed = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-bob"))
+            .await;
+        let ApplyOutcome::Refused { reason: msg, retry } = &attributed else {
+            panic!("a same-id conflict must be Refused, got {attributed:?}");
+        };
+        assert!(
+            msg.contains(token),
+            "the message names the branch ({token}): {msg}"
+        );
+        assert!(
+            !msg.contains("UNIQUE constraint") && !msg.contains("federation_backend"),
+            "no raw storage text: {msg}"
+        );
+        assert_eq!(
+            *retry,
+            RetryDisposition::Terminal,
+            "first-seen wins; never retried"
+        );
+
+        // Door 2 — unattributed (persist's typed pre-write door).
+        let unattributed = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, None)
+            .await;
+        let ApplyOutcome::Refused {
+            reason: msg2,
+            retry: retry2,
+        } = &unattributed
+        else {
+            panic!("a same-id conflict must be Refused on the typed door, got {unattributed:?}");
+        };
+        assert!(msg2.contains(token), "same token on the typed door: {msg2}");
+        assert_eq!(*retry2, RetryDisposition::Terminal);
+
+        // Both mirror axes booked, once per door.
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.attestation_apply_refusals_by_reason
+                .get(token)
+                .copied(),
+            Some(2),
+            "the token axis books the typed branch once per refusal: {:?}",
+            snap.attestation_apply_refusals_by_reason
+        );
+        assert_eq!(
+            snap.apply_refusals_by_kind
+                .get(&EnvelopeKind::Attestation)
+                .copied(),
+            Some(2),
+            "the kind axis books at the #425 choke"
+        );
+
+        // A byte-identical re-offer is still a quiet Duplicate on both doors
+        // and books nothing further.
+        for peer in [Some("node-bob"), None] {
+            assert_eq!(
+                bridge
+                    .apply_envelope_bytes(EnvelopeKind::Attestation, &first, peer)
+                    .await,
+                ApplyOutcome::Duplicate,
+                "identical bytes (peer={peer:?}) are a Duplicate, not a refusal"
+            );
+        }
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.attestation_apply_refusals_by_reason
+                .get(token)
+                .copied(),
+            Some(2),
+            "duplicates never count on the refusal ledger"
+        );
+        assert_eq!(
+            snap.replication_duplicate_total
+                .get(&EnvelopeKind::Attestation)
+                .copied(),
+            Some(2)
         );
     }
 
