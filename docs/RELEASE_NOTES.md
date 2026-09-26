@@ -1,5 +1,77 @@
 # CIRISEdge Release Notes
 
+# v31.1.0 — the bytes plane tells the truth, the Attestation plane refuses by name, and a refusal that cannot converge parks
+
+**2026-09-25** (PRs #681, #684, #685, #686; CIRISEdge#680, #669, #459, #679). MINOR from v31.0.0.
+Ladder triple unchanged: **edge v31.1.0 · persist v48.0.0 · verify v16.1.0** — no pin, ABI, hash or
+wheel-floor move; **no rider re-pin** (no manifest row changed). Leviculum moves to
+**v0.27.0+ciris.1**. The persist verify-v17 adopt (CIRISPersist#913) is the next cut, not this one.
+
+## #669 — persist's withdrawn-bytes surface, adopted for real (PR #684)
+
+v30.3.0's note claimed edge's `Withdrawn` was reachable from persist's serve door; it was not —
+persist's typed `BlobError::Withdrawn` (v47.2.0, CC 2.3 at the bytes plane) fell into the
+fail-closed wildcard as `PolicyDenied`, which tells the peer this node HAS the bytes and is
+declining, so the fetcher hunted on to the next holder to be told the same thing.
+
+- `blob_swarm`: `BlobError::Withdrawn → ChunkSourceRefusal::Withdrawn` (the one refusal a
+  fetcher ABORTS on) at every serve/read site; `MissReason::Withdrawn` on the wire; the
+  `every_persist_serve_refusal_is_mapped` pin names it.
+- `group_content`: a withdrawn blob is a typed `GroupContentError::Withdrawn`, not `Substrate(..)`.
+- Eviction goes through `Engine::evict_blob` — persist retracts this node's live `holds_bytes`
+  claims (a hybrid-signed `withdraws` each; a refused retraction ABORTS and the bytes stay), then
+  deletes. Before, edge deleted first and left a live claim naming bytes it no longer held.
+  `BlobEvictor::evict_blob_bytes → EvictReport { withdraws_emitted, blob_deleted }`.
+- Witnesses: `a_withdrawn_reference_from_the_persist_door_is_withdrawn_on_the_wire`,
+  `a_withdrawn_blob_is_a_typed_withdrawn_answer`,
+  `a_refused_retraction_evicts_nothing_and_an_admitted_one_reports_the_order`.
+
+## #459 — the Attestation plane refuses by name (PR #685)
+
+persist's `AttestationRefusalReason` (live since persist v36.0.0, decided PRE-write) is adopted the
+way v15.9.0 adopted the Key plane's: `attestation_outcome_to_apply` maps the closed reason set —
+`AlreadyPresentIdentical → ApplyOutcome::Duplicate` (the genesis re-offers that read as refusals),
+`ConflictingAttestation` terminal, `StoreConflict` transient — and the attributed door's
+`Conflict` error is named rather than surfaced as `federation_backend` / raw SQL text. New ledger
+`attestation_apply_refusals_by_reason` (FFI bundle key of the same name); the pin
+`attestation_outcome_to_apply_maps_the_closed_reason_set` reds on any persist widening.
+**Filed:** CIRISPersist#917 — the attributed SYNC door (`put_attestation_synced`) has no typed
+pre-write outcome, so a decoration-only re-delivery books as a refusal there where the
+unattributed path books a duplicate; edge maps both doors today and closes the asymmetry when
+persist answers.
+
+## #679 — structural refusals park instead of spinning (PR #686)
+
+The canonical re-refused rows from senders whose keys it never admitted — 107 refusals / 6 h,
+each a full deserialize + verify + admission — and the loop hid real refusals in
+`apply_refusals_by_kind`. `FSD/STRUCTURAL_REFUSALS.md` puts each of the issue's three asks on the
+side where the choice lives:
+
+- **Ask 2, shipped:** the receiver **parks** a row whose signer's Key it does not hold
+  (`refusal_backoff::record_waiting_on_at`, indexed by signer) — quiet on the terminal schedule,
+  not the transient one — and **releases** every row parked on a signer the moment that signer's
+  Key admits through the choke (`park_or_release` at `apply_envelope_bytes`). Counters
+  `rows_parked_on_signer` / `signer_releases`. Witnesses:
+  `an_attestation_from_an_unknown_attester_is_parked_on_that_signer`,
+  `a_key_admitted_through_the_choke_releases_the_rows_parked_on_it`.
+- **Ask 3, rejected as a sender gate:** the Key plane is `SelfOwn` — a sender never carries a
+  third party's key, so the only sender-side precondition it could evaluate is already true for
+  every row it admitted; the precondition is decidable only at the receiver, which is the park.
+- **Ask 1, designed and deferred:** refuse-with-reason is a wire change — a
+  `ReplicationMessage::Refused { kind, refusals: [{hash, reason, retry}] }` riding the CRPL v3
+  round (no sequence numbers) — proposed in the FSD with its threat check and version gating, to
+  ship with the next serve-advertise re-pin. #679 stays open for it.
+
+## #680 — leviculum v0.27.0+ciris.1 (PR #681)
+
+Upstream +465 commits (incl. upstream 0.9.0). One compile break: `CooperativeStamper::generate`
+takes a `&StampCancel` (cancellable). Nothing in edge matches `ResourceError::Cancelled`.
+Follow-up: re-measure leviculum#57 (link accumulation ratio) on this version.
+
+Gates: each PR green on its own CI; the merged tree rebuilt as one — `replication:: blob_swarm::
+group_content:: observability::` units, the test-anchor lane modules, clippy `-D warnings` on the
+five CI combos.
+
 # v31.0.0 — a room's roster converges both ways: persist v48.0.0 (CIRISPersist#860 / #905), the 17th kind
 
 **2026-09-24** (CIRISPersist#860 — edge's ask from #608/#613 — and #905; CIRISEdge#672). **MAJOR**
