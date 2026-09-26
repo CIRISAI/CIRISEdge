@@ -969,8 +969,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-crypto"
-version = "16.1.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v16.1.0#d99da1c24d69ecaab2d0bd7c858aa606a608c778"
+version = "17.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v17.1.0#cdc6498af2605a402bbff1e399c2c0795b968180"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "31.1.0"
+version = "32.0.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1059,8 +1059,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-keyring"
-version = "16.1.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v16.1.0#d99da1c24d69ecaab2d0bd7c858aa606a608c778"
+version = "17.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v17.1.0#cdc6498af2605a402bbff1e399c2c0795b968180"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1095,8 +1095,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "48.0.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v48.0.0#59283e3e4cb54bc90f92eb110d81246be8e9ee64"
+version = "49.0.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v49.0.0#a5965d42e79ff35c79509beaaebd417514b7914d"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1134,8 +1134,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-verify-core"
-version = "16.1.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v16.1.0#d99da1c24d69ecaab2d0bd7c858aa606a608c778"
+version = "17.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v17.1.0#cdc6498af2605a402bbff1e399c2c0795b968180"
 dependencies = [
  "android_system_properties",
  "async-trait",
@@ -1784,7 +1784,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1978,7 +1978,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3078,7 +3078,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3890,7 +3890,7 @@ dependencies = [
  "mio",
  "nix 0.31.3",
  "serialport",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4034,7 +4034,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4902,7 +4902,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5441,7 +5441,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6103,10 +6103,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.5.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7127,7 +7127,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

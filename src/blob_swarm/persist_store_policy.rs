@@ -647,6 +647,7 @@ mod directory_tests {
             authority_key_id: PERSON.to_owned(),
             scrub_signature_classical: sig_b64,
             scrub_signature_pqc: Some(pqc_b64),
+            supersede_proof: None,
         })
         .await
         .expect("seed the room");

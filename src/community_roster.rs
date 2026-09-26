@@ -32,6 +32,30 @@
 //! registered key — every pair room and allocated room edge produces can now
 //! be revoked from.
 //!
+//! # What the substrate adjudicates (persist v49.0.0, CIRISPersist#908)
+//!
+//! Both doors verify the signature AND the signers' **standing**: a widening
+//! or revocation counts only if its signers satisfy the group's
+//! `consensus_protocol` evaluated over the active roster at the row's
+//! `effective_at` (`founder_only`, `unanimous`, `majority`, `quorum:M/N`,
+//! `reverse_quorum`, `weighted:*`/`custom:*` from the `policy_blob`; only
+//! founders count in `infrastructure` rooms), or is a member removing
+//! themself, or a moderator whose appointment was live at that instant.
+//! Rows may carry `cosignatures` (each hybrid-verified over the same
+//! envelope) to reach a threshold. A change that leaves the group with no
+//! founder is never admitted; no ending is retroactive. The refusal is
+//! `RosterAuthorityUnauthorized { rule }` — edge classifies it terminal except
+//! the rule `roster_authority_not_established` (retry after the roster).
+//! `witness_set` is stored, not counted. Whether `authority` SHOULD change
+//! this roster is therefore no longer only the caller's policy: the door
+//! enforces the room's own protocol; the producers here sign single-authority
+//! rows (`cosignatures` empty), which is exactly what a `founder_only` room —
+//! every room `crate::chat::community` creates — admits from a founder.
+//!
+//! A room is a keyless identifier (V151): neither door needs the room to be a
+//! registered key — every pair room and allocated room edge produces can now
+//! be revoked from.
+//!
 //! # What the substrate does NOT adjudicate here
 //!
 //! Both doors are **mechanistic**: any registered hybrid key whose signature
@@ -129,6 +153,7 @@ pub async fn community_membership_widening(
             authority_key_id: authority.key_id.clone(),
             scrub_signature_classical,
             scrub_signature_pqc,
+            cosignatures: Vec::new(),
         },
     ))
 }
@@ -210,6 +235,7 @@ pub async fn community_membership_revocation(
         authority_key_id: authority.key_id.clone(),
         scrub_signature_classical,
         scrub_signature_pqc,
+        cosignatures: Vec::new(),
     })
 }
 

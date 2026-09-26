@@ -409,6 +409,7 @@ pub async fn signed_community(
         authority_key_id: authority.key_id.clone(),
         scrub_signature_classical,
         scrub_signature_pqc,
+        supersede_proof: None,
     })
 }
 

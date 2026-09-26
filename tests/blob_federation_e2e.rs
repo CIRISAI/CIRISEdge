@@ -1092,6 +1092,7 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
             authority_key_id: founder.key_id.clone(),
             scrub_signature_classical: B64.encode(&ed_sig),
             scrub_signature_pqc: Some(B64.encode(&pqc_sig)),
+            supersede_proof: None,
         })
         .await
         .expect("seed the room");
