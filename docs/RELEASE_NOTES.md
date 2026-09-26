@@ -1,5 +1,64 @@
 # CIRISEdge Release Notes
 
+# v32.1.0 — durable MLS state over persist's sealed store, rejoin after restart, one boot re-address call (CIRISEdge#676)
+
+**2026-09-26** (PR #691; CIRISEdge#676 for CIRISServer#630 / #623; persist v49.0.0 #911). MINOR
+from v32.0.0 — new public surface, no pin, ABI, hash or wheel-floor move, no rider re-pin. Ladder
+triple unchanged: **edge v32.1.0 · persist v49.0.0 · verify v17.1.0**. Design:
+`FSD/MLS_STATE_AT_REST.md` (written before the code).
+
+## The key root is persist's (#911)
+
+`mls::scope_state::open_mls_state(path)` opens `XChaChaKvStore::open_mls_state` — persist's
+`encrypted_kv` keyed from the node's one hardware-sealed seed under `mls-state-at-rest-v1` — off
+the async worker via `spawn_blocking`. No seed → `MlsStateUnavailable::HardwareCustodyUnavailable`
+by name, and **nothing opens**; the only fallback edge offers is `ScopeStateProvider::ephemeral()`
+(a random one-shot key, in memory). Edge derives no passphrase from a room id — the
+CIRISServer#630 `open_in_memory(room_id)` shape is what this removes.
+
+## The snapshot is the durability mechanism (ask (a), on record on #676)
+
+openmls 0.8.1's libcrux `Provider` fixes its storage to a private `MemoryStorage`, so a per-method
+`StorageProvider` over the KV would need edge's own `OpenMlsProvider` — ~60 synchronous KV
+round-trips per commit — for the durability the existing snapshot (`group_state_put/get`, one
+sealed write per commit) already gives. The "DEFERRED to v6.1.0" note is retired. What was **not**
+durable and now is: pending-join key material (`stash_key_material` / `restore_key_material`),
+per-member add instants (`member_joins`, persisted beside the ledger before the head moves), and
+the room index (`persisted_room_ids`). Revisit only if openmls lets a provider's storage be
+supplied.
+
+## Rejoin after restart, in `decide`
+
+A tree member that publishes a KeyPackage **after** its recorded add is a restart signal →
+`SelfRoomAction::Rejoin(members)` (remove, then add with the fresh KeyPackage), ranked after
+`Abandon`/`Remove` and before `Add`. `decide()` is unchanged for callers passing no signal;
+`decide_with_republished` + `republished_members` (`latest_key_package_at`) are the new surface. A
+forged re-publish is impossible: the KeyPackage row is self-signed and only the member can place it.
+
+## One boot call
+
+`mls::boot::readdress_persisted_rooms(store, groups, lifecycle, lens, classify)` walks the room
+index, restores each group, classifies (host classifier first, then `chat:*` → community,
+`family:*` → family, a `user` id → self room), snapshots through persist's authorized roster fold,
+installs the addresses (falls to `refresh_members` when already held — idempotent by the
+lifecycle's own verb), and returns a `ReaddressReport` (installed / skipped, by name). The host
+calls it once at boot; CIRISServer#630 carries the wiring (path, boot call, driving `decide` with
+the republish signal, stash/restore around a join, what each error means). No pyo3 binding in this
+cut — the host ask is on #630.
+
+## Threat check (FSD §5)
+
+State-file theft: sealed under the hardware seed. Rollback of the state file: a stale epoch is
+refused by peers; forward secrecy holds. Cross-room key reuse: per-room namespaces. Downgrade via
+`HardwareCustodyUnavailable`: edge opens nothing. Witnesses S1–S8 as named in the FSD §7 table —
+round-trip across two opens of the same path, rejoin without a Welcome, the named degraded
+posture (this host has no TPM, so the degraded branch ran; a TPM host takes the durable branch),
+N rooms re-addressed at boot, stash/restore of pending-join material.
+
+Gates: `mls:: self_room:: chat:: cohort_addressing:: scope_lifecycle::` units; `storage_provider_e2e`,
+`chat_two_person_community`, `chat_message_federates`, `chat_harness_dx`, `blob_federation_e2e`,
+`realtime_av_spine_e2e`; `check --all-targets`; clippy `-D warnings` on the CI combos.
+
 # v32.0.0 — roster standing is the consensus protocol; the family converges; a member may list themself (persist v49.0.0, verify v17.1.0)
 
 **2026-09-26** (CIRISPersist#908, #907, #909, #910, #911, #912, #913, #915; CIRISVerify#207/#292/#293/#223).
