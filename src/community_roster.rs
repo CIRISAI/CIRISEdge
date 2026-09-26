@@ -56,17 +56,6 @@
 //! registered key — every pair room and allocated room edge produces can now
 //! be revoked from.
 //!
-//! # What the substrate does NOT adjudicate here
-//!
-//! Both doors are **mechanistic**: any registered hybrid key whose signature
-//! verifies is admitted as the authority. The community's
-//! `consensus_protocol` (`unanimous`, `majority`, …) is NOT enforced at
-//! either door — quorum is the `supersede_*_with_quorum` ceremony's job —
-//! and `witness_set` is stored, not counted. Whether `authority` SHOULD be
-//! allowed to change this roster is the caller's policy (a founder, a named
-//! moderator); this module guarantees only that what it signs is what the
-//! door admits.
-//!
 //! # Both changes replicate
 //!
 //! `CommunityMembershipWidening` and `CommunityMembershipRevocation` are each
