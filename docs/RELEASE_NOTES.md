@@ -1,5 +1,96 @@
 # CIRISEdge Release Notes
 
+# v32.0.0 — roster standing is the consensus protocol; the family converges; a member may list themself (persist v49.0.0, verify v17.1.0)
+
+**2026-09-26** (CIRISPersist#908, #907, #909, #910, #911, #912, #913, #915; CIRISVerify#207/#292/#293/#223).
+**MAJOR** from v31.1.0: two new replicated kinds move `REPLICATION_POLICY_HASH` and edge's
+serve/advertise manifest, so every rider re-pins. Ladder triple: **edge v32.0.0 · persist v49.0.0 ·
+verify v17.1.0** (one `ciris_crypto` / `ciris-verify-core` / `ciris-keyring` in the graph — the two
+pins move together).
+
+## The pins (riders re-pin; no ABI move)
+
+| Pin | v31.1.0 | v32.0.0 |
+|---|---|---|
+| persist `REPLICATION_POLICY_HASH` | `9d62d3a8…` | `5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a` |
+| persist `CONSENT_GRAMMAR_HASH` | `07a677bb…` | `8230589131945c4b4db3c2e7ca2187e6c02543cd8f084b0f8862eb951d2c82ac` |
+| persist `ENVELOPE_VOCABULARY_SHA256` (`listed` joins the signed vocabulary; edge does not pin it) | `4d7054a6…` | `a6a84cc9d5f4d6bd6295cfc78b42bce35145d2bb9ff14391bfe32ab027116a6a` |
+| edge `SERVE_ADVERTISE_POLICY_HASH` (two new plane rows) | `d6e4f0df…` | see `serve_policy.rs` |
+| wheel floor | `ciris-persist>=48,<49` | **`ciris-persist>=49,<50`** |
+
+All four persist ABI constants unchanged (`DIRECTORY_ABI_VERSION` 5); both capsule digests grew.
+
+## #908 — roster standing is the group's `consensus_protocol` (persist-side; edge classifies)
+
+A membership widening or revocation, community or family, now counts only when its signers have
+standing under the group's protocol at the row's `effective_at` — `founder_only`, `unanimous`,
+`majority`, `quorum:M/N`, `reverse_quorum`, `weighted:*`/`custom:*` from the `policy_blob`; only
+founders in `infrastructure` rooms — or is a member removing themself, or a moderator whose
+appointment was live at that instant. Rows carry `cosignatures` (each hybrid-verified over the same
+envelope; skip-if-empty, so single-signed bytes are unchanged). A change that leaves the group
+founderless is never admitted; no ending is retroactive. Edge's roster reads already go through
+persist's authorized fold (`active_community_members`, `is_active_community_member`, …), so the
+standing rules land here by construction; edge produces single-authority rows (`cosignatures`
+empty), exactly what a `founder_only` room admits from a founder. **New refusal class**
+`ApplyRefusalClass::RosterAuthorityUnauthorized` (`roster_authority_unauthorized`, terminal);
+persist's one retryable rule, `roster_authority_not_established`, classifies as
+`RetryAfterRoster`. `community_roster`'s module doc no longer says the protocol is unenforced.
+
+## #910 — the family converges: `FamilyMembershipWidening`, the 18th kind
+
+The family twin of v31.0.0's community widening: append plane, structural, `Global` projection,
+bodies held, V2 framing, content-hash-indexed, swept via
+`list_signed_family_membership_widenings_since` on the three-part
+`(family, member, effective_at)` resume id, applied through `put_family_membership_widening`. The
+family revocation PK gains `effective_at` (a removed member can be re-added and removed again);
+its resume id is the same triple. `SignedFamily` / `SignedCommunity` gain `supersede_proof`: a
+differing group record under an occupied id applies only with a proof that passes against the
+receiver's own prior roster — edge carries the field through its apply path and its producers set
+`None` (amendments come from persist's `supersede_*_with_quorum`).
+
+## #912 — CC 2's `listed`: `CommunityMembershipListing`, the 19th kind
+
+A per-membership opt-in **the member chooses** (`Some("public")` lists, absent clears; forward-only;
+counts only within the member's current membership span — a pre-join listing is inert, a re-added
+member is unlisted until they list again). Signer binding `SelfOwn` on persist's side: only the
+member lists themself, no founder/moderator/quorum can. **Wire reach = the room's membership
+planes and no wider** (a listing row reveals its signer is in the room; CC 2: the roster is never
+globally enumerable) — `listed_members` is the host-gated output of persist's fold, not the rows'
+reach. Edge sweeps/applies it like the membership planes (`list_signed_community_membership_listings_since`,
+`put_community_membership_listing`, three-part resume). Edge reads `listed_members` nowhere; a
+capsule consumer (the server) gets a host-side op from persist's next cut.
+
+## Verify v17.1.0 — strict Ed25519, and three keyring corrections
+
+- **Strict Ed25519 verification** (#207 item 1): small-order / torsion-component `A` and `R` are
+  rejected; the permissive rule accepted a universal forgery. No honest signer is affected.
+  Edge's surfaces are byte-identical between v16.1.0 and v17.x (`HardwareSigner`, keyring, crypto
+  public lines), so the adopt is the pin. Persist's `verify_strict` is the one Ed25519 rule on
+  both floors (#913).
+- **#292** the keyring no longer archives the node key it minted seconds earlier when Secure
+  Enclave falls back to software (CIRISServer#608's "edge cannot open the node key"); **#293**
+  challenge-less Android Key Attestation (GenerationCustody); **#915** Android generation custody
+  on persist's side; **#223** validation's consensus-source comparison.
+
+## #911 (for CIRISEdge#676) — the MLS-state store root exists
+
+`XChaChaKvStore::open_mls_state(path)` keys an `encrypted_kv` from persist's one hardware-sealed
+seed under `mls-state-at-rest-v1`; sync/blocking (call from `spawn_blocking`); no seed →
+`KVError::HardwareCustodyUnavailable` (the named degraded posture; never a passphrase fallback).
+Edge's openmls `StorageProvider` over it, rejoin-after-restart in `decide`, and the one boot
+re-address entry point are the next PR (#676), not this cut.
+
+## Also: #907 caller admission reads the fold (a widened member is admitted, a re-added member is
+admitted again); **#909** `AttestationFilter::lifecycle` hides retracted rows from every drive
+listing; **#917** (typed outcome on the attributed sync door) is **not** in v49 — next persist cut.
+
+Gates: `replication:: community_roster:: chat:: blob_swarm:: group_content:: observability::`
+units incl. `field_conformance` + `serve_policy`; test-anchor lane modules; `active_roster_e2e`,
+`bridge_combinator_e2e`, `replication_wire_proptest`, `chat_message_federates`,
+`group_content_end_to_end`, `conformance_vectors_v19`, `accord_carrier_verify`; the first-contact
+ladder; `check --all-targets`; clippy `-D warnings` on the five CI combos. E4 forward-path pins
+for both new kinds (the listing signed by the member it names).
+
 # v31.1.0 — the bytes plane tells the truth, the Attestation plane refuses by name, and a refusal that cannot converge parks
 
 **2026-09-25** (PRs #681, #684, #685, #686; CIRISEdge#680, #669, #459, #679). MINOR from v31.0.0.

@@ -81,10 +81,11 @@ stream, so a partition on one kind never gates convergence on another.
   (`is_bootstrap`, [`protocol.rs:228`](../src/replication/protocol.rs)) — the
   self-authenticating kinds a fresh peer must deliver to introduce itself, exempt
   from the attribution gate (§5.4). A proptest asserts this set is *exactly*
-  those three over all 17 kinds (§5.4; `EnvelopeKind::ALL` is 17 since
-  `CommunityMembershipWidening` in v31.0.0 — persist v48.0.0 #860, the roster's
-  append-plane mirror of `CommunityMembershipRevocation`: structural, `Global`
-  projection, bodies held, V2 framing; was 16 since `KeyGrant` in v24.1.0).
+  those three over all 19 kinds (§5.4; `EnvelopeKind::ALL` is 19 since
+  `FamilyMembershipWidening` and `CommunityMembershipListing` in v32.0.0 — persist
+  v49.0.0 #910/#912: the family widening twin and CC 2's `listed` plane, both riding
+  the membership planes' projection; 17 since `CommunityMembershipWidening` in
+  v31.0.0 — persist v48.0.0 #860; 16 since `KeyGrant` in v24.1.0).
 - **`cursor-served`** = **only `AccordQuorumEvidence`** (`is_cursor_served`,
   `protocol.rs:263`, pinned over `ALL` by
   `cursor_served_is_exactly_accord_quorum_evidence`, `protocol.rs:672`). A bundle

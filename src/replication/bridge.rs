@@ -105,10 +105,10 @@ use ciris_persist::federation::register::{KeyRefusalReason, ReplicatedKeyOutcome
 use ciris_persist::federation::trust_root::capability_roots_to_trusted_root;
 use ciris_persist::federation::types::delegation_scope;
 use ciris_persist::federation::types::{
-    Attestation, KeyRecord, SignedAttestation, SignedCommunity,
+    Attestation, KeyRecord, SignedAttestation, SignedCommunity, SignedCommunityMembershipListing,
     SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening, SignedFamily,
-    SignedFamilyMembershipRevocation, SignedIdentityOccurrence, SignedIdentityOccurrenceRevocation,
-    SignedKeyRecord, SignedLocationProof, SignedRevocation,
+    SignedFamilyMembershipRevocation, SignedFamilyMembershipWidening, SignedIdentityOccurrence,
+    SignedIdentityOccurrenceRevocation, SignedKeyRecord, SignedLocationProof, SignedRevocation,
 };
 use ciris_persist::federation::{AttestationOutcome, FederationDirectory};
 use ciris_verify_core::threshold::ThresholdMember;
@@ -223,6 +223,16 @@ pub enum ApplyRefusalClass {
     /// once the roster does. Scope-agnostic: persist produces it only when
     /// the roster is structurally absent, never inferred from another error.
     RetryAfterRoster,
+    /// persist v49.0.0 (CIRISPersist#908, `FSD/ROOM_ROSTER_AUTHORITY.md`) — a
+    /// membership widening/revocation whose signers have NO STANDING under the
+    /// group's `consensus_protocol` at the row's `effective_at` (a non-founder
+    /// in an `infrastructure` room, short of `quorum:M/N`, a change that would
+    /// leave the group founderless, the room key or record signer as author).
+    /// Terminal: nothing about it changes by waiting — except the one rule
+    /// persist names retryable, `roster_authority_not_established` (the roster
+    /// the standing is judged against is not held yet), which classifies as
+    /// [`Self::RetryAfterRoster`] instead.
+    RosterAuthorityUnauthorized,
     /// persist#757 (AV-45) — a `community`-scoped row whose writer is NOT in
     /// the roster this node holds. Until persist v47.0.0 this and "roster not
     /// held yet" were one refusal, and edge called both transient; persist
@@ -243,6 +253,7 @@ impl ApplyRefusalClass {
     pub const ALL: &'static [Self] = &[
         Self::CommunityRosterFork,
         Self::RetryAfterRoster,
+        Self::RosterAuthorityUnauthorized,
         Self::NotACommunityMember,
         Self::NotAFamilyMember,
         Self::ThirdPartyRow,
@@ -256,6 +267,7 @@ impl ApplyRefusalClass {
         match self {
             Self::CommunityRosterFork => "community_roster_fork",
             Self::RetryAfterRoster => "retry_after_roster",
+            Self::RosterAuthorityUnauthorized => "roster_authority_unauthorized",
             Self::NotACommunityMember => "not_a_community_member",
             Self::NotAFamilyMember => "not_a_family_member",
             Self::ThirdPartyRow => "third_party_row",
@@ -310,6 +322,14 @@ impl ApplyRefusalClass {
         use ciris_persist::scope::ScopeRefusalReason as R;
         match err {
             E::WriteScopeRefused(R::MembershipUnresolved) => Some(Self::RetryAfterRoster),
+            // v49.0.0 (#908): standing not yet judgeable ⇒ transient; every other
+            // rule is a verdict about the signers, not about this node's state.
+            E::RosterAuthorityUnauthorized { rule, .. }
+                if *rule == ciris_persist::federation::ROSTER_AUTHORITY_RULE_NOT_ESTABLISHED =>
+            {
+                Some(Self::RetryAfterRoster)
+            }
+            E::RosterAuthorityUnauthorized { .. } => Some(Self::RosterAuthorityUnauthorized),
             E::WriteScopeRefused(R::NoCommunityMembership) => Some(Self::NotACommunityMember),
             E::WriteScopeRefused(R::NoFamilyMembership) => Some(Self::NotAFamilyMember),
             E::CohortStandingRefused { .. } => Some(Self::ThirdPartyRow),
@@ -3728,6 +3748,12 @@ impl FederationDirectoryReplicationBridge {
             EnvelopeKind::CommunityMembershipWidening => {
                 self.list_community_membership_widenings(window).await
             }
+            EnvelopeKind::FamilyMembershipWidening => {
+                self.list_family_membership_widenings(window).await
+            }
+            EnvelopeKind::CommunityMembershipListing => {
+                self.list_community_membership_listings(window).await
+            }
             EnvelopeKind::LocationProof => self.list_location_proofs(window).await,
             // CIRISEdge#474 — the accord-quorum-evidence plane is NEVER advertised
             // by content-hash: it has no `signed_wire_index` entry
@@ -4284,6 +4310,14 @@ impl FederationDirectoryReplicationBridge {
             // roster is a read-time fold, nothing is rewritten.
             EnvelopeKind::CommunityMembershipWidening => {
                 self.apply_community_membership_widening(envelope_bytes)
+                    .await
+            }
+            // persist v49.0.0 — #910 the family mirror, #912 the member's own listing.
+            EnvelopeKind::FamilyMembershipWidening => {
+                self.apply_family_membership_widening(envelope_bytes).await
+            }
+            EnvelopeKind::CommunityMembershipListing => {
+                self.apply_community_membership_listing(envelope_bytes)
                     .await
             }
             EnvelopeKind::LocationProof => self.apply_location_proof(envelope_bytes).await,
@@ -7338,6 +7372,54 @@ impl FederationDirectoryReplicationBridge {
         .await
     }
 
+    /// persist v49.0.0 (CIRISPersist#910) — the family widening plane, the
+    /// 18th kind: the community widening's family twin, swept the same way.
+    async fn list_family_membership_widenings(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
+        self.sweep_paged(
+            EnvelopeKind::FamilyMembershipWidening,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_family_membership_widenings_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedFamilyMembershipWidening::resume_pair,
+            |_| true,
+            |s| Self::ms_seq(s.widening.family_membership_widening.effective_at),
+            |s| &s.widening,
+        )
+        .await
+    }
+
+    /// persist v49.0.0 (CIRISPersist#912) — the `listed` membership listing
+    /// plane, the 19th kind: a member's OWN disclosure (signer binding
+    /// `SelfOwn` on persist's side). It travels exactly as far as the room's
+    /// widening and revocation rows and no further (a listing row — even a
+    /// cleared or pre-join one — reveals that its signer is in the room), so
+    /// it rides the membership planes' projection; `listed_members` is the
+    /// host-gated OUTPUT of the fold, not the rows' wire reach.
+    async fn list_community_membership_listings(
+        &self,
+        window: SweepWindow<'_>,
+    ) -> Vec<EnvelopeRef> {
+        self.sweep_paged(
+            EnvelopeKind::CommunityMembershipListing,
+            window,
+            |since, limit| async move {
+                self.directory
+                    .list_signed_community_membership_listings_since(since, limit)
+                    .await
+                    .unwrap_or_default()
+            },
+            ciris_persist::federation::ServedCommunityMembershipListing::resume_pair,
+            |_| true,
+            |s| Self::ms_seq(s.listing.community_membership_listing.effective_at),
+            |s| &s.listing,
+        )
+        .await
+    }
+
     async fn list_location_proofs(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // CIRISEdge#523 — plane 3 of 3. A LocationProof's `subject_key_id` is
         // whoever the proof is ABOUT, which for a person's presence claim is a
@@ -7971,6 +8053,26 @@ impl FederationDirectoryReplicationBridge {
             bytes,
             SignedCommunityMembershipWidening,
             put_community_membership_widening
+        )
+    }
+
+    async fn apply_family_membership_widening(&self, bytes: &[u8]) -> ApplyOutcome {
+        apply_signed_plane!(
+            self,
+            "FamilyMembershipWidening",
+            bytes,
+            SignedFamilyMembershipWidening,
+            put_family_membership_widening
+        )
+    }
+
+    async fn apply_community_membership_listing(&self, bytes: &[u8]) -> ApplyOutcome {
+        apply_signed_plane!(
+            self,
+            "CommunityMembershipListing",
+            bytes,
+            SignedCommunityMembershipListing,
+            put_community_membership_listing
         )
     }
 
@@ -10160,6 +10262,7 @@ pub(crate) mod tests {
             authority_key_id: authority_key_id.to_string(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            supersede_proof: None,
         }
     }
 
@@ -10172,6 +10275,7 @@ pub(crate) mod tests {
             authority_key_id: authority_key_id.to_string(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            supersede_proof: None,
         }
     }
 
@@ -10188,6 +10292,7 @@ pub(crate) mod tests {
             authority_key_id: authority_key_id.to_string(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            cosignatures: Vec::new(),
         }
     }
 
@@ -10204,6 +10309,7 @@ pub(crate) mod tests {
             authority_key_id: authority_key_id.to_string(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
+            cosignatures: Vec::new(),
         }
     }
 
@@ -10218,6 +10324,38 @@ pub(crate) mod tests {
         SignedCommunityMembershipWidening {
             community_membership_widening: widening,
             authority_key_id: authority_key_id.to_string(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            cosignatures: Vec::new(),
+        }
+    }
+
+    /// Hybrid-sign a [`FamilyMembershipWidening`] — the family twin (#910).
+    fn sign_family_membership_widening_fixture(
+        authority_key_id: &str,
+        widening: ciris_persist::federation::FamilyMembershipWidening,
+    ) -> SignedFamilyMembershipWidening {
+        let (_h, classical, pqc) =
+            sign_attestation_envelope(authority_key_id, &widening.signing_envelope());
+        SignedFamilyMembershipWidening {
+            family_membership_widening: widening,
+            authority_key_id: authority_key_id.to_string(),
+            scrub_signature_classical: classical,
+            scrub_signature_pqc: pqc,
+            cosignatures: Vec::new(),
+        }
+    }
+
+    /// Hybrid-sign a [`CommunityMembershipListing`] — signed by the MEMBER it
+    /// names (persist's `SelfOwn` binding: only the member lists themself).
+    fn sign_community_membership_listing_fixture(
+        listing: ciris_persist::federation::CommunityMembershipListing,
+    ) -> SignedCommunityMembershipListing {
+        let member = listing.member_key_id.clone();
+        let (_h, classical, pqc) = sign_attestation_envelope(&member, &listing.signing_envelope());
+        SignedCommunityMembershipListing {
+            community_membership_listing: listing,
+            authority_key_id: member,
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
         }
@@ -10256,6 +10394,47 @@ pub(crate) mod tests {
             consensus_protocol_entrenched: false,
             persist_row_hash: String::new(),
         }
+    }
+
+    /// persist v49.0.0 (CIRISPersist#908) — a membership widening or revocation
+    /// admits only when its signers have STANDING under the group's
+    /// `consensus_protocol` at the row's instant; `founder_only` needs an active
+    /// founder. A fixture group that will be CHANGED is therefore founded by the
+    /// key that will sign the change (a `user`, so it self-anchors under the
+    /// steward-binding gate), with `member` beside it.
+    fn fixture_community_founded(
+        community_key_id: &str,
+        founder_key_id: &str,
+        member_key_id: &str,
+    ) -> Community {
+        let mut c = fixture_community(community_key_id, member_key_id);
+        c.members.insert(
+            0,
+            CommunityMember {
+                key_id: founder_key_id.to_string(),
+                joined_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+                role: Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_string()),
+            },
+        );
+        c
+    }
+
+    /// The family twin of [`fixture_community_founded`].
+    fn fixture_family_founded(
+        family_key_id: &str,
+        founder_key_id: &str,
+        member_key_id: &str,
+    ) -> Family {
+        let mut f = fixture_family(family_key_id, member_key_id);
+        f.members.insert(
+            0,
+            FamilyMember {
+                key_id: founder_key_id.to_string(),
+                joined_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+                role: Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_string()),
+            },
+        );
+        f
     }
 
     /// A minimal admissible [`Community`] — structural mirror of
@@ -10876,14 +11055,14 @@ pub(crate) mod tests {
             EnvelopeKind::FamilyMembershipRevocation,
             &[], // tombstone plane advertises Global — no cohort needed
             &[
-                ("e4-authority", identity_type::AGENT),
+                ("e4-authority", identity_type::USER),
                 ("e4-family", identity_type::AGENT),
                 ("e4-member", identity_type::AGENT),
             ],
             &[],
             &[sign_family_fixture(
                 "e4-authority",
-                fixture_family("e4-family", "e4-member"),
+                fixture_family_founded("e4-family", "e4-authority", "e4-member"),
             )],
             &[],
             &signed,
@@ -10919,14 +11098,14 @@ pub(crate) mod tests {
             EnvelopeKind::CommunityMembershipRevocation,
             &[],
             &[
-                ("e4-authority", identity_type::AGENT),
+                ("e4-authority", identity_type::USER),
                 ("e4-community", identity_type::AGENT),
                 // CC 3.2 — a room member roots in a human; a `user` self-anchors.
                 ("e4-member", identity_type::USER),
             ],
             &[sign_community_fixture(
                 "e4-authority",
-                fixture_community("e4-community", "e4-member"),
+                fixture_community_founded("e4-community", "e4-authority", "e4-member"),
             )],
             &[],
             &[],
@@ -10962,7 +11141,7 @@ pub(crate) mod tests {
             EnvelopeKind::CommunityMembershipWidening,
             &[],
             &[
-                ("e4-authority", identity_type::AGENT),
+                ("e4-authority", identity_type::USER),
                 ("e4-community", identity_type::AGENT),
                 // CC 3.2 — room members root in a human; `user` self-anchors.
                 ("e4-member", identity_type::USER),
@@ -10970,7 +11149,7 @@ pub(crate) mod tests {
             ],
             &[sign_community_fixture(
                 "e4-authority",
-                fixture_community("e4-community", "e4-member"),
+                fixture_community_founded("e4-community", "e4-authority", "e4-member"),
             )],
             &[],
             &[],
@@ -10983,6 +11162,86 @@ pub(crate) mod tests {
                 )
             },
             |s| s.community_membership_widening.signing_envelope(),
+        )
+        .await;
+    }
+
+    /// #910 — the family widening plane's E4 forward path (the 18th kind).
+    #[tokio::test]
+    async fn e4_family_membership_widening_forward_path_preserves_authority_signature() {
+        let signed = sign_family_membership_widening_fixture(
+            "e4-authority",
+            ciris_persist::federation::FamilyMembershipWidening {
+                family_key_id: "e4-family".to_string(),
+                member_key_id: "e4-newcomer".to_string(),
+                joined_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                effective_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                role: None,
+                persist_row_hash: String::new(),
+            },
+        );
+        pin_e4_forward_path(
+            EnvelopeKind::FamilyMembershipWidening,
+            &[],
+            &[
+                ("e4-authority", identity_type::USER),
+                ("e4-member", identity_type::USER),
+                ("e4-newcomer", identity_type::USER),
+            ],
+            &[],
+            &[sign_family_fixture(
+                "e4-authority",
+                fixture_family_founded("e4-family", "e4-authority", "e4-member"),
+            )],
+            &[],
+            &signed,
+            |s: &SignedFamilyMembershipWidening| {
+                (
+                    s.authority_key_id.clone(),
+                    s.scrub_signature_classical.clone(),
+                    s.scrub_signature_pqc.clone(),
+                )
+            },
+            |s| s.family_membership_widening.signing_envelope(),
+        )
+        .await;
+    }
+
+    /// #912 — the listing plane's E4 forward path (the 19th kind): the row is
+    /// signed by the member it names and survives the wire byte-for-byte.
+    #[tokio::test]
+    async fn e4_community_membership_listing_forward_path_preserves_member_signature() {
+        let signed = sign_community_membership_listing_fixture(
+            ciris_persist::federation::CommunityMembershipListing {
+                community_key_id: "e4-community".to_string(),
+                member_key_id: "e4-member".to_string(),
+                effective_at: "2026-07-02T00:00:00Z".parse().expect("rfc3339"),
+                listed: Some("public".to_string()),
+                persist_row_hash: String::new(),
+            },
+        );
+        pin_e4_forward_path(
+            EnvelopeKind::CommunityMembershipListing,
+            &[],
+            &[
+                ("e4-authority", identity_type::AGENT),
+                ("e4-member", identity_type::USER),
+            ],
+            &[sign_community_fixture(
+                "e4-authority",
+                fixture_community("e4-community", "e4-member"),
+            )],
+            &[],
+            &[],
+            &signed,
+            |s: &SignedCommunityMembershipListing| {
+                (
+                    s.authority_key_id.clone(),
+                    s.scrub_signature_classical.clone(),
+                    s.scrub_signature_pqc.clone(),
+                )
+            },
+            |s| s.community_membership_listing.signing_envelope(),
         )
         .await;
     }
@@ -11066,6 +11325,7 @@ pub(crate) mod tests {
                     authority_key_id: String::new(),
                     scrub_signature_classical: String::new(),
                     scrub_signature_pqc: None,
+                    supersede_proof: None,
                 })
                 .expect("serialize"),
             ),
@@ -11076,6 +11336,7 @@ pub(crate) mod tests {
                     authority_key_id: String::new(),
                     scrub_signature_classical: String::new(),
                     scrub_signature_pqc: None,
+                    supersede_proof: None,
                 })
                 .expect("serialize"),
             ),
@@ -11094,6 +11355,7 @@ pub(crate) mod tests {
                     authority_key_id: String::new(),
                     scrub_signature_classical: String::new(),
                     scrub_signature_pqc: None,
+                    cosignatures: Vec::new(),
                 })
                 .expect("serialize"),
             ),
@@ -11112,6 +11374,7 @@ pub(crate) mod tests {
                     authority_key_id: String::new(),
                     scrub_signature_classical: String::new(),
                     scrub_signature_pqc: None,
+                    cosignatures: Vec::new(),
                 })
                 .expect("serialize"),
             ),
@@ -15775,6 +16038,7 @@ pub(crate) mod tests {
             authority_key_id: String::new(),
             scrub_signature_classical: String::new(),
             scrub_signature_pqc: None,
+            supersede_proof: None,
         })
         .expect("serialize unsigned family");
         let refused = bridge
@@ -16819,7 +17083,8 @@ pub(crate) mod tests {
                 ("person-bob", identity_type::USER),
                 ("node-bob", identity_type::NODE),
                 ("node-stranger", identity_type::NODE),
-                ("room-authority", identity_type::AGENT),
+                // v49.0.0 (#908): a founder must be a person (steward-binding).
+                ("room-authority", identity_type::USER),
                 ("chat-room", identity_type::AGENT),
                 ("household", identity_type::AGENT),
             ],
@@ -16876,7 +17141,9 @@ pub(crate) mod tests {
         backend
             .put_community(sign_community_fixture(
                 "room-authority",
-                fixture_community("chat-room", member),
+                // v49.0.0 (#908): the room's later revocation is signed by
+                // `room-authority`, so it is the room's FOUNDER (a person).
+                fixture_community_founded("chat-room", "room-authority", member),
             ))
             .await
             .expect("seed community");
@@ -17015,7 +17282,8 @@ pub(crate) mod tests {
                 ("node-bob", identity_type::NODE),
                 ("node-carol", identity_type::NODE),
                 ("node-stranger", identity_type::NODE),
-                ("room-authority", identity_type::AGENT),
+                // v49.0.0 (#908): a founder must be a person (steward-binding).
+                ("room-authority", identity_type::USER),
                 ("chat-room", identity_type::AGENT),
             ],
         )
@@ -17218,8 +17486,13 @@ pub(crate) mod tests {
 
         let now = Utc::now();
         backend
+            // v49.0.0 (#908): a removal needs STANDING — a pair room's protocol
+            // needs both founders for a removal by the other, and the record's
+            // signer `room-authority` is a stranger to the roster. A member
+            // removing THEMSELF is always admitted, and it is what this test is
+            // about: bob leaves, and stops receiving the room's rows.
             .put_community_membership_revocation(sign_community_membership_revocation_fixture(
-                "room-authority",
+                "person-bob",
                 CommunityMembershipRevocation {
                     community_key_id: "chat-room".to_owned(),
                     removed_identity_key_id: "person-bob".to_owned(),

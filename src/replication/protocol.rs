@@ -78,6 +78,8 @@ use serde::{Deserialize, Serialize};
 /// | `LocationProof`                  | `put_location_proof(SignedLocationProof)`           | v4.10.0 (#154) |
 /// | `KeyGrant`                       | `Engine::apply_replicated_key_grant(SignedKeyGrantSet)` — routed by `attestation_type` prefix `key_grant:`; rides the Attestation cursor | v44.3.0 (#848) |
 /// | `CommunityMembershipWidening`    | `put_community_membership_widening(SignedCommunityMembershipWidening)` — the roster's append-plane mirror of the revocation | v48.0.0 (#860) |
+/// | `FamilyMembershipWidening`       | `put_family_membership_widening(SignedFamilyMembershipWidening)` — the family twin | v49.0.0 (#910) |
+/// | `CommunityMembershipListing`     | `put_community_membership_listing(SignedCommunityMembershipListing)` — CC 2 `listed`, the member's own | v49.0.0 (#912) |
 ///
 /// Adding a variant going forward bumps `WIRE_PROTOCOL_VERSION` (see
 /// `wire_frame.rs`). Anticipated v2 additions (operational-data CEG
@@ -207,6 +209,19 @@ pub enum EnvelopeKind {
     /// content-hash-indexed, E4 authority-signed.
     /// `put_community_membership_widening(...)`.
     CommunityMembershipWidening,
+    /// `federation_family_membership_widenings` — persist v49.0.0
+    /// (CIRISPersist#910): the family twin of `CommunityMembershipWidening`.
+    /// Structural, content-hash-indexed, E4 authority-signed (co-signable).
+    /// `put_family_membership_widening(...)`.
+    FamilyMembershipWidening,
+    /// `federation_community_membership_listings` — persist v49.0.0
+    /// (CIRISPersist#912): CC 2's `listed`, a member's OWN per-membership
+    /// opt-in to public view (`Some("public")` lists, absent clears; forward-
+    /// only; counts only within the member's current membership span). Signer
+    /// binding `SelfOwn` — only the member lists themself. Rides the room's
+    /// membership planes' projection and no wider (a listing row reveals its
+    /// signer is in the room). `put_community_membership_listing(...)`.
+    CommunityMembershipListing,
 }
 
 impl EnvelopeKind {
@@ -215,7 +230,7 @@ impl EnvelopeKind {
     /// `REPLICATION_POLICY_HASH`). Basis for the serve/advertise manifest
     /// (CIRISEdge#393 item 3). `AccordQuorumEvidence` (CIRISEdge#474) is appended
     /// last — order is hashed, so it MUST stay at the end.
-    pub const ALL: [EnvelopeKind; 17] = [
+    pub const ALL: [EnvelopeKind; 19] = [
         Self::Key,
         Self::Attestation,
         Self::Revocation,
@@ -233,9 +248,12 @@ impl EnvelopeKind {
         Self::AccordQuorumEvidence,
         // CIRISPersist#848 — appended; order is hashed.
         Self::KeyGrant,
-        // CIRISPersist#860 (v48.0.0) — appended LAST; order is hashed
-        // (`REPLICATION_POLICY_HASH` 9d62d3a8…).
+        // CIRISPersist#860 (v48.0.0) — appended; order is hashed.
         Self::CommunityMembershipWidening,
+        // CIRISPersist#910 / #912 (v49.0.0) — appended LAST, in this order
+        // (`REPLICATION_POLICY_HASH` 5501d6b9…).
+        Self::FamilyMembershipWidening,
+        Self::CommunityMembershipListing,
     ];
 
     /// CIRISEdge#402/#406 — the finite, self-authenticating **bootstrap** kinds a
@@ -407,6 +425,8 @@ impl EnvelopeKind {
             Self::AccordQuorumEvidence => "accord_quorum_evidence",
             Self::KeyGrant => "key_grant",
             Self::CommunityMembershipWidening => "community_membership_widening",
+            Self::FamilyMembershipWidening => "family_membership_widening",
+            Self::CommunityMembershipListing => "community_membership_listing",
         }
     }
 
@@ -441,6 +461,8 @@ impl EnvelopeKind {
             Self::CommunityMembershipRevocation => "CommunityMembershipRevocation",
             // #860 — indexed like the revocation (`record_key{community, member, effective_at}`).
             Self::CommunityMembershipWidening => "CommunityMembershipWidening",
+            Self::FamilyMembershipWidening => "FamilyMembershipWidening",
+            Self::CommunityMembershipListing => "CommunityMembershipListing",
             Self::LocationProof => "LocationProof",
             Self::Organization => "Organization",
             Self::OrgMembership => "OrgMembership",
@@ -485,7 +507,10 @@ impl EnvelopeKind {
             // #848 — post-v1 tag; v1-only peers serde-reject it.
             | Self::KeyGrant
             // #860 — post-v1 tag, same reasoning.
-            | Self::CommunityMembershipWidening => {
+            | Self::CommunityMembershipWidening
+            // #910 / #912 — post-v1 tags.
+            | Self::FamilyMembershipWidening
+            | Self::CommunityMembershipListing => {
                 crate::replication::wire_frame::WIRE_PROTOCOL_VERSION_V2
             }
         }
@@ -994,6 +1019,8 @@ mod tests {
                 EnvelopeKind::AccordQuorumEvidence => "accord_quorum_evidence",
                 EnvelopeKind::KeyGrant => "key_grant",
                 EnvelopeKind::CommunityMembershipWidening => "community_membership_widening",
+                EnvelopeKind::FamilyMembershipWidening => "family_membership_widening",
+                EnvelopeKind::CommunityMembershipListing => "community_membership_listing",
             };
             // The serde rename, the manifest key, and the pin all agree.
             assert_eq!(kind.as_wire_str(), wire, "{kind:?}: as_wire_str drifted");
