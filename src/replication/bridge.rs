@@ -1560,6 +1560,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// exactly the kind nothing else can observe. `Relaxed` — a counter nobody
     /// orders against.
     retry_suppressions: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#679 — rows PARKED on an absent signer's `Key` (a structural
+    /// refusal: re-asking cannot change the verdict until the key lands).
+    rows_parked_on_signer: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#679 — rows RELEASED because their signer's `Key` admitted
+    /// through this choke. The convergence half of the same witness.
+    signer_releases: std::sync::atomic::AtomicUsize,
 }
 
 /// CIRISEdge#523 — one memoized owner-binding resolution for one node.
@@ -1774,6 +1780,8 @@ impl FederationDirectoryReplicationBridge {
             // in which asking flat-out is the right answer.
             refusal_backoff: RefusalBackoff::new(),
             retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
+            rows_parked_on_signer: std::sync::atomic::AtomicUsize::new(0),
+            signer_releases: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1852,6 +1860,8 @@ impl FederationDirectoryReplicationBridge {
             // in which asking flat-out is the right answer.
             refusal_backoff: RefusalBackoff::new(),
             retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
+            rows_parked_on_signer: std::sync::atomic::AtomicUsize::new(0),
+            signer_releases: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -3554,6 +3564,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             }
         }
         self.remember_outcome(kind, envelope_bytes, &outcome);
+        self.park_or_release(kind, envelope_bytes, &outcome).await;
         outcome
     }
 
@@ -3569,6 +3580,109 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         hit
+    }
+}
+
+impl FederationDirectoryReplicationBridge {
+    /// CIRISEdge#679 — the STRUCTURAL half of the refusal memory, decided where
+    /// the store can be afforded (the #552 rule: the apply loop records, the
+    /// choke decides).
+    ///
+    /// - A **transient refusal that names a signer this directory does not
+    ///   hold** is not "still replicating": the Key plane is `SelfOwn`, so the
+    ///   peer that offered the row never carries a third party's key, and the
+    ///   only recovery (#552 B's `Pull` for the signer's own key) either lands
+    ///   or does not. The row is PARKED on the signer — quiet on the terminal
+    ///   schedule — instead of re-asked every 20…300 s forever. Measured on the
+    ///   canonical: 107 unknown-attester refusals in 6 h, the same keys a month
+    ///   later (CIRISServer#488).
+    /// - A **`Key` admit** RELEASES every row parked on that key at once, so a
+    ///   row parked at 09:00 whose signer registers at 09:01 is re-asked on the
+    ///   next round, not at 09:30. This is the convergence the park waits for.
+    ///
+    /// Gates the ASK only, like all of #544: an unsolicited push of parked
+    /// bytes is still applied on its merits. Never touches how the refusal was
+    /// classified — it reads the outcome's disposition and the row's named
+    /// signer, both already decided.
+    async fn park_or_release(
+        &self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+        outcome: &ApplyOutcome,
+    ) {
+        use sha2::{Digest as _, Sha256};
+        match outcome.retry_disposition() {
+            None if kind == EnvelopeKind::Key => {
+                // The admitted (or already-held) key's id sits on the wrapper's
+                // `record` or at the top level (the legacy wire).
+                let Some(key_id) = serde_json::from_slice::<serde_json::Value>(envelope_bytes)
+                    .ok()
+                    .and_then(|v| {
+                        v.pointer("/record/key_id")
+                            .or_else(|| v.get("key_id"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                else {
+                    return;
+                };
+                let released = self.refusal_backoff.release_signer(&key_id);
+                if released > 0 {
+                    self.signer_releases
+                        .fetch_add(released, std::sync::atomic::Ordering::Relaxed);
+                    tracing::info!(
+                        signer = %key_id,
+                        released,
+                        "signer's Key landed — released the rows parked on it; the next \
+                         round asks for them again (CIRISEdge#679)"
+                    );
+                }
+            }
+            Some(RetryDisposition::Transient) => {
+                let Some(signer) =
+                    crate::replication::missing_signer::missing_signer_of(kind, envelope_bytes)
+                else {
+                    return;
+                };
+                // The store lookup the apply loop could not afford: is the named
+                // signer GENUINELY absent? A present signer means the refusal was
+                // about something else (a roster, a race) and the ordinary #544
+                // window stands.
+                if !matches!(self.directory.lookup_public_key(&signer).await, Ok(None)) {
+                    return;
+                }
+                let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+                let window =
+                    self.refusal_backoff
+                        .record_waiting_on_at(kind, hash, &signer, Instant::now());
+                self.rows_parked_on_signer
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    kind = ?kind,
+                    envelope_hash = %hex::encode(&hash[..8]),
+                    signer = %signer,
+                    backoff_secs = window.as_secs(),
+                    parked = self.refusal_backoff.parked_on_signer_len(),
+                    "apply refused STRUCTURALLY — the signer's Key is not held; parked \
+                     until it lands, quiet meanwhile (CIRISEdge#679)"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// CIRISEdge#679 — rows parked on an absent signer since construction.
+    #[must_use]
+    pub fn rows_parked_on_signer(&self) -> usize {
+        self.rows_parked_on_signer
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#679 — rows released by a signer's `Key` admit since construction.
+    #[must_use]
+    pub fn signer_releases(&self) -> usize {
+        self.signer_releases
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -9343,6 +9457,89 @@ pub(crate) mod tests {
         assert!(!bridge.retry_suppressed(EnvelopeKind::Organization, &superseding));
         // …and it is scoped to the plane the verdict was reached on.
         assert!(!bridge.retry_suppressed(EnvelopeKind::Key, &hash));
+    }
+
+    /// CIRISEdge#679 — an attestation whose attester this directory does not
+    /// hold is refused (correctly, fail-closed) and, because the named signer
+    /// is GENUINELY absent, PARKED on that signer under the terminal schedule:
+    /// quiet long past every transient window, so the canonical stops paying a
+    /// Deliver + verify every 20…300 s for a row it structurally cannot admit.
+    /// Driven through the real choke (`apply_envelope_bytes`), so the park is a
+    /// consequence of the outcome the field produces, not of a hand-built
+    /// disposition.
+    #[tokio::test]
+    async fn an_attestation_from_an_unknown_attester_is_parked_on_that_signer() {
+        // NO keys registered: `stranger-x` is unknown to this directory.
+        let (_backend, bridge) = make_bridge(&[]);
+        let bytes = fixture_federation_attestation_bytes("stranger-x", "stranger-x");
+        let hash: [u8; 32] = Sha256::digest(&bytes).into();
+
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Attestation, &bytes, Some("peer-relay"))
+            .await;
+        let ApplyOutcome::Refused { reason, retry } = &outcome else {
+            panic!("an unknown attester must be refused, got {outcome:?}");
+        };
+        assert_eq!(
+            *retry,
+            RetryDisposition::Transient,
+            "the classification is untouched by #679 (an ambiguous token stays transient): {reason}"
+        );
+        assert_eq!(bridge.rows_parked_on_signer(), 1, "parked once");
+        assert_eq!(bridge.refusal_backoff.parked_on_signer_len(), 1);
+        assert!(bridge.retry_suppressed(EnvelopeKind::Attestation, &hash));
+        // Long past the whole transient schedule — a plain #544 window would
+        // have re-asked ~12 times by now.
+        let much_later = Instant::now()
+            + crate::replication::refusal_backoff::TRANSIENT_CAP
+            + std::time::Duration::from_secs(60);
+        assert!(
+            bridge
+                .refusal_backoff
+                .suppressed_at(EnvelopeKind::Attestation, &hash, much_later),
+            "a parked row is quiet on the TERMINAL schedule, not the transient one"
+        );
+        // Released by name: the next round's want asks again at once.
+        assert_eq!(bridge.refusal_backoff.release_signer("stranger-x"), 1);
+        assert!(!bridge.retry_suppressed(EnvelopeKind::Attestation, &hash));
+    }
+
+    /// CIRISEdge#679 — the convergence half: a `Key` admitted THROUGH THE CHOKE
+    /// releases every row parked on that key, so a row that arrived a round
+    /// before its signer registered is re-asked on the next round, not after
+    /// a 30-minute park. The row is parked directly (its signing is not what
+    /// this test is about); the release rides the real Key apply path.
+    #[tokio::test]
+    async fn a_key_admitted_through_the_choke_releases_the_rows_parked_on_it() {
+        let record = minted_key_record("k-late-signer", identity_type::NODE, 0x29).await;
+        let (_backend, bridge) = make_bridge(std::slice::from_ref(&record.key_id));
+        let parked = [0xABu8; 32];
+        bridge.refusal_backoff.record_waiting_on_at(
+            EnvelopeKind::Attestation,
+            parked,
+            &record.key_id,
+            Instant::now(),
+        );
+        assert!(bridge.retry_suppressed(EnvelopeKind::Attestation, &parked));
+
+        let key_bytes = serde_json::to_vec(&SignedKeyRecord { record }).expect("serialize key");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::Key, &key_bytes, Some("peer-x"))
+            .await;
+        assert!(
+            outcome.is_admitted(),
+            "the late signer's key admits: {outcome:?}"
+        );
+        assert_eq!(
+            bridge.signer_releases(),
+            1,
+            "the choke released the parked row"
+        );
+        assert!(
+            !bridge.retry_suppressed(EnvelopeKind::Attestation, &parked),
+            "released: the next want asks for the row immediately"
+        );
+        assert_eq!(bridge.refusal_backoff.parked_on_signer_len(), 0);
     }
 
     /// CIRISEdge#544 — suppression gates the ASK, never the ADMIT. A row this

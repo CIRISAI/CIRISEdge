@@ -173,12 +173,21 @@ struct Entry {
     disposition: RetryDisposition,
     /// When this node may ask for these bytes again.
     retry_at: Instant,
+    /// CIRISEdge#679 — the signer whose `Key` row this row is PARKED on, if
+    /// the refusal was structural (the signer is absent from the directory).
+    /// Indexed in [`State::by_signer`] so the Key admit releases every row at
+    /// once; `None` for an ordinary #544 window.
+    waiting_on: Option<String>,
 }
 
 struct State {
     entries: HashMap<RowKey, Entry>,
     /// Eviction order; front is oldest. Capped at `max_keys`.
     order: VecDeque<RowKey>,
+    /// CIRISEdge#679 — signer → the rows parked on its `Key`. Kept in
+    /// lockstep with `entries` (insert on park, remove on clear/evict), so a
+    /// release never touches a row that was already forgotten.
+    by_signer: HashMap<String, Vec<RowKey>>,
 }
 
 /// The node-wide refusal memory.
@@ -223,6 +232,7 @@ impl RefusalBackoff {
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 order: VecDeque::new(),
+                by_signer: HashMap::new(),
             }),
             max_keys: max_keys.max(1),
         }
@@ -257,11 +267,7 @@ impl RefusalBackoff {
 
         // New key — evict oldest first if at capacity (front-drop, matching
         // `LogThrottle`), so a peer cycling hashes cannot grow this unbounded.
-        if st.order.len() >= self.max_keys {
-            if let Some(evict) = st.order.pop_front() {
-                st.entries.remove(&evict);
-            }
-        }
+        Self::evict_if_full(&mut st, self.max_keys);
         let window = disposition.window(1);
         st.entries.insert(
             key,
@@ -269,10 +275,137 @@ impl RefusalBackoff {
                 attempts: 1,
                 disposition,
                 retry_at: now + window,
+                waiting_on: None,
             },
         );
         st.order.push_back(key);
         window
+    }
+
+    /// CIRISEdge#679 — book a STRUCTURAL refusal: `(kind, envelope_hash)` was
+    /// refused because `signer`'s `Key` row is absent from this directory, and
+    /// re-asking cannot change that until the key lands. The row is parked on
+    /// the signer under the TERMINAL schedule (`TERMINAL_BASE` doubling to
+    /// `TERMINAL_CAP` — never silence) and indexed, so
+    /// [`Self::release_signer`] frees every row parked on that key the instant
+    /// the key admits. Until then the ask is quiet; a peer that pushes the
+    /// bytes anyway is still applied on its merits (the #544 rule: this gates
+    /// the ASK, never the ADMIT).
+    ///
+    /// Why terminal-shaped rather than the 20 s transient window: the missing
+    /// row is not "still replicating" in any sense this node can act on — the
+    /// Key plane is `SelfOwn`, so a third party's key never arrives from the
+    /// peer that offered the row, and the one recovery this node has (a
+    /// `Pull` for the signer's own key, #552 B) either answers or it does not.
+    /// What DOES move the verdict is the key landing, and that is what the
+    /// index is for. A row parked here costs at most ~4 asks a day instead of
+    /// 12 an hour.
+    pub fn record_waiting_on_at(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: [u8; 32],
+        signer: &str,
+        now: Instant,
+    ) -> Duration {
+        let key = (kind, envelope_hash);
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let attempts = if let Some(e) = st.entries.get_mut(&key) {
+            e.attempts = e.attempts.saturating_add(1);
+            e.attempts
+        } else {
+            Self::evict_if_full(&mut st, self.max_keys);
+            st.entries.insert(
+                key,
+                Entry {
+                    attempts: 1,
+                    disposition: RetryDisposition::Terminal,
+                    retry_at: now,
+                    waiting_on: None,
+                },
+            );
+            st.order.push_back(key);
+            1
+        };
+        let window = RetryDisposition::Terminal.window(attempts);
+        let previous = {
+            let e = st.entries.get_mut(&key).expect("inserted above");
+            e.disposition = RetryDisposition::Terminal;
+            e.retry_at = now + window;
+            e.waiting_on.replace(signer.to_owned())
+        };
+        // Re-parked on a different signer: drop the old index entry.
+        if let Some(old) = previous {
+            if old != signer {
+                Self::unindex(&mut st.by_signer, &old, &key);
+            }
+        }
+        let rows = st.by_signer.entry(signer.to_owned()).or_default();
+        if !rows.contains(&key) {
+            rows.push(key);
+        }
+        window
+    }
+
+    /// CIRISEdge#679 — `signer`'s `Key` row landed: forget every row parked on
+    /// it, so the next round's `want` asks for them immediately. Returns how
+    /// many rows were released (the witness that the park→release path fired).
+    pub fn release_signer(&self, signer: &str) -> usize {
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(rows) = st.by_signer.remove(signer) else {
+            return 0;
+        };
+        let mut released = 0;
+        for key in rows {
+            if st.entries.remove(&key).is_some() {
+                st.order.retain(|k| *k != key);
+                released += 1;
+            }
+        }
+        released
+    }
+
+    /// CIRISEdge#679 — how many rows are currently parked on an absent signer's
+    /// `Key`. The structural-refusal witness: a bound nobody can observe is the
+    /// kind that silently stops holding.
+    #[must_use]
+    pub fn parked_on_signer_len(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .by_signer
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+
+    /// Front-drop one entry when at capacity (matching `LogThrottle`), so a
+    /// peer cycling hashes cannot grow the memory unbounded. Keeps the signer
+    /// index in lockstep.
+    fn evict_if_full(st: &mut State, max_keys: usize) {
+        if st.order.len() >= max_keys {
+            if let Some(evict) = st.order.pop_front() {
+                if let Some(e) = st.entries.remove(&evict) {
+                    if let Some(signer) = e.waiting_on {
+                        Self::unindex(&mut st.by_signer, &signer, &evict);
+                    }
+                }
+            }
+        }
+    }
+
+    fn unindex(by_signer: &mut HashMap<String, Vec<RowKey>>, signer: &str, key: &RowKey) {
+        if let Some(rows) = by_signer.get_mut(signer) {
+            rows.retain(|k| k != key);
+            if rows.is_empty() {
+                by_signer.remove(signer);
+            }
+        }
     }
 
     /// Should the round's `want` DROP `(kind, envelope_hash)` at `now`?
@@ -307,8 +440,11 @@ impl RefusalBackoff {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if st.entries.remove(&key).is_some() {
+        if let Some(e) = st.entries.remove(&key) {
             st.order.retain(|k| *k != key);
+            if let Some(signer) = e.waiting_on {
+                Self::unindex(&mut st.by_signer, &signer, &key);
+            }
         }
     }
 
@@ -327,6 +463,85 @@ impl RefusalBackoff {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests_679 {
+    use super::*;
+
+    fn h(seed: u8) -> [u8; 32] {
+        let mut x = [0u8; 32];
+        x[0] = seed;
+        x
+    }
+
+    /// CIRISEdge#679 — a parked row is quiet on the TERMINAL schedule (every
+    /// transient window would have elapsed long before) and is released the
+    /// instant its signer's key lands; a row parked on another signer is
+    /// untouched.
+    #[test]
+    fn rows_parked_on_a_signer_stay_quiet_until_that_signer_is_released() {
+        let b = RefusalBackoff::new();
+        let now = Instant::now();
+        let w = b.record_waiting_on_at(EnvelopeKind::Attestation, h(1), "stranger-a", now);
+        b.record_waiting_on_at(EnvelopeKind::Attestation, h(2), "stranger-a", now);
+        b.record_waiting_on_at(EnvelopeKind::Attestation, h(3), "stranger-b", now);
+        assert_eq!(w, TERMINAL_BASE, "the first park earns the terminal base");
+        assert_eq!(b.parked_on_signer_len(), 3);
+        let later = now + TRANSIENT_CAP + Duration::from_secs(1);
+        assert!(
+            b.suppressed_at(EnvelopeKind::Attestation, &h(1), later),
+            "still quiet past every transient window"
+        );
+        assert_eq!(b.release_signer("stranger-a"), 2, "both rows on stranger-a");
+        assert!(!b.suppressed_at(EnvelopeKind::Attestation, &h(1), now));
+        assert!(!b.suppressed_at(EnvelopeKind::Attestation, &h(2), now));
+        assert!(
+            b.suppressed_at(EnvelopeKind::Attestation, &h(3), now),
+            "stranger-b's row is untouched"
+        );
+        assert_eq!(b.parked_on_signer_len(), 1);
+        assert_eq!(b.release_signer("stranger-a"), 0, "idempotent");
+        assert_eq!(b.release_signer("nobody"), 0);
+    }
+
+    /// The index never outlives its entry: `clear` (the row landed) and
+    /// front-drop eviction both drop the park, so a later release cannot
+    /// resurrect a forgotten row or miscount.
+    #[test]
+    fn clear_and_eviction_keep_the_signer_index_in_lockstep() {
+        let b = RefusalBackoff::with_capacity(2);
+        let now = Instant::now();
+        b.record_waiting_on_at(EnvelopeKind::Attestation, h(1), "s", now);
+        b.clear(EnvelopeKind::Attestation, &h(1));
+        assert_eq!(b.parked_on_signer_len(), 0);
+        assert_eq!(b.release_signer("s"), 0);
+        b.record_waiting_on_at(EnvelopeKind::Attestation, h(1), "s", now);
+        b.record_waiting_on_at(EnvelopeKind::Attestation, h(2), "s", now);
+        // A third entry evicts h(1) (front-drop).
+        b.record_at(EnvelopeKind::Key, h(9), RetryDisposition::Transient, now);
+        assert_eq!(b.len(), 2);
+        assert_eq!(
+            b.parked_on_signer_len(),
+            1,
+            "the evicted park left the index"
+        );
+        assert_eq!(b.release_signer("s"), 1);
+        assert_eq!(b.len(), 1, "only the unrelated Key entry remains");
+    }
+
+    /// Re-parking the same row on a different signer moves the index; the
+    /// attempt count keeps doubling toward the cap, never resets on a re-park.
+    #[test]
+    fn a_re_park_moves_the_index_and_keeps_doubling() {
+        let b = RefusalBackoff::new();
+        let now = Instant::now();
+        let w1 = b.record_waiting_on_at(EnvelopeKind::Attestation, h(1), "s1", now);
+        let w2 = b.record_waiting_on_at(EnvelopeKind::Attestation, h(1), "s2", now);
+        assert_eq!(w2, w1 * 2);
+        assert_eq!(b.release_signer("s1"), 0, "no longer parked on s1");
+        assert_eq!(b.release_signer("s2"), 1);
     }
 }
 
