@@ -188,6 +188,19 @@ fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> Grou
         // a_pointer_copied_onto_another_authors_row_does_not_open` performs a
         // real substitution against a real community DEK and still binds here.
         B::SealDidNotOpen { .. } => GroupContentError::SealMismatch { sha256_hex },
+        // persist v47.2.0 (CIRISPersist#853, CC 2.3 at the bytes plane;
+        // CIRISEdge#669): the referencing row was retired. Typed, because a
+        // withdrawn file must never read as "not here" or as a substrate
+        // fault — it is the subject's retraction, honoured.
+        B::Withdrawn {
+            attestation_id,
+            withdraws_id,
+            ..
+        } => GroupContentError::Withdrawn {
+            sha256_hex,
+            attestation_id: attestation_id.clone(),
+            withdraws_id: withdraws_id.clone(),
+        },
         other => GroupContentError::Substrate(other.to_string()),
     }
 }
@@ -399,6 +412,30 @@ impl GroupContentStore for PersistGroupContentStore {
 
 #[cfg(test)]
 mod tests {
+    /// CIRISEdge#669 — persist's typed `Withdrawn` is typed here too, never
+    /// `Substrate(..)` (where it landed until this arm) and never `NotHeld`.
+    #[test]
+    fn a_withdrawn_blob_is_a_typed_withdrawn_answer() {
+        use ciris_persist::federation::BlobError;
+        let e = BlobError::Withdrawn {
+            sha256_hex: "cd".repeat(32),
+            attestation_id: "row-9".into(),
+            withdraws_id: "withdraws-9".into(),
+        };
+        match super::map_err("cd".repeat(32), &e) {
+            super::GroupContentError::Withdrawn {
+                sha256_hex,
+                attestation_id,
+                withdraws_id,
+            } => {
+                assert_eq!(sha256_hex, "cd".repeat(32));
+                assert_eq!(attestation_id, "row-9");
+                assert_eq!(withdraws_id, "withdraws-9");
+            }
+            other => panic!("a withdrawn reference must be typed Withdrawn, got {other:?}"),
+        }
+    }
+
     use super::*;
     use crate::group_content::ContentField;
 

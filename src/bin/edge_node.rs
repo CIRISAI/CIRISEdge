@@ -2225,9 +2225,12 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
                     pull_sink: None,
                     revocations: Some(ciris_edge::replication::RevocationWiring {
                         register: Arc::new(ciris_edge::blob_swarm::RevocationRegister::default()),
-                        evictor: Some(
-                            Arc::clone(&directory) as Arc<dyn ciris_edge::blob_swarm::BlobEvictor>
-                        ),
+                        // CIRISEdge#669 — the ENGINE, not the bare backend:
+                        // eviction retracts this node's holds_bytes claims
+                        // (signed withdraws) before it deletes, and only the
+                        // engine holds the signer (persist `evict_blob`).
+                        evictor: Some(Arc::new(engine.0.clone())
+                            as Arc<dyn ciris_edge::blob_swarm::BlobEvictor>),
                     }),
                 }),
                 ..Default::default()

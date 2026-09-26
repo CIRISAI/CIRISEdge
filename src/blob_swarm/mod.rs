@@ -568,6 +568,17 @@ pub fn serve_result_to_chunk(
         // it should. Failing closed kept it safe; it did not make it true.
         Err(BlobError::NotHeld { .. } | BlobError::Evicted { .. }) => Ok(None),
 
+        // persist v47.2.0 (CIRISPersist#853/#862, CC 2.3 at the bytes plane;
+        // CIRISEdge#669): the referencing row was retired — persist's fold is
+        // authoritative (by reference, `evidence_refs` OR a typed
+        // `BlobPointer`), wider than edge's own #606 register, which knows
+        // only the rows it recorded. `Withdrawn` is the ONE refusal the
+        // fetcher aborts on instead of walking to the next holder; leaving
+        // it to the wildcard below answered `PolicyDenied` — "this node HAS
+        // the bytes and is declining" — and sent the peer hunting for bytes
+        // every holder had been told to refuse.
+        Err(BlobError::Withdrawn { .. }) => Err(ChunkSourceRefusal::Withdrawn),
+
         // Capacity: clears when the host disk recovers, never on retry.
         Err(BlobError::DiskPressureProxyRefused { .. }) => Err(ChunkSourceRefusal::DiskPressure),
 
@@ -2013,12 +2024,42 @@ mod tests {
                 BlobError::Backend("db gone".into()),
                 Err(ChunkSourceRefusal::PolicyDenied),
             ),
+            // CIRISEdge#669 — the v47.2.0 variant is mapped by NAME, not by
+            // the wildcard: a withdrawn reference is `Withdrawn` on the wire.
+            (
+                BlobError::Withdrawn {
+                    sha256_hex: sha.clone(),
+                    attestation_id: "row-1".into(),
+                    withdraws_id: "withdraws-1".into(),
+                },
+                Err(ChunkSourceRefusal::Withdrawn),
+            ),
         ];
 
         for (err, want) in cases {
             let label = err.to_string();
             assert_eq!(serve_result_to_chunk(Err(err)), want, "mapping for {label}");
         }
+    }
+
+    /// CIRISEdge#669 — end to end from persist's typed refusal to the wire
+    /// word: a `BlobError::Withdrawn` from the serve door reaches the peer
+    /// as `MissReason::Withdrawn` (the abort word), never `PolicyDenied`.
+    #[test]
+    fn a_withdrawn_reference_from_the_persist_door_is_withdrawn_on_the_wire() {
+        use ciris_persist::federation::BlobError;
+        let refusal = serve_result_to_chunk(Err(BlobError::Withdrawn {
+            sha256_hex: "ab".repeat(32),
+            attestation_id: "row-1".into(),
+            withdraws_id: "withdraws-1".into(),
+        }))
+        .expect_err("a withdrawn reference is a refusal, not an absence");
+        assert_eq!(refusal, ChunkSourceRefusal::Withdrawn);
+        assert_eq!(
+            refusal.to_miss_reason(),
+            crate::messages::MissReason::Withdrawn,
+            "the peer is told to STOP hunting, not that this node is declining"
+        );
     }
 
     /// persist v44.0.0 (#832) — a SEALED v2 DAG passes edge's structural
