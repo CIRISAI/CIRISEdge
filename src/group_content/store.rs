@@ -33,6 +33,23 @@ pub enum GroupContentError {
         /// Hex at-rest sha the read targeted.
         sha256_hex: String,
     },
+    /// The row referencing the bytes was withdrawn (CC 2.3 at the bytes
+    /// plane — persist v47.2.0, CIRISPersist#853; CIRISEdge#669). Not
+    /// [`Self::NotHeld`]: the bytes may well be here, and the remedy is
+    /// none — a subject pulled their row, so the bytes stop. Named so a
+    /// caller never shows "not found" for a deliberate retraction.
+    #[error(
+        "withdrawn: {sha256_hex} — its binding row {attestation_id} was retired by \
+         {withdraws_id}"
+    )]
+    Withdrawn {
+        /// Hex at-rest sha the read targeted.
+        sha256_hex: String,
+        /// The last live binding row, now retired.
+        attestation_id: String,
+        /// The `withdraws` (or `recants`) that retired it.
+        withdraws_id: String,
+    },
     /// The bytes were swept by a retention sweep. persist distinguishes
     /// this from [`Self::NotHeld`] so an operator can tell "swept" from
     /// "wrong handle"; the remedy differs (there is none for swept).

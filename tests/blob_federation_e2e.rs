@@ -1549,7 +1549,7 @@ async fn an_authorized_withdraws_that_arrived_first_evicts_when_its_target_lands
     let register = Arc::new(RevocationRegister::default());
     let serve = PersistBlobChunkSource::new(node_b.store.engine().clone())
         .with_revocations(Some(Arc::clone(&register)));
-    let evictor: &dyn BlobEvictor = &*node_b.dir;
+    let evictor: &dyn BlobEvictor = node_b.store.engine();
 
     let row = signed_content_row(&alice, room, &sealed.pointer).await;
     node_a
@@ -1697,7 +1697,7 @@ async fn a_withdraws_revokes_the_bytes_on_a_holder_and_an_unauthorized_one_is_in
     let register = Arc::new(RevocationRegister::default());
     let serve = PersistBlobChunkSource::new(node_b.store.engine().clone())
         .with_revocations(Some(Arc::clone(&register)));
-    let evictor: &dyn BlobEvictor = &*node_b.dir;
+    let evictor: &dyn BlobEvictor = node_b.store.engine();
     let sha_hex = hex::encode(sha);
     assert_eq!(register.verdict(&sha), BytesVerdict::Unknown);
     assert!(

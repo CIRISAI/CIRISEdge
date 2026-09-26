@@ -1290,6 +1290,10 @@ pub enum UnopenedReason {
     NotGranted { detail: String },
     /// Held once, swept: the epoch was destroyed or the bytes evicted.
     Evicted { detail: String },
+    /// The row referencing the bytes was withdrawn by its subject (CC 2.3
+    /// at the bytes plane; persist v47.2.0, CIRISEdge#669). A verdict, not
+    /// a state to wait through: the retraction is honoured, the bytes stop.
+    Withdrawn { detail: String },
     /// The seal did not open under the AAD rebuilt from this row — the
     /// row and the bytes disagree, or the bytes were tampered with.
     SealMismatch { detail: String },
@@ -1310,6 +1314,7 @@ impl UnopenedReason {
             Self::NotFetched { .. } => "not_fetched",
             Self::NotGranted { .. } => "not_granted",
             Self::Evicted { .. } => "evicted",
+            Self::Withdrawn { .. } => "withdrawn",
             Self::SealMismatch { .. } => "seal_mismatch",
             Self::MalformedRow { .. } => "malformed_row",
             Self::NotText { .. } => "not_text",
@@ -1324,6 +1329,7 @@ impl UnopenedReason {
             Self::NotFetched { detail }
             | Self::NotGranted { detail }
             | Self::Evicted { detail }
+            | Self::Withdrawn { detail }
             | Self::SealMismatch { detail }
             | Self::MalformedRow { detail }
             | Self::NotText { detail }
@@ -1347,6 +1353,7 @@ impl UnopenedReason {
             E::NotHeld { .. } => Self::NotFetched { detail },
             E::NotGranted { .. } => Self::NotGranted { detail },
             E::Evicted { .. } => Self::Evicted { detail },
+            E::Withdrawn { .. } => Self::Withdrawn { detail },
             E::SealMismatch { .. } => Self::SealMismatch { detail },
             E::Substrate(_) => Self::Substrate { detail },
         }
