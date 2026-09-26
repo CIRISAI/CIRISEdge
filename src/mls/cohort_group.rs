@@ -989,6 +989,13 @@ struct CohortGroupInner {
     /// The epoch ledger — see [`EpochLedger`]. Persisted in
     /// [`LEDGER_SLOT`] on every persist, before the head moves.
     ledger: EpochLedger,
+    /// CIRISEdge#676 (`FSD/MLS_STATE_AT_REST.md` §4.1) — when each CURRENT
+    /// member was added, as this node recorded it: the creator at creation,
+    /// the commit claim's instant for adds this node makes, the observer
+    /// claim's instant for remote commits, every member at Welcome time on
+    /// the joiner. Persisted beside every snapshot; the reference point a
+    /// re-published KeyPackage is compared against (a restart signal).
+    member_joins: HashMap<String, DateTime<Utc>>,
 }
 
 impl CohortGroupInner {
@@ -1044,6 +1051,7 @@ impl CohortGroupInner {
         let blob = self.snapshot();
         let ledger = serde_json::to_vec(&self.ledger)
             .map_err(|e| CohortGroupError::LedgerMalformed(format!("encode: {e}")));
+        let joins = self.member_joins.clone();
         async move {
             let epoch = self.epoch();
             if epoch >= LEDGER_SLOT {
@@ -1061,6 +1069,13 @@ impl CohortGroupInner {
             // peers (CIRISEdge#604).
             self.store
                 .group_state_put(&self.community_id, LEDGER_SLOT, &ledger)
+                .await?;
+            // (1c) the member-join instants, beside the ledger and before the
+            // head moves (CIRISEdge#676): a restart that sees the new head
+            // must also see when its members were added, or its rejoin
+            // signal compares a fresh KeyPackage against nothing.
+            self.store
+                .member_joins_put(&self.community_id, &joins)
                 .await?;
             // (2) then the head pointer.
             self.store
@@ -1237,6 +1252,7 @@ impl CohortGroupInner {
                 key_package: key_package_bytes,
             },
         );
+        self.member_joins.insert(key_id.to_string(), at);
         self.persist_and_seal(commit, welcome, claim).await
     }
 
@@ -1264,6 +1280,7 @@ impl CohortGroupInner {
                 key_id: key_id.to_string(),
             },
         );
+        self.member_joins.remove(key_id);
         self.persist_and_seal(commit, welcome, claim).await
     }
 
@@ -1435,6 +1452,7 @@ impl CohortGroup {
             held_commits: BTreeMap::new(),
             own_key_id: own_key_id.to_string(),
             ledger: EpochLedger::default(),
+            member_joins: HashMap::from([(own_key_id.to_string(), now_ms())]),
         };
 
         // Persist the genesis epoch before handing out a handle: a
@@ -1573,6 +1591,13 @@ impl CohortGroup {
             .into_group(key_material.provider.as_ref())
             .map_err(|e| CohortGroupError::WelcomeRejected(format!("into_group: {e:?}")))?;
 
+        // Every member the Welcome shows is 'added' as of the join, for the
+        // joiner's own restart-signal bookkeeping (FSD §4.1).
+        let joined_at = now_ms();
+        let member_joins: HashMap<String, DateTime<Utc>> = credential_ids(&group)
+            .into_iter()
+            .map(|m| (m, joined_at))
+            .collect();
         let inner = CohortGroupInner {
             community_id: community_id.to_string(),
             own_key_id: key_material.key_id.clone(),
@@ -1583,6 +1608,7 @@ impl CohortGroup {
             retained_epochs: retained_epochs.max(1),
             held_commits: BTreeMap::new(),
             ledger: EpochLedger::default(),
+            member_joins,
         };
 
         // Persist the joined epoch before handing out a handle — same
@@ -1674,6 +1700,10 @@ impl CohortGroup {
                 .map_err(|e| CohortGroupError::LedgerMalformed(format!("decode: {e}")))?,
             None => EpochLedger::default(),
         };
+        let member_joins = store
+            .member_joins_get(community_id)
+            .await?
+            .unwrap_or_default();
         Ok(Some(Self {
             community_id: Arc::from(community_id),
             inner: Arc::new(Mutex::new(CohortGroupInner {
@@ -1686,6 +1716,7 @@ impl CohortGroup {
                 held_commits: BTreeMap::new(),
                 own_key_id,
                 ledger,
+                member_joins,
             })),
         }))
     }
@@ -1702,13 +1733,19 @@ impl CohortGroup {
 
     /// The CIRIS `key_id`s of every member, in leaf order.
     pub async fn member_key_ids(&self) -> Vec<String> {
-        self.inner
-            .lock()
-            .await
-            .group
-            .members()
-            .map(|m| String::from_utf8_lossy(m.credential.serialized_content()).into_owned())
-            .collect()
+        credential_ids(&self.inner.lock().await.group)
+    }
+
+    /// CIRISEdge#676 — when `key_id` was added to this group, as this node
+    /// recorded it (`FSD/MLS_STATE_AT_REST.md` §4.1), or `None` for a
+    /// non-member / a member whose add predates the record.
+    pub async fn member_added_at(&self, key_id: &str) -> Option<DateTime<Utc>> {
+        self.inner.lock().await.member_joins.get(key_id).copied()
+    }
+
+    /// CIRISEdge#676 — every current member's recorded add instant.
+    pub async fn member_joins(&self) -> HashMap<String, DateTime<Utc>> {
+        self.inner.lock().await.member_joins.clone()
     }
 
     /// Whether the group is still operational (a removed member's
@@ -1907,6 +1944,7 @@ impl CohortGroup {
     ) -> Result<ClaimedApplyOutcome, CohortGroupError> {
         let mut guard = self.inner.lock().await;
         let inner = &mut *guard;
+        let before = credential_ids(&inner.group);
 
         let framed_epoch = peek_commit_epoch(commit)?;
         let current = inner.epoch();
@@ -1957,6 +1995,16 @@ impl CohortGroup {
         inner.ledger.prune(inner.epoch(), inner.retained_epochs);
         let observer =
             claim.unwrap_or_else(|| CommitClaim::new(now_ms(), inner.own_key_id.clone()));
+        // CIRISEdge#676 — members this commit added are 'added' at the
+        // claim's instant; members it removed leave the join map.
+        let after = credential_ids(&inner.group);
+        let added_at = observer.asserted_at();
+        for m in &after {
+            if !before.contains(m) {
+                inner.member_joins.entry(m.clone()).or_insert(added_at);
+            }
+        }
+        inner.member_joins.retain(|m, _| after.contains(m));
         let sealed = inner.persist_and_seal(Vec::new(), None, observer).await?;
         Ok(ClaimedApplyOutcome::Applied(sealed.epoch()))
     }
@@ -2086,6 +2134,101 @@ fn peek_commit_epoch(commit: &[u8]) -> Result<u64, CohortGroupError> {
 /// snapshot design possible without implementing the ~45-method
 /// synchronous `StorageProvider` over an async KV (CIRISEdge#217 —
 /// see module docs).
+/// The CIRIS `key_id`s of a group's current members (the basic credential
+/// each leaf carries).
+fn credential_ids(group: &MlsGroup) -> Vec<String> {
+    group
+        .members()
+        .map(|m| String::from_utf8_lossy(m.credential.serialized_content()).into_owned())
+        .collect()
+}
+
+/// CIRISEdge#676 (`FSD/MLS_STATE_AT_REST.md` §3) — the on-disk form of a
+/// [`CohortKeyMaterial`]: `CKM1` ‖ u32 pk_len ‖ signer public key ‖ u32
+/// kid_len ‖ key_id ‖ the provider's storage snapshot (the same codec as
+/// group state). Sealed by the store it is written to.
+const KEY_MATERIAL_MAGIC: &[u8; 4] = b"CKM1";
+
+/// Encode pending-join material for the sealed store.
+///
+/// # Errors
+/// [`CohortGroupError::SnapshotMalformed`] if the storage map cannot be
+/// encoded.
+pub fn key_material_to_bytes(material: &CohortKeyMaterial) -> Result<Vec<u8>, CohortGroupError> {
+    let map = material
+        .provider
+        .storage()
+        .values
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    let snapshot = encode_snapshot(&map)?;
+    let pk = material.signer.to_public_vec();
+    let kid = material.key_id.as_bytes();
+    let pk_len = u32::try_from(pk.len())
+        .map_err(|_| CohortGroupError::SnapshotMalformed("signer key too long".into()))?;
+    let kid_len = u32::try_from(kid.len())
+        .map_err(|_| CohortGroupError::SnapshotMalformed("key id too long".into()))?;
+    let mut out = Vec::with_capacity(4 + 8 + pk.len() + kid.len() + snapshot.len());
+    out.extend_from_slice(KEY_MATERIAL_MAGIC);
+    out.extend_from_slice(&pk_len.to_be_bytes());
+    out.extend_from_slice(&pk);
+    out.extend_from_slice(&kid_len.to_be_bytes());
+    out.extend_from_slice(kid);
+    out.extend_from_slice(&snapshot);
+    Ok(out)
+}
+
+/// Decode pending-join material written by [`key_material_to_bytes`] into a
+/// fresh provider that can consume the matching Welcome.
+///
+/// # Errors
+/// [`CohortGroupError::SnapshotMalformed`] on a foreign or truncated blob;
+/// [`CohortGroupError::SignerMissing`] if the signer is not in the snapshot.
+pub fn key_material_from_bytes(bytes: &[u8]) -> Result<CohortKeyMaterial, CohortGroupError> {
+    let bad = |m: &str| CohortGroupError::SnapshotMalformed(format!("pending join: {m}"));
+    if bytes.len() < 12 || &bytes[..4] != KEY_MATERIAL_MAGIC {
+        return Err(bad("magic"));
+    }
+    let mut at = 4;
+    let take_u32 = |at: &mut usize| -> Result<usize, CohortGroupError> {
+        let end = *at + 4;
+        let v = u32::from_be_bytes(
+            bytes
+                .get(*at..end)
+                .ok_or_else(|| bad("length"))?
+                .try_into()
+                .map_err(|_| bad("length"))?,
+        );
+        *at = end;
+        Ok(v as usize)
+    };
+    let pk_len = take_u32(&mut at)?;
+    let pk = bytes
+        .get(at..at + pk_len)
+        .ok_or_else(|| bad("signer key"))?
+        .to_vec();
+    at += pk_len;
+    let kid_len = take_u32(&mut at)?;
+    let key_id = String::from_utf8(
+        bytes
+            .get(at..at + kid_len)
+            .ok_or_else(|| bad("key id"))?
+            .to_vec(),
+    )
+    .map_err(|_| bad("key id utf-8"))?;
+    at += kid_len;
+    let map = decode_snapshot(&bytes[at..])?;
+    let provider = Arc::new(LibcruxProvider::default());
+    restore_storage(provider.storage(), map);
+    let signer = SignatureKeyPair::read(provider.storage(), &pk, SignatureScheme::ED25519)
+        .ok_or_else(|| CohortGroupError::SignerMissing(key_id.clone()))?;
+    Ok(CohortKeyMaterial {
+        provider,
+        signer,
+        key_id,
+    })
+}
+
 fn restore_storage(storage: &MemStorage, map: HashMap<Vec<u8>, Vec<u8>>) {
     let mut guard = storage
         .values
@@ -2233,6 +2376,10 @@ impl CohortGroups {
             self.retained_epochs,
         )
         .await?;
+        // CIRISEdge#676 — the room's state supersedes the pending material.
+        if let Err(e) = self.store.pending_join_delete(community_id).await {
+            tracing::warn!(community_id, error = %e, "pending-join material not cleared after join");
+        }
         live.insert(community_id.to_string(), handle.clone());
         Ok(handle)
     }
@@ -2244,6 +2391,53 @@ impl CohortGroups {
     /// on.
     pub async fn evict(&self, community_id: &str) -> bool {
         self.live.lock().await.remove(community_id).is_some()
+    }
+
+    /// The sealed store every group here persists through.
+    #[must_use]
+    pub fn store(&self) -> &ScopeStateProvider {
+        &self.store
+    }
+
+    /// CIRISEdge#676 (`FSD/MLS_STATE_AT_REST.md` §3) — keep a published
+    /// KeyPackage's private material across a restart, so the Welcome
+    /// sealed to it can still be consumed. One slot per room; the newest
+    /// publication wins.
+    ///
+    /// # Errors
+    /// Codec or store faults.
+    pub async fn stash_key_material(
+        &self,
+        community_id: &str,
+        material: &CohortKeyMaterial,
+    ) -> Result<(), CohortGroupError> {
+        let bytes = key_material_to_bytes(material)?;
+        self.store.pending_join_put(community_id, &bytes).await?;
+        Ok(())
+    }
+
+    /// CIRISEdge#676 — the stashed material for `community_id`, if a
+    /// KeyPackage was published and no Welcome consumed yet. A restarted
+    /// node passes it to [`Self::join`] when the Welcome arrives.
+    ///
+    /// # Errors
+    /// Store or codec faults; a foreign blob is `SnapshotMalformed`.
+    pub async fn restore_key_material(
+        &self,
+        community_id: &str,
+    ) -> Result<Option<CohortKeyMaterial>, CohortGroupError> {
+        match self.store.pending_join_get(community_id).await? {
+            None => Ok(None),
+            Some(bytes) => key_material_from_bytes(&bytes).map(Some),
+        }
+    }
+
+    /// CIRISEdge#676 (FSD §5) — every room this store holds state for.
+    ///
+    /// # Errors
+    /// Store faults.
+    pub async fn persisted_room_ids(&self) -> Result<Vec<String>, CohortGroupError> {
+        Ok(self.store.persisted_room_ids().await?)
     }
 }
 
@@ -2277,6 +2471,102 @@ mod tests {
         let add = a.add_member(joiner, kp).await.unwrap();
         let welcome = add.welcome().expect("an Add produces a Welcome").to_vec();
         (a, material, welcome)
+    }
+
+    /// CIRISEdge#676 / FSD §7 S3 — a published KeyPackage's material is
+    /// stashed, a FRESH `CohortGroups` over the same store (a restart)
+    /// restores it, the Welcome sealed to it is consumed, and the stash is
+    /// gone afterwards. The joiner's member-join map is persisted with it.
+    #[tokio::test]
+    async fn pending_join_material_survives_a_restart_and_is_consumed_once() {
+        let kv = Arc::new(XChaChaKvStore::open_in_memory(b"restart-store").unwrap());
+        let store = ScopeStateProvider::new(Arc::clone(&kv));
+        let a = CohortGroup::create(open_store(), "c-restart", "node-a", 16)
+            .await
+            .unwrap();
+        let (material, kp) = mint_cohort_key_material("node-b").unwrap();
+        // Before the restart: B published and stashed.
+        let before = CohortGroups::new(store.clone(), "node-b");
+        before
+            .stash_key_material("c-restart", &material)
+            .await
+            .unwrap();
+        drop(before);
+        drop(material);
+        let add = a.add_member("node-b", kp).await.unwrap();
+        let welcome = add.welcome().expect("welcome").to_vec();
+        // After the restart: a fresh handle over the same sealed bytes.
+        let after = CohortGroups::new(ScopeStateProvider::new(Arc::clone(&kv)), "node-b");
+        let restored = after
+            .restore_key_material("c-restart")
+            .await
+            .unwrap()
+            .expect("the stash survived");
+        assert_eq!(restored.key_id, "node-b");
+        let b = after
+            .join("c-restart", restored, &welcome)
+            .await
+            .expect("the Welcome sealed to the restored material is consumable");
+        assert_eq!(b.epoch().await, a.epoch().await);
+        assert_eq!(
+            b.destination_secret().await.unwrap().as_bytes(),
+            a.destination_secret().await.unwrap().as_bytes()
+        );
+        assert!(
+            after
+                .restore_key_material("c-restart")
+                .await
+                .unwrap()
+                .is_none(),
+            "consumed once: the stash is cleared by the join"
+        );
+        assert!(
+            b.member_added_at("node-a").await.is_some()
+                && b.member_added_at("node-b").await.is_some(),
+            "the joiner records every member as added at the join"
+        );
+        assert_eq!(
+            after.persisted_room_ids().await.unwrap(),
+            vec!["c-restart".to_string()],
+            "the room is indexed for the boot re-address"
+        );
+        // A foreign blob is refused by name, not decoded.
+        store
+            .pending_join_put("c-restart", b"not material")
+            .await
+            .unwrap();
+        assert!(matches!(
+            after.restore_key_material("c-restart").await,
+            Err(CohortGroupError::SnapshotMalformed(_))
+        ));
+    }
+
+    /// CIRISEdge#676 / FSD §4.1 — the creator's own add instant is recorded
+    /// at creation, an added member's at the commit claim's instant, and a
+    /// removed member leaves the map; all of it survives a reload.
+    #[tokio::test]
+    async fn member_join_instants_follow_adds_and_removes_across_a_reload() {
+        let kv = Arc::new(XChaChaKvStore::open_in_memory(b"joins-store").unwrap());
+        let store = ScopeStateProvider::new(Arc::clone(&kv));
+        let a = CohortGroup::create(store.clone(), "c-joins", "node-a", 16)
+            .await
+            .unwrap();
+        assert!(a.member_added_at("node-a").await.is_some());
+        let (_m, kp) = mint_cohort_key_material("node-b").unwrap();
+        let at = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let _added = a.add_member_at("node-b", kp, at).await.unwrap();
+        assert_eq!(a.member_added_at("node-b").await, Some(at));
+        let reloaded = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-joins", 16)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert_eq!(
+            reloaded.member_added_at("node-b").await,
+            Some(at),
+            "survives a reload"
+        );
+        let _removed = reloaded.remove_member("node-b").await.unwrap();
+        assert_eq!(reloaded.member_added_at("node-b").await, None);
     }
 
     #[tokio::test]
