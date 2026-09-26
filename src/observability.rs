@@ -1012,6 +1012,16 @@ pub struct EdgeMetrics {
     /// holds what was offered. Extends per-plane as persist types more
     /// refusals.
     pub key_apply_refusals_by_reason: Arc<RwLock<HashMap<String, u64>>>,
+    /// CIRISEdge#459 (persist v36.0.0 / CIRISPersist#624) — the receive-plane
+    /// mirror, reason axis for the ATTESTATION plane: policy refusals counted by
+    /// persist's stable `AttestationRefusalReason` token
+    /// (`conflicting_attestation`, `store_conflict`; a closed, append-only
+    /// contract — bounded cardinality by construction). The duplicate halves
+    /// (`Unchanged`, `Deduplicated`, `already_present_identical`) never count
+    /// here: the receiver already holds what was offered. The same-id-
+    /// different-bytes conflict that used to read `federation_backend` (a raw
+    /// SQL constraint) is now a named mesh fact.
+    pub attestation_apply_refusals_by_reason: Arc<RwLock<HashMap<String, u64>>>,
     /// CIRISEdge#522 (persist v38.2.0) — the receive plane's **door-class**
     /// axis: per-[`crate::replication::bridge::ApplyRefusalClass`] count of
     /// applies refused by one of the three doors that moved in persist
@@ -1397,6 +1407,14 @@ impl EdgeMetrics {
         *guard.entry(token.to_string()).or_insert(0) += 1;
     }
 
+    /// CIRISEdge#459 — count one TYPED Attestation-plane policy refusal by
+    /// persist's stable token (`AttestationRefusalReason::as_str()` — a closed,
+    /// append-only set, so cardinality is bounded by the persist contract).
+    pub fn inc_attestation_apply_refusal(&self, token: &str) {
+        let mut guard = self.attestation_apply_refusals_by_reason.write();
+        *guard.entry(token.to_string()).or_insert(0) += 1;
+    }
+
     /// CIRISEdge#522 — count one v38.2.0 door-class refusal by its stable
     /// token. `token` comes from
     /// [`ApplyRefusalClass::as_str`](crate::replication::bridge::ApplyRefusalClass::as_str)
@@ -1477,6 +1495,10 @@ impl EdgeMetrics {
                 .clone(),
             apply_refusals_by_kind: self.apply_refusals_by_kind.read().clone(),
             key_apply_refusals_by_reason: self.key_apply_refusals_by_reason.read().clone(),
+            attestation_apply_refusals_by_reason: self
+                .attestation_apply_refusals_by_reason
+                .read()
+                .clone(),
             apply_refusals_by_class: self.apply_refusals_by_class.read().clone(),
             replication_applied_total: self.replication_applied_total.read().clone(),
             replication_duplicate_total: self.replication_duplicate_total.read().clone(),
@@ -1553,6 +1575,9 @@ pub struct EdgeMetricsBundle {
     /// persist v24.2.0 / #565 — typed Key-plane policy refusals by persist's
     /// stable token (closed, append-only 9-token contract).
     pub key_apply_refusals_by_reason: HashMap<String, u64>,
+    /// CIRISEdge#459 — typed Attestation-plane policy refusals by persist's
+    /// stable `AttestationRefusalReason` token (closed, append-only).
+    pub attestation_apply_refusals_by_reason: HashMap<String, u64>,
     /// CIRISEdge#522 — snapshot of
     /// [`EdgeMetrics::apply_refusals_by_class`]: the three v38.2.0 apply-door
     /// classes by their stable tokens.

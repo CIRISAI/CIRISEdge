@@ -2447,6 +2447,7 @@ impl PyEdge {
     ///   # persist's stable token (closed, append-only 9-token contract).
     ///   "apply_refusals_by_kind": {"key": 3, ...},
     ///   "key_apply_refusals_by_reason": {"pubkey_swap": 3, ...},
+    ///   "attestation_apply_refusals_by_reason": {"conflicting_attestation": 88, ...},
     ///   # CIRISEdge#522 / persist v38.2.0 — the apply-DOOR class axis:
     ///   # "retry_after_roster" (transient, converges once the
     ///   # roster applies), "third_party_row" (AV-84 verdict about the row),
@@ -2636,6 +2637,12 @@ impl PyEdge {
             refusals_reason.set_item(token.as_str(), *v)?;
         }
         root.set_item("key_apply_refusals_by_reason", refusals_reason)?;
+        // CIRISEdge#459 — the Attestation plane's typed-refusal axis.
+        let att_refusals_reason = pyo3::types::PyDict::new(py);
+        for (token, v) in &bundle.attestation_apply_refusals_by_reason {
+            att_refusals_reason.set_item(token.as_str(), *v)?;
+        }
+        root.set_item("attestation_apply_refusals_by_reason", att_refusals_reason)?;
 
         // CIRISEdge#522 (persist v38.2.0) — the apply-door CLASS axis. Without
         // it, `apply_refusals_by_kind` mixes a node mid-sync whose roster has
