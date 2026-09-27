@@ -42,7 +42,7 @@ pub use boot::{readdress_persisted_rooms, InstalledRoom, ReaddressReport};
 pub use cohort_group::{key_material_from_bytes, key_material_to_bytes, CohortKeyMaterial};
 pub use cohort_group::{
     ClaimedApplyOutcome, CohortCommit, CohortGroup, CohortGroupError, CohortGroups, CohortSecret,
-    CommitApplyOutcome, CommitClaim,
+    CommitApplyOutcome, CommitClaim, MarkPlaced,
 };
 pub use scope_state::{
     open_mls_state, MlsStateUnavailable, ScopeStateProvider, ScopeStateProviderError,

@@ -92,6 +92,10 @@ fn namespace_for(community_id: &str, kind: &str) -> String {
 #[derive(Clone)]
 pub struct ScopeStateProvider {
     kv: Arc<XChaChaKvStore>,
+    /// Test-only failure injection: while set, `group_state_put` fails (a
+    /// store double for the "ack write failed" witness, CIRISEdge#697).
+    #[cfg(test)]
+    pub(crate) fail_group_state_puts: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Errors from the substrate-tier MLS state provider.
@@ -181,7 +185,11 @@ impl ScopeStateProvider {
     /// ([`XChaChaKvStore::open`]).
     #[must_use]
     pub fn new(kv: Arc<XChaChaKvStore>) -> Self {
-        Self { kv }
+        Self {
+            kv,
+            #[cfg(test)]
+            fail_group_state_puts: Arc::default(),
+        }
     }
 
     /// CIRISEdge#676 — an **in-memory** store under a random one-shot key:
@@ -278,6 +286,15 @@ impl ScopeStateProvider {
         epoch: u64,
         bytes: &[u8],
     ) -> Result<(), ScopeStateProviderError> {
+        #[cfg(test)]
+        if self
+            .fail_group_state_puts
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ScopeStateProviderError::Codec(
+                "injected put failure".into(),
+            ));
+        }
         let ns = namespace_for(community_id, KIND_GROUP_STATE);
         let key = epoch.to_be_bytes();
         self.kv.put(&ns, &key, bytes).await?;
@@ -407,6 +424,18 @@ impl ScopeStateProvider {
                 .map(Some)
                 .map_err(|e| ScopeStateProviderError::Codec(e.to_string())),
         }
+    }
+
+    /// Test-only: drop a room's join map, to reproduce a store persisted
+    /// before the map existed (CIRISEdge#695 upgrade witness).
+    #[cfg(test)]
+    pub(crate) async fn member_joins_delete(
+        &self,
+        community_id: &str,
+    ) -> Result<(), ScopeStateProviderError> {
+        let ns = namespace_for(community_id, KIND_MEMBER_JOINS);
+        self.kv.delete(&ns, b"v1").await?;
+        Ok(())
     }
 
     /// Write `{member_key_id → added_at}` for `community_id`.

@@ -458,6 +458,9 @@ pub struct CohortCommit {
     commit: Vec<u8>,
     welcome: Option<Vec<u8>>,
     claim: CommitClaim,
+    /// CIRISEdge#697 — the key ids the Welcome admits (empty when there is
+    /// no Welcome), so a recovered Add can be placed without its intent.
+    welcome_recipients: Vec<String>,
 }
 
 impl CohortCommit {
@@ -487,6 +490,23 @@ impl CohortCommit {
         &self.claim
     }
 
+    /// CIRISEdge#697 (`FSD/MLS_STATE_AT_REST.md` §4.3) — the key ids this
+    /// Commit's Welcome admits, in order; empty when there is no Welcome.
+    /// Survives a restart through the outbox, so a recovered Add is placed
+    /// with `welcome_attestation_in` to the right recipient.
+    pub fn welcome_recipients(&self) -> &[String] {
+        &self.welcome_recipients
+    }
+
+    /// CIRISEdge#697 — the stable identity of THIS commit: sha256 of the
+    /// Commit bytes. The placement ack ([`CohortGroup::mark_placed`]) is
+    /// keyed by it, because after a lost contest the same epoch can hold a
+    /// different re-proposed commit.
+    pub fn placement_id(&self) -> [u8; 32] {
+        use sha2::Digest as _;
+        sha2::Sha256::digest(&self.commit).into()
+    }
+
     /// Consume into `(epoch, commit_bytes, welcome_bytes)`.
     pub fn into_parts(self) -> (u64, Vec<u8>, Option<Vec<u8>>) {
         (self.epoch, self.commit, self.welcome)
@@ -500,6 +520,7 @@ impl std::fmt::Debug for CohortCommit {
             .field("commit_len", &self.commit.len())
             .field("welcome_len", &self.welcome.as_ref().map(Vec::len))
             .field("claim", &self.claim)
+            .field("welcome_recipients", &self.welcome_recipients)
             .finish()
     }
 }
@@ -597,6 +618,24 @@ struct OutboxEntry {
     #[serde(default, with = "b64_opt")]
     welcome: Option<Vec<u8>>,
     claim: CommitClaim,
+    /// The key ids the Welcome admits (CIRISEdge#697 review) — the intent
+    /// that named them may be pruned while the debt is retained.
+    #[serde(default)]
+    welcome_recipients: Vec<String>,
+}
+
+/// What [`CohortGroup::mark_placed`] did with an acknowledgement
+/// (CIRISEdge#697, `FSD/MLS_STATE_AT_REST.md` §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "Superseded means the ack named a commit this group no longer owes"]
+pub enum MarkPlaced {
+    /// The entry for this commit was removed, durably.
+    Removed,
+    /// No entry at the commit's epoch — already acknowledged, or never owed.
+    NotOwed,
+    /// The epoch holds a DIFFERENT commit (a re-proposal after a lost
+    /// contest): the ack is for a discarded commit and deletes nothing.
+    Superseded,
 }
 
 /// Base64 (standard) for the outbox's byte fields — a JSON number array
@@ -1111,6 +1150,7 @@ impl CohortGroupInner {
         &mut self,
         commit: Vec<u8>,
         welcome: Option<Vec<u8>>,
+        welcome_recipients: Vec<String>,
         claim: CommitClaim,
     ) -> impl std::future::Future<Output = Result<CohortCommit, CohortGroupError>> + '_ {
         let blob = self.snapshot();
@@ -1126,6 +1166,7 @@ impl CohortGroupInner {
                     commit: commit.clone(),
                     welcome: welcome.clone(),
                     claim: claim.clone(),
+                    welcome_recipients: welcome_recipients.clone(),
                 },
             );
         }
@@ -1170,6 +1211,7 @@ impl CohortGroupInner {
                 commit,
                 welcome,
                 claim,
+                welcome_recipients,
             })
         }
     }
@@ -1360,7 +1402,8 @@ impl CohortGroupInner {
             },
         );
         self.member_joins.insert(key_id.to_string(), at);
-        self.persist_and_seal(commit, welcome, claim).await
+        self.persist_and_seal(commit, welcome, vec![key_id.to_string()], claim)
+            .await
     }
 
     /// Remove a member: the committer's half of [`CohortGroup::remove_member_at`].
@@ -1388,7 +1431,8 @@ impl CohortGroupInner {
             },
         );
         self.member_joins.remove(key_id);
-        self.persist_and_seal(commit, welcome, claim).await
+        self.persist_and_seal(commit, welcome, Vec::new(), claim)
+            .await
     }
 
     /// Rotate the own leaf: the committer's half of [`CohortGroup::rotate_at`].
@@ -1411,7 +1455,8 @@ impl CohortGroupInner {
             .map(|m| serialize_mls_message(&m))
             .transpose()?;
         let claim = self.claim_local(framed, at, CommitIntent::Rotate);
-        self.persist_and_seal(commit, welcome, claim).await
+        self.persist_and_seal(commit, welcome, Vec::new(), claim)
+            .await
     }
 
     /// Roll the group back to the state it had AT `epoch` — the
@@ -1484,6 +1529,56 @@ impl std::fmt::Debug for CohortGroup {
             .field("state", &"<locked>")
             .finish_non_exhaustive()
     }
+}
+
+/// CIRISEdge#695 review (`FSD/MLS_STATE_AT_REST.md` §4.3 "Upgrade
+/// backfill") — join instants for a group persisted before the join map
+/// existed, chosen by what each is USED for:
+///
+/// - **another member**: the Rejoin signal compares its newest KeyPackage
+///   against this instant, so an EARLY instant misreads the KeyPackage the
+///   add consumed as a restart (a spurious Rejoin). The exact instant of
+///   this node's own `Add` intent when the ledger still holds it; otherwise
+///   `loaded_at` — every KeyPackage already placed predates it.
+/// - **this node**: never a Rejoin candidate; the instant feeds the host's
+///   creation-claim fallback, where EARLIER is safe. The creation claim if
+///   recorded, else the smallest claim the ledger holds (the group existed
+///   before its first commit), else `loaded_at`.
+fn backfill_member_joins(
+    group: &MlsGroup,
+    own_key_id: &str,
+    ledger: &EpochLedger,
+    loaded_at: DateTime<Utc>,
+) -> HashMap<String, DateTime<Utc>> {
+    let earliest_proven = ledger
+        .creation
+        .as_ref()
+        .map(CommitClaim::asserted_at)
+        .or_else(|| ledger.claims.values().map(CommitClaim::asserted_at).min())
+        .unwrap_or(loaded_at);
+    let exact_add = |member: &str| {
+        ledger
+            .intents
+            .iter()
+            .rev()
+            .find_map(|(epoch, intent)| match intent {
+                CommitIntent::Add { key_id, .. } if key_id == member => {
+                    ledger.claims.get(epoch).map(CommitClaim::asserted_at)
+                }
+                _ => None,
+            })
+    };
+    credential_ids(group)
+        .into_iter()
+        .map(|m| {
+            let at = if m == own_key_id {
+                earliest_proven
+            } else {
+                exact_add(&m).unwrap_or(loaded_at)
+            };
+            (m, at)
+        })
+        .collect()
 }
 
 impl CohortGroup {
@@ -1807,10 +1902,23 @@ impl CohortGroup {
                  (CIRISEdge#697)"
             );
         }
-        let member_joins = store
-            .member_joins_get(community_id)
-            .await?
-            .unwrap_or_default();
+        let member_joins = if let Some(joins) = store.member_joins_get(community_id).await? {
+            joins
+        } else {
+            // CIRISEdge#695 review — a group persisted before the join map
+            // existed: backfill every current member by what its instant
+            // is USED for (FSD §4.3 "Upgrade backfill"), and persist it.
+            let joins = backfill_member_joins(&group, &own_key_id, &ledger, now_ms());
+            if let Err(e) = store.member_joins_put(community_id, &joins).await {
+                tracing::warn!(
+                    community_id,
+                    error = %e,
+                    "backfilled member-join map could not be written; kept in memory, the \
+                     next commit persists it (CIRISEdge#695)"
+                );
+            }
+            joins
+        };
         Ok(Some(Self {
             community_id: Arc::from(community_id),
             inner: Arc::new(Mutex::new(CohortGroupInner {
@@ -1879,28 +1987,49 @@ impl CohortGroup {
                 commit: e.commit.clone(),
                 welcome: e.welcome.clone(),
                 claim: e.claim.clone(),
+                welcome_recipients: e.welcome_recipients.clone(),
             })
             .collect()
     }
 
-    /// CIRISEdge#697 (§4.3) — the host placed the Commit that advanced the
-    /// group to `epoch`: remove it from the outbox, durably (a ledger-only
-    /// write; the head does not move). Idempotent.
+    /// CIRISEdge#697 (§4.3) — the host placed `commit`: remove it from the
+    /// outbox, durably (a ledger-only write; the head does not move).
+    ///
+    /// Keyed by the commit ([`CohortCommit::placement_id`]), never by the
+    /// epoch alone: after a lost contest the same epoch can hold a different
+    /// re-proposed commit, and a late ack for the discarded one answers
+    /// [`MarkPlaced::Superseded`] and deletes nothing. The entry leaves
+    /// memory only after the ledger write succeeds, so a failed write leaves
+    /// the debt owed and a retry writes again. Idempotent
+    /// ([`MarkPlaced::NotOwed`]).
     ///
     /// # Errors
-    /// The ledger encode or the store write.
-    pub async fn mark_placed(&self, epoch: u64) -> Result<(), CohortGroupError> {
+    /// The ledger encode or the store write (the entry stays owed).
+    pub async fn mark_placed(&self, commit: &CohortCommit) -> Result<MarkPlaced, CohortGroupError> {
         let mut inner = self.inner.lock().await;
-        if inner.ledger.outbox.remove(&epoch).is_none() {
-            return Ok(());
+        let Some(entry) = inner.ledger.outbox.get(&commit.epoch) else {
+            return Ok(MarkPlaced::NotOwed);
+        };
+        if entry.commit != commit.commit {
+            tracing::info!(
+                community_id = %inner.community_id,
+                epoch = commit.epoch,
+                "mark_placed for a commit this group no longer owes at that epoch (a re-proposal \
+                 holds it after a lost contest); nothing deleted (CIRISEdge#697)"
+            );
+            return Ok(MarkPlaced::Superseded);
         }
-        let ledger = serde_json::to_vec(&inner.ledger)
+        let mut next = inner.ledger.clone();
+        next.outbox.remove(&commit.epoch);
+        let ledger = serde_json::to_vec(&next)
             .map_err(|e| CohortGroupError::LedgerMalformed(format!("encode: {e}")))?;
         inner
             .store
             .group_state_put(&inner.community_id, LEDGER_SLOT, &ledger)
             .await?;
-        Ok(())
+        // Durable — only now forget it in memory.
+        inner.ledger.outbox.remove(&commit.epoch);
+        Ok(MarkPlaced::Removed)
     }
 
     /// Whether the group is still operational (a removed member's
@@ -2160,7 +2289,9 @@ impl CohortGroup {
             }
         }
         inner.member_joins.retain(|m, _| after.contains(m));
-        let sealed = inner.persist_and_seal(Vec::new(), None, observer).await?;
+        let sealed = inner
+            .persist_and_seal(Vec::new(), None, Vec::new(), observer)
+            .await?;
         Ok(ClaimedApplyOutcome::Applied(sealed.epoch()))
     }
 }
@@ -2235,7 +2366,9 @@ impl CohortGroupInner {
         self.process_and_merge_commit(commit)?;
         self.ledger.claims.insert(framed_epoch, arrival.clone());
         self.ledger.prune(self.epoch(), self.retained_epochs);
-        let _ = self.persist_and_seal(Vec::new(), None, arrival).await?;
+        let _ = self
+            .persist_and_seal(Vec::new(), None, Vec::new(), arrival)
+            .await?;
 
         let mut reproposed = Vec::new();
         for intent in lost {
@@ -2858,8 +2991,16 @@ mod tests {
             "the add and the rotate"
         );
 
-        a.mark_placed(epoch).await.unwrap();
-        a.mark_placed(epoch).await.unwrap(); // idempotent
+        let placed_add = owed[0].clone();
+        assert_eq!(
+            a.mark_placed(&placed_add).await.unwrap(),
+            MarkPlaced::Removed
+        );
+        assert_eq!(
+            a.mark_placed(&placed_add).await.unwrap(),
+            MarkPlaced::NotOwed,
+            "idempotent"
+        );
         drop(a);
         let a = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-out", 16)
             .await
@@ -2872,6 +3013,197 @@ mod tests {
             .map(CohortCommit::epoch)
             .collect();
         assert_eq!(owed, vec![rot.epoch()], "mark_placed is durable");
+    }
+
+    /// CIRISEdge#697 review / FSD §7 S15 — a `mark_placed` whose ledger write
+    /// fails leaves the debt owed on the handle; a retry writes; a restart
+    /// does not replay the acked commit.
+    #[tokio::test]
+    async fn a_failed_ack_write_keeps_the_debt_and_a_retry_clears_it() {
+        let kv = Arc::new(XChaChaKvStore::open_in_memory(b"ack-fail").unwrap());
+        let store = ScopeStateProvider::new(Arc::clone(&kv));
+        let a = CohortGroup::create(store.clone(), "c-ackf", "node-a", 16)
+            .await
+            .unwrap();
+        let rot = a.rotate().await.unwrap();
+        store
+            .fail_group_state_puts
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(a.mark_placed(&rot).await.is_err(), "the write failed");
+        assert_eq!(
+            a.unplaced_commits().await.len(),
+            1,
+            "a failed ack write forgets nothing"
+        );
+        store
+            .fail_group_state_puts
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            a.mark_placed(&rot).await.unwrap(),
+            MarkPlaced::Removed,
+            "the retry writes"
+        );
+        drop(a);
+        let a = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-ackf", 16)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert!(
+            a.unplaced_commits().await.is_empty(),
+            "a restart does not replay an acked commit"
+        );
+    }
+
+    /// CIRISEdge#697 review / FSD §7 S16 — a recovered Add names its Welcome's
+    /// recipient after a restart, with its `CommitIntent` pruned, and the
+    /// recipient joins with the recovered Welcome.
+    #[tokio::test]
+    async fn a_recovered_add_names_its_welcome_recipient() {
+        let kv = Arc::new(XChaChaKvStore::open_in_memory(b"recipients").unwrap());
+        // retained = 1: the Add's intent ages out after two more commits.
+        let a = CohortGroup::create(
+            ScopeStateProvider::new(Arc::clone(&kv)),
+            "c-rcpt",
+            "node-a",
+            1,
+        )
+        .await
+        .unwrap();
+        let (material, kp) = mint_cohort_key_material("node-b").unwrap();
+        let add = a.add_member("node-b", kp).await.unwrap();
+        assert_eq!(add.welcome_recipients(), ["node-b".to_string()]);
+        let add_epoch = add.epoch();
+        let r1 = a.rotate().await.unwrap();
+        let r2 = a.rotate().await.unwrap();
+        assert!(r1.welcome_recipients().is_empty() && r2.welcome_recipients().is_empty());
+        drop((add, a));
+        let a = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-rcpt", 1)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert!(
+            !a.inner
+                .lock()
+                .await
+                .ledger
+                .intents
+                .contains_key(&(add_epoch - 1)),
+            "the intent that named the recipient is pruned"
+        );
+        let owed = a.unplaced_commits().await;
+        let recovered = owed
+            .iter()
+            .find(|c| c.epoch() == add_epoch)
+            .expect("still owed");
+        assert_eq!(
+            recovered.welcome_recipients(),
+            ["node-b".to_string()],
+            "the outbox carries who the Welcome is for"
+        );
+        let b = CohortGroup::join(
+            open_store(),
+            "c-rcpt",
+            material,
+            recovered.welcome().expect("an Add carries a Welcome"),
+            1,
+        )
+        .await
+        .expect("the recovered Welcome admits its named recipient");
+        assert!(b.member_key_ids().await.contains(&"node-b".to_string()));
+    }
+
+    /// CIRISEdge#695 review / FSD §7 S17 — a group persisted before the join
+    /// map existed loads with every member backfilled (this node = the
+    /// earliest instant the ledger proves; a member with a held Add intent =
+    /// that claim's instant; one without = the load instant), persists the
+    /// backfill, and an already-placed KeyPackage is not read as a restart.
+    #[tokio::test]
+    async fn a_pre_upgrade_group_backfills_its_join_map_without_a_spurious_rejoin() {
+        let t = |s: i64| chrono::DateTime::from_timestamp(1_700_000_000 + s, 0).unwrap();
+        let kv = Arc::new(XChaChaKvStore::open_in_memory(b"upgrade").unwrap());
+        let store = ScopeStateProvider::new(Arc::clone(&kv));
+        let a = CohortGroup::create(store.clone(), "c-upg", "node-a", 16)
+            .await
+            .unwrap();
+        let (_mb, kpb) = mint_cohort_key_material("node-b").unwrap();
+        let (_mc, kpc) = mint_cohort_key_material("node-c").unwrap();
+        let _ab = a
+            .add_member_at("node-b", kpb.clone(), t(100))
+            .await
+            .unwrap();
+        let _ac = a.add_member_at("node-c", kpc, t(200)).await.unwrap();
+        drop(a);
+        // Reshape the store to what v32.1 persisted: no join map, no creation
+        // claim, no outbox, and C's Add intent already aged out.
+        store.member_joins_delete("c-upg").await.unwrap();
+        let v32_ledger = EpochLedger {
+            claims: BTreeMap::from([
+                (0, CommitClaim::new(t(100), "node-a")),
+                (1, CommitClaim::new(t(200), "node-a")),
+            ]),
+            intents: BTreeMap::from([(
+                0,
+                CommitIntent::Add {
+                    key_id: "node-b".into(),
+                    key_package: key_package_to_bytes(kpb).unwrap(),
+                },
+            )]),
+            ..EpochLedger::default()
+        };
+        store
+            .group_state_put(
+                "c-upg",
+                LEDGER_SLOT,
+                &serde_json::to_vec(&v32_ledger).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let before_load = now_ms();
+        let a = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-upg", 16)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert_eq!(
+            a.member_added_at("node-a").await,
+            Some(t(100)),
+            "this node: the earliest instant the ledger proves"
+        );
+        assert_eq!(
+            a.member_added_at("node-b").await,
+            Some(t(100)),
+            "a member with a held Add intent: that claim's exact instant"
+        );
+        let c_at = a.member_added_at("node-c").await.expect("backfilled");
+        assert!(
+            c_at >= before_load,
+            "a member with no intent: the load instant"
+        );
+
+        // No spurious Rejoin: the KeyPackages each member placed BEFORE the
+        // upgrade (B's consumed one at t(90); C's at t(150)) are not restarts.
+        let latest = HashMap::from([
+            ("node-b".to_string(), t(90)),
+            ("node-c".to_string(), t(150)),
+        ]);
+        assert!(
+            crate::self_room::republished_from(&a.member_joins().await, &latest).is_empty(),
+            "an already-placed KeyPackage is never read as a restart after the backfill"
+        );
+        // ...while a KeyPackage placed after the load IS a restart signal.
+        let later = HashMap::from([("node-c".to_string(), c_at + chrono::Duration::hours(1))]);
+        assert_eq!(
+            crate::self_room::republished_from(&a.member_joins().await, &later),
+            vec!["node-c".to_string()]
+        );
+
+        // Persisted: a second load reads the same map, not a fresh "now".
+        drop(a);
+        let again = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-upg", 16)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert_eq!(again.member_added_at("node-c").await, Some(c_at));
     }
 
     /// CIRISEdge#697 / FSD §7 S12 — the outbox is never ahead of the head: a
@@ -4293,6 +4625,59 @@ mod convergence_tests {
              re-proposal — without it the Add is silently lost"
         );
         assert_eq!(secret(&a).await, secret(&b).await);
+    }
+
+    /// CIRISEdge#697 review / FSD §7 S14 — a late ack for a DISCARDED commit
+    /// does not delete the re-proposal that holds the same epoch. B commits
+    /// Add(D)@e→e+1 then Rotate@e+1→e+2; A's earlier Add(D)@e wins; B rolls
+    /// back, skips the satisfied Add and re-proposes Rotate at e+2. A late
+    /// `mark_placed` for the discarded Rotate is `Superseded`, and the
+    /// re-proposal stays owed.
+    #[tokio::test]
+    async fn a_stale_ack_after_a_rollback_does_not_delete_the_reproposal() {
+        let (a, b, _c) = three("c-stale-ack").await;
+        let base = b.epoch().await;
+        let (_md, kpd) = mint_cohort_key_material("node-d").unwrap();
+        let b_add = b
+            .add_member_at("node-d", kpd.clone(), at(20))
+            .await
+            .unwrap();
+        let b_rot = b.rotate_at(at(21)).await.unwrap();
+        assert_eq!(b_rot.epoch(), base + 2);
+        let a_add = a.add_member_at("node-d", kpd, at(10)).await.unwrap();
+
+        let (_, reproposed) = expect_superseded(
+            b.apply_remote_commit_claimed(a_add.commit(), Some(a_add.claim().clone()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(
+            reproposed.len(),
+            1,
+            "the satisfied Add is skipped; the Rotate re-proposed"
+        );
+        let redo = &reproposed[0];
+        assert_eq!(
+            redo.epoch(),
+            base + 2,
+            "the re-proposal holds the discarded Rotate's epoch"
+        );
+        assert_ne!(redo.placement_id(), b_rot.placement_id());
+
+        assert_eq!(
+            b.mark_placed(&b_rot).await.unwrap(),
+            MarkPlaced::Superseded,
+            "a late ack for the discarded Rotate deletes nothing"
+        );
+        assert_eq!(b.mark_placed(&b_add).await.unwrap(), MarkPlaced::NotOwed);
+        let owed = b.unplaced_commits().await;
+        assert_eq!(owed.len(), 1);
+        assert_eq!(
+            owed[0].placement_id(),
+            redo.placement_id(),
+            "the re-proposal's recovery entry survives the stale ack"
+        );
+        assert_eq!(b.mark_placed(redo).await.unwrap(), MarkPlaced::Removed);
     }
 
     /// The ledger survives a restart: a reloaded loser still knows who
