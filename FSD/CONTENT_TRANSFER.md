@@ -571,6 +571,80 @@ answer to "is this chunked"** — one fact, one member, no way for two to disagr
 opens it through the same door as an inline blob (persist's whole-read caps at 64 MiB and names the
 range door above that).
 
+#### 6.7.1 The sealed descriptor — a file's name and media type open only with the bytes (CIRISEdge#698, CIRISConstitution#114)
+
+**Ruled (CC 3.3.13, CIRISConstitution#114, 2026-09-27).** In the encrypted two-hash case the Source
+struct gains **`sealed_descriptor`**: base64 of an AEAD seal **under the room's DEK** over the JCS
+object `{name, format, codec?}`, with the blob's **address digest as associated data** (a descriptor
+cannot be moved onto another blob). Always in clear and required: `size` (checked before hashing by
+every holder, CC 5.3.2.5), the address `digest`, the room target, `content_digest`, `placeholder`.
+`format`/`codec` are in clear **iff** `sealed_descriptor` is absent — both present is refused as
+"one description" — and `name` never appears in clear beside a seal. The sniff check (CC 5.3.2.6)
+runs where the bytes decrypt, by the opener; a holder that cannot open the bytes cannot sniff and
+does not claim to.
+
+**Why this key and no other.** The descriptor must open for exactly the parties that can open the
+bytes — "may read the name" and "may open the bytes" are one fact, not two grants that can drift.
+That is only true if the descriptor is sealed under the **same DEK the bytes were sealed under**:
+the pointer's `(tier, community_key_id, epoch)` selects it, the same cascade wraps it to the same
+occurrences (CC 4.4.3.2.1), a revocation ends both at once, and the at-rest cascade (CC 6.1.5)
+covers both. Any other key — a per-room key edge derives, the pre-v24 `RoomKey` exporter, the
+node's identity seed — would be a second authorization surface and a second thing to rotate, and
+is refused here (memory rule: use the machinery we pay for; never invent a key).
+
+**What a reader sees.** With the DEK: name and media type, returned by `files::open` / `FileRef`
+after the bytes' key opens. Without it — a relay, a stolen disk, a mis-widened row (the class
+CIRISPersist#919 fixed), a removed member's stale copy — the address, the size, the room target,
+and a descriptor that is **typed sealed**, never an empty name. The row tables of the federation
+directory are not sealed (they must be queryable); the bytes are; after this the description is
+too.
+
+**The mixed-fleet rule (from persist's gate code, 2026-09-27).** persist v50.0.0 admits a `file:v1`
+row that carries `sealed_descriptor` and omits a clear format **as long as the row carries no
+top-level `media` member**: persist's media gate (`check_media_source`) runs only on a non-null
+`media` Source struct, and edge's file rows carry the pointer under `content` (edge's own pointer
+struct) with no `media` member, so an extra member inside `content` rides through opaque and a v50
+reader stores the row and shows no name. The moment a producer emits persist's `media` struct on a
+row, v50 **refuses** a sealed one (the struct is closed; `format` required in clear) until
+CIRISPersist#922 (the cut after v50). Therefore: **the seal lives inside edge's `content` pointer**
+(`BlobPointer.sealed_descriptor`, §7 table) and CIRISEdge#638's adoption of persist's `media`
+struct on file rows is sequenced after #922.
+
+**Where the producer is blocked, and the exact door it needs.** Edge never holds a DEK. Its only
+seal is `GroupContentStore::seal` → persist `put_blob_scoped(scope, community, plaintext,
+media_type, caller_aad)`, which resolves the cascade inside persist and returns a pointer at a
+**new blob**; `read_blob_as` returns plaintext. persist v49/v50 exposes no door that seals **small
+caller bytes under an existing blob's DEK and returns the ciphertext**, and no DEK reader
+(`at_rest_cascade::seal/open` are `pub` but take the DEK). Sealing the descriptor as a second blob
+would satisfy "same authorization" but not the ruled member (an inline base64 AEAD), and would
+fork the shape persist#922 gates — so the producer waits rather than approximating. **Persist ask
+(CIRISPersist, alongside #922):**
+
+```
+Engine::seal_descriptor_for_blob(at_rest_sha256: &[u8;32], viewer_or_author_key_id: &str,
+                                 plaintext_jcs: &[u8]) -> Result<Vec<u8> /* AEAD envelope, base64'd by the caller */, BlobError>
+Engine::open_descriptor_for_blob(at_rest_sha256: &[u8;32], viewer_key_id: &str,
+                                 sealed: &[u8]) -> Result<Vec<u8>, BlobError>
+```
+— the DEK is the one that blob was sealed under (its recorded tier / community / epoch; the same
+grants gate both calls; `BlobError::NotGranted` when the viewer cannot open the bytes), the AAD is
+the blob's address digest as #114 rules (persist frames it exactly as it frames chunk AAD, never
+reinterprets it), the envelope is `at_rest_cascade::AtRestEnvelope`'s bytes. With that door edge's
+producer is one call beside `seal`, and the opener is one call beside `open`.
+
+**Invariants and witnesses (to land with the producer):**
+
+| # | Invariant | Witness |
+|---|---|---|
+| D1 | A member who can open the bytes gets name + media type; the two facts are one | `files::a_member_opens_the_bytes_and_the_descriptor_together` |
+| D2 | A reader who cannot open the bytes gets a **typed sealed** descriptor and no plaintext name **anywhere in the serialized row** | `files::an_unauthorized_reader_sees_a_pointer_a_size_and_no_description` (asserts on the row bytes) |
+| D3 | AAD binding: a `sealed_descriptor` copied onto another blob's row does not open | `files::a_descriptor_moved_to_another_blob_does_not_open` |
+| D4 | One description: a row with both `sealed_descriptor` and a clear `media_type`/`filename` is never produced; the reader refuses it by name | `files::a_row_with_two_descriptions_is_refused` |
+| D5 | Read-compat: pre-#698 rows (clear `filename` + `media_type`, no seal) still open and list | `files::a_v32_row_still_opens` (the old-shape vector is kept as a read case) |
+| D6 | Round trip through persist's real sqlite backend, both scope paths (self/family `InvisibleEncrypted`, community `CommunityDek`) | `tests/files_sealed_descriptor_e2e.rs` |
+| D7 | Mixed fleet: the row carries no `media` member; a v50 reader admits it | conformance vector, encrypted case |
+
+
 Every persist door already existed at the pinned version — Q1 shipped in v44.5.0
 (`serve_blob_range_to_peer`), Q2 is settled, the scoped DAG shipped in #832/#838 — so this was never
 gated on **CIRISPersist#821**, only on edge wiring it. An earlier draft of this section said

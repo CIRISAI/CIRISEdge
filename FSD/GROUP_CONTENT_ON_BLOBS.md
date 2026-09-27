@@ -463,7 +463,8 @@ that reveals the content.
 | `community_key_id` | which community to read as; NOT an AAD input (§5.1.1) |
 | `content_sha256` | the at-rest sha to read |
 | `content_field` | which field this blob is; **AAD input** |
-| `media_type` | so a reader knows what it got before opening it |
+| `media_type` | so a reader knows what it got before opening it — **in clear iff `sealed_descriptor` is absent** (CC 3.3.13 / CIRISConstitution#114: one description, never two) |
+| `sealed_descriptor` | CIRISEdge#698 — base64 AEAD under the **same DEK as the bytes** over JCS `{name, format, codec?}`, AAD = this blob's address digest; opens only for a reader who can open the bytes; the file row's `filename` is then absent in clear. Lives here, inside `content`, not in persist's `media` struct, until CIRISPersist#922 (mixed-fleet rule, `CONTENT_TRANSFER.md` §6.7.1). Producer blocked on a persist seal/open door for an existing blob's DEK (§6.7.1). |
 | `stream_id` | present iff chunked — the DAG's stream (§5.5) |
 | `epoch` | the community epoch the bytes were **sealed under**; `CommunityDek` only. NOT an AAD input. See below. |
 
