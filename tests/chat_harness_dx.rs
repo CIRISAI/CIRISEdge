@@ -379,4 +379,7 @@ async fn the_documented_file_and_self_room_shapes_typecheck() {
     pin::<Result<Option<(Vec<u8>, u64)>, String>>(
         ciris_edge::chat::welcome_for(dir, "node-a", "alice-fed", "node-c").await,
     );
+    pin::<Result<Option<ciris_edge::chat::PlacedWelcome>, String>>(
+        ciris_edge::chat::welcome_for_row(dir, "node-a", "alice-fed", "node-c").await,
+    );
 }

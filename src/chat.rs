@@ -1124,6 +1124,22 @@ pub async fn welcome_from(
         .next_back())
 }
 
+/// A Welcome row as placed: its bytes, the epoch it welcomes into, and the
+/// row's `asserted_at` (CIRISEdge#696).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacedWelcome {
+    /// The serialized MLS Welcome.
+    pub bytes: Vec<u8>,
+    /// The epoch the Welcome joins the recipient into.
+    pub epoch: u64,
+    /// When the row was asserted — what a restarted creator compares with
+    /// `CohortGroup::member_added_at` to tell whether a member in its tree
+    /// was welcomed FOR ITS CURRENT ADD (`asserted_at >= added_at`), or only
+    /// for an earlier one (a crash between `add_member` and placing the
+    /// Welcome).
+    pub asserted_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// **The Welcome addressed to `recipient_key_id`** in `room` (CIRISEdge#656).
 ///
 /// [`welcome_from`] returns the LAST Welcome in the room, which is right
@@ -1137,6 +1153,9 @@ pub async fn welcome_from(
 /// recipient)` — so a legacy pair handshake keeps working and a wider
 /// room never hands a joiner somebody else's Welcome.
 ///
+/// The bytes and epoch only; [`welcome_for_row`] also returns the row's
+/// instant.
+///
 /// # Errors
 /// The directory read.
 pub async fn welcome_for(
@@ -1145,6 +1164,22 @@ pub async fn welcome_for(
     room: &str,
     recipient_key_id: &str,
 ) -> Result<Option<(Vec<u8>, u64)>, String> {
+    Ok(welcome_for_row(directory, from, room, recipient_key_id)
+        .await?
+        .map(|w| (w.bytes, w.epoch)))
+}
+
+/// [`welcome_for`], with the row's `asserted_at` (CIRISEdge#696,
+/// `FSD/MLS_STATE_AT_REST.md` §2 `welcome`).
+///
+/// # Errors
+/// The directory read.
+pub async fn welcome_for_row(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    from: &str,
+    room: &str,
+    recipient_key_id: &str,
+) -> Result<Option<PlacedWelcome>, String> {
     use base64::Engine as _;
     let pair_room = pair_community_key_id(from, recipient_key_id);
     Ok(rows_in_room(directory, &[from.to_owned()], room)
@@ -1171,7 +1206,11 @@ pub async fn welcome_for(
             let epoch = env
                 .get(FIELD_MLS_EPOCH)
                 .and_then(serde_json::Value::as_u64)?;
-            Some((bytes, epoch))
+            Some(PlacedWelcome {
+                bytes,
+                epoch,
+                asserted_at: a.asserted_at,
+            })
         })
         .next_back())
 }

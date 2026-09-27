@@ -80,6 +80,21 @@ boot   : mls::boot::readdress_persisted_rooms(&store, &groups, &lifecycle, &lens
 drive  : self_room::decide_with_republished(own, roster, held, rival, republished) each tick
          (decide(..) with an empty republished slice is unchanged for callers that do not yet
          compute it). republished = self_room::republished_members(...) — see §4.
+outbox : at boot, for every opened group: group.unplaced_commits().await -> Vec<CohortCommit>
+         (oldest epoch first) — place each Commit, and its Welcome to each of
+         commit.welcome_recipients() (welcome_attestation_in), exactly as a fresh one, then
+         group.mark_placed(&commit).await -> MarkPlaced::{Removed, NotOwed, Superseded}. After
+         every placement in normal operation, too: a CohortCommit is in the outbox from the moment
+         it exists until mark_placed (§4.3). The ack names THE commit (placement_id), not the
+         epoch.
+welcome: chat::welcome_for_row(dir, from, room, recipient) -> Option<PlacedWelcome{bytes, epoch,
+         asserted_at}> — the row's instant, so a restarted creator can tell whether a member in
+         its tree was welcomed FOR ITS CURRENT ADD (asserted_at >= member_added_at). welcome_for
+         (bytes, epoch) is unchanged.
+lineage: group.creation_claim().await -> Option<CommitClaim> — the claim the group was CREATED
+         under (creator + instant), persisted with the group; survives the creator's removal.
+         None on a group this node JOINED (a joiner never saw the creation; the host keeps its
+         own record if it needs one).
 ```
 
 What the host must NOT do: open the store per room; derive a passphrase; catch
@@ -137,7 +152,70 @@ the one the add consumed and is never a restart signal). Pure over rows the node
 | epoch, exporter secret, addresses | re-derived from the snapshot (`MlsGroup::load`) | re-requested: fresh KeyPackage → `Rejoin` at a holder → Welcome |
 | the room's roster | re-fetched from the directory (`nodes_owned_by` / `active_*_members`) — never trusted from the tree alone | same |
 | pending Welcome material | restored from `pending_join` | minted anew (the old KeyPackage's Welcome, if it ever comes, is unconsumable and ignored) |
-| commit claims / epoch ledger | rebuilt as commits arrive (bounded retention; not persisted) | same |
+| commit claims / epoch ledger | persisted in the ledger slot beside every snapshot, before the head moves (bounded retention) | re-requested with the group |
+| creation claim | persisted in the ledger at genesis; never pruned | unknown (a re-created group has a new one) |
+| unplaced Commits / Welcomes | the outbox (§4.3): handed back by `unplaced_commits()` | lost with the group; the room's members see a stale holder and `decide` repairs |
+
+**§4.3 Genesis, lineage and the outbox (CIRISEdge#695, #696, #697).**
+
+*Who owns what (confirmed against persist v50, `FSD/SECOND_DEVICE.md` §2):* the MLS group state,
+epoch secrets, scope addresses and Commit/Welcome production are **edge's**; persist owns the DEK
+cascade, the #916 device re-wrap, the MLS-state store (storage only, §1) and roster standing. The
+items below are therefore edge's to make durable.
+
+- **Upgrade backfill (groups persisted before this cut have no join map).** `load` of a group
+  with no `member_joins` slot backfills every current tree member and persists the map, choosing
+  each instant by what it is USED for:
+  - **Another member** — the instant feeds the Rejoin signal (a KeyPackage published *after* it
+    is a restart). An early instant would make the KeyPackage the add consumed look newer than
+    the add: a spurious Rejoin, evicting a healthy device. So: the exact add instant when the
+    ledger still holds this node's `Add` intent for that member (its claim's instant); otherwise
+    **the load instant** — every KeyPackage already placed predates it, so none is misread as a
+    restart, and restarts after the upgrade are detected. The cost is stated: a member that lost
+    state *and* republished before the upgrade is not detected by this signal; its next
+    republish is.
+  - **This node itself** — never a Rejoin candidate (`decide` excludes own); the instant feeds
+    the host's creation-claim fallback, where EARLIER is the safe direction (a late instant loses
+    a creation contest it should win). So: the earliest instant the durable state proves — the
+    smallest claim in the ledger (the group existed before its first commit) — else the load
+    instant.
+  - A backfill that cannot be written is logged and kept in memory; the next commit persists it.
+
+- **Genesis persists what a commit persists.** `create` and `join` write the snapshot, the ledger
+  and the member-join map, and only then the head — the same slot order as `persist_and_seal`.
+  Before this a group that never committed reloaded with no join instants (#695): a creator alone
+  in its room had nothing for `member_added_at(own)` to answer.
+- **Lineage.** The ledger carries `creation: Option<CommitClaim>` — set once, at `create`, to
+  `(created_at, creator)`; never pruned, never rewritten by a rollback. A self room's creation
+  contest is decided by that claim; before this it could only be inferred from `member_joins`,
+  which drops a removed member (#696).
+- **The outbox.** `add_member` / `remove_member` / `rotate` make their epoch durable BEFORE the
+  host places the Commit. A crash (or a failed placement) in that window used to leave the group
+  at N+1 with the Commit bytes gone: the members stay at N, every later Commit is one they cannot
+  apply, and the room forks with nothing reporting it (#697). Now `persist_and_seal` writes the
+  sealed Commit, Welcome and claim into the ledger's `outbox` **in the same write as the claim,
+  before the head moves**; `unplaced_commits()` returns them, oldest first; `mark_placed(epoch)`
+  removes one (a ledger-only write; the head does not move). A remote commit this node merely
+  applied has nothing to place and is never in the outbox.
+  - **The ack names the commit, not the epoch.** `mark_placed(&CohortCommit)` removes the entry
+    only if its `placement_id` (sha256 of the Commit bytes) matches: after a lost contest the
+    same epoch can hold a DIFFERENT re-proposed commit, and a late ack for the discarded one must
+    not delete the re-proposal's recovery entry. A mismatch is `MarkPlaced::Superseded` (no
+    delete); no entry is `MarkPlaced::NotOwed`.
+  - **Durable before forgotten.** `mark_placed` writes the ledger without the entry first and
+    only then drops it in memory; a failed write leaves the entry owed on the handle, so a retry
+    writes again rather than reporting success over a debt the store still holds.
+  - **The Welcome's recipients travel with it.** Each entry carries the key ids its Welcome
+    admits (`welcome_recipients()`), so a recovered Add can be placed with
+    `welcome_attestation_in` even after its `CommitIntent` has aged out of the ledger.
+  - **Never ahead of the head.** A crash between the ledger write and the head move leaves an
+    outbox entry for an epoch the group never reached; `load` drops every entry above the head,
+    so a host is never handed a Commit its own group does not hold.
+  - **A lost contest drops its commits.** A rollback (CC 3 convergent merge) discards this node's
+    commits above the fork point; their outbox entries go with them, and the re-proposals enter
+    the outbox as new commits.
+  - **Not pruned by retention.** An unplaced Commit is owed until placed; the retention window
+    bounds snapshots, not debts. Entries are a few KB (the Welcome carries the ratchet tree).
 
 ---
 
@@ -189,6 +267,15 @@ tree's — the tree may be behind; `decide` closes the gap on the next tick.
 | S6 | Boot re-address installs every persisted room's addresses into the lifecycle and reports each skip by name; it is idempotent. | `boot::a_restarted_node_readdresses_every_persisted_room`, `boot::readdress_is_idempotent` |
 | S7 | Tampered store bytes are refused at read (`AuthFailure`), never decoded as state. | `scope_state::a_tampered_row_is_refused_not_decoded` |
 | S8 | Edge derives no passphrase: `ephemeral()` is random per open; no code path passes a room id, key id or path to `XChaChaKvStore::open`. | grep pin `no_room_id_is_a_passphrase` (source gate) |
+| S9 | A group that never committed reloads with the creator's join instant (`member_added_at(own)` is `Some`), on `create` and on `join`. | `cohort_group::a_genesis_group_reloads_with_its_join_map` |
+| S10 | The creation claim persists with the group and survives the creator's removal; a joined group reports `None`. | `cohort_group::the_creation_claim_survives_a_reload_and_the_creators_removal` |
+| S11 | A Commit that was durable but never placed is handed back after a restart, byte-identical (Commit, Welcome, claim); `mark_placed` removes it and the removal is durable; remote applies never enter the outbox. | `cohort_group::an_unplaced_commit_survives_a_restart_until_marked_placed` |
+| S12 | The outbox is never ahead of the head: an entry for an epoch the head did not reach is dropped at load. | `cohort_group::an_outbox_entry_above_the_head_is_dropped_at_load` |
+| S13 | `welcome_for_row` returns the row's `asserted_at` beside the bytes and epoch. | `tests/chat_message_federates.rs` (the handshake witness reads `welcome_for_row` and asserts the row's `asserted_at`) |
+| S14 | A late `mark_placed` for a discarded commit does not delete the re-proposal that holds the same epoch after a lost contest (`Superseded`, entry kept). | `cohort_group::a_stale_ack_after_a_rollback_does_not_delete_the_reproposal` |
+| S15 | A `mark_placed` whose ledger write fails leaves the debt owed on the handle; a retry writes; a restart does not replay an acked commit. | `cohort_group::a_failed_ack_write_keeps_the_debt_and_a_retry_clears_it` |
+| S16 | A recovered Add carries its Welcome's recipient key id after a restart, with the intent pruned. | `cohort_group::a_recovered_add_names_its_welcome_recipient` |
+| S17 | A group persisted with no join map loads with every member backfilled (creator = earliest proven instant; others = exact add claim or the load instant), persists it, and an already-placed KeyPackage is not read as a restart. | `cohort_group::a_pre_upgrade_group_backfills_its_join_map_without_a_spurious_rejoin` |
 
 ---
 
