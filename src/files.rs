@@ -239,7 +239,7 @@ pub async fn publish(
         plaintext: write.bytes,
         media_type: Some(write.media_type),
     };
-    let chunked = write.bytes.len() > ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP;
+    let chunked = must_chunk(write.bytes.len());
     let sealed = if chunked {
         store.seal_chunked(req).await
     } else {
@@ -410,6 +410,28 @@ async fn file_row(
     })
 }
 
+/// **Does `plaintext_len` bytes have to be a chunk DAG?** (CIRISEdge#687)
+///
+/// Persist's inline cap (`DEFAULT_INLINE_BYTES_CAP`) is enforced on the
+/// STORED body, and an encrypted tier stores an `AtRestEnvelope` — the
+/// plaintext plus `AT_REST_ENVELOPE_OVERHEAD` (magic ‖ nonce ‖ tag). Deciding
+/// on the plaintext length let every file within one overhead of the cap
+/// (1,048,541–1,048,576 bytes today) choose "inline" and then be refused by
+/// the seal. The decision is made on the length persist will check, using
+/// persist's own exported constant, never a literal.
+///
+/// Conservative for the plaintext tier: `publish` does not know the tier
+/// before persist resolves it, so a plaintext-tier file within one overhead
+/// of the cap is chunked when it could have been inline. That is correct
+/// (the chunk door seals every tier) and costs one manifest; the reverse
+/// error — choosing inline for a body persist will refuse — is the bug.
+#[must_use]
+pub fn must_chunk(plaintext_len: usize) -> bool {
+    plaintext_len
+        .saturating_add(ciris_persist::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD)
+        > ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP
+}
+
 /// A file as a reader sees it, before any byte moves.
 ///
 /// Recognising the row is synchronous and total; opening it is neither. A
@@ -428,6 +450,31 @@ pub struct FileRow {
     pub media_type: Option<String>,
     /// The pointer at the bytes — the key plane.
     pub pointer: BlobPointer,
+    /// Whether this row is live or retracted, as far as the listing that
+    /// produced it can tell (CIRISEdge#693). [`FileRow::from_row`] and a
+    /// `Live` listing always say [`FileLifecycle::Live`]; a listing that opts
+    /// retracted rows back in ([`in_room_with`]) names each one.
+    pub lifecycle: FileLifecycle,
+}
+
+/// A file row's retraction state (CIRISEdge#693).
+///
+/// Decided by the same predicate persist's `Live` listing uses to hide a row
+/// — a structural composer of that kind, from the row's own attester, that
+/// references it — so a row marked `Live` here is exactly one a `Live`
+/// listing returns, and a retracted one names which composer retracted it.
+/// If several apply, the strongest wins: `Withdrawn`, then `Recanted`, then
+/// `Superseded`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FileLifecycle {
+    /// Not retracted.
+    Live,
+    /// Retracted by a `withdraws` (the author took it back; CC 2.3).
+    Withdrawn,
+    /// Retracted by a `recants`.
+    Recanted,
+    /// Replaced by a `supersedes` (a rename or a new version).
+    Superseded,
 }
 
 impl FileRow {
@@ -451,6 +498,7 @@ impl FileRow {
                 .map(ToOwned::to_owned),
             media_type: pointer.media_type.clone(),
             pointer,
+            lifecycle: FileLifecycle::Live,
         })
     }
 
@@ -558,6 +606,39 @@ pub async fn in_room(
     limit: usize,
     after: Option<ciris_persist::ceg::AttestationCursor>,
 ) -> Result<DrivePage, FileError> {
+    in_room_with(
+        engine,
+        room,
+        caller_occurrence_key_id,
+        limit,
+        after,
+        ciris_persist::ceg::LifecycleView::Live,
+    )
+    .await
+}
+
+/// [`in_room`] with persist's lifecycle axis exposed (CIRISEdge#693): the same
+/// caller gate, the same [`belongs_to`], the same resumable paging — and
+/// `lifecycle` selects which retracted rows come back.
+/// `LifecycleView::IncludeWithdrawn` is the drive's history view: a withdrawn
+/// file is listed and marked [`FileLifecycle::Withdrawn`], so a host can
+/// answer "withdrawn" for an id the room once held and "never here" for one
+/// it did not, instead of both reading as absent.
+///
+/// A `Live` listing costs nothing extra. Any other view reads each returned
+/// row's composers once (`list_attestations_referencing`) to name its state —
+/// bounded by `limit`.
+///
+/// # Errors
+/// [`FileError::Drive`] from the substrate.
+pub async fn in_room_with(
+    engine: &ciris_persist::Engine,
+    room: &ScopeRoom,
+    caller_occurrence_key_id: &str,
+    limit: usize,
+    after: Option<ciris_persist::ceg::AttestationCursor>,
+    lifecycle: ciris_persist::ceg::LifecycleView,
+) -> Result<DrivePage, FileError> {
     use ciris_persist::ceg::AttestationFilter;
     use ciris_persist::scope::CallerScope;
 
@@ -602,6 +683,7 @@ pub async fn in_room(
                     let mut f = AttestationFilter::default();
                     f.cohort_scope = Some(room.row_scope_token().to_owned());
                     f.dimension_exact = Some(FILE_DIMENSION.to_owned());
+                    f.lifecycle = lifecycle;
                     f
                 },
                 cursor,
@@ -619,7 +701,10 @@ pub async fn in_room(
             // after the gate rather than trusted instead of it. It can DROP
             // rows, which is why a page yielding nothing is not evidence the
             // room is empty.
-            if let Some(file) = belongs_to(room, row) {
+            if let Some(mut file) = belongs_to(room, row) {
+                if lifecycle != ciris_persist::ceg::LifecycleView::Live {
+                    file.lifecycle = lifecycle_of(engine, row, room).await?;
+                }
                 files.push(file);
             }
         }
@@ -634,9 +719,55 @@ pub async fn in_room(
     })
 }
 
-/// Is `row` one of `room`'s files? See [`in_room`] for why the identity
-/// check differs per kind.
-fn belongs_to(room: &ScopeRoom, row: &Attestation) -> Option<FileRow> {
+/// The retraction state of one listed row — persist's `Live` hide rule, read
+/// per row: a structural composer of that kind, from the row's own attester,
+/// referencing it (see [`FileLifecycle`]).
+async fn lifecycle_of(
+    engine: &ciris_persist::Engine,
+    row: &Attestation,
+    room: &ScopeRoom,
+) -> Result<FileLifecycle, FileError> {
+    use ciris_persist::federation::precedence::references_attestation_id_from_envelope;
+    use ciris_persist::federation::types::attestation_type;
+
+    let composers = engine
+        .federation_directory()
+        .list_attestations_referencing(&row.attestation_id)
+        .await
+        .map_err(|e| FileError::Drive {
+            room: room.to_string(),
+            detail: format!("composers of {}: {e}", row.attestation_id),
+        })?;
+    let retracted_by = |kind: &str| {
+        composers.iter().any(|c| {
+            c.attestation_type == kind
+                && c.attesting_key_id == row.attesting_key_id
+                && references_attestation_id_from_envelope(&c.attestation_envelope)
+                    == Some(row.attestation_id.as_str())
+        })
+    };
+    Ok(if retracted_by(attestation_type::WITHDRAWS) {
+        FileLifecycle::Withdrawn
+    } else if retracted_by(attestation_type::RECANTS) {
+        FileLifecycle::Recanted
+    } else if retracted_by(attestation_type::SUPERSEDES) {
+        FileLifecycle::Superseded
+    } else {
+        FileLifecycle::Live
+    })
+}
+
+/// **Is `row` one of `room`'s files?** — edge's room rule, public so a host
+/// that holds a row by id applies THIS rule rather than a copy of it
+/// (CIRISEdge#693). [`in_room`] / [`in_room_with`] apply it after persist's
+/// caller gate; it answers "is it this room's", never "may this caller see
+/// it". Returns the recognised [`FileRow`] (lifecycle `Live` — the rule does
+/// not read composers), or `None` for a row of another room, another scope,
+/// or not a file. The identity check differs per room kind: a community /
+/// family / affiliations row names its room in the cohort-target field; a
+/// self row names its owner in the pointer's group slot.
+#[must_use]
+pub fn belongs_to(room: &ScopeRoom, row: &Attestation) -> Option<FileRow> {
     if row.cohort_scope != room.row_scope_token() {
         return None;
     }
@@ -768,6 +899,33 @@ mod tests {
     /// refusing (CIRISEdge#633), so this arm is unreachable from that door.
     /// It stays for a `GroupContentStore` that implements only `seal`, and
     /// its message names the shape rather than a missing door.
+    /// CIRISEdge#687 — the shape is chosen on the length persist checks (the
+    /// sealed envelope), not the plaintext. Pinned against persist's own
+    /// constants so a change to the envelope moves the boundary with it.
+    #[test]
+    fn the_inline_decision_is_made_on_the_sealed_length() {
+        let cap = ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP;
+        let overhead = ciris_persist::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD;
+        assert!(
+            !must_chunk(cap - overhead),
+            "the largest body whose envelope fits stays inline"
+        );
+        assert!(
+            must_chunk(cap - overhead + 1),
+            "one more byte and the envelope would exceed the cap"
+        );
+        assert!(
+            must_chunk(cap),
+            "a body AT the plaintext cap no longer rides inline (the #687 range)"
+        );
+        assert!(must_chunk(cap + 1));
+        assert!(!must_chunk(0));
+        assert!(
+            !must_chunk(usize::MAX - 1) || must_chunk(usize::MAX),
+            "saturates, never wraps"
+        );
+    }
+
     #[test]
     fn the_inline_bound_names_the_shape_above_it() {
         let cap = ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP;

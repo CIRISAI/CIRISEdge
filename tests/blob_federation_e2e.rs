@@ -3202,3 +3202,192 @@ async fn a_file_over_the_inline_bound_is_chunked_and_still_opens() {
     assert_eq!(opened.len(), big.len(), "every chunk came back");
     assert_eq!(opened, big, "and in order, with the tail chunk intact");
 }
+
+/// **CIRISEdge#687 — every file size around the inline bound publishes and
+/// round-trips.** The cap is enforced on the SEALED body, which is the
+/// plaintext plus the at-rest envelope; deciding on the plaintext length
+/// refused every file within one envelope of the cap (the server measured
+/// 1,048,575 bytes refused at upload). Self tier (`InvisibleEncrypted`) for
+/// all five sizes; the community tier (`CommunityDek`) for the two sizes on
+/// either side of the old failure range.
+#[tokio::test]
+async fn every_file_size_around_the_inline_bound_publishes_and_round_trips() {
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let node_a = node(&[&alice], &alice).await;
+    let self_room = ciris_edge::self_room::room(&alice.key_id);
+    let community = ciris_edge::scope_room::ScopeRoom::community("room-687");
+    seed_room(&node_a, "room-687", &[&alice]).await;
+
+    let cases: [(&ciris_edge::scope_room::ScopeRoom, usize); 7] = [
+        (&self_room, 1_048_540),
+        (&self_room, 1_048_541),
+        (&self_room, 1_048_575),
+        (&self_room, 1_048_576),
+        (&self_room, 1_048_577),
+        (&community, 1_048_541),
+        (&community, 1_048_576),
+    ];
+    for (i, (room, size)) in cases.iter().enumerate() {
+        let bytes: Vec<u8> = (0..*size)
+            .map(|j| u8::try_from((j + i) % 251).expect("a byte"))
+            .collect();
+        let nth = i64::try_from(i).expect("fits");
+        let published = ciris_edge::files::publish(
+            &*node_a.dir,
+            &node_a.store,
+            ciris_edge::replication::attestation_bind::Signers {
+                node: &node_a.signer,
+                actor: None,
+            },
+            &ciris_edge::files::FileWrite {
+                room,
+                bytes: &bytes,
+                media_type: "application/octet-stream",
+                filename: Some("sized.bin"),
+                asserted_at: ts() + chrono::Duration::seconds(nth),
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a {size}-byte file publishes into {room} (#687): {e}"));
+        assert_eq!(
+            published.pointer.stream_id.is_some(),
+            ciris_edge::files::must_chunk(*size),
+            "{size} bytes: the shape follows the SEALED length"
+        );
+        let row = ciris_edge::files::FileRow::from_row(&published.row).expect("a file row");
+        let opened = row
+            .open(&node_a.store, &node_a.me)
+            .await
+            .unwrap_or_else(|e| panic!("the author opens the {size}-byte file: {e:?}"));
+        assert_eq!(
+            opened, bytes,
+            "{size} bytes round-trip byte-identical in {room}"
+        );
+    }
+}
+
+/// **CIRISEdge#693 — the drive's history view.** A withdrawn file is absent
+/// from the `Live` listing, present and marked `Withdrawn` with
+/// `IncludeWithdrawn`; an id the room never held appears in neither, so
+/// "withdrawn" and "never here" are distinguishable; and the public
+/// `belongs_to` agrees with the listing on the same rows.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_withdrawn_file_is_listed_as_withdrawn_only_when_history_is_asked_for() {
+    use ciris_edge::files::{belongs_to, in_room, in_room_with, FileLifecycle};
+    use ciris_persist::ceg::LifecycleView;
+
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let node_a = node(&[&alice], &alice).await;
+    let room = ciris_edge::self_room::room(&alice.key_id);
+    let other = ciris_edge::scope_room::ScopeRoom::community("room-693-other");
+
+    let mut rows = Vec::new();
+    for (i, name) in ["keep.txt", "gone.txt"].iter().enumerate() {
+        let nth = i64::try_from(i).expect("fits");
+        let published = ciris_edge::files::publish(
+            &*node_a.dir,
+            &node_a.store,
+            ciris_edge::replication::attestation_bind::Signers {
+                node: &node_a.signer,
+                actor: None,
+            },
+            &ciris_edge::files::FileWrite {
+                room: &room,
+                bytes: format!("contents of {name}").as_bytes(),
+                media_type: "text/plain",
+                filename: Some(name),
+                asserted_at: ts() + chrono::Duration::seconds(nth),
+            },
+        )
+        .await
+        .expect("publish");
+        rows.push(published.row);
+    }
+    let (kept, gone) = (&rows[0], &rows[1]);
+
+    // The author withdraws `gone.txt` (CC 2.3) — the drive's delete.
+    let withdraws = ciris_edge::replication::attestation_bind::withdraws_attestation(
+        gone,
+        "deleted from the drive",
+        ts() + chrono::Duration::seconds(10),
+        &node_a.signer,
+    )
+    .await
+    .expect("build the withdraws");
+    node_a
+        .dir
+        .put_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: withdraws,
+        })
+        .await
+        .expect("the author's withdraws is admitted");
+
+    let ids = |page: &ciris_edge::files::DrivePage| -> Vec<(String, FileLifecycle)> {
+        let mut v: Vec<_> = page
+            .files
+            .iter()
+            .map(|f| (f.attestation_id.clone(), f.lifecycle))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    };
+
+    let live = in_room(node_a.store.engine(), &room, &node_a.me, 10, None)
+        .await
+        .expect("live listing");
+    assert_eq!(
+        ids(&live),
+        vec![(kept.attestation_id.clone(), FileLifecycle::Live)],
+        "the Live drive hides the withdrawn file (unchanged behaviour)"
+    );
+
+    let history = in_room_with(
+        node_a.store.engine(),
+        &room,
+        &node_a.me,
+        10,
+        None,
+        LifecycleView::IncludeWithdrawn,
+    )
+    .await
+    .expect("history listing");
+    let mut expected = vec![
+        (kept.attestation_id.clone(), FileLifecycle::Live),
+        (gone.attestation_id.clone(), FileLifecycle::Withdrawn),
+    ];
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        ids(&history),
+        expected,
+        "IncludeWithdrawn lists the withdrawn file and names it Withdrawn"
+    );
+
+    // "Never here" is distinguishable from "withdrawn": an id the room never
+    // held is in neither listing.
+    let never = "never-in-this-room";
+    assert!(history.files.iter().all(|f| f.attestation_id != never));
+    assert!(history.files.iter().any(
+        |f| f.attestation_id == gone.attestation_id && f.lifecycle == FileLifecycle::Withdrawn
+    ));
+
+    // The public room rule agrees with the listing on the same rows, and
+    // refuses them for another room.
+    for row in [kept, gone] {
+        let by_rule = belongs_to(&room, row).expect("the public rule recognises the room's file");
+        assert_eq!(by_rule.attestation_id, row.attestation_id);
+        assert!(
+            history
+                .files
+                .iter()
+                .any(|f| f.attestation_id == row.attestation_id),
+            "what the rule accepts, the listing returned"
+        );
+        assert!(
+            belongs_to(&other, row).is_none(),
+            "and it is not another room's file"
+        );
+    }
+}
