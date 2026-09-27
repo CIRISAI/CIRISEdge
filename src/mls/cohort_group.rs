@@ -573,6 +573,71 @@ enum CommitIntent {
 struct EpochLedger {
     claims: BTreeMap<u64, CommitClaim>,
     intents: BTreeMap<u64, CommitIntent>,
+    /// CIRISEdge#696 (`FSD/MLS_STATE_AT_REST.md` §4.3) — the claim this group
+    /// was CREATED under: set once at [`CohortGroup::create`], never pruned,
+    /// never touched by a rollback. `None` on a group this node joined.
+    #[serde(default)]
+    creation: Option<CommitClaim>,
+    /// CIRISEdge#697 (§4.3) — every Commit this node authored whose epoch is
+    /// durable but which the host has not yet reported placed, keyed by the
+    /// epoch it advanced the group TO. Written in the same ledger write as the
+    /// claim, before the head moves; removed by [`CohortGroup::mark_placed`].
+    /// Deliberately NOT pruned by retention: an unplaced Commit is owed until
+    /// placed.
+    #[serde(default)]
+    outbox: BTreeMap<u64, OutboxEntry>,
+}
+
+/// One unplaced Commit (and Welcome) in the [`EpochLedger`]'s outbox
+/// (CIRISEdge#697). Byte-identical to the [`CohortCommit`] the host was handed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OutboxEntry {
+    #[serde(with = "b64")]
+    commit: Vec<u8>,
+    #[serde(default, with = "b64_opt")]
+    welcome: Option<Vec<u8>>,
+    claim: CommitClaim,
+}
+
+/// Base64 (standard) for the outbox's byte fields — a JSON number array
+/// would triple a Welcome that carries the ratchet tree.
+mod b64 {
+    use base64::Engine as _;
+    pub(super) fn serialize<S: serde::Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(v))
+    }
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s: String = serde::Deserialize::deserialize(d)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(s)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// [`b64`] for an optional byte field.
+mod b64_opt {
+    use base64::Engine as _;
+    #[allow(clippy::ref_option)]
+    pub(super) fn serialize<S: serde::Serializer>(
+        v: &Option<Vec<u8>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(b) => s.serialize_some(&base64::engine::general_purpose::STANDARD.encode(b)),
+            None => s.serialize_none(),
+        }
+    }
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        let s: Option<String> = serde::Deserialize::deserialize(d)?;
+        s.map(|s| {
+            base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
+    }
 }
 
 /// Claims are kept this many times longer than snapshots. A claim is a
@@ -1043,12 +1108,27 @@ impl CohortGroupInner {
     /// leave the caller thinking the epoch did not happen when it
     /// did — the exact desync this ordering exists to prevent.
     fn persist_and_seal(
-        &self,
+        &mut self,
         commit: Vec<u8>,
         welcome: Option<Vec<u8>>,
         claim: CommitClaim,
     ) -> impl std::future::Future<Output = Result<CohortCommit, CohortGroupError>> + '_ {
         let blob = self.snapshot();
+        // CIRISEdge#697 — the outbox: a Commit this node authored enters the
+        // ledger in the SAME write as its claim, before the head moves, so a
+        // restart that sees the new head also sees what it still owes the
+        // room. A remote commit this node only applied carries no bytes to
+        // place and never enters.
+        if !commit.is_empty() {
+            self.ledger.outbox.insert(
+                self.epoch(),
+                OutboxEntry {
+                    commit: commit.clone(),
+                    welcome: welcome.clone(),
+                    claim: claim.clone(),
+                },
+            );
+        }
         let ledger = serde_json::to_vec(&self.ledger)
             .map_err(|e| CohortGroupError::LedgerMalformed(format!("encode: {e}")));
         let joins = self.member_joins.clone();
@@ -1092,6 +1172,33 @@ impl CohortGroupInner {
                 claim,
             })
         }
+    }
+
+    /// Persist a GENESIS epoch (create / join) with the same slot order a
+    /// commit uses — snapshot, ledger, member-join map, and only then the
+    /// head (CIRISEdge#695, `FSD/MLS_STATE_AT_REST.md` §4.3). Before this a
+    /// group that never committed reloaded with no join instants.
+    async fn persist_genesis(&self) -> Result<(), CohortGroupError> {
+        let epoch = self.epoch();
+        if epoch >= LEDGER_SLOT {
+            return Err(CohortGroupError::EpochExhausted);
+        }
+        let blob = self.snapshot()?;
+        let ledger = serde_json::to_vec(&self.ledger)
+            .map_err(|e| CohortGroupError::LedgerMalformed(format!("encode: {e}")))?;
+        self.store
+            .group_state_put(&self.community_id, epoch, &blob)
+            .await?;
+        self.store
+            .group_state_put(&self.community_id, LEDGER_SLOT, &ledger)
+            .await?;
+        self.store
+            .member_joins_put(&self.community_id, &self.member_joins)
+            .await?;
+        self.store
+            .group_state_put(&self.community_id, HEAD_SLOT, &encode_head(epoch))
+            .await?;
+        Ok(())
     }
 
     /// Drop the snapshot that just fell out of the retention window.
@@ -1441,6 +1548,7 @@ impl CohortGroup {
             cred_with_key,
         )
         .map_err(|e| CohortGroupError::CreateFailed(format!("MlsGroup::new: {e:?}")))?;
+        let created_at = now_ms();
 
         let inner = CohortGroupInner {
             community_id: community_id.to_string(),
@@ -1451,23 +1559,19 @@ impl CohortGroup {
             retained_epochs: retained_epochs.max(1),
             held_commits: BTreeMap::new(),
             own_key_id: own_key_id.to_string(),
-            ledger: EpochLedger::default(),
-            member_joins: HashMap::from([(own_key_id.to_string(), now_ms())]),
+            ledger: EpochLedger {
+                // CIRISEdge#696 — the lineage: who created this group, when.
+                creation: Some(CommitClaim::new(created_at, own_key_id)),
+                ..EpochLedger::default()
+            },
+            member_joins: HashMap::from([(own_key_id.to_string(), created_at)]),
         };
 
         // Persist the genesis epoch before handing out a handle: a
         // group that exists only in RAM is the same failure the
-        // ordering invariant guards against, just at epoch 0.
-        let epoch = inner.epoch();
-        let blob = inner.snapshot()?;
-        inner
-            .store
-            .group_state_put(&inner.community_id, epoch, &blob)
-            .await?;
-        inner
-            .store
-            .group_state_put(&inner.community_id, HEAD_SLOT, &encode_head(epoch))
-            .await?;
+        // ordering invariant guards against, just at epoch 0. The
+        // join map and the ledger go with it (#695, #696).
+        inner.persist_genesis().await?;
 
         Ok(Self {
             community_id: Arc::from(community_id),
@@ -1615,19 +1719,7 @@ impl CohortGroup {
         // ordering as `create`, and for the same reason: a group that
         // exists only in RAM is membership the node loses on restart
         // while its peers still count it in the roster.
-        let epoch = inner.epoch();
-        if epoch == HEAD_SLOT {
-            return Err(CohortGroupError::EpochExhausted);
-        }
-        let blob = inner.snapshot()?;
-        inner
-            .store
-            .group_state_put(&inner.community_id, epoch, &blob)
-            .await?;
-        inner
-            .store
-            .group_state_put(&inner.community_id, HEAD_SLOT, &encode_head(epoch))
-            .await?;
+        inner.persist_genesis().await?;
 
         Ok(Self {
             community_id: Arc::from(community_id),
@@ -1695,11 +1787,26 @@ impl CohortGroup {
             .to_vec();
         let own_key_id = String::from_utf8(own_key_id)
             .map_err(|e| CohortGroupError::SnapshotMalformed(format!("own credential: {e}")))?;
-        let ledger = match store.group_state_get(community_id, LEDGER_SLOT).await? {
+        let mut ledger: EpochLedger = match store.group_state_get(community_id, LEDGER_SLOT).await?
+        {
             Some(blob) => serde_json::from_slice(&blob)
                 .map_err(|e| CohortGroupError::LedgerMalformed(format!("decode: {e}")))?,
             None => EpochLedger::default(),
         };
+        // CIRISEdge#697 — never hand the host a Commit its own group does not
+        // hold: a crash between the ledger write and the head move leaves an
+        // outbox entry for an epoch the head never reached.
+        let dropped = ledger.outbox.split_off(&(epoch + 1));
+        if !dropped.is_empty() {
+            tracing::warn!(
+                community_id,
+                head = epoch,
+                dropped = ?dropped.keys().collect::<Vec<_>>(),
+                "cohort MLS outbox held commits above the durable head (a crash between the \
+                 ledger write and the head move); dropped — the group will re-commit \
+                 (CIRISEdge#697)"
+            );
+        }
         let member_joins = store
             .member_joins_get(community_id)
             .await?
@@ -1746,6 +1853,54 @@ impl CohortGroup {
     /// CIRISEdge#676 — every current member's recorded add instant.
     pub async fn member_joins(&self) -> HashMap<String, DateTime<Utc>> {
         self.inner.lock().await.member_joins.clone()
+    }
+
+    /// CIRISEdge#696 (`FSD/MLS_STATE_AT_REST.md` §4.3) — the claim this group
+    /// was CREATED under (creator + instant), persisted with the group and
+    /// kept across the creator's removal. `None` on a group this node joined.
+    pub async fn creation_claim(&self) -> Option<CommitClaim> {
+        self.inner.lock().await.ledger.creation.clone()
+    }
+
+    /// CIRISEdge#697 (§4.3) — every Commit this node authored whose epoch is
+    /// durable but which the host has not reported placed, oldest epoch
+    /// first, byte-identical to the [`CohortCommit`] first handed out. A
+    /// reloaded group hands the host exactly what it still owes the room:
+    /// place each, then [`Self::mark_placed`].
+    pub async fn unplaced_commits(&self) -> Vec<CohortCommit> {
+        self.inner
+            .lock()
+            .await
+            .ledger
+            .outbox
+            .iter()
+            .map(|(epoch, e)| CohortCommit {
+                epoch: *epoch,
+                commit: e.commit.clone(),
+                welcome: e.welcome.clone(),
+                claim: e.claim.clone(),
+            })
+            .collect()
+    }
+
+    /// CIRISEdge#697 (§4.3) — the host placed the Commit that advanced the
+    /// group to `epoch`: remove it from the outbox, durably (a ledger-only
+    /// write; the head does not move). Idempotent.
+    ///
+    /// # Errors
+    /// The ledger encode or the store write.
+    pub async fn mark_placed(&self, epoch: u64) -> Result<(), CohortGroupError> {
+        let mut inner = self.inner.lock().await;
+        if inner.ledger.outbox.remove(&epoch).is_none() {
+            return Ok(());
+        }
+        let ledger = serde_json::to_vec(&inner.ledger)
+            .map_err(|e| CohortGroupError::LedgerMalformed(format!("encode: {e}")))?;
+        inner
+            .store
+            .group_state_put(&inner.community_id, LEDGER_SLOT, &ledger)
+            .await?;
+        Ok(())
     }
 
     /// Whether the group is still operational (a removed member's
@@ -2074,6 +2229,9 @@ impl CohortGroupInner {
         self.restore_epoch(framed_epoch).await?;
         self.ledger.claims.retain(|e, _| *e < framed_epoch);
         self.ledger.intents.retain(|e, _| *e < framed_epoch);
+        // CIRISEdge#697 — the commits this rollback discards are superseded,
+        // not owed: placing one would fork the room. Re-proposals re-enter.
+        self.ledger.outbox.retain(|e, _| *e <= framed_epoch);
         self.process_and_merge_commit(commit)?;
         self.ledger.claims.insert(framed_epoch, arrival.clone());
         self.ledger.prune(self.epoch(), self.retained_epochs);
@@ -2539,6 +2697,212 @@ mod tests {
             after.restore_key_material("c-restart").await,
             Err(CohortGroupError::SnapshotMalformed(_))
         ));
+    }
+
+    /// CIRISEdge#695 / FSD §7 S9 — a group that NEVER committed reloads with
+    /// its join map: the creator's instant on an on-disk store after a drop
+    /// and reopen (the server's repro), and every member on a joiner.
+    #[tokio::test]
+    async fn a_genesis_group_reloads_with_its_join_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mls-state.kv");
+        let created_at = {
+            let kv = XChaChaKvStore::open(&path, b"genesis-pass").unwrap();
+            let a =
+                CohortGroup::create(ScopeStateProvider::new(Arc::new(kv)), "c-gen", "node-a", 16)
+                    .await
+                    .unwrap();
+            a.member_added_at("node-a")
+                .await
+                .expect("recorded at create")
+        };
+        let kv = XChaChaKvStore::open(&path, b"genesis-pass").unwrap();
+        let reloaded = CohortGroup::load(ScopeStateProvider::new(Arc::new(kv)), "c-gen", 16)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert_eq!(
+            reloaded.member_added_at("node-a").await,
+            Some(created_at),
+            "a creator alone in its room keeps its join instant across a restart"
+        );
+
+        // The joiner's genesis persists its map too.
+        let (_a, material, welcome) = founder_and_welcome("c-gen-join", "node-b").await;
+        let kv = Arc::new(XChaChaKvStore::open_in_memory(b"joiner-gen").unwrap());
+        let _b = CohortGroup::join(
+            ScopeStateProvider::new(Arc::clone(&kv)),
+            "c-gen-join",
+            material,
+            &welcome,
+            16,
+        )
+        .await
+        .unwrap();
+        let b = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-gen-join", 16)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert!(b.member_added_at("node-a").await.is_some());
+        assert!(b.member_added_at("node-b").await.is_some());
+    }
+
+    /// CIRISEdge#696 / FSD §7 S10 — the creation claim persists with the group
+    /// and survives the creator's removal; a joined group reports `None`.
+    #[tokio::test]
+    async fn the_creation_claim_survives_a_reload_and_the_creators_removal() {
+        let kv = Arc::new(XChaChaKvStore::open_in_memory(b"lineage").unwrap());
+        let a = CohortGroup::create(
+            ScopeStateProvider::new(Arc::clone(&kv)),
+            "c-lin",
+            "node-a",
+            16,
+        )
+        .await
+        .unwrap();
+        let claim = a.creation_claim().await.expect("set at create");
+        assert_eq!(claim.committer_key_id(), "node-a");
+        let (_m, kp) = mint_cohort_key_material("node-b").unwrap();
+        let _add = a.add_member("node-b", kp).await.unwrap();
+        drop(a);
+        let a = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-lin", 16)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert_eq!(
+            a.creation_claim().await,
+            Some(claim.clone()),
+            "survives a reload"
+        );
+        // The creator's own leaf leaves the tree (a self room's creator device
+        // is removed); the lineage does not.
+        let _rot = a.rotate().await.unwrap();
+        assert!(a.member_added_at("node-b").await.is_some());
+        let _rm = a.remove_member("node-b").await.unwrap();
+        assert_eq!(a.creation_claim().await, Some(claim), "never pruned");
+
+        let (_f, material, welcome) = founder_and_welcome("c-lin-join", "node-c").await;
+        let c = CohortGroup::join(open_store(), "c-lin-join", material, &welcome, 16)
+            .await
+            .unwrap();
+        assert_eq!(
+            c.creation_claim().await,
+            None,
+            "a joiner never saw the creation"
+        );
+    }
+
+    /// CIRISEdge#697 / FSD §7 S11 — a Commit that was durable but never placed
+    /// comes back after a restart, byte-identical; `mark_placed` removes it
+    /// durably; a remote commit this node only applied never enters.
+    #[tokio::test]
+    async fn an_unplaced_commit_survives_a_restart_until_marked_placed() {
+        let kv = Arc::new(XChaChaKvStore::open_in_memory(b"outbox").unwrap());
+        let a = CohortGroup::create(
+            ScopeStateProvider::new(Arc::clone(&kv)),
+            "c-out",
+            "node-a",
+            16,
+        )
+        .await
+        .unwrap();
+        assert!(
+            a.unplaced_commits().await.is_empty(),
+            "genesis owes nothing"
+        );
+        let (material, kp) = mint_cohort_key_material("node-b").unwrap();
+        let add = a.add_member("node-b", kp).await.unwrap();
+        // "Crash": drop the handle without placing the Commit.
+        let (epoch, commit, welcome) = (
+            add.epoch(),
+            add.commit().to_vec(),
+            add.welcome().map(<[u8]>::to_vec),
+        );
+        let claim = add.claim().clone();
+        drop(add);
+        drop(a);
+        let a = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-out", 16)
+            .await
+            .unwrap()
+            .expect("persisted");
+        let owed = a.unplaced_commits().await;
+        assert_eq!(owed.len(), 1, "the reloaded group hands back what it owes");
+        assert_eq!(owed[0].epoch(), epoch);
+        assert_eq!(owed[0].commit(), commit.as_slice(), "Commit byte-identical");
+        assert_eq!(
+            owed[0].welcome().map(<[u8]>::to_vec),
+            welcome,
+            "Welcome byte-identical"
+        );
+        assert_eq!(owed[0].claim(), &claim);
+
+        // The joiner applies nothing it must place.
+        let b = CohortGroup::join(
+            open_store(),
+            "c-out",
+            material,
+            welcome.as_deref().unwrap(),
+            16,
+        )
+        .await
+        .unwrap();
+        let rot = a.rotate().await.unwrap();
+        let _ = b.apply_remote_commit(rot.commit()).await.unwrap();
+        assert!(
+            b.unplaced_commits().await.is_empty(),
+            "a remote apply never enters the outbox"
+        );
+        assert_eq!(
+            a.unplaced_commits().await.len(),
+            2,
+            "the add and the rotate"
+        );
+
+        a.mark_placed(epoch).await.unwrap();
+        a.mark_placed(epoch).await.unwrap(); // idempotent
+        drop(a);
+        let a = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-out", 16)
+            .await
+            .unwrap()
+            .expect("persisted");
+        let owed: Vec<u64> = a
+            .unplaced_commits()
+            .await
+            .iter()
+            .map(CohortCommit::epoch)
+            .collect();
+        assert_eq!(owed, vec![rot.epoch()], "mark_placed is durable");
+    }
+
+    /// CIRISEdge#697 / FSD §7 S12 — the outbox is never ahead of the head: a
+    /// crash between the ledger write and the head move leaves an entry for an
+    /// epoch the head never reached, and `load` drops it.
+    #[tokio::test]
+    async fn an_outbox_entry_above_the_head_is_dropped_at_load() {
+        let kv = Arc::new(XChaChaKvStore::open_in_memory(b"outbox-head").unwrap());
+        let store = ScopeStateProvider::new(Arc::clone(&kv));
+        let a = CohortGroup::create(store.clone(), "c-oh", "node-a", 16)
+            .await
+            .unwrap();
+        let (_m, kp) = mint_cohort_key_material("node-b").unwrap();
+        let add = a.add_member("node-b", kp).await.unwrap();
+        assert_eq!(add.epoch(), 1);
+        drop(a);
+        // Simulate the crash window: the ledger (with the outbox entry for
+        // epoch 1) is written, the head is still at 0.
+        store
+            .group_state_put("c-oh", HEAD_SLOT, &encode_head(0))
+            .await
+            .unwrap();
+        let a = CohortGroup::load(ScopeStateProvider::new(Arc::clone(&kv)), "c-oh", 16)
+            .await
+            .unwrap()
+            .expect("persisted");
+        assert_eq!(a.epoch().await, 0);
+        assert!(
+            a.unplaced_commits().await.is_empty(),
+            "a Commit for an epoch the group does not hold is never handed out"
+        );
     }
 
     /// CIRISEdge#676 / FSD §4.1 — the creator's own add instant is recorded

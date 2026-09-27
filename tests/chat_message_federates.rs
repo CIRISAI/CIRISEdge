@@ -486,6 +486,19 @@ async fn the_mls_handshake_rides_the_room_as_signed_rows() {
         .expect("the Welcome row is in the room");
     assert_eq!(got_welcome, welcome);
     assert_eq!(epoch, commit.epoch());
+    // CIRISEdge#696 / FSD §7 S13 — the addressed read carries the ROW's
+    // instant beside the bytes and epoch, so a restarted creator can tell
+    // whether a member was welcomed for its current add.
+    let placed = chat::welcome_for_row(&*w.dir, "alice-fed", &room, "bob-fed")
+        .await
+        .unwrap()
+        .expect("the Welcome addressed to bob is in the room");
+    assert_eq!(placed.bytes, welcome);
+    assert_eq!(placed.epoch, commit.epoch());
+    assert_eq!(
+        placed.asserted_at, w_row.asserted_at,
+        "the row's own instant"
+    );
     let b = CohortGroup::join(store("bob-wire"), &room, material, &got_welcome, 16)
         .await
         .unwrap();
