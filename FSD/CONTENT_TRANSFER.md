@@ -579,8 +579,10 @@ object `{name?, format, codec?}`, with the blob's **address digest as associated
 cannot be moved onto another blob). `name` is **optional inside the seal** — `FileWrite::filename`
 is `Option<&str>` and a nameless file is a valid file; the sealed object simply omits it, and the
 reader type carries `Option<String>`. What the contract forbids is a *cleartext* name beside a
-seal, and an *empty* name standing in for an absent one. Always in clear and required: `size` (checked before hashing by
-every holder, CC 5.3.2.5), the address `digest`, the room target, `content_digest`, `placeholder`.
+seal, and an *empty* name standing in for an absent one. Always in clear and **required**: `size` (checked before hashing by
+every holder, CC 5.3.2.5), the address `digest`, the room target, `content_digest` (encrypted case).
+**Optional, and in clear when present:** `placeholder` (a thumbhash; images only — a non-image file
+carries none and fabricates none).
 `format`/`codec` are in clear **iff** `sealed_descriptor` is absent — both present is refused as
 "one description" — and `name` never appears in clear beside a seal. The sniff check (CC 5.3.2.6)
 runs where the bytes decrypt, by the opener; a holder that cannot open the bytes cannot sniff and
@@ -595,8 +597,27 @@ covers both. Any other key — a per-room key edge derives, the pre-v24 `RoomKey
 node's identity seed — would be a second authorization surface and a second thing to rotate, and
 is refused here (memory rule: use the machinery we pay for; never invent a key).
 
-**What a reader sees.** With the DEK: name and media type, returned by `files::open` / `FileRef`
-after the bytes' key opens. Without it — a relay, a stolen disk, a mis-widened row (the class
+**What a reader sees, and the API that carries it.** The reader today is `FileRow::open(store,
+viewer) -> Result<Vec<u8>, UnopenedReason>` (bytes only) and stays as it is for byte-only callers.
+The producer lands beside it **`FileRow::open_described(store, viewer) -> Result<Opened,
+UnopenedReason>`** with `Opened { bytes: Vec<u8>, descriptor: Descriptor }` and
+
+```
+enum Descriptor {
+    Clear  { format: String, codec: Option<String>, name: Option<String> },   // pre-#698 row / plaintext tier: from the row's clear members
+    Opened { format: String, codec: Option<String>, name: Option<String> },   // sealed_descriptor opened with the bytes' key
+    Sealed,                                                                     // sealed_descriptor present, this viewer cannot open it (never reached from open_described's Ok — see below)
+}
+```
+
+`open_described` opens the descriptor **with the same call that opens the bytes** (one door, one
+grant check), so its `Ok` never carries `Sealed`; `Sealed` is what the *listing* (`FileRow` /
+`DrivePage`) reports for a row this viewer holds but cannot open, and `UnopenedReason` stays the
+error for a failed open. `FileRow.filename` / `FileRow.media_type` remain the **clear** members
+(`None` on a sealed row); the opened values live only in `Opened`. `name: None` inside `Opened`
+means absent-by-author; a sealed-to-this-viewer descriptor is `Descriptor::Sealed` on the row —
+never an empty string on either axis. With the DEK, then: name and media type via
+`open_described`. Without it — a relay, a stolen disk, a mis-widened row (the class
 CIRISPersist#919 fixed), a removed member's stale copy — the address, the size, the room target,
 and a descriptor that is **typed sealed** — never a cleartext name, and never an empty string standing
 in for an absent or unopened one (`Option` on both axes: absent-by-author vs sealed-to-this-reader). The row tables of the federation
@@ -620,13 +641,21 @@ images only). These are added to the compat pointer in the same change as `seale
 pre-#922 row satisfies the Source contract and D2's unauthorized reader gets the promised size and CIRISEdge#638's adoption of persist's `media`
 struct on file rows is sequenced after #922.
 
-**The producer must not leak the format through the blob write.** Sealing the pointer's
-`media_type` conceals nothing while `files::publish` still hands `SealRequest.media_type =
-Some(write.media_type)` to `GroupContentStore::seal`, which forwards it to `put_blob_scoped` —
-persist records it on the blob/holder metadata of discoverable tiers. For an encrypted-descriptor
-write the producer passes **`media_type: None`** to `seal` **and** `seal_stream_scoped`; the format
-lives only inside the seal. The D2 witness therefore asserts on **every substrate row the write
-generates** (the file row, the blob row, any holder row), not on the file row alone. (Persist to
+**The producer must not leak the format through the blob write — and the store, not the producer,
+decides.** Sealing the pointer's `media_type` conceals nothing while `files::publish` hands
+`SealRequest.media_type = Some(write.media_type)` to `GroupContentStore::seal`, which forwards it
+to `put_blob_scoped` — persist records it on the blob/holder metadata of discoverable tiers. But
+the producer **cannot** choose `None` up front: persist resolves the tier and returns it in
+`SealedContent.tier` (directory state can make even a community-scoped write plaintext), and a
+plaintext result must carry a clear `format`. So the suppression lives **inside the write API**:
+`SealRequest` gains a `Description { name: Option, format, codec: Option }` (replacing the bare
+`media_type`), and `seal` / `seal_chunked` — which see the resolved tier — either (a) encrypted
+tier: pass `media_type: None` to `put_blob_scoped` / `seal_stream_scoped`, seal the description
+through the persist door, and return the pointer with `sealed_descriptor` and no clear
+`format`/`codec`; or (b) plaintext tier: pass the format through and return a pointer with clear
+`format`/`codec`, no seal. One code path, one decision, after the tier is known. The D2 witness
+asserts on **every substrate row the write generates** (the file row, the blob row, any holder
+row), not on the file row alone, and runs once per resolved tier. (Persist to
 confirm `put_blob_scoped` / `seal_stream_scoped` accept `None` and store no format claim for it —
 noted on CIRISPersist#923.)
 
@@ -644,6 +673,7 @@ fork the shape persist#922 gates — so the producer waits rather than approxima
 Engine::seal_descriptor_for_blob(at_rest_sha256: &[u8;32], viewer_or_author_key_id: &str,
                                  plaintext_jcs: &[u8]) -> Result<Vec<u8> /* AEAD envelope, base64'd by the caller */, BlobError>
 Engine::open_descriptor_for_blob(at_rest_sha256: &[u8;32], viewer_key_id: &str,
+                                 caller_aad: &[u8],   // the referencing ROW's AAD (author, instant, field) — the blob is authenticated under it first
                                  sealed: &[u8]) -> Result<Vec<u8>, BlobError>
 ```
 — the DEK is the one that blob was sealed under (its recorded tier / community / epoch; the same
@@ -680,9 +710,9 @@ noted on CIRISPersist#923):
 | # | Invariant | Witness |
 |---|---|---|
 | D1 | A member who can open the bytes gets name + media type; the two facts are one | `files::a_member_opens_the_bytes_and_the_descriptor_together` |
-| D2 | A reader who cannot open the bytes gets a **typed sealed** descriptor and no plaintext name or format **anywhere in any substrate row the write generated** (file row, blob row, holder rows) | `files::an_unauthorized_reader_sees_a_pointer_a_size_and_no_description` (asserts on the row bytes) |
+| D2 | A reader who cannot open the bytes gets a **typed sealed** descriptor and no plaintext name, format **or codec** anywhere in any substrate row the write generated (file row, blob row, holder rows) | `files::an_unauthorized_reader_sees_a_pointer_a_size_and_no_description` (asserts on the row bytes) |
 | D3 | AAD binding: a `sealed_descriptor` copied onto another blob's row does not open | `files::a_descriptor_moved_to_another_blob_does_not_open` |
-| D4 | One description: a row with both `sealed_descriptor` and a clear `media_type`/`filename` is never produced; the reader refuses it by name | `files::a_row_with_two_descriptions_is_refused` |
+| D4 | One description: a row with both `sealed_descriptor` and a clear `media_type`/`codec`/`filename` is never produced; the reader refuses it by name | `files::a_row_with_two_descriptions_is_refused` |
 | D5 | Read-compat: pre-#698 rows (clear `filename` + `media_type`, no seal) still open and list | `files::a_v32_row_still_opens` (the old-shape vector is kept as a read case) |
 | D6 | Round trip through persist's real sqlite backend, both scope paths (self/family `InvisibleEncrypted`, community `CommunityDek`) | `tests/files_sealed_descriptor_e2e.rs` |
 | D7 | Mixed fleet: the row carries no `media` member; a v50 reader admits it | conformance vector, encrypted case |
