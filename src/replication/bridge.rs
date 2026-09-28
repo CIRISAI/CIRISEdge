@@ -10241,7 +10241,7 @@ pub(crate) mod tests {
     /// an `agent`-role member must be steward-bound (CC 3.2 / CC 3.4.7.1),
     /// while a `user`-role member self-anchors — the fixtures register
     /// community members as `user`.
-    async fn register_fixture_keys(backend: &MemoryBackend, keys: &[(&str, &str)]) {
+    pub(crate) async fn register_fixture_keys(backend: &MemoryBackend, keys: &[(&str, &str)]) {
         for (k, ty) in keys {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -10254,7 +10254,7 @@ pub(crate) mod tests {
 
     /// Hybrid-sign a [`Family`] for submission as `authority_key_id` —
     /// persist's `tier_ingest::test_support::sign_family` shape.
-    fn sign_family_fixture(authority_key_id: &str, family: Family) -> SignedFamily {
+    pub(crate) fn sign_family_fixture(authority_key_id: &str, family: Family) -> SignedFamily {
         let (_h, classical, pqc) =
             sign_attestation_envelope(authority_key_id, &family.signing_envelope());
         SignedFamily {
@@ -10281,7 +10281,7 @@ pub(crate) mod tests {
 
     /// Hybrid-sign a [`FamilyMembershipRevocation`] — mirrors
     /// [`sign_family_fixture`].
-    fn sign_family_membership_revocation_fixture(
+    pub(crate) fn sign_family_membership_revocation_fixture(
         authority_key_id: &str,
         revocation: FamilyMembershipRevocation,
     ) -> SignedFamilyMembershipRevocation {
@@ -10331,7 +10331,7 @@ pub(crate) mod tests {
     }
 
     /// Hybrid-sign a [`FamilyMembershipWidening`] — the family twin (#910).
-    fn sign_family_membership_widening_fixture(
+    pub(crate) fn sign_family_membership_widening_fixture(
         authority_key_id: &str,
         widening: ciris_persist::federation::FamilyMembershipWidening,
     ) -> SignedFamilyMembershipWidening {
@@ -10380,7 +10380,7 @@ pub(crate) mod tests {
     /// `consensus_protocol` form and every member key_id must be registered
     /// (persist `validate_family_members`); `family_key_id` itself is
     /// keyless (persist v24.0.0 dropped that FK).
-    fn fixture_family(family_key_id: &str, member_key_id: &str) -> Family {
+    pub(crate) fn fixture_family(family_key_id: &str, member_key_id: &str) -> Family {
         Family {
             family_key_id: family_key_id.to_string(),
             family_name: "E4 Pin Household".to_string(),
@@ -10420,7 +10420,7 @@ pub(crate) mod tests {
     }
 
     /// The family twin of [`fixture_community_founded`].
-    fn fixture_family_founded(
+    pub(crate) fn fixture_family_founded(
         family_key_id: &str,
         founder_key_id: &str,
         member_key_id: &str,
@@ -17064,7 +17064,11 @@ pub(crate) mod tests {
         }
     }
 
-    async fn seed_owner_binding(backend: &MemoryBackend, owner: &str, node: &str) -> String {
+    pub(crate) async fn seed_owner_binding(
+        backend: &MemoryBackend,
+        owner: &str,
+        node: &str,
+    ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = owner_binding_envelope(&id, owner, node);
         seed_raw_attestation(backend, &id, owner, node, "delegates_to", envelope).await;

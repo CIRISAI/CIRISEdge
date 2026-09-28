@@ -307,7 +307,7 @@ prove a family branch — each row below names its own.
 | **R2** row reaches every member's nodes | send set ∪= the nodes hosting each active member's occurrences (implicit) | persist §6.1 | `RecipientNotInSendSet` | — *(persist: "a family row authored by A is held on member B's node with no grant")* |
 | **R3** key reaches every member | wrapped per member at write; **retroactive on new member** (CC 8.1.12.4) | persist §6.5 | `NotGranted` | — *(persist: "a member admitted after the write opens the write")* |
 | **R4** holder known | the author's nodes (as self); a member's node that adopted may serve but **nothing points at it** (§6.4) | edge §6.2 | `NoOtherNode` | — *(edge: "a family row's pull asks the author's nodes, never list_holders")* |
-| **R5** holder addressed | `BlobMeaning::project` yields `Group { Family, group_id = family_key_id }` ✓ v29.4.0 (read through persist's `envelope_cohort_target`, four aliases, disagreement refused `GroupIdAmbiguous` — CIRISPersist#887); the **family group** installed: members = the nodes of every active member | edge `meaning.rs` family arm ✓; `family_addressing::snapshot` —; host drives on roster change | `blob_group_not_installed { scope: family }` | projector: `meaning::facets_646::a_family_row_reads_family_key_id_through_persists_cohort_target_reader` ✓; group: — |
+| **R5** holder addressed | `BlobMeaning::project` yields `Group { Family, group_id = family_key_id }` ✓ v29.4.0 (read through persist's `envelope_cohort_target`, four aliases, disagreement refused `GroupIdAmbiguous` — CIRISPersist#887); the **family group** installed: members = the nodes of every active member | edge `meaning.rs` family arm ✓; `family_room::{roster, snapshot}` ✓ (CIRISEdge#646 family half); host drives on roster change | `blob_group_not_installed { scope: family }` | projector: `meaning::facets_646::a_family_row_reads_family_key_id_through_persists_cohort_target_reader` ✓; group: — |
 | **R6** holder serves | arrival on the family group ∧ requester is an active member's node (`SenderStanding::MemberOfJoinedGroup` at family) | edge `admit_blob_serve` | `blob_serve_arrival_scope_insufficient` | — *(edge: "a member's node is served on the family address; a non-member's node is refused by name")* |
 | **R7** bytes adopted | `is_audience` family arm (`author_is_local_or_family`); adopt `LocalOnly` | persist | `NotPartyTo` | — *(persist: "a family row adopts on a member's node and is `NotPartyTo` on a non-member's")* |
 | **R8** reader opens | wrap for this device's occurrence, as a member | edge `group_content` | `Body::Unopened` | — *(e2e: "a member's device opens what another member wrote")* |
@@ -464,8 +464,8 @@ no chicken-and-egg. Welcome is HPKE-wrapped under the invitee's X-Wing key (CC 5
 
 `self_room::snapshot(group, identity)` is the twin of `cohort_addressing::snapshot`, differing only
 in the key; there is no person-to-node walk and so no `unresolved` set, because the tree already
-holds nodes. **Family** is the same shape with the roster from `list_families_for_member_active`
-(§6.4).
+holds nodes. **Family** is the same shape with the roster from the family's authorized roster
+(§6.4.1).
 
 This reuses the CC 5.4.6 substrate — derived addresses are transport privacy for *any* non-public
 cohort — without being the community approach: no holder claim, no swarm discovery, no community
@@ -478,6 +478,46 @@ Each member's node receives the row by fan-out; the holder by construction is th
 (the minter); other family nodes that adopted may serve a fetch addressed to them but nothing points
 anyone at them. "Any member's device may serve any other's" holds only opportunistically, which is
 what CC 5.2 permits: no advertisement, ever.
+
+### 6.4.1 The family room (edge, `family_room`) — membership in place of principal equality
+
+The family room is the self room's machinery with ONE predicate swapped. A self room's members are
+the nodes of ONE principal (`nodes_owned_by(identity)`); a family room's members are the nodes of
+EVERY ACTIVE MEMBER of the family. Those are different predicates and each is asked of its own
+authority, never of the other:
+
+| question | self room | family room |
+|---|---|---|
+| who belongs (persons) | the identity — principal equality | persist `active_family_members(family)` — the **authorized** roster fold (v49 #910/#908: record ∪ `FamilyMembershipWidening` − revocations, by `effective_at`, only events whose signers had standing under the family's `consensus_protocol`) |
+| person → nodes | `nodes_owned_by(identity)` | `nodes_owned_by(member)` per member — the same walk the send set's node half uses (CIRISEdge#524), so the room and the row's recipients cannot disagree about a person's devices |
+| which rooms does this node owe | its owner's one self room | `list_families_for_member_active(owner_of(node))` — the member-side twin of the same fold (a node with no owner is its own principal) |
+| creator rule, contest, add / remove / rejoin | `self_room::decide` | **the same `decide`** — it is a rule over a sorted node set and a held tree, and knows nothing of why a node belongs |
+
+- **Roster** — `family_room::roster(directory, family, lens) -> FamilyRoster { nodes, by_member,
+  unresolved }`: `nodes` sorted and deduplicated (the creator rule is an ordering over it); `by_member`
+  keeps which person each node came through, for the host's receipts; `unresolved` names members
+  with no node yet (a person whose owner binding has not replicated) — reported, never guessed, and
+  not an error: the member joins the room when their node appears. An unknown family is an error by
+  name (persist's `InvalidArgument`), never an empty roster.
+- **What a removed member stops receiving.** A revocation leaves the authorized roster at its
+  `effective_at`; the next `roster` omits every node of that person, `decide` answers `Remove(those
+  nodes)` before anything else (removal first, the #646 review rule), the epoch advances, and what
+  follows is forward-secure from them. A member's OWN second device is in the room *because the
+  member is*, not because the device is — revoke the device's occurrence/owner binding and it leaves;
+  revoke the member and all of their devices leave.
+- **Standing** is persist's (#908): edge never decides whether a widening or revocation counts; it
+  reads the fold that already applied the family's protocol.
+- **Not memoized.** Neither roster is: each is read when the host drives `decide` (on a roster-change
+  event or its cadence), and persist's readers are the cache. A memo would need the family plane's
+  change events wired to invalidate it — its own change if profiling asks for it.
+- `family_room::snapshot(group, family)` is `self_room::snapshot` keyed by `ScopeRoom::family`.
+
+Witnesses (`family_room::tests`, over persist's real memory backend and `PersistLens`): with family
+F{alice (founder), bob}, bob's node is in F's node set and NOT in alice's self roster; alice's second
+device is in F's set through alice and IS in alice's self roster (both predicates asserted
+separately); a founder-signed `FamilyMembershipWidening` adding carol puts carol's node in the set; a
+founder-signed revocation of bob takes every one of bob's nodes out and `decide` answers `Remove`; a
+stranger's node is never in it; an unknown family is refused by name.
 
 ### 6.5 Retroactive re-grant on a new occurrence (persist)
 
