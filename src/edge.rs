@@ -8536,6 +8536,9 @@ async fn verify_self_at_login_delegation(
     let mut saw_missing_scope = false;
     let mut saw_retracted = false;
     let mut saw_substrate_fault = false;
+    // persist v50.0.0 (#928, CIRISEdge#701) — a chain that continues past the
+    // effective depth cap. Named, never a substrate fault.
+    let mut saw_beyond_depth_cap = false;
     // Both `SignerUnreached` and persist's `NoTrustRoots` (issuer
     // emitted no delegation edges) map onto edge's `SignerUnreached`
     // — they're indistinguishable from the gate's vantage. We don't
@@ -8562,6 +8565,20 @@ async fn verify_self_at_login_delegation(
                         "reachable_under_scope_with_reasons returned SubstrateUnavailable verdict",
                     );
                     saw_substrate_fault = true;
+                }
+                // persist v50.0.0 (CIRISPersist#928, CC 4.1.1; CIRISEdge#701)
+                // — "too deep to confer": no transitive trust past the cap
+                // (self-verify only). A verdict about the chain; booking it as
+                // a substrate fault (the wildcard below) would misname it.
+                ReachabilityVerdict::BeyondDepthCap => {
+                    tracing::debug!(
+                        event = "edge.delegation_gate.beyond_depth_cap",
+                        root = %root,
+                        max_depth,
+                        "delegation chain continues past the effective depth cap — \
+                         no transitive trust past it (CC 4.1.1)",
+                    );
+                    saw_beyond_depth_cap = true;
                 }
                 ReachabilityVerdict::SignerUnreached | ReachabilityVerdict::NoTrustRoots => {
                     // Both fall through to the default `SignerUnreached`
@@ -8604,6 +8621,11 @@ async fn verify_self_at_login_delegation(
         Err(DelegationRefusalSubReason::MissingScope)
     } else if saw_retracted {
         Err(DelegationRefusalSubReason::RetractedAtRoot)
+    } else if saw_beyond_depth_cap {
+        // A chain exists and carries the scope — it is just longer than this
+        // node confers across. More informative than a substrate fault or
+        // "unreached", less than an explicit retraction or a missing scope.
+        Err(DelegationRefusalSubReason::BeyondDepthCap)
     } else if saw_substrate_fault {
         Err(DelegationRefusalSubReason::SubstrateUnavailable)
     } else {
@@ -8930,6 +8952,17 @@ mod delegation_gate_tests {
     /// v6.5.0 `self_at_login` shape: scope as JSON array.
     #[allow(clippy::similar_names)] // granter/grantee mirrors persist's column names
     fn delegates_to_row(granter: &str, grantee: &str, scope: &[&str]) -> Attestation {
+        delegates_to_row_with(granter, grantee, scope, false)
+    }
+
+    /// [`delegates_to_row`] with `sub_delegation` set, so the grantee may
+    /// deputize onward (persist's walk refuses a hop past depth 1 without it).
+    fn delegates_to_row_with(
+        granter: &str,
+        grantee: &str,
+        scope: &[&str],
+        sub_delegation: bool,
+    ) -> Attestation {
         // v31.0.0 (CIRISPersist#598): µs-truncate the instant so the signed
         // `asserted_at` and its typed column agree at postgres resolution.
         let now =
@@ -8941,6 +8974,11 @@ mod delegation_gate_tests {
             "bilateral_pair_id": format!("pair-{granter}-{grantee}"),
             "scope": scope,
         });
+        if sub_delegation {
+            if let Some(obj) = envelope.as_object_mut() {
+                obj.insert("sub_delegation".to_owned(), serde_json::json!(true));
+            }
+        }
         // #598: bind the signed `asserted_at` into the envelope BEFORE signing.
         if let Some(obj) = envelope.as_object_mut() {
             obj.insert(
@@ -9150,6 +9188,68 @@ mod delegation_gate_tests {
         )
         .await;
         assert_eq!(out, Ok(()));
+    }
+
+    /// persist v50.0.0 (CIRISPersist#928, CC 4.1.1; CIRISEdge#701) — a
+    /// six-hop chain `user-root → d1 → … → d5 → agent`, every hop carrying the
+    /// scope and `sub_delegation`. Built once, walked at two depths below.
+    async fn six_hop_chain() -> Arc<dyn ciris_persist::federation::FederationDirectory> {
+        let backend = Arc::new(MemoryBackend::new());
+        let keys = ["user-root", "d1", "d2", "d3", "d4", "d5", "agent"];
+        let mut seeded = vec![("user-root", identity_type::USER)];
+        for k in &keys[1..] {
+            seeded.push((k, identity_type::AGENT));
+        }
+        seed_keys(&backend, &seeded).await;
+        for w in keys.windows(2) {
+            seed_attestation(
+                &backend,
+                delegates_to_row_with(w[0], w[1], &super::SELF_AT_LOGIN_SCOPE_TOKENS, true),
+            )
+            .await;
+        }
+        backend
+    }
+
+    /// CIRISEdge#701 — a chain that continues past this node's depth cap is
+    /// refused as `BeyondDepthCap` ("too deep to confer"), NOT booked as a
+    /// substrate fault (the pre-v50 wildcard's reading).
+    #[tokio::test]
+    async fn a_chain_past_the_depth_cap_is_beyond_depth_cap_not_a_substrate_fault() {
+        let dir = six_hop_chain().await;
+        let out = verify_self_at_login_delegation(
+            "agent",
+            &dir,
+            &["user-root".into()],
+            SCOPE_MESSAGE_IO,
+            4,
+        )
+        .await;
+        assert_eq!(
+            out,
+            Err(crate::messages::DelegationRefusalSubReason::BeyondDepthCap),
+            "a 6-hop chain under a 4-hop cap is too deep to confer, named as such"
+        );
+    }
+
+    /// CIRISEdge#701 — the same chain under an explicit deeper cap (the 16-hop
+    /// ceiling, opt-in) is walked and admits.
+    #[tokio::test]
+    async fn the_same_chain_under_an_explicit_deeper_cap_admits() {
+        let dir = six_hop_chain().await;
+        let out = verify_self_at_login_delegation(
+            "agent",
+            &dir,
+            &["user-root".into()],
+            SCOPE_MESSAGE_IO,
+            16,
+        )
+        .await;
+        assert_eq!(
+            out,
+            Ok(()),
+            "the explicit 16-hop opt-in reaches the sixth hop"
+        );
     }
 
     #[tokio::test]
