@@ -410,6 +410,8 @@ pub async fn signed_community(
         scrub_signature_classical,
         scrub_signature_pqc,
         supersede_proof: None,
+        cosignatures: Vec::new(),
+        lineage: Vec::new(),
     })
 }
 

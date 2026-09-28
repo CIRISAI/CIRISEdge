@@ -1093,6 +1093,8 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
             scrub_signature_classical: B64.encode(&ed_sig),
             scrub_signature_pqc: Some(B64.encode(&pqc_sig)),
             supersede_proof: None,
+            cosignatures: Vec::new(),
+            lineage: Vec::new(),
         })
         .await
         .expect("seed the room");

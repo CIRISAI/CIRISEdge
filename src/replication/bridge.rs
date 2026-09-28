@@ -110,7 +110,7 @@ use ciris_persist::federation::types::{
     SignedFamilyMembershipRevocation, SignedFamilyMembershipWidening, SignedIdentityOccurrence,
     SignedIdentityOccurrenceRevocation, SignedKeyRecord, SignedLocationProof, SignedRevocation,
 };
-use ciris_persist::federation::{AttestationOutcome, FederationDirectory};
+use ciris_persist::federation::FederationDirectory;
 use ciris_verify_core::threshold::ThresholdMember;
 
 use super::directory::ReplicationDirectory;
@@ -430,7 +430,14 @@ fn key_refusal_retry(reason: KeyRefusalReason) -> RetryDisposition {
         // if it is rebound by its holder the same offer is `ConflictingVersion`
         // — refused in every successor state, the `ConflictingVersion`
         // argument verbatim.
-        | KeyRefusalReason::RebindChangesRecord => RetryDisposition::Terminal,
+        | KeyRefusalReason::RebindChangesRecord
+        // persist v50.0.0 (CC 3.4.7.3 Clause A, #925 review H3) — a replicated
+        // record that would FUSE `node` with `agent`/`user`, or add/remove
+        // `node` from a stored `identity_type`. `node` is fixed at mint and the
+        // offered bytes are fixed, so no later state admits this offer: the key
+        // re-mints instead. Terminal, the `ConflictingVersion` argument again.
+        | KeyRefusalReason::NodeIdentityFused
+        | KeyRefusalReason::NodeIdentityChanged => RetryDisposition::Terminal,
         // v44.7.0 (#864) — `NotSelfSigned` / `RecordAbsent` are verdicts of the
         // LOCAL rebind door (`rebind_key_record`), which the replication plane
         // never runs: a fresh node INSERTS a bound record, a holder REBINDS.
@@ -7821,41 +7828,16 @@ impl FederationDirectoryReplicationBridge {
                 // plan/act race ⇒ `store_conflict` (transient).
                 //
                 // An ATTRIBUTED receive keeps the privileged SYNC door naming the
-                // peer (v41 origin, see above). That door decides the same id
-                // pre-write too (`attestation_reput_verdict`: equal
-                // `persist_row_hash` ⇒ `AlreadyHeld`, else `Error::Conflict`) but
-                // has no typed outcome and cannot tell decoration-only from a
-                // true conflict — so its `Conflict` is mapped to the SAME
-                // `conflicting_attestation` token (first-seen still wins;
-                // terminal). An origin-aware typed door is the persist ask that
-                // would let the synced path name `already_present_identical`.
+                // peer (v41 origin, see above). Since persist v50.0.0 (#917) that
+                // door returns the SAME typed `ReplicatedAttestationOutcome` as
+                // the unattributed one, so both doors map through
+                // `attestation_outcome_to_apply`: a decoration-only re-delivery
+                // is `already_present_identical` (a Duplicate) on both, and a
+                // true same-id conflict is `conflicting_attestation` (terminal)
+                // on both. The pre-v50 `Err(Conflict)` special case is gone.
                 let (outcome, refusal_token) = match source_peer {
                     Some(peer) => match self.directory.put_attestation_synced(record, peer).await {
-                        Ok(AttestationOutcome::Inserted) => (ApplyOutcome::Admitted, None),
-                        // Byte-identical row already held: routine non-progress,
-                        // exactly like `ReplicatedKeyOutcome::Unchanged`. COUNTED
-                        // (`inc_duplicate(Attestation)` at the #425 choke) and QUIET.
-                        Ok(AttestationOutcome::AlreadyHeld) => (ApplyOutcome::Duplicate, None),
-                        // `AttestationOutcome` is `#[non_exhaustive]` — the
-                        // MAXIMAL_UNKNOWN trap: a future variant must NOT land as a
-                        // quiet `Admitted`/`Duplicate`. LOUD and TERMINAL (#544): the
-                        // verdict is a property of THIS BUILD's vocabulary.
-                        Ok(other) => (
-                            ApplyOutcome::refused_terminal(format!(
-                                "Attestation: persist returned an AttestationOutcome this edge \
-                                 build does not know ({other:?}); adopt the persist cut that \
-                                 added it — CIRISPersist#771 (content_hash={content_hash})"
-                            )),
-                            None,
-                        ),
-                        Err(ciris_persist::federation::Error::Conflict(_)) => {
-                            attestation_outcome_to_apply(
-                                ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome::Refused {
-                                    reason: ciris_persist::federation::attestation_apply::AttestationRefusalReason::ConflictingAttestation,
-                                },
-                                &content_hash,
-                            )
-                        }
+                        Ok(o) => attestation_outcome_to_apply(o, &content_hash),
                         // persist v38.2.0 (CIRISEdge#522) — the door classes (AV-45
                         // membership, AV-84 third-party rows) arrive as typed persist
                         // variants and `refuse` names + counts them.
@@ -9465,6 +9447,10 @@ pub(crate) mod tests {
             // v44.7.0 — a rebind-shaped offer whose claim moved: the same
             // fixed-bytes-vs-stored-claim argument as `ConflictingVersion`.
             KeyRefusalReason::RebindChangesRecord,
+            // v50.0.0 (CC 3.4.7.3 Clause A) — `node` is fixed at mint; a fused
+            // or node-changing offer is refused in every successor state.
+            KeyRefusalReason::NodeIdentityFused,
+            KeyRefusalReason::NodeIdentityChanged,
         ];
         for &reason in KeyRefusalReason::ALL {
             // Drive the mapping the field drives, not the private fn alone.
@@ -10276,6 +10262,8 @@ pub(crate) mod tests {
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
             supersede_proof: None,
+            cosignatures: Vec::new(),
+            lineage: Vec::new(),
         }
     }
 
@@ -11337,6 +11325,8 @@ pub(crate) mod tests {
                     scrub_signature_classical: String::new(),
                     scrub_signature_pqc: None,
                     supersede_proof: None,
+                    cosignatures: Vec::new(),
+                    lineage: Vec::new(),
                 })
                 .expect("serialize"),
             ),
