@@ -42,32 +42,43 @@ What was **not** durable, and is after this cut:
 
 ---
 
-## 1. Key root and degraded posture
+## 1. Key root, the two custody kinds, and the one refusal (persist v50.0.0 #920, CIRISEdge#694)
 
-- **The key is persist's.** `XChaChaKvStore::open_mls_state(path)` derives the store key by HKDF
-  (CIRISVerify) from persist's one hardware-sealed seed under `MLS_STATE_CONTEXT =
-  "mls-state-at-rest-v1"` — the same root as the secrets master and the content-at-rest master, so
-  every host gets the same custody and there is still one seed to seal. Only the first open of an
-  empty store may seal a seed; a store in use re-derives and never mints (§11.7).
-- **No seed ⇒ `KVError::HardwareCustodyUnavailable`** (no TPM / Keystore / Secure Enclave, a
-  build without `secrets`, `CIRIS_DATA_DIR` unset, or a seed gone missing under a store in use).
-  Edge surfaces it by name as `MlsStateUnavailable::HardwareCustodyUnavailable(detail)` and
-  **opens nothing**. The host chooses: keep MLS state in memory (`ScopeStateProvider::ephemeral()`
-  — today's behaviour, a restart loses group state, stated as such), or open with
-  `XChaChaKvStore::open(path, passphrase)` where the passphrase is the **operator's** (FSD §7.8
-  phone-class tier). **Edge refuses to derive a passphrase from anything** — not a room id, not a
-  key id, not a path. A room id is public; a key sealed under it is a key sealed under nothing.
-- **Sync and blocking.** The opener touches the TPM and the filesystem; edge runs it under
-  `tokio::task::spawn_blocking`. Hosts call the async wrapper, never persist's opener directly.
+- **The key is persist's, and it follows the content master.** `Engine::open_mls_state(path)`
+  derives the store key by HKDF (CIRISVerify) under `MLS_STATE_CONTEXT = "mls-state-at-rest-v1"`
+  from **the root the persisted `federation_content_master` row names**: the hardware-sealed seed
+  (`key_kind='hardware'`) or the persisted **software** content master (`key_kind='software'`,
+  `BLOB_ENCRYPTION_AT_REST.md` §4.3/§10.2 — "a software fallback that is honest about being
+  software"). The MLS store is content at rest; there is no seed file and no third root. **The row
+  wins**: a store created on a software host keeps opening after a TPM appears. A node with no row
+  yet gets one on first open, exactly as its first encrypted blob write would create it.
+- **Two custody kinds, both durable on disk.** The opener returns `MlsStateCustody { kind:
+  Hardware | Software, descriptor }` beside the store; edge logs the kind by name and returns it.
+  A host with no TPM / Keystore / Secure Enclave (every CI runner) opens **on disk** as `Software`
+  — a custody *class*, not a failure (CC 4.2.2.1; verify reports `HardwareType::SoftwareOnly` the
+  same way). A v32.1.0 store keyed from the hardware seed under a software row opens through
+  persist's compat arm and is reported `Hardware` with a `legacy-v49-…` descriptor, not re-keyed.
+- **One refusal: §11.7.** `KVError::HardwareCustodyUnavailable` now means only that the row says
+  hardware and the seed is unreachable (or the compat arm's hardware key is unreachable); nothing
+  is written and nothing is minted. Edge surfaces it by name as
+  `MlsStateUnavailable::HardwareCustodyUnavailable(detail)` and **opens nothing**; that is the
+  only case a host falls back to `ScopeStateProvider::ephemeral()` (in memory, a restart loses
+  group state, stated as such) or an operator passphrase (`XChaChaKvStore::open(path,
+  passphrase)`, FSD §7.8 phone-class tier). **Edge refuses to derive a passphrase from anything** —
+  not a room id, not a key id, not a path. A wrong-keyed store on a host with no hardware storage is
+  `WrongPassphrase` → `MlsStateUnavailable::Store`.
+- **Async; the engine does the blocking.** `mls::scope_state::open_mls_state(engine, path)` awaits
+  persist's `Engine::open_mls_state` (it reads the content-master row); hosts call edge's wrapper.
 
 ---
 
 ## 2. Host wiring contract
 
 ```text
-open   : mls::scope_state::open_mls_state(path).await
-           -> Ok(ScopeStateProvider)                          durable, hardware-rooted
-           -> Err(MlsStateUnavailable::HardwareCustodyUnavailable(detail))   choose §1's posture
+open   : mls::scope_state::open_mls_state(&engine, path).await
+           -> Ok((ScopeStateProvider, MlsStateCustody))       durable ON DISK; log custody.kind
+                                                              (hardware | software) by name
+           -> Err(MlsStateUnavailable::HardwareCustodyUnavailable(detail))   §11.7 only: §1's fallback
            -> Err(MlsStateUnavailable::Store(KVError))        wrong key / tamper / backend: do not
                                                               silently fall back — a store that
                                                               fails to open is a store to inspect
@@ -260,7 +271,7 @@ tree's — the tree may be behind; `decide` closes the gap on the next tick.
 | # | Invariant | Witness |
 |---|---|---|
 | S1 | A group written through one `ScopeStateProvider` is readable through a **fresh** provider over the same store bytes (restart), at the same epoch with the same exporter secret. | `cohort_group` (existing) + `boot::a_restarted_node_readdresses_every_persisted_room` |
-| S2 | `open_mls_state` on a host with no sealed seed returns `MlsStateUnavailable::HardwareCustodyUnavailable` by name and opens nothing; no file is created with a derived key. | `scope_state::no_hardware_seed_is_the_named_degraded_posture` (runs on every CI runner — none has a TPM) |
+| S2 | `open_mls_state(engine, path)` on a host with no hardware storage opens the store **on disk** under the persisted software content master, reports the custody kind by name, and re-opens it with the same kind and the same contents; the in-memory fallback is reachable only through persist's §11.7 refusal. | `scope_state::a_tpm_less_host_opens_the_store_on_disk_as_software` (runs on every CI runner — none has a TPM) |
 | S3 | Pending join material survives a restart: stash → fresh `CohortGroups` over the same store → `restore_key_material` → `join(welcome)` succeeds; the stash is cleared after the join. | `cohort_group::pending_join_material_survives_a_restart_and_is_consumed_once` |
 | S4 | `decide` answers `Rejoin(m)` iff `m` is in the tree and re-published; `Remove` and `Abandon` rank above it; `Add` below it. | `self_room::a_re_published_key_package_from_a_tree_member_is_a_rejoin` and the ordering tests |
 | S5 | `republished_members` is computed from rows the node holds and the persisted add instants; a KeyPackage older than the add is never a signal. | `self_room::republished_is_only_a_key_package_newer_than_the_add` |

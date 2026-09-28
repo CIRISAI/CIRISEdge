@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use ciris_persist::encrypted_kv::{EncryptedKVStore, KVError, XChaChaKvStore};
+use ciris_persist::encrypted_kv::{EncryptedKVStore, KVError, MlsStateCustody, XChaChaKvStore};
 
 use super::archive_mode::{ArchiveMode, ArchiveModeError, ARCHIVE_MODE_NAMESPACE};
 
@@ -149,28 +149,40 @@ pub enum MlsStateUnavailable {
     Join(String),
 }
 
-/// CIRISEdge#676 — **open the durable MLS-state store at `path`, keyed from
-/// persist's hardware-sealed seed** (persist v49.0.0 #911,
-/// [`XChaChaKvStore::open_mls_state`]), off the async worker.
+/// CIRISEdge#676 / #694 — **open the durable MLS-state store at `path`,
+/// keyed from the root persist's content master resolves to on this host**
+/// (persist v50.0.0 #920, `Engine::open_mls_state`), and report which.
 ///
-/// Only the first open of an empty store may seal a seed; a store in use
-/// re-derives and never mints (persist `BLOB_ENCRYPTION_AT_REST.md` §11.7).
-/// One store per node, every room namespaced inside it (FSD §2).
+/// The root is named by the persisted `federation_content_master` row: the
+/// hardware-sealed seed where the row says `hardware`, otherwise the persisted
+/// SOFTWARE content master (`BLOB_ENCRYPTION_AT_REST.md` §4.3 — "a software
+/// fallback that is honest about being software"). **Both are durable on
+/// disk**; a TPM-less host (every CI runner) opens the store and gets
+/// [`MlsStateCustodyKind::Software`] by name — a custody CLASS, never a
+/// failure (CC 4.2.2.1). The kind is logged here and returned so the host can
+/// report it. One store per node, every room namespaced inside it (FSD §2).
 ///
 /// # Errors
-/// [`MlsStateUnavailable`] — see its variants; the caller branches on them.
+/// [`MlsStateUnavailable::HardwareCustodyUnavailable`] is persist's §11.7
+/// refusal only — the row says hardware and the seed is unreachable — and is
+/// the one case a host falls back to [`ScopeStateProvider::ephemeral`].
+/// Every other refusal is [`MlsStateUnavailable::Store`].
 pub async fn open_mls_state(
+    engine: &ciris_persist::Engine,
     path: impl AsRef<Path>,
-) -> Result<ScopeStateProvider, MlsStateUnavailable> {
+) -> Result<(ScopeStateProvider, MlsStateCustody), MlsStateUnavailable> {
     let path = path.as_ref().to_path_buf();
-    let opened = tokio::task::spawn_blocking({
-        let path = path.clone();
-        move || XChaChaKvStore::open_mls_state(&path)
-    })
-    .await
-    .map_err(|e| MlsStateUnavailable::Join(e.to_string()))?;
-    match opened {
-        Ok(kv) => Ok(ScopeStateProvider::new(Arc::new(kv))),
+    match engine.open_mls_state(&path).await {
+        Ok((kv, custody)) => {
+            tracing::info!(
+                path = %path.display(),
+                custody = custody.kind.as_str(),
+                descriptor = %custody.descriptor,
+                "MLS-state store opened on disk (custody `{}`)",
+                custody.kind.as_str()
+            );
+            Ok((ScopeStateProvider::new(Arc::new(kv)), custody))
+        }
         Err(KVError::HardwareCustodyUnavailable(detail)) => {
             Err(MlsStateUnavailable::HardwareCustodyUnavailable(detail))
         }
@@ -194,8 +206,10 @@ impl ScopeStateProvider {
 
     /// CIRISEdge#676 — an **in-memory** store under a random one-shot key:
     /// the named "state does not survive this process" posture a host
-    /// chooses when [`open_mls_state`] answers
-    /// [`MlsStateUnavailable::HardwareCustodyUnavailable`]. Replaces every
+    /// chooses ONLY when [`open_mls_state`] answers
+    /// [`MlsStateUnavailable::HardwareCustodyUnavailable`] — persist's §11.7
+    /// refusal (the row says hardware, the seed is unreachable). A host with no
+    /// TPM does NOT get here: it opens on disk under the software master. Replaces every
     /// `open_in_memory(room_id)` (a room id is public; a key sealed under it
     /// is a key sealed under nothing).
     ///
@@ -605,24 +619,63 @@ mod tests {
         assert_eq!(provider.member_joins_get("other").await.unwrap(), None);
     }
 
-    /// FSD §7 S2 — on a host with no hardware-sealed seed (every CI runner,
-    /// and this one), the opener answers the DEGRADED POSTURE BY NAME and
-    /// opens nothing: no file is created under a derived key.
+    /// FSD §7 S2 (v50, #694) — on a host with no hardware storage (every CI
+    /// runner, and this one) the opener opens ON DISK under the persisted
+    /// SOFTWARE content master and says so by name; a hardware host opens
+    /// `Hardware`. Either way the store is durable: re-opening through the
+    /// same engine reads back what was written. The degraded in-memory posture
+    /// is reachable only through persist's §11.7 refusal, which this host
+    /// cannot produce.
     #[tokio::test]
-    async fn no_hardware_seed_is_the_named_degraded_posture() {
+    async fn a_tpm_less_host_opens_the_store_on_disk_as_software() {
+        use ciris_persist::encrypted_kv::MlsStateCustodyKind;
+        use ciris_persist::store::backend::Backend as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("mls-state.kv");
-        match open_mls_state(&path).await {
-            Err(MlsStateUnavailable::HardwareCustodyUnavailable(detail)) => {
-                assert!(!detail.is_empty(), "the refusal names its cause");
-            }
-            Ok(_) => {
-                // A host WITH a sealed seed opens durably — also correct; the
-                // witness is that the answer is one of the two named ones.
-                assert!(path.exists(), "a durable open creates the store");
-            }
-            Err(other) => panic!("neither posture: {other:?}"),
-        }
+        let backend = ciris_persist::prelude::FederationDirectorySqlite::open(
+            dir.path().join("persist.db").to_string_lossy().to_string(),
+        )
+        .await
+        .expect("open substrate");
+        backend.run_migrations().await.expect("migrate");
+        let mut ed = ciris_keyring::Ed25519SoftwareSigner::new("mls-state-test");
+        ed.import_key(&[9u8; 32]).expect("import test key");
+        let signer: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(ed);
+        let engine = ciris_persist::Engine::from_shared(
+            ciris_persist::BackendDispatch::Sqlite(backend),
+            signer,
+        );
+        let (p, custody) = open_mls_state(&engine, &path)
+            .await
+            .expect("a host without a TPM still opens a durable store");
+        assert!(path.exists(), "the store is ON DISK, not in memory");
+        assert!(
+            matches!(
+                custody.kind,
+                MlsStateCustodyKind::Software | MlsStateCustodyKind::Hardware
+            ),
+            "the custody class is reported by name: {custody:?}"
+        );
+        assert!(
+            !custody.descriptor.is_empty(),
+            "the descriptor names the root"
+        );
+        p.group_state_put("r", 0, b"state").await.expect("write");
+        drop(p);
+        let (reopened, again) = open_mls_state(&engine, &path).await.expect("reopen");
+        assert_eq!(
+            again.kind, custody.kind,
+            "the row wins: same custody on reopen"
+        );
+        assert_eq!(
+            reopened
+                .group_state_get("r", 0)
+                .await
+                .expect("read")
+                .as_deref(),
+            Some(&b"state"[..]),
+            "durable across opens"
+        );
     }
 
     /// FSD §7 S7 — a store opened under another key is refused, not decoded
