@@ -14,11 +14,9 @@
 //! persist ([`ciris_persist::federation::namespace::attestation_family`], read
 //! by [`crate::family_gates::gates_for`]); the full-match, refusal-bearing
 //! matcher the vectors describe is persist v50's
-//! `namespace::matcher::match_family` (CIRISPersist#924), which does not exist
-//! at the pinned persist v49. The replay therefore lands `#[ignore]`d in
-//! [`crate::field_conformance`] and is wired at the v33.0.0 adopt
-//! (CIRISEdge#702); what runs today is the pin, the fixture checks and the
-//! family-helper coverage, which need no matcher.
+//! `namespace::matcher::match_family` (CIRISPersist#924), and
+//! [`crate::field_conformance`] replays every vector against it (wired at the
+//! v33.0.0 adopt, CIRISEdge#702).
 //!
 //! Test-only: the files are ~325 KB and nothing in production reads them.
 

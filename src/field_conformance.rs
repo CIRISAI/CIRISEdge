@@ -303,7 +303,7 @@ fn check_cohort_scope_projection() -> Result<(), String> {
             dimension: "moderation:allegation:v1",
         },
         Plane::Attestation {
-            dimension: "provenance:build_manifest:v1",
+            dimension: "provenance:build_manifest:linux-x86_64:v1",
         },
         // CIRISEdge#706 — `consent:{kind}` is closed in its leaves (rc5), so the
         // reference refuses `consent:share:v1` as `namespace_family_unregistered`;
@@ -483,17 +483,17 @@ fn check_attestation_prefixes_covers() -> Result<(), String> {
     use ciris_persist::federation::consent_grammar::covers;
     // The grant-prefix gate the serve path applies is str::starts_with (covers),
     // trailing-colon significant: `trace:` gates `trace:complete:v1` but NOT
-    // `trace_summary:v1`. Value semantics, not presence.
+    // `trace_summary:sample:v1`. Value semantics, not presence.
     let prefixes = vec!["trace:".to_string()];
     if !covers(&prefixes, "trace:complete:v1") {
         return Err("`trace:` must cover `trace:complete:v1`".into());
     }
-    if covers(&prefixes, "trace_summary:v1") {
+    if covers(&prefixes, "trace_summary:sample:v1") {
         return Err(
-            "`trace:` must NOT cover `trace_summary:v1` (trailing colon significant)".into(),
+            "`trace:` must NOT cover `trace_summary:sample:v1` (trailing colon significant)".into(),
         );
     }
-    if covers(&prefixes, "capacity:audit:v1") {
+    if covers(&prefixes, "capacity:integrity:v1") {
         return Err("`trace:` must not cover an unrelated dimension".into());
     }
     Ok(())
@@ -618,13 +618,10 @@ mod tests {
     /// All 962 published `(dimension, family, refusal)` triples, exact: a
     /// matcher that answers differently from the reference on any one fails
     /// the build, every mismatch named. Edge's matcher is persist's — the
-    /// full-match, refusal-bearing `namespace::matcher::match_family` ships in
-    /// persist v50.0.0 (CIRISPersist#924) and does not exist at the pinned
-    /// v49 — so the replay is wired at the v33.0.0 adopt (CIRISEdge#702), where
-    /// [`edge_namespace_match`] becomes the one-line call to it. Ignored, never
-    /// deleted, until then.
+    /// full-match, refusal-bearing `namespace::matcher::match_family` of
+    /// persist v50.0.0 (CIRISPersist#924), wired in [`edge_namespace_match`]
+    /// at the v33.0.0 adopt (CIRISEdge#702).
     #[test]
-    #[ignore = "replays against persist v50's namespace::matcher::match_family (CIRISPersist#924); wired at the v33.0.0 adopt, CIRISEdge#702"]
     fn cc_namespace_match_vectors_replay() {
         let vs = crate::cc_namespace::vectors();
         assert_eq!(vs.len(), crate::cc_namespace::VENDORED_N_VECTORS);
@@ -648,14 +645,14 @@ mod tests {
     }
 
     /// The function edge classifies a dimension through, as the vectors'
-    /// `(family, refusal)` pair. At persist v50: `let m =
-    /// ciris_persist::federation::namespace::matcher::match_family(d);
-    /// (m.family.map(str::to_owned), m.refusal.map(|r| r.as_str().to_owned()))`.
+    /// `(family, refusal)` pair: persist v50's full-match, refusal-bearing
+    /// `namespace::matcher::match_family` (CIRISPersist#924) — edge's matcher
+    /// is persist's, never a second spelling.
     fn edge_namespace_match(dimension: &str) -> (Option<String>, Option<String>) {
-        todo!(
-            "persist v49 has no full-match matcher; wire persist v50's \
-             namespace::matcher::match_family here at the v33.0.0 adopt (CIRISEdge#702) — \
-             asked for {dimension:?}"
+        let m = ciris_persist::federation::namespace::matcher::match_family(dimension);
+        (
+            m.family.map(str::to_owned),
+            m.refusal.map(|r| r.as_str().to_owned()),
         )
     }
 

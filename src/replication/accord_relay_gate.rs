@@ -1134,8 +1134,8 @@ mod tests {
     fn a_non_drill_row_names_its_accord_with_the_signed_key_or_is_refused() {
         for dim in [
             "accord:human_dignity:v1",
-            "accord:invoke:notify:halt",
-            "accord:halt:v1",
+            "accord:invoke:notify:halt:v1",
+            "accord:lifecycle:active:v1",
         ] {
             assert_eq!(
                 AccordRelaySubject::of_row(&accord_row(dim, "holder-a", "some-agent", None)),
@@ -1447,7 +1447,9 @@ mod tests {
         assert!(AccordRelayGate::dimension_half_is_gated(
             "accord:lifecycle:v1"
         ));
-        assert!(AccordRelayGate::dimension_half_is_gated("accord:halt:v1"));
+        assert!(AccordRelayGate::dimension_half_is_gated(
+            "accord:lifecycle:active:v1"
+        ));
         assert!(AccordRelayGate::dimension_half_is_gated(
             "accord:human_dignity:v1"
         ));
@@ -1457,8 +1459,8 @@ mod tests {
             "scores:reputation:v1",
             "moderation:conduct:v1",
             "consent:replication:v1",
-            "provenance:build_manifest:v1",
-            "capacity:relay:v1",
+            "provenance:build_manifest:linux-x86_64:v1",
+            "capacity:integrity:v1",
             "transport:reachability:v1",
             // The bare stem is not "under" the stem — persist's prefix grammar.
             "accord:",
@@ -1895,7 +1897,7 @@ mod tests {
         // dimension, naming its accord with the signed key. The subject is the
         // signed root + the bound signer — persist's type arm, not a skip.
         let invoke = typed_accord_row_value(
-            "accord:invoke:notify:halt",
+            "accord:invoke:notify:halt:v1",
             None,
             signer,
             signer,
@@ -1923,7 +1925,7 @@ mod tests {
         // pre-filter would have CARRIED this row unexamined.
         assert_eq!(
             gate.may_relay_attestation(
-                &typed_accord_row_value("accord:invoke:notify:halt", None, signer, signer, None),
+                &typed_accord_row_value("accord:invoke:notify:halt:v1", None, signer, signer, None),
                 t0
             )
             .await,
@@ -1936,7 +1938,7 @@ mod tests {
         // cached verdict — gated once, no second evaluation for the second
         // namespace. (A second signer, so the single new entry is visible.)
         let both = typed_accord_row_value(
-            "accord:invoke:notify:halt",
+            "accord:invoke:notify:halt:v1",
             Some("accord:human_dignity:v1"),
             second,
             second,

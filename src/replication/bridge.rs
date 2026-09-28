@@ -11810,7 +11810,7 @@ pub(crate) mod tests {
             "id": id,
             "attesting_key_id": holder,
             "attested_key_id": holder,
-            "attestation_type": "accord:invoke:notify:halt",
+            "attestation_type": "accord:invoke:notify:halt:v1",
             "accord_root": accord_root,
         });
         seed_raw_attestation(
@@ -11818,7 +11818,7 @@ pub(crate) mod tests {
             &id,
             holder,
             holder,
-            "accord:invoke:notify:halt",
+            "accord:invoke:notify:halt:v1",
             envelope,
         )
         .await;
@@ -14505,7 +14505,7 @@ pub(crate) mod tests {
             att_json("trust:reliability:v1", "self", "scores", "node-own"),
             att_json("trust:reliability:v1", "community", "scores", "peer-a"),
             att_json(
-                "provenance:build_manifest:linux-x86_64",
+                "provenance:build_manifest:linux-x86_64:v1",
                 "federation",
                 "scores",
                 "some-builder",
@@ -14618,7 +14618,7 @@ pub(crate) mod tests {
     #[test]
     fn trust_root_provenance_projection_value_is_pinned() {
         let a = att_json(
-            "provenance:build_manifest:linux-x86_64",
+            "provenance:build_manifest:linux-x86_64:v1",
             "federation",
             "scores",
             "some-builder",
@@ -14709,7 +14709,7 @@ pub(crate) mod tests {
     #[test]
     fn attestation_trust_root_commons_is_global_advertised() {
         let a = att_json(
-            "provenance:build_manifest:linux-x86_64",
+            "provenance:build_manifest:linux-x86_64:v1",
             "federation",
             "scores",
             "some-builder",
@@ -15314,9 +15314,9 @@ pub(crate) mod tests {
         let seated_hash = locate_accord_hash(&bridge, root, seated, "scores").await;
         let unseated_hash = locate_accord_hash(&bridge, root, unseated, "scores").await;
         let seated_invoke_hash =
-            locate_accord_hash(&bridge, root, seated, "accord:invoke:notify:halt").await;
+            locate_accord_hash(&bridge, root, seated, "accord:invoke:notify:halt:v1").await;
         let unseated_invoke_hash =
-            locate_accord_hash(&bridge, root, unseated, "accord:invoke:notify:halt").await;
+            locate_accord_hash(&bridge, root, unseated, "accord:invoke:notify:halt:v1").await;
         let bridge = bridge
             .with_local_key_id(Some(local.to_string()))
             .with_accord_relay_gate(Some(Arc::new(AccordRelayGate::new(
@@ -15458,7 +15458,7 @@ pub(crate) mod tests {
             "attestation_envelope": { "dimension": "accord:human_dignity:v1" },
         });
         let by_type = serde_json::json!({
-            "attestation_type": "accord:invoke:notify:halt",
+            "attestation_type": "accord:invoke:notify:halt:v1",
             "attestation_envelope": { "dimension": "trust:example:v1" },
         });
         // The shape a TYPE-namespace row actually produces on the wire: the
@@ -15466,7 +15466,7 @@ pub(crate) mod tests {
         // (persist's `is_accord_family` takes `Option<&str>` for exactly this
         // row — `None` is not a dimension-arm match, never an error).
         let by_type_no_dimension = serde_json::json!({
-            "attestation_type": "accord:invoke:notify:halt",
+            "attestation_type": "accord:invoke:notify:halt:v1",
             "attestation_envelope": { "accord_root": "humanity-accord" },
         });
         // BOTH fields accord-shaped — one row, one family membership, and the
@@ -15474,7 +15474,7 @@ pub(crate) mod tests {
         // accord_relay_gate's
         // `the_type_namespace_row_is_judged_not_skipped_and_both_namespaces_gate_once`).
         let by_both = serde_json::json!({
-            "attestation_type": "accord:invoke:notify:halt",
+            "attestation_type": "accord:invoke:notify:halt:v1",
             "attestation_envelope": { "dimension": "accord:human_dignity:v1" },
         });
         let neither = serde_json::json!({
