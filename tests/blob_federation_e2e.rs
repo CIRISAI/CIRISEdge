@@ -3391,3 +3391,186 @@ async fn a_withdrawn_file_is_listed_as_withdrawn_only_when_history_is_asked_for(
         );
     }
 }
+
+/// CIRISEdge#675 — **a file is authored by its person, co-signed by the node,
+/// and any of the person's devices may withdraw it.**
+///
+/// Device A publishes with the owner's fed-ID signer in hand: the row's
+/// attester is the PERSON, the node's custody scrub rides beside it after the
+/// crossing, and the bytes open (the content AAD names the same author the
+/// row does). Device B — the same owner, a different node key — withdraws it
+/// with the person's signer; a stranger cannot. A node-authored row (the
+/// agent-only posture, and every row from before #675) still opens, and only
+/// its node may withdraw it (`FSD/CONTENT_TRANSFER.md` §6.7.0).
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one scenario, both postures, on purpose
+async fn a_file_is_authored_by_its_person_and_withdrawn_from_their_other_device() {
+    use ciris_edge::files::{publish, withdraw, FileError, FileRow, FileWrite};
+    use ciris_edge::replication::attestation_bind::Signers;
+    use ciris_persist::federation::FederationDirectory;
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let alice_phone = Ident::new("alice-phone", 0x33);
+    let carol = Ident::new("carol-fed", 0x44);
+    let node_a = node(&[&alice, &carol], &alice).await;
+    let node_b = device_of(&[&alice, &alice_phone, &carol], &alice, &alice_phone).await;
+    federate(&node_a, &node_b).await;
+    federate(&node_b, &node_a).await;
+    let alice_signer = edge_signer_for(&alice);
+    let carol_signer = edge_signer_for(&carol);
+    let room = ciris_edge::self_room::room(&alice.key_id);
+
+    // ── the person authors ────────────────────────────────────────────────
+    let published = publish(
+        &*node_a.dir,
+        &node_a.store,
+        Signers {
+            node: &node_a.signer,
+            actor: Some(&alice_signer),
+        },
+        &FileWrite {
+            room: &room,
+            bytes: b"alice's contract",
+            media_type: "text/plain",
+            filename: Some("contract.txt"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("publish as the person");
+    assert!(
+        published.crossed,
+        "the person's file crosses to her devices"
+    );
+    assert_eq!(
+        published.row.attesting_key_id, alice.key_id,
+        "the row's attester is the PERSON (her fed-ID), not the machine"
+    );
+    let file = FileRow::from_row(&published.row).expect("a file row");
+    assert_eq!(
+        file.open(&node_a.store, &node_a.me).await.expect("opens"),
+        b"alice's contract",
+        "the bytes open: the seal's AAD named the same author the row does"
+    );
+    let crossed_id = match &published.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!("crossed: {other:?}")
+        }
+    };
+    let on_wire = node_a
+        .dir
+        .get_attestation(&crossed_id)
+        .await
+        .expect("read")
+        .expect("the crossed row is held");
+    assert_eq!(on_wire.attesting_key_id, alice.key_id);
+    assert!(
+        on_wire
+            .additional_scrubs
+            .iter()
+            .any(|s| s.scrub_key_id == node_a.me),
+        "the node's custody co-scrub rides beside the person's signature: {:?}",
+        on_wire.additional_scrubs
+    );
+
+    // ── B (same owner, other node) holds the row and withdraws it ─────────
+    node_b
+        .dir
+        .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: on_wire.clone(),
+        })
+        .await
+        .expect("B admits the person's file row");
+    let stranger = withdraw(
+        &*node_b.dir,
+        &on_wire,
+        "not mine to delete",
+        ts() + chrono::Duration::seconds(5),
+        Signers {
+            node: &node_b.signer,
+            actor: Some(&carol_signer),
+        },
+    )
+    .await;
+    assert!(
+        matches!(stranger, Err(FileError::NotAuthor { ref author, .. }) if *author == alice.key_id),
+        "a stranger holds no signer that is the author: {stranger:?}"
+    );
+    let tomb = withdraw(
+        &*node_b.dir,
+        &on_wire,
+        "deleted from my phone",
+        ts() + chrono::Duration::seconds(10),
+        Signers {
+            node: &node_b.signer,
+            actor: Some(&alice_signer),
+        },
+    )
+    .await
+    .expect("the person withdraws her file from her other device");
+    let stored = node_b
+        .dir
+        .get_attestation(&tomb.attestation_id)
+        .await
+        .expect("read")
+        .expect("the withdraws is stored");
+    assert_eq!(
+        stored.withdraws_admission_rule,
+        Some(1),
+        "persist admitted it under rule 1 — issuer == the row's attester"
+    );
+
+    // ── read-compat: a node-authored row ──────────────────────────────────
+    let legacy = publish(
+        &*node_a.dir,
+        &node_a.store,
+        Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &FileWrite {
+            room: &room,
+            bytes: b"written by the node",
+            media_type: "text/plain",
+            filename: Some("legacy.txt"),
+            asserted_at: ts() + chrono::Duration::seconds(20),
+        },
+    )
+    .await
+    .expect("publish with no person in hand (agent-only posture)");
+    assert_eq!(legacy.row.attesting_key_id, node_a.me, "the node authors");
+    let legacy_file = FileRow::from_row(&legacy.row).expect("a file row");
+    assert_eq!(
+        legacy_file
+            .open(&node_a.store, &node_a.me)
+            .await
+            .expect("opens"),
+        b"written by the node",
+        "a node-authored row still opens"
+    );
+    let not_b = legacy_file.author_signer(Signers {
+        node: &node_b.signer,
+        actor: Some(&alice_signer),
+    });
+    assert!(
+        matches!(not_b, Err(FileError::NotAuthor { ref author, .. }) if *author == node_a.me),
+        "only the authoring node may retract a node-authored row: {:?}",
+        not_b.map(|s| s.key_id.clone())
+    );
+    withdraw(
+        &*node_a.dir,
+        &legacy.row,
+        "deleted on the node that wrote it",
+        ts() + chrono::Duration::seconds(30),
+        Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+    )
+    .await
+    .expect("the authoring node withdraws its own row");
+}
