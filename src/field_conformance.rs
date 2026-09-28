@@ -305,8 +305,11 @@ fn check_cohort_scope_projection() -> Result<(), String> {
         Plane::Attestation {
             dimension: "provenance:build_manifest:v1",
         },
+        // CIRISEdge#706 — `consent:{kind}` is closed in its leaves (rc5), so the
+        // reference refuses `consent:share:v1` as `namespace_family_unregistered`;
+        // the Consent family stands on a catalogued leaf.
         Plane::Attestation {
-            dimension: "consent:share:v1",
+            dimension: "consent:state:granted:v1",
         },
         Plane::Attestation {
             dimension: "trace:reasoning:v1",
@@ -607,6 +610,75 @@ mod tests {
         assert!(
             stale.is_empty(),
             "conformance entries no longer edge-owned in persist's matrix (rename/removal?): {stale:#?}"
+        );
+    }
+
+    /// CIRISEdge#706 item 1 — **replay the CC vectors against edge's matcher.**
+    ///
+    /// All 962 published `(dimension, family, refusal)` triples, exact: a
+    /// matcher that answers differently from the reference on any one fails
+    /// the build, every mismatch named. Edge's matcher is persist's — the
+    /// full-match, refusal-bearing `namespace::matcher::match_family` ships in
+    /// persist v50.0.0 (CIRISPersist#924) and does not exist at the pinned
+    /// v49 — so the replay is wired at the v33.0.0 adopt (CIRISEdge#702), where
+    /// [`edge_namespace_match`] becomes the one-line call to it. Ignored, never
+    /// deleted, until then.
+    #[test]
+    #[ignore = "replays against persist v50's namespace::matcher::match_family (CIRISPersist#924); wired at the v33.0.0 adopt, CIRISEdge#702"]
+    fn cc_namespace_match_vectors_replay() {
+        let vs = crate::cc_namespace::vectors();
+        assert_eq!(vs.len(), crate::cc_namespace::VENDORED_N_VECTORS);
+        let mut bad = Vec::new();
+        for v in &vs {
+            let (family, refusal) = edge_namespace_match(&v.dimension);
+            if family != v.family || refusal != v.refusal {
+                bad.push(format!(
+                    "{:?}: reference ({:?}, {:?}) edge ({family:?}, {refusal:?})",
+                    v.dimension, v.family, v.refusal
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} divergence(s) from the CC reference matcher over {} vectors:\n{}",
+            bad.len(),
+            vs.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// The function edge classifies a dimension through, as the vectors'
+    /// `(family, refusal)` pair. At persist v50: `let m =
+    /// ciris_persist::federation::namespace::matcher::match_family(d);
+    /// (m.family.map(str::to_owned), m.refusal.map(|r| r.as_str().to_owned()))`.
+    fn edge_namespace_match(dimension: &str) -> (Option<String>, Option<String>) {
+        todo!(
+            "persist v49 has no full-match matcher; wire persist v50's \
+             namespace::matcher::match_family here at the v33.0.0 adopt (CIRISEdge#702) — \
+             asked for {dimension:?}"
+        )
+    }
+
+    /// CIRISEdge#706 item 3 — every dimension this module's fixtures stand on
+    /// that the CC vectors name must be ADMITTED by the reference. A fixture
+    /// that the Constitution refuses (as `consent:share:v1` became when rc5
+    /// closed `consent:{kind}`) tests a shape no conformant producer emits.
+    #[test]
+    fn this_modules_fixture_dimensions_are_admitted_by_the_cc_reference() {
+        let admitted: std::collections::HashMap<String, Option<String>> =
+            crate::cc_namespace::vectors()
+                .into_iter()
+                .map(|v| (v.dimension, v.refusal))
+                .collect();
+        // The Consent family's representative is a catalogued sample.
+        assert_eq!(
+            admitted.get("consent:state:granted:v1"),
+            Some(&None),
+            "the Consent fixture must be a leaf the rc5 reference admits"
+        );
+        assert!(
+            !admitted.contains_key("consent:share:v1") || admitted["consent:share:v1"].is_some(),
+            "consent:share:v1 is refused by rc5 — it must not come back as a fixture"
         );
     }
 }

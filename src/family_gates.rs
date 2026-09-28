@@ -200,7 +200,17 @@ pub fn gates_for(dimension: &str) -> FamilyGates {
         | AttestationFamily::SubstrateHealth
         | AttestationFamily::Moderation
         | AttestationFamily::ProvenanceBuildManifest
-        | AttestationFamily::Chat => FamilyGates::NONE,
+        | AttestationFamily::Chat
+        // CIRISEdge#706 — found by the registry-coverage test: persist decided
+        // `session:*` (v38.7.0, #782) and `duty:*` (v42.0.0, #814) and this fold
+        // never named them, so both fell to the wildcard and were MAXIMALLY
+        // gated — withheld from every peer lacking `infra:serve`. Persist's rows
+        // for both (`projection_for`) are the Chat shape: `SelfOwn` at
+        // self/family, `Cohort` at every other tier, no `Projection::Capability`
+        // cell and no `authority` branch — so neither of edge's two
+        // family-conditioned gates keys on them.
+        | AttestationFamily::SessionClaim
+        | AttestationFamily::Duty => FamilyGates::NONE,
 
         // `Unknown` is NOT the unknown-family case, and conflating the two
         // was a real bug in this module — invisible for as long as it had no
@@ -248,7 +258,8 @@ mod tests {
     const REPRESENTATIVES: &[(&str, &str)] = &[
         ("trace:reasoning:v1", "Trace"),
         ("accord:human_dignity:v1", "Accord"),
-        ("consent:share:v1", "Consent"),
+        // CIRISEdge#706 — rc5 closes `consent:{kind}`; stand on a catalogued leaf.
+        ("consent:state:granted:v1", "Consent"),
         ("scores:alignment:v1", "Scores"),
         ("capacity:relay_delivery:v1", "Capacity"),
         ("content_class:nsfw:v1", "ContentClass"),
@@ -262,6 +273,9 @@ mod tests {
         // one family, so the representative is a plain message dimension
         // (persist's own `FAMILY_DIMS` representative is `chat:message:v1`).
         ("chat:message:v1", "Chat"),
+        // CIRISEdge#706 — persist's own `FAMILY_DIMS` representatives.
+        ("session:claim:v1", "SessionClaim"),
+        ("duty:attribute:v1", "Duty"),
     ];
 
     #[test]
@@ -340,7 +354,7 @@ mod tests {
         for dimension in [
             "accord:human_dignity:v1",
             "trace:reasoning:v1",
-            "consent:share:v1",
+            "consent:state:granted:v1",
             "trust:example:v1",
             "objection:halt:v1",
         ] {
@@ -439,5 +453,125 @@ mod tests {
             gates_for("accord:human_dignity:v1"),
         );
         assert!(!gates_for("accordion:not:accord:v1").accord_relay_gated);
+    }
+
+    // ── CIRISEdge#706 item 2 — every family helper against the CC registry ──
+    //
+    // The `trace:`/`accord:` loop above checks the two family-conditioned
+    // gates over the eleven REPRESENTATIVES only. These two tests generalise it
+    // to the Constitution's own registry (vendored, `crate::cc_namespace`), in
+    // both directions: a helper for a family the registry does not carry fails,
+    // and a family the registry carries that the gate fold does not cover — or
+    // gates on the wrong family — fails.
+
+    /// Stems edge (or the persist classifier it reads) keys on that rc5 carries
+    /// no registry row for. Each is OPEN vocabulary under the CC reference
+    /// (family `None`, refusal `None`), so a dimension under it is admitted —
+    /// but a family helper keyed on it names a family the Constitution does
+    /// not. Listed with its reason rather than skipped; the test below fails
+    /// if an entry goes stale in either direction.
+    const HELPER_STEMS_WITHOUT_A_REGISTRY_ROW: &[(&str, &str)] = &[(
+        "scores:",
+        "persist's AttestationFamily::Scores keys the `scores:` stem; rc5 carries no \
+         `scores:*` row (`scores` is an attestation_type, and `scores:` dimensions are open \
+         vocabulary) — persist's taxonomy, raised at the v33.0.0 adopt (CIRISEdge#702)",
+    )];
+
+    /// Every family helper edge keys on names a stem the CC registry carries.
+    #[test]
+    fn every_family_helper_names_a_family_the_cc_registry_carries() {
+        use crate::cc_namespace::{registry_prefixes, stem};
+        let registry_stems: std::collections::BTreeSet<String> = registry_prefixes()
+            .iter()
+            .map(|p| stem(p).to_owned())
+            .collect();
+        // The helpers: one stem per family `gates_for` names (its
+        // representative), plus the prefix constants edge's producers key on.
+        let mut helpers: Vec<(String, &str)> = REPRESENTATIVES
+            .iter()
+            .map(|(d, family)| (stem(d).to_owned(), *family))
+            .collect();
+        helpers.push((
+            crate::chat::CHAT_ATTESTATION_PREFIX.to_owned(),
+            "chat::CHAT_ATTESTATION_PREFIX",
+        ));
+        helpers.push((
+            crate::key_boundary::KEY_BOUNDARY_PREFIX.to_owned(),
+            "key_boundary::KEY_BOUNDARY_PREFIX",
+        ));
+        for (helper_stem, helper) in &helpers {
+            let exempt = HELPER_STEMS_WITHOUT_A_REGISTRY_ROW
+                .iter()
+                .any(|(s, _)| s == helper_stem);
+            assert!(
+                registry_stems.contains(helper_stem) || exempt,
+                "{helper} keys the `{helper_stem}` stem, which the CC registry does not \
+                 carry — a helper for a family the Constitution has no row for"
+            );
+        }
+        // …and the exemptions stay honest: each is still a helper, and still
+        // absent from the registry.
+        for (exempt_stem, why) in HELPER_STEMS_WITHOUT_A_REGISTRY_ROW {
+            assert!(
+                helpers.iter().any(|(s, _)| s == exempt_stem),
+                "stale exemption `{exempt_stem}`: no helper keys it any more ({why})"
+            );
+            assert!(
+                !registry_stems.contains(*exempt_stem),
+                "stale exemption `{exempt_stem}`: the registry now carries it — drop the \
+                 exemption ({why})"
+            );
+        }
+    }
+
+    /// Every family the CC registry carries is covered by the gate fold: an
+    /// admitted sample of it classifies (never the unknown wildcard), the E3
+    /// capability gate lands on exactly the `trace:` rows, and the CC 4.2.1
+    /// relay gate on exactly the `accord:` rows.
+    #[test]
+    fn every_cc_registry_family_is_covered_by_the_gate_fold() {
+        use crate::cc_namespace::{stem, vectors, REGISTRY_JSON};
+        let root: serde_json::Value = serde_json::from_str(REGISTRY_JSON).unwrap();
+        let mut sample: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for v in vectors() {
+            if v.refusal.is_none() {
+                if let Some(f) = v.family {
+                    sample.entry(f).or_insert(v.dimension);
+                }
+            }
+        }
+        for fam in root["families"].as_array().unwrap() {
+            let prefix = fam["prefix"].as_str().unwrap();
+            let Some(dimension) = sample.get(prefix) else {
+                // A parent closed in its leaves admits nothing of its own —
+                // every leaf is a row, sampled under that row.
+                assert_eq!(
+                    fam["leaves_closed"].as_bool(),
+                    Some(true),
+                    "registry family `{prefix}` has no admitted vector and is not closed in \
+                     its leaves — nothing exercises it"
+                );
+                continue;
+            };
+            let gates = gates_for(dimension);
+            assert!(
+                !gates.unknown_family,
+                "`{dimension}` (registry family `{prefix}`) reached the unknown wildcard — \
+                 a family the Constitution carries that edge's gate fold does not cover"
+            );
+            assert_eq!(
+                gates.requires_serve_capability,
+                stem(prefix) == "trace:",
+                "E3 serve-capability gate on `{dimension}` (family `{prefix}`): it keys on \
+                 exactly the `trace:` rows"
+            );
+            assert_eq!(
+                gates.accord_relay_gated,
+                stem(prefix) == "accord:",
+                "CC 4.2.1 relay gate on `{dimension}` (family `{prefix}`): it keys on \
+                 exactly the `accord:` rows"
+            );
+        }
     }
 }
