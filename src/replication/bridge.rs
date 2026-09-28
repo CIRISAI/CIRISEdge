@@ -7934,60 +7934,76 @@ impl FederationDirectoryReplicationBridge {
     ///   chat mints one deterministic community per pair) means two nodes
     ///   author BYTE-IDENTICAL content and each signs as itself, so a
     ///   re-offered copy is the COMMON case, not an anomaly. persist answers
-    ///   `Ok` and leaves the stored row and its first-accepted authority
+    ///   `Unchanged` and leaves the stored row and its first-accepted authority
     ///   signature untouched. The macro would have called that `Admitted` —
     ///   claiming anti-entropy progress on every round that re-offers a
     ///   community this node already holds, which is the "applied all N" /
     ///   "nothing moved" collapse #457 exists to prevent.
     /// - **differing roster under an occupied id → `Refused`, named.**
-    ///   persist returns the TYPED
-    ///   [`Error::Conflict`](ciris_persist::federation::Error::Conflict); edge
-    ///   books it as [`ApplyRefusalClass::CommunityRosterFork`]. It is not
+    ///   persist returns the TYPED refusal `ConflictingRecord` (v50; the
+    ///   [`Error::Conflict`](ciris_persist::federation::Error::Conflict) before
+    ///   it); edge books it as [`ApplyRefusalClass::CommunityRosterFork`]. It is not
     ///   retryable (retrying spins) and must not be dropped (dropping hides a
     ///   fork). Roster CHANGES travel as supersedes, never as a differing
     ///   re-put, so this can only mean two authorities disagree about one id.
     ///
-    /// # Why the pre-read, and why it is honest
+    /// # The replicated door (persist v50.0.0, CIRISPersist#925/#931)
     ///
-    /// `put_community` returns `Result<(), Error>`: `Ok` alone cannot say
-    /// whether a row was inserted or absorbed. Persist decides by comparing
-    /// the stored `persist_row_hash` to the offered one; edge asks the
-    /// equivalent question with the read it already has — *was this
-    /// `community_key_id` occupied before we knocked?* Occupied + `Ok` is
-    /// exactly persist's identical-re-put branch, because the differing branch
-    /// is the `Conflict` above. Recomputing the hash here instead would
-    /// re-implement `compute_persist_row_hash`'s stamping rules downstream of
-    /// the authority that owns them — a second spelling that can drift.
+    /// A record received from a peer goes through
+    /// `apply_replicated_community`, never the local `put_community` door:
+    /// v50 made the local door run the full CC 3.2 infrastructure gate
+    /// whoever signed, which would refuse a legacy non-conformant record the
+    /// federation already carries. The replicated door admits it as DATA (the
+    /// fold's gates still apply) and routes an occupied id with a supersede
+    /// proof through the amendment checks. Locally authored communities keep
+    /// `put_community`; the Family plane stays on `put_family`.
     ///
-    /// A concurrent insert between the read and the put mislabels one row
-    /// `Admitted` that was really a duplicate. That is a counter's rounding,
-    /// not a safety property: the stored state is whatever persist's verdict
-    /// made it either way, and the honest direction (over-reporting progress
-    /// once) is the one that cannot hide a fork. Communities are rare and this
-    /// costs one point-read per applied community row.
+    /// Its outcome is TYPED, decided under the write's own serialization
+    /// (persist PR #921 review F3), so the pre-read edge used to label
+    /// `Admitted` vs `Duplicate` is gone — it raced a concurrent apply of the
+    /// same record, and the answer now comes from the one party that knows:
+    ///
+    /// - `Inserted` / `Superseded` → `Admitted`.
+    /// - `Unchanged` → `Duplicate`.
+    /// - `Refused { ConflictingRecord }` → [`ApplyRefusalClass::CommunityRosterFork`]
+    ///   (a differing record with no proof, or a proof over a version this
+    ///   node does not hold — the fork signal, as before).
+    /// - `Refused { DegradesConformance }` → the same class: a supersede that
+    ///   would replace a CONFORMANT infrastructure record with a
+    ///   non-conformant one is two authorities disagreeing about one id, and
+    ///   nothing about it changes by waiting.
     async fn apply_community(&self, bytes: &[u8]) -> ApplyOutcome {
+        use ciris_persist::federation::{ReplicatedCommunityOutcome, ReplicatedCommunityRefusal};
+
         let record: SignedCommunity = match serde_json::from_slice(bytes) {
             Ok(r) => r,
             Err(e) => return ApplyOutcome::Deserialize(apply_deser_reason("Community", bytes, &e)),
         };
         let content_hash =
             content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
-        // Read BEFORE the put — see the doc comment. A read ERROR is not an
-        // occupancy answer: fall back to `false`, which can only mislabel a
-        // duplicate as admitted, never invent a refusal.
-        let was_occupied = self
-            .directory
-            .lookup_community(&record.community.community_key_id)
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        match self.directory.put_community(record).await {
-            Ok(()) if was_occupied => ApplyOutcome::Duplicate,
-            Ok(()) => ApplyOutcome::Admitted,
-            // The FORK signal. Matched on the typed variant — edge deleted a
-            // `reason.contains("conflict")` discriminator in v18.2.0 and this
-            // is not the place to grow another.
+        let community_key_id = record.community.community_key_id.clone();
+        match self.directory.apply_replicated_community(record).await {
+            Ok(ReplicatedCommunityOutcome::Inserted | ReplicatedCommunityOutcome::Superseded) => {
+                ApplyOutcome::Admitted
+            }
+            Ok(ReplicatedCommunityOutcome::Unchanged) => ApplyOutcome::Duplicate,
+            Ok(ReplicatedCommunityOutcome::Refused { reason }) => {
+                let why = match reason {
+                    ReplicatedCommunityRefusal::ConflictingRecord => "conflicting_record",
+                    ReplicatedCommunityRefusal::DegradesConformance => "degrades_conformance",
+                };
+                let err = ciris_persist::federation::Error::Conflict(format!(
+                    "replicated community {community_key_id} refused: {why}"
+                ));
+                self.refuse_as(
+                    "Community",
+                    &content_hash,
+                    &err,
+                    ApplyRefusalClass::CommunityRosterFork,
+                )
+            }
+            // A hard error from the door (the typed refusals are `Ok`). A
+            // `Conflict` here is still the fork signal on this plane.
             Err(e @ ciris_persist::federation::Error::Conflict(_)) => self.refuse_as(
                 "Community",
                 &content_hash,
@@ -10793,6 +10809,65 @@ pub(crate) mod tests {
             "{terminal}"
         );
         assert!(terminal.contains("TERMINAL"), "{terminal}");
+    }
+
+    /// persist v50.0.0 (CIRISPersist#931) — a Community record received from a
+    /// peer goes through the REPLICATED door. A legacy `founder_only`
+    /// infrastructure record (non-conformant under CC 3.2, which wants a
+    /// quorum protocol) is refused by the LOCAL door whoever signed it; the
+    /// federation already carries such records, so the replicated apply must
+    /// admit it as DATA — `Admitted`, then `Duplicate` on the re-offer. Through
+    /// `put_community` (the pre-v50 wiring) this row would be refused on every
+    /// round.
+    #[tokio::test]
+    async fn a_replicated_legacy_infrastructure_community_is_admitted_as_data() {
+        use ciris_persist::federation::FederationDirectory;
+
+        let cohort = vec!["legacy-human".to_string()];
+        let (backend, bridge) = make_bridge(&cohort);
+        register_fixture_keys(&backend, &[("legacy-human", identity_type::USER)]).await;
+        let legacy = sign_community_fixture(
+            "legacy-human",
+            Community {
+                community_key_id: "legacy-infra-room".to_string(),
+                community_name: "trust root".to_string(),
+                members: vec![CommunityMember {
+                    key_id: "legacy-human".to_string(),
+                    joined_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+                    role: Some(
+                        ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_string(),
+                    ),
+                }],
+                founded_at: "2026-07-01T00:00:00Z".parse().expect("rfc3339"),
+                consensus_protocol: "founder_only".to_string(),
+                policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+                persist_row_hash: String::new(),
+            },
+        );
+        backend
+            .put_community(legacy.clone())
+            .await
+            .expect_err("precondition: the LOCAL door judges a legacy record and refuses it");
+        let wire = serde_json::to_vec(&legacy).expect("signed community serializes");
+        assert_eq!(
+            bridge
+                .apply_envelope_bytes(EnvelopeKind::Community, &wire, None)
+                .await,
+            ApplyOutcome::Admitted,
+            "the replicated door admits a legacy record as data",
+        );
+        assert_eq!(
+            bridge
+                .apply_envelope_bytes(EnvelopeKind::Community, &wire, None)
+                .await,
+            ApplyOutcome::Duplicate,
+            "an identical re-offer is Unchanged at persist, Duplicate here",
+        );
+        assert!(backend
+            .lookup_community("legacy-infra-room")
+            .await
+            .expect("lookup")
+            .is_some());
     }
 
     /// persist#758 (CIRISEdge#522 item 1) — the Community door's THREE
