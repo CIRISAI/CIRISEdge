@@ -154,6 +154,93 @@ pub enum FileError {
         /// The inline bound (persist's `DEFAULT_INLINE_BYTES_CAP`).
         cap: usize,
     },
+
+    /// **An author-only operation, and no signer in hand is the author**
+    /// (CIRISEdge#675). The row's attester is `author`; the signers offered
+    /// were `held`. For a person-authored row any of the owner's devices holds
+    /// the person's key; a row a NODE authored (before #675, or by an
+    /// agent-only node) can be retracted only by that node.
+    #[error(
+        "{attestation_id} is authored by {author}; none of the signers in hand ({held:?}) is \
+         its author, so an author-only operation cannot be signed (FSD/CONTENT_TRANSFER.md §6.7.0)"
+    )]
+    NotAuthor {
+        /// The file row.
+        attestation_id: String,
+        /// The row's attester.
+        author: String,
+        /// The key ids of the signers offered.
+        held: Vec<String>,
+    },
+
+    /// Building or writing the `withdraws` failed.
+    #[error("withdraw {attestation_id}: {detail}")]
+    Withdraw {
+        /// The file row.
+        attestation_id: String,
+        /// What went wrong.
+        detail: String,
+    },
+}
+
+/// **Who authors a file — the one choice** (CIRISEdge#675,
+/// `FSD/CONTENT_TRANSFER.md` §6.7.0).
+///
+/// The actor (the person) when their signer is in hand, else this node — the
+/// agent-only posture. The row's `attesting_key_id`, the content AAD's author
+/// and the row id's preimage all read this one value, so the seal and the row
+/// cannot name different authors.
+#[must_use]
+pub fn file_author(signers: Signers<'_>) -> &crate::identity::LocalSigner {
+    signers.actor.unwrap_or(signers.node)
+}
+
+/// **Withdraw a file** (CC 2.3) — the drive's delete, signed by the row's
+/// author (CIRISEdge#675).
+///
+/// The signer is [`FileRow::author_signer`]'s answer: for a person-authored
+/// row, the person's key, which every device of the owner holds; for a
+/// node-authored row, only that node's. The `withdraws` is persist's own
+/// envelope ([`withdraws_attestation`](crate::replication::attestation_bind::withdraws_attestation)),
+/// born federation-tier, written through `put_attestation` so persist's
+/// authority gate (rule 1: issuer == the row's attester) decides.
+///
+/// # Errors
+/// [`FileError::NotAuthor`] when no signer in hand is the author; otherwise
+/// [`FileError::Withdraw`] naming the build or write failure.
+pub async fn withdraw(
+    directory: &dyn FederationDirectory,
+    row: &Attestation,
+    reason: &str,
+    asserted_at: DateTime<Utc>,
+    signers: Signers<'_>,
+) -> Result<Attestation, FileError> {
+    let file = FileRow::from_row(row).ok_or_else(|| FileError::Withdraw {
+        attestation_id: row.attestation_id.clone(),
+        detail: "not a file row".to_owned(),
+    })?;
+    let signer = file.author_signer(signers)?;
+    let withdraws = crate::replication::attestation_bind::withdraws_attestation(
+        row,
+        reason,
+        asserted_at,
+        signer,
+    )
+    .await
+    .map_err(|detail| FileError::Withdraw {
+        attestation_id: row.attestation_id.clone(),
+        detail,
+    })?;
+    directory
+        .put_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: withdraws.clone(),
+        })
+        .await
+        .map_err(|e| FileError::Withdraw {
+            attestation_id: row.attestation_id.clone(),
+            detail: e.to_string(),
+        })?;
+    Ok(withdraws)
 }
 
 /// What [`publish`] did.
@@ -219,7 +306,9 @@ pub async fn publish(
     signers: Signers<'_>,
     write: &FileWrite<'_>,
 ) -> Result<PublishedFile, FileError> {
-    let author_key_id = signers.node.key_id.clone();
+    // CIRISEdge#675 — the person authors; the node co-signs at the crossing.
+    let author = file_author(signers);
+    let author_key_id = author.key_id.clone();
     // Persist's group slot per cohort: the community at `community`, the
     // OWNER at `self`, the family at `family` — which is exactly the id the
     // room names, so the seal and the projector cannot disagree about which
@@ -268,7 +357,7 @@ pub async fn publish(
         );
     }
 
-    let row = file_row(signers.node, write, &sealed.pointer)
+    let row = file_row(author, write, &sealed.pointer)
         .await
         .map_err(FileError::Row)?;
     directory
@@ -440,7 +529,10 @@ pub fn must_chunk(plaintext_len: usize) -> bool {
 pub struct FileRow {
     /// The row's id.
     pub attestation_id: String,
-    /// Who wrote it.
+    /// Who wrote it — the PERSON (their fed-ID) for a file published with
+    /// the actor's signer in hand, the node for an agent-only node or a row
+    /// from before CIRISEdge#675. The node's custody co-scrub is on the row
+    /// (`additional_scrubs`), not here.
     pub attesting_key_id: String,
     /// When.
     pub asserted_at: DateTime<Utc>,
@@ -500,6 +592,35 @@ impl FileRow {
             pointer,
             lifecycle: FileLifecycle::Live,
         })
+    }
+
+    /// **The signer that may perform an author-only operation on this file**
+    /// — withdraw, replace, rename (CIRISEdge#675): whichever signer in hand
+    /// IS the row's attester. A person-authored row answers the person's key
+    /// (any of the owner's devices); a node-authored row answers only that
+    /// node's key.
+    ///
+    /// # Errors
+    /// [`FileError::NotAuthor`] naming the author and the signers offered.
+    pub fn author_signer<'a>(
+        &self,
+        signers: Signers<'a>,
+    ) -> Result<&'a crate::identity::LocalSigner, FileError> {
+        signers
+            .actor
+            .into_iter()
+            .chain(std::iter::once(signers.node))
+            .find(|s| s.key_id == self.attesting_key_id)
+            .ok_or_else(|| FileError::NotAuthor {
+                attestation_id: self.attestation_id.clone(),
+                author: self.attesting_key_id.clone(),
+                held: signers
+                    .actor
+                    .into_iter()
+                    .chain(std::iter::once(signers.node))
+                    .map(|s| s.key_id.clone())
+                    .collect(),
+            })
     }
 
     /// The bytes, or **why not** — `NotFetched` while the row is held and

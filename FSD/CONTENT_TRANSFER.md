@@ -571,6 +571,35 @@ answer to "is this chunked"** — one fact, one member, no way for two to disagr
 opens it through the same door as an inline blob (persist's whole-read caps at 64 MiB and names the
 range door above that).
 
+#### 6.7.0 Who authors a file — the person, co-signed by the node (CIRISEdge#675)
+
+A file row is a claim a **person** makes ("this is my file"), so it is authored the way chat rows
+are: **`attesting_key_id` = the actor** (the owner's fed-ID, `Signers::actor`), signed at write by
+the actor's key; the **node** that holds it adds its custody scrub at the crossing
+(`additional_scrubs`, `cosigned_at` — `attestation_bind::custody_for`'s `NodeCoScrub` arm, which
+*preserves* the actor's base signature; no door re-signs it as the node). Before #675 the row was
+authored by the node alone, so "author only" meant "this machine", and a file written on the
+owner's laptop could not be withdrawn from their phone.
+
+- **The one choice, in one place.** `files::file_author(signers)` = the actor if in hand, else the
+  node — the node-only posture is kept for hosts with no human signer (an agent-only node), exactly
+  as before. The row's author, the content AAD's author (`content_aad(author, instant, field)`) and
+  the id preimage all read that one value, so the seal and the row can never name different
+  authors (a mismatch would make every read fail). #698's sealed descriptor composes on the same
+  value.
+- **Author-only operations** (withdraw; a replace/rename is a `supersedes` by the same rule) are
+  authorized by the **row's attester**: `FileRow::author_signer(signers)` returns whichever signer
+  in hand IS that attester, else `FileError::NotAuthor`. For an actor-authored row that is the
+  owner's fed-ID signer, which every device of the owner holds — so any of the owner's devices
+  withdraws it (persist's `withdraws` rule 1: issuer == `T.attesting_key_id`). `files::withdraw`
+  builds the `withdraws` with persist's own envelope builder and writes it.
+- **Read-compat — node-authored rows (written before #675, or by an agent-only node).** They still
+  list and open unchanged (the AAD names the node, as it did when sealed). Their author is the
+  NODE, so only that node can withdraw them; another device of the same owner gets
+  `FileError::NotAuthor` naming the authoring node. Letting the owner withdraw a row its own node
+  authored would need persist to admit "issuer = `owner_of(T.attesting_key_id)`" as a withdraws
+  authority — not built; recorded as a persist ask, not approximated here.
+
 #### 6.7.1 The sealed descriptor — a file's name and media type open only with the bytes (CIRISEdge#698, CIRISConstitution#114)
 
 **Ruled (CC 3.3.13, CIRISConstitution#114, 2026-09-27).** In the encrypted two-hash case the Source
