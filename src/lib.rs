@@ -83,6 +83,9 @@ pub mod directory_cache_driver;
 mod edge;
 // v6.1.0 (CIRISEdge#175, FSD §3.1) — Poisson emission discipline
 // with substrate-maintenance cover.
+/// CIRISEdge#706 — the CC namespace grammar vendored for replay (test-only).
+#[cfg(test)]
+pub(crate) mod cc_namespace;
 pub mod emission;
 pub mod events;
 pub mod ffi;
