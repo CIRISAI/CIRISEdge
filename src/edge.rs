@@ -8957,6 +8957,7 @@ mod delegation_gate_tests {
 
     /// [`delegates_to_row`] with `sub_delegation` set, so the grantee may
     /// deputize onward (persist's walk refuses a hop past depth 1 without it).
+    #[allow(clippy::similar_names)] // granter/grantee mirrors persist's column names
     fn delegates_to_row_with(
         granter: &str,
         grantee: &str,

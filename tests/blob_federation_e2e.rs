@@ -1621,6 +1621,7 @@ async fn an_authorized_withdraws_that_arrived_first_evicts_when_its_target_lands
 
 /// A signed `delegates_to(granter → grantee)` carrying `scope`, built with the
 /// same binder and signer every edge producer uses.
+#[allow(clippy::similar_names)] // granter/grantee mirrors persist's column names
 async fn signed_delegation(
     granter: &Ident,
     grantee: &Ident,

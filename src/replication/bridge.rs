@@ -11365,6 +11365,7 @@ pub(crate) mod tests {
     /// error. Edge adds no signing of its own, so nothing on the edge side
     /// can heal — or mask — a stripped authority signature.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one leg per declaration plane, in order
     async fn e4_unsigned_declarations_refuse_at_admission() {
         let (backend, bridge) = make_bridge(&[]);
         // Every FK'd id exists, so the ONLY failing gate is the E4 verify
