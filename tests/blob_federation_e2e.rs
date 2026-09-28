@@ -1619,6 +1619,216 @@ async fn an_authorized_withdraws_that_arrived_first_evicts_when_its_target_lands
     assert!(node_b.dir.get_blob(&sha).await.expect("get_blob").is_none());
 }
 
+/// A signed `delegates_to(granter → grantee)` carrying `scope`, built with the
+/// same binder and signer every edge producer uses.
+async fn signed_delegation(
+    granter: &Ident,
+    grantee: &Ident,
+    scope: &str,
+) -> ciris_persist::federation::Attestation {
+    use ciris_edge::replication::attestation_bind::{
+        bind_attestation_envelope, truncate_to_substrate_resolution, AttestationColumns,
+    };
+    use sha2::Digest as _;
+
+    let signer = edge_signer_for(granter);
+    let asserted_at = truncate_to_substrate_resolution(ts());
+    let attestation_id = format!("deleg-{}-{}", granter.key_id, grantee.key_id);
+    let mut envelope = serde_json::json!({ "scope": [scope] });
+    let subjects: Vec<String> = Vec::new();
+    bind_attestation_envelope(
+        &mut envelope,
+        asserted_at,
+        &AttestationColumns {
+            attestation_id: &attestation_id,
+            attesting_key_id: &granter.key_id,
+            attestation_type: "delegates_to",
+            attested_key_id: &grantee.key_id,
+            subject_key_ids: &subjects,
+            cohort_scope: "federation",
+            weight: None,
+        },
+    );
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
+    let digest = sha2::Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) =
+        ciris_edge::identity::sign_bound_hybrid(&signer, &canonical, "delegation row")
+            .await
+            .expect("sign the delegation");
+    ciris_persist::federation::Attestation {
+        attestation_id,
+        attesting_key_id: granter.key_id.clone(),
+        attested_key_id: grantee.key_id.clone(),
+        attestation_type: "delegates_to".to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: granter.key_id.clone(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: "federation".to_owned(),
+        tier: "federation".to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    }
+}
+
+/// **A `withdraws` retires at the depth it was ADMITTED under** (persist
+/// v50.0.0 CIRISPersist#928 review H2; CIRISEdge#703). A seven-hop
+/// `consent_revocation` proxy chain `k0 → … → k6 → alice` names the row's
+/// subject. B admitted k0's withdrawal while it walked the legacy 16-hop
+/// depth (the depth every pre-v50 row is backfilled at), with the target not
+/// yet local — so it is stored rule=None and recorded at 16. The node's depth
+/// then drops to the CC 4.1.1 default (5). When the row lands, the register's
+/// recompute must re-derive at the ROW's admission depth: the bytes still go.
+/// Walking the node's CURRENT depth (the write-time gate) would un-retire what
+/// the row validly retired — the regression this pins.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // chain, crossing, and replay in order on purpose
+async fn a_seven_hop_withdraws_admitted_at_the_legacy_depth_still_stops_the_bytes() {
+    use ciris_edge::blob_swarm::revocation::{apply_observation, observe};
+    use ciris_edge::blob_swarm::{
+        BlobChunkSource as _, BlobEvictor, BytesVerdict, ChunkSourceRefusal,
+        PersistBlobChunkSource, RevocationRegister,
+    };
+    use ciris_edge::replication::attestation_bind::withdraws_attestation;
+    use ciris_persist::federation::admission::DELEGATION_SCOPE_CONSENT_REVOCATION;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::{
+        FederationDirectory as _, SignedAttestation, DEFAULT_DELEGATION_DEPTH, MAX_DELEGATION_DEPTH,
+    };
+
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let proxies: Vec<Ident> = (0..7u8)
+        .map(|i| Ident::new(&format!("proxy-k{i}"), 0x40 + i))
+        .collect();
+    let mut idents: Vec<&Ident> = vec![&alice, &bob];
+    idents.extend(proxies.iter());
+    let room = "room-alice-bob";
+    let node_a = node(&idents, &alice).await;
+    let node_b = node(&idents, &bob).await;
+    seed_room(&node_a, room, &[&alice, &bob]).await;
+    seed_room(&node_b, room, &[&alice, &bob]).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+
+    // k0 → k1 → … → k6 → alice: seven consent_revocation hops on B.
+    let mut chain: Vec<&Ident> = proxies.iter().collect();
+    chain.push(&alice);
+    for w in chain.windows(2) {
+        node_b
+            .dir
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: signed_delegation(w[0], w[1], DELEGATION_SCOPE_CONSENT_REVOCATION)
+                    .await,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("B admits {} → {}: {e}", w[0].key_id, w[1].key_id));
+    }
+
+    let body = b"withdrawn by a proxy seven hops out";
+    let sealed = node_a
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(room),
+            author_key_id: &alice.key_id,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: body,
+            media_type: Some("text/plain"),
+        })
+        .await
+        .expect("seal");
+    let sha = cross_key_and_bytes(&node_a, &node_b, &sealed, &alice, room, body).await;
+
+    let register = Arc::new(RevocationRegister::default());
+    let serve = PersistBlobChunkSource::new(node_b.store.engine().clone())
+        .with_revocations(Some(Arc::clone(&register)));
+    let evictor: &dyn BlobEvictor = node_b.store.engine();
+
+    let row = signed_content_row(&alice, room, &sealed.pointer).await;
+    node_a
+        .dir
+        .put_attestation_authored(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("A admits the row");
+
+    // k0's withdrawal crosses FIRST, while B walks the legacy 16-hop depth.
+    node_b
+        .dir
+        .set_withdraws_delegation_depth(MAX_DELEGATION_DEPTH);
+    let withdraws = withdraws_attestation(&row, "proxy", ts(), &edge_signer_for(&proxies[0]))
+        .await
+        .expect("build");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: withdraws.clone(),
+        })
+        .await
+        .expect("admitted deferred: the target is not here yet");
+    assert_eq!(
+        node_b
+            .dir
+            .withdraws_admission_depth(&withdraws.attestation_id)
+            .await
+            .expect("depth read"),
+        Some(MAX_DELEGATION_DEPTH),
+        "precondition: recorded at the depth it was admitted under",
+    );
+    assert!(apply_observation(
+        &register,
+        &*node_b.dir,
+        Some(evictor),
+        observe(&withdraws).expect("observed"),
+    )
+    .await
+    .is_empty());
+
+    // The node's depth drops to the CC 4.1.1 default; seven hops exceed it.
+    node_b
+        .dir
+        .set_withdraws_delegation_depth(DEFAULT_DELEGATION_DEPTH);
+
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("B admits the row");
+    let evicted = apply_observation(
+        &register,
+        &*node_b.dir,
+        Some(evictor),
+        observe(&row).expect("observed"),
+    )
+    .await;
+    assert_eq!(
+        evicted,
+        vec![sha],
+        "the replayed withdrawal re-derives at its ADMISSION depth (16) and the seven-hop \
+         proxy still retires the bytes — not at the node's current default (5)",
+    );
+    assert_eq!(register.verdict(&sha), BytesVerdict::Revoked);
+    assert!(matches!(
+        serve.read_chunk(sha, sha, &node_b.me).await,
+        Err(ChunkSourceRefusal::Withdrawn)
+    ));
+    assert!(node_b.dir.get_blob(&sha).await.expect("get_blob").is_none());
+}
+
 /// **CC 2.3 reaches the bytes.** A subject's `withdraws` is admitted on a
 /// holder, RE-VERIFIED against the row the holder has, and the bytes go:
 /// the serve door answers `Withdrawn` (the one refusal the fetcher aborts
