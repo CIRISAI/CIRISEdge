@@ -2719,7 +2719,7 @@ impl PyEdge {
     ///   transport was registered at init.
     /// - `ValueError("unknown EnvelopeKind: {token}")` if a kind
     ///   string in `peers` doesn't match the 10 wire tokens.
-    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None))]
+    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None, publish_sets_by_kind = None))]
     fn start_replication(
         &self,
         py: Python<'_>,
@@ -2743,6 +2743,13 @@ impl PyEdge {
         // it → 0 delivery even after transport rooting. `None` preserves the
         // pre-fix cohort projection. The server supplies the set; edge wraps it.
         occurrence_publish_set: Option<Vec<String>>,
+        // CIRISEdge#678 (CIRISServer#148 limb b) — per-plane publish sets,
+        // keyed by wire kind (`"key"`, `"identity_occurrence"`,
+        // `"transport_destination"`). A named kind publishes exactly its set;
+        // an unnamed kind stays on the union above. Lets the server relay a
+        // third party's anchored key while withholding that party's
+        // occurrences and routes. `None` = unchanged behaviour.
+        publish_sets_by_kind: Option<std::collections::HashMap<String, Vec<String>>>,
     ) -> PyResult<PyReplicationHandle> {
         let directory = self
             .inner
@@ -2807,6 +2814,28 @@ impl PyEdge {
                         as crate::replication::bridge::CohortProvider)
                 }
             };
+
+        if let Some(by_kind) = publish_sets_by_kind {
+            let mut sets = std::collections::HashMap::with_capacity(by_kind.len());
+            for (token, set) in by_kind {
+                let kind = parse_envelope_kind(&token)?;
+                if !matches!(
+                    kind,
+                    crate::replication::EnvelopeKind::Key
+                        | crate::replication::EnvelopeKind::IdentityOccurrence
+                        | crate::replication::EnvelopeKind::TransportDestination
+                ) {
+                    return Err(PyValueError::new_err(format!(
+                        "publish_sets_by_kind: {token} is not a SelfOwn plane (key, \
+                         identity_occurrence, transport_destination)"
+                    )));
+                }
+                sets.insert(kind, set);
+            }
+            config.kind_publish_selector = Some(
+                crate::replication::bridge::KindPublishSelector::from_sets(sets),
+            );
+        }
 
         let executor = self.executor.clone();
         let runtime = py.detach(|| {

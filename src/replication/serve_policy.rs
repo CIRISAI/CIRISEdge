@@ -39,9 +39,22 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // `list_revocations` → `Projection::Global`, the #311 tombstone rule).
         // The manifest states that truth — the earlier `per_record_projection`
         // claim here described a mechanism these planes never had.
-        EnvelopeKind::Key
-        | EnvelopeKind::IdentityOccurrence
-        | EnvelopeKind::TransportDestination => ("self_own", "public"),
+        //
+        // CIRISEdge#678 — a host's per-kind publish set (`KindPublishSelector`)
+        // may replace the self set for any of the three; the projection is
+        // still `self_own` (the host names what it speaks for), so the cell
+        // does not move.
+        EnvelopeKind::Key => ("self_own", "public"),
+        // CIRISEdge#682 (CC 5.4.6, CIRISServer#655) — announce is per node. An
+        // OWNED node's occurrence and route are served (advertise, direct
+        // fetch, subject Pull) to every peer only when the node is announced
+        // (a live owner-binding at `cohort_scope: federation`); otherwise only
+        // to its owner's own nodes, booked `identity_row_node_not_announced`.
+        // An unowned node is its own trust subject and serves as before.
+        EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination => (
+            "self_own",
+            "owned node: announced → public; unannounced → owner's nodes only",
+        ),
         // E3: the trace plane is the sole capability-gated serve path — and the
         // ONE plane whose projection is genuinely decided per row.
         EnvelopeKind::Attestation => (
@@ -229,8 +242,15 @@ pub fn serve_advertise_policy_sha256() -> String {
 // `Attestation` is untouched: per-row entitlement (trace:* → capability, the G2
 // carve). **CIRISServer must mirror this pin** (supersedes e8216fec…,
 // e54c5677… and 75ceef58…, none of which shipped server-side).
+//
+// CIRISEdge#682 — RE-PINNED, 6fbf0282… → e4c4d625…. The IdentityOccurrence and
+// TransportDestination `serve` cells now state the per-node announce gate
+// (CC 5.4.6, CIRISServer#655): an owned node's occurrence and route reach every
+// peer only when announced (owner-binding at `cohort_scope: federation`), else
+// only its owner's own nodes — on the advertise, the direct fetch and the
+// subject Pull alike. `Key` is untouched. **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "6fbf0282408148ceea541c9e5f0b6c0726d6e10b41880b7ce9d81339ecb3e7ab";
+    "e4c4d6253afe686a01eec073da343b74b11af6da6cd26c16a6ef0aacc9804569";
 
 #[cfg(test)]
 mod tests {

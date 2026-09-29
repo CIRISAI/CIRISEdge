@@ -1276,6 +1276,78 @@ const CURSOR_PAGE_BUDGET_BYTES: usize = 512 * 1024;
 /// so the bridge observes peer-set evolution without restart.
 pub type CohortProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
+/// CIRISEdge#678 — the per-kind `SelfOwn` publish set a host may install with
+/// [`FederationDirectoryReplicationBridge::with_kind_publish_selector`] (or
+/// `ReplicationRuntimeConfig::kind_publish_selector`). ONE hook that receives
+/// the kind: `Some(set)` is that plane's publish set, `None` leaves the plane on
+/// the self-publish set. Consulted only for `Key`, `IdentityOccurrence` and
+/// `TransportDestination` — the planes that advertise a subject set.
+#[derive(Clone)]
+pub struct KindPublishSelector(Arc<dyn Fn(EnvelopeKind) -> Option<Vec<String>> + Send + Sync>);
+
+impl KindPublishSelector {
+    /// Wrap a host closure.
+    pub fn new(f: impl Fn(EnvelopeKind) -> Option<Vec<String>> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// A fixed table: each named kind publishes exactly its set; every kind
+    /// not named stays on the self-publish set.
+    #[must_use]
+    pub fn from_sets(sets: HashMap<EnvelopeKind, Vec<String>>) -> Self {
+        Self::new(move |kind| sets.get(&kind).cloned())
+    }
+
+    /// The set for `kind`, or `None` for "the default".
+    #[must_use]
+    pub fn select(&self, kind: EnvelopeKind) -> Option<Vec<String>> {
+        (self.0)(kind)
+    }
+}
+
+impl std::fmt::Debug for KindPublishSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("KindPublishSelector(..)")
+    }
+}
+
+/// CIRISEdge#682 — who may be handed the `IdentityOccurrence` /
+/// `TransportDestination` rows about one occurrence key. Decided from persist
+/// state (the owner-binding and its `cohort_scope`), never from a host flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdentityRowReach {
+    /// Announced (a live owner-binding at `cohort_scope: federation`), or
+    /// unowned — a node that is its own trust subject has no owner to announce
+    /// it and serves its rows as it always has (the canonical, a bare server).
+    Everyone,
+    /// Owned and NOT announced: only the owner's own nodes
+    /// (`nodes_owned_by(owner)`, which includes the node itself).
+    OwnersNodes(HashSet<String>),
+    /// The owner or the announce state could not be read. Fail-closed: only
+    /// the node itself.
+    Unresolved,
+}
+
+impl IdentityRowReach {
+    /// `None` = serve; `Some(reason)` = withhold, booked under `reason`.
+    fn withholds(
+        &self,
+        subject: &str,
+        peer: Option<&str>,
+    ) -> Option<crate::observability::WithholdReason> {
+        use crate::observability::WithholdReason;
+        if peer == Some(subject) {
+            return None;
+        }
+        match self {
+            Self::Everyone => None,
+            Self::OwnersNodes(nodes) => (!peer.is_some_and(|p| nodes.contains(p)))
+                .then_some(WithholdReason::IdentityRowNodeNotAnnounced),
+            Self::Unresolved => Some(WithholdReason::IdentityRowAnnounceUnresolved),
+        }
+    }
+}
+
 /// Type alias for the v2 key-directory provider — an operator-configured
 /// callback yielding the current federation key_directory
 /// (`Vec<ThresholdMember>`). Re-invoked on each operational admit so
@@ -1470,6 +1542,20 @@ pub struct FederationDirectoryReplicationBridge {
     /// CIRISEdge#523 — the resolved owner-binding memo backing the Cohort-scoped
     /// advertise widening (`node_key_id → owner`). See [`OwnerCache`].
     owner_cache: Mutex<OwnerCache>,
+    /// CIRISEdge#682 — the announce-state memo behind the identity-plane serve
+    /// gate (`occurrence key → who may be handed its IdOcc/TD rows`). Same TTL
+    /// and the same invalidation events as [`Self::owner_cache`], plus the
+    /// owner-binding `supersedes` widening that IS an announce. See
+    /// [`Self::identity_row_reach`].
+    announce_cache: Mutex<HashMap<String, (Instant, IdentityRowReach)>>,
+    /// CIRISEdge#682 — how many times the announce memo MISSED and the walk
+    /// (`owner_of` + the owner's rows + `nodes_owned_by`) ran. The memo's own
+    /// witness, as [`Self::owner_reads`] is for the owner memo. `Relaxed`.
+    announce_reads: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#678 — the host's per-kind publish set for the `SelfOwn`
+    /// planes. `None` (and a selector answering `None` for a kind) keeps that
+    /// kind on [`Self::self_provider`] exactly as before.
+    kind_publish_selector: Option<KindPublishSelector>,
     /// CIRISEdge#523 — how many times the bridge actually asked persist's
     /// `owner_of` (i.e. the memo MISSED). The cache's own witness: the advertise
     /// path runs per round per plane, so "three planes in one round cost ONE
@@ -1771,6 +1857,9 @@ impl FederationDirectoryReplicationBridge {
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
+            announce_cache: Mutex::new(HashMap::new()),
+            announce_reads: std::sync::atomic::AtomicUsize::new(0),
+            kind_publish_selector: None,
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
@@ -1851,6 +1940,9 @@ impl FederationDirectoryReplicationBridge {
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
+            announce_cache: Mutex::new(HashMap::new()),
+            announce_reads: std::sync::atomic::AtomicUsize::new(0),
+            kind_publish_selector: None,
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
             owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
             owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
@@ -1905,6 +1997,25 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_self_provider(mut self, selector: Option<CohortProvider>) -> Self {
         self.self_provider = selector;
+        self
+    }
+
+    /// CIRISEdge#678 (CIRISServer#148 limb b) — install a PER-KIND publish set
+    /// for the `SelfOwn` planes (`Key`, `IdentityOccurrence`,
+    /// `TransportDestination`).
+    ///
+    /// [`Self::with_self_provider`] hands all three planes ONE set, so a host
+    /// can relay every plane for a subject or none. Onward flow is per plane:
+    /// a third party's key record may be relayed on the anchoring it carries,
+    /// while that party's occurrences and routes need a `share`/`publish`
+    /// principle on THEIR grant (`retain` authorises holding, not forwarding).
+    /// The selector receives the kind and answers the set for it; `None` for a
+    /// kind keeps that kind on the self-publish set. The answer REPLACES the
+    /// default for that kind — the host computes both, as it already does for
+    /// the self set. Unset: behaviour is exactly the single-provider one.
+    #[must_use]
+    pub fn with_kind_publish_selector(mut self, selector: Option<KindPublishSelector>) -> Self {
+        self.kind_publish_selector = selector;
         self
     }
 
@@ -2977,6 +3088,13 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             (EnvelopeKind::Attestation, Some(peer)) => {
                 self.list_attestations(Some(peer), window).await
             }
+            // CIRISEdge#682 — the identity planes are per-peer too: an
+            // unannounced node's occurrence and route go only to its owner's
+            // own nodes. An unbound peer (`None`) proves no ownership and is
+            // treated as a stranger.
+            (EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination, peer) => {
+                self.list_identity_plane_for_peer(kind, peer, window).await
+            }
             _ => self.list_envelope_refs_unbounded(kind, window).await,
         }
     }
@@ -3297,7 +3415,8 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 // arm so the fail-closed refusal below never queues behind a
                 // sweep — refusing costs nothing and must stay instant.
                 let _permit = self.sweep_gate.enter().await;
-                self.subject_holdings_inner(kind, subject_key_id).await
+                self.subject_holdings_inner(kind, subject_key_id, peer_key_id)
+                    .await
             }
             other => {
                 tracing::warn!(
@@ -3340,6 +3459,20 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             );
             return None;
         };
+        // CIRISEdge#682 — the direct-fetch twin of the announce-gated identity
+        // advertise: a peer that learned an unannounced node's occurrence or
+        // route hash out-of-band (or from a holder that relayed it) is not
+        // handed the bytes unless it is one of that node's owner's nodes. Keyed
+        // on the ROW's occurrence, so it covers a relayed row as well as our own.
+        if matches!(
+            kind,
+            EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination
+        ) && self
+            .identity_row_fetch_withholds(kind, &bytes, envelope_hash, peer_key_id)
+            .await
+        {
+            return None;
+        }
         if kind == EnvelopeKind::Attestation {
             // CIRISEdge#440 — the direct-fetch twins of the advertise-sweep
             // pause + quarantine gates, so a peer cannot obtain a paused
@@ -3803,6 +3936,7 @@ impl FederationDirectoryReplicationBridge {
         &self,
         kind: EnvelopeKind,
         subject_key_id: &str,
+        peer_key_id: Option<&str>,
     ) -> Vec<EnvelopeRef> {
         let mut refs: Vec<EnvelopeRef> = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
@@ -3879,6 +4013,18 @@ impl FederationDirectoryReplicationBridge {
                         .list_signed_identity_occurrences_for(subject_key_id),
                     "identity-occurrence"
                 ) {
+                    // CIRISEdge#682 — the subject-Pull twin of the announce gate:
+                    // a named lookup never lists an unannounced node's
+                    // occurrence to a peer outside its owner's nodes.
+                    if self
+                        .identity_row_pull_withholds(
+                            &row.identity_occurrence.occurrence_key_id,
+                            peer_key_id,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
                     let seq = Self::ms_seq(row.identity_occurrence.asserted_at);
                     match content_hash_of(&row) {
                         Some((hash, _)) => push(hash, seq),
@@ -3893,6 +4039,13 @@ impl FederationDirectoryReplicationBridge {
                     "transport-destination"
                 ) {
                     let td = &row.transport_destination;
+                    // CIRISEdge#682 — the subject-Pull twin (see above).
+                    if self
+                        .identity_row_pull_withholds(&td.occurrence_key_id, peer_key_id)
+                        .await
+                    {
+                        continue;
+                    }
                     let seq = if td.epoch > 0 {
                         td.epoch
                     } else {
@@ -4364,6 +4517,22 @@ impl FederationDirectoryReplicationBridge {
     /// back-compat); `Cohort` uses the anti-entropy cohort; `Global` uses
     /// own-union-cohort, the widest set the node can enumerate, so a tombstone
     /// is never dropped when its subject exits the cohort (anti-rollback).
+    /// CIRISEdge#678 — the publish set of one `SelfOwn` plane: the host's
+    /// per-kind answer when it gave one, else the self-publish set
+    /// ([`Self::subjects_for_projection`]`(SelfOwn)`) exactly as before.
+    fn self_own_subjects(&self, kind: EnvelopeKind) -> HashSet<String> {
+        if let Some(set) = self
+            .kind_publish_selector
+            .as_ref()
+            .and_then(|selector| selector.select(kind))
+        {
+            return set.into_iter().collect();
+        }
+        self.subjects_for_projection(Projection::SelfOwn)
+            .into_iter()
+            .collect()
+    }
+
     fn subjects_for_projection(&self, projection: Projection) -> Vec<String> {
         match projection {
             Projection::SelfOwn => {
@@ -4481,10 +4650,7 @@ impl FederationDirectoryReplicationBridge {
     ///      node-local `admitted_at` — the #682 fix, so a late-admitted key sorts
     ///      by when THIS node saw it, not by a stale producer clock.
     async fn list_keys(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
-        let subjects: HashSet<String> = self
-            .subjects_for_projection(Projection::SelfOwn)
-            .into_iter()
-            .collect();
+        let subjects = self.self_own_subjects(EnvelopeKind::Key);
         self.list_keys_page(Some(&subjects), window).await
     }
 
@@ -4541,14 +4707,44 @@ impl FederationDirectoryReplicationBridge {
         self.list_keys_page(None, SweepWindow::Full).await
     }
 
+    /// CIRISEdge#682 — the announce-gated advertise of the two identity planes.
+    /// The `SelfOwn` publish set is narrowed per peer by
+    /// [`Self::identity_rows_withheld_from`] (one reach walk per subject, not
+    /// per row), then the plane's ordinary since-cursor page runs over what is
+    /// left. Each withheld subject is booked once per sweep under its reason.
+    async fn list_identity_plane_for_peer(
+        &self,
+        kind: EnvelopeKind,
+        peer: Option<&str>,
+        window: SweepWindow<'_>,
+    ) -> Vec<EnvelopeRef> {
+        let mut subjects = self.self_own_subjects(kind);
+        let withheld = self.identity_rows_withheld_from(&subjects, peer).await;
+        for (subject, reason) in &withheld {
+            subjects.remove(subject);
+            self.withhold(
+                *reason,
+                peer.unwrap_or("<unattributed>"),
+                &format!("{kind:?} rows about {subject}: advertise (CIRISEdge#682)"),
+            );
+        }
+        match kind {
+            EnvelopeKind::IdentityOccurrence => {
+                self.list_identity_occurrences_page(Some(&subjects), window)
+                    .await
+            }
+            _ => {
+                self.list_transport_destinations_page(Some(&subjects), window)
+                    .await
+            }
+        }
+    }
+
     /// IdentityOccurrence plane — `SelfOwn` (publish-own): the node's OWN KEX
     /// occurrences. Scope filter is the `SelfOwn` publish set (keyed by the
     /// occurrence key_id); seq is `asserted_at`.
     async fn list_identity_occurrences(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
-        let subjects: HashSet<String> = self
-            .subjects_for_projection(Projection::SelfOwn)
-            .into_iter()
-            .collect();
+        let subjects = self.self_own_subjects(EnvelopeKind::IdentityOccurrence);
         self.list_identity_occurrences_page(Some(&subjects), window)
             .await
     }
@@ -4594,10 +4790,7 @@ impl FederationDirectoryReplicationBridge {
     /// (CIRISPersist#443), falling back to `asserted_at` for a pre-#443
     /// producer whose projection reads epoch 0.
     async fn list_transport_destinations(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
-        let subjects: HashSet<String> = self
-            .subjects_for_projection(Projection::SelfOwn)
-            .into_iter()
-            .collect();
+        let subjects = self.self_own_subjects(EnvelopeKind::TransportDestination);
         self.list_transport_destinations_page(Some(&subjects), window)
             .await
     }
@@ -7203,6 +7396,246 @@ impl FederationDirectoryReplicationBridge {
         if let Ok(mut memo) = self.consent_memo.lock() {
             *memo = None;
         }
+        // CIRISEdge#682 — the announce memo is owner-derived on BOTH sides (the
+        // node's own binding decides announced-ness; the owner's other bindings
+        // decide who counts as "the owner's nodes"), so it has no single key to
+        // evict. Whole drop, the #524 trade: ownership events are rare.
+        if let Ok(mut memo) = self.announce_cache.lock() {
+            memo.clear();
+        }
+    }
+
+    /// CIRISEdge#682 — how many times the announce walk actually ran (the memo
+    /// missed). The witness that one sweep pays for each subject ONCE.
+    #[must_use]
+    pub fn announce_reads(&self) -> usize {
+        self.announce_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// **CIRISEdge#682 (CC 5.4.6, CIRISServer#655) — who may be handed the
+    /// `IdentityOccurrence` / `TransportDestination` rows about `subject`.**
+    ///
+    /// Announce is per node: the person promotes the owner-binding
+    /// `owner → node` to `cohort_scope: federation` (`POST
+    /// /v1/federation/announce`, persist `widen_audience`). An announced node's
+    /// identity rows are lightnet — served to every peer, as before. An
+    /// unannounced one is darknet: reachable by its person's own nodes, never
+    /// listed, so its rows go only to `nodes_owned_by(owner)`.
+    ///
+    /// Decided from persist state alone, never from a host flag, and memoized
+    /// under [`OWNER_BINDING_MEMO_TTL`] so a sweep over N peers pays for each
+    /// subject once (the memo is dropped on every ownership event, see
+    /// [`Self::invalidate_owner_memo`]). An unresolved answer is NOT cached,
+    /// matching [`Self::owner_of_cached`].
+    async fn identity_row_reach(&self, subject: &str) -> IdentityRowReach {
+        if let Ok(memo) = self.announce_cache.lock() {
+            if let Some((at, reach)) = memo.get(subject) {
+                if at.elapsed() < OWNER_BINDING_MEMO_TTL {
+                    return reach.clone();
+                }
+            }
+        }
+        self.announce_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let reach = match self.owner_of_cached(subject).await {
+            // Its own trust subject (FIRST_CONTACT §3's degenerate point): no
+            // owner, so no announce axis. The canonical and bare servers.
+            OwnerLookup::Unowned => IdentityRowReach::Everyone,
+            OwnerLookup::Unresolved => IdentityRowReach::Unresolved,
+            OwnerLookup::Owner(owner) => match self.node_is_announced(&owner, subject).await {
+                Ok(true) => IdentityRowReach::Everyone,
+                Ok(false) => match ciris_persist::federation::admission::nodes_owned_by(
+                    &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
+                    &owner,
+                )
+                .await
+                {
+                    Ok(nodes) => IdentityRowReach::OwnersNodes(nodes.into_iter().collect()),
+                    Err(e) => {
+                        tracing::debug!(
+                            subject,
+                            error = %e,
+                            "nodes_owned_by unresolved — an unannounced node's identity rows \
+                             are served to itself only (CIRISEdge#682 fail-closed)"
+                        );
+                        IdentityRowReach::Unresolved
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!(
+                        subject,
+                        error = %e,
+                        "announce state unresolved — identity rows are served to the node \
+                         itself only (CIRISEdge#682 fail-closed)"
+                    );
+                    IdentityRowReach::Unresolved
+                }
+            },
+        };
+        if reach != IdentityRowReach::Unresolved {
+            if let Ok(mut memo) = self.announce_cache.lock() {
+                memo.insert(subject.to_owned(), (Instant::now(), reach.clone()));
+            }
+        }
+        reach
+    }
+
+    /// CIRISEdge#682 — is `node` announced by `owner`? True iff a LIVE row
+    /// authored by the owner and naming the node is an owner-binding at
+    /// `cohort_scope: federation`: either the `delegates_to` itself written at
+    /// federation, or the `supersedes` widening persist's `widen_audience`
+    /// writes over it (the announce route). The widening is judged the way
+    /// persist's own minor gate judges it (`check_minor_owner_binding_not_announced`):
+    /// on the body it carries, else on the prior it names.
+    ///
+    /// Liveness is persist's: `precedence::retired_ids` (an admitted
+    /// `withdraws`/`recants` of the widening un-announces the node) and
+    /// `expires_at`. The binding's own liveness is already folded by `owner_of`,
+    /// which the caller resolved first.
+    async fn node_is_announced(
+        &self,
+        owner: &str,
+        node: &str,
+    ) -> Result<bool, ciris_persist::federation::Error> {
+        use ciris_persist::federation::admission::is_owner_binding_envelope;
+        use ciris_persist::federation::types::{attestation_type, cohort_scope};
+        let rows = self.directory.list_attestations_for(node).await?;
+        let refs: Vec<&Attestation> = rows.iter().collect();
+        let retired = ciris_persist::federation::precedence::retired_ids(&refs);
+        let now = chrono::Utc::now();
+        for r in &rows {
+            if r.attesting_key_id != owner
+                || r.attested_key_id != node
+                || r.cohort_scope != cohort_scope::FEDERATION
+                || retired.contains(r.attestation_id.as_str())
+                || r.expires_at.is_some_and(|exp| exp <= now)
+            {
+                continue;
+            }
+            let announces = if r.attestation_type == attestation_type::DELEGATES_TO {
+                is_owner_binding_envelope(&r.attestation_envelope)
+            } else if r.attestation_type == attestation_type::SUPERSEDES {
+                if is_owner_binding_envelope(&r.attestation_envelope) {
+                    true
+                } else {
+                    match r
+                        .attestation_envelope
+                        .get("references_attestation_id")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some(prior_id) => {
+                            let prior = match rows.iter().find(|p| p.attestation_id == prior_id) {
+                                Some(p) => Some(p.clone()),
+                                None => self.directory.get_attestation(prior_id).await?,
+                            };
+                            prior.is_some_and(|p| {
+                                p.attestation_type == attestation_type::DELEGATES_TO
+                                    && is_owner_binding_envelope(&p.attestation_envelope)
+                            })
+                        }
+                        None => false,
+                    }
+                }
+            } else {
+                false
+            };
+            if announces {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// CIRISEdge#682 — the occurrence key an identity-plane wire row is about
+    /// (the key its reach is decided for). `None` for bytes that do not decode
+    /// as the plane's signed container.
+    fn identity_row_subject(kind: EnvelopeKind, bytes: &[u8]) -> Option<String> {
+        match kind {
+            EnvelopeKind::IdentityOccurrence => {
+                serde_json::from_slice::<SignedIdentityOccurrence>(bytes)
+                    .ok()
+                    .map(|s| s.identity_occurrence.occurrence_key_id)
+            }
+            EnvelopeKind::TransportDestination => serde_json::from_slice::<
+                ciris_persist::federation::self_at_login::SignedTransportDestination,
+            >(bytes)
+            .ok()
+            .map(|s| s.transport_destination.occurrence_key_id),
+            _ => None,
+        }
+    }
+
+    /// CIRISEdge#682 — the fetch-twin decision, booked at the deciding branch.
+    /// Undecodable bytes fail closed (the reach cannot be decided for a row
+    /// whose subject is unreadable, and the receiver could not admit it anyway).
+    async fn identity_row_fetch_withholds(
+        &self,
+        kind: EnvelopeKind,
+        bytes: &[u8],
+        envelope_hash: &[u8; 32],
+        peer: Option<&str>,
+    ) -> bool {
+        let peer_label = peer.unwrap_or("<unattributed>");
+        let reason = match Self::identity_row_subject(kind, bytes) {
+            Some(subject) => self
+                .identity_row_reach(&subject)
+                .await
+                .withholds(&subject, peer),
+            None => Some(crate::observability::WithholdReason::IdentityRowAnnounceUnresolved),
+        };
+        let Some(reason) = reason else {
+            return false;
+        };
+        self.withhold(
+            reason,
+            peer_label,
+            &format!(
+                "{kind:?} {}: fetch (CIRISEdge#682)",
+                hex::encode(&envelope_hash[..8])
+            ),
+        );
+        true
+    }
+
+    /// CIRISEdge#682 — the subject-Pull decision for one identity row about
+    /// `occurrence`, booked at the deciding branch.
+    async fn identity_row_pull_withholds(&self, occurrence: &str, peer: Option<&str>) -> bool {
+        let Some(reason) = self
+            .identity_row_reach(occurrence)
+            .await
+            .withholds(occurrence, peer)
+        else {
+            return false;
+        };
+        self.withhold(
+            reason,
+            peer.unwrap_or("<unattributed>"),
+            &format!("identity rows about {occurrence}: subject Pull (CIRISEdge#682)"),
+        );
+        true
+    }
+
+    /// CIRISEdge#682 — one sweep's reach table for the subjects a `SelfOwn`
+    /// identity plane is about to advertise to `peer`: the set of subjects this
+    /// peer may NOT be handed, each with the reason to book. Resolved once per
+    /// (sweep, subject) — the filter closure the sweep takes is synchronous.
+    async fn identity_rows_withheld_from(
+        &self,
+        subjects: &HashSet<String>,
+        peer: Option<&str>,
+    ) -> HashMap<String, crate::observability::WithholdReason> {
+        let mut out = HashMap::new();
+        for subject in subjects {
+            if let Some(reason) = self
+                .identity_row_reach(subject)
+                .await
+                .withholds(subject, peer)
+            {
+                out.insert(subject.clone(), reason);
+            }
+        }
+        out
     }
 
     /// CIRISEdge#606 — act on an ADMITTED row for the revocation register:
@@ -7244,12 +7677,19 @@ impl FederationDirectoryReplicationBridge {
     ///   drop the entry for its subject regardless: a memo eviction costs one
     ///   directory walk, and the other direction is a node keeping a withdrawn
     ///   owner for a whole TTL;
-    /// - everything else (`scores`, `supersedes`, …) moves nothing, so the
-    ///   highest-volume plane pays only a string compare.
+    /// - a `supersedes` carrying the owner-binding body is the WIDENING persist's
+    ///   `widen_audience` writes — the announce route (CIRISEdge#682) — and moves
+    ///   announce state;
+    /// - everything else (`scores`, …) moves nothing, so the highest-volume
+    ///   plane pays only a string compare.
     fn owner_binding_touched(attestation: &Attestation) -> Option<&str> {
         use ciris_persist::federation::types::attestation_type;
         match attestation.attestation_type.as_str() {
-            attestation_type::DELEGATES_TO => {
+            // A `delegates_to` owner-binding moves ownership; a `supersedes`
+            // carrying the owner-binding body is the WIDENING persist's
+            // `widen_audience` writes — the announce route (CIRISEdge#682) —
+            // and moves announce state. Same drop either way.
+            attestation_type::DELEGATES_TO | attestation_type::SUPERSEDES => {
                 ciris_persist::federation::admission::is_owner_binding_envelope(
                     &attestation.attestation_envelope,
                 )
@@ -17189,6 +17629,256 @@ pub(crate) mod tests {
         backend
     }
 
+    // ─── CIRISEdge#682 — identity rows follow the node's announce state ───
+    //
+    // Field-exact: the owner-binding is persist's own shape (`seed_owner_binding`
+    // envelope), the announce is its `cohort_scope` (`federation` = announced,
+    // `self` = not), and the route is a really-signed `SignedTransportDestination`
+    // admitted through the ordinary apply door.
+
+    /// `person-bob` owns `node-bob` (announced iff `announced`) and `node-bob-2`
+    /// (announced). `node-stranger` is owned by nobody. `node-bob`'s signed route
+    /// is held. Returns the backend, the bridge publishing `[node-bob,
+    /// person-bob]` with a live metrics ledger, and the route's wire hash.
+    async fn announce_fixture(
+        announced: bool,
+    ) -> (
+        Arc<MemoryBackend>,
+        FederationDirectoryReplicationBridge,
+        crate::observability::EdgeMetrics,
+        [u8; 32],
+    ) {
+        use sha2::{Digest as _, Sha256};
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-bob", identity_type::USER),
+                ("node-bob", identity_type::NODE),
+                ("node-bob-2", identity_type::NODE),
+                ("node-stranger", identity_type::NODE),
+            ],
+        )
+        .await;
+        let scope = if announced { "federation" } else { "self" };
+        let id = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &id,
+            "person-bob",
+            "node-bob",
+            "delegates_to",
+            scope,
+            owner_binding_envelope(&id, "person-bob", "node-bob"),
+        )
+        .await;
+        seed_owner_binding(&backend, "person-bob", "node-bob-2").await;
+        let metrics = crate::observability::EdgeMetrics::new();
+        let publish = vec!["node-bob".to_string(), "person-bob".to_string()];
+        let bridge = bridge_over(&backend, &[])
+            .with_self_provider(Some(Arc::new(move || publish.clone())))
+            .with_local_key_id(Some("node-bob".to_string()))
+            .with_metrics(Some(metrics.clone()));
+        let signed =
+            sign_transport_destination_fixture("node-bob", "aa00", 1, Utc::now().trunc_subsecs(6));
+        let wire = serde_json::to_vec(&signed).expect("wire");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire, None)
+            .await;
+        assert!(outcome.is_admitted(), "route admits, got {outcome:?}");
+        let hash: [u8; 32] = Sha256::digest(&wire).into();
+        (backend, bridge, metrics, hash)
+    }
+
+    fn advertised(refs: &[EnvelopeRef], hash: &[u8; 32]) -> bool {
+        refs.iter().any(|r| &r.envelope_hash == hash)
+    }
+
+    /// **The #682 pin (darknet half).** An unannounced node's route reaches its
+    /// owner's other node and never a stranger — on the advertise AND the
+    /// direct-fetch twin — and the stranger's refusal is booked by name.
+    #[tokio::test]
+    async fn an_unannounced_nodes_route_reaches_only_its_owners_nodes_682() {
+        use crate::observability::WithholdReason;
+        let (_backend, bridge, metrics, hash) = announce_fixture(false).await;
+        let kind = EnvelopeKind::TransportDestination;
+
+        let sibling = bridge
+            .list_envelope_refs_for_peer(kind, Some("node-bob-2"))
+            .await;
+        assert!(
+            advertised(&sibling, &hash),
+            "the owner's other node is offered the unannounced node's route"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(kind, &hash, Some("node-bob-2"))
+                .await
+                .is_some(),
+            "…and may fetch it"
+        );
+
+        let stranger = bridge
+            .list_envelope_refs_for_peer(kind, Some("node-stranger"))
+            .await;
+        assert!(
+            !advertised(&stranger, &hash),
+            "a stranger is NOT offered an unannounced node's route (CC 5.4.6)"
+        );
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer(kind, &hash, Some("node-stranger"))
+                .await
+                .is_none(),
+            "the fetch twin agrees: a hash learned out-of-band buys nothing"
+        );
+        assert!(
+            !advertised(&bridge.list_envelope_refs_for_peer(kind, None).await, &hash),
+            "an unbound requester proves no ownership and is a stranger"
+        );
+        let snap = metrics.snapshot();
+        assert!(
+            snap.withholds_by_reason
+                .get(&WithholdReason::IdentityRowNodeNotAnnounced)
+                .copied()
+                .unwrap_or(0)
+                >= 2,
+            "advertise + fetch refusals are booked by name: {:?}",
+            snap.withholds_by_reason
+        );
+        assert!(
+            snap.recent_withholds
+                .iter()
+                .any(|w| w.peer_key_id == "node-stranger" && w.detail.contains("fetch")),
+            "the fetch refusal names its branch"
+        );
+    }
+
+    /// **The #682 pin (lightnet half).** The same node, announced (owner-binding
+    /// at `federation`), serves its route to a stranger exactly as before.
+    #[tokio::test]
+    async fn an_announced_nodes_route_reaches_a_stranger_682() {
+        let (_backend, bridge, metrics, hash) = announce_fixture(true).await;
+        let kind = EnvelopeKind::TransportDestination;
+        assert!(advertised(
+            &bridge
+                .list_envelope_refs_for_peer(kind, Some("node-stranger"))
+                .await,
+            &hash
+        ));
+        assert!(bridge
+            .fetch_envelope_bytes_for_peer(kind, &hash, Some("node-stranger"))
+            .await
+            .is_some());
+        assert!(
+            metrics.snapshot().withholds_by_reason.is_empty(),
+            "nothing withheld for an announced node"
+        );
+    }
+
+    /// The reach is a PER-SWEEP memo, not a per-peer walk: two peers and two
+    /// planes in one round pay for each subject once.
+    #[tokio::test]
+    async fn the_announce_walk_is_memoized_across_peers_and_planes_682() {
+        let (_backend, bridge, _metrics, _hash) = announce_fixture(false).await;
+        for peer in ["node-bob-2", "node-stranger"] {
+            for kind in [
+                EnvelopeKind::TransportDestination,
+                EnvelopeKind::IdentityOccurrence,
+            ] {
+                let _ = bridge.list_envelope_refs_for_peer(kind, Some(peer)).await;
+            }
+        }
+        assert_eq!(
+            bridge.announce_reads(),
+            2,
+            "one walk per subject in the publish set (node-bob, person-bob)"
+        );
+    }
+
+    /// The reach table itself: the node always gets its own rows; unowned is
+    /// everyone; unannounced is the owner's nodes; unresolved is nobody else.
+    #[test]
+    fn identity_row_reach_withholds_by_announce_state_682() {
+        use crate::observability::WithholdReason;
+        let owners: HashSet<String> = ["n1".to_string(), "n2".to_string()].into();
+        let dark = IdentityRowReach::OwnersNodes(owners);
+        assert_eq!(dark.withholds("n1", Some("n1")), None);
+        assert_eq!(dark.withholds("n1", Some("n2")), None);
+        assert_eq!(
+            dark.withholds("n1", Some("x")),
+            Some(WithholdReason::IdentityRowNodeNotAnnounced)
+        );
+        assert_eq!(
+            dark.withholds("n1", None),
+            Some(WithholdReason::IdentityRowNodeNotAnnounced)
+        );
+        assert_eq!(IdentityRowReach::Everyone.withholds("n1", None), None);
+        assert_eq!(
+            IdentityRowReach::Unresolved.withholds("n1", Some("n2")),
+            Some(WithholdReason::IdentityRowAnnounceUnresolved)
+        );
+        assert_eq!(
+            IdentityRowReach::Unresolved.withholds("n1", Some("n1")),
+            None,
+            "a node is never refused its own rows"
+        );
+    }
+
+    /// **CIRISEdge#678.** A per-kind selector narrows ONLY the kinds it names:
+    /// the Key plane publishes own + anchored, the other two stay on the
+    /// self-publish set; unset, every plane is the self set.
+    #[tokio::test]
+    async fn a_kind_publish_selector_narrows_only_the_named_kinds_678() {
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("me", identity_type::AGENT),
+                ("anchored", identity_type::AGENT),
+                ("third-party", identity_type::AGENT),
+            ],
+        )
+        .await;
+        let publish = vec![
+            "me".to_string(),
+            "anchored".to_string(),
+            "third-party".to_string(),
+        ];
+        let base =
+            bridge_over(&backend, &[]).with_self_provider(Some(Arc::new(move || publish.clone())));
+        let self_set = base.self_own_subjects(EnvelopeKind::IdentityOccurrence);
+        assert_eq!(
+            self_set.len(),
+            3,
+            "unset: every SelfOwn plane is the self set"
+        );
+        assert_eq!(base.list_envelope_refs(EnvelopeKind::Key).await.len(), 3);
+
+        let bridge = base.with_kind_publish_selector(Some(KindPublishSelector::from_sets(
+            [(
+                EnvelopeKind::Key,
+                vec!["me".to_string(), "anchored".to_string()],
+            )]
+            .into(),
+        )));
+        assert_eq!(
+            bridge.list_envelope_refs(EnvelopeKind::Key).await.len(),
+            2,
+            "the Key plane publishes only what the host named for it"
+        );
+        for kind in [
+            EnvelopeKind::IdentityOccurrence,
+            EnvelopeKind::TransportDestination,
+        ] {
+            assert_eq!(
+                bridge.self_own_subjects(kind),
+                self_set,
+                "{kind:?} was not named, so it stays on the self set"
+            );
+        }
+    }
+
     /// v18.5.0 — [`fixture_community`] with a **seated moderator**.
     ///
     /// `check_no_moderator_federate_apply` (CC 4.5.4 / §11.11) re-checks live
@@ -17859,6 +18549,25 @@ pub(crate) mod tests {
             FederationDirectoryReplicationBridge::owner_binding_touched(&withdrawal),
             Some("node-bob"),
             "a retraction carries no dimension, so it is treated conservatively"
+        );
+
+        // CIRISEdge#682 — the owner-binding WIDENING (the announce) moves the
+        // announce memo; a supersedes of anything else moves nothing.
+        let mut widening = att_with_dimension(Some(
+            ciris_persist::federation::types::owner_binding::DIMENSION,
+        ));
+        widening.attestation_type = "supersedes".to_string();
+        widening.attested_key_id = "node-bob".to_string();
+        assert_eq!(
+            FederationDirectoryReplicationBridge::owner_binding_touched(&widening),
+            Some("node-bob"),
+            "announcing = widening the owner-binding"
+        );
+        let mut other_widening = att_with_dimension(Some("trace:complete:v1"));
+        other_widening.attestation_type = "supersedes".to_string();
+        assert_eq!(
+            FederationDirectoryReplicationBridge::owner_binding_touched(&other_widening),
+            None
         );
 
         let mut scores = att_with_dimension(Some("trace:complete:v1"));
