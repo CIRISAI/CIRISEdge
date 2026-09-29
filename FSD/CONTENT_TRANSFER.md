@@ -637,14 +637,20 @@ owner's laptop could not be withdrawn from their phone.
   list and open unchanged (the AAD names the node, as it did when sealed). Their author is the
   NODE. **Since edge v33.0.0 (persist v51, CIRISPersist#941 / CIRISEdge#941, CC 3.4.7.3)** the
   node's owner may withdraw them too: persist lifts withdraws rule 1 to the producer's principal —
-  the issuer is the node's single live owner (`owner_of`) AND an owner-binding over that node was
-  asserted at or before the row, so a later buyer of a used node retracts nothing. `files::withdraw`
+  the issuer is the node's single live owner (`owner_of`) AND **the issuer's owner-binding was in
+  force at the row's instant, and no other owner's was** (a binding is in force from its
+  `asserted_at` until its expiry or first withdrawal). So a later buyer of a used node retracts
+  nothing, an A→B→A re-binding does not give A back B's tenure, a backdated re-binding is refused,
+  and a clean hand-off lets the new owner retract what the node wrote on their watch. `files::withdraw`
   falls back to the actor in hand exactly when `owner_of(T.attesting_key_id)` names it (an
   ambiguous owner is no principal) and persist's door stays the judge; anyone else still gets
   `FileError::NotAuthor` naming the authoring node. `FileRow::author_signer` stays strictly the
   attester. Witness: `a_file_is_authored_by_its_person_and_withdrawn_from_their_other_device`
   (a stranger refused, the owner admitted under rule 1 from her other device; red with the
-  fallback removed). Mixed fleet: a v50 node refuses the owner's withdraws a v51 node admits.
+  fallback removed). The hand-off / A→B→A / backdated cases are persist's witnesses at v51.0.0; edge has no
+  hand-off witness because its producer `owner_binding_attestation` keys the row id by the NODE
+  alone (`owner-binding-{node}`), so a second owner's binding over the same node collides with the
+  first's id — a follow-up for the producer, not a withdraw-path gap. Mixed fleet: a v50 node refuses the owner's withdraws a v51 node admits.
 
 #### 6.7.1 The sealed descriptor — a file's name and media type open only with the bytes (CIRISEdge#698, CIRISConstitution#114)
 
