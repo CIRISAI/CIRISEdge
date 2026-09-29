@@ -42,7 +42,9 @@
 //! ([`MAX_BODY_BYTES`], `WIRE_ENVELOPE_MAX_BYTES`) are packet-path and
 //! admissibility ceilings; neither is a segment-size or MDU constant, and edge
 //! defines no such constant anywhere — the segment boundary is leviculum's and
-//! the per-link MDU comes from `link_mdu()`.
+//! the per-link MDU comes from `link_mdu()`, less leviculum's own
+//! `CHANNEL_ENVELOPE_HEADER_SIZE` because every piece rides the link Channel
+//! (CIRISEdge#716 — the caller passes the CHANNEL MDU to [`fragment`]).
 //!
 //! ## The whole-frame-retry ceiling — and its ARQ closure (CIRISEdge#422)
 //! Because whole-frame retry is at whole-frame granularity, a frame that needs
@@ -208,6 +210,10 @@ fn msg_id_of(frame: &[u8]) -> [u8; 8] {
 }
 
 /// Split `frame` into packet-path-sized fragments for a link of `mdu` bytes.
+///
+/// `mdu` is the CHANNEL payload MDU (`link_mdu() - CHANNEL_ENVELOPE_HEADER_SIZE`,
+/// CIRISEdge#716), not the raw link MDU: each piece is one link-Channel send, and
+/// a piece sized to the raw link MDU is refused by leviculum's Channel.
 ///
 /// A frame that already fits (`frame.len() <= mdu`) is returned **as-is, in one
 /// piece, unwrapped** — the receiver routes it directly (it is not a `CFRG`
