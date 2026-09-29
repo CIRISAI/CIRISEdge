@@ -453,7 +453,9 @@ impl GroupContentStore for PersistGroupContentStore {
                 GroupContentError::Substrate(format!("sealed descriptor is not base64: {e}"))
             })?;
         self.engine
-            .open_descriptor_for_blob(&sha, viewer_key_id, &sealed)
+            // persist v51.0.0 grew the row-AAD parameter (#923 amendment);
+            // wired to the referencing row in the next change.
+            .open_descriptor_for_blob(&sha, viewer_key_id, &sealed, None)
             .await
             .map_err(|e| map_err(sha_hex, &e))
     }
