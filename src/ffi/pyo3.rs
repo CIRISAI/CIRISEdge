@@ -2585,6 +2585,12 @@ impl PyEdge {
             pull_sources.set_item(label.as_str(), *n)?;
         }
         root.set_item("blob_pull_sources", pull_sources)?;
+        // CIRISEdge#717 — pulls that refused to store, by reason.
+        let pull_refusals = pyo3::types::PyDict::new(py);
+        for (label, n) in &bundle.blob_pull_refusals {
+            pull_refusals.set_item(label.as_str(), *n)?;
+        }
+        root.set_item("blob_pull_refusals", pull_refusals)?;
         root.set_item(
             "replication_routed_to_responder_total",
             bundle.replication_routed_to_responder_total,

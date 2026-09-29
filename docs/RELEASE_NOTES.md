@@ -1,5 +1,55 @@
 # CIRISEdge Release Notes
 
+# v34.1.0 — multi-fragment frames on a small-MTU link; a chunk-DAG manifest never lands as the file
+
+**2026-09-29** (CIRISEdge#716 → PR #719; CIRISEdge#717, partial → PR #721). **MINOR** from v34.0.0:
+two fixes found by CIRISServer's native fixture. No pin or hash moves. Ladder triple: **edge v34.1.0 ·
+persist v51.1.0 · verify v18.0.0**.
+
+## The pins
+
+Unchanged from v34.0.0: persist `v51.1.0` (wheel floor `>=51.1,<52`), verify `v18.0.0`, every ABI
+constant, `REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH`, `SERVE_ADVERTISE_POLICY_HASH`
+(`e4c4d625…`). **Riders:** a pin bump only.
+
+## #716 — frames larger than one packet deliver on a small-MTU link
+
+Edge cut multi-fragment frames to the link's packet MDU (431 bytes at the 500-byte base MTU), but
+every fragment rides the link **Channel**, whose limit is 6 bytes smaller
+(`CHANNEL_ENVELOPE_HEADER_SIZE`). Leviculum refused each full-size fragment `TooLarge`, reported as
+`stalled="link_send_error"` at fragment 0, so every multi-fragment frame stalled while
+single-packet frames delivered. The Resource fallback could not rescue it when the link's one
+outgoing-resource slot was busy. Docker's TCP links negotiate a large MTU, which is why the mesh
+never showed it; the server's loopback fixture did.
+
+- All four fragmenting call sites (Channel-first, Busy interleave, `CANN` announce push, `CBND`
+  bundle push) now cut to `link MDU − CHANNEL_ENVELOPE_HEADER_SIZE`, imported from leviculum.
+- Witness: `tests/reverse_link_716.rs`, B dials A and A answers over B's link. It fails on v34.0.0
+  with the field signature (`mdu=431 … fragments=470 fragments_sent=0 stalled="link_send_error"`).
+- Follow-up: CIRISEdge#720, checking whether A/V chunks are sized against the same limit.
+
+## #717 (partial) — a pulled chunk-DAG blob is refused by name, never stored as its manifest
+
+A second device pulling a self file whose sealed size crosses 1 MiB fetched the pointer's sha as
+one blob and stored the chunk-DAG **manifest** (~500 bytes of JSON) as the file. The puller now:
+
+- refuses a pointer that carries `stream_id` as `PullOutcome::StreamPointerNeedsDagPull` **before**
+  fetching anything, so nothing is stored and nothing is retried;
+- counts that and the existing whole-blob `SizeMismatch` refusal in a new metric,
+  `blob_pull_refusals{size_mismatch, stream_pointer_needs_dag_pull}`, also in the PyO3 metrics dict.
+
+Large self files still do not open on a second device. That waits on persist v51.3.0
+(CIRISPersist#947: open the sealed manifest's chunk list, adopt each chunk, promote the manifest
+row to `chunk_dag`), which edge adopts with the full DAG pull. Until then the failure is named and
+counted instead of a 200 serving the wrong bytes.
+
+## Rust surface
+
+- `PullOutcome` gains `StreamPointerNeedsDagPull { stream_id, declared }`. It is not
+  `#[non_exhaustive]`; no known downstream crate matches on it (CIRISServer's `PullOutcome` is its
+  own type).
+- `EdgeMetrics` gains `blob_pull_refusals`.
+
 # v34.0.0 — identity rows follow the announce; per-kind publish sets; first contact on the opaque plane
 
 **2026-09-29** (CIRISEdge#682, #678 → PR #713; CIRISEdge#683 → PR #714). **MAJOR** from v33.1.0: the

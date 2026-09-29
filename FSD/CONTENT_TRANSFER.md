@@ -855,6 +855,13 @@ needs `adopt_sealed_chunk` per chunk against the manifest, under the same store 
 lands a DAG is written, listed and opened on the node that sealed it, and a far node reads
 `not_fetched` — the honest state, not a silent gap. Tracked on CIRISEdge#633.
 
+**Until then a stream pointer is refused by name** (CIRISEdge#717): the puller never whole-pulls a
+pointer carrying `stream_id` — its address is the manifest's, and stored whole the manifest read back
+as the file — so it answers `StreamPointerNeedsDagPull` before any request, stores nothing, and counts
+`blob_pull_refusals{stream_pointer_needs_dag_pull}`; the DAG pull waits on persist's sealed-DAG adopt
+door (CIRISPersist#947). A whole blob whose length is not the one its pointer implies (`size`, plus
+`AT_REST_ENVELOPE_OVERHEAD` at a sealed tier) is refused `SizeMismatch`, counted `size_mismatch`.
+
 #### 6.7.2 Rename — a new row over the same bytes (CIRISEdge#702, the server's ask)
 
 A rename changes what a file is *called*, never what it *is*. So it writes **no byte**: the new row
