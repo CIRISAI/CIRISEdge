@@ -5347,6 +5347,19 @@ async fn route_replication_frame(
             return false; // non-CRPL unattributed envelope → envelope dispatch
         }
         let Some(bootstrap_source) = bootstrap_carve_out_source(frame) else {
+            // CIRISEdge#727 — the owner-binding rung (`FSD/FIRST_CONTACT.md`
+            // §2.1.1), beside the #402 rung: an un-attributed push of an
+            // owner-binding signed by THIS node's own owner is admitted through
+            // the apply door (attester == owner_of(self), signature verified
+            // against the held owner key), consumed here, counted under
+            // `first_contact_outcomes`. Nothing else un-attributed changes.
+            if let Some(gate) = registry.owner_binding_carve_out() {
+                if let crate::first_contact::OwnerBindingOutcome::Consumed { .. } =
+                    gate.admit_frame(frame).await
+                {
+                    return true;
+                }
+            }
             if let ThrottleDecision::Emit { suppressed_prev } =
                 inbound_unroutable_crpl_log().check(frame.transport.0)
             {

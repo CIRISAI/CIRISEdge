@@ -2307,6 +2307,9 @@ pub struct ReticulumTransport {
     /// FIRST on every link, before the `CBND` bundle. `None` only when no
     /// attestation exists, which #333 already makes a construction error.
     own_announce_frame: Option<Vec<u8>>,
+    /// CIRISEdge#727 — see [`ReticulumAuth::own_owner_binding`]. Pushed on
+    /// links this node dials, after `own_announce_frame` and `own_bundle`.
+    own_owner_binding: Option<Arc<dyn crate::first_contact::OwnOwnerBindingSource>>,
     /// CIRISEdge#34 — shared event bus. Drives the AsyncIterator
     /// surface (`subscribe_announces` / `subscribe_interface_events`)
     /// in `crate::ffi::pyo3`. `None` means a transport built with no
@@ -2625,6 +2628,12 @@ pub struct ReticulumAuth {
     /// enforcement flip: turn it on once the peers that must root you parse
     /// v2 (i.e. run #436-aware builds).
     pub own_build_bundle: Option<Vec<u8>>,
+    /// CIRISEdge#727 (`FSD/FIRST_CONTACT.md` §2.1.1) — this node's own
+    /// owner-binding, pushed as a bare bootstrap-plane `Deliver` on every link
+    /// this node DIALS, after the announce and the bundle. Asked on each dial
+    /// (the binding is directory state). `None` → nothing pushed, exactly the
+    /// pre-#727 wire. Never pushed on a link a peer opened; never advertised.
+    pub own_owner_binding: Option<Arc<dyn crate::first_contact::OwnOwnerBindingSource>>,
 }
 
 impl Default for ReticulumAuth {
@@ -2641,6 +2650,7 @@ impl Default for ReticulumAuth {
             blackhole_rules: None,
             transport_identity_keystore: None,
             own_build_bundle: None,
+            own_owner_binding: None,
         }
     }
 }
@@ -2711,6 +2721,8 @@ impl ReticulumTransport {
             local_identity: self.local_identity.clone(),
             own_bundle: self.own_bundle.clone(),
             own_announce_frame: self.own_announce_frame.clone(),
+            own_owner_binding: self.own_owner_binding.clone(),
+            metrics: self.metrics.clone(),
             dialed_link_dest: Arc::clone(&self.dialed_link_dest),
             reusable_dialed_link: Arc::clone(&self.reusable_dialed_link),
             link_in_flight: Arc::clone(&self.link_in_flight),
@@ -2766,6 +2778,7 @@ impl ReticulumTransport {
             blackhole_rules,
             transport_identity_keystore,
             own_build_bundle,
+            own_owner_binding,
         } = auth;
 
         // v3.1.0 (CIRISEdge#99) — when the host wired a
@@ -3297,6 +3310,7 @@ impl ReticulumTransport {
             bundle_save_gate,
             peer_bundles: Arc::new(crate::bundle_gate::PeerBundleStore::new()),
             own_bundle,
+            own_owner_binding,
             event_bus,
             reachability,
             interface_specs: Arc::new(std::sync::Mutex::new(interface_specs)),
@@ -4481,6 +4495,11 @@ impl ReticulumTransport {
         // LINKIDENTIFY so the responder can attribute the frame.
         if let Some(own) = self.own_bundle.as_ref() {
             push_own_bundle_frames(&self.node, own, &link_id).await;
+        }
+        // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
+        // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle.
+        if let Some(src) = self.own_owner_binding.as_ref() {
+            push_own_owner_binding(&self.node, src.as_ref(), &link_id, self.metrics.as_ref()).await;
         }
         Ok(link_id.into_bytes())
     }
@@ -6316,6 +6335,10 @@ struct DialCtx {
     own_bundle: Option<OwnBuildBundle>,
     /// CIRISEdge#627 — see `ReticulumTransport::own_announce_frame`.
     own_announce_frame: Option<Vec<u8>>,
+    /// CIRISEdge#727 — see `ReticulumTransport::own_owner_binding`.
+    own_owner_binding: Option<Arc<dyn crate::first_contact::OwnOwnerBindingSource>>,
+    /// CIRISEdge#727 — the push is counted (`owner_binding_pushed`).
+    metrics: Option<crate::observability::EdgeMetrics>,
     dialed_link_dest: Arc<Mutex<HashMap<LinkId, DestinationHash>>>,
     reusable_dialed_link: Arc<Mutex<HashMap<DestinationHash, Vec<LinkId>>>>,
     link_in_flight: Arc<Mutex<HashSet<LinkId>>>,
@@ -6482,6 +6505,12 @@ impl DialCtx {
         // contends with the resource lane — leviculum#27).
         if let Some(own) = self.own_bundle.as_ref() {
             push_own_bundle_frames(&self.node, own, &link_id).await;
+        }
+        // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
+        // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle and
+        // before the resource ship (same Channel lane as the bundle).
+        if let Some(src) = self.own_owner_binding.as_ref() {
+            push_own_owner_binding(&self.node, src.as_ref(), &link_id, self.metrics.as_ref()).await;
         }
 
         // PUBLISH LAST. Only now is the link established AND identified AND
@@ -8623,6 +8652,70 @@ async fn push_own_announce_frame(node: &ReticulumNode, frame: &[u8], link_id: &L
              stalled past its pacing budget; the peer binds us from the RNS announce or \
              the next link-up (CIRISEdge#627/#636)"
         );
+    }
+}
+
+/// CIRISEdge#727 (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2) — push this node's
+/// own owner-binding on a link this node DIALED. Called from the two dial
+/// paths only (`link_open` and the cold dial in `send`), never from the
+/// responder-side link-up arm, so a link a peer opened never carries it. The
+/// frame is a bare bootstrap-plane `Deliver` (kind `Attestation`, one row);
+/// the receiver judges it on the owner-binding rung (attester == its own
+/// owner, signature against the held owner key) or drops it. Fragmented on the
+/// link Channel exactly as the #436 bundle is. Counted: `owner_binding_pushed`
+/// / `owner_binding_push_incomplete` under `first_contact_outcomes`.
+async fn push_own_owner_binding(
+    node: &ReticulumNode,
+    source: &dyn crate::first_contact::OwnOwnerBindingSource,
+    link_id: &LinkId,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+) {
+    let Some(frame) = source.own_owner_binding_frame().await else {
+        return; // unowned, ambiguous, or no live binding: nothing to say
+    };
+    let mdu = link_channel_mdu(node, link_id);
+    let Some(fragments) = crate::transport::frame_fragment::fragment(&frame, mdu) else {
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            own_bundle_push_log().check("owner-binding-degenerate-mdu")
+        {
+            tracing::warn!(
+                link = ?link_id,
+                mdu,
+                bytes = frame.len(),
+                suppressed_prev,
+                "own owner-binding push skipped — link MDU too small to fragment (CIRISEdge#727)"
+            );
+        }
+        return;
+    };
+    let outcome = send_fragments_on_channel(node, link_id, &fragments).await;
+    if outcome.complete() {
+        if let Some(m) = metrics {
+            m.inc_first_contact(crate::first_contact::OWNER_BINDING_PUSHED);
+        }
+        tracing::debug!(
+            link = ?link_id,
+            bytes = frame.len(),
+            fragments = outcome.total,
+            "own owner-binding pushed on a dialed link (CIRISEdge#727)"
+        );
+    } else {
+        if let Some(m) = metrics {
+            m.inc_first_contact(crate::first_contact::OWNER_BINDING_PUSH_INCOMPLETE);
+        }
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            own_bundle_push_log().check("owner-binding-channel-backpressure")
+        {
+            tracing::warn!(
+                link = ?link_id,
+                fragments = outcome.total,
+                fragments_sent = outcome.sent,
+                stalled = outcome.stalled.unwrap_or("-"),
+                suppressed_prev,
+                "own owner-binding push incomplete — link Channel stalled; the peer \
+                 re-receives on the next dial (CIRISEdge#727)"
+            );
+        }
     }
 }
 

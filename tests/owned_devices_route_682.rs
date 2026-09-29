@@ -44,6 +44,10 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ciris_edge::first_contact::{
+    DirectoryOwnerBinding, OwnerBindingCarveOut, OwnerBindingOutcome, OwnerBindingRefusal,
+    OWNER_BINDING_ADMITTED, OWNER_BINDING_ANSWERED, OWNER_BINDING_PUSHED,
+};
 use ciris_edge::identity::{sign_bound_hybrid, LocalSigner};
 use ciris_edge::observability::WithholdReason;
 use ciris_edge::replication::attestation_bind::{
@@ -64,7 +68,7 @@ use ciris_edge::EdgeMetrics;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::{Attestation, FederationDirectory, SignedAttestation};
 use ciris_persist::store::sqlite::SqliteBackend;
-use common::{build_reticulum_with_retry, directory_with};
+use common::{build_reticulum_with_retry_metrics, directory_with};
 use sha2::Digest as _;
 
 fn free_port() -> u16 {
@@ -175,6 +179,18 @@ impl Ident {
 /// `attestation_bind::owner_binding_attestation` mints it, at a chosen
 /// `cohort_scope`: `self` is what a claim writes; `federation` is the announce.
 async fn owner_binding_at(owner: &Ident, node: &str, cohort_scope: &str) -> Attestation {
+    owner_binding_signed_by(owner, owner, node, cohort_scope).await
+}
+
+/// CIRISEdge#727 — the same row with the attester FIELD naming `owner` but the
+/// signature made by `signer`. With `signer == owner` it is the genuine
+/// binding; with a stranger's key it is the forged-signature negative.
+async fn owner_binding_signed_by(
+    owner: &Ident,
+    signer: &Ident,
+    node: &str,
+    cohort_scope: &str,
+) -> Attestation {
     let asserted_at = ciris_edge::replication::attestation_bind::truncate_to_substrate_resolution(
         chrono::Utc::now(),
     );
@@ -200,7 +216,7 @@ async fn owner_binding_at(owner: &Ident, node: &str, cohort_scope: &str) -> Atte
     );
     let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
     let digest = sha2::Sha256::digest(&canonical);
-    let (sig_classical, sig_pqc) = sign_bound_hybrid(&owner.signer(), &canonical, "owner binding")
+    let (sig_classical, sig_pqc) = sign_bound_hybrid(&signer.signer(), &canonical, "owner binding")
         .await
         .expect("hybrid sign");
     Attestation {
@@ -267,21 +283,63 @@ impl Device {
                 .withholds(WithholdReason::IdentityRowAnnounceUnresolved),
         )
     }
+    /// CIRISEdge#727 — one `first_contact_outcomes` label (`owner_binding_*`).
+    fn ledger(&self, label: &str) -> u64 {
+        ledger(&self.metrics, label)
+    }
+    /// CIRISEdge#727 — every `owner_binding_*` label this node booked.
+    fn owner_binding_ledger(&self) -> Vec<(String, u64)> {
+        let mut v: Vec<(String, u64)> = self
+            .metrics
+            .snapshot()
+            .first_contact_outcomes
+            .into_iter()
+            .filter(|(k, _)| k.starts_with("owner_binding_"))
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+fn ledger(metrics: &EdgeMetrics, label: &str) -> u64 {
+    metrics
+        .snapshot()
+        .first_contact_outcomes
+        .get(label)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// What D2 starts with (D1 always starts claimed: the three key records and
+/// its own binding at `scope`).
+#[derive(Clone, Copy)]
+enum D2Starts {
+    /// Claimed like D1: the three records and its own binding at `scope`.
+    Claimed,
+    /// CIRISEdge#727 recovery: wiped to its seed (its own record) and the
+    /// owner's key record — no sibling record, no binding.
+    Wiped,
 }
 
 struct Pair {
     d1: Device,
     d2: Device,
     owner: Ident,
-    _tmp: tempfile::TempDir,
+    /// D1's TCP listen port — a third node bootstraps to it (test (c)).
+    d1_port: u16,
+    tmp: tempfile::TempDir,
 }
 
 /// One owner, two claimed devices. Each device's directory: the three key
 /// records and ITS OWN owner-binding at `scope`. D2 bootstraps to D1; the
 /// runtimes then dial each other over RNS links from the announces.
 // One linear fixture (as `first_contact_ladder_659.rs`).
-#[allow(clippy::too_many_lines)]
 async fn pair(tag: &str, scope: &str) -> Pair {
+    pair_with(tag, scope, D2Starts::Claimed).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn pair_with(tag: &str, scope: &str, d2: D2Starts) -> Pair {
     let tmp = tempfile::tempdir().expect("tempdir");
     let owner = Ident::new(&format!("owner-682-{tag}"), 0x41).await;
     let k1 = Arc::new(Ident::new(&format!("d1-682-{tag}"), 0x11).await);
@@ -292,12 +350,29 @@ async fn pair(tag: &str, scope: &str) -> Pair {
         owner.record("user").await,
     ];
     let dir1 = directory_with(records.clone()).await;
-    let dir2 = directory_with(records).await;
-    for (dir, node) in [(&dir1, &k1.key_id), (&dir2, &k2.key_id)] {
+    let dir2 = match d2 {
+        D2Starts::Claimed => directory_with(records).await,
+        D2Starts::Wiped => {
+            directory_with(vec![k2.record("node").await, owner.record("user").await]).await
+        }
+    };
+    // D1 holds ITS OWN binding; under `Wiped` it also still holds D2's (the
+    // sibling remembers the wiped device — that is what recovery rides).
+    let d1_bindings: Vec<&str> = match d2 {
+        D2Starts::Claimed => vec![&k1.key_id],
+        D2Starts::Wiped => vec![&k1.key_id, &k2.key_id],
+    };
+    for node in d1_bindings {
         let row = owner_binding_at(&owner, node, scope).await;
-        dir.put_attestation(SignedAttestation { attestation: row })
+        dir1.put_attestation(SignedAttestation { attestation: row })
             .await
-            .unwrap_or_else(|e| panic!("owner-binding for {node} at {scope}: {e:?}"));
+            .unwrap_or_else(|e| panic!("owner-binding for {node} at {scope} (D1): {e:?}"));
+    }
+    if matches!(d2, D2Starts::Claimed) {
+        let row = owner_binding_at(&owner, &k2.key_id, scope).await;
+        dir2.put_attestation(SignedAttestation { attestation: row })
+            .await
+            .unwrap_or_else(|e| panic!("owner-binding for D2 at {scope}: {e:?}"));
     }
 
     let auth = |key: &Arc<Ident>, dir: &Arc<SqliteBackend>| ReticulumAuth {
@@ -305,42 +380,59 @@ async fn pair(tag: &str, scope: &str) -> Pair {
         rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
         resolver: None,
         hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        // CIRISEdge#727 — the production wiring: a node pushes its own
+        // owner-binding on every link it dials.
+        own_owner_binding: Some(Arc::new(DirectoryOwnerBinding::new(
+            Arc::clone(dir) as Arc<dyn FederationDirectory>,
+            key.key_id.clone(),
+        ))),
         ..ReticulumAuth::default()
     };
-    let (t1, addr1) = build_reticulum_with_retry(|| {
-        let base = tmp.path().to_path_buf();
-        let auth = auth(&k1, &dir1);
-        let key_id = k1.key_id.clone();
-        async move {
-            let mut c = ReticulumTransportConfig::new(base.join("d1/transport.id"), &key_id);
-            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-            c.announce_interval = Duration::from_secs(5);
-            (c, auth)
-        }
-    })
+    // One `EdgeMetrics` per device, shared by its transport (the #727 push
+    // ledger is a transport fact) and its runtime.
+    let m1 = EdgeMetrics::new();
+    let m2 = EdgeMetrics::new();
+    let (t1, addr1) = build_reticulum_with_retry_metrics(
+        || {
+            let base = tmp.path().to_path_buf();
+            let auth = auth(&k1, &dir1);
+            let key_id = k1.key_id.clone();
+            async move {
+                let mut c = ReticulumTransportConfig::new(base.join("d1/transport.id"), &key_id);
+                c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+                c.announce_interval = Duration::from_secs(5);
+                (c, auth)
+            }
+        },
+        m1.clone(),
+    )
     .await;
     let port1 = addr1.port();
-    let (t2, _) = build_reticulum_with_retry(|| {
-        let base = tmp.path().to_path_buf();
-        let auth = auth(&k2, &dir2);
-        let key_id = k2.key_id.clone();
-        async move {
-            let mut c = ReticulumTransportConfig::new(base.join("d2/transport.id"), &key_id);
-            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-            c.bootstrap_peers = vec![format!("127.0.0.1:{port1}").parse().unwrap()];
-            c.announce_interval = Duration::from_secs(5);
-            (c, auth)
-        }
-    })
+    let (t2, _) = build_reticulum_with_retry_metrics(
+        || {
+            let base = tmp.path().to_path_buf();
+            let auth = auth(&k2, &dir2);
+            let key_id = k2.key_id.clone();
+            async move {
+                let mut c = ReticulumTransportConfig::new(base.join("d2/transport.id"), &key_id);
+                c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+                c.bootstrap_peers = vec![format!("127.0.0.1:{port1}").parse().unwrap()];
+                c.announce_interval = Duration::from_secs(5);
+                (c, auth)
+            }
+        },
+        m2.clone(),
+    )
     .await;
 
-    let d1 = device(Arc::clone(&k1), dir1, t1, &owner, &k2).await;
-    let d2 = device(Arc::clone(&k2), dir2, t2, &owner, &k1).await;
+    let d1 = device(Arc::clone(&k1), dir1, t1, m1, &owner, &k2).await;
+    let d2 = device(Arc::clone(&k2), dir2, t2, m2, &owner, &k1).await;
     Pair {
         d1,
         d2,
         owner,
-        _tmp: tmp,
+        d1_port: port1,
+        tmp,
     }
 }
 
@@ -352,10 +444,10 @@ async fn device(
     key: Arc<Ident>,
     dir: Arc<SqliteBackend>,
     transport: Arc<ReticulumTransport>,
+    metrics: EdgeMetrics,
     owner: &Ident,
     peer: &Ident,
 ) -> Device {
-    let metrics = EdgeMetrics::new();
     let peers = [
         EnvelopeKind::Key,
         EnvelopeKind::IdentityOccurrence,
@@ -507,21 +599,26 @@ fn init_tracing() {
         .try_init();
 }
 
-async fn routes_cross_and_a_resource_row_admits(p: &Pair, label: &str) {
+/// Returns the number of round sweeps until both routes crossed.
+async fn routes_cross_and_a_resource_row_admits(p: &Pair, label: &str) -> usize {
     let crossed = drive_until(p, Duration::from_secs(120), || async {
         p.d2.holds_route_for(&p.d1.key).await && p.d1.holds_route_for(&p.d2.key).await
     })
     .await;
     dump(p, label).await;
+    for (who, dev) in [("D1", &p.d1), ("D2", &p.d2)] {
+        eprintln!(
+            "[{label}] {who} owner-binding ledger: {:?}",
+            dev.owner_binding_ledger()
+        );
+    }
     assert!(
         crossed.is_some(),
         "[{label}] each device must come to hold the other's hybrid-signed route (the \
          #393 item-2 operand) — see the withhold ledger above for which leg held it back"
     );
-    eprintln!(
-        "[{label}] both routes crossed after {} sweep(s)",
-        crossed.unwrap_or(0)
-    );
+    let sweeps = crossed.unwrap_or(0);
+    eprintln!("[{label}] both routes crossed after {sweeps} sweep(s)");
 
     // D1 → D2 as a Resource, over whichever live link D1 holds to D2.
     let extra: Vec<Ident> = {
@@ -567,6 +664,7 @@ async fn routes_cross_and_a_resource_row_admits(p: &Pair, label: &str) {
          D1's route"
     );
     let _ = &p.owner;
+    sweeps
 }
 
 /// Control: both devices announced (owner-binding at `federation`) — the
@@ -585,16 +683,427 @@ async fn announced_devices_of_one_owner_exchange_routes_and_admit_682() {
     );
 }
 
+/// CIRISEdge#727 — the round bound for the unannounced pair. The announced
+/// control crosses in 2 sweeps; the dark pair needs each device's own binding
+/// to cross first (pushed on the dial each device makes in its first round),
+/// then the route in the next. Measured: see the PR. This is a BOUND, asserted
+/// so a regression to "converges eventually" (a TTL-paced memo, #568) fails
+/// loudly instead of passing slowly.
+const UNANNOUNCED_ROUND_BOUND: usize = 6;
+
+/// CIRISEdge#727 — the round bound for RECOVERY. The wiped device is unowned
+/// in its own directory, so the rung admits nothing at it; it re-learns its
+/// binding on the ordinary attributed path (§2.1.1 "Recovery"). Measured 12
+/// sweeps, and the shape is known: both routes cross within 2 sweeps, then
+/// the sibling's Attestation-plane round toward the wiped device — opened
+/// before the device was Attributed at the sibling, so its reply could not
+/// route back — waits out the fixture's 15 s `round_timeout` (≈10 sweeps at
+/// 1.5 s) before the NEXT round delivers both bindings. That is the #634
+/// stuck-round class, bounded by `round_timeout`, not a memo TTL (#568): no
+/// gate here waits on time. Pinned with the one-timeout margin.
+const RECOVERY_ROUND_BOUND: usize = 16;
+
 /// The claimed-but-unannounced pair: each device knows only its own binding.
-/// FAILS on main (see the module docs): neither route ever crosses, each side
-/// books ~320 `identity_row_node_not_announced` withholds in 120 s. Run it with
-/// `--ignored` to reproduce; un-ignore it with the fix.
-#[ignore = "CIRISEdge#722 follow-up: two unannounced devices of one owner deadlock on \
-            #682 (each withholds its route until it holds the other's owner-binding, \
-            which cannot cross un-attributed); pins the pre-fix failure"]
+/// FAILED on the pre-#727 code (see the module docs): neither route ever
+/// crossed, each side booked ≈320 `identity_row_node_not_announced` withholds
+/// in 120 s. With the owner-binding rung (`FSD/FIRST_CONTACT.md` §2.1.1) each
+/// device pushes `owner → self` on the link it dials; the sibling admits it
+/// (its own owner signed it), the #682 memo invalidates, and its route
+/// follows on the next round. Bounded in rounds; no TTL waited on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unannounced_devices_of_one_owner_exchange_routes_and_admit_682() {
     init_tracing();
     let p = pair("dark", "self").await;
-    routes_cross_and_a_resource_row_admits(&p, "unannounced").await;
+    let sweeps = routes_cross_and_a_resource_row_admits(&p, "unannounced").await;
+    assert!(
+        sweeps <= UNANNOUNCED_ROUND_BOUND,
+        "the unannounced pair must converge within {UNANNOUNCED_ROUND_BOUND} sweeps, took \
+         {sweeps} (a memo left to its TTL would still pass the 120 s budget — #568)"
+    );
+    // I-a / I-d: each side ADMITTED the other's binding on the rung (the row
+    // is in the directory, and the ledger names the rung, not a TTL).
+    for (who, dev, other) in [("D1", &p.d1, &p.d2), ("D2", &p.d2, &p.d1)] {
+        assert!(
+            dev.holds_attestation(&format!("owner-binding-{}", other.key.key_id))
+                .await,
+            "{who} must hold its sibling's owner-binding"
+        );
+        assert!(
+            dev.ledger(OWNER_BINDING_ADMITTED) >= 1,
+            "{who} must have admitted a binding on the owner-binding rung, ledger={:?}",
+            dev.owner_binding_ledger()
+        );
+        // I-b: each side SENT its own binding — on a link it dialed, or as
+        // the answer to its sibling's newly admitted binding (which of the two
+        // depends on who dialed first and whether the other's sends reused
+        // that link, #531). Never neither.
+        assert!(
+            dev.ledger(OWNER_BINDING_PUSHED) + dev.ledger(OWNER_BINDING_ANSWERED) >= 1,
+            "{who} must have pushed (dialed link) or answered (reply path) its own binding, \
+             ledger={:?}",
+            dev.owner_binding_ledger()
+        );
+        assert_eq!(
+            dev.ledger(OwnerBindingRefusal::NotOwnOwner.as_str()),
+            0,
+            "{who} received nothing but its own owner's bindings"
+        );
+    }
+}
+
+// ── CIRISEdge#727 — the negatives and the recovery case (I20) ──────────────
+
+/// The Deliver the rung judges: kind Attestation, the given rows.
+fn owner_binding_deliver(rows: &[Attestation]) -> DeliverMessage {
+    DeliverMessage {
+        kind: EnvelopeKind::Attestation,
+        envelopes: rows
+            .iter()
+            .map(|r| {
+                serde_json::to_vec(&SignedAttestation {
+                    attestation: r.clone(),
+                })
+                .expect("json")
+            })
+            .collect(),
+    }
+}
+
+/// (a) `O → Y` signed by a key that is not R's owner is refused BY NAME, both
+/// shapes: the attester field names a stranger (refused before any
+/// cryptography), and the attester field names O but a stranger signed
+/// (refused at the signature). Nothing is stored either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_binding_signed_by_a_key_that_is_not_the_receivers_owner_is_refused_by_name_727() {
+    let owner = Ident::new("owner-727a", 0x51).await;
+    let r = Ident::new("r-727a", 0x52).await;
+    let y = Ident::new("y-727a", 0x53).await;
+    let stranger = Ident::new("stranger-727a", 0x54).await;
+    let dir = directory_with(vec![
+        owner.record("user").await,
+        r.record("node").await,
+        y.record("node").await,
+        stranger.record("user").await,
+    ])
+    .await;
+    dir.put_attestation(SignedAttestation {
+        attestation: owner_binding_at(&owner, &r.key_id, "self").await,
+    })
+    .await
+    .expect("R's own binding");
+    let metrics = EdgeMetrics::new();
+    let gate = OwnerBindingCarveOut::new(
+        r.key_id.clone(),
+        Arc::clone(&dir) as Arc<dyn FederationDirectory>,
+        None,
+        Some(metrics.clone()),
+    );
+
+    // Shape 1: a stranger's own binding of Y — attester = stranger.
+    let strangers_row = owner_binding_at(&stranger, &y.key_id, "self").await;
+    let out = gate
+        .admit_deliver(&owner_binding_deliver(std::slice::from_ref(&strangers_row)))
+        .await;
+    assert_eq!(
+        out,
+        OwnerBindingOutcome::Consumed {
+            admitted: 0,
+            held: 0,
+            refused: vec![OwnerBindingRefusal::NotOwnOwner],
+            subjects: vec![],
+        },
+        "a binding whose attester is not R's owner is refused by name"
+    );
+    assert_eq!(ledger(&metrics, "owner_binding_not_own_owner"), 1);
+    assert_eq!(
+        ledger(&metrics, "owner_binding_signature_invalid"),
+        0,
+        "refused BEFORE any cryptography: the signature was never checked"
+    );
+
+    // Shape 2: the attester FIELD says O, the signature is the stranger's.
+    let forged = owner_binding_signed_by(&owner, &stranger, &y.key_id, "self").await;
+    let out = gate.admit_deliver(&owner_binding_deliver(&[forged])).await;
+    assert_eq!(
+        out,
+        OwnerBindingOutcome::Consumed {
+            admitted: 0,
+            held: 0,
+            refused: vec![OwnerBindingRefusal::SignatureInvalid],
+            subjects: vec![],
+        },
+        "a row naming O but not signed by O fails against the held owner key"
+    );
+    assert_eq!(ledger(&metrics, "owner_binding_signature_invalid"), 1);
+
+    // Nothing landed: Y is not one of O's nodes at R.
+    let rows = dir.list_attestations_since(None, 1024).await.expect("list");
+    assert!(
+        !rows
+            .iter()
+            .any(|s| s.attestation.attestation_id == format!("owner-binding-{}", y.key_id)),
+        "no refused row is stored"
+    );
+    let owned_nodes = ciris_persist::federation::admission::nodes_owned_by(&*dir, &owner.key_id)
+        .await
+        .expect("nodes_owned_by");
+    assert_eq!(
+        owned_nodes,
+        vec![r.key_id.clone()],
+        "O's node set at R is still just R"
+    );
+    assert_eq!(ledger(&metrics, OWNER_BINDING_ADMITTED), 0);
+}
+
+/// (b) A stranger S receiving `O → X` refuses it — unowned S by
+/// `owner_binding_receiver_unowned`, S owned by P by
+/// `owner_binding_not_own_owner` — stores nothing, and O's device set is not
+/// enumerable at S: `nodes_owned_by(O)` stays empty, which is exactly the set
+/// the #682 serve gate would hand X's rows to. S never serves X the self plane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stranger_refuses_another_owners_binding_and_holds_nothing_727() {
+    let owner = Ident::new("owner-727b", 0x61).await;
+    let x = Ident::new("x-727b", 0x62).await;
+    let s = Ident::new("s-727b", 0x63).await;
+    let p = Ident::new("p-727b", 0x64).await;
+    let genuine = owner_binding_at(&owner, &x.key_id, "self").await;
+
+    // S unowned.
+    let dir_s = directory_with(vec![
+        owner.record("user").await,
+        x.record("node").await,
+        s.record("node").await,
+    ])
+    .await;
+    let metrics = EdgeMetrics::new();
+    let gate = OwnerBindingCarveOut::new(
+        s.key_id.clone(),
+        Arc::clone(&dir_s) as Arc<dyn FederationDirectory>,
+        None,
+        Some(metrics.clone()),
+    );
+    let out = gate
+        .admit_deliver(&owner_binding_deliver(std::slice::from_ref(&genuine)))
+        .await;
+    assert_eq!(
+        out,
+        OwnerBindingOutcome::Consumed {
+            admitted: 0,
+            held: 0,
+            refused: vec![OwnerBindingRefusal::ReceiverUnowned],
+            subjects: vec![],
+        }
+    );
+    assert_eq!(ledger(&metrics, "owner_binding_receiver_unowned"), 1);
+
+    // S owned by P: still not O.
+    let dir_s2 = directory_with(vec![
+        owner.record("user").await,
+        x.record("node").await,
+        s.record("node").await,
+        p.record("user").await,
+    ])
+    .await;
+    dir_s2
+        .put_attestation(SignedAttestation {
+            attestation: owner_binding_at(&p, &s.key_id, "self").await,
+        })
+        .await
+        .expect("P → S");
+    let metrics2 = EdgeMetrics::new();
+    let gate2 = OwnerBindingCarveOut::new(
+        s.key_id.clone(),
+        Arc::clone(&dir_s2) as Arc<dyn FederationDirectory>,
+        None,
+        Some(metrics2.clone()),
+    );
+    let out = gate2
+        .admit_deliver(&owner_binding_deliver(std::slice::from_ref(&genuine)))
+        .await;
+    assert_eq!(
+        out,
+        OwnerBindingOutcome::Consumed {
+            admitted: 0,
+            held: 0,
+            refused: vec![OwnerBindingRefusal::NotOwnOwner],
+            subjects: vec![],
+        }
+    );
+    assert_eq!(ledger(&metrics2, "owner_binding_not_own_owner"), 1);
+    assert_eq!(
+        ledger(&metrics2, "owner_binding_signature_invalid"),
+        0,
+        "no cryptography was spent on a stranger's row"
+    );
+
+    for (label, dir) in [("unowned S", &dir_s), ("P-owned S", &dir_s2)] {
+        let rows = dir.list_attestations_since(None, 1024).await.expect("list");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.attestation.attestation_id == genuine.attestation_id),
+            "[{label}] the genuine `O → X` is NOT stored at a stranger"
+        );
+        let owned_nodes =
+            ciris_persist::federation::admission::nodes_owned_by(&**dir, &owner.key_id)
+                .await
+                .expect("nodes_owned_by");
+        assert!(
+            owned_nodes.is_empty(),
+            "[{label}] O's device set is not enumerable at S (got {owned_nodes:?}) — the #682 \
+             serve gate hands X's rows to exactly this set, so S never serves X the self \
+             plane"
+        );
+    }
+}
+
+/// (c) X pushes its binding only on a link X DIALED. A stranger S that dials
+/// D1 (D1 never dials S — S is not in D1's peer set) is sent nothing on the
+/// rung: S's ledger has no `owner_binding_*` entry at all, S holds no binding
+/// of O's, and D1's push count equals what it pushed toward its sibling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_pushes_its_binding_only_on_a_link_it_dialed_727() {
+    init_tracing();
+    let p = pair("dialed", "self").await;
+    // The stranger: unowned, its own record + D1's + the owner's (so it can
+    // verify anything it is handed), D1 as its only peer, dialing D1.
+    let s = Arc::new(Ident::new("stranger-727c", 0x71).await);
+    let dir_s = directory_with(vec![
+        s.record("node").await,
+        p.d1.key.record("node").await,
+        p.owner.record("user").await,
+    ])
+    .await;
+    let port1 = p.d1_port;
+    let ms = EdgeMetrics::new();
+    let (ts, _) = build_reticulum_with_retry_metrics(
+        || {
+            let base = p.tmp.path().to_path_buf();
+            let auth = ReticulumAuth {
+                signer: Some(s.signer()),
+                rooting: Some(Arc::clone(&dir_s) as Arc<dyn RootingDirectory>),
+                resolver: None,
+                hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+                own_owner_binding: Some(Arc::new(DirectoryOwnerBinding::new(
+                    Arc::clone(&dir_s) as Arc<dyn FederationDirectory>,
+                    s.key_id.clone(),
+                ))),
+                ..ReticulumAuth::default()
+            };
+            let key_id = s.key_id.clone();
+            async move {
+                let mut c = ReticulumTransportConfig::new(base.join("s/transport.id"), &key_id);
+                c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+                c.bootstrap_peers = vec![format!("127.0.0.1:{port1}").parse().unwrap()];
+                c.announce_interval = Duration::from_secs(5);
+                (c, auth)
+            }
+        },
+        ms.clone(),
+    )
+    .await;
+    let stranger = device(Arc::clone(&s), dir_s, ts, ms, &s, &p.d1.key).await;
+
+    // Drive all three; the pair converges, the stranger keeps dialing D1.
+    let crossed = drive_until(&p, Duration::from_secs(120), || async {
+        let _ = stranger.runtime.round_now_all().await;
+        p.d2.holds_route_for(&p.d1.key).await && p.d1.holds_route_for(&p.d2.key).await
+    })
+    .await;
+    assert!(
+        crossed.is_some(),
+        "the pair still converges with a stranger attached"
+    );
+    for _ in 0..3 {
+        let _ = stranger.runtime.round_now_all().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    eprintln!(
+        "[dialed] D1 ledger {:?}; S ledger {:?}",
+        p.d1.owner_binding_ledger(),
+        stranger.owner_binding_ledger()
+    );
+
+    // I-b: the stranger is unowned, so it pushed nothing on the links IT dialed.
+    assert_eq!(
+        stranger.ledger(OWNER_BINDING_PUSHED),
+        0,
+        "an unowned node pushes nothing"
+    );
+    // I-b: D1 pushed only toward its sibling; nothing rode the stranger's
+    // inbound link, so the stranger's rung never fired — not even a refusal.
+    assert!(
+        stranger.owner_binding_ledger().is_empty(),
+        "the stranger's inbound link carried no binding push at all: {:?}",
+        stranger.owner_binding_ledger()
+    );
+    assert!(
+        !stranger
+            .holds_attestation(&format!("owner-binding-{}", p.d1.key.key_id))
+            .await,
+        "the stranger holds no binding of O's"
+    );
+    let owned_nodes =
+        ciris_persist::federation::admission::nodes_owned_by(&*stranger.dir, &p.owner.key_id)
+            .await
+            .expect("nodes_owned_by");
+    assert!(
+        owned_nodes.is_empty(),
+        "O's device set is not enumerable at the stranger"
+    );
+    assert!(
+        p.d1.ledger(OWNER_BINDING_PUSHED) + p.d1.ledger(OWNER_BINDING_ANSWERED) >= 1,
+        "D1 sent its binding toward its sibling (and, per the stranger's empty ledger, \
+         nowhere else)"
+    );
+}
+
+/// Recovery: D2 wiped to its seed + O's key record dials D1, which still
+/// holds `O → D2`. D2 re-converges: it holds `O → D2` and `O → D1` again and
+/// both routes cross, within the same round bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wiped_device_reconverges_by_dialling_its_sibling_727() {
+    init_tracing();
+    let p = pair_with("wiped", "self", D2Starts::Wiped).await;
+    assert!(
+        !p.d2
+            .holds_attestation(&format!("owner-binding-{}", p.d2.key.key_id))
+            .await,
+        "precondition: the wiped device holds no binding about itself"
+    );
+    let crossed = drive_until(&p, Duration::from_secs(120), || async {
+        p.d2.holds_route_for(&p.d1.key).await
+            && p.d1.holds_route_for(&p.d2.key).await
+            && p.d2
+                .holds_attestation(&format!("owner-binding-{}", p.d2.key.key_id))
+                .await
+            && p.d2
+                .holds_attestation(&format!("owner-binding-{}", p.d1.key.key_id))
+                .await
+    })
+    .await;
+    dump(&p, "wiped").await;
+    for (who, dev) in [("D1", &p.d1), ("D2", &p.d2)] {
+        eprintln!(
+            "[wiped] {who} owner-binding ledger: {:?}",
+            dev.owner_binding_ledger()
+        );
+    }
+    let sweeps = crossed.expect(
+        "the wiped device must recover its binding, its sibling's binding and both routes \
+         by dialling its sibling",
+    );
+    eprintln!("[wiped] recovered after {sweeps} sweep(s)");
+    assert!(
+        sweeps <= RECOVERY_ROUND_BOUND,
+        "recovery must be bounded in rounds (one stuck-round timeout + the exchange), took \
+         {sweeps} > {RECOVERY_ROUND_BOUND}"
+    );
+    let owned_nodes =
+        ciris_persist::federation::admission::nodes_owned_by(&*p.d2.dir, &p.owner.key_id)
+            .await
+            .expect("nodes_owned_by");
+    let mut want = vec![p.d1.key.key_id.clone(), p.d2.key.key_id.clone()];
+    want.sort();
+    assert_eq!(owned_nodes, want, "D2 knows O's device set again");
 }

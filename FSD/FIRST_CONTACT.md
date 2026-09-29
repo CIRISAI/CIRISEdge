@@ -118,6 +118,117 @@ Pull (`bridge::an_unannounced_nodes_route_reaches_only_its_owners_nodes_682`).
   still a stranger for these two rows: announce is the owner's disclosure decision about the
   device, not a replication grant.
 
+### 2.1.1 The owner-binding rung — a binding signed by the receiver's own owner (CIRISEdge#727)
+
+I14 is the designed path: the device-join answer carries the owner's bindings, so a device knows
+its siblings before it needs to. This rung is the **belt** under it, for a device that skipped or
+lost that exchange: two devices of one owner, both claimed before announcing (owner-binding at
+`self`), each knowing only its own binding. Without it they deadlock on §2.1, witnessed in
+`owned_devices_route_682::unannounced_devices_of_one_owner_exchange_routes_and_admit_682` (on
+the pre-#727 code: ≈320 `identity_row_node_not_announced` per side in 120 s, no route crosses).
+The shape is the one #402 closed for `Key` / `IdentityOccurrence` — the row that would earn
+attribution is the row attribution is demanded for — so the answer has the same shape: a rung
+beside the #402 rung, for one more row, on the same door.
+
+**Why the row is self-authenticating to its receiver, and to nobody else.** An owner-binding
+`O → X` is `delegates_to(O → X, delegation_purpose: owner_binding)`, signed by O ([CC 3.2]: the
+owner signs its own owner-binding, MUST). A receiver R whose own owner is O already holds O's key
+record — it is R's trust subject — so R can verify the signature with what it holds, and nothing
+in the row needs the link's attribution to be true. That is exactly why a self-signed `Key` crosses
+an Identified link (#402). To a node that is *not* O's, the same row is a claim about a stranger's
+household: it has no standing to hold it and no use for it ([CC 5.4.6] #111: a node whose binding
+is held only at `self` is reachable by the person's own nodes and by whoever holds a code they
+issued, and MUST NOT be enumerated to any node outside the owner's `self` cohort).
+
+**Why the push is the owner's act.** Dialling is what an unannounced node does to a peer its owner
+chose — the peer set the owner configured, or the code the owner issued ([CC 2.6.8], [CC 5.4.6]).
+So a node revealing "I am O's" on a link *it* dialed reveals it to a peer O chose. A link a
+stranger opened reveals nothing: the stranger learned X's transport destination from the RNS
+announce every routing node emits, which places nothing on the roster, and X answers on it with
+what §2.1 already allows and nothing more.
+
+**The rule, three parts.**
+
+1. **Admission carve-out.** A receiver R with `owner_of(R) = O` admits an owner-binding
+   attestation `O → X` arriving on ANY link, attributed or not, when the attester is R's OWN owner
+   and the signature verifies against the owner key R holds. A binding whose attester is not R's
+   owner takes the ordinary path, unchanged: dropped un-attributed, admitted through the sync door
+   attributed. On admit the #682 owner memo invalidates (the same hook `owner_binding_touched`
+   fires for every admitted binding), so R serves `O → R` and its route to X on the next round —
+   bounded in rounds, never a TTL wait (#568).
+2. **Send carve-out.** A node X pushes its OWN owner-binding `O → X` — about itself, nothing else —
+   as an unsolicited bootstrap-plane `Deliver` (the #927 bare-Deliver shape, kind `Attestation`,
+   one envelope) in exactly two situations: **(i) on a link X itself dialed**, right after the link
+   is identified and its announce and bundle are served (#627 / #436 order); **(ii) as the answer**
+   to a sibling's binding X has just admitted as NEW under rule 1, on the reply path of the link it
+   arrived on (the #683 answer shape, `send_on_reply_path`). Case (ii) exists because the initiator
+   direction does not always dial: a node whose sends ride the link its sibling opened (#531 link
+   reuse) never reaches the dial-path push, and without the answer the exchange is one-way — the
+   sibling withholds its route forever (witnessed on the first cut of this rung). The answer's
+   recipient is proven to be O's node, a stronger warrant than a dial; it is sent only on a NEW
+   admission, never on a row already held, so two siblings exchange exactly one binding each and
+   stop. Never advertised, never on a link a stranger opened, never any binding about another node.
+   The serve policy (advertise, fetch twin, subject Pull, the #884 send-set gate) is untouched: the
+   row still crosses no round toward a peer outside its audience.
+3. **Privacy bound.** A stranger S (not O's) receiving `O → X` refuses it under rule 1 by name
+   (`owner_binding_not_own_owner`, or `owner_binding_receiver_unowned` when S has no owner), before
+   any cryptography, and stores nothing; O's device set stays non-enumerable to S. No announce, no
+   directory listing, no derived plane is touched.
+
+**State table (the receiver R, for one inbound un-attributed `Deliver` of kind `Attestation`).**
+
+| Frame | `owner_of(R)` | Attester | Signature vs R's held owner key | Verdict | Ledger (`first_contact_outcomes`) |
+|---|---|---|---|---|---|
+| any envelope is not an owner-binding `delegates_to` | — | — | — | not this rung: dropped `SkippedNoSourceKeyId` as before | — |
+| more than `MAX_OWNER_BINDING_PUSH` envelopes | — | — | — | refused, nothing read | `owner_binding_deliver_oversized` |
+| all owner-bindings | unresolved (read error, `AmbiguousNodeOwner`) | — | — | refused, fail-closed | `owner_binding_owner_unresolved` |
+| all owner-bindings | `None` (R unowned) | — | — | refused | `owner_binding_receiver_unowned` |
+| all owner-bindings | `O` | `≠ O` | not checked | refused, per row | `owner_binding_not_own_owner` |
+| all owner-bindings | `O` | `O` | fails | refused, per row | `owner_binding_signature_invalid` |
+| all owner-bindings | `O` | `O` | verifies | persist's replicated-attestation door (Wire origin, every admission gate intact — the single-owner gate included) | `owner_binding_admitted` / `owner_binding_held` / `owner_binding_door_refused` |
+| same frame, `source_key_id` present (an attributed link) | — | — | — | the ordinary attributed path, unchanged | the Attestation plane's own counters |
+
+**The sender X, for one link.**
+
+| Link | X holds a live owner-binding about itself | Pushed | Ledger |
+|---|---|---|---|
+| X dialed it | yes (`attester = owner_of(X)`, `attested = X`, not retired, not expired) | that one row, once, after announce + bundle | `owner_binding_pushed` (or `owner_binding_push_incomplete` when the Channel stalls) |
+| X dialed it | no (unowned, or the owner is ambiguous — fail-closed) | nothing | — |
+| a sibling's binding was just admitted as NEW on it (either direction) | yes | that one row, once, on the reply path | `owner_binding_answered` (or `owner_binding_answer_failed`) |
+| a sibling's binding arrived on it but was already held, or was refused | — | nothing (the exchange is complete, or the sender is no sibling) | — |
+| a peer opened it, nothing admitted on it | — | nothing | — |
+
+**Convergence (the un-ignored witness).** X dials R; X pushes `O → X`; R admits (rule 1), the memo
+invalidates, R's next round serves `O → R` and its route to X (§2.1: X is now in
+`nodes_owned_by(O)` as R resolves it); R's own dial of X pushes `O → R` the same way; both hold
+each other's binding, both serve their routes, both Attributed, both Rooted (#393 item 2 holds both
+ways), a Resource-carried row crosses. The bound is in **rounds** (the witness asserts it), and no
+TTL is waited on: every state change that moves the answer fires the memo invalidation.
+
+**Recovery (the wiped device).** A device X wiped to its seed and its owner's key record holds no
+binding, so it pushes nothing and — being unowned in its own directory — admits nothing on this
+rung. It re-converges by dialling a sibling R that still holds `O → X`: X's bootstrap rows cross
+(#402), R attributes X and, X being one of O's nodes as R resolves it, serves it `O → X`, `O → R`
+and its route on the ordinary attributed path; X then holds its binding again and the rung applies
+to it as before. The genesis rule (CC 3.2: the first binding is set at provisioning, never by a
+landgrab) is untouched: nothing here mints a binding, and a receiver never admits one signed by
+anyone but the owner it already has.
+
+**Invariants (each witnessed in §6, I20).**
+
+- **(I-a)** An owner-binding whose attester is the receiver's OWN owner is admitted on any link,
+  after signature verification against the owner key the receiver holds.
+- **(I-b)** A node pushes only its OWN owner-binding, only on a link it dialed or in answer to a
+  sibling's binding newly admitted on that link, and never advertises it. A stranger's link gets
+  nothing: no push (it was not dialed by this node), no answer (nothing of a stranger's admits).
+- **(I-c)** A stranger receiving it refuses by name, before any cryptography, and O's device set is
+  not enumerable to it.
+- **(I-d)** Admission invalidates the #682 memo, so convergence is bounded in rounds, with no TTL.
+
+[CC 3.2]: https://github.com/CIRISAI/CIRISConstitution/blob/4fd2e9e/constitution/part_3_the_namespace.md
+[CC 5.4.6]: https://github.com/CIRISAI/CIRISConstitution/blob/4fd2e9e/constitution/part_5_transport_substrate.md
+[CC 2.6.8]: https://github.com/CIRISAI/CIRISConstitution/blob/4fd2e9e/constitution/part_2_the_grammar.md
+
 ### 2.2 First contact on the opaque plane (CIRISEdge#683)
 
 §2.1 leaves one pair with no way in: a device the first device has **never seen**. The new phone
@@ -328,6 +439,7 @@ before — minus the four rows that now cross.
 | I17 | **An opaque answer rides the path its request arrived on**, and falls back to the by-key send only when that path is gone. | `first_contact_opaque_683::a_never_peered_device_with_its_key_record_is_verified_handled_and_answered_on_its_path_683` (the path is asserted); `reticulum_loopback::a_never_peered_device_is_answered_on_the_link_it_opened_683` (end to end over Reticulum; the #627 on-link announce also binds the link there, so this one does not distinguish the path) |
 | I18 | **A requester admits introductions only from a solicited answer** (its `in_reply_to` matches a request it sent to the answer's signer), keys by proof of possession before the verify and attestations through the replication apply door after it. | `first_contact_opaque_683::an_unsolicited_answer_introduces_nothing_683`, `…::the_answer_introductions_land_at_the_requester_683` |
 | I19 | **The remaining limit is on-path trust on first use.** A device cannot tell the true holder of a `key_id` it has never seen. persist binds the `key_id` inside the registration envelope and checks the self-signature against the record's own public keys, but never derives `key_id` from the public key, so a self-signed record may claim any `key_id`. The challenge (off-path parties cannot name the request) and the path check (the answer must arrive on the request's medium) narrow who can attempt the substitution to a party that saw the request on that medium; neither prevents it. Closing it needs the key id to be derivable from the key (a persist change) or an out-of-band commitment to the first device's key (the pairing code). | `first_contact_opaque_683::a_forged_answer_built_from_public_material_introduces_nothing_683` (the off-path half; fails on the pre-challenge code, where the forged record was admitted as the first device's key) |
+| I20 | **The owner-binding rung (§2.1.1, CIRISEdge#727).** (I-a) A binding whose attester is the receiver's own owner is admitted on any link after signature verification against the held owner key, through persist's replicated-attestation door. (I-b) A node pushes only its own binding, only on a link it dialed or in answer to a sibling's binding newly admitted on that link, never advertises it. (I-c) A stranger refuses it by name before any cryptography and stores nothing. (I-d) Admission invalidates the #682 memo; the unannounced pair converges in a bounded number of rounds. | `owned_devices_route_682::unannounced_devices_of_one_owner_exchange_routes_and_admit_682` (I-a, I-d: the round bound is asserted; fails on the pre-#727 code); `…::a_binding_signed_by_a_key_that_is_not_the_receivers_owner_is_refused_by_name_727` (I-a negative, both the attester field and the signature); `…::a_stranger_refuses_another_owners_binding_and_holds_nothing_727` (I-c); `…::a_node_pushes_its_binding_only_on_a_link_it_dialed_727` (I-b); `…::a_wiped_device_reconverges_by_dialling_its_sibling_727` (recovery); `protocol::tests::an_owner_binding_push_is_exactly_a_deliver_of_owner_binding_rows_727` (the shape) |
 
 ---
 
@@ -367,6 +479,14 @@ the load-bearing rule in this document that realises it.
 
 ## 9. Change log
 
+- **CIRISEdge#727** — §2.1.1 the owner-binding rung, the belt under I14: an owner-binding whose
+  attester is the receiver's own owner is self-authenticating to that receiver and is admitted on
+  any link (signature verified against the held owner key, then persist's replicated-attestation
+  door; the #682 memo invalidates on admit); a node pushes its own binding, once, on a link it
+  dialed, after the announce and bundle; a stranger refuses it by name before any cryptography.
+  Ledger: `owner_binding_*` under `first_contact_outcomes`. The serve policy is untouched
+  (`SERVE_ADVERTISE_POLICY_HASH` / `REPLICATION_POLICY_HASH` unchanged). I20; the unannounced pair
+  of `owned_devices_route_682` un-ignored and bounded in rounds.
 - **CIRISEdge#683** — §2.2 first contact on the opaque plane. An `OpaqueRequest` may carry its
   sender's self-signed `key_record`. The receiver checks shape, then rate (per sender, per link,
   node-wide), then proof of possession, then admits through the #402 Key door, all before the

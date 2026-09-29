@@ -251,6 +251,18 @@ impl InboundRouter {
             Err(e) => return RouteDisposition::Failed(format!("malformed CRPL frame: {e}")),
         }
         let Some(peer) = routing_source(frame) else {
+            // CIRISEdge#727 — the owner-binding rung (`FSD/FIRST_CONTACT.md`
+            // §2.1.1): an un-attributed push of an owner-binding signed by
+            // THIS node's own owner is self-authenticating to this node and
+            // is admitted through the apply door here, never via a
+            // coordinator. Anything else un-attributed drops as before.
+            if let Some(gate) = self.registry.owner_binding_carve_out() {
+                if let crate::first_contact::OwnerBindingOutcome::Consumed { .. } =
+                    gate.admit_frame(frame).await
+                {
+                    return RouteDisposition::Routed;
+                }
+            }
             return RouteDisposition::Unattributed;
         };
         match self

@@ -217,6 +217,53 @@ where
     panic!("build reticulum transport: exhausted {MAX_ATTEMPTS} bind retries: {last_err:?}");
 }
 
+/// [`build_reticulum_with_retry`] with an [`EdgeMetrics`] handle attached to
+/// the transport (`ReticulumTransport::with_metrics`), so transport-side
+/// counters — the CIRISEdge#727 `owner_binding_pushed` ledger, the #530
+/// announce-intake evictions — are readable by the test.
+///
+/// [`EdgeMetrics`]: ciris_edge::EdgeMetrics
+#[cfg(feature = "transport-reticulum")]
+#[allow(dead_code)]
+pub async fn build_reticulum_with_retry_metrics<F, Fut>(
+    mut make: F,
+    metrics: ciris_edge::EdgeMetrics,
+) -> (
+    Arc<ciris_edge::transport::reticulum::ReticulumTransport>,
+    std::net::SocketAddr,
+)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<
+        Output = (
+            ciris_edge::transport::reticulum::ReticulumTransportConfig,
+            ciris_edge::transport::reticulum::ReticulumAuth,
+        ),
+    >,
+{
+    use ciris_edge::transport::reticulum::ReticulumTransport;
+
+    const MAX_ATTEMPTS: usize = 16;
+    let mut last_err = None;
+    for _ in 0..MAX_ATTEMPTS {
+        let (cfg, auth) = make().await;
+        let addr = cfg.listen_addr;
+        match ReticulumTransport::new(cfg, auth).await {
+            Ok(transport) => {
+                return (
+                    Arc::new(transport.with_metrics(Some(metrics.clone()))),
+                    addr,
+                )
+            }
+            Err(err) if is_addr_in_use(&err) => {
+                last_err = Some(err);
+            }
+            Err(err) => panic!("build reticulum transport: {err:?}"),
+        }
+    }
+    panic!("build reticulum transport: exhausted {MAX_ATTEMPTS} bind retries: {last_err:?}");
+}
+
 /// True if a transport build error is the transient ephemeral-port bind
 /// race from `free_port()` (see [`build_reticulum_with_retry`]) rather
 /// than a genuine configuration or crypto failure.

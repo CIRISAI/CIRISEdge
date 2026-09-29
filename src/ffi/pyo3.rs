@@ -6499,6 +6499,15 @@ pub fn init_edge_runtime(
         // CIRISEdge#436 — first-contact rooting: announce the bundle's
         // manifest commitment + serve the bundle on link-up.
         own_build_bundle,
+        // CIRISEdge#727 — this node's own owner-binding rides every link it
+        // DIALS (the owner-binding rung, `FSD/FIRST_CONTACT.md` §2.1.1), read
+        // from the same federation directory the receiver's gate consults.
+        // Keyed on the ADVERTISED id — the node peers see (#541: the binding
+        // is `owner → node`, never `owner → actor`).
+        own_owner_binding: Some(Arc::new(crate::first_contact::DirectoryOwnerBinding::new(
+            Arc::clone(&federation_directory_for_edge),
+            advertised_key_id.clone(),
+        ))),
     };
 
     // ── Step 5: build the transport + Edge under the host runtime.

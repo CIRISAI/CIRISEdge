@@ -400,6 +400,497 @@ impl AdmissionDoors {
     }
 }
 
+// ── CIRISEdge#727 — the owner-binding rung (`FSD/FIRST_CONTACT.md` §2.1.1) ──
+
+/// The most owner-binding rows one push may carry. A node pushes exactly ONE
+/// (its own); the cap bounds what a stranger's push costs before it is refused
+/// by name, and is small on purpose.
+pub const MAX_OWNER_BINDING_PUSH: usize = 4;
+
+/// Why an owner-binding push (or one row of it) was refused. Operator-facing,
+/// counted under `first_contact_outcomes`, never answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OwnerBindingRefusal {
+    /// More than [`MAX_OWNER_BINDING_PUSH`] rows; nothing is read.
+    DeliverOversized,
+    /// This node's own owner could not be resolved (a read error, or an
+    /// ambiguous owner — CC 3.2 cardinality ≠ 1 fails closed).
+    OwnerUnresolved,
+    /// This node has no owner, so no binding is self-authenticating to it.
+    ReceiverUnowned,
+    /// The row's attester is not this node's owner: a stranger's household.
+    /// Decided before any cryptography.
+    NotOwnOwner,
+    /// The attester IS this node's owner, but the signature does not verify
+    /// against the owner key this node holds.
+    SignatureInvalid,
+    /// A row that passed the shape check could not be deserialized as a row.
+    Malformed,
+    /// Persist's replicated-attestation door refused it (its own gates: the
+    /// single-owner rule, quota, tier ingest).
+    DoorRefused,
+}
+
+impl OwnerBindingRefusal {
+    /// Stable ledger label.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeliverOversized => "owner_binding_deliver_oversized",
+            Self::OwnerUnresolved => "owner_binding_owner_unresolved",
+            Self::ReceiverUnowned => "owner_binding_receiver_unowned",
+            Self::NotOwnOwner => "owner_binding_not_own_owner",
+            Self::SignatureInvalid => "owner_binding_signature_invalid",
+            Self::Malformed => "owner_binding_malformed",
+            Self::DoorRefused => "owner_binding_door_refused",
+        }
+    }
+}
+
+/// Ledger label for a row the door admitted as new.
+pub const OWNER_BINDING_ADMITTED: &str = "owner_binding_admitted";
+/// Ledger label for a row this node already held.
+pub const OWNER_BINDING_HELD: &str = "owner_binding_held";
+/// Ledger label (sender side) for a binding pushed complete on a dialed link.
+pub const OWNER_BINDING_PUSHED: &str = "owner_binding_pushed";
+/// Ledger label (sender side) for a push the link Channel did not complete.
+pub const OWNER_BINDING_PUSH_INCOMPLETE: &str = "owner_binding_push_incomplete";
+
+/// Ledger label (receiver side) for this node's own binding sent back on the
+/// reply path of a link a sibling's binding was NEWLY admitted on.
+pub const OWNER_BINDING_ANSWERED: &str = "owner_binding_answered";
+/// Ledger label (receiver side) for an answer the transport could not send.
+pub const OWNER_BINDING_ANSWER_FAILED: &str = "owner_binding_answer_failed";
+
+/// The rung's verdict on one inbound frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerBindingOutcome {
+    /// Not an un-attributed owner-binding push: the ordinary path, untouched.
+    NotApplicable,
+    /// The frame was this rung's and is consumed here, whatever each row's
+    /// fate. `refused` lists every row (or the frame) refused, by name;
+    /// `subjects` the `attested_key_id` of every row admitted as NEW.
+    Consumed {
+        admitted: usize,
+        held: usize,
+        refused: Vec<OwnerBindingRefusal>,
+        subjects: Vec<String>,
+    },
+}
+
+/// What the receiver needs to ANSWER a sibling (§2.1.1 rule 2, second
+/// clause): the transport whose reply path the frame names, and this node's
+/// own binding.
+struct OwnerBindingAnswer {
+    transport: Arc<dyn crate::transport::Transport>,
+    own: Arc<dyn OwnOwnerBindingSource>,
+}
+
+/// **The receiver's half of the owner-binding rung** (§2.1.1 rule 1).
+///
+/// An owner-binding `O → X` arriving on an un-attributed link is admitted
+/// iff its attester is THIS node's own owner (`owner_of(local)`, persist's
+/// single-valued resolver — never a sorted `.next()`) and its signature
+/// verifies against the owner key this node holds
+/// ([`verify_row_hybrid_signature`](ciris_persist::federation::verify_row_hybrid_signature),
+/// which resolves the attester's REGISTERED keys). It then goes through the
+/// same apply door #683's introductions use — the replication bridge's
+/// unattributed `apply_envelope_bytes`, so the #682 owner memo is invalidated
+/// on admit — or, with no runtime, persist's `apply_replicated_attestation`
+/// directly. Every persist admission gate stays in front of the write.
+///
+/// A row whose attester is not this node's owner is refused BEFORE any
+/// cryptography (`owner_binding_not_own_owner`): a stranger's push costs one
+/// memoised owner read and a string compare. Nothing is stored, nothing is
+/// answered, and the refusal names itself in `first_contact_outcomes`.
+///
+/// This gate reads the frame's bytes only; it never consults the link's
+/// identity. The row is self-authenticating to its receiver or it is not.
+pub struct OwnerBindingCarveOut {
+    local_key_id: String,
+    doors: AdmissionDoors,
+    metrics: Option<crate::observability::EdgeMetrics>,
+    answer: Option<OwnerBindingAnswer>,
+}
+
+impl std::fmt::Debug for OwnerBindingCarveOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnerBindingCarveOut")
+            .field("local_key_id", &self.local_key_id)
+            .field("bridge", &self.doors.replication.is_some())
+            .field("answers", &self.answer.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl OwnerBindingCarveOut {
+    /// `replication` is the runtime's bridge when one is installed (the memo
+    /// invalidation lives there); `None` calls persist directly.
+    #[must_use]
+    pub fn new(
+        local_key_id: impl Into<String>,
+        directory: Arc<dyn FederationDirectory>,
+        replication: Option<Arc<dyn ReplicationDirectory>>,
+        metrics: Option<crate::observability::EdgeMetrics>,
+    ) -> Self {
+        Self {
+            local_key_id: local_key_id.into(),
+            doors: AdmissionDoors {
+                directory,
+                replication,
+            },
+            metrics,
+            answer: None,
+        }
+    }
+
+    /// **The answer** (§2.1.1 rule 2, second clause). Having NEWLY admitted a
+    /// sibling's binding on a link, this node sends its own binding back on
+    /// that link's reply path ([`Transport::send_on_reply_path`], the #683
+    /// answer shape). The recipient is proven to be its owner's node — a
+    /// stronger warrant than a dial. Answered only on `admitted`, never on
+    /// `held`, so two siblings exchange exactly one binding each and stop.
+    ///
+    /// Why it is needed at all: the initiator direction does not always dial.
+    /// A node whose sends ride the link its sibling opened (#531 link reuse)
+    /// never reaches the dial-path push, so without the answer the exchange
+    /// is one-way and the sibling withholds its route forever.
+    ///
+    /// [`Transport::send_on_reply_path`]: crate::transport::Transport::send_on_reply_path
+    #[must_use]
+    pub fn with_answer(
+        mut self,
+        transport: Arc<dyn crate::transport::Transport>,
+        own: Arc<dyn OwnOwnerBindingSource>,
+    ) -> Self {
+        self.answer = Some(OwnerBindingAnswer { transport, own });
+        self
+    }
+
+    /// This node's key id — the `self` whose owner decides admission.
+    #[must_use]
+    pub fn local_key_id(&self) -> &str {
+        &self.local_key_id
+    }
+
+    fn count(&self, label: &'static str) {
+        if let Some(m) = &self.metrics {
+            m.inc_first_contact(label);
+        }
+    }
+
+    /// Judge one inbound frame. Applies only to an **un-attributed** CRPL
+    /// `Deliver` of the owner-binding push shape
+    /// ([`DeliverMessage::is_owner_binding_push`]); an attributed frame takes
+    /// the ordinary path whatever it carries (rule 1 admits it there too, on
+    /// the sync door).
+    pub async fn admit_frame(&self, frame: &crate::transport::InboundFrame) -> OwnerBindingOutcome {
+        if frame.source_key_id.is_some() {
+            return OwnerBindingOutcome::NotApplicable;
+        }
+        let Ok(Some(crate::replication::ReplicationMessage::Deliver(deliver))) =
+            crate::replication::wire_frame::try_unwrap(&frame.envelope_bytes)
+        else {
+            return OwnerBindingOutcome::NotApplicable;
+        };
+        let outcome = self.admit_deliver(&deliver).await;
+        if let OwnerBindingOutcome::Consumed { subjects, .. } = &outcome {
+            // The answer rides only a NEW admission (never `held`), and only
+            // the reply path the frame names — never a by-key dial of our
+            // own, which the transport's fallback would attempt for a path
+            // that is gone. `subjects[0]` is the sibling that pushed (a node
+            // pushes only its own binding); the id is the transport's
+            // by-key fallback target and nothing else.
+            if let (Some(answer), Some(path), Some(sibling)) = (
+                self.answer.as_ref(),
+                frame.reply_path.as_ref(),
+                subjects.first(),
+            ) {
+                self.answer_on(answer, path, sibling).await;
+            }
+        }
+        outcome
+    }
+
+    async fn answer_on(
+        &self,
+        answer: &OwnerBindingAnswer,
+        path: &crate::transport::ReplyPath,
+        sibling: &str,
+    ) {
+        let Some(frame) = answer.own.own_owner_binding_frame().await else {
+            return; // unowned or ambiguous: nothing of ours to say
+        };
+        match answer
+            .transport
+            .send_on_reply_path(sibling, path, &frame)
+            .await
+        {
+            Ok(_) => {
+                self.count(OWNER_BINDING_ANSWERED);
+                tracing::debug!(
+                    local = %self.local_key_id,
+                    sibling,
+                    "own owner-binding ANSWERED on the sibling's reply path (CIRISEdge#727)"
+                );
+            }
+            Err(e) => {
+                self.count(OWNER_BINDING_ANSWER_FAILED);
+                tracing::warn!(
+                    local = %self.local_key_id,
+                    sibling,
+                    error = %e,
+                    "own owner-binding answer failed — the sibling re-pushes on its next dial \
+                     (CIRISEdge#727)"
+                );
+            }
+        }
+    }
+
+    /// Judge one Deliver as if it arrived un-attributed. The frame-level door
+    /// above calls this; tests call it directly.
+    pub async fn admit_deliver(
+        &self,
+        deliver: &crate::replication::DeliverMessage,
+    ) -> OwnerBindingOutcome {
+        use ciris_persist::federation::admission::owner_of;
+
+        if !deliver.is_owner_binding_push() {
+            return OwnerBindingOutcome::NotApplicable;
+        }
+        let mut refused = Vec::new();
+        let refuse_frame = |this: &Self, r: OwnerBindingRefusal, detail: &str| {
+            this.count(r.as_str());
+            tracing::warn!(
+                local = %this.local_key_id,
+                refusal = r.as_str(),
+                detail,
+                envelopes = deliver.envelopes.len(),
+                "owner-binding push REFUSED — nothing stored (CIRISEdge#727)"
+            );
+            OwnerBindingOutcome::Consumed {
+                admitted: 0,
+                held: 0,
+                refused: vec![r],
+                subjects: Vec::new(),
+            }
+        };
+        if deliver.envelopes.len() > MAX_OWNER_BINDING_PUSH {
+            return refuse_frame(
+                self,
+                OwnerBindingRefusal::DeliverOversized,
+                "more rows than one node's own binding could be",
+            );
+        }
+        let owner = match owner_of(self.doors.directory.as_ref(), &self.local_key_id).await {
+            Ok(Some(owner)) => owner,
+            Ok(None) => {
+                return refuse_frame(
+                    self,
+                    OwnerBindingRefusal::ReceiverUnowned,
+                    "this node has no owner, so no binding is self-authenticating to it",
+                );
+            }
+            Err(e) => {
+                return refuse_frame(self, OwnerBindingRefusal::OwnerUnresolved, &e.to_string());
+            }
+        };
+        let mut admitted = 0usize;
+        let mut held = 0usize;
+        let mut subjects: Vec<String> = Vec::new();
+        for bytes in &deliver.envelopes {
+            match self.admit_row(&owner, bytes).await {
+                Ok(RowAdmit::Admitted(subject)) => {
+                    admitted += 1;
+                    subjects.push(subject);
+                }
+                Ok(RowAdmit::Held) => held += 1,
+                Err(r) => {
+                    self.count(r.as_str());
+                    refused.push(r);
+                }
+            }
+        }
+        OwnerBindingOutcome::Consumed {
+            admitted,
+            held,
+            refused,
+            subjects,
+        }
+    }
+
+    /// One row of a push, against `owner` (= `owner_of(local)`, already
+    /// resolved). The order is the rule: attester field first (the privacy
+    /// bound — no cryptography for a stranger's row), then the signature
+    /// against the held owner key, then persist's door.
+    async fn admit_row(&self, owner: &str, bytes: &[u8]) -> Result<RowAdmit, OwnerBindingRefusal> {
+        let signed = serde_json::from_slice::<SignedAttestation>(bytes)
+            .map_err(|_| OwnerBindingRefusal::Malformed)?;
+        let row = &signed.attestation;
+        // The privacy bound (rule 3): decided on the attester field alone,
+        // before a single signature is checked.
+        if row.attesting_key_id != owner {
+            tracing::debug!(
+                local = %self.local_key_id,
+                attester = %row.attesting_key_id,
+                subject = %row.attested_key_id,
+                "owner-binding push refused: not this node's owner (CIRISEdge#727)"
+            );
+            return Err(OwnerBindingRefusal::NotOwnOwner);
+        }
+        // Rule 1's cryptographic half: against the owner key THIS node holds
+        // (persist resolves the attester's registered keys; an attester it
+        // does not hold is a refusal, never a pass).
+        if let Err(e) = ciris_persist::federation::verify_row_hybrid_signature(
+            self.doors.directory.as_ref(),
+            row,
+        )
+        .await
+        {
+            tracing::warn!(
+                local = %self.local_key_id,
+                attestation_id = %row.attestation_id,
+                error = %e,
+                "owner-binding push refused: the signature does not verify against the held \
+                 owner key (CIRISEdge#727)"
+            );
+            return Err(OwnerBindingRefusal::SignatureInvalid);
+        }
+        match self.doors.admit_attestation(&signed).await {
+            Ok(true) => {
+                self.count(OWNER_BINDING_ADMITTED);
+                tracing::info!(
+                    local = %self.local_key_id,
+                    attestation_id = %row.attestation_id,
+                    subject = %row.attested_key_id,
+                    "owner-binding ADMITTED on the owner-binding rung — the announce memo is \
+                     invalidated; the next round serves this owner's node (CIRISEdge#727)"
+                );
+                Ok(RowAdmit::Admitted(row.attested_key_id.clone()))
+            }
+            Ok(false) => {
+                self.count(OWNER_BINDING_HELD);
+                Ok(RowAdmit::Held)
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    local = %self.local_key_id,
+                    attestation_id = %row.attestation_id,
+                    reason,
+                    "owner-binding push refused by persist's door (CIRISEdge#727)"
+                );
+                Err(OwnerBindingRefusal::DoorRefused)
+            }
+        }
+    }
+}
+
+/// One row's fate on the rung (the refusals are the `Err` arm).
+enum RowAdmit {
+    /// A new row; carries its `attested_key_id` (the sibling that pushed).
+    Admitted(String),
+    /// Already held.
+    Held,
+}
+
+/// **The sender's half of the owner-binding rung** (§2.1.1 rule 2): the
+/// frame a transport pushes on a link this node DIALED, right after the
+/// announce and bundle. `None` means push nothing — the node is unowned, its
+/// owner is ambiguous (fail-closed), or it holds no live binding about itself.
+///
+/// The transport asks on every dial and never caches: the binding is
+/// directory state (a claim, an announce, a withdrawal all move it).
+#[async_trait::async_trait]
+pub trait OwnOwnerBindingSource: Send + Sync {
+    /// The CRPL `Deliver` (kind `Attestation`, exactly one envelope: this
+    /// node's own live owner-binding), or `None`.
+    async fn own_owner_binding_frame(&self) -> Option<Vec<u8>>;
+}
+
+/// The production [`OwnOwnerBindingSource`]: this node's live owner-binding
+/// read from its federation directory. "Live" is judged the way the bridge's
+/// #682 announce walk judges it: not retired by an admitted `withdraws` /
+/// `recants` (persist's `precedence::retired_ids`), not expired; the attester
+/// must be `owner_of(local)` (persist's single-valued resolver) and the
+/// subject this node. Among several live rows the latest `asserted_at` wins.
+pub struct DirectoryOwnerBinding {
+    directory: Arc<dyn FederationDirectory>,
+    local_key_id: String,
+}
+
+impl DirectoryOwnerBinding {
+    #[must_use]
+    pub fn new(directory: Arc<dyn FederationDirectory>, local_key_id: impl Into<String>) -> Self {
+        Self {
+            directory,
+            local_key_id: local_key_id.into(),
+        }
+    }
+
+    /// The row itself (the frame builder's input), for callers that want to
+    /// inspect what would be pushed.
+    pub async fn own_owner_binding(&self) -> Option<ciris_persist::federation::Attestation> {
+        use ciris_persist::federation::admission::{is_owner_binding_envelope, owner_of};
+        use ciris_persist::federation::types::attestation_type;
+
+        let owner = match owner_of(self.directory.as_ref(), &self.local_key_id).await {
+            Ok(Some(o)) => o,
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!(
+                    local = %self.local_key_id,
+                    error = %e,
+                    "own owner-binding: owner unresolved — nothing pushed (CIRISEdge#727)"
+                );
+                return None;
+            }
+        };
+        let rows = match self
+            .directory
+            .list_attestations_for(&self.local_key_id)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::debug!(
+                    local = %self.local_key_id,
+                    error = %e,
+                    "own owner-binding: directory unreadable — nothing pushed (CIRISEdge#727)"
+                );
+                return None;
+            }
+        };
+        let refs: Vec<&ciris_persist::federation::Attestation> = rows.iter().collect();
+        let retired = ciris_persist::federation::precedence::retired_ids(&refs);
+        let now = chrono::Utc::now();
+        rows.iter()
+            .filter(|r| {
+                r.attestation_type == attestation_type::DELEGATES_TO
+                    && r.attesting_key_id == owner
+                    && r.attested_key_id == self.local_key_id
+                    && is_owner_binding_envelope(&r.attestation_envelope)
+                    && !retired.contains(r.attestation_id.as_str())
+                    && !r.expires_at.is_some_and(|exp| exp <= now)
+            })
+            .max_by_key(|r| r.asserted_at)
+            .cloned()
+    }
+}
+
+#[async_trait::async_trait]
+impl OwnOwnerBindingSource for DirectoryOwnerBinding {
+    async fn own_owner_binding_frame(&self) -> Option<Vec<u8>> {
+        let row = self.own_owner_binding().await?;
+        let bytes = serde_json::to_vec(&SignedAttestation { attestation: row }).ok()?;
+        Some(crate::replication::wire_frame::wrap_for_kind(
+            &crate::replication::ReplicationMessage::Deliver(crate::replication::DeliverMessage {
+                kind: EnvelopeKind::Attestation,
+                envelopes: vec![bytes],
+            }),
+        ))
+    }
+}
+
 /// Find `needle` in `hay` — the cheap prefilter that keeps the door off every
 /// frame that does not name the field it reads.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {

@@ -2118,6 +2118,15 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
         rooting: Some(Arc::clone(&directory) as Arc<dyn RootingDirectory>),
         resolver: None,
         hybrid_policy: HybridPolicy::Ed25519Fallback,
+        // CIRISEdge#727 — this node's own owner-binding rides every link it
+        // dials (the owner-binding rung). A harness node is unowned unless
+        // its fixture claims it, in which case the source finds the row.
+        own_owner_binding: Some(Arc::new(
+            ciris_edge::first_contact::DirectoryOwnerBinding::new(
+                Arc::clone(&directory) as Arc<dyn ciris_persist::federation::FederationDirectory>,
+                cfg.node_id.clone(),
+            ),
+        )),
         ..ReticulumAuth::default()
     };
     let transport = Arc::new(

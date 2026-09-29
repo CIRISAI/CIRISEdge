@@ -1003,6 +1003,19 @@ impl Session {
                     "unsolicited Deliver on a BOOTSTRAP plane — admitted (peer/canonical \
                      seeding; #927 proactive push) (CIRISEdge#426)"
                 );
+            } else if deliver.is_owner_binding_push() {
+                // CIRISEdge#727 — an owner-binding push that reached a
+                // coordinator arrived ATTRIBUTED (the un-attributed one is
+                // consumed on the owner-binding rung before any coordinator):
+                // rule 1 admits it on the ordinary sync door, and the
+                // bridge's `owner_binding_touched` invalidates the memo.
+                tracing::debug!(
+                    kind = ?self.kind,
+                    source_peer = source_peer.unwrap_or("<unattributed>"),
+                    envelopes = deliver.envelopes.len(),
+                    "unsolicited owner-binding push on an attributed link — the ordinary \
+                     Attestation door decides (CIRISEdge#727)"
+                );
             } else {
                 tracing::warn!(
                     kind = ?self.kind,
