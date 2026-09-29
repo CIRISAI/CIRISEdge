@@ -4853,4 +4853,66 @@ mod files {
             );
         }
     }
+
+    /// The custody view (persist v51.1.0, CIRISPersist#942) through
+    /// `FileRow::custody`: the blob's tier, size and held-here for a member,
+    /// copies unobservable at `self` by design, `NotGranted` for a stranger —
+    /// and the SAME answer for a renamed row, which names the same blob.
+    #[tokio::test]
+    async fn a_files_custody_is_its_blobs_and_a_rename_does_not_move_it() {
+        use ciris_persist::ceg::LifecycleView;
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        for (i, (room, tier)) in rooms.iter().enumerate() {
+            let nth = i64::try_from(i).expect("fits");
+            let body = b"where are my bytes".to_vec();
+            let published = write(&node_a, room, &body, Some("where.txt"), None, nth).await;
+            let old = listed(&node_a, room, LifecycleView::Live)
+                .await
+                .into_iter()
+                .next()
+                .expect("listed");
+            let custody = old
+                .custody(&node_a.store, &node_a.me)
+                .await
+                .unwrap_or_else(|e| panic!("{room}: custody: {e}"));
+            assert_eq!(custody.sha256_hex, published.pointer.content_sha256);
+            let expected_tier = match tier {
+                CryptoTier::InvisibleEncrypted => "invisible_encrypted",
+                CryptoTier::CommunityDek => "community_dek",
+                CryptoTier::Plaintext => "plaintext",
+            };
+            assert_eq!(custody.tier, expected_tier, "{room}");
+            assert!(custody.held_here, "{room}: this node stores the bytes");
+            assert!(!custody.access.is_empty(), "{room}: someone can open it");
+            if *tier == CryptoTier::InvisibleEncrypted {
+                assert!(
+                    !custody.copies_observable,
+                    "{room}: self copies elsewhere are unknowable by design"
+                );
+            }
+            let refused = old
+                .custody(&node_a.store, "stranger-occ")
+                .await
+                .expect_err("a stranger gets no custody view");
+            assert_eq!(refused.kind(), "not_granted", "{room}: {refused}");
+
+            rename_as_node(&node_a, room, &old, Some("still-here.txt"))
+                .await
+                .unwrap_or_else(|e| panic!("{room}: rename: {e}"));
+            let renamed = listed(&node_a, room, LifecycleView::Live)
+                .await
+                .into_iter()
+                .next()
+                .expect("listed");
+            assert_eq!(
+                renamed
+                    .custody(&node_a.store, &node_a.me)
+                    .await
+                    .expect("custody after rename"),
+                custody,
+                "{room}: a rename writes no byte, so custody does not move"
+            );
+        }
+    }
 }

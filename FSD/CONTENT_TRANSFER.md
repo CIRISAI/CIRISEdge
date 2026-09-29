@@ -937,6 +937,14 @@ target only for a **same-attester** composer, so a #941 owner-`withdraws` is adm
 | RN4 | The renamed descriptor opens under no other binding — another instant, another author, another blob — and does open under the claim's own binding (by the rule above) | `files::a_renamed_descriptor_opens_only_under_the_claims_binding` |
 | RN5 | `replaces` naming a file of another blob is refused | inside RN2's witness |
 
+**The custody view (persist v51.1.0, CIRISPersist#942).** `FileRow::custody(store, viewer)` →
+persist's `Engine::blob_custody` through `GroupContentStore::custody`: tier, size, held-here, access
+per person, announced holders, `copies_observable` (false at `self`/`family` by design). It is
+about the **blob**, not the row — no row AAD, no description — so every row over one blob, a
+rename's included, gets the same answer; a viewer who cannot open the bytes is `NotGranted`. It
+goes through the store rather than persist directly so a host holds one handle and one error type
+for the whole drive. Witness: `files::a_files_custody_is_its_blobs_and_a_rename_does_not_move_it`.
+
 ### 6.8 The drive read is a gated query (CIRISPersist#891 — shipped v46.4.0, adopted v30.0.0)
 
 R10 is a query: *this room's file rows, resumable*. Until persist v46.4.0 the only door edge had was

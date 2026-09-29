@@ -463,6 +463,18 @@ impl GroupContentStore for PersistGroupContentStore {
             .map_err(|e| map_err(sha_hex, &e))
     }
 
+    async fn custody(
+        &self,
+        pointer: &BlobPointer,
+        viewer_key_id: &str,
+    ) -> Result<ciris_persist::federation::blob_custody::BlobCustody, GroupContentError> {
+        let (sha_hex, sha) = pointer_sha(pointer)?;
+        self.engine
+            .blob_custody(&sha, viewer_key_id)
+            .await
+            .map_err(|e| map_err(sha_hex, &e))
+    }
+
     async fn redescribe(
         &self,
         req: super::RedescribeRequest<'_>,

@@ -370,6 +370,29 @@ pub trait GroupContentStore: Send + Sync + 'static {
             "this store has no re-describe door (CIRISEdge#702)".to_owned(),
         ))
     }
+
+    /// **Who holds the bytes a pointer names, and who can open them**
+    /// (persist v51.1.0 `Engine::blob_custody`, CIRISPersist#942) — tier,
+    /// size, held-here, access per person, announced holders, and whether
+    /// copies elsewhere are observable at all (never for `self`/`family`).
+    ///
+    /// About the BLOB, not a row: no row AAD is presented, and nothing about
+    /// the description is released. Authorized as a read of the bytes is —
+    /// a viewer who cannot open them is [`GroupContentError::NotGranted`].
+    ///
+    /// # Errors
+    /// As [`Self::open`]; a store without a custody door says so as
+    /// [`GroupContentError::Substrate`].
+    async fn custody(
+        &self,
+        pointer: &BlobPointer,
+        viewer_key_id: &str,
+    ) -> Result<ciris_persist::federation::blob_custody::BlobCustody, GroupContentError> {
+        let _ = (pointer, viewer_key_id);
+        Err(GroupContentError::Substrate(
+            "this store has no custody door (CIRISPersist#942)".to_owned(),
+        ))
+    }
 }
 
 /// Build the AAD for a seal request. Exposed so a test — or a second

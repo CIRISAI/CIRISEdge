@@ -1045,6 +1045,31 @@ impl FileRow {
             .map_err(|e| UnopenedReason::from_store_error(&e))
     }
 
+    /// **Where this file's bytes are, and who can open them** — the drive's
+    /// custody view, persist's `Engine::blob_custody` (v51.1.0,
+    /// CIRISPersist#942) through the same [`GroupContentStore`] every other
+    /// read of this row goes through, so a host holds one handle and one
+    /// error type ([`UnopenedReason`]) for the whole drive.
+    ///
+    /// It answers about the BLOB the pointer names — the same answer for
+    /// every row over it, a rename's included (§6.7.2) — and reveals no
+    /// description. `copies_observable: false` for `self`/`family` is by
+    /// design (CC 5.2), never "no copies".
+    ///
+    /// # Errors
+    /// [`UnopenedReason`] as [`Self::open`]: a viewer who cannot open the
+    /// bytes is `NotGranted`.
+    pub async fn custody(
+        &self,
+        store: &dyn GroupContentStore,
+        viewer_key_id: &str,
+    ) -> Result<ciris_persist::federation::blob_custody::BlobCustody, UnopenedReason> {
+        store
+            .custody(&self.pointer, viewer_key_id)
+            .await
+            .map_err(|e| UnopenedReason::from_store_error(&e))
+    }
+
     /// **The bytes and what they are, through one grant** (CIRISEdge#698,
     /// `FSD/CONTENT_TRANSFER.md` §6.7.1): [`Self::open`] then
     /// [`Self::describe`]. `Ok` never carries [`Descriptor::Sealed`].
