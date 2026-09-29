@@ -449,6 +449,7 @@ async fn tier3_dispatch_inbound_signals_fetch_content() {
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     })
     .await;
 

@@ -484,3 +484,191 @@ where
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// CIRISEdge#683 (FIRST_CONTACT.md §2.2, I15/I17) — an unannounced device the
+/// first device has never seen dials it and asks to join. The first device
+/// holds no key for it and nothing is primed in its peer map. The request
+/// carries the new device's own record; the answer must arrive on the link the
+/// new device opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn a_never_peered_device_is_answered_on_the_link_it_opened_683() {
+    use ciris_edge::verify::HybridPolicy;
+    use ciris_edge::{Edge, EdgeConfig, OpaqueAnswer, OpaqueResponse};
+    use ciris_persist::federation::FederationDirectory as _;
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ciris_edge=debug")
+        .try_init();
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let a = mint_node("first-device", 0x2a).await;
+    let b = mint_node("new-device", 0x2b).await;
+    let dir_a = directory_with(vec![a.1.clone()]).await;
+    let dir_b = directory_with(vec![b.1.clone(), a.1.clone()]).await;
+
+    let auth = |signer: Arc<LocalSigner>, dir: Arc<ciris_persist::store::sqlite::SqliteBackend>| {
+        ReticulumAuth {
+            signer: Some(signer),
+            rooting: Some(dir as Arc<dyn RootingDirectory>),
+            resolver: None,
+            hybrid_policy: HybridPolicy::Strict,
+            ..ReticulumAuth::default()
+        }
+    };
+    let (transport_a, addr_a) = build_reticulum_with_retry(|| {
+        let (key, signer, dir) = (a.0.clone(), Arc::clone(&a.2), dir_a.clone());
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), &key);
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.announce_interval = Duration::from_secs(2);
+            (c, auth(signer, dir))
+        }
+    })
+    .await;
+    let port_a = addr_a.port();
+    let (transport_b, _addr_b) = build_reticulum_with_retry(|| {
+        let (key, signer, dir) = (b.0.clone(), Arc::clone(&b.2), dir_b.clone());
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), &key);
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
+            c.announce_interval = Duration::from_secs(2);
+            // An unannounced device (§2.1): it dials, it is never listed.
+            c.federation_visible = false;
+            (c, auth(signer, dir))
+        }
+    })
+    .await;
+    // ONE direction only: the new device knows its first device's route (it
+    // is announced, or in the pairing code). The first device knows nothing.
+    let mut a_ed = [0u8; 32];
+    a_ed.copy_from_slice(&transport_a.local_transport_pubkey()[32..64]);
+    transport_b
+        .inject_rooted_peer_for_test(&a.0, transport_a.local_dest_hash(), a_ed)
+        .await;
+
+    let build = |me: &(String, ciris_persist::prelude::KeyRecord, Arc<LocalSigner>),
+                 dir: &Arc<ciris_persist::store::sqlite::SqliteBackend>,
+                 t: &Arc<ciris_edge::transport::reticulum::ReticulumTransport>| {
+        Arc::new(
+            Edge::builder()
+                .directory(dir.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+                .federation_directory(
+                    dir.clone() as Arc<dyn ciris_persist::federation::FederationDirectory>
+                )
+                .queue(dir.clone())
+                .signer(Arc::clone(&me.2))
+                .transport(t.clone() as Arc<dyn Transport>)
+                .reticulum_transport(t.clone())
+                .config(EdgeConfig {
+                    hybrid_policy: HybridPolicy::Strict,
+                    cohort_scope_enforcement: ciris_edge::CohortScopeEnforcement::Off,
+                    ..EdgeConfig::default()
+                })
+                .build()
+                .expect("build edge"),
+        )
+    };
+    let edge_a = build(&a, &dir_a, &transport_a);
+    let edge_b = build(&b, &dir_b, &transport_b);
+    let (seen_tx, mut seen_rx) = mpsc::channel::<(String, bool)>(4);
+    edge_a.register_opaque_answerer(2, move |ctx| {
+        let _ = seen_tx.try_send((ctx.sender_key_id, ctx.first_contact));
+        OpaqueAnswer::from(OpaqueResponse {
+            kind: 2,
+            status: 200,
+            payload: b"welcome".to_vec(),
+        })
+    });
+
+    let rt_a = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .expect("rt A"),
+    );
+    let rt_b = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .expect("rt B"),
+    );
+    let _ha = edge_a.spawn_background_listeners(rt_a.handle());
+    let _hb = edge_b.spawn_background_listeners(rt_b.handle());
+
+    assert!(
+        !transport_a.knows_peer(&b.0).await,
+        "the first device has no route to the new one"
+    );
+    assert!(dir_a.lookup_public_key(&b.0).await.unwrap().is_none());
+
+    // End to end over real Reticulum: the first device admits a key it has
+    // never seen from the request itself, verifies, hands the host a first
+    // contact, and the answer comes back. (Which path the answer takes is
+    // pinned in-process by `first_contact_opaque_683`; here #627's on-link
+    // announce also binds the new device's link at the first device, so the
+    // by-key reverse path would find the same link.)
+    let exchange = edge_b
+        .send_opaque_request_introducing(&a.0, 2, b"join please".to_vec(), 20_000)
+        .await
+        .expect("the join is answered over the link the new device opened");
+    assert_eq!(exchange.response.status, 200);
+    assert_eq!(exchange.response.payload, b"welcome");
+
+    let (sender, first) = tokio::time::timeout(Duration::from_secs(5), seen_rx.recv())
+        .await
+        .expect("handler ran")
+        .expect("channel open");
+    assert_eq!(sender, b.0);
+    assert!(first, "the host was told it is a first contact");
+    assert!(
+        dir_a.lookup_public_key(&b.0).await.unwrap().is_some(),
+        "the new device's key was admitted from its own request"
+    );
+
+    std::mem::forget(rt_a);
+    std::mem::forget(rt_b);
+}
+
+/// A node identity minted the production way (`register_self_federation_key`
+/// over a throwaway engine): `(key_id, PoP-valid self-signed record, signer)`.
+async fn mint_node(
+    alias: &str,
+    seed: u8,
+) -> (String, ciris_persist::prelude::KeyRecord, Arc<LocalSigner>) {
+    use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
+    let classical: Arc<dyn HardwareSigner> =
+        Arc::new(Ed25519SoftwareSigner::from_bytes(&[seed; 32], alias).expect("ed25519"));
+    let pqc: Arc<dyn PqcSigner> = Arc::new(
+        MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{alias}-pqc"))
+            .expect("ml-dsa-65"),
+    );
+    let persist_signer = ciris_persist::prelude::LocalSigner::from_hardware_parts(
+        Arc::clone(&classical),
+        alias.to_owned(),
+        Some(Arc::clone(&pqc)),
+        Some(format!("{alias}-pqc")),
+    )
+    .await
+    .expect("persist signer");
+    let engine = ciris_persist::Engine::with_signer(Arc::new(persist_signer), "sqlite::memory:")
+        .await
+        .expect("throwaway engine");
+    let key_id = engine
+        .register_self_federation_key("node", alias, None, serde_json::json!({}), Vec::new())
+        .await
+        .expect("mint");
+    let record = engine
+        .federation_directory()
+        .lookup_public_key(&key_id)
+        .await
+        .expect("read back")
+        .expect("minted");
+    let signer = Arc::new(LocalSigner::new(key_id.clone(), classical, Some(pqc)));
+    (key_id, record, signer)
+}

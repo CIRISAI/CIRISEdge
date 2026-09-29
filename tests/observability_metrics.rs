@@ -319,6 +319,7 @@ async fn metrics_counter_increments_on_receive() {
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 
@@ -445,6 +446,7 @@ async fn metrics_transport_bytes_io_counted() {
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 
@@ -504,6 +506,7 @@ async fn metrics_verify_failure_classified_by_error() {
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 

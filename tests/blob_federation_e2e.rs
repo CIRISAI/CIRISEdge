@@ -2199,6 +2199,7 @@ impl ciris_edge::transport::Transport for WireEnd {
                 source_key_id: None,
                 link_key_id: None,
                 arrival_scope: None,
+                reply_path: None,
             };
             if sink.send(frame).await.is_err() {
                 break;

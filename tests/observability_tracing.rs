@@ -303,6 +303,7 @@ async fn dispatch_inbound_emits_structured_span_with_fields() {
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 
@@ -388,6 +389,7 @@ async fn verify_failure_emits_structured_error_event() {
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
 

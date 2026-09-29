@@ -493,6 +493,85 @@ impl Message for OpaqueRequest {
     type Response = OpaqueResponse;
 }
 
+/// CIRISEdge#683 — the records a first-contact answer hands the requester
+/// (`FSD/FIRST_CONTACT.md` §2.2): key records the requester needs to verify
+/// what it is given, and the attestations it needs to recognise its siblings
+/// (the owner's binding to the answering device, I14). Every row is
+/// self-verifying; the requester admits them through the same doors
+/// replication uses, and only from a solicited answer.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct Introductions {
+    /// Key records, admitted by proof of possession before the answer is
+    /// verified (the answerer's own record may be among them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<ciris_persist::federation::SignedKeyRecord>,
+    /// Attestations, admitted through the replication apply door after the
+    /// answer is verified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attestations: Vec<ciris_persist::federation::SignedAttestation>,
+}
+
+impl Introductions {
+    /// Nothing to introduce.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.attestations.is_empty()
+    }
+}
+
+/// CIRISEdge#683 — the `OpaqueRequest` body as it rides the wire. The public
+/// [`OpaqueRequest`] is the host's shape and is unchanged; this adds the one
+/// field a first-contact request may carry: the sender's own self-signed key
+/// record. Absent, the bytes are identical to an [`OpaqueRequest`]'s, and a
+/// receiver that predates the field ignores it (serde skips unknown fields).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct OpaqueRequestWire {
+    pub kind: u32,
+    pub payload: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_record: Option<ciris_persist::federation::SignedKeyRecord>,
+}
+
+impl Message for OpaqueRequestWire {
+    const TYPE: MessageType = MessageType::OpaqueRequest;
+    const DELIVERY: Delivery = Delivery::Ephemeral;
+    type Response = OpaqueResponse;
+}
+
+/// CIRISEdge#683 — the `OpaqueResponse` body as it rides the wire: the public
+/// [`OpaqueResponse`] plus the answer's [`Introductions`]. Empty
+/// introductions serialize to exactly an [`OpaqueResponse`]'s bytes.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub(crate) struct OpaqueResponseWire {
+    pub kind: u32,
+    pub status: u16,
+    pub payload: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Introductions::is_empty")]
+    pub introductions: Introductions,
+}
+
+impl OpaqueResponseWire {
+    pub(crate) fn from_parts(response: OpaqueResponse, introductions: Introductions) -> Self {
+        Self {
+            kind: response.kind,
+            status: response.status,
+            payload: response.payload,
+            introductions,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (OpaqueResponse, Introductions) {
+        (
+            OpaqueResponse {
+                kind: self.kind,
+                status: self.status,
+                payload: self.payload,
+            },
+            self.introductions,
+        )
+    }
+}
+
 impl Message for OpaqueResponse {
     const TYPE: MessageType = MessageType::OpaqueResponse;
     const DELIVERY: Delivery = Delivery::Ephemeral;

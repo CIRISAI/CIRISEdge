@@ -260,6 +260,7 @@ async fn dispatch(
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
     Ok(())

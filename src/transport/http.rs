@@ -626,6 +626,7 @@ async fn inbound_handler(
         // CIRISEdge#499 — HTTP has no scope-derived destination plane; every
         // request arrives at the federation endpoint.
         arrival_scope: None,
+        reply_path: None,
     };
     match state.sink.send(frame).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),

@@ -236,6 +236,7 @@ fn bench_dispatch(c: &mut Criterion) {
                         source_key_id: None,
                         link_key_id: None,
                         arrival_scope: None, // CIRISEdge#499 — federation arrival
+                        reply_path: None,
                     };
                     edge.dispatch_inbound_for_test(black_box(frame)).await;
                 }

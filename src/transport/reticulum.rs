@@ -5236,11 +5236,26 @@ impl ReticulumTransport {
     // is one linear retry loop with a single match; extracting the Busy arm would
     // split the retry/deadline state across a helper for no readability gain.
     #[allow(clippy::too_many_lines)]
-    async fn send_via_reverse_path(&self, destination_key_id: &str, envelope_bytes: &[u8]) -> bool {
+    ///
+    /// CIRISEdge#683 — `pinned` names the link to ride instead of resolving the
+    /// peer's freshest ATTRIBUTED link: the link a request arrived on, for an
+    /// answer to a requester this node cannot attribute. Each attempt re-checks
+    /// that the pinned link is still established; a dead one ends the loop the
+    /// same way a vanished attributed link does.
+    async fn send_via_reverse_path(
+        &self,
+        destination_key_id: &str,
+        envelope_bytes: &[u8],
+        pinned: Option<LinkId>,
+    ) -> bool {
         let deadline = tokio::time::Instant::now() + REVERSE_PATH_BUSY_RETRY_WINDOW;
         let mut attempts: u32 = 0;
         loop {
-            let Some(link_id) = self.live_attributed_link_to(destination_key_id).await else {
+            let live = match pinned {
+                Some(id) => Some(id).filter(|id| self.node.link_is_established(id)),
+                None => self.live_attributed_link_to(destination_key_id).await,
+            };
+            let Some(link_id) = live else {
                 if attempts > 0 {
                     // The link died mid-retry and the peer has not re-dialed.
                     if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
@@ -5696,7 +5711,7 @@ impl Transport for ReticulumTransport {
         // CIRISEdge#353 — REVERSE PATH FIRST (see `send_via_reverse_path`).
         // Ordered AFTER the blackhole check so an operator ban still wins.
         if self
-            .send_via_reverse_path(destination_key_id, envelope_bytes)
+            .send_via_reverse_path(destination_key_id, envelope_bytes, None)
             .await
         {
             return Ok(TransportSendOutcome::Delivered);
@@ -5868,6 +5883,47 @@ impl Transport for ReticulumTransport {
         shipped.map_err(ShipError::into_transport)?;
 
         Ok(TransportSendOutcome::Delivered)
+    }
+
+    /// CIRISEdge#683 — answer on the link the request arrived on. A path minted
+    /// by another transport, or a link that has since closed, falls back to the
+    /// by-key [`Self::send`] (which still tries the peer's attributed links and
+    /// then a dial).
+    async fn send_on_reply_path(
+        &self,
+        destination_key_id: &str,
+        path: &crate::transport::ReplyPath,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        if envelope_bytes.len() > MAX_BODY_BYTES {
+            return Err(TransportError::BodyTooLarge {
+                actual: envelope_bytes.len(),
+                limit: MAX_BODY_BYTES,
+            });
+        }
+        // The operator ban still wins over the reply path, exactly as it wins
+        // over `send`'s reverse path (v13.8.0: every candidate address).
+        for candidate in &self.resolve_dial_candidates(destination_key_id).await {
+            self.check_blackhole(&candidate.dest_hash.into_bytes())
+                .await?;
+        }
+        if path.transport() == TransportId::RETICULUM_RS
+            && self
+                .send_via_reverse_path(
+                    destination_key_id,
+                    envelope_bytes,
+                    Some(LinkId::new(path.token())),
+                )
+                .await
+        {
+            tracing::debug!(
+                destination_key_id,
+                link = %hex::encode(path.token()),
+                "answer delivered on the link its request arrived on (CIRISEdge#683/#353)"
+            );
+            return Ok(TransportSendOutcome::Delivered);
+        }
+        self.send(destination_key_id, envelope_bytes).await
     }
 
     async fn listen(&self, sink: mpsc::Sender<InboundFrame>) -> Result<(), TransportError> {
@@ -7103,6 +7159,13 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         source_key_id,
         link_key_id,
         arrival_scope,
+        // CIRISEdge#683 — the link this frame arrived on; an answer rides it
+        // first (#353), which is the only way back to a requester this node
+        // cannot attribute (a never-peered device, FIRST_CONTACT.md §2.2).
+        reply_path: Some(crate::transport::ReplyPath::new(
+            TransportId::RETICULUM_RS,
+            link_id.into_bytes(),
+        )),
     };
     if let Err(e) = ctx.sink.send(frame).await {
         tracing::error!(error = %e, "inbound channel send failed");

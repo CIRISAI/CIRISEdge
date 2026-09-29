@@ -529,6 +529,11 @@ base64      = "0.22"
 # Same crate previously lifted to runtime in v1.4.x for the
 # AccordCarrier hex path; dev-deps copy kept for the test fixtures.
 hex         = "0.4"
+# CIRISEdge#683 — the first-contact door's prefilter: one substring scan per
+# inbound frame keeps the extra envelope parse off every frame that does not
+# name the field it reads. Already in the graph (serde_json/regex); pinned here
+# only to name it.
+memchr      = "2"
 
 # Errors / logs
 thiserror   = "1"

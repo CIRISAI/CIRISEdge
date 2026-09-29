@@ -492,6 +492,53 @@ pub struct InboundFrame {
     /// what lets [`admit_blob_serve`](crate::blob_swarm::admit_blob_serve) gate a
     /// chunk request before its body is deserialized rather than after.
     pub arrival_scope: Option<crate::scope_addressing::InboundAddress>,
+    /// CIRISEdge#683 — the path this frame ARRIVED on, as the carrying
+    /// transport names it (Reticulum: the link id). An answer to this frame
+    /// rides it first ([`Transport::send_on_reply_path`]); the by-key send is
+    /// the fallback when the path is gone. This is the #353 rule stated on the
+    /// frame instead of re-derived from attribution: a requester that is not
+    /// attributable here (a never-peered device, `FIRST_CONTACT.md` §2.2) has
+    /// no attributed link to be answered on, but it does have the one it used.
+    ///
+    /// A **routing fact, not a trust claim**: it names a path, never a key, and
+    /// no gate reads it except the first-contact per-link budget. `None` for
+    /// transports with no per-sender path (HTTP, packet radio, FFI injection).
+    pub reply_path: Option<ReplyPath>,
+}
+
+/// CIRISEdge#683 — an inbound frame's arrival path (see
+/// [`InboundFrame::reply_path`]). Opaque outside the transport that minted it:
+/// `token` is that transport's own path id (Reticulum: the 16-byte link id).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReplyPath {
+    transport: TransportId,
+    token: [u8; 16],
+}
+
+impl ReplyPath {
+    /// A path on `transport`, named by that transport's own 16-byte id.
+    #[must_use]
+    pub const fn new(transport: TransportId, token: [u8; 16]) -> Self {
+        Self { transport, token }
+    }
+
+    /// The transport that minted this path.
+    #[must_use]
+    pub const fn transport(&self) -> TransportId {
+        self.transport
+    }
+
+    /// The transport's own id for the path.
+    #[must_use]
+    pub const fn token(&self) -> [u8; 16] {
+        self.token
+    }
+
+    /// A stable, low-cardinality key for per-path budgets and logs.
+    #[must_use]
+    pub fn bucket_key(&self) -> String {
+        format!("{}:{}", self.transport.0, hex::encode(self.token))
+    }
 }
 
 /// The trait every transport implements. Edge holds a
@@ -518,6 +565,21 @@ pub trait Transport: Send + Sync + 'static {
         &self,
         sink: tokio::sync::mpsc::Sender<InboundFrame>,
     ) -> Result<(), TransportError>;
+
+    /// CIRISEdge#683 — send `envelope_bytes` back along `path`, the path a
+    /// request from `destination_key_id` arrived on (#353: answer on the link
+    /// the requester opened). A transport that keeps no per-sender path sends
+    /// by key, which is what the default does; the Reticulum transport rides
+    /// the link and falls back to the by-key send only when the link is gone.
+    async fn send_on_reply_path(
+        &self,
+        destination_key_id: &str,
+        path: &ReplyPath,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        let _ = path;
+        self.send(destination_key_id, envelope_bytes).await
+    }
 }
 
 /// CIRISEdge#454 — a no-op [`Transport`] for tests + downstream consumers whose
