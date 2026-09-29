@@ -1,5 +1,60 @@
 # CIRISEdge Release Notes
 
+# v34.2.0 — a scoped body rides the identity-plane link when no direct path exists; the #722 refusal names what it holds
+
+**2026-09-29** (CIRISEdge#718 → PR #723; CIRISEdge#722 → PR #725). **MINOR** from v34.1.0. No pin or hash
+moves: persist `v51.1.0` (wheel floor `>=51.1,<52`), verify `v18.0.0`, every ABI constant,
+`REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH`, `SERVE_ADVERTISE_POLICY_HASH` (`e4c4d625…`) and
+the wire vocabulary hash are unchanged. **Riders:** a pin bump only.
+
+## #718 — CC 5.4.6 (rc6 `4fd2e9e`, CIRISConstitution#132 ruled): scoped bodies through a forwarder
+
+Two members that reach each other only through a non-member transport node (two phones behind the
+canonical) now exchange room bodies.
+
+- **Send:** one choice per send from leviculum's path table (`ReticulumTransport::scoped_path_shape`,
+  `choose_scoped_carrier`): a member at one hop gets the derived address, exactly as before; a member
+  behind a forwarder gets the identity-plane link with the room discriminator inside the link
+  encryption. Never a fallback after a failed direct send. Counted in `blob_scoped_carriers`.
+- **Wire:** `BlobChunkFetch.scope_discriminator: Option<[u8; 16]>` in the signed body, inside the
+  E2E link; absent ⇒ bytes unchanged.
+- **Admission:** `BlobScopeRouter::scoped_arrival` checks the discriminator against the same
+  `ScopeAddressTable` the arrival path uses and requires this node's own address in the room;
+  `DiscriminatorUnheld` and `DiscriminatorOnDerivedAddress` are refused by name. Every downstream
+  gate then runs unchanged on the stamped arrival scope.
+- **What the forwarder sees:** endpoints, timing, sizes (CC 1.13.3.1's conceded non-goal); nothing
+  naming the room. Verified in leviculum at the pin: link keys are HKDF over the endpoints'
+  ephemeral secret; a forwarder retains a link table and forwards link data by id.
+- **No direct handoff exists yet:** the transport-destination row carries only the RNS hash and
+  leviculum has no NAT traversal (leviculum#70 filed, DCUtR shape). The ciphertext-relay branch is
+  the shipped behaviour.
+- FSD: `CONTENT_TRANSFER.md` rung R5′, `CIRIS_EDGE_TRANSPORT.md` §3.4. Evidence row
+  `CLM-scoped-body-identity-link`. Witness `tests/scoped_body_identity_link_718.rs` fails on
+  v34.1.0 with the field's `NoRouteToPeer` errors.
+- Follow-up: CIRISEdge#724 — a derived-address dial is a no-path link request leviculum broadcasts
+  on every interface.
+
+## #722 — the item-2 refusal now says what the receiver holds
+
+The field report (CIRISServer's native selffiles fixture: Resource-carried frames on the direct
+reverse-path link refused at #393 item 2 while packets pass) was traced, and the premise was refuted
+from code and a live witness: both inbound arms reach the same `attribute_and_deliver`, and a receiver
+that holds the peer's hybrid-signed route admits Resource-carried rows
+(`tests/reverse_link_resource_binding_722.rs`). The packets that "pass" are the #402 bootstrap
+carve-out kinds. No hybrid-signed row fits 8 fragments at MTU 500 (an ML-DSA-65 signature is 3,309
+bytes), so signed rows have always gone Resource-first; the Channel-first cap stays 8.
+
+What this release adds: the item-2 WARN carries `held_signed_route=…` (`none`, or the held
+destination when it differs from the link's), and the silent over-cap Channel-first skip is a named
+debug line plus the `channel_first_skipped_over_cap` counter. The field operand is still open on
+#722; this operand settles it on the next run.
+
+## Rust surface
+
+- `WithholdReason` +2 variants (`ALL_REASONS` 46→48); `PullOutcome` unchanged from v34.1.0.
+- New metrics maps `blob_scoped_carriers`; new counter `channel_first_skipped_over_cap`.
+- `BlobChunkFetch` gains an optional field (serde-default; wire-compatible).
+
 # v34.1.0 — multi-fragment frames on a small-MTU link; a chunk-DAG manifest never lands as the file
 
 **2026-09-29** (CIRISEdge#716 → PR #719; CIRISEdge#717, partial → PR #721). **MINOR** from v34.0.0:
