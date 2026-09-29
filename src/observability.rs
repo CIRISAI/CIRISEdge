@@ -947,6 +947,13 @@ pub struct EdgeMetrics {
     /// `federation:claim_index` (`list_holders`). The one line that proves a
     /// self/family pull never touched the directory.
     pub blob_pull_sources: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#717 — pulls that fetched (or would have fetched) bytes and
+    /// refused to STORE them, by reason: `size_mismatch` (a whole blob whose
+    /// length is not the one its pointer implies, CC 5.3.2.5) and
+    /// `stream_pointer_needs_dag_pull` (a chunk-DAG pointer, which the whole
+    /// blob path would otherwise store as its manifest). Nothing is stored on
+    /// either; a non-zero count is a file that is not on this device.
+    pub blob_pull_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
     /// the live announce-intake map under **capacity backpressure** (the
     /// `MAX_PEERS` cap in `transport::reticulum`).
@@ -1243,6 +1250,15 @@ impl EdgeMetrics {
         *self.blob_pull_sources.write().entry(tag).or_insert(0) += 1;
     }
 
+    /// CIRISEdge#717 — count one pull that refused to store, by reason tag.
+    pub fn inc_blob_pull_refusal(&self, reason_tag: &'static str) {
+        *self
+            .blob_pull_refusals
+            .write()
+            .entry(reason_tag)
+            .or_insert(0) += 1;
+    }
+
     /// CIRISEdge#640 — count one blob-route refusal by its branch tag.
     pub fn inc_blob_route_refusal(&self, reason_tag: &'static str) {
         *self
@@ -1502,6 +1518,12 @@ impl EdgeMetrics {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
+            blob_pull_refusals: self
+                .blob_pull_refusals
+                .read()
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
             blob_route_refusals: self
                 .blob_route_refusals
                 .read()
@@ -1579,6 +1601,8 @@ pub struct EdgeMetricsBundle {
     pub blob_serve_refusals: HashMap<String, u64>,
     /// CIRISEdge#646 — where each pull found its holders, `scope:source`.
     pub blob_pull_sources: HashMap<String, u64>,
+    /// CIRISEdge#717 — pulls that refused to store, by reason.
+    pub blob_pull_refusals: HashMap<String, u64>,
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
     /// `unbound` / `not_applicable`). The door never drops.
     pub bootstrap_door_outcomes: HashMap<String, u64>,

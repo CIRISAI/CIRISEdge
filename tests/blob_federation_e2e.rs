@@ -2584,6 +2584,18 @@ async fn commons_evidence_row(
     sha: &[u8; 32],
     asserted_at: chrono::DateTime<chrono::Utc>,
 ) -> ciris_persist::federation::Attestation {
+    commons_row(author, sha, None, asserted_at).await
+}
+
+/// [`commons_evidence_row`], optionally carrying a typed `content` pointer
+/// beside the citation — the shape `files::publish` writes, at commons
+/// scope, so the pull routes on the federation address in-process.
+async fn commons_row(
+    author: &ciris_edge::identity::LocalSigner,
+    sha: &[u8; 32],
+    pointer: Option<&BlobPointer>,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> ciris_persist::federation::Attestation {
     use ciris_edge::replication::attestation_bind::{
         bind_attestation_envelope, truncate_to_substrate_resolution, AttestationColumns,
     };
@@ -2596,7 +2608,18 @@ async fn commons_evidence_row(
         "score": 1.0,
         "evidence_refs": [hex::encode(sha)],
     });
-    let attestation_id = format!("evidence-{}", &hex::encode(sha)[..16]);
+    if let Some(p) = pointer {
+        envelope[ciris_edge::chat::FIELD_CONTENT] = serde_json::to_value(p).expect("pointer");
+    }
+    let attestation_id = format!(
+        "{}-{}",
+        if pointer.is_some() {
+            "pointer"
+        } else {
+            "evidence"
+        },
+        &hex::encode(sha)[..16]
+    );
     let subjects = vec![author_key_id.to_owned()];
     bind_attestation_envelope(
         &mut envelope,
@@ -2819,6 +2842,275 @@ async fn a_far_node_holds_what_the_pull_brought_home() {
         panic!("a whole blob is held inline, got {held:?}");
     };
     assert_eq!(got, body, "B holds byte-for-byte what A stored");
+}
+
+// ─── CIRISEdge#717: a pulled body is the length its pointer implies ─────
+
+/// Two nodes on the in-process wire, A a blessed commons sender whose holder
+/// claims B holds, and B's puller over its own substrate. Commons scope is
+/// the one plane that routes in-process (a scoped pull stops at the router
+/// on this transport — `a_self_rows_pull_asks_the_authors_nodes…`), so the
+/// #717 witnesses ride it with the pointer shape `files::publish` writes.
+struct CommonsPull {
+    node_a: Node,
+    node_b: Node,
+    edge_b: Arc<ciris_edge::Edge>,
+    puller: Arc<ciris_edge::blob_swarm::BlobPuller<SqliteBackend>>,
+    _stops: (
+        tokio::sync::watch::Sender<bool>,
+        tokio::sync::watch::Sender<bool>,
+    ),
+}
+
+async fn commons_pull() -> CommonsPull {
+    use ciris_edge::blob_swarm::{BlobPuller, PullConfig};
+    use ciris_persist::federation::FederationDirectory;
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let node_a = node(&[&alice, &bob], &alice).await;
+    let node_b = node(&[&alice, &bob], &bob).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+    let (wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (_edge_a, stop_a) = spawn_edge(&node_a, wire_a).await;
+    let (edge_b, stop_b) = spawn_edge(&node_b, wire_b).await;
+    let puller = BlobPuller::new(
+        Arc::clone(&edge_b),
+        node_b.store.engine().clone(),
+        node_b.dir.clone(),
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        node_b.me.clone(),
+        PullConfig {
+            commons_allowlist: vec![node_a.me.clone()],
+            consent: ciris_edge::blob_swarm::OperatorStoreConsent {
+                commons: ciris_edge::blob_swarm::ConsentDisposition::Announce,
+                ..ciris_edge::blob_swarm::OperatorStoreConsent::default()
+            },
+            ..PullConfig::default()
+        },
+    );
+    CommonsPull {
+        node_a,
+        node_b,
+        edge_b,
+        puller,
+        _stops: (stop_a, stop_b),
+    }
+}
+
+impl CommonsPull {
+    /// A holds `body` inline and announces it; B admits A's holder claims.
+    /// Returns the address.
+    async fn a_holds(&self, body: &[u8]) -> [u8; 32] {
+        use ciris_persist::federation::blobs::BlobBody;
+        use ciris_persist::federation::{FederationDirectory, SignedAttestation};
+        let sha: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(body).into();
+        self.node_a
+            .store
+            .engine()
+            .put_blob_signing(
+                &sha,
+                BlobBody::Inline(body.to_vec()),
+                Some("application/octet-stream"),
+                &self.node_a.me,
+                chrono::Utc::now(),
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .expect("A stores and announces");
+        for bytes in rows_of(&self.node_a, "holds_bytes:").await {
+            let h: ciris_persist::federation::Attestation =
+                serde_json::from_slice(&bytes).expect("row");
+            // Idempotent on a re-admit of an earlier claim.
+            let _ = self
+                .node_b
+                .dir
+                .put_attestation(SignedAttestation { attestation: h })
+                .await;
+        }
+        sha
+    }
+
+    fn refusals(&self) -> std::collections::HashMap<String, u64> {
+        self.edge_b.metrics().snapshot().blob_pull_refusals
+    }
+}
+
+/// The pointer `files::publish` writes, at the plaintext tier, over `sha`.
+fn file_pointer(sha: &[u8; 32], size: u64, stream_id: Option<&str>) -> BlobPointer {
+    let mut v = serde_json::json!({
+        "community_key_id": "",
+        "tier": "plaintext",
+        "content_sha256": hex::encode(sha),
+        "content_field": "body",
+        "media_type": "video/mp4",
+        "size": size,
+    });
+    if let Some(s) = stream_id {
+        v["stream_id"] = serde_json::json!(s);
+    }
+    serde_json::from_value(v).expect("pointer")
+}
+
+/// **CIRISEdge#717 — a chunk-DAG pointer is refused by name; its manifest
+/// never lands as the file.**
+///
+/// The server's shape (CIRISServer#697 selffiles ladder): a file over the
+/// inline bound is a DAG whose address is its MANIFEST's, and the holder
+/// answers a request for that address with the manifest — a few hundred
+/// bytes of `{"chunk_tier":…,"chunks":[…],"total_size":…}` — which the
+/// whole-blob pull stored as the file (`storage_kind = inline`), so the
+/// second device served 610 bytes for a 1,048,577-byte video with a 200.
+///
+/// Here A holds, at the pointer's address, exactly what a holder serves
+/// for a 1 MiB + 1 file sealed at `self`: the persist-canonical v2 manifest
+/// over its 256 KiB chunks. B pulls the row's pointer. Before the fix B
+/// stored those bytes as the file; now the pull is refused BY NAME before
+/// any request, B holds no row at that address, and the refusal is counted.
+///
+/// The self route itself does not run in-process (the router needs a
+/// scope table and a Reticulum send — see the self pin above), so the pull
+/// rides commons scope with the served bytes and pointer shape unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chunk_dag_pointer_is_refused_by_name_and_its_manifest_never_lands_as_the_file() {
+    use ciris_edge::blob_swarm::PullOutcome;
+    use ciris_persist::federation::blobs::{BlobBody, BlobStorage as _};
+    use ciris_persist::federation::types::cohort_scope::CryptoTier;
+    use ciris_persist::federation::{ChunkManifest, ChunkRef};
+    init_tracing();
+    let t = commons_pull().await;
+
+    // A 1 MiB + 1 file, chunked as `seal_chunked` chunks it; the manifest
+    // is persist's own canonical encoding of it — the bytes a holder serves.
+    let file_len: u64 = 1_048_577;
+    let chunk = ciris_edge::group_content::store::CHUNK_BYTES as u64;
+    let mut chunks = Vec::new();
+    let mut off = 0u64;
+    let mut seq = 0u64;
+    while off < file_len {
+        let size = chunk.min(file_len - off);
+        chunks.push(ChunkRef {
+            sha: <sha2::Sha256 as sha2::Digest>::digest(seq.to_be_bytes()).into(),
+            size: u32::try_from(size).expect("fits"),
+            seq: Some(seq),
+        });
+        off += size;
+        seq += 1;
+    }
+    let manifest = ChunkManifest {
+        v: 2,
+        total_size: file_len,
+        chunks,
+        chunk_tier: Some(CryptoTier::InvisibleEncrypted),
+        stream_id: Some("file-717".into()),
+    };
+    manifest.validate_total_size().expect("a coherent manifest");
+    let served = manifest.to_jcs_bytes();
+    assert!(
+        served.starts_with(b"{\"chunk_tier\":\"i"),
+        "fixture: the server's first 16 bytes"
+    );
+
+    let sha = t.a_holds(&served).await;
+    let row = commons_row(
+        &t.node_a.signer,
+        &sha,
+        Some(&file_pointer(&sha, file_len, Some("file-717"))),
+        ts(),
+    )
+    .await;
+
+    let verdict = t.puller.pull_one(&row, sha, 0).await;
+    if let Some(held) = t.node_b.dir.get_blob(&sha).await.expect("get_blob") {
+        let len = match &held {
+            BlobBody::Inline(b) => b.len(),
+            other => panic!("B holds a non-inline body: {other:?}"),
+        };
+        panic!(
+            "CIRISEdge#717: B stored {len} bytes of chunk-DAG manifest as a {file_len}-byte \
+             file (storage_kind = inline) — the whole-blob pull must refuse a stream pointer \
+             by name. Verdict: {verdict:?}"
+        );
+    }
+    assert_eq!(
+        verdict,
+        PullOutcome::StreamPointerNeedsDagPull {
+            stream_id: "file-717".into(),
+            declared: Some(file_len),
+        }
+    );
+    assert_eq!(
+        t.refusals().get("stream_pointer_needs_dag_pull").copied(),
+        Some(1),
+        "the refusal is counted: {:?}",
+        t.refusals()
+    );
+    assert!(
+        !t.node_b.dir.has_blob(&sha).await.expect("has_blob"),
+        "nothing stored"
+    );
+}
+
+/// **CIRISEdge#717 / #638 item 2 — a whole blob whose length is not its
+/// pointer's is refused; one whose length is, pulls byte-identical.**
+///
+/// The served body hashes to its address either way — content addressing
+/// cannot catch a row that misdescribes its bytes, only the declared size
+/// can (CC 5.3.2.5). The honest pointer is the control: the same door, the
+/// same holder, the bytes arrive exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_blob_is_stored_only_at_the_length_its_pointer_declares() {
+    use ciris_edge::blob_swarm::PullOutcome;
+    use ciris_persist::federation::blobs::{BlobBody, BlobStorage as _};
+    init_tracing();
+    let t = commons_pull().await;
+
+    // The misdescribed blob: 4,096 bytes, declared 4,097.
+    let lying = vec![0x5Au8; 4096];
+    let sha = t.a_holds(&lying).await;
+    let row = commons_row(
+        &t.node_a.signer,
+        &sha,
+        Some(&file_pointer(&sha, 4097, None)),
+        ts(),
+    )
+    .await;
+    assert_eq!(
+        t.puller.pull_one(&row, sha, 0).await,
+        PullOutcome::SizeMismatch {
+            declared: 4097,
+            received: 4096,
+        }
+    );
+    assert!(
+        !t.node_b.dir.has_blob(&sha).await.expect("has_blob"),
+        "a refused body is never stored"
+    );
+    assert_eq!(
+        t.refusals().get("size_mismatch").copied(),
+        Some(1),
+        "the refusal is counted: {:?}",
+        t.refusals()
+    );
+
+    // The control: an honest plaintext pointer pulls byte-identical.
+    let honest: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    let sha = t.a_holds(&honest).await;
+    let row = commons_row(
+        &t.node_a.signer,
+        &sha,
+        Some(&file_pointer(&sha, honest.len() as u64, None)),
+        ts(),
+    )
+    .await;
+    assert_eq!(
+        t.puller.pull_one(&row, sha, 0).await,
+        PullOutcome::Stored { announced: true }
+    );
+    match t.node_b.dir.get_blob(&sha).await.expect("get_blob") {
+        Some(BlobBody::Inline(got)) => assert_eq!(got, honest, "byte-identical"),
+        other => panic!("B holds {other:?}"),
+    }
 }
 
 /// **CIRISEdge#601 vs #499 — the community leg, pinned where it stops.**

@@ -250,6 +250,70 @@ pub enum PullOutcome {
     /// stored length the pointer's `size` implies at its tier. Not adopted,
     /// not retried: the row, not the holder, is wrong.
     SizeMismatch { declared: u64, received: u64 },
+    /// CIRISEdge#717 — the pointer names a **chunk DAG** (`stream_id` is
+    /// present), and this puller moves whole blobs only. A DAG's address is
+    /// its MANIFEST's, so a whole-blob fetch of it brings home ~500 bytes of
+    /// manifest and, stored, that manifest reads back as the file. Refused
+    /// before any request goes out, nothing stored, not retried: the DAG pull
+    /// waits on persist's sealed-DAG adopt door (CIRISPersist#947), and until
+    /// then the honest state on this node is `not_fetched`.
+    StreamPointerNeedsDagPull {
+        /// The pointer's stream.
+        stream_id: String,
+        /// The PLAINTEXT size the pointer declares, if any.
+        declared: Option<u64>,
+    },
+}
+
+/// A `CommunityDek` pointer with no sealed-under epoch cannot be adopted,
+/// so it is not worth a fetch (CIRISEdge#601).
+fn epoch_refusal(row: &Attestation, blob_hex: &str, meaning: &BlobMeaning) -> Option<PullOutcome> {
+    let pointer = meaning.pointer()?;
+    if pointer.tier != CryptoTier::CommunityDek || pointer.epoch.is_some() {
+        return None;
+    }
+    tracing::warn!(
+        blob = %blob_hex,
+        attestation_id = %row.attestation_id,
+        "pull refused: a community_dek pointer with no sealed-under epoch — the \
+         row predates the epoch-bearing pointer, and a guessed epoch is a blob \
+         that reads NotGranted forever (CIRISEdge#601)"
+    );
+    Some(PullOutcome::NoEpoch)
+}
+
+/// The `blob_pull_refusals` tag for [`PullOutcome::SizeMismatch`].
+pub const PULL_REFUSAL_SIZE_MISMATCH: &str = "size_mismatch";
+/// The `blob_pull_refusals` tag for [`PullOutcome::StreamPointerNeedsDagPull`].
+pub const PULL_REFUSAL_STREAM_POINTER_NEEDS_DAG_PULL: &str = "stream_pointer_needs_dag_pull";
+
+/// CIRISEdge#717 — a pointer this puller must not whole-pull: one naming a
+/// chunk DAG. `None` for every other reference (a whole-blob pointer, an
+/// `evidence_refs` citation).
+fn stream_refusal(
+    row: &Attestation,
+    blob_hex: &str,
+    meaning: &BlobMeaning,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+) -> Option<PullOutcome> {
+    let pointer = meaning.pointer()?;
+    let stream_id = pointer.stream_id.clone()?;
+    if let Some(m) = metrics {
+        m.inc_blob_pull_refusal(PULL_REFUSAL_STREAM_POINTER_NEEDS_DAG_PULL);
+    }
+    tracing::warn!(
+        blob = %blob_hex,
+        attestation_id = %row.attestation_id,
+        stream_id = %stream_id,
+        declared = ?pointer.size,
+        "pull refused: the pointer names a chunk DAG, and the whole-blob pull would store its \
+         MANIFEST as the file — nothing fetched, nothing stored, until the DAG pull lands \
+         (CIRISEdge#717, CIRISPersist#947)"
+    );
+    Some(PullOutcome::StreamPointerNeedsDagPull {
+        stream_id,
+        declared: pointer.size,
+    })
 }
 
 /// The declared-size check (CIRISEdge#638 item 2): the hash already matched,
@@ -260,11 +324,15 @@ fn size_refusal(
     blob_hex: &str,
     meaning: &BlobMeaning,
     received_len: usize,
+    metrics: Option<&crate::observability::EdgeMetrics>,
 ) -> Option<PullOutcome> {
     let declared = meaning.pointer().and_then(declared_stored_len)?;
     let received = received_len as u64;
     if received == declared {
         return None;
+    }
+    if let Some(m) = metrics {
+        m.inc_blob_pull_refusal(PULL_REFUSAL_SIZE_MISMATCH);
     }
     tracing::warn!(
         blob = %blob_hex,
@@ -278,8 +346,9 @@ fn size_refusal(
 
 /// **The stored length a pointer's declared `size` implies** (CIRISEdge#638
 /// item 2) — `None` when the row declares none (pre-#698) or the pointer is
-/// a chunk DAG (its manifest pins `total_size` per chunk already, and the
-/// puller fetches whole blobs only). A sealed tier stores the plaintext
+/// a chunk DAG: its address is the manifest's, whose length no pointer
+/// declares, and the puller refuses a DAG pointer by name before fetching
+/// (CIRISEdge#717, [`PullOutcome::StreamPointerNeedsDagPull`]). A sealed tier stores the plaintext
 /// inside an `AtRestEnvelope`, so the fetched body is `size` plus persist's
 /// own exported overhead — the same arithmetic `files::must_chunk` uses.
 #[must_use]
@@ -712,15 +781,15 @@ where
         // The binding the adopt door will need, decided BEFORE any request:
         // a row that cannot be adopted is not worth a fetch.
         let tier = meaning.pointer().map_or(CryptoTier::Plaintext, |p| p.tier);
-        if tier == CryptoTier::CommunityDek && meaning.pointer().and_then(|p| p.epoch).is_none() {
-            tracing::warn!(
-                blob = %blob_hex,
-                attestation_id = %row.attestation_id,
-                "pull refused: a community_dek pointer with no sealed-under epoch — the \
-                 row predates the epoch-bearing pointer, and a guessed epoch is a blob \
-                 that reads NotGranted forever (CIRISEdge#601)"
-            );
-            return PullOutcome::NoEpoch;
+        if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning) {
+            return refused;
+        }
+
+        // CIRISEdge#717 — a chunk DAG is not a whole blob: refused before
+        // the holder walk and the fetch, which would store its manifest.
+        let metrics = self.edge.metrics();
+        if let Some(refused) = stream_refusal(row, &blob_hex, &meaning, Some(&metrics)) {
+            return refused;
         }
 
         // Who has it — persist's holder plane, minus ourselves.
@@ -770,7 +839,8 @@ where
 
         // CIRISEdge#638 item 2 (CC 5.3.2.5): the row's declared size, checked
         // before anything is stored.
-        if let Some(refused) = size_refusal(row, &blob_hex, &meaning, bytes.len()) {
+        let received = bytes.len();
+        if let Some(refused) = size_refusal(row, &blob_hex, &meaning, received, Some(&metrics)) {
             return refused;
         }
 
@@ -951,6 +1021,35 @@ mod tests {
         p.stream_id = None;
         p.size = None;
         assert_eq!(declared_stored_len(&p), None, "pre-#698: nothing declared");
+    }
+
+    /// CIRISEdge#717 — every tier: a pointer carrying `stream_id` is refused
+    /// by name before any fetch, and the same pointer without one is not.
+    /// The field shape is `files::publish`'s: a chunked write sets
+    /// `stream_id`, a whole-blob write leaves it absent.
+    #[test]
+    fn a_stream_pointer_is_refused_by_name_at_every_tier() {
+        for tier in ["plaintext", "community_dek", "invisible_encrypted"] {
+            let mut row = content_row("community", "room", &SHA);
+            row.attestation_envelope["content"]["tier"] = serde_json::json!(tier);
+            row.attestation_envelope["content"]["size"] = serde_json::json!(1_048_577);
+            let meaning = BlobMeaning::project(&row, &SHA).expect("pointer");
+            assert_eq!(
+                stream_refusal(&row, "ab", &meaning, None),
+                None,
+                "{tier}: a whole-blob pointer is pulled whole"
+            );
+            row.attestation_envelope["content"]["stream_id"] = serde_json::json!("file-1");
+            let meaning = BlobMeaning::project(&row, &SHA).expect("pointer");
+            assert_eq!(
+                stream_refusal(&row, "ab", &meaning, None),
+                Some(PullOutcome::StreamPointerNeedsDagPull {
+                    stream_id: "file-1".into(),
+                    declared: Some(1_048_577),
+                }),
+                "{tier}: a DAG pointer must never be whole-pulled — its address is the manifest's"
+            );
+        }
     }
 
     fn sink_with(capacity: usize) -> (PullSink, mpsc::Receiver<PullRequest>) {
