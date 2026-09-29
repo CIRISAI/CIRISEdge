@@ -79,7 +79,8 @@
 //! reassembles them, so edge still sees exactly ONE `ResourceCompleted` per
 //! transfer carrying the whole payload — at `segment_index == total_segments`.
 //! Edge therefore owns NO segment-size or MDU constant of its own: the boundary
-//! is leviculum's, and the per-link MDU comes from `link_mdu()`. This is a
+//! is leviculum's, and the per-link MDU comes from `link_mdu()` (less the
+//! channel envelope header for the Channel path, CIRISEdge#716). This is a
 //! DIFFERENT layer from [`crate::transport::frame_fragment`], which fragments
 //! oversized frames onto the sub-MDU PACKET path (`CFRG`, leviculum#39); the two
 //! reassembly paths never see each other's bytes.
@@ -394,6 +395,29 @@ const CHANNEL_FRAME_SEND_BUDGET: Duration = Duration::from_secs(15);
 /// one-resource gate was where the server's rounds went to time out. Bigger
 /// frames keep the Resource path with the Channel as the busy fallback.
 const CHANNEL_FIRST_MAX_FRAGMENTS: usize = 8;
+
+/// CIRISEdge#716 — the largest payload ONE link-Channel send accepts on a link
+/// whose packet MDU is `link_mdu`: leviculum's `Channel::mdu`, i.e. the link MDU
+/// minus the 6-byte channel envelope header (`CHANNEL_ENVELOPE_HEADER_SIZE`,
+/// Python `Channel.MDU = outlet.mdu - 6`).
+///
+/// Every `CFRG` fragment and every unwrapped single-piece frame that
+/// [`send_fragments_on_channel`] ships rides `send_on_link`, i.e. the Channel,
+/// so this — not `link_mdu()` — is the size [`crate::transport::frame_fragment::fragment`] must cut
+/// to. Cutting to the raw link MDU made every full-size fragment 6 bytes over:
+/// `Channel::send_raw` refused it `TooLarge`, `send_on_link` folded that into
+/// `SendError::LinkFailed`, and every multi-fragment frame stalled at fragment 0
+/// (`link_send_error`) on any link below the u16 envelope ceiling — the MTU-500
+/// reverse-path link in the field. `fragment` still applies the u16 ceiling.
+fn channel_payload_mdu(link_mdu: usize) -> usize {
+    link_mdu.saturating_sub(leviculum_core::constants::CHANNEL_ENVELOPE_HEADER_SIZE)
+}
+
+/// [`channel_payload_mdu`] for a live link; 0 when leviculum no longer holds it
+/// (the fragmenter then refuses, exactly as a missing `link_mdu` did).
+fn link_channel_mdu(node: &ReticulumNode, link_id: &LinkId) -> usize {
+    node.link_mdu(link_id).map_or(0, channel_payload_mdu)
+}
 
 /// What [`send_fragments_on_channel`] achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5277,7 +5301,7 @@ impl ReticulumTransport {
             // `CHANNEL_FIRST_MAX_FRAGMENTS`). A stall falls through to the
             // Resource path below exactly as before.
             if attempts == 1 {
-                let mdu = self.node.link_mdu(&link_id).unwrap_or(0);
+                let mdu = link_channel_mdu(&self.node, &link_id);
                 if let Some(fragments) =
                     crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
                         .filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
@@ -5364,7 +5388,7 @@ impl ReticulumTransport {
                     // `attribute_and_deliver`. A best-effort lost fragment just means
                     // the frame re-fragments next round — the same whole-frame retry
                     // unit anti-entropy already relies on.
-                    let mdu = self.node.link_mdu(&link_id).unwrap_or(0);
+                    let mdu = link_channel_mdu(&self.node, &link_id);
                     if let Some(fragments) =
                         crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
                     {
@@ -8411,7 +8435,7 @@ fn report_attribution_miss(
 /// same lane in the same order. A lost push is recoverable (the RNS announce
 /// still exists; the next link-up re-serves) and never silent.
 async fn push_own_announce_frame(node: &ReticulumNode, frame: &[u8], link_id: &LinkId) {
-    let mdu = node.link_mdu(link_id).unwrap_or(0);
+    let mdu = link_channel_mdu(node, link_id);
     let Some(fragments) = crate::transport::frame_fragment::fragment(frame, mdu) else {
         if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
             own_bundle_push_log().check("announce-degenerate-mdu")
@@ -8449,7 +8473,7 @@ async fn push_own_announce_frame(node: &ReticulumNode, frame: &[u8], link_id: &L
 }
 
 async fn push_own_bundle_frames(node: &ReticulumNode, own: &OwnBuildBundle, link_id: &LinkId) {
-    let mdu = node.link_mdu(link_id).unwrap_or(0);
+    let mdu = link_channel_mdu(node, link_id);
     let Some(fragments) = crate::transport::frame_fragment::fragment(&own.frame, mdu) else {
         if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
             own_bundle_push_log().check("degenerate-mdu")
@@ -10640,6 +10664,40 @@ async fn with_timeout<F: std::future::Future>(dur: Duration, fut: F) -> Option<F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CIRISEdge#716 — every piece the fragmenter produces for a link must be
+    /// accepted by leviculum's Channel on that link. Checked against the
+    /// authority itself (`Channel::mdu`), over the base-MTU link MDU the field
+    /// hit (431) and across the range up to and past the u16 envelope ceiling.
+    #[test]
+    fn channel_fragments_fit_leviculums_channel_mdu_716() {
+        let channel = leviculum_core::link::channel::Channel::new();
+        for link_mdu in [431usize, 432, 1_000, 8_191, 65_535, 65_541, 65_542, 262_000] {
+            let mdu = channel_payload_mdu(link_mdu);
+            let ceiling = channel.mdu(link_mdu);
+            assert!(
+                mdu >= ceiling,
+                "link_mdu={link_mdu}: channel_payload_mdu {mdu} must not undercut Channel::mdu {ceiling}"
+            );
+            let frame: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+            let pieces =
+                crate::transport::frame_fragment::fragment(&frame, mdu).expect("fragmentable");
+            assert!(
+                pieces.len() > 1,
+                "link_mdu={link_mdu}: 200 KB must fragment"
+            );
+            for p in &pieces {
+                assert!(
+                    p.len() <= ceiling,
+                    "link_mdu={link_mdu}: a {}-byte piece exceeds Channel::mdu {ceiling} — \
+                     leviculum refuses it TooLarge, reported as link_send_error (#716)",
+                    p.len()
+                );
+            }
+        }
+        // The field value, spelled out: 431 − 6.
+        assert_eq!(channel_payload_mdu(431), 425);
+    }
 
     /// CIRISEdge#530 — the announce-intake capacity bound's victim selection.
     ///
