@@ -292,6 +292,12 @@ impl Root {
             "pre_rotation_commitment".into(),
             serde_json::Value::String(commitment),
         );
+        // persist v51 (CIRISPersist#937/#938, CC 3.2 T4a/T6 rc6) — the rc6
+        // charter carries its three members in the signed bytes. A KEY root
+        // holds no lineage, so T4a's attach gate is not armed for it; the
+        // members ride the charter every root now signs, and the ladder
+        // proves they change nothing about rooting a key root.
+        rc6_charter_members(&mut extra);
         delegates_to_row(
             &self.key.signer(),
             &self.key.key_id,
@@ -302,6 +308,19 @@ impl Root {
         )
         .await
     }
+}
+
+/// The rc6 charter members (persist v51 `envelope::paths`), at persist's
+/// shipped defaults: a 7-day attach window, a 24-hour witness cadence, one
+/// independent witness.
+fn rc6_charter_members(extra: &mut serde_json::Map<String, serde_json::Value>) {
+    use ciris_persist::federation::envelope::paths;
+    extra.insert(paths::ATTACH_WINDOW_SECS.into(), 604_800.into());
+    extra.insert(paths::WITNESS_CADENCE_SECS.into(), 86_400.into());
+    extra.insert(
+        paths::WITNESS_QUORUM.into(),
+        ciris_persist::federation::lineage_witness::DEFAULT_WITNESS_QUORUM.into(),
+    );
 }
 
 /// One genesis-shaped node: a self-signed node key, a self-signed owner, the

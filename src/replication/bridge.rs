@@ -11736,6 +11736,18 @@ pub(crate) mod tests {
             "scope": ["infra:serve", "infra:attest"],
             "pre_rotation_commitment": commitment,
         });
+        // persist v51 (CIRISPersist#937/#938) — the rc6 charter members at
+        // persist's shipped defaults. A key root holds no lineage, so the T4a
+        // attach gate is not armed for it; they ride every charter.
+        let mut envelope = envelope;
+        {
+            use ciris_persist::federation::envelope::paths;
+            envelope[paths::ATTACH_WINDOW_SECS] = serde_json::json!(604_800);
+            envelope[paths::WITNESS_CADENCE_SECS] = serde_json::json!(86_400);
+            envelope[paths::WITNESS_QUORUM] = serde_json::json!(
+                ciris_persist::federation::lineage_witness::DEFAULT_WITNESS_QUORUM
+            );
+        }
         seed_raw_attestation(backend, &id, root, root, "delegates_to", envelope).await;
         id
     }
