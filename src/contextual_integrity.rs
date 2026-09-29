@@ -211,6 +211,12 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         // served nothing. A recipient bound, not an information-type one.
         WithholdReason::RecipientNotRooted => CiParameter::Recipient,
 
+        // CIRISEdge#682 (CC 5.4.6) — an unannounced node's identity rows reach
+        // only its owner's own nodes: the audience the person chose for that
+        // device. Unresolved is the same promise kept fail-closed.
+        WithholdReason::IdentityRowNodeNotAnnounced
+        | WithholdReason::IdentityRowAnnounceUnresolved => CiParameter::Recipient,
+
         WithholdReason::AccordRelayRosterUnresolvable
         | WithholdReason::AccordRelaySignerNotSeated
         | WithholdReason::AccordRelayNoTrustEdge
@@ -834,7 +840,7 @@ mod tests {
     /// So: when adding a reason, add it here too, and on a merge that touches
     /// this file check the count against the enum rather than trusting a
     /// green suite.
-    const ALL_REASONS: [WithholdReason; 44] = [
+    const ALL_REASONS: [WithholdReason; 46] = [
         WithholdReason::EnvelopeUnfetchable,
         WithholdReason::LocalIdentityMissing,
         WithholdReason::SendSetUnresolved,
@@ -879,5 +885,7 @@ mod tests {
         WithholdReason::HoldingScopeDirectoryMissing,
         WithholdReason::HoldingScopeRecipientSetUnresolved,
         WithholdReason::HoldingScopeRecipientReadError,
+        WithholdReason::IdentityRowNodeNotAnnounced,
+        WithholdReason::IdentityRowAnnounceUnresolved,
     ];
 }

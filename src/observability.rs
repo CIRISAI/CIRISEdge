@@ -549,6 +549,23 @@ pub enum WithholdReason {
     /// third-party mail silently would be indistinguishable from one that
     /// never received it.
     LxmfRetentionExpired,
+    /// CIRISEdge#682 (CC 5.4.6, CIRISServer#655) — an `IdentityOccurrence` or
+    /// `TransportDestination` row about an OWNED node that is **not announced**
+    /// (no live owner-binding `owner → node` at `cohort_scope: federation`),
+    /// asked for by a peer that is not one of that owner's own nodes. The
+    /// darknet half of the per-node announce ruling: an unannounced device is
+    /// reachable by its person's own nodes and by whoever they hand a code to,
+    /// never listed. Booked on the advertise, the direct-fetch twin and the
+    /// subject-Pull alike (`detail` names which). Not a fault — the peer is
+    /// outside the audience the owner chose.
+    IdentityRowNodeNotAnnounced,
+    /// CIRISEdge#682 — the announce state of the node an identity-plane row is
+    /// about could not be decided (`owner_of` ambiguous or a directory read
+    /// failed). Fail-closed: the row is served only to the node itself, because
+    /// "I could not read whether you announced" is not "you announced".
+    /// Distinct from [`Self::IdentityRowNodeNotAnnounced`] so an operator is
+    /// sent to the directory, not to the announce wizard.
+    IdentityRowAnnounceUnresolved,
 }
 
 impl WithholdReason {
@@ -602,6 +619,8 @@ impl WithholdReason {
             Self::LxmfFrameOversized => "lxmf_frame_oversized",
             Self::LxmfMailboxFull => "lxmf_mailbox_full",
             Self::LxmfRetentionExpired => "lxmf_retention_expired",
+            Self::IdentityRowNodeNotAnnounced => "identity_row_node_not_announced",
+            Self::IdentityRowAnnounceUnresolved => "identity_row_announce_unresolved",
         }
     }
 }

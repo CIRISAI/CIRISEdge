@@ -818,8 +818,31 @@ Absent or `false`, behaviour is byte-for-byte what it was.
 
 ## 6. Serve & consent — consent *is* routing (Attestation plane only)
 
-Only the `Attestation` plane is recipient-gated; every other kind serves per its
-projection (§3). Three gates compose, narrowest question last
+Only the `Attestation` plane is consent-gated. One other gate is per-recipient:
+**the identity planes follow the node's announce state (CIRISEdge#682, CC 5.4.6,
+CIRISServer#655).** An owned node's `IdentityOccurrence` and `TransportDestination`
+rows are served to every peer only when the node is *announced* — a live
+owner-binding `owner → node` at `cohort_scope: federation`, written directly or by
+persist's `widen_audience` `supersedes` (the `POST /v1/federation/announce` route).
+An unannounced node's rows go only to `nodes_owned_by(owner)`; anyone else is booked
+`identity_row_node_not_announced` (`identity_row_announce_unresolved` when the owner
+or the announce state cannot be read — fail-closed to the node itself). The gate is
+keyed on the ROW's occurrence key, so it covers a relayed row as well as our own,
+and it holds on all three serve axes: the per-peer advertise, the direct-fetch twin
+and the subject Pull. An unowned node is its own trust subject and serves as before.
+Decided from persist state, memoized per sweep (the owner memo's TTL and
+invalidation events, plus the widening). `FSD/FIRST_CONTACT.md` §2.1 is how it
+composes with the bootstrap kinds. `Key` is not gated: a key record discloses no
+route.
+
+The `SelfOwn` publish set itself may be chosen per plane (CIRISEdge#678): a host
+that relays a third party's anchored key record but has no onward-flow principle on
+that party's occurrences or routes installs a `KindPublishSelector`
+(`ReplicationRuntimeConfig::kind_publish_selector`; PyO3 `publish_sets_by_kind`).
+A kind it does not name stays on the self-publish set; unset, nothing changes.
+
+Every other kind serves per its projection (§3). On the Attestation plane three
+gates compose, narrowest question last
 ([`bridge.rs`](../src/replication/bridge.rs)):
 
 | Gate | Question | Mechanism |

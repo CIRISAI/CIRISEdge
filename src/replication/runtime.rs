@@ -168,6 +168,7 @@ fn build_bridge(
             bridge_config,
         )
         .with_self_provider(self_provider)
+        .with_kind_publish_selector(config.kind_publish_selector.clone())
         .with_convergence(Some(convergence))
         .with_local_key_id(config.local_key_id.clone())
         .with_engine(config.sealed_content.as_ref().map(|w| w.engine.clone()))
@@ -665,6 +666,16 @@ pub struct ReplicationRuntimeConfig {
     /// Requires [`Self::local_key_id`]: with no "I" there is no
     /// `delegates_to(self → root)` to evaluate, and the gate holds fully closed.
     pub accord_relay_enforced: bool,
+    /// CIRISEdge#678 (CIRISServer#148 limb b) — the per-kind publish set for
+    /// the `SelfOwn` planes. `start`'s `self_provider` hands `Key`,
+    /// `IdentityOccurrence` and `TransportDestination` ONE set; a host that
+    /// relays a third party's anchored key record but not that party's
+    /// occurrences or routes (their grant carries no onward-flow principle)
+    /// answers per kind here. A kind the selector answers `None` for stays on
+    /// `self_provider`. `None` (the default) is exactly the single-set
+    /// behaviour. See
+    /// [`FederationDirectoryReplicationBridge::with_kind_publish_selector`].
+    pub kind_publish_selector: Option<super::bridge::KindPublishSelector>,
 }
 
 /// Live replication runtime — bridge + registry + scheduler task +

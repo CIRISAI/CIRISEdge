@@ -31,6 +31,7 @@ CIRISEdge#671 for the consent path (the send set). Both are one carve-out with o
 | **Rooted** (pair) | `rooted_with(peer)`: the two owner-bindings resolve, and the two owners' acceptances name **one root in common that is valid at this node** (persist `trust_root_valid`, incl. the v47.3.0 holder-hardware leg). Computed every sweep, never stored. | CC 4.4.3.8 item 3 ("two nodes with no shared root compose nothing"); persist #901 |
 | **Send set** (per direction) | The peers this node has granted `consent:replication` (persist `list_consent_peers(local)`), widened by the owner-binding axis (#524) and the self-collective axis (persist #884). A `ResolvedRecipient` exists only from this set. | CC 3.3.7 |
 | **Reach** | Which rows a resolved recipient may be handed: `Consent` (everything the other gates allow), `SelfCollective` / `Family` (only rows of that scope), **`FirstContact`** (only this node's allegiance facts — #671). | `src/replication/resolved_state.rs` |
+| **Announced** (per node) | The node's owner-binding `owner → node` is live at `cohort_scope: federation` — written there, or widened there by persist's `widen_audience` `supersedes` (`POST /v1/federation/announce`, CIRISServer#655). The person chooses it per device; a minor's binding can never be announced (persist, CC 3.4.13 Q5). An unowned node has no announce axis. | CC 5.4.6; persist `check_minor_owner_binding_not_announced` |
 | **Conferral** | Accord co-scrub / `infra:serve` conferred by a root the node trusts. Authority, not standing. Never implied by Rooted. | CC 4.2.1; transport FSD §5.4.1 invariant 1 |
 
 ---
@@ -74,6 +75,48 @@ Two closure facts make the table safe:
 - **`Reach::FirstContact` admits only `Audience::Federation`** — allegiance facts are federation
   rows by definition (CC 3.3.7 makes governance records public; the acceptance and owner-binding
   are exactly that). A `self`/`family`/`community` row can never ride first contact.
+
+### 2.1 The announce axis on the bootstrap kinds (CIRISEdge#682)
+
+The bootstrap kinds are self-authenticating, so they could cross any link. Whether they
+*should* cross is the owner's choice, made per node (CC 5.4.6: identity rows are lightnet
+only for the devices the person announced). The gate is on the SENDER's side and keyed on
+the row's occurrence key `n`; it narrows the ✅ in the bootstrap column of the table above
+for two of the three kinds:
+
+| `n` is… | `IdentityOccurrence` / `TransportDestination` about `n` go to | Ledger |
+|---|---|---|
+| unowned (its own trust subject: the canonical, a bare server) | every peer, as before | — |
+| owned and **announced** | every peer, as before | — |
+| owned and **not announced** | `n` itself and `nodes_owned_by(owner_of(n))` — never a stranger, never an unbound requester | `identity_row_node_not_announced` |
+| owner or announce state unreadable (`AmbiguousNodeOwner`, a read error) | `n` itself only (fail-closed) | `identity_row_announce_unresolved` |
+
+`Key` is not gated: a key record carries no route and is what every verifier needs to check
+a signature. The same predicate holds on the advertise, the direct-fetch twin and the subject
+Pull (`bridge::an_unannounced_nodes_route_reaches_only_its_owners_nodes_682`).
+
+**How it composes with the rungs.**
+
+- **An announced node is unchanged at every rung** (R1–R4), so first contact between announced
+  or unowned nodes — production's agent ↔ canonical topology, and the ladder — is untouched.
+- **An unannounced node never becomes Attributed at a stranger**, because Attributed needs a
+  hybrid-signed transport binding and its route is exactly what is withheld. That is the
+  point, not a regression: a darknet device is reached by its person's own nodes and by
+  whoever holds its code, and is never listed. It can still *dial* announced peers, whose
+  routes are public.
+- **An unannounced second device and its owner's first device (CIRISEdge#683).** The second
+  device B *reaches* the first device A as before: A is announced, so A's route is public and
+  B dials it; A answers on the link B opened (#353). What the gate adds is on B's serve: B
+  hands A its occurrence and route only once B can see that A is its owner's node, i.e. B
+  holds `owner → A`. That row is A's owner-binding at `federation` — public, but at B it
+  arrives only by a path that does not need B to be Attributed at A first. Precondition
+  **I14**: the device-join answer (#683's opaque response, the server's second-device flow)
+  carries the owner's binding to A alongside the new binding to B. Without it B withholds
+  its route from A (booked), and A cannot attribute B — the same state as before #683, never
+  a worse one.
+- **Consent does not widen it.** A peer in B's send set that is not one of the owner's nodes is
+  still a stranger for these two rows: announce is the owner's disclosure decision about the
+  device, not a replication grant.
 
 ---
 
@@ -192,6 +235,9 @@ before — minus the four rows that now cross.
 | I11 | **Deployment precondition — a root is judged from the judge's own records.** `trust_root_valid` reads the charter and every holder's evidence-carrying key record from the judging node's directory; nothing at first contact carries a *third party's* charter (rung R2′). For the accord these rows are genesis-seeded on every node; for any other root they must have replicated (or been chartered locally) before acceptance can Root anyone. | ladder: `Node::new(.., roots, chartered)` — the different-roots rung withholds R's charter until the roots meet, and a peer that lacks a root's KEY refuses its charter at admission |
 | I12 | **A stalled root still Roots the pairs already attached to it** (persist v51.0.0, CC 3.2 T7 + T4). A trust-root community below M+1 active founders is *valid but non-admitting*: `resolve_community` serves it with `live: false` (v50 returned no resolution), `trust_root_valid` deliberately ignores `live` (persist `FSD/TRUST_ROOT_RC6.md` §3; the mutant "a stalled root is invalid" is KILLED by I195), and "non-admitting" is enforced where something new is conferred — `admit_community_change` refuses a new member with `liveness_stalled_non_admitting`. `rooted_with` composes `trust_root_valid(..).valid` and reads no liveness, so two subjects attached before the stall stay Rooted; refusing them would detach the attached, which T4 forbids. Edge adds no stall gate. | persist I195 (stalled ⇒ `trust_root_valid` unchanged, new member refused); edge's `rooted_with` reads only `.valid` — no edge fixture stands up a trust-root *community* (its roots are key roots), so the community arm is persist's witness |
 
+| I13 | **An unannounced node's identity rows reach only its owner's nodes** (CIRISEdge#682, CC 5.4.6). An owned node's `IdentityOccurrence` / `TransportDestination` go to every peer iff its owner-binding is live at `federation`; otherwise only to `nodes_owned_by(owner)`, on the advertise, the fetch twin and the subject Pull, booked `identity_row_node_not_announced`. Unowned nodes and announced nodes are unchanged; the decision is read from persist, memoized per sweep. | `bridge::an_unannounced_nodes_route_reaches_only_its_owners_nodes_682` (advertise + fetch + unbound); `bridge::an_announced_nodes_route_reaches_a_stranger_682`; `bridge::the_announce_walk_is_memoized_across_peers_and_planes_682`; ladder unchanged (its owner-bindings are at `federation`) |
+| I14 | **Deployment precondition: a device learns its siblings from its owner's bindings.** An unannounced device serves its route to a sibling only once it holds `owner → sibling`. The second-device join (#683) must deliver the owner's binding to the approving device with the new device's own binding. | §2.1; to be witnessed by #683's ladder rung |
+
 ---
 
 ## 7. What is still owed (certification rungs, tracked on CIRISEdge#659)
@@ -230,6 +276,11 @@ the load-bearing rule in this document that realises it.
 
 ## 9. Change log
 
+- **CIRISEdge#682 / #678** — §2.1 the announce axis: an owned, unannounced node's occurrence and
+  route reach only its owner's nodes (advertise, fetch twin, subject Pull; ledger tokens
+  `identity_row_node_not_announced` / `identity_row_announce_unresolved`); I13, I14.
+  `SERVE_ADVERTISE_POLICY_HASH` re-pinned. The `SelfOwn` publish set may be chosen per plane
+  (`KindPublishSelector`, #678); unset, unchanged.
 - **v30.3.1 (CIRISEdge#671)** — `Reach::FirstContact`: a non-consented Attributed peer is minted a
   recipient that carries only this node's allegiance facts; production's canonical becomes
   judgeable by every agent. Ledger tokens unchanged. Ladder's shared-root rung made one-directional
