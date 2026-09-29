@@ -838,6 +838,10 @@ pub(crate) type OpaqueRequestHandlerFn = Arc<
 /// §2.2) and the waiter.
 pub(crate) struct PendingOpaqueRequest {
     destination_key_id: String,
+    /// The transport the request went out on. An answer may introduce records
+    /// only if it arrives on the same one (the #683 review: it narrows who can
+    /// attempt a substitution to parties on that medium).
+    transport: crate::transport::TransportId,
     tx: oneshot::Sender<crate::first_contact::OpaqueExchange>,
 }
 
@@ -2896,10 +2900,20 @@ impl Edge {
         use crate::messages::{OpaqueRequest, OpaqueRequestWire};
         // CIRISEdge#683 — the wire body; without a key record its bytes are
         // exactly an `OpaqueRequest`'s.
+        // CIRISEdge#683 review — a request that can be answered with
+        // introductions carries a fresh challenge, so its correlation (the body
+        // hash) cannot be computed by anyone who did not see it.
+        let challenge = key_record.as_ref().map(|_| {
+            use rand::RngCore as _;
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            hex::encode(bytes)
+        });
         let msg = OpaqueRequestWire {
             kind,
             payload,
             key_record,
+            challenge,
         };
         // Build + sign the request envelope up front so we can key the
         // pending map on its body_sha256 (the correlation token the
@@ -2911,6 +2925,9 @@ impl Edge {
             .map_err(|e| EdgeError::Config(format!("re-parse own envelope: {e}")))?;
         let correlation = envelope_body_sha256(&envelope);
 
+        if self.transports.is_empty() {
+            return Err(EdgeError::Config("no transport configured".into()));
+        }
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self
@@ -2921,6 +2938,7 @@ impl Edge {
                 correlation,
                 PendingOpaqueRequest {
                     destination_key_id: destination_key_id.to_owned(),
+                    transport: self.transports[0].id(),
                     tx,
                 },
             );
@@ -5711,14 +5729,16 @@ async fn dispatch_inbound(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(&c)
-                .is_some_and(|p| p.destination_key_id == intro_env.signing_key_id)
+                .is_some_and(|p| {
+                    p.destination_key_id == intro_env.signing_key_id && p.transport == transport
+                })
         });
         if !solicited {
             metrics.inc_first_contact("first_contact_unsolicited_introductions");
             tracing::debug!(
                 signer = %intro_env.signing_key_id,
                 "opaque answer carries introductions but answers no request of ours to \
-                 its signer; ignored (CIRISEdge#683)"
+                 its signer on this transport; ignored (CIRISEdge#683)"
             );
         } else if let Some(doors) = first_contact.doors.as_ref() {
             let mut report = crate::first_contact::IntroductionReport::default();

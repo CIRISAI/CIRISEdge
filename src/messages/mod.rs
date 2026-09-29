@@ -530,6 +530,14 @@ pub(crate) struct OpaqueRequestWire {
     pub payload: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_record: Option<ciris_persist::federation::SignedKeyRecord>,
+    /// CIRISEdge#683 review — 32 fresh random bytes (hex), present exactly
+    /// when `key_record` is. The answer's correlation is this body's hash, and
+    /// without the challenge every other field of a first-contact request is
+    /// public or guessable (the join kind, a deterministic payload, the
+    /// sender's published record), so anyone could compute it and forge a
+    /// "solicited" answer. With it, only a party that SAW the request can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge: Option<String>,
 }
 
 impl Message for OpaqueRequestWire {

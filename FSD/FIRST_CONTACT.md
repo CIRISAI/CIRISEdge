@@ -128,9 +128,11 @@ becomes Attributed at A only through its route, and §2.1 withholds B's route fr
 holds `owner → A`, which is exactly what B is asking for. So the request has to carry what A
 needs to check it.
 
-**What a first-contact request may carry.** One field and nothing else: `key_record`, the
-sender's own `SignedKeyRecord`, **self-signed** (`scrub_key_id = key_id = envelope.signing_key_id`).
-No attestation, no route, no third party's record. It is the same object a #402 bootstrap
+**What a first-contact request may carry.** Two fields and nothing else: `key_record`, the
+sender's own `SignedKeyRecord`, **self-signed** (`scrub_key_id = key_id = envelope.signing_key_id`),
+and `challenge`, 32 fresh random bytes (`OsRng`, hex), present exactly when `key_record` is. No
+attestation, no route, no third party's record. The challenge exists for the answer: see the
+requester's order below. It is the same object a #402 bootstrap
 `Deliver` carries, arriving on the opaque plane instead of the replication plane.
 
 **The receiver's order (A).** All of it runs *before* the envelope verify, because the verify
@@ -176,8 +178,20 @@ The host adds `owner → A` (A's owner-binding), the owner's key record, and `ow
 mints that binding. Only the host can mint it, because it depends on the person approving the join.
 
 **The requester's order (B).** B admits introductions only from a **solicited** answer: its
-`in_reply_to` matches a request B sent, and B sent that request to the key that signed the answer.
-Anything else is ignored.
+`in_reply_to` matches a request B sent, B sent that request to the key that signed the answer, and
+the answer arrived on the transport the request went out on. Anything else is ignored and counted
+`first_contact_unsolicited_introductions`.
+
+Why the request carries a challenge. The correlation is the request body's hash, and the solicited
+check reads it off a frame nobody has verified yet. Without the challenge every field of a join
+request is public or guessable: the join kind is fixed, the payload is often deterministic, and
+the key record is the sender's published row. Anyone could compute the correlation and forge an
+answer that introduces a record *claiming* A's `key_id` with the attacker's keys. That record
+passes proof of possession (see I19), and the attacker signs the answer with those keys. With 32
+random bytes in the body, only a party that saw the request can name it. The path check is the
+second belt: an answer must come back on the medium the request left on. Only the transport is
+checked, not the link: edge sends by key and never learns which link the transport picked, and
+recording it would be new machinery.
 
 1. Keys, **before** verifying the answer, since the responder's key may be among them: known
    keys are skipped; each unknown one goes through the same PoP and Key door as step 3–4 above.
@@ -313,6 +327,7 @@ before — minus the four rows that now cross.
 | I16 | **An unknown key without a record is dropped exactly as before.** | `first_contact_opaque_683::an_unknown_key_without_a_record_is_dropped_as_before_683` |
 | I17 | **An opaque answer rides the path its request arrived on**, and falls back to the by-key send only when that path is gone. | `first_contact_opaque_683::a_never_peered_device_with_its_key_record_is_verified_handled_and_answered_on_its_path_683` (the path is asserted); `reticulum_loopback::a_never_peered_device_is_answered_on_the_link_it_opened_683` (end to end over Reticulum; the #627 on-link announce also binds the link there, so this one does not distinguish the path) |
 | I18 | **A requester admits introductions only from a solicited answer** (its `in_reply_to` matches a request it sent to the answer's signer), keys by proof of possession before the verify and attestations through the replication apply door after it. | `first_contact_opaque_683::an_unsolicited_answer_introduces_nothing_683`, `…::the_answer_introductions_land_at_the_requester_683` |
+| I19 | **The remaining limit is on-path trust on first use.** A device cannot tell the true holder of a `key_id` it has never seen. persist binds the `key_id` inside the registration envelope and checks the self-signature against the record's own public keys, but never derives `key_id` from the public key, so a self-signed record may claim any `key_id`. The challenge (off-path parties cannot name the request) and the path check (the answer must arrive on the request's medium) narrow who can attempt the substitution to a party that saw the request on that medium; neither prevents it. Closing it needs the key id to be derivable from the key (a persist change) or an out-of-band commitment to the first device's key (the pairing code). | `first_contact_opaque_683::a_forged_answer_built_from_public_material_introduces_nothing_683` (the off-path half; fails on the pre-challenge code, where the forged record was admitted as the first device's key) |
 
 ---
 
@@ -358,7 +373,9 @@ the load-bearing rule in this document that realises it.
   envelope verify. Every opaque answer rides the path its request arrived on (a reply path the
   transport stamps on the inbound frame; Reticulum uses the link id). A first-contact answer
   carries `introductions`, which the requester admits only from a solicited answer. Ledger:
-  `first_contact_outcomes`. I15–I18; I14 witnessed.
+  `first_contact_outcomes`. I15–I19; I14 witnessed. Review: a key-carrying request also carries a
+  random `challenge`, so an off-path attacker cannot compute the correlation, and introductions are
+  admitted only from an answer on the request's transport. I19 records the on-path TOFU limit.
 - **CIRISEdge#682 / #678** — §2.1 the announce axis: an owned, unannounced node's occurrence and
   route reach only its owner's nodes (advertise, fetch twin, subject Pull; ledger tokens
   `identity_row_node_not_announced` / `identity_row_announce_unresolved`); I13, I14.

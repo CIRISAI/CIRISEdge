@@ -86,6 +86,8 @@ struct Minted {
     key_id: String,
     record: KeyRecord,
     signer: Arc<LocalSigner>,
+    classical: Arc<dyn ciris_keyring::HardwareSigner>,
+    pqc: Arc<dyn ciris_keyring::PqcSigner>,
 }
 
 async fn mint(alias: &str, seed: u8) -> Minted {
@@ -118,9 +120,15 @@ async fn mint(alias: &str, seed: u8) -> Minted {
         .expect("read back")
         .expect("minted record exists");
     Minted {
-        signer: Arc::new(LocalSigner::new(key_id.clone(), classical, Some(pqc))),
+        signer: Arc::new(LocalSigner::new(
+            key_id.clone(),
+            Arc::clone(&classical),
+            Some(Arc::clone(&pqc)),
+        )),
         key_id,
         record,
+        classical,
+        pqc,
     }
 }
 
@@ -521,4 +529,159 @@ async fn an_unsolicited_answer_introduces_nothing_683() {
         outcome(&edge_c, "first_contact_unsolicited_introductions"),
         1
     );
+}
+
+/// A self-signed record that CLAIMS `claimed_key_id` but carries `attacker`'s
+/// keys. persist binds the key_id inside the registration envelope and checks
+/// the self-signature against the record's own pubkeys; it never derives the
+/// key_id from the pubkey, so this passes proof of possession.
+async fn forge_record(attacker: &Minted, claimed_key_id: &str) -> KeyRecord {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let mut record = attacker.record.clone();
+    record.key_id = claimed_key_id.to_owned();
+    record.scrub_key_id = claimed_key_id.to_owned();
+    record.identity_ref = claimed_key_id.to_owned();
+    ciris_persist::federation::admission::bind_subject_into_envelope(
+        &mut record.registration_envelope,
+        claimed_key_id,
+        &record.identity_type,
+        &record.pubkey_ed25519_base64,
+        record.pubkey_ml_dsa_65_base64.as_deref(),
+        None,
+    )
+    .expect("bind");
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&record.registration_envelope)
+        .expect("canonicalize");
+    record.original_content_hash = hex::encode(sha2::Sha256::digest(&canonical));
+    let ed = attacker.classical.sign(&canonical).await.expect("ed sign");
+    let mut bound = canonical.clone();
+    bound.extend_from_slice(&ed);
+    let pq = attacker.pqc.sign(&bound).await.expect("pqc sign");
+    record.scrub_signature_classical = b64.encode(&ed);
+    record.scrub_signature_pqc = Some(b64.encode(&pq));
+    record.persist_row_hash = String::new();
+    record
+}
+
+/// The review finding on #714. An attacker who never saw the new device's
+/// request forges the first device's answer from public material only: the
+/// fixed join kind, a guessed payload, and the new device's published record
+/// give the correlation; a self-signed record CLAIMING the first device's
+/// key_id (with the attacker's keys) passes proof of possession; and the answer
+/// is signed with those keys. Without a per-request challenge the requester
+/// admitted that record before any verify, and trusted the attacker as its
+/// owner's device. With the challenge the guessed correlation answers nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forged_answer_built_from_public_material_introduces_nothing_683() {
+    let p = pair(false).await;
+    let attacker = mint("attacker", 0x6f).await;
+
+    let (edge_b, a_id) = (Arc::clone(&p.edge_b), p.a.key_id.clone());
+    let ask = tokio::spawn(async move {
+        edge_b
+            .send_opaque_request_introducing(&a_id, JOIN, b"join".to_vec(), 5_000)
+            .await
+    });
+    // The request goes to the real first device; the attacker never sees it.
+    let _unseen = wait_sent(&p.t_b).await;
+
+    // The attacker's guess at the correlation: the body hash of what a join
+    // request from B would contain, built from public material only.
+    let guessed = ciris_edge::identity::build_envelope(
+        MessageType::OpaqueRequest,
+        &p.b.key_id,
+        &p.a.key_id,
+        &CarriedReq {
+            kind: JOIN,
+            payload: b"join".to_vec(),
+            key_record: SignedKeyRecord {
+                record: p.b.record.clone(),
+            },
+        },
+        None,
+    )
+    .expect("guess");
+    let correlation = ciris_edge::identity::envelope_body_sha256(&guessed);
+
+    // The forged answer: signed by the attacker's keys under A's key_id, and
+    // introducing the attacker's record as A's.
+    let forged = forge_record(&attacker, &p.a.key_id).await;
+    let mut answer = OpaqueAnswer::from(OpaqueResponse {
+        kind: JOIN,
+        status: 200,
+        payload: b"welcome".to_vec(),
+    });
+    answer.introductions.keys = vec![SignedKeyRecord { record: forged }];
+    let body = serde_json::json!({
+        "kind": JOIN,
+        "status": 200,
+        "payload": b"welcome".to_vec(),
+        "introductions": answer.introductions,
+    });
+    let mut env = ciris_edge::identity::build_envelope(
+        MessageType::OpaqueResponse,
+        &p.a.key_id,
+        &p.b.key_id,
+        &body,
+        Some(correlation),
+    )
+    .expect("forged answer");
+    let impostor = LocalSigner::new(
+        p.a.key_id.clone(),
+        Arc::clone(&attacker.classical),
+        Some(Arc::clone(&attacker.pqc)),
+    );
+    ciris_edge::identity::sign_envelope(&impostor, &mut env)
+        .await
+        .expect("sign");
+    p.edge_b
+        .dispatch_inbound_for_test(frame(serde_json::to_vec(&env).unwrap(), None))
+        .await;
+
+    assert!(
+        !holds(&p.dir_b, &p.a.key_id).await,
+        "the attacker's record was admitted as the first device's key"
+    );
+    assert_eq!(
+        outcome(&p.edge_b, "first_contact_unsolicited_introductions"),
+        1,
+        "the guessed correlation answers no request of ours"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), ask)
+            .await
+            .is_err(),
+        "the forged answer did not resolve the join"
+    );
+}
+
+/// The review's path check: the genuine answer, arriving on a transport the
+/// request did not go out on, introduces nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_on_another_transport_introduces_nothing_683() {
+    let p = pair(false).await;
+    let _seen = answer_joins(&p.edge_a, Vec::new());
+    let (edge_b, a_id) = (Arc::clone(&p.edge_b), p.a.key_id.clone());
+    let ask = tokio::spawn(async move {
+        edge_b
+            .send_opaque_request_introducing(&a_id, JOIN, b"join".to_vec(), 5_000)
+            .await
+    });
+    let request = wait_sent(&p.t_b).await;
+    p.edge_a
+        .dispatch_inbound_for_test(frame(request.bytes, Some(ReplyPath::new(TID, LINK))))
+        .await;
+    let answer = wait_sent(&p.t_a).await;
+    let mut elsewhere = frame(answer.bytes, None);
+    elsewhere.transport = TransportId("some-other-medium");
+    p.edge_b.dispatch_inbound_for_test(elsewhere).await;
+
+    assert!(!holds(&p.dir_b, &p.a.key_id).await);
+    assert_eq!(
+        outcome(&p.edge_b, "first_contact_unsolicited_introductions"),
+        1
+    );
+    ask.abort();
 }
