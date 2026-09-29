@@ -339,6 +339,7 @@ async fn the_documented_file_and_self_room_shapes_typecheck() {
             room: &room,
             bytes: b"bytes",
             media_type: "text/plain",
+            codec: None,
             filename: Some("boat.jpg"),
             asserted_at: chrono::Utc::now(),
         },

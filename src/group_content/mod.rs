@@ -58,8 +58,8 @@ pub mod store;
 
 pub use persist_store::PersistGroupContentStore;
 pub use store::{
-    aad_for_open, aad_for_seal, GroupContentError, GroupContentStore, OpenRequest, SealRequest,
-    SealedContent,
+    aad_for_open, aad_for_seal, Description, GroupContentError, GroupContentStore, OpenRequest,
+    SealRequest, SealedContent,
 };
 
 use serde::{Deserialize, Serialize};
@@ -209,6 +209,36 @@ pub struct BlobPointer {
     /// docs for why it is here and why it is not an AAD input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epoch: Option<u64>,
+    /// CIRISEdge#698 — the codec, in clear. Present only beside a clear
+    /// [`Self::media_type`] (plaintext tier); never beside a seal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    /// CIRISEdge#698 / CC 3.3.13 — base64 (standard) of the `AtRestEnvelope`
+    /// sealing `{name?, format, codec?}` under **the bytes' own DEK**, AAD =
+    /// the blob's address digest (persist `seal_descriptor_for_blob`).
+    /// Encrypted tiers only; its presence means no clear `media_type`,
+    /// `codec` or row `filename` — two descriptions are refused by name.
+    ///
+    /// Lives inside edge's `content` pointer, not a top-level `media`
+    /// member: persist v50 readers refuse a sealed `media` struct, so the
+    /// mixed-fleet rule (§6.7.1) keeps it here until every reader runs v51.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_descriptor: Option<String>,
+    /// CIRISEdge#698 / CC 5.3.2.5 — the plaintext size in bytes, in clear:
+    /// every holder checks it before hashing, and a self/family file emits
+    /// no `holds_bytes` row a reader could learn it from. `None` on a
+    /// pointer written before #698.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// CIRISEdge#698 / CC 3.3.13 — hex SHA-256 of the PLAINTEXT, in clear,
+    /// in the encrypted (two-hash) case; `content_sha256` is the at-rest
+    /// address. `None` at the plaintext tier, where the two are one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+    /// CIRISEdge#698 — an optional thumbhash, in clear when present; images
+    /// only, and never fabricated for a file that has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
 }
 
 /// Serde default for [`BlobPointer::tier`] — a pointer written before the
@@ -377,6 +407,11 @@ mod tests {
             media_type: None,
             stream_id: None,
             epoch: None,
+            codec: None,
+            sealed_descriptor: None,
+            size: None,
+            content_digest: None,
+            placeholder: None,
         };
         let after_widening = BlobPointer {
             community_key_id: "community-b".into(),
@@ -410,6 +445,11 @@ mod tests {
             media_type: Some("text/plain".into()),
             stream_id: None,
             epoch: None,
+            codec: None,
+            sealed_descriptor: None,
+            size: None,
+            content_digest: None,
+            placeholder: None,
         };
         assert!(!whole.is_chunked());
 
@@ -432,6 +472,11 @@ mod tests {
             media_type: None,
             stream_id: None,
             epoch: None,
+            codec: None,
+            sealed_descriptor: None,
+            size: None,
+            content_digest: None,
+            placeholder: None,
         };
         let json = serde_json::to_string(&p).expect("serialize");
         for forbidden in ["epoch", "author", "asserted_at"] {
@@ -452,6 +497,11 @@ mod tests {
             media_type: Some("video/mp4".into()),
             stream_id: Some("w-01JBQ".into()),
             epoch: None,
+            codec: None,
+            sealed_descriptor: None,
+            size: None,
+            content_digest: None,
+            placeholder: None,
         };
         let json = serde_json::to_string(&p).expect("serialize");
         let back: BlobPointer = serde_json::from_str(&json).expect("deserialize");
