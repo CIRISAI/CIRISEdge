@@ -703,16 +703,15 @@ impl FileRow {
     #[must_use]
     pub fn descriptor(&self) -> Descriptor {
         match (&self.pointer.sealed_descriptor, &self.media_type) {
-            (Some(_), _) => Descriptor::Sealed,
             (None, Some(format)) => Descriptor::Clear {
                 format: format.clone(),
                 codec: self.codec.clone(),
                 name: self.filename.clone(),
             },
             // `try_from_row` refuses a row with neither, so a FileRow built
-            // by it never lands here; a hand-built one reads as sealed —
-            // the side that shows nothing.
-            (None, None) => Descriptor::Sealed,
+            // by it never reaches `(None, None)`; a hand-built one reads as
+            // sealed — the side that shows nothing.
+            (Some(_), _) | (None, None) => Descriptor::Sealed,
         }
     }
 
@@ -786,33 +785,33 @@ impl FileRow {
         viewer_key_id: &str,
     ) -> Result<Opened, UnopenedReason> {
         let bytes = self.open(store, viewer_key_id).await?;
-        let descriptor = match &self.pointer.sealed_descriptor {
-            None => self.descriptor(),
-            Some(_) => {
-                let jcs = store
-                    .open_descriptor(&self.pointer, viewer_key_id)
-                    .await
-                    .map_err(|e| UnopenedReason::from_store_error(&e))?;
-                let opened: SealedDescription =
-                    serde_json::from_slice(&jcs).map_err(|e| UnopenedReason::MalformedRow {
-                        detail: format!(
-                            "{}: the sealed descriptor opened to something other than                              {{name?, format, codec?}}: {e}",
-                            self.attestation_id
-                        ),
-                    })?;
-                if opened.name.as_deref() == Some("") {
-                    return Err(UnopenedReason::MalformedRow {
+        let descriptor = if self.pointer.sealed_descriptor.is_none() {
+            self.descriptor()
+        } else {
+            let jcs = store
+                .open_descriptor(&self.pointer, viewer_key_id)
+                .await
+                .map_err(|e| UnopenedReason::from_store_error(&e))?;
+            let opened: SealedDescription =
+                serde_json::from_slice(&jcs).map_err(|e| UnopenedReason::MalformedRow {
+                    detail: format!(
+                        "{}: the sealed descriptor opened to something other than \
+                             {{name?, format, codec?}}: {e}",
+                        self.attestation_id
+                    ),
+                })?;
+            if opened.name.as_deref() == Some("") {
+                return Err(UnopenedReason::MalformedRow {
                         detail: format!(
                             "{}: an empty name inside the seal — absent is omitted, never an empty string",
                             self.attestation_id
                         ),
                     });
-                }
-                Descriptor::Opened {
-                    format: opened.format,
-                    codec: opened.codec,
-                    name: opened.name,
-                }
+            }
+            Descriptor::Opened {
+                format: opened.format,
+                codec: opened.codec,
+                name: opened.name,
             }
         };
         Ok(Opened { bytes, descriptor })
@@ -841,7 +840,8 @@ pub enum NotAFile {
     NoPointer,
     /// A `sealed_descriptor` beside clear description members (D4).
     #[error(
-        "{attestation_id}: two descriptions — a sealed descriptor beside clear {clear:?};          refused, because which one is true cannot be known"
+        "{attestation_id}: two descriptions — a sealed descriptor beside clear {clear:?}; \
+         refused, because which one is true cannot be known"
     )]
     TwoDescriptions {
         /// The row.
@@ -1278,8 +1278,8 @@ mod tests {
         ));
     }
 
-    /// D5 (CIRISEdge#698) — read-compat: the v32 row shape (clear filename
-    /// + media_type, no seal, no size) still lists, with a `Clear`
+    /// D5 (CIRISEdge#698) — read-compat: the v32 row shape (a clear filename
+    /// and media type, no seal, no size) still lists, with a `Clear`
     /// descriptor. The vector is the exact pre-#698 pointer.
     #[test]
     fn a_v32_row_still_opens() {

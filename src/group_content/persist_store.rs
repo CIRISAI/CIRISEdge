@@ -573,7 +573,9 @@ impl PersistGroupContentStore {
             }
         }
         Err(GroupContentError::Substrate(format!(
-            "sealed {} but could not seal its descriptor: no key this node unwraps for opens              the blob's DEK (tried {candidates:?}; last: {}) — CC 3.3.13 forbids the clear              fallback",
+            "sealed {} but could not seal its descriptor: no key this node unwraps for opens \
+             the blob's DEK (tried {candidates:?}; last: {}) — CC 3.3.13 forbids the clear \
+             fallback",
             hex::encode(at_rest_sha256),
             last.unwrap_or_else(|| "no candidate".to_owned())
         )))

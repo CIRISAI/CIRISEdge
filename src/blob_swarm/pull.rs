@@ -252,6 +252,30 @@ pub enum PullOutcome {
     SizeMismatch { declared: u64, received: u64 },
 }
 
+/// The declared-size check (CIRISEdge#638 item 2): the hash already matched,
+/// so a length that is not the declared one is the ROW misdescribing its
+/// bytes — refused, never adopted.
+fn size_refusal(
+    row: &Attestation,
+    blob_hex: &str,
+    meaning: &BlobMeaning,
+    received_len: usize,
+) -> Option<PullOutcome> {
+    let declared = meaning.pointer().and_then(declared_stored_len)?;
+    let received = received_len as u64;
+    if received == declared {
+        return None;
+    }
+    tracing::warn!(
+        blob = %blob_hex,
+        attestation_id = %row.attestation_id,
+        declared,
+        received,
+        "pull refused: the bytes are not the size the row declares (CC 5.3.2.5)"
+    );
+    Some(PullOutcome::SizeMismatch { declared, received })
+}
+
 /// **The stored length a pointer's declared `size` implies** (CIRISEdge#638
 /// item 2) — `None` when the row declares none (pre-#698) or the pointer is
 /// a chunk DAG (its manifest pins `total_size` per chunk already, and the
@@ -745,20 +769,9 @@ where
         };
 
         // CIRISEdge#638 item 2 (CC 5.3.2.5): the row's declared size, checked
-        // before anything is stored. The hash already matched, so a mismatch
-        // here is the ROW misdescribing its bytes — refused, never adopted.
-        if let Some(declared) = meaning.pointer().and_then(declared_stored_len) {
-            let received = bytes.len() as u64;
-            if received != declared {
-                tracing::warn!(
-                    blob = %blob_hex,
-                    attestation_id = %row.attestation_id,
-                    declared,
-                    received,
-                    "pull refused: the bytes are not the size the row declares (CC 5.3.2.5)"
-                );
-                return PullOutcome::SizeMismatch { declared, received };
-            }
+        // before anything is stored.
+        if let Some(refused) = size_refusal(row, &blob_hex, &meaning, bytes.len()) {
+            return refused;
         }
 
         // Store, through the door the gate's verdict names.
