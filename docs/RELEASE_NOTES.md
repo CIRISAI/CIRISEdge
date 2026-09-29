@@ -1,5 +1,86 @@
 # CIRISEdge Release Notes
 
+# v33.1.0 — files::rename, and adopt persist v51.1.0 (the custody view)
+
+**2026-09-29** (CIRISEdge#702 server ask, PR #711; CIRISPersist#942 → v51.1.0 at `3488557`).
+**MINOR** from v33.0.0. It adds `files::rename`, adopts persist v51.1.0, and adds the custody view
+that persist version exposes. Every public API change is additive. Ladder triple: **edge v33.1.0 ·
+persist v51.1.0 · verify v18.0.0**. The graph has one `ciris-persist`, and one each of
+`ciris-verify-core`, `ciris-keyring` and `ciris-crypto`.
+
+## The pins
+
+| | v33.0.0 | v33.1.0 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v51.0.0"` → `d7f3a40` | `tag = "v51.1.0"` (`version = "51"`) → `3488557328` |
+| ciris-persist (wheel floor) | `>=51,<52` | **`>=51.1,<52`** (edge calls `blob_custody`, which v51.0 lacks) |
+| CIRISVerify crates | `v18.0.0` | `v18.0.0` (persist did not move it) |
+| `DIRECTORY_ABI_VERSION` / signer / outbound / executor ABI | 6 / 1 / 1 / 1 | unchanged |
+| `REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH`, `TRANSFORM_ALGEBRA_HASH`, manifest `0.3.0`, `ENVELOPE_VOCABULARY_SHA256` | — | unchanged (diffed from source at the tag) |
+
+**Riders:** move the wheel floor to `>=51.1`. No rider hash needs re-pinning.
+
+## `files::rename` (#702, FSD/CONTENT_TRANSFER.md §6.7.2)
+
+```rust
+files::rename(directory, store, signers, room, old: &FileRow, new_name: Option<&str>, replaces: &str)
+    -> Result<PublishedFile, FileError>
+```
+
+- **Nothing is written to the bytes.** The new `file:v1` row points at the same blob, and only the
+  description changes.
+- **The AAD rule.** The new row keeps `old`'s `attesting_key_id` and `asserted_at`, because the
+  bytes' AAD names both. The rename signs its own time as the envelope member `renamed_at`, which
+  follows the pattern of persist's `widened_at`. So `open` and `describe` are unchanged, and a
+  same-name rename cannot collide with the row it replaces.
+- **The descriptor is re-sealed.** `GroupContentStore::redescribe` is new, and its default refuses.
+  It opens the current description as this node, under the prior row's AAD. It then swaps `name`,
+  keeps `format` and `codec`, and re-seals through `seal_descriptor_for_blob`. At the plaintext
+  tier the new name goes in clear on the row instead.
+- **`replaces` is a CC 2 `supersedes` by the same attester.** It is created at federation tier,
+  like withdraw's `withdraws`, and has the shape `{references_attestation_id, supersession_reason:
+  "rename", differs_in: ["name"], replacement_attestation_id}`. It is written only after the new
+  row has crossed, and `replaces` must name `old`'s file in the same room over the same blob. The
+  drive's Live listing shows the new row; `IncludeSuperseded` also shows the prior, as
+  `Superseded`, still carrying its old name.
+- **Only the author can rename.** Rename uses `FileRow::author_signer`. The #941 owner fallback does
+  **not** apply: persist lifts rule 1 for `withdraws` only, a `supersedes` must come from the same
+  attester, and the byte AAD names that attester. The owner of a node that authored a file gets
+  `NotAuthor`; to change the name they withdraw the file and publish it again.
+- **RN4 finding (by design, and pinned):** the old row and the new row present the same row AAD.
+  As a result, the renamed descriptor also opens under the old row's columns. What tells two rows
+  of one claim apart is their signatures and their lifecycle, not the AEAD. Against any other
+  author, any other instant or any other blob, it is refused crypto-class, exactly as under D8.
+  Binding a descriptor to a single row would need a caller AAD on `seal_descriptor_for_blob`, and
+  CC 3.3.13 does not call for one.
+- **Noted, not fixed:** persist's Live view and edge's `lifecycle_of` hide a composer's target only
+  when the composer has the same attester. A #941 owner-`withdraws` is therefore admitted, but the
+  file it withdraws still lists as Live.
+
+## The custody view (CIRISPersist#942)
+
+`FileRow::custody(store, viewer)` calls the new default-refusing `GroupContentStore::custody`,
+which reaches `Engine::blob_custody`. It reports tier, size, whether this node holds the bytes,
+access per person, announced holders and `copies_observable`. For `self` and `family`,
+`copies_observable` is always false: copies elsewhere cannot be seen by design.
+
+- The view describes the blob, not a row. So a renamed row gets the same answer as the row it
+  replaced.
+- A viewer who cannot open the bytes gets `NotGranted`.
+- It goes through the store so that hosts keep one handle and one error type.
+
+## Witnesses
+
+These run on real sqlite, in `tests/blob_federation_e2e.rs::files`:
+
+- RN1 `a_renamed_file_lists_under_its_new_name_over_the_same_bytes`
+- RN2 + RN5 `a_stranger_cannot_rename`
+- RN3 `a_plaintext_rename_rides_in_clear`
+- RN4 `a_renamed_descriptor_opens_only_under_the_claims_binding`
+- `a_files_custody_is_its_blobs_and_a_rename_does_not_move_it`
+
+RN1 and RN3 fail when the `supersedes` write is removed.
+
 # v33.0.0 — adopt persist v51.0.0 + CIRISVerify 18.0.0: a file's name opens only with its bytes, the owner retracts what their node wrote, the relay-delivery score admits
 
 **2026-09-29** (CIRISPersist#943 → v51.0.0 at `d7f3a40`; CIRISVerify v18.0.0; CIRISConstitution#129 rc6 `651140a`;

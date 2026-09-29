@@ -627,7 +627,7 @@ owner's laptop could not be withdrawn from their phone.
   the id preimage all read that one value, so the seal and the row can never name different
   authors (a mismatch would make every read fail). #698's sealed descriptor composes on the same
   value.
-- **Author-only operations** (withdraw; a replace/rename is a `supersedes` by the same rule) are
+- **Author-only operations** (withdraw; a rename is a `supersedes` by the same rule, §6.7.2) are
   authorized by the **row's attester**: `FileRow::author_signer(signers)` returns whichever signer
   in hand IS that attester, else `FileError::NotAuthor`. For an actor-authored row that is the
   owner's fed-ID signer, which every device of the owner holds — so any of the owner's devices
@@ -854,6 +854,96 @@ COUNT, never the chunk size.
 needs `adopt_sealed_chunk` per chunk against the manifest, under the same store gate. Until that
 lands a DAG is written, listed and opened on the node that sealed it, and a far node reads
 `not_fetched` — the honest state, not a silent gap. Tracked on CIRISEdge#633.
+
+#### 6.7.2 Rename — a new row over the same bytes (CIRISEdge#702, the server's ask)
+
+A rename changes what a file is *called*, never what it *is*. So it writes **no byte**: the new row
+points at the **same blob** (same `content_sha256`, same tier / community / epoch, same `size` and
+`content_digest`), and only the description changes. `files::rename(directory, store, signers, room,
+old, new_name, replaces) -> Result<PublishedFile, FileError>`.
+
+**The AAD rule — the byte binding is the claim's, and it does not move.** The bytes were sealed
+under `content_aad(author, asserted_at, Body)` of the row that wrote them, and GCM does not let a
+second row re-bind them. So the new row carries **the old row's `attesting_key_id` and the old
+row's `asserted_at`** — the instant of the *content claim*, exactly as persist's widening keeps the
+prior's `asserted_at` (CIRISPersist#801) — and the rename act gets its own signed instant,
+**`renamed_at`**, beside it (persist's `widened_at` pattern). Consequences, each deliberate:
+
+- `FileRow::open` / `describe` are **unchanged**: the new row's two AAD inputs are the old row's,
+  read off the row as always. No pointer member duplicates them (§7's rule: a second copy is one
+  that can disagree).
+- The rows' ids differ even for a same-name rename (`renamed_at` is in the id preimage), so a
+  rename can never collide with — and supersede — itself.
+- The new row lists where the old one did (newest-first is by `asserted_at`, the claim's instant).
+- The byte AAD names the attester, so **only the attester can rename** (below).
+
+**The descriptor is re-sealed over the same blob.** Encrypted tier: the store opens the current
+description as this node (through the descriptor door, which authenticates the blob under the
+row's AAD first — a pointer that does not open under `old` cannot be renamed), replaces `name`
+(`None` = the file becomes nameless, D10's shape), keeps `format` and `codec`, and seals
+`{name?, format, codec?}` again with persist's `seal_descriptor_for_blob` — the bytes' own DEK,
+AAD = the address digest, as §6.7.1 rules. A pre-#698 encrypted row (clear `format`, no seal) is
+upgraded on rename: its clear format and codec move inside the seal and leave the pointer. Plaintext
+tier: nothing is sealed; the new name rides the row's clear `filename` and the format stays clear
+on the pointer (#698's rule). The store makes that choice from the pointer's recorded tier, as the
+write does (`GroupContentStore::redescribe`); the producer never does, and no host ever handles the
+descriptor's JCS.
+
+**What the descriptor is bound to, stated exactly.** The descriptor's AAD is the blob's address
+digest (CC 3.3.13), and persist's door releases it only under a row AAD that authenticates the
+blob. The old and new rows present the **same** row AAD by the rule above, so the new descriptor
+*does* authenticate under the old row's columns, and vice versa — the AEAD cannot tell two rows of
+one claim apart, and nothing here pretends it can. What binds a descriptor to *its* row is the
+row's **signature** (each row signs its own `content` pointer; only the attester can put a
+descriptor on a row presenting that binding) and the **lifecycle** (the old row is superseded).
+Against everyone else D8 holds unchanged: the renamed descriptor under any other row binding —
+another author, another instant — or on another blob is refused at the door, crypto-class. A
+descriptor bound per ROW would need a caller AAD on `seal_descriptor_for_blob`, which CC 3.3.13
+does not rule; nothing is asked for, because the signature already carries that binding.
+
+**`replaces` is a `supersedes`** (CC 2: *this attestation row replaces a prior one by the same
+attester*, `{references_attestation_id, supersession_reason, differs_in[]}`). The replacement body
+travels as its own `file:v1` row, authored and crossed exactly as `publish` crosses (§6.7.0: the
+actor signs, the node co-scrubs), and a **`supersedes` composer** by the same attester, born
+federation-tier like `files::withdraw`'s `withdraws`, retires the prior:
+`references_attestation_id = replaces`, `supersession_reason = "rename"`, `differs_in = ["name"]`,
+`replacement_attestation_id = the new row's id` (the composer + separate replacement shape persist's
+own vocabulary sweep emits). It is the composer, not the new row, that must reach every holder of
+the prior: a room's members hold the prior's *widening*, never the authored row, so only a
+federation-born composer naming the row the room holds retires it there. persist's `Live` read
+hides a row a same-attester `supersedes` references, and edge's `lifecycle_of` reads it as
+`FileLifecycle::Superseded`, so `in_room` lists the new row and `IncludeSuperseded` lists both.
+`replaces` must name a file row **of this room, by the same attester, over the same blob** as
+`old`, or the rename is refused — a replacement must replace its own (persist v42's rule for
+config `supersedes`). The composer is written **only after the new row crossed**: a parked
+crossing (`PublishedFile::crossed == false`) leaves the old file live rather than retiring it in
+favour of a row nobody else holds.
+
+**Author only — and why #941 does not reach it.** Authorized by `FileRow::author_signer` exactly as
+withdraw. The #941 owner rule does **not** extend to rename: persist lifts *withdraws* rule 1 to
+the producer's principal, but a `supersedes` is by the same attester (CC 2; persist's `Live` fold
+compares attesters), and the byte AAD names the attester — an owner signing as herself would
+write a row whose AAD opens nothing. So the owner of a node that authored a file gets
+`FileError::NotAuthor`; her path is `withdraw` (#941) and `publish` again. (A read-side gap found
+on the way, reported not fixed here: persist's `Live` view and `lifecycle_of` both hide a composer
+target only for a **same-attester** composer, so a #941 owner-`withdraws` is admitted and listed
+`Live` still.)
+
+| # | Invariant | Witness |
+|---|---|---|
+| RN1 | A renamed sealed self file lists once, under the new name, for the owner; its bytes are byte-identical and the pointer names the same blob; the old row is `Superseded` and listed only under `IncludeSuperseded`, still opening its old name | `files::a_renamed_file_lists_under_its_new_name_over_the_same_bytes` (self + community) |
+| RN2 | A stranger cannot rename (`NotAuthor`), and nothing is written | `files::a_stranger_cannot_rename` |
+| RN3 | A plaintext-tier rename rides in clear: the new name on the row, the format on the pointer, nothing sealed | `files::a_plaintext_rename_rides_in_clear` |
+| RN4 | The renamed descriptor opens under no other binding — another instant, another author, another blob — and does open under the claim's own binding (by the rule above) | `files::a_renamed_descriptor_opens_only_under_the_claims_binding` |
+| RN5 | `replaces` naming a file of another blob is refused | inside RN2's witness |
+
+**The custody view (persist v51.1.0, CIRISPersist#942).** `FileRow::custody(store, viewer)` →
+persist's `Engine::blob_custody` through `GroupContentStore::custody`: tier, size, held-here, access
+per person, announced holders, `copies_observable` (false at `self`/`family` by design). It is
+about the **blob**, not the row — no row AAD, no description — so every row over one blob, a
+rename's included, gets the same answer; a viewer who cannot open the bytes is `NotGranted`. It
+goes through the store rather than persist directly so a host holds one handle and one error type
+for the whole drive. Witness: `files::a_files_custody_is_its_blobs_and_a_rename_does_not_move_it`.
 
 ### 6.8 The drive read is a gated query (CIRISPersist#891 — shipped v46.4.0, adopted v30.0.0)
 

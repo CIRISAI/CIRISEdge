@@ -59,7 +59,7 @@ pub mod store;
 pub use persist_store::PersistGroupContentStore;
 pub use store::{
     aad_for_open, aad_for_seal, Description, GroupContentError, GroupContentStore, OpenRequest,
-    SealRequest, SealedContent,
+    RedescribeRequest, SealRequest, SealedContent,
 };
 
 use serde::{Deserialize, Serialize};

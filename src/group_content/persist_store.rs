@@ -462,6 +462,85 @@ impl GroupContentStore for PersistGroupContentStore {
             .await
             .map_err(|e| map_err(sha_hex, &e))
     }
+
+    async fn custody(
+        &self,
+        pointer: &BlobPointer,
+        viewer_key_id: &str,
+    ) -> Result<ciris_persist::federation::blob_custody::BlobCustody, GroupContentError> {
+        let (sha_hex, sha) = pointer_sha(pointer)?;
+        self.engine
+            .blob_custody(&sha, viewer_key_id)
+            .await
+            .map_err(|e| map_err(sha_hex, &e))
+    }
+
+    async fn redescribe(
+        &self,
+        req: super::RedescribeRequest<'_>,
+    ) -> Result<crate::group_content::BlobPointer, GroupContentError> {
+        use base64::Engine as _;
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        let mut pointer = req.pointer.clone();
+        // The tier the write recorded decides, as it did for the write
+        // (§6.7.1): plaintext carries its description in clear, and the name
+        // is the row's.
+        if pointer.tier == CryptoTier::Plaintext {
+            return Ok(pointer);
+        }
+        let (sha_hex, sha) = pointer_sha(req.pointer)?;
+        // This node reads as its own derived key — the node-class occurrence
+        // the write's describe tried first. A node that cannot open the
+        // description cannot rename it.
+        let own = self.engine.local_derived_key_id().await.map_err(|e| {
+            GroupContentError::Substrate(format!("derive this engine's key id: {e}"))
+        })?;
+        let open = OpenRequest {
+            pointer: req.pointer,
+            author_key_id: req.author_key_id,
+            asserted_at: req.asserted_at,
+            viewer_key_id: &own,
+        };
+        let (format, codec) = if req.pointer.sealed_descriptor.is_some() {
+            let jcs = self.open_descriptor(open).await?;
+            let current: crate::files::SealedDescription =
+                serde_json::from_slice(&jcs).map_err(|e| {
+                    GroupContentError::Substrate(format!(
+                        "{sha_hex}: the sealed descriptor is not {{name?, format, codec?}}: {e}"
+                    ))
+                })?;
+            (current.format, current.codec)
+        } else {
+            // A pre-#698 pointer: the format rode in clear. Authenticate the
+            // blob under the prior row first — a pointer that does not open
+            // under its row is not renamed.
+            self.open(open).await?;
+            let format = pointer.media_type.clone().ok_or_else(|| {
+                GroupContentError::Substrate(format!(
+                    "{sha_hex}: neither a sealed nor a clear description to rename"
+                ))
+            })?;
+            (format, pointer.codec.clone())
+        };
+        let jcs = super::Description {
+            name: req.name,
+            format: &format,
+            codec: codec.as_deref(),
+        }
+        .to_jcs()
+        .map_err(GroupContentError::Substrate)?;
+        let envelope = self
+            .engine
+            .seal_descriptor_for_blob(&sha, &own, &jcs)
+            .await
+            .map_err(|e| map_err(sha_hex, &e))?;
+        pointer.sealed_descriptor =
+            Some(base64::engine::general_purpose::STANDARD.encode(envelope));
+        // One description (D4): the seal replaces any clear one.
+        pointer.media_type = None;
+        pointer.codec = None;
+        Ok(pointer)
+    }
 }
 
 /// The pointer's at-rest address, parsed — hex for messages, bytes for doors.
