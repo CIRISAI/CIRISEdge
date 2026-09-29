@@ -5076,6 +5076,14 @@ impl FederationDirectoryReplicationBridge {
     /// Fail-closed: no local identity, an unresolvable owner, or a read error
     /// → `false`.
     ///
+    /// **A stalled root still Roots** (persist v51.0.0, CC 3.2 T7 + T4;
+    /// `FSD/FIRST_CONTACT.md` I12): a trust-root community below M+1 active
+    /// founders is valid but non-admitting — `trust_root_valid` ignores its
+    /// `live: false` by design, and persist refuses the NEW member at
+    /// `admit_community_change`. This reads only `.valid`, so pairs attached
+    /// before the stall stay Rooted; gating them here would detach the
+    /// attached, which T4 forbids.
+    ///
     /// Open ruling (FSD §5.3 item 1): "hardware-backed holder keys" — persist has
     /// no `hardware_class`; pending Eric's confirmation this gains the predicate
     /// *R's charter holders are `accord_holder`-typed keys*.
