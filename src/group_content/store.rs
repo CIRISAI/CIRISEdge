@@ -103,8 +103,52 @@ pub struct SealRequest<'a> {
     pub field: ContentField,
     /// The content.
     pub plaintext: &'a [u8],
-    /// So a reader knows what it has before opening it.
-    pub media_type: Option<&'a str>,
+    /// What the content is, and what to call it — **sealed or clear by the
+    /// resolved tier, which the store decides and the producer never does**
+    /// (CIRISEdge#698, CC 3.3.13, `FSD/CONTENT_TRANSFER.md` §6.7.1).
+    ///
+    /// Encrypted tier: persist is handed NO media type (it would record the
+    /// format beside sealed bytes), and the description is sealed under the
+    /// bytes' own DEK into [`BlobPointer::sealed_descriptor`]. Plaintext tier:
+    /// the format and codec ride the pointer in clear, and nothing is sealed.
+    /// `None` for content whose dimension already says what it is (a chat
+    /// body).
+    pub description: Option<Description<'a>>,
+}
+
+/// **What a sealed blob is** — the `{name?, format, codec?}` object CC 3.3.13
+/// seals beside encrypted bytes (CIRISEdge#698).
+///
+/// `name: None` is absent-by-author — a nameless file is a valid file — and
+/// is never written as an empty string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Description<'a> {
+    /// What to call it, if anything.
+    pub name: Option<&'a str>,
+    /// The media type (`format` in the CC Source struct).
+    pub format: &'a str,
+    /// The codec, when the format alone does not say.
+    pub codec: Option<&'a str>,
+}
+
+impl Description<'_> {
+    /// The JCS bytes a sealed descriptor carries: `{name?, format, codec?}`,
+    /// absent members omitted (never `null`, never `""`).
+    ///
+    /// # Errors
+    /// Canonicalization failure, as prose.
+    pub fn to_jcs(&self) -> Result<Vec<u8>, String> {
+        let mut obj = serde_json::Map::new();
+        if let Some(name) = self.name {
+            obj.insert("name".to_owned(), serde_json::json!(name));
+        }
+        obj.insert("format".to_owned(), serde_json::json!(self.format));
+        if let Some(codec) = self.codec {
+            obj.insert("codec".to_owned(), serde_json::json!(codec));
+        }
+        ciris_persist::prelude::ceg_produce_canonicalize(&serde_json::Value::Object(obj))
+            .map_err(|e| format!("canonicalize the descriptor: {e}"))
+    }
 }
 
 /// The result of a seal — the pointer to put on the row, plus **who can
@@ -262,6 +306,27 @@ pub trait GroupContentStore: Send + Sync + 'static {
     /// [`GroupContentError::SealMismatch`] when the rebuilt AAD does not
     /// match, and the rest as documented.
     async fn open(&self, req: OpenRequest<'_>) -> Result<Vec<u8>, GroupContentError>;
+
+    /// **Open the sealed descriptor a pointer carries** (CIRISEdge#698) —
+    /// the JCS `{name?, format, codec?}` bytes, under the same grant as the
+    /// bytes it describes.
+    ///
+    /// Takes the same [`OpenRequest`] as [`Self::open`]: the descriptor's own
+    /// AAD binds it to its BLOB (the address digest), and the REFERENCING
+    /// ROW's AAD — rebuilt from `req` exactly as [`aad_for_open`] does — must
+    /// authenticate the blob before the descriptor opens (persist v51.0.0,
+    /// the #923 amendment). A pointer transplanted onto another row, or
+    /// moved to another blob, is refused at the door, after authorization.
+    ///
+    /// # Errors
+    /// As [`Self::open`]; a store without a descriptor door says so as
+    /// [`GroupContentError::Substrate`].
+    async fn open_descriptor(&self, req: OpenRequest<'_>) -> Result<Vec<u8>, GroupContentError> {
+        let _ = req;
+        Err(GroupContentError::Substrate(
+            "this store has no sealed-descriptor door (CIRISEdge#698)".to_owned(),
+        ))
+    }
 }
 
 /// Build the AAD for a seal request. Exposed so a test — or a second
@@ -311,6 +376,11 @@ mod tests {
             media_type: None,
             stream_id: None,
             epoch: None,
+            codec: None,
+            sealed_descriptor: None,
+            size: None,
+            content_digest: None,
+            placeholder: None,
         }
     }
 
@@ -325,7 +395,7 @@ mod tests {
             asserted_at: now(),
             field: ContentField::Body,
             plaintext: b"hello",
-            media_type: Some("text/plain"),
+            description: None,
         };
         let p = pointer(ContentField::Body);
         let open = OpenRequest {

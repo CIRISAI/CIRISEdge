@@ -648,6 +648,8 @@ mod directory_tests {
             scrub_signature_classical: sig_b64,
             scrub_signature_pqc: Some(pqc_b64),
             supersede_proof: None,
+            cosignatures: Vec::new(),
+            lineage: Vec::new(),
         })
         .await
         .expect("seed the room");

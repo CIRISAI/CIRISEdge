@@ -39,6 +39,7 @@ pub mod welcome_wrap;
 
 pub use archive_mode::{ArchiveMode, ArchiveModeError, DEFAULT_ROTATE_FORWARD_WINDOW_DAYS};
 pub use boot::{readdress_persisted_rooms, InstalledRoom, ReaddressReport};
+pub use ciris_persist::encrypted_kv::{MlsStateCustody, MlsStateCustodyKind};
 pub use cohort_group::{key_material_from_bytes, key_material_to_bytes, CohortKeyMaterial};
 pub use cohort_group::{
     ClaimedApplyOutcome, CohortCommit, CohortGroup, CohortGroupError, CohortGroups, CohortSecret,

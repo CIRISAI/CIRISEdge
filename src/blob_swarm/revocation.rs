@@ -33,8 +33,9 @@
 //! into a remote-delete primitive: anyone who can get a `withdraws` admitted
 //! erases content they had no authority over — and with CIRISEdge#582 still
 //! open that lands as mass deletion. So [`apply_observation`] calls persist's
-//! own [`check_withdraws_admission`] every time, never reads the column, and
-//! treats `None`/`Err` as **inert**.
+//! own `check_withdraws_admission_as_admitted` every time (the read form: at
+//! the row's admission depth, v50 #928), never reads the column, and treats
+//! `None`/`Err` as **inert**.
 //!
 //! # Fail-closed toward RETENTION
 //!
@@ -496,14 +497,22 @@ async fn resolve_withdraws_target(
 /// **THE RECOMPUTE.** persist's own admission rule, against the target this
 /// node holds, now. Never the stored `withdraws_admission_rule`, never
 /// `None`-as-permission. `Some(rule)` is the only value that lets bytes go.
+///
+/// persist v50.0.0 (CIRISPersist#928 review H2; CIRISEdge#703): the READ form,
+/// `check_withdraws_admission_as_admitted` — the proxy walk runs at the depth
+/// the row was ADMITTED under (nothing recorded = the 16-hop legacy walk), and
+/// still re-walks the edges as they stand now (#853). The write form walks the
+/// node's CURRENT depth, which would un-retire what a pre-v50 row validly
+/// retired, or let a deferred row retire through a chain its admission never
+/// walked.
 async fn authorized_rule(
     directory: &dyn FederationDirectory,
     row: &Attestation,
     target_id: &str,
 ) -> Option<u8> {
-    use ciris_persist::federation::admission::check_withdraws_admission;
+    use ciris_persist::federation::admission::check_withdraws_admission_as_admitted;
 
-    match check_withdraws_admission(directory, row).await {
+    match check_withdraws_admission_as_admitted(directory, row).await {
         Ok(Some(rule)) => Some(rule),
         Ok(None) => {
             tracing::warn!(

@@ -251,11 +251,20 @@ impl GroupContentStore for PersistGroupContentStore {
                 req.cohort_scope,
                 req.community_key_id,
                 req.plaintext,
-                req.media_type,
+                clear_format(tier, req.description.as_ref()),
                 aad_arg,
             )
             .await
             .map_err(|e| map_err(String::new(), &e))?;
+        let described = self
+            .describe(
+                out.tier,
+                &out.at_rest_sha256,
+                req.plaintext,
+                req.description.as_ref(),
+                &out.granted,
+            )
+            .await?;
 
         Ok(SealedContent {
             // persist RESOLVED this; we do not re-derive it. Re-deriving
@@ -266,7 +275,7 @@ impl GroupContentStore for PersistGroupContentStore {
                 tier: out.tier,
                 content_sha256: hex::encode(out.at_rest_sha256),
                 content_field: req.field,
-                media_type: req.media_type.map(ToOwned::to_owned),
+                media_type: described.media_type,
                 // Whole-blob seal. A chunked write goes through the DAG
                 // doors and sets this; the two are deliberately not one
                 // call, because "does a reader want part of this" is a
@@ -279,6 +288,11 @@ impl GroupContentStore for PersistGroupContentStore {
                 // pointer is what goes on the wire and the struct is what
                 // the caller sees.
                 epoch: out.epoch,
+                codec: described.codec,
+                sealed_descriptor: described.sealed_descriptor,
+                size: Some(described.size),
+                content_digest: described.content_digest,
+                placeholder: None,
             },
             epoch: out.epoch,
             granted: out.granted,
@@ -346,11 +360,23 @@ impl GroupContentStore for PersistGroupContentStore {
                 req.cohort_scope,
                 req.community_key_id,
                 &stream_id,
-                req.media_type,
+                clear_format(tier, req.description.as_ref()),
                 aad_arg,
             )
             .await
             .map_err(|e| map_err(String::new(), &e))?;
+        // The descriptor binds to the MANIFEST — what a reader opens and what
+        // the row cites — under the manifest's DEK. That this reaches every
+        // chunk rests on persist's one-access-set-per-stream invariant (D9).
+        let described = self
+            .describe(
+                sealed.tier,
+                &sealed.manifest_sha256,
+                req.plaintext,
+                req.description.as_ref(),
+                &sealed.granted,
+            )
+            .await?;
 
         Ok(SealedContent {
             pointer: crate::group_content::BlobPointer {
@@ -358,10 +384,15 @@ impl GroupContentStore for PersistGroupContentStore {
                 tier: sealed.tier,
                 content_sha256: hex::encode(sealed.manifest_sha256),
                 content_field: req.field,
-                media_type: req.media_type.map(ToOwned::to_owned),
+                media_type: described.media_type,
                 // The presence of this IS the answer to "is this chunked".
                 stream_id: Some(stream_id),
                 epoch: sealed.epoch,
+                codec: described.codec,
+                sealed_descriptor: described.sealed_descriptor,
+                size: Some(described.size),
+                content_digest: described.content_digest,
+                placeholder: None,
             },
             tier: sealed.tier,
             epoch: sealed.epoch,
@@ -374,12 +405,7 @@ impl GroupContentStore for PersistGroupContentStore {
 
     async fn open(&self, req: OpenRequest<'_>) -> Result<Vec<u8>, GroupContentError> {
         use ciris_persist::federation::types::cohort_scope::CryptoTier;
-        let sha_hex = req.pointer.content_sha256.clone();
-        let raw = hex::decode(&sha_hex)
-            .map_err(|e| GroupContentError::Substrate(format!("pointer sha is not hex: {e}")))?;
-        let sha: [u8; 32] = raw
-            .try_into()
-            .map_err(|_| GroupContentError::Substrate("pointer sha is not 32 bytes".to_owned()))?;
+        let (sha_hex, sha) = pointer_sha(req.pointer)?;
 
         // Ask the ROW what tier it is, exactly as persist's own read door
         // does. Not the pointer, and not the scope label.
@@ -407,6 +433,157 @@ impl GroupContentStore for PersistGroupContentStore {
             .read_blob_as(&sha, req.viewer_key_id, aad_arg)
             .await
             .map_err(|e| map_err(sha_hex, &e))
+    }
+
+    async fn open_descriptor(&self, req: OpenRequest<'_>) -> Result<Vec<u8>, GroupContentError> {
+        use base64::Engine as _;
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        let (sha_hex, sha) = pointer_sha(req.pointer)?;
+        let sealed_b64 = req.pointer.sealed_descriptor.as_deref().ok_or_else(|| {
+            GroupContentError::Substrate(format!(
+                "pointer {sha_hex} carries no sealed descriptor to open"
+            ))
+        })?;
+        let sealed = base64::engine::general_purpose::STANDARD
+            .decode(sealed_b64)
+            .map_err(|e| {
+                GroupContentError::Substrate(format!("sealed descriptor is not base64: {e}"))
+            })?;
+        // The ROW's binding, exactly as `open` presents it: persist
+        // authenticates the blob under it before the descriptor opens, so a
+        // transplanted pointer is refused at the door (#923 amendment, D8).
+        let aad = aad_for_open(&req);
+        let aad_arg = match req.pointer.tier {
+            CryptoTier::Plaintext => None,
+            CryptoTier::InvisibleEncrypted | CryptoTier::CommunityDek => Some(aad.as_slice()),
+        };
+        self.engine
+            .open_descriptor_for_blob(&sha, req.viewer_key_id, &sealed, aad_arg)
+            .await
+            .map_err(|e| map_err(sha_hex, &e))
+    }
+}
+
+/// The pointer's at-rest address, parsed — hex for messages, bytes for doors.
+fn pointer_sha(pointer: &BlobPointer) -> Result<(String, [u8; 32]), GroupContentError> {
+    let sha_hex = pointer.content_sha256.clone();
+    let raw = hex::decode(&sha_hex)
+        .map_err(|e| GroupContentError::Substrate(format!("pointer sha is not hex: {e}")))?;
+    let sha: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| GroupContentError::Substrate("pointer sha is not 32 bytes".to_owned()))?;
+    Ok((sha_hex, sha))
+}
+
+/// The format persist may record on the blob: the description's, at the
+/// plaintext tier only. An encrypted write hands persist NO media type —
+/// a format recorded on the blob or holder metadata beside sealed bytes is
+/// exactly the leak CC 3.3.13 closes (CIRISEdge#698, D2).
+fn clear_format<'a>(
+    tier: ciris_persist::federation::types::cohort_scope::CryptoTier,
+    description: Option<&super::Description<'a>>,
+) -> Option<&'a str> {
+    match tier {
+        ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext => {
+            description.map(|d| d.format)
+        }
+        _ => None,
+    }
+}
+
+/// The pointer members a description becomes, once the tier is KNOWN.
+struct Described {
+    media_type: Option<String>,
+    codec: Option<String>,
+    sealed_descriptor: Option<String>,
+    size: u64,
+    content_digest: Option<String>,
+}
+
+impl PersistGroupContentStore {
+    /// **Decide the description's shape after persist resolved the tier** —
+    /// the one decision CIRISEdge#698 puts in the store, never the producer.
+    ///
+    /// Plaintext tier: clear `format`/`codec`, nothing sealed, no second
+    /// digest (the address IS the plaintext's). Encrypted tier: the JCS
+    /// `{name?, format, codec?}` sealed under the bytes' own DEK by persist's
+    /// `seal_descriptor_for_blob`, the plaintext digest in clear, and no
+    /// clear format anywhere.
+    ///
+    /// The sealing door recovers the DEK *as a viewer*, so it needs a key
+    /// this node can unwrap for: this engine's own derived key first (the
+    /// node-class occurrence), then each occurrence the write granted. None
+    /// opening means this node cannot read what it just wrote — refused by
+    /// name, never a pointer with a silently-missing description.
+    async fn describe(
+        &self,
+        tier: ciris_persist::federation::types::cohort_scope::CryptoTier,
+        at_rest_sha256: &[u8; 32],
+        plaintext: &[u8],
+        description: Option<&super::Description<'_>>,
+        granted: &[String],
+    ) -> Result<Described, GroupContentError> {
+        use base64::Engine as _;
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        use sha2::{Digest as _, Sha256};
+        let size = plaintext.len() as u64;
+        if tier == CryptoTier::Plaintext {
+            return Ok(Described {
+                media_type: description.map(|d| d.format.to_owned()),
+                codec: description.and_then(|d| d.codec).map(ToOwned::to_owned),
+                sealed_descriptor: None,
+                size,
+                content_digest: None,
+            });
+        }
+        let content_digest = Some(hex::encode(Sha256::digest(plaintext)));
+        let Some(description) = description else {
+            return Ok(Described {
+                media_type: None,
+                codec: None,
+                sealed_descriptor: None,
+                size,
+                content_digest,
+            });
+        };
+        let jcs = description.to_jcs().map_err(GroupContentError::Substrate)?;
+        let mut candidates: Vec<String> = Vec::with_capacity(granted.len() + 1);
+        if let Ok(own) = self.engine.local_derived_key_id().await {
+            candidates.push(own);
+        }
+        for g in granted {
+            if !candidates.contains(g) {
+                candidates.push(g.clone());
+            }
+        }
+        let mut last = None;
+        for key_id in &candidates {
+            match self
+                .engine
+                .seal_descriptor_for_blob(at_rest_sha256, key_id, &jcs)
+                .await
+            {
+                Ok(envelope) => {
+                    return Ok(Described {
+                        media_type: None,
+                        codec: None,
+                        sealed_descriptor: Some(
+                            base64::engine::general_purpose::STANDARD.encode(envelope),
+                        ),
+                        size,
+                        content_digest,
+                    });
+                }
+                Err(e) => last = Some(format!("{key_id}: {e}")),
+            }
+        }
+        Err(GroupContentError::Substrate(format!(
+            "sealed {} but could not seal its descriptor: no key this node unwraps for opens \
+             the blob's DEK (tried {candidates:?}; last: {}) — CC 3.3.13 forbids the clear \
+             fallback",
+            hex::encode(at_rest_sha256),
+            last.unwrap_or_else(|| "no candidate".to_owned())
+        )))
     }
 }
 
@@ -439,6 +616,26 @@ mod tests {
     use super::*;
     use crate::group_content::ContentField;
 
+    /// CIRISEdge#698 D2, edge's half — an encrypted write hands persist NO
+    /// media type (persist would record it beside the sealed bytes); only
+    /// the plaintext tier passes the format through.
+    #[test]
+    fn an_encrypted_write_hands_persist_no_format() {
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        let d = crate::group_content::Description {
+            name: Some("boat.jpg"),
+            format: "image/jpeg",
+            codec: None,
+        };
+        assert_eq!(
+            clear_format(CryptoTier::Plaintext, Some(&d)),
+            Some("image/jpeg")
+        );
+        assert_eq!(clear_format(CryptoTier::InvisibleEncrypted, Some(&d)), None);
+        assert_eq!(clear_format(CryptoTier::CommunityDek, Some(&d)), None);
+        assert_eq!(clear_format(CryptoTier::Plaintext, None), None);
+    }
+
     async fn store() -> PersistGroupContentStore {
         use ciris_persist::store::backend::Backend as _;
         let backend = ciris_persist::prelude::FederationDirectorySqlite::open(":memory:")
@@ -470,6 +667,11 @@ mod tests {
             media_type: None,
             stream_id: None,
             epoch: None,
+            codec: None,
+            sealed_descriptor: None,
+            size: None,
+            content_digest: None,
+            placeholder: None,
         }
     }
 

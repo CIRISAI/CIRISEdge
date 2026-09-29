@@ -177,7 +177,11 @@ async fn commons_content_round_trips_through_the_one_write_door() {
             asserted_at: instant(),
             field: ContentField::Body,
             plaintext: body,
-            media_type: Some("application/json"),
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "application/json",
+                codec: None,
+            }),
         })
         .await
         .expect("commons seal");
@@ -230,7 +234,7 @@ async fn a_pointer_survives_the_wire_and_still_opens() {
             asserted_at: instant(),
             field: ContentField::Body,
             plaintext: body,
-            media_type: None,
+            description: None,
         })
         .await
         .expect("seal");
@@ -282,7 +286,7 @@ async fn commons_content_is_not_bound_to_its_author_and_says_so() {
             asserted_at: instant(),
             field: ContentField::Body,
             plaintext: b"public",
-            media_type: None,
+            description: None,
         })
         .await
         .expect("seal");
@@ -319,6 +323,11 @@ async fn an_unknown_pointer_is_not_held_rather_than_a_bare_error() {
         media_type: None,
         stream_id: None,
         epoch: None,
+        codec: None,
+        sealed_descriptor: None,
+        size: None,
+        content_digest: None,
+        placeholder: None,
     };
     let err = s
         .open(OpenRequest {
@@ -358,7 +367,7 @@ async fn identical_commons_content_seals_to_one_address() {
                 asserted_at: instant(),
                 field: ContentField::Body,
                 plaintext: b"the same bytes",
-                media_type: None,
+                description: None,
             })
             .await
             .expect("seal")
@@ -377,7 +386,7 @@ async fn identical_commons_content_seals_to_one_address() {
             asserted_at: instant(),
             field: ContentField::Body,
             plaintext: b"dedup me",
-            media_type: None,
+            description: None,
         })
         .await
         .expect("seal");
@@ -389,7 +398,7 @@ async fn identical_commons_content_seals_to_one_address() {
             asserted_at: instant(),
             field: ContentField::Body,
             plaintext: b"dedup me",
-            media_type: None,
+            description: None,
         })
         .await
         .expect("re-seal");

@@ -25,6 +25,7 @@
 //!         room: &self_room::room(&owner),   // or ScopeRoom::community(room)
 //!         bytes: &jpeg,
 //!         media_type: "image/jpeg",
+//!         codec: None,
 //!         filename: Some("boat.jpg"),
 //!         asserted_at: Utc::now(),
 //!     },
@@ -47,7 +48,9 @@
 use chrono::{DateTime, Utc};
 
 use crate::chat::UnopenedReason;
-use crate::group_content::{BlobPointer, ContentField, GroupContentStore, SealRequest};
+use crate::group_content::{
+    BlobPointer, ContentField, Description, GroupContentStore, SealRequest,
+};
 use crate::replication::attestation_bind::{share, CrossingBasis, Shared, Signers};
 use crate::scope_room::ScopeRoom;
 use ciris_persist::federation::types::cohort_scope::CryptoTier;
@@ -70,10 +73,16 @@ pub struct FileWrite<'a> {
     /// The plaintext. Sealed before it is stored; the bytes never ride the
     /// row.
     pub bytes: &'a [u8],
-    /// What it is, so a reader knows before opening it.
+    /// What it is, so a reader knows before opening it. **Sealed with the
+    /// bytes** at an encrypted tier (CIRISEdge#698): a party that cannot open
+    /// the file cannot learn its type either.
     pub media_type: &'a str,
+    /// The codec, when the media type alone does not say (sealed as
+    /// `media_type` is).
+    pub codec: Option<&'a str>,
     /// What to call it. Optional: a file is identified by its sha, and a
-    /// name is a convenience for people.
+    /// name is a convenience for people. Sealed with the bytes at an
+    /// encrypted tier; in clear on the row only at the plaintext tier.
     pub filename: Option<&'a str>,
     /// When the author asserts it — an AAD input, so it is not free.
     pub asserted_at: DateTime<Utc>,
@@ -159,7 +168,8 @@ pub enum FileError {
     /// (CIRISEdge#675). The row's attester is `author`; the signers offered
     /// were `held`. For a person-authored row any of the owner's devices holds
     /// the person's key; a row a NODE authored (before #675, or by an
-    /// agent-only node) can be retracted only by that node.
+    /// agent-only node) can be retracted by that node or, through [`withdraw`]
+    /// (CIRISEdge#941), by the node's single live owner.
     #[error(
         "{attestation_id} is authored by {author}; none of the signers in hand ({held:?}) is \
          its author, so an author-only operation cannot be signed (FSD/CONTENT_TRANSFER.md §6.7.0)"
@@ -196,11 +206,14 @@ pub fn file_author(signers: Signers<'_>) -> &crate::identity::LocalSigner {
 }
 
 /// **Withdraw a file** (CC 2.3) — the drive's delete, signed by the row's
-/// author (CIRISEdge#675).
+/// author (CIRISEdge#675), or by the owner of the node that authored it
+/// (CIRISEdge#941).
 ///
 /// The signer is [`FileRow::author_signer`]'s answer: for a person-authored
 /// row, the person's key, which every device of the owner holds; for a
-/// node-authored row, only that node's. The `withdraws` is persist's own
+/// node-authored row, that node's — or, since persist v51 (CIRISPersist#941),
+/// the actor in hand when it is that node's single live owner, from any of
+/// their devices. The `withdraws` is persist's own
 /// envelope ([`withdraws_attestation`](crate::replication::attestation_bind::withdraws_attestation)),
 /// born federation-tier, written through `put_attestation` so persist's
 /// authority gate (rule 1: issuer == the row's attester) decides.
@@ -219,7 +232,12 @@ pub async fn withdraw(
         attestation_id: row.attestation_id.clone(),
         detail: "not a file row".to_owned(),
     })?;
-    let signer = file.author_signer(signers)?;
+    let signer = match file.author_signer(signers) {
+        Ok(signer) => signer,
+        Err(not_author) => node_owner_signer(directory, &file, signers)
+            .await
+            .ok_or(not_author)?,
+    };
     let withdraws = crate::replication::attestation_bind::withdraws_attestation(
         row,
         reason,
@@ -241,6 +259,30 @@ pub async fn withdraw(
             detail: e.to_string(),
         })?;
     Ok(withdraws)
+}
+
+/// **CIRISEdge#941 / CIRISPersist#941 (CC 3.4.7.3)** — the actor in hand, when
+/// it is the single live owner of the NODE that authored `file`.
+///
+/// persist v51 lifts withdraws rule 1 to the producer's principal: a file a
+/// node wrote before files were authored as the person (pre-#675/#708) is the
+/// person's to retract from any device. This names the candidate; persist's
+/// door stays the judge — it also requires an owner-binding over that node
+/// asserted at or before the row, so a later owner of a used node retracts
+/// nothing (that refusal surfaces as [`FileError::Withdraw`]). An ambiguous or
+/// unresolvable owner is not a principal: `None`, and the caller keeps
+/// [`FileError::NotAuthor`].
+async fn node_owner_signer<'a>(
+    directory: &dyn FederationDirectory,
+    file: &FileRow,
+    signers: Signers<'a>,
+) -> Option<&'a crate::identity::LocalSigner> {
+    let actor = signers.actor?;
+    let owner = ciris_persist::federation::admission::owner_of(directory, &file.attesting_key_id)
+        .await
+        .ok()
+        .flatten()?;
+    (owner == actor.key_id).then_some(actor)
 }
 
 /// What [`publish`] did.
@@ -326,7 +368,13 @@ pub async fn publish(
         asserted_at: write.asserted_at,
         field: ContentField::Body,
         plaintext: write.bytes,
-        media_type: Some(write.media_type),
+        // CIRISEdge#698 — the store seals this or writes it in clear by the
+        // tier persist resolves; this producer never chooses.
+        description: Some(Description {
+            name: write.filename,
+            format: write.media_type,
+            codec: write.codec,
+        }),
     };
     let chunked = must_chunk(write.bytes.len());
     let sealed = if chunked {
@@ -433,7 +481,9 @@ async fn file_row(
     if let Some(field) = write.room.cohort_target_field() {
         envelope[field] = serde_json::json!(write.room.content_group_id());
     }
-    if let Some(name) = write.filename {
+    // One description (CIRISEdge#698 D4): a sealed pointer carries the name
+    // inside its seal, so the row carries none in clear.
+    if let (Some(name), None) = (write.filename, &pointer.sealed_descriptor) {
         envelope[FIELD_FILENAME] = serde_json::json!(name);
     }
     // Every producer cites (CIRISEdge#646): the row is found BY the bytes it
@@ -536,10 +586,14 @@ pub struct FileRow {
     pub attesting_key_id: String,
     /// When.
     pub asserted_at: DateTime<Utc>,
-    /// Its name, if it carries one.
+    /// Its name, **in clear** — `None` on a sealed row (the name is inside
+    /// [`BlobPointer::sealed_descriptor`]; [`Self::open_described`] opens it)
+    /// and on a nameless file.
     pub filename: Option<String>,
-    /// What it is.
+    /// What it is, **in clear** — `None` on a sealed row, as `filename`.
     pub media_type: Option<String>,
+    /// The codec, in clear, when the row names one (CIRISEdge#698).
+    pub codec: Option<String>,
     /// The pointer at the bytes — the key plane.
     pub pointer: BlobPointer,
     /// Whether this row is live or retracted, as far as the listing that
@@ -571,27 +625,94 @@ pub enum FileLifecycle {
 
 impl FileRow {
     /// Recognise a file row. `None` for anything else — a chat message, a
-    /// key package, a row that cites no bytes.
+    /// key package, a row that cites no bytes — and for a file row this
+    /// reader refuses ([`Self::try_from_row`] names why).
     #[must_use]
     pub fn from_row(row: &Attestation) -> Option<Self> {
+        match Self::try_from_row(row) {
+            Ok(file) => Some(file),
+            Err(NotAFile::OtherDimension | NotAFile::NoPointer) => None,
+            Err(refused) => {
+                tracing::warn!(
+                    attestation_id = %row.attestation_id,
+                    refusal = %refused,
+                    "file row refused by the reader (CIRISEdge#698)"
+                );
+                None
+            }
+        }
+    }
+
+    /// Recognise a file row, **naming** a refusal.
+    ///
+    /// # Errors
+    /// [`NotAFile::OtherDimension`] / [`NotAFile::NoPointer`] for rows that
+    /// are not files; [`NotAFile::TwoDescriptions`] for a row carrying a
+    /// `sealed_descriptor` beside a clear `media_type`, `codec` or `filename`
+    /// (D4 — which one is true is unknowable, so neither is shown);
+    /// [`NotAFile::NoDescription`] for a row with neither.
+    pub fn try_from_row(row: &Attestation) -> Result<Self, NotAFile> {
         let env = &row.attestation_envelope;
         if env.get("dimension").and_then(serde_json::Value::as_str) != Some(FILE_DIMENSION) {
-            return None;
+            return Err(NotAFile::OtherDimension);
         }
-        let pointer: BlobPointer =
-            serde_json::from_value(env.get(crate::chat::FIELD_CONTENT)?.clone()).ok()?;
-        Some(Self {
+        let pointer: BlobPointer = env
+            .get(crate::chat::FIELD_CONTENT)
+            .and_then(|p| serde_json::from_value(p.clone()).ok())
+            .ok_or(NotAFile::NoPointer)?;
+        let filename = env
+            .get(FIELD_FILENAME)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        if pointer.sealed_descriptor.is_some() {
+            let clear: Vec<&'static str> = [
+                ("media_type", pointer.media_type.is_some()),
+                ("codec", pointer.codec.is_some()),
+                (FIELD_FILENAME, env.get(FIELD_FILENAME).is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(member, present)| present.then_some(member))
+            .collect();
+            if !clear.is_empty() {
+                return Err(NotAFile::TwoDescriptions {
+                    attestation_id: row.attestation_id.clone(),
+                    clear,
+                });
+            }
+        } else if pointer.media_type.is_none() {
+            return Err(NotAFile::NoDescription {
+                attestation_id: row.attestation_id.clone(),
+            });
+        }
+        Ok(Self {
             attestation_id: row.attestation_id.clone(),
             attesting_key_id: row.attesting_key_id.clone(),
             asserted_at: row.asserted_at,
-            filename: env
-                .get(FIELD_FILENAME)
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
+            filename,
             media_type: pointer.media_type.clone(),
+            codec: pointer.codec.clone(),
             pointer,
             lifecycle: FileLifecycle::Live,
         })
+    }
+
+    /// **What the listing may say about this file** without opening it
+    /// (CIRISEdge#698): the clear description, or [`Descriptor::Sealed`] —
+    /// typed, never an empty string. [`Self::open_described`] is the only
+    /// path to [`Descriptor::Opened`].
+    #[must_use]
+    pub fn descriptor(&self) -> Descriptor {
+        match (&self.pointer.sealed_descriptor, &self.media_type) {
+            (None, Some(format)) => Descriptor::Clear {
+                format: format.clone(),
+                codec: self.codec.clone(),
+                name: self.filename.clone(),
+            },
+            // `try_from_row` refuses a row with neither, so a FileRow built
+            // by it never reaches `(None, None)`; a hand-built one reads as
+            // sealed — the side that shows nothing.
+            (Some(_), _) | (None, None) => Descriptor::Sealed,
+        }
     }
 
     /// **The signer that may perform an author-only operation on this file**
@@ -642,6 +763,154 @@ impl FileRow {
             .await
             .map_err(|e| UnopenedReason::from_store_error(&e))
     }
+
+    /// **The bytes and what they are, through one grant** (CIRISEdge#698,
+    /// `FSD/CONTENT_TRANSFER.md` §6.7.1): [`Self::open`] then
+    /// [`Self::describe`]. `Ok` never carries [`Descriptor::Sealed`].
+    ///
+    /// # Errors
+    /// [`UnopenedReason`] as [`Self::open`] and [`Self::describe`].
+    pub async fn open_described(
+        &self,
+        store: &dyn GroupContentStore,
+        viewer_key_id: &str,
+    ) -> Result<Opened, UnopenedReason> {
+        let bytes = self.open(store, viewer_key_id).await?;
+        let descriptor = self.describe(store, viewer_key_id).await?;
+        Ok(Opened { bytes, descriptor })
+    }
+
+    /// **What the file is, without returning its bytes** (CIRISEdge#698;
+    /// CIRISServer's drive listing, CIRISEdge#702).
+    ///
+    /// A clear row answers from its members ([`Descriptor::Clear`]). A sealed
+    /// row opens ONLY its descriptor, under the row's AAD: persist v51's door
+    /// authenticates the blob under the referencing row before the
+    /// descriptor opens, so a pointer transplanted onto another row (D8) or
+    /// moved to another blob (D3) is refused there — the row gate no longer
+    /// needs the bytes returned. The door does read the blob to authenticate
+    /// it, so a row whose bytes are not here is `NotFetched`, as `open` is.
+    ///
+    /// # Errors
+    /// [`UnopenedReason`] as [`Self::open`]; a descriptor that fails its AAD
+    /// is `SealMismatch` (or `Substrate` for persist's crypto-class refusal),
+    /// never `NotGranted`, and one that opens to something other than
+    /// `{name?, format, codec?}` is `MalformedRow`.
+    pub async fn describe(
+        &self,
+        store: &dyn GroupContentStore,
+        viewer_key_id: &str,
+    ) -> Result<Descriptor, UnopenedReason> {
+        if self.pointer.sealed_descriptor.is_none() {
+            return Ok(self.descriptor());
+        }
+        let jcs = store
+            .open_descriptor(crate::group_content::OpenRequest {
+                pointer: &self.pointer,
+                author_key_id: &self.attesting_key_id,
+                asserted_at: self.asserted_at,
+                viewer_key_id,
+            })
+            .await
+            .map_err(|e| UnopenedReason::from_store_error(&e))?;
+        let opened: SealedDescription =
+            serde_json::from_slice(&jcs).map_err(|e| UnopenedReason::MalformedRow {
+                detail: format!(
+                    "{}: the sealed descriptor opened to something other than \
+                     {{name?, format, codec?}}: {e}",
+                    self.attestation_id
+                ),
+            })?;
+        if opened.name.as_deref() == Some("") {
+            return Err(UnopenedReason::MalformedRow {
+                detail: format!(
+                    "{}: an empty name inside the seal — absent is omitted, never \"\"",
+                    self.attestation_id
+                ),
+            });
+        }
+        Ok(Descriptor::Opened {
+            format: opened.format,
+            codec: opened.codec,
+            name: opened.name,
+        })
+    }
+}
+
+/// The object inside a sealed descriptor.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedDescription {
+    #[serde(default)]
+    name: Option<String>,
+    format: String,
+    #[serde(default)]
+    codec: Option<String>,
+}
+
+/// Why a row is not a readable file (CIRISEdge#698).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NotAFile {
+    /// Not `file:v1`.
+    #[error("not a file row")]
+    OtherDimension,
+    /// No readable pointer under `content`.
+    #[error("a file row with no readable pointer")]
+    NoPointer,
+    /// A `sealed_descriptor` beside clear description members (D4).
+    #[error(
+        "{attestation_id}: two descriptions — a sealed descriptor beside clear {clear:?}; \
+         refused, because which one is true cannot be known"
+    )]
+    TwoDescriptions {
+        /// The row.
+        attestation_id: String,
+        /// The clear members found beside the seal.
+        clear: Vec<&'static str>,
+    },
+    /// Neither a clear format nor a sealed descriptor.
+    #[error("{attestation_id}: a file row with no description, sealed or clear")]
+    NoDescription {
+        /// The row.
+        attestation_id: String,
+    },
+}
+
+/// What a file is, as far as a given read can say (CIRISEdge#698).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Descriptor {
+    /// From the row's clear members — a plaintext-tier file, or a row from
+    /// before #698.
+    Clear {
+        /// The media type.
+        format: String,
+        /// The codec, if named.
+        codec: Option<String>,
+        /// The name; `None` = the author gave none.
+        name: Option<String>,
+    },
+    /// The sealed descriptor, opened with the bytes' key.
+    Opened {
+        /// The media type.
+        format: String,
+        /// The codec, if named.
+        codec: Option<String>,
+        /// The name; `None` = the author gave none (never `""`).
+        name: Option<String>,
+    },
+    /// Sealed, and not opened by this read — the listing's word for a row
+    /// held but not (yet) opened. Never an `Ok` of
+    /// [`FileRow::open_described`].
+    Sealed,
+}
+
+/// A file opened with its description.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opened {
+    /// The plaintext.
+    pub bytes: Vec<u8>,
+    /// What it is — `Clear` or `Opened`, never `Sealed`.
+    pub descriptor: Descriptor,
 }
 
 /// How many queries [`in_room`] will issue for one call before handing back
@@ -957,6 +1226,109 @@ mod tests {
         assert!(FileRow::from_row(&row_with(FILE_DIMENSION, serde_json::json!({}))).is_none());
     }
 
+    /// D4 (CIRISEdge#698) — one description: a sealed descriptor beside a
+    /// clear `media_type`, `codec` or `filename` is refused BY NAME, each
+    /// member on its own, and never listed.
+    #[test]
+    fn a_row_with_two_descriptions_is_refused() {
+        let sha = "bb".repeat(32);
+        let sealed = |extra: serde_json::Value| {
+            let mut p = serde_json::json!({
+                "community_key_id": "alice-fed",
+                "tier": "invisible_encrypted",
+                "content_sha256": sha,
+                "content_field": "body",
+                "sealed_descriptor": "c2VhbGVk",
+                "size": 5,
+            });
+            for (k, v) in extra.as_object().expect("an object") {
+                p[k] = v.clone();
+            }
+            p
+        };
+        let cases = [
+            (
+                serde_json::json!({ crate::chat::FIELD_CONTENT: sealed(serde_json::json!({"media_type": "image/jpeg"})) }),
+                vec!["media_type"],
+            ),
+            (
+                serde_json::json!({ crate::chat::FIELD_CONTENT: sealed(serde_json::json!({"codec": "h264"})) }),
+                vec!["codec"],
+            ),
+            (
+                serde_json::json!({
+                    crate::chat::FIELD_CONTENT: sealed(serde_json::json!({})),
+                    FIELD_FILENAME: "boat.jpg",
+                }),
+                vec![FIELD_FILENAME],
+            ),
+        ];
+        for (env, named) in cases {
+            let row = row_with(FILE_DIMENSION, env);
+            match FileRow::try_from_row(&row) {
+                Err(NotAFile::TwoDescriptions { clear, .. }) => assert_eq!(clear, named),
+                other => panic!("two descriptions must be refused by name, got {other:?}"),
+            }
+            assert!(FileRow::from_row(&row).is_none(), "and never listed");
+        }
+
+        // The sealed row alone is a file, typed sealed.
+        let row = row_with(
+            FILE_DIMENSION,
+            serde_json::json!({ crate::chat::FIELD_CONTENT: sealed(serde_json::json!({})) }),
+        );
+        let f = FileRow::try_from_row(&row).expect("one description");
+        assert_eq!(f.descriptor(), Descriptor::Sealed);
+        assert_eq!((f.filename, f.media_type, f.codec), (None, None, None));
+
+        // Neither description: refused by name too.
+        let bare = row_with(
+            FILE_DIMENSION,
+            serde_json::json!({ crate::chat::FIELD_CONTENT: {
+                "community_key_id": "alice-fed",
+                "tier": "invisible_encrypted",
+                "content_sha256": sha,
+                "content_field": "body",
+            }}),
+        );
+        assert!(matches!(
+            FileRow::try_from_row(&bare),
+            Err(NotAFile::NoDescription { .. })
+        ));
+    }
+
+    /// D5 (CIRISEdge#698) — read-compat: the v32 row shape (a clear filename
+    /// and media type, no seal, no size) still lists, with a `Clear`
+    /// descriptor. The vector is the exact pre-#698 pointer.
+    #[test]
+    fn a_v32_row_still_opens() {
+        let sha = "cc".repeat(32);
+        let row = row_with(
+            FILE_DIMENSION,
+            serde_json::json!({
+                crate::chat::FIELD_CONTENT: {
+                    "community_key_id": "alice-fed",
+                    "tier": "invisible_encrypted",
+                    "content_sha256": sha,
+                    "content_field": "body",
+                    "media_type": "image/jpeg",
+                },
+                FIELD_FILENAME: "boat.jpg",
+            }),
+        );
+        let f = FileRow::from_row(&row).expect("a v32 file row lists");
+        assert_eq!(
+            f.descriptor(),
+            Descriptor::Clear {
+                format: "image/jpeg".into(),
+                codec: None,
+                name: Some("boat.jpg".into()),
+            }
+        );
+        assert_eq!(f.pointer.size, None, "absent, never fabricated");
+        assert_eq!(f.pointer.sealed_descriptor, None);
+    }
+
     /// CIRISEdge#657 review — a short page is a VALUE, not a log line.
     ///
     /// `belongs_to` drops rows the gate admitted that are not this room's,
@@ -1141,6 +1513,7 @@ mod tests {
                 room: &room,
                 bytes: b"bytes",
                 media_type: "image/jpeg",
+                codec: None,
                 filename: Some("boat.jpg"),
                 asserted_at: at,
             };

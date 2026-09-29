@@ -635,10 +635,22 @@ owner's laptop could not be withdrawn from their phone.
   builds the `withdraws` with persist's own envelope builder and writes it.
 - **Read-compat — node-authored rows (written before #675, or by an agent-only node).** They still
   list and open unchanged (the AAD names the node, as it did when sealed). Their author is the
-  NODE, so only that node can withdraw them; another device of the same owner gets
-  `FileError::NotAuthor` naming the authoring node. Letting the owner withdraw a row its own node
-  authored would need persist to admit "issuer = `owner_of(T.attesting_key_id)`" as a withdraws
-  authority — not built; recorded as a persist ask, not approximated here.
+  NODE. **Since edge v33.0.0 (persist v51, CIRISPersist#941 / CIRISEdge#941, CC 3.4.7.3)** the
+  node's owner may withdraw them too: persist lifts withdraws rule 1 to the producer's principal —
+  the issuer is the node's single live owner (`owner_of`) AND **the issuer's owner-binding was in
+  force at the row's instant, and no other owner's was** (a binding is in force from its
+  `asserted_at` until its expiry or first withdrawal). So a later buyer of a used node retracts
+  nothing, an A→B→A re-binding does not give A back B's tenure, a backdated re-binding is refused,
+  and a clean hand-off lets the new owner retract what the node wrote on their watch. `files::withdraw`
+  falls back to the actor in hand exactly when `owner_of(T.attesting_key_id)` names it (an
+  ambiguous owner is no principal) and persist's door stays the judge; anyone else still gets
+  `FileError::NotAuthor` naming the authoring node. `FileRow::author_signer` stays strictly the
+  attester. Witness: `a_file_is_authored_by_its_person_and_withdrawn_from_their_other_device`
+  (a stranger refused, the owner admitted under rule 1 from her other device; red with the
+  fallback removed). The hand-off / A→B→A / backdated cases are persist's witnesses at v51.0.0; edge has no
+  hand-off witness because its producer `owner_binding_attestation` keys the row id by the NODE
+  alone (`owner-binding-{node}`), so a second owner's binding over the same node collides with the
+  first's id — a follow-up for the producer, not a withdraw-path gap. Mixed fleet: a v50 node refuses the owner's withdraws a v51 node admits.
 
 #### 6.7.1 The sealed descriptor — a file's name and media type open only with the bytes (CIRISEdge#698, CIRISConstitution#114)
 
@@ -783,12 +795,38 @@ noted on CIRISPersist#923):
 | D3 | AAD binding: a `sealed_descriptor` copied onto another blob's row does not open | `files::a_descriptor_moved_to_another_blob_does_not_open` |
 | D4 | One description: a row with both `sealed_descriptor` and a clear `media_type`/`codec`/`filename` is never produced; the reader refuses it by name | `files::a_row_with_two_descriptions_is_refused` |
 | D5 | Read-compat: pre-#698 rows (clear `filename` + `media_type`, no seal) still open and list | `files::a_v32_row_still_opens` (the old-shape vector is kept as a read case) |
-| D6 | Round trip through persist's real sqlite backend, both scope paths (self/family `InvisibleEncrypted`, community `CommunityDek`) | `tests/files_sealed_descriptor_e2e.rs` |
-| D7 | Mixed fleet: the row carries no `media` member; a v50 reader admits it | conformance vector, encrypted case |
-| D8 | A pointer + descriptor transplanted onto **another row** of the same blob does not open (row AAD gate), and one moved to **another blob** does not open (address-digest AAD) | `files::a_transplanted_descriptor_opens_on_neither_another_row_nor_another_blob` |
-| D9 | A chunked file written across an occurrence change opens name, manifest and every chunk together, or none (one access set per stream) | `files::a_chunked_files_descriptor_and_every_chunk_share_one_access_set` |
+| D6 | Round trip through persist's real sqlite backend, both scope paths (self/family `InvisibleEncrypted`, community `CommunityDek`) | every `files::` witness in `tests/blob_federation_e2e.rs` runs both encrypted scope paths on real sqlite |
+| D7 | Mixed fleet: the row carries no `media` member; a v50 reader admits it | asserted inside the D2 witness (no top-level `media`); no CIRISConformance vector yet |
+| D8 | A pointer + descriptor transplanted onto **another row** of the same blob does not open (row AAD gate), and one moved to **another blob** does not open (address-digest AAD) | `files::a_transplanted_descriptor_opens_on_neither_another_row_nor_another_blob` — refused at persist's door under row 2's AAD and under none |
+| D9 | A chunked file written across an occurrence change opens name, manifest and every chunk together, or none (one access set per stream) | `files::a_chunked_files_descriptor_and_every_chunk_share_one_access_set` — manifest + chunks + descriptor open together, a stranger none, every granted occurrence holds a grant on every chunk; the mid-write occurrence change is persist's I34b (TESTED at v51.0.0) — edge seals only through `Engine::seal_stream_scoped`, which emits `chunk_key_grant_emissions` |
 | D10 | A nameless encrypted file round-trips with `name` absent inside the seal; the reader gets `None`, never `""` | `files::a_nameless_file_seals_format_only_and_reads_back_absent` |
 
+
+
+**Landed (edge v33.0.0, persist v51.0.0).** The producer and reader ship as written above, on the
+doors persist actually shipped: `Engine::seal_descriptor_for_blob(at_rest_sha256, key_id,
+plaintext)` and `Engine::open_descriptor_for_blob(at_rest_sha256, viewer_key_id, sealed)`.
+Three things differ from the ask, each handled and pinned:
+
+- **Seal location: `content`, not `media`.** persist v51 accepts a sealed `media` struct, but a
+  v50 reader still refuses one (MEDIA_SOURCE §9.5), so the seal stays in
+  `BlobPointer.sealed_descriptor` under `content` and no `media` member is emitted. The move to
+  persist's `media` struct (CIRISEdge#638) waits until the fleet floor is ≥ v51.
+- **The opener takes the row's AAD (persist v51.0.0 at the tag).** `open_descriptor_for_blob(sha,
+  viewer, sealed, caller_aad)` authenticates the blob under the referencing row before the
+  descriptor opens. Edge's store door takes the same `OpenRequest` as `open` and passes the row's
+  AAD, so `FileRow::describe` opens the descriptor alone (no bytes returned — the drive listing's
+  path, CIRISEdge#702) and a transplanted or moved pointer is refused AT THE DOOR, crypto-class,
+  never `NotGranted` (D8, including the raw door with no row AAD). The door reads the blob to
+  authenticate it, so a row whose bytes are absent is `NotFetched` for `describe` too.
+- **The sealing door recovers the DEK as a viewer.** The store passes this engine's derived key
+  first, then each granted occurrence; if none unwraps on this node the write fails by name (no
+  clear fallback). Chat bodies carry no description (`description: None`): the dimension is the
+  format, so there is nothing to seal and no format for persist to record.
+
+D9 is TESTED on persist's side at the tag (I34b: one recipient set per stream; `Engine::seal_stream_scoped`
+emits the widened chunks' key-grant sets). Edge seals streams only through that Engine door, so
+there is nothing to emit below it.
 
 Every persist door already existed at the pinned version — Q1 shipped in v44.5.0
 (`serve_blob_range_to_peer`), Q2 is settled, the scoped DAG shipped in #832/#838 — so this was never

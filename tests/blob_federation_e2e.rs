@@ -387,7 +387,11 @@ async fn the_row_carries_the_meaning_and_the_bytes_never_do() {
             asserted_at: ts(),
             field: ContentField::Body,
             plaintext: b"the bytes",
-            media_type: Some("text/plain"),
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
         })
         .await
         .expect("seal");
@@ -484,7 +488,11 @@ async fn a_peer_holding_only_the_pointer_reads_not_held_not_not_granted() {
             asserted_at: ts(),
             field: ContentField::Body,
             plaintext: b"bytes that live only on node A",
-            media_type: Some("text/plain"),
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
         })
         .await
         .expect("alice seals on her own node");
@@ -564,7 +572,11 @@ async fn a_commons_blob_opens_on_any_node_because_no_key_is_involved() {
             asserted_at: ts(),
             field: ContentField::Body,
             plaintext: body,
-            media_type: Some("text/plain"),
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
         })
         .await
         .expect("seal on A");
@@ -583,7 +595,11 @@ async fn a_commons_blob_opens_on_any_node_because_no_key_is_involved() {
             asserted_at: ts(),
             field: ContentField::Body,
             plaintext: body,
-            media_type: Some("text/plain"),
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
         })
         .await
         .expect("B stores the transferred bytes");
@@ -640,7 +656,7 @@ async fn holds_bytes_says_possession_and_never_meaning() {
             // Bytes with no referencing row anywhere. Nothing in the
             // substrate refuses this today.
             plaintext: b"\x00\x01\x02 unexplained bytes",
-            media_type: None,
+            description: None,
         })
         .await
         .expect("the substrate accepts unexplained bytes");
@@ -723,6 +739,11 @@ async fn a_pointer_to_bytes_that_were_never_written_is_a_miss() {
         media_type: Some("text/plain".into()),
         stream_id: None,
         epoch: None,
+        codec: None,
+        sealed_descriptor: None,
+        size: None,
+        content_digest: None,
+        placeholder: None,
     };
 
     let err = node_a
@@ -1093,6 +1114,8 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
             scrub_signature_classical: B64.encode(&ed_sig),
             scrub_signature_pqc: Some(B64.encode(&pqc_sig)),
             supersede_proof: None,
+            cosignatures: Vec::new(),
+            lineage: Vec::new(),
         })
         .await
         .expect("seed the room");
@@ -1164,7 +1187,11 @@ async fn a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive() {
             asserted_at: ts(),
             field: ContentField::Body,
             plaintext: body,
-            media_type: Some("text/plain"),
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
         })
         .await
         .expect("seal at the community tier");
@@ -1541,7 +1568,11 @@ async fn an_authorized_withdraws_that_arrived_first_evicts_when_its_target_lands
             asserted_at: ts(),
             field: ContentField::Body,
             plaintext: body,
-            media_type: Some("text/plain"),
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
         })
         .await
         .expect("seal");
@@ -1609,6 +1640,221 @@ async fn an_authorized_withdraws_that_arrived_first_evicts_when_its_target_lands
     );
     let (_, _, pending, _, _) = register.stats();
     assert_eq!(pending, 0, "consumed on replay, not left to replay twice");
+    assert_eq!(register.verdict(&sha), BytesVerdict::Revoked);
+    assert!(matches!(
+        serve.read_chunk(sha, sha, &node_b.me).await,
+        Err(ChunkSourceRefusal::Withdrawn)
+    ));
+    assert!(node_b.dir.get_blob(&sha).await.expect("get_blob").is_none());
+}
+
+/// A signed `delegates_to(granter → grantee)` carrying `scope`, built with the
+/// same binder and signer every edge producer uses.
+#[allow(clippy::similar_names)] // granter/grantee mirrors persist's column names
+async fn signed_delegation(
+    granter: &Ident,
+    grantee: &Ident,
+    scope: &str,
+) -> ciris_persist::federation::Attestation {
+    use ciris_edge::replication::attestation_bind::{
+        bind_attestation_envelope, truncate_to_substrate_resolution, AttestationColumns,
+    };
+    use sha2::Digest as _;
+
+    let signer = edge_signer_for(granter);
+    let asserted_at = truncate_to_substrate_resolution(ts());
+    let attestation_id = format!("deleg-{}-{}", granter.key_id, grantee.key_id);
+    let mut envelope = serde_json::json!({ "scope": [scope] });
+    let subjects: Vec<String> = Vec::new();
+    bind_attestation_envelope(
+        &mut envelope,
+        asserted_at,
+        &AttestationColumns {
+            attestation_id: &attestation_id,
+            attesting_key_id: &granter.key_id,
+            attestation_type: "delegates_to",
+            attested_key_id: &grantee.key_id,
+            subject_key_ids: &subjects,
+            cohort_scope: "federation",
+            weight: None,
+        },
+    );
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
+    let digest = sha2::Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) =
+        ciris_edge::identity::sign_bound_hybrid(&signer, &canonical, "delegation row")
+            .await
+            .expect("sign the delegation");
+    ciris_persist::federation::Attestation {
+        attestation_id,
+        attesting_key_id: granter.key_id.clone(),
+        attested_key_id: grantee.key_id.clone(),
+        attestation_type: "delegates_to".to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: granter.key_id.clone(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: "federation".to_owned(),
+        tier: "federation".to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    }
+}
+
+/// **A `withdraws` retires at the depth it was ADMITTED under** (persist
+/// v50.0.0 CIRISPersist#928 review H2; CIRISEdge#703). A seven-hop
+/// `consent_revocation` proxy chain `k0 → … → k6 → alice` names the row's
+/// subject. B admitted k0's withdrawal while it walked the legacy 16-hop
+/// depth (the depth every pre-v50 row is backfilled at), with the target not
+/// yet local — so it is stored rule=None and recorded at 16. The node's depth
+/// then drops to the CC 4.1.1 default (5). When the row lands, the register's
+/// recompute must re-derive at the ROW's admission depth: the bytes still go.
+/// Walking the node's CURRENT depth (the write-time gate) would un-retire what
+/// the row validly retired — the regression this pins.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // chain, crossing, and replay in order on purpose
+async fn a_seven_hop_withdraws_admitted_at_the_legacy_depth_still_stops_the_bytes() {
+    use ciris_edge::blob_swarm::revocation::{apply_observation, observe};
+    use ciris_edge::blob_swarm::{
+        BlobChunkSource as _, BlobEvictor, BytesVerdict, ChunkSourceRefusal,
+        PersistBlobChunkSource, RevocationRegister,
+    };
+    use ciris_edge::replication::attestation_bind::withdraws_attestation;
+    use ciris_persist::federation::admission::DELEGATION_SCOPE_CONSENT_REVOCATION;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::{
+        FederationDirectory as _, SignedAttestation, DEFAULT_DELEGATION_DEPTH, MAX_DELEGATION_DEPTH,
+    };
+
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let proxies: Vec<Ident> = (0..7u8)
+        .map(|i| Ident::new(&format!("proxy-k{i}"), 0x40 + i))
+        .collect();
+    let mut idents: Vec<&Ident> = vec![&alice, &bob];
+    idents.extend(proxies.iter());
+    let room = "room-alice-bob";
+    let node_a = node(&idents, &alice).await;
+    let node_b = node(&idents, &bob).await;
+    seed_room(&node_a, room, &[&alice, &bob]).await;
+    seed_room(&node_b, room, &[&alice, &bob]).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+
+    // k0 → k1 → … → k6 → alice: seven consent_revocation hops on B.
+    let mut chain: Vec<&Ident> = proxies.iter().collect();
+    chain.push(&alice);
+    for w in chain.windows(2) {
+        node_b
+            .dir
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: signed_delegation(w[0], w[1], DELEGATION_SCOPE_CONSENT_REVOCATION)
+                    .await,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("B admits {} → {}: {e}", w[0].key_id, w[1].key_id));
+    }
+
+    let body = b"withdrawn by a proxy seven hops out";
+    let sealed = node_a
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(room),
+            author_key_id: &alice.key_id,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: body,
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
+        })
+        .await
+        .expect("seal");
+    let sha = cross_key_and_bytes(&node_a, &node_b, &sealed, &alice, room, body).await;
+
+    let register = Arc::new(RevocationRegister::default());
+    let serve = PersistBlobChunkSource::new(node_b.store.engine().clone())
+        .with_revocations(Some(Arc::clone(&register)));
+    let evictor: &dyn BlobEvictor = node_b.store.engine();
+
+    let row = signed_content_row(&alice, room, &sealed.pointer).await;
+    node_a
+        .dir
+        .put_attestation_authored(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("A admits the row");
+
+    // k0's withdrawal crosses FIRST, while B walks the legacy 16-hop depth.
+    node_b
+        .dir
+        .set_withdraws_delegation_depth(MAX_DELEGATION_DEPTH);
+    let withdraws = withdraws_attestation(&row, "proxy", ts(), &edge_signer_for(&proxies[0]))
+        .await
+        .expect("build");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: withdraws.clone(),
+        })
+        .await
+        .expect("admitted deferred: the target is not here yet");
+    assert_eq!(
+        node_b
+            .dir
+            .withdraws_admission_depth(&withdraws.attestation_id)
+            .await
+            .expect("depth read"),
+        Some(MAX_DELEGATION_DEPTH),
+        "precondition: recorded at the depth it was admitted under",
+    );
+    assert!(apply_observation(
+        &register,
+        &*node_b.dir,
+        Some(evictor),
+        observe(&withdraws).expect("observed"),
+    )
+    .await
+    .is_empty());
+
+    // The node's depth drops to the CC 4.1.1 default; seven hops exceed it.
+    node_b
+        .dir
+        .set_withdraws_delegation_depth(DEFAULT_DELEGATION_DEPTH);
+
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("B admits the row");
+    let evicted = apply_observation(
+        &register,
+        &*node_b.dir,
+        Some(evictor),
+        observe(&row).expect("observed"),
+    )
+    .await;
+    assert_eq!(
+        evicted,
+        vec![sha],
+        "the replayed withdrawal re-derives at its ADMISSION depth (16) and the seven-hop \
+         proxy still retires the bytes — not at the node's current default (5)",
+    );
     assert_eq!(register.verdict(&sha), BytesVerdict::Revoked);
     assert!(matches!(
         serve.read_chunk(sha, sha, &node_b.me).await,
@@ -1686,7 +1932,11 @@ async fn a_withdraws_revokes_the_bytes_on_a_holder_and_an_unauthorized_one_is_in
             asserted_at: ts(),
             field: ContentField::Body,
             plaintext: body,
-            media_type: Some("text/plain"),
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
         })
         .await
         .expect("seal at the community tier");
@@ -2113,6 +2363,7 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
             room: &ciris_edge::self_room::room(&alice.key_id),
             bytes: b"my file, on my other device",
             media_type: "text/plain",
+            codec: None,
             filename: Some("my-file.txt"),
             asserted_at: ts(),
         },
@@ -2161,7 +2412,25 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         "the room is exhausted, and a caller can tell — a short page is never \
          mistaken for a small drive"
     );
-    assert_eq!(drive.files[0].filename.as_deref(), Some("my-file.txt"));
+    // CIRISEdge#698 — a self file is encrypted, so its name is SEALED with
+    // the bytes: the listing says `Sealed`, never the name in clear.
+    assert_eq!(drive.files[0].filename, None);
+    assert_eq!(
+        drive.files[0].descriptor(),
+        ciris_edge::files::Descriptor::Sealed
+    );
+    let described = drive.files[0]
+        .open_described(&node_a.store, &node_a.me)
+        .await
+        .expect("the author opens bytes and descriptor together");
+    assert_eq!(
+        described.descriptor,
+        ciris_edge::files::Descriptor::Opened {
+            format: "text/plain".into(),
+            codec: None,
+            name: Some("my-file.txt".into()),
+        }
+    );
     assert_eq!(
         drive.files[0].pointer.content_sha256,
         published.pointer.content_sha256
@@ -2198,6 +2467,7 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
             room: &room,
             bytes: b"a file for the room",
             media_type: "text/plain",
+            codec: None,
             filename: Some("room-file.txt"),
             asserted_at: ts(),
         },
@@ -2215,9 +2485,10 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         drive
             .files
             .iter()
-            .map(|f| f.filename.as_deref())
+            .map(|f| f.pointer.content_sha256.as_str())
             .collect::<Vec<_>>(),
-        vec![Some("room-file.txt")],
+        vec![in_room.pointer.content_sha256.as_str()],
+        // By address: a CommunityDek file's name is sealed (CIRISEdge#698).
         "R10 (community): the room's file, and only the room's file"
     );
     assert!(drive.resume.is_none(), "one file, one page");
@@ -2227,7 +2498,7 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
             .expect("list")
             .files
             .iter()
-            .all(|f| f.filename.as_deref() != Some("room-file.txt")),
+            .all(|f| f.pointer.content_sha256 != in_room.pointer.content_sha256),
         "the community file is not in alice's self drive: the gate keys on the row's room"
     );
 
@@ -2605,7 +2876,11 @@ async fn a_community_pull_stops_at_the_scope_router_on_a_legacy_node() {
             asserted_at: ts(),
             field: ContentField::Body,
             plaintext: body,
-            media_type: Some("text/plain"),
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
         })
         .await
         .expect("seal at the community tier");
@@ -2960,7 +3235,11 @@ async fn a_community_pull_resolves_through_the_rooms_group_and_stops_at_the_scop
             asserted_at: ts(),
             field: ContentField::Body,
             plaintext: body,
-            media_type: Some("text/plain"),
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
         })
         .await
         .expect("seal at the community tier");
@@ -3093,6 +3372,7 @@ async fn a_resumed_drive_listing_never_steps_over_a_file() {
                 room: &room,
                 bytes: format!("contents of {name}").as_bytes(),
                 media_type: "text/plain",
+                codec: None,
                 filename: Some(name),
                 // Distinct instants: the drive is ordered newest-first on
                 // (asserted_at, attestation_id).
@@ -3164,6 +3444,7 @@ async fn a_file_over_the_inline_bound_is_chunked_and_still_opens() {
             room: &room,
             bytes: &big,
             media_type: "video/mp4",
+            codec: None,
             filename: Some("boat.mp4"),
             asserted_at: ts(),
         },
@@ -3191,8 +3472,21 @@ async fn a_file_over_the_inline_bound_is_chunked_and_still_opens() {
         .await
         .expect("list");
     assert_eq!(drive.files.len(), 1);
-    assert_eq!(drive.files[0].filename.as_deref(), Some("boat.mp4"));
+    // CIRISEdge#698 — sealed with the MANIFEST's DEK, opened with the bytes.
+    assert_eq!(drive.files[0].filename, None);
     assert!(drive.files[0].pointer.stream_id.is_some());
+    assert_eq!(
+        drive.files[0]
+            .open_described(&node_a.store, &node_a.me)
+            .await
+            .expect("bytes and descriptor open together")
+            .descriptor,
+        ciris_edge::files::Descriptor::Opened {
+            format: "video/mp4".into(),
+            codec: None,
+            name: Some("boat.mp4".into()),
+        }
+    );
 
     // And it opens, byte for byte, through the same door as an inline blob.
     let opened = drive.files[0]
@@ -3244,6 +3538,7 @@ async fn every_file_size_around_the_inline_bound_publishes_and_round_trips() {
                 room,
                 bytes: &bytes,
                 media_type: "application/octet-stream",
+                codec: None,
                 filename: Some("sized.bin"),
                 asserted_at: ts() + chrono::Duration::seconds(nth),
             },
@@ -3298,6 +3593,7 @@ async fn a_withdrawn_file_is_listed_as_withdrawn_only_when_history_is_asked_for(
                 room: &room,
                 bytes: format!("contents of {name}").as_bytes(),
                 media_type: "text/plain",
+                codec: None,
                 filename: Some(name),
                 asserted_at: ts() + chrono::Duration::seconds(nth),
             },
@@ -3432,6 +3728,7 @@ async fn a_file_is_authored_by_its_person_and_withdrawn_from_their_other_device(
             room: &room,
             bytes: b"alice's contract",
             media_type: "text/plain",
+            codec: None,
             filename: Some("contract.txt"),
             asserted_at: ts(),
         },
@@ -3536,6 +3833,7 @@ async fn a_file_is_authored_by_its_person_and_withdrawn_from_their_other_device(
             room: &room,
             bytes: b"written by the node",
             media_type: "text/plain",
+            codec: None,
             filename: Some("legacy.txt"),
             asserted_at: ts() + chrono::Duration::seconds(20),
         },
@@ -3573,4 +3871,495 @@ async fn a_file_is_authored_by_its_person_and_withdrawn_from_their_other_device(
     )
     .await
     .expect("the authoring node withdraws its own row");
+
+    // ── CIRISEdge#941 (persist v51, CC 3.4.7.3): the node's OWNER retracts a
+    // node-authored row from her other device ─────────────────────────────
+    let node_written = publish(
+        &*node_a.dir,
+        &node_a.store,
+        Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &FileWrite {
+            room: &room,
+            bytes: b"written by the laptop before #708",
+            media_type: "text/plain",
+            codec: None,
+            filename: Some("laptop.txt"),
+            asserted_at: ts() + chrono::Duration::seconds(40),
+        },
+    )
+    .await
+    .expect("a node-authored file");
+    assert_eq!(node_written.row.attesting_key_id, node_a.me);
+    let crossed_id = match &node_written.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!("crossed: {other:?}")
+        }
+    };
+    let node_row = node_a
+        .dir
+        .get_attestation(&crossed_id)
+        .await
+        .expect("read")
+        .expect("the crossed node-authored row is held");
+    node_b
+        .dir
+        .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: node_row.clone(),
+        })
+        .await
+        .expect("B admits the node-authored row");
+    let not_owner = withdraw(
+        &*node_b.dir,
+        &node_row,
+        "not my node",
+        ts() + chrono::Duration::seconds(45),
+        Signers {
+            node: &node_b.signer,
+            actor: Some(&carol_signer),
+        },
+    )
+    .await;
+    assert!(
+        matches!(not_owner, Err(FileError::NotAuthor { ref author, .. }) if *author == node_a.me),
+        "carol is neither the authoring node nor its owner: {not_owner:?}"
+    );
+    let owners = withdraw(
+        &*node_b.dir,
+        &node_row,
+        "deleted from my phone — my laptop wrote it",
+        ts() + chrono::Duration::seconds(50),
+        Signers {
+            node: &node_b.signer,
+            actor: Some(&alice_signer),
+        },
+    )
+    .await
+    .expect("the node's owner withdraws what her node produced (CIRISPersist#941)");
+    assert_eq!(owners.attesting_key_id, alice.key_id, "signed as the owner");
+    let stored = node_b
+        .dir
+        .get_attestation(&owners.attestation_id)
+        .await
+        .expect("read")
+        .expect("the owner's withdraws is stored");
+    assert_eq!(
+        stored.withdraws_admission_rule,
+        Some(1),
+        "rule 1 lifted to the producer's principal — the producer's own retraction"
+    );
+}
+
+/// **CIRISEdge#698 — the sealed descriptor** (`FSD/CONTENT_TRANSFER.md`
+/// §6.7.1, CC 3.3.13): a file's name and media type open only with its bytes.
+/// Named `files::…` to match the FSD's witness table; they live here because
+/// this harness is the one with real hybrid nodes, provisioned occurrences
+/// and both encrypted tiers on a real sqlite substrate (D6).
+mod files {
+    use super::*;
+    use ciris_edge::files::{publish, Descriptor, FileRow, FileWrite, PublishedFile};
+    use ciris_edge::replication::attestation_bind::Signers;
+    use ciris_edge::scope_room::ScopeRoom;
+    use ciris_persist::federation::types::cohort_scope::CryptoTier;
+
+    const SECRET_NAME: &str = "q3-layoffs-draft.pdf";
+    const SECRET_FORMAT: &str = "application/x-ciris-698-format";
+    const SECRET_CODEC: &str = "ciris-698-codec";
+
+    async fn write(
+        node: &Node,
+        room: &ScopeRoom,
+        bytes: &[u8],
+        filename: Option<&str>,
+        codec: Option<&str>,
+        nth: i64,
+    ) -> PublishedFile {
+        publish(
+            &*node.dir,
+            &node.store,
+            Signers {
+                node: &node.signer,
+                actor: None,
+            },
+            &FileWrite {
+                room,
+                bytes,
+                media_type: SECRET_FORMAT,
+                codec,
+                filename,
+                asserted_at: ts() + chrono::Duration::seconds(nth),
+            },
+        )
+        .await
+        .expect("publish")
+    }
+
+    /// Both encrypted tiers, one node: the self room (`InvisibleEncrypted`)
+    /// and a community room (`CommunityDek`).
+    async fn rooms() -> (Node, [(ScopeRoom, CryptoTier); 2]) {
+        let alice = Ident::new("alice-fed", 0x11);
+        let node_a = node(&[&alice], &alice).await;
+        seed_room(&node_a, "room-698", &[&alice]).await;
+        (
+            node_a,
+            [
+                (
+                    ciris_edge::self_room::room(&alice.key_id),
+                    CryptoTier::InvisibleEncrypted,
+                ),
+                (ScopeRoom::community("room-698"), CryptoTier::CommunityDek),
+            ],
+        )
+    }
+
+    /// D1 + D6 — a party that opens the bytes gets the name, format and
+    /// codec, through the same grant; both scope paths, real sqlite.
+    #[tokio::test]
+    async fn a_member_opens_the_bytes_and_the_descriptor_together() {
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        for (i, (room, tier)) in rooms.iter().enumerate() {
+            let nth = i64::try_from(i).expect("fits");
+            let body = format!("the {tier:?} file").into_bytes();
+            let published = write(
+                &node_a,
+                room,
+                &body,
+                Some(SECRET_NAME),
+                Some(SECRET_CODEC),
+                nth,
+            )
+            .await;
+            assert_eq!(published.tier, *tier, "{room}: the tier under test");
+            let row = FileRow::from_row(&published.row).expect("a file row");
+            let opened = row
+                .open_described(&node_a.store, &node_a.me)
+                .await
+                .unwrap_or_else(|e| panic!("{room}: bytes + descriptor open: {e}"));
+            assert_eq!(opened.bytes, body);
+            assert_eq!(
+                opened.descriptor,
+                Descriptor::Opened {
+                    format: SECRET_FORMAT.into(),
+                    codec: Some(SECRET_CODEC.into()),
+                    name: Some(SECRET_NAME.into()),
+                },
+                "{room}: one grant, both facts"
+            );
+        }
+    }
+
+    /// D2 + D7 — a reader who cannot open the bytes gets a pointer, a size
+    /// and a TYPED sealed descriptor: no name, format or codec in clear in
+    /// any row the write generated, and no top-level `media` member (the
+    /// mixed-fleet rule). Once per encrypted tier. The blob-metadata half
+    /// ("persist stores no format for `media_type: None`") is persist's
+    /// #923 twin witness; edge's half is that it hands persist `None`.
+    #[tokio::test]
+    async fn an_unauthorized_reader_sees_a_pointer_a_size_and_no_description() {
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        let body = b"sealed and described".to_vec();
+        for (i, (room, _tier)) in rooms.iter().enumerate() {
+            let nth = i64::try_from(i).expect("fits");
+            let published = write(
+                &node_a,
+                room,
+                &body,
+                Some(SECRET_NAME),
+                Some(SECRET_CODEC),
+                nth,
+            )
+            .await;
+
+            let p = &published.pointer;
+            assert!(p.sealed_descriptor.is_some(), "{room}: sealed");
+            assert_eq!(p.media_type, None, "{room}: no clear format");
+            assert_eq!(p.codec, None, "{room}: no clear codec");
+            assert_eq!(p.size, Some(body.len() as u64), "{room}: size in clear");
+            assert_eq!(
+                p.content_digest.as_deref(),
+                Some(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body)).as_str()),
+                "{room}: the plaintext digest in clear (two-hash case)"
+            );
+            assert!(
+                published.row.attestation_envelope.get("media").is_none(),
+                "{room}: D7 — no top-level `media` member; a v50 reader admits the row"
+            );
+
+            let mut rows = rows_of(&node_a, "").await;
+            rows.push(serde_json::to_vec(&published.row).expect("row bytes"));
+            for bytes in &rows {
+                let text = String::from_utf8_lossy(bytes);
+                for secret in [SECRET_NAME, SECRET_FORMAT, SECRET_CODEC] {
+                    assert!(
+                        !text.contains(secret),
+                        "{room}: `{secret}` appears in clear in a substrate row: {text}"
+                    );
+                }
+            }
+
+            let row = FileRow::from_row(&published.row).expect("a file row");
+            assert_eq!(row.filename, None);
+            assert_eq!(row.media_type, None);
+            assert_eq!(row.descriptor(), Descriptor::Sealed, "typed, never \"\"");
+            let refused = row
+                .open_described(&node_a.store, "stranger-occ")
+                .await
+                .expect_err("a stranger opens neither");
+            assert_eq!(refused.kind(), "not_granted", "{room}: {refused}");
+        }
+    }
+
+    /// D3 — a `sealed_descriptor` copied onto another blob's row does not
+    /// open: its AAD is the address digest of the blob it was sealed for.
+    #[tokio::test]
+    async fn a_descriptor_moved_to_another_blob_does_not_open() {
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        let (room, _) = &rooms[0];
+        let a = write(&node_a, room, b"file a", Some("a.txt"), None, 0).await;
+        let b = write(&node_a, room, b"file b", Some("b.txt"), None, 1).await;
+        let mut row = FileRow::from_row(&a.row).expect("a");
+        row.pointer.sealed_descriptor = b.pointer.sealed_descriptor.clone();
+        let refused = row
+            .open_described(&node_a.store, &node_a.me)
+            .await
+            .expect_err("b's descriptor on a's blob");
+        assert_eq!(refused.kind(), "seal_mismatch", "{refused}");
+    }
+
+    /// D8 — a pointer + descriptor transplanted onto ANOTHER ROW of the same
+    /// blob, or moved to ANOTHER BLOB, is refused AT THE DESCRIPTOR DOOR
+    /// (persist v51.0.0's `caller_aad`, the #923 amendment): after
+    /// authorization, as a crypto-class refusal — never `NotGranted`, since
+    /// the viewer WAS authorized. Checked through `describe` (no bytes
+    /// returned), `open_described`, the store door with row 2's AAD, and the
+    /// raw engine door with NO row AAD at all.
+    #[tokio::test]
+    async fn a_transplanted_descriptor_opens_on_neither_another_row_nor_another_blob() {
+        use base64::Engine as _;
+        use ciris_edge::group_content::{GroupContentStore as _, OpenRequest};
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        let crypto_class = |kind: &str| kind == "seal_mismatch" || kind == "substrate";
+        for (i, (room, _)) in rooms.iter().enumerate() {
+            let nth = i64::try_from(i).expect("fits") * 2;
+            let a = write(&node_a, room, b"file a", Some("a.txt"), None, nth).await;
+            let b = write(&node_a, room, b"file b", Some("b.txt"), None, nth + 1).await;
+
+            // The honest row describes itself — the control.
+            let honest = FileRow::from_row(&a.row).expect("a");
+            assert!(
+                matches!(
+                    honest.describe(&node_a.store, &node_a.me).await,
+                    Ok(Descriptor::Opened { .. })
+                ),
+                "{room}: the control opens"
+            );
+
+            // Another row: a's pointer under b's row columns.
+            let mut transplanted = FileRow::from_row(&b.row).expect("b");
+            transplanted.pointer = a.pointer.clone();
+            for refused in [
+                transplanted
+                    .describe(&node_a.store, &node_a.me)
+                    .await
+                    .expect_err("describe: a's pointer on b's row"),
+                transplanted
+                    .open_described(&node_a.store, &node_a.me)
+                    .await
+                    .expect_err("open_described: a's pointer on b's row"),
+            ] {
+                assert!(
+                    crypto_class(refused.kind()),
+                    "{room}: row gate is crypto-class, never not_granted: {refused}"
+                );
+            }
+            // The store door itself, presented row 2's AAD.
+            let at_door = node_a
+                .store
+                .open_descriptor(OpenRequest {
+                    pointer: &transplanted.pointer,
+                    author_key_id: &transplanted.attesting_key_id,
+                    asserted_at: transplanted.asserted_at,
+                    viewer_key_id: &node_a.me,
+                })
+                .await
+                .expect_err("the door refuses row 2's AAD");
+            assert!(
+                !matches!(
+                    at_door,
+                    ciris_edge::group_content::GroupContentError::NotGranted { .. }
+                ),
+                "{room}: after authorization, never NotGranted: {at_door}"
+            );
+            // The raw engine door with NO row AAD: refused too.
+            let sha: [u8; 32] = hex::decode(&a.pointer.content_sha256)
+                .expect("hex")
+                .try_into()
+                .expect("32");
+            let sealed = base64::engine::general_purpose::STANDARD
+                .decode(a.pointer.sealed_descriptor.as_deref().expect("sealed"))
+                .expect("b64");
+            let bare = node_a
+                .store
+                .engine()
+                .open_descriptor_for_blob(&sha, &node_a.me, &sealed, None)
+                .await
+                .expect_err("no row AAD, no descriptor");
+            assert!(
+                !matches!(
+                    bare,
+                    ciris_persist::federation::BlobError::NotGranted { .. }
+                ),
+                "{room}: crypto-class, never NotGranted: {bare}"
+            );
+
+            // Another blob.
+            let mut moved = FileRow::from_row(&a.row).expect("a");
+            moved.pointer.sealed_descriptor = b.pointer.sealed_descriptor.clone();
+            let refused = moved
+                .describe(&node_a.store, &node_a.me)
+                .await
+                .expect_err("b's descriptor on a's blob");
+            assert!(crypto_class(refused.kind()), "{room}: blob gate: {refused}");
+        }
+    }
+
+    /// D9 — a chunked file's descriptor binds to the MANIFEST, and one access
+    /// set covers the manifest and every chunk: a viewer granted the manifest
+    /// opens name + every chunk together, a stranger opens none, and on the
+    /// self tier every granted occurrence holds an at-rest grant on the
+    /// manifest AND on each chunk row. persist v51.0.0 made this structural
+    /// (one recipient set per stream, `chunk_key_grant_emissions` emitted by
+    /// `Engine::seal_stream_scoped` — edge seals only through that Engine
+    /// door) and TESTED the mid-write occurrence change as I34b; edge's
+    /// one-call seal cannot interleave an occurrence change, so that half is
+    /// persist's witness.
+    #[tokio::test]
+    async fn a_chunked_files_descriptor_and_every_chunk_share_one_access_set() {
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        let cap = ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP;
+        let big: Vec<u8> = (0..(cap + 3 * 4096 + 11))
+            .map(|i| u8::try_from(i % 241).expect("a byte"))
+            .collect();
+        for (i, (room, _)) in rooms.iter().enumerate() {
+            let nth = i64::try_from(i).expect("fits");
+            let published = write(&node_a, room, &big, Some("big.bin"), None, nth).await;
+            assert!(published.pointer.stream_id.is_some(), "{room}: a DAG");
+            let row = FileRow::from_row(&published.row).expect("a file row");
+            let opened = row
+                .open_described(&node_a.store, &node_a.me)
+                .await
+                .unwrap_or_else(|e| panic!("{room}: manifest, chunks, descriptor: {e}"));
+            assert_eq!(opened.bytes, big, "{room}: every chunk");
+            assert_eq!(
+                opened.descriptor,
+                Descriptor::Opened {
+                    format: SECRET_FORMAT.into(),
+                    codec: None,
+                    name: Some("big.bin".into()),
+                }
+            );
+            assert!(
+                row.open_described(&node_a.store, "stranger-occ")
+                    .await
+                    .is_err(),
+                "{room}: a stranger opens none"
+            );
+            if published.tier == CryptoTier::InvisibleEncrypted {
+                use ciris_persist::federation::BlobStorage as _;
+                let manifest: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+                    .expect("hex")
+                    .try_into()
+                    .expect("32");
+                let chunks = node_a
+                    .dir
+                    .stream_chunks(published.pointer.stream_id.as_deref().expect("a DAG"))
+                    .await
+                    .expect("list the stream")
+                    .chunks;
+                assert!(chunks.len() > 1, "{room}: several chunks");
+                assert!(!published.granted.is_empty(), "{room}: someone is granted");
+                for occ in &published.granted {
+                    for sha in std::iter::once(manifest).chain(chunks.iter().map(|c| c.chunk_sha)) {
+                        assert!(
+                            node_a
+                                .dir
+                                .get_at_rest_grant(&sha, occ)
+                                .await
+                                .expect("grant lookup")
+                                .is_some(),
+                            "{room}: {occ} granted the manifest must hold a grant on {} too \
+                             (one access set per stream)",
+                            hex::encode(sha)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// CIRISEdge#638 item 2 — the puller's size check, against the length
+    /// persist ACTUALLY records for the sealed body (`BlobHead.size_bytes`),
+    /// at both encrypted tiers: the declared size a far node checks is the
+    /// stored length a holder serves, or every honest pull is refused.
+    #[tokio::test]
+    async fn a_pointers_declared_size_is_the_stored_length_persist_records() {
+        use ciris_persist::federation::BlobStorage as _;
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        for (i, (room, tier)) in rooms.iter().enumerate() {
+            let nth = i64::try_from(i).expect("fits");
+            let body = vec![7u8; 4321 + i];
+            let published = write(&node_a, room, &body, Some("sized.bin"), None, nth).await;
+            let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+            let head = node_a
+                .dir
+                .blob_head(&sha)
+                .await
+                .expect("blob_head")
+                .expect("the blob is held");
+            assert_eq!(
+                ciris_edge::blob_swarm::pull::declared_stored_len(&published.pointer),
+                Some(head.size_bytes),
+                "{room} ({tier:?}): declared size ⇒ the stored length persist records"
+            );
+        }
+    }
+
+    /// D10 — a nameless file seals `{format}` only and reads back `None`,
+    /// never `""`.
+    #[tokio::test]
+    async fn a_nameless_file_seals_format_only_and_reads_back_absent() {
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        let (room, _) = &rooms[1];
+        let published = write(&node_a, room, b"no name", None, None, 0).await;
+        assert!(published.pointer.sealed_descriptor.is_some());
+        let opened = FileRow::from_row(&published.row)
+            .expect("a file row")
+            .open_described(&node_a.store, &node_a.me)
+            .await
+            .expect("opens");
+        assert_eq!(
+            opened.descriptor,
+            Descriptor::Opened {
+                format: SECRET_FORMAT.into(),
+                codec: None,
+                name: None,
+            }
+        );
+    }
 }

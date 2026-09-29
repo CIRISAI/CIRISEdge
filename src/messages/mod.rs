@@ -1048,6 +1048,14 @@ pub enum DelegationRefusalSubReason {
     /// (same posture as `NoAccordHoldersConfigured` on the
     /// AccordCarrier gate).
     SubstrateUnavailable,
+    /// persist v50.0.0 (CIRISPersist#928, CC 4.1.1; CIRISEdge#701) — the
+    /// signer was not reached within the walk's effective depth cap AND a
+    /// scope-bearing chain continues past it: the chain is too deep to confer
+    /// (self-verify only). A verdict about the CHAIN, not the substrate — never
+    /// booked as `SubstrateUnavailable`; a receiver may lift it only by an
+    /// explicit deeper `delegation_graph_max_depth` (16 is the ceiling). Wire
+    /// token `beyond_depth_cap`.
+    BeyondDepthCap,
 }
 
 /// Domain-separation tag for [`DeliveryRefusalAttestation::canonical_bytes`].

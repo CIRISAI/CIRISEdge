@@ -410,6 +410,8 @@ pub async fn signed_community(
         scrub_signature_classical,
         scrub_signature_pqc,
         supersede_proof: None,
+        cosignatures: Vec::new(),
+        lineage: Vec::new(),
     })
 }
 
@@ -683,7 +685,11 @@ pub async fn chat_message_attestation_in(
             asserted_at: at,
             field: crate::group_content::ContentField::Body,
             plaintext: body.as_bytes(),
-            media_type: Some("text/plain"),
+            // A chat body's format is its dimension's (`chat:message:v1` is
+            // text), so it carries no description: nothing to seal beside
+            // encrypted bytes, and no format for persist to record
+            // (CIRISEdge#698).
+            description: None,
         })
         .await
         .map_err(|e| format!("seal chat content: {e}"))?;
