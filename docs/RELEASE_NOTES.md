@@ -2,7 +2,7 @@
 
 # v33.0.0 — adopt persist v51.0.0 + CIRISVerify 18.0.0: a file's name opens only with its bytes, the owner retracts what their node wrote, the relay-delivery score admits
 
-**2026-09-28** (CIRISPersist#943 → v51.0.0; CIRISVerify v18.0.0; CIRISConstitution#129 rc6 `651140a`;
+**2026-09-29** (CIRISPersist#943 → v51.0.0 at `d7f3a40`; CIRISVerify v18.0.0; CIRISConstitution#129 rc6 `651140a`;
 CIRISEdge#698, #941, #638 item 2, #694, #701, #703, #706; CIRISPersist#920, #922/#923, #924, #926,
 #928, #931, #937/#938/#939, #941). **MAJOR** from v32.1.0: persist is a MAJOR (nobody adopts
 v50 — this cut carries its surface too), the wheel floor moves, `DIRECTORY_ABI_VERSION` moved 5→6
@@ -14,7 +14,7 @@ the graph).
 
 | | v32.1.0 | v33.0.0 |
 |---|---|---|
-| ciris-persist (Cargo) | `tag = "v49.0.0"` | `tag = "v51.0.0"` (`version = "51"`) |
+| ciris-persist (Cargo) | `tag = "v49.0.0"` | `tag = "v51.0.0"` (`version = "51"`) → `d7f3a4054033` |
 | ciris-persist (wheel floor) | `>=49,<50` | `>=51,<52` |
 | CIRISVerify crates | `v17.1.0` | `v18.0.0` (`version = "18"`, lockstep) |
 | `DIRECTORY_ABI_VERSION` | 5 | **6** (at v50; executor/outbound/signer stay 1) |
@@ -22,7 +22,10 @@ the graph).
 | `ENVELOPE_VOCABULARY_SHA256` (persist's; edge pins none) | `a6a84cc9…` | `c9558c98…` |
 | vendored CC registry | rc5 `a4d29a6`, 148 families, 962 vectors | rc6 `651140a`, 149 families, 968 vectors, `registry_sha256` `c22dc087…` |
 
-Riders re-pin the wheel floor and the ABI; no replication/consent hash moves.
+Riders re-pin the wheel floor and the ABI; no replication/consent hash moves. Every constant was
+re-diffed from source at the tag after the merge (16 review fixes landed between the release branch
+and `d7f3a40`): nothing moved. persist's capsule op/result digests grew (`PutLineageHeadCosign` /
+`LineageCosignOutcome` appended) with `DIRECTORY_ABI_VERSION` still 6.
 
 ## The sealed descriptor (#698, CC 3.3.13, CIRISConstitution#114)
 
@@ -34,25 +37,33 @@ clear format, codec or row `filename`. **The store decides, after persist resolv
 persist no media type at all. Plaintext tier: format/codec in clear, nothing sealed. Chat bodies
 carry no description (the dimension is the format).
 
-Reader: `FileRow::open_described(store, viewer) -> Opened { bytes, descriptor }`, bytes first under
-the row's AAD, then the descriptor — `Descriptor::{Clear, Opened, Sealed}`, `Ok` never `Sealed`.
+Reader: `FileRow::describe(store, viewer) -> Descriptor` opens the descriptor ALONE under the row's
+AAD (persist's `open_descriptor_for_blob(sha, viewer, sealed, caller_aad)`, the #923 amendment in the
+tag) — the drive-listing path CIRISServer asked for on #702; the door authenticates the blob, so
+absent bytes still read `NotFetched`. `FileRow::open_described` = `open` + `describe`, `Opened { bytes,
+descriptor }`. `Descriptor::{Clear, Opened, Sealed}`; `Ok` never `Sealed`. `GroupContentStore::
+open_descriptor` takes the same `OpenRequest` as `open`.
 `FileRow::try_from_row` refuses two descriptions (or none) by name (`NotAFile`); `from_row` drops
 them with a WARN. **Seal location: inside edge's `content` pointer, not a `media` member** — a
 v50 reader refuses a sealed `media` struct, so persist's `media` adoption (#638 item 3) waits for a
 fleet floor ≥ v51.
 
-Two gaps, stated: persist v51's opener takes **no `caller_aad`** (the accepted #923 amendment did
-not ship), so D8's row gate is edge's ordering and a direct door caller is blob-bound only — pinned
-by the D8 witness, flips when persist adds it. **D9** (one access set per stream across a mid-write
-occurrence change) is persist's witness and is not marked TESTED in v51; edge's D9 covers the
-same-viewer half only. Witnesses D1–D5, D8, D10 (+ D6 on real sqlite at both encrypted tiers; D7
-inside D2) — `tests/blob_federation_e2e.rs::files::*`, `files::tests::*`.
+Both #923 amendments are in the tag and closed here. **D8:** a pointer transplanted onto another row
+is refused AT THE DOOR under row 2's AAD, and under no AAD at all — crypto-class, never
+`NotGranted`. **D9:** persist wraps a stream's manifest and every chunk to one recipient set and
+`Engine::seal_stream_scoped` emits `chunk_key_grant_emissions` (TESTED, I34b); edge seals only through
+that Engine door, and its D9 witness checks every granted occurrence holds a grant on every chunk.
+Witnesses D1–D5, D8–D10 (+ D6 on real sqlite at both encrypted tiers; D7 inside D2) —
+`tests/blob_federation_e2e.rs::files::*`, `files::tests::*`.
 
 ## The owner retracts what their node wrote (#941, CIRISPersist#941, CC 3.4.7.3)
 
 `files::withdraw` falls back to the actor in hand when it is the authoring node's single live
-owner; persist's door keeps the binding-at-or-before-the-row guard. A stranger still gets
-`FileError::NotAuthor`. Mixed fleet: a v50 node refuses what a v51 node admits.
+owner; persist judges it: the issuer's owner-binding must be in force at the row's instant and no
+other owner's (A→B→A and a backdated re-binding refused, a hand-off admitted). A stranger still gets
+`FileError::NotAuthor`. Mixed fleet: a v50 node refuses what a v51 node admits. Follow-up: edge's
+`owner_binding_attestation` keys its id by the node alone, so a hand-off's second binding collides
+with the first's id.
 
 ## A declared size is checked (#638 item 2, CC 5.3.2.5)
 
@@ -74,6 +85,11 @@ produces no `trust:accepts:v1` edge and no trust-root community. The charter fix
 `attach_window_secs` / `witness_cadence_secs` / `witness_quorum` at persist's shipped defaults; a
 key root holds no lineage, so T4a is not armed for it and every ladder/bridge witness stays green.
 
+**A stalled trust root still Roots** (T7 + T4): v51 serves a stalled community with `live: false`
+(v50 returned nothing); it is valid but non-admitting — `trust_root_valid` ignores `live` by design
+and persist refuses the new member at `admit_community_change`. `rooted_with` reads only `.valid`,
+so pairs attached before a stall stay Rooted (`FSD/FIRST_CONTACT.md` I12). No edge gate added.
+
 ## Carried from the v50 pre-stage
 
 - **MLS state opens on disk under persist's content master** (#694, CIRISPersist#920):
@@ -90,7 +106,7 @@ key root holds no lineage, so T4a is not armed for it and every ladder/bridge wi
 
 `SealRequest.media_type` → `description`; `BlobPointer` gains five optional members (struct
 literals must name them); `FileWrite.codec`; `FileRow.codec`; `PullOutcome::SizeMismatch`;
-`GroupContentStore::open_descriptor` (defaulted); `open_mls_state` takes the `Engine`.
+`GroupContentStore::open_descriptor(OpenRequest)` (defaulted); `FileRow::describe`; `open_mls_state` takes the `Engine`.
 
 # v32.1.0 — durable MLS state over persist's sealed store, rejoin after restart, one boot re-address call (CIRISEdge#676)
 
