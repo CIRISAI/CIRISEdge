@@ -351,6 +351,65 @@ shared-interface handoff is the follow-up and needs leviculum's cooperation.
 Evidence row: `CLM-scoped-body-identity-link` (CC 5.4.6) in `evidence/CIRISEdge.cc_impl.tsv`,
 generated from `field_conformance::EDGE_CC_CLAIM_CONFORMANCE`.
 
+### 3.5 A link belongs to exactly one plane (CIRISEdge#728)
+
+A Reticulum link is dialled to ONE destination hash, and that hash names the plane the link
+lives on for its whole life: an announced (federation) destination puts the link on the
+**identity plane**; a scope-derived member address — one the `ScopeAddressTable` reverse
+index holds, on either end — makes it a **scoped link**. Edge classifies every link at
+establishment (`LinkEstablished` carries the destination on both sides; the dial paths know
+what they dialled before that) and stores the plane beside the link's peer association
+(`link_plane`, `ReticulumTransport`). The two facts are orthogonal: a scoped link the peer
+identified IS attributed to that peer (a scoped body still needs a source), and that
+attribution says nothing about which traffic may ride the link. The field failure this
+section closes (CIRISServer `selffiles`, v34.2.0) was the reverse-path selector reading the
+attribution as a licence: D2 dialled D1's self-room address, D1 keyed the link to D2 at
+`LinkIdentified` and then chose it as "D2's freshest live link" for identity-plane
+Delivers, and D2 dropped every one — its side of the link resolves to D1's derived address,
+which is an arrival discriminator, not a peer identity. One link pool serving two planes.
+
+**The selection rule.** Every link lookup is keyed by `(peer, plane)`, never by peer alone.
+An identity-plane send — replication rounds and Delivers, opaque requests and answers by
+key, announce and bundle pushes, content fetch, i.e. everything that goes through
+`Transport::send` — selects only identity-plane links (`live_link_to(peer, Identity)`, the
+`reusable_dialed_link` pool), and when none is live it dials the peer's identity destination
+exactly as it would with no link at all. A scoped send never resolves by peer: it dials the
+derived address (`send_to_scoped_destination`) or, under §3.4's forwarder rule, the identity
+link — and the answer to a request rides the link the request arrived on (`ReplyPath`, #683),
+which keeps a scoped request's answer on its scoped link without the answer path having to
+know the plane. The responder-side `CANN`/`CBND` push at link-up is identity-plane control
+traffic and is not made on a scoped link.
+
+**The refusal.** The receiver enforces the same line: a replication frame (`CRPL`), an
+announce frame (`CANN`) or a bundle frame (`CBND`) arriving on a scoped link is refused by
+name — `identity_frame_on_scoped_link`, counted in `transport_inbound_drops`, logged
+(throttled) with the link, its destination and the scope the destination resolves to — before
+attribution runs, so it can never again read as a generic attribution miss. This includes the
+bootstrap kinds. `FIRST_CONTACT.md` §2's R1 carve-out (#402) is an *attribution* carve-out on
+the identity plane: it lets a self-authenticating `Key`/`IdentityOccurrence` cross a link
+whose peer is not yet attributable; it does not move a kind across planes. A derived address
+exists only after first contact (it is derived from a group secret the pair shares once
+rooted), so there is nothing for a bootstrap kind to bootstrap on a scoped link, and admitting
+one would make the scoped link a second first-contact channel. Opaque envelopes are the scoped
+body class (§3.4: the blob plane) and are admitted there by `scoped_arrival`; the transport
+refuses only what it can name without parsing an envelope.
+
+**Invariants (named).**
+
+- **I-3.5.1 One plane per link.** `link_plane` is written once per link, at establishment,
+  from the link's destination; the reverse index decides. Witness:
+  `reticulum::tests::link_plane::a_derived_address_on_either_end_is_scoped`.
+- **I-3.5.2 Identity traffic never rides a scoped link.** With only a scoped link live to the
+  peer, an identity-plane send dials the identity destination; it never borrows the scoped
+  link. Witness: `tests/link_plane_728.rs::identity_plane_rows_admit_while_a_scoped_link_is_live_728`
+  (fails on v34.2.0 with the `UNATTRIBUTED` drop) and `..::an_identity_send_dials_rather_than_borrowing_the_scoped_link_728`.
+- **I-3.5.3 A scoped body keeps its carrier.** A direct scoped send lands on the derived
+  address (`arrival_scope` set at the receiver) even while an identity link to the same peer
+  is live. Witness: `tests/link_plane_728.rs::a_scoped_body_rides_the_derived_link_not_the_identity_link_728`.
+- **I-3.5.4 The refusal is named and counted.** An identity-plane frame forced onto a scoped
+  link is `identity_frame_on_scoped_link`, never `DestUnmatched`. Witness:
+  `tests/link_plane_728.rs::an_identity_frame_on_a_scoped_link_is_refused_by_name_728`.
+
 ---
 
 ## 4. The anti-entropy replication session (OSI 5)
@@ -1060,6 +1119,10 @@ one the network cannot express breaking.*
    is never handed anything that names the room** — the derived address at one hop, the
    identity-plane link with an in-link discriminator beyond it, chosen once from the path
    table and admitted against the same `ScopeAddressTable` (§3.4, CC 5.4.6 at `4fd2e9e`).
+9. **A link belongs to exactly one plane** — classified at establishment from its
+   destination; identity-plane traffic selects identity-plane links only and dials when none
+   is live; a replication/announce/bundle frame on a scoped link is refused
+   `identity_frame_on_scoped_link` (§3.5, CIRISEdge#728).
 
 ---
 

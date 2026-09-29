@@ -2559,6 +2559,14 @@ impl PyEdge {
             door.set_item(label.as_str(), *n)?;
         }
         root.set_item("bootstrap_door_outcomes", door)?;
+        // CIRISEdge#728 — transport receive-side refusals by reason tag
+        // (`identity_frame_on_scoped_link`: an identity-plane frame on a link
+        // dialled to a scope-derived address). Refusals are drops.
+        let transport_drops = pyo3::types::PyDict::new(py);
+        for (label, n) in &bundle.transport_inbound_drops {
+            transport_drops.set_item(label.as_str(), *n)?;
+        }
+        root.set_item("transport_inbound_drops", transport_drops)?;
         // CIRISEdge#683 — the opaque-plane first-contact door: admitted, known
         // key, and each named refusal (refusals are drops).
         let first_contact = pyo3::types::PyDict::new(py);
