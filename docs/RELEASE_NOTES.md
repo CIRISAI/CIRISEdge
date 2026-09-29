@@ -1,5 +1,58 @@
 # CIRISEdge Release Notes
 
+# v34.3.0 — a link belongs to one plane; unannounced devices of one owner exchange and recover directly
+
+**2026-09-29** (CIRISEdge#728 → PR #730, closes #722; CIRISEdge#727 → PR #729). **MINOR** from v34.2.0. No pin
+or hash moves: persist `v51.1.0` (wheel floor `>=51.1,<52`), verify `v18.0.0`, every ABI constant,
+`REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH` and `SERVE_ADVERTISE_POLICY_HASH` (`e4c4d625…`)
+unchanged. **Riders:** a pin bump only.
+
+## #728 — a link belongs to one plane (the actual cause of #722)
+
+CIRISServer's native selffiles fixture delivered 0/25 rows over a direct link. Read with timestamps,
+the item-2 refusals were three lines in the first second, before the peer's route landed; the
+whole-run starvation was that D2 had dialed D1's **self-room derived address**, and D1's send path
+then chose that link as "the peer's live inbound link" for identity-plane replication Delivers. D2
+dropped every one as UNATTRIBUTED, because a scoped address is an arrival discriminator, not a peer
+identity. One link pool was serving two planes.
+
+- Every link is classified `LinkPlane::{Identity, Scoped}` at establishment on both ends
+  (`NodeEvent::LinkEstablished` names the destination; the `ScopeAddressTable` reverse index knows
+  every derived address this node holds), stored beside the peer association.
+- Identity-plane sends (`Transport::send`, the #532 idle pool, the responder CANN/CBND push) select
+  only identity-plane links; with none live they dial the identity destination as before. Scoped
+  sends keep #718's choice.
+- An identity-plane frame (`CRPL`/`CANN`/`CBND`) arriving on a scoped link is refused by name,
+  `identity_frame_on_scoped_link`, counted in the new `EdgeMetrics::transport_inbound_drops`
+  (snapshot + PyO3), logged throttled with link, dest and scope.
+- Witness `tests/link_plane_728.rs`: self room installed on both nodes, B dials A's derived address
+  and holds A's identity route, A's identity-plane rows admit within 4 sweeps; fails on v34.2.0 with
+  the field's UNATTRIBUTED drop. FSD: `CIRIS_EDGE_TRANSPORT.md` §3.5.
+- Follow-up: #731 (initiator-side `arrival_scope` names the peer's member address).
+
+## #727 — owner-binding carve-out (maintainer-approved; I14 stays the designed path)
+
+Two devices of one owner that claim before announcing deadlocked under the #682 announce gate: each
+withheld its route until it held the other's owner-binding, which the send-set gate withheld in turn
+(≈320 `identity_row_node_not_announced` per side, nothing ever crossed).
+
+- **Admission:** an owner-binding whose attester is this node's OWN owner (`owner_of(self)`, from its
+  own directory) is admitted on any link after `verify_row_hybrid_signature` against the attester's
+  registered keys. Any other attester takes the ordinary path. Admission invalidates the #682 memo.
+- **Send:** a node pushes only its OWN binding, as a bootstrap-plane Deliver, on a link it dialed
+  (`MAX_OWNER_BINDING_PUSH = 4`), and **answers** a newly admitted sibling with its own binding on the
+  frame's reply path, on `admitted` only, never `held`. A stranger's link gets nothing; a binding
+  whose attester is not our owner is refused by name (`owner_binding_*` under `first_contact_outcomes`).
+- The unannounced pair now converges in **2 sweeps**, the same as the announced control. Recovery of
+  a wiped device (seed + owner key) re-converges in 13 sweeps through the ordinary path: a wiped
+  device is unowned in its own directory until its own binding arrives (CC 3.2), so the rung does not
+  apply to it. FSD: `FIRST_CONTACT.md` §2.1.1.
+
+## Rust surface
+
+- New `EdgeMetrics::transport_inbound_drops` map; new `first_contact_outcomes` labels
+  `owner_binding_*`; `LinkPlane` is internal.
+
 # v34.2.0 — a scoped body rides the identity-plane link when no direct path exists; the #722 refusal names what it holds
 
 **2026-09-29** (CIRISEdge#718 → PR #723; CIRISEdge#722 → PR #725). **MINOR** from v34.1.0. No pin or hash
