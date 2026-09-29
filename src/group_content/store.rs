@@ -311,21 +311,18 @@ pub trait GroupContentStore: Send + Sync + 'static {
     /// the JCS `{name?, format, codec?}` bytes, under the same grant as the
     /// bytes it describes.
     ///
-    /// This door authenticates the descriptor to its BLOB (the address digest
-    /// is its AAD), not to its ROW: callers that must refuse a pointer
-    /// transplanted onto another row open the bytes first, under the row's
-    /// AAD, as [`FileRow::open_described`](crate::files::FileRow::open_described)
-    /// does.
+    /// Takes the same [`OpenRequest`] as [`Self::open`]: the descriptor's own
+    /// AAD binds it to its BLOB (the address digest), and the REFERENCING
+    /// ROW's AAD — rebuilt from `req` exactly as [`aad_for_open`] does — must
+    /// authenticate the blob before the descriptor opens (persist v51.0.0,
+    /// the #923 amendment). A pointer transplanted onto another row, or
+    /// moved to another blob, is refused at the door, after authorization.
     ///
     /// # Errors
     /// As [`Self::open`]; a store without a descriptor door says so as
     /// [`GroupContentError::Substrate`].
-    async fn open_descriptor(
-        &self,
-        pointer: &BlobPointer,
-        viewer_key_id: &str,
-    ) -> Result<Vec<u8>, GroupContentError> {
-        let _ = (pointer, viewer_key_id);
+    async fn open_descriptor(&self, req: OpenRequest<'_>) -> Result<Vec<u8>, GroupContentError> {
+        let _ = req;
         Err(GroupContentError::Substrate(
             "this store has no sealed-descriptor door (CIRISEdge#698)".to_owned(),
         ))

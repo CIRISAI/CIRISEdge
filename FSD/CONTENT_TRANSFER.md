@@ -791,7 +791,7 @@ noted on CIRISPersist#923):
 | D5 | Read-compat: pre-#698 rows (clear `filename` + `media_type`, no seal) still open and list | `files::a_v32_row_still_opens` (the old-shape vector is kept as a read case) |
 | D6 | Round trip through persist's real sqlite backend, both scope paths (self/family `InvisibleEncrypted`, community `CommunityDek`) | every `files::` witness in `tests/blob_federation_e2e.rs` runs both encrypted scope paths on real sqlite |
 | D7 | Mixed fleet: the row carries no `media` member; a v50 reader admits it | asserted inside the D2 witness (no top-level `media`); no CIRISConformance vector yet |
-| D8 | A pointer + descriptor transplanted onto **another row** of the same blob does not open (row AAD gate), and one moved to **another blob** does not open (address-digest AAD) | `files::a_transplanted_descriptor_opens_on_neither_another_row_nor_another_blob` |
+| D8 | A pointer + descriptor transplanted onto **another row** of the same blob does not open (row AAD gate), and one moved to **another blob** does not open (address-digest AAD) | `files::a_transplanted_descriptor_opens_on_neither_another_row_nor_another_blob` — refused at persist's door under row 2's AAD and under none |
 | D9 | A chunked file written across an occurrence change opens name, manifest and every chunk together, or none (one access set per stream) | `files::a_chunked_files_descriptor_and_every_chunk_share_one_access_set` — **partial:** same-viewer manifest + chunks + descriptor, stranger none; the mid-write occurrence-change half is persist's (#923) and UNVERIFIED at v51 |
 | D10 | A nameless encrypted file round-trips with `name` absent inside the seal; the reader gets `None`, never `""` | `files::a_nameless_file_seals_format_only_and_reads_back_absent` |
 
@@ -806,12 +806,13 @@ Three things differ from the ask, each handled and pinned:
   v50 reader still refuses one (MEDIA_SOURCE §9.5), so the seal stays in
   `BlobPointer.sealed_descriptor` under `content` and no `media` member is emitted. The move to
   persist's `media` struct (CIRISEdge#638) waits until the fleet floor is ≥ v51.
-- **The opener takes no `caller_aad`.** v51 shipped the descriptor door bound to the BLOB only
-  (address-digest AAD); the accepted row-AAD amendment is not in it. Edge enforces D8 by
-  ordering: `FileRow::open_described` opens the bytes under the row's AAD first and the
-  descriptor only after, so a transplanted row refuses at the bytes. A direct caller of the door
-  (edge's `GroupContentStore::open_descriptor`, persist's Python opener) is **not** row-gated — the
-  D8 witness pins that, and flips when persist adds the parameter.
+- **The opener takes the row's AAD (persist v51.0.0 at the tag).** `open_descriptor_for_blob(sha,
+  viewer, sealed, caller_aad)` authenticates the blob under the referencing row before the
+  descriptor opens. Edge's store door takes the same `OpenRequest` as `open` and passes the row's
+  AAD, so `FileRow::describe` opens the descriptor alone (no bytes returned — the drive listing's
+  path, CIRISEdge#702) and a transplanted or moved pointer is refused AT THE DOOR, crypto-class,
+  never `NotGranted` (D8, including the raw door with no row AAD). The door reads the blob to
+  authenticate it, so a row whose bytes are absent is `NotFetched` for `describe` too.
 - **The sealing door recovers the DEK as a viewer.** The store passes this engine's derived key
   first, then each granted occurrence; if none unwraps on this node the write fails by name (no
   clear fallback). Chat bodies carry no description (`description: None`): the dimension is the

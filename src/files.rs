@@ -765,56 +765,75 @@ impl FileRow {
     }
 
     /// **The bytes and what they are, through one grant** (CIRISEdge#698,
-    /// `FSD/CONTENT_TRANSFER.md` §6.7.1).
-    ///
-    /// The bytes open FIRST, under the AAD rebuilt from this row, and the
-    /// descriptor opens only after: persist's descriptor door authenticates
-    /// the descriptor to its BLOB (address-digest AAD), not to its ROW, so
-    /// the row gate (D8 — a pointer transplanted onto another row of the same
-    /// blob) is this ordering. `Ok` never carries [`Descriptor::Sealed`]; a
-    /// viewer who cannot open the descriptor could not open the bytes either,
-    /// and gets the bytes' [`UnopenedReason`].
+    /// `FSD/CONTENT_TRANSFER.md` §6.7.1): [`Self::open`] then
+    /// [`Self::describe`]. `Ok` never carries [`Descriptor::Sealed`].
     ///
     /// # Errors
-    /// [`UnopenedReason`] as [`Self::open`]; a descriptor that fails its AAD
-    /// (moved from another blob) is `SealMismatch`, and one that opens to
-    /// something other than `{name?, format, codec?}` is `MalformedRow`.
+    /// [`UnopenedReason`] as [`Self::open`] and [`Self::describe`].
     pub async fn open_described(
         &self,
         store: &dyn GroupContentStore,
         viewer_key_id: &str,
     ) -> Result<Opened, UnopenedReason> {
         let bytes = self.open(store, viewer_key_id).await?;
-        let descriptor = if self.pointer.sealed_descriptor.is_none() {
-            self.descriptor()
-        } else {
-            let jcs = store
-                .open_descriptor(&self.pointer, viewer_key_id)
-                .await
-                .map_err(|e| UnopenedReason::from_store_error(&e))?;
-            let opened: SealedDescription =
-                serde_json::from_slice(&jcs).map_err(|e| UnopenedReason::MalformedRow {
-                    detail: format!(
-                        "{}: the sealed descriptor opened to something other than \
-                             {{name?, format, codec?}}: {e}",
-                        self.attestation_id
-                    ),
-                })?;
-            if opened.name.as_deref() == Some("") {
-                return Err(UnopenedReason::MalformedRow {
-                        detail: format!(
-                            "{}: an empty name inside the seal — absent is omitted, never an empty string",
-                            self.attestation_id
-                        ),
-                    });
-            }
-            Descriptor::Opened {
-                format: opened.format,
-                codec: opened.codec,
-                name: opened.name,
-            }
-        };
+        let descriptor = self.describe(store, viewer_key_id).await?;
         Ok(Opened { bytes, descriptor })
+    }
+
+    /// **What the file is, without returning its bytes** (CIRISEdge#698;
+    /// CIRISServer's drive listing, CIRISEdge#702).
+    ///
+    /// A clear row answers from its members ([`Descriptor::Clear`]). A sealed
+    /// row opens ONLY its descriptor, under the row's AAD: persist v51's door
+    /// authenticates the blob under the referencing row before the
+    /// descriptor opens, so a pointer transplanted onto another row (D8) or
+    /// moved to another blob (D3) is refused there — the row gate no longer
+    /// needs the bytes returned. The door does read the blob to authenticate
+    /// it, so a row whose bytes are not here is `NotFetched`, as `open` is.
+    ///
+    /// # Errors
+    /// [`UnopenedReason`] as [`Self::open`]; a descriptor that fails its AAD
+    /// is `SealMismatch` (or `Substrate` for persist's crypto-class refusal),
+    /// never `NotGranted`, and one that opens to something other than
+    /// `{name?, format, codec?}` is `MalformedRow`.
+    pub async fn describe(
+        &self,
+        store: &dyn GroupContentStore,
+        viewer_key_id: &str,
+    ) -> Result<Descriptor, UnopenedReason> {
+        if self.pointer.sealed_descriptor.is_none() {
+            return Ok(self.descriptor());
+        }
+        let jcs = store
+            .open_descriptor(crate::group_content::OpenRequest {
+                pointer: &self.pointer,
+                author_key_id: &self.attesting_key_id,
+                asserted_at: self.asserted_at,
+                viewer_key_id,
+            })
+            .await
+            .map_err(|e| UnopenedReason::from_store_error(&e))?;
+        let opened: SealedDescription =
+            serde_json::from_slice(&jcs).map_err(|e| UnopenedReason::MalformedRow {
+                detail: format!(
+                    "{}: the sealed descriptor opened to something other than \
+                     {{name?, format, codec?}}: {e}",
+                    self.attestation_id
+                ),
+            })?;
+        if opened.name.as_deref() == Some("") {
+            return Err(UnopenedReason::MalformedRow {
+                detail: format!(
+                    "{}: an empty name inside the seal — absent is omitted, never \"\"",
+                    self.attestation_id
+                ),
+            });
+        }
+        Ok(Descriptor::Opened {
+            format: opened.format,
+            codec: opened.codec,
+            name: opened.name,
+        })
     }
 }
 

@@ -435,14 +435,11 @@ impl GroupContentStore for PersistGroupContentStore {
             .map_err(|e| map_err(sha_hex, &e))
     }
 
-    async fn open_descriptor(
-        &self,
-        pointer: &BlobPointer,
-        viewer_key_id: &str,
-    ) -> Result<Vec<u8>, GroupContentError> {
+    async fn open_descriptor(&self, req: OpenRequest<'_>) -> Result<Vec<u8>, GroupContentError> {
         use base64::Engine as _;
-        let (sha_hex, sha) = pointer_sha(pointer)?;
-        let sealed_b64 = pointer.sealed_descriptor.as_deref().ok_or_else(|| {
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        let (sha_hex, sha) = pointer_sha(req.pointer)?;
+        let sealed_b64 = req.pointer.sealed_descriptor.as_deref().ok_or_else(|| {
             GroupContentError::Substrate(format!(
                 "pointer {sha_hex} carries no sealed descriptor to open"
             ))
@@ -452,10 +449,16 @@ impl GroupContentStore for PersistGroupContentStore {
             .map_err(|e| {
                 GroupContentError::Substrate(format!("sealed descriptor is not base64: {e}"))
             })?;
+        // The ROW's binding, exactly as `open` presents it: persist
+        // authenticates the blob under it before the descriptor opens, so a
+        // transplanted pointer is refused at the door (#923 amendment, D8).
+        let aad = aad_for_open(&req);
+        let aad_arg = match req.pointer.tier {
+            CryptoTier::Plaintext => None,
+            CryptoTier::InvisibleEncrypted | CryptoTier::CommunityDek => Some(aad.as_slice()),
+        };
         self.engine
-            // persist v51.0.0 grew the row-AAD parameter (#923 amendment);
-            // wired to the referencing row in the next change.
-            .open_descriptor_for_blob(&sha, viewer_key_id, &sealed, None)
+            .open_descriptor_for_blob(&sha, req.viewer_key_id, &sealed, aad_arg)
             .await
             .map_err(|e| map_err(sha_hex, &e))
     }

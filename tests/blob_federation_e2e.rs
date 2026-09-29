@@ -4135,62 +4135,101 @@ mod files {
         assert_eq!(refused.kind(), "seal_mismatch", "{refused}");
     }
 
-    /// D8 — transplanted onto ANOTHER ROW of the same blob, the pointer and
-    /// its descriptor open neither (the row AAD gates the bytes, and
-    /// `open_described` opens the bytes first); moved to another blob, the
-    /// address-digest AAD refuses it (D3).
-    ///
-    /// The last assertion PINS the half persist v51 did not ship: the
-    /// descriptor door takes no `caller_aad` (the accepted #923 amendment),
-    /// so a caller of the door itself — not `open_described` — opens a
-    /// transplanted pointer's descriptor. When persist lands the amendment,
-    /// this flips and the store passes the row's AAD.
+    /// D8 — a pointer + descriptor transplanted onto ANOTHER ROW of the same
+    /// blob, or moved to ANOTHER BLOB, is refused AT THE DESCRIPTOR DOOR
+    /// (persist v51.0.0's `caller_aad`, the #923 amendment): after
+    /// authorization, as a crypto-class refusal — never `NotGranted`, since
+    /// the viewer WAS authorized. Checked through `describe` (no bytes
+    /// returned), `open_described`, the store door with row 2's AAD, and the
+    /// raw engine door with NO row AAD at all.
     #[tokio::test]
     async fn a_transplanted_descriptor_opens_on_neither_another_row_nor_another_blob() {
-        use ciris_edge::group_content::GroupContentStore as _;
+        use base64::Engine as _;
+        use ciris_edge::group_content::{GroupContentStore as _, OpenRequest};
         init_tracing();
         let (node_a, rooms) = rooms().await;
+        let crypto_class = |kind: &str| kind == "seal_mismatch" || kind == "substrate";
         for (i, (room, _)) in rooms.iter().enumerate() {
             let nth = i64::try_from(i).expect("fits") * 2;
             let a = write(&node_a, room, b"file a", Some("a.txt"), None, nth).await;
             let b = write(&node_a, room, b"file b", Some("b.txt"), None, nth + 1).await;
 
+            // The honest row describes itself — the control.
+            let honest = FileRow::from_row(&a.row).expect("a");
+            assert!(
+                matches!(
+                    honest.describe(&node_a.store, &node_a.me).await,
+                    Ok(Descriptor::Opened { .. })
+                ),
+                "{room}: the control opens"
+            );
+
             // Another row: a's pointer under b's row columns.
             let mut transplanted = FileRow::from_row(&b.row).expect("b");
             transplanted.pointer = a.pointer.clone();
-            let refused = transplanted
-                .open_described(&node_a.store, &node_a.me)
+            for refused in [
+                transplanted
+                    .describe(&node_a.store, &node_a.me)
+                    .await
+                    .expect_err("describe: a's pointer on b's row"),
+                transplanted
+                    .open_described(&node_a.store, &node_a.me)
+                    .await
+                    .expect_err("open_described: a's pointer on b's row"),
+            ] {
+                assert!(
+                    crypto_class(refused.kind()),
+                    "{room}: row gate is crypto-class, never not_granted: {refused}"
+                );
+            }
+            // The store door itself, presented row 2's AAD.
+            let at_door = node_a
+                .store
+                .open_descriptor(OpenRequest {
+                    pointer: &transplanted.pointer,
+                    author_key_id: &transplanted.attesting_key_id,
+                    asserted_at: transplanted.asserted_at,
+                    viewer_key_id: &node_a.me,
+                })
                 .await
-                .expect_err("a's pointer on b's row");
-            assert_eq!(
-                refused.kind(),
-                "seal_mismatch",
-                "{room}: row gate: {refused}"
+                .expect_err("the door refuses row 2's AAD");
+            assert!(
+                !matches!(
+                    at_door,
+                    ciris_edge::group_content::GroupContentError::NotGranted { .. }
+                ),
+                "{room}: after authorization, never NotGranted: {at_door}"
+            );
+            // The raw engine door with NO row AAD: refused too.
+            let sha: [u8; 32] = hex::decode(&a.pointer.content_sha256)
+                .expect("hex")
+                .try_into()
+                .expect("32");
+            let sealed = base64::engine::general_purpose::STANDARD
+                .decode(a.pointer.sealed_descriptor.as_deref().expect("sealed"))
+                .expect("b64");
+            let bare = node_a
+                .store
+                .engine()
+                .open_descriptor_for_blob(&sha, &node_a.me, &sealed, None)
+                .await
+                .expect_err("no row AAD, no descriptor");
+            assert!(
+                !matches!(
+                    bare,
+                    ciris_persist::federation::BlobError::NotGranted { .. }
+                ),
+                "{room}: crypto-class, never NotGranted: {bare}"
             );
 
             // Another blob.
             let mut moved = FileRow::from_row(&a.row).expect("a");
             moved.pointer.sealed_descriptor = b.pointer.sealed_descriptor.clone();
             let refused = moved
-                .open_described(&node_a.store, &node_a.me)
+                .describe(&node_a.store, &node_a.me)
                 .await
                 .expect_err("b's descriptor on a's blob");
-            assert_eq!(
-                refused.kind(),
-                "seal_mismatch",
-                "{room}: blob gate: {refused}"
-            );
-
-            // The pin: persist's door is blob-bound only at v51.
-            assert!(
-                node_a
-                    .store
-                    .open_descriptor(&transplanted.pointer, &node_a.me)
-                    .await
-                    .is_ok(),
-                "{room}: persist v51's descriptor door gained the row AAD — pass it from \
-                 the store and flip this pin (CIRISPersist#923 amendment)"
-            );
+            assert!(crypto_class(refused.kind()), "{room}: blob gate: {refused}");
         }
     }
 
