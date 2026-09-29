@@ -630,6 +630,48 @@ pub struct DeliverMessage {
     pub envelopes: Vec<Vec<u8>>,
 }
 
+impl DeliverMessage {
+    /// CIRISEdge#727 (`FSD/FIRST_CONTACT.md` §2.1.1) — is this Deliver the
+    /// **owner-binding push** shape: kind `Attestation`, at least one envelope,
+    /// and EVERY envelope a `delegates_to` carrying persist's owner-binding
+    /// marker ([`is_owner_binding_envelope`])? This is the structural half of
+    /// the owner-binding rung — what a router can decide from the bytes alone.
+    /// Whether the rows are self-authenticating to THIS receiver (attester ==
+    /// its own owner, signature verifies against the held owner key) is the
+    /// receiver's half (`first_contact::OwnerBindingCarveOut`), never decided
+    /// here.
+    ///
+    /// A Deliver that mixes one owner-binding with anything else is NOT the
+    /// shape: on an un-attributed link it drops as every other non-bootstrap
+    /// frame does. Persist's predicate is imported, never re-derived (the
+    /// capability-token provenance rule).
+    ///
+    /// [`is_owner_binding_envelope`]: ciris_persist::federation::admission::is_owner_binding_envelope
+    #[must_use]
+    pub fn is_owner_binding_push(&self) -> bool {
+        #[derive(serde::Deserialize)]
+        struct RowPeek {
+            attestation_type: String,
+            attestation_envelope: serde_json::Value,
+        }
+        #[derive(serde::Deserialize)]
+        struct SignedPeek {
+            attestation: RowPeek,
+        }
+        self.kind == EnvelopeKind::Attestation
+            && !self.envelopes.is_empty()
+            && self.envelopes.iter().all(|bytes| {
+                serde_json::from_slice::<SignedPeek>(bytes).is_ok_and(|s| {
+                    s.attestation.attestation_type
+                        == ciris_persist::federation::types::attestation_type::DELEGATES_TO
+                        && ciris_persist::federation::admission::is_owner_binding_envelope(
+                            &s.attestation.attestation_envelope,
+                        )
+                })
+            })
+    }
+}
+
 /// The protocol's top-level message type — what flows on the wire
 /// between region peers. `#[serde(tag = "type")]` so a future variant
 /// is transparent to v1 receivers (they refuse on unknown tag, NOT
@@ -1054,6 +1096,68 @@ mod tests {
         }
         // The load-bearing E3 negative: the trace-bearing plane is never bootstrap.
         assert!(!EnvelopeKind::Attestation.is_bootstrap());
+    }
+
+    /// CIRISEdge#727 — the owner-binding push is EXACTLY a non-empty
+    /// Attestation Deliver whose every envelope is an owner-binding
+    /// `delegates_to` (persist's marker). Not the kind alone, not a mixed
+    /// batch, not a plain delegation, not another plane.
+    #[test]
+    fn an_owner_binding_push_is_exactly_a_deliver_of_owner_binding_rows_727() {
+        let owner_binding = |node: &str| {
+            let envelope =
+                ciris_persist::federation::self_at_login::owner_binding_delegates_to_envelope(
+                    node,
+                    &["infra:network_presence".to_string()],
+                );
+            serde_json::to_vec(&serde_json::json!({
+                "attestation": {
+                    "attestation_type": "delegates_to",
+                    "attestation_envelope": envelope,
+                }
+            }))
+            .unwrap()
+        };
+        let plain_delegation = serde_json::to_vec(&serde_json::json!({
+            "attestation": {
+                "attestation_type": "delegates_to",
+                "attestation_envelope": {"dimension": "delegation:act_on_behalf:v1"},
+            }
+        }))
+        .unwrap();
+        let deliver = |kind, envelopes| DeliverMessage { kind, envelopes };
+
+        assert!(
+            deliver(EnvelopeKind::Attestation, vec![owner_binding("x")]).is_owner_binding_push()
+        );
+        assert!(deliver(
+            EnvelopeKind::Attestation,
+            vec![owner_binding("x"), owner_binding("y")]
+        )
+        .is_owner_binding_push());
+        assert!(
+            !deliver(EnvelopeKind::Attestation, vec![]).is_owner_binding_push(),
+            "an empty Deliver is not a push"
+        );
+        assert!(
+            !deliver(
+                EnvelopeKind::Attestation,
+                vec![owner_binding("x"), plain_delegation.clone()]
+            )
+            .is_owner_binding_push(),
+            "one non-binding row disqualifies the whole batch"
+        );
+        assert!(
+            !deliver(EnvelopeKind::Attestation, vec![plain_delegation]).is_owner_binding_push(),
+            "a delegates_to without the owner-binding marker is not a binding"
+        );
+        assert!(
+            !deliver(EnvelopeKind::Key, vec![owner_binding("x")]).is_owner_binding_push(),
+            "the shape is keyed on the Attestation plane"
+        );
+        assert!(
+            !deliver(EnvelopeKind::Attestation, vec![b"not json".to_vec()]).is_owner_binding_push()
+        );
     }
 
     /// Wire-stability sanity: confirm no two kinds collide on their

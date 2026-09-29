@@ -197,6 +197,14 @@ pub struct ReplicationRegistry {
     /// attribution first (`LinkAttribution::ResolvedToSelf`), but this door is
     /// public and an operator's own listener may hand it anything.
     local_key_id: OnceLock<String>,
+    /// CIRISEdge#727 — the owner-binding rung's receiver gate
+    /// (`FSD/FIRST_CONTACT.md` §2.1.1), installed by the runtime once it has a
+    /// directory, a bridge and a local key. Consulted by the inbound routers
+    /// ([`super::InboundRouter`] and `Edge`'s dispatch) for an un-attributed
+    /// CRPL frame that is not a #402 bootstrap kind, BEFORE that frame is
+    /// dropped `SkippedNoSourceKeyId`. `None` (never installed) preserves the
+    /// pre-#727 behaviour: every such frame drops.
+    owner_binding_carve_out: OnceLock<Arc<crate::first_contact::OwnerBindingCarveOut>>,
 }
 
 impl ReplicationRegistry {
@@ -208,7 +216,30 @@ impl ReplicationRegistry {
             initiators: RwLock::new(HashMap::new()),
             responder_factory: OnceLock::new(),
             local_key_id: OnceLock::new(),
+            owner_binding_carve_out: OnceLock::new(),
         }
+    }
+
+    /// CIRISEdge#727 — install the owner-binding rung's receiver gate.
+    /// Set-once; a second install is ignored (the first stands).
+    pub fn install_owner_binding_carve_out(
+        &self,
+        gate: Arc<crate::first_contact::OwnerBindingCarveOut>,
+    ) {
+        if self.owner_binding_carve_out.set(gate).is_err() {
+            tracing::warn!(
+                "ReplicationRegistry::install_owner_binding_carve_out called twice; keeping \
+                 the first (CIRISEdge#727)"
+            );
+        }
+    }
+
+    /// CIRISEdge#727 — the installed owner-binding gate, if any.
+    #[must_use]
+    pub fn owner_binding_carve_out(
+        &self,
+    ) -> Option<&Arc<crate::first_contact::OwnerBindingCarveOut>> {
+        self.owner_binding_carve_out.get()
     }
 
     /// CIRISEdge#621 — a registry that knows this node's own key id and will

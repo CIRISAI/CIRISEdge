@@ -322,6 +322,46 @@ fn resolve_sweep_page_rows(mut config: BridgeConfig) -> BridgeConfig {
 /// serve gate). The baseline pins the node's ACTUAL configured cadence + page
 /// limit, so an empty plane resolves to exactly what the node already runs —
 /// relief, never a gate.
+/// The runtime's registry ([`ReplicationRegistry::for_config`]) with the
+/// CIRISEdge#727 owner-binding rung's receiver gate installed
+/// (`FSD/FIRST_CONTACT.md` §2.1.1): an owner-binding whose attester is THIS
+/// node's own owner is admitted on an un-attributed link, through the
+/// bridge's apply door (so the #682 owner memo invalidates on admit). Needs a
+/// local key — with no "I" there is no "my owner"; without one nothing is
+/// installed and every such frame drops as before.
+///
+/// The gate also ANSWERS a newly admitted sibling with this node's own binding
+/// on the frame's reply path (rule 2, second clause): the initiator direction
+/// does not always dial (#531 link reuse), so the dial-path push alone leaves
+/// the exchange one-way.
+fn registry_for(
+    config: &ReplicationRuntimeConfig,
+    directory: &Arc<dyn FederationDirectory>,
+    bridge: &Arc<FederationDirectoryReplicationBridge>,
+    transport: &Arc<dyn Transport>,
+) -> Arc<ReplicationRegistry> {
+    let registry = Arc::new(ReplicationRegistry::for_config(config));
+    let Some(local) = config.local_key_id.as_deref() else {
+        return registry;
+    };
+    registry.install_owner_binding_carve_out(Arc::new(
+        crate::first_contact::OwnerBindingCarveOut::new(
+            local,
+            Arc::clone(directory),
+            Some(Arc::clone(bridge) as Arc<dyn ReplicationDirectory>),
+            config.metrics.clone(),
+        )
+        .with_answer(
+            Arc::clone(transport),
+            Arc::new(crate::first_contact::DirectoryOwnerBinding::new(
+                Arc::clone(directory),
+                local,
+            )),
+        ),
+    ));
+    registry
+}
+
 fn build_mesh_config_reader(
     directory: &Arc<dyn FederationDirectory>,
     config: &ReplicationRuntimeConfig,
@@ -834,7 +874,9 @@ impl ReplicationRuntime {
             Arc::clone(&convergence),
         );
 
-        let registry = Arc::new(ReplicationRegistry::for_config(&config));
+        // CIRISEdge#727 — the registry carries the owner-binding rung's
+        // receiver gate (see [`registry_for`]).
+        let registry = registry_for(&config, &directory, &bridge, &transport);
 
         // CIRISEdge#370 — ONE shared applier for every coordinator (initial
         // initiators, the #312 responder factory, hot-adds). The adapter is a

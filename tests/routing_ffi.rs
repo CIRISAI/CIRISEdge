@@ -93,6 +93,7 @@ async fn auth_with(
         blackhole_rules: Some(blackhole),
         transport_identity_keystore: None,
         own_build_bundle: None,
+        own_owner_binding: None,
     }
 }
 
@@ -842,6 +843,7 @@ async fn auth_pinned_backend(
         blackhole_rules: Some(blackhole),
         transport_identity_keystore: None,
         own_build_bundle: None,
+        own_owner_binding: None,
     }
 }
 
