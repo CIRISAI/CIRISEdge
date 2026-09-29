@@ -635,10 +635,16 @@ owner's laptop could not be withdrawn from their phone.
   builds the `withdraws` with persist's own envelope builder and writes it.
 - **Read-compat — node-authored rows (written before #675, or by an agent-only node).** They still
   list and open unchanged (the AAD names the node, as it did when sealed). Their author is the
-  NODE, so only that node can withdraw them; another device of the same owner gets
-  `FileError::NotAuthor` naming the authoring node. Letting the owner withdraw a row its own node
-  authored would need persist to admit "issuer = `owner_of(T.attesting_key_id)`" as a withdraws
-  authority — not built; recorded as a persist ask, not approximated here.
+  NODE. **Since edge v33.0.0 (persist v51, CIRISPersist#941 / CIRISEdge#941, CC 3.4.7.3)** the
+  node's owner may withdraw them too: persist lifts withdraws rule 1 to the producer's principal —
+  the issuer is the node's single live owner (`owner_of`) AND an owner-binding over that node was
+  asserted at or before the row, so a later buyer of a used node retracts nothing. `files::withdraw`
+  falls back to the actor in hand exactly when `owner_of(T.attesting_key_id)` names it (an
+  ambiguous owner is no principal) and persist's door stays the judge; anyone else still gets
+  `FileError::NotAuthor` naming the authoring node. `FileRow::author_signer` stays strictly the
+  attester. Witness: `a_file_is_authored_by_its_person_and_withdrawn_from_their_other_device`
+  (a stranger refused, the owner admitted under rule 1 from her other device; red with the
+  fallback removed). Mixed fleet: a v50 node refuses the owner's withdraws a v51 node admits.
 
 #### 6.7.1 The sealed descriptor — a file's name and media type open only with the bytes (CIRISEdge#698, CIRISConstitution#114)
 

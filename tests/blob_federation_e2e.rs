@@ -3871,6 +3871,89 @@ async fn a_file_is_authored_by_its_person_and_withdrawn_from_their_other_device(
     )
     .await
     .expect("the authoring node withdraws its own row");
+
+    // ── CIRISEdge#941 (persist v51, CC 3.4.7.3): the node's OWNER retracts a
+    // node-authored row from her other device ─────────────────────────────
+    let node_written = publish(
+        &*node_a.dir,
+        &node_a.store,
+        Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &FileWrite {
+            room: &room,
+            bytes: b"written by the laptop before #708",
+            media_type: "text/plain",
+            codec: None,
+            filename: Some("laptop.txt"),
+            asserted_at: ts() + chrono::Duration::seconds(40),
+        },
+    )
+    .await
+    .expect("a node-authored file");
+    assert_eq!(node_written.row.attesting_key_id, node_a.me);
+    let crossed_id = match &node_written.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!("crossed: {other:?}")
+        }
+    };
+    let node_row = node_a
+        .dir
+        .get_attestation(&crossed_id)
+        .await
+        .expect("read")
+        .expect("the crossed node-authored row is held");
+    node_b
+        .dir
+        .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: node_row.clone(),
+        })
+        .await
+        .expect("B admits the node-authored row");
+    let not_owner = withdraw(
+        &*node_b.dir,
+        &node_row,
+        "not my node",
+        ts() + chrono::Duration::seconds(45),
+        Signers {
+            node: &node_b.signer,
+            actor: Some(&carol_signer),
+        },
+    )
+    .await;
+    assert!(
+        matches!(not_owner, Err(FileError::NotAuthor { ref author, .. }) if *author == node_a.me),
+        "carol is neither the authoring node nor its owner: {not_owner:?}"
+    );
+    let owners = withdraw(
+        &*node_b.dir,
+        &node_row,
+        "deleted from my phone — my laptop wrote it",
+        ts() + chrono::Duration::seconds(50),
+        Signers {
+            node: &node_b.signer,
+            actor: Some(&alice_signer),
+        },
+    )
+    .await
+    .expect("the node's owner withdraws what her node produced (CIRISPersist#941)");
+    assert_eq!(owners.attesting_key_id, alice.key_id, "signed as the owner");
+    let stored = node_b
+        .dir
+        .get_attestation(&owners.attestation_id)
+        .await
+        .expect("read")
+        .expect("the owner's withdraws is stored");
+    assert_eq!(
+        stored.withdraws_admission_rule,
+        Some(1),
+        "rule 1 lifted to the producer's principal — the producer's own retraction"
+    );
 }
 
 /// **CIRISEdge#698 — the sealed descriptor** (`FSD/CONTENT_TRANSFER.md`

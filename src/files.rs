@@ -168,7 +168,8 @@ pub enum FileError {
     /// (CIRISEdge#675). The row's attester is `author`; the signers offered
     /// were `held`. For a person-authored row any of the owner's devices holds
     /// the person's key; a row a NODE authored (before #675, or by an
-    /// agent-only node) can be retracted only by that node.
+    /// agent-only node) can be retracted by that node or, through [`withdraw`]
+    /// (CIRISEdge#941), by the node's single live owner.
     #[error(
         "{attestation_id} is authored by {author}; none of the signers in hand ({held:?}) is \
          its author, so an author-only operation cannot be signed (FSD/CONTENT_TRANSFER.md §6.7.0)"
@@ -205,11 +206,14 @@ pub fn file_author(signers: Signers<'_>) -> &crate::identity::LocalSigner {
 }
 
 /// **Withdraw a file** (CC 2.3) — the drive's delete, signed by the row's
-/// author (CIRISEdge#675).
+/// author (CIRISEdge#675), or by the owner of the node that authored it
+/// (CIRISEdge#941).
 ///
 /// The signer is [`FileRow::author_signer`]'s answer: for a person-authored
 /// row, the person's key, which every device of the owner holds; for a
-/// node-authored row, only that node's. The `withdraws` is persist's own
+/// node-authored row, that node's — or, since persist v51 (CIRISPersist#941),
+/// the actor in hand when it is that node's single live owner, from any of
+/// their devices. The `withdraws` is persist's own
 /// envelope ([`withdraws_attestation`](crate::replication::attestation_bind::withdraws_attestation)),
 /// born federation-tier, written through `put_attestation` so persist's
 /// authority gate (rule 1: issuer == the row's attester) decides.
@@ -228,7 +232,12 @@ pub async fn withdraw(
         attestation_id: row.attestation_id.clone(),
         detail: "not a file row".to_owned(),
     })?;
-    let signer = file.author_signer(signers)?;
+    let signer = match file.author_signer(signers) {
+        Ok(signer) => signer,
+        Err(not_author) => node_owner_signer(directory, &file, signers)
+            .await
+            .ok_or(not_author)?,
+    };
     let withdraws = crate::replication::attestation_bind::withdraws_attestation(
         row,
         reason,
@@ -250,6 +259,30 @@ pub async fn withdraw(
             detail: e.to_string(),
         })?;
     Ok(withdraws)
+}
+
+/// **CIRISEdge#941 / CIRISPersist#941 (CC 3.4.7.3)** — the actor in hand, when
+/// it is the single live owner of the NODE that authored `file`.
+///
+/// persist v51 lifts withdraws rule 1 to the producer's principal: a file a
+/// node wrote before files were authored as the person (pre-#675/#708) is the
+/// person's to retract from any device. This names the candidate; persist's
+/// door stays the judge — it also requires an owner-binding over that node
+/// asserted at or before the row, so a later owner of a used node retracts
+/// nothing (that refusal surfaces as [`FileError::Withdraw`]). An ambiguous or
+/// unresolvable owner is not a principal: `None`, and the caller keeps
+/// [`FileError::NotAuthor`].
+async fn node_owner_signer<'a>(
+    directory: &dyn FederationDirectory,
+    file: &FileRow,
+    signers: Signers<'a>,
+) -> Option<&'a crate::identity::LocalSigner> {
+    let actor = signers.actor?;
+    let owner = ciris_persist::federation::admission::owner_of(directory, &file.attesting_key_id)
+        .await
+        .ok()
+        .flatten()?;
+    (owner == actor.key_id).then_some(actor)
 }
 
 /// What [`publish`] did.
