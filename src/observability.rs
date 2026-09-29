@@ -933,6 +933,14 @@ pub struct EdgeMetrics {
     /// link was attributed by its announce before any Deliver). The door never
     /// drops, so there is no drop label.
     pub bootstrap_door_outcomes: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#728 — inbound frames the Reticulum transport REFUSED at its
+    /// receive-side choke point (`drop_inbound`, #425), by the low-cardinality
+    /// reason tag. Today's one counted tag is `identity_frame_on_scoped_link`:
+    /// a replication / announce / bundle frame that arrived on a link dialled
+    /// to a scope-derived address (`FSD/CIRIS_EDGE_TRANSPORT.md` §3.5). A
+    /// non-zero count names a peer whose sender still selects links by peer
+    /// alone (pre-#728); it is never the generic attribution miss.
+    pub transport_inbound_drops: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#683 — the opaque-plane first-contact door, per label
     /// (`FIRST_CONTACT.md` §2.2): `first_contact_admitted`,
     /// `first_contact_known_key`, every `first_contact_*` refusal, and
@@ -1312,6 +1320,27 @@ impl EdgeMetrics {
             .or_insert(0) += 1;
     }
 
+    /// CIRISEdge#728 — count one transport receive-side refusal by its
+    /// `drop_inbound` reason tag.
+    pub fn inc_transport_inbound_drop(&self, reason_tag: &'static str) {
+        *self
+            .transport_inbound_drops
+            .write()
+            .entry(reason_tag)
+            .or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#728 — the transport receive-side refusals by reason tag
+    /// (tests + the operator readback).
+    #[must_use]
+    pub fn transport_inbound_drops(&self) -> HashMap<String, u64> {
+        self.transport_inbound_drops
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
     /// CIRISEdge#683 — count one first-contact door outcome by its label.
     pub fn inc_first_contact(&self, label: &'static str) {
         *self
@@ -1589,6 +1618,7 @@ impl EdgeMetrics {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
+            transport_inbound_drops: self.transport_inbound_drops(),
             first_contact_outcomes: self
                 .first_contact_outcomes
                 .read()
@@ -1663,6 +1693,9 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
     /// `unbound` / `not_applicable`). The door never drops.
     pub bootstrap_door_outcomes: HashMap<String, u64>,
+    /// CIRISEdge#728 — transport receive-side refusals by `drop_inbound`
+    /// reason tag (`identity_frame_on_scoped_link`, …).
+    pub transport_inbound_drops: HashMap<String, u64>,
     /// CIRISEdge#683 — the opaque-plane first-contact door by label.
     pub first_contact_outcomes: HashMap<String, u64>,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).

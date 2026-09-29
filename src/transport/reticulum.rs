@@ -2384,6 +2384,19 @@ pub struct ReticulumTransport {
     /// of "I dialed link L to dest D", consulted when `link_destination` is `None`.
     /// Removed on `LinkClosed`.
     dialed_link_dest: Arc<Mutex<HashMap<LinkId, DestinationHash>>>,
+    /// CIRISEdge#728 — the PLANE each link belongs to, fixed at establishment
+    /// (`FSD/CIRIS_EDGE_TRANSPORT.md` §3.5). Written on the dial paths the
+    /// moment a link is dialled (they know what they dialled) and in the
+    /// `LinkEstablished` arm for both directions (leviculum names the link's
+    /// destination there; the `ScopeAddressTable` reverse index decides),
+    /// removed on `LinkClosed` / teardown. Stored BESIDE the peer association
+    /// rather than folded into it: `link_to_peer_key_id` answers *who* is on
+    /// the far end and is correct for a scoped link the peer identified; this
+    /// answers *which traffic may ride it*, and every link selector keys on
+    /// `(peer, plane)` — never on peer alone, which is how the self-room link
+    /// D2 dialled to D1's derived address became D1's "freshest live link to
+    /// D2" for identity-plane Delivers that D2 could only drop.
+    link_plane: Arc<Mutex<HashMap<LinkId, LinkPlane>>>,
     /// CIRISEdge#532 — the peer's REUSABLE outbound link, keyed by the dest we
     /// dialed. This is the fix for 29 establishes/minute across 20 links on a
     /// 3-peer mesh: `connect_awaited` creates a NEW link on EVERY call (it is
@@ -2724,6 +2737,7 @@ impl ReticulumTransport {
             own_owner_binding: self.own_owner_binding.clone(),
             metrics: self.metrics.clone(),
             dialed_link_dest: Arc::clone(&self.dialed_link_dest),
+            link_plane: Arc::clone(&self.link_plane),
             reusable_dialed_link: Arc::clone(&self.reusable_dialed_link),
             link_in_flight: Arc::clone(&self.link_in_flight),
         }
@@ -3321,6 +3335,7 @@ impl ReticulumTransport {
                 crate::transport::frame_fragment::Reassembler::new(),
             )),
             dialed_link_dest: Arc::new(Mutex::new(HashMap::new())),
+            link_plane: Arc::new(Mutex::new(HashMap::new())),
             reusable_dialed_link: Arc::new(Mutex::new(HashMap::new())),
             link_in_flight: Arc::new(Mutex::new(HashSet::new())),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
@@ -3926,6 +3941,14 @@ impl ReticulumTransport {
             .lock()
             .await
             .insert(link_id, dest_hash);
+        // CIRISEdge#728 — this link is SCOPED for its whole life: the peer's
+        // reverse-path selector may attribute it to us, but no identity-plane
+        // send on either side may ride it. Tagged here, before establishment,
+        // so no selector can observe an untagged link.
+        self.link_plane
+            .lock()
+            .await
+            .insert(link_id, LinkPlane::Scoped);
 
         // Explicit-hash destinations are never pathed (see the routability note
         // above), so this is always the bootstrap-broadcast budget.
@@ -4469,6 +4492,12 @@ impl ReticulumTransport {
             .lock()
             .await
             .insert(link_id, dest_hash);
+        // CIRISEdge#728 — a rooted peer's announced destination is never a
+        // derived address (derived addresses are announce-suppressed, CC 5.4),
+        // so a link opened here is identity-plane; classified through the same
+        // table anyway, so the rule has one author.
+        let plane = classify_link_plane(self.scope_addresses.get().map(Arc::as_ref), &dest_hash);
+        self.link_plane.lock().await.insert(link_id, plane);
 
         // Runtime-agnostic bound (CIRISEdge#217): `established` resolves `Ok(())` on
         // establishment / `Err(LinkClosed)` on link death; anything else — or the
@@ -4550,7 +4579,25 @@ impl ReticulumTransport {
             }
         }
         self.link_in_flight.lock().await.remove(&link_id);
+        // CIRISEdge#728 — the plane record goes with the link.
+        self.link_plane.lock().await.remove(&link_id);
         Ok(())
+    }
+
+    /// CIRISEdge#728 test seam — every link this node currently holds
+    /// established, with the plane it was classified on and whether this node
+    /// dialled it. A witness reads this on both ends to prove that an
+    /// identity-plane send DIALLED an identity link rather than borrowing the
+    /// scoped one, and to name the scoped link it forces a frame onto.
+    #[doc(hidden)]
+    pub async fn link_planes_for_test(&self) -> Vec<([u8; 16], LinkPlane, bool)> {
+        let planes = self.link_plane.lock().await;
+        let dialed = self.dialed_link_dest.lock().await;
+        planes
+            .iter()
+            .filter(|(id, _)| self.node.link_is_established(id))
+            .map(|(id, plane)| (id.into_bytes(), *plane, dialed.contains_key(id)))
+            .collect()
     }
 
     /// Send a request over an established link and wait for the
@@ -5315,15 +5362,30 @@ impl ReticulumTransport {
         }))
     }
 
-    async fn live_attributed_link_to(&self, destination_key_id: &str) -> Option<LinkId> {
-        let candidates: Vec<LinkId> = self
-            .link_to_peer_key_id
-            .lock()
-            .await
-            .iter()
-            .filter(|(_, peer)| peer.as_str() == destination_key_id)
-            .map(|(id, _)| *id)
-            .collect();
+    /// CIRISEdge#353 — the peer's freshest LIVE link that it dialled and
+    /// identified to us (the reverse path), ON `plane`.
+    ///
+    /// CIRISEdge#728 — keyed by `(peer, plane)`, never by peer alone. The
+    /// attributed set (`link_to_peer_key_id`) rightly contains the scoped link
+    /// a peer dialled to one of our derived addresses — it identified it, and
+    /// scoped bodies on it need a source — but an identity-plane reply must not
+    /// ride it: the peer's side of that link resolves to OUR derived address,
+    /// which its attribution cannot (and must not) map to a peer, so every
+    /// frame we put there is dropped `UNATTRIBUTED`. A link with no plane
+    /// record is never selected (fail-closed; every established link has one).
+    async fn live_link_to(&self, destination_key_id: &str, plane: LinkPlane) -> Option<LinkId> {
+        let candidates: Vec<LinkId> = {
+            let planes = self.link_plane.lock().await;
+            self.link_to_peer_key_id
+                .lock()
+                .await
+                .iter()
+                .filter(|(id, peer)| {
+                    peer.as_str() == destination_key_id && planes.get(*id) == Some(&plane)
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
         let last_inbound = self.link_last_inbound_at.lock().await;
         let established_at = self.link_established_at.lock().await;
         // CIRISEdge#353 — build the (link, last_inbound, established_at) tuples
@@ -5384,6 +5446,14 @@ impl ReticulumTransport {
     /// answer to a requester this node cannot attribute. Each attempt re-checks
     /// that the pinned link is still established; a dead one ends the loop the
     /// same way a vanished attributed link does.
+    ///
+    /// CIRISEdge#728 — the UNPINNED reverse path is the identity plane: it is
+    /// reached only from [`Transport::send`] (by key), and a scoped send never
+    /// resolves a link by peer (it dials the derived address, #499, or the
+    /// identity link under §3.4). So the lookup is `(peer, Identity)`. A pinned
+    /// link carries no plane check on purpose: it is the link a REQUEST arrived
+    /// on, and the receiver already refused any identity-plane request on a
+    /// scoped link, so an answer pinned to a scoped link is a scoped answer.
     async fn send_via_reverse_path(
         &self,
         destination_key_id: &str,
@@ -5395,7 +5465,10 @@ impl ReticulumTransport {
         loop {
             let live = match pinned {
                 Some(id) => Some(id).filter(|id| self.node.link_is_established(id)),
-                None => self.live_attributed_link_to(destination_key_id).await,
+                None => {
+                    self.live_link_to(destination_key_id, LinkPlane::Identity)
+                        .await
+                }
             };
             let Some(link_id) = live else {
                 if attempts > 0 {
@@ -6263,6 +6336,7 @@ impl Transport for ReticulumTransport {
                         link_last_inbound_at: &self.link_last_inbound_at,
                         inbound_reasm: &self.inbound_reasm,
                         dialed_link_dest: &self.dialed_link_dest,
+                        link_plane: &self.link_plane,
                         scope_addresses: &self.scope_addresses,
                         #[cfg(feature = "lxmf")]
                         lxmf_serve: &self.lxmf_serve,
@@ -6340,6 +6414,9 @@ struct DialCtx {
     /// CIRISEdge#727 — the push is counted (`owner_binding_pushed`).
     metrics: Option<crate::observability::EdgeMetrics>,
     dialed_link_dest: Arc<Mutex<HashMap<LinkId, DestinationHash>>>,
+    /// CIRISEdge#728 — see `ReticulumTransport::link_plane`. A dial tags its
+    /// link `Identity` at connect; the pool hands out identity-plane links only.
+    link_plane: Arc<Mutex<HashMap<LinkId, LinkPlane>>>,
     reusable_dialed_link: Arc<Mutex<HashMap<DestinationHash, Vec<LinkId>>>>,
     link_in_flight: Arc<Mutex<HashSet<LinkId>>>,
 }
@@ -6438,6 +6515,15 @@ impl DialCtx {
             .lock()
             .await
             .insert(link_id, peer.dest_hash);
+        // CIRISEdge#728 — an identity-plane dial by construction: `peer` came
+        // from `resolve_dial_candidates` (announced / directory-resolved
+        // destinations; a derived address is neither). Tagged before
+        // establishment so the pool and the reverse-path selector never see an
+        // untagged link.
+        self.link_plane
+            .lock()
+            .await
+            .insert(link_id, LinkPlane::Identity);
 
         // Await `LinkEstablished` on BOTH ends — the peer must have accepted the
         // LINK_REQUEST or a resource transfer cannot start. `established` resolves
@@ -6534,6 +6620,12 @@ impl DialCtx {
     /// selector does. A stale entry is EVICTED on the way out rather than left
     /// to fail the next send too — the map is a cache over leviculum's link
     /// registry, and leviculum is the authority.
+    ///
+    /// CIRISEdge#728 — the pool is fed only by `dial_and_identify` (identity
+    /// dials), so its keys are announced destinations; the plane is checked on
+    /// the way out regardless, so this lookup is `(dest, Identity)` by
+    /// construction AND by check, and a scoped link can never be handed to an
+    /// identity-plane sender through this door either.
     async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
         let mut map = self.reusable_dialed_link.lock().await;
         let pool = map.get_mut(dest)?;
@@ -6546,10 +6638,13 @@ impl DialCtx {
             return None;
         }
         let in_flight = self.link_in_flight.lock().await;
+        let planes = self.link_plane.lock().await;
         // IDLE only. A link mid-transfer is not available: Reticulum runs one
         // resource per link, so handing it out serialises the caller behind the
         // transfer already on it — which is the regression the M=4 sweep caught.
-        pool.iter().find(|id| !in_flight.contains(*id)).copied()
+        pool.iter()
+            .find(|id| !in_flight.contains(*id) && planes.get(*id) == Some(&LinkPlane::Identity))
+            .copied()
     }
 }
 
@@ -6657,6 +6752,11 @@ struct EventCtx<'a> {
     /// same name on [`ReticulumTransport`]). Consulted in `attribute_and_deliver`
     /// when leviculum's `link_destination` is `None` for an own-dialed link.
     dialed_link_dest: &'a Mutex<HashMap<LinkId, DestinationHash>>,
+    /// CIRISEdge#728 — the per-link plane (see the field of the same name on
+    /// [`ReticulumTransport`]). Written in the `LinkEstablished` arm, read by
+    /// `attribute_and_deliver` to refuse an identity-plane frame on a scoped
+    /// link by name, removed on `LinkClosed`.
+    link_plane: &'a Mutex<HashMap<LinkId, LinkPlane>>,
     /// CIRISEdge#499 — the scope-native address table (see the field of the same
     /// name on [`ReticulumTransport`]). `attribute_and_deliver` probes its
     /// reverse index once per frame to stamp `InboundFrame::arrival_scope`,
@@ -6676,6 +6776,73 @@ struct EventCtx<'a> {
     /// leviculum rather than from inference.
     congestion: &'a crate::transport::av_backpressure::CongestionRegistry,
 }
+
+/// CIRISEdge#728 — the plane a Reticulum link belongs to, decided ONCE at
+/// establishment from the destination it was dialled to, on either end
+/// (`FSD/CIRIS_EDGE_TRANSPORT.md` §3.5).
+///
+/// A link is dialled to exactly one destination hash. If that hash is a
+/// scope-derived member address — one the [`ScopeAddressTable`] reverse index
+/// holds (the index carries EVERY member's address of every installed group,
+/// so the dialler's side classifies the peer's address and the responder's
+/// side its own) — the link is `Scoped`; otherwise it is on the identity
+/// plane. The plane is a property of the LINK, not of the peer it is
+/// attributed to: a scoped link the peer identified is still attributed to
+/// that peer (a scoped body needs a source), and a scoped body may still ride
+/// an identity link under §3.4's forwarder rule. What the plane governs is
+/// selection and refusal: an identity-plane send selects identity-plane links
+/// only, and a replication / announce / bundle frame arriving on a scoped link
+/// is refused by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinkPlane {
+    /// Dialled to an announced (federation) destination.
+    Identity,
+    /// Dialled to a scope-derived member address (`ScopeAddressTable`).
+    Scoped,
+}
+
+impl LinkPlane {
+    /// Stable token for logs and the test seam.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Scoped => "scoped",
+        }
+    }
+}
+
+/// CIRISEdge#728 — classify a link by the destination it was dialled to. Pure
+/// over the table: `Scoped` iff the reverse index resolves the hash. No table
+/// (a node that never opted into scope-native addressing) ⇒ every link is
+/// identity-plane, which is exactly the pre-#499 world.
+fn classify_link_plane(table: Option<&ScopeAddressTable>, dest: &DestinationHash) -> LinkPlane {
+    match table.and_then(|t| t.accepts_inbound(dest.as_bytes())) {
+        Some(_) => LinkPlane::Scoped,
+        None => LinkPlane::Identity,
+    }
+}
+
+/// CIRISEdge#728 — the identity-plane frame classes the transport can name
+/// WITHOUT parsing an envelope: a replication frame (`CRPL`), the on-link
+/// announce (`CANN`) and the build bundle (`CBND`). `None` is an opaque
+/// envelope — the scoped-body class (§3.4: the blob plane), whose admission on
+/// a scoped link is `BlobScopeRouter::scoped_arrival`'s, not the transport's.
+fn identity_plane_frame_class(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&crate::replication::wire_frame::REPLICATION_FRAME_MAGIC) {
+        Some("replication")
+    } else if crate::transport::announce_frame::is_announce_frame(data) {
+        Some("announce")
+    } else if crate::transport::peer_bundle_frame::is_peer_bundle_frame(data) {
+        Some("bundle")
+    } else {
+        None
+    }
+}
+
+/// The `drop_inbound` reason tag for an identity-plane frame on a scoped link
+/// (CIRISEdge#728); the `transport_inbound_drops` key.
+pub const DROP_IDENTITY_FRAME_ON_SCOPED_LINK: &str = "identity_frame_on_scoped_link";
 
 /// CIRISEdge#424 — the classified result of attributing an inbound frame's link to
 /// a source peer. Every arm is explicit so a `None` attribution can NEVER again be
@@ -6960,6 +7127,83 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         };
         frame
     };
+    // CIRISEdge#353/#424 — the link's DESTINATION, the basis of INITIATOR-side
+    // attribution below and (CIRISEdge#499) of the arrival scope. leviculum's
+    // `link_destination` answers this for links a peer dialed to us, but returns
+    // `None` for our OWN dialed links (its `link()` registry misses the initiator
+    // direction / a #66 re-key). That `None` is exactly what dropped every
+    // initiator-side reply `source_key_id=None` (CIRISEdge#424): the arm exited
+    // at step one into an un-instrumented `else`. Fall back to edge's own
+    // connect-time record (`dialed_link_dest`), which is re-key-independent.
+    let dest = match ctx.node.link_destination(&link_id) {
+        Some(d) => Some(d),
+        None => ctx.dialed_link_dest.lock().await.get(&link_id).copied(),
+    };
+    // CIRISEdge#499 — resolve the SCOPE-DERIVED address this frame arrived on,
+    // here, once, BEFORE the envelope is parsed. The resolution is a single
+    // hash-map probe against the reverse index (the table exists precisely so
+    // the packet path never derives — see
+    // `scope_addressing::lookup_never_calls_the_deriver`).
+    //
+    // `None` — no table installed, or a hash that is not one of ours — means the
+    // frame arrived on the FEDERATION address, which downstream reads as
+    // `CohortScope::Public`. That is not a downgrade: it is the literal truth
+    // about what reaching a public discovery address demonstrates.
+    //
+    // This is a receive-side ADMISSION FACT, orthogonal to `source_key_id`: it
+    // says which group secret the sender possessed, not who the sender is. A
+    // frame can carry one without the other, and the blob serve gate needs
+    // exactly this one.
+    let arrival_scope = dest.and_then(|d| {
+        ctx.scope_addresses
+            .get()
+            .and_then(|t| t.accepts_inbound(&d.into_bytes()))
+    });
+    // CIRISEdge#728 — THE PLANE CHECK, ahead of attribution. A replication,
+    // announce or bundle frame on a SCOPED link is refused by name here, so it
+    // can never again read as the generic `DestUnmatched` miss (the initiator's
+    // side of a scoped link resolves to the peer's derived address, which the
+    // peers map does not — and must not — hold). The plane is the link's
+    // establishment-time record; a link the record misses (a re-keyed alias
+    // the event loop has not tagged) is classified from its destination the
+    // same way. Bootstrap kinds are NOT exempt: `FIRST_CONTACT.md` §2's R1
+    // carve-out (#402) is an attribution carve-out on the identity plane, and
+    // a derived address exists only after first contact.
+    let recorded_plane = ctx.link_plane.lock().await.get(&link_id).copied();
+    let plane = recorded_plane.unwrap_or_else(|| {
+        dest.map_or(LinkPlane::Identity, |d| {
+            classify_link_plane(ctx.scope_addresses.get().map(Arc::as_ref), &d)
+        })
+    });
+    if plane == LinkPlane::Scoped {
+        if let Some(class) = identity_plane_frame_class(&data) {
+            let scope = arrival_scope.as_ref().map_or_else(
+                || "peer-derived".to_owned(),
+                |a| {
+                    format!(
+                        "{}:{} member={} epoch={}",
+                        a.group().scope().kind_token(),
+                        a.group().group_id(),
+                        a.member_key_id(),
+                        a.epoch()
+                    )
+                },
+            );
+            let detail = format!(
+                "an identity-plane {class} frame ({} bytes) arrived on a SCOPED link — link={link_id:?} \
+                 dest={} scope={scope}. The sender selected this link by peer alone (pre-#728); \
+                 identity-plane traffic rides identity-plane links only \
+                 (FSD/CIRIS_EDGE_TRANSPORT.md §3.5)",
+                data.len(),
+                dest.map_or_else(|| "-".to_owned(), |d| hex::encode(d.into_bytes())),
+            );
+            if let Some(m) = ctx.metrics {
+                m.inc_transport_inbound_drop(DROP_IDENTITY_FRAME_ON_SCOPED_LINK);
+            }
+            drop_inbound(Some(link_id), DROP_IDENTITY_FRAME_ON_SCOPED_LINK, &detail);
+            return;
+        }
+    }
     // CIRISEdge#393 (E3) — resolve the candidate peer key_id for this link, then
     // gate it through `SourceKeyId::from_rooted_binding`: attribution survives
     // ONLY for a `Rooted ∧ owns_key` peer. An Advisory or non-owning binding —
@@ -6972,20 +7216,9 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // CIRISEdge#353/#424 — INITIATOR-side attribution. `link_to_peer_key_id` is fed
     // by `LinkIdentified`, which only fires on links a PEER dialed to us; a reply
     // arriving on a link WE dialed (the reverse path a NAT'd peer's responder uses)
-    // has no entry. The basis is the link's DESTINATION: we dialed a dest resolved
-    // from the VERIFIED route table, and RNS establishment proves the remote
-    // controls that dest's keys — same trust the outbound send used.
-    //
-    // leviculum's `link_destination` answers this for links a peer dialed to us,
-    // but returns `None` for our OWN dialed links (its `link()` registry misses the
-    // initiator direction / a #66 re-key). That `None` is exactly what dropped
-    // every initiator-side reply `source_key_id=None` (CIRISEdge#424): the arm
-    // exited at step one into an un-instrumented `else`. Fall back to edge's own
-    // connect-time record (`dialed_link_dest`), which is re-key-independent.
-    let dest = match ctx.node.link_destination(&link_id) {
-        Some(d) => Some(d),
-        None => ctx.dialed_link_dest.lock().await.get(&link_id).copied(),
-    };
+    // has no entry. The basis is the link's DESTINATION (`dest` above): we dialed
+    // a dest resolved from the VERIFIED route table, and RNS establishment proves
+    // the remote controls that dest's keys — same trust the outbound send used.
     let candidate_key_id = {
         let peers = ctx.peers.lock().await;
         let outcome = resolve_link_attribution(identified, dest, ctx.local_key_id, |d| {
@@ -7338,27 +7571,8 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         // exact condition already stated upstream).
         None => None,
     };
-    // CIRISEdge#499 — resolve the SCOPE-DERIVED address this frame arrived on,
-    // here, once, BEFORE the envelope is parsed. `dest` is the link's
-    // destination, already in hand for the attribution above; the resolution is
-    // a single hash-map probe against the reverse index (the table exists
-    // precisely so the packet path never derives — see
-    // `scope_addressing::lookup_never_calls_the_deriver`).
-    //
-    // `None` — no table installed, or a hash that is not one of ours — means the
-    // frame arrived on the FEDERATION address, which downstream reads as
-    // `CohortScope::Public`. That is not a downgrade: it is the literal truth
-    // about what reaching a public discovery address demonstrates.
-    //
-    // This is a receive-side ADMISSION FACT, orthogonal to `source_key_id`: it
-    // says which group secret the sender possessed, not who the sender is. A
-    // frame can carry one without the other, and the blob serve gate needs
-    // exactly this one.
-    let arrival_scope = dest.and_then(|d| {
-        ctx.scope_addresses
-            .get()
-            .and_then(|t| t.accepts_inbound(&d.into_bytes()))
-    });
+    // CIRISEdge#499 — `arrival_scope` was resolved above (once, before the plane
+    // check and the parse) and is stamped here unchanged.
     let frame = InboundFrame {
         envelope_bytes: data,
         transport: TransportId::RETICULUM_RS,
@@ -7422,7 +7636,11 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         // `node.accept_link(...)` dance is gone. We now hear the
         // already-accepted link via `LinkEstablished` directly on the
         // responder side; the resource strategy + bookkeeping run there.
-        NodeEvent::LinkEstablished { link_id, .. } => {
+        NodeEvent::LinkEstablished {
+            link_id,
+            destination_hash,
+            ..
+        } => {
             // Auto-accept inbound resources so envelope transfers
             // reassemble without app intervention. Covers BOTH responder
             // (the link the peer just initiated against us) and
@@ -7431,6 +7649,27 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 .node
                 .set_resource_strategy(&link_id, ResourceStrategy::AcceptAll);
             ctx.established_links.lock().await.insert(link_id);
+            // CIRISEdge#728 — classify the link's PLANE from the destination
+            // leviculum names on the event (the dialled dest, on both ends:
+            // `link_management.rs:1173/1418` at v0.27.0+ciris.1). The dial
+            // paths already tagged their own links at connect under the dial
+            // id; this covers the responder side and the #66 re-keyed alias an
+            // event may carry, and never overrides a connect-time tag.
+            let plane = {
+                let mut planes = ctx.link_plane.lock().await;
+                *planes.entry(link_id).or_insert_with(|| {
+                    classify_link_plane(
+                        ctx.scope_addresses.get().map(Arc::as_ref),
+                        &destination_hash,
+                    )
+                })
+            };
+            tracing::debug!(
+                link = ?link_id,
+                dest = %hex::encode(destination_hash.into_bytes()),
+                plane = plane.as_str(),
+                "link established — plane fixed for its lifetime (CIRISEdge#728)"
+            );
             // CIRISEdge#32 (v0.14.0) — record establish time for the
             // Links FFI surface's `age_seconds` derivation.
             let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
@@ -7456,9 +7695,14 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // ordering hazard). For links WE dialed the push happens on the
             // dial paths right after `identify_link`, so the bundle frame can
             // never outrun the LINKIDENTIFY the receiver attributes it by.
+            //
+            // CIRISEdge#728 — NOT on a scoped link. The announce and the
+            // bundle are identity-plane control frames; a link dialled to
+            // one of our derived addresses carries scoped bodies only, and
+            // the far end refuses them there by name anyway.
             {
                 let own_dialed = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
-                if !own_dialed {
+                if !own_dialed && plane == LinkPlane::Identity {
                     // CIRISEdge#627 — responder side: our announce rides the
                     // peer's link back to it, FIRST, so the dialer binds us
                     // without waiting for our RNS announce either.
@@ -7899,6 +8143,8 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // CIRISEdge#532 — a closed link cannot still be "transferring"; leaving
             // it marked would leak a pool slot that is never handed out again.
             ctx.link_in_flight.lock().await.remove(&link_id);
+            // CIRISEdge#728 — and its plane record.
+            ctx.link_plane.lock().await.remove(&link_id);
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
             // CIRISEdge#34 link half (v0.14.0) — emit `link_closed`
             // event. Severity reflects whether the close was graceful.
@@ -13810,6 +14056,11 @@ mod scope_native_addressing_tests {
              see a detached dial's link"
         );
         assert!(
+            Arc::ptr_eq(&ctx.link_plane, &t.link_plane),
+            "the plane a detached dial TAGS its link with must be the map the \
+             selectors READ, or an identity link is never selectable (#728)"
+        );
+        assert!(
             Arc::ptr_eq(&ctx.node, &t.node),
             "one node, or the dial establishes on a different stack entirely"
         );
@@ -13872,6 +14123,65 @@ mod scope_native_addressing_tests {
             .install_group(scope, group_id, 1, &[9u8; 32], members)
             .expect("install group");
         table
+    }
+
+    /// CIRISEdge#728 (I-3.5.1) — a link's plane is decided by the reverse
+    /// index: a member address on EITHER end (the index holds every member's,
+    /// so the dialler classifies the peer's address and the responder its
+    /// own) is scoped; any other hash, and every hash without a table, is
+    /// identity-plane.
+    #[test]
+    fn a_derived_address_on_either_end_is_scoped() {
+        let table = table_with_group(&CohortScope::SelfOnly, "self:owner", &["d1", "d2"]);
+        let mine = table
+            .send_address(&CohortScope::SelfOnly, "self:owner", "d1")
+            .expect("d1's address");
+        let theirs = table
+            .send_address(&CohortScope::SelfOnly, "self:owner", "d2")
+            .expect("d2's address");
+        for addr in [mine, theirs] {
+            assert_eq!(
+                classify_link_plane(Some(&table), &DestinationHash::new(*addr.as_bytes())),
+                LinkPlane::Scoped
+            );
+        }
+        let announced = DestinationHash::new([0xA5; 16]);
+        assert_eq!(
+            classify_link_plane(Some(&table), &announced),
+            LinkPlane::Identity
+        );
+        assert_eq!(
+            classify_link_plane(None, &DestinationHash::new(*mine.as_bytes())),
+            LinkPlane::Identity,
+            "no table ⇒ no scoped links: the pre-#499 world"
+        );
+    }
+
+    /// CIRISEdge#728 — what the receiver refuses on a scoped link is exactly
+    /// what it can NAME without parsing an envelope: the three magic-prefixed
+    /// identity-plane frames. An opaque envelope is the scoped-body class.
+    #[test]
+    fn identity_plane_frame_classes_are_named_without_a_parse() {
+        use crate::replication::protocol::{DeliverMessage, EnvelopeKind, ReplicationMessage};
+        let crpl = crate::replication::wire_frame::wrap_for_kind(&ReplicationMessage::Deliver(
+            DeliverMessage {
+                kind: EnvelopeKind::Key,
+                envelopes: vec![b"{}".to_vec()],
+            },
+        ));
+        assert_eq!(identity_plane_frame_class(&crpl), Some("replication"));
+        assert_eq!(
+            identity_plane_frame_class(&crate::transport::peer_bundle_frame::encode(b"{}")),
+            Some("bundle")
+        );
+        let mut cann = crate::transport::announce_frame::ANNOUNCE_FRAME_MAGIC.to_vec();
+        cann.extend_from_slice(&[1, 0, 0]);
+        assert_eq!(identity_plane_frame_class(&cann), Some("announce"));
+        assert_eq!(
+            identity_plane_frame_class(br#"{"message_type":"BlobChunkFetch"}"#),
+            None
+        );
+        assert_eq!(identity_plane_frame_class(b""), None);
     }
 
     #[tokio::test]
