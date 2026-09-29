@@ -981,6 +981,12 @@ pub struct EdgeMetrics {
     /// CIRISEdge#627 — first-seen announces whose Stage 2 (rooting walk) was
     /// dropped at a full priority lane. Must read 0 in every harness run.
     pub announce_queue_drop_first_seen: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#722 — reverse-path frames that SKIPPED Channel-first because
+    /// they cut to more than `CHANNEL_FIRST_MAX_FRAGMENTS` and went straight to
+    /// the Resource path. A routing decision, so it is counted (and logged) —
+    /// before #722 it was a silent `filter`, indistinguishable in the log from a
+    /// Channel send that never happened.
+    pub channel_first_skipped_over_cap: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#627 — Stage-1 latency of the most recent first-seen bind
     /// (announce receipt → binding installed + links bound), milliseconds.
     /// A gauge of the last value, not a histogram: the question it answers is
@@ -1324,6 +1330,18 @@ impl EdgeMetrics {
         self.announce_queue_drop_first_seen
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+    /// CIRISEdge#722 — a reverse-path frame skipped Channel-first (over the
+    /// fragment cap) and went to the Resource path.
+    pub fn inc_channel_first_skipped_over_cap(&self) {
+        self.channel_first_skipped_over_cap
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// CIRISEdge#722 — read `channel_first_skipped_over_cap`.
+    #[must_use]
+    pub fn channel_first_skipped_over_cap(&self) -> u64 {
+        self.channel_first_skipped_over_cap
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
     /// CIRISEdge#627 — record the latest Stage-1 announce→binding latency.
     pub fn record_announce_to_binding_ms(&self, ms: u64) {
         self.announce_to_binding_ms_last
@@ -1548,6 +1566,7 @@ impl EdgeMetrics {
             announce_intake_evictions: self.announce_intake_evictions(),
             link_before_binding: self.link_before_binding(),
             announce_queue_drop_first_seen: self.announce_queue_drop_first_seen(),
+            channel_first_skipped_over_cap: self.channel_first_skipped_over_cap(),
             announce_to_binding_ms_last: self.announce_to_binding_ms_last(),
             withholds_by_reason: self.withholds_by_reason.read().clone(),
             recent_withholds: self.recent_withholds.read().iter().cloned().collect(),
@@ -1624,6 +1643,10 @@ pub struct EdgeMetricsBundle {
     pub link_before_binding: u64,
     /// CIRISEdge#627 — first-seen announces shed at a full priority lane. 0.
     pub announce_queue_drop_first_seen: u64,
+    /// CIRISEdge#722 — reverse-path frames sent Resource-first because they
+    /// exceeded `CHANNEL_FIRST_MAX_FRAGMENTS` (every hybrid-signed row does at a
+    /// 500-byte MTU: the ML-DSA-65 signature alone outweighs eight fragments).
+    pub channel_first_skipped_over_cap: u64,
     /// CIRISEdge#627 — latest Stage-1 announce→binding latency, ms (0–2 expected).
     pub announce_to_binding_ms_last: u64,
     /// CIRISEdge#433 — cumulative per-reason withhold count. Empty on an IDLE
