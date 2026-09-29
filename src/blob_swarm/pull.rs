@@ -244,6 +244,32 @@ pub enum PullOutcome {
     /// A `CommunityDek` pointer with no sealed-under epoch. Not retried;
     /// the row will never carry one.
     NoEpoch,
+    /// CIRISEdge#638 item 2 / CC 5.3.2.5 — the bytes hashed to the row's
+    /// address but their length is not the size the row DECLARES (the OCI
+    /// rule: a declared size is checked, never trusted). `declared` is the
+    /// stored length the pointer's `size` implies at its tier. Not adopted,
+    /// not retried: the row, not the holder, is wrong.
+    SizeMismatch { declared: u64, received: u64 },
+}
+
+/// **The stored length a pointer's declared `size` implies** (CIRISEdge#638
+/// item 2) — `None` when the row declares none (pre-#698) or the pointer is
+/// a chunk DAG (its manifest pins `total_size` per chunk already, and the
+/// puller fetches whole blobs only). A sealed tier stores the plaintext
+/// inside an `AtRestEnvelope`, so the fetched body is `size` plus persist's
+/// own exported overhead — the same arithmetic `files::must_chunk` uses.
+#[must_use]
+pub fn declared_stored_len(pointer: &crate::group_content::BlobPointer) -> Option<u64> {
+    if pointer.stream_id.is_some() {
+        return None;
+    }
+    let size = pointer.size?;
+    Some(match pointer.tier {
+        CryptoTier::Plaintext => size,
+        CryptoTier::CommunityDek | CryptoTier::InvisibleEncrypted => size.saturating_add(
+            ciris_persist::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD as u64,
+        ),
+    })
 }
 
 /// Hash-only verifier for the pull's swarm fetch: the assembled blob is
@@ -718,6 +744,23 @@ where
             }
         };
 
+        // CIRISEdge#638 item 2 (CC 5.3.2.5): the row's declared size, checked
+        // before anything is stored. The hash already matched, so a mismatch
+        // here is the ROW misdescribing its bytes — refused, never adopted.
+        if let Some(declared) = meaning.pointer().and_then(declared_stored_len) {
+            let received = bytes.len() as u64;
+            if received != declared {
+                tracing::warn!(
+                    blob = %blob_hex,
+                    attestation_id = %row.attestation_id,
+                    declared,
+                    received,
+                    "pull refused: the bytes are not the size the row declares (CC 5.3.2.5)"
+                );
+                return PullOutcome::SizeMismatch { declared, received };
+            }
+        }
+
         // Store, through the door the gate's verdict names.
         match tier {
             CryptoTier::Plaintext => {
@@ -861,6 +904,41 @@ mod tests {
     use super::*;
 
     const SHA: [u8; 32] = [0xAB; 32];
+
+    /// CIRISEdge#638 item 2 — the declared size, as the field produces it:
+    /// the pointer `files::publish` writes (plaintext `size`), read at the
+    /// tier the row records. Sealed tiers add persist's envelope overhead;
+    /// a DAG and a pre-#698 pointer declare nothing to check.
+    #[test]
+    fn a_pointers_declared_size_names_the_stored_length_at_its_tier() {
+        use ciris_persist::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD;
+        let mut p: crate::group_content::BlobPointer = serde_json::from_value(serde_json::json!({
+            "community_key_id": "room",
+            "tier": "plaintext",
+            "content_sha256": "ab".repeat(32),
+            "content_field": "body",
+            "size": 1000,
+        }))
+        .expect("pointer");
+        assert_eq!(declared_stored_len(&p), Some(1000));
+        for tier in [CryptoTier::CommunityDek, CryptoTier::InvisibleEncrypted] {
+            p.tier = tier;
+            assert_eq!(
+                declared_stored_len(&p),
+                Some(1000 + AT_REST_ENVELOPE_OVERHEAD as u64),
+                "{tier:?}: the envelope, not the plaintext, is what arrives"
+            );
+        }
+        p.stream_id = Some("file-1".into());
+        assert_eq!(
+            declared_stored_len(&p),
+            None,
+            "a DAG's manifest pins its own sizes"
+        );
+        p.stream_id = None;
+        p.size = None;
+        assert_eq!(declared_stored_len(&p), None, "pre-#698: nothing declared");
+    }
 
     fn sink_with(capacity: usize) -> (PullSink, mpsc::Receiver<PullRequest>) {
         let (tx, rx) = mpsc::channel(capacity);

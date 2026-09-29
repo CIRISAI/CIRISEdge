@@ -4152,6 +4152,37 @@ mod files {
         }
     }
 
+    /// CIRISEdge#638 item 2 — the puller's size check, against the length
+    /// persist ACTUALLY records for the sealed body (`BlobHead.size_bytes`),
+    /// at both encrypted tiers: the declared size a far node checks is the
+    /// stored length a holder serves, or every honest pull is refused.
+    #[tokio::test]
+    async fn a_pointers_declared_size_is_the_stored_length_persist_records() {
+        use ciris_persist::federation::BlobStorage as _;
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        for (i, (room, tier)) in rooms.iter().enumerate() {
+            let nth = i64::try_from(i).expect("fits");
+            let body = vec![7u8; 4321 + i];
+            let published = write(&node_a, room, &body, Some("sized.bin"), None, nth).await;
+            let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+            let head = node_a
+                .dir
+                .blob_head(&sha)
+                .await
+                .expect("blob_head")
+                .expect("the blob is held");
+            assert_eq!(
+                ciris_edge::blob_swarm::pull::declared_stored_len(&published.pointer),
+                Some(head.size_bytes),
+                "{room} ({tier:?}): declared size ⇒ the stored length persist records"
+            );
+        }
+    }
+
     /// D10 — a nameless file seals `{format}` only and reads back `None`,
     /// never `""`.
     #[tokio::test]
