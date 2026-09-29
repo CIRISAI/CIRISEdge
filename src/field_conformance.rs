@@ -615,7 +615,7 @@ mod tests {
 
     /// CIRISEdge#706 item 1 — **replay the CC vectors against edge's matcher.**
     ///
-    /// All 962 published `(dimension, family, refusal)` triples, exact: a
+    /// All 968 published `(dimension, family, refusal)` triples, exact: a
     /// matcher that answers differently from the reference on any one fails
     /// the build, every mismatch named. Edge's matcher is persist's — the
     /// full-match, refusal-bearing `namespace::matcher::match_family` of
@@ -654,6 +654,29 @@ mod tests {
             m.family.map(str::to_owned),
             m.refusal.map(|r| r.as_str().to_owned()),
         )
+    }
+
+    /// CIRISConstitution#129 (landed at `651140a`, vendored by persist v51) —
+    /// edge's PRODUCTION A/V relay-delivery score dimension is a registered,
+    /// edge-owned leaf under `capacity:`. Persist v50's rc5 registry refused it
+    /// (`namespace_family_unregistered`); this pins that the registry edge ships
+    /// against admits it, through the matcher persist's admission gate runs,
+    /// AND that the CC reference agrees on the same bytes.
+    #[test]
+    fn the_production_relay_delivery_dimension_admits() {
+        let dim = crate::transport::realtime_av_alm::CAPACITY_RELAY_DELIVERY_DIMENSION;
+        assert_eq!(dim, "capacity:relay_delivery:v1");
+        let (family, refusal) = edge_namespace_match(dim);
+        assert_eq!(
+            refusal, None,
+            "{dim} must admit under the vendored registry"
+        );
+        assert_eq!(family.as_deref(), Some("capacity:relay_delivery"));
+        let reference = crate::cc_namespace::vectors()
+            .into_iter()
+            .find(|v| v.dimension == dim)
+            .expect("the CC vectors carry edge's registered row");
+        assert_eq!(reference.refusal, None);
     }
 
     /// CIRISEdge#706 item 3 — every dimension this module's fixtures stand on

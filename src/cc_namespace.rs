@@ -3,7 +3,7 @@
 //!
 //! CC publishes two generated files beside Part 3: `namespace_registry.json`
 //! (every family row — prefix, segments, closed leaves) and
-//! `namespace_match_vectors.json` (962 `(dimension, family, refusal)` triples,
+//! `namespace_match_vectors.json` (968 `(dimension, family, refusal)` triples,
 //! exactly as the reference matcher `tools/cc_namespace_match.py` answers them).
 //! The contract on the vectors file: *every consumer replays these against its
 //! own matcher*. Both are vendored byte-for-byte under
@@ -20,20 +20,23 @@
 //!
 //! Test-only: the files are ~325 KB and nothing in production reads them.
 
-/// The CIRISConstitution commit both files are vendored from (CC `main` at
-/// the rc5 PDF finalisation). Byte-identical to `c60d0a6` (the rc5 cut), which
-/// is what persist v50 vendors — so the replay persist runs and the one edge
-/// runs read the same bytes.
-pub const VENDORED_CC_COMMIT: &str = "a4d29a64278f3ced3b8502dfb2502d3a41ce879b";
+/// The CIRISConstitution commit both files are vendored from: `651140a` on
+/// `rc6` (`cc_version 1.0-rc6`), the commit that registered edge's
+/// `capacity:relay_delivery` row (CIRISConstitution#129). Byte-identical to
+/// what persist v51 vendors (CIRISPersist#924 follow-on) — so the replay
+/// persist runs and the one edge runs read the same bytes. (Was rc5
+/// `a4d29a6` until the v33.0.0 adopt.)
+pub const VENDORED_CC_COMMIT: &str = "651140a2a553e2276bf5d80c77a32feaa9968f75";
 
 /// `_meta.registry_sha256` — the hash of the GRAMMAR (families + `_meta`
 /// minus the prose hash), CSD/3's pin. A wording edit to Part 3 moves only
 /// `source_sha256`; a grammar edit moves this.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "07e0c72538f3dd42451cac0c5f2529eed37bea3e8996640de2749aabb960b7fb";
+    "c22dc0874b4c5ade08d8a691effdee36464eeaa76e3c57de28bdd0d0b2328d3e";
 
-/// The number of vectors the pinned file carries (released rc5).
-pub const VENDORED_N_VECTORS: usize = 962;
+/// The number of vectors the pinned file carries (rc6 at `651140a`: rc5's
+/// 962 plus the six for edge's registered relay-delivery row).
+pub const VENDORED_N_VECTORS: usize = 968;
 
 /// `vendor/constitution/namespace_registry.json`, byte-for-byte.
 pub const REGISTRY_JSON: &str = include_str!("../vendor/constitution/namespace_registry.json");
@@ -170,7 +173,7 @@ mod tests {
     /// generator does and requires it to equal the file's own claim, the
     /// vectors file's claim, and [`VENDORED_REGISTRY_SHA256`]. A hand edit to
     /// either file, or a re-vendor that moved the bytes without the pin, fails
-    /// here; a CC wording edit (which moves only `source_sha256`) does not.
+    /// here; a CC wording edit (which moves only `source_sha256`) or a `cc_version` bump does not.
     #[test]
     fn vendored_grammar_hashes_to_its_pin() {
         use sha2::{Digest, Sha256};
@@ -180,6 +183,9 @@ mod tests {
         let mut grammar_meta = meta.clone();
         grammar_meta.remove("source_sha256");
         grammar_meta.remove("registry_sha256");
+        // rc6 (CC `tools/build_cc_namespace.py` at 651140a): a `cc_version` bump
+        // is not a grammar change, so it leaves the preimage too.
+        grammar_meta.remove("cc_version");
         let grammar = serde_json::json!({
             "_meta": serde_json::Value::Object(grammar_meta),
             "families": root["families"].clone(),
@@ -201,7 +207,7 @@ mod tests {
             vroot["_meta"]["registry_sha256"], VENDORED_REGISTRY_SHA256,
             "the vectors were generated from a different grammar than the vendored registry"
         );
-        assert_eq!(meta["cc_version"], "1.0-rc5");
+        assert_eq!(meta["cc_version"], "1.0-rc6");
         // The commit is a full 40-hex SHA — a re-vendor records exactly where the bytes came from.
         assert!(
             VENDORED_CC_COMMIT.len() == 40
