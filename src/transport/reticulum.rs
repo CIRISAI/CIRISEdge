@@ -5401,9 +5401,35 @@ impl ReticulumTransport {
             // Resource path below exactly as before.
             if attempts == 1 {
                 let mdu = link_channel_mdu(&self.node, &link_id);
+                let fragments = crate::transport::frame_fragment::fragment(envelope_bytes, mdu);
+                // CIRISEdge#722 — the over-cap decision SPEAKS. It used to be a
+                // bare `filter`, so a frame that went Resource-first left no
+                // line at all and the log read as "Channel-first never ran".
+                // At a 500-byte MTU (409-byte CFRG payload) eight fragments carry
+                // 3272 bytes; every hybrid-signed row exceeds that (an ML-DSA-65
+                // signature alone is 3309 bytes), so this is the NORMAL path for
+                // a Deliver and the cap is doing exactly what its rule says:
+                // control-plane frames ride the Channel, rows ride a Resource.
+                if let Some(f) = fragments
+                    .as_ref()
+                    .filter(|f| f.len() > CHANNEL_FIRST_MAX_FRAGMENTS)
+                {
+                    if let Some(m) = self.metrics.as_ref() {
+                        m.inc_channel_first_skipped_over_cap();
+                    }
+                    tracing::debug!(
+                        destination_key_id,
+                        link = ?link_id,
+                        mdu,
+                        bytes = envelope_bytes.len(),
+                        fragments = f.len(),
+                        max_fragments = CHANNEL_FIRST_MAX_FRAGMENTS,
+                        "Channel-first SKIPPED — frame exceeds the fragment cap; the Resource \
+                         path goes first (CIRISEdge#722 / #636)"
+                    );
+                }
                 if let Some(fragments) =
-                    crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
-                        .filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
+                    fragments.filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
                 {
                     let outcome = send_fragments_on_channel(&self.node, &link_id, &fragments).await;
                     if outcome.complete() {
@@ -6752,6 +6778,24 @@ async fn binding_exists_cached(
     verdict
 }
 
+/// CIRISEdge#722 — one line describing the signed reticulum route this node
+/// HOLDS for `key_id` (the item-2 operand the peers-map `dest` is compared
+/// against): `dest=… hybrid=… epoch=… provenance=…`, `none`, or the read error.
+/// Used only on the throttled item-2 refusal log, never on the hot path.
+async fn describe_held_route(rooting: &dyn RootingDirectory, key_id: &str) -> String {
+    match rooting.signed_reticulum_route(key_id).await {
+        Ok(Some(r)) => format!(
+            "dest={} hybrid={} epoch={} provenance={:?}",
+            r.transport_destination.destination,
+            r.signature.mldsa65_signature_base64.is_some(),
+            r.transport_destination.epoch,
+            r.transport_destination.binding_provenance
+        ),
+        Ok(None) => "none".to_owned(),
+        Err(e) => format!("read-error: {e}"),
+    }
+}
+
 /// Handle one [`NodeEvent`]. Announce events populate the peer map;
 /// link requests are accepted with auto-resource-accept; established
 /// links + completed sender-side resources unblock [`Transport::send`];
@@ -7163,15 +7207,26 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                     } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                         link_attribution_miss_log().check(key_id.as_str())
                     {
+                        // CIRISEdge#722 — name the OTHER operand. `dest` is what
+                        // the peer announced (its peers-map entry); the row this
+                        // node HOLDS for the peer decides the verdict, and the two
+                        // failure classes ("no row has reached me" vs "the row
+                        // names a different dest") were indistinguishable from
+                        // this line alone. Read on the throttled path only.
+                        let held_signed_route = describe_held_route(rooting, &key_id).await;
                         tracing::warn!(
                             link = ?link_id,
                             peer = %key_id,
                             dest = %hex::encode(d),
+                            %held_signed_route,
                             suppressed_prev,
                             "inbound frame DROPPED — item 1 PASSED (owns_key) but \
                              item 2 FAILED: no hybrid-verified SignedTransportDestination \
                              binds this (peer, dest) pair (CIRISEdge#393 item 2). This is \
-                             the ONLY failing conjunct"
+                             the ONLY failing conjunct. `held_signed_route=none` ⇒ the \
+                             peer's TransportDestination row has not reached this node; a \
+                             held dest ≠ `dest` ⇒ the peer announces on a destination its \
+                             signed route does not name (CIRISEdge#722)"
                         );
                         None
                     } else {
