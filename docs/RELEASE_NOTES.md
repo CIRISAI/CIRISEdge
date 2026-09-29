@@ -1,5 +1,88 @@
 # CIRISEdge Release Notes
 
+# v34.0.0 — identity rows follow the announce; per-kind publish sets; first contact on the opaque plane
+
+**2026-09-29** (CIRISEdge#682, #678 → PR #713; CIRISEdge#683 → PR #714). **MAJOR** from v33.1.0: the
+serve-advertise policy hash moves, and three public types change shape (below). No persist or verify
+move. Ladder triple: **edge v34.0.0 · persist v51.1.0 · verify v18.0.0**.
+
+## The pins
+
+| | v33.1.0 | v34.0.0 |
+|---|---|---|
+| ciris-persist / wheel floor | `v51.1.0` / `>=51.1,<52` | unchanged |
+| CIRISVerify crates | `v18.0.0` | unchanged |
+| ABI constants, `REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH` | — | unchanged |
+| **`SERVE_ADVERTISE_POLICY_HASH`** | `6fbf0282…` | **`e4c4d6253afe686a01eec073da343b74b11af6da6cd26c16a6ef0aacc9804569`** |
+
+**Riders:** re-pin `SERVE_ADVERTISE_POLICY_HASH`. Nothing else.
+
+## #682 — an owned node's identity rows follow its announce (CC 5.4.6)
+
+An owned node's `IdentityOccurrence` and `TransportDestination` rows reach every peer only while
+the node is **announced**: the owner-binding `owner → node` is live at `cohort_scope: federation`
+(written there, or widened there by persist's `widen_audience`). Otherwise they reach only the
+owner's own nodes (`nodes_owned_by(owner)`).
+
+- Keyed on the row's occurrence key, so relayed rows are gated too. Enforced on all three serve
+  axes: advertise, the direct-fetch twin, and the subject Pull.
+- Withhold tokens: `identity_row_node_not_announced`; `identity_row_announce_unresolved` (an
+  ambiguous owner or a read error) fails closed.
+- Unowned nodes (a canonical, a bare server) serve as before. `Key` is not gated.
+- Read from persist state, never from a host flag; memoized per sweep and invalidated by the
+  ownership events plus an admitted owner-binding widening.
+- `FSD/FIRST_CONTACT.md` §2.1, I13, I14.
+
+## #678 — per-kind publish sets
+
+`KindPublishSelector` returns a plane's `SelfOwn` publish set by kind, so a host can relay a third
+party's anchored key record while withholding its occurrences and routes. Exposed as
+`with_kind_publish_selector`, `ReplicationRuntimeConfig::kind_publish_selector`, and PyO3
+`start_replication(..., publish_sets_by_kind={"key": [...]})`. Unnamed kinds and an unset selector
+behave as before.
+
+## #683 — first contact on the opaque plane (`FSD/FIRST_CONTACT.md` §2.2, I15–I19)
+
+A new device can ask its owner's first device to let it join before that device has ever seen its
+key.
+
+- **Requester:** `Edge::send_opaque_request_introducing(dest, kind, payload, timeout_ms)` attaches
+  this node's own self-signed key record and a fresh 32-byte random `challenge`, and returns an
+  `OpaqueExchange { response, introductions }`. An answer's introduced keys are admitted only if it
+  answers a pending request to that signer (unguessable correlation) and arrives on the transport
+  the request went out on. Keys are admitted before the verify; attestations are admitted after it,
+  through the replication apply door, so the owner memo invalidates.
+- **Receiver, before the verify:** shape check (the record names the envelope's signer and is
+  self-signed), then budgets (per sender 3 / 10 min and 12 / day, per link 6 / 10 min, node-wide
+  32 / h), then persist's proof of possession, then the replicated Key door. Each refusal is named,
+  counted in `first_contact_outcomes`, and gets no answer. Admission grants no trust, and the key is
+  never advertised.
+- **Answering:** `Edge::register_opaque_answerer(kind, |ctx| OpaqueAnswer)` sees
+  `ctx.first_contact` and may attach key records and attestations; on a first contact edge adds
+  this node's own record. The answer rides the requester's arrival path
+  (`Transport::send_on_reply_path`, falling back to by-key).
+- **I14 (deployment precondition):** a device-join answer must carry the owner's binding to the
+  approving device, and the owner's binding to the new device once minted.
+- **I19 (the remaining limit):** persist binds `key_id` inside the registration envelope but never
+  derives it from the public key, so an attacker on the path at first contact can still substitute
+  a record. The challenge and the transport check stop off-path forgery. They do not stop an
+  on-path attacker.
+- Without a key record, request and answer wire bytes are unchanged.
+
+## Breaking Rust surface
+
+- `InboundFrame` has a new pub field, `reply_path`. Struct literals must add it (`None`).
+- `WithholdReason` has two new variants and is not `#[non_exhaustive]`.
+- `ReplicationRuntimeConfig` has a new pub field; `..Default::default()` literals are unaffected.
+- `Transport` has a new provided method, `send_on_reply_path`; implementors inherit the by-key
+  default.
+
+## Not in this cut
+
+#679 ask 1 (a `Refused` reply as wire version `0x04`) stays deferred. Per
+`FSD/STRUCTURAL_REFUSALS.md` §1 it waits for ask 2 (the park, v31.1.0) to be measured on the
+canonical, and no such measurement exists yet.
+
 # v33.1.0 — files::rename, and adopt persist v51.1.0 (the custody view)
 
 **2026-09-29** (CIRISEdge#702 server ask, PR #711; CIRISPersist#942 → v51.1.0 at `3488557`).
