@@ -260,6 +260,24 @@ pub struct OpenRequest<'a> {
     pub viewer_key_id: &'a str,
 }
 
+/// A request to re-describe content a row already points at — a rename
+/// (CIRISEdge#702, `FSD/CONTENT_TRANSFER.md` §6.7.2).
+///
+/// Carries the prior row's binding, never a new one: the bytes stay sealed
+/// under the claim's `(author, asserted_at)`, so that is what the store
+/// authenticates them under before it touches the description.
+#[derive(Debug, Clone)]
+pub struct RedescribeRequest<'a> {
+    /// The prior row's pointer.
+    pub pointer: &'a BlobPointer,
+    /// The prior row's author — an AAD input.
+    pub author_key_id: &'a str,
+    /// The prior row's instant — an AAD input.
+    pub asserted_at: chrono::DateTime<chrono::Utc>,
+    /// The new name; `None` makes the file nameless (never `""`).
+    pub name: Option<&'a str>,
+}
+
 /// Seal and open group content.
 ///
 /// Implementations wrap a `ciris_persist::Engine`; see
@@ -325,6 +343,31 @@ pub trait GroupContentStore: Send + Sync + 'static {
         let _ = req;
         Err(GroupContentError::Substrate(
             "this store has no sealed-descriptor door (CIRISEdge#698)".to_owned(),
+        ))
+    }
+
+    /// **Give the same bytes a new name** (CIRISEdge#702, §6.7.2) — the
+    /// pointer a renaming row carries: the SAME blob, the description
+    /// rewritten by the tier the pointer records.
+    ///
+    /// Encrypted tier: the current description is opened as this node (the
+    /// blob authenticated under the prior row's AAD first), its `name`
+    /// replaced, and `{name?, format, codec?}` sealed again under the bytes'
+    /// own DEK; a pre-#698 pointer's clear format and codec move inside the
+    /// seal. Plaintext tier: the pointer is returned with its clear format,
+    /// and the name is the row's to carry in clear. The store decides, as it
+    /// does for a write; the producer never handles the descriptor's bytes.
+    ///
+    /// # Errors
+    /// As [`Self::open_descriptor`]; a store without a descriptor door says
+    /// so as [`GroupContentError::Substrate`].
+    async fn redescribe(
+        &self,
+        req: RedescribeRequest<'_>,
+    ) -> Result<BlobPointer, GroupContentError> {
+        let _ = req;
+        Err(GroupContentError::Substrate(
+            "this store has no re-describe door (CIRISEdge#702)".to_owned(),
         ))
     }
 }

@@ -4362,4 +4362,495 @@ mod files {
             }
         );
     }
+
+    // ── CIRISEdge#702 — rename (`FSD/CONTENT_TRANSFER.md` §6.7.2) ──────────
+
+    const NEW_NAME: &str = "q3-plan-final.pdf";
+
+    /// The one file `room` lists under `view`, by lifecycle.
+    async fn listed(
+        node: &Node,
+        room: &ScopeRoom,
+        view: ciris_persist::ceg::LifecycleView,
+    ) -> Vec<FileRow> {
+        ciris_edge::files::in_room_with(node.store.engine(), room, &node.me, 20, None, view)
+            .await
+            .expect("list the room")
+            .files
+    }
+
+    async fn rename_as_node(
+        node: &Node,
+        room: &ScopeRoom,
+        old: &FileRow,
+        name: Option<&str>,
+    ) -> Result<PublishedFile, ciris_edge::files::FileError> {
+        ciris_edge::files::rename(
+            &*node.dir,
+            &node.store,
+            Signers {
+                node: &node.signer,
+                actor: None,
+            },
+            room,
+            old,
+            name,
+            &old.attestation_id,
+        )
+        .await
+    }
+
+    /// RN1 — a renamed sealed file lists ONCE, under its new name, over the
+    /// same bytes (same blob, byte-identical), and the prior is `Superseded`:
+    /// hidden from the Live drive, listed under `IncludeSuperseded`, still
+    /// describing its OLD name. Both encrypted tiers (self + community), real
+    /// sqlite.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one scenario, both tiers, the whole lifecycle on purpose
+    async fn a_renamed_file_lists_under_its_new_name_over_the_same_bytes() {
+        use ciris_edge::files::FileLifecycle;
+        use ciris_persist::ceg::LifecycleView;
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        for (i, (room, tier)) in rooms.iter().enumerate() {
+            let nth = i64::try_from(i).expect("fits");
+            let body = format!("the {tier:?} file to rename").into_bytes();
+            let published = write(
+                &node_a,
+                room,
+                &body,
+                Some(SECRET_NAME),
+                Some(SECRET_CODEC),
+                nth,
+            )
+            .await;
+            let before = listed(&node_a, room, LifecycleView::Live).await;
+            assert_eq!(before.len(), 1, "{room}: one file before");
+            let old = &before[0];
+
+            let renamed = rename_as_node(&node_a, room, old, Some(NEW_NAME))
+                .await
+                .unwrap_or_else(|e| panic!("{room}: rename: {e}"));
+            assert!(renamed.crossed, "{room}: the new row crossed");
+            assert_eq!(renamed.tier, *tier, "{room}: the tier is the bytes'");
+            assert_eq!(
+                renamed.pointer.content_sha256, published.pointer.content_sha256,
+                "{room}: the SAME blob — no byte written"
+            );
+            assert_eq!(renamed.pointer.size, published.pointer.size);
+            assert_eq!(
+                renamed.pointer.content_digest,
+                published.pointer.content_digest
+            );
+            assert_ne!(
+                renamed.pointer.sealed_descriptor, published.pointer.sealed_descriptor,
+                "{room}: the descriptor was re-sealed"
+            );
+            assert_eq!(
+                renamed.row.asserted_at, old.asserted_at,
+                "{room}: the claim's instant — the bytes' AAD names it"
+            );
+            assert!(
+                renamed
+                    .row
+                    .attestation_envelope
+                    .get(ciris_edge::files::FIELD_RENAMED_AT)
+                    .is_some(),
+                "{room}: the act signs its own instant"
+            );
+            let text = serde_json::to_string(&renamed.row).expect("row json");
+            assert!(
+                !text.contains(NEW_NAME) && !text.contains(SECRET_FORMAT),
+                "{room}: the new name rides sealed, never in clear: {text}"
+            );
+
+            let live = listed(&node_a, room, LifecycleView::Live).await;
+            assert_eq!(live.len(), 1, "{room}: ONE file after the rename");
+            let now = &live[0];
+            assert_ne!(now.attestation_id, old.attestation_id);
+            let opened = now
+                .open_described(&node_a.store, &node_a.me)
+                .await
+                .unwrap_or_else(|e| panic!("{room}: the renamed file opens: {e}"));
+            assert_eq!(opened.bytes, body, "{room}: byte-identical");
+            assert_eq!(
+                opened.descriptor,
+                Descriptor::Opened {
+                    format: SECRET_FORMAT.into(),
+                    codec: Some(SECRET_CODEC.into()),
+                    name: Some(NEW_NAME.into()),
+                },
+                "{room}: the new name; format and codec kept"
+            );
+
+            let history = listed(&node_a, room, LifecycleView::IncludeSuperseded).await;
+            assert_eq!(history.len(), 2, "{room}: both rows in the history");
+            let prior = history
+                .iter()
+                .find(|f| f.attestation_id == old.attestation_id)
+                .expect("the prior is listed under IncludeSuperseded");
+            assert_eq!(prior.lifecycle, FileLifecycle::Superseded, "{room}");
+            assert_eq!(
+                prior
+                    .describe(&node_a.store, &node_a.me)
+                    .await
+                    .expect("describe"),
+                Descriptor::Opened {
+                    format: SECRET_FORMAT.into(),
+                    codec: Some(SECRET_CODEC.into()),
+                    name: Some(SECRET_NAME.into()),
+                },
+                "{room}: the prior keeps its own descriptor — a rename touches no prior row"
+            );
+
+            // Renamed again: the chain holds, and nameless is `None`.
+            let again = rename_as_node(&node_a, room, now, None)
+                .await
+                .unwrap_or_else(|e| panic!("{room}: rename again: {e}"));
+            let live = listed(&node_a, room, LifecycleView::Live).await;
+            assert_eq!(live.len(), 1, "{room}: still one file");
+            assert_eq!(
+                live[0]
+                    .describe(&node_a.store, &node_a.me)
+                    .await
+                    .expect("describe"),
+                Descriptor::Opened {
+                    format: SECRET_FORMAT.into(),
+                    codec: Some(SECRET_CODEC.into()),
+                    name: None,
+                },
+                "{room}: nameless reads back None"
+            );
+            assert_eq!(
+                again.pointer.content_sha256,
+                published.pointer.content_sha256
+            );
+        }
+    }
+
+    /// RN2 + RN5 — a stranger cannot rename, and `replaces` naming another
+    /// file is refused; neither writes a row.
+    #[tokio::test]
+    async fn a_stranger_cannot_rename() {
+        use ciris_edge::files::FileError;
+        use ciris_persist::ceg::LifecycleView;
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        let carol_signer = edge_signer_for(&Ident::new("carol-fed", 0x44));
+        let (room, _) = &rooms[0];
+        let a = write(&node_a, room, b"file a", Some("a.txt"), None, 0).await;
+        let b = write(&node_a, room, b"file b", Some("b.txt"), None, 1).await;
+        let old = FileRow::from_row(&a.row).expect("a");
+
+        let refused = ciris_edge::files::rename(
+            &*node_a.dir,
+            &node_a.store,
+            Signers {
+                node: &carol_signer,
+                actor: None,
+            },
+            room,
+            &old,
+            Some("mine-now.txt"),
+            &old.attestation_id,
+        )
+        .await
+        .expect_err("a stranger renames nothing");
+        assert!(
+            matches!(refused, FileError::NotAuthor { ref author, .. } if *author == node_a.me),
+            "{refused:?}"
+        );
+
+        let wrong_target = ciris_edge::files::rename(
+            &*node_a.dir,
+            &node_a.store,
+            Signers {
+                node: &node_a.signer,
+                actor: None,
+            },
+            room,
+            &old,
+            Some("a2.txt"),
+            &b.row.attestation_id,
+        )
+        .await
+        .expect_err("`replaces` names another blob's file");
+        assert!(
+            matches!(wrong_target, FileError::Row(_)),
+            "{wrong_target:?}"
+        );
+
+        let history = listed(&node_a, room, LifecycleView::All).await;
+        let mut ids: Vec<_> = history.iter().map(|f| f.attestation_id.clone()).collect();
+        ids.sort();
+        let mut expected = vec![a.row.attestation_id.clone(), b.row.attestation_id.clone()];
+        expected.sort();
+        assert_eq!(ids, expected, "no row was written by either refusal");
+    }
+
+    /// RN3 — a plaintext-tier rename rides in clear (#698's rule): the new
+    /// name on the row's `filename`, the format on the pointer, nothing
+    /// sealed. No `ScopeRoom` resolves a plaintext tier today, so the prior
+    /// is hand-built exactly as a plaintext-tier write lands (a clear
+    /// pointer from the store's own seal at a commons scope, a community
+    /// file row naming the room), then renamed through the real path.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // the hand-built plaintext-tier prior is most of it
+    async fn a_plaintext_rename_rides_in_clear() {
+        use ciris_edge::group_content::{ContentField, Description, GroupContentStore as _};
+        use ciris_edge::replication::attestation_bind::{
+            bind_attestation_envelope, truncate_to_substrate_resolution, AttestationColumns,
+        };
+        use ciris_persist::ceg::LifecycleView;
+        use ciris_persist::federation::FederationDirectory as _;
+        use sha2::Digest as _;
+        init_tracing();
+        let alice = Ident::new("alice-fed", 0x11);
+        let node_a = node(&[&alice], &alice).await;
+        seed_room(&node_a, "room-702-clear", &[&alice]).await;
+        let room = ScopeRoom::community("room-702-clear");
+        let alice_signer = edge_signer_for(&alice);
+        let asserted_at = truncate_to_substrate_resolution(ts());
+        let body = b"a public notice".to_vec();
+
+        let sealed = node_a
+            .store
+            .seal(ciris_edge::group_content::SealRequest {
+                cohort_scope: "federation",
+                community_key_id: Some("room-702-clear"),
+                author_key_id: &alice.key_id,
+                asserted_at,
+                field: ContentField::Body,
+                plaintext: &body,
+                description: Some(Description {
+                    name: Some("notice.txt"),
+                    format: "text/plain",
+                    codec: None,
+                }),
+            })
+            .await
+            .expect("seal at the commons");
+        assert_eq!(sealed.tier, CryptoTier::Plaintext);
+        assert_eq!(sealed.pointer.media_type.as_deref(), Some("text/plain"));
+        assert!(sealed.pointer.sealed_descriptor.is_none());
+
+        let attestation_id = format!("file-702-clear-{}", &sealed.pointer.content_sha256[..12]);
+        let mut envelope = serde_json::json!({
+            "dimension": ciris_edge::files::FILE_DIMENSION,
+            "community_key_id": "room-702-clear",
+            ciris_edge::chat::FIELD_CONTENT: serde_json::to_value(&sealed.pointer).expect("ptr"),
+            ciris_edge::files::FIELD_FILENAME: "notice.txt",
+        });
+        let subjects = vec![alice.key_id.clone()];
+        bind_attestation_envelope(
+            &mut envelope,
+            asserted_at,
+            &AttestationColumns {
+                attestation_id: &attestation_id,
+                attesting_key_id: &alice.key_id,
+                attestation_type: "scores",
+                attested_key_id: &alice.key_id,
+                subject_key_ids: &subjects,
+                cohort_scope: "community",
+                weight: None,
+            },
+        );
+        let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("jcs");
+        let (sig_classical, sig_pqc) = ciris_edge::identity::sign_bound_hybrid(
+            &alice_signer,
+            &canonical,
+            ciris_edge::files::FILE_DIMENSION,
+        )
+        .await
+        .expect("sign");
+        let prior = ciris_persist::federation::Attestation {
+            attestation_id: attestation_id.clone(),
+            attesting_key_id: alice.key_id.clone(),
+            attested_key_id: alice.key_id.clone(),
+            attestation_type: "scores".to_owned(),
+            weight: None,
+            asserted_at,
+            expires_at: None,
+            attestation_envelope: envelope,
+            original_content_hash: hex::encode(sha2::Sha256::digest(&canonical)),
+            scrub_signature_classical: sig_classical,
+            scrub_signature_pqc: sig_pqc,
+            scrub_key_id: alice.key_id.clone(),
+            scrub_timestamp: asserted_at,
+            pqc_completed_at: None,
+            persist_row_hash: String::new(),
+            subject_key_ids: subjects,
+            withdraws_admission_rule: None,
+            cohort_scope: "community".to_owned(),
+            tier: "federation".to_owned(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        };
+        node_a
+            .dir
+            .put_attestation(ciris_persist::federation::SignedAttestation {
+                attestation: prior.clone(),
+            })
+            .await
+            .expect("the plaintext-tier file row is admitted");
+        let old = FileRow::from_row(&prior).expect("a clear file row");
+        assert_eq!(
+            old.descriptor(),
+            Descriptor::Clear {
+                format: "text/plain".into(),
+                codec: None,
+                name: Some("notice.txt".into()),
+            }
+        );
+
+        let renamed = ciris_edge::files::rename(
+            &*node_a.dir,
+            &node_a.store,
+            Signers {
+                node: &node_a.signer,
+                actor: Some(&alice_signer),
+            },
+            &room,
+            &old,
+            Some("notice-v2.txt"),
+            &old.attestation_id,
+        )
+        .await
+        .expect("a plaintext-tier rename");
+        assert!(renamed.crossed);
+        assert_eq!(renamed.tier, CryptoTier::Plaintext);
+        assert!(
+            renamed.pointer.sealed_descriptor.is_none(),
+            "nothing sealed"
+        );
+        assert_eq!(renamed.pointer.media_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            renamed
+                .row
+                .attestation_envelope
+                .get(ciris_edge::files::FIELD_FILENAME)
+                .and_then(serde_json::Value::as_str),
+            Some("notice-v2.txt"),
+            "the new name in clear on the row"
+        );
+
+        let live = listed(&node_a, &room, LifecycleView::Live).await;
+        assert_eq!(live.len(), 1, "one file: {live:?}");
+        assert_eq!(
+            live[0].descriptor(),
+            Descriptor::Clear {
+                format: "text/plain".into(),
+                codec: None,
+                name: Some("notice-v2.txt".into()),
+            }
+        );
+        assert_eq!(
+            live[0]
+                .open(&node_a.store, &node_a.me)
+                .await
+                .expect("opens"),
+            body,
+            "the same bytes"
+        );
+        assert!(
+            node_a
+                .dir
+                .get_attestation(&old.attestation_id)
+                .await
+                .expect("read")
+                .is_some(),
+            "the prior is kept, retired by the supersedes"
+        );
+    }
+
+    /// RN4 — the renamed descriptor is bound to the bytes and the CLAIM's
+    /// binding (§6.7.2): it opens under no other author, no other instant,
+    /// and on no other blob — and, by the rule, it DOES authenticate under
+    /// the prior row's columns, which are the claim's too. What separates the
+    /// two rows of one claim is the signature and the lifecycle, not the AEAD.
+    #[tokio::test]
+    async fn a_renamed_descriptor_opens_only_under_the_claims_binding() {
+        init_tracing();
+        let (node_a, rooms) = rooms().await;
+        let crypto_class = |kind: &str| kind == "seal_mismatch" || kind == "substrate";
+        for (i, (room, _)) in rooms.iter().enumerate() {
+            let nth = i64::try_from(i).expect("fits") * 2;
+            let a = write(&node_a, room, b"file a", Some("a.txt"), None, nth).await;
+            let b = write(&node_a, room, b"file b", Some("b.txt"), None, nth + 1).await;
+            // The row the ROOM holds — at a community, a's widening, never
+            // the authored self row (`replaces` must be this room's file).
+            let old = listed(&node_a, room, ciris_persist::ceg::LifecycleView::Live)
+                .await
+                .into_iter()
+                .find(|f| f.pointer.content_sha256 == a.pointer.content_sha256)
+                .expect("a is listed");
+            let renamed = rename_as_node(&node_a, room, &old, Some("a-renamed.txt"))
+                .await
+                .unwrap_or_else(|e| panic!("{room}: rename: {e}"));
+            let new = FileRow::from_row(&renamed.row).expect("the new row");
+            let expect_new = Descriptor::Opened {
+                format: SECRET_FORMAT.into(),
+                codec: None,
+                name: Some("a-renamed.txt".into()),
+            };
+            assert_eq!(
+                new.describe(&node_a.store, &node_a.me)
+                    .await
+                    .expect("control"),
+                expect_new
+            );
+
+            // Another instant — the rename act's, say — is not the claim's.
+            let mut other_instant = new.clone();
+            other_instant.asserted_at += chrono::Duration::seconds(1);
+            let refused = other_instant
+                .describe(&node_a.store, &node_a.me)
+                .await
+                .expect_err("another instant");
+            assert!(crypto_class(refused.kind()), "{room}: {refused}");
+
+            // Another row of another claim (b's columns).
+            let mut other_row = FileRow::from_row(&b.row).expect("b");
+            other_row.attesting_key_id = "someone-else".into();
+            other_row.pointer = renamed.pointer.clone();
+            let refused = other_row
+                .describe(&node_a.store, &node_a.me)
+                .await
+                .expect_err("another author");
+            assert!(crypto_class(refused.kind()), "{room}: {refused}");
+
+            // Another blob.
+            let mut moved = FileRow::from_row(&b.row).expect("b");
+            moved.pointer.sealed_descriptor = renamed.pointer.sealed_descriptor.clone();
+            let refused = moved
+                .describe(&node_a.store, &node_a.me)
+                .await
+                .expect_err("another blob");
+            assert!(crypto_class(refused.kind()), "{room}: {refused}");
+
+            // The prior row's columns ARE the claim's: pinned, so a change to
+            // the rule is a deliberate one.
+            let mut under_prior = old.clone();
+            under_prior.pointer = renamed.pointer.clone();
+            assert_eq!(
+                under_prior
+                    .describe(&node_a.store, &node_a.me)
+                    .await
+                    .expect("the claim's binding"),
+                expect_new,
+                "{room}: one claim, one byte binding (§6.7.2)"
+            );
+            // And the prior's own pointer still says what it said.
+            assert_eq!(
+                old.describe(&node_a.store, &node_a.me)
+                    .await
+                    .expect("prior"),
+                Descriptor::Opened {
+                    format: SECRET_FORMAT.into(),
+                    codec: None,
+                    name: Some("a.txt".into()),
+                }
+            );
+        }
+    }
 }

@@ -49,7 +49,7 @@ use chrono::{DateTime, Utc};
 
 use crate::chat::UnopenedReason;
 use crate::group_content::{
-    BlobPointer, ContentField, Description, GroupContentStore, SealRequest,
+    BlobPointer, ContentField, Description, GroupContentStore, RedescribeRequest, SealRequest,
 };
 use crate::replication::attestation_bind::{share, CrossingBasis, Shared, Signers};
 use crate::scope_room::ScopeRoom;
@@ -63,6 +63,14 @@ pub const FILE_DIMENSION: &str = "file:v1";
 
 /// The envelope member carrying the file's name, when it has one.
 pub const FIELD_FILENAME: &str = "filename";
+
+/// The envelope member carrying a rename's own instant (CIRISEdge#702,
+/// `FSD/CONTENT_TRANSFER.md` §6.7.2). The row's `asserted_at` stays the
+/// content claim's — the bytes' AAD names it — so the act signs its time here.
+pub const FIELD_RENAMED_AT: &str = "renamed_at";
+
+/// The `supersession_reason` a rename's `supersedes` carries.
+pub const RENAME_REASON: &str = "rename";
 
 /// A file to write into a room.
 #[derive(Debug, Clone)]
@@ -285,6 +293,251 @@ async fn node_owner_signer<'a>(
     (owner == actor.key_id).then_some(actor)
 }
 
+/// **Rename a file** (CIRISEdge#702, `FSD/CONTENT_TRANSFER.md` §6.7.2) — a
+/// new row over the same bytes, and a `supersedes` retiring `replaces`.
+///
+/// No byte is written: the new row points at the SAME blob, and only its
+/// description changes — re-sealed under the bytes' own DEK at an encrypted
+/// tier ([`GroupContentStore::redescribe`]), in clear at the plaintext tier.
+/// The new row keeps `old`'s author and `asserted_at` (the bytes' AAD names
+/// both) and signs the act's own instant as [`FIELD_RENAMED_AT`]. It is
+/// authored and crossed exactly as [`publish`] crosses; then — only once it
+/// crossed — a `supersedes` by the same attester, born federation-tier like
+/// [`withdraw`]'s `withdraws`, names `replaces` so every holder of the prior
+/// retires it. A parked crossing leaves the prior live: `crossed: false`.
+///
+/// `new_name: None` makes the file nameless. `replaces` must name a file row
+/// of `room`, by `old`'s attester, over `old`'s blob — normally
+/// `old.attestation_id`, as [`in_room`] listed it.
+///
+/// **Author only.** [`FileRow::author_signer`], as withdraw — but NOT the
+/// #941 owner fallback: a `supersedes` is by the same attester (CC 2), and
+/// the bytes' AAD names the attester, so the owner of an authoring node has
+/// [`withdraw`] + [`publish`], not rename.
+///
+/// [`PublishedFile::granted`] / [`PublishedFile::excluded`] are empty: a
+/// rename grants nothing — the bytes' grants are the write's.
+///
+/// # Errors
+/// [`FileError::NotAuthor`] when no signer in hand is `old`'s attester;
+/// [`FileError::Row`] when `replaces` is not this file in this room;
+/// [`FileError::Seal`] when the description cannot be re-sealed (including a
+/// pointer that does not open under `old`'s binding); [`FileError::Author`]
+/// when a row cannot be stored; [`FileError::Cross`] when the crossing fails.
+pub async fn rename(
+    directory: &dyn FederationDirectory,
+    store: &dyn GroupContentStore,
+    signers: Signers<'_>,
+    room: &ScopeRoom,
+    old: &FileRow,
+    new_name: Option<&str>,
+    replaces: &str,
+) -> Result<PublishedFile, FileError> {
+    let author = old.author_signer(signers)?;
+    if new_name == Some("") {
+        return Err(FileError::Row(format!(
+            "rename {}: an empty name stands in for an absent one — pass None (§6.7.1)",
+            old.attestation_id
+        )));
+    }
+
+    let prior = replaced_row(directory, room, old, replaces).await?;
+
+    let pointer = store
+        .redescribe(RedescribeRequest {
+            pointer: &old.pointer,
+            author_key_id: &old.attesting_key_id,
+            asserted_at: old.asserted_at,
+            name: new_name,
+        })
+        .await
+        .map_err(|e| FileError::Seal {
+            room: room.to_string(),
+            detail: e.to_string(),
+        })?;
+
+    let renamed_at = Utc::now();
+    let row = file_row_at(
+        author,
+        room,
+        old.asserted_at,
+        new_name,
+        &pointer,
+        Some(renamed_at),
+    )
+    .await
+    .map_err(FileError::Row)?;
+    directory
+        .put_attestation_authored(ciris_persist::federation::SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .map_err(|e| FileError::Author {
+            attestation_id: row.attestation_id.clone(),
+            detail: e.to_string(),
+        })?;
+
+    let crossing = share(
+        directory,
+        &row,
+        room.widen_to(),
+        CrossingBasis::ProducerAuthority,
+        signers,
+    )
+    .await
+    .map_err(|e| FileError::Cross {
+        room: room.to_string(),
+        detail: e,
+    })?;
+    let crossed = matches!(
+        crossing.shared,
+        Shared::Placed { .. } | Shared::AlreadyThere { .. }
+    );
+    if crossed {
+        let supersedes = rename_supersedes(&prior, &row.attestation_id, renamed_at, author)
+            .await
+            .map_err(FileError::Row)?;
+        directory
+            .put_attestation(ciris_persist::federation::SignedAttestation {
+                attestation: supersedes.clone(),
+            })
+            .await
+            .map_err(|e| FileError::Author {
+                attestation_id: supersedes.attestation_id.clone(),
+                detail: e.to_string(),
+            })?;
+    } else {
+        tracing::warn!(
+            %room,
+            attestation_id = %row.attestation_id,
+            replaces,
+            shared = ?crossing.shared,
+            "rename authored but NOT crossed — the prior stays live until the new row reaches \
+             the room (FSD/CONTENT_TRANSFER.md §6.7.2)"
+        );
+    }
+
+    Ok(PublishedFile {
+        row,
+        tier: pointer.tier,
+        pointer,
+        shared: crossing.shared,
+        crossed,
+        granted: Vec::new(),
+        excluded: Vec::new(),
+    })
+}
+
+/// The row `replaces` names, when it is `old`'s file in `room` — a
+/// replacement must replace its own: this room's file, this attester, this
+/// blob (persist v42's rule for a config `supersedes`, applied here).
+async fn replaced_row(
+    directory: &dyn FederationDirectory,
+    room: &ScopeRoom,
+    old: &FileRow,
+    replaces: &str,
+) -> Result<Attestation, FileError> {
+    let prior = directory
+        .get_attestation(replaces)
+        .await
+        .map_err(|e| FileError::Row(format!("rename: read {replaces}: {e}")))?
+        .ok_or_else(|| FileError::Row(format!("rename: {replaces} is not held here")))?;
+    let names_this_file = belongs_to(room, &prior).is_some_and(|p| {
+        p.attesting_key_id == old.attesting_key_id
+            && p.pointer.content_sha256 == old.pointer.content_sha256
+    });
+    if !names_this_file {
+        return Err(FileError::Row(format!(
+            "rename {}: `replaces` {replaces} is not this file in {room} (same attester, same \
+             blob) — a supersedes must replace its own",
+            old.attestation_id
+        )));
+    }
+    Ok(prior)
+}
+
+/// The `supersedes` a rename retires its prior with (CC 2:
+/// `{references_attestation_id, supersession_reason, differs_in[]}`), plus
+/// the replacement's id — the composer + separate replacement shape persist's
+/// vocabulary sweep emits. Born federation-tier, like a `withdraws`: it must
+/// reach every holder of the prior, and a room holds the prior's widening,
+/// never the authored row.
+async fn rename_supersedes(
+    prior: &Attestation,
+    replacement_attestation_id: &str,
+    asserted_at: DateTime<Utc>,
+    signer: &crate::identity::LocalSigner,
+) -> Result<Attestation, String> {
+    use crate::replication::attestation_bind::{
+        bind_attestation_envelope, truncate_to_substrate_resolution, AttestationColumns,
+    };
+    use ciris_persist::federation::envelope::paths;
+    use ciris_persist::federation::types::{attestation_tier, attestation_type, cohort_scope};
+    use sha2::{Digest as _, Sha256};
+
+    let asserted_at = truncate_to_substrate_resolution(asserted_at);
+    let issuer = signer.key_id.as_str();
+    // Deterministic per (issuer, prior, replacement): a retry dedups, and two
+    // devices renaming the same prior differently write two composers.
+    let attestation_id = {
+        let mut h = Sha256::new();
+        for part in [issuer, &prior.attestation_id, replacement_attestation_id] {
+            h.update(part.as_bytes());
+            h.update([0]);
+        }
+        format!("supersedes-{}", &hex::encode(h.finalize())[..32])
+    };
+    let mut envelope = serde_json::json!({
+        paths::REFERENCES_ATTESTATION_ID: prior.attestation_id,
+        "supersession_reason": RENAME_REASON,
+        paths::DIFFERS_IN: ["name"],
+        "replacement_attestation_id": replacement_attestation_id,
+    });
+    let subjects: Vec<String> = Vec::new();
+    bind_attestation_envelope(
+        &mut envelope,
+        asserted_at,
+        &AttestationColumns {
+            attestation_id: &attestation_id,
+            attesting_key_id: issuer,
+            attestation_type: attestation_type::SUPERSEDES,
+            attested_key_id: &prior.attesting_key_id,
+            subject_key_ids: &subjects,
+            cohort_scope: cohort_scope::FEDERATION,
+            weight: None,
+        },
+    );
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope)
+        .map_err(|e| format!("canonicalize: {e}"))?;
+    let digest = Sha256::digest(&canonical);
+    let (sig_classical, sig_pqc) =
+        crate::identity::sign_bound_hybrid(signer, &canonical, attestation_type::SUPERSEDES)
+            .await?;
+    Ok(Attestation {
+        attestation_id,
+        attesting_key_id: issuer.to_owned(),
+        attested_key_id: prior.attesting_key_id.clone(),
+        attestation_type: attestation_type::SUPERSEDES.to_owned(),
+        weight: None,
+        asserted_at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(digest),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: issuer.to_owned(),
+        scrub_timestamp: asserted_at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: cohort_scope::FEDERATION.to_owned(),
+        tier: attestation_tier::FEDERATION.to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    })
+}
+
 /// What [`publish`] did.
 #[derive(Debug, Clone)]
 pub struct PublishedFile {
@@ -466,6 +719,28 @@ async fn file_row(
     write: &FileWrite<'_>,
     pointer: &BlobPointer,
 ) -> Result<Attestation, String> {
+    file_row_at(
+        author,
+        write.room,
+        write.asserted_at,
+        write.filename,
+        pointer,
+        None,
+    )
+    .await
+}
+
+/// [`file_row`] over its parts. `renamed_at` is the rename act's own signed
+/// instant (§6.7.2) — beside, never instead of, `asserted_at`, which stays
+/// the content claim's because the bytes' AAD names it.
+async fn file_row_at(
+    author: &crate::identity::LocalSigner,
+    room: &ScopeRoom,
+    asserted_at: DateTime<Utc>,
+    filename: Option<&str>,
+    pointer: &BlobPointer,
+    renamed_at: Option<DateTime<Utc>>,
+) -> Result<Attestation, String> {
     use crate::replication::attestation_bind::{
         bind_attestation_envelope, render_signed_instant, truncate_to_substrate_resolution,
         AttestationColumns,
@@ -473,18 +748,24 @@ async fn file_row(
     use sha2::{Digest as _, Sha256};
 
     let author_key_id = author.key_id.as_str();
-    let asserted_at = truncate_to_substrate_resolution(write.asserted_at);
+    let asserted_at = truncate_to_substrate_resolution(asserted_at);
     let mut envelope = serde_json::json!({
         "dimension": FILE_DIMENSION,
         crate::chat::FIELD_CONTENT: pointer,
     });
-    if let Some(field) = write.room.cohort_target_field() {
-        envelope[field] = serde_json::json!(write.room.content_group_id());
+    if let Some(field) = room.cohort_target_field() {
+        envelope[field] = serde_json::json!(room.content_group_id());
     }
     // One description (CIRISEdge#698 D4): a sealed pointer carries the name
     // inside its seal, so the row carries none in clear.
-    if let (Some(name), None) = (write.filename, &pointer.sealed_descriptor) {
+    if let (Some(name), None) = (filename, &pointer.sealed_descriptor) {
         envelope[FIELD_FILENAME] = serde_json::json!(name);
+    }
+    // In the id preimage, so a rename never collides with — and supersedes —
+    // the row it renames, even to the same name.
+    if let Some(at) = renamed_at {
+        envelope[FIELD_RENAMED_AT] =
+            serde_json::json!(render_signed_instant(truncate_to_substrate_resolution(at)));
     }
     // Every producer cites (CIRISEdge#646): the row is found BY the bytes it
     // references, and an uncited row leaves the revocation walk's known set
@@ -494,7 +775,7 @@ async fn file_row(
     let attestation_id = {
         let mut h = Sha256::new();
         h.update(FILE_DIMENSION.as_bytes());
-        h.update(write.room.table_group_id().as_bytes());
+        h.update(room.table_group_id().as_bytes());
         h.update(author_key_id.as_bytes());
         h.update(render_signed_instant(asserted_at).as_bytes());
         h.update(
@@ -840,12 +1121,12 @@ impl FileRow {
 /// The object inside a sealed descriptor.
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SealedDescription {
+pub(crate) struct SealedDescription {
     #[serde(default)]
-    name: Option<String>,
-    format: String,
+    pub(crate) name: Option<String>,
+    pub(crate) format: String,
     #[serde(default)]
-    codec: Option<String>,
+    pub(crate) codec: Option<String>,
 }
 
 /// Why a row is not a readable file (CIRISEdge#698).
