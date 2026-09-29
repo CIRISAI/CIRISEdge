@@ -118,6 +118,92 @@ Pull (`bridge::an_unannounced_nodes_route_reaches_only_its_owners_nodes_682`).
   still a stranger for these two rows: announce is the owner's disclosure decision about the
   device, not a replication grant.
 
+### 2.2 First contact on the opaque plane (CIRISEdge#683)
+
+§2.1 leaves one pair with no way in: a device the first device has **never seen**. The new phone
+B asks its owner's first device A to let it join (the server's device-join kind, `0x0000_0002`).
+The request is an `OpaqueRequest` signed by B's key, and A has no record of that key, so A's
+verify answers `UnknownKey` and the frame is dropped. B cannot fix that through replication: B
+becomes Attributed at A only through its route, and §2.1 withholds B's route from A until B
+holds `owner → A`, which is exactly what B is asking for. So the request has to carry what A
+needs to check it.
+
+**What a first-contact request may carry.** Two fields and nothing else: `key_record`, the
+sender's own `SignedKeyRecord`, **self-signed** (`scrub_key_id = key_id = envelope.signing_key_id`),
+and `challenge`, 32 fresh random bytes (`OsRng`, hex), present exactly when `key_record` is. No
+attestation, no route, no third party's record. The challenge exists for the answer: see the
+requester's order below. It is the same object a #402 bootstrap
+`Deliver` carries, arriving on the opaque plane instead of the replication plane.
+
+**The receiver's order (A).** All of it runs *before* the envelope verify, because the verify
+records the nonce in the replay window first: a verify that failed `UnknownKey` and was re-run
+after admission would read as a replay.
+
+| Step | Check | Refusal (dropped, counted under `first_contact_outcomes`, throttled `warn`) |
+|---|---|---|
+| 0 | Applies only to an `OpaqueRequest` carrying `key_record` whose signing key A's directory does **not** hold. A known key ignores the record and takes the ordinary path. An unknown key **without** a record is dropped `UnknownKey` exactly as before. | — (`first_contact_known_key` counts the ignored case) |
+| 1 | The record names the envelope's signer and is self-signed. | `first_contact_record_names_other_key`, `first_contact_record_not_self_signed` |
+| 2 | **Rate limit** before any cryptography: per sender key, per link (the path the frame arrived on; a transport with no link identity shares one bucket), and one node-wide ceiling. The node-wide ceiling is the one that holds under identity rotation, where every request brings a fresh key. | `first_contact_sender_budget_spent`, `first_contact_link_budget_spent`, `first_contact_node_budget_spent`, `first_contact_at_capacity` |
+| 3 | **Proof of possession**: persist's `verify_key_registration` (Strict hybrid, subject-bound, the gate `register_federation_key` runs). | `first_contact_proof_of_possession_failed`, and nothing is written |
+| 4 | **Admission** through the replicated Key door: the bridge's `apply_key`, which calls persist `apply_replicated_key_record` (`KeyDoor::ReplicatedInsert`, a key minted elsewhere). That is the #402 door. With no replication runtime installed, the same persist call is made on the directory directly. | `first_contact_key_refused` (persist names the reason) |
+| 5 | The envelope verify, unchanged. | the existing `verify_failures_total` classes |
+| 6 | The host handler runs with `first_contact = true`. | — |
+
+A refused request gets **no answer**. An answer to a refused request would tell the sender which
+check failed, and a sender who can see that can tune its retries against it (#554 D3).
+`first_contact_admitted` counts the ones that got through.
+
+**What admission is, and what it is not.** A holds one more key row. That row grants nothing.
+Attributed still needs a hybrid-signed transport binding and Rooted still needs an acceptance.
+The Key plane's advertise is `SelfOwn` (`list_keys`), so A never offers B's key to anyone; a
+subject Pull naming B can return it, which is true of every key (keys are public by design, §2.1).
+The request writes no attestation, no consent row and no CEG record. This is not a new plane. It
+is the #402 carve-out's door, reached from the opaque plane. A record can be admitted and its
+envelope then fail verify; the result is a PoP-proven key and nothing else, which is also what a
+#402 bootstrap `Deliver` leaves.
+
+**The reply rides the requester's link** (#353). B is unannounced and usually NAT'd, so A has no
+route to dial. The inbound frame carries a transport-level *reply path* (Reticulum: the link it
+arrived on), and every opaque response is sent on it first. The by-key send is used only if that
+link is gone. Before #683 the reply looked for the freshest *attributed* link to the requester.
+Over Reticulum a dialing device usually has one, because #627's on-link announce binds the link
+(Advisory) before the request arrives. But that depends on the announce arriving first, and a
+transport with no on-link announce has no such binding at all. The reply path is a fact about the
+frame and depends on neither.
+
+**The answer carries the binding (I14).** A first-contact handler answers with
+`OpaqueAnswer { response, introductions }`. `introductions` is a list of key records and
+attestations. On a first-contact answer edge adds A's own key record, so B can verify the reply.
+The host adds `owner → A` (A's owner-binding), the owner's key record, and `owner → B` once it
+mints that binding. Only the host can mint it, because it depends on the person approving the join.
+
+**The requester's order (B).** B admits introductions only from a **solicited** answer: its
+`in_reply_to` matches a request B sent, B sent that request to the key that signed the answer, and
+the answer arrived on the transport the request went out on. Anything else is ignored and counted
+`first_contact_unsolicited_introductions`.
+
+Why the request carries a challenge. The correlation is the request body's hash, and the solicited
+check reads it off a frame nobody has verified yet. Without the challenge every field of a join
+request is public or guessable: the join kind is fixed, the payload is often deterministic, and
+the key record is the sender's published row. Anyone could compute the correlation and forge an
+answer that introduces a record *claiming* A's `key_id` with the attacker's keys. That record
+passes proof of possession (see I19), and the attacker signs the answer with those keys. With 32
+random bytes in the body, only a party that saw the request can name it. The path check is the
+second belt: an answer must come back on the medium the request left on. Only the transport is
+checked, not the link: edge sends by key and never learns which link the transport picked, and
+recording it would be new machinery.
+
+1. Keys, **before** verifying the answer, since the responder's key may be among them: known
+   keys are skipped; each unknown one goes through the same PoP and Key door as step 3–4 above.
+   Capped at 8.
+2. Verify the answer (unchanged pipeline).
+3. Attestations, through the replication apply door (`apply_envelope_bytes`, unattributed). That
+   is the door replication uses, so the bridge's owner memo is invalidated on admit. A side door
+   into persist would leave the §2.1 gate reading a stale owner. Capped at 16.
+4. The caller's `send_opaque_request_introducing` returns the response **and** a report of what was
+   admitted, known or refused. By then B holds `owner → A`, so §2.1 lets B serve its occurrence and
+   route to A, and A can attribute B on B's next link.
+
 ---
 
 ## 3. The pair state machine (both directions)
@@ -236,7 +322,12 @@ before — minus the four rows that now cross.
 | I12 | **A stalled root still Roots the pairs already attached to it** (persist v51.0.0, CC 3.2 T7 + T4). A trust-root community below M+1 active founders is *valid but non-admitting*: `resolve_community` serves it with `live: false` (v50 returned no resolution), `trust_root_valid` deliberately ignores `live` (persist `FSD/TRUST_ROOT_RC6.md` §3; the mutant "a stalled root is invalid" is KILLED by I195), and "non-admitting" is enforced where something new is conferred — `admit_community_change` refuses a new member with `liveness_stalled_non_admitting`. `rooted_with` composes `trust_root_valid(..).valid` and reads no liveness, so two subjects attached before the stall stay Rooted; refusing them would detach the attached, which T4 forbids. Edge adds no stall gate. | persist I195 (stalled ⇒ `trust_root_valid` unchanged, new member refused); edge's `rooted_with` reads only `.valid` — no edge fixture stands up a trust-root *community* (its roots are key roots), so the community arm is persist's witness |
 
 | I13 | **An unannounced node's identity rows reach only its owner's nodes** (CIRISEdge#682, CC 5.4.6). An owned node's `IdentityOccurrence` / `TransportDestination` go to every peer iff its owner-binding is live at `federation`; otherwise only to `nodes_owned_by(owner)`, on the advertise, the fetch twin and the subject Pull, booked `identity_row_node_not_announced`. Unowned nodes and announced nodes are unchanged; the decision is read from persist, memoized per sweep. | `bridge::an_unannounced_nodes_route_reaches_only_its_owners_nodes_682` (advertise + fetch + unbound); `bridge::an_announced_nodes_route_reaches_a_stranger_682`; `bridge::the_announce_walk_is_memoized_across_peers_and_planes_682`; ladder unchanged (its owner-bindings are at `federation`) |
-| I14 | **Deployment precondition: a device learns its siblings from its owner's bindings.** An unannounced device serves its route to a sibling only once it holds `owner → sibling`. The second-device join (#683) must deliver the owner's binding to the approving device with the new device's own binding. | §2.1; to be witnessed by #683's ladder rung |
+| I14 | **Deployment precondition: a device learns its siblings from its owner's bindings.** An unannounced device serves its route to a sibling only once it holds `owner → sibling`. The second-device join (#683) must deliver the owner's binding to the approving device with the new device's own binding. | §2.1, §2.2; `bridge::the_first_devices_binding_in_the_answer_opens_the_new_devices_route_683` (withheld before the answer's rows are admitted through the requester's door, served after); `first_contact_opaque_683::the_answer_introductions_land_at_the_requester_683` |
+| I15 | **A first-contact opaque request admits at most its sender's own key, and nothing else.** Admission happens only after the shape check, the rate limit (per sender, per link, node-wide) and persist's proof of possession, in that order, and goes through the replicated Key door. A refused request leaves no row and gets no answer. | `first_contact_opaque_683::a_forged_record_is_refused_and_nothing_is_admitted_683`, `…::a_record_naming_another_key_is_refused_683`, `…::the_first_contact_budget_trips_by_name_683`; `first_contact::tests::*` (the three budgets) |
+| I16 | **An unknown key without a record is dropped exactly as before.** | `first_contact_opaque_683::an_unknown_key_without_a_record_is_dropped_as_before_683` |
+| I17 | **An opaque answer rides the path its request arrived on**, and falls back to the by-key send only when that path is gone. | `first_contact_opaque_683::a_never_peered_device_with_its_key_record_is_verified_handled_and_answered_on_its_path_683` (the path is asserted); `reticulum_loopback::a_never_peered_device_is_answered_on_the_link_it_opened_683` (end to end over Reticulum; the #627 on-link announce also binds the link there, so this one does not distinguish the path) |
+| I18 | **A requester admits introductions only from a solicited answer** (its `in_reply_to` matches a request it sent to the answer's signer), keys by proof of possession before the verify and attestations through the replication apply door after it. | `first_contact_opaque_683::an_unsolicited_answer_introduces_nothing_683`, `…::the_answer_introductions_land_at_the_requester_683` |
+| I19 | **The remaining limit is on-path trust on first use.** A device cannot tell the true holder of a `key_id` it has never seen. persist binds the `key_id` inside the registration envelope and checks the self-signature against the record's own public keys, but never derives `key_id` from the public key, so a self-signed record may claim any `key_id`. The challenge (off-path parties cannot name the request) and the path check (the answer must arrive on the request's medium) narrow who can attempt the substitution to a party that saw the request on that medium; neither prevents it. Closing it needs the key id to be derivable from the key (a persist change) or an out-of-band commitment to the first device's key (the pairing code). | `first_contact_opaque_683::a_forged_answer_built_from_public_material_introduces_nothing_683` (the off-path half; fails on the pre-challenge code, where the forged record was admitted as the first device's key) |
 
 ---
 
@@ -276,6 +367,15 @@ the load-bearing rule in this document that realises it.
 
 ## 9. Change log
 
+- **CIRISEdge#683** — §2.2 first contact on the opaque plane. An `OpaqueRequest` may carry its
+  sender's self-signed `key_record`. The receiver checks shape, then rate (per sender, per link,
+  node-wide), then proof of possession, then admits through the #402 Key door, all before the
+  envelope verify. Every opaque answer rides the path its request arrived on (a reply path the
+  transport stamps on the inbound frame; Reticulum uses the link id). A first-contact answer
+  carries `introductions`, which the requester admits only from a solicited answer. Ledger:
+  `first_contact_outcomes`. I15–I19; I14 witnessed. Review: a key-carrying request also carries a
+  random `challenge`, so an off-path attacker cannot compute the correlation, and introductions are
+  admitted only from an answer on the request's transport. I19 records the on-path TOFU limit.
 - **CIRISEdge#682 / #678** — §2.1 the announce axis: an owned, unannounced node's occurrence and
   route reach only its owner's nodes (advertise, fetch twin, subject Pull; ledger tokens
   `identity_row_node_not_announced` / `identity_row_announce_unresolved`); I13, I14.

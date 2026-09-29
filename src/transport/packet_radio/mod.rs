@@ -252,6 +252,7 @@ impl Transport for PacketRadioTransport {
                         // CIRISEdge#499 — packet radio has no scope-derived destination
                         // plane; every frame arrives at the federation address.
                         arrival_scope: None,
+                        reply_path: None,
                     };
                     if sink.send(frame).await.is_err() {
                         // Sink closed — listener should exit cleanly.

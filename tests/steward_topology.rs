@@ -534,6 +534,7 @@ async fn a_classical_only_receiver_emits_no_attestation() {
         source_key_id: None,
         link_key_id: None,
         arrival_scope: None,
+        reply_path: None,
     };
     receiver_edge.dispatch_inbound_for_test(frame).await;
 
@@ -644,6 +645,7 @@ async fn federation_delivery_emits_attestation_per_recipient() {
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     };
     receiver_edge.dispatch_inbound_for_test(frame).await;
 

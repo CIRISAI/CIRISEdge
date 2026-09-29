@@ -818,20 +818,60 @@ struct RegisteredHandler {
 pub(crate) type OpaqueSubscriber = (u32, mpsc::UnboundedSender<(String, u32, Vec<u8>)>);
 
 /// CC 0.7 opaque-request handler (CIRISEdge#241, v8.0.0). Keyed by
-/// `kind`; invoked with `(sender_key_id, payload)` and returns the
-/// [`crate::OpaqueResponse`] edge ships back. An unknown `kind` (no
+/// `kind`; invoked with the request's [`crate::OpaqueRequestContext`] and
+/// returns the [`crate::OpaqueAnswer`] edge ships back. An unknown `kind` (no
 /// registered handler) is answered by edge with a `501` response —
 /// never a silent drop (MISSION §6 anti-pattern 7).
-pub(crate) type OpaqueRequestHandlerFn =
-    Arc<dyn Fn(String, Vec<u8>) -> crate::messages::OpaqueResponse + Send + Sync>;
+///
+/// CIRISEdge#683 — the context says whether the request was a first contact,
+/// and the answer may carry introductions. The `(sender, payload) ->
+/// OpaqueResponse` handlers registered through
+/// [`Edge::register_opaque_handler`] are wrapped into this shape.
+pub(crate) type OpaqueRequestHandlerFn = Arc<
+    dyn Fn(crate::first_contact::OpaqueRequestContext) -> crate::first_contact::OpaqueAnswer
+        + Send
+        + Sync,
+>;
+
+/// CIRISEdge#683 — one pending opaque request: who it was sent to (an answer
+/// may introduce records only if its signer is that key, `FIRST_CONTACT.md`
+/// §2.2) and the waiter.
+pub(crate) struct PendingOpaqueRequest {
+    destination_key_id: String,
+    /// The transport the request went out on. An answer may introduce records
+    /// only if it arrives on the same one (the #683 review: it narrows who can
+    /// attempt a substitution to parties on that medium).
+    transport: crate::transport::TransportId,
+    tx: oneshot::Sender<crate::first_contact::OpaqueExchange>,
+}
 
 /// CC 0.7 opaque-request→response correlation map (CIRISEdge#241).
 /// Keyed by the request envelope's `body_sha256`; the responder stamps
 /// that value into the response envelope's `in_reply_to` so the
 /// dispatcher can resolve the pending [`Edge::send_opaque_request`]
 /// oneshot. Mirrors the `content_fetch_pending` correlation pattern.
-type OpaqueRequestPendingMap =
-    std::sync::Mutex<HashMap<[u8; 32], oneshot::Sender<crate::messages::OpaqueResponse>>>;
+type OpaqueRequestPendingMap = std::sync::Mutex<HashMap<[u8; 32], PendingOpaqueRequest>>;
+
+/// CIRISEdge#683 — what the inbound dispatcher needs for first contact on the
+/// opaque plane: the node's budgets and the persist doors (absent when no
+/// federation directory is wired, which closes the door).
+#[derive(Clone)]
+pub(crate) struct FirstContactWiring {
+    gate: Arc<std::sync::Mutex<crate::first_contact::FirstContactGate>>,
+    doors: Option<crate::first_contact::AdmissionDoors>,
+}
+
+/// CIRISEdge#683 — the persist doors first contact admits through: the
+/// directory, plus the replication bridge when a runtime is installed.
+fn admission_doors(
+    directory: Option<&Arc<dyn ciris_persist::federation::FederationDirectory>>,
+    bridge: Option<Arc<crate::replication::FederationDirectoryReplicationBridge>>,
+) -> Option<crate::first_contact::AdmissionDoors> {
+    directory.map(|d| crate::first_contact::AdmissionDoors {
+        directory: Arc::clone(d),
+        replication: bridge.map(|b| b as Arc<dyn crate::replication::ReplicationDirectory>),
+    })
+}
 
 /// Phase 2 typed ephemeral request→response correlation map — the
 /// closure of the v0.8.0 "correlation not wired" carve-out. Keyed by
@@ -1111,6 +1151,16 @@ pub struct Edge {
     /// CC 0.7 opaque request→response correlation map (CIRISEdge#241).
     /// Keyed by the request envelope `body_sha256`.
     opaque_request_pending: Arc<OpaqueRequestPendingMap>,
+    /// CIRISEdge#683 — the node's first-contact budgets (per sender, per link,
+    /// node-wide; `FIRST_CONTACT.md` §2.2 step 2). One per node, shared by
+    /// every dispatch task.
+    first_contact_gate: Arc<std::sync::Mutex<crate::first_contact::FirstContactGate>>,
+    /// CIRISEdge#683 — the replication bridge, installed with the replication
+    /// routing, so a first contact's records are admitted through the SAME
+    /// apply door replication uses (the bridge's memos invalidate on admit).
+    /// Empty ⇒ the directory is called directly (no bridge, no memo).
+    introduction_bridge:
+        Arc<ReinstallableCell<crate::replication::FederationDirectoryReplicationBridge>>,
     /// Phase 2 typed ephemeral request→response correlation map. Keyed
     /// by the request envelope `body_sha256`; resolved by the
     /// `MessageType::EphemeralResponse` dispatch arm (and, for
@@ -2189,6 +2239,21 @@ impl Edge {
         // different registry logs loudly; same-object re-install is a
         // debug-level no-op.
         self.replication_registry.install(runtime.registry());
+        // CIRISEdge#683 — the same install hands first contact the bridge's
+        // apply door, so an introduced owner-binding invalidates the owner
+        // memo the §2.1 announce gate reads.
+        self.introduction_bridge.install(runtime.bridge());
+    }
+
+    /// CIRISEdge#683 — the first-contact wiring the inbound dispatcher reads.
+    fn first_contact_wiring(&self) -> FirstContactWiring {
+        FirstContactWiring {
+            gate: Arc::clone(&self.first_contact_gate),
+            doors: admission_doors(
+                self.federation_directory.as_ref(),
+                self.introduction_bridge.get(),
+            ),
+        }
     }
 
     /// v5.2.0 (CIRISEdge#143) — register a
@@ -2771,8 +2836,85 @@ impl Edge {
         payload: Vec<u8>,
         timeout_ms: u64,
     ) -> Result<crate::messages::OpaqueResponse, EdgeError> {
-        use crate::messages::OpaqueRequest;
-        let msg = OpaqueRequest { kind, payload };
+        self.send_opaque_request_inner(destination_key_id, kind, payload, None, timeout_ms)
+            .await
+            .map(|exchange| exchange.response)
+    }
+
+    /// CIRISEdge#683 — [`Self::send_opaque_request`] for a **first contact**:
+    /// the request carries this node's own self-signed key record, so a peer
+    /// that has never seen this node can verify it (`FIRST_CONTACT.md` §2.2).
+    /// A new device asking its owner's first device to let it join is the case
+    /// this exists for.
+    ///
+    /// The answer's introductions (the responder's key, the owner's binding to
+    /// the responder, the owner's binding to this node once minted) are
+    /// admitted before this returns, through the same doors replication uses;
+    /// [`crate::OpaqueExchange::introductions`] says what landed.
+    ///
+    /// # Errors
+    ///
+    /// [`EdgeError::Config`] when no federation directory is wired or it holds
+    /// no record for this node's own key, plus everything
+    /// [`Self::send_opaque_request`] returns.
+    pub async fn send_opaque_request_introducing(
+        &self,
+        destination_key_id: &str,
+        kind: u32,
+        payload: Vec<u8>,
+        timeout_ms: u64,
+    ) -> Result<crate::first_contact::OpaqueExchange, EdgeError> {
+        let own = self.own_key_record().await?;
+        self.send_opaque_request_inner(destination_key_id, kind, payload, Some(own), timeout_ms)
+            .await
+    }
+
+    /// CIRISEdge#683 — this node's own key record, as its directory holds it.
+    async fn own_key_record(
+        &self,
+    ) -> Result<ciris_persist::federation::SignedKeyRecord, EdgeError> {
+        let directory = self.federation_directory.as_ref().ok_or_else(|| {
+            EdgeError::Config("first contact needs a federation directory (CIRISEdge#683)".into())
+        })?;
+        let record = directory
+            .lookup_public_key(&self.signer.key_id)
+            .await
+            .map_err(|e| EdgeError::Persist(format!("own key record: {e}")))?
+            .ok_or_else(|| {
+                EdgeError::Config(format!(
+                    "no key record for this node's own key {} (CIRISEdge#683)",
+                    self.signer.key_id
+                ))
+            })?;
+        Ok(ciris_persist::federation::SignedKeyRecord { record })
+    }
+
+    async fn send_opaque_request_inner(
+        &self,
+        destination_key_id: &str,
+        kind: u32,
+        payload: Vec<u8>,
+        key_record: Option<ciris_persist::federation::SignedKeyRecord>,
+        timeout_ms: u64,
+    ) -> Result<crate::first_contact::OpaqueExchange, EdgeError> {
+        use crate::messages::{OpaqueRequest, OpaqueRequestWire};
+        // CIRISEdge#683 — the wire body; without a key record its bytes are
+        // exactly an `OpaqueRequest`'s.
+        // CIRISEdge#683 review — a request that can be answered with
+        // introductions carries a fresh challenge, so its correlation (the body
+        // hash) cannot be computed by anyone who did not see it.
+        let challenge = key_record.as_ref().map(|_| {
+            use rand::RngCore as _;
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            hex::encode(bytes)
+        });
+        let msg = OpaqueRequestWire {
+            kind,
+            payload,
+            key_record,
+            challenge,
+        };
         // Build + sign the request envelope up front so we can key the
         // pending map on its body_sha256 (the correlation token the
         // responder echoes into `in_reply_to`).
@@ -2783,13 +2925,23 @@ impl Edge {
             .map_err(|e| EdgeError::Config(format!("re-parse own envelope: {e}")))?;
         let correlation = envelope_body_sha256(&envelope);
 
+        if self.transports.is_empty() {
+            return Err(EdgeError::Config("no transport configured".into()));
+        }
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self
                 .opaque_request_pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.insert(correlation, tx);
+            pending.insert(
+                correlation,
+                PendingOpaqueRequest {
+                    destination_key_id: destination_key_id.to_owned(),
+                    transport: self.transports[0].id(),
+                    tx,
+                },
+            );
         }
 
         if self.transports.is_empty() {
@@ -2810,7 +2962,7 @@ impl Edge {
         self.metrics.inc_sent(&OpaqueRequest::TYPE);
 
         match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await {
-            Ok(Ok(resp)) => Ok(resp),
+            Ok(Ok(exchange)) => Ok(exchange),
             Ok(Err(_recv)) => Err(EdgeError::Config(
                 "opaque request correlation channel dropped".into(),
             )),
@@ -3324,6 +3476,25 @@ impl Edge {
     where
         F: Fn(String, Vec<u8>) -> crate::messages::OpaqueResponse + Send + Sync + 'static,
     {
+        self.register_opaque_answerer(kind, move |ctx| f(ctx.sender_key_id, ctx.payload).into());
+    }
+
+    /// CIRISEdge#683 — register an opaque-request handler that sees the whole
+    /// [`crate::OpaqueRequestContext`] (including whether the request was a
+    /// first contact, `FIRST_CONTACT.md` §2.2) and answers with an
+    /// [`crate::OpaqueAnswer`], whose `introductions` the requester admits
+    /// from a solicited answer. A device-join handler uses it to hand the new
+    /// device the owner's binding to this node and, once minted, the owner's
+    /// binding to the new device (I14). On a first-contact answer edge adds
+    /// this node's own key record itself. Same replace semantics as
+    /// [`Self::register_opaque_handler`], and the same `kind` space.
+    pub fn register_opaque_answerer<F>(&self, kind: u32, f: F)
+    where
+        F: Fn(crate::first_contact::OpaqueRequestContext) -> crate::first_contact::OpaqueAnswer
+            + Send
+            + Sync
+            + 'static,
+    {
         let mut handlers = self
             .opaque_handlers
             .lock()
@@ -3826,6 +3997,7 @@ impl Edge {
             self.swarm_runtime.get().as_ref(),
             &self.converged_claims,
             &self.blob_scope_router(),
+            &self.first_contact_wiring(),
         )
         .await;
     }
@@ -4578,6 +4750,8 @@ impl Edge {
         // (atomic refcount bump per inbound frame) and the OnceLock
         // load inside the loop is a cheap atomic.
         let replication_registry = self.replication_registry.clone();
+        let first_contact_gate = Arc::clone(&self.first_contact_gate);
+        let introduction_bridge = Arc::clone(&self.introduction_bridge);
         let mut shutdown = shutdown_rx;
         loop {
             tokio::select! {
@@ -4621,6 +4795,15 @@ impl Edge {
                     let blob_chunk_source_clone = blob_chunk_source.clone();
                     let swarm_runtime_clone = swarm_runtime.clone();
                     let converged_claims_clone = converged_claims.clone();
+                    // CIRISEdge#683 — per frame, like the registry: the bridge
+                    // may be (re-)installed after `run` starts.
+                    let first_contact_clone = FirstContactWiring {
+                        gate: Arc::clone(&first_contact_gate),
+                        doors: admission_doors(
+                            federation_directory_for_cohort.as_ref(),
+                            introduction_bridge.get(),
+                        ),
+                    };
                     #[cfg(feature = "_reticulum-module")]
                     let blob_scope_router = crate::blob_swarm::BlobScopeRouter::new(
                         blob_scope_transport
@@ -4665,6 +4848,7 @@ impl Edge {
                             swarm_runtime_clone.get().as_ref(),
                             &converged_claims_clone,
                             &blob_scope_router,
+                            &first_contact_clone,
                         ).await;
                     });
                 }
@@ -4935,6 +5119,17 @@ fn blob_scope_withheld_log() -> &'static crate::log_throttle::LogThrottle {
 fn inbound_verify_reject_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_VERIFY_REJECT_LOG.get_or_init(|| {
         crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 32)
+    })
+}
+
+// CIRISEdge#683 — a refused first contact is attacker-EXPECTED traffic too, so
+// the always-on signal is `first_contact_outcomes[label]` and the line is
+// throttled per label (a small closed set).
+static FIRST_CONTACT_REFUSAL_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+fn first_contact_refusal_log() -> &'static crate::log_throttle::LogThrottle {
+    FIRST_CONTACT_REFUSAL_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
     })
 }
 
@@ -5359,6 +5554,7 @@ fn select_reply_transport(
         swarm_runtime,
         converged_claims,
         blob_scope_router,
+        first_contact,
     ),
     fields(
         transport_id = %frame.transport.0,
@@ -5461,6 +5657,8 @@ async fn dispatch_inbound(
     // "is this node scope-native". Default (no table) leaves the blob serve gate
     // DISARMED, i.e. byte-identical to pre-#499.
     blob_scope_router: &crate::blob_swarm::BlobScopeRouter,
+    // CIRISEdge#683 — first contact on the opaque plane (FIRST_CONTACT.md §2.2).
+    first_contact: &FirstContactWiring,
 ) {
     let received_at = frame.received_at;
     let transport = frame.transport;
@@ -5473,10 +5671,98 @@ async fn dispatch_inbound(
     // the top, so every serve gate below reads the same value and none of them
     // can accidentally re-derive it from something the requester said.
     let arrival_scope = frame.arrival_scope.clone();
+    // CIRISEdge#683 — the path this frame arrived on; an opaque answer rides it.
+    let reply_path = frame.reply_path;
     // CIRISEdge#28 (v0.19.0) — count the bytes consumed by the
     // listener side regardless of verify outcome (the wire spent the
     // bytes; observability covers them).
     metrics.add_bytes_in(transport, frame.envelope_bytes.len() as u64);
+    // CIRISEdge#683 — first contact on the opaque plane (FIRST_CONTACT.md
+    // §2.2), BEFORE the verify: the verify records the nonce before it checks
+    // the signature, so a verify that failed `UnknownKey` and ran again after
+    // admission would read as a replay. A frame that carries no key record
+    // costs one substring scan here.
+    let first_contact_outcome = {
+        let link =
+            reply_path.map_or_else(|| format!("transport:{}", transport.0), |p| p.bucket_key());
+        let now = u64::try_from(received_at.timestamp()).unwrap_or(0);
+        crate::first_contact::admit_first_contact(
+            &frame.envelope_bytes,
+            &link,
+            first_contact.doors.as_ref(),
+            &first_contact.gate,
+            now,
+        )
+        .await
+    };
+    if let Some(label) = first_contact_outcome.label() {
+        metrics.inc_first_contact(label);
+    }
+    if first_contact_outcome.drops() {
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            first_contact_refusal_log().check(first_contact_outcome.label().unwrap_or("-"))
+        {
+            tracing::warn!(
+                event = "edge.dispatch_inbound.first_contact_refused",
+                transport_id = %transport.0,
+                outcome = first_contact_outcome.label().unwrap_or("-"),
+                suppressed_prev,
+                "first-contact opaque request refused before verify; dropped, no answer \
+                 (CIRISEdge#683, FIRST_CONTACT.md §2.2)"
+            );
+        }
+        return;
+    }
+    // CIRISEdge#683 — the requester's half: a SOLICITED answer (its
+    // `in_reply_to` names a request this node sent to the answer's signer)
+    // may introduce keys, admitted before the verify because the answerer's
+    // own key may be among them. Attestations wait for the verify.
+    let mut introductions: Option<(
+        crate::first_contact::IntroductionReport,
+        crate::messages::Introductions,
+    )> = None;
+    if let Some((intro_env, intro)) =
+        crate::first_contact::carried_introductions(&frame.envelope_bytes)
+    {
+        let solicited = intro_env.in_reply_to.is_some_and(|c| {
+            opaque_request_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&c)
+                .is_some_and(|p| {
+                    p.destination_key_id == intro_env.signing_key_id && p.transport == transport
+                })
+        });
+        if !solicited {
+            metrics.inc_first_contact("first_contact_unsolicited_introductions");
+            tracing::debug!(
+                signer = %intro_env.signing_key_id,
+                "opaque answer carries introductions but answers no request of ours to \
+                 its signer on this transport; ignored (CIRISEdge#683)"
+            );
+        } else if let Some(doors) = first_contact.doors.as_ref() {
+            let mut report = crate::first_contact::IntroductionReport::default();
+            crate::first_contact::admit_introduced_keys(doors, &intro.keys, &mut report).await;
+            introductions = Some((report, intro));
+        } else {
+            let mut report = crate::first_contact::IntroductionReport::default();
+            for k in &intro.keys {
+                report.refused.push((
+                    k.record.key_id.clone(),
+                    crate::first_contact::FirstContactRefusal::NoDirectory
+                        .as_str()
+                        .to_string(),
+                ));
+            }
+            introductions = Some((
+                report,
+                crate::messages::Introductions {
+                    keys: Vec::new(),
+                    attestations: intro.attestations,
+                },
+            ));
+        }
+    }
     let verified = match verify.verify(&frame.envelope_bytes, transport).await {
         Ok(v) => v,
         Err(e) => {
@@ -6589,17 +6875,50 @@ async fn dispatch_inbound(
     // OpaqueResponse → correlate back to the pending `send_opaque_request`
     // via the envelope `in_reply_to` (the request's body_sha256).
     if envelope.message_type == MessageType::OpaqueResponse {
-        match serde_json::from_str::<crate::messages::OpaqueResponse>(envelope.body.get()) {
-            Ok(resp) => {
+        match serde_json::from_str::<crate::messages::OpaqueResponseWire>(envelope.body.get()) {
+            Ok(wire) => {
+                let (resp, _) = wire.into_parts();
                 if let Some(correlation) = envelope.in_reply_to {
-                    let tx = {
+                    let waiter = {
                         let mut pending = opaque_request_pending
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         pending.remove(&correlation)
                     };
-                    if let Some(tx) = tx {
-                        let _ = tx.send(resp);
+                    if let Some(waiter) = waiter {
+                        // CIRISEdge#683 — the answer is verified now: its
+                        // attestations go through the replication apply door
+                        // before the caller sees the response, so a device that
+                        // asked to join holds the owner's binding by the time
+                        // `send_opaque_request_introducing` returns (I14).
+                        let mut report = crate::first_contact::IntroductionReport::default();
+                        if let Some((mut keys_report, intro)) = introductions.take() {
+                            match first_contact.doors.as_ref() {
+                                Some(doors) => {
+                                    crate::first_contact::admit_introduced_attestations(
+                                        doors,
+                                        &intro.attestations,
+                                        &mut keys_report,
+                                    )
+                                    .await;
+                                }
+                                None => {
+                                    for a in &intro.attestations {
+                                        keys_report.refused.push((
+                                            a.attestation.attestation_id.clone(),
+                                            crate::first_contact::FirstContactRefusal::NoDirectory
+                                                .as_str()
+                                                .to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                            report = keys_report;
+                        }
+                        let _ = waiter.tx.send(crate::first_contact::OpaqueExchange {
+                            response: resp,
+                            introductions: report,
+                        });
                     } else {
                         // Phase 2 fallback — a typed
                         // `Edge::send::<OpaqueRequest>` registers in
@@ -6682,7 +7001,7 @@ async fn dispatch_inbound(
     // drop, MISSION §6 anti-pattern 7). The response is signed +
     // shipped back to the sender with `in_reply_to = request body_sha256`.
     if envelope.message_type == MessageType::OpaqueRequest {
-        match serde_json::from_str::<crate::messages::OpaqueRequest>(envelope.body.get()) {
+        match serde_json::from_str::<crate::messages::OpaqueRequestWire>(envelope.body.get()) {
             Ok(req) => {
                 let handler = {
                     let handlers = opaque_handlers
@@ -6690,8 +7009,20 @@ async fn dispatch_inbound(
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     handlers.get(&req.kind).cloned()
                 };
-                let response = if let Some(h) = handler {
-                    h(envelope.signing_key_id.clone(), req.payload)
+                // CIRISEdge#683 — a first contact is a request whose own
+                // record introduced its (now verified) signer.
+                let first = matches!(
+                    &first_contact_outcome,
+                    crate::first_contact::FirstContactOutcome::Admitted { sender_key_id }
+                        if *sender_key_id == envelope.signing_key_id
+                );
+                let mut answer = if let Some(h) = handler {
+                    h(crate::first_contact::OpaqueRequestContext {
+                        sender_key_id: envelope.signing_key_id.clone(),
+                        kind: req.kind,
+                        payload: req.payload,
+                        first_contact: first,
+                    })
                 } else {
                     tracing::warn!(
                         kind = req.kind,
@@ -6703,7 +7034,41 @@ async fn dispatch_inbound(
                         status: 501,
                         payload: b"unknown kind".to_vec(),
                     }
+                    .into()
                 };
+                // CIRISEdge#683 — a device that has never seen this node needs
+                // its key to verify the answer; edge adds it, the host adds
+                // the bindings (FIRST_CONTACT.md §2.2, I14).
+                if first {
+                    if let Some(doors) = first_contact.doors.as_ref() {
+                        let already = answer
+                            .introductions
+                            .keys
+                            .iter()
+                            .any(|k| k.record.key_id == signer.key_id);
+                        if !already {
+                            match doors.directory.lookup_public_key(&signer.key_id).await {
+                                Ok(Some(record)) => answer.introductions.keys.insert(
+                                    0,
+                                    ciris_persist::federation::SignedKeyRecord { record },
+                                ),
+                                Ok(None) => tracing::warn!(
+                                    key_id = %signer.key_id,
+                                    "first-contact answer: no key record for this node's own \
+                                     key; the requester may not be able to verify it (CIRISEdge#683)"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "first-contact answer: own key lookup failed (CIRISEdge#683)"
+                                ),
+                            }
+                        }
+                    }
+                }
+                let body = crate::messages::OpaqueResponseWire::from_parts(
+                    answer.response,
+                    answer.introductions,
+                );
                 // Ship the response back to the sender. Correlation rides
                 // `in_reply_to = request body_sha256`.
                 if let Some(transport) = response_transport {
@@ -6711,7 +7076,7 @@ async fn dispatch_inbound(
                         MessageType::OpaqueResponse,
                         &signer.key_id,
                         &envelope.signing_key_id,
-                        &response,
+                        &body,
                         Some(body_sha256),
                     ) {
                         Ok(mut resp_env) => {
@@ -6720,9 +7085,28 @@ async fn dispatch_inbound(
                             } else {
                                 match serde_json::to_vec(&resp_env) {
                                     Ok(bytes) => {
-                                        if let Err(e) =
-                                            transport.send(&envelope.signing_key_id, &bytes).await
+                                        // CIRISEdge#683 / #353 — on the path the
+                                        // request arrived on, when this transport
+                                        // minted it; by key otherwise.
+                                        let sent = match reply_path
+                                            .filter(|p| p.transport() == transport.id())
                                         {
+                                            Some(path) => {
+                                                transport
+                                                    .send_on_reply_path(
+                                                        &envelope.signing_key_id,
+                                                        &path,
+                                                        &bytes,
+                                                    )
+                                                    .await
+                                            }
+                                            None => {
+                                                transport
+                                                    .send(&envelope.signing_key_id, &bytes)
+                                                    .await
+                                            }
+                                        };
+                                        if let Err(e) = sent {
                                             tracing::warn!(
                                                 error = %e,
                                                 "OpaqueResponse transport send failed",
@@ -7646,6 +8030,10 @@ impl EdgeBuilder {
             opaque_next_id: Arc::new(AtomicU64::new(1)),
             opaque_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             opaque_request_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            first_contact_gate: Arc::new(std::sync::Mutex::new(
+                crate::first_contact::FirstContactGate::new(),
+            )),
+            introduction_bridge: Arc::new(ReinstallableCell::new("introduction_bridge")),
             ephemeral_response_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             verified_envelope_tx,
             content_fetch_pending,
@@ -9476,6 +9864,7 @@ mod inbound_ingest_tests {
             source_key_id: source.map(crate::transport::SourceKeyId::transport_authenticated),
             link_key_id: None,
             arrival_scope: None,
+            reply_path: None,
         }
     }
 
@@ -9819,6 +10208,7 @@ mod inbound_ingest_tests {
             )),
             link_key_id: None,
             arrival_scope: None,
+            reply_path: None,
         };
         let route = |f: InboundFrame| {
             let r = Arc::clone(&registry);
@@ -9895,6 +10285,7 @@ mod inbound_ingest_tests {
             source_key_id: None,
             link_key_id: link.map(str::to_string),
             arrival_scope: None,
+            reply_path: None,
         };
 
         // (a) Key + link → admitted on the link's transport identity.
@@ -9945,6 +10336,7 @@ mod inbound_ingest_tests {
             source_key_id: None,
             link_key_id: Some("fresh-peer".into()),
             arrival_scope: None,
+            reply_path: None,
         };
         assert!(
             bootstrap_carve_out_source(&junk).is_none(),
@@ -9976,6 +10368,7 @@ mod inbound_ingest_tests {
                 source_key_id: None,
                 link_key_id: link.clone(),
                 arrival_scope: None,
+                reply_path: None,
             };
             // Some(link) exactly when kind is a bootstrap kind AND a link exists.
             let expected = link.filter(|_| kind.is_bootstrap());

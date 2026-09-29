@@ -269,6 +269,7 @@ async fn dispatch(
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     };
     edge.dispatch_inbound_for_test(frame).await;
     Ok(())
@@ -649,6 +650,7 @@ async fn build_signed_envelope_from_software_signer_drives_trust_gate() {
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     };
     let outcome = edge.dispatch_inbound_observed_outcome_for_test(frame).await;
 
@@ -691,6 +693,7 @@ async fn build_outcome(edge: &Edge, sender: &LocalSigner, destination: &str) -> 
         link_key_id: None,
         // CIRISEdge#499 — federation arrival (no scope table in this fixture).
         arrival_scope: None,
+        reply_path: None,
     };
     edge.dispatch_inbound_observed_outcome_for_test(frame).await
 }

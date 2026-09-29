@@ -17776,6 +17776,130 @@ pub(crate) mod tests {
         );
     }
 
+    /// **CIRISEdge#683 — I14 witnessed.** The new, unannounced device
+    /// (`node-bob`) does not yet hold `person-bob → node-bob-2`, so the first
+    /// device (`node-bob-2`) is a stranger to it and its route is withheld.
+    /// The first device's answer carries that binding; admitted through the
+    /// requester's door, which is the replication apply door, it drops the
+    /// announce memo, and the route is served on the very next ask.
+    ///
+    /// The negative control is the reason the door is the bridge: the same row
+    /// written straight into the directory leaves the 30 s announce memo
+    /// standing, and the route stays withheld even though the binding is held.
+    #[tokio::test]
+    async fn the_first_devices_binding_in_the_answer_opens_the_new_devices_route_683() {
+        for through_bridge in [true, false] {
+            let (backend, bridge, hash) = first_contact_fixture().await;
+            let kind = EnvelopeKind::TransportDestination;
+            assert!(
+                !advertised(
+                    &bridge
+                        .list_envelope_refs_for_peer(kind, Some("node-bob-2"))
+                        .await,
+                    &hash
+                ),
+                "before the answer the first device is a stranger here (§2.1)"
+            );
+
+            let id = uuid::Uuid::new_v4().to_string();
+            let binding = SignedAttestation {
+                attestation: build_federation_attestation(
+                    &id,
+                    "person-bob",
+                    "node-bob-2",
+                    "delegates_to",
+                    owner_binding_envelope(&id, "person-bob", "node-bob-2"),
+                ),
+            };
+            let doors = crate::first_contact::AdmissionDoors {
+                directory: backend.clone(),
+                replication: through_bridge
+                    .then(|| Arc::clone(&bridge) as Arc<dyn ReplicationDirectory>),
+            };
+            let mut report = crate::first_contact::IntroductionReport::default();
+            crate::first_contact::admit_introduced_attestations(
+                &doors,
+                std::slice::from_ref(&binding),
+                &mut report,
+            )
+            .await;
+            assert_eq!(
+                report.attestations_admitted,
+                vec![id.clone()],
+                "the answer's binding is admitted: {report:?}"
+            );
+
+            let served = advertised(
+                &bridge
+                    .list_envelope_refs_for_peer(kind, Some("node-bob-2"))
+                    .await,
+                &hash,
+            );
+            if through_bridge {
+                assert!(
+                    served,
+                    "holding owner → first device, the new device offers it its route (I14)"
+                );
+                assert!(bridge
+                    .fetch_envelope_bytes_for_peer(kind, &hash, Some("node-bob-2"))
+                    .await
+                    .is_some());
+            } else {
+                assert!(
+                    !served,
+                    "a side door into persist leaves the announce memo stale — which is \
+                     why introductions go through the replication apply door"
+                );
+            }
+        }
+    }
+
+    /// The #683 fixture: [`announce_fixture`]'s unannounced `node-bob` with
+    /// its route held, and `node-bob-2`'s key held but NOT its owner-binding
+    /// (the state of a new device that has only just reached its first one).
+    async fn first_contact_fixture() -> (
+        Arc<MemoryBackend>,
+        Arc<FederationDirectoryReplicationBridge>,
+        [u8; 32],
+    ) {
+        use sha2::{Digest as _, Sha256};
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-bob", identity_type::USER),
+                ("node-bob", identity_type::NODE),
+                ("node-bob-2", identity_type::NODE),
+            ],
+        )
+        .await;
+        let id = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &id,
+            "person-bob",
+            "node-bob",
+            "delegates_to",
+            "self",
+            owner_binding_envelope(&id, "person-bob", "node-bob"),
+        )
+        .await;
+        let publish = vec!["node-bob".to_string(), "person-bob".to_string()];
+        let bridge = Arc::new(
+            bridge_over(&backend, &[])
+                .with_self_provider(Some(Arc::new(move || publish.clone())))
+                .with_local_key_id(Some("node-bob".to_string())),
+        );
+        let signed =
+            sign_transport_destination_fixture("node-bob", "aa00", 1, Utc::now().trunc_subsecs(6));
+        let wire = serde_json::to_vec(&signed).expect("wire");
+        let outcome = bridge
+            .apply_envelope_bytes(EnvelopeKind::TransportDestination, &wire, None)
+            .await;
+        assert!(outcome.is_admitted(), "route admits, got {outcome:?}");
+        (backend, bridge, Sha256::digest(&wire).into())
+    }
+
     /// The reach is a PER-SWEEP memo, not a per-peer walk: two peers and two
     /// planes in one round pay for each subject once.
     #[tokio::test]

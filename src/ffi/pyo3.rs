@@ -1087,6 +1087,7 @@ impl PyEdge {
                     source_key_id: None,
                     link_key_id: None,   // CIRISEdge#402
                     arrival_scope: None, // CIRISEdge#499 — injected frame, federation arrival
+                    reply_path: None,
                 };
                 inner
                     .dispatch_inbound_observed_outcome_for_test(frame)
@@ -2558,6 +2559,13 @@ impl PyEdge {
             door.set_item(label.as_str(), *n)?;
         }
         root.set_item("bootstrap_door_outcomes", door)?;
+        // CIRISEdge#683 — the opaque-plane first-contact door: admitted, known
+        // key, and each named refusal (refusals are drops).
+        let first_contact = pyo3::types::PyDict::new(py);
+        for (label, n) in &bundle.first_contact_outcomes {
+            first_contact.set_item(label.as_str(), *n)?;
+        }
+        root.set_item("first_contact_outcomes", first_contact)?;
         // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
         // a missing install and a membership refusal are two numbers.
         let route_refusals = pyo3::types::PyDict::new(py);

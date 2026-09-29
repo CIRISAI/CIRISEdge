@@ -63,6 +63,8 @@ pub mod content_occurrence;
 pub mod debug;
 pub mod delivery_mode;
 pub mod detector;
+/// CIRISEdge#683 — first contact on the opaque plane (`FSD/FIRST_CONTACT.md` §2.2).
+pub mod first_contact;
 pub mod group_content;
 /// CIRISEdge#554 — the receiver-side budget on unsolicited contact requests.
 pub mod invite_gate;
@@ -350,6 +352,10 @@ pub use edge::{
     AgentMode, CanonicalBootstrapPeer, ChunkResult, ContentResult, Edge, EdgeBuilder, EdgeConfig,
     EdgeError, PublishOutcome, VerifiedEnvelopeSnapshot, DEFAULT_BLACKHOLE_PRUNE_INTERVAL_SECONDS,
 };
+pub use first_contact::{
+    FirstContactGate, FirstContactRefusal, IntroductionReport, OpaqueAnswer, OpaqueExchange,
+    OpaqueRequestContext,
+};
 // v6.1.0 (CIRISEdge#175, FSD §3.1) — Poisson emission surface.
 pub use emission::{
     seal_envelope, unseal_envelope, BudgetMeter, BudgetState, EmissionEnvelope,
@@ -378,8 +384,8 @@ pub use messages::{
     BuildManifestPublication, BuildManifestPublicationResponse, ContentBody, ContentFetch,
     ContentMiss, DSARRequest, DSARResponse, DeliveryAttestation, DeliveryAttestationError,
     DeliveryRefusalAttestation, EdgeEnvelope, FederationAnnouncement, GoalDeclaration,
-    GoalDeclarationResponse, GoalRetirement, GoalRetirementResponse, HintShape, MessageType,
-    MissReason, OpaqueEvent, OpaqueRequest, OpaqueResponse, PublicKeyRegistration,
+    GoalDeclarationResponse, GoalRetirement, GoalRetirementResponse, HintShape, Introductions,
+    MessageType, MissReason, OpaqueEvent, OpaqueRequest, OpaqueResponse, PublicKeyRegistration,
     PublicKeyRegistrationResponse, RefusalReason, SchemaVersion, StewardDirective,
     TestimonialWitness, TransportMedium, WithdrawalReason, Withdraws, ACCORD_THRESHOLD_M_OF_N,
     DEFAULT_MAX_CONTENT_BODY_BYTES, DELIVERY_ATTESTATION_DOMAIN,

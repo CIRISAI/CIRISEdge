@@ -921,6 +921,12 @@ pub struct EdgeMetrics {
     /// link was attributed by its announce before any Deliver). The door never
     /// drops, so there is no drop label.
     pub bootstrap_door_outcomes: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#683 — the opaque-plane first-contact door, per label
+    /// (`FIRST_CONTACT.md` §2.2): `first_contact_admitted`,
+    /// `first_contact_known_key`, every `first_contact_*` refusal, and
+    /// `first_contact_unsolicited_introductions` on the requester's side. The
+    /// refusals are drops; this ledger is how an operator reads them.
+    pub first_contact_outcomes: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#640 — blob holders dropped from a pull's candidate set, by the
     /// router's refusal BRANCH (`ScopeRouteRefusal::reason_tag`):
     /// `blob_group_not_installed` (the host's lifecycle never installed the
@@ -1255,6 +1261,15 @@ impl EdgeMetrics {
             .or_insert(0) += 1;
     }
 
+    /// CIRISEdge#683 — count one first-contact door outcome by its label.
+    pub fn inc_first_contact(&self, label: &'static str) {
+        *self
+            .first_contact_outcomes
+            .write()
+            .entry(label)
+            .or_insert(0) += 1;
+    }
+
     /// CIRISEdge#530 — increment the announce-intake pressure-eviction counter.
     /// Called once per evicted UNRETAINED binding at the `MAX_PEERS` cap, so the
     /// previously `debug!`-only eviction is countable in production.
@@ -1499,6 +1514,12 @@ impl EdgeMetrics {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
+            first_contact_outcomes: self
+                .first_contact_outcomes
+                .read()
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
             replication_routed_to_responder_total: self.route_counters().0,
             replication_routed_to_initiator_total: self.route_counters().1,
             replication_reply_dropped_total: self.route_counters().2,
@@ -1561,6 +1582,8 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
     /// `unbound` / `not_applicable`). The door never drops.
     pub bootstrap_door_outcomes: HashMap<String, u64>,
+    /// CIRISEdge#683 — the opaque-plane first-contact door by label.
+    pub first_contact_outcomes: HashMap<String, u64>,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
     pub replication_routed_to_responder_total: u64,
     /// CIRISEdge#634 — replies routed into an initiator's round inbox.

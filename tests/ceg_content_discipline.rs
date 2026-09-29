@@ -207,6 +207,7 @@ impl Transport for InjectTransport {
                 link_key_id: None,
                 // CIRISEdge#499 — federation arrival (no scope table in this fixture).
                 arrival_scope: None,
+                reply_path: None,
             };
             if sink.send(frame).await.is_err() {
                 break;
