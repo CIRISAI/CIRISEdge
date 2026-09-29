@@ -1853,6 +1853,22 @@ pub struct BlobChunkFetch {
     /// logic (EWMA, in-flight cap) is fetcher-local and not wire-bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_hint: Option<HintShape>,
+    /// CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) — the
+    /// in-link scope discriminator: the HOLDER's own scope-derived address
+    /// for the content's room, the same 16 bytes the fetcher would have
+    /// dialled had a direct path existed. Present ONLY when the fetch rides
+    /// the members' end-to-end encrypted identity-plane link because the
+    /// holder is reachable solely through a non-member transport node;
+    /// absent on the derived-address carrier.
+    ///
+    /// Lives here, in the signed envelope body, so it sits INSIDE the
+    /// Reticulum link encryption and the forwarder is handed nothing that
+    /// names the room. The responder resolves it against the same
+    /// `ScopeAddressTable` its arrival path consults and refuses by name an
+    /// address it does not hold (`BlobScopeRouter::scoped_arrival`). It is
+    /// never a packet header, an announce or a path request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_discriminator: Option<[u8; 16]>,
 }
 
 impl Message for BlobChunkFetch {
@@ -2558,6 +2574,37 @@ mod tests {
     /// CIRISEdge#55 — round-trip both SHAs through JSON serde.
     /// Catches accidental wire-shape drift between Fetch / Body / Miss
     /// (all three must carry the same SHA pair).
+    /// CIRISEdge#718 — the in-link scope discriminator is an OPTIONAL body
+    /// field: a pre-#718 peer's fetch (no field) decodes, a fetch without one
+    /// serializes byte-identically to before (`skip_serializing_if`), and one
+    /// carrying it round-trips the 16 bytes.
+    #[test]
+    fn blob_chunk_fetch_scope_discriminator_is_optional_on_the_wire() {
+        let blob = [7u8; 32];
+        let legacy = serde_json::json!({ "blob_sha256": blob, "chunk_sha256": blob });
+        let decoded: BlobChunkFetch = serde_json::from_value(legacy).expect("pre-#718 shape");
+        assert_eq!(decoded.scope_discriminator, None);
+        let bare = BlobChunkFetch {
+            blob_sha256: blob,
+            chunk_sha256: blob,
+            response_hint: None,
+            scope_discriminator: None,
+        };
+        assert!(
+            !serde_json::to_string(&bare)
+                .expect("json")
+                .contains("scope_discriminator"),
+            "the derived-address carrier names no discriminator on the wire"
+        );
+        let scoped = BlobChunkFetch {
+            scope_discriminator: Some([0xD1; 16]),
+            ..bare
+        };
+        let back: BlobChunkFetch =
+            serde_json::from_str(&serde_json::to_string(&scoped).expect("json")).expect("decode");
+        assert_eq!(back.scope_discriminator, Some([0xD1; 16]));
+    }
+
     #[test]
     fn blob_chunk_wire_shapes_round_trip_through_json() {
         let blob = [7u8; 32];
@@ -2566,6 +2613,7 @@ mod tests {
             blob_sha256: blob,
             chunk_sha256: chunk,
             response_hint: None,
+            scope_discriminator: None,
         };
         let body = BlobChunkBody {
             blob_sha256: blob,

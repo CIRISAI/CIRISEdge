@@ -3708,6 +3708,8 @@ impl Edge {
             blob_sha256,
             chunk_sha256,
             response_hint: None,
+            // The unscoped path never names a room (CIRISEdge#718).
+            scope_discriminator: None,
         };
         // Phase 2 — `BlobChunkFetch::Response = ()`, so Delivered is
         // `Ok(())` directly (same migration as `fetch_content`; the
@@ -3738,6 +3740,74 @@ impl Edge {
                     "fetch_blob_chunk timeout after {timeout:?}"
                 )))
             }
+        }
+    }
+
+    /// CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) — choose the
+    /// link a scoped fetch to `peer_key_id` rides, ONCE, from the path table:
+    ///   one hop            ⇒ the derived address (the zero-observer path,
+    ///                        exactly as before);
+    ///   more than one hop  ⇒ the members' end-to-end encrypted identity-plane
+    ///                        link, the room discriminated INSIDE the link
+    ///                        (`BlobChunkFetch::scope_discriminator`);
+    ///   no path            ⇒ the derived address (never a forwarder on a guess).
+    /// Counted (`blob_scoped_carriers`) and logged with the path shape.
+    /// `None` when this node has no Reticulum transport (the caller refuses).
+    #[cfg(feature = "_reticulum-module")]
+    async fn scoped_carrier_for(
+        &self,
+        peer_key_id: &str,
+        blob_sha256: &[u8; 32],
+    ) -> Option<crate::blob_swarm::CarrierChoice> {
+        let transport = self.reticulum_transport.as_ref()?;
+        let shape = transport.scoped_path_shape(peer_key_id).await;
+        let choice = crate::blob_swarm::choose_scoped_carrier(shape);
+        self.metrics.inc_blob_scoped_carrier(choice.reason_tag);
+        tracing::info!(
+            event = "edge.blob_chunk_fetch.carrier",
+            holder = %peer_key_id,
+            blob_sha256 = %hex::encode(&blob_sha256[..8]),
+            path = ?shape,
+            carrier = ?choice.carrier,
+            reason = choice.reason_tag,
+            "scoped fetch carrier chosen from the path table (CC 5.4.6, CIRISEdge#718)",
+        );
+        Some(choice)
+    }
+
+    /// CIRISEdge#718 — ship a signed `BlobChunkFetch` on the chosen carrier.
+    ///
+    /// The identity-plane arm is the ordinary Reticulum send to the holder's
+    /// key_id — reverse path first, else the PATHED announced destination
+    /// (route-table-first, #336). The dial target names the holder's public
+    /// identity, never the room; the forwarder relays link ciphertext by link
+    /// id and is handed nothing else (leviculum `transport.rs:7094-7220`).
+    #[cfg(feature = "_reticulum-module")]
+    async fn ship_scoped_fetch(
+        transport: &Arc<crate::transport::reticulum::ReticulumTransport>,
+        choice: crate::blob_swarm::CarrierChoice,
+        recipient: &crate::blob_swarm::BlobRecipient,
+        address: &crate::scope_addressing::MemberAddress,
+        envelope_bytes: &[u8],
+    ) -> Result<(), EdgeError> {
+        match choice.carrier {
+            crate::blob_swarm::ScopedCarrier::DerivedAddress => transport
+                .send_to_scoped_destination(recipient.peer_key_id(), address, envelope_bytes)
+                .await
+                .map(|_| ())
+                .map_err(|e| EdgeError::Config(format!("scope-native blob fetch send: {e}"))),
+            crate::blob_swarm::ScopedCarrier::IdentityLink => crate::transport::Transport::send(
+                &**transport,
+                recipient.peer_key_id(),
+                envelope_bytes,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                EdgeError::Config(format!(
+                    "scope-native blob fetch send (identity-plane link, CIRISEdge#718): {e}"
+                ))
+            }),
         }
     }
 
@@ -3812,14 +3882,36 @@ impl Edge {
             pending.remove(&key);
         };
 
+        // CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) — the
+        // CARRIER, chosen ONCE, from the path table, BEFORE any dial (see
+        // `scoped_carrier_for`). A decision, not a fallback: a direct dial
+        // that fails transiently below stays `NoRouteToPeer` and is NOT
+        // re-routed through a forwarder (FSD/CIRIS_EDGE_TRANSPORT.md §3.4 I-3.4.2).
+        #[cfg(feature = "_reticulum-module")]
+        let choice = self
+            .scoped_carrier_for(recipient.peer_key_id(), &blob_sha256)
+            .await;
+        #[cfg(feature = "_reticulum-module")]
+        let scope_discriminator = match choice {
+            Some(c) if c.carrier == crate::blob_swarm::ScopedCarrier::IdentityLink => {
+                Some(*address.as_bytes())
+            }
+            _ => None,
+        };
+        #[cfg(not(feature = "_reticulum-module"))]
+        let scope_discriminator: Option<[u8; 16]> = None;
+
         let fetch = crate::messages::BlobChunkFetch {
             blob_sha256,
             chunk_sha256,
             response_hint: None,
+            scope_discriminator,
         };
 
         // Build + sign exactly as the unscoped path does — the ENVELOPE is
-        // unchanged by scope-native addressing, only the address it rides.
+        // unchanged by scope-native addressing (the #718 discriminator is a
+        // body field, inside the signature and inside the link encryption),
+        // only the link it rides.
         let envelope_bytes = match self
             .build_signed_envelope_with_cohort_scope(recipient.peer_key_id(), &fetch, None, None)
             .await
@@ -3832,13 +3924,12 @@ impl Edge {
         };
 
         #[cfg(feature = "_reticulum-module")]
-        let sent = match self.reticulum_transport.as_ref() {
-            Some(transport) => transport
-                .send_to_scoped_destination(recipient.peer_key_id(), address, &envelope_bytes)
-                .await
-                .map(|_| ())
-                .map_err(|e| EdgeError::Config(format!("scope-native blob fetch send: {e}"))),
-            None => Err(EdgeError::Config(format!(
+        let sent = match (self.reticulum_transport.as_ref(), choice) {
+            (Some(transport), Some(choice)) => {
+                Self::ship_scoped_fetch(transport, choice, recipient, address, &envelope_bytes)
+                    .await
+            }
+            (None, _) | (_, None) => Err(EdgeError::Config(format!(
                 "scope-native blob fetch: holder '{}' resolved to a scope-derived \
                  address but this node has no Reticulum transport. HTTP and packet \
                  radio have no scope-derived destination plane, and shipping this \
@@ -6197,16 +6288,47 @@ async fn dispatch_inbound(
                 // mean the responder makes the same calls, not just reaches the
                 // same verdict.
                 let scope_native = blob_scope_router.is_scope_native();
+                // CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) —
+                // the ADMISSION FACT, from what the transport stamped AND what
+                // the body carried. A request on the identity-plane link names
+                // the room through an in-link discriminator; it is resolved
+                // against the SAME `ScopeAddressTable` reverse index the arrival
+                // path consults, and only an address THIS node holds (its own
+                // member address) stamps the arrival. A discriminator the node
+                // does not hold, or one on a frame that ALSO arrived on a
+                // derived address, is refused by name here, before the gate.
+                let scoped_arrival = blob_scope_router.scoped_arrival(
+                    arrival_scope.clone(),
+                    req.scope_discriminator.as_ref(),
+                    &signer.key_id,
+                );
+                let arrival_scope = match &scoped_arrival {
+                    Ok(a) => a.clone(),
+                    Err(_) => None,
+                };
                 let content_scope = if scope_native {
                     source.chunk_scope(req.blob_sha256).await
                 } else {
                     None
                 };
-                let admission = crate::blob_swarm::admit_blob_serve(
-                    scope_native,
-                    arrival_scope.as_ref(),
-                    content_scope.as_ref(),
-                );
+                let admission = match scoped_arrival {
+                    Err(refusal) => crate::blob_swarm::ServeAdmission::Refuse(refusal),
+                    Ok(arrival) => {
+                        if req.scope_discriminator.is_some() && arrival.is_some() {
+                            // Counted on admission of the DISCRIMINATOR, before
+                            // the serve gate's own verdict: the identity-link
+                            // branch is never silent (§3.4 I-3.4.6).
+                            metrics.inc_blob_scoped_carrier(
+                                crate::blob_swarm::SCOPED_CARRIER_SERVE_IDENTITY_LINK_ADMITTED,
+                            );
+                        }
+                        crate::blob_swarm::admit_blob_serve(
+                            scope_native,
+                            arrival.as_ref(),
+                            content_scope.as_ref(),
+                        )
+                    }
+                };
                 let scope_refusal = match admission {
                     crate::blob_swarm::ServeAdmission::Admit => None,
                     // Never a bare `continue` (CIRISEdge#425): the refusal is

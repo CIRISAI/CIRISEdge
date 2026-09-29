@@ -230,7 +230,13 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         // is outside the context.
         WithholdReason::BlobScopeUndeterminable
         | WithholdReason::BlobArrivalScopeInsufficient
-        | WithholdReason::BlobArrivalGroupMismatch => CiParameter::Recipient,
+        | WithholdReason::BlobArrivalGroupMismatch
+        // CIRISEdge#718 — an in-link discriminator is the same demonstration
+        // of context membership carried inside the link; one that names an
+        // address this node does not hold, or one on a path it did not take,
+        // is a recipient outside the context.
+        | WithholdReason::BlobDiscriminatorUnheld
+        | WithholdReason::BlobDiscriminatorOnDerivedAddress => CiParameter::Recipient,
 
         // CIRISEdge#499 (holdings plane) — "I hold this" is itself a
         // flow, and before this cut a family-scoped holding's content id
@@ -840,7 +846,7 @@ mod tests {
     /// So: when adding a reason, add it here too, and on a merge that touches
     /// this file check the count against the enum rather than trusting a
     /// green suite.
-    const ALL_REASONS: [WithholdReason; 46] = [
+    const ALL_REASONS: [WithholdReason; 48] = [
         WithholdReason::EnvelopeUnfetchable,
         WithholdReason::LocalIdentityMissing,
         WithholdReason::SendSetUnresolved,
@@ -867,6 +873,8 @@ mod tests {
         WithholdReason::BlobScopeUndeterminable,
         WithholdReason::BlobArrivalScopeInsufficient,
         WithholdReason::BlobArrivalGroupMismatch,
+        WithholdReason::BlobDiscriminatorUnheld,
+        WithholdReason::BlobDiscriminatorOnDerivedAddress,
         WithholdReason::HoldingScopeUndeterminable,
         WithholdReason::HoldingScopePublicGroup,
         WithholdReason::HoldingScopePeerNotInRoster,

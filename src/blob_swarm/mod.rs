@@ -68,8 +68,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub use scope::{
-    admit_blob_serve, BlobRecipient, BlobScopeRouter, ContentScope, ScopeRouteRefusal,
-    ServeAdmission, ServeRefusal,
+    admit_blob_serve, choose_scoped_carrier, BlobRecipient, BlobScopeRouter, CarrierChoice,
+    ContentScope, ScopeRouteRefusal, ScopedCarrier, ScopedPathShape, ServeAdmission, ServeRefusal,
+    SCOPED_CARRIER_SERVE_IDENTITY_LINK_ADMITTED,
 };
 
 /// Operator knobs for the swarm scheduler. Defaults match the
