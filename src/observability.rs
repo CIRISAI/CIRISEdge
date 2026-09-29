@@ -413,6 +413,16 @@ pub enum WithholdReason {
     /// folding this into [`Self::BlobArrivalScopeInsufficient`] would report a
     /// cross-group access attempt as an ordinary scope mismatch.
     BlobArrivalGroupMismatch,
+    /// CIRISEdge#718 (CC 5.4.6, CIRISConstitution#132) — a `BlobChunkFetch` on
+    /// the identity-plane link carried an in-link scope discriminator naming
+    /// NO derived address this node holds (unknown bytes, another member's
+    /// address, or any discriminator on a node without a table). Refused by
+    /// name at `BlobScopeRouter::scoped_arrival`.
+    BlobDiscriminatorUnheld,
+    /// CIRISEdge#718 — a `BlobChunkFetch` arrived ON a derived address AND
+    /// carried a discriminator: a mismatch (a body on the derived address needs
+    /// none; one that carries it names a path it did not take).
+    BlobDiscriminatorOnDerivedAddress,
     /// CIRISEdge#499 (swarm holdings plane) — the publisher could not determine
     /// a held content's SCOPE on a scope-native node, so it cannot know which
     /// peers are entitled to learn the holding exists. Fail-closed, and its own
@@ -601,6 +611,8 @@ impl WithholdReason {
             Self::BlobScopeUndeterminable => "blob_scope_undeterminable",
             Self::BlobArrivalScopeInsufficient => "blob_arrival_scope_insufficient",
             Self::BlobArrivalGroupMismatch => "blob_arrival_group_mismatch",
+            Self::BlobDiscriminatorUnheld => "blob_discriminator_unheld",
+            Self::BlobDiscriminatorOnDerivedAddress => "blob_discriminator_on_derived_address",
             Self::HoldingScopeUndeterminable => "holding_scope_undeterminable",
             Self::HoldingScopePublicGroup => "holding_scope_public_group",
             Self::HoldingScopePeerNotInRoster => "holding_scope_peer_not_in_roster",
@@ -941,6 +953,17 @@ pub struct EdgeMetrics {
     /// and `no_chunk_source_wired`. The serve-side twin of `blob_route_refusals`;
     /// the withhold ledger carries the same events keyed coarser.
     pub blob_serve_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) — which link
+    /// each scoped body rode, chosen ONCE per send from the path table:
+    /// `send:derived_address` (a one-hop path — the zero-observer path),
+    /// `send:identity_link` (only a forwarder's path — the members' E2E
+    /// identity-plane link, the room discriminated inside it),
+    /// `send:path_unknown_derived` (no path — never a forwarder on a guess);
+    /// and on the serve side `serve:identity_link_admitted` (a discriminator
+    /// resolved to THIS node's own address and stamped as the arrival). Both
+    /// branches are counted so neither can go silent; the refusals ride
+    /// `blob_serve_refusals` (`blob_serve_discriminator_*`).
+    pub blob_scoped_carriers: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#646 — where a pull found its holders, by `scope:source`:
     /// `self:author_nodes` / `family:author_nodes` (the row's author's nodes,
     /// no discovery — CC 5.2) vs `community:claim_index` /
@@ -1268,6 +1291,12 @@ impl EdgeMetrics {
             .or_insert(0) += 1;
     }
 
+    /// CIRISEdge#718 — count one scoped-carrier choice (or identity-link
+    /// admission) by its tag.
+    pub fn inc_blob_scoped_carrier(&self, tag: &'static str) {
+        *self.blob_scoped_carriers.write().entry(tag).or_insert(0) += 1;
+    }
+
     /// CIRISEdge#636 — count one bootstrap-door decision by its label.
     pub fn inc_bootstrap_door(&self, decision: &'static str) {
         *self
@@ -1530,6 +1559,12 @@ impl EdgeMetrics {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
+            blob_scoped_carriers: self
+                .blob_scoped_carriers
+                .read()
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
             bootstrap_door_outcomes: self
                 .bootstrap_door_outcomes
                 .read()
@@ -1599,6 +1634,9 @@ pub struct EdgeMetricsBundle {
     pub blob_route_refusals: HashMap<String, u64>,
     /// CIRISEdge#640 — `BlobChunkFetch`es received and not served, by branch.
     pub blob_serve_refusals: HashMap<String, u64>,
+    /// CIRISEdge#718 — which link each scoped body rode (`send:*`) and
+    /// identity-link admissions (`serve:identity_link_admitted`).
+    pub blob_scoped_carriers: HashMap<String, u64>,
     /// CIRISEdge#646 — where each pull found its holders, `scope:source`.
     pub blob_pull_sources: HashMap<String, u64>,
     /// CIRISEdge#717 — pulls that refused to store, by reason.

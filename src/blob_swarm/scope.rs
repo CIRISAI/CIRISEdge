@@ -502,7 +502,145 @@ impl BlobScopeRouter {
             }),
         }
     }
+
+    /// CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) — the
+    /// admission fact for a `BlobChunkFetch`, from what the transport stamped
+    /// AND what the body carried.
+    ///
+    /// The one place a discriminator becomes an arrival. Resolved against the
+    /// SAME [`ScopeAddressTable`] reverse index the derived-address arrival path
+    /// consults (`accepts_inbound`), plus the check that path gets for free from
+    /// the transport registering only this node's addresses: the named address
+    /// must be **this node's own** member address (`member_key_id == own`). The
+    /// reverse index holds every member's address, so without the own-check a
+    /// requester could name its own address and be served.
+    ///
+    /// | `arrival` | `discriminator` | result |
+    /// |---|---|---|
+    /// | `Some(a)` | `None` | `Ok(Some(a))` — derived-address arrival, as today |
+    /// | `None` | `None` | `Ok(None)` — federation arrival |
+    /// | `None` | `Some(d)` held by this node | `Ok(Some(d's InboundAddress))` — stamped as if arrived on `d` |
+    /// | `None` | `Some(d)` not held / no table | `Err(DiscriminatorUnheld)` |
+    /// | `Some(_)` | `Some(_)` | `Err(DiscriminatorOnDerivedAddress)` |
+    ///
+    /// # Errors
+    /// [`ServeRefusal::DiscriminatorUnheld`], [`ServeRefusal::DiscriminatorOnDerivedAddress`].
+    pub fn scoped_arrival(
+        &self,
+        arrival: Option<InboundAddress>,
+        discriminator: Option<&[u8; 16]>,
+        own_key_id: &str,
+    ) -> Result<Option<InboundAddress>, ServeRefusal> {
+        match (arrival, discriminator) {
+            (arrival, None) => Ok(arrival),
+            (Some(_), Some(_)) => Err(ServeRefusal::DiscriminatorOnDerivedAddress),
+            (None, Some(d)) => {
+                let Some(table) = self.table.as_ref() else {
+                    return Err(ServeRefusal::DiscriminatorUnheld);
+                };
+                match table.accepts_inbound(d) {
+                    Some(inbound) if inbound.member_key_id() == own_key_id => Ok(Some(inbound)),
+                    _ => Err(ServeRefusal::DiscriminatorUnheld),
+                }
+            }
+        }
+    }
 }
+
+// ─── CARRIER: which link a scoped body rides (CC 5.4.6 / CIRISConstitution#132) ──
+
+/// The shape of the path to a holder's ANNOUNCED destination, as leviculum's
+/// path table reports it at send time (CIRISEdge#718).
+///
+/// Read from the transport (`ReticulumTransport::scoped_path_shape`) and
+/// handed to [`choose_scoped_carrier`], which is the only place the shape
+/// turns into a decision. At the pin (leviculum v0.27.0+ciris.1) a receiver
+/// adds one to the wire hop count and installs the announce's `transport_id`
+/// as `next_hop` (`transport.rs:5673-5680`, `incoming_hop_count` `:8534`), so
+/// a directly attached neighbour is `hops == 1, next_hop == None`
+/// (`PathEntry::is_direct`, `storage_types.rs:55`) and anything a transport
+/// node rebroadcast is `hops > 1` with the node as `next_hop`
+/// (`PathEntry::needs_relay`, `:59`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScopedPathShape {
+    /// A one-hop path: the holder is a directly attached neighbour.
+    Direct {
+        /// Always `1` from the path table; carried for the log line.
+        hops: u8,
+    },
+    /// A multi-hop path through at least one transport node.
+    Forwarded {
+        /// The path's hop count (`> 1`).
+        hops: u8,
+        /// The first relay (`PathEntry::next_hop`), for the log line only.
+        /// Never used for addressing.
+        next_hop: [u8; 16],
+    },
+    /// No path entry for any of the holder's announced destinations.
+    Unknown,
+}
+
+/// The link a scoped body rides. Chosen ONCE per send by
+/// [`choose_scoped_carrier`], before any dial.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScopedCarrier {
+    /// The holder's scope-derived address, dialled directly — the
+    /// zero-observer path (CC 5.4.6). Byte-identical to pre-#718.
+    DerivedAddress,
+    /// The members' end-to-end encrypted identity-plane link to the holder's
+    /// announced destination, the room discriminated INSIDE the link
+    /// (`BlobChunkFetch::scope_discriminator`). Sanctioned only where no
+    /// direct path exists (CIRISConstitution#132).
+    IdentityLink,
+}
+
+/// A carrier choice with the reason it was made, for the counter and the log.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CarrierChoice {
+    /// The link to ride.
+    pub carrier: ScopedCarrier,
+    /// Stable, low-cardinality tag: the `blob_scoped_carriers` key.
+    pub reason_tag: &'static str,
+}
+
+/// CC 5.4.6 at `4fd2e9e` (CIRISConstitution#132) — decide, from the path
+/// table alone, which link a scoped body rides.
+///
+/// - **Direct** ⇒ the derived address. "A substrate MUST prefer the derived
+///   address whenever a direct link exists and MUST NOT route a scoped body
+///   through a forwarder when a direct path is available."
+/// - **Forwarded** ⇒ the identity-plane link. "Where the only path between two
+///   members runs through a non-member transport node … a scoped body MAY
+///   ride the members' identity-plane link."
+/// - **Unknown** ⇒ the derived address. No path is not "only a forwarder's
+///   path": a forwarder is never chosen on a guess. The broadcast dial reaches
+///   a directly attached neighbour whose announce has not landed yet, and
+///   nobody else — exactly pre-#718 behaviour, retried on the next round.
+///
+/// This is a decision, not a fallback: it is made before the dial, and a
+/// direct dial that fails transiently is NOT re-routed here (`FSD/CIRIS_EDGE_TRANSPORT.md`
+/// §3.4 I-3.4.2).
+#[must_use]
+pub const fn choose_scoped_carrier(shape: ScopedPathShape) -> CarrierChoice {
+    match shape {
+        ScopedPathShape::Direct { .. } => CarrierChoice {
+            carrier: ScopedCarrier::DerivedAddress,
+            reason_tag: "send:derived_address",
+        },
+        ScopedPathShape::Forwarded { .. } => CarrierChoice {
+            carrier: ScopedCarrier::IdentityLink,
+            reason_tag: "send:identity_link",
+        },
+        ScopedPathShape::Unknown => CarrierChoice {
+            carrier: ScopedCarrier::DerivedAddress,
+            reason_tag: "send:path_unknown_derived",
+        },
+    }
+}
+
+/// The `blob_scoped_carriers` key booked when a request on the identity-plane
+/// link is admitted through its in-link discriminator (CIRISEdge#718).
+pub const SCOPED_CARRIER_SERVE_IDENTITY_LINK_ADMITTED: &str = "serve:identity_link_admitted";
 
 // ─── SERVE: admission ahead of the parse ────────────────────────────
 
@@ -539,6 +677,18 @@ pub enum ServeRefusal {
         /// [`CohortScope::kind_token`] of the content's scope.
         content_kind: &'static str,
     },
+    /// CIRISEdge#718 (CC 5.4.6, CIRISConstitution#132) — the request arrived
+    /// on the identity-plane link carrying an in-link scope discriminator
+    /// that names NO derived address this node holds: bytes not in the
+    /// [`ScopeAddressTable`] at any live epoch, another member's address (the
+    /// reverse index holds every member's, so `accepts_inbound` alone is not
+    /// "held"), or any discriminator on a node with no table at all. Refused
+    /// by name; the wire answer is a typed `PolicyDenied` miss.
+    DiscriminatorUnheld,
+    /// CIRISEdge#718 — the request arrived ON a derived address AND carried a
+    /// discriminator. A body on the derived address needs none; one that
+    /// carries it names a path it did not take. A mismatch, refused.
+    DiscriminatorOnDerivedAddress,
 }
 
 impl ServeRefusal {
@@ -551,6 +701,8 @@ impl ServeRefusal {
             Self::ScopeUndeterminable => "blob_serve_scope_undeterminable",
             Self::ArrivalScopeInsufficient { .. } => "blob_serve_arrival_scope_insufficient",
             Self::GroupMismatch { .. } => "blob_serve_group_mismatch",
+            Self::DiscriminatorUnheld => "blob_serve_discriminator_unheld",
+            Self::DiscriminatorOnDerivedAddress => "blob_serve_discriminator_on_derived_address",
         }
     }
 
@@ -566,6 +718,12 @@ impl ServeRefusal {
             }
             Self::GroupMismatch { .. } => {
                 crate::observability::WithholdReason::BlobArrivalGroupMismatch
+            }
+            Self::DiscriminatorUnheld => {
+                crate::observability::WithholdReason::BlobDiscriminatorUnheld
+            }
+            Self::DiscriminatorOnDerivedAddress => {
+                crate::observability::WithholdReason::BlobDiscriminatorOnDerivedAddress
             }
         }
     }
@@ -592,6 +750,14 @@ impl std::fmt::Display for ServeRefusal {
                 "request arrived on a '{content_kind}'-scoped address derived from a \
                  DIFFERENT group's exporter_secret — possession of one group's secret \
                  proves nothing about another's (CIRISEdge#499)"
+            ),
+            Self::DiscriminatorUnheld => f.write_str(
+                "request on the identity-plane link carries a scope discriminator naming \
+                 NO derived address this node holds — refusing (CC 5.4.6, CIRISEdge#718)",
+            ),
+            Self::DiscriminatorOnDerivedAddress => f.write_str(
+                "request arrived ON a derived address and ALSO carries a scope \
+                 discriminator — a mismatch, refusing (CC 5.4.6, CIRISEdge#718)",
             ),
         }
     }
@@ -1448,5 +1614,152 @@ mod tests {
                  kept the old entry would leave a removed member's address routable (CC 5.4.3)",
             );
         }
+    }
+
+    // ── CARRIER + DISCRIMINATOR (CIRISEdge#718, CC 5.4.6 / CIRISConstitution#132) ──
+
+    /// The EXACT shapes the field produces (leviculum v0.27.0+ciris.1): a
+    /// direct neighbour is `hops == 1, next_hop == None`; a transport node's
+    /// rebroadcast is `hops == 2` with the node as `next_hop`; a peer whose
+    /// announce never landed has no entry.
+    #[test]
+    fn the_carrier_is_the_derived_address_at_one_hop_and_the_identity_link_beyond() {
+        let direct = choose_scoped_carrier(ScopedPathShape::Direct { hops: 1 });
+        assert_eq!(direct.carrier, ScopedCarrier::DerivedAddress);
+        assert_eq!(direct.reason_tag, "send:derived_address");
+
+        let forwarded = choose_scoped_carrier(ScopedPathShape::Forwarded {
+            hops: 2,
+            next_hop: [0xC0; 16],
+        });
+        assert_eq!(forwarded.carrier, ScopedCarrier::IdentityLink);
+        assert_eq!(forwarded.reason_tag, "send:identity_link");
+
+        // Three hops is still "forwarded" — the count is not the rule.
+        assert_eq!(
+            choose_scoped_carrier(ScopedPathShape::Forwarded {
+                hops: 3,
+                next_hop: [0xC1; 16],
+            })
+            .carrier,
+            ScopedCarrier::IdentityLink
+        );
+
+        // No path: the derived address, never a forwarder on a guess.
+        let unknown = choose_scoped_carrier(ScopedPathShape::Unknown);
+        assert_eq!(unknown.carrier, ScopedCarrier::DerivedAddress);
+        assert_eq!(unknown.reason_tag, "send:path_unknown_derived");
+    }
+
+    #[test]
+    fn no_discriminator_passes_the_arrival_through_unchanged() {
+        let t = table();
+        let router = BlobScopeRouter::new(Some(Arc::clone(&t)));
+        let arrival = arrival_for(&t, &CohortScope::Family, "fam-1");
+        let out = router
+            .scoped_arrival(Some(arrival.clone()), None, ALICE)
+            .expect("no discriminator is the derived-address path");
+        assert_eq!(out.as_ref().map(|a| a.group().group_id()), Some("fam-1"));
+        assert!(router
+            .scoped_arrival(None, None, ALICE)
+            .expect("federation arrival")
+            .is_none());
+    }
+
+    /// The positive: a discriminator naming THIS node's own address for the
+    /// room stamps the arrival, and the unchanged serve gate then admits the
+    /// room's content on it — the identity-link path behaves exactly like the
+    /// derived-address path downstream.
+    #[test]
+    fn a_discriminator_naming_this_nodes_own_address_stamps_the_arrival() {
+        let t = table();
+        let router = BlobScopeRouter::new(Some(Arc::clone(&t)));
+        let own = t
+            .send_address(&CohortScope::Family, "fam-1", ALICE)
+            .expect("alice's address");
+        let stamped = router
+            .scoped_arrival(None, Some(own.as_bytes()), ALICE)
+            .expect("own address is held")
+            .expect("stamped");
+        assert_eq!(stamped.member_key_id(), ALICE);
+        assert_eq!(stamped.group().group_id(), "fam-1");
+        assert_eq!(
+            admit_blob_serve(true, Some(&stamped), Some(&family_content())),
+            ServeAdmission::Admit,
+            "the serve gate admits on a discriminator-stamped arrival exactly as on a real one",
+        );
+        // And the same stamp refuses the OTHER room's content — the gate still gates.
+        assert!(matches!(
+            admit_blob_serve(true, Some(&stamped), Some(&community_content())),
+            ServeAdmission::Refuse(_)
+        ));
+    }
+
+    /// The forgery the own-check exists for: the reverse index holds EVERY
+    /// member's address, so `accepts_inbound` alone would accept a requester
+    /// naming its own address. Refused by name.
+    #[test]
+    fn a_discriminator_naming_another_members_address_is_unheld() {
+        let t = table();
+        let router = BlobScopeRouter::new(Some(Arc::clone(&t)));
+        let bobs = t
+            .send_address(&CohortScope::Family, "fam-1", BOB)
+            .expect("bob's address");
+        assert!(
+            t.accepts_inbound(bobs.as_bytes()).is_some(),
+            "precondition: the reverse index DOES hold bob's address — the trap is real",
+        );
+        assert!(matches!(
+            router.scoped_arrival(None, Some(bobs.as_bytes()), ALICE),
+            Err(ServeRefusal::DiscriminatorUnheld)
+        ));
+    }
+
+    #[test]
+    fn a_discriminator_naming_unknown_bytes_is_unheld() {
+        let t = table();
+        let router = BlobScopeRouter::new(Some(t));
+        assert!(matches!(
+            router.scoped_arrival(None, Some(&[0x5A; 16]), ALICE),
+            Err(ServeRefusal::DiscriminatorUnheld)
+        ));
+        assert_eq!(
+            ServeRefusal::DiscriminatorUnheld.reason_tag(),
+            "blob_serve_discriminator_unheld"
+        );
+    }
+
+    #[test]
+    fn a_discriminator_on_a_derived_address_arrival_is_a_mismatch() {
+        let t = table();
+        let router = BlobScopeRouter::new(Some(Arc::clone(&t)));
+        let arrival = arrival_for(&t, &CohortScope::Family, "fam-1");
+        let own = t
+            .send_address(&CohortScope::Family, "fam-1", ALICE)
+            .expect("alice's address");
+        assert!(matches!(
+            router.scoped_arrival(Some(arrival), Some(own.as_bytes()), ALICE),
+            Err(ServeRefusal::DiscriminatorOnDerivedAddress)
+        ));
+        assert_eq!(
+            ServeRefusal::DiscriminatorOnDerivedAddress.reason_tag(),
+            "blob_serve_discriminator_on_derived_address"
+        );
+    }
+
+    /// A legacy node holds no derived address, so it cannot verify a
+    /// discriminator: refused, never admitted as "unarmed".
+    #[test]
+    fn a_discriminator_on_a_legacy_node_is_unheld() {
+        let router = BlobScopeRouter::new(None);
+        assert!(matches!(
+            router.scoped_arrival(None, Some(&[0x11; 16]), ALICE),
+            Err(ServeRefusal::DiscriminatorUnheld)
+        ));
+        // The legacy federation path is untouched.
+        assert!(router
+            .scoped_arrival(None, None, ALICE)
+            .expect("federation")
+            .is_none());
     }
 }

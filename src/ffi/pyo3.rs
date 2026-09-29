@@ -2591,6 +2591,13 @@ impl PyEdge {
             pull_refusals.set_item(label.as_str(), *n)?;
         }
         root.set_item("blob_pull_refusals", pull_refusals)?;
+        // CIRISEdge#718 — which link each scoped body rode, and identity-link
+        // admissions (CC 5.4.6 / CIRISConstitution#132).
+        let scoped_carriers = pyo3::types::PyDict::new(py);
+        for (label, n) in &bundle.blob_scoped_carriers {
+            scoped_carriers.set_item(label.as_str(), *n)?;
+        }
+        root.set_item("blob_scoped_carriers", scoped_carriers)?;
         root.set_item(
             "replication_routed_to_responder_total",
             bundle.replication_routed_to_responder_total,

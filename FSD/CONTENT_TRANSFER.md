@@ -251,7 +251,8 @@ witness column is the work.
 | **R3** key reaches the member | `key_grant` set admitted, wraps projected to the member's occurrences | persist `apply_replicated_key_grant`; host wires `SealedContentWiring` | `key_grant set … projected as grants` (INFO) / `NotGranted` | `blob_federation_e2e::a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive`; `chat_harness_dx` (config shape) |
 | **R4** holder discovered | `holds_bytes` at community visibility, indexed with the row (v44.8.1) | persist `put_blob_scoped` | `NoHolders` | persist I113/I113c; `blob_federation_e2e::holds_bytes_says_possession_and_never_meaning` |
 | **R5** holder addressed | the room installed in the scope table (nodes, not persons); route to the derived address | host drives `ScopeLifecycle` with `snapshot_for_nodes` | `blob_group_not_installed` / `blob_holder_not_in_group` / `blob_holder_sealed_out` (`blob_route_refusals`) | `scope.rs::a_group_that_was_never_installed_is_named_as_such_not_as_a_membership_refusal`, `cohort_addressing::a_community_of_persons_installs_as_its_nodes` |
-| **R6** holder serves | arrival on the matching group; `chunk_scope` answered (`answers_scope`) | edge `admit_blob_serve`; host wires a scope-answering source | `blob_serve_scope_undeterminable` / `…arrival_scope_insufficient` / `…group_mismatch` (`blob_serve_refusals`); build refuses the unwired state | `scope.rs::a_scoped_blob_is_served_to_a_peer_arriving_on_the_matching_address`, `edge.rs::scope_native_gate_640` |
+| **R5′** carrier chosen (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132, CIRISEdge#718) | ONE choice per send, from the path table, BEFORE any dial: the holder's announced destination at **one hop** ⇒ the derived address (the zero-observer path, exactly R5); at **more than one hop** ⇒ the members' end-to-end encrypted **identity-plane link**, the room discriminated INSIDE the link (`BlobChunkFetch.scope_discriminator` = the holder's own derived address, in the envelope body); **no path** ⇒ the derived address (a forwarder is never chosen on a guess). Never a fallback after a failed direct dial | edge `blob_swarm::scope::choose_scoped_carrier` over `ReticulumTransport::scoped_path_shape` (`fetch_blob_chunk_scoped`) | none — both branches are counted (`blob_scoped_carriers`: `send:derived_address` / `send:identity_link` / `send:path_unknown_derived`) and logged with the hop count; a transient direct-link failure stays `NoRouteToPeer` and never re-routes | `scope.rs::the_carrier_is_the_derived_address_at_one_hop_and_the_identity_link_beyond`, `reticulum.rs::scoped_path_shape_tests`, `scoped_body_identity_link_718.rs` (three nodes on real Reticulum, C a non-member transport node) |
+| **R6** holder serves | arrival on the matching group; `chunk_scope` answered (`answers_scope`). A request on the identity-plane link is admitted **only if** its in-link discriminator names a derived address THIS node holds (own member address, any live epoch — the same `ScopeAddressTable` reverse index the arrival path consults); then it is stamped as that arrival and every gate below reads it identically. A discriminator on a frame that ALSO arrived on a derived address is a mismatch | edge `BlobScopeRouter::scoped_arrival` → `admit_blob_serve`; host wires a scope-answering source | `blob_serve_scope_undeterminable` / `…arrival_scope_insufficient` / `…group_mismatch` / **`…discriminator_unheld`** / **`…discriminator_on_derived_address`** (`blob_serve_refusals`); build refuses the unwired state | `scope.rs::a_scoped_blob_is_served_to_a_peer_arriving_on_the_matching_address`, `scope.rs::a_discriminator_*`, `edge.rs::scope_native_gate_640`, `scoped_body_identity_link_718.rs::a_forged_discriminator_is_refused_by_name` |
 | **R7** bytes adopted | sha verified, size bounded; provenance from the row + pointer, minter derived; `is_audience` community arm | persist `adopt_sealed_blob`; edge `pull.rs::adopt_sealed` | `StoreFailed(NotPartyTo)`, `size ≠ stored length` (AV-89) | persist I121–I135; `pull.rs::a_pointer_only_chat_row_keeps_the_pointers_tier_and_community`, `the_minter_is_never_transcribed_from_the_author` |
 | **R8** reader opens | wrap for the viewer's occurrence, AAD rebuilt from the row | edge `group_content` | `Body::Unopened { reason }` | `blob_federation_e2e::a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive`; ladder `arrived` / `hamburger` |
 | **R9** withdraw reaches holders | `withdraws` re-verified against the held row; bytes evicted, refused `Withdrawn` | edge `revocation`, persist `delete_blob` | `Revoked` / `Withdrawn` | `blob_federation_e2e::a_withdraws_revokes_the_bytes_on_a_holder_and_an_unauthorized_one_is_inert`, `revocation.rs::a_blob_is_revoked_only_when_every_known_reference_is_withdrawn` |
@@ -1060,6 +1061,23 @@ spellings at once.
     one convergence window. *Mutant:* both create → the later CreationClaim never abandons → B's fetch
     routes to an address A never registered → `mine_on_b` red at R5 with `blob_group_not_installed`
     on A's side reading healthy: exactly the CIRISEdge#646 shape this document exists to prevent.
+12. **The derived address is preferred whenever a direct link exists; a forwarder is never chosen
+    on a guess, and never as a fallback** (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132). The carrier
+    is chosen ONCE per send from the path table (`hops == 1` ⇒ derived address; `hops > 1` ⇒
+    identity-plane link; no path ⇒ derived address). *Mutant:* re-route to the identity link after
+    a failed direct dial → the negative control (an A–B direct link present, C a transport node)
+    finds `send:identity_link > 0` or a relayed link on C → red.
+13. **The forwarder is handed nothing that names the room.** The discriminator lives in the
+    envelope body, inside the link encryption; it is never a packet header, an announce, a path
+    request, or resource-advertisement metadata, and the transport node retains only its
+    transport link table (link id, interfaces, hop counts, the ANNOUNCED destination). *Mutant:*
+    put the discriminator on the dial target → C's path/link tables carry a derived address →
+    `scoped_body_identity_link_718.rs` reds on C's tables, not on a log line.
+14. **A discriminator is admitted against the same table as an arrival, and only for an address
+    this node holds.** The reverse index holds EVERY member's address (so a peer's own address is
+    in it); the discriminator path therefore also checks `member_key_id == own`. *Mutant:* drop
+    the own-check → a requester naming ITS OWN address is served → the forged-discriminator
+    witness reds.
 
 ## 8. Observability — what a run must be able to say
 
@@ -1072,6 +1090,7 @@ spellings at once.
 | **`blob_pull_sources`** `scope:source` (`author_nodes` / `claim_index`) | R4 | ✓ v29.4.0 (metrics snapshot + PyO3 dict) |
 | `blob_route_refusals` (`blob_group_not_installed` / `…not_in_group` / `…sealed_out`) | R5 | ✓ v26.2.0 |
 | `blob_serve_refusals` | R6 | ✓ v27.0.0 |
+| `blob_scoped_carriers` (`send:derived_address` / `send:identity_link` / `send:path_unknown_derived` / `serve:identity_link_admitted`); `blob_serve_refusals` `…discriminator_unheld` / `…discriminator_on_derived_address`; line `scoped fetch carrier chosen` (holder, hops, next_hop, carrier, reason) | R5′ / R6 | ✓ (CIRISEdge#718) |
 | `scope lifecycle INSTALLED / ADVANCED / REFRESHED` (scope, group, epoch, members, added/removed) | R5 | ✓ v26.2.0 / v29.2.0 (#648); self room: — |
 | `self room CREATED / JOINED / ABANDONED(claim)` (identity, creator, claim) | R5 | — (the host logs what `self_room::decide` named; the decision itself is a pure value) |
 | `blob meaning projected` with `group_id` provenance (`identity` / `family_id` / `community`) | R5 | — |
@@ -1140,6 +1159,17 @@ template: it is green because each rung has a witness, not because a run passed.
 
 ## 13. Changelog
 
+- **2026-09-29 (CIRISEdge#718 — CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132 ruled (a)).** Rung
+  **R5′** added: a scoped body rides the members' end-to-end encrypted identity-plane link when the
+  only path to the holder runs through a non-member transport node, the room discriminated inside
+  the link and admitted at R6 against the same `ScopeAddressTable` the arrival path consults. The
+  derived address stays the zero-observer path and is chosen whenever the path table says one hop;
+  the choice is made once per send, never as a fallback. Invariants 12–14; two R6 refusals by name;
+  `blob_scoped_carriers`. The direct-handoff clause of the ruling has no mechanism at v34
+  (`TransportDestination` carries no interface endpoint, leviculum has no NAT traversal), so the
+  ciphertext-relay branch is the shipped behaviour and the handoff is a follow-up on the ticket.
+  Evidence row `CLM-scoped-body-identity-link` carried in `evidence/CIRISEdge.cc_impl.tsv`.
+  Witness: `tests/scoped_body_identity_link_718.rs` (A and B each dial C, never each other).
 - **2026-09-23 (v30.1.0: adopt persist v46.5.0 + v47.0.0).** The community drive is open and
   witnessed (R10, §6.8.1); `DriveGateUnavailable` is deleted with its cause. `affiliations` is a
   room at every gate (§4.1 census all ✓): `With::Affiliations { community_key_id }`, and edge's

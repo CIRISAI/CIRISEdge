@@ -224,6 +224,133 @@ table arms every scope-native path at once — transport inbound admission, blob
 router + serve gate, swarm holdings gate — so "which addresses I answer on" and
 "which I send to" cannot drift ([`edge.rs:6214`](../src/edge.rs)).
 
+### 3.4 A scoped body across a forwarder — the identity-plane link with an in-link discriminator (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132, CIRISEdge#718)
+
+**The rule (CC 5.4.6, ruled (a)).** The derived address is the zero-observer path: where
+a direct link exists between two members, a scoped body crosses it and nothing else. Where
+the only path between two members runs through a non-member transport node, a scoped body
+MAY ride the members' **identity-plane link** — end-to-end encrypted between the two
+endpoints, the room discriminated *inside* the link encryption, admitted by the receiver
+against the same address table the derived-address arrival path consults. Nothing about
+the derived address is emitted, resolved or retained by anyone. A substrate MUST prefer
+the derived address whenever a direct link exists and MUST NOT route a scoped body through
+a forwarder when a direct path is available. The intermediary's only role is reachability.
+
+**What "scoped body" is in edge.** Every scoped body is the blob plane: a chat message's
+sealed body and a room file both move as `BlobChunkFetch` → `BlobChunkBody` between a
+puller and a holder (`FSD/CONTENT_TRANSFER.md` §2, R5–R8). The chat ROW itself is a
+replication row and already rides identity-plane rounds. The whole class of derived-address
+sends is therefore ONE funnel — `resolve_holder_routes` → `BlobRecipient` →
+`Edge::fetch_blob_chunk_scoped` → `ReticulumTransport::send_to_scoped_destination`
+([`edge.rs:3785`](../src/edge.rs), [`blob_swarm/mod.rs:1450`](../src/blob_swarm/mod.rs))
+— and ONE admission seam — `InboundFrame::arrival_scope`, stamped by the transport from
+the link's destination hash ([`reticulum.rs:7273`](../src/transport/reticulum.rs)) and read
+by the `BlobChunkFetch` responder's `admit_blob_serve` ([`edge.rs:6291`](../src/edge.rs)).
+The `BlobChunkBody` answer rides the reply path of whichever link the request came in on.
+
+**The send-side choice — once per send, from the path table, before any dial.**
+
+| the holder's announced destination in leviculum's path table | carrier | reason tag |
+|---|---|---|
+| a path with `hops == 1` (`PathEntry::is_direct`) | the **derived address**, exactly as before (`send_to_scoped_destination`) | `send:derived_address` |
+| a path with `hops > 1` and a `next_hop` (`PathEntry::needs_relay`) | the **identity-plane link** (`Transport::send` to the holder's `key_id` — reverse path first, else the pathed announced destination), the discriminator in the envelope body | `send:identity_link` |
+| no path entry | the **derived address** (a forwarder is never chosen on a guess; a broadcast dial reaches a directly attached neighbour and no one else) | `send:path_unknown_derived` |
+
+The decision is `blob_swarm::scope::choose_scoped_carrier(ScopedPathShape)`
+([`blob_swarm/scope.rs:624`](../src/blob_swarm/scope.rs)), a pure
+function over `ReticulumTransport::scoped_path_shape(key_id)` — the shape of the best path
+among the peer's dial candidates, read with leviculum's `get_path_clone`. **It is not a
+fallback**: a direct dial that fails transiently reports `NoRouteToPeer` and is retried by
+the scheduler on the same carrier; nothing re-routes a failed derived-address send through
+a forwarder, because "the direct link failed just now" is not "no direct path exists".
+
+*What `hops == 1` means at the pin (leviculum v0.27.0+ciris.1).* The receiver adds one to
+the wire hop count (`Transport::incoming_hop_count`, `leviculum-core/src/transport.rs:8534-8544`)
+and installs the path with that count and the announce's `transport_id` as `next_hop`
+(`transport.rs:5673-5680`); an originator emits `hops = 0`, so a directly attached
+neighbour learns `hops = 1, next_hop = None`, and a transport node's rebroadcast lands as
+`hops = 2, next_hop = <that node>`. `PathEntry::is_direct()` is exactly `hops == 1`
+(`leviculum-core/src/storage_types.rs:55-57`) and `needs_relay()` is `hops > 1 &&
+next_hop.is_some()` (`:59-62`); leviculum's own `send_to_destination` reads the same entry
+at send time (`transport.rs:3665-3690`), and `get_path_clone` is a clone taken under the
+storage borrow, consistent at the call.
+
+**The discriminator.** `BlobChunkFetch.scope_discriminator: Option<[u8; 16]>` — the
+holder's OWN derived address for the room at the puller's send epoch, the same 16 bytes
+the puller would otherwise have dialled (`BlobRecipient::scoped_address`). It is a field of
+the signed envelope body: inside the Reticulum link payload, so inside the link encryption;
+signed by the requester, so not forgeable in transit. It is absent on the derived-address
+carrier. It is never a packet header, never an announce, never a path request, never
+resource-advertisement metadata — if it ever appears on the packet path that is a bug.
+
+**The admission rule** (`BlobScopeRouter::scoped_arrival`, [`blob_swarm/scope.rs:528`](../src/blob_swarm/scope.rs)),
+evaluated by the `BlobChunkFetch` responder BEFORE `admit_blob_serve`, which then runs
+unchanged on the result:
+
+| `arrival_scope` (link dest ∈ reverse index) | `scope_discriminator` in the body | result |
+|---|---|---|
+| `Some(a)` | absent | `Some(a)` — the derived-address arrival, as today |
+| `None` | absent | `None` — federation arrival, reads as `Public` |
+| `None` | `Some(d)` where `ScopeAddressTable::accepts_inbound(d)` names THIS node's own member address (any live epoch) | `Some(that InboundAddress)` — stamped as if the frame had arrived on `d`; the serve gate, blob router and holdings gate behave identically; counted `serve:identity_link_admitted` |
+| `None` | `Some(d)` naming no address this node holds — unknown bytes, OR another member's address (the reverse index holds every member's address, so `accepts_inbound` alone is not "held") | **refuse** `blob_serve_discriminator_unheld` (`WithholdReason::BlobDiscriminatorUnheld`), typed miss `PolicyDenied` |
+| `Some(_)` | `Some(_)` | **refuse** `blob_serve_discriminator_on_derived_address` — a mismatch: a body on the derived address needs no discriminator, and one that carries it names a path it did not take |
+| no table installed | `Some(_)` | **refuse** `blob_serve_discriminator_unheld` — a legacy node holds no derived address and cannot verify scope |
+
+Arrival on a derived address proves possession of the group's `exporter_secret` because
+the transport only registers this node's own addresses; a discriminator proves the same
+thing only after the own-address check, which is why that check is part of the rule.
+
+**What the forwarder can and cannot observe.** The link key is HKDF over the X25519 shared
+secret of the two endpoints' *ephemeral* keys, salted by the link id
+(`leviculum-core/src/link/mod.rs:806-809` responder, `:1941-1944` initiator,
+`derive_link_key` at `:2013-2017`); no transport node holds either ephemeral private half.
+A transport node that relays a link request inserts a `LinkEntry` — link id, the two
+interface indices, hop counts, proof deadline, the **announced** destination hash, the
+responder's announce-cached signing key (`leviculum-core/src/storage_types.rs:67-91`,
+inserted at `transport.rs:6211-6226`) — and forwards every subsequent link packet by link
+id, the packet bytes unchanged apart from the hop count (`transport.rs:7094-7220`,
+`forward_on_interface_from`). So, per CC 1.13.3.1 at federation scope, it learns: that a
+link exists between two announced endpoints, and that ciphertext flows on it at certain
+times and sizes. It cannot read the body, cannot tell a room body from a replication
+round, and holds no identifier that names the room — no derived address enters its path
+table, link table, announce cache or directory, because none is ever dialled, announced or
+path-requested. What it could do is traffic analysis across a clique of member links; the
+record layer's diversified ids and cover framing (CC 5.4.2/5.4.3) are the payload answer,
+and the blinded-retained-state family (Tor v3 / I2P b33) is the roadmap answer for the
+endpoint correlation. Edge claims neither.
+
+**The direct-handoff clause has no mechanism at v34** — stated on the ticket: the
+`TransportDestination` row carries the RNS destination hash and `transport_kind`, never an
+interface endpoint; a path response reveals the next hop, not the peer's address;
+leviculum has no NAT traversal. So a link established through a forwarder cannot be
+brought direct afterwards. The ciphertext-relay branch is the shipped behaviour; a
+shared-interface handoff is the follow-up and needs leviculum's cooperation.
+
+**Invariants (named).**
+
+- **I-3.4.1 Direct-preferred.** `scoped_path_shape == Direct` ⇒ the derived address, always.
+  Witness: `tests/scoped_body_identity_link_718.rs::a_direct_link_keeps_the_body_on_the_derived_address`
+  (with an A–B link present, `send:identity_link == 0` and C's relayed link table is empty).
+- **I-3.4.2 Never a fallback.** The carrier is decided before the dial; no code path
+  re-routes after a failed direct dial. Witness: `choose_scoped_carrier` is the only
+  producer of the choice and `fetch_blob_chunk_scoped` calls it once.
+- **I-3.4.3 In-link only.** The discriminator exists in `BlobChunkFetch`'s body and
+  nowhere else; the dial target on the identity-link carrier is the holder's announced
+  destination. Witness: C's path table and relayed link table hold no derived address
+  (`forwarded_room_body_rides_the_identity_plane_link`).
+- **I-3.4.4 Same table, own address.** A discriminator is resolved by
+  `ScopeAddressTable::accepts_inbound` AND `member_key_id == own`; nothing else stamps an
+  arrival. Witness: `a_forged_discriminator_is_refused_by_name` (a random address and the
+  requester's own address are both `blob_serve_discriminator_unheld`).
+- **I-3.4.5 Mismatch refuses.** A discriminator on a derived-address arrival is refused.
+  Witness: `scope.rs::a_discriminator_on_a_derived_address_arrival_is_a_mismatch`.
+- **I-3.4.6 Both branches counted.** `blob_scoped_carriers` moves on every choice and every
+  identity-link admission; a refusal is booked in `blob_serve_refusals` and the withhold
+  ledger. No branch is silent.
+
+Evidence row: `CLM-scoped-body-identity-link` (CC 5.4.6) in `evidence/CIRISEdge.cc_impl.tsv`,
+generated from `field_conformance::EDGE_CC_CLAIM_CONFORMANCE`.
+
 ---
 
 ## 4. The anti-entropy replication session (OSI 5)
@@ -929,6 +1056,10 @@ one the network cannot express breaking.*
    disclose more than the original fact — §3.2, CIRISPersist#713).
 7. **PQC-mandatory** — hybrid Ed25519 + ML-DSA-65 for authenticity; item-2 requires
    the ML-DSA transport binding.
+8. **A scoped body never touches a forwarder while a direct path exists, and a forwarder
+   is never handed anything that names the room** — the derived address at one hop, the
+   identity-plane link with an in-link discriminator beyond it, chosen once from the path
+   table and admitted against the same `ScopeAddressTable` (§3.4, CC 5.4.6 at `4fd2e9e`).
 
 ---
 

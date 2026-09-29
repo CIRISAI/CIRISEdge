@@ -102,6 +102,39 @@ pub const EDGE_FIELD_CONFORMANCE: &[FieldConformance] = &[
     },
 ];
 
+/// CIRISEdge#718 — a Constitution claim edge resolves OUTSIDE persist's
+/// field-processor matrix: the claim is on a TRANSPORT rule (CC 5.4.6), not
+/// on a manifest field, so it cannot ride [`EDGE_FIELD_CONFORMANCE`] (whose
+/// rows are cross-checked against `field_processor_matrix` by
+/// `no_conformance_entry_is_stale`). Same discipline otherwise: a pure check
+/// that exercises the LIVE decision the evidence anchor names, emitted into
+/// the same `CIRISEdge.cc_impl.tsv` by [`edge_evidence_rows`].
+pub struct ClaimConformance {
+    /// The CC section the claim lives in.
+    pub cc: &'static str,
+    /// The `CLM-*` claim id, exactly as `constitution/claims.tsv` names it.
+    pub clm: &'static str,
+    /// The property the check proves.
+    pub property: &'static str,
+    /// The check — `Ok(())` conformant, `Err(reason)` a violation.
+    pub check: fn() -> Result<(), String>,
+    /// The `path#symbol` evidence anchor.
+    pub evidence: &'static str,
+}
+
+/// The transport-rule claims edge carries evidence for (CIRISEdge#718).
+pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[ClaimConformance {
+    cc: "5.4.6",
+    clm: "CLM-scoped-body-identity-link",
+    property:
+        "a scoped body rides the derived address at one hop and the identity-plane link only \
+               beyond it, chosen once from the path table; an in-link discriminator is admitted \
+               against the same ScopeAddressTable and only for an address this node holds; a \
+               discriminator on a derived-address arrival is a mismatch",
+    check: check_scoped_body_identity_link,
+    evidence: "src/blob_swarm/scope.rs#choose_scoped_carrier",
+}];
+
 /// Every edge-tagged field edge does NOT process with a runtime value-check —
 /// each with the concrete upstream reason. Deferring is NOT skipping: the field
 /// is still ACCOUNTED FOR (the completeness test asserts it), and the reason names
@@ -217,6 +250,16 @@ pub fn edge_evidence_rows() -> Vec<String> {
                 env!("CARGO_PKG_VERSION"),
             )
         }))
+        // CIRISEdge#718 — the transport-rule claims, same row shape.
+        .chain(EDGE_CC_CLAIM_CONFORMANCE.iter().map(|c| {
+            format!(
+                "{}\t{}\tCIRISEdge\t{}\tciris-edge@v{}",
+                c.cc,
+                c.clm,
+                c.evidence,
+                env!("CARGO_PKG_VERSION"),
+            )
+        }))
         .collect()
 }
 
@@ -232,6 +275,11 @@ pub fn run_edge_field_conformance() -> Result<(), Vec<String>> {
             violations.push(format!("{}: {reason}", c.field));
         }
     }
+    for c in EDGE_CC_CLAIM_CONFORMANCE {
+        if let Err(reason) = (c.check)() {
+            violations.push(format!("{}: {reason}", c.clm));
+        }
+    }
     if violations.is_empty() {
         Ok(())
     } else {
@@ -240,6 +288,89 @@ pub fn run_edge_field_conformance() -> Result<(), Vec<String>> {
 }
 
 // ─── the pure value-semantics checks ────────────────────────────────────────
+
+/// CIRISEdge#718 — `CLM-scoped-body-identity-link` (CC 5.4.6 at `4fd2e9e`,
+/// CIRISConstitution#132), against the LIVE decision and admission functions.
+fn check_scoped_body_identity_link() -> Result<(), String> {
+    const OWN: &str = "ed25519:own-node";
+    const PEER: &str = "ed25519:peer-node";
+    use crate::blob_swarm::{
+        choose_scoped_carrier, BlobScopeRouter, ScopedCarrier, ScopedPathShape, ServeRefusal,
+    };
+    use crate::cohort_scope::CohortScope;
+    use crate::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
+    use std::sync::Arc;
+
+    // The send-side choice, on the exact shapes the path table produces.
+    if choose_scoped_carrier(ScopedPathShape::Direct { hops: 1 }).carrier
+        != ScopedCarrier::DerivedAddress
+    {
+        return Err("a one-hop path must ride the derived address (MUST prefer it)".into());
+    }
+    if choose_scoped_carrier(ScopedPathShape::Forwarded {
+        hops: 2,
+        next_hop: [0xC0; 16],
+    })
+    .carrier
+        != ScopedCarrier::IdentityLink
+    {
+        return Err("a forwarded-only path must ride the identity-plane link".into());
+    }
+    if choose_scoped_carrier(ScopedPathShape::Unknown).carrier != ScopedCarrier::DerivedAddress {
+        return Err("no path must never choose a forwarder on a guess".into());
+    }
+
+    // The admission, against a real table (the production deriver).
+    let table = Arc::new(ScopeAddressTable::new(Arc::new(ScopePrivacyDeriver)));
+    table
+        .install_group(
+            &CohortScope::Family,
+            "fam-718",
+            1,
+            &[0x7E; 32],
+            &[OWN, PEER],
+        )
+        .map_err(|e| format!("install: {e}"))?;
+    let router = BlobScopeRouter::new(Some(Arc::clone(&table)));
+    let own = table
+        .send_address(&CohortScope::Family, "fam-718", OWN)
+        .ok_or("own address")?;
+    let peers = table
+        .send_address(&CohortScope::Family, "fam-718", PEER)
+        .ok_or("peer address")?;
+    match router.scoped_arrival(None, Some(own.as_bytes()), OWN) {
+        Ok(Some(a)) if a.member_key_id() == OWN && a.group().group_id() == "fam-718" => {}
+        other => return Err(format!("own address must stamp the arrival, got {other:?}")),
+    }
+    if !matches!(
+        router.scoped_arrival(None, Some(peers.as_bytes()), OWN),
+        Err(ServeRefusal::DiscriminatorUnheld)
+    ) {
+        return Err("another member's address is not held by this node — must refuse".into());
+    }
+    if !matches!(
+        router.scoped_arrival(None, Some(&[0x11; 16]), OWN),
+        Err(ServeRefusal::DiscriminatorUnheld)
+    ) {
+        return Err("unknown bytes must refuse by name".into());
+    }
+    let arrived = table
+        .accepts_inbound(own.as_bytes())
+        .ok_or("reverse index")?;
+    if !matches!(
+        router.scoped_arrival(Some(arrived), Some(own.as_bytes()), OWN),
+        Err(ServeRefusal::DiscriminatorOnDerivedAddress)
+    ) {
+        return Err("a discriminator on a derived-address arrival is a mismatch".into());
+    }
+    if !matches!(
+        BlobScopeRouter::new(None).scoped_arrival(None, Some(own.as_bytes()), OWN),
+        Err(ServeRefusal::DiscriminatorUnheld)
+    ) {
+        return Err("a legacy node holds no derived address — must refuse".into());
+    }
+    Ok(())
+}
 
 fn check_delivery_mode() -> Result<(), String> {
     use crate::delivery_mode::{decide, DeliveryDecision};

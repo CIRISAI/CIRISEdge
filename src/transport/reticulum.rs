@@ -1357,6 +1357,37 @@ struct DialCandidate {
     source: DialSource,
 }
 
+/// CIRISEdge#718 — the pure half of [`ReticulumTransport::scoped_path_shape`]:
+/// from the `(hops, next_hop)` of every path entry the peer's dial candidates
+/// resolve to, the shape the scoped-carrier choice is made on.
+///
+/// `hops <= 1` is a direct path (`PathEntry::is_direct` is `hops == 1`; `0`
+/// only ever names a local destination and is treated as direct rather than
+/// as a forwarder). `hops > 1` WITH a `next_hop` is a relayed path
+/// (`PathEntry::needs_relay`); the fewest hops wins. A `hops > 1` entry with
+/// no `next_hop` cannot be routed by leviculum either, so it counts for
+/// nothing here.
+fn scoped_path_shape_from_paths(
+    paths: &[(u8, Option<[u8; 16]>)],
+) -> crate::blob_swarm::ScopedPathShape {
+    use crate::blob_swarm::ScopedPathShape;
+    if let Some((hops, _)) = paths
+        .iter()
+        .filter(|(h, _)| *h <= 1)
+        .min_by_key(|(h, _)| *h)
+    {
+        return ScopedPathShape::Direct { hops: *hops };
+    }
+    paths
+        .iter()
+        .filter_map(|(h, nh)| nh.map(|nh| (*h, nh)))
+        .filter(|(h, _)| *h > 1)
+        .min_by_key(|(h, _)| *h)
+        .map_or(ScopedPathShape::Unknown, |(hops, next_hop)| {
+            ScopedPathShape::Forwarded { hops, next_hop }
+        })
+}
+
 /// CIRISEdge#336 (v13.8.0) — ROUTE-TABLE-FIRST dial selection: the pure
 /// decision that makes "dial an unroutable dest while a routable one exists"
 /// impossible by construction. Input is the candidate list as
@@ -3945,6 +3976,74 @@ impl ReticulumTransport {
     #[must_use]
     pub fn inbound_scope(&self, dest_hash: &[u8; 16]) -> Option<InboundAddress> {
         self.scope_addresses.get()?.accepts_inbound(dest_hash)
+    }
+
+    /// CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) — the shape
+    /// of the path to `destination_key_id`'s ANNOUNCED destination(s), read
+    /// from leviculum's path table right now, for the scoped-carrier choice
+    /// (`blob_swarm::scope::choose_scoped_carrier`).
+    ///
+    /// Every dial candidate (`resolve_dial_candidates`: the announce-cached
+    /// dest, the explicit-hash dest, the computed named dest) is looked up with
+    /// `ReticulumNode::get_path_clone` — a clone taken under the storage lock,
+    /// consistent at the call — and the BEST path wins: any one-hop entry makes
+    /// the peer `Direct`; otherwise the fewest-hop relayed entry makes it
+    /// `Forwarded`; no entry at all is `Unknown`. The derived address itself is
+    /// never looked up (it is announce-suppressed and has no path by design).
+    ///
+    /// What the numbers mean at the pin (leviculum v0.27.0+ciris.1): the
+    /// receiver adds one to the wire hop count (`incoming_hop_count`,
+    /// `transport.rs:8534`) and installs the announce's `transport_id` as
+    /// `next_hop` (`transport.rs:5673-5680`); `PathEntry::is_direct` is exactly
+    /// `hops == 1` (`storage_types.rs:55`) and `needs_relay` is `hops > 1 &&
+    /// next_hop.is_some()` (`:59`). A directly attached neighbour therefore
+    /// reads `hops == 1`; a transport node's rebroadcast reads `hops == 2`
+    /// with that node as `next_hop`.
+    pub async fn scoped_path_shape(
+        &self,
+        destination_key_id: &str,
+    ) -> crate::blob_swarm::ScopedPathShape {
+        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        let paths: Vec<(u8, Option<[u8; 16]>)> = candidates
+            .iter()
+            .filter_map(|c| self.node.get_path_clone(&c.dest_hash))
+            .map(|p| (p.hops, p.next_hop))
+            .collect();
+        scoped_path_shape_from_paths(&paths)
+    }
+
+    /// CIRISEdge#718 test seam — what a TRANSPORT NODE can say about the
+    /// traffic it carried: leviculum's `packets_forwarded` counter and the
+    /// byte counters its interface I/O tasks keep, summed. A witness reads
+    /// this on the non-member forwarder to prove, from the forwarder's own
+    /// side, that a scoped body did (forwarded path) or did not (direct path)
+    /// cross it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn relay_observation_for_test(&self) -> (u64, u64) {
+        let forwarded = self.node.transport_stats().packets_forwarded();
+        let bytes = self
+            .node
+            .interface_stats()
+            .iter()
+            .map(|i| i.rx_bytes + i.tx_bytes)
+            .sum();
+        (forwarded, bytes)
+    }
+
+    /// CIRISEdge#718 test seam — every `(destination_hash, hops, next_hop)`
+    /// row of this node's path table, so a witness can assert what a
+    /// NON-MEMBER transport node retains (nothing naming a room: no derived
+    /// address ever enters its path table, because none is announced or
+    /// path-requested).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn path_table_rows_for_test(&self) -> Vec<([u8; 16], u8, Option<[u8; 16]>)> {
+        self.node
+            .path_table_entries()
+            .into_iter()
+            .map(|e| (e.hash, e.hops, e.next_hop))
+            .collect()
     }
 
     /// spec. Returns a `Vec<TransportSpec>` of `(handle, kind)` pairs.
@@ -14061,5 +14160,74 @@ mod link_reuse_tests {
         *gates.entry(dest(1)).or_default() += 1;
         assert_eq!(gates.len(), 2, "two peers must get two independent gates");
         assert_eq!(gates[&dest(1)], 2, "same peer shares one gate");
+    }
+}
+
+/// CIRISEdge#718 — the path-table inputs the field produces, exactly
+/// (leviculum v0.27.0+ciris.1: a direct neighbour installs `hops = 1,
+/// next_hop = None`; a transport node's rebroadcast installs `hops = 2,
+/// next_hop = Some(node)`; an unheard peer has no entry).
+#[cfg(test)]
+mod scoped_path_shape_tests {
+    use super::scoped_path_shape_from_paths;
+    use crate::blob_swarm::ScopedPathShape;
+
+    const RELAY: [u8; 16] = [0xC0; 16];
+
+    #[test]
+    fn a_direct_neighbour_is_direct() {
+        assert_eq!(
+            scoped_path_shape_from_paths(&[(1, None)]),
+            ScopedPathShape::Direct { hops: 1 }
+        );
+    }
+
+    #[test]
+    fn a_transport_nodes_rebroadcast_is_forwarded() {
+        assert_eq!(
+            scoped_path_shape_from_paths(&[(2, Some(RELAY))]),
+            ScopedPathShape::Forwarded {
+                hops: 2,
+                next_hop: RELAY
+            }
+        );
+    }
+
+    #[test]
+    fn no_entry_is_unknown() {
+        assert_eq!(scoped_path_shape_from_paths(&[]), ScopedPathShape::Unknown);
+    }
+
+    /// Two candidates for one peer (the announce-cached dest at two hops via
+    /// the canonical, the computed named dest heard directly): the direct
+    /// one wins — "MUST prefer the derived address whenever a direct link
+    /// exists" is decided on the BEST path, not the first candidate.
+    #[test]
+    fn any_direct_path_beats_a_relayed_one() {
+        assert_eq!(
+            scoped_path_shape_from_paths(&[(2, Some(RELAY)), (1, None)]),
+            ScopedPathShape::Direct { hops: 1 }
+        );
+    }
+
+    #[test]
+    fn the_fewest_hop_relay_wins_among_relayed_paths() {
+        assert_eq!(
+            scoped_path_shape_from_paths(&[(3, Some([0xC1; 16])), (2, Some(RELAY))]),
+            ScopedPathShape::Forwarded {
+                hops: 2,
+                next_hop: RELAY
+            }
+        );
+    }
+
+    /// A multi-hop entry with no next hop is unroutable by leviculum too
+    /// (`needs_relay` requires `next_hop`); it must not read as forwarded.
+    #[test]
+    fn a_relayed_entry_without_a_next_hop_counts_for_nothing() {
+        assert_eq!(
+            scoped_path_shape_from_paths(&[(2, None)]),
+            ScopedPathShape::Unknown
+        );
     }
 }
