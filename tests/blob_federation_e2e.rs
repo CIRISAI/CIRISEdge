@@ -4233,12 +4233,16 @@ mod files {
         }
     }
 
-    /// D9 — a chunked file's descriptor binds to the MANIFEST, and a viewer
-    /// granted the manifest opens name + every chunk together; a stranger
-    /// opens none. The mid-write OCCURRENCE change half is persist's (#923:
-    /// per-chunk occurrence wraps on self/family streams) and is not
-    /// reachable from this door, which writes a stream in one call — it
-    /// stays UNVERIFIED here until persist's release note says TESTED.
+    /// D9 — a chunked file's descriptor binds to the MANIFEST, and one access
+    /// set covers the manifest and every chunk: a viewer granted the manifest
+    /// opens name + every chunk together, a stranger opens none, and on the
+    /// self tier every granted occurrence holds an at-rest grant on the
+    /// manifest AND on each chunk row. persist v51.0.0 made this structural
+    /// (one recipient set per stream, `chunk_key_grant_emissions` emitted by
+    /// `Engine::seal_stream_scoped` — edge seals only through that Engine
+    /// door) and TESTED the mid-write occurrence change as I34b; edge's
+    /// one-call seal cannot interleave an occurrence change, so that half is
+    /// persist's witness.
     #[tokio::test]
     async fn a_chunked_files_descriptor_and_every_chunk_share_one_access_set() {
         init_tracing();
@@ -4271,6 +4275,36 @@ mod files {
                     .is_err(),
                 "{room}: a stranger opens none"
             );
+            if published.tier == CryptoTier::InvisibleEncrypted {
+                use ciris_persist::federation::BlobStorage as _;
+                let manifest: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+                    .expect("hex")
+                    .try_into()
+                    .expect("32");
+                let chunks = node_a
+                    .dir
+                    .stream_chunks(published.pointer.stream_id.as_deref().expect("a DAG"))
+                    .await
+                    .expect("list the stream")
+                    .chunks;
+                assert!(chunks.len() > 1, "{room}: several chunks");
+                assert!(!published.granted.is_empty(), "{room}: someone is granted");
+                for occ in &published.granted {
+                    for sha in std::iter::once(manifest).chain(chunks.iter().map(|c| c.chunk_sha)) {
+                        assert!(
+                            node_a
+                                .dir
+                                .get_at_rest_grant(&sha, occ)
+                                .await
+                                .expect("grant lookup")
+                                .is_some(),
+                            "{room}: {occ} granted the manifest must hold a grant on {} too \
+                             (one access set per stream)",
+                            hex::encode(sha)
+                        );
+                    }
+                }
+            }
         }
     }
 

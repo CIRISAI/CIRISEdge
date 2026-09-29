@@ -792,7 +792,7 @@ noted on CIRISPersist#923):
 | D6 | Round trip through persist's real sqlite backend, both scope paths (self/family `InvisibleEncrypted`, community `CommunityDek`) | every `files::` witness in `tests/blob_federation_e2e.rs` runs both encrypted scope paths on real sqlite |
 | D7 | Mixed fleet: the row carries no `media` member; a v50 reader admits it | asserted inside the D2 witness (no top-level `media`); no CIRISConformance vector yet |
 | D8 | A pointer + descriptor transplanted onto **another row** of the same blob does not open (row AAD gate), and one moved to **another blob** does not open (address-digest AAD) | `files::a_transplanted_descriptor_opens_on_neither_another_row_nor_another_blob` — refused at persist's door under row 2's AAD and under none |
-| D9 | A chunked file written across an occurrence change opens name, manifest and every chunk together, or none (one access set per stream) | `files::a_chunked_files_descriptor_and_every_chunk_share_one_access_set` — **partial:** same-viewer manifest + chunks + descriptor, stranger none; the mid-write occurrence-change half is persist's (#923) and UNVERIFIED at v51 |
+| D9 | A chunked file written across an occurrence change opens name, manifest and every chunk together, or none (one access set per stream) | `files::a_chunked_files_descriptor_and_every_chunk_share_one_access_set` — manifest + chunks + descriptor open together, a stranger none, every granted occurrence holds a grant on every chunk; the mid-write occurrence change is persist's I34b (TESTED at v51.0.0) — edge seals only through `Engine::seal_stream_scoped`, which emits `chunk_key_grant_emissions` |
 | D10 | A nameless encrypted file round-trips with `name` absent inside the seal; the reader gets `None`, never `""` | `files::a_nameless_file_seals_format_only_and_reads_back_absent` |
 
 
@@ -818,8 +818,9 @@ Three things differ from the ask, each handled and pinned:
   clear fallback). Chat bodies carry no description (`description: None`): the dimension is the
   format, so there is nothing to seal and no format for persist to record.
 
-D9's occurrence-change half is persist's witness and is **not** marked TESTED in the v51 release
-note; it stays UNVERIFIED until it is.
+D9 is TESTED on persist's side at the tag (I34b: one recipient set per stream; `Engine::seal_stream_scoped`
+emits the widened chunks' key-grant sets). Edge seals streams only through that Engine door, so
+there is nothing to emit below it.
 
 Every persist door already existed at the pinned version — Q1 shipped in v44.5.0
 (`serve_blob_range_to_peer`), Q2 is settled, the scoped DAG shipped in #832/#838 — so this was never
