@@ -556,6 +556,18 @@ struct RosterEntry {
     /// tautology — the agent id already was the transport id.
     #[serde(default)]
     agent_key_id: String,
+    /// The human's APP device — the device the login ceremony (`self_at_login`)
+    /// admits beside the agent. A separate key from the node on purpose
+    /// (CIRISEdge#768): naming the node's own engine occurrence as the app
+    /// re-signed the node's occurrence-consented binding with the human's key
+    /// alone, which persist's #932 rule then refuses to resolve, so the node
+    /// stopped being party to its owner's rooms.
+    #[serde(default)]
+    app_key_id: String,
+    #[serde(default)]
+    app_pubkey_b64: String,
+    #[serde(default)]
+    app_pqc_pubkey_b64: String,
     #[serde(default)]
     agent_pubkey_b64: String,
     #[serde(default)]
@@ -1878,6 +1890,11 @@ async fn stand_up(
     let agent = FedKey::load_or_create(&agent_label, &cfg.state_dir.join("agent"))?;
     let agent_key_id = agent.derived_key_id(&agent_label)?;
 
+    // The human's APP device, for the login ceremony (see `RosterEntry::app_key_id`).
+    let app_label = format!("{}-app", cfg.node_name);
+    let app = FedKey::load_or_create(&app_label, &cfg.state_dir.join("app"))?;
+    let app_key_id = app.derived_key_id(&app_label)?;
+
     // ── 2. Publish the public half + reachability ────────────────────
     publish_roster_entry(
         &cfg.mesh_dir,
@@ -1894,6 +1911,9 @@ async fn stand_up(
             agent_key_id: agent_key_id.clone(),
             agent_pubkey_b64: agent.pubkey_b64()?,
             agent_pqc_pubkey_b64: agent.pqc_pubkey_b64(&agent_label).await?,
+            app_key_id: app_key_id.clone(),
+            app_pubkey_b64: app.pubkey_b64()?,
+            app_pqc_pubkey_b64: app.pqc_pubkey_b64(&app_label).await?,
         },
     )
     .map_err(|e| format!("publish roster entry: {e}"))?;
@@ -1920,6 +1940,21 @@ async fn stand_up(
                 )
                 .await?,
             );
+            // The owner's APP device — the login ceremony's `app` occurrence
+            // (its precondition: the occurrence key is a registered row).
+            if !entry.app_key_id.is_empty() {
+                rows.push(
+                    signed_record(
+                        &entry.app_key_id,
+                        &entry.app_pubkey_b64,
+                        &entry.app_pqc_pubkey_b64,
+                        &steward_signer,
+                        STEWARD_KEY_ID,
+                        "user",
+                    )
+                    .await?,
+                );
+            }
             // The AGENT that runs on it — a separate identity, and the third
             // key an agent needs to be viable.
             if !entry.agent_key_id.is_empty() {
@@ -2096,10 +2131,16 @@ async fn stand_up(
     // agent)` that `steward_bindings_of(agent)` resolves everywhere. CC
     // 3.4.7.3 Clause D. This is NOT a second owner-binding.
     //
-    // The ceremony takes an app and an agent. This node's "device" is the
-    // engine occurrence `provision_engine_occurrence` just published — same
-    // key, same content-KEM pubkeys — so persist sees the same row and the
-    // drift rule is satisfied by construction. The agent carries seed-derived
+    // The ceremony takes an app and an agent. The app is the human's own
+    // device (`app_key_id`), NOT this node: the node's binding to its owner is
+    // the engine occurrence `provision_engine_occurrence` just published,
+    // signed by the node itself — the occurrence's consent persist's #932
+    // rule requires before the binding makes the node party to the owner's
+    // rooms. The ceremony signs its occurrences with the human alone, and one
+    // (identity, occurrence) pair is one row, so naming the node here
+    // overwrote that consent and the node could no longer hold a byte of its
+    // owner's rooms (CIRISEdge#768: the chat body's adopt refused
+    // `NotPartyTo`). Both the app and the agent carry seed-derived
     // device-class pubkeys: it is a wrap target the harness never reads
     // through (persist's read door unwraps only with the content-KEM
     // identity — CIRISPersist#848), which is exactly the device-occurrence
@@ -2115,18 +2156,9 @@ async fn stand_up(
     // W5 check at the top of `self_at_login` demands (CIRISEdge#767: it used
     // to be the owner's LABEL here, and every standup was refused).
     //
-    // Runs AFTER provisioning: the door checks the signer against the
-    // identity's ACTIVE occurrences, and `me` is one only once it exists.
     {
-        use ciris_persist::federation::blobs::BlobStorage as _;
-        let kem = directory
-            .load_or_init_content_kem_identity()
-            .await
-            .map_err(|e| format!("content-KEM identity for the login ceremony: {e}"))?;
-        let app_enc = ciris_persist::federation::EncryptionPubkeys {
-            x25519_base64: kem.x25519_pubkey_b64,
-            ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
-        };
+        #[allow(deprecated)] // the DEVICE class is the right class for an app
+        let app_enc = ciris_edge::content_occurrence::enc_pubkeys_from_seed(&app.seed)?;
         #[allow(deprecated)] // the DEVICE class is the right class for an agent
         let agent_enc = ciris_edge::content_occurrence::enc_pubkeys_from_seed(&agent.seed)?;
         let identity_signer = ciris_persist::signing::LocalSigner::from_hardware_parts(
@@ -2143,8 +2175,8 @@ async fn stand_up(
                 identity_key_id: owner_key_id.clone(),
                 identity_signer: Some(Arc::new(identity_signer)),
                 app: ciris_persist::engine::SelfAtLoginOccurrence {
-                    occurrence_key_id: me.clone(),
-                    device_class: ciris_persist::federation::types::device_class::SERVER.to_owned(),
+                    occurrence_key_id: app_key_id.clone(),
+                    device_class: ciris_persist::federation::types::device_class::LAPTOP.to_owned(),
                     hardware_attestation: None,
                     encryption_pubkeys: Some(app_enc),
                     transport_destinations: Vec::new(),
@@ -2164,7 +2196,7 @@ async fn stand_up(
         tracing::info!(
             human = %owner_key_id,
             agent = %agent_key_id,
-            app = %me,
+            app = %app_key_id,
             ?outcome,
             "login ceremony complete — the agent is an occurrence of its human and the \
              human-signed delegation is its stewardship anchor (CC 3.4.7.3 Clause D; \
@@ -5598,9 +5630,14 @@ async fn run_nonmember(occ: Occurrence) -> Result<(), String> {
     // (b) It cannot open ciphertext it is handed. Wait for a real media
     //     frame (it is on the mesh; the harness addresses one to it) and
     //     try, with a key it derives from material it actually holds.
+    //
+    //     Bounded by the harness barrier, not a fixed minute: the publisher
+    //     streams only after the cohort's chat legs finish, and those wait on
+    //     real delivery (the pair's body is pulled before it opens), so the
+    //     stream's start is not a constant this node can guess.
     let mut tried = 0usize;
     let mut opened = 0usize;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + cfg.barrier_timeout;
     while Instant::now() < deadline && tried == 0 {
         let msg = {
             let mut rx = occ.mailbox.media.lock().await;
