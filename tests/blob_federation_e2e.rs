@@ -6576,7 +6576,9 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     assert!(
         matches!(
             file.open(&node_d.store, &node_d.me).await,
-            Err(UnopenedReason::NotGranted { .. })
+            Err(ciris_edge::files::FileError::Unopened(
+                UnopenedReason::NotGranted { .. }
+            ))
         ),
         "D reads NotGranted on the e0 file: the epoch-bearing pointer, not the current \
          epoch, is what the bytes are bound to"
