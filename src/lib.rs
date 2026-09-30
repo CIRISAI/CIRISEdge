@@ -113,6 +113,8 @@ pub mod multimedia;
 pub mod observability;
 pub mod outbound;
 pub mod reachability;
+// CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files.
+pub mod receipts;
 pub mod replication;
 pub mod sas;
 mod sas_wordlist;

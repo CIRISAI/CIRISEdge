@@ -2599,6 +2599,12 @@ impl PyEdge {
             pull_refusals.set_item(label.as_str(), *n)?;
         }
         root.set_item("blob_pull_refusals", pull_refusals)?;
+        // CIRISEdge#738 — delivery receipts for files, by tag.
+        let delivery_receipts = pyo3::types::PyDict::new(py);
+        for (label, n) in &bundle.delivery_receipts {
+            delivery_receipts.set_item(label.as_str(), *n)?;
+        }
+        root.set_item("delivery_receipts", delivery_receipts)?;
         // CIRISEdge#718 — which link each scoped body rode, and identity-link
         // admissions (CC 5.4.6 / CIRISConstitution#132).
         let scoped_carriers = pyo3::types::PyDict::new(py);

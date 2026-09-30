@@ -1462,6 +1462,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// keeps the pre-v24.4.0 behaviour: rows arrive, bytes never do, and
     /// every non-author member reads `NotFetched`.
     pull_sink: Option<crate::blob_swarm::PullSink>,
+    /// CIRISEdge#738 — CC 5.3.3.6 delivery receipts. Armed by the ENGINE (the
+    /// stream log lives in its backend): an admitted `delivery_receipt:*` row
+    /// is validated and stored ([`crate::receipts::admit_and_count`]), and a
+    /// file row a peer has receipted in full is not re-offered to that peer.
+    receipts: Arc<crate::receipts::ReceiptLedger>,
     /// CIRISEdge#311 — the SELF-plane publish set. Collapses the #257
     /// `key_selector` + #305 `occurrence_selector` into ONE provider: both were
     /// the same `Projection::SelfOwn` re-implemented per plane. When `Some`, the
@@ -1846,6 +1851,7 @@ impl FederationDirectoryReplicationBridge {
             engine: None,
             revocations: None,
             pull_sink: None,
+            receipts: Arc::new(crate::receipts::ReceiptLedger::new()),
             self_provider: None,
             local_key_id: None,
             config,
@@ -1929,6 +1935,7 @@ impl FederationDirectoryReplicationBridge {
             engine: None,
             revocations: None,
             pull_sink: None,
+            receipts: Arc::new(crate::receipts::ReceiptLedger::new()),
             self_provider: None,
             local_key_id: None,
             config,
@@ -2043,6 +2050,36 @@ impl FederationDirectoryReplicationBridge {
     pub fn with_pull_sink(mut self, sink: Option<crate::blob_swarm::PullSink>) -> Self {
         self.pull_sink = sink;
         self
+    }
+
+    /// CIRISEdge#738 — the delivery-receipt ledger this bridge suppresses
+    /// re-offers by. Shared so a host (or a test) can read which peers hold
+    /// which files in full.
+    #[must_use]
+    pub fn receipt_ledger(&self) -> Arc<crate::receipts::ReceiptLedger> {
+        Arc::clone(&self.receipts)
+    }
+
+    /// CIRISEdge#738 — does the advertise to `peer` skip `att`: a chunked
+    /// file row whose stream `peer` has receipted in full (it holds the row
+    /// and every chunk under the published root)? Hydrates the stream's
+    /// receipts from the engine's store once per process.
+    async fn receipted_by_peer(
+        &self,
+        peer: &str,
+        att: &ciris_persist::federation::Attestation,
+    ) -> bool {
+        let Some(stream_id) = crate::receipts::file_row_stream(att) else {
+            return false;
+        };
+        if let Some(log) = self
+            .engine
+            .as_ref()
+            .and_then(|e| crate::receipts::stream_log_of(&e.0))
+        {
+            self.receipts.hydrate(&*log, stream_id).await;
+        }
+        self.receipts.is_receipted(peer, stream_id)
     }
 
     /// CIRISEdge#386 — bind this node's own federation key_id (builder). The
@@ -7029,6 +7066,18 @@ impl FederationDirectoryReplicationBridge {
             if !Self::attestation_is_advertised(&canonical_json, &ctx.self_set) {
                 continue;
             }
+            // CIRISEdge#738 — a chunked file this peer has receipted in full
+            // (CC 5.3.3.6: it holds the row and every chunk under the root this
+            // node published) is done for this peer: not re-offered. Only for a
+            // resolved peer — the peer-blind view is not an offer to anyone.
+            if ctx.resolved_recipient.is_some()
+                && self.receipted_by_peer(peer_label, &att.attestation).await
+            {
+                if let Some(m) = &self.metrics {
+                    m.inc_delivery_receipt(crate::receipts::RE_OFFER_SUPPRESSED_RECEIPTED);
+                }
+                continue;
+            }
             // CIRISEdge#440 — the mesh-config pause: `feature.trace_replication`
             // relieved to 0 withholds every `trace:*` row from the advertise.
             // Booked ONCE per sweep (the decision is one per-sweep fact, not one
@@ -8217,6 +8266,13 @@ impl FederationDirectoryReplicationBridge {
                 // `BlobMeaning::referenced_shas` runs; a row that references
                 // nothing (the high-volume planes) is a few `is_object` tests
                 // and no clone. Nothing here awaits.
+                // CIRISEdge#738 — a delivery receipt, admitted by persist, is
+                // validated and stored as a receipt once the row is in.
+                let receipt_row: Option<ciris_persist::federation::Attestation> = self
+                    .engine
+                    .as_ref()
+                    .filter(|_| crate::receipts::receipt_row_stream(&record.attestation).is_some())
+                    .map(|_| record.attestation.clone());
                 let pull: Option<ciris_persist::federation::Attestation> = self
                     .pull_sink
                     .as_ref()
@@ -8317,6 +8373,21 @@ impl FederationDirectoryReplicationBridge {
                     // node's to pull if the gate agrees. Offered, never awaited.
                     if let (Some(sink), Some(row)) = (self.pull_sink.as_ref(), pull) {
                         let _ = sink.offer(&row);
+                    }
+                    if let (Some(row), Some(log)) = (
+                        receipt_row,
+                        self.engine
+                            .as_ref()
+                            .and_then(|e| crate::receipts::stream_log_of(&e.0)),
+                    ) {
+                        let _ = crate::receipts::admit_and_count(
+                            &*log,
+                            &*self.directory,
+                            &row,
+                            &self.receipts,
+                            self.metrics.as_ref(),
+                        )
+                        .await;
                     }
                 }
                 outcome

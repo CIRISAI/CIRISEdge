@@ -216,6 +216,10 @@ pub(crate) const STREAM_EPOCH: u64 = 0;
 
 #[async_trait::async_trait]
 impl GroupContentStore for PersistGroupContentStore {
+    fn stream_log(&self) -> Option<Arc<dyn crate::receipts::StreamLog>> {
+        crate::receipts::stream_log_of(&self.engine)
+    }
+
     async fn seal(&self, req: SealRequest<'_>) -> Result<SealedContent, GroupContentError> {
         // An AAD binds a ciphertext to its row. A PLAINTEXT tier has no
         // ciphertext to bind, and persist REFUSES `Some(aad)` there rather
