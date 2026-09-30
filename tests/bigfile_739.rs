@@ -1019,6 +1019,8 @@ struct PullReport {
     adopt_batch_peak: u64,
     /// Sum of every batch's adopt wall time.
     adopt_total: Duration,
+    /// Retryable fetch failures the pull resumed from.
+    retries: u32,
     elapsed: Duration,
     mem_peak: usize,
     phases_b: Vec<(String, u64, u64)>,
@@ -1097,7 +1099,23 @@ async fn pull_once(
     let _ = take_adopts();
     let baseline = mem_mark();
     let started = Instant::now();
-    let verdict = puller.pull_one(&p.row, p.sha, 0).await;
+    // A lane that times out stops the pull with a retryable fetch failure;
+    // the puller's own retry resumes it (held chunks skipped). The bench
+    // does the same, at once, and counts it, so a transient timeout on a
+    // loaded host does not throw away a long run.
+    let mut retries = 0u32;
+    let verdict = loop {
+        match puller.pull_one(&p.row, p.sha, retries).await {
+            PullOutcome::FetchFailed {
+                reason,
+                retrying: true,
+            } if retries < 3 => {
+                retries += 1;
+                eprintln!("[{tag}] retryable fetch failure, resuming (retry {retries}): {reason}");
+            }
+            other => break other,
+        }
+    };
     let elapsed = started.elapsed();
     let mem_peak = mem_peak_over(baseline);
     let adopts = take_adopts();
@@ -1130,6 +1148,7 @@ async fn pull_once(
         adopt_batches: adopts.len() as u64,
         adopt_batch_peak: ledger(&b.edge.metrics(), "adopt_batch_peak"),
         adopt_total: Duration::from_micros(adopts.iter().map(|a| a.2).sum()),
+        retries,
         elapsed,
         mem_peak,
         phases_b: phases(&b.edge.metrics()),
@@ -1676,6 +1695,9 @@ fn lanes_by_batch_table(total: u64, ceiling_1: f64, reports: &[PullReport]) -> S
     }));
     t.push_str(&row("pull s", &|r| {
         format!("{:.1}", r.elapsed.as_secs_f64())
+    }));
+    t.push_str(&row("resumed after a lane timeout", &|r| {
+        r.retries.to_string()
     }));
     t.push_str(&row("pull MB/s", &|r| {
         format!("{:.1}", mb_per_s(total, r.elapsed))
