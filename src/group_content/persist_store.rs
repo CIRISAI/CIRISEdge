@@ -24,8 +24,8 @@
 use std::sync::Arc;
 
 use super::store::{
-    aad_for_open, aad_for_seal, GroupContentError, GroupContentStore, OpenRequest, SealRequest,
-    SealedContent,
+    aad_for_open, aad_for_seal, ContentReader, GroupContentError, GroupContentStore, OpenRequest,
+    SealRequest, SealedContent, StreamSealRequest,
 };
 use super::BlobPointer;
 
@@ -268,7 +268,11 @@ impl GroupContentStore for PersistGroupContentStore {
             .describe(
                 out.tier,
                 &out.at_rest_sha256,
-                req.plaintext,
+                req.plaintext.len() as u64,
+                &{
+                    use sha2::{Digest as _, Sha256};
+                    Sha256::digest(req.plaintext).into()
+                },
                 req.description.as_ref(),
                 &out.granted,
             )
@@ -309,8 +313,20 @@ impl GroupContentStore for PersistGroupContentStore {
     }
 
     async fn seal_chunked(&self, req: SealRequest<'_>) -> Result<SealedContent, GroupContentError> {
+        // ONE chunk-seal path (CIRISEdge#744): a slice is a reader that ends
+        // where the slice does, and declares its own length.
+        let mut reader: &[u8] = req.plaintext;
+        self.seal_chunked_stream(StreamSealRequest::of(&req), &mut reader)
+            .await
+    }
+
+    async fn seal_chunked_stream(
+        &self,
+        req: StreamSealRequest<'_>,
+        reader: &mut ContentReader<'_>,
+    ) -> Result<SealedContent, GroupContentError> {
         use ciris_persist::federation::types::cohort_scope::CryptoTier;
-        let aad = aad_for_seal(&req);
+        let aad = req.aad();
         // The tier is the DIRECTORY's answer, exactly as `seal` asks it — not
         // re-derived from the scope, which would drop the axis the write door
         // applies (an infrastructure community resolves plaintext whatever
@@ -331,30 +347,21 @@ impl GroupContentStore for PersistGroupContentStore {
         // stream is keyed before its content is known, and two files with
         // identical bytes are still two writes.
         let stream_id = format!("file-{}", uuid::Uuid::new_v4());
-        let mut written = 0usize;
-        for (seq, chunk) in req
-            .plaintext
-            .chunks(crate::group_content::store::CHUNK_BYTES)
-            .enumerate()
+        let mut written: Vec<[u8; 32]> = Vec::new();
+        let (read, digest) = match self
+            .write_chunks(&req, &stream_id, aad_arg, reader, &mut written)
+            .await
         {
-            self.engine
-                .put_blob_chunk_scoped(
-                    req.cohort_scope,
-                    req.community_key_id,
-                    &stream_id,
-                    seq as u64,
-                    chunk,
-                    STREAM_EPOCH,
-                    aad_arg,
-                )
-                .await
-                .map_err(|e| map_err(String::new(), &e))?;
-            written += 1;
-        }
+            Ok(done) => done,
+            Err(e) => {
+                self.evict_unsealed(tier, &stream_id, &written).await;
+                return Err(e);
+            }
+        };
         // An empty file would seal a stream with no chunks, which is a
         // manifest pinning nothing — refused here rather than stored as a
         // blob that opens to nothing.
-        if written == 0 {
+        if written.is_empty() {
             return Err(GroupContentError::Substrate(
                 "refusing to seal an empty chunk DAG: a manifest over no chunks is content \
                  that opens to nothing"
@@ -362,7 +369,10 @@ impl GroupContentStore for PersistGroupContentStore {
             ));
         }
 
-        let sealed = self
+        // The LAST chunk has landed and the count is the declared one: only
+        // now does the stream seal (CIRISEdge#744) — and only a sealed stream
+        // becomes a pointer, so no row can cite a partial file.
+        let sealed = match self
             .engine
             .seal_stream_scoped(
                 req.cohort_scope,
@@ -372,7 +382,13 @@ impl GroupContentStore for PersistGroupContentStore {
                 aad_arg,
             )
             .await
-            .map_err(|e| map_err(String::new(), &e))?;
+        {
+            Ok(sealed) => sealed,
+            Err(e) => {
+                self.evict_unsealed(tier, &stream_id, &written).await;
+                return Err(map_err(String::new(), &e));
+            }
+        };
         // The descriptor binds to the MANIFEST — what a reader opens and what
         // the row cites — under the manifest's DEK. That this reaches every
         // chunk rests on persist's one-access-set-per-stream invariant (D9).
@@ -380,7 +396,8 @@ impl GroupContentStore for PersistGroupContentStore {
             .describe(
                 sealed.tier,
                 &sealed.manifest_sha256,
-                req.plaintext,
+                read,
+                &digest,
                 req.description.as_ref(),
                 &sealed.granted,
             )
@@ -629,6 +646,162 @@ impl GroupContentStore for PersistGroupContentStore {
     }
 }
 
+/// Read into `buf` until it is FULL or the reader ends; the count read.
+///
+/// A reader may hand back fewer bytes than asked on any call (a socket, a
+/// multipart body); chunk boundaries must not follow that, or the same
+/// content streamed two ways would seal two different DAGs. Filling each
+/// chunk fully makes them `seq × CHUNK_BYTES` whatever the reader's pacing —
+/// exactly the slice path's boundaries (CIRISEdge#744).
+async fn fill_chunk(reader: &mut ContentReader<'_>, buf: &mut [u8]) -> std::io::Result<usize> {
+    use tokio::io::AsyncReadExt as _;
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]).await {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
+impl PersistGroupContentStore {
+    /// Read `reader` a chunk at a time and write each chunk through
+    /// `put_blob_chunk_scoped` as it arrives, pushing each chunk's at-rest
+    /// sha onto `written` (the caller evicts them on refusal). Returns the
+    /// plaintext size and SHA-256, folded in chunk by chunk — the descriptor's
+    /// inputs, without the content (CIRISEdge#744).
+    ///
+    /// The ONE chunk buffer is reused: the content is never held, only the
+    /// chunk in hand.
+    async fn write_chunks(
+        &self,
+        req: &StreamSealRequest<'_>,
+        stream_id: &str,
+        aad: Option<&[u8]>,
+        reader: &mut ContentReader<'_>,
+        written: &mut Vec<[u8; 32]>,
+    ) -> Result<(u64, [u8; 32]), GroupContentError> {
+        use sha2::{Digest as _, Sha256};
+        let mut buf = vec![0u8; crate::group_content::store::CHUNK_BYTES];
+        let mut digest = Sha256::new();
+        let mut read: u64 = 0;
+        loop {
+            let n = fill_chunk(reader, &mut buf)
+                .await
+                .map_err(|e| GroupContentError::Reader {
+                    read,
+                    detail: e.to_string(),
+                })?;
+            if n == 0 {
+                break;
+            }
+            read += n as u64;
+            // A LONG reader is refused at the first chunk that crosses the
+            // declaration — before that chunk is written, and without
+            // draining a reader that may never end.
+            if read > req.declared_len {
+                return Err(GroupContentError::DeclaredLengthMismatch {
+                    declared: req.declared_len,
+                    read,
+                });
+            }
+            let chunk = &buf[..n];
+            digest.update(chunk);
+            let put = self
+                .engine
+                .put_blob_chunk_scoped(
+                    req.cohort_scope,
+                    req.community_key_id,
+                    stream_id,
+                    written.len() as u64,
+                    chunk,
+                    STREAM_EPOCH,
+                    aad,
+                )
+                .await
+                .map_err(|e| map_err(String::new(), &e))?;
+            written.push(put.chunk_sha256);
+        }
+        if read != req.declared_len {
+            return Err(GroupContentError::DeclaredLengthMismatch {
+                declared: req.declared_len,
+                read,
+            });
+        }
+        Ok((read, digest.finalize().into()))
+    }
+
+    /// **A refused streamed seal leaves nothing it wrote** (CIRISEdge#744,
+    /// `FSD/CONTENT_TRANSFER.md` §6.7.4) — the deterministic half of the
+    /// refusal.
+    ///
+    /// Persist has no GC (`federation::blobs` "Why no GC": blobs persist
+    /// forever unless a door deletes them), so without this a 2 GiB upload
+    /// refused at its last chunk would hold 2 GiB of chunks no manifest and
+    /// no row will ever name. Each chunk goes through persist's ONE eviction
+    /// door, `Engine::evict_blob` (retract this node's `holds_bytes` for the
+    /// sha — a chunk has none — then delete the row with its grants and
+    /// epoch binding in one transaction).
+    ///
+    /// Only at an ENCRYPTED tier: each chunk there is sealed under a fresh
+    /// DEK (self/family) or a random nonce (community), so its ciphertext sha
+    /// is this write's alone. A plaintext chunk's sha is its content's, and
+    /// may be a chunk another file's manifest names; it is left in place —
+    /// unreferenced by this call, unannounced, never pulled (no manifest
+    /// names it).
+    ///
+    /// What does not go: persist's stream bookkeeping (`federation_streams`,
+    /// `federation_stream_chunks` — ids and sizes, no bytes; there is no door
+    /// for it, and `stream_chunks` lists nothing once the blobs are gone), and
+    /// the per-chunk `key_grant` sets `put_blob_chunk_scoped` already emitted
+    /// (wraps of DEKs for ciphertext that no longer exists anywhere).
+    /// Best-effort by construction: the refusal the caller gets is the
+    /// reason the write failed, and an eviction that also fails is logged,
+    /// never substituted for it.
+    async fn evict_unsealed(
+        &self,
+        tier: ciris_persist::federation::types::cohort_scope::CryptoTier,
+        stream_id: &str,
+        written: &[[u8; 32]],
+    ) {
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        if written.is_empty() {
+            return;
+        }
+        if tier == CryptoTier::Plaintext {
+            tracing::info!(
+                stream_id,
+                chunks = written.len(),
+                "streamed seal refused at the plaintext tier: its chunks are content-addressed \
+                 and stay (unreferenced, unannounced) — CIRISEdge#744"
+            );
+            return;
+        }
+        let now = chrono::Utc::now();
+        let mut failed = 0usize;
+        for sha in written {
+            if let Err(e) = self.engine.evict_blob(sha, now).await {
+                failed += 1;
+                tracing::warn!(
+                    stream_id,
+                    chunk = %hex::encode(sha),
+                    error = %e,
+                    "streamed seal refused, and evicting one of its chunks failed too"
+                );
+            }
+        }
+        tracing::info!(
+            stream_id,
+            written = written.len(),
+            evicted = written.len() - failed,
+            "streamed seal refused: the chunks it wrote are evicted (CIRISEdge#744)"
+        );
+    }
+}
+
 /// The pointer's at-rest address, parsed — hex for messages, bytes for doors.
 fn pointer_sha(pointer: &BlobPointer) -> Result<(String, [u8; 32]), GroupContentError> {
     let sha_hex = pointer.content_sha256.clone();
@@ -680,18 +853,21 @@ impl PersistGroupContentStore {
     /// node-class occurrence), then each occurrence the write granted. None
     /// opening means this node cannot read what it just wrote — refused by
     /// name, never a pointer with a silently-missing description.
+    ///
+    /// Takes the plaintext's SIZE and SHA-256, never the plaintext
+    /// (CIRISEdge#744): a streamed seal folds both in chunk by chunk and has
+    /// no whole plaintext to hand over.
     async fn describe(
         &self,
         tier: ciris_persist::federation::types::cohort_scope::CryptoTier,
         at_rest_sha256: &[u8; 32],
-        plaintext: &[u8],
+        size: u64,
+        plaintext_sha256: &[u8; 32],
         description: Option<&super::Description<'_>>,
         granted: &[String],
     ) -> Result<Described, GroupContentError> {
         use base64::Engine as _;
         use ciris_persist::federation::types::cohort_scope::CryptoTier;
-        use sha2::{Digest as _, Sha256};
-        let size = plaintext.len() as u64;
         if tier == CryptoTier::Plaintext {
             return Ok(Described {
                 media_type: description.map(|d| d.format.to_owned()),
@@ -701,7 +877,7 @@ impl PersistGroupContentStore {
                 content_digest: None,
             });
         }
-        let content_digest = Some(hex::encode(Sha256::digest(plaintext)));
+        let content_digest = Some(hex::encode(plaintext_sha256));
         let Some(description) = description else {
             return Ok(Described {
                 media_type: None,

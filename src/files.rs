@@ -100,6 +100,44 @@ pub struct FileWrite<'a> {
     pub asserted_at: DateTime<Utc>,
 }
 
+/// A file to write into a room **from a reader** (CIRISEdge#744,
+/// `FSD/CONTENT_TRANSFER.md` §6.7.4) — [`FileWrite`] with the plaintext
+/// replaced by the length the reader will yield. The bytes come through
+/// [`publish_stream`]'s reader, a chunk at a time.
+#[derive(Debug, Clone)]
+pub struct FileStreamWrite<'a> {
+    /// As [`FileWrite::room`].
+    pub room: &'a ScopeRoom,
+    /// **Exactly what the reader will yield.** The shape follows it (inline
+    /// at or below the bound, [`must_chunk`]; a chunk DAG above), and a
+    /// reader yielding any other count is [`FileError::DeclaredLengthMismatch`].
+    pub declared_len: u64,
+    /// As [`FileWrite::media_type`].
+    pub media_type: &'a str,
+    /// As [`FileWrite::codec`].
+    pub codec: Option<&'a str>,
+    /// As [`FileWrite::filename`].
+    pub filename: Option<&'a str>,
+    /// As [`FileWrite::asserted_at`] — an AAD input.
+    pub asserted_at: DateTime<Utc>,
+}
+
+impl<'a> FileStreamWrite<'a> {
+    /// The streaming form of a slice write: the same members, the slice's
+    /// length declared.
+    #[must_use]
+    pub fn of(write: &FileWrite<'a>) -> Self {
+        Self {
+            room: write.room,
+            declared_len: write.bytes.len() as u64,
+            media_type: write.media_type,
+            codec: write.codec,
+            filename: write.filename,
+            asserted_at: write.asserted_at,
+        }
+    }
+}
+
 /// Why a file was not published. A door that returns one string for
 /// "persist refused the seal" and "nobody can read this" makes the caller
 /// parse prose to find out which; each arm here has a different remedy.
@@ -236,6 +274,36 @@ pub enum FileError {
         cap: u64,
     },
 
+    /// **The reader did not yield what the write declared** (CIRISEdge#744,
+    /// `FSD/CONTENT_TRANSFER.md` §6.7.4). Refused by name; nothing crosses:
+    /// no manifest, no pointer, no `file:v1` row. The chunks a DAG write had
+    /// already sealed are evicted (encrypted tier) before this returns.
+    /// `read` is exact for a short reader and a lower bound (`> declared`)
+    /// for a long one, which is stopped rather than drained.
+    #[error(
+        "declared {declared} bytes but the reader yielded {read}: nothing published, no row \
+         (FSD/CONTENT_TRANSFER.md §6.7.4)"
+    )]
+    DeclaredLengthMismatch {
+        /// What the write declared.
+        declared: u64,
+        /// What the reader produced (a lower bound when `> declared`).
+        read: u64,
+    },
+
+    /// **The reader failed mid-stream** (CIRISEdge#744) — an I/O error from
+    /// the caller's source, not a seal refusal. Nothing published, no row;
+    /// written chunks are evicted as for [`Self::DeclaredLengthMismatch`].
+    #[error("read the content for {room}: failed after {read} bytes: {detail}")]
+    Read {
+        /// The room the write was for.
+        room: String,
+        /// Bytes consumed before the failure.
+        read: u64,
+        /// The reader's error.
+        detail: String,
+    },
+
     /// **A range outside the file** (RFC 9110 §14.4; CIRISEdge#737): `offset`
     /// at or past the end, `offset + len` past the end, or `len == 0`. The
     /// end is never silently clamped — a caller that asked for `len` bytes
@@ -293,6 +361,8 @@ impl FileError {
             Self::Withdraw { .. } => "withdraw",
             Self::AboveWholeReadCap { .. } => "above_whole_read_cap",
             Self::RangeNotSatisfiable { .. } => "range_not_satisfiable",
+            Self::DeclaredLengthMismatch { .. } => "declared_length_mismatch",
+            Self::Read { .. } => "read",
         }
     }
 
@@ -721,44 +791,51 @@ pub async fn publish(
     signers: Signers<'_>,
     write: &FileWrite<'_>,
 ) -> Result<PublishedFile, FileError> {
+    // ONE seal path (CIRISEdge#744): a slice is a reader that ends where the
+    // slice does, and declares its own length.
+    publish_stream(
+        directory,
+        store,
+        signers,
+        &FileStreamWrite::of(write),
+        write.bytes,
+    )
+    .await
+}
+
+/// **Write a file into a room from a reader** — seal chunk by chunk, author,
+/// cross (CIRISEdge#744, `FSD/CONTENT_TRANSFER.md` §6.7.4). [`publish`] is
+/// this over a slice.
+///
+/// The shape follows `write.declared_len` at the one boundary [`publish`]
+/// uses ([`must_chunk`]): at or below it the reader is read whole (≤ 1 MiB,
+/// the inline bound) and sealed inline exactly as before; above it the store's
+/// [`GroupContentStore::seal_chunked_stream`] reads `CHUNK_BYTES` at a time
+/// and seals + writes each chunk as it arrives, so a 2 GiB file holds one
+/// chunk in hand, never the file. The stream seals (manifest + descriptor)
+/// only after the LAST chunk lands; the `file:v1` row is authored and
+/// crosses only after that — so a row never names a partial file.
+///
+/// A reader yielding any count other than `declared_len` is
+/// [`FileError::DeclaredLengthMismatch`]; a reader error is
+/// [`FileError::Read`]. Neither leaves a manifest or a row, and the chunks a
+/// DAG write had sealed are evicted at an encrypted tier (§6.7.4).
+///
+/// # Errors
+/// As [`publish`], plus the two reader refusals above.
+pub async fn publish_stream<R>(
+    directory: &dyn FederationDirectory,
+    store: &dyn GroupContentStore,
+    signers: Signers<'_>,
+    write: &FileStreamWrite<'_>,
+    mut reader: R,
+) -> Result<PublishedFile, FileError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
     // CIRISEdge#675 — the person authors; the node co-signs at the crossing.
     let author = file_author(signers);
-    let author_key_id = author.key_id.clone();
-    // Persist's group slot per cohort: the community at `community`, the
-    // OWNER at `self`, the family at `family` — which is exactly the id the
-    // room names, so the seal and the projector cannot disagree about which
-    // group these bytes belong to (`FSD/CONTENT_TRANSFER.md` §6.2).
-    // **Shape follows size at exactly one boundary** (§6.7). CC 2.6.1.3
-    // bounds a signed envelope at 1 MiB and persist's inline cap is the same
-    // number for the same reason, so above it the bytes cannot ride inside
-    // the row and become a sealed chunk DAG (CC 5.3.3.1). Both doors take
-    // the same request and return the same `SealedContent`; the pointer's
-    // `stream_id` is what tells a reader which it got.
-    let req = SealRequest {
-        cohort_scope: write.room.row_scope_token(),
-        community_key_id: Some(write.room.content_group_id()),
-        author_key_id: &author_key_id,
-        asserted_at: write.asserted_at,
-        field: ContentField::Body,
-        plaintext: write.bytes,
-        // CIRISEdge#698 — the store seals this or writes it in clear by the
-        // tier persist resolves; this producer never chooses.
-        description: Some(Description {
-            name: write.filename,
-            format: write.media_type,
-            codec: write.codec,
-        }),
-    };
-    let chunked = must_chunk(write.bytes.len());
-    let sealed = if chunked {
-        store.seal_chunked(req).await
-    } else {
-        store.seal(req).await
-    }
-    .map_err(|e| FileError::Seal {
-        room: write.room.to_string(),
-        detail: e.to_string(),
-    })?;
+    let sealed = seal_file(store, write, &author.key_id, &mut reader).await?;
 
     // Checked BEFORE the row is authored, so a file nobody can open never
     // becomes a row somebody has to revoke.
@@ -778,9 +855,16 @@ pub async fn publish(
         );
     }
 
-    let row = file_row(author, write, &sealed.pointer)
-        .await
-        .map_err(FileError::Row)?;
+    let row = file_row_at(
+        author,
+        write.room,
+        write.asserted_at,
+        write.filename,
+        &sealed.pointer,
+        None,
+    )
+    .await
+    .map_err(FileError::Row)?;
     directory
         .put_attestation_authored(ciris_persist::federation::SignedAttestation {
             attestation: row.clone(),
@@ -832,8 +916,93 @@ pub async fn publish(
     })
 }
 
+/// The seal half of [`publish_stream`]: the shape by the DECLARED length, the
+/// store's door for it, and the store's refusal mapped to the file's words.
+async fn seal_file<R>(
+    store: &dyn GroupContentStore,
+    write: &FileStreamWrite<'_>,
+    author_key_id: &str,
+    reader: &mut R,
+) -> Result<crate::group_content::SealedContent, FileError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    use crate::group_content::{GroupContentError, StreamSealRequest};
+    let description = Some(Description {
+        name: write.filename,
+        format: write.media_type,
+        codec: write.codec,
+    });
+    // Persist's group slot per cohort: the community at `community`, the
+    // OWNER at `self`, the family at `family` — which is exactly the id the
+    // room names, so the seal and the projector cannot disagree about which
+    // group these bytes belong to (`FSD/CONTENT_TRANSFER.md` §6.2).
+    // **Shape follows size at exactly one boundary** (§6.7). CC 2.6.1.3
+    // bounds a signed envelope at 1 MiB and persist's inline cap is the same
+    // number for the same reason, so above it the bytes cannot ride inside
+    // the row and become a sealed chunk DAG (CC 5.3.3.1). Both doors return
+    // the same `SealedContent`; the pointer's `stream_id` is what tells a
+    // reader which it got. The DECLARED length decides, before a byte is
+    // read — a reader that then disagrees is refused, never re-routed.
+    let chunked = usize::try_from(write.declared_len).map_or(true, must_chunk);
+    let seal_err = |e: GroupContentError| match e {
+        GroupContentError::DeclaredLengthMismatch { declared, read } => {
+            FileError::DeclaredLengthMismatch { declared, read }
+        }
+        GroupContentError::Reader { read, detail } => FileError::Read {
+            room: write.room.to_string(),
+            read,
+            detail,
+        },
+        other => FileError::Seal {
+            room: write.room.to_string(),
+            detail: other.to_string(),
+        },
+    };
+    Ok(if chunked {
+        store
+            .seal_chunked_stream(
+                StreamSealRequest {
+                    cohort_scope: write.room.row_scope_token(),
+                    community_key_id: Some(write.room.content_group_id()),
+                    author_key_id,
+                    asserted_at: write.asserted_at,
+                    field: ContentField::Body,
+                    declared_len: write.declared_len,
+                    // CIRISEdge#698 — the store seals this or writes it in
+                    // clear by the tier persist resolves; this producer never
+                    // chooses.
+                    description,
+                },
+                reader,
+            )
+            .await
+            .map_err(seal_err)?
+    } else {
+        // At or below the inline bound (≤ 1 MiB): read whole — and exactly
+        // `declared_len`, so the inline shape is the one it always was.
+        let bytes = read_declared(reader, write.declared_len)
+            .await
+            .map_err(seal_err)?;
+        store
+            .seal(SealRequest {
+                cohort_scope: write.room.row_scope_token(),
+                community_key_id: Some(write.room.content_group_id()),
+                author_key_id,
+                asserted_at: write.asserted_at,
+                field: ContentField::Body,
+                plaintext: &bytes,
+                description,
+            })
+            .await
+            .map_err(seal_err)?
+    })
+}
+
 /// The authored row: the same binding ceremony every edge producer uses,
-/// with the file's members.
+/// with the file's members. `publish_stream` calls [`file_row_at`] directly
+/// (it holds no slice); this form stays for the unit tests.
+#[cfg(test)]
 async fn file_row(
     author: &crate::identity::LocalSigner,
     write: &FileWrite<'_>,
@@ -970,6 +1139,56 @@ pub fn must_chunk(plaintext_len: usize) -> bool {
     plaintext_len
         .saturating_add(ciris_persist::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD)
         > ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP
+}
+
+/// Read exactly `declared` bytes of an INLINE-sized write (≤ the inline
+/// bound, so the buffer is at most 1 MiB), then probe one byte more: a
+/// reader that ends early or runs on is refused by name, as the chunked path
+/// refuses it (CIRISEdge#744).
+async fn read_declared<R>(
+    reader: &mut R,
+    declared: u64,
+) -> Result<Vec<u8>, crate::group_content::GroupContentError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    use crate::group_content::GroupContentError;
+    use tokio::io::AsyncReadExt as _;
+    let io = |read: u64, e: &std::io::Error| GroupContentError::Reader {
+        read,
+        detail: e.to_string(),
+    };
+    let cap = usize::try_from(declared)
+        .map_err(|_| GroupContentError::DeclaredLengthMismatch { declared, read: 0 })?;
+    let mut buf = vec![0u8; cap];
+    let mut filled = 0usize;
+    while filled < cap {
+        match reader.read(&mut buf[filled..]).await {
+            Ok(0) => {
+                return Err(GroupContentError::DeclaredLengthMismatch {
+                    declared,
+                    read: filled as u64,
+                })
+            }
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io(filled as u64, &e)),
+        }
+    }
+    let mut probe = [0u8; 1];
+    loop {
+        match reader.read(&mut probe).await {
+            Ok(0) => return Ok(buf),
+            Ok(n) => {
+                return Err(GroupContentError::DeclaredLengthMismatch {
+                    declared,
+                    read: declared + n as u64,
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io(declared, &e)),
+        }
+    }
 }
 
 /// A file as a reader sees it, before any byte moves.
