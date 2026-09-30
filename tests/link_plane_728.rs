@@ -311,6 +311,7 @@ async fn side(
                     // Rounds are driven by the test (`round_now_all`).
                     cadence: Duration::from_secs(3600),
                     round_timeout: Duration::from_secs(15),
+                    ..SchedulerConfig::default()
                 },
                 local_key_id: Some(key.key_id.clone()),
                 metrics: Some(metrics.clone()),
@@ -675,11 +676,13 @@ async fn an_identity_send_dials_rather_than_borrowing_the_scoped_link_728() {
     let p = pair("dial").await;
     open_scoped_link_b_to_a(&p, b"scoped-open-728-dial").await;
     let before = planes(&p.a).await;
-    assert_eq!(
-        before.0, 0,
-        "precondition: A holds no identity-plane link to B (B only dialled A's derived \
-         address): {before:?}"
-    );
+    // Whether B's own replication has ALSO dialled A's identity destination
+    // by now is timing (macOS schedules it earlier than Linux; the v34.3.0
+    // darwin lane caught this precondition as a race). The invariant does not
+    // depend on it: an identity send must never ride the scoped link. When A
+    // starts with no identity link, it must DIAL one (asserted below); when B
+    // already opened one, A may use it. Either way B refuses nothing on the
+    // scoped link and admits the rows.
     assert!(before.1 >= 1, "the scoped link is live at A: {before:?}");
 
     let (frame, ids) = resource_deliver(&p).await;
@@ -695,20 +698,33 @@ async fn an_identity_send_dials_rather_than_borrowing_the_scoped_link_728() {
 
     let after = planes(&p.a).await;
     assert!(
-        after.2 >= 1,
-        "A must have DIALLED an identity-plane link to B rather than riding the scoped \
-         one: before={before:?} after={after:?} (identity, scoped, dialled-identity)"
+        after.0 >= 1,
+        "the Deliver rode an identity-plane link: before={before:?} after={after:?} \
+         (identity, scoped, dialled-identity)"
+    );
+    if before.0 == 0 {
+        assert!(
+            after.2 >= 1,
+            "with no identity link to B, A must have DIALLED one rather than riding the \
+             scoped link: before={before:?} after={after:?}"
+        );
+    }
+    assert_eq!(
+        scoped_link_refusals(&p.b.metrics),
+        0,
+        "no identity-plane frame reached B over the scoped link"
     );
     assert!(
         after.1 >= 1,
         "the scoped link is untouched by the identity-plane send: {after:?}"
     );
-    // And B classified the same links the same way from its end: the link IT
-    // dialled is scoped, the link A dialled is identity-plane.
+    // And B classified the links from its end: the one IT dialled to A's
+    // derived address is scoped, and an identity-plane link exists (A's dial,
+    // or B's own identity dial when B's replication got there first).
     let b_planes = planes(&p.b).await;
     assert!(
-        b_planes.0 >= 1 && b_planes.1 >= 1 && b_planes.2 == 0,
-        "B: one identity link (A's), one scoped link (its own): {b_planes:?}"
+        b_planes.0 >= 1 && b_planes.1 >= 1,
+        "B: an identity link and its own scoped link: {b_planes:?}"
     );
 }
 
@@ -720,7 +736,8 @@ async fn a_scoped_body_rides_the_derived_link_not_the_identity_link_728() {
     let p = pair("scoped").await;
     open_scoped_link_b_to_a(&p, b"scoped-open-728-body").await;
 
-    // Put an identity-plane link A → B in place first (A dials it).
+    // Put an identity-plane link between A and B in place first (A dials it,
+    // unless B's replication already opened one).
     let (frame, ids) = resource_deliver(&p).await;
     p.a.transport
         .send(&p.b.key.key_id, &frame)
@@ -735,8 +752,8 @@ async fn a_scoped_body_rides_the_derived_link_not_the_identity_link_728() {
     );
     let a_planes = planes(&p.a).await;
     assert!(
-        a_planes.2 >= 1,
-        "an identity link A → B is live: {a_planes:?}"
+        a_planes.0 >= 1,
+        "an identity-plane link between A and B is live (A's dial or B's): {a_planes:?}"
     );
 
     // A scoped body A → B, with that identity link live.

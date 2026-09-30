@@ -377,7 +377,9 @@ pub use runtime::{
     SealedContentWiring,
 };
 #[doc(inline)]
-pub use scheduler::{ReplicationScheduler, RoundEvent, SchedulerConfig};
+pub use scheduler::{
+    ReplicationScheduler, RoundBoundStats, RoundEvent, RoundGate, SchedulerConfig,
+};
 #[doc(inline)]
 pub use session::{ReplicationOutcome, Session, SessionRole};
 pub use summary::{ApplyOutcome, LocalState, StalenessSignal, StateApplier, StateProvider};

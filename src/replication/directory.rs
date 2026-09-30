@@ -179,8 +179,8 @@ pub trait ReplicationDirectory: Send + Sync {
     ///
     /// Deliberately **synchronous**: it is an in-memory probe of the
     /// implementation's own refusal memory, consulted once per wanted hash per
-    /// round, and routing it through the adapter's `block_on` would put a
-    /// runtime hop on the hot path of a pure map lookup. It must never do I/O.
+    /// round, and a runtime hop on the hot path of a pure map lookup would buy
+    /// nothing. It must never do I/O.
     ///
     /// Defaults to `false` (ask for everything, the pre-#544 behaviour) so the
     /// mock and any host impl need no change; the bridge overrides it with the
@@ -252,25 +252,25 @@ pub trait ReplicationDirectory: Send + Sync {
 }
 
 /// Adapter that lifts an `Arc<dyn ReplicationDirectory>` into the
-/// sync [`StateProvider`] surface the session machinery expects (the
+/// [`StateProvider`] surface the session machinery expects (the
 /// apply half lives on [`MutableDirectoryStateAdapter`]).
 ///
-/// The session machinery uses synchronous traits (the state machine
-/// is itself synchronous — it just produces messages); this adapter
-/// bridges to the async `ReplicationDirectory` by using
-/// `tokio::runtime::Handle::current().block_on(...)` inside the
-/// sync impls. SAFE because:
+/// CIRISEdge#740 — a plain async forwarder, nothing more. Until v34.3.0 the
+/// provider traits were synchronous and this adapter bridged to the async
+/// directory with `tokio::task::block_in_place` + `Handle::block_on`, argued
+/// safe because the reads were "short". Length was never the hazard; DEPTH
+/// was. `block_in_place` hands the worker's core to a replacement worker
+/// drawn from the **blocking pool**, then `block_on` parks the caller on a
+/// persist read that needs a blocking-pool slot of its own. Each concurrent
+/// bridged read therefore held one pool slot while waiting for another, and
+/// a kicked round runs every (peer, kind) at once: three peers × fourteen
+/// kinds = 42 held slots of a 32-slot pool, the persist reads behind them
+/// never started, and the node stopped (the server's gdb dump: 42 threads
+/// parked in `local_refs`'s `block_on`, zero pool threads executing). Two
+/// peers (28) fit, which is why every two-node witness was green.
 ///
-/// - The session is driven from inside an async tokio context (the
-///   coordinator's `drive_round_step` is `async fn`).
-/// - The `block_on` calls are short — typed lookups against the
-///   directory or its cache, no I/O loops.
-/// - The directory's own implementation owns its locking; the adapter
-///   doesn't add synchronization beyond what the trait obliges.
-///
-/// If the calling thread is NOT inside a tokio runtime, the
-/// `Handle::current()` call panics with a clear message — same
-/// behavior as any other tokio-coupled sync interface.
+/// A read now costs a pool slot only for the SQL call itself, like every
+/// other persist read; nothing here holds one while waiting.
 pub struct DirectoryStateAdapter {
     inner: Arc<dyn ReplicationDirectory>,
     /// CIRISEdge#379 — the peer this provider serves. When set, listing +
@@ -297,17 +297,12 @@ impl DirectoryStateAdapter {
     }
 }
 
+#[async_trait]
 impl StateProvider for DirectoryStateAdapter {
-    fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
-        let inner = Arc::clone(&self.inner);
-        let peer = self.peer_key_id.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                inner
-                    .list_envelope_refs_for_peer(kind, peer.as_deref())
-                    .await
-            })
-        })
+    async fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        self.inner
+            .list_envelope_refs_for_peer(kind, self.peer_key_id.as_deref())
+            .await
     }
 
     /// CIRISEdge#414 + #416 — the node's REAL holdings for the round's RECEIVE
@@ -318,20 +313,16 @@ impl StateProvider for DirectoryStateAdapter {
     /// it to true holdings, so `want` shrinks after admission and the round
     /// converges. The per-peer #396 send gate + projection stay on the offer
     /// ([`Self::local_refs`]) and delivery (`fetch_envelope_bytes_for_peer`).
-    fn local_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
-        let inner = Arc::clone(&self.inner);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async move { inner.list_holdings(kind).await })
-        })
+    async fn local_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        self.inner.list_holdings(kind).await
     }
 
     /// CIRISEdge#544 — forward the want-suppression question to the directory,
-    /// which is the ONE shared bridge every per-peer provider sits on. No
-    /// `block_on`: the trait method is sync precisely so this stays a map probe.
-    /// Node-wide by construction — peer A's refusal removes the row from peer
-    /// B's `want` too, which is the point (the verdict is about this node's
-    /// state, not about who carried the bytes).
+    /// which is the ONE shared bridge every per-peer provider sits on. Sync by
+    /// contract: a map probe, never I/O. Node-wide by construction — peer A's
+    /// refusal removes the row from peer B's `want` too, which is the point
+    /// (the verdict is about this node's state, not about who carried the
+    /// bytes).
     /// CIRISEdge#552 — FORWARD, do not answer.
     ///
     /// This adapter is the production `StateProvider`, and until it forwarded
@@ -370,55 +361,38 @@ impl StateProvider for DirectoryStateAdapter {
         self.inner.retry_suppressed(kind, envelope_hash)
     }
 
-    fn fetch_envelope(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> Option<Vec<u8>> {
-        let inner = Arc::clone(&self.inner);
-        let hash = *envelope_hash;
-        let peer = self.peer_key_id.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                inner
-                    .fetch_envelope_bytes_for_peer(kind, &hash, peer.as_deref())
-                    .await
-            })
-        })
+    async fn fetch_envelope(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: &[u8; 32],
+    ) -> Option<Vec<u8>> {
+        self.inner
+            .fetch_envelope_bytes_for_peer(kind, envelope_hash, self.peer_key_id.as_deref())
+            .await
     }
 
     /// CIRISEdge#462 — answer a subject-scoped Pull. Routes to
     /// [`ReplicationDirectory::subject_holdings`] with the bound `peer_key_id`
     /// (the authenticated requester) so the impl's entitlement gate (requester ==
     /// subject) and the G2 capacity carve both apply.
-    fn subject_refs(&self, kind: EnvelopeKind, subject_key_id: &str) -> Vec<EnvelopeRef> {
-        let inner = Arc::clone(&self.inner);
-        let subject = subject_key_id.to_owned();
-        let peer = self.peer_key_id.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                inner
-                    .subject_holdings(kind, &subject, peer.as_deref())
-                    .await
-            })
-        })
+    async fn subject_refs(&self, kind: EnvelopeKind, subject_key_id: &str) -> Vec<EnvelopeRef> {
+        self.inner
+            .subject_holdings(kind, subject_key_id, self.peer_key_id.as_deref())
+            .await
     }
 
-    /// CIRISEdge#474 — serve an accord-quorum-evidence cursor pull, bridging the
-    /// async persist read into the sync provider surface (same `block_on` pattern
-    /// as [`Self::subject_refs`]). Returns the serialized bundles past `since`.
-    fn accord_evidence_since(
+    /// CIRISEdge#474 — serve an accord-quorum-evidence cursor pull. Returns the
+    /// serialized bundles past `since`.
+    async fn accord_evidence_since(
         &self,
         kind: EnvelopeKind,
         since: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Vec<Vec<u8>> {
-        let inner = Arc::clone(&self.inner);
         // CIRISEdge#531 — the bound peer travels with the pull so the impl can
         // keep a per-peer serve watermark under the page's byte budget.
-        let peer = self.peer_key_id.clone();
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                inner
-                    .accord_evidence_since(kind, since, peer.as_deref())
-                    .await
-            })
-        })
+        self.inner
+            .accord_evidence_since(kind, since, self.peer_key_id.as_deref())
+            .await
     }
 }
 
@@ -432,8 +406,10 @@ impl StateProvider for DirectoryStateAdapter {
 /// wrapping mutex. (The historical name survives from the `&mut self` era,
 /// when the coordinator had to hold it inside `Arc<Mutex<dyn StateApplier>>`
 /// — the lock protected nothing and serialized every peer's applies through
-/// one hold-across-the-whole-message critical section with `block_on` DB
-/// I/O inside; the store owns the real concurrency control.)
+/// one hold-across-the-whole-message critical section; the store owns the
+/// real concurrency control.) CIRISEdge#740 — the apply is awaited directly;
+/// see [`DirectoryStateAdapter`] for why the old `block_in_place` bridge
+/// could not stay.
 pub struct MutableDirectoryStateAdapter {
     inner: Arc<dyn ReplicationDirectory>,
 }
@@ -444,23 +420,17 @@ impl MutableDirectoryStateAdapter {
     }
 }
 
+#[async_trait]
 impl StateApplier for MutableDirectoryStateAdapter {
-    fn apply_envelope(
+    async fn apply_envelope(
         &self,
         kind: EnvelopeKind,
         envelope_bytes: &[u8],
         source_peer: Option<&str>,
     ) -> ApplyOutcome {
-        let inner = Arc::clone(&self.inner);
-        let bytes = envelope_bytes.to_vec();
-        let peer = source_peer.map(str::to_owned);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                inner
-                    .apply_envelope_bytes(kind, &bytes, peer.as_deref())
-                    .await
-            })
-        })
+        self.inner
+            .apply_envelope_bytes(kind, envelope_bytes, source_peer)
+            .await
     }
 }
 
@@ -745,38 +715,42 @@ mod tests {
         assert_eq!(dir.count(EnvelopeKind::Attestation).await, 1);
     }
 
-    /// DirectoryStateAdapter (read path) bridges the async trait to
-    /// the sync StateProvider via block_in_place. The test holds the
-    /// concrete Arc<MockReplicationDirectory> for seeding AND passes
-    /// it as Arc<dyn> to the adapter.
-    #[tokio::test(flavor = "multi_thread")]
+    /// DirectoryStateAdapter (read path) forwards to the async directory —
+    /// CIRISEdge#740: on a CURRENT-THREAD runtime, which the old
+    /// `block_in_place` bridge could not run on at all (it panics outside a
+    /// multi-thread runtime). The test holds the concrete
+    /// Arc<MockReplicationDirectory> for seeding AND passes it as Arc<dyn> to
+    /// the adapter.
+    #[tokio::test]
     async fn directory_state_adapter_reads_through() {
         let mock = Arc::new(MockReplicationDirectory::new());
         mock.seed(EnvelopeKind::Key, h(3), b"e3".to_vec(), 1).await;
         let dir: Arc<dyn ReplicationDirectory> = Arc::clone(&mock) as Arc<dyn ReplicationDirectory>;
         let adapter = DirectoryStateAdapter::new(dir);
-        let refs = adapter.local_refs(EnvelopeKind::Key);
+        let refs = adapter.local_refs(EnvelopeKind::Key).await;
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].envelope_hash, h(3));
-        let bytes = adapter.fetch_envelope(EnvelopeKind::Key, &h(3));
+        let bytes = adapter.fetch_envelope(EnvelopeKind::Key, &h(3)).await;
         assert_eq!(bytes, Some(b"e3".to_vec()));
     }
 
-    /// MutableDirectoryStateAdapter (write path) bridges the async
-    /// trait to the `&self` StateApplier (#370).
-    #[tokio::test(flavor = "multi_thread")]
+    /// MutableDirectoryStateAdapter (write path) forwards to the async
+    /// directory's `&self` apply (#370, #740).
+    #[tokio::test]
     async fn mutable_directory_state_adapter_writes_through() {
         let mock = Arc::new(MockReplicationDirectory::new());
         let dir: Arc<dyn ReplicationDirectory> = Arc::clone(&mock) as Arc<dyn ReplicationDirectory>;
         let adapter = MutableDirectoryStateAdapter::new(dir);
-        let admitted = adapter.apply_envelope(EnvelopeKind::Revocation, b"rev_bytes", None);
+        let admitted = adapter
+            .apply_envelope(EnvelopeKind::Revocation, b"rev_bytes", None)
+            .await;
         assert!(admitted.is_admitted());
         assert_eq!(mock.count(EnvelopeKind::Revocation).await, 1);
     }
 
     /// Round-trip via the adapters: seed via mock, list via adapter,
     /// apply via adapter, re-list shows the new envelope.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn adapters_round_trip_via_session_shape() {
         let mock = Arc::new(MockReplicationDirectory::new());
         mock.seed(EnvelopeKind::Attestation, h(1), b"e1".to_vec(), 1)
@@ -785,15 +759,28 @@ mod tests {
         let provider = DirectoryStateAdapter::new(Arc::clone(&dir));
         let applier = MutableDirectoryStateAdapter::new(dir);
         // Initial list shows the seed.
-        assert_eq!(provider.local_refs(EnvelopeKind::Attestation).len(), 1);
+        assert_eq!(
+            provider.local_refs(EnvelopeKind::Attestation).await.len(),
+            1
+        );
         // Apply a new envelope.
-        let admitted = applier.apply_envelope(EnvelopeKind::Attestation, b"e_new", None);
+        let admitted = applier
+            .apply_envelope(EnvelopeKind::Attestation, b"e_new", None)
+            .await;
         assert!(admitted.is_admitted());
         // List now shows two.
-        assert_eq!(provider.local_refs(EnvelopeKind::Attestation).len(), 2);
+        assert_eq!(
+            provider.local_refs(EnvelopeKind::Attestation).await.len(),
+            2
+        );
         // Duplicate apply refused.
-        let dup = applier.apply_envelope(EnvelopeKind::Attestation, b"e_new", None);
+        let dup = applier
+            .apply_envelope(EnvelopeKind::Attestation, b"e_new", None)
+            .await;
         assert!(!dup.is_admitted(), "duplicate apply must not admit");
-        assert_eq!(provider.local_refs(EnvelopeKind::Attestation).len(), 2);
+        assert_eq!(
+            provider.local_refs(EnvelopeKind::Attestation).await.len(),
+            2
+        );
     }
 }

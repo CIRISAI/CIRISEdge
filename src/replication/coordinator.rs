@@ -181,10 +181,11 @@ pub struct ReplicationCoordinator {
     /// NO wrapping mutex: `apply_envelope` is `&self` (stateless production
     /// adapter; interior-mutable test appliers), so per-peer coordinators
     /// apply concurrently down to the store's own serialization. The old
-    /// `Arc<Mutex<_>>` was held across a whole message's applies — with
-    /// `block_on` DB I/O inside — serializing round servicing across peers
-    /// (≈ N × batch-apply-time; the ~40-peer collapse past the 30 s
-    /// transport timeout) while protecting nothing.
+    /// `Arc<Mutex<_>>` was held across a whole message's applies —
+    /// serializing round servicing across peers (≈ N × batch-apply-time; the
+    /// ~40-peer collapse past the 30 s transport timeout) while protecting
+    /// nothing. CIRISEdge#740 — the apply is awaited: no `block_in_place` /
+    /// `block_on` bridge sits on this path any more.
     applier: Arc<dyn StateApplier>,
     /// The long-lived state machine for this peer-pair anti-entropy
     /// relationship. Wrapped in `Mutex` so `drive_round_step` can
@@ -624,7 +625,7 @@ impl ReplicationCoordinator {
                     self.end_round().await;
                 }
                 self.begin_round().await;
-                session.start_round(self.provider.as_ref())
+                session.start_round(self.provider.as_ref()).await
             }
             Some(Inbound { msg: m, meta }) => {
                 if let RoleInbox::Responder { bound_round, .. } = &self.inbox {
@@ -659,12 +660,14 @@ impl ReplicationCoordinator {
                         );
                     }
                 }
-                session.on_message(
-                    m,
-                    self.provider.as_ref(),
-                    self.applier.as_ref(),
-                    Some(self.peer_key_id.as_str()),
-                )
+                session
+                    .on_message(
+                        m,
+                        self.provider.as_ref(),
+                        self.applier.as_ref(),
+                        Some(self.peer_key_id.as_str()),
+                    )
+                    .await
             }
         };
         let step = Self::outcome_to_step(outcome);
@@ -1090,17 +1093,22 @@ mod tests {
         state: LocalState,
         envelopes: HashMap<[u8; 32], Vec<u8>>,
     }
+    #[async_trait::async_trait]
     impl StateProvider for StaticProvider {
-        fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        async fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
             self.state.refs_for(kind)
         }
-        fn fetch_envelope(&self, _kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
+        async fn fetch_envelope(&self, _kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
             self.envelopes.get(h).cloned()
         }
         // CIRISEdge#462 — the mock treats its whole state as the pulled subject's
         // testimony (a real bridge scopes + gates per subject; here we exercise
         // the coordinator wiring, not the serve gate).
-        fn subject_refs(&self, kind: EnvelopeKind, _subject_key_id: &str) -> Vec<EnvelopeRef> {
+        async fn subject_refs(
+            &self,
+            kind: EnvelopeKind,
+            _subject_key_id: &str,
+        ) -> Vec<EnvelopeRef> {
             self.state.refs_for(kind)
         }
     }
@@ -1127,8 +1135,9 @@ mod tests {
             })
         }
     }
+    #[async_trait::async_trait]
     impl StateApplier for RecordingApplier {
-        fn apply_envelope(
+        async fn apply_envelope(
             &self,
             _kind: EnvelopeKind,
             bytes: &[u8],
@@ -1857,8 +1866,8 @@ mod tests {
     /// CIRISEdge#370 — THE fix's proof: two coordinators (two different peers)
     /// sharing ONE `Arc<dyn StateApplier>` apply CONCURRENTLY — no wrapping
     /// mutex serializes them. Field-provenance: the shared applier is the REAL
-    /// production adapter ([`MutableDirectoryStateAdapter`], the exact
-    /// `block_in_place → block_on` bridge the runtime wires), over a
+    /// production adapter ([`MutableDirectoryStateAdapter`], the exact async
+    /// forwarder the runtime wires — CIRISEdge#740), over a
     /// [`ReplicationDirectory`] whose `apply_envelope_bytes` parks each apply
     /// on a 2-party `tokio::sync::Barrier`. The barrier releases ONLY if the
     /// second peer's apply enters while the first is still inside — under the

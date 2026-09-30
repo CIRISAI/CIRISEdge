@@ -43,6 +43,24 @@
 //! tokio core, no new dep) instead of `CancellationToken` keeps the
 //! dep surface minimal.
 //!
+//! ## A kick is bounded (CIRISEdge#740)
+//!
+//! `RoundNow` and `Propagate` kick every matching coordinator at once, and
+//! every coordinator's first cadence tick fires the moment it is spawned —
+//! so a kick (or a start) on a node with P peers over K planes would run
+//! P × K rounds concurrently. Every round makes persist reads, and persist
+//! runs each SQL call on tokio's blocking pool; with the read path async end
+//! to end (#740) an unbounded fan-out can no longer wedge the pool, but it
+//! can still fill it — 130 peers × 14 planes is 1,820 rounds queueing on a
+//! 32-slot pool. So the scheduler drives at most
+//! [`SchedulerConfig::max_concurrent_rounds`] rounds at a time, across every
+//! coordinator it owns, through one [`RoundGate`]: a kicked coordinator that
+//! finds the gate full WAITS for a permit (its kick is not lost — the
+//! `Notify` holds it), then runs. No sleeps, no retry counts: the gate is a
+//! semaphore and the wait is exactly as long as the rounds ahead of it. The
+//! bound is chosen once and logged once at start; every wait is counted
+//! ([`RoundBoundStats`]).
+//!
 //! ## Round timeout
 //!
 //! Each in-flight `SendThenWait` wait is bounded by `round_timeout`.
@@ -53,6 +71,7 @@
 //! up whatever state changed in the meantime.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,11 +98,51 @@ use super::session::SessionRole;
 pub struct SchedulerConfig {
     pub cadence: Duration,
     pub round_timeout: Duration,
+    /// CIRISEdge#740 — at most this many `(peer, kind)` rounds in flight at
+    /// once across EVERY coordinator this scheduler drives (kicked and
+    /// cadence rounds alike). A round holds one permit from its open to its
+    /// close, so a kick on a P-peer, K-plane node runs `min(P × K, this)`
+    /// rounds concurrently and queues the rest behind the gate — counted,
+    /// never dropped. `0` is raised to `1` (a bound of zero would be a
+    /// scheduler that never runs a round). Default
+    /// [`Self::DEFAULT_MAX_CONCURRENT_ROUNDS`]; see
+    /// [`Self::max_concurrent_rounds_for`] for the rule.
+    pub max_concurrent_rounds: usize,
 }
 
 impl SchedulerConfig {
     pub const DEFAULT_CADENCE: Duration = Duration::from_secs(30);
     pub const DEFAULT_ROUND_TIMEOUT: Duration = Duration::from_secs(10);
+    /// CIRISEdge#740 — the default round bound, derived from the default
+    /// blocking-pool ceiling by [`Self::max_concurrent_rounds_for`]: half of
+    /// [`DEFAULT_MAX_BLOCKING_THREADS`](crate::runtime_budget::DEFAULT_MAX_BLOCKING_THREADS)
+    /// (32), i.e. 16.
+    pub const DEFAULT_MAX_CONCURRENT_ROUNDS: usize =
+        Self::max_concurrent_rounds_for(crate::runtime_budget::DEFAULT_MAX_BLOCKING_THREADS);
+
+    /// CIRISEdge#740 — the rule: at most HALF the blocking pool may be
+    /// occupied by anti-entropy rounds at once, so a full fan-out can never
+    /// take the last slot from persist's own connection waiters, the
+    /// transport, or anything else that shares the pool.
+    ///
+    /// A round is sequential internally — it awaits one persist call at a
+    /// time — so N in-flight rounds put at most N calls on the pool. The
+    /// pre-#740 arithmetic was the other way round: each bridged read held a
+    /// slot WHILE waiting for a slot, so 42 rounds needed 42 + 42 of 32.
+    /// This rule assumes the read path is async end to end; that invariant
+    /// is what `FSD/CIRIS_EDGE_TRANSPORT.md` §4 pins.
+    ///
+    /// A host that sizes its own pool (CIRISServer's `node_runtime`, edge's
+    /// `RuntimeBudget`) should pass that size here.
+    #[must_use]
+    pub const fn max_concurrent_rounds_for(max_blocking_threads: usize) -> usize {
+        let half = max_blocking_threads / 2;
+        if half == 0 {
+            1
+        } else {
+            half
+        }
+    }
 }
 
 impl Default for SchedulerConfig {
@@ -91,6 +150,107 @@ impl Default for SchedulerConfig {
         Self {
             cadence: Self::DEFAULT_CADENCE,
             round_timeout: Self::DEFAULT_ROUND_TIMEOUT,
+            max_concurrent_rounds: Self::DEFAULT_MAX_CONCURRENT_ROUNDS,
+        }
+    }
+}
+
+/// CIRISEdge#740 — the one gate every round of one scheduler passes through:
+/// a semaphore sized to [`SchedulerConfig::max_concurrent_rounds`], plus the
+/// counters that make the bound observable. Shared by every coordinator task
+/// the scheduler spawns (initial and hot-added).
+#[derive(Debug)]
+pub struct RoundGate {
+    permits: tokio::sync::Semaphore,
+    bound: usize,
+    in_flight: AtomicUsize,
+    peak_in_flight: AtomicUsize,
+    waited: AtomicU64,
+}
+
+/// CIRISEdge#740 — a snapshot of [`RoundGate`]: the bound, how many rounds
+/// are in flight now, the most that ever were, and how many rounds had to
+/// wait for a permit since start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundBoundStats {
+    pub bound: usize,
+    pub in_flight: usize,
+    pub peak_in_flight: usize,
+    pub waited: u64,
+}
+
+/// A round's permit: released — and the in-flight gauge decremented — on
+/// drop, so every exit path out of a round (completion, timeout, error,
+/// cancel, panic) returns the slot.
+struct RoundPermit<'a> {
+    gate: &'a RoundGate,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+}
+
+impl Drop for RoundPermit<'_> {
+    fn drop(&mut self) {
+        self.gate.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl RoundGate {
+    fn new(bound: usize) -> Self {
+        let bound = bound.max(1);
+        Self {
+            permits: tokio::sync::Semaphore::new(bound),
+            bound,
+            in_flight: AtomicUsize::new(0),
+            peak_in_flight: AtomicUsize::new(0),
+            waited: AtomicU64::new(0),
+        }
+    }
+
+    /// Say the bound once, when the scheduler starts driving.
+    fn log_bound(&self, coordinators: usize) {
+        tracing::info!(
+            max_concurrent_rounds = self.bound,
+            coordinators,
+            "scheduler: rounds are bounded — a kick or a start runs at most this many \
+             (peer, kind) rounds at once; the rest queue behind the gate (CIRISEdge#740)"
+        );
+    }
+
+    /// Take a permit, waiting behind the rounds ahead if the gate is full.
+    async fn enter(&self, peer_id: &str, kind: &str) -> RoundPermit<'_> {
+        let permit = if let Ok(p) = self.permits.try_acquire() {
+            p
+        } else {
+            let waited = self.waited.fetch_add(1, Ordering::AcqRel) + 1;
+            tracing::debug!(
+                peer = %peer_id,
+                kind = %kind,
+                bound = self.bound,
+                waited_total = waited,
+                "round bound: gate full — this round waits for a permit (CIRISEdge#740)"
+            );
+            // The semaphore is never closed, so this cannot fail; a
+            // closed gate would be a scheduler bug, not a round outcome.
+            self.permits
+                .acquire()
+                .await
+                .expect("round gate is never closed")
+        };
+        let now = self.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak_in_flight.fetch_max(now, Ordering::AcqRel);
+        RoundPermit {
+            gate: self,
+            _permit: permit,
+        }
+    }
+
+    /// The gate's current numbers.
+    #[must_use]
+    pub fn stats(&self) -> RoundBoundStats {
+        RoundBoundStats {
+            bound: self.bound,
+            in_flight: self.in_flight.load(Ordering::Acquire),
+            peak_in_flight: self.peak_in_flight.load(Ordering::Acquire),
+            waited: self.waited.load(Ordering::Acquire),
         }
     }
 }
@@ -138,6 +298,8 @@ pub struct ReplicationScheduler {
     config: SchedulerConfig,
     coordinators: Vec<Arc<ReplicationCoordinator>>,
     command_rx: Option<mpsc::Receiver<SchedulerCommand>>,
+    /// CIRISEdge#740 — the round bound, shared by every coordinator task.
+    round_gate: Arc<RoundGate>,
     /// CIRISEdge#440 — the resolved mesh-config read seam. When `Some`, each
     /// coordinator loop re-checks `antientropy.round_secs` ONCE per round
     /// (after the round, before the next tick is scheduled): a live relief
@@ -219,9 +381,17 @@ struct CoordControl {
 #[derive(Clone, Debug)]
 pub struct SchedulerHandle {
     command_tx: mpsc::Sender<SchedulerCommand>,
+    /// CIRISEdge#740 — read access to the scheduler's round gate.
+    round_gate: Arc<RoundGate>,
 }
 
 impl SchedulerHandle {
+    /// CIRISEdge#740 — the round bound and its counters.
+    #[must_use]
+    pub fn round_bound(&self) -> RoundBoundStats {
+        self.round_gate.stats()
+    }
+
     /// Add an Initiator coordinator to the running scheduler. The
     /// scheduler spawns a new task on its next select iteration.
     /// Idempotent vs. an already-active `(peer_key_id, kind)`:
@@ -294,12 +464,25 @@ pub enum SchedulerCommandError {
 
 impl ReplicationScheduler {
     pub fn new(config: SchedulerConfig) -> Self {
+        if config.max_concurrent_rounds == 0 {
+            tracing::warn!(
+                "scheduler: max_concurrent_rounds(0) would never run a round; using 1 \
+                 (CIRISEdge#740)"
+            );
+        }
         Self {
             config,
             coordinators: Vec::new(),
             command_rx: None,
+            round_gate: Arc::new(RoundGate::new(config.max_concurrent_rounds)),
             mesh_config: None,
         }
+    }
+
+    /// CIRISEdge#740 — the round bound and its counters.
+    #[must_use]
+    pub fn round_bound(&self) -> RoundBoundStats {
+        self.round_gate.stats()
     }
 
     /// CIRISEdge#440 — install the resolved mesh-config reader (builder); see
@@ -325,7 +508,10 @@ impl ReplicationScheduler {
     pub fn install_control_channel(&mut self) -> SchedulerHandle {
         let (command_tx, command_rx) = mpsc::channel(32);
         self.command_rx = Some(command_rx);
-        SchedulerHandle { command_tx }
+        SchedulerHandle {
+            command_tx,
+            round_gate: Arc::clone(&self.round_gate),
+        }
     }
 
     /// Register an Initiator-side coordinator with the scheduler.
@@ -388,6 +574,10 @@ impl ReplicationScheduler {
         let mut per_coord: HashMap<(String, EnvelopeKind), CoordControl> = HashMap::new();
         let mut handles = Vec::with_capacity(self.coordinators.len());
 
+        // CIRISEdge#740 — the bound is chosen once, here, and said once.
+        let round_gate = Arc::clone(&self.round_gate);
+        round_gate.log_bound(self.coordinators.len());
+
         let mesh_config = self.mesh_config.take();
         for coord in self.coordinators.drain(..) {
             spawn_coord(
@@ -398,6 +588,7 @@ impl ReplicationScheduler {
                 self.config.round_timeout,
                 event_sink.clone(),
                 mesh_config.clone(),
+                Arc::clone(&round_gate),
             );
         }
 
@@ -438,6 +629,7 @@ impl ReplicationScheduler {
                                 self.config.round_timeout,
                                 event_sink.clone(),
                                 mesh_config.clone(),
+                                Arc::clone(&round_gate),
                             );
                         }
                         SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
@@ -493,6 +685,7 @@ impl ReplicationScheduler {
 }
 
 /// Spawn one coordinator task and record its per-coord cancel handle.
+#[allow(clippy::too_many_arguments)] // one spawn site's wiring, every arg a distinct seam
 fn spawn_coord(
     per_coord: &mut HashMap<(String, EnvelopeKind), CoordControl>,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
@@ -501,6 +694,7 @@ fn spawn_coord(
     round_timeout: Duration,
     event_sink: Option<mpsc::Sender<(String, RoundEvent)>>,
     mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
+    round_gate: Arc<RoundGate>,
 ) {
     debug_assert_eq!(
         coord.role(),
@@ -526,12 +720,14 @@ fn spawn_coord(
             kick,
             event_sink,
             mesh_config,
+            round_gate,
         )
         .await;
     });
     handles.push(h);
 }
 
+#[allow(clippy::too_many_arguments)] // the per-coordinator loop's wiring, one seam each
 async fn run_one_coordinator_forever(
     coord: Arc<ReplicationCoordinator>,
     cadence: Duration,
@@ -540,6 +736,7 @@ async fn run_one_coordinator_forever(
     kick: Arc<tokio::sync::Notify>,
     event_sink: Option<tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
     mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
+    round_gate: Arc<RoundGate>,
 ) {
     let mut interval = tokio::time::interval(cadence);
     // `Burst` is the default; with `MissedTickBehavior::Skip` a
@@ -569,14 +766,23 @@ async fn run_one_coordinator_forever(
                 // (`ReplicationRuntime::sync_and_await`): run the round now
                 // and push the next scheduled one a full cadence out, so a
                 // kick never doubles a round.
+                //
+                // CIRISEdge#740 — behind the gate: a kick fans out to every
+                // coordinator at once, and the gate is what turns that into
+                // at most `max_concurrent_rounds` rounds in flight.
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str, kicked = true);
                 let _enter = span.enter();
+                let _permit = round_gate.enter(&peer_id, &kind_str).await;
                 round_and_report(&coord, round_timeout, event_sink.as_ref(), &peer_id).await;
                 interval.reset();
             }
             _ = interval.tick() => {
+                // CIRISEdge#740 — behind the same gate: every coordinator's
+                // first tick fires the moment it is spawned, so a start is a
+                // fan-out too.
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
                 let _enter = span.enter();
+                let _permit = round_gate.enter(&peer_id, &kind_str).await;
                 round_and_report(&coord, round_timeout, event_sink.as_ref(), &peer_id).await;
                 if let Some(reader) = &mesh_config {
                     let target = reader.relief().await.round_cadence.unwrap_or(cadence);
@@ -919,11 +1125,12 @@ mod tests {
         state: LocalState,
         envelopes: HashMap<[u8; 32], Vec<u8>>,
     }
+    #[async_trait::async_trait]
     impl StateProvider for StaticProvider {
-        fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        async fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
             self.state.refs_for(kind)
         }
-        fn fetch_envelope(&self, _kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
+        async fn fetch_envelope(&self, _kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
             self.envelopes.get(h).cloned()
         }
     }
@@ -946,8 +1153,9 @@ mod tests {
             })
         }
     }
+    #[async_trait::async_trait]
     impl StateApplier for RecordingApplier {
-        fn apply_envelope(
+        async fn apply_envelope(
             &self,
             _kind: EnvelopeKind,
             bytes: &[u8],
@@ -974,6 +1182,7 @@ mod tests {
         SchedulerConfig {
             cadence: Duration::from_millis(10),
             round_timeout: Duration::from_millis(500),
+            ..SchedulerConfig::default()
         }
     }
 
@@ -1171,6 +1380,7 @@ mod tests {
         let config = SchedulerConfig {
             cadence: Duration::from_millis(10),
             round_timeout: Duration::from_millis(100),
+            ..SchedulerConfig::default()
         };
         let mut sched = ReplicationScheduler::new(config);
         sched.add_initiator(alice_coord);
@@ -1252,6 +1462,7 @@ mod tests {
         let mut sched = ReplicationScheduler::new(SchedulerConfig {
             cadence: Duration::from_secs(3600),
             round_timeout: Duration::from_millis(80),
+            ..SchedulerConfig::default()
         });
         let control = sched.install_control_channel();
         let (event_tx, mut event_rx) = mpsc::channel::<(String, RoundEvent)>(64);
@@ -1327,6 +1538,158 @@ mod tests {
             .await
             .expect("shutdown")
             .expect("join");
+    }
+
+    /// CIRISEdge#740 — a kick is bounded. N+1 coordinators are kicked at once
+    /// under a bound of N: exactly N rounds enter their provider read, the
+    /// (N+1)th waits behind the gate (counted in `waited`), and it runs the
+    /// moment a permit frees — nothing is dropped, the peak never exceeds N.
+    /// The provider parks each read on an awaited gate, so "in flight" here is
+    /// a round genuinely inside its persist-shaped read, not a race window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)] // one scenario: start, close, kick, observe, open, drain
+    async fn a_kick_of_n_plus_one_rounds_runs_at_most_n_at_once() {
+        const N: usize = 2;
+        struct ParkingProvider {
+            open: watch::Receiver<bool>,
+            entered: Arc<std::sync::atomic::AtomicUsize>,
+            entered_note: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl StateProvider for ParkingProvider {
+            async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                self.entered.fetch_add(1, Ordering::AcqRel);
+                self.entered_note.notify_waiters();
+                let mut open = self.open.clone();
+                while !*open.borrow_and_update() {
+                    if open.changed().await.is_err() {
+                        break;
+                    }
+                }
+                Vec::new()
+            }
+            async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                None
+            }
+        }
+
+        let mut sched = ReplicationScheduler::new(SchedulerConfig {
+            cadence: Duration::from_secs(3600),
+            round_timeout: Duration::from_millis(200),
+            max_concurrent_rounds: N,
+        });
+        let control = sched.install_control_channel();
+        let (event_tx, mut event_rx) = mpsc::channel::<(String, RoundEvent)>(64);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (open_tx, open_rx) = watch::channel(true);
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered_note = Arc::new(tokio::sync::Notify::new());
+        let sched_handle =
+            tokio::spawn(async move { sched.run_with_events(cancel_rx, Some(event_tx)).await });
+
+        for i in 0..=N {
+            let transport: Arc<dyn Transport> = Arc::new(InMemTransport {
+                peer_inbox: HashMap::new(),
+            });
+            let provider: Arc<dyn StateProvider> = Arc::new(ParkingProvider {
+                open: open_rx.clone(),
+                entered: Arc::clone(&entered),
+                entered_note: Arc::clone(&entered_note),
+            });
+            let applier = RecordingApplier::with(HashMap::new(), std::collections::HashSet::new());
+            control
+                .add_initiator(Arc::new(ReplicationCoordinator::new(
+                    transport,
+                    format!("peer-{i}"),
+                    EnvelopeKind::Key,
+                    SessionRole::Initiator,
+                    provider,
+                    applier,
+                )))
+                .await
+                .expect("add");
+        }
+        // Start-up fan-out with the gate open: every coordinator's first tick.
+        for _ in 0..=N {
+            tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("start-up round")
+                .expect("open");
+        }
+        let base = entered.load(Ordering::Acquire);
+        let base_waited = control.round_bound().waited;
+
+        // Close the read gate and KICK every coordinator at once.
+        open_tx.send_replace(false);
+        control.round_now(None).await.expect("kick");
+
+        // Exactly N rounds reach their read.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let note = entered_note.notified();
+                if entered.load(Ordering::Acquire) >= base + N {
+                    break;
+                }
+                note.await;
+            }
+        })
+        .await
+        .expect("N rounds enter their read");
+        let stats = control.round_bound();
+        assert_eq!(stats.bound, N);
+        assert_eq!(stats.in_flight, N, "N rounds hold the gate: {stats:?}");
+        // The (N+1)th is behind the gate, not inside a read: give it every
+        // chance to (wrongly) enter.
+        let extra = tokio::time::timeout(Duration::from_millis(300), async {
+            loop {
+                let note = entered_note.notified();
+                if entered.load(Ordering::Acquire) > base + N {
+                    break;
+                }
+                note.await;
+            }
+        })
+        .await;
+        assert!(
+            extra.is_err(),
+            "round N+1 entered its read while N held the gate"
+        );
+        assert_eq!(entered.load(Ordering::Acquire), base + N);
+        assert!(
+            control.round_bound().waited > base_waited,
+            "the waiting round is counted: {:?}",
+            control.round_bound()
+        );
+
+        // Open the gate: all N+1 rounds finish — the waiter was queued, not lost.
+        open_tx.send_replace(true);
+        for _ in 0..=N {
+            tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("kicked round")
+                .expect("open");
+        }
+        assert_eq!(entered.load(Ordering::Acquire), base + N + 1);
+        let stats = control.round_bound();
+        assert_eq!(stats.in_flight, 0, "every permit returned: {stats:?}");
+        assert_eq!(stats.peak_in_flight, N, "the bound was never exceeded");
+
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), sched_handle)
+            .await
+            .expect("shutdown")
+            .expect("join");
+    }
+
+    /// CIRISEdge#740 — a bound of zero is raised to one, never a scheduler that
+    /// cannot run a round.
+    #[test]
+    fn a_zero_round_bound_is_raised_to_one() {
+        let s = ReplicationScheduler::new(SchedulerConfig {
+            max_concurrent_rounds: 0,
+            ..SchedulerConfig::default()
+        });
+        assert_eq!(s.round_bound().bound, 1);
     }
 
     #[tokio::test]
@@ -1513,6 +1876,7 @@ mod tests {
         let config = SchedulerConfig {
             cadence: Duration::from_millis(20),
             round_timeout: Duration::from_millis(40),
+            ..SchedulerConfig::default()
         };
         let window = Duration::from_millis(800);
 
@@ -1547,8 +1911,9 @@ mod tests {
     struct RecoveryProvider {
         queued: std::sync::Mutex<Option<String>>,
     }
+    #[async_trait::async_trait]
     impl StateProvider for RecoveryProvider {
-        fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
             // Deliberately non-empty is unnecessary: invariant 1 is about what
             // a RECOVERY round puts on the wire, and it must send no Summary
             // even when this node has refs it would otherwise advertise.
@@ -1557,7 +1922,7 @@ mod tests {
                 seq: 1,
             }]
         }
-        fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+        async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
             None
         }
         fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {

@@ -836,7 +836,7 @@ impl Default for BridgeConfig {
 /// [`SweepGate::enter`] hands back a [`SweepPermit`] whose `Drop` releases both
 /// the permit and the in-flight count. Every exit path out of a sweep —
 /// `return`, `?`, an early `Vec::new()` refusal, a panic unwinding through the
-/// `block_in_place` bridge — runs it. There is no manual release to forget.
+/// provider's await — runs it. There is no manual release to forget.
 ///
 /// ## Re-entrancy
 ///
@@ -20709,8 +20709,8 @@ mod sweep_width_tests {
 
     /// Release is STRUCTURAL, not a manual call an early return can skip. Both
     /// non-happy exits are covered: an error return out of the middle of a
-    /// sweep, and a panic unwinding through it (the `block_in_place` bridge the
-    /// production provider uses can carry one).
+    /// sweep, and a panic unwinding through it (a panic in the awaited
+    /// provider read carries through the round's task).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn permit_is_released_on_every_exit_path() {
         /// A sweep that takes the gate and then bails out mid-way, the shape
