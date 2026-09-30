@@ -1295,6 +1295,49 @@ impl InboundStats {
     }
 }
 
+/// CIRISEdge#768 — persist's gated serve door, answering each blob's SCOPE from
+/// the row that references it (`BlobMeaning::project`). A node with a scope
+/// address table must answer `chunk_scope`, or the scope gate withholds every
+/// scoped fetch as undeterminable (CIRISEdge#499/#640). Same shape as the
+/// in-repo scope-native fixtures (`tests/self_dag_field_path_717.rs`).
+struct RowScopedChunkSource {
+    inner: ciris_edge::blob_swarm::PersistBlobChunkSource,
+    dir: Arc<SqliteBackend>,
+}
+
+#[async_trait::async_trait]
+impl ciris_edge::blob_swarm::BlobChunkSource for RowScopedChunkSource {
+    async fn read_chunk(
+        &self,
+        blob_sha256: [u8; 32],
+        chunk_sha256: [u8; 32],
+        requesting_peer_key_id: &str,
+    ) -> Result<Option<Vec<u8>>, ciris_edge::blob_swarm::ChunkSourceRefusal> {
+        self.inner
+            .read_chunk(blob_sha256, chunk_sha256, requesting_peer_key_id)
+            .await
+    }
+
+    async fn chunk_scope(
+        &self,
+        blob_sha256: [u8; 32],
+    ) -> Option<ciris_edge::blob_swarm::ContentScope> {
+        use ciris_persist::federation::FederationDirectory as _;
+        let rows = self
+            .dir
+            .attestations_binding_content(&hex::encode(blob_sha256))
+            .await
+            .ok()?;
+        rows.iter()
+            .find_map(|row| ciris_edge::blob_swarm::BlobMeaning::project(row, &blob_sha256).ok())
+            .map(|m| m.scope().clone())
+    }
+
+    fn answers_scope(&self) -> bool {
+        true
+    }
+}
+
 /// Drain the transport, splitting harness frames from REPLICATION frames.
 ///
 /// `Transport::listen` claims the node's single event receiver, so whoever
@@ -1312,6 +1355,7 @@ fn spawn_inbound(
     transport: &Arc<ReticulumTransport>,
     router: ciris_edge::replication::InboundRouter,
     stats: Arc<InboundStats>,
+    edge: Arc<ciris_edge::Edge>,
 ) -> Arc<Mailbox> {
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(4096);
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
@@ -1331,7 +1375,20 @@ fn spawn_inbound(
             let Some((kind, header, payload)) = decode_frame(&frame.envelope_bytes) else {
                 // Not harness framing — hand it to replication before giving up
                 // on it. This is THE line the module docs ask the operator for.
-                stats.record(&router.try_route(&frame).await);
+                let disposition = router.try_route(&frame).await;
+                stats.record(&disposition);
+                // CIRISEdge#768 — neither harness framing nor replication: an
+                // edge envelope (the blob plane's `BlobChunkFetch` and its
+                // answers), so it goes to the Edge's own inbound dispatch —
+                // the body `Edge::run` runs per frame. Spawned: a serve reads
+                // the store and signs, and must not stall this demultiplexer.
+                if matches!(
+                    disposition,
+                    ciris_edge::replication::RouteDisposition::NotReplication
+                ) {
+                    let edge = Arc::clone(&edge);
+                    tokio::spawn(async move { edge.dispatch_inbound_for_test(frame).await });
+                }
                 continue;
             };
             match kind {
@@ -2287,6 +2344,67 @@ async fn stand_up(
         cfg.convergence,
     ));
 
+    // ── 7b. THE BLOB PLANE: serve and pull, the production path ──────
+    //
+    // CIRISEdge#768. A chat body is a blob in the room's store with only a
+    // pointer on the row (#596), so a member reads it only once the bytes are
+    // HERE. Without this the receiver held the row, the key_grant and the
+    // widening, and read `NotFetched` forever — `SealedContentWiring`'s own
+    // documented `pull_sink: None` outcome.
+    //
+    // Serve: an `Edge` over this node's transport whose chunk source is
+    // persist's gated serve door, answering each blob's scope from the row
+    // that references it (the scope gate judges the address a request arrived
+    // on against it). The harness keeps `Transport::listen` (it demultiplexes
+    // its own framing and replication); the frames that are neither — the
+    // `BlobChunkFetch` requests and their answers — are handed to this Edge's
+    // dispatch (`spawn_inbound`). `Edge::run` is not started: it would claim
+    // the same single listener.
+    //
+    // Pull: persist's `BlobPuller`, offered every admitted row that references
+    // a blob by the replication bridge, fetching over the room's scope-native
+    // routes through this same Edge.
+    let revocations = Arc::new(ciris_edge::blob_swarm::RevocationRegister::default());
+    let edge = Arc::new(
+        ciris_edge::Edge::builder()
+            .directory(Arc::clone(&directory) as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+            .federation_directory(
+                Arc::clone(&directory) as Arc<dyn ciris_persist::federation::FederationDirectory>
+            )
+            .queue(directory.clone())
+            .signer(Arc::clone(&node_signer))
+            .reticulum_transport(Arc::clone(&transport))
+            .blob_chunk_source(Arc::new(RowScopedChunkSource {
+                inner: ciris_edge::blob_swarm::PersistBlobChunkSource::new(engine.0.clone())
+                    .with_revocations(Some(Arc::clone(&revocations))),
+                dir: Arc::clone(&directory),
+            }))
+            .config(ciris_edge::EdgeConfig {
+                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                ..ciris_edge::EdgeConfig::default()
+            })
+            .build()
+            .map_err(|e| format!("build the blob-plane edge: {e}"))?,
+    );
+    let (pull_sink, _puller) = ciris_edge::blob_swarm::BlobPuller::spawn(
+        Arc::clone(&edge),
+        engine.0.clone(),
+        Arc::clone(&directory),
+        Arc::clone(&directory) as Arc<dyn ciris_persist::federation::FederationDirectory>,
+        cfg.node_id.clone(),
+        ciris_edge::blob_swarm::PullConfig {
+            // What a node that stores its owner's rooms consents to: its own,
+            // its family's and its communities' bytes; never the commons.
+            consent: ciris_edge::blob_swarm::OperatorStoreConsent {
+                own: ciris_edge::blob_swarm::ConsentDisposition::Announce,
+                family: ciris_edge::blob_swarm::ConsentDisposition::Announce,
+                community: ciris_edge::blob_swarm::ConsentDisposition::Announce,
+                commons: ciris_edge::blob_swarm::ConsentDisposition::Decline,
+            },
+            ..ciris_edge::blob_swarm::PullConfig::default()
+        },
+    );
+
     // ── 8. THE REPLICATION PLANE ─────────────────────────────────────
     //
     // Without this the harness has no anti-entropy at all: each node held
@@ -2358,14 +2476,15 @@ async fn stand_up(
                 // `withdraws` is re-verified against the row this node holds,
                 // and if authorized the bytes it references are deleted here
                 // and refused `Withdrawn` to every peer; the evictor is this
-                // node's own substrate). This harness pulls no blobs, so no
-                // pull sink — the type makes "a puller with no engine"
-                // unconstructible either way.
+                // node's own substrate). The pull sink is the blob plane's
+                // puller (7b): an admitted row that references a blob is
+                // offered to it, and the same register the chunk source
+                // consults answers `Withdrawn` for what a withdraws revoked.
                 sealed_content: Some(ciris_edge::replication::SealedContentWiring {
                     engine: engine.clone(),
-                    pull_sink: None,
+                    pull_sink: Some(pull_sink),
                     revocations: Some(ciris_edge::replication::RevocationWiring {
-                        register: Arc::new(ciris_edge::blob_swarm::RevocationRegister::default()),
+                        register: Arc::clone(&revocations),
                         // CIRISEdge#669 — the ENGINE, not the bare backend:
                         // eviction retracts this node's holds_bytes claims
                         // (signed withdraws) before it deletes, and only the
@@ -2426,6 +2545,7 @@ async fn stand_up(
         &transport,
         ciris_edge::replication::InboundRouter::new(replication.registry()),
         Arc::clone(&inbound_stats),
+        Arc::clone(&edge),
     );
 
     Ok(Occurrence {
@@ -3359,6 +3479,44 @@ async fn run_chat_legs(occ: &Occurrence) {
             );
         }
     }
+    // ── the room's addresses (CIRISEdge#768) ─────────────────────────
+    //
+    // The body is a community blob, so its bytes move over the room's
+    // scope-native addresses (CC 5.4.6): the router resolves each holder to
+    // its derived destination from THIS table, and the serving side admits a
+    // fetch against the address it arrived on. Installed from the room's MLS
+    // group — the addressing root the handshake above built and
+    // `rotate_converges` left both ends on — with the owners walked to their
+    // NODES (`snapshot_for_nodes`: the roster names persons, a holder and a
+    // listener are nodes). Recorded on the send leg of both ends.
+    let room_addresses: serde_json::Value = async {
+        let lens = ciris_edge::contact::PersistLens::new(dir);
+        let roster = ciris_edge::cohort_addressing::snapshot_for_nodes(&group, &lens)
+            .await
+            .map_err(|e| format!("snapshot_for_nodes: {e}"))?;
+        let unresolved: Vec<String> = roster.unresolved.iter().map(|(m, _)| m.clone()).collect();
+        let epoch = roster.snapshot.epoch;
+        let members = roster.snapshot.members.clone();
+        let out = occ
+            .lifecycle
+            .install(
+                &ciris_edge::cohort_addressing::scope_for(&room),
+                &roster.snapshot,
+            )
+            .map_err(|e| format!("lifecycle.install: {e}"))?;
+        Ok::<_, String>(serde_json::json!({
+            "epoch": epoch,
+            "member_nodes": members,
+            "unresolved_members": unresolved,
+            "derived": out.derived,
+        }))
+    }
+    .await
+    .unwrap_or_else(|e: String| {
+        tracing::error!(%room, error = %e, "the room's scope addresses were NOT installed");
+        serde_json::json!({ "error": e })
+    });
+
     // ── send_message ─────────────────────────────────────────────────
     if i_send {
         let sent = async {
@@ -3436,6 +3594,7 @@ async fn run_chat_legs(occ: &Occurrence) {
                         "attested_by": my_owner,
                         "custody": cfg.node_id,
                         "with": "community",
+                        "room_addresses": room_addresses,
                         "covers": "the body written to the room's blob store under persist's community \
                                    DEK (wrapped per member occurrence, CIRISPersist#848) with only the \
                                    pointer on the row, authored tier:local / cohort:self by the OWNER \
@@ -3498,15 +3657,33 @@ async fn run_chat_legs(occ: &Occurrence) {
                 checks: 0,
             }
         });
-    let seen = chat::messages_in_room(dir, &senders, &room, &reader_store, &viewer)
-        .await
-        .unwrap_or_default();
-    let opened = seen.iter().any(|m| {
+    // The row is here; the BYTES follow it (CIRISEdge#768): the bridge
+    // offered the admitted row to the puller, which fetches the body over the
+    // room's addresses. Wait on the OPEN, bounded, polling — the only state
+    // worth waiting through is `NotFetched`; any other verdict ends the wait.
+    let is_open = |m: &chat::ChatMessage| {
         m.widens.is_some()
             && m.body == Body::Text(CHAT_BODY.to_owned())
             && m.author_key_id == peer_owner
             && m.attesting_key_id == peer_owner
-    });
+    };
+    let open_started = Instant::now();
+    let mut open_checks = 0u32;
+    let seen = loop {
+        open_checks += 1;
+        let seen = chat::messages_in_room(dir, &senders, &room, &reader_store, &viewer)
+            .await
+            .unwrap_or_default();
+        let pending = seen.iter().any(|m| {
+            m.widens.is_some()
+                && matches!(&m.body, Body::Unopened { reason } if reason.is_pending())
+        });
+        if seen.iter().any(is_open) || !pending || open_started.elapsed() >= budget {
+            break seen;
+        }
+        tokio_sleep(Duration::from_millis(500)).await;
+    };
+    let opened = seen.iter().any(is_open);
     // The RAW rows: the peer's `self` copy must not be here (CC 5.2), and no
     // chat row may carry the plaintext.
     let raw = dir
@@ -3563,14 +3740,19 @@ async fn run_chat_legs(occ: &Occurrence) {
             "expected_author": peer_owner,
             "expected_attested_by": peer_owner,
             "opened": opened,
+            "open_waited_ms": open_started.elapsed().as_millis(),
+            "open_checks": open_checks,
+            "room_addresses": room_addresses,
             "leaked_self_rows": leaked_self_rows,
             "plaintext_on_wire": plaintext_on_wire,
             "peer_node": peer_node,
             "inbound": occ.inbound_stats.as_json(),
             "covers": "a community-scoped, SEALED chat row attested and signed by the peer's \
                        human — the supersedes their share wrote — arrived over RNS through \
-                       the relay, was read back by room, and its BODY OPENED through this \
-                       node's occurrence wrap in the room's key_grant set (persist's \
+                       the relay, was read back by room, its body's BYTES were pulled from \
+                       the author's node by the production puller over the room's \
+                       scope-native addresses (CIRISEdge#768), and the BODY OPENED through \
+                       this node's occurrence wrap in the room's key_grant set (persist's \
                        community DEK); no self copy and no plaintext reached this node",
         }),
     );
