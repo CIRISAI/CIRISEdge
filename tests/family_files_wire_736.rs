@@ -3,8 +3,8 @@
 //!
 //! Two persons, P and Q, each with one device (P1, Q1), and a family formed
 //! under persist v52's consent rule (CIRISPersist#955, CIRISConstitution#133):
-//! P founds it ALONE and the founding record crosses on P1's publish-own arm
-//! (the family twin of #955's community arm, added here); P1 proposes Q; the
+//! P founds it ALONE; P1 proposes Q; the founding record crosses to Q1 on
+//! P1's publish-own arm (the family twin of #955's community arm) and the
 //! proposal is admitted at Q1's bridge apply door; Q1 accepts for Q
 //! (`membership::reply`, a device acting for its person); the acceptance is
 //! admitted at P1's door and P1's bridge widens on arrival
@@ -615,32 +615,10 @@ async fn active_members(node: &Node) -> Vec<String> {
 
 /// The v52 consent flow, across the bridges, exactly as hosts drive it:
 /// P1 proposes Q → Q1's inbox → Q1 accepts for Q → P1 widens on arrival →
-/// the widening reaches every other node. R (no device) consents too and is
+/// the widening reaches Q1. R (no device) consents too and is
 /// widened in on P1 from R's own signed acceptance.
-async fn form_family_by_consent(
-    p1: &Member,
-    q1: &Member,
-    others: &[&Member],
-    p: &Ident,
-    q: &Ident,
-    r: &Ident,
-) {
+async fn form_family_by_consent(p1: &Member, q1: &Member, p: &Ident, q: &Ident, r: &Ident) {
     found_family(&p1.node, p).await;
-    for to in std::iter::once(q1).chain(others.iter().copied()) {
-        assert!(
-            carry_plane(p1, to, EnvelopeKind::Family)
-                .await
-                .iter()
-                .all(ApplyOutcome::is_admitted),
-            "the founding reaches {}",
-            to.node.me
-        );
-    }
-    assert_eq!(
-        active_members(&q1.node).await,
-        [p.key_id.as_str()],
-        "founded by P alone"
-    );
 
     let expires = chrono::Utc::now() + chrono::Duration::days(7);
     // P1 (a device acting for P, a founder) proposes Q.
@@ -655,6 +633,23 @@ async fn form_family_by_consent(
     )
     .await
     .expect("P1 proposes Q");
+    // The founding record reaches the INVITEE's node, after the proposal
+    // names it (the record the proposal needs to be admitted). A non-family
+    // node is handed nothing here: what the record plane may reach before a
+    // proposal is its own fix (the v38 record-exposure blocker), and this
+    // witness asserts nothing about a non-member's record.
+    assert!(
+        carry_plane(p1, q1, EnvelopeKind::Family)
+            .await
+            .iter()
+            .all(ApplyOutcome::is_admitted),
+        "the founding reaches the invitee's node"
+    );
+    assert_eq!(
+        active_members(&q1.node).await,
+        [p.key_id.as_str()],
+        "founded by P alone"
+    );
     // It reaches Q1 at Q1's apply door. Not through P1's serve: before the
     // widening Q1 is a first-contact stranger to P1 (no consent grant, not a
     // family member's node), and first-contact reach carries no family-scoped
@@ -694,22 +689,12 @@ async fn form_family_by_consent(
         "P1 widened Q in on the acceptance"
     );
 
-    // Q's widening reaches Q1 through P1's serve. A non-member node (N) is
-    // handed the founding record only: a widening lands only where the
-    // member's own acceptance is held (persist #955), and no consent row is
-    // served to a node outside the family.
+    // Q's widening reaches Q1 through P1's serve (it lands only where Q's
+    // own acceptance is held, persist #955).
     let applied = carry_plane(p1, q1, EnvelopeKind::FamilyMembershipWidening).await;
     assert_eq!(applied.len(), 1, "one widening");
     assert!(applied[0].is_admitted(), "{applied:?}");
     assert_eq!(active_members(&q1.node).await, want, "Q1 reads the roster");
-    for to in others {
-        assert_eq!(
-            active_members(&to.node).await,
-            [p.key_id.as_str()],
-            "{} holds the founding only",
-            to.node.me
-        );
-    }
 
     // R consents too — signing their own acceptance (R has no device; the
     // row reaches P1 as any delivered row does).
@@ -1146,7 +1131,7 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
         carry_route(&a.node, &b.node).await;
     }
 
-    form_family_by_consent(&p1, &q1, &[&n], &p, &q, &r).await;
+    form_family_by_consent(&p1, &q1, &p, &q, &r).await;
     let lens = ciris_edge::contact::PersistLens::new(&*p1.node.dir);
     let roster = ciris_edge::family_room::roster(&*p1.node.dir, FAMILY, &lens)
         .await
@@ -1357,7 +1342,7 @@ async fn family_files_cross_through_a_non_member_forwarder_that_learns_nothing_7
     carry_route(&p1.node, &q1.node).await;
     carry_route(&q1.node, &p1.node).await;
 
-    form_family_by_consent(&p1, &q1, &[], &p, &q, &r).await;
+    form_family_by_consent(&p1, &q1, &p, &q, &r).await;
     let lens = ciris_edge::contact::PersistLens::new(&*p1.node.dir);
     let roster = ciris_edge::family_room::roster(&*p1.node.dir, FAMILY, &lens)
         .await
