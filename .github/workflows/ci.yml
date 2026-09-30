@@ -2412,13 +2412,27 @@ jobs:
           python3 <<'PYEOF' >> "$GITHUB_OUTPUT"
           import re, json
           text = open('Cargo.toml').read()
-          def find_tag(crate):
-              m = re.search(rf'^{re.escape(crate)}\s*=\s*\{{[^}}]*tag\s*=\s*"v(\d+\.\d+\.\d+)"', text, re.M)
+          lock = open('Cargo.lock').read()
+          def lock_version(crate):
+              m = re.search(rf'^name = "{re.escape(crate)}"\nversion = "([^"]+)"', lock, re.M)
               if not m:
-                  raise SystemExit(f'no tag found for {crate} in Cargo.toml')
+                  raise SystemExit(f'no {crate} entry in Cargo.lock')
               return m.group(1)
-          persist = find_tag('ciris-persist')
-          verify_major = int(find_tag('ciris-keyring').split('.')[0])
+          def find_pin(crate):
+              # A `tag = "vX.Y.Z"` pin names the version and the git ref at once.
+              # A prestage pins `rev = "<sha>"` (develop against the certified
+              # commit, flip to the tag once it derefs to that tree): the git ref
+              # is the sha and the version is Cargo.lock's resolved entry. Both
+              # shapes are pins; only the tag one was parsed before (CIRISEdge#733).
+              m = re.search(rf'^{re.escape(crate)}\s*=\s*\{{[^}}]*tag\s*=\s*"v(\d+\.\d+\.\d+)"', text, re.M)
+              if m:
+                  return m.group(1), f'v{m.group(1)}'
+              m = re.search(rf'^{re.escape(crate)}\s*=\s*\{{[^}}]*rev\s*=\s*"([0-9a-f]{{7,40}})"', text, re.M)
+              if m:
+                  return lock_version(crate), m.group(1)
+              raise SystemExit(f'no tag or rev pin found for {crate} in Cargo.toml')
+          persist, persist_ref = find_pin('ciris-persist')
+          verify_major = int(find_pin('ciris-keyring')[0].split('.')[0])
           pins = {
               # CIRISEdge is git-tag-only and persist stopped PyPI-publishing at
               # v30.4.0, so build persist from the git tag edge pins in Cargo.toml.
@@ -2448,7 +2462,7 @@ jobs:
               # package in one step), so the tag's major IS the wheel's major.
               # ciris-server's wheel carries no `ciris-verify` dependency at all
               # (only `ciris-client`), so this cannot create a third conflict.
-              'ciris-persist': f'git+https://github.com/CIRISAI/CIRISPersist.git@v{persist}',
+              'ciris-persist': f'git+https://github.com/CIRISAI/CIRISPersist.git@{persist_ref}',
               'ciris-verify': f'ciris-verify>={verify_major},<{verify_major + 1}',
           }
           print(f'json={json.dumps(pins)}')
