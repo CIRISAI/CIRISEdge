@@ -10260,17 +10260,19 @@ mod inbound_ingest_tests {
             }
         }
         struct NoProvider;
+        #[async_trait::async_trait]
         impl StateProvider for NoProvider {
-            fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+            async fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
                 vec![]
             }
-            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
         }
         struct NoApplier;
+        #[async_trait::async_trait]
         impl StateApplier for NoApplier {
-            fn apply_envelope(
+            async fn apply_envelope(
                 &self,
                 _k: EnvelopeKind,
                 _b: &[u8],
@@ -10382,28 +10384,34 @@ mod inbound_ingest_tests {
         use crate::replication::summary::ApplyOutcome;
         use crate::replication::summary::StateApplier;
         use crate::replication::summary::StateProvider;
-        use std::sync::{Arc, Condvar, Mutex};
+        use std::sync::Arc;
 
-        struct Gate(Mutex<bool>, Condvar);
-        struct ParkingProvider(Arc<Gate>);
+        // CIRISEdge#740 — the provider is async, so the park is an awaited
+        // gate (a blocking wait inside `local_refs` would be the exact
+        // sync-over-async shape #740 removed).
+        struct ParkingProvider(tokio::sync::watch::Receiver<bool>);
+        #[async_trait::async_trait]
         impl StateProvider for ParkingProvider {
-            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
-                let mut open = self.0 .0.lock().unwrap();
-                while !*open {
-                    open = self.0 .1.wait(open).unwrap();
+            async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+                let mut open = self.0.clone();
+                while !*open.borrow() {
+                    if open.changed().await.is_err() {
+                        break;
+                    }
                 }
                 vec![]
             }
-            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
-            fn subject_refs(&self, _kind: EnvelopeKind, _subject: &str) -> Vec<EnvelopeRef> {
+            async fn subject_refs(&self, _kind: EnvelopeKind, _subject: &str) -> Vec<EnvelopeRef> {
                 vec![]
             }
         }
         struct NoApply;
+        #[async_trait::async_trait]
         impl StateApplier for NoApply {
-            fn apply_envelope(
+            async fn apply_envelope(
                 &self,
                 _k: EnvelopeKind,
                 _b: &[u8],
@@ -10434,16 +10442,15 @@ mod inbound_ingest_tests {
             }
         }
 
-        let gate = Arc::new(Gate(Mutex::new(false), Condvar::new()));
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
         let registry = Arc::new(ReplicationRegistry::new());
-        let factory_gate = Arc::clone(&gate);
         registry.set_responder_factory(Arc::new(move |peer: &str, kind| {
             let coord = Arc::new(ReplicationCoordinator::new(
                 Arc::new(NullTransport),
                 peer,
                 kind,
                 SessionRole::Responder,
-                Arc::new(ParkingProvider(Arc::clone(&factory_gate))),
+                Arc::new(ParkingProvider(gate_rx.clone())),
                 Arc::new(NoApply),
             ));
             crate::replication::runtime::spawn_responder_drive(Arc::clone(&coord));
@@ -10519,8 +10526,7 @@ mod inbound_ingest_tests {
         );
 
         // Release the driver so the task ends cleanly.
-        *gate.0.lock().unwrap() = true;
-        gate.1.notify_all();
+        let _ = gate_tx.send(true);
     }
 
     /// CIRISEdge#402 — the bootstrap attribution carve-out truth table, tested at
@@ -10669,17 +10675,19 @@ mod inbound_ingest_tests {
             }
         }
         struct NoProvider;
+        #[async_trait::async_trait]
         impl StateProvider for NoProvider {
-            fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+            async fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
                 vec![]
             }
-            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
         }
         struct NoApplier;
+        #[async_trait::async_trait]
         impl StateApplier for NoApplier {
-            fn apply_envelope(
+            async fn apply_envelope(
                 &self,
                 _k: EnvelopeKind,
                 _b: &[u8],

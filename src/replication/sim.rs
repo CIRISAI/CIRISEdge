@@ -153,11 +153,12 @@ impl SimStore {
             .is_some_and(|m| m.contains_key(hash))
     }
 }
+#[async_trait::async_trait]
 impl StateProvider for SimStore {
-    fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+    async fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         self.state.refs_for(kind)
     }
-    fn fetch_envelope(&self, _kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
+    async fn fetch_envelope(&self, _kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
         self.bytes.get(h).cloned()
     }
 }
@@ -171,8 +172,9 @@ struct SimApplier<'a> {
     /// Maps applied bytes back to their hash (production verifies + rehashes).
     applied: std::sync::Mutex<Vec<[u8; 32]>>,
 }
+#[async_trait::async_trait]
 impl StateApplier for SimApplier<'_> {
-    fn apply_envelope(
+    async fn apply_envelope(
         &self,
         kind: EnvelopeKind,
         bytes: &[u8],
@@ -321,7 +323,10 @@ impl Scenario {
             }
             // Initiator (node 0) opens the round — its Summary goes TO the
             // responder (node 1). It records its own emitted fragments for ARQ.
-            let out = nodes[0].session.start_round(&nodes[0].store);
+            // CIRISEdge#740 — the session is async end to end; the DST harness
+            // is single-threaded and its store is in-memory, so the future is
+            // ready on first poll and `block_on` here is a plain call.
+            let out = futures::executor::block_on(nodes[0].session.start_round(&nodes[0].store));
             self.emit(
                 1,
                 out,
@@ -472,8 +477,12 @@ impl Scenario {
                 store: std::sync::Mutex::new(&mut node.store),
                 applied: std::sync::Mutex::new(Vec::new()),
             };
-            node.session
-                .on_message(msg, &provider_snapshot, &applier, None)
+            futures::executor::block_on(node.session.on_message(
+                msg,
+                &provider_snapshot,
+                &applier,
+                None,
+            ))
         };
         self.emit(1 - to, outcome, wire, metrics, &mut nodes[to].retx, rng);
     }

@@ -474,6 +474,7 @@ async fn device(
                     // under test here).
                     cadence: Duration::from_secs(3600),
                     round_timeout: Duration::from_secs(15),
+                    ..SchedulerConfig::default()
                 },
                 local_key_id: Some(key.key_id.clone()),
                 metrics: Some(metrics.clone()),

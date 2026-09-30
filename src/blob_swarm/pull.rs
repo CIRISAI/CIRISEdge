@@ -1612,7 +1612,7 @@ where
             }
             Err(e) => return PullOutcome::Refused(e.to_string()),
         };
-        match pointer.tier {
+        let outcome = match pointer.tier {
             CryptoTier::Plaintext => {
                 self.pull_plaintext_dag(row, sha, attempts, meaning, stream_id, disposition, fetch)
                     .await
@@ -1621,7 +1621,18 @@ where
                 self.pull_sealed_dag(row, sha, attempts, meaning, stream_id, disposition, fetch)
                     .await
             }
-        }
+        };
+        // CIRISEdge#738 — the one receipt hook: acts on `Stored` only.
+        crate::receipts::on_dag_pulled(
+            &self.engine,
+            &*self.backend,
+            &self.local_key_id,
+            row,
+            &outcome,
+            &self.edge.metrics(),
+        )
+        .await;
+        outcome
     }
 
     /// One address through the fetcher, verified against it here — whoever

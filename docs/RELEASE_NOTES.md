@@ -1,5 +1,169 @@
 # CIRISEdge Release Notes
 
+# v36.0.0 — files of any size up to ~2.5 GiB, pulled chunk by chunk, read by range, published from a stream, with delivery receipts; persist v51.3.0
+
+**2026-09-30** (PR #733 adopt + lanes of CIRISEdge#734: #741, #743, #746, #747). **MAJOR** from v35.0.0.
+Ladder triple: **edge v36.0.0 · persist v51.3.0 · verify v18.0.0**.
+
+## The pins
+
+| | v35.0.0 | v36.0.0 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v51.1.0"` | **`tag = "v51.3.0"`** → `412a679f` (a merge over the certified `9d406712`, identical tree `5396f436`) |
+| ciris-persist (wheel floor) | `>=51.1,<52` | **`>=51.3,<52`** (edge calls the #947 doors v51.3 adds) |
+| CIRISVerify crates | `v18.0.0` | unchanged (one copy each of verify-core / keyring / crypto) |
+| ABI constants, `REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH`, `TRANSFORM_ALGEBRA_HASH`, manifest `0.3.0`, `ENVELOPE_VOCABULARY_SHA256`, `SERVE_ADVERTISE_POLICY_HASH` | — | **all unchanged** (diffed from source, verified empty) |
+
+**Riders:** move the wheel floor to `>=51.3`, and see the Rust surface below. No hash re-pin.
+
+## #717 — a chunk-DAG file pulls as its chunks (closes #717)
+
+v34.1.0 refused a stream pointer by name; the pull now walks the DAG through persist v51.3's doors: adopt
+the manifest → open it as this node (`NotGranted` ⇒ `DagAwaitingKey`, retried) → bound the plan (stream,
+`total_size` vs the pointer's size, chunk count, the storage bound) → fetch chunks by sha, held ones
+skipped (a pull resumes) → promote to `chunk_dag`. Every refusal is named and counted in
+`blob_pull_refusals` (`dag_*`, `no_epoch`). A plaintext (commons) DAG goes through
+`put_blob_chunks_signing` and announces `holds_bytes`; it keeps a 64 MiB in-memory bound because that
+door is one-shot (CIRISPersist#952). Witnesses: 1 MiB plaintext and 1.3 MiB sealed self files
+byte-identical on the second device; tampered manifest / chunk, over-cap and pre-key negatives.
+Measured on CIRISServer's native selffiles ladder at v34.3.0 as 22/25 with exactly the ≥ 1 MiB files
+missing; those are this release's.
+
+## #735 — community DAGs, holder to holder (PR #741)
+
+A 1.3 MiB `community_dek` file pulled by C from B (a member that promoted it), never from the author;
+epoch rotation, tampered chunk and non-member negatives. Fixed on the way: `NoEpoch` is counted, and a
+resumed sealed pull reports its `holds_bytes` claim from the claim index.
+
+## #737 — read by range and by chunks (PR #743)
+
+`FileRow::open_range(store, viewer, offset, len)`, `FileRow::chunks()` (one item per chunk, `seq`
+order), `FileRow::layout()`. `open` above persist's 64 MiB whole-read cap returns
+`FileError::AboveWholeReadCap` instead of persist's cap error. Witness: a 100 MiB file read on the second
+device with peak live allocation ~4 chunks (counting allocator), ranges across chunk boundaries, EOF
+refusals by name.
+
+## #744 — publish from a stream (PR #747)
+
+`files::publish_stream(…, reader, declared_len, …)` seals chunk by chunk; the `file:v1` row crosses
+only after the last chunk lands; a reader that yields a different length is refused by name
+(`FileError::DeclaredLengthMismatch`) and its encrypted chunks are evicted. `publish(bytes)` is a thin
+wrapper, so there is one seal path. Measured: a 2 GiB publish in 72.6 s (release) at 4.9 MiB peak live
+allocation. **Ceiling:** one file maxes out near 2.5 GiB because persist stores the sealed manifest
+inline under its 1 MiB cap (CIRISPersist#954, persist v52).
+
+## #738 — CC 5.3.3.6 delivery receipts for chunked files (PR #746)
+
+`files::publish` puts the file stream's STH through persist's anti-equivocation gate and carries it on
+the row; the receiver, on promote, puts that STH into its own store (persist recomputes the root from
+the chunks it pulled) and emits exactly one node-signed `delivery_receipt:{stream_id}:v1` row at the
+file's cohort; the author admits it (`receipt_*` refusals named and counted in `delivery_receipts`),
+`FileRow::received_by` lists them, and the bridge stops re-offering a row a peer receipted in full
+(`re_offer_suppressed_receipted`). Self and community witnessed. Receipts for inline files, receipt
+timestamps and the family lane wait on persist v52 (CIRISPersist#953).
+
+## #712 — an owner's withdraw of a node-authored file lists as Withdrawn
+
+Mirrors persist #945: a `withdraws` with `withdraws_admission_rule` set is final whoever signed it.
+
+## Rust surface (why MAJOR)
+
+- `FileRow::open` / `open_described` return `FileError` (was the store's error); new variants
+  `Unopened(UnopenedReason)`, `AboveWholeReadCap`, `RangeNotSatisfiable`, `DeclaredLengthMismatch`, `Read`.
+- `PullOutcome::StreamPointerNeedsDagPull` is gone (the pull succeeds); `DagAwaitingKey` and `DagRefused`
+  are new.
+- New: `files::publish_stream`, `FileStreamWrite`, `FileRow::{open_range, chunks, layout, received_by}`,
+  `GroupContentStore::{open_range, layout, seal_chunked_stream}`, `receipts` module; metrics
+  `delivery_receipts`, `re_offer_suppressed_receipted`, `dag_*` / `no_epoch` refusal tags.
+
+# v35.0.0 — three peers no longer deadlock the blocking pool: the state-provider read path is async and a kick is bounded
+
+**2026-09-29** (CIRISEdge#740 → PR #745). **MAJOR** from v34.3.0 (Rust API break below). No pin or hash
+moves: persist `v51.1.0` (wheel floor `>=51.1,<52`), verify `v18.0.0`, every ABI constant,
+`REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH`, `SERVE_ADVERTISE_POLICY_HASH` unchanged.
+
+## The deadlock (found by CIRISServer's native ladder)
+
+A node with THREE peers wedged on its first replication fan-out. `StateProvider::local_refs` was a sync
+method; the directory adapter bridged it with `block_in_place` + `Handle::block_on` on a persist read
+that itself needs a blocking-pool slot. A fan-out runs peers × kinds rounds at once: 3 × 14 = 42 > 32
+slots, so every slot held a parked hand-off and no read could start. Two peers (28) fit, which is why
+every two-node witness was green. Startup is itself a fan-out (every coordinator fires its first tick
+on spawn), so the node wedged before any kick.
+
+- **The bridge is gone:** `StateProvider` and `StateApplier` are `#[async_trait]`; the directory adapter
+  awaits persist directly. No `block_in_place`/`block_on` remains on a round path (the remaining sites
+  are FFI entry points, the process entry and test code; listed in PR #745).
+- **A kick is bounded:** one semaphore (`RoundGate`) in the scheduler covers `round_now_all`,
+  `sync_and_await`, `Propagate` and the startup tick. Default `max(1, max_blocking_threads / 2)` (16 on a
+  32-slot pool; a compile-time assert keeps > 8 slots for persist's readers + writer); configurable as
+  `SchedulerConfig::max_concurrent_rounds`; over-limit rounds wait, never drop;
+  `ReplicationRuntime::round_bound()` reports bound, in flight, peak, waited.
+- **Witness** `tests/kick_three_peers_740.rs`: four real Reticulum nodes, three peers, self room,
+  `max_blocking_threads(32)`. On v34.3.0: 3 of 42 rounds after 240 s, wedged at startup. Fixed: 42
+  startup + 42 kicked rounds in ~5 s. FSD `CIRIS_EDGE_TRANSPORT.md` §4.5, invariant 10.
+
+## Breaking Rust surface
+
+- `StateProvider` / `StateApplier` implementors must be `async` with `#[async_trait]`.
+- `Session::start_round` and `Session::on_message` are `async`.
+- `SchedulerConfig` gains `max_concurrent_rounds` (struct literals need `..SchedulerConfig::default()`).
+- CIRISServer implements neither trait; its `tests/trace_round_e2e.rs` calls
+  `DirectoryStateAdapter::local_refs` and drives `Session` synchronously, so it needs `.await`s.
+
+# v34.3.0 — a link belongs to one plane; unannounced devices of one owner exchange and recover directly
+
+**2026-09-29** (CIRISEdge#728 → PR #730, closes #722; CIRISEdge#727 → PR #729). **MINOR** from v34.2.0. No pin
+or hash moves: persist `v51.1.0` (wheel floor `>=51.1,<52`), verify `v18.0.0`, every ABI constant,
+`REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH` and `SERVE_ADVERTISE_POLICY_HASH` (`e4c4d625…`)
+unchanged. **Riders:** a pin bump only.
+
+## #728 — a link belongs to one plane (the actual cause of #722)
+
+CIRISServer's native selffiles fixture delivered 0/25 rows over a direct link. Read with timestamps,
+the item-2 refusals were three lines in the first second, before the peer's route landed; the
+whole-run starvation was that D2 had dialed D1's **self-room derived address**, and D1's send path
+then chose that link as "the peer's live inbound link" for identity-plane replication Delivers. D2
+dropped every one as UNATTRIBUTED, because a scoped address is an arrival discriminator, not a peer
+identity. One link pool was serving two planes.
+
+- Every link is classified `LinkPlane::{Identity, Scoped}` at establishment on both ends
+  (`NodeEvent::LinkEstablished` names the destination; the `ScopeAddressTable` reverse index knows
+  every derived address this node holds), stored beside the peer association.
+- Identity-plane sends (`Transport::send`, the #532 idle pool, the responder CANN/CBND push) select
+  only identity-plane links; with none live they dial the identity destination as before. Scoped
+  sends keep #718's choice.
+- An identity-plane frame (`CRPL`/`CANN`/`CBND`) arriving on a scoped link is refused by name,
+  `identity_frame_on_scoped_link`, counted in the new `EdgeMetrics::transport_inbound_drops`
+  (snapshot + PyO3), logged throttled with link, dest and scope.
+- Witness `tests/link_plane_728.rs`: self room installed on both nodes, B dials A's derived address
+  and holds A's identity route, A's identity-plane rows admit within 4 sweeps; fails on v34.2.0 with
+  the field's UNATTRIBUTED drop. FSD: `CIRIS_EDGE_TRANSPORT.md` §3.5.
+- Follow-up: #731 (initiator-side `arrival_scope` names the peer's member address).
+
+## #727 — owner-binding carve-out (maintainer-approved; I14 stays the designed path)
+
+Two devices of one owner that claim before announcing deadlocked under the #682 announce gate: each
+withheld its route until it held the other's owner-binding, which the send-set gate withheld in turn
+(≈320 `identity_row_node_not_announced` per side, nothing ever crossed).
+
+- **Admission:** an owner-binding whose attester is this node's OWN owner (`owner_of(self)`, from its
+  own directory) is admitted on any link after `verify_row_hybrid_signature` against the attester's
+  registered keys. Any other attester takes the ordinary path. Admission invalidates the #682 memo.
+- **Send:** a node pushes only its OWN binding, as a bootstrap-plane Deliver, on a link it dialed
+  (`MAX_OWNER_BINDING_PUSH = 4`), and **answers** a newly admitted sibling with its own binding on the
+  frame's reply path, on `admitted` only, never `held`. A stranger's link gets nothing; a binding
+  whose attester is not our owner is refused by name (`owner_binding_*` under `first_contact_outcomes`).
+- The unannounced pair now converges in **2 sweeps**, the same as the announced control. Recovery of
+  a wiped device (seed + owner key) re-converges in 13 sweeps through the ordinary path: a wiped
+  device is unowned in its own directory until its own binding arrives (CC 3.2), so the rung does not
+  apply to it. FSD: `FIRST_CONTACT.md` §2.1.1.
+
+## Rust surface
+
+- New `EdgeMetrics::transport_inbound_drops` map; new `first_contact_outcomes` labels
+  `owner_binding_*`; `LinkPlane` is internal.
+
 # v34.2.0 — a scoped body rides the identity-plane link when no direct path exists; the #722 refusal names what it holds
 
 **2026-09-29** (CIRISEdge#718 → PR #723; CIRISEdge#722 → PR #725). **MINOR** from v34.1.0. No pin or hash

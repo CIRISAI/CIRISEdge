@@ -607,6 +607,16 @@ pub trait GroupContentStore: Send + Sync + 'static {
             "this store has no custody door (CIRISPersist#942)".to_owned(),
         ))
     }
+
+    /// **The per-stream transparency log this store's chunk DAGs live in**
+    /// (CIRISEdge#738, CC 5.3.3.3 / 5.3.3.6) — where `files::publish` puts a
+    /// file stream's STH and where a file's delivery receipts are read.
+    /// `None` (the default) for a store with no stream log: its files publish
+    /// no STH and cannot be receipted, which `FileRow::received_by` reports as
+    /// an empty list, never a failure.
+    fn stream_log(&self) -> Option<std::sync::Arc<dyn crate::receipts::StreamLog>> {
+        None
+    }
 }
 
 /// Build the AAD for a seal request. Exposed so a test — or a second

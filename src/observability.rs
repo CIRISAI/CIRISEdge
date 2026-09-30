@@ -1007,6 +1007,15 @@ pub struct EdgeMetrics {
     /// chunk count exactly once — the witness for "each chunk adopted exactly
     /// once".
     pub blob_dag_chunks: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files, by tag
+    /// (`receipts`): `emitted` / `not_emitted_*` on the receiving node;
+    /// `admitted` and the named refusals (`receipt_root_unpublished`,
+    /// `receipt_tree_size_short`, `receipt_epoch_mismatch`,
+    /// `receipt_signer_not_member`, `receipt_duplicate`, `receipt_malformed`,
+    /// `receipt_file_unknown`, `receipt_substrate`) on the author's; and
+    /// `re_offer_suppressed_receipted` — a row not re-offered to a peer that
+    /// receipted it in full.
+    pub delivery_receipts: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
     /// the live announce-intake map under **capacity backpressure** (the
     /// `MAX_PEERS` cap in `transport::reticulum`).
@@ -1150,6 +1159,15 @@ pub struct EdgeMetrics {
     /// idle. Keyed on the SAME [`EnvelopeKind`] the replication wire uses (one
     /// kind list, not two).
     pub replication_envelopes_served_total: Arc<RwLock<HashMap<EnvelopeKind, u64>>>,
+}
+
+/// A `&'static str`-keyed counter map, cloned out with owned keys for the
+/// snapshot (the lock is held only for the copy).
+fn owned_keys<V: Copy>(map: &RwLock<HashMap<&'static str, V>>) -> HashMap<String, V> {
+    map.read()
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), *v))
+        .collect()
 }
 
 impl EdgeMetrics {
@@ -1339,6 +1357,11 @@ impl EdgeMetrics {
         let mut chunks = self.blob_dag_chunks.write();
         let slot = chunks.entry(gauge).or_insert(0);
         *slot = (*slot).max(value);
+    }
+
+    /// CIRISEdge#738 — count one delivery-receipt event by its tag.
+    pub fn inc_delivery_receipt(&self, tag: &'static str) {
+        *self.delivery_receipts.write().entry(tag).or_insert(0) += 1;
     }
 
     /// CIRISEdge#640 — count one blob-route refusal by its branch tag.
@@ -1645,18 +1668,9 @@ impl EdgeMetrics {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
-            blob_dag_phases: self
-                .blob_dag_phases
-                .read()
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), *v))
-                .collect(),
-            blob_dag_chunks: self
-                .blob_dag_chunks
-                .read()
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), *v))
-                .collect(),
+            blob_dag_phases: owned_keys(&self.blob_dag_phases),
+            blob_dag_chunks: owned_keys(&self.blob_dag_chunks),
+            delivery_receipts: owned_keys(&self.delivery_receipts),
             blob_route_refusals: self
                 .blob_route_refusals
                 .read()
@@ -1752,6 +1766,8 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#739 — chunk-DAG chunk ledger by outcome (`adopted`,
     /// `skipped_held`, `in_flight_peak`).
     pub blob_dag_chunks: HashMap<String, u64>,
+    /// CIRISEdge#738 — delivery receipts for files, by tag.
+    pub delivery_receipts: HashMap<String, u64>,
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
     /// `unbound` / `not_applicable`). The door never drops.
     pub bootstrap_door_outcomes: HashMap<String, u64>,

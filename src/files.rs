@@ -554,6 +554,11 @@ pub async fn rename(
         new_name,
         &pointer,
         Some(renamed_at),
+        // The same bytes, the same stream, the same root (CIRISEdge#738).
+        prior
+            .attestation_envelope
+            .get(crate::receipts::FIELD_STREAM_STH)
+            .cloned(),
     )
     .await
     .map_err(FileError::Row)?;
@@ -855,6 +860,19 @@ where
         );
     }
 
+    // CIRISEdge#738 (CC 5.3.3.3 / 5.3.3.6, §6.10) — a chunk DAG is a stream,
+    // and a stream's root is published by its producer: the STH over the
+    // chunks just sealed, through persist's anti-equivocation gate, carried on
+    // the row so it reaches exactly the row's audience. The root is what a
+    // receiver's delivery receipt names; without it no receipt can join.
+    let stream_sth = publish_stream_sth(
+        store,
+        signers,
+        write.room,
+        write.asserted_at,
+        &sealed.pointer,
+    )
+    .await?;
     let row = file_row_at(
         author,
         write.room,
@@ -862,6 +880,7 @@ where
         write.filename,
         &sealed.pointer,
         None,
+        stream_sth,
     )
     .await
     .map_err(FileError::Row)?;
@@ -1007,6 +1026,7 @@ async fn file_row(
     author: &crate::identity::LocalSigner,
     write: &FileWrite<'_>,
     pointer: &BlobPointer,
+    stream_sth: Option<serde_json::Value>,
 ) -> Result<Attestation, String> {
     file_row_at(
         author,
@@ -1015,8 +1035,38 @@ async fn file_row(
         write.filename,
         pointer,
         None,
+        stream_sth,
     )
     .await
+}
+
+/// **Publish a chunked file's STH** (CIRISEdge#738, §6.10) and return the
+/// claim the row carries: `None` for an inline file (persist's gate recomputes
+/// a root from stream rows, and an inline blob has none — see
+/// [`crate::receipts`]) and for a store with no stream log. The stream's
+/// producer is the NODE (`signers.node`): it wrote the chunks.
+///
+/// # Errors
+/// [`FileError::Seal`] — publishing the stream's root is part of sealing it.
+async fn publish_stream_sth(
+    store: &dyn GroupContentStore,
+    signers: Signers<'_>,
+    room: &ScopeRoom,
+    asserted_at: DateTime<Utc>,
+    pointer: &BlobPointer,
+) -> Result<Option<serde_json::Value>, FileError> {
+    let (Some(stream_id), Some(log)) = (pointer.stream_id.as_deref(), store.stream_log()) else {
+        return Ok(None);
+    };
+    let claim = crate::receipts::publish_file_sth(&*log, signers.node, stream_id, asserted_at)
+        .await
+        .map_err(|detail| FileError::Seal {
+            room: room.to_string(),
+            detail: format!("stream STH: {detail}"),
+        })?;
+    serde_json::to_value(claim)
+        .map(Some)
+        .map_err(|e| FileError::Row(format!("stream STH claim: {e}")))
 }
 
 /// [`file_row`] over its parts. `renamed_at` is the rename act's own signed
@@ -1029,6 +1079,7 @@ async fn file_row_at(
     filename: Option<&str>,
     pointer: &BlobPointer,
     renamed_at: Option<DateTime<Utc>>,
+    stream_sth: Option<serde_json::Value>,
 ) -> Result<Attestation, String> {
     use crate::replication::attestation_bind::{
         bind_attestation_envelope, render_signed_instant, truncate_to_substrate_resolution,
@@ -1055,6 +1106,11 @@ async fn file_row_at(
     if let Some(at) = renamed_at {
         envelope[FIELD_RENAMED_AT] =
             serde_json::json!(render_signed_instant(truncate_to_substrate_resolution(at)));
+    }
+    // CIRISEdge#738 — the stream's producer-signed STH rides the row, so the
+    // root reaches exactly the row's audience, signed under the row.
+    if let Some(sth) = stream_sth {
+        envelope[crate::receipts::FIELD_STREAM_STH] = sth;
     }
     // Every producer cites (CIRISEdge#646): the row is found BY the bytes it
     // references, and an uncited row leaves the revocation walk's known set
@@ -1580,6 +1636,27 @@ impl FileRow {
             .custody(&self.pointer, viewer_key_id)
             .await
             .map_err(|e| UnopenedReason::from_store_error(&e))
+    }
+
+    /// **Which nodes have received this file** (CIRISEdge#738, CC 5.3.3.6):
+    /// every delivery receipt the author's store holds for the file's stream,
+    /// as `(node, epoch, K, at)` ([`crate::receipts::Received`]). A receipt is
+    /// proof of DELIVERY — the node holds bytes committing to all `K` chunks
+    /// under the published root — never of consumption.
+    ///
+    /// Empty for an inline file (no stream) and for a store with no stream log.
+    ///
+    /// # Errors
+    /// The store read failed.
+    pub async fn received_by(
+        &self,
+        store: &dyn GroupContentStore,
+    ) -> Result<Vec<crate::receipts::Received>, String> {
+        let (Some(stream_id), Some(log)) = (self.pointer.stream_id.as_deref(), store.stream_log())
+        else {
+            return Ok(Vec::new());
+        };
+        crate::receipts::received_for(&*log, stream_id).await
     }
 
     /// **The bytes and what they are, through one grant** (CIRISEdge#698,
@@ -2494,7 +2571,7 @@ mod tests {
                 filename: Some("boat.jpg"),
                 asserted_at: at,
             };
-            let row = file_row(&signer, &write, &pointer(&sha))
+            let row = file_row(&signer, &write, &pointer(&sha), None)
                 .await
                 .expect("authored row");
             let env = &row.attestation_envelope;

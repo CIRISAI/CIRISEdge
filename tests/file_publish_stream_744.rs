@@ -433,17 +433,21 @@ fn vm_hwm_kib() -> Option<u64> {
         .ok()
 }
 
-/// **SW1** — 2 GiB from a generating reader, a few chunks resident, read
+/// **SW1** — a large file (256 MiB default, 2 GiB via `L8_STREAM_BYTES`) from a generating reader, a few chunks resident, read
 /// back byte-identical on the author.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_2_gib_self_file_publishes_from_a_reader_holding_a_few_chunks() {
     use ciris_edge::group_content::store::CHUNK_BYTES;
     use ciris_persist::federation::types::cohort_scope::CryptoTier;
     init_tracing();
+    // 256 MiB by default (1,024 chunks: the bounded-memory property holds at
+    // any size, and CI's test lanes can't spend ~16 min and 2 GiB of disk on
+    // it). The full 2 GiB is `L8_STREAM_BYTES=2147483648`, run by hand and by
+    // the multi-GiB bench (CIRISEdge#739).
     let len: u64 = std::env::var("L8_STREAM_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2048 * MIB);
+        .unwrap_or(256 * MIB);
     // File-backed, under the crate's target dir (on /home), never tmpfs.
     let tmp = tempfile::Builder::new()
         .prefix("l8-sw1-")

@@ -670,6 +670,7 @@ jobs:
       # CIRISEdge#229 — save edge-self-warm on main, per-ABI.
       - uses: CIRISAI/CIRISCache/save@v1
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        continue-on-error: true  # a cache SAVE must never fail a build or a release (v34.3.0: setup-oras HTTP 500 skipped the upload)
         with:
           key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -1901,6 +1902,7 @@ jobs:
       # consumers get a release blob like every other PLAT.
       - uses: CIRISAI/CIRISCache/save@v1
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+        continue-on-error: true  # a cache SAVE must never fail a build or a release (v34.3.0: setup-oras HTTP 500 skipped the upload)
         with:
           key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}

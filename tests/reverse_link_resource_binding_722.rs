@@ -303,6 +303,7 @@ async fn pair(tag: &str, seed_route_at_b: bool) -> Pair {
                 scheduler: SchedulerConfig {
                     cadence: Duration::from_secs(3600),
                     round_timeout: Duration::from_secs(15),
+                    ..SchedulerConfig::default()
                 },
                 local_key_id: Some(key_b.key_id.clone()),
                 metrics: Some(EdgeMetrics::new()),

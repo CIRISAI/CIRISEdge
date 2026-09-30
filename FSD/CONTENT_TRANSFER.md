@@ -1358,6 +1358,84 @@ a room with the producer" is a **transitive widening** — a member of any one o
 rows from all of them — and would put the local read door in contradiction with both shipped
 spellings at once.
 
+### 6.10 Delivery receipts — CC 5.3.3.6 for files (CIRISEdge#738, lane 4 of #734)
+
+A chunked file already is a stream (`stream_id`, chunks at `seq`), so a file receipt is CC 5.3.3.6's
+`delivery_receipt:{stream_id}` at the file's stream with **`K` = the stream's `tree_size`** (its
+chunk count): the receiving NODE's hybrid-signed statement that it holds bytes committing to every
+chunk under the named root. Proof of **delivery**, never of consumption; "delivered" is the host's
+verdict. Canonical bytes are persist's `receipt_signing_bytes` (the one spelling); verification is
+the JOIN against a published STH root, which persist's `put_delivery_receipt` performs.
+
+**Publish — the producer publishes the root, and it rides the row.** No persist production path
+publishes a per-stream STH for a chunk-DAG file, so `files::publish` does: after the chunk seal it
+reads the stream's chunk addresses in `seq` order (`stream_chunks`), builds the STH
+(`receipts::stream_sth_for_file` — verify-core's `SignedTreeHead`, root by verify-core's
+`InMemoryTransparencyStore` over persist's `StreamChunkLeaf`, signed by the node's full hybrid) and
+puts it through `put_stream_sth`, whose anti-equivocation gate recomputes the root from the stored
+chunks. The STH is also carried **on the file row** as `stream_sth` (`StreamSthClaim`: `tree_size`,
+hex root, timestamp, producer key, the signature's two halves; public keys are resolved from the
+verifier's own directory). That is the placement decision: after a pull, **what the receiver holds is
+the row and the chunks** — no STH table row arrives on any replication plane — so the claim must be in
+the row, signed under it, at exactly the row's audience. A rename carries the prior row's claim
+(same bytes, same stream, same root). `stream_sth_for_file` mirrors persist v51.4.0's
+`federation::stream_sth::produce_stream_sth(local, stream_id, chunk_shas_in_seq_order, tree_size,
+timestamp)`; on that pin its body becomes that one call.
+
+**Inline files carry no receipt at this pin.** `put_stream_sth` recomputes the root from
+`federation_stream_chunks`, and an inline file is one blob row with no stream rows, so a one-leaf STH
+over it is refused as an over-claimed `tree_size`. Only DAG files (> 1 MiB, §6.7) are receiptable
+until persist has a one-leaf stream door over an inline blob.
+
+**Receive — once, after promote, as the node.** The DAG pull's one hook (`receipts::on_dag_pulled`,
+called at the end of `pull_dag_inner`) acts on `Stored` only: `DagAwaitingKey`, every `DagRefused`
+rung, and a resume still missing chunks emit nothing. The receiver puts the row's STH into **its
+own** store first — persist recomputes the root from the chunks this node just adopted and refuses a
+root they do not reproduce — so the root it signs is one its own bytes commit to. It signs with the
+engine's hybrid signer (the node received the bytes; CC 5.3.3.6 names the subscriber key), stores the
+receipt, and emits it as a `scores` row on `delivery_receipt:{stream_id}:v1` (CC 3.4.6's reserved
+family, resolved by persist's namespace matcher). Exactly once per `(stream, epoch, receiver)`: a
+receipt already held for this node at this epoch emits nothing. The epoch is the pointer's
+sealed-under epoch for a community file, the stream label (0) for self/family.
+
+**Delivery — the room's delivered path, never discovery.** The receipt row is emitted at the file
+row's own cohort with the same cohort target: `self` reaches the owner's devices, `family` the family,
+`community` the room's members. CC 5.2 holds (no `holds_bytes`, no discovery surface at self/family);
+nothing is ever emitted at a commons scope.
+
+**Admit — on the author's node, every refusal named** (`receipts::admit_receipt_row`, run by the
+replication bridge when persist admits a `delivery_receipt:*` row; counted under
+`delivery_receipts`):
+
+| refusal | when |
+|---|---|
+| `receipt_malformed` | not a receipt row, a subscriber other than the row's signer, or a receipt at a cohort other than the file's |
+| `receipt_file_unknown` | the file row it names is not held, or points at another stream |
+| `receipt_signer_not_member` | the signer's principal (its owner) is not in the file's room: the owner for `self`, an active family member, an active community member |
+| `receipt_epoch_mismatch` | the receipt's epoch is not the file's |
+| `receipt_root_unpublished` | no STH is published for the stream here, or the root is not the published one (persist's JOIN names the same) |
+| `receipt_tree_size_short` | `K` > the published `tree_size` |
+| `receipt_duplicate` | this node already receipted this stream at this epoch |
+| `receipt_substrate` | persist refused otherwise (the signature over the pinned key, a read) |
+
+**Read — who received it, and the re-offer.** `FileRow::received_by(store)` lists the receipts the
+author's store holds as `(node, epoch, K, at)`; `at` is `None` at this pin (persist's
+`list_delivery_receipts_for` does not return the `received_at` it stores). A receipt for all
+`tree_size` chunks enters the bridge's `ReceiptLedger`, and the Attestation advertise to a resolved
+peer skips a file row whose stream that peer receipted in full (`re_offer_suppressed_receipted`) —
+the honest half of #679 ask 1, no wire change. The ledger hydrates from the store once per stream,
+so a restart does not resume re-offering. The serve path, the holdings the diff reads, and the
+projection are unchanged: the peer can still fetch the row, it is simply not offered again.
+
+**Witnesses** (`tests/delivery_receipts_738.rs`, real SQLite substrates): self — exactly one receipt
+from the owner's second device after a 1.3 MiB pull, none while the key is pending, none after a
+tampered chunk, admitted through A's bridge, the file row no longer offered to that device, a
+self-invented root and a second receipt refused by name; community — a receipt per member that
+pulled (two), each admitted through A's bridge into its ledger, a non-member's receipt, a wrong
+epoch and a `K` past the tree refused by name; family — written, `#[ignore]`d: at persist `9d406712`
+a family file cannot be published (the content `key_grant` set carries no `family_key_id`, so the
+write gate refuses it, lane 3).
+
 ## 7. Invariants — and the mutant each must kill## 7. Invariants — and the mutant each must kill
 
 1. **No `holds_bytes` for self/family at any audience.** persist I52 stays as written; edge
@@ -1428,6 +1506,7 @@ spellings at once.
 | `blob meaning projected` with `group_id` provenance (`identity` / `family_id` / `community`) | R5 | — |
 | `chat: body opened` / `Body::Unopened { reason }` | R8 | ✓ |
 | ladder stages: `bound`, `sent`, `arrived`, `hamburger` | community | ✓ (server); **`mine_on_b`** for self — |
+| `delivery_receipts` (`emitted` / `not_emitted_{no_sth,sth_refused,failed}` on the receiver; `admitted` and the §6.10 refusals on the author; `re_offer_suppressed_receipted`) | §6.10 | ✓ (CIRISEdge#738; metrics snapshot + PyO3 dict) |
 
 The ladder's merged narrative (CIRISServer#612) already prints R2–R8 for community in time order;
 the self row set adds `mine_on_b` = "a self row written on A opened on B", with the rung named on red.
@@ -1500,6 +1579,12 @@ template: it is green because each rung has a witness, not because a run passed.
   the manifest adopt, ahead of promotion — the plaintext door announces after every chunk — so a
   manifest-only holder is discoverable; the puller's `NotHeld` walk-on covers it and the door shape
   is persist's to move (CIRISPersist#951).
+- **2026-09-29 (CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files, §6.10).** `files::publish`
+  publishes a DAG file's STH through persist's gate and carries it on the row; the DAG pull emits one
+  node-signed receipt on promote and delivers it as a `delivery_receipt:{stream_id}:v1` row at the
+  file's cohort; the author admits it with every refusal named; `FileRow::received_by`; the bridge
+  stops re-offering a row a peer receipted in full. Inline files and the family witness wait on
+  persist (§6.10).
 - **2026-09-29 (CIRISEdge#718 — CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132 ruled (a)).** Rung
   **R5′** added: a scoped body rides the members' end-to-end encrypted identity-plane link when the
   only path to the holder runs through a non-member transport node, the room discriminated inside
