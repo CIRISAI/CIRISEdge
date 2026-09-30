@@ -338,48 +338,235 @@ pub fn community(
     ))
 }
 
-/// **The two-person room, as a record — both people founders, and therefore
-/// both moderators.**
+/// **The two-person room's founding record — founded by its opener alone.**
 ///
-/// CC 4.5.4 / §11.11: no unmoderated federated space. Persist refuses to
-/// federate any content keyed on a community that has no live named
-/// moderator, and a named moderator exists iff the community has a
-/// steward-bound AUTHORITY root — a `founder`, or under any protocol but
-/// `founder_only`, any member. A pair room is two equals, so both are named
-/// `founder` outright: each is an authority root and a zero-hop moderator
-/// **by construction of the record**, not by the accident of a protocol
-/// setting. `unanimous` is kept so that nothing decides without both.
+/// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133): *nobody joins a
+/// family or community without their own consent*. A founding record admits
+/// only the members who signed it, so the record lists the OPENER alone
+/// (`founder`); the other person joins by accepting a
+/// `membership:proposal:v1` offering them `founder`, and the opener's side
+/// then widens the roster ([`open_pair_room`], [`accept_pair_proposal`],
+/// [`crate::membership`]). The END STATE is unchanged from the two-founder
+/// record this replaced: both people are founders, so both are authority
+/// roots and zero-hop moderators (CC 4.5.4 / §11.11), and `unanimous` keeps
+/// nothing decided without both once the second founder is in.
 ///
-/// Everything that opens a pair room — the mesh harness, the tests, a
-/// consumer — builds it here, so the roster shape cannot drift between them.
-/// Sign it with [`signed_pair_community`]. The record is BYTE-IDENTICAL to
-/// what this function produced before the N-member builder existed
-/// (CIRISEdge#608) — pinned by `the_pair_room_is_byte_identical_over_the_general_builder`
-/// — because every pair room on the mesh is a derived id whose far end
-/// re-derives the same bytes, and a changed byte is a `CommunityRosterFork`
-/// on every one of them.
+/// The room id is still derived from the pair ([`pair_community_key_id`]) and
+/// the name is still the sorted pair, so the record is a function of (opener,
+/// peer, `founded_at`). Two ends that open the same pair CONCURRENTLY author
+/// differing records under one id (a `Conflict` at the door); the mesh
+/// harness avoids it by letting only the [`PairRole::Creator`] open.
 #[must_use]
 pub fn pair_community(
-    a: &str,
-    b: &str,
+    opener: &str,
+    peer: &str,
     founded_at: chrono::DateTime<chrono::Utc>,
 ) -> ciris_persist::federation::types::Community {
     use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
     use ciris_persist::federation::types::consensus_protocol;
-    let mut pair = [a, b];
+    let mut pair = [opener, peer];
     pair.sort_unstable();
-    // Two founders satisfy `community`'s roster rule by construction, so the
-    // validating door is not consulted — the pair shape IS the rule.
+    // One founder satisfies `community`'s roster rule by construction, so the
+    // validating door is not consulted — the shape IS the rule.
     build_community(
-        &pair_community_key_id(a, b),
+        &pair_community_key_id(opener, peer),
         &format!("{} <-> {}", pair[0], pair[1]),
-        &[
-            (pair[0], Some(MEMBER_ROLE_FOUNDER)),
-            (pair[1], Some(MEMBER_ROLE_FOUNDER)),
-        ],
+        &[(opener, Some(MEMBER_ROLE_FOUNDER))],
         consensus_protocol::UNANIMOUS,
         founded_at,
     )
+}
+
+/// What [`open_pair_room`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairRoomOpened {
+    /// The derived room id.
+    pub room: String,
+    /// `true` when this call authored the founding record; `false` when this
+    /// directory already held it (an idempotent re-open).
+    pub founded: bool,
+    /// The proposal inviting the peer — the one this call stored, or the live
+    /// one it found already pending. `None` once the peer is a member.
+    pub proposal: Option<Attestation>,
+}
+
+/// **Host call: open the pair room with `peer`** (persist v52.0.0,
+/// CIRISPersist#955). Founds the room with `opener` alone as `founder`
+/// (signed by `authority`, which must act for `opener`), then proposes `peer`
+/// at role `founder`, live until `expires_at` (at most 30 days out). The
+/// proposal replicates to the peer's nodes; their acceptance replicates back,
+/// and the opener's node widens the roster on its arrival when its
+/// replication bridge carries a [`crate::membership::MembershipWidener`] for
+/// `opener`'s key — no further call on this side.
+///
+/// Idempotent: a room already held here is not re-founded, and a live
+/// proposal already pending for `peer` is returned instead of a second one.
+///
+/// # Errors
+/// The room is held here but `opener` is not its founder (the peer opened it
+/// — accept their proposal instead: [`pair_proposal_for`] /
+/// [`accept_pair_proposal`]); the founding or proposal refused; a build or
+/// signing failure.
+pub async fn open_pair_room(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    opener: &str,
+    peer: &str,
+    founded_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    authority: &crate::identity::LocalSigner,
+) -> Result<PairRoomOpened, String> {
+    use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
+    let room = pair_community_key_id(opener, peer);
+    let founded = match directory
+        .lookup_community(&room)
+        .await
+        .map_err(|e| format!("lookup room {room}: {e}"))?
+    {
+        Some(held) => {
+            if !held
+                .members
+                .iter()
+                .any(|m| m.key_id == opener && m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+            {
+                return Err(format!(
+                    "room {room} is already held here and {opener} did not found it — the                      other side opened it; accept its proposal (chat::pair_proposal_for →                      chat::accept_pair_proposal) (CIRISPersist#955)"
+                ));
+            }
+            false
+        }
+        None => {
+            let row = signed_pair_community(opener, peer, founded_at, authority).await?;
+            directory
+                .put_community(row)
+                .await
+                .map_err(|e| format!("found room {room}: {e}"))?;
+            true
+        }
+    };
+    let active = directory
+        .active_community_members(&room)
+        .await
+        .map_err(|e| format!("read room {room}: {e}"))?;
+    if active.iter().any(|m| m.key_id == peer) {
+        return Ok(PairRoomOpened {
+            room,
+            founded,
+            proposal: None,
+        });
+    }
+    if let Some(live) = live_proposal_by(directory, &authority.key_id, &room, peer).await? {
+        return Ok(PairRoomOpened {
+            room,
+            founded,
+            proposal: Some(live),
+        });
+    }
+    let proposal = crate::membership::propose(
+        directory,
+        crate::membership::GroupScope::Community,
+        &room,
+        peer,
+        Some(MEMBER_ROLE_FOUNDER),
+        expires_at,
+        authority,
+    )
+    .await
+    .map_err(|e| format!("propose {peer} into {room}: {e}"))?;
+    Ok(PairRoomOpened {
+        room,
+        founded,
+        proposal: Some(proposal),
+    })
+}
+
+/// A live proposal `proposer_key_id` signed inviting `invitee` into `room`
+/// that the invitee has not declined, if one is held here.
+async fn live_proposal_by(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    proposer_key_id: &str,
+    room: &str,
+    invitee: &str,
+) -> Result<Option<Attestation>, String> {
+    let now = chrono::Utc::now();
+    let mut live = directory
+        .list_attestations_by(proposer_key_id)
+        .await
+        .map_err(|e| format!("list proposals by {proposer_key_id}: {e}"))?
+        .into_iter()
+        .filter(|p| {
+            crate::membership::dimension_of(p) == Some(crate::membership::PROPOSAL_DIMENSION)
+                && p.subject_key_ids.first().map(String::as_str) == Some(invitee)
+                && p.attestation_envelope
+                    .get(FIELD_COMMUNITY_ID)
+                    .and_then(serde_json::Value::as_str)
+                    == Some(room)
+                && p.expires_at.is_some_and(|t| t > now)
+        })
+        .collect::<Vec<_>>();
+    let declined: std::collections::HashSet<String> = directory
+        .list_attestations_for(invitee)
+        .await
+        .map_err(|e| format!("list replies of {invitee}: {e}"))?
+        .into_iter()
+        .filter(|r| {
+            crate::membership::dimension_of(r) == Some(crate::membership::DECLINE_DIMENSION)
+        })
+        .filter_map(|r| {
+            r.attestation_envelope
+                .get("references_attestation_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    live.retain(|p| !declined.contains(&p.attestation_id));
+    live.sort_by(|a, b| b.asserted_at.cmp(&a.asserted_at));
+    Ok(live.into_iter().next())
+}
+
+/// **Host call: the pending proposal inviting `me` into the pair room with
+/// `peer`**, if one is held here (the invite inbox, narrowed to one room).
+///
+/// # Errors
+/// A directory read failure.
+pub async fn pair_proposal_for(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    me: &str,
+    peer: &str,
+) -> Result<Option<crate::membership::PendingProposal>, crate::membership::MembershipError> {
+    let room = pair_community_key_id(me, peer);
+    Ok(crate::membership::pending_proposals_for(directory, me)
+        .await?
+        .into_iter()
+        .find(|p| p.group_key_id == room))
+}
+
+/// **Host call: accept a pair-room proposal** — `signer` acts for the
+/// invitee (their person key, or a device bound to them). The acceptance
+/// replicates back and the opener's node widens the roster; see
+/// [`crate::membership::reply`] for the refusals (by rule).
+///
+/// # Errors
+/// [`crate::membership::reply`]'s.
+pub async fn accept_pair_proposal(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    proposal_attestation_id: &str,
+    signer: &crate::identity::LocalSigner,
+) -> Result<Attestation, crate::membership::MembershipError> {
+    crate::membership::reply(directory, proposal_attestation_id, true, signer).await
+}
+
+/// **Host call: decline a pair-room proposal.** Final for that proposal: a
+/// later widening naming the invitee under it is refused by persist with
+/// `membership_declined`.
+///
+/// # Errors
+/// [`crate::membership::reply`]'s.
+pub async fn decline_pair_proposal(
+    directory: &dyn ciris_persist::federation::FederationDirectory,
+    proposal_attestation_id: &str,
+    signer: &crate::identity::LocalSigner,
+) -> Result<Attestation, crate::membership::MembershipError> {
+    crate::membership::reply(directory, proposal_attestation_id, false, signer).await
 }
 
 /// A [`Community`](ciris_persist::federation::types::Community) record,
@@ -416,19 +603,18 @@ pub async fn signed_community(
 }
 
 /// [`pair_community`], hybrid-signed by `authority` — the key that vouches
-/// for the record (the node that opens the room, in the harness). Both ends
-/// author the same derived row; the second `put_community` is a `Conflict`,
-/// which is the same room either way.
+/// for the record, acting for `opener` (the opener's node, in the harness).
+/// Only the opener authors it; the peer joins by proposal ([`open_pair_room`]).
 ///
 /// # Errors
 /// Canonicalization or signing failure.
 pub async fn signed_pair_community(
-    a: &str,
-    b: &str,
+    opener: &str,
+    peer: &str,
     founded_at: chrono::DateTime<chrono::Utc>,
     authority: &crate::identity::LocalSigner,
 ) -> Result<ciris_persist::federation::types::SignedCommunity, String> {
-    signed_community(pair_community(a, b, founded_at), authority).await
+    signed_community(pair_community(opener, peer, founded_at), authority).await
 }
 
 /// Which side of the MLS handshake a person is in a pair room — decided

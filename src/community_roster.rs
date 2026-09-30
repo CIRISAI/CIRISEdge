@@ -365,8 +365,36 @@ mod admit_tests {
         }
     }
 
+    /// persist v52.0.0 (CIRISPersist#955) — `member` consents to join `room`
+    /// (at `role`): a proposal by `founder`, accepted by `member` — the real
+    /// flow, through [`crate::membership`], not a fixture shortcut.
+    async fn consent(
+        dir: &SqliteBackend,
+        room: &str,
+        founder: &crate::identity::LocalSigner,
+        member: &crate::identity::LocalSigner,
+        role: Option<&str>,
+    ) {
+        let proposal = crate::membership::propose(
+            dir,
+            crate::membership::GroupScope::Community,
+            room,
+            &member.key_id,
+            role,
+            chrono::Utc::now() + chrono::Duration::days(7),
+            founder,
+        )
+        .await
+        .expect("the founder's proposal is admitted");
+        crate::membership::reply(dir, &proposal.attestation_id, true, member)
+            .await
+            .expect("the member's acceptance is admitted");
+    }
+
     /// A directory with three registered humans and a room founded by the
-    /// first, holding the first two. Returns `(dir, founder, room id, carol)`.
+    /// first ALONE (persist v52.0.0: a founding record admits only its
+    /// signers), the second joined by proposal → acceptance → widening.
+    /// Returns `(dir, founder, room id, carol)` — carol has NOT consented.
     ///
     /// `register_room_key` decides whether the room's id is ALSO registered
     /// as a federation key. persist's revocation table FKs
@@ -412,13 +440,10 @@ mod admit_tests {
         let record = crate::chat::community(
             &room,
             "the room",
-            &[
-                (
-                    "alice-fed",
-                    Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER),
-                ),
-                ("bob-fed", None),
-            ],
+            &[(
+                "alice-fed",
+                Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER),
+            )],
             ciris_persist::federation::types::consensus_protocol::FOUNDER_ONLY,
             ts(),
         )
@@ -430,6 +455,10 @@ mod admit_tests {
         )
         .await
         .expect("persist admits the room");
+        consent(&dir, &room, &alice, &bob, None).await;
+        assert!(widen_community(&*dir, &room, "bob-fed", None, ts(), &alice)
+            .await
+            .expect("bob joins on his acceptance"));
         (dir, alice, room, carol)
     }
 
@@ -449,9 +478,10 @@ mod admit_tests {
     /// grown.**
     #[tokio::test]
     async fn a_widening_is_admitted_and_the_active_roster_grows() {
-        let (dir, alice, room, _carol) = room_of_two(false).await;
+        let (dir, alice, room, carol) = room_of_two(false).await;
         assert_eq!(active(&dir, &room).await, ["alice-fed", "bob-fed"]);
 
+        consent(&dir, &room, &alice, &carol, None).await;
         let added = widen_community(&*dir, &room, "carol-fed", None, ts(), &alice)
             .await
             .expect("persist must ADMIT the widening this producer builds");
@@ -477,7 +507,9 @@ mod admit_tests {
     /// the E4 rule: roster growth is not an unauthenticated write door.
     #[tokio::test]
     async fn a_widening_under_a_forged_authority_is_refused() {
-        let (dir, _alice, room, carol) = room_of_two(false).await;
+        let (dir, alice, room, carol) = room_of_two(false).await;
+        // Carol consented, so the only thing wrong below is the signature.
+        consent(&dir, &room, &alice, &carol, None).await;
         // Carol's key signs, but the spec CLAIMS alice as the authority — the
         // registered pubkeys for alice do not verify carol's signature.
         let (member, mut spec) =
@@ -508,13 +540,16 @@ mod admit_tests {
     /// signed the grown record and failed closed on any move).
     #[tokio::test]
     async fn a_widening_signed_over_the_row_survives_a_moved_roster() {
-        let (dir, alice, room, _carol) = room_of_two(false).await;
+        let (dir, alice, room, carol) = room_of_two(false).await;
         // A widening's member is a `federation_keys` FK: dave must be a key.
+        let dave = signer("dave-fed", 4);
         dir.put_public_key(SignedKeyRecord {
-            record: user_record(&signer("dave-fed", 4)).await,
+            record: user_record(&dave).await,
         })
         .await
         .expect("register dave");
+        consent(&dir, &room, &alice, &carol, None).await;
+        consent(&dir, &room, &alice, &dave, None).await;
         let (member, spec) =
             community_membership_widening(&*dir, &room, "carol-fed", None, ts(), &alice)
                 .await
@@ -654,5 +689,76 @@ mod admit_tests {
             2,
             "two revocations, two instants"
         );
+    }
+
+    /// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — **a
+    /// widening without the member's own acceptance is refused BY RULE**,
+    /// retryable (the acceptance may still arrive), and nothing is written.
+    #[tokio::test]
+    async fn a_widening_without_the_members_acceptance_is_refused_by_rule() {
+        let (dir, alice, room, _carol) = room_of_two(false).await;
+        let err = crate::membership::widen(
+            &*dir,
+            crate::membership::GroupScope::Community,
+            &room,
+            "carol-fed",
+            None,
+            ts(),
+            &alice,
+        )
+        .await
+        .expect_err("no acceptance, no growth");
+        assert_eq!(
+            err.rule(),
+            Some(crate::membership::RULE_ACCEPTANCE_UNRESOLVED),
+            "{err}"
+        );
+        assert!(err.is_retryable(), "the acceptance may still arrive");
+        assert_eq!(active(&dir, &room).await, ["alice-fed", "bob-fed"]);
+    }
+
+    /// persist v52.0.0 (CIRISPersist#955) — **a decline is final**: a later
+    /// widening under that proposal is refused `membership_declined`, and edge
+    /// reads it TERMINAL (never re-offered as transient).
+    #[tokio::test]
+    async fn a_declined_proposal_refuses_the_widening_terminally() {
+        let (dir, alice, room, carol) = room_of_two(false).await;
+        let proposal = crate::membership::propose(
+            &*dir,
+            crate::membership::GroupScope::Community,
+            &room,
+            "carol-fed",
+            None,
+            chrono::Utc::now() + chrono::Duration::days(7),
+            &alice,
+        )
+        .await
+        .expect("propose");
+        crate::membership::reply(&*dir, &proposal.attestation_id, false, &carol)
+            .await
+            .expect("carol declines");
+        let err = crate::membership::widen(
+            &*dir,
+            crate::membership::GroupScope::Community,
+            &room,
+            "carol-fed",
+            None,
+            ts(),
+            &alice,
+        )
+        .await
+        .expect_err("declined");
+        assert_eq!(err.rule(), Some(crate::membership::RULE_DECLINED), "{err}");
+        assert!(!err.is_retryable());
+        assert_eq!(active(&dir, &room).await, ["alice-fed", "bob-fed"]);
+        // And the classifier the apply path uses agrees: terminal.
+        let persist_err = ciris_persist::federation::Error::MembershipAcceptanceRefused {
+            group_key_id: room.clone(),
+            member_key_id: "carol-fed".into(),
+            rule: crate::membership::RULE_DECLINED,
+        };
+        let class = crate::replication::bridge::ApplyRefusalClass::classify(&persist_err)
+            .expect("classified");
+        assert!(!class.is_transient(), "{class:?}");
     }
 }

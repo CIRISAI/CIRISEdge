@@ -1678,7 +1678,7 @@ const _: () = {
     }
 };
 
-const DISCOVERY_PLANES: [EnvelopeKind; 4] = [
+const DISCOVERY_PLANES: [EnvelopeKind; 6] = [
     // The three that PROMOTE an advisory link to an attributed one. The harness
     // first registered `EnvelopeKind::ALL` (sixty coordinators — it saturated
     // the transport), then narrowed to `Key` + `Attestation`, which omits two
@@ -1689,6 +1689,13 @@ const DISCOVERY_PLANES: [EnvelopeKind; 4] = [
     EnvelopeKind::TransportDestination,
     // What discovery actually reads.
     EnvelopeKind::Attestation,
+    // persist v52.0.0 (CIRISPersist#955) — the pair room is founded by its
+    // creator alone and the joiner is added by the creator's widening after it
+    // accepts, so the joiner can no longer author the room locally: the record
+    // and the widening must reach it. (The proposal and the acceptance ride the
+    // Attestation plane above.)
+    EnvelopeKind::Community,
+    EnvelopeKind::CommunityMembershipWidening,
 ];
 
 /// Build the whole occurrence: keys, sealed KV, directory, transport,
@@ -2041,34 +2048,41 @@ async fn stand_up(
 
     // ── This node's PAIR ROOMS with every roster owner ───────────────
     //
-    // Authored at STANDUP, before replication starts, so a peer's message —
-    // or its MLS handshake row — is admissible the moment it arrives: AV-45
-    // proves the writer's membership against the room the row names, and a
-    // room that is not yet known is a transient refusal that costs a whole
-    // round. Both humans are FOUNDERS (`chat::pair_community`), so the room
-    // has its moderators by construction. Idempotent on both ends.
+    // Opened at STANDUP, before replication starts, by the pair's CREATOR
+    // (the smaller fed-ID, `chat::PairRole`) only: persist v52.0.0
+    // (CIRISPersist#955, CIRISConstitution#133) admits a founding record only
+    // for the members who signed it, so the creator founds the room alone and
+    // PROPOSES the other owner as `founder`. The joiner accepts in `open_chat`;
+    // this node's bridge widens the roster when the acceptance arrives
+    // (`ReplicationRuntimeConfig::membership_widener`). End state as before:
+    // both humans are founders, so the room has its moderators. Idempotent.
     let founded_at: chrono::DateTime<chrono::Utc> =
         chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
             .map_err(|e| format!("ts: {e}"))?
             .into();
     let mut rooms = 0usize;
     for entry in roster.values().filter(|e| e.key_id != cfg.node_id) {
-        if entry.owner_key_id.is_empty() {
+        if entry.owner_key_id.is_empty()
+            || entry.owner_key_id == owner_key_id
+            || chat::PairRole::of(&owner_key_id, &entry.owner_key_id) != chat::PairRole::Creator
+        {
             continue;
         }
-        let row = chat::signed_pair_community(
+        match chat::open_pair_room(
+            &*directory,
             &owner_key_id,
             &entry.owner_key_id,
             founded_at,
+            chrono::Utc::now() + chrono::Duration::days(7),
             &node_signer,
         )
-        .await?;
-        match directory.put_community(row).await {
-            Ok(()) | Err(ciris_persist::federation::Error::Conflict(_)) => rooms += 1,
+        .await
+        {
+            Ok(_) => rooms += 1,
             Err(e) => {
                 tracing::warn!(
                     node = %cfg.node_id, peer_owner = %entry.owner_key_id, error = %e,
-                    "pair room refused at standup — the chat legs will author it again"
+                    "pair room refused at standup — the chat legs will open it again"
                 );
             }
         }
@@ -2252,6 +2266,13 @@ async fn stand_up(
                             as Arc<dyn ciris_edge::blob_swarm::BlobEvictor>),
                     }),
                 }),
+                // persist v52.0.0 (CIRISPersist#955) — this node widens its
+                // owner's rooms on an admitted acceptance of a proposal the
+                // owner (or this node, for them) issued; the owner's own key
+                // signs, because the roster's consensus counts seat keys.
+                membership_widener: Some(ciris_edge::membership::MembershipWidener::new(vec![
+                    Arc::clone(&owner_signer),
+                ])),
                 ..Default::default()
             },
             // THE SELF-PUBLISH SET — the identities this node speaks for.
@@ -2727,6 +2748,81 @@ async fn share_in_room(
     }
 }
 
+/// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — the pair room
+/// by consent, from either side. The CREATOR (`chat::PairRole`) founds the
+/// room alone and proposes the peer as `founder` (idempotent — standup did
+/// it), then waits until its own bridge has widened the roster on the peer's
+/// acceptance. The JOINER waits for the proposal, accepts it with its node
+/// acting for its owner, then waits for the creator's widening to arrive.
+/// Returns how the room came to be, for the artifact.
+async fn open_pair_room_by_consent(
+    occ: &Occurrence,
+    my_owner: &str,
+    peer_owner: &str,
+    peer_node: &str,
+    founded_at: chrono::DateTime<chrono::Utc>,
+    budget: Duration,
+) -> Result<&'static str, String> {
+    let dir: &dyn ciris_persist::federation::FederationDirectory = &*occ.directory;
+    let room = chat::pair_community_key_id(my_owner, peer_owner);
+    let is_member = |who: String| {
+        let room = room.clone();
+        async move {
+            dir.active_community_members(&room)
+                .await
+                .is_ok_and(|m| m.iter().any(|m| m.key_id == who))
+        }
+    };
+    let how = match chat::PairRole::of(my_owner, peer_owner) {
+        chat::PairRole::Creator => {
+            chat::open_pair_room(
+                dir,
+                my_owner,
+                peer_owner,
+                founded_at,
+                chrono::Utc::now() + chrono::Duration::days(7),
+                &occ.node_signer,
+            )
+            .await?;
+            "founded, proposed, widened on acceptance"
+        }
+        chat::PairRole::Joiner => {
+            occ.replication
+                .sync_and_await(peer_node, budget, || async {
+                    chat::pair_proposal_for(dir, my_owner, peer_owner)
+                        .await
+                        .is_ok_and(|p| p.is_some())
+                })
+                .await
+                .map_err(|e| format!("sync_and_await (proposal): {e}"))?;
+            let pending = chat::pair_proposal_for(dir, my_owner, peer_owner)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("the creator's proposal did not arrive within the budget")?;
+            chat::accept_pair_proposal(dir, &pending.proposal.attestation_id, &occ.node_signer)
+                .await
+                .map_err(|e| format!("accept the proposal: {e}"))?;
+            "accepted the creator's proposal"
+        }
+    };
+    let joiner = match chat::PairRole::of(my_owner, peer_owner) {
+        chat::PairRole::Creator => peer_owner.to_owned(),
+        chat::PairRole::Joiner => my_owner.to_owned(),
+    };
+    occ.replication
+        .sync_and_await(peer_node, budget, || is_member(joiner.clone()))
+        .await
+        .map_err(|e| format!("sync_and_await (widening): {e}"))?;
+    if is_member(joiner.clone()).await {
+        Ok(how)
+    } else {
+        Err(format!(
+            "{joiner} is not on the room's roster within the budget — the widening on \
+             acceptance did not land (CIRISPersist#955)"
+        ))
+    }
+}
+
 async fn run_chat_legs(occ: &Occurrence) {
     use ciris_edge::chat::{self, Body, PairRole};
     use ciris_edge::mls::cohort_group::{
@@ -2855,18 +2951,13 @@ async fn run_chat_legs(occ: &Occurrence) {
     let mut members = vec![my_owner.clone(), peer_owner.clone()];
     members.sort_unstable();
 
-    // ── open_chat: the room record (standup authored it; idempotent) ──
+    // ── open_chat: the room, by consent (CIRISPersist#955) ────────────
+    // The creator founds + proposes (standup did; idempotent) and waits for
+    // its bridge to widen the roster on the joiner's acceptance; the joiner
+    // waits for the proposal, accepts it, and waits for the widening.
     let room_how =
-        match chat::signed_pair_community(&my_owner, &peer_owner, founded_at, &occ.node_signer)
-            .await
-        {
-            Err(e) => Err(e),
-            Ok(row) => match occ.directory.put_community(row).await {
-                Ok(()) => Ok("authored"),
-                Err(ciris_persist::federation::Error::Conflict(_)) => Ok("already present"),
-                Err(e) => Err(format!("put_community: {e}")),
-            },
-        };
+        open_pair_room_by_consent(occ, &my_owner, &peer_owner, &peer_node, founded_at, budget)
+            .await;
     let room_how = match room_how {
         Ok(how) => how,
         Err(e) => {
