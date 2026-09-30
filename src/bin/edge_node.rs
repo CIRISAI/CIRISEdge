@@ -365,6 +365,17 @@ impl Role {
 
 struct Config {
     role: Role,
+    /// This node's NAME — the container name, `EDGE_NODE_ID`, what every
+    /// env list (`EDGE_EXPECT`, `EDGE_COHORT_MEMBERS`, …) and every census
+    /// row names it by. Never a key_id.
+    node_name: String,
+    /// This node's federation KEY_ID: `derive_key_id(node_name, fed pubkey)`
+    /// (CC 2.6.8). Holds the name until `stand_up` has loaded the key, and
+    /// the derived id from then on — the one id the transport, the edge
+    /// signer and the content engine all carry (the production shape: a
+    /// holder's `holds_bytes` signer IS the transport identity peers dial,
+    /// CIRISEdge#768). The name lists below are translated to key_ids at the
+    /// same moment, from the roster.
     node_id: String,
     /// Private, per-container. Federation seed + transport identity +
     /// sealed KV live here and nowhere else.
@@ -460,6 +471,7 @@ impl Config {
         }
         Ok(Self {
             role,
+            node_name: node_id.clone(),
             node_id: node_id.clone(),
             state_dir: PathBuf::from(
                 env_str("EDGE_STATE_DIR").unwrap_or_else(|| format!("/state/{node_id}")),
@@ -499,6 +511,9 @@ impl Config {
 /// generated in the node's own state dir and never leave it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RosterEntry {
+    /// The node's NAME (`EDGE_NODE_ID`); `key_id` is the id derived from it.
+    #[serde(default)]
+    name: String,
     key_id: String,
     role: String,
     advertise: String,
@@ -618,8 +633,8 @@ fn directory_path(mesh: &Path) -> PathBuf {
 fn publish_roster_entry(mesh: &Path, entry: &RosterEntry) -> std::io::Result<()> {
     let dir = roster_dir(mesh);
     std::fs::create_dir_all(&dir)?;
-    let tmp = dir.join(format!("{}.tmp", entry.key_id));
-    let final_path = dir.join(format!("{}.json", entry.key_id));
+    let tmp = dir.join(format!("{}.tmp", entry.name));
+    let final_path = dir.join(format!("{}.json", entry.name));
     std::fs::write(&tmp, serde_json::to_vec_pretty(entry).unwrap_or_default())?;
     // Rename so a reader never observes a half-written record.
     std::fs::rename(&tmp, &final_path)
@@ -668,7 +683,28 @@ fn read_roster(mesh: &Path) -> BTreeMap<String, RosterEntry> {
     out
 }
 
-/// Wait until every id in `expect` has published a roster entry.
+fn roster_has_name(roster: &BTreeMap<String, RosterEntry>, name: &str) -> bool {
+    roster.values().any(|e| e.name == name)
+}
+
+/// The key_id the roster holds for the node NAMED `name`.
+fn key_of(roster: &BTreeMap<String, RosterEntry>, name: &str) -> Result<String, String> {
+    roster
+        .values()
+        .find(|e| e.name == name)
+        .map(|e| e.key_id.clone())
+        .ok_or_else(|| format!("no roster entry is named {name:?}"))
+}
+
+/// The NAME of the node whose key_id is `key_id` — for the few places a census
+/// row must name a node. Falls back to the key_id itself.
+fn name_of(roster: &BTreeMap<String, RosterEntry>, key_id: &str) -> String {
+    roster
+        .get(key_id)
+        .map_or_else(|| key_id.to_owned(), |e| e.name.clone())
+}
+
+/// Wait until every NAME in `expect` has published a roster entry.
 ///
 /// Returns `Err` with the ids still missing when the deadline passes —
 /// the caller reports a leg that did not run, never a green one.
@@ -684,14 +720,17 @@ async fn await_roster(
         .with_poll_floor(Duration::from_millis(250))
         .await_until(timeout, || async {
             let roster = read_roster(mesh);
-            expect.iter().all(|k| roster.contains_key(k))
+            expect.iter().all(|n| roster_has_name(&roster, n))
         })
         .await;
     let roster = read_roster(mesh);
     if outcome.is_converged() {
         return Ok(roster);
     }
-    let missing: Vec<&String> = expect.iter().filter(|k| !roster.contains_key(*k)).collect();
+    let missing: Vec<&String> = expect
+        .iter()
+        .filter(|n| !roster_has_name(&roster, n))
+        .collect();
     Err(format!(
         "roster barrier timed out after {}s; still missing {missing:?}",
         timeout.as_secs()
@@ -827,9 +866,9 @@ impl FedKey {
     /// edge's `key_id` is the id DERIVED from it — the shape
     /// `PersistGroupContentStore::from_shared_hybrid` and every persist
     /// `LocalSigner` built from it assume. [`Self::local_signer`] keys the
-    /// signer by the label itself, which is right only for the harness's
-    /// label-keyed transport NODE identity; a persist-side actor (the owner)
-    /// signed that way names an id no persist signer can ever derive.
+    /// signer by the label itself, which is right only for the test trust
+    /// root's fixed steward id; any other actor signed that way names an id
+    /// no persist signer can ever derive.
     fn identity_signer(&self, label: &str) -> Result<LocalSigner, String> {
         let mut signer = self.local_signer(label)?;
         signer.key_id = self.derived_key_id(label)?;
@@ -1729,7 +1768,7 @@ const DISCOVERY_PLANES: [EnvelopeKind; 6] = [
 /// Build the whole occurrence: keys, sealed KV, directory, transport,
 /// address table, lifecycle.
 async fn stand_up(
-    cfg: Config,
+    mut cfg: Config,
     reporter: Arc<Reporter>,
     max_blocking_threads: usize,
 ) -> Result<Occurrence, String> {
@@ -1737,7 +1776,15 @@ async fn stand_up(
         .map_err(|e| format!("create state dir {}: {e}", cfg.state_dir.display()))?;
 
     // ── 1. This node's own federation key (private; own volume only) ──
-    let fed = FedKey::load_or_create(&cfg.node_id, &cfg.state_dir.join("fed"))?;
+    //
+    // Its key_id is DERIVED from the node's name and pubkey (CC 2.6.8), and it
+    // is the ONE id this node goes by: the transport identity peers dial, the
+    // edge signer, and the content engine (whose `holds_bytes` claims name the
+    // holder a blob pull then dials — CIRISEdge#768). The harness used to key
+    // the node by its bare name and run the engine under a second key, so a
+    // holder was a key no transport listened on.
+    let fed = FedKey::load_or_create(&cfg.node_name, &cfg.state_dir.join("fed"))?;
+    cfg.node_id = fed.derived_key_id(&cfg.node_name)?;
 
     // The PERSON who owns this node. A node cannot consent and cannot be a
     // contact — its owner is both — so directory discovery resolves an
@@ -1750,7 +1797,7 @@ async fn stand_up(
     // keystore holds; persist's signers all name themselves by the derived id,
     // so a label-keyed owner is an attester no signer of its can ever match
     // (persist W5 refused every standup from 2026-09-14 — CIRISEdge#767).
-    let owner_label = format!("{}-owner", cfg.node_id);
+    let owner_label = format!("{}-owner", cfg.node_name);
     let owner = FedKey::load_or_create(&owner_label, &cfg.state_dir.join("owner"))?;
     let owner_key_id = owner.derived_key_id(&owner_label)?;
 
@@ -1759,24 +1806,26 @@ async fn stand_up(
     // transport identity. An agent is resolved to a node in order to be
     // reached, so the two cannot be the same key without making that
     // resolution meaningless.
-    let agent_key_id = format!("{}-agent", cfg.node_id);
-    let agent = FedKey::load_or_create(&agent_key_id, &cfg.state_dir.join("agent"))?;
+    let agent_label = format!("{}-agent", cfg.node_name);
+    let agent = FedKey::load_or_create(&agent_label, &cfg.state_dir.join("agent"))?;
+    let agent_key_id = agent.derived_key_id(&agent_label)?;
 
     // ── 2. Publish the public half + reachability ────────────────────
     publish_roster_entry(
         &cfg.mesh_dir,
         &RosterEntry {
+            name: cfg.node_name.clone(),
             key_id: cfg.node_id.clone(),
             role: cfg.role.as_str().to_owned(),
             advertise: cfg.advertise.clone(),
             fed_pubkey_b64: fed.pubkey_b64()?,
             owner_key_id: owner_key_id.clone(),
             owner_pubkey_b64: owner.pubkey_b64()?,
-            fed_pqc_pubkey_b64: fed.pqc_pubkey_b64(&cfg.node_id).await?,
+            fed_pqc_pubkey_b64: fed.pqc_pubkey_b64(&cfg.node_name).await?,
             owner_pqc_pubkey_b64: owner.pqc_pubkey_b64(&owner_label).await?,
             agent_key_id: agent_key_id.clone(),
             agent_pubkey_b64: agent.pubkey_b64()?,
-            agent_pqc_pubkey_b64: agent.pqc_pubkey_b64(&agent_key_id).await?,
+            agent_pqc_pubkey_b64: agent.pqc_pubkey_b64(&agent_label).await?,
         },
     )
     .map_err(|e| format!("publish roster entry: {e}"))?;
@@ -1851,6 +1900,26 @@ async fn stand_up(
         serde_json::from_slice(&dir_bytes).map_err(|e| format!("decode directory: {e}"))?;
     let directory = open_directory(rows).await?;
 
+    // The directory is signed only once every expected node has published its
+    // roster entry, so the roster is complete here: translate every NAME list
+    // the environment gave into the key_ids the mesh actually runs on. From
+    // here on `cfg`'s lists and `cfg.node_id` are key_ids; a name survives
+    // only where a census row reads one (`name_of`).
+    {
+        let roster = read_roster(&cfg.mesh_dir);
+        let keys = |names: &[String]| -> Result<Vec<String>, String> {
+            names.iter().map(|n| key_of(&roster, n)).collect()
+        };
+        cfg.expect = keys(&cfg.expect)?;
+        cfg.cohort_members = keys(&cfg.cohort_members)?;
+        cfg.observers = keys(&cfg.observers)?;
+        cfg.late_joiner = cfg
+            .late_joiner
+            .as_deref()
+            .map(|n| key_of(&roster, n))
+            .transpose()?;
+    }
+
     // This node's own owner binding, written locally and replicated from here.
     // Nothing is seeded into a peer: a peer learns this the same way it learns
     // any other signed row, which is the point of testing discovery rather
@@ -1867,12 +1936,14 @@ async fn stand_up(
     debug_assert_eq!(owner_signer.key_id, owner_key_id);
     emit_owner_binding(&directory, &owner_key_id, &owner_signer, &cfg.node_id).await?;
 
-    // The signer the content engine is built over: the owner's key material
-    // under a DISTINCT alias, so the engine's derived id — this node's content
-    // occurrence of its owner — is not the owner's own id. Built over the
-    // owner's alias it would derive to `owner_key_id` itself, and the node
-    // would be bound, registered and published as an occurrence of itself.
-    let engine_signer = owner.identity_signer(&format!("{}-occ", cfg.node_id))?;
+    // The signer the content engine is built over: THIS NODE's key, so the
+    // engine's derived id is `cfg.node_id` — the node's content occurrence of
+    // its owner, the signer of its `holds_bytes` claims, and the transport
+    // identity peers dial are one key (the production shape, and
+    // `tests/scoped_body_identity_link_718.rs`'s). The node's owner binding
+    // above is what lets persist resolve it to the owner, a room member.
+    let engine_signer = fed.identity_signer(&cfg.node_name)?;
+    debug_assert_eq!(engine_signer.key_id, cfg.node_id);
 
     // CIRISPersist#848 — the hybrid Engine this node seals AND projects
     // through, built ONCE and shared by the replication runtime (which routes
@@ -1915,33 +1986,27 @@ async fn stand_up(
     // admissible key_grant emitter (persist resolves the derived key to the
     // owner, a room member) AND a recipient it can decrypt for. A seed-
     // derived occurrence would be wrapped to and never opened.
-    // The ENGINE's derived key needs its own owner binding, and it is not one
-    // of the two emitted above.
     //
-    // The engine is built over `engine_signer`, so the key it publishes its
-    // occurrence under is `derive_key_id("{node_id}-occ", <owner pubkey>)` —
-    // which is neither `cfg.node_id`, `agent_key_id`, nor `owner_key_id`. persist v44.4.0's gated occurrence door lifts a signing
-    // key to an identity only through a live owner binding naming THAT key, so
-    // without this the publish is refused and node standup aborts. Before
-    // v44.4.0 the occurrence went through the trusted-local door, which
-    // checked nothing — which is exactly why this was never needed and is
-    // needed now.
-    //
-    // Registered first: the binding's `attested_key_id` FKs onto
-    // `federation_keys`, and this is the same registration
-    // `provision_engine_occurrence` would do a moment later (it finds the key
-    // present and skips).
+    // The engine is built over THIS NODE's signer, so the key it publishes
+    // its occurrence under is `cfg.node_id` itself: already registered (the
+    // steward's `node` row) and already owner-bound (the binding above), which
+    // is what persist v44.4.0's gated occurrence door lifts to the owner's
+    // identity. The harness used to build the engine under a second derived
+    // key and had to register and owner-bind that key separately; with one key
+    // there is nothing extra to bind. Checked, because every holder a blob
+    // pull dials is this id (CIRISEdge#768).
     let engine_key = content_store
         .engine()
         .local_derived_key_id()
         .await
         .map_err(|e| format!("derive this engine's federation key id: {e}"))?;
-    content_store
-        .engine()
-        .register_self_federation_key("node", &engine_key, None, serde_json::json!({}), Vec::new())
-        .await
-        .map_err(|e| format!("register {engine_key} as this node's federation key: {e}"))?;
-    emit_owner_binding(&directory, &owner_key_id, &owner_signer, &engine_key).await?;
+    if engine_key != cfg.node_id {
+        return Err(format!(
+            "the content engine derives {engine_key:?}, not this node's key {:?} — its \
+             holds_bytes claims would name a holder no transport listens on",
+            cfg.node_id
+        ));
+    }
 
     let (me, _) = ciris_edge::content_occurrence::provision_engine_occurrence(
         content_store.engine(),
@@ -2055,7 +2120,7 @@ async fn stand_up(
     // granting B says nothing about B granting A, so each node authors its own
     // half — the same shape CIRISServer's `POST /v1/federation/peering` writes,
     // which is where this pattern is taken from rather than invented.
-    let node_signer = fed.local_signer(&cfg.node_id)?;
+    let node_signer = fed.identity_signer(&cfg.node_name)?;
     for peer in roster.keys().filter(|k| *k != &cfg.node_id) {
         let grant = ciris_edge::replication::attestation_bind::replication_consent_attestation(
             &cfg.node_id,
@@ -2150,7 +2215,7 @@ async fn stand_up(
     //
     // Same class as the owner binding: classical-only where the federation tier
     // is PQC-mandatory. `FedKey` already carries both halves.
-    let signer = Arc::new(fed.local_signer(&cfg.node_id)?);
+    let signer = Arc::new(fed.identity_signer(&cfg.node_name)?);
     // Kept for the chat legs: the NODE co-scrubs the owner's message at the
     // crossing, under the owner binding it acts under.
     let node_signer = Arc::clone(&signer);
@@ -3871,7 +3936,10 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 "at_frame": seq,
                 "new_epoch": new_epoch,
                 "kind": if joiner.is_some() { "member_join" } else { "rekey_only" },
-                "late_joiner": joiner,
+                // The census names nodes, so the joiner is reported by NAME
+                // (`census.py::infer_late_joiner`); its key_id beside it.
+                "late_joiner": joiner.as_deref().map(|k| name_of(&read_roster(&cfg.mesh_dir), k)),
+                "late_joiner_key_id": joiner,
                 "derived": advanced.derived,
                 "own_address": hex::encode(advanced.own_address.as_bytes()),
                 "pending_seals": occ.lifecycle.pending_seals(),
@@ -5401,7 +5469,7 @@ fn main() -> std::process::ExitCode {
             }
         };
         let reporter = Arc::new(Reporter::new(
-            &cfg.node_id,
+            &cfg.node_name,
             cfg.role.as_str(),
             cfg.results.clone(),
         ));
@@ -5490,10 +5558,14 @@ mod tests {
         let label_keyed = owner.local_signer(label).expect("label signer");
         assert_ne!(persist_derived(&label_keyed).await, label_keyed.key_id);
 
-        // The content engine's alias derives to a DIFFERENT id, so the node's
-        // content occurrence is never the owner itself.
-        let engine = owner.identity_signer("sub-1-occ").expect("engine signer");
-        assert_ne!(engine.key_id, signer.key_id);
+        // CIRISEdge#768 — the NODE: its edge signer (the transport's), and the
+        // persist signer the content engine is built from it with, name ONE
+        // id, so the engine's `holds_bytes` claims name the key peers dial.
+        let fed = FedKey::from_root_seed([9u8; 32]);
+        let node = fed.identity_signer("sub-1").expect("node signer");
+        assert_eq!(node.key_id, fed.derived_key_id("sub-1").unwrap());
+        assert_eq!(persist_derived(&node).await, node.key_id);
+        assert_ne!(node.key_id, signer.key_id);
     }
 
     // Field provenance (the #336 lesson): every input below is exactly a
