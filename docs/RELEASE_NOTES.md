@@ -1,5 +1,40 @@
 # CIRISEdge Release Notes
 
+# v35.0.0 — three peers no longer deadlock the blocking pool: the state-provider read path is async and a kick is bounded
+
+**2026-09-29** (CIRISEdge#740 → PR #745). **MAJOR** from v34.3.0 (Rust API break below). No pin or hash
+moves: persist `v51.1.0` (wheel floor `>=51.1,<52`), verify `v18.0.0`, every ABI constant,
+`REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH`, `SERVE_ADVERTISE_POLICY_HASH` unchanged.
+
+## The deadlock (found by CIRISServer's native ladder)
+
+A node with THREE peers wedged on its first replication fan-out. `StateProvider::local_refs` was a sync
+method; the directory adapter bridged it with `block_in_place` + `Handle::block_on` on a persist read
+that itself needs a blocking-pool slot. A fan-out runs peers × kinds rounds at once: 3 × 14 = 42 > 32
+slots, so every slot held a parked hand-off and no read could start. Two peers (28) fit, which is why
+every two-node witness was green. Startup is itself a fan-out (every coordinator fires its first tick
+on spawn), so the node wedged before any kick.
+
+- **The bridge is gone:** `StateProvider` and `StateApplier` are `#[async_trait]`; the directory adapter
+  awaits persist directly. No `block_in_place`/`block_on` remains on a round path (the remaining sites
+  are FFI entry points, the process entry and test code; listed in PR #745).
+- **A kick is bounded:** one semaphore (`RoundGate`) in the scheduler covers `round_now_all`,
+  `sync_and_await`, `Propagate` and the startup tick. Default `max(1, max_blocking_threads / 2)` (16 on a
+  32-slot pool; a compile-time assert keeps > 8 slots for persist's readers + writer); configurable as
+  `SchedulerConfig::max_concurrent_rounds`; over-limit rounds wait, never drop;
+  `ReplicationRuntime::round_bound()` reports bound, in flight, peak, waited.
+- **Witness** `tests/kick_three_peers_740.rs`: four real Reticulum nodes, three peers, self room,
+  `max_blocking_threads(32)`. On v34.3.0: 3 of 42 rounds after 240 s, wedged at startup. Fixed: 42
+  startup + 42 kicked rounds in ~5 s. FSD `CIRIS_EDGE_TRANSPORT.md` §4.5, invariant 10.
+
+## Breaking Rust surface
+
+- `StateProvider` / `StateApplier` implementors must be `async` with `#[async_trait]`.
+- `Session::start_round` and `Session::on_message` are `async`.
+- `SchedulerConfig` gains `max_concurrent_rounds` (struct literals need `..SchedulerConfig::default()`).
+- CIRISServer implements neither trait; its `tests/trace_round_e2e.rs` calls
+  `DirectoryStateAdapter::local_refs` and drives `Session` synchronously, so it needs `.await`s.
+
 # v34.3.0 — a link belongs to one plane; unannounced devices of one owner exchange and recover directly
 
 **2026-09-29** (CIRISEdge#728 → PR #730, closes #722; CIRISEdge#727 → PR #729). **MINOR** from v34.2.0. No pin
