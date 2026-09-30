@@ -59,7 +59,7 @@ proves that set is closed (it can never widen into "everything").
 |---|---|---|---|
 | **R0** B unknown (no frame yet) | — | — | — |
 | **R1** B *Identified* (a link exists, B not yet attributable) | ✅ delivered on the link (#402: only self-authenticating kinds) | ❌ | ❌ |
-| **R2** B *Attributed*, **A has not consented to B** (production: the canonical toward every agent) | ✅ | ✅ **#671** — served under `Reach::FirstContact`; nothing else | ❌ `recipient_not_in_send_set` |
+| **R2** B *Attributed*, **A has not consented to B** (production: the canonical toward every agent) | ✅ | ✅ **#671** — served under `Reach::FirstContact`; nothing else | ❌ `recipient_not_in_send_set`, except the membership ceremony addressed to B's person (§2.4, #756): a proposal naming B's owner, and the invitee's reply to B's owner's proposal held at A |
 | **R3** B *Attributed*, A **has** consented to B, pair **not Rooted** | ✅ | ✅ **#668** — the floor's self-authored exemption | ❌ `recipient_not_rooted` |
 | **R4** B *Attributed*, A consented, pair **Rooted** | ✅ | ✅ | ✅ subject to audience (CC 5.2), `#379` conferral for `trace:*`, item 6 `recipient_capability` |
 | **R2′** B Attributed, A not consented, pair Rooted (A's owner and B's owner accept a common valid root but A never wrote a grant) | ✅ | ✅ (FirstContact) | ❌ `recipient_not_in_send_set` — **Rooted is not consent** (CC 3.3.7: out-of-group flow needs the explicit object) |
@@ -74,7 +74,10 @@ Two closure facts make the table safe:
   fine — consent already covers it; at R2 the first-contact reach serves only the four).
 - **`Reach::FirstContact` admits only `Audience::Federation`** — allegiance facts are federation
   rows by definition (CC 3.3.7 makes governance records public; the acceptance and owner-binding
-  are exactly that). A `self`/`family`/`community` row can never ride first contact.
+  are exactly that). A `self`/`family`/`community` row can never ride first contact, with one
+  exception (§2.4, CIRISEdge#756): the membership ceremony addressed to the peer's own person — a
+  `membership:proposal:v1` naming it, and the invitee's reply to its proposal — at the group's
+  `family`/`community` target.
 
 ### 2.1 The announce axis on the bootstrap kinds (CIRISEdge#682)
 
@@ -317,6 +320,65 @@ recording it would be new machinery.
 
 ---
 
+### 2.4 The membership ceremony at first contact (CIRISEdge#756)
+
+(§2.3 is CIRISEdge#752's relayed owner-binding, on the v37.1 track; the numbering leaves it room.)
+
+**What it is for.** An invitation is how a stranger joins a group. CC rc6 3.1.3.2 (CIRISConstitution
+#133, as amended in edb0253) makes admission two consents, the group's and the joiner's own, and
+names `subject_key_ids` as "the key the substrate delivers on — a proposal is readable by, and
+applied on, any node whose self-collective contains that entry, without that node holding the
+group's roster". persist ships the wire (CIRISPersist#955, `FSD/MEMBERSHIP_ACCEPTANCE.md` §3.1, §7)
+and leaves the routing to the transport: the proposal reaches K's node keyed on `subject_key_ids`,
+and K's `membership:acceptance:v1` / `membership:decline:v1` reaches the proposer's nodes. The
+invitee is, in the normal case, a stranger to the group's nodes: no `consent:replication` grant
+names K's node, so it is reached as `Reach::FirstContact`. Before #756 that reach admitted only
+`federation` rows and only this node's allegiance facts, so the invitation was withheld and the
+joiner could never consent. #754 added the audience arms (`peer_is_proposal_invitee`,
+`peer_is_reply_proposer`); this section adds the reach half.
+
+**The rule.** Under `Reach::FirstContact` a node N serving peer X additionally serves exactly two
+row classes, both at a `family` or `community` audience (the group's target), and nothing else:
+
+- **(a) the invitation.** A `membership:proposal:v1` row whose `subject_key_ids` contains
+  `owner_of(X)` (persist's resolver; X itself when X is unowned), i.e. the proposal addressed to
+  X's person.
+- **(b) the answer.** A `membership:acceptance:v1` / `membership:decline:v1` row whose
+  `references_attestation_id` resolves to a proposal row **held in N's store**, whose
+  `attested_key_id` (persist §10: the reply is attested to the invitee) is in that proposal's
+  `subject_key_ids`, and whose proposal's proposer resolves to X's person (`owner_of` of the
+  proposal's `attesting_key_id` equals `owner_of(X)`, or the proposal's attester is X). This is the
+  reply travelling from the invitee's node back to the node(s) of the person who invited.
+
+Everything else a first-contact peer is withheld stays withheld, under the same token
+(`recipient_not_in_send_set`): any other row at the group's target, a proposal addressed to anyone
+else, a reply to a proposal N does not hold, a reply to someone else's proposal, and every other
+shape the §2 table lists. The owner reads are persist's `owner_of`, memoized per sweep with the
+other reach reads; a proposal is read once per sweep per reference.
+
+**The #659 Rooted floor does not apply to these two classes** (decision, #756). The floor keeps
+"rows A holds about **others**" (§2 table) from an un-Rooted peer. Neither class is about others to
+the recipient: the invitation names the recipient's own person as its data subject, and the answer
+replies to the recipient's own person's proposal. Both are first-party to the recipient in exactly
+the sense the subject Pull's first-party carve (CIRISEdge#462, v16 review) uses, and that carve
+does not run the floor either. The normative text decides it: CC 3.1.3.2 makes delivery keyed on
+`subject_key_ids` "without that node holding the group's roster", and "nobody joins without their
+own consent" (CIRISConstitution#133) is unsatisfiable if the invitation cannot reach an invitee who
+shares no root with the inviter, since a stranger is exactly who an invitation is for. Rooted
+remains required for everything else, and a proposal or reply authored by N's own self-publish set
+was already exempt (#668).
+
+**Which path carries each row.** The advertise (`list_attestations`) and the direct-fetch twin
+(`fetch_envelope_bytes_for_peer`) share the gate (`audience_withholds`), so they agree. The subject
+Pull answers only a requester about itself (`requester == subject`) with rows about or by it: a
+proposal names K's *person*, not K's node, and a reply names K and is authored by K's node, so
+neither is ever listed to the other side's node by a subject Pull; there is no third twin to add
+and no ref is disclosed that the fetch would refuse.
+
+**Invariant I22** (§6).
+
+---
+
 ## 3. The pair state machine (both directions)
 
 Let `L(A→B) ∈ {Unknown, Identified, Attributed}` and `C(A→B) ∈ {None, FirstContact, Consent}` (the
@@ -402,6 +464,9 @@ For every Attestation row A considers handing B (advertise and the direct-fetch 
    trusts. Unchanged by first contact (allegiance facts are never `trace:*`).
 4. **Item 6 `recipient_capability`**: producer-declared restrictions. Fail-open when none.
 5. **Audience** (`audience_withholds`), in this order:
+   0. **the membership ceremony (#756, §2.4)**: under `FirstContact`, a proposal naming B's owner
+      or the invitee's reply to B's owner's proposal held at A skips 1–2 and the floor in 4, and is
+      served by 3's membership arms;
    1. reach admits the row's audience — `FirstContact` admits only `federation`;
    2. **first-contact narrowing (#671)**: under `FirstContact` the row must be an allegiance fact
       of A, else `recipient_not_in_send_set` (detail names the narrowing);
@@ -440,6 +505,7 @@ before — minus the four rows that now cross.
 | I18 | **A requester admits introductions only from a solicited answer** (its `in_reply_to` matches a request it sent to the answer's signer), keys by proof of possession before the verify and attestations through the replication apply door after it. | `first_contact_opaque_683::an_unsolicited_answer_introduces_nothing_683`, `…::the_answer_introductions_land_at_the_requester_683` |
 | I19 | **The remaining limit is on-path trust on first use.** A device cannot tell the true holder of a `key_id` it has never seen. persist binds the `key_id` inside the registration envelope and checks the self-signature against the record's own public keys, but never derives `key_id` from the public key, so a self-signed record may claim any `key_id`. The challenge (off-path parties cannot name the request) and the path check (the answer must arrive on the request's medium) narrow who can attempt the substitution to a party that saw the request on that medium; neither prevents it. Closing it needs the key id to be derivable from the key (a persist change) or an out-of-band commitment to the first device's key (the pairing code). | `first_contact_opaque_683::a_forged_answer_built_from_public_material_introduces_nothing_683` (the off-path half; fails on the pre-challenge code, where the forged record was admitted as the first device's key) |
 | I20 | **The owner-binding rung (§2.1.1, CIRISEdge#727).** (I-a) A binding whose attester is the receiver's own owner is admitted on any link after signature verification against the held owner key, through persist's replicated-attestation door. (I-b) A node pushes only its own binding, only on a link it dialed or in answer to a sibling's binding newly admitted on that link, never advertises it. (I-c) A stranger refuses it by name before any cryptography and stores nothing. (I-d) Admission invalidates the #682 memo; the unannounced pair converges in a bounded number of rounds. | `owned_devices_route_682::unannounced_devices_of_one_owner_exchange_routes_and_admit_682` (I-a, I-d: the round bound is asserted; fails on the pre-#727 code); `…::a_binding_signed_by_a_key_that_is_not_the_receivers_owner_is_refused_by_name_727` (I-a negative, both the attester field and the signature); `…::a_stranger_refuses_another_owners_binding_and_holds_nothing_727` (I-c); `…::a_node_pushes_its_binding_only_on_a_link_it_dialed_727` (I-b); `…::a_wiped_device_reconverges_by_dialling_its_sibling_727` (recovery); `protocol::tests::an_owner_binding_push_is_exactly_a_deliver_of_owner_binding_rows_727` (the shape) |
+| I22 | **The membership ceremony reaches its stranger (§2.4, CIRISEdge#756; CIRISPersist#955, CC rc6 3.1.3.2, CIRISConstitution#133).** Under `Reach::FirstContact` a node additionally serves (a) a `membership:proposal:v1` whose `subject_key_ids` contains `owner_of(peer)` and (b) an acceptance/decline, attested to the invitee of a proposal held here, whose proposal's proposer is `owner_of(peer)`; on the advertise and the fetch twin alike, without the Rooted floor (first-party to the recipient). Nothing else widens: no other row at the group's target, no proposal to anyone else, no reply to a proposal not held here or to someone else's proposal. | `membership_first_contact_756::a_stranger_is_invited_accepts_and_joins_over_first_contact_756` (community) and `…_a_family_over_first_contact_756` (three nodes over Reticulum, no consent, no common root; fails on the pre-#756 gate: the invitee's node never holds the proposal); `bridge::first_contact_serves_the_membership_ceremony_to_its_parties_and_nothing_else_756` (advertise + fetch twin, relayed un-Rooted proposal, the four negatives) |
 
 ---
 
@@ -479,6 +545,18 @@ the load-bearing rule in this document that realises it.
 
 ## 9. Change log
 
+- **CIRISEdge#756** (persist v52 adopt, edge v38.0.0) — §2.4 the membership ceremony at first
+  contact: a stranger's node is served the proposal naming its person, and the invitee's node
+  serves the reply back to the proposer's person's nodes; the Rooted floor does not apply to these
+  two first-party classes (CC rc6 3.1.3.2 delivers on `subject_key_ids`; CIRISConstitution#133).
+  The R2 row, the closure note and §5 name the exception; I22. `SERVE_ADVERTISE_POLICY_HASH`
+  re-pinned (the Attestation `serve` cell states what first contact carries).
+  The Family plane now also advertises this node's own-founded families (the family twin of
+  #754's Community arm): a family is founded by its opener alone, so without it the joined
+  invitee's node never held the record and could not follow the family (witnessed: the family
+  case fails without it). The group RECORD planes are `public` (manifest) and not per-recipient,
+  so a stranger peer holds the record of a group its peer founded before any proposal; what
+  first contact withholds is the group's attestation rows.
 - **CIRISEdge#727** — §2.1.1 the owner-binding rung, the belt under I14: an owner-binding whose
   attester is the receiver's own owner is self-authenticating to that receiver and is admitted on
   any link (signature verified against the held owner key, then persist's replicated-attestation

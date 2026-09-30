@@ -1260,6 +1260,14 @@ struct AudienceMemo {
     /// one sweep: the allegiance predicate asks it once per self-publish
     /// identity, not once per row.
     roots: HashMap<String, Vec<String>>,
+    /// CIRISEdge#756 — `owner_of(key)` (or the key itself when unowned) per
+    /// key, for one sweep: the first-contact membership arm asks it for the
+    /// peer and for each proposal's proposer. `None` = unresolved (fail-closed).
+    owners: HashMap<String, Option<String>>,
+    /// CIRISEdge#756 — a reply's referenced proposal as held here, for one
+    /// sweep: `(proposer attesting_key_id, subject_key_ids)` when the id names
+    /// a held `membership:proposal:v1`, else `None`.
+    proposals: HashMap<String, Option<(String, Vec<String>)>>,
 }
 
 /// The cohorts one identity is a member of, by id.
@@ -6238,9 +6246,20 @@ impl FederationDirectoryReplicationBridge {
                 return true;
             }
         };
-        if self
-            .reach_withholds(reach, &audience, row, peer, memo, site)
-            .await
+        // CIRISEdge#756 (`FSD/FIRST_CONTACT.md` §2.4, I22) — the membership
+        // ceremony addressed to the peer's own person crosses first contact:
+        // the invitation naming it and the invitee's answer to its proposal.
+        // Decided once here, it replaces the reach half (the reach admits no
+        // group-target row and the #671 narrowing admits only allegiance facts)
+        // and the Rooted floor below (both rows are first-party to the peer).
+        let first_contact_membership = reach == Reach::FirstContact
+            && self
+                .first_contact_membership_serves(&audience, row, peer, memo)
+                .await;
+        if !first_contact_membership
+            && self
+                .reach_withholds(reach, &audience, row, peer, memo, site)
+                .await
         {
             return true;
         }
@@ -6251,14 +6270,18 @@ impl FederationDirectoryReplicationBridge {
                 matches!((row_owner, peer_owner), (Some(a), Some(b)) if a == b)
             }
             Audience::Family { family_key_id } => {
-                self.peer_in_cohort(peer, memo, |c| c.families.contains(family_key_id))
-                    .await
+                first_contact_membership
+                    || self
+                        .peer_in_cohort(peer, memo, |c| c.families.contains(family_key_id))
+                        .await
                     || self.peer_is_proposal_invitee(row, peer, memo).await
                     || self.peer_is_reply_proposer(row, peer, memo).await
             }
             Audience::Community { community_key_id } => {
-                self.peer_in_cohort(peer, memo, |c| c.communities.contains(community_key_id))
-                    .await
+                first_contact_membership
+                    || self
+                        .peer_in_cohort(peer, memo, |c| c.communities.contains(community_key_id))
+                        .await
                     || self.peer_is_proposal_invitee(row, peer, memo).await
                     || self.peer_is_reply_proposer(row, peer, memo).await
             }
@@ -6318,7 +6341,14 @@ impl FederationDirectoryReplicationBridge {
             .self_provider
             .as_ref()
             .is_some_and(|p| p().iter().any(|id| id == attester));
-        if !self_authored && !self.rooted_with(peer, memo).await {
+        // CIRISEdge#756 — and the membership ceremony addressed to the peer's
+        // own person (§2.4): the invitation names the peer's person as its data
+        // subject and the answer replies to the peer's person's own proposal, so
+        // neither is "about others" to it (the subject-Pull first-party carve,
+        // which runs no floor either). CC rc6 3.1.3.2 delivers a proposal on
+        // `subject_key_ids` without the invitee holding the roster, and an
+        // invitee is normally a stranger who shares no root with the inviter.
+        if !self_authored && !first_contact_membership && !self.rooted_with(peer, memo).await {
             self.withhold(
                 WithholdReason::RecipientNotRooted,
                 peer,
@@ -6336,6 +6366,134 @@ impl FederationDirectoryReplicationBridge {
         false
     }
 
+    /// CIRISEdge#756 (`FSD/FIRST_CONTACT.md` §2.4, I22) — under first contact,
+    /// is `row` one of the two membership-ceremony rows addressed to `peer`'s
+    /// own person? Both at the group's `family`/`community` target, nothing
+    /// else:
+    ///
+    /// - **(a)** a `membership:proposal:v1` whose `subject_key_ids` contains
+    ///   `owner_of(peer)` (the peer itself when unowned) — the invitation, keyed
+    ///   on `subject_key_ids` as CC rc6 3.1.3.2 and CIRISPersist#955 §7 route it;
+    /// - **(b)** a `membership:acceptance:v1` / `membership:decline:v1` whose
+    ///   `references_attestation_id` names a proposal HELD HERE, whose
+    ///   `attested_key_id` is that proposal's invitee, and whose proposal was
+    ///   issued by `peer`'s person — the answer travelling back to the inviter.
+    ///
+    /// A proposal to anyone else, a reply to a proposal not held here, a reply
+    /// to someone else's proposal and every other group-target row answer
+    /// `false`. Owners are persist's `owner_of`, memoized per sweep; an
+    /// unresolved owner fails closed.
+    async fn first_contact_membership_serves(
+        &self,
+        audience: &ciris_persist::federation::Audience,
+        row: &serde_json::Value,
+        peer: &str,
+        memo: &mut AudienceMemo,
+    ) -> bool {
+        use ciris_persist::federation::membership_acceptance::{
+            ACCEPTANCE_DIMENSION, DECLINE_DIMENSION, PROPOSAL_DIMENSION,
+        };
+        use ciris_persist::federation::Audience;
+        if !matches!(
+            audience,
+            Audience::Family { .. } | Audience::Community { .. }
+        ) {
+            return false;
+        }
+        let dimension = row
+            .pointer("/attestation_envelope/dimension")
+            .and_then(serde_json::Value::as_str);
+        let subjects_of = |v: &serde_json::Value| -> Vec<String> {
+            v.get("subject_key_ids")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        match dimension {
+            Some(PROPOSAL_DIMENSION) => {
+                let subjects = subjects_of(row);
+                if subjects.is_empty() {
+                    return false;
+                }
+                let Some(peer_person) = self.owner_or_self(peer, memo).await else {
+                    return false;
+                };
+                subjects.contains(&peer_person)
+            }
+            Some(ACCEPTANCE_DIMENSION | DECLINE_DIMENSION) => {
+                let Some(proposal_id) = row
+                    .pointer("/attestation_envelope/references_attestation_id")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    return false;
+                };
+                let Some((proposer, invitees)) = self.held_proposal(proposal_id, memo).await else {
+                    return false;
+                };
+                let replier = row
+                    .get("attested_key_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if replier.is_empty() || !invitees.iter().any(|k| k == replier) {
+                    return false;
+                }
+                if proposer == peer {
+                    return true;
+                }
+                let proposer_person = self.owner_or_self(&proposer, memo).await;
+                let peer_person = self.owner_or_self(peer, memo).await;
+                matches!((proposer_person, peer_person), (Some(a), Some(b)) if a == b)
+            }
+            _ => false,
+        }
+    }
+
+    /// CIRISEdge#756 — `owner_of(key)`, or `key` itself when it carries no
+    /// owner-binding (a person, or an unowned node that is its own trust
+    /// subject); `None` when the resolution failed. Memoized per sweep over the
+    /// round-scoped owner cache (`owner_of_cached`).
+    async fn owner_or_self(&self, key: &str, memo: &mut AudienceMemo) -> Option<String> {
+        if let Some(hit) = memo.owners.get(key) {
+            return hit.clone();
+        }
+        let out = match self.owner_of_cached(key).await {
+            OwnerLookup::Owner(owner) => Some(owner),
+            OwnerLookup::Unowned => Some(key.to_owned()),
+            OwnerLookup::Unresolved => None,
+        };
+        memo.owners.insert(key.to_owned(), out.clone());
+        out
+    }
+
+    /// CIRISEdge#756 — the proposal `proposal_id` names, when it is HELD in
+    /// this node's store and is a `membership:proposal:v1`: its attester (the
+    /// proposer) and its `subject_key_ids` (the invitee). Memoized per sweep.
+    async fn held_proposal(
+        &self,
+        proposal_id: &str,
+        memo: &mut AudienceMemo,
+    ) -> Option<(String, Vec<String>)> {
+        if let Some(hit) = memo.proposals.get(proposal_id) {
+            return hit.clone();
+        }
+        let out = match self.directory.get_attestation(proposal_id).await {
+            Ok(Some(p))
+                if crate::membership::dimension_of(&p)
+                    == Some(crate::membership::PROPOSAL_DIMENSION) =>
+            {
+                Some((p.attesting_key_id, p.subject_key_ids))
+            }
+            _ => None,
+        };
+        memo.proposals.insert(proposal_id.to_owned(), out.clone());
+        out
+    }
+
     /// persist v52.0.0 (CIRISPersist#955) — **the membership-proposal arm** of
     /// the family / community audience, the serve-side twin of persist's
     /// `CallerScope::admits_membership_proposal` (and its SQL `EXISTS` over
@@ -6345,7 +6503,9 @@ impl FederationDirectoryReplicationBridge {
     /// rooms that peer is in. ORed with the membership check; it admits
     /// nothing else (no other dimension, no other scope). The send-set half
     /// ([`Self::reach_withholds`]) still runs first: a first-contact stranger
-    /// is not handed a family-scoped row by this arm.
+    /// is not handed a group-target row by this arm. The first-contact
+    /// invitee is served by [`Self::first_contact_membership_serves`]
+    /// (CIRISEdge#756), which replaces the reach half for exactly that row.
     async fn peer_is_proposal_invitee(
         &self,
         row: &serde_json::Value,
@@ -7975,7 +8135,18 @@ impl FederationDirectoryReplicationBridge {
     async fn list_families(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // CIRISEdge#523 — plane 1 of 3. A Family's members are PERSONS; the
         // cohort is NODE-keyed. See [`Self::cohort_set_with_owners`].
-        let cohort = self.cohort_set_with_owners().await;
+        let mut cohort = self.cohort_set_with_owners().await;
+        // CIRISEdge#756 — the family twin of the Community plane's v52 arm
+        // (`list_communities`): a family is founded by its opener ALONE
+        // (CIRISPersist#955), so a new family's record names only this node's
+        // own person and never crossed the cohort arm. The invitee's node needs
+        // the record to follow the family once it joins (CIRISPersist#955 §7:
+        // it must hold the group's record and roster planes); publish-own
+        // keeps the exposure where it was before v52, when the record listed
+        // the invitee and crossed on the cohort arm.
+        if let Some(own) = self.self_provider.as_ref() {
+            cohort.extend(own());
+        }
         self.sweep_paged(
             EnvelopeKind::Family,
             window,
@@ -18900,6 +19071,256 @@ pub(crate) mod tests {
         assert!(
             !is_offered(&bridge, "node-carol", hash).await,
             "nobody else is: the room is not held here, so no member arm applies"
+        );
+    }
+
+    /// CIRISEdge#756 (`FSD/FIRST_CONTACT.md` §2.4, I22) — **first contact
+    /// carries the membership ceremony to its two parties and nothing else.**
+    ///
+    /// No consent anywhere and no root in common: every peer is an un-Rooted
+    /// stranger (`Reach::FirstContact`). Side A is the inviter P's node holding
+    /// the room G (P alone); side B is the invitee K's node. On the advertise
+    /// AND the fetch twin:
+    ///
+    /// - A serves K's node P's proposal naming K, and a RELAYED proposal naming
+    ///   K (authored by a person who is not this node's; the Rooted floor does
+    ///   not apply to the invitee's own invitation);
+    /// - A serves K's node neither P's proposal to Z nor G's room row, and
+    ///   serves C's node none of the three;
+    /// - B serves P's node K's acceptance of P's proposal (held at B), and
+    ///   neither K's reply to M's proposal nor anything of it to C's node;
+    /// - a reply naming a proposal this node does not hold is not served.
+    ///
+    /// FAILS on the pre-#756 gate: the reach refuses every group-target row to
+    /// a first-contact peer, so neither the proposal nor the reply is offered.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn first_contact_serves_the_membership_ceremony_to_its_parties_and_nothing_else_756() {
+        use crate::membership::GroupScope;
+        async fn side() -> Arc<MemoryBackend> {
+            let backend = Arc::new(MemoryBackend::new());
+            register_fixture_keys(
+                &backend,
+                &[
+                    ("person-p", identity_type::USER),
+                    ("person-k", identity_type::USER),
+                    ("person-q", identity_type::USER),
+                    ("person-z", identity_type::USER),
+                    ("person-m", identity_type::USER),
+                    ("node-a", identity_type::NODE),
+                    ("node-b", identity_type::NODE),
+                    ("node-c", identity_type::NODE),
+                    ("room-authority", identity_type::USER),
+                ],
+            )
+            .await;
+            seed_owner_binding(&backend, "person-p", "node-a").await;
+            seed_owner_binding(&backend, "person-k", "node-b").await;
+            seed_owner_binding(&backend, "person-q", "node-c").await;
+            backend
+        }
+        fn stranger_bridge(
+            backend: &Arc<MemoryBackend>,
+            node: &str,
+            person: &str,
+        ) -> FederationDirectoryReplicationBridge {
+            let publish = vec![node.to_owned(), person.to_owned()];
+            // NO consent: empty cohort, no grant, no owner route; no root.
+            bridge_over(backend, &[])
+                .with_local_key_id(Some(node.to_owned()))
+                .with_self_provider(Some(Arc::new(move || publish.clone())))
+        }
+        async fn fetches(
+            bridge: &FederationDirectoryReplicationBridge,
+            peer: &str,
+            hash: [u8; 32],
+        ) -> bool {
+            bridge
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some(peer))
+                .await
+                .is_some()
+        }
+        let expires = Utc::now() + chrono::Duration::days(7);
+
+        // ── Side A: P's node, holding G (P alone). ───────────────────────────
+        let a = side().await;
+        let room = crate::chat::pair_community("person-p", "person-k", Utc::now());
+        let g = room.community_key_id.clone();
+        a.put_community(sign_community_fixture("room-authority", room))
+            .await
+            .expect("G, founded by P alone");
+        let to_k = crate::membership::propose(
+            &*a,
+            GroupScope::Community,
+            &g,
+            "person-k",
+            None,
+            expires,
+            &fixture_local_signer("person-p"),
+        )
+        .await
+        .expect("P proposes K");
+        let to_z = crate::membership::propose(
+            &*a,
+            GroupScope::Community,
+            &g,
+            "person-z",
+            None,
+            expires,
+            &fixture_local_signer("person-p"),
+        )
+        .await
+        .expect("P proposes Z");
+        // A proposal by M into a room this node does not hold, naming K: stored
+        // for its subject (persist #955 Q4) and RELAYED here — not self-authored.
+        let relayed = crate::membership::proposal_attestation(
+            GroupScope::Community,
+            "m-room",
+            "person-k",
+            None,
+            expires,
+            &fixture_local_signer("person-m"),
+        )
+        .await
+        .expect("M's proposal");
+        a.put_attestation(SignedAttestation {
+            attestation: relayed.clone(),
+        })
+        .await
+        .expect("a proposal whose room is not held here is stored for its subject");
+        let room_row = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &a,
+            &room_row,
+            "person-p",
+            "person-p",
+            "scores",
+            "community",
+            serde_json::json!({
+                "dimension": "chat:message:v1",
+                "community_key_id": g,
+                "body": "for the room",
+            }),
+        )
+        .await;
+        let bridge_a = stranger_bridge(&a, "node-a", "person-p");
+        let (h_to_k, h_to_z, h_relayed, h_room) = (
+            hash_of(&a, &to_k.attestation_id).await,
+            hash_of(&a, &to_z.attestation_id).await,
+            hash_of(&a, &relayed.attestation_id).await,
+            hash_of(&a, &room_row).await,
+        );
+        for (hash, what) in [
+            (h_to_k, "P's proposal naming K"),
+            (
+                h_relayed,
+                "a relayed proposal naming K (no Rooted floor on it)",
+            ),
+        ] {
+            assert!(
+                is_offered(&bridge_a, "node-b", hash).await,
+                "K's node (a stranger, un-Rooted) is offered {what}"
+            );
+            assert!(
+                fetches(&bridge_a, "node-b", hash).await,
+                "the fetch twin agrees: {what}"
+            );
+        }
+        for (hash, what) in [
+            (h_to_z, "a proposal naming someone else"),
+            (h_room, "any other row at the group's target"),
+        ] {
+            assert!(
+                !is_offered(&bridge_a, "node-b", hash).await,
+                "K's node is never offered {what}"
+            );
+            assert!(
+                !fetches(&bridge_a, "node-b", hash).await,
+                "nor can it fetch {what}"
+            );
+        }
+        for hash in [h_to_k, h_to_z, h_relayed, h_room] {
+            assert!(
+                !is_offered(&bridge_a, "node-c", hash).await,
+                "a different stranger is offered none of the ceremony"
+            );
+            assert!(!fetches(&bridge_a, "node-c", hash).await);
+        }
+
+        // ── Side B: K's node, holding P's and M's proposals, K's replies. ────
+        let b = side().await;
+        for p in [&to_k, &relayed] {
+            b.put_attestation(SignedAttestation {
+                attestation: p.clone(),
+            })
+            .await
+            .expect("the invitee's node stores a proposal naming its person");
+        }
+        let accept = crate::membership::reply(
+            &*b,
+            &to_k.attestation_id,
+            true,
+            &fixture_local_signer("node-b"),
+        )
+        .await
+        .expect("K accepts P's proposal (its node acting for it)");
+        let decline_m = crate::membership::reply(
+            &*b,
+            &relayed.attestation_id,
+            false,
+            &fixture_local_signer("node-b"),
+        )
+        .await
+        .expect("K declines M's proposal");
+        let bridge_b = stranger_bridge(&b, "node-b", "person-k");
+        let (h_accept, h_decline_m) = (
+            hash_of(&b, &accept.attestation_id).await,
+            hash_of(&b, &decline_m.attestation_id).await,
+        );
+        assert!(
+            is_offered(&bridge_b, "node-a", h_accept).await,
+            "the proposer's node (a stranger) is offered K's acceptance of its proposal"
+        );
+        assert!(fetches(&bridge_b, "node-a", h_accept).await);
+        assert!(
+            !is_offered(&bridge_b, "node-a", h_decline_m).await
+                && !fetches(&bridge_b, "node-a", h_decline_m).await,
+            "a reply to someone else's proposal is not served to P's node"
+        );
+        for hash in [h_accept, h_decline_m] {
+            assert!(
+                !is_offered(&bridge_b, "node-c", hash).await
+                    && !fetches(&bridge_b, "node-c", hash).await,
+                "a different stranger gets no reply"
+            );
+        }
+
+        // A reply naming a proposal this node does not hold is not served,
+        // even to the node that would be its proposer's.
+        let mut memo = AudienceMemo::default();
+        let orphan = serde_json::json!({
+            "attesting_key_id": "node-b",
+            "attested_key_id": "person-k",
+            "attestation_type": "scores",
+            "cohort_scope": "community",
+            "subject_key_ids": ["person-k"],
+            "attestation_envelope": {
+                "dimension": crate::membership::ACCEPTANCE_DIMENSION,
+                "references_attestation_id": "a-proposal-not-held-here",
+            },
+        });
+        assert!(
+            !bridge_b
+                .first_contact_membership_serves(
+                    &ciris_persist::federation::Audience::Community {
+                        community_key_id: g.clone(),
+                    },
+                    &orphan,
+                    "node-a",
+                    &mut memo,
+                )
+                .await,
+            "a reply whose proposal is not held here is not the ceremony"
         );
     }
 
