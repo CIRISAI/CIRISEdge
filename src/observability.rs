@@ -986,6 +986,27 @@ pub struct EdgeMetrics {
     /// `dag_chunk_missing` (`blob_swarm::DagPullRefusal::tag`). Nothing is
     /// stored on any; a non-zero count is a file that is not on this device.
     pub blob_pull_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#739 — the chunk-DAG pull's per-phase clock, `(total ns,
+    /// samples)` by phase, so a run can say WHERE a pull's time went rather
+    /// than only how long it took (`FSD/CONTENT_TRANSFER.md` §6.7.5). On the
+    /// PULLING node: `dag_fetch_wait` (dispatch of a chunk request → its
+    /// verified bytes in hand: the wire, the holder's serve, and this node's
+    /// inbound verify), `dag_adopt` (`adopt_sealed_chunk`), `dag_promote`;
+    /// on any node: `inbound_verify_chunk_body` (the hybrid verify + body
+    /// parse of a `BlobChunkBody` envelope) and `serve_chunk` (a
+    /// `BlobChunkFetch` answered: the store read, the signed response, the
+    /// send). A closed key set; each key is a `&'static str` at its one
+    /// producer.
+    pub blob_dag_phases: Arc<RwLock<HashMap<&'static str, (u64, u64)>>>,
+    /// CIRISEdge#739 — the chunk-DAG pull's chunk ledger by outcome:
+    /// `adopted` (fetched, verified, `adopt_sealed_chunk` returned),
+    /// `skipped_held` (already at its position with the manifest's sha when
+    /// the walk started — a resume), `in_flight_peak` (the most requests the
+    /// pipeline had outstanding at once, a gauge kept as a high-water mark).
+    /// `adopted` summed across a pull and its resumes equals the manifest's
+    /// chunk count exactly once — the witness for "each chunk adopted exactly
+    /// once".
+    pub blob_dag_chunks: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files, by tag
     /// (`receipts`): `emitted` / `not_emitted_*` on the receiving node;
     /// `admitted` and the named refusals (`receipt_root_unpublished`,
@@ -1138,6 +1159,15 @@ pub struct EdgeMetrics {
     /// idle. Keyed on the SAME [`EnvelopeKind`] the replication wire uses (one
     /// kind list, not two).
     pub replication_envelopes_served_total: Arc<RwLock<HashMap<EnvelopeKind, u64>>>,
+}
+
+/// A `&'static str`-keyed counter map, cloned out with owned keys for the
+/// snapshot (the lock is held only for the copy).
+fn owned_keys<V: Copy>(map: &RwLock<HashMap<&'static str, V>>) -> HashMap<String, V> {
+    map.read()
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), *v))
+        .collect()
 }
 
 impl EdgeMetrics {
@@ -1304,6 +1334,29 @@ impl EdgeMetrics {
             .write()
             .entry(reason_tag)
             .or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#739 — add one sample to a chunk-DAG phase clock.
+    pub fn add_blob_dag_phase(&self, phase: &'static str, elapsed: std::time::Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let mut phases = self.blob_dag_phases.write();
+        let slot = phases.entry(phase).or_insert((0, 0));
+        slot.0 = slot.0.saturating_add(ns);
+        slot.1 = slot.1.saturating_add(1);
+    }
+
+    /// CIRISEdge#739 — count chunks in the DAG pull's ledger by outcome.
+    pub fn add_blob_dag_chunks(&self, outcome: &'static str, n: u64) {
+        let mut chunks = self.blob_dag_chunks.write();
+        let slot = chunks.entry(outcome).or_insert(0);
+        *slot = slot.saturating_add(n);
+    }
+
+    /// CIRISEdge#739 — raise a high-water mark in the DAG pull's ledger.
+    pub fn max_blob_dag_chunks(&self, gauge: &'static str, value: u64) {
+        let mut chunks = self.blob_dag_chunks.write();
+        let slot = chunks.entry(gauge).or_insert(0);
+        *slot = (*slot).max(value);
     }
 
     /// CIRISEdge#738 — count one delivery-receipt event by its tag.
@@ -1615,12 +1668,9 @@ impl EdgeMetrics {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
-            delivery_receipts: self
-                .delivery_receipts
-                .read()
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), *v))
-                .collect(),
+            blob_dag_phases: owned_keys(&self.blob_dag_phases),
+            blob_dag_chunks: owned_keys(&self.blob_dag_chunks),
+            delivery_receipts: owned_keys(&self.delivery_receipts),
             blob_route_refusals: self
                 .blob_route_refusals
                 .read()
@@ -1711,6 +1761,11 @@ pub struct EdgeMetricsBundle {
     pub blob_pull_sources: HashMap<String, u64>,
     /// CIRISEdge#717 — pulls that refused to store, by reason.
     pub blob_pull_refusals: HashMap<String, u64>,
+    /// CIRISEdge#739 — chunk-DAG phase clocks, `(total ns, samples)` by phase.
+    pub blob_dag_phases: HashMap<String, (u64, u64)>,
+    /// CIRISEdge#739 — chunk-DAG chunk ledger by outcome (`adopted`,
+    /// `skipped_held`, `in_flight_peak`).
+    pub blob_dag_chunks: HashMap<String, u64>,
     /// CIRISEdge#738 — delivery receipts for files, by tag.
     pub delivery_receipts: HashMap<String, u64>,
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /

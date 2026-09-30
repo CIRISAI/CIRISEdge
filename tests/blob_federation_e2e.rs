@@ -3439,7 +3439,8 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
     );
 
     // 3. A tampered chunk: refused at its position; the manifest stays held
-    //    and chunk 0 (adopted before it) is kept for the resume.
+    //    and every other chunk the pipelined walk had in flight (CIRISEdge#739:
+    //    the lanes drain on a stop) is adopted and kept for the resume.
     assert!(matches!(
         puller.pull_dag_with(&row, sha, &fetch(Some(chunk1))).await,
         PullOutcome::DagRefused(DagPullRefusal::ChunkMismatch { seq: 1, .. })
@@ -3455,13 +3456,13 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
         .collect();
     assert_eq!(
         positions,
-        vec![0],
-        "chunk 0 adopted, chunk 1 refused, nothing after"
+        vec![0, 2, 3, 4],
+        "chunk 1 refused at its position; the rest (all in flight at the default K) adopted"
     );
     assert_eq!(refusals().get("dag_chunk_mismatch").copied(), Some(1));
 
-    // 4. The honest pull RESUMES: manifest held, chunk 0 skipped, 1–4
-    //    adopted, promoted.
+    // 4. The honest pull RESUMES: manifest held, the held chunks skipped,
+    //    chunk 1 adopted, promoted.
     assert_eq!(
         puller.pull_dag_with(&row, sha, &fetch(None)).await,
         PullOutcome::Stored { announced: false },
@@ -6274,8 +6275,9 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
         .collect();
     assert_eq!(
         positions,
-        vec![0],
-        "chunk 0 kept, chunk 1 refused, nothing after"
+        vec![0, 2, 3, 4],
+        "chunk 1 refused at its position; the rest (all in flight at the default K, \
+         CIRISEdge#739: the lanes drain on a stop) kept"
     );
     assert_eq!(
         node_c
@@ -6321,8 +6323,9 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     let servers_c = fetch_c.servers();
     assert_eq!(
         servers_c.len(),
-        4,
-        "the resume fetched chunks 1–4 only (manifest and chunk 0 were held): {servers_c:?}"
+        1,
+        "the resume fetched chunk 1 only (the manifest and chunks 0, 2–4 were held — the \
+         refused pull's lanes drained, CIRISEdge#739): {servers_c:?}"
     );
     assert!(
         servers_c.iter().all(|h| *h == node_b.me),

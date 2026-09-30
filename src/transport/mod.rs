@@ -580,6 +580,30 @@ pub trait Transport: Send + Sync + 'static {
         let _ = path;
         self.send(destination_key_id, envelope_bytes).await
     }
+
+    /// CIRISEdge#739 — [`Self::send_on_reply_path`] with NO by-key fallback:
+    /// the bytes ride `path` or the send fails. For a reply whose plane is
+    /// fixed by its request's arrival link (#728 — a `BlobChunkFetch` that
+    /// arrived on a scope-derived address must be answered there and never
+    /// on the identity plane). A transport that keeps no per-sender path
+    /// has no such path to ride and refuses by name, which is the default.
+    ///
+    /// # Errors
+    /// [`TransportError::Unreachable`] when this transport holds no live
+    /// path for `path`; the Reticulum transport's own errors otherwise.
+    async fn send_on_reply_path_only(
+        &self,
+        destination_key_id: &str,
+        path: &ReplyPath,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        let _ = (destination_key_id, envelope_bytes);
+        Err(TransportError::Unreachable(format!(
+            "transport {} keeps no reply path to ride ({})",
+            self.id().0,
+            path.bucket_key()
+        )))
+    }
 }
 
 /// CIRISEdge#454 — a no-op [`Transport`] for tests + downstream consumers whose

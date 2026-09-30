@@ -2443,6 +2443,41 @@ pub struct ReticulumTransport {
     /// second lane — and Tokio's is FIFO-fair, so a waiter cannot be starved by
     /// a steady arrival of new senders.
     dial_gate: Arc<Mutex<HashMap<DestinationHash, Arc<tokio::sync::Semaphore>>>>,
+    /// CIRISEdge#739 — the SCOPED twin of `reusable_dialed_link`: identified
+    /// links to a scope-derived member address, keyed by that address, fed
+    /// only by [`Self::lease_scoped_link`]'s dial and tagged
+    /// `LinkPlane::Scoped` for life (#728). Until this pool every scoped
+    /// send (`send_to_scoped_destination`) dialled a fresh link, so a chunk
+    /// DAG pull paid establish + identify PER CHUNK and left a link per chunk
+    /// behind for the idle reaper — 8,192 links for a 2 GiB file, against
+    /// leviculum's 1,024-link FIFO (#508).
+    ///
+    /// Reuse is IDLE-only, exactly as the identity pool's: a link is handed
+    /// out only while no [`ScopedLinkLease`] holds it. The lease spans the
+    /// whole request→response EXCHANGE, not the request's send — the reply
+    /// is the peer's Resource on this same link (`send_on_reply_path`), and
+    /// Reticulum runs one Resource per link per direction, so a second
+    /// request on the link before the first reply lands would put the peer's
+    /// second reply behind `TransferInProgress`. K leases = K lanes; the
+    /// pool grows to the demand and no further.
+    reusable_scoped_link: Arc<Mutex<HashMap<DestinationHash, Vec<LinkId>>>>,
+    /// CIRISEdge#739 — scoped links currently under a [`ScopedLinkLease`].
+    /// A `std` mutex, because the lease releases in `Drop` (a cancelled
+    /// fetch must give its lane back without an executor).
+    scoped_link_leased: Arc<std::sync::Mutex<HashSet<LinkId>>>,
+    /// CIRISEdge#739 test seam — the next `n` answers on a reply path TEAR
+    /// DOWN the link they would ride just before riding it: the request has
+    /// arrived and been admitted on that link, and its answer finds the link
+    /// gone (the responder's durable-queue fallback, witnessed in
+    /// `tests/bigfile_739.rs`). Zero in production; only
+    /// [`ReticulumTransport::tear_down_next_reply_links_for_test`] raises it.
+    tear_down_reply_link: std::sync::atomic::AtomicU32,
+    /// CIRISEdge#739 test seam — every scoped lease dials a FRESH link and
+    /// never enters the pool: the pre-#739 one-link-per-exchange shape, so
+    /// the bench can attribute the pool's gain on its own. `false` in
+    /// production; only [`ReticulumTransport::bypass_scoped_pool_for_test`]
+    /// sets it.
+    scoped_pool_bypass: std::sync::atomic::AtomicBool,
     /// CIRISEdge#33 — operator-configured deny-list. Keyed by the
     /// 16-byte Reticulum identity hash of the blocked peer. `send`
     /// consults this BEFORE the leviculum connect call; a hit
@@ -2747,11 +2782,6 @@ impl ReticulumTransport {
     /// now, but every existing caller keeps its shape.
     async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
         self.dial_ctx().reusable_link_to(dest).await
-    }
-
-    /// Delegates to [`DialCtx::path_table_snapshot`].
-    fn path_table_snapshot(&self) -> String {
-        self.dial_ctx().path_table_snapshot()
     }
 
     /// Construct + start the transport: load-or-generate the
@@ -3339,6 +3369,10 @@ impl ReticulumTransport {
             reusable_dialed_link: Arc::new(Mutex::new(HashMap::new())),
             link_in_flight: Arc::new(Mutex::new(HashSet::new())),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
+            reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
+            scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            tear_down_reply_link: std::sync::atomic::AtomicU32::new(0),
+            scoped_pool_bypass: std::sync::atomic::AtomicBool::new(false),
             blackhole: blackhole_rules,
             blackhole_cache: std::sync::Mutex::new((0, None)),
             binding_cache: std::sync::Mutex::new(HashMap::new()),
@@ -3899,13 +3933,44 @@ impl ReticulumTransport {
         address: &MemberAddress,
         envelope_bytes: &[u8],
     ) -> Result<TransportSendOutcome, TransportError> {
-        if envelope_bytes.len() > MAX_BODY_BYTES {
-            return Err(TransportError::BodyTooLarge {
-                actual: envelope_bytes.len(),
-                limit: MAX_BODY_BYTES,
-            });
-        }
+        // CIRISEdge#739 — one exchange's worth of lane: lease (reuse before
+        // dialing), ship, release at return. A caller that must hold the
+        // lane across its reply uses the two halves directly.
+        let lease = self.lease_scoped_link(destination_key_id, address).await?;
+        self.send_on_scoped_lease(&lease, envelope_bytes).await
+    }
 
+    /// CIRISEdge#739 — **a lane to `destination_key_id`'s scope-derived
+    /// `address`, held for one request→response exchange.**
+    ///
+    /// The scoped twin of `send`'s #532 REUSE-BEFORE-DIALING: an IDLE pooled
+    /// link to this derived address is leased as is; otherwise one is dialled
+    /// under the per-destination dial gate (bounded concurrency, not
+    /// exclusion — with every pooled lane leased, the next dial IS the next
+    /// lane), identified (#340), tagged `LinkPlane::Scoped` for life (#728),
+    /// and PUBLISHED LAST into the pool. The dial runs in a spawned task so a
+    /// caller cancelled mid-dial (a fetch that timed out) abandons its WAIT
+    /// and not the link (#568): the link still lands in the pool for the
+    /// next lease.
+    ///
+    /// The lease is released on `Drop`. Hold it until the peer's reply has
+    /// landed: the reply is the peer's Resource on this same link, and a
+    /// second request on the link before then would put the peer's second
+    /// reply behind Reticulum's one-Resource-per-link rule. `K` live leases
+    /// to one address are `K` parallel lanes — the property #532 named
+    /// ("link churn WAS the parallelism") kept without the churn.
+    ///
+    /// # Errors
+    /// [`TransportError::Unreachable`] when the peer's transport identity
+    /// cannot be resolved (no signing key ⇒ no link proof);
+    /// [`TransportError::NoRouteToPeer`] / [`TransportError::Timeout`] when the
+    /// derived destination does not establish; [`TransportError::Io`] on a
+    /// leviculum fault.
+    pub async fn lease_scoped_link(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+    ) -> Result<ScopedLinkLease, TransportError> {
         let dest_hash = DestinationHash::new(*address.as_bytes());
         // Operator deny-list first, on the DERIVED hash — a ban must not be
         // bypassable by addressing the peer in one of its scopes.
@@ -3928,70 +3993,193 @@ impl ReticulumTransport {
             )));
         };
 
-        let (link, established) = self
-            .node
-            .connect_awaited(&dest_hash, &transport_ed25519)
-            .await
-            .map_err(|e| TransportError::Io(format!("reticulum connect (scoped): {e}")))?;
-        let link_id = *link.link_id();
-        // CIRISEdge#424 — record the dest we dialed so a reply arriving on this
-        // link attributes to this peer (leviculum's `link_destination` is `None`
-        // for our own dialed links).
-        self.dialed_link_dest
-            .lock()
-            .await
-            .insert(link_id, dest_hash);
-        // CIRISEdge#728 — this link is SCOPED for its whole life: the peer's
-        // reverse-path selector may attribute it to us, but no identity-plane
-        // send on either side may ride it. Tagged here, before establishment,
-        // so no selector can observe an untagged link.
-        self.link_plane
-            .lock()
-            .await
-            .insert(link_id, LinkPlane::Scoped);
-
-        // Explicit-hash destinations are never pathed (see the routability note
-        // above), so this is always the bootstrap-broadcast budget.
-        if !matches!(
-            with_timeout(NO_PATH_ESTABLISH_TIMEOUT, established).await,
-            Some(Ok(()))
-        ) {
-            tracing::error!(
-                key_id = %destination_key_id,
-                target_dest = %hex::encode(dest_hash.into_bytes()),
-                "scope-native send: derived destination did not establish. A derived \
-                 address is announce-suppressed by design (CC 5.4), so it is \
-                 broadcast-only — only a directly-attached neighbour answers. Making a \
-                 scoped address relay-routable without re-publishing the reachability \
-                 fact is unspecified upstream (CIRISEdge#499). NOT retried on the \
-                 federation address: that would collapse the very context this \
-                 address exists to separate."
-            );
-            return Err(TransportError::NoRouteToPeer {
-                key_id: destination_key_id.to_string(),
-                target_dest: hex::encode(dest_hash.into_bytes()),
-                has_path: false,
-                paths: self.path_table_snapshot(),
-            });
+        // REUSE BEFORE DIALING (CIRISEdge#532, the scoped pool — #739).
+        let bypass = self
+            .scoped_pool_bypass
+            .load(std::sync::atomic::Ordering::Acquire);
+        if bypass {
+            let link_id = self
+                .dial_ctx()
+                .dial_scoped_link(destination_key_id, dest_hash, &transport_ed25519)
+                .await?;
+            return Ok(ScopedLinkLease::claim(link_id, &self.scoped_link_leased));
         }
-
-        // CIRISEdge#340 — IDENTIFY before shipping, so the responder can
-        // attribute the frame. Same ordering as the federation send path.
-        self.node
-            .identify_link(&link_id, &self.local_identity)
-            .await
-            .map_err(|e| TransportError::Io(format!("reticulum identify_link (scoped): {e}")))?;
-
-        self.ship_resource_on_link(
-            &link_id,
-            envelope_bytes,
-            DIAL_NO_PROGRESS_WINDOW,
-            RESOURCE_TRANSFER_TIMEOUT,
+        if let Some(lease) = lease_pooled_scoped_link(
+            &self.node,
+            &self.reusable_scoped_link,
+            &self.scoped_link_leased,
+            &self.link_plane,
+            &dest_hash,
         )
         .await
-        .map_err(ShipError::into_transport)?;
+        {
+            tracing::trace!(
+                key_id = %destination_key_id,
+                link = %hex::encode(lease.link_id.as_bytes()),
+                "reusing an idle scoped link to this member address (CIRISEdge#739)"
+            );
+            return Ok(lease);
+        }
 
-        Ok(TransportSendOutcome::Delivered)
+        // SINGLE-FLIGHT-BOUNDED dial (the #532 gate, per destination). The
+        // permit is acquired INSIDE the task, so a cancelled caller cannot
+        // release a gate the dial it covers is still using.
+        let gate = self.dial_gate_for(dest_hash).await;
+        let ctx = self.dial_ctx();
+        let pool = Arc::clone(&self.reusable_scoped_link);
+        let leased = Arc::clone(&self.scoped_link_leased);
+        let dkid = destination_key_id.to_owned();
+        let dial = tokio::spawn(async move {
+            let _dial_permit = gate
+                .acquire()
+                .await
+                .map_err(|e| TransportError::Io(format!("dial gate closed: {e}")))?;
+            // Double-check behind the gate: a dial we queued behind may have
+            // just published an idle lane.
+            if let Some(lease) =
+                lease_pooled_scoped_link(&ctx.node, &pool, &leased, &ctx.link_plane, &dest_hash)
+                    .await
+            {
+                return Ok(lease);
+            }
+            let link_id = ctx
+                .dial_scoped_link(&dkid, dest_hash, &transport_ed25519)
+                .await?;
+            // Claim BEFORE publishing, so no concurrent lease can take the
+            // lane between the publish and this caller's first send.
+            let lease = ScopedLinkLease::claim(link_id, &leased);
+            // PUBLISH LAST: established AND identified — what a reuser skips.
+            pool.lock()
+                .await
+                .entry(dest_hash)
+                .or_default()
+                .push(link_id);
+            Ok(lease)
+        });
+        dial.await
+            .map_err(|e| TransportError::Io(format!("scoped dial task failed: {e}")))?
+    }
+
+    /// CIRISEdge#739 — ship one envelope on a leased scoped link.
+    ///
+    /// Channel-first for a control-plane-sized frame (≤ `CHANNEL_FIRST_MAX_FRAGMENTS`
+    /// link packets at this link's MDU — a `BlobChunkFetch` is a few KB), the
+    /// Resource path otherwise or on a Channel stall: the #636/#716 rule the
+    /// reverse path already applies, so a request no longer pays a Resource
+    /// advertise/accept/proof round for four kilobytes. A lane that fails to
+    /// carry and is no longer established is evicted from the pool, so the
+    /// next lease dials instead of inheriting a dead link.
+    ///
+    /// # Errors
+    /// [`TransportError::BodyTooLarge`] above the AV-13 ceiling;
+    /// [`TransportError::Timeout`] / [`TransportError::Io`] from the ship.
+    pub async fn send_on_scoped_lease(
+        &self,
+        lease: &ScopedLinkLease,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        if envelope_bytes.len() > MAX_BODY_BYTES {
+            return Err(TransportError::BodyTooLarge {
+                actual: envelope_bytes.len(),
+                limit: MAX_BODY_BYTES,
+            });
+        }
+        let link_id = lease.link_id;
+        let mdu = link_channel_mdu(&self.node, &link_id);
+        if let Some(fragments) = crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
+            .filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
+        {
+            let outcome = send_fragments_on_channel(&self.node, &link_id, &fragments).await;
+            if outcome.complete() {
+                tracing::trace!(
+                    link = %hex::encode(link_id.as_bytes()),
+                    bytes = envelope_bytes.len(),
+                    fragments = outcome.total,
+                    "scoped frame delivered as link PACKET(s), Channel-first (CIRISEdge#739)"
+                );
+                return Ok(TransportSendOutcome::Delivered);
+            }
+            tracing::debug!(
+                link = %hex::encode(link_id.as_bytes()),
+                fragments = outcome.total,
+                fragments_sent = outcome.sent,
+                stalled = outcome.stalled.unwrap_or("-"),
+                "scoped Channel-first send stalled; trying the Resource path (CIRISEdge#739)"
+            );
+        }
+        let claimed = self.claim_link_for_transfer(link_id).await;
+        let shipped = self
+            .ship_resource_on_link(
+                &link_id,
+                envelope_bytes,
+                DIAL_NO_PROGRESS_WINDOW,
+                RESOURCE_TRANSFER_TIMEOUT,
+            )
+            .await;
+        if claimed {
+            self.release_link_after_transfer(link_id).await;
+        }
+        match shipped {
+            Ok(()) => Ok(TransportSendOutcome::Delivered),
+            Err(e) => {
+                if !self.node.link_is_established(&link_id) {
+                    self.evict_scoped_link(link_id).await;
+                }
+                Err(e.into_transport())
+            }
+        }
+    }
+
+    /// CIRISEdge#739 — drop `link_id` from the scoped pool (it stays leased
+    /// until its lease drops; it is simply never handed out again).
+    async fn evict_scoped_link(&self, link_id: LinkId) {
+        let mut map = self.reusable_scoped_link.lock().await;
+        map.retain(|_, links| {
+            links.retain(|id| *id != link_id);
+            !links.is_empty()
+        });
+    }
+
+    /// CIRISEdge#739 test seam — the next `n` reply-path answers tear their
+    /// link down first (see `tear_down_reply_link`).
+    #[doc(hidden)]
+    pub fn tear_down_next_reply_links_for_test(&self, n: u32) {
+        self.tear_down_reply_link
+            .store(n, std::sync::atomic::Ordering::Release);
+    }
+
+    /// CIRISEdge#739 test seam — the teardowns still armed.
+    #[doc(hidden)]
+    pub fn pending_reply_teardowns_for_test(&self) -> u32 {
+        self.tear_down_reply_link
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// CIRISEdge#739 test seam — see `scoped_pool_bypass`.
+    #[doc(hidden)]
+    pub fn bypass_scoped_pool_for_test(&self, on: bool) {
+        self.scoped_pool_bypass
+            .store(on, std::sync::atomic::Ordering::Release);
+    }
+
+    /// CIRISEdge#739 test seam — `(pooled, leased)` scoped-link counts, so a
+    /// witness can assert that `K` lanes in flight cost `K` links and not one
+    /// per chunk.
+    #[doc(hidden)]
+    pub async fn scoped_link_pool_for_test(&self) -> (usize, usize) {
+        let pooled = self
+            .reusable_scoped_link
+            .lock()
+            .await
+            .values()
+            .map(Vec::len)
+            .sum();
+        let leased = self
+            .scoped_link_leased
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        (pooled, leased)
     }
 
     /// CIRISEdge#499 — resolve an inbound destination hash to the scope
@@ -6167,6 +6355,55 @@ impl Transport for ReticulumTransport {
         self.send(destination_key_id, envelope_bytes).await
     }
 
+    async fn send_on_reply_path_only(
+        &self,
+        destination_key_id: &str,
+        path: &crate::transport::ReplyPath,
+        envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        if envelope_bytes.len() > MAX_BODY_BYTES {
+            return Err(TransportError::BodyTooLarge {
+                actual: envelope_bytes.len(),
+                limit: MAX_BODY_BYTES,
+            });
+        }
+        for candidate in &self.resolve_dial_candidates(destination_key_id).await {
+            self.check_blackhole(&candidate.dest_hash.into_bytes())
+                .await?;
+        }
+        if self
+            .tear_down_reply_link
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            let _ = self.node.close_link(&LinkId::new(path.token())).await;
+        }
+        // CIRISEdge#739 — the arrival link, PINNED, whatever its plane (#728:
+        // the reply's plane is the request's by construction); no by-key
+        // fallback on any failure — the caller decides what a missing path
+        // means for its message class.
+        if path.transport() == TransportId::RETICULUM_RS
+            && self
+                .send_via_reverse_path(
+                    destination_key_id,
+                    envelope_bytes,
+                    Some(LinkId::new(path.token())),
+                )
+                .await
+        {
+            return Ok(TransportSendOutcome::Delivered);
+        }
+        Err(TransportError::Unreachable(format!(
+            "no live reply path {} to {destination_key_id} — the link the request arrived \
+             on is gone or would not carry the reply (CIRISEdge#739)",
+            hex::encode(path.token())
+        )))
+    }
+
     async fn listen(&self, sink: mpsc::Sender<InboundFrame>) -> Result<(), TransportError> {
         // Claim the node's single event receiver. A second `listen`
         // call finds it gone — that is a wiring bug, not a runtime
@@ -6384,6 +6621,90 @@ impl Transport for ReticulumTransport {
     }
 }
 
+/// CIRISEdge#739 — **one lane on a scoped link, held for one exchange.**
+///
+/// Handed out by [`ReticulumTransport::lease_scoped_link`]; while it lives
+/// the link is not offered to any other scoped sender to the same member
+/// address, and dropping it returns the link to the pool. Hold it until the
+/// peer's reply has landed (see the lease method's contract).
+#[must_use = "dropping the lease returns the link to the pool"]
+pub struct ScopedLinkLease {
+    link_id: LinkId,
+    leased: Arc<std::sync::Mutex<HashSet<LinkId>>>,
+}
+
+impl ScopedLinkLease {
+    fn claim(link_id: LinkId, leased: &Arc<std::sync::Mutex<HashSet<LinkId>>>) -> Self {
+        leased
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(link_id);
+        Self {
+            link_id,
+            leased: Arc::clone(leased),
+        }
+    }
+
+    /// The leased link's id (leviculum's 16-byte truncated hash).
+    #[must_use]
+    pub fn link_id_bytes(&self) -> [u8; 16] {
+        self.link_id.into_bytes()
+    }
+}
+
+impl Drop for ScopedLinkLease {
+    fn drop(&mut self) {
+        self.leased
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.link_id);
+    }
+}
+
+impl std::fmt::Debug for ScopedLinkLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopedLinkLease")
+            .field("link", &hex::encode(self.link_id.as_bytes()))
+            .finish_non_exhaustive()
+    }
+}
+
+/// CIRISEdge#739 — the scoped pool's IDLE-only selector, shared by the
+/// transport and the detached dial (`DialCtx`): an established, `Scoped`-plane
+/// link to `dest` that no lease holds, claimed atomically under the lease set's
+/// lock so two concurrent leases cannot pick the same lane. Dead entries are
+/// evicted on the way out — the map is a cache over leviculum's link registry,
+/// and leviculum is the authority.
+async fn lease_pooled_scoped_link(
+    node: &ReticulumNode,
+    pool: &Mutex<HashMap<DestinationHash, Vec<LinkId>>>,
+    leased: &Arc<std::sync::Mutex<HashSet<LinkId>>>,
+    planes: &Mutex<HashMap<LinkId, LinkPlane>>,
+    dest: &DestinationHash,
+) -> Option<ScopedLinkLease> {
+    let mut map = pool.lock().await;
+    let links = map.get_mut(dest)?;
+    links.retain(|id| node.link_is_established(id));
+    if links.is_empty() {
+        map.remove(dest);
+        return None;
+    }
+    let planes = planes.lock().await;
+    let mut held = leased
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let id = links
+        .iter()
+        .find(|id| !held.contains(*id) && planes.get(*id) == Some(&LinkPlane::Scoped))
+        .copied()?;
+    held.insert(id);
+    drop(held);
+    Some(ScopedLinkLease {
+        link_id: id,
+        leased: Arc::clone(leased),
+    })
+}
+
 /// CIRISEdge#568 — the state a cold dial needs, cloneable so the dial can
 /// OUTLIVE the round that asked for it.
 ///
@@ -6422,6 +6743,75 @@ struct DialCtx {
 }
 
 impl DialCtx {
+    /// CIRISEdge#739 — dial `dest_hash` (a scope-derived member address) and
+    /// identify the link: the body `send_to_scoped_destination` ran inline
+    /// before the scoped pool, unchanged in its steps — record the dialled
+    /// dest (#424), tag the plane `Scoped` before establishment (#728), the
+    /// bootstrap-broadcast establish budget (a derived address is never
+    /// pathed), then `identify_link` (#340). Returns the link ready to carry.
+    async fn dial_scoped_link(
+        &self,
+        destination_key_id: &str,
+        dest_hash: DestinationHash,
+        transport_ed25519: &[u8; 32],
+    ) -> Result<LinkId, TransportError> {
+        let (link, established) = self
+            .node
+            .connect_awaited(&dest_hash, transport_ed25519)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum connect (scoped): {e}")))?;
+        let link_id = *link.link_id();
+        // CIRISEdge#424 — record the dest we dialed so a reply arriving on this
+        // link attributes to this peer (leviculum's `link_destination` is `None`
+        // for our own dialed links).
+        self.dialed_link_dest
+            .lock()
+            .await
+            .insert(link_id, dest_hash);
+        // CIRISEdge#728 — this link is SCOPED for its whole life: the peer's
+        // reverse-path selector may attribute it to us, but no identity-plane
+        // send on either side may ride it. Tagged here, before establishment,
+        // so no selector can observe an untagged link.
+        self.link_plane
+            .lock()
+            .await
+            .insert(link_id, LinkPlane::Scoped);
+
+        // Explicit-hash destinations are never pathed (see the routability note
+        // on `send_to_scoped_destination`), so this is always the
+        // bootstrap-broadcast budget.
+        if !matches!(
+            with_timeout(NO_PATH_ESTABLISH_TIMEOUT, established).await,
+            Some(Ok(()))
+        ) {
+            tracing::error!(
+                key_id = %destination_key_id,
+                target_dest = %hex::encode(dest_hash.into_bytes()),
+                "scope-native send: derived destination did not establish. A derived \
+                 address is announce-suppressed by design (CC 5.4), so it is \
+                 broadcast-only — only a directly-attached neighbour answers. Making a \
+                 scoped address relay-routable without re-publishing the reachability \
+                 fact is unspecified upstream (CIRISEdge#499). NOT retried on the \
+                 federation address: that would collapse the very context this \
+                 address exists to separate."
+            );
+            return Err(TransportError::NoRouteToPeer {
+                key_id: destination_key_id.to_string(),
+                target_dest: hex::encode(dest_hash.into_bytes()),
+                has_path: false,
+                paths: self.path_table_snapshot(),
+            });
+        }
+
+        // CIRISEdge#340 — IDENTIFY before shipping, so the responder can
+        // attribute the frame. Same ordering as the federation send path.
+        self.node
+            .identify_link(&link_id, &self.local_identity)
+            .await
+            .map_err(|e| TransportError::Io(format!("reticulum identify_link (scoped): {e}")))?;
+        Ok(link_id)
+    }
+
     /// Snapshot every known path-table entry. v1.1.0 (CIRISEdge#44) —
     /// backed by leviculum's now-public
     /// `ReticulumNode::path_table_entries` (each row is a deep
@@ -6863,6 +7253,18 @@ enum LinkAttribution {
     /// A destination IS known but matches no rooted peer in the map (e.g. the peer
     /// has not rooted yet).
     DestUnmatched(DestinationHash),
+    /// CIRISEdge#749 — a frame on a SCOPED link THIS node dialled (a leased
+    /// lane, `lease_scoped_link`): the answer to one of its own scoped
+    /// requests, which rides the arrival link by design since #739. The
+    /// link's destination is the PEER's scope-derived address, and a derived
+    /// address is never in the peers map (#728: it must not be — that would
+    /// collapse the context the address exists to separate), so the
+    /// dialled-dest lookup has nothing to find. Not a miss and not a drop: the
+    /// frame goes on unattributed, as every scoped-lane answer is, and is
+    /// admitted on its own signature and its request's correlation, never on
+    /// a source. Identity-plane classes never reach this arm — the #728 plane
+    /// check refuses them by name first.
+    OwnScopedLane(Option<DestinationHash>),
     /// CIRISEdge#621 — the attribution resolved to THIS node's own key. An
     /// inbound link is, by construction, a link someone else holds the far end
     /// of; its source is never us. This arm fires when the peers map carries a
@@ -6902,6 +7304,28 @@ fn drop_resolved_to_self(link_id: LinkId, key_id: &str) {
 /// A miss here on an identified link is therefore `link_before_binding`:
 /// counted, and it must read 0 — it is the alarm that the announce-before-link
 /// ordering broke, not a state a peer is designed to sit in.
+/// CIRISEdge#749 — [`resolve_link_attribution`] behind the plane of the link:
+/// an un-identified frame on a scoped link this node DIALLED is
+/// [`LinkAttribution::OwnScopedLane`], and the peers map is not consulted —
+/// asking it for a derived address was the category error that logged every
+/// #739 chunk answer as an `UNATTRIBUTED` miss. Every other link resolves
+/// exactly as before, including a scoped link a PEER dialled (the responder
+/// side, attributed through its identify, #340) and an un-identified one of
+/// those (a genuine miss, still loud).
+fn resolve_link_attribution_on_plane(
+    plane: LinkPlane,
+    we_dialled: bool,
+    identified: Option<String>,
+    dest: Option<DestinationHash>,
+    local_key_id: &str,
+    peer_for_dest: impl FnOnce(DestinationHash) -> Option<String>,
+) -> LinkAttribution {
+    if plane == LinkPlane::Scoped && we_dialled && identified.is_none() {
+        return LinkAttribution::OwnScopedLane(dest);
+    }
+    resolve_link_attribution(identified, dest, local_key_id, peer_for_dest)
+}
+
 fn resolve_link_attribution(
     identified: Option<String>,
     dest: Option<DestinationHash>,
@@ -7219,14 +7643,27 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // has no entry. The basis is the link's DESTINATION (`dest` above): we dialed
     // a dest resolved from the VERIFIED route table, and RNS establishment proves
     // the remote controls that dest's keys — same trust the outbound send used.
+    // CIRISEdge#749 — whether THIS node dialled the link: the `connect`-time
+    // record (`dialed_link_dest`), which every own dial writes, scoped lanes
+    // included. Read only for a scoped link; it is what tells a lane's answer
+    // (ours) from an un-identified peer-dialled scoped link (a real miss).
+    let we_dialled =
+        plane == LinkPlane::Scoped && ctx.dialed_link_dest.lock().await.contains_key(&link_id);
     let candidate_key_id = {
         let peers = ctx.peers.lock().await;
-        let outcome = resolve_link_attribution(identified, dest, ctx.local_key_id, |d| {
-            peers
-                .iter()
-                .find(|(_, rooted)| rooted.peer.dest_hash == d)
-                .map(|(key_id, _)| key_id.clone())
-        });
+        let outcome = resolve_link_attribution_on_plane(
+            plane,
+            we_dialled,
+            identified,
+            dest,
+            ctx.local_key_id,
+            |d| {
+                peers
+                    .iter()
+                    .find(|(_, rooted)| rooted.peer.dest_hash == d)
+                    .map(|(key_id, _)| key_id.clone())
+            },
+        );
         drop(peers);
         match outcome {
             // CIRISEdge#621 — never our own key. A frame attributed to
@@ -7267,6 +7704,23 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                          route on the link's proven identity (CIRISEdge#424/#624)"
                     );
                 }
+                None
+            }
+            // CIRISEdge#749 — the answer on our own leased lane. Named, not a
+            // miss: nothing on this arm is dropped for want of a source (the
+            // identity-plane classes that would be were refused above, #728),
+            // so it speaks at DEBUG — at WARN it was one line per chunk of a
+            // #739 pull, 743 on one CI run, reading as the #728 class.
+            LinkAttribution::OwnScopedLane(d) => {
+                tracing::debug!(
+                    link = ?link_id,
+                    dest = %d.map_or_else(|| "-".to_owned(), |d| hex::encode(d.into_bytes())),
+                    bytes = data.len(),
+                    "inbound frame on a SCOPED lane this node dialled — the answer to its own \
+                     scoped request, on the request's link (CIRISEdge#739). A derived address \
+                     is never in the peers map (#728), so it is delivered unattributed by \
+                     design and admitted on its own signature and correlation (CIRISEdge#749)"
+                );
                 None
             }
             LinkAttribution::DestUnmatched(d) => {
@@ -12288,6 +12742,70 @@ mod tests {
             assert_eq!(out, LinkAttribution::DestUnmatched(dh(9)));
         }
 
+        /// CIRISEdge#749 — THE FIELD INPUT: an answer on a scoped lane THIS node
+        /// dialled arrives with no `LinkIdentified` entry and the lane's dialled
+        /// destination, the peer's DERIVED address, which the peers map never
+        /// holds. Before, that resolved `DestUnmatched` and warned once per
+        /// chunk of every #739 pull; it is the named own-lane outcome, and the
+        /// peers map is not asked about a derived address at all.
+        #[test]
+        fn an_answer_on_our_own_scoped_lane_is_named_not_a_miss_749() {
+            let out = resolve_link_attribution_on_plane(
+                LinkPlane::Scoped,
+                true,
+                None,
+                Some(dh(0x61)),
+                SELF,
+                |_| panic!("a derived address is never looked up in the peers map"),
+            );
+            assert_eq!(out, LinkAttribution::OwnScopedLane(Some(dh(0x61))));
+        }
+
+        /// The other three corners resolve exactly as the plane-blind resolver
+        /// does: a scoped link a PEER dialled attributes through its identify
+        /// (the responder side of every lane, #340), an un-identified one of
+        /// those is still the loud miss, and an identity-plane link we dialled
+        /// still attributes via its recorded dest (#424).
+        #[test]
+        fn only_our_own_unidentified_scoped_lane_takes_the_named_arm_749() {
+            let responder = resolve_link_attribution_on_plane(
+                LinkPlane::Scoped,
+                false,
+                Some("peer-b".into()),
+                Some(dh(1)),
+                SELF,
+                |_| None,
+            );
+            assert_eq!(responder, LinkAttribution::ViaIdentified("peer-b".into()));
+            let unidentified = resolve_link_attribution_on_plane(
+                LinkPlane::Scoped,
+                false,
+                None,
+                Some(dh(2)),
+                SELF,
+                |_| None,
+            );
+            assert_eq!(unidentified, LinkAttribution::DestUnmatched(dh(2)));
+            let identity = resolve_link_attribution_on_plane(
+                LinkPlane::Identity,
+                true,
+                None,
+                Some(dh(3)),
+                SELF,
+                |d| (d == dh(3)).then(|| "peer-c".to_string()),
+            );
+            assert_eq!(identity, LinkAttribution::ViaDialedDest("peer-c".into()));
+            let identity_miss = resolve_link_attribution_on_plane(
+                LinkPlane::Identity,
+                true,
+                None,
+                Some(dh(4)),
+                SELF,
+                |_| None,
+            );
+            assert_eq!(identity_miss, LinkAttribution::DestUnmatched(dh(4)));
+        }
+
         // ── CIRISEdge#621 — attribution never resolves to the local key ──
 
         /// (a) THE #621 CONDITION: the peers map holds a self-entry under our own
@@ -12367,6 +12885,10 @@ mod tests {
                         proptest::prop_assert_eq!(k, SELF.to_string());
                     }
                     LinkAttribution::NoDest | LinkAttribution::DestUnmatched(_) => {}
+                    // Only the plane-aware wrapper names a scoped lane.
+                    LinkAttribution::OwnScopedLane(_) => {
+                        proptest::prop_assert!(false, "the plane-blind resolver named a lane");
+                    }
                 }
             }
         }
@@ -14536,8 +15058,10 @@ mod link_reuse_tests {
     //! call while edge's only reuse selector was consulted on the reverse path
     //! alone. These pin the two decisions that close it, as pure functions over
     //! the state the field produces.
-    use super::{DestinationHash, LinkId};
+    use super::{DestinationHash, LinkId, ScopedLinkLease};
     use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::sync::Arc;
 
     /// The eviction identity guard, extracted as the predicate it is: a close
     /// event retracts the peer's reusable link ONLY if the closing link is the
@@ -14618,6 +15142,39 @@ mod link_reuse_tests {
         *gates.entry(dest(1)).or_default() += 1;
         assert_eq!(gates.len(), 2, "two peers must get two independent gates");
         assert_eq!(gates[&dest(1)], 2, "same peer shares one gate");
+    }
+
+    /// CIRISEdge#739 — a scoped lane is held for the exchange and given back
+    /// on drop, and a leased lane is never offered to a second lessee: the
+    /// idle-only rule of the identity pool (above), on the scoped pool, with
+    /// the lease as the busy marker.
+    #[test]
+    fn a_scoped_lease_holds_its_lane_and_drop_returns_it() {
+        let leased: Arc<std::sync::Mutex<HashSet<LinkId>>> =
+            Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let pool = [link(1), link(2)];
+        let first = ScopedLinkLease::claim(link(1), &leased);
+        assert_eq!(first.link_id_bytes(), link(1).into_bytes());
+        let idle = |held: &HashSet<LinkId>| pool.iter().find(|id| !held.contains(*id)).copied();
+        assert_eq!(
+            idle(&leased.lock().unwrap()),
+            Some(link(2)),
+            "with lane 1 leased, the next lease takes lane 2"
+        );
+        let second = ScopedLinkLease::claim(link(2), &leased);
+        assert_eq!(
+            idle(&leased.lock().unwrap()),
+            None,
+            "every lane leased ⇒ the next lessee dials a third, never queues"
+        );
+        drop(first);
+        assert_eq!(
+            idle(&leased.lock().unwrap()),
+            Some(link(1)),
+            "the dropped lease's lane is idle again"
+        );
+        drop(second);
+        assert!(leased.lock().unwrap().is_empty());
     }
 }
 

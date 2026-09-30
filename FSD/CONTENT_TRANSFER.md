@@ -1165,6 +1165,126 @@ Read}`; `group_content::{StreamSealRequest (+ ::of, ::aad), ContentReader}`,
 `GroupContentStore::seal_chunked_stream` (default: a named `Substrate` refusal),
 `GroupContentError::{DeclaredLengthMismatch, Reader}`. `publish`'s signature and behaviour are unchanged.
 
+#### 6.7.5 Pulling a big file fast — the pipeline, and the bench it answers to (CIRISEdge#739, lane 7 of #734)
+
+**"Fast" is defined against the wire, not guessed.** The ceiling is a raw transfer of the same byte
+count over the same two-node Reticulum loopback link (TCP interface, MDU 16297) through edge's own
+`Transport::send` — 4 MiB frames, each one leviculum Resource with auto-compress on, as edge ships
+everything. **Criterion:** the DAG pull's sustained throughput (bytes admitted on the puller, first
+chunk request to `promote`) is within **2×** of that ceiling (one lane — a single Resource stream)
+for a 2 GiB self file, and the per-chunk cost is clocked per phase so the residual is NAMED, not
+inferred. The bench is `tests/bigfile_739.rs` (release build, `--ignored`, run alone); it prints the
+table below and asserts the criterion when `CIRIS_BIGFILE_ASSERT_RATIO=1`.
+
+**The rules** (each a named mechanism, each measured on its own below):
+
+1. **A chunk answer rides the link its request arrived on.** `BlobChunkFetch` is answered with
+   `Transport::send_on_reply_path_only` — the #683 `ReplyPath`, pinned, no by-key fallback inside the
+   transport — so a scoped request's answer stays on its scoped link (§3.5 I-3.5.3 of the transport
+   FSD: the answer path never needs to know the plane). The durable outbound queue is the **fallback
+   only**, when the arrival link is gone by the time the answer is signed: logged once a minute, counted
+   (`blob_scoped_carriers`: `serve:reply_path` against `serve:reply_queued_fallback`), sent by key —
+   for a scoped arrival that is §3.4's identity-link carrier (#718), exactly where every answer went
+   before this cut. Until it, **every** chunk answer was a ~1 MB row in the durable queue, claimed on
+   the dispatcher's 500 ms idle poll.
+2. **Scoped links are pooled and leased per exchange.** `ReticulumTransport::lease_scoped_link` is the
+   scoped twin of #532's reuse-before-dialing: an IDLE pooled link to the derived address is leased
+   as is, otherwise one is dialled under the per-destination dial gate, identified, tagged
+   `LinkPlane::Scoped` for life (#728) and published last. The lease is held for the whole
+   request→answer exchange (the answer is the peer's Resource on that link, one Resource per link per
+   direction) and returned on drop. `K` leases = `K` links; the pool grows to the demand and no
+   further — 8,192 dials for a 2 GiB file become `K`.
+3. **The walk is a pipeline of `K` lanes under a byte budget.** Each lane fetches one chunk, checks
+   its sha and its stored length, and ADOPTS it (`adopt_sealed_chunk`) — the adopt is in the lane,
+   not behind the loop. Admission (`pipeline_admits`, a pure fn): fewer than `K` lanes AND the stored
+   bytes in flight within `dag_bytes_in_flight` — except that an empty pipeline always admits one, so
+   a budget below one chunk degrades to `K = 1`, never to a stall. Fetch order is `seq`; the holders
+   are routed ONCE per DAG and the swarm's holder selection (`pick_peer`: lowest EWMA RTT with
+   capacity) is kept across every chunk, so the second chunk knows what the first learned. The store
+   gate is asked once, before the first byte moves.
+4. **A stop drains; a kill cancels.** On a refusal, a fetch that did not arrive, or a failed adopt,
+   no further lane is admitted and the lanes in flight finish — everything that arrives verified is
+   adopted and kept — and the FIRST stop names the outcome (alone booking its retry or its refusal).
+   A killed pull (task dropped) cancels every lane; a chunk whose adopt had not returned is then
+   either absent or held at its position, never twice, since a position holds one row.
+5. **Resume.** A retry re-opens the held manifest, skips every chunk held at its position with the
+   manifest's sha, and fetches the rest; `adopted` + `skipped_held` (`blob_dag_chunks`) sum to the
+   manifest's chunk count exactly.
+
+**Defaults, read off the curve.** `DEFAULT_DAG_CHUNKS_IN_FLIGHT` = **8**: the knee (K = 4 → 8 is
++49 %, 8 → 16 is within run-to-run noise on the measuring host while its transient heap doubles).
+`DEFAULT_DAG_BYTES_IN_FLIGHT` = 8 × `DEFAULT_INLINE_BYTES_CAP` (8 MiB of stored chunk bytes: `K` lanes
+at the producer's 1 MiB ceiling, 32 at `files::publish`'s 256 KiB segments), so at the producer's
+segment size `K` governs.
+
+**The table** (release, two nodes in one process on a 32-core host shared with other builds, 16
+tokio workers; `N` = 256 MiB = 1,024 chunks of 256 KiB at `invisible_encrypted`; ceilings varied
+12.3–14.2 MB/s across runs, each ratio is against its own run's ceiling):
+
+| build | pull | MB/s | ratio (1 lane) | peak heap | notes |
+|---|---|---|---|---|---|
+| base (feat-737) | sequential, a dial per chunk, answers via the durable queue | 0.41 | 30.1× | 32 MiB | 1,025 queue rows for chunk bodies |
+| #739, K = 1 | answers on the arrival link, pooled lane | 1.2 | 10.5× | 37 MiB | 0 queue rows |
+| #739, K = 4 | pipelined | 3.7 | 3.4× | 106 MiB | |
+| #739, K = 8 (default) | pipelined | 5.5–5.8 | 2.3–2.5× | 210 MiB | |
+| #739, K = 16 | pipelined | 5.0–6.4 | 2.2–2.6× | 342–385 MiB | |
+
+At **2 GiB** (8,192 chunks; ceiling 12.6–13.0 MB/s): base **0.34 MB/s** (6,226 s, 36.6×, 8,199 queue
+rows — six chunks re-requested — and leviculum's outbound circuit open and SHEDDING for the last
+~30 minutes, #66: the one-link-per-chunk churn against its 1,024-link table); #739 at K = 8 **3.8 MB/s**
+(569 s, **3.4×**, 0 queue rows, 8 scoped links, 241 MiB peak heap over baseline, read-back 82 MB/s).
+**The 2× criterion is met at neither size; the table says why, and the residual below is where the
+rest of the gap lives.**
+
+**Each change's gain, measured alone** (64 MiB, K = 1, `CIRIS_BIGFILE_SEAM`): the pre-#739 wire
+shape (every answer's arrival link torn down, so every answer takes the queue and every request
+dials) 0.4 MB/s → answers on the arrival link, a dial per chunk (`nopool`) 1.1 MB/s (**2.75×**, 517 ms
+less per chunk: the queue poll and the ~1 MB row) → the pooled lane 1.2 MB/s (+7 %, 16 ms per chunk:
+the establish + identify) → pipelining, K = 8, 5.5 MB/s (**4.6×**). Holder routing once per DAG and
+Channel-first requests are inside the noise at K = 1.
+
+**Per-chunk phases at K = 1** (the critical path, `blob_dag_phases`): serving node — gate + store
+read 1.3 ms, build + hybrid-sign the `BlobChunkBody` envelope 55 ms, ship on the arrival link 77 ms
+(bz2 compress + transfer + proof); pulling node — `inbound_verify_chunk_body` 50 ms, body parse
+3.7 ms, `dag_adopt` 25 ms; `dag_fetch_wait` 191 ms end to end; `dag_promote` once, ~0.1 s.
+
+**The residual, named** (why K = 8 lands at ~2.3× at 256 MiB and 3.4× at 2 GiB, not under 2×):
+
+- **persist — `adopt_sealed_chunk` grows with the store.** 25 ms per chunk at K = 1 on a 256 MiB
+  pull, **201 ms** average per lane at 2 GiB (`dag_adopt` = 1,643 s of lane time in a 569 s pull:
+  about three of the eight lanes are always adopting) — `src/engine.rs:5627` →
+  `federation/adopt_cascade.rs:226` (`resolve_adopt`, `would_hold`, then
+  `project_pending_content_grants` per chunk) → `store/sqlite.rs:16025` (`put_blob_chunk_floor`,
+  one writer). The serving side's store read grows the same way (gate + read 1.3 → 11.5 ms).
+  This is the dominant term at 2 GiB and it is persist's.
+
+- **leviculum — incoming Resource assembly under the node lock.** The receive side decrypts,
+  bz2-decompresses and hashes each ~940 KB answer inside `NodeCore` while the driver holds the node's
+  `std` mutex (`leviculum-core/src/node/link_management.rs:2786` → `resource/incoming.rs:569–640`, the
+  decompress at `:625`), so every other lane's packets — and every tokio worker that touches the node
+  — wait ~21 ms per chunk. It is the receive-side counterpart of leviculum#29, which moved the SEND
+  side's build off-lock.
+- **persist — the canonical form is built from a cloned value tree.** Signing and verifying both
+  `to_value` the whole envelope and `canonicalize_envelope_for_signing` clones it
+  (`ciris-persist src/verify/canonical.rs:342`): for a chunk body that is two quarter-million-element
+  trees per side per chunk (~38 ms of CPU and ~12 MiB of transient heap per lane per node — the
+  "peak heap" column is that, not buffered chunks: the pipeline itself holds `K` chunks).
+- **Both are amplified by the chunk body's encoding (CIRISEdge#742).** `BlobChunkBody.bytes` is a
+  JSON integer array: a 262,188-byte stored chunk is a 940,543-byte envelope (3.59×). After
+  leviculum's bz2 the wire cost is small — 270,123 bytes, +3 % over the raw chunk and +14 % over
+  bz2 of the raw chunk — but the CPU cost is not: bz2 compress 41.6 ms vs 13.4 ms for the raw
+  bytes, decompress 20.6 ms under the lock above, and the value trees above. Changing the encoding
+  is a wire break, tracked there, not made here.
+
+| # | Invariant | Witness |
+|---|---|---|
+| P1 | A 256 MiB (and 2 GiB) self file pulls to the owner's other device over real Reticulum loopback byte-identical, promoted `chunk_dag`, in `K` scoped links (`scoped_link_pool_for_test` = `(K, 0)` after) | `tests/bigfile_739.rs::a_256_mib_self_file_pulls_within_the_ceiling_and_resumes_after_a_kill_739`, `::a_2_gib_self_file_pulls_within_the_ceiling_739` |
+| P2 | No chunk answer is written to the durable outbound queue while the arrival link lives; with it torn down the answer takes the queue fallback and still lands | same, and the CI variant `::a_256_mib_self_file_resumes_after_a_kill_quick_739` |
+| P3 | Killed at ~50 % and resumed from the same store: held chunks skipped, each position adopted exactly once (`skipped + adopted = chunk count`), byte-identical | same |
+| P4 | The admission rule: `K` bounds lanes, the budget bounds bytes, an empty pipeline admits one | `blob_swarm::pull::tests::the_pipeline_admits_by_lanes_and_by_bytes_and_never_stalls` |
+| P5 | A leased scoped lane is never offered to a second lessee and returns on drop | `transport::reticulum::link_reuse_tests::a_scoped_lease_holds_its_lane_and_drop_returns_it` |
+| P6 | A stop drains: a tampered chunk is refused at its position and every other chunk in flight is adopted and kept | `tests/blob_federation_e2e.rs::a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_whole` |
+
 ### 6.8 The drive read is a gated query (CIRISPersist#891 — shipped v46.4.0, adopted v30.0.0)
 
 R10 is a query: *this room's file rows, resumable*. Until persist v46.4.0 the only door edge had was

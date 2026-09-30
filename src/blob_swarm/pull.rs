@@ -44,13 +44,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ciris_persist::federation::blobs::BlobStorage;
 use ciris_persist::federation::types::cohort_scope::CryptoTier;
 use ciris_persist::federation::{
     AdoptDisposition, Attestation, BlobBody, BlobProvenance, FederationDirectory,
 };
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::mpsc;
 
 use super::meaning::{BlobMeaning, MeaningRefusal};
@@ -181,7 +182,34 @@ pub struct PullConfig {
     /// The operator's own answer (axis 3): what this node agrees to hold
     /// and whether it advertises holding it, per content class.
     pub consent: super::store_gate::OperatorStoreConsent,
+    /// CIRISEdge#739 (`FSD/CONTENT_TRANSFER.md` §6.7.5) — **chunk requests a
+    /// sealed-DAG pull keeps in flight at once** (`K`). Each is one leased
+    /// lane on the holder's scoped link pool, so this is also the most
+    /// scoped links the pull holds to one holder. The default is read off
+    /// the measured curve in `tests/bigfile_739.rs`, not chosen by taste:
+    /// it is the knee (§6.7.5: K = 4 → 8 is +49 %, 8 → 16 is inside the
+    /// run-to-run noise while the per-lane transient heap doubles). `0`
+    /// behaves as `1`.
+    pub dag_chunks_in_flight: usize,
+    /// CIRISEdge#739 — **the byte budget of those requests**: the sum of the
+    /// STORED sizes (plaintext + `AT_REST_ENVELOPE_OVERHEAD`) of every chunk
+    /// in flight stays at or under this, whatever `K` says — the bound on the
+    /// chunk bytes the pull holds, independent of the file's size (each
+    /// lane's transient — the answer envelope's JSON form, CIRISEdge#742 — is
+    /// on top of it; §6.7.5 measures both). At least one request is always
+    /// admitted, so a budget below one chunk degrades to `K = 1` rather than
+    /// to a stall.
+    pub dag_bytes_in_flight: u64,
 }
+
+/// CIRISEdge#739 — the default `K` (see [`PullConfig::dag_chunks_in_flight`]).
+pub const DEFAULT_DAG_CHUNKS_IN_FLIGHT: usize = 8;
+/// CIRISEdge#739 — the default byte budget (see
+/// [`PullConfig::dag_bytes_in_flight`]): eight of the largest chunk persist
+/// admits (`DEFAULT_INLINE_BYTES_CAP`), i.e. `K` full lanes at the producer's
+/// ceiling, and 32 lanes at `files::publish`'s 256 KiB segments.
+pub const DEFAULT_DAG_BYTES_IN_FLIGHT: u64 =
+    8 * ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP as u64;
 
 impl Default for PullConfig {
     fn default() -> Self {
@@ -194,6 +222,8 @@ impl Default for PullConfig {
             swarm: SwarmConfig::default(),
             commons_allowlist: Vec::new(),
             consent: super::store_gate::OperatorStoreConsent::default(),
+            dag_chunks_in_flight: DEFAULT_DAG_CHUNKS_IN_FLIGHT,
+            dag_bytes_in_flight: DEFAULT_DAG_BYTES_IN_FLIGHT,
         }
     }
 }
@@ -672,14 +702,99 @@ pub trait DagByteFetch: Send + Sync {
     async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String>;
 }
 
-/// The production [`DagByteFetch`]: one swarm session over the pull's
-/// holders, the store gate armed, one whole-blob fetch per address (a chunk
-/// is its own content-addressed row on the holder, served by
-/// `PersistBlobChunkSource` exactly as a whole blob is).
+/// The production [`DagByteFetch`] (CIRISEdge#739): the pull's holders
+/// ROUTED ONCE, then one `fetch_blob_chunk_scoped` per address — a chunk is
+/// its own content-addressed row on the holder, served by
+/// `PersistBlobChunkSource` exactly as a whole blob is, and asked for as one
+/// (`blob = chunk = sha`). Holder selection is the swarm's own rule
+/// (`pick_peer`: lowest EWMA RTT with capacity, untimed holders first) kept
+/// across the whole DAG in `peers`, so the second chunk already knows what
+/// the first learned; a holder that misses or errors is struck and, at the
+/// swarm's limits, retired for this pull.
+///
+/// Until this cut every chunk opened its own `SwarmScheduler` session: the
+/// store gate asked again, every holder routed again, a task and a channel
+/// per address, and the per-holder cap of `max_in_flight_per_peer` — which
+/// bounded a single-holder pull (a self file: the author's one node) at four
+/// lanes whatever the pipeline asked. The gate is asked once, in
+/// `pull_dag_inner`, before the first byte moves; the fetcher never re-asks.
 struct SwarmFetch {
-    scheduler: SwarmScheduler,
+    edge: Arc<crate::Edge>,
     holders: Vec<String>,
     meaning: BlobMeaning,
+    swarm: SwarmConfig,
+    /// The pipeline's `K`: the per-holder capacity here, since the pipeline
+    /// itself never has more than `K` requests outstanding in total.
+    lanes: u32,
+    blob_hex: String,
+    routes: tokio::sync::OnceCell<Result<HashMap<String, super::BlobRecipient>, String>>,
+    peers: Mutex<HashMap<String, super::PeerState>>,
+}
+
+impl SwarmFetch {
+    fn new(
+        edge: Arc<crate::Edge>,
+        holders: Vec<String>,
+        meaning: BlobMeaning,
+        swarm: SwarmConfig,
+        lanes: usize,
+        blob_hex: String,
+    ) -> Self {
+        let peers = holders
+            .iter()
+            .map(|h| (h.clone(), super::PeerState::default()))
+            .collect();
+        Self {
+            edge,
+            holders,
+            meaning,
+            swarm,
+            lanes: u32::try_from(lanes.max(1)).unwrap_or(u32::MAX),
+            blob_hex,
+            routes: tokio::sync::OnceCell::new(),
+            peers: Mutex::new(peers),
+        }
+    }
+
+    /// The holders' scoped addresses, resolved on the first fetch and held
+    /// for the DAG (CIRISEdge#499: the route follows the key plane).
+    async fn routes(&self) -> Result<&HashMap<String, super::BlobRecipient>, String> {
+        self.routes
+            .get_or_init(|| async {
+                let router = self.edge.blob_scope_router();
+                let metrics = self.edge.metrics();
+                super::resolve_holder_routes(
+                    &router,
+                    Some(&self.meaning.key_plane()),
+                    &self.holders,
+                    &self.blob_hex,
+                    Some(&metrics),
+                )
+            })
+            .await
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// Pick a holder with capacity and book one request against it.
+    fn pick(&self) -> Option<String> {
+        let mut peers = self.peers.lock().ok()?;
+        let peer = super::pick_peer(&peers, self.lanes)?;
+        if let Some(state) = peers.get_mut(&peer) {
+            state.in_flight = state.in_flight.saturating_add(1);
+        }
+        Some(peer)
+    }
+
+    /// Release the booking and record what the holder did.
+    fn settle(&self, peer: &str, record: impl FnOnce(&mut super::PeerState)) {
+        if let Ok(mut peers) = self.peers.lock() {
+            if let Some(state) = peers.get_mut(peer) {
+                state.in_flight = state.in_flight.saturating_sub(1);
+                record(state);
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -689,17 +804,100 @@ impl DagByteFetch for SwarmFetch {
     }
 
     async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String> {
-        self.scheduler
-            .fetch_blob_scoped_with_disposition(
-                sha,
-                ChunkManifestLite::whole_blob(sha),
-                self.holders.clone(),
-                Some(self.meaning.clone()),
-            )
-            .await
-            .map(|(bytes, _)| bytes)
-            .map_err(|e| e.to_string())
+        let routes = self.routes().await?;
+        let alpha = self.swarm.ewma_alpha;
+        let strike_limit = self.swarm.error_strike_limit;
+        let timeout = self.swarm.per_request_timeout;
+        // Bounded: every holder may be struck to its limit and no further.
+        let max_attempts = routes.len().max(1) * (strike_limit.max(1) as usize + 1);
+        let mut last = String::from("no holder accepted the request");
+        for _ in 0..max_attempts {
+            let Some(peer) = self.pick() else {
+                return Err(format!("no holders left for {}: {last}", hex::encode(sha)));
+            };
+            let Some(recipient) = routes.get(&peer) else {
+                // Unroutable holders were dropped by `resolve_holder_routes`
+                // (loudly); one reaching here is not a candidate.
+                self.settle(&peer, |s| s.demoted = true);
+                continue;
+            };
+            let started = Instant::now();
+            match self
+                .edge
+                .fetch_blob_chunk_scoped(recipient, sha, sha, timeout)
+                .await
+            {
+                Ok(crate::ChunkResult::Bytes(bytes)) => {
+                    self.settle(&peer, |s| s.record_rtt(started.elapsed(), alpha));
+                    return Ok(bytes);
+                }
+                Ok(crate::ChunkResult::ChunkMiss { reason }) => {
+                    // The wire reason is `MissReason`'s Debug repr (the
+                    // scheduler's convention).
+                    let gone = reason.contains("Withdrawn") || reason.contains("Revoked");
+                    let hard = reason.contains("PolicyDenied") || reason.contains("DiskPressure");
+                    self.settle(&peer, |s| {
+                        if hard {
+                            s.demoted = true;
+                        } else {
+                            s.record_error_strike(strike_limit);
+                        }
+                    });
+                    if gone {
+                        return Err(format!("withdrawn or revoked federation-wide: {reason}"));
+                    }
+                    last = format!("{peer}: chunk miss {reason}");
+                }
+                Err(e) => {
+                    self.settle(&peer, |s| {
+                        s.record_rtt(timeout, alpha);
+                        s.record_error_strike(strike_limit);
+                    });
+                    last = format!("{peer}: {e}");
+                }
+            }
+        }
+        Err(last)
     }
+}
+
+/// CIRISEdge#739 (`FSD/CONTENT_TRANSFER.md` §6.7.5) — **may the pipeline
+/// admit the next chunk request?** `in_flight` requests are outstanding
+/// holding `bytes_in_flight` of stored bytes; the next would add `stored`.
+/// Admitted while both bounds hold — fewer than `lanes` outstanding AND the
+/// budget not exceeded — except that an EMPTY pipeline always admits one:
+/// the budget bounds memory, it never stalls a pull whose chunks are larger
+/// than it. Pure, so the rule is a test.
+#[must_use]
+pub fn pipeline_admits(
+    in_flight: usize,
+    lanes: usize,
+    bytes_in_flight: u64,
+    stored: u64,
+    budget: u64,
+) -> bool {
+    if in_flight == 0 {
+        return true;
+    }
+    in_flight < lanes.max(1) && bytes_in_flight.saturating_add(stored) <= budget
+}
+
+/// One chunk the sealed-DAG walk still has to fetch: its position, its
+/// ciphertext sha, its plaintext size (CIRISEdge#739).
+struct DagWant {
+    seq: u64,
+    sha: [u8; 32],
+    size: u64,
+}
+
+/// Why one lane of the sealed-DAG pipeline stopped (CIRISEdge#739).
+enum LaneStop {
+    /// The chunk did not arrive verified.
+    Fetch(DagFetchStop),
+    /// It arrived, but not at the length the manifest implies.
+    Length { got: usize, expected: u64 },
+    /// Persist refused or failed the adopt.
+    Adopt(String),
 }
 
 /// Why one address did not arrive verified.
@@ -1312,16 +1510,14 @@ where
             let retrying = self.book_retry(row, sha, attempts);
             return PullOutcome::NoHolders { attempts, retrying };
         }
-        let fetch = SwarmFetch {
-            scheduler: SwarmScheduler::new(
-                Arc::clone(&self.edge),
-                Arc::new(HashOnlyVerifier),
-                self.config.swarm.clone(),
-            )
-            .with_store_policy(Arc::clone(&self.policy)),
+        let fetch = SwarmFetch::new(
+            Arc::clone(&self.edge),
             holders,
-            meaning: meaning.clone(),
-        };
+            meaning.clone(),
+            self.config.swarm.clone(),
+            self.config.dag_chunks_in_flight,
+            hex::encode(sha),
+        );
         self.pull_dag_inner(row, sha, attempts, meaning, &fetch)
             .await
     }
@@ -1398,8 +1594,10 @@ where
             return refused;
         }
         // MAY — the gate, asked of the FETCHER's holders before a byte moves
-        // (CIRISEdge#581). The swarm asks it again inside each fetch; a
-        // caller's fetcher gets no way round it.
+        // (CIRISEdge#581), once per DAG: every chunk shares the row, the
+        // meaning and the holder set the answer was given for (CIRISEdge#739
+        // stopped re-asking it per chunk). A caller's fetcher gets no way
+        // round it — nothing below runs without its disposition.
         let disposition = match super::store_admission_with(
             self.policy.as_ref(),
             sha,
@@ -1631,6 +1829,10 @@ where
                     .collect(),
                 Err(e) => return PullOutcome::StoreFailed(format!("stream_chunks: {e}")),
             };
+        // Every chunk's address is read off the view BEFORE the first request,
+        // so a malformed manifest is refused with nothing fetched.
+        let mut wanted: Vec<DagWant> = Vec::with_capacity(view.chunks.len());
+        let mut skipped_held: u64 = 0;
         for c in &view.chunks {
             let mut want = [0u8; 32];
             if let Err(e) = hex::decode_to_slice(&c.sha256_hex, &mut want) {
@@ -1643,74 +1845,161 @@ where
                 );
             }
             if held_chunks.get(&c.seq) == Some(&want) {
+                skipped_held += 1;
                 continue;
             }
-            let bytes = match self.fetch_verified(fetch, want).await {
-                Ok(b) => b,
-                Err(DagFetchStop::Transport(reason)) => {
-                    return self.dag_fetch_failed(
-                        row,
-                        sha,
-                        attempts,
-                        &format!("chunk seq {}", c.seq),
-                        &reason,
-                    )
+            wanted.push(DagWant {
+                seq: c.seq,
+                sha: want,
+                size: u64::from(c.size),
+            });
+        }
+        // Fetch order is `seq` (CIRISEdge#739, §6.7.5): the file's position
+        // order, so a pull cut at any moment holds a prefix plus a window,
+        // the resume's skip set is contiguous, and a reader that streams
+        // (`FileRow::chunks`) behind a pull in progress meets held chunks
+        // first. The view lists them in that order; sorting pins the rule
+        // rather than inheriting it.
+        wanted.sort_by_key(|w| w.seq);
+        let metrics = self.edge.metrics();
+        metrics.add_blob_dag_chunks("skipped_held", skipped_held);
+
+        // ── the pipeline ── K lanes in flight, under a byte budget; each lane
+        // fetches ONE chunk, checks it, and adopts it (CIRISEdge#739,
+        // §6.7.5). The adopt is inside the lane, not behind the loop: with it
+        // on the loop, every adopt stalled the refill, and at K = 16 the
+        // serial adopts were most of the wall clock. The lanes are futures on
+        // THIS task (never spawned). On a stop (a refusal, a fetch that did
+        // not arrive, a failed adopt) no further lane is admitted and the
+        // lanes already in flight DRAIN — each adopts what arrives verified —
+        // so everything the pull paid for is kept for the resume; the FIRST
+        // stop names the outcome. A killed pull (the task dropped) cancels
+        // every lane instead, and a chunk whose adopt had not returned is
+        // then either absent (the resume fetches it) or held at its position
+        // (the resume skips it) — never held twice, since a position holds
+        // one row.
+        let lanes = self.config.dag_chunks_in_flight.max(1);
+        let budget = self.config.dag_bytes_in_flight;
+        let overhead = AT_REST_ENVELOPE_OVERHEAD as u64;
+        let stream = view.stream_id.as_str();
+        let provenance = &provenance;
+        let engine = &self.engine;
+        let mut in_flight = FuturesUnordered::new();
+        let mut bytes_in_flight: u64 = 0;
+        let mut peak: usize = 0;
+        let mut next = wanted.into_iter().peekable();
+        let mut stop: Option<PullOutcome> = None;
+        loop {
+            while let Some(stored) = next
+                .peek()
+                .filter(|_| stop.is_none())
+                .map(|w| w.size.saturating_add(overhead))
+            {
+                if !pipeline_admits(in_flight.len(), lanes, bytes_in_flight, stored, budget) {
+                    break;
                 }
-                Err(DagFetchStop::HashMismatch { got }) => {
-                    return self.dag_refused(
-                        row,
-                        &blob_hex,
-                        DagPullRefusal::ChunkMismatch {
-                            seq: c.seq,
-                            detail: format!(
-                                "the bytes served for {} hash to {}",
-                                c.sha256_hex,
-                                hex::encode(got)
-                            ),
-                        },
-                    )
-                }
+                let Some(w) = next.next() else { break };
+                bytes_in_flight = bytes_in_flight.saturating_add(stored);
+                in_flight.push(async move {
+                    let started = Instant::now();
+                    let fetched = self.fetch_verified(fetch, w.sha).await;
+                    let fetch_wait = started.elapsed();
+                    let bytes = match fetched {
+                        Ok(b) => b,
+                        Err(stop) => return (w, fetch_wait, None, Err(LaneStop::Fetch(stop))),
+                    };
+                    // The stored body is the plaintext plus persist's
+                    // envelope — the arithmetic `declared_stored_len` uses for
+                    // a whole blob; persist's adopt checks the envelope's own
+                    // length again behind this.
+                    let expected = w.size.saturating_add(overhead);
+                    if bytes.len() as u64 != expected {
+                        let got = bytes.len();
+                        return (w, fetch_wait, None, Err(LaneStop::Length { got, expected }));
+                    }
+                    let adopting = Instant::now();
+                    let adopted = engine
+                        .adopt_sealed_chunk(
+                            stream,
+                            w.seq,
+                            &bytes,
+                            crate::group_content::persist_store::STREAM_EPOCH,
+                            w.size,
+                            provenance.clone(),
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| LaneStop::Adopt(e.to_string()));
+                    (w, fetch_wait, Some(adopting.elapsed()), adopted)
+                });
+            }
+            peak = peak.max(in_flight.len());
+            let Some((w, fetch_wait, adopt, result)) = in_flight.next().await else {
+                break;
             };
-            // The stored body is the plaintext plus persist's envelope — the
-            // arithmetic `declared_stored_len` uses for a whole blob; persist's
-            // adopt checks the envelope's own length again behind this.
-            let expected_len = u64::from(c.size) + AT_REST_ENVELOPE_OVERHEAD as u64;
-            if bytes.len() as u64 != expected_len {
-                return self.dag_refused(
+            bytes_in_flight = bytes_in_flight.saturating_sub(w.size.saturating_add(overhead));
+            metrics.add_blob_dag_phase("dag_fetch_wait", fetch_wait);
+            if let Some(adopt) = adopt {
+                metrics.add_blob_dag_phase("dag_adopt", adopt);
+            }
+            let stopped = match result {
+                Ok(()) => {
+                    metrics.add_blob_dag_chunks("adopted", 1);
+                    continue;
+                }
+                // A later lane's stop, while draining: the first stop names
+                // the outcome (and alone books its retry or its refusal).
+                Err(_) if stop.is_some() => continue,
+                Err(LaneStop::Fetch(DagFetchStop::Transport(reason))) => self.dag_fetch_failed(
+                    row,
+                    sha,
+                    attempts,
+                    &format!("chunk seq {}", w.seq),
+                    &reason,
+                ),
+                Err(LaneStop::Fetch(DagFetchStop::HashMismatch { got })) => self.dag_refused(
                     row,
                     &blob_hex,
                     DagPullRefusal::ChunkMismatch {
-                        seq: c.seq,
+                        seq: w.seq,
                         detail: format!(
-                            "{} bytes arrived but the manifest's size {} implies {expected_len}",
-                            bytes.len(),
-                            c.size
+                            "the bytes served for {} hash to {}",
+                            hex::encode(w.sha),
+                            hex::encode(got)
                         ),
                     },
-                );
-            }
-            if let Err(e) = self
-                .engine
-                .adopt_sealed_chunk(
-                    &view.stream_id,
-                    c.seq,
-                    &bytes,
-                    crate::group_content::persist_store::STREAM_EPOCH,
-                    u64::from(c.size),
-                    provenance.clone(),
-                )
-                .await
-            {
-                return PullOutcome::StoreFailed(format!("adopt chunk seq {}: {e}", c.seq));
-            }
+                ),
+                Err(LaneStop::Length { got, expected }) => self.dag_refused(
+                    row,
+                    &blob_hex,
+                    DagPullRefusal::ChunkMismatch {
+                        seq: w.seq,
+                        detail: format!(
+                            "{got} bytes arrived but the manifest's size {} implies {expected}",
+                            w.size
+                        ),
+                    },
+                ),
+                Err(LaneStop::Adopt(e)) => {
+                    PullOutcome::StoreFailed(format!("adopt chunk seq {}: {e}", w.seq))
+                }
+            };
+            stop = Some(stopped);
+        }
+        metrics.max_blob_dag_chunks("in_flight_peak", peak as u64);
+        drop(in_flight);
+        if let Some(outcome) = stop {
+            return outcome;
         }
 
         // ── promoted ── persist checks every chunk row against the manifest.
-        match self
+        let promoting = Instant::now();
+        let promoted = self
             .engine
             .promote_adopted_manifest_to_dag(&sha, &self.local_key_id, Some(&aad))
-            .await
-        {
+            .await;
+        metrics.add_blob_dag_phase("dag_promote", promoting.elapsed());
+        match promoted {
             Ok(promotion) => {
                 tracing::info!(
                     blob = %blob_hex,
@@ -2007,6 +2296,33 @@ where
 mod tests {
     use super::super::meaning::fixture::{bare_row, content_row};
     use super::*;
+
+    /// CIRISEdge#739 — the pipeline's admission rule (§6.7.5): `K` bounds
+    /// the requests, the byte budget bounds the memory, and an empty
+    /// pipeline always admits one so a budget below one chunk degrades to
+    /// `K = 1` rather than to a stall.
+    #[test]
+    fn the_pipeline_admits_by_lanes_and_by_bytes_and_never_stalls() {
+        let chunk = 256 * 1024 + 44;
+        // Lanes: K = 4 admits the fourth, refuses the fifth.
+        assert!(pipeline_admits(3, 4, 3 * chunk, chunk, u64::MAX));
+        assert!(!pipeline_admits(4, 4, 4 * chunk, chunk, u64::MAX));
+        // Bytes: a budget of two chunks admits the second, refuses the third,
+        // whatever K says.
+        assert!(pipeline_admits(1, 16, chunk, chunk, 2 * chunk));
+        assert!(!pipeline_admits(2, 16, 2 * chunk, chunk, 2 * chunk));
+        // Never a stall: an empty pipeline admits a chunk larger than the
+        // whole budget, and K = 0 behaves as K = 1.
+        assert!(pipeline_admits(0, 16, 0, 10 * chunk, chunk));
+        assert!(pipeline_admits(0, 0, 0, chunk, 0));
+        assert!(!pipeline_admits(1, 0, chunk, chunk, u64::MAX));
+        // The defaults hold `K` of the largest chunk persist admits.
+        assert_eq!(
+            DEFAULT_DAG_BYTES_IN_FLIGHT,
+            DEFAULT_DAG_CHUNKS_IN_FLIGHT as u64
+                * ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP as u64
+        );
+    }
 
     const SHA: [u8; 32] = [0xAB; 32];
 
