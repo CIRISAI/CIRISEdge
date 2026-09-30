@@ -900,6 +900,21 @@ Witnesses (`tests/blob_federation_e2e.rs`): `a_plaintext_chunk_dag_pulls_through
 chunk → refused at `seq 1` with chunk 0 kept; honest → resumed, promoted, `FileRow::open` at full
 size), `a_dag_manifest_over_the_caps_or_off_its_pointer_is_refused_before_a_chunk_moves`.
 
+**The community row** (CIRISEdge#735, lane 2 of #734; witness
+`a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek`, three members on three
+substrates plus a non-member, 1,300,000 bytes at `community_dek`). What differs from the two tiers
+above, each asserted from the receiving side:
+
+| axis | `community_dek` | witnessed |
+|---|---|---|
+| **key** | ONE `key_grant` set per `(community, epoch)` — every chunk and the manifest are sealed under the epoch's DEK and the cascade wraps that DEK once per member occurrence (the self tier emits a set per blob: six for the same file). The set names the members' nodes and no non-member's; a non-member admits the carrier and can unwrap nothing | B and C apply A's e0 set; D's occurrence is in no wrap |
+| **pointer** | carries `epoch: Some(e0)` (CIRISEdge#601); the adopt binds the manifest and every chunk to THAT epoch, never to the room's current one. A pointer at this tier naming no epoch is `NoEpoch` before any fetch, counted **`no_epoch`** (CIRISEdge#735: before that cut the one community-tier refusal the pull could reach was the one it did not count) | a pre-#601 pointer over the same bytes → `NoEpoch`, `no_epoch = 1` |
+| **holder to holder** | B pulls from A, promotes, and its own `holds_bytes` on the DAG root is federation-tier and hybrid-signed — C admits it through `apply_replicated_attestation` and discovers B by `list_holders`. C's reach is B alone; every address C holds was served by B and none by A | `servers()` of C's fetcher = `[B, B, B, B]` |
+| **announce** | persist's `adopt_sealed_blob(Announce)` emits the claim when the MANIFEST is adopted, ahead of promotion (the plaintext door announces after every chunk). A RESUME skips that adopt, so `Stored { announced }` now reads the claim off the index (`list_holders` ∋ self) instead of reporting `false` for a door not called — on the base the resumed community pull denied the claim it had made. That a manifest-only holder is discoverable before it holds a chunk is persist's door shape (CIRISPersist#951 asks for the claim at promotion); a puller that reaches one gets `NotHeld` per chunk and walks on (CC 5.3.2.1) | C's tampered attempt announces; the resume reports `announced: true` |
+| **tampered chunk** | refused `ChunkMismatch { seq }` by name, counted `dag_chunk_mismatch`, the earlier chunk kept; the next offer resumes. Rotation to another holder on a dishonest body is the swarm session's (`SwarmConfig::dishonest_strike_limit`, `blob_swarm::tests`), not the walk's: a caller's `DagByteFetch` is one session | B serves a flipped chunk 1 → `seq: 1`, positions `[0]`, then resumed from B |
+| **non-member** | refused at the store gate (`Refused("axis …")`) before the first fetch; holds nothing, claims nothing. The serve side is the scope gate — a non-member derives no room address and holds no discriminator (`tests/scoped_body_identity_link_718.rs`); persist's `serve_blob_to_peer` ignores the requester | D: no fetch, no blob, no claim |
+| **rotated epoch** | erin's removal rotates the DEK (AV-70, one write through `community_roster`); D is widened in and A seals at `e1 > e0`. D opens e1 content and its pull of the e0 file parks **`DagAwaitingKey`** — the manifest adopted at e0, `inline`, `FileRow::open` → `NotGranted`, no `dag_*` refusal — while C, granted at e0, still reads it (once shared, always shared). Edge cannot tell "never granted" from "not yet granted" (persist I61/I62 order independence), so this is a named wait, not a refusal; the retry ceiling ends it | D: `DagAwaitingKey`, `NotGranted`; C: byte-identical after the rotation |
+
 #### 6.7.2 Rename — a new row over the same bytes (CIRISEdge#702, the server's ask)
 
 A rename changes what a file is *called*, never what it *is*. So it writes **no byte**: the new row
@@ -1196,6 +1211,15 @@ template: it is green because each rung has a witness, not because a run passed.
 
 ## 13. Changelog
 
+- **2026-09-29 (CIRISEdge#735, lane 2 of #734 — the community chunk DAG, holder to holder).** §6.7
+  gains the `community_dek` row: one `key_grant` set per epoch, the pointer's epoch binds the adopt,
+  B's `holds_bytes` on the DAG root is what C discovers and fetches from, the four negatives by
+  name. Two things the witness proved missing, fixed in `pull.rs`: `NoEpoch` is counted
+  (`no_epoch`), and a RESUMED sealed pull reports `announced` from the claim index instead of
+  denying the claim the first attempt emitted. Judgement recorded: persist announces a sealed DAG at
+  the manifest adopt, ahead of promotion — the plaintext door announces after every chunk — so a
+  manifest-only holder is discoverable; the puller's `NotHeld` walk-on covers it and the door shape
+  is persist's to move (CIRISPersist#951).
 - **2026-09-29 (CIRISEdge#718 — CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132 ruled (a)).** Rung
   **R5′** added: a scoped body rides the members' end-to-end encrypted identity-plane link when the
   only path to the holder runs through a non-member transport node, the room discriminated inside
