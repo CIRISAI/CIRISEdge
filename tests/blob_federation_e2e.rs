@@ -5820,3 +5820,772 @@ mod files {
         }
     }
 }
+
+// ─── CIRISEdge#735: the community chunk DAG, holder to holder ────────────
+
+/// CIRISEdge#735 — a [`ciris_edge::blob_swarm::DagByteFetch`] over the peers
+/// this node can REACH, walked in holder order the way the swarm session
+/// walks its holders: a holder with no route is passed over, a holder that
+/// answers `NotHeld` is passed over, the first body wins. It records which
+/// holder served each address, so a witness can say WHO the bytes came
+/// from rather than only that they arrived. `tamper` flips the last byte of
+/// the body served at that address — a dishonest holder, which the fetcher
+/// cannot detect (the puller's belt does).
+struct MeshFetch {
+    requester: String,
+    holders: Vec<String>,
+    reach: Vec<(String, ciris_persist::Engine)>,
+    tamper: Option<[u8; 32]>,
+    served_by: std::sync::Mutex<Vec<([u8; 32], String)>>,
+}
+
+impl MeshFetch {
+    fn new(requester: &str, holders: Vec<String>, reach: &[&Node]) -> Self {
+        Self {
+            requester: requester.to_owned(),
+            holders,
+            reach: reach
+                .iter()
+                .map(|n| (n.me.clone(), n.store.engine().clone()))
+                .collect(),
+            tamper: None,
+            served_by: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn tampering(mut self, sha: [u8; 32]) -> Self {
+        self.tamper = Some(sha);
+        self
+    }
+
+    /// The holders that served, one per address fetched, in order.
+    fn servers(&self) -> Vec<String> {
+        self.served_by
+            .lock()
+            .expect("served_by")
+            .iter()
+            .map(|(_, h)| h.clone())
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl ciris_edge::blob_swarm::DagByteFetch for MeshFetch {
+    fn holders(&self) -> &[String] {
+        &self.holders
+    }
+
+    async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String> {
+        use ciris_persist::federation::blobs::BlobBody;
+        let mut misses = Vec::new();
+        for holder in &self.holders {
+            let Some((_, engine)) = self.reach.iter().find(|(k, _)| k == holder) else {
+                misses.push(format!("{holder}: no route"));
+                continue;
+            };
+            match engine.serve_blob_to_peer(&sha, &self.requester).await {
+                Ok(BlobBody::Inline(mut bytes)) => {
+                    if self.tamper == Some(sha) {
+                        if let Some(last) = bytes.last_mut() {
+                            *last ^= 0x01;
+                        }
+                    }
+                    self.served_by
+                        .lock()
+                        .expect("served_by")
+                        .push((sha, holder.clone()));
+                    return Ok(bytes);
+                }
+                Ok(other) => misses.push(format!("{holder}: not inline ({other:?})")),
+                Err(e) => misses.push(format!("{holder}: {e}")),
+            }
+        }
+        Err(format!(
+            "no reachable holder served {}: {misses:?}",
+            hex::encode(sha)
+        ))
+    }
+}
+
+/// A node's own `holds_bytes` rows naming `sha`.
+async fn own_holder_claims(
+    node: &Node,
+    sha: &[u8; 32],
+) -> Vec<ciris_persist::federation::Attestation> {
+    let hex_sha = hex::encode(sha);
+    rows_of(node, "holds_bytes:")
+        .await
+        .into_iter()
+        .map(|b| serde_json::from_slice::<ciris_persist::federation::Attestation>(&b).expect("row"))
+        .filter(|a| {
+            a.attesting_key_id == node.me
+                && a.attestation_envelope["evidence_refs"]
+                    .as_array()
+                    .is_some_and(|refs| refs.iter().any(|r| r.as_str() == Some(&hex_sha)))
+        })
+        .collect()
+}
+
+/// **CIRISEdge#735 — a community chunk DAG is pulled holder to holder under
+/// the room's DEK: A → B → C, with the negatives each refused by name.**
+///
+/// Three members of one room on three substrates — alice (A), bob (B),
+/// carol (C) — plus dave (D), who is not a member, and erin, a member with no
+/// node who is later removed so the room's epoch rotates. Every directory
+/// holds the roster and every member node the others' occurrences and owner
+/// bindings (the identity plane). The community route does not run over the
+/// in-process wire (no scope table on a legacy node — the #616/#499 pins), so
+/// each walk is `pull_dag_with` over [`MeshFetch`], whose REACH is the
+/// topology: B reaches A; C reaches B and never A; D reaches B. Every persist
+/// door on the receiving side is the production one.
+///
+/// 1. A publishes a 1,300,000-byte file through the file door into the
+///    community room: five 256 KiB chunks and a manifest, each its own
+///    at-rest envelope under the room's epoch-`e0` DEK; the pointer carries
+///    `epoch: Some(e0)` (CIRISEdge#601) and `stream_id`. The row, A's
+///    `key_grant` sets and A's `holds_bytes` cross to B and C.
+/// 2. B pulls from A: manifest → opened as B → chunks → promoted;
+///    `storage_kind = chunk_dag`, byte-identical, B's own `holds_bytes`
+///    names the DAG root and is admitted on C through the gated door.
+/// 3. C discovers B through `list_holders`, is refused a tampered chunk 1
+///    from B `ChunkMismatch { seq: 1 }` (counted `dag_chunk_mismatch`,
+///    chunk 0 kept), then RESUMES from B honest and reads byte-identical;
+///    every address C fetched was served by B, none by A.
+/// 4. A pointer at `community_dek` naming no epoch (a pre-#601 row) is
+///    `NoEpoch`, counted `no_epoch` — the counter this cut adds.
+/// 5. D, not a member, is refused at the store gate before a byte moves,
+///    holds nothing, claims nothing, and A's sets wrap nothing to D.
+/// 6. erin is removed (the room's DEK rotates — AV-70, one write), D is
+///    widened in, A seals again at `e1 > e0`: D opens the new body (it holds
+///    the new DEK) and its pull of the OLD file parks `DagAwaitingKey` — the
+///    manifest binds to the POINTER's epoch `e0`, which D was never granted;
+///    C, granted at `e0`, still reads it after the rotation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // the whole ladder across three holders, in order, on purpose
+async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() {
+    use ciris_edge::blob_swarm::{BlobPuller, DagPullRefusal, PullConfig, PullOutcome};
+    use ciris_edge::chat::UnopenedReason;
+    use ciris_edge::files::FileRow;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::key_grant::{
+        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
+    };
+    use ciris_persist::federation::types::cohort_scope::CryptoTier;
+    use ciris_persist::federation::{FederationDirectory, SignedAttestation};
+    const ROOM: &str = "room-735";
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let carol = Ident::new("carol-fed", 0x44);
+    let dave = Ident::new("dave-fed", 0x66);
+    let erin = Ident::new("erin-fed", 0x77);
+    // persist's revocation table keys the room onto `federation_keys`
+    // (`community_roster::revoke_community_member`), so the room id is
+    // registered as a key the way persist's own fixtures do it.
+    let room_key = Ident::new(ROOM, 0x99);
+    let idents = [&alice, &bob, &carol, &dave, &erin, &room_key];
+    let node_a = node(&idents, &alice).await;
+    let node_b = node(&idents, &bob).await;
+    let node_c = node(&idents, &carol).await;
+    let node_d = node(&idents, &dave).await;
+    let members = [&alice, &bob, &carol, &erin];
+    for n in [&node_a, &node_b, &node_c, &node_d] {
+        seed_room(n, ROOM, &members).await;
+    }
+    // The identity plane: every node knows every other's occurrence and
+    // owner binding (what the mesh's IdentityOccurrence plane carries).
+    let nodes = [&node_a, &node_b, &node_c, &node_d];
+    for from in nodes {
+        for to in nodes {
+            if !std::ptr::eq(from, to) {
+                federate(from, to).await;
+            }
+        }
+    }
+    let (wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (wire_c, wire_d) = wire(&node_c.me, &node_d.me);
+    let (_edge_a, _stop_a) = spawn_edge(&node_a, wire_a).await;
+    let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
+    let (edge_c, _stop_c) = spawn_edge(&node_c, wire_c).await;
+    let (edge_d, _stop_d) = spawn_edge(&node_d, wire_d).await;
+    let puller_for = |edge: &Arc<ciris_edge::Edge>, n: &Node| {
+        BlobPuller::new(
+            Arc::clone(edge),
+            n.store.engine().clone(),
+            n.dir.clone(),
+            n.dir.clone() as Arc<dyn FederationDirectory>,
+            n.me.clone(),
+            PullConfig::default(),
+        )
+    };
+    let puller_b = puller_for(&edge_b, &node_b);
+    let puller_c = puller_for(&edge_c, &node_c);
+    let puller_d = puller_for(&edge_d, &node_d);
+    let refusals = |edge: &Arc<ciris_edge::Edge>| edge.metrics().snapshot().blob_pull_refusals;
+    let holders_on = |n: &Node, sha: [u8; 32]| {
+        let dir = n.dir.clone();
+        let me = n.me.clone();
+        async move {
+            let mut h: Vec<String> = dir
+                .list_holders(&sha)
+                .await
+                .expect("list_holders")
+                .into_iter()
+                .filter(|k| *k != me)
+                .collect();
+            h.sort();
+            h
+        }
+    };
+
+    // ── 1. A publishes into the room: a DAG under the epoch-e0 DEK. ──
+    let file_len = 1_300_000usize;
+    let plain = body_of(file_len, 0x735);
+    let room = ciris_edge::scope_room::ScopeRoom::community(ROOM);
+    let published = ciris_edge::files::publish(
+        &*node_a.dir,
+        &node_a.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &ciris_edge::files::FileWrite {
+            room: &room,
+            bytes: &plain,
+            media_type: "video/mp4",
+            codec: None,
+            filename: Some("release.mp4"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("publish a chunked file into the community room");
+    assert_eq!(
+        published.tier,
+        CryptoTier::CommunityDek,
+        "a room seals under its DEK"
+    );
+    let e0 = published
+        .pointer
+        .epoch
+        .expect("a community_dek pointer carries its sealed-under epoch (CIRISEdge#601)");
+    let stream_id = published
+        .pointer
+        .stream_id
+        .clone()
+        .expect("over the inline bound: a chunk DAG");
+    assert_eq!(published.pointer.size, Some(file_len as u64));
+    let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let crossed_id = match &published.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!("the community file must cross: {other:?}")
+        }
+    };
+    let row = node_a
+        .dir
+        .get_attestation(&crossed_id)
+        .await
+        .expect("read")
+        .expect("the crossed row");
+    assert_eq!(
+        row.cohort_scope,
+        ciris_persist::federation::types::cohort_scope::COMMUNITY
+    );
+    for n in [&node_b, &node_c, &node_d] {
+        n.dir
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .expect("a member's node admits the crossed row");
+    }
+    let aad = ciris_edge::group_content::content_aad(
+        &row.attesting_key_id,
+        row.asserted_at,
+        published.pointer.content_field,
+    );
+    let view_a = node_a
+        .store
+        .engine()
+        .open_sealed_manifest_as(&sha, &node_a.me, Some(&aad))
+        .await
+        .expect("A opens its own manifest");
+    assert_eq!(view_a.chunks.len(), 5, "4 × 256 KiB + 251,424 bytes");
+    let chunk1: [u8; 32] = hex::decode(&view_a.chunks[1].sha256_hex)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+
+    // The KEY crosses to the members (a set per chunk and the manifest) —
+    // to B and C through the key-grant door; D is not a member and gets
+    // nothing from A's cascade (asserted at step 5).
+    node_a
+        .store
+        .engine()
+        .emit_pending_key_grants()
+        .await
+        .expect("A emits");
+    let sets_of = |n: &Node| {
+        let dir = n.dir.clone();
+        async move {
+            dir.list_attestations_since(None, 500)
+                .await
+                .expect("list rows")
+                .into_iter()
+                .filter(|a| {
+                    a.attestation
+                        .attestation_type
+                        .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+                })
+                .map(|a| a.attestation)
+                .collect::<Vec<_>>()
+        }
+    };
+    let sets_a = sets_of(&node_a).await;
+    // ONE set: at `community_dek` every chunk and the manifest are sealed
+    // under the epoch's DEK, and the cascade wraps that DEK once per
+    // occurrence — unlike `invisible_encrypted`, where each blob has its own
+    // key and its own set (the self witness sees six).
+    assert!(
+        !sets_a.is_empty(),
+        "A's seal emitted the room's epoch-e0 key_grant set"
+    );
+    for n in [&node_b, &node_c] {
+        let mut wraps = 0;
+        for s in &sets_a {
+            wraps += n
+                .store
+                .engine()
+                .apply_replicated_key_grant(SignedKeyGrantSet {
+                    attestation: s.clone(),
+                })
+                .await
+                .expect("a member applies A's set")
+                .wraps_written;
+        }
+        assert!(
+            wraps >= 1,
+            "{} holds its own private half: {wraps} wraps",
+            n.me
+        );
+    }
+    // A's holder claims cross as rows do — to both B and C. C's TRANSPORT
+    // reach is the topology; the claim plane is not.
+    admit_holder_claims(&node_a, &node_b).await;
+    admit_holder_claims(&node_a, &node_c).await;
+    assert_eq!(holders_on(&node_b, sha).await, vec![node_a.me.clone()]);
+
+    // ── 2. B pulls from A and becomes a holder. ──
+    let fetch_b = MeshFetch::new(&node_b.me, holders_on(&node_b, sha).await, &[&node_a]);
+    assert_eq!(
+        puller_b.pull_dag_with(&row, sha, &fetch_b).await,
+        PullOutcome::Stored { announced: true },
+        "B stores and announces the room's DAG: refusals {:?}",
+        refusals(&edge_b)
+    );
+    assert_eq!(
+        node_b
+            .dir
+            .blob_head(&sha)
+            .await
+            .expect("blob_head")
+            .expect("held")
+            .storage_kind,
+        "chunk_dag",
+        "promoted on B"
+    );
+    let file = FileRow::from_row(&row).expect("a file row");
+    let got_b = file
+        .open(&node_b.store, &node_b.me)
+        .await
+        .expect("bob opens the file alice published");
+    assert_eq!(got_b.len(), file_len);
+    assert!(got_b == plain, "byte-identical on B");
+    assert!(
+        fetch_b.servers().iter().all(|h| *h == node_a.me),
+        "B fetched every address from A: {:?}",
+        fetch_b.servers()
+    );
+    let claims_b = own_holder_claims(&node_b, &sha).await;
+    assert_eq!(
+        claims_b.len(),
+        1,
+        "B's own holds_bytes names the DAG root exactly once: {claims_b:?}"
+    );
+    assert_eq!(claims_b[0].attesting_key_id, node_b.me, "the claim names B");
+    assert!(
+        node_b
+            .dir
+            .list_holders(&sha)
+            .await
+            .expect("list_holders")
+            .contains(&node_b.me),
+        "B is a holder in its own index"
+    );
+    // B's claim reaches C through the GATED door — the claim is
+    // federation-tier and hybrid-signed, so a peer admits it.
+    node_c
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: claims_b[0].clone(),
+        })
+        .await
+        .expect("C admits B's holder claim through the replication door");
+    let mut expect_holders_c = vec![node_a.me.clone(), node_b.me.clone()];
+    expect_holders_c.sort();
+    assert_eq!(
+        holders_on(&node_c, sha).await,
+        expect_holders_c,
+        "C discovers B (and A) through holds_bytes"
+    );
+
+    // ── 3. C pulls FROM B: a tampered chunk first, then the honest resume. ──
+    let fetch_c_tampered =
+        MeshFetch::new(&node_c.me, holders_on(&node_c, sha).await, &[&node_b]).tampering(chunk1);
+    match puller_c.pull_dag_with(&row, sha, &fetch_c_tampered).await {
+        PullOutcome::DagRefused(DagPullRefusal::ChunkMismatch { seq: 1, .. }) => {}
+        other => panic!("a tampered chunk 1 from B is refused at its position: {other:?}"),
+    }
+    assert_eq!(
+        refusals(&edge_c).get("dag_chunk_mismatch").copied(),
+        Some(1),
+        "counted by name on C"
+    );
+    let positions: Vec<u64> = node_c
+        .dir
+        .stream_chunks(&stream_id)
+        .await
+        .expect("stream_chunks")
+        .chunks
+        .iter()
+        .map(|c| c.seq)
+        .collect();
+    assert_eq!(
+        positions,
+        vec![0],
+        "chunk 0 kept, chunk 1 refused, nothing after"
+    );
+    assert_eq!(
+        node_c
+            .dir
+            .blob_head(&sha)
+            .await
+            .expect("blob_head")
+            .expect("manifest held")
+            .storage_kind,
+        "inline",
+        "not promoted"
+    );
+    assert!(
+        fetch_c_tampered.servers().iter().all(|h| *h == node_b.me),
+        "C reached only B: {:?}",
+        fetch_c_tampered.servers()
+    );
+
+    let fetch_c = MeshFetch::new(&node_c.me, holders_on(&node_c, sha).await, &[&node_b]);
+    assert_eq!(
+        puller_c.pull_dag_with(&row, sha, &fetch_c).await,
+        PullOutcome::Stored { announced: true },
+        "C resumes from B and stores: refusals {:?}",
+        refusals(&edge_c)
+    );
+    assert_eq!(
+        node_c
+            .dir
+            .blob_head(&sha)
+            .await
+            .expect("blob_head")
+            .expect("held")
+            .storage_kind,
+        "chunk_dag",
+        "promoted on C"
+    );
+    let got_c = file
+        .open(&node_c.store, &node_c.me)
+        .await
+        .expect("carol opens the file, fetched from bob");
+    assert_eq!(got_c.len(), file_len);
+    assert!(got_c == plain, "byte-identical on C");
+    let servers_c = fetch_c.servers();
+    assert_eq!(
+        servers_c.len(),
+        4,
+        "the resume fetched chunks 1–4 only (manifest and chunk 0 were held): {servers_c:?}"
+    );
+    assert!(
+        servers_c.iter().all(|h| *h == node_b.me),
+        "every byte C holds came from B — never from A, which C cannot reach"
+    );
+    let claims_c = own_holder_claims(&node_c, &sha).await;
+    assert_eq!(
+        claims_c.len(),
+        1,
+        "C announces the DAG root once: {claims_c:?}"
+    );
+    assert_eq!(
+        puller_c.pull_dag_with(&row, sha, &fetch_c).await,
+        PullOutcome::AlreadyHeld,
+        "held is held"
+    );
+    assert_eq!(
+        puller_c.pull_one(&row, sha, 0).await,
+        PullOutcome::AlreadyHeld,
+        "the production path offers nothing past the head"
+    );
+
+    // ── 4. A community_dek pointer naming NO epoch: NoEpoch, counted. ──
+    let mut legacy = published.pointer.clone();
+    legacy.epoch = None;
+    let legacy_row = federation_content_row(&node_a.signer, ROOM, &legacy, ts()).await;
+    assert_eq!(
+        puller_c.pull_dag_with(&legacy_row, sha, &fetch_c).await,
+        PullOutcome::NoEpoch,
+        "a pointer with no sealed-under epoch is refused by name (CIRISEdge#601)"
+    );
+    assert_eq!(
+        refusals(&edge_c).get("no_epoch").copied(),
+        Some(1),
+        "NoEpoch is counted under blob_pull_refusals like every other named refusal \
+         (CIRISEdge#735): {:?}",
+        refusals(&edge_c)
+    );
+
+    // ── 5. D is not a member: refused at the gate, before a byte moves. ──
+    let fetch_d = MeshFetch::new(&node_d.me, vec![node_b.me.clone()], &[&node_b]);
+    match puller_d.pull_dag_with(&row, sha, &fetch_d).await {
+        PullOutcome::Refused(reason) => {
+            assert!(
+                reason.contains("axis"),
+                "the store gate names its axis: {reason}"
+            );
+        }
+        other => panic!("a non-member's pull is refused at the store gate: {other:?}"),
+    }
+    assert!(fetch_d.servers().is_empty(), "nothing was fetched for D");
+    assert!(
+        !node_d.dir.has_blob(&sha).await.expect("has_blob"),
+        "D holds nothing"
+    );
+    assert!(
+        own_holder_claims(&node_d, &sha).await.is_empty(),
+        "D claims nothing"
+    );
+    // A's e0 set names no occurrence of D: the cascade enumerated the
+    // room's members. (D still admits and stores the carrier — a wrap is
+    // ciphertext addressed to someone else, and `wraps_written` counts rows
+    // inserted, not rows this node can unwrap.)
+    let recipients_of = |set: &ciris_persist::federation::Attestation| {
+        ciris_persist::federation::key_grant::KeyGrantSet::from_attestation(set)
+            .expect("persist reads its own set back")
+            .wraps
+            .into_iter()
+            .map(|w| w.recipient_key_id)
+            .collect::<Vec<_>>()
+    };
+    for s in &sets_a {
+        let recipients = recipients_of(s);
+        assert!(
+            recipients.contains(&node_b.me) && recipients.contains(&node_c.me),
+            "the e0 set wraps to the members' nodes: {recipients:?}"
+        );
+        assert!(
+            !recipients.contains(&node_d.me),
+            "A's cascade wrapped nothing to a non-member's occurrence: {recipients:?}"
+        );
+        node_d
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantSet {
+                attestation: s.clone(),
+            })
+            .await
+            .expect("D admits the carrier row and can unwrap none of it");
+    }
+
+    // ── 6. The epoch rotates; a member granted only at e1 cannot read e0. ──
+    let alice_signer = edge_signer_for(&alice);
+    let now = chrono::Utc::now();
+    let removal = ciris_edge::community_roster::community_membership_revocation(
+        ROOM,
+        &erin.key_id,
+        now,
+        None,
+        &[],
+        &alice_signer,
+    )
+    .await
+    .expect("the founder signs erin's removal");
+    for n in nodes {
+        n.dir
+            .put_community_membership_revocation(removal.clone())
+            .await
+            .expect("every directory folds the removal — the room's DEK rotates (AV-70)");
+    }
+    let (member_d, spec_d) = ciris_edge::community_roster::community_membership_widening(
+        &*node_a.dir,
+        ROOM,
+        &dave.key_id,
+        None,
+        now,
+        &alice_signer,
+    )
+    .await
+    .expect("the founder signs dave's widening");
+    for n in nodes {
+        n.dir
+            .add_community_member(ROOM, member_d.clone(), &spec_d)
+            .await
+            .expect("every directory folds the widening");
+    }
+    let post = node_a
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(ROOM),
+            author_key_id: &node_a.me,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: b"sealed after the rotation",
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
+        })
+        .await
+        .expect("A seals after the rotation");
+    let e1 = post.epoch.expect("epoch-bearing");
+    assert!(e1 > e0, "the removal rotated the room's epoch: {e0} → {e1}");
+    node_a
+        .store
+        .engine()
+        .emit_pending_key_grants()
+        .await
+        .expect("A emits");
+    let mut wrapped_to_d = Vec::new();
+    for s in sets_of(&node_a).await {
+        if recipients_of(&s).contains(&node_d.me) {
+            wrapped_to_d.push(s.attestation_type.clone());
+        }
+        node_d
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantSet { attestation: s })
+            .await
+            .expect("D applies A's sets");
+    }
+    assert_eq!(
+        wrapped_to_d.len(),
+        1,
+        "exactly one set wraps to D — the e1 set, minted after it joined: {wrapped_to_d:?}"
+    );
+    // Positive control: D reads what was sealed after it joined. The bytes
+    // cross as the whole-blob path carries them.
+    {
+        use ciris_persist::federation::blobs::BlobBody;
+        use ciris_persist::federation::{AdoptDisposition, BlobProvenance};
+        let post_sha: [u8; 32] = hex::decode(&post.pointer.content_sha256)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes");
+        let BlobBody::Inline(envelope) = node_a
+            .store
+            .engine()
+            .serve_blob_to_peer(&post_sha, &node_d.me)
+            .await
+            .expect("A serves")
+        else {
+            panic!("inline")
+        };
+        let post_aad = ciris_edge::group_content::aad_for_open(&OpenRequest {
+            pointer: &post.pointer,
+            author_key_id: &node_a.me,
+            asserted_at: ts(),
+            viewer_key_id: &node_d.me,
+        });
+        node_d
+            .store
+            .engine()
+            .adopt_sealed_blob(
+                &envelope,
+                BlobProvenance {
+                    author_key_id: node_a.me.clone(),
+                    cohort_scope: "community".to_owned(),
+                    community_key_id: Some(ROOM.to_owned()),
+                    epoch: post.epoch,
+                    tier: post.tier,
+                    minter_key_id: Some(node_a.me.clone()),
+                },
+                Some(&post_aad),
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("D adopts the e1 body");
+        let opened = node_d
+            .store
+            .open(OpenRequest {
+                pointer: &post.pointer,
+                author_key_id: &node_a.me,
+                asserted_at: ts(),
+                viewer_key_id: &node_d.me,
+            })
+            .await
+            .expect("D, a member since the rotation, opens e1 content");
+        assert_eq!(opened, b"sealed after the rotation");
+    }
+    // The old file: D is a member now, so the gate admits the pull; the
+    // manifest binds to the POINTER's epoch e0, which D was never granted.
+    node_d
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: claims_b[0].clone(),
+        })
+        .await
+        .expect("D admits B's holder claim");
+    let fetch_d = MeshFetch::new(&node_d.me, holders_on(&node_d, sha).await, &[&node_b]);
+    match puller_d.pull_dag_with(&row, sha, &fetch_d).await {
+        PullOutcome::DagAwaitingKey { .. } => {}
+        other => panic!(
+            "a reader holding only the rotated epoch's DEK parks by name on the pointer's \
+             epoch — the manifest is held, nothing decrypts, nothing is promoted: {other:?}"
+        ),
+    }
+    assert_eq!(
+        node_d
+            .dir
+            .blob_head(&sha)
+            .await
+            .expect("blob_head")
+            .expect("manifest held")
+            .storage_kind,
+        "inline",
+        "the manifest is adopted at e0 and not promoted"
+    );
+    assert!(
+        matches!(
+            file.open(&node_d.store, &node_d.me).await,
+            Err(UnopenedReason::NotGranted { .. })
+        ),
+        "D reads NotGranted on the e0 file: the epoch-bearing pointer, not the current \
+         epoch, is what the bytes are bound to"
+    );
+    assert!(
+        !refusals(&edge_d).keys().any(|k| k.starts_with("dag_")),
+        "a missing key is a wait, never a DAG refusal: {:?}",
+        refusals(&edge_d)
+    );
+    // And a member granted at e0 keeps reading it after the rotation
+    // (AV-70: once shared, always shared).
+    let still = file
+        .open(&node_c.store, &node_c.me)
+        .await
+        .expect("carol still opens the e0 file after the rotation");
+    assert!(still == plain, "byte-identical on C after the rotation");
+}

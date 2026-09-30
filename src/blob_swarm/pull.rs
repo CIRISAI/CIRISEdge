@@ -267,11 +267,22 @@ pub enum PullOutcome {
 }
 
 /// A `CommunityDek` pointer with no sealed-under epoch cannot be adopted,
-/// so it is not worth a fetch (CIRISEdge#601).
-fn epoch_refusal(row: &Attestation, blob_hex: &str, meaning: &BlobMeaning) -> Option<PullOutcome> {
+/// so it is not worth a fetch (CIRISEdge#601). Counted under
+/// [`PULL_REFUSAL_NO_EPOCH`] like every other named refusal (CIRISEdge#735):
+/// before, the only community-tier refusal the pull could reach was the one
+/// it did not count.
+fn epoch_refusal(
+    row: &Attestation,
+    blob_hex: &str,
+    meaning: &BlobMeaning,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+) -> Option<PullOutcome> {
     let pointer = meaning.pointer()?;
     if pointer.tier != CryptoTier::CommunityDek || pointer.epoch.is_some() {
         return None;
+    }
+    if let Some(m) = metrics {
+        m.inc_blob_pull_refusal(PULL_REFUSAL_NO_EPOCH);
     }
     tracing::warn!(
         blob = %blob_hex,
@@ -285,6 +296,9 @@ fn epoch_refusal(row: &Attestation, blob_hex: &str, meaning: &BlobMeaning) -> Op
 
 /// The `blob_pull_refusals` tag for [`PullOutcome::SizeMismatch`].
 pub const PULL_REFUSAL_SIZE_MISMATCH: &str = "size_mismatch";
+/// The `blob_pull_refusals` tag for [`PullOutcome::NoEpoch`] (CIRISEdge#601 /
+/// #735): a `community_dek` pointer naming no sealed-under epoch.
+pub const PULL_REFUSAL_NO_EPOCH: &str = "no_epoch";
 /// The `blob_pull_refusals` tag for [`DagPullRefusal::ManifestMismatch`].
 pub const PULL_REFUSAL_DAG_MANIFEST_MISMATCH: &str = "dag_manifest_mismatch";
 /// The `blob_pull_refusals` tag for [`DagPullRefusal::TotalSizeMismatch`].
@@ -1115,7 +1129,7 @@ where
         // The binding the adopt door will need, decided BEFORE any request:
         // a row that cannot be adopted is not worth a fetch.
         let tier = meaning.pointer().map_or(CryptoTier::Plaintext, |p| p.tier);
-        if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning) {
+        if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning, Some(&self.edge.metrics())) {
             return refused;
         }
 
@@ -1350,7 +1364,7 @@ where
         let Some(stream_id) = pointer.stream_id.as_deref() else {
             return PullOutcome::Refused("the pointer names no stream_id".into());
         };
-        if let Some(refused) = epoch_refusal(row, &blob_hex, meaning) {
+        if let Some(refused) = epoch_refusal(row, &blob_hex, meaning, Some(&self.edge.metrics())) {
             return refused;
         }
         // MAY — the gate, asked of the FETCHER's holders before a byte moves
@@ -1481,12 +1495,24 @@ where
         };
 
         // ── manifest ── held from an earlier attempt, or fetched now.
-        let mut announced = false;
+        let announced;
         let held = match self.backend.has_blob(&sha).await {
             Ok(h) => h,
             Err(e) => return PullOutcome::StoreFailed(format!("has_blob: {e}")),
         };
-        if !held {
+        if held {
+            // CIRISEdge#735 — a RESUME. The manifest was adopted, and its
+            // `holds_bytes` emitted or not, by an earlier attempt; this one
+            // skips the adopt, so `announced` is read off the claim that
+            // exists rather than reported false for a door not called. At
+            // `community_dek` the first attempt announced and the resume
+            // used to deny it; at `invisible_encrypted` no claim exists
+            // (CC 5.2) and this reads false, as before.
+            announced = match self.backend.list_holders(&sha).await {
+                Ok(holders) => holders.contains(&self.local_key_id),
+                Err(e) => return PullOutcome::StoreFailed(format!("list_holders: {e}")),
+            };
+        } else {
             let bytes = match self.fetch_verified(fetch, sha).await {
                 Ok(b) => b,
                 Err(DagFetchStop::Transport(reason)) => {
@@ -1505,14 +1531,14 @@ where
                     )
                 }
             };
-            match self
+            announced = match self
                 .engine
                 .adopt_sealed_blob(&bytes, provenance.clone(), Some(&aad), adopt)
                 .await
             {
-                Ok(outcome) => announced = outcome.announced,
+                Ok(outcome) => outcome.announced,
                 Err(e) => return PullOutcome::StoreFailed(format!("adopt manifest: {e}")),
-            }
+            };
         }
 
         // ── verified ── opened as THIS NODE, under the row's AAD.
