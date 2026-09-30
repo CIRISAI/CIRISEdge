@@ -73,9 +73,60 @@ pub enum GroupContentError {
         /// Hex at-rest sha the read targeted.
         sha256_hex: String,
     },
+    /// A range read whose start is at or past the content's end (RFC 9110
+    /// §14.4; persist's `RangeNotSatisfiable`, CIRISEdge#737). Carries the
+    /// PLAINTEXT total persist named, so the caller learns the size it
+    /// overshot.
+    #[error(
+        "range not satisfiable for {sha256_hex}: start {range_start} is at or past the \
+         {size}-byte end"
+    )]
+    RangeNotSatisfiable {
+        /// Hex at-rest sha the read targeted.
+        sha256_hex: String,
+        /// The first byte asked for.
+        range_start: u64,
+        /// The content's plaintext size.
+        size: u64,
+    },
     /// Anything else the substrate reported.
     #[error("substrate: {0}")]
     Substrate(String),
+}
+
+/// **A chunk DAG's layout, for a viewer** (CIRISEdge#737,
+/// `FSD/CONTENT_TRANSFER.md` §6.7.3): the manifest's per-chunk PLAINTEXT
+/// sizes in `seq` order, with the file offset each chunk starts at — the
+/// prefix sum persist's own range reader maps a range onto
+/// (`ChunkManifest::slices_for_range`). What a streaming reader needs to
+/// ask for exactly one chunk at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkLayout {
+    /// The stream the manifest names — the one the pointer names.
+    pub stream_id: String,
+    /// The file's plaintext size: the sum of every chunk's `size`.
+    pub total_size: u64,
+    /// The chunks, in `seq` order, offsets contiguous from 0.
+    pub chunks: Vec<ChunkExtent>,
+}
+
+/// One chunk's place in the file (CIRISEdge#737).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkExtent {
+    /// The chunk's position in its stream — the `seq` its AAD is bound to.
+    pub seq: u64,
+    /// The first plaintext byte of the file this chunk holds.
+    pub offset: u64,
+    /// The chunk's plaintext length.
+    pub size: u64,
+}
+
+impl ChunkExtent {
+    /// The last byte this chunk holds, inclusive. `None` for an empty chunk.
+    #[must_use]
+    pub fn end_inclusive(&self) -> Option<u64> {
+        self.size.checked_sub(1).map(|last| self.offset + last)
+    }
 }
 
 /// A request to seal content into a group's blob store.
@@ -324,6 +375,49 @@ pub trait GroupContentStore: Send + Sync + 'static {
     /// [`GroupContentError::SealMismatch`] when the rebuilt AAD does not
     /// match, and the rest as documented.
     async fn open(&self, req: OpenRequest<'_>) -> Result<Vec<u8>, GroupContentError>;
+
+    /// **Open a plaintext range** `[start, end_inclusive]` of the content a
+    /// row points at (CIRISEdge#737, `FSD/CONTENT_TRANSFER.md` §6.7.3) —
+    /// persist's `Engine::read_blob_range_as` under the same AAD as
+    /// [`Self::open`].
+    ///
+    /// A chunk DAG opens only the chunks covering the range, each under its
+    /// own envelope and position-bound AAD; an inline body is opened once
+    /// and sliced. Persist clamps `end_inclusive` to the content's last byte
+    /// (RFC 9110 §14.4), so a short answer means the range ran past the end;
+    /// `start` at or past the end is [`GroupContentError::RangeNotSatisfiable`].
+    ///
+    /// # Errors
+    /// As [`Self::open`], plus `RangeNotSatisfiable`; a store without a range
+    /// door says so as [`GroupContentError::Substrate`].
+    async fn open_range(
+        &self,
+        req: OpenRequest<'_>,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<Vec<u8>, GroupContentError> {
+        let _ = (req, start, end_inclusive);
+        Err(GroupContentError::Substrate(
+            "this store has no range door (CIRISEdge#737)".to_owned(),
+        ))
+    }
+
+    /// **The chunk layout of a sealed DAG** the pointer names (CIRISEdge#737)
+    /// — persist's `Engine::open_sealed_manifest_as` under the row's AAD:
+    /// the manifest's chunks in `seq` order with their plaintext sizes, as
+    /// [`ChunkLayout`]. Authorized as [`Self::open`] is; a pointer that names
+    /// no stream, or a plaintext-tier DAG (a clear v1 manifest, which the
+    /// range door assembles without a layout), is refused by name.
+    ///
+    /// # Errors
+    /// As [`Self::open`]; a store without the door says so as
+    /// [`GroupContentError::Substrate`].
+    async fn layout(&self, req: OpenRequest<'_>) -> Result<ChunkLayout, GroupContentError> {
+        let _ = req;
+        Err(GroupContentError::Substrate(
+            "this store has no sealed-manifest door (CIRISEdge#737)".to_owned(),
+        ))
+    }
 
     /// **Open the sealed descriptor a pointer carries** (CIRISEdge#698) —
     /// the JCS `{name?, format, codec?}` bytes, under the same grant as the
