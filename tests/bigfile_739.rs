@@ -1045,6 +1045,255 @@ async fn pull_once(
     report
 }
 
+// ─── the stall watch (CIRISEdge#749) ──────────────────────────────────
+
+/// **How long a pull may hold no new chunk before the witness calls it
+/// stopped.** Read off the protocol's own clocks, not off a host's speed: a
+/// healthy lane's longest silence is one exchange at its worst — the scoped
+/// dial's establish budget (`NO_PATH_ESTABLISH_TIMEOUT`, 5 s, a derived
+/// address is never pathed) and identify, the request's Resource fallback
+/// (`DIAL_NO_PROGRESS_WINDOW`, 30 s of no progress) and the wait for the
+/// answer (`SwarmConfig::per_request_timeout`, 30 s; on its expiry the lane
+/// STOPS the pull, which the watch sees as `Finished`) — plus the adopt that
+/// follows. K lanes run that in parallel, so a chunk held within one worst
+/// exchange is progress. The 30 s of slack above the 65 s sum covers a debug
+/// build's adopt on a two-core runner (persist's `adopt_sealed_chunk` is one
+/// writer). A pull that stops fetching trips this whatever the host's speed;
+/// a slow one that keeps landing chunks never does.
+const STALL: Duration = Duration::from_secs(5 + 30 + 30 + 30);
+
+/// The overall backstop for one watched stretch (half a 256 MiB pull, or
+/// its resume): only a pull that crawls without ever pausing for `STALL`
+/// reaches it. It is not the witness's clock; the step's own timeout is
+/// sized above two of these (`.github/workflows/ci.yml`).
+const BACKSTOP: Duration = Duration::from_secs(20 * 60);
+
+/// How a watched stretch of a pull ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Watch {
+    /// `target` chunks were held.
+    Reached { held: u64, elapsed: Duration },
+    /// The pull task returned before `target` (the caller decides whether
+    /// that is the failure it names).
+    Finished { held: u64 },
+    /// No new chunk was held for `STALL`.
+    Stalled {
+        held: u64,
+        total: u64,
+        silent: Duration,
+        elapsed: Duration,
+    },
+    /// Still moving, but past the backstop.
+    Backstop {
+        held: u64,
+        total: u64,
+        elapsed: Duration,
+    },
+}
+
+impl std::fmt::Display for Watch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reached { held, elapsed } => {
+                write!(f, "reached {held} chunks in {:.1}s", elapsed.as_secs_f64())
+            }
+            Self::Finished { held } => write!(f, "the pull returned with {held} chunks held"),
+            Self::Stalled {
+                held,
+                total,
+                silent,
+                elapsed,
+            } => write!(
+                f,
+                "STALLED — no new chunk held for {:.0}s (the stall bound) at {held}/{total}, \
+                 {:.0}s into the pull",
+                silent.as_secs_f64(),
+                elapsed.as_secs_f64()
+            ),
+            Self::Backstop {
+                held,
+                total,
+                elapsed,
+            } => write!(
+                f,
+                "still moving at {held}/{total} after the {:.0}s backstop",
+                elapsed.as_secs_f64()
+            ),
+        }
+    }
+}
+
+/// Chunks of `stream` held in `node`'s store.
+async fn held_chunks(node: &Node, stream: &str) -> u64 {
+    node.dir
+        .stream_chunks(stream)
+        .await
+        .map(|l| l.chunks.len() as u64)
+        .unwrap_or(0)
+}
+
+/// Poll a pull's held-chunk count until it reaches `target`, the pull
+/// returns, no new chunk lands for `stall`, or `backstop` passes. Prints a
+/// line at each tenth of `total`, so a slow runner's log shows the rate.
+#[allow(clippy::too_many_arguments)]
+async fn watch_pull<H, F>(
+    what: &str,
+    target: u64,
+    total: u64,
+    mut held: impl FnMut() -> H,
+    mut finished: F,
+    stall: Duration,
+    backstop: Duration,
+    poll: Duration,
+) -> Watch
+where
+    H: std::future::Future<Output = u64>,
+    F: FnMut() -> bool,
+{
+    let started = Instant::now();
+    let mut last = held().await;
+    let mut last_moved = Instant::now();
+    let step = (total / 10).max(1);
+    let mut next_mark = (last / step + 1) * step;
+    loop {
+        let now = held().await;
+        if now > last {
+            last = now;
+            last_moved = Instant::now();
+            while now >= next_mark {
+                eprintln!(
+                    "[{what}] {now}/{total} chunks held at {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+                next_mark += step;
+            }
+        }
+        if now >= target {
+            return Watch::Reached {
+                held: now,
+                elapsed: started.elapsed(),
+            };
+        }
+        if finished() {
+            // One last read: the pull may have landed its final chunks
+            // between the count above and its return.
+            let now = held().await;
+            if now >= target {
+                return Watch::Reached {
+                    held: now,
+                    elapsed: started.elapsed(),
+                };
+            }
+            return Watch::Finished { held: now };
+        }
+        if last_moved.elapsed() >= stall {
+            return Watch::Stalled {
+                held: now,
+                total,
+                silent: last_moved.elapsed(),
+                elapsed: started.elapsed(),
+            };
+        }
+        if started.elapsed() >= backstop {
+            return Watch::Backstop {
+                held: now,
+                total,
+                elapsed: started.elapsed(),
+            };
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// The watch's own witness, at a scaled clock: a pull that stops fetching
+/// is `Stalled` (whatever it held), a slow one that keeps landing chunks is
+/// not, a pull that returns early is `Finished`, and one that never pauses
+/// but crawls meets the backstop. Runs in every lane that runs this file.
+#[tokio::test]
+async fn the_stall_watch_trips_on_a_stopped_pull_and_not_on_a_slow_one_749() {
+    use std::sync::atomic::AtomicU64;
+    let ms = Duration::from_millis;
+    // Stops fetching at 5 of 100: stalled, not a deadline.
+    let n = Arc::new(AtomicU64::new(0));
+    let c = Arc::clone(&n);
+    let w = watch_pull(
+        "stops",
+        50,
+        100,
+        || {
+            let c = Arc::clone(&c);
+            async move {
+                let v = c.load(Ordering::SeqCst);
+                if v < 5 {
+                    c.store(v + 1, Ordering::SeqCst);
+                }
+                c.load(Ordering::SeqCst)
+            }
+        },
+        || false,
+        ms(200),
+        ms(60_000),
+        ms(5),
+    )
+    .await;
+    assert!(
+        matches!(w, Watch::Stalled { held: 5, .. }),
+        "a pull that stops fetching trips the stall bound: {w:?}"
+    );
+    // Slow but moving (one chunk per 3 polls, well inside the bound): reaches.
+    let polls = Arc::new(AtomicU64::new(0));
+    let p2 = Arc::clone(&polls);
+    let w = watch_pull(
+        "slow",
+        20,
+        40,
+        || {
+            let p2 = Arc::clone(&p2);
+            async move { p2.fetch_add(1, Ordering::SeqCst) / 3 }
+        },
+        || false,
+        ms(200),
+        ms(60_000),
+        ms(5),
+    )
+    .await;
+    assert!(
+        matches!(w, Watch::Reached { held: 20, .. }),
+        "a slow pull that keeps landing chunks is never called stalled: {w:?}"
+    );
+    // Returns early.
+    let w = watch_pull(
+        "done",
+        50,
+        100,
+        || async { 7 },
+        || true,
+        ms(200),
+        ms(60_000),
+        ms(5),
+    )
+    .await;
+    assert_eq!(w, Watch::Finished { held: 7 });
+    // Crawls without ever pausing for the bound: the backstop.
+    let polls = Arc::new(AtomicU64::new(0));
+    let p3 = Arc::clone(&polls);
+    let w = watch_pull(
+        "crawl",
+        1_000_000,
+        1_000_000,
+        || {
+            let p3 = Arc::clone(&p3);
+            async move { p3.fetch_add(1, Ordering::SeqCst) }
+        },
+        || false,
+        ms(200),
+        ms(100),
+        ms(5),
+    )
+    .await;
+    assert!(matches!(w, Watch::Backstop { .. }), "{w:?}");
+}
+
 /// Kill B at ~50 % and resume from the same store, the resumed pull's first
 /// chunk answer forced onto the responder's queue fallback.
 async fn resume_once(
@@ -1072,24 +1321,30 @@ async fn resume_once(
     let started = Instant::now();
     let pull = tokio::spawn(async move { puller.pull_one(&row, sha, 0).await });
     let half = (p.chunk_count / 2) as u64;
-    let deadline = Instant::now() + Duration::from_secs(600);
-    loop {
-        let held = b
-            .node
-            .dir
-            .stream_chunks(&p.stream_id)
-            .await
-            .map(|l| l.chunks.len() as u64)
-            .unwrap_or(0);
-        if held >= half {
-            break;
+    // THE STALL WATCH (CIRISEdge#749), not a wall-clock deadline: the pull
+    // fails the witness when no new chunk has been held for `STALL`, however
+    // slow the host is while it keeps moving.
+    let total_chunks = p.chunk_count as u64;
+    let watched = watch_pull(
+        "first half",
+        half,
+        total_chunks,
+        || held_chunks(&b.node, &p.stream_id),
+        || pull.is_finished(),
+        STALL,
+        BACKSTOP,
+        Duration::from_millis(50),
+    )
+    .await;
+    match watched {
+        Watch::Reached { held, elapsed } => eprintln!(
+            "[resume] 50 % reached: {held}/{total_chunks} chunks held in {:.1}s",
+            elapsed.as_secs_f64()
+        ),
+        Watch::Finished { held } => {
+            panic!("the pull finished before the kill point ({held}/{total_chunks} held)")
         }
-        assert!(
-            !pull.is_finished(),
-            "the pull finished before the kill point"
-        );
-        assert!(Instant::now() < deadline, "the pull never reached 50 %");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        stopped => panic!("the pull never reached 50 %: {stopped}"),
     }
     // THE KILL: the pull task aborted mid-walk, B's edge stopped, its
     // transport dropped, its store closed.
@@ -1123,7 +1378,31 @@ async fn resume_once(
     let rows_before = queued_chunk_replies(a).await;
     arm_reply_teardown(&a.rt, 1);
     let started = Instant::now();
-    let verdict = puller.pull_one(&p.row, p.sha, 0).await;
+    let row = p.row.clone();
+    let resumed = tokio::spawn(async move { puller.pull_one(&row, sha, 0).await });
+    // The same stall watch over the resume, to the last chunk: a resume that
+    // stops fetching fails by name instead of hanging the step. Once every
+    // chunk is held only promotion is left, which adds no chunk, so the watch
+    // ends there and the join below waits for the verdict.
+    match watch_pull(
+        "resume",
+        total_chunks,
+        total_chunks,
+        || held_chunks(&b.node, &p.stream_id),
+        || resumed.is_finished(),
+        STALL,
+        BACKSTOP,
+        Duration::from_millis(50),
+    )
+    .await
+    {
+        Watch::Reached { .. } | Watch::Finished { .. } => {}
+        stopped => panic!("the resumed pull did not complete: {stopped}"),
+    }
+    let verdict = tokio::time::timeout(STALL, resumed)
+        .await
+        .expect("every chunk is held, and the promote returns within the stall bound")
+        .expect("the resumed pull task");
     let resume_time = started.elapsed();
     let fallbacks = carrier(a, "serve:reply_queued_fallback") - queued_before;
     let fallback_rows = queued_chunk_replies(a).await.saturating_sub(rows_before);
@@ -1446,8 +1725,12 @@ async fn a_2_gib_self_file_pulls_within_the_ceiling_739() {
 /// byte-identical, every position adopted exactly once, zero chunk replies
 /// in the durable queue during the pull and the queue fallback taken when
 /// the arrival link is torn down. No ceiling and no curve — correctness,
-/// not speed, on a shared runner; the debug build pulls ≈ 0.7 MB/s, so the
-/// step's budget is 20 minutes.
+/// not speed, on a shared runner. The witness fails on a STALL (no new chunk
+/// held for `STALL`), never on the host's speed: a debug build on a two-core
+/// runner lands ≈ 0.7 chunks/s (CIRISEdge#749 — ≈ 12 min to 50 %, the CPU of
+/// sign + verify + bz2 + adopt per chunk, reproduced under `taskset -c 0,1`),
+/// so the step's budget (`.github/workflows/ci.yml`) is sized over two
+/// `BACKSTOP`s, not over a guess at the rate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 #[ignore = "256 MiB on the wire; CI runs it alone in the network gauntlet"]
 async fn a_256_mib_self_file_resumes_after_a_kill_quick_739() {

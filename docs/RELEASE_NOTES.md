@@ -29,7 +29,14 @@ MB/s (517 ms less per chunk); pooled links instead of a dial per chunk → 1.2 M
   byte-identical, each chunk adopted exactly once.
 - Per-phase clocks and a chunk ledger in `EdgeMetrics`; an answered chunk request no longer logs WARN
   (8,193 lines per 2 GiB pull).
-- Witness `tests/bigfile_739.rs`: 256 MiB resume variant in CI (453 s debug); the 2 GiB tables by hand.
+- Witness `tests/bigfile_739.rs`: 256 MiB resume variant in CI; the 2 GiB tables by hand. It fails on a
+  **stall** (no new chunk held for 95 s, the sum of the scoped establish, Resource no-progress and
+  per-request clocks plus adopt slack), not on wall time: a debug build on two cores lands ≈ 0.7 chunks/s,
+  which a 600 s deadline to 50 % could not meet (CIRISEdge#749; the step's budget is 50 min).
+- An answer on a scoped lane this node dialled is named `OwnScopedLane` (DEBUG) instead of the
+  `UNATTRIBUTED` WARN it logged once per chunk: its destination is the peer's derived address, which the
+  peers map never holds (#728). Nothing was dropped; the chunk bodies were always delivered on their
+  signature and correlation (CIRISEdge#749).
 
 ## What is left (the 2× target is not met at 2 GiB), each filed
 

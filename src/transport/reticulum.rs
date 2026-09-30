@@ -7253,6 +7253,18 @@ enum LinkAttribution {
     /// A destination IS known but matches no rooted peer in the map (e.g. the peer
     /// has not rooted yet).
     DestUnmatched(DestinationHash),
+    /// CIRISEdge#749 — a frame on a SCOPED link THIS node dialled (a leased
+    /// lane, `lease_scoped_link`): the answer to one of its own scoped
+    /// requests, which rides the arrival link by design since #739. The
+    /// link's destination is the PEER's scope-derived address, and a derived
+    /// address is never in the peers map (#728: it must not be — that would
+    /// collapse the context the address exists to separate), so the
+    /// dialled-dest lookup has nothing to find. Not a miss and not a drop: the
+    /// frame goes on unattributed, as every scoped-lane answer is, and is
+    /// admitted on its own signature and its request's correlation, never on
+    /// a source. Identity-plane classes never reach this arm — the #728 plane
+    /// check refuses them by name first.
+    OwnScopedLane(Option<DestinationHash>),
     /// CIRISEdge#621 — the attribution resolved to THIS node's own key. An
     /// inbound link is, by construction, a link someone else holds the far end
     /// of; its source is never us. This arm fires when the peers map carries a
@@ -7292,6 +7304,28 @@ fn drop_resolved_to_self(link_id: LinkId, key_id: &str) {
 /// A miss here on an identified link is therefore `link_before_binding`:
 /// counted, and it must read 0 — it is the alarm that the announce-before-link
 /// ordering broke, not a state a peer is designed to sit in.
+/// CIRISEdge#749 — [`resolve_link_attribution`] behind the plane of the link:
+/// an un-identified frame on a scoped link this node DIALLED is
+/// [`LinkAttribution::OwnScopedLane`], and the peers map is not consulted —
+/// asking it for a derived address was the category error that logged every
+/// #739 chunk answer as an `UNATTRIBUTED` miss. Every other link resolves
+/// exactly as before, including a scoped link a PEER dialled (the responder
+/// side, attributed through its identify, #340) and an un-identified one of
+/// those (a genuine miss, still loud).
+fn resolve_link_attribution_on_plane(
+    plane: LinkPlane,
+    we_dialled: bool,
+    identified: Option<String>,
+    dest: Option<DestinationHash>,
+    local_key_id: &str,
+    peer_for_dest: impl FnOnce(DestinationHash) -> Option<String>,
+) -> LinkAttribution {
+    if plane == LinkPlane::Scoped && we_dialled && identified.is_none() {
+        return LinkAttribution::OwnScopedLane(dest);
+    }
+    resolve_link_attribution(identified, dest, local_key_id, peer_for_dest)
+}
+
 fn resolve_link_attribution(
     identified: Option<String>,
     dest: Option<DestinationHash>,
@@ -7609,14 +7643,27 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // has no entry. The basis is the link's DESTINATION (`dest` above): we dialed
     // a dest resolved from the VERIFIED route table, and RNS establishment proves
     // the remote controls that dest's keys — same trust the outbound send used.
+    // CIRISEdge#749 — whether THIS node dialled the link: the `connect`-time
+    // record (`dialed_link_dest`), which every own dial writes, scoped lanes
+    // included. Read only for a scoped link; it is what tells a lane's answer
+    // (ours) from an un-identified peer-dialled scoped link (a real miss).
+    let we_dialled =
+        plane == LinkPlane::Scoped && ctx.dialed_link_dest.lock().await.contains_key(&link_id);
     let candidate_key_id = {
         let peers = ctx.peers.lock().await;
-        let outcome = resolve_link_attribution(identified, dest, ctx.local_key_id, |d| {
-            peers
-                .iter()
-                .find(|(_, rooted)| rooted.peer.dest_hash == d)
-                .map(|(key_id, _)| key_id.clone())
-        });
+        let outcome = resolve_link_attribution_on_plane(
+            plane,
+            we_dialled,
+            identified,
+            dest,
+            ctx.local_key_id,
+            |d| {
+                peers
+                    .iter()
+                    .find(|(_, rooted)| rooted.peer.dest_hash == d)
+                    .map(|(key_id, _)| key_id.clone())
+            },
+        );
         drop(peers);
         match outcome {
             // CIRISEdge#621 — never our own key. A frame attributed to
@@ -7657,6 +7704,23 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
                          route on the link's proven identity (CIRISEdge#424/#624)"
                     );
                 }
+                None
+            }
+            // CIRISEdge#749 — the answer on our own leased lane. Named, not a
+            // miss: nothing on this arm is dropped for want of a source (the
+            // identity-plane classes that would be were refused above, #728),
+            // so it speaks at DEBUG — at WARN it was one line per chunk of a
+            // #739 pull, 743 on one CI run, reading as the #728 class.
+            LinkAttribution::OwnScopedLane(d) => {
+                tracing::debug!(
+                    link = ?link_id,
+                    dest = %d.map_or_else(|| "-".to_owned(), |d| hex::encode(d.into_bytes())),
+                    bytes = data.len(),
+                    "inbound frame on a SCOPED lane this node dialled — the answer to its own \
+                     scoped request, on the request's link (CIRISEdge#739). A derived address \
+                     is never in the peers map (#728), so it is delivered unattributed by \
+                     design and admitted on its own signature and correlation (CIRISEdge#749)"
+                );
                 None
             }
             LinkAttribution::DestUnmatched(d) => {
@@ -12678,6 +12742,70 @@ mod tests {
             assert_eq!(out, LinkAttribution::DestUnmatched(dh(9)));
         }
 
+        /// CIRISEdge#749 — THE FIELD INPUT: an answer on a scoped lane THIS node
+        /// dialled arrives with no `LinkIdentified` entry and the lane's dialled
+        /// destination, the peer's DERIVED address, which the peers map never
+        /// holds. Before, that resolved `DestUnmatched` and warned once per
+        /// chunk of every #739 pull; it is the named own-lane outcome, and the
+        /// peers map is not asked about a derived address at all.
+        #[test]
+        fn an_answer_on_our_own_scoped_lane_is_named_not_a_miss_749() {
+            let out = resolve_link_attribution_on_plane(
+                LinkPlane::Scoped,
+                true,
+                None,
+                Some(dh(0x61)),
+                SELF,
+                |_| panic!("a derived address is never looked up in the peers map"),
+            );
+            assert_eq!(out, LinkAttribution::OwnScopedLane(Some(dh(0x61))));
+        }
+
+        /// The other three corners resolve exactly as the plane-blind resolver
+        /// does: a scoped link a PEER dialled attributes through its identify
+        /// (the responder side of every lane, #340), an un-identified one of
+        /// those is still the loud miss, and an identity-plane link we dialled
+        /// still attributes via its recorded dest (#424).
+        #[test]
+        fn only_our_own_unidentified_scoped_lane_takes_the_named_arm_749() {
+            let responder = resolve_link_attribution_on_plane(
+                LinkPlane::Scoped,
+                false,
+                Some("peer-b".into()),
+                Some(dh(1)),
+                SELF,
+                |_| None,
+            );
+            assert_eq!(responder, LinkAttribution::ViaIdentified("peer-b".into()));
+            let unidentified = resolve_link_attribution_on_plane(
+                LinkPlane::Scoped,
+                false,
+                None,
+                Some(dh(2)),
+                SELF,
+                |_| None,
+            );
+            assert_eq!(unidentified, LinkAttribution::DestUnmatched(dh(2)));
+            let identity = resolve_link_attribution_on_plane(
+                LinkPlane::Identity,
+                true,
+                None,
+                Some(dh(3)),
+                SELF,
+                |d| (d == dh(3)).then(|| "peer-c".to_string()),
+            );
+            assert_eq!(identity, LinkAttribution::ViaDialedDest("peer-c".into()));
+            let identity_miss = resolve_link_attribution_on_plane(
+                LinkPlane::Identity,
+                true,
+                None,
+                Some(dh(4)),
+                SELF,
+                |_| None,
+            );
+            assert_eq!(identity_miss, LinkAttribution::DestUnmatched(dh(4)));
+        }
+
         // ── CIRISEdge#621 — attribution never resolves to the local key ──
 
         /// (a) THE #621 CONDITION: the peers map holds a self-entry under our own
@@ -12757,6 +12885,10 @@ mod tests {
                         proptest::prop_assert_eq!(k, SELF.to_string());
                     }
                     LinkAttribution::NoDest | LinkAttribution::DestUnmatched(_) => {}
+                    // Only the plane-aware wrapper names a scoped lane.
+                    LinkAttribution::OwnScopedLane(_) => {
+                        proptest::prop_assert!(false, "the plane-blind resolver named a lane");
+                    }
                 }
             }
         }

@@ -293,10 +293,14 @@ jobs:
       # ceiling, no K curve): the speed table is the release-build
       # `--ignored` run documented in the test. Budget: 30 minutes (measured
       # locally on a debug build: see the PR for the number).
+      # CIRISEdge#749 — the witness fails on a STALL (no new chunk held for
+      # its protocol-derived bound), not on wall time. On this runner a debug
+      # build lands ≈ 0.7 chunks/s (≈ 12 min per half of the 256 MiB pull), so
+      # the budget is publish + setup + two of the test's 20-minute BACKSTOPs.
       - name: bigfile resume witness (CIRISEdge#739)
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 30
+          timeout_minutes: 50
           max_attempts: 2
           retry_wait_seconds: 60
           shell: bash
