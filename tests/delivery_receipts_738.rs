@@ -860,18 +860,12 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
 /// **Family (two persons): a receipt from the other person's device; none
 /// admitted from a non-family node.**
 ///
-/// First blocked at persist rev 9d406712 (no family file could be
-/// PUBLISHED: CIRISPersist#953 item 1, fixed in v52). Still blocked at
-/// e398da3c / 64a89f75, one rung later: the other member's node cannot ADOPT
-/// the bytes. persist's hold gate answers the `family` arm from the
-/// operator's `DiskPressureConfig::is_family` predicate (and `speaks_for`,
-/// same principal only), never from the family roster
-/// (`federation/replication/hold.rs` `is_audience`), and no production
-/// engine installs that predicate — so the pull ends `StoreFailed("adopt
-/// manifest: not party to family content …")`. Un-ignore when persist
-/// resolves the family arm by roster (CIRISEdge#736).
+/// Was `#[ignore]`d twice: at persist 9d406712 no family file could be
+/// published (CIRISPersist#953 item 1), and at e398da3c the other member's
+/// node refused the bytes `NotPartyTo` (the hold gate's family arm read only
+/// the operator predicate, CIRISPersist#960). Both fixed in persist v52;
+/// un-ignored by the family lane (CIRISEdge#736).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "persist e398da3c/64a89f75: the family adopt is NotPartyTo on a member's node (hold.rs is_audience reads only the operator is_family predicate; see doc)"]
 async fn a_family_file_is_receipted_by_the_other_persons_device_and_no_one_else() {
     init_tracing();
     let alice = Ident::new("alice-fed", 0x11);

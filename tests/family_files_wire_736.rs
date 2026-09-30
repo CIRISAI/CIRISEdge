@@ -41,15 +41,6 @@
 //!   not in its path table, not in a scope table, not in its directory, not
 //!   a byte of either file.
 //!
-//! **Blocked at persist e398da3c / 64a89f75** (both witnesses `#[ignore]`d):
-//! the family file publishes, crosses and reaches Q1's puller, the bytes
-//! arrive from P1's serve gate — and Q1's adopt refuses them
-//! `NotPartyTo { cohort_scope: family }`. persist's hold gate
-//! (`federation/replication/hold.rs`, `is_audience`) answers the family arm
-//! from the operator's `DiskPressureConfig::is_family` predicate and
-//! `speaks_for` (same principal) only, never from the family roster, and no
-//! production engine installs that predicate.
-//!
 //! Requires the `transport-reticulum` feature.
 
 #![cfg(feature = "transport-reticulum")]
@@ -647,7 +638,7 @@ async fn form_family_by_consent(
     }
     assert_eq!(
         active_members(&q1.node).await,
-        [p.key_id.clone()],
+        [p.key_id.as_str()],
         "founded by P alone"
     );
 
@@ -714,7 +705,7 @@ async fn form_family_by_consent(
     for to in others {
         assert_eq!(
             active_members(&to.node).await,
-            [p.key_id.clone()],
+            [p.key_id.as_str()],
             "{} holds the founding only",
             to.node.me
         );
@@ -771,7 +762,7 @@ async fn form_family_by_consent(
     let applied = carry_plane(p1, q1, EnvelopeKind::FamilyMembershipWidening).await;
     assert_eq!(applied.len(), 2, "both widenings offered");
     assert!(
-        applied.iter().any(|o| o.is_admitted()),
+        applied.iter().any(ApplyOutcome::is_admitted),
         "R's widening lands on Q1 once R's acceptance is held: {applied:?}"
     );
     assert_eq!(
@@ -1117,7 +1108,6 @@ async fn assert_holds_nothing_of(node: &Node, files: &[&File], who: &str) {
 /// named unresolved; (c) N holds nothing, is offered nothing, is served
 /// nothing, by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "persist e398da3c/64a89f75: a family blob is NotPartyTo on the other member's node — hold.rs is_audience answers the family arm from the operator is_family predicate, never the roster (CIRISEdge#736)"]
 async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_member_736() {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1164,7 +1154,11 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
     let mut want_nodes = vec![p1.node.me.clone(), q1.node.me.clone()];
     want_nodes.sort();
     assert_eq!(roster.nodes, want_nodes, "the roster's nodes: P1 and Q1");
-    assert_eq!(roster.unresolved, [r.key_id.clone()], "R has no device yet");
+    assert_eq!(
+        roster.unresolved,
+        [r.key_id.as_str()],
+        "R has no device yet"
+    );
     install_family_room(&p1, &q1, &roster.nodes).await;
     arm_puller(&mut q1);
 
@@ -1188,7 +1182,7 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
         // (b) — the unresolved member is NAMED on the write, not skipped.
         assert_eq!(
             f.published.unresolved,
-            [r.key_id.clone()],
+            [r.key_id.as_str()],
             "the publish names the family member no device of whom it reaches"
         );
         // (c) — the key half: wrapped to the family's devices, never to N.
@@ -1322,7 +1316,6 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
 /// files still cross — on the identity-plane link with the family
 /// discriminated inside it (#718) — and F holds nothing naming the family.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "persist e398da3c/64a89f75: a family blob is NotPartyTo on the other member's node — hold.rs is_audience answers the family arm from the operator is_family predicate, never the roster (CIRISEdge#736)"]
 async fn family_files_cross_through_a_non_member_forwarder_that_learns_nothing_736() {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
