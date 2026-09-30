@@ -1237,6 +1237,10 @@ struct AudienceMemo {
     /// one sweep: the allegiance predicate asks it once per self-publish
     /// identity, not once per row.
     roots: HashMap<String, Vec<String>>,
+    /// CIRISEdge#752 — the relayed-announce verdict per attestation id, for one
+    /// sweep: the liveness walk runs once per candidate binding, not once per
+    /// first-contact peer.
+    relayed_announce: HashMap<String, bool>,
 }
 
 /// The cohorts one identity is a member of, by id.
@@ -5195,6 +5199,9 @@ impl FederationDirectoryReplicationBridge {
             Err(e) => serde_json::json!({ "malformed": e.to_string() }),
         };
         serde_json::json!({
+            // CIRISEdge#752 — the relayed-announce predicate matches THIS row
+            // against the live announcing rows persist folds for its subject.
+            "attestation_id": att.attestation_id,
             "attesting_key_id": att.attesting_key_id,
             // CIRISEdge#671 — the allegiance predicate reads the edge's far end.
             "attested_key_id": att.attested_key_id,
@@ -6059,6 +6066,74 @@ impl FederationDirectoryReplicationBridge {
             .is_some_and(|roots| roots.iter().any(|r| r == far_end))
     }
 
+    /// CIRISEdge#752 — may a FIRST-CONTACT peer be handed this row although it
+    /// is not one of this node's allegiance facts? Only when it is the public
+    /// roster entry CC 5.4.6 makes of an announced device
+    /// (`FSD/FIRST_CONTACT.md` §2.3), all four decided by persist:
+    ///
+    /// - (a) an owner-binding — persist's `is_owner_binding_envelope`, on a
+    ///   `delegates_to` or the `supersedes` widening that announces it;
+    /// - (b) at `cohort_scope: federation` — the announce;
+    /// - (c) LIVE — the row's attester is the subject's single live owner
+    ///   (`owner_of`), and the row is one of the live announcing rows the #682
+    ///   gate reads ([`Self::live_announcing_rows`]: `retired_ids`, expiry, the
+    ///   widening judged on its prior);
+    /// - (d) its subject is in THIS relay's `Key` or `IdentityOccurrence`
+    ///   publish set — the host's [`KindPublishSelector`] answer.
+    ///
+    /// No selector installed ⇒ `false` for every row: the first-contact reach is
+    /// then exactly #671's, byte for byte.
+    async fn attestation_is_relayed_announce(
+        &self,
+        row: &serde_json::Value,
+        memo: &mut AudienceMemo,
+    ) -> bool {
+        use ciris_persist::federation::admission::is_owner_binding_envelope;
+        use ciris_persist::federation::types::{attestation_type, cohort_scope};
+        if self.kind_publish_selector.is_none() {
+            return false;
+        }
+        let field = |k: &str| row.get(k).and_then(serde_json::Value::as_str);
+        let (Some(id), Some(owner), Some(node)) = (
+            field("attestation_id"),
+            field("attesting_key_id"),
+            field("attested_key_id"),
+        ) else {
+            return false;
+        };
+        let ty = field("attestation_type");
+        if ty != Some(attestation_type::DELEGATES_TO) && ty != Some(attestation_type::SUPERSEDES) {
+            return false;
+        }
+        let env = row
+            .get("attestation_envelope")
+            .unwrap_or(&serde_json::Value::Null);
+        if !is_owner_binding_envelope(env)
+            || Self::attestation_cohort_scope(row) != cohort_scope::FEDERATION
+        {
+            return false;
+        }
+        if !self.self_own_subjects(EnvelopeKind::Key).contains(node)
+            && !self
+                .self_own_subjects(EnvelopeKind::IdentityOccurrence)
+                .contains(node)
+        {
+            return false;
+        }
+        if let Some(hit) = memo.relayed_announce.get(id) {
+            return *hit;
+        }
+        let live = match self.owner_of_cached(node).await {
+            OwnerLookup::Owner(o) if o == owner => self
+                .live_announcing_rows(owner, node)
+                .await
+                .is_ok_and(|ids| ids.contains(id)),
+            _ => false,
+        };
+        memo.relayed_announce.insert(id.to_owned(), live);
+        live
+    }
+
     /// The REACH half of the audience question, per recipient: which rows the
     /// axis that admitted this peer may carry at all. CIRISPersist#884 — the
     /// self-collective / family reaches carry only rows of their scope;
@@ -6111,13 +6186,24 @@ impl FederationDirectoryReplicationBridge {
         // grant, a score, content) stays behind the send set exactly as before,
         // under the same ledger token, so a run reads the same counter it read
         // before minus the four rows that now cross.
-        if reach == Reach::FirstContact && !self.attestation_is_allegiance_fact(row, memo).await {
+        //
+        // CIRISEdge#752 (CC 5.4.6, CIRISServer#701) — plus ONE shape about a
+        // third party: a live, announced owner-binding (`federation`) of a node
+        // this relay chose to publish (its `KindPublishSelector` Key or
+        // IdentityOccurrence set). The announce made that binding public, so
+        // relaying it concedes nothing; every other row about others stays
+        // withheld here, and the Rooted floor below still runs on it.
+        if reach == Reach::FirstContact
+            && !self.attestation_is_allegiance_fact(row, memo).await
+            && !self.attestation_is_relayed_announce(row, memo).await
+        {
             self.withhold(
                 WithholdReason::RecipientNotInSendSet,
                 peer,
                 &format!(
                     "{site}: attestation: not consent-included — first-contact reach carries \
-                     only this node's allegiance facts (CIRISEdge#671)"
+                     only this node's allegiance facts and the announced owner-bindings of \
+                     nodes it publishes (CIRISEdge#671, #752)"
                 ),
             );
             tracing::debug!(
@@ -6125,8 +6211,9 @@ impl FederationDirectoryReplicationBridge {
                 attester,
                 site,
                 "attestation withheld — the recipient is an Attributed stranger (first \
-                 contact) and this row is not one of this node's allegiance facts \
-                 (CIRISEdge#671, FSD/FIRST_CONTACT.md §2)"
+                 contact) and this row is neither one of this node's allegiance facts nor \
+                 an announced owner-binding of a node it publishes (CIRISEdge#671, #752, \
+                 FSD/FIRST_CONTACT.md §2)"
             );
             return true;
         }
@@ -7547,12 +7634,25 @@ impl FederationDirectoryReplicationBridge {
         owner: &str,
         node: &str,
     ) -> Result<bool, ciris_persist::federation::Error> {
+        Ok(!self.live_announcing_rows(owner, node).await?.is_empty())
+    }
+
+    /// The ids of the LIVE rows by which `owner` announces `node` — the set
+    /// [`Self::node_is_announced`] tests for emptiness, and the set the
+    /// CIRISEdge#752 relay rule tests a candidate row's membership in, so the
+    /// two read one liveness.
+    async fn live_announcing_rows(
+        &self,
+        owner: &str,
+        node: &str,
+    ) -> Result<HashSet<String>, ciris_persist::federation::Error> {
         use ciris_persist::federation::admission::is_owner_binding_envelope;
         use ciris_persist::federation::types::{attestation_type, cohort_scope};
         let rows = self.directory.list_attestations_for(node).await?;
         let refs: Vec<&Attestation> = rows.iter().collect();
         let retired = ciris_persist::federation::precedence::retired_ids(&refs);
         let now = chrono::Utc::now();
+        let mut live = HashSet::new();
         for r in &rows {
             if r.attesting_key_id != owner
                 || r.attested_key_id != node
@@ -7590,10 +7690,10 @@ impl FederationDirectoryReplicationBridge {
                 false
             };
             if announces {
-                return Ok(true);
+                live.insert(r.attestation_id.clone());
             }
         }
-        Ok(false)
+        Ok(live)
     }
 
     /// CIRISEdge#682 — the occurrence key an identity-plane wire row is about
@@ -19536,6 +19636,166 @@ pub(crate) mod tests {
             served_rooted, allegiance,
             "Rooted without a consent:replication grant is still first contact: the same \
              allegiance facts and nothing about others (I2, CC 3.3.7)"
+        );
+    }
+
+    /// CIRISEdge#752 — `FSD/FIRST_CONTACT.md` I21 at the bridge. A relay with a
+    /// `KindPublishSelector` publishing `node-d` hands a first-contact peer
+    /// `person-o → node-d` (a third party's owner-binding at `federation`) on the
+    /// advertise AND the fetch twin, beside its own allegiance facts. Withheld:
+    /// the same owner's binding of a node the relay does not publish, its
+    /// `self`-scoped binding of a published node, and its consent row about the
+    /// published node. With no selector the served set is exactly #671's.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_relay_serves_a_published_nodes_announced_binding_at_first_contact_752() {
+        let backend = Arc::new(MemoryBackend::new());
+        let (relay, peer, peer_owner) = ("node-relay", "node-peer", "person-peer");
+        let (o, d, e, u) = ("person-o", "node-d", "node-e", "node-u");
+        register_fixture_keys(
+            &backend,
+            &[
+                (relay, identity_type::NODE),
+                (peer, identity_type::NODE),
+                (peer_owner, identity_type::USER),
+                (o, identity_type::USER),
+                (d, identity_type::NODE),
+                (e, identity_type::NODE),
+                (u, identity_type::NODE),
+            ],
+        )
+        .await;
+        // The relay is unowned (its own trust subject, the canonical's shape)
+        // and Rooted with the peer through `root-r`, so the #659 floor passes
+        // and what is measured is the first-contact narrowing alone.
+        seed_owner_binding(&backend, peer_owner, peer).await;
+        seed_common_root(&backend, &[relay, peer_owner]).await;
+        let announced = seed_owner_binding(&backend, o, d).await;
+        let unpublished = seed_owner_binding(&backend, o, e).await;
+        let unannounced = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &unannounced,
+            o,
+            u,
+            "delegates_to",
+            "self",
+            owner_binding_envelope(&unannounced, o, u),
+        )
+        .await;
+        let consent = uuid::Uuid::new_v4().to_string();
+        seed_raw_attestation(
+            &backend,
+            &consent,
+            o,
+            d,
+            "scores",
+            serde_json::json!({
+                "id": consent,
+                "attesting_key_id": o,
+                "attested_key_id": d,
+                "attestation_type": "scores",
+                "dimension": "consent:replication:v1",
+                "payload": { "grants": "transfer", "attestation_prefixes": ["trace:"] },
+            }),
+        )
+        .await;
+
+        let publish = vec![relay.to_string()];
+        let base = || {
+            let publish = publish.clone();
+            bridge_over(&backend, &[])
+                .with_local_key_id(Some(relay.to_string()))
+                .with_self_provider(Some(Arc::new(move || publish.clone())))
+        };
+        let served = |bridge: FederationDirectoryReplicationBridge| async move {
+            bridge
+                .list_attestations_for_peer(Some(peer))
+                .await
+                .into_iter()
+                .map(|r| r.envelope_hash)
+                .collect::<std::collections::BTreeSet<[u8; 32]>>()
+        };
+        // Selector unset: #671 exactly — the relay's allegiance facts only.
+        let before = served(base()).await;
+        let announced_hash = wire_hash_of(&backend, &announced).await;
+        assert!(
+            !before.contains(&announced_hash),
+            "no selector ⇒ a third party's binding never rides first contact (#671 unchanged)"
+        );
+        assert!(
+            base()
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &announced_hash,
+                    Some(peer)
+                )
+                .await
+                .is_none(),
+            "…and the fetch twin agrees"
+        );
+
+        let selector = || {
+            KindPublishSelector::from_sets(HashMap::from([
+                (
+                    EnvelopeKind::Key,
+                    vec![
+                        relay.to_string(),
+                        d.to_string(),
+                        u.to_string(),
+                        o.to_string(),
+                    ],
+                ),
+                (
+                    EnvelopeKind::IdentityOccurrence,
+                    vec![relay.to_string(), d.to_string(), u.to_string()],
+                ),
+            ]))
+        };
+        let metrics = crate::observability::EdgeMetrics::new();
+        let with = || {
+            base()
+                .with_kind_publish_selector(Some(selector()))
+                .with_metrics(Some(metrics.clone()))
+        };
+        let after = served(with()).await;
+        let mut expected = before.clone();
+        expected.insert(announced_hash);
+        assert_eq!(
+            after, expected,
+            "the selector adds EXACTLY the announced binding of the published node"
+        );
+        assert!(
+            with()
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &announced_hash,
+                    Some(peer)
+                )
+                .await
+                .is_some(),
+            "the fetch twin serves what the advertise offers"
+        );
+        for (id, why) in [
+            (&unpublished, "a node the relay does not publish"),
+            (&unannounced, "a binding at `self` (not announced)"),
+            (&consent, "a consent row about a published node"),
+        ] {
+            let hash = wire_hash_of(&backend, id).await;
+            assert!(!after.contains(&hash), "not advertised: {why}");
+            assert!(
+                with()
+                    .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some(peer))
+                    .await
+                    .is_none(),
+                "not fetchable out-of-band: {why}"
+            );
+        }
+        assert!(
+            metrics.withholds(crate::observability::WithholdReason::RecipientNotInSendSet) >= 2,
+            "the unpublished binding and the consent row are withheld under the unchanged \
+             token: {:?}",
+            metrics.snapshot().withholds_by_reason
         );
     }
 
