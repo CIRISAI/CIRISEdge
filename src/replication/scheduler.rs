@@ -1670,7 +1670,21 @@ mod tests {
                 .expect("open");
         }
         assert_eq!(entered.load(Ordering::Acquire), base + N + 1);
-        let stats = control.round_bound();
+        // A round emits its event BEFORE its permit guard drops at task end, so
+        // `in_flight` reaches 0 a moment after the last event, not with it
+        // (under a loaded `--lib` run the read raced the drop: in_flight 1).
+        // Wait for the permits with a deadline; never assert on the race.
+        let stats = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let s = control.round_bound();
+                if s.in_flight == 0 {
+                    break s;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| control.round_bound());
         assert_eq!(stats.in_flight, 0, "every permit returned: {stats:?}");
         assert_eq!(stats.peak_in_flight, N, "the bound was never exceeded");
 
