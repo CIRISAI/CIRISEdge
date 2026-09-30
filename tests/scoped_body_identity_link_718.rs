@@ -271,6 +271,22 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
             .await
             .expect("pqc sign")
     };
+    // persist v52.0.0 (CIRISPersist#955, Q1) — a founding record admits only
+    // the members who signed it: every other listed member co-signs.
+    let mut cosignatures = Vec::new();
+    for m in &members[1..] {
+        let ed = m.ed.sign(&canonical).await.expect("cosign ed");
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&ed);
+        let pqc = ciris_keyring::PqcSigner::sign(&m.pqc, &bound)
+            .await
+            .expect("cosign pqc");
+        cosignatures.push(ciris_persist::federation::types::RosterCosignature {
+            authority_key_id: m.key_id.clone(),
+            scrub_signature_classical: B64.encode(&ed),
+            scrub_signature_pqc: Some(B64.encode(&pqc)),
+        });
+    }
     node.dir
         .put_community(SignedCommunity {
             community,
@@ -278,7 +294,7 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
             scrub_signature_classical: B64.encode(&ed_sig),
             scrub_signature_pqc: Some(B64.encode(&pqc_sig)),
             supersede_proof: None,
-            cosignatures: Vec::new(),
+            cosignatures,
             lineage: Vec::new(),
         })
         .await

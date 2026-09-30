@@ -280,6 +280,25 @@ async fn federate_all(nodes: &[&Node]) {
     }
 }
 
+/// persist v52.0.0 (CIRISPersist#955, Q1) — a founding record admits only the
+/// members who signed it: each of `members` co-signs `canonical`, as a real
+/// founding does.
+async fn cosign(
+    members: &[&Ident],
+    canonical: &[u8],
+) -> Vec<ciris_persist::federation::types::RosterCosignature> {
+    let mut out = Vec::new();
+    for m in members {
+        let (ed, pqc) = m.sign_hybrid(canonical).await;
+        out.push(ciris_persist::federation::types::RosterCosignature {
+            authority_key_id: m.key_id.clone(),
+            scrub_signature_classical: ed,
+            scrub_signature_pqc: Some(pqc),
+        });
+    }
+    out
+}
+
 /// A community `room` founded by `members[0]`, on `node`.
 async fn seed_community(node: &Node, room: &str, members: &[&Ident]) {
     use ciris_persist::federation::types::{Community, CommunityMember, SignedCommunity};
@@ -310,7 +329,7 @@ async fn seed_community(node: &Node, room: &str, members: &[&Ident]) {
             scrub_signature_classical: ed,
             scrub_signature_pqc: Some(pqc),
             supersede_proof: None,
-            cosignatures: Vec::new(),
+            cosignatures: cosign(&members[1..], &canonical).await,
             lineage: Vec::new(),
         })
         .await
@@ -345,7 +364,7 @@ async fn seed_family(node: &Node, family: &str, members: &[&Ident]) {
     let (ed, pqc) = founder.sign_hybrid(&canonical).await;
     node.dir
         .put_family(SignedFamily {
-            cosignatures: Vec::new(),
+            cosignatures: cosign(&members[1..], &canonical).await,
             family: record,
             authority_key_id: founder.key_id.clone(),
             scrub_signature_classical: ed,

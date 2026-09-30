@@ -170,17 +170,43 @@ async fn world() -> World {
         .expect("seed record");
     }
     // The pair room, members the two HUMANS — both FOUNDERS, so both are
-    // zero-hop moderators (§11.11) by construction: a `community` placement
-    // is a membership claim the put door proves against the cohort the row
-    // names (AV-45), and persist refuses to federate an unmoderated room.
-    let room = chat::pair_community_key_id("alice-fed", "bob-fed");
-    dir.put_community(
-        chat::signed_pair_community("alice-fed", "bob-fed", ts(), &alice_node)
-            .await
-            .expect("sign the room"),
+    // zero-hop moderators (§11.11): a `community` placement is a membership
+    // claim the put door proves against the cohort the row names (AV-45), and
+    // persist refuses to federate an unmoderated room. persist v52.0.0
+    // (CIRISPersist#955): alice founds it ALONE and proposes bob as founder;
+    // bob accepts; alice's side widens — the real flow, on one substrate.
+    let opened = chat::open_pair_room(
+        &*dir,
+        "alice-fed",
+        "bob-fed",
+        ts(),
+        chrono::Utc::now() + chrono::Duration::days(7),
+        &alice,
     )
     .await
-    .expect("the pair room is admitted");
+    .expect("alice opens the pair room");
+    let room = opened.room;
+    let acceptance = chat::accept_pair_proposal(
+        &*dir,
+        &opened.proposal.expect("bob is proposed").attestation_id,
+        &bob,
+    )
+    .await
+    .expect("bob accepts");
+    let widened = ciris_edge::membership::widen_on_acceptance(
+        &*dir,
+        &acceptance,
+        &ciris_edge::membership::MembershipWidener::new(vec![Arc::new(signer("alice-fed", 1))]),
+    )
+    .await
+    .expect("alice's side widens on bob's acceptance");
+    assert!(
+        matches!(
+            widened,
+            ciris_edge::membership::WidenOutcome::Widened { .. }
+        ),
+        "{widened:?}"
+    );
     World {
         dir,
         alice,
@@ -1364,11 +1390,14 @@ async fn signed_instants_are_canonical() {
 #[tokio::test]
 async fn both_members_of_the_pair_room_are_moderators() {
     let w = world().await;
-    let room = chat::pair_community("alice-fed", "bob-fed", ts());
-    assert!(room
-        .members
-        .iter()
-        .all(|m| m.role.as_deref() == Some("founder")));
+    // The END STATE (founding record + the #955 widening): both founders.
+    let roster = w
+        .dir
+        .active_community_members(&w.room)
+        .await
+        .expect("roster");
+    assert_eq!(roster.len(), 2);
+    assert!(roster.iter().all(|m| m.role.as_deref() == Some("founder")));
     let mods = ciris_persist::federation::admission::moderators_of(&*w.dir, &w.room, "moderate")
         .await
         .expect("moderators_of");
@@ -1862,14 +1891,12 @@ async fn the_same_message_sends_once_the_occurrences_are_provisioned() {
 
 // ─── CIRISEdge#608 — N-member rooms ──────────────────────────────────────
 
-/// **The pair record is byte-identical over the general builder.**
-///
-/// Every pair room on the mesh is a DERIVED id whose far end re-derives the
-/// same bytes independently; a changed byte in `pair_community` is a
-/// `CommunityRosterFork` on every one of them. So the record the general
-/// builder now produces for a pair is pinned against the shape the pair
-/// builder produced before the general one existed — hand-built here, the
-/// way it was written then.
+/// **The pair room's founding record, pinned** (persist v52.0.0,
+/// CIRISPersist#955). The room is founded by its OPENER alone — the far end
+/// joins by accepting a proposal — so the record is a function of (opener,
+/// peer, instant): the derived id and the sorted name, one founder, and
+/// `unanimous`. Hand-built here so a changed byte is a red test, not a
+/// `CommunityRosterFork` in the field.
 #[test]
 fn the_pair_room_is_byte_identical_over_the_general_builder() {
     use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
@@ -1881,14 +1908,11 @@ fn the_pair_room_is_byte_identical_over_the_general_builder() {
     let before = Community {
         community_key_id: chat::pair_community_key_id(a, b),
         community_name: format!("{} <-> {}", members[0], members[1]),
-        members: members
-            .iter()
-            .map(|k| CommunityMember {
-                key_id: (*k).to_owned(),
-                joined_at: ts(),
-                role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
-            })
-            .collect(),
+        members: vec![CommunityMember {
+            key_id: a.to_owned(), // the opener, and only the opener
+            joined_at: ts(),
+            role: Some(MEMBER_ROLE_FOUNDER.to_owned()),
+        }],
         founded_at: ts(),
         consensus_protocol: consensus_protocol::UNANIMOUS.to_owned(),
         policy_blob: None,
@@ -2167,16 +2191,13 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
     let b = peer(&humans, ("bob-fed", 3)).await;
     let c = peer(&humans, ("carol-fed", 5)).await;
 
-    // ── The room, created once with its full roster, on every node ──
+    // ── The room: founded by alice ALONE on every node (persist v52.0.0,
+    //    CIRISPersist#955 — a founding record admits only its signers) ──
     let room = chat::new_room_community_key_id();
     let roster = chat::community(
         &room,
         "the trio",
-        &[
-            ("alice-fed", Some(MEMBER_ROLE_FOUNDER)),
-            ("bob-fed", None),
-            ("carol-fed", None),
-        ],
+        &[("alice-fed", Some(MEMBER_ROLE_FOUNDER))],
         consensus_protocol::FOUNDER_ONLY,
         ts(),
     )
@@ -2197,6 +2218,65 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
             })
             .await
             .expect("register the room id as a key (persist fixture convention)");
+    }
+    // ── Bob and carol join by consent: alice proposes, each accepts, alice
+    //    widens — on alice's node, then the rows cross to the other two ──
+    for (member, who) in [(&bob, "bob-fed"), (&carol, "carol-fed")] {
+        let proposal = ciris_edge::membership::propose(
+            &*a.dir,
+            ciris_edge::membership::GroupScope::Community,
+            &room,
+            who,
+            None,
+            chrono::Utc::now() + chrono::Duration::days(7),
+            &alice,
+        )
+        .await
+        .expect("alice proposes");
+        ciris_edge::membership::reply(&*a.dir, &proposal.attestation_id, true, member)
+            .await
+            .expect("the member accepts");
+        assert!(ciris_edge::membership::widen(
+            &*a.dir,
+            ciris_edge::membership::GroupScope::Community,
+            &room,
+            who,
+            None,
+            ts(),
+            &alice,
+        )
+        .await
+        .expect("alice widens on the acceptance"));
+    }
+    let consent_rows: Vec<_> = a
+        .dir
+        .list_attestations_since(None, 1024)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.attestation)
+        .filter(ciris_edge::membership::is_membership_row)
+        .collect();
+    let widenings = a
+        .dir
+        .list_signed_community_membership_widenings_since(None, 64)
+        .await
+        .unwrap();
+    for to in [&b, &c] {
+        for row in &consent_rows {
+            to.dir
+                .put_attestation(ciris_persist::federation::SignedAttestation {
+                    attestation: row.clone(),
+                })
+                .await
+                .expect("a peer admits the replicated consent row");
+        }
+        for w in &widenings {
+            to.dir
+                .put_community_membership_widening(w.widening.clone())
+                .await
+                .expect("a peer admits the replicated widening");
+        }
     }
     // ── The planes: everyone knows everyone's engine ──
     for (from, to) in [(&a, &b), (&a, &c), (&b, &a), (&b, &c), (&c, &a), (&c, &b)] {

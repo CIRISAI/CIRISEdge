@@ -187,26 +187,54 @@ fn store() -> ScopeStateProvider {
 /// `open_two_person_community` builds the MLS group under a bespoke id; this
 /// registers that same id as the community persist checks membership against
 /// when a commit row is widened to the room.
+///
+/// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133): nobody joins
+/// without their own consent, so alice founds the room ALONE, proposes bob as
+/// `founder`, bob's node accepts for bob, and alice widens on the acceptance —
+/// the same end state (two founders), reached the only admissible way.
 async fn register_room(dir: &SqliteBackend, room: &str, alice: &Party, bob: &Party) {
+    use ciris_edge::membership::{self, GroupScope, MembershipWidener, WidenOutcome};
     use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
     use ciris_persist::federation::types::consensus_protocol;
     let record = ciris_edge::chat::community(
         room,
         "Chat",
-        &[
-            (&alice.fed_id, Some(MEMBER_ROLE_FOUNDER)),
-            (&bob.fed_id, Some(MEMBER_ROLE_FOUNDER)),
-        ],
+        &[(&alice.fed_id, Some(MEMBER_ROLE_FOUNDER))],
         consensus_protocol::UNANIMOUS,
         ts(),
     )
-    .expect("a two-founder roster");
+    .expect("the opener founds it");
     let signed = ciris_edge::chat::signed_community(record, &alice.node_signer)
         .await
         .expect("sign the room");
     dir.put_community(signed)
         .await
         .expect("the room is admitted");
+    let proposal = membership::propose(
+        dir,
+        GroupScope::Community,
+        room,
+        &bob.fed_id,
+        Some(MEMBER_ROLE_FOUNDER),
+        chrono::Utc::now() + chrono::Duration::days(7),
+        &alice.node_signer,
+    )
+    .await
+    .expect("alice's node proposes bob");
+    let acceptance = membership::reply(dir, &proposal.attestation_id, true, &bob.node_signer)
+        .await
+        .expect("bob's node accepts for bob");
+    let widened = membership::widen_on_acceptance(
+        dir,
+        &acceptance,
+        &MembershipWidener::new(vec![Arc::new(signer(&alice.fed_id, 1))]),
+    )
+    .await
+    .expect("alice widens on the acceptance");
+    assert!(
+        matches!(widened, WidenOutcome::Widened { .. }),
+        "{widened:?}"
+    );
 }
 
 /// Carry a commit the way the mesh does (CIRISEdge#604): as a signed
