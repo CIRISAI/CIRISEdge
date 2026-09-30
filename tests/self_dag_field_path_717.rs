@@ -1065,7 +1065,7 @@ async fn withdrawn_files_chunks_stop_being_served_766(
     let shape = |r: &Result<Option<Vec<u8>>, ChunkSourceRefusal>| match r {
         Ok(Some(_)) => "bytes".to_owned(),
         Ok(None) => "not held".to_owned(),
-        Err(e) => format!("{e:?}"),
+        Err(refusal) => format!("{refusal:?}"),
     };
     let warm_answer = shape(&unarmed.read_chunk(y_sha, y_chunk, peer).await);
     assert!(
