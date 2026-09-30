@@ -3,10 +3,12 @@
 //!
 //! Every node here is its own SQLite substrate, seeded with the same
 //! identities and rosters, sharing nothing but what a test hands over — the
-//! harness of `blob_federation_e2e.rs`. A file over the inline bound is
-//! published through `files::publish`, its crossed row is admitted on the
-//! receiver, the receiver's `BlobPuller` walks the DAG through persist's real
-//! doors (`pull_dag_with` over a fetcher reading the author's peer-serve door),
+//! harness of `blob_federation_e2e.rs`. A file is published through
+//! `files::publish`, its crossed row is admitted on the receiver, the
+//! receiver's `BlobPuller` pulls it through persist's real doors over a
+//! fetcher reading the author's peer-serve door (`pull_dag_with` walks a file
+//! over the inline bound; `pull_inline_with` stores one under it, whose log is
+//! persist's one-leaf `inline_blob_stream_id`, CIRISPersist#953),
 //! and the receipt the receiver emits is handed back to the author's node and
 //! admitted there — then read with `FileRow::received_by`.
 //!
@@ -487,7 +489,22 @@ struct Published {
 }
 
 async fn publish(author: &Node, room: &ScopeRoom, seed: u32) -> Published {
-    let plain = body_of(FILE_LEN, seed);
+    let file = publish_len(author, room, seed, FILE_LEN).await;
+    assert!(
+        FileRow::from_row(&file.row)
+            .expect("file")
+            .pointer
+            .stream_id
+            .is_some(),
+        "over the bound: a chunk DAG"
+    );
+    file
+}
+
+/// [`publish`] at any length: at or under the inline bound the file is one
+/// blob, and its stream is the one-leaf log persist names after its address.
+async fn publish_len(author: &Node, room: &ScopeRoom, seed: u32, len: usize) -> Published {
+    let plain = body_of(len, seed);
     let published = ciris_edge::files::publish(
         &*author.dir,
         &author.store,
@@ -505,12 +522,8 @@ async fn publish(author: &Node, room: &ScopeRoom, seed: u32) -> Published {
         },
     )
     .await
-    .expect("publish a chunked file");
-    let stream_id = published
-        .pointer
-        .stream_id
-        .clone()
-        .expect("over the bound: a chunk DAG");
+    .expect("publish a file");
+    let stream_id = receipts::receipt_stream_id(&published.pointer).expect("a file's stream");
     let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
         .expect("hex")
         .try_into()
@@ -527,11 +540,15 @@ async fn publish(author: &Node, room: &ScopeRoom, seed: u32) -> Published {
         .await
         .expect("read")
         .expect("the crossed row");
-    let chunks = author
-        .dir
-        .stream_chunk_shas(&stream_id)
-        .await
-        .expect("stream chunks");
+    let chunks = if published.pointer.stream_id.is_some() {
+        author
+            .dir
+            .stream_chunk_shas(&stream_id)
+            .await
+            .expect("stream chunks")
+    } else {
+        Vec::new()
+    };
     Published {
         row,
         sha,
@@ -822,6 +839,11 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
     assert_eq!(received.len(), 1, "exactly one receipt: {received:?}");
     assert_eq!(received[0].node_key_id, node_b.me);
     assert_eq!((received[0].epoch, received[0].k), (0, 5));
+    assert!(
+        received[0].at > file.row.asserted_at && received[0].at <= chrono::Utc::now(),
+        "`at` is when A's store took the receipt (CIRISPersist#953): {}",
+        received[0].at
+    );
     assert!(bridge
         .receipt_ledger()
         .is_receipted(&node_b.me, &file.stream_id));
@@ -855,22 +877,179 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
     );
 }
 
+// ─── INLINE: a file under the bound is receipted too ──────────────────
+
+/// The inline witness's file: well under the 1 MiB inline bound.
+const INLINE_LEN: usize = 200_000;
+
+/// **Inline (≤ 1 MiB, self, two devices): the one-leaf STH at publish,
+/// exactly one receipt from the second device on inline admission, `at`
+/// populated on the author's read, the re-offer stops, and a forged receipt
+/// naming a self-invented root is refused by name.** (CIRISPersist#953.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // the whole ladder, in order, on purpose
+async fn an_inline_self_file_is_receipted_once_by_the_owners_other_device() {
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let alice_phone = Ident::new("alice-phone", 0x33);
+    let node_a = node(&[&alice], &alice).await;
+    let node_b = device(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    federate_all(&[&node_a, &node_b]).await;
+    let edge_b = edge_of(&node_b);
+
+    let room = ciris_edge::self_room::room(&alice.key_id);
+    let file = publish_len(&node_a, &room, 0x1a1e, INLINE_LEN).await;
+    let file_row = FileRow::from_row(&file.row).expect("a file row");
+    assert!(file_row.pointer.stream_id.is_none(), "an inline file");
+
+    // PUBLISH: the one-leaf log is persist's name for the blob, and its STH
+    // is published on A and rides the row.
+    assert_eq!(
+        file.stream_id,
+        ciris_persist::federation::stream_sth::inline_blob_stream_id(&file.sha),
+        "an inline file's log is named after its address"
+    );
+    let sth_a = node_a
+        .dir
+        .latest_stream_sth(&file.stream_id)
+        .await
+        .expect("read")
+        .expect("files::publish published the inline file's one-leaf STH");
+    assert_eq!(sth_a.tree_size, 1, "one leaf: the blob's own address");
+    let claim = receipts::StreamSthClaim::from_row(&file.row).expect("the row carries the STH");
+    assert_eq!(claim.stream_id, file.stream_id);
+    assert_eq!(claim.root().expect("root"), sth_a.root_hash);
+    assert_eq!(claim.tree_size, 1);
+
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: file.row.clone(),
+        })
+        .await
+        .expect("B admits the crossed row");
+    cross_keys(&node_a, &node_b).await;
+    let puller = puller_of(&node_b, &edge_b);
+    assert!(receipt_rows(&node_b, &file.stream_id).await.is_empty());
+
+    // A stream pointer is not the inline door's.
+    // (The DAG door refuses this one by name, the mirror image.)
+    assert!(matches!(
+        puller
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b, None))
+            .await,
+        PullOutcome::Refused(_)
+    ));
+    assert!(receipt_rows(&node_b, &file.stream_id).await.is_empty());
+
+    // INLINE ADMISSION: stored, and ONE receipt, as the node, K = 1.
+    assert_eq!(
+        puller
+            .pull_inline_with(&file.row, file.sha, &fetch_from(&node_a, &node_b, None))
+            .await,
+        PullOutcome::Stored { announced: false }
+    );
+    let rows = receipt_rows(&node_b, &file.stream_id).await;
+    assert_eq!(rows.len(), 1, "exactly one receipt row: {rows:#?}");
+    let receipt_row = rows[0].clone();
+    assert_eq!(
+        receipt_row.attesting_key_id, node_b.me,
+        "signed by the NODE"
+    );
+    assert_eq!(
+        receipt_row.cohort_scope, "self",
+        "the room's delivered path"
+    );
+    let held_b = node_b
+        .dir
+        .list_delivery_receipts_for(&file.stream_id, 10)
+        .await
+        .expect("list");
+    assert_eq!(held_b.len(), 1);
+    assert_eq!(held_b[0].k, 1, "K = tree_size = 1");
+    assert_eq!(
+        held_b[0].chunk_root, sth_a.root_hash,
+        "the root B's own blob reproduces is A's published root"
+    );
+    assert_eq!(counted(&edge_b, receipts::RECEIPT_EMITTED), 1);
+
+    // Held is held: a re-pull emits nothing more.
+    assert_eq!(
+        puller
+            .pull_inline_with(&file.row, file.sha, &fetch_from(&node_a, &node_b, None))
+            .await,
+        PullOutcome::AlreadyHeld
+    );
+    assert_eq!(receipt_rows(&node_b, &file.stream_id).await.len(), 1);
+
+    // DELIVERED back to A through its bridge apply path; received_by names B
+    // with the instant A's store took it; the advertise to B drops the row.
+    let bridge = bridge_of(&node_a, vec![node_a.me.clone(), alice.key_id.clone()]);
+    assert!(
+        offered_to(&bridge, &node_a, &file.row, &node_b.me).await,
+        "before the receipt, A offers the file row to alice's other device"
+    );
+    assert!(file_row
+        .received_by(&node_a.store)
+        .await
+        .expect("read")
+        .is_empty());
+    assert_eq!(
+        apply_through(&bridge, &receipt_row, &node_b.me).await,
+        ciris_edge::replication::summary::ApplyOutcome::Admitted,
+        "A's bridge admits B's inline receipt row"
+    );
+    let received = file_row.received_by(&node_a.store).await.expect("read");
+    assert_eq!(received.len(), 1, "exactly one receipt: {received:?}");
+    assert_eq!(received[0].node_key_id, node_b.me);
+    assert_eq!((received[0].epoch, received[0].k), (0, 1));
+    assert!(
+        received[0].at > file.row.asserted_at && received[0].at <= chrono::Utc::now(),
+        "`at` is when A's store took the receipt: {}",
+        received[0].at
+    );
+    assert!(bridge
+        .receipt_ledger()
+        .is_receipted(&node_b.me, &file.stream_id));
+    assert!(
+        !offered_to(&bridge, &node_a, &file.row, &node_b.me).await,
+        "a device that receipted the inline file is not re-offered its row"
+    );
+
+    // A forged inline receipt naming a self-invented root: refused by name.
+    let ledger = ReceiptLedger::new();
+    let forged = forged_row(&node_b, &file.row, &file.stream_id, 0, [0x42; 32], 1).await;
+    let refused = deliver_receipt(&node_a, &forged, &ledger).await;
+    assert!(
+        matches!(refused, Err(ReceiptRefusal::RootUnpublished { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(
+        refused.expect_err("refused").tag(),
+        receipts::RECEIPT_ROOT_UNPUBLISHED
+    );
+    assert_eq!(
+        file_row
+            .received_by(&node_a.store)
+            .await
+            .expect("read")
+            .len(),
+        1,
+        "still exactly one"
+    );
+}
+
 // ─── FAMILY: two persons ──────────────────────────────────────────────
 
 /// **Family (two persons): a receipt from the other person's device; none
 /// admitted from a non-family node.**
 ///
-/// Blocked at persist rev 9d406712: a family file cannot be PUBLISHED. The
-/// content `key_grant` set for a `family` seal is emitted at `cohort_scope:
-/// family` with no `family_key_id` cohort target (`federation/key_grant.rs`,
-/// `KeyGrantSet::envelope_extra` — the `Content` arm writes `owner_key_id`
-/// only), and persist's write gate refuses a family row naming no family
-/// (`federation/admission.rs`, `check_write_cohort_scope`, the `Family` arm:
-/// `NoFamilyMembership`), so `put_blob_chunk_scoped` fails "attestation
-/// emission failed" before any receipt can exist. Un-ignore when persist
-/// carries the family target on the content set (lane 3 of CIRISEdge#734).
+/// Was `#[ignore]`d twice: at persist 9d406712 no family file could be
+/// published (CIRISPersist#953 item 1), and at e398da3c the other member's
+/// node refused the bytes `NotPartyTo` (the hold gate's family arm read only
+/// the operator predicate, CIRISPersist#960). Both fixed in persist v52;
+/// un-ignored by the family lane (CIRISEdge#736).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "persist 9d406712: a family content key_grant carries no family_key_id, so every family seal is refused (see doc)"]
 async fn a_family_file_is_receipted_by_the_other_persons_device_and_no_one_else() {
     init_tracing();
     let alice = Ident::new("alice-fed", 0x11);

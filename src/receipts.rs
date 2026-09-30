@@ -1,24 +1,26 @@
 //! **Delivery receipts for files** — CC 5.3.3.6 `delivery_receipt:{stream_id}`
 //! (CIRISEdge#738, lane 4 of #734; `FSD/CONTENT_TRANSFER.md` §6.10).
 //!
-//! A chunked file already is a stream (`stream_id`, chunks at `seq`), so a file
-//! receipt is CC 5.3.3.6's object at the file's stream with `K` = the stream's
-//! `tree_size` (its chunk count): the receiving NODE's signed statement that it
+//! Every file is a stream (a chunked file's `stream_id`, an inline file's
+//! one-leaf log — below), so a file receipt is CC 5.3.3.6's object at the
+//! file's stream with `K` = the stream's `tree_size` (its chunk count, 1 for
+//! an inline file): the receiving NODE's signed statement that it
 //! holds bytes committing to every chunk under the named root. Proof of
 //! DELIVERY, never of consumption; "delivered" is the caller's verdict.
 //!
 //! # The four places a receipt is touched, one function each
 //!
 //! 1. **Publish** — [`stream_sth_for_file`] builds the producer-signed STH
-//!    (verify-core's [`SignedTreeHead`], signed by the node's hybrid signer);
-//!    `files::publish` puts it through persist's `put_stream_sth` (the
-//!    anti-equivocation gate recomputes the root from the stored chunks) and
-//!    carries it on the file row as [`FIELD_STREAM_STH`], so it travels with
-//!    the row at the row's audience and a receiver holds the claim the moment
-//!    it holds the row.
-//! 2. **Receive** — [`on_dag_pulled`], called once from the DAG pull after
-//!    `promote`: the receiver puts the row's STH into its OWN store, where
-//!    persist recomputes the root from the chunks this node just adopted — so
+//!    through persist's one producer (`stream_sth::produce_stream_sth`, the
+//!    root `put_stream_sth`'s anti-equivocation gate recomputes, signed by
+//!    the node's hybrid signer); `files::publish` puts it through persist's
+//!    `put_stream_sth` and carries it on the file row as [`FIELD_STREAM_STH`],
+//!    so it travels with the row at the row's audience and a receiver holds
+//!    the claim the moment it holds the row.
+//! 2. **Receive** — [`on_file_pulled`], called once from the DAG pull after
+//!    `promote` and once from the whole-blob pull after an inline file is
+//!    stored: the receiver puts the row's STH into its OWN store, where
+//!    persist recomputes the root from the bytes this node just adopted — so
 //!    the root it signs is one its own bytes reproduce — then signs the receipt
 //!    as the node, stores it, and emits it as a `scores` row on
 //!    `delivery_receipt:{stream_id}:v1` at the file's own cohort (self → the
@@ -28,27 +30,33 @@
 //!    row arrives: every refusal has a name ([`ReceiptRefusal::tag`]), counted
 //!    under `delivery_receipts`, then persist's `put_delivery_receipt` (the
 //!    signature over the pinned key and the JOIN against a published root).
-//! 4. **Read** — `FileRow::received_by` over `list_delivery_receipts_for`, and
-//!    the [`ReceiptLedger`] the replication bridge consults so a row a peer has
-//!    receipted in full is not re-offered to that peer.
+//! 4. **Read** — `FileRow::received_by` over
+//!    `list_stored_delivery_receipts_for` (with the instant the author's store
+//!    took each receipt), and the [`ReceiptLedger`] the replication bridge
+//!    consults so a row a peer has receipted in full is not re-offered to that
+//!    peer.
 //!
-//! # Inline files carry no receipt at this persist pin
+//! # Every file is a stream
 //!
-//! persist's `put_stream_sth` recomputes the root from
-//! `federation_stream_chunks` rows, and an inline file (≤ 1 MiB) is one blob
-//! row with no stream rows, so a one-leaf STH over it is refused as an
-//! over-claimed `tree_size`. Only chunk-DAG files are receiptable until persist
-//! grows a door for a one-leaf stream over an inline blob.
+//! A chunked file's stream is its `stream_id`, its leaves the chunk addresses
+//! in `seq` order. An inline file (≤ 1 MiB) is one blob with no stream rows;
+//! its log is persist's `stream_sth::inline_blob_stream_id(&sha)` (the at-rest
+//! address as 64 lowercase hex, CIRISPersist#953) with ONE leaf, the blob's
+//! own address, `tree_size` 1. [`receipt_stream_id`] is the one place a
+//! file's stream is named.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use base64::Engine as _;
+use ciris_persist::federation::stream_receipt::StoredDeliveryReceipt;
 use ciris_persist::federation::stream_receipt::{receipt_signing_bytes, DeliveryReceipt};
+use ciris_persist::federation::stream_sth::{inline_blob_of_stream_id, inline_blob_stream_id};
 use ciris_persist::federation::{Attestation, BlobError, BlobStorage, FederationDirectory};
 use ciris_verify_core::transparency::SignedTreeHead;
 
 use crate::files::{FileRow, FILE_DIMENSION};
+use crate::group_content::BlobPointer;
 
 /// The reserved family's stem (CC 3.4.6, registered to Edge).
 pub const RECEIPT_DIMENSION_PREFIX: &str = "delivery_receipt:";
@@ -134,24 +142,51 @@ pub fn receipt_row_stream(row: &Attestation) -> Option<&str> {
         .and_then(stream_of_receipt_dimension)
 }
 
-/// The `stream_id` a chunked FILE row points at — the cheap read the advertise
-/// loop uses (no full `FileRow` parse).
+/// **The stream a file's receipts name** — the one place it is spelled. A
+/// chunk DAG's is its `stream_id`; an inline file's is persist's
+/// [`inline_blob_stream_id`] over its at-rest address (CIRISPersist#953).
+/// `None` only for a pointer whose address is not 32 bytes of hex.
+#[must_use]
+pub fn receipt_stream_id(pointer: &BlobPointer) -> Option<String> {
+    if let Some(stream_id) = &pointer.stream_id {
+        return Some(stream_id.clone());
+    }
+    inline_address(pointer).map(|sha| inline_blob_stream_id(&sha))
+}
+
+/// An inline pointer's at-rest address, decoded.
+fn inline_address(pointer: &BlobPointer) -> Option<[u8; 32]> {
+    hex::decode(&pointer.content_sha256)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+}
+
+/// The stream a FILE row's receipts name — the cheap read the advertise loop
+/// uses (no full `FileRow` parse). A chunked row's `stream_id`; an inline
+/// row's address, which is its log's name exactly when it is spelled the way
+/// [`inline_blob_stream_id`] spells it (64 lowercase hex, as every edge
+/// pointer is written) — so this agrees with [`receipt_stream_id`].
 #[must_use]
 pub fn file_row_stream(row: &Attestation) -> Option<&str> {
     let env = &row.attestation_envelope;
     if env.get("dimension").and_then(serde_json::Value::as_str) != Some(FILE_DIMENSION) {
         return None;
     }
-    env.get(crate::chat::FIELD_CONTENT)?
-        .get("stream_id")?
-        .as_str()
+    let content = env.get(crate::chat::FIELD_CONTENT)?;
+    if let Some(stream_id) = content.get("stream_id").and_then(serde_json::Value::as_str) {
+        return Some(stream_id);
+    }
+    content
+        .get("content_sha256")
+        .and_then(serde_json::Value::as_str)
+        .filter(|sha| inline_blob_of_stream_id(sha).is_some())
 }
 
-// ─── The stream log: persist's five doors, object-safe ────────────────
+// ─── The stream log: persist's six doors, object-safe ────────────────
 
 /// persist's per-stream transparency-log and receipt doors, as an object-safe
 /// trait so a `dyn` store, the puller's concrete backend and the bridge's
-/// engine all reach the same five calls. Implemented for every
+/// engine all reach the same six calls. Implemented for every
 /// [`BlobStorage`]; no edge-side storage.
 #[async_trait::async_trait]
 pub trait StreamLog: Send + Sync {
@@ -174,6 +209,13 @@ pub trait StreamLog: Send + Sync {
         stream_id: &str,
         limit: i64,
     ) -> Result<Vec<DeliveryReceipt>, BlobError>;
+    /// The stored receipts for the stream, each with the instant this store
+    /// took it (CIRISPersist#953).
+    async fn list_stored_delivery_receipts_for(
+        &self,
+        stream_id: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredDeliveryReceipt>, BlobError>;
 }
 
 #[async_trait::async_trait]
@@ -216,6 +258,14 @@ where
     ) -> Result<Vec<DeliveryReceipt>, BlobError> {
         BlobStorage::list_delivery_receipts_for(self, stream_id, limit).await
     }
+
+    async fn list_stored_delivery_receipts_for(
+        &self,
+        stream_id: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredDeliveryReceipt>, BlobError> {
+        BlobStorage::list_stored_delivery_receipts_for(self, stream_id, limit).await
+    }
 }
 
 /// The stream log an [`Engine`](ciris_persist::Engine) is built over, or
@@ -237,22 +287,19 @@ pub fn stream_log_of(engine: &ciris_persist::Engine) -> Option<std::sync::Arc<dy
 /// **The stream's producer-signed STH — the one place edge builds it**
 /// (CIRISEdge#738, CC 5.3.3.3).
 ///
-/// `log_id = stream:<stream_id>`, `tree_size` = the leaves given, root =
-/// RFC 6962 over the chunk addresses in `seq` order, computed by verify-core's
-/// [`InMemoryTransparencyStore`](ciris_verify_core::transparency::InMemoryTransparencyStore)
-/// over persist's own leaf type ([`StreamChunkLeaf`](ciris_persist::federation::StreamChunkLeaf)),
-/// the bytes signed are [`SignedTreeHead::signing_bytes`], and the signature is
-/// the node's full hybrid (`identity::sign_hybrid_raw`). No byte here is
-/// spelled by edge.
-///
-/// The signature mirrors persist v51.4.0's
+/// One call to persist's producer,
 /// `federation::stream_sth::produce_stream_sth(local, stream_id,
-/// chunk_shas_in_seq_order, tree_size, timestamp)`; when edge adopts that pin
-/// this body becomes that one call.
+/// chunk_shas_in_seq_order, tree_size, timestamp)` (CIRISPersist#950): the
+/// RFC 6962 root over the first `tree_size` leaves, `log_id =
+/// stream:<stream_id>`, [`SignedTreeHead::signing_bytes`], and the full
+/// hybrid under `signer` — exactly the root `put_stream_sth`'s
+/// anti-equivocation gate recomputes. No byte here is spelled by edge. For an
+/// inline file the call is `(inline_blob_stream_id(&sha), &[sha], 1)`
+/// ([`file_leaves`]).
 ///
 /// # Errors
-/// `tree_size` exceeds the leaves given, the tree could not be built, or the
-/// signer has no PQC half.
+/// `tree_size` is 0 or exceeds the leaves given, or the signer has no PQC
+/// half (the federation tier is PQC-mandatory, CC 5.3.2.4.3) or fails.
 pub async fn stream_sth_for_file(
     signer: &crate::identity::LocalSigner,
     stream_id: &str,
@@ -260,61 +307,80 @@ pub async fn stream_sth_for_file(
     tree_size: u64,
     timestamp: chrono::DateTime<chrono::Utc>,
 ) -> Result<SignedTreeHead, String> {
-    use ciris_verify_core::transparency::{InMemoryTransparencyStore, TransparencyStore as _};
-    let n = usize::try_from(tree_size).map_err(|_| "tree_size exceeds usize".to_owned())?;
-    let leaves = chunk_shas_in_seq_order.get(..n).ok_or_else(|| {
-        format!(
-            "stream {stream_id}: tree_size {tree_size} over {} leaves",
-            chunk_shas_in_seq_order.len()
-        )
-    })?;
-    let store: InMemoryTransparencyStore<ciris_persist::federation::StreamChunkLeaf> =
-        InMemoryTransparencyStore::new(None);
-    for sha in leaves {
-        store
-            .append(ciris_persist::federation::StreamChunkLeaf::new(*sha))
-            .map_err(|e| format!("stream {stream_id}: leaf: {e}"))?;
+    if signer.pqc.is_none() {
+        return Err(format!(
+            "stream {stream_id}: signer {} has no ML-DSA-65 half — a stream STH is the full \
+             hybrid or nothing (CC 5.3.2.4.3)",
+            signer.key_id
+        ));
     }
-    let root_hash = store
-        .root()
-        .map_err(|e| format!("stream {stream_id}: root: {e}"))?;
-    let log_id = ciris_persist::federation::log_id_for_stream(stream_id);
-    let bytes = SignedTreeHead::signing_bytes(&log_id, tree_size, &root_hash, timestamp);
-    let signature = crate::identity::sign_hybrid_raw(signer, &bytes, "stream STH").await?;
-    Ok(SignedTreeHead {
-        log_id,
+    let local = ciris_persist::signing::LocalSigner::from_hardware_parts(
+        signer.classical.clone(),
+        signer.key_id.clone(),
+        signer.pqc.clone(),
+        Some(signer.key_id.clone()),
+    )
+    .await
+    .map_err(|e| format!("stream {stream_id}: signer {}: {e}", signer.key_id))?;
+    ciris_persist::federation::stream_sth::produce_stream_sth(
+        &local,
+        stream_id,
+        chunk_shas_in_seq_order,
         tree_size,
-        root_hash,
         timestamp,
-        signature,
-        witness_signatures: Vec::new(),
-    })
+    )
+    .await
+    .map_err(|e| format!("stream {stream_id}: {e}"))
 }
 
-/// **Publish a file stream's STH** — read the stream's chunks from the store
-/// that sealed them, build the STH over all of them, and put it through
-/// persist's gate. Returns the claim the file row carries.
+/// **A file's stream and its leaves in `seq` order**, read from the store
+/// that sealed it: a chunk DAG's chunk addresses, or an inline file's one
+/// leaf — its own at-rest address, under [`inline_blob_stream_id`].
 ///
 /// # Errors
-/// The chunk read, the STH build, or persist's gate refused.
+/// The pointer names no readable address, the chunk read failed, or the
+/// stream holds no chunks.
+pub async fn file_leaves(
+    log: &dyn StreamLog,
+    pointer: &BlobPointer,
+) -> Result<(String, Vec<[u8; 32]>), String> {
+    if let Some(stream_id) = &pointer.stream_id {
+        let shas = log
+            .stream_chunk_shas(stream_id)
+            .await
+            .map_err(|e| format!("stream {stream_id}: chunks: {e}"))?;
+        if shas.is_empty() {
+            return Err(format!("stream {stream_id}: no chunks to commit to"));
+        }
+        return Ok((stream_id.clone(), shas));
+    }
+    let sha = inline_address(pointer).ok_or_else(|| {
+        format!(
+            "inline file: address {:?} is not 32 bytes of hex",
+            pointer.content_sha256
+        )
+    })?;
+    Ok((inline_blob_stream_id(&sha), vec![sha]))
+}
+
+/// **Publish a file's STH** — the file's stream and leaves
+/// ([`file_leaves`]), the STH over all of them ([`stream_sth_for_file`]),
+/// through persist's gate. Returns the claim the file row carries.
+///
+/// # Errors
+/// The leaf read, the STH build, or persist's gate refused.
 pub async fn publish_file_sth(
     log: &dyn StreamLog,
     signer: &crate::identity::LocalSigner,
-    stream_id: &str,
+    pointer: &BlobPointer,
     timestamp: chrono::DateTime<chrono::Utc>,
 ) -> Result<StreamSthClaim, String> {
-    let shas = log
-        .stream_chunk_shas(stream_id)
-        .await
-        .map_err(|e| format!("stream {stream_id}: chunks: {e}"))?;
-    if shas.is_empty() {
-        return Err(format!("stream {stream_id}: no chunks to commit to"));
-    }
-    let sth = stream_sth_for_file(signer, stream_id, &shas, shas.len() as u64, timestamp).await?;
+    let (stream_id, shas) = file_leaves(log, pointer).await?;
+    let sth = stream_sth_for_file(signer, &stream_id, &shas, shas.len() as u64, timestamp).await?;
     log.put_stream_sth(sth.clone(), &signer.key_id)
         .await
         .map_err(|e| format!("stream {stream_id}: put_stream_sth: {e}"))?;
-    Ok(StreamSthClaim::of(stream_id, &sth, &signer.key_id))
+    Ok(StreamSthClaim::of(&stream_id, &sth, &signer.key_id))
 }
 
 /// **The STH as the file row carries it.** Compact: the signature's two
@@ -724,12 +790,14 @@ where
     })
 }
 
-/// **The DAG pull's one hook** (`blob_swarm::pull`): on `Stored` for a file
-/// row whose pointer names a stream, [`emit_receipt`], counted. Every other
-/// outcome — a refusal, a wait for the key, a resume still missing chunks —
-/// emits nothing, which is what "none before promote" and "none after a
-/// tampered chunk" rest on.
-pub async fn on_dag_pulled<B>(
+/// **The pull's receipt hook** — called from exactly two places in
+/// `blob_swarm::pull`: the DAG walk after `promote`, and the whole-blob pull
+/// after an inline file is stored. On `Stored` for a file row,
+/// [`emit_receipt`] over the file's stream ([`receipt_stream_id`]), counted.
+/// Every other outcome — a refusal, a wait for the key, a resume still
+/// missing chunks — emits nothing, which is what "none before promote" and
+/// "none after a tampered chunk" rest on.
+pub async fn on_file_pulled<B>(
     engine: &ciris_persist::Engine,
     backend: &B,
     local_key_id: &str,
@@ -745,7 +813,7 @@ pub async fn on_dag_pulled<B>(
     let Some(file) = FileRow::from_row(row) else {
         return;
     };
-    let Some(stream_id) = file.pointer.stream_id.clone() else {
+    let Some(stream_id) = receipt_stream_id(&file.pointer) else {
         return;
     };
     match emit_receipt(engine, backend, local_key_id, row, &file, &stream_id).await {
@@ -950,7 +1018,7 @@ pub async fn admit_receipt_row(
         .map_err(|e| ReceiptRefusal::Substrate(format!("read {file_id}: {e}")))?
         .ok_or_else(|| ReceiptRefusal::FileUnknown(format!("{file_id} is not held here")))?;
     let file = FileRow::from_row(&file_row)
-        .filter(|f| f.pointer.stream_id.as_deref() == Some(stream_id.as_str()))
+        .filter(|f| receipt_stream_id(&f.pointer).as_deref() == Some(stream_id.as_str()))
         .ok_or_else(|| {
             ReceiptRefusal::FileUnknown(format!("{file_id} is not a file on stream {stream_id}"))
         })?;
@@ -1144,11 +1212,11 @@ pub struct Received {
     /// The epoch it receipted.
     pub epoch: u64,
     /// Chunks acknowledged (`K`); equal to the file's chunk count for a whole
-    /// file.
+    /// file (1 for an inline file).
     pub k: u64,
-    /// When. `None` at this persist pin: `list_delivery_receipts_for` does not
-    /// return the `received_at` column it stores.
-    pub at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the author's store took the receipt (persist's `received_at`,
+    /// CIRISPersist#953) — the store's fact, not the subscriber's claim.
+    pub at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The receipts `stream_id` holds in `log`, as [`Received`].
@@ -1157,16 +1225,21 @@ pub struct Received {
 /// The store read failed.
 pub async fn received_for(log: &dyn StreamLog, stream_id: &str) -> Result<Vec<Received>, String> {
     Ok(log
-        .list_delivery_receipts_for(stream_id, RECEIPT_LIST_LIMIT)
+        .list_stored_delivery_receipts_for(stream_id, RECEIPT_LIST_LIMIT)
         .await
         .map_err(|e| format!("list receipts for {stream_id}: {e}"))?
         .into_iter()
-        .map(|r| Received {
-            node_key_id: r.subscriber_key_id,
-            epoch: r.epoch,
-            k: r.k,
-            at: None,
-        })
+        .map(
+            |StoredDeliveryReceipt {
+                 receipt,
+                 received_at,
+             }| Received {
+                node_key_id: receipt.subscriber_key_id,
+                epoch: receipt.epoch,
+                k: receipt.k,
+                at: received_at,
+            },
+        )
         .collect())
 }
 
@@ -1277,6 +1350,15 @@ mod tests {
             additional_scrubs: Vec::new(),
         };
         assert_eq!(file_row_stream(&row), Some("file-x"));
+        // An inline file names its one-leaf log: its address, as persist
+        // spells it — and only that spelling.
+        let sha = [0xab; 32];
+        let inline = inline_blob_stream_id(&sha);
+        row.attestation_envelope["content"] = serde_json::json!({ "content_sha256": inline });
+        assert_eq!(file_row_stream(&row), Some(inline.as_str()));
+        row.attestation_envelope["content"] =
+            serde_json::json!({ "content_sha256": inline.to_uppercase() });
+        assert_eq!(file_row_stream(&row), None, "not persist's spelling");
         row.attestation_envelope["dimension"] = serde_json::json!("chat.message");
         assert_eq!(file_row_stream(&row), None);
         row.attestation_envelope["dimension"] = serde_json::json!(receipt_dimension("file-x"));

@@ -118,11 +118,14 @@ impl PersistBlobChunkSource {
     async fn chunk_in_named_dag(&self, dag: [u8; 32], chunk: [u8; 32], requester: &str) -> bool {
         use ciris_persist::federation::BlobBody;
         let dag_hex = hex::encode(dag);
-        let rows = match self
-            .engine
-            .federation_directory()
-            .attestations_binding_content(&dag_hex)
-            .await
+        // CIRISEdge#736 — the widenings too: a family file's placement on its
+        // author's node is the `supersedes` widening its own `self` row, and
+        // the stream was written at the family.
+        let rows = match crate::blob_swarm::BlobMeaning::referencing_rows(
+            &*self.engine.federation_directory(),
+            &dag,
+        )
+        .await
         {
             Ok(rows) => rows,
             Err(e) => {
