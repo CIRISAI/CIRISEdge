@@ -398,6 +398,14 @@ pub enum WithholdReason {
     /// (`BlobChunkSource::chunk_scope` unwired or returning `None`) with an
     /// operator remedy, not a statement about the requester.
     BlobScopeUndeterminable,
+    /// CIRISEdge#717 (blob plane) — an inbound `BlobChunkFetch` named a DAG
+    /// the requester IS entitled to (`blob_sha256`, the scope gate's input)
+    /// and a `chunk_sha256` that is not one of that DAG's chunks in this
+    /// node's store. The scope gate authorizes by the NAMED file, so a chunk
+    /// outside it is a request for content the gate never judged — a chunk of
+    /// another room's file, named under a file of this one. Refused at the
+    /// serve door ([`crate::blob_swarm::ChunkSourceRefusal::ChunkNotInNamedDag`]).
+    ChunkNotInNamedDag,
     /// CIRISEdge#499 (blob plane) — the blob's scope does not admit the scope
     /// the request ARRIVED on, per the #48-A
     /// [`allows_recipient_scope`](crate::cohort_scope::CohortScope::allows_recipient_scope)
@@ -609,6 +617,7 @@ impl WithholdReason {
             Self::AccordRelayObjectRootUnnamed => "accord_relay_object_root_unnamed",
             Self::AccordRelayObjectRootDisagrees => "accord_relay_object_root_disagrees",
             Self::BlobScopeUndeterminable => "blob_scope_undeterminable",
+            Self::ChunkNotInNamedDag => "chunk_not_in_named_dag",
             Self::BlobArrivalScopeInsufficient => "blob_arrival_scope_insufficient",
             Self::BlobArrivalGroupMismatch => "blob_arrival_group_mismatch",
             Self::BlobDiscriminatorUnheld => "blob_discriminator_unheld",

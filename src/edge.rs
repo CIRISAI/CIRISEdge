@@ -6551,6 +6551,35 @@ async fn dispatch_inbound(
                             }
                         }
                         Err(refusal) => {
+                            // CIRISEdge#717 — a chunk outside the DAG the
+                            // request named is a serve-gate refusal: booked
+                            // (unthrottled) and spoken (throttled) exactly as
+                            // the scope gate's, answered `PolicyDenied`.
+                            if refusal == crate::blob_swarm::ChunkSourceRefusal::ChunkNotInNamedDag
+                            {
+                                const TAG: &str = "chunk_not_in_named_dag";
+                                metrics.inc_withhold(
+                                    crate::observability::WithholdReason::ChunkNotInNamedDag,
+                                    &envelope.signing_key_id,
+                                    TAG,
+                                );
+                                metrics.inc_blob_serve_refusal(TAG);
+                                if let crate::log_throttle::ThrottleDecision::Emit {
+                                    suppressed_prev,
+                                } = blob_scope_withheld_log().check(TAG)
+                                {
+                                    tracing::warn!(
+                                        event = "edge.blob_chunk_fetch.chunk_not_in_named_dag",
+                                        peer_key_id = %envelope.signing_key_id,
+                                        blob_sha256 = %hex::encode(&req.blob_sha256[..8]),
+                                        chunk_sha256 = %hex::encode(&req.chunk_sha256[..8]),
+                                        suppressed_prev,
+                                        "BlobChunkFetch WITHHELD — the chunk is not one of the \
+                                         named DAG's chunks in this store; the scope gate \
+                                         judged the named file, not this chunk (CIRISEdge#717)",
+                                    );
+                                }
+                            }
                             let miss = BlobChunkMissBody {
                                 blob_sha256: req.blob_sha256,
                                 chunk_sha256: req.chunk_sha256,

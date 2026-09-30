@@ -97,6 +97,93 @@ impl PersistBlobChunkSource {
     }
 }
 
+impl PersistBlobChunkSource {
+    /// CIRISEdge#717 — **is `chunk` one of the chunks of the DAG at `dag`,
+    /// in this store?** Two readings, either sufficient, neither guessed:
+    ///
+    /// 1. **The stream a referencing row names.** A sealed DAG's manifest is
+    ///    an envelope this door does not open, but every row referencing the
+    ///    DAG carries its pointer in clear, and the pointer's `stream_id` is
+    ///    the stream the chunks were written (or adopted) at. The chunk must
+    ///    be listed there — AND the stream's own row (`federation_streams`,
+    ///    V143: the cohort and community its first append named) must agree
+    ///    with the row naming it, so a row cannot borrow another room's
+    ///    stream by naming its id.
+    /// 2. **A clear manifest.** A plaintext DAG's root is its manifest,
+    ///    which lists the chunks by sha — including a DAG pulled whole
+    ///    through `put_blob_chunks`, which writes no stream rows.
+    ///
+    /// Anything unreadable reads as "not a member": this is a refusal gate,
+    /// and it fails closed.
+    async fn chunk_in_named_dag(&self, dag: [u8; 32], chunk: [u8; 32], requester: &str) -> bool {
+        use ciris_persist::federation::BlobBody;
+        let dag_hex = hex::encode(dag);
+        let rows = match self
+            .engine
+            .federation_directory()
+            .attestations_binding_content(&dag_hex)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    blob = %dag_hex,
+                    error = %e,
+                    "PersistBlobChunkSource: the rows referencing the named DAG could not be \
+                     read — its stream is unknown (CIRISEdge#717)"
+                );
+                Vec::new()
+            }
+        };
+        for row in &rows {
+            let Some(members) = row.attestation_envelope.as_object() else {
+                continue;
+            };
+            for pointer in members
+                .values()
+                .filter(|v| v.is_object())
+                .filter_map(|v| {
+                    serde_json::from_value::<crate::group_content::BlobPointer>(v.clone()).ok()
+                })
+                .filter(|p| p.content_sha256.eq_ignore_ascii_case(&dag_hex))
+            {
+                let Some(stream_id) = pointer.stream_id.as_deref() else {
+                    continue;
+                };
+                let Ok(listing) = self.engine.stream_chunks(stream_id).await else {
+                    continue;
+                };
+                if let Some(head) = &listing.stream {
+                    let community_agrees = match head.community_key_id.as_deref() {
+                        Some(c) => {
+                            pointer.community_key_id.is_empty() || c == pointer.community_key_id
+                        }
+                        None => true,
+                    };
+                    if head.cohort_scope != row.cohort_scope || !community_agrees {
+                        tracing::warn!(
+                            blob = %dag_hex,
+                            stream_id,
+                            row = %row.attestation_id,
+                            "PersistBlobChunkSource: a row names a stream whose own cohort or \
+                             community disagrees with it — not counted as the DAG's stream \
+                             (CIRISEdge#717)"
+                        );
+                        continue;
+                    }
+                }
+                if listing.chunks.iter().any(|c| c.chunk_sha == chunk) {
+                    return true;
+                }
+            }
+        }
+        matches!(
+            self.engine.serve_blob_to_peer(&dag, requester).await,
+            Ok(BlobBody::ChunkDag(manifest)) if manifest.chunks.iter().any(|c| c.sha == chunk)
+        )
+    }
+}
+
 #[async_trait::async_trait]
 impl BlobChunkSource for PersistBlobChunkSource {
     async fn read_chunk(
@@ -125,6 +212,26 @@ impl BlobChunkSource for PersistBlobChunkSource {
                 );
                 return Err(ChunkSourceRefusal::Withdrawn);
             }
+        }
+        // CIRISEdge#717 — the named DAG bounds the chunk. The responder's
+        // scope gate judged `blob_sha256` (the file whose referencing row
+        // projects the scope); a `chunk_sha256` that is not one of THAT
+        // file's chunks would be served on the strength of a judgement about
+        // another file. `(sha, sha)` — a whole blob, or a DAG's root — is
+        // the file itself and never asks.
+        if chunk_sha256 != blob_sha256
+            && !self
+                .chunk_in_named_dag(blob_sha256, chunk_sha256, requesting_peer_key_id)
+                .await
+        {
+            tracing::debug!(
+                blob = %hex::encode(blob_sha256),
+                chunk = %hex::encode(chunk_sha256),
+                peer = %requesting_peer_key_id,
+                "PersistBlobChunkSource: the chunk is not one of the named DAG's chunks in \
+                 this store — refusing ChunkNotInNamedDag (CIRISEdge#717)",
+            );
+            return Err(ChunkSourceRefusal::ChunkNotInNamedDag);
         }
         // Serve the CHUNK's sha, not the blob's. Persist stores each
         // chunk as its own content-addressed `federation_blobs` row

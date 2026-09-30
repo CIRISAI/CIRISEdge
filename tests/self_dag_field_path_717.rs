@@ -758,4 +758,163 @@ async fn a_self_files_chunks_arrive_on_the_owners_other_device_through_the_real_
         sha2::Sha256::digest(&plain).as_slice(),
         "B's chunk walk is byte-identical"
     );
+
+    // ── B can serve what it pulled: its copy of the stream carries the same
+    // cohort and community as the row naming it, so a second hop's
+    // membership check (`chunk_in_named_dag`) reads B's chunks as the DAG's.
+    let b_stream = b
+        .node
+        .dir
+        .stream_chunks(&stream_id)
+        .await
+        .expect("B's stream listing");
+    if let Some(head) = &b_stream.stream {
+        assert_eq!(head.cohort_scope, row.cohort_scope, "B's stream cohort");
+        if let Some(c) = &head.community_key_id {
+            assert_eq!(
+                c, &published.pointer.community_key_id,
+                "B's stream community agrees with the pointer"
+            );
+        }
+    }
+
+    chunk_membership_is_the_named_dags(&a, &b, &alice, &row, sha, &stream_id).await;
+}
+
+/// **CIRISEdge#717 review — the widening this fix introduced, closed.**
+///
+/// Naming the DAG as the `blob` of a chunk request moved the scope gate onto
+/// the NAMED file. Without a bound on the chunk, a requester entitled to file
+/// X could name X and ask for a chunk of file Y by its sha. A's serve door
+/// now serves `(dag, chunk)` only when `chunk` is one of that DAG's chunks
+/// in A's store; otherwise it refuses `chunk_not_in_named_dag` (booked in
+/// the withhold ledger and `blob_serve_refusals`, `PolicyDenied` on the
+/// wire). Y here is a second file of the same owner, so the requester IS
+/// entitled to both — the refusal is the membership bound alone, not the
+/// scope gate, which is exactly the check a cross-room Y would have to pass.
+///
+/// The controls: `(X, x_chunk)` and `(Y, y_chunk)` are served, and `(X, X)`
+/// — a DAG's root, the whole-blob shape — is served exactly as before.
+async fn chunk_membership_is_the_named_dags(
+    a: &Member,
+    b: &Member,
+    owner: &Ident,
+    row_x: &Attestation,
+    x: [u8; 32],
+    x_stream: &str,
+) {
+    let plain_y = content(FILE_LEN, 0x0718);
+    let room = ciris_edge::self_room::room(&owner.key_id);
+    let person = person_signer(owner);
+    let y = ciris_edge::files::publish(
+        &*a.node.dir,
+        &a.node.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &a.node.signer,
+            actor: Some(&person),
+        },
+        &ciris_edge::files::FileWrite {
+            room: &room,
+            bytes: &plain_y,
+            media_type: "video/mp4",
+            codec: None,
+            filename: Some("another.mp4"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("publish file Y");
+    let y_sha: [u8; 32] = hex::decode(&y.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let y_stream = y.pointer.stream_id.clone().expect("Y is a chunk DAG");
+    let first_chunk = |listing: ciris_persist::federation::StreamChunks| {
+        listing
+            .chunks
+            .first()
+            .map(|c| c.chunk_sha)
+            .expect("a DAG has chunks")
+    };
+    let x_chunk = first_chunk(
+        a.node
+            .dir
+            .stream_chunks(x_stream)
+            .await
+            .expect("X's stream"),
+    );
+    let y_chunk = first_chunk(
+        a.node
+            .dir
+            .stream_chunks(&y_stream)
+            .await
+            .expect("Y's stream"),
+    );
+    assert_ne!(x_chunk, y_chunk, "precondition: two files, two chunk sets");
+    assert_eq!(row_x.cohort_scope, "self", "precondition: X is a self file");
+
+    let scope = ContentScope::Group {
+        scope: CohortScope::SelfOnly,
+        group_id: ciris_edge::self_room::room(&owner.key_id).table_group_id(),
+    };
+    let to_a = b
+        .edge
+        .blob_scope_router()
+        .route(Some(&scope), &a.node.me)
+        .expect("B routes to A on the self room's address");
+    let ask = |blob: [u8; 32], chunk: [u8; 32]| {
+        let edge = Arc::clone(&b.edge);
+        let to_a = to_a.clone();
+        async move {
+            edge.fetch_blob_chunk_scoped(&to_a, blob, chunk, Duration::from_secs(15))
+                .await
+                .expect("A answers")
+        }
+    };
+    let served = |r: &ciris_edge::ChunkResult, want: [u8; 32]| match r {
+        ciris_edge::ChunkResult::Bytes(bytes) => {
+            let got: [u8; 32] = sha2::Sha256::digest(bytes).into();
+            got == want
+        }
+        ciris_edge::ChunkResult::ChunkMiss { .. } => false,
+    };
+    let withheld = || {
+        a.edge
+            .metrics()
+            .withholds(ciris_edge::observability::WithholdReason::ChunkNotInNamedDag)
+    };
+    let before = withheld();
+
+    // The attack: name X (entitled), ask for Y's chunk.
+    let cross = ask(x, y_chunk).await;
+    match &cross {
+        ciris_edge::ChunkResult::ChunkMiss { reason } => assert!(
+            reason.contains("PolicyDenied"),
+            "a chunk outside the named DAG is PolicyDenied on the wire, got {reason}"
+        ),
+        ciris_edge::ChunkResult::Bytes(_) => panic!(
+            "A served Y's chunk under a request naming X — the scope gate judged X, \
+             so this is content the gate never judged (CIRISEdge#717 review)"
+        ),
+    }
+    assert_eq!(
+        withheld(),
+        before + 1,
+        "the refusal is booked chunk_not_in_named_dag on A"
+    );
+
+    // The controls.
+    assert!(
+        served(&ask(x, x_chunk).await, x_chunk),
+        "(X, X's chunk) is served"
+    );
+    assert!(
+        served(&ask(y_sha, y_chunk).await, y_chunk),
+        "(Y, Y's chunk) is served"
+    );
+    assert!(
+        served(&ask(x, x).await, x),
+        "(X, X) — the DAG's root, the whole-blob shape — is served as before"
+    );
+    assert_eq!(withheld(), before + 1, "no control was refused");
 }
