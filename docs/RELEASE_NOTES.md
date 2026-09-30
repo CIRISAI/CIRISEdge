@@ -1,5 +1,45 @@
 # CIRISEdge Release Notes
 
+# v36.1.0 — the chunk-DAG pull runs 7–18× faster: chunk replies on the arrival link, pooled links, eight chunks in flight
+
+**2026-09-30** (CIRISEdge#739 → PR #749, lane 7 of #734). **MINOR** from v36.0.0. No pin or hash moves:
+persist `v51.3.0` (floor `>=51.3,<52`), verify `v18.0.0`, every ABI constant and hash unchanged.
+**Riders:** a pin bump only.
+
+## Measured (release build, two nodes on loopback; ratio = pull time ÷ a raw leviculum transfer of the same bytes on the same link)
+
+| size | raw link | v36.0.0 | v36.1.0 |
+|---|---|---|---|
+| 256 MiB | 12.3–14.2 MB/s | 0.41 MB/s (30.1×) | **5.5–5.8 MB/s (2.3–2.5×)** |
+| 2 GiB | 12.6–13.0 MB/s | 0.34 MB/s (36.6×) | **3.8 MB/s (3.4×)** |
+
+Each change attributed separately (64 MiB, one chunk at a time): replying on the arrival link 0.4 → 1.1
+MB/s (517 ms less per chunk); pooled links instead of a dial per chunk → 1.2 MB/s; eight chunks in flight
+4.6× on top. Chunks in flight at 256 MiB: 1 → 1.2, 4 → 3.7, 8 → 5.5–5.8, 16 → 5.0–6.4 MB/s; the default is
+8 (`DEFAULT_DAG_*_IN_FLIGHT`).
+
+- **Chunk replies ride the link the request arrived on.** v36.0.0 answered every `BlobChunkFetch` through
+  the durable outbound queue (a ~1 MB sqlite row per chunk, claimed on a 500 ms idle poll): 1,025 queue
+  rows for a 256 MiB pull, now 0. The durable queue is the fallback only when no live link exists.
+- **Pooled scoped links with per-exchange leases;** no re-dial per chunk; the dial gate is honoured.
+- **K chunks in flight** with a byte budget; order by `seq`; holder selection reused.
+- **A pull that fails part-way keeps what its in-flight fetches verified,** so a resume refetches only
+  what is missing (the tampered-chunk witnesses hold `[0, 2, 3, 4]` and refetch one chunk).
+- **Resume after a kill** (256 MiB): killed at 50 %, the resume adopts the rest, skips what is held,
+  byte-identical, each chunk adopted exactly once.
+- Per-phase clocks and a chunk ledger in `EdgeMetrics`; an answered chunk request no longer logs WARN
+  (8,193 lines per 2 GiB pull).
+- Witness `tests/bigfile_739.rs`: 256 MiB resume variant in CI (453 s debug); the 2 GiB tables by hand.
+
+## What is left (the 2× target is not met at 2 GiB), each filed
+
+persist `adopt_sealed_chunk` grows with the store (25 → 201 ms/chunk; CIRISPersist#957, in v52 with a
+batched `adopt_sealed_chunks`); persist's signing form clones the JSON value tree (CIRISPersist#958, in
+v52); leviculum decompresses each reply under the node lock (leviculum#71); chunk bytes travel as a JSON
+integer array, cheap on the wire after compression but ~half the per-chunk CPU and ~12 MiB transient
+per chunk in flight (CIRISEdge#742, a coordinated wire cut). v37.0.0 adopts persist v52 and re-runs the
+2 GiB bench against 2×.
+
 # v36.0.0 — files of any size up to ~2.5 GiB, pulled chunk by chunk, read by range, published from a stream, with delivery receipts; persist v51.3.0
 
 **2026-09-30** (PR #733 adopt + lanes of CIRISEdge#734: #741, #743, #746, #747). **MAJOR** from v35.0.0.
