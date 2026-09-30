@@ -78,11 +78,26 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // RECORD is not public: it reaches the group's live members and the
         // invitees of a live proposal held here (the record travels with the
         // invitation), on the advertise and the fetch twin, at every reach.
-        EnvelopeKind::Family | EnvelopeKind::Community => (
+        // CIRISEdge#762 (CC 5.4.6 "from outsiders only", CC 4.4.3.2.1, persist's
+        // #761 ruling) — only a PRIVATE group is gated: a PUBLIC group's record
+        // (`public_group::is_public_group`: an `infrastructure` community; the
+        // accord family, the genesis bundle's family and the deployment's WA
+        // reclaim family) keeps the pre-v38 `public` serve, since every node
+        // resolves its trust root / reclaim authority through it.
+        EnvelopeKind::Family => (
             "cohort",
-            "group record → owner_of(peer) is a live member, or a subject_key_ids \
-             invitee of a live membership:proposal:v1 into the group held here; \
-             else withheld (group_record_not_member_or_invitee)",
+            "public family (accord_family_key_id | genesis bundle family_key_id | \
+             ReclaimPolicy.wa_family_key_id) → public; else group record → \
+             owner_of(peer) is a live member, or a subject_key_ids invitee of a live \
+             membership:proposal:v1 into the group held here; else withheld \
+             (group_record_not_member_or_invitee)",
+        ),
+        EnvelopeKind::Community => (
+            "cohort",
+            "cohort_subkind == infrastructure → public; else group record → \
+             owner_of(peer) is a live member, or a subject_key_ids invitee of a live \
+             membership:proposal:v1 into the group held here; else withheld \
+             (group_record_not_member_or_invitee)",
         ),
         EnvelopeKind::LocationProof => ("cohort", "public"),
         // The four `global` planes: the two tombstone planes above join the two
@@ -283,8 +298,15 @@ pub fn serve_advertise_policy_sha256() -> String {
 // `group_record_not_member_or_invitee`. `LocationProof` keeps `public`.
 // Combined at the v38 merge of v37.1.0; the value below is computed from the
 // merged manifest. **CIRISServer must mirror this pin.**
+//
+// CIRISEdge#762 (v38.0.0) — RE-PINNED, a09e34a6… → e3070d53…: the Family and
+// Community `serve` cells carve PUBLIC groups out of the group-record gate (an
+// `infrastructure` community; the accord / genesis / WA reclaim families keep
+// the pre-v38 `public` serve — CC 5.4.6 "from outsiders only", CC 4.4.3.2.1,
+// persist's #761 ruling; `FSD/FIRST_CONTACT.md` §2.5, I23). **CIRISServer must
+// mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "a09e34a60d6a8a6a2194b0d7f3bfbe0100345f8a99ed7fb858be1b38515b40b4";
+    "e3070d5327d6518b7ef50b0988f1af92790e2ea4efb9833cc4213a4127fc41b0";
 
 #[cfg(test)]
 mod tests {

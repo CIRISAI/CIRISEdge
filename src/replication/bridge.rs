@@ -115,6 +115,7 @@ use ciris_verify_core::threshold::ThresholdMember;
 
 use super::directory::ReplicationDirectory;
 use super::protocol::{EnvelopeKind, EnvelopeRef};
+use super::public_group::{is_public_group, GroupRef};
 use super::summary::ApplyOutcome;
 
 // ─── CIRISEdge#423 → #425 — apply-refusal diagnostics, now by construction ──
@@ -3610,6 +3611,9 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // record's hash out-of-band is not handed the record unless its person
         // is a live member of the group or the invitee of a live proposal into
         // it held here. The same predicate as the advertise, so the two agree.
+        // CIRISEdge#762: a PUBLIC group's record (an `infrastructure`
+        // community, the accord family, the WA reclaim body) is exempt, on
+        // both twins alike (`is_public_group`).
         if matches!(kind, EnvelopeKind::Family | EnvelopeKind::Community)
             && !self
                 .group_record_fetch_serves(kind, &bytes, peer_key_id)
@@ -8318,7 +8322,9 @@ impl FederationDirectoryReplicationBridge {
 
     /// CIRISEdge#758 (CC 5.4.6, `FSD/FIRST_CONTACT.md` §2.5, I23) — the
     /// per-peer view of a group RECORD plane: the sweep's rows, narrowed to the
-    /// groups `peer` may be handed ([`Self::group_records_servable_to`]).
+    /// groups `peer` may be handed ([`Self::group_records_servable_to`]) —
+    /// PRIVATE groups only: a public group's record ([`is_public_group`],
+    /// CIRISEdge#762) keeps the pre-v38 `public` serve to every peer.
     /// Every record the sweep considered and the gate kept back is booked
     /// `group_record_not_member_or_invitee`.
     async fn list_group_records_for_peer(
@@ -8386,7 +8392,9 @@ impl FederationDirectoryReplicationBridge {
     /// CIRISEdge#758 — the direct-fetch twin: the record's group read from its
     /// wire bytes (`family.family_key_id` / `community.community_key_id`) and
     /// judged by the SAME servable set the advertise uses. Fail-closed: an
-    /// unattributed requester, or bytes that name no group, get nothing.
+    /// unattributed requester, or bytes that name no group, get nothing —
+    /// except a PUBLIC group's record (CIRISEdge#762, [`is_public_group`]),
+    /// which is served to any requester, as the advertise serves it.
     async fn group_record_fetch_serves(
         &self,
         kind: EnvelopeKind,
@@ -8398,12 +8406,31 @@ impl FederationDirectoryReplicationBridge {
         } else {
             "/community/community_key_id"
         };
-        let group = serde_json::from_slice::<serde_json::Value>(bytes)
-            .ok()
-            .and_then(|v| {
-                v.pointer(pointer)
-                    .and_then(|g| g.as_str().map(str::to_owned))
-            });
+        let value = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+        let group = value.as_ref().and_then(|v| {
+            v.pointer(pointer)
+                .and_then(|g| g.as_str().map(str::to_owned))
+        });
+        // CIRISEdge#762 — a PUBLIC group's record is served to any requester,
+        // attributed or not, exactly as the advertise serves it: the pre-v38
+        // `public` serve, judged by the same predicate.
+        let public = if kind == EnvelopeKind::Family {
+            group
+                .as_deref()
+                .is_some_and(|g| is_public_group(GroupRef::Family(g)))
+        } else {
+            value
+                .as_ref()
+                .and_then(|v| v.get("community"))
+                .and_then(|c| {
+                    serde_json::from_value::<ciris_persist::federation::types::Community>(c.clone())
+                        .ok()
+                })
+                .is_some_and(|c| is_public_group(GroupRef::Community(&c)))
+        };
+        if public {
+            return true;
+        }
         let servable = match (peer, group.as_ref()) {
             (Some(p), Some(_)) => {
                 self.group_records_servable_to(p, &mut AudienceMemo::default())
@@ -8617,11 +8644,15 @@ impl FederationDirectoryReplicationBridge {
                     .iter()
                     .any(|m| cohort.contains(&m.key_id))
                     && gate.map_or(true, |g| {
-                        self.group_record_admits(
-                            g,
-                            EnvelopeKind::Family,
-                            &s.family.family.family_key_id,
-                        )
+                        // CIRISEdge#762 — a PUBLIC family (the accord family,
+                        // the WA reclaim body) keeps the pre-v38 `public`
+                        // serve: every node resolves through it.
+                        is_public_group(GroupRef::Family(&s.family.family.family_key_id))
+                            || self.group_record_admits(
+                                g,
+                                EnvelopeKind::Family,
+                                &s.family.family.family_key_id,
+                            )
                     })
             },
             |s| Self::ms_seq(s.family.family.founded_at),
@@ -8671,11 +8702,15 @@ impl FederationDirectoryReplicationBridge {
                     .iter()
                     .any(|m| cohort.contains(&m.key_id))
                     && gate.map_or(true, |g| {
-                        self.group_record_admits(
-                            g,
-                            EnvelopeKind::Community,
-                            &s.community.community.community_key_id,
-                        )
+                        // CIRISEdge#762 — an `infrastructure` community is
+                        // Commons-tier (CC 4.4.3.2.1): the pre-v38 `public`
+                        // serve, to every peer.
+                        is_public_group(GroupRef::Community(&s.community.community))
+                            || self.group_record_admits(
+                                g,
+                                EnvelopeKind::Community,
+                                &s.community.community.community_key_id,
+                            )
                     })
             },
             |s| Self::ms_seq(s.community.community.founded_at),
@@ -19991,6 +20026,158 @@ pub(crate) mod tests {
         assert!(
             metrics.withholds(WithholdReason::GroupRecordNotMemberOrInvitee) >= 6,
             "every refusal is booked by name"
+        );
+    }
+
+    /// **CIRISEdge#762 — a PUBLIC group's record is served to every peer.**
+    ///
+    /// The #758 gate hid EVERY group record from non-members, so the groups
+    /// every node resolves its trust root through (an `infrastructure`
+    /// community) stopped reaching outsiders. Here node-c is a stranger (no
+    /// membership, no invitation): it is served the infrastructure community
+    /// on the advertise AND the fetch twin, and an unattributed requester too
+    /// (first contact), while a private community and a private family held
+    /// beside it stay withheld and booked. Fails on the pre-#762 gate (every
+    /// record withheld).
+    ///
+    /// The accord family is seated beside them through the genesis door
+    /// (`put_family_local`, the only door persist admits `humanity-accord`
+    /// through, CIRISPersist#648) and is asserted NEVER LISTED: a genesis
+    /// family carries no signed record, so the Family plane never offers it
+    /// and no peer ever resolves it from a replicated record, on v37.1.0 as
+    /// now. Its public marker is inert-but-correct (persist's list; v53's
+    /// predicate carries it).
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_public_group_record_is_served_to_every_peer_762() {
+        use crate::observability::WithholdReason;
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-p", identity_type::USER),
+                ("person-q", identity_type::USER),
+                ("node-a", identity_type::NODE),
+                ("node-c", identity_type::NODE),
+            ],
+        )
+        .await;
+        for (owner, node) in [("person-p", "node-a"), ("person-q", "node-c")] {
+            seed_owner_binding(&backend, owner, node).await;
+        }
+        let founded: chrono::DateTime<Utc> = "2026-07-01T00:00:00Z".parse().expect("rfc3339");
+        let community = |id: &str, protocol: &str, blob: Option<serde_json::Value>| Community {
+            community_key_id: id.to_owned(),
+            community_name: id.to_owned(),
+            members: vec![CommunityMember {
+                key_id: "person-p".to_owned(),
+                joined_at: founded,
+                role: Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
+            }],
+            founded_at: founded,
+            consensus_protocol: protocol.to_owned(),
+            policy_blob: blob,
+            persist_row_hash: String::new(),
+        };
+        backend
+            .put_community(sign_community_fixture(
+                "person-p",
+                community(
+                    "infra-762",
+                    "quorum:1/1",
+                    Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
+                ),
+            ))
+            .await
+            .expect("the infrastructure community");
+        backend
+            .put_community(sign_community_fixture(
+                "person-p",
+                community("priv-c-762", "founder_only", None),
+            ))
+            .await
+            .expect("the private community");
+        // The accord family enters a directory only through the genesis door
+        // (`put_family_local`): persist reserves the id at every admission door
+        // (CIRISPersist#648). Seated here by this node's own person, so the
+        // Family sweep considers it.
+        let accord = ciris_persist::federation::canonical_community::accord_family_key_id();
+        let mut accord_family = fixture_family_founded(accord, "person-p", "person-p");
+        accord_family.members.truncate(1);
+        backend
+            .put_family_local(accord_family)
+            .await
+            .expect("the accord family, through the genesis door");
+        let mut private_family = fixture_family_founded("priv-f-762", "person-p", "person-p");
+        private_family.members.truncate(1);
+        backend
+            .put_family(sign_family_fixture("person-p", private_family))
+            .await
+            .expect("the private family");
+
+        let metrics = crate::observability::EdgeMetrics::new();
+        let publish = vec!["node-a".to_owned(), "person-p".to_owned()];
+        let bridge = bridge_over(&backend, &[])
+            .with_local_key_id(Some("node-a".to_owned()))
+            .with_self_provider(Some(Arc::new(move || publish.clone())))
+            .with_metrics(Some(metrics.clone()));
+        let refs = |kind: EnvelopeKind| {
+            let bridge = &bridge;
+            async move { bridge.list_envelope_refs(kind).await }
+        };
+        assert_eq!(refs(EnvelopeKind::Community).await.len(), 2);
+        assert_eq!(
+            refs(EnvelopeKind::Family).await.len(),
+            1,
+            "the genesis-seated accord family has no signed record: never listed"
+        );
+        let served = |kind: EnvelopeKind, peer: Option<&'static str>| {
+            let bridge = &bridge;
+            async move {
+                let mut out = Vec::new();
+                for r in bridge.list_envelope_refs(kind).await {
+                    let listed = bridge
+                        .list_envelope_refs_for_peer(kind, peer)
+                        .await
+                        .iter()
+                        .any(|x| x.envelope_hash == r.envelope_hash);
+                    let bytes = bridge
+                        .fetch_envelope_bytes_for_peer(kind, &r.envelope_hash, peer)
+                        .await;
+                    assert_eq!(
+                        listed,
+                        bytes.is_some(),
+                        "{kind:?} to {peer:?}: the advertise and the fetch twin agree"
+                    );
+                    if let Some(b) = bytes {
+                        let v: serde_json::Value = serde_json::from_slice(&b).expect("json");
+                        let id = v
+                            .pointer("/community/community_key_id")
+                            .or_else(|| v.pointer("/family/family_key_id"))
+                            .and_then(|g| g.as_str())
+                            .expect("group id")
+                            .to_owned();
+                        out.push(id);
+                    }
+                }
+                out.sort();
+                out
+            }
+        };
+        for peer in [Some("node-c"), None] {
+            assert_eq!(
+                served(EnvelopeKind::Community, peer).await,
+                vec!["infra-762".to_owned()],
+                "{peer:?}: the infrastructure community is public, the private one is not"
+            );
+            assert!(
+                served(EnvelopeKind::Family, peer).await.is_empty(),
+                "{peer:?}: the private family is withheld"
+            );
+        }
+        assert!(
+            metrics.withholds(WithholdReason::GroupRecordNotMemberOrInvitee) >= 3,
+            "the private records are still withheld and booked by name"
         );
     }
 
