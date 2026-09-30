@@ -1581,6 +1581,7 @@ mod tests {
             .expect("pinned founding instant");
         backend
             .put_family_local(Family {
+                dissolved_at: None,
                 family_key_id: root.to_owned(),
                 family_name: root.to_owned(),
                 members: members

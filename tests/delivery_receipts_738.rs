@@ -322,6 +322,7 @@ async fn seed_family(node: &Node, family: &str, members: &[&Ident]) {
     use ciris_persist::federation::types::{Family, FamilyMember, SignedFamily};
     let founder = members[0];
     let record = Family {
+        dissolved_at: None,
         family_key_id: family.to_owned(),
         family_name: "The Household".to_owned(),
         members: members
@@ -344,6 +345,7 @@ async fn seed_family(node: &Node, family: &str, members: &[&Ident]) {
     let (ed, pqc) = founder.sign_hybrid(&canonical).await;
     node.dir
         .put_family(SignedFamily {
+            cosignatures: Vec::new(),
             family: record,
             authority_key_id: founder.key_id.clone(),
             scrub_signature_classical: ed,

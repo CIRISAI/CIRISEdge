@@ -4439,19 +4439,38 @@ impl FederationDirectoryReplicationBridge {
                 // backstop when no observer is installed.
                 if outcome.is_admitted() {
                     if let Ok(r) = serde_json::from_slice::<SignedRevocation>(envelope_bytes) {
-                        if let Some(observer) = &self.revocation_observer {
-                            observer(&r.revocation.revoked_key_id);
+                        // persist v52.0.0 (CIRISPersist#784) — the SUBJECT is
+                        // `revoked_key_sha256_ed25519_raw`; `revoked_key_id` is
+                        // optional (a revoker may withhold the cleartext label).
+                        if let Some(revoked) = r.revocation.revoked_key_id.as_deref() {
+                            if let Some(observer) = &self.revocation_observer {
+                                observer(revoked);
+                            }
+                            // Workstream F — a revoked key can be a seated
+                            // accord holder or the root itself; either way
+                            // its cached relay verdict is now false.
+                            self.invalidate_accord_relay(&[revoked]);
+                            // CIRISEdge#523 — and it can be either SIDE of
+                            // an owner-binding: the node whose owner is
+                            // memoized, or the owner key itself (which
+                            // stops conferring membership on every node it
+                            // owns). `invalidate` drops both directions.
+                            self.invalidate_owner_memo(revoked);
+                        } else {
+                            // A digest-only revocation names no key_id, and
+                            // every cache here is keyed by key_id. Choosing
+                            // invalidation keys is a cache concern, never a
+                            // trust rule: over-broad costs a re-resolve,
+                            // too-narrow serves a falsified verdict — so
+                            // drop the whole of each memo. The key_id-keyed
+                            // observer has nothing to name; its TTL-free
+                            // consumer (`DirectoryCache`) is not wired in
+                            // production (see `directory_cache.rs`).
+                            if let Some(gate) = self.accord_relay_gate.as_ref() {
+                                gate.invalidate_all();
+                            }
+                            self.invalidate_owner_memo_all();
                         }
-                        // Workstream F — a revoked key can be a seated accord
-                        // holder or the root itself; either way its cached
-                        // relay verdict is now false.
-                        self.invalidate_accord_relay(&[&r.revocation.revoked_key_id]);
-                        // CIRISEdge#523 — and it can be either SIDE of an
-                        // owner-binding: the node whose owner is memoized, or
-                        // the owner key itself (which stops conferring
-                        // membership on every node it owns). `invalidate`
-                        // drops both directions.
-                        self.invalidate_owner_memo(&r.revocation.revoked_key_id);
                     }
                 }
                 outcome
@@ -6182,10 +6201,12 @@ impl FederationDirectoryReplicationBridge {
             Audience::Family { family_key_id } => {
                 self.peer_in_cohort(peer, memo, |c| c.families.contains(family_key_id))
                     .await
+                    || self.peer_is_proposal_invitee(row, peer, memo).await
             }
             Audience::Community { community_key_id } => {
                 self.peer_in_cohort(peer, memo, |c| c.communities.contains(community_key_id))
                     .await
+                    || self.peer_is_proposal_invitee(row, peer, memo).await
             }
             // CIRISPersist#897 / persist v47.0.0 — an affiliation is a room.
             // CC 4.4.3.2.1 puts `affiliations` in the Community tier (reader:
@@ -6259,6 +6280,45 @@ impl FederationDirectoryReplicationBridge {
             return true;
         }
         false
+    }
+
+    /// persist v52.0.0 (CIRISPersist#955) — **the membership-proposal arm** of
+    /// the family / community audience, the serve-side twin of persist's
+    /// `CallerScope::admits_membership_proposal` (and its SQL `EXISTS` over
+    /// `attestation_subjects`): a `membership:proposal:v1` row placed at a
+    /// family or community reaches the invitee it names in `subject_key_ids`
+    /// — the invitee's own key, or a node whose principal it is — whatever
+    /// rooms that peer is in. ORed with the membership check; it admits
+    /// nothing else (no other dimension, no other scope). The send-set half
+    /// ([`Self::reach_withholds`]) still runs first: a first-contact stranger
+    /// is not handed a family-scoped row by this arm.
+    async fn peer_is_proposal_invitee(
+        &self,
+        row: &serde_json::Value,
+        peer: &str,
+        memo: &mut AudienceMemo,
+    ) -> bool {
+        let is_proposal = row
+            .pointer("/attestation_envelope/dimension")
+            .and_then(serde_json::Value::as_str)
+            == Some(ciris_persist::federation::membership_acceptance::PROPOSAL_DIMENSION);
+        if !is_proposal {
+            return false;
+        }
+        let subjects: Vec<&str> = row
+            .get("subject_key_ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        if subjects.is_empty() {
+            return false;
+        }
+        if subjects.contains(&peer) {
+            return true;
+        }
+        self.principal_of(peer, memo)
+            .await
+            .is_some_and(|principal| subjects.contains(&principal.as_str()))
     }
 
     /// The principal behind `key`, memoized: a person is their own, a node's
@@ -7449,6 +7509,22 @@ impl FederationDirectoryReplicationBridge {
         // node's own binding decides announced-ness; the owner's other bindings
         // decide who counts as "the owner's nodes"), so it has no single key to
         // evict. Whole drop, the #524 trade: ownership events are rare.
+        if let Ok(mut memo) = self.announce_cache.lock() {
+            memo.clear();
+        }
+    }
+
+    /// persist v52.0.0 (CIRISPersist#784) — the whole-drop sibling of
+    /// [`Self::invalidate_owner_memo`], for a digest-only revocation that names
+    /// no key_id to evict by. Revocations are rare; the memos refill on the
+    /// next resolve.
+    fn invalidate_owner_memo_all(&self) {
+        if let Ok(mut cache) = self.owner_cache.lock() {
+            cache.by_node.clear();
+        }
+        if let Ok(mut memo) = self.consent_memo.lock() {
+            *memo = None;
+        }
         if let Ok(mut memo) = self.announce_cache.lock() {
             memo.clear();
         }
@@ -10551,7 +10627,8 @@ pub(crate) mod tests {
         let now = Utc::now().trunc_subsecs(6);
         let mut rev = ciris_persist::federation::types::Revocation {
             revocation_id: "rev-1".to_string(),
-            revoked_key_id: target.to_string(),
+            revoked_key_id: Some(target.to_string()),
+            revoked_key_sha256_ed25519_raw: revoked_digest_of(&backend, target).await,
             revoking_key_id: revoker.to_string(),
             reason: None,
             revoked_at: now,
@@ -10779,6 +10856,7 @@ pub(crate) mod tests {
         let (_h, classical, pqc) =
             sign_attestation_envelope(authority_key_id, &family.signing_envelope());
         SignedFamily {
+            cosignatures: Vec::new(),
             family,
             authority_key_id: authority_key_id.to_string(),
             scrub_signature_classical: classical,
@@ -10905,6 +10983,7 @@ pub(crate) mod tests {
     /// keyless (persist v24.0.0 dropped that FK).
     pub(crate) fn fixture_family(family_key_id: &str, member_key_id: &str) -> Family {
         Family {
+            dissolved_at: None,
             family_key_id: family_key_id.to_string(),
             family_name: "E4 Pin Household".to_string(),
             members: vec![FamilyMember {
@@ -11904,6 +11983,7 @@ pub(crate) mod tests {
             (
                 EnvelopeKind::Family,
                 serde_json::to_vec(&SignedFamily {
+                    cosignatures: Vec::new(),
                     family: fixture_family("e4-family", "e4-member"),
                     authority_key_id: String::new(),
                     scrub_signature_classical: String::new(),
@@ -13661,7 +13741,12 @@ pub(crate) mod tests {
             let now = Utc::now().trunc_subsecs(6);
             let mut rev = Revocation {
                 revocation_id: id.to_string(),
-                revoked_key_id: revoked.to_string(),
+                revoked_key_id: Some(revoked.to_string()),
+                // persist v52.0.0 (#784) — the SUBJECT; any well-formed digest
+                // serves the pure binding gate this test drives.
+                revoked_key_sha256_ed25519_raw: hex::encode(
+                    <sha2::Sha256 as sha2::Digest>::digest(revoked),
+                ),
                 revoking_key_id: "revoker".to_string(),
                 reason: None,
                 revoked_at: now,
@@ -13699,7 +13784,7 @@ pub(crate) mod tests {
         // ATTACK: sign a revocation of victim-A, then repaint the target column to
         // victim-B. The signed envelope still pins victim-A.
         let mut pasted = build("rev-spoof", "victim-A");
-        pasted.revoked_key_id = "victim-B".to_string();
+        pasted.revoked_key_id = Some("victim-B".to_string());
 
         let err = ciris_persist::federation::admission::check_revocation_envelope_binding(&pasted)
             .expect_err(
@@ -13930,6 +14015,22 @@ pub(crate) mod tests {
         seed_raw_attestation(backend, &id, granter, peer, "scores", envelope).await;
     }
 
+    /// persist v52.0.0 (CIRISPersist#784) — a revocation's SUBJECT: the
+    /// `sha256_ed25519_raw` digest of the held key's raw Ed25519 pubkey. A
+    /// `revoked_key_id` beside it must name a held key with this digest.
+    async fn revoked_digest_of(backend: &MemoryBackend, key_id: &str) -> String {
+        let key = backend
+            .lookup_public_key(key_id)
+            .await
+            .expect("lookup revoked key")
+            .expect("the revoked key is held");
+        ciris_persist::federation::key_digest::Sha256Ed25519Raw::from_pubkey_base64(
+            &key.pubkey_ed25519_base64,
+        )
+        .expect("digest of the held pubkey")
+        .to_hex()
+    }
+
     /// Seed a hybrid-signed `Revocation` of `revoked` by `revoking` (both must
     /// be registered keys). persist computes `persist_row_hash` on put — the
     /// value the Revocation plane advertises + the cache-free fetch scan matches.
@@ -13938,7 +14039,8 @@ pub(crate) mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let mut revocation = Revocation {
             revocation_id: id,
-            revoked_key_id: revoked.to_string(),
+            revoked_key_id: Some(revoked.to_string()),
+            revoked_key_sha256_ed25519_raw: revoked_digest_of(backend, revoked).await,
             revoking_key_id: revoking.to_string(),
             reason: None,
             revoked_at: now,
@@ -14010,7 +14112,8 @@ pub(crate) mod tests {
             let parsed: SignedRevocation =
                 serde_json::from_slice(&bytes).expect("fetched bytes are a SignedRevocation");
             assert_eq!(
-                parsed.revocation.revoked_key_id, revoked,
+                parsed.revocation.revoked_key_id.as_deref(),
+                Some(revoked),
                 "the re-derived bytes are the advertised revocation"
             );
         }
@@ -15811,6 +15914,7 @@ pub(crate) mod tests {
             .expect("pinned founding instant");
         backend
             .put_family_local(Family {
+                dissolved_at: None,
                 family_key_id: root.to_owned(),
                 family_name: root.to_owned(),
                 members: vec![FamilyMember {
@@ -16173,6 +16277,7 @@ pub(crate) mod tests {
         for (root, seat) in [(accord_a, holder), (accord_b, b_holder)] {
             backend
                 .put_family_local(Family {
+                    dissolved_at: None,
                     family_key_id: root.to_owned(),
                     family_name: root.to_owned(),
                     members: vec![member(seat)],
@@ -16359,6 +16464,7 @@ pub(crate) mod tests {
         for (root, member) in [(accord_a, holder), (accord_b, b_holder)] {
             backend
                 .put_family_local(Family {
+                    dissolved_at: None,
                     family_key_id: root.to_owned(),
                     family_name: root.to_owned(),
                     members: vec![FamilyMember {
@@ -16618,6 +16724,7 @@ pub(crate) mod tests {
             .parse()
             .expect("pinned founding instant");
         let family = Family {
+            dissolved_at: None,
             family_key_id: root.to_owned(),
             family_name: root.to_owned(),
             members: vec![FamilyMember {
@@ -16631,6 +16738,7 @@ pub(crate) mod tests {
             persist_row_hash: String::new(),
         };
         let unsigned = serde_json::to_vec(&SignedFamily {
+            cosignatures: Vec::new(),
             family: family.clone(),
             authority_key_id: String::new(),
             scrub_signature_classical: String::new(),

@@ -1096,8 +1096,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "51.3.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v51.3.0#412a679f04c0455a747abd6deec37f4d0c70ee4e"
+version = "52.0.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?rev=e398da3c#e398da3ce27afa8eb97a2556e1ec5131b6fb8d19"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1122,6 +1122,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.19",
