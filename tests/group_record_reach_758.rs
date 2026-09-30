@@ -489,6 +489,7 @@ struct Fixture {
     _tmp: tempfile::TempDir,
 }
 
+#[allow(clippy::many_single_char_names)] // the issue's names
 async fn fixture(tag: u8) -> Fixture {
     let tmp = tempfile::tempdir().expect("tempdir");
     let key_a = Ident::new(&format!("node-a-758-{tag}"), 0x2a ^ tag).await;
@@ -577,7 +578,7 @@ fn record_withholds(node: &Node) -> u64 {
 /// I23: FAILS on the pre-#758 code (B, C and D hold G's and F's records
 /// before any proposal: the founder-advertise leak).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)] // the whole lifecycle, in order, on purpose
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)] // the whole lifecycle, the issue's names
 async fn a_group_record_reaches_only_members_and_live_invitees_758() {
     init_tracing();
     let f = fixture(0x00).await;
@@ -658,12 +659,12 @@ async fn a_group_record_reaches_only_members_and_live_invitees_758() {
                 }
             }
         }
-        for id in to_c.iter() {
+        for id in &to_c {
             if !c.holds(id).await {
                 return false;
             }
         }
-        for id in to_d.iter() {
+        for id in &to_d {
             if !d.holds(id).await {
                 return false;
             }
