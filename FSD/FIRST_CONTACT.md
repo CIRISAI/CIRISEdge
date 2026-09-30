@@ -449,6 +449,43 @@ an outsider learned that the group exists and who founded it. The sweep may stil
 groups; who *receives* one is now this gate. Before v52 a record crossed only because a member sat
 in the operator's cohort, and then to any peer; members keep receiving it, outsiders no longer do.
 
+**The public-group carve-out (CIRISEdge#762).** The gate applies to **private** groups only. A
+**public** group's record keeps the pre-v38 `public` serve, to every peer, on the advertise and the
+fetch twin, at every reach including first contact and an unbound requester. A group is public when
+`replication::public_group::is_public_group` says so, with persist's markers read where persist's
+own readers read them:
+
+- a **Community** whose `policy_blob.cohort_subkind` is `infrastructure` (persist's
+  `community_subkind(&c) == Some(admission::COHORT_SUBKIND_INFRASTRUCTURE)`). The subkind, not the
+  id: `ciris-canonical` carries it, and so does every other infrastructure community;
+- a **Family** named by configured id: the accord / charter family
+  (`canonical_community::accord_family_key_id()` and `genesis::canonical_genesis_bundle()
+  .family_key_id`; under `test-anchor` also the anchored accord family,
+  `genesis::accord_family_genesis_record().family_key_id`), and the deployment's Wise-Authority
+  reclaim body, `ReclaimPolicy::from_deployment_pin().wa_family_key_id` (published by
+  `CIRIS_PERSIST_WA_ADJUDICATION_FAMILY_KEY_ID`, the source persist's reclaim admission reads).
+
+*Why.* CC 5.4.6 hides a group's existence and membership "from outsiders **only**", and CC
+4.4.3.2.1 makes `infrastructure` communities Commons-tier and publicly auditable. Every node
+resolves its trust root through groups it is not a member of: persist's `trust_root_valid` takes the
+family arm by `lookup_family(root_ref)` and the community arm by the stored standing of
+`ciris-canonical` (`trust_root.rs`), and ownership reclaim reads the WA body's record and active
+roster (`ownership_reclaim.rs` `wa_quorum_over_body`). Gating those records to members broke
+trust-root resolution on every node outside them. persist's ruling on CIRISEdge#761: public groups'
+records stay visible to every peer; only private groups are gated.
+
+*The accord family is carried for completeness, not because the gate could break it.* persist
+reserves `humanity-accord` at every admission door (`ConstitutionalFamilyReserved`,
+CIRISPersist#648): it enters a directory only through the genesis seeder / assemble ceremony
+(`put_family_local`), carries no signed record, and so is never listed on the Family plane nor
+admitted from a peer, on v37.1.0 as now. Every node resolves the family arm from its own genesis
+seed. Its marker stays in the predicate because it is persist's list and v53's predicate carries it.
+
+The predicate is a stand-in for
+persist v53's `federation::replication_audience::is_public_group`, which will replace it. The
+**membership planes** (widenings, revocations, listings) are untouched here: persist v53's
+`may_receive` decides them (#761).
+
 **Invariant I23** (§6).
 
 ---
@@ -583,7 +620,7 @@ before — minus the four rows that now cross.
 | I20 | **The owner-binding rung (§2.1.1, CIRISEdge#727).** (I-a) A binding whose attester is the receiver's own owner is admitted on any link after signature verification against the held owner key, through persist's replicated-attestation door. (I-b) A node pushes only its own binding, only on a link it dialed or in answer to a sibling's binding newly admitted on that link, never advertises it. (I-c) A stranger refuses it by name before any cryptography and stores nothing. (I-d) Admission invalidates the #682 memo; the unannounced pair converges in a bounded number of rounds. | `owned_devices_route_682::unannounced_devices_of_one_owner_exchange_routes_and_admit_682` (I-a, I-d: the round bound is asserted; fails on the pre-#727 code); `…::a_binding_signed_by_a_key_that_is_not_the_receivers_owner_is_refused_by_name_727` (I-a negative, both the attester field and the signature); `…::a_stranger_refuses_another_owners_binding_and_holds_nothing_727` (I-c); `…::a_node_pushes_its_binding_only_on_a_link_it_dialed_727` (I-b); `…::a_wiped_device_reconverges_by_dialling_its_sibling_727` (recovery); `protocol::tests::an_owner_binding_push_is_exactly_a_deliver_of_owner_binding_rows_727` (the shape) |
 | I21 | **A relay serves a first-contact peer the announced owner-binding of a node it publishes, and no other row about others** (§2.3, CIRISEdge#752, CC 5.4.6). The binding must be an owner-binding, at `federation`, live (attester = `owner_of(subject)`, the row in the #682 live announcing set), and its subject in the relay's `KindPublishSelector` `Key`/`IdentityOccurrence` set. Without a selector R2 is #671's. Consent grants, `self` bindings and bindings of unpublished nodes stay withheld; the Rooted floor still runs. | `relay_roster_752::a_stranger_lists_a_relays_published_device_under_its_owner_752` (three identities over real links: the stranger admits the device's key, occurrence and binding from the relay and `nodes_owned_by(owner)` names the device; fails on the pre-#752 code); `…::without_a_selector_nothing_about_others_reaches_the_stranger_752`; `bridge::a_relay_serves_a_published_nodes_announced_binding_at_first_contact_752` (advertise + fetch twin, the three negatives, selector unset) |
 | I22 | **The membership ceremony reaches its stranger (§2.4, CIRISEdge#756; CIRISPersist#955, CC rc6 3.1.3.2, CIRISConstitution#133).** Under `Reach::FirstContact` a node additionally serves (a) a `membership:proposal:v1` whose `subject_key_ids` contains `owner_of(peer)` and (b) an acceptance/decline, attested to the invitee of a proposal held here, whose proposal's proposer is `owner_of(peer)`; on the advertise and the fetch twin alike, without the Rooted floor (first-party to the recipient). Nothing else widens: no other row at the group's target, no proposal to anyone else, no reply to a proposal not held here or to someone else's proposal. | `membership_first_contact_756::a_stranger_is_invited_accepts_and_joins_over_first_contact_756` (community) and `…_a_family_over_first_contact_756` (three nodes over Reticulum, no consent, no common root; fails on the pre-#756 gate: the invitee's node never holds the proposal); `bridge::first_contact_serves_the_membership_ceremony_to_its_parties_and_nothing_else_756` (advertise + fetch twin, relayed un-Rooted proposal, the four negatives) |
-| I23 | **A group's record reaches its members and live invitees, nobody else (§2.5, CIRISEdge#758; CC 5.4.6).** A `Family` / `Community` record is served to a peer only when `owner_of(peer)` is a live member of the group or the `subject_key_ids` invitee of a live proposal into it held here; otherwise withheld as `group_record_not_member_or_invitee`, on the advertise and the fetch twin alike, at every reach. | `group_record_reach_758::a_group_record_reaches_only_members_and_live_invitees_758` (four nodes over Reticulum: a stranger never holds G's or F's record, an invitee only once proposed, a member as a member, and the pair room's invitee gets its record; fails on the pre-#758 code: every peer holds both records before any proposal); `bridge::a_group_record_is_served_only_to_members_and_live_invitees_758` (advertise + fetch twin: stranger, invitee, declined invitee, member, unbound peer) |
+| I23 | **A group's record reaches its members and live invitees, nobody else (§2.5, CIRISEdge#758; CC 5.4.6).** A `Family` / `Community` record is served to a peer only when `owner_of(peer)` is a live member of the group or the `subject_key_ids` invitee of a live proposal into it held here; otherwise withheld as `group_record_not_member_or_invitee`, on the advertise and the fetch twin alike, at every reach. **Public groups are exempt (CIRISEdge#762; CC 5.4.6 "from outsiders only", CC 4.4.3.2.1, persist's #761 ruling):** an `infrastructure` community and the accord / genesis / WA reclaim families keep the `public` serve to every peer, so every node still resolves its trust root and reclaim authority through them. | `group_record_reach_758::a_group_record_reaches_only_members_and_live_invitees_758` (four nodes over Reticulum: a stranger never holds G's or F's record, an invitee only once proposed, a member as a member, and the pair room's invitee gets its record; fails on the pre-#758 code: every peer holds both records before any proposal); `bridge::a_group_record_is_served_only_to_members_and_live_invitees_758` (advertise + fetch twin: stranger, invitee, declined invitee, member, unbound peer); `public_group_reach_762::a_public_group_resolves_on_a_non_member_762` (a non-member node receives an infrastructure community and the configured WA family, and persist's `stored_standing` and reclaim reads answer on it as on the holder, while a private community and family stay withheld; fails on the pre-#762 gate); `bridge::a_public_group_record_is_served_to_every_peer_762` (advertise + fetch twin, attributed stranger and unbound requester; the genesis-seated accord family is never listed) |
 
 ---
 
@@ -623,6 +660,15 @@ the load-bearing rule in this document that realises it.
 
 ## 9. Change log
 
+- **CIRISEdge#762** (edge v38.0.0) — §2.5 / I23: the group-record gate exempts PUBLIC groups
+  (`public_group::is_public_group`: an `infrastructure` community by subkind; the accord family,
+  the genesis bundle's family, the anchored accord family under `test-anchor`, and the deployment's
+  WA reclaim family by configured id). Their records keep the pre-v38 `public` serve, so a node
+  outside them still resolves its trust root and reclaim authority (CC 5.4.6 "from outsiders only",
+  CC 4.4.3.2.1, persist's #761 ruling). Stand-in for persist v53's
+  `replication_audience::is_public_group`. The Family and Community `serve` cells state the
+  carve-out; `SERVE_ADVERTISE_POLICY_HASH` re-pinned a09e34a6… → e3070d53…. Membership planes unchanged (v53
+  `may_receive`).
 - **CIRISEdge#758** (edge v38.0.0) — §2.5: a group's record (Family, Community) reaches only the
   group's live members and the invitees of a live proposal held here (the §2.4 predicate, reused);
   everyone else is withheld as `group_record_not_member_or_invitee` (CC 5.4.6). Closes the
