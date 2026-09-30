@@ -16,6 +16,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use async_trait::async_trait;
+
 use super::protocol::{EnvelopeKind, EnvelopeRef};
 use super::refusal_backoff::RetryDisposition;
 
@@ -78,16 +80,49 @@ impl LocalState {
     }
 }
 
-/// Trait the live Session calls to read local state. Production
-/// adapter (follow-up PR) wraps `FederationDirectory`'s
-/// `list_attestations` / `list_federation_keys` / `list_revocations`
-/// surfaces.
+/// Trait the live Session calls to read local state. The production
+/// adapter ([`DirectoryStateAdapter`]) wraps the persist-backed
+/// [`ReplicationDirectory`] read surface.
+///
+/// # Async end to end (CIRISEdge#740)
+///
+/// Every method that can touch a store is `async`; the production adapter
+/// awaits persist directly and the [`Session`] awaits the adapter. Until
+/// v34.3.0 the trait was synchronous and the adapter bridged with
+/// `tokio::task::block_in_place` + `Handle::block_on`, and that bridge is a
+/// deadlock whose depth scales with the fan-out: `block_in_place` hands the
+/// worker's core to a replacement drawn from the **blocking pool**, then
+/// `block_on` parks the caller on a persist read that itself needs a
+/// blocking-pool slot (persist runs every SQL call on `spawn_blocking`). A
+/// kicked round runs every (peer, kind) at once, so 3 peers × 14 kinds = 42
+/// bridged callers held 42 slots of a 32-slot pool before any read could
+/// start, and nothing could ever free one — the process stopped (no further
+/// round, no HTTP, `/health` unanswered). 2 × 14 = 28 fit, which is why every
+/// two-node witness had been green. The pool size is not the fix — raising it
+/// only moves the threshold (10 peers = 140) — so the bridge is gone: a
+/// `StateProvider` read now costs a pool slot only for the duration of the
+/// SQL call itself, exactly as any other persist read does.
+///
+/// The methods that stay synchronous (`retention`, `note_known_hashes`,
+/// `note_missing_signer`, `take_missing_signer_for`, `retry_suppressed`)
+/// are in-memory probes by contract — never I/O — and sit on the apply loop's
+/// hot path where a runtime hop would buy nothing.
+///
+/// This is a breaking change for every implementor: `local_refs`,
+/// `local_holdings`, `fetch_envelope`, `subject_refs` and
+/// `accord_evidence_since` are `async` and the impl carries
+/// `#[async_trait::async_trait]`.
+///
+/// [`DirectoryStateAdapter`]: super::directory::DirectoryStateAdapter
+/// [`ReplicationDirectory`]: super::directory::ReplicationDirectory
+/// [`Session`]: super::session::Session
+#[async_trait]
 pub trait StateProvider: Send + Sync {
     /// Snapshot the refs this node OFFERS to the round's peer for `kind` — the
     /// SEND axis. On the Attestation plane this is CIRISEdge#396-send-gated (a
     /// peer outside this node's live `consent:replication` send-set is offered
     /// nothing). Read once per round; callers don't memoize.
-    fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef>;
+    async fn local_refs(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef>;
 
     /// CIRISEdge#414 — the refs this node actually HOLDS for `kind` — the
     /// RECEIVE axis. Used ONLY to compute what the node still LACKS
@@ -101,8 +136,8 @@ pub trait StateProvider: Send + Sync {
     /// (`fetch_envelope_bytes_for_peer`) stay independently send-gated, so send
     /// fail-secure is unchanged. Defaults to [`Self::local_refs`] for providers
     /// with no peer-gating (every non-Attestation plane, and the test providers).
-    fn local_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
-        self.local_refs(kind)
+    async fn local_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        self.local_refs(kind).await
     }
 
     /// CIRISEdge#544 — should the round's `want` DROP this hash?
@@ -204,7 +239,8 @@ pub trait StateProvider: Send + Sync {
     /// Return the byte-exact signed envelope for the given content
     /// hash, or `None` if the envelope isn't in local state. Called
     /// during the Deliver-message construction step.
-    fn fetch_envelope(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> Option<Vec<u8>>;
+    async fn fetch_envelope(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32])
+        -> Option<Vec<u8>>;
 
     /// CIRISEdge#462 — the RECEIVE-axis SERVE reader: the refs this node holds
     /// for `kind` where `subject_key_id` is the data-subject (`list_signed_records`)
@@ -227,7 +263,7 @@ pub trait StateProvider: Send + Sync {
     /// the persist `FederationDirectory`) can answer a subject pull. Test/in-memory
     /// providers that don't override it simply return no refs — a Pull to them is
     /// a well-formed no-op, never a panic.
-    fn subject_refs(&self, _kind: EnvelopeKind, _subject_key_id: &str) -> Vec<EnvelopeRef> {
+    async fn subject_refs(&self, _kind: EnvelopeKind, _subject_key_id: &str) -> Vec<EnvelopeRef> {
         Vec::new()
     }
 
@@ -244,7 +280,7 @@ pub trait StateProvider: Send + Sync {
     /// Defaults to empty: only the production `DirectoryStateAdapter` (holding the
     /// persist `FederationDirectory`) and the DST store answer it. A cursor pull to
     /// a provider that doesn't override it is a well-formed no-op, never a panic.
-    fn accord_evidence_since(
+    async fn accord_evidence_since(
         &self,
         _kind: EnvelopeKind,
         _since: Option<chrono::DateTime<chrono::Utc>>,
@@ -378,6 +414,13 @@ impl ApplyOutcome {
 /// shared `Arc<dyn StateApplier>` directly, no mutex; per-peer rounds apply
 /// concurrently down to the store's own serialization. Implementations that
 /// record state (test appliers) use interior mutability.
+///
+/// CIRISEdge#740 — `apply_envelope` is `async` (the fourth breaking
+/// `StateApplier` change), for the reason [`StateProvider`] gives: the
+/// production adapter used to bridge persist's async `apply_envelope_bytes`
+/// with `block_in_place` + `block_on`, and every such bridge on a round's
+/// path is a blocking-pool slot held while waiting for a blocking-pool slot.
+#[async_trait]
 pub trait StateApplier: Send + Sync {
     /// Apply one envelope to local state. The receiver MUST verify the signed
     /// envelope's signature + canonical-bytes hash before admitting. Returns an
@@ -392,7 +435,7 @@ pub trait StateApplier: Send + Sync {
     /// because this identity was dropped before reaching the applier. `None` for
     /// non-peer-attributed applies (tests / self-seed). The receiver is transport-
     /// blind otherwise; this is pass-through metadata, not a protocol input.
-    fn apply_envelope(
+    async fn apply_envelope(
         &self,
         kind: EnvelopeKind,
         envelope_bytes: &[u8],

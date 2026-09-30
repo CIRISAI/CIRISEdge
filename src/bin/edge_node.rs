@@ -1693,7 +1693,11 @@ const DISCOVERY_PLANES: [EnvelopeKind; 4] = [
 
 /// Build the whole occurrence: keys, sealed KV, directory, transport,
 /// address table, lifecycle.
-async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, String> {
+async fn stand_up(
+    cfg: Config,
+    reporter: Arc<Reporter>,
+    max_blocking_threads: usize,
+) -> Result<Occurrence, String> {
     std::fs::create_dir_all(&cfg.state_dir)
         .map_err(|e| format!("create state dir {}: {e}", cfg.state_dir.display()))?;
 
@@ -2216,6 +2220,12 @@ async fn stand_up(cfg: Config, reporter: Arc<Reporter>) -> Result<Occurrence, St
                 scheduler: ciris_edge::replication::SchedulerConfig {
                     cadence: Duration::from_secs(5),
                     round_timeout: Duration::from_secs(10),
+                    // CIRISEdge#740 — the round bound follows THIS runtime's
+                    // blocking pool (half of it), not the library default.
+                    max_concurrent_rounds:
+                        ciris_edge::replication::SchedulerConfig::max_concurrent_rounds_for(
+                            max_blocking_threads,
+                        ),
                 },
                 local_key_id: Some(cfg.node_id.clone()),
                 // CIRISEdge#640 — the sealed-content door as ONE value: the
@@ -5262,7 +5272,7 @@ fn main() -> std::process::ExitCode {
         ));
         let role = cfg.role;
 
-        let occ = match stand_up(cfg, Arc::clone(&reporter)).await {
+        let occ = match stand_up(cfg, Arc::clone(&reporter), budget.max_blocking_threads).await {
             Ok(o) => o,
             Err(e) => {
                 reporter.not_run("mesh.standup", e);

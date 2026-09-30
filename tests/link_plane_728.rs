@@ -311,6 +311,7 @@ async fn side(
                     // Rounds are driven by the test (`round_now_all`).
                     cadence: Duration::from_secs(3600),
                     round_timeout: Duration::from_secs(15),
+                    ..SchedulerConfig::default()
                 },
                 local_key_id: Some(key.key_id.clone()),
                 metrics: Some(metrics.clone()),

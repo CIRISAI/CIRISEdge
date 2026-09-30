@@ -628,8 +628,11 @@ impl std::fmt::Debug for SealedContentWiring {
 /// Configuration for [`ReplicationRuntime::start`].
 #[derive(Debug, Clone, Default)]
 pub struct ReplicationRuntimeConfig {
-    /// Cadence + round-timeout for the scheduler. Defaults to
-    /// [`SchedulerConfig::default`] (30 s cadence, 10 s round timeout).
+    /// Cadence + round-timeout + round bound for the scheduler. Defaults to
+    /// [`SchedulerConfig::default`] (30 s cadence, 10 s round timeout, at
+    /// most [`SchedulerConfig::DEFAULT_MAX_CONCURRENT_ROUNDS`] rounds in
+    /// flight — CIRISEdge#740: a kick on a 130-peer node runs 16 rounds at a
+    /// time, not 1,800; see [`SchedulerConfig::max_concurrent_rounds`]).
     pub scheduler: SchedulerConfig,
     /// Cache + paging tuning for the bridge. Defaults to
     /// [`BridgeConfig::default`].
@@ -732,8 +735,9 @@ pub struct ReplicationRuntime {
     /// hot-adds — with NO wrapping mutex. `apply_envelope` is `&self`, so
     /// per-peer rounds apply concurrently down to the store's own
     /// serialization; the old per-coordinator `Arc<Mutex<_>>` hold-across-
-    /// the-whole-message critical section (with `block_on` DB I/O inside)
-    /// is gone.
+    /// the-whole-message critical section is gone, and so (CIRISEdge#740) is
+    /// the `block_in_place` + `block_on` bridge the adapter used to carry —
+    /// the apply is awaited end to end.
     applier: Arc<dyn StateApplier>,
     /// Bumped once per ADMITTED envelope. The thing that lets a caller AWAIT a
     /// row's arrival rather than poll for it — see [`Self::await_convergence`]
@@ -1435,6 +1439,14 @@ impl ReplicationRuntime {
         Arc::clone(&self.registry)
     }
 
+    /// CIRISEdge#740 — the scheduler's round bound and its counters: the
+    /// bound, rounds in flight now, the peak, and how many rounds have waited
+    /// behind the gate since start.
+    #[must_use]
+    pub fn round_bound(&self) -> super::scheduler::RoundBoundStats {
+        self.scheduler_handle.round_bound()
+    }
+
     /// The runtime's bridge. Useful for telemetry or tests that
     /// want to inspect cache state.
     pub fn bridge(&self) -> Arc<FederationDirectoryReplicationBridge> {
@@ -1527,9 +1539,10 @@ mod tests {
     /// the routed Summary sat in its inbox and was never processed: the
     /// responder never replied and the initiator timed out forever (the #348
     /// silent stall). This asserts a reply is emitted back to the initiator.
-    // multi_thread: `DirectoryStateAdapter` uses `block_in_place` (directory.rs),
-    // which requires a multi-threaded runtime — the shape the real edge runtime
-    // always has.
+    // multi_thread: the shape the real edge runtime always has. (Until
+    // CIRISEdge#740 this was REQUIRED — `DirectoryStateAdapter` bridged with
+    // `block_in_place`, which panics on a current-thread runtime; the
+    // adapter is a plain async forwarder now and the flavor is a choice.)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn factory_responder_is_driven_and_replies_to_a_round_open() {
         use super::super::protocol::{ReplicationMessage, SummaryMessage};
@@ -1896,6 +1909,7 @@ mod tests {
                 scheduler: SchedulerConfig {
                     cadence: std::time::Duration::from_secs(3600),
                     round_timeout: std::time::Duration::from_secs(5),
+                    ..SchedulerConfig::default()
                 },
                 metrics: Some(metrics.clone()),
                 local_key_id: Some(name.to_string()),
