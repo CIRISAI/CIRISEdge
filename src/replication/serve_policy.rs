@@ -57,9 +57,17 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         ),
         // E3: the trace plane is the sole capability-gated serve path — and the
         // ONE plane whose projection is genuinely decided per row.
+        //
+        // CIRISEdge#671 / #752 (CC 5.4.6, CIRISServer#701) — a first-contact
+        // peer (no consent, no owner/family axis) is served this node's own
+        // allegiance facts and, when the host installed a `KindPublishSelector`,
+        // the live `federation` owner-binding of every node in that selector's
+        // Key / IdentityOccurrence set (the public device roster); nothing else.
         EnvelopeKind::Attestation => (
             "per_record_projection",
-            "trace:* → capability:infra:serve; else public",
+            "trace:* → capability:infra:serve; first contact → own allegiance facts \
+             + live federation owner-bindings of nodes in the Key/IdentityOccurrence \
+             publish set; else public",
         ),
         EnvelopeKind::Family | EnvelopeKind::Community | EnvelopeKind::LocationProof => {
             ("cohort", "public")
@@ -249,8 +257,15 @@ pub fn serve_advertise_policy_sha256() -> String {
 // peer only when announced (owner-binding at `cohort_scope: federation`), else
 // only its owner's own nodes — on the advertise, the direct fetch and the
 // subject Pull alike. `Key` is untouched. **CIRISServer must mirror this pin.**
+//
+// CIRISEdge#752 — RE-PINNED, e4c4d625… → b86a7042…. The Attestation `serve` cell
+// now names what a first-contact peer (no consent) is served: this node's own
+// allegiance facts (#671, which the cell never stated) and, with a
+// `KindPublishSelector` installed, the live `federation` owner-binding of each
+// node in the Key / IdentityOccurrence publish set (CC 5.4.6, CIRISServer#701).
+// **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "e4c4d6253afe686a01eec073da343b74b11af6da6cd26c16a6ef0aacc9804569";
+    "b86a7042ad9ccc81d7e54abc9b9a2fb8d8a415e7d1c85be025484292150347eb";
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,29 @@
 # CIRISEdge Release Notes
 
+# v37.1.0 — a relay serves a third party's announced owner-binding at first contact (CC 5.4.6 public roster)
+
+**2026-09-30** (CIRISEdge#752 → PR #753; for CIRISServer#701). **MINOR** from v37.0.0. persist `v51.3.0`
+(floor `>=51.3,<52`), verify `v18.0.0`, every ABI constant unchanged. **Re-pin:**
+`SERVE_ADVERTISE_POLICY_HASH` `e4c4d625…` → **`b86a7042ad9ccc81d7e54abc9b9a2fb8d8a415e7d1c85be025484292150347eb`**.
+
+CC 5.4.6 (CIRISConstitution#111): a person's device roster is public exactly for the devices announced,
+and announcing IS carrying the owner-binding at federation scope. With CIRISServer#701's
+`KindPublishSelector` a relay (the canonical) already published announced nodes' keys and occurrences,
+but #671's first-contact rule served only the relay's OWN allegiance facts, so a stranger peered only with
+the canonical could never list anyone's announced devices.
+
+- **The rule:** a first-contact peer is also served an Attestation that is an owner-binding
+  (`ownership:responsible_party:node:v1`), at `cohort_scope: federation`, LIVE (the #682 announce gate's
+  liveness, now one shared read `live_announcing_rows`), and whose subject node is in the relay's Key or
+  IdentityOccurrence publish set. Advertise and the direct-fetch twin agree; the subject Pull is unchanged.
+  With no selector set, first contact is exactly #671's.
+- **Still withheld:** consent grants, self-plane rows, bindings at `self` (unannounced), bindings of nodes
+  the relay does not publish. The #659 Rooted floor still applies (rows about others go only to Rooted
+  peers; the public roster is public at FEDERATION scope).
+- **Witness** `tests/relay_roster_752.rs`: stranger X peered only with relay C admits D's key, occurrence
+  and `O → D`, and `nodes_owned_by(O)` at X lists D; the four negatives hold; with the rule disabled X gets
+  no binding and cannot admit D's occurrence. FSD `FIRST_CONTACT.md` §2.3, invariant I21.
+
 # v37.0.0 — a self-room chunk DAG pulls its chunks on the real replication path; a chunk is served only under the file it belongs to
 
 **2026-09-30** (CIRISEdge#717 field regression → PR #751). **MAJOR** from v36.1.0 (`WithholdReason` gains a
