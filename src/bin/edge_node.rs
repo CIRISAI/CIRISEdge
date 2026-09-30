@@ -1296,7 +1296,7 @@ impl InboundStats {
 }
 
 /// CIRISEdge#768 — persist's gated serve door, answering each blob's SCOPE from
-/// the row that references it (`BlobMeaning::project`). A node with a scope
+/// the rows that place it (`BlobMeaning::serve_scope`). A node with a scope
 /// address table must answer `chunk_scope`, or the scope gate withholds every
 /// scoped fetch as undeterminable (CIRISEdge#499/#640). Same shape as the
 /// in-repo scope-native fixtures (`tests/self_dag_field_path_717.rs`).
@@ -1322,15 +1322,10 @@ impl ciris_edge::blob_swarm::BlobChunkSource for RowScopedChunkSource {
         &self,
         blob_sha256: [u8; 32],
     ) -> Option<ciris_edge::blob_swarm::ContentScope> {
-        use ciris_persist::federation::FederationDirectory as _;
-        let rows = self
-            .dir
-            .attestations_binding_content(&hex::encode(blob_sha256))
-            .await
-            .ok()?;
-        rows.iter()
-            .find_map(|row| ciris_edge::blob_swarm::BlobMeaning::project(row, &blob_sha256).ok())
-            .map(|m| m.scope().clone())
+        // The library's one rule (CIRISEdge#736/#759): a shared body is
+        // referenced by the author's `self` row AND the widening that placed
+        // it in the room, and the widening decides.
+        ciris_edge::blob_swarm::BlobMeaning::serve_scope(&*self.dir, &blob_sha256).await
     }
 
     fn answers_scope(&self) -> bool {
