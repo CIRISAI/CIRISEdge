@@ -417,31 +417,30 @@ pub async fn open_pair_room(
 ) -> Result<PairRoomOpened, String> {
     use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
     let room = pair_community_key_id(opener, peer);
-    let founded = match directory
+    let held = directory
         .lookup_community(&room)
         .await
-        .map_err(|e| format!("lookup room {room}: {e}"))?
-    {
-        Some(held) => {
-            if !held
-                .members
-                .iter()
-                .any(|m| m.key_id == opener && m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
-            {
-                return Err(format!(
-                    "room {room} is already held here and {opener} did not found it — the                      other side opened it; accept its proposal (chat::pair_proposal_for →                      chat::accept_pair_proposal) (CIRISPersist#955)"
-                ));
-            }
-            false
+        .map_err(|e| format!("lookup room {room}: {e}"))?;
+    let founded = if let Some(held) = held {
+        if !held
+            .members
+            .iter()
+            .any(|m| m.key_id == opener && m.role.as_deref() == Some(MEMBER_ROLE_FOUNDER))
+        {
+            return Err(format!(
+                "room {room} is already held here and {opener} did not found it — the \
+                 other side opened it; accept its proposal (chat::pair_proposal_for → \
+                 chat::accept_pair_proposal) (CIRISPersist#955)"
+            ));
         }
-        None => {
-            let row = signed_pair_community(opener, peer, founded_at, authority).await?;
-            directory
-                .put_community(row)
-                .await
-                .map_err(|e| format!("found room {room}: {e}"))?;
-            true
-        }
+        false
+    } else {
+        let row = signed_pair_community(opener, peer, founded_at, authority).await?;
+        directory
+            .put_community(row)
+            .await
+            .map_err(|e| format!("found room {room}: {e}"))?;
+        true
     };
     let active = directory
         .active_community_members(&room)
@@ -519,7 +518,7 @@ async fn live_proposal_by(
         })
         .collect();
     live.retain(|p| !declined.contains(&p.attestation_id));
-    live.sort_by(|a, b| b.asserted_at.cmp(&a.asserted_at));
+    live.sort_by_key(|p| std::cmp::Reverse(p.asserted_at));
     Ok(live.into_iter().next())
 }
 

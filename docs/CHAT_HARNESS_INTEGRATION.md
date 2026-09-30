@@ -481,7 +481,7 @@ to copy; every call below is exercised there.
 | "Send request to join chat community" | your `POST /v1/contacts` | **server** |
 | "Request received from X" + optional note | your transport of choice; edge carries the bytes | **server** |
 | accept → consent | your consent grant | **server** |
-| "Joined community with X" | `chat::signed_pair_community` (the room record, both people `founder`s), `put_community` on your directory — the second put is a `Conflict`, which is the same room. Then the MLS handshake OVER THE ROOM: joiner `key_package_attestation` → creator `CohortGroup::create` + `add_member` + `welcome_attestation` → joiner `CohortGroup::join` from `welcome_from`. The group is the room's CC 5.4 addressing root, not a content key | edge |
+| "Joined community with X" | **By consent (persist v52.0.0, CIRISPersist#955, CIRISConstitution#133):** the opener calls `chat::open_pair_room` (founds the room with the opener ALONE as `founder`, proposes the other person as `founder`); the invitee's inbox reads `chat::pair_proposal_for` / `membership::pending_proposals_for` and answers `chat::accept_pair_proposal` (or `decline_pair_proposal`); the opener's node widens the roster when the acceptance arrives (set `ReplicationRuntimeConfig::membership_widener` to the opener's person signer). End state: both people `founder`s. Then the MLS handshake OVER THE ROOM: joiner `key_package_attestation` → creator `CohortGroup::create` + `add_member` + `welcome_attestation` → joiner `CohortGroup::join` from `welcome_from`. The group is the room's CC 5.4 addressing root, not a content key | edge |
 | "Chat with Y" | `contact::the_other_member(&group.member_key_ids().await, own_key_id)` | edge |
 | send a message | `chat::chat_message_attestation(&author, &peer, body, now, &store)` — the body goes to the room's blob store under persist's community DEK, the row carries the pointer; the returned `SealedContent` says who can open it, and a body nobody can open is REFUSED before it is sent | edge |
 | read the room | `chat::messages_in_room(&*dir, &[peer_fed_id], &room, &store, viewer_occurrence_key)` — opened through the viewer's occurrence wrap; a row that will not open is `Body::Unopened { reason }` | edge |
@@ -511,11 +511,16 @@ Four things worth knowing before you build on it:
    and cannot be a contact, so pasting either into one search box is correct and
    supported — `resolve` walks a node to its owner. Do not create two contact
    entries for one human.
-2. **The invitee is a moderator, not a guest.** Both members of a pair room
-   are `founder`s in the record and the protocol is `unanimous`: persist
-   refuses to federate a room with no live named moderator (CC 4.5.4), and a
-   founder is one. If your UI implies the creator is privileged, it is
-   describing a rule the substrate does not enforce.
+2. **The invitee is a moderator, not a guest, once they have accepted.**
+   The opener founds the pair room alone and proposes the other person as
+   `founder`; on their acceptance the roster is widened, so both members are
+   `founder`s and the protocol is `unanimous`. persist refuses to federate a
+   room with no live named moderator (CC 4.5.4), and a founder is one. Nobody
+   is in a room they did not accept (CIRISConstitution#133): a widening
+   without the member's acceptance is refused by rule
+   (`membership::MembershipError::rule`). A decline is terminal. If your UI
+   implies the creator is privileged after the join, it is describing a rule
+   the substrate does not enforce.
 3. **"Chat with Y" is derived, never stored.** `the_other_member` returns `None`
    unless the room is exactly two people *and* you are one of them — so a group
    chat cannot silently render under one participant's name. Decide what an
@@ -538,8 +543,8 @@ Four things worth knowing before you build on it:
    classical-only fallback anywhere in edge from v19.0.0), including the two
    handshake rows (`chat:key_package:v1`, `chat:welcome:v1`), which the
    audience gate serves to exactly the other member's nodes. Both humans are
-   `founder`s of the pair room, so it federates (§11.11) without anyone
-   appointing anyone.
+   `founder`s of the pair room once the invitee has accepted, so it federates
+   (§11.11) without anyone appointing anyone.
 
 Every rung above is proven over the real mesh, not just in unit tests:
 `bench-mesh`'s `ladder.discover_by_fedid` resolves a PEER's owner from a

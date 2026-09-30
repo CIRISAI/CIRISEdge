@@ -365,7 +365,9 @@ pub async fn pending_proposals_for(
             .await
             .map_err(|e| MembershipError::from_persist("list proposals", &e))?;
         let full = page.len() == PAGE as usize;
-        since = page.last().map(|s| s.resume_pair());
+        since = page
+            .last()
+            .map(ciris_persist::federation::types::ServedAttestation::resume_pair);
         for served in page {
             let p = served.attestation;
             if dimension_of(&p) != Some(PROPOSAL_DIMENSION)
@@ -396,7 +398,7 @@ pub async fn pending_proposals_for(
             break;
         }
     }
-    out.sort_by(|a, b| a.proposal.asserted_at.cmp(&b.proposal.asserted_at));
+    out.sort_by_key(|p| p.proposal.asserted_at);
     Ok(out)
 }
 

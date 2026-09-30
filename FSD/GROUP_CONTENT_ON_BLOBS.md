@@ -163,8 +163,60 @@ Two rules follow, and both are load-bearing:
 A two-party room is not a special case. `pair_community_key_id(a, b)` already
 derives a stable community id from two federation ids in sorted order; that
 id is a `community_key_id` like any other, and the roster machinery treats it
-like any other. The 2-party derivation exists so a pair needs no roster
-ceremony — not so it can take a different code path.
+like any other. The 2-party derivation exists so a pair needs no id
+allocation — not so it can take a different code path, and not so it can skip
+the consent step below.
+
+### 3.1 Joining a room — nobody joins without their own consent
+
+CIRISConstitution#133 ruled that **nobody joins a family or community without
+their own consent**, and persist v52.0.0 (CIRISPersist#955, FSD
+`MEMBERSHIP_ACCEPTANCE.md`) enforces it at every roster door. Edge follows it
+with no co-signed founding path:
+
+1. **A group is founded by its opener alone.** A founding record admits only
+   the members who signed it (`membership_founding_member_unsigned`
+   otherwise), so edge's founding records list the opener and nobody else.
+   `chat::pair_community(opener, peer, at)` lists the opener as `founder`
+   under `unanimous`.
+2. **Everyone else joins by accepting a proposal.** The opener (a founder
+   under `founder_only`, any member otherwise) emits `membership:proposal:v1`
+   placed at the group, naming the invitee in `subject_key_ids` and the
+   offered role, live for at most 30 days (`membership::propose`,
+   `chat::open_pair_room` for a pair, where the offered role is `founder`).
+   Edge's audience gate serves a proposal to the invitee's nodes whatever
+   rooms they are in, the serve-side twin of persist's
+   `admits_membership_proposal`.
+3. **The invitee's PERSON replies** (a device bound to them may sign for it:
+   persist compares the signer and the invitee as identities):
+   `membership::reply` / `chat::accept_pair_proposal` /
+   `chat::decline_pair_proposal`, with the invite inbox read through
+   `membership::pending_proposals_for` / `chat::pair_proposal_for`. A decline
+   is final for that proposal. The audience gate serves the reply to the
+   proposer's nodes even from a node that does not hold the group, which
+   the invitee's usually does not.
+4. **The proposer's node widens on the acceptance.** A node whose replication
+   bridge carries a `membership::MembershipWidener`
+   (`ReplicationRuntimeConfig::membership_widener`) signs the ordinary roster
+   widening at the offered role when it admits an acceptance of a proposal one
+   of its identities issued, so the opener takes no second action. The widener
+   signs with the founder's own key, because the roster's consensus counts
+   seat keys. It is idempotent: a re-applied acceptance finds the member active.
+
+A widening without a matching live acceptance is refused by persist, and edge
+surfaces the refusal by rule and never silently retries it:
+`membership_acceptance_unresolved` / `membership_proposal_unresolved` are
+transient (`ApplyRefusalClass::RetryAfterConsent`), because the missing row
+may still arrive. Every other rule, a decline or an expiry included, is
+terminal (`MembershipConsentRefused`). A member who only ever declined leaves
+no acceptance for persist's growth gate to rank, so persist reports that case
+as `acceptance_unresolved`. `membership::widen` names it `membership_declined`
+instead.
+
+The pair room's end state is unchanged: both people are founders, so both are
+zero-hop moderators (§11.11), and `unanimous` keeps nothing decided without
+both. The difference is that the second founder got there by accepting.
+`tests/pair_room_consent_955.rs` witnesses the whole path across two nodes.
 
 ---
 

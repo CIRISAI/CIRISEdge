@@ -56,6 +56,16 @@
 //! registered key — every pair room and allocated room edge produces can now
 //! be revoked from.
 //!
+//! # A widening needs the member's own acceptance (persist v52.0.0)
+//!
+//! CIRISConstitution#133 / CIRISPersist#955: nobody joins without their own
+//! consent. The widening door admits a growth only on a matching live
+//! `membership:acceptance:v1` by the member, so the producer here is step 3
+//! of [`crate::membership`]'s propose → accept → widen; without the
+//! acceptance persist refuses it by rule. A room is founded by its opener
+//! alone ([`crate::chat::community`] with one member, or
+//! [`crate::chat::open_pair_room`]).
+//!
 //! # Both changes replicate
 //!
 //! `CommunityMembershipWidening` and `CommunityMembershipRevocation` are each
