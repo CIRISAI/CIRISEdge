@@ -1333,6 +1333,20 @@ impl ciris_edge::blob_swarm::BlobChunkSource for RowScopedChunkSource {
     }
 }
 
+/// CIRISEdge#768 — the blob plane's counters, for the chat legs' detail: which
+/// holder source a pull used, the carriers its fetches rode, and every route,
+/// serve and pull refusal by branch.
+fn blob_plane_json(edge: &ciris_edge::Edge) -> serde_json::Value {
+    let m = edge.metrics().snapshot();
+    serde_json::json!({
+        "pull_sources": m.blob_pull_sources,
+        "pull_refusals": m.blob_pull_refusals,
+        "route_refusals": m.blob_route_refusals,
+        "serve_refusals": m.blob_serve_refusals,
+        "scoped_carriers": m.blob_scoped_carriers,
+    })
+}
+
 /// Drain the transport, splitting harness frames from REPLICATION frames.
 ///
 /// `Transport::listen` claims the node's single event receiver, so whoever
@@ -1735,6 +1749,8 @@ fn annexb_access_units(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 /// scope-address lifecycle driving the real transport.
 struct Occurrence {
     cfg: Config,
+    /// CIRISEdge#768 — the blob plane's Edge (serve + the puller's fetches).
+    edge: Arc<ciris_edge::Edge>,
     /// The real anti-entropy runtime. Owner bindings reach peers through this
     /// and nothing else — the harness seeds no state into any peer.
     replication: Arc<ciris_edge::replication::ReplicationRuntime>,
@@ -2545,6 +2561,7 @@ async fn stand_up(
 
     Ok(Occurrence {
         cfg,
+        edge,
         replication,
         inbound_stats,
         transport,
@@ -3590,6 +3607,7 @@ async fn run_chat_legs(occ: &Occurrence) {
                         "custody": cfg.node_id,
                         "with": "community",
                         "room_addresses": room_addresses,
+                        "blob_plane": blob_plane_json(&occ.edge),
                         "covers": "the body written to the room's blob store under persist's community \
                                    DEK (wrapped per member occurrence, CIRISPersist#848) with only the \
                                    pointer on the row, authored tier:local / cohort:self by the OWNER \
@@ -3738,6 +3756,7 @@ async fn run_chat_legs(occ: &Occurrence) {
             "open_waited_ms": open_started.elapsed().as_millis(),
             "open_checks": open_checks,
             "room_addresses": room_addresses,
+            "blob_plane": blob_plane_json(&occ.edge),
             "leaked_self_rows": leaked_self_rows,
             "plaintext_on_wire": plaintext_on_wire,
             "peer_node": peer_node,
@@ -5618,9 +5637,11 @@ fn main() -> std::process::ExitCode {
         use tracing_subscriber::{fmt, EnvFilter};
         let _ = fmt()
             .with_writer(std::io::stderr)
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-            )
+            .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // The puller reports each pull's outcome at debug; a
+                // body that never opened is unreadable without it.
+                EnvFilter::new("info,ciris_edge::blob_swarm::pull=debug")
+            }))
             .try_init();
     }
     //
