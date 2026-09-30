@@ -917,4 +917,177 @@ async fn chunk_membership_is_the_named_dags(
         "(X, X) — the DAG's root, the whole-blob shape — is served as before"
     );
     assert_eq!(withheld(), before + 1, "no control was refused");
+
+    // ── CIRISEdge#766 — the same refusal with A's membership sets WARM.
+    // The controls above made A's serve gate read X's and Y's chunk sets
+    // and keep them (one listing per file, not per chunk). A held set must
+    // bound the chunk exactly as the listing did.
+    let cross_warm = ask(x, y_chunk).await;
+    assert!(
+        matches!(&cross_warm, ciris_edge::ChunkResult::ChunkMiss { reason } if reason.contains("PolicyDenied")),
+        "with X's chunk set held, Y's chunk named under X is still refused (CIRISEdge#766): \
+         {cross_warm:?}"
+    );
+    assert_eq!(
+        withheld(),
+        before + 2,
+        "booked chunk_not_in_named_dag again, from the held set"
+    );
+    assert!(
+        served(&ask(x, x_chunk).await, x_chunk),
+        "(X, X's chunk) is served from the held set"
+    );
+
+    withdrawn_files_chunks_stop_being_served_766(a, b, &person, (x, x_chunk), &y, y_chunk).await;
+}
+
+/// **CIRISEdge#766 — a held chunk set never outlives the file's withdrawal.**
+///
+/// A serve door armed with the revocation register (as production wires it,
+/// `replication::runtime`) serves Y's chunk — so Y's chunk set is held — and
+/// then Y's author withdraws Y (`files::withdraw`, the drive's delete). The
+/// register takes the withdrawal through the same two calls the bridge makes
+/// ([`observe`] / [`apply_observation`], with the evictor): the next request
+/// for Y's chunk is refused `Withdrawn` and the held set is dropped. A door
+/// that is NOT armed reads no register, so it never refused a withdrawn file
+/// at this gate; for it the witness is that a held set answers exactly what a
+/// cold door answers (the cache is never staler than the listing). X,
+/// untouched, is still served from its set.
+///
+/// [`observe`]: ciris_edge::blob_swarm::revocation::observe
+/// [`apply_observation`]: ciris_edge::blob_swarm::revocation::apply_observation
+async fn withdrawn_files_chunks_stop_being_served_766(
+    a: &Member,
+    b: &Member,
+    person: &ciris_edge::identity::LocalSigner,
+    (x, x_chunk): ([u8; 32], [u8; 32]),
+    y: &ciris_edge::files::PublishedFile,
+    y_chunk: [u8; 32],
+) {
+    use ciris_edge::blob_swarm::revocation::{apply_observation, observe};
+    use ciris_edge::blob_swarm::{
+        BlobChunkSource as _, BlobEvictor, BytesVerdict, ChunkSourceRefusal,
+        PersistBlobChunkSource, RevocationRegister,
+    };
+    let y_sha: [u8; 32] = hex::decode(&y.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let register = Arc::new(RevocationRegister::default());
+    let armed = PersistBlobChunkSource::new(a.node.store.engine().clone())
+        .with_revocations(Some(Arc::clone(&register)));
+    // The same door, unarmed: what a stale set could serve if the register
+    // were not wired.
+    let unarmed = PersistBlobChunkSource::new(a.node.store.engine().clone());
+    let evictor: &dyn BlobEvictor = a.node.store.engine();
+    // A holds Y's row; the register indexes it as the bridge would.
+    assert!(
+        apply_observation(
+            &register,
+            &*a.node.dir,
+            Some(evictor),
+            observe(&y.row).expect("a file row carries a pointer"),
+        )
+        .await
+        .is_empty(),
+        "indexing Y's row evicts nothing"
+    );
+    assert_eq!(register.verdict(&y_sha), BytesVerdict::Live);
+
+    let peer = &b.node.me;
+    for door in [&armed, &unarmed] {
+        assert!(
+            matches!(door.read_chunk(y_sha, y_chunk, peer).await, Ok(Some(ref bytes))
+                if <[u8; 32]>::from(sha2::Sha256::digest(bytes)) == y_chunk),
+            "precondition: (Y, Y's chunk) is served"
+        );
+        assert!(
+            matches!(door.read_chunk(x, x_chunk, peer).await, Ok(Some(_))),
+            "precondition: (X, X's chunk) is served"
+        );
+        assert!(
+            door.holds_membership_of(&y_sha) && door.holds_membership_of(&x),
+            "precondition: both files' chunk sets are held — the next asks are cache hits"
+        );
+        assert!(
+            matches!(
+                door.read_chunk(x, y_chunk, peer).await,
+                Err(ChunkSourceRefusal::ChunkNotInNamedDag)
+            ),
+            "a held set bounds the chunk: Y's chunk under X is refused"
+        );
+    }
+
+    // ── Y's author withdraws Y; the holder's register takes it.
+    let withdraws = ciris_edge::files::withdraw(
+        &*a.node.dir,
+        &y.row,
+        "deleted from the drive",
+        ts(),
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &a.node.signer,
+            actor: Some(person),
+        },
+    )
+    .await
+    .expect("Y's author withdraws Y");
+    let evicted = apply_observation(
+        &register,
+        &*a.node.dir,
+        Some(evictor),
+        observe(&withdraws).expect("a withdraws is observed"),
+    )
+    .await;
+    assert_eq!(
+        evicted,
+        vec![y_sha],
+        "every reference to Y withdrawn: Y is evicted"
+    );
+    assert_eq!(register.verdict(&y_sha), BytesVerdict::Revoked);
+
+    assert!(
+        matches!(
+            armed.read_chunk(y_sha, y_chunk, peer).await,
+            Err(ChunkSourceRefusal::Withdrawn)
+        ),
+        "after the withdrawal Y's chunk is refused Withdrawn — a held set does not serve it \
+         (CIRISEdge#766)"
+    );
+    assert!(
+        !armed.holds_membership_of(&y_sha),
+        "the withdrawal dropped Y's held chunk set"
+    );
+    // An UNARMED door never honoured a withdrawal at this gate (it reads no
+    // register); what #766 must not do is make its answer staler than the
+    // uncached check's. A door with Y's set held answers exactly what a cold
+    // door (no set, the listing read afresh) answers.
+    let cold = PersistBlobChunkSource::new(a.node.store.engine().clone());
+    let shape = |r: &Result<Option<Vec<u8>>, ChunkSourceRefusal>| match r {
+        Ok(Some(_)) => "bytes".to_owned(),
+        Ok(None) => "not held".to_owned(),
+        Err(e) => format!("{e:?}"),
+    };
+    let warm_answer = shape(&unarmed.read_chunk(y_sha, y_chunk, peer).await);
+    assert!(
+        !cold.holds_membership_of(&y_sha),
+        "precondition: the cold door holds no set"
+    );
+    let cold_answer = shape(&cold.read_chunk(y_sha, y_chunk, peer).await);
+    eprintln!("CIRISEdge#766 unarmed door after Y's withdrawal: held set -> {warm_answer}, cold -> {cold_answer}");
+    assert_eq!(
+        warm_answer, cold_answer,
+        "a held set answers exactly what the uncached check answers after the withdrawal \
+         (CIRISEdge#766: the cache is never staler than the listing)"
+    );
+    assert!(
+        matches!(
+            unarmed.read_chunk(x, y_chunk, peer).await,
+            Err(ChunkSourceRefusal::ChunkNotInNamedDag)
+        ),
+        "and Y's chunk under X is still refused on the unarmed door"
+    );
+    assert!(
+        matches!(armed.read_chunk(x, x_chunk, peer).await, Ok(Some(_))),
+        "X, untouched, is still served from its set"
+    );
 }

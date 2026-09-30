@@ -207,6 +207,19 @@ fn take_adopts() -> Vec<(u64, u64, u64)> {
     std::mem::take(&mut *ADOPTS.lock().expect("adopts"))
 }
 
+/// CIRISEdge#766 — the target the responder's per-chunk serve event is
+/// emitted under (A's gate + store read, per chunk that returned bytes).
+const SERVE_TARGET: &str = "ciris_edge::blob_swarm::serve_gate";
+
+/// Every chunk A served since the last [`take_serves`]: `(chunk sha hex,
+/// gate + read µs)`. The responder knows the sha, not the seq; the bench
+/// maps it through A's stream listing.
+static SERVES: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn take_serves() -> Vec<(String, u64)> {
+    std::mem::take(&mut *SERVES.lock().expect("serves"))
+}
+
 /// A tracing layer that records the puller's adopt events, whatever the
 /// log filter says (it has its own per-layer filter).
 struct AdoptCapture;
@@ -222,6 +235,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdoptCapture {
             first: u64,
             chunks: u64,
             us: u64,
+            chunk: String,
         }
         impl tracing::field::Visit for Fields {
             fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
@@ -232,13 +246,22 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdoptCapture {
                     _ => {}
                 }
             }
-            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if f.name() == "chunk" {
+                    self.chunk = format!("{v:?}");
+                }
+            }
         }
-        if event.metadata().target() != ADOPT_TARGET {
+        let target = event.metadata().target();
+        if target != ADOPT_TARGET && target != SERVE_TARGET {
             return;
         }
         let mut f = Fields::default();
         event.record(&mut f);
+        if target == SERVE_TARGET {
+            SERVES.lock().expect("serves").push((f.chunk, f.us));
+            return;
+        }
         ADOPTS
             .lock()
             .expect("adopts")
@@ -263,6 +286,31 @@ fn adopt_curve(adopts: &[(u64, u64, u64)]) -> Vec<(u64, f64, u64)> {
         .collect()
 }
 
+/// CIRISEdge#766 — mean A-side `serve_gate_read` per chunk (ms) by
+/// stream-position bucket; `seq_of` maps a chunk sha (hex) to its seq.
+/// Returns the curve and how many served chunks the map did not place.
+fn serve_curve(
+    serves: &[(String, u64)],
+    seq_of: &std::collections::HashMap<String, u64>,
+) -> (Vec<(u64, f64, u64)>, u64) {
+    let mut by: std::collections::BTreeMap<u64, (u64, u64)> = std::collections::BTreeMap::new();
+    let mut unplaced = 0u64;
+    for (chunk, us) in serves {
+        let Some(seq) = seq_of.get(chunk) else {
+            unplaced += 1;
+            continue;
+        };
+        let slot = by.entry(seq / BUCKET).or_insert((0, 0));
+        slot.0 += us;
+        slot.1 += 1;
+    }
+    let curve = by
+        .into_iter()
+        .map(|(b, (us, n))| (b * BUCKET, us as f64 / n.max(1) as f64 / 1e3, n))
+        .collect();
+    (curve, unplaced)
+}
+
 fn init_tracing() {
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
@@ -274,7 +322,9 @@ fn init_tracing() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ciris_edge=warn")),
         );
     let capture = AdoptCapture.with_filter(
-        tracing_subscriber::filter::Targets::new().with_target(ADOPT_TARGET, tracing::Level::DEBUG),
+        tracing_subscriber::filter::Targets::new()
+            .with_target(ADOPT_TARGET, tracing::Level::DEBUG)
+            .with_target(SERVE_TARGET, tracing::Level::DEBUG),
     );
     let _ = tracing_subscriber::registry()
         .with(fmt)
@@ -1019,6 +1069,9 @@ struct PullReport {
     adopt_batch_peak: u64,
     /// Sum of every batch's adopt wall time.
     adopt_total: Duration,
+    /// CIRISEdge#766 — `(bucket start seq, mean A serve_gate_read ms per
+    /// chunk, chunks served)`.
+    serve_curve: Vec<(u64, f64, u64)>,
     /// Retryable fetch failures the pull resumed from.
     retries: u32,
     elapsed: Duration,
@@ -1097,6 +1150,7 @@ async fn pull_once(
         eprintln!("[{tag}] attribution seam armed on B: {seam}");
     }
     let _ = take_adopts();
+    let _ = take_serves();
     let baseline = mem_mark();
     let started = Instant::now();
     // A lane that times out stops the pull with a retryable fetch failure;
@@ -1119,6 +1173,7 @@ async fn pull_once(
     let elapsed = started.elapsed();
     let mem_peak = mem_peak_over(baseline);
     let adopts = take_adopts();
+    let serves = take_serves();
     assert_eq!(
         verdict,
         PullOutcome::Stored { announced: false },
@@ -1141,10 +1196,36 @@ async fn pull_once(
         ledger(&b.edge.metrics(), "adopted"),
         "every adopted chunk is in the adopt clock (the capture layer saw every batch)"
     );
+    // A's positions, read once, to place each served chunk.
+    let seq_of: std::collections::HashMap<String, u64> = a
+        .node
+        .dir
+        .stream_chunks(&p.stream_id)
+        .await
+        .expect("A's stream listing")
+        .chunks
+        .iter()
+        .map(|c| (hex::encode(c.chunk_sha), c.seq))
+        .collect();
+    // The DAG's root (its manifest, served as `(sha, sha)`) has no position.
+    let root = hex::encode(p.sha);
+    let chunk_serves: Vec<(String, u64)> =
+        serves.iter().filter(|(c, _)| *c != root).cloned().collect();
+    let (serve_curve, unplaced) = serve_curve(&chunk_serves, &seq_of);
+    assert_eq!(
+        unplaced, 0,
+        "every served chunk is one of the file's positions on A"
+    );
+    assert!(
+        chunk_serves.len() as u64 >= ledger(&b.edge.metrics(), "adopted"),
+        "the serve clock saw every chunk B adopted ({} served events)",
+        chunk_serves.len()
+    );
     let report = PullReport {
         k,
         batch,
         adopt_curve: adopt_curve(&adopts),
+        serve_curve,
         adopt_batches: adopts.len() as u64,
         adopt_batch_peak: ledger(&b.edge.metrics(), "adopt_batch_peak"),
         adopt_total: Duration::from_micros(adopts.iter().map(|a| a.2).sum()),
@@ -1565,12 +1646,16 @@ async fn resume_once(
         "each chunk adopted exactly once across the kill: {skipped_resume} held + \
          {adopted_resume} adopted on resume"
     );
-    // What the first attempt left held is what it counted, plus at most the
-    // lanes the kill cut between persist's commit and the lane's return.
+    // What the first attempt left held is what it counted, plus at most what
+    // the kill cut between persist's commit and the count: K single adopts
+    // at batch 1, or the one batch in flight above it (CIRISEdge#765 adopts
+    // one batch at a time, so a kill mid-batch can leave a whole batch
+    // committed and uncounted).
+    let cut = k.max(DEFAULT_BATCH) as u64;
     assert!(
-        skipped_resume >= adopted_first && skipped_resume <= adopted_first + k as u64,
-        "the resume skipped what the first attempt adopted ({adopted_first}, + at most K = {k} \
-         cut mid-adopt): skipped {skipped_resume}"
+        skipped_resume >= adopted_first && skipped_resume <= adopted_first + cut,
+        "the resume skipped what the first attempt adopted ({adopted_first}, + at most \
+         max(K = {k}, batch = {DEFAULT_BATCH}) cut mid-adopt): skipped {skipped_resume}"
     );
     let (got, _) = read_back(&b.node, p).await;
     assert_eq!(got, p.plain_sha, "byte-identical after the resume");
@@ -1689,6 +1774,30 @@ fn lanes_by_batch_table(total: u64, ceiling_1: f64, reports: &[PullReport]) -> S
         line.push('\n');
         line
     };
+    // CIRISEdge#766 — A's serve clock by the same buckets.
+    t.push_str("\nA serve_gate_read ms per chunk by stream position (CIRISEdge#766)\n| chunks |");
+    for r in reports {
+        t.push_str(&format!(" K={} batch={} |", r.k, r.batch));
+    }
+    t.push_str("\n|---|");
+    for _ in reports {
+        t.push_str("---|");
+    }
+    t.push('\n');
+    let serve_buckets: std::collections::BTreeSet<u64> = reports
+        .iter()
+        .flat_map(|r| r.serve_curve.iter().map(|c| c.0))
+        .collect();
+    for b in serve_buckets {
+        t.push_str(&format!("| {b}–{} |", b + BUCKET - 1));
+        for r in reports {
+            match r.serve_curve.iter().find(|c| c.0 == b) {
+                Some((_, ms, _)) => t.push_str(&format!(" {ms:.2} |")),
+                None => t.push_str(" – |"),
+            }
+        }
+        t.push('\n');
+    }
     t.push_str(&row("adopt batches", &|r| r.adopt_batches.to_string()));
     t.push_str(&row("adopt wall s (sum)", &|r| {
         format!("{:.1}", r.adopt_total.as_secs_f64())
@@ -1838,6 +1947,14 @@ async fn run(
             r.adopt_curve
                 .iter()
                 .map(|(s, ms, _)| format!("{s}:{ms:.2}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+        table.push_str(&format!(
+            "serve clock on A K={k} batch={batch} (CIRISEdge#766): mean serve_gate_read ms/chunk by stream position: {}\n",
+            r.serve_curve
+                .iter()
+                .map(|(s, ms, n)| format!("{s}:{ms:.2}/{n}"))
                 .collect::<Vec<_>>()
                 .join(" "),
         ));
