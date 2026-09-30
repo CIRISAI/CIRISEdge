@@ -3697,6 +3697,42 @@ async fn run_chat_legs(occ: &Occurrence) {
         tokio_sleep(Duration::from_millis(500)).await;
     };
     let opened = seen.iter().any(is_open);
+    // persist's hold rule (`BLOB_REPLICATION.md` §4) admits community bytes
+    // only on a node PARTY TO the room: one of its principals (the humans it
+    // is an active occurrence of, and its own key) an active member. Read
+    // here, after the wait, so a `NotPartyTo` store refusal can be told apart
+    // from a roster that never reached this node.
+    let party_to = {
+        let principals = dir
+            .active_identities_for_occurrence(&cfg.node_id)
+            .await
+            .map_err(|e| e.to_string());
+        let mut rooms_by_principal = serde_json::Map::new();
+        if let Ok(ps) = &principals {
+            for key in ps.iter().chain(std::iter::once(&cfg.node_id)) {
+                let rooms = dir
+                    .list_communities_for_member_active(key)
+                    .await
+                    .map(|cs| {
+                        cs.into_iter()
+                            .map(|c| c.community_key_id)
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(|e| e.to_string());
+                rooms_by_principal.insert(key.clone(), serde_json::json!(rooms));
+            }
+        }
+        let members = dir
+            .active_community_members(&room)
+            .await
+            .map(|m| m.into_iter().map(|m| m.key_id).collect::<Vec<_>>())
+            .map_err(|e| e.to_string());
+        serde_json::json!({
+            "principals_of_this_node": principals,
+            "active_rooms_by_principal": rooms_by_principal,
+            "room_active_members": members,
+        })
+    };
     // The RAW rows: the peer's `self` copy must not be here (CC 5.2), and no
     // chat row may carry the plaintext.
     let raw = dir
@@ -3757,6 +3793,7 @@ async fn run_chat_legs(occ: &Occurrence) {
             "open_checks": open_checks,
             "room_addresses": room_addresses,
             "blob_plane": blob_plane_json(&occ.edge),
+            "party_to": party_to,
             "leaked_self_rows": leaked_self_rows,
             "plaintext_on_wire": plaintext_on_wire,
             "peer_node": peer_node,
