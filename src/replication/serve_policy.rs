@@ -57,13 +57,29 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         ),
         // E3: the trace plane is the sole capability-gated serve path — and the
         // ONE plane whose projection is genuinely decided per row.
+        // CIRISEdge#756 (`FSD/FIRST_CONTACT.md` §2.4) — the cell states what
+        // first contact carries: this node's allegiance facts (#671) and the
+        // membership ceremony addressed to the peer's own person (a proposal
+        // naming `owner_of(peer)`; the invitee's reply to a proposal held here
+        // that the peer's person issued), with no Rooted floor on those two.
         EnvelopeKind::Attestation => (
             "per_record_projection",
-            "trace:* → capability:infra:serve; else public",
+            "trace:* → capability:infra:serve; first contact → own allegiance facts \
+             + membership:proposal:v1 naming owner_of(peer) + the invitee's \
+             membership:acceptance|decline:v1 to a held proposal by owner_of(peer); \
+             else public",
         ),
-        EnvelopeKind::Family | EnvelopeKind::Community | EnvelopeKind::LocationProof => {
-            ("cohort", "public")
-        }
+        // CIRISEdge#758 (CC 5.4.6, `FSD/FIRST_CONTACT.md` §2.5) — a group
+        // RECORD is not public: it reaches the group's live members and the
+        // invitees of a live proposal held here (the record travels with the
+        // invitation), on the advertise and the fetch twin, at every reach.
+        EnvelopeKind::Family | EnvelopeKind::Community => (
+            "cohort",
+            "group record → owner_of(peer) is a live member, or a subject_key_ids \
+             invitee of a live membership:proposal:v1 into the group held here; \
+             else withheld (group_record_not_member_or_invitee)",
+        ),
+        EnvelopeKind::LocationProof => ("cohort", "public"),
         // The four `global` planes: the two tombstone planes above join the two
         // membership-revocation planes here — all four fan out over the
         // hardcoded widest own∪cohort set (`Projection::Global`).
@@ -249,8 +265,24 @@ pub fn serve_advertise_policy_sha256() -> String {
 // peer only when announced (owner-binding at `cohort_scope: federation`), else
 // only its owner's own nodes — on the advertise, the direct fetch and the
 // subject Pull alike. `Key` is untouched. **CIRISServer must mirror this pin.**
+//
+// CIRISEdge#756 — RE-PINNED, e4c4d625… → 9af0dc28…. The Attestation `serve`
+// cell now states what first contact carries: this node's allegiance facts
+// (#671) and the membership ceremony addressed to the peer's own person — a
+// `membership:proposal:v1` naming `owner_of(peer)`, and the invitee's
+// acceptance/decline of a proposal held here that `owner_of(peer)` issued
+// (`FSD/FIRST_CONTACT.md` §2.4, I22; CIRISPersist#955, CC rc6 3.1.3.2). Folded
+// into the v38.0.0 re-pin. **CIRISServer must mirror this pin.**
+//
+// CIRISEdge#758 — RE-PINNED, 9af0dc28… → b949d7b2…. The Family and Community
+// `serve` cells move from `public` to the group-record gate (CC 5.4.6): a
+// record reaches `owner_of(peer)` only as a live member or as the invitee of a
+// live proposal into the group held here; anyone else is booked
+// `group_record_not_member_or_invitee` (`FSD/FIRST_CONTACT.md` §2.5, I23).
+// `LocationProof` keeps `public`. Folded into the v38.0.0 re-pin.
+// **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "e4c4d6253afe686a01eec073da343b74b11af6da6cd26c16a6ef0aacc9804569";
+    "b949d7b2825fbcb99dda6a9713f4e8dca814ca4969f0812418ad92b82e629ccc";
 
 #[cfg(test)]
 mod tests {
