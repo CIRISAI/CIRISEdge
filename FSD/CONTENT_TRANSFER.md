@@ -920,6 +920,37 @@ above, each asserted from the receiving side:
 | **non-member** | refused at the store gate (`Refused("axis …")`) before the first fetch; holds nothing, claims nothing. The serve side is the scope gate — a non-member derives no room address and holds no discriminator (`tests/scoped_body_identity_link_718.rs`); persist's `serve_blob_to_peer` ignores the requester | D: no fetch, no blob, no claim |
 | **rotated epoch** | erin's removal rotates the DEK (AV-70, one write through `community_roster`); D is widened in and A seals at `e1 > e0`. D opens e1 content and its pull of the e0 file parks **`DagAwaitingKey`** — the manifest adopted at e0, `inline`, `FileRow::open` → `NotGranted`, no `dag_*` refusal — while C, granted at e0, still reads it (once shared, always shared). Edge cannot tell "never granted" from "not yet granted" (persist I61/I62 order independence), so this is a named wait, not a refusal; the retry ceiling ends it | D: `DagAwaitingKey`, `NotGranted`; C: byte-identical after the rotation |
 
+**The family row** (CIRISEdge#736, lane 3 of #734; witnesses in `tests/family_files_wire_736.rs`:
+`family_files_cross_to_the_other_persons_device_and_never_to_a_non_member_736` and
+`family_files_cross_through_a_non_member_forwarder_that_learns_nothing_736`). The setup: two persons
+P and Q, each with one device (P1, Q1), on their own SQLite substrates over real Reticulum. The family
+is formed under persist v52's consent rule: P founds it alone, P1 proposes Q, Q1 accepts for Q, and
+P1's bridge widens on arrival. A third member R consents but has no device. P1 publishes 200 KiB
+(inline) and 1,300,000 bytes (DAG) at `invisible_encrypted`. Q1's real puller (bridge apply → sink →
+the family `author_nodes` rung → the scope router → Reticulum) reads both byte-identical. What differs
+from the self tier, each asserted from the side that must show it:
+
+| axis | family (`invisible_encrypted`, the family roster) | witnessed |
+|---|---|---|
+| **send set** | the file row goes to exactly `family_room::roster(..).nodes`, the nodes of every active member (§6.4.1). A member with no node yet (`unresolved`) is NAMED on the write, `PublishedFile::unresolved`, with a WARN, and is never skipped silently | P1's bridge offers each row to Q1 and not to N; `unresolved == [R]` on both publishes |
+| **key** | wrapped to every active member's occurrences at write (persist; the content set names `family_key_id`, CIRISPersist#953) | `granted` ∋ Q1, ∌ N |
+| **the founding crosses** | the opener's own family is advertised by publish-own (`list_families`, the twin of #955's community arm). Under v52 the founding lists the opener alone, so without this arm the invitee's node never holds the family and refuses the proposal. **Open (v38 blocker):** the record planes are public, so this arm hands the record to every peer, before any proposal; restricting it to members and live proposal invitees is its own fix, and no witness here asserts anything about a non-member's family record | Q1 admits the record after P1 proposes Q |
+| **serve scope** | a family file on its author's node is TWO rows: the person's `self` row and the `supersedes` placing it in the family. Persist's binding index returns only the first, so the chunk source reads the widenings too (`BlobMeaning::referencing_rows` / `serve_scope`, also used by `chunk_in_named_dag`); before, P1 scoped every family file `self` and withheld Q1 with `blob_serve_arrival_scope_insufficient` | Q1's fetches admitted on the family address |
+| **holder** | the author's nodes, never the claim index (CC 5.2) | `blob_pull_sources`: `family:author_nodes` ≥ 2, `family:claim_index` = 0 |
+| **adopt** | a member's node is party to family content by the ROSTER (persist `hold::is_audience`'s family arm, CIRISPersist#960; before it, the other member's node refused `NotPartyTo`) | Q1 holds the DAG `chunk_dag`, both files open byte-identical |
+| **delivered, never discovered** | no `holds_bytes` row for either sha at any audience, on any node | `list_holders`, `list_local_holders` and the federation stream on P1, Q1, N, F |
+| **non-member N** | offered neither row, served neither by hash (`recipient_not_in_send_set`); N derives no family address; N's direct ask over the federation address is `PolicyDenied`, booked `blob_serve_arrival_scope_insufficient` ×2 on P1; N holds no row, no byte, no chunk | the direct witness |
+| **forwarder F** | with P1 and Q1 dialling only F, both bodies cross on the identity-plane link with the family discriminated inside (#718): `send:identity_link` ≥ 2, `send:derived_address` = 0, `serve:identity_link_admitted` ≥ 2. F's path table holds no family-derived address, F has no scope table, no row naming the family, no P1 key and no byte | the forwarder witness |
+| **receipt** | Q1's device receipts the file back to P1 inside the family; a non-member's receipt is `receipt_signer_not_member` (§6.10) | `delivery_receipts_738::a_family_file_is_receipted_by_the_other_persons_device_and_no_one_else` |
+
+Two paths the witness hands over by hand, and why. **Consent rows before the widening**: the proposal
+and Q's acceptance reach the other node's apply door directly. Until Q is a member, Q1 is a
+first-contact stranger to P1, and first-contact reach carries no family-scoped row. The #955 invitee arm
+widens the audience, not the send set, so hosts whose persons have consented to each other carry these
+rows on the replication round. **Another person's rows**: P1 serves a row it holds about someone else
+(R's acceptance) only to a peer it shares a trust root with (#659), and this harness roots no one. The
+file rows are P's own, so they cross the real serve.
+
 #### 6.7.2 Rename — a new row over the same bytes (CIRISEdge#702, the server's ask)
 
 A rename changes what a file is *called*, never what it *is*. So it writes **no byte**: the new row

@@ -7975,7 +7975,19 @@ impl FederationDirectoryReplicationBridge {
     async fn list_families(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         // CIRISEdge#523 — plane 1 of 3. A Family's members are PERSONS; the
         // cohort is NODE-keyed. See [`Self::cohort_set_with_owners`].
-        let cohort = self.cohort_set_with_owners().await;
+        let mut cohort = self.cohort_set_with_owners().await;
+        // CIRISEdge#736 — the family twin of the #955 publish-own arm in
+        // `list_communities`. Under persist v52 a family is founded by its
+        // opener ALONE and every other member joins by accepting a proposal,
+        // so a new family's record names only this node's own person. Without
+        // this the record crosses to no one: the invitee's node cannot admit
+        // the proposal (`active_family_members` names an unknown family), and
+        // the widening that follows the acceptance cannot land anywhere. The
+        // exposure is where it was before v52, when the same record listed the
+        // invitee and crossed on the cohort arm.
+        if let Some(own) = self.self_provider.as_ref() {
+            cohort.extend(own());
+        }
         self.sweep_paged(
             EnvelopeKind::Family,
             window,
@@ -18620,6 +18632,39 @@ pub(crate) mod tests {
                 .await
                 .is_empty(),
             "…and the same negative control holds"
+        );
+    }
+
+    /// CIRISEdge#736 — a family founded by this node's own person ALONE (the
+    /// persist v52 founding: every other member joins by consent) is
+    /// advertised by publish-own, so the invitee's node can follow it; with no
+    /// cohort member on the roster and no own identity, it is not.
+    #[tokio::test]
+    async fn a_family_founded_by_this_nodes_own_person_alone_is_advertised() {
+        let backend = owner_axis_backend(true).await;
+        backend
+            .put_family(sign_family_fixture(
+                "person-alice",
+                fixture_family("household", "person-alice"),
+            ))
+            .await
+            .expect("seed family");
+        let own = vec!["node-alice".to_string(), "person-alice".to_string()];
+        assert_eq!(
+            bridge_over(&backend, &[])
+                .with_self_provider(Some(Arc::new(move || own.clone())))
+                .list_envelope_refs(EnvelopeKind::Family)
+                .await
+                .len(),
+            1,
+            "the opener's own family crosses on the publish-own arm"
+        );
+        assert!(
+            bridge_over(&backend, &["node-stranger"])
+                .list_envelope_refs(EnvelopeKind::Family)
+                .await
+                .is_empty(),
+            "a node whose own person is not on the roster advertises nothing"
         );
     }
 

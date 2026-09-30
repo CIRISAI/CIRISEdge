@@ -1044,17 +1044,12 @@ async fn an_inline_self_file_is_receipted_once_by_the_owners_other_device() {
 /// **Family (two persons): a receipt from the other person's device; none
 /// admitted from a non-family node.**
 ///
-/// Blocked at persist rev 9d406712: a family file cannot be PUBLISHED. The
-/// content `key_grant` set for a `family` seal is emitted at `cohort_scope:
-/// family` with no `family_key_id` cohort target (`federation/key_grant.rs`,
-/// `KeyGrantSet::envelope_extra` — the `Content` arm writes `owner_key_id`
-/// only), and persist's write gate refuses a family row naming no family
-/// (`federation/admission.rs`, `check_write_cohort_scope`, the `Family` arm:
-/// `NoFamilyMembership`), so `put_blob_chunk_scoped` fails "attestation
-/// emission failed" before any receipt can exist. Un-ignore when persist
-/// carries the family target on the content set (lane 3 of CIRISEdge#734).
+/// Was `#[ignore]`d twice: at persist 9d406712 no family file could be
+/// published (CIRISPersist#953 item 1), and at e398da3c the other member's
+/// node refused the bytes `NotPartyTo` (the hold gate's family arm read only
+/// the operator predicate, CIRISPersist#960). Both fixed in persist v52;
+/// un-ignored by the family lane (CIRISEdge#736).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "persist 9d406712: a family content key_grant carries no family_key_id, so every family seal is refused (see doc)"]
 async fn a_family_file_is_receipted_by_the_other_persons_device_and_no_one_else() {
     init_tracing();
     let alice = Ident::new("alice-fed", 0x11);
