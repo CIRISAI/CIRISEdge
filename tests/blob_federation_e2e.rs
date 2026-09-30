@@ -2952,102 +2952,559 @@ fn file_pointer(sha: &[u8; 32], size: u64, stream_id: Option<&str>) -> BlobPoint
     serde_json::from_value(v).expect("pointer")
 }
 
-/// **CIRISEdge#717 — a chunk-DAG pointer is refused by name; its manifest
-/// never lands as the file.**
+/// CIRISEdge#717 — B admits A's `holds_bytes` rows, as anti-entropy would.
+async fn admit_holder_claims(from: &Node, to: &Node) {
+    use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
+    for bytes in rows_of(from, "holds_bytes:").await {
+        let h: ciris_persist::federation::Attestation =
+            serde_json::from_slice(&bytes).expect("row");
+        // Idempotent on a re-admit of an earlier claim.
+        let _ = to
+            .dir
+            .put_attestation(SignedAttestation { attestation: h })
+            .await;
+    }
+}
+
+/// A deterministic, incompressible-looking body of `len` bytes.
+fn body_of(len: usize, seed: u32) -> Vec<u8> {
+    (0..u32::try_from(len).expect("fits"))
+        .map(|i| {
+            let mixed = i.wrapping_add(seed).wrapping_mul(2_654_435_761) >> 13;
+            u8::try_from(mixed & 0xFF).expect("masked")
+        })
+        .collect()
+}
+
+/// **CIRISEdge#717 — a plaintext chunk DAG pulls through the real doors and
+/// reads back whole.**
 ///
-/// The server's shape (CIRISServer#697 selffiles ladder): a file over the
-/// inline bound is a DAG whose address is its MANIFEST's, and the holder
-/// answers a request for that address with the manifest — a few hundred
-/// bytes of `{"chunk_tier":…,"chunks":[…],"total_size":…}` — which the
-/// whole-blob pull stored as the file (`storage_kind = inline`), so the
-/// second device served 610 bytes for a 1,048,577-byte video with a 200.
+/// The server's shape (CIRISServer#697 selffiles ladder), at the commons
+/// tier so the route runs in-process: a file over the inline bound is a DAG
+/// whose address is its MANIFEST's. Before v34.1.0 the whole-blob pull
+/// stored those few hundred bytes as the file; v34.1.0 refused the pointer
+/// by name; now the pull walks the DAG — manifest → verified → chunks →
+/// promoted — through persist's `put_blob_chunks_signing`, and B serves the
+/// 1,048,577-byte file byte-identical with `storage_kind = chunk_dag` and
+/// its own `holds_bytes` on the manifest.
 ///
-/// Here A holds, at the pointer's address, exactly what a holder serves
-/// for a 1 MiB + 1 file sealed at `self`: the persist-canonical v2 manifest
-/// over its 256 KiB chunks. B pulls the row's pointer. Before the fix B
-/// stored those bytes as the file; now the pull is refused BY NAME before
-/// any request, B holds no row at that address, and the refusal is counted.
-///
-/// The self route itself does not run in-process (the router needs a
-/// scope table and a Reticulum send — see the self pin above), so the pull
-/// rides commons scope with the served bytes and pointer shape unchanged.
+/// A writes it exactly as `files::publish` chunks a commons file: 256 KiB
+/// segments into a stream, sealed into a v1 manifest at the plaintext tier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_chunk_dag_pointer_is_refused_by_name_and_its_manifest_never_lands_as_the_file() {
+async fn a_plaintext_chunk_dag_pulls_through_the_real_doors_and_reads_back_whole() {
     use ciris_edge::blob_swarm::PullOutcome;
-    use ciris_persist::federation::blobs::{BlobBody, BlobStorage as _};
-    use ciris_persist::federation::types::cohort_scope::CryptoTier;
-    use ciris_persist::federation::{ChunkManifest, ChunkRef};
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::types::cohort_scope::{CryptoTier, FEDERATION};
     init_tracing();
     let t = commons_pull().await;
 
-    // A 1 MiB + 1 file, chunked as `seal_chunked` chunks it; the manifest
-    // is persist's own canonical encoding of it — the bytes a holder serves.
-    let file_len: u64 = 1_048_577;
-    let chunk = ciris_edge::group_content::store::CHUNK_BYTES as u64;
-    let mut chunks = Vec::new();
-    let mut off = 0u64;
-    let mut seq = 0u64;
-    while off < file_len {
-        let size = chunk.min(file_len - off);
-        chunks.push(ChunkRef {
-            sha: <sha2::Sha256 as sha2::Digest>::digest(seq.to_be_bytes()).into(),
-            size: u32::try_from(size).expect("fits"),
-            seq: Some(seq),
-        });
-        off += size;
-        seq += 1;
+    let file_len = 1_048_577usize;
+    let plain = body_of(file_len, 717);
+    let stream_id = "file-717-plain";
+    let engine_a = t.node_a.store.engine();
+    for (seq, chunk) in plain
+        .chunks(ciris_edge::group_content::store::CHUNK_BYTES)
+        .enumerate()
+    {
+        engine_a
+            .put_blob_chunk_scoped(FEDERATION, None, stream_id, seq as u64, chunk, 0, None)
+            .await
+            .unwrap_or_else(|e| panic!("A appends chunk {seq}: {e}"));
     }
-    let manifest = ChunkManifest {
-        v: 2,
-        total_size: file_len,
-        chunks,
-        chunk_tier: Some(CryptoTier::InvisibleEncrypted),
-        stream_id: Some("file-717".into()),
-    };
-    manifest.validate_total_size().expect("a coherent manifest");
-    let served = manifest.to_jcs_bytes();
-    assert!(
-        served.starts_with(b"{\"chunk_tier\":\"i"),
-        "fixture: the server's first 16 bytes"
-    );
-
-    let sha = t.a_holds(&served).await;
+    let sealed = engine_a
+        .seal_stream_scoped(FEDERATION, None, stream_id, Some("video/mp4"), None)
+        .await
+        .expect("A seals the commons stream");
+    assert_eq!(sealed.tier, CryptoTier::Plaintext, "commons is in clear");
+    assert_eq!(sealed.total_size, file_len as u64);
+    assert_eq!(sealed.chunk_count, 5, "4 × 256 KiB + 1 byte");
+    let sha = sealed.manifest_sha256;
+    admit_holder_claims(&t.node_a, &t.node_b).await;
     let row = commons_row(
         &t.node_a.signer,
         &sha,
-        Some(&file_pointer(&sha, file_len, Some("file-717"))),
+        Some(&file_pointer(&sha, file_len as u64, Some(stream_id))),
         ts(),
     )
     .await;
 
     let verdict = t.puller.pull_one(&row, sha, 0).await;
-    if let Some(held) = t.node_b.dir.get_blob(&sha).await.expect("get_blob") {
-        let len = match &held {
-            BlobBody::Inline(b) => b.len(),
-            other => panic!("B holds a non-inline body: {other:?}"),
-        };
-        panic!(
-            "CIRISEdge#717: B stored {len} bytes of chunk-DAG manifest as a {file_len}-byte \
-             file (storage_kind = inline) — the whole-blob pull must refuse a stream pointer \
-             by name. Verdict: {verdict:?}"
-        );
-    }
     assert_eq!(
         verdict,
-        PullOutcome::StreamPointerNeedsDagPull {
-            stream_id: "file-717".into(),
-            declared: Some(file_len),
-        }
-    );
-    assert_eq!(
-        t.refusals().get("stream_pointer_needs_dag_pull").copied(),
-        Some(1),
-        "the refusal is counted: {:?}",
+        PullOutcome::Stored { announced: true },
+        "the DAG pull stores and announces a commons DAG: refusals {:?}",
         t.refusals()
     );
+    let head = t
+        .node_b
+        .dir
+        .blob_head(&sha)
+        .await
+        .expect("blob_head")
+        .expect("B holds the manifest row");
+    assert_eq!(
+        head.storage_kind, "chunk_dag",
+        "the manifest row IS the DAG on B, not a file of manifest JSON"
+    );
+    let got = t
+        .node_b
+        .store
+        .engine()
+        .read_blob_as(&sha, &t.node_b.me, None)
+        .await
+        .expect("B reads the file it pulled");
+    assert_eq!(got.len(), file_len, "full size");
+    assert!(got == plain, "byte-identical");
     assert!(
-        !t.node_b.dir.has_blob(&sha).await.expect("has_blob"),
-        "nothing stored"
+        t.node_b
+            .dir
+            .list_holders(&sha)
+            .await
+            .expect("list_holders")
+            .contains(&t.node_b.me),
+        "B announced its own holds_bytes on the manifest (persist#947 ask 3): a pulled \
+         commons DAG is not a silent holder"
+    );
+    assert!(
+        t.refusals().is_empty(),
+        "nothing refused: {:?}",
+        t.refusals()
+    );
+    assert_eq!(
+        t.puller.pull_one(&row, sha, 0).await,
+        PullOutcome::AlreadyHeld,
+        "a promoted DAG is held; a second offer fetches nothing"
+    );
+}
+
+/// **CIRISEdge#717 — a DAG manifest over the caps, or off its pointer, is
+/// refused by name before a chunk moves.** Nothing is stored, each refusal
+/// is counted under its own tag, and no chunk is ever requested (the
+/// chunks named here do not exist anywhere).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dag_manifest_over_the_caps_or_off_its_pointer_is_refused_before_a_chunk_moves() {
+    use ciris_edge::blob_swarm::{DagPullRefusal, PullOutcome};
+    use ciris_persist::federation::blobs::{BlobStorage as _, DEFAULT_INLINE_BYTES_CAP};
+    use ciris_persist::federation::{ChunkManifest, ChunkRef};
+    init_tracing();
+    let t = commons_pull().await;
+    let cap = DEFAULT_INLINE_BYTES_CAP as u64;
+
+    // A single chunk one byte over persist's inline cap: the adopt would
+    // refuse it on arrival; the plan refuses it before the request.
+    let over = ChunkManifest {
+        v: 1,
+        total_size: cap + 1,
+        chunks: vec![ChunkRef {
+            sha: [0x71; 32],
+            size: u32::try_from(cap + 1).expect("fits"),
+            seq: None,
+        }],
+        chunk_tier: None,
+        stream_id: None,
+    };
+    let sha = t.a_holds(&over.to_jcs_bytes()).await;
+    let row = commons_row(
+        &t.node_a.signer,
+        &sha,
+        Some(&file_pointer(&sha, cap + 1, Some("file-717-over"))),
+        ts(),
+    )
+    .await;
+    assert_eq!(
+        t.puller.pull_one(&row, sha, 0).await,
+        PullOutcome::DagRefused(DagPullRefusal::OverCap {
+            what: "chunk_size",
+            value: cap + 1,
+            cap,
+        })
+    );
+    assert!(!t.node_b.dir.has_blob(&sha).await.expect("has_blob"));
+
+    // A coherent manifest whose total is not what the pointer declares.
+    let honest = ChunkManifest {
+        v: 1,
+        total_size: 300,
+        chunks: vec![
+            ChunkRef {
+                sha: [0x72; 32],
+                size: 200,
+                seq: None,
+            },
+            ChunkRef {
+                sha: [0x73; 32],
+                size: 100,
+                seq: None,
+            },
+        ],
+        chunk_tier: None,
+        stream_id: None,
+    };
+    let sha = t.a_holds(&honest.to_jcs_bytes()).await;
+    let row = commons_row(
+        &t.node_a.signer,
+        &sha,
+        Some(&file_pointer(&sha, 301, Some("file-717-size"))),
+        ts(),
+    )
+    .await;
+    assert_eq!(
+        t.puller.pull_one(&row, sha, 0).await,
+        PullOutcome::DagRefused(DagPullRefusal::TotalSizeMismatch {
+            declared: 301,
+            manifest: 300,
+        })
+    );
+    assert!(!t.node_b.dir.has_blob(&sha).await.expect("has_blob"));
+
+    // Bytes at the address that are not a manifest at all.
+    let sha = t.a_holds(b"not a manifest, a file").await;
+    let row = commons_row(
+        &t.node_a.signer,
+        &sha,
+        Some(&file_pointer(&sha, 22, Some("file-717-junk"))),
+        ts(),
+    )
+    .await;
+    assert!(matches!(
+        t.puller.pull_one(&row, sha, 0).await,
+        PullOutcome::DagRefused(DagPullRefusal::ManifestMismatch { .. })
+    ));
+    assert!(!t.node_b.dir.has_blob(&sha).await.expect("has_blob"));
+
+    let refusals = t.refusals();
+    assert_eq!(
+        refusals.get("dag_over_cap").copied(),
+        Some(1),
+        "{refusals:?}"
+    );
+    assert_eq!(
+        refusals.get("dag_total_size_mismatch").copied(),
+        Some(1),
+        "{refusals:?}"
+    );
+    assert_eq!(
+        refusals.get("dag_manifest_mismatch").copied(),
+        Some(1),
+        "{refusals:?}"
+    );
+}
+
+/// CIRISEdge#717 — a [`DagByteFetch`](ciris_edge::blob_swarm::DagByteFetch)
+/// that reads the holder's store directly through persist's peer-serve door
+/// — the bytes a `PersistBlobChunkSource` would put on the wire — with one
+/// address optionally tampered, so the puller's own verification is what a
+/// test exercises, not the transport's.
+struct StoreFetch {
+    engine: ciris_persist::Engine,
+    peer: String,
+    holders: Vec<String>,
+    tamper: Option<[u8; 32]>,
+}
+
+#[async_trait::async_trait]
+impl ciris_edge::blob_swarm::DagByteFetch for StoreFetch {
+    fn holders(&self) -> &[String] {
+        &self.holders
+    }
+
+    async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String> {
+        use ciris_persist::federation::blobs::BlobBody;
+        let body = self
+            .engine
+            .serve_blob_to_peer(&sha, &self.peer)
+            .await
+            .map_err(|e| e.to_string())?;
+        let BlobBody::Inline(mut bytes) = body else {
+            return Err("not inline".into());
+        };
+        if self.tamper == Some(sha) {
+            if let Some(last) = bytes.last_mut() {
+                *last ^= 0x01;
+            }
+        }
+        Ok(bytes)
+    }
+}
+
+/// **CIRISEdge#717 — a sealed self chunk DAG, pulled by the owner's other
+/// device through the real doors, reads back whole.**
+///
+/// A is alice's laptop, B her phone (`device_of`): one owner, two node keys,
+/// each holding the other's occurrence and owner binding. A publishes a
+/// 1,300,000-byte file into alice's self room through the file door — five
+/// 256 KiB chunks sealed at `InvisibleEncrypted`, a v2 manifest, every wrap
+/// addressed to both devices. The self route does not run over the in-process
+/// wire (no scope table on a legacy node), so the walk is driven through
+/// `pull_dag_with` with a fetcher that reads A's store through the peer-serve
+/// door — the same bytes the wire carries, and the same persist doors on B:
+/// `adopt_sealed_blob`, `open_sealed_manifest_as`, `adopt_sealed_chunk`,
+/// `promote_adopted_manifest_to_dag`, then `FileRow::open`.
+///
+/// In order, on ONE B: a tampered manifest leaves nothing; an honest pull
+/// before the key arrived parks as `DagAwaitingKey` with the manifest held;
+/// after the `key_grant` sets cross, a tampered chunk is refused at its
+/// position with the manifest still held and the earlier chunk kept; the
+/// honest pull RESUMES from that state, promotes, and B reads the file at
+/// full size with `storage_kind = chunk_dag`; a second offer is `AlreadyHeld`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // the whole ladder on one device, in order, on purpose
+async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_whole() {
+    use ciris_edge::blob_swarm::{BlobPuller, DagPullRefusal, PullConfig, PullOutcome};
+    use ciris_edge::files::FileRow;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::key_grant::{
+        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
+    };
+    use ciris_persist::federation::types::cohort_scope::CryptoTier;
+    use ciris_persist::federation::FederationDirectory;
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let alice_phone = Ident::new("alice-phone", 0x33);
+    let node_a = node(&[&alice], &alice).await;
+    let node_b = device_of(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+    let (wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (_edge_a, _stop_a) = spawn_edge(&node_a, wire_a).await;
+    let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
+
+    // A: the file door, over the inline bound.
+    let file_len = 1_300_000usize;
+    let plain = body_of(file_len, 0x5e1f);
+    let room = ciris_edge::self_room::room(&alice.key_id);
+    let published = ciris_edge::files::publish(
+        &*node_a.dir,
+        &node_a.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &ciris_edge::files::FileWrite {
+            room: &room,
+            bytes: &plain,
+            media_type: "video/mp4",
+            codec: None,
+            filename: Some("holiday.mp4"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("publish a chunked file into alice's self room");
+    assert_eq!(published.tier, CryptoTier::InvisibleEncrypted);
+    let stream_id = published
+        .pointer
+        .stream_id
+        .clone()
+        .expect("over the bound: a chunk DAG");
+    assert_eq!(published.pointer.size, Some(file_len as u64));
+    let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let crossed_id = match &published.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!("the self file must cross: {other:?}")
+        }
+    };
+    let row = node_a
+        .dir
+        .get_attestation(&crossed_id)
+        .await
+        .expect("read")
+        .expect("the crossed row");
+    node_b
+        .dir
+        .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("B admits the crossed row");
+    // The chunk list, from A's own view of it: chunk 1's address, to tamper.
+    let aad = ciris_edge::group_content::content_aad(
+        &row.attesting_key_id,
+        row.asserted_at,
+        published.pointer.content_field,
+    );
+    let view_a = node_a
+        .store
+        .engine()
+        .open_sealed_manifest_as(&sha, &node_a.me, Some(&aad))
+        .await
+        .expect("A opens its own manifest");
+    assert_eq!(
+        view_a.storage_kind, "chunk_dag",
+        "the origin's row is a DAG"
+    );
+    assert_eq!(view_a.total_size, file_len as u64);
+    assert_eq!(view_a.chunks.len(), 5, "4 × 256 KiB + 251,424 bytes");
+    let chunk1: [u8; 32] = hex::decode(&view_a.chunks[1].sha256_hex)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+
+    let puller = BlobPuller::new(
+        Arc::clone(&edge_b),
+        node_b.store.engine().clone(),
+        node_b.dir.clone(),
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        node_b.me.clone(),
+        PullConfig::default(),
+    );
+    let fetch = |tamper: Option<[u8; 32]>| StoreFetch {
+        engine: node_a.store.engine().clone(),
+        peer: node_b.me.clone(),
+        holders: vec![node_a.me.clone()],
+        tamper,
+    };
+    let refusals = || edge_b.metrics().snapshot().blob_pull_refusals;
+
+    // 1. A tampered manifest: refused at the manifest rung, nothing stored.
+    assert!(matches!(
+        puller.pull_dag_with(&row, sha, &fetch(Some(sha))).await,
+        PullOutcome::DagRefused(DagPullRefusal::ManifestMismatch { .. })
+    ));
+    assert!(
+        !node_b.dir.has_blob(&sha).await.expect("has_blob"),
+        "a manifest that does not verify is never adopted"
+    );
+    assert_eq!(refusals().get("dag_manifest_mismatch").copied(), Some(1));
+
+    // 2. Honest bytes, but the key has not crossed yet: the manifest is
+    //    adopted and held; the pull parks by name.
+    assert!(matches!(
+        puller.pull_dag_with(&row, sha, &fetch(None)).await,
+        PullOutcome::DagAwaitingKey { retrying: true, .. }
+    ));
+    let head = node_b
+        .dir
+        .blob_head(&sha)
+        .await
+        .expect("blob_head")
+        .expect("the manifest is held");
+    assert_eq!(
+        head.storage_kind, "inline",
+        "held as received, not yet a DAG"
+    );
+
+    // The key crosses: A's content sets (a wrap per chunk and one for the
+    // manifest), through B's key-grant door.
+    node_a
+        .store
+        .engine()
+        .emit_pending_key_grants()
+        .await
+        .expect("A emits");
+    let sets: Vec<_> = node_a
+        .dir
+        .list_attestations_since(None, 500)
+        .await
+        .expect("list A's rows")
+        .into_iter()
+        .filter(|a| {
+            a.attestation
+                .attestation_type
+                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+        })
+        .collect();
+    assert!(
+        sets.len() >= 6,
+        "a set per chunk and the manifest: {}",
+        sets.len()
+    );
+    let mut wraps = 0;
+    for s in &sets {
+        wraps += node_b
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantSet {
+                attestation: s.attestation.clone(),
+            })
+            .await
+            .expect("B applies A's set")
+            .wraps_written;
+    }
+    // Projected now: the wraps for the bytes B already HOLDS (the manifest —
+    // the seal's set and the descriptor's). A chunk's wrap is held pending
+    // until its chunk is adopted (persist I61/I62: a set admitted before its
+    // bytes is projected by the adopt), which the walk below exercises chunk
+    // by chunk.
+    assert!(
+        wraps >= 1,
+        "B holds its own private half: {wraps} wraps projected"
+    );
+
+    // 3. A tampered chunk: refused at its position; the manifest stays held
+    //    and chunk 0 (adopted before it) is kept for the resume.
+    assert!(matches!(
+        puller.pull_dag_with(&row, sha, &fetch(Some(chunk1))).await,
+        PullOutcome::DagRefused(DagPullRefusal::ChunkMismatch { seq: 1, .. })
+    ));
+    let positions: Vec<u64> = node_b
+        .dir
+        .stream_chunks(&stream_id)
+        .await
+        .expect("stream_chunks")
+        .chunks
+        .iter()
+        .map(|c| c.seq)
+        .collect();
+    assert_eq!(
+        positions,
+        vec![0],
+        "chunk 0 adopted, chunk 1 refused, nothing after"
+    );
+    assert_eq!(refusals().get("dag_chunk_mismatch").copied(), Some(1));
+
+    // 4. The honest pull RESUMES: manifest held, chunk 0 skipped, 1–4
+    //    adopted, promoted.
+    assert_eq!(
+        puller.pull_dag_with(&row, sha, &fetch(None)).await,
+        PullOutcome::Stored { announced: false },
+        "an invisible-tier DAG is stored and never announced (CC 5.2)"
+    );
+    let head = node_b
+        .dir
+        .blob_head(&sha)
+        .await
+        .expect("blob_head")
+        .expect("held");
+    assert_eq!(head.storage_kind, "chunk_dag", "promoted");
+    let file = FileRow::from_row(&row).expect("a file row");
+    let got = file
+        .open(&node_b.store, &node_b.me)
+        .await
+        .expect("alice's phone opens the file her laptop wrote");
+    assert_eq!(got.len(), file_len, "full size");
+    assert!(got == plain, "byte-identical");
+    assert_eq!(
+        node_b
+            .store
+            .engine()
+            .open_sealed_manifest_as(&sha, &node_b.me, Some(&aad))
+            .await
+            .expect("B opens the view")
+            .total_size,
+        file_len as u64,
+        "the view's total is the plaintext size; the row's size_bytes stays the envelope's"
+    );
+    assert!(
+        rows_of(&node_b, "holds_bytes:").await.is_empty(),
+        "CC 5.2: no holder claim for self bytes, before or after the pull"
+    );
+
+    // 5. Held is held: the production path offers nothing past the head.
+    assert_eq!(
+        puller.pull_one(&row, sha, 0).await,
+        PullOutcome::AlreadyHeld
+    );
+    assert_eq!(
+        puller.pull_dag_with(&row, sha, &fetch(None)).await,
+        PullOutcome::AlreadyHeld
     );
 }
 
@@ -4249,6 +4706,160 @@ async fn a_file_is_authored_by_its_person_and_withdrawn_from_their_other_device(
     );
 }
 
+/// **CIRISEdge#712 — the owner's withdraw of a node-authored file lists as
+/// `Withdrawn`.** persist v51.2.0 (CIRISPersist#945): a `withdraws` the write
+/// door admitted under a resolved rule — here rule 1 lifted to the node's
+/// owner (#941) — hides its target from every `Live` listing, whoever signed
+/// it; edge's history fold mirrors that rule, so the drive's `IncludeWithdrawn`
+/// view names the file `Withdrawn` instead of `Live`. A `supersedes` stays a
+/// same-attester act (CC 2): a rename by anyone else retires nothing.
+///
+/// On the previous pin the owner's withdraw was stored, rule-stamped, and
+/// invisible to both listings' folds: the file stayed `Live` in the drive.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // write, cross, withdraw, both listings — the whole #712 ladder in one place
+async fn an_owners_withdraw_of_a_node_authored_file_lists_as_withdrawn() {
+    use ciris_edge::files::{in_room, in_room_with, publish, withdraw, FileLifecycle, FileWrite};
+    use ciris_edge::replication::attestation_bind::Signers;
+    use ciris_persist::ceg::LifecycleView;
+    use ciris_persist::federation::FederationDirectory as _;
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let alice_phone = Ident::new("alice-phone", 0x33);
+    let node_a = node(&[&alice], &alice).await;
+    let node_b = device_of(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    federate(&node_a, &node_b).await;
+    federate(&node_b, &node_a).await;
+    let alice_signer = edge_signer_for(&alice);
+    let room = ciris_edge::self_room::room(&alice.key_id);
+
+    // The laptop writes two files with no person in hand (the pre-#708 /
+    // agent-only posture): the node authors.
+    let mut crossed = Vec::new();
+    for (i, name) in ["keep.txt", "gone.txt"].iter().enumerate() {
+        let nth = i64::try_from(i).expect("fits");
+        let published = publish(
+            &*node_a.dir,
+            &node_a.store,
+            Signers {
+                node: &node_a.signer,
+                actor: None,
+            },
+            &FileWrite {
+                room: &room,
+                bytes: format!("laptop wrote {name}").as_bytes(),
+                media_type: "text/plain",
+                codec: None,
+                filename: Some(name),
+                asserted_at: ts() + chrono::Duration::seconds(nth),
+            },
+        )
+        .await
+        .expect("a node-authored file");
+        assert_eq!(
+            published.row.attesting_key_id, node_a.me,
+            "the node authors"
+        );
+        let id = match &published.shared {
+            ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+            | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+                attestation_id.clone()
+            }
+            other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+                panic!("crossed: {other:?}")
+            }
+        };
+        let row = node_a
+            .dir
+            .get_attestation(&id)
+            .await
+            .expect("read")
+            .expect("the crossed row");
+        node_b
+            .dir
+            .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .expect("the phone admits the laptop's row");
+        crossed.push(row);
+    }
+    let (kept, gone) = (&crossed[0], &crossed[1]);
+
+    // The OWNER withdraws `gone.txt` from her phone (#941): not the author,
+    // the node's single live owner — persist admits it under rule 1.
+    let owners = withdraw(
+        &*node_b.dir,
+        gone,
+        "deleted from my phone — my laptop wrote it",
+        ts() + chrono::Duration::seconds(10),
+        Signers {
+            node: &node_b.signer,
+            actor: Some(&alice_signer),
+        },
+    )
+    .await
+    .expect("the node's owner withdraws what her node produced");
+    assert_eq!(owners.attesting_key_id, alice.key_id, "signed as the owner");
+    assert_ne!(
+        owners.attesting_key_id, gone.attesting_key_id,
+        "not the author"
+    );
+    let stored = node_b
+        .dir
+        .get_attestation(&owners.attestation_id)
+        .await
+        .expect("read")
+        .expect("stored");
+    assert_eq!(
+        stored.withdraws_admission_rule,
+        Some(1),
+        "admitted, rule-stamped"
+    );
+
+    let ids = |page: &ciris_edge::files::DrivePage| -> Vec<(String, FileLifecycle)> {
+        let mut v: Vec<_> = page
+            .files
+            .iter()
+            .map(|f| (f.attestation_id.clone(), f.lifecycle))
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    };
+    // The Live drive hides it (persist #945: an admitted withdraws hides,
+    // whoever signed it).
+    let live = in_room(node_b.store.engine(), &room, &node_b.me, 10, None)
+        .await
+        .expect("live listing");
+    assert_eq!(
+        ids(&live),
+        vec![(kept.attestation_id.clone(), FileLifecycle::Live)],
+        "the Live drive hides a file its node's owner withdrew (CIRISPersist#945)"
+    );
+    // The history view lists it and names it — Withdrawn, not Live (#712).
+    let history = in_room_with(
+        node_b.store.engine(),
+        &room,
+        &node_b.me,
+        10,
+        None,
+        LifecycleView::IncludeWithdrawn,
+    )
+    .await
+    .expect("history listing");
+    let mut expected = vec![
+        (kept.attestation_id.clone(), FileLifecycle::Live),
+        (gone.attestation_id.clone(), FileLifecycle::Withdrawn),
+    ];
+    expected.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        ids(&history),
+        expected,
+        "IncludeWithdrawn names the owner-withdrawn file Withdrawn (CIRISEdge#712): the \
+         history fold honours an admitted withdraws whoever signed it"
+    );
+}
+
 /// **CIRISEdge#698 — the sealed descriptor** (`FSD/CONTENT_TRANSFER.md`
 /// §6.7.1, CC 3.3.13): a file's name and media type open only with its bytes.
 /// Named `files::…` to match the FSD's witness table; they live here because
@@ -4461,10 +5072,15 @@ mod files {
             let mut transplanted = FileRow::from_row(&b.row).expect("b");
             transplanted.pointer = a.pointer.clone();
             for refused in [
-                transplanted
-                    .describe(&node_a.store, &node_a.me)
-                    .await
-                    .expect_err("describe: a's pointer on b's row"),
+                // CIRISEdge#737: `open_described` answers `FileError`; the
+                // descriptor's own refusal is lifted into it, so both legs
+                // are judged by one `kind`.
+                ciris_edge::files::FileError::from(
+                    transplanted
+                        .describe(&node_a.store, &node_a.me)
+                        .await
+                        .expect_err("describe: a's pointer on b's row"),
+                ),
                 transplanted
                     .open_described(&node_a.store, &node_a.me)
                     .await
@@ -5208,4 +5824,775 @@ mod files {
             );
         }
     }
+}
+
+// ─── CIRISEdge#735: the community chunk DAG, holder to holder ────────────
+
+/// CIRISEdge#735 — a [`ciris_edge::blob_swarm::DagByteFetch`] over the peers
+/// this node can REACH, walked in holder order the way the swarm session
+/// walks its holders: a holder with no route is passed over, a holder that
+/// answers `NotHeld` is passed over, the first body wins. It records which
+/// holder served each address, so a witness can say WHO the bytes came
+/// from rather than only that they arrived. `tamper` flips the last byte of
+/// the body served at that address — a dishonest holder, which the fetcher
+/// cannot detect (the puller's belt does).
+struct MeshFetch {
+    requester: String,
+    holders: Vec<String>,
+    reach: Vec<(String, ciris_persist::Engine)>,
+    tamper: Option<[u8; 32]>,
+    served_by: std::sync::Mutex<Vec<([u8; 32], String)>>,
+}
+
+impl MeshFetch {
+    fn new(requester: &str, holders: Vec<String>, reach: &[&Node]) -> Self {
+        Self {
+            requester: requester.to_owned(),
+            holders,
+            reach: reach
+                .iter()
+                .map(|n| (n.me.clone(), n.store.engine().clone()))
+                .collect(),
+            tamper: None,
+            served_by: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn tampering(mut self, sha: [u8; 32]) -> Self {
+        self.tamper = Some(sha);
+        self
+    }
+
+    /// The holders that served, one per address fetched, in order.
+    fn servers(&self) -> Vec<String> {
+        self.served_by
+            .lock()
+            .expect("served_by")
+            .iter()
+            .map(|(_, h)| h.clone())
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl ciris_edge::blob_swarm::DagByteFetch for MeshFetch {
+    fn holders(&self) -> &[String] {
+        &self.holders
+    }
+
+    async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String> {
+        use ciris_persist::federation::blobs::BlobBody;
+        let mut misses = Vec::new();
+        for holder in &self.holders {
+            let Some((_, engine)) = self.reach.iter().find(|(k, _)| k == holder) else {
+                misses.push(format!("{holder}: no route"));
+                continue;
+            };
+            match engine.serve_blob_to_peer(&sha, &self.requester).await {
+                Ok(BlobBody::Inline(mut bytes)) => {
+                    if self.tamper == Some(sha) {
+                        if let Some(last) = bytes.last_mut() {
+                            *last ^= 0x01;
+                        }
+                    }
+                    self.served_by
+                        .lock()
+                        .expect("served_by")
+                        .push((sha, holder.clone()));
+                    return Ok(bytes);
+                }
+                Ok(other) => misses.push(format!("{holder}: not inline ({other:?})")),
+                Err(e) => misses.push(format!("{holder}: {e}")),
+            }
+        }
+        Err(format!(
+            "no reachable holder served {}: {misses:?}",
+            hex::encode(sha)
+        ))
+    }
+}
+
+/// A node's own `holds_bytes` rows naming `sha`.
+async fn own_holder_claims(
+    node: &Node,
+    sha: &[u8; 32],
+) -> Vec<ciris_persist::federation::Attestation> {
+    let hex_sha = hex::encode(sha);
+    rows_of(node, "holds_bytes:")
+        .await
+        .into_iter()
+        .map(|b| serde_json::from_slice::<ciris_persist::federation::Attestation>(&b).expect("row"))
+        .filter(|a| {
+            a.attesting_key_id == node.me
+                && a.attestation_envelope["evidence_refs"]
+                    .as_array()
+                    .is_some_and(|refs| refs.iter().any(|r| r.as_str() == Some(&hex_sha)))
+        })
+        .collect()
+}
+
+/// **CIRISEdge#735 — a community chunk DAG is pulled holder to holder under
+/// the room's DEK: A → B → C, with the negatives each refused by name.**
+///
+/// Three members of one room on three substrates — alice (A), bob (B),
+/// carol (C) — plus dave (D), who is not a member, and erin, a member with no
+/// node who is later removed so the room's epoch rotates. Every directory
+/// holds the roster and every member node the others' occurrences and owner
+/// bindings (the identity plane). The community route does not run over the
+/// in-process wire (no scope table on a legacy node — the #616/#499 pins), so
+/// each walk is `pull_dag_with` over [`MeshFetch`], whose REACH is the
+/// topology: B reaches A; C reaches B and never A; D reaches B. Every persist
+/// door on the receiving side is the production one.
+///
+/// 1. A publishes a 1,300,000-byte file through the file door into the
+///    community room: five 256 KiB chunks and a manifest, each its own
+///    at-rest envelope under the room's epoch-`e0` DEK; the pointer carries
+///    `epoch: Some(e0)` (CIRISEdge#601) and `stream_id`. The row, A's
+///    `key_grant` sets and A's `holds_bytes` cross to B and C.
+/// 2. B pulls from A: manifest → opened as B → chunks → promoted;
+///    `storage_kind = chunk_dag`, byte-identical, B's own `holds_bytes`
+///    names the DAG root and is admitted on C through the gated door.
+/// 3. C discovers B through `list_holders`, is refused a tampered chunk 1
+///    from B `ChunkMismatch { seq: 1 }` (counted `dag_chunk_mismatch`,
+///    chunk 0 kept), then RESUMES from B honest and reads byte-identical;
+///    every address C fetched was served by B, none by A.
+/// 4. A pointer at `community_dek` naming no epoch (a pre-#601 row) is
+///    `NoEpoch`, counted `no_epoch` — the counter this cut adds.
+/// 5. D, not a member, is refused at the store gate before a byte moves,
+///    holds nothing, claims nothing, and A's sets wrap nothing to D.
+/// 6. erin is removed (the room's DEK rotates — AV-70, one write), D is
+///    widened in, A seals again at `e1 > e0`: D opens the new body (it holds
+///    the new DEK) and its pull of the OLD file parks `DagAwaitingKey` — the
+///    manifest binds to the POINTER's epoch `e0`, which D was never granted;
+///    C, granted at `e0`, still reads it after the rotation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // the whole ladder across three holders, in order, on purpose
+async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() {
+    use ciris_edge::blob_swarm::{BlobPuller, DagPullRefusal, PullConfig, PullOutcome};
+    use ciris_edge::chat::UnopenedReason;
+    use ciris_edge::files::FileRow;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::key_grant::{
+        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
+    };
+    use ciris_persist::federation::types::cohort_scope::CryptoTier;
+    use ciris_persist::federation::{FederationDirectory, SignedAttestation};
+    const ROOM: &str = "room-735";
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let carol = Ident::new("carol-fed", 0x44);
+    let dave = Ident::new("dave-fed", 0x66);
+    let erin = Ident::new("erin-fed", 0x77);
+    // persist's revocation table keys the room onto `federation_keys`
+    // (`community_roster::revoke_community_member`), so the room id is
+    // registered as a key the way persist's own fixtures do it.
+    let room_key = Ident::new(ROOM, 0x99);
+    let idents = [&alice, &bob, &carol, &dave, &erin, &room_key];
+    let node_a = node(&idents, &alice).await;
+    let node_b = node(&idents, &bob).await;
+    let node_c = node(&idents, &carol).await;
+    let node_d = node(&idents, &dave).await;
+    let members = [&alice, &bob, &carol, &erin];
+    for n in [&node_a, &node_b, &node_c, &node_d] {
+        seed_room(n, ROOM, &members).await;
+    }
+    // The identity plane: every node knows every other's occurrence and
+    // owner binding (what the mesh's IdentityOccurrence plane carries).
+    let nodes = [&node_a, &node_b, &node_c, &node_d];
+    for from in nodes {
+        for to in nodes {
+            if !std::ptr::eq(from, to) {
+                federate(from, to).await;
+            }
+        }
+    }
+    let (wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (wire_c, wire_d) = wire(&node_c.me, &node_d.me);
+    let (_edge_a, _stop_a) = spawn_edge(&node_a, wire_a).await;
+    let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
+    let (edge_c, _stop_c) = spawn_edge(&node_c, wire_c).await;
+    let (edge_d, _stop_d) = spawn_edge(&node_d, wire_d).await;
+    let puller_for = |edge: &Arc<ciris_edge::Edge>, n: &Node| {
+        BlobPuller::new(
+            Arc::clone(edge),
+            n.store.engine().clone(),
+            n.dir.clone(),
+            n.dir.clone() as Arc<dyn FederationDirectory>,
+            n.me.clone(),
+            PullConfig::default(),
+        )
+    };
+    let puller_b = puller_for(&edge_b, &node_b);
+    let puller_c = puller_for(&edge_c, &node_c);
+    let puller_d = puller_for(&edge_d, &node_d);
+    let refusals = |edge: &Arc<ciris_edge::Edge>| edge.metrics().snapshot().blob_pull_refusals;
+    let holders_on = |n: &Node, sha: [u8; 32]| {
+        let dir = n.dir.clone();
+        let me = n.me.clone();
+        async move {
+            let mut h: Vec<String> = dir
+                .list_holders(&sha)
+                .await
+                .expect("list_holders")
+                .into_iter()
+                .filter(|k| *k != me)
+                .collect();
+            h.sort();
+            h
+        }
+    };
+
+    // ── 1. A publishes into the room: a DAG under the epoch-e0 DEK. ──
+    let file_len = 1_300_000usize;
+    let plain = body_of(file_len, 0x735);
+    let room = ciris_edge::scope_room::ScopeRoom::community(ROOM);
+    let published = ciris_edge::files::publish(
+        &*node_a.dir,
+        &node_a.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &ciris_edge::files::FileWrite {
+            room: &room,
+            bytes: &plain,
+            media_type: "video/mp4",
+            codec: None,
+            filename: Some("release.mp4"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("publish a chunked file into the community room");
+    assert_eq!(
+        published.tier,
+        CryptoTier::CommunityDek,
+        "a room seals under its DEK"
+    );
+    let e0 = published
+        .pointer
+        .epoch
+        .expect("a community_dek pointer carries its sealed-under epoch (CIRISEdge#601)");
+    let stream_id = published
+        .pointer
+        .stream_id
+        .clone()
+        .expect("over the inline bound: a chunk DAG");
+    assert_eq!(published.pointer.size, Some(file_len as u64));
+    let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let crossed_id = match &published.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!("the community file must cross: {other:?}")
+        }
+    };
+    let row = node_a
+        .dir
+        .get_attestation(&crossed_id)
+        .await
+        .expect("read")
+        .expect("the crossed row");
+    assert_eq!(
+        row.cohort_scope,
+        ciris_persist::federation::types::cohort_scope::COMMUNITY
+    );
+    for n in [&node_b, &node_c, &node_d] {
+        n.dir
+            .apply_replicated_attestation(SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .expect("a member's node admits the crossed row");
+    }
+    let aad = ciris_edge::group_content::content_aad(
+        &row.attesting_key_id,
+        row.asserted_at,
+        published.pointer.content_field,
+    );
+    let view_a = node_a
+        .store
+        .engine()
+        .open_sealed_manifest_as(&sha, &node_a.me, Some(&aad))
+        .await
+        .expect("A opens its own manifest");
+    assert_eq!(view_a.chunks.len(), 5, "4 × 256 KiB + 251,424 bytes");
+    let chunk1: [u8; 32] = hex::decode(&view_a.chunks[1].sha256_hex)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+
+    // The KEY crosses to the members (a set per chunk and the manifest) —
+    // to B and C through the key-grant door; D is not a member and gets
+    // nothing from A's cascade (asserted at step 5).
+    node_a
+        .store
+        .engine()
+        .emit_pending_key_grants()
+        .await
+        .expect("A emits");
+    let sets_of = |n: &Node| {
+        let dir = n.dir.clone();
+        async move {
+            dir.list_attestations_since(None, 500)
+                .await
+                .expect("list rows")
+                .into_iter()
+                .filter(|a| {
+                    a.attestation
+                        .attestation_type
+                        .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+                })
+                .map(|a| a.attestation)
+                .collect::<Vec<_>>()
+        }
+    };
+    let sets_a = sets_of(&node_a).await;
+    // ONE set: at `community_dek` every chunk and the manifest are sealed
+    // under the epoch's DEK, and the cascade wraps that DEK once per
+    // occurrence — unlike `invisible_encrypted`, where each blob has its own
+    // key and its own set (the self witness sees six).
+    assert!(
+        !sets_a.is_empty(),
+        "A's seal emitted the room's epoch-e0 key_grant set"
+    );
+    for n in [&node_b, &node_c] {
+        let mut wraps = 0;
+        for s in &sets_a {
+            wraps += n
+                .store
+                .engine()
+                .apply_replicated_key_grant(SignedKeyGrantSet {
+                    attestation: s.clone(),
+                })
+                .await
+                .expect("a member applies A's set")
+                .wraps_written;
+        }
+        assert!(
+            wraps >= 1,
+            "{} holds its own private half: {wraps} wraps",
+            n.me
+        );
+    }
+    // A's holder claims cross as rows do — to both B and C. C's TRANSPORT
+    // reach is the topology; the claim plane is not.
+    admit_holder_claims(&node_a, &node_b).await;
+    admit_holder_claims(&node_a, &node_c).await;
+    assert_eq!(holders_on(&node_b, sha).await, vec![node_a.me.clone()]);
+
+    // ── 2. B pulls from A and becomes a holder. ──
+    let fetch_b = MeshFetch::new(&node_b.me, holders_on(&node_b, sha).await, &[&node_a]);
+    assert_eq!(
+        puller_b.pull_dag_with(&row, sha, &fetch_b).await,
+        PullOutcome::Stored { announced: true },
+        "B stores and announces the room's DAG: refusals {:?}",
+        refusals(&edge_b)
+    );
+    assert_eq!(
+        node_b
+            .dir
+            .blob_head(&sha)
+            .await
+            .expect("blob_head")
+            .expect("held")
+            .storage_kind,
+        "chunk_dag",
+        "promoted on B"
+    );
+    let file = FileRow::from_row(&row).expect("a file row");
+    let got_b = file
+        .open(&node_b.store, &node_b.me)
+        .await
+        .expect("bob opens the file alice published");
+    assert_eq!(got_b.len(), file_len);
+    assert!(got_b == plain, "byte-identical on B");
+    assert!(
+        fetch_b.servers().iter().all(|h| *h == node_a.me),
+        "B fetched every address from A: {:?}",
+        fetch_b.servers()
+    );
+    let claims_b = own_holder_claims(&node_b, &sha).await;
+    assert_eq!(
+        claims_b.len(),
+        1,
+        "B's own holds_bytes names the DAG root exactly once: {claims_b:?}"
+    );
+    assert_eq!(claims_b[0].attesting_key_id, node_b.me, "the claim names B");
+    assert!(
+        node_b
+            .dir
+            .list_holders(&sha)
+            .await
+            .expect("list_holders")
+            .contains(&node_b.me),
+        "B is a holder in its own index"
+    );
+    // B's claim reaches C through the GATED door — the claim is
+    // federation-tier and hybrid-signed, so a peer admits it.
+    node_c
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: claims_b[0].clone(),
+        })
+        .await
+        .expect("C admits B's holder claim through the replication door");
+    let mut expect_holders_c = vec![node_a.me.clone(), node_b.me.clone()];
+    expect_holders_c.sort();
+    assert_eq!(
+        holders_on(&node_c, sha).await,
+        expect_holders_c,
+        "C discovers B (and A) through holds_bytes"
+    );
+
+    // ── 3. C pulls FROM B: a tampered chunk first, then the honest resume. ──
+    let fetch_c_tampered =
+        MeshFetch::new(&node_c.me, holders_on(&node_c, sha).await, &[&node_b]).tampering(chunk1);
+    match puller_c.pull_dag_with(&row, sha, &fetch_c_tampered).await {
+        PullOutcome::DagRefused(DagPullRefusal::ChunkMismatch { seq: 1, .. }) => {}
+        other => panic!("a tampered chunk 1 from B is refused at its position: {other:?}"),
+    }
+    assert_eq!(
+        refusals(&edge_c).get("dag_chunk_mismatch").copied(),
+        Some(1),
+        "counted by name on C"
+    );
+    let positions: Vec<u64> = node_c
+        .dir
+        .stream_chunks(&stream_id)
+        .await
+        .expect("stream_chunks")
+        .chunks
+        .iter()
+        .map(|c| c.seq)
+        .collect();
+    assert_eq!(
+        positions,
+        vec![0],
+        "chunk 0 kept, chunk 1 refused, nothing after"
+    );
+    assert_eq!(
+        node_c
+            .dir
+            .blob_head(&sha)
+            .await
+            .expect("blob_head")
+            .expect("manifest held")
+            .storage_kind,
+        "inline",
+        "not promoted"
+    );
+    assert!(
+        fetch_c_tampered.servers().iter().all(|h| *h == node_b.me),
+        "C reached only B: {:?}",
+        fetch_c_tampered.servers()
+    );
+
+    let fetch_c = MeshFetch::new(&node_c.me, holders_on(&node_c, sha).await, &[&node_b]);
+    assert_eq!(
+        puller_c.pull_dag_with(&row, sha, &fetch_c).await,
+        PullOutcome::Stored { announced: true },
+        "C resumes from B and stores: refusals {:?}",
+        refusals(&edge_c)
+    );
+    assert_eq!(
+        node_c
+            .dir
+            .blob_head(&sha)
+            .await
+            .expect("blob_head")
+            .expect("held")
+            .storage_kind,
+        "chunk_dag",
+        "promoted on C"
+    );
+    let got_c = file
+        .open(&node_c.store, &node_c.me)
+        .await
+        .expect("carol opens the file, fetched from bob");
+    assert_eq!(got_c.len(), file_len);
+    assert!(got_c == plain, "byte-identical on C");
+    let servers_c = fetch_c.servers();
+    assert_eq!(
+        servers_c.len(),
+        4,
+        "the resume fetched chunks 1–4 only (manifest and chunk 0 were held): {servers_c:?}"
+    );
+    assert!(
+        servers_c.iter().all(|h| *h == node_b.me),
+        "every byte C holds came from B — never from A, which C cannot reach"
+    );
+    let claims_c = own_holder_claims(&node_c, &sha).await;
+    assert_eq!(
+        claims_c.len(),
+        1,
+        "C announces the DAG root once: {claims_c:?}"
+    );
+    assert_eq!(
+        puller_c.pull_dag_with(&row, sha, &fetch_c).await,
+        PullOutcome::AlreadyHeld,
+        "held is held"
+    );
+    assert_eq!(
+        puller_c.pull_one(&row, sha, 0).await,
+        PullOutcome::AlreadyHeld,
+        "the production path offers nothing past the head"
+    );
+
+    // ── 4. A community_dek pointer naming NO epoch: NoEpoch, counted. ──
+    let mut legacy = published.pointer.clone();
+    legacy.epoch = None;
+    let legacy_row = federation_content_row(&node_a.signer, ROOM, &legacy, ts()).await;
+    assert_eq!(
+        puller_c.pull_dag_with(&legacy_row, sha, &fetch_c).await,
+        PullOutcome::NoEpoch,
+        "a pointer with no sealed-under epoch is refused by name (CIRISEdge#601)"
+    );
+    assert_eq!(
+        refusals(&edge_c).get("no_epoch").copied(),
+        Some(1),
+        "NoEpoch is counted under blob_pull_refusals like every other named refusal \
+         (CIRISEdge#735): {:?}",
+        refusals(&edge_c)
+    );
+
+    // ── 5. D is not a member: refused at the gate, before a byte moves. ──
+    let fetch_d = MeshFetch::new(&node_d.me, vec![node_b.me.clone()], &[&node_b]);
+    match puller_d.pull_dag_with(&row, sha, &fetch_d).await {
+        PullOutcome::Refused(reason) => {
+            assert!(
+                reason.contains("axis"),
+                "the store gate names its axis: {reason}"
+            );
+        }
+        other => panic!("a non-member's pull is refused at the store gate: {other:?}"),
+    }
+    assert!(fetch_d.servers().is_empty(), "nothing was fetched for D");
+    assert!(
+        !node_d.dir.has_blob(&sha).await.expect("has_blob"),
+        "D holds nothing"
+    );
+    assert!(
+        own_holder_claims(&node_d, &sha).await.is_empty(),
+        "D claims nothing"
+    );
+    // A's e0 set names no occurrence of D: the cascade enumerated the
+    // room's members. (D still admits and stores the carrier — a wrap is
+    // ciphertext addressed to someone else, and `wraps_written` counts rows
+    // inserted, not rows this node can unwrap.)
+    let recipients_of = |set: &ciris_persist::federation::Attestation| {
+        ciris_persist::federation::key_grant::KeyGrantSet::from_attestation(set)
+            .expect("persist reads its own set back")
+            .wraps
+            .into_iter()
+            .map(|w| w.recipient_key_id)
+            .collect::<Vec<_>>()
+    };
+    for s in &sets_a {
+        let recipients = recipients_of(s);
+        assert!(
+            recipients.contains(&node_b.me) && recipients.contains(&node_c.me),
+            "the e0 set wraps to the members' nodes: {recipients:?}"
+        );
+        assert!(
+            !recipients.contains(&node_d.me),
+            "A's cascade wrapped nothing to a non-member's occurrence: {recipients:?}"
+        );
+        node_d
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantSet {
+                attestation: s.clone(),
+            })
+            .await
+            .expect("D admits the carrier row and can unwrap none of it");
+    }
+
+    // ── 6. The epoch rotates; a member granted only at e1 cannot read e0. ──
+    let alice_signer = edge_signer_for(&alice);
+    let now = chrono::Utc::now();
+    let removal = ciris_edge::community_roster::community_membership_revocation(
+        ROOM,
+        &erin.key_id,
+        now,
+        None,
+        &[],
+        &alice_signer,
+    )
+    .await
+    .expect("the founder signs erin's removal");
+    for n in nodes {
+        n.dir
+            .put_community_membership_revocation(removal.clone())
+            .await
+            .expect("every directory folds the removal — the room's DEK rotates (AV-70)");
+    }
+    let (member_d, spec_d) = ciris_edge::community_roster::community_membership_widening(
+        &*node_a.dir,
+        ROOM,
+        &dave.key_id,
+        None,
+        now,
+        &alice_signer,
+    )
+    .await
+    .expect("the founder signs dave's widening");
+    for n in nodes {
+        n.dir
+            .add_community_member(ROOM, member_d.clone(), &spec_d)
+            .await
+            .expect("every directory folds the widening");
+    }
+    let post = node_a
+        .store
+        .seal(SealRequest {
+            cohort_scope: "community",
+            community_key_id: Some(ROOM),
+            author_key_id: &node_a.me,
+            asserted_at: ts(),
+            field: ContentField::Body,
+            plaintext: b"sealed after the rotation",
+            description: Some(ciris_edge::group_content::Description {
+                name: None,
+                format: "text/plain",
+                codec: None,
+            }),
+        })
+        .await
+        .expect("A seals after the rotation");
+    let e1 = post.epoch.expect("epoch-bearing");
+    assert!(e1 > e0, "the removal rotated the room's epoch: {e0} → {e1}");
+    node_a
+        .store
+        .engine()
+        .emit_pending_key_grants()
+        .await
+        .expect("A emits");
+    let mut wrapped_to_d = Vec::new();
+    for s in sets_of(&node_a).await {
+        if recipients_of(&s).contains(&node_d.me) {
+            wrapped_to_d.push(s.attestation_type.clone());
+        }
+        node_d
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantSet { attestation: s })
+            .await
+            .expect("D applies A's sets");
+    }
+    assert_eq!(
+        wrapped_to_d.len(),
+        1,
+        "exactly one set wraps to D — the e1 set, minted after it joined: {wrapped_to_d:?}"
+    );
+    // Positive control: D reads what was sealed after it joined. The bytes
+    // cross as the whole-blob path carries them.
+    {
+        use ciris_persist::federation::blobs::BlobBody;
+        use ciris_persist::federation::{AdoptDisposition, BlobProvenance};
+        let post_sha: [u8; 32] = hex::decode(&post.pointer.content_sha256)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes");
+        let BlobBody::Inline(envelope) = node_a
+            .store
+            .engine()
+            .serve_blob_to_peer(&post_sha, &node_d.me)
+            .await
+            .expect("A serves")
+        else {
+            panic!("inline")
+        };
+        let post_aad = ciris_edge::group_content::aad_for_open(&OpenRequest {
+            pointer: &post.pointer,
+            author_key_id: &node_a.me,
+            asserted_at: ts(),
+            viewer_key_id: &node_d.me,
+        });
+        node_d
+            .store
+            .engine()
+            .adopt_sealed_blob(
+                &envelope,
+                BlobProvenance {
+                    author_key_id: node_a.me.clone(),
+                    cohort_scope: "community".to_owned(),
+                    community_key_id: Some(ROOM.to_owned()),
+                    epoch: post.epoch,
+                    tier: post.tier,
+                    minter_key_id: Some(node_a.me.clone()),
+                },
+                Some(&post_aad),
+                AdoptDisposition::LocalOnly,
+            )
+            .await
+            .expect("D adopts the e1 body");
+        let opened = node_d
+            .store
+            .open(OpenRequest {
+                pointer: &post.pointer,
+                author_key_id: &node_a.me,
+                asserted_at: ts(),
+                viewer_key_id: &node_d.me,
+            })
+            .await
+            .expect("D, a member since the rotation, opens e1 content");
+        assert_eq!(opened, b"sealed after the rotation");
+    }
+    // The old file: D is a member now, so the gate admits the pull; the
+    // manifest binds to the POINTER's epoch e0, which D was never granted.
+    node_d
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: claims_b[0].clone(),
+        })
+        .await
+        .expect("D admits B's holder claim");
+    let fetch_d = MeshFetch::new(&node_d.me, holders_on(&node_d, sha).await, &[&node_b]);
+    match puller_d.pull_dag_with(&row, sha, &fetch_d).await {
+        PullOutcome::DagAwaitingKey { .. } => {}
+        other => panic!(
+            "a reader holding only the rotated epoch's DEK parks by name on the pointer's \
+             epoch — the manifest is held, nothing decrypts, nothing is promoted: {other:?}"
+        ),
+    }
+    assert_eq!(
+        node_d
+            .dir
+            .blob_head(&sha)
+            .await
+            .expect("blob_head")
+            .expect("manifest held")
+            .storage_kind,
+        "inline",
+        "the manifest is adopted at e0 and not promoted"
+    );
+    assert!(
+        matches!(
+            file.open(&node_d.store, &node_d.me).await,
+            Err(ciris_edge::files::FileError::Unopened(
+                UnopenedReason::NotGranted { .. }
+            ))
+        ),
+        "D reads NotGranted on the e0 file: the epoch-bearing pointer, not the current \
+         epoch, is what the bytes are bound to"
+    );
+    assert!(
+        !refusals(&edge_d).keys().any(|k| k.starts_with("dag_")),
+        "a missing key is a wait, never a DAG refusal: {:?}",
+        refusals(&edge_d)
+    );
+    // And a member granted at e0 keeps reading it after the rotation
+    // (AV-70: once shared, always shared).
+    let still = file
+        .open(&node_c.store, &node_c.me)
+        .await
+        .expect("carol still opens the e0 file after the rotation");
+    assert!(still == plain, "byte-identical on C after the rotation");
 }

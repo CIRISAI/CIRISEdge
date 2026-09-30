@@ -609,8 +609,10 @@ and `GroupContentStore::seal_chunked` is the door: `put_blob_chunk_scoped` per 2
 `seal_stream_scoped`. The returned pointer carries **`stream_id: Some(..)`, and its presence IS the
 answer to "is this chunked"** — one fact, one member, no way for two to disagree — while
 `content_sha256` is the MANIFEST's, which is what a reader opens and what the row cites. A reader
-opens it through the same door as an inline blob (persist's whole-read caps at 64 MiB and names the
-range door above that).
+opens it through the same door as an inline blob **up to persist's 64 MiB whole-read cap**; above it
+the file is read by range or streamed chunk by chunk, and a whole `open` refuses by name (§6.7.3). The
+write streams too: `files::publish_stream` seals from a reader one chunk at a time, and `publish` is it
+over a slice (§6.7.4).
 
 #### 6.7.0 Who authors a file — the person, co-signed by the node (CIRISEdge#675)
 
@@ -851,17 +853,72 @@ CC 5.3.3.1's `MAX_CHUNKS_PER_EPOCH = 2²⁴`. At 256 KiB per chunk that ceiling 
 asking for a few seconds of a video should not pull a megabyte. CC bounds the envelope and the chunk
 COUNT, never the chunk size.
 
-**What remains: the cross-node fetch.** The puller adopts a whole blob (`adopt_sealed_blob`); a DAG
-needs `adopt_sealed_chunk` per chunk against the manifest, under the same store gate. Until that
-lands a DAG is written, listed and opened on the node that sealed it, and a far node reads
-`not_fetched` — the honest state, not a silent gap. Tracked on CIRISEdge#633.
+**The cross-node fetch — the DAG pull** (CIRISEdge#717; persist v51.3.0, CIRISPersist#947). The
+puller never whole-pulls a pointer carrying `stream_id`: its address is the MANIFEST's, and stored
+whole the manifest read back as the file (v34.1.0 refused such a pointer by name as
+`StreamPointerNeedsDagPull`; that interim arm is gone). A stream pointer takes its own walk — through
+the same holder rung (§6.2) and the same store gate as a whole blob — over persist's three #947 doors:
 
-**Until then a stream pointer is refused by name** (CIRISEdge#717): the puller never whole-pulls a
-pointer carrying `stream_id` — its address is the manifest's, and stored whole the manifest read back
-as the file — so it answers `StreamPointerNeedsDagPull` before any request, stores nothing, and counts
-`blob_pull_refusals{stream_pointer_needs_dag_pull}`; the DAG pull waits on persist's sealed-DAG adopt
-door (CIRISPersist#947). A whole blob whose length is not the one its pointer implies (`size`, plus
-`AT_REST_ENVELOPE_OVERHEAD` at a sealed tier) is refused `SizeMismatch`, counted `size_mismatch`.
+| door | what it does |
+|---|---|
+| `open_sealed_manifest_as(sha, viewer, aad)` | the chunk list of a held sealed manifest, opened for an authorized viewer (as `read_blob_as` authorizes): `{sha256_hex, size, seq}` per chunk, `stream_id`, `total_size`, the row's `storage_kind`, and the three caps (per-chunk inline cap, whole-read cap, max chunks); refuses a non-manifest by name |
+| `promote_adopted_manifest_to_dag(sha, viewer, aad)` | flips an adopted manifest row to `chunk_dag` once every chunk is held at `(stream_id, seq)` with the named sha and `plaintext_size = size`; otherwise names the first missing `(seq, sha)`; idempotent |
+| `put_blob_chunks_signing(manifest, chunks, author)` | a plaintext DAG in one shot, every chunk verified against the manifest inside the door, the manifest's `holds_bytes` announced as `store_plaintext` announces a whole blob |
+
+**The states, in order.** Each rung refuses by name (`PullOutcome::DagRefused`) and counts under
+`blob_pull_refusals`; nothing past a refusal is stored, and nothing stored reads wrong.
+
+| state | sealed (`invisible_encrypted` / `community_dek`) | plaintext (commons) |
+|---|---|---|
+| **manifest** | fetched by the pointer's sha and verified against it by the puller; `adopt_sealed_blob` as received — an inline envelope edge never opens — with the row's provenance and AAD, exactly as a whole blob | fetched by the pointer's sha and verified against it; parsed in clear as persist's canonical JCS shape, the reading proven by re-canonicalizing to the fetched bytes |
+| **verified** | `open_sealed_manifest_as` as THIS NODE under the row's AAD. `NotGranted` ⇒ `DagAwaitingKey`: the manifest stays held and the retry resumes when the `key_grant` lands (the key follows the bytes in either order, persist I61/I62) | the manifest's `chunk_tier` is plaintext |
+| | then `check_dag_plan`, BEFORE any chunk is fetched: the manifest names the pointer's stream; `total_size` is the pointer's `size` (compared to the manifest's plaintext total — never to the row's `size_bytes`, which stays the envelope's length after promotion); chunk count ≤ `max_chunks`; every stored chunk body (`size` + `AT_REST_ENVELOPE_OVERHEAD` sealed, `size` plain) ≤ the inline cap; `total_size` ≤ what the chunk list can hold (`chunk_count × (inline cap − per-chunk overhead)`, the STORAGE bound — CIRISEdge#737; with the sum rule it is exact) and, for a plaintext DAG only, ≤ the 64 MiB in-memory bound of the one-shot door; sizes sum to `total_size`; no repeated `seq` | same, with persist's constants for the caps |
+| **chunks** | each by its sha — its own content-addressed row on the holder, served as a whole blob is — verified, length-checked, `adopt_sealed_chunk` at `(stream_id, seq)` with `plaintext_size = size`; a chunk already held at its position with the manifest's sha is skipped (resume) | each by its sha, verified, length-checked, held in memory until the door takes them (bounded by the whole-read cap the plan enforced) |
+| **promoted** | `promote_adopted_manifest_to_dag` — persist re-checks every chunk row against the manifest; `promoted: false` = already a DAG (`AlreadyHeld`) | `put_blob_chunks_signing` — stored and announced in one shot |
+| **read** | `storage_kind = chunk_dag`; `read_blob_as` and the range read serve the file (`FileRow::open`) | same |
+
+| refusal | when | `blob_pull_refusals` tag |
+|---|---|---|
+| `ManifestMismatch` | the bytes at the address do not hash to it, do not parse as a chunk manifest (persist names which: a plaintext row, a sealed whole blob, a v1 manifest), are not canonical, name another stream, or are incoherent (sizes ≠ total, a repeated `seq`, no chunks) | `dag_manifest_mismatch` |
+| `TotalSizeMismatch` | the manifest's `total_size` ≠ the pointer's `size` | `dag_total_size_mismatch` |
+| `OverCap` | chunk count, a chunk's stored body, `total_size` over the chunk list's storage bound (`total_size_vs_chunks`), or a plaintext DAG over the in-memory bound (`total_size_in_memory`) — `what` names the axis | `dag_over_cap` |
+| `ChunkMismatch` | a chunk's bytes do not hash to the manifest's sha, or are not the length its size implies | `dag_chunk_mismatch` |
+| `ChunkMissing` | promotion names a chunk not held as named | `dag_chunk_missing` |
+
+A whole blob whose length is not the one its pointer implies (`size`, plus `AT_REST_ENVELOPE_OVERHEAD`
+at a sealed tier) is still refused `SizeMismatch`, counted `size_mismatch`. **Held is not done:** a
+manifest held `inline` at a sealed tier under a stream pointer is a pull to resume, and `pull_one`
+resumes it rather than answering `AlreadyHeld`. `BlobPuller::pull_dag_with` runs the same walk over a
+caller's `DagByteFetch` (a deployment whose transport is not the swarm's; the store-level witness): the
+gate is asked of the fetcher's holders before the first fetch and every body is verified by the puller,
+so a fetcher can fail a pull and never feed one. Judgements recorded: **the pull is chunk-wise
+and has no read-size ceiling** — a sealed DAG is adopted one chunk at a time at `(stream_id, seq)`, so
+its only size bound is what its manifest can legally hold, and persist's 64 MiB whole-read cap governs
+READS, not pulls (§6.7.3; until CIRISEdge#737 the pull borrowed the read cap as its ceiling); a plaintext
+DAG is held whole until `put_blob_chunks_signing` takes it and so keeps that 64 MiB as its in-memory
+bound; chunks are fetched one address at a time through one swarm session.
+
+Witnesses (`tests/blob_federation_e2e.rs`): `a_plaintext_chunk_dag_pulls_through_the_real_doors_and_reads_back_whole`
+(1,048,577 bytes, five chunks, `chunk_dag` on B, byte-identical, B's own `holds_bytes`),
+`a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_whole` (1,300,000 bytes at
+`invisible_encrypted`: tampered manifest → nothing; honest before the key → `DagAwaitingKey`; tampered
+chunk → refused at `seq 1` with chunk 0 kept; honest → resumed, promoted, `FileRow::open` at full
+size), `a_dag_manifest_over_the_caps_or_off_its_pointer_is_refused_before_a_chunk_moves`.
+
+**The community row** (CIRISEdge#735, lane 2 of #734; witness
+`a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek`, three members on three
+substrates plus a non-member, 1,300,000 bytes at `community_dek`). What differs from the two tiers
+above, each asserted from the receiving side:
+
+| axis | `community_dek` | witnessed |
+|---|---|---|
+| **key** | ONE `key_grant` set per `(community, epoch)` — every chunk and the manifest are sealed under the epoch's DEK and the cascade wraps that DEK once per member occurrence (the self tier emits a set per blob: six for the same file). The set names the members' nodes and no non-member's; a non-member admits the carrier and can unwrap nothing | B and C apply A's e0 set; D's occurrence is in no wrap |
+| **pointer** | carries `epoch: Some(e0)` (CIRISEdge#601); the adopt binds the manifest and every chunk to THAT epoch, never to the room's current one. A pointer at this tier naming no epoch is `NoEpoch` before any fetch, counted **`no_epoch`** (CIRISEdge#735: before that cut the one community-tier refusal the pull could reach was the one it did not count) | a pre-#601 pointer over the same bytes → `NoEpoch`, `no_epoch = 1` |
+| **holder to holder** | B pulls from A, promotes, and its own `holds_bytes` on the DAG root is federation-tier and hybrid-signed — C admits it through `apply_replicated_attestation` and discovers B by `list_holders`. C's reach is B alone; every address C holds was served by B and none by A | `servers()` of C's fetcher = `[B, B, B, B]` |
+| **announce** | persist's `adopt_sealed_blob(Announce)` emits the claim when the MANIFEST is adopted, ahead of promotion (the plaintext door announces after every chunk). A RESUME skips that adopt, so `Stored { announced }` now reads the claim off the index (`list_holders` ∋ self) instead of reporting `false` for a door not called — on the base the resumed community pull denied the claim it had made. That a manifest-only holder is discoverable before it holds a chunk is persist's door shape (CIRISPersist#951 asks for the claim at promotion); a puller that reaches one gets `NotHeld` per chunk and walks on (CC 5.3.2.1) | C's tampered attempt announces; the resume reports `announced: true` |
+| **tampered chunk** | refused `ChunkMismatch { seq }` by name, counted `dag_chunk_mismatch`, the earlier chunk kept; the next offer resumes. Rotation to another holder on a dishonest body is the swarm session's (`SwarmConfig::dishonest_strike_limit`, `blob_swarm::tests`), not the walk's: a caller's `DagByteFetch` is one session | B serves a flipped chunk 1 → `seq: 1`, positions `[0]`, then resumed from B |
+| **non-member** | refused at the store gate (`Refused("axis …")`) before the first fetch; holds nothing, claims nothing. The serve side is the scope gate — a non-member derives no room address and holds no discriminator (`tests/scoped_body_identity_link_718.rs`); persist's `serve_blob_to_peer` ignores the requester | D: no fetch, no blob, no claim |
+| **rotated epoch** | erin's removal rotates the DEK (AV-70, one write through `community_roster`); D is widened in and A seals at `e1 > e0`. D opens e1 content and its pull of the e0 file parks **`DagAwaitingKey`** — the manifest adopted at e0, `inline`, `FileRow::open` → `NotGranted`, no `dag_*` refusal — while C, granted at e0, still reads it (once shared, always shared). Edge cannot tell "never granted" from "not yet granted" (persist I61/I62 order independence), so this is a named wait, not a refusal; the retry ceiling ends it | D: `DagAwaitingKey`, `NotGranted`; C: byte-identical after the rotation |
 
 #### 6.7.2 Rename — a new row over the same bytes (CIRISEdge#702, the server's ask)
 
@@ -953,6 +1010,161 @@ rename's included, gets the same answer; a viewer who cannot open the bytes is `
 goes through the store rather than persist directly so a host holds one handle and one error type
 for the whole drive. Witness: `files::a_files_custody_is_its_blobs_and_a_rename_does_not_move_it`.
 
+#### 6.7.3 Read — whole below the cap, by range or by chunk above it (CIRISEdge#737, lane 5 of #734)
+
+Persist bounds a **whole** read of a chunk DAG at `DAG_WHOLE_READ_CAP_BYTES` = 64 MiB (64 chunks at the
+1 MiB inline cap; `BLOB_ENCRYPTION_AT_REST.md` §12.4: *a video is read by range, never assembled whole
+inside a request handler*). The bound is on what one call materializes, not on what a file may weigh —
+storage is `MAX_CHUNKS_PER_EPOCH` × 1 MiB = 16 TiB per stream — so "arbitrary size" means: every read
+above 64 MiB is a range read, and a file of any size streams. Edge's reader has three doors, all
+through `GroupContentStore` (persist's `read_blob_as`, `read_blob_range_as`, `open_sealed_manifest_as`),
+all under **the row's one binding** (`content_aad(author, asserted_at, field)`, §6.7.1's AAD rule):
+
+| door | what it hands over | bound |
+|---|---|---|
+| `FileRow::open(store, viewer)` | the whole file | ≤ 64 MiB; above it **`FileError::AboveWholeReadCap`**, refused by name BEFORE persist is asked, pointing at the two doors below — never persist's raw cap error |
+| `FileRow::open_range(store, viewer, offset, len)` | exactly `len` bytes from `offset` | `len` ≤ 64 MiB (the same cap, same refusal); a window outside the file is **`FileError::RangeNotSatisfiable`** naming the size — `offset ≥ size`, `offset + len > size`, `len = 0`; the end is never silently clamped |
+| `FileRow::chunks(store, viewer)` → `FileChunks::next()` / `into_stream()` | the file, one chunk at a time, in `seq` order | every item ≤ 1 MiB; peak buffering a constant number of chunks (below) |
+
+**How a range maps onto chunks (persist, at the pin).** A sealed DAG's manifest (v2) lists every chunk's
+`(seq, ciphertext sha, PLAINTEXT size)`; `ChunkManifest::slices_for_range(start, end)` is a prefix sum
+over the sizes that yields, per covering chunk, the chunk-local inclusive window to keep. The range
+door authorizes the viewer on the manifest row first, opens the manifest under the row AAD, clamps
+`end` to `total_size − 1` (`start ≥ total_size` is `RangeNotSatisfiable{size}`), and then for each
+covering chunk in `seq` order: checks the chunk ROW's tier and its sha over the stored ciphertext,
+checks the viewer's grant on that chunk (`self`/`family`) or on the chunk's own DEK epoch (community,
+memoized per epoch), opens the envelope under `chunk_aad(row_aad, stream_id, seq)`, checks the opened
+length against the manifest's, and appends the local window. A range ending on a chunk boundary opens
+exactly the chunks up to it; a range of one byte opens one chunk; a range spanning a boundary opens
+both. The seek is O(covering chunks). A plaintext DAG (v1 manifest, no envelopes) is assembled by the
+storage layer's `get_blob_range` over the same prefix sum with each chunk's sha re-verified; an inline
+body (sealed or clear) is opened once and sliced.
+
+**The streaming rule.** `chunks()` reads nothing until the first `next()`. For a sealed DAG it opens the
+manifest **once** (`layout()`: `(seq, offset, size)` per chunk, the same prefix sum) and then asks the
+range door for **exactly one manifest chunk per item** — so each item is one producer segment opened
+under its own envelope and position-bound AAD, and the whole file is never in memory: peak = the item
+in hand + persist's own copy of the chunk it is opening (ciphertext + plaintext) — three chunks' worth,
+a constant. A plaintext DAG has no per-chunk envelopes and is walked in 1 MiB windows (persist's inline
+cap, the most one chunk can hold, so an item is never more than a chunk's worth whatever the producer's
+segment size); an inline file is one item. A refusal is one `Err` item and ends the walk. **The
+descriptor is not per chunk**: it is one object per file (§6.7.1), opened by `FileRow::describe` once
+— a host streaming a file describes it once and walks the chunks; `open_described` stays the whole
+read and is capped as `open` is.
+
+**Sizes and who decides them.** The whole-read decision reads the pointer's `size` (the pull verified
+it against the manifest's `total_size`, `TotalSizeMismatch` otherwise; the author's node wrote both);
+a sealed DAG declaring none is measured from its manifest; a plaintext DAG declaring none is left to
+persist's own door. `open_range` refuses against the declared size without a read, and — for a pointer
+declaring none — against persist's `RangeNotSatisfiable` and the length that came back (a short answer
+= the window ran past the end; the refusal names `offset + returned`).
+
+**Pull ≠ read.** The pull is chunk-wise (§6.7's DAG table) and, since this cut, has no read-size
+ceiling: `check_dag_plan` bounds a DAG by what its manifest can legally hold. The read cap is the
+reader's. A 100 MiB self file therefore pulls to the owner's other device and is read there by range.
+
+| # | Invariant | Witness (`tests/file_range_read_737.rs`) |
+|---|---|---|
+| RR1 | A 100 MiB self file (400 × 256 KiB at `invisible_encrypted`) published on A pulls to the owner's other device B through the real DAG doors and `chunks()` on B yields 400 items of exactly the manifest's sizes, in `seq` order, concatenating byte-identical | `a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_range` |
+| RR2 | `open_range` on B is byte-identical at `[0,1)`, a mid-chunk window, the last byte, a window across two chunks, a window across many; `len` past EOF, `offset = size`, `len = 0` are `RangeNotSatisfiable` naming the size; `len` above the cap is `AboveWholeReadCap` | same |
+| RR3 | A whole `open` of that file on B is `FileError::AboveWholeReadCap` naming the size and the cap, not a persist error; `describe` opens the descriptor once | same |
+| RR4 | Peak buffering during the walk is bounded by a constant number of chunks: a counting global allocator in the test binary measures live bytes, and the walk's peak over its baseline stays under 32 MiB while the file is 100 MiB (a whole read would be ≥ 100 MiB); every item ≤ 1 MiB | same |
+| RR5 | The arithmetic — exact `len` or a named refusal at every edge, the walk one chunk per item, a plaintext DAG in windows, an inline file one item, `open` refusing above the cap before the store is asked | `files::tests::{open_above_the_whole_read_cap_is_refused_by_name_before_the_store_is_asked, open_range_returns_exactly_len_or_refuses_by_name, chunks_walks_a_sealed_dag_one_manifest_chunk_at_a_time, chunks_walks_a_plaintext_dag_in_windows, chunks_of_an_inline_file_is_one_item}` |
+| RR6 | A 100 MiB sealed plan passes `check_dag_plan`; a plan whose `total_size` exceeds its chunk list's storage bound, or a plaintext plan over the in-memory bound, is `OverCap` naming the axis | `blob_swarm::pull::tests::the_dag_plan_is_bounded_before_a_chunk_moves` |
+
+**API note.** `FileRow::open` / `open_described` now return `FileError` (with `FileError::Unopened(UnopenedReason)`
+carrying the drive's two-state answer unchanged, and `FileError::kind()` answering the reason's `kind`), so a
+host's status mapping keeps its words and gains `above_whole_read_cap` / `range_not_satisfiable`.
+
+#### 6.7.4 Write — sealed chunk by chunk from a reader; the row crosses after the last chunk (CIRISEdge#744, lane 8 of #734)
+
+§6.7.3 made every read above 64 MiB a range or a chunk walk. The write was still whole: `files::publish`
+took `FileWrite { bytes: &[u8] }`, so a 2 GiB publish held 2 GiB before persist saw a byte — and a host
+receiving an upload had to buffer the body to call it (the server's 64 MiB upload cap exists for that
+reason alone). The chunk doors were already per-chunk (`put_blob_chunk_scoped`, then
+`seal_stream_scoped`); only the argument was whole.
+
+**The door.** `files::publish_stream(directory, store, signers, &FileStreamWrite { room, declared_len,
+media_type, codec, filename, asserted_at }, reader)` where `reader: impl tokio::io::AsyncRead + Unpin +
+Send`. `files::publish(bytes)` is this over the slice (`FileStreamWrite::of(write)`, the slice as the
+reader) — **one seal path**, and `GroupContentStore::seal_chunked(slice)` is likewise a slice over the
+store's new streaming door `seal_chunked_stream(StreamSealRequest { .., declared_len, .. }, reader)`.
+
+**The streaming rule.**
+
+1. **Shape by the DECLARED length, before a byte is read** — the one boundary §6.7 names
+   (`must_chunk`, CC 2.6.1.3 / persist's inline cap). At or below it the reader is read whole (≤ 1 MiB)
+   and sealed inline through `seal` exactly as before: an inline file's row shape does not change. A
+   reader that then disagrees with its declaration is refused, never re-routed to the other shape.
+2. **Above it, one chunk in hand.** The store reads `CHUNK_BYTES` (256 KiB) at a time into ONE reused
+   buffer, **filling each chunk fully unless the reader ends** — so chunk boundaries are `seq ×
+   CHUNK_BYTES` whatever the reader's pace (a socket's short reads, a multipart body's frames), exactly
+   the slice path's — and hands each to `put_blob_chunk_scoped(scope, group, stream_id, seq, chunk,
+   STREAM_EPOCH, row_aad)` as it arrives. `stream_id` (`file-<uuid>`), `seq` (0..n) and the position AAD
+   (`chunk_aad(row_aad, stream_id, seq)`, persist's) are the slice path's, unchanged. The plaintext's
+   size and SHA-256 — the descriptor's inputs (`content_digest`, `size`, §6.7.1) — are folded in chunk
+   by chunk; the store's describe step now takes those two, never the plaintext.
+3. **The stream seals after the LAST chunk lands** and the count equals `declared_len`:
+   `seal_stream_scoped` (the manifest, its grants, D9's one access set), then the sealed descriptor over
+   the manifest. Only a sealed stream becomes a pointer; only a pointer becomes a `file:v1` row; the row
+   is authored and crosses (§6.9) after that — **so a row never names a partial file**, and the
+   replicating half of a publish is untouched by this lane.
+
+Peak buffering: the chunk in hand plus persist's copies of the chunk it is sealing (screen, envelope,
+row body) and, at the seal, the manifest — a constant, not the file. Witnessed by a counting global
+allocator (SW1).
+
+**The refusal.** A reader that yields fewer bytes than declared (EOF early) or more (a chunk crossing
+the declaration) is **`FileError::DeclaredLengthMismatch { declared, read }`** (`kind()` =
+`declared_length_mismatch`; the store's `GroupContentError::DeclaredLengthMismatch`). `read` is exact
+for a short reader; a long one is stopped at the first chunk past `declared` — never drained, it may not
+end — so `read` is then a lower bound, `> declared`. A reader I/O error is **`FileError::Read { room,
+read, detail }`** (`kind()` = `read`). Either way: **no manifest, no pointer, no `file:v1` row**, nothing
+crosses.
+
+**What the chunks already written become — deterministic, from persist's code at the pin.** Persist has
+no GC (`federation::blobs`, "Why no GC in v0.1": blobs persist until a door deletes them), no chunk
+announces anything (`put_blob_chunk_scoped` writes no `holds_bytes`; only the seal announces, and
+`invisible_encrypted` never does), and no manifest names them, so nothing would ever pull them — they
+would sit on the author's disk forever. So the store **evicts them before the refusal returns**, through
+persist's one eviction door `Engine::evict_blob` (retract this node's `holds_bytes` for the sha — a
+chunk has none — then delete the blob row with its at-rest grants and epoch binding in one transaction,
+§11.5 I19):
+
+| tier | chunks written before the refusal |
+|---|---|
+| `invisible_encrypted` (self/family), `community_dek` | **evicted**: each is sealed under a fresh DEK / a random nonce, so its ciphertext sha is this write's alone and nothing else can cite it |
+| `plaintext` | **left in place**: the sha is the content's, and may be a chunk another file's manifest names; unreferenced by this write and unannounced |
+
+The same holds when the chunk door or the seal door itself refuses mid-stream. What an eviction does
+not remove, because persist has no door for it: the stream bookkeeping rows (`federation_streams`,
+`federation_stream_chunks` — ids and sizes, no bytes; `stream_chunks` lists nothing once the blobs are
+gone), and the per-chunk `key_grant` sets `put_blob_chunk_scoped` already emitted (§14, "the key follows
+the chunk") — they replicate to the self-collective as wraps of DEKs for ciphertext that exists nowhere
+(SW2 counts them: 36 sets for the 36 chunks of a refused 9 MiB write). The eviction is best-effort by
+construction: the refusal the caller gets is why the write failed, and an eviction failure is logged
+beside it, never substituted for it.
+
+**The manifest bound — the real ceiling of one file today.** Persist stores the sealed manifest inline,
+and `seal_stream_with_scope` refuses a manifest body above the 1 MiB inline cap. A v2 manifest entry is
+`{"seq":N,"sha":"<64 hex>","size":262144}` — about 100 bytes — so at edge's 256 KiB `CHUNK_BYTES` one
+file tops out near **10 400 chunks ≈ 2.5 GiB** (2 GiB = 8 192 chunks ≈ 0.82 MiB of manifest, inside
+it). Above that the stream refuses AT THE SEAL, after every chunk was written (the chunks are then
+evicted, above). §6.7.3's "16 TiB per stream" is `MAX_CHUNKS_PER_EPOCH` × 1 MiB and is not reachable
+through an inline manifest; the next lever is edge's chunk size (1 MiB chunks ≈ 10 GiB), then a
+nested/External manifest in persist.
+
+| # | Invariant | Witness (`tests/file_publish_stream_744.rs`) |
+|---|---|---|
+| SW1 | A 2 GiB self file (`invisible_encrypted`, 8 192 × 256 KiB) published from a generating reader handing out jagged 100 003-byte reads — the file never materialized — seals with the publish's peak live allocation over its baseline < 32 MiB (counting global allocator), the pointer's `content_digest` = the generator's sha256, and `FileRow::chunks()` on the author reads 8 192 items hashing to it | `a_2_gib_self_file_publishes_from_a_reader_holding_a_few_chunks` |
+| SW2 | Declared 10 MiB, yields 9 MiB → `DeclaredLengthMismatch { declared: 10 MiB, read: 9 MiB }` by name; no `file:v1` row, the drive lists nothing new, `federation_blob_bytes` unchanged (the 36 written chunks evicted — the witness goes red with the eviction removed); a long reader (2 → 3 MiB) and both inline-sized cases (short, long) refused the same way | `a_reader_that_does_not_yield_its_declared_length_publishes_nothing_by_name` |
+| SW3 | A 200 KiB (inline) and a 1.3 MiB (DAG) file through `publish` and through `publish_stream` give the same pointer modulo per-write randomness (at-rest sha, `stream_id`, the sealed descriptor's nonce), the same row shape and columns, the same grant split, the same chunk boundaries, and open + describe identically | `publish_and_publish_stream_produce_the_same_row_and_read_the_same` |
+
+**API note.** New: `files::publish_stream`, `files::FileStreamWrite` (+ `::of`), `FileError::{DeclaredLengthMismatch,
+Read}`; `group_content::{StreamSealRequest (+ ::of, ::aad), ContentReader}`,
+`GroupContentStore::seal_chunked_stream` (default: a named `Substrate` refusal),
+`GroupContentError::{DeclaredLengthMismatch, Reader}`. `publish`'s signature and behaviour are unchanged.
+
 ### 6.8 The drive read is a gated query (CIRISPersist#891 — shipped v46.4.0, adopted v30.0.0)
 
 R10 is a query: *this room's file rows, resumable*. Until persist v46.4.0 the only door edge had was
@@ -1026,6 +1238,84 @@ a room with the producer" is a **transitive widening** — a member of any one o
 rows from all of them — and would put the local read door in contradiction with both shipped
 spellings at once.
 
+### 6.10 Delivery receipts — CC 5.3.3.6 for files (CIRISEdge#738, lane 4 of #734)
+
+A chunked file already is a stream (`stream_id`, chunks at `seq`), so a file receipt is CC 5.3.3.6's
+`delivery_receipt:{stream_id}` at the file's stream with **`K` = the stream's `tree_size`** (its
+chunk count): the receiving NODE's hybrid-signed statement that it holds bytes committing to every
+chunk under the named root. Proof of **delivery**, never of consumption; "delivered" is the host's
+verdict. Canonical bytes are persist's `receipt_signing_bytes` (the one spelling); verification is
+the JOIN against a published STH root, which persist's `put_delivery_receipt` performs.
+
+**Publish — the producer publishes the root, and it rides the row.** No persist production path
+publishes a per-stream STH for a chunk-DAG file, so `files::publish` does: after the chunk seal it
+reads the stream's chunk addresses in `seq` order (`stream_chunks`), builds the STH
+(`receipts::stream_sth_for_file` — verify-core's `SignedTreeHead`, root by verify-core's
+`InMemoryTransparencyStore` over persist's `StreamChunkLeaf`, signed by the node's full hybrid) and
+puts it through `put_stream_sth`, whose anti-equivocation gate recomputes the root from the stored
+chunks. The STH is also carried **on the file row** as `stream_sth` (`StreamSthClaim`: `tree_size`,
+hex root, timestamp, producer key, the signature's two halves; public keys are resolved from the
+verifier's own directory). That is the placement decision: after a pull, **what the receiver holds is
+the row and the chunks** — no STH table row arrives on any replication plane — so the claim must be in
+the row, signed under it, at exactly the row's audience. A rename carries the prior row's claim
+(same bytes, same stream, same root). `stream_sth_for_file` mirrors persist v51.4.0's
+`federation::stream_sth::produce_stream_sth(local, stream_id, chunk_shas_in_seq_order, tree_size,
+timestamp)`; on that pin its body becomes that one call.
+
+**Inline files carry no receipt at this pin.** `put_stream_sth` recomputes the root from
+`federation_stream_chunks`, and an inline file is one blob row with no stream rows, so a one-leaf STH
+over it is refused as an over-claimed `tree_size`. Only DAG files (> 1 MiB, §6.7) are receiptable
+until persist has a one-leaf stream door over an inline blob.
+
+**Receive — once, after promote, as the node.** The DAG pull's one hook (`receipts::on_dag_pulled`,
+called at the end of `pull_dag_inner`) acts on `Stored` only: `DagAwaitingKey`, every `DagRefused`
+rung, and a resume still missing chunks emit nothing. The receiver puts the row's STH into **its
+own** store first — persist recomputes the root from the chunks this node just adopted and refuses a
+root they do not reproduce — so the root it signs is one its own bytes commit to. It signs with the
+engine's hybrid signer (the node received the bytes; CC 5.3.3.6 names the subscriber key), stores the
+receipt, and emits it as a `scores` row on `delivery_receipt:{stream_id}:v1` (CC 3.4.6's reserved
+family, resolved by persist's namespace matcher). Exactly once per `(stream, epoch, receiver)`: a
+receipt already held for this node at this epoch emits nothing. The epoch is the pointer's
+sealed-under epoch for a community file, the stream label (0) for self/family.
+
+**Delivery — the room's delivered path, never discovery.** The receipt row is emitted at the file
+row's own cohort with the same cohort target: `self` reaches the owner's devices, `family` the family,
+`community` the room's members. CC 5.2 holds (no `holds_bytes`, no discovery surface at self/family);
+nothing is ever emitted at a commons scope.
+
+**Admit — on the author's node, every refusal named** (`receipts::admit_receipt_row`, run by the
+replication bridge when persist admits a `delivery_receipt:*` row; counted under
+`delivery_receipts`):
+
+| refusal | when |
+|---|---|
+| `receipt_malformed` | not a receipt row, a subscriber other than the row's signer, or a receipt at a cohort other than the file's |
+| `receipt_file_unknown` | the file row it names is not held, or points at another stream |
+| `receipt_signer_not_member` | the signer's principal (its owner) is not in the file's room: the owner for `self`, an active family member, an active community member |
+| `receipt_epoch_mismatch` | the receipt's epoch is not the file's |
+| `receipt_root_unpublished` | no STH is published for the stream here, or the root is not the published one (persist's JOIN names the same) |
+| `receipt_tree_size_short` | `K` > the published `tree_size` |
+| `receipt_duplicate` | this node already receipted this stream at this epoch |
+| `receipt_substrate` | persist refused otherwise (the signature over the pinned key, a read) |
+
+**Read — who received it, and the re-offer.** `FileRow::received_by(store)` lists the receipts the
+author's store holds as `(node, epoch, K, at)`; `at` is `None` at this pin (persist's
+`list_delivery_receipts_for` does not return the `received_at` it stores). A receipt for all
+`tree_size` chunks enters the bridge's `ReceiptLedger`, and the Attestation advertise to a resolved
+peer skips a file row whose stream that peer receipted in full (`re_offer_suppressed_receipted`) —
+the honest half of #679 ask 1, no wire change. The ledger hydrates from the store once per stream,
+so a restart does not resume re-offering. The serve path, the holdings the diff reads, and the
+projection are unchanged: the peer can still fetch the row, it is simply not offered again.
+
+**Witnesses** (`tests/delivery_receipts_738.rs`, real SQLite substrates): self — exactly one receipt
+from the owner's second device after a 1.3 MiB pull, none while the key is pending, none after a
+tampered chunk, admitted through A's bridge, the file row no longer offered to that device, a
+self-invented root and a second receipt refused by name; community — a receipt per member that
+pulled (two), each admitted through A's bridge into its ledger, a non-member's receipt, a wrong
+epoch and a `K` past the tree refused by name; family — written, `#[ignore]`d: at persist `9d406712`
+a family file cannot be published (the content `key_grant` set carries no `family_key_id`, so the
+write gate refuses it, lane 3).
+
 ## 7. Invariants — and the mutant each must kill## 7. Invariants — and the mutant each must kill
 
 1. **No `holds_bytes` for self/family at any audience.** persist I52 stays as written; edge
@@ -1096,6 +1386,7 @@ spellings at once.
 | `blob meaning projected` with `group_id` provenance (`identity` / `family_id` / `community`) | R5 | — |
 | `chat: body opened` / `Body::Unopened { reason }` | R8 | ✓ |
 | ladder stages: `bound`, `sent`, `arrived`, `hamburger` | community | ✓ (server); **`mine_on_b`** for self — |
+| `delivery_receipts` (`emitted` / `not_emitted_{no_sth,sth_refused,failed}` on the receiver; `admitted` and the §6.10 refusals on the author; `re_offer_suppressed_receipted`) | §6.10 | ✓ (CIRISEdge#738; metrics snapshot + PyO3 dict) |
 
 The ladder's merged narrative (CIRISServer#612) already prints R2–R8 for community in time order;
 the self row set adds `mine_on_b` = "a self row written on A opened on B", with the rung named on red.
@@ -1107,7 +1398,7 @@ the self row set adds `mine_on_b` = "a self row written on A opened on B", with 
 | **all** | `ReplicationRuntimeConfig::local_key_id`; `sealed_content: SealedContentWiring { engine, pull_sink, revocations }`; a `BlobChunkSource` with `answers_scope() -> true` if scope-native; `kick()` after publishing | rounds, propagation kicks, key-grant projection, pull on admitted rows, revocation eviction |
 | **community** | the widen (`share(.., With::Community, ..)`); `ScopeLifecycle::install` on `Keyed` with `snapshot_for_nodes`, `advance` on epoch change, `seal_due` on a cadence | holder claim, discovery, swarm pull, serve, adopt, announce |
 | **self / family** | tick `self_room::decide` and perform the action it names (§6.3's table); `self_room::snapshot` → `install` on join, `advance` on every Commit, `refresh_members` (#648) when an occurrence resolves late, `seal_due` on the cadence | the creator rule ITSELF (`decide` is edge's), the implicit send set (persist), author's-nodes fetch, `LocalOnly` adopt, retroactive re-grant (persist) |
-| **files, every cohort** | `files::publish(dir, store, signers, &FileWrite { room, bytes, media_type, filename, asserted_at })` — one call, ≤ 1 MiB until §6.7 | the seal at the room's tier, persist's group slot, the citing row, the cohort target field, and the crossing to the room's audience; every refusal typed (`FileError::{TooLargeForInline, ReadableByNobody, Seal, Author, Cross, Row}`). Read: `files::in_room(engine, &room, caller, limit, after) -> DrivePage` — persist's gated query (§6.8), resumable, `resume: None` meaning the room is exhausted — + `FileRow::open` → bytes or `UnopenedReason` (`NotFetched` = "on another device") |
+| **files, every cohort** | `files::publish(dir, store, signers, &FileWrite { room, bytes, media_type, filename, asserted_at })` — one call, ≤ 1 MiB until §6.7 | the seal at the room's tier, persist's group slot, the citing row, the cohort target field, and the crossing to the room's audience; every refusal typed (`FileError::{TooLargeForInline, ReadableByNobody, Seal, Author, Cross, Row}`). Read: `files::in_room(engine, &room, caller, limit, after) -> DrivePage` — persist's gated query (§6.8), resumable, `resume: None` meaning the room is exhausted — + `FileRow::open` → bytes or `FileError` (`Unopened(NotFetched)` = "on another device"; above 64 MiB `AboveWholeReadCap`, and the file streams through `FileRow::chunks` / `open_range`, §6.7.3) |
 | **commons** | the allowlist (`SenderStanding::Allowlisted`) | everything else |
 | **client** (CIRISServer#615) | create: descriptor + bytes with `size`; read: verify → sniff → policy; enumerate: `GET /v1/drive` over the row plane, cursor `since`, row-held/bytes-absent as a state | — |
 
@@ -1159,6 +1450,21 @@ template: it is green because each rung has a witness, not because a run passed.
 
 ## 13. Changelog
 
+- **2026-09-29 (CIRISEdge#735, lane 2 of #734 — the community chunk DAG, holder to holder).** §6.7
+  gains the `community_dek` row: one `key_grant` set per epoch, the pointer's epoch binds the adopt,
+  B's `holds_bytes` on the DAG root is what C discovers and fetches from, the four negatives by
+  name. Two things the witness proved missing, fixed in `pull.rs`: `NoEpoch` is counted
+  (`no_epoch`), and a RESUMED sealed pull reports `announced` from the claim index instead of
+  denying the claim the first attempt emitted. Judgement recorded: persist announces a sealed DAG at
+  the manifest adopt, ahead of promotion — the plaintext door announces after every chunk — so a
+  manifest-only holder is discoverable; the puller's `NotHeld` walk-on covers it and the door shape
+  is persist's to move (CIRISPersist#951).
+- **2026-09-29 (CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files, §6.10).** `files::publish`
+  publishes a DAG file's STH through persist's gate and carries it on the row; the DAG pull emits one
+  node-signed receipt on promote and delivers it as a `delivery_receipt:{stream_id}:v1` row at the
+  file's cohort; the author admits it with every refusal named; `FileRow::received_by`; the bridge
+  stops re-offering a row a peer receipted in full. Inline files and the family witness wait on
+  persist (§6.10).
 - **2026-09-29 (CIRISEdge#718 — CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132 ruled (a)).** Rung
   **R5′** added: a scoped body rides the members' end-to-end encrypted identity-plane link when the
   only path to the holder runs through a non-member transport node, the room discriminated inside

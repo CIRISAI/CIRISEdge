@@ -56,8 +56,17 @@ runs:
         #   `CIRISPersist.*tag = "v`    → ciris-persist git tag (P)
         #   `CIRISVerify.*tag = "v`     → ciris-verify  git tag (V)
         E=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-        P=$(grep -m1 'CIRISPersist.*tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
-        V=$(grep -m1 'CIRISVerify.*tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/')
+        # A `tag = "vX.Y.Z"` pin names the version directly. A prestage pins
+        # `rev = "<sha>"` instead (the rc-adopt pattern: develop against the
+        # certified commit, flip to the tag once it derefs to that tree); then
+        # the version comes from the resolved entry in Cargo.lock. Under
+        # `pipefail` a non-matching `grep -m1` would fail this step outright and
+        # every lane would read as red before any build ran (CIRISEdge#733).
+        lock_version() { awk -v n="$1" '$0=="name = \""n"\"" {f=1; next} f && /^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.lock; }
+        P=$(grep -m1 'CIRISPersist.*tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/' || true)
+        [ -n "${P}" ] || P=$(lock_version ciris-persist || true)
+        V=$(grep -m1 'CIRISVerify.*tag = "v' Cargo.toml | sed -E 's/.*tag = "v([0-9.]+)".*/\1/' || true)
+        [ -n "${V}" ] || V=$(lock_version ciris-verify-core || true)
         BASE="ciris-substrate-v1-${{ inputs.plat }}-release-rustc${RUSTC}"
         KEY_VERIFY="${BASE}-pnone-enone-v${V:-none}"
         KEY_PERSIST="${BASE}-p${P:-none}-enone-v${V:-none}"

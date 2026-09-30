@@ -980,11 +980,21 @@ pub struct EdgeMetrics {
     pub blob_pull_sources: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#717 — pulls that fetched (or would have fetched) bytes and
     /// refused to STORE them, by reason: `size_mismatch` (a whole blob whose
-    /// length is not the one its pointer implies, CC 5.3.2.5) and
-    /// `stream_pointer_needs_dag_pull` (a chunk-DAG pointer, which the whole
-    /// blob path would otherwise store as its manifest). Nothing is stored on
-    /// either; a non-zero count is a file that is not on this device.
+    /// length is not the one its pointer implies, CC 5.3.2.5) and the DAG
+    /// pull's rungs (`FSD/CONTENT_TRANSFER.md` §6.7): `dag_manifest_mismatch`,
+    /// `dag_total_size_mismatch`, `dag_over_cap`, `dag_chunk_mismatch`,
+    /// `dag_chunk_missing` (`blob_swarm::DagPullRefusal::tag`). Nothing is
+    /// stored on any; a non-zero count is a file that is not on this device.
     pub blob_pull_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files, by tag
+    /// (`receipts`): `emitted` / `not_emitted_*` on the receiving node;
+    /// `admitted` and the named refusals (`receipt_root_unpublished`,
+    /// `receipt_tree_size_short`, `receipt_epoch_mismatch`,
+    /// `receipt_signer_not_member`, `receipt_duplicate`, `receipt_malformed`,
+    /// `receipt_file_unknown`, `receipt_substrate`) on the author's; and
+    /// `re_offer_suppressed_receipted` — a row not re-offered to a peer that
+    /// receipted it in full.
+    pub delivery_receipts: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
     /// the live announce-intake map under **capacity backpressure** (the
     /// `MAX_PEERS` cap in `transport::reticulum`).
@@ -1296,6 +1306,11 @@ impl EdgeMetrics {
             .or_insert(0) += 1;
     }
 
+    /// CIRISEdge#738 — count one delivery-receipt event by its tag.
+    pub fn inc_delivery_receipt(&self, tag: &'static str) {
+        *self.delivery_receipts.write().entry(tag).or_insert(0) += 1;
+    }
+
     /// CIRISEdge#640 — count one blob-route refusal by its branch tag.
     pub fn inc_blob_route_refusal(&self, reason_tag: &'static str) {
         *self
@@ -1600,6 +1615,12 @@ impl EdgeMetrics {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
+            delivery_receipts: self
+                .delivery_receipts
+                .read()
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
             blob_route_refusals: self
                 .blob_route_refusals
                 .read()
@@ -1690,6 +1711,8 @@ pub struct EdgeMetricsBundle {
     pub blob_pull_sources: HashMap<String, u64>,
     /// CIRISEdge#717 — pulls that refused to store, by reason.
     pub blob_pull_refusals: HashMap<String, u64>,
+    /// CIRISEdge#738 — delivery receipts for files, by tag.
+    pub delivery_receipts: HashMap<String, u64>,
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
     /// `unbound` / `not_applicable`). The door never drops.
     pub bootstrap_door_outcomes: HashMap<String, u64>,

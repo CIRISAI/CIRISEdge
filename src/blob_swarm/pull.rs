@@ -251,26 +251,38 @@ pub enum PullOutcome {
     /// not retried: the row, not the holder, is wrong.
     SizeMismatch { declared: u64, received: u64 },
     /// CIRISEdge#717 — the pointer names a **chunk DAG** (`stream_id` is
-    /// present), and this puller moves whole blobs only. A DAG's address is
-    /// its MANIFEST's, so a whole-blob fetch of it brings home ~500 bytes of
-    /// manifest and, stored, that manifest reads back as the file. Refused
-    /// before any request goes out, nothing stored, not retried: the DAG pull
-    /// waits on persist's sealed-DAG adopt door (CIRISPersist#947), and until
-    /// then the honest state on this node is `not_fetched`.
-    StreamPointerNeedsDagPull {
-        /// The pointer's stream.
-        stream_id: String,
-        /// The PLAINTEXT size the pointer declares, if any.
-        declared: Option<u64>,
-    },
+    /// present) and the DAG pull (`FSD/CONTENT_TRANSFER.md` §6.7) refused it
+    /// by name — before the manifest, at the manifest, or at a chunk — and
+    /// left no file that reads wrong. Which rung, and why, is on the
+    /// refusal; each is counted under its own `blob_pull_refusals` tag
+    /// ([`DagPullRefusal::tag`]). Not retried: the row, the manifest or the
+    /// holder is wrong, and none changes by asking again.
+    DagRefused(DagPullRefusal),
+    /// CIRISEdge#717 — a sealed DAG's manifest is held but this node cannot
+    /// open it YET: the `key_grant` that wraps the DAG's DEK to this node
+    /// has not arrived (the key follows the bytes, in either order — persist
+    /// I61/I62). Queued for retry; the manifest stays held and the retry
+    /// resumes from it.
+    DagAwaitingKey { attempts: u32, retrying: bool },
 }
 
 /// A `CommunityDek` pointer with no sealed-under epoch cannot be adopted,
-/// so it is not worth a fetch (CIRISEdge#601).
-fn epoch_refusal(row: &Attestation, blob_hex: &str, meaning: &BlobMeaning) -> Option<PullOutcome> {
+/// so it is not worth a fetch (CIRISEdge#601). Counted under
+/// [`PULL_REFUSAL_NO_EPOCH`] like every other named refusal (CIRISEdge#735):
+/// before, the only community-tier refusal the pull could reach was the one
+/// it did not count.
+fn epoch_refusal(
+    row: &Attestation,
+    blob_hex: &str,
+    meaning: &BlobMeaning,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+) -> Option<PullOutcome> {
     let pointer = meaning.pointer()?;
     if pointer.tier != CryptoTier::CommunityDek || pointer.epoch.is_some() {
         return None;
+    }
+    if let Some(m) = metrics {
+        m.inc_blob_pull_refusal(PULL_REFUSAL_NO_EPOCH);
     }
     tracing::warn!(
         blob = %blob_hex,
@@ -284,36 +296,418 @@ fn epoch_refusal(row: &Attestation, blob_hex: &str, meaning: &BlobMeaning) -> Op
 
 /// The `blob_pull_refusals` tag for [`PullOutcome::SizeMismatch`].
 pub const PULL_REFUSAL_SIZE_MISMATCH: &str = "size_mismatch";
-/// The `blob_pull_refusals` tag for [`PullOutcome::StreamPointerNeedsDagPull`].
-pub const PULL_REFUSAL_STREAM_POINTER_NEEDS_DAG_PULL: &str = "stream_pointer_needs_dag_pull";
+/// The `blob_pull_refusals` tag for [`PullOutcome::NoEpoch`] (CIRISEdge#601 /
+/// #735): a `community_dek` pointer naming no sealed-under epoch.
+pub const PULL_REFUSAL_NO_EPOCH: &str = "no_epoch";
+/// The `blob_pull_refusals` tag for [`DagPullRefusal::ManifestMismatch`].
+pub const PULL_REFUSAL_DAG_MANIFEST_MISMATCH: &str = "dag_manifest_mismatch";
+/// The `blob_pull_refusals` tag for [`DagPullRefusal::TotalSizeMismatch`].
+pub const PULL_REFUSAL_DAG_TOTAL_SIZE_MISMATCH: &str = "dag_total_size_mismatch";
+/// The `blob_pull_refusals` tag for [`DagPullRefusal::OverCap`].
+pub const PULL_REFUSAL_DAG_OVER_CAP: &str = "dag_over_cap";
+/// The `blob_pull_refusals` tag for [`DagPullRefusal::ChunkMismatch`].
+pub const PULL_REFUSAL_DAG_CHUNK_MISMATCH: &str = "dag_chunk_mismatch";
+/// The `blob_pull_refusals` tag for [`DagPullRefusal::ChunkMissing`].
+pub const PULL_REFUSAL_DAG_CHUNK_MISSING: &str = "dag_chunk_missing";
 
-/// CIRISEdge#717 — a pointer this puller must not whole-pull: one naming a
-/// chunk DAG. `None` for every other reference (a whole-blob pointer, an
-/// `evidence_refs` citation).
-fn stream_refusal(
-    row: &Attestation,
-    blob_hex: &str,
-    meaning: &BlobMeaning,
-    metrics: Option<&crate::observability::EdgeMetrics>,
-) -> Option<PullOutcome> {
-    let pointer = meaning.pointer()?;
-    let stream_id = pointer.stream_id.clone()?;
-    if let Some(m) = metrics {
-        m.inc_blob_pull_refusal(PULL_REFUSAL_STREAM_POINTER_NEEDS_DAG_PULL);
+/// CIRISEdge#717 — **why a chunk-DAG pull stopped**, by rung
+/// (`FSD/CONTENT_TRANSFER.md` §6.7, the pull state table). Every arm is a
+/// named state a test asserts and a `blob_pull_refusals` tag counts
+/// ([`Self::tag`]). None is retried: the row, the manifest or the holder is
+/// wrong, and asking again gets the same answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DagPullRefusal {
+    /// The bytes at the pointer's address are not the manifest the pointer
+    /// describes: they do not hash to it, do not parse as a chunk manifest
+    /// (persist names which — a sealed whole blob, a v1 manifest, a plaintext
+    /// row), are not canonical, name a stream other than the pointer's, or
+    /// are incoherent (chunk sizes that do not sum to `total_size`, a
+    /// repeated `seq`, no chunks). `detail` is the finding.
+    ManifestMismatch {
+        /// What was found.
+        detail: String,
+    },
+    /// The manifest's `total_size` is not the size the pointer declares
+    /// (CC 5.3.2.5: a declared size is checked, never trusted). Compared to
+    /// the PLAINTEXT total the manifest names — never to the row's
+    /// `size_bytes`, which stays the manifest envelope's length after
+    /// promotion (CIRISPersist#947).
+    TotalSizeMismatch {
+        /// The pointer's `size`.
+        declared: u64,
+        /// The manifest's `total_size`.
+        manifest: u64,
+    },
+    /// The manifest asks for more than this node will do. `what` names the
+    /// axis — `chunk_count`, `chunk_size` (the STORED body: the envelope at a
+    /// sealed tier), `total_size` — `value` what it asked and `cap` the
+    /// bound: persist's own caps, read off the opened view at a sealed tier
+    /// and its constants at plaintext, decided BEFORE any chunk is fetched so
+    /// a hostile manifest cannot make this node fetch or allocate unboundedly.
+    OverCap {
+        /// The axis.
+        what: &'static str,
+        /// What the manifest asked.
+        value: u64,
+        /// The bound.
+        cap: u64,
+    },
+    /// A fetched chunk is not the one the manifest names at `seq`: it does
+    /// not hash to the manifest's sha, or its length is not the one its
+    /// declared size implies. Nothing of it is stored.
+    ChunkMismatch {
+        /// The chunk's position.
+        seq: u64,
+        /// What was found.
+        detail: String,
+    },
+    /// Persist's promotion refused: a chunk the manifest names is not held
+    /// as named, and `detail` (persist's own message) names the first
+    /// missing `(seq, sha)`. Reached only if an adopt did not land what it
+    /// said it did — the puller's own walk adopts every chunk first.
+    ChunkMissing {
+        /// Persist's finding.
+        detail: String,
+    },
+}
+
+impl DagPullRefusal {
+    /// The `blob_pull_refusals` tag this refusal is counted under.
+    #[must_use]
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::ManifestMismatch { .. } => PULL_REFUSAL_DAG_MANIFEST_MISMATCH,
+            Self::TotalSizeMismatch { .. } => PULL_REFUSAL_DAG_TOTAL_SIZE_MISMATCH,
+            Self::OverCap { .. } => PULL_REFUSAL_DAG_OVER_CAP,
+            Self::ChunkMismatch { .. } => PULL_REFUSAL_DAG_CHUNK_MISMATCH,
+            Self::ChunkMissing { .. } => PULL_REFUSAL_DAG_CHUNK_MISSING,
+        }
     }
-    tracing::warn!(
-        blob = %blob_hex,
-        attestation_id = %row.attestation_id,
-        stream_id = %stream_id,
-        declared = ?pointer.size,
-        "pull refused: the pointer names a chunk DAG, and the whole-blob pull would store its \
-         MANIFEST as the file — nothing fetched, nothing stored, until the DAG pull lands \
-         (CIRISEdge#717, CIRISPersist#947)"
-    );
-    Some(PullOutcome::StreamPointerNeedsDagPull {
-        stream_id,
-        declared: pointer.size,
-    })
+}
+
+/// CIRISEdge#717 — **the manifest as the puller sees it, before a chunk
+/// moves**: the shape [`check_dag_plan`] bounds, at either tier — built from
+/// the view persist opened (sealed, [`Self::from_sealed_view`]) or the clear
+/// manifest the puller parsed (plaintext, [`Self::from_clear_manifest`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DagPlan {
+    /// The stream the manifest names. `None` for a v1 (plaintext) manifest,
+    /// which names none.
+    pub stream_id: Option<String>,
+    /// The file's PLAINTEXT size, as the manifest states it.
+    pub total_size: u64,
+    /// `(seq, plaintext size)` per chunk, in manifest order.
+    pub chunks: Vec<(u64, u64)>,
+    /// Persist's per-chunk inline cap: the STORED body must fit it.
+    pub inline_bytes_cap: u64,
+    /// **The bytes this walk holds in memory at once, when it holds them
+    /// all** (CIRISEdge#737). `Some` for a PLAINTEXT plan: persist's one-shot
+    /// `put_blob_chunks_signing` takes every chunk together, so the walk
+    /// buffers the whole DAG and bounds it by persist's whole-read constant.
+    /// `None` for a sealed plan: each chunk is adopted at `(stream_id, seq)`
+    /// as it arrives, so the pull is chunk-wise and its only size ceiling is
+    /// the STORAGE bound (rule 4). The whole-read cap governs READS, not
+    /// pulls (`FSD/CONTENT_TRANSFER.md` §6.7.3).
+    pub in_memory_cap_bytes: Option<u64>,
+    /// Persist's chunk-count cap.
+    pub max_chunks: u64,
+    /// Bytes persist adds to each chunk's stored body at this tier —
+    /// `AT_REST_ENVELOPE_OVERHEAD` sealed, 0 at plaintext.
+    pub per_chunk_overhead: u64,
+}
+
+impl DagPlan {
+    /// The plan of a SEALED manifest persist opened for this node
+    /// (`Engine::open_sealed_manifest_as`): the three caps are the view's.
+    #[must_use]
+    pub fn from_sealed_view(
+        view: &ciris_persist::federation::chunk_dag_cascade::orchestrate::SealedManifestView,
+    ) -> Self {
+        Self {
+            stream_id: Some(view.stream_id.clone()),
+            total_size: view.total_size,
+            chunks: view
+                .chunks
+                .iter()
+                .map(|c| (c.seq, u64::from(c.size)))
+                .collect(),
+            inline_bytes_cap: view.inline_bytes_cap,
+            in_memory_cap_bytes: None,
+            max_chunks: view.max_chunks,
+            per_chunk_overhead:
+                ciris_persist::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD as u64,
+        }
+    }
+
+    /// The plan of a CLEAR manifest (a plaintext DAG, [`parse_clear_manifest`]):
+    /// the caps are persist's constants, and `inline_bytes_cap` is this
+    /// node's. A v1 manifest positions no chunk, so `seq` is the index.
+    #[must_use]
+    pub fn from_clear_manifest(
+        manifest: &ciris_persist::federation::ChunkManifest,
+        inline_bytes_cap: u64,
+    ) -> Self {
+        Self {
+            stream_id: manifest.stream_id.clone(),
+            total_size: manifest.total_size,
+            chunks: manifest
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.seq.unwrap_or(i as u64), u64::from(c.size)))
+                .collect(),
+            inline_bytes_cap,
+            in_memory_cap_bytes: Some(
+                ciris_persist::federation::chunk_dag_cascade::DAG_WHOLE_READ_CAP_BYTES,
+            ),
+            max_chunks: ciris_persist::federation::blobs::MAX_CHUNKS_PER_EPOCH,
+            per_chunk_overhead: 0,
+        }
+    }
+}
+
+/// **The bounds, decided before a chunk moves** (CIRISEdge#717,
+/// `FSD/CONTENT_TRANSFER.md` §6.7 — the `verified` rung). In order:
+///
+/// 1. the manifest names the POINTER's stream (a v1 manifest names none);
+/// 2. `total_size` is the size the pointer declares (when it declares one:
+///    a pre-#698 pointer declares nothing to check, as `declared_stored_len`);
+/// 3. the chunk count is within `max_chunks` and is not zero;
+/// 4. every chunk's STORED body (`size + per_chunk_overhead`) fits the inline
+///    cap — the bound persist's adopt applies, applied here before the fetch;
+/// 5. `total_size` is within what the chunk list can legally hold —
+///    `chunk_count × (inline cap − per-chunk overhead)` — the STORAGE bound
+///    (CIRISEdge#737; after rule 4 so an over-full chunk is named as such,
+///    before rule 6 so an inflated total over well-sized chunks is named as
+///    this; with rule 6 the bound is exact). A plaintext plan is also within
+///    [`DagPlan::in_memory_cap_bytes`], the whole DAG being held until
+///    persist's one-shot door takes it;
+/// 6. the chunk sizes sum to `total_size` and no `seq` repeats.
+///
+/// Pure, so the rule is tested on the exact shapes `files::publish` produces.
+///
+/// # Errors
+/// The first [`DagPullRefusal`] that applies.
+pub fn check_dag_plan(
+    pointer_stream_id: &str,
+    declared: Option<u64>,
+    plan: &DagPlan,
+) -> Result<(), DagPullRefusal> {
+    if let Some(named) = plan.stream_id.as_deref() {
+        if named != pointer_stream_id {
+            return Err(DagPullRefusal::ManifestMismatch {
+                detail: format!(
+                    "the manifest names stream {named:?} but the pointer names {pointer_stream_id:?}"
+                ),
+            });
+        }
+    }
+    if let Some(declared) = declared {
+        if declared != plan.total_size {
+            return Err(DagPullRefusal::TotalSizeMismatch {
+                declared,
+                manifest: plan.total_size,
+            });
+        }
+    }
+    let count = plan.chunks.len() as u64;
+    if count == 0 {
+        return Err(DagPullRefusal::ManifestMismatch {
+            detail: "a manifest over no chunks is content that opens to nothing".into(),
+        });
+    }
+    if count > plan.max_chunks {
+        return Err(DagPullRefusal::OverCap {
+            what: "chunk_count",
+            value: count,
+            cap: plan.max_chunks,
+        });
+    }
+    for (_, size) in &plan.chunks {
+        let stored = size.saturating_add(plan.per_chunk_overhead);
+        if stored > plan.inline_bytes_cap {
+            return Err(DagPullRefusal::OverCap {
+                what: "chunk_size",
+                value: stored,
+                cap: plan.inline_bytes_cap,
+            });
+        }
+    }
+    // CIRISEdge#737 — the pull is chunk-wise; its ceiling is what the
+    // manifest can hold, not what a whole READ may materialize.
+    let per_chunk_max = plan
+        .inline_bytes_cap
+        .saturating_sub(plan.per_chunk_overhead);
+    let storage_bound = count.saturating_mul(per_chunk_max);
+    if plan.total_size > storage_bound {
+        return Err(DagPullRefusal::OverCap {
+            what: "total_size_vs_chunks",
+            value: plan.total_size,
+            cap: storage_bound,
+        });
+    }
+    if let Some(in_memory) = plan.in_memory_cap_bytes {
+        if plan.total_size > in_memory {
+            return Err(DagPullRefusal::OverCap {
+                what: "total_size_in_memory",
+                value: plan.total_size,
+                cap: in_memory,
+            });
+        }
+    }
+    let mut sum: u64 = 0;
+    let mut seen = HashSet::with_capacity(plan.chunks.len());
+    for (seq, size) in &plan.chunks {
+        sum = sum.saturating_add(*size);
+        if !seen.insert(*seq) {
+            return Err(DagPullRefusal::ManifestMismatch {
+                detail: format!("chunk seq {seq} appears twice in the manifest"),
+            });
+        }
+    }
+    if sum != plan.total_size {
+        return Err(DagPullRefusal::ManifestMismatch {
+            detail: format!(
+                "the chunk sizes sum to {sum} but the manifest says total_size {}",
+                plan.total_size
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// **A clear chunk manifest, read off the wire shape persist writes**
+/// (`ChunkManifest::to_jcs_bytes`: `sha` as lowercase hex, keys sorted) —
+/// the bytes a holder serves at a plaintext DAG's address. Persist's own
+/// reader is crate-private, so the puller reads the same shape and PROVES
+/// the reading by re-canonicalizing: the JCS of what it read must be the
+/// bytes it was given, or the manifest is refused. A parse the puller cannot
+/// round-trip is one it did not understand, whatever hashed.
+///
+/// # Errors
+/// The finding, for [`DagPullRefusal::ManifestMismatch`].
+pub fn parse_clear_manifest(
+    bytes: &[u8],
+) -> Result<ciris_persist::federation::ChunkManifest, String> {
+    use ciris_persist::federation::{ChunkManifest, ChunkRef};
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ChunkRefWire {
+        sha: String,
+        size: u32,
+        #[serde(default)]
+        seq: Option<u64>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ManifestWire {
+        v: u32,
+        total_size: u64,
+        chunks: Vec<ChunkRefWire>,
+        #[serde(default)]
+        chunk_tier: Option<String>,
+        #[serde(default)]
+        stream_id: Option<String>,
+    }
+    let wire: ManifestWire =
+        serde_json::from_slice(bytes).map_err(|e| format!("not a chunk manifest: {e}"))?;
+    let chunk_tier = match wire.chunk_tier.as_deref() {
+        None => None,
+        Some(s) => Some(
+            [
+                CryptoTier::Plaintext,
+                CryptoTier::InvisibleEncrypted,
+                CryptoTier::CommunityDek,
+            ]
+            .into_iter()
+            .find(|t| t.as_str() == s)
+            .ok_or_else(|| format!("unknown chunk_tier {s:?}"))?,
+        ),
+    };
+    let mut chunks = Vec::with_capacity(wire.chunks.len());
+    for (i, c) in wire.chunks.into_iter().enumerate() {
+        let mut sha = [0u8; 32];
+        hex::decode_to_slice(&c.sha, &mut sha)
+            .map_err(|e| format!("chunk [{i}] sha is not 32 hex bytes: {e}"))?;
+        chunks.push(ChunkRef {
+            sha,
+            size: c.size,
+            seq: c.seq,
+        });
+    }
+    let manifest = ChunkManifest {
+        v: wire.v,
+        total_size: wire.total_size,
+        chunks,
+        chunk_tier,
+        stream_id: wire.stream_id,
+    };
+    if manifest.to_jcs_bytes() != bytes {
+        return Err(
+            "the manifest is not persist's canonical (JCS) encoding — the puller's reading of \
+             it cannot be trusted"
+                .into(),
+        );
+    }
+    Ok(manifest)
+}
+
+/// CIRISEdge#717 — **where a DAG pull's bytes come from**, one address at a
+/// time. Production is the swarm: [`BlobPuller::pull_one`] builds one over
+/// the holders persist knows. A deployment with its own transport, or a
+/// witness at the store level, hands [`BlobPuller::pull_dag_with`] its own.
+///
+/// A fetcher cannot inject bytes, only fail to produce them: the puller
+/// verifies every body it receives against the address it asked for, and
+/// the store gate (axis 1, trust) is asked of every holder the fetcher
+/// names before the first fetch — whoever fetches, the gate runs.
+#[async_trait::async_trait]
+pub trait DagByteFetch: Send + Sync {
+    /// The holders this fetcher draws from — the store gate's axis 1 is
+    /// asked of every one of them before the first fetch.
+    fn holders(&self) -> &[String];
+    /// The bytes at `sha`, or why not. An `Err` ends the pull as
+    /// [`PullOutcome::FetchFailed`] (retried; a sealed pull resumes from
+    /// whatever it adopted before the failure).
+    async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String>;
+}
+
+/// The production [`DagByteFetch`]: one swarm session over the pull's
+/// holders, the store gate armed, one whole-blob fetch per address (a chunk
+/// is its own content-addressed row on the holder, served by
+/// `PersistBlobChunkSource` exactly as a whole blob is).
+struct SwarmFetch {
+    scheduler: SwarmScheduler,
+    holders: Vec<String>,
+    meaning: BlobMeaning,
+}
+
+#[async_trait::async_trait]
+impl DagByteFetch for SwarmFetch {
+    fn holders(&self) -> &[String] {
+        &self.holders
+    }
+
+    async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String> {
+        self.scheduler
+            .fetch_blob_scoped_with_disposition(
+                sha,
+                ChunkManifestLite::whole_blob(sha),
+                self.holders.clone(),
+                Some(self.meaning.clone()),
+            )
+            .await
+            .map(|(bytes, _)| bytes)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Why one address did not arrive verified.
+enum DagFetchStop {
+    /// The fetcher could not produce it (transport, timeout, no holder).
+    Transport(String),
+    /// It arrived, but does not hash to the address asked for.
+    HashMismatch { got: [u8; 32] },
 }
 
 /// The declared-size check (CIRISEdge#638 item 2): the hash already matched,
@@ -347,10 +741,11 @@ fn size_refusal(
 /// **The stored length a pointer's declared `size` implies** (CIRISEdge#638
 /// item 2) — `None` when the row declares none (pre-#698) or the pointer is
 /// a chunk DAG: its address is the manifest's, whose length no pointer
-/// declares, and the puller refuses a DAG pointer by name before fetching
-/// (CIRISEdge#717, [`PullOutcome::StreamPointerNeedsDagPull`]). A sealed tier stores the plaintext
-/// inside an `AtRestEnvelope`, so the fetched body is `size` plus persist's
-/// own exported overhead — the same arithmetic `files::must_chunk` uses.
+/// declares; the DAG pull compares `size` to the manifest's `total_size`
+/// instead (CIRISEdge#717, [`check_dag_plan`]). A sealed tier stores the
+/// plaintext inside an `AtRestEnvelope`, so the fetched body is `size` plus
+/// persist's own exported overhead — the same arithmetic `files::must_chunk`
+/// uses.
 #[must_use]
 pub fn declared_stored_len(pointer: &crate::group_content::BlobPointer) -> Option<u64> {
     if pointer.stream_id.is_some() {
@@ -733,64 +1128,51 @@ where
     async fn pull_one_inner(&self, row: &Attestation, sha: [u8; 32], attempts: u32) -> PullOutcome {
         let blob_hex = hex::encode(sha);
 
-        // Idempotent: held is held.
-        match self.backend.has_blob(&sha).await {
-            Ok(true) => return PullOutcome::AlreadyHeld,
-            Ok(false) => {}
+        // Idempotent: held is held — with one exception (CIRISEdge#717). A
+        // sealed DAG's manifest adopted by an earlier attempt and not yet
+        // promoted is held `inline` at a sealed tier; under a stream pointer
+        // that is a pull to RESUME, not a file to skip. Decided once the
+        // pointer is read.
+        let held = match self.backend.has_blob(&sha).await {
+            Ok(h) => h,
             Err(e) => return PullOutcome::StoreFailed(format!("has_blob: {e}")),
+        };
+        if held {
+            match self.backend.blob_head(&sha).await {
+                Ok(Some(h))
+                    if h.storage_kind == "inline" && h.crypto_tier != CryptoTier::Plaintext => {}
+                Ok(_) => return PullOutcome::AlreadyHeld,
+                Err(e) => return PullOutcome::StoreFailed(format!("blob_head: {e}")),
+            }
         }
 
         // TRUST — what the signed row says these bytes are.
-        // CIRISEdge#646 / `FSD/CONTENT_TRANSFER.md` §6.2 — for a self or
-        // family row the author's identity is the self room's id and the
-        // author's NODES are the holders, so the one directory walk
-        // (`contact::resolve`: key → person → their nodes, CC 4.4.3.2.4.1(b))
-        // is done up front and feeds both the projector and the source rule.
-        // Community and commons rows never need it.
-        let author = self.resolve_author(row).await;
-        let author_identity = author
-            .as_ref()
-            .and_then(|r| r.as_ref().ok())
-            .map(|subject| subject.fed_id.clone());
-        let meaning = match BlobMeaning::project_with(row, &sha, author_identity.as_deref()) {
+        let (meaning, author) = match self.project(row, sha, attempts).await {
             Ok(m) => m,
-            // A self/family row's group id can come from the author's
-            // identity, so "no group" while the author is still converging is
-            // a WAIT, not a refusal — refusing it terminally leaves the blob
-            // unfetched forever after convergence, since nothing re-applies
-            // the row (CIRISEdge#646 review).
-            Err(MeaningRefusal::GroupWithoutId { .. })
-                if author
-                    .as_ref()
-                    .and_then(|r| r.as_ref().err())
-                    .is_some_and(crate::contact::LadderStall::is_self_resolving) =>
-            {
-                let retrying = self.book_retry(row, sha, attempts);
-                tracing::debug!(
-                    blob = %blob_hex,
-                    author = %row.attesting_key_id,
-                    retrying,
-                    "self/family pull: the row's group id waits on the author's directory \
-                     records, which are still converging (CIRISEdge#646)"
-                );
-                return PullOutcome::AuthorUnresolved { attempts, retrying };
-            }
-            Err(r) => return PullOutcome::NoMeaning(r),
+            Err(outcome) => return outcome,
         };
+        let is_dag = meaning.pointer().is_some_and(|p| p.stream_id.is_some());
+        if held && !is_dag {
+            return PullOutcome::AlreadyHeld;
+        }
 
         // The binding the adopt door will need, decided BEFORE any request:
         // a row that cannot be adopted is not worth a fetch.
         let tier = meaning.pointer().map_or(CryptoTier::Plaintext, |p| p.tier);
-        if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning) {
+        if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning, Some(&self.edge.metrics())) {
             return refused;
         }
 
-        // CIRISEdge#717 — a chunk DAG is not a whole blob: refused before
-        // the holder walk and the fetch, which would store its manifest.
-        let metrics = self.edge.metrics();
-        if let Some(refused) = stream_refusal(row, &blob_hex, &meaning, Some(&metrics)) {
-            return refused;
+        // CIRISEdge#717 — a chunk DAG is not a whole blob: its address is its
+        // MANIFEST's, and a whole-blob fetch of it would store the manifest
+        // as the file. It has its own walk (`FSD/CONTENT_TRANSFER.md` §6.7),
+        // through the same holder rung and the same gate.
+        if is_dag {
+            return self
+                .pull_dag(row, sha, attempts, &meaning, author.as_ref())
+                .await;
         }
+        let metrics = self.edge.metrics();
 
         // Who has it — persist's holder plane, minus ourselves.
         let holders = match self
@@ -854,6 +1236,646 @@ where
                 self.adopt_sealed(row, sha, &meaning, tier, &bytes, disposition)
                     .await
             }
+        }
+    }
+
+    /// TRUST — what the signed row says these bytes are, with the author
+    /// walk a self/family row needs (CIRISEdge#646). `Err` carries the
+    /// outcome to return: a refusal, or a wait on the directory.
+    async fn project(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        attempts: u32,
+    ) -> Result<
+        (
+            BlobMeaning,
+            Option<Result<crate::contact::Subject, crate::contact::LadderStall>>,
+        ),
+        PullOutcome,
+    > {
+        let blob_hex = hex::encode(sha);
+        // CIRISEdge#646 / `FSD/CONTENT_TRANSFER.md` §6.2 — for a self or
+        // family row the author's identity is the self room's id and the
+        // author's NODES are the holders, so the one directory walk
+        // (`contact::resolve`: key → person → their nodes, CC 4.4.3.2.4.1(b))
+        // is done up front and feeds both the projector and the source rule.
+        // Community and commons rows never need it.
+        let author = self.resolve_author(row).await;
+        let author_identity = author
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .map(|subject| subject.fed_id.clone());
+        match BlobMeaning::project_with(row, &sha, author_identity.as_deref()) {
+            Ok(m) => Ok((m, author)),
+            // A self/family row's group id can come from the author's
+            // identity, so "no group" while the author is still converging is
+            // a WAIT, not a refusal — refusing it terminally leaves the blob
+            // unfetched forever after convergence, since nothing re-applies
+            // the row (CIRISEdge#646 review).
+            Err(MeaningRefusal::GroupWithoutId { .. })
+                if author
+                    .as_ref()
+                    .and_then(|r| r.as_ref().err())
+                    .is_some_and(crate::contact::LadderStall::is_self_resolving) =>
+            {
+                let retrying = self.book_retry(row, sha, attempts);
+                tracing::debug!(
+                    blob = %blob_hex,
+                    author = %row.attesting_key_id,
+                    retrying,
+                    "self/family pull: the row's group id waits on the author's directory \
+                     records, which are still converging (CIRISEdge#646)"
+                );
+                Err(PullOutcome::AuthorUnresolved { attempts, retrying })
+            }
+            Err(r) => Err(PullOutcome::NoMeaning(r)),
+        }
+    }
+
+    /// CIRISEdge#717 — **the chunk-DAG pull, over the swarm**: the holder walk
+    /// and the store gate exactly as a whole blob's, then
+    /// [`Self::pull_dag_with`]'s walk with one swarm session as the fetcher.
+    async fn pull_dag(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        attempts: u32,
+        meaning: &BlobMeaning,
+        author: Option<&Result<crate::contact::Subject, crate::contact::LadderStall>>,
+    ) -> PullOutcome {
+        let holders = match self.holders_for(row, sha, attempts, meaning, author).await {
+            Ok(h) => h,
+            Err(outcome) => return outcome,
+        };
+        if holders.is_empty() {
+            let retrying = self.book_retry(row, sha, attempts);
+            return PullOutcome::NoHolders { attempts, retrying };
+        }
+        let fetch = SwarmFetch {
+            scheduler: SwarmScheduler::new(
+                Arc::clone(&self.edge),
+                Arc::new(HashOnlyVerifier),
+                self.config.swarm.clone(),
+            )
+            .with_store_policy(Arc::clone(&self.policy)),
+            holders,
+            meaning: meaning.clone(),
+        };
+        self.pull_dag_inner(row, sha, attempts, meaning, &fetch)
+            .await
+    }
+
+    /// **The chunk-DAG pull with a caller's fetcher** (CIRISEdge#717,
+    /// `FSD/CONTENT_TRANSFER.md` §6.7): the same walk [`Self::pull_one`]
+    /// runs for a pointer carrying `stream_id` — trust (the row's meaning),
+    /// may (the store gate, asked of `fetch`'s holders), then manifest →
+    /// verified → chunks → promoted — with `fetch` producing the bytes
+    /// instead of the swarm. For a deployment whose transport is not the
+    /// swarm's, and for the store-level witness. Every body `fetch` returns
+    /// is verified against the address asked for; a fetcher can fail the
+    /// pull, never feed it.
+    ///
+    /// A pointer without `stream_id` is [`Self::pull_one`]'s and is refused
+    /// here by name. Dedupes on `sha` against every other pull, as
+    /// `pull_one` does.
+    pub async fn pull_dag_with(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        fetch: &dyn DagByteFetch,
+    ) -> PullOutcome {
+        {
+            let Ok(mut set) = self.in_flight.lock() else {
+                return PullOutcome::InFlight;
+            };
+            if !set.insert(sha) {
+                return PullOutcome::InFlight;
+            }
+        }
+        let outcome = async {
+            let (meaning, _author) = match self.project(row, sha, 0).await {
+                Ok(m) => m,
+                Err(outcome) => return outcome,
+            };
+            if meaning
+                .pointer()
+                .and_then(|p| p.stream_id.as_deref())
+                .is_none()
+            {
+                return PullOutcome::Refused(
+                    "pull_dag_with: the pointer names no stream_id — a whole blob is \
+                     pull_one's (CIRISEdge#717)"
+                        .into(),
+                );
+            }
+            self.pull_dag_inner(row, sha, 0, &meaning, fetch).await
+        }
+        .await;
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.remove(&sha);
+        }
+        outcome
+    }
+
+    /// The DAG walk proper, tier-dispatched, after the gate.
+    async fn pull_dag_inner(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        attempts: u32,
+        meaning: &BlobMeaning,
+        fetch: &dyn DagByteFetch,
+    ) -> PullOutcome {
+        let blob_hex = hex::encode(sha);
+        let Some(pointer) = meaning.pointer() else {
+            return PullOutcome::Refused("a DAG is named only by a typed pointer".into());
+        };
+        let Some(stream_id) = pointer.stream_id.as_deref() else {
+            return PullOutcome::Refused("the pointer names no stream_id".into());
+        };
+        if let Some(refused) = epoch_refusal(row, &blob_hex, meaning, Some(&self.edge.metrics())) {
+            return refused;
+        }
+        // MAY — the gate, asked of the FETCHER's holders before a byte moves
+        // (CIRISEdge#581). The swarm asks it again inside each fetch; a
+        // caller's fetcher gets no way round it.
+        let disposition = match super::store_admission_with(
+            self.policy.as_ref(),
+            sha,
+            Some(meaning),
+            fetch.holders(),
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(SwarmError::StoreRefused { refusal, axis, .. }) => {
+                return PullOutcome::Refused(format!("axis {axis}: {refusal:?}"));
+            }
+            Err(e) => return PullOutcome::Refused(e.to_string()),
+        };
+        let outcome = match pointer.tier {
+            CryptoTier::Plaintext => {
+                self.pull_plaintext_dag(row, sha, attempts, meaning, stream_id, disposition, fetch)
+                    .await
+            }
+            CryptoTier::CommunityDek | CryptoTier::InvisibleEncrypted => {
+                self.pull_sealed_dag(row, sha, attempts, meaning, stream_id, disposition, fetch)
+                    .await
+            }
+        };
+        // CIRISEdge#738 — the one receipt hook: acts on `Stored` only.
+        crate::receipts::on_dag_pulled(
+            &self.engine,
+            &*self.backend,
+            &self.local_key_id,
+            row,
+            &outcome,
+            &self.edge.metrics(),
+        )
+        .await;
+        outcome
+    }
+
+    /// One address through the fetcher, verified against it here — whoever
+    /// fetched. Content addressing is the puller's belt, not the fetcher's.
+    async fn fetch_verified(
+        &self,
+        fetch: &dyn DagByteFetch,
+        sha: [u8; 32],
+    ) -> Result<Vec<u8>, DagFetchStop> {
+        use sha2::{Digest as _, Sha256};
+        let bytes = fetch.fetch(sha).await.map_err(DagFetchStop::Transport)?;
+        let got: [u8; 32] = Sha256::digest(&bytes).into();
+        if got != sha {
+            return Err(DagFetchStop::HashMismatch { got });
+        }
+        Ok(bytes)
+    }
+
+    /// A named DAG refusal: counted under its tag, logged with the row.
+    fn dag_refused(
+        &self,
+        row: &Attestation,
+        blob_hex: &str,
+        refusal: DagPullRefusal,
+    ) -> PullOutcome {
+        self.edge.metrics().inc_blob_pull_refusal(refusal.tag());
+        tracing::warn!(
+            blob = %blob_hex,
+            attestation_id = %row.attestation_id,
+            refusal = ?refusal,
+            "DAG pull refused (CIRISEdge#717, FSD/CONTENT_TRANSFER.md §6.7)"
+        );
+        PullOutcome::DagRefused(refusal)
+    }
+
+    /// A fetch that did not arrive: booked for retry, named.
+    fn dag_fetch_failed(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        attempts: u32,
+        what: &str,
+        reason: &str,
+    ) -> PullOutcome {
+        let retrying = self.book_retry(row, sha, attempts);
+        PullOutcome::FetchFailed {
+            reason: format!("{what}: {reason}"),
+            retrying,
+        }
+    }
+
+    /// **A sealed DAG** (`InvisibleEncrypted` / `CommunityDek`), persist's
+    /// #947 order: adopt the manifest as received (an inline envelope, never
+    /// opened here) → open it as this node → bound the work → adopt each
+    /// chunk at `(stream_id, seq)` → promote. Resumable: a manifest held from
+    /// an earlier attempt is not re-fetched, and chunks already held at their
+    /// position with the manifest's sha are skipped, so a retry finishes
+    /// what the last attempt started.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the walk's rungs, in order, in one place on purpose
+    async fn pull_sealed_dag(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        attempts: u32,
+        meaning: &BlobMeaning,
+        stream_id: &str,
+        disposition: StoreDisposition,
+        fetch: &dyn DagByteFetch,
+    ) -> PullOutcome {
+        use ciris_persist::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD;
+        use ciris_persist::federation::BlobError;
+        let blob_hex = hex::encode(sha);
+        let Some(pointer) = meaning.pointer() else {
+            return PullOutcome::StoreFailed(
+                "sealed tier without a typed pointer — cannot form a provenance".into(),
+            );
+        };
+        // The provenance and AAD exactly as the whole-blob adopt forms them
+        // (`adopt_sealed`): the row is the access grant, the pointer the key
+        // plane, the minter derived by persist. The chunks share the
+        // manifest's provenance — one access set per stream (persist D9).
+        let provenance = match BlobProvenance::from_attestation(row, &sha, pointer.epoch, None) {
+            Ok(p) => p,
+            Err(e) => {
+                return PullOutcome::StoreFailed(format!(
+                    "provenance from the referencing row {}: {e}",
+                    row.attestation_id
+                ))
+            }
+        };
+        let aad = crate::group_content::content_aad(
+            &row.attesting_key_id,
+            row.asserted_at,
+            pointer.content_field,
+        );
+        let adopt = match disposition {
+            StoreDisposition::Announce => AdoptDisposition::Announce,
+            StoreDisposition::LocalOnly => AdoptDisposition::LocalOnly,
+        };
+
+        // ── manifest ── held from an earlier attempt, or fetched now.
+        let announced;
+        let held = match self.backend.has_blob(&sha).await {
+            Ok(h) => h,
+            Err(e) => return PullOutcome::StoreFailed(format!("has_blob: {e}")),
+        };
+        if held {
+            // CIRISEdge#735 — a RESUME. The manifest was adopted, and its
+            // `holds_bytes` emitted or not, by an earlier attempt; this one
+            // skips the adopt, so `announced` is read off the claim that
+            // exists rather than reported false for a door not called. At
+            // `community_dek` the first attempt announced and the resume
+            // used to deny it; at `invisible_encrypted` no claim exists
+            // (CC 5.2) and this reads false, as before.
+            announced = match self.backend.list_holders(&sha).await {
+                Ok(holders) => holders.contains(&self.local_key_id),
+                Err(e) => return PullOutcome::StoreFailed(format!("list_holders: {e}")),
+            };
+        } else {
+            let bytes = match self.fetch_verified(fetch, sha).await {
+                Ok(b) => b,
+                Err(DagFetchStop::Transport(reason)) => {
+                    return self.dag_fetch_failed(row, sha, attempts, "manifest", &reason)
+                }
+                Err(DagFetchStop::HashMismatch { got }) => {
+                    return self.dag_refused(
+                        row,
+                        &blob_hex,
+                        DagPullRefusal::ManifestMismatch {
+                            detail: format!(
+                                "the bytes served at the pointer's address hash to {}",
+                                hex::encode(got)
+                            ),
+                        },
+                    )
+                }
+            };
+            announced = match self
+                .engine
+                .adopt_sealed_blob(&bytes, provenance.clone(), Some(&aad), adopt)
+                .await
+            {
+                Ok(outcome) => outcome.announced,
+                Err(e) => return PullOutcome::StoreFailed(format!("adopt manifest: {e}")),
+            };
+        }
+
+        // ── verified ── opened as THIS NODE, under the row's AAD.
+        let view = match self
+            .engine
+            .open_sealed_manifest_as(&sha, &self.local_key_id, Some(&aad))
+            .await
+        {
+            Ok(v) => v,
+            // The key follows the bytes, in either order (persist I61/I62):
+            // the manifest is held; the wrap to this node has not landed.
+            Err(BlobError::NotGranted { .. }) => {
+                let retrying = self.book_retry(row, sha, attempts);
+                tracing::debug!(
+                    blob = %blob_hex,
+                    attestation_id = %row.attestation_id,
+                    retrying,
+                    "DAG pull: the manifest is held but this node holds no wrap for it yet — \
+                     waiting on the key_grant (CIRISEdge#717)"
+                );
+                return PullOutcome::DagAwaitingKey { attempts, retrying };
+            }
+            Err(BlobError::InvalidArgument(detail)) => {
+                return self.dag_refused(
+                    row,
+                    &blob_hex,
+                    DagPullRefusal::ManifestMismatch { detail },
+                )
+            }
+            Err(e) => return PullOutcome::StoreFailed(format!("open_sealed_manifest_as: {e}")),
+        };
+        if view.storage_kind == "chunk_dag" {
+            // Promoted under us (a concurrent pull, or a second offer of the
+            // same row after completion): the file is here.
+            return PullOutcome::AlreadyHeld;
+        }
+        let plan = DagPlan::from_sealed_view(&view);
+        if let Err(refusal) = check_dag_plan(stream_id, pointer.size, &plan) {
+            return self.dag_refused(row, &blob_hex, refusal);
+        }
+
+        // ── chunks ── each by its sha, adopted at its position; held ones skipped.
+        let held_chunks: HashMap<u64, [u8; 32]> =
+            match self.backend.stream_chunks(&view.stream_id).await {
+                Ok(listing) => listing
+                    .chunks
+                    .into_iter()
+                    .map(|c| (c.seq, c.chunk_sha))
+                    .collect(),
+                Err(e) => return PullOutcome::StoreFailed(format!("stream_chunks: {e}")),
+            };
+        for c in &view.chunks {
+            let mut want = [0u8; 32];
+            if let Err(e) = hex::decode_to_slice(&c.sha256_hex, &mut want) {
+                return self.dag_refused(
+                    row,
+                    &blob_hex,
+                    DagPullRefusal::ManifestMismatch {
+                        detail: format!("chunk seq {} sha is not 32 hex bytes: {e}", c.seq),
+                    },
+                );
+            }
+            if held_chunks.get(&c.seq) == Some(&want) {
+                continue;
+            }
+            let bytes = match self.fetch_verified(fetch, want).await {
+                Ok(b) => b,
+                Err(DagFetchStop::Transport(reason)) => {
+                    return self.dag_fetch_failed(
+                        row,
+                        sha,
+                        attempts,
+                        &format!("chunk seq {}", c.seq),
+                        &reason,
+                    )
+                }
+                Err(DagFetchStop::HashMismatch { got }) => {
+                    return self.dag_refused(
+                        row,
+                        &blob_hex,
+                        DagPullRefusal::ChunkMismatch {
+                            seq: c.seq,
+                            detail: format!(
+                                "the bytes served for {} hash to {}",
+                                c.sha256_hex,
+                                hex::encode(got)
+                            ),
+                        },
+                    )
+                }
+            };
+            // The stored body is the plaintext plus persist's envelope — the
+            // arithmetic `declared_stored_len` uses for a whole blob; persist's
+            // adopt checks the envelope's own length again behind this.
+            let expected_len = u64::from(c.size) + AT_REST_ENVELOPE_OVERHEAD as u64;
+            if bytes.len() as u64 != expected_len {
+                return self.dag_refused(
+                    row,
+                    &blob_hex,
+                    DagPullRefusal::ChunkMismatch {
+                        seq: c.seq,
+                        detail: format!(
+                            "{} bytes arrived but the manifest's size {} implies {expected_len}",
+                            bytes.len(),
+                            c.size
+                        ),
+                    },
+                );
+            }
+            if let Err(e) = self
+                .engine
+                .adopt_sealed_chunk(
+                    &view.stream_id,
+                    c.seq,
+                    &bytes,
+                    crate::group_content::persist_store::STREAM_EPOCH,
+                    u64::from(c.size),
+                    provenance.clone(),
+                )
+                .await
+            {
+                return PullOutcome::StoreFailed(format!("adopt chunk seq {}: {e}", c.seq));
+            }
+        }
+
+        // ── promoted ── persist checks every chunk row against the manifest.
+        match self
+            .engine
+            .promote_adopted_manifest_to_dag(&sha, &self.local_key_id, Some(&aad))
+            .await
+        {
+            Ok(promotion) => {
+                tracing::info!(
+                    blob = %blob_hex,
+                    attestation_id = %row.attestation_id,
+                    stream_id = %view.stream_id,
+                    chunk_count = promotion.chunk_count,
+                    total_size = promotion.total_size,
+                    promoted = promotion.promoted,
+                    announced,
+                    "DAG pulled: the manifest row is a chunk_dag and reads as the file \
+                     (CIRISEdge#717)"
+                );
+                PullOutcome::Stored { announced }
+            }
+            Err(BlobError::InvalidArgument(detail)) => {
+                self.dag_refused(row, &blob_hex, DagPullRefusal::ChunkMissing { detail })
+            }
+            Err(e) => PullOutcome::StoreFailed(format!("promote_adopted_manifest_to_dag: {e}")),
+        }
+    }
+
+    /// **A plaintext DAG** (a commons file): the manifest is in clear, so the
+    /// puller reads it itself, bounds the work, fetches every chunk, and
+    /// stores the whole DAG in one shot through persist's
+    /// `put_blob_chunks_signing` — every chunk verified against the manifest
+    /// again inside the door, and the manifest's `holds_bytes` announced as
+    /// `store_plaintext` announces a whole blob. Held in memory until the
+    /// door takes it, bounded by the plan's `in_memory_cap_bytes` (persist's
+    /// whole-read constant, reused as this walk's buffer bound — CIRISEdge#737).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the walk's rungs, in order, in one place on purpose
+    async fn pull_plaintext_dag(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        attempts: u32,
+        meaning: &BlobMeaning,
+        stream_id: &str,
+        disposition: StoreDisposition,
+        fetch: &dyn DagByteFetch,
+    ) -> PullOutcome {
+        let blob_hex = hex::encode(sha);
+        let Some(pointer) = meaning.pointer() else {
+            return PullOutcome::Refused("a DAG is named only by a typed pointer".into());
+        };
+        if disposition == StoreDisposition::LocalOnly {
+            return PullOutcome::StoreFailed(
+                "the store gate said LocalOnly for PLAINTEXT bytes, and persist exposes no \
+                 local-only plaintext door to a consumer (store_blob_local needs a \
+                 StorageFloor only persist can mint, I22); refusing rather than announcing \
+                 against the verdict"
+                    .into(),
+            );
+        }
+        // ── manifest ──
+        let bytes = match self.fetch_verified(fetch, sha).await {
+            Ok(b) => b,
+            Err(DagFetchStop::Transport(reason)) => {
+                return self.dag_fetch_failed(row, sha, attempts, "manifest", &reason)
+            }
+            Err(DagFetchStop::HashMismatch { got }) => {
+                return self.dag_refused(
+                    row,
+                    &blob_hex,
+                    DagPullRefusal::ManifestMismatch {
+                        detail: format!(
+                            "the bytes served at the pointer's address hash to {}",
+                            hex::encode(got)
+                        ),
+                    },
+                )
+            }
+        };
+        // ── verified ──
+        let manifest = match parse_clear_manifest(&bytes) {
+            Ok(m) => m,
+            Err(detail) => {
+                return self.dag_refused(
+                    row,
+                    &blob_hex,
+                    DagPullRefusal::ManifestMismatch { detail },
+                )
+            }
+        };
+        if manifest
+            .chunk_tier
+            .is_some_and(|t| t != CryptoTier::Plaintext)
+        {
+            return self.dag_refused(
+                row,
+                &blob_hex,
+                DagPullRefusal::ManifestMismatch {
+                    detail: format!(
+                        "a plaintext pointer names a manifest sealed at {:?}",
+                        manifest.chunk_tier
+                    ),
+                },
+            );
+        }
+        let plan = DagPlan::from_clear_manifest(&manifest, self.backend.inline_bytes_cap() as u64);
+        if let Err(refusal) = check_dag_plan(stream_id, pointer.size, &plan) {
+            return self.dag_refused(row, &blob_hex, refusal);
+        }
+        // ── chunks ──
+        let mut chunks = Vec::with_capacity(manifest.chunks.len());
+        for (i, c) in manifest.chunks.iter().enumerate() {
+            let seq = c.seq.unwrap_or(i as u64);
+            let body = match self.fetch_verified(fetch, c.sha).await {
+                Ok(b) => b,
+                Err(DagFetchStop::Transport(reason)) => {
+                    return self.dag_fetch_failed(
+                        row,
+                        sha,
+                        attempts,
+                        &format!("chunk seq {seq}"),
+                        &reason,
+                    )
+                }
+                Err(DagFetchStop::HashMismatch { got }) => {
+                    return self.dag_refused(
+                        row,
+                        &blob_hex,
+                        DagPullRefusal::ChunkMismatch {
+                            seq,
+                            detail: format!(
+                                "the bytes served for {} hash to {}",
+                                hex::encode(c.sha),
+                                hex::encode(got)
+                            ),
+                        },
+                    )
+                }
+            };
+            if body.len() as u64 != u64::from(c.size) {
+                return self.dag_refused(
+                    row,
+                    &blob_hex,
+                    DagPullRefusal::ChunkMismatch {
+                        seq,
+                        detail: format!(
+                            "{} bytes arrived but the manifest says {}",
+                            body.len(),
+                            c.size
+                        ),
+                    },
+                );
+            }
+            chunks.push((c.sha, BlobBody::Inline(body)));
+        }
+        // ── stored + announced ──
+        match self
+            .engine
+            .put_blob_chunks_signing(manifest, chunks, &row.attesting_key_id)
+            .await
+        {
+            Ok(got) => {
+                debug_assert_eq!(got, sha, "the DAG's address is its manifest's");
+                tracing::info!(
+                    blob = %blob_hex,
+                    attestation_id = %row.attestation_id,
+                    stream_id = %stream_id,
+                    "plaintext DAG pulled and announced (CIRISEdge#717)"
+                );
+                PullOutcome::Stored { announced: true }
+            }
+            Err(e) => PullOutcome::StoreFailed(format!("put_blob_chunks_signing: {e}")),
         }
     }
 
@@ -1023,33 +2045,262 @@ mod tests {
         assert_eq!(declared_stored_len(&p), None, "pre-#698: nothing declared");
     }
 
-    /// CIRISEdge#717 — every tier: a pointer carrying `stream_id` is refused
-    /// by name before any fetch, and the same pointer without one is not.
-    /// The field shape is `files::publish`'s: a chunked write sets
-    /// `stream_id`, a whole-blob write leaves it absent.
-    #[test]
-    fn a_stream_pointer_is_refused_by_name_at_every_tier() {
-        for tier in ["plaintext", "community_dek", "invisible_encrypted"] {
-            let mut row = content_row("community", "room", &SHA);
-            row.attestation_envelope["content"]["tier"] = serde_json::json!(tier);
-            row.attestation_envelope["content"]["size"] = serde_json::json!(1_048_577);
-            let meaning = BlobMeaning::project(&row, &SHA).expect("pointer");
-            assert_eq!(
-                stream_refusal(&row, "ab", &meaning, None),
-                None,
-                "{tier}: a whole-blob pointer is pulled whole"
-            );
-            row.attestation_envelope["content"]["stream_id"] = serde_json::json!("file-1");
-            let meaning = BlobMeaning::project(&row, &SHA).expect("pointer");
-            assert_eq!(
-                stream_refusal(&row, "ab", &meaning, None),
-                Some(PullOutcome::StreamPointerNeedsDagPull {
-                    stream_id: "file-1".into(),
-                    declared: Some(1_048_577),
-                }),
-                "{tier}: a DAG pointer must never be whole-pulled — its address is the manifest's"
-            );
+    /// CIRISEdge#717 — the plan of the file `files::publish` chunks: 1 MiB + 1
+    /// as `CHUNK_BYTES` (256 KiB) segments at a sealed tier, the caps persist
+    /// reports on the opened view.
+    fn sealed_plan(total: u64) -> DagPlan {
+        use ciris_persist::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD;
+        let chunk = crate::group_content::store::CHUNK_BYTES as u64;
+        let mut chunks = Vec::new();
+        let mut off = 0;
+        while off < total {
+            let size = chunk.min(total - off);
+            chunks.push((chunks.len() as u64, size));
+            off += size;
         }
+        DagPlan {
+            stream_id: Some("file-717".into()),
+            total_size: total,
+            chunks,
+            inline_bytes_cap: ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP as u64,
+            in_memory_cap_bytes: None,
+            max_chunks: ciris_persist::federation::blobs::MAX_CHUNKS_PER_EPOCH,
+            per_chunk_overhead: AT_REST_ENVELOPE_OVERHEAD as u64,
+        }
+    }
+
+    /// CIRISEdge#717 — the bounds, on the field's shapes: the honest plan
+    /// passes; every refusal is named by its rung, in the order the walk
+    /// checks them, and none needs a chunk fetched.
+    #[test]
+    fn the_dag_plan_is_bounded_before_a_chunk_moves() {
+        let total = 1_048_577u64;
+        let plan = sealed_plan(total);
+        assert_eq!(plan.chunks.len(), 5, "4 × 256 KiB + 1 byte");
+        assert_eq!(check_dag_plan("file-717", Some(total), &plan), Ok(()));
+        assert_eq!(
+            check_dag_plan("file-717", None, &plan),
+            Ok(()),
+            "a pre-#698 pointer declares nothing to check"
+        );
+
+        // The pointer names another stream.
+        assert!(matches!(
+            check_dag_plan("file-other", Some(total), &plan),
+            Err(DagPullRefusal::ManifestMismatch { .. })
+        ));
+        // The pointer's size is not the manifest's total.
+        assert_eq!(
+            check_dag_plan("file-717", Some(total + 1), &plan),
+            Err(DagPullRefusal::TotalSizeMismatch {
+                declared: total + 1,
+                manifest: total,
+            })
+        );
+        // Count over the cap.
+        let mut p = plan.clone();
+        p.max_chunks = 4;
+        assert_eq!(
+            check_dag_plan("file-717", Some(total), &p),
+            Err(DagPullRefusal::OverCap {
+                what: "chunk_count",
+                value: 5,
+                cap: 4,
+            })
+        );
+        // CIRISEdge#737 — a sealed DAG above persist's whole-READ cap pulls:
+        // 100 MiB as 400 × 256 KiB is within what its chunk list can hold.
+        let big = 100 * 1024 * 1024;
+        let p = sealed_plan(big);
+        assert_eq!(p.chunks.len(), 400);
+        assert_eq!(
+            check_dag_plan("file-717", Some(big), &p),
+            Ok(()),
+            "the pull is chunk-wise; the whole-read cap governs reads (§6.7.3)"
+        );
+        // Total above what the chunk list can legally hold (the STORAGE
+        // bound): one well-sized chunk under a total no single chunk can
+        // carry — named before the sum rule would call it a mismatch.
+        let mut p = plan.clone();
+        let per_chunk_max = p.inline_bytes_cap - p.per_chunk_overhead;
+        p.chunks = vec![(0, 100)];
+        p.total_size = per_chunk_max + 1;
+        assert_eq!(
+            check_dag_plan("file-717", Some(p.total_size), &p),
+            Err(DagPullRefusal::OverCap {
+                what: "total_size_vs_chunks",
+                value: per_chunk_max + 1,
+                cap: per_chunk_max,
+            })
+        );
+        // A PLAINTEXT plan is held whole until persist's one-shot door takes
+        // it, so it keeps an in-memory ceiling.
+        let mut p = plan.clone();
+        p.in_memory_cap_bytes = Some(total - 1);
+        assert_eq!(
+            check_dag_plan("file-717", Some(total), &p),
+            Err(DagPullRefusal::OverCap {
+                what: "total_size_in_memory",
+                value: total,
+                cap: total - 1,
+            })
+        );
+        // A chunk whose STORED body (plaintext + envelope) is over the inline
+        // cap — a 1 MiB chunk at a sealed tier does not fit persist's 1 MiB.
+        // Named as the chunk's fault, though the storage bound would also
+        // have caught it (rule 4 runs before rule 5).
+        let cap = ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP as u64;
+        let mut p = sealed_plan(cap);
+        p.chunks = vec![(0, cap)];
+        assert!(matches!(
+            check_dag_plan("file-717", Some(cap), &p),
+            Err(DagPullRefusal::OverCap { what: "chunk_size", cap: c, .. }) if c == cap
+        ));
+        // Sizes that do not sum to the total.
+        let mut p = plan.clone();
+        p.chunks[4].1 = 2;
+        assert!(matches!(
+            check_dag_plan("file-717", Some(total), &p),
+            Err(DagPullRefusal::ManifestMismatch { .. })
+        ));
+        // A repeated position.
+        let mut p = plan.clone();
+        p.chunks[4].0 = 3;
+        assert!(matches!(
+            check_dag_plan("file-717", Some(total), &p),
+            Err(DagPullRefusal::ManifestMismatch { .. })
+        ));
+        // No chunks at all.
+        let mut p = plan;
+        p.chunks.clear();
+        p.total_size = 0;
+        assert!(matches!(
+            check_dag_plan("file-717", Some(0), &p),
+            Err(DagPullRefusal::ManifestMismatch { .. })
+        ));
+    }
+
+    /// CIRISEdge#717 — a clear (v1) manifest names no stream and positions
+    /// no chunk: the plan takes the index as `seq` and skips the stream check.
+    #[test]
+    fn a_clear_manifest_plan_positions_by_index_and_names_no_stream() {
+        use ciris_persist::federation::{ChunkManifest, ChunkRef};
+        let manifest = ChunkManifest {
+            v: 1,
+            total_size: 300,
+            chunks: vec![
+                ChunkRef {
+                    sha: [1; 32],
+                    size: 200,
+                    seq: None,
+                },
+                ChunkRef {
+                    sha: [2; 32],
+                    size: 100,
+                    seq: None,
+                },
+            ],
+            chunk_tier: None,
+            stream_id: None,
+        };
+        let plan = DagPlan::from_clear_manifest(&manifest, 1024);
+        assert_eq!(plan.stream_id, None);
+        assert_eq!(plan.chunks, vec![(0, 200), (1, 100)]);
+        assert_eq!(plan.per_chunk_overhead, 0);
+        assert_eq!(check_dag_plan("any-stream", Some(300), &plan), Ok(()));
+    }
+
+    /// CIRISEdge#717 — the puller's reading of a clear manifest is persist's
+    /// own encoding, proven by round trip; anything else is refused, however
+    /// it hashed.
+    #[test]
+    fn a_clear_manifest_is_read_only_when_it_round_trips_canonically() {
+        use ciris_persist::federation::{ChunkManifest, ChunkRef};
+        let v1 = ChunkManifest {
+            v: 1,
+            total_size: 300,
+            chunks: vec![
+                ChunkRef {
+                    sha: [0xAB; 32],
+                    size: 200,
+                    seq: None,
+                },
+                ChunkRef {
+                    sha: [0xCD; 32],
+                    size: 100,
+                    seq: None,
+                },
+            ],
+            chunk_tier: None,
+            stream_id: None,
+        };
+        let bytes = v1.to_jcs_bytes();
+        assert_eq!(
+            parse_clear_manifest(&bytes).expect("persist's own shape"),
+            v1
+        );
+        // The sealed (v2) shape reads too — the tier check is the caller's.
+        let v2 = ChunkManifest {
+            v: 2,
+            chunk_tier: Some(CryptoTier::InvisibleEncrypted),
+            stream_id: Some("file-1".into()),
+            chunks: v1
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ChunkRef {
+                    seq: Some(i as u64),
+                    ..c.clone()
+                })
+                .collect(),
+            ..v1.clone()
+        };
+        assert_eq!(parse_clear_manifest(&v2.to_jcs_bytes()).expect("v2"), v2);
+        // Semantically identical, not canonical: refused.
+        let pretty = serde_json::to_vec_pretty(
+            &serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        )
+        .unwrap();
+        assert!(parse_clear_manifest(&pretty).is_err());
+        // Not a manifest at all.
+        assert!(parse_clear_manifest(b"{\"hello\":1}").is_err());
+        assert!(parse_clear_manifest(b"not json").is_err());
+    }
+
+    /// The refusal tags are a closed set, distinct from each other and from
+    /// the whole-blob tags.
+    #[test]
+    fn dag_refusal_tags_are_a_closed_set() {
+        let tags = [
+            DagPullRefusal::ManifestMismatch {
+                detail: String::new(),
+            }
+            .tag(),
+            DagPullRefusal::TotalSizeMismatch {
+                declared: 0,
+                manifest: 0,
+            }
+            .tag(),
+            DagPullRefusal::OverCap {
+                what: "chunk_count",
+                value: 0,
+                cap: 0,
+            }
+            .tag(),
+            DagPullRefusal::ChunkMismatch {
+                seq: 0,
+                detail: String::new(),
+            }
+            .tag(),
+            DagPullRefusal::ChunkMissing {
+                detail: String::new(),
+            }
+            .tag(),
+            PULL_REFUSAL_SIZE_MISMATCH,
+        ];
+        let set: HashSet<&str> = tags.iter().copied().collect();
+        assert_eq!(set.len(), tags.len(), "{tags:?}");
+        assert!(tags.iter().all(|t| !t.is_empty()));
     }
 
     fn sink_with(capacity: usize) -> (PullSink, mpsc::Receiver<PullRequest>) {

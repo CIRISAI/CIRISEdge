@@ -1,5 +1,81 @@
 # CIRISEdge Release Notes
 
+# v36.0.0 — files of any size up to ~2.5 GiB, pulled chunk by chunk, read by range, published from a stream, with delivery receipts; persist v51.3.0
+
+**2026-09-30** (PR #733 adopt + lanes of CIRISEdge#734: #741, #743, #746, #747). **MAJOR** from v35.0.0.
+Ladder triple: **edge v36.0.0 · persist v51.3.0 · verify v18.0.0**.
+
+## The pins
+
+| | v35.0.0 | v36.0.0 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v51.1.0"` | **`tag = "v51.3.0"`** → `412a679f` (a merge over the certified `9d406712`, identical tree `5396f436`) |
+| ciris-persist (wheel floor) | `>=51.1,<52` | **`>=51.3,<52`** (edge calls the #947 doors v51.3 adds) |
+| CIRISVerify crates | `v18.0.0` | unchanged (one copy each of verify-core / keyring / crypto) |
+| ABI constants, `REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH`, `TRANSFORM_ALGEBRA_HASH`, manifest `0.3.0`, `ENVELOPE_VOCABULARY_SHA256`, `SERVE_ADVERTISE_POLICY_HASH` | — | **all unchanged** (diffed from source, verified empty) |
+
+**Riders:** move the wheel floor to `>=51.3`, and see the Rust surface below. No hash re-pin.
+
+## #717 — a chunk-DAG file pulls as its chunks (closes #717)
+
+v34.1.0 refused a stream pointer by name; the pull now walks the DAG through persist v51.3's doors: adopt
+the manifest → open it as this node (`NotGranted` ⇒ `DagAwaitingKey`, retried) → bound the plan (stream,
+`total_size` vs the pointer's size, chunk count, the storage bound) → fetch chunks by sha, held ones
+skipped (a pull resumes) → promote to `chunk_dag`. Every refusal is named and counted in
+`blob_pull_refusals` (`dag_*`, `no_epoch`). A plaintext (commons) DAG goes through
+`put_blob_chunks_signing` and announces `holds_bytes`; it keeps a 64 MiB in-memory bound because that
+door is one-shot (CIRISPersist#952). Witnesses: 1 MiB plaintext and 1.3 MiB sealed self files
+byte-identical on the second device; tampered manifest / chunk, over-cap and pre-key negatives.
+Measured on CIRISServer's native selffiles ladder at v34.3.0 as 22/25 with exactly the ≥ 1 MiB files
+missing; those are this release's.
+
+## #735 — community DAGs, holder to holder (PR #741)
+
+A 1.3 MiB `community_dek` file pulled by C from B (a member that promoted it), never from the author;
+epoch rotation, tampered chunk and non-member negatives. Fixed on the way: `NoEpoch` is counted, and a
+resumed sealed pull reports its `holds_bytes` claim from the claim index.
+
+## #737 — read by range and by chunks (PR #743)
+
+`FileRow::open_range(store, viewer, offset, len)`, `FileRow::chunks()` (one item per chunk, `seq`
+order), `FileRow::layout()`. `open` above persist's 64 MiB whole-read cap returns
+`FileError::AboveWholeReadCap` instead of persist's cap error. Witness: a 100 MiB file read on the second
+device with peak live allocation ~4 chunks (counting allocator), ranges across chunk boundaries, EOF
+refusals by name.
+
+## #744 — publish from a stream (PR #747)
+
+`files::publish_stream(…, reader, declared_len, …)` seals chunk by chunk; the `file:v1` row crosses
+only after the last chunk lands; a reader that yields a different length is refused by name
+(`FileError::DeclaredLengthMismatch`) and its encrypted chunks are evicted. `publish(bytes)` is a thin
+wrapper, so there is one seal path. Measured: a 2 GiB publish in 72.6 s (release) at 4.9 MiB peak live
+allocation. **Ceiling:** one file maxes out near 2.5 GiB because persist stores the sealed manifest
+inline under its 1 MiB cap (CIRISPersist#954, persist v52).
+
+## #738 — CC 5.3.3.6 delivery receipts for chunked files (PR #746)
+
+`files::publish` puts the file stream's STH through persist's anti-equivocation gate and carries it on
+the row; the receiver, on promote, puts that STH into its own store (persist recomputes the root from
+the chunks it pulled) and emits exactly one node-signed `delivery_receipt:{stream_id}:v1` row at the
+file's cohort; the author admits it (`receipt_*` refusals named and counted in `delivery_receipts`),
+`FileRow::received_by` lists them, and the bridge stops re-offering a row a peer receipted in full
+(`re_offer_suppressed_receipted`). Self and community witnessed. Receipts for inline files, receipt
+timestamps and the family lane wait on persist v52 (CIRISPersist#953).
+
+## #712 — an owner's withdraw of a node-authored file lists as Withdrawn
+
+Mirrors persist #945: a `withdraws` with `withdraws_admission_rule` set is final whoever signed it.
+
+## Rust surface (why MAJOR)
+
+- `FileRow::open` / `open_described` return `FileError` (was the store's error); new variants
+  `Unopened(UnopenedReason)`, `AboveWholeReadCap`, `RangeNotSatisfiable`, `DeclaredLengthMismatch`, `Read`.
+- `PullOutcome::StreamPointerNeedsDagPull` is gone (the pull succeeds); `DagAwaitingKey` and `DagRefused`
+  are new.
+- New: `files::publish_stream`, `FileStreamWrite`, `FileRow::{open_range, chunks, layout, received_by}`,
+  `GroupContentStore::{open_range, layout, seal_chunked_stream}`, `receipts` module; metrics
+  `delivery_receipts`, `re_offer_suppressed_receipted`, `dag_*` / `no_epoch` refusal tags.
+
 # v35.0.0 — three peers no longer deadlock the blocking pool: the state-provider read path is async and a kick is bounded
 
 **2026-09-29** (CIRISEdge#740 → PR #745). **MAJOR** from v34.3.0 (Rust API break below). No pin or hash
