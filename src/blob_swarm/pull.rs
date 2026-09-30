@@ -1374,7 +1374,6 @@ where
 
         // The binding the adopt door will need, decided BEFORE any request:
         // a row that cannot be adopted is not worth a fetch.
-        let tier = meaning.pointer().map_or(CryptoTier::Plaintext, |p| p.tier);
         if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning, Some(&self.edge.metrics())) {
             return refused;
         }
@@ -1442,17 +1441,135 @@ where
             return refused;
         }
 
-        // Store, through the door the gate's verdict names.
-        match tier {
+        self.store_whole(row, sha, &meaning, bytes, disposition)
+            .await
+    }
+
+    /// **Store a whole (inline) blob**, through the door the gate's verdict
+    /// names, then the inline file's receipt hook (CIRISEdge#738, CC 5.3.3.6):
+    /// a file row's inline bytes, once stored, are receipted exactly as a
+    /// promoted DAG is. The one inline call site of
+    /// [`crate::receipts::on_file_pulled`].
+    async fn store_whole(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        meaning: &BlobMeaning,
+        bytes: Vec<u8>,
+        disposition: StoreDisposition,
+    ) -> PullOutcome {
+        let tier = meaning.pointer().map_or(CryptoTier::Plaintext, |p| p.tier);
+        let outcome = match tier {
             CryptoTier::Plaintext => {
-                self.store_plaintext(row, sha, &meaning, bytes, disposition)
+                self.store_plaintext(row, sha, meaning, bytes, disposition)
                     .await
             }
             CryptoTier::CommunityDek | CryptoTier::InvisibleEncrypted => {
-                self.adopt_sealed(row, sha, &meaning, tier, &bytes, disposition)
+                self.adopt_sealed(row, sha, meaning, tier, &bytes, disposition)
                     .await
             }
+        };
+        crate::receipts::on_file_pulled(
+            &self.engine,
+            &*self.backend,
+            &self.local_key_id,
+            row,
+            &outcome,
+            &self.edge.metrics(),
+        )
+        .await;
+        outcome
+    }
+
+    /// **The whole-blob pull with a caller's fetcher** (CIRISEdge#738) — the
+    /// inline counterpart of [`Self::pull_dag_with`]: trust (the row's
+    /// meaning), may (the store gate, asked of `fetch`'s holders), the one
+    /// fetch verified against the address, the declared size, then the store
+    /// and the inline receipt hook [`Self::pull_one`] runs. For a deployment
+    /// whose transport is not the swarm's, and for the store-level witness.
+    /// A pointer carrying `stream_id` is [`Self::pull_dag_with`]'s and is
+    /// refused here by name. Dedupes on `sha` against every other pull.
+    pub async fn pull_inline_with(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        fetch: &dyn DagByteFetch,
+    ) -> PullOutcome {
+        {
+            let Ok(mut set) = self.in_flight.lock() else {
+                return PullOutcome::InFlight;
+            };
+            if !set.insert(sha) {
+                return PullOutcome::InFlight;
+            }
         }
+        let outcome = self.pull_inline_inner(row, sha, fetch).await;
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.remove(&sha);
+        }
+        outcome
+    }
+
+    async fn pull_inline_inner(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        fetch: &dyn DagByteFetch,
+    ) -> PullOutcome {
+        let blob_hex = hex::encode(sha);
+        match self.backend.has_blob(&sha).await {
+            Ok(true) => return PullOutcome::AlreadyHeld,
+            Ok(false) => {}
+            Err(e) => return PullOutcome::StoreFailed(format!("has_blob: {e}")),
+        }
+        let (meaning, _author) = match self.project(row, sha, 0).await {
+            Ok(m) => m,
+            Err(outcome) => return outcome,
+        };
+        if meaning.pointer().is_some_and(|p| p.stream_id.is_some()) {
+            return PullOutcome::Refused(
+                "pull_inline_with: the pointer names a stream_id — a chunk DAG is                  pull_dag_with's (CIRISEdge#717)"
+                    .into(),
+            );
+        }
+        let metrics = self.edge.metrics();
+        if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning, Some(&metrics)) {
+            return refused;
+        }
+        let disposition = match super::store_admission_with(
+            self.policy.as_ref(),
+            sha,
+            Some(&meaning),
+            fetch.holders(),
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(SwarmError::StoreRefused { refusal, axis, .. }) => {
+                return PullOutcome::Refused(format!("axis {axis}: {refusal:?}"));
+            }
+            Err(e) => return PullOutcome::Refused(e.to_string()),
+        };
+        let bytes = match self.fetch_verified(fetch, sha).await {
+            Ok(b) => b,
+            Err(DagFetchStop::Transport(reason)) => {
+                return PullOutcome::FetchFailed {
+                    reason,
+                    retrying: false,
+                }
+            }
+            Err(DagFetchStop::HashMismatch { got }) => {
+                return PullOutcome::Refused(format!(
+                    "pull_inline_with: the fetched body hashes to {}, not {blob_hex}",
+                    hex::encode(got)
+                ))
+            }
+        };
+        if let Some(refused) = size_refusal(row, &blob_hex, &meaning, bytes.len(), Some(&metrics)) {
+            return refused;
+        }
+        self.store_whole(row, sha, &meaning, bytes, disposition)
+            .await
     }
 
     /// TRUST — what the signed row says these bytes are, with the author
@@ -1640,8 +1757,8 @@ where
                     .await
             }
         };
-        // CIRISEdge#738 — the one receipt hook: acts on `Stored` only.
-        crate::receipts::on_dag_pulled(
+        // CIRISEdge#738 — the DAG's receipt hook: acts on `Stored` only.
+        crate::receipts::on_file_pulled(
             &self.engine,
             &*self.backend,
             &self.local_key_id,

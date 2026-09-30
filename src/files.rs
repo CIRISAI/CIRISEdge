@@ -860,11 +860,12 @@ where
         );
     }
 
-    // CIRISEdge#738 (CC 5.3.3.3 / 5.3.3.6, §6.10) — a chunk DAG is a stream,
-    // and a stream's root is published by its producer: the STH over the
-    // chunks just sealed, through persist's anti-equivocation gate, carried on
-    // the row so it reaches exactly the row's audience. The root is what a
-    // receiver's delivery receipt names; without it no receipt can join.
+    // CIRISEdge#738 (CC 5.3.3.3 / 5.3.3.6, §6.10) — every file is a stream
+    // (a chunk DAG's, or an inline file's one-leaf log), and a stream's root
+    // is published by its producer: the STH over the bytes just sealed,
+    // through persist's anti-equivocation gate, carried on the row so it
+    // reaches exactly the row's audience. The root is what a receiver's
+    // delivery receipt names; without it no receipt can join.
     let stream_sth = publish_stream_sth(
         store,
         signers,
@@ -1040,11 +1041,11 @@ async fn file_row(
     .await
 }
 
-/// **Publish a chunked file's STH** (CIRISEdge#738, §6.10) and return the
-/// claim the row carries: `None` for an inline file (persist's gate recomputes
-/// a root from stream rows, and an inline blob has none — see
-/// [`crate::receipts`]) and for a store with no stream log. The stream's
-/// producer is the NODE (`signers.node`): it wrote the chunks.
+/// **Publish the file's STH** (CIRISEdge#738, §6.10) and return the claim
+/// the row carries — for every file: a chunk DAG's stream over its chunks,
+/// an inline file's one-leaf log over its own address (CIRISPersist#953, see
+/// [`crate::receipts`]). `None` only for a store with no stream log. The
+/// stream's producer is the NODE (`signers.node`): it wrote the bytes.
 ///
 /// # Errors
 /// [`FileError::Seal`] — publishing the stream's root is part of sealing it.
@@ -1055,10 +1056,10 @@ async fn publish_stream_sth(
     asserted_at: DateTime<Utc>,
     pointer: &BlobPointer,
 ) -> Result<Option<serde_json::Value>, FileError> {
-    let (Some(stream_id), Some(log)) = (pointer.stream_id.as_deref(), store.stream_log()) else {
+    let Some(log) = store.stream_log() else {
         return Ok(None);
     };
-    let claim = crate::receipts::publish_file_sth(&*log, signers.node, stream_id, asserted_at)
+    let claim = crate::receipts::publish_file_sth(&*log, signers.node, pointer, asserted_at)
         .await
         .map_err(|detail| FileError::Seal {
             room: room.to_string(),
@@ -1644,7 +1645,9 @@ impl FileRow {
     /// proof of DELIVERY — the node holds bytes committing to all `K` chunks
     /// under the published root — never of consumption.
     ///
-    /// Empty for an inline file (no stream) and for a store with no stream log.
+    /// Inline and chunked files alike ([`crate::receipts::receipt_stream_id`]);
+    /// `at` is when the author's store took each receipt. Empty for a store
+    /// with no stream log.
     ///
     /// # Errors
     /// The store read failed.
@@ -1652,11 +1655,13 @@ impl FileRow {
         &self,
         store: &dyn GroupContentStore,
     ) -> Result<Vec<crate::receipts::Received>, String> {
-        let (Some(stream_id), Some(log)) = (self.pointer.stream_id.as_deref(), store.stream_log())
-        else {
+        let (Some(stream_id), Some(log)) = (
+            crate::receipts::receipt_stream_id(&self.pointer),
+            store.stream_log(),
+        ) else {
             return Ok(Vec::new());
         };
-        crate::receipts::received_for(&*log, stream_id).await
+        crate::receipts::received_for(&*log, &stream_id).await
     }
 
     /// **The bytes and what they are, through one grant** (CIRISEdge#698,
