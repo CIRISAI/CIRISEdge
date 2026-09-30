@@ -283,6 +283,29 @@ jobs:
               --test explicit_hash_addressing \
               --test realtime_av_spine_e2e
 
+      # CIRISEdge#739 — the multi-GiB transfer witness, CI variant, in its own
+      # step so its budget is its own: a 256 MiB self file published on A and
+      # pulled by the owner's other device over real Reticulum loopback
+      # through the pipelined DAG walk, killed at ~50 % and resumed from the
+      # same store — byte-identical, every position adopted exactly once, no
+      # chunk reply in the durable outbound queue, and the queue fallback
+      # taken when the arrival link is torn down. Correctness only (no
+      # ceiling, no K curve): the speed table is the release-build
+      # `--ignored` run documented in the test. Budget: 30 minutes (measured
+      # locally on a debug build: see the PR for the number).
+      - name: bigfile resume witness (CIRISEdge#739)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 2
+          retry_wait_seconds: 60
+          shell: bash
+          command: |
+            set -euo pipefail
+            cargo test --features "transport-http transport-reticulum" \
+              --test bigfile_739 -- --ignored --nocapture \
+              a_256_mib_self_file_resumes_after_a_kill_quick_739
+
   # ─── test-anchor lane — the #386 ALLOW-path coverage ────────────────
   # CIRISEdge#435: `trace_serve_requires_accord_blessing_and_trusted_root` is
   # the ONLY test that can mint a genuine 2-of-3 accord co-scrub (persist

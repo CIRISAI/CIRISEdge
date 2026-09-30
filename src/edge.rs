@@ -3782,6 +3782,13 @@ impl Edge {
     /// (route-table-first, #336). The dial target names the holder's public
     /// identity, never the room; the forwarder relays link ciphertext by link
     /// id and is handed nothing else (leviculum `transport.rs:7094-7220`).
+    ///
+    /// CIRISEdge#739 — on the derived-address arm the request rides a LEASED
+    /// scoped link (`ReticulumTransport::lease_scoped_link`), and the lease is
+    /// returned so the caller holds the lane until the reply lands: the reply
+    /// is the holder's Resource on that same link, and Reticulum runs one
+    /// Resource per link per direction. `None` on the identity-plane arm,
+    /// whose pool the transport manages inside `send`.
     #[cfg(feature = "_reticulum-module")]
     async fn ship_scoped_fetch(
         transport: &Arc<crate::transport::reticulum::ReticulumTransport>,
@@ -3789,20 +3796,28 @@ impl Edge {
         recipient: &crate::blob_swarm::BlobRecipient,
         address: &crate::scope_addressing::MemberAddress,
         envelope_bytes: &[u8],
-    ) -> Result<(), EdgeError> {
+    ) -> Result<Option<crate::transport::reticulum::ScopedLinkLease>, EdgeError> {
         match choice.carrier {
-            crate::blob_swarm::ScopedCarrier::DerivedAddress => transport
-                .send_to_scoped_destination(recipient.peer_key_id(), address, envelope_bytes)
-                .await
-                .map(|_| ())
-                .map_err(|e| EdgeError::Config(format!("scope-native blob fetch send: {e}"))),
+            crate::blob_swarm::ScopedCarrier::DerivedAddress => {
+                let lease = transport
+                    .lease_scoped_link(recipient.peer_key_id(), address)
+                    .await
+                    .map_err(|e| {
+                        EdgeError::Config(format!("scope-native blob fetch lease: {e}"))
+                    })?;
+                transport
+                    .send_on_scoped_lease(&lease, envelope_bytes)
+                    .await
+                    .map_err(|e| EdgeError::Config(format!("scope-native blob fetch send: {e}")))?;
+                Ok(Some(lease))
+            }
             crate::blob_swarm::ScopedCarrier::IdentityLink => crate::transport::Transport::send(
                 &**transport,
                 recipient.peer_key_id(),
                 envelope_bytes,
             )
             .await
-            .map(|_| ())
+            .map(|_| None)
             .map_err(|e| {
                 EdgeError::Config(format!(
                     "scope-native blob fetch send (identity-plane link, CIRISEdge#718): {e}"
@@ -3945,17 +3960,22 @@ impl Edge {
             // renamed to `_address` at the binding: the name documents what
             // the resolved value IS on the arm that uses it.
             let _ = (&envelope_bytes, address);
-            Err::<(), EdgeError>(EdgeError::Config(format!(
+            Err::<Option<()>, EdgeError>(EdgeError::Config(format!(
                 "scope-native blob fetch: holder '{}' resolved to a scope-derived \
                  address but this build has no Reticulum module — refusing rather \
                  than falling back to the federation address (CIRISEdge#499)",
                 recipient.peer_key_id()
             )))
         };
-        if let Err(e) = sent {
-            forget(self);
-            return Err(e);
-        }
+        // CIRISEdge#739 — the scoped lane stays LEASED until the reply lands
+        // (or the wait ends): held here, dropped at every exit below.
+        let _lane = match sent {
+            Ok(lease) => lease,
+            Err(e) => {
+                forget(self);
+                return Err(e);
+            }
+        };
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => Ok(result),
@@ -5205,6 +5225,17 @@ fn blob_scope_withheld_log() -> &'static crate::log_throttle::LogThrottle {
     })
 }
 
+static CHUNK_REPLY_FALLBACK_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#739 — a chunk reply that could not ride its arrival link and
+/// took the durable queue instead. One label.
+fn chunk_reply_fallback_log() -> &'static crate::log_throttle::LogThrottle {
+    CHUNK_REPLY_FALLBACK_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(1, std::time::Duration::from_secs(60), 4)
+    })
+}
+
 /// Point 5 — a verify-rejected inbound frame (attacker-expected junk). Keyed on
 /// the verify-error class (a small closed set).
 fn inbound_verify_reject_log() -> &'static crate::log_throttle::LogThrottle {
@@ -5867,8 +5898,16 @@ async fn dispatch_inbound(
             ));
         }
     }
+    let verify_started = std::time::Instant::now();
     let verified = match verify.verify(&frame.envelope_bytes, transport).await {
-        Ok(v) => v,
+        Ok(v) => {
+            // CIRISEdge#739 — the chunk-body verify is on the pull's critical
+            // path, so it is clocked by type; every other type is not.
+            if v.envelope.message_type == MessageType::BlobChunkBody {
+                metrics.add_blob_dag_phase("inbound_verify_chunk_body", verify_started.elapsed());
+            }
+            v
+        }
         Err(e) => {
             // CIRISEdge#317 point 5 — a verify-rejected frame is attacker-EXPECTED
             // traffic, not an operational error, so the always-on signal is the
@@ -6232,9 +6271,10 @@ async fn dispatch_inbound(
             );
             return;
         }
-        if let Ok(body) =
-            serde_json::from_str::<crate::messages::BlobChunkBody>(envelope.body.get())
-        {
+        let parse_started = std::time::Instant::now();
+        let parsed = serde_json::from_str::<crate::messages::BlobChunkBody>(envelope.body.get());
+        metrics.add_blob_dag_phase("inbound_parse_chunk_body", parse_started.elapsed());
+        if let Ok(body) = parsed {
             let mut pending = blob_chunk_fetch_pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6274,6 +6314,9 @@ async fn dispatch_inbound(
                 use crate::messages::{
                     BlobChunkBody, BlobChunkMiss as BlobChunkMissBody, MissReason,
                 };
+                // CIRISEdge#739 — the serve clock: gate, store read, signed
+                // reply, shipped.
+                let serve_started = std::time::Instant::now();
 
                 // CIRISEdge#499 — SCOPE ADMISSION, ahead of the read.
                 //
@@ -6420,6 +6463,7 @@ async fn dispatch_inbound(
                         .await
                     {
                         Ok(Some(bytes)) => {
+                            metrics.add_blob_dag_phase("serve_gate_read", serve_started.elapsed());
                             // AV-13 size gate on outbound: refuse to
                             // emit a chunk that exceeds the ceiling
                             // (the peer would drop it anyway, but the
@@ -6534,30 +6578,98 @@ async fn dispatch_inbound(
                     }
                 };
 
+                let signed_at = std::time::Instant::now();
+                metrics.add_blob_dag_phase("serve_gate_read_sign", serve_started.elapsed());
                 if let Some(bytes) = response_envelope_bytes {
-                    let env: Result<EdgeEnvelope, _> = serde_json::from_slice(&bytes);
-                    if let Ok(env) = env {
-                        let body_sha = envelope_body_sha256(&env);
-                        let body_size = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
-                        // Ephemeral delivery class — short TTL, single attempt.
-                        // The fetcher's per-request timeout governs retry,
-                        // not the outbound queue.
-                        let _ = queue
-                            .enqueue_outbound(
-                                &signer.key_id,
-                                &envelope.signing_key_id,
-                                &message_type_str(&response_kind),
-                                "1.0.0",
-                                &bytes,
-                                &body_sha,
-                                body_size,
-                                false,
-                                None,
-                                1,
-                                60,
-                                Utc::now(),
-                            )
-                            .await;
+                    // CIRISEdge#739 — the reply rides the link the request
+                    // ARRIVED on, directly (`send_on_reply_path_only`: the
+                    // #683/#353 shape an `OpaqueResponse` answers with, minus
+                    // the by-key fallback). Before this cut every chunk reply
+                    // was written to the DURABLE outbound queue — a ~1 MB row
+                    // per chunk, claimed on the dispatcher's 500 ms idle
+                    // poll, then sent by key on the identity plane — so each
+                    // paid a store round-trip and up to half a second of
+                    // nothing, and a scoped request's reply rode a different
+                    // link (and plane) than its request.
+                    //
+                    // What the queue provided and a chunk body does not need:
+                    // durability and retry — the requester re-requests on its
+                    // per-request timeout and the DAG walk resumes from what
+                    // landed. So the queue stays ONLY as the fallback when the
+                    // arrival link is gone (torn down between the request and
+                    // its answer): logged once a minute, counted under
+                    // `blob_scoped_carriers` as `serve:reply_queued_fallback`
+                    // against `serve:reply_path`. The live answer keeps the
+                    // arrival link's plane (#728, `FSD/CIRIS_EDGE_TRANSPORT.md`
+                    // §3.5); the fallback is the by-key send, which for a scoped
+                    // arrival is §3.4's identity-link carrier (#718) — exactly
+                    // where every chunk reply went before this cut.
+                    let on_path = match response_transport {
+                        Some(transport) => {
+                            match reply_path.filter(|p| p.transport() == transport.id()) {
+                                Some(path) => transport
+                                    .send_on_reply_path_only(
+                                        &envelope.signing_key_id,
+                                        &path,
+                                        &bytes,
+                                    )
+                                    .await
+                                    .map(|_| ()),
+                                None => Err(TransportError::Unreachable(
+                                    "the request carried no reply path on this transport".into(),
+                                )),
+                            }
+                        }
+                        None => Err(TransportError::Unreachable(
+                            "no transport to ship the reply on".into(),
+                        )),
+                    };
+                    match on_path {
+                        Ok(()) => {
+                            metrics.inc_blob_scoped_carrier("serve:reply_path");
+                            metrics.add_blob_dag_phase("serve_ship", signed_at.elapsed());
+                            metrics.add_blob_dag_phase("serve_chunk", serve_started.elapsed());
+                        }
+                        Err(e) => {
+                            metrics.inc_blob_scoped_carrier("serve:reply_queued_fallback");
+                            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                                chunk_reply_fallback_log().check("queued")
+                            {
+                                tracing::info!(
+                                    error = %e,
+                                    requester = %envelope.signing_key_id,
+                                    kind = %message_type_str(&response_kind),
+                                    suppressed_prev,
+                                    "BlobChunkFetch responder: no reply path; the reply \
+                                     takes the durable outbound queue by key \
+                                     (CIRISEdge#739 fallback)"
+                                );
+                            }
+                            let env: Result<EdgeEnvelope, _> = serde_json::from_slice(&bytes);
+                            if let Ok(env) = env {
+                                let body_sha = envelope_body_sha256(&env);
+                                let body_size = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
+                                // Ephemeral delivery class — short TTL, single
+                                // attempt. The fetcher's per-request timeout
+                                // governs retry, not the outbound queue.
+                                let _ = queue
+                                    .enqueue_outbound(
+                                        &signer.key_id,
+                                        &envelope.signing_key_id,
+                                        &message_type_str(&response_kind),
+                                        "1.0.0",
+                                        &bytes,
+                                        &body_sha,
+                                        body_size,
+                                        false,
+                                        None,
+                                        1,
+                                        60,
+                                        Utc::now(),
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
             } else {
@@ -7436,13 +7548,22 @@ async fn dispatch_inbound(
         // — a missing typed `Handler<M>` entry for them is expected,
         // not an error. Suppress the `no handler registered` warning
         // for those.
-        if !matches!(
-            envelope.message_type,
-            MessageType::OpaqueEvent
-                | MessageType::OpaqueRequest
-                | MessageType::OpaqueResponse
-                | MessageType::EphemeralResponse
-        ) {
+        //
+        // CIRISEdge#739 — likewise a `BlobChunkFetch` on a node with a chunk
+        // source: it was ANSWERED above. Warning here logged one WARN per
+        // chunk served — 8,193 for a 2 GiB file. Without a source the drop is
+        // real and still warns.
+        let answered_above =
+            envelope.message_type == MessageType::BlobChunkFetch && blob_chunk_source.is_some();
+        if !answered_above
+            && !matches!(
+                envelope.message_type,
+                MessageType::OpaqueEvent
+                    | MessageType::OpaqueRequest
+                    | MessageType::OpaqueResponse
+                    | MessageType::EphemeralResponse
+            )
+        {
             tracing::warn!(
                 message_type = ?envelope.message_type,
                 "no handler registered; dropping",

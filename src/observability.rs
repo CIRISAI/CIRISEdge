@@ -986,6 +986,27 @@ pub struct EdgeMetrics {
     /// `dag_chunk_missing` (`blob_swarm::DagPullRefusal::tag`). Nothing is
     /// stored on any; a non-zero count is a file that is not on this device.
     pub blob_pull_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#739 — the chunk-DAG pull's per-phase clock, `(total ns,
+    /// samples)` by phase, so a run can say WHERE a pull's time went rather
+    /// than only how long it took (`FSD/CONTENT_TRANSFER.md` §6.7.5). On the
+    /// PULLING node: `dag_fetch_wait` (dispatch of a chunk request → its
+    /// verified bytes in hand: the wire, the holder's serve, and this node's
+    /// inbound verify), `dag_adopt` (`adopt_sealed_chunk`), `dag_promote`;
+    /// on any node: `inbound_verify_chunk_body` (the hybrid verify + body
+    /// parse of a `BlobChunkBody` envelope) and `serve_chunk` (a
+    /// `BlobChunkFetch` answered: the store read, the signed response, the
+    /// send). A closed key set; each key is a `&'static str` at its one
+    /// producer.
+    pub blob_dag_phases: Arc<RwLock<HashMap<&'static str, (u64, u64)>>>,
+    /// CIRISEdge#739 — the chunk-DAG pull's chunk ledger by outcome:
+    /// `adopted` (fetched, verified, `adopt_sealed_chunk` returned),
+    /// `skipped_held` (already at its position with the manifest's sha when
+    /// the walk started — a resume), `in_flight_peak` (the most requests the
+    /// pipeline had outstanding at once, a gauge kept as a high-water mark).
+    /// `adopted` summed across a pull and its resumes equals the manifest's
+    /// chunk count exactly once — the witness for "each chunk adopted exactly
+    /// once".
+    pub blob_dag_chunks: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
     /// the live announce-intake map under **capacity backpressure** (the
     /// `MAX_PEERS` cap in `transport::reticulum`).
@@ -1297,6 +1318,29 @@ impl EdgeMetrics {
             .or_insert(0) += 1;
     }
 
+    /// CIRISEdge#739 — add one sample to a chunk-DAG phase clock.
+    pub fn add_blob_dag_phase(&self, phase: &'static str, elapsed: std::time::Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let mut phases = self.blob_dag_phases.write();
+        let slot = phases.entry(phase).or_insert((0, 0));
+        slot.0 = slot.0.saturating_add(ns);
+        slot.1 = slot.1.saturating_add(1);
+    }
+
+    /// CIRISEdge#739 — count chunks in the DAG pull's ledger by outcome.
+    pub fn add_blob_dag_chunks(&self, outcome: &'static str, n: u64) {
+        let mut chunks = self.blob_dag_chunks.write();
+        let slot = chunks.entry(outcome).or_insert(0);
+        *slot = slot.saturating_add(n);
+    }
+
+    /// CIRISEdge#739 — raise a high-water mark in the DAG pull's ledger.
+    pub fn max_blob_dag_chunks(&self, gauge: &'static str, value: u64) {
+        let mut chunks = self.blob_dag_chunks.write();
+        let slot = chunks.entry(gauge).or_insert(0);
+        *slot = (*slot).max(value);
+    }
+
     /// CIRISEdge#640 — count one blob-route refusal by its branch tag.
     pub fn inc_blob_route_refusal(&self, reason_tag: &'static str) {
         *self
@@ -1601,6 +1645,18 @@ impl EdgeMetrics {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
+            blob_dag_phases: self
+                .blob_dag_phases
+                .read()
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
+            blob_dag_chunks: self
+                .blob_dag_chunks
+                .read()
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), *v))
+                .collect(),
             blob_route_refusals: self
                 .blob_route_refusals
                 .read()
@@ -1691,6 +1747,11 @@ pub struct EdgeMetricsBundle {
     pub blob_pull_sources: HashMap<String, u64>,
     /// CIRISEdge#717 — pulls that refused to store, by reason.
     pub blob_pull_refusals: HashMap<String, u64>,
+    /// CIRISEdge#739 — chunk-DAG phase clocks, `(total ns, samples)` by phase.
+    pub blob_dag_phases: HashMap<String, (u64, u64)>,
+    /// CIRISEdge#739 — chunk-DAG chunk ledger by outcome (`adopted`,
+    /// `skipped_held`, `in_flight_peak`).
+    pub blob_dag_chunks: HashMap<String, u64>,
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
     /// `unbound` / `not_applicable`). The door never drops.
     pub bootstrap_door_outcomes: HashMap<String, u64>,

@@ -353,8 +353,9 @@ pub use meaning::{BlobMeaning, MeaningRefusal};
 pub mod pull;
 pub use pull::{
     check_dag_plan, parse_clear_manifest, BlobPuller, DagByteFetch, DagPlan, DagPullRefusal,
-    PullConfig, PullOffer, PullOutcome, PullRequest, PullSink, PULL_REFUSAL_DAG_CHUNK_MISMATCH,
-    PULL_REFUSAL_DAG_CHUNK_MISSING, PULL_REFUSAL_DAG_MANIFEST_MISMATCH, PULL_REFUSAL_DAG_OVER_CAP,
+    PullConfig, PullOffer, PullOutcome, PullRequest, PullSink, DEFAULT_DAG_BYTES_IN_FLIGHT,
+    DEFAULT_DAG_CHUNKS_IN_FLIGHT, PULL_REFUSAL_DAG_CHUNK_MISMATCH, PULL_REFUSAL_DAG_CHUNK_MISSING,
+    PULL_REFUSAL_DAG_MANIFEST_MISMATCH, PULL_REFUSAL_DAG_OVER_CAP,
     PULL_REFUSAL_DAG_TOTAL_SIZE_MISMATCH, PULL_REFUSAL_NO_EPOCH, PULL_REFUSAL_SIZE_MISMATCH,
 };
 
