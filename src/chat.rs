@@ -1425,7 +1425,12 @@ impl UnopenedReason {
             // CIRISEdge#737 — a range past the end is the file reader's to
             // name (`FileError::RangeNotSatisfiable`) before it reaches here;
             // a chat body is never read by range, so here it is a fault.
-            E::RangeNotSatisfiable { .. } | E::Substrate(_) => Self::Substrate { detail },
+            // CIRISEdge#744 — the two streamed-WRITE refusals never arise on
+            // a read; if one reached here it is a fault, not a reader state.
+            E::RangeNotSatisfiable { .. }
+            | E::DeclaredLengthMismatch { .. }
+            | E::Reader { .. }
+            | E::Substrate(_) => Self::Substrate { detail },
         }
     }
 }

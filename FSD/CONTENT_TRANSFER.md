@@ -610,7 +610,9 @@ and `GroupContentStore::seal_chunked` is the door: `put_blob_chunk_scoped` per 2
 answer to "is this chunked"** — one fact, one member, no way for two to disagree — while
 `content_sha256` is the MANIFEST's, which is what a reader opens and what the row cites. A reader
 opens it through the same door as an inline blob **up to persist's 64 MiB whole-read cap**; above it
-the file is read by range or streamed chunk by chunk, and a whole `open` refuses by name (§6.7.3).
+the file is read by range or streamed chunk by chunk, and a whole `open` refuses by name (§6.7.3). The
+write streams too: `files::publish_stream` seals from a reader one chunk at a time, and `publish` is it
+over a slice (§6.7.4).
 
 #### 6.7.0 Who authors a file — the person, co-signed by the node (CIRISEdge#675)
 
@@ -1058,6 +1060,95 @@ reader's. A 100 MiB self file therefore pulls to the owner's other device and is
 **API note.** `FileRow::open` / `open_described` now return `FileError` (with `FileError::Unopened(UnopenedReason)`
 carrying the drive's two-state answer unchanged, and `FileError::kind()` answering the reason's `kind`), so a
 host's status mapping keeps its words and gains `above_whole_read_cap` / `range_not_satisfiable`.
+
+#### 6.7.4 Write — sealed chunk by chunk from a reader; the row crosses after the last chunk (CIRISEdge#744, lane 8 of #734)
+
+§6.7.3 made every read above 64 MiB a range or a chunk walk. The write was still whole: `files::publish`
+took `FileWrite { bytes: &[u8] }`, so a 2 GiB publish held 2 GiB before persist saw a byte — and a host
+receiving an upload had to buffer the body to call it (the server's 64 MiB upload cap exists for that
+reason alone). The chunk doors were already per-chunk (`put_blob_chunk_scoped`, then
+`seal_stream_scoped`); only the argument was whole.
+
+**The door.** `files::publish_stream(directory, store, signers, &FileStreamWrite { room, declared_len,
+media_type, codec, filename, asserted_at }, reader)` where `reader: impl tokio::io::AsyncRead + Unpin +
+Send`. `files::publish(bytes)` is this over the slice (`FileStreamWrite::of(write)`, the slice as the
+reader) — **one seal path**, and `GroupContentStore::seal_chunked(slice)` is likewise a slice over the
+store's new streaming door `seal_chunked_stream(StreamSealRequest { .., declared_len, .. }, reader)`.
+
+**The streaming rule.**
+
+1. **Shape by the DECLARED length, before a byte is read** — the one boundary §6.7 names
+   (`must_chunk`, CC 2.6.1.3 / persist's inline cap). At or below it the reader is read whole (≤ 1 MiB)
+   and sealed inline through `seal` exactly as before: an inline file's row shape does not change. A
+   reader that then disagrees with its declaration is refused, never re-routed to the other shape.
+2. **Above it, one chunk in hand.** The store reads `CHUNK_BYTES` (256 KiB) at a time into ONE reused
+   buffer, **filling each chunk fully unless the reader ends** — so chunk boundaries are `seq ×
+   CHUNK_BYTES` whatever the reader's pace (a socket's short reads, a multipart body's frames), exactly
+   the slice path's — and hands each to `put_blob_chunk_scoped(scope, group, stream_id, seq, chunk,
+   STREAM_EPOCH, row_aad)` as it arrives. `stream_id` (`file-<uuid>`), `seq` (0..n) and the position AAD
+   (`chunk_aad(row_aad, stream_id, seq)`, persist's) are the slice path's, unchanged. The plaintext's
+   size and SHA-256 — the descriptor's inputs (`content_digest`, `size`, §6.7.1) — are folded in chunk
+   by chunk; the store's describe step now takes those two, never the plaintext.
+3. **The stream seals after the LAST chunk lands** and the count equals `declared_len`:
+   `seal_stream_scoped` (the manifest, its grants, D9's one access set), then the sealed descriptor over
+   the manifest. Only a sealed stream becomes a pointer; only a pointer becomes a `file:v1` row; the row
+   is authored and crosses (§6.9) after that — **so a row never names a partial file**, and the
+   replicating half of a publish is untouched by this lane.
+
+Peak buffering: the chunk in hand plus persist's copies of the chunk it is sealing (screen, envelope,
+row body) and, at the seal, the manifest — a constant, not the file. Witnessed by a counting global
+allocator (SW1).
+
+**The refusal.** A reader that yields fewer bytes than declared (EOF early) or more (a chunk crossing
+the declaration) is **`FileError::DeclaredLengthMismatch { declared, read }`** (`kind()` =
+`declared_length_mismatch`; the store's `GroupContentError::DeclaredLengthMismatch`). `read` is exact
+for a short reader; a long one is stopped at the first chunk past `declared` — never drained, it may not
+end — so `read` is then a lower bound, `> declared`. A reader I/O error is **`FileError::Read { room,
+read, detail }`** (`kind()` = `read`). Either way: **no manifest, no pointer, no `file:v1` row**, nothing
+crosses.
+
+**What the chunks already written become — deterministic, from persist's code at the pin.** Persist has
+no GC (`federation::blobs`, "Why no GC in v0.1": blobs persist until a door deletes them), no chunk
+announces anything (`put_blob_chunk_scoped` writes no `holds_bytes`; only the seal announces, and
+`invisible_encrypted` never does), and no manifest names them, so nothing would ever pull them — they
+would sit on the author's disk forever. So the store **evicts them before the refusal returns**, through
+persist's one eviction door `Engine::evict_blob` (retract this node's `holds_bytes` for the sha — a
+chunk has none — then delete the blob row with its at-rest grants and epoch binding in one transaction,
+§11.5 I19):
+
+| tier | chunks written before the refusal |
+|---|---|
+| `invisible_encrypted` (self/family), `community_dek` | **evicted**: each is sealed under a fresh DEK / a random nonce, so its ciphertext sha is this write's alone and nothing else can cite it |
+| `plaintext` | **left in place**: the sha is the content's, and may be a chunk another file's manifest names; unreferenced by this write and unannounced |
+
+The same holds when the chunk door or the seal door itself refuses mid-stream. What an eviction does
+not remove, because persist has no door for it: the stream bookkeeping rows (`federation_streams`,
+`federation_stream_chunks` — ids and sizes, no bytes; `stream_chunks` lists nothing once the blobs are
+gone), and the per-chunk `key_grant` sets `put_blob_chunk_scoped` already emitted (§14, "the key follows
+the chunk") — they replicate to the self-collective as wraps of DEKs for ciphertext that exists nowhere
+(SW2 counts them: 36 sets for the 36 chunks of a refused 9 MiB write). The eviction is best-effort by
+construction: the refusal the caller gets is why the write failed, and an eviction failure is logged
+beside it, never substituted for it.
+
+**The manifest bound — the real ceiling of one file today.** Persist stores the sealed manifest inline,
+and `seal_stream_with_scope` refuses a manifest body above the 1 MiB inline cap. A v2 manifest entry is
+`{"seq":N,"sha":"<64 hex>","size":262144}` — about 100 bytes — so at edge's 256 KiB `CHUNK_BYTES` one
+file tops out near **10 400 chunks ≈ 2.5 GiB** (2 GiB = 8 192 chunks ≈ 0.82 MiB of manifest, inside
+it). Above that the stream refuses AT THE SEAL, after every chunk was written (the chunks are then
+evicted, above). §6.7.3's "16 TiB per stream" is `MAX_CHUNKS_PER_EPOCH` × 1 MiB and is not reachable
+through an inline manifest; the next lever is edge's chunk size (1 MiB chunks ≈ 10 GiB), then a
+nested/External manifest in persist.
+
+| # | Invariant | Witness (`tests/file_publish_stream_744.rs`) |
+|---|---|---|
+| SW1 | A 2 GiB self file (`invisible_encrypted`, 8 192 × 256 KiB) published from a generating reader handing out jagged 100 003-byte reads — the file never materialized — seals with the publish's peak live allocation over its baseline < 32 MiB (counting global allocator), the pointer's `content_digest` = the generator's sha256, and `FileRow::chunks()` on the author reads 8 192 items hashing to it | `a_2_gib_self_file_publishes_from_a_reader_holding_a_few_chunks` |
+| SW2 | Declared 10 MiB, yields 9 MiB → `DeclaredLengthMismatch { declared: 10 MiB, read: 9 MiB }` by name; no `file:v1` row, the drive lists nothing new, `federation_blob_bytes` unchanged (the 36 written chunks evicted — the witness goes red with the eviction removed); a long reader (2 → 3 MiB) and both inline-sized cases (short, long) refused the same way | `a_reader_that_does_not_yield_its_declared_length_publishes_nothing_by_name` |
+| SW3 | A 200 KiB (inline) and a 1.3 MiB (DAG) file through `publish` and through `publish_stream` give the same pointer modulo per-write randomness (at-rest sha, `stream_id`, the sealed descriptor's nonce), the same row shape and columns, the same grant split, the same chunk boundaries, and open + describe identically | `publish_and_publish_stream_produce_the_same_row_and_read_the_same` |
+
+**API note.** New: `files::publish_stream`, `files::FileStreamWrite` (+ `::of`), `FileError::{DeclaredLengthMismatch,
+Read}`; `group_content::{StreamSealRequest (+ ::of, ::aad), ContentReader}`,
+`GroupContentStore::seal_chunked_stream` (default: a named `Substrate` refusal),
+`GroupContentError::{DeclaredLengthMismatch, Reader}`. `publish`'s signature and behaviour are unchanged.
 
 ### 6.8 The drive read is a gated query (CIRISPersist#891 — shipped v46.4.0, adopted v30.0.0)
 

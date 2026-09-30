@@ -478,7 +478,7 @@ ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v18.0.0
 ciris-verify-core = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v18.0.0", version = "18" }
 
 # Async runtime
-tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio       = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
 async-trait = "0.1"
 futures     = "0.3"
 # v7.0.12 (CIRISEdge#217) — runtime-agnostic Delay primitive for
