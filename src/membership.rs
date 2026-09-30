@@ -552,10 +552,10 @@ pub async fn widen_on_acceptance(
 /// → `add_community_member`. Family: a signed `FamilyMembershipWidening` →
 /// `put_family_membership_widening`. persist admits it only on a matching
 /// live acceptance by `member_key_id`; without one the refusal comes back by
-/// rule — and where the member only ever DECLINED a proposal into this group,
-/// edge names it `membership_declined` (terminal) rather than persist's
-/// `membership_acceptance_unresolved`. `Ok(false)` = the member was already
-/// active (no row written).
+/// persist's rule, verbatim (a member who only ever DECLINED is refused
+/// `membership_declined`, terminal, by persist itself since v52 — CIRISPersist
+/// #955 follow-up; edge keeps no second copy of that rule). `Ok(false)` = the
+/// member was already active (no row written).
 ///
 /// # Errors
 /// Build/sign failure, or persist's refusal.
@@ -568,7 +568,7 @@ pub async fn widen(
     at: chrono::DateTime<chrono::Utc>,
     authority: &crate::identity::LocalSigner,
 ) -> Result<bool, MembershipError> {
-    let out = widen_at_door(
+    widen_at_door(
         directory,
         scope,
         group_key_id,
@@ -577,52 +577,7 @@ pub async fn widen(
         at,
         authority,
     )
-    .await;
-    match out {
-        Err(MembershipError::Refused { rule, .. }) if rule == RULE_ACCEPTANCE_UNRESOLVED => {
-            // persist's growth gate ranks `membership_declined` only among
-            // ACCEPTANCES whose proposal was also declined; a member who only
-            // ever declined leaves no acceptance at all, so the door says
-            // "unresolved" (retryable). Edge names the decline instead — the
-            // member said no to this group, and waiting will not change that;
-            // only a NEW proposal and its acceptance can.
-            if declined_group(directory, scope, group_key_id, member_key_id).await? {
-                Err(MembershipError::Refused {
-                    group_key_id: group_key_id.to_owned(),
-                    member_key_id: member_key_id.to_owned(),
-                    rule: RULE_DECLINED,
-                })
-            } else {
-                out
-            }
-        }
-        other => other,
-    }
-}
-
-/// Has `member` declined a proposal into `group` and accepted none?
-async fn declined_group(
-    directory: &dyn FederationDirectory,
-    scope: GroupScope,
-    group: &str,
-    member: &str,
-) -> Result<bool, MembershipError> {
-    let replies: Vec<Attestation> = directory
-        .list_attestations_for(member)
-        .await
-        .map_err(|e| MembershipError::from_persist("list replies", &e))?
-        .into_iter()
-        .filter(|r| {
-            r.cohort_scope == scope.cohort_scope() && group_of(r, scope).as_deref() == Some(group)
-        })
-        .collect();
-    let accepted = replies
-        .iter()
-        .any(|r| dimension_of(r) == Some(ACCEPTANCE_DIMENSION));
-    let declined = replies
-        .iter()
-        .any(|r| dimension_of(r) == Some(DECLINE_DIMENSION));
-    Ok(declined && !accepted)
+    .await
 }
 
 async fn widen_at_door(
