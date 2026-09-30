@@ -481,6 +481,15 @@ pub enum ChunkSourceRefusal {
     /// `Engine::serve_blob_to_peer` and observes
     /// `BlobError::DiskPressureProxyRefused`.
     DiskPressure,
+    /// CIRISEdge#717 — the request named a DAG (`blob_sha256`) and a chunk
+    /// (`chunk_sha256 != blob_sha256`) that is not one of that DAG's chunks
+    /// in this store. The scope gate judged the NAMED file; serving a chunk
+    /// outside it would serve content the gate never judged. On the wire it
+    /// is `PolicyDenied` — as every serve-gate refusal is, so an unentitled
+    /// peer is not told which gate it failed — and locally it is booked as
+    /// `chunk_not_in_named_dag` in the withhold ledger and
+    /// `blob_serve_refusals`.
+    ChunkNotInNamedDag,
 }
 
 impl ChunkSourceRefusal {
@@ -490,7 +499,9 @@ impl ChunkSourceRefusal {
         match self {
             Self::Withdrawn => crate::messages::MissReason::Withdrawn,
             Self::Revoked => crate::messages::MissReason::Revoked,
-            Self::PolicyDenied => crate::messages::MissReason::PolicyDenied,
+            Self::PolicyDenied | Self::ChunkNotInNamedDag => {
+                crate::messages::MissReason::PolicyDenied
+            }
             Self::DiskPressure => crate::messages::MissReason::DiskPressure,
         }
     }

@@ -236,7 +236,11 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         // address this node does not hold, or one on a path it did not take,
         // is a recipient outside the context.
         | WithholdReason::BlobDiscriminatorUnheld
-        | WithholdReason::BlobDiscriminatorOnDerivedAddress => CiParameter::Recipient,
+        | WithholdReason::BlobDiscriminatorOnDerivedAddress
+        // CIRISEdge#717 — the requester demonstrated membership of the NAMED
+        // file's context; a chunk outside that file is content from a context
+        // it did not demonstrate.
+        | WithholdReason::ChunkNotInNamedDag => CiParameter::Recipient,
 
         // CIRISEdge#499 (holdings plane) — "I hold this" is itself a
         // flow, and before this cut a family-scoped holding's content id
@@ -846,7 +850,7 @@ mod tests {
     /// So: when adding a reason, add it here too, and on a merge that touches
     /// this file check the count against the enum rather than trusting a
     /// green suite.
-    const ALL_REASONS: [WithholdReason; 48] = [
+    const ALL_REASONS: [WithholdReason; 49] = [
         WithholdReason::EnvelopeUnfetchable,
         WithholdReason::LocalIdentityMissing,
         WithholdReason::SendSetUnresolved,
@@ -871,6 +875,7 @@ mod tests {
         WithholdReason::AccordRelayObjectRootUnnamed,
         WithholdReason::AccordRelayObjectRootDisagrees,
         WithholdReason::BlobScopeUndeterminable,
+        WithholdReason::ChunkNotInNamedDag,
         WithholdReason::BlobArrivalScopeInsufficient,
         WithholdReason::BlobArrivalGroupMismatch,
         WithholdReason::BlobDiscriminatorUnheld,

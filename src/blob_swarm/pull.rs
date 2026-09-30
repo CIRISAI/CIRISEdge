@@ -705,8 +705,22 @@ pub trait DagByteFetch: Send + Sync {
 /// The production [`DagByteFetch`] (CIRISEdge#739): the pull's holders
 /// ROUTED ONCE, then one `fetch_blob_chunk_scoped` per address — a chunk is
 /// its own content-addressed row on the holder, served by
-/// `PersistBlobChunkSource` exactly as a whole blob is, and asked for as one
-/// (`blob = chunk = sha`). Holder selection is the swarm's own rule
+/// `PersistBlobChunkSource` exactly as a whole blob is, and asked for as
+/// `(blob = the DAG's address, chunk = sha)`: the manifest as `(dag, dag)`,
+/// each chunk as `(dag, chunk)`.
+///
+/// **Why the blob field is the DAG's, never the chunk's** (CIRISEdge#717,
+/// field regression on v36.1.0): the holder's serve gate (CIRISEdge#499)
+/// asks its chunk source for the SCOPE of the request's `blob_sha256`, and a
+/// source answers that from a row that references the blob. A row references
+/// the MANIFEST (the pointer's `content_sha256`); nothing references a
+/// chunk. A self or family chunk has no community-DEK binding either, so a
+/// request naming the chunk as its blob reads as `scope undeterminable` and
+/// is withheld as `PolicyDenied` — every chunk, every retry, on every
+/// scope-native holder, while the manifest (whose blob IS its row's) was
+/// served. Naming the DAG puts the gate on the reference the row made, and a
+/// withdrawal of that row (CIRISEdge#606) now refuses the chunks as it
+/// refuses the manifest. Holder selection is the swarm's own rule
 /// (`pick_peer`: lowest EWMA RTT with capacity, untimed holders first) kept
 /// across the whole DAG in `peers`, so the second chunk already knows what
 /// the first learned; a holder that misses or errors is struck and, at the
@@ -726,6 +740,9 @@ struct SwarmFetch {
     /// The pipeline's `K`: the per-holder capacity here, since the pipeline
     /// itself never has more than `K` requests outstanding in total.
     lanes: u32,
+    /// The DAG's address — the manifest's sha, the pointer's
+    /// `content_sha256` — named as the `blob` of every request.
+    dag: [u8; 32],
     blob_hex: String,
     routes: tokio::sync::OnceCell<Result<HashMap<String, super::BlobRecipient>, String>>,
     peers: Mutex<HashMap<String, super::PeerState>>,
@@ -738,7 +755,7 @@ impl SwarmFetch {
         meaning: BlobMeaning,
         swarm: SwarmConfig,
         lanes: usize,
-        blob_hex: String,
+        dag: [u8; 32],
     ) -> Self {
         let peers = holders
             .iter()
@@ -750,7 +767,8 @@ impl SwarmFetch {
             meaning,
             swarm,
             lanes: u32::try_from(lanes.max(1)).unwrap_or(u32::MAX),
-            blob_hex,
+            dag,
+            blob_hex: hex::encode(dag),
             routes: tokio::sync::OnceCell::new(),
             peers: Mutex::new(peers),
         }
@@ -824,7 +842,7 @@ impl DagByteFetch for SwarmFetch {
             let started = Instant::now();
             match self
                 .edge
-                .fetch_blob_chunk_scoped(recipient, sha, sha, timeout)
+                .fetch_blob_chunk_scoped(recipient, self.dag, sha, timeout)
                 .await
             {
                 Ok(crate::ChunkResult::Bytes(bytes)) => {
@@ -1516,7 +1534,7 @@ where
             meaning.clone(),
             self.config.swarm.clone(),
             self.config.dag_chunks_in_flight,
-            hex::encode(sha),
+            sha,
         );
         self.pull_dag_inner(row, sha, attempts, meaning, &fetch)
             .await
