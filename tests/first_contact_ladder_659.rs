@@ -451,6 +451,7 @@ async fn start_runtime(
                 scheduler: SchedulerConfig {
                     cadence: Duration::from_secs(3),
                     round_timeout: Duration::from_secs(15),
+                    ..SchedulerConfig::default()
                 },
                 local_key_id: Some(node.key.key_id.clone()),
                 metrics: Some(node.metrics.clone()),

@@ -33,15 +33,33 @@
 //!
 //! [`MIN_MAX_BLOCKING_THREADS`] is a hard clamp, not a suggestion, because
 //! starving this pool can WEDGE a runtime rather than merely slow it.
-//! Edge's replication directory adapter calls
-//! [`tokio::task::block_in_place`] (`src/replication/directory.rs`, six
-//! sites). That call transitions the calling worker into a blocking thread
-//! and needs a replacement to take over its queue — drawn from this same
-//! pool. Set the pool below what the in-flight `block_in_place` calls plus
-//! persist's connection waiters need, and the runtime can run out of
-//! threads to hand the work to. This is the same shape as the history
-//! CIRISServer#446/#501 records, where a serving node with too few threads
-//! stopped calling `accept()` while `Recv-Q` climbed.
+//! Persist's SQL — and the wait for a connection — runs on this pool, and
+//! every FFI entry that bridges a foreign (non-tokio) thread onto the
+//! runtime with [`tokio::task::block_in_place`] (`src/ffi/uniffi_impl*.rs`,
+//! the pyo3 Python-callback seams) needs a replacement worker drawn from
+//! this same pool. Set the pool below what those plus persist's connection
+//! waiters need, and the runtime can run out of threads to hand the work
+//! to. This is the same shape as the history CIRISServer#446/#501 records,
+//! where a serving node with too few threads stopped calling `accept()`
+//! while `Recv-Q` climbed.
+//!
+//! # What the floor could never protect against (CIRISEdge#740)
+//!
+//! Until v34.3.0 the replication directory adapter
+//! (`src/replication/directory.rs`) bridged the sync provider traits with
+//! `block_in_place` + `Handle::block_on` — six sites on the round's path.
+//! Each concurrent bridged read held one pool slot (its replacement worker)
+//! WHILE waiting for a second (the persist read behind it), so the demand
+//! was `2 × in-flight reads`, and a kicked round runs every (peer, kind) at
+//! once: 3 peers × 14 kinds = 42 held slots against this 32-slot default
+//! and the node stopped. No floor fixes a demand that scales with the peer
+//! count; the bridge is gone (the traits are async end to end) and the
+//! scheduler bounds concurrent rounds to half the pool
+//! ([`SchedulerConfig::max_concurrent_rounds_for`]), so rounds can never
+//! take more than half of it.
+//!
+//! [`SchedulerConfig::max_concurrent_rounds_for`]:
+//!     crate::replication::SchedulerConfig::max_concurrent_rounds_for
 //!
 //! # What this deliberately does NOT address
 //!
@@ -66,15 +84,26 @@ pub const MAX_BLOCKING_ENV: &str = "CIRIS_RUNTIME_MAX_BLOCKING_THREADS";
 /// Default ceiling on the blocking pool, replacing tokio's 512.
 ///
 /// Sized against what actually queues there in the fold: persist's read
-/// pool tops out at 8 readers plus 1 writer, `block_in_place` replacements
-/// are bounded by the runtime's worker count (2 or 4), and the rest is
-/// headroom for bursts. 32 is ~3.5x the concurrent-SQL ceiling and 16x
-/// below tokio's default.
+/// pool tops out at 8 readers plus 1 writer, FFI `block_in_place`
+/// replacements are bounded by the runtime's worker count (2 or 4), the
+/// scheduler puts at most half of this on the pool as in-flight rounds
+/// (CIRISEdge#740), and the rest is headroom for bursts. 32 is ~3.5x the
+/// concurrent-SQL ceiling and 16x below tokio's default.
 pub const DEFAULT_MAX_BLOCKING_THREADS: usize = 32;
+
+// CIRISEdge#740 — a full round fan-out (the scheduler's default bound) must
+// still leave persist's 8 readers + 1 writer a pool slot each. Checked at
+// compile time: moving either constant past this line is a build failure.
+const _: () = assert!(
+    DEFAULT_MAX_BLOCKING_THREADS
+        - crate::replication::SchedulerConfig::DEFAULT_MAX_CONCURRENT_ROUNDS
+        > 8,
+    "a full fan-out must still leave persist's 8 readers + 1 writer a slot each",
+);
 
 /// Hard floor on the blocking pool — see the module docs on wedging.
 /// Covers persist's 9 concurrent connections plus a worker's worth of
-/// `block_in_place` replacements, with room to spare.
+/// FFI `block_in_place` replacements, with room to spare.
 pub const MIN_MAX_BLOCKING_THREADS: usize = 16;
 
 /// A resolved thread budget for one tokio runtime.
@@ -82,7 +111,7 @@ pub const MIN_MAX_BLOCKING_THREADS: usize = 16;
 pub struct RuntimeBudget {
     /// Async worker threads.
     pub worker_threads: usize,
-    /// Ceiling on the blocking pool (`spawn_blocking` + `block_in_place`
+    /// Ceiling on the blocking pool (`spawn_blocking` + FFI `block_in_place`
     /// replacements).
     pub max_blocking_threads: usize,
 }
@@ -136,8 +165,8 @@ impl RuntimeBudget {
                 using = max_blocking_threads,
                 env = MAX_BLOCKING_ENV,
                 "runtime budget: blocking pool floor enforced — persist's connection \
-                 waiters and block_in_place replacements share this pool, and starving \
-                 it stalls the runtime rather than slowing it",
+                 waiters and FFI block_in_place replacements share this pool, and \
+                 starving it stalls the runtime rather than slowing it",
             );
         }
 
@@ -246,7 +275,7 @@ mod tests {
 
     #[test]
     fn the_floor_clears_what_actually_contends_for_the_pool() {
-        // persist's read pool ceiling (8) + its writer, plus a
+        // persist's read pool ceiling (8) + its writer, plus an FFI
         // `block_in_place` replacement for every worker on edge's widest
         // production runtime (edge_node, 4).
         let persist_connections = 8 + 1;
@@ -254,6 +283,29 @@ mod tests {
         assert!(
             MIN_MAX_BLOCKING_THREADS >= persist_connections + widest_worker_count,
             "the floor must clear persist's connections plus block_in_place replacements",
+        );
+    }
+
+    /// CIRISEdge#740 — the scheduler's round bound is derived from THIS
+    /// budget's default, and it must leave persist's connections room on the
+    /// same pool: rounds may take at most half.
+    #[test]
+    fn the_default_round_bound_leaves_persist_half_the_default_pool() {
+        use crate::replication::SchedulerConfig;
+        assert_eq!(
+            SchedulerConfig::DEFAULT_MAX_CONCURRENT_ROUNDS,
+            DEFAULT_MAX_BLOCKING_THREADS / 2,
+        );
+        assert_eq!(SchedulerConfig::max_concurrent_rounds_for(32), 16);
+        assert_eq!(
+            SchedulerConfig::max_concurrent_rounds_for(1),
+            1,
+            "never zero"
+        );
+        assert_eq!(
+            SchedulerConfig::max_concurrent_rounds_for(0),
+            1,
+            "never zero"
         );
     }
 

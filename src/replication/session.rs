@@ -345,7 +345,7 @@ impl Session {
     /// responders wait for an inbound Summary via [`Self::on_message`].
     /// A Responder `start_round` is refused with
     /// [`ReplicationOutcome::UnexpectedMessage`] (state untouched).
-    pub fn start_round(&mut self, provider: &dyn StateProvider) -> ReplicationOutcome {
+    pub async fn start_round(&mut self, provider: &dyn StateProvider) -> ReplicationOutcome {
         if !matches!(self.role, SessionRole::Initiator) {
             // Release-safe guard (was a `debug_assert!` that compiled OUT of
             // release builds, so a mis-scheduled production Responder would
@@ -376,7 +376,7 @@ impl Session {
                 },
             )]);
         }
-        let refs = provider.local_refs(self.kind);
+        let refs = provider.local_refs(self.kind).await;
         let summary = SummaryMessage {
             kind: self.kind,
             refs: refs.clone(),
@@ -428,7 +428,7 @@ impl Session {
             let mut envelopes: Vec<Vec<u8>> = Vec::new();
             let mut budget_used = 0usize;
             for r in candidates {
-                let Some(bytes) = provider.fetch_envelope(self.kind, &r.envelope_hash) else {
+                let Some(bytes) = provider.fetch_envelope(self.kind, &r.envelope_hash).await else {
                     continue;
                 };
                 if budget_used + bytes.len() > PROACTIVE_PUSH_BUDGET_BYTES && !envelopes.is_empty()
@@ -487,7 +487,7 @@ impl Session {
     /// - Inbound Deliver → Apply envelopes via [`StateApplier`]; mark
     ///   the round complete from our side.
     /// - Inbound Fetch → Same as Diff (responder fulfills the request).
-    pub fn on_message(
+    pub async fn on_message(
         &mut self,
         msg: ReplicationMessage,
         provider: &dyn StateProvider,
@@ -503,14 +503,16 @@ impl Session {
         match msg {
             ReplicationMessage::Summary(remote_summary) => {
                 self.on_summary(&remote_summary, provider, source_peer)
+                    .await
             }
-            ReplicationMessage::Diff(diff) => self.on_diff(&diff, provider, source_peer),
+            ReplicationMessage::Diff(diff) => self.on_diff(&diff, provider, source_peer).await,
             ReplicationMessage::Deliver(deliver) => {
                 self.on_deliver(&deliver, provider, applier, source_peer)
+                    .await
             }
-            ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch, provider, source_peer),
-            ReplicationMessage::Pull(pull) => self.on_pull(&pull, provider),
-            ReplicationMessage::CursorPull(cp) => self.on_cursor_pull(&cp, provider),
+            ReplicationMessage::Fetch(fetch) => self.on_fetch(&fetch, provider, source_peer).await,
+            ReplicationMessage::Pull(pull) => self.on_pull(&pull, provider).await,
+            ReplicationMessage::CursorPull(cp) => self.on_cursor_pull(&cp, provider).await,
         }
     }
 
@@ -526,7 +528,7 @@ impl Session {
     /// is a `Duplicate`, never a double-count. An empty result is a well-formed
     /// empty `Deliver`: the round still completes (the reply is solicited via the
     /// requester's `awaiting_cursor_deliver`), no timeout, no unsolicited WARN.
-    fn on_cursor_pull(
+    async fn on_cursor_pull(
         &mut self,
         pull: &CursorPullMessage,
         provider: &dyn StateProvider,
@@ -534,7 +536,7 @@ impl Session {
         if pull.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
-        let envelopes = provider.accord_evidence_since(self.kind, pull.since);
+        let envelopes = provider.accord_evidence_since(self.kind, pull.since).await;
         ReplicationOutcome::Send(vec![ReplicationMessage::Deliver(DeliverMessage {
             kind: self.kind,
             envelopes,
@@ -639,11 +641,15 @@ impl Session {
     /// coming.
     const PULL_EXEMPT_ROUNDS: u8 = 3;
 
-    fn on_pull(&mut self, pull: &PullMessage, provider: &dyn StateProvider) -> ReplicationOutcome {
+    async fn on_pull(
+        &mut self,
+        pull: &PullMessage,
+        provider: &dyn StateProvider,
+    ) -> ReplicationOutcome {
         if pull.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
-        let refs = provider.subject_refs(self.kind, &pull.subject_key_id);
+        let refs = provider.subject_refs(self.kind, &pull.subject_key_id).await;
         let summary = SummaryMessage {
             kind: self.kind,
             refs,
@@ -655,7 +661,7 @@ impl Session {
         ReplicationOutcome::Send(vec![ReplicationMessage::Summary(summary)])
     }
 
-    fn on_summary(
+    async fn on_summary(
         &mut self,
         remote: &SummaryMessage,
         provider: &dyn StateProvider,
@@ -674,7 +680,7 @@ impl Session {
         // responder with no consent to send to the initiator saw an empty offer,
         // so `want` became "everything" or the round went dark. `local_holdings`
         // is the node's peer-blind own-state; the offer + delivery stay send-gated.
-        let local = provider.local_holdings(self.kind);
+        let local = provider.local_holdings(self.kind).await;
         let mut want = diff_refs(&local, &remote.refs);
         // CIRISEdge#544 — the re-offer loop is RECEIVER-PULLED, and this is where
         // the pull is decided. `want` is memoryless: a refused row is never
@@ -760,7 +766,7 @@ impl Session {
         // (matching the initiator's sequence). For initiators, we
         // already sent our Summary in start_round; skip resending.
         if matches!(self.role, SessionRole::Responder) && self.last_summary_sent.is_none() {
-            let my_refs = provider.local_refs(self.kind);
+            let my_refs = provider.local_refs(self.kind).await;
             let my_summary = SummaryMessage {
                 kind: self.kind,
                 refs: my_refs,
@@ -811,7 +817,7 @@ impl Session {
     /// than one page (every plane on a small mesh) it is still the very next
     /// round. The re-sweep is what keeps this sentence true; see
     /// `bridge::PlaneWatermark`.
-    fn pack_bounded_deliver(
+    async fn pack_bounded_deliver(
         &self,
         want: &[[u8; 32]],
         provider: &dyn StateProvider,
@@ -820,7 +826,7 @@ impl Session {
         let mut dropped: Vec<[u8; 32]> = Vec::new();
         let mut packed_bytes = 0usize;
         for h in want {
-            let Some(bytes) = provider.fetch_envelope(self.kind, h) else {
+            let Some(bytes) = provider.fetch_envelope(self.kind, h).await else {
                 dropped.push(*h);
                 continue;
             };
@@ -835,7 +841,7 @@ impl Session {
         (envelopes, dropped)
     }
 
-    fn on_diff(
+    async fn on_diff(
         &mut self,
         diff: &DiffMessage,
         provider: &dyn StateProvider,
@@ -844,7 +850,7 @@ impl Session {
         if diff.kind != self.kind {
             return ReplicationOutcome::UnexpectedMessage;
         }
-        let (envelopes, dropped) = self.pack_bounded_deliver(&diff.want, provider);
+        let (envelopes, dropped) = self.pack_bounded_deliver(&diff.want, provider).await;
         // CIRISEdge#429 — an advertised want we cannot serve must NEVER be inferred
         // from a short byte count. Say so, per-miss and in aggregate. NOT fatal: the
         // round still ships what it could, and the remainder re-diffs next round —
@@ -892,7 +898,7 @@ impl Session {
         ReplicationOutcome::Send(vec![deliver])
     }
 
-    fn on_fetch(
+    async fn on_fetch(
         &mut self,
         fetch: &FetchMessage,
         provider: &dyn StateProvider,
@@ -908,6 +914,7 @@ impl Session {
             provider,
             source_peer,
         )
+        .await
     }
 
     // CIRISEdge#552 pushed this past the 100-line bound. One scenario — decide
@@ -915,7 +922,7 @@ impl Session {
     // in a different function from the apply it guards, which is the coupling
     // worth keeping visible.
     #[allow(clippy::too_many_lines)]
-    fn on_deliver(
+    async fn on_deliver(
         &mut self,
         deliver: &DeliverMessage,
         // CIRISEdge#552 — the retention decision lives on the provider, and the
@@ -1061,7 +1068,10 @@ impl Session {
                     continue;
                 }
             }
-            match applier.apply_envelope(self.kind, env_bytes, source_peer) {
+            match applier
+                .apply_envelope(self.kind, env_bytes, source_peer)
+                .await
+            {
                 ApplyOutcome::Admitted => admitted += 1,
                 // Routine non-progress (a re-delivered held row) — quiet by design;
                 // WARN-ing every duplicate would drown the genuine refusals.
@@ -1208,11 +1218,12 @@ mod tests {
         envelopes: HashMap<[u8; 32], Vec<u8>>,
     }
 
+    #[async_trait::async_trait]
     impl StateProvider for TestProvider {
-        fn local_refs(&self, kind: EnvelopeKind) -> Vec<super::super::protocol::EnvelopeRef> {
+        async fn local_refs(&self, kind: EnvelopeKind) -> Vec<super::super::protocol::EnvelopeRef> {
             self.state.refs_for(kind)
         }
-        fn fetch_envelope(&self, _kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
+        async fn fetch_envelope(&self, _kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
             self.envelopes.get(h).cloned()
         }
     }
@@ -1234,8 +1245,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl StateApplier for TestApplier {
-        fn apply_envelope(
+        async fn apply_envelope(
             &self,
             kind: EnvelopeKind,
             bytes: &[u8],
@@ -1289,14 +1301,15 @@ mod tests {
     struct CursorProvider {
         bundles: Vec<Vec<u8>>,
     }
+    #[async_trait::async_trait]
     impl StateProvider for CursorProvider {
-        fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
             Vec::new()
         }
-        fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+        async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
             None
         }
-        fn accord_evidence_since(
+        async fn accord_evidence_since(
             &self,
             _kind: EnvelopeKind,
             _since: Option<chrono::DateTime<chrono::Utc>>,
@@ -1308,11 +1321,11 @@ mod tests {
     /// CIRISEdge#474 — an Initiator round for the cursor plane opens with a
     /// `CursorPull` (`since: None`), NEVER a Summary: the plane has no content-hash
     /// index, so the Summary/Diff/Fetch flow does not apply to it.
-    #[test]
-    fn cursor_round_initiator_opens_with_cursor_pull_not_summary() {
+    #[tokio::test]
+    async fn cursor_round_initiator_opens_with_cursor_pull_not_summary() {
         let provider = CursorProvider { bundles: vec![] };
         let mut init = Session::new(SessionRole::Initiator, EnvelopeKind::AccordQuorumEvidence);
-        match init.start_round(&provider) {
+        match init.start_round(&provider).await {
             ReplicationOutcome::Send(msgs) => {
                 assert_eq!(msgs.len(), 1, "one CursorPull, no Summary");
                 match &msgs[0] {
@@ -1329,8 +1342,8 @@ mod tests {
 
     /// CIRISEdge#474 — a Responder answers a `CursorPull` DIRECTLY with a `Deliver`
     /// of the provider's bundles (no Summary/Diff round-trip for an index-less plane).
-    #[test]
-    fn cursor_round_responder_serves_bundles_as_a_deliver() {
+    #[tokio::test]
+    async fn cursor_round_responder_serves_bundles_as_a_deliver() {
         let b1 = b"{\"proposal\":1}".to_vec();
         let b2 = b"{\"proposal\":2}".to_vec();
         let provider = CursorProvider {
@@ -1342,7 +1355,10 @@ mod tests {
             kind: EnvelopeKind::AccordQuorumEvidence,
             since: None,
         });
-        match resp.on_message(pull, &provider, &applier, Some("peer")) {
+        match resp
+            .on_message(pull, &provider, &applier, Some("peer"))
+            .await
+        {
             ReplicationOutcome::Send(msgs) => {
                 assert_eq!(msgs.len(), 1);
                 match &msgs[0] {
@@ -1364,8 +1380,8 @@ mod tests {
     /// CIRISEdge#474 — the full 2-message exchange: Initiator CursorPull → Deliver
     /// → the Initiator applies the delivered bundles (solicited via
     /// `awaiting_cursor_deliver`) and completes.
-    #[test]
-    fn cursor_round_initiator_applies_delivered_bundles_and_completes() {
+    #[tokio::test]
+    async fn cursor_round_initiator_applies_delivered_bundles_and_completes() {
         let b1 = b"{\"proposal\":\"a\"}".to_vec();
         let h1 = h(7);
         let provider = CursorProvider {
@@ -1373,7 +1389,7 @@ mod tests {
         };
         let applier = applier_for(&[(h1, b1.clone())]);
         let mut init = Session::new(SessionRole::Initiator, EnvelopeKind::AccordQuorumEvidence);
-        let ReplicationOutcome::Send(open) = init.start_round(&provider) else {
+        let ReplicationOutcome::Send(open) = init.start_round(&provider).await else {
             panic!("expected Send")
         };
         assert!(matches!(open[0], ReplicationMessage::CursorPull(_)));
@@ -1381,7 +1397,10 @@ mod tests {
             kind: EnvelopeKind::AccordQuorumEvidence,
             envelopes: vec![b1],
         });
-        match init.on_message(deliver, &provider, &applier, Some("peer")) {
+        match init
+            .on_message(deliver, &provider, &applier, Some("peer"))
+            .await
+        {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             other => panic!("expected Applied, got {other:?}"),
         }
@@ -1395,18 +1414,21 @@ mod tests {
     /// CIRISEdge#474 — an evidence-free peer answers with an EMPTY Deliver; the
     /// Initiator's round still completes cleanly (no timeout, no unsolicited WARN —
     /// the reply is solicited via `awaiting_cursor_deliver`).
-    #[test]
-    fn empty_cursor_pull_completes_the_round() {
+    #[tokio::test]
+    async fn empty_cursor_pull_completes_the_round() {
         let provider = CursorProvider { bundles: vec![] };
         let applier = applier_for(&[]);
         let mut init = Session::new(SessionRole::Initiator, EnvelopeKind::AccordQuorumEvidence);
-        let _ = init.start_round(&provider);
+        let _ = init.start_round(&provider).await;
         assert!(!init.is_complete());
         let empty = ReplicationMessage::Deliver(DeliverMessage {
             kind: EnvelopeKind::AccordQuorumEvidence,
             envelopes: vec![],
         });
-        match init.on_message(empty, &provider, &applier, Some("peer")) {
+        match init
+            .on_message(empty, &provider, &applier, Some("peer"))
+            .await
+        {
             ReplicationOutcome::Applied {
                 admitted, refused, ..
             } => {
@@ -1419,8 +1441,8 @@ mod tests {
     }
 
     /// Two peers with disjoint state converge in one round.
-    #[test]
-    fn full_sync_disjoint_state_converges() {
+    #[tokio::test]
+    async fn full_sync_disjoint_state_converges() {
         // Alice has envelopes {1, 2}; Bob has {3, 4}.
         let a_provider = provider_with(&[
             (EnvelopeKind::Key, h(1), b"env_1".to_vec(), 10),
@@ -1437,7 +1459,7 @@ mod tests {
         let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Key);
 
         // 1. Alice starts → sends Summary.
-        let alice_step1 = alice.start_round(&a_provider);
+        let alice_step1 = alice.start_round(&a_provider).await;
         let alice_summary = match alice_step1 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -1447,7 +1469,9 @@ mod tests {
         };
 
         // 2. Bob receives Alice's Summary → emits {Summary, Diff}.
-        let bob_step1 = bob.on_message(alice_summary, &b_provider, &b_applier, None);
+        let bob_step1 = bob
+            .on_message(alice_summary, &b_provider, &b_applier, None)
+            .await;
         let (bob_summary, bob_diff) = match bob_step1 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 2);
@@ -1458,7 +1482,9 @@ mod tests {
 
         // 3. Alice receives Bob's Summary → emits Diff. (Then
         //    receives Bob's Diff → emits Deliver.)
-        let alice_step2 = alice.on_message(bob_summary, &a_provider, &a_applier, None);
+        let alice_step2 = alice
+            .on_message(bob_summary, &a_provider, &a_applier, None)
+            .await;
         let alice_diff = match alice_step2 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -1468,7 +1494,9 @@ mod tests {
         };
 
         // 4. Bob receives Alice's Diff → emits Deliver(env_1, env_2).
-        let bob_step2 = bob.on_message(alice_diff, &b_provider, &b_applier, None);
+        let bob_step2 = bob
+            .on_message(alice_diff, &b_provider, &b_applier, None)
+            .await;
         let bob_deliver = match bob_step2 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -1478,7 +1506,9 @@ mod tests {
         };
 
         // 5. Alice receives Bob's Diff → emits Deliver(env_3, env_4).
-        let alice_step3 = alice.on_message(bob_diff, &a_provider, &a_applier, None);
+        let alice_step3 = alice
+            .on_message(bob_diff, &a_provider, &a_applier, None)
+            .await;
         let alice_deliver = match alice_step3 {
             ReplicationOutcome::Send(ref msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -1488,7 +1518,9 @@ mod tests {
         };
 
         // 6. Alice applies Bob's Deliver → admitted env_3 + env_4.
-        let alice_final = alice.on_message(bob_deliver, &a_provider, &a_applier, None);
+        let alice_final = alice
+            .on_message(bob_deliver, &a_provider, &a_applier, None)
+            .await;
         match alice_final {
             ReplicationOutcome::Applied {
                 admitted,
@@ -1504,7 +1536,9 @@ mod tests {
         }
 
         // 7. Bob applies Alice's Deliver → admitted env_1 + env_2.
-        let bob_final = bob.on_message(alice_deliver, &b_provider, &b_applier, None);
+        let bob_final = bob
+            .on_message(alice_deliver, &b_provider, &b_applier, None)
+            .await;
         match bob_final {
             ReplicationOutcome::Applied {
                 admitted,
@@ -1529,8 +1563,8 @@ mod tests {
 
     /// Partial overlap — peers share some envelopes; only the missing
     /// ones get delivered.
-    #[test]
-    fn partial_overlap_only_missing_delivered() {
+    #[tokio::test]
+    async fn partial_overlap_only_missing_delivered() {
         // Alice has {1, 2, 3}; Bob has {2, 3, 4}. The intersection is
         // {2, 3}; alice wants {4}; bob wants {1}.
         let a_provider = provider_with(&[
@@ -1550,32 +1584,49 @@ mod tests {
         let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
 
         // Mechanical round-drive (same as full_sync above).
-        let m_alice_summary = match alice.start_round(&a_provider) {
+        let m_alice_summary = match alice.start_round(&a_provider).await {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let (m_bob_summary, m_bob_diff) =
-            match bob.on_message(m_alice_summary, &b_provider, &b_applier, None) {
-                ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
-                _ => panic!(),
-            };
-        let m_alice_diff = match alice.on_message(m_bob_summary, &a_provider, &a_applier, None) {
+        let (m_bob_summary, m_bob_diff) = match bob
+            .on_message(m_alice_summary, &b_provider, &b_applier, None)
+            .await
+        {
+            ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
+            _ => panic!(),
+        };
+        let m_alice_diff = match alice
+            .on_message(m_bob_summary, &a_provider, &a_applier, None)
+            .await
+        {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let m_bob_deliver = match bob.on_message(m_alice_diff, &b_provider, &b_applier, None) {
+        let m_bob_deliver = match bob
+            .on_message(m_alice_diff, &b_provider, &b_applier, None)
+            .await
+        {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let m_alice_deliver = match alice.on_message(m_bob_diff, &a_provider, &a_applier, None) {
+        let m_alice_deliver = match alice
+            .on_message(m_bob_diff, &a_provider, &a_applier, None)
+            .await
+        {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        match alice.on_message(m_bob_deliver, &a_provider, &a_applier, None) {
+        match alice
+            .on_message(m_bob_deliver, &a_provider, &a_applier, None)
+            .await
+        {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             o => panic!("unexpected: {o:?}"),
         }
-        match bob.on_message(m_alice_deliver, &b_provider, &b_applier, None) {
+        match bob
+            .on_message(m_alice_deliver, &b_provider, &b_applier, None)
+            .await
+        {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             o => panic!("unexpected: {o:?}"),
         }
@@ -1587,25 +1638,29 @@ mod tests {
     /// is empty), yet must still service the round — requesting exactly the rows
     /// it LACKS. Before the split, `want` was computed from the empty offer, which
     /// fused the #396 send gate onto the receive side and darkened the plane.
-    #[test]
-    fn receive_uses_holdings_not_the_send_gated_offer() {
+    #[tokio::test]
+    async fn receive_uses_holdings_not_the_send_gated_offer() {
         // A provider whose OFFER (local_refs) is empty — the responder has no
         // consent to SEND to this peer — but whose real HOLDINGS (local_holdings)
         // contain {A}. The initiator offers {A, B}.
         struct SplitProvider {
             holdings: Vec<super::super::protocol::EnvelopeRef>,
         }
+        #[async_trait::async_trait]
         impl StateProvider for SplitProvider {
-            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<super::super::protocol::EnvelopeRef> {
+            async fn local_refs(
+                &self,
+                _kind: EnvelopeKind,
+            ) -> Vec<super::super::protocol::EnvelopeRef> {
                 Vec::new() // send-gated: this node offers NOTHING to the peer
             }
-            fn local_holdings(
+            async fn local_holdings(
                 &self,
                 _kind: EnvelopeKind,
             ) -> Vec<super::super::protocol::EnvelopeRef> {
                 self.holdings.clone() // the node's REAL state, peer-blind
             }
-            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
         }
@@ -1631,7 +1686,10 @@ mod tests {
                 },
             ],
         });
-        let out = match responder.on_message(remote_summary, &provider, &applier, None) {
+        let out = match responder
+            .on_message(remote_summary, &provider, &applier, None)
+            .await
+        {
             ReplicationOutcome::Send(m) => m,
             o => panic!("unexpected: {o:?}"),
         };
@@ -1657,8 +1715,8 @@ mod tests {
 
     /// Idempotent — running the protocol twice changes nothing the
     /// second time (Deliver becomes empty; InSync the whole way).
-    #[test]
-    fn idempotent_second_run_no_changes() {
+    #[tokio::test]
+    async fn idempotent_second_run_no_changes() {
         let a_provider = provider_with(&[
             (EnvelopeKind::Key, h(1), b"e1".to_vec(), 1),
             (EnvelopeKind::Key, h(2), b"e2".to_vec(), 2),
@@ -1674,23 +1732,30 @@ mod tests {
         let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Key);
 
         // Drive round.
-        let alice_summary = match alice.start_round(&a_provider) {
+        let alice_summary = match alice.start_round(&a_provider).await {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
-        let (bob_summary_resp, bob_diff_msg) =
-            match bob.on_message(alice_summary, &b_provider, &b_applier, None) {
-                ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
-                _ => panic!(),
-            };
-        let alice_diff_msg = match alice.on_message(bob_summary_resp, &a_provider, &a_applier, None)
+        let (bob_summary_resp, bob_diff_msg) = match bob
+            .on_message(alice_summary, &b_provider, &b_applier, None)
+            .await
+        {
+            ReplicationOutcome::Send(m) => (m[0].clone(), m[1].clone()),
+            _ => panic!(),
+        };
+        let alice_diff_msg = match alice
+            .on_message(bob_summary_resp, &a_provider, &a_applier, None)
+            .await
         {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
         // Bob's Deliver from Alice's Diff should be empty (Alice has
         // everything Bob has).
-        let bob_deliver_msg = match bob.on_message(alice_diff_msg, &b_provider, &b_applier, None) {
+        let bob_deliver_msg = match bob
+            .on_message(alice_diff_msg, &b_provider, &b_applier, None)
+            .await
+        {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
         };
@@ -1698,7 +1763,9 @@ mod tests {
             assert!(d.envelopes.is_empty(), "bob should deliver nothing");
         }
         // Same for Alice's Deliver from Bob's Diff.
-        let alice_deliver_msg = match alice.on_message(bob_diff_msg, &a_provider, &a_applier, None)
+        let alice_deliver_msg = match alice
+            .on_message(bob_diff_msg, &a_provider, &a_applier, None)
+            .await
         {
             ReplicationOutcome::Send(m) => m[0].clone(),
             _ => panic!(),
@@ -1707,7 +1774,10 @@ mod tests {
             assert!(d.envelopes.is_empty(), "alice should deliver nothing");
         }
         // Applied with 0 admitted, InSync staleness.
-        match alice.on_message(bob_deliver_msg, &a_provider, &a_applier, None) {
+        match alice
+            .on_message(bob_deliver_msg, &a_provider, &a_applier, None)
+            .await
+        {
             ReplicationOutcome::Applied {
                 admitted,
                 staleness,
@@ -1722,20 +1792,22 @@ mod tests {
 
     /// Mismatched-kind message refused with UnexpectedMessage —
     /// defence against a misbehaving peer or a routing bug.
-    #[test]
-    fn mismatched_kind_refused() {
+    #[tokio::test]
+    async fn mismatched_kind_refused() {
         let provider = provider_with(&[]);
         let applier = applier_for(&[]);
         let mut s = Session::new(SessionRole::Responder, EnvelopeKind::Key);
-        let r = s.on_message(
-            ReplicationMessage::Diff(DiffMessage {
-                kind: EnvelopeKind::Revocation, // ← wrong kind for this session
-                want: vec![],
-            }),
-            &provider,
-            &applier,
-            None,
-        );
+        let r = s
+            .on_message(
+                ReplicationMessage::Diff(DiffMessage {
+                    kind: EnvelopeKind::Revocation, // ← wrong kind for this session
+                    want: vec![],
+                }),
+                &provider,
+                &applier,
+                None,
+            )
+            .await;
         assert_eq!(r, ReplicationOutcome::UnexpectedMessage);
     }
 
@@ -1747,21 +1819,23 @@ mod tests {
     /// won't pull — simply APPLIES it. `on_message` dispatches by message TYPE,
     /// not phase, so there is NO Summary→Diff→Deliver gate that would refuse the
     /// push. A regression here would silently re-break the mobile trace.
-    #[test]
-    fn responder_applies_unsolicited_bare_deliver() {
+    #[tokio::test]
+    async fn responder_applies_unsolicited_bare_deliver() {
         let provider = provider_with(&[]);
         let applier = applier_for(&[(h(1), b"pushed-key".to_vec())]);
         let mut bob = Session::new(SessionRole::Responder, EnvelopeKind::Key);
         // No Summary, no Diff — the initiator just pushes its key envelope.
-        let r = bob.on_message(
-            ReplicationMessage::Deliver(DeliverMessage {
-                kind: EnvelopeKind::Key,
-                envelopes: vec![b"pushed-key".to_vec()],
-            }),
-            &provider,
-            &applier,
-            None,
-        );
+        let r = bob
+            .on_message(
+                ReplicationMessage::Deliver(DeliverMessage {
+                    kind: EnvelopeKind::Key,
+                    envelopes: vec![b"pushed-key".to_vec()],
+                }),
+                &provider,
+                &applier,
+                None,
+            )
+            .await;
         match r {
             ReplicationOutcome::Applied {
                 admitted, refused, ..
@@ -1779,12 +1853,12 @@ mod tests {
     /// carrier-NAT'd peer's key/attestation lands without a return-path Diff.
     /// The plain (non-publishing) initiator stays Summary-only — no unsolicited
     /// dump of a large-state node's contents.
-    #[test]
-    fn proactive_publish_initiator_delivers_alongside_summary() {
+    #[tokio::test]
+    async fn proactive_publish_initiator_delivers_alongside_summary() {
         let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"my-key-env".to_vec(), 1)]);
         let mut m =
             Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
-        match m.start_round(&provider) {
+        match m.start_round(&provider).await {
             ReplicationOutcome::Send(msgs) => {
                 assert_eq!(msgs.len(), 2, "Summary + proactive Deliver");
                 assert!(matches!(msgs[0], ReplicationMessage::Summary(_)));
@@ -1800,7 +1874,7 @@ mod tests {
         }
         // Without the flag: Summary only — the default anti-entropy pull.
         let mut plain = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
-        match plain.start_round(&provider) {
+        match plain.start_round(&provider).await {
             ReplicationOutcome::Send(msgs) => assert_eq!(msgs.len(), 1, "Summary only"),
             o => panic!("expected Send, got {o:?}"),
         }
@@ -1810,8 +1884,8 @@ mod tests {
 
     /// The peer's last reverse-path Summary is the delta basis: refs it
     /// already holds are NOT re-pushed.
-    #[test]
-    fn proactive_push_skips_refs_the_peer_summary_holds() {
+    #[tokio::test]
+    async fn proactive_push_skips_refs_the_peer_summary_holds() {
         let provider = provider_with(&[
             (EnvelopeKind::Attestation, h(1), b"env-a".to_vec(), 1),
             (EnvelopeKind::Attestation, h(2), b"env-b".to_vec(), 2),
@@ -1820,19 +1894,21 @@ mod tests {
         let mut s = Session::new(SessionRole::Initiator, EnvelopeKind::Attestation)
             .with_proactive_publish(true);
         // The responder's reverse-path Summary arrives first: it holds h(1).
-        let _ = s.on_message(
-            ReplicationMessage::Summary(SummaryMessage {
-                kind: EnvelopeKind::Attestation,
-                refs: vec![EnvelopeRef {
-                    envelope_hash: h(1),
-                    seq: 1,
-                }],
-            }),
-            &provider,
-            &applier,
-            None,
-        );
-        match s.start_round(&provider) {
+        let _ = s
+            .on_message(
+                ReplicationMessage::Summary(SummaryMessage {
+                    kind: EnvelopeKind::Attestation,
+                    refs: vec![EnvelopeRef {
+                        envelope_hash: h(1),
+                        seq: 1,
+                    }],
+                }),
+                &provider,
+                &applier,
+                None,
+            )
+            .await;
+        match s.start_round(&provider).await {
             ReplicationOutcome::Send(msgs) => {
                 let deliver = msgs.iter().find_map(|m| match m {
                     ReplicationMessage::Deliver(d) => Some(d),
@@ -1847,16 +1923,16 @@ mod tests {
 
     /// An envelope pushed this round is NOT re-pushed next round (sent-cache);
     /// it re-qualifies only after `PROACTIVE_REFRESH_ROUNDS`.
-    #[test]
-    fn proactive_push_does_not_repush_within_refresh_window() {
+    #[tokio::test]
+    async fn proactive_push_does_not_repush_within_refresh_window() {
         let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"env-a".to_vec(), 1)]);
         let mut s =
             Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
-        match s.start_round(&provider) {
+        match s.start_round(&provider).await {
             ReplicationOutcome::Send(msgs) => assert_eq!(msgs.len(), 2, "round 1 pushes"),
             o => panic!("expected Send, got {o:?}"),
         }
-        match s.start_round(&provider) {
+        match s.start_round(&provider).await {
             ReplicationOutcome::Send(msgs) => {
                 assert_eq!(
                     msgs.len(),
@@ -1871,8 +1947,22 @@ mod tests {
     /// The per-round byte budget bounds the batch; spillover converges on the
     /// next round (oldest seq first), and an envelope bigger than the whole
     /// budget still ships alone.
-    #[test]
-    fn proactive_push_respects_budget_with_spillover() {
+    #[tokio::test]
+    async fn proactive_push_respects_budget_with_spillover() {
+        // CIRISEdge#740 — `start_round` is async; a closure can't `.await`,
+        // so the helper is an async fn over the same provider.
+        async fn round_envelopes(s: &mut Session, provider: &TestProvider) -> Vec<Vec<u8>> {
+            match s.start_round(provider).await {
+                ReplicationOutcome::Send(msgs) => msgs
+                    .into_iter()
+                    .find_map(|m| match m {
+                        ReplicationMessage::Deliver(d) => Some(d.envelopes),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                o => panic!("expected Send, got {o:?}"),
+            }
+        }
         let big_a = vec![0xAAu8; PROACTIVE_PUSH_BUDGET_BYTES - 1024];
         let big_b = vec![0xBBu8; PROACTIVE_PUSH_BUDGET_BYTES - 1024];
         let oversize = vec![0xCCu8; PROACTIVE_PUSH_BUDGET_BYTES + 4096];
@@ -1883,32 +1973,24 @@ mod tests {
         ]);
         let mut s = Session::new(SessionRole::Initiator, EnvelopeKind::Attestation)
             .with_proactive_publish(true);
-        let round_envelopes = |s: &mut Session| -> Vec<Vec<u8>> {
-            match s.start_round(&provider) {
-                ReplicationOutcome::Send(msgs) => msgs
-                    .into_iter()
-                    .find_map(|m| match m {
-                        ReplicationMessage::Deliver(d) => Some(d.envelopes),
-                        _ => None,
-                    })
-                    .unwrap_or_default(),
-                o => panic!("expected Send, got {o:?}"),
-            }
-        };
         assert_eq!(
-            round_envelopes(&mut s),
+            round_envelopes(&mut s, &provider).await,
             vec![big_a],
             "round 1: seq-1 fits, rest spills"
         );
-        assert_eq!(round_envelopes(&mut s), vec![big_b], "round 2: seq-2");
         assert_eq!(
-            round_envelopes(&mut s),
+            round_envelopes(&mut s, &provider).await,
+            vec![big_b],
+            "round 2: seq-2"
+        );
+        assert_eq!(
+            round_envelopes(&mut s, &provider).await,
             vec![oversize],
             "round 3: the over-budget envelope still ships, alone — a budget \
              bounds the batch, never strands an envelope"
         );
         assert!(
-            round_envelopes(&mut s).is_empty(),
+            round_envelopes(&mut s, &provider).await.is_empty(),
             "round 4: everything sent"
         );
     }
@@ -1917,32 +1999,34 @@ mod tests {
     /// set and we want nothing of its, the round completes at send — no wire
     /// wait, and `round_outcomes` reports `completed` (the #370 instrument
     /// stops normalizing error). Pushed-but-unconfirmed rounds do NOT complete.
-    #[test]
-    fn initiator_final_completes_only_on_confirmed_sync() {
+    #[tokio::test]
+    async fn initiator_final_completes_only_on_confirmed_sync() {
         let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"env-a".to_vec(), 1)]);
         let applier = applier_for(&[]);
         let mut s =
             Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
         // Round 1: never heard the peer → pushes, must NOT complete.
         assert!(
-            matches!(s.start_round(&provider), ReplicationOutcome::Send(_)),
+            matches!(s.start_round(&provider).await, ReplicationOutcome::Send(_)),
             "unconfirmed push stays Send-then-wait"
         );
         // The reverse-path Summary arrives: peer holds h(1) (and nothing more).
-        let _ = s.on_message(
-            ReplicationMessage::Summary(SummaryMessage {
-                kind: EnvelopeKind::Key,
-                refs: vec![EnvelopeRef {
-                    envelope_hash: h(1),
-                    seq: 1,
-                }],
-            }),
-            &provider,
-            &applier,
-            None,
-        );
+        let _ = s
+            .on_message(
+                ReplicationMessage::Summary(SummaryMessage {
+                    kind: EnvelopeKind::Key,
+                    refs: vec![EnvelopeRef {
+                        envelope_hash: h(1),
+                        seq: 1,
+                    }],
+                }),
+                &provider,
+                &applier,
+                None,
+            )
+            .await;
         // Round 2: confirmed sync → SendAndComplete.
-        match s.start_round(&provider) {
+        match s.start_round(&provider).await {
             ReplicationOutcome::SendAndComplete { msgs, kind } => {
                 assert_eq!(kind, EnvelopeKind::Key);
                 assert_eq!(msgs.len(), 1, "Summary only — nothing to push");
@@ -1954,7 +2038,7 @@ mod tests {
         s.reset();
         assert!(
             matches!(
-                s.start_round(&provider),
+                s.start_round(&provider).await,
                 ReplicationOutcome::SendAndComplete { .. }
             ),
             "knowledge survives reset — steady-state stays completed"
@@ -1963,32 +2047,34 @@ mod tests {
 
     /// A peer whose Summary advertises rows WE lack blocks initiator-final —
     /// the pull half of anti-entropy still matters when it can work.
-    #[test]
-    fn initiator_final_blocked_when_we_want_their_rows() {
+    #[tokio::test]
+    async fn initiator_final_blocked_when_we_want_their_rows() {
         let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"env-a".to_vec(), 1)]);
         let applier = applier_for(&[]);
         let mut s =
             Session::new(SessionRole::Initiator, EnvelopeKind::Key).with_proactive_publish(true);
-        let _ = s.on_message(
-            ReplicationMessage::Summary(SummaryMessage {
-                kind: EnvelopeKind::Key,
-                refs: vec![
-                    EnvelopeRef {
-                        envelope_hash: h(1),
-                        seq: 1,
-                    },
-                    EnvelopeRef {
-                        envelope_hash: h(9), // theirs, we lack it
-                        seq: 9,
-                    },
-                ],
-            }),
-            &provider,
-            &applier,
-            None,
-        );
+        let _ = s
+            .on_message(
+                ReplicationMessage::Summary(SummaryMessage {
+                    kind: EnvelopeKind::Key,
+                    refs: vec![
+                        EnvelopeRef {
+                            envelope_hash: h(1),
+                            seq: 1,
+                        },
+                        EnvelopeRef {
+                            envelope_hash: h(9), // theirs, we lack it
+                            seq: 9,
+                        },
+                    ],
+                }),
+                &provider,
+                &applier,
+                None,
+            )
+            .await;
         assert!(
-            matches!(s.start_round(&provider), ReplicationOutcome::Send(_)),
+            matches!(s.start_round(&provider).await, ReplicationOutcome::Send(_)),
             "wanting their rows keeps the round open"
         );
     }
@@ -1996,23 +2082,25 @@ mod tests {
     /// Fetch — on-demand envelope retrieval, distinct from anti-
     /// entropy. Responder behavior is the same shape as Diff
     /// (look up envelopes by hash, deliver bytes).
-    #[test]
-    fn fetch_returns_requested_envelopes() {
+    #[tokio::test]
+    async fn fetch_returns_requested_envelopes() {
         let provider = provider_with(&[
             (EnvelopeKind::Attestation, h(1), b"e1".to_vec(), 1),
             (EnvelopeKind::Attestation, h(2), b"e2".to_vec(), 2),
         ]);
         let applier = applier_for(&[]);
         let mut s = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
-        let r = s.on_message(
-            ReplicationMessage::Fetch(FetchMessage {
-                kind: EnvelopeKind::Attestation,
-                want: vec![h(1), h(99)], // h(99) doesn't exist
-            }),
-            &provider,
-            &applier,
-            None,
-        );
+        let r = s
+            .on_message(
+                ReplicationMessage::Fetch(FetchMessage {
+                    kind: EnvelopeKind::Attestation,
+                    want: vec![h(1), h(99)], // h(99) doesn't exist
+                }),
+                &provider,
+                &applier,
+                None,
+            )
+            .await;
         match r {
             ReplicationOutcome::Send(msgs) => {
                 assert_eq!(msgs.len(), 1);
@@ -2035,8 +2123,8 @@ mod tests {
     /// order. Frames of one round may ride different pooled links, so
     /// `Deliver_R` can overtake `Diff_R`; completing on the first Deliver would
     /// close the round with the peer's wants unserved.
-    #[test]
-    fn initiator_completes_on_deliver_and_diff_in_either_order() {
+    #[tokio::test]
+    async fn initiator_completes_on_deliver_and_diff_in_either_order() {
         let provider = provider_with(&[(EnvelopeKind::Key, h(9), b"e9".to_vec(), 9)]);
         let applier = applier_for(&[(h(1), b"e1".to_vec())]);
         let bob_summary = || {
@@ -2063,10 +2151,15 @@ mod tests {
 
         // Wire order: Summary_R, Diff_R, Deliver_R.
         let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
-        alice.start_round(&provider);
+        alice.start_round(&provider).await;
         assert!(!alice.is_fresh());
-        let _ = alice.on_message(bob_summary(), &provider, &applier, None);
-        match alice.on_message(bob_diff(), &provider, &applier, None) {
+        let _ = alice
+            .on_message(bob_summary(), &provider, &applier, None)
+            .await;
+        match alice
+            .on_message(bob_diff(), &provider, &applier, None)
+            .await
+        {
             ReplicationOutcome::Send(msgs) => {
                 assert!(
                     matches!(msgs[0], ReplicationMessage::Deliver(_)),
@@ -2076,7 +2169,10 @@ mod tests {
             o => panic!("{o:?}"),
         }
         assert!(!alice.is_complete());
-        match alice.on_message(bob_deliver(), &provider, &applier, None) {
+        match alice
+            .on_message(bob_deliver(), &provider, &applier, None)
+            .await
+        {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
             o => panic!("{o:?}"),
         }
@@ -2087,9 +2183,14 @@ mod tests {
         // carrying the held report.
         let applier = applier_for(&[(h(1), b"e1".to_vec())]);
         let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
-        alice.start_round(&provider);
-        let _ = alice.on_message(bob_summary(), &provider, &applier, None);
-        match alice.on_message(bob_deliver(), &provider, &applier, None) {
+        alice.start_round(&provider).await;
+        let _ = alice
+            .on_message(bob_summary(), &provider, &applier, None)
+            .await;
+        match alice
+            .on_message(bob_deliver(), &provider, &applier, None)
+            .await
+        {
             ReplicationOutcome::Send(msgs) => assert!(msgs.is_empty(), "wait, nothing to send"),
             o => panic!("expected the round to hold, got {o:?}"),
         }
@@ -2097,7 +2198,10 @@ mod tests {
             !alice.is_complete(),
             "not complete until the peer's Diff is served"
         );
-        match alice.on_message(bob_diff(), &provider, &applier, None) {
+        match alice
+            .on_message(bob_diff(), &provider, &applier, None)
+            .await
+        {
             ReplicationOutcome::SendThenApplied {
                 msgs,
                 admitted,
@@ -2114,8 +2218,8 @@ mod tests {
         assert!(alice.is_fresh());
     }
 
-    #[test]
-    fn bounded_by_staleness_when_some_envelopes_refused() {
+    #[tokio::test]
+    async fn bounded_by_staleness_when_some_envelopes_refused() {
         // Bob's summary advertises 3 envelopes; Alice's applier
         // only accepts 1 of them (the other 2 have unknown bytes →
         // refused).
@@ -2140,15 +2244,19 @@ mod tests {
                 },
             ],
         });
-        alice.start_round(&a_provider);
-        let _ = alice.on_message(bob_summary, &a_provider, &a_applier, None);
+        alice.start_round(&a_provider).await;
+        let _ = alice
+            .on_message(bob_summary, &a_provider, &a_applier, None)
+            .await;
         // CIRISEdge#634 — the responder always sends its Diff; the round is
         // not complete until it has been served, so feed it as the wire does.
         let bob_diff = ReplicationMessage::Diff(DiffMessage {
             kind: EnvelopeKind::Key,
             want: vec![],
         });
-        let _ = alice.on_message(bob_diff, &a_provider, &a_applier, None);
+        let _ = alice
+            .on_message(bob_diff, &a_provider, &a_applier, None)
+            .await;
         let bob_deliver = ReplicationMessage::Deliver(DeliverMessage {
             kind: EnvelopeKind::Key,
             envelopes: vec![
@@ -2157,7 +2265,10 @@ mod tests {
                 b"unknown_e3".to_vec(),
             ],
         });
-        match alice.on_message(bob_deliver, &a_provider, &a_applier, None) {
+        match alice
+            .on_message(bob_deliver, &a_provider, &a_applier, None)
+            .await
+        {
             ReplicationOutcome::Applied {
                 admitted,
                 refused,
@@ -2178,11 +2289,12 @@ mod tests {
     /// compiler already forbids a silent `return false` (`ApplyOutcome` is
     /// `#[must_use]` with no `bool`); this locks the counting half so a refusal can
     /// never again read as absence of work.
-    #[test]
-    fn on_deliver_counts_every_refusal_at_the_choke_point() {
+    #[tokio::test]
+    async fn on_deliver_counts_every_refusal_at_the_choke_point() {
         struct RefusingApplier;
+        #[async_trait::async_trait]
         impl StateApplier for RefusingApplier {
-            fn apply_envelope(
+            async fn apply_envelope(
                 &self,
                 _k: EnvelopeKind,
                 _b: &[u8],
@@ -2196,7 +2308,10 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             envelopes: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
         };
-        match responder.on_deliver(&deliver, &BodiesProvider, &RefusingApplier, Some("peer-x")) {
+        match responder
+            .on_deliver(&deliver, &BodiesProvider, &RefusingApplier, Some("peer-x"))
+            .await
+        {
             ReplicationOutcome::Applied {
                 admitted, refused, ..
             } => {
@@ -2216,8 +2331,8 @@ mod tests {
     /// request survived zero rounds and its body was then treated as
     /// unsolicited and dropped. An expectation is REQUEST state, not ROUND
     /// state.
-    #[test]
-    fn an_expectation_survives_a_round_reset_until_its_own_ttl_expires() {
+    #[tokio::test]
+    async fn an_expectation_survives_a_round_reset_until_its_own_ttl_expires() {
         let h = [7u8; 32];
         let mut sess = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
         sess.expect_bodies([h]);
@@ -2261,15 +2376,16 @@ mod tests {
     /// ordinary Summaries cannot repair it either, because hash-first records
     /// the hash and clears the want. The row this node explicitly ASKED for
     /// could then never admit.
-    #[test]
-    fn a_requested_body_refused_transiently_is_still_expected() {
+    #[tokio::test]
+    async fn a_requested_body_refused_transiently_is_still_expected() {
         use std::sync::Mutex;
         struct P;
+        #[async_trait::async_trait]
         impl StateProvider for P {
-            fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+            async fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
                 Vec::new()
             }
-            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
             fn retention(&self, _k: EnvelopeKind) -> crate::replication::retention::Retention {
@@ -2277,8 +2393,9 @@ mod tests {
             }
         }
         struct Refuser(Mutex<bool>);
+        #[async_trait::async_trait]
         impl StateApplier for Refuser {
-            fn apply_envelope(
+            async fn apply_envelope(
                 &self,
                 _k: EnvelopeKind,
                 _b: &[u8],
@@ -2307,10 +2424,14 @@ mod tests {
         let applier = Refuser(Mutex::new(false));
 
         // First delivery: transiently refused. The expectation must survive.
-        sess.on_deliver(&deliver, &P, &applier, Some("peer-1"));
+        sess.on_deliver(&deliver, &P, &applier, Some("peer-1"))
+            .await;
 
         // The dependency has landed; the SAME bytes are redelivered.
-        match sess.on_deliver(&deliver, &P, &applier, Some("peer-1")) {
+        match sess
+            .on_deliver(&deliver, &P, &applier, Some("peer-1"))
+            .await
+        {
             ReplicationOutcome::Applied { admitted, .. } => assert_eq!(
                 admitted, 1,
                 "the redelivered body must still be expected and therefore \
@@ -2325,15 +2446,16 @@ mod tests {
     /// refusal named. Not "the resolver exists" — that was true while nothing
     /// called it. This delivers a record whose signer is unknown and asserts the
     /// name reached the PROVIDER, which is the seam that was missing.
-    #[test]
-    fn a_transient_refusal_records_the_signer_it_named() {
+    #[tokio::test]
+    async fn a_transient_refusal_records_the_signer_it_named() {
         use std::sync::Mutex;
         struct RecordingProvider(Mutex<Vec<String>>);
+        #[async_trait::async_trait]
         impl StateProvider for RecordingProvider {
-            fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
+            async fn local_refs(&self, _k: EnvelopeKind) -> Vec<EnvelopeRef> {
                 Vec::new()
             }
-            fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
             fn note_missing_signer(
@@ -2349,8 +2471,9 @@ mod tests {
             }
         }
         struct TransientRefuser;
+        #[async_trait::async_trait]
         impl StateApplier for TransientRefuser {
-            fn apply_envelope(
+            async fn apply_envelope(
                 &self,
                 _k: EnvelopeKind,
                 _b: &[u8],
@@ -2360,8 +2483,9 @@ mod tests {
             }
         }
         struct TerminalRefuser;
+        #[async_trait::async_trait]
         impl StateApplier for TerminalRefuser {
-            fn apply_envelope(
+            async fn apply_envelope(
                 &self,
                 _k: EnvelopeKind,
                 _b: &[u8],
@@ -2379,7 +2503,9 @@ mod tests {
 
         let provider = RecordingProvider(Mutex::new(Vec::new()));
         let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
-        responder.on_deliver(&deliver, &provider, &TransientRefuser, Some("peer-x"));
+        responder
+            .on_deliver(&deliver, &provider, &TransientRefuser, Some("peer-x"))
+            .await;
         assert_eq!(
             provider.0.lock().unwrap().as_slice(),
             ["steward-abc123@peer-x"],
@@ -2393,7 +2519,9 @@ mod tests {
         // would be a request this node can never use.
         let provider = RecordingProvider(Mutex::new(Vec::new()));
         let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
-        responder.on_deliver(&deliver, &provider, &TerminalRefuser, Some("peer-x"));
+        responder
+            .on_deliver(&deliver, &provider, &TerminalRefuser, Some("peer-x"))
+            .await;
         assert!(
             provider.0.lock().unwrap().is_empty(),
             "a TERMINAL refusal waits on nothing — it must not queue a pull"
@@ -2409,18 +2537,19 @@ mod tests {
     ///
     /// This is the whole mechanism: the node still computes what it lacks (so it
     /// knows the record exists and who has it) but does not pull the corpus.
-    #[test]
-    fn hash_first_learns_the_hashes_and_asks_for_no_bodies() {
+    #[tokio::test]
+    async fn hash_first_learns_the_hashes_and_asks_for_no_bodies() {
         use std::sync::Mutex;
         struct HashFirstProvider {
             noted: Mutex<Vec<[u8; 32]>>,
             peer: Mutex<Option<String>>,
         }
+        #[async_trait::async_trait]
         impl StateProvider for HashFirstProvider {
-            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
                 Vec::new()
             }
-            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
             fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
@@ -2458,12 +2587,15 @@ mod tests {
                 },
             ],
         };
-        let ReplicationOutcome::Send(msgs) = session.on_message(
-            ReplicationMessage::Summary(remote),
-            &provider,
-            &NoApply,
-            Some("peer-a"),
-        ) else {
+        let ReplicationOutcome::Send(msgs) = session
+            .on_message(
+                ReplicationMessage::Summary(remote),
+                &provider,
+                &NoApply,
+                Some("peer-a"),
+            )
+            .await
+        else {
             panic!("a summary must produce a round");
         };
 
@@ -2500,14 +2632,15 @@ mod tests {
     /// `is_none()` gate read it as solicited and let the bodies through — the
     /// node accumulated exactly the corpus it had just declined. An empty ask is
     /// not an ask.
-    #[test]
-    fn a_proactive_deliver_after_an_empty_hash_first_diff_is_not_applied() {
+    #[tokio::test]
+    async fn a_proactive_deliver_after_an_empty_hash_first_diff_is_not_applied() {
         struct HashFirstEverywhere;
+        #[async_trait::async_trait]
         impl StateProvider for HashFirstEverywhere {
-            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
                 Vec::new()
             }
-            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
             fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
@@ -2517,29 +2650,33 @@ mod tests {
 
         let mut session = Session::new(SessionRole::Responder, EnvelopeKind::Key);
         // The publisher's Summary — hash-first empties the want and sets Some(0).
-        let _ = session.on_message(
-            ReplicationMessage::Summary(SummaryMessage {
-                kind: EnvelopeKind::Key,
-                refs: vec![EnvelopeRef {
-                    envelope_hash: h(1),
-                    seq: 1,
-                }],
-            }),
-            &HashFirstEverywhere,
-            &NoApply,
-            Some("publisher"),
-        );
+        let _ = session
+            .on_message(
+                ReplicationMessage::Summary(SummaryMessage {
+                    kind: EnvelopeKind::Key,
+                    refs: vec![EnvelopeRef {
+                        envelope_hash: h(1),
+                        seq: 1,
+                    }],
+                }),
+                &HashFirstEverywhere,
+                &NoApply,
+                Some("publisher"),
+            )
+            .await;
         // ...immediately followed by the bodies we did not ask for.
         let applier = TrackingApplier::default();
-        let outcome = session.on_message(
-            ReplicationMessage::Deliver(DeliverMessage {
-                kind: EnvelopeKind::Key,
-                envelopes: vec![b"a-body".to_vec()],
-            }),
-            &HashFirstEverywhere,
-            &applier,
-            Some("publisher"),
-        );
+        let outcome = session
+            .on_message(
+                ReplicationMessage::Deliver(DeliverMessage {
+                    kind: EnvelopeKind::Key,
+                    envelopes: vec![b"a-body".to_vec()],
+                }),
+                &HashFirstEverywhere,
+                &applier,
+                Some("publisher"),
+            )
+            .await;
         assert!(
             matches!(outcome, ReplicationOutcome::Applied { admitted: 0, .. }),
             "a proactive body must be learned, not applied — got {outcome:?}"
@@ -2558,14 +2695,15 @@ mod tests {
     /// Suppressing it would make hash-first silently break the one flow whose
     /// entire purpose is asking for bodies on purpose — and the reply arrives as
     /// an ordinary Summary, so nothing would have looked wrong.
-    #[test]
-    fn a_pull_reply_is_fetched_even_under_hash_first() {
+    #[tokio::test]
+    async fn a_pull_reply_is_fetched_even_under_hash_first() {
         struct HashFirstEverywhere;
+        #[async_trait::async_trait]
         impl StateProvider for HashFirstEverywhere {
-            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
                 Vec::new()
             }
-            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
             fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
@@ -2583,12 +2721,15 @@ mod tests {
                 seq: 1,
             }],
         };
-        let ReplicationOutcome::Send(msgs) = session.on_message(
-            ReplicationMessage::Summary(reply),
-            &HashFirstEverywhere,
-            &NoApply,
-            Some("peer-a"),
-        ) else {
+        let ReplicationOutcome::Send(msgs) = session
+            .on_message(
+                ReplicationMessage::Summary(reply),
+                &HashFirstEverywhere,
+                &NoApply,
+                Some("peer-a"),
+            )
+            .await
+        else {
             panic!("a summary must produce a round");
         };
         let diff = msgs
@@ -2616,14 +2757,15 @@ mod tests {
     /// round's worth on a session that pulled, and does NOT become a permanent
     /// opt-out from hash-first. Fetching too much is wasteful and visible;
     /// fetching nothing is neither.
-    #[test]
-    fn the_on_demand_exemption_is_released_when_the_round_resets() {
+    #[tokio::test]
+    async fn the_on_demand_exemption_is_released_when_the_round_resets() {
         struct HashFirstEverywhere;
+        #[async_trait::async_trait]
         impl StateProvider for HashFirstEverywhere {
-            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
                 Vec::new()
             }
-            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
             fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
@@ -2643,12 +2785,15 @@ mod tests {
 
         // Within the round the exemption stands — a racing Summary must not be
         // able to consume it out from under the reply it was set for.
-        let ReplicationOutcome::Send(first) = session.on_message(
-            ReplicationMessage::Summary(summary(1)),
-            &HashFirstEverywhere,
-            &NoApply,
-            Some("peer-a"),
-        ) else {
+        let ReplicationOutcome::Send(first) = session
+            .on_message(
+                ReplicationMessage::Summary(summary(1)),
+                &HashFirstEverywhere,
+                &NoApply,
+                Some("peer-a"),
+            )
+            .await
+        else {
             panic!("a summary must produce a round");
         };
         assert!(
@@ -2663,12 +2808,15 @@ mod tests {
         // killed by that round finishing first, and testimony recovery became
         // timing-dependent.
         session.reset();
-        let ReplicationOutcome::Send(mid) = session.on_message(
-            ReplicationMessage::Summary(summary(3)),
-            &HashFirstEverywhere,
-            &NoApply,
-            Some("peer-a"),
-        ) else {
+        let ReplicationOutcome::Send(mid) = session
+            .on_message(
+                ReplicationMessage::Summary(summary(3)),
+                &HashFirstEverywhere,
+                &NoApply,
+                Some("peer-a"),
+            )
+            .await
+        else {
             panic!("a summary must produce a round");
         };
         assert!(
@@ -2680,12 +2828,15 @@ mod tests {
         // It is bounded, though: after its window it lapses.
         session.reset();
         session.reset();
-        let ReplicationOutcome::Send(msgs) = session.on_message(
-            ReplicationMessage::Summary(summary(2)),
-            &HashFirstEverywhere,
-            &NoApply,
-            Some("peer-a"),
-        ) else {
+        let ReplicationOutcome::Send(msgs) = session
+            .on_message(
+                ReplicationMessage::Summary(summary(2)),
+                &HashFirstEverywhere,
+                &NoApply,
+                Some("peer-a"),
+            )
+            .await
+        else {
             panic!("a summary must produce a round");
         };
         let diff = msgs
@@ -2704,14 +2855,15 @@ mod tests {
 
     /// CIRISEdge#553 — the carve-out reaches the round, not just the pure
     /// function. A node configured hash-first STILL pulls revocation bodies.
-    #[test]
-    fn a_hash_first_node_still_pulls_revocation_bodies() {
+    #[tokio::test]
+    async fn a_hash_first_node_still_pulls_revocation_bodies() {
         struct HashFirstEverywhere;
+        #[async_trait::async_trait]
         impl StateProvider for HashFirstEverywhere {
-            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
                 Vec::new()
             }
-            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
             fn retention(&self, _kind: EnvelopeKind) -> crate::replication::retention::Retention {
@@ -2727,12 +2879,15 @@ mod tests {
                 seq: 1,
             }],
         };
-        let ReplicationOutcome::Send(msgs) = session.on_message(
-            ReplicationMessage::Summary(remote),
-            &HashFirstEverywhere,
-            &NoApply,
-            Some("peer-a"),
-        ) else {
+        let ReplicationOutcome::Send(msgs) = session
+            .on_message(
+                ReplicationMessage::Summary(remote),
+                &HashFirstEverywhere,
+                &NoApply,
+                Some("peer-a"),
+            )
+            .await
+        else {
             panic!("a summary must produce a round");
         };
 
@@ -2752,17 +2907,18 @@ mod tests {
     }
 
     /// choosing, which is why the fix needs no wire change.
-    #[test]
-    fn the_rounds_want_omits_hashes_this_node_has_already_refused() {
+    #[tokio::test]
+    async fn the_rounds_want_omits_hashes_this_node_has_already_refused() {
         /// A provider holding nothing, that has refused exactly `refused`.
         struct SuppressingProvider {
             refused: [u8; 32],
         }
+        #[async_trait::async_trait]
         impl StateProvider for SuppressingProvider {
-            fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+            async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
                 Vec::new()
             }
-            fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+            async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
                 None
             }
             fn retry_suppressed(&self, _kind: EnvelopeKind, envelope_hash: &[u8; 32]) -> bool {
@@ -2787,12 +2943,15 @@ mod tests {
                 },
             ],
         };
-        let ReplicationOutcome::Send(msgs) = session.on_message(
-            ReplicationMessage::Summary(remote),
-            &provider,
-            &NoApply,
-            None,
-        ) else {
+        let ReplicationOutcome::Send(msgs) = session
+            .on_message(
+                ReplicationMessage::Summary(remote),
+                &provider,
+                &NoApply,
+                None,
+            )
+            .await
+        else {
             panic!("a Summary must produce Summary+Diff");
         };
         let diff = msgs
@@ -2819,11 +2978,12 @@ mod tests {
     /// A provider with default retention (`Bodies`), for deliver-side tests
     /// that are not about retention at all.
     struct BodiesProvider;
+    #[async_trait::async_trait]
     impl StateProvider for BodiesProvider {
-        fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
+        async fn local_refs(&self, _kind: EnvelopeKind) -> Vec<EnvelopeRef> {
             Vec::new()
         }
-        fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+        async fn fetch_envelope(&self, _kind: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
             None
         }
     }
@@ -2838,8 +2998,9 @@ mod tests {
             self.seen.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
+    #[async_trait::async_trait]
     impl StateApplier for TrackingApplier {
-        fn apply_envelope(
+        async fn apply_envelope(
             &self,
             _kind: EnvelopeKind,
             _bytes: &[u8],
@@ -2852,8 +3013,9 @@ mod tests {
 
     /// An applier for want-side tests, which never see a Deliver.
     struct NoApply;
+    #[async_trait::async_trait]
     impl StateApplier for NoApply {
-        fn apply_envelope(
+        async fn apply_envelope(
             &self,
             _k: EnvelopeKind,
             _b: &[u8],
@@ -2868,14 +3030,15 @@ mod tests {
     /// path, which made the consent plane send-only — an admitted peer could write
     /// with no per-peer check because the identity was gone). A recording applier
     /// captures what `on_deliver` hands it: every applied envelope carries the peer.
-    #[test]
-    fn on_deliver_threads_source_peer_to_the_applier() {
+    #[tokio::test]
+    async fn on_deliver_threads_source_peer_to_the_applier() {
         struct PeerRecordingApplier {
             // CIRISEdge#370 — interior mutability: `apply_envelope` is `&self`.
             seen: std::sync::Mutex<Vec<Option<String>>>,
         }
+        #[async_trait::async_trait]
         impl StateApplier for PeerRecordingApplier {
-            fn apply_envelope(
+            async fn apply_envelope(
                 &self,
                 _k: EnvelopeKind,
                 _b: &[u8],
@@ -2896,7 +3059,9 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             envelopes: vec![b"x".to_vec(), b"y".to_vec()],
         };
-        responder.on_deliver(&deliver, &BodiesProvider, &applier, Some("canonical-1"));
+        responder
+            .on_deliver(&deliver, &BodiesProvider, &applier, Some("canonical-1"))
+            .await;
         assert_eq!(
             *applier.seen.lock().unwrap(),
             vec![
@@ -2913,8 +3078,8 @@ mod tests {
     /// round's re-diff. This bounds the per-round wire frame so its fragment count
     /// stays reassemblable under packet loss — the belt to the transport
     /// fragmenter's suspenders.
-    #[test]
-    fn on_diff_bounds_the_deliver_by_byte_budget() {
+    #[tokio::test]
+    async fn on_diff_bounds_the_deliver_by_byte_budget() {
         // Eight 100 KiB envelopes = 800 KiB wanted, well over the 512 KiB budget.
         let env_size = 100 * 1024;
         let n = 8u8;
@@ -2936,7 +3101,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             want: wanted,
         };
-        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None) else {
+        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None).await else {
             panic!("on_diff must Send a Deliver");
         };
         let ReplicationMessage::Deliver(deliver) = &msgs[0] else {
@@ -2969,8 +3134,8 @@ mod tests {
     /// The always-≥1 rule: a SINGLE envelope larger than the whole budget still
     /// ships whole (the transport fragments it) — the budget bounds how many whole
     /// envelopes ride together, never splits one.
-    #[test]
-    fn on_diff_ships_a_single_oversize_envelope_whole() {
+    #[tokio::test]
+    async fn on_diff_ships_a_single_oversize_envelope_whole() {
         let big = MAX_DELIVER_ENVELOPE_BYTES + 4096;
         let hash = h(42);
         let provider = provider_with(&[(EnvelopeKind::Attestation, hash, vec![7u8; big], 1)]);
@@ -2979,7 +3144,7 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             want: vec![hash],
         };
-        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None) else {
+        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None).await else {
             panic!("on_diff must Send a Deliver");
         };
         let ReplicationMessage::Deliver(deliver) = &msgs[0] else {
@@ -2999,16 +3164,17 @@ mod tests {
     /// directly — infer nothing from a byte count), and the round still ships what
     /// it COULD: short, not fatal. The send-side twin of #425's "never a silent
     /// drop" on the apply path.
-    #[test]
-    fn on_diff_surfaces_an_advertised_but_unfetchable_want() {
+    #[tokio::test]
+    async fn on_diff_surfaces_an_advertised_but_unfetchable_want() {
         let fetchable = h(1);
         let unfetchable = h(2); // deliberately never seeded into the provider
         let provider = provider_with(&[(EnvelopeKind::Attestation, fetchable, vec![9u8; 128], 1)]);
         let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
 
         // The helper RETURNS the unfetchable hash rather than vanishing it.
-        let (envelopes, dropped) =
-            responder.pack_bounded_deliver(&[fetchable, unfetchable], &provider);
+        let (envelopes, dropped) = responder
+            .pack_bounded_deliver(&[fetchable, unfetchable], &provider)
+            .await;
         assert_eq!(
             dropped,
             vec![unfetchable],
@@ -3025,7 +3191,8 @@ mod tests {
             kind: EnvelopeKind::Attestation,
             want: vec![fetchable, unfetchable],
         };
-        let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, Some("peer-x"))
+        let ReplicationOutcome::Send(msgs) =
+            responder.on_diff(&diff, &provider, Some("peer-x")).await
         else {
             panic!("a partially-unfetchable Diff must still Send a short Deliver, not fail");
         };
@@ -3041,8 +3208,8 @@ mod tests {
 
     /// The #429 loud path stays silent on the happy path: a fully-fetchable Diff
     /// records NO drops, so no false-positive "ships short" warn fires.
-    #[test]
-    fn on_diff_records_no_drop_when_every_want_is_fetchable() {
+    #[tokio::test]
+    async fn on_diff_records_no_drop_when_every_want_is_fetchable() {
         let a = h(1);
         let b = h(2);
         let provider = provider_with(&[
@@ -3050,7 +3217,7 @@ mod tests {
             (EnvelopeKind::Attestation, b, vec![2u8; 64], 2),
         ]);
         let responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
-        let (envelopes, dropped) = responder.pack_bounded_deliver(&[a, b], &provider);
+        let (envelopes, dropped) = responder.pack_bounded_deliver(&[a, b], &provider).await;
         assert!(dropped.is_empty(), "no unfetchable want → no drop");
         assert_eq!(envelopes.len(), 2, "both fetchable wants pack");
     }
@@ -3060,12 +3227,12 @@ mod tests {
     /// message-typed `UnexpectedMessage`, sends nothing, and leaves the
     /// session's round state untouched — a mis-scheduled `start_round` must
     /// not emit a bogus Summary-as-initiator nor complete anything.
-    #[test]
-    fn responder_start_round_is_refused_release_safe() {
+    #[tokio::test]
+    async fn responder_start_round_is_refused_release_safe() {
         let provider = provider_with(&[(EnvelopeKind::Key, h(1), b"e1".to_vec(), 1)]);
         let mut s = Session::new(SessionRole::Responder, EnvelopeKind::Key);
         assert_eq!(
-            s.start_round(&provider),
+            s.start_round(&provider).await,
             ReplicationOutcome::UnexpectedMessage,
             "a Responder never opens a round"
         );
@@ -3073,15 +3240,17 @@ mod tests {
         // The session still services its real job afterwards: an inbound
         // Summary produces the ordinary {Summary, Diff} responder step.
         let applier = applier_for(&[]);
-        let out = s.on_message(
-            ReplicationMessage::Summary(SummaryMessage {
-                kind: EnvelopeKind::Key,
-                refs: vec![],
-            }),
-            &provider,
-            &applier,
-            None,
-        );
+        let out = s
+            .on_message(
+                ReplicationMessage::Summary(SummaryMessage {
+                    kind: EnvelopeKind::Key,
+                    refs: vec![],
+                }),
+                &provider,
+                &applier,
+                None,
+            )
+            .await;
         assert!(
             matches!(out, ReplicationOutcome::Send(ref m) if m.len() == 2),
             "state untouched — the responder round proceeds normally, got {out:?}"
@@ -3097,8 +3266,8 @@ mod tests {
     /// own transport binding at WARN. The membership itself is ALL-pinned in
     /// protocol.rs (`is_bootstrap_is_exactly_the_three_bootstrap_kinds`); this
     /// pins the WIRING, which log-level-only behavior cannot observe.
-    #[test]
-    fn the_unsolicited_deliver_classification_reads_is_bootstrap() {
+    #[tokio::test]
+    async fn the_unsolicited_deliver_classification_reads_is_bootstrap() {
         let src = include_str!("session.rs");
         let start = src.find("fn on_deliver").expect("on_deliver exists");
         let end = src[start..]

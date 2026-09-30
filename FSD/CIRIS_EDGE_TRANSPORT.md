@@ -531,6 +531,54 @@ Two constants bound what a single round can put on the wire
 Both budgets bound the *batch*, never strand an envelope: a single envelope
 larger than the whole budget still ships, alone (the transport fragments it).
 
+### 4.5 Invariant: no sync-over-async on the read path; a kick is bounded (CIRISEdge#740)
+
+**Every read and apply a round makes is awaited end to end.** `StateProvider`
+(`local_refs`, `local_holdings`, `fetch_envelope`, `subject_refs`,
+`accord_evidence_since`) and `StateApplier::apply_envelope` are `async`
+([`summary.rs`](../src/replication/summary.rs)); the production adapters
+([`directory.rs`](../src/replication/directory.rs)) await persist directly and
+the `Session` awaits the adapter. No `tokio::task::block_in_place` /
+`Handle::block_on` sits anywhere on a round's path. The methods that stay sync
+(`retention`, `note_known_hashes`, `note_missing_signer`,
+`take_missing_signer_for`, `retry_suppressed`) are in-memory probes by contract
+and must never do I/O.
+
+*Why, with the arithmetic.* Persist runs every SQL call on tokio's blocking
+pool (`max_blocking_threads`, **32** on edge and server). The pre-#740 adapter
+bridged the sync trait with `block_in_place` (which hands the worker's core to
+a replacement drawn **from that pool**) + `block_on` (which parks on a persist
+read that needs **another** slot). So each concurrent bridged read held one
+slot while waiting for a second, and a kick runs every `(peer, kind)` at once:
+
+| peers × kinds | bridged reads | held slots vs 32 | result |
+|---|---|---|---|
+| 2 × 14 | 28 | 28 < 32 — the reads get the remaining 4 | green (why every two-node witness passed) |
+| 3 × 14 | 42 | 32 of 32 held by parked hand-offs, 0 reads start | **the process stops** (no round, no HTTP) |
+| 10 × 14 | 140 | raising the pool only moves the threshold | — |
+
+Async end to end, a round costs a slot only for the duration of the SQL call
+itself, and a round awaits one call at a time.
+
+**A kick is bounded.** `RoundNow` / `Propagate` (`round_now_all`,
+`sync_and_await`) and the start-up tick fan out to every coordinator, so the
+scheduler drives at most `SchedulerConfig::max_concurrent_rounds` rounds at
+once through ONE semaphore ([`RoundGate`](../src/replication/scheduler.rs)); a
+round holds its permit from open to close, the rest WAIT for a permit (the
+kick is queued, never dropped, no sleeps, no retry count). The rule:
+`max_concurrent_rounds_for(max_blocking_threads) = max(1, max_blocking_threads
+/ 2)` — rounds may occupy at most half the pool (16 of 32 by default; edge_node
+derives it from its own `RuntimeBudget`), leaving the other 16 ≥ persist's 8
+readers + 1 writer. So 130 peers × 14 kinds = 1,820 rounds run 16 at a time,
+not 1,820 at once. Configurable on `ReplicationRuntimeConfig.scheduler`;
+observable via `ReplicationRuntime::round_bound()` (`bound`, `in_flight`,
+`peak_in_flight`, `waited`).
+
+Witnesses: `tests/kick_three_peers_740.rs` (three rooted peers, a kick under
+`max_blocking_threads(32)` with a hard timeout — wedges on v34.3.0, completes
+with every `(peer, kind)` round run after #740);
+`scheduler::tests::a_kick_of_n_plus_one_rounds_runs_at_most_n_at_once`.
+
 ---
 
 ## 5. Transport attribution (OSI 4) — identity *is* addressing
@@ -1123,6 +1171,10 @@ one the network cannot express breaking.*
    destination; identity-plane traffic selects identity-plane links only and dials when none
    is live; a replication/announce/bundle frame on a scoped link is refused
    `identity_frame_on_scoped_link` (§3.5, CIRISEdge#728).
+10. **No sync-over-async on the read path; a kick is bounded** — every provider read
+   and apply a round makes is awaited (no `block_in_place` / `Handle::block_on`), and
+   at most `max_blocking_threads / 2` rounds are in flight at once; 3 peers × 14
+   kinds = 42 bridged reads wedged a 32-slot pool (§4.5, CIRISEdge#740).
 
 ---
 
