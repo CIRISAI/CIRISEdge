@@ -455,6 +455,88 @@ impl BlobMeaning {
         }
     }
 
+    /// **Every row that places `blob_sha256`, widenings included**
+    /// (CIRISEdge#736) — persist's `attestations_binding_content` (the
+    /// federation-tier `scores` rows citing the sha) plus each one's WIDENING:
+    /// a `supersedes` naming it in `references_attestation_id` that binds the
+    /// same sha. Widenings first, in persist's order.
+    ///
+    /// Why the widenings matter: every edge producer authors at `self` and
+    /// crosses (`FSD/CONTENT_TRANSFER.md` §6.9). A family or community file's
+    /// crossing is persist's two-row widening, so on the author's node the
+    /// file is TWO rows: the author's `self` row (promoted to federation
+    /// tier, it reaches the owner's own devices) and the `supersedes` placing
+    /// it in the family — the row the other members receive. Persist's
+    /// binding index returns only `scores` rows, so a reader of it alone sees
+    /// the `self` row and never the family placement.
+    ///
+    /// # Errors
+    /// A directory read failed (the caller fails closed).
+    pub async fn referencing_rows(
+        directory: &dyn ciris_persist::federation::FederationDirectory,
+        blob_sha256: &[u8; 32],
+    ) -> Result<Vec<Attestation>, String> {
+        let hex_sha = hex::encode(blob_sha256);
+        let base = directory
+            .attestations_binding_content(&hex_sha)
+            .await
+            .map_err(|e| format!("rows binding {hex_sha}: {e}"))?;
+        let mut widenings = Vec::new();
+        for row in &base {
+            let referencing = directory
+                .list_attestations_referencing(&row.attestation_id)
+                .await
+                .map_err(|e| format!("rows referencing {}: {e}", row.attestation_id))?;
+            widenings.extend(referencing.into_iter().filter(|r| {
+                r.attestation_type == "supersedes"
+                    && r.attesting_key_id == row.attesting_key_id
+                    && Self::project(r, blob_sha256).is_ok()
+            }));
+        }
+        widenings.extend(base);
+        Ok(widenings)
+    }
+
+    /// **The scope a chunk source serves a blob under** (CIRISEdge#736) —
+    /// the host rule behind
+    /// [`BlobChunkSource::chunk_scope`](super::BlobChunkSource::chunk_scope)
+    /// for every tier without a community-DEK binding (self, family,
+    /// plaintext), spelled once here so hosts do not re-derive it: the first
+    /// row of [`Self::referencing_rows`] that projects — the WIDENING when
+    /// the file crossed into a family or room, the row itself otherwise.
+    ///
+    /// Answering from the binding index alone scoped every family file
+    /// `self` on its author's node (the author's own row) and withheld every
+    /// member's fetch by name (`blob_serve_arrival_scope_insufficient`,
+    /// "scoped 'self' but the request arrived on a 'family' address"). `None`
+    /// when nothing projects or the read failed: the serve is then withheld,
+    /// fail-closed.
+    pub async fn serve_scope(
+        directory: &dyn ciris_persist::federation::FederationDirectory,
+        blob_sha256: &[u8; 32],
+    ) -> Option<ContentScope> {
+        match Self::referencing_rows(directory, blob_sha256).await {
+            Ok(rows) => Self::scope_of_rows(&rows, blob_sha256),
+            Err(e) => {
+                tracing::warn!(
+                    blob = %hex::encode(blob_sha256),
+                    error = %e,
+                    "serve scope undeterminable — the rows placing this blob could not be read"
+                );
+                None
+            }
+        }
+    }
+
+    /// The pure half of [`Self::serve_scope`]: the first row that projects,
+    /// over rows in [`Self::referencing_rows`] order (widenings first).
+    #[must_use]
+    pub fn scope_of_rows(rows: &[Attestation], blob_sha256: &[u8; 32]) -> Option<ContentScope> {
+        rows.iter()
+            .find_map(|r| Self::project(r, blob_sha256).ok())
+            .map(|m| m.scope)
+    }
+
     /// The cohort this content was placed in, by the party that signed it —
     /// the row's placement. See [`Self::key_plane`] for which questions
     /// each facet answers.
@@ -831,6 +913,49 @@ mod facets_646 {
 #[cfg(test)]
 mod tests {
     use super::fixture::{bare_row, content_row};
+
+    /// CIRISEdge#736 — a family file's widening decides its serve scope, not
+    /// the author's own `self` row it widens. Red if the base row is read
+    /// first (`scoped 'self' but the request arrived on a 'family' address`).
+    #[test]
+    fn serve_scope_answers_from_the_widening_before_the_authors_self_row_736() {
+        let sha = [0x36; 32];
+        let own = content_row(
+            ciris_persist::federation::types::cohort_scope::SELF,
+            "fam-736",
+            &sha,
+        );
+        let mut widening = content_row(
+            ciris_persist::federation::types::cohort_scope::FAMILY,
+            "fam-736",
+            &sha,
+        );
+        widening.attestation_type = "supersedes".into();
+        let got = BlobMeaning::scope_of_rows(&[widening, own.clone()], &sha)
+            .expect("the widening projects");
+        assert!(
+            matches!(
+                &got,
+                ContentScope::Group {
+                    scope: CohortScope::Family,
+                    ..
+                }
+            ),
+            "{got:?}"
+        );
+        let alone = BlobMeaning::scope_of_rows(&[own], &sha).expect("the self row projects");
+        assert!(
+            matches!(
+                &alone,
+                ContentScope::Group {
+                    scope: CohortScope::SelfOnly,
+                    ..
+                }
+            ),
+            "an uncrossed-into-family file keeps its own row's scope: {alone:?}"
+        );
+    }
+
     use super::*;
 
     const SHA: [u8; 32] = [9u8; 32];

@@ -532,6 +532,7 @@ pub async fn rename(
     }
 
     let prior = replaced_row(directory, room, old, replaces).await?;
+    let unresolved = unresolved_members(directory, room).await?;
 
     let pointer = store
         .redescribe(RedescribeRequest {
@@ -620,6 +621,7 @@ pub async fn rename(
         crossed,
         granted: Vec::new(),
         excluded: Vec::new(),
+        unresolved,
     })
 }
 
@@ -761,6 +763,15 @@ pub struct PublishedFile {
     /// than dropped — a caller that does not look still gets the file, but a
     /// caller that does can say who is missing it and why.
     pub excluded: Vec<String>,
+    /// **Family members this write reaches NO device of** (CIRISEdge#736):
+    /// the family roster's `unresolved` members
+    /// ([`crate::family_room::FamilyRoster::unresolved`]) at write time —
+    /// active members whose owner binding to a node is not held here, so the
+    /// row's send set holds none of their devices and no grant was wrapped to
+    /// them. Named rather than skipped: the file reaches them only once a
+    /// device of theirs is bound (and persist re-grants, §6.5). Always empty
+    /// outside a family room.
+    pub unresolved: Vec<String>,
 }
 
 /// **Write a file into a room** — seal, author, cross.
@@ -840,6 +851,9 @@ where
 {
     // CIRISEdge#675 — the person authors; the node co-signs at the crossing.
     let author = file_author(signers);
+    // CIRISEdge#736 — who this write can NOT reach, read before a byte is
+    // sealed, so an unreadable roster refuses the write rather than hiding it.
+    let unresolved = unresolved_members(directory, write.room).await?;
     let sealed = seal_file(store, write, &author.key_id, &mut reader).await?;
 
     // Checked BEFORE the row is authored, so a file nobody can open never
@@ -924,6 +938,8 @@ where
         );
     }
 
+    warn_unresolved(write.room, &row.attestation_id, &unresolved);
+
     Ok(PublishedFile {
         row,
         pointer: sealed.pointer,
@@ -932,7 +948,47 @@ where
         crossed,
         granted: sealed.granted,
         excluded: sealed.excluded,
+        unresolved,
     })
+}
+
+/// CIRISEdge#736 — the family roster's `unresolved` members for a write into
+/// `room` (`FSD/CONTENT_TRANSFER.md` §6.4.1): the send set of a family row is
+/// the roster's NODES, so a member with no node is outside it by
+/// construction. Reported by name on the result, never a silent skip. Empty
+/// outside a family room.
+///
+/// # Errors
+/// [`FileError::Cross`] when the family's roster cannot be read — an unknown
+/// family is refused by name, never answered with an empty audience.
+async fn unresolved_members(
+    directory: &dyn FederationDirectory,
+    room: &ScopeRoom,
+) -> Result<Vec<String>, FileError> {
+    let ScopeRoom::Family { family_key_id } = room else {
+        return Ok(Vec::new());
+    };
+    let lens = crate::contact::PersistLens::new(directory);
+    crate::family_room::roster(directory, family_key_id, &lens)
+        .await
+        .map(|r| r.unresolved)
+        .map_err(|detail| FileError::Cross {
+            room: room.to_string(),
+            detail,
+        })
+}
+
+fn warn_unresolved(room: &ScopeRoom, attestation_id: &str, unresolved: &[String]) {
+    if !unresolved.is_empty() {
+        tracing::warn!(
+            %room,
+            attestation_id,
+            unresolved = ?unresolved,
+            "family file written with members no device of whom it reaches — their owner \
+             binding is not held here; the row reaches them when a device of theirs is bound \
+             (FSD/CONTENT_TRANSFER.md §6.4.1, CIRISEdge#736)"
+        );
+    }
 }
 
 /// The seal half of [`publish_stream`]: the shape by the DECLARED length, the
