@@ -5268,8 +5268,12 @@ impl FederationDirectoryReplicationBridge {
             "attestation_type": att.attestation_type,
             "cohort_scope": att.cohort_scope,
             "cohort_target": cohort_target,
+            // persist v52.0.0 (CIRISPersist#955) — the membership arms of the
+            // audience gate read the proposal's invitee and a reply's proposal.
+            "subject_key_ids": att.subject_key_ids,
             "attestation_envelope": {
                 "dimension": att.attestation_envelope.get("dimension"),
+                "references_attestation_id": att.attestation_envelope.get("references_attestation_id"),
                 // CIRISEdge#671 — the CC 2.4.1.2 owner-binding marker, so the
                 // allegiance predicate reads the same envelope on the advertise
                 // as the fetch twin reads off the wire row.
