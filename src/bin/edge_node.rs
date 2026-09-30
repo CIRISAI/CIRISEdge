@@ -3712,18 +3712,35 @@ async fn run_chat_legs(occ: &Occurrence) {
             && m.author_key_id == peer_owner
             && m.attesting_key_id == peer_owner
     };
+    //
+    // Two states are waited through, not one. `NotFetched`: the bytes are
+    // still in flight. `NotGranted`: the bytes are here and the key is not
+    // yet — the key plane converges independently of the byte plane, and
+    // persist binds a body to its epoch's minter only once it can tell which
+    // set granted it (bytes before the set, or a room with several epoch
+    // minters, bind to the author and rebind when a set lands again —
+    // CIRISPersist#876, I128/I129). Observed on this mesh: NotGranted for
+    // ~3.5 s after the bytes landed, then open. Every other verdict ends the
+    // wait, and each reason's first sighting is reported.
     let open_started = Instant::now();
     let mut open_checks = 0u32;
+    let mut first_seen: BTreeMap<&'static str, u128> = BTreeMap::new();
     let seen = loop {
         open_checks += 1;
         let seen = chat::messages_in_room(dir, &senders, &room, &reader_store, &viewer)
             .await
             .unwrap_or_default();
-        let pending = seen.iter().any(|m| {
-            m.widens.is_some()
-                && matches!(&m.body, Body::Unopened { reason } if reason.is_pending())
-        });
-        if seen.iter().any(is_open) || !pending || open_started.elapsed() >= budget {
+        let mut waiting = false;
+        for m in seen.iter().filter(|m| m.widens.is_some()) {
+            if let Body::Unopened { reason } = &m.body {
+                first_seen
+                    .entry(reason.kind())
+                    .or_insert_with(|| open_started.elapsed().as_millis());
+                waiting |= reason.is_pending()
+                    || matches!(reason, chat::UnopenedReason::NotGranted { .. });
+            }
+        }
+        if seen.iter().any(is_open) || !waiting || open_started.elapsed() >= budget {
             break seen;
         }
         tokio_sleep(Duration::from_millis(500)).await;
@@ -3822,6 +3839,7 @@ async fn run_chat_legs(occ: &Occurrence) {
             "expected_attested_by": peer_owner,
             "opened": opened,
             "open_waited_ms": open_started.elapsed().as_millis(),
+            "unopened_first_seen_ms": first_seen,
             "open_checks": open_checks,
             "room_addresses": room_addresses,
             "blob_plane": blob_plane_json(&occ.edge),
