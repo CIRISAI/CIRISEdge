@@ -355,7 +355,7 @@ pub use pull::{
     check_dag_plan, parse_clear_manifest, BlobPuller, DagByteFetch, DagPlan, DagPullRefusal,
     PullConfig, PullOffer, PullOutcome, PullRequest, PullSink, PULL_REFUSAL_DAG_CHUNK_MISMATCH,
     PULL_REFUSAL_DAG_CHUNK_MISSING, PULL_REFUSAL_DAG_MANIFEST_MISMATCH, PULL_REFUSAL_DAG_OVER_CAP,
-    PULL_REFUSAL_DAG_TOTAL_SIZE_MISMATCH, PULL_REFUSAL_SIZE_MISMATCH,
+    PULL_REFUSAL_DAG_TOTAL_SIZE_MISMATCH, PULL_REFUSAL_NO_EPOCH, PULL_REFUSAL_SIZE_MISMATCH,
 };
 
 pub mod persist_store_policy;

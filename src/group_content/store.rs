@@ -73,9 +73,90 @@ pub enum GroupContentError {
         /// Hex at-rest sha the read targeted.
         sha256_hex: String,
     },
+    /// A range read whose start is at or past the content's end (RFC 9110
+    /// §14.4; persist's `RangeNotSatisfiable`, CIRISEdge#737). Carries the
+    /// PLAINTEXT total persist named, so the caller learns the size it
+    /// overshot.
+    #[error(
+        "range not satisfiable for {sha256_hex}: start {range_start} is at or past the \
+         {size}-byte end"
+    )]
+    RangeNotSatisfiable {
+        /// Hex at-rest sha the read targeted.
+        sha256_hex: String,
+        /// The first byte asked for.
+        range_start: u64,
+        /// The content's plaintext size.
+        size: u64,
+    },
+    /// **A streamed write whose reader yielded a different number of bytes
+    /// than the caller declared** (CIRISEdge#744, `FSD/CONTENT_TRANSFER.md`
+    /// §6.7.4). Nothing is sealed: no manifest, no pointer, and the chunks
+    /// the stream wrote before the count came out wrong are evicted (see
+    /// [`GroupContentStore::seal_chunked_stream`]).
+    ///
+    /// `read` is exact when the reader ran SHORT (it hit EOF there). When it
+    /// ran LONG the stream stops at the first chunk that crosses `declared`
+    /// — an unbounded reader is never drained to count it — so `read` is the
+    /// bytes consumed by then: a lower bound, always `> declared`.
+    #[error(
+        "declared {declared} bytes but the reader yielded {read}: nothing sealed, the chunks \
+         written so far are evicted (FSD/CONTENT_TRANSFER.md §6.7.4)"
+    )]
+    DeclaredLengthMismatch {
+        /// What the caller said the content weighs.
+        declared: u64,
+        /// What the reader produced (a lower bound when `> declared`).
+        read: u64,
+    },
+    /// The reader itself failed mid-stream (CIRISEdge#744) — an I/O error,
+    /// not a substrate refusal. Nothing is sealed; written chunks are evicted
+    /// as for [`Self::DeclaredLengthMismatch`].
+    #[error("reading the content failed after {read} bytes: {detail}")]
+    Reader {
+        /// Bytes consumed before the failure.
+        read: u64,
+        /// The reader's error.
+        detail: String,
+    },
     /// Anything else the substrate reported.
     #[error("substrate: {0}")]
     Substrate(String),
+}
+
+/// **A chunk DAG's layout, for a viewer** (CIRISEdge#737,
+/// `FSD/CONTENT_TRANSFER.md` §6.7.3): the manifest's per-chunk PLAINTEXT
+/// sizes in `seq` order, with the file offset each chunk starts at — the
+/// prefix sum persist's own range reader maps a range onto
+/// (`ChunkManifest::slices_for_range`). What a streaming reader needs to
+/// ask for exactly one chunk at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkLayout {
+    /// The stream the manifest names — the one the pointer names.
+    pub stream_id: String,
+    /// The file's plaintext size: the sum of every chunk's `size`.
+    pub total_size: u64,
+    /// The chunks, in `seq` order, offsets contiguous from 0.
+    pub chunks: Vec<ChunkExtent>,
+}
+
+/// One chunk's place in the file (CIRISEdge#737).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkExtent {
+    /// The chunk's position in its stream — the `seq` its AAD is bound to.
+    pub seq: u64,
+    /// The first plaintext byte of the file this chunk holds.
+    pub offset: u64,
+    /// The chunk's plaintext length.
+    pub size: u64,
+}
+
+impl ChunkExtent {
+    /// The last byte this chunk holds, inclusive. `None` for an empty chunk.
+    #[must_use]
+    pub fn end_inclusive(&self) -> Option<u64> {
+        self.size.checked_sub(1).map(|last| self.offset + last)
+    }
 }
 
 /// A request to seal content into a group's blob store.
@@ -115,6 +196,58 @@ pub struct SealRequest<'a> {
     /// body).
     pub description: Option<Description<'a>>,
 }
+
+/// A request to seal content that arrives as a READER, chunk by chunk
+/// (CIRISEdge#744) — [`SealRequest`] with `declared_len` in place of the
+/// plaintext slice. Every AAD input is the same, so the two seal paths bind
+/// the same row the same way.
+#[derive(Debug, Clone)]
+pub struct StreamSealRequest<'a> {
+    /// As [`SealRequest::cohort_scope`].
+    pub cohort_scope: &'a str,
+    /// As [`SealRequest::community_key_id`].
+    pub community_key_id: Option<&'a str>,
+    /// As [`SealRequest::author_key_id`] — an AAD input.
+    pub author_key_id: &'a str,
+    /// As [`SealRequest::asserted_at`] — an AAD input.
+    pub asserted_at: chrono::DateTime<chrono::Utc>,
+    /// As [`SealRequest::field`] — an AAD input.
+    pub field: ContentField,
+    /// **What the reader will yield, exactly.** A reader that yields any
+    /// other count is [`GroupContentError::DeclaredLengthMismatch`] and seals
+    /// nothing.
+    pub declared_len: u64,
+    /// As [`SealRequest::description`].
+    pub description: Option<Description<'a>>,
+}
+
+impl<'a> StreamSealRequest<'a> {
+    /// The streaming form of a slice request: the same binding, the slice's
+    /// length declared.
+    #[must_use]
+    pub fn of(req: &SealRequest<'a>) -> Self {
+        Self {
+            cohort_scope: req.cohort_scope,
+            community_key_id: req.community_key_id,
+            author_key_id: req.author_key_id,
+            asserted_at: req.asserted_at,
+            field: req.field,
+            declared_len: req.plaintext.len() as u64,
+            description: req.description,
+        }
+    }
+
+    /// The AAD a seal under this request binds — [`aad_for_seal`]'s inputs,
+    /// through the same function.
+    #[must_use]
+    pub fn aad(&self) -> Vec<u8> {
+        content_aad(self.author_key_id, self.asserted_at, self.field)
+    }
+}
+
+/// The reader a streamed seal consumes (CIRISEdge#744): any tokio
+/// `AsyncRead` that can be held across the store's await points.
+pub type ContentReader<'r> = dyn tokio::io::AsyncRead + Unpin + Send + 'r;
 
 /// **What a sealed blob is** — the `{name?, format, codec?}` object CC 3.3.13
 /// seals beside encrypted bytes (CIRISEdge#698).
@@ -317,6 +450,44 @@ pub trait GroupContentStore: Send + Sync + 'static {
     /// [`GroupContentError`], as [`Self::seal`].
     async fn seal_chunked(&self, req: SealRequest<'_>) -> Result<SealedContent, GroupContentError>;
 
+    /// **Seal a chunk DAG from a reader, one chunk at a time**
+    /// (CIRISEdge#744, `FSD/CONTENT_TRANSFER.md` §6.7.4) — the door
+    /// [`Self::seal_chunked`] is a slice over, so there is one chunk-seal
+    /// path.
+    ///
+    /// Reads [`CHUNK_BYTES`] at a time (filling each chunk fully unless the
+    /// reader ends, so the chunk boundaries are exactly the slice path's),
+    /// seals and writes each chunk as it arrives, and only after the LAST
+    /// chunk lands and the count equals `req.declared_len` seals the stream
+    /// (manifest + descriptor). Peak buffering is one chunk plus the
+    /// substrate's own copies of the chunk it is sealing — never the content.
+    ///
+    /// # On refusal
+    /// A count that is not `declared_len` is
+    /// [`GroupContentError::DeclaredLengthMismatch`]; a reader error is
+    /// [`GroupContentError::Reader`]. Either way — and on a chunk or seal
+    /// refusal from the substrate — no pointer is returned, and the chunks
+    /// the call wrote at an ENCRYPTED tier are evicted before it returns
+    /// (their ciphertext shas are unique to this write, so nothing else can
+    /// cite them). A plaintext-tier chunk is content-addressed and may be the
+    /// very bytes another file's chunk names, so it is left in place —
+    /// unreferenced by this call, and unannounced (a chunk announces nothing;
+    /// only the seal does).
+    ///
+    /// # Errors
+    /// As above, and [`GroupContentError`] as [`Self::seal`]. A store with
+    /// no streaming door says so as [`GroupContentError::Substrate`].
+    async fn seal_chunked_stream(
+        &self,
+        req: StreamSealRequest<'_>,
+        reader: &mut ContentReader<'_>,
+    ) -> Result<SealedContent, GroupContentError> {
+        let _ = (req, reader);
+        Err(GroupContentError::Substrate(
+            "this store has no streaming chunk-seal door (CIRISEdge#744)".to_owned(),
+        ))
+    }
+
     /// Open content a row points at.
     ///
     /// # Errors
@@ -324,6 +495,49 @@ pub trait GroupContentStore: Send + Sync + 'static {
     /// [`GroupContentError::SealMismatch`] when the rebuilt AAD does not
     /// match, and the rest as documented.
     async fn open(&self, req: OpenRequest<'_>) -> Result<Vec<u8>, GroupContentError>;
+
+    /// **Open a plaintext range** `[start, end_inclusive]` of the content a
+    /// row points at (CIRISEdge#737, `FSD/CONTENT_TRANSFER.md` §6.7.3) —
+    /// persist's `Engine::read_blob_range_as` under the same AAD as
+    /// [`Self::open`].
+    ///
+    /// A chunk DAG opens only the chunks covering the range, each under its
+    /// own envelope and position-bound AAD; an inline body is opened once
+    /// and sliced. Persist clamps `end_inclusive` to the content's last byte
+    /// (RFC 9110 §14.4), so a short answer means the range ran past the end;
+    /// `start` at or past the end is [`GroupContentError::RangeNotSatisfiable`].
+    ///
+    /// # Errors
+    /// As [`Self::open`], plus `RangeNotSatisfiable`; a store without a range
+    /// door says so as [`GroupContentError::Substrate`].
+    async fn open_range(
+        &self,
+        req: OpenRequest<'_>,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<Vec<u8>, GroupContentError> {
+        let _ = (req, start, end_inclusive);
+        Err(GroupContentError::Substrate(
+            "this store has no range door (CIRISEdge#737)".to_owned(),
+        ))
+    }
+
+    /// **The chunk layout of a sealed DAG** the pointer names (CIRISEdge#737)
+    /// — persist's `Engine::open_sealed_manifest_as` under the row's AAD:
+    /// the manifest's chunks in `seq` order with their plaintext sizes, as
+    /// [`ChunkLayout`]. Authorized as [`Self::open`] is; a pointer that names
+    /// no stream, or a plaintext-tier DAG (a clear v1 manifest, which the
+    /// range door assembles without a layout), is refused by name.
+    ///
+    /// # Errors
+    /// As [`Self::open`]; a store without the door says so as
+    /// [`GroupContentError::Substrate`].
+    async fn layout(&self, req: OpenRequest<'_>) -> Result<ChunkLayout, GroupContentError> {
+        let _ = req;
+        Err(GroupContentError::Substrate(
+            "this store has no sealed-manifest door (CIRISEdge#737)".to_owned(),
+        ))
+    }
 
     /// **Open the sealed descriptor a pointer carries** (CIRISEdge#698) —
     /// the JCS `{name?, format, codec?}` bytes, under the same grant as the

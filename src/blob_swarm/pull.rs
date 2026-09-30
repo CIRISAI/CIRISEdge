@@ -267,11 +267,22 @@ pub enum PullOutcome {
 }
 
 /// A `CommunityDek` pointer with no sealed-under epoch cannot be adopted,
-/// so it is not worth a fetch (CIRISEdge#601).
-fn epoch_refusal(row: &Attestation, blob_hex: &str, meaning: &BlobMeaning) -> Option<PullOutcome> {
+/// so it is not worth a fetch (CIRISEdge#601). Counted under
+/// [`PULL_REFUSAL_NO_EPOCH`] like every other named refusal (CIRISEdge#735):
+/// before, the only community-tier refusal the pull could reach was the one
+/// it did not count.
+fn epoch_refusal(
+    row: &Attestation,
+    blob_hex: &str,
+    meaning: &BlobMeaning,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+) -> Option<PullOutcome> {
     let pointer = meaning.pointer()?;
     if pointer.tier != CryptoTier::CommunityDek || pointer.epoch.is_some() {
         return None;
+    }
+    if let Some(m) = metrics {
+        m.inc_blob_pull_refusal(PULL_REFUSAL_NO_EPOCH);
     }
     tracing::warn!(
         blob = %blob_hex,
@@ -285,6 +296,9 @@ fn epoch_refusal(row: &Attestation, blob_hex: &str, meaning: &BlobMeaning) -> Op
 
 /// The `blob_pull_refusals` tag for [`PullOutcome::SizeMismatch`].
 pub const PULL_REFUSAL_SIZE_MISMATCH: &str = "size_mismatch";
+/// The `blob_pull_refusals` tag for [`PullOutcome::NoEpoch`] (CIRISEdge#601 /
+/// #735): a `community_dek` pointer naming no sealed-under epoch.
+pub const PULL_REFUSAL_NO_EPOCH: &str = "no_epoch";
 /// The `blob_pull_refusals` tag for [`DagPullRefusal::ManifestMismatch`].
 pub const PULL_REFUSAL_DAG_MANIFEST_MISMATCH: &str = "dag_manifest_mismatch";
 /// The `blob_pull_refusals` tag for [`DagPullRefusal::TotalSizeMismatch`].
@@ -386,9 +400,15 @@ pub struct DagPlan {
     pub chunks: Vec<(u64, u64)>,
     /// Persist's per-chunk inline cap: the STORED body must fit it.
     pub inline_bytes_cap: u64,
-    /// Persist's whole-read cap: this cut pulls a DAG whole, so it is the
-    /// pull's ceiling too (§6.7: a range-pulled DAG is the follow-on).
-    pub whole_read_cap_bytes: u64,
+    /// **The bytes this walk holds in memory at once, when it holds them
+    /// all** (CIRISEdge#737). `Some` for a PLAINTEXT plan: persist's one-shot
+    /// `put_blob_chunks_signing` takes every chunk together, so the walk
+    /// buffers the whole DAG and bounds it by persist's whole-read constant.
+    /// `None` for a sealed plan: each chunk is adopted at `(stream_id, seq)`
+    /// as it arrives, so the pull is chunk-wise and its only size ceiling is
+    /// the STORAGE bound (rule 4). The whole-read cap governs READS, not
+    /// pulls (`FSD/CONTENT_TRANSFER.md` §6.7.3).
+    pub in_memory_cap_bytes: Option<u64>,
     /// Persist's chunk-count cap.
     pub max_chunks: u64,
     /// Bytes persist adds to each chunk's stored body at this tier —
@@ -412,7 +432,7 @@ impl DagPlan {
                 .map(|c| (c.seq, u64::from(c.size)))
                 .collect(),
             inline_bytes_cap: view.inline_bytes_cap,
-            whole_read_cap_bytes: view.whole_read_cap_bytes,
+            in_memory_cap_bytes: None,
             max_chunks: view.max_chunks,
             per_chunk_overhead:
                 ciris_persist::federation::at_rest_cascade::AT_REST_ENVELOPE_OVERHEAD as u64,
@@ -437,8 +457,9 @@ impl DagPlan {
                 .map(|(i, c)| (c.seq.unwrap_or(i as u64), u64::from(c.size)))
                 .collect(),
             inline_bytes_cap,
-            whole_read_cap_bytes:
+            in_memory_cap_bytes: Some(
                 ciris_persist::federation::chunk_dag_cascade::DAG_WHOLE_READ_CAP_BYTES,
+            ),
             max_chunks: ciris_persist::federation::blobs::MAX_CHUNKS_PER_EPOCH,
             per_chunk_overhead: 0,
         }
@@ -452,9 +473,15 @@ impl DagPlan {
 /// 2. `total_size` is the size the pointer declares (when it declares one:
 ///    a pre-#698 pointer declares nothing to check, as `declared_stored_len`);
 /// 3. the chunk count is within `max_chunks` and is not zero;
-/// 4. `total_size` is within the whole-read cap;
-/// 5. every chunk's STORED body (`size + per_chunk_overhead`) fits the inline
+/// 4. every chunk's STORED body (`size + per_chunk_overhead`) fits the inline
 ///    cap — the bound persist's adopt applies, applied here before the fetch;
+/// 5. `total_size` is within what the chunk list can legally hold —
+///    `chunk_count × (inline cap − per-chunk overhead)` — the STORAGE bound
+///    (CIRISEdge#737; after rule 4 so an over-full chunk is named as such,
+///    before rule 6 so an inflated total over well-sized chunks is named as
+///    this; with rule 6 the bound is exact). A plaintext plan is also within
+///    [`DagPlan::in_memory_cap_bytes`], the whole DAG being held until
+///    persist's one-shot door takes it;
 /// 6. the chunk sizes sum to `total_size` and no `seq` repeats.
 ///
 /// Pure, so the rule is tested on the exact shapes `files::publish` produces.
@@ -496,16 +523,7 @@ pub fn check_dag_plan(
             cap: plan.max_chunks,
         });
     }
-    if plan.total_size > plan.whole_read_cap_bytes {
-        return Err(DagPullRefusal::OverCap {
-            what: "total_size",
-            value: plan.total_size,
-            cap: plan.whole_read_cap_bytes,
-        });
-    }
-    let mut sum: u64 = 0;
-    let mut seen = HashSet::with_capacity(plan.chunks.len());
-    for (seq, size) in &plan.chunks {
+    for (_, size) in &plan.chunks {
         let stored = size.saturating_add(plan.per_chunk_overhead);
         if stored > plan.inline_bytes_cap {
             return Err(DagPullRefusal::OverCap {
@@ -514,6 +532,32 @@ pub fn check_dag_plan(
                 cap: plan.inline_bytes_cap,
             });
         }
+    }
+    // CIRISEdge#737 — the pull is chunk-wise; its ceiling is what the
+    // manifest can hold, not what a whole READ may materialize.
+    let per_chunk_max = plan
+        .inline_bytes_cap
+        .saturating_sub(plan.per_chunk_overhead);
+    let storage_bound = count.saturating_mul(per_chunk_max);
+    if plan.total_size > storage_bound {
+        return Err(DagPullRefusal::OverCap {
+            what: "total_size_vs_chunks",
+            value: plan.total_size,
+            cap: storage_bound,
+        });
+    }
+    if let Some(in_memory) = plan.in_memory_cap_bytes {
+        if plan.total_size > in_memory {
+            return Err(DagPullRefusal::OverCap {
+                what: "total_size_in_memory",
+                value: plan.total_size,
+                cap: in_memory,
+            });
+        }
+    }
+    let mut sum: u64 = 0;
+    let mut seen = HashSet::with_capacity(plan.chunks.len());
+    for (seq, size) in &plan.chunks {
         sum = sum.saturating_add(*size);
         if !seen.insert(*seq) {
             return Err(DagPullRefusal::ManifestMismatch {
@@ -1115,7 +1159,7 @@ where
         // The binding the adopt door will need, decided BEFORE any request:
         // a row that cannot be adopted is not worth a fetch.
         let tier = meaning.pointer().map_or(CryptoTier::Plaintext, |p| p.tier);
-        if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning) {
+        if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning, Some(&self.edge.metrics())) {
             return refused;
         }
 
@@ -1350,7 +1394,7 @@ where
         let Some(stream_id) = pointer.stream_id.as_deref() else {
             return PullOutcome::Refused("the pointer names no stream_id".into());
         };
-        if let Some(refused) = epoch_refusal(row, &blob_hex, meaning) {
+        if let Some(refused) = epoch_refusal(row, &blob_hex, meaning, Some(&self.edge.metrics())) {
             return refused;
         }
         // MAY — the gate, asked of the FETCHER's holders before a byte moves
@@ -1492,12 +1536,24 @@ where
         };
 
         // ── manifest ── held from an earlier attempt, or fetched now.
-        let mut announced = false;
+        let announced;
         let held = match self.backend.has_blob(&sha).await {
             Ok(h) => h,
             Err(e) => return PullOutcome::StoreFailed(format!("has_blob: {e}")),
         };
-        if !held {
+        if held {
+            // CIRISEdge#735 — a RESUME. The manifest was adopted, and its
+            // `holds_bytes` emitted or not, by an earlier attempt; this one
+            // skips the adopt, so `announced` is read off the claim that
+            // exists rather than reported false for a door not called. At
+            // `community_dek` the first attempt announced and the resume
+            // used to deny it; at `invisible_encrypted` no claim exists
+            // (CC 5.2) and this reads false, as before.
+            announced = match self.backend.list_holders(&sha).await {
+                Ok(holders) => holders.contains(&self.local_key_id),
+                Err(e) => return PullOutcome::StoreFailed(format!("list_holders: {e}")),
+            };
+        } else {
             let bytes = match self.fetch_verified(fetch, sha).await {
                 Ok(b) => b,
                 Err(DagFetchStop::Transport(reason)) => {
@@ -1516,14 +1572,14 @@ where
                     )
                 }
             };
-            match self
+            announced = match self
                 .engine
                 .adopt_sealed_blob(&bytes, provenance.clone(), Some(&aad), adopt)
                 .await
             {
-                Ok(outcome) => announced = outcome.announced,
+                Ok(outcome) => outcome.announced,
                 Err(e) => return PullOutcome::StoreFailed(format!("adopt manifest: {e}")),
-            }
+            };
         }
 
         // ── verified ── opened as THIS NODE, under the row's AAD.
@@ -1682,7 +1738,8 @@ where
     /// `put_blob_chunks_signing` — every chunk verified against the manifest
     /// again inside the door, and the manifest's `holds_bytes` announced as
     /// `store_plaintext` announces a whole blob. Held in memory until the
-    /// door takes it, bounded by the whole-read cap the plan enforced.
+    /// door takes it, bounded by the plan's `in_memory_cap_bytes` (persist's
+    /// whole-read constant, reused as this walk's buffer bound — CIRISEdge#737).
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // the walk's rungs, in order, in one place on purpose
     async fn pull_plaintext_dag(
         &self,
@@ -2006,8 +2063,7 @@ mod tests {
             total_size: total,
             chunks,
             inline_bytes_cap: ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP as u64,
-            whole_read_cap_bytes:
-                ciris_persist::federation::chunk_dag_cascade::DAG_WHOLE_READ_CAP_BYTES,
+            in_memory_cap_bytes: None,
             max_chunks: ciris_persist::federation::blobs::MAX_CHUNKS_PER_EPOCH,
             per_chunk_overhead: AT_REST_ENVELOPE_OVERHEAD as u64,
         }
@@ -2052,19 +2108,47 @@ mod tests {
                 cap: 4,
             })
         );
-        // Total over the whole-read cap.
+        // CIRISEdge#737 — a sealed DAG above persist's whole-READ cap pulls:
+        // 100 MiB as 400 × 256 KiB is within what its chunk list can hold.
+        let big = 100 * 1024 * 1024;
+        let p = sealed_plan(big);
+        assert_eq!(p.chunks.len(), 400);
+        assert_eq!(
+            check_dag_plan("file-717", Some(big), &p),
+            Ok(()),
+            "the pull is chunk-wise; the whole-read cap governs reads (§6.7.3)"
+        );
+        // Total above what the chunk list can legally hold (the STORAGE
+        // bound): one well-sized chunk under a total no single chunk can
+        // carry — named before the sum rule would call it a mismatch.
         let mut p = plan.clone();
-        p.whole_read_cap_bytes = total - 1;
+        let per_chunk_max = p.inline_bytes_cap - p.per_chunk_overhead;
+        p.chunks = vec![(0, 100)];
+        p.total_size = per_chunk_max + 1;
+        assert_eq!(
+            check_dag_plan("file-717", Some(p.total_size), &p),
+            Err(DagPullRefusal::OverCap {
+                what: "total_size_vs_chunks",
+                value: per_chunk_max + 1,
+                cap: per_chunk_max,
+            })
+        );
+        // A PLAINTEXT plan is held whole until persist's one-shot door takes
+        // it, so it keeps an in-memory ceiling.
+        let mut p = plan.clone();
+        p.in_memory_cap_bytes = Some(total - 1);
         assert_eq!(
             check_dag_plan("file-717", Some(total), &p),
             Err(DagPullRefusal::OverCap {
-                what: "total_size",
+                what: "total_size_in_memory",
                 value: total,
                 cap: total - 1,
             })
         );
         // A chunk whose STORED body (plaintext + envelope) is over the inline
         // cap — a 1 MiB chunk at a sealed tier does not fit persist's 1 MiB.
+        // Named as the chunk's fault, though the storage bound would also
+        // have caught it (rule 4 runs before rule 5).
         let cap = ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP as u64;
         let mut p = sealed_plan(cap);
         p.chunks = vec![(0, cap)];
