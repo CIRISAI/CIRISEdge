@@ -10853,10 +10853,18 @@ pub(crate) mod tests {
     /// Hybrid-sign a [`Family`] for submission as `authority_key_id` —
     /// persist's `tier_ingest::test_support::sign_family` shape.
     pub(crate) fn sign_family_fixture(authority_key_id: &str, family: Family) -> SignedFamily {
-        let (_h, classical, pqc) =
-            sign_attestation_envelope(authority_key_id, &family.signing_envelope());
+        let envelope = family.signing_envelope();
+        let (_h, classical, pqc) = sign_attestation_envelope(authority_key_id, &envelope);
+        // persist v52.0.0 (CIRISPersist#955, Q1) — a founding record admits only
+        // the members who signed it; every listed member co-signs, as a real
+        // founding does (persist's own `tier_ingest::test_support::sign_family`).
+        let cosignatures = founding_cosignatures_fixture(
+            authority_key_id,
+            family.members.iter().map(|m| m.key_id.as_str()),
+            &envelope,
+        );
         SignedFamily {
-            cosignatures: Vec::new(),
+            cosignatures,
             family,
             authority_key_id: authority_key_id.to_string(),
             scrub_signature_classical: classical,
@@ -10865,17 +10873,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// persist v52.0.0 (CIRISPersist#955, Q1) — a co-signature over `envelope`
+    /// from every listed member except the authority (each once): persist's
+    /// `tier_ingest::test_support::founding_cosignatures`, over edge's
+    /// deterministic fixture keys.
+    pub(crate) fn founding_cosignatures_fixture<'a>(
+        authority_key_id: &str,
+        members: impl Iterator<Item = &'a str>,
+        envelope: &serde_json::Value,
+    ) -> Vec<ciris_persist::federation::types::RosterCosignature> {
+        let mut seen = std::collections::BTreeSet::new();
+        members
+            .filter(|m| *m != authority_key_id && seen.insert((*m).to_owned()))
+            .map(|m| {
+                let (_h, classical, pqc) = sign_attestation_envelope(m, envelope);
+                ciris_persist::federation::types::RosterCosignature {
+                    authority_key_id: m.to_owned(),
+                    scrub_signature_classical: classical,
+                    scrub_signature_pqc: pqc,
+                }
+            })
+            .collect()
+    }
+
     /// Hybrid-sign a [`Community`] — mirrors [`sign_family_fixture`].
     fn sign_community_fixture(authority_key_id: &str, community: Community) -> SignedCommunity {
-        let (_h, classical, pqc) =
-            sign_attestation_envelope(authority_key_id, &community.signing_envelope());
+        let envelope = community.signing_envelope();
+        let (_h, classical, pqc) = sign_attestation_envelope(authority_key_id, &envelope);
+        // persist v52.0.0 (CIRISPersist#955, Q1) — see `sign_family_fixture`.
+        let cosignatures = founding_cosignatures_fixture(
+            authority_key_id,
+            community.members.iter().map(|m| m.key_id.as_str()),
+            &envelope,
+        );
         SignedCommunity {
             community,
             authority_key_id: authority_key_id.to_string(),
             scrub_signature_classical: classical,
             scrub_signature_pqc: pqc,
             supersede_proof: None,
-            cosignatures: Vec::new(),
+            cosignatures,
             lineage: Vec::new(),
         }
     }
