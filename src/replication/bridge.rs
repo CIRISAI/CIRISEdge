@@ -1277,6 +1277,14 @@ struct CohortsOf {
     communities: HashSet<String>,
 }
 
+/// CIRISEdge#758 — one peer's group-record gate for one sweep or fetch: the
+/// groups whose record it may be handed, and where the answer is booked.
+struct GroupRecordGate<'a> {
+    peer: &'a str,
+    servable: &'a CohortsOf,
+    site: &'static str,
+}
+
 /// CIRISEdge#531 DEPTH — the hard stop on a [`SweepWindow::Full`] drain.
 ///
 /// A `Full` drain loops until a page comes back short. Every exit depends on
@@ -1588,6 +1596,10 @@ pub struct FederationDirectoryReplicationBridge {
     /// owner-binding `supersedes` widening that IS an announce. See
     /// [`Self::identity_row_reach`].
     announce_cache: Mutex<HashMap<String, (Instant, IdentityRowReach)>>,
+    /// CIRISEdge#758 — the live membership proposals held here, the invite
+    /// half of the group-record gate (see [`Self::held_live_invites`]). Bounded
+    /// by [`INVITE_MEMO_TTL`] and dropped whenever a membership row is admitted.
+    invite_cache: Mutex<Option<(Instant, Arc<Vec<HeldInvite>>)>>,
     /// CIRISEdge#682 — how many times the announce memo MISSED and the walk
     /// (`owner_of` + the owner's rows + `nodes_owned_by`) ran. The memo's own
     /// witness, as [`Self::owner_reads`] is for the owner memo. `Relaxed`.
@@ -1822,6 +1834,24 @@ const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(10);
 /// of which are time-driven, so a TTL is the only thing that can observe them.
 const OWNER_BINDING_MEMO_TTL: Duration = Duration::from_secs(30);
 
+/// CIRISEdge#758 — how long the held-live-proposal snapshot behind the
+/// group-record gate is reused. Short on purpose: a proposal authored on this
+/// node through the host API never crosses the bridge's apply door (so the
+/// admit-time drop cannot see it), and its invitee should get the record in
+/// the round after the proposal, not a memo lifetime later. An admitted
+/// membership row drops the memo at once.
+const INVITE_MEMO_TTL: Duration = Duration::from_secs(5);
+
+/// CIRISEdge#758 — one live `membership:proposal:v1` held here: the group it
+/// invites into and the invitees it names. See
+/// [`FederationDirectoryReplicationBridge::held_live_invites`].
+#[derive(Debug, Clone)]
+struct HeldInvite {
+    scope: crate::membership::GroupScope,
+    group_key_id: String,
+    subjects: Vec<String>,
+}
+
 /// CIRISPersist#848 / CIRISEdge#601 — a `ciris_persist::Engine` the bridge
 /// routes `key_grant:*` rows to.
 ///
@@ -1900,6 +1930,7 @@ impl FederationDirectoryReplicationBridge {
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
             announce_cache: Mutex::new(HashMap::new()),
+            invite_cache: Mutex::new(None),
             announce_reads: std::sync::atomic::AtomicUsize::new(0),
             kind_publish_selector: None,
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -1985,6 +2016,7 @@ impl FederationDirectoryReplicationBridge {
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
             announce_cache: Mutex::new(HashMap::new()),
+            invite_cache: Mutex::new(None),
             announce_reads: std::sync::atomic::AtomicUsize::new(0),
             kind_publish_selector: None,
             owner_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -3184,6 +3216,13 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             (EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination, peer) => {
                 self.list_identity_plane_for_peer(kind, peer, window).await
             }
+            // CIRISEdge#758 (CC 5.4.6) — the group RECORD planes are per-peer
+            // too: a Family / Community record reaches the group's live members
+            // and the invitees of a live proposal held here, nobody else. An
+            // unbound peer (`None`) proves no person and is served none.
+            (EnvelopeKind::Family | EnvelopeKind::Community, peer) => {
+                self.list_group_records_for_peer(kind, peer, window).await
+            }
             _ => self.list_envelope_refs_unbounded(kind, window).await,
         }
     }
@@ -3559,6 +3598,18 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         ) && self
             .identity_row_fetch_withholds(kind, &bytes, envelope_hash, peer_key_id)
             .await
+        {
+            return None;
+        }
+        // CIRISEdge#758 (CC 5.4.6) — the direct-fetch twin of the per-peer
+        // group-record advertise: a peer that learned a Family / Community
+        // record's hash out-of-band is not handed the record unless its person
+        // is a live member of the group or the invitee of a live proposal into
+        // it held here. The same predicate as the advertise, so the two agree.
+        if matches!(kind, EnvelopeKind::Family | EnvelopeKind::Community)
+            && !self
+                .group_record_fetch_serves(kind, &bytes, peer_key_id)
+                .await
         {
             return None;
         }
@@ -4481,6 +4532,15 @@ impl FederationDirectoryReplicationBridge {
             EnvelopeKind::Attestation | EnvelopeKind::KeyGrant => {
                 let outcome = self.apply_attestation(envelope_bytes, source_peer).await;
                 if outcome.is_admitted() {
+                    // CIRISEdge#758 — a membership row moves the invite set the
+                    // group-record gate reads; a byte probe keeps the scores
+                    // plane from paying a parse for it.
+                    if envelope_bytes
+                        .windows(b"membership:".len())
+                        .any(|w| w == b"membership:")
+                    {
+                        self.drop_invite_memo();
+                    }
                     self.widen_on_admitted_acceptance(envelope_bytes).await;
                 }
                 outcome
@@ -6416,14 +6476,8 @@ impl FederationDirectoryReplicationBridge {
         };
         match dimension {
             Some(PROPOSAL_DIMENSION) => {
-                let subjects = subjects_of(row);
-                if subjects.is_empty() {
-                    return false;
-                }
-                let Some(peer_person) = self.owner_or_self(peer, memo).await else {
-                    return false;
-                };
-                subjects.contains(&peer_person)
+                self.proposal_invites_peer(&subjects_of(row), peer, memo)
+                    .await
             }
             Some(ACCEPTANCE_DIMENSION | DECLINE_DIMENSION) => {
                 let Some(proposal_id) = row
@@ -6451,6 +6505,30 @@ impl FederationDirectoryReplicationBridge {
             }
             _ => false,
         }
+    }
+
+    /// CIRISEdge#756 / #758 — **is `peer` an invitee of a proposal naming
+    /// `subjects`?** True when `subject_key_ids` names the peer itself or its
+    /// person (`owner_of(peer)`, the peer when unowned). The ONE predicate: the
+    /// first-contact proposal row (#756, I22) and the group record that travels
+    /// with the invitation (#758, I23) both ask it. Fail-closed on an
+    /// unresolved owner.
+    async fn proposal_invites_peer(
+        &self,
+        subjects: &[String],
+        peer: &str,
+        memo: &mut AudienceMemo,
+    ) -> bool {
+        if subjects.is_empty() {
+            return false;
+        }
+        if subjects.iter().any(|s| s == peer) {
+            return true;
+        }
+        let Some(person) = self.owner_or_self(peer, memo).await else {
+            return false;
+        };
+        subjects.contains(&person)
     }
 
     /// CIRISEdge#756 — `owner_of(key)`, or `key` itself when it carries no
@@ -7617,6 +7695,12 @@ impl FederationDirectoryReplicationBridge {
     /// there is no twin to widen, and this is the note that says so, so the next
     /// reader does not go looking for one.
     ///
+    /// CIRISEdge#758 changed that for `Family` and `Community`: their records
+    /// are now gated PER PEER (members and live invitees only, CC 5.4.6), on
+    /// the advertise and on a fetch twin that reads the same predicate
+    /// ([`Self::group_records_servable_to`]). This filter still bounds what the
+    /// sweep considers; the gate decides who receives it.
+    ///
     /// The subject-scoped Pull (`subject_holdings`) is a different axis — it
     /// pins requester == subject and is an ENTITLEMENT question, not an
     /// advertise scope — and is deliberately untouched here (its own
@@ -8132,18 +8216,286 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    /// CIRISEdge#758 (CC 5.4.6, `FSD/FIRST_CONTACT.md` §2.5, I23) — the
+    /// per-peer view of a group RECORD plane: the sweep's rows, narrowed to the
+    /// groups `peer` may be handed ([`Self::group_records_servable_to`]).
+    /// Every record the sweep considered and the gate kept back is booked
+    /// `group_record_not_member_or_invitee`.
+    async fn list_group_records_for_peer(
+        &self,
+        kind: EnvelopeKind,
+        peer: Option<&str>,
+        window: SweepWindow<'_>,
+    ) -> Vec<EnvelopeRef> {
+        let servable = match peer {
+            Some(p) => {
+                self.group_records_servable_to(p, &mut AudienceMemo::default())
+                    .await
+            }
+            None => CohortsOf::default(),
+        };
+        let gate = GroupRecordGate {
+            peer: peer.unwrap_or("<unattributed>"),
+            servable: &servable,
+            site: "advertise",
+        };
+        if kind == EnvelopeKind::Family {
+            self.list_families_gated(window, Some(&gate)).await
+        } else {
+            self.list_communities_gated(window, Some(&gate)).await
+        }
+    }
+
+    /// CIRISEdge#758 — does `gate` admit the record of `group`? Books the
+    /// withhold at the branch when it does not.
+    fn group_record_admits(
+        &self,
+        gate: &GroupRecordGate<'_>,
+        kind: EnvelopeKind,
+        group: &str,
+    ) -> bool {
+        let servable = if kind == EnvelopeKind::Family {
+            &gate.servable.families
+        } else {
+            &gate.servable.communities
+        };
+        if servable.contains(group) {
+            return true;
+        }
+        self.withhold(
+            crate::observability::WithholdReason::GroupRecordNotMemberOrInvitee,
+            gate.peer,
+            &format!(
+                "{}: {} record: the peer's person is neither a live member nor a live \
+                 invitee (CIRISEdge#758, CC 5.4.6)",
+                gate.site,
+                kind.as_wire_str()
+            ),
+        );
+        tracing::debug!(
+            peer = gate.peer,
+            group,
+            kind = ?kind,
+            site = gate.site,
+            "group record withheld — the recipient's person is neither a live member of the \
+             group nor the invitee of a live proposal into it held here (CIRISEdge#758, CC 5.4.6)"
+        );
+        false
+    }
+
+    /// CIRISEdge#758 — the direct-fetch twin: the record's group read from its
+    /// wire bytes (`family.family_key_id` / `community.community_key_id`) and
+    /// judged by the SAME servable set the advertise uses. Fail-closed: an
+    /// unattributed requester, or bytes that name no group, get nothing.
+    async fn group_record_fetch_serves(
+        &self,
+        kind: EnvelopeKind,
+        bytes: &[u8],
+        peer: Option<&str>,
+    ) -> bool {
+        let pointer = if kind == EnvelopeKind::Family {
+            "/family/family_key_id"
+        } else {
+            "/community/community_key_id"
+        };
+        let group = serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|v| {
+                v.pointer(pointer)
+                    .and_then(|g| g.as_str().map(str::to_owned))
+            });
+        let servable = match (peer, group.as_ref()) {
+            (Some(p), Some(_)) => {
+                self.group_records_servable_to(p, &mut AudienceMemo::default())
+                    .await
+            }
+            _ => CohortsOf::default(),
+        };
+        let gate = GroupRecordGate {
+            peer: peer.unwrap_or("<unattributed>"),
+            servable: &servable,
+            site: "fetch",
+        };
+        self.group_record_admits(&gate, kind, group.as_deref().unwrap_or(""))
+    }
+
+    /// CIRISEdge#758 (CC 5.4.6) — **the groups whose RECORD `peer` may be
+    /// handed**: those its person is (a) a live member of, or (b) the invitee
+    /// of, through a live `membership:proposal:v1` held on this node — the
+    /// record travels with the invitation.
+    ///
+    /// (a) is the audience gate's own membership read ([`Self::cohorts_of`],
+    /// persist's `_active` views, #597) for the peer, its principal and
+    /// `owner_of(peer)`. (b) is [`Self::proposal_invites_peer`], the predicate
+    /// #756 serves the proposal ROW on, over [`Self::held_live_invites`].
+    /// Fail-closed throughout: an unresolved owner or an unreadable
+    /// membership contributes nothing.
+    async fn group_records_servable_to(&self, peer: &str, memo: &mut AudienceMemo) -> CohortsOf {
+        let mut out = CohortsOf::default();
+        let mut ids = vec![peer.to_owned()];
+        if let Some(principal) = self.principal_of(peer, memo).await {
+            if !ids.contains(&principal) {
+                ids.push(principal);
+            }
+        }
+        if let Some(person) = self.owner_or_self(peer, memo).await {
+            if !ids.contains(&person) {
+                ids.push(person);
+            }
+        }
+        for id in &ids {
+            if let Some(c) = self.cohorts_of(id, memo).await {
+                out.families.extend(c.families);
+                out.communities.extend(c.communities);
+            }
+        }
+        for invite in self.held_live_invites().await.iter() {
+            if self
+                .proposal_invites_peer(&invite.subjects, peer, memo)
+                .await
+            {
+                match invite.scope {
+                    crate::membership::GroupScope::Family => {
+                        out.families.insert(invite.group_key_id.clone());
+                    }
+                    crate::membership::GroupScope::Community => {
+                        out.communities.insert(invite.group_key_id.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// CIRISEdge#758 — the LIVE membership proposals held here: federation
+    /// tier, unexpired, not declined by an invitee it names and not withdrawn
+    /// or recanted by its proposer. Memoized for [`INVITE_MEMO_TTL`].
+    ///
+    /// Read by author: a proposal is authored by a member of its group (a
+    /// founder under `founder_only`) or a node acting for one, and the record
+    /// sweep lists only groups with a member in this node's own set or its
+    /// (owner-widened) cohort, so those are the authors read. persist has no
+    /// subject-keyed attestation read; a proposal by an author outside that
+    /// set is not an invite here (fail-closed: its record is served by the
+    /// author's own node, which holds it).
+    async fn held_live_invites(&self) -> Arc<Vec<HeldInvite>> {
+        use crate::membership::{dimension_of, GroupScope, DECLINE_DIMENSION, PROPOSAL_DIMENSION};
+        use ciris_persist::federation::types::{attestation_tier, attestation_type};
+        if let Ok(cache) = self.invite_cache.lock() {
+            if let Some((at, invites)) = cache.as_ref() {
+                if at.elapsed() < INVITE_MEMO_TTL {
+                    return Arc::clone(invites);
+                }
+            }
+        }
+        let mut authors = self.cohort_set_with_owners().await;
+        if let Some(own) = self.self_provider.as_ref() {
+            authors.extend(own());
+        }
+        let now = chrono::Utc::now();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for author in &authors {
+            let Ok(rows) = self.directory.list_attestations_by(author).await else {
+                continue;
+            };
+            for p in rows {
+                if dimension_of(&p) != Some(PROPOSAL_DIMENSION)
+                    || p.tier != attestation_tier::FEDERATION
+                    || !p.expires_at.is_some_and(|t| t > now)
+                    || p.subject_key_ids.is_empty()
+                    || !seen.insert(p.attestation_id.clone())
+                {
+                    continue;
+                }
+                let Some(scope) = GroupScope::of_row(&p) else {
+                    continue;
+                };
+                let Some(group_key_id) = crate::membership::group_of(&p, scope) else {
+                    continue;
+                };
+                // Withdrawn / recanted by its proposer: no longer an invitation.
+                let Ok(composers) = self
+                    .directory
+                    .list_attestations_referencing(&p.attestation_id)
+                    .await
+                else {
+                    continue;
+                };
+                if composers.iter().any(|r| {
+                    matches!(
+                        r.attestation_type.as_str(),
+                        attestation_type::WITHDRAWS | attestation_type::RECANTS
+                    ) && r.attesting_key_id == p.attesting_key_id
+                }) {
+                    continue;
+                }
+                // Declined by an invitee it names (a decline is attested to the
+                // invitee and names the proposal; persist makes it terminal).
+                let mut declined = false;
+                for subject in &p.subject_key_ids {
+                    let Ok(replies) = self.directory.list_attestations_for(subject).await else {
+                        declined = true;
+                        break;
+                    };
+                    if replies.iter().any(|r| {
+                        dimension_of(r) == Some(DECLINE_DIMENSION)
+                            && r.attestation_envelope
+                                .get("references_attestation_id")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(p.attestation_id.as_str())
+                    }) {
+                        declined = true;
+                        break;
+                    }
+                }
+                if declined {
+                    continue;
+                }
+                out.push(HeldInvite {
+                    scope,
+                    group_key_id,
+                    subjects: p.subject_key_ids,
+                });
+            }
+        }
+        let out = Arc::new(out);
+        if let Ok(mut cache) = self.invite_cache.lock() {
+            *cache = Some((Instant::now(), Arc::clone(&out)));
+        }
+        out
+    }
+
+    /// CIRISEdge#758 — drop the held-invite memo: a membership row was admitted
+    /// (a proposal, an acceptance or a decline), so the invite set may move.
+    fn drop_invite_memo(&self) {
+        if let Ok(mut cache) = self.invite_cache.lock() {
+            *cache = None;
+        }
+    }
+
     async fn list_families(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
+        self.list_families_gated(window, None).await
+    }
+
+    /// The Family plane's sweep, with the CIRISEdge#758 per-peer gate when a
+    /// peer is bound (`gate`); `None` is the peer-blind view (holdings,
+    /// diagnostics, tests).
+    async fn list_families_gated(
+        &self,
+        window: SweepWindow<'_>,
+        gate: Option<&GroupRecordGate<'_>>,
+    ) -> Vec<EnvelopeRef> {
         // CIRISEdge#523 — plane 1 of 3. A Family's members are PERSONS; the
         // cohort is NODE-keyed. See [`Self::cohort_set_with_owners`].
         let mut cohort = self.cohort_set_with_owners().await;
-        // CIRISEdge#756 — the family twin of the Community plane's v52 arm
-        // (`list_communities`): a family is founded by its opener ALONE
-        // (CIRISPersist#955), so a new family's record names only this node's
-        // own person and never crossed the cohort arm. The invitee's node needs
-        // the record to follow the family once it joins (CIRISPersist#955 §7:
-        // it must hold the group's record and roster planes); publish-own
-        // keeps the exposure where it was before v52, when the record listed
-        // the invitee and crossed on the cohort arm.
+        // A family is founded by its opener ALONE (CIRISPersist#955), so a new
+        // family's record names only this node's own person and never crosses
+        // the cohort arm: the sweep also lists the families this node's own
+        // identities are in. That widens only what this node CONSIDERS; who
+        // RECEIVES a record is the per-peer gate below (CIRISEdge#758, CC
+        // 5.4.6): the group's live members and the invitees of a live proposal
+        // held here. Never every peer.
         if let Some(own) = self.self_provider.as_ref() {
             cohort.extend(own());
         }
@@ -8163,6 +8515,13 @@ impl FederationDirectoryReplicationBridge {
                     .members
                     .iter()
                     .any(|m| cohort.contains(&m.key_id))
+                    && gate.map_or(true, |g| {
+                        self.group_record_admits(
+                            g,
+                            EnvelopeKind::Family,
+                            &s.family.family.family_key_id,
+                        )
+                    })
             },
             |s| Self::ms_seq(s.family.family.founded_at),
             |s| &s.family,
@@ -8171,16 +8530,26 @@ impl FederationDirectoryReplicationBridge {
     }
 
     async fn list_communities(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
+        self.list_communities_gated(window, None).await
+    }
+
+    /// The Community plane's sweep — the twin of [`Self::list_families_gated`].
+    async fn list_communities_gated(
+        &self,
+        window: SweepWindow<'_>,
+        gate: Option<&GroupRecordGate<'_>>,
+    ) -> Vec<EnvelopeRef> {
         // CIRISEdge#523 — plane 2 of 3, and the one the ladder MEASURED: the
         // recipient held 0 `federation_communities` rows for a room its owner
         // is a member of. See [`Self::cohort_set_with_owners`].
         let mut cohort = self.cohort_set_with_owners().await;
         // persist v52.0.0 (CIRISPersist#955) — a room is founded by its opener
         // ALONE and everyone else joins by accepting a proposal, so a new
-        // room's roster names only this node's own person: publish-own. The
-        // invitee's node needs the record to follow the room (the widening
-        // names it), and before v52 the same record listed the invitee and so
-        // crossed on the cohort arm — this keeps the exposure where it was.
+        // room's roster names only this node's own person: the sweep also
+        // lists the rooms this node's own identities are in. Who RECEIVES a
+        // record is the per-peer gate (CIRISEdge#758, CC 5.4.6): the room's
+        // live members and the invitees of a live proposal held here — the
+        // record travels with the invitation, never to every peer.
         if let Some(own) = self.self_provider.as_ref() {
             cohort.extend(own());
         }
@@ -8200,6 +8569,13 @@ impl FederationDirectoryReplicationBridge {
                     .members
                     .iter()
                     .any(|m| cohort.contains(&m.key_id))
+                    && gate.map_or(true, |g| {
+                        self.group_record_admits(
+                            g,
+                            EnvelopeKind::Community,
+                            &s.community.community.community_key_id,
+                        )
+                    })
             },
             |s| Self::ms_seq(s.community.community.founded_at),
             |s| &s.community,
@@ -19321,6 +19697,166 @@ pub(crate) mod tests {
                 )
                 .await,
             "a reply whose proposal is not held here is not the ceremony"
+        );
+    }
+
+    /// CIRISEdge#758 (`FSD/FIRST_CONTACT.md` §2.5, I23; CC 5.4.6) — **a group
+    /// RECORD is served only to the group's live members and live invitees.**
+    ///
+    /// P's node A holds community G (P alone) and family F (P and L). P has
+    /// proposed K into both and X into G; X declined. No consent anywhere. On
+    /// the per-peer advertise AND the fetch twin:
+    ///
+    /// - K's node (a live invitee) gets both records;
+    /// - L's node (a member of F) gets F, and not G (neither member nor invitee);
+    /// - X's node (declined) does not get G;
+    /// - Q's node (a stranger) and an unbound peer get neither.
+    ///
+    /// FAILS on the pre-#758 code: the record planes were peer-blind, so every
+    /// peer was offered both records.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_group_record_is_served_only_to_members_and_live_invitees_758() {
+        use crate::membership::GroupScope;
+        use crate::observability::WithholdReason;
+        let backend = Arc::new(MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-p", identity_type::USER),
+                ("person-k", identity_type::USER),
+                ("person-l", identity_type::USER),
+                ("person-q", identity_type::USER),
+                ("person-x", identity_type::USER),
+                ("node-a", identity_type::NODE),
+                ("node-b", identity_type::NODE),
+                ("node-c", identity_type::NODE),
+                ("node-d", identity_type::NODE),
+                ("node-e", identity_type::NODE),
+                ("room-authority", identity_type::USER),
+            ],
+        )
+        .await;
+        for (owner, node) in [
+            ("person-p", "node-a"),
+            ("person-k", "node-b"),
+            ("person-q", "node-c"),
+            ("person-l", "node-d"),
+            ("person-x", "node-e"),
+        ] {
+            seed_owner_binding(&backend, owner, node).await;
+        }
+        let room = crate::chat::pair_community("person-p", "person-k", Utc::now());
+        let g = room.community_key_id.clone();
+        backend
+            .put_community(sign_community_fixture("room-authority", room))
+            .await
+            .expect("G, founded by P alone");
+        backend
+            .put_family(sign_family_fixture(
+                "person-p",
+                fixture_family_founded("f-758", "person-p", "person-l"),
+            ))
+            .await
+            .expect("F, P and L");
+        let expires = Utc::now() + chrono::Duration::days(7);
+        for (scope, group, invitee) in [
+            (GroupScope::Community, g.as_str(), "person-k"),
+            (GroupScope::Family, "f-758", "person-k"),
+            (GroupScope::Community, g.as_str(), "person-x"),
+        ] {
+            crate::membership::propose(
+                &*backend,
+                scope,
+                group,
+                invitee,
+                None,
+                expires,
+                &fixture_local_signer("person-p"),
+            )
+            .await
+            .expect("P proposes");
+        }
+        let to_x = crate::membership::pending_proposals_for(&*backend, "person-x")
+            .await
+            .expect("X's inbox")
+            .pop()
+            .expect("the proposal to X")
+            .proposal;
+        crate::membership::reply(
+            &*backend,
+            &to_x.attestation_id,
+            false,
+            &fixture_local_signer("node-e"),
+        )
+        .await
+        .expect("X declines");
+
+        let metrics = crate::observability::EdgeMetrics::new();
+        let publish = vec!["node-a".to_owned(), "person-p".to_owned()];
+        let bridge = bridge_over(&backend, &[])
+            .with_local_key_id(Some("node-a".to_owned()))
+            .with_self_provider(Some(Arc::new(move || publish.clone())))
+            .with_metrics(Some(metrics.clone()));
+        let record = |kind: EnvelopeKind| {
+            let bridge = &bridge;
+            async move {
+                let refs = bridge.list_envelope_refs(kind).await;
+                assert_eq!(refs.len(), 1, "one {kind:?} record held");
+                refs[0].envelope_hash
+            }
+        };
+        let (h_g, h_f) = (
+            record(EnvelopeKind::Community).await,
+            record(EnvelopeKind::Family).await,
+        );
+        let served = |kind: EnvelopeKind, peer: Option<&'static str>, hash: [u8; 32]| {
+            let bridge = &bridge;
+            async move {
+                let listed = bridge
+                    .list_envelope_refs_for_peer(kind, peer)
+                    .await
+                    .iter()
+                    .any(|r| r.envelope_hash == hash);
+                let fetched = bridge
+                    .fetch_envelope_bytes_for_peer(kind, &hash, peer)
+                    .await
+                    .is_some();
+                assert_eq!(
+                    listed, fetched,
+                    "{kind:?} to {peer:?}: the advertise and the fetch twin agree"
+                );
+                listed
+            }
+        };
+        assert!(
+            served(EnvelopeKind::Community, Some("node-b"), h_g).await
+                && served(EnvelopeKind::Family, Some("node-b"), h_f).await,
+            "a live invitee's node is served both records (the record travels with the \
+             invitation)"
+        );
+        assert!(
+            served(EnvelopeKind::Family, Some("node-d"), h_f).await,
+            "a member's node is served its group's record"
+        );
+        assert!(
+            !served(EnvelopeKind::Community, Some("node-d"), h_g).await,
+            "a member of F is neither a member of nor invited into G"
+        );
+        assert!(
+            !served(EnvelopeKind::Community, Some("node-e"), h_g).await,
+            "a declined proposal is not a live invitation"
+        );
+        for peer in [Some("node-c"), None] {
+            assert!(
+                !served(EnvelopeKind::Community, peer, h_g).await
+                    && !served(EnvelopeKind::Family, peer, h_f).await,
+                "{peer:?}, an outsider, is served no group record (CC 5.4.6)"
+            );
+        }
+        assert!(
+            metrics.withholds(WithholdReason::GroupRecordNotMemberOrInvitee) >= 6,
+            "every refusal is booked by name"
         );
     }
 

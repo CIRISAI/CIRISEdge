@@ -217,6 +217,12 @@ pub fn parameter_of(reason: WithholdReason) -> CiParameter {
         WithholdReason::IdentityRowNodeNotAnnounced
         | WithholdReason::IdentityRowAnnounceUnresolved => CiParameter::Recipient,
 
+        // CIRISEdge#758 (CC 5.4.6) — a group's record reaches its members and
+        // its live invitees; anyone else is outside the group's context. A
+        // recipient bound: the record is admitted information, the audience
+        // is not.
+        WithholdReason::GroupRecordNotMemberOrInvitee => CiParameter::Recipient,
+
         WithholdReason::AccordRelayRosterUnresolvable
         | WithholdReason::AccordRelaySignerNotSeated
         | WithholdReason::AccordRelayNoTrustEdge
@@ -850,7 +856,7 @@ mod tests {
     /// So: when adding a reason, add it here too, and on a merge that touches
     /// this file check the count against the enum rather than trusting a
     /// green suite.
-    const ALL_REASONS: [WithholdReason; 49] = [
+    const ALL_REASONS: [WithholdReason; 50] = [
         WithholdReason::EnvelopeUnfetchable,
         WithholdReason::LocalIdentityMissing,
         WithholdReason::SendSetUnresolved,
@@ -900,5 +906,6 @@ mod tests {
         WithholdReason::HoldingScopeRecipientReadError,
         WithholdReason::IdentityRowNodeNotAnnounced,
         WithholdReason::IdentityRowAnnounceUnresolved,
+        WithholdReason::GroupRecordNotMemberOrInvitee,
     ];
 }

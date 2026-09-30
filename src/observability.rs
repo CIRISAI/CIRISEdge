@@ -590,6 +590,15 @@ pub enum WithholdReason {
     /// Distinct from [`Self::IdentityRowNodeNotAnnounced`] so an operator is
     /// sent to the directory, not to the announce wizard.
     IdentityRowAnnounceUnresolved,
+    /// CIRISEdge#758 (CC 5.4.6) — a `Family` / `Community` RECORD asked for (on
+    /// the advertise or the direct-fetch twin) by a peer whose person
+    /// (`owner_of(peer)`, the peer itself when unowned) is neither a live
+    /// member of that group nor the invitee (`subject_key_ids`) of a live
+    /// `membership:proposal:v1` into it held on this node. The construction
+    /// hides a group's existence and membership from outsiders; a founder's
+    /// node offering the record to every peer disclosed both. Not a fault —
+    /// the peer is outside the group. `detail` names the plane and the site.
+    GroupRecordNotMemberOrInvitee,
 }
 
 impl WithholdReason {
@@ -648,6 +657,7 @@ impl WithholdReason {
             Self::LxmfRetentionExpired => "lxmf_retention_expired",
             Self::IdentityRowNodeNotAnnounced => "identity_row_node_not_announced",
             Self::IdentityRowAnnounceUnresolved => "identity_row_announce_unresolved",
+            Self::GroupRecordNotMemberOrInvitee => "group_record_not_member_or_invitee",
         }
     }
 }

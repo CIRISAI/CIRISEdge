@@ -667,7 +667,7 @@ pub fn is_membership_row(row: &Attestation) -> bool {
     )
 }
 
-fn group_of(row: &Attestation, scope: GroupScope) -> Option<String> {
+pub(crate) fn group_of(row: &Attestation, scope: GroupScope) -> Option<String> {
     row.attestation_envelope
         .get(scope.target_member())
         .and_then(serde_json::Value::as_str)

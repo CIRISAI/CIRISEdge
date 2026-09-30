@@ -377,6 +377,37 @@ and no ref is disclosed that the fetch would refuse.
 
 **Invariant I22** (§6).
 
+### 2.5 A group's record reaches its members and live invitees, nobody else (CIRISEdge#758)
+
+**The rule.** A `Family` or `Community` **record** (the roster declaration itself, not a row at
+its target) is served to a peer X only when X's person, `owner_of(X)` (X itself when unowned), is
+
+- **(a) a live member** of that group: persist's `list_*_for_member_active` over X, X's principal
+  and `owner_of(X)`, the audience gate's own membership read (#597); or
+- **(b) a live invitee:** named in the `subject_key_ids` of a **live** `membership:proposal:v1` into
+  that group **held in this node's store** (federation tier, unexpired, not declined by the invitee,
+  not withdrawn or recanted by its proposer). The predicate is the one §2.4 serves the proposal row
+  on (`proposal_invites_peer`): the record travels with the invitation, and never ahead of it.
+
+Anyone else is withheld and booked `group_record_not_member_or_invitee`. It holds on every reach:
+at first contact the invitee gets the record its proposal needs (CC rc6 3.1.3.2 lets it admit the
+proposal without the roster, but following the group once it joins needs the record) and nothing
+widens for a stranger. The advertise (`list_envelope_refs_for_peer` → `list_group_records_for_peer`)
+and the direct-fetch twin (`fetch_envelope_bytes_for_peer` → `group_record_fetch_serves`) read the
+same servable set, so they agree; an unbound peer gets nothing. The record planes answer no subject
+Pull (`receive: none`), so there is no third twin.
+
+**Why.** CC 5.4.6: the construction "hides the group's existence, membership, and
+`querier → invitee` edges from outsiders". Under persist v52 (CIRISPersist#955) a group is founded
+by its opener alone, so to get the record to an invitee #754 (communities) and #756 / #736
+(families) made a founder's node list the groups its own person founded. The record planes were
+peer-blind (`serve: public`), so that listing went to **every** peer before any proposal existed:
+an outsider learned that the group exists and who founded it. The sweep may still consider those
+groups; who *receives* one is now this gate. Before v52 a record crossed only because a member sat
+in the operator's cohort, and then to any peer; members keep receiving it, outsiders no longer do.
+
+**Invariant I23** (§6).
+
 ---
 
 ## 3. The pair state machine (both directions)
@@ -506,6 +537,7 @@ before — minus the four rows that now cross.
 | I19 | **The remaining limit is on-path trust on first use.** A device cannot tell the true holder of a `key_id` it has never seen. persist binds the `key_id` inside the registration envelope and checks the self-signature against the record's own public keys, but never derives `key_id` from the public key, so a self-signed record may claim any `key_id`. The challenge (off-path parties cannot name the request) and the path check (the answer must arrive on the request's medium) narrow who can attempt the substitution to a party that saw the request on that medium; neither prevents it. Closing it needs the key id to be derivable from the key (a persist change) or an out-of-band commitment to the first device's key (the pairing code). | `first_contact_opaque_683::a_forged_answer_built_from_public_material_introduces_nothing_683` (the off-path half; fails on the pre-challenge code, where the forged record was admitted as the first device's key) |
 | I20 | **The owner-binding rung (§2.1.1, CIRISEdge#727).** (I-a) A binding whose attester is the receiver's own owner is admitted on any link after signature verification against the held owner key, through persist's replicated-attestation door. (I-b) A node pushes only its own binding, only on a link it dialed or in answer to a sibling's binding newly admitted on that link, never advertises it. (I-c) A stranger refuses it by name before any cryptography and stores nothing. (I-d) Admission invalidates the #682 memo; the unannounced pair converges in a bounded number of rounds. | `owned_devices_route_682::unannounced_devices_of_one_owner_exchange_routes_and_admit_682` (I-a, I-d: the round bound is asserted; fails on the pre-#727 code); `…::a_binding_signed_by_a_key_that_is_not_the_receivers_owner_is_refused_by_name_727` (I-a negative, both the attester field and the signature); `…::a_stranger_refuses_another_owners_binding_and_holds_nothing_727` (I-c); `…::a_node_pushes_its_binding_only_on_a_link_it_dialed_727` (I-b); `…::a_wiped_device_reconverges_by_dialling_its_sibling_727` (recovery); `protocol::tests::an_owner_binding_push_is_exactly_a_deliver_of_owner_binding_rows_727` (the shape) |
 | I22 | **The membership ceremony reaches its stranger (§2.4, CIRISEdge#756; CIRISPersist#955, CC rc6 3.1.3.2, CIRISConstitution#133).** Under `Reach::FirstContact` a node additionally serves (a) a `membership:proposal:v1` whose `subject_key_ids` contains `owner_of(peer)` and (b) an acceptance/decline, attested to the invitee of a proposal held here, whose proposal's proposer is `owner_of(peer)`; on the advertise and the fetch twin alike, without the Rooted floor (first-party to the recipient). Nothing else widens: no other row at the group's target, no proposal to anyone else, no reply to a proposal not held here or to someone else's proposal. | `membership_first_contact_756::a_stranger_is_invited_accepts_and_joins_over_first_contact_756` (community) and `…_a_family_over_first_contact_756` (three nodes over Reticulum, no consent, no common root; fails on the pre-#756 gate: the invitee's node never holds the proposal); `bridge::first_contact_serves_the_membership_ceremony_to_its_parties_and_nothing_else_756` (advertise + fetch twin, relayed un-Rooted proposal, the four negatives) |
+| I23 | **A group's record reaches its members and live invitees, nobody else (§2.5, CIRISEdge#758; CC 5.4.6).** A `Family` / `Community` record is served to a peer only when `owner_of(peer)` is a live member of the group or the `subject_key_ids` invitee of a live proposal into it held here; otherwise withheld as `group_record_not_member_or_invitee`, on the advertise and the fetch twin alike, at every reach. | `group_record_reach_758::a_group_record_reaches_only_members_and_live_invitees_758` (four nodes over Reticulum: a stranger never holds G's or F's record, an invitee only once proposed, a member as a member, and the pair room's invitee gets its record; fails on the pre-#758 code: every peer holds both records before any proposal); `bridge::a_group_record_is_served_only_to_members_and_live_invitees_758` (advertise + fetch twin: stranger, invitee, declined invitee, member, unbound peer) |
 
 ---
 
@@ -545,6 +577,12 @@ the load-bearing rule in this document that realises it.
 
 ## 9. Change log
 
+- **CIRISEdge#758** (edge v38.0.0) — §2.5: a group's record (Family, Community) reaches only the
+  group's live members and the invitees of a live proposal held here (the §2.4 predicate, reused);
+  everyone else is withheld as `group_record_not_member_or_invitee` (CC 5.4.6). Closes the
+  founder-advertise leak #754 / #756 / #736 opened: the founder's node offered the record of every
+  group its person founded to every peer, before any proposal. The record planes' `serve` cell
+  moves from `public` to the gate; `SERVE_ADVERTISE_POLICY_HASH` re-pinned. I23.
 - **CIRISEdge#756** (persist v52 adopt, edge v38.0.0) — §2.4 the membership ceremony at first
   contact: a stranger's node is served the proposal naming its person, and the invitee's node
   serves the reply back to the proposer's person's nodes; the Rooted floor does not apply to these
@@ -554,9 +592,7 @@ the load-bearing rule in this document that realises it.
   The Family plane now also advertises this node's own-founded families (the family twin of
   #754's Community arm): a family is founded by its opener alone, so without it the joined
   invitee's node never held the record and could not follow the family (witnessed: the family
-  case fails without it). The group RECORD planes are `public` (manifest) and not per-recipient,
-  so a stranger peer holds the record of a group its peer founded before any proposal; what
-  first contact withholds is the group's attestation rows.
+  case fails without it). (That listing went to every peer; #758, §2.5, gates it per peer.)
 - **CIRISEdge#727** — §2.1.1 the owner-binding rung, the belt under I14: an owner-binding whose
   attester is the receiver's own owner is self-authenticating to that receiver and is admitted on
   any link (signature verified against the held owner key, then persist's replicated-attestation

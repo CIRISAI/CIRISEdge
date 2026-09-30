@@ -69,9 +69,17 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
              membership:acceptance|decline:v1 to a held proposal by owner_of(peer); \
              else public",
         ),
-        EnvelopeKind::Family | EnvelopeKind::Community | EnvelopeKind::LocationProof => {
-            ("cohort", "public")
-        }
+        // CIRISEdge#758 (CC 5.4.6, `FSD/FIRST_CONTACT.md` §2.5) — a group
+        // RECORD is not public: it reaches the group's live members and the
+        // invitees of a live proposal held here (the record travels with the
+        // invitation), on the advertise and the fetch twin, at every reach.
+        EnvelopeKind::Family | EnvelopeKind::Community => (
+            "cohort",
+            "group record → owner_of(peer) is a live member, or a subject_key_ids \
+             invitee of a live membership:proposal:v1 into the group held here; \
+             else withheld (group_record_not_member_or_invitee)",
+        ),
+        EnvelopeKind::LocationProof => ("cohort", "public"),
         // The four `global` planes: the two tombstone planes above join the two
         // membership-revocation planes here — all four fan out over the
         // hardcoded widest own∪cohort set (`Projection::Global`).
@@ -265,8 +273,16 @@ pub fn serve_advertise_policy_sha256() -> String {
 // acceptance/decline of a proposal held here that `owner_of(peer)` issued
 // (`FSD/FIRST_CONTACT.md` §2.4, I22; CIRISPersist#955, CC rc6 3.1.3.2). Folded
 // into the v38.0.0 re-pin. **CIRISServer must mirror this pin.**
+//
+// CIRISEdge#758 — RE-PINNED, 9af0dc28… → b949d7b2…. The Family and Community
+// `serve` cells move from `public` to the group-record gate (CC 5.4.6): a
+// record reaches `owner_of(peer)` only as a live member or as the invitee of a
+// live proposal into the group held here; anyone else is booked
+// `group_record_not_member_or_invitee` (`FSD/FIRST_CONTACT.md` §2.5, I23).
+// `LocationProof` keeps `public`. Folded into the v38.0.0 re-pin.
+// **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "9af0dc28ae9bbdb83aafb9886b5b753143f5a18bdaa7f06d5c8baf15a4bc32f2";
+    "b949d7b2825fbcb99dda6a9713f4e8dca814ca4969f0812418ad92b82e629ccc";
 
 #[cfg(test)]
 mod tests {
