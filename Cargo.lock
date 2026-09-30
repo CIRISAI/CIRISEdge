@@ -1096,8 +1096,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "51.1.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v51.1.0#3488557328a85ded8be07fac0932f00e43e028f3"
+version = "51.3.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?rev=9d406712#9d40671247bf21d62bd2eb6a9423f44eef7b397a"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

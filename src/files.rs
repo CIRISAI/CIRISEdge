@@ -887,16 +887,19 @@ pub struct FileRow {
 /// A file row's retraction state (CIRISEdge#693).
 ///
 /// Decided by the same predicate persist's `Live` listing uses to hide a row
-/// — a structural composer of that kind, from the row's own attester, that
-/// references it — so a row marked `Live` here is exactly one a `Live`
-/// listing returns, and a retracted one names which composer retracted it.
-/// If several apply, the strongest wins: `Withdrawn`, then `Recanted`, then
-/// `Superseded`.
+/// — a structural composer of that kind referencing it, from the row's own
+/// attester or admitted by the write door under a resolved rule
+/// ([`retraction_counts`]; persist v51.2.0 / CIRISPersist#945, CIRISEdge#712)
+/// — so a row marked `Live` here is exactly one a `Live` listing returns, and
+/// a retracted one names which composer retracted it. If several apply, the
+/// strongest wins: `Withdrawn`, then `Recanted`, then `Superseded`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileLifecycle {
     /// Not retracted.
     Live,
-    /// Retracted by a `withdraws` (the author took it back; CC 2.3).
+    /// Retracted by a `withdraws` (CC 2.3): the author's, or one persist
+    /// admitted from another principal — the authoring node's owner
+    /// (CIRISEdge#941/#712), a subject, a delegate.
     Withdrawn,
     /// Retracted by a `recants`.
     Recanted,
@@ -1416,8 +1419,13 @@ pub async fn in_room_with(
 }
 
 /// The retraction state of one listed row — persist's `Live` hide rule, read
-/// per row: a structural composer of that kind, from the row's own attester,
-/// referencing it (see [`FileLifecycle`]).
+/// per row (v51.2.0, CIRISPersist#945): a structural composer of that kind
+/// referencing it, from the row's own attester OR one the write door ADMITTED
+/// under a resolved rule (`withdraws_admission_rule` set — a node owner's
+/// withdraw of its node's row, CIRISEdge#941/#712; a subject's rule-2
+/// revocation; a delegate's). A `supersedes` is a same-attester act (CC 2)
+/// and never carries a rule, so for it the same-author check is the whole
+/// rule. See [`FileLifecycle`].
 async fn lifecycle_of(
     engine: &ciris_persist::Engine,
     row: &Attestation,
@@ -1437,7 +1445,11 @@ async fn lifecycle_of(
     let retracted_by = |kind: &str| {
         composers.iter().any(|c| {
             c.attestation_type == kind
-                && c.attesting_key_id == row.attesting_key_id
+                && retraction_counts(
+                    &c.attesting_key_id,
+                    &row.attesting_key_id,
+                    c.withdraws_admission_rule,
+                )
                 && references_attestation_id_from_envelope(&c.attestation_envelope)
                     == Some(row.attestation_id.as_str())
         })
@@ -1451,6 +1463,18 @@ async fn lifecycle_of(
     } else {
         FileLifecycle::Live
     })
+}
+
+/// **Does a composer signed by `composer` retract a row by `author`?** — the
+/// predicate persist's every `Live` filter applies since v51.2.0
+/// (CIRISPersist#945), mirrored so the history view names exactly the rows
+/// the live view hides (CIRISEdge#712): the target's own author's retraction
+/// counts, and so does one the write door admitted under a resolved rule
+/// (`withdraws_admission_rule` is `Some`), whoever signed it. An unadmitted
+/// cross-attester composer retracts nothing (CEG §6.1 rule 4).
+#[must_use]
+pub fn retraction_counts(composer: &str, author: &str, admission_rule: Option<u8>) -> bool {
+    composer == author || admission_rule.is_some()
 }
 
 /// **Is `row` one of `room`'s files?** — edge's room rule, public so a host

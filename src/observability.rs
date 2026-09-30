@@ -980,10 +980,11 @@ pub struct EdgeMetrics {
     pub blob_pull_sources: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#717 — pulls that fetched (or would have fetched) bytes and
     /// refused to STORE them, by reason: `size_mismatch` (a whole blob whose
-    /// length is not the one its pointer implies, CC 5.3.2.5) and
-    /// `stream_pointer_needs_dag_pull` (a chunk-DAG pointer, which the whole
-    /// blob path would otherwise store as its manifest). Nothing is stored on
-    /// either; a non-zero count is a file that is not on this device.
+    /// length is not the one its pointer implies, CC 5.3.2.5) and the DAG
+    /// pull's rungs (`FSD/CONTENT_TRANSFER.md` §6.7): `dag_manifest_mismatch`,
+    /// `dag_total_size_mismatch`, `dag_over_cap`, `dag_chunk_mismatch`,
+    /// `dag_chunk_missing` (`blob_swarm::DagPullRefusal::tag`). Nothing is
+    /// stored on any; a non-zero count is a file that is not on this device.
     pub blob_pull_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#530 — cumulative count of UNRETAINED peer bindings evicted from
     /// the live announce-intake map under **capacity backpressure** (the

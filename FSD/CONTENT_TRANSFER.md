@@ -851,17 +851,54 @@ CC 5.3.3.1's `MAX_CHUNKS_PER_EPOCH = 2²⁴`. At 256 KiB per chunk that ceiling 
 asking for a few seconds of a video should not pull a megabyte. CC bounds the envelope and the chunk
 COUNT, never the chunk size.
 
-**What remains: the cross-node fetch.** The puller adopts a whole blob (`adopt_sealed_blob`); a DAG
-needs `adopt_sealed_chunk` per chunk against the manifest, under the same store gate. Until that
-lands a DAG is written, listed and opened on the node that sealed it, and a far node reads
-`not_fetched` — the honest state, not a silent gap. Tracked on CIRISEdge#633.
+**The cross-node fetch — the DAG pull** (CIRISEdge#717; persist v51.3.0, CIRISPersist#947). The
+puller never whole-pulls a pointer carrying `stream_id`: its address is the MANIFEST's, and stored
+whole the manifest read back as the file (v34.1.0 refused such a pointer by name as
+`StreamPointerNeedsDagPull`; that interim arm is gone). A stream pointer takes its own walk — through
+the same holder rung (§6.2) and the same store gate as a whole blob — over persist's three #947 doors:
 
-**Until then a stream pointer is refused by name** (CIRISEdge#717): the puller never whole-pulls a
-pointer carrying `stream_id` — its address is the manifest's, and stored whole the manifest read back
-as the file — so it answers `StreamPointerNeedsDagPull` before any request, stores nothing, and counts
-`blob_pull_refusals{stream_pointer_needs_dag_pull}`; the DAG pull waits on persist's sealed-DAG adopt
-door (CIRISPersist#947). A whole blob whose length is not the one its pointer implies (`size`, plus
-`AT_REST_ENVELOPE_OVERHEAD` at a sealed tier) is refused `SizeMismatch`, counted `size_mismatch`.
+| door | what it does |
+|---|---|
+| `open_sealed_manifest_as(sha, viewer, aad)` | the chunk list of a held sealed manifest, opened for an authorized viewer (as `read_blob_as` authorizes): `{sha256_hex, size, seq}` per chunk, `stream_id`, `total_size`, the row's `storage_kind`, and the three caps (per-chunk inline cap, whole-read cap, max chunks); refuses a non-manifest by name |
+| `promote_adopted_manifest_to_dag(sha, viewer, aad)` | flips an adopted manifest row to `chunk_dag` once every chunk is held at `(stream_id, seq)` with the named sha and `plaintext_size = size`; otherwise names the first missing `(seq, sha)`; idempotent |
+| `put_blob_chunks_signing(manifest, chunks, author)` | a plaintext DAG in one shot, every chunk verified against the manifest inside the door, the manifest's `holds_bytes` announced as `store_plaintext` announces a whole blob |
+
+**The states, in order.** Each rung refuses by name (`PullOutcome::DagRefused`) and counts under
+`blob_pull_refusals`; nothing past a refusal is stored, and nothing stored reads wrong.
+
+| state | sealed (`invisible_encrypted` / `community_dek`) | plaintext (commons) |
+|---|---|---|
+| **manifest** | fetched by the pointer's sha and verified against it by the puller; `adopt_sealed_blob` as received — an inline envelope edge never opens — with the row's provenance and AAD, exactly as a whole blob | fetched by the pointer's sha and verified against it; parsed in clear as persist's canonical JCS shape, the reading proven by re-canonicalizing to the fetched bytes |
+| **verified** | `open_sealed_manifest_as` as THIS NODE under the row's AAD. `NotGranted` ⇒ `DagAwaitingKey`: the manifest stays held and the retry resumes when the `key_grant` lands (the key follows the bytes in either order, persist I61/I62) | the manifest's `chunk_tier` is plaintext |
+| | then `check_dag_plan`, BEFORE any chunk is fetched: the manifest names the pointer's stream; `total_size` is the pointer's `size` (compared to the manifest's plaintext total — never to the row's `size_bytes`, which stays the envelope's length after promotion); chunk count ≤ `max_chunks`; `total_size` ≤ the whole-read cap; every stored chunk body (`size` + `AT_REST_ENVELOPE_OVERHEAD` sealed, `size` plain) ≤ the inline cap; sizes sum to `total_size`; no repeated `seq` | same, with persist's constants for the caps |
+| **chunks** | each by its sha — its own content-addressed row on the holder, served as a whole blob is — verified, length-checked, `adopt_sealed_chunk` at `(stream_id, seq)` with `plaintext_size = size`; a chunk already held at its position with the manifest's sha is skipped (resume) | each by its sha, verified, length-checked, held in memory until the door takes them (bounded by the whole-read cap the plan enforced) |
+| **promoted** | `promote_adopted_manifest_to_dag` — persist re-checks every chunk row against the manifest; `promoted: false` = already a DAG (`AlreadyHeld`) | `put_blob_chunks_signing` — stored and announced in one shot |
+| **read** | `storage_kind = chunk_dag`; `read_blob_as` and the range read serve the file (`FileRow::open`) | same |
+
+| refusal | when | `blob_pull_refusals` tag |
+|---|---|---|
+| `ManifestMismatch` | the bytes at the address do not hash to it, do not parse as a chunk manifest (persist names which: a plaintext row, a sealed whole blob, a v1 manifest), are not canonical, name another stream, or are incoherent (sizes ≠ total, a repeated `seq`, no chunks) | `dag_manifest_mismatch` |
+| `TotalSizeMismatch` | the manifest's `total_size` ≠ the pointer's `size` | `dag_total_size_mismatch` |
+| `OverCap` | chunk count, a chunk's stored body, or `total_size` over persist's cap (`what` names the axis) | `dag_over_cap` |
+| `ChunkMismatch` | a chunk's bytes do not hash to the manifest's sha, or are not the length its size implies | `dag_chunk_mismatch` |
+| `ChunkMissing` | promotion names a chunk not held as named | `dag_chunk_missing` |
+
+A whole blob whose length is not the one its pointer implies (`size`, plus `AT_REST_ENVELOPE_OVERHEAD`
+at a sealed tier) is still refused `SizeMismatch`, counted `size_mismatch`. **Held is not done:** a
+manifest held `inline` at a sealed tier under a stream pointer is a pull to resume, and `pull_one`
+resumes it rather than answering `AlreadyHeld`. `BlobPuller::pull_dag_with` runs the same walk over a
+caller's `DagByteFetch` (a deployment whose transport is not the swarm's; the store-level witness): the
+gate is asked of the fetcher's holders before the first fetch and every body is verified by the puller,
+so a fetcher can fail a pull and never feed one. Judgements this cut records: a DAG above persist's
+whole-read cap (64 MiB) is not pulled whole — the range-pulled DAG is the follow-on; chunks are fetched
+one address at a time through one swarm session.
+
+Witnesses (`tests/blob_federation_e2e.rs`): `a_plaintext_chunk_dag_pulls_through_the_real_doors_and_reads_back_whole`
+(1,048,577 bytes, five chunks, `chunk_dag` on B, byte-identical, B's own `holds_bytes`),
+`a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_whole` (1,300,000 bytes at
+`invisible_encrypted`: tampered manifest → nothing; honest before the key → `DagAwaitingKey`; tampered
+chunk → refused at `seq 1` with chunk 0 kept; honest → resumed, promoted, `FileRow::open` at full
+size), `a_dag_manifest_over_the_caps_or_off_its_pointer_is_refused_before_a_chunk_moves`.
 
 #### 6.7.2 Rename — a new row over the same bytes (CIRISEdge#702, the server's ask)
 

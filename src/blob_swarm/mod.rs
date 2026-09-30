@@ -351,7 +351,12 @@ pub trait BlobChunkVerifier: Send + Sync {
 pub mod meaning;
 pub use meaning::{BlobMeaning, MeaningRefusal};
 pub mod pull;
-pub use pull::{BlobPuller, PullConfig, PullOffer, PullOutcome, PullRequest, PullSink};
+pub use pull::{
+    check_dag_plan, parse_clear_manifest, BlobPuller, DagByteFetch, DagPlan, DagPullRefusal,
+    PullConfig, PullOffer, PullOutcome, PullRequest, PullSink, PULL_REFUSAL_DAG_CHUNK_MISMATCH,
+    PULL_REFUSAL_DAG_CHUNK_MISSING, PULL_REFUSAL_DAG_MANIFEST_MISMATCH, PULL_REFUSAL_DAG_OVER_CAP,
+    PULL_REFUSAL_DAG_TOTAL_SIZE_MISMATCH, PULL_REFUSAL_SIZE_MISMATCH,
+};
 
 pub mod persist_store_policy;
 pub use persist_store_policy::PersistBlobStorePolicy;
@@ -536,13 +541,21 @@ pub fn serve_result_to_chunk(
     match served {
         Ok(BlobBody::Inline(bytes)) => Ok(Some(bytes)),
 
+        // CIRISEdge#717 — a plaintext DAG's ROOT, asked for by its address.
+        // The address is the SHA-256 of the canonical manifest, so the
+        // canonical manifest IS the bytes at that address — what the DAG
+        // pull fetches first, then each leaf by its own sha. A sealed root
+        // is an inline envelope and never reaches this arm. The hash belt
+        // in `PersistBlobChunkSource::read_chunk` checks the encoding
+        // against the address as it does every body.
+        Ok(BlobBody::ChunkDag(manifest)) => Ok(Some(manifest.to_jcs_bytes())),
+
         // The chunk-fetch responder hands a peer BYTES. A body that is a
-        // pointer (`External`) or a DAG root (`ChunkDag`) is not chunk
-        // bytes: edge never dereferences an external URI on a peer's
-        // behalf (MEDIA_SHARING.md §2.6), and a manifest is the root, not
-        // a leaf. Refuse rather than answer `NotHeld` — we DO hold
-        // something for this SHA, so a miss would send the peer hunting
-        // for a holder that will tell it the same thing.
+        // pointer (`External`) is not bytes: edge never dereferences an
+        // external URI on a peer's behalf (MEDIA_SHARING.md §2.6). Refuse
+        // rather than answer `NotHeld` — we DO hold something for this SHA,
+        // so a miss would send the peer hunting for a holder that will tell
+        // it the same thing.
         Ok(other) => {
             tracing::warn!(
                 body = ?core::mem::discriminant(&other),
@@ -802,7 +815,24 @@ impl SwarmScheduler {
             // path from looking like a policy decision.
             return Ok(store_gate::StoreDisposition::Announce);
         };
+        store_admission_with(policy.as_ref(), blob_sha256, meaning, holders).await
+    }
+}
 
+/// **The store gate, as the scheduler runs it** (CIRISEdge#581) — the one
+/// spelling, shared with the DAG pull ([`pull::BlobPuller::pull_dag_with`],
+/// CIRISEdge#717), which asks it of a caller's fetcher's holders before the
+/// first fetch so no fetcher gets round the gate. Ordered BEFORE any byte
+/// moves, which is the whole point: a gate that runs after the transfer has
+/// already spent the disk and the bandwidth it was meant to protect, and on
+/// the announce path it has already published that we hold the content.
+pub(crate) async fn store_admission_with(
+    policy: &dyn store_gate::BlobStorePolicy,
+    blob_sha256: [u8; 32],
+    meaning: Option<&meaning::BlobMeaning>,
+    holders: &[String],
+) -> Result<store_gate::StoreDisposition, SwarmError> {
+    {
         // Fail-closed on an unclassifiable blob, exactly as the serve gate
         // does — before any axis, because none can be evaluated.
         //
@@ -922,7 +952,9 @@ impl SwarmScheduler {
             }),
         }
     }
+}
 
+impl SwarmScheduler {
     /// Drive a swarm fetch of `blob_sha256`, given the chunk
     /// manifest + the federation key_ids of every holder. Returns
     /// the assembled blob bytes.
@@ -2117,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn an_inline_body_is_the_only_servable_chunk_body() {
+    fn an_inline_body_or_a_dag_root_is_served_and_an_external_ref_is_not() {
         use ciris_persist::federation::BlobBody;
 
         assert_eq!(
@@ -2125,17 +2157,34 @@ mod tests {
             Ok(Some(b"manifest bytes".to_vec()))
         );
 
-        // A DAG root is not a leaf: refuse, do NOT report a miss. A miss
-        // would send the peer hunting for another holder over bytes we
-        // are simply not serving on this path.
+        // CIRISEdge#717 — a plaintext DAG root, asked for by its address, is
+        // served as its canonical manifest: the bytes that hash to the
+        // address, which the DAG pull fetches first.
+        let root = ciris_persist::federation::ChunkManifest {
+            v: ciris_persist::federation::CHUNK_MANIFEST_VERSION,
+            total_size: 3,
+            chunks: vec![ciris_persist::federation::ChunkRef {
+                sha: [7; 32],
+                size: 3,
+                seq: None,
+            }],
+            chunk_tier: None,
+            stream_id: None,
+        };
         assert_eq!(
-            serve_result_to_chunk(Ok(BlobBody::ChunkDag(
-                ciris_persist::federation::ChunkManifest {
-                    v: ciris_persist::federation::CHUNK_MANIFEST_VERSION,
-                    total_size: 0,
-                    chunks: vec![],
-                    chunk_tier: None,
-                    stream_id: None,
+            serve_result_to_chunk(Ok(BlobBody::ChunkDag(root.clone()))),
+            Ok(Some(root.to_jcs_bytes()))
+        );
+
+        // An external reference is not bytes: refuse, do NOT report a miss.
+        // A miss would send the peer hunting for another holder over bytes
+        // we are simply not serving on this path.
+        assert_eq!(
+            serve_result_to_chunk(Ok(BlobBody::External(
+                ciris_persist::federation::ExternalRef {
+                    uri: "https://example.invalid/blob".into(),
+                    size_bytes: 3,
+                    media_type: None,
                 }
             ))),
             Err(ChunkSourceRefusal::PolicyDenied)

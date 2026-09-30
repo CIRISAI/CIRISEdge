@@ -212,7 +212,7 @@ fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> Grou
 /// is the chunk row's own binding. A file is complete when it is written, so
 /// it is one epoch; an appendable stream (A/V) rolls its own against CC
 /// 5.3.3.1's `MAX_CHUNKS_PER_EPOCH`.
-const STREAM_EPOCH: u64 = 0;
+pub(crate) const STREAM_EPOCH: u64 = 0;
 
 #[async_trait::async_trait]
 impl GroupContentStore for PersistGroupContentStore {

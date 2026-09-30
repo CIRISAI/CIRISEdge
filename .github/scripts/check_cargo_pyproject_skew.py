@@ -36,22 +36,52 @@ PAIRS = [
 ]
 
 
+CARGO_LOCK = Path("Cargo.lock")
+
+
 def cargo_pinned_tag(crate: str, text: str) -> str:
-    """Return the SemVer string Cargo.toml pins `crate` to (via `tag =`).
+    """Return the SemVer string Cargo.toml pins `crate` to.
+
+    Via `tag = "vX.Y.Z"` (a release) or `tag = "vX.Y.Z-rc.N"` (an RC
+    staging adopt), read off the line; or, when the pin is a `rev = "<sha>"`
+    (a prestaged adopt of a certified commit ahead of its tag), the version
+    Cargo RESOLVED for that rev in `Cargo.lock` — the same crate version the
+    tag will name, so the floor check below asks the same question either
+    way. A rev pin without a lock entry is a real failure, not a skip.
 
     Picks the FIRST matching line; tolerant of comments preceding the
     line. Edge pins persist twice (main deps + dev-deps) but on the same
-    tag — taking the first is fine.
+    tag/rev — taking the first is fine.
     """
     # Accept a release tag `vX.Y.Z` AND a pre-release/build tag `vX.Y.Z-rc.N`
     # (RC staging adopts, e.g. `v31.2.0-rc.1`) — the suffix is captured so the
     # PEP 440 comparison below sees the real pre-release version.
     pattern = rf'^\s*{re.escape(crate)}\s*=\s*\{{[^}}]*tag\s*=\s*"v(\d+\.\d+\.\d+(?:[-.+][0-9A-Za-z.+-]*)?)"'
     match = re.search(pattern, text, re.M)
-    if not match:
+    if match:
+        return match.group(1)
+    rev_pattern = rf'^\s*{re.escape(crate)}\s*=\s*\{{[^}}]*rev\s*=\s*"([0-9a-fA-F]{{7,40}})"'
+    rev = re.search(rev_pattern, text, re.M)
+    if not rev:
         raise SystemExit(
             f"check_cargo_pyproject_skew: no `tag = \"vX.Y.Z\"` (or `vX.Y.Z-rc.N`) "
-            f"entry for {crate} in Cargo.toml"
+            f"or `rev = \"<sha>\"` entry for {crate} in Cargo.toml"
+        )
+    return cargo_locked_version(crate, rev.group(1), CARGO_LOCK.read_text())
+
+
+def cargo_locked_version(crate: str, rev: str, lock_text: str) -> str:
+    """The version `Cargo.lock` records for `crate` at git `rev`."""
+    block = re.compile(
+        rf'^\[\[package\]\]\s*\nname = "{re.escape(crate)}"\s*\nversion = "([^"]+)"\s*\n'
+        rf'source = "git\+[^"]*\?rev={re.escape(rev)}#[0-9a-fA-F]+"',
+        re.M,
+    )
+    match = block.search(lock_text)
+    if not match:
+        raise SystemExit(
+            f"check_cargo_pyproject_skew: Cargo.toml pins {crate} to rev {rev} but Cargo.lock "
+            f"records no `[[package]]` for {crate} at that rev — run `cargo update -p {crate}`"
         )
     return match.group(1)
 
