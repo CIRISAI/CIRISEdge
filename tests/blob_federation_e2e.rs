@@ -5072,10 +5072,15 @@ mod files {
             let mut transplanted = FileRow::from_row(&b.row).expect("b");
             transplanted.pointer = a.pointer.clone();
             for refused in [
-                transplanted
-                    .describe(&node_a.store, &node_a.me)
-                    .await
-                    .expect_err("describe: a's pointer on b's row"),
+                // CIRISEdge#737: `open_described` answers `FileError`; the
+                // descriptor's own refusal is lifted into it, so both legs
+                // are judged by one `kind`.
+                ciris_edge::files::FileError::from(
+                    transplanted
+                        .describe(&node_a.store, &node_a.me)
+                        .await
+                        .expect_err("describe: a's pointer on b's row"),
+                ),
                 transplanted
                     .open_described(&node_a.store, &node_a.me)
                     .await

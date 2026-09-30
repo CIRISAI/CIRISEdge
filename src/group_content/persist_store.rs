@@ -201,6 +201,14 @@ fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> Grou
             attestation_id: attestation_id.clone(),
             withdraws_id: withdraws_id.clone(),
         },
+        // CIRISEdge#737 — RFC 9110 §14.4 at the range door: typed, because
+        // "you asked past the end" carries the size and is the caller's to
+        // act on, never a substrate fault.
+        B::RangeNotSatisfiable { range_start, size } => GroupContentError::RangeNotSatisfiable {
+            sha256_hex,
+            range_start: *range_start,
+            size: *size,
+        },
         other => GroupContentError::Substrate(other.to_string()),
     }
 }
@@ -433,6 +441,84 @@ impl GroupContentStore for PersistGroupContentStore {
             .read_blob_as(&sha, req.viewer_key_id, aad_arg)
             .await
             .map_err(|e| map_err(sha_hex, &e))
+    }
+
+    async fn open_range(
+        &self,
+        req: OpenRequest<'_>,
+        start: u64,
+        end_inclusive: u64,
+    ) -> Result<Vec<u8>, GroupContentError> {
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        let (sha_hex, sha) = pointer_sha(req.pointer)?;
+        // The ROW's binding, exactly as `open` presents it (CIRISEdge#737):
+        // persist frames it per chunk with `(stream_id, seq)` itself, so the
+        // caller AAD is the same bytes for every chunk of the DAG.
+        let aad = aad_for_open(&req);
+        let aad_arg = match req.pointer.tier {
+            CryptoTier::Plaintext => None,
+            CryptoTier::InvisibleEncrypted | CryptoTier::CommunityDek => Some(aad.as_slice()),
+        };
+        self.engine
+            .read_blob_range_as(&sha, req.viewer_key_id, start, end_inclusive, aad_arg)
+            .await
+            .map_err(|e| map_err(sha_hex, &e))
+    }
+
+    async fn layout(&self, req: OpenRequest<'_>) -> Result<super::ChunkLayout, GroupContentError> {
+        use ciris_persist::federation::types::cohort_scope::CryptoTier;
+        let (sha_hex, sha) = pointer_sha(req.pointer)?;
+        let Some(named_stream) = req.pointer.stream_id.as_deref() else {
+            return Err(GroupContentError::Substrate(format!(
+                "pointer {sha_hex} names no stream_id: not a chunk DAG, nothing to lay out \
+                 (CIRISEdge#737)"
+            )));
+        };
+        if req.pointer.tier == CryptoTier::Plaintext {
+            // A v1 manifest is in clear and persist's range door assembles it
+            // by `get_blob_range` with no layout needed; `open_sealed_manifest_as`
+            // refuses it by name, and so does this, before the substrate.
+            return Err(GroupContentError::Substrate(format!(
+                "pointer {sha_hex} is a plaintext-tier DAG: no sealed manifest to open; read it \
+                 by range (CIRISEdge#737)"
+            )));
+        }
+        let aad = aad_for_open(&req);
+        let view = self
+            .engine
+            .open_sealed_manifest_as(&sha, req.viewer_key_id, Some(aad.as_slice()))
+            .await
+            .map_err(|e| map_err(sha_hex.clone(), &e))?;
+        // The manifest names the pointer's stream (the puller's rule 1,
+        // re-asked at read so a layout is never handed out for another stream).
+        if view.stream_id != named_stream {
+            return Err(GroupContentError::Substrate(format!(
+                "pointer {sha_hex} names stream {named_stream:?} but its manifest names {:?}",
+                view.stream_id
+            )));
+        }
+        let mut offset = 0u64;
+        let mut chunks = Vec::with_capacity(view.chunks.len());
+        for c in &view.chunks {
+            let size = u64::from(c.size);
+            chunks.push(super::ChunkExtent {
+                seq: c.seq,
+                offset,
+                size,
+            });
+            offset = offset.saturating_add(size);
+        }
+        if offset != view.total_size {
+            return Err(GroupContentError::Substrate(format!(
+                "manifest {sha_hex}: chunk sizes sum to {offset} but total_size says {}",
+                view.total_size
+            )));
+        }
+        Ok(super::ChunkLayout {
+            stream_id: view.stream_id,
+            total_size: view.total_size,
+            chunks,
+        })
     }
 
     async fn open_descriptor(&self, req: OpenRequest<'_>) -> Result<Vec<u8>, GroupContentError> {
