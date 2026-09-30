@@ -57,15 +57,20 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         ),
         // E3: the trace plane is the sole capability-gated serve path — and the
         // ONE plane whose projection is genuinely decided per row.
-        // CIRISEdge#756 (`FSD/FIRST_CONTACT.md` §2.4) — the cell states what
-        // first contact carries: this node's allegiance facts (#671) and the
-        // membership ceremony addressed to the peer's own person (a proposal
-        // naming `owner_of(peer)`; the invitee's reply to a proposal held here
-        // that the peer's person issued), with no Rooted floor on those two.
+        // CIRISEdge#671 / #752 / #756 — a first-contact peer (no consent, no
+        // owner/family axis) is served this node's own allegiance facts (#671);
+        // with a `KindPublishSelector` installed, the live `federation`
+        // owner-binding of every node in that selector's Key /
+        // IdentityOccurrence set (#752, CC 5.4.6 public roster, CIRISServer#701);
+        // and the membership ceremony addressed to the peer's own person (#756:
+        // a proposal naming `owner_of(peer)`; the invitee's reply to a proposal
+        // held here that the peer's person issued), with no Rooted floor on
+        // those two (`FSD/FIRST_CONTACT.md` §2.3–§2.4).
         EnvelopeKind::Attestation => (
             "per_record_projection",
             "trace:* → capability:infra:serve; first contact → own allegiance facts \
-             + membership:proposal:v1 naming owner_of(peer) + the invitee's \
+             + live federation owner-bindings of nodes in the Key/IdentityOccurrence \
+             publish set + membership:proposal:v1 naming owner_of(peer) + the invitee's \
              membership:acceptance|decline:v1 to a held proposal by owner_of(peer); \
              else public",
         ),
@@ -266,23 +271,20 @@ pub fn serve_advertise_policy_sha256() -> String {
 // only its owner's own nodes — on the advertise, the direct fetch and the
 // subject Pull alike. `Key` is untouched. **CIRISServer must mirror this pin.**
 //
-// CIRISEdge#756 — RE-PINNED, e4c4d625… → 9af0dc28…. The Attestation `serve`
-// cell now states what first contact carries: this node's allegiance facts
-// (#671) and the membership ceremony addressed to the peer's own person — a
-// `membership:proposal:v1` naming `owner_of(peer)`, and the invitee's
-// acceptance/decline of a proposal held here that `owner_of(peer)` issued
-// (`FSD/FIRST_CONTACT.md` §2.4, I22; CIRISPersist#955, CC rc6 3.1.3.2). Folded
-// into the v38.0.0 re-pin. **CIRISServer must mirror this pin.**
+// CIRISEdge#752 (v37.1.0) — RE-PINNED on main, e4c4d625… → b86a7042…: the
+// Attestation `serve` cell names first contact's own allegiance facts (#671) and,
+// with a `KindPublishSelector`, the live `federation` owner-binding of each node
+// in the Key / IdentityOccurrence publish set (CC 5.4.6, CIRISServer#701).
 //
-// CIRISEdge#758 — RE-PINNED, 9af0dc28… → b949d7b2…. The Family and Community
-// `serve` cells move from `public` to the group-record gate (CC 5.4.6): a
-// record reaches `owner_of(peer)` only as a live member or as the invitee of a
-// live proposal into the group held here; anyone else is booked
-// `group_record_not_member_or_invitee` (`FSD/FIRST_CONTACT.md` §2.5, I23).
-// `LocationProof` keeps `public`. Folded into the v38.0.0 re-pin.
-// **CIRISServer must mirror this pin.**
+// CIRISEdge#756 / #758 (v38.0.0) — the same cell also carries the membership
+// ceremony addressed to the peer's own person (`FSD/FIRST_CONTACT.md` §2.4, I22;
+// CIRISPersist#955, CC rc6 3.1.3.2), and the Family and Community `serve` cells
+// move from `public` to the group-record gate (CC 5.4.6; §2.5, I23), booked
+// `group_record_not_member_or_invitee`. `LocationProof` keeps `public`.
+// Combined at the v38 merge of v37.1.0; the value below is computed from the
+// merged manifest. **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "b949d7b2825fbcb99dda6a9713f4e8dca814ca4969f0812418ad92b82e629ccc";
+    "a09e34a60d6a8a6a2194b0d7f3bfbe0100345f8a99ed7fb858be1b38515b40b4";
 
 #[cfg(test)]
 mod tests {
