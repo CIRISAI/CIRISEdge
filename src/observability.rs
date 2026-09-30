@@ -234,7 +234,13 @@ impl RoundOutcome {
 /// `Copy + Eq + Hash` so it sits in the counter `HashMap` key. The peer and any
 /// per-event detail ride the bounded [`WithholdRecord`] ring, never the label —
 /// unbounded label cardinality explodes downstream metric storage.
+///
+/// `#[non_exhaustive]` (v37.0.0): new named refusals are added as the serve
+/// gates grow (#713, #718, #717 each added one, and each forced a MAJOR bump
+/// on every downstream exhaustive match). A consumer matches the reasons it
+/// treats specially and routes the rest through a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum WithholdReason {
     /// The requested `(kind, envelope_hash)` did not resolve to bytes in local
     /// state. This is the bridge-level origin of the #429

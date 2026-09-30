@@ -1,5 +1,44 @@
 # CIRISEdge Release Notes
 
+# v37.0.0 — a self-room chunk DAG pulls its chunks on the real replication path; a chunk is served only under the file it belongs to
+
+**2026-09-30** (CIRISEdge#717 field regression → PR #751). **MAJOR** from v36.1.0 (`WithholdReason` gains a
+variant and becomes `#[non_exhaustive]`). No pin or hash moves: persist `v51.3.0` (floor `>=51.3,<52`),
+verify `v18.0.0`, every ABI constant and hash unchanged.
+
+## The regression (found by CIRISServer's native selffiles ladder on v36.1.0: 22/25)
+
+On the owner's second device the three ≥ 1 MiB self files stayed as their manifests: the DAG walk adopted
+each manifest, then every chunk request came back `BlobChunkMiss`. v36.1.0's pipelined fetcher asked for
+every piece as `(sha, sha)`, so a chunk request named the CHUNK as its blob; the serving node's scope gate
+resolves a request's scope from a row that references the blob, and rows reference the manifest, never a
+chunk. D1 booked 85 `blob_scope_undeterminable` withholds for 85 requests; each walk ended `FetchFailed` and
+retried forever from the held manifest. Edge's witnesses missed it because the bench's chunk source answered
+one fixed scope for every sha, and the other DAG tests called the DAG doors directly.
+
+- **Fix:** every request names the file's address: the manifest as `(dag, dag)`, each chunk as
+  `(dag, chunk)`, so the gate judges the row that references the file (withdrawing that row now refuses
+  the chunks too).
+- **The widening that fix would open, closed in the same release:** with the gate judging the NAMED file,
+  a request naming file X could otherwise fetch a chunk of file Y. The serving side (`PersistBlobChunkSource::read_chunk`)
+  now serves `(dag, chunk)` only when `chunk` belongs to that DAG in its own store (sealed: the stream named
+  by a row referencing the file, whose cohort/community must match the row; plaintext: the manifest at the
+  file's address), else it refuses `WithholdReason::ChunkNotInNamedDag`, booked in the withhold ledger and
+  `blob_serve_refusals`. The wire answer stays `BlobChunkMiss { PolicyDenied }` like every other serve-gate
+  refusal (no gate identity to the peer, no new wire value for older peers).
+- **Witness** `tests/self_dag_field_path_717.rs`: the person authors a 1.3 MB file on device A (A
+  co-signs), the `file:v1` row reaches device B through B's replication bridge with the pull sink wired, and
+  B's real puller fetches over Reticulum; A's chunk source answers scope only from a referencing row, as the
+  server does. Fails on v36.1.0 with the field's shape (manifest inline, 0 chunks); passes, byte-identical.
+  The cross-file request is refused; the check disabled, the test fails.
+- **Field:** the server's selffiles ladder, built against this fix: **25/25**, 131 chunk bodies, 0 withholds.
+
+## Rust surface (why MAJOR)
+
+- `WithholdReason::ChunkNotInNamedDag` (new) and **`WithholdReason` is now `#[non_exhaustive]`**: an
+  exhaustive downstream `match` needs a `_` arm once (CIRISServer: `src/operator_surface.rs`
+  `WithholdSeverity::of`). After this, new refusal reasons are not breaking changes.
+
 # v36.1.0 — the chunk-DAG pull runs 7–18× faster: chunk replies on the arrival link, pooled links, eight chunks in flight
 
 **2026-09-30** (CIRISEdge#739 → PR #749, lane 7 of #734). **MINOR** from v36.0.0. No pin or hash moves:
