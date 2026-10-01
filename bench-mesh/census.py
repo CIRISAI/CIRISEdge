@@ -120,6 +120,30 @@ EXPECTED = {
     },
 }
 
+# CIRISEdge#782 — the pair chat runs on the publisher and the FIRST
+# subscriber only (`run_chat_legs`: `cohort_members[1]`, which run.sh always
+# builds as `sub-1`). Every other subscriber reports open_chat/send_message as
+# principled not_runs and emits no owner_binding_converged. The `subscriber`
+# contract binds these three on PAIR_CHAT_SUBSCRIBER alone; at M<=2 the only
+# other subscriber is the late joiner, which is why no run showed the gap
+# until M=4 got far enough to report a second early subscriber.
+PAIR_CHAT_LEGS = frozenset({
+    "ladder.owner_binding_converged",
+    "ladder.open_chat",
+    "ladder.send_message",
+})
+PAIR_CHAT_SUBSCRIBER = "sub-1"
+
+
+def expected_for(node, role):
+    """The contract `node` is held to: its role's, minus the pair-chat legs
+    for a subscriber that is not the pair's member."""
+    expected = EXPECTED.get(role)
+    if expected is not None and role == "subscriber" and node != PAIR_CHAT_SUBSCRIBER:
+        expected = expected - PAIR_CHAT_LEGS
+    return expected
+
+
 # Emitted by main() for ANY role, only as a bail marker on Err.
 BAIL_LEG = "mesh.role_completion"
 
@@ -776,7 +800,7 @@ def census(path, rc, late_joiner=INFER, expect_nodes=None):
         role = rows[0].get("role") if rows else role_from_name(node)
         if node == late_joiner:
             role = "late-joiner"
-        expected = EXPECTED.get(role)
+        expected = expected_for(node, role)
         if expected is None:
             violations.append(f"{node}: unknown role {role!r} — no contract to hold it to")
             out.append(f"  {node:<12} role={role!r}  UNKNOWN ROLE")
@@ -1272,6 +1296,25 @@ def self_test():
 
     rows = [r for r in _golden() if r["node"] != "relay-1"]
     check("expected node emitted nothing (relay-1 silent)", rows, 1)
+
+    # CIRISEdge#782 — at M>=3 an early subscriber other than sub-1 runs no
+    # pair chat: its two principled not_runs and its absent
+    # owner_binding_converged are not violations; the same absence on sub-1 is.
+    m4 = _golden()
+    for leg in ["mesh.standup", "mesh.rooting", "ladder.discover",
+                "ladder.discover_by_fedid", "cohort.join", "scope.install",
+                "perf.receive", "conformance.member_can_fetch",
+                "conformance.rotation_frame_loss", "scope.seal"]:
+        m4.append(_row("sub-3", "subscriber", leg))
+    for leg in ["ladder.open_chat", "ladder.send_message"]:
+        m4.append(_row("sub-3", "subscriber", leg, ran=False,
+                       reason="the pair chat legs run on the publisher and the "
+                              "first subscriber only"))
+    check("M>=3: a non-first subscriber is not held to the pair chat",
+          m4, 0, expect_nodes=EXPECT_NODES + ["sub-3"])
+    rows = [r for r in _golden()
+            if not (r["node"] == "sub-1" and r["leg"] == "ladder.open_chat")]
+    check("the pair's subscriber (sub-1) IS held to the pair chat", rows, 1)
 
     print("")
     print("══ host capacity: the pre-flight and the degradation doctrine ══")
