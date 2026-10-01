@@ -1,3 +1,4 @@
 results/
 logs-*.txt
+logs/
 __pycache__/

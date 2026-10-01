@@ -158,6 +158,19 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      # CIRISEdge#768 — every point's FULL per-node logs (run.sh writes them
+      # to bench-mesh/logs/<point>/<container>.log before it stops the
+      # containers). The step below keeps only a 300-line tail of the LAST
+      # point; a sweep's earlier points had no logs at all.
+      - name: Upload full node logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-mesh-logs
+          path: bench-mesh/logs/
+          if-no-files-found: warn
+          retention-days: 30
+
       # `docker logs` by container NAME, not `docker compose logs`.
       #
       # compose interpolates `compose.yaml` before it will do anything, and the
