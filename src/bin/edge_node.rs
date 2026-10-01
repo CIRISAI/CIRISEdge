@@ -3751,6 +3751,60 @@ async fn run_chat_legs(occ: &Occurrence) {
     // is an active occurrence of, and its own key) an active member. Read
     // here, after the wait, so a `NotPartyTo` store refusal can be told apart
     // from a roster that never reached this node.
+    // The KEY plane, as this node holds it, for every widened body that did
+    // not open: the body's epoch binding (community, minter, epoch), which
+    // minters' admitted sets granted THIS viewer a wrap at that epoch, and
+    // whether the binding's minter did. Tells a stranded binding (bound to
+    // the author; persist I128) from a wrap that never reached this node.
+    let key_plane = {
+        use ciris_persist::federation::blobs::BlobStorage as _;
+        let rows = dir
+            .list_attestations_by(&peer_owner)
+            .await
+            .unwrap_or_default();
+        let mut out = Vec::new();
+        for m in seen.iter().filter(|m| m.widens.is_some() && !is_open(m)) {
+            let sha = rows
+                .iter()
+                .find(|a| a.attestation_id == m.attestation_id)
+                .and_then(|a| a.attestation_envelope.get(chat::FIELD_CONTENT).cloned())
+                .and_then(|v| {
+                    serde_json::from_value::<ciris_edge::group_content::BlobPointer>(v).ok()
+                })
+                .and_then(|p| hex::decode(p.content_sha256).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b).ok());
+            let Some(sha) = sha else {
+                out.push(serde_json::json!({ "attestation_id": m.attestation_id, "sha": null }));
+                continue;
+            };
+            let binding = occ.directory.community_dek_blob_epoch(&sha).await;
+            let (granting, binding_minter_grants) = match &binding {
+                Ok(Some((c, minter, e))) => (
+                    occ.directory
+                        .community_dek_minters_granting(c, *e, &viewer)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    occ.directory
+                        .community_dek_has_member_grant(c, minter, *e, &viewer)
+                        .await
+                        .map_err(|e| e.to_string()),
+                ),
+                _ => (Ok(Vec::new()), Ok(false)),
+            };
+            out.push(serde_json::json!({
+                "attestation_id": m.attestation_id,
+                "sha": hex::encode(sha),
+                "binding": binding.map_err(|e| e.to_string()),
+                "minters_granting_this_viewer": granting,
+                "binding_minter_grants_this_viewer": binding_minter_grants,
+            }));
+        }
+        serde_json::json!({
+            "viewer": viewer,
+            "backend_node_key": ciris_persist::federation::FederationDirectory::node_key_id(&*occ.directory),
+            "unopened": out,
+        })
+    };
     let party_to = {
         let principals = dir
             .active_identities_for_occurrence(&cfg.node_id)
@@ -3844,6 +3898,7 @@ async fn run_chat_legs(occ: &Occurrence) {
             "room_addresses": room_addresses,
             "blob_plane": blob_plane_json(&occ.edge),
             "party_to": party_to,
+            "key_plane": key_plane,
             "leaked_self_rows": leaked_self_rows,
             "plaintext_on_wire": plaintext_on_wire,
             "peer_node": peer_node,
