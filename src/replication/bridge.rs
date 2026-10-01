@@ -1563,6 +1563,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// a proposal this node's identities issued. `None`: acceptances are
     /// stored and nothing is widened here.
     membership_widener: Option<crate::membership::MembershipWidener>,
+    /// CIRISEdge#768 — the runtime's pending-`KeyGrant` emitter's wake. An
+    /// admitted row that can make persist re-wrap an epoch (the #916 doors —
+    /// [`crate::replication::key_grant_emitter::wakes_key_grant_emitter`])
+    /// wakes it; the apply itself never signs. `None` (no sealed-content
+    /// engine) wakes nothing.
+    key_grant_wake: Option<Arc<tokio::sync::Notify>>,
     /// CIRISEdge#440 — the resolved mesh-config read seam. `Some` lets a root's
     /// TTL'd relief shrink the since-page limit
     /// ([`Self::effective_page_limit`]) and pause the `trace:*` plane
@@ -1931,6 +1937,7 @@ impl FederationDirectoryReplicationBridge {
             convergence: None,
             revocation_observer: None,
             membership_widener: None,
+            key_grant_wake: None,
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
@@ -2017,6 +2024,7 @@ impl FederationDirectoryReplicationBridge {
             convergence: None,
             revocation_observer: None,
             membership_widener: None,
+            key_grant_wake: None,
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
@@ -2297,6 +2305,15 @@ impl FederationDirectoryReplicationBridge {
         widener: Option<crate::membership::MembershipWidener>,
     ) -> Self {
         self.membership_widener = widener;
+        self
+    }
+
+    /// CIRISEdge#768 — install the pending-`KeyGrant` emitter's wake
+    /// (builder). The runtime passes `Some` iff it runs an emitter, i.e. iff
+    /// it was given a sealed-content engine.
+    #[must_use]
+    pub fn with_key_grant_wake(mut self, wake: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.key_grant_wake = wake;
         self
     }
 
@@ -3869,6 +3886,17 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         if outcome.is_admitted() {
             if let Some(signal) = &self.convergence {
                 signal.note_admitted();
+            }
+            // CIRISEdge#768 — persist re-wrapped (grant rows only) if this row
+            // was an occurrence or an owner binding; the emitter signs and
+            // emits. A permit, never a call: the apply path does not sign.
+            if let Some(wake) = &self.key_grant_wake {
+                if crate::replication::key_grant_emitter::wakes_key_grant_emitter(
+                    kind,
+                    envelope_bytes,
+                ) {
+                    wake.notify_one();
+                }
             }
         }
         self.remember_outcome(kind, envelope_bytes, &outcome);
