@@ -180,56 +180,84 @@ async fn dirty_axes_of(
 /// Spawn the emitter for `engine`. It runs until `cancel` reads `true` (the
 /// runtime's shutdown signal) and returns the task's handle for the runtime to
 /// await. First pass at start is a [`EmitPass::Sweep`].
+///
+/// # Where the work runs
+///
+/// On this task — never on the apply path, which only issues a permit. The
+/// passes are `async`: persist's SQLite I/O inside them already goes through
+/// persist's own blocking pool, per query. Wrapping a whole pass in
+/// `spawn_blocking` + `block_on` would pin one blocking thread for the pass
+/// AND nest persist's blocking calls under it — the pool-exhaustion shape
+/// CIRISEdge#740 removed from the round path — so it is deliberately not done.
 pub fn spawn_key_grant_emitter(
     engine: BridgeEngine,
     wake: Arc<Notify>,
-    mut cancel: watch::Receiver<bool>,
+    cancel: watch::Receiver<bool>,
     config: KeyGrantEmitterConfig,
 ) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut backstop = tokio::time::interval(config.backstop.max(Duration::from_millis(100)));
-        backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // `interval`'s first tick is immediate; it is the start pass below.
-        backstop.tick().await;
-        let mut pass = EmitPass::Sweep;
-        loop {
-            if *cancel.borrow() {
-                break;
-            }
-            match emit_pass(&engine.0, pass).await {
-                Ok(0) => {}
-                Ok(sets) => tracing::info!(
-                    sets,
-                    ?pass,
-                    "pending KeyGrant sets emitted — re-wraps and failed emissions are on the \
-                     wire (CIRISPersist#916, CIRISEdge#768)"
-                ),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    ?pass,
-                    "pending KeyGrant emission failed; the dirty epochs stay dirty and the \
-                     next wake or backstop tick retries (CIRISEdge#768)"
-                ),
-            }
-            pass = tokio::select! {
-                () = wake.notified() => {
-                    // Coalesce the burst this wake belongs to.
-                    tokio::select! {
-                        () = tokio::time::sleep(config.debounce) => {}
-                        _ = cancel.changed() => {}
-                    }
-                    EmitPass::Sweep
-                }
-                _ = backstop.tick() => EmitPass::DirtyOnly,
-                changed = cancel.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-            };
+    tokio::spawn(emitter_loop(wake, cancel, config, move |pass| {
+        let engine = engine.clone();
+        async move { emit_pass(&engine.0, pass).await }
+    }))
+}
+
+/// The loop, over any pass runner — so the coalescing rule is a unit test
+/// (one sweep per burst, not one per wake) without a persist engine.
+async fn emitter_loop<F, Fut>(
+    wake: Arc<Notify>,
+    mut cancel: watch::Receiver<bool>,
+    config: KeyGrantEmitterConfig,
+    run_pass: F,
+) where
+    F: Fn(EmitPass) -> Fut,
+    Fut: std::future::Future<Output = Result<usize, String>>,
+{
+    let mut backstop = tokio::time::interval(config.backstop.max(Duration::from_millis(100)));
+    backstop.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval`'s first tick is immediate; it is the start pass below.
+    backstop.tick().await;
+    let mut pass = EmitPass::Sweep;
+    loop {
+        if *cancel.borrow() {
+            break;
         }
-    })
+        match run_pass(pass).await {
+            Ok(0) => {}
+            Ok(sets) => tracing::info!(
+                sets,
+                ?pass,
+                "pending KeyGrant sets emitted — re-wraps and failed emissions are on the \
+                 wire (CIRISPersist#916, CIRISEdge#768)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                ?pass,
+                "pending KeyGrant emission failed; the dirty epochs stay dirty and the \
+                 next wake or backstop tick retries (CIRISEdge#768)"
+            ),
+        }
+        pass = tokio::select! {
+            () = wake.notified() => {
+                // Coalesce the burst this wake belongs to: wait out the
+                // window, then take the ONE permit wakes inside it left (a
+                // `Notify` holds at most one), so the burst is one sweep, not
+                // two. A wake after this point is a new burst: it gets a pass.
+                tokio::select! {
+                    () = tokio::time::sleep(config.debounce) => {}
+                    _ = cancel.changed() => {}
+                }
+                let _ = tokio::time::timeout(Duration::ZERO, wake.notified()).await;
+                EmitPass::Sweep
+            }
+            _ = backstop.tick() => EmitPass::DirtyOnly,
+            changed = cancel.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +319,63 @@ mod tests {
         .expect("wrapped");
         assert!(wakes_key_grant_emitter(EnvelopeKind::Attestation, &bare));
         assert!(wakes_key_grant_emitter(EnvelopeKind::Attestation, &wrapped));
+    }
+
+    /// A burst of N wakes inside the debounce window is ONE sweep, not N
+    /// (and not two): the start sweep, then one for the burst; the backstop
+    /// (an hour here) never fires.
+    #[tokio::test]
+    async fn a_burst_of_wakes_is_one_sweep() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let sweeps = Arc::new(AtomicUsize::new(0));
+        let dirty_only = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(Notify::new());
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (s, d) = (Arc::clone(&sweeps), Arc::clone(&dirty_only));
+        let task = tokio::spawn(emitter_loop(
+            Arc::clone(&wake),
+            cancel_rx,
+            KeyGrantEmitterConfig {
+                debounce: Duration::from_millis(250),
+                backstop: Duration::from_secs(3600),
+            },
+            move |pass| {
+                let (s, d) = (Arc::clone(&s), Arc::clone(&d));
+                async move {
+                    match pass {
+                        EmitPass::Sweep => s.fetch_add(1, Ordering::SeqCst),
+                        EmitPass::DirtyOnly => d.fetch_add(1, Ordering::SeqCst),
+                    };
+                    Ok(0)
+                }
+            },
+        ));
+        // The start sweep.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            sweeps.load(Ordering::SeqCst),
+            1,
+            "the start pass is a sweep"
+        );
+        // A burst of 100 admissions, all inside one debounce window.
+        for _ in 0..100 {
+            wake.notify_one();
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(sweeps.load(Ordering::SeqCst), 2, "the burst is ONE sweep");
+        assert_eq!(
+            dirty_only.load(Ordering::SeqCst),
+            0,
+            "the backstop did not fire"
+        );
+        // A later, separate wake is its own pass.
+        wake.notify_one();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(sweeps.load(Ordering::SeqCst), 3);
+        let _ = cancel_tx.send(true);
+        task.await
+            .expect("the loop stops with the runtime's cancel");
     }
 
     /// The two #916 doors wake the emitter; nothing else does.
