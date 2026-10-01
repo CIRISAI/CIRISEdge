@@ -3618,11 +3618,38 @@ async fn run_chat_legs(occ: &Occurrence) {
                 )
                 .await?
             };
-            Ok::<_, String>((msg.attestation_id, sealed, crossing))
+            // Who the seal wrapped the epoch to — the occurrences that can
+            // read this, as THIS node resolved the room's members at seal time.
+            let occurrences_of = |owner: String| async move {
+                dir.list_identity_occurrences_active(&owner)
+                    .await
+                    .map(|os| {
+                        os.into_iter()
+                            .map(|o| {
+                                serde_json::json!({
+                                    "occurrence": o.occurrence_key_id,
+                                    "device_class": o.device_class,
+                                    "has_enc_pubkeys": o.encryption_pubkeys.is_some(),
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .map_err(|e| e.to_string())
+            };
+            let wrapped_to = serde_json::json!({
+                "granted": sealed_content.granted,
+                "excluded": sealed_content.excluded,
+                "epoch": sealed_content.epoch,
+                "active_occurrences_seen_here": {
+                    "peer_owner": occurrences_of(peer_owner.clone()).await,
+                    "my_owner": occurrences_of(my_owner.clone()).await,
+                },
+            });
+            Ok::<_, String>((msg.attestation_id, sealed, crossing, wrapped_to))
         }
         .await;
         match sent {
-            Ok((id, sealed, crossing)) => {
+            Ok((id, sealed, crossing, wrapped_to)) => {
                 use ciris_edge::replication::attestation_bind::Shared;
                 tracing::info!(%room, attestation_id = %id, shared = ?crossing.shared, "chat message shared (sealed)");
                 rep.ran(
@@ -3631,6 +3658,7 @@ async fn run_chat_legs(occ: &Occurrence) {
                     serde_json::json!({
                         "room": room,
                         "authored_attestation_id": id,
+                        "wrapped_to": wrapped_to,
                         "sealed": sealed,
                         "body_on_wire_is_ciphertext": true,
                         "crossing": crossing,
