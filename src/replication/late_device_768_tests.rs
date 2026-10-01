@@ -409,10 +409,10 @@ async fn a_late_member_device_receives_the_epoch_key_on_the_wire_768() {
     late_device_scenario(RoomHistory::PointerRecorded).await;
 }
 
-/// The same, for the room shape the mesh actually has: never rotated. Needs
-/// CIRISPersist#967 (persist v52.0.1) — un-ignore with that pin.
+/// The same, for the room shape the mesh actually has: never rotated. Live
+/// since persist v52.0.1 (CIRISPersist#967: the re-wrap walk enumerates the
+/// key-state table, so an epoch-0-only room is visited).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "CIRISPersist#967: community_dek_communities() omits never-rotated rooms"]
 async fn a_late_member_device_receives_the_epoch_key_in_a_never_rotated_room_768() {
     late_device_scenario(RoomHistory::NeverRotated).await;
 }
