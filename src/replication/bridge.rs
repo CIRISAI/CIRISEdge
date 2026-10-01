@@ -1569,6 +1569,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// wakes it; the apply itself never signs. `None` (no sealed-content
     /// engine) wakes nothing.
     key_grant_wake: Option<Arc<tokio::sync::Notify>>,
+    /// CIRISEdge#776 — the runtime's scheduler, for the release kick: a row
+    /// refused while its signer was unbound is asked for again AT ONCE from
+    /// the peer that offered it when the signer's binding lands. Installed
+    /// once, after the scheduler exists (the bridge is built first).
+    release_kick: std::sync::OnceLock<super::scheduler::SchedulerHandle>,
     /// CIRISEdge#440 — the resolved mesh-config read seam. `Some` lets a root's
     /// TTL'd relief shrink the since-page limit
     /// ([`Self::effective_page_limit`]) and pause the `trace:*` plane
@@ -1938,6 +1943,7 @@ impl FederationDirectoryReplicationBridge {
             revocation_observer: None,
             membership_widener: None,
             key_grant_wake: None,
+            release_kick: std::sync::OnceLock::new(),
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
@@ -2025,6 +2031,7 @@ impl FederationDirectoryReplicationBridge {
             revocation_observer: None,
             membership_widener: None,
             key_grant_wake: None,
+            release_kick: std::sync::OnceLock::new(),
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
@@ -2291,6 +2298,13 @@ impl FederationDirectoryReplicationBridge {
     pub fn with_revocation_observer(mut self, observer: Option<RevocationObserver>) -> Self {
         self.revocation_observer = observer;
         self
+    }
+
+    /// CIRISEdge#776 — install the scheduler the release kick fires through.
+    /// First install wins; the runtime calls it once, after building the
+    /// scheduler. Without it a released row waits for the next cadence tick.
+    pub fn install_release_kick(&self, scheduler: super::scheduler::SchedulerHandle) {
+        let _ = self.release_kick.set(scheduler);
     }
 
     /// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — install the
@@ -3900,7 +3914,8 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
             }
         }
         self.remember_outcome(kind, envelope_bytes, &outcome);
-        self.park_or_release(kind, envelope_bytes, &outcome).await;
+        self.park_or_release(kind, envelope_bytes, &outcome, source_peer)
+            .await;
         outcome
     }
 
@@ -3920,6 +3935,77 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
 }
 
 impl FederationDirectoryReplicationBridge {
+    /// CIRISEdge#776 — an admitted owner binding or identity occurrence made
+    /// its node / occurrence key an occurrence of an identity: release the rows
+    /// refused while that SIGNER was unbound (keyed on the signer — never a
+    /// blanket clear) and ask the peers that offered them again NOW, through
+    /// the scheduler's per-coordinator kick (one per (plane, peer); coalesced,
+    /// never a doubled round, never blocking this apply). The release forgets
+    /// the rows, so a kicked re-ask refused again is booked afresh on the
+    /// ordinary window and is never kicked twice by one release.
+    fn release_newly_bound_signer(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) {
+        let Some(signer) = newly_bound_signer_of(kind, envelope_bytes) else {
+            return;
+        };
+        let (released, ask) = self.refusal_backoff.release_signer_from(&signer);
+        if released == 0 {
+            return;
+        }
+        self.signer_releases
+            .fetch_add(released, std::sync::atomic::Ordering::Relaxed);
+        let kicked = self.release_kick.get().map_or(0, |scheduler| {
+            ask.iter()
+                .filter(|(plane, peer)| scheduler.try_kick(peer, *plane))
+                .count()
+        });
+        tracing::info!(
+            signer = %signer,
+            released,
+            kicked,
+            "signer is now bound to its identity — released the rows refused while it \
+             was not, and asked their peers again now (CIRISEdge#776)"
+        );
+    }
+
+    /// CIRISEdge#776 — a `Transient` identity-occurrence refusal whose signer's
+    /// Key IS held but which no live owner binding names: persist's gated door
+    /// refused it because the binding has not arrived yet (the standup race).
+    /// It keeps its transient window but is indexed on the signer (and the peer
+    /// that offered it), so the binding's admission releases and re-asks it at
+    /// once. A signer that IS bound is never indexed: its refusal was about
+    /// something else, and it waits on the ordinary window — which is what
+    /// keeps a release from turning into a kick loop.
+    async fn index_unbound_occurrence(
+        &self,
+        kind: EnvelopeKind,
+        envelope_bytes: &[u8],
+        signer: &str,
+        source_peer: Option<&str>,
+    ) {
+        use sha2::{Digest as _, Sha256};
+        if kind != EnvelopeKind::IdentityOccurrence
+            || !matches!(
+                ciris_persist::federation::admission::owner_of(&*self.directory, signer).await,
+                Ok(None)
+            )
+        {
+            return;
+        }
+        let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+        if self
+            .refusal_backoff
+            .index_waiting_on(kind, hash, signer, source_peer)
+        {
+            tracing::debug!(
+                envelope_hash = %hex::encode(&hash[..8]),
+                signer = %signer,
+                from = source_peer.unwrap_or("<unattributed>"),
+                "occurrence refused before its signer was bound — indexed on the \
+                 signer; its binding releases and re-asks it (CIRISEdge#776)"
+            );
+        }
+    }
+
     /// CIRISEdge#679 — the STRUCTURAL half of the refusal memory, decided where
     /// the store can be afforded (the #552 rule: the apply loop records, the
     /// choke decides).
@@ -3945,9 +4031,21 @@ impl FederationDirectoryReplicationBridge {
         kind: EnvelopeKind,
         envelope_bytes: &[u8],
         outcome: &ApplyOutcome,
+        source_peer: Option<&str>,
     ) {
         use sha2::{Digest as _, Sha256};
         match outcome.retry_disposition() {
+            // CIRISEdge#776 — an admitted owner binding or identity occurrence
+            // makes its node/occurrence key an occurrence of an identity: rows
+            // refused because that SIGNER was not yet bound are released now,
+            // keyed on the signer (never a blanket clear).
+            None if matches!(
+                kind,
+                EnvelopeKind::Attestation | EnvelopeKind::IdentityOccurrence
+            ) =>
+            {
+                self.release_newly_bound_signer(kind, envelope_bytes);
+            }
             None if kind == EnvelopeKind::Key => {
                 // The admitted (or already-held) key's id sits on the wrapper's
                 // `record` or at the top level (the legacy wire).
@@ -3983,8 +4081,12 @@ impl FederationDirectoryReplicationBridge {
                 // The store lookup the apply loop could not afford: is the named
                 // signer GENUINELY absent? A present signer means the refusal was
                 // about something else (a roster, a race) and the ordinary #544
-                // window stands.
+                // window stands — with one exception below.
                 if !matches!(self.directory.lookup_public_key(&signer).await, Ok(None)) {
+                    // CIRISEdge#776 — an identity occurrence whose (registered)
+                    // signer is not yet BOUND: indexed on the signer.
+                    self.index_unbound_occurrence(kind, envelope_bytes, &signer, source_peer)
+                        .await;
                     return;
                 }
                 let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
@@ -4005,6 +4107,13 @@ impl FederationDirectoryReplicationBridge {
             }
             _ => {}
         }
+    }
+
+    /// CIRISEdge#679/#776 — rows CURRENTLY indexed on a signer (an absent
+    /// Key, or an unbound occurrence signer) and so releasable by its landing.
+    #[must_use]
+    pub fn parked_on_signer_len(&self) -> usize {
+        self.refusal_backoff.parked_on_signer_len()
     }
 
     /// CIRISEdge#679 — rows parked on an absent signer since construction.
@@ -22864,5 +22973,47 @@ mod sweep_width_tests {
                 bridge.max_sweeps_in_flight()
             );
         }
+    }
+}
+/// The `attestation_type` an owner binding carries, as bytes for the scan.
+const DELEGATES_TO_BYTES: &[u8] =
+    ciris_persist::federation::types::attestation_type::DELEGATES_TO.as_bytes();
+
+/// CIRISEdge#776 — the key an admitted row makes an occurrence of an identity:
+/// an owner binding's bound node (`delegates_to` with an owner-binding
+/// envelope → `attested_key_id`) or an identity occurrence's
+/// `occurrence_key_id`. `None` for any other row.
+fn newly_bound_signer_of(kind: EnvelopeKind, envelope_bytes: &[u8]) -> Option<String> {
+    match kind {
+        EnvelopeKind::Attestation => {
+            // The bulk plane: a substring scan before any parse, so an ordinary
+            // admitted row pays no second deserialization.
+            if !envelope_bytes
+                .windows(DELEGATES_TO_BYTES.len())
+                .any(|w| w == DELEGATES_TO_BYTES)
+            {
+                return None;
+            }
+            let row = serde_json::from_slice::<Attestation>(envelope_bytes)
+                .ok()
+                .or_else(|| {
+                    serde_json::from_slice::<SignedAttestation>(envelope_bytes)
+                        .ok()
+                        .map(|s| s.attestation)
+                })?;
+            (row.attestation_type
+                == ciris_persist::federation::types::attestation_type::DELEGATES_TO
+                && ciris_persist::federation::admission::is_owner_binding_envelope(
+                    &row.attestation_envelope,
+                )
+                && !row.attested_key_id.is_empty())
+            .then_some(row.attested_key_id)
+        }
+        EnvelopeKind::IdentityOccurrence => serde_json::from_slice::<
+            ciris_persist::federation::SignedIdentityOccurrence,
+        >(envelope_bytes)
+        .ok()
+        .map(|o| o.identity_occurrence.occurrence_key_id),
+        _ => None,
     }
 }
