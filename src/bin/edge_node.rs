@@ -1251,6 +1251,12 @@ type ControlFrame = (Option<String>, Control);
 /// A live inbound mailbox: the `listen` sink demultiplexed by frame kind.
 struct Mailbox {
     control: Mutex<mpsc::UnboundedReceiver<ControlFrame>>,
+    /// CIRISEdge#782 — control frames a receive loop did not ask for, kept
+    /// IN ORDER for the phase that does. Every loop names what it wants
+    /// ([`Mailbox::next_control_where`]); nothing is consumed by a loop that
+    /// was not waiting for it. Bounded: past [`MAILBOX_DEFERRED_CAP`] the
+    /// oldest is dropped LOUDLY, by frame type.
+    deferred: std::sync::Mutex<std::collections::VecDeque<ControlFrame>>,
     media: Mutex<mpsc::UnboundedReceiver<DataFrame>>,
     blob: Mutex<mpsc::UnboundedReceiver<DataFrame>>,
 }
@@ -1432,31 +1438,104 @@ fn spawn_inbound(
 
     Arc::new(Mailbox {
         control: Mutex::new(ctl_rx),
+        deferred: std::sync::Mutex::new(std::collections::VecDeque::new()),
         media: Mutex::new(med_rx),
         blob: Mutex::new(blb_rx),
     })
 }
 
+/// CIRISEdge#782 — the deferred control queue's bound. A run carries a few
+/// hundred control frames; reaching this means frames nobody waits for are
+/// piling up, which is itself a finding.
+const MAILBOX_DEFERRED_CAP: usize = 4096;
+
+impl Control {
+    /// The variant's name, for the loud paths.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::KeyPackage { .. } => "KeyPackage",
+            Self::Welcome { .. } => "Welcome",
+            Self::Commit { .. } => "Commit",
+            Self::Ready { .. } => "Ready",
+            Self::StreamStart { .. } => "StreamStart",
+            Self::StreamEnd { .. } => "StreamEnd",
+            Self::BlobStart { .. } => "BlobStart",
+            Self::SealProbe { .. } => "SealProbe",
+            Self::AddressProbe { .. } => "AddressProbe",
+            Self::AddressProbeAck { .. } => "AddressProbeAck",
+            Self::SealGo { .. } => "SealGo",
+            Self::Sealed { .. } => "Sealed",
+            Self::Report { .. } => "Report",
+        }
+    }
+}
+
 impl Mailbox {
-    /// Await the next control message, or `Err` on timeout.
+    /// CIRISEdge#782 — the next control frame `wanted` accepts, or `Err` on
+    /// timeout. Frames it does NOT accept are never consumed: they are kept,
+    /// in arrival order, for the phase that waits for them. (The publisher's
+    /// admission loop used to discard every non-KeyPackage frame, so at M≥3
+    /// an early member's `Ready` was eaten while a later member was still
+    /// being admitted, and the Ready barrier then waited 300 s for it.)
     ///
-    /// The receiver guard is taken and released inside the `select!`
-    /// arm's own future — no guard is alive across the timeout branch
-    /// (CIRISEdge#217).
-    async fn next_control(&self, timeout: Duration) -> Result<(Option<String>, Control), String> {
+    /// The receiver guard is taken and released inside each poll — no guard
+    /// is alive across the sleep (CIRISEdge#217).
+    async fn next_control_where(
+        &self,
+        timeout: Duration,
+        wanted: impl Fn(&Control) -> bool,
+    ) -> Result<ControlFrame, String> {
         let deadline = Instant::now() + timeout;
         loop {
-            {
-                let mut rx = self.control.lock().await;
-                if let Ok(msg) = rx.try_recv() {
-                    return Ok(msg);
-                }
+            if let Some(frame) = self.try_control_where(&wanted).await {
+                return Ok(frame);
             }
             if Instant::now() >= deadline {
                 return Err(format!("no control frame within {}s", timeout.as_secs()));
             }
             tokio_sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Non-blocking [`Self::next_control_where`]: the first deferred frame
+    /// `wanted` accepts, else the first newly arrived one (deferring every
+    /// arrival it skips), else `None`.
+    async fn try_control_where(&self, wanted: impl Fn(&Control) -> bool) -> Option<ControlFrame> {
+        {
+            let mut deferred = self
+                .deferred
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(i) = deferred.iter().position(|(_, c)| wanted(c)) {
+                return deferred.remove(i);
+            }
+        }
+        let mut rx = self.control.lock().await;
+        while let Ok(frame) = rx.try_recv() {
+            if wanted(&frame.1) {
+                return Some(frame);
+            }
+            let mut deferred = self
+                .deferred
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if deferred.len() >= MAILBOX_DEFERRED_CAP {
+                if let Some((_, dropped)) = deferred.pop_front() {
+                    tracing::warn!(
+                        kind = dropped.kind(),
+                        cap = MAILBOX_DEFERRED_CAP,
+                        "control frame DROPPED — the deferred queue is full of frames no \
+                         phase asked for (CIRISEdge#782)"
+                    );
+                }
+            }
+            tracing::debug!(
+                kind = frame.1.kind(),
+                "control frame deferred for a later phase"
+            );
+            deferred.push_back(frame);
+        }
+        None
     }
 }
 
@@ -1574,7 +1653,16 @@ async fn probe_scope_address(
     }
     let until = Instant::now() + timeout;
     while Instant::now() < until {
-        let Ok((_s, msg)) = mailbox.next_control(Duration::from_secs(2)).await else {
+        let Ok((_s, msg)) = mailbox
+            .next_control_where(Duration::from_secs(2), |c| {
+                matches!(c, Control::AddressProbeAck { nonce: n, .. } if *n == nonce)
+                    || matches!(
+                        c,
+                        Control::Report { .. } | Control::SealProbe { .. } | Control::Sealed { .. }
+                    )
+            })
+            .await
+        else {
             continue;
         };
         match msg {
@@ -4059,13 +4147,24 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
     let join_start = Instant::now();
     let mut admitted: Vec<String> = Vec::new();
     let mut pending_late: Option<(String, String)> = None;
+    // CIRISEdge#782 — a member admitted early installs its addresses and
+    // says `Ready` while later members are still being admitted; it is
+    // recorded here, for the barrier below, never discarded.
+    let mut ready: Vec<String> = Vec::new();
     while admitted.len() < early.len() {
         let (_src, msg) = occ
             .mailbox
-            .next_control(cfg.barrier_timeout)
+            .next_control_where(cfg.barrier_timeout, |c| {
+                matches!(c, Control::KeyPackage { .. } | Control::Ready { .. })
+            })
             .await
             .map_err(|e| format!("waiting for KeyPackages: {e}"))?;
         let Control::KeyPackage { key_id, kp_b64 } = msg else {
+            if let Control::Ready { key_id, .. } = msg {
+                if !ready.contains(&key_id) {
+                    ready.push(key_id);
+                }
+            }
             continue;
         };
         if Some(&key_id) == cfg.late_joiner.as_ref() {
@@ -4139,12 +4238,14 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
         }),
     );
 
-    // Wait for every early member to say its addresses are installed.
-    let mut ready: Vec<String> = Vec::new();
+    // Wait for every early member to say its addresses are installed
+    // (those that already did during admission are in `ready`).
     while ready.len() < admitted.len() {
         let (_src, msg) = occ
             .mailbox
-            .next_control(cfg.barrier_timeout)
+            .next_control_where(cfg.barrier_timeout, |c| {
+                matches!(c, Control::Ready { .. } | Control::KeyPackage { .. })
+            })
             .await
             .map_err(|e| format!("waiting for Ready: {e}"))?;
         match msg {
@@ -4221,8 +4322,12 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 let want = cfg.late_joiner.clone();
                 let until = Instant::now() + cfg.barrier_timeout;
                 while pending_late.is_none() && Instant::now() < until {
-                    if let Ok((_s, Control::KeyPackage { key_id, kp_b64 })) =
-                        occ.mailbox.next_control(Duration::from_secs(5)).await
+                    if let Ok((_s, Control::KeyPackage { key_id, kp_b64 })) = occ
+                        .mailbox
+                        .next_control_where(Duration::from_secs(5), |c| {
+                            matches!(c, Control::KeyPackage { .. })
+                        })
+                        .await
                     {
                         if Some(&key_id) == want.as_ref() {
                             pending_late = Some((key_id, kp_b64));
@@ -4521,7 +4626,16 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
         let msg = if let Some(m) = stash.pop_front() {
             m
         } else {
-            let Ok((_s, msg)) = occ.mailbox.next_control(Duration::from_secs(5)).await else {
+            let Ok((_s, msg)) = occ
+                .mailbox
+                .next_control_where(Duration::from_secs(5), |c| {
+                    matches!(
+                        c,
+                        Control::Report { .. } | Control::SealProbe { .. } | Control::Sealed { .. }
+                    )
+                })
+                .await
+            else {
                 continue;
             };
             msg
@@ -5054,7 +5168,10 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     let welcome = loop {
         let (_s, msg) = occ
             .mailbox
-            .next_control(cfg.barrier_timeout)
+            .next_control_where(cfg.barrier_timeout, |c| {
+                matches!(c, Control::Welcome { key_id, .. } if *key_id == cfg.node_id)
+                    || matches!(c, Control::Commit { .. })
+            })
             .await
             .map_err(|e| format!("waiting for Welcome: {e}"))?;
         match msg {
@@ -5191,10 +5308,16 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
             let got = if let Some((epoch, commit_b64)) = pending_commits.pop_front() {
                 Some((None, Control::Commit { epoch, commit_b64 }))
             } else {
-                let mut rx = occ.mailbox.control.lock().await;
-                let got = rx.try_recv().ok();
-                drop(rx);
-                got
+                occ.mailbox
+                    .try_control_where(|c| {
+                        matches!(
+                            c,
+                            Control::Commit { .. }
+                                | Control::StreamEnd { .. }
+                                | Control::BlobStart { .. }
+                        )
+                    })
+                    .await
             };
             if let Some((_s, msg)) = got {
                 match msg {
@@ -5551,7 +5674,14 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
                     if Instant::now() >= until {
                         return Err("no SealGo from the publisher".to_owned());
                     }
-                    match occ.mailbox.next_control(Duration::from_secs(5)).await {
+                    match occ
+                        .mailbox
+                        .next_control_where(Duration::from_secs(5), |c| {
+                            matches!(c, Control::SealGo { key_id } if *key_id == cfg.node_id)
+                                || matches!(c, Control::AddressProbe { .. })
+                        })
+                        .await
+                    {
                         Ok((_s, Control::SealGo { key_id })) if key_id == cfg.node_id => break,
                         Ok((_s, Control::AddressProbe { address_hex, nonce })) => {
                             answer_address_probe(&occ.transport, &publisher, &address_hex, nonce)
@@ -5584,8 +5714,12 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
                 let mut answered = 0u8;
                 let until = Instant::now() + Duration::from_secs(60);
                 while answered < 2 && Instant::now() < until {
-                    if let Ok((_s, Control::AddressProbe { address_hex, nonce })) =
-                        occ.mailbox.next_control(Duration::from_secs(5)).await
+                    if let Ok((_s, Control::AddressProbe { address_hex, nonce })) = occ
+                        .mailbox
+                        .next_control_where(Duration::from_secs(5), |c| {
+                            matches!(c, Control::AddressProbe { .. })
+                        })
+                        .await
                     {
                         answer_address_probe(&occ.transport, &publisher, &address_hex, nonce).await;
                         answered += 1;
@@ -5896,6 +6030,61 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{seal_after_verdict, FedKey, SealAfterVerdict};
+
+    /// CIRISEdge#782 — a loop waiting for one kind never consumes another:
+    /// the publisher's admission loop (waiting on KeyPackages) used to eat an
+    /// early member's `Ready`, and the Ready barrier then waited 300 s for it.
+    #[tokio::test]
+    async fn a_frame_one_phase_skips_is_kept_for_the_phase_that_wants_it() {
+        use super::{Control, Mailbox};
+        use std::time::Duration;
+        let (ctl_tx, ctl_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_m_tx, med_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_b_tx, blb_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mailbox = Mailbox {
+            control: tokio::sync::Mutex::new(ctl_rx),
+            deferred: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            media: tokio::sync::Mutex::new(med_rx),
+            blob: tokio::sync::Mutex::new(blb_rx),
+        };
+        let ready = |k: &str| Control::Ready {
+            key_id: k.to_owned(),
+            epoch: 1,
+        };
+        ctl_tx.send((None, ready("sub-3"))).unwrap();
+        ctl_tx.send((None, ready("sub-1"))).unwrap();
+        ctl_tx
+            .send((
+                None,
+                Control::KeyPackage {
+                    key_id: "sub-2".to_owned(),
+                    kp_b64: String::new(),
+                },
+            ))
+            .unwrap();
+        // The admission phase asks only for KeyPackages …
+        let (_, kp) = mailbox
+            .next_control_where(Duration::from_millis(200), |c| {
+                matches!(c, Control::KeyPackage { .. })
+            })
+            .await
+            .expect("the KeyPackage");
+        assert!(matches!(kp, Control::KeyPackage { ref key_id, .. } if key_id == "sub-2"));
+        // … and the Ready phase still gets both Readys, in arrival order.
+        for want in ["sub-3", "sub-1"] {
+            let (_, r) = mailbox
+                .next_control_where(Duration::from_millis(200), |c| {
+                    matches!(c, Control::Ready { .. })
+                })
+                .await
+                .expect("a Ready the admission phase skipped");
+            assert!(matches!(r, Control::Ready { ref key_id, .. } if key_id == want));
+        }
+        assert!(mailbox
+            .next_control_where(Duration::from_millis(50), |_| true)
+            .await
+            .is_err());
+    }
 
     /// CIRISEdge#767 — the owner's signer must name the id persist derives
     /// for it, or `self_at_login`'s W5 check (`CustodyIsNotTheActor`) refuses
