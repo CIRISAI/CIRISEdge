@@ -1,5 +1,78 @@
 # CIRISEdge Release Notes
 
+# v38.1.0 — a device that joins a room late gets its key: the re-wrap is sent, never-rotated rooms are re-wrapped, and an early occurrence is re-asked the moment its binding lands
+
+**2026-10-01** (PRs #774, #775, #777, #778; persist CIRISPersist v52.0.1).
+**MINOR** from v38.0.0 (new public API in #775/#778; `SchedulerCommand` becomes `#[non_exhaustive]`, a
+break for a downstream exhaustive `match`, which nobody has: v38 was not yet adopted). Ladder triple:
+**edge v38.1.0 · persist v52.0.1 · verify v18.0.0**.
+
+## The pins
+
+| | v38.0.0 | v38.1.0 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v52.0.0"` | **`tag = "v52.0.1"`** → `4608c4d9` (a merge over the certified `9f502e43`, identical tree `8be04057`) |
+| ciris-persist (wheel floor) | `>=52,<53` | **`>=52.0.1,<53`** (the server needs 52.0.1's session-liveness fix) |
+| ABI constants, policy hashes, manifest, vocabulary | — | unchanged (persist 52.0.1 is a PATCH: no wire, ABI or migration change) |
+
+## The bug (CIRISEdge#768): a member's device that arrives after a room's epoch is minted never gets the key
+
+Found by the mesh harness, which now stands up again (#769). In a pair room, the second person's
+device read `NotGranted` forever whenever the publisher minted epoch 0 before it had admitted that
+device's node occurrence (a race in the arrival order; one green mesh run in five was luck). Four
+causes, each fixed with a witness that fails on the pre-fix code:
+
+- **#774: the backend didn't know its own node key.** A steward-registered node never told its shared
+  persist backend which key is its own (`Engine::from_shared_with_local` doesn't; persist learns it only
+  in `register_self_federation_key`, which `provision_engine_occurrence` skips for a registered node),
+  so persist's #916 re-wrap skipped every epoch the node had minted. `PersistGroupContentStore::from_shared_hybrid`
+  now sets it from the engine's own signer, the minter the re-wrap compares, and is correct under the
+  actor/node split (#541) too. The persist-side gap is CIRISPersist#966.
+- **#775: edge never sent the re-wraps.** Persist's re-wrap writes grant rows and marks the epoch dirty.
+  Sending them is "the pending-KeyGrant loop every host runs", and edge had no such loop
+  (`emit_pending_key_grants` had zero call sites). The replication runtime now owns one emitter per
+  sealed-content engine (`replication::key_grant_emitter`):
+  - it is woken by the bridge when it admits an IdentityOccurrence or owner-binding Attestation;
+  - wakes are coalesced (250 ms debounce; a burst of wakes is one pass);
+  - a scheduler-cadence backstop does a dirty-only pass (≈0.2 ms at 100 rooms, debug), so the timer
+    never runs the full sweep;
+  - apply never signs;
+  - it shuts down with the runtime.
+- **CIRISPersist#967 (persist v52.0.1): never-rotated rooms were invisible to the re-wrap walk.**
+  `community_dek_communities()` read only the pointer table, which gets a row on an epoch bump. Every
+  pair room is epoch 0 forever. Persist now unions the key-state table. Edge's never-rotated-room
+  witness is un-ignored in this release.
+- **#776 / #778: an occurrence refused because it arrived before its owner binding waited out a 20 s+
+  backoff.** The bridge now indexes such a refusal on its signer. When the binding (or occurrence) that
+  resolves the signer is admitted, it releases exactly that signer's rows and fires a bounded
+  per-coordinator kick (`SchedulerCommand::Kick`), so the row is re-asked at once rather than on the
+  next cadence. A re-refusal for another reason returns to normal backoff (no kick loop).
+
+## Also
+
+- **`UnopenedReason::NotGranted` is not terminal** (#772): its doc no longer says "no amount of waiting
+  changes it". It clears when a late wrap arrives. Treat it as retryable for a recently pulled or
+  recently joined room.
+- **CI** (#777): the linux test lanes link with line-tables-only debuginfo; the pyo3-full lane had run
+  out of disk mid-link.
+- **persist v52.0.1 also carries:** session liveness (`handler_for` judges the signed `valid_until`, so
+  a superseding renewal stays live), and #964 (`persist_row_hash` renders a truncated instant the way
+  chrono renders the µs read-back, so a re-offered pg row reads `Unchanged`).
+
+## Rust surface
+
+- New: `replication::key_grant_emitter` (`spawn_key_grant_emitter`), `SchedulerHandle::try_kick`,
+  `SchedulerCommand::Kick { peer_key_id, kind }`, the bridge's `install_release_kick`.
+- `SchedulerCommand` is now `#[non_exhaustive]`.
+
+## Known, open
+
+- **#768 closes on the mesh**: three consecutive green K=1 M=2 runs on this release.
+- **#779**: a pulled chunk DAG is reported before every chunk's key has arrived (a 256 MiB self file
+  read stops part-way with `NotGranted`). Fix in flight. Root cost: CIRISPersist#969 (persist mints a
+  DEK per chunk; CC 5.3.3.1 requires one per (stream, epoch)), targeted for persist v53.
+- **#773**: `canonicalize` at 16 KiB +6.7% instructions across the v52 adopt (small bodies −15–19%).
+
 # v38.0.0 — persist v52: membership by consent, invitations that reach strangers, group records only to members and invitees, receipts for every file, family files, and a 2 GiB pull within ~2× of the wire
 
 **2026-09-30** (PR #754 + lanes #755, #759, #760, #764, #765, #769, #770; persist CIRISPersist v52.0.0).
