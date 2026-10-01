@@ -178,6 +178,10 @@ struct Entry {
     /// Indexed in [`State::by_signer`] so the Key admit releases every row at
     /// once; `None` for an ordinary #544 window.
     waiting_on: Option<String>,
+    /// CIRISEdge#776 — the peer that offered the refused bytes, when the row
+    /// waits on a dependency another plane delivers: the release asks THAT
+    /// peer again at once (a kick), not at the next cadence tick.
+    waiting_from: Option<String>,
 }
 
 struct State {
@@ -276,6 +280,7 @@ impl RefusalBackoff {
                 disposition,
                 retry_at: now + window,
                 waiting_on: None,
+                waiting_from: None,
             },
         );
         st.order.push_back(key);
@@ -324,6 +329,7 @@ impl RefusalBackoff {
                     disposition: RetryDisposition::Terminal,
                     retry_at: now,
                     waiting_on: None,
+                    waiting_from: None,
                 },
             );
             st.order.push_back(key);
@@ -349,25 +355,79 @@ impl RefusalBackoff {
         window
     }
 
+    /// CIRISEdge#776 — index an ALREADY-booked refusal on the `signer` whose
+    /// standing it waits for, WITHOUT changing its schedule (a transient row
+    /// keeps its transient window). [`Self::release_signer`] then frees it the
+    /// moment the dependency lands instead of when the window elapses. Returns
+    /// `false` when no refusal is booked for the row (nothing to index).
+    pub fn index_waiting_on(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: [u8; 32],
+        signer: &str,
+        from_peer: Option<&str>,
+    ) -> bool {
+        let key = (kind, envelope_hash);
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = st.entries.get_mut(&key) else {
+            return false;
+        };
+        entry.waiting_from = from_peer.map(str::to_owned);
+        let previous = entry.waiting_on.replace(signer.to_owned());
+        if let Some(old) = previous {
+            if old != signer {
+                Self::unindex(&mut st.by_signer, &old, &key);
+            }
+        }
+        let rows = st.by_signer.entry(signer.to_owned()).or_default();
+        if !rows.contains(&key) {
+            rows.push(key);
+        }
+        true
+    }
+
     /// CIRISEdge#679 — `signer`'s `Key` row landed: forget every row parked on
     /// it, so the next round's `want` asks for them immediately. Returns how
     /// many rows were released (the witness that the park→release path fired).
+    ///
+    /// CIRISEdge#776 — also called when an owner binding or an identity
+    /// occurrence that makes `signer` an occurrence of an identity is admitted:
+    /// a row refused because its signer was not yet bound is released then.
     pub fn release_signer(&self, signer: &str) -> usize {
+        self.release_signer_from(signer).0
+    }
+
+    /// CIRISEdge#776 — [`Self::release_signer`], also naming who to ask: the
+    /// distinct `(plane, peer)` pairs the released rows were offered from
+    /// (rows booked without a peer contribute to the count only). The caller
+    /// kicks one round per pair — the release forgets the rows, so a kicked
+    /// re-ask that is refused again is booked afresh on the ordinary window,
+    /// never kicked twice by one release.
+    pub fn release_signer_from(&self, signer: &str) -> (usize, Vec<(EnvelopeKind, String)>) {
         let mut st = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(rows) = st.by_signer.remove(signer) else {
-            return 0;
+            return (0, Vec::new());
         };
         let mut released = 0;
+        let mut ask: Vec<(EnvelopeKind, String)> = Vec::new();
         for key in rows {
-            if st.entries.remove(&key).is_some() {
+            if let Some(entry) = st.entries.remove(&key) {
                 st.order.retain(|k| *k != key);
                 released += 1;
+                if let Some(peer) = entry.waiting_from {
+                    if !ask.iter().any(|(k, p)| *k == key.0 && *p == peer) {
+                        ask.push((key.0, peer));
+                    }
+                }
             }
         }
-        released
+        (released, ask)
     }
 
     /// CIRISEdge#679 — how many rows are currently parked on an absent signer's

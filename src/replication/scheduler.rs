@@ -339,6 +339,15 @@ pub enum SchedulerCommand {
         from_peer: String,
         kind: EnvelopeKind,
     },
+    /// CIRISEdge#776 — fire a round NOW on the ONE Initiator `(peer_key_id,
+    /// kind)`: a row this node refused from that peer was waiting on a
+    /// dependency that just landed, so ask for it again now instead of at the
+    /// next cadence tick. The same per-coordinator `Notify` as `RoundNow`, so
+    /// it coalesces and never doubles a round. No-op if no such Initiator.
+    Kick {
+        peer_key_id: String,
+        kind: EnvelopeKind,
+    },
 }
 
 impl std::fmt::Debug for SchedulerCommand {
@@ -361,6 +370,11 @@ impl std::fmt::Debug for SchedulerCommand {
             Self::Propagate { from_peer, kind } => f
                 .debug_struct("Propagate")
                 .field("from_peer", from_peer)
+                .field("kind", kind)
+                .finish(),
+            Self::Kick { peer_key_id, kind } => f
+                .debug_struct("Kick")
+                .field("peer_key_id", peer_key_id)
                 .field("kind", kind)
                 .finish(),
         }
@@ -433,6 +447,20 @@ impl SchedulerHandle {
             })
             .await
             .map_err(|_| SchedulerCommandError::SchedulerStopped)
+    }
+
+    /// CIRISEdge#776 — fire a round NOW on `(peer_key_id, kind)` only. Never
+    /// blocks (`try_send`): it is called from the apply path; a full command
+    /// channel drops the kick and the cadence still asks. Returns whether the
+    /// kick was queued. See [`SchedulerCommand::Kick`].
+    #[must_use]
+    pub fn try_kick(&self, peer_key_id: &str, kind: EnvelopeKind) -> bool {
+        self.command_tx
+            .try_send(SchedulerCommand::Kick {
+                peer_key_id: peer_key_id.to_owned(),
+                kind,
+            })
+            .is_ok()
     }
 
     /// CIRISEdge#636 — rows just admitted from `from_peer` on `kind`: fire a
@@ -658,6 +686,7 @@ impl ReplicationScheduler {
                         SchedulerCommand::Propagate { from_peer, kind } => {
                             propagate_kick(&per_coord, &from_peer, kind);
                         }
+                        SchedulerCommand::Kick { peer_key_id, kind } => kick_one(&per_coord, peer_key_id, kind),
                     }
                 }
                 else => {
@@ -920,6 +949,18 @@ impl From<CoordinatorError> for RoundError {
 /// ([`run_one_recovery_round`]) deliberately omits it — see
 /// `docs/FSD_SIGNER_RECOVERY.md` §3, where sending a second Summary alongside a
 /// Pull is the single fact that broke three earlier attempts.
+/// CIRISEdge#776 — the `Kick` arm: the one coordinator `(peer, kind)`, if it
+/// exists. Its `Notify` coalesces, so a kick never doubles a round.
+fn kick_one(
+    per_coord: &HashMap<(String, EnvelopeKind), CoordControl>,
+    peer_key_id: String,
+    kind: EnvelopeKind,
+) {
+    if let Some(c) = per_coord.get(&(peer_key_id, kind)) {
+        c.kick.notify_one();
+    }
+}
+
 /// CIRISEdge#636 — the `Propagate` arm: kick every coordinator on `kind` whose
 /// peer is not `from_peer`. A row admitted FROM a peer is offered to every
 /// OTHER peer on its plane now, not at the next cadence tick.

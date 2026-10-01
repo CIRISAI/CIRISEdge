@@ -133,6 +133,8 @@ pub mod mesh_config;
 /// CIRISEdge#552 — which Key an unverifiable signature was missing, so it can
 /// be pulled. `Key` is the root of every admission's dependency closure.
 pub mod missing_signer;
+#[cfg(test)]
+mod occurrence_before_binding_776_tests;
 pub mod protocol;
 /// CIRISEdge#762 — the public-group predicate the #758 record gate exempts
 /// (stand-in for persist v53's `replication_audience::is_public_group`).

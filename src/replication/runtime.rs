@@ -246,6 +246,16 @@ fn spawn_key_grant_emitter_for(
     ))
 }
 
+/// CIRISEdge#776 — hand the bridge the scheduler its release kick fires
+/// through, and pass the handle on.
+fn with_release_kick(
+    bridge: &FederationDirectoryReplicationBridge,
+    handle: SchedulerHandle,
+) -> SchedulerHandle {
+    bridge.install_release_kick(handle.clone());
+    handle
+}
+
 /// CIRISEdge#531 — apply the [`BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV`]
 /// override, if the operator set one, to the runtime's bridge config.
 ///
@@ -986,7 +996,7 @@ impl ReplicationRuntime {
         // takes effect on the next round.
         let mut scheduler =
             ReplicationScheduler::new(config.scheduler).with_mesh_config(mesh_config.clone());
-        let scheduler_handle = scheduler.install_control_channel();
+        let scheduler_handle = with_release_kick(&bridge, scheduler.install_control_channel());
         let coords: Vec<Arc<ReplicationCoordinator>> = peers
             .iter()
             .map(|peer| {
