@@ -23,9 +23,12 @@
 //! grant rows. A's sets are carried to B through B's runtime's bridge
 //! `apply_envelope_bytes(Attestation, ..)`, the key_grant door.
 //!
-//! `cargo test --features transport-reticulum --test late_device_rewrap_768`
+//! `cargo test --lib late_device_768`
+//!
+//! A lib-level test module, not a `tests/` binary: every integration test
+//! binary is linked separately, and one more pushed the `pyo3-full` CI lane's
+//! runner out of disk (run 36805316128, `ld` bus error at 13 MB free).
 
-#![cfg(feature = "transport-reticulum")]
 // P, Q (persons) and A, B, C (their nodes) are the issue's names; the
 // scenario reads as one sequence on purpose.
 #![allow(clippy::many_single_char_names, clippy::too_many_lines)]
@@ -33,21 +36,21 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine as _;
-use ciris_edge::group_content::{
+use crate::group_content::{
     ContentField, GroupContentStore, PersistGroupContentStore, SealRequest,
 };
-use ciris_edge::replication::directory::ReplicationDirectory as _;
-use ciris_edge::replication::key_grant_emitter::{emit_pass, EmitPass};
-use ciris_edge::replication::{
+use crate::replication::directory::ReplicationDirectory as _;
+use crate::replication::key_grant_emitter::{emit_pass, EmitPass};
+use crate::replication::{
     BridgeEngine, EnvelopeKind, ReplicationRuntime, ReplicationRuntimeConfig, SchedulerConfig,
     SealedContentWiring,
 };
-use ciris_edge::transport::{
+use crate::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
+use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::blobs::BlobStorage as _;
 use ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX;
@@ -136,7 +139,7 @@ impl Ident {
         }
     }
 
-    fn signer(&self) -> Arc<ciris_edge::identity::LocalSigner> {
+    fn signer(&self) -> Arc<crate::identity::LocalSigner> {
         let hw: Arc<dyn HardwareSigner> = Arc::new(
             Ed25519SoftwareSigner::from_bytes(&[self.seed; 32], self.ed.current_alias())
                 .expect("rebuild the signer"),
@@ -148,7 +151,7 @@ impl Ident {
             )
             .expect("rebuild the pqc half"),
         );
-        Arc::new(ciris_edge::identity::LocalSigner::new(
+        Arc::new(crate::identity::LocalSigner::new(
             self.key_id.clone(),
             hw,
             Some(pqc),
@@ -200,8 +203,8 @@ async fn device(seed_idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
         )
         .expect("rebuild the registered pqc half"),
     );
-    let identity = ciris_edge::identity::LocalSigner::new(derived.clone(), hw, Some(pqc));
-    let binding = ciris_edge::replication::attestation_bind::owner_binding_attestation(
+    let identity = crate::identity::LocalSigner::new(derived.clone(), hw, Some(pqc));
+    let binding = crate::replication::attestation_bind::owner_binding_attestation(
         &owner.key_id,
         &derived,
         ts(),
@@ -221,7 +224,7 @@ async fn device(seed_idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
     )
     .await
     .expect("hybrid content store");
-    let (me, _) = ciris_edge::content_occurrence::provision_engine_occurrence(
+    let (me, _) = crate::content_occurrence::provision_engine_occurrence(
         store.engine(),
         &*dir,
         &owner.key_id,
