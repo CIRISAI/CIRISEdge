@@ -314,6 +314,11 @@ pub struct ReplicationScheduler {
 ///
 /// Emitted by [`SchedulerHandle`] and consumed inside
 /// [`ReplicationScheduler::run_with_events`].
+///
+/// `#[non_exhaustive]` (CIRISEdge#776, as `WithholdReason` in v37): commands
+/// are added as the runtime learns new kicks (`Kick` was), and a downstream
+/// `match` must not break when one is.
+#[non_exhaustive]
 pub enum SchedulerCommand {
     /// Spawn a new Initiator coordinator task. The coordinator's
     /// role must be [`SessionRole::Initiator`] (debug-asserted).
