@@ -3719,7 +3719,7 @@ async fn run_chat_legs(occ: &Occurrence) {
     // persist binds a body to its epoch's minter only once it can tell which
     // set granted it (bytes before the set, or a room with several epoch
     // minters, bind to the author and rebind when a set lands again —
-    // CIRISPersist#876, I128/I129). Observed on this mesh: NotGranted for
+    // CIRISPersist#876, I128/I129; CIRISEdge#772). Observed on this mesh: NotGranted for
     // ~3.5 s after the bytes landed, then open. Every other verdict ends the
     // wait, and each reason's first sighting is reported.
     let open_started = Instant::now();

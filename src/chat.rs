@@ -1523,11 +1523,12 @@ pub enum Body {
 ///
 /// The two that matter are the first two. [`Self::NotFetched`] is a state a
 /// reader waits through: the row arrived, the bytes have not, and the pull
-/// (`blob_swarm::pull`) is what changes it. [`Self::NotGranted`] is the
-/// boundary working: the bytes are here and this viewer holds no grant, and
-/// no amount of waiting changes it. CIRISServer's contact view asserts on
-/// exactly this difference; before the split it string-matched persist's
-/// prose.
+/// (`blob_swarm::pull`) is what changes it. [`Self::NotGranted`] is
+/// USUALLY the boundary working: the bytes are here and this viewer holds no
+/// grant. It is NOT always final — see its own doc for the transient case
+/// (CIRISEdge#772) — so a reader that must tell "not yet" from "never" cannot
+/// do it from this arm alone today. CIRISServer's contact view asserts on
+/// this difference; before the split it string-matched persist's prose.
 ///
 /// Every arm carries `detail` — the substrate's own sentence — because a
 /// refusal that cannot be followed back is one nobody can act on. `Display`
@@ -1537,8 +1538,19 @@ pub enum UnopenedReason {
     /// Not held on this node yet. A pull may be in flight, queued, or not
     /// yet triggered; the state to wait through.
     NotFetched { detail: String },
-    /// Held, and this viewer's occurrence holds no grant for it — the
+    /// Held, and this viewer's occurrence holds no grant for it — usually the
     /// confidentiality boundary, working as designed.
+    ///
+    /// **Not always terminal (CIRISEdge#772).** persist binds a sealed body to
+    /// the epoch's MINTER, and when it cannot tell which admitted `key_grant`
+    /// set granted this viewer — the bytes landed before the set, or the room
+    /// has several minters at that epoch and the pointer names none
+    /// (CIRISPersist I128/I129) — it binds the body to the author and reports
+    /// no grant until a set for that axis is admitted again, when it rebinds
+    /// (#876) and the body opens. Observed on the mesh: a pair room with two
+    /// epoch-0 minters read `NotGranted` for ~3.5 s after the bytes arrived.
+    /// Persist's refusal does not distinguish the two cases, so neither can
+    /// this arm; [`Self::is_pending`] still answers `false` for it.
     NotGranted { detail: String },
     /// Held once, swept: the epoch was destroyed or the bytes evicted.
     Evicted { detail: String },
