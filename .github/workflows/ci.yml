@@ -81,6 +81,14 @@ jobs:
   linux-x86_64-test:
     name: linux-x86_64 (${{ matrix.combo.name }})
     runs-on: ubuntu-latest
+    # Test binaries link with line tables only, not full debuginfo. Each
+    # integration-test binary links persist + verify; at full debuginfo
+    # pyo3-full's --tests set ran the runner out of disk mid-link
+    # (`ld … Bus error`, 13 MB free, PR #775) after free-disk-space.
+    # Line tables keep file:line in panics and backtraces.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     # v7.4.4 (CIRISEdge#238) — restore only; the canonical linux-x86_64
     # save now lives on `pyo3-wheel linux-x86_64` (release profile).
     # `packages: write` no longer needed here.
