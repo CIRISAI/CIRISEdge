@@ -146,14 +146,40 @@ impl PersistGroupContentStore {
         )
         .await
         .map_err(|e| format!("hybrid local signer for {}: {e}", signer.key_id))?;
-        Ok(Self::new(
-            ciris_persist::Engine::from_shared_with_local(
-                backend,
-                signer.classical.clone(),
-                Some(Arc::new(local)),
-            ),
-            directory,
-        ))
+        let engine = ciris_persist::Engine::from_shared_with_local(
+            backend.clone(),
+            signer.classical.clone(),
+            Some(Arc::new(local)),
+        );
+        // CIRISEdge#768 — tell the SHARED backend which key is this node
+        // (persist#607). `Engine::from_shared_with_local` does not, and persist
+        // otherwise learns it only inside `register_self_federation_key`, which
+        // a node whose key row already exists (a steward-registered node) never
+        // calls. Untold, persist's receive doors skip every member-device
+        // re-wrap of this node's own epochs (#916: "no node key set on this
+        // backend"), so a member whose node occurrence arrives after an epoch
+        // was minted is never wrapped that epoch and reads `NotGranted` for
+        // good.
+        //
+        // DO NOT "fix" this to the advertised node. The id is the ENGINE's
+        // federation signer — exactly what `register_self_federation_key` sets
+        // (`local_derived_key_id`), and the minter of every epoch this engine
+        // seals, which is what the #916 re-wrap compares against. Under
+        // `use_node_identity` (CIRISEdge#541: peers see the node, storage and
+        // agency are the actor) a host that builds this store over the ACTOR's
+        // signer mints as the actor, so the backend must name the actor:
+        // naming the advertised node there would make the re-wrap skip every
+        // epoch this engine minted. Witnessed by
+        // `under_an_actor_node_split_the_backend_names_the_engines_signer`.
+        // This is edge's belt for CIRISPersist#966 (persist's shared-backend
+        // constructors never tell the backend its key); drop it once persist
+        // does.
+        let node_key = engine
+            .local_derived_key_id()
+            .await
+            .map_err(|e| format!("this engine's federation key id: {e}"))?;
+        set_backend_node_key(&backend, &node_key);
+        Ok(Self::new(engine, directory))
     }
 
     /// The engine this store seals through — hand a clone to
@@ -163,6 +189,20 @@ impl PersistGroupContentStore {
     #[must_use]
     pub fn engine(&self) -> &ciris_persist::Engine {
         &self.engine
+    }
+}
+
+/// Tell the concrete backend behind `backend` which federation key is this
+/// node — the fact persist's node-relative doors (the #916 re-wrap, the #607
+/// "does THIS NODE trust that root" gates) read, and that a shared-backend
+/// `Engine` is never told.
+#[allow(unreachable_patterns)] // the wildcard is live only when persist builds without `postgres`
+fn set_backend_node_key(backend: &ciris_persist::BackendDispatch, node_key_id: &str) {
+    match backend {
+        ciris_persist::BackendDispatch::Sqlite(b) => b.set_node_key_id(node_key_id),
+        #[cfg(feature = "pyo3")]
+        ciris_persist::BackendDispatch::Postgres(b) => b.set_node_key_id(node_key_id),
+        _ => {}
     }
 }
 
@@ -1001,6 +1041,136 @@ mod tests {
 
     fn now() -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::from_timestamp(1_767_225_296, 789_000_000).expect("ts")
+    }
+
+    async fn migrated_backend() -> Arc<ciris_persist::store::sqlite::SqliteBackend> {
+        use ciris_persist::store::backend::Backend as _;
+        let backend = ciris_persist::prelude::FederationDirectorySqlite::open(":memory:")
+            .await
+            .expect("open in-memory substrate");
+        backend.run_migrations().await.expect("migrate");
+        backend
+    }
+
+    /// A hybrid edge signer whose `key_id` is the id derived from `label`.
+    async fn hybrid_signer(label: &str, seed: u8) -> crate::identity::LocalSigner {
+        let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+            ciris_keyring::Ed25519SoftwareSigner::from_bytes(&[seed; 32], label)
+                .expect("ed25519 signer"),
+        );
+        let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(
+            ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(
+                &[seed ^ 0x55; 32],
+                format!("{label}-pqc"),
+            )
+            .expect("ml-dsa signer"),
+        );
+        let derived = ciris_verify_core::fedcode::derive_key_id(
+            label,
+            &classical.public_key().await.expect("pubkey"),
+        );
+        crate::identity::LocalSigner::new(derived, classical, Some(pqc))
+    }
+
+    /// The node key `register_self_federation_key` sets for an engine built
+    /// over `signer` — read off a twin backend, so the witness compares
+    /// against persist's own door rather than a re-derivation of it.
+    async fn node_key_register_self_sets(signer: &crate::identity::LocalSigner) -> Option<String> {
+        use ciris_persist::federation::FederationDirectory as _;
+        let twin = migrated_backend().await;
+        let local = ciris_persist::signing::LocalSigner::from_hardware_parts(
+            signer.classical.clone(),
+            ciris_keyring::HardwareSigner::current_alias(&*signer.classical).to_owned(),
+            signer.pqc.clone(),
+            Some(signer.key_id.clone()),
+        )
+        .await
+        .expect("persist signer");
+        let engine = ciris_persist::Engine::from_shared_with_local(
+            ciris_persist::BackendDispatch::Sqlite(twin.clone()),
+            signer.classical.clone(),
+            Some(Arc::new(local)),
+        );
+        let id = engine.local_derived_key_id().await.expect("derived id");
+        engine
+            .register_self_federation_key("node", &id, None, serde_json::json!({}), Vec::new())
+            .await
+            .expect("register self");
+        twin.node_key_id()
+    }
+
+    /// CIRISEdge#768 — the hybrid sealing constructor tells the SHARED backend
+    /// which key is this node (persist#607/#916). `Engine::from_shared_with_local`
+    /// does not, and persist learns it otherwise only inside
+    /// `register_self_federation_key`, which `provision_engine_occurrence`
+    /// skips when the key row already exists (a steward-registered node).
+    /// Untold, every receive-side member-device re-wrap is skipped ("no node
+    /// key set on this backend … (#916)"), and a member whose node occurrence
+    /// reaches this node after it minted a room epoch reads that room's bodies
+    /// `NotGranted` for good — the mesh's pair-room chat body (run
+    /// 36791574370: 90 s of `NotGranted`).
+    #[tokio::test]
+    async fn from_shared_hybrid_tells_the_backend_its_node_key() {
+        use ciris_persist::federation::FederationDirectory as _;
+        let backend = migrated_backend().await;
+        let node = hybrid_signer("node-768", 3).await;
+        assert_eq!(
+            backend.node_key_id(),
+            None,
+            "precondition: an untold backend"
+        );
+        let store = PersistGroupContentStore::from_shared_hybrid(
+            ciris_persist::BackendDispatch::Sqlite(backend.clone()),
+            backend.clone(),
+            &node,
+        )
+        .await
+        .expect("hybrid store");
+        let told = backend.node_key_id();
+        assert_eq!(told.as_deref(), Some(node.key_id.as_str()));
+        // (a) the FEDERATION signer's id — the engine's own signing key, the
+        // id `register_self_federation_key` would have set, by persist's door.
+        assert_eq!(
+            told,
+            store.engine().local_derived_key_id().await.ok(),
+            "the key the engine signs and mints as"
+        );
+        assert_eq!(
+            told,
+            node_key_register_self_sets(&node).await,
+            "the same id persist's own register-self door sets"
+        );
+    }
+
+    /// CIRISEdge#768 (b) — `use_node_identity` (#541): peers see the NODE,
+    /// storage and agency are the ACTOR. A host that builds this store over
+    /// the actor's signer mints every epoch as the actor, so the backend's
+    /// node key must be the ACTOR's (what persist's register-self sets for that
+    /// engine, and the minter the #916 re-wrap compares) — never the
+    /// advertised node, under which the re-wrap would skip every epoch this
+    /// engine minted.
+    #[tokio::test]
+    async fn under_an_actor_node_split_the_backend_names_the_engines_signer() {
+        use ciris_persist::federation::FederationDirectory as _;
+        let backend = migrated_backend().await;
+        let advertised_node = hybrid_signer("node-541", 5).await;
+        let actor = hybrid_signer("actor-541", 6).await;
+        assert_ne!(
+            advertised_node.key_id, actor.key_id,
+            "precondition: a real split"
+        );
+        let store = PersistGroupContentStore::from_shared_hybrid(
+            ciris_persist::BackendDispatch::Sqlite(backend.clone()),
+            backend.clone(),
+            &actor,
+        )
+        .await
+        .expect("hybrid store over the actor");
+        let told = backend.node_key_id();
+        assert_eq!(told.as_deref(), Some(actor.key_id.as_str()));
+        assert_ne!(told.as_deref(), Some(advertised_node.key_id.as_str()));
+        assert_eq!(told, store.engine().local_derived_key_id().await.ok());
+        assert_eq!(told, node_key_register_self_sets(&actor).await);
     }
 
     fn absent_pointer() -> BlobPointer {
