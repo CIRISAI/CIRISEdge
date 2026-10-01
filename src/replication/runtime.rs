@@ -159,6 +159,7 @@ fn build_bridge(
     self_provider: Option<CohortProvider>,
     mesh_config: Option<Arc<MeshConfigReader>>,
     convergence: Arc<super::convergence::ConvergenceSignal>,
+    key_grant_wake: Option<Arc<tokio::sync::Notify>>,
 ) -> Arc<FederationDirectoryReplicationBridge> {
     let bridge_config = resolve_sweep_permits(config.bridge);
     Arc::new(
@@ -207,6 +208,7 @@ fn build_bridge(
         )
         .with_metrics(config.metrics.clone())
         .with_membership_widener(config.membership_widener.clone())
+        .with_key_grant_wake(key_grant_wake)
         .with_mesh_config(mesh_config)
         // Workstream F — installed iff the operator turned enforcement ON. See
         // `ReplicationRuntimeConfig::accord_relay_enforced`: `false` keeps
@@ -221,6 +223,27 @@ fn build_bridge(
             ))
         })),
     )
+}
+
+/// CIRISEdge#768 — ONE pending-KeyGrant emitter per sealed-content engine,
+/// stopped with the runtime (it watches the runtime's cancel channel). Its
+/// backstop is the scheduler cadence. `None` when this node seals nothing.
+fn spawn_key_grant_emitter_for(
+    config: &ReplicationRuntimeConfig,
+    wake: Option<Arc<tokio::sync::Notify>>,
+    cancel_rx: &watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    use super::key_grant_emitter::{spawn_key_grant_emitter, KeyGrantEmitterConfig};
+    let (wiring, wake) = (config.sealed_content.as_ref()?, wake?);
+    Some(spawn_key_grant_emitter(
+        wiring.engine.clone(),
+        wake,
+        cancel_rx.clone(),
+        KeyGrantEmitterConfig {
+            debounce: KeyGrantEmitterConfig::DEFAULT_DEBOUNCE,
+            backstop: config.scheduler.cadence,
+        },
+    ))
 }
 
 /// CIRISEdge#531 — apply the [`BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV`]
@@ -751,6 +774,9 @@ pub struct ReplicationRuntime {
     convergence: Arc<super::convergence::ConvergenceSignal>,
     cancel_tx: watch::Sender<bool>,
     scheduler_task: Option<JoinHandle<()>>,
+    /// CIRISEdge#768 — the pending-KeyGrant emitter
+    /// ([`super::key_grant_emitter`]); `Some` iff `sealed_content` was set.
+    key_grant_emitter: Option<JoinHandle<()>>,
     config: ReplicationRuntimeConfig,
     /// Runtime control channel for the scheduler (CIRISEdge#173,
     /// v5.1.0). Used by [`Self::register_initiator_peer`] /
@@ -810,6 +836,10 @@ impl ReplicationRuntime {
     /// `peers` is the initial Initiator set. Each entry constructs
     /// one [`ReplicationCoordinator`] in Initiator role, registers
     /// it with the registry, and hands it to the scheduler.
+    // The assembly reads as one sequence (bridge → registry → applier →
+    // coordinators → scheduler → the #768 KeyGrant emitter); splitting it to
+    // dodge the line ceiling would scatter the ONE production wiring.
+    #[allow(clippy::too_many_lines)]
     pub async fn start(
         directory: Arc<dyn FederationDirectory>,
         transport: Arc<dyn Transport>,
@@ -875,6 +905,8 @@ impl ReplicationRuntime {
         // The ONE production bridge — shared by every coordinator below AND by the
         // #312 responder factory. See [`build_bridge`] for the #433 metrics wiring.
         let convergence = super::convergence::ConvergenceSignal::shared();
+        // CIRISEdge#768 — the pending-KeyGrant emitter's wake (iff this node seals).
+        let key_grant_wake = config.sealed_content.as_ref().map(|_| Arc::default());
         let bridge = build_bridge(
             &directory,
             cohort,
@@ -882,6 +914,7 @@ impl ReplicationRuntime {
             self_provider,
             mesh_config.clone(),
             Arc::clone(&convergence),
+            key_grant_wake.clone(),
         );
 
         // CIRISEdge#727 — the registry carries the owner-binding rung's
@@ -991,6 +1024,7 @@ impl ReplicationRuntime {
         }
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let key_grant_emitter = spawn_key_grant_emitter_for(&config, key_grant_wake, &cancel_rx);
         // CIRISEdge#370/#636 — see [`spawn_scheduler_task`] for the event sink.
         let scheduler_task = spawn_scheduler_task(scheduler, &scheduler_handle, cancel_rx, &config);
 
@@ -1006,6 +1040,7 @@ impl ReplicationRuntime {
             convergence,
             cancel_tx,
             scheduler_task: Some(scheduler_task),
+            key_grant_emitter,
             config,
             scheduler_handle,
             current_initiators: Arc::new(Mutex::new(initial_initiator_set)),
@@ -1470,6 +1505,9 @@ impl ReplicationRuntime {
     pub async fn shutdown(&mut self) {
         let _ = self.cancel_tx.send(true);
         if let Some(task) = self.scheduler_task.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.key_grant_emitter.take() {
             let _ = task.await;
         }
     }

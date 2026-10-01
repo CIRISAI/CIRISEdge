@@ -125,7 +125,10 @@ pub mod directory;
 /// CIRISEdge#552 — hashes known to exist whose bodies this node does not
 /// hold. NEVER holdings; see the module docs for why that distinction is the
 /// whole safety of the design.
+pub mod key_grant_emitter;
 pub mod known_hashes;
+#[cfg(test)]
+mod late_device_768_tests;
 pub mod mesh_config;
 /// CIRISEdge#552 — which Key an unverifiable signature was missing, so it can
 /// be pulled. `Key` is the root of every admission's dependency closure.
