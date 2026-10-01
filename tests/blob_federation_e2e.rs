@@ -1107,6 +1107,23 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
             .await
             .expect("pqc sign")
     };
+    // persist v52.0.0 (CIRISPersist#955, Q1) — a founding record admits only
+    // the members who signed it: every other listed member co-signs the same
+    // canonical bytes, as a real founding does.
+    let mut cosignatures = Vec::new();
+    for m in &members[1..] {
+        let ed = m.ed.sign(&canonical).await.expect("cosign ed");
+        let mut bound = canonical.clone();
+        bound.extend_from_slice(&ed);
+        let pqc = ciris_keyring::PqcSigner::sign(&m.pqc, &bound)
+            .await
+            .expect("cosign pqc");
+        cosignatures.push(ciris_persist::federation::types::RosterCosignature {
+            authority_key_id: m.key_id.clone(),
+            scrub_signature_classical: B64.encode(&ed),
+            scrub_signature_pqc: Some(B64.encode(&pqc)),
+        });
+    }
     node.dir
         .put_community(SignedCommunity {
             community,
@@ -1114,7 +1131,7 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
             scrub_signature_classical: B64.encode(&ed_sig),
             scrub_signature_pqc: Some(B64.encode(&pqc_sig)),
             supersede_proof: None,
-            cosignatures: Vec::new(),
+            cosignatures,
             lineage: Vec::new(),
         })
         .await
@@ -6435,6 +6452,38 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
             .put_community_membership_revocation(removal.clone())
             .await
             .expect("every directory folds the removal — the room's DEK rotates (AV-70)");
+    }
+    // persist v52.0.0 (CIRISPersist#955) — dave joins on his own acceptance:
+    // alice proposes, dave accepts, and both rows cross to every directory
+    // before any of them folds the widening.
+    let proposal_d = ciris_edge::membership::propose(
+        &*node_a.dir,
+        ciris_edge::membership::GroupScope::Community,
+        ROOM,
+        &dave.key_id,
+        None,
+        now + chrono::Duration::days(7),
+        &alice_signer,
+    )
+    .await
+    .expect("alice proposes dave");
+    let acceptance_d = ciris_edge::membership::reply(
+        &*node_a.dir,
+        &proposal_d.attestation_id,
+        true,
+        &edge_signer_for(&dave),
+    )
+    .await
+    .expect("dave accepts");
+    for n in nodes.iter().filter(|n| !Arc::ptr_eq(&n.dir, &node_a.dir)) {
+        for row in [&proposal_d, &acceptance_d] {
+            n.dir
+                .put_attestation(ciris_persist::federation::SignedAttestation {
+                    attestation: row.clone(),
+                })
+                .await
+                .expect("the consent rows cross");
+        }
     }
     let (member_d, spec_d) = ciris_edge::community_roster::community_membership_widening(
         &*node_a.dir,

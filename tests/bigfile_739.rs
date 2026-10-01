@@ -194,13 +194,141 @@ fn free_port() -> u16 {
         .port()
 }
 
+// ─── the adopt clock by stream position (CIRISPersist#957) ────────────
+
+/// The target the puller's per-batch adopt event is emitted under.
+const ADOPT_TARGET: &str = "ciris_edge::blob_swarm::dag_adopt";
+
+/// Every adopt batch the puller reported since the last [`take_adopts`]:
+/// `(lowest seq in the batch, chunks, elapsed µs)`.
+static ADOPTS: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn take_adopts() -> Vec<(u64, u64, u64)> {
+    std::mem::take(&mut *ADOPTS.lock().expect("adopts"))
+}
+
+/// CIRISEdge#766 — the target the responder's per-chunk serve event is
+/// emitted under (A's gate + store read, per chunk that returned bytes).
+const SERVE_TARGET: &str = "ciris_edge::blob_swarm::serve_gate";
+
+/// Every chunk A served since the last [`take_serves`]: `(chunk sha hex,
+/// gate + read µs)`. The responder knows the sha, not the seq; the bench
+/// maps it through A's stream listing.
+static SERVES: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn take_serves() -> Vec<(String, u64)> {
+    std::mem::take(&mut *SERVES.lock().expect("serves"))
+}
+
+/// A tracing layer that records the puller's adopt events, whatever the
+/// log filter says (it has its own per-layer filter).
+struct AdoptCapture;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AdoptCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        #[derive(Default)]
+        struct Fields {
+            first: u64,
+            chunks: u64,
+            us: u64,
+            chunk: String,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                match f.name() {
+                    "first_seq" => self.first = v,
+                    "chunks" => self.chunks = v,
+                    "elapsed_us" => self.us = v,
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                if f.name() == "chunk" {
+                    self.chunk = format!("{v:?}");
+                }
+            }
+        }
+        let target = event.metadata().target();
+        if target != ADOPT_TARGET && target != SERVE_TARGET {
+            return;
+        }
+        let mut f = Fields::default();
+        event.record(&mut f);
+        if target == SERVE_TARGET {
+            SERVES.lock().expect("serves").push((f.chunk, f.us));
+            return;
+        }
+        ADOPTS
+            .lock()
+            .expect("adopts")
+            .push((f.first, f.chunks, f.us));
+    }
+}
+
+/// Stream positions per bucket of the adopt curve.
+const BUCKET: u64 = 512;
+
+/// Mean adopt time per chunk (ms) by stream-position bucket: a batch's time
+/// is split evenly over its chunks and booked at its lowest seq.
+fn adopt_curve(adopts: &[(u64, u64, u64)]) -> Vec<(u64, f64, u64)> {
+    let mut by: std::collections::BTreeMap<u64, (u64, u64)> = std::collections::BTreeMap::new();
+    for &(first, chunks, us) in adopts {
+        let slot = by.entry(first / BUCKET).or_insert((0, 0));
+        slot.0 += us;
+        slot.1 += chunks;
+    }
+    by.into_iter()
+        .map(|(b, (us, n))| (b * BUCKET, us as f64 / n.max(1) as f64 / 1e3, n))
+        .collect()
+}
+
+/// CIRISEdge#766 — mean A-side `serve_gate_read` per chunk (ms) by
+/// stream-position bucket; `seq_of` maps a chunk sha (hex) to its seq.
+/// Returns the curve and how many served chunks the map did not place.
+fn serve_curve(
+    serves: &[(String, u64)],
+    seq_of: &std::collections::HashMap<String, u64>,
+) -> (Vec<(u64, f64, u64)>, u64) {
+    let mut by: std::collections::BTreeMap<u64, (u64, u64)> = std::collections::BTreeMap::new();
+    let mut unplaced = 0u64;
+    for (chunk, us) in serves {
+        let Some(seq) = seq_of.get(chunk) else {
+            unplaced += 1;
+            continue;
+        };
+        let slot = by.entry(seq / BUCKET).or_insert((0, 0));
+        slot.0 += us;
+        slot.1 += 1;
+    }
+    let curve = by
+        .into_iter()
+        .map(|(b, (us, n))| (b * BUCKET, us as f64 / n.max(1) as f64 / 1e3, n))
+        .collect();
+    (curve, unplaced)
+}
+
 fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::Layer as _;
+    let fmt = tracing_subscriber::fmt::layer()
+        .with_test_writer()
+        .with_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ciris_edge=warn")),
-        )
-        .with_test_writer()
+        );
+    let capture = AdoptCapture.with_filter(
+        tracing_subscriber::filter::Targets::new()
+            .with_target(ADOPT_TARGET, tracing::Level::DEBUG)
+            .with_target(SERVE_TARGET, tracing::Level::DEBUG),
+    );
+    let _ = tracing_subscriber::registry()
+        .with(fmt)
+        .with(capture)
         .try_init();
 }
 
@@ -851,8 +979,11 @@ const BRANCH: &str = "pipelined (#739)";
 
 const DEFAULT_K: usize = ciris_edge::blob_swarm::DEFAULT_DAG_CHUNKS_IN_FLIGHT;
 
-fn with_lanes(mut cfg: PullConfig, k: usize) -> PullConfig {
+const DEFAULT_BATCH: usize = ciris_edge::blob_swarm::DEFAULT_DAG_ADOPT_BATCH_CHUNKS;
+
+fn with_lanes(mut cfg: PullConfig, k: usize, batch: usize) -> PullConfig {
     cfg.dag_chunks_in_flight = k;
+    cfg.dag_adopt_batch_chunks = batch;
     cfg
 }
 
@@ -931,6 +1062,18 @@ fn arm_seam(a: &ReticulumTransport, rt: &ReticulumTransport) -> &'static str {
 
 struct PullReport {
     k: usize,
+    batch: usize,
+    /// `(bucket start seq, mean adopt ms per chunk, chunks)`.
+    adopt_curve: Vec<(u64, f64, u64)>,
+    adopt_batches: u64,
+    adopt_batch_peak: u64,
+    /// Sum of every batch's adopt wall time.
+    adopt_total: Duration,
+    /// CIRISEdge#766 — `(bucket start seq, mean A serve_gate_read ms per
+    /// chunk, chunks served)`.
+    serve_curve: Vec<(u64, f64, u64)>,
+    /// Retryable fetch failures the pull resumed from.
+    retries: u32,
     elapsed: Duration,
     mem_peak: usize,
     phases_b: Vec<(String, u64, u64)>,
@@ -943,14 +1086,14 @@ struct PullReport {
     read_back: Duration,
 }
 
-fn puller_for(b: &Member, k: usize) -> Arc<BlobPuller<SqliteBackend>> {
+fn puller_for(b: &Member, k: usize, batch: usize) -> Arc<BlobPuller<SqliteBackend>> {
     BlobPuller::new(
         Arc::clone(&b.edge),
         b.node.store.engine().clone(),
         b.node.dir.clone(),
         b.node.dir.clone() as Arc<dyn FederationDirectory>,
         b.node.me.clone(),
-        with_lanes(PullConfig::default(), k),
+        with_lanes(PullConfig::default(), k, batch),
     )
 }
 
@@ -979,7 +1122,7 @@ async fn pull_once(
     node_b: Node,
     members: &[String],
     p: &Published,
-    k: usize,
+    (k, batch): (usize, usize),
 ) -> PullReport {
     federate(&a.node, &node_b).await;
     federate(&node_b, &a.node).await;
@@ -1001,16 +1144,36 @@ async fn pull_once(
         p.grants.len()
     );
 
-    let puller = puller_for(&b, k);
+    let puller = puller_for(&b, k, batch);
     let seam = arm_seam(&a.rt, &b.rt);
     if !seam.is_empty() {
         eprintln!("[{tag}] attribution seam armed on B: {seam}");
     }
+    let _ = take_adopts();
+    let _ = take_serves();
     let baseline = mem_mark();
     let started = Instant::now();
-    let verdict = puller.pull_one(&p.row, p.sha, 0).await;
+    // A lane that times out stops the pull with a retryable fetch failure;
+    // the puller's own retry resumes it (held chunks skipped). The bench
+    // does the same, at once, and counts it, so a transient timeout on a
+    // loaded host does not throw away a long run.
+    let mut retries = 0u32;
+    let verdict = loop {
+        match puller.pull_one(&p.row, p.sha, retries).await {
+            PullOutcome::FetchFailed {
+                reason,
+                retrying: true,
+            } if retries < 3 => {
+                retries += 1;
+                eprintln!("[{tag}] retryable fetch failure, resuming (retry {retries}): {reason}");
+            }
+            other => break other,
+        }
+    };
     let elapsed = started.elapsed();
     let mem_peak = mem_peak_over(baseline);
+    let adopts = take_adopts();
+    let serves = take_serves();
     assert_eq!(
         verdict,
         PullOutcome::Stored { announced: false },
@@ -1027,8 +1190,46 @@ async fn pull_once(
     let (got, read_back) = read_back(&b.node, p).await;
     assert_eq!(got, p.plain_sha, "byte-identical on B at K={k}");
     a.rt.tear_down_next_reply_links_for_test(0);
+    let adopted_chunks: u64 = adopts.iter().map(|a| a.1).sum();
+    assert_eq!(
+        adopted_chunks,
+        ledger(&b.edge.metrics(), "adopted"),
+        "every adopted chunk is in the adopt clock (the capture layer saw every batch)"
+    );
+    // A's positions, read once, to place each served chunk.
+    let seq_of: std::collections::HashMap<String, u64> = a
+        .node
+        .dir
+        .stream_chunks(&p.stream_id)
+        .await
+        .expect("A's stream listing")
+        .chunks
+        .iter()
+        .map(|c| (hex::encode(c.chunk_sha), c.seq))
+        .collect();
+    // The DAG's root (its manifest, served as `(sha, sha)`) has no position.
+    let root = hex::encode(p.sha);
+    let chunk_serves: Vec<(String, u64)> =
+        serves.iter().filter(|(c, _)| *c != root).cloned().collect();
+    let (serve_curve, unplaced) = serve_curve(&chunk_serves, &seq_of);
+    assert_eq!(
+        unplaced, 0,
+        "every served chunk is one of the file's positions on A"
+    );
+    assert!(
+        chunk_serves.len() as u64 >= ledger(&b.edge.metrics(), "adopted"),
+        "the serve clock saw every chunk B adopted ({} served events)",
+        chunk_serves.len()
+    );
     let report = PullReport {
         k,
+        batch,
+        adopt_curve: adopt_curve(&adopts),
+        serve_curve,
+        adopt_batches: adopts.len() as u64,
+        adopt_batch_peak: ledger(&b.edge.metrics(), "adopt_batch_peak"),
+        adopt_total: Duration::from_micros(adopts.iter().map(|a| a.2).sum()),
+        retries,
         elapsed,
         mem_peak,
         phases_b: phases(&b.edge.metrics()),
@@ -1315,7 +1516,7 @@ async fn resume_once(
     wait_direct(a, &b, Duration::from_secs(60)).await;
     cross_to(&b.node, p).await;
 
-    let puller = puller_for(&b, k);
+    let puller = puller_for(&b, k, DEFAULT_BATCH);
     let row = p.row.clone();
     let sha = p.sha;
     let started = Instant::now();
@@ -1368,7 +1569,7 @@ async fn resume_once(
     wait_direct(&b, a, Duration::from_secs(60)).await;
     wait_direct(a, &b, Duration::from_secs(60)).await;
     cross_to(&b.node, p).await;
-    let puller = puller_for(&b, k);
+    let puller = puller_for(&b, k, DEFAULT_BATCH);
     // THE FALLBACK WITNESS: A tears down the arrival link of the resumed
     // pull's first answer just before riding it, so that answer takes the
     // durable queue by key — and still lands (the pull completes). Replies
@@ -1445,12 +1646,16 @@ async fn resume_once(
         "each chunk adopted exactly once across the kill: {skipped_resume} held + \
          {adopted_resume} adopted on resume"
     );
-    // What the first attempt left held is what it counted, plus at most the
-    // lanes the kill cut between persist's commit and the lane's return.
+    // What the first attempt left held is what it counted, plus at most what
+    // the kill cut between persist's commit and the count: K single adopts
+    // at batch 1, or the one batch in flight above it (CIRISEdge#765 adopts
+    // one batch at a time, so a kill mid-batch can leave a whole batch
+    // committed and uncounted).
+    let cut = k.max(DEFAULT_BATCH) as u64;
     assert!(
-        skipped_resume >= adopted_first && skipped_resume <= adopted_first + k as u64,
-        "the resume skipped what the first attempt adopted ({adopted_first}, + at most K = {k} \
-         cut mid-adopt): skipped {skipped_resume}"
+        skipped_resume >= adopted_first && skipped_resume <= adopted_first + cut,
+        "the resume skipped what the first attempt adopted ({adopted_first}, + at most \
+         max(K = {k}, batch = {DEFAULT_BATCH}) cut mid-adopt): skipped {skipped_resume}"
     );
     let (got, _) = read_back(&b.node, p).await;
     assert_eq!(got, p.plain_sha, "byte-identical after the resume");
@@ -1496,6 +1701,122 @@ fn free_bytes(path: &Path) -> u64 {
         .map_or(0, |kb| kb * 1024)
 }
 
+/// The pulls to run: `CIRIS_BIGFILE_CURVE` as `KxB` entries (lanes x adopt
+/// batch, e.g. `1x1,1x16,8x1,8x16`), else `CIRIS_BIGFILE_K_CURVE` (or
+/// `ks`) at the default batch; the default `(K, batch)` is always included.
+fn env_curve(ks: &[usize], default_k: usize) -> Vec<(usize, usize)> {
+    let mut curve: Vec<(usize, usize)> = if let Ok(s) = std::env::var("CIRIS_BIGFILE_CURVE") {
+        s.split(',')
+            .filter_map(|e| {
+                let (k, b) = e.trim().split_once('x')?;
+                Some((k.parse().ok()?, b.parse().ok()?))
+            })
+            .collect()
+    } else {
+        std::env::var("CIRIS_BIGFILE_K_CURVE")
+            .ok()
+            .map(|s| s.split(',').filter_map(|k| k.trim().parse().ok()).collect())
+            .unwrap_or_else(|| ks.to_vec())
+            .into_iter()
+            .map(|k| (k, DEFAULT_BATCH))
+            .collect()
+    };
+    if !curve.contains(&(default_k, DEFAULT_BATCH)) {
+        curve.push((default_k, DEFAULT_BATCH));
+    }
+    curve
+}
+
+/// A store's files (the database, its WAL and shared memory).
+fn remove_store(db: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut p = db.as_os_str().to_owned();
+        p.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(p));
+    }
+}
+
+/// CIRISPersist#957's table: one column per `(K, batch)` pull, one row per
+/// stream-position bucket (mean adopt ms per chunk), then the pull's MB/s
+/// and its ratio to the 1-lane ceiling. Markdown, to paste.
+fn lanes_by_batch_table(total: u64, ceiling_1: f64, reports: &[PullReport]) -> String {
+    let mut t = format!(
+        "\n#957 table, N = {:.0} MiB: mean adopt ms per chunk by stream position\n| chunks |",
+        mib(total)
+    );
+    for r in reports {
+        t.push_str(&format!(" K={} batch={} |", r.k, r.batch));
+    }
+    t.push_str("\n|---|");
+    for _ in reports {
+        t.push_str("---|");
+    }
+    t.push('\n');
+    let buckets: std::collections::BTreeSet<u64> = reports
+        .iter()
+        .flat_map(|r| r.adopt_curve.iter().map(|c| c.0))
+        .collect();
+    for b in buckets {
+        t.push_str(&format!("| {b}–{} |", b + BUCKET - 1));
+        for r in reports {
+            match r.adopt_curve.iter().find(|c| c.0 == b) {
+                Some((_, ms, _)) => t.push_str(&format!(" {ms:.2} |")),
+                None => t.push_str(" – |"),
+            }
+        }
+        t.push('\n');
+    }
+    let row = |label: &str, f: &dyn Fn(&PullReport) -> String| {
+        let mut line = format!("| {label} |");
+        for r in reports {
+            line.push_str(&format!(" {} |", f(r)));
+        }
+        line.push('\n');
+        line
+    };
+    // CIRISEdge#766 — A's serve clock by the same buckets.
+    t.push_str("\nA serve_gate_read ms per chunk by stream position (CIRISEdge#766)\n| chunks |");
+    for r in reports {
+        t.push_str(&format!(" K={} batch={} |", r.k, r.batch));
+    }
+    t.push_str("\n|---|");
+    for _ in reports {
+        t.push_str("---|");
+    }
+    t.push('\n');
+    let serve_buckets: std::collections::BTreeSet<u64> = reports
+        .iter()
+        .flat_map(|r| r.serve_curve.iter().map(|c| c.0))
+        .collect();
+    for b in serve_buckets {
+        t.push_str(&format!("| {b}–{} |", b + BUCKET - 1));
+        for r in reports {
+            match r.serve_curve.iter().find(|c| c.0 == b) {
+                Some((_, ms, _)) => t.push_str(&format!(" {ms:.2} |")),
+                None => t.push_str(" – |"),
+            }
+        }
+        t.push('\n');
+    }
+    t.push_str(&row("adopt batches", &|r| r.adopt_batches.to_string()));
+    t.push_str(&row("adopt wall s (sum)", &|r| {
+        format!("{:.1}", r.adopt_total.as_secs_f64())
+    }));
+    t.push_str(&row("pull s", &|r| {
+        format!("{:.1}", r.elapsed.as_secs_f64())
+    }));
+    t.push_str(&row("resumed after a lane timeout", &|r| {
+        r.retries.to_string()
+    }));
+    t.push_str(&row("pull MB/s", &|r| {
+        format!("{:.1}", mb_per_s(total, r.elapsed))
+    }));
+    t.push_str(&row("ratio to 1-lane ceiling", &|r| {
+        format!("{:.2}x", ceiling_1 / mb_per_s(total, r.elapsed))
+    }));
+    t
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -1503,7 +1824,13 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-async fn run(total: u64, curve: &[usize], default_k: usize, do_resume: bool, with_ceiling: bool) {
+async fn run(
+    total: u64,
+    curve: &[(usize, usize)],
+    default_k: usize,
+    do_resume: bool,
+    with_ceiling: bool,
+) {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let free = free_bytes(tmp.path());
@@ -1550,7 +1877,7 @@ async fn run(total: u64, curve: &[usize], default_k: usize, do_resume: bool, wit
     // publishes: the self room's key_grant sets are wrapped to the owner's
     // occurrences A holds at seal time, and every device is a member of the
     // self room.
-    let mut phones: Vec<(usize, Phone, Node)> = Vec::new();
+    let mut phones: Vec<((usize, usize), Phone, Node)> = Vec::new();
     let mut members_b: Vec<String> = Vec::new();
     let mut resume_phone: Option<Phone> = None;
     for (i, k) in curve
@@ -1560,7 +1887,7 @@ async fn run(total: u64, curve: &[usize], default_k: usize, do_resume: bool, wit
         .chain(std::iter::once(None).filter(|_| do_resume))
         .enumerate()
     {
-        let tag = k.map_or_else(|| "resume".to_owned(), |k| format!("k{k}"));
+        let tag = k.map_or_else(|| "resume".to_owned(), |(k, b)| format!("k{k}b{b}"));
         let ident = Ident::new(
             &format!("alice-phone-739-{tag}"),
             0x40 + u8::try_from(i).expect("a short curve"),
@@ -1606,9 +1933,31 @@ async fn run(total: u64, curve: &[usize], default_k: usize, do_resume: bool, wit
     // 3. The K curve.
     let mut best: Option<&PullReport> = None;
     let mut reports = Vec::new();
-    for (k, phone, node_b) in phones {
-        let r = pull_once(tmp.path(), &format!("k{k}"), &a, node_b, &members, &p, k).await;
+    for ((k, batch), phone, node_b) in phones {
+        let tag = format!("k{k}b{batch}");
+        let r = pull_once(tmp.path(), &tag, &a, node_b, &members, &p, (k, batch)).await;
+        // B's store is done with: free its disk before the next pull.
+        remove_store(Path::new(&phone.db));
         drop(phone);
+        table.push_str(&format!(
+            "adopt clock K={k} batch={batch}: {} batches (largest {}), {:.2}s of adopt wall time; mean ms/chunk by stream position: {}\n",
+            r.adopt_batches,
+            r.adopt_batch_peak,
+            r.adopt_total.as_secs_f64(),
+            r.adopt_curve
+                .iter()
+                .map(|(s, ms, _)| format!("{s}:{ms:.2}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
+        table.push_str(&format!(
+            "serve clock on A K={k} batch={batch} (CIRISEdge#766): mean serve_gate_read ms/chunk by stream position: {}\n",
+            r.serve_curve
+                .iter()
+                .map(|(s, ms, n)| format!("{s}:{ms:.2}/{n}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ));
         table.push_str(&format!(
             "pull K={:>2}: {:.2}s = {:.1} MB/s, ratio pull/ceiling(1 lane) = {:.2}x, (4 lanes) = {:.2}x; peak heap over baseline {:.1} MiB; adopted {} skipped {} in_flight_peak {}; B scoped pool (pooled, leased) = {:?}; read-back {:.2}s = {:.1} MB/s\n    B phases: {}\n    A phases: {}; A carriers: {:?}\n",
             r.k,
@@ -1636,8 +1985,12 @@ async fn run(total: u64, curve: &[usize], default_k: usize, do_resume: bool, wit
         }
     }
     if let Some(b) = best {
-        table.push_str(&format!("fastest K in the curve: {}\n", b.k));
+        table.push_str(&format!(
+            "fastest in the curve: K={} batch={}\n",
+            b.k, b.batch
+        ));
     }
+    table.push_str(&lanes_by_batch_table(total, ceiling_1, &reports));
 
     // 4. Resume.
     // The pulls above: every chunk answer rode its arrival link, none the
@@ -1673,7 +2026,7 @@ async fn run(total: u64, curve: &[usize], default_k: usize, do_resume: bool, wit
     if with_ceiling && std::env::var("CIRIS_BIGFILE_ASSERT_RATIO").is_ok_and(|v| v == "1") {
         let r = reports
             .iter()
-            .find(|r| r.k == default_k)
+            .find(|r| r.k == default_k && r.batch == DEFAULT_BATCH)
             .expect("the default K is in the curve");
         let ratio = ceiling_1 / mb_per_s(total, r.elapsed);
         assert!(
@@ -1693,18 +2046,8 @@ async fn run(total: u64, curve: &[usize], default_k: usize, do_resume: bool, wit
 #[ignore = "the 256 MiB table: a release-build bench, run alone"]
 async fn a_256_mib_self_file_pulls_within_the_ceiling_and_resumes_after_a_kill_739() {
     let total = env_usize("CIRIS_BIGFILE_BYTES", 256 * 1024 * 1024) as u64;
-    let curve: Vec<usize> = std::env::var("CIRIS_BIGFILE_K_CURVE")
-        .ok()
-        .map(|s| s.split(',').filter_map(|k| k.trim().parse().ok()).collect())
-        .unwrap_or_else(|| vec![1, 4, 16]);
     let default_k = env_usize("CIRIS_BIGFILE_K", DEFAULT_K);
-    let curve = if curve.contains(&default_k) {
-        curve
-    } else {
-        let mut c = curve;
-        c.push(default_k);
-        c
-    };
+    let curve = env_curve(&[1, 4, 16], default_k);
     let do_resume = std::env::var("CIRIS_BIGFILE_RESUME").map_or(true, |v| v != "0");
     run(total, &curve, default_k, do_resume, true).await;
 }
@@ -1717,7 +2060,8 @@ async fn a_256_mib_self_file_pulls_within_the_ceiling_and_resumes_after_a_kill_7
 async fn a_2_gib_self_file_pulls_within_the_ceiling_739() {
     let total = env_usize("CIRIS_BIGFILE_BYTES", 2 * 1024 * 1024 * 1024) as u64;
     let default_k = env_usize("CIRIS_BIGFILE_K", DEFAULT_K);
-    run(total, &[default_k], default_k, false, true).await;
+    let curve = env_curve(&[], default_k);
+    run(total, &curve, default_k, false, true).await;
 }
 
 /// The CI witness (network gauntlet, run alone in its own step): a 256 MiB

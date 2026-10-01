@@ -38,9 +38,103 @@
 //! cohabitation-only capability, which matters precisely because the
 //! Pi/iOS hosts that run sovereign are the ones that hit disk pressure.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use super::{serve_result_to_chunk, BlobChunkSource, ChunkSourceRefusal, ContentScope};
+
+/// CIRISEdge#766 — **how many files' chunk sets the serve gate remembers.**
+///
+/// The #717 membership check is a question about a whole file (is this
+/// chunk one of the DAG's?), and answering it from the stream listing costs
+/// the whole listing: asked once per chunk served, that is O(n²) per file
+/// (≈ 645 ms per chunk at 2 GiB). The answer is the same set for every chunk
+/// of the file, so it is read once and kept, keyed by the DAG's address.
+///
+/// Bounded by FILE count, least-recently-used out: at most this many files'
+/// sets are held. A set is 32 bytes per chunk (a sorted slice), so the bound
+/// in bytes is `32 × Σ chunks` — at the ~2.5 GiB file ceiling in 256 KiB
+/// chunks (≈ 10,240 chunks, 320 KiB a file), ≤ 10 MiB for 32 files. A node
+/// serving more files than this at once re-reads a listing per file it
+/// brings back, never per chunk.
+pub const MEMBERSHIP_CACHE_FILES: usize = 32;
+
+/// One file's chunk set, and the inputs it was read under.
+struct Membership {
+    /// The ids of the rows referencing the DAG when the set was read,
+    /// sorted. The set is valid only while the same rows reference it: a
+    /// row withdrawn out of the directory, or a new widening naming another
+    /// stream, changes this and the set is read again.
+    rows: Vec<String>,
+    /// The chunk shas of every stream those rows name (and agree with),
+    /// sorted and deduplicated — a lookup is a binary search.
+    chunks: Box<[[u8; 32]]>,
+    /// The cache's clock at the last hit, for least-recently-used eviction.
+    used: u64,
+}
+
+/// CIRISEdge#766 — the per-file membership sets, LRU-bounded by file count.
+/// Pure (no I/O), so its rules are unit-tested alone.
+#[derive(Default)]
+struct MembershipCache {
+    entries: HashMap<[u8; 32], Membership>,
+    clock: u64,
+}
+
+impl MembershipCache {
+    /// Is `chunk` in the set held for `dag`, read under exactly `rows`?
+    /// `false` covers "no set", "a set read under other rows" and "not in
+    /// the set" alike: each sends the caller to the listing.
+    fn hit(&mut self, dag: &[u8; 32], rows: &[String], chunk: &[u8; 32]) -> bool {
+        self.clock += 1;
+        let clock = self.clock;
+        match self.entries.get_mut(dag) {
+            Some(m) if m.rows == rows && m.chunks.binary_search(chunk).is_ok() => {
+                m.used = clock;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Hold `chunks` as `dag`'s set, read under `rows`, evicting the
+    /// least-recently-used file when `cap` files are already held.
+    fn put(&mut self, dag: [u8; 32], rows: Vec<String>, mut chunks: Vec<[u8; 32]>, cap: usize) {
+        if cap == 0 {
+            return;
+        }
+        chunks.sort_unstable();
+        chunks.dedup();
+        self.clock += 1;
+        if !self.entries.contains_key(&dag) && self.entries.len() >= cap {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, m)| m.used)
+                .map(|(k, _)| *k)
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            dag,
+            Membership {
+                rows,
+                chunks: chunks.into_boxed_slice(),
+                used: self.clock,
+            },
+        );
+    }
+
+    /// Drop `dag`'s set (its references were withdrawn, or none remain).
+    fn forget(&mut self, dag: &[u8; 32]) {
+        self.entries.remove(dag);
+    }
+
+    fn holds(&self, dag: &[u8; 32]) -> bool {
+        self.entries.contains_key(dag)
+    }
+}
 
 /// A [`BlobChunkSource`] that answers from a persist substrate through
 /// the gated peer-serve door.
@@ -55,6 +149,9 @@ pub struct PersistBlobChunkSource {
     /// withdrawn answers [`ChunkSourceRefusal::Withdrawn`] instead of being
     /// served. `None` is pre-#606 behaviour.
     revocations: Option<Arc<super::RevocationRegister>>,
+    /// CIRISEdge#766 — each served file's chunk set, read once per file
+    /// instead of once per chunk ([`MEMBERSHIP_CACHE_FILES`]).
+    membership: Mutex<MembershipCache>,
 }
 
 impl std::fmt::Debug for PersistBlobChunkSource {
@@ -74,6 +171,7 @@ impl PersistBlobChunkSource {
         Self {
             engine,
             revocations: None,
+            membership: Mutex::new(MembershipCache::default()),
         }
     }
 
@@ -95,6 +193,21 @@ impl PersistBlobChunkSource {
     ) -> Self {
         Self::new(ciris_persist::Engine::from_shared(backend, signer))
     }
+
+    /// CIRISEdge#766 — whether the serve gate currently holds `dag`'s chunk
+    /// set. For witnesses that the membership cache was warm (or dropped)
+    /// when they asked.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn holds_membership_of(&self, dag: &[u8; 32]) -> bool {
+        self.membership.lock().is_ok_and(|c| c.holds(dag))
+    }
+
+    fn forget_membership(&self, dag: &[u8; 32]) {
+        if let Ok(mut c) = self.membership.lock() {
+            c.forget(dag);
+        }
+    }
 }
 
 impl PersistBlobChunkSource {
@@ -115,14 +228,32 @@ impl PersistBlobChunkSource {
     ///
     /// Anything unreadable reads as "not a member": this is a refusal gate,
     /// and it fails closed.
+    ///
+    /// **CIRISEdge#766 — once per file, not once per chunk.** Reading (1)
+    /// lists the whole stream; the set it yields is the same for every chunk
+    /// of the file, so it is kept ([`MEMBERSHIP_CACHE_FILES`]) under the ids
+    /// of the rows it was read through. The rows are read fresh on every
+    /// call (an indexed lookup, as before), and a set read under other rows
+    /// is not used: the membership answer rests on exactly the inputs the
+    /// uncached check read, except the listing itself. A chunk NOT in the
+    /// held set re-reads the listing (a relay still adopting the stream
+    /// grows it), so a cached miss never refuses what the listing would
+    /// admit. Withdrawal is honoured where it always was — the revocation
+    /// register's `Revoked` verdict, checked before this gate on every
+    /// chunk, which also drops the file's set — and the bytes are still
+    /// read through the gated door per chunk: a held set says only "a
+    /// member", never "servable".
     async fn chunk_in_named_dag(&self, dag: [u8; 32], chunk: [u8; 32], requester: &str) -> bool {
         use ciris_persist::federation::BlobBody;
         let dag_hex = hex::encode(dag);
-        let rows = match self
-            .engine
-            .federation_directory()
-            .attestations_binding_content(&dag_hex)
-            .await
+        // CIRISEdge#736 — the widenings too: a family file's placement on its
+        // author's node is the `supersedes` widening its own `self` row, and
+        // the stream was written at the family.
+        let rows = match crate::blob_swarm::BlobMeaning::referencing_rows(
+            &*self.engine.federation_directory(),
+            &dag,
+        )
+        .await
         {
             Ok(rows) => rows,
             Err(e) => {
@@ -135,11 +266,25 @@ impl PersistBlobChunkSource {
                 Vec::new()
             }
         };
+        let mut row_ids: Vec<String> = rows.iter().map(|r| r.attestation_id.clone()).collect();
+        row_ids.sort_unstable();
+        if row_ids.is_empty() {
+            // Nothing references the DAG any more: no stream is its stream.
+            self.forget_membership(&dag);
+        } else if self
+            .membership
+            .lock()
+            .is_ok_and(|mut c| c.hit(&dag, &row_ids, &chunk))
+        {
+            return true;
+        }
+        let mut members: Vec<[u8; 32]> = Vec::new();
+        let mut listed = false;
         for row in &rows {
-            let Some(members) = row.attestation_envelope.as_object() else {
+            let Some(fields) = row.attestation_envelope.as_object() else {
                 continue;
             };
-            for pointer in members
+            for pointer in fields
                 .values()
                 .filter(|v| v.is_object())
                 .filter_map(|v| {
@@ -172,9 +317,17 @@ impl PersistBlobChunkSource {
                         continue;
                     }
                 }
-                if listing.chunks.iter().any(|c| c.chunk_sha == chunk) {
-                    return true;
-                }
+                listed = true;
+                members.extend(listing.chunks.iter().map(|c| c.chunk_sha));
+            }
+        }
+        if listed {
+            let found = members.contains(&chunk);
+            if let Ok(mut c) = self.membership.lock() {
+                c.put(dag, row_ids, members, MEMBERSHIP_CACHE_FILES);
+            }
+            if found {
+                return true;
             }
         }
         matches!(
@@ -210,6 +363,8 @@ impl BlobChunkSource for PersistBlobChunkSource {
                     "PersistBlobChunkSource: every reference to this blob was withdrawn — \
                      refusing Withdrawn (CC 2.3 at the bytes plane, CIRISEdge#606)",
                 );
+                // CIRISEdge#766 — and the file's held chunk set goes with it.
+                self.forget_membership(&blob_sha256);
                 return Err(ChunkSourceRefusal::Withdrawn);
             }
         }
@@ -291,5 +446,64 @@ impl BlobChunkSource for PersistBlobChunkSource {
     /// withholding every scoped fetch at runtime.
     async fn chunk_scope(&self, _blob_sha256: [u8; 32]) -> Option<ContentScope> {
         None
+    }
+}
+
+#[cfg(test)]
+mod membership_cache_tests {
+    use super::MembershipCache;
+
+    fn rows(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_held_set_answers_only_its_own_chunks_under_its_own_rows_766() {
+        let mut c = MembershipCache::default();
+        let (x, y) = ([1u8; 32], [2u8; 32]);
+        c.put(x, rows(&["r1"]), vec![[9; 32], [7; 32], [9; 32]], 4);
+        assert!(c.hit(&x, &rows(&["r1"]), &[7; 32]), "a member of X's set");
+        assert!(
+            c.hit(&x, &rows(&["r1"]), &[9; 32]),
+            "dedup keeps the member"
+        );
+        assert!(!c.hit(&x, &rows(&["r1"]), &[8; 32]), "not a member of X");
+        assert!(
+            !c.hit(&y, &rows(&["r1"]), &[7; 32]),
+            "X's set says nothing about Y"
+        );
+        assert!(
+            !c.hit(&x, &rows(&["r1", "r2"]), &[7; 32]),
+            "a set read under other rows is not used (a row added)"
+        );
+        assert!(!c.hit(&x, &rows(&[]), &[7; 32]), "or a row gone");
+        c.forget(&x);
+        assert!(
+            !c.holds(&x) && !c.hit(&x, &rows(&["r1"]), &[7; 32]),
+            "forgotten"
+        );
+    }
+
+    #[test]
+    fn the_cache_holds_at_most_cap_files_least_recently_used_out_766() {
+        let mut c = MembershipCache::default();
+        let r = rows(&["r"]);
+        for i in 0..3u8 {
+            c.put([i; 32], r.clone(), vec![[i; 32]], 3);
+        }
+        // Touch file 0, so file 1 is the least recently used.
+        assert!(c.hit(&[0; 32], &r, &[0; 32]));
+        c.put([3; 32], r.clone(), vec![[3; 32]], 3);
+        assert_eq!(c.entries.len(), 3, "bounded by file count");
+        assert!(!c.holds(&[1; 32]), "the least recently used file went");
+        assert!(c.holds(&[0; 32]) && c.holds(&[2; 32]) && c.holds(&[3; 32]));
+        // Re-putting a held file replaces it without evicting another.
+        c.put([3; 32], r.clone(), vec![[4; 32]], 3);
+        assert_eq!(c.entries.len(), 3);
+        assert!(c.hit(&[3; 32], &r, &[4; 32]) && !c.hit(&[3; 32], &r, &[3; 32]));
+        // A zero cap holds nothing.
+        let mut z = MembershipCache::default();
+        z.put([5; 32], r.clone(), vec![[5; 32]], 0);
+        assert!(!z.holds(&[5; 32]));
     }
 }

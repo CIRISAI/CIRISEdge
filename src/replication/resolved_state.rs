@@ -91,6 +91,10 @@ pub(crate) enum Reach {
     /// the rows a reader needs before Policy A (CC 4.4.3.8) can be evaluated
     /// about us at all. It carries nothing else: `admits` allows only
     /// `federation`, and the audience gate narrows it to the allegiance shape.
+    /// One exception, decided in the audience gate before this reach is asked
+    /// (CIRISEdge#756, `FSD/FIRST_CONTACT.md` §2.4): the membership ceremony
+    /// addressed to the peer's own person — the proposal naming it and the
+    /// invitee's answer to its proposal — at the group's target.
     FirstContact,
 }
 

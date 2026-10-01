@@ -57,21 +57,49 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         ),
         // E3: the trace plane is the sole capability-gated serve path — and the
         // ONE plane whose projection is genuinely decided per row.
-        //
-        // CIRISEdge#671 / #752 (CC 5.4.6, CIRISServer#701) — a first-contact
-        // peer (no consent, no owner/family axis) is served this node's own
-        // allegiance facts and, when the host installed a `KindPublishSelector`,
-        // the live `federation` owner-binding of every node in that selector's
-        // Key / IdentityOccurrence set (the public device roster); nothing else.
+        // CIRISEdge#671 / #752 / #756 — a first-contact peer (no consent, no
+        // owner/family axis) is served this node's own allegiance facts (#671);
+        // with a `KindPublishSelector` installed, the live `federation`
+        // owner-binding of every node in that selector's Key /
+        // IdentityOccurrence set (#752, CC 5.4.6 public roster, CIRISServer#701);
+        // and the membership ceremony addressed to the peer's own person (#756:
+        // a proposal naming `owner_of(peer)`; the invitee's reply to a proposal
+        // held here that the peer's person issued), with no Rooted floor on
+        // those two (`FSD/FIRST_CONTACT.md` §2.3–§2.4).
         EnvelopeKind::Attestation => (
             "per_record_projection",
             "trace:* → capability:infra:serve; first contact → own allegiance facts \
              + live federation owner-bindings of nodes in the Key/IdentityOccurrence \
-             publish set; else public",
+             publish set + membership:proposal:v1 naming owner_of(peer) + the invitee's \
+             membership:acceptance|decline:v1 to a held proposal by owner_of(peer); \
+             else public",
         ),
-        EnvelopeKind::Family | EnvelopeKind::Community | EnvelopeKind::LocationProof => {
-            ("cohort", "public")
-        }
+        // CIRISEdge#758 (CC 5.4.6, `FSD/FIRST_CONTACT.md` §2.5) — a group
+        // RECORD is not public: it reaches the group's live members and the
+        // invitees of a live proposal held here (the record travels with the
+        // invitation), on the advertise and the fetch twin, at every reach.
+        // CIRISEdge#762 (CC 5.4.6 "from outsiders only", CC 4.4.3.2.1, persist's
+        // #761 ruling) — only a PRIVATE group is gated: a PUBLIC group's record
+        // (`public_group::is_public_group`: an `infrastructure` community; the
+        // accord family, the genesis bundle's family and the deployment's WA
+        // reclaim family) keeps the pre-v38 `public` serve, since every node
+        // resolves its trust root / reclaim authority through it.
+        EnvelopeKind::Family => (
+            "cohort",
+            "public family (accord_family_key_id | genesis bundle family_key_id | \
+             ReclaimPolicy.wa_family_key_id) → public; else group record → \
+             owner_of(peer) is a live member, or a subject_key_ids invitee of a live \
+             membership:proposal:v1 into the group held here; else withheld \
+             (group_record_not_member_or_invitee)",
+        ),
+        EnvelopeKind::Community => (
+            "cohort",
+            "cohort_subkind == infrastructure → public; else group record → \
+             owner_of(peer) is a live member, or a subject_key_ids invitee of a live \
+             membership:proposal:v1 into the group held here; else withheld \
+             (group_record_not_member_or_invitee)",
+        ),
+        EnvelopeKind::LocationProof => ("cohort", "public"),
         // The four `global` planes: the two tombstone planes above join the two
         // membership-revocation planes here — all four fan out over the
         // hardcoded widest own∪cohort set (`Projection::Global`).
@@ -258,14 +286,27 @@ pub fn serve_advertise_policy_sha256() -> String {
 // only its owner's own nodes — on the advertise, the direct fetch and the
 // subject Pull alike. `Key` is untouched. **CIRISServer must mirror this pin.**
 //
-// CIRISEdge#752 — RE-PINNED, e4c4d625… → b86a7042…. The Attestation `serve` cell
-// now names what a first-contact peer (no consent) is served: this node's own
-// allegiance facts (#671, which the cell never stated) and, with a
-// `KindPublishSelector` installed, the live `federation` owner-binding of each
-// node in the Key / IdentityOccurrence publish set (CC 5.4.6, CIRISServer#701).
-// **CIRISServer must mirror this pin.**
+// CIRISEdge#752 (v37.1.0) — RE-PINNED on main, e4c4d625… → b86a7042…: the
+// Attestation `serve` cell names first contact's own allegiance facts (#671) and,
+// with a `KindPublishSelector`, the live `federation` owner-binding of each node
+// in the Key / IdentityOccurrence publish set (CC 5.4.6, CIRISServer#701).
+//
+// CIRISEdge#756 / #758 (v38.0.0) — the same cell also carries the membership
+// ceremony addressed to the peer's own person (`FSD/FIRST_CONTACT.md` §2.4, I22;
+// CIRISPersist#955, CC rc6 3.1.3.2), and the Family and Community `serve` cells
+// move from `public` to the group-record gate (CC 5.4.6; §2.5, I23), booked
+// `group_record_not_member_or_invitee`. `LocationProof` keeps `public`.
+// Combined at the v38 merge of v37.1.0; the value below is computed from the
+// merged manifest. **CIRISServer must mirror this pin.**
+//
+// CIRISEdge#762 (v38.0.0) — RE-PINNED, a09e34a6… → e3070d53…: the Family and
+// Community `serve` cells carve PUBLIC groups out of the group-record gate (an
+// `infrastructure` community; the accord / genesis / WA reclaim families keep
+// the pre-v38 `public` serve — CC 5.4.6 "from outsiders only", CC 4.4.3.2.1,
+// persist's #761 ruling; `FSD/FIRST_CONTACT.md` §2.5, I23). **CIRISServer must
+// mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "b86a7042ad9ccc81d7e54abc9b9a2fb8d8a415e7d1c85be025484292150347eb";
+    "e3070d5327d6518b7ef50b0988f1af92790e2ea4efb9833cc4213a4127fc41b0";
 
 #[cfg(test)]
 mod tests {

@@ -206,6 +206,7 @@ fn build_bridge(
                 }),
         )
         .with_metrics(config.metrics.clone())
+        .with_membership_widener(config.membership_widener.clone())
         .with_mesh_config(mesh_config)
         // Workstream F — installed iff the operator turned enforcement ON. See
         // `ReplicationRuntimeConfig::accord_relay_enforced`: `false` keeps
@@ -719,6 +720,11 @@ pub struct ReplicationRuntimeConfig {
     /// behaviour. See
     /// [`FederationDirectoryReplicationBridge::with_kind_publish_selector`].
     pub kind_publish_selector: Option<super::bridge::KindPublishSelector>,
+    /// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — the roster
+    /// keys this node widens for on an admitted acceptance of a proposal they
+    /// issued (see [`crate::membership`]). `None` (the default): acceptances
+    /// are stored and nothing is widened by this node.
+    pub membership_widener: Option<crate::membership::MembershipWidener>,
 }
 
 /// Live replication runtime — bridge + registry + scheduler task +

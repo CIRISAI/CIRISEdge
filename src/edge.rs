@@ -6463,7 +6463,18 @@ async fn dispatch_inbound(
                         .await
                     {
                         Ok(Some(bytes)) => {
-                            metrics.add_blob_dag_phase("serve_gate_read", serve_started.elapsed());
+                            let gate_read = serve_started.elapsed();
+                            metrics.add_blob_dag_phase("serve_gate_read", gate_read);
+                            // CIRISEdge#766 — one event per served chunk, so
+                            // a bench can book the serve clock by stream
+                            // position (the responder knows the sha, not
+                            // the seq). Debug: free unless subscribed.
+                            tracing::debug!(
+                                target: "ciris_edge::blob_swarm::serve_gate",
+                                chunk = %hex::encode(req.chunk_sha256),
+                                elapsed_us = u64::try_from(gate_read.as_micros()).unwrap_or(u64::MAX),
+                                "chunk serve: the gate and the read returned bytes (CIRISEdge#766)"
+                            );
                             // AV-13 size gate on outbound: refuse to
                             // emit a chunk that exceeds the ceiling
                             // (the peer would drop it anyway, but the

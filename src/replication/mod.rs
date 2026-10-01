@@ -131,6 +131,9 @@ pub mod mesh_config;
 /// be pulled. `Key` is the root of every admission's dependency closure.
 pub mod missing_signer;
 pub mod protocol;
+/// CIRISEdge#762 — the public-group predicate the #758 record gate exempts
+/// (stand-in for persist v53's `replication_audience::is_public_group`).
+pub mod public_group;
 pub mod refusal_backoff;
 pub mod registry;
 pub mod resolved_state;

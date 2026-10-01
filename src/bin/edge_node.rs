@@ -808,6 +808,34 @@ impl FedKey {
         Ok(LocalSigner::new(key_id, classical, Some(pqc)))
     }
 
+    /// The REGISTERED federation key_id of the identity this key is under
+    /// `label`: `derive_key_id(label, ed25519 pubkey)` = `"<label>-<fp>"` (CC
+    /// 2.6.8, CIRISVerify FSD-003). A label is the derivation's INPUT, never a
+    /// key_id: every persist signer reports `derived_key_id()`, and a row that
+    /// names the label as its attester while the signer names the derived id is
+    /// refused (persist W5, `CustodyIsNotTheActor`) — CIRISEdge#767.
+    fn derived_key_id(&self, label: &str) -> Result<String, String> {
+        let pubkey = self
+            .signer()?
+            .public_key()
+            .map_err(|e| format!("pubkey: {e}"))?;
+        Ok(ciris_verify_core::fedcode::derive_key_id(label, &pubkey))
+    }
+
+    /// The hybrid signer for the identity registered under
+    /// [`Self::derived_key_id`]`(label)`: the keystore alias is `label`, and
+    /// edge's `key_id` is the id DERIVED from it — the shape
+    /// `PersistGroupContentStore::from_shared_hybrid` and every persist
+    /// `LocalSigner` built from it assume. [`Self::local_signer`] keys the
+    /// signer by the label itself, which is right only for the harness's
+    /// label-keyed transport NODE identity; a persist-side actor (the owner)
+    /// signed that way names an id no persist signer can ever derive.
+    fn identity_signer(&self, label: &str) -> Result<LocalSigner, String> {
+        let mut signer = self.local_signer(label)?;
+        signer.key_id = self.derived_key_id(label)?;
+        Ok(signer)
+    }
+
     /// Base64 ML-DSA-65 public key — the directory record must carry it, or
     /// `verify_hybrid` sees a PQC signature with no pubkey to check it against
     /// and refuses the pair outright.
@@ -1678,7 +1706,7 @@ const _: () = {
     }
 };
 
-const DISCOVERY_PLANES: [EnvelopeKind; 4] = [
+const DISCOVERY_PLANES: [EnvelopeKind; 6] = [
     // The three that PROMOTE an advisory link to an attributed one. The harness
     // first registered `EnvelopeKind::ALL` (sixty coordinators — it saturated
     // the transport), then narrowed to `Key` + `Attestation`, which omits two
@@ -1689,6 +1717,13 @@ const DISCOVERY_PLANES: [EnvelopeKind; 4] = [
     EnvelopeKind::TransportDestination,
     // What discovery actually reads.
     EnvelopeKind::Attestation,
+    // persist v52.0.0 (CIRISPersist#955) — the pair room is founded by its
+    // creator alone and the joiner is added by the creator's widening after it
+    // accepts, so the joiner can no longer author the room locally: the record
+    // and the widening must reach it. (The proposal and the acceptance ride the
+    // Attestation plane above.)
+    EnvelopeKind::Community,
+    EnvelopeKind::CommunityMembershipWidening,
 ];
 
 /// Build the whole occurrence: keys, sealed KV, directory, transport,
@@ -1709,8 +1744,15 @@ async fn stand_up(
     // identifier to the person first and to their nodes second. Without a real
     // owner every lookup stops at `owner_of` returning `None`, which is exactly
     // why the route-reachability leg could not cover resolution.
-    let owner_key_id = format!("{}-owner", cfg.node_id);
-    let owner = FedKey::load_or_create(&owner_key_id, &cfg.state_dir.join("owner"))?;
+    //
+    // The owner's key_id is the id DERIVED from its label and pubkey (CC
+    // 2.6.8), read from the key — never the label. The label is what the
+    // keystore holds; persist's signers all name themselves by the derived id,
+    // so a label-keyed owner is an attester no signer of its can ever match
+    // (persist W5 refused every standup from 2026-09-14 — CIRISEdge#767).
+    let owner_label = format!("{}-owner", cfg.node_id);
+    let owner = FedKey::load_or_create(&owner_label, &cfg.state_dir.join("owner"))?;
+    let owner_key_id = owner.derived_key_id(&owner_label)?;
 
     // The AGENT that runs here — the third of the three keys (human, node,
     // agent). Distinct from `cfg.node_id`, which is the NODE: the dialable
@@ -1731,7 +1773,7 @@ async fn stand_up(
             owner_key_id: owner_key_id.clone(),
             owner_pubkey_b64: owner.pubkey_b64()?,
             fed_pqc_pubkey_b64: fed.pqc_pubkey_b64(&cfg.node_id).await?,
-            owner_pqc_pubkey_b64: owner.pqc_pubkey_b64(&owner_key_id).await?,
+            owner_pqc_pubkey_b64: owner.pqc_pubkey_b64(&owner_label).await?,
             agent_key_id: agent_key_id.clone(),
             agent_pubkey_b64: agent.pubkey_b64()?,
             agent_pqc_pubkey_b64: agent.pqc_pubkey_b64(&agent_key_id).await?,
@@ -1821,8 +1863,16 @@ async fn stand_up(
     // human-signed `delegates_to` that `steward_bindings_of(agent)` resolves.
     // Nothing on the ladder resolves the agent through `owner_of`; the rung
     // that names a row names `owner_of(peer_node)`.
-    let owner_signer = Arc::new(owner.local_signer(&owner_key_id)?);
+    let owner_signer = Arc::new(owner.identity_signer(&owner_label)?);
+    debug_assert_eq!(owner_signer.key_id, owner_key_id);
     emit_owner_binding(&directory, &owner_key_id, &owner_signer, &cfg.node_id).await?;
+
+    // The signer the content engine is built over: the owner's key material
+    // under a DISTINCT alias, so the engine's derived id — this node's content
+    // occurrence of its owner — is not the owner's own id. Built over the
+    // owner's alias it would derive to `owner_key_id` itself, and the node
+    // would be bound, registered and published as an occurrence of itself.
+    let engine_signer = owner.identity_signer(&format!("{}-occ", cfg.node_id))?;
 
     // CIRISPersist#848 — the hybrid Engine this node seals AND projects
     // through, built ONCE and shared by the replication runtime (which routes
@@ -1835,7 +1885,7 @@ async fn stand_up(
     let content_store = ciris_edge::group_content::PersistGroupContentStore::from_shared_hybrid(
         ciris_persist::BackendDispatch::Sqlite(directory.clone()),
         directory.clone(),
-        &owner_signer,
+        &engine_signer,
     )
     .await
     .map_err(|e| format!("hybrid content engine: {e}"))?;
@@ -1868,10 +1918,9 @@ async fn stand_up(
     // The ENGINE's derived key needs its own owner binding, and it is not one
     // of the two emitted above.
     //
-    // The engine is built over `owner_signer`, so the key it publishes its
-    // occurrence under is `derive_key_id(<owner alias>, <owner pubkey>)` —
-    // `{node_id}-owner-<fp>` — which is neither `cfg.node_id` nor
-    // `agent_key_id`. persist v44.4.0's gated occurrence door lifts a signing
+    // The engine is built over `engine_signer`, so the key it publishes its
+    // occurrence under is `derive_key_id("{node_id}-occ", <owner pubkey>)` —
+    // which is neither `cfg.node_id`, `agent_key_id`, nor `owner_key_id`. persist v44.4.0's gated occurrence door lifts a signing
     // key to an identity only through a live owner binding naming THAT key, so
     // without this the publish is refused and node standup aborts. Before
     // v44.4.0 the occurrence went through the trusted-local door, which
@@ -1929,8 +1978,9 @@ async fn stand_up(
     // built the way `from_shared_hybrid` builds the engine's: `key_id` is the
     // keystore ALIAS (`current_alias()`), never the derived id — passing the
     // derived id derives twice (PR #607). Its `derived_key_id()` is therefore
-    // `me`, which is an active occurrence of the owner, so the gated door's
-    // `signer_acts_for` admits the rows it signs.
+    // `owner_key_id` — the identity itself, which is exactly what persist's
+    // W5 check at the top of `self_at_login` demands (CIRISEdge#767: it used
+    // to be the owner's LABEL here, and every standup was refused).
     //
     // Runs AFTER provisioning: the door checks the signer against the
     // identity's ACTIVE occurrences, and `me` is one only once it exists.
@@ -2041,34 +2091,41 @@ async fn stand_up(
 
     // ── This node's PAIR ROOMS with every roster owner ───────────────
     //
-    // Authored at STANDUP, before replication starts, so a peer's message —
-    // or its MLS handshake row — is admissible the moment it arrives: AV-45
-    // proves the writer's membership against the room the row names, and a
-    // room that is not yet known is a transient refusal that costs a whole
-    // round. Both humans are FOUNDERS (`chat::pair_community`), so the room
-    // has its moderators by construction. Idempotent on both ends.
+    // Opened at STANDUP, before replication starts, by the pair's CREATOR
+    // (the smaller fed-ID, `chat::PairRole`) only: persist v52.0.0
+    // (CIRISPersist#955, CIRISConstitution#133) admits a founding record only
+    // for the members who signed it, so the creator founds the room alone and
+    // PROPOSES the other owner as `founder`. The joiner accepts in `open_chat`;
+    // this node's bridge widens the roster when the acceptance arrives
+    // (`ReplicationRuntimeConfig::membership_widener`). End state as before:
+    // both humans are founders, so the room has its moderators. Idempotent.
     let founded_at: chrono::DateTime<chrono::Utc> =
         chrono::DateTime::parse_from_rfc3339("2026-05-01T00:00:00Z")
             .map_err(|e| format!("ts: {e}"))?
             .into();
     let mut rooms = 0usize;
     for entry in roster.values().filter(|e| e.key_id != cfg.node_id) {
-        if entry.owner_key_id.is_empty() {
+        if entry.owner_key_id.is_empty()
+            || entry.owner_key_id == owner_key_id
+            || chat::PairRole::of(&owner_key_id, &entry.owner_key_id) != chat::PairRole::Creator
+        {
             continue;
         }
-        let row = chat::signed_pair_community(
+        match chat::open_pair_room(
+            &*directory,
             &owner_key_id,
             &entry.owner_key_id,
             founded_at,
+            chrono::Utc::now() + chrono::Duration::days(7),
             &node_signer,
         )
-        .await?;
-        match directory.put_community(row).await {
-            Ok(()) | Err(ciris_persist::federation::Error::Conflict(_)) => rooms += 1,
+        .await
+        {
+            Ok(_) => rooms += 1,
             Err(e) => {
                 tracing::warn!(
                     node = %cfg.node_id, peer_owner = %entry.owner_key_id, error = %e,
-                    "pair room refused at standup — the chat legs will author it again"
+                    "pair room refused at standup — the chat legs will open it again"
                 );
             }
         }
@@ -2252,6 +2309,13 @@ async fn stand_up(
                             as Arc<dyn ciris_edge::blob_swarm::BlobEvictor>),
                     }),
                 }),
+                // persist v52.0.0 (CIRISPersist#955) — this node widens its
+                // owner's rooms on an admitted acceptance of a proposal the
+                // owner (or this node, for them) issued; the owner's own key
+                // signs, because the roster's consensus counts seat keys.
+                membership_widener: Some(ciris_edge::membership::MembershipWidener::new(vec![
+                    Arc::clone(&owner_signer),
+                ])),
                 ..Default::default()
             },
             // THE SELF-PUBLISH SET — the identities this node speaks for.
@@ -2727,6 +2791,81 @@ async fn share_in_room(
     }
 }
 
+/// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — the pair room
+/// by consent, from either side. The CREATOR (`chat::PairRole`) founds the
+/// room alone and proposes the peer as `founder` (idempotent — standup did
+/// it), then waits until its own bridge has widened the roster on the peer's
+/// acceptance. The JOINER waits for the proposal, accepts it with its node
+/// acting for its owner, then waits for the creator's widening to arrive.
+/// Returns how the room came to be, for the artifact.
+async fn open_pair_room_by_consent(
+    occ: &Occurrence,
+    my_owner: &str,
+    peer_owner: &str,
+    peer_node: &str,
+    founded_at: chrono::DateTime<chrono::Utc>,
+    budget: Duration,
+) -> Result<&'static str, String> {
+    let dir: &dyn ciris_persist::federation::FederationDirectory = &*occ.directory;
+    let room = chat::pair_community_key_id(my_owner, peer_owner);
+    let is_member = |who: String| {
+        let room = room.clone();
+        async move {
+            dir.active_community_members(&room)
+                .await
+                .is_ok_and(|m| m.iter().any(|m| m.key_id == who))
+        }
+    };
+    let how = match chat::PairRole::of(my_owner, peer_owner) {
+        chat::PairRole::Creator => {
+            chat::open_pair_room(
+                dir,
+                my_owner,
+                peer_owner,
+                founded_at,
+                chrono::Utc::now() + chrono::Duration::days(7),
+                &occ.node_signer,
+            )
+            .await?;
+            "founded, proposed, widened on acceptance"
+        }
+        chat::PairRole::Joiner => {
+            occ.replication
+                .sync_and_await(peer_node, budget, || async {
+                    chat::pair_proposal_for(dir, my_owner, peer_owner)
+                        .await
+                        .is_ok_and(|p| p.is_some())
+                })
+                .await
+                .map_err(|e| format!("sync_and_await (proposal): {e}"))?;
+            let pending = chat::pair_proposal_for(dir, my_owner, peer_owner)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("the creator's proposal did not arrive within the budget")?;
+            chat::accept_pair_proposal(dir, &pending.proposal.attestation_id, &occ.node_signer)
+                .await
+                .map_err(|e| format!("accept the proposal: {e}"))?;
+            "accepted the creator's proposal"
+        }
+    };
+    let joiner = match chat::PairRole::of(my_owner, peer_owner) {
+        chat::PairRole::Creator => peer_owner.to_owned(),
+        chat::PairRole::Joiner => my_owner.to_owned(),
+    };
+    occ.replication
+        .sync_and_await(peer_node, budget, || is_member(joiner.clone()))
+        .await
+        .map_err(|e| format!("sync_and_await (widening): {e}"))?;
+    if is_member(joiner.clone()).await {
+        Ok(how)
+    } else {
+        Err(format!(
+            "{joiner} is not on the room's roster within the budget — the widening on \
+             acceptance did not land (CIRISPersist#955)"
+        ))
+    }
+}
+
 async fn run_chat_legs(occ: &Occurrence) {
     use ciris_edge::chat::{self, Body, PairRole};
     use ciris_edge::mls::cohort_group::{
@@ -2762,7 +2901,8 @@ async fn run_chat_legs(occ: &Occurrence) {
         return;
     };
 
-    let my_owner = format!("{}-owner", cfg.node_id);
+    // Read from the signer, never rebuilt from the node's label (#767).
+    let my_owner = occ.owner_signer.key_id.clone();
     let Some(peer_owner) = occ
         .roster
         .get(&peer_node)
@@ -2855,18 +2995,13 @@ async fn run_chat_legs(occ: &Occurrence) {
     let mut members = vec![my_owner.clone(), peer_owner.clone()];
     members.sort_unstable();
 
-    // ── open_chat: the room record (standup authored it; idempotent) ──
+    // ── open_chat: the room, by consent (CIRISPersist#955) ────────────
+    // The creator founds + proposes (standup did; idempotent) and waits for
+    // its bridge to widen the roster on the joiner's acceptance; the joiner
+    // waits for the proposal, accepts it, and waits for the widening.
     let room_how =
-        match chat::signed_pair_community(&my_owner, &peer_owner, founded_at, &occ.node_signer)
-            .await
-        {
-            Err(e) => Err(e),
-            Ok(row) => match occ.directory.put_community(row).await {
-                Ok(()) => Ok("authored"),
-                Err(ciris_persist::federation::Error::Conflict(_)) => Ok("already present"),
-                Err(e) => Err(format!("put_community: {e}")),
-            },
-        };
+        open_pair_room_by_consent(occ, &my_owner, &peer_owner, &peer_node, founded_at, budget)
+            .await;
     let room_how = match room_how {
         Ok(how) => how,
         Err(e) => {
@@ -5319,7 +5454,47 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{seal_after_verdict, SealAfterVerdict};
+    use super::{seal_after_verdict, FedKey, SealAfterVerdict};
+
+    /// CIRISEdge#767 — the owner's signer must name the id persist derives
+    /// for it, or `self_at_login`'s W5 check (`CustodyIsNotTheActor`) refuses
+    /// the login ceremony and every standup dies. Built exactly the way the
+    /// ceremony builds its persist identity signer (alias =
+    /// `current_alias()`), from the signer `stand_up` builds.
+    #[tokio::test]
+    async fn owner_signer_names_the_id_persist_derives_for_it() {
+        let owner = FedKey::from_root_seed([7u8; 32]);
+        let label = "sub-1-owner";
+        let persist_derived = |s: &ciris_edge::identity::LocalSigner| {
+            let classical = s.classical.clone();
+            let pqc = s.pqc.clone();
+            let pqc_id = s.key_id.clone();
+            async move {
+                ciris_persist::signing::LocalSigner::from_hardware_parts(
+                    classical.clone(),
+                    ciris_keyring::HardwareSigner::current_alias(&*classical).to_owned(),
+                    pqc,
+                    Some(pqc_id),
+                )
+                .await
+                .expect("persist signer")
+                .derived_key_id()
+            }
+        };
+
+        let signer = owner.identity_signer(label).expect("identity signer");
+        assert_eq!(signer.key_id, owner.derived_key_id(label).unwrap());
+        assert_eq!(persist_derived(&signer).await, signer.key_id);
+
+        // The pre-fix shape: keyed by the label, which persist never derives.
+        let label_keyed = owner.local_signer(label).expect("label signer");
+        assert_ne!(persist_derived(&label_keyed).await, label_keyed.key_id);
+
+        // The content engine's alias derives to a DIFFERENT id, so the node's
+        // content occurrence is never the owner itself.
+        let engine = owner.identity_signer("sub-1-occ").expect("engine signer");
+        assert_ne!(engine.key_id, signer.key_id);
+    }
 
     // Field provenance (the #336 lesson): every input below is exactly a
     // value `probe_scope_address` produces — `Some(held)` is an

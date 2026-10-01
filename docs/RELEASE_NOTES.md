@@ -1,5 +1,90 @@
 # CIRISEdge Release Notes
 
+# v38.0.0 — persist v52: membership by consent, invitations that reach strangers, group records only to members and invitees, receipts for every file, family files, and a 2 GiB pull within ~2× of the wire
+
+**2026-09-30** (PR #754 + lanes #755, #759, #760, #764, #765, #769, #770; persist CIRISPersist v52.0.0).
+**MAJOR** from v37.1.0. Ladder triple: **edge v38.0.0 · persist v52.0.0 · verify v18.0.0**.
+
+## The pins
+
+| | v37.1.0 | v38.0.0 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v51.3.0"` | **`tag = "v52.0.0"`** → `5ce36224` (a merge over the certified `ab339195`, identical tree `bb3cc676`) |
+| ciris-persist (wheel floor) | `>=51.3,<52` | **`>=52,<53`** (the directory ABI moved) |
+| `DIRECTORY_ABI_VERSION` | 6 | **7** (#784: a revocation names its subject by `revoked_key_sha256_ed25519_raw`; `revoked_key_id` optional) |
+| capsule `DirectoryOp` digest | `9050c899…` | `bd3273da…` (`RevocationsForSubject` appended) |
+| `SERVE_ADVERTISE_POLICY_HASH` | `b86a7042…` | **`e3070d5327d6518b7ef50b0988f1af92790e2ea4efb9833cc4213a4127fc41b0`** |
+| verify crates, other ABI constants, `REPLICATION_POLICY_HASH`, `CONSENT_GRAMMAR_HASH`, `TRANSFORM_ALGEBRA_HASH`, manifest, `ENVELOPE_VOCABULARY_SHA256` | — | unchanged |
+
+**Riders:** wheel floor `>=52,<53`; re-pin `SERVE_ADVERTISE_POLICY_HASH`; see the Rust surface below.
+
+## Membership by consent (CIRISPersist#955, CIRISConstitution#133: "nobody joins a family or community without their own consent")
+
+A group is founded by its opener alone; everyone else joins by proposal → acceptance (signed by the
+joiner's person; a device may sign) → widening (signed by a founder's person). A pair room keeps its
+end state (both people founders): the opener founds, proposes the peer with the `founder` role, the
+peer's node accepts, and the opener's node widens on the acceptance's arrival.
+
+- **Host API:** `membership::{propose, reply, pending_proposals_for, widen_on_acceptance, widen}`,
+  `MembershipWidener`, `MembershipError::is_retryable`; `chat::{open_pair_room, pair_proposal_for,
+  accept_pair_proposal, decline_pair_proposal}`; set `ReplicationRuntimeConfig::membership_widener` to
+  the opener's PERSON signer. A decline is terminal (`membership_declined`, answered by persist).
+- **Invitations reach strangers (#756):** under first contact a node also serves a proposal naming
+  `owner_of(peer)`, and the invitee's reply to a proposal held here that the peer's person issued;
+  exempt from the Rooted floor (CC rc6 3.1.3.2: readable "without that node holding the group's
+  roster"). `FSD/FIRST_CONTACT.md` §2.4, I22.
+- **Apply classes:** `retry_after_consent` (transient, the `*_unresolved` rules) and
+  `membership_consent_refused` (terminal).
+
+## A group record reaches only its members and live invitees (#758, #762; CC 5.4.6)
+
+v52's opener-only founding made edge advertise a founder's groups; on the public record plane that
+told every peer a private group existed. A Community/Family record now reaches a peer only when its
+person is a live member or the invitee of a live proposal held here; everyone else is withheld as
+`group_record_not_member_or_invitee`. **Public groups are exempt** and reach every node as before:
+communities with subkind `infrastructure`, the accord/charter family, and the configured WA family
+(`replication::public_group::is_public_group`, the stand-in for persist v53's
+`replication_audience::is_public_group`), so trust-root resolution is unaffected. The membership
+planes (widening/revocation/listing) are unchanged pending persist's `may_receive` (CIRISEdge#761).
+§2.5, I23.
+
+## Files
+
+- **Receipts for every file (#755):** the STH comes from persist's `produce_stream_sth` (the one
+  place edge builds it); inline files use `inline_blob_stream_id` (one leaf), so every file is
+  receiptable; `FileRow::received_by` reports when (`list_stored_delivery_receipts_for`).
+- **Family files over the wire (#759, #736):** a family's files cross to the other members' devices
+  through the real puller, delivered never discovered (no `holds_bytes`), a non-family node served
+  nothing; persist #960 (v52) resolves family audience from the roster. Edge fixes found on the way:
+  `BlobMeaning::serve_scope` judges a crossed file by its widening row, not the author's `self` row
+  (CIRISServer's `chunk_scope` has the same bug; switch to it); `PublishedFile::unresolved` names
+  members with no device.
+- **Batched adopt (#765):** the DAG pull adopts through persist's `adopt_sealed_chunks`
+  (`PullConfig::dag_adopt_batch_chunks`, default 16). Adopt time per chunk is flat across a 2 GiB
+  stream (table on CIRISPersist#957).
+- **Linear serving (#770, #766):** the chunk-of-file check uses a bounded per-file cache instead of
+  listing the stream per chunk (645 → 30 ms/chunk at 2 GiB).
+- **Measured** (release, two nodes on loopback, ratio to a raw leviculum transfer on the same link):
+  256 MiB **1.87×**, 2 GiB **2.16×** (6.4 MB/s; v36.0.0 was 36.6×). The rest is the serving node's
+  per-chunk signing and shipping (CIRISEdge#742, the chunk-bytes encoding, a coordinated wire cut).
+
+## Also
+
+- **Revocations (#784):** a digest-only revocation clears the key-keyed caches wholesale.
+- **Mesh harness (#769, #767):** stands up under persist's W5 again (39 → 1 contract violation); the
+  remaining gap, blob pulls in the harness, is #768.
+- Follow-ups filed: #761 (membership planes' audience, persist ruling), #771 (a withdrawn DAG's chunks
+  stay servable), #742 (chunk-bytes encoding).
+
+## Rust surface (why MAJOR)
+
+- persist v52's API (ABI 7; the revocation subject digest; new trait methods, none implemented by edge).
+- New `membership` module and `chat` pair-room functions; `ReplicationRuntimeConfig::membership_widener`.
+- `WithholdReason` gains `GroupRecordNotMemberOrInvitee` (non-exhaustive since v37.0.0).
+- `receipts::stream_sth_for_file` builds through persist; `Received::at` is a `DateTime`.
+- `PullConfig::dag_adopt_batch_chunks`; `BlobPuller::pull_inline_with`; `PublishedFile::unresolved`;
+  `BlobMeaning::{referencing_rows, serve_scope}`.
+
 # v37.1.0 — a relay serves a third party's announced owner-binding at first contact (CC 5.4.6 public roster)
 
 **2026-09-30** (CIRISEdge#752 → PR #753; for CIRISServer#701). **MINOR** from v37.0.0. persist `v51.3.0`

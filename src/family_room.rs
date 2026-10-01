@@ -151,8 +151,9 @@ pub async fn snapshot(
 mod tests {
     use super::*;
     use crate::replication::bridge::tests::{
-        fixture_family_founded, register_fixture_keys, seed_owner_binding, sign_family_fixture,
-        sign_family_membership_revocation_fixture, sign_family_membership_widening_fixture,
+        fixture_consent, fixture_family_founded, register_fixture_keys, seed_owner_binding,
+        sign_family_fixture, sign_family_membership_revocation_fixture,
+        sign_family_membership_widening_fixture,
     };
     use crate::self_room::{decide, HeldRoom, SelfRoomAction};
     use ciris_persist::federation::identity_type;
@@ -248,6 +249,16 @@ mod tests {
         let b = backend().await;
         let lens = crate::contact::PersistLens::new(&b);
         let before = roster(&b, FAMILY, &lens).await.unwrap();
+        // persist v52.0.0 (#955) — carol consents before she is added.
+        fixture_consent(
+            &b,
+            crate::membership::GroupScope::Family,
+            FAMILY,
+            "person-alice",
+            "person-carol",
+            None,
+        )
+        .await;
         b.put_family_membership_widening(sign_family_membership_widening_fixture(
             "person-alice",
             FamilyMembershipWidening {
@@ -318,6 +329,15 @@ mod tests {
     async fn a_member_with_no_node_yet_is_unresolved_not_guessed() {
         let b = backend().await;
         register_fixture_keys(&b, &[("person-dave", identity_type::USER)]).await;
+        fixture_consent(
+            &b,
+            crate::membership::GroupScope::Family,
+            FAMILY,
+            "person-alice",
+            "person-dave",
+            None,
+        )
+        .await;
         b.put_family_membership_widening(sign_family_membership_widening_fixture(
             "person-alice",
             FamilyMembershipWidening {

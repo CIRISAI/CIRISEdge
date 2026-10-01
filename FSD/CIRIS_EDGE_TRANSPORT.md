@@ -184,7 +184,9 @@ under a constant, resolved once per plane
   (`bridge.rs:1750`), `FamilyMembershipRevocation` +
   `CommunityMembershipRevocation` (`bridge.rs:2811`);
 - `Cohort` — `Family`, `Community`, `LocationProof` (rows filtered to the
-  cohort roster, `bridge.rs:2806`);
+  cohort roster, `bridge.rs:2806`); `Family` and `Community` are further gated
+  **per peer** (CIRISEdge#758, §6): a group record reaches only the group's live
+  members and the invitees of a live proposal held here;
 - unfiltered public-operational — `Organization`, `OrgMembership`,
   `PartnerRecord` (`in_scope = |_| true`, `bridge.rs:2936`);
 - not advertised at all — `AccordQuorumEvidence` (the cursor plane, §2).
@@ -1052,7 +1054,7 @@ Absent or `false`, behaviour is byte-for-byte what it was.
 
 ## 6. Serve & consent — consent *is* routing (Attestation plane only)
 
-Only the `Attestation` plane is consent-gated. One other gate is per-recipient:
+Only the `Attestation` plane is consent-gated. Two other gates are per-recipient. The first:
 **the identity planes follow the node's announce state (CIRISEdge#682, CC 5.4.6,
 CIRISServer#655).** An owned node's `IdentityOccurrence` and `TransportDestination`
 rows are served to every peer only when the node is *announced* — a live
@@ -1068,6 +1070,20 @@ Decided from persist state, memoized per sweep (the owner memo's TTL and
 invalidation events, plus the widening). `FSD/FIRST_CONTACT.md` §2.1 is how it
 composes with the bootstrap kinds. `Key` is not gated: a key record discloses no
 route.
+
+**The second per-recipient gate: the group record planes (CIRISEdge#758, CC 5.4.6).**
+A `Family` or `Community` record is served to a peer only when the peer's person
+(`owner_of(peer)`, the peer itself when unowned) is a live member of that group
+(persist's `_active` membership reads) or is named in the `subject_key_ids` of a
+live `membership:proposal:v1` into it held on this node (unexpired, not declined,
+not withdrawn): the record travels with the invitation. Anyone else is booked
+`group_record_not_member_or_invitee`. CC 5.4.6 hides a group's existence,
+membership and `querier → invitee` edges from outsiders; a record offered to every
+peer disclosed all three. The gate holds on the per-peer advertise and the
+direct-fetch twin (the record planes answer no subject Pull), at every reach
+including first contact. `FSD/FIRST_CONTACT.md` §2.5 is the rule and I23 its
+witness; the manifest's `serve` cell for the two planes states it
+(`SERVE_ADVERTISE_POLICY_HASH`).
 
 The `SelfOwn` publish set itself may be chosen per plane (CIRISEdge#678): a host
 that relays a third party's anchored key record but has no onward-flow principle on

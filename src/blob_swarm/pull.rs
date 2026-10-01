@@ -200,7 +200,31 @@ pub struct PullConfig {
     /// admitted, so a budget below one chunk degrades to `K = 1` rather than
     /// to a stall.
     pub dag_bytes_in_flight: u64,
+    /// CIRISPersist#957 — **the most chunks one adopt hands persist** in a
+    /// sealed-DAG pull. Verified chunks wait for a batch and go through
+    /// `Engine::adopt_sealed_chunks` in one writer transaction. A batch is
+    /// flushed when it holds this many chunks or persist's byte bound
+    /// (`MAX_BATCH_BYTES`), when no fetch is in flight (the run drained, the
+    /// byte budget is full, or the pull ended or stopped), and at the end.
+    /// Chunks waiting for a batch still count against `dag_bytes_in_flight`
+    /// until the adopt returns. The value is clamped to `1..=MAX_CHUNKS_PER_BATCH`.
+    /// At `1`, each chunk is adopted as it arrives, concurrently, which is the
+    /// v36.1.0 behaviour. Above `1`, one batch is adopted at a time while the
+    /// lanes keep fetching. The default comes from the curve in
+    /// `tests/bigfile_739.rs` (see [`DEFAULT_DAG_ADOPT_BATCH_CHUNKS`]).
+    pub dag_adopt_batch_chunks: usize,
 }
+
+/// CIRISPersist#957 — the default adopt batch (see
+/// [`PullConfig::dag_adopt_batch_chunks`]), read off the 256 MiB curve in
+/// `tests/bigfile_739.rs` at the default `K` and byte budget. Per-chunk adopt
+/// time falls from 90 ms (batch of 1, eight at once) to 8.7 ms at 16, and the
+/// pull is fastest at 16. At 32 and 64 the waiting and adopting chunks take
+/// the whole default budget (8 MiB, about 31 chunks of 256 KiB). The lanes
+/// then stop fetching while a batch fills or commits, and the pull slows to
+/// 1.3× and 3.1× the time at 16. So the default is about half the budget's
+/// chunk count at `files::publish`'s segment size.
+pub const DEFAULT_DAG_ADOPT_BATCH_CHUNKS: usize = 16;
 
 /// CIRISEdge#739 — the default `K` (see [`PullConfig::dag_chunks_in_flight`]).
 pub const DEFAULT_DAG_CHUNKS_IN_FLIGHT: usize = 8;
@@ -224,6 +248,7 @@ impl Default for PullConfig {
             consent: super::store_gate::OperatorStoreConsent::default(),
             dag_chunks_in_flight: DEFAULT_DAG_CHUNKS_IN_FLIGHT,
             dag_bytes_in_flight: DEFAULT_DAG_BYTES_IN_FLIGHT,
+            dag_adopt_batch_chunks: DEFAULT_DAG_ADOPT_BATCH_CHUNKS,
         }
     }
 }
@@ -900,6 +925,47 @@ pub fn pipeline_admits(
     in_flight < lanes.max(1) && bytes_in_flight.saturating_add(stored) <= budget
 }
 
+/// CIRISPersist#957 — **is the waiting run of verified chunks ready to go to
+/// persist as one batch?** `pending` chunks of `pending_bytes` envelope bytes
+/// are waiting and `fetching` requests are still out. Ready when the batch is
+/// full (`batch_max` chunks, or persist's `MAX_BATCH_BYTES`), or when nothing
+/// is being fetched: the run drained, the byte budget is full, or the pull
+/// ended or stopped. Waiting for a fuller batch would then wait forever. Pure,
+/// so the rule is a test.
+#[must_use]
+pub fn adopt_batch_ready(
+    pending: usize,
+    pending_bytes: usize,
+    fetching: usize,
+    batch_max: usize,
+) -> bool {
+    use ciris_persist::federation::blobs::MAX_BATCH_BYTES;
+    pending > 0
+        && (fetching == 0 || pending >= batch_max.max(1) || pending_bytes >= MAX_BATCH_BYTES)
+}
+
+/// CIRISPersist#957 — **how many of the waiting chunks (front first) one
+/// batch takes**: at most `batch_max` (clamped to persist's
+/// `MAX_CHUNKS_PER_BATCH`) and at most persist's `MAX_BATCH_BYTES` of
+/// envelopes, and always at least one, so a chunk larger than the byte bound
+/// still goes (persist refuses it by name rather than the pull stalling).
+/// Pure, so the rule is a test.
+#[must_use]
+pub fn adopt_batch_take(sizes: &[usize], batch_max: usize) -> usize {
+    use ciris_persist::federation::blobs::{MAX_BATCH_BYTES, MAX_CHUNKS_PER_BATCH};
+    let cap = batch_max.clamp(1, MAX_CHUNKS_PER_BATCH);
+    let mut bytes = 0usize;
+    let mut n = 0usize;
+    for &s in sizes.iter().take(cap) {
+        if n > 0 && bytes.saturating_add(s) > MAX_BATCH_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(s);
+        n += 1;
+    }
+    n
+}
+
 /// One chunk the sealed-DAG walk still has to fetch: its position, its
 /// ciphertext sha, its plaintext size (CIRISEdge#739).
 struct DagWant {
@@ -914,8 +980,6 @@ enum LaneStop {
     Fetch(DagFetchStop),
     /// It arrived, but not at the length the manifest implies.
     Length { got: usize, expected: u64 },
-    /// Persist refused or failed the adopt.
-    Adopt(String),
 }
 
 /// Why one address did not arrive verified.
@@ -1374,7 +1438,6 @@ where
 
         // The binding the adopt door will need, decided BEFORE any request:
         // a row that cannot be adopted is not worth a fetch.
-        let tier = meaning.pointer().map_or(CryptoTier::Plaintext, |p| p.tier);
         if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning, Some(&self.edge.metrics())) {
             return refused;
         }
@@ -1442,17 +1505,135 @@ where
             return refused;
         }
 
-        // Store, through the door the gate's verdict names.
-        match tier {
+        self.store_whole(row, sha, &meaning, bytes, disposition)
+            .await
+    }
+
+    /// **Store a whole (inline) blob**, through the door the gate's verdict
+    /// names, then the inline file's receipt hook (CIRISEdge#738, CC 5.3.3.6):
+    /// a file row's inline bytes, once stored, are receipted exactly as a
+    /// promoted DAG is. The one inline call site of
+    /// [`crate::receipts::on_file_pulled`].
+    async fn store_whole(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        meaning: &BlobMeaning,
+        bytes: Vec<u8>,
+        disposition: StoreDisposition,
+    ) -> PullOutcome {
+        let tier = meaning.pointer().map_or(CryptoTier::Plaintext, |p| p.tier);
+        let outcome = match tier {
             CryptoTier::Plaintext => {
-                self.store_plaintext(row, sha, &meaning, bytes, disposition)
+                self.store_plaintext(row, sha, meaning, bytes, disposition)
                     .await
             }
             CryptoTier::CommunityDek | CryptoTier::InvisibleEncrypted => {
-                self.adopt_sealed(row, sha, &meaning, tier, &bytes, disposition)
+                self.adopt_sealed(row, sha, meaning, tier, &bytes, disposition)
                     .await
             }
+        };
+        crate::receipts::on_file_pulled(
+            &self.engine,
+            &*self.backend,
+            &self.local_key_id,
+            row,
+            &outcome,
+            &self.edge.metrics(),
+        )
+        .await;
+        outcome
+    }
+
+    /// **The whole-blob pull with a caller's fetcher** (CIRISEdge#738) — the
+    /// inline counterpart of [`Self::pull_dag_with`]: trust (the row's
+    /// meaning), may (the store gate, asked of `fetch`'s holders), the one
+    /// fetch verified against the address, the declared size, then the store
+    /// and the inline receipt hook [`Self::pull_one`] runs. For a deployment
+    /// whose transport is not the swarm's, and for the store-level witness.
+    /// A pointer carrying `stream_id` is [`Self::pull_dag_with`]'s and is
+    /// refused here by name. Dedupes on `sha` against every other pull.
+    pub async fn pull_inline_with(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        fetch: &dyn DagByteFetch,
+    ) -> PullOutcome {
+        {
+            let Ok(mut set) = self.in_flight.lock() else {
+                return PullOutcome::InFlight;
+            };
+            if !set.insert(sha) {
+                return PullOutcome::InFlight;
+            }
         }
+        let outcome = self.pull_inline_inner(row, sha, fetch).await;
+        if let Ok(mut set) = self.in_flight.lock() {
+            set.remove(&sha);
+        }
+        outcome
+    }
+
+    async fn pull_inline_inner(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        fetch: &dyn DagByteFetch,
+    ) -> PullOutcome {
+        let blob_hex = hex::encode(sha);
+        match self.backend.has_blob(&sha).await {
+            Ok(true) => return PullOutcome::AlreadyHeld,
+            Ok(false) => {}
+            Err(e) => return PullOutcome::StoreFailed(format!("has_blob: {e}")),
+        }
+        let (meaning, _author) = match self.project(row, sha, 0).await {
+            Ok(m) => m,
+            Err(outcome) => return outcome,
+        };
+        if meaning.pointer().is_some_and(|p| p.stream_id.is_some()) {
+            return PullOutcome::Refused(
+                "pull_inline_with: the pointer names a stream_id — a chunk DAG is                  pull_dag_with's (CIRISEdge#717)"
+                    .into(),
+            );
+        }
+        let metrics = self.edge.metrics();
+        if let Some(refused) = epoch_refusal(row, &blob_hex, &meaning, Some(&metrics)) {
+            return refused;
+        }
+        let disposition = match super::store_admission_with(
+            self.policy.as_ref(),
+            sha,
+            Some(&meaning),
+            fetch.holders(),
+        )
+        .await
+        {
+            Ok(d) => d,
+            Err(SwarmError::StoreRefused { refusal, axis, .. }) => {
+                return PullOutcome::Refused(format!("axis {axis}: {refusal:?}"));
+            }
+            Err(e) => return PullOutcome::Refused(e.to_string()),
+        };
+        let bytes = match self.fetch_verified(fetch, sha).await {
+            Ok(b) => b,
+            Err(DagFetchStop::Transport(reason)) => {
+                return PullOutcome::FetchFailed {
+                    reason,
+                    retrying: false,
+                }
+            }
+            Err(DagFetchStop::HashMismatch { got }) => {
+                return PullOutcome::Refused(format!(
+                    "pull_inline_with: the fetched body hashes to {}, not {blob_hex}",
+                    hex::encode(got)
+                ))
+            }
+        };
+        if let Some(refused) = size_refusal(row, &blob_hex, &meaning, bytes.len(), Some(&metrics)) {
+            return refused;
+        }
+        self.store_whole(row, sha, &meaning, bytes, disposition)
+            .await
     }
 
     /// TRUST — what the signed row says these bytes are, with the author
@@ -1640,8 +1821,8 @@ where
                     .await
             }
         };
-        // CIRISEdge#738 — the one receipt hook: acts on `Stored` only.
-        crate::receipts::on_dag_pulled(
+        // CIRISEdge#738 — the DAG's receipt hook: acts on `Stored` only.
+        crate::receipts::on_file_pulled(
             &self.engine,
             &*self.backend,
             &self.local_key_id,
@@ -1883,28 +2064,43 @@ where
         metrics.add_blob_dag_chunks("skipped_held", skipped_held);
 
         // ── the pipeline ── K lanes in flight, under a byte budget; each lane
-        // fetches ONE chunk, checks it, and adopts it (CIRISEdge#739,
-        // §6.7.5). The adopt is inside the lane, not behind the loop: with it
-        // on the loop, every adopt stalled the refill, and at K = 16 the
-        // serial adopts were most of the wall clock. The lanes are futures on
-        // THIS task (never spawned). On a stop (a refusal, a fetch that did
-        // not arrive, a failed adopt) no further lane is admitted and the
-        // lanes already in flight DRAIN — each adopts what arrives verified —
-        // so everything the pull paid for is kept for the resume; the FIRST
-        // stop names the outcome. A killed pull (the task dropped) cancels
-        // every lane instead, and a chunk whose adopt had not returned is
-        // then either absent (the resume fetches it) or held at its position
-        // (the resume skips it) — never held twice, since a position holds
-        // one row.
+        // fetches ONE chunk and checks it (CIRISEdge#739, §6.7.5). Verified
+        // chunks wait for an adopt batch (CIRISPersist#957): one
+        // `adopt_sealed_chunks` per batch, one writer transaction, while the
+        // lanes keep fetching. At a batch of one, each chunk is adopted as it
+        // arrives, concurrently (the v36.1.0 shape). Lanes and adopts are
+        // futures on THIS task (never spawned). A waiting or adopting chunk
+        // still counts against the byte budget, so the pull's memory bound is
+        // unchanged. On a stop (a refusal, a fetch that did not arrive, a
+        // refused adopt) no further lane is admitted, the lanes in flight
+        // DRAIN, and every chunk that arrived verified is still adopted, so
+        // everything the pull paid for is kept for the resume. The FIRST stop
+        // names the outcome. Persist commits a batch's accepted items even
+        // when others in it are refused, so a refused chunk is named and the
+        // rest land. A killed pull (the task dropped) cancels every lane and
+        // adopt instead. A chunk whose adopt had not returned is then either
+        // absent (the resume fetches it) or held at its position (the resume
+        // skips it), never held twice, since a position holds one row.
         let lanes = self.config.dag_chunks_in_flight.max(1);
         let budget = self.config.dag_bytes_in_flight;
+        let batch_max = self
+            .config
+            .dag_adopt_batch_chunks
+            .clamp(1, ciris_persist::federation::blobs::MAX_CHUNKS_PER_BATCH);
+        // One batch at a time: a second concurrent batch would only queue on
+        // persist's one writer. At a batch of one, up to K adopts run at once.
+        let adopters = if batch_max == 1 { lanes } else { 1 };
         let overhead = AT_REST_ENVELOPE_OVERHEAD as u64;
         let stream = view.stream_id.as_str();
         let provenance = &provenance;
         let engine = &self.engine;
-        let mut in_flight = FuturesUnordered::new();
+        let mut fetching = FuturesUnordered::new();
+        let mut adopting = FuturesUnordered::new();
+        let mut pending: Vec<(DagWant, Vec<u8>)> = Vec::new();
+        let mut pending_bytes: usize = 0;
         let mut bytes_in_flight: u64 = 0;
         let mut peak: usize = 0;
+        let mut batch_peak: usize = 0;
         let mut next = wanted.into_iter().peekable();
         let mut stop: Option<PullOutcome> = None;
         loop {
@@ -1913,99 +2109,170 @@ where
                 .filter(|_| stop.is_none())
                 .map(|w| w.size.saturating_add(overhead))
             {
-                if !pipeline_admits(in_flight.len(), lanes, bytes_in_flight, stored, budget) {
+                if !pipeline_admits(fetching.len(), lanes, bytes_in_flight, stored, budget) {
                     break;
                 }
                 let Some(w) = next.next() else { break };
                 bytes_in_flight = bytes_in_flight.saturating_add(stored);
-                in_flight.push(async move {
+                fetching.push(async move {
                     let started = Instant::now();
                     let fetched = self.fetch_verified(fetch, w.sha).await;
                     let fetch_wait = started.elapsed();
-                    let bytes = match fetched {
-                        Ok(b) => b,
-                        Err(stop) => return (w, fetch_wait, None, Err(LaneStop::Fetch(stop))),
+                    let checked = match fetched {
+                        Err(stop) => Err(LaneStop::Fetch(stop)),
+                        // The stored body is the plaintext plus persist's
+                        // envelope — the arithmetic `declared_stored_len`
+                        // uses for a whole blob; persist's adopt checks the
+                        // envelope's own length again behind this.
+                        Ok(bytes) if bytes.len() as u64 != w.size.saturating_add(overhead) => {
+                            Err(LaneStop::Length {
+                                got: bytes.len(),
+                                expected: w.size.saturating_add(overhead),
+                            })
+                        }
+                        Ok(bytes) => Ok(bytes),
                     };
-                    // The stored body is the plaintext plus persist's
-                    // envelope — the arithmetic `declared_stored_len` uses for
-                    // a whole blob; persist's adopt checks the envelope's own
-                    // length again behind this.
-                    let expected = w.size.saturating_add(overhead);
-                    if bytes.len() as u64 != expected {
-                        let got = bytes.len();
-                        return (w, fetch_wait, None, Err(LaneStop::Length { got, expected }));
-                    }
-                    let adopting = Instant::now();
+                    (w, fetch_wait, checked)
+                });
+            }
+            peak = peak.max(fetching.len());
+            while adopting.len() < adopters
+                && adopt_batch_ready(pending.len(), pending_bytes, fetching.len(), batch_max)
+            {
+                let sizes: Vec<usize> = pending.iter().map(|(_, b)| b.len()).collect();
+                let take = adopt_batch_take(&sizes, batch_max);
+                let batch: Vec<(DagWant, Vec<u8>)> = pending.drain(..take).collect();
+                pending_bytes -= sizes[..take].iter().sum::<usize>();
+                batch_peak = batch_peak.max(batch.len());
+                adopting.push(async move {
+                    let items: Vec<ciris_persist::federation::AdoptChunkItem<'_>> = batch
+                        .iter()
+                        .map(|(w, bytes)| ciris_persist::federation::AdoptChunkItem {
+                            seq: w.seq,
+                            envelope: bytes,
+                            plaintext_size: w.size,
+                        })
+                        .collect();
+                    let started = Instant::now();
                     let adopted = engine
-                        .adopt_sealed_chunk(
+                        .adopt_sealed_chunks(
                             stream,
-                            w.seq,
-                            &bytes,
+                            &items,
                             crate::group_content::persist_store::STREAM_EPOCH,
-                            w.size,
                             provenance.clone(),
                         )
                         .await
-                        .map(|_| ())
-                        .map_err(|e| LaneStop::Adopt(e.to_string()));
-                    (w, fetch_wait, Some(adopting.elapsed()), adopted)
+                        .map_err(|e| e.to_string());
+                    let elapsed = started.elapsed();
+                    drop(items);
+                    let wants: Vec<DagWant> = batch.into_iter().map(|(w, _)| w).collect();
+                    (wants, elapsed, adopted)
                 });
             }
-            peak = peak.max(in_flight.len());
-            let Some((w, fetch_wait, adopt, result)) = in_flight.next().await else {
-                break;
-            };
-            bytes_in_flight = bytes_in_flight.saturating_sub(w.size.saturating_add(overhead));
-            metrics.add_blob_dag_phase("dag_fetch_wait", fetch_wait);
-            if let Some(adopt) = adopt {
-                metrics.add_blob_dag_phase("dag_adopt", adopt);
+            tokio::select! {
+                Some((w, fetch_wait, checked)) = fetching.next(), if !fetching.is_empty() => {
+                    metrics.add_blob_dag_phase("dag_fetch_wait", fetch_wait);
+                    let stopped = match checked {
+                        Ok(bytes) => {
+                            // Verified: it waits for a batch, even while the
+                            // pull drains after a stop.
+                            pending_bytes += bytes.len();
+                            pending.push((w, bytes));
+                            continue;
+                        }
+                        Err(_) if stop.is_some() => None,
+                        Err(LaneStop::Fetch(DagFetchStop::Transport(reason))) => {
+                            Some(self.dag_fetch_failed(
+                                row,
+                                sha,
+                                attempts,
+                                &format!("chunk seq {}", w.seq),
+                                &reason,
+                            ))
+                        }
+                        Err(LaneStop::Fetch(DagFetchStop::HashMismatch { got })) => {
+                            Some(self.dag_refused(
+                                row,
+                                &blob_hex,
+                                DagPullRefusal::ChunkMismatch {
+                                    seq: w.seq,
+                                    detail: format!(
+                                        "the bytes served for {} hash to {}",
+                                        hex::encode(w.sha),
+                                        hex::encode(got)
+                                    ),
+                                },
+                            ))
+                        }
+                        Err(LaneStop::Length { got, expected }) => Some(self.dag_refused(
+                            row,
+                            &blob_hex,
+                            DagPullRefusal::ChunkMismatch {
+                                seq: w.seq,
+                                detail: format!(
+                                    "{got} bytes arrived but the manifest's size {} implies {expected}",
+                                    w.size
+                                ),
+                            },
+                        )),
+                    };
+                    bytes_in_flight =
+                        bytes_in_flight.saturating_sub(w.size.saturating_add(overhead));
+                    if stop.is_none() {
+                        stop = stopped;
+                    }
+                }
+                Some((wants, elapsed, adopted)) = adopting.next(), if !adopting.is_empty() => {
+                    for w in &wants {
+                        bytes_in_flight =
+                            bytes_in_flight.saturating_sub(w.size.saturating_add(overhead));
+                    }
+                    metrics.add_blob_dag_phase("dag_adopt", elapsed);
+                    metrics.add_blob_dag_chunks("adopt_batches", 1);
+                    tracing::debug!(
+                        target: "ciris_edge::blob_swarm::dag_adopt",
+                        first_seq = wants.iter().map(|w| w.seq).min().unwrap_or(0),
+                        chunks = wants.len() as u64,
+                        elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                        "DAG pull: one adopt batch returned (CIRISPersist#957)"
+                    );
+                    // Either the batch was refused whole (nothing written),
+                    // or each item answered in its slot, in order.
+                    let answers: Vec<Result<(), String>> = match adopted {
+                        Ok(per_item) => per_item
+                            .into_iter()
+                            .map(|r| r.map(|_| ()).map_err(|e| e.to_string()))
+                            .collect(),
+                        Err(e) => wants.iter().map(|_| Err(e.clone())).collect(),
+                    };
+                    for (w, answer) in wants.iter().zip(answers) {
+                        match answer {
+                            Ok(()) => metrics.add_blob_dag_chunks("adopted", 1),
+                            Err(e) => {
+                                tracing::warn!(
+                                    blob = %blob_hex,
+                                    stream_id = %stream,
+                                    seq = w.seq,
+                                    error = %e,
+                                    "DAG pull: persist refused a chunk's adopt"
+                                );
+                                if stop.is_none() {
+                                    stop = Some(PullOutcome::StoreFailed(format!(
+                                        "adopt chunk seq {}: {e}",
+                                        w.seq
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+                else => break,
             }
-            let stopped = match result {
-                Ok(()) => {
-                    metrics.add_blob_dag_chunks("adopted", 1);
-                    continue;
-                }
-                // A later lane's stop, while draining: the first stop names
-                // the outcome (and alone books its retry or its refusal).
-                Err(_) if stop.is_some() => continue,
-                Err(LaneStop::Fetch(DagFetchStop::Transport(reason))) => self.dag_fetch_failed(
-                    row,
-                    sha,
-                    attempts,
-                    &format!("chunk seq {}", w.seq),
-                    &reason,
-                ),
-                Err(LaneStop::Fetch(DagFetchStop::HashMismatch { got })) => self.dag_refused(
-                    row,
-                    &blob_hex,
-                    DagPullRefusal::ChunkMismatch {
-                        seq: w.seq,
-                        detail: format!(
-                            "the bytes served for {} hash to {}",
-                            hex::encode(w.sha),
-                            hex::encode(got)
-                        ),
-                    },
-                ),
-                Err(LaneStop::Length { got, expected }) => self.dag_refused(
-                    row,
-                    &blob_hex,
-                    DagPullRefusal::ChunkMismatch {
-                        seq: w.seq,
-                        detail: format!(
-                            "{got} bytes arrived but the manifest's size {} implies {expected}",
-                            w.size
-                        ),
-                    },
-                ),
-                Err(LaneStop::Adopt(e)) => {
-                    PullOutcome::StoreFailed(format!("adopt chunk seq {}: {e}", w.seq))
-                }
-            };
-            stop = Some(stopped);
         }
         metrics.max_blob_dag_chunks("in_flight_peak", peak as u64);
-        drop(in_flight);
+        metrics.max_blob_dag_chunks("adopt_batch_peak", batch_peak as u64);
+        drop(fetching);
+        drop(adopting);
         if let Some(outcome) = stop {
             return outcome;
         }
@@ -2340,6 +2607,50 @@ mod tests {
             DEFAULT_DAG_CHUNKS_IN_FLIGHT as u64
                 * ciris_persist::federation::blobs::DEFAULT_INLINE_BYTES_CAP as u64
         );
+    }
+
+    /// CIRISPersist#957 — a batch goes when it is full by count or by
+    /// persist's byte bound, or when nothing more is being fetched (never a
+    /// wait for chunks that are not coming), and never empty.
+    #[test]
+    fn an_adopt_batch_goes_when_full_or_when_the_run_drains_and_never_empty() {
+        use ciris_persist::federation::blobs::MAX_BATCH_BYTES;
+        let chunk = 256 * 1024 + 44;
+        // Nothing waiting: never a batch, whatever else holds.
+        assert!(!adopt_batch_ready(0, 0, 0, 16));
+        // Lanes still fetching and the batch not full: wait.
+        assert!(!adopt_batch_ready(15, 15 * chunk, 8, 16));
+        // Full by count.
+        assert!(adopt_batch_ready(16, 16 * chunk, 8, 16));
+        // Full by persist's byte bound before the count.
+        assert!(adopt_batch_ready(3, MAX_BATCH_BYTES, 8, 64));
+        // The run drained (the end, a stop, or the byte budget full): go now.
+        assert!(adopt_batch_ready(1, chunk, 0, 16));
+        // A batch of one goes as each chunk arrives; 0 behaves as 1.
+        assert!(adopt_batch_ready(1, chunk, 8, 1));
+        assert!(adopt_batch_ready(1, chunk, 8, 0));
+    }
+
+    /// CIRISPersist#957 — a batch takes the front of the run, within persist's
+    /// caps (`MAX_CHUNKS_PER_BATCH`, `MAX_BATCH_BYTES`), and always at least
+    /// one chunk.
+    #[test]
+    fn an_adopt_batch_respects_persists_caps_and_always_takes_one() {
+        use ciris_persist::federation::blobs::{MAX_BATCH_BYTES, MAX_CHUNKS_PER_BATCH};
+        let chunk = 256 * 1024 + 44;
+        assert_eq!(adopt_batch_take(&[chunk; 20], 16), 16);
+        assert_eq!(adopt_batch_take(&[chunk; 5], 16), 5);
+        // Clamped to persist's count cap, and 0 behaves as 1.
+        assert_eq!(adopt_batch_take(&[16; 200], 1000), MAX_CHUNKS_PER_BATCH);
+        assert_eq!(adopt_batch_take(&[chunk; 3], 0), 1);
+        // The byte cap: 1 MiB envelopes stop before 32 MiB.
+        let big = 1024 * 1024 + 44;
+        let n = adopt_batch_take(&[big; 64], 64);
+        assert_eq!(n, MAX_BATCH_BYTES / big);
+        assert!(n * big <= MAX_BATCH_BYTES);
+        // One chunk over the byte cap still goes alone (persist names it).
+        assert_eq!(adopt_batch_take(&[MAX_BATCH_BYTES + 1, chunk], 16), 1);
+        assert_eq!(adopt_batch_take(&[], 16), 0);
     }
 
     const SHA: [u8; 32] = [0xAB; 32];

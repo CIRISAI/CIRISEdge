@@ -104,6 +104,10 @@ pub mod identity;
 pub mod key_boundary;
 pub mod log_throttle;
 pub mod manifest;
+/// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — nobody joins a
+/// family or community without their own consent: proposal → acceptance →
+/// widening, as producers and host calls.
+pub mod membership;
 pub mod messages;
 // v6.0.0 (CIRISEdge#175, FSD §3.3 / §3.5 / §6) — substrate-tier MLS
 // state for scope-native privacy. Distinct from
