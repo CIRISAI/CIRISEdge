@@ -22,10 +22,18 @@ pub enum GroupContentError {
     /// Distinct from every other arm because the remedy is membership, not
     /// a retry: this is what a non-member — or a member excluded at write
     /// time for carrying no `encryption_pubkeys` — sees.
-    #[error("not granted: this viewer holds no key for {sha256_hex}")]
+    #[error(
+        "not granted: this viewer holds no key for {sha256_hex}{}",
+        chunk.as_ref().map(|c| format!(" (chunk seq {} = {})", c.seq, c.sha256_hex)).unwrap_or_default()
+    )]
     NotGranted {
         /// Hex at-rest sha the read targeted.
         sha256_hex: String,
+        /// CIRISEdge#779 — when the read was a chunk DAG's and the refusal
+        /// was one of its CHUNKS (not the manifest), the first chunk in the
+        /// range this viewer holds no wrap for. `None` for a whole blob, a
+        /// refused manifest, or a refusal the store could not attribute.
+        chunk: Option<RefusedChunk>,
     },
     /// The bytes are not held here.
     #[error("not held: {sha256_hex}")]
@@ -122,6 +130,18 @@ pub enum GroupContentError {
     /// Anything else the substrate reported.
     #[error("substrate: {0}")]
     Substrate(String),
+}
+
+/// CIRISEdge#779 — the chunk of a DAG a read was refused at: its position
+/// and its own at-rest address (over its ciphertext), which is what the
+/// key_grant that would open it names. A refusal naming only the file's
+/// address sent the field looking for the wrong row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedChunk {
+    /// The chunk's position in its stream.
+    pub seq: u64,
+    /// Hex at-rest sha of the chunk row.
+    pub sha256_hex: String,
 }
 
 /// **A chunk DAG's layout, for a viewer** (CIRISEdge#737,

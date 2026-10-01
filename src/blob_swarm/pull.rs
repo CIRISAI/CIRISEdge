@@ -318,6 +318,12 @@ pub enum PullOutcome {
     /// has not arrived (the key follows the bytes, in either order — persist
     /// I61/I62). Queued for retry; the manifest stays held and the retry
     /// resumes from it.
+    ///
+    /// CIRISEdge#779 — also the state of a `self` / `family` DAG whose every
+    /// chunk is HELD but some chunk's own wrap to this node has not arrived:
+    /// it is not promoted, reported `Stored` or receipted until every chunk
+    /// opens here. A retry that finds fewer chunks waiting than the last one
+    /// does not spend an attempt.
     DagAwaitingKey { attempts: u32, retrying: bool },
 }
 
@@ -1087,6 +1093,12 @@ pub struct BlobPuller<B> {
     config: PullConfig,
     in_flight: Mutex<HashSet<[u8; 32]>>,
     retries: Mutex<HashMap<[u8; 32], Retry>>,
+    /// CIRISEdge#779 — per sealed DAG parked on its chunk keys, how many
+    /// chunks lacked this node's wrap at the last attempt. A retry that finds
+    /// fewer does not spend an attempt: the grants arrive one set per chunk,
+    /// in `seq` order, for minutes on a big file, and a pull that is being
+    /// fed must not give up on the attempt ceiling meant for one that is not.
+    chunk_keys_missing: Mutex<HashMap<[u8; 32], u64>>,
 }
 
 /// CIRISEdge#646 — the `scope:source` label for `blob_pull_sources`. A
@@ -1161,6 +1173,7 @@ where
             config,
             in_flight: Mutex::new(HashSet::new()),
             retries: Mutex::new(HashMap::new()),
+            chunk_keys_missing: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1235,6 +1248,51 @@ where
             .map(|(k, _)| *k)
             .collect();
         due.into_iter().filter_map(|k| retries.remove(&k)).collect()
+    }
+
+    /// CIRISEdge#779 — the `seq`s of `chunks` this node holds no at-rest
+    /// wrap for: one `get_at_rest_grant` per chunk, the read door's own first
+    /// question (metadata only; nothing is unwrapped or opened).
+    async fn chunks_without_wrap(
+        &self,
+        chunks: &[(u64, [u8; 32])],
+    ) -> Result<Vec<u64>, ciris_persist::federation::BlobError> {
+        let mut missing = Vec::new();
+        for (seq, sha) in chunks {
+            if self
+                .backend
+                .get_at_rest_grant(sha, &self.local_key_id)
+                .await?
+                .is_none()
+            {
+                missing.push(*seq);
+            }
+        }
+        Ok(missing)
+    }
+
+    /// CIRISEdge#779 — record that `sha` is parked with `missing` chunk
+    /// wraps outstanding; `true` when that is fewer than at the last attempt
+    /// (or this is the first), i.e. the grants are arriving. Bounded by the
+    /// retry ledger's capacity: past it the memory is dropped, and attempts
+    /// count as they do for every other retry.
+    fn chunk_keys_progressed(&self, sha: [u8; 32], missing: u64) -> bool {
+        let Ok(mut seen) = self.chunk_keys_missing.lock() else {
+            return false;
+        };
+        if seen.len() >= self.config.retry_capacity && !seen.contains_key(&sha) {
+            seen.clear();
+        }
+        match seen.insert(sha, missing) {
+            Some(before) => missing < before,
+            None => true,
+        }
+    }
+
+    fn forget_chunk_keys(&self, sha: [u8; 32]) {
+        if let Ok(mut seen) = self.chunk_keys_missing.lock() {
+            seen.remove(&sha);
+        }
     }
 
     /// Book a retry, bounded. Returns whether it was booked (false when the
@@ -2031,6 +2089,7 @@ where
         // Every chunk's address is read off the view BEFORE the first request,
         // so a malformed manifest is refused with nothing fetched.
         let mut wanted: Vec<DagWant> = Vec::with_capacity(view.chunks.len());
+        let mut addresses: Vec<(u64, [u8; 32])> = Vec::with_capacity(view.chunks.len());
         let mut skipped_held: u64 = 0;
         for c in &view.chunks {
             let mut want = [0u8; 32];
@@ -2043,6 +2102,7 @@ where
                     },
                 );
             }
+            addresses.push((c.seq, want));
             if held_chunks.get(&c.seq) == Some(&want) {
                 skipped_held += 1;
                 continue;
@@ -2275,6 +2335,51 @@ where
         drop(adopting);
         if let Some(outcome) = stop {
             return outcome;
+        }
+
+        // ── keyed ── CIRISEdge#779: every chunk opens as THIS NODE before the
+        // file is promoted, reported Stored and receipted (CC 5.3.3.6). At
+        // `self` / `family` each chunk is sealed under its own DEK, and its
+        // wrap to this node is its own content-axis key_grant set, which
+        // arrives after the bytes and in `seq` order, ~2.4 sets/s in the
+        // field. Promoting on the bytes alone reported a 256 MiB file pulled
+        // with 242 of its 1024 chunks unopenable here; the read stopped at
+        // the first. The question is the read door's own (persist's
+        // `open_stream_chunk_row_for_viewer` asks `get_at_rest_grant` of the
+        // chunk row first), asked as metadata, so nothing is decrypted to
+        // answer it. At `community_dek` the chunks share the manifest's
+        // epoch binding (one provenance per stream, adopted above), so the
+        // manifest opening as this node already answered it.
+        if pointer.tier == CryptoTier::InvisibleEncrypted {
+            let missing = match self.chunks_without_wrap(&addresses).await {
+                Ok(m) => m,
+                Err(e) => return PullOutcome::StoreFailed(format!("get_at_rest_grant: {e}")),
+            };
+            if let Some(first_seq) = missing.first().copied() {
+                let missing = missing.len() as u64;
+                let attempts_spent = if self.chunk_keys_progressed(sha, missing) {
+                    attempts.saturating_sub(1)
+                } else {
+                    attempts
+                };
+                let retrying = self.book_retry(row, sha, attempts_spent);
+                if !retrying {
+                    self.forget_chunk_keys(sha);
+                }
+                tracing::info!(
+                    blob = %blob_hex,
+                    attestation_id = %row.attestation_id,
+                    stream_id = %view.stream_id,
+                    chunk_count = addresses.len() as u64,
+                    missing,
+                    first_seq,
+                    retrying,
+                    "DAG pull: every chunk is held but this node holds no wrap for some yet — \
+                     not promoted, waiting on their key_grant sets (CIRISEdge#779)"
+                );
+                return PullOutcome::DagAwaitingKey { attempts, retrying };
+            }
+            self.forget_chunk_keys(sha);
         }
 
         // ── promoted ── persist checks every chunk row against the manifest.

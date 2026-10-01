@@ -59,8 +59,8 @@ pub mod store;
 pub use persist_store::PersistGroupContentStore;
 pub use store::{
     aad_for_open, aad_for_seal, ChunkExtent, ChunkLayout, ContentReader, Description,
-    GroupContentError, GroupContentStore, OpenRequest, RedescribeRequest, SealRequest,
-    SealedContent, StreamSealRequest,
+    GroupContentError, GroupContentStore, OpenRequest, RedescribeRequest, RefusedChunk,
+    SealRequest, SealedContent, StreamSealRequest,
 };
 
 use serde::{Deserialize, Serialize};

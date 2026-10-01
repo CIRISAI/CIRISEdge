@@ -190,6 +190,46 @@ impl PersistGroupContentStore {
     pub fn engine(&self) -> &ciris_persist::Engine {
         &self.engine
     }
+
+    /// CIRISEdge#779 — the first chunk of the sealed DAG at `sha` covering
+    /// `[start, end_inclusive]` that `viewer_key_id` holds no wrap for, read
+    /// off the manifest's layout. `None` when the manifest itself does not
+    /// open (the refusal is the file's), when every covering chunk is
+    /// wrapped (the refusal was something else), or when it cannot be told.
+    async fn refused_chunk(
+        &self,
+        sha: &[u8; 32],
+        viewer_key_id: &str,
+        aad: &[u8],
+        start: u64,
+        end_inclusive: u64,
+    ) -> Option<super::RefusedChunk> {
+        let view = self
+            .engine
+            .open_sealed_manifest_as(sha, viewer_key_id, Some(aad))
+            .await
+            .ok()?;
+        let mut offset: u64 = 0;
+        for c in &view.chunks {
+            let first = offset;
+            offset = offset.saturating_add(u64::from(c.size));
+            if c.size == 0 || offset <= start {
+                continue;
+            }
+            if first > end_inclusive {
+                break;
+            }
+            let mut chunk_sha = [0u8; 32];
+            hex::decode_to_slice(&c.sha256_hex, &mut chunk_sha).ok()?;
+            if !at_rest_grant_held(self.engine.backend(), &chunk_sha, viewer_key_id).await? {
+                return Some(super::RefusedChunk {
+                    seq: c.seq,
+                    sha256_hex: c.sha256_hex.clone(),
+                });
+            }
+        }
+        None
+    }
 }
 
 /// Tell the concrete backend behind `backend` which federation key is this
@@ -206,12 +246,36 @@ fn set_backend_node_key(backend: &ciris_persist::BackendDispatch, node_key_id: &
     }
 }
 
+/// CIRISEdge#779 — does `viewer_key_id` hold an at-rest wrap on the row at
+/// `sha`? The read door's first question of a sealed chunk, asked as
+/// metadata. `None` when the backend cannot be asked.
+#[allow(unreachable_patterns)] // the wildcard is live only when persist builds without `postgres`
+async fn at_rest_grant_held(
+    backend: &ciris_persist::BackendDispatch,
+    sha: &[u8; 32],
+    viewer_key_id: &str,
+) -> Option<bool> {
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    let held = match backend {
+        ciris_persist::BackendDispatch::Sqlite(b) => b.get_at_rest_grant(sha, viewer_key_id).await,
+        #[cfg(feature = "pyo3")]
+        ciris_persist::BackendDispatch::Postgres(b) => {
+            b.get_at_rest_grant(sha, viewer_key_id).await
+        }
+        _ => return None,
+    };
+    held.ok().map(|g| g.is_some())
+}
+
 /// Translate a persist blob error into the typed vocabulary, preserving the
 /// distinctions that have different remedies.
 fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> GroupContentError {
     use ciris_persist::federation::BlobError as B;
     match e {
-        B::NotGranted { .. } => GroupContentError::NotGranted { sha256_hex },
+        B::NotGranted { .. } => GroupContentError::NotGranted {
+            sha256_hex,
+            chunk: None,
+        },
         B::NotHeld { .. } => GroupContentError::NotHeld { sha256_hex },
         B::Evicted { .. } => GroupContentError::Evicted { sha256_hex },
         // persist#831: an AAD mismatch fails AFTER authorization, as a crypto
@@ -520,10 +584,33 @@ impl GroupContentStore for PersistGroupContentStore {
             CryptoTier::Plaintext => None,
             CryptoTier::InvisibleEncrypted | CryptoTier::CommunityDek => Some(aad.as_slice()),
         };
-        self.engine
+        match self
+            .engine
             .read_blob_range_as(&sha, req.viewer_key_id, start, end_inclusive, aad_arg)
             .await
-            .map_err(|e| map_err(sha_hex, &e))
+        {
+            Ok(bytes) => Ok(bytes),
+            // CIRISEdge#779 — persist's range door names the DAG it was asked
+            // for, never the chunk that refused (`refused_sha`), so the field
+            // log named the file and the grant search looked at the wrong
+            // row. Which chunk is asked here, on the refusal path only.
+            Err(e @ ciris_persist::federation::BlobError::NotGranted { .. }) => {
+                let chunk = match (req.pointer.tier, req.pointer.stream_id.is_some()) {
+                    (CryptoTier::InvisibleEncrypted, true) => {
+                        self.refused_chunk(&sha, req.viewer_key_id, &aad, start, end_inclusive)
+                            .await
+                    }
+                    _ => None,
+                };
+                match map_err(sha_hex, &e) {
+                    GroupContentError::NotGranted { sha256_hex, .. } => {
+                        Err(GroupContentError::NotGranted { sha256_hex, chunk })
+                    }
+                    other => Err(other),
+                }
+            }
+            Err(e) => Err(map_err(sha_hex, &e)),
+        }
     }
 
     async fn layout(&self, req: OpenRequest<'_>) -> Result<super::ChunkLayout, GroupContentError> {
