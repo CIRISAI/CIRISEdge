@@ -284,6 +284,19 @@ run_point_once() {
     --row-out "$postrow" || true
 
   compose "${PROFILES[@]}" logs --no-color --tail 2000 > "logs-relays-${relays}-subs-${subs}.txt" 2>&1 || true
+  # The FULL per-node logs of this point, one file per container, before
+  # `stop` — the workflow uploads `logs/` as an artifact. A 300-line tail of
+  # the LAST point is all a failing run used to leave, which is how a
+  # sweep's M=2 failure could only be diagnosed by re-running it
+  # (CIRISEdge#768). By container NAME (fixed by `container_name:`), so no
+  # compose interpolation is involved.
+  local logdir="logs/relays-${relays}-subs-${subs}-attempt-${attempt}"
+  mkdir -p "$logdir"
+  for c in bm-publisher bm-relay-1 bm-relay-2 bm-sub-1 bm-sub-2 bm-sub-3 bm-sub-4 bm-nonmember; do
+    if docker inspect "$c" >/dev/null 2>&1; then
+      docker logs "$c" > "$logdir/$c.log" 2>&1 || true
+    fi
+  done
   compose "${PROFILES[@]}" stop >/dev/null 2>&1 || true
 
   # Read the results out of the volume — never out of scrollback.
