@@ -87,11 +87,31 @@ use ciris_persist::federation::FederationDirectory;
 /// What provisioning did — reported rather than returned as `()`, because
 /// "already correct" and "just created" are different operational facts and
 /// the third arm is a problem.
+///
+/// `#[non_exhaustive]` (CIRISEdge#799): a match outside this crate carries a
+/// wildcard arm, so the next outcome is not a MAJOR.
 #[must_use = "provisioning reports drift, which is silent if dropped"]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Provisioned {
-    /// The occurrence already existed carrying exactly these pubkeys.
+    /// The occurrence already existed carrying exactly these pubkeys and
+    /// this `device_class`.
     AlreadyCurrent,
+    /// CIRISEdge#799 — the occurrence existed with these pubkeys under
+    /// ANOTHER `device_class`, and was re-issued under the one asked for:
+    /// same keys, a newer `asserted_at`, the stored `valid_until` carried.
+    ///
+    /// The class is not cosmetic. persist derives a node's replication
+    /// audience from it (S1): a server-class occurrence (`server`,
+    /// `embedded`, `service`, `agent`) is sent no self/family content, so a
+    /// person's phone left labelled `server` is cut off from their own
+    /// files. Keys unchanged means the grants wrapped to them still open.
+    Reclassed {
+        /// The class the stored row carried.
+        from: String,
+        /// The class it carries now.
+        to: String,
+    },
     /// The occurrence was registered now.
     Created,
     /// An occurrence exists under this key id with **different** content
@@ -139,6 +159,21 @@ pub fn enc_pubkeys_from_seed(ed25519_seed: &[u8; 32]) -> Result<EncryptionPubkey
     })
 }
 
+/// CIRISEdge#799 — refuse a `device_class` outside persist's closed set
+/// before anything is written or signed, naming the set.
+fn check_device_class(device_class: &str) -> Result<(), String> {
+    use ciris_persist::federation::types::device_class;
+    if device_class::is_valid(device_class) {
+        Ok(())
+    } else {
+        Err(format!(
+            "device_class {device_class:?} is not one of persist's {:?} — refused, never \
+             published (CIRISEdge#799)",
+            device_class::ALL
+        ))
+    }
+}
+
 /// Register `occurrence_key_id` as a **content-only** occurrence of
 /// `identity_key_id`, so the DEK cascade has a wrap target for that identity
 /// on this node. Idempotent. **Trusted-local door: the row never leaves this
@@ -161,8 +196,16 @@ pub fn enc_pubkeys_from_seed(ed25519_seed: &[u8; 32]) -> Result<EncryptionPubkey
 /// form, and a node's own row now goes through that gated door (published)
 /// rather than this one.
 ///
+/// CIRISEdge#799 — a row with these pubkeys under another `device_class` is
+/// re-written under the asked-for class ([`Provisioned::Reclassed`]), every
+/// other column carried. Only an UNSIGNED row can be: this door never
+/// mutates a signed occurrence (persist's `WHERE signature IS NULL`), and
+/// only its signer can re-issue one, so a signed row of another class is
+/// refused by name rather than reported reclassed while unchanged.
+///
 /// # Errors
-/// Directory read or write failure.
+/// An unknown `device_class`, a signed row of another class, or a directory
+/// read or write failure.
 pub async fn ensure_content_occurrence(
     directory: &dyn FederationDirectory,
     identity_key_id: &str,
@@ -170,6 +213,7 @@ pub async fn ensure_content_occurrence(
     device_class: &str,
     enc: EncryptionPubkeys,
 ) -> Result<Provisioned, String> {
+    check_device_class(device_class)?;
     let existing = directory
         .list_identity_occurrences_active(identity_key_id)
         .await
@@ -179,9 +223,33 @@ pub async fn ensure_content_occurrence(
         .iter()
         .find(|o| o.occurrence_key_id == occurrence_key_id)
     {
-        return Ok(match found.encryption_pubkeys.as_ref() {
-            Some(have) if *have == enc => Provisioned::AlreadyCurrent,
-            _ => Provisioned::Drifted,
+        if found.encryption_pubkeys.as_ref() != Some(&enc) {
+            return Ok(Provisioned::Drifted);
+        }
+        if found.device_class == device_class {
+            return Ok(Provisioned::AlreadyCurrent);
+        }
+        if occurrence_is_on_signed_plane(directory, identity_key_id, occurrence_key_id).await? {
+            return Err(format!(
+                "content occurrence {occurrence_key_id} of {identity_key_id} is SIGNED as \
+                 {:?}; the trusted-local door cannot reclass it to {device_class:?} — only its \
+                 signer can re-issue it (CIRISEdge#799)",
+                found.device_class
+            ));
+        }
+        let from = found.device_class.clone();
+        directory
+            .put_identity_occurrence_local(IdentityOccurrence {
+                device_class: device_class.to_owned(),
+                asserted_at: chrono::Utc::now(),
+                persist_row_hash: String::new(),
+                ..found.clone()
+            })
+            .await
+            .map_err(|e| format!("reclass content occurrence {occurrence_key_id}: {e}"))?;
+        return Ok(Provisioned::Reclassed {
+            from,
+            to: device_class.to_owned(),
         });
     }
 
@@ -244,6 +312,13 @@ pub async fn provision_from_seed(
             occurrence = occurrence_key_id,
             "content occurrence already current"
         ),
+        Provisioned::Reclassed { ref from, ref to } => tracing::info!(
+            identity = identity_key_id,
+            occurrence = occurrence_key_id,
+            from = %from,
+            to = %to,
+            "content occurrence RECLASSED — same keys (CIRISEdge#799)"
+        ),
         Provisioned::Drifted => tracing::warn!(
             identity = identity_key_id,
             occurrence = occurrence_key_id,
@@ -281,7 +356,7 @@ async fn occurrence_is_on_signed_plane<B>(
     occurrence_key_id: &str,
 ) -> Result<bool, String>
 where
-    B: FederationDirectory,
+    B: FederationDirectory + ?Sized,
 {
     const PAGE: u32 = 256;
     const MAX_PAGES: usize = 64;
@@ -338,10 +413,17 @@ where
 /// node. This is the pattern persist's own two-node witness uses
 /// (`key_grant_invariants.rs`, I61).
 ///
+/// CIRISEdge#799 — the occurrence carries `device_class`, and a stored row
+/// with these keys under another class is re-published under it
+/// ([`Provisioned::Reclassed`]). persist derives the replication audience
+/// from the class (S1), so a node first provisioned under the wrong one
+/// would otherwise keep it forever.
+///
 /// # Errors
-/// The derived id could not be computed, registration failed, the content-KEM
-/// identity could not be loaded or minted, the occurrence could not be
-/// published, or the directory write failed.
+/// An unknown `device_class`, the derived id could not be computed,
+/// registration failed, the content-KEM identity could not be loaded or
+/// minted, the occurrence could not be published, or the directory write
+/// failed.
 pub async fn provision_engine_occurrence<B>(
     engine: &ciris_persist::Engine,
     backend: &B,
@@ -351,6 +433,7 @@ pub async fn provision_engine_occurrence<B>(
 where
     B: FederationDirectory + BlobStorage,
 {
+    check_device_class(device_class)?;
     let me = engine
         .local_derived_key_id()
         .await
@@ -397,6 +480,13 @@ where
     //  * DRIFTED — different pubkeys. Never touched: a peer may already hold
     //    grants wrapped to the stored keys, and which one is authoritative is
     //    the operator's call, not ours.
+    //
+    // And one case that ALWAYS republishes (CIRISEdge#799): RECLASSED — the
+    // same pubkeys under another `device_class`. The signed put is
+    // last-signed-wins on `device_class` too (persist's upsert, `WHERE
+    // excluded.asserted_at > stored`), so re-signing now is what moves the
+    // row, on this node and on every peer the plane carries it to; the
+    // stored `valid_until` is carried as for the heal.
     //  * ALREADY ON THE PLANE — a signed row is already replicable, so there
     //    is nothing to heal and re-signing would only bump `asserted_at` and
     //    re-advertise the row to every peer on every boot.
@@ -420,6 +510,10 @@ where
 
     let outcome = match &existing {
         Some(found) if found.encryption_pubkeys.as_ref() != Some(&enc) => Provisioned::Drifted,
+        Some(found) if found.device_class != device_class => Provisioned::Reclassed {
+            from: found.device_class.clone(),
+            to: device_class.to_owned(),
+        },
         Some(_) => Provisioned::AlreadyCurrent,
         None => Provisioned::Created,
     };
@@ -429,6 +523,8 @@ where
     let publish: Option<Option<chrono::DateTime<chrono::Utc>>> = match &existing {
         // Drifted: never.
         Some(found) if found.encryption_pubkeys.as_ref() != Some(&enc) => None,
+        // Reclassed: always, carrying the stored expiry.
+        Some(found) if found.device_class != device_class => Some(found.valid_until),
         Some(found) => {
             if occurrence_is_on_signed_plane(backend, identity_key_id, &me).await? {
                 None
@@ -466,6 +562,15 @@ where
                 "engine occurrence current"
             );
         }
+        Provisioned::Reclassed { from, to } => tracing::info!(
+            identity = identity_key_id,
+            occurrence = %me,
+            from = %from,
+            to = %to,
+            "engine occurrence RECLASSED and republished — same keys, so every grant wrapped \
+             to them still opens; the replication audience follows the new class \
+             (CIRISEdge#799)"
+        ),
         Provisioned::Drifted => tracing::warn!(
             identity = identity_key_id,
             occurrence = %me,
@@ -475,4 +580,264 @@ where
         ),
     }
     Ok((me, outcome))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob_swarm::chunk_grants_779_tests::{device, federate, Ident, Node};
+    use ciris_persist::federation::types::device_class;
+
+    /// This node's own row: the active occurrence, and the signed one a peer
+    /// replicates (`None` when it is not on the plane).
+    async fn rows(
+        node: &Node,
+        identity: &str,
+        occurrence: &str,
+    ) -> (Option<IdentityOccurrence>, Option<IdentityOccurrence>) {
+        let active = node
+            .dir
+            .list_identity_occurrences_active(identity)
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|o| o.occurrence_key_id == occurrence);
+        let signed = node
+            .dir
+            .list_signed_identity_occurrences_since(None, 256)
+            .await
+            .expect("plane")
+            .into_iter()
+            .map(|s| s.occurrence.identity_occurrence)
+            .find(|o| o.identity_key_id == identity && o.occurrence_key_id == occurrence);
+        (active, signed)
+    }
+
+    fn pubkeys(fill: u8) -> EncryptionPubkeys {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        EncryptionPubkeys {
+            x25519_base64: b64.encode([fill; 32]),
+            ml_kem_768_base64: b64.encode([fill; 1184]),
+        }
+    }
+
+    /// **CIRISEdge#799 — a node provisioned `server` and reprovisioned
+    /// `phone` is reclassed, on its own plane and on a peer's; a second call
+    /// is current and re-signs nothing.**
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_server_occurrence_reprovisioned_as_a_phone_is_reclassed_799() {
+        let alice = Ident::new("alice-fed", 0x11);
+        let phone = Ident::new("alice-phone", 0x33);
+        let laptop = Ident::new("alice-laptop", 0x44);
+        // Both provisioned `server` by the harness, as the field did.
+        let node = device(&[&alice, &phone], &alice, &phone, None).await;
+        let peer = device(&[&alice, &laptop], &alice, &laptop, None).await;
+        federate(&node, &peer).await;
+        let (_, before) = rows(&node, &alice.key_id, &node.me).await;
+        let before = before.expect("published on the plane");
+        assert_eq!(before.device_class, device_class::SERVER);
+
+        let (me, outcome) = provision_engine_occurrence(
+            node.store.engine(),
+            &*node.dir,
+            &alice.key_id,
+            device_class::PHONE,
+        )
+        .await
+        .expect("reprovision");
+        assert_eq!(me, node.me);
+        assert_eq!(
+            outcome,
+            Provisioned::Reclassed {
+                from: device_class::SERVER.to_owned(),
+                to: device_class::PHONE.to_owned(),
+            }
+        );
+        let (active, signed) = rows(&node, &alice.key_id, &node.me).await;
+        let signed = signed.expect("still on the plane");
+        assert_eq!(active.expect("active").device_class, device_class::PHONE);
+        assert_eq!(
+            signed.device_class,
+            device_class::PHONE,
+            "re-signed as a phone"
+        );
+        assert_eq!(
+            signed.encryption_pubkeys, before.encryption_pubkeys,
+            "same keys: every grant wrapped to them still opens"
+        );
+        assert!(signed.asserted_at > before.asserted_at, "a newer signature");
+
+        // The peer takes the newer signed row: last-signed-wins on the class.
+        federate(&node, &peer).await;
+        let (on_peer, _) = rows(&peer, &alice.key_id, &node.me).await;
+        assert_eq!(
+            on_peer.expect("the peer holds it").device_class,
+            device_class::PHONE
+        );
+
+        // Idempotent: nothing to change, nothing re-signed.
+        let (_, again) = provision_engine_occurrence(
+            node.store.engine(),
+            &*node.dir,
+            &alice.key_id,
+            device_class::PHONE,
+        )
+        .await
+        .expect("again");
+        assert_eq!(again, Provisioned::AlreadyCurrent);
+        let (_, after) = rows(&node, &alice.key_id, &node.me).await;
+        assert_eq!(
+            after.expect("plane").asserted_at,
+            signed.asserted_at,
+            "no asserted_at churn"
+        );
+    }
+
+    /// **CIRISEdge#799 — an operator's expiry survives the reclass.**
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reclass_carries_the_stored_expiry_799() {
+        let alice = Ident::new("alice-fed", 0x11);
+        let phone = Ident::new("alice-phone", 0x33);
+        let node = device(&[&alice, &phone], &alice, &phone, None).await;
+        let expiry = chrono::Utc::now() + chrono::Duration::days(30);
+        let expiry = chrono::DateTime::from_timestamp(expiry.timestamp(), 0).expect("ts");
+        node.store
+            .engine()
+            .publish_self_occurrence(&alice.key_id, device_class::SERVER, Some(expiry))
+            .await
+            .expect("an operator sets an expiry");
+        let (_, outcome) = provision_engine_occurrence(
+            node.store.engine(),
+            &*node.dir,
+            &alice.key_id,
+            device_class::LAPTOP,
+        )
+        .await
+        .expect("reprovision");
+        assert!(
+            matches!(outcome, Provisioned::Reclassed { .. }),
+            "{outcome:?}"
+        );
+        let (active, signed) = rows(&node, &alice.key_id, &node.me).await;
+        assert_eq!(active.expect("active").valid_until, Some(expiry));
+        let signed = signed.expect("plane");
+        assert_eq!(signed.device_class, device_class::LAPTOP);
+        assert_eq!(signed.valid_until, Some(expiry), "the expiry is carried");
+    }
+
+    /// **CIRISEdge#799 — the local door: same keys under another class is
+    /// reclassed; other keys are Drifted and untouched; a signed row is
+    /// refused by name; an unknown class is refused at both doors before
+    /// anything is written.**
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_local_door_reclasses_and_never_touches_drift_799() {
+        let alice = Ident::new("alice-fed", 0x11);
+        let phone = Ident::new("alice-phone", 0x33);
+        let node = device(&[&alice, &phone], &alice, &phone, None).await;
+        // A device-class row this node holds for someone else: the
+        // phone's own key, unsigned (local door).
+        let other = phone.key_id.clone();
+        let keys = pubkeys(7);
+        assert_eq!(
+            ensure_content_occurrence(
+                &*node.dir,
+                &alice.key_id,
+                &other,
+                device_class::SERVER,
+                keys.clone()
+            )
+            .await
+            .expect("create"),
+            Provisioned::Created
+        );
+        // Other keys: Drifted, the row as it was.
+        assert_eq!(
+            ensure_content_occurrence(
+                &*node.dir,
+                &alice.key_id,
+                &other,
+                device_class::PHONE,
+                pubkeys(9)
+            )
+            .await
+            .expect("drift"),
+            Provisioned::Drifted
+        );
+        let (row, _) = rows(&node, &alice.key_id, &other).await;
+        let row = row.expect("held");
+        assert_eq!(
+            (row.device_class.as_str(), row.encryption_pubkeys.as_ref()),
+            (device_class::SERVER, Some(&keys)),
+            "drift is never written"
+        );
+        // Same keys, another class: reclassed.
+        assert_eq!(
+            ensure_content_occurrence(
+                &*node.dir,
+                &alice.key_id,
+                &other,
+                device_class::PHONE,
+                keys.clone()
+            )
+            .await
+            .expect("reclass"),
+            Provisioned::Reclassed {
+                from: device_class::SERVER.to_owned(),
+                to: device_class::PHONE.to_owned(),
+            }
+        );
+        let (row, _) = rows(&node, &alice.key_id, &other).await;
+        assert_eq!(row.expect("held").device_class, device_class::PHONE);
+        assert_eq!(
+            ensure_content_occurrence(&*node.dir, &alice.key_id, &other, device_class::PHONE, keys)
+                .await
+                .expect("again"),
+            Provisioned::AlreadyCurrent
+        );
+
+        // This node's own row is SIGNED: the local door cannot reclass it.
+        let kem = node
+            .dir
+            .load_or_init_content_kem_identity()
+            .await
+            .expect("kem");
+        let own = EncryptionPubkeys {
+            x25519_base64: kem.x25519_pubkey_b64,
+            ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
+        };
+        let refused = ensure_content_occurrence(
+            &*node.dir,
+            &alice.key_id,
+            &node.me,
+            device_class::PHONE,
+            own,
+        )
+        .await
+        .expect_err("a signed row is its signer's");
+        assert!(refused.contains("SIGNED"), "{refused}");
+
+        // An unknown class: refused at both doors, nothing written.
+        for bad in ["toaster", "Phone", ""] {
+            assert!(
+                ensure_content_occurrence(&*node.dir, &alice.key_id, &other, bad, pubkeys(7))
+                    .await
+                    .is_err_and(|e| e.contains("not one of"))
+            );
+            assert!(provision_engine_occurrence(
+                node.store.engine(),
+                &*node.dir,
+                &alice.key_id,
+                bad
+            )
+            .await
+            .is_err_and(|e| e.contains("not one of")));
+        }
+        let (own_row, _) = rows(&node, &alice.key_id, &node.me).await;
+        assert_eq!(
+            own_row.expect("held").device_class,
+            device_class::SERVER,
+            "nothing published"
+        );
+    }
 }

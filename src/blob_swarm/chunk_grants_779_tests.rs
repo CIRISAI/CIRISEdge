@@ -71,15 +71,15 @@ fn body_of(len: usize, seed: u32) -> Vec<u8> {
         .collect()
 }
 
-struct Ident {
-    key_id: String,
+pub(crate) struct Ident {
+    pub(crate) key_id: String,
     seed: u8,
     ed: Ed25519SoftwareSigner,
     pqc: MlDsa65SoftwareSigner,
 }
 
 impl Ident {
-    fn new(key_id: &str, seed: u8) -> Self {
+    pub(crate) fn new(key_id: &str, seed: u8) -> Self {
         let mut ed = Ed25519SoftwareSigner::new(key_id);
         ed.import_key(&[seed; 32]).expect("import ed key");
         let pqc =
@@ -140,17 +140,17 @@ impl Ident {
     }
 }
 
-struct Node {
-    dir: Arc<SqliteBackend>,
-    store: PersistGroupContentStore,
+pub(crate) struct Node {
+    pub(crate) dir: Arc<SqliteBackend>,
+    pub(crate) store: PersistGroupContentStore,
     identity: String,
-    me: String,
+    pub(crate) me: String,
     signer: Arc<crate::identity::LocalSigner>,
 }
 
 /// A device of `owner` keyed from `device`, with its owner binding and its
 /// node-class engine occurrence (`delivery_receipts_738::device`).
-async fn device(
+pub(crate) async fn device(
     idents: &[&Ident],
     owner: &Ident,
     device: &Ident,
@@ -224,7 +224,7 @@ async fn device(
 }
 
 /// Hand `from`'s node key, owner binding and occurrence to `to`.
-async fn federate(from: &Node, to: &Node) {
+pub(crate) async fn federate(from: &Node, to: &Node) {
     let rec =
         ciris_persist::federation::FederationDirectory::lookup_public_key(&*from.dir, &from.me)
             .await

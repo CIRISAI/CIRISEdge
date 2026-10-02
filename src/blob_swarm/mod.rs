@@ -351,7 +351,7 @@ pub trait BlobChunkVerifier: Send + Sync {
 pub mod meaning;
 pub use meaning::{BlobMeaning, MeaningRefusal};
 #[cfg(test)]
-mod chunk_grants_779_tests;
+pub(crate) mod chunk_grants_779_tests;
 mod key_wake;
 pub mod pull;
 pub use pull::{
