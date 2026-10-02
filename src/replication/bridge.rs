@@ -13398,7 +13398,7 @@ pub(crate) mod tests {
 
     /// Seed one `delegates_to(attester → subject)` carrying `scope`, and
     /// return its `attestation_id` (so a test can tombstone that exact edge).
-    async fn seed_delegates_to(
+    pub(crate) async fn seed_delegates_to(
         backend: &MemoryBackend,
         attester: &str,
         subject: &str,

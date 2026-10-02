@@ -6501,6 +6501,7 @@ impl Transport for ReticulumTransport {
             hybrid_policy: self.hybrid_policy,
             transport_binding_enforcement: self.transport_binding_enforcement,
             bundle_save_gate: self.bundle_save_gate,
+            local_key_id: Arc::from(self.config.local_key_id.as_str()),
             // CIRISEdge#530 — cheap clone (every `EdgeMetrics` field is an `Arc`).
             metrics: self.metrics.clone(),
         };
@@ -7074,6 +7075,9 @@ struct AnnounceCtx {
     hybrid_policy: HybridPolicy,
     transport_binding_enforcement: TransportBindingEnforcement,
     bundle_save_gate: crate::bundle_gate::BundleSaveGateMode,
+    /// CIRISEdge#786 — this node's own key id: the bundle gate asks persist's
+    /// capability walk for a pipeline's standing from THIS node's trust root.
+    local_key_id: Arc<str>,
     /// CIRISEdge#530 — optional metrics handle, so an announce-intake capacity
     /// eviction is COUNTED and not merely logged. `None` leaves the eviction
     /// loud-but-uncounted (the throttled WARN still fires), which is the same
@@ -9639,6 +9643,7 @@ fn peer_bundle_link_binding_ok(
 async fn process_peer_bundle_frame(
     frame: &[u8],
     key_id: &str,
+    reader_key_id: &str,
     link_identity_hash: Option<[u8; 16]>,
     link_dest16: Option<[u8; 16]>,
     peers: &Mutex<HashMap<String, RootedPeer>>,
@@ -9694,7 +9699,10 @@ async fn process_peer_bundle_frame(
     if let Err(e) = bundles.register(key_id, bundle_bytes) {
         return Refused(PeerBundleRefusal::RegisterRefused(e));
     }
-    match rooting.verify_peer_build_bundle(key_id, bundle_bytes).await {
+    match rooting
+        .verify_peer_build_bundle(reader_key_id, key_id, bundle_bytes)
+        .await
+    {
         crate::bundle_gate::BundleGateVerdict::Refused(refusal) => {
             // The bundle stays registered (shape-passed); refusals are never
             // cached, so a directory row replicating in later un-sticks the
@@ -9705,6 +9713,7 @@ async fn process_peer_bundle_frame(
             bundles.note_verified(key_id, crate::bundle_gate::sha256_of(bundle_bytes));
             commit_one_motion_upgrade(
                 key_id,
+                reader_key_id,
                 link_identity_hash,
                 link_dest16,
                 peers,
@@ -9737,6 +9746,7 @@ async fn process_peer_bundle_frame(
 #[allow(clippy::too_many_arguments)] // the one-motion writer takes exactly the upgrade's operands
 async fn commit_one_motion_upgrade(
     key_id: &str,
+    reader_key_id: &str,
     link_identity_hash: Option<[u8; 16]>,
     link_dest16: Option<[u8; 16]>,
     peers: &Mutex<HashMap<String, RootedPeer>>,
@@ -9773,8 +9783,15 @@ async fn commit_one_motion_upgrade(
     let Some((already_passed, dest16, pubkey64, epoch)) = upgraded else {
         return PeerBundleOutcome::Refused(PeerBundleRefusal::LinkBindingMismatch);
     };
-    let persist_provenance =
-        crate::bundle_gate::gated_save_provenance(gate, Rooted, key_id, bundles, rooting).await;
+    let persist_provenance = crate::bundle_gate::gated_save_provenance(
+        gate,
+        Rooted,
+        key_id,
+        reader_key_id,
+        bundles,
+        rooting,
+    )
+    .await;
     rooting
         .persist_transport_binding(key_id, dest16, pubkey64, persist_provenance, epoch)
         .await;
@@ -9995,6 +10012,7 @@ async fn handle_peer_bundle_frame(
     match process_peer_bundle_frame(
         frame,
         &key_id,
+        ctx.local_key_id,
         link_identity_hash,
         link_dest16,
         ctx.peers,
@@ -10857,6 +10875,7 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
             ctx.bundle_save_gate,
             persist_provenance,
             &persisted_key,
+            &ctx.local_key_id,
             &ctx.peer_bundles,
             rooting,
         )
@@ -14038,7 +14057,9 @@ mod tests {
     /// operands: `Advisory ∧ owns_key=false`).
     mod first_contact_rooting {
         use super::*;
-        use crate::bundle_gate::test_support::{field_fixture, tampered, PIPELINE, PRESENTER};
+        use crate::bundle_gate::test_support::{
+            field_fixture, tampered, PIPELINE, PRESENTER, READER,
+        };
         use crate::bundle_gate::{
             manifest_commitment_of_bundle, sha256_of, BundleSaveGateMode, PeerBundleStore,
             MAX_PEER_BUNDLE_BYTES,
@@ -14099,6 +14120,7 @@ mod tests {
             let out = process_peer_bundle_frame(
                 &frame,
                 PRESENTER,
+                READER,
                 // The link proved exactly the announce's transport identity.
                 Some(identity_hash_of64(&pk)),
                 None,
@@ -14159,6 +14181,7 @@ mod tests {
             let out = process_peer_bundle_frame(
                 &frame,
                 PRESENTER,
+                READER,
                 Some(identity_hash_of64(&pk)),
                 None,
                 &peers,
@@ -14195,6 +14218,7 @@ mod tests {
             let out = process_peer_bundle_frame(
                 &frame,
                 PRESENTER,
+                READER,
                 Some(identity_hash_of64(&pk)),
                 None,
                 &peers,
@@ -14237,6 +14261,7 @@ mod tests {
             let out = process_peer_bundle_frame(
                 &frame,
                 PRESENTER,
+                READER,
                 Some(identity_hash_of64(&pk)),
                 None,
                 &peers,
@@ -14272,6 +14297,7 @@ mod tests {
             let out = process_peer_bundle_frame(
                 &big,
                 PRESENTER,
+                READER,
                 Some(identity_hash_of64(&pk)),
                 None,
                 &peers,
@@ -14290,6 +14316,7 @@ mod tests {
             let out = process_peer_bundle_frame(
                 &v2,
                 PRESENTER,
+                READER,
                 Some(identity_hash_of64(&pk)),
                 None,
                 &peers,
@@ -14321,6 +14348,7 @@ mod tests {
             let out = process_peer_bundle_frame(
                 &frame,
                 PRESENTER,
+                READER,
                 // The link proved the OTHER identity (a squat / stale rotation).
                 Some(identity_hash_of64(&other_pk)),
                 None,
@@ -14360,6 +14388,7 @@ mod tests {
             let out = process_peer_bundle_frame(
                 &frame,
                 PIPELINE,
+                READER,
                 Some(identity_hash_of64(&pk)),
                 None,
                 &peers,

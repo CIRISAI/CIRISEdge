@@ -309,17 +309,19 @@ pub trait RootingDirectory: Send + Sync + 'static {
     /// build-attestation bundle with every trust input pinned from THIS
     /// federation directory (never caller-supplied, never read from the
     /// bundle): the presenter member is `presenter_key_id`'s directory row,
-    /// the pipeline member + accord-co-scrubbed record are the directory row
-    /// the carried manifest NAMES (a name only — pubkeys and the
-    /// `infra:attest` blessing come from the row), and the co-scrub anchors
-    /// are the directory's `accord_holder` rows. See
-    /// [`crate::bundle_gate`] for the full chain + what a verdict does and
-    /// does not prove. Default is a typed
+    /// the pipeline member is the directory row the carried manifest NAMES (a
+    /// name only — pubkeys come from the row), and the pipeline's
+    /// `infra:attest` standing is asked of persist from `reader_key_id`'s
+    /// trust root on both CC 3.1.2.1 planes
+    /// ([`pipeline_blessing`](crate::bundle_gate::pipeline_blessing),
+    /// CIRISEdge#786). See [`crate::bundle_gate`] for the full chain + what a
+    /// verdict does and does not prove. Default is a typed
     /// [`BundleGateRefusal::NoDirectory`](crate::bundle_gate::BundleGateRefusal::NoDirectory)
     /// refusal (test doubles / no directory ⇒ fail-closed — under the gate a
     /// refusal can only downgrade a durable save, never widen one).
     async fn verify_peer_build_bundle(
         &self,
+        _reader_key_id: &str,
         _presenter_key_id: &str,
         _bundle_bytes: &[u8],
     ) -> crate::bundle_gate::BundleGateVerdict {
@@ -532,12 +534,13 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
 
     async fn verify_peer_build_bundle(
         &self,
+        reader_key_id: &str,
         presenter_key_id: &str,
         bundle_bytes: &[u8],
     ) -> crate::bundle_gate::BundleGateVerdict {
         use crate::bundle_gate::{
-            bundle_pipeline_key_id, verify_bundle_with_directory_rows, BundleGateRefusal as R,
-            BundleGateVerdict as V, MAX_PEER_BUNDLE_BYTES,
+            bundle_pipeline_key_id, pipeline_blessing, verify_bundle_with_directory_rows,
+            BundleGateRefusal as R, BundleGateVerdict as V, MAX_PEER_BUNDLE_BYTES,
         };
         // Cheap rejects first (the verify-pipeline cost-asymmetry discipline):
         // size cap before parse, parse before any directory round-trip.
@@ -553,10 +556,11 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             return V::Refused(R::MalformedBundle("not a JSON SignedCegObject"));
         };
         // The ONLY thing read from the object: the pipeline row's NAME. All
-        // pubkeys / roles / quorum inputs come from the directory rows below.
+        // pubkeys come from the directory rows below, the standing from
+        // persist's two planes.
         let Some(pipeline_key_id) = bundle_pipeline_key_id(&bundle).map(str::to_string) else {
             return V::Refused(R::MalformedBundle(
-                "carried manifest names no pipeline attesting_key_id",
+                "carried manifest names no pipeline row.attesting_key_id",
             ));
         };
         // Pin the presenter — the peer being saved, named by the CALLER
@@ -582,17 +586,18 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
                 }
                 Ok(Some(row)) => row,
             };
-        // Pin the accord anchors: the directory's accord_holder rows.
-        let anchor_rows = match FederationDirectory::list_keys_by_identity_type(
-            self,
-            ciris_persist::federation::types::identity_type::ACCORD_HOLDER,
-        )
-        .await
-        {
+        // The pipeline's standing, from THIS node's trust root: the walk, then
+        // the ceremony plane (CC 3.1.2.1). Neither ⇒ refusal.
+        let blessing = match pipeline_blessing(self, reader_key_id, &pipeline_key_id).await {
             Err(e) => return V::Refused(R::DirectoryUnavailable(e.to_string())),
-            Ok(rows) => rows,
+            Ok(None) => {
+                return V::Refused(R::PipelineWithoutStanding {
+                    key_id: pipeline_key_id,
+                })
+            }
+            Ok(Some(blessing)) => blessing,
         };
-        verify_bundle_with_directory_rows(&bundle, &presenter_row, &pipeline_row, &anchor_rows)
+        verify_bundle_with_directory_rows(&bundle, &presenter_row, &pipeline_row, &blessing)
     }
 
     async fn stored_reticulum_binding(&self, key_id: &str) -> Option<StoredTransportBinding> {
