@@ -2597,6 +2597,7 @@ async fn stand_up(
                         ciris_edge::replication::SchedulerConfig::max_concurrent_rounds_for(
                             max_blocking_threads,
                         ),
+                    ..ciris_edge::replication::SchedulerConfig::default()
                 },
                 local_key_id: Some(cfg.node_id.clone()),
                 // CIRISEdge#640 — the sealed-content door as ONE value: the

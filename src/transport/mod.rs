@@ -541,6 +541,55 @@ impl ReplyPath {
     }
 }
 
+/// CIRISEdge#794 — what a transport saw that proves a peer reachable again.
+/// The replication scheduler backs off a peer the transport has no route to
+/// ([`TransportError::NoRouteToPeer`]) and clears that backoff on one of these,
+/// so a returning device catches up at once instead of waiting out the cap.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachabilityEvidence {
+    /// The peer's announce verified and bound it, which installs a path to it.
+    PathLearned,
+    /// A link came up and was identified as this peer's.
+    LinkUp,
+    /// An attributed frame from this peer just arrived: if it reached us, it
+    /// is reachable.
+    InboundFrame,
+}
+
+impl ReachabilityEvidence {
+    /// A stable token for logs.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PathLearned => "path_learned",
+            Self::LinkUp => "link_up",
+            Self::InboundFrame => "inbound_frame",
+        }
+    }
+}
+
+/// CIRISEdge#794 — one piece of [`ReachabilityEvidence`] about one peer, as a
+/// transport emits it on [`Transport::subscribe_reachability`].
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerReachable {
+    /// The peer's federation key id.
+    pub peer_key_id: String,
+    /// What was seen.
+    pub evidence: ReachabilityEvidence,
+}
+
+impl PeerReachable {
+    #[must_use]
+    pub fn new(peer_key_id: impl Into<String>, evidence: ReachabilityEvidence) -> Self {
+        Self {
+            peer_key_id: peer_key_id.into(),
+            evidence,
+        }
+    }
+}
+
 /// The trait every transport implements. Edge holds a
 /// `Vec<Box<dyn Transport>>`; multiple transports active simultaneously
 /// is the multi-medium reach M-1 demands.
@@ -603,6 +652,15 @@ pub trait Transport: Send + Sync + 'static {
             self.id().0,
             path.bucket_key()
         )))
+    }
+
+    /// CIRISEdge#794 — subscribe to this transport's per-peer reachability
+    /// evidence: a path learned or a link identified for a peer. The
+    /// replication runtime feeds it to the scheduler's no-route backoff. A
+    /// transport with no such events returns `None`, which is the default;
+    /// the backoff then clears on an inbound frame or on its own expiry.
+    fn subscribe_reachability(&self) -> Option<tokio::sync::broadcast::Receiver<PeerReachable>> {
+        None
     }
 }
 

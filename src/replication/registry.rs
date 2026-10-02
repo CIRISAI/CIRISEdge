@@ -205,6 +205,11 @@ pub struct ReplicationRegistry {
     /// dropped `SkippedNoSourceKeyId`. `None` (never installed) preserves the
     /// pre-#727 behaviour: every such frame drops.
     owner_binding_carve_out: OnceLock<Arc<crate::first_contact::OwnerBindingCarveOut>>,
+    /// CIRISEdge#794 — the scheduler's no-route backoff. Every attributed
+    /// CRPL frame is evidence its sender is reachable, so it clears that
+    /// peer's backoff before the frame is routed — before anything its
+    /// admission triggers (the #776 release kick) can ask that peer again.
+    no_route_backoff: OnceLock<Arc<super::no_route_backoff::NoRouteBackoff>>,
 }
 
 impl ReplicationRegistry {
@@ -217,7 +222,14 @@ impl ReplicationRegistry {
             responder_factory: OnceLock::new(),
             local_key_id: OnceLock::new(),
             owner_binding_carve_out: OnceLock::new(),
+            no_route_backoff: OnceLock::new(),
         }
+    }
+
+    /// CIRISEdge#794 — clear a sender's no-route backoff on its inbound
+    /// frames (see the field). Set-once; the runtime installs its scheduler's.
+    pub fn install_no_route_backoff(&self, scheduler: &super::scheduler::SchedulerHandle) {
+        let _ = self.no_route_backoff.set(scheduler.backoff());
     }
 
     /// CIRISEdge#727 — install the owner-binding rung's receiver gate.
@@ -438,6 +450,12 @@ impl ReplicationRegistry {
                  built for ourselves (CIRISEdge#621 / CIRISServer#607)"
             );
             return Ok(RouteOutcome::RefusedSelf);
+        }
+        if let Some(backoff) = self.no_route_backoff.get() {
+            backoff.note_reachable(
+                peer_key_id,
+                crate::transport::ReachabilityEvidence::InboundFrame,
+            );
         }
         let kind = framed.msg.kind();
         let meta = framed.meta;
