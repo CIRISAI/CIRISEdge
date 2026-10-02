@@ -404,7 +404,7 @@ async fn cross_keys_except(author: &Node, reader: &Node, withhold: &[[u8; 32]]) 
         .emit_pending_key_grants()
         .await
         .expect("emit");
-    let withheld: Vec<String> = withhold.iter().map(hex::encode).collect();
+    let held_back: Vec<String> = withhold.iter().map(hex::encode).collect();
     let mut applied = 0;
     for s in author
         .dir
@@ -420,7 +420,7 @@ async fn cross_keys_except(author: &Node, reader: &Node, withhold: &[[u8; 32]]) 
     {
         let set = KeyGrantSet::from_attestation(&s.attestation).expect("a well-formed set");
         if let KeyGrantAxis::Content { at_rest_sha256, .. } = &set.axis {
-            if withheld.contains(at_rest_sha256) {
+            if held_back.contains(at_rest_sha256) {
                 continue;
             }
         }
