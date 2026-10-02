@@ -1506,7 +1506,8 @@ harness = false
 required-features = ["transport-http", "transport-reticulum"]
 
 [dev-dependencies]
-tokio    = { version = "1", features = ["full"] }
+# `test-util`: paused-clock lib tests (the CIRISEdge#794 backoff schedule).
+tokio    = { version = "1", features = ["full", "test-util"] }
 proptest = "1"
 # Reticulum loopback + authenticated-resolution acceptance tests
 # (tests/reticulum_loopback.rs, tests/reticulum_av42.rs). `hex`

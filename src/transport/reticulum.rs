@@ -106,7 +106,10 @@ use leviculum_std::NodeEvent;
 use super::attestation::{
     AnnounceAttestation, AttestationError, AttestationPayload, TransportBindingEnforcement,
 };
-use super::{InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome};
+use super::{
+    InboundFrame, PeerReachable, ReachabilityEvidence, Transport, TransportError, TransportId,
+    TransportSendOutcome,
+};
 use crate::identity::LocalSigner;
 use crate::reachability::{AttemptOutcome, ReachabilityTracker};
 use crate::scope_addressing::{InboundAddress, MemberAddress, ScopeAddressTable};
@@ -157,6 +160,11 @@ const LINK_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(30);
 /// directly-reachable peer — e.g. a `prime_peer`'d bootstrap peer that
 /// never announced — is never regressed.
 const NO_PATH_ESTABLISH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// CIRISEdge#794 — the reachability-evidence broadcast's buffer. A lagging
+/// subscriber loses the oldest evidence, never blocks the event loop; the
+/// backoff it feeds still expires on its own schedule.
+const PEER_REACHABLE_CAPACITY: usize = 256;
 
 /// CIRISEdge#363 — the link keepalive interval edge asks leviculum to apply,
 /// node-wide, so a freshly-admitted **advisory/bootstrap** link survives long
@@ -2320,6 +2328,11 @@ pub struct ReticulumTransport {
     /// through to the event loop's [`EventCtx`] so a rooted announce
     /// records an [`AttemptOutcome::AnnounceReceived`].
     reachability: Option<Arc<ReachabilityTracker>>,
+    /// CIRISEdge#794 — per-peer reachability evidence (a verified announce, an
+    /// identified link), handed to [`Transport::subscribe_reachability`]
+    /// subscribers: the replication scheduler clears a peer's no-route backoff
+    /// on it. Always present; a send with no subscriber is a no-op.
+    peer_reachable: tokio::sync::broadcast::Sender<PeerReachable>,
     /// CIRISEdge#24 (v0.12.0) — typed registry of every interface
     /// that was wired into the underlying [`ReticulumNode`] via
     /// [`ReticulumTransportConfig::interfaces`]. Each entry pins
@@ -3357,6 +3370,7 @@ impl ReticulumTransport {
             own_owner_binding,
             event_bus,
             reachability,
+            peer_reachable: tokio::sync::broadcast::channel(PEER_REACHABLE_CAPACITY).0,
             interface_specs: Arc::new(std::sync::Mutex::new(interface_specs)),
             link_established_at: Arc::new(Mutex::new(HashMap::new())),
             link_to_peer_key_id: Arc::new(Mutex::new(HashMap::new())),
@@ -6061,6 +6075,10 @@ impl Transport for ReticulumTransport {
         TransportId::RETICULUM_RS
     }
 
+    fn subscribe_reachability(&self) -> Option<tokio::sync::broadcast::Receiver<PeerReachable>> {
+        Some(self.peer_reachable.subscribe())
+    }
+
     async fn send(
         &self,
         destination_key_id: &str,
@@ -6578,6 +6596,7 @@ impl Transport for ReticulumTransport {
                         #[cfg(feature = "lxmf")]
                         lxmf_serve: &self.lxmf_serve,
                         congestion: &self.congestion,
+                        peer_reachable: &self.peer_reachable,
                     };
                     handle_event(event, &ctx).await;
 
@@ -7165,6 +7184,8 @@ struct EventCtx<'a> {
     /// node-level "are we shedding" question has an answer that came from
     /// leviculum rather than from inference.
     congestion: &'a crate::transport::av_backpressure::CongestionRegistry,
+    /// CIRISEdge#794 — see the field of the same name on [`ReticulumTransport`].
+    peer_reachable: &'a tokio::sync::broadcast::Sender<PeerReachable>,
 }
 
 /// CIRISEdge#728 — the plane a Reticulum link belongs to, decided ONCE at
@@ -8293,6 +8314,12 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 }
             }
             if let Some(key_id) = matched_key {
+                // CIRISEdge#794 — an identified link to this peer is evidence
+                // it is reachable; a subscriber clears its no-route backoff.
+                let _ = ctx.peer_reachable.send(PeerReachable::new(
+                    key_id.clone(),
+                    ReachabilityEvidence::LinkUp,
+                ));
                 ctx.link_to_peer_key_id.lock().await.insert(link_id, key_id);
             }
         }
@@ -9856,6 +9883,16 @@ async fn receive_announce(ctx: &EventCtx<'_>, view: AnnounceView, link: Option<L
     let (outcome, key_id) =
         stage1_bind_announce(&view, ctx.peers, ctx.transport_binding_enforcement).await;
     let carrier = view.carrier;
+    // CIRISEdge#794 — a self-verified announce bound or refreshed this peer's
+    // route: a path to it was just learned.
+    if let (Stage1Outcome::InstalledNew | Stage1Outcome::Refreshed, Some(key_id)) =
+        (outcome, key_id.as_deref())
+    {
+        let _ = ctx.peer_reachable.send(PeerReachable::new(
+            key_id,
+            ReachabilityEvidence::PathLearned,
+        ));
+    }
     if let (Stage1Outcome::InstalledNew, Some(key_id)) = (outcome, key_id.as_deref()) {
         let bound = bind_identified_links_to(
             ctx.node,

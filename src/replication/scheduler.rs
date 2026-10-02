@@ -61,6 +61,16 @@
 //! bound is chosen once and logged once at start; every wait is counted
 //! ([`RoundBoundStats`]).
 //!
+//! ## A peer with no route backs off (CIRISEdge#794)
+//!
+//! A round that fails because the transport has NO ROUTE to its peer puts the
+//! whole peer — every coordinator toward it — into one shared exponential
+//! backoff with full jitter ([`super::no_route_backoff`]). While it holds, the
+//! peer's coordinators skip ticks AND kicks without taking a gate permit; one
+//! of them probes when the delay expires. Evidence that the peer is reachable
+//! (a path, an identified link, a frame from it) clears the backoff and kicks
+//! the peer's coordinators at once.
+//!
 //! ## Round timeout
 //!
 //! Each in-flight `SendThenWait` wait is bounded by `round_timeout`.
@@ -79,6 +89,7 @@ use tracing::Instrument;
 use tokio::sync::{mpsc, watch};
 
 use super::coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};
+use super::no_route_backoff::{Admission, NoRouteBackoff, NoRouteBackoffEntry, RoundClass};
 use super::protocol::EnvelopeKind;
 use super::session::SessionRole;
 
@@ -301,6 +312,9 @@ pub struct ReplicationScheduler {
     command_rx: Option<mpsc::Receiver<SchedulerCommand>>,
     /// CIRISEdge#740 — the round bound, shared by every coordinator task.
     round_gate: Arc<RoundGate>,
+    /// CIRISEdge#794 — the per-peer no-route backoff, shared by every
+    /// coordinator task, the handle and the registry's inbound door.
+    backoff: Arc<NoRouteBackoff>,
     /// CIRISEdge#440 — the resolved mesh-config read seam. When `Some`, each
     /// coordinator loop re-checks `antientropy.round_secs` ONCE per round
     /// (after the round, before the next tick is scheduled): a live relief
@@ -403,6 +417,8 @@ pub struct SchedulerHandle {
     command_tx: mpsc::Sender<SchedulerCommand>,
     /// CIRISEdge#740 — read access to the scheduler's round gate.
     round_gate: Arc<RoundGate>,
+    /// CIRISEdge#794 — the scheduler's no-route backoff.
+    backoff: Arc<NoRouteBackoff>,
 }
 
 impl SchedulerHandle {
@@ -410,6 +426,45 @@ impl SchedulerHandle {
     #[must_use]
     pub fn round_bound(&self) -> RoundBoundStats {
         self.round_gate.stats()
+    }
+
+    /// CIRISEdge#794 — every peer backed off for having no route, with its
+    /// next-attempt time and current window. Empty in the steady state.
+    #[must_use]
+    pub fn no_route_backoff(&self) -> Vec<NoRouteBackoffEntry> {
+        self.backoff.snapshot()
+    }
+
+    /// CIRISEdge#794 — evidence that `peer_key_id` is reachable. Clears its
+    /// no-route backoff, if any, and kicks its coordinators now. Never blocks;
+    /// a no-op for a peer that is not backed off. The runtime feeds this from
+    /// the transport's [`subscribe_reachability`](crate::transport::Transport::subscribe_reachability)
+    /// and from every attributed inbound CRPL frame; a host with its own
+    /// evidence may call it too.
+    pub fn note_reachable(
+        &self,
+        peer_key_id: &str,
+        evidence: crate::transport::ReachabilityEvidence,
+    ) {
+        self.backoff.note_reachable(peer_key_id, evidence);
+    }
+
+    /// CIRISEdge#794 — change the no-route backoff's window ceiling on a
+    /// running scheduler (see [`ReplicationScheduler::with_no_route_backoff_cap`]).
+    /// Takes effect at each backed-off peer's next window.
+    pub fn set_no_route_backoff_cap(&self, cap: Duration) {
+        self.backoff.set_cap(cap);
+    }
+
+    /// The window ceiling in force.
+    #[must_use]
+    pub fn no_route_backoff_cap(&self) -> Duration {
+        self.backoff.cap()
+    }
+
+    /// The backoff itself, for the registry's inbound door.
+    pub(crate) fn backoff(&self) -> Arc<NoRouteBackoff> {
+        Arc::clone(&self.backoff)
     }
 
     /// Add an Initiator coordinator to the running scheduler. The
@@ -509,6 +564,7 @@ impl ReplicationScheduler {
             coordinators: Vec::new(),
             command_rx: None,
             round_gate: Arc::new(RoundGate::new(config.max_concurrent_rounds)),
+            backoff: Arc::new(NoRouteBackoff::new()),
             mesh_config: None,
         }
     }
@@ -517,6 +573,35 @@ impl ReplicationScheduler {
     #[must_use]
     pub fn round_bound(&self) -> RoundBoundStats {
         self.round_gate.stats()
+    }
+
+    /// CIRISEdge#794 — see [`SchedulerHandle::no_route_backoff`].
+    #[must_use]
+    pub fn no_route_backoff(&self) -> Vec<NoRouteBackoffEntry> {
+        self.backoff.snapshot()
+    }
+
+    /// CIRISEdge#794 — the ceiling of the per-peer no-route backoff window
+    /// (builder). A peer the transport has no route to is retried after a
+    /// delay drawn from `[0, window]`, the window doubling from
+    /// [`NO_ROUTE_BACKOFF_INITIAL`](super::no_route_backoff::NO_ROUTE_BACKOFF_INITIAL)
+    /// up to this. Without this call the cap is
+    /// [`DEFAULT_NO_ROUTE_BACKOFF_CAP`](super::no_route_backoff::DEFAULT_NO_ROUTE_BACKOFF_CAP)
+    /// (15 min); under 1 s is raised to 1 s. A running scheduler's cap is
+    /// changed through [`SchedulerHandle::set_no_route_backoff_cap`].
+    #[must_use]
+    pub fn with_no_route_backoff_cap(self, cap: Duration) -> Self {
+        self.backoff.set_cap(cap);
+        self
+    }
+
+    /// Tests pin the jitter so the probe schedule is countable.
+    #[cfg(test)]
+    pub(crate) fn with_backoff_jitter(mut self, jitter: fn(Duration) -> Duration) -> Self {
+        let pinned = NoRouteBackoff::with_jitter(jitter);
+        pinned.set_cap(self.backoff.cap());
+        self.backoff = Arc::new(pinned);
+        self
     }
 
     /// CIRISEdge#440 — install the resolved mesh-config reader (builder); see
@@ -545,6 +630,7 @@ impl ReplicationScheduler {
         SchedulerHandle {
             command_tx,
             round_gate: Arc::clone(&self.round_gate),
+            backoff: Arc::clone(&self.backoff),
         }
     }
 
@@ -611,6 +697,9 @@ impl ReplicationScheduler {
         // CIRISEdge#740 — the bound is chosen once, here, and said once.
         let round_gate = Arc::clone(&self.round_gate);
         round_gate.log_bound(self.coordinators.len());
+        // CIRISEdge#794 — a peer leaving backoff wakes its coordinators here.
+        let backoff = Arc::clone(&self.backoff);
+        let mut wakes = backoff.take_wakes();
 
         let mesh_config = self.mesh_config.take();
         for coord in self.coordinators.drain(..) {
@@ -623,6 +712,7 @@ impl ReplicationScheduler {
                 event_sink.clone(),
                 mesh_config.clone(),
                 Arc::clone(&round_gate),
+                Arc::clone(&backoff),
             );
         }
 
@@ -664,36 +754,26 @@ impl ReplicationScheduler {
                                 event_sink.clone(),
                                 mesh_config.clone(),
                                 Arc::clone(&round_gate),
+                                Arc::clone(&backoff),
                             );
                         }
                         SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
-                            if let Some(c) = per_coord.remove(&(peer_key_id, kind)) {
-                                let _ = c.cancel.send(true);
-                            }
+                            remove_initiator(&mut per_coord, &backoff, &peer_key_id, kind);
                         }
                         SchedulerCommand::RoundNow { peer_key_id } => {
-                            let mut kicked = 0usize;
-                            for ((peer, _kind), c) in &per_coord {
-                                let wanted = match peer_key_id.as_deref() {
-                                    None => true,
-                                    Some(p) => p == peer,
-                                };
-                                if wanted {
-                                    c.kick.notify_one();
-                                    kicked += 1;
-                                }
-                            }
-                            tracing::debug!(
-                                peer = ?peer_key_id,
-                                kicked,
-                                "scheduler: RoundNow — rounds fired ahead of the cadence"
-                            );
+                            round_now_kick(&per_coord, peer_key_id.as_deref());
                         }
                         SchedulerCommand::Propagate { from_peer, kind } => {
                             propagate_kick(&per_coord, &from_peer, kind);
                         }
                         SchedulerCommand::Kick { peer_key_id, kind } => kick_one(&per_coord, peer_key_id, kind),
                     }
+                }
+                Some(wake) = async {
+                    // SAFETY of unwrap: guarded by `if wakes.is_some()`.
+                    wakes.as_mut().unwrap().recv().await
+                }, if wakes.is_some() => {
+                    wake_kick(&per_coord, &wake);
                 }
                 else => {
                     // command_rx is None AND cancel is not changing —
@@ -730,6 +810,7 @@ fn spawn_coord(
     event_sink: Option<mpsc::Sender<(String, RoundEvent)>>,
     mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
     round_gate: Arc<RoundGate>,
+    backoff: Arc<NoRouteBackoff>,
 ) {
     debug_assert_eq!(
         coord.role(),
@@ -756,6 +837,7 @@ fn spawn_coord(
             event_sink,
             mesh_config,
             round_gate,
+            backoff,
         )
         .await;
     });
@@ -772,6 +854,7 @@ async fn run_one_coordinator_forever(
     event_sink: Option<tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
     mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
     round_gate: Arc<RoundGate>,
+    backoff: Arc<NoRouteBackoff>,
 ) {
     let mut interval = tokio::time::interval(cadence);
     // `Burst` is the default; with `MissedTickBehavior::Skip` a
@@ -787,6 +870,15 @@ async fn run_one_coordinator_forever(
 
     let peer_id = coord.peer_key_id().to_string();
     let kind_str = format!("{:?}", coord.kind());
+    let round = GatedRound {
+        coord: &coord,
+        round_timeout,
+        event_sink: event_sink.as_ref(),
+        peer_id: &peer_id,
+        kind_str: &kind_str,
+        round_gate: &round_gate,
+        backoff: &backoff,
+    };
 
     loop {
         tokio::select! {
@@ -812,14 +904,14 @@ async fn run_one_coordinator_forever(
                 // while the task is parked (on the gate, or in the round), so
                 // every later round polled on that worker nested under it:
                 // 9,495 spans deep on the canonical, then a stack overflow.
+                //
+                // CIRISEdge#794 — a kick does not bypass the no-route backoff:
+                // a backed-off peer's coordinator ignores it (and takes no
+                // permit). The schedule is then left alone, not reset.
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str, kicked = true);
-                async {
-                    let _permit = round_gate.enter(&peer_id, &kind_str).await;
-                    round_and_report(&coord, round_timeout, event_sink.as_ref(), &peer_id).await;
+                if round.run().instrument(span).await {
+                    interval.reset();
                 }
-                .instrument(span)
-                .await;
-                interval.reset();
             }
             _ = interval.tick() => {
                 // CIRISEdge#740 — behind the same gate: every coordinator's
@@ -827,12 +919,7 @@ async fn run_one_coordinator_forever(
                 // fan-out too.
                 // CIRISEdge#790 — instrumented, never entered (see the kick arm).
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
-                async {
-                    let _permit = round_gate.enter(&peer_id, &kind_str).await;
-                    round_and_report(&coord, round_timeout, event_sink.as_ref(), &peer_id).await;
-                }
-                .instrument(span)
-                .await;
+                round.run().instrument(span).await;
                 if let Some(reader) = &mesh_config {
                     let target = reader.relief().await.round_cadence.unwrap_or(cadence);
                     if target != current_cadence {
@@ -857,15 +944,67 @@ async fn run_one_coordinator_forever(
     }
 }
 
+/// One coordinator's round, as both the tick and the kick arm run it: past the
+/// no-route backoff (CIRISEdge#794), then through the round gate (#740).
+struct GatedRound<'a> {
+    coord: &'a Arc<ReplicationCoordinator>,
+    round_timeout: Duration,
+    event_sink: Option<&'a tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
+    peer_id: &'a str,
+    kind_str: &'a str,
+    round_gate: &'a RoundGate,
+    backoff: &'a NoRouteBackoff,
+}
+
+impl GatedRound<'_> {
+    /// Run the round unless the peer is backed off. Returns whether it ran.
+    async fn run(&self) -> bool {
+        // Decided BEFORE the gate: a backed-off coordinator never holds or
+        // queues for a permit.
+        let Admission::Run(ticket) = self.backoff.admit(self.peer_id, self.coord.kind()) else {
+            tracing::trace!("round skipped — peer is in no-route backoff (CIRISEdge#794)");
+            return false;
+        };
+        let _permit = self.round_gate.enter(self.peer_id, self.kind_str).await;
+        // Another plane may have found the peer unroutable while this one
+        // waited for its permit.
+        if ticket.overtaken() {
+            return false;
+        }
+        let class = round_and_report(
+            self.coord,
+            self.round_timeout,
+            self.event_sink,
+            self.peer_id,
+        )
+        .await;
+        ticket.finish(class);
+        true
+    }
+}
+
+/// CIRISEdge#794 — the no-route classification of a round error, typed.
+fn round_class_of(e: &RoundError) -> RoundClass {
+    match e {
+        RoundError::Coordinator(CoordinatorError::Transport(t)) => {
+            RoundClass::of_transport_error(t).unwrap_or(RoundClass::Other)
+        }
+        RoundError::Coordinator(_) | RoundError::Timeout | RoundError::InboundClosed => {
+            RoundClass::Other
+        }
+    }
+}
+
 /// One anti-entropy round toward this coordinator's peer — the signer-recovery
 /// attempt first, then the ordinary round — and its [`RoundEvent`] to the sink.
 /// Shared by the cadence tick and the [`SchedulerCommand::RoundNow`] kick.
+/// Returns how the round ended, for the no-route backoff (CIRISEdge#794).
 async fn round_and_report(
     coord: &Arc<ReplicationCoordinator>,
     round_timeout: Duration,
     event_sink: Option<&tokio::sync::mpsc::Sender<(String, RoundEvent)>>,
     peer_id: &str,
-) {
+) -> RoundClass {
     // FSD-SIGNER-RECOVERY D3 — a recovery round REPLACES this
     // tick's ordinary round; the two never overlap. It costs one
     // cadence tick per recovered key, and only on a tick where a
@@ -875,6 +1014,16 @@ async fn round_and_report(
     let recovery = match run_one_recovery_round(coord, round_timeout).await {
         Ok(step) => step,
         Err(e) => {
+            // CIRISEdge#794 — no route: the ordinary round would fail the
+            // same way, so it does not run; the backoff takes over.
+            if let RoundClass::NoRoute(error) = round_class_of(&e) {
+                tracing::debug!(%error, "signer-recovery round: no route to peer (CIRISEdge#794)");
+                if let Some(sink) = event_sink {
+                    let event = RoundEvent::Error(format!("transport: {error}"));
+                    let _ = sink.send((peer_id.to_string(), event)).await;
+                }
+                return RoundClass::NoRoute(error);
+            }
             // A failed recovery must not also cost this peer its
             // ordinary round. The row stays transient-refused and
             // re-notes its signer on the next offer (D6).
@@ -897,9 +1046,14 @@ async fn round_and_report(
         if let Some(sink) = event_sink {
             let _ = sink.send((peer_id.to_string(), event)).await;
         }
-        return;
+        return RoundClass::Other;
     }
-    let event = match run_one_round(coord, round_timeout).await {
+    let outcome = run_one_round(coord, round_timeout).await;
+    let class = match &outcome {
+        Ok(_) => RoundClass::Other,
+        Err(e) => round_class_of(e),
+    };
+    let event = match outcome {
         // CIRISEdge#380 — run_one_round converts SendThenComplete to
         // Complete after sending; the merged arm is defensive if it
         // ever leaks through.
@@ -920,6 +1074,12 @@ async fn round_and_report(
         Err(RoundError::Timeout) => {
             tracing::warn!("round timed out waiting for peer reply");
             RoundEvent::TimedOut
+        }
+        // CIRISEdge#794 — no route is logged once per backoff entry and
+        // exit by the backoff, never once per round.
+        Err(RoundError::Coordinator(e)) if matches!(class, RoundClass::NoRoute(_)) => {
+            tracing::debug!(error = %e, "round: no route to peer (CIRISEdge#794)");
+            RoundEvent::Error(e.to_string())
         }
         Err(RoundError::Coordinator(e)) => {
             tracing::warn!(error = %e, "coordinator error during round");
@@ -945,6 +1105,7 @@ async fn round_and_report(
     // expires. Relief can only LENGTHEN the cadence
     // (relieve-never-expand, enforced in persist's fold), so this
     // can never speed rounds up past what the operator configured.
+    class
 }
 
 #[derive(Debug)]
@@ -978,6 +1139,55 @@ fn kick_one(
 ) {
     if let Some(c) = per_coord.get(&(peer_key_id, kind)) {
         c.kick.notify_one();
+    }
+}
+
+/// v19.0.0 — the `RoundNow` arm: kick every coordinator toward `peer_key_id`
+/// (every coordinator, `None`).
+fn round_now_kick(
+    per_coord: &HashMap<(String, EnvelopeKind), CoordControl>,
+    peer_key_id: Option<&str>,
+) {
+    let mut kicked = 0usize;
+    for ((peer, _kind), c) in per_coord {
+        if peer_key_id.map_or(true, |p| p == peer) {
+            c.kick.notify_one();
+            kicked += 1;
+        }
+    }
+    tracing::debug!(
+        peer = ?peer_key_id,
+        kicked,
+        "scheduler: RoundNow — rounds fired ahead of the cadence"
+    );
+}
+
+/// The `RemoveInitiator` arm: stop the one coordinator. CIRISEdge#794 — a peer
+/// with no coordinator left is out of the send set; its backoff goes too.
+fn remove_initiator(
+    per_coord: &mut HashMap<(String, EnvelopeKind), CoordControl>,
+    backoff: &NoRouteBackoff,
+    peer_key_id: &str,
+    kind: EnvelopeKind,
+) {
+    if let Some(c) = per_coord.remove(&(peer_key_id.to_owned(), kind)) {
+        let _ = c.cancel.send(true);
+    }
+    if !per_coord.keys().any(|(p, _)| p == peer_key_id) {
+        backoff.forget(peer_key_id);
+    }
+}
+
+/// CIRISEdge#794 — a peer left backoff: kick its coordinators now, except the
+/// plane whose probe just ran.
+fn wake_kick(
+    per_coord: &HashMap<(String, EnvelopeKind), CoordControl>,
+    wake: &super::no_route_backoff::Wake,
+) {
+    for ((peer, kind), c) in per_coord {
+        if *peer == wake.peer_key_id && Some(*kind) != wake.except {
+            c.kick.notify_one();
+        }
     }
 }
 

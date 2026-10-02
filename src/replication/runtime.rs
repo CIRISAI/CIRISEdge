@@ -435,6 +435,43 @@ fn log_started(config: &ReplicationRuntimeConfig, peers: usize, proactive_publis
     );
 }
 
+/// CIRISEdge#794 — feed the transport's per-peer reachability evidence (a path
+/// learned, a link identified) into the scheduler's no-route backoff. A
+/// transport with no such events spawns nothing.
+pub(crate) fn spawn_reachability_forwarder(
+    transport: &Arc<dyn Transport>,
+    handle: &SchedulerHandle,
+    cancel_rx: &watch::Receiver<bool>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    let Some(mut events) = transport.subscribe_reachability() else {
+        return;
+    };
+    let handle = handle.clone();
+    let mut cancel = cancel_rx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => {
+                    if *cancel.borrow() {
+                        return;
+                    }
+                }
+                event = events.recv() => match event {
+                    Ok(seen) => handle.note_reachable(&seen.peer_key_id, seen.evidence),
+                    // Evidence lost to lag only delays a clear; the backoff
+                    // still expires on its own schedule.
+                    Err(RecvError::Lagged(missed)) => tracing::debug!(
+                        missed,
+                        "reachability evidence lagged (CIRISEdge#794)"
+                    ),
+                    Err(RecvError::Closed) => return,
+                },
+            }
+        }
+    });
+}
+
 fn spawn_scheduler_task(
     scheduler: ReplicationScheduler,
     handle: &SchedulerHandle,
@@ -997,6 +1034,8 @@ impl ReplicationRuntime {
         let mut scheduler =
             ReplicationScheduler::new(config.scheduler).with_mesh_config(mesh_config.clone());
         let scheduler_handle = with_release_kick(&bridge, scheduler.install_control_channel());
+        // CIRISEdge#794 — inbound frames clear their sender's no-route backoff.
+        registry.install_no_route_backoff(&scheduler_handle);
         let coords: Vec<Arc<ReplicationCoordinator>> = peers
             .iter()
             .map(|peer| {
@@ -1035,6 +1074,7 @@ impl ReplicationRuntime {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let key_grant_emitter = spawn_key_grant_emitter_for(&config, key_grant_wake, &cancel_rx);
+        spawn_reachability_forwarder(&transport, &scheduler_handle, &cancel_rx);
         // CIRISEdge#370/#636 — see [`spawn_scheduler_task`] for the event sink.
         let scheduler_task = spawn_scheduler_task(scheduler, &scheduler_handle, cancel_rx, &config);
 
@@ -1488,6 +1528,20 @@ impl ReplicationRuntime {
     /// this when bytes arrive from an identified source peer.
     pub fn registry(&self) -> Arc<ReplicationRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    /// CIRISEdge#794 — every peer backed off for having no route, with its
+    /// next-attempt time and current window.
+    #[must_use]
+    pub fn no_route_backoff(&self) -> Vec<super::no_route_backoff::NoRouteBackoffEntry> {
+        self.scheduler_handle.no_route_backoff()
+    }
+
+    /// CIRISEdge#794 — set the no-route backoff's window ceiling (default
+    /// [`DEFAULT_NO_ROUTE_BACKOFF_CAP`](super::no_route_backoff::DEFAULT_NO_ROUTE_BACKOFF_CAP),
+    /// 15 min). Takes effect at each backed-off peer's next window.
+    pub fn set_no_route_backoff_cap(&self, cap: std::time::Duration) {
+        self.scheduler_handle.set_no_route_backoff_cap(cap);
     }
 
     /// CIRISEdge#740 — the scheduler's round bound and its counters: the

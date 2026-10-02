@@ -133,6 +133,9 @@ pub mod mesh_config;
 /// CIRISEdge#552 — which Key an unverifiable signature was missing, so it can
 /// be pulled. `Key` is the root of every admission's dependency closure.
 pub mod missing_signer;
+pub mod no_route_backoff;
+#[cfg(test)]
+mod no_route_backoff_794_tests;
 #[cfg(test)]
 mod occurrence_before_binding_776_tests;
 pub mod protocol;
@@ -378,6 +381,10 @@ pub use refusal_backoff::{RefusalBackoff, RetryDisposition};
 #[doc(inline)]
 pub use bridge::BridgeEngine;
 pub use bridge::RevocationWiring;
+#[doc(inline)]
+pub use no_route_backoff::{
+    BackoffExit, NoRouteBackoffEntry, DEFAULT_NO_ROUTE_BACKOFF_CAP, NO_ROUTE_BACKOFF_INITIAL,
+};
 pub use registry::{RegistryError, ReplicationRegistry, RouteOutcome};
 #[doc(inline)]
 pub use runtime::{

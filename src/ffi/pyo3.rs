@@ -3053,6 +3053,62 @@ impl PyReplicationHandle {
         })
     }
 
+    /// CIRISEdge#794 — every peer this node's anti-entropy has backed off
+    /// because the transport has NO ROUTE to it: a list of dicts
+    /// `{"peer_key_id", "current_delay_secs", "next_attempt_in_secs",
+    /// "next_attempt_unix_ms", "failed_probes", "backed_off_secs", "probing"}`,
+    /// sorted by peer. Empty in the steady state and after `stop()`. A
+    /// backed-off peer stays in the send set; its rounds and kicks are held
+    /// until a path, a link or a frame from it shows up, or its delay expires.
+    fn no_route_backoff<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        let entries = py.detach(|| {
+            run_async(&executor, async move {
+                inner
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(crate::replication::ReplicationRuntime::no_route_backoff)
+                    .unwrap_or_default()
+            })
+        });
+        let out = pyo3::types::PyList::empty(py);
+        for e in entries {
+            let d = pyo3::types::PyDict::new(py);
+            d.set_item("peer_key_id", &e.peer_key_id)?;
+            d.set_item("current_delay_secs", e.current_delay.as_secs_f64())?;
+            d.set_item("next_attempt_in_secs", e.next_attempt_in.as_secs_f64())?;
+            d.set_item("next_attempt_unix_ms", e.next_attempt_unix_ms)?;
+            d.set_item("failed_probes", e.failed_probes)?;
+            d.set_item("backed_off_secs", e.backed_off_for.as_secs_f64())?;
+            d.set_item("probing", e.probing)?;
+            out.append(d)?;
+        }
+        Ok(out)
+    }
+
+    /// CIRISEdge#794 — set the no-route backoff's window ceiling, in seconds
+    /// (default 900 = 15 min; under 1 s is raised to 1 s). Takes effect at
+    /// each backed-off peer's next window. A no-op after `stop()`.
+    fn set_no_route_backoff_cap(&self, py: Python<'_>, cap_secs: f64) -> PyResult<()> {
+        let cap = std::time::Duration::try_from_secs_f64(cap_secs).map_err(|e| {
+            PyValueError::new_err(format!(
+                "cap_secs must be a finite non-negative number: {e}"
+            ))
+        })?;
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                if let Some(rt) = inner.lock().await.as_ref() {
+                    rt.set_no_route_backoff_cap(cap);
+                }
+            });
+        });
+        Ok(())
+    }
+
     /// CIRISEdge#462 — pull a subject's own testimony from a peer (the RECEIVE
     /// axis). For each subject-pullable kind, ensures a scheduled Initiator
     /// coordinator for `peer_key_id` and sends a subject-scoped `Pull`; the peer
