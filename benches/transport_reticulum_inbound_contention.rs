@@ -109,9 +109,12 @@ use common::{build_in_memory_backend, signed_record, BenchFedKey};
 
 /// How many independent flooder peers hammer V's inbound path. Each is a distinct
 /// link → a distinct concurrent inbound-decrypt task contending for V's node lock,
-/// which is what leviculum#29's 20–40-link fan-out reproduced. Kept modest so the
-/// N+2-node mutual discovery at fixture build stays under the timeout.
-const N_FLOODERS: usize = 8;
+/// which is what leviculum#29's 20–40-link fan-out reproduced. Kept SMALL (#369
+/// rock-solid): fewer nodes → an N+2-node discovery that reliably completes on a
+/// flaky/loaded runner within one attempt (bench.yml retries the whole run 3× as
+/// the backstop). Still ample concurrent inbound to feed the drain past any single
+/// flooder link's failure.
+const N_FLOODERS: usize = 4;
 /// The measured outbound payload. leviculum#29 used 1 MiB; edge's loopback bench
 /// tops out at a PROVEN-deliverable 64 KiB, so this rides the resource path
 /// (segmented, > the ~470 B MDU) at a size this harness reassembles reliably.
