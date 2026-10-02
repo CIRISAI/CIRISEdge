@@ -15,7 +15,11 @@ use super::{content_aad, BlobPointer, ContentField};
 
 /// What went wrong, typed so a caller can tell "you may not read this" from
 /// "this is not here" from "the bytes are wrong".
+///
+/// `#[non_exhaustive]` (CIRISEdge#779): a match outside this crate carries a
+/// wildcard arm, so the next refusal the substrate learns is not a MAJOR.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GroupContentError {
     /// The viewer holds no grant on this content.
     ///
@@ -136,7 +140,11 @@ pub enum GroupContentError {
 /// and its own at-rest address (over its ciphertext), which is what the
 /// key_grant that would open it names. A refusal naming only the file's
 /// address sent the field looking for the wrong row.
+///
+/// `#[non_exhaustive]`: read it, never build it outside this crate, so a
+/// field it gains later is not a MAJOR.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RefusedChunk {
     /// The chunk's position in its stream.
     pub seq: u64,

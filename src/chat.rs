@@ -1533,7 +1533,12 @@ pub enum Body {
 /// Every arm carries `detail` — the substrate's own sentence — because a
 /// refusal that cannot be followed back is one nobody can act on. `Display`
 /// renders it, so a caller that only wants text gets what it got before.
+///
+/// `#[non_exhaustive]` (CIRISEdge#779, in the same MAJOR as
+/// [`crate::group_content::GroupContentError`]'s): a match outside this
+/// crate carries a wildcard arm, so the next reason is not a MAJOR.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UnopenedReason {
     /// Not held on this node yet. A pull may be in flight, queued, or not
     /// yet triggered; the state to wait through.

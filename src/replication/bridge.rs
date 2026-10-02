@@ -9198,6 +9198,11 @@ impl FederationDirectoryReplicationBridge {
                     "key_grant set admitted — wraps addressed to this node's occurrences \
                      projected as grants (CIRISPersist#848)"
                 );
+                // CIRISEdge#779 — a DAG pull parked on this key is woken now,
+                // not when (or if) its retry ladder comes round again.
+                if let Some(sink) = self.pull_sink.as_ref() {
+                    sink.key_grant_admitted(&admission);
+                }
                 match admission.attestation {
                     ReplicatedAttestationOutcome::Inserted => ApplyOutcome::Admitted,
                     // The carrier was already held (or deduplicated by hash).

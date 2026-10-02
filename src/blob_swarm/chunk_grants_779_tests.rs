@@ -28,7 +28,7 @@ use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyReco
 use ciris_persist::store::backend::Backend as _;
 use ciris_persist::store::sqlite::SqliteBackend;
 
-use super::pull::{BlobPuller, DagByteFetch, PullConfig, PullOutcome};
+use super::pull::{BlobPuller, DagByteFetch, PullConfig, PullOutcome, PullSink};
 use crate::files::{FileError, FileRow, FileWrite};
 use crate::group_content::{GroupContentError, GroupContentStore as _, PersistGroupContentStore};
 use crate::receipts::{self, StreamLog as _};
@@ -286,6 +286,14 @@ fn edge_of(node: &Node) -> Arc<crate::Edge> {
 }
 
 fn puller_of(node: &Node, edge: &Arc<crate::Edge>) -> Arc<BlobPuller<SqliteBackend>> {
+    puller_with(node, edge, PullConfig::default())
+}
+
+fn puller_with(
+    node: &Node,
+    edge: &Arc<crate::Edge>,
+    config: PullConfig,
+) -> Arc<BlobPuller<SqliteBackend>> {
     use ciris_persist::federation::FederationDirectory;
     BlobPuller::new(
         Arc::clone(edge),
@@ -293,7 +301,7 @@ fn puller_of(node: &Node, edge: &Arc<crate::Edge>) -> Arc<BlobPuller<SqliteBacke
         node.dir.clone(),
         node.dir.clone() as Arc<dyn FederationDirectory>,
         node.me.clone(),
-        PullConfig::default(),
+        config,
     )
 }
 
@@ -396,8 +404,14 @@ async fn publish_self_file(author: &Node, owner: &Ident) -> Published {
 }
 
 /// Apply the author's `key_grant` sets through `reader`'s key-grant door,
-/// except those for a blob in `withhold`. Returns how many were applied.
-async fn cross_keys_except(author: &Node, reader: &Node, withhold: &[[u8; 32]]) -> usize {
+/// except those for a blob in `withhold`, and hand each admission to `sink`
+/// as the bridge's key-grant door does. Returns how many were applied.
+async fn cross_keys_except(
+    author: &Node,
+    reader: &Node,
+    withhold: &[[u8; 32]],
+    sink: Option<&PullSink>,
+) -> usize {
     author
         .store
         .engine()
@@ -424,7 +438,7 @@ async fn cross_keys_except(author: &Node, reader: &Node, withhold: &[[u8; 32]]) 
                 continue;
             }
         }
-        reader
+        let admission = reader
             .store
             .engine()
             .apply_replicated_key_grant(SignedKeyGrantSet {
@@ -432,6 +446,9 @@ async fn cross_keys_except(author: &Node, reader: &Node, withhold: &[[u8; 32]]) 
             })
             .await
             .expect("the reader admits the set");
+        if let Some(sink) = sink {
+            sink.key_grant_admitted(&admission);
+        }
         applied += 1;
     }
     applied
@@ -501,7 +518,7 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
 
     // 2. The manifest's wrap and chunks 0..=2's land; 3 and 4's have not.
     //    Every chunk's BYTES arrive on this pull.
-    assert!(cross_keys_except(&node_a, &node_b, &late_chunks(&file)).await > 0);
+    assert!(cross_keys_except(&node_a, &node_b, &late_chunks(&file), None).await > 0);
     let early = puller
         .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
         .await;
@@ -524,7 +541,7 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
 
     // 3. The last grants land: the resume promotes, receipts once, and the
     //    whole file streams through `FileRow::chunks`.
-    assert!(cross_keys_except(&node_a, &node_b, &[]).await > 0);
+    assert!(cross_keys_except(&node_a, &node_b, &[], None).await > 0);
     assert_eq!(
         puller
             .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
@@ -565,7 +582,7 @@ async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
         .await
         .expect("B admits the crossed row");
     let puller = puller_of(&node_b, &edge_b);
-    cross_keys_except(&node_a, &node_b, &late_chunks(&file)).await;
+    cross_keys_except(&node_a, &node_b, &late_chunks(&file), None).await;
     assert!(matches!(
         puller
             .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
@@ -633,4 +650,94 @@ async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
     );
     let chunk = chunk.expect("the refused chunk is named");
     assert_eq!((chunk.seq, chunk.sha256_hex), (3, late));
+}
+
+async fn promoted(node: &Node, sha: &[u8; 32]) -> bool {
+    node.dir
+        .blob_head(sha)
+        .await
+        .expect("blob_head")
+        .is_some_and(|h| h.storage_kind == "chunk_dag")
+}
+
+/// **A DAG parked past its whole retry ladder is still stored when its
+/// grants land.** The ladder is bounded and the bridge offers a row once, so
+/// before the wake a stall longer than the ladder left the file unpromoted
+/// for good, even after every grant arrived. Here the ladder is two attempts
+/// 50 ms apart; it runs out with chunks 3 and 4 unwrapped; the last grants
+/// land through the key-grant door's hook; the puller's own loop promotes the
+/// file and receipts it once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dag_parked_past_its_ladder_is_woken_by_its_grants_779() {
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: file.row.clone(),
+        })
+        .await
+        .expect("B admits the crossed row");
+    let puller = puller_with(
+        &node_b,
+        &edge_b,
+        PullConfig {
+            max_attempts: 2,
+            retry_backoff: std::time::Duration::from_millis(50),
+            ..PullConfig::default()
+        },
+    );
+    let (sink, run) = Arc::clone(&puller).start();
+
+    // Every chunk's bytes, and every wrap but chunks 3 and 4's.
+    cross_keys_except(&node_a, &node_b, &late_chunks(&file), Some(&sink)).await;
+    assert!(matches!(
+        puller
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::DagAwaitingKey { .. }
+    ));
+
+    // The stall: longer than the whole ladder. The loop's retries run out.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while puller.retry_booked(file.sha) {
+        assert!(std::time::Instant::now() < deadline, "the ladder runs out");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !puller.retry_booked(file.sha),
+        "nothing is left on the ladder"
+    );
+    assert!(!promoted(&node_b, &file.sha).await);
+    assert!(receipt_rows(&node_b, &file.stream_id).await.is_empty());
+
+    // The last grants land. Nothing re-offers the row; the grant wakes it.
+    assert!(cross_keys_except(&node_a, &node_b, &[], Some(&sink)).await > 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !promoted(&node_b, &file.sha).await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "chunks 3 and 4 are wrapped here now, and the parked DAG was never re-pulled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // Let any duplicate wake run before counting.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(receipt_rows(&node_b, &file.stream_id).await.len(), 1);
+    assert_eq!(receipts_emitted(&edge_b), 1);
+
+    let file_row = FileRow::from_row(&file.row).expect("a file row");
+    let mut walk = file_row.chunks(&node_b.store, &node_b.me);
+    let mut read = Vec::with_capacity(FILE_LEN);
+    while let Some(item) = walk.next().await {
+        read.extend_from_slice(&item.expect("every chunk opens as this node"));
+    }
+    assert!(
+        read == file.plain,
+        "the walk reads the file the author wrote"
+    );
+    drop(sink);
+    run.abort();
 }

@@ -54,6 +54,7 @@ use ciris_persist::federation::{
 use futures::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::mpsc;
 
+use super::key_wake::{self, KeyWaits};
 use super::meaning::{BlobMeaning, MeaningRefusal};
 use super::store_gate::{BlobStorePolicy, StoreDisposition};
 use super::{
@@ -88,6 +89,9 @@ pub enum PullOffer {
 pub struct PullSink {
     tx: mpsc::Sender<PullRequest>,
     dropped: Arc<AtomicU64>,
+    /// CIRISEdge#779 — the puller's parked-DAG register, so the key-grant
+    /// door can wake the DAG a grant names.
+    key_waits: Arc<KeyWaits>,
 }
 
 impl std::fmt::Debug for PullSink {
@@ -134,6 +138,33 @@ impl PullSink {
         }
     }
 
+    /// CIRISEdge#779 — **a key_grant set was admitted.** If it wrote a wrap
+    /// to this node, wake the parked DAG pull waiting on it: a content-axis
+    /// set names the row (manifest or chunk) it opens, an epoch-axis set the
+    /// epoch. Never blocks and never awaits (the apply path's door, like
+    /// [`Self::offer`]); the puller's next tick re-pulls each woken DAG once,
+    /// from a fresh retry ladder, however many of its grants landed.
+    pub fn key_grant_admitted(
+        &self,
+        admission: &ciris_persist::federation::key_grant::KeyGrantAdmission,
+    ) {
+        use ciris_persist::federation::key_grant::KeyGrantAxis;
+        if admission.wraps_written == 0 {
+            return;
+        }
+        match &admission.axis {
+            KeyGrantAxis::Content { at_rest_sha256, .. } => {
+                let mut sha = [0u8; 32];
+                if hex::decode_to_slice(at_rest_sha256, &mut sha).is_ok() {
+                    self.key_waits.wake_content(sha);
+                }
+            }
+            KeyGrantAxis::Epoch { epoch, .. } => {
+                self.key_waits.wake_epoch(*epoch);
+            }
+        }
+    }
+
     /// How many offers the full queue has dropped since start-up.
     #[must_use]
     pub fn dropped(&self) -> u64 {
@@ -150,6 +181,7 @@ impl PullSink {
         Self {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
+            key_waits: Arc::new(KeyWaits::new(1)),
         }
     }
 }
@@ -1093,13 +1125,16 @@ pub struct BlobPuller<B> {
     config: PullConfig,
     in_flight: Mutex<HashSet<[u8; 32]>>,
     retries: Mutex<HashMap<[u8; 32], Retry>>,
+    /// CIRISEdge#779 — every sealed DAG parked on a key, and what it waits
+    /// on; shared with the [`PullSink`] so an admitted grant wakes it.
+    key_waits: Arc<KeyWaits>,
     /// CIRISEdge#779 — per sealed DAG parked on its chunk keys, how many
     /// chunks lacked this node's wrap at the last attempt. A retry that finds
     /// fewer restarts the attempt ladder: the grants arrive one set per chunk,
     /// in `seq` order, for minutes on a big file, so only CONSECUTIVE retries
-    /// that see no new grant count toward the ceiling. Nothing re-offers the
-    /// row when a grant lands, so a pull that gives up while it is still being
-    /// fed would leave the file unpromoted for good.
+    /// that see no new grant count toward the ceiling. The wake
+    /// ([`Self::key_waits`]) is what un-parks a DAG whose ladder ran out; this
+    /// keeps a pull that is being fed from running out in the first place.
     chunk_keys_missing: Mutex<HashMap<[u8; 32], u64>>,
 }
 
@@ -1161,6 +1196,7 @@ where
         config: PullConfig,
     ) -> Arc<Self> {
         let local_key_id = local_key_id.into();
+        let retry_capacity = config.retry_capacity;
         let policy: Arc<dyn BlobStorePolicy> = Arc::new(
             PersistBlobStorePolicy::new(directory, local_key_id.clone())
                 .with_commons_allowlist(config.commons_allowlist.iter().cloned())
@@ -1175,6 +1211,7 @@ where
             config,
             in_flight: Mutex::new(HashSet::new()),
             retries: Mutex::new(HashMap::new()),
+            key_waits: Arc::new(KeyWaits::new(retry_capacity)),
             chunk_keys_missing: Mutex::new(HashMap::new()),
         })
     }
@@ -1186,6 +1223,7 @@ where
         let sink = PullSink {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
+            key_waits: Arc::clone(&self.key_waits),
         };
         let handle = tokio::spawn(self.run(rx));
         (sink, handle)
@@ -1209,6 +1247,9 @@ where
                 _ = tick.tick() => {
                     for r in self.due_retries() {
                         self.dispatch(&limiter, r.row, r.sha, r.attempts);
+                    }
+                    for (sha, row) in self.woken_dags() {
+                        self.dispatch(&limiter, row, sha, 0);
                     }
                 }
             }
@@ -1239,6 +1280,51 @@ where
         });
     }
 
+    /// CIRISEdge#779 — the parked DAGs a grant woke since the last tick, not
+    /// in flight, each once and from a fresh ladder (a booked retry for the
+    /// same DAG is dropped: this dispatch replaces it).
+    fn woken_dags(&self) -> Vec<([u8; 32], Attestation)> {
+        let busy = match self.in_flight.lock() {
+            Ok(set) => set.clone(),
+            Err(_) => return Vec::new(),
+        };
+        let woken = self.key_waits.take_woken(&busy);
+        if !woken.is_empty() {
+            if let Ok(mut retries) = self.retries.lock() {
+                for (sha, _) in &woken {
+                    retries.remove(sha);
+                }
+            }
+        }
+        woken
+    }
+
+    /// CIRISEdge#779 — a parked DAG stops waiting on its key once the pull
+    /// ends any way but parked or deduped: stored, held, or refused for
+    /// good. A transient failure keeps it, so a grant can still wake it.
+    fn settle_key_wait(&self, sha: [u8; 32], outcome: &PullOutcome) {
+        if matches!(
+            outcome,
+            PullOutcome::Stored { .. }
+                | PullOutcome::AlreadyHeld
+                | PullOutcome::Refused(_)
+                | PullOutcome::DagRefused(_)
+                | PullOutcome::NoMeaning(_)
+        ) {
+            self.key_waits.forget(sha);
+        }
+    }
+
+    /// Whether a retry is booked for `sha` — how a witness tells a pull that
+    /// gave up from one still on its ladder.
+    #[cfg(test)]
+    pub(crate) fn retry_booked(&self, sha: [u8; 32]) -> bool {
+        self.retries
+            .lock()
+            .map(|r| r.contains_key(&sha))
+            .unwrap_or(false)
+    }
+
     fn due_retries(&self) -> Vec<Retry> {
         let now = std::time::Instant::now();
         let Ok(mut retries) = self.retries.lock() else {
@@ -1252,13 +1338,13 @@ where
         due.into_iter().filter_map(|k| retries.remove(&k)).collect()
     }
 
-    /// CIRISEdge#779 — the `seq`s of `chunks` this node holds no at-rest
-    /// wrap for: one `get_at_rest_grant` per chunk, the read door's own first
-    /// question (metadata only; nothing is unwrapped or opened).
+    /// CIRISEdge#779 — the `(seq, sha)` of every chunk this node holds no
+    /// at-rest wrap for: one `get_at_rest_grant` per chunk, the read door's
+    /// own first question (metadata only; nothing is unwrapped or opened).
     async fn chunks_without_wrap(
         &self,
         chunks: &[(u64, [u8; 32])],
-    ) -> Result<Vec<u64>, ciris_persist::federation::BlobError> {
+    ) -> Result<Vec<(u64, [u8; 32])>, ciris_persist::federation::BlobError> {
         let mut missing = Vec::new();
         for (seq, sha) in chunks {
             if self
@@ -1267,7 +1353,7 @@ where
                 .await?
                 .is_none()
             {
-                missing.push(*seq);
+                missing.push((*seq, *sha));
             }
         }
         Ok(missing)
@@ -1354,6 +1440,7 @@ where
             }
         }
         let outcome = self.pull_one_inner(row, sha, attempts).await;
+        self.settle_key_wait(sha, &outcome);
         if let Ok(mut set) = self.in_flight.lock() {
             set.remove(&sha);
         }
@@ -1827,6 +1914,7 @@ where
             self.pull_dag_inner(row, sha, 0, &meaning, fetch).await
         }
         .await;
+        self.settle_key_wait(sha, &outcome);
         if let Ok(mut set) = self.in_flight.lock() {
             set.remove(&sha);
         }
@@ -2049,6 +2137,17 @@ where
             // The key follows the bytes, in either order (persist I61/I62):
             // the manifest is held; the wrap to this node has not landed.
             Err(BlobError::NotGranted { .. }) => {
+                // CIRISEdge#779 — parked on the manifest's key: its wrap
+                // (self / family) or its epoch's grant (`community_dek`)
+                // wakes the pull, however long the ladder has given up.
+                self.key_waits.park(
+                    sha,
+                    row,
+                    match pointer.tier {
+                        CryptoTier::InvisibleEncrypted => key_wake::Awaiting::Content(vec![sha]),
+                        _ => key_wake::Awaiting::Epoch(pointer.epoch),
+                    },
+                );
                 let retrying = self.book_retry(row, sha, attempts);
                 tracing::debug!(
                     blob = %blob_hex,
@@ -2357,7 +2456,15 @@ where
                 Ok(m) => m,
                 Err(e) => return PullOutcome::StoreFailed(format!("get_at_rest_grant: {e}")),
             };
-            if let Some(first_seq) = missing.first().copied() {
+            if let Some(&(first_seq, _)) = missing.first() {
+                // Parked on these chunks' wraps: each grant that lands wakes
+                // the pull (coalesced per tick), so giving up on the ladder
+                // below is not giving up on the file.
+                self.key_waits.park(
+                    sha,
+                    row,
+                    key_wake::Awaiting::Content(missing.iter().map(|&(_, c)| c).collect()),
+                );
                 let missing = missing.len() as u64;
                 // Progress restarts the ladder (and its backoff); bounded,
                 // since `missing` can only fall `chunk_count` times.
@@ -3063,6 +3170,7 @@ mod tests {
             PullSink {
                 tx,
                 dropped: Arc::new(AtomicU64::new(0)),
+                key_waits: Arc::new(KeyWaits::new(4)),
             },
             rx,
         )
