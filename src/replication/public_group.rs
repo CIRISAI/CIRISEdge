@@ -109,6 +109,8 @@ mod tests {
             consensus_protocol: "founder_only".to_owned(),
             policy_blob,
             persist_row_hash: String::new(),
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
         }
     }
 

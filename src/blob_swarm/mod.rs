@@ -2141,11 +2141,13 @@ mod tests {
                     // this and the manifest's `stream_id`; edge's scheduler
                     // never decrypts, so it projects both away.
                     seq: Some(0),
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: [2u8; 32],
                     size: 200,
                     seq: Some(1),
+                    epoch: None,
                 },
             ],
             chunk_tier: Some(
@@ -2182,6 +2184,7 @@ mod tests {
                 sha: [7; 32],
                 size: 3,
                 seq: None,
+                epoch: None,
             }],
             chunk_tier: None,
             stream_id: None,

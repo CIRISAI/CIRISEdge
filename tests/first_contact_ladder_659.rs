@@ -283,8 +283,14 @@ impl Root {
     /// `delegates_to(R → R, [infra:serve, infra:attest])` with the recovery
     /// pre-commitment — persist's `trust_root_valid` leg 2.
     async fn charter(&self) -> Attestation {
+        // persist v53 (CC 3.2 T3, rc7) — the commitment binds the successor's
+        // key id AND both public keys, read off its registered record.
+        let successor = ciris_persist::federation::trust_root::CommittedKey::from_record(
+            &self.successor.record("user").await,
+        )
+        .expect("the successor is hybrid");
         let commitment = ciris_persist::federation::trust_root::pre_rotation_commitment(
-            std::slice::from_ref(&self.successor.key_id),
+            std::slice::from_ref(&successor),
         )
         .expect("commitment");
         let mut extra = serde_json::Map::new();

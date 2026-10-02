@@ -1596,6 +1596,8 @@ mod tests {
                 consensus_protocol: "quorum:2/3".to_owned(),
                 consensus_protocol_entrenched: true,
                 persist_row_hash: String::new(),
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
             })
             .await
             .expect("seed the accord family (keyless, local door)");

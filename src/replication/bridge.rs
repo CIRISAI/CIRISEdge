@@ -12100,6 +12100,8 @@ pub(crate) mod tests {
             consensus_protocol: "founder_only".to_string(),
             consensus_protocol_entrenched: false,
             persist_row_hash: String::new(),
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
         }
     }
 
@@ -12159,6 +12161,8 @@ pub(crate) mod tests {
             consensus_protocol: "founder_only".to_string(),
             policy_blob: None,
             persist_row_hash: String::new(),
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
         }
     }
 
@@ -12549,6 +12553,8 @@ pub(crate) mod tests {
                 consensus_protocol: "founder_only".to_string(),
                 policy_blob: Some(serde_json::json!({ "cohort_subkind": "infrastructure" })),
                 persist_row_hash: String::new(),
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
             },
         );
         backend
@@ -13482,9 +13488,14 @@ pub(crate) mod tests {
         successor_keys: &[String],
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        let commitment =
-            ciris_persist::federation::trust_root::pre_rotation_commitment(successor_keys)
-                .expect("pre-rotation commitment");
+        // persist v53 (CC 3.2 T3, rc7) — the commitment binds each successor's
+        // key material, not its id: persist's deterministic test pair per id.
+        let committed: Vec<_> = successor_keys
+            .iter()
+            .map(|k| ciris_persist::federation::trust_root::test_committed_key(k))
+            .collect();
+        let commitment = ciris_persist::federation::trust_root::pre_rotation_commitment(&committed)
+            .expect("pre-rotation commitment");
         let envelope = serde_json::json!({
             "id": id,
             "references_attestation_id": id,
@@ -17088,6 +17099,8 @@ pub(crate) mod tests {
                 consensus_protocol: "quorum:2/3".to_owned(),
                 consensus_protocol_entrenched: true,
                 persist_row_hash: String::new(),
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
             })
             .await
             .expect("seed the accord family");
@@ -17447,6 +17460,8 @@ pub(crate) mod tests {
                     consensus_protocol: "quorum:2/3".to_owned(),
                     consensus_protocol_entrenched: true,
                     persist_row_hash: String::new(),
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                 })
                 .await
                 .expect("seed the accord family");
@@ -17638,6 +17653,8 @@ pub(crate) mod tests {
                     consensus_protocol: "quorum:2/3".to_owned(),
                     consensus_protocol_entrenched: true,
                     persist_row_hash: String::new(),
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                 })
                 .await
                 .expect("seed the accord family");
@@ -17898,6 +17915,8 @@ pub(crate) mod tests {
             consensus_protocol: "quorum:2/3".to_owned(),
             consensus_protocol_entrenched: true,
             persist_row_hash: String::new(),
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
         };
         let unsigned = serde_json::to_vec(&SignedFamily {
             cosignatures: Vec::new(),
@@ -18708,6 +18727,8 @@ pub(crate) mod tests {
                     consensus_protocol: "majority".to_string(),
                     policy_blob: None,
                     persist_row_hash: String::new(),
+                    prev_head_digest: String::new(),
+                    charter_digest: String::new(),
                 },
             ))
             .await
@@ -20272,6 +20293,8 @@ pub(crate) mod tests {
             consensus_protocol: protocol.to_owned(),
             policy_blob: blob,
             persist_row_hash: String::new(),
+            prev_head_digest: String::new(),
+            charter_digest: String::new(),
         };
         backend
             .put_community(sign_community_fixture(

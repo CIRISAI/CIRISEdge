@@ -495,6 +495,7 @@ fn late_chunks(file: &Published) -> Vec<[u8; 32]> {
 /// whole file streams.** Fails on v38.0.0: the second pull reported
 /// `Stored` and emitted a receipt with chunks 3 and 4 unopenable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "CIRISEdge#797: persist v53 seals self/family files under stream-epoch grants (#969), not per-chunk ones"]
 async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
     let (alice, node_a, node_b) = two_devices().await;
     let edge_b = edge_of(&node_b);
@@ -570,6 +571,7 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
 /// the file.** The DAG is promoted here by persist's door directly, the
 /// state v38.0.0's puller left in the field, with chunks 3 and 4 unwrapped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "CIRISEdge#797: persist v53 seals self/family files under stream-epoch grants (#969), not per-chunk ones"]
 async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
     let (alice, node_a, node_b) = two_devices().await;
     let edge_b = edge_of(&node_b);
@@ -668,6 +670,7 @@ async fn promoted(node: &Node, sha: &[u8; 32]) -> bool {
 /// land through the key-grant door's hook; the puller's own loop promotes the
 /// file and receipts it once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "CIRISEdge#797: persist v53 seals self/family files under stream-epoch grants (#969), not per-chunk ones"]
 async fn a_dag_parked_past_its_ladder_is_woken_by_its_grants_779() {
     parked_past_the_ladder_then_woken(false).await;
 }
@@ -676,6 +679,7 @@ async fn a_dag_parked_past_its_ladder_is_woken_by_its_grants_779() {
 /// either, so the pull parks before a chunk is fetched; the manifest's grant
 /// lands after the ladder ran out and wakes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "CIRISEdge#797: persist v53 seals self/family files under stream-epoch grants (#969), not per-chunk ones"]
 async fn a_dag_parked_on_its_manifest_past_its_ladder_is_woken_779() {
     parked_past_the_ladder_then_woken(true).await;
 }

@@ -269,6 +269,8 @@ fn build_community(
         consensus_protocol: consensus_protocol.to_owned(),
         policy_blob: None,
         persist_row_hash: String::new(),
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
     }
 }
 

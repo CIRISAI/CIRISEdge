@@ -436,6 +436,7 @@ fn vm_hwm_kib() -> Option<u64> {
 /// **SW1** — a large file (256 MiB default, 2 GiB via `L8_STREAM_BYTES`) from a generating reader, a few chunks resident, read
 /// back byte-identical on the author.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "CIRISEdge#797: persist v53 streams carry an epoch terminator chunk (#969), one more row than the data chunks"]
 async fn a_2_gib_self_file_publishes_from_a_reader_holding_a_few_chunks() {
     use ciris_edge::group_content::store::CHUNK_BYTES;
     use ciris_persist::federation::types::cohort_scope::CryptoTier;

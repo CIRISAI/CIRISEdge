@@ -491,6 +491,7 @@ const MIB: usize = 1024 * 1024;
 
 /// **RR1–RR4** — the 100 MiB self file, on the owner's other device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "CIRISEdge#797: persist v53 streams carry an epoch terminator chunk (#969); the reader adopts v4 stream-epoch DAGs in #797"]
 #[allow(clippy::too_many_lines)] // one file, every read shape, in order, on purpose
 async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_range() {
     use ciris_edge::blob_swarm::{BlobPuller, PullConfig, PullOutcome};

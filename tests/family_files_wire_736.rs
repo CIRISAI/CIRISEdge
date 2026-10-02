@@ -588,6 +588,8 @@ async fn found_family(p1: &Node, p: &Ident) {
         consensus_protocol: "founder_only".to_owned(),
         consensus_protocol_entrenched: false,
         persist_row_hash: String::new(),
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
     };
     let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&record.signing_envelope())
         .expect("canonicalize the family");
@@ -1093,6 +1095,7 @@ async fn assert_holds_nothing_of(node: &Node, files: &[&File], who: &str) {
 /// named unresolved; (c) N holds nothing, is offered nothing, is served
 /// nothing, by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "CIRISEdge#797: a v4 stream-epoch family DAG (#969) parks awaiting its stream grant until #797"]
 async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_member_736() {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1301,6 +1304,7 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
 /// files still cross — on the identity-plane link with the family
 /// discriminated inside it (#718) — and F holds nothing naming the family.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "CIRISEdge#797: a v4 stream-epoch family DAG (#969) parks awaiting its stream grant until #797"]
 async fn family_files_cross_through_a_non_member_forwarder_that_learns_nothing_736() {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");

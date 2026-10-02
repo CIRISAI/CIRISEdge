@@ -162,6 +162,10 @@ impl PullSink {
             KeyGrantAxis::Epoch { epoch, .. } => {
                 self.key_waits.wake_epoch(*epoch);
             }
+            // persist v53 (CIRISPersist#969) — a stream-epoch set. No DAG
+            // parks on a stream epoch yet: the puller's v4 (stream-keyed)
+            // path is CIRISEdge#797, which adds the wake it opens.
+            KeyGrantAxis::Stream { .. } => {}
         }
     }
 
@@ -726,6 +730,9 @@ pub fn parse_clear_manifest(
             sha,
             size: c.size,
             seq: c.seq,
+            // A clear manifest is never v4 (stream-keyed, sealed), so no
+            // chunk names a stream epoch (CIRISPersist#969).
+            epoch: None,
         });
     }
     let manifest = ChunkManifest {
@@ -3078,11 +3085,13 @@ mod tests {
                     sha: [1; 32],
                     size: 200,
                     seq: None,
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: [2; 32],
                     size: 100,
                     seq: None,
+                    epoch: None,
                 },
             ],
             chunk_tier: None,
@@ -3109,11 +3118,13 @@ mod tests {
                     sha: [0xAB; 32],
                     size: 200,
                     seq: None,
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: [0xCD; 32],
                     size: 100,
                     seq: None,
+                    epoch: None,
                 },
             ],
             chunk_tier: None,

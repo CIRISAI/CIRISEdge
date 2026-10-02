@@ -1917,6 +1917,8 @@ fn the_pair_room_is_byte_identical_over_the_general_builder() {
         consensus_protocol: consensus_protocol::UNANIMOUS.to_owned(),
         policy_blob: None,
         persist_row_hash: String::new(),
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
     };
     let after = chat::pair_community(a, b, ts());
     assert_eq!(after, before, "the typed record must not have moved");
