@@ -1,5 +1,28 @@
 # CIRISEdge Release Notes
 
+# v38.1.1 — persist v52.0.2: a postgres reconnect no longer aborts a host that loads edge and persist as separate wheels
+
+**2026-10-02** (persist CIRISPersist v52.0.2). **PATCH** from v38.1.0. Ladder triple:
+**edge v38.1.1 · persist v52.0.2 · verify v18.0.0**.
+
+| | v38.1.0 | v38.1.1 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v52.0.1"` | **`tag = "v52.0.2"`** → `21572bb3` (a merge over the certified `21595591`, identical tree `4bbed7fb`) |
+| ciris-persist (wheel floor) | `>=52.0.1,<53` | **`>=52.0.2,<53`** |
+| ABI constants, policy hashes, manifest, vocabulary, Rust surface | — | unchanged |
+
+- **The abort (CIRISServer#705, CIRISPersist#354).** On a host that loads `ciris_edge` and
+  `ciris_persist` as separate wheels, edge's own runtimes awaited persist's postgres pool. When the
+  pool opened a new connection, persist's connector, built in persist's library with its own copy of
+  tokio, found no persist reactor on edge's thread and panicked across the library boundary. Edge's
+  std then aborted the process. Persist's connector now hops to persist's own runtime when called
+  from such a thread, and a panic there returns an error instead of unwinding. The server wheel (one
+  library) was never affected.
+- **Still to do on edge's side:** CIRISEdge#783 (stop taking the raw backend from the deprecated
+  `outbound_queue_capsule` for verify/rooting; audit every edge runtime that drives persist I/O).
+- Also on main since v38.1.0: the mesh harness fixes #781 (closes #768) and #784 (closes #782; M=4 green
+  alone). They're harness-only, plus a `UnopenedReason::NotGranted` doc correction (#772).
+
 # v38.1.0 — a device that joins a room late gets its key: the re-wrap is sent, never-rotated rooms are re-wrapped, and an early occurrence is re-asked the moment its binding lands
 
 **2026-10-01** (PRs #774, #775, #777, #778; persist CIRISPersist v52.0.1).
