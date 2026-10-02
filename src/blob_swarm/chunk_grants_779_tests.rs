@@ -760,7 +760,19 @@ async fn parked_past_the_ladder_then_woken(manifest_too: bool) {
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    // Let any duplicate wake run before counting.
+    // The loop's pull promotes, returns `Stored`, and only then signs and
+    // stores the receipt (`on_file_pulled`), so `promoted` turning true does
+    // not mean the receipt is there yet. Wait for the receipt itself (a fixed
+    // 300 ms lost this race on a loaded CI runner, #798), then let any
+    // duplicate wake run before counting.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while receipt_rows(&node_b, &file.stream_id).await.is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the woken pull promoted the file but never receipted it"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(receipt_rows(&node_b, &file.stream_id).await.len(), 1);
     assert_eq!(receipts_emitted(&edge_b), 1);

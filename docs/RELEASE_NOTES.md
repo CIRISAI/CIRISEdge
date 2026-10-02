@@ -1,5 +1,61 @@
 # CIRISEdge Release Notes
 
+# v39.1.0 — a peer with no route is backed off, per peer and through every kick, instead of retried twice a second
+
+**2026-10-02** (PR #795, CIRISEdge#794). **MINOR** from v39.0.0: additive only, so a host adopts it with
+no code change. Ladder triple: **edge v39.1.0 · persist v52.0.2 · verify v18.0.0**. Pins unchanged.
+
+## The bug (CIRISEdge#794, production canonical)
+
+Rounds toward peers with no transport route (`transport: no route to peer … has_path=false`) ran ~2/s:
+every cadence tick and every kick ran a round for every kind toward an offline device, with no backoff,
+and each logged a WARN (575–692 suppressed per ~5 min). Kicks were the larger source: every row
+admitted from any peer fires a propagation kick (#636) toward every other peer.
+
+## What changed
+
+- **Per-peer backoff.** Only `TransportError::NoRouteToPeer { has_path: false }` (typed) enters it.
+  Every other round error behaves as before. All of a peer's coordinators share one state, so an
+  offline device costs one probe, not a round per kind. The schedule is 30 s doubling to a cap
+  (default 15 min), each delay drawn uniformly from [0, window] (full jitter). One coordinator probes
+  when the delay expires; an abandoned probe releases its claim.
+- **Kicks don't bypass it.** The check runs in the coordinator task before it asks the #740 round
+  gate for a permit, and `RoundNow` (and the host's kick / round_now / sync_and_await), `Propagate`
+  (#636) and `Kick`/`try_kick` (#778) all reach a coordinator there. A skipped coordinator never holds
+  or waits for a permit, and an ignored kick doesn't reset the cadence.
+- **Reset on evidence.** A learned path, an established link (the new `Transport::subscribe_reachability`
+  stream; Reticulum emits path-learned on a verified announce and link-up on `LinkIdentified`), or any
+  inbound frame from the peer clears it and runs every plane at once. The inbound-frame clear runs
+  before routing, so #778's release kick toward that peer is never swallowed.
+- **Never dropped.** The peer stays in the send set and catches up when it returns.
+- **The probe is still discovery.** At the pinned leviculum, a dial with no path broadcasts the link
+  request on every interface, which is how a directly attached neighbour that never announces gets
+  found. Each probe is still a real round, so that broadcast continues, on the backoff schedule.
+  (The default cap is at the low end of the 15–30 min band for that reason.)
+- **Visible.** The replication snapshot lists backed-off peers with their current delay, next attempt
+  and failed probes. One INFO line logs entry and one logs exit, with the reason (`path_learned`,
+  `link_up`, `inbound_frame`, `expiry`). The per-round WARN for no-route is DEBUG.
+
+## Rust / Python surface (all additive)
+
+- `replication::no_route_backoff` (re-exported): `NoRouteBackoffEntry`, `BackoffExit` (both
+  `#[non_exhaustive]`), `NO_ROUTE_BACKOFF_INITIAL`, `DEFAULT_NO_ROUTE_BACKOFF_CAP`.
+- The cap: `ReplicationScheduler::with_no_route_backoff_cap`, `SchedulerHandle::{set_,}no_route_backoff_cap`,
+  `ReplicationRuntime::set_no_route_backoff_cap`, Python `ReplicationHandle.set_no_route_backoff_cap`.
+  It's settable at runtime and applies from each peer's next window. `SchedulerConfig` is unchanged.
+- Snapshot: `SchedulerHandle` / `ReplicationScheduler` / `ReplicationRuntime::no_route_backoff()`,
+  Python `ReplicationHandle.no_route_backoff()`.
+- `Transport::subscribe_reachability()` has a default body returning `None`, so external `Transport`
+  impls compile unchanged and are cleared by inbound frames and expiry. New `ReachabilityEvidence`,
+  `PeerReachable` (`#[non_exhaustive]`); `SchedulerHandle::note_reachable` for hosts with their own
+  evidence.
+
+## Known, open
+
+- #796: on FIRST contact with an offline peer, every plane's first round is already dialling before
+  any learns there's no route, each waiting the 5 s no-path timeout once. That now happens once per
+  backoff entry instead of every tick and kick.
+
 # v39.0.0 — a pulled file is readable when it says it is: no Stored and no delivery receipt until every chunk opens here, and a key's arrival wakes the waiting pull
 
 **2026-10-02** (PR #787, CIRISEdge#779). **MAJOR** from v38.1.1 (error types change shape; below).
