@@ -298,6 +298,9 @@ impl Root {
         // members ride the charter every root now signs, and the ladder
         // proves they change nothing about rooting a key root.
         rc6_charter_members(&mut extra);
+        extra.extend(trust_job(
+            ciris_persist::federation::trust_root::TRUST_CHARTER_DIMENSION,
+        ));
         delegates_to_row(
             &self.key.signer(),
             &self.key.key_id,
@@ -310,17 +313,25 @@ impl Root {
     }
 }
 
-/// The rc6 charter members (persist v51 `envelope::paths`), at persist's
-/// shipped defaults: a 7-day attach window, a 24-hour witness cadence, one
-/// independent witness.
+/// persist v53 (CIRISPersist#973, CC 3.2 T4a "bundle only") — a new
+/// `delegates_to` with no `trust:{job}` label gives no acceptance and is no
+/// charter, so each row names its job. The roots here are KEY roots (no
+/// lineage), so an acceptance names no `attached_head_digest`.
+fn trust_job(dimension: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("dimension".into(), dimension.into());
+    m
+}
+
+/// The rc6 charter members (persist v51 `envelope::paths`): a 7-day attach
+/// window, a 24-hour witness cadence, and witnessed mode off. persist v53
+/// (#973) removed `DEFAULT_WITNESS_QUORUM` (was 1): silence and `0` are one
+/// state, and a declared `1` is refused at the charter door.
 fn rc6_charter_members(extra: &mut serde_json::Map<String, serde_json::Value>) {
     use ciris_persist::federation::envelope::paths;
     extra.insert(paths::ATTACH_WINDOW_SECS.into(), 604_800.into());
     extra.insert(paths::WITNESS_CADENCE_SECS.into(), 86_400.into());
-    extra.insert(
-        paths::WITNESS_QUORUM.into(),
-        ciris_persist::federation::lineage_witness::DEFAULT_WITNESS_QUORUM.into(),
-    );
+    extra.insert(paths::WITNESS_QUORUM.into(), 0.into());
 }
 
 /// One genesis-shaped node: a self-signed node key, a self-signed owner, the
@@ -381,7 +392,7 @@ impl Node {
             &self.owner.key_id,
             &root.key.key_id,
             &["infra:attest", "infra:serve"],
-            serde_json::Map::new(),
+            trust_job(ciris_persist::federation::trust_root::TRUST_ACCEPTS_DIMENSION),
             "accepts",
         )
         .await;

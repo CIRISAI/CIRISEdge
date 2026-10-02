@@ -11670,7 +11670,7 @@ pub(crate) mod tests {
         // NODE trusts it, it is live, and it confers `slash` on the revoker.
         backend.set_node_key_id(local);
         seed_root_charter(&backend, root, &[format!("{root}-successor")]).await;
-        seed_delegates_to(
+        seed_acceptance_edge(
             &backend,
             local,
             root,
@@ -13416,6 +13416,56 @@ pub(crate) mod tests {
         id
     }
 
+    /// persist v53 (CIRISPersist#973, CC 3.2 T4a "bundle only") — an ACCEPTANCE
+    /// edge `delegates_to(subject → root)`. A new `delegates_to` with no
+    /// `trust:{job}` label gives no acceptance, so the walk (`trusted_roots_of`,
+    /// `trust_root_valid`) reads this one only because it names
+    /// `trust:accepts:v1`; the envelope is persist's own
+    /// `acceptance_edge_envelope`, which names the head the attach gate asks a
+    /// lineage root for (none for a key root). Grants (root → delegate) stay on
+    /// [`seed_delegates_to`]: an unlabelled grant still confers.
+    async fn seed_acceptance_edge(
+        backend: &MemoryBackend,
+        attester: &str,
+        root: &str,
+        scope: &serde_json::Value,
+    ) -> String {
+        let scope: Vec<&str> = scope
+            .as_array()
+            .expect("scope is an array")
+            .iter()
+            .map(|s| s.as_str().expect("scope token is a string"))
+            .collect();
+        let id = uuid::Uuid::new_v4().to_string();
+        let envelope = acceptance_envelope(backend, &id, attester, root, &scope).await;
+        seed_raw_attestation(backend, &id, attester, root, "delegates_to", envelope).await;
+        id
+    }
+
+    /// The labelled acceptance envelope [`seed_acceptance_edge`] signs.
+    async fn acceptance_envelope(
+        backend: &MemoryBackend,
+        id: &str,
+        attester: &str,
+        root: &str,
+        scope: &[&str],
+    ) -> serde_json::Value {
+        let mut envelope =
+            ciris_persist::federation::canonical_community::acceptance_edge_envelope(
+                backend,
+                root,
+                scope,
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("acceptance edge envelope");
+        envelope["id"] = serde_json::json!(id);
+        envelope["attesting_key_id"] = serde_json::json!(attester);
+        envelope["attested_key_id"] = serde_json::json!(root);
+        envelope["attestation_type"] = serde_json::json!("delegates_to");
+        envelope
+    }
+
     /// Seed a root's SELF-CHARTER — `delegates_to(root → root)`. persist v19
     /// (CIRISPersist#488) tightened this shape twice, and both are enforced at
     /// admission, so the fixture carries what the field must carry:
@@ -13441,20 +13491,23 @@ pub(crate) mod tests {
             "attesting_key_id": root,
             "attested_key_id": root,
             "attestation_type": "delegates_to",
+            // persist v53 (#973): an unlabelled self-loop is no charter.
+            "dimension": ciris_persist::federation::trust_root::TRUST_CHARTER_DIMENSION,
             "scope": ["infra:serve", "infra:attest"],
             "pre_rotation_commitment": commitment,
         });
-        // persist v51 (CIRISPersist#937/#938) — the rc6 charter members at
-        // persist's shipped defaults. A key root holds no lineage, so the T4a
-        // attach gate is not armed for it; they ride every charter.
+        // persist v51 (CIRISPersist#937/#938) — the rc6 charter members. A key
+        // root holds no lineage, so the T4a attach gate is not armed for it;
+        // they ride every charter. persist v53 (#973) removed
+        // `DEFAULT_WITNESS_QUORUM` (was 1): silence and `0` are one state,
+        // witnessed mode off, and a declared `1` is refused at the charter
+        // door (`charter_witness_quorum_below_majority`).
         let mut envelope = envelope;
         {
             use ciris_persist::federation::envelope::paths;
             envelope[paths::ATTACH_WINDOW_SECS] = serde_json::json!(604_800);
             envelope[paths::WITNESS_CADENCE_SECS] = serde_json::json!(86_400);
-            envelope[paths::WITNESS_QUORUM] = serde_json::json!(
-                ciris_persist::federation::lineage_witness::DEFAULT_WITNESS_QUORUM
-            );
+            envelope[paths::WITNESS_QUORUM] = serde_json::json!(0);
         }
         seed_raw_attestation(backend, &id, root, root, "delegates_to", envelope).await;
         id
@@ -14582,8 +14635,8 @@ pub(crate) mod tests {
             let (backend, bridge) =
                 test_fixtures::make_bridge_with_keys(&[local, third_party, stranger, root]).await;
             // Both hang their trust off the same root (CC 4's shape).
-            seed_delegates_to(&backend, local, root, &scope).await;
-            seed_delegates_to(&backend, stranger, root, &scope).await;
+            seed_acceptance_edge(&backend, local, root, &scope).await;
+            seed_acceptance_edge(&backend, stranger, root, &scope).await;
             let bridge = bridge
                 .with_local_key_id(Some(local.to_string()))
                 .with_serve_tier_for_test(tier);
@@ -15731,7 +15784,7 @@ pub(crate) mod tests {
         //   3. accord:lifecycle scores about root, fresh  — root is live
         //   4. delegates_to(root → trusted_peer, infra:serve) — the grant
         let trust_edge_id = seed_root_charter(&backend, root, &[format!("{root}-successor")]).await;
-        let our_trust_edge = seed_delegates_to(
+        let our_trust_edge = seed_acceptance_edge(
             &backend,
             local,
             root,
@@ -15983,7 +16036,7 @@ pub(crate) mod tests {
         // Trust graph: root self-declares, WE trust it, it is live, and it
         // grants `infra:serve` to full_peer ONLY.
         seed_root_charter(&backend, root, &[format!("{root}-successor")]).await;
-        let our_trust_edge = seed_delegates_to(
+        let our_trust_edge = seed_acceptance_edge(
             &backend,
             local,
             root,
@@ -17040,7 +17093,7 @@ pub(crate) mod tests {
             .expect("seed the accord family");
         // CC 4.2.1 — OUR consent edge to the root. Without this leg the gate
         // refuses even the seated holder, which is exactly the point of it.
-        seed_delegates_to(
+        seed_acceptance_edge(
             &backend,
             local,
             root,
@@ -17399,7 +17452,7 @@ pub(crate) mod tests {
                 .expect("seed the accord family");
             // CC 4.2.1 — this node validly trusts BOTH roots, so leg 2 holds
             // either way and cannot be what separates the two rows.
-            seed_delegates_to(
+            seed_acceptance_edge(
                 &backend,
                 local,
                 root,
@@ -17592,7 +17645,7 @@ pub(crate) mod tests {
         // CC 4.2.1 — OUR consent edge to BOTH roots, so leg 2 holds either way
         // and cannot be what separates the two rows.
         for root in [accord_a, accord_b] {
-            seed_delegates_to(
+            seed_acceptance_edge(
                 &backend,
                 local,
                 root,
@@ -18342,17 +18395,16 @@ pub(crate) mod tests {
             })
             .await
             .expect("seed mesh-config root key");
-        let id = uuid::Uuid::new_v4().to_string();
-        let envelope = serde_json::json!({
-            "id": id,
-            "attesting_key_id": node,
-            "attested_key_id": root,
-            "attestation_type": "delegates_to",
-            // Infra duty scopes only — the reject-agency-on-node-key gate
-            // (persist #236) refuses agency conferrals on node-typed keys.
-            "scope": ["infra:attest", "infra:serve"],
-        });
-        seed_raw_attestation(backend, &id, node, root, "delegates_to", envelope).await;
+        // Infra duty scopes only — the reject-agency-on-node-key gate
+        // (persist #236) refuses agency conferrals on node-typed keys. The
+        // subscription is a labelled acceptance edge (persist v53, #973).
+        seed_acceptance_edge(
+            backend,
+            node,
+            root,
+            &serde_json::json!(["infra:attest", "infra:serve"]),
+        )
+        .await;
     }
 
     /// Seed one root-authored mesh-config relief row through the REAL
@@ -18845,7 +18897,6 @@ pub(crate) mod tests {
             }
         }
         seed_root_charter(backend, "root-r", &["succ-1".to_string()]).await;
-        let scope = serde_json::json!(["infra:attest", "infra:serve"]);
         for subject in subjects {
             // A subject registered under keys the fixture signer does not hold
             // (persist's test-support `Identity`, a canonical record with a
@@ -18853,13 +18904,14 @@ pub(crate) mod tests {
             // the test that needs it Rooted must seed the acceptance itself.
             // Loud, not silent.
             let id = uuid::Uuid::new_v4().to_string();
-            let envelope = serde_json::json!({
-                "id": id,
-                "attesting_key_id": subject,
-                "attested_key_id": "root-r",
-                "attestation_type": "delegates_to",
-                "scope": scope,
-            });
+            let envelope = acceptance_envelope(
+                backend,
+                &id,
+                subject,
+                "root-r",
+                &["infra:attest", "infra:serve"],
+            )
+            .await;
             if let Err(e) = try_seed_scoped_attestation(
                 backend,
                 &id,
@@ -21200,9 +21252,9 @@ pub(crate) mod tests {
         seed_root_charter(&backend, "root-x", &["succ-x".to_string()]).await;
         seed_root_charter(&backend, "root-y", &["succ-x".to_string()]).await;
         let scope = serde_json::json!(["infra:attest", "infra:serve"]);
-        seed_delegates_to(&backend, "person-alice", "root-x", &scope).await;
+        seed_acceptance_edge(&backend, "person-alice", "root-x", &scope).await;
         // Bob's owner accepts a DIFFERENT valid root.
-        seed_delegates_to(&backend, "person-bob", "root-y", &scope).await;
+        seed_acceptance_edge(&backend, "person-bob", "root-y", &scope).await;
         let bridge = bridge_over(&backend, &["node-bob", "node-stranger"])
             .with_local_key_id(Some("node-alice".to_string()));
 
@@ -21213,7 +21265,7 @@ pub(crate) mod tests {
         );
 
         // Bob's owner also accepts root-x — the intersection is on it.
-        let bob_accepts_x = seed_delegates_to(&backend, "person-bob", "root-x", &scope).await;
+        let bob_accepts_x = seed_acceptance_edge(&backend, "person-bob", "root-x", &scope).await;
         let mut memo = AudienceMemo::default();
         assert!(
             bridge.rooted_with("node-bob", &mut memo).await,
@@ -21273,8 +21325,8 @@ pub(crate) mod tests {
         seed_owner_binding(&backend, "person-bob", "node-bob").await;
         seed_root_charter(&backend, "root-z", &["succ-x".to_string()]).await;
         let scope = serde_json::json!(["infra:attest", "infra:serve"]);
-        seed_delegates_to(&backend, "person-alice", "root-z", &scope).await;
-        seed_delegates_to(&backend, "person-bob", "root-z", &scope).await;
+        seed_acceptance_edge(&backend, "person-alice", "root-z", &scope).await;
+        seed_acceptance_edge(&backend, "person-bob", "root-z", &scope).await;
         let bridge =
             bridge_over(&backend, &["node-bob"]).with_local_key_id(Some("node-alice".to_string()));
 
@@ -21287,8 +21339,8 @@ pub(crate) mod tests {
 
         // The positive control: the same pair, the same walk, over an attested holder.
         seed_root_charter(&backend, "root-x", &["succ-x".to_string()]).await;
-        seed_delegates_to(&backend, "person-alice", "root-x", &scope).await;
-        seed_delegates_to(&backend, "person-bob", "root-x", &scope).await;
+        seed_acceptance_edge(&backend, "person-alice", "root-x", &scope).await;
+        seed_acceptance_edge(&backend, "person-bob", "root-x", &scope).await;
         let mut memo = AudienceMemo::default();
         assert!(
             bridge.rooted_with("node-bob", &mut memo).await,
@@ -21341,8 +21393,8 @@ pub(crate) mod tests {
         let owner_binding = seed_owner_binding(&backend, owner, local).await;
         seed_root_charter(&backend, "root-r", &["succ-1".to_string()]).await;
         let scope = serde_json::json!(["infra:attest", "infra:serve"]);
-        let owner_accepts = seed_delegates_to(&backend, owner, "root-r", &scope).await;
-        let node_accepts = seed_delegates_to(&backend, local, "root-r", &scope).await;
+        let owner_accepts = seed_acceptance_edge(&backend, owner, "root-r", &scope).await;
+        let node_accepts = seed_acceptance_edge(&backend, local, "root-r", &scope).await;
         // Self-authored but NOT an allegiance fact — the owner's own
         // `consent:replication:v1` grant naming a third party (CC 3.3.7: the
         // consent object itself; a self-loop `delegates_to` would be a
@@ -21440,7 +21492,7 @@ pub(crate) mod tests {
         // I2 — Rooted is not consent. The peer's owner accepts the same valid
         // root; the pair is Rooted at this node; the served set does not widen.
         seed_owner_binding(&backend, peer_owner, peer).await;
-        seed_delegates_to(&backend, peer_owner, "root-r", &scope).await;
+        seed_acceptance_edge(&backend, peer_owner, "root-r", &scope).await;
         let mut memo = AudienceMemo::default();
         assert!(
             bridge.rooted_with(peer, &mut memo).await,
