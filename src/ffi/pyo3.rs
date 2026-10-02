@@ -3088,6 +3088,27 @@ impl PyReplicationHandle {
         Ok(out)
     }
 
+    /// CIRISEdge#794 — set the no-route backoff's window ceiling, in seconds
+    /// (default 900 = 15 min; under 1 s is raised to 1 s). Takes effect at
+    /// each backed-off peer's next window. A no-op after `stop()`.
+    fn set_no_route_backoff_cap(&self, py: Python<'_>, cap_secs: f64) -> PyResult<()> {
+        let cap = std::time::Duration::try_from_secs_f64(cap_secs).map_err(|e| {
+            PyValueError::new_err(format!(
+                "cap_secs must be a finite non-negative number: {e}"
+            ))
+        })?;
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                if let Some(rt) = inner.lock().await.as_ref() {
+                    rt.set_no_route_backoff_cap(cap);
+                }
+            });
+        });
+        Ok(())
+    }
+
     /// CIRISEdge#462 — pull a subject's own testimony from a peer (the RECEIVE
     /// axis). For each subject-pullable kind, ensures a scheduled Initiator
     /// coordinator for `peer_key_id` and sends a subject-scoped `Pull`; the peer

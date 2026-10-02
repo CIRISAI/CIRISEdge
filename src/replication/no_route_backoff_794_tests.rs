@@ -438,6 +438,23 @@ async fn a_non_no_route_error_does_not_back_off_794() {
     rig.stop().await;
 }
 
+/// The cap reaches the running scheduler through the builder and the handle,
+/// never through `SchedulerConfig` (which gained no field).
+#[test]
+fn the_cap_is_set_by_builder_and_handle_not_by_config_794() {
+    let mut sched = ReplicationScheduler::new(SchedulerConfig::default());
+    let handle = sched.install_control_channel();
+    assert_eq!(
+        handle.no_route_backoff_cap(),
+        super::DEFAULT_NO_ROUTE_BACKOFF_CAP
+    );
+    let mut sched = sched.with_no_route_backoff_cap(Duration::from_secs(20 * 60));
+    let handle = sched.install_control_channel();
+    assert_eq!(handle.no_route_backoff_cap(), Duration::from_secs(20 * 60));
+    handle.set_no_route_backoff_cap(Duration::from_secs(25 * 60));
+    assert_eq!(handle.no_route_backoff_cap(), Duration::from_secs(25 * 60));
+}
+
 /// A removed peer's backoff goes with its last coordinator.
 #[tokio::test(start_paused = true)]
 async fn removing_the_last_plane_forgets_the_backoff_794() {

@@ -120,27 +120,11 @@ pub struct SchedulerConfig {
     /// [`Self::DEFAULT_MAX_CONCURRENT_ROUNDS`]; see
     /// [`Self::max_concurrent_rounds_for`] for the rule.
     pub max_concurrent_rounds: usize,
-    /// CIRISEdge#794 — the ceiling of the per-peer no-route backoff window.
-    /// A peer the transport has no route to is retried after a delay drawn
-    /// from `[0, window]`, the window doubling from
-    /// [`NO_ROUTE_BACKOFF_INITIAL`](super::no_route_backoff::NO_ROUTE_BACKOFF_INITIAL)
-    /// up to this. Default [`Self::DEFAULT_NO_ROUTE_BACKOFF_CAP`]. Values under
-    /// 1 s are raised to 1 s.
-    pub no_route_backoff_cap: Duration,
 }
 
 impl SchedulerConfig {
     pub const DEFAULT_CADENCE: Duration = Duration::from_secs(30);
     pub const DEFAULT_ROUND_TIMEOUT: Duration = Duration::from_secs(10);
-    /// CIRISEdge#794 — 15 min. The cap only governs a peer that comes back
-    /// SILENTLY: an announce, an identified link or a frame from it clears
-    /// the backoff at once. The silent case is a directly-attached neighbour
-    /// that never announced, and the probe's broadcast link request is the
-    /// only thing that finds it, so the cap sits at the low end of the
-    /// 15–30 min band: with full jitter such a peer is re-probed every
-    /// 7.5 min on average, at one round per peer instead of one per plane per
-    /// tick.
-    pub const DEFAULT_NO_ROUTE_BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
     /// CIRISEdge#740 — the default round bound, derived from the default
     /// blocking-pool ceiling by [`Self::max_concurrent_rounds_for`]: half of
     /// [`DEFAULT_MAX_BLOCKING_THREADS`](crate::runtime_budget::DEFAULT_MAX_BLOCKING_THREADS)
@@ -179,7 +163,6 @@ impl Default for SchedulerConfig {
             cadence: Self::DEFAULT_CADENCE,
             round_timeout: Self::DEFAULT_ROUND_TIMEOUT,
             max_concurrent_rounds: Self::DEFAULT_MAX_CONCURRENT_ROUNDS,
-            no_route_backoff_cap: Self::DEFAULT_NO_ROUTE_BACKOFF_CAP,
         }
     }
 }
@@ -466,6 +449,19 @@ impl SchedulerHandle {
         self.backoff.note_reachable(peer_key_id, evidence);
     }
 
+    /// CIRISEdge#794 — change the no-route backoff's window ceiling on a
+    /// running scheduler (see [`ReplicationScheduler::with_no_route_backoff_cap`]).
+    /// Takes effect at each backed-off peer's next window.
+    pub fn set_no_route_backoff_cap(&self, cap: Duration) {
+        self.backoff.set_cap(cap);
+    }
+
+    /// The window ceiling in force.
+    #[must_use]
+    pub fn no_route_backoff_cap(&self) -> Duration {
+        self.backoff.cap()
+    }
+
     /// The backoff itself, for the registry's inbound door.
     pub(crate) fn backoff(&self) -> Arc<NoRouteBackoff> {
         Arc::clone(&self.backoff)
@@ -568,7 +564,7 @@ impl ReplicationScheduler {
             coordinators: Vec::new(),
             command_rx: None,
             round_gate: Arc::new(RoundGate::new(config.max_concurrent_rounds)),
-            backoff: Arc::new(NoRouteBackoff::new(config.no_route_backoff_cap)),
+            backoff: Arc::new(NoRouteBackoff::new()),
             mesh_config: None,
         }
     }
@@ -585,13 +581,26 @@ impl ReplicationScheduler {
         self.backoff.snapshot()
     }
 
+    /// CIRISEdge#794 — the ceiling of the per-peer no-route backoff window
+    /// (builder). A peer the transport has no route to is retried after a
+    /// delay drawn from `[0, window]`, the window doubling from
+    /// [`NO_ROUTE_BACKOFF_INITIAL`](super::no_route_backoff::NO_ROUTE_BACKOFF_INITIAL)
+    /// up to this. Without this call the cap is
+    /// [`DEFAULT_NO_ROUTE_BACKOFF_CAP`](super::no_route_backoff::DEFAULT_NO_ROUTE_BACKOFF_CAP)
+    /// (15 min); under 1 s is raised to 1 s. A running scheduler's cap is
+    /// changed through [`SchedulerHandle::set_no_route_backoff_cap`].
+    #[must_use]
+    pub fn with_no_route_backoff_cap(self, cap: Duration) -> Self {
+        self.backoff.set_cap(cap);
+        self
+    }
+
     /// Tests pin the jitter so the probe schedule is countable.
     #[cfg(test)]
     pub(crate) fn with_backoff_jitter(mut self, jitter: fn(Duration) -> Duration) -> Self {
-        self.backoff = Arc::new(NoRouteBackoff::with_jitter(
-            self.config.no_route_backoff_cap,
-            jitter,
-        ));
+        let pinned = NoRouteBackoff::with_jitter(jitter);
+        pinned.set_cap(self.backoff.cap());
+        self.backoff = Arc::new(pinned);
         self
     }
 
@@ -1839,7 +1848,6 @@ mod tests {
             cadence: Duration::from_secs(3600),
             round_timeout: Duration::from_millis(200),
             max_concurrent_rounds: N,
-            ..SchedulerConfig::default()
         });
         let control = sched.install_control_channel();
         let (event_tx, mut event_rx) = mpsc::channel::<(String, RoundEvent)>(64);

@@ -12,8 +12,11 @@
 //!
 //! Exponential with full jitter: the window starts at
 //! [`NO_ROUTE_BACKOFF_INITIAL`] (30 s), doubles after every probe that still
-//! finds no route, and is capped at
-//! [`SchedulerConfig::no_route_backoff_cap`](super::scheduler::SchedulerConfig::no_route_backoff_cap).
+//! finds no route, and is capped at [`DEFAULT_NO_ROUTE_BACKOFF_CAP`] unless the
+//! host sets another cap
+//! ([`ReplicationScheduler::with_no_route_backoff_cap`](super::scheduler::ReplicationScheduler::with_no_route_backoff_cap),
+//! [`SchedulerHandle::set_no_route_backoff_cap`](super::scheduler::SchedulerHandle::set_no_route_backoff_cap)).
+//! No existing type gains a field for it.
 //! Each delay is drawn uniformly from `[0, window]`, so a fleet of offline peers
 //! does not retry in lockstep. When the delay expires, ONE coordinator toward
 //! the peer claims the probe; the rest keep skipping until it resolves.
@@ -33,7 +36,7 @@
 //! never dropped from the send set: it is a member and catches up on return.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -45,6 +48,19 @@ use crate::transport::{ReachabilityEvidence, TransportError};
 
 /// CIRISEdge#794 — the first backoff window after a peer is found unroutable.
 pub const NO_ROUTE_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
+
+/// CIRISEdge#794 — the default ceiling of the backoff window: 15 min. The cap
+/// only governs a peer that comes back SILENTLY: an announce, an identified
+/// link or a frame from it clears the backoff at once. The silent case is a
+/// directly-attached neighbour that never announced, and the probe's
+/// broadcast link request is the only thing that finds it, so the cap sits at
+/// the low end of the 15–30 min band: with full jitter such a peer is
+/// re-probed every 7.5 min on average, at one round per peer instead of one
+/// per plane per tick.
+pub const DEFAULT_NO_ROUTE_BACKOFF_CAP: Duration = Duration::from_secs(15 * 60);
+
+/// A cap under this is raised to it.
+const MIN_NO_ROUTE_BACKOFF_CAP: Duration = Duration::from_secs(1);
 
 /// CIRISEdge#794 — why a peer left the no-route backoff.
 #[non_exhaustive]
@@ -144,7 +160,8 @@ pub(crate) struct Wake {
 /// The shared no-route state of one scheduler: every coordinator task, the
 /// scheduler's handle and the registry's inbound door hold the same `Arc`.
 pub(crate) struct NoRouteBackoff {
-    cap: Duration,
+    /// The window ceiling, milliseconds; settable while running.
+    cap_ms: AtomicU64,
     peers: Mutex<HashMap<String, PeerState>>,
     /// Mirrors `peers.len()` so the per-frame evidence path takes no lock
     /// while nothing is backed off (the steady state).
@@ -159,7 +176,7 @@ pub(crate) struct NoRouteBackoff {
 impl std::fmt::Debug for NoRouteBackoff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NoRouteBackoff")
-            .field("cap", &self.cap)
+            .field("cap", &self.cap())
             .field("backed_off", &self.len.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
@@ -170,6 +187,10 @@ pub(crate) fn full_jitter(window: Duration) -> Duration {
     use rand::Rng as _;
     let ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
     Duration::from_millis(rand::thread_rng().gen_range(0..=ms))
+}
+
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The window after one more probe found no route: doubled, capped.
@@ -222,20 +243,32 @@ impl Drop for RoundTicket<'_> {
 }
 
 impl NoRouteBackoff {
-    pub(crate) fn new(cap: Duration) -> Self {
-        Self::with_jitter(cap, full_jitter)
+    pub(crate) fn new() -> Self {
+        Self::with_jitter(full_jitter)
     }
 
-    pub(crate) fn with_jitter(cap: Duration, jitter: fn(Duration) -> Duration) -> Self {
+    pub(crate) fn with_jitter(jitter: fn(Duration) -> Duration) -> Self {
         let (wake_tx, wake_rx) = mpsc::unbounded_channel();
         Self {
-            cap: cap.max(Duration::from_secs(1)),
+            cap_ms: AtomicU64::new(millis(DEFAULT_NO_ROUTE_BACKOFF_CAP)),
             peers: Mutex::new(HashMap::new()),
             len: AtomicUsize::new(0),
             wake_tx,
             wake_rx: Mutex::new(Some(wake_rx)),
             jitter,
         }
+    }
+
+    /// The window ceiling now.
+    pub(crate) fn cap(&self) -> Duration {
+        Duration::from_millis(self.cap_ms.load(Ordering::Acquire))
+    }
+
+    /// Set the window ceiling (under 1 s is raised to 1 s). Takes effect at
+    /// each peer's next window; a delay already drawn stands.
+    pub(crate) fn set_cap(&self, cap: Duration) {
+        self.cap_ms
+            .store(millis(cap.max(MIN_NO_ROUTE_BACKOFF_CAP)), Ordering::Release);
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, PeerState>> {
@@ -284,7 +317,7 @@ impl NoRouteBackoff {
         let backed_off = peers.contains_key(peer);
         match class {
             RoundClass::NoRoute(error) if !backed_off => {
-                let window = NO_ROUTE_BACKOFF_INITIAL.min(self.cap);
+                let window = NO_ROUTE_BACKOFF_INITIAL.min(self.cap());
                 let delay = (self.jitter)(window);
                 let now = Instant::now();
                 peers.insert(
@@ -302,7 +335,7 @@ impl NoRouteBackoff {
                     peer = %peer,
                     retry_in_secs = delay.as_secs_f64(),
                     window_secs = window.as_secs_f64(),
-                    cap_secs = self.cap.as_secs_f64(),
+                    cap_secs = self.cap().as_secs_f64(),
                     error = %error,
                     "peer has NO ROUTE — every plane toward it backs off (ticks and kicks \
                      alike) until a path, a link or a frame from it shows up, or the delay \
@@ -311,7 +344,7 @@ impl NoRouteBackoff {
             }
             RoundClass::NoRoute(_) if probe => {
                 if let Some(s) = peers.get_mut(peer) {
-                    s.window = next_window(s.window, self.cap);
+                    s.window = next_window(s.window, self.cap());
                     let delay = (self.jitter)(s.window);
                     s.next_attempt = Instant::now() + delay;
                     s.failed_probes = s.failed_probes.saturating_add(1);
@@ -437,10 +470,35 @@ mod tests {
         }
     }
 
+    /// The cap is a setter, not a config field: it defaults to 15 min, is
+    /// clamped to 1 s, and a lowered cap governs the next window.
+    #[tokio::test(start_paused = true)]
+    async fn the_cap_defaults_to_15_min_and_a_set_cap_governs_the_next_window_794() {
+        let b = NoRouteBackoff::with_jitter(|w| w);
+        assert_eq!(b.cap(), DEFAULT_NO_ROUTE_BACKOFF_CAP);
+        b.set_cap(Duration::ZERO);
+        assert_eq!(
+            b.cap(),
+            Duration::from_secs(1),
+            "under 1 s is raised to 1 s"
+        );
+        b.set_cap(Duration::from_secs(45));
+        let fail = |b: &NoRouteBackoff| match b.admit("p", EnvelopeKind::Key) {
+            Admission::Run(t) => t.finish(RoundClass::NoRoute("no route".into())),
+            Admission::Skip => panic!("due"),
+        };
+        fail(&b);
+        for want in [45, 45] {
+            tokio::time::advance(Duration::from_secs(45)).await;
+            fail(&b);
+            assert_eq!(b.snapshot()[0].current_delay, Duration::from_secs(want));
+        }
+    }
+
     /// The probe claim is exclusive and released if its round never reports.
     #[tokio::test(start_paused = true)]
     async fn one_probe_at_a_time_and_an_abandoned_probe_releases_794() {
-        let b = NoRouteBackoff::with_jitter(Duration::from_secs(900), |w| w);
+        let b = NoRouteBackoff::with_jitter(|w| w);
         let no_route = || RoundClass::NoRoute("no route".into());
         match b.admit("p", EnvelopeKind::Key) {
             Admission::Run(t) => t.finish(no_route()),

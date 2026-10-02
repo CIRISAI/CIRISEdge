@@ -1537,6 +1537,13 @@ impl ReplicationRuntime {
         self.scheduler_handle.no_route_backoff()
     }
 
+    /// CIRISEdge#794 — set the no-route backoff's window ceiling (default
+    /// [`DEFAULT_NO_ROUTE_BACKOFF_CAP`](super::no_route_backoff::DEFAULT_NO_ROUTE_BACKOFF_CAP),
+    /// 15 min). Takes effect at each backed-off peer's next window.
+    pub fn set_no_route_backoff_cap(&self, cap: std::time::Duration) {
+        self.scheduler_handle.set_no_route_backoff_cap(cap);
+    }
+
     /// CIRISEdge#740 — the scheduler's round bound and its counters: the
     /// bound, rounds in flight now, the peak, and how many rounds have waited
     /// behind the gate since start.

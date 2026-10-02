@@ -382,7 +382,9 @@ pub use refusal_backoff::{RefusalBackoff, RetryDisposition};
 pub use bridge::BridgeEngine;
 pub use bridge::RevocationWiring;
 #[doc(inline)]
-pub use no_route_backoff::{BackoffExit, NoRouteBackoffEntry, NO_ROUTE_BACKOFF_INITIAL};
+pub use no_route_backoff::{
+    BackoffExit, NoRouteBackoffEntry, DEFAULT_NO_ROUTE_BACKOFF_CAP, NO_ROUTE_BACKOFF_INITIAL,
+};
 pub use registry::{RegistryError, ReplicationRegistry, RouteOutcome};
 #[doc(inline)]
 pub use runtime::{
