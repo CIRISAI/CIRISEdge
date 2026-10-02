@@ -330,7 +330,8 @@ run_point_once() {
   local cc=0
   python3 census.py "$out" "$rc" \
     --late-joiner "$MESH_LATE_JOINER" \
-    --expect "$MESH_EXPECT" || cc=$?
+    --expect "$MESH_EXPECT" \
+    --cohort "$MESH_COHORT" || cc=$?
   return "$cc"
 }
 

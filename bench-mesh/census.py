@@ -120,6 +120,47 @@ EXPECTED = {
     },
 }
 
+# CIRISEdge#782 — the pair chat runs on the publisher and the FIRST
+# subscriber only: `run_chat_legs` takes `cohort_members[1]`, the second
+# entry of EDGE_COHORT_MEMBERS. Every other subscriber reports
+# open_chat/send_message as principled not_runs and emits no
+# owner_binding_converged. At M<=2 the only other subscriber is the late
+# joiner, which is why no run showed the gap until M=4 reported a second
+# early subscriber.
+#
+# The pair's subscriber is DERIVED from the same assignment the run used —
+# run.sh passes `--cohort "$MESH_COHORT"`, the list it also hands the
+# harness — never hard-coded. Without `--cohort` (re-censusing a file) the
+# contract stays strict: every subscriber is held to the pair-chat legs.
+PAIR_CHAT_LEGS = frozenset({
+    "ladder.owner_binding_converged",
+    "ladder.open_chat",
+    "ladder.send_message",
+})
+
+
+def pair_subscriber_of(cohort):
+    """The node the harness assigns the pair chat to: `cohort[1]`, exactly
+    as `run_chat_legs` reads `cfg.cohort_members.get(1)`. `None` when the run
+    named no cohort (or a cohort with no subscriber)."""
+    return cohort[1] if cohort and len(cohort) > 1 else None
+
+
+def expected_for(node, role, pair_subscriber=None):
+    """The contract `node` is held to: its role's, minus the pair-chat legs
+    for a subscriber the run did NOT assign to the pair room. With no
+    assignment known (`pair_subscriber is None`) nothing is dropped."""
+    expected = EXPECTED.get(role)
+    if (
+        expected is not None
+        and role == "subscriber"
+        and pair_subscriber is not None
+        and node != pair_subscriber
+    ):
+        expected = expected - PAIR_CHAT_LEGS
+    return expected
+
+
 # Emitted by main() for ANY role, only as a bail marker on Err.
 BAIL_LEG = "mesh.role_completion"
 
@@ -648,7 +689,7 @@ def _read_leg_rows(path):
     return rows, None
 
 
-def census(path, rc, late_joiner=INFER, expect_nodes=None):
+def census(path, rc, late_joiner=INFER, expect_nodes=None, cohort=None):
     """Returns (exit_code, printed lines). Never prints a number it did
     not read out of the file."""
     out = []
@@ -776,7 +817,7 @@ def census(path, rc, late_joiner=INFER, expect_nodes=None):
         role = rows[0].get("role") if rows else role_from_name(node)
         if node == late_joiner:
             role = "late-joiner"
-        expected = EXPECTED.get(role)
+        expected = expected_for(node, role, pair_subscriber_of(cohort))
         if expected is None:
             violations.append(f"{node}: unknown role {role!r} — no contract to hold it to")
             out.append(f"  {node:<12} role={role!r}  UNKNOWN ROLE")
@@ -1186,7 +1227,7 @@ def preflight_self_test():
 def self_test():
     failures = 0
 
-    def check(name, rows, want_exit, expect_nodes=EXPECT_NODES):
+    def check(name, rows, want_exit, expect_nodes=EXPECT_NODES, cohort=None):
         nonlocal failures
         with tempfile.NamedTemporaryFile(
             "w", suffix=".jsonl", delete=False, dir=tempfile.gettempdir()
@@ -1195,7 +1236,7 @@ def self_test():
                 f.write(json.dumps(r) + "\n")
             path = f.name
         try:
-            code, out = census(path, 0, expect_nodes=expect_nodes)
+            code, out = census(path, 0, expect_nodes=expect_nodes, cohort=cohort)
         finally:
             os.unlink(path)
         verdict = "ok" if code == want_exit else "SELF-TEST FAILURE"
@@ -1273,6 +1314,40 @@ def self_test():
     rows = [r for r in _golden() if r["node"] != "relay-1"]
     check("expected node emitted nothing (relay-1 silent)", rows, 1)
 
+    # CIRISEdge#782 — at M>=3 an early subscriber other than sub-1 runs no
+    # pair chat: its two principled not_runs and its absent
+    # owner_binding_converged are not violations; the same absence on sub-1 is.
+    m4 = _golden()
+    for leg in ["mesh.standup", "mesh.rooting", "ladder.discover",
+                "ladder.discover_by_fedid", "cohort.join", "scope.install",
+                "perf.receive", "conformance.member_can_fetch",
+                "conformance.rotation_frame_loss", "scope.seal"]:
+        m4.append(_row("sub-3", "subscriber", leg))
+    for leg in ["ladder.open_chat", "ladder.send_message"]:
+        m4.append(_row("sub-3", "subscriber", leg, ran=False,
+                       reason="the pair chat legs run on the publisher and the "
+                              "first subscriber only"))
+    m4_cohort = ["publisher", "sub-1", "sub-2", "sub-3"]
+    check("M>=3: a subscriber the run did not assign to the pair is not held to it",
+          m4, 0, expect_nodes=EXPECT_NODES + ["sub-3"], cohort=m4_cohort)
+    # The assigned pair subscriber's pair-chat legs ABSENT → violation, each.
+    for leg in sorted(PAIR_CHAT_LEGS):
+        rows = [r for r in m4 if not (r["node"] == "sub-1" and r["leg"] == leg)]
+        check(f"the assigned pair subscriber (sub-1) missing {leg} is a violation",
+              rows, 1, expect_nodes=EXPECT_NODES + ["sub-3"], cohort=m4_cohort)
+    # All three absent at once, too.
+    rows = [r for r in m4 if not (r["node"] == "sub-1" and r["leg"] in PAIR_CHAT_LEGS)]
+    check("the assigned pair subscriber missing every pair-chat leg is a violation",
+          rows, 1, expect_nodes=EXPECT_NODES + ["sub-3"], cohort=m4_cohort)
+    # The assignment is derived, not hard-coded: name sub-3 the pair's
+    # subscriber and sub-3's principled not_runs now fail.
+    check("the pair subscriber comes from the cohort the run used (sub-3 assigned)",
+          m4, 1, expect_nodes=EXPECT_NODES + ["sub-3"],
+          cohort=["publisher", "sub-3", "sub-1", "sub-2"])
+    # No cohort known → strict: every subscriber is held to the pair chat.
+    check("no --cohort: the contract stays strict for every subscriber",
+          m4, 1, expect_nodes=EXPECT_NODES + ["sub-3"])
+
     print("")
     print("══ host capacity: the pre-flight and the degradation doctrine ══")
     failures += preflight_self_test()
@@ -1343,6 +1418,10 @@ def main():
     ap.add_argument("--expect", default=None,
                     help="comma-separated node ids the topology started — a "
                          "silent node then fails instead of vanishing")
+    ap.add_argument("--cohort", default=None,
+                    help="the cohort roster the harness got (EDGE_COHORT_MEMBERS, "
+                         "comma-separated, publisher first); its second entry is "
+                         "the pair chat's subscriber (CIRISEdge#782)")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--preflight", action="store_true",
                     help="hold the HOST to the floor for a point of --nodes "
@@ -1379,7 +1458,8 @@ def main():
     # Omitted flag = infer from the file; explicit "" = there is none.
     lj = INFER if args.late_joiner is None else (args.late_joiner or None)
     expect = [n for n in (args.expect or "").split(",") if n] or None
-    code, out = census(args.path, args.rc, late_joiner=lj, expect_nodes=expect)
+    cohort = [n for n in (args.cohort or "").split(",") if n] or None
+    code, out = census(args.path, args.rc, late_joiner=lj, expect_nodes=expect, cohort=cohort)
     for line in out:
         print(line)
     sys.exit(code)
