@@ -141,7 +141,7 @@ impl PullSink {
     /// CIRISEdge#779 — **a key_grant set was admitted.** If it wrote a wrap
     /// to this node, wake the parked DAG pull waiting on it: a content-axis
     /// set names the row (manifest or chunk) it opens, an epoch-axis set the
-    /// epoch. Never blocks and never awaits (the apply path's door, like
+    /// epoch, a stream-axis set (CIRISEdge#797) the stream epoch. Never blocks and never awaits (the apply path's door, like
     /// [`Self::offer`]); the puller's next tick re-pulls each woken DAG once,
     /// from a fresh retry ladder, however many of its grants landed.
     pub fn key_grant_admitted(
@@ -162,10 +162,14 @@ impl PullSink {
             KeyGrantAxis::Epoch { epoch, .. } => {
                 self.key_waits.wake_epoch(*epoch);
             }
-            // persist v53 (CIRISPersist#969) — a stream-epoch set. No DAG
-            // parks on a stream epoch yet: the puller's v4 (stream-keyed)
-            // path is CIRISEdge#797, which adds the wake it opens.
-            KeyGrantAxis::Stream { .. } => {}
+            // CIRISEdge#797 (persist v53, CIRISPersist#969) — a stream-epoch
+            // set: one per `(stream, epoch)`, opening every chunk of a v4 DAG
+            // sealed at that epoch.
+            KeyGrantAxis::Stream {
+                stream_id, epoch, ..
+            } => {
+                self.key_waits.wake_stream(stream_id, *epoch);
+            }
         }
     }
 
@@ -1011,12 +1015,102 @@ pub fn adopt_batch_take(sizes: &[usize], batch_max: usize) -> usize {
     n
 }
 
+/// CIRISEdge#797 — **what a DAG parked on its chunk keys waits for**, from
+/// persist's readiness door's `missing`: the stream epochs a v4 DAG lacks
+/// (woken by their `key_grant:stream:v1` sets), else the rows a v2 DAG lacks
+/// a content wrap for (each chunk, or a v3 child manifest). A DAG names one
+/// shape: persist keys a stream per chunk or per epoch, never both.
+pub(crate) fn awaiting_of(
+    missing: &[ciris_persist::federation::chunk_dag_cascade::orchestrate::MissingChunkKey],
+) -> key_wake::Awaiting {
+    use ciris_persist::federation::chunk_dag_cascade::orchestrate::MissingChunkKey as M;
+    let streams: Vec<(String, u64)> = missing
+        .iter()
+        .filter_map(|m| match m {
+            M::Stream {
+                stream_id, epoch, ..
+            } => Some((stream_id.clone(), *epoch)),
+            _ => None,
+        })
+        .collect();
+    if !streams.is_empty() {
+        return key_wake::Awaiting::Stream(streams);
+    }
+    key_wake::Awaiting::Content(
+        missing
+            .iter()
+            .filter_map(|m| {
+                let hex_sha = match m {
+                    M::Content { chunk_sha256, .. } => chunk_sha256,
+                    M::Child { child_sha256, .. } => child_sha256,
+                    M::Stream { .. } => return None,
+                };
+                let mut sha = [0u8; 32];
+                hex::decode_to_slice(hex_sha, &mut sha).ok().map(|()| sha)
+            })
+            .collect(),
+    )
+}
+
+/// CIRISEdge#797 — **is this persist refusal the wait for a chunk's key?**
+/// `blob_chunk_key_not_yet_granted` (CIRISPersist#969) is persist's typed
+/// RETRYABLE: the viewer is authorized on the DAG and one chunk's key set
+/// (its own content grant at v2, its stream epoch's at v4) has not arrived.
+/// `Some` names what to park on; every other error is `None`, so a
+/// stranger's `blob_not_granted` is never mistaken for a wait.
+#[must_use]
+pub(crate) fn awaiting_key_of(
+    e: &ciris_persist::federation::BlobError,
+) -> Option<key_wake::Awaiting> {
+    use ciris_persist::federation::{BlobError, ChunkKeyRef};
+    let BlobError::ChunkKeyNotYetGranted { key, .. } = e else {
+        return None;
+    };
+    Some(match key {
+        ChunkKeyRef::Stream { stream_id, epoch } => {
+            key_wake::Awaiting::Stream(vec![(stream_id.clone(), *epoch)])
+        }
+        ChunkKeyRef::Content { at_rest_sha256 } => {
+            let mut sha = [0u8; 32];
+            key_wake::Awaiting::Content(
+                hex::decode_to_slice(at_rest_sha256, &mut sha)
+                    .ok()
+                    .map(|()| sha)
+                    .into_iter()
+                    .collect(),
+            )
+        }
+    })
+}
+
 /// One chunk the sealed-DAG walk still has to fetch: its position, its
-/// ciphertext sha, its plaintext size (CIRISEdge#739).
+/// ciphertext sha, its plaintext size (CIRISEdge#739), and the stream epoch
+/// it is adopted at (CIRISEdge#797: the manifest's, for a v4 DAG).
 struct DagWant {
     seq: u64,
     sha: [u8; 32],
     size: u64,
+    epoch: u64,
+}
+
+/// CIRISEdge#797 — **the stream epoch a sealed chunk is adopted at**: the
+/// manifest's own `epoch` for the chunk (a v4, stream-keyed DAG, whose reader
+/// opens the chunk under that epoch's stream grant, CIRISPersist#969), else
+/// the label a one-shot file is written under (a v2 DAG, per-chunk keys).
+#[must_use]
+pub fn chunk_adopt_epoch(manifest_epoch: Option<u64>) -> u64 {
+    manifest_epoch.unwrap_or(crate::group_content::persist_store::STREAM_EPOCH)
+}
+
+/// CIRISEdge#797 — **how many of the waiting chunks (front first) share the
+/// first one's epoch.** Persist's batch adopt takes ONE epoch per call, so a
+/// batch never crosses an epoch: [`adopt_batch_take`]'s count is capped at
+/// this run. Pure, so the rule is a test.
+#[must_use]
+pub fn same_epoch_run(epochs: &[u64]) -> usize {
+    epochs
+        .first()
+        .map_or(0, |first| epochs.iter().take_while(|e| *e == first).count())
 }
 
 /// Why one lane of the sealed-DAG pipeline stopped (CIRISEdge#739).
@@ -1369,29 +1463,8 @@ where
         due
     }
 
-    /// CIRISEdge#779 — the `(seq, sha)` of every chunk this node holds no
-    /// at-rest wrap for: one `get_at_rest_grant` per chunk, the read door's
-    /// own first question (metadata only; nothing is unwrapped or opened).
-    async fn chunks_without_wrap(
-        &self,
-        chunks: &[(u64, [u8; 32])],
-    ) -> Result<Vec<(u64, [u8; 32])>, ciris_persist::federation::BlobError> {
-        let mut missing = Vec::new();
-        for (seq, sha) in chunks {
-            if self
-                .backend
-                .get_at_rest_grant(sha, &self.local_key_id)
-                .await?
-                .is_none()
-            {
-                missing.push((*seq, *sha));
-            }
-        }
-        Ok(missing)
-    }
-
     /// CIRISEdge#779 — record that `sha` is parked with `missing` chunk
-    /// wraps outstanding; `true` when that is fewer than at the last attempt,
+    /// keys outstanding (per chunk at v2, per stream epoch at v4); `true` when that is fewer than at the last attempt,
     /// i.e. the grants are arriving. A first sighting is not progress, so a
     /// memory dropped at the retry ledger's capacity can only spend attempts,
     /// never restart the ladder.
@@ -2221,7 +2294,6 @@ where
         // Every chunk's address is read off the view BEFORE the first request,
         // so a malformed manifest is refused with nothing fetched.
         let mut wanted: Vec<DagWant> = Vec::with_capacity(view.chunks.len());
-        let mut addresses: Vec<(u64, [u8; 32])> = Vec::with_capacity(view.chunks.len());
         let mut skipped_held: u64 = 0;
         for c in &view.chunks {
             let mut want = [0u8; 32];
@@ -2234,7 +2306,6 @@ where
                     },
                 );
             }
-            addresses.push((c.seq, want));
             if held_chunks.get(&c.seq) == Some(&want) {
                 skipped_held += 1;
                 continue;
@@ -2243,6 +2314,7 @@ where
                 seq: c.seq,
                 sha: want,
                 size: u64::from(c.size),
+                epoch: chunk_adopt_epoch(c.epoch),
             });
         }
         // Fetch order is `seq` (CIRISEdge#739, §6.7.5): the file's position
@@ -2331,8 +2403,13 @@ where
             while adopting.len() < adopters
                 && adopt_batch_ready(pending.len(), pending_bytes, fetching.len(), batch_max)
             {
+                // Fetched chunks wait in seq order, so a batch is a run of
+                // positions and an epoch boundary (CIRISEdge#797) ends it.
+                pending.sort_by_key(|(w, _)| w.seq);
                 let sizes: Vec<usize> = pending.iter().map(|(_, b)| b.len()).collect();
-                let take = adopt_batch_take(&sizes, batch_max);
+                let epochs: Vec<u64> = pending.iter().map(|(w, _)| w.epoch).collect();
+                let take = adopt_batch_take(&sizes, batch_max).min(same_epoch_run(&epochs));
+                let epoch = epochs[0];
                 let batch: Vec<(DagWant, Vec<u8>)> = pending.drain(..take).collect();
                 pending_bytes -= sizes[..take].iter().sum::<usize>();
                 batch_peak = batch_peak.max(batch.len());
@@ -2347,12 +2424,7 @@ where
                         .collect();
                     let started = Instant::now();
                     let adopted = engine
-                        .adopt_sealed_chunks(
-                            stream,
-                            &items,
-                            crate::group_content::persist_store::STREAM_EPOCH,
-                            provenance.clone(),
-                        )
+                        .adopt_sealed_chunks(stream, &items, epoch, provenance.clone())
                         .await
                         .map_err(|e| e.to_string());
                     let elapsed = started.elapsed();
@@ -2470,35 +2542,34 @@ where
         }
 
         // ── keyed ── CIRISEdge#779: every chunk opens as THIS NODE before the
-        // file is promoted, reported Stored and receipted (CC 5.3.3.6). At
-        // `self` / `family` each chunk is sealed under its own DEK, and its
-        // wrap to this node is its own content-axis key_grant set, which
-        // arrives after the bytes and in `seq` order, ~2.4 sets/s in the
-        // field. Promoting on the bytes alone reported a 256 MiB file pulled
-        // with 242 of its 1024 chunks unopenable here; the read stopped at
-        // the first. The question is the read door's own (persist's
-        // `open_stream_chunk_row_for_viewer` asks `get_at_rest_grant` of the
-        // chunk row first), asked as metadata, so nothing is decrypted to
-        // answer it. At `community_dek` the chunks share the manifest's
+        // file is promoted, reported Stored and receipted (CC 5.3.3.6). The
+        // key follows the bytes on its own plane: promoting on the bytes
+        // alone reported a 256 MiB file pulled with 242 of its 1024 chunks
+        // unopenable here. CIRISEdge#797 — asked through persist's readiness
+        // door, ONE call for both manifest versions, answered from the grant
+        // rows with no chunk opened: per stream EPOCH for a v4 DAG (one DEK
+        // per `(stream, epoch)`, CIRISPersist#969), per chunk for a v2 one
+        // (persist I314c). At `community_dek` the chunks share the manifest's
         // epoch binding (one provenance per stream, adopted above), so the
         // manifest opening as this node already answered it.
         if pointer.tier == CryptoTier::InvisibleEncrypted {
-            let missing = match self.chunks_without_wrap(&addresses).await {
-                Ok(m) => m,
-                Err(e) => return PullOutcome::StoreFailed(format!("get_at_rest_grant: {e}")),
+            let readiness = match self
+                .engine
+                .sealed_dag_readiness(&sha, &self.local_key_id, Some(&aad))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return PullOutcome::StoreFailed(format!("sealed_dag_readiness: {e}")),
             };
-            if let Some(&(first_seq, _)) = missing.first() {
-                // Parked on these chunks' wraps: each grant that lands wakes
-                // the pull (coalesced per tick), so giving up on the ladder
-                // below is not giving up on the file.
-                self.key_waits.park(
-                    sha,
-                    row,
-                    key_wake::Awaiting::Content(missing.iter().map(|&(_, c)| c).collect()),
-                );
-                let missing = missing.len() as u64;
+            if !readiness.missing.is_empty() {
+                // Parked on exactly what the door names: each grant that
+                // lands wakes the pull (coalesced per tick), so giving up on
+                // the ladder below is not giving up on the file.
+                let awaiting = awaiting_of(&readiness.missing);
+                let missing = readiness.missing.len() as u64;
+                self.key_waits.park(sha, row, awaiting);
                 // Progress restarts the ladder (and its backoff); bounded,
-                // since `missing` can only fall `chunk_count` times.
+                // since `missing` can only fall as many times as it has keys.
                 let attempts_spent = if self.chunk_keys_progressed(sha, missing) {
                     0
                 } else {
@@ -2512,12 +2583,12 @@ where
                     blob = %blob_hex,
                     attestation_id = %row.attestation_id,
                     stream_id = %view.stream_id,
-                    chunk_count = addresses.len() as u64,
+                    chunk_count = view.chunks.len() as u64,
+                    chunk_keys = readiness.chunk_keys,
                     missing,
-                    first_seq,
                     retrying,
-                    "DAG pull: every chunk is held but this node holds no wrap for some yet — \
-                     not promoted, waiting on their key_grant sets (CIRISEdge#779)"
+                    "DAG pull: every chunk is held but this node holds no key for some yet — \
+                     not promoted, waiting on their key_grant sets (CIRISEdge#779, #797)"
                 );
                 return PullOutcome::DagAwaitingKey { attempts, retrying };
             }
@@ -2549,7 +2620,18 @@ where
             Err(BlobError::InvalidArgument(detail)) => {
                 self.dag_refused(row, &blob_hex, DagPullRefusal::ChunkMissing { detail })
             }
-            Err(e) => PullOutcome::StoreFailed(format!("promote_adopted_manifest_to_dag: {e}")),
+            // CIRISEdge#797 — persist's typed retryable: this node is
+            // authorized on the DAG and a chunk's key has not landed yet. The
+            // state to wait through, parked on the key it names; never a
+            // refusal and never `NotGranted`.
+            Err(e) => match awaiting_key_of(&e) {
+                Some(awaiting) => {
+                    self.key_waits.park(sha, row, awaiting);
+                    let retrying = self.book_retry(row, sha, attempts);
+                    PullOutcome::DagAwaitingKey { attempts, retrying }
+                }
+                None => PullOutcome::StoreFailed(format!("promote_adopted_manifest_to_dag: {e}")),
+            },
         }
     }
 
@@ -2898,6 +2980,101 @@ mod tests {
         // One chunk over the byte cap still goes alone (persist names it).
         assert_eq!(adopt_batch_take(&[MAX_BATCH_BYTES + 1, chunk], 16), 1);
         assert_eq!(adopt_batch_take(&[], 16), 0);
+    }
+
+    /// CIRISEdge#797 — a batch never crosses a stream epoch (persist's batch
+    /// adopt takes one): the run of the front chunk's epoch caps it. A v4
+    /// chunk is adopted at its manifest epoch; a v2 chunk (no epoch) at the
+    /// label a file is written under.
+    #[test]
+    fn an_adopt_batch_stays_in_one_epoch_and_each_chunk_takes_its_own_797() {
+        assert_eq!(same_epoch_run(&[0, 0, 0, 1, 1]), 3);
+        assert_eq!(same_epoch_run(&[1, 1]), 2);
+        assert_eq!(same_epoch_run(&[2, 0, 2]), 1, "a run, not a count");
+        assert_eq!(same_epoch_run(&[]), 0);
+        assert_eq!(chunk_adopt_epoch(Some(3)), 3, "v4: the manifest's epoch");
+        assert_eq!(
+            chunk_adopt_epoch(None),
+            crate::group_content::persist_store::STREAM_EPOCH,
+            "v2: the one-shot label, as before #969"
+        );
+    }
+
+    /// CIRISEdge#797 — `blob_chunk_key_not_yet_granted` is the wait, parked
+    /// on the key it names (a stream epoch at v4, a chunk's own row at v2);
+    /// a stranger's `blob_not_granted` and every other error are not.
+    #[test]
+    fn a_chunk_key_not_yet_granted_is_a_wait_never_a_refusal_797() {
+        use ciris_persist::federation::{BlobError, ChunkKeyRef};
+        let pending = |key| BlobError::ChunkKeyNotYetGranted {
+            sha256_hex: hex::encode([1u8; 32]),
+            viewer_key_id: "me".into(),
+            seq: 3,
+            chunk_sha_hex: hex::encode([2u8; 32]),
+            key,
+        };
+        let stream = pending(ChunkKeyRef::Stream {
+            stream_id: "file-x".into(),
+            epoch: 1,
+        });
+        assert_eq!(stream.kind(), "blob_chunk_key_not_yet_granted");
+        assert!(matches!(
+            awaiting_key_of(&stream),
+            Some(key_wake::Awaiting::Stream(ref e)) if e == &[("file-x".to_owned(), 1)]
+        ));
+        assert!(matches!(
+            awaiting_key_of(&pending(ChunkKeyRef::Content {
+                at_rest_sha256: hex::encode([2u8; 32]),
+            })),
+            Some(key_wake::Awaiting::Content(ref c)) if c == &[[2u8; 32]]
+        ));
+        let stranger = BlobError::NotGranted {
+            sha256_hex: hex::encode([1u8; 32]),
+            viewer_key_id: "stranger".into(),
+        };
+        assert!(awaiting_key_of(&stranger).is_none());
+        assert!(awaiting_key_of(&BlobError::Backend("x".into())).is_none());
+    }
+
+    /// CIRISEdge#797 — the readiness door's `missing`, as the park reads it:
+    /// a v4 DAG waits on stream epochs (its stream sets wake it), a v2 DAG
+    /// on each chunk row's content wrap (persist I314c's legacy branch).
+    #[test]
+    fn a_dag_parks_on_what_the_readiness_door_names_797() {
+        use ciris_persist::federation::chunk_dag_cascade::orchestrate::MissingChunkKey as M;
+        let v4 = [
+            M::Stream {
+                stream_id: "file-x".into(),
+                epoch: 0,
+                seq_from: 0,
+                seq_to: 1 << 62,
+            },
+            M::Stream {
+                stream_id: "file-x".into(),
+                epoch: 1,
+                seq_from: 3,
+                seq_to: (1 << 62) + 1,
+            },
+        ];
+        assert!(matches!(
+            awaiting_of(&v4),
+            key_wake::Awaiting::Stream(ref e)
+                if e == &[("file-x".to_owned(), 0), ("file-x".to_owned(), 1)]
+        ));
+        let v2 = [
+            M::Content {
+                seq: 3,
+                chunk_sha256: hex::encode([3u8; 32]),
+            },
+            M::Content {
+                seq: 4,
+                chunk_sha256: hex::encode([4u8; 32]),
+            },
+        ];
+        assert!(matches!(
+            awaiting_of(&v2),
+            key_wake::Awaiting::Content(ref c) if c == &[[3u8; 32], [4u8; 32]]
+        ));
     }
 
     const SHA: [u8; 32] = [0xAB; 32];
@@ -3256,7 +3433,7 @@ mod tests {
         let plain = bare_row("federation");
         assert_eq!(sink.offer(&plain), PullOffer::NotAReference);
         let mut holds = bare_row("federation");
-        holds.attestation_type = format!("holds_bytes:sha256:{}", &hex::encode(SHA)[..16]);
+        holds.attestation_type = format!("holds_bytes:sha256:{}", &hex::encode(SHA)[..8]);
         holds.attestation_envelope =
             serde_json::json!({ "kind": "holds_bytes", "evidence_refs": [hex::encode(SHA)] });
         assert_eq!(

@@ -1559,6 +1559,12 @@ pub enum UnopenedReason {
     /// Persist's refusal does not distinguish the two cases, so neither can
     /// this arm; [`Self::is_pending`] still answers `false` for it.
     NotGranted { detail: String },
+    /// CIRISEdge#797 — held, this viewer is authorized on the file, and the
+    /// key of one of its chunks has not arrived yet (persist v53's
+    /// `blob_chunk_key_not_yet_granted`, CIRISPersist#969). A state to wait
+    /// through, not a verdict: key sets follow the bytes on their own plane.
+    /// [`Self::is_pending`] answers `true`.
+    AwaitingKey { detail: String },
     /// Held once, swept: the epoch was destroyed or the bytes evicted.
     Evicted { detail: String },
     /// The row referencing the bytes was withdrawn by its subject (CC 2.3
@@ -1584,6 +1590,7 @@ impl UnopenedReason {
         match self {
             Self::NotFetched { .. } => "not_fetched",
             Self::NotGranted { .. } => "not_granted",
+            Self::AwaitingKey { .. } => "awaiting_key",
             Self::Evicted { .. } => "evicted",
             Self::Withdrawn { .. } => "withdrawn",
             Self::SealMismatch { .. } => "seal_mismatch",
@@ -1599,6 +1606,7 @@ impl UnopenedReason {
         match self {
             Self::NotFetched { detail }
             | Self::NotGranted { detail }
+            | Self::AwaitingKey { detail }
             | Self::Evicted { detail }
             | Self::Withdrawn { detail }
             | Self::SealMismatch { detail }
@@ -1608,11 +1616,11 @@ impl UnopenedReason {
         }
     }
 
-    /// Is this a state a reader should wait through (the bytes may still
-    /// arrive), as opposed to a verdict?
+    /// Is this a state a reader should wait through (the bytes, or a
+    /// chunk's key, may still arrive), as opposed to a verdict?
     #[must_use]
     pub fn is_pending(&self) -> bool {
-        matches!(self, Self::NotFetched { .. })
+        matches!(self, Self::NotFetched { .. } | Self::AwaitingKey { .. })
     }
 
     /// The one mapping from the store's typed error. Kept here, once, so
@@ -1623,6 +1631,7 @@ impl UnopenedReason {
         match e {
             E::NotHeld { .. } => Self::NotFetched { detail },
             E::NotGranted { .. } => Self::NotGranted { detail },
+            E::ChunkKeyPending { .. } => Self::AwaitingKey { detail },
             E::Evicted { .. } => Self::Evicted { detail },
             E::Withdrawn { .. } => Self::Withdrawn { detail },
             E::SealMismatch { .. } => Self::SealMismatch { detail },

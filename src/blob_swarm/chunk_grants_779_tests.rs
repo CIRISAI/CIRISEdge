@@ -13,6 +13,14 @@
 //! These witnesses run that order on two real SQLite substrates (the
 //! `delivery_receipts_738` harness, in-process): the bytes first, the chunk
 //! grants after, the last ones held back.
+//!
+//! **CIRISEdge#797 (persist v53, CIRISPersist#969).** A self/family stream
+//! is sealed under one DEK per `(stream, epoch)`, granted by one
+//! `key_grant:stream:v1` set per epoch, and each epoch ends in a zero-length
+//! terminator chunk at `seq = 2^62 + epoch`. The author here rolls its epoch
+//! label every [`EPOCH_CHUNKS`] chunks, so the file is two epochs (seq 0..=2
+//! and 3..=4) and "chunks 3 and 4's keys arrive last" is epoch 1's stream
+//! set held back: the same order as the field, one set where there were two.
 
 use std::sync::Arc;
 
@@ -31,7 +39,7 @@ use ciris_persist::store::sqlite::SqliteBackend;
 use super::pull::{BlobPuller, DagByteFetch, PullConfig, PullOutcome, PullSink};
 use crate::files::{FileError, FileRow, FileWrite};
 use crate::group_content::{GroupContentError, GroupContentStore as _, PersistGroupContentStore};
-use crate::receipts::{self, StreamLog as _};
+use crate::receipts::{self, StreamLog};
 use crate::replication::attestation_bind::{Shared, Signers};
 
 fn ts() -> chrono::DateTime<chrono::Utc> {
@@ -41,8 +49,18 @@ fn ts() -> chrono::DateTime<chrono::Utc> {
 /// 1.3 MiB: four 256 KiB chunks and a tail, seq 0..=4.
 const FILE_LEN: usize = 1_300_000;
 
-/// The chunks whose grants arrive LAST — the field's seq 782..1023.
+/// CIRISEdge#797 — the author rolls its epoch label every this many chunks:
+/// epoch 0 is seq 0..=2, epoch 1 is seq 3..=4.
+const EPOCH_CHUNKS: u64 = 3;
+
+/// The chunks whose key arrives LAST — the field's seq 782..1023 — are
+/// epoch 1's: its one stream set is held back.
 const LATE: std::ops::RangeInclusive<u64> = 3..=4;
+const LATE_EPOCH: u64 = 1;
+
+/// persist's terminator position base (`TERMINATOR_SEQ_BASE`, #969): an
+/// epoch's terminator sits at `2^62 + epoch`, after every data chunk.
+const TERMINATOR_SEQ_BASE: u64 = 1 << 62;
 
 fn body_of(len: usize, seed: u32) -> Vec<u8> {
     (0..u32::try_from(len).expect("fits"))
@@ -132,7 +150,12 @@ struct Node {
 
 /// A device of `owner` keyed from `device`, with its owner binding and its
 /// node-class engine occurrence (`delivery_receipts_738::device`).
-async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
+async fn device(
+    idents: &[&Ident],
+    owner: &Ident,
+    device: &Ident,
+    chunks_per_epoch: Option<u64>,
+) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -179,6 +202,10 @@ async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
     )
     .await
     .expect("hybrid content store");
+    let store = match chunks_per_epoch {
+        Some(n) => store.with_chunks_per_epoch(n),
+        None => store,
+    };
     let (me, _) = crate::content_occurrence::provision_engine_occurrence(
         store.engine(),
         &*dir,
@@ -345,8 +372,11 @@ struct Published {
     sha: [u8; 32],
     stream_id: String,
     plain: Vec<u8>,
-    /// Chunk addresses in `seq` order.
+    /// The data chunks' addresses in `seq` order.
     chunks: Vec<[u8; 32]>,
+    /// CIRISEdge#797 — every chunk of the stream, terminators included, as
+    /// `(seq, plaintext size, address)` in `seq` order.
+    stream: Vec<(u64, u64, [u8; 32])>,
 }
 
 async fn publish_self_file(author: &Node, owner: &Ident) -> Published {
@@ -388,28 +418,68 @@ async fn publish_self_file(author: &Node, owner: &Ident) -> Published {
         .await
         .expect("read")
         .expect("the crossed row");
-    let chunks = author
+    let stream: Vec<(u64, u64, [u8; 32])> = author
         .dir
-        .stream_chunk_shas(&stream_id)
+        .stream_chunks(&stream_id)
         .await
-        .expect("stream chunks");
-    assert_eq!(chunks.len(), 5, "four 256 KiB chunks and the tail");
+        .expect("stream chunks")
+        .chunks
+        .into_iter()
+        .map(|c| (c.seq, c.plaintext_size, c.chunk_sha))
+        .collect();
+    // CIRISEdge#797 — five data chunks, then one empty terminator per epoch
+    // (two epochs: the label rolled at seq 3), sorting after every data chunk.
+    let seqs: Vec<u64> = stream.iter().map(|c| c.0).collect();
+    assert_eq!(
+        seqs,
+        vec![0, 1, 2, 3, 4, TERMINATOR_SEQ_BASE, TERMINATOR_SEQ_BASE + 1],
+        "four 256 KiB chunks, the tail, and a terminator per epoch"
+    );
+    assert!(
+        stream[5..].iter().all(|c| c.1 == 0),
+        "terminators are empty"
+    );
+    let chunks = stream[..5].iter().map(|c| c.2).collect();
     Published {
         row,
         sha,
         stream_id,
         plain,
         chunks,
+        stream,
+    }
+}
+
+/// The key sets a crossing holds back.
+#[derive(Debug, Clone, Default)]
+struct Withhold {
+    /// Content-axis sets for these rows (the manifest).
+    rows: Vec<[u8; 32]>,
+    /// CIRISEdge#797 — stream-axis sets for these epochs.
+    epochs: Vec<u64>,
+}
+
+impl Withhold {
+    fn none() -> Self {
+        Self::default()
+    }
+
+    /// The late chunks' key: epoch 1's stream set.
+    fn late() -> Self {
+        Self {
+            rows: Vec::new(),
+            epochs: vec![LATE_EPOCH],
+        }
     }
 }
 
 /// Apply the author's `key_grant` sets through `reader`'s key-grant door,
-/// except those for a blob in `withhold`, and hand each admission to `sink`
-/// as the bridge's key-grant door does. Returns how many were applied.
+/// except those `withhold` names, and hand each admission to `sink` as the
+/// bridge's key-grant door does. Returns how many were applied.
 async fn cross_keys_except(
     author: &Node,
     reader: &Node,
-    withhold: &[[u8; 32]],
+    withhold: &Withhold,
     sink: Option<&PullSink>,
 ) -> usize {
     author
@@ -418,7 +488,7 @@ async fn cross_keys_except(
         .emit_pending_key_grants()
         .await
         .expect("emit");
-    let held_back: Vec<String> = withhold.iter().map(hex::encode).collect();
+    let held_back: Vec<String> = withhold.rows.iter().map(hex::encode).collect();
     let mut applied = 0;
     for s in author
         .dir
@@ -433,10 +503,12 @@ async fn cross_keys_except(
         })
     {
         let set = KeyGrantSet::from_attestation(&s.attestation).expect("a well-formed set");
-        if let KeyGrantAxis::Content { at_rest_sha256, .. } = &set.axis {
-            if held_back.contains(at_rest_sha256) {
+        match &set.axis {
+            KeyGrantAxis::Content { at_rest_sha256, .. } if held_back.contains(at_rest_sha256) => {
                 continue;
             }
+            KeyGrantAxis::Stream { epoch, .. } if withhold.epochs.contains(epoch) => continue,
+            _ => {}
         }
         let admission = reader
             .store
@@ -477,17 +549,11 @@ fn receipts_emitted(edge: &crate::Edge) -> u64 {
 async fn two_devices() -> (Ident, Node, Node) {
     let alice = Ident::new("alice-fed", 0x11);
     let alice_phone = Ident::new("alice-phone", 0x33);
-    let node_a = device(&[&alice], &alice, &alice).await;
-    let node_b = device(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    let node_a = device(&[&alice], &alice, &alice, Some(EPOCH_CHUNKS)).await;
+    let node_b = device(&[&alice, &alice_phone], &alice, &alice_phone, None).await;
     federate(&node_a, &node_b).await;
     federate(&node_b, &node_a).await;
     (alice, node_a, node_b)
-}
-
-/// The chunks whose grants are held back, by address.
-fn late_chunks(file: &Published) -> Vec<[u8; 32]> {
-    LATE.map(|seq| file.chunks[usize::try_from(seq).expect("fits")])
-        .collect()
 }
 
 /// **The pull does not report a DAG Stored, promote it, or receipt it while
@@ -495,7 +561,6 @@ fn late_chunks(file: &Published) -> Vec<[u8; 32]> {
 /// whole file streams.** Fails on v38.0.0: the second pull reported
 /// `Stored` and emitted a receipt with chunks 3 and 4 unopenable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "CIRISEdge#797: persist v53 seals self/family files under stream-epoch grants (#969), not per-chunk ones"]
 async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
     let (alice, node_a, node_b) = two_devices().await;
     let edge_b = edge_of(&node_b);
@@ -519,7 +584,7 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
 
     // 2. The manifest's wrap and chunks 0..=2's land; 3 and 4's have not.
     //    Every chunk's BYTES arrive on this pull.
-    assert!(cross_keys_except(&node_a, &node_b, &late_chunks(&file), None).await > 0);
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::late(), None).await > 0);
     let early = puller
         .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
         .await;
@@ -528,10 +593,10 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
         "every chunk's bytes are held but chunks {LATE:?} do not open here: the pull must park \
          on their keys, not report the file pulled; got {early:?}"
     );
-    for (seq, chunk) in file.chunks.iter().enumerate() {
+    for (seq, _, chunk) in &file.stream {
         assert!(
             node_b.dir.has_blob(chunk).await.expect("has_blob"),
-            "chunk {seq}'s bytes were adopted and are kept for the resume"
+            "chunk {seq}'s bytes (terminators too) were adopted and are kept for the resume"
         );
     }
     assert!(
@@ -542,7 +607,7 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
 
     // 3. The last grants land: the resume promotes, receipts once, and the
     //    whole file streams through `FileRow::chunks`.
-    assert!(cross_keys_except(&node_a, &node_b, &[], None).await > 0);
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await > 0);
     assert_eq!(
         puller
             .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
@@ -560,7 +625,10 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
         read.extend_from_slice(&item.expect("every chunk opens as this node"));
         items += 1;
     }
-    assert_eq!(items, 5);
+    assert_eq!(
+        items, 5,
+        "one item per data chunk; the empty terminators hold no byte"
+    );
     assert!(
         read == file.plain,
         "the walk reads the file the author wrote"
@@ -571,7 +639,6 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
 /// the file.** The DAG is promoted here by persist's door directly, the
 /// state v38.0.0's puller left in the field, with chunks 3 and 4 unwrapped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "CIRISEdge#797: persist v53 seals self/family files under stream-epoch grants (#969), not per-chunk ones"]
 async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
     let (alice, node_a, node_b) = two_devices().await;
     let edge_b = edge_of(&node_b);
@@ -584,7 +651,7 @@ async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
         .await
         .expect("B admits the crossed row");
     let puller = puller_of(&node_b, &edge_b);
-    cross_keys_except(&node_a, &node_b, &late_chunks(&file), None).await;
+    cross_keys_except(&node_a, &node_b, &Withhold::late(), None).await;
     assert!(matches!(
         puller
             .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
@@ -621,6 +688,14 @@ async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
         said.contains(&late) && said.contains("seq 3"),
         "the refusal names chunk 3 by its own sha: {said}"
     );
+    // CIRISEdge#797 — and it is the wait, not the verdict: this node is
+    // authorized on the file and epoch 1's key has not landed yet.
+    assert_eq!(reason.kind(), "awaiting_key", "{said}");
+    assert!(
+        reason.is_pending(),
+        "a chunk's key still arriving is a state to wait through"
+    );
+    assert!(walk.next().await.is_none(), "a refusal ends the walk");
 
     // The store's typed error, directly: the file's sha, AND the chunk.
     let layout = file_row
@@ -642,16 +717,26 @@ async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
         )
         .await
         .expect_err("chunk 3 is not wrapped to this node");
-    let GroupContentError::NotGranted { sha256_hex, chunk } = err else {
-        panic!("NotGranted: {err:?}");
+    // CIRISEdge#797 — persist's `blob_chunk_key_not_yet_granted`, typed:
+    // never `NotGranted`, which is the stranger's refusal.
+    let GroupContentError::ChunkKeyPending {
+        sha256_hex,
+        chunk,
+        key,
+    } = err
+    else {
+        panic!("ChunkKeyPending: {err:?}");
     };
     assert_eq!(
         sha256_hex,
         hex::encode(file.sha),
         "the read targeted the file"
     );
-    let chunk = chunk.expect("the refused chunk is named");
     assert_eq!((chunk.seq, chunk.sha256_hex), (3, late));
+    assert!(
+        key.contains("key_grant:stream:v1") && key.contains(&format!("epoch {LATE_EPOCH}")),
+        "the key to wait for is epoch 1's stream set: {key}"
+    );
 }
 
 async fn promoted(node: &Node, sha: &[u8; 32]) -> bool {
@@ -670,7 +755,6 @@ async fn promoted(node: &Node, sha: &[u8; 32]) -> bool {
 /// land through the key-grant door's hook; the puller's own loop promotes the
 /// file and receipts it once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "CIRISEdge#797: persist v53 seals self/family files under stream-epoch grants (#969), not per-chunk ones"]
 async fn a_dag_parked_past_its_ladder_is_woken_by_its_grants_779() {
     parked_past_the_ladder_then_woken(false).await;
 }
@@ -679,7 +763,6 @@ async fn a_dag_parked_past_its_ladder_is_woken_by_its_grants_779() {
 /// either, so the pull parks before a chunk is fetched; the manifest's grant
 /// lands after the ladder ran out and wakes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "CIRISEdge#797: persist v53 seals self/family files under stream-epoch grants (#969), not per-chunk ones"]
 async fn a_dag_parked_on_its_manifest_past_its_ladder_is_woken_779() {
     parked_past_the_ladder_then_woken(true).await;
 }
@@ -708,10 +791,11 @@ async fn parked_past_the_ladder_then_woken(manifest_too: bool) {
     );
     let (sink, run) = Arc::clone(&puller).start();
 
-    // Every wrap but chunks 3 and 4's (and the manifest's, on that arm).
-    let mut withhold = late_chunks(&file);
+    // Every key but chunks 3 and 4's — epoch 1's stream set — (and the
+    // manifest's, on that arm).
+    let mut withhold = Withhold::late();
     if manifest_too {
-        withhold.push(file.sha);
+        withhold.rows.push(file.sha);
     }
     cross_keys_except(&node_a, &node_b, &withhold, Some(&sink)).await;
     assert!(matches!(
@@ -738,7 +822,7 @@ async fn parked_past_the_ladder_then_woken(manifest_too: bool) {
     assert!(receipt_rows(&node_b, &file.stream_id).await.is_empty());
 
     // The last grants land. Nothing re-offers the row; the grant wakes it.
-    assert!(cross_keys_except(&node_a, &node_b, &[], Some(&sink)).await > 0);
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::none(), Some(&sink)).await > 0);
     if manifest_too {
         // The woken pull opens the manifest and goes for the chunks, which
         // this harness's loop has no wire to fetch (`NoWire`): it fails the
@@ -793,4 +877,126 @@ async fn parked_past_the_ladder_then_woken(manifest_too: bool) {
     );
     drop(sink);
     run.abort();
+}
+
+/// **CIRISEdge#797 — a multi-epoch v4 DAG, its terminators held, reads and
+/// range-reads as the file.** The file is two stream epochs (seq 0..=2 and
+/// 3..=4) with an empty terminator per epoch at `2^62 + epoch`: the pull
+/// adopts all seven chunks, each at its manifest epoch, and promotes; the
+/// layout carries the terminators as empty extents at the file's end, never
+/// as bytes; whole, streamed and ranged reads (one across the epoch
+/// boundary) are the author's bytes; and the one receipt's `K` is the
+/// stream's tree size, the terminators included, as persist's STH commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // every read shape over one pulled file, in order, on purpose
+async fn a_multi_epoch_dag_reads_and_range_reads_across_its_terminators_797() {
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: file.row.clone(),
+        })
+        .await
+        .expect("B admits the crossed row");
+    cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await;
+    let puller = puller_of(&node_b, &edge_b);
+    assert_eq!(
+        puller
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false }
+    );
+    let held: Vec<(u64, u64, [u8; 32])> = node_b
+        .dir
+        .stream_chunks(&file.stream_id)
+        .await
+        .expect("stream chunks")
+        .chunks
+        .into_iter()
+        .map(|c| (c.seq, c.plaintext_size, c.chunk_sha))
+        .collect();
+    assert_eq!(
+        held, file.stream,
+        "every chunk, terminators too, at its position"
+    );
+
+    let file_row = FileRow::from_row(&file.row).expect("a file row");
+    let layout = file_row
+        .layout(&node_b.store, &node_b.me)
+        .await
+        .expect("layout");
+    assert_eq!(layout.total_size, FILE_LEN as u64);
+    let extents: Vec<(u64, u64, u64)> = layout
+        .chunks
+        .iter()
+        .map(|c| (c.seq, c.offset, c.size))
+        .collect();
+    let chunk = 256 * 1024u64;
+    assert_eq!(
+        extents,
+        vec![
+            (0, 0, chunk),
+            (1, chunk, chunk),
+            (2, 2 * chunk, chunk),
+            (3, 3 * chunk, chunk),
+            (4, 4 * chunk, FILE_LEN as u64 - 4 * chunk),
+            (TERMINATOR_SEQ_BASE, FILE_LEN as u64, 0),
+            (TERMINATOR_SEQ_BASE + 1, FILE_LEN as u64, 0),
+        ],
+        "the terminators are empty extents at the end: no offset moves"
+    );
+    assert!(layout.chunks[5].end_inclusive().is_none());
+
+    let whole = file_row
+        .open(&node_b.store, &node_b.me)
+        .await
+        .expect("the whole file opens");
+    assert!(whole == file.plain, "whole read: the author's bytes");
+    let mut walk = file_row.chunks(&node_b.store, &node_b.me);
+    let mut streamed = Vec::with_capacity(FILE_LEN);
+    let mut items = 0;
+    while let Some(item) = walk.next().await {
+        let item = item.expect("every chunk opens");
+        assert!(!item.is_empty(), "no empty item reaches the reader");
+        streamed.extend_from_slice(&item);
+        items += 1;
+    }
+    assert_eq!(items, 5);
+    assert!(streamed == file.plain, "streamed read: the author's bytes");
+
+    // Ranges: inside epoch 0, across the epoch boundary (chunk 2 → 3), inside
+    // epoch 1, the last byte; past the end is refused, naming the size.
+    let boundary = 3 * chunk;
+    for (offset, len) in [
+        (0u64, 10u64),
+        (boundary - 100, 200),
+        (boundary + 5, 1000),
+        (FILE_LEN as u64 - 1, 1),
+    ] {
+        let got = file_row
+            .open_range(&node_b.store, &node_b.me, offset, len)
+            .await
+            .unwrap_or_else(|e| panic!("range {offset}+{len}: {e}"));
+        let at = usize::try_from(offset).expect("fits");
+        let end = at + usize::try_from(len).expect("fits");
+        assert!(got == file.plain[at..end], "range {offset}+{len}");
+    }
+    assert!(matches!(
+        file_row
+            .open_range(&node_b.store, &node_b.me, FILE_LEN as u64, 1)
+            .await,
+        Err(FileError::RangeNotSatisfiable { .. })
+    ));
+
+    let receipts = StreamLog::list_delivery_receipts_for(&*node_b.dir, &file.stream_id, 16)
+        .await
+        .expect("receipts");
+    assert_eq!(receipts.len(), 1, "one receipt");
+    assert_eq!(
+        receipts[0].k,
+        file.stream.len() as u64,
+        "K is the stream's tree size: the data chunks and a terminator per epoch"
+    );
 }

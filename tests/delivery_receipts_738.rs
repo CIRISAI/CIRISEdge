@@ -718,7 +718,6 @@ async fn apply_through(
 /// before promote, none after a tampered chunk; a forged root and a duplicate
 /// are refused by name.**
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "CIRISEdge#797: persist v53 streams carry an epoch terminator chunk (#969); receipt leaves are reworked in #797"]
 #[allow(clippy::too_many_lines)] // the whole ladder, in order, on purpose
 async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
     init_tracing();
@@ -739,10 +738,17 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
         .await
         .expect("read")
         .expect("files::publish published the stream's STH");
-    assert_eq!(sth_a.tree_size, 5, "4 × 256 KiB + the tail");
+    // CIRISEdge#797 (persist v53, CIRISPersist#969): the stream's leaves are
+    // every chunk persist holds for it, epoch 0's empty terminator included,
+    // so the root a receipt names commits to it too (CC 5.3.3.6).
+    assert_eq!(
+        sth_a.tree_size, 6,
+        "4 × 256 KiB + the tail + epoch 0's terminator"
+    );
+    assert_eq!(sth_a.tree_size, file.chunks.len() as u64);
     let claim = receipts::StreamSthClaim::from_row(&file.row).expect("the row carries the STH");
     assert_eq!(claim.root().expect("root"), sth_a.root_hash);
-    assert_eq!(claim.tree_size, 5);
+    assert_eq!(claim.tree_size, 6);
 
     node_b
         .dir
@@ -809,7 +815,7 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
         .await
         .expect("list");
     assert_eq!(held_b.len(), 1);
-    assert_eq!(held_b[0].k, 5, "K = tree_size");
+    assert_eq!(held_b[0].k, 6, "K = tree_size, the terminator included");
     assert_eq!(
         held_b[0].chunk_root, sth_a.root_hash,
         "the root B's own chunks reproduce is A's published root"
@@ -843,7 +849,7 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
     let received = file_row.received_by(&node_a.store).await.expect("read");
     assert_eq!(received.len(), 1, "exactly one receipt: {received:?}");
     assert_eq!(received[0].node_key_id, node_b.me);
-    assert_eq!((received[0].epoch, received[0].k), (0, 5));
+    assert_eq!((received[0].epoch, received[0].k), (0, 6));
     assert!(
         received[0].at > file.row.asserted_at && received[0].at <= chrono::Utc::now(),
         "`at` is when A's store took the receipt (CIRISPersist#953): {}",
@@ -1055,7 +1061,6 @@ async fn an_inline_self_file_is_receipted_once_by_the_owners_other_device() {
 /// the operator predicate, CIRISPersist#960). Both fixed in persist v52;
 /// un-ignored by the family lane (CIRISEdge#736).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "CIRISEdge#797: a v4 stream-epoch family DAG (#969) parks awaiting its stream grant until #797"]
 async fn a_family_file_is_receipted_by_the_other_persons_device_and_no_one_else() {
     init_tracing();
     let alice = Ident::new("alice-fed", 0x11);

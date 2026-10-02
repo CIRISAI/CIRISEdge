@@ -552,7 +552,6 @@ async fn key_grants_of(a: &Node) -> Vec<Attestation> {
 /// (`blob_serve_scope_undeterminable`), and B's `FileRow::open` reads the
 /// manifest's JSON — the field's 518 / 610 / 9,529 bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "CIRISEdge#797: a v4 stream-epoch self DAG (#969) is not promoted by the puller until #797"]
 async fn a_self_files_chunks_arrive_on_the_owners_other_device_through_the_real_pull_717() {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");

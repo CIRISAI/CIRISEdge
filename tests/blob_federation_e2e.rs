@@ -67,6 +67,11 @@ use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyReco
 use ciris_persist::store::backend::Backend as _;
 use ciris_persist::store::sqlite::SqliteBackend;
 
+/// persist's terminator position base (CIRISPersist#969): a self/family
+/// stream epoch's empty terminator chunk sits at `2^62 + epoch`, after every
+/// data chunk (CIRISEdge#797).
+const TERMINATOR_SEQ_BASE: u64 = 1 << 62;
+
 fn ts() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp(1_767_225_296, 789_000_000).expect("ts")
 }
@@ -3270,7 +3275,6 @@ impl ciris_edge::blob_swarm::DagByteFetch for StoreFetch {
 /// honest pull RESUMES from that state, promotes, and B reads the file at
 /// full size with `storage_kind = chunk_dag`; a second offer is `AlreadyHeld`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "CIRISEdge#797: persist v53 seals self files as v4 stream-epoch DAGs (#969) with a terminator chunk; the puller adopts them in #797"]
 #[allow(clippy::too_many_lines)] // the whole ladder on one device, in order, on purpose
 async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_whole() {
     use ciris_edge::blob_swarm::{BlobPuller, DagPullRefusal, PullConfig, PullOutcome};
@@ -3364,7 +3368,16 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
         "the origin's row is a DAG"
     );
     assert_eq!(view_a.total_size, file_len as u64);
-    assert_eq!(view_a.chunks.len(), 5, "4 × 256 KiB + 251,424 bytes");
+    // CIRISEdge#797 (persist v53, CIRISPersist#969): a v4 DAG, one stream
+    // epoch, whose empty terminator sorts after the data chunks.
+    assert_eq!(
+        view_a.chunks.len(),
+        6,
+        "4 × 256 KiB + 251,424 bytes, and epoch 0's terminator"
+    );
+    assert_eq!(view_a.chunks[5].seq, TERMINATOR_SEQ_BASE);
+    assert_eq!(view_a.chunks[5].size, 0);
+    assert!(view_a.chunks.iter().all(|c| c.epoch == Some(0)));
     let chunk1: [u8; 32] = hex::decode(&view_a.chunks[1].sha256_hex)
         .expect("hex")
         .try_into()
@@ -3414,8 +3427,8 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
         "held as received, not yet a DAG"
     );
 
-    // The key crosses: A's content sets (a wrap per chunk and one for the
-    // manifest), through B's key-grant door.
+    // The key crosses: A's sets (the manifest's content set and the stream's
+    // one epoch set, CIRISEdge#797), through B's key-grant door.
     node_a
         .store
         .engine()
@@ -3434,11 +3447,18 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
                 .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
         })
         .collect();
-    assert!(
-        sets.len() >= 6,
-        "a set per chunk and the manifest: {}",
-        sets.len()
+    let stream_sets = sets
+        .iter()
+        .filter(|s| {
+            s.attestation.attestation_type
+                == ciris_persist::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
+        })
+        .count();
+    assert_eq!(
+        stream_sets, 1,
+        "one stream set for the file's one epoch, never one per chunk"
     );
+    assert!(sets.len() >= 2, "and the manifest's: {}", sets.len());
     let mut wraps = 0;
     for s in &sets {
         wraps += node_b
@@ -3452,10 +3472,7 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
             .wraps_written;
     }
     // Projected now: the wraps for the bytes B already HOLDS (the manifest —
-    // the seal's set and the descriptor's). A chunk's wrap is held pending
-    // until its chunk is adopted (persist I61/I62: a set admitted before its
-    // bytes is projected by the adopt), which the walk below exercises chunk
-    // by chunk.
+    // the seal's set and the descriptor's), and the stream epoch's.
     assert!(
         wraps >= 1,
         "B holds its own private half: {wraps} wraps projected"
@@ -3479,8 +3496,9 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
         .collect();
     assert_eq!(
         positions,
-        vec![0, 2, 3, 4],
-        "chunk 1 refused at its position; the rest (all in flight at the default K) adopted"
+        vec![0, 2, 3, 4, TERMINATOR_SEQ_BASE],
+        "chunk 1 refused at its position; the rest (all in flight at the default K), the \
+         terminator included, adopted"
     );
     assert_eq!(refusals().get("dag_chunk_mismatch").copied(), Some(1));
 
@@ -5169,15 +5187,19 @@ mod files {
     /// D9 — a chunked file's descriptor binds to the MANIFEST, and one access
     /// set covers the manifest and every chunk: a viewer granted the manifest
     /// opens name + every chunk together, a stranger opens none, and on the
-    /// self tier every granted occurrence holds an at-rest grant on the
-    /// manifest AND on each chunk row. persist v51.0.0 made this structural
-    /// (one recipient set per stream, `chunk_key_grant_emissions` emitted by
+    /// self tier every granted occurrence can open every chunk. persist
+    /// v51.0.0 made this structural (one recipient set per stream, emitted by
     /// `Engine::seal_stream_scoped` — edge seals only through that Engine
     /// door) and TESTED the mid-write occurrence change as I34b; edge's
     /// one-call seal cannot interleave an occurrence change, so that half is
     /// persist's witness.
+    ///
+    /// CIRISEdge#797 (persist v53, CIRISPersist#969): the chunks are keyed by
+    /// stream EPOCH, so a chunk row carries no wrap of its own; "every granted
+    /// occurrence opens every chunk" is persist's readiness door answering
+    /// readable, nothing missing, for each of them — and `NotGranted` for a
+    /// stranger.
     #[tokio::test]
-    #[ignore = "CIRISEdge#797: persist v53 grants a self/family stream once per epoch (#969), not once per chunk"]
     async fn a_chunked_files_descriptor_and_every_chunk_share_one_access_set() {
         init_tracing();
         let (node_a, rooms) = rooms().await;
@@ -5223,21 +5245,45 @@ mod files {
                     .chunks;
                 assert!(chunks.len() > 1, "{room}: several chunks");
                 assert!(!published.granted.is_empty(), "{room}: someone is granted");
+                let aad = ciris_edge::group_content::content_aad(
+                    &published.row.attesting_key_id,
+                    published.row.asserted_at,
+                    published.pointer.content_field,
+                );
                 for occ in &published.granted {
-                    for sha in std::iter::once(manifest).chain(chunks.iter().map(|c| c.chunk_sha)) {
-                        assert!(
-                            node_a
-                                .dir
-                                .get_at_rest_grant(&sha, occ)
-                                .await
-                                .expect("grant lookup")
-                                .is_some(),
-                            "{room}: {occ} granted the manifest must hold a grant on {} too \
-                             (one access set per stream)",
-                            hex::encode(sha)
-                        );
-                    }
+                    assert!(
+                        node_a
+                            .dir
+                            .get_at_rest_grant(&manifest, occ)
+                            .await
+                            .expect("grant lookup")
+                            .is_some(),
+                        "{room}: {occ} is granted the manifest"
+                    );
+                    let ready = node_a
+                        .store
+                        .engine()
+                        .sealed_dag_readiness(&manifest, occ, Some(&aad))
+                        .await
+                        .unwrap_or_else(|e| panic!("{room}: readiness for {occ}: {e}"));
+                    assert_eq!(ready.chunk_keys, "stream_epoch", "{room}: a v4 DAG");
+                    assert!(
+                        ready.readable && ready.missing.is_empty(),
+                        "{room}: {occ} granted the manifest must open every chunk too \
+                         (one access set per stream): {ready:?}"
+                    );
                 }
+                assert!(
+                    matches!(
+                        node_a
+                            .store
+                            .engine()
+                            .sealed_dag_readiness(&manifest, "stranger-occ", Some(&aad))
+                            .await,
+                        Err(ciris_persist::federation::BlobError::NotGranted { .. })
+                    ),
+                    "{room}: a stranger learns nothing about the chunks"
+                );
             }
         }
     }
