@@ -74,6 +74,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::Instrument;
 
 use tokio::sync::{mpsc, watch};
 
@@ -804,20 +805,34 @@ async fn run_one_coordinator_forever(
                 // CIRISEdge#740 — behind the gate: a kick fans out to every
                 // coordinator at once, and the gate is what turns that into
                 // at most `max_concurrent_rounds` rounds in flight.
+                //
+                // CIRISEdge#790 — the span INSTRUMENTS the round's future; it
+                // is never entered with a guard held across an await. A held
+                // `Span::enter` guard stays on the worker thread's span stack
+                // while the task is parked (on the gate, or in the round), so
+                // every later round polled on that worker nested under it:
+                // 9,495 spans deep on the canonical, then a stack overflow.
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str, kicked = true);
-                let _enter = span.enter();
-                let _permit = round_gate.enter(&peer_id, &kind_str).await;
-                round_and_report(&coord, round_timeout, event_sink.as_ref(), &peer_id).await;
+                async {
+                    let _permit = round_gate.enter(&peer_id, &kind_str).await;
+                    round_and_report(&coord, round_timeout, event_sink.as_ref(), &peer_id).await;
+                }
+                .instrument(span)
+                .await;
                 interval.reset();
             }
             _ = interval.tick() => {
                 // CIRISEdge#740 — behind the same gate: every coordinator's
                 // first tick fires the moment it is spawned, so a start is a
                 // fan-out too.
+                // CIRISEdge#790 — instrumented, never entered (see the kick arm).
                 let span = tracing::info_span!("anti_entropy_round", peer = %peer_id, kind = %kind_str);
-                let _enter = span.enter();
-                let _permit = round_gate.enter(&peer_id, &kind_str).await;
-                round_and_report(&coord, round_timeout, event_sink.as_ref(), &peer_id).await;
+                async {
+                    let _permit = round_gate.enter(&peer_id, &kind_str).await;
+                    round_and_report(&coord, round_timeout, event_sink.as_ref(), &peer_id).await;
+                }
+                .instrument(span)
+                .await;
                 if let Some(reader) = &mesh_config {
                     let target = reader.relief().await.round_cadence.unwrap_or(cadence);
                     if target != current_cadence {
@@ -2111,5 +2126,49 @@ mod tests {
             "a non-Key coordinator must not recover"
         );
         assert!(rx.try_recv().is_err(), "and must send nothing");
+    }
+}
+
+/// CIRISEdge#790 — the class gate: no `Span::enter` / `.entered()` guard is
+/// bound anywhere in `src/`. In async code a guard held across an `.await`
+/// leaves its span on the worker thread's stack while the task is parked, so
+/// every span later opened on that worker nests under it without bound (the
+/// canonical's 9,495-deep `anti_entropy_round` chain and its stack overflow).
+/// Instrument the future (`.instrument(span)`) instead. No clippy lint catches
+/// this, so the gate reads the source; it fails on the pre-#790 scheduler.
+#[cfg(test)]
+mod span_guard_790 {
+    #[test]
+    fn no_span_guard_is_bound_in_src_790() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).expect("read source");
+                    for (n, line) in text.lines().enumerate() {
+                        let code = line.split("//").next().unwrap_or("");
+                        let binds = code.contains("let ") && code.contains('=');
+                        // Split literals, so this gate never matches itself.
+                        let guard = code.contains(concat!("span", ".enter()"))
+                            || code.contains(concat!(".enter", "ed()"));
+                        if binds && guard {
+                            out.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        walk(&src, &mut found);
+        assert!(
+            found.is_empty(),
+            "a tracing span guard is bound in src/ (CIRISEdge#790): instrument the \
+             future with `.instrument(span)` instead of holding `span.enter()` / \
+             `.entered()` across awaits:\n{}",
+            found.join("\n")
+        );
     }
 }
