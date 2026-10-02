@@ -1,5 +1,56 @@
 # CIRISEdge Release Notes
 
+# v39.0.0 — a pulled file is readable when it says it is: no Stored and no delivery receipt until every chunk opens here, and a key's arrival wakes the waiting pull
+
+**2026-10-02** (PR #787, CIRISEdge#779). **MAJOR** from v38.1.1 (error types change shape; below).
+Ladder triple: **edge v39.0.0 · persist v52.0.2 · verify v18.0.0**. Pins unchanged.
+
+## The bug (CIRISEdge#779, from the server's 256 MiB self-file run)
+
+A pulled self/family chunk DAG was promoted, reported `Stored` and receipted as soon as every chunk's
+**bytes** were held, while chunk **key grants** were still arriving (in seq order, ~2.4/s). A streamed
+`FileRow::chunks()` read then died at the first chunk without this node's wrap, with `NotGranted`, after
+195 MiB. The refusal also named the **file's** sha, not the chunk's, which sent the first diagnosis the
+wrong way.
+
+- **The gate.** At `invisible_encrypted` (self/family), once every chunk is held and before promotion,
+  the pull checks each chunk for this node's at-rest wrap: one `get_at_rest_grant` metadata read per
+  chunk, nothing decrypted. Any missing wrap returns `DagAwaitingKey` and books a retry. No delivery
+  receipt (CC 5.3.3.6) is emitted until the file is `Stored`. `community_dek` is not gated (its chunks
+  open under the manifest's epoch grant).
+- **The wake.** A parked DAG records what it waits on (each missing chunk's sha; the manifest's sha or
+  the pointer epoch on the manifest arm). When the bridge admits a key_grant set that writes this node a
+  wrap, the DAG is woken and re-pulled from a fresh ladder on the puller's next tick: one coalesced
+  re-pull per DAG per tick (1,024 grants → one pull), held over (never lost, never concurrent) if a pull
+  is in flight, in a bounded register. So a grant stream that stalls longer than the whole retry ladder
+  still ends `Stored`. Before the wake, such a file would have stayed unpromoted for good.
+- **The ladder.** A retry that finds fewer chunks missing resets the attempt count; only consecutive
+  stalls spend attempts. It stays bounded, since the missing count can only fall once per chunk.
+- **The refusal names the chunk.** `open_range`'s `NotGranted` carries the refused chunk's `seq` and
+  sha.
+
+The root cost of the key-grant stream (one DEK and one grant set per chunk) is persist's,
+CIRISPersist#969 (CC 5.3.3.1: one DEK per (stream, epoch)), in persist v53.
+
+## Rust surface (breaking)
+
+| Change | Kind |
+|---|---|
+| `group_content::GroupContentError::NotGranted` gains `chunk: Option<RefusedChunk>` | **breaking**: construction, and any pattern without `..` |
+| `group_content::GroupContentError` is `#[non_exhaustive]` | **breaking**: an exhaustive `match` needs a `_` arm (taken now so the next variant isn't another MAJOR) |
+| `chat::UnopenedReason` is `#[non_exhaustive]` | **breaking**, same reason; `NotGranted { detail }` now names the chunk |
+| `group_content::RefusedChunk { seq, sha256_hex }` | new, `#[non_exhaustive]` |
+| `blob_swarm::PullSink::key_grant_admitted(&KeyGrantAdmission)` | new |
+
+## Also
+
+- The CI flake in the new manifest-arm witness was the test's observation, not the product:
+  `retry_booked` reads false in the instant between a due retry leaving the ledger and its pull booking
+  the next rung. The test now waits on "not booked and nothing dispatched" (6/30 failures before, 0/30
+  after, at `--test-threads=16`).
+- Filed along the way: #788 (`mutual_initiators_both_complete_rounds_634`, one CI failure, not
+  reproduced), #791 (the `holds_bytes` carrier must be matched exactly, for the persist v53 cut).
+
 # v38.1.1 — a replication round no longer nests its tracing span without bound (a canonical stack overflow); persist v52.0.2: a postgres reconnect no longer aborts a separate-wheel host
 
 **2026-10-02** (persist CIRISPersist v52.0.2). **PATCH** from v38.1.0. Ladder triple:
