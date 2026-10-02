@@ -739,8 +739,22 @@ mod tests {
         let phone = Ident::new("alice-phone", 0x33);
         let laptop = Ident::new("alice-laptop", 0x44);
         // Both provisioned `server` by the harness, as the field did.
-        let node = device(&[&alice, &phone], &alice, &phone, None).await;
-        let peer = device(&[&alice, &laptop], &alice, &laptop, None).await;
+        let node = device(
+            &[&alice, &phone],
+            &alice,
+            &phone,
+            None,
+            device_class::SERVER,
+        )
+        .await;
+        let peer = device(
+            &[&alice, &laptop],
+            &alice,
+            &laptop,
+            None,
+            device_class::SERVER,
+        )
+        .await;
         federate(&node, &peer).await;
         let (_, before) = rows(&node, &alice.key_id, &node.me).await;
         let before = before.expect("published on the plane");
@@ -807,7 +821,14 @@ mod tests {
     async fn a_reclass_carries_the_stored_expiry_799() {
         let alice = Ident::new("alice-fed", 0x11);
         let phone = Ident::new("alice-phone", 0x33);
-        let node = device(&[&alice, &phone], &alice, &phone, None).await;
+        let node = device(
+            &[&alice, &phone],
+            &alice,
+            &phone,
+            None,
+            device_class::SERVER,
+        )
+        .await;
         let expiry = chrono::Utc::now() + chrono::Duration::days(30);
         let expiry = chrono::DateTime::from_timestamp(expiry.timestamp(), 0).expect("ts");
         node.store
@@ -839,10 +860,18 @@ mod tests {
     /// refused by name; an unknown class is refused at both doors before
     /// anything is written.**
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)] // one door, four outcomes, each asserted on the row
     async fn the_local_door_reclasses_and_never_touches_drift_799() {
         let alice = Ident::new("alice-fed", 0x11);
         let phone = Ident::new("alice-phone", 0x33);
-        let node = device(&[&alice, &phone], &alice, &phone, None).await;
+        let node = device(
+            &[&alice, &phone],
+            &alice,
+            &phone,
+            None,
+            device_class::SERVER,
+        )
+        .await;
         // A device-class row this node holds for someone else: the
         // phone's own key, unsigned (local door).
         let other = phone.key_id.clone();
@@ -963,8 +992,22 @@ mod tests {
         let actor = Ident::new("alice-actor", 0x33);
         let wire = Ident::new("alice-wire", 0x55);
         let laptop = Ident::new("alice-laptop", 0x44);
-        let node = device(&[&alice, &actor, &wire], &alice, &actor, None).await;
-        let peer = device(&[&alice, &laptop], &alice, &laptop, None).await;
+        let node = device(
+            &[&alice, &actor, &wire],
+            &alice,
+            &actor,
+            None,
+            device_class::SERVER,
+        )
+        .await;
+        let peer = device(
+            &[&alice, &laptop],
+            &alice,
+            &laptop,
+            None,
+            device_class::SERVER,
+        )
+        .await;
         let (wire_key, _) = register_node_key(&node.dir, &alice, &wire).await;
         assert_ne!(wire_key, node.me, "split: the wire key is not the engine's");
         let (hw, pqc) = wire.signers();

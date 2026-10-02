@@ -178,15 +178,30 @@ struct Node {
 }
 
 async fn node(idents: &[&Ident], signer: &Ident) -> Node {
-    build_node_with(idents, signer, signer).await
+    // persist v53 S1 (CC 3.3.7) — alice's laptop.
+    build_node_with(
+        idents,
+        signer,
+        signer,
+        ciris_persist::federation::types::device_class::LAPTOP,
+    )
+    .await
 }
 
 /// A SECOND device of `owner` (CIRISEdge#646).
 async fn device_of(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
-    build_node_with(idents, owner, device).await
+    // persist v53 S1 (CC 3.3.7) — her phone: in her self audience as a
+    // personal-class device.
+    build_node_with(
+        idents,
+        owner,
+        device,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await
 }
 
-async fn build_node_with(idents: &[&Ident], owner: &Ident, signer: &Ident) -> Node {
+async fn build_node_with(idents: &[&Ident], owner: &Ident, signer: &Ident, class: &str) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -261,7 +276,7 @@ async fn build_node_with(idents: &[&Ident], owner: &Ident, signer: &Ident) -> No
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     .expect("provision this node's engine occurrence");

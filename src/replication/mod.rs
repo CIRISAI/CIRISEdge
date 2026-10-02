@@ -122,6 +122,9 @@ pub mod bridge;
 pub mod convergence;
 pub mod coordinator;
 pub mod directory;
+/// CIRISEdge#761 — the `(scope, group, named)` a membership-plane row is about,
+/// for persist's `may_receive_group_plane` serve gate.
+pub mod group_plane;
 /// CIRISEdge#552 — hashes known to exist whose bodies this node does not
 /// hold. NEVER holdings; see the module docs for why that distinction is the
 /// whole safety of the design.
@@ -139,9 +142,6 @@ mod no_route_backoff_794_tests;
 #[cfg(test)]
 mod occurrence_before_binding_776_tests;
 pub mod protocol;
-/// CIRISEdge#762 — the public-group predicate the #758 record gate exempts
-/// (stand-in for persist v53's `replication_audience::is_public_group`).
-pub mod public_group;
 pub mod refusal_backoff;
 pub mod registry;
 pub mod resolved_state;

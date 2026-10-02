@@ -188,10 +188,25 @@ struct Node {
 /// witness — an in-memory SQLite would hold the whole file in RAM, which is
 /// exactly the residency this lane removes from edge).
 async fn node_at(path: &str, idents: &[&Ident], signer: &Ident) -> Node {
-    build_node_with(path, idents, signer, signer).await
+    // persist v53 S1 (CC 3.3.7) — alice's own device: it reads back her self
+    // file only as a personal-class node.
+    build_node_with(
+        path,
+        idents,
+        signer,
+        signer,
+        ciris_persist::federation::types::device_class::LAPTOP,
+    )
+    .await
 }
 
-async fn build_node_with(path: &str, idents: &[&Ident], owner: &Ident, signer: &Ident) -> Node {
+async fn build_node_with(
+    path: &str,
+    idents: &[&Ident],
+    owner: &Ident,
+    signer: &Ident,
+    class: &str,
+) -> Node {
     let dir = FederationDirectorySqlite::open(path)
         .await
         .expect("open substrate");
@@ -266,7 +281,7 @@ async fn build_node_with(path: &str, idents: &[&Ident], owner: &Ident, signer: &
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     .expect("provision this node's engine occurrence");

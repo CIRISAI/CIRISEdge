@@ -177,7 +177,15 @@ struct Node {
 /// the owner's identity (`blob_federation_e2e::device_of`). `db` is the
 /// sqlite path (`":memory:"` for a throwaway); `seed_idents` are the key
 /// records every node must hold.
-async fn device(db: &str, seed_idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
+/// `class` is the occurrence's `device_class` (persist v53 S1, CC 3.3.7): the
+/// phone adopts the laptop's self DAG only as a personal-class device.
+async fn device(
+    db: &str,
+    seed_idents: &[&Ident],
+    owner: &Ident,
+    device: &Ident,
+    class: &str,
+) -> Node {
     let dir = FederationDirectorySqlite::open(db)
         .await
         .expect("open substrate");
@@ -252,7 +260,7 @@ async fn device(db: &str, seed_idents: &[&Ident], owner: &Ident, device: &Ident)
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     {
@@ -559,8 +567,22 @@ async fn a_self_files_chunks_arrive_on_the_owners_other_device_through_the_real_
     let laptop = Ident::new("alice-laptop-717", 0x12);
     let phone = Ident::new("alice-phone-717", 0x13);
     let seeds = [&alice, &laptop, &phone];
-    let node_a = device(":memory:", &seeds, &alice, &laptop).await;
-    let node_b = device(":memory:", &seeds, &alice, &phone).await;
+    let node_a = device(
+        ":memory:",
+        &seeds,
+        &alice,
+        &laptop,
+        ciris_persist::federation::types::device_class::LAPTOP,
+    )
+    .await;
+    let node_b = device(
+        ":memory:",
+        &seeds,
+        &alice,
+        &phone,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     // The Key / owner-binding / occurrence planes, both ways — BEFORE A
     // publishes: the self room's key_grant sets wrap to the owner's
     // occurrences A holds at seal time.

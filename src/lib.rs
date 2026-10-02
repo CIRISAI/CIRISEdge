@@ -190,8 +190,14 @@ mod wire_vocabulary_hash_tests {
 // (#655/#662). Edge's serve/advertise half is UNCHANGED — its own
 // SERVE_ADVERTISE_POLICY_HASH test + all 815 behavioral tests still pass — so this
 // is a clean witness re-pin of the persist-internal apply policy (CIRISEdge#393).
+// persist v53 S1 re-pin (CIRISPersist#963, CIRISEdge#761): every `KindPolicy`
+// gains `audience` (`ServeAudience::{Cohort, MembershipPlane, Public}`), naming
+// the persist predicate edge's serve gate calls (`may_receive` /
+// `may_receive_group_plane`). Edge's serve half moved with it: the Attestation
+// audience gate and the group record + membership planes now ask those
+// predicates. Previous value: 5501d6b9…714a.
 pub const PERSIST_REPLICATION_POLICY_HASH: &str =
-    "5501d6b9621e0af400ed89c0c803515b33c084676be5cd5182c3629277d9714a";
+    "1860451cf166879431dadf433422f6fdb43a911b5c889b0f55ca491262393869";
 
 #[cfg(test)]
 mod replication_policy_hash_tests {
@@ -223,8 +229,12 @@ mod replication_policy_hash_tests {
 // v31.1.0 re-pin: the closed consent grammar moved with the baked plane the
 // ceremony trust root confers (#665). Edge's consent handling is UNCHANGED (no
 // consent test regressed), so this is a clean witness re-pin (CIRISEdge#397 §5).
+// persist v53 S1 re-pin (CIRISPersist#963, CIRISEdge#761): `consent:replication`
+// gains the optional per-node `cohorts` allow list ({scope, target}, CC 3.3.7).
+// Edge writes no grants; it reads the list only through persist's audience
+// resolver. Previous value: 82305891…82ac.
 pub const PERSIST_CONSENT_GRAMMAR_HASH: &str =
-    "8230589131945c4b4db3c2e7ca2187e6c02543cd8f084b0f8862eb951d2c82ac";
+    "4d473eac6f2bfde1a78b01e9a2ac8442fc9adb5207c7adeb51d509215b79e843";
 
 #[cfg(test)]
 mod consent_grammar_hash_tests {

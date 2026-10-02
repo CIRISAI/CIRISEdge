@@ -213,7 +213,10 @@ struct Node {
 /// A device of `owner` (`self_dag_field_path_717::device`): the node key is
 /// `device`'s, the owner binding is signed by `owner`, the engine occurrence
 /// is provisioned under the owner.
-async fn device(seed_idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
+/// `class` is the occurrence's `device_class` (persist v53 S1, CC 3.3.7): a
+/// person's own device is `phone`, so it is in its family's audience; the
+/// forwarder is a `server`.
+async fn device(seed_idents: &[&Ident], owner: &Ident, device: &Ident, class: &str) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -271,7 +274,7 @@ async fn device(seed_idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     .expect("provision this node's engine occurrence");
@@ -1106,9 +1109,27 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
     let n_owner = Ident::new("person-n-736", 0x41);
     let n_id = Ident::new("device-n-736", 0x42);
     let seeds = [&p, &p1_id, &q, &q1_id, &r, &n_owner, &n_id];
-    let node_p1 = device(&seeds, &p, &p1_id).await;
-    let node_q1 = device(&seeds, &q, &q1_id).await;
-    let node_n = device(&seeds, &n_owner, &n_id).await;
+    let node_p1 = device(
+        &seeds,
+        &p,
+        &p1_id,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
+    let node_q1 = device(
+        &seeds,
+        &q,
+        &q1_id,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
+    let node_n = device(
+        &seeds,
+        &n_owner,
+        &n_id,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     for (a, b) in [
         (&node_p1, &node_q1),
         (&node_q1, &node_p1),
@@ -1313,10 +1334,28 @@ async fn family_files_cross_through_a_non_member_forwarder_that_learns_nothing_7
     let r = Ident::new("person-r-736f", 0x31);
     let f_id = Ident::new("forwarder-736f", 0x51);
     let seeds = [&p, &p1_id, &q, &q1_id, &r];
-    let node_p1 = device(&seeds, &p, &p1_id).await;
-    let node_q1 = device(&seeds, &q, &q1_id).await;
+    let node_p1 = device(
+        &seeds,
+        &p,
+        &p1_id,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
+    let node_q1 = device(
+        &seeds,
+        &q,
+        &q1_id,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     // F knows only itself: it is in no family and never learns of one.
-    let node_f = device(&[&f_id], &f_id, &f_id).await;
+    let node_f = device(
+        &[&f_id],
+        &f_id,
+        &f_id,
+        ciris_persist::federation::types::device_class::SERVER,
+    )
+    .await;
     federate(&node_p1, &node_q1).await;
     federate(&node_q1, &node_p1).await;
 

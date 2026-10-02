@@ -159,13 +159,18 @@ async fn node(idents: &[&Ident], signer: &Ident) -> Node {
     build_node(idents, signer, true).await
 }
 
+/// The class a person's own node is provisioned as: persist v53 S1 (CC 3.3.7)
+/// keeps the owner's self and family content to personal-class devices, and
+/// every [`node`] here is a person's own node.
+const PERSON_NODE: &str = ciris_persist::federation::types::device_class::LAPTOP;
+
 /// [`node`], with provisioning optional — a node built with `provision:
 /// false` is a pre-v24.2.0 node before its first occurrence exists, which is
 /// the only honest way to simulate one: persist's trusted-local door carries
 /// `WHERE signature IS NULL`, so it CANNOT downgrade a row that was published,
 /// and a legacy row can only be made by never publishing in the first place.
 async fn build_node(idents: &[&Ident], signer: &Ident, provision: bool) -> Node {
-    build_node_with(idents, signer, signer, provision).await
+    build_node_with(idents, signer, signer, provision, PERSON_NODE).await
 }
 
 /// CIRISEdge#646 — a SECOND device of `owner`: the node's own signing key
@@ -175,7 +180,15 @@ async fn build_node(idents: &[&Ident], signer: &Ident, provision: bool) -> Node 
 /// same person's self-collective (CC 3.3.6), and `contact::resolve` on
 /// either yields the other.
 async fn device_of(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
-    build_node_with(idents, owner, device, true).await
+    // persist v53 S1 — the owner's second device, her phone.
+    build_node_with(
+        idents,
+        owner,
+        device,
+        true,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await
 }
 
 async fn build_node_with(
@@ -183,6 +196,7 @@ async fn build_node_with(
     owner: &Ident,
     signer: &Ident,
     provision: bool,
+    class: &str,
 ) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
@@ -287,7 +301,7 @@ async fn build_node_with(
             store.engine(),
             &*dir,
             &owner.key_id,
-            "server",
+            class,
         )
         .await
         .expect("provision this node's engine occurrence");
@@ -1027,10 +1041,14 @@ async fn a_node_provisions_its_engine_occurrence_and_the_cascade_finds_it() {
     );
 
     // Idempotent: a restart must not mint a second occurrence.
-    let (again, outcome) =
-        provision_engine_occurrence(node_a.store.engine(), &*node_a.dir, &alice.key_id, "server")
-            .await
-            .expect("re-provision");
+    let (again, outcome) = provision_engine_occurrence(
+        node_a.store.engine(),
+        &*node_a.dir,
+        &alice.key_id,
+        PERSON_NODE,
+    )
+    .await
+    .expect("re-provision");
     assert_eq!(again, node_a.me);
     assert_eq!(outcome, Provisioned::AlreadyCurrent);
 }
@@ -1060,15 +1078,25 @@ async fn a_foreign_occurrence_under_the_engine_id_reports_drift() {
     // engine's occurrence already exists, so overwrite the row's pubkeys
     // through the directory door directly.
     let _ = dir;
-    let _ = ensure_content_occurrence(&*node_a.dir, &alice.key_id, &node_a.me, "server", foreign)
-        .await
-        .expect("directory write");
+    let _ = ensure_content_occurrence(
+        &*node_a.dir,
+        &alice.key_id,
+        &node_a.me,
+        PERSON_NODE,
+        foreign,
+    )
+    .await
+    .expect("directory write");
     // ensure_content_occurrence itself refuses to overwrite (Drifted) — so
     // the drift is observable from provisioning as well.
-    let (_, outcome) =
-        provision_engine_occurrence(node_a.store.engine(), &*node_a.dir, &alice.key_id, "server")
-            .await
-            .expect("provision");
+    let (_, outcome) = provision_engine_occurrence(
+        node_a.store.engine(),
+        &*node_a.dir,
+        &alice.key_id,
+        PERSON_NODE,
+    )
+    .await
+    .expect("provision");
     assert_eq!(
         outcome,
         Provisioned::AlreadyCurrent,

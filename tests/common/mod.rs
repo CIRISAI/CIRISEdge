@@ -272,3 +272,60 @@ fn is_addr_in_use(err: &ciris_edge::transport::TransportError) -> bool {
     let msg = err.to_string();
     msg.contains("Address already in use") || msg.contains("os error 98")
 }
+
+/// persist v53 S1 (CIRISEdge#761) — `node`'s own signed identity occurrence
+/// under `owner` (the row a host's `provision_engine_occurrence` publishes,
+/// in persist's content-only form, CIRISPersist#851): signed by the node, so
+/// it carries the occurrence's own consent (#932) and resolves the node to
+/// its owner on every directory it replicates to. Under S1 a node is its
+/// owner's only through this row, never the owner-binding alone. `class` is
+/// the `device_class` the fixture models; the pubkeys are placeholders (no
+/// content is wrapped to them).
+pub async fn node_signed_occurrence(
+    owner_key_id: &str,
+    node_key_id: &str,
+    node_signer: &ciris_edge::identity::LocalSigner,
+    class: &str,
+) -> ciris_persist::federation::types::SignedIdentityOccurrence {
+    let at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .expect("millis");
+    let (x25519, ml_kem) = (B64.encode([0x07; 32]), B64.encode([0x09; 1184]));
+    let env = serde_json::json!({
+        "attesting_key_id": node_key_id,
+        "identity_key_id": owner_key_id,
+        "occurrence_key_id": node_key_id,
+        "device_class": class,
+        "encryption_pubkeys": { "x25519_base64": x25519, "ml_kem_768_base64": ml_kem },
+        "asserted_at": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "valid_until": serde_json::Value::Null,
+        "hardware_attestation": serde_json::Value::Null,
+    });
+    let bytes = ciris_verify_core::jcs::canonicalize(&env).expect("jcs");
+    let (ed, pqc) = ciris_edge::identity::sign_bound_hybrid(node_signer, &bytes, "occurrence")
+        .await
+        .expect("hybrid sign");
+    ciris_persist::federation::types::SignedIdentityOccurrence {
+        identity_occurrence: ciris_persist::federation::types::IdentityOccurrence {
+            identity_key_id: owner_key_id.to_owned(),
+            occurrence_key_id: node_key_id.to_owned(),
+            device_class: class.to_owned(),
+            hardware_attestation: None,
+            asserted_at: at,
+            valid_until: None,
+            encryption_pubkeys: Some(ciris_persist::federation::types::EncryptionPubkeys {
+                x25519_base64: x25519,
+                ml_kem_768_base64: ml_kem,
+            }),
+            transport_binding: None,
+            persist_row_hash: String::new(),
+        },
+        attesting_key_id: node_key_id.to_owned(),
+        signed_envelope: env,
+        signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+            ed25519_signature_base64: ed,
+            mldsa65_signature_base64: pqc,
+        },
+    }
+}

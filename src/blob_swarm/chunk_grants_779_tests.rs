@@ -31,6 +31,7 @@ use ciris_persist::federation::blobs::BlobStorage as _;
 use ciris_persist::federation::key_grant::{
     KeyGrantAxis, KeyGrantSet, SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
 };
+use ciris_persist::federation::types::device_class;
 use ciris_persist::federation::{Attestation, FederationDirectory as _, SignedAttestation};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
@@ -187,12 +188,16 @@ pub(crate) async fn register_node_key(
 }
 
 /// A device of `owner` keyed from `device`, with its owner binding and its
-/// node-class engine occurrence (`delivery_receipts_738::device`).
+/// engine occurrence of `class` (`delivery_receipts_738::device`). Under
+/// persist v53 S1 the class decides self/family reach (CC 3.3.7): a personal
+/// device (`phone` | `laptop`) is wrapped its owner's self content, a server
+/// is not.
 pub(crate) async fn device(
     idents: &[&Ident],
     owner: &Ident,
     device: &Ident,
     chunks_per_epoch: Option<u64>,
+    class: &str,
 ) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
@@ -221,7 +226,7 @@ pub(crate) async fn device(
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     .expect("provision this node's engine occurrence");
@@ -391,8 +396,13 @@ struct Published {
 }
 
 async fn publish_self_file(author: &Node, owner: &Ident) -> Published {
+    publish_self_file_seeded(author, owner, 0x0779).await
+}
+
+/// [`publish_self_file`] with the body drawn from `seed`, so two files differ.
+async fn publish_self_file_seeded(author: &Node, owner: &Ident, seed: u32) -> Published {
     let room = crate::self_room::room(&owner.key_id);
-    let plain = body_of(FILE_LEN, 0x0779);
+    let plain = body_of(FILE_LEN, seed);
     let published = crate::files::publish(
         &*author.dir,
         &author.store,
@@ -560,8 +570,24 @@ fn receipts_emitted(edge: &crate::Edge) -> u64 {
 async fn two_devices() -> (Ident, Node, Node) {
     let alice = Ident::new("alice-fed", 0x11);
     let alice_phone = Ident::new("alice-phone", 0x33);
-    let node_a = device(&[&alice], &alice, &alice, Some(EPOCH_CHUNKS)).await;
-    let node_b = device(&[&alice, &alice_phone], &alice, &alice_phone, None).await;
+    // S1 (CC 3.3.7) — D1 and D2 are alice's own devices: B is wrapped every
+    // chunk of her self file only as a personal-class node.
+    let node_a = device(
+        &[&alice],
+        &alice,
+        &alice,
+        Some(EPOCH_CHUNKS),
+        device_class::LAPTOP,
+    )
+    .await;
+    let node_b = device(
+        &[&alice, &alice_phone],
+        &alice,
+        &alice_phone,
+        None,
+        device_class::PHONE,
+    )
+    .await;
     federate(&node_a, &node_b).await;
     federate(&node_b, &node_a).await;
     (alice, node_a, node_b)
@@ -1010,4 +1036,132 @@ async fn a_multi_epoch_dag_reads_and_range_reads_across_its_terminators_797() {
         file.stream.len() as u64,
         "K is the stream's tree size: the data chunks and a terminator per epoch"
     );
+}
+
+/// Hand `from`'s current signed engine occurrence to `to` (the row a peer
+/// replicates after a reclass: same keys, the new class, a newer
+/// `asserted_at`).
+async fn carry_occurrence(from: &Node, to: &Node) {
+    let occ = from
+        .dir
+        .list_signed_identity_occurrences_since(None, 64)
+        .await
+        .expect("list occurrences")
+        .into_iter()
+        .map(|s| s.occurrence)
+        .filter(|o| {
+            o.identity_occurrence.occurrence_key_id == from.me
+                && o.identity_occurrence.identity_key_id == from.identity
+        })
+        .max_by_key(|o| o.identity_occurrence.asserted_at)
+        .expect("the engine occurrence is on the signed plane");
+    to.dir
+        .put_identity_occurrence(occ)
+        .await
+        .expect("admit the far node's occurrence");
+}
+
+/// **CIRISEdge#799 under persist v53 S1 (CC 3.3.7) — a device its owner
+/// claimed as a `server` is wrapped none of the owner's self file; once
+/// `provision_engine_occurrence` reclasses it `phone` it is wrapped every
+/// chunk and reads the whole file.** The field shape: alice's phone, whose
+/// embedded server provisioned it `server`. A (her laptop) publishes a self
+/// file and B holds the crossed row and every key set A emits, yet B's pull
+/// parks on its keys: S1 keeps a server-class node out of its owner's self
+/// audience, and the wraps follow the audience. Reprovisioned as a `phone`
+/// (`Reclassed`), its new occurrence reaches A, and alice's next self file is
+/// wrapped to it: B's pull is `Stored` and streams the file. Fails without the
+/// #799 reclass (`AlreadyCurrent`, the row stays `server`, B is still refused).
+/// (The file published while B was a server stays unwrapped to it: persist's
+/// `emit_pending_key_grants` re-wraps room epochs to arriving devices, not
+/// existing self blobs — a persist gap, raised with the S1 adoption.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reclassed_phone_receives_its_owners_self_file_and_a_server_does_not_799() {
+    use crate::content_occurrence::{provision_engine_occurrence, Provisioned};
+    let alice = Ident::new("alice-fed", 0x11);
+    let alice_phone = Ident::new("alice-phone", 0x33);
+    let node_a = device(
+        &[&alice],
+        &alice,
+        &alice,
+        Some(EPOCH_CHUNKS),
+        device_class::LAPTOP,
+    )
+    .await;
+    let node_b = device(
+        &[&alice, &alice_phone],
+        &alice,
+        &alice_phone,
+        None,
+        device_class::SERVER,
+    )
+    .await;
+    federate(&node_a, &node_b).await;
+    federate(&node_b, &node_a).await;
+    let edge_b = edge_of(&node_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: file.row.clone(),
+        })
+        .await
+        .expect("B admits the crossed row");
+    let puller = puller_of(&node_b, &edge_b);
+
+    // 1. As a `server`: every key set A emits crosses, and B is party to
+    //    none of it — persist's hold refuses the manifest at adopt.
+    cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await;
+    let as_server = puller
+        .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+        .await;
+    assert!(
+        matches!(&as_server, PullOutcome::StoreFailed(e) if e.contains("not party to self content")),
+        "a server-class device of alice's holds none of her self file (CC 3.3.7); \
+         got {as_server:?}"
+    );
+
+    // 2. Reclassed `phone` (#799): same keys, the new class, re-signed.
+    let (_, outcome) = provision_engine_occurrence(
+        node_b.store.engine(),
+        &*node_b.dir,
+        &alice.key_id,
+        device_class::PHONE,
+    )
+    .await
+    .expect("reprovision as a phone");
+    assert_eq!(
+        outcome,
+        Provisioned::Reclassed {
+            from: device_class::SERVER.to_owned(),
+            to: device_class::PHONE.to_owned(),
+        }
+    );
+    carry_occurrence(&node_b, &node_a).await;
+
+    // 3. Alice's next self file is wrapped to the phone: it stores and
+    //    streams there.
+    let next = publish_self_file_seeded(&node_a, &alice, 0x0799).await;
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: next.row.clone(),
+        })
+        .await
+        .expect("B admits the next crossed row");
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await > 0);
+    assert_eq!(
+        puller
+            .pull_dag_with(&next.row, next.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false },
+        "the reclassed phone is in alice's self audience and opens every chunk"
+    );
+    let file_row = FileRow::from_row(&next.row).expect("a file row");
+    let mut walk = file_row.chunks(&node_b.store, &node_b.me);
+    let mut read = Vec::with_capacity(FILE_LEN);
+    while let Some(item) = walk.next().await {
+        read.extend_from_slice(&item.expect("every chunk opens on the phone"));
+    }
+    assert!(read == next.plain, "the phone reads the file alice wrote");
 }

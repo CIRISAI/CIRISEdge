@@ -214,6 +214,23 @@ impl Node {
             .expect("owner binding"),
         )
         .await;
+        // persist v53 S1 — the node's own signed occurrence, as every host
+        // publishes one: persist's audience resolver reaches a member's node
+        // (and resolves it to its person) through it, never the owner-binding
+        // alone. Each node here is its person's own device (`phone`): the
+        // family variant's later family row reaches K's node only as a
+        // personal-class device (CC 3.3.7: a server holds no family content).
+        dir.put_identity_occurrence(
+            common::node_signed_occurrence(
+                &owner.key_id,
+                &key.key_id,
+                &key.signer(),
+                ciris_persist::federation::types::device_class::PHONE,
+            )
+            .await,
+        )
+        .await
+        .expect("the node's own occurrence");
         Self {
             key,
             owner,

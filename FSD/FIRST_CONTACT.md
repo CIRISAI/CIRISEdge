@@ -422,6 +422,16 @@ and no ref is disclosed that the fetch would refuse.
 
 ### 2.5 A group's record reaches its members and live invitees, nobody else (CIRISEdge#758)
 
+**persist v53 S1 (CIRISEdge#761).** The rule below is now persist's
+`replication_audience::may_receive_group_plane(X, scope, group, named)`, called per row by the
+advertise (`list_group_plane_for_peer`) and the fetch twin (`group_plane_fetch_serves`) over the same
+`(scope, group, named)` read (`replication::group_plane`). It covers the record AND the five
+membership planes (revocations, widenings, the listing): a private group's rows reach its members'
+nodes, its live invitees' nodes (full plane history) and the nodes of the member a row names; a public
+group's (`is_public_group`) reach every peer, an unbound requester included. A node is resolved to its
+person through its identity occurrence (`active_identities_for_occurrence`), never the owner-binding
+alone. The text below is the pre-v53 statement of the same rule.
+
 **The rule.** A `Family` or `Community` **record** (the roster declaration itself, not a row at
 its target) is served to a peer X only when X's person, `owner_of(X)` (X itself when unowned), is
 

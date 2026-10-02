@@ -136,7 +136,10 @@ struct Node {
 /// A node of `owner`, its own key from `device` (the owner's first device when
 /// the two are the same identity), with the owner binding and the node-class
 /// engine occurrence provisioned — `blob_federation_e2e::build_node_with`.
-async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
+/// `class` is the occurrence's `device_class`: under persist v53 S1 a
+/// personal device (`phone` | `laptop`) is in its owner's self and family
+/// audience, a server-class node is not (CC 3.3.7).
+async fn device(idents: &[&Ident], owner: &Ident, device: &Ident, class: &str) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -207,7 +210,7 @@ async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     .expect("provision this node's engine occurrence");
@@ -221,7 +224,13 @@ async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
 }
 
 async fn node(idents: &[&Ident], owner: &Ident) -> Node {
-    device(idents, owner, owner).await
+    device(
+        idents,
+        owner,
+        owner,
+        ciris_persist::federation::types::device_class::LAPTOP,
+    )
+    .await
 }
 
 /// Hand `from`'s node key, owner binding and published occurrence to `to` —
@@ -724,7 +733,13 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
     let alice = Ident::new("alice-fed", 0x11);
     let alice_phone = Ident::new("alice-phone", 0x33);
     let node_a = node(&[&alice], &alice).await;
-    let node_b = device(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    let node_b = device(
+        &[&alice, &alice_phone],
+        &alice,
+        &alice_phone,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     federate_all(&[&node_a, &node_b]).await;
     let edge_b = edge_of(&node_b);
 
@@ -904,7 +919,13 @@ async fn an_inline_self_file_is_receipted_once_by_the_owners_other_device() {
     let alice = Ident::new("alice-fed", 0x11);
     let alice_phone = Ident::new("alice-phone", 0x33);
     let node_a = node(&[&alice], &alice).await;
-    let node_b = device(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    let node_b = device(
+        &[&alice, &alice_phone],
+        &alice,
+        &alice_phone,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     federate_all(&[&node_a, &node_b]).await;
     let edge_b = edge_of(&node_b);
 
