@@ -718,14 +718,16 @@ async fn parked_past_the_ladder_then_woken(manifest_too: bool) {
     ));
 
     // The stall: longer than the whole ladder. The loop's retries run out.
+    // "No retry booked" is not "spent": a due retry leaves the ledger before
+    // its pull books the next rung, so wait on the puller's own answer.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while puller.retry_booked(file.sha) {
+    while !puller.ladder_spent(file.sha) {
         assert!(std::time::Instant::now() < deadline, "the ladder runs out");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(
-        !puller.retry_booked(file.sha),
+        puller.ladder_spent(file.sha),
         "nothing is left on the ladder"
     );
     assert!(!promoted(&node_b, &file.sha).await);

@@ -42,7 +42,7 @@
 //!   counter, never a silent stall.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1136,6 +1136,11 @@ pub struct BlobPuller<B> {
     /// ([`Self::key_waits`]) is what un-parks a DAG whose ladder ran out; this
     /// keeps a pull that is being fed from running out in the first place.
     chunk_keys_missing: Mutex<HashMap<[u8; 32], u64>>,
+    /// CIRISEdge#779 — pulls the loop has handed out and not seen finish. A
+    /// retry is counted under the ledger's lock as it leaves the ledger, so a
+    /// DAG between two rungs of its ladder always shows a booked retry or a
+    /// pull outstanding, never neither (see [`Self::ladder_spent`]).
+    dispatched: AtomicUsize,
 }
 
 /// CIRISEdge#646 — the `scope:source` label for `blob_pull_sources`. A
@@ -1213,6 +1218,7 @@ where
             retries: Mutex::new(HashMap::new()),
             key_waits: Arc::new(KeyWaits::new(retry_capacity)),
             chunk_keys_missing: Mutex::new(HashMap::new()),
+            dispatched: AtomicUsize::new(0),
         })
     }
 
@@ -1241,6 +1247,7 @@ where
                 req = rx.recv() => {
                     let Some(req) = req else { break };
                     for sha in BlobMeaning::referenced_shas(&req.row) {
+                        self.dispatched.fetch_add(1, Ordering::SeqCst);
                         self.dispatch(&limiter, req.row.clone(), sha, 0);
                     }
                 }
@@ -1257,6 +1264,8 @@ where
         tracing::info!("BlobPuller: sink closed, exiting");
     }
 
+    /// Run one pull. The caller has already counted it in `dispatched`; the
+    /// task uncounts it when the pull is over.
     fn dispatch(
         self: &Arc<Self>,
         limiter: &Arc<tokio::sync::Semaphore>,
@@ -1267,16 +1276,16 @@ where
         let me = Arc::clone(self);
         let limiter = Arc::clone(limiter);
         tokio::spawn(async move {
-            let Ok(_permit) = limiter.acquire().await else {
-                return;
-            };
-            let outcome = me.pull_one(&row, sha, attempts).await;
-            tracing::debug!(
-                blob = %hex::encode(sha),
-                attestation_id = %row.attestation_id,
-                ?outcome,
-                "pull"
-            );
+            if let Ok(_permit) = limiter.acquire().await {
+                let outcome = me.pull_one(&row, sha, attempts).await;
+                tracing::debug!(
+                    blob = %hex::encode(sha),
+                    attestation_id = %row.attestation_id,
+                    ?outcome,
+                    "pull"
+                );
+            }
+            me.dispatched.fetch_sub(1, Ordering::SeqCst);
         });
     }
 
@@ -1290,11 +1299,15 @@ where
         };
         let woken = self.key_waits.take_woken(&busy);
         if !woken.is_empty() {
-            if let Ok(mut retries) = self.retries.lock() {
+            let mut retries = self.retries.lock().ok();
+            if let Some(retries) = retries.as_mut() {
                 for (sha, _) in &woken {
                     retries.remove(sha);
                 }
             }
+            // Counted before the lock drops: see `dispatched`.
+            self.dispatched.fetch_add(woken.len(), Ordering::SeqCst);
+            drop(retries);
         }
         woken
     }
@@ -1315,11 +1328,22 @@ where
         }
     }
 
-    /// Whether a retry is booked for `sha` — how a witness tells a pull that
-    /// gave up from one still on its ladder.
+    /// Whether a retry is booked for `sha`.
     #[cfg(test)]
     pub(crate) fn retry_booked(&self, sha: [u8; 32]) -> bool {
         self.retries.lock().is_ok_and(|r| r.contains_key(&sha))
+    }
+
+    /// Whether the loop has given up on `sha`: no retry booked and no pull
+    /// outstanding. "No retry booked" alone is not it: a due retry leaves the
+    /// ledger before its pull runs and books the next rung, so between rungs
+    /// the ledger is empty while the ladder is not spent. Read under the
+    /// ledger's lock, where a retry leaving it is already counted.
+    #[cfg(test)]
+    pub(crate) fn ladder_spent(&self, sha: [u8; 32]) -> bool {
+        self.retries
+            .lock()
+            .is_ok_and(|r| !r.contains_key(&sha) && self.dispatched.load(Ordering::SeqCst) == 0)
     }
 
     fn due_retries(&self) -> Vec<Retry> {
@@ -1332,7 +1356,10 @@ where
             .filter(|(_, r)| r.not_before <= now)
             .map(|(k, _)| *k)
             .collect();
-        due.into_iter().filter_map(|k| retries.remove(&k)).collect()
+        let due: Vec<Retry> = due.into_iter().filter_map(|k| retries.remove(&k)).collect();
+        // Counted before the lock drops: see `dispatched`.
+        self.dispatched.fetch_add(due.len(), Ordering::SeqCst);
+        due
     }
 
     /// CIRISEdge#779 — the `(seq, sha)` of every chunk this node holds no
