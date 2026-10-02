@@ -99,7 +99,7 @@ impl std::fmt::Debug for PullSink {
         f.debug_struct("PullSink")
             .field("capacity", &self.tx.capacity())
             .field("dropped", &self.dropped.load(Ordering::Relaxed))
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1319,10 +1319,7 @@ where
     /// gave up from one still on its ladder.
     #[cfg(test)]
     pub(crate) fn retry_booked(&self, sha: [u8; 32]) -> bool {
-        self.retries
-            .lock()
-            .map(|r| r.contains_key(&sha))
-            .unwrap_or(false)
+        self.retries.lock().is_ok_and(|r| r.contains_key(&sha))
     }
 
     fn due_retries(&self) -> Vec<Retry> {

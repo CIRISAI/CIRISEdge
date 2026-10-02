@@ -669,6 +669,18 @@ async fn promoted(node: &Node, sha: &[u8; 32]) -> bool {
 /// file and receipts it once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dag_parked_past_its_ladder_is_woken_by_its_grants_779() {
+    parked_past_the_ladder_then_woken(false).await;
+}
+
+/// **The same for the manifest arm (#717):** no wrap on the manifest
+/// either, so the pull parks before a chunk is fetched; the manifest's grant
+/// lands after the ladder ran out and wakes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dag_parked_on_its_manifest_past_its_ladder_is_woken_779() {
+    parked_past_the_ladder_then_woken(true).await;
+}
+
+async fn parked_past_the_ladder_then_woken(manifest_too: bool) {
     let (alice, node_a, node_b) = two_devices().await;
     let edge_b = edge_of(&node_b);
     let file = publish_self_file(&node_a, &alice).await;
@@ -683,15 +695,21 @@ async fn a_dag_parked_past_its_ladder_is_woken_by_its_grants_779() {
         &node_b,
         &edge_b,
         PullConfig {
-            max_attempts: 2,
+            // The manifest arm's witness is a booked retry after the wake;
+            // a longer ladder keeps one booked for ~350 ms, not one tick.
+            max_attempts: if manifest_too { 4 } else { 2 },
             retry_backoff: std::time::Duration::from_millis(50),
             ..PullConfig::default()
         },
     );
     let (sink, run) = Arc::clone(&puller).start();
 
-    // Every chunk's bytes, and every wrap but chunks 3 and 4's.
-    cross_keys_except(&node_a, &node_b, &late_chunks(&file), Some(&sink)).await;
+    // Every wrap but chunks 3 and 4's (and the manifest's, on that arm).
+    let mut withhold = late_chunks(&file);
+    if manifest_too {
+        withhold.push(file.sha);
+    }
+    cross_keys_except(&node_a, &node_b, &withhold, Some(&sink)).await;
     assert!(matches!(
         puller
             .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
@@ -715,6 +733,23 @@ async fn a_dag_parked_past_its_ladder_is_woken_by_its_grants_779() {
 
     // The last grants land. Nothing re-offers the row; the grant wakes it.
     assert!(cross_keys_except(&node_a, &node_b, &[], Some(&sink)).await > 0);
+    if manifest_too {
+        // The woken pull opens the manifest and goes for the chunks, which
+        // this harness's loop has no wire to fetch (`NoWire`): it fails the
+        // fetch and books a retry from a fresh ladder. That retry is the
+        // witness: without the wake nothing runs and nothing is booked.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !puller.retry_booked(file.sha) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the manifest is wrapped here now, and the parked DAG was never re-pulled"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        drop(sink);
+        run.abort();
+        return;
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !promoted(&node_b, &file.sha).await {
         assert!(

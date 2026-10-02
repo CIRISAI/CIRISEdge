@@ -86,31 +86,28 @@ impl KeyWaits {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
-        let woken = match inner.parked.remove(&dag) {
-            Some(old) => {
-                inner.unindex(dag, &old.awaiting);
-                old.woken
-            }
-            None => {
-                if inner.parked.len() >= self.capacity {
-                    if let Some(oldest) = inner
-                        .parked
-                        .iter()
-                        .min_by_key(|(_, p)| p.order)
-                        .map(|(k, _)| *k)
-                    {
-                        if let Some(p) = inner.parked.remove(&oldest) {
-                            inner.unindex(oldest, &p.awaiting);
-                        }
-                        tracing::warn!(
-                            dropped = %hex::encode(oldest),
-                            "parked-DAG key register FULL — dropped the oldest; a grant for it \
-                             no longer wakes its pull (CIRISEdge#779)"
-                        );
+        let woken = if let Some(old) = inner.parked.remove(&dag) {
+            inner.unindex(dag, &old.awaiting);
+            old.woken
+        } else {
+            if inner.parked.len() >= self.capacity {
+                if let Some(oldest) = inner
+                    .parked
+                    .iter()
+                    .min_by_key(|(_, p)| p.order)
+                    .map(|(k, _)| *k)
+                {
+                    if let Some(p) = inner.parked.remove(&oldest) {
+                        inner.unindex(oldest, &p.awaiting);
                     }
+                    tracing::warn!(
+                        dropped = %hex::encode(oldest),
+                        "parked-DAG key register FULL — dropped the oldest; a grant for it \
+                         no longer wakes its pull (CIRISEdge#779)"
+                    );
                 }
-                false
             }
+            false
         };
         if let Awaiting::Content(keys) = &awaiting {
             for k in keys {
@@ -167,7 +164,7 @@ impl KeyWaits {
         let mut woke = 0;
         for p in inner.parked.values_mut() {
             if let Awaiting::Epoch(e) = p.awaiting {
-                if e.is_none_or(|e| e == epoch) {
+                if e.map_or(true, |e| e == epoch) {
                     p.woken = true;
                     woke += 1;
                 }
@@ -196,10 +193,7 @@ impl KeyWaits {
 
     #[cfg(test)]
     pub(crate) fn is_parked(&self, dag: [u8; 32]) -> bool {
-        self.inner
-            .lock()
-            .map(|i| i.parked.contains_key(&dag))
-            .unwrap_or(false)
+        self.inner.lock().is_ok_and(|i| i.parked.contains_key(&dag))
     }
 }
 
