@@ -323,7 +323,7 @@ pub enum PullOutcome {
     /// chunk is HELD but some chunk's own wrap to this node has not arrived:
     /// it is not promoted, reported `Stored` or receipted until every chunk
     /// opens here. A retry that finds fewer chunks waiting than the last one
-    /// does not spend an attempt.
+    /// restarts the attempt ladder; only consecutive stalls spend it.
     DagAwaitingKey { attempts: u32, retrying: bool },
 }
 
@@ -1095,9 +1095,11 @@ pub struct BlobPuller<B> {
     retries: Mutex<HashMap<[u8; 32], Retry>>,
     /// CIRISEdge#779 — per sealed DAG parked on its chunk keys, how many
     /// chunks lacked this node's wrap at the last attempt. A retry that finds
-    /// fewer does not spend an attempt: the grants arrive one set per chunk,
-    /// in `seq` order, for minutes on a big file, and a pull that is being
-    /// fed must not give up on the attempt ceiling meant for one that is not.
+    /// fewer restarts the attempt ladder: the grants arrive one set per chunk,
+    /// in `seq` order, for minutes on a big file, so only CONSECUTIVE retries
+    /// that see no new grant count toward the ceiling. Nothing re-offers the
+    /// row when a grant lands, so a pull that gives up while it is still being
+    /// fed would leave the file unpromoted for good.
     chunk_keys_missing: Mutex<HashMap<[u8; 32], u64>>,
 }
 
@@ -1272,10 +1274,10 @@ where
     }
 
     /// CIRISEdge#779 — record that `sha` is parked with `missing` chunk
-    /// wraps outstanding; `true` when that is fewer than at the last attempt
-    /// (or this is the first), i.e. the grants are arriving. Bounded by the
-    /// retry ledger's capacity: past it the memory is dropped, and attempts
-    /// count as they do for every other retry.
+    /// wraps outstanding; `true` when that is fewer than at the last attempt,
+    /// i.e. the grants are arriving. A first sighting is not progress, so a
+    /// memory dropped at the retry ledger's capacity can only spend attempts,
+    /// never restart the ladder.
     fn chunk_keys_progressed(&self, sha: [u8; 32], missing: u64) -> bool {
         let Ok(mut seen) = self.chunk_keys_missing.lock() else {
             return false;
@@ -1285,7 +1287,7 @@ where
         }
         match seen.insert(sha, missing) {
             Some(before) => missing < before,
-            None => true,
+            None => false,
         }
     }
 
@@ -2357,8 +2359,10 @@ where
             };
             if let Some(first_seq) = missing.first().copied() {
                 let missing = missing.len() as u64;
+                // Progress restarts the ladder (and its backoff); bounded,
+                // since `missing` can only fall `chunk_count` times.
                 let attempts_spent = if self.chunk_keys_progressed(sha, missing) {
-                    attempts.saturating_sub(1)
+                    0
                 } else {
                     attempts
                 };
