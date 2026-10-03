@@ -112,6 +112,18 @@ pub enum Provisioned {
         /// The class it carries now.
         to: String,
     },
+    /// CIRISEdge#799 — the occurrence exists with these pubkeys under
+    /// ANOTHER `device_class`, but it is a SIGNED row: only its signer (the
+    /// owner, e.g. the `self_at_login` fold for a split node's wire key) can
+    /// re-issue it. The row is left exactly as it is and the caller carries
+    /// on with it; the host re-issues it through the owner's pen when that is
+    /// available. Not an error: the node still provisions.
+    ReclassNeedsSigner {
+        /// The class the signed row carries.
+        from: String,
+        /// The class asked for.
+        to: String,
+    },
     /// The occurrence was registered now.
     Created,
     /// An occurrence exists under this key id with **different** content
@@ -201,11 +213,12 @@ fn check_device_class(device_class: &str) -> Result<(), String> {
 /// other column carried. Only an UNSIGNED row can be: this door never
 /// mutates a signed occurrence (persist's `WHERE signature IS NULL`), and
 /// only its signer can re-issue one, so a signed row of another class is
-/// refused by name rather than reported reclassed while unchanged.
+/// left untouched and reported [`Provisioned::ReclassNeedsSigner`] (logged
+/// once per row and class pair) — never an error, since the host provisions
+/// on every self-room tick and an error there would refuse every self write.
 ///
 /// # Errors
-/// An unknown `device_class`, a signed row of another class, or a directory
-/// read or write failure.
+/// An unknown `device_class`, or a directory read or write failure.
 pub async fn ensure_content_occurrence(
     directory: &dyn FederationDirectory,
     identity_key_id: &str,
@@ -230,12 +243,19 @@ pub async fn ensure_content_occurrence(
             return Ok(Provisioned::AlreadyCurrent);
         }
         if occurrence_is_on_signed_plane(directory, identity_key_id, occurrence_key_id).await? {
-            return Err(format!(
-                "content occurrence {occurrence_key_id} of {identity_key_id} is SIGNED as \
-                 {:?}; the trusted-local door cannot reclass it to {device_class:?} — only its \
-                 signer can re-issue it (CIRISEdge#799)",
-                found.device_class
-            ));
+            let (from, to) = (found.device_class.clone(), device_class.to_owned());
+            if first_reclass_needs_signer(identity_key_id, occurrence_key_id, &from, &to) {
+                tracing::warn!(
+                    identity = identity_key_id,
+                    occurrence = occurrence_key_id,
+                    from = %from,
+                    to = %to,
+                    "content occurrence is SIGNED under another device_class — left as it is; \
+                     only its signer (the owner) can re-issue it under the new class, so the \
+                     replication audience follows the old class until then (CIRISEdge#799)"
+                );
+            }
+            return Ok(Provisioned::ReclassNeedsSigner { from, to });
         }
         let from = found.device_class.clone();
         directory
@@ -268,6 +288,21 @@ pub async fn ensure_content_occurrence(
         .await
         .map_err(|e| format!("register content occurrence {occurrence_key_id}: {e}"))?;
     Ok(Provisioned::Created)
+}
+
+/// [`Provisioned::ReclassNeedsSigner`] is reported on every provisioning
+/// call (the host calls on every self-room tick) but logged once per
+/// `(identity, occurrence, from, to)` per process.
+fn first_reclass_needs_signer(identity: &str, occurrence: &str, from: &str, to: &str) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+        .lock()
+        .map_or(true, |mut seen| {
+            seen.insert(format!(
+                "{identity}\u{1f}{occurrence}\u{1f}{from}\u{1f}{to}"
+            ))
+        })
 }
 
 /// [`ensure_content_occurrence`] with the pubkeys derived from a raw seed,
@@ -319,6 +354,8 @@ pub async fn provision_from_seed(
             to = %to,
             "content occurrence RECLASSED — same keys (CIRISEdge#799)"
         ),
+        // Logged once by `ensure_content_occurrence` itself.
+        Provisioned::ReclassNeedsSigner { .. } => {}
         Provisioned::Drifted => tracing::warn!(
             identity = identity_key_id,
             occurrence = occurrence_key_id,
@@ -571,6 +608,8 @@ where
              to them still opens; the replication audience follows the new class \
              (CIRISEdge#799)"
         ),
+        // Not produced here: this door re-signs the engine's own row.
+        Provisioned::ReclassNeedsSigner { .. } => {}
         Provisioned::Drifted => tracing::warn!(
             identity = identity_key_id,
             occurrence = %me,
@@ -825,7 +864,8 @@ mod tests {
             Provisioned::AlreadyCurrent
         );
 
-        // This node's own row is SIGNED: the local door cannot reclass it.
+        // This node's own row is SIGNED: the local door leaves it to its
+        // signer, reports it, and the caller carries on with the row.
         let kem = node
             .dir
             .load_or_init_content_kem_identity()
@@ -835,16 +875,28 @@ mod tests {
             x25519_base64: kem.x25519_pubkey_b64,
             ml_kem_768_base64: kem.ml_kem_768_pubkey_b64,
         };
-        let refused = ensure_content_occurrence(
-            &*node.dir,
-            &alice.key_id,
-            &node.me,
-            device_class::PHONE,
-            own,
-        )
-        .await
-        .expect_err("a signed row is its signer's");
-        assert!(refused.contains("SIGNED"), "{refused}");
+        let (before, signed_before) = rows(&node, &alice.key_id, &node.me).await;
+        assert_eq!(
+            ensure_content_occurrence(
+                &*node.dir,
+                &alice.key_id,
+                &node.me,
+                device_class::PHONE,
+                own,
+            )
+            .await
+            .expect("a signed row of another class is not an error"),
+            Provisioned::ReclassNeedsSigner {
+                from: device_class::SERVER.to_owned(),
+                to: device_class::PHONE.to_owned(),
+            }
+        );
+        let (after, signed_after) = rows(&node, &alice.key_id, &node.me).await;
+        assert_eq!(
+            (after, signed_after),
+            (before, signed_before),
+            "the signed row is untouched: only its signer re-issues it"
+        );
 
         // An unknown class: refused at both doors, nothing written.
         for bad in ["toaster", "Phone", ""] {
