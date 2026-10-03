@@ -75,7 +75,7 @@ fn body_of(len: usize, seed: u32) -> Vec<u8> {
 pub(crate) struct Ident {
     pub(crate) key_id: String,
     seed: u8,
-    pub(crate) ed: Ed25519SoftwareSigner,
+    ed: Ed25519SoftwareSigner,
     pqc: MlDsa65SoftwareSigner,
 }
 
@@ -125,7 +125,7 @@ impl Ident {
         }
     }
 
-    pub(crate) fn signers(&self) -> (Arc<dyn HardwareSigner>, Arc<dyn PqcSigner>) {
+    fn signers(&self) -> (Arc<dyn HardwareSigner>, Arc<dyn PqcSigner>) {
         let hw: Arc<dyn HardwareSigner> = Arc::new(
             Ed25519SoftwareSigner::from_bytes(&[self.seed; 32], self.ed.current_alias())
                 .expect("rebuild the signer"),
@@ -149,13 +149,29 @@ pub(crate) struct Node {
     signer: Arc<crate::identity::LocalSigner>,
 }
 
-/// Register `device`'s derived signing key as a node key on `dir`, with an
-/// owner binding from `owner` naming it; returns the key id and its signer.
-pub(crate) async fn register_node_key(
-    dir: &SqliteBackend,
+/// A device of `owner` keyed from `device`, with its owner binding and its
+/// engine occurrence of `class` (`delivery_receipts_738::device`). Under
+/// persist v53 S1 the class decides self/family reach (CC 3.3.7): a personal
+/// device (`phone` | `laptop`) is wrapped its owner's self content, a server
+/// is not.
+pub(crate) async fn device(
+    idents: &[&Ident],
     owner: &Ident,
     device: &Ident,
-) -> (String, crate::identity::LocalSigner) {
+    chunks_per_epoch: Option<u64>,
+    class: &str,
+) -> Node {
+    let dir = FederationDirectorySqlite::open(":memory:")
+        .await
+        .expect("open substrate");
+    dir.run_migrations().await.expect("migrate");
+    for id in idents {
+        dir.put_public_key(SignedKeyRecord {
+            record: id.record().await,
+        })
+        .await
+        .expect("seed identity");
+    }
     let ed_pub = device.ed.public_key().await.expect("pubkey");
     let derived = ciris_verify_core::fedcode::derive_key_id(device.ed.current_alias(), &ed_pub);
     let mut rec = device.record().await;
@@ -184,33 +200,6 @@ pub(crate) async fn register_node_key(
     })
     .await
     .expect("admit this node's owner binding");
-    (derived, identity)
-}
-
-/// A device of `owner` keyed from `device`, with its owner binding and its
-/// engine occurrence of `class` (`delivery_receipts_738::device`). Under
-/// persist v53 S1 the class decides self/family reach (CC 3.3.7): a personal
-/// device (`phone` | `laptop`) is wrapped its owner's self content, a server
-/// is not.
-pub(crate) async fn device(
-    idents: &[&Ident],
-    owner: &Ident,
-    device: &Ident,
-    chunks_per_epoch: Option<u64>,
-    class: &str,
-) -> Node {
-    let dir = FederationDirectorySqlite::open(":memory:")
-        .await
-        .expect("open substrate");
-    dir.run_migrations().await.expect("migrate");
-    for id in idents {
-        dir.put_public_key(SignedKeyRecord {
-            record: id.record().await,
-        })
-        .await
-        .expect("seed identity");
-    }
-    let (_, identity) = register_node_key(&dir, owner, device).await;
     let store = PersistGroupContentStore::from_shared_hybrid(
         ciris_persist::BackendDispatch::Sqlite(dir.clone()),
         dir.clone(),
