@@ -62,20 +62,21 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // with a `KindPublishSelector` installed, the live `federation`
         // owner-binding of every node in that selector's Key /
         // IdentityOccurrence set (#752, CC 5.4.6 public roster, CIRISServer#701);
-        // and the membership ceremony addressed to the peer's own person (#756:
-        // a proposal naming `owner_of(peer)`; the invitee's reply to a proposal
-        // held here that the peer's person issued), with no Rooted floor on
-        // those two (`FSD/FIRST_CONTACT.md` §2.3–§2.4).
+        // and the membership ceremony addressed to the peer's own person (#756),
+        // with no Rooted floor on it (`FSD/FIRST_CONTACT.md` §2.3–§2.4). Who a
+        // ceremony row is addressed to is persist's `may_receive` (CIRISEdge#761:
+        // a proposal → every node whose principals include its invitee; an
+        // answer → the nodes of the held proposal's proposer).
         EnvelopeKind::Attestation => (
             "per_record_projection",
             "trace:* → capability:infra:serve; first contact → own allegiance facts \
              + live federation owner-bindings of nodes in the Key/IdentityOccurrence \
-             publish set + membership:proposal:v1 naming owner_of(peer) + the invitee's \
-             membership:acceptance|decline:v1 to a held proposal by owner_of(peer); \
-             else persist may_receive(peer, row) (origin, refers-to — never for a \
-             key_grant set —, public, the cohort's per-node audience: self → the \
-             owner's personal-class nodes), ORed with the membership ceremony \
-             (proposal → invitee's nodes, answer → proposer's nodes)",
+             publish set + a membership:proposal|acceptance|decline:v1 persist \
+             may_receive admits as refers-to; else persist may_receive(peer, row) \
+             (origin, refers-to — never for a key_grant set —, the membership \
+             ceremony: proposal → invitee's nodes, answer → proposer's nodes, every \
+             stage → the group's membership-plane audience; public, the cohort's \
+             per-node audience: self → the owner's personal-class nodes)",
         ),
         // CIRISEdge#758 / #762 / #761 (CC 5.4.6 "from outsiders only", CC
         // 4.4.3.2.1; persist v53 S1 `ServeAudience::MembershipPlane`) — a
@@ -315,8 +316,16 @@ pub fn serve_advertise_policy_sha256() -> String {
 // nodes), the Attestation cell's row half to persist's `may_receive` (`self`
 // → the owner's personal-class nodes), and the KeyGrant cell to the cohort's
 // audience. **CIRISServer must mirror this pin.**
+//
+// CIRISEdge#761 (persist 8fcbeb9e) — RE-PINNED, e7b1ba86… → 68c5298b…: the
+// Attestation cell's membership ceremony moves into persist's `may_receive`
+// (a proposal → every node whose principals include the invitee, an answer →
+// the proposer's nodes, every stage → the group's membership-plane audience);
+// edge's own invitee/proposer checks are gone, and first contact carries a
+// ceremony row exactly when persist admits it as refers-to. **CIRISServer must
+// mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "e7b1ba86f0a5eeabcae5159eeb18237a540f0f17401e57b8b43cbc8f84420699";
+    "68c5298b4bb48bbf8ffdb7ef881b71386b3db6ba8c6026b8bb61ec454ebe3850";
 
 #[cfg(test)]
 mod tests {

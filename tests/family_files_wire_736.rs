@@ -659,7 +659,7 @@ async fn form_family_by_consent(p1: &Member, q1: &Member, p: &Ident, q: &Ident, 
     // widening Q1 is a first-contact stranger to P1 (no consent grant, not a
     // family member's node), and first-contact reach carries no family-scoped
     // row — the #955 invitee arm widens the AUDIENCE, not the send set
-    // (`peer_is_proposal_invitee`). A host whose persons consented to each
+    // (persist's `may_receive`, CIRISEdge#761). A host whose persons consented to each
     // other carries it on the round; `pair_room_consent_955` hands it over
     // the same way.
     assert!(
