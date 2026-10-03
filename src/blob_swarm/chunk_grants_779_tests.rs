@@ -146,7 +146,7 @@ pub(crate) struct Node {
     pub(crate) store: PersistGroupContentStore,
     identity: String,
     pub(crate) me: String,
-    signer: Arc<crate::identity::LocalSigner>,
+    pub(crate) signer: Arc<crate::identity::LocalSigner>,
 }
 
 /// A device of `owner` keyed from `device`, with its owner binding and its
@@ -1025,6 +1025,71 @@ async fn a_multi_epoch_dag_reads_and_range_reads_across_its_terminators_797() {
         file.stream.len() as u64,
         "K is the stream's tree size: the data chunks and a terminator per epoch"
     );
+}
+
+/// **A wrong-AAD read of a v4 DAG is `SealMismatch`, whole and by range**
+/// (persist v53, CIRISPersist#842 kept at #969). B holds the pulled file
+/// and every key; a read that presents another row's binding (the same
+/// author, the instant off by one second) must say "this did not open under
+/// that row", never "you may not read this" (`NotGranted`) or a substrate
+/// fault: persist's `blob_seal_did_not_open`, which edge types
+/// `GroupContentError::SealMismatch`. The correct binding still opens.
+/// Fails with edge's `SealDidNotOpen` arm removed (the refusal falls through
+/// to `Substrate`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_aad_read_of_a_v4_dag_is_seal_mismatch_whole_and_by_range_797() {
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: file.row.clone(),
+        })
+        .await
+        .expect("B admits the crossed row");
+    cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await;
+    assert_eq!(
+        puller_of(&node_b, &edge_b)
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false }
+    );
+    let file_row = FileRow::from_row(&file.row).expect("a file row");
+    let request = |asserted_at| crate::group_content::OpenRequest {
+        pointer: &file_row.pointer,
+        author_key_id: &file_row.attesting_key_id,
+        asserted_at,
+        viewer_key_id: &node_b.me,
+    };
+    let right = file.row.asserted_at;
+    let wrong = right + chrono::Duration::seconds(1);
+    let whole = node_b.store.open(request(right)).await.expect("opens");
+    assert!(whole == file.plain, "the row's own binding opens");
+
+    let whole_wrong = node_b.store.open(request(wrong)).await;
+    assert!(
+        matches!(whole_wrong, Err(GroupContentError::SealMismatch { .. })),
+        "a whole read under another binding is SealMismatch: {whole_wrong:?}"
+    );
+    // A range inside epoch 0, and one across the epoch boundary.
+    let chunk = 256 * 1024u64;
+    for (start, end_inclusive) in [(10u64, 20u64), (3 * chunk - 100, 3 * chunk + 100)] {
+        let ok = node_b
+            .store
+            .open_range(request(right), start, end_inclusive)
+            .await
+            .expect("the range opens under the row's binding");
+        assert_eq!(ok.len() as u64, end_inclusive - start + 1);
+        let got = node_b
+            .store
+            .open_range(request(wrong), start, end_inclusive)
+            .await;
+        assert!(
+            matches!(got, Err(GroupContentError::SealMismatch { .. })),
+            "range {start}..={end_inclusive} under another binding is SealMismatch: {got:?}"
+        );
+    }
 }
 
 /// Hand `from`'s current signed engine occurrence to `to` (the row a peer

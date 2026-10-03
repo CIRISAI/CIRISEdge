@@ -11,11 +11,14 @@
 //! a completed pull files `here` (`BlobPuller::report_here`); the durability
 //! pass re-files a lapsing `here`, corrects a lost copy to `none` and lists
 //! the repairs rarest first (`BlobPuller::durability_sweep`); a promoted DAG
-//! that lost a chunk is repaired and reported whole again.
+//! that lost a chunk, or a device that lost the whole file, is repaired and
+//! reported whole again through persist's custody door (under the row's AAD);
+//! a withdrawn file is not repaired.
 
 use ciris_persist::federation::blobs::BlobStorage as _;
 use ciris_persist::federation::custody_ack::{device_custody_of, CustodyVerdict};
 use ciris_persist::federation::durability::{DeficitAudience, DurabilityMode};
+use ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX;
 use ciris_persist::federation::types::device_class;
 use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
 
@@ -25,7 +28,7 @@ use super::chunk_grants_779_tests::{
     EPOCH_CHUNKS,
 };
 use super::durability::row_deficit;
-use super::pull::PullOutcome;
+use super::pull::{DagByteFetch as _, PullOutcome};
 
 /// Hand `from`'s `custody:ack:v1` rows to `to`'s replicated door, as the
 /// audience-gated replication would (the bridge-level gate is witnessed by
@@ -189,9 +192,10 @@ async fn a_self_file_reaches_every_personal_device_as_a_full_holder_not_a_server
 /// without the pass: no repair list, and B's stale `here` hides the lost
 /// copy for 72 h.
 ///
-/// F1's repair stops at persist (see
-/// `a_chunk_repair_refiles_here_for_the_whole_dag_763`).
+/// Then F1's lost chunk is repaired too (persist v53 re-adopts the identical
+/// chunk at its kept position), and the next pass has nothing left to do.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // two files' loss, sweep and repair, in order, on purpose
 async fn a_device_that_lost_its_copy_is_missing_and_repaired_rarest_first_763() {
     let (alice, node_a, node_b) = two_devices().await;
     let (edge_a, edge_b) = (edge_of(&node_a), edge_of(&node_b));
@@ -292,23 +296,52 @@ async fn a_device_that_lost_its_copy_is_missing_and_repaired_rarest_first_763() 
         .map(|r| r.sha)
         .collect();
     assert_eq!(again, vec![f1.sha], "only F1 is left to repair");
+    assert_eq!(
+        puller_b
+            .pull_dag_with(&f1.row, f1.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false },
+        "F1's lost chunk is repaired"
+    );
+    assert_eq!(
+        verdict(&node_b, &node_b.me, &f1.sha).await,
+        CustodyVerdict::Here
+    );
+    assert!(
+        puller_b.durability_sweep().await.repairs.is_empty(),
+        "nothing left to repair"
+    );
+}
+
+/// The `key_grant` sets `node` holds (every axis).
+async fn key_grant_rows(node: &Node) -> usize {
+    node.dir
+        .list_attestations_since(None, 1000)
+        .await
+        .expect("list")
+        .into_iter()
+        .filter(|a| {
+            a.attestation
+                .attestation_type
+                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+        })
+        .count()
 }
 
 /// **A promoted DAG that lost a chunk is not "held": the pull goes after the
 /// chunk, and no `here` is filed while any chunk is missing.** B pulled the
-/// file (`here` filed), then lost chunk 1. Re-offered, the pull is no longer
-/// `AlreadyHeld`: it fetches the missing chunk from A and hands it to
-/// persist's adopt door. B files no `here` for a DAG it does not hold whole.
-/// Fails on the pre-#763 puller, which answered `AlreadyHeld` for a promoted
-/// DAG whatever it was missing.
-///
-/// **The repair cannot complete on this persist (8fcbeb9e):** the lost
-/// chunk's stream position survives `delete_blob` (the eviction floor), and
-/// `adopt_sealed_chunks` refuses re-adopting the IDENTICAL `(seq, sha)` there
-/// as a seq conflict ("stream … seq 1 already exists"). Asserted here by name
-/// so the day persist accepts it this test reds and the full witness below
-/// is un-ignored.
+/// file (`here` filed), then lost chunk 1. While it is missing, persist's
+/// custody door refuses B's `here` by name (`custody_ack_here_dag_incomplete`,
+/// the manifest opened under the row's AAD), and a DIFFERENT chunk offered at
+/// the lost chunk's kept position is refused (`already exists`) and stores
+/// nothing. Re-offered, the pull is no longer `AlreadyHeld`: it fetches the
+/// missing chunk from A, persist re-adopts the identical `(seq, sha)`, and
+/// the DAG is `Stored` again. Fails on the pre-#763 puller, which answered
+/// `AlreadyHeld` for a promoted DAG whatever it was missing, and with the
+/// custody door asked without the row's AAD (the refusal is then
+/// `custody_ack_here_seal_did_not_open`, not the incomplete DAG).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // every refusal before the repair, then the repair, in order, on purpose
 async fn a_dag_missing_a_chunk_is_not_held_and_files_no_here_763() {
     let (alice, node_a, node_b) = two_devices().await;
     let edge_b = edge_of(&node_b);
@@ -328,29 +361,8 @@ async fn a_dag_missing_a_chunk_is_not_held_and_files_no_here_763() {
         .await
         .expect("list")
         .len();
-    assert!(node_b
-        .dir
-        .delete_blob(&file.stream[1].2)
-        .await
-        .expect("delete"));
-    let repair = puller
-        .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
-        .await;
-    assert!(
-        matches!(&repair, PullOutcome::StoreFailed(e) if e.contains("seq 1 already exists")),
-        "the pull fetched the lost chunk and persist's adopt door refused its position \
-         (not AlreadyHeld): {repair:?}"
-    );
-    assert_eq!(
-        node_b
-            .dir
-            .list_attestations_by(&node_b.me)
-            .await
-            .expect("list")
-            .len(),
-        reports_before,
-        "no `here` for a DAG missing a chunk"
-    );
+    let (lost_seq, _, lost) = file.stream[1];
+    assert!(node_b.dir.delete_blob(&lost).await.expect("delete"));
     let file_row = crate::files::FileRow::from_row(&file.row).expect("a file row");
     assert!(
         !super::durability::holds_whole(
@@ -365,15 +377,98 @@ async fn a_dag_missing_a_chunk_is_not_held_and_files_no_here_763() {
         .expect("holding"),
         "persist's readiness door names the lost chunk"
     );
+    let refused = super::durability::file_custody(
+        node_b.store.engine(),
+        &file.row,
+        &file.sha,
+        &file_row.pointer,
+        ciris_persist::federation::custody_ack::CustodyState::Here,
+    )
+    .await;
+    assert!(
+        matches!(&refused, Err(e) if e.contains("custody_ack_here_dag_incomplete")),
+        "persist's door refuses `here` for a DAG missing a chunk: {refused:?}"
+    );
+
+    // A different chunk at the lost chunk's kept position: refused, nothing
+    // stored. Persist's adopt door, as the pull calls it.
+    let (other_seq, other_size, other) = file.stream[2];
+    let envelope = fetch_from(&node_a, &node_b)
+        .fetch(other)
+        .await
+        .expect("seq 2's envelope");
+    let provenance = ciris_persist::federation::BlobProvenance::from_attestation(
+        &file.row,
+        &file.sha,
+        file_row.pointer.epoch,
+        None,
+    )
+    .expect("provenance");
+    let wrong = node_b
+        .store
+        .engine()
+        .adopt_sealed_chunks(
+            &file.stream_id,
+            &[ciris_persist::federation::AdoptChunkItem {
+                seq: lost_seq,
+                envelope: &envelope,
+                plaintext_size: other_size,
+            }],
+            0,
+            provenance,
+        )
+        .await
+        .expect("the door answers per item");
+    assert!(
+        matches!(&wrong[..], [Err(e)] if e.to_string().contains("already exists")),
+        "seq {other_seq}'s chunk at seq {lost_seq}'s kept position is refused: {wrong:?}"
+    );
+    assert!(!node_b.dir.has_blob(&lost).await.expect("has_blob"));
+    let at_lost: Vec<[u8; 32]> = node_b
+        .dir
+        .stream_chunks(&file.stream_id)
+        .await
+        .expect("stream chunks")
+        .chunks
+        .into_iter()
+        .filter(|c| c.seq == lost_seq)
+        .map(|c| c.chunk_sha)
+        .collect();
+    assert!(
+        !at_lost.contains(&other),
+        "the refused chunk was not stored at seq {lost_seq}: {at_lost:?}"
+    );
+    assert_eq!(
+        node_b
+            .dir
+            .list_attestations_by(&node_b.me)
+            .await
+            .expect("list")
+            .len(),
+        reports_before,
+        "no `here` for a DAG missing a chunk"
+    );
+
+    let repair = puller
+        .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+        .await;
+    assert_eq!(
+        repair,
+        PullOutcome::Stored { announced: false },
+        "the pull fetched the lost chunk and persist re-adopted it at its kept position \
+         (not AlreadyHeld, not a seq conflict)"
+    );
+    assert!(node_b.dir.has_blob(&lost).await.expect("has_blob"));
 }
 
-/// **A chunk repair re-files `here` for the WHOLE DAG.** As above, then the
-/// repair completes: `Stored`, one NEW `here` (accepted only because every
-/// chunk is held again), and the file reads back byte-identical.
+/// **A chunk repair re-files `here` for the WHOLE DAG.** B pulled the file,
+/// lost chunk 1, and B's durability pass corrected its `here` to `none` and
+/// listed the file as a repair. The repair completes: `Stored`, a NEW `here`
+/// (accepted by persist's door only because every chunk is held again), and
+/// the file reads back byte-identical. Fails without the pass (no repair,
+/// B's stale `here` stands) and with the custody door asked without the
+/// row's AAD (no `here` is filed for any edge DAG).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "persist 8fcbeb9e refuses re-adopting a lost chunk at its surviving stream position \
-            (adopt_sealed_chunks: `seq N already exists`, identical sha); un-ignore when persist \
-            makes that re-adopt idempotent"]
 async fn a_chunk_repair_refiles_here_for_the_whole_dag_763() {
     let (alice, node_a, node_b) = two_devices().await;
     let edge_b = edge_of(&node_b);
@@ -387,17 +482,30 @@ async fn a_chunk_repair_refiles_here_for_the_whole_dag_763() {
             .await,
         PullOutcome::Stored { announced: false }
     );
+    assert_eq!(
+        verdict(&node_b, &node_b.me, &file.sha).await,
+        CustodyVerdict::Here
+    );
+    let lost = file.stream[1].2;
+    assert!(node_b.dir.delete_blob(&lost).await.expect("delete"));
+    let sweep = puller.durability_sweep().await;
+    let repairs: Vec<[u8; 32]> = sweep.repairs.iter().map(|r| r.sha).collect();
+    assert_eq!(repairs, vec![file.sha], "the sweep lists the damaged DAG");
+    assert_eq!(
+        verdict(&node_b, &node_b.me, &file.sha).await,
+        CustodyVerdict::None,
+        "the sweep corrected B's `here` to `none`"
+    );
     let reports_before = node_b
         .dir
         .list_attestations_by(&node_b.me)
         .await
         .expect("list")
         .len();
-    let lost = file.stream[1].2;
-    assert!(node_b.dir.delete_blob(&lost).await.expect("delete"));
+    let repair = &sweep.repairs[0];
     assert_eq!(
         puller
-            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .pull_dag_with(&repair.row, repair.sha, &fetch_from(&node_a, &node_b))
             .await,
         PullOutcome::Stored { announced: false },
         "a promoted DAG missing a chunk is repaired, not AlreadyHeld"
@@ -434,4 +542,196 @@ async fn a_chunk_repair_refiles_here_for_the_whole_dag_763() {
         PullOutcome::AlreadyHeld,
         "a whole DAG re-offered is held"
     );
+    assert!(puller.durability_sweep().await.repairs.is_empty());
+}
+
+/// **A device that lost a WHOLE self file is repaired, and reads it with no
+/// new key.** B pulled the file and reported `here`; then the whole file is
+/// evicted (`delete_blob` of the manifest and every chunk, terminators
+/// included). B's pass corrects its `here` to `none` and lists the file as a
+/// repair, rarest first (A's report never reached B: no live holder). The
+/// repair pulls the manifest and every chunk again, and the file reads whole,
+/// by stream and by `open`, under the at-rest grants the eviction KEPT (CC:
+/// a grant is a key-plane fact, not a holding): B holds exactly the
+/// `key_grant` sets it held before. Fails without the pass (B's stale `here`
+/// stands and nothing is repaired).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_whole_lost_file_is_repaired_and_reads_with_no_new_key_763() {
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+    let puller = puller_of(&node_b, &edge_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    deliver_row(&file, &node_b).await;
+    cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await;
+    assert_eq!(
+        puller
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false }
+    );
+    assert_eq!(
+        verdict(&node_b, &node_b.me, &file.sha).await,
+        CustodyVerdict::Here
+    );
+    let grants_before = key_grant_rows(&node_b).await;
+    assert!(grants_before > 0, "B was granted the file's keys");
+
+    // The whole file, gone from B's store.
+    assert!(node_b.dir.delete_blob(&file.sha).await.expect("delete"));
+    for (_, _, chunk) in &file.stream {
+        node_b.dir.delete_blob(chunk).await.expect("delete");
+    }
+    assert!(!node_b.dir.has_blob(&file.sha).await.expect("has_blob"));
+
+    let sweep = puller.durability_sweep().await;
+    let repairs: Vec<[u8; 32]> = sweep.repairs.iter().map(|r| r.sha).collect();
+    assert_eq!(repairs, vec![file.sha], "the lost file is a repair");
+    assert!(
+        sweep.repairs[0].live_here.is_empty(),
+        "no live holder B knows of: rarest"
+    );
+    assert_eq!(
+        verdict(&node_b, &node_b.me, &file.sha).await,
+        CustodyVerdict::None,
+        "B reported the lost copy `none`"
+    );
+    let d = row_deficit(&*node_b.dir, &file.row, &file.sha, chrono::Utc::now())
+        .await
+        .expect("deficit");
+    assert!(d.missing.contains(&node_b.me), "B is missing: {d:?}");
+
+    let repair = &sweep.repairs[0];
+    assert_eq!(
+        puller
+            .pull_dag_with(&repair.row, repair.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false },
+        "the whole file is repaired"
+    );
+    assert_eq!(
+        verdict(&node_b, &node_b.me, &file.sha).await,
+        CustodyVerdict::Here
+    );
+    let file_row = crate::files::FileRow::from_row(&file.row).expect("a file row");
+    let whole = file_row
+        .open(&node_b.store, &node_b.me)
+        .await
+        .expect("the repaired file opens");
+    assert!(whole == file.plain, "the repaired file reads whole");
+    let mut walk = file_row.chunks(&node_b.store, &node_b.me);
+    let mut read = Vec::new();
+    while let Some(item) = walk.next().await {
+        read.extend_from_slice(&item.expect("every chunk opens"));
+    }
+    assert!(read == file.plain, "and by stream");
+    assert_eq!(
+        key_grant_rows(&node_b).await,
+        grants_before,
+        "no key_grant set was re-applied: the eviction kept the grants"
+    );
+    assert!(puller.durability_sweep().await.repairs.is_empty());
+}
+
+/// **A withdrawn self file reads `Withdrawn` for a device holding its grant,
+/// and the durability pass does not repair it.** B pulled the file; alice
+/// withdraws it (CC 2.3) and the `withdraws` row reaches B. A's read is
+/// refused `Withdrawn`, not `NotGranted` and not a substrate fault (B's is
+/// pinned below on a persist gap). Then B's copy is evicted: the pass lists
+/// no repair and files no report for it (a retracted file is not
+/// durability's to restore). Fails with the pass
+/// listing withdrawn files (`LifecycleView::IncludeWithdrawn`): the evicted
+/// file comes back as a repair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawn_file_reads_withdrawn_and_is_not_repaired_763() {
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+    let puller = puller_of(&node_b, &edge_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    deliver_row(&file, &node_b).await;
+    cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await;
+    assert_eq!(
+        puller
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false }
+    );
+    let withdraws = crate::files::withdraw(
+        &*node_a.dir,
+        &file.row,
+        "deleted from the drive",
+        file.row.asserted_at + chrono::Duration::seconds(1),
+        crate::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+    )
+    .await
+    .expect("the author withdraws the file");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: withdraws,
+        })
+        .await
+        .expect("B admits the withdrawal");
+
+    let file_row = crate::files::FileRow::from_row(&file.row).expect("a file row");
+    let at_a = file_row.open(&node_a.store, &node_a.me).await;
+    assert!(
+        matches!(
+            &at_a,
+            Err(crate::files::FileError::Unopened(
+                crate::chat::UnopenedReason::Withdrawn { .. }
+            ))
+        ),
+        "a grant-holder's read of a withdrawn file is Withdrawn: {:?}",
+        at_a.as_ref().map(Vec::len)
+    );
+
+    // PERSIST GAP (reported, v53.0.0): B filed a custody `here` after its
+    // pull, a federation-tier `scores` row citing the blob in
+    // `evidence_refs`. Persist's tombstone fold (`binding_state` over
+    // `attestations_binding_content`) counts that report as a LIVE binding of
+    // the content, so on every device that reported `here` the withdrawn file
+    // still reads. Pinned by name: when persist stops counting custody
+    // reports as bindings this leg reds, and B's read is asserted `Withdrawn`
+    // like A's.
+    let bindings = node_b
+        .dir
+        .attestations_binding_content(&hex::encode(file.sha))
+        .await
+        .expect("bindings");
+    assert!(
+        bindings.iter().any(|r| r.attesting_key_id == node_b.me
+            && ciris_persist::federation::admission::envelope_dimension(&r.attestation_envelope)
+                == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)),
+        "B's own custody report is one of the blob's bindings"
+    );
+    assert_eq!(
+        ciris_persist::federation::blob_tombstone::binding_state(&*node_b.dir, &file.sha)
+            .await
+            .expect("fold"),
+        ciris_persist::federation::blob_tombstone::BindingState::Live,
+        "persist's fold on B: the custody report keeps the withdrawn blob live"
+    );
+    assert!(
+        file_row.open(&node_b.store, &node_b.me).await.is_ok(),
+        "B (which reported `here`) still reads the withdrawn file on this persist"
+    );
+
+    assert!(node_b.dir.delete_blob(&file.sha).await.expect("delete"));
+    for (_, _, chunk) in &file.stream {
+        node_b.dir.delete_blob(chunk).await.expect("delete");
+    }
+    let sweep = puller.durability_sweep().await;
+    assert!(
+        !sweep.repairs.iter().any(|r| r.sha == file.sha),
+        "a withdrawn file is not repaired: {:?}",
+        sweep
+            .repairs
+            .iter()
+            .map(|r| hex::encode(r.sha))
+            .collect::<Vec<_>>()
+    );
+    assert!(!sweep.reported_here.contains(&file.sha));
 }

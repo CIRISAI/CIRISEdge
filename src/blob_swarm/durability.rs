@@ -203,60 +203,40 @@ where
 }
 
 /// **File this node's custody report** for the file `row` names
-/// (`custody:ack:v1`, CC 3.1.3.3), placed at the row's own cohort. `here`
-/// is filed only when [`holds_whole`] says every byte is held — for a chunk
-/// DAG the manifest AND every chunk, so a report filed after a chunk repair
-/// covers the whole DAG — and names the stored length; `none` is "this
-/// device is in the audience and holds no copy".
+/// (`custody:ack:v1`, CC 3.1.3.3), placed at the row's own cohort, through
+/// persist's door (`Engine::put_custody_ack`). `here` is filed only when
+/// every byte is held — for a chunk DAG the manifest AND every chunk, so a
+/// report filed after a chunk repair covers the whole DAG — and names the
+/// stored length; `none` is "this device is in the audience and holds no
+/// copy".
 ///
-/// Built on persist's own envelope ([`custody_ack_envelope`]) and emitted
-/// through the engine's self-signing door, exactly the row persist's
-/// `Engine::put_custody_ack` writes. Edge checks completeness itself because
-/// persist's check opens the manifest without the caller's AAD, and every
-/// manifest edge seals is bound to its row's AAD (`content_aad`), so persist's
-/// door refuses an edge DAG's `here` as an AEAD mismatch.
-///
-/// [`custody_ack_envelope`]: ciris_persist::federation::custody_ack::custody_ack_envelope
+/// The door opens the manifest under the row's own AAD (`content_aad`, the
+/// data every file edge seals is bound to): a DAG not held whole is refused
+/// `custody_ack_here_dag_incomplete`, a manifest that does not open under the
+/// row's data `custody_ack_here_seal_did_not_open`.
 ///
 /// # Errors
-/// `here` for a file not held whole, a store read, or the emit failed.
-pub async fn file_custody<B>(
+/// Persist refused the report (a `here` for a file not held whole, a seal that
+/// did not open) or the emit failed.
+pub async fn file_custody(
     engine: &ciris_persist::Engine,
-    backend: &B,
-    me: &str,
     row: &Attestation,
     sha: &[u8; 32],
     pointer: &crate::group_content::BlobPointer,
     state: ciris_persist::federation::custody_ack::CustodyState,
-) -> Result<String, String>
-where
-    B: ciris_persist::federation::blobs::BlobStorage + Sync,
-{
-    use ciris_persist::federation::custody_ack::{custody_ack_envelope, CustodyState};
-    let size = match state {
-        CustodyState::Here => {
-            if !holds_whole(engine, backend, me, row, sha, pointer).await? {
-                return Err("custody: `here` refused — this node does not hold every byte".into());
-            }
-            backend
-                .blob_head(sha)
-                .await
-                .map_err(|e| format!("blob_head: {e}"))?
-                .map(|h| h.size_bytes)
-        }
-        CustodyState::None => None,
-    };
-    let env = custody_ack_envelope(sha, state, size, &row.cohort_scope, group_of(row))
-        .map_err(|e| e.to_string())?;
-    let core: ciris_persist::federation::envelope::EnvelopeCore =
-        serde_json::from_value(env).map_err(|e| format!("custody envelope: {e}"))?;
+) -> Result<String, String> {
+    let aad = crate::group_content::content_aad(
+        &row.attesting_key_id,
+        row.asserted_at,
+        pointer.content_field,
+    );
     engine
-        .emit_attestation_self(
-            ciris_persist::federation::EmitAttestationInput::with_envelope(
-                ciris_persist::federation::types::attestation_type::SCORES,
-                core,
-                row.cohort_scope.clone(),
-            ),
+        .put_custody_ack(
+            sha,
+            state,
+            Some(&row.cohort_scope),
+            group_of(row),
+            Some(&aad),
         )
         .await
         .map_err(|e| e.to_string())

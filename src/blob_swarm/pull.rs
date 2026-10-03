@@ -1740,17 +1740,7 @@ where
             (false, false) => None,
         };
         if let Some(state) = report {
-            match durability::file_custody(
-                &self.engine,
-                &*self.backend,
-                me,
-                &row,
-                &sha,
-                &file.pointer,
-                state,
-            )
-            .await
-            {
+            match durability::file_custody(&self.engine, &row, &sha, &file.pointer, state).await {
                 Ok(_) if state == CustodyState::Here => out.reported_here.push(sha),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(
@@ -2092,8 +2082,6 @@ where
         };
         match super::durability::file_custody(
             &self.engine,
-            &*self.backend,
-            &self.local_key_id,
             row,
             &sha,
             pointer,
