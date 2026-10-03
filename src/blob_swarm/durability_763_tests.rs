@@ -313,6 +313,20 @@ async fn a_device_that_lost_its_copy_is_missing_and_repaired_rarest_first_763() 
     );
 }
 
+/// The custody reports `node` has signed.
+async fn custody_reports_by(node: &Node) -> usize {
+    node.dir
+        .list_attestations_by(&node.me)
+        .await
+        .expect("list")
+        .iter()
+        .filter(|r| {
+            ciris_persist::federation::admission::envelope_dimension(&r.attestation_envelope)
+                == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+        })
+        .count()
+}
+
 /// The `key_grant` sets `node` holds (every axis).
 async fn key_grant_rows(node: &Node) -> usize {
     node.dir
@@ -719,6 +733,29 @@ async fn a_withdrawn_file_reads_withdrawn_and_is_not_repaired_763() {
         "B (which reported `here`) still reads the withdrawn file on this persist"
     );
 
+    // Edge never files `here` for a retracted file: not on a direct report
+    // (the post-pull path), and not on the daily re-file.
+    let reports = custody_reports_by(&node_b).await;
+    let direct = super::durability::file_custody(
+        node_b.store.engine(),
+        &file.row,
+        &file.sha,
+        &file_row.pointer,
+        ciris_persist::federation::custody_ack::CustodyState::Here,
+    )
+    .await;
+    assert!(
+        matches!(&direct, Err(e) if e.contains("is retracted")),
+        "`here` for a withdrawn file is refused by edge: {direct:?}"
+    );
+    let resweep = puller.durability_sweep().await;
+    assert!(!resweep.reported_here.contains(&file.sha));
+    assert_eq!(
+        custody_reports_by(&node_b).await,
+        reports,
+        "the sweep filed no new `here` for the withdrawn file"
+    );
+
     assert!(node_b.dir.delete_blob(&file.sha).await.expect("delete"));
     for (_, _, chunk) in &file.stream {
         node_b.dir.delete_blob(chunk).await.expect("delete");
@@ -734,4 +771,150 @@ async fn a_withdrawn_file_reads_withdrawn_and_is_not_repaired_763() {
             .collect::<Vec<_>>()
     );
     assert!(!sweep.reported_here.contains(&file.sha));
+}
+
+/// A `tracing` writer into a shared buffer, for a witness that names a log
+/// line.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("capture").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// **A withdrawn self file is refused to peers by the device that reported
+/// holding it.** B pulled the file and filed its custody `here`, a row that
+/// cites the file's sha in `evidence_refs`. Every row B holds goes through
+/// the revocation register as the replication apply path hands it over, and
+/// then alice's `withdraws` lands. The register reads `Revoked` (B's custody
+/// report is a holding, not a reference), and B's serve door refuses a
+/// requesting peer `Withdrawn`, logging the refusal at INFO. The refusal is
+/// booked as `blob_serve_refusals["withdrawn"]`. Fails with a custody report
+/// counted as a reference (`is_possession_row` without the custody arm): B's
+/// own report keeps the register `Live` and B serves the withdrawn file's
+/// chunks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // the register, the serve door, its log line and its counter, in order, on purpose
+async fn a_withdrawn_file_is_refused_to_peers_despite_this_devices_custody_report_763() {
+    use super::revocation::{apply_observation, observe};
+    use super::{BlobChunkSource as _, BytesVerdict, ChunkSourceRefusal, RevocationRegister};
+
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+    let puller = puller_of(&node_b, &edge_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    deliver_row(&file, &node_b).await;
+    cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await;
+    assert_eq!(
+        puller
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false }
+    );
+    assert_eq!(
+        verdict(&node_b, &node_b.me, &file.sha).await,
+        CustodyVerdict::Here,
+        "precondition: B reported its copy"
+    );
+
+    // Every row B holds, through the register, as the apply path feeds it.
+    let register = std::sync::Arc::new(RevocationRegister::default());
+    for signed in node_b
+        .dir
+        .list_attestations_since(None, 1000)
+        .await
+        .expect("list")
+    {
+        if let Some(obs) = observe(&signed.attestation) {
+            apply_observation(&register, &*node_b.dir, None, obs).await;
+        }
+    }
+    assert_eq!(register.verdict(&file.sha), BytesVerdict::Live);
+
+    let withdraws = crate::files::withdraw(
+        &*node_a.dir,
+        &file.row,
+        "deleted from the drive",
+        file.row.asserted_at + chrono::Duration::seconds(1),
+        crate::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+    )
+    .await
+    .expect("the author withdraws the file");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: withdraws.clone(),
+        })
+        .await
+        .expect("B admits the withdrawal");
+    apply_observation(
+        &register,
+        &*node_b.dir,
+        None,
+        observe(&withdraws).expect("a withdraws is observed"),
+    )
+    .await;
+    assert_eq!(
+        register.verdict(&file.sha),
+        BytesVerdict::Revoked,
+        "B's own custody report does not keep the withdrawn file live"
+    );
+
+    let source = super::PersistBlobChunkSource::new(node_b.store.engine().clone())
+        .with_revocations(Some(std::sync::Arc::clone(&register)));
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .finish();
+    let refused = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        source
+            .read_chunk(file.sha, file.stream[0].2, &node_a.me)
+            .await
+    };
+    assert_eq!(
+        refused,
+        Err(ChunkSourceRefusal::Withdrawn),
+        "B refuses the withdrawn file's chunk to a peer"
+    );
+    let logged = String::from_utf8(captured.0.lock().expect("capture").clone()).expect("utf8");
+    assert!(
+        logged.contains("INFO") && logged.contains("refusing Withdrawn"),
+        "the refusal is logged at INFO: {logged:?}"
+    );
+
+    let metrics = crate::observability::EdgeMetrics::new();
+    metrics.book_chunk_source_refusal(&ChunkSourceRefusal::Withdrawn);
+    metrics.book_chunk_source_refusal(&ChunkSourceRefusal::PolicyDenied);
+    assert_eq!(
+        metrics
+            .snapshot()
+            .blob_serve_refusals
+            .get(crate::observability::BLOB_SERVE_REFUSED_WITHDRAWN)
+            .copied(),
+        Some(1),
+        "a Withdrawn serve refusal is booked under its tag"
+    );
+    assert_eq!(
+        crate::observability::BLOB_SERVE_REFUSED_WITHDRAWN,
+        "withdrawn"
+    );
 }

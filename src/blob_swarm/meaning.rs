@@ -262,6 +262,12 @@ impl BlobMeaning {
         if is_holds_bytes_type(&row.attestation_type) || envelope_kind == Some(HOLDS_BYTES_KIND) {
             return Err(MeaningRefusal::PossessionIsNotMeaning);
         }
+        // CIRISEdge#763 — a custody report (`custody:ack:v1`) cites the blob
+        // in `evidence_refs` as a HOLDING fact: "this device has a copy".
+        // It gives the bytes no meaning.
+        if is_custody_report(&row.attestation_envelope) {
+            return Err(MeaningRefusal::PossessionIsNotMeaning);
+        }
 
         // (3) It must name THIS blob.
         let sha_hex = hex::encode(blob_sha256);
@@ -365,20 +371,16 @@ impl BlobMeaning {
     /// blob too, but as possession, and a puller that fetched on possession
     /// claims would fetch every blob every peer announced. The full
     /// projection refuses it as `PossessionIsNotMeaning`; this pre-check
-    /// keeps the apply path from cloning a row it would then refuse.
+    /// keeps the apply path from cloning a row it would then refuse. A
+    /// custody report (`custody:ack:v1`, CIRISEdge#763) is possession too
+    /// ([`is_possession_row`]).
     ///
     /// Signature is NOT checked here — that is `project`'s job, per sha,
     /// and it runs before any byte moves. This is the cheap "should the
     /// apply path even hand this row to the puller" question.
     #[must_use]
     pub fn referenced_shas(row: &Attestation) -> Vec<[u8; 32]> {
-        if is_holds_bytes_type(&row.attestation_type)
-            || row
-                .attestation_envelope
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                == Some(HOLDS_BYTES_KIND)
-        {
+        if is_possession_row(row) {
             return Vec::new();
         }
         let Some(obj) = row.attestation_envelope.as_object() else {
@@ -651,13 +653,18 @@ fn references_as_evidence(envelope: &serde_json::Value, sha_hex: &str) -> bool {
 /// top-level-only pointer scan, same `evidence_refs` read, so the two can
 /// never disagree about what counts as a reference. A `holds_bytes` row is
 /// possession and references nothing — the caller checks that by type, as
-/// `project` does, before asking.
+/// `project` does, before asking ([`is_possession_row`]). A custody report
+/// (`custody:ack:v1`) is possession by its envelope alone, so this answers
+/// nothing for one even when the caller did not ask (CIRISEdge#763).
 ///
 /// Entries that are not 64 lowercase-or-uppercase hex characters are
 /// skipped: `evidence_refs` may carry other kinds of evidence, and a pointer
 /// with a malformed hash is a row the store gate would refuse anyway.
 #[must_use]
 pub fn referenced_shas(envelope: &serde_json::Value) -> Vec<[u8; 32]> {
+    if is_custody_report(envelope) {
+        return Vec::new();
+    }
     let mut out: Vec<[u8; 32]> = Vec::new();
     let mut push = |hex_str: &str| {
         if let Ok(bytes) = hex::decode(hex_str) {
@@ -684,6 +691,27 @@ pub fn referenced_shas(envelope: &serde_json::Value) -> Vec<[u8; 32]> {
         }
     }
     out
+}
+
+/// CIRISEdge#763 — is this envelope a **custody report** (`custody:ack:v1`,
+/// CC 3.1.3.3)? A device's report that it holds (or lost) its copy of a blob.
+/// It cites the blob in `evidence_refs`, but as a holding fact: it is not a
+/// reference to the content, so it neither gives the bytes meaning nor keeps
+/// them live against a withdrawal. Identified by persist's own dimension
+/// constant.
+#[must_use]
+pub fn is_custody_report(envelope: &serde_json::Value) -> bool {
+    ciris_persist::federation::admission::envelope_dimension(envelope)
+        == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+}
+
+/// **Is this row possession, never a reference?** A `holds_bytes` claim
+/// ([`is_holds_bytes_row`]) or a custody report ([`is_custody_report`]).
+/// The one question every reader that derives "this row references that
+/// content" asks first (CIRISEdge#606, #763).
+#[must_use]
+pub fn is_possession_row(row: &Attestation) -> bool {
+    is_holds_bytes_row(row) || is_custody_report(&row.attestation_envelope)
 }
 
 /// Is this row a `holds_bytes` claim — possession, never a reference?

@@ -704,6 +704,11 @@ pub struct RemovalReceiptLedger {
 /// Removal primitives are rare; 1024 covers years of fleet churn.
 pub const REMOVAL_LEDGER_CAP: usize = 1024;
 
+/// CIRISEdge#763 — the `blob_serve_refusals` tag for a chunk serve refused
+/// `Withdrawn`: every reference to the file was withdrawn (CC 2.3), by edge's
+/// revocation register or persist's tombstone fold.
+pub const BLOB_SERVE_REFUSED_WITHDRAWN: &str = "withdrawn";
+
 impl RemovalReceiptLedger {
     /// A removal-class row exists locally (seen at advertise assembly).
     /// Idempotent; evicts oldest past the cap.
@@ -1336,6 +1341,16 @@ impl EdgeMetrics {
             self.replication_routed_to_initiator_total.load(Relaxed),
             self.replication_reply_dropped_total.load(Relaxed),
         )
+    }
+
+    /// CIRISEdge#763 — book one chunk-source refusal at the serve door:
+    /// [`BLOB_SERVE_REFUSED_WITHDRAWN`] for a file every reference to which
+    /// was withdrawn (CC 2.3 at the bytes plane). Other refusals are booked
+    /// where they are decided.
+    pub fn book_chunk_source_refusal(&self, refusal: &crate::blob_swarm::ChunkSourceRefusal) {
+        if *refusal == crate::blob_swarm::ChunkSourceRefusal::Withdrawn {
+            self.inc_blob_serve_refusal(BLOB_SERVE_REFUSED_WITHDRAWN);
+        }
     }
 
     /// CIRISEdge#640 — count one unserved `BlobChunkFetch` by its branch tag.

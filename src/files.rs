@@ -2217,6 +2217,24 @@ async fn lifecycle_of(
     row: &Attestation,
     room: &ScopeRoom,
 ) -> Result<FileLifecycle, FileError> {
+    row_lifecycle(engine, row)
+        .await
+        .map_err(|detail| FileError::Drive {
+            room: room.to_string(),
+            detail,
+        })
+}
+
+/// [`lifecycle_of`] for a row held by id, outside a listing: the same
+/// composers, the same predicate. CIRISEdge#763 — the custody door asks it
+/// before filing `here`, so a withdrawn file is never reported held.
+///
+/// # Errors
+/// The composers could not be read.
+pub(crate) async fn row_lifecycle(
+    engine: &ciris_persist::Engine,
+    row: &Attestation,
+) -> Result<FileLifecycle, String> {
     use ciris_persist::federation::precedence::references_attestation_id_from_envelope;
     use ciris_persist::federation::types::attestation_type;
 
@@ -2224,10 +2242,7 @@ async fn lifecycle_of(
         .federation_directory()
         .list_attestations_referencing(&row.attestation_id)
         .await
-        .map_err(|e| FileError::Drive {
-            room: room.to_string(),
-            detail: format!("composers of {}: {e}", row.attestation_id),
-        })?;
+        .map_err(|e| format!("composers of {}: {e}", row.attestation_id))?;
     let retracted_by = |kind: &str| {
         composers.iter().any(|c| {
             c.attestation_type == kind

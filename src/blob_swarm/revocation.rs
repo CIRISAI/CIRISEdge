@@ -83,7 +83,7 @@ use async_trait::async_trait;
 use ciris_persist::federation::types::attestation_type;
 use ciris_persist::federation::{Attestation, FederationDirectory};
 
-use super::meaning::{is_holds_bytes_row, referenced_shas};
+use super::meaning::{is_possession_row, referenced_shas};
 use crate::holonomic::swarm_rarity::ConsentState;
 
 /// The default cap on distinct blobs the register tracks. Chosen as a
@@ -364,8 +364,9 @@ pub fn observe(row: &Attestation) -> Option<Observation> {
     if row.attestation_type == attestation_type::WITHDRAWS {
         return Some(Observation::Withdraws(Box::new(row.clone())));
     }
-    // Possession is not a reference (memory trap 4 / `BlobMeaning` step 2).
-    if is_holds_bytes_row(row) {
+    // Possession is not a reference (memory trap 4 / `BlobMeaning` step 2):
+    // a `holds_bytes` claim, or a custody report (CIRISEdge#763).
+    if is_possession_row(row) {
         return None;
     }
     let shas = referenced_shas(&row.attestation_envelope);
@@ -483,7 +484,7 @@ async fn resolve_withdraws_target(
     // content-location plane (ContentMiss / eviction announcements), not a
     // revocation of content. persist's gate skips the consent rules for it
     // (`Ok(None)`); so do we, by the same predicate `BlobMeaning` uses.
-    if is_holds_bytes_row(&target) {
+    if is_possession_row(&target) {
         return None;
     }
     let shas = referenced_shas(&target.attestation_envelope);
@@ -552,8 +553,12 @@ async fn complete_known_references(
         let hex_sha = hex::encode(sha);
         match directory.attestations_binding_content(&hex_sha).await {
             Ok(rows) => {
+                // persist's binding predicate counts a custody report
+                // (`custody:ack:v1`) as a binding at v53.0.0; it is a holding,
+                // and a device's own report must never keep a withdrawn file
+                // live on that device (CIRISEdge#763).
                 for r in rows {
-                    if !is_holds_bytes_row(&r) {
+                    if !is_possession_row(&r) {
                         register.note_reference(sha, &r.attestation_id);
                     }
                 }
@@ -729,6 +734,58 @@ mod tests {
 
         row.attestation_type = "withdraws".into();
         assert!(matches!(observe(&row), Some(Observation::Withdraws(_))));
+    }
+
+    /// CIRISEdge#763 — a custody report (`custody:ack:v1`) is a holding,
+    /// never a reference: it does not keep a withdrawn file live, and a
+    /// genuine second reference still does. Fails with the custody arm out of
+    /// `is_possession_row` (the report is indexed and the file stays `Live`).
+    #[test]
+    fn a_custody_report_is_not_a_reference_and_a_second_file_row_is_763() {
+        let file = |id: &str| {
+            let mut r = withdraws_row();
+            r.attestation_id = id.into();
+            r.attestation_type = "scores".into();
+            r.attestation_envelope = serde_json::json!({
+                "dimension": crate::files::FILE_DIMENSION,
+                "evidence_refs": [hex::encode(sha(7))],
+            });
+            r
+        };
+        let mut custody = file("custody-1");
+        custody.attestation_envelope = serde_json::json!({
+            "dimension": ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION,
+            "evidence_refs": [hex::encode(sha(7))],
+        });
+        assert!(
+            observe(&custody).is_none(),
+            "a custody report observes nothing"
+        );
+        assert!(referenced_shas(&custody.attestation_envelope).is_empty());
+        assert!(crate::blob_swarm::BlobMeaning::referenced_shas(&custody).is_empty());
+
+        let note = |r: &RevocationRegister, row: &ciris_persist::federation::Attestation| {
+            if let Some(Observation::References { row_id, shas }) = observe(row) {
+                for s in shas {
+                    r.note_reference(s, &row_id);
+                }
+            }
+        };
+        // The file row and the device's custody report: withdrawing the file
+        // revokes it.
+        let alone = RevocationRegister::default();
+        note(&alone, &file("file-1"));
+        note(&alone, &custody);
+        alone.note_withdrawn("file-1", &[sha(7)]);
+        assert_eq!(alone.verdict(&sha(7)), BytesVerdict::Revoked);
+
+        // A second live file row citing the same bytes keeps them live.
+        let shared = RevocationRegister::default();
+        note(&shared, &file("file-1"));
+        note(&shared, &custody);
+        note(&shared, &file("file-2"));
+        shared.note_withdrawn("file-1", &[sha(7)]);
+        assert_eq!(shared.verdict(&sha(7)), BytesVerdict::Live);
     }
 
     fn withdraws_row() -> ciris_persist::federation::Attestation {

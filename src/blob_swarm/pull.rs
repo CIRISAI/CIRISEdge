@@ -1928,7 +1928,8 @@ where
                     if h.storage_kind == "inline" && h.crypto_tier != CryptoTier::Plaintext => {}
                 // CIRISEdge#763 — a promoted sealed DAG is held only if every
                 // chunk is; the DAG walk asks persist's readiness door and
-                // REPAIRS the chunks this node lost (CC 6.1.5.3).
+                // REPAIRS the chunks this node lost (CC 6.1.5.3). The
+                // readiness check there decides the repair, not this arm.
                 Ok(Some(h))
                     if h.storage_kind == "chunk_dag" && h.crypto_tier != CryptoTier::Plaintext => {}
                 Ok(_) => return PullOutcome::AlreadyHeld,

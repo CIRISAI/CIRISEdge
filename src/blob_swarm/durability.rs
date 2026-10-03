@@ -215,9 +215,17 @@ where
 /// `custody_ack_here_dag_incomplete`, a manifest that does not open under the
 /// row's data `custody_ack_here_seal_did_not_open`.
 ///
+/// A file whose row is withdrawn or recanted (CC 2.3) is never reported
+/// `here`: the report is a holding of content its author retracted, and a
+/// device must not advertise, to its cohort or to persist's tombstone fold,
+/// that it keeps it. Asked by the same composer read the drive's lifecycle
+/// uses ([`crate::files::FileLifecycle`]); a superseded file (a rename) still
+/// has a live row over the same bytes and is reported as before.
+///
 /// # Errors
 /// Persist refused the report (a `here` for a file not held whole, a seal that
-/// did not open) or the emit failed.
+/// did not open) or the emit failed; `here` for a retracted file; the
+/// file's composers could not be read.
 pub async fn file_custody(
     engine: &ciris_persist::Engine,
     row: &Attestation,
@@ -225,6 +233,18 @@ pub async fn file_custody(
     pointer: &crate::group_content::BlobPointer,
     state: ciris_persist::federation::custody_ack::CustodyState,
 ) -> Result<String, String> {
+    use crate::files::FileLifecycle;
+    if state == ciris_persist::federation::custody_ack::CustodyState::Here {
+        match crate::files::row_lifecycle(engine, row).await? {
+            FileLifecycle::Withdrawn | FileLifecycle::Recanted => {
+                return Err(format!(
+                    "custody: `here` not filed — {} is retracted (CC 2.3)",
+                    row.attestation_id
+                ));
+            }
+            FileLifecycle::Live | FileLifecycle::Superseded => {}
+        }
+    }
     let aad = crate::group_content::content_aad(
         &row.attesting_key_id,
         row.asserted_at,

@@ -6562,6 +6562,11 @@ async fn dispatch_inbound(
                             }
                         }
                         Err(refusal) => {
+                            // CIRISEdge#763 — a serve refused because every
+                            // reference to the file was withdrawn (CC 2.3 at
+                            // the bytes plane): counted, so a harness can see
+                            // a withdrawn file stop being served.
+                            metrics.book_chunk_source_refusal(&refusal);
                             // CIRISEdge#717 — a chunk outside the DAG the
                             // request named is a serve-gate refusal: booked
                             // (unthrottled) and spoken (throttled) exactly as
