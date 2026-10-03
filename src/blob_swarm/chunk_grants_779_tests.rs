@@ -1163,3 +1163,188 @@ async fn a_reclassed_phone_receives_its_owners_self_file_and_a_server_does_not_7
         "a device re-classed into the self audience gets the earlier self keys (I397b–d)"
     );
 }
+
+/// **CIRISEdge#797 — a legacy v2 DAG (v52's per-chunk-keyed file) written on
+/// A is pulled and read on B through edge's real DAG pull.** persist v53
+/// writes only v4 manifests, so the file is written by persist's one v2
+/// writer (`write_legacy_v2_dag`, test-anchor) as a v52 node did, and A emits
+/// its key-grant sets. B is alice's phone, a personal-class device (under S1
+/// a server-class node is given no self keys). The file is sealed, manifest
+/// and chunks, under edge's `content_aad` of the row that names it, as a v52
+/// edge node sealed it. B learns of the file only
+/// through the crossed sets and a self row pointing at the DAG; edge's
+/// `pull_dag_with` fetches and adopts the sealed manifest and every sealed
+/// chunk. Chunk 0's content grant is held back first: the pull parks on it
+/// (a v2 DAG waits on per-chunk content grants, `awaiting_of` → `Content`),
+/// and that grant's arrival wakes the pull, which promotes. On B: the
+/// manifest is v2 and its chunks carry no epoch (each adopted at epoch 0,
+/// `chunk_adopt_epoch`), persist's readiness reads the DAG readable on
+/// content keys, and the whole file and a range read back exactly. Fails if
+/// edge parks a v2 DAG on anything but its chunks' content grants (the pull
+/// is never woken).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // write, park, wake, then every read, in order
+async fn a_legacy_v2_dag_is_pulled_and_read_on_the_owners_other_device_797() {
+    use ciris_persist::federation::chunk_dag_cascade::test_support::{
+        write_legacy_v2_dag, LegacyV2Dag,
+    };
+    use ciris_persist::federation::types::cohort_scope::SELF;
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+
+    // The row template: a real self file of alice's, whose pointer is then
+    // pointed at the v2 DAG (the pull reads the pointer, never the template's
+    // bytes).
+    let template = publish_self_file_seeded(&node_a, &alice, 0x0797).await;
+    let template_hex = hex::encode(template.sha);
+    let field = template
+        .row
+        .attestation_envelope
+        .as_object()
+        .expect("envelope object")
+        .values()
+        .filter_map(|v| serde_json::from_value::<crate::group_content::BlobPointer>(v.clone()).ok())
+        .find(|p| p.content_sha256 == template_hex)
+        .expect("the template's pointer")
+        .content_field;
+    // The AAD a v52 edge writer bound the file to: the naming row's.
+    let aad = crate::group_content::content_aad(
+        &template.row.attesting_key_id,
+        template.row.asserted_at,
+        field,
+    );
+    let stream = format!("v2-797-{}", uuid::Uuid::new_v4().simple());
+    let segs: Vec<Vec<u8>> = (0..5)
+        .map(|i: usize| {
+            (0..60 + (i % 4) * 17)
+                .map(|j| (i * 29 + j).to_le_bytes()[0])
+                .collect()
+        })
+        .collect();
+    let LegacyV2Dag {
+        manifest_sha256: root,
+        chunk_sha256,
+        plaintext,
+    } = write_legacy_v2_dag(
+        node_a.store.engine(),
+        &*node_a.dir,
+        SELF,
+        &alice.key_id,
+        &stream,
+        &segs,
+        Some(&aad),
+    )
+    .await
+    .expect("A writes a v2 file, as a v52 node did");
+    let mut row = template.row.clone();
+    let slot = row
+        .attestation_envelope
+        .as_object_mut()
+        .expect("envelope object")
+        .values_mut()
+        .find(|v| {
+            v.get("content_sha256").and_then(serde_json::Value::as_str)
+                == Some(template_hex.as_str())
+        })
+        .expect("the template's pointer");
+    slot["content_sha256"] = serde_json::json!(hex::encode(root));
+    slot["stream_id"] = serde_json::json!(stream);
+    slot["size"] = serde_json::json!(plaintext.len());
+    slot["content_digest"] = serde_json::json!(hex::encode(
+        <sha2::Sha256 as sha2::Digest>::digest(&plaintext)
+    ));
+    if let Some(o) = slot.as_object_mut() {
+        o.remove("sealed_descriptor");
+    }
+
+    // A's key-grant sets cross, all but chunk 0's content grant. B's pull
+    // through edge's DAG path fetches and adopts the manifest and every
+    // chunk, then parks on what persist's readiness names for a v2 DAG: the
+    // missing chunk's own content grant (`awaiting_of` → `Content`).
+    let puller = puller_with(
+        &node_b,
+        &edge_b,
+        PullConfig {
+            max_attempts: 2,
+            retry_backoff: std::time::Duration::from_millis(50),
+            ..PullConfig::default()
+        },
+    );
+    let (sink, run) = Arc::clone(&puller).start();
+    let held_back = Withhold {
+        rows: vec![chunk_sha256[0]],
+        epochs: Vec::new(),
+    };
+    assert!(cross_keys_except(&node_a, &node_b, &held_back, Some(&sink)).await > 0);
+    let parked = puller
+        .pull_dag_with(&row, root, &fetch_from(&node_a, &node_b))
+        .await;
+    assert!(
+        matches!(parked, PullOutcome::DagAwaitingKey { .. }),
+        "chunk 0's grant is missing: the v2 DAG parks on it, not Stored; got {parked:?}"
+    );
+    assert!(!promoted(&node_b, &root).await);
+    // Let the retry ladder run out, so only the grant's wake can re-pull.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !puller.ladder_spent(root) {
+        assert!(std::time::Instant::now() < deadline, "the ladder runs out");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!promoted(&node_b, &root).await);
+
+    // Chunk 0's grant lands. Nothing re-offers the row: the grant wakes the
+    // parked pull, which promotes the v2 DAG.
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::none(), Some(&sink)).await > 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !promoted(&node_b, &root).await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "chunk 0's content grant landed and the parked v2 DAG was never re-pulled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    drop(sink);
+    run.abort();
+
+    let b = node_b.store.engine();
+    let view = b
+        .open_sealed_manifest_as(&root, &node_b.me, Some(&aad))
+        .await
+        .expect("B opens the manifest");
+    assert_eq!(view.version, 2, "B holds a legacy (v2) manifest");
+    assert!(
+        view.chunks.iter().all(|c| c.epoch.is_none()),
+        "a v2 chunk names no epoch: edge adopts each at epoch 0"
+    );
+    assert_eq!(
+        view.chunks
+            .iter()
+            .map(|c| c.sha256_hex.clone())
+            .collect::<Vec<_>>(),
+        chunk_sha256.iter().map(hex::encode).collect::<Vec<_>>()
+    );
+    let ready = b
+        .sealed_dag_readiness(&root, &node_b.me, Some(&aad))
+        .await
+        .expect("readiness");
+    assert_eq!(ready.chunk_keys, "content", "{ready:?}");
+    assert!(
+        ready.held && ready.readable && ready.missing.is_empty(),
+        "{ready:?}"
+    );
+    assert_eq!(
+        b.read_blob_as(&root, &node_b.me, Some(&aad))
+            .await
+            .expect("whole read"),
+        plaintext,
+        "B reads the v2 file whole"
+    );
+    assert_eq!(
+        b.read_blob_range_as(&root, &node_b.me, 70, 200, Some(&aad))
+            .await
+            .expect("range read"),
+        plaintext[70..=200].to_vec(),
+        "a range across chunk boundaries"
+    );
+}
