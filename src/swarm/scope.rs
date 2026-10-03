@@ -944,15 +944,19 @@ mod tests {
     fn persist_owns_the_fountain_content_projection() {
         use AuthorityClass::{AccordCoScrub, ProducerSteward};
         for authority in [ProducerSteward, AccordCoScrub] {
+            // persist v53 S3 (#963, CC 6.1.5.3 "durability at every tier"):
+            // self/family bytes hold-and-forward among their own audience, so
+            // their FountainContent cell moved `SelfOwn` → `Cohort`; the
+            // audience is S1's (the owner's allowed nodes / the family's).
             assert_eq!(
                 HoldingsScopeGate::projection_of(&CohortScope::SelfOnly, authority),
-                Projection::SelfOwn,
-                "self scope must be structurally invisible under {authority:?}",
+                Projection::Cohort,
+                "self bytes relay only within their own audience under {authority:?}",
             );
             assert_eq!(
                 HoldingsScopeGate::projection_of(&CohortScope::Family, authority),
-                Projection::SelfOwn,
-                "family scope must be structurally invisible under {authority:?}",
+                Projection::Cohort,
+                "family bytes relay only within their own audience under {authority:?}",
             );
             assert_eq!(
                 HoldingsScopeGate::projection_of(&cohort("neighbourhood"), authority),
@@ -1267,9 +1271,11 @@ mod tests {
         let g = armed().await;
         assert_eq!(
             g.admits(PIPELINE, Some(&family_content()), OUTSIDER).await,
+            // persist v53 S3: the family cell is `Cohort` (was `self_own`);
+            // an outsider is still outside it.
             HoldingAnnounce::Withhold(HoldingRefusal::PeerNotInRoster {
                 content_kind: "family",
-                projection: "self_own",
+                projection: "cohort",
             }),
         );
         assert!(

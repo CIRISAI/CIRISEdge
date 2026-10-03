@@ -1678,8 +1678,9 @@ impl FileRow {
     ///
     /// It answers about the BLOB the pointer names — the same answer for
     /// every row over it, a rename's included (§6.7.2) — and reveals no
-    /// description. `copies_observable: false` for `self`/`family` is by
-    /// design (CC 5.2), never "no copies".
+    /// description. Since persist v53 S2 (`custody:ack:v1`, CC 3.1.3.3)
+    /// copies are observable at every tier: a `self`/`family` device with no
+    /// live report reads `unknown`, never a copy and never "no copies".
     ///
     /// # Errors
     /// [`UnopenedReason`] as [`Self::open`]: a viewer who cannot open the

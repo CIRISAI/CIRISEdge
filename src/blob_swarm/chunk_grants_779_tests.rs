@@ -1061,9 +1061,10 @@ async fn carry_occurrence(from: &Node, to: &Node) {
 /// (`Reclassed`), its new occurrence reaches A, and alice's next self file is
 /// wrapped to it: B's pull is `Stored` and streams the file. Fails without the
 /// #799 reclass (`AlreadyCurrent`, the row stays `server`, B is still refused).
-/// (The file published while B was a server stays unwrapped to it: persist's
-/// `emit_pending_key_grants` re-wraps room epochs to arriving devices, not
-/// existing self blobs — a persist gap, raised with the S1 adoption.)
+/// The file published while B was a server reaches it too: persist's
+/// signed-occurrence receive door treats a device re-classed into the self
+/// audience as a newcomer to the self keys A holds (I397b–d, persist
+/// 32fe46f9), and A's next emission carries the re-wraps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reclassed_phone_receives_its_owners_self_file_and_a_server_does_not_799() {
     use crate::content_occurrence::{provision_engine_occurrence, Provisioned};
@@ -1153,4 +1154,12 @@ async fn a_reclassed_phone_receives_its_owners_self_file_and_a_server_does_not_7
         read.extend_from_slice(&item.expect("every chunk opens on the phone"));
     }
     assert!(read == next.plain, "the phone reads the file alice wrote");
+    // The earlier file, published while B was a server, now opens too.
+    assert_eq!(
+        puller
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false },
+        "a device re-classed into the self audience gets the earlier self keys (I397b–d)"
+    );
 }

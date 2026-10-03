@@ -5893,12 +5893,13 @@ mod files {
             assert_eq!(custody.tier, expected_tier, "{room}");
             assert!(custody.held_here, "{room}: this node stores the bytes");
             assert!(!custody.access.is_empty(), "{room}: someone can open it");
-            if *tier == CryptoTier::InvisibleEncrypted {
-                assert!(
-                    !custody.copies_observable,
-                    "{room}: self copies elsewhere are unknowable by design"
-                );
-            }
+            // persist v53 S2 (CIRISPersist#942, CC 3.1.3.3): copies are
+            // observable at every tier now — a self/family device with no
+            // live `custody:ack:v1` report reads `unknown`, never a copy.
+            assert!(
+                custody.copies_observable,
+                "{room}: copies are observable at every tier (custody:ack:v1)"
+            );
             let refused = old
                 .custody(&node_a.store, "stranger-occ")
                 .await
