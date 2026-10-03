@@ -437,6 +437,13 @@ pub struct FountainSwarmRuntime {
     cancel_tx: watch::Sender<bool>,
     publisher_task: Option<JoinHandle<()>>,
     converger_task: Option<JoinHandle<()>>,
+    /// CIRISEdge#763 — the host's holdings source, for the scope of the
+    /// content an inbound claim names.
+    holdings: Arc<dyn FountainHoldingsSource>,
+    /// CIRISEdge#763 — the publish gate's twin for INBOUND claims: the same
+    /// persist answer decides whom a holding is told to and whose claim is
+    /// counted.
+    claim_gate: HoldingsPublishGate,
 }
 
 /// Internal observed-claims map. Keyed by content_id → peer_id →
@@ -684,6 +691,7 @@ impl FountainSwarmRuntime {
             );
         }
 
+        let claim_gate = publish_gate.clone();
         let publisher_task = {
             let holdings = Arc::clone(&holdings);
             let transport = Arc::clone(&transport);
@@ -741,6 +749,8 @@ impl FountainSwarmRuntime {
             cancel_tx,
             publisher_task: Some(publisher_task),
             converger_task: Some(converger_task),
+            holdings,
+            claim_gate,
         }
     }
 
@@ -762,12 +772,38 @@ impl FountainSwarmRuntime {
     /// passes [`HoldingClaimVerification::SignatureOnly`]: the claim is
     /// past the AV-9 verify gate, so the signature is real, and nothing in
     /// the protocol yet challenges possession.
+    ///
+    /// CIRISEdge#763 (CC 6.1.5.3) — and only a claim [`Self::claim_admission`]
+    /// admits for its `peer_id` is counted: a `self`/`family` holding claim
+    /// from a node outside the content's cohort audience is refused, so it
+    /// can neither inflate the holder count the converger evicts on nor
+    /// enter the rarity math.
     pub async fn register_observed_claim(
         &self,
         claim: FountainHoldingClaim,
         verification: HoldingClaimVerification,
     ) {
+        if !self
+            .claim_admission(&claim.content_id, &claim.peer_id)
+            .await
+            .is_announced()
+        {
+            return;
+        }
         self.observed.write().await.upsert(claim, verification);
+    }
+
+    /// CIRISEdge#763 — **may `claimant`'s holding claim for `content_id` be
+    /// counted?** The host's declared scope for the content
+    /// ([`FountainHoldingsSource::content_scope`]) through the publish gate's
+    /// inbound twin ([`HoldingsPublishGate::admit_claim_and_book`]): at
+    /// `self` / `family` the claimant must be in persist's audience for the
+    /// content; every other scope is admitted as before.
+    pub async fn claim_admission(&self, content_id: &str, claimant: &str) -> HoldingAnnounce {
+        let scope = self.holdings.content_scope(content_id);
+        self.claim_gate
+            .admit_claim_and_book(claimant, content_id, scope.as_ref())
+            .await
     }
 
     /// Shared observed-claims map for tests + telemetry. Cheap clone
@@ -1205,6 +1241,63 @@ async fn run_converger(
     }
 }
 
+/// CIRISEdge#763 (CC 6.1.5.3) — the audience size of a `self`/`family`
+/// content when its target is FULL holding (persist's `durability_mode`
+/// below `N + K`), else `None` (the tuple governs, or the content is not at
+/// a cohort-delivered tier, or its audience is not enumerable). The audience
+/// is persist's `audience_nodes` over the content's federation group key.
+async fn full_holding_audience(
+    holdings: &Arc<dyn FountainHoldingsSource>,
+    directory: &dyn FederationDirectory,
+    content_id: &str,
+) -> Option<u32> {
+    use crate::blob_swarm::ContentScope;
+    use crate::cohort_scope::CohortScope;
+    use crate::scope_room::ScopeRoom;
+    use ciris_persist::federation::types::cohort_scope as cs;
+    let content = holdings.content_scope(content_id)?;
+    let (token, key) = match (&content, ScopeRoom::from_content_scope(&content)) {
+        (
+            ContentScope::Group {
+                scope: CohortScope::SelfOnly,
+                ..
+            },
+            Some(ScopeRoom::SelfCollective { identity_key_id }),
+        ) => (cs::SELF, identity_key_id),
+        (
+            ContentScope::Group {
+                scope: CohortScope::Family,
+                ..
+            },
+            Some(ScopeRoom::Family { family_key_id }),
+        ) => (cs::FAMILY, family_key_id),
+        _ => return None,
+    };
+    match ciris_persist::federation::replication_audience::audience_nodes(
+        directory,
+        token,
+        Some(&key),
+    )
+    .await
+    {
+        Ok(ciris_persist::federation::replication_audience::Audience::Nodes(n))
+            if crate::blob_swarm::target_mode(n.len())
+                == ciris_persist::federation::durability::DurabilityMode::Full =>
+        {
+            u32::try_from(n.len()).ok()
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::debug!(
+                content_id,
+                error = %e,
+                "swarm_runtime.converger: the cohort audience is unreadable — the tuple governs"
+            );
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn converger_tick(
     observed: &Arc<RwLock<ObservedClaims>>,
@@ -1348,6 +1441,30 @@ async fn converger_tick(
         } else {
             RarityScore(0)
         };
+
+        // CIRISEdge#763 (CC 6.1.5.3) — THE TARGET AT EVERY TIER. A `self`
+        // or `family` content whose audience is smaller than `N + K` is held
+        // WHOLE by every audience node: no symbol spread is feasible, so the
+        // tuple's eject-above-target never applies and the target is the
+        // audience itself. Below it the content needs repair; at it, it is
+        // kept. At `N + K` or more the tuple below governs as before.
+        if let Some(audience) = full_holding_audience(holdings, directory, &content_id).await {
+            if let Some(sink) = sink {
+                sink(if observed_count < audience {
+                    SwarmEvent::RepairNeeded {
+                        content_id: content_id.clone(),
+                        observed_holders: observed_count,
+                        min_viable: audience,
+                    }
+                } else {
+                    SwarmEvent::Keep {
+                        content_id: content_id.clone(),
+                        observed_holders: observed_count,
+                    }
+                });
+            }
+            continue;
+        }
 
         // CIRISEdge#184 (v6.3.0) — diversity refinement on top of
         // the substrate verdict. When either the score OR the floor
@@ -2004,8 +2121,19 @@ mod tests {
     /// belongs to no scope group — the peer the leak used to reach.
     fn family_table() -> Arc<ScopeAddressTable> {
         let t = ScopeAddressTable::new(Arc::new(StubDeriver));
-        t.install_group(&CohortScope::Family, "fam-1", 1, &[0xA1; 32], &[INSIDER])
-            .expect("family install");
+        // CIRISEdge#763 — a COMMUNITY group: a family's holdings answer from
+        // persist's audience now, not the table, so the table-roster witness
+        // runs on the one tier that still reads it.
+        t.install_group(
+            &CohortScope::Cohort {
+                cohort_id: "neighbourhood".to_string(),
+            },
+            "com-1",
+            1,
+            &[0xA1; 32],
+            &[INSIDER],
+        )
+        .expect("community install");
         Arc::new(t)
     }
 
@@ -2074,8 +2202,10 @@ mod tests {
                 (
                     "c-family".to_string(),
                     ContentScope::Group {
-                        scope: CohortScope::Family,
-                        group_id: "fam-1".to_string(),
+                        scope: CohortScope::Cohort {
+                            cohort_id: "neighbourhood".to_string(),
+                        },
+                        group_id: "com-1".to_string(),
                     },
                 ),
                 ("c-federation".to_string(), ContentScope::Federation),
@@ -2290,6 +2420,88 @@ mod tests {
         .await;
         assert!(sends.is_empty());
         assert!(metrics.withholds(WithholdReason::HoldingScopeUndeterminable) > 0);
+    }
+
+    /// **CIRISEdge#763 at the LOOP — a self holding is announced to the
+    /// owner's personal device and to no one outside the cohort, and a claim
+    /// from outside the cohort is not counted.** alice's phone is the
+    /// insider; mallory's phone and alice's server-class node are outside
+    /// her self audience (persist S1/S3). Fails without the #763 gate: the
+    /// pre-#763 publisher read the table (here it seats nobody, so even the
+    /// phone went untold), and every inbound claim was counted.
+    #[tokio::test]
+    async fn a_self_holding_reaches_the_cohort_and_an_outside_claim_is_not_counted_763() {
+        use crate::swarm::scope::tests::cohort_directory_763;
+        const PHONE: &str = "node-alice-phone";
+        const SERVER: &str = "node-alice-server";
+        const MALLORY: &str = "node-mallory-phone";
+        let self_scope = ContentScope::Group {
+            scope: CohortScope::SelfOnly,
+            group_id: "person-alice".to_string(),
+        };
+        let holdings: Arc<dyn FountainHoldingsSource> = Arc::new(ScopedHoldings {
+            held: vec![held("c-self", vec![1, 2])],
+            scopes: BTreeMap::from([("c-self".to_string(), self_scope)]),
+        });
+        let dir: Arc<dyn FederationDirectory> = cohort_directory_763().await;
+        let table = Arc::new(ScopeAddressTable::new(Arc::new(StubDeriver)));
+        let sends = drive_publisher_as(
+            Arc::clone(&holdings),
+            vec![PHONE.to_string(), SERVER.to_string(), MALLORY.to_string()],
+            SwarmRuntimeOptions {
+                scope_table: Some(Arc::clone(&table)),
+                ..SwarmRuntimeOptions::default()
+            },
+            "node-alice-laptop",
+            Arc::clone(&dir),
+        )
+        .await;
+        assert!(
+            announced(&sends, PHONE, "c-self"),
+            "alice's personal device is told of her self holding"
+        );
+        for outside in [SERVER, MALLORY] {
+            assert!(
+                !announced(&sends, outside, "c-self"),
+                "{outside} is outside alice's self audience and is told nothing"
+            );
+        }
+
+        let tx: Arc<dyn Transport> = Arc::new(RecordingTransport::default());
+        let cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
+        let mut rt = FountainSwarmRuntime::start_with_options(
+            SwarmRuntimeConfig {
+                publish_cadence: Duration::from_secs(60),
+                observe_cadence: Duration::from_secs(60),
+                ..Default::default()
+            },
+            holdings,
+            dir,
+            tx,
+            cohort,
+            "node-alice-laptop".to_string(),
+            None,
+            SwarmRuntimeOptions {
+                scope_table: Some(table),
+                ..SwarmRuntimeOptions::default()
+            },
+        );
+        for claimant in [PHONE, SERVER, MALLORY] {
+            rt.register_observed_claim(
+                FountainHoldingClaim::new(claimant, "c-self", vec![1, 2], 1_700_000_000),
+                HoldingClaimVerification::SignatureOnly,
+            )
+            .await;
+        }
+        let map = rt.observed_handle();
+        let g = map.read().await;
+        assert_eq!(
+            g.peer_ids_for("c-self"),
+            vec![PHONE.to_string()],
+            "only the claim from inside alice's self audience is counted"
+        );
+        drop(g);
+        rt.shutdown().await;
     }
 
     // ─── CIRISEdge#546 — the config plane governs a RUNNING swarm ─────

@@ -48,11 +48,11 @@ fn ts() -> chrono::DateTime<chrono::Utc> {
 }
 
 /// 1.3 MiB: four 256 KiB chunks and a tail, seq 0..=4.
-const FILE_LEN: usize = 1_300_000;
+pub(crate) const FILE_LEN: usize = 1_300_000;
 
 /// CIRISEdge#797 — the author rolls its epoch label every this many chunks:
 /// epoch 0 is seq 0..=2, epoch 1 is seq 3..=4.
-const EPOCH_CHUNKS: u64 = 3;
+pub(crate) const EPOCH_CHUNKS: u64 = 3;
 
 /// The chunks whose key arrives LAST — the field's seq 782..1023 — are
 /// epoch 1's: its one stream set is held back.
@@ -302,7 +302,7 @@ impl crate::transport::Transport for NoWire {
     }
 }
 
-fn edge_of(node: &Node) -> Arc<crate::Edge> {
+pub(crate) fn edge_of(node: &Node) -> Arc<crate::Edge> {
     use ciris_persist::federation::FederationDirectory;
     Arc::new(
         crate::Edge::builder()
@@ -317,11 +317,11 @@ fn edge_of(node: &Node) -> Arc<crate::Edge> {
     )
 }
 
-fn puller_of(node: &Node, edge: &Arc<crate::Edge>) -> Arc<BlobPuller<SqliteBackend>> {
+pub(crate) fn puller_of(node: &Node, edge: &Arc<crate::Edge>) -> Arc<BlobPuller<SqliteBackend>> {
     puller_with(node, edge, PullConfig::default())
 }
 
-fn puller_with(
+pub(crate) fn puller_with(
     node: &Node,
     edge: &Arc<crate::Edge>,
     config: PullConfig,
@@ -338,7 +338,7 @@ fn puller_with(
 }
 
 /// The author's peer-serve door: the bytes a holder puts on the wire.
-struct StoreFetch {
+pub(crate) struct StoreFetch {
     engine: ciris_persist::Engine,
     peer: String,
     holders: Vec<String>,
@@ -364,7 +364,7 @@ impl DagByteFetch for StoreFetch {
     }
 }
 
-fn fetch_from(author: &Node, reader: &Node) -> StoreFetch {
+pub(crate) fn fetch_from(author: &Node, reader: &Node) -> StoreFetch {
     StoreFetch {
         engine: author.store.engine().clone(),
         peer: reader.me.clone(),
@@ -372,24 +372,24 @@ fn fetch_from(author: &Node, reader: &Node) -> StoreFetch {
     }
 }
 
-struct Published {
-    row: Attestation,
-    sha: [u8; 32],
-    stream_id: String,
-    plain: Vec<u8>,
+pub(crate) struct Published {
+    pub(crate) row: Attestation,
+    pub(crate) sha: [u8; 32],
+    pub(crate) stream_id: String,
+    pub(crate) plain: Vec<u8>,
     /// The data chunks' addresses in `seq` order.
-    chunks: Vec<[u8; 32]>,
+    pub(crate) chunks: Vec<[u8; 32]>,
     /// CIRISEdge#797 — every chunk of the stream, terminators included, as
     /// `(seq, plaintext size, address)` in `seq` order.
-    stream: Vec<(u64, u64, [u8; 32])>,
+    pub(crate) stream: Vec<(u64, u64, [u8; 32])>,
 }
 
-async fn publish_self_file(author: &Node, owner: &Ident) -> Published {
+pub(crate) async fn publish_self_file(author: &Node, owner: &Ident) -> Published {
     publish_self_file_seeded(author, owner, 0x0779).await
 }
 
 /// [`publish_self_file`] with the body drawn from `seed`, so two files differ.
-async fn publish_self_file_seeded(author: &Node, owner: &Ident, seed: u32) -> Published {
+pub(crate) async fn publish_self_file_seeded(author: &Node, owner: &Ident, seed: u32) -> Published {
     let room = crate::self_room::room(&owner.key_id);
     let plain = body_of(FILE_LEN, seed);
     let published = crate::files::publish(
@@ -462,7 +462,7 @@ async fn publish_self_file_seeded(author: &Node, owner: &Ident, seed: u32) -> Pu
 
 /// The key sets a crossing holds back.
 #[derive(Debug, Clone, Default)]
-struct Withhold {
+pub(crate) struct Withhold {
     /// Content-axis sets for these rows (the manifest).
     rows: Vec<[u8; 32]>,
     /// CIRISEdge#797 — stream-axis sets for these epochs.
@@ -470,7 +470,7 @@ struct Withhold {
 }
 
 impl Withhold {
-    fn none() -> Self {
+    pub(crate) fn none() -> Self {
         Self::default()
     }
 
@@ -486,7 +486,7 @@ impl Withhold {
 /// Apply the author's `key_grant` sets through `reader`'s key-grant door,
 /// except those `withhold` names, and hand each admission to `sink` as the
 /// bridge's key-grant door does. Returns how many were applied.
-async fn cross_keys_except(
+pub(crate) async fn cross_keys_except(
     author: &Node,
     reader: &Node,
     withhold: &Withhold,
@@ -556,7 +556,7 @@ fn receipts_emitted(edge: &crate::Edge) -> u64 {
         .unwrap_or(0)
 }
 
-async fn two_devices() -> (Ident, Node, Node) {
+pub(crate) async fn two_devices() -> (Ident, Node, Node) {
     let alice = Ident::new("alice-fed", 0x11);
     let alice_phone = Ident::new("alice-phone", 0x33);
     // S1 (CC 3.3.7) — D1 and D2 are alice's own devices: B is wrapped every
@@ -1030,7 +1030,7 @@ async fn a_multi_epoch_dag_reads_and_range_reads_across_its_terminators_797() {
 /// Hand `from`'s current signed engine occurrence to `to` (the row a peer
 /// replicates after a reclass: same keys, the new class, a newer
 /// `asserted_at`).
-async fn carry_occurrence(from: &Node, to: &Node) {
+pub(crate) async fn carry_occurrence(from: &Node, to: &Node) {
     let occ = from
         .dir
         .list_signed_identity_occurrences_since(None, 64)

@@ -352,6 +352,10 @@ pub mod meaning;
 pub use meaning::{BlobMeaning, MeaningRefusal};
 #[cfg(test)]
 pub(crate) mod chunk_grants_779_tests;
+pub mod durability;
+#[cfg(test)]
+mod durability_763_tests;
+pub use durability::{rarest_first, target_mode, DurabilitySweep, Repair};
 mod key_wake;
 pub mod pull;
 pub use pull::{

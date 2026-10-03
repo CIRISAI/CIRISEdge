@@ -1276,6 +1276,91 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
         "no family pull consulted the claim index: {sources:?}"
     );
 
+    // ── (e) CIRISEdge#763 (CC 6.1.5.3) — durability at the family tier. Q1's
+    //    completed pulls filed its `custody:ack:v1` `here` for each file; the
+    //    reports cross Q1 → P1 through the real serve gate (persist's
+    //    may_receive: the family's audience) and never Q1 → N. On P1,
+    //    persist's deficit names the family's audience — the roster's nodes,
+    //    N not among them — in Full mode, with Q1 a live full holder.
+    for f in [&inline, &dag] {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let sha_hex = hex::encode(f.sha);
+        loop {
+            let here = ciris_persist::federation::custody_ack::device_custody_of(
+                &*q1.node.dir,
+                &q1.node.me,
+                &sha_hex,
+                None,
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("custody fold")
+            .state;
+            if here == ciris_persist::federation::custody_ack::CustodyVerdict::Here {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Q1 never filed its `here` for the pulled family file ({here:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    let custody_rows = |carried: &[(String, ApplyOutcome)], node: &Node| {
+        let ids: Vec<String> = carried.iter().map(|(id, _)| id.clone()).collect();
+        let dir = Arc::clone(&node.dir);
+        async move {
+            let mut count = 0;
+            for id in ids {
+                if let Ok(Some(row)) = dir.get_attestation(&id).await {
+                    if ciris_persist::federation::admission::envelope_dimension(
+                        &row.attestation_envelope,
+                    ) == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+                    {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+    };
+    let to_p1 = carry_rows(&q1, &p1).await;
+    assert_eq!(
+        custody_rows(&to_p1, &q1.node).await,
+        2,
+        "both of Q1's custody reports reach P1, a family node: {to_p1:?}"
+    );
+    let to_n_reports = carry_rows(&q1, &n).await;
+    assert_eq!(
+        custody_rows(&to_n_reports, &q1.node).await,
+        0,
+        "no custody report reaches N, outside the family"
+    );
+    for f in [&inline, &dag] {
+        let deficit = ciris_edge::blob_swarm::durability::row_deficit(
+            &*p1.node.dir,
+            &f.row,
+            &f.sha,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the deficit");
+        assert_eq!(
+            deficit.audience,
+            ciris_persist::federation::durability::DeficitAudience::Nodes(roster.nodes.clone()),
+            "the family file's audience is the roster's nodes"
+        );
+        assert_eq!(
+            deficit.mode,
+            Some(ciris_persist::federation::durability::DurabilityMode::Full),
+            "two nodes < N + K: every audience node a full holder"
+        );
+        assert!(
+            deficit.live_here.contains(&q1.node.me) && !deficit.missing.contains(&q1.node.me),
+            "Q1 is a live full holder of the family file: {deficit:?}"
+        );
+    }
+
     // ── (c) N asks P1 for each file directly: refused on P1's serve gate
     //    by name; N cannot route the family at all.
     assert!(
