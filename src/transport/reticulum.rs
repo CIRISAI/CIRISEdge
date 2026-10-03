@@ -9710,7 +9710,12 @@ async fn process_peer_bundle_frame(
             Refused(PeerBundleRefusal::VerifyRefused(refusal))
         }
         crate::bundle_gate::BundleGateVerdict::Verified(verdict) => {
-            bundles.note_verified(key_id, crate::bundle_gate::sha256_of(bundle_bytes));
+            bundles.note_verified(
+                key_id,
+                crate::bundle_gate::sha256_of(bundle_bytes),
+                reader_key_id,
+                &verdict,
+            );
             commit_one_motion_upgrade(
                 key_id,
                 reader_key_id,

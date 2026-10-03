@@ -330,6 +330,24 @@ pub trait RootingDirectory: Send + Sync + 'static {
         )
     }
 
+    /// CIRISEdge#793 — the pipeline's `infra:attest` standing NOW, from
+    /// `reader_key_id`'s trust root
+    /// ([`pipeline_blessing`](crate::bundle_gate::pipeline_blessing), both
+    /// CC 3.1.2.1 planes): what a cached bundle verdict is re-checked against
+    /// at every use. `Ok(None)` is "no standing on either plane". Default
+    /// [`BundleGateRefusal::NoDirectory`](crate::bundle_gate::BundleGateRefusal::NoDirectory)
+    /// (no directory ⇒ fail-closed).
+    async fn pipeline_standing(
+        &self,
+        _reader_key_id: &str,
+        _pipeline_key_id: &str,
+    ) -> Result<
+        Option<ciris_verify_core::manifest_contribution::PipelineBlessing>,
+        crate::bundle_gate::BundleGateRefusal,
+    > {
+        Err(crate::bundle_gate::BundleGateRefusal::NoDirectory)
+    }
+
     /// CIRISEdge#406 — the CURRENT signed reticulum route stored for
     /// `key_id`, signature container included (the read half of the
     /// self-signed-route producer's emit-only-on-change guard). One row per
@@ -530,6 +548,19 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         FederationDirectory::put_signed_transport_destination(self, signed)
             .await
             .map_err(|e| format!("put_signed_transport_destination: {e}"))
+    }
+
+    async fn pipeline_standing(
+        &self,
+        reader_key_id: &str,
+        pipeline_key_id: &str,
+    ) -> Result<
+        Option<ciris_verify_core::manifest_contribution::PipelineBlessing>,
+        crate::bundle_gate::BundleGateRefusal,
+    > {
+        crate::bundle_gate::pipeline_blessing(self, reader_key_id, pipeline_key_id)
+            .await
+            .map_err(|e| crate::bundle_gate::BundleGateRefusal::DirectoryUnavailable(e.to_string()))
     }
 
     async fn verify_peer_build_bundle(

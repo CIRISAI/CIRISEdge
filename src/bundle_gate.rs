@@ -168,16 +168,31 @@ pub enum BundleRegisterError {
     NoTransport,
 }
 
-/// One stored bundle: the raw bytes plus (when set) the SHA-256 of the exact
-/// bytes that last verified — the verdict cache. Only VERIFIED outcomes are
-/// cached; a refusal is never cached, so a late-arriving directory row (the
-/// pipeline record replicating in after registration) flips the gate on the
-/// next Rooted save rather than pinning the downgrade (the transit-gate
-/// don't-cache-refusals honesty rule, CIRISEdge#430).
+/// One stored bundle: the raw bytes plus (when set) what the last
+/// verification of exactly these bytes established — the verdict cache. Only
+/// VERIFIED outcomes are cached; a refusal is never cached, so a late-arriving
+/// directory row (the pipeline record replicating in after registration)
+/// flips the gate on the next Rooted save rather than pinning the downgrade
+/// (the transit-gate don't-cache-refusals honesty rule, CIRISEdge#430).
 #[derive(Debug, Clone)]
 struct StoredPeerBundle {
     bytes: Vec<u8>,
-    verified_sha256: Option<[u8; 32]>,
+    verified: Option<VerifiedBundle>,
+}
+
+/// CIRISEdge#793 — what a verification of one bundle's bytes established.
+/// The bytes-dependent work (decode, the signature chain against the pinned
+/// rows) is cached against `sha256`. The pipeline's STANDING is not a
+/// property of the bytes (CC 3.1.2.1: the reader evaluates it at use, and a
+/// withdrawal, a dropped root or a de-rooted root changes it with the bundle
+/// unchanged), so the blessing the verification ran under is kept only to be
+/// compared with a fresh [`pipeline_blessing`] at every use, and it is
+/// reader-relative: a cached verdict serves only the reader it was asked for.
+#[derive(Debug, Clone)]
+struct VerifiedBundle {
+    sha256: [u8; 32],
+    reader_key_id: String,
+    blessing: PipelineBlessing,
 }
 
 /// CIRISEdge#437 — per-peer store of presented build-attestation bundles.
@@ -228,7 +243,7 @@ impl PeerBundleStore {
             key_id.to_string(),
             StoredPeerBundle {
                 bytes: bytes.to_vec(),
-                verified_sha256: None,
+                verified: None,
             },
         );
         Ok(())
@@ -244,26 +259,74 @@ impl PeerBundleStore {
             .map(|b| b.bytes.clone())
     }
 
-    /// Record that the bytes hashing to `sha256` verified for `key_id`.
+    /// Record that the bytes hashing to `sha256` verified for `key_id`, read
+    /// by `reader_key_id`, under the standing `verdict` names (CIRISEdge#793:
+    /// kept to be re-checked at each use, never trusted from the cache).
     /// No-op if the stored bytes have changed since (a racing re-register
     /// must not inherit the old bytes' verdict).
-    pub fn note_verified(&self, key_id: &str, sha256: [u8; 32]) {
+    pub fn note_verified(
+        &self,
+        key_id: &str,
+        sha256: [u8; 32],
+        reader_key_id: &str,
+        verdict: &BundleVerdict,
+    ) {
         let mut map = self.inner.lock().expect("peer bundle store poisoned");
         if let Some(entry) = map.get_mut(key_id) {
             if sha256_of(&entry.bytes) == sha256 {
-                entry.verified_sha256 = Some(sha256);
+                entry.verified = Some(VerifiedBundle {
+                    sha256,
+                    reader_key_id: reader_key_id.to_owned(),
+                    blessing: PipelineBlessing {
+                        pipeline_key_id: verdict.build.attested_by.clone(),
+                        standing: verdict.build.standing.clone(),
+                    },
+                });
             }
         }
     }
 
     /// Is `key_id`'s stored bundle already verified at exactly these bytes?
+    /// The bytes' answer only — whether the pipeline still has standing is
+    /// asked at use ([`gated_save_provenance`], CIRISEdge#793).
     #[must_use]
     pub fn is_verified(&self, key_id: &str, sha256: [u8; 32]) -> bool {
         self.inner
             .lock()
             .expect("peer bundle store poisoned")
             .get(key_id)
-            .is_some_and(|b| b.verified_sha256 == Some(sha256))
+            .is_some_and(|b| b.verified.as_ref().is_some_and(|v| v.sha256 == sha256))
+    }
+
+    /// CIRISEdge#793 — the blessing `key_id`'s bundle verified under, if
+    /// these exact bytes verified for `reader_key_id`. The caller re-resolves
+    /// the standing and compares; this never answers "still has standing".
+    fn verified_blessing(
+        &self,
+        key_id: &str,
+        sha256: [u8; 32],
+        reader_key_id: &str,
+    ) -> Option<PipelineBlessing> {
+        self.inner
+            .lock()
+            .expect("peer bundle store poisoned")
+            .get(key_id)
+            .and_then(|b| b.verified.as_ref())
+            .filter(|v| v.sha256 == sha256 && v.reader_key_id == reader_key_id)
+            .map(|v| v.blessing.clone())
+    }
+
+    /// CIRISEdge#793 — drop `key_id`'s cached verdict (its pipeline lost
+    /// standing): the next use verifies from scratch.
+    fn forget_verified(&self, key_id: &str) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("peer bundle store poisoned")
+            .get_mut(key_id)
+        {
+            entry.verified = None;
+        }
     }
 
     /// Number of peers with a stored bundle.
@@ -291,6 +354,7 @@ pub fn sha256_of(bytes: &[u8]) -> [u8; 32] {
 /// chain. Every variant is a hard refusal — under the gate they all read as
 /// "no verified bundle" (fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BundleGateRefusal {
     /// No federation directory is wired (the `RootingDirectory` default
     /// impl) — nothing can be pinned, so nothing can verify.
@@ -491,6 +555,13 @@ pub fn verify_bundle_with_directory_rows(
 ///   refused/rejected one → the SAVE downgrades to `Advisory` with a loud
 ///   named warn. Refusals are never cached, so a directory row that
 ///   replicates in later un-sticks the gate at the next Rooted save.
+/// - CIRISEdge#793 — a cached verdict skips only the bytes-dependent work.
+///   The pipeline's standing is re-resolved at EVERY use
+///   ([`RootingDirectory::pipeline_standing`](crate::verify::RootingDirectory::pipeline_standing),
+///   [`pipeline_blessing`]) for the reader now asking: the same blessing →
+///   `Rooted`; none (the grant or co-scrub withdrawn, the root no longer
+///   accepted or rooted) → `Advisory` and the cache entry is dropped; a
+///   different blessing → a full re-verification under it.
 pub async fn gated_save_provenance(
     mode: BundleSaveGateMode,
     provenance: BindingProvenance,
@@ -515,19 +586,53 @@ pub async fn gated_save_provenance(
         return BindingProvenance::Advisory;
     };
     let digest = sha256_of(&bytes);
-    if bundles.is_verified(key_id, digest) {
-        tracing::debug!(
-            key_id,
-            "CIRISEdge#437 bundle_gate: cached verified bundle — Rooted durable save proceeds"
-        );
-        return BindingProvenance::Rooted;
+    if let Some(cached) = bundles.verified_blessing(key_id, digest, reader_key_id) {
+        match rooting
+            .pipeline_standing(reader_key_id, &cached.pipeline_key_id)
+            .await
+        {
+            Ok(Some(now)) if now == cached => {
+                tracing::debug!(
+                    key_id,
+                    "CIRISEdge#437 bundle_gate: cached verified bundle, standing re-checked \
+                     (CIRISEdge#793) — Rooted durable save proceeds"
+                );
+                return BindingProvenance::Rooted;
+            }
+            // The standing moved planes or roots: verify again under it.
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                bundles.forget_verified(key_id);
+                tracing::warn!(
+                    key_id,
+                    gate = mode.as_str(),
+                    pipeline = %cached.pipeline_key_id,
+                    refusal = "pipeline_without_standing",
+                    "CIRISEdge#793 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — the \
+                     cached bundle's pipeline no longer holds infra:attest on either standing \
+                     plane from this node (withdrawn, or its root is no longer accepted)"
+                );
+                return BindingProvenance::Advisory;
+            }
+            Err(refusal) => {
+                tracing::warn!(
+                    key_id,
+                    gate = mode.as_str(),
+                    refusal = %refusal,
+                    "CIRISEdge#793 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — the \
+                     cached bundle's standing could not be re-checked (refusals are not cached; \
+                     the next Rooted save asks again)"
+                );
+                return BindingProvenance::Advisory;
+            }
+        }
     }
     match rooting
         .verify_peer_build_bundle(reader_key_id, key_id, &bytes)
         .await
     {
         BundleGateVerdict::Verified(verdict) => {
-            bundles.note_verified(key_id, digest);
+            bundles.note_verified(key_id, digest, reader_key_id, &verdict);
             tracing::info!(
                 key_id,
                 target = %verdict.build.target,
@@ -950,6 +1055,30 @@ mod tests {
         );
     }
 
+    /// A verdict as verify returns one, for the cache's unit tests.
+    fn a_verdict() -> BundleVerdict {
+        use ciris_verify_core::build_attestation_bundle::{PresentedBuild, TransparencyCheck};
+        use ciris_verify_core::manifest_contribution::{PipelineStanding, VerifiedManifest};
+        BundleVerdict {
+            presenter_key_id: PRESENTER.to_owned(),
+            presents: PresentedBuild::SelfVerify,
+            build: VerifiedManifest {
+                attested_by: PIPELINE.to_owned(),
+                standing: PipelineStanding::AccordRole,
+                attestation_id: "m-1".to_owned(),
+                asserted_at: TS.to_owned(),
+                target: TARGET.to_owned(),
+                build_id: "build-793".to_owned(),
+                binary_hash: "ab".repeat(32),
+                binary_version: "0.0.0".to_owned(),
+                manifest_hash: "cd".repeat(32),
+                manifest_size: 0,
+                evidence_refs: Vec::new(),
+            },
+            transparency: TransparencyCheck::Absent,
+        }
+    }
+
     #[test]
     fn verdict_cache_is_per_exact_bytes_and_resets_on_replace() {
         let store = PeerBundleStore::new();
@@ -959,11 +1088,17 @@ mod tests {
 
         assert!(!store.is_verified("p", digest), "nothing verified yet");
         // A stale digest (bytes that are not the stored ones) never caches.
-        store.note_verified("p", [0u8; 32]);
+        let verdict = a_verdict();
+        store.note_verified("p", [0u8; 32], READER, &verdict);
         assert!(!store.is_verified("p", [0u8; 32]));
-        // The exact stored bytes' digest caches.
-        store.note_verified("p", digest);
+        // The exact stored bytes' digest caches, for the reader that asked.
+        store.note_verified("p", digest, READER, &verdict);
         assert!(store.is_verified("p", digest));
+        assert_eq!(
+            store.verified_blessing("p", digest, READER),
+            Some(PipelineBlessing::accord_role(PIPELINE))
+        );
+        assert_eq!(store.verified_blessing("p", digest, "another-reader"), None);
         // Re-registration (even of the same bytes) resets the cache — new
         // registration, fresh verification.
         store.register("p", &bytes).expect("re-register");
@@ -1373,6 +1508,64 @@ mod tests {
         );
     }
 
+    /// **The pre-19 standing check, reconstructed** (CIRISEdge#786 witness
+    /// (d)). Verify 18's `verify_build_manifest_via_coscrub` step 4, which the
+    /// old seam ran over `(pipeline_record, accord_anchors)` read from the
+    /// directory: the record's declared identity binds its signed envelope,
+    /// names the pipeline, carries `infra:attest` in its envelope roles, and
+    /// at least `MIN_ACCORD_COSCRUBS` (2) distinct accord anchors' scrubs
+    /// hybrid-verify (RequireHybrid) over `JCS(registration_envelope)`. Built
+    /// from verify 19's own public primitives (`KeyRecord::scrubs`,
+    /// `roles_in_envelope`, `check_subject_binding`,
+    /// `verify_threshold_signatures`), which are unchanged from 18; only the
+    /// composition is restated. It reads nothing a withdrawal writes, which
+    /// is the point.
+    fn pre_19_co_scrub_roots(
+        pipeline_row: &PersistKeyRecord,
+        anchors: &[PersistKeyRecord],
+    ) -> bool {
+        use ciris_verify_core::federation_self_record::KeyRecord as VerifyKeyRecord;
+        use ciris_verify_core::threshold::{verify_threshold_signatures, ThresholdSignature};
+        const MIN_ACCORD_COSCRUBS: usize = 2;
+        let Ok(record) =
+            serde_json::to_value(pipeline_row).and_then(serde_json::from_value::<VerifyKeyRecord>)
+        else {
+            return false;
+        };
+        if record.check_subject_binding().is_err() || record.key_id != pipeline_row.key_id {
+            return false;
+        }
+        if !record
+            .roles_in_envelope()
+            .iter()
+            .any(|r| r == MANIFEST_PUBLISH_SCOPE)
+        {
+            return false;
+        }
+        let Ok(canonical) = ciris_verify_core::jcs::canonicalize(&record.registration_envelope)
+        else {
+            return false;
+        };
+        let members: Vec<ThresholdMember> = anchors.iter().map(threshold_member_from_row).collect();
+        let mut verified = std::collections::BTreeSet::new();
+        for scrub in record.scrubs() {
+            let Some(member) = members.iter().find(|m| m.member_id == scrub.scrub_key_id) else {
+                continue;
+            };
+            let sig = ThresholdSignature {
+                member_id: member.member_id.clone(),
+                ed25519_signature_base64: scrub.scrub_signature_classical.clone(),
+                mldsa65_signature_base64: scrub.scrub_signature_pqc.clone(),
+            };
+            if verify_threshold_signatures(&canonical, std::slice::from_ref(member), &[sig], 1)
+                == Ok(1)
+            {
+                verified.insert(scrub.scrub_key_id);
+            }
+        }
+        verified.len() >= MIN_ACCORD_COSCRUBS
+    }
+
     /// Witness (d) — the bundle the pre-19 path rooted and neither plane
     /// admits: the accord quorum WITHDREW the pipeline's `infra:attest`.
     /// The withdrawal is a tombstone and never mutates the row, so the
@@ -1418,6 +1611,38 @@ mod tests {
             .await
             .expect("read"));
 
+        // The pre-19 path, run: over the same directory rows it read, its
+        // standing check ROOTS this pipeline. And it discriminates: a plain
+        // pipeline row (no co-scrub) does not root under it.
+        let pipeline_row = FederationDirectory::lookup_public_key(&backend, PIPELINE)
+            .await
+            .expect("read")
+            .expect("pipeline row");
+        let anchors =
+            FederationDirectory::list_keys_by_identity_type(&backend, identity_type::ACCORD_HOLDER)
+                .await
+                .expect("anchors");
+        assert!(
+            pre_19_co_scrub_roots(&pipeline_row, &anchors),
+            "the pre-19 co-scrub path roots the withdrawn pipeline"
+        );
+        let (plain, _) = plain_pipeline_fixture().await;
+        let plain_row = FederationDirectory::lookup_public_key(&plain, PIPELINE)
+            .await
+            .expect("read")
+            .expect("plain pipeline row");
+        assert!(
+            !pre_19_co_scrub_roots(&plain_row, &anchors),
+            "control: the reconstruction refuses a pipeline with no co-scrub"
+        );
+        // Neither CC 3.1.2.1 plane admits it.
+        assert_eq!(
+            pipeline_blessing(&backend, READER, PIPELINE)
+                .await
+                .expect("standing"),
+            None
+        );
+
         assert_eq!(
             RootingDirectory::verify_peer_build_bundle(&backend, READER, PRESENTER, &bytes).await,
             BundleGateVerdict::Refused(BundleGateRefusal::PipelineWithoutStanding {
@@ -1438,5 +1663,111 @@ mod tests {
             .await,
             BindingProvenance::Advisory
         );
+    }
+
+    /// **CIRISEdge#793 — a cached verdict does not outlive the pipeline's
+    /// standing.** The bundle verifies (ceremony plane) and the Rooted save
+    /// proceeds, caching the verdict against its bytes. Then the accord quorum
+    /// withdraws the pipeline's `infra:attest`. The next Rooted save, same
+    /// bytes, no re-register, is Advisory, and the cache entry is dropped.
+    /// Fails with the cache answering `Rooted` by bytes alone (the pre-#793
+    /// `is_verified` short-circuit).
+    #[tokio::test]
+    async fn a_cached_verdict_does_not_outlive_the_pipelines_standing_793() {
+        use ciris_persist::federation::types::roles::INFRA_ATTEST;
+
+        let (backend, bytes) = field_fixture().await;
+        let store = PeerBundleStore::new();
+        store.register(PRESENTER, &bytes).expect("register");
+        let save = || {
+            gated_save_provenance(
+                BundleSaveGateMode::RequireBundleForRootedSave,
+                BindingProvenance::Rooted,
+                PRESENTER,
+                READER,
+                &store,
+                &backend,
+            )
+        };
+        assert_eq!(save().await, BindingProvenance::Rooted);
+        assert!(store.is_verified(PRESENTER, sha256_of(&bytes)), "cached");
+        assert_eq!(save().await, BindingProvenance::Rooted, "the cache hit");
+
+        FederationDirectory::record_role_withdrawal(
+            &backend,
+            INFRA_ATTEST,
+            PIPELINE,
+            None,
+            &"cd".repeat(32),
+        )
+        .await
+        .expect("the quorum withdraws the pipeline's infra:attest");
+        assert_eq!(
+            save().await,
+            BindingProvenance::Advisory,
+            "same bytes, no re-register: the withdrawal reaches the cached peer"
+        );
+        assert!(
+            !store.is_verified(PRESENTER, sha256_of(&bytes)),
+            "the stale verdict is dropped"
+        );
+        assert_eq!(save().await, BindingProvenance::Advisory);
+    }
+
+    /// **CIRISEdge#793 — a cached verdict is the reader's, not the bundle's.**
+    /// The walk confers the pipeline from a root `READER` accepts, and the
+    /// Rooted save for `READER` caches. A node that never accepted that root,
+    /// asking of the same store and bytes, gets Advisory: standing is
+    /// reader-relative (CC 3.1.2.1), so the cache never answers for another
+    /// reader. Fails with the cache keyed by bytes alone.
+    #[tokio::test]
+    async fn a_cached_verdict_answers_only_the_reader_it_was_asked_for_793() {
+        let (backend, bytes) = plain_pipeline_fixture().await;
+        reader_accepts_common_root(&backend, READER).await;
+        crate::replication::bridge::tests::seed_delegates_to(
+            &backend,
+            "root-r",
+            PIPELINE,
+            &serde_json::json!([ciris_verify_core::manifest_contribution::MANIFEST_PUBLISH_SCOPE]),
+        )
+        .await;
+        let stranger = "reader-stranger-793";
+        FederationDirectory::put_public_key(
+            &backend,
+            ciris_persist::federation::SignedKeyRecord {
+                record: crate::replication::bridge::tests::fixture_key_record(
+                    stranger,
+                    identity_type::NODE,
+                ),
+            },
+        )
+        .await
+        .expect("seed stranger row");
+
+        let store = PeerBundleStore::new();
+        store.register(PRESENTER, &bytes).expect("register");
+        let save = |reader: &'static str| {
+            let store = &store;
+            let backend = &backend;
+            async move {
+                gated_save_provenance(
+                    BundleSaveGateMode::RequireBundleForRootedSave,
+                    BindingProvenance::Rooted,
+                    PRESENTER,
+                    reader,
+                    store,
+                    backend,
+                )
+                .await
+            }
+        };
+        assert_eq!(save(READER).await, BindingProvenance::Rooted);
+        assert!(store.is_verified(PRESENTER, sha256_of(&bytes)));
+        assert_eq!(
+            save(stranger).await,
+            BindingProvenance::Advisory,
+            "a reader that does not accept the root gets no standing from another's cache"
+        );
+        assert_eq!(save(READER).await, BindingProvenance::Rooted);
     }
 }
