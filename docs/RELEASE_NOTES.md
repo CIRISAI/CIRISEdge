@@ -1,5 +1,123 @@
 # CIRISEdge Release Notes
 
+# v40.0.0 — persist v53 + CIRISVerify 19: one audience resolver, stream-epoch file keys, durability at every tier, device classes that follow the hardware, and build standing on both planes
+
+**2026-10-03.** **MAJOR** from v39.1.0. Ladder triple: **edge v40.0.0 · persist v53.0.1 · verify v19.0.0**.
+A clean cut: persist v53 has no cross-version compatibility with v52 on new trust-root acceptance edges,
+so a fleet moves together.
+
+## The pins
+
+| | v39.1.0 | v40.0.0 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v52.0.2"`, `version = "52"` | **`tag = "v53.0.1"`, `version = "53"`** → `85fa53a4` |
+| ciris-persist (wheel floor) | `>=52.0.2,<53` | **`>=53.0.1,<54`** (never the 53.0.0 retraction leak) |
+| CIRISVerify (`ciris-keyring`, `ciris-crypto`, `ciris-verify-core`) | `tag = "v18.0.0"` | **`tag = "v19.0.0"`** (one `ciris-verify-core` in the graph) |
+| `REPLICATION_POLICY_HASH` (persist) | — | **`1860451cf166879431dadf433422f6fdb43a911b5c889b0f55ca491262393869`** (persist S1) |
+| `CONSENT_GRAMMAR_HASH` (persist) | — | **`4d473eac6f2bfde1a78b01e9a2ac8442fc9adb5207c7adeb51d509215b79e843`** (persist S1) |
+| `SERVE_ADVERTISE_POLICY_HASH` (edge) | `e3070d53…` | **`68c5298b4bb48bbf8ffdb7ef881b71386b3db6ba8c6026b8bb61ec454ebe3850`** |
+| `DIRECTORY_ABI_VERSION` | 7 | 7 (the `DirectoryOp` digest moved: `TrustDirectionHeldAmong`) |
+
+**Riders:** re-pin the three hashes; set the host's real `device_class` at every provisioning site
+(below); infrastructure communities must be founded under a `substrate_persist` key unless Rooted.
+
+## Who receives what: persist S1 is the only audience resolver (#761)
+
+Every send and receive decision on the serve gate (advertise and fetch) goes through persist's
+`replication_audience::may_receive` (cohort kinds) and `may_receive_group_plane` (membership planes,
+with `live_invitees_of`). Group records and all five membership planes are gated; key-grant sets reach
+a device only through the audience, never just because they name it. Edge's own `is_public_group`
+stand-in and its proposal/reply audience checks (#955/#756) are retired. Edge keeps only the transport
+carve: under first contact, a ceremony row that persist says refers to the stranger may reach them
+before rooting.
+
+- **Node class decides self/family reach.** Personal (`phone` | `laptop`) devices get all the owner's
+  cohorts; server-class (`server` | `embedded` | `service` | `agent`) nodes get no self/family content,
+  though the owner's rooms still reach them (CC 3.3.7). An owned node with no live occurrence gets no
+  self content.
+- **Public groups.** A community is public only if it is Rooted, or if `cohort_subkind ==
+  infrastructure` AND its key record carries `substrate_persist` on the serving node (SecReview F2).
+  The accord family, the deployment's WA family and conferring families stay public.
+- **Membership ceremony.** A proposal reaches every node of the invitee's person; an acceptance or
+  decline reaches the proposer's nodes; `affiliations`-scoped room proposals count as live invitations.
+
+## Device class follows the hardware (#799)
+
+`provision_engine_occurrence` used to compare only keys, so every node first provisioned as `server`
+stayed `server` forever. Under S1 that would have cut people off from their own self/family content
+on their own phones and laptops.
+
+- Same keys, different class → re-signed and published with the new class, keeping `valid_until`, and
+  reported as `Provisioned::Reclassed { from, to }`. Different keys → still `Drifted`, untouched. An
+  unknown class is refused.
+- `ensure_content_occurrence` (the split-node path) reclasses an unsigned row the same way. A row
+  signed by its OWNER with a different class returns non-error `Provisioned::ReclassNeedsSigner { from,
+  to }` and is left untouched (only the owner can re-issue it; logged once). A device reclassed into
+  its owner's self audience gets the self keys already held, so files published while it was
+  mislabelled open after the reclass.
+
+## File keys: one per (stream, epoch) (#797, #791; persist #969)
+
+- The `key_grant:stream:v1` plane is replicated, emitted and wakes a parked pull. Manifest v4 carries a
+  per-chunk epoch and the pull adopts each chunk at it (an adopt batch never crosses an epoch). v2 DAGs
+  still pull and read (end-to-end witness via persist's test-only v2 writer).
+- Each epoch ends in a zero-length terminator chunk (seq 2^62 + epoch): fetched, adopted and served;
+  counted in receipt K; skipped by `FileRow::chunks()`; an empty extent at the end of the range layout.
+- One `sealed_dag_readiness(sha, own_key_id, aad)` call replaces the per-chunk grant probe, for v2 and
+  v4 alike.
+- `blob_chunk_key_not_yet_granted` is `GroupContentError::ChunkKeyPending` /
+  `UnopenedReason::AwaitingKey` (`is_pending()`): wait, don't deny. A wrong-AAD read of a v4 DAG is
+  `SealMismatch`.
+- The `holds_bytes` carrier is matched exactly: `^holds_bytes:sha256:[0-9a-f]{8}$`.
+
+The per-chunk key-grant stream (~2.4 sets/s) that bounded time-to-readable for big files is gone.
+
+## Durability at every tier (#763, CC 6.1.5.3)
+
+- A completed self/family pull files this node's `custody:ack:v1` `here` through persist's door, under
+  the row's AAD (a DAG only once every chunk is held).
+- A 15-minute durability sweep (`PullConfig.durability_interval`; `None` disables it) re-files stale
+  `here`, files `none` for a lost copy, and repairs rarest-first over persist's deficit. It repairs a
+  lost chunk and a whole lost file (eviction keeps the key grants).
+- Self/family holdings are announced to, and holding claims admitted from, persist's cohort audience
+  only. Full holding below 26 audience nodes, tuple at 26 and above. A server-class node leaves its
+  owner's self files alone.
+- **Retraction holds on every holder.** A custody report is a holding, never a reference: persist
+  v53.0.1 stops counting it as a content binding, and edge's `referenced_shas` and revocation register
+  skip it. So a withdrawn file reads `Withdrawn` on every device that reported `here`, and the chunk
+  source refuses peers `Withdrawn`. Edge never files or repairs `here` for a withdrawn file.
+  New counter: `blob_serve_refusals["withdrawn"]` (`observability::BLOB_SERVE_REFUSED_WITHDRAWN`).
+
+## Build standing on both planes (#786, #793; CIRISVerify 19)
+
+`bundle_gate` evaluates a pipeline's standing as CC 3.1.2.1 requires, from the READER's trust root:
+persist's capability walk first (`PipelineBlessing::conferred`, Delegation or FamilyQuorum; the walk's
+AccordCoScrub maps to `accord_role`), then the accord co-scrub (`is_infra_attest_effective` →
+`accord_role`). It refuses only when both say no (`BundleGateRefusal::PipelineWithoutStanding`). A
+cached verdict now keeps only the bytes' verification and re-checks standing at every use, so a
+withdrawn grant or a dropped root reaches a cached peer (#793). Verify 19 moved the pipeline's key id
+into the manifest's signed row; the old read would have refused every v19 bundle as malformed.
+
+## Rust surface (breaking)
+
+- `RootingDirectory::verify_peer_build_bundle(reader_key_id, presenter_key_id, bytes)`,
+  `gated_save_provenance(…, key_id, reader_key_id, …)`, `verify_bundle_with_directory_rows(…,
+  &PipelineBlessing)`; new `bundle_gate::pipeline_blessing`; removed `verify_key_record_from_row`.
+- `BundleGateRefusal`: −`MalformedPipelineRecord`, −`NoAccordAnchors`, +`PipelineWithoutStanding`;
+  now `#[non_exhaustive]`.
+- `content_occurrence::Provisioned` gains `Reclassed`, `ReclassNeedsSigner`; now `#[non_exhaustive]`.
+- New (additive): `GroupContentError::ChunkKeyPending`, `UnopenedReason::AwaitingKey`,
+  `PullConfig::durability_interval`, `BlobPuller::durability_sweep`, `blob_serve_refusals`.
+
+## Known, open
+
+- #771: a withdrawn DAG's chunks are refused only where the revocation register is armed (every
+  production chunk source is); full eviction of a withdrawn DAG's chunks needs persist's chunk→manifest
+  link (CIRISPersist#979).
+- #800: an intermittent 240 s stall in the family-files forwarder leg (2/2 pass on re-run).
+- #801: witness the withdrawn-serve counter at the responder, not by calling `EdgeMetrics` directly.
+- #796: first contact with an offline peer still dials every plane once.
+
 # v39.1.0 — a peer with no route is backed off, per peer and through every kick, instead of retried twice a second
 
 **2026-10-02** (PR #795, CIRISEdge#794). **MINOR** from v39.0.0: additive only, so a host adopts it with
