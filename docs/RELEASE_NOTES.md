@@ -1,5 +1,36 @@
 # CIRISEdge Release Notes
 
+# v40.0.1 — six durability fixes from the v40.0.0 review: outsider claims, unread audiences, repair counts, withdrawn files, a blocking sweep, and an unbounded room
+
+**2026-10-04.** **PATCH** from v40.0.0. Same pins (persist v53.0.1, verify v19.0.0), no API change.
+Ladder triple: **edge v40.0.1 · persist v53.0.1 · verify v19.0.0**. Adopt this rather than v40.0.0.
+
+A review of the v40.0.0 PR (#802) found six defects in the #763 self/family durability code:
+
+- **An outsider's self/family holding claim was counted** on a runtime with no scope table (the default
+  `SwarmRuntimeOptions`): the gate's unarmed `Announce` ran before the cohort decision. Self/family
+  holdings are now decided by persist's cohort audience first, with or without a table, and are
+  withheld when there's no directory to ask (CC 5.2: delivered, never discovered). The "no table means
+  open" default still holds for the tiers the table governs: federation, community, unknown scope.
+- **An unreadable cohort audience fell through to the tuple's eviction.** The converger's target is
+  now `Full(n)` / `Tuple` / `Unknown`, and `Unknown` keeps the content for that tick.
+- **A fully held file asked for repair forever.** The full-holding target compared `SignatureOnly`
+  claims, weighted at half a holder (the #582 weighting, which guards deletes), against the audience
+  size, and left out the local copy. It now counts each signed holder once, plus the local copy.
+- **A withdrawn cohort file was kept or repaired.** The full-holding branch ran before consent; a
+  `Revoked` content now skips it, so `EjectHardDelete` stays its retry path.
+- **The durability sweep blocked the puller.** It ran inline in the receive loop, so on a large drive
+  new rows were dropped (the bounded sink filled) and retries and key wakes waited. It now runs as its
+  own task, one at a time.
+- **A room past 4096 files was never fully swept.** The bounded sweep restarted every room at its
+  head. It now saves its room and page cursor and resumes there, wrapping around.
+
+Witnesses: `a_cohort_claim_is_refused_from_an_outsider_without_a_scope_table_802`,
+`a_fully_held_cohort_content_is_kept_not_repaired_802`,
+`a_revoked_cohort_content_is_not_kept_by_the_full_holding_branch_802`,
+`the_durability_pass_rolls_past_its_file_budget_802`. Each fails with its fix reverted. The unread-audience
+case has no direct witness (no failing-directory double exists).
+
 # v40.0.0 — persist v53 + CIRISVerify 19: one audience resolver, stream-epoch file keys, durability at every tier, device classes that follow the hardware, and build standing on both planes
 
 **2026-10-03.** **MAJOR** from v39.1.0. Ladder triple: **edge v40.0.0 · persist v53.0.1 · verify v19.0.0**.
