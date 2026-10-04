@@ -928,3 +928,47 @@ async fn a_withdrawn_file_is_refused_to_peers_despite_this_devices_custody_repor
         "withdrawn"
     );
 }
+
+/// **CIRISEdge#802 review — the bounded durability pass ROLLS through a
+/// room larger than its budget.** In test builds a pass reads pages of 2
+/// and stops once it has read 3 files. alice's laptop holds five self
+/// files: the first pass reads four (two pages) and saves its place; the
+/// second resumes there and reaches the fifth, which a pass restarting at
+/// the room's head every time never did (so a room past the budget had its
+/// tail permanently excluded from custody refresh and repair). Fails with
+/// the pass restarting each room at `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_durability_pass_rolls_past_its_file_budget_802() {
+    let (alice, node_a, _node_b) = two_devices().await;
+    let edge_a = edge_of(&node_a);
+    let puller_a = puller_of(&node_a, &edge_a);
+    let mut shas = Vec::new();
+    for seed in 0..5u32 {
+        shas.push(
+            publish_self_file_seeded(&node_a, &alice, 0x0802_0000 + seed)
+                .await
+                .sha,
+        );
+    }
+    let first = puller_a.durability_sweep().await;
+    assert_eq!(
+        first.reported_here.len(),
+        4,
+        "the first pass stops after two pages (budget 3): {} reported",
+        first.reported_here.len()
+    );
+    let second = puller_a.durability_sweep().await;
+    let mut reached: Vec<[u8; 32]> = first.reported_here.clone();
+    reached.extend(second.reported_here.iter().copied());
+    for sha in &shas {
+        assert!(
+            reached.contains(sha),
+            "every file is reached within two passes; {} was not",
+            hex::encode(sha)
+        );
+    }
+    assert!(
+        !second.reported_here.is_empty(),
+        "the second pass resumed past the first pass's stop, not at the room's head"
+    );
+}

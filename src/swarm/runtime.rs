@@ -1241,21 +1241,41 @@ async fn run_converger(
     }
 }
 
-/// CIRISEdge#763 (CC 6.1.5.3) — the audience size of a `self`/`family`
-/// content when its target is FULL holding (persist's `durability_mode`
-/// below `N + K`), else `None` (the tuple governs, or the content is not at
-/// a cohort-delivered tier, or its audience is not enumerable). The audience
-/// is persist's `audience_nodes` over the content's federation group key.
+/// CIRISEdge#763 (CC 6.1.5.3) — what governs a content's holding target.
+///
+/// CIRISEdge#802 review: an unreadable audience is its own answer, never
+/// folded into "the tuple governs". For a `self`/`family` content, the tuple
+/// path can evict, while the true policy may be that every audience node
+/// keeps a full copy, so a transient directory error must retain rather
+/// than fall through to an eviction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CohortTarget {
+    /// Full holding: every node of an audience of this size holds the whole
+    /// content (persist's `durability_mode` below `N + K`).
+    Full(u32),
+    /// The tuple governs: not a cohort-delivered tier, or an audience at or
+    /// above `N + K`, or not enumerable as nodes.
+    Tuple,
+    /// A `self`/`family` content whose audience could not be read: keep it,
+    /// decide nothing.
+    Unknown,
+}
+
+/// CIRISEdge#763 (CC 6.1.5.3) — the holding target of a content. The
+/// audience is persist's `audience_nodes` over the content's federation
+/// group key; see [`CohortTarget`].
 async fn full_holding_audience(
     holdings: &Arc<dyn FountainHoldingsSource>,
     directory: &dyn FederationDirectory,
     content_id: &str,
-) -> Option<u32> {
+) -> CohortTarget {
     use crate::blob_swarm::ContentScope;
     use crate::cohort_scope::CohortScope;
     use crate::scope_room::ScopeRoom;
     use ciris_persist::federation::types::cohort_scope as cs;
-    let content = holdings.content_scope(content_id)?;
+    let Some(content) = holdings.content_scope(content_id) else {
+        return CohortTarget::Tuple;
+    };
     let (token, key) = match (&content, ScopeRoom::from_content_scope(&content)) {
         (
             ContentScope::Group {
@@ -1271,7 +1291,7 @@ async fn full_holding_audience(
             },
             Some(ScopeRoom::Family { family_key_id }),
         ) => (cs::FAMILY, family_key_id),
-        _ => return None,
+        _ => return CohortTarget::Tuple,
     };
     match ciris_persist::federation::replication_audience::audience_nodes(
         directory,
@@ -1284,16 +1304,17 @@ async fn full_holding_audience(
             if crate::blob_swarm::target_mode(n.len())
                 == ciris_persist::federation::durability::DurabilityMode::Full =>
         {
-            u32::try_from(n.len()).ok()
+            u32::try_from(n.len()).map_or(CohortTarget::Unknown, CohortTarget::Full)
         }
-        Ok(_) => None,
+        Ok(_) => CohortTarget::Tuple,
         Err(e) => {
             tracing::debug!(
                 content_id,
                 error = %e,
-                "swarm_runtime.converger: the cohort audience is unreadable — the tuple governs"
+                "swarm_runtime.converger: the cohort audience is unreadable — keeping the \
+                 content this tick (CIRISEdge#802 review: never evict on an unread audience)"
             );
-            None
+            CohortTarget::Unknown
         }
     }
 }
@@ -1448,22 +1469,54 @@ async fn converger_tick(
         // tuple's eject-above-target never applies and the target is the
         // audience itself. Below it the content needs repair; at it, it is
         // kept. At `N + K` or more the tuple below governs as before.
-        if let Some(audience) = full_holding_audience(holdings, directory, &content_id).await {
-            if let Some(sink) = sink {
-                sink(if observed_count < audience {
-                    SwarmEvent::RepairNeeded {
-                        content_id: content_id.clone(),
-                        observed_holders: observed_count,
-                        min_viable: audience,
+        //
+        // CIRISEdge#802 review, three corrections:
+        // - A REVOKED content skips this branch, so the generic policy's
+        //   `EjectHardDelete` below stays its retry path; full holding
+        //   never asks to repair a withdrawn file.
+        // - The full-holding target counts HOLDERS, not weighted claim
+        //   equivalents: the weighting guards deletes, and repair is not a
+        //   delete. The local node's own copy counts too, since the publish
+        //   path never claims to itself; inbound claims are already bounded
+        //   to the audience by `claim_admission`.
+        // - An unreadable audience keeps the content this tick, rather than
+        //   falling through to the tuple's eviction.
+        if consent != ConsentState::Revoked {
+            match full_holding_audience(holdings, directory, &content_id).await {
+                CohortTarget::Full(audience) => {
+                    let local_holds = local_by_content.contains_key(&content_id)
+                        && !all_claims.iter().any(|c| c.peer_id == local_peer_id);
+                    // `all_claims` excludes `Unverified` (no valid signature);
+                    // every other claim is one holder.
+                    let claimed = u32::try_from(all_claims.len()).unwrap_or(u32::MAX);
+                    let holders = claimed.saturating_add(u32::from(local_holds));
+                    if let Some(sink) = sink {
+                        sink(if holders < audience {
+                            SwarmEvent::RepairNeeded {
+                                content_id: content_id.clone(),
+                                observed_holders: holders,
+                                min_viable: audience,
+                            }
+                        } else {
+                            SwarmEvent::Keep {
+                                content_id: content_id.clone(),
+                                observed_holders: holders,
+                            }
+                        });
                     }
-                } else {
-                    SwarmEvent::Keep {
-                        content_id: content_id.clone(),
-                        observed_holders: observed_count,
+                    continue;
+                }
+                CohortTarget::Unknown => {
+                    if let Some(sink) = sink {
+                        sink(SwarmEvent::Keep {
+                            content_id: content_id.clone(),
+                            observed_holders: observed_count,
+                        });
                     }
-                });
+                    continue;
+                }
+                CohortTarget::Tuple => {}
             }
-            continue;
         }
 
         // CIRISEdge#184 (v6.3.0) — diversity refinement on top of
@@ -2502,6 +2555,105 @@ mod tests {
         );
         drop(g);
         rt.shutdown().await;
+    }
+
+    /// One converger tick over a single `self` content of alice's, held by
+    /// her phone (the local node, the whole of her self audience: her
+    /// server-class node is outside it), which has also claimed it once
+    /// `SignatureOnly`. Returns the events the tick emitted.
+    async fn full_holding_tick_802(
+        revocations: Option<&crate::blob_swarm::RevocationRegister>,
+        content_id: &str,
+    ) -> Vec<SwarmEvent> {
+        use crate::swarm::scope::tests::cohort_directory_763;
+        const PHONE: &str = "node-alice-phone";
+        let holdings: Arc<dyn FountainHoldingsSource> = Arc::new(ScopedHoldings {
+            held: vec![held(content_id, vec![1, 2])],
+            scopes: BTreeMap::from([(
+                content_id.to_string(),
+                ContentScope::Group {
+                    scope: CohortScope::SelfOnly,
+                    group_id: "person-alice".to_string(),
+                },
+            )]),
+        });
+        let dir = cohort_directory_763().await;
+        let observed = Arc::new(RwLock::new(ObservedClaims::default()));
+        observed.write().await.upsert(
+            FountainHoldingClaim::new(PHONE, content_id, vec![1, 2], 1_700_000_000),
+            HoldingClaimVerification::SignatureOnly,
+        );
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: SwarmRuntimeEventSink = {
+            let events = Arc::clone(&events);
+            Arc::new(move |e| events.lock().expect("events").push(e))
+        };
+        converger_tick(
+            &observed,
+            &holdings,
+            &*dir,
+            &SwarmRuntimeConfig::default(),
+            Some(&sink),
+            PHONE,
+            &crate::swarm::diversity::NullRttObserver,
+            revocations,
+        )
+        .await;
+        let out = events.lock().expect("events").clone();
+        out
+    }
+
+    /// **CIRISEdge#802 review — the full-holding target counts holders.**
+    /// alice's self audience is one node, her phone, and it holds the
+    /// content. Her one `SignatureOnly` claim weighs half a holder-equivalent
+    /// (the #582 weighting, which guards DELETES), so the tick used to
+    /// compare 0 holders against an audience of 1 and ask for repair on every
+    /// tick, forever. Repair is not a delete: the target counts each holder
+    /// once, so the fully held content is kept. Fails with the branch
+    /// comparing `weighted_holder_equivalents` again.
+    #[tokio::test]
+    async fn a_fully_held_cohort_content_is_kept_not_repaired_802() {
+        let events = full_holding_tick_802(None, "c-full").await;
+        assert!(
+            events.iter().any(|e| matches!(e,
+                SwarmEvent::Keep { content_id, observed_holders: 1 } if content_id == "c-full")),
+            "the whole audience holds it: Keep with 1 holder, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SwarmEvent::RepairNeeded { .. })),
+            "a fully held content is not repaired: {events:?}"
+        );
+    }
+
+    /// **CIRISEdge#802 review — a REVOKED cohort content is not repaired.**
+    /// The same content, its every reference withdrawn (the revocation
+    /// register reads `Revoked`). The full-holding branch used to run before
+    /// consent was consulted and emitted `Keep`/`RepairNeeded`, skipping the
+    /// generic policy whose `EjectHardDelete` is the retry path for a
+    /// withdrawn file whose immediate eviction failed. Now it is not handled
+    /// by that branch at all. Fails with the `consent != Revoked` guard
+    /// removed: the branch keeps the revoked content.
+    #[tokio::test]
+    async fn a_revoked_cohort_content_is_not_kept_by_the_full_holding_branch_802() {
+        let sha = [0x5Au8; 32];
+        let content_id = hex::encode(sha);
+        let register = crate::blob_swarm::RevocationRegister::new(64, 64);
+        assert!(register.note_reference(sha, "row-file"));
+        register.note_withdrawn("row-file", &[sha]);
+        assert_eq!(
+            register.consent_for(&content_id),
+            ConsentState::Revoked,
+            "setup: every reference withdrawn"
+        );
+        let events = full_holding_tick_802(Some(&register), &content_id).await;
+        assert!(
+            !events.iter().any(|e| matches!(e,
+                SwarmEvent::Keep { content_id: c, .. } | SwarmEvent::RepairNeeded { content_id: c, .. }
+                    if *c == content_id)),
+            "a revoked content is never kept or repaired by full holding: {events:?}"
+        );
     }
 
     // ─── CIRISEdge#546 — the config plane governs a RUNNING swarm ─────

@@ -1255,6 +1255,16 @@ pub struct BlobPuller<B> {
     /// DAG between two rungs of its ladder always shows a booked retry or a
     /// pull outstanding, never neither (see [`Self::ladder_spent`]).
     dispatched: AtomicUsize,
+    /// CIRISEdge#802 review — where the bounded durability pass stopped:
+    /// the room and the page cursor within it. The next pass resumes there
+    /// and wraps around, so every file in every room is eventually visited,
+    /// rather than only each room's first `MAX_FILES`.
+    durability_resume: Mutex<
+        Option<(
+            crate::scope_room::ScopeRoom,
+            Option<ciris_persist::ceg::AttestationCursor>,
+        )>,
+    >,
 }
 
 /// CIRISEdge#646 — the `scope:source` label for `blob_pull_sources`. A
@@ -1333,6 +1343,7 @@ where
             key_waits: Arc::new(KeyWaits::new(retry_capacity)),
             chunk_keys_missing: Mutex::new(HashMap::new()),
             dispatched: AtomicUsize::new(0),
+            durability_resume: Mutex::new(None),
         })
     }
 
@@ -1365,6 +1376,14 @@ where
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             t
         });
+        // CIRISEdge#802 review — the pass runs as its OWN task. Awaited
+        // inline, a pass over a large drive held this loop for its whole
+        // run: new rows were not received (the bounded sink filled and its
+        // non-blocking offer dropped pulls), and due retries and key-woken
+        // DAGs waited. One pass at a time; a tick that lands while one runs
+        // is skipped. Its repairs are dispatched here when it finishes.
+        let mut sweep_task: Option<tokio::task::JoinHandle<super::durability::DurabilitySweep>> =
+            None;
         loop {
             tokio::select! {
                 () = async {
@@ -1373,10 +1392,26 @@ where
                         None => std::future::pending::<()>().await,
                     }
                 } => {
-                    let sweep = self.durability_sweep().await;
-                    for r in sweep.repairs {
-                        self.dispatched.fetch_add(1, Ordering::SeqCst);
-                        self.dispatch(&limiter, r.row, r.sha, 0);
+                    if sweep_task.is_none() {
+                        let me = Arc::clone(&self);
+                        sweep_task = Some(tokio::spawn(async move { me.durability_sweep().await }));
+                    }
+                }
+                joined = async {
+                    match sweep_task.as_mut() {
+                        Some(task) => task.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    sweep_task = None;
+                    match joined {
+                        Ok(sweep) => {
+                            for r in sweep.repairs {
+                                self.dispatched.fetch_add(1, Ordering::SeqCst);
+                                self.dispatch(&limiter, r.row, r.sha, 0);
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "durability pass task failed"),
                     }
                 }
                 req = rx.recv() => {
@@ -1395,6 +1430,9 @@ where
                     }
                 }
             }
+        }
+        if let Some(task) = sweep_task {
+            task.abort();
         }
         tracing::info!("BlobPuller: sink closed, exiting");
     }
@@ -1583,40 +1621,99 @@ where
     /// node's audience (a server-class node and the owner's self content, CC
     /// 3.3.7) is counted and left alone.
     pub async fn durability_sweep(&self) -> super::durability::DurabilitySweep {
+        // Small in tests, so the rolling scan's budget can be exercised
+        // (CIRISEdge#802 review) without thousands of fixture files.
+        #[cfg(not(test))]
         const PAGE: usize = 64;
+        #[cfg(not(test))]
         const MAX_FILES: usize = 4096;
+        #[cfg(test)]
+        const PAGE: usize = 2;
+        #[cfg(test)]
+        const MAX_FILES: usize = 3;
         let mut out = super::durability::DurabilitySweep::default();
         let now = chrono::Utc::now();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         let mut read = 0usize;
-        for room in self.durability_rooms().await {
-            let mut cursor = None;
-            loop {
-                let page = match crate::files::in_room(
-                    &self.engine,
-                    &room,
-                    &self.local_key_id,
-                    PAGE,
-                    cursor.take(),
-                )
-                .await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(room = %room, error = %e, "durability pass: listing failed");
-                        break;
-                    }
-                };
-                for file in page.files {
-                    read += 1;
-                    self.durability_of_file(&file, now, &mut seen, &mut out)
-                        .await;
+        // CIRISEdge#802 review — a ROLLING bounded scan. Resume where the
+        // last pass stopped (room + page cursor), visit up to `MAX_FILES`,
+        // wrapping round the rooms, and save where this pass stopped. Before,
+        // every pass restarted each room at its first page, so a room past
+        // `MAX_FILES` files (or every room after the shared budget ran out)
+        // was never refreshed or repaired past its head.
+        let rooms = self.durability_rooms().await;
+        let n = rooms.len();
+        let resume = self
+            .durability_resume
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take());
+        let (mut i, mut cursor) = match resume {
+            Some((room, cursor)) => match rooms.iter().position(|r| *r == room) {
+                Some(p) => (p, cursor),
+                None => (0, None),
+            },
+            None => (0, None),
+        };
+        // Entering a room mid-way means its head is still unvisited this
+        // pass, so the cycle ends one room later, back at that head.
+        let cycle = if cursor.is_some() { n + 1 } else { n };
+        let mut next_resume = None;
+        let mut rooms_finished = 0usize;
+        loop {
+            if n == 0 {
+                break;
+            }
+            let room = &rooms[i];
+            let page = match crate::files::in_room(
+                &self.engine,
+                room,
+                &self.local_key_id,
+                PAGE,
+                cursor.take(),
+            )
+            .await
+            {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::warn!(room = %room, error = %e, "durability pass: listing failed");
+                    None
                 }
-                cursor = page.resume;
-                if cursor.is_none() || read >= MAX_FILES {
+            };
+            let page_resume = match page {
+                Some(page) => {
+                    for file in page.files {
+                        read += 1;
+                        self.durability_of_file(&file, now, &mut seen, &mut out)
+                            .await;
+                    }
+                    page.resume
+                }
+                None => None,
+            };
+            if let Some(more) = page_resume {
+                if read >= MAX_FILES {
+                    next_resume = Some((room.clone(), Some(more)));
                     break;
                 }
+                cursor = Some(more);
+                continue;
             }
+            // This room is done. A full cycle (every room visited once) ends
+            // the pass; `seen` keeps a file met twice from being counted
+            // twice.
+            rooms_finished += 1;
+            i = (i + 1) % n;
+            if rooms_finished >= cycle {
+                break;
+            }
+            if read >= MAX_FILES {
+                next_resume = Some((rooms[i].clone(), None));
+                break;
+            }
+        }
+        if let Ok(mut g) = self.durability_resume.lock() {
+            *g = next_resume;
         }
         super::durability::rarest_first(&mut out.repairs);
         tracing::info!(

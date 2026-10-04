@@ -547,12 +547,22 @@ impl HoldingsScopeGate {
     /// So this branch keeps edge's address-table membership — the only
     /// registry edge holds a key for — and the group-key-id seam is
     /// reported upstream rather than faked here.
+    #[allow(clippy::too_many_lines)] // the gate's one decision: arming, scope, authority, verb, in order
     pub async fn admits(
         &self,
         publisher_key_id: &str,
         content: Option<&ContentScope>,
         peer_key_id: &str,
     ) -> HoldingAnnounce {
+        // CIRISEdge#802 review — decided before the arming check, with or
+        // without a table. See `cohort_admits`.
+        if let Some(verdict) = self
+            .cohort_admits(publisher_key_id, content, peer_key_id)
+            .await
+        {
+            return verdict;
+        }
+
         // ARMING — the byte-identical early return. No probe, no await.
         let Some(table) = self.table.as_ref() else {
             warn_holdings_scope_gate_unarmed();
@@ -724,6 +734,59 @@ impl HoldingsScopeGate {
                 }
             }
         }
+    }
+
+    /// CIRISEdge#802 review — a `self`/`family` holding's verdict, or
+    /// `None` for any other content.
+    ///
+    /// These holdings resolve their audience from persist's directory, not
+    /// from the address table (CC 5.2: delivered to the self-collective,
+    /// never discovered; CC 6.1.5.3 / persist S3: bounded to the cohort
+    /// audience). So they must NOT inherit the table's unarmed `Announce`:
+    /// on a runtime started without a table (`SwarmRuntimeOptions::default`)
+    /// that early return admitted an outsider's self/family claim into the
+    /// observed set, where it fed rarity and repair. With no directory to
+    /// ask, the holding is withheld, never announced to an unknown peer.
+    async fn cohort_admits(
+        &self,
+        publisher_key_id: &str,
+        content: Option<&ContentScope>,
+        peer_key_id: &str,
+    ) -> Option<HoldingAnnounce> {
+        let cohort @ ContentScope::Group {
+            scope: CohortScope::SelfOnly | CohortScope::Family,
+            group_id,
+        } = content?
+        else {
+            return None;
+        };
+        let Some(directory) = self.directory.as_deref() else {
+            return Some(HoldingAnnounce::Withhold(HoldingRefusal::DirectoryMissing));
+        };
+        let authority = match holdings_authority(directory, publisher_key_id).await {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(
+                    publisher = %publisher_key_id,
+                    error = %e,
+                    "holdings gate: holdings_authority FAILED — withholding",
+                );
+                return Some(HoldingAnnounce::Withhold(
+                    HoldingRefusal::AuthorityUnresolved,
+                ));
+            }
+        };
+        Some(
+            Self::cohort_audience_verdict(
+                directory,
+                cohort,
+                group_id,
+                cohort.cohort_scope(),
+                authority,
+                peer_key_id,
+            )
+            .await,
+        )
     }
 
     /// CIRISEdge#763 — the `self` / `family` arm of [`Self::admits`]:
@@ -1142,18 +1205,27 @@ pub(crate) mod tests {
 
     // ─── Arming: the no-regression case ───────────────────────────────
 
-    /// A node with NO address table announces everything, including
-    /// content whose scope is unknown AND content that is family-scoped.
-    /// This is the pre-#499 deployment and it must not change.
+    /// A node with NO address table announces everything EXCEPT
+    /// `self`/`family` holdings: content whose scope is unknown, federation
+    /// and community content all announce, as on the pre-#499 deployment.
     ///
     /// v18 PIN — "no table ⇒ default-open" is INTENTIONAL, not an
-    /// oversight: production rides this staged state, and arming is an
-    /// operator OPT-IN (`EdgeBuilder::scope_native_addressing` installs the
-    /// MLS table; the CIRISVerify#259 deriver is shipped). A future "fix"
-    /// that flips this default fail-closed would dark every holding on
-    /// every existing deployment. If you are here to flip it: that is the
-    /// arming event, done by installing the table — not by editing the
-    /// gate.
+    /// oversight, for the tiers the table governs: production rides this
+    /// staged state, and arming is an operator OPT-IN
+    /// (`EdgeBuilder::scope_native_addressing` installs the MLS table; the
+    /// CIRISVerify#259 deriver is shipped). A future "fix" that flips those
+    /// tiers fail-closed would dark every such holding on every existing
+    /// deployment. If you are here to flip them: that is the arming event,
+    /// done by installing the table, not by editing the gate.
+    ///
+    /// CIRISEdge#802 review — `self`/`family` were never the table's to
+    /// open. CC 5.2 makes those bytes delivered to the self-collective and
+    /// never discovered, and CC 6.1.5.3 (persist S3) bounds their holdings
+    /// to the cohort audience, which persist answers from the DIRECTORY with
+    /// no table at all. So they are decided by that audience, armed or not;
+    /// with no directory to ask, they are withheld (`DirectoryMissing`),
+    /// never announced to an unknown peer. Every production runtime has a
+    /// directory.
     #[tokio::test]
     async fn unarmed_gate_announces_everything() {
         let g = HoldingsScopeGate::new(None, None);
@@ -1164,10 +1236,11 @@ pub(crate) mod tests {
                 .admits(publisher, Some(&ContentScope::Federation), OUTSIDER)
                 .await
                 .is_announced());
-            assert!(g
-                .admits(publisher, Some(&family_content()), OUTSIDER)
-                .await
-                .is_announced());
+            assert_eq!(
+                g.admits(publisher, Some(&family_content()), OUTSIDER).await,
+                HoldingAnnounce::Withhold(HoldingRefusal::DirectoryMissing),
+                "a family holding is never announced to an unknown peer (CC 5.2)"
+            );
             assert!(g
                 .admits(publisher, Some(&community_content()), OUTSIDER)
                 .await
@@ -1180,7 +1253,9 @@ pub(crate) mod tests {
     /// turned a directory into a second arming condition. If the early
     /// return were dropped, a directory-wired unarmed node would start
     /// consulting persist and a plain producer's federation content would
-    /// go dark on a deployment that never opted in.
+    /// go dark on a deployment that never opted in. (`self`/`family` are
+    /// not on the table-armed path at all; see
+    /// `unarmed_gate_announces_everything` and CIRISEdge#802.)
     #[tokio::test]
     async fn unarmed_path_is_identical_with_and_without_a_directory() {
         let dir = directory().await;
@@ -1190,7 +1265,6 @@ pub(crate) mod tests {
             for content in [
                 None,
                 Some(ContentScope::Federation),
-                Some(family_content()),
                 Some(community_content()),
             ] {
                 let a = no_dir.admits(publisher, content.as_ref(), OUTSIDER).await;
@@ -1840,5 +1914,42 @@ pub(crate) mod tests {
                 .is_announced(),
             "a community claim is not this gate's"
         );
+    }
+
+    /// **CIRISEdge#802 review — with NO address table, a `self`/`family`
+    /// claim from outside the cohort is still refused.** A runtime started
+    /// with `SwarmRuntimeOptions::default` has no table. The gate's unarmed
+    /// early return (`Announce`) used to run before the cohort arm, so an
+    /// outsider's self/family claim was admitted and fed rarity and repair.
+    /// The cohort audience needs only the directory. Both the inbound claim
+    /// and the outbound announcement are decided by persist's answer here.
+    /// Fails with the cohort decision placed back after the arming check.
+    #[tokio::test]
+    async fn a_cohort_claim_is_refused_from_an_outsider_without_a_scope_table_802() {
+        let dir: Arc<dyn FederationDirectory> = cohort_directory_763().await;
+        let pg = HoldingsPublishGate::new(None, Some(Arc::clone(&dir)), None);
+        let g = HoldingsScopeGate::new(None, Some(dir));
+        for content in [self_content_763(), family_content_763()] {
+            assert!(
+                pg.admit_claim_and_book(ALICE_PHONE, "c-802", Some(&content))
+                    .await
+                    .is_announced(),
+                "{content:?}: alice's phone may claim a holding, table or not"
+            );
+            for outside in [MALLORY_PHONE, ALICE_SERVER] {
+                assert!(
+                    !pg.admit_claim_and_book(outside, "c-802", Some(&content))
+                        .await
+                        .is_announced(),
+                    "{content:?}: with no table, a claim from {outside} is still refused"
+                );
+                assert!(
+                    !g.admits(ALICE_PHONE, Some(&content), outside)
+                        .await
+                        .is_announced(),
+                    "{content:?}: with no table, {outside} is still not told of the holding"
+                );
+            }
+        }
     }
 }
