@@ -243,8 +243,13 @@ impl PersistBlobChunkSource {
     /// chunk, which also drops the file's set — and the bytes are still
     /// read through the gated door per chunk: a held set says only "a
     /// member", never "servable".
-    async fn chunk_in_named_dag(&self, dag: [u8; 32], chunk: [u8; 32], requester: &str) -> bool {
-        use ciris_persist::federation::BlobBody;
+    async fn chunk_in_named_dag(
+        &self,
+        dag: [u8; 32],
+        chunk: [u8; 32],
+        requester: &str,
+    ) -> DagMembership {
+        use ciris_persist::federation::{BlobBody, BlobError};
         let dag_hex = hex::encode(dag);
         // CIRISEdge#736 — the widenings too: a family file's placement on its
         // author's node is the `supersedes` widening its own `self` row, and
@@ -276,7 +281,7 @@ impl PersistBlobChunkSource {
             .lock()
             .is_ok_and(|mut c| c.hit(&dag, &row_ids, &chunk))
         {
-            return true;
+            return DagMembership::Member;
         }
         let mut members: Vec<[u8; 32]> = Vec::new();
         let mut listed = false;
@@ -295,8 +300,16 @@ impl PersistBlobChunkSource {
                 let Some(stream_id) = pointer.stream_id.as_deref() else {
                     continue;
                 };
-                let Ok(listing) = self.engine.stream_chunks(stream_id).await else {
-                    continue;
+                let listing = match self.engine.stream_chunks(stream_id).await {
+                    Ok(l) => l,
+                    // persist v53.1 (#979): a withdrawn DAG's stream refuses
+                    // through the chunk→manifest link. That IS the answer:
+                    // the chunk is in the DAG, and the DAG is withdrawn.
+                    Err(BlobError::Withdrawn { .. }) => {
+                        self.forget_membership(&dag);
+                        return DagMembership::Withdrawn;
+                    }
+                    Err(_) => continue,
                 };
                 if let Some(head) = &listing.stream {
                     let community_agrees = match head.community_key_id.as_deref() {
@@ -327,14 +340,39 @@ impl PersistBlobChunkSource {
                 c.put(dag, row_ids, members, MEMBERSHIP_CACHE_FILES);
             }
             if found {
-                return true;
+                return DagMembership::Member;
             }
         }
-        matches!(
-            self.engine.serve_blob_to_peer(&dag, requester).await,
-            Ok(BlobBody::ChunkDag(manifest)) if manifest.chunks.iter().any(|c| c.sha == chunk)
-        )
+        match self.engine.serve_blob_to_peer(&dag, requester).await {
+            Ok(BlobBody::ChunkDag(manifest)) if manifest.chunks.iter().any(|c| c.sha == chunk) => {
+                DagMembership::Member
+            }
+            // persist v53.1 (#979): the manifest itself is refused Withdrawn.
+            Err(BlobError::Withdrawn { .. }) => {
+                self.forget_membership(&dag);
+                DagMembership::Withdrawn
+            }
+            _ => DagMembership::NotMember,
+        }
     }
+}
+
+/// CIRISEdge#717 / #766 — what the serve gate learns about `(dag, chunk)`.
+///
+/// Three answers, because two of them are refusals with different remedies:
+/// a chunk that is not one of the named DAG's is `ChunkNotInNamedDag` (the
+/// requester named the wrong file); a chunk of a DAG whose every reference
+/// is withdrawn is `Withdrawn` (CC 2.3 at the bytes plane, the one refusal
+/// the fetcher aborts on). Since persist v53.1 (#979) the store answers the
+/// second itself, through the chunk→manifest link, when the DAG's stream
+/// or manifest is read; before this enum that answer was swallowed on the
+/// cold path and reported as the first, while a warm cache reached the serve
+/// door and reported the second: the same door answering two ways.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DagMembership {
+    Member,
+    NotMember,
+    Withdrawn,
 }
 
 #[async_trait::async_trait]
@@ -374,19 +412,33 @@ impl BlobChunkSource for PersistBlobChunkSource {
         // file's chunks would be served on the strength of a judgement about
         // another file. `(sha, sha)` — a whole blob, or a DAG's root — is
         // the file itself and never asks.
-        if chunk_sha256 != blob_sha256
-            && !self
+        if chunk_sha256 != blob_sha256 {
+            match self
                 .chunk_in_named_dag(blob_sha256, chunk_sha256, requesting_peer_key_id)
                 .await
-        {
-            tracing::debug!(
-                blob = %hex::encode(blob_sha256),
-                chunk = %hex::encode(chunk_sha256),
-                peer = %requesting_peer_key_id,
-                "PersistBlobChunkSource: the chunk is not one of the named DAG's chunks in \
-                 this store — refusing ChunkNotInNamedDag (CIRISEdge#717)",
-            );
-            return Err(ChunkSourceRefusal::ChunkNotInNamedDag);
+            {
+                DagMembership::Member => {}
+                DagMembership::Withdrawn => {
+                    tracing::info!(
+                        blob = %hex::encode(blob_sha256),
+                        chunk = %hex::encode(chunk_sha256),
+                        peer = %requesting_peer_key_id,
+                        "PersistBlobChunkSource: the named DAG is withdrawn in this store — \
+                         refusing Withdrawn (CC 2.3 at the bytes plane; persist #979)",
+                    );
+                    return Err(ChunkSourceRefusal::Withdrawn);
+                }
+                DagMembership::NotMember => {
+                    tracing::debug!(
+                        blob = %hex::encode(blob_sha256),
+                        chunk = %hex::encode(chunk_sha256),
+                        peer = %requesting_peer_key_id,
+                        "PersistBlobChunkSource: the chunk is not one of the named DAG's chunks \
+                         in this store — refusing ChunkNotInNamedDag (CIRISEdge#717)",
+                    );
+                    return Err(ChunkSourceRefusal::ChunkNotInNamedDag);
+                }
+            }
         }
         // Serve the CHUNK's sha, not the blob's. Persist stores each
         // chunk as its own content-addressed `federation_blobs` row
