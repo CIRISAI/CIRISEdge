@@ -260,6 +260,8 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
         consensus_protocol: "founder_only".to_owned(),
         policy_blob: None,
         persist_row_hash: String::new(),
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
     };
     let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
         .expect("canonicalize the room");

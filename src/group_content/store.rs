@@ -37,7 +37,34 @@ pub enum GroupContentError {
         /// was one of its CHUNKS (not the manifest), the first chunk in the
         /// range this viewer holds no wrap for. `None` for a whole blob, a
         /// refused manifest, or a refusal the store could not attribute.
+        ///
+        /// CIRISEdge#797 (persist v53) — persist itself now tells a viewer
+        /// authorized on the DAG which chunk's key is missing, as
+        /// [`Self::ChunkKeyPending`]; `NotGranted` is the stranger's refusal,
+        /// on the DAG, and names no chunk.
         chunk: Option<RefusedChunk>,
+    },
+    /// CIRISEdge#797 — **authorized, and a chunk's key has not arrived
+    /// yet.** The viewer holds the DAG's manifest grant, but not the key of
+    /// the chunk named: its own content grant (a v2 DAG) or its stream
+    /// epoch's (a v4 DAG, CIRISPersist#969). persist's
+    /// `blob_chunk_key_not_yet_granted`, RETRYABLE: key sets replicate on
+    /// their own plane, after the bytes, so this is a state to wait through,
+    /// never [`Self::NotGranted`]'s verdict.
+    #[error(
+        "awaiting key: this viewer is authorized on {sha256_hex} but holds no key yet for chunk \
+         seq {} = {} ({key})",
+        chunk.seq,
+        chunk.sha256_hex
+    )]
+    ChunkKeyPending {
+        /// Hex at-rest sha the read targeted (the DAG).
+        sha256_hex: String,
+        /// The chunk whose key is missing.
+        chunk: RefusedChunk,
+        /// The key set to wait for, as persist names it
+        /// (`key_grant:stream:v1 for stream … epoch …`).
+        key: String,
     },
     /// The bytes are not held here.
     #[error("not held: {sha256_hex}")]

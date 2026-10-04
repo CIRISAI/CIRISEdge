@@ -380,6 +380,17 @@ names K's node, so it is reached as `Reach::FirstContact`. Before #756 that reac
 joiner could never consent. #754 added the audience arms (`peer_is_proposal_invitee`,
 `peer_is_reply_proposer`); this section adds the reach half.
 
+**persist 8fcbeb9e (CIRISEdge#761).** Who a ceremony row is addressed to is now persist's
+`replication_audience::may_receive`: a proposal reaches every node whose principals
+(`self_collective::principals_of`) include its invitee, an acceptance or decline the nodes of the
+proposer of the held proposal it answers, and every stage the group's membership-plane audience.
+Edge's own invitee and proposer checks (`peer_is_proposal_invitee`, `peer_is_reply_proposer`,
+`proposal_invites_peer`) are retired. What stays edge's is the transport half: under first contact
+a `membership:proposal|acceptance|decline:v1` row at a `family`/`community` audience that
+`may_receive` admits as **refers-to** crosses the reach and skips the Rooted floor below. A row that
+reaches X only as a member of the group is not first-party and keeps the floor. The text below is
+the pre-v53 statement of the same addressing.
+
 **The rule.** Under `Reach::FirstContact` a node N serving peer X additionally serves exactly two
 row classes, both at a `family` or `community` audience (the group's target), and nothing else:
 
@@ -422,6 +433,16 @@ and no ref is disclosed that the fetch would refuse.
 
 ### 2.5 A group's record reaches its members and live invitees, nobody else (CIRISEdge#758)
 
+**persist v53 S1 (CIRISEdge#761).** The rule below is now persist's
+`replication_audience::may_receive_group_plane(X, scope, group, named)`, called per row by the
+advertise (`list_group_plane_for_peer`) and the fetch twin (`group_plane_fetch_serves`) over the same
+`(scope, group, named)` read (`replication::group_plane`). It covers the record AND the five
+membership planes (revocations, widenings, the listing): a private group's rows reach its members'
+nodes, its live invitees' nodes (full plane history) and the nodes of the member a row names; a public
+group's (`is_public_group`) reach every peer, an unbound requester included. A node is resolved to its
+person through its identity occurrence (`active_identities_for_occurrence`), never the owner-binding
+alone. The text below is the pre-v53 statement of the same rule.
+
 **The rule.** A `Family` or `Community` **record** (the roster declaration itself, not a row at
 its target) is served to a peer X only when X's person, `owner_of(X)` (X itself when unowned), is
 
@@ -430,7 +451,8 @@ its target) is served to a peer X only when X's person, `owner_of(X)` (X itself 
 - **(b) a live invitee:** named in the `subject_key_ids` of a **live** `membership:proposal:v1` into
   that group **held in this node's store** (federation tier, unexpired, not declined by the invitee,
   not withdrawn or recanted by its proposer). The predicate is the one §2.4 serves the proposal row
-  on (`proposal_invites_peer`): the record travels with the invitation, and never ahead of it.
+  on (`proposal_invites_peer`, now persist's `live_invitees_of`): the record travels with the
+  invitation, and never ahead of it.
 
 Anyone else is withheld and booked `group_record_not_member_or_invitee`. It holds on every reach:
 at first contact the invitee gets the record its proposal needs (CC rc6 3.1.3.2 lets it admit the

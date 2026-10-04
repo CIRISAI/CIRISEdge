@@ -141,7 +141,7 @@ impl PullSink {
     /// CIRISEdge#779 — **a key_grant set was admitted.** If it wrote a wrap
     /// to this node, wake the parked DAG pull waiting on it: a content-axis
     /// set names the row (manifest or chunk) it opens, an epoch-axis set the
-    /// epoch. Never blocks and never awaits (the apply path's door, like
+    /// epoch, a stream-axis set (CIRISEdge#797) the stream epoch. Never blocks and never awaits (the apply path's door, like
     /// [`Self::offer`]); the puller's next tick re-pulls each woken DAG once,
     /// from a fresh retry ladder, however many of its grants landed.
     pub fn key_grant_admitted(
@@ -161,6 +161,14 @@ impl PullSink {
             }
             KeyGrantAxis::Epoch { epoch, .. } => {
                 self.key_waits.wake_epoch(*epoch);
+            }
+            // CIRISEdge#797 (persist v53, CIRISPersist#969) — a stream-epoch
+            // set: one per `(stream, epoch)`, opening every chunk of a v4 DAG
+            // sealed at that epoch.
+            KeyGrantAxis::Stream {
+                stream_id, epoch, ..
+            } => {
+                self.key_waits.wake_stream(stream_id, *epoch);
             }
         }
     }
@@ -245,6 +253,12 @@ pub struct PullConfig {
     /// lanes keep fetching. The default comes from the curve in
     /// `tests/bigfile_739.rs` (see [`DEFAULT_DAG_ADOPT_BATCH_CHUNKS`]).
     pub dag_adopt_batch_chunks: usize,
+    /// CIRISEdge#763 (CC 6.1.5.3) — **how often the puller runs a
+    /// durability pass** over this node's `self` and `family` files
+    /// ([`BlobPuller::durability_sweep`]): it re-files a lapsing `here`,
+    /// reports a lost copy `none`, and repairs what this node is missing,
+    /// rarest first. `None` turns the pass off (a host driving it itself).
+    pub durability_interval: Option<Duration>,
 }
 
 /// CIRISPersist#957 — the default adopt batch (see
@@ -257,6 +271,12 @@ pub struct PullConfig {
 /// 1.3× and 3.1× the time at 16. So the default is about half the budget's
 /// chunk count at `files::publish`'s segment size.
 pub const DEFAULT_DAG_ADOPT_BATCH_CHUNKS: usize = 16;
+
+/// CIRISEdge#763 — the default durability pass cadence (see
+/// [`PullConfig::durability_interval`]): well inside the 24 h re-file horizon
+/// ([`CUSTODY_REFRESH`](super::durability::CUSTODY_REFRESH)), and often
+/// enough that a device that lost a copy is repaired within the hour.
+pub const DEFAULT_DURABILITY_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
 /// CIRISEdge#739 — the default `K` (see [`PullConfig::dag_chunks_in_flight`]).
 pub const DEFAULT_DAG_CHUNKS_IN_FLIGHT: usize = 8;
@@ -281,6 +301,7 @@ impl Default for PullConfig {
             dag_chunks_in_flight: DEFAULT_DAG_CHUNKS_IN_FLIGHT,
             dag_bytes_in_flight: DEFAULT_DAG_BYTES_IN_FLIGHT,
             dag_adopt_batch_chunks: DEFAULT_DAG_ADOPT_BATCH_CHUNKS,
+            durability_interval: Some(DEFAULT_DURABILITY_INTERVAL),
         }
     }
 }
@@ -726,6 +747,9 @@ pub fn parse_clear_manifest(
             sha,
             size: c.size,
             seq: c.seq,
+            // A clear manifest is never v4 (stream-keyed, sealed), so no
+            // chunk names a stream epoch (CIRISPersist#969).
+            epoch: None,
         });
     }
     let manifest = ChunkManifest {
@@ -1004,12 +1028,102 @@ pub fn adopt_batch_take(sizes: &[usize], batch_max: usize) -> usize {
     n
 }
 
+/// CIRISEdge#797 — **what a DAG parked on its chunk keys waits for**, from
+/// persist's readiness door's `missing`: the stream epochs a v4 DAG lacks
+/// (woken by their `key_grant:stream:v1` sets), else the rows a v2 DAG lacks
+/// a content wrap for (each chunk, or a v3 child manifest). A DAG names one
+/// shape: persist keys a stream per chunk or per epoch, never both.
+pub(crate) fn awaiting_of(
+    missing: &[ciris_persist::federation::chunk_dag_cascade::orchestrate::MissingChunkKey],
+) -> key_wake::Awaiting {
+    use ciris_persist::federation::chunk_dag_cascade::orchestrate::MissingChunkKey as M;
+    let streams: Vec<(String, u64)> = missing
+        .iter()
+        .filter_map(|m| match m {
+            M::Stream {
+                stream_id, epoch, ..
+            } => Some((stream_id.clone(), *epoch)),
+            _ => None,
+        })
+        .collect();
+    if !streams.is_empty() {
+        return key_wake::Awaiting::Stream(streams);
+    }
+    key_wake::Awaiting::Content(
+        missing
+            .iter()
+            .filter_map(|m| {
+                let hex_sha = match m {
+                    M::Content { chunk_sha256, .. } => chunk_sha256,
+                    M::Child { child_sha256, .. } => child_sha256,
+                    M::Stream { .. } => return None,
+                };
+                let mut sha = [0u8; 32];
+                hex::decode_to_slice(hex_sha, &mut sha).ok().map(|()| sha)
+            })
+            .collect(),
+    )
+}
+
+/// CIRISEdge#797 — **is this persist refusal the wait for a chunk's key?**
+/// `blob_chunk_key_not_yet_granted` (CIRISPersist#969) is persist's typed
+/// RETRYABLE: the viewer is authorized on the DAG and one chunk's key set
+/// (its own content grant at v2, its stream epoch's at v4) has not arrived.
+/// `Some` names what to park on; every other error is `None`, so a
+/// stranger's `blob_not_granted` is never mistaken for a wait.
+#[must_use]
+pub(crate) fn awaiting_key_of(
+    e: &ciris_persist::federation::BlobError,
+) -> Option<key_wake::Awaiting> {
+    use ciris_persist::federation::{BlobError, ChunkKeyRef};
+    let BlobError::ChunkKeyNotYetGranted { key, .. } = e else {
+        return None;
+    };
+    Some(match key {
+        ChunkKeyRef::Stream { stream_id, epoch } => {
+            key_wake::Awaiting::Stream(vec![(stream_id.clone(), *epoch)])
+        }
+        ChunkKeyRef::Content { at_rest_sha256 } => {
+            let mut sha = [0u8; 32];
+            key_wake::Awaiting::Content(
+                hex::decode_to_slice(at_rest_sha256, &mut sha)
+                    .ok()
+                    .map(|()| sha)
+                    .into_iter()
+                    .collect(),
+            )
+        }
+    })
+}
+
 /// One chunk the sealed-DAG walk still has to fetch: its position, its
-/// ciphertext sha, its plaintext size (CIRISEdge#739).
+/// ciphertext sha, its plaintext size (CIRISEdge#739), and the stream epoch
+/// it is adopted at (CIRISEdge#797: the manifest's, for a v4 DAG).
 struct DagWant {
     seq: u64,
     sha: [u8; 32],
     size: u64,
+    epoch: u64,
+}
+
+/// CIRISEdge#797 — **the stream epoch a sealed chunk is adopted at**: the
+/// manifest's own `epoch` for the chunk (a v4, stream-keyed DAG, whose reader
+/// opens the chunk under that epoch's stream grant, CIRISPersist#969), else
+/// the label a one-shot file is written under (a v2 DAG, per-chunk keys).
+#[must_use]
+pub fn chunk_adopt_epoch(manifest_epoch: Option<u64>) -> u64 {
+    manifest_epoch.unwrap_or(crate::group_content::persist_store::STREAM_EPOCH)
+}
+
+/// CIRISEdge#797 — **how many of the waiting chunks (front first) share the
+/// first one's epoch.** Persist's batch adopt takes ONE epoch per call, so a
+/// batch never crosses an epoch: [`adopt_batch_take`]'s count is capped at
+/// this run. Pure, so the rule is a test.
+#[must_use]
+pub fn same_epoch_run(epochs: &[u64]) -> usize {
+    epochs
+        .first()
+        .map_or(0, |first| epochs.iter().take_while(|e| *e == first).count())
 }
 
 /// Why one lane of the sealed-DAG pipeline stopped (CIRISEdge#739).
@@ -1242,8 +1356,29 @@ where
         let mut tick =
             tokio::time::interval(self.config.retry_backoff.max(Duration::from_millis(50)));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // CIRISEdge#763 — the durability pass, on its own slower cadence.
+        let mut durability = self.config.durability_interval.map(|every| {
+            let mut t = tokio::time::interval_at(
+                tokio::time::Instant::now() + every,
+                every.max(Duration::from_secs(1)),
+            );
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        });
         loop {
             tokio::select! {
+                () = async {
+                    match durability.as_mut() {
+                        Some(t) => { t.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let sweep = self.durability_sweep().await;
+                    for r in sweep.repairs {
+                        self.dispatched.fetch_add(1, Ordering::SeqCst);
+                        self.dispatch(&limiter, r.row, r.sha, 0);
+                    }
+                }
                 req = rx.recv() => {
                     let Some(req) = req else { break };
                     for sha in BlobMeaning::referenced_shas(&req.row) {
@@ -1362,29 +1497,8 @@ where
         due
     }
 
-    /// CIRISEdge#779 — the `(seq, sha)` of every chunk this node holds no
-    /// at-rest wrap for: one `get_at_rest_grant` per chunk, the read door's
-    /// own first question (metadata only; nothing is unwrapped or opened).
-    async fn chunks_without_wrap(
-        &self,
-        chunks: &[(u64, [u8; 32])],
-    ) -> Result<Vec<(u64, [u8; 32])>, ciris_persist::federation::BlobError> {
-        let mut missing = Vec::new();
-        for (seq, sha) in chunks {
-            if self
-                .backend
-                .get_at_rest_grant(sha, &self.local_key_id)
-                .await?
-                .is_none()
-            {
-                missing.push((*seq, *sha));
-            }
-        }
-        Ok(missing)
-    }
-
     /// CIRISEdge#779 — record that `sha` is parked with `missing` chunk
-    /// wraps outstanding; `true` when that is fewer than at the last attempt,
+    /// keys outstanding (per chunk at v2, per stream epoch at v4); `true` when that is fewer than at the last attempt,
     /// i.e. the grants are arriving. A first sighting is not progress, so a
     /// memory dropped at the retry ledger's capacity can only spend attempts,
     /// never restart the ladder.
@@ -1445,6 +1559,205 @@ where
             },
         );
         true
+    }
+
+    /// CIRISEdge#763 (CC 6.1.5.3) — **one durability pass** over the `self`
+    /// and `family` files this node's persons can read: the self room of each
+    /// principal behind this node, and every family that principal is an
+    /// active member of, through the drive's own gated listing
+    /// ([`crate::files::in_room`]). For each file whose audience
+    /// ([`durability::row_deficit`](super::durability::row_deficit), persist's
+    /// rule) contains this node:
+    ///
+    /// - held whole, and this node's report is not a live `here` or is older
+    ///   than [`CUSTODY_REFRESH`](super::durability::CUSTODY_REFRESH): `here`
+    ///   is (re-)filed;
+    /// - not held whole (never pulled, or a chunk lost): a live `here` of
+    ///   this node's is corrected to `none`, so the cohort's deficit lists it,
+    ///   and the file is a [`Repair`](super::durability::Repair).
+    ///
+    /// Repairs come back **rarest first**
+    /// ([`rarest_first`](super::durability::rarest_first)); the run loop
+    /// dispatches them in that order, each through [`Self::pull_one`], whose
+    /// holder rung adds the deficit's live holders. A file outside this
+    /// node's audience (a server-class node and the owner's self content, CC
+    /// 3.3.7) is counted and left alone.
+    pub async fn durability_sweep(&self) -> super::durability::DurabilitySweep {
+        const PAGE: usize = 64;
+        const MAX_FILES: usize = 4096;
+        let mut out = super::durability::DurabilitySweep::default();
+        let now = chrono::Utc::now();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let mut read = 0usize;
+        for room in self.durability_rooms().await {
+            let mut cursor = None;
+            loop {
+                let page = match crate::files::in_room(
+                    &self.engine,
+                    &room,
+                    &self.local_key_id,
+                    PAGE,
+                    cursor.take(),
+                )
+                .await
+                {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(room = %room, error = %e, "durability pass: listing failed");
+                        break;
+                    }
+                };
+                for file in page.files {
+                    read += 1;
+                    self.durability_of_file(&file, now, &mut seen, &mut out)
+                        .await;
+                }
+                cursor = page.resume;
+                if cursor.is_none() || read >= MAX_FILES {
+                    break;
+                }
+            }
+        }
+        super::durability::rarest_first(&mut out.repairs);
+        tracing::info!(
+            files = read,
+            repairs = out.repairs.len(),
+            reported_here = out.reported_here.len(),
+            not_in_audience = out.not_in_audience,
+            "durability pass (CIRISEdge#763, CC 6.1.5.3)"
+        );
+        out
+    }
+
+    /// The rooms a durability pass lists: each principal's self room and
+    /// every family that principal is an active member of.
+    async fn durability_rooms(&self) -> Vec<crate::scope_room::ScopeRoom> {
+        let dir: &dyn FederationDirectory = &*self.backend;
+        let principals = match ciris_persist::federation::self_collective::principals_of(
+            dir,
+            &self.local_key_id,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "durability pass: principals unreadable");
+                return Vec::new();
+            }
+        };
+        let mut rooms = Vec::new();
+        for p in &principals {
+            rooms.push(crate::self_room::room(p));
+            match dir.list_families_for_member_active(p).await {
+                Ok(families) => rooms.extend(families.into_iter().map(|f| {
+                    crate::scope_room::ScopeRoom::Family {
+                        family_key_id: f.family_key_id,
+                    }
+                })),
+                Err(e) => tracing::warn!(
+                    principal = %p,
+                    error = %e,
+                    "durability pass: families unreadable"
+                ),
+            }
+        }
+        rooms
+    }
+
+    /// One file of a durability pass — see [`Self::durability_sweep`].
+    async fn durability_of_file(
+        &self,
+        file: &crate::files::FileRow,
+        now: chrono::DateTime<chrono::Utc>,
+        seen: &mut HashSet<[u8; 32]>,
+        out: &mut super::durability::DurabilitySweep,
+    ) {
+        use super::durability::{self, Repair};
+        use ciris_persist::federation::custody_ack::{
+            device_custody_of, CustodyState, CustodyVerdict,
+        };
+        let me = self.local_key_id.as_str();
+        let dir: &dyn FederationDirectory = &*self.backend;
+        let Ok(sha) =
+            <[u8; 32]>::try_from(hex::decode(&file.pointer.content_sha256).unwrap_or_default())
+        else {
+            return;
+        };
+        if !seen.insert(sha) {
+            return;
+        }
+        let Ok(Some(row)) = dir.get_attestation(&file.attestation_id).await else {
+            return;
+        };
+        if !durability::is_cohort_delivered(&row) {
+            return;
+        }
+        let blob = hex::encode(sha);
+        let deficit = match durability::row_deficit(dir, &row, &sha, now).await {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::debug!(blob = %blob, error = %e, "durability pass: deficit unreadable");
+                return;
+            }
+        };
+        if !durability::audience_of(&deficit).is_some_and(|a| a.iter().any(|n| n == me)) {
+            out.not_in_audience += 1;
+            return;
+        }
+        let whole = match durability::holds_whole(
+            &self.engine,
+            &*self.backend,
+            me,
+            &row,
+            &sha,
+            &file.pointer,
+        )
+        .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::debug!(blob = %blob, error = %e, "durability pass: holding unreadable");
+                return;
+            }
+        };
+        let mine = device_custody_of(dir, me, &deficit.sha256_hex, None, now)
+            .await
+            .ok();
+        let live_here = mine
+            .as_ref()
+            .is_some_and(|c| c.state == CustodyVerdict::Here);
+        let fresh = mine
+            .as_ref()
+            .and_then(|c| c.reported_at)
+            .is_some_and(|at| now.signed_duration_since(at) < durability::CUSTODY_REFRESH);
+        let report = match (whole, live_here) {
+            // Held, reported, and the report is recent: nothing to do.
+            (true, true) if fresh => return,
+            (true, _) => Some(CustodyState::Here),
+            // The copy this node reported is gone: say so, so the cohort's
+            // deficit lists this node until it is repaired.
+            (false, true) => Some(CustodyState::None),
+            (false, false) => None,
+        };
+        if let Some(state) = report {
+            match durability::file_custody(&self.engine, &row, &sha, &file.pointer, state).await {
+                Ok(_) if state == CustodyState::Here => out.reported_here.push(sha),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    blob = %blob,
+                    state = state.as_str(),
+                    error = %e,
+                    "durability pass: custody report not filed"
+                ),
+            }
+        }
+        if !whole {
+            out.repairs.push(Repair {
+                row,
+                sha,
+                live_here: deficit.live_here.into_iter().filter(|n| n != me).collect(),
+            });
+        }
     }
 
     /// **The sequence**, for one blob one row references. Public so a test
@@ -1565,6 +1878,27 @@ where
         self.edge
             .metrics()
             .inc_blob_pull_source(pull_source_tag(key_plane.cohort_scope(), true));
+        // CIRISEdge#763 (CC 6.1.5.3) — and every audience node with a live
+        // `here`: a repair pulls from whichever of the cohort's own devices
+        // still holds the file, not only from the author's (which may be the
+        // one that lost it). Bounded to the audience by persist's deficit, so
+        // no node outside the cohort is ever asked.
+        let mut nodes = nodes;
+        match super::durability::row_deficit(&*self.backend, row, &sha, chrono::Utc::now()).await {
+            Ok(deficit) => {
+                for holder in deficit.live_here {
+                    if !nodes.contains(&holder) {
+                        nodes.push(holder);
+                    }
+                }
+            }
+            Err(e) => tracing::debug!(
+                blob = %hex::encode(sha),
+                error = %e,
+                "self/family pull: the durability deficit is unreadable — asking the \
+                 author's nodes only (CIRISEdge#763)"
+            ),
+        }
         let others: Vec<String> = nodes
             .into_iter()
             .filter(|k| *k != self.local_key_id)
@@ -1592,6 +1926,12 @@ where
             match self.backend.blob_head(&sha).await {
                 Ok(Some(h))
                     if h.storage_kind == "inline" && h.crypto_tier != CryptoTier::Plaintext => {}
+                // CIRISEdge#763 — a promoted sealed DAG is held only if every
+                // chunk is; the DAG walk asks persist's readiness door and
+                // REPAIRS the chunks this node lost (CC 6.1.5.3). The
+                // readiness check there decides the repair, not this arm.
+                Ok(Some(h))
+                    if h.storage_kind == "chunk_dag" && h.crypto_tier != CryptoTier::Plaintext => {}
                 Ok(_) => return PullOutcome::AlreadyHeld,
                 Err(e) => return PullOutcome::StoreFailed(format!("blob_head: {e}")),
             }
@@ -1713,7 +2053,56 @@ where
             &self.edge.metrics(),
         )
         .await;
+        self.report_here(row, sha, meaning, &outcome).await;
         outcome
+    }
+
+    /// CIRISEdge#763 (CC 6.1.5.3, 3.1.3.3) — **a completed self/family pull
+    /// files this node's `here`**, so the cohort can count the copy and the
+    /// durability deficit stops listing this node. Acts on `Stored` only, and
+    /// only at `self` / `family` (the tiers whose copies are otherwise
+    /// unobservable: no `holds_bytes` at any audience, CC 5.2). For a chunk
+    /// DAG `here` means the manifest and every chunk
+    /// ([`durability::file_custody`](super::durability::file_custody)), so the
+    /// `Stored` a chunk repair ends in re-files it for the whole DAG. A
+    /// refused report is logged by name and changes nothing about the pull.
+    async fn report_here(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        meaning: &BlobMeaning,
+        outcome: &PullOutcome,
+    ) {
+        if !matches!(outcome, PullOutcome::Stored { .. })
+            || !super::durability::is_cohort_delivered(row)
+        {
+            return;
+        }
+        let Some(pointer) = meaning.pointer() else {
+            return;
+        };
+        match super::durability::file_custody(
+            &self.engine,
+            row,
+            &sha,
+            pointer,
+            ciris_persist::federation::custody_ack::CustodyState::Here,
+        )
+        .await
+        {
+            Ok(report) => tracing::info!(
+                blob = %hex::encode(sha),
+                attestation_id = %row.attestation_id,
+                report = %report,
+                "custody `here` filed for a pulled file (CIRISEdge#763, CC 3.1.3.3)"
+            ),
+            Err(e) => tracing::warn!(
+                blob = %hex::encode(sha),
+                attestation_id = %row.attestation_id,
+                error = %e,
+                "custody `here` NOT filed for a pulled file (CIRISEdge#763)"
+            ),
+        }
     }
 
     /// **The whole-blob pull with a caller's fetcher** (CIRISEdge#738) — the
@@ -2003,6 +2392,8 @@ where
             &self.edge.metrics(),
         )
         .await;
+        // CIRISEdge#763 — and its custody report, for the whole DAG.
+        self.report_here(row, sha, meaning, &outcome).await;
         outcome
     }
 
@@ -2191,10 +2582,31 @@ where
             }
             Err(e) => return PullOutcome::StoreFailed(format!("open_sealed_manifest_as: {e}")),
         };
-        if view.storage_kind == "chunk_dag" {
-            // Promoted under us (a concurrent pull, or a second offer of the
-            // same row after completion): the file is here.
-            return PullOutcome::AlreadyHeld;
+        // Promoted already (a concurrent pull, a second offer of the same
+        // row after completion, or a durability repair): the file is here iff
+        // every chunk is. CIRISEdge#763 (CC 6.1.5.3) — a chunk this node lost
+        // is fetched again below, the held ones skipped, and the DAG is
+        // reported `Stored` once it is whole again, so a repair re-files the
+        // node's `here` for the WHOLE DAG.
+        let repairing = view.storage_kind == "chunk_dag";
+        if repairing {
+            match self
+                .engine
+                .sealed_dag_readiness(&sha, &self.local_key_id, Some(&aad))
+                .await
+            {
+                Ok(r) if r.held => return PullOutcome::AlreadyHeld,
+                Ok(r) => tracing::info!(
+                    blob = %blob_hex,
+                    attestation_id = %row.attestation_id,
+                    not_held = ?r.not_held,
+                    "DAG repair: the promoted DAG is missing chunks here — fetching them \
+                     (CIRISEdge#763)"
+                ),
+                Err(e) => {
+                    return PullOutcome::StoreFailed(format!("sealed_dag_readiness: {e}"));
+                }
+            }
         }
         let plan = DagPlan::from_sealed_view(&view);
         if let Err(refusal) = check_dag_plan(stream_id, pointer.size, &plan) {
@@ -2214,7 +2626,6 @@ where
         // Every chunk's address is read off the view BEFORE the first request,
         // so a malformed manifest is refused with nothing fetched.
         let mut wanted: Vec<DagWant> = Vec::with_capacity(view.chunks.len());
-        let mut addresses: Vec<(u64, [u8; 32])> = Vec::with_capacity(view.chunks.len());
         let mut skipped_held: u64 = 0;
         for c in &view.chunks {
             let mut want = [0u8; 32];
@@ -2227,7 +2638,6 @@ where
                     },
                 );
             }
-            addresses.push((c.seq, want));
             if held_chunks.get(&c.seq) == Some(&want) {
                 skipped_held += 1;
                 continue;
@@ -2236,6 +2646,7 @@ where
                 seq: c.seq,
                 sha: want,
                 size: u64::from(c.size),
+                epoch: chunk_adopt_epoch(c.epoch),
             });
         }
         // Fetch order is `seq` (CIRISEdge#739, §6.7.5): the file's position
@@ -2324,8 +2735,13 @@ where
             while adopting.len() < adopters
                 && adopt_batch_ready(pending.len(), pending_bytes, fetching.len(), batch_max)
             {
+                // Fetched chunks wait in seq order, so a batch is a run of
+                // positions and an epoch boundary (CIRISEdge#797) ends it.
+                pending.sort_by_key(|(w, _)| w.seq);
                 let sizes: Vec<usize> = pending.iter().map(|(_, b)| b.len()).collect();
-                let take = adopt_batch_take(&sizes, batch_max);
+                let epochs: Vec<u64> = pending.iter().map(|(w, _)| w.epoch).collect();
+                let take = adopt_batch_take(&sizes, batch_max).min(same_epoch_run(&epochs));
+                let epoch = epochs[0];
                 let batch: Vec<(DagWant, Vec<u8>)> = pending.drain(..take).collect();
                 pending_bytes -= sizes[..take].iter().sum::<usize>();
                 batch_peak = batch_peak.max(batch.len());
@@ -2340,12 +2756,7 @@ where
                         .collect();
                     let started = Instant::now();
                     let adopted = engine
-                        .adopt_sealed_chunks(
-                            stream,
-                            &items,
-                            crate::group_content::persist_store::STREAM_EPOCH,
-                            provenance.clone(),
-                        )
+                        .adopt_sealed_chunks(stream, &items, epoch, provenance.clone())
                         .await
                         .map_err(|e| e.to_string());
                     let elapsed = started.elapsed();
@@ -2463,35 +2874,34 @@ where
         }
 
         // ── keyed ── CIRISEdge#779: every chunk opens as THIS NODE before the
-        // file is promoted, reported Stored and receipted (CC 5.3.3.6). At
-        // `self` / `family` each chunk is sealed under its own DEK, and its
-        // wrap to this node is its own content-axis key_grant set, which
-        // arrives after the bytes and in `seq` order, ~2.4 sets/s in the
-        // field. Promoting on the bytes alone reported a 256 MiB file pulled
-        // with 242 of its 1024 chunks unopenable here; the read stopped at
-        // the first. The question is the read door's own (persist's
-        // `open_stream_chunk_row_for_viewer` asks `get_at_rest_grant` of the
-        // chunk row first), asked as metadata, so nothing is decrypted to
-        // answer it. At `community_dek` the chunks share the manifest's
+        // file is promoted, reported Stored and receipted (CC 5.3.3.6). The
+        // key follows the bytes on its own plane: promoting on the bytes
+        // alone reported a 256 MiB file pulled with 242 of its 1024 chunks
+        // unopenable here. CIRISEdge#797 — asked through persist's readiness
+        // door, ONE call for both manifest versions, answered from the grant
+        // rows with no chunk opened: per stream EPOCH for a v4 DAG (one DEK
+        // per `(stream, epoch)`, CIRISPersist#969), per chunk for a v2 one
+        // (persist I314c). At `community_dek` the chunks share the manifest's
         // epoch binding (one provenance per stream, adopted above), so the
         // manifest opening as this node already answered it.
         if pointer.tier == CryptoTier::InvisibleEncrypted {
-            let missing = match self.chunks_without_wrap(&addresses).await {
-                Ok(m) => m,
-                Err(e) => return PullOutcome::StoreFailed(format!("get_at_rest_grant: {e}")),
+            let readiness = match self
+                .engine
+                .sealed_dag_readiness(&sha, &self.local_key_id, Some(&aad))
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return PullOutcome::StoreFailed(format!("sealed_dag_readiness: {e}")),
             };
-            if let Some(&(first_seq, _)) = missing.first() {
-                // Parked on these chunks' wraps: each grant that lands wakes
-                // the pull (coalesced per tick), so giving up on the ladder
-                // below is not giving up on the file.
-                self.key_waits.park(
-                    sha,
-                    row,
-                    key_wake::Awaiting::Content(missing.iter().map(|&(_, c)| c).collect()),
-                );
-                let missing = missing.len() as u64;
+            if !readiness.missing.is_empty() {
+                // Parked on exactly what the door names: each grant that
+                // lands wakes the pull (coalesced per tick), so giving up on
+                // the ladder below is not giving up on the file.
+                let awaiting = awaiting_of(&readiness.missing);
+                let missing = readiness.missing.len() as u64;
+                self.key_waits.park(sha, row, awaiting);
                 // Progress restarts the ladder (and its backoff); bounded,
-                // since `missing` can only fall `chunk_count` times.
+                // since `missing` can only fall as many times as it has keys.
                 let attempts_spent = if self.chunk_keys_progressed(sha, missing) {
                     0
                 } else {
@@ -2505,16 +2915,42 @@ where
                     blob = %blob_hex,
                     attestation_id = %row.attestation_id,
                     stream_id = %view.stream_id,
-                    chunk_count = addresses.len() as u64,
+                    chunk_count = view.chunks.len() as u64,
+                    chunk_keys = readiness.chunk_keys,
                     missing,
-                    first_seq,
                     retrying,
-                    "DAG pull: every chunk is held but this node holds no wrap for some yet — \
-                     not promoted, waiting on their key_grant sets (CIRISEdge#779)"
+                    "DAG pull: every chunk is held but this node holds no key for some yet — \
+                     not promoted, waiting on their key_grant sets (CIRISEdge#779, #797)"
                 );
                 return PullOutcome::DagAwaitingKey { attempts, retrying };
             }
             self.forget_chunk_keys(sha);
+        }
+
+        // ── repaired ── the manifest row is a chunk_dag already; what made
+        // it one was persist's check of every chunk row, and the readiness
+        // door re-asks it of the chunks the repair adopted.
+        if repairing {
+            return match self
+                .engine
+                .sealed_dag_readiness(&sha, &self.local_key_id, Some(&aad))
+                .await
+            {
+                Ok(r) if r.held && r.readable => {
+                    tracing::info!(
+                        blob = %blob_hex,
+                        attestation_id = %row.attestation_id,
+                        stream_id = %view.stream_id,
+                        "DAG repaired: every chunk is held and opens here again (CIRISEdge#763)"
+                    );
+                    PullOutcome::Stored { announced }
+                }
+                Ok(r) => PullOutcome::StoreFailed(format!(
+                    "DAG repair: still not whole after the fetch (not held {:?})",
+                    r.not_held
+                )),
+                Err(e) => PullOutcome::StoreFailed(format!("sealed_dag_readiness: {e}")),
+            };
         }
 
         // ── promoted ── persist checks every chunk row against the manifest.
@@ -2542,7 +2978,18 @@ where
             Err(BlobError::InvalidArgument(detail)) => {
                 self.dag_refused(row, &blob_hex, DagPullRefusal::ChunkMissing { detail })
             }
-            Err(e) => PullOutcome::StoreFailed(format!("promote_adopted_manifest_to_dag: {e}")),
+            // CIRISEdge#797 — persist's typed retryable: this node is
+            // authorized on the DAG and a chunk's key has not landed yet. The
+            // state to wait through, parked on the key it names; never a
+            // refusal and never `NotGranted`.
+            Err(e) => match awaiting_key_of(&e) {
+                Some(awaiting) => {
+                    self.key_waits.park(sha, row, awaiting);
+                    let retrying = self.book_retry(row, sha, attempts);
+                    PullOutcome::DagAwaitingKey { attempts, retrying }
+                }
+                None => PullOutcome::StoreFailed(format!("promote_adopted_manifest_to_dag: {e}")),
+            },
         }
     }
 
@@ -2893,6 +3340,101 @@ mod tests {
         assert_eq!(adopt_batch_take(&[], 16), 0);
     }
 
+    /// CIRISEdge#797 — a batch never crosses a stream epoch (persist's batch
+    /// adopt takes one): the run of the front chunk's epoch caps it. A v4
+    /// chunk is adopted at its manifest epoch; a v2 chunk (no epoch) at the
+    /// label a file is written under.
+    #[test]
+    fn an_adopt_batch_stays_in_one_epoch_and_each_chunk_takes_its_own_797() {
+        assert_eq!(same_epoch_run(&[0, 0, 0, 1, 1]), 3);
+        assert_eq!(same_epoch_run(&[1, 1]), 2);
+        assert_eq!(same_epoch_run(&[2, 0, 2]), 1, "a run, not a count");
+        assert_eq!(same_epoch_run(&[]), 0);
+        assert_eq!(chunk_adopt_epoch(Some(3)), 3, "v4: the manifest's epoch");
+        assert_eq!(
+            chunk_adopt_epoch(None),
+            crate::group_content::persist_store::STREAM_EPOCH,
+            "v2: the one-shot label, as before #969"
+        );
+    }
+
+    /// CIRISEdge#797 — `blob_chunk_key_not_yet_granted` is the wait, parked
+    /// on the key it names (a stream epoch at v4, a chunk's own row at v2);
+    /// a stranger's `blob_not_granted` and every other error are not.
+    #[test]
+    fn a_chunk_key_not_yet_granted_is_a_wait_never_a_refusal_797() {
+        use ciris_persist::federation::{BlobError, ChunkKeyRef};
+        let pending = |key| BlobError::ChunkKeyNotYetGranted {
+            sha256_hex: hex::encode([1u8; 32]),
+            viewer_key_id: "me".into(),
+            seq: 3,
+            chunk_sha_hex: hex::encode([2u8; 32]),
+            key,
+        };
+        let stream = pending(ChunkKeyRef::Stream {
+            stream_id: "file-x".into(),
+            epoch: 1,
+        });
+        assert_eq!(stream.kind(), "blob_chunk_key_not_yet_granted");
+        assert!(matches!(
+            awaiting_key_of(&stream),
+            Some(key_wake::Awaiting::Stream(ref e)) if e == &[("file-x".to_owned(), 1)]
+        ));
+        assert!(matches!(
+            awaiting_key_of(&pending(ChunkKeyRef::Content {
+                at_rest_sha256: hex::encode([2u8; 32]),
+            })),
+            Some(key_wake::Awaiting::Content(ref c)) if c == &[[2u8; 32]]
+        ));
+        let stranger = BlobError::NotGranted {
+            sha256_hex: hex::encode([1u8; 32]),
+            viewer_key_id: "stranger".into(),
+        };
+        assert!(awaiting_key_of(&stranger).is_none());
+        assert!(awaiting_key_of(&BlobError::Backend("x".into())).is_none());
+    }
+
+    /// CIRISEdge#797 — the readiness door's `missing`, as the park reads it:
+    /// a v4 DAG waits on stream epochs (its stream sets wake it), a v2 DAG
+    /// on each chunk row's content wrap (persist I314c's legacy branch).
+    #[test]
+    fn a_dag_parks_on_what_the_readiness_door_names_797() {
+        use ciris_persist::federation::chunk_dag_cascade::orchestrate::MissingChunkKey as M;
+        let v4 = [
+            M::Stream {
+                stream_id: "file-x".into(),
+                epoch: 0,
+                seq_from: 0,
+                seq_to: 1 << 62,
+            },
+            M::Stream {
+                stream_id: "file-x".into(),
+                epoch: 1,
+                seq_from: 3,
+                seq_to: (1 << 62) + 1,
+            },
+        ];
+        assert!(matches!(
+            awaiting_of(&v4),
+            key_wake::Awaiting::Stream(ref e)
+                if e == &[("file-x".to_owned(), 0), ("file-x".to_owned(), 1)]
+        ));
+        let v2 = [
+            M::Content {
+                seq: 3,
+                chunk_sha256: hex::encode([3u8; 32]),
+            },
+            M::Content {
+                seq: 4,
+                chunk_sha256: hex::encode([4u8; 32]),
+            },
+        ];
+        assert!(matches!(
+            awaiting_of(&v2),
+            key_wake::Awaiting::Content(ref c) if c == &[[3u8; 32], [4u8; 32]]
+        ));
+    }
+
     const SHA: [u8; 32] = [0xAB; 32];
 
     /// CIRISEdge#638 item 2 — the declared size, as the field produces it:
@@ -3078,11 +3620,13 @@ mod tests {
                     sha: [1; 32],
                     size: 200,
                     seq: None,
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: [2; 32],
                     size: 100,
                     seq: None,
+                    epoch: None,
                 },
             ],
             chunk_tier: None,
@@ -3109,11 +3653,13 @@ mod tests {
                     sha: [0xAB; 32],
                     size: 200,
                     seq: None,
+                    epoch: None,
                 },
                 ChunkRef {
                     sha: [0xCD; 32],
                     size: 100,
                     seq: None,
+                    epoch: None,
                 },
             ],
             chunk_tier: None,
@@ -3245,7 +3791,7 @@ mod tests {
         let plain = bare_row("federation");
         assert_eq!(sink.offer(&plain), PullOffer::NotAReference);
         let mut holds = bare_row("federation");
-        holds.attestation_type = format!("holds_bytes:sha256:{}", &hex::encode(SHA)[..16]);
+        holds.attestation_type = format!("holds_bytes:sha256:{}", &hex::encode(SHA)[..8]);
         holds.attestation_envelope =
             serde_json::json!({ "kind": "holds_bytes", "evidence_refs": [hex::encode(SHA)] });
         assert_eq!(

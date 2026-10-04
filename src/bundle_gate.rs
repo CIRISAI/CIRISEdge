@@ -25,13 +25,27 @@
 //!   `key_id` (the peer being saved), so a relayed third-party bundle can
 //!   never satisfy this peer's gate
 //!   (`BundleRejection::PresenterKeyMismatch`);
-//! - the **pipeline** member + accord-co-scrubbed `KeyRecord` are the
-//!   directory row named by the carried manifest's `attesting_key_id` (a
-//!   *name* only — all pubkeys and the `infra:attest` blessing come from the
-//!   directory row, and the co-scrub quorum from the anchors);
-//! - the **accord anchors** are the directory's `identity_type =
-//!   'accord_holder'` rows. No rows → refusal (fail-closed; no baked-anchor
-//!   fallback is invented here).
+//! - the **pipeline** member is the directory row named by the carried
+//!   manifest's signed `row.attesting_key_id` (a *name* only — the pubkeys
+//!   come from the directory row);
+//! - the pipeline's **standing** to attest builds (`infra:attest`) is a
+//!   [`PipelineBlessing`] from persist, asked from THIS node's trust root
+//!   ([`pipeline_blessing`]). CC 3.1.2.1 (rc6 22ea349) names two planes and a
+//!   reader MUST ask both before it finds no standing: the capability walk
+//!   (`capability_roots_to_trusted_root(dir, reader, pipeline,
+//!   "infra:attest")`, a `trust:confers:v1` grant from a root this node
+//!   accepts), then, only if the walk finds none, the ceremony plane
+//!   (`admission::is_infra_attest_effective`, the accord co-scrub of
+//!   `infra:attest` onto the pipeline's own record, minus any quorum
+//!   withdrawal). Both say no → refusal. Production pipelines stand on the
+//!   second plane (the CIRISServer `/v1/accord/ci-key` ceremony), so a
+//!   walk-only gate would refuse every production build.
+//!
+//! Until verify 19 the gate handed verify the pipeline's key record and the
+//! directory's `accord_holder` rows and let verify re-check the co-scrub. That
+//! copy could not see a quorum role-withdrawal, so a withdrawn pipeline still
+//! verified (CIRISEdge#786); the substrate, which sees withdrawals, now
+//! answers.
 //!
 //! What a verified bundle proves — and does not — is verify's contract
 //! (CIRISVerify#181): the holder of the peer's federation key signed an
@@ -61,12 +75,15 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
 use ciris_persist::federation::self_at_login::BindingProvenance;
-use ciris_persist::federation::KeyRecord as PersistKeyRecord;
+use ciris_persist::federation::trust_root::{capability_roots_to_trusted_root, ConferralPlane};
+use ciris_persist::federation::{FederationDirectory, KeyRecord as PersistKeyRecord};
 use ciris_verify_core::build_attestation_bundle::{
     verify_build_attestation_bundle, BundleRejection, BundleVerdict, BUILD_ATTESTATION_BUNDLE_KIND,
 };
 use ciris_verify_core::ceg_outbox::SignedCegObject;
-use ciris_verify_core::federation_self_record::KeyRecord as VerifyKeyRecord;
+use ciris_verify_core::manifest_contribution::{
+    PipelineBlessing, WalkPlane, MANIFEST_PUBLISH_SCOPE,
+};
 use ciris_verify_core::threshold::ThresholdMember;
 
 /// Hard byte cap on a registered peer bundle. A real bundle is a presenter
@@ -151,16 +168,31 @@ pub enum BundleRegisterError {
     NoTransport,
 }
 
-/// One stored bundle: the raw bytes plus (when set) the SHA-256 of the exact
-/// bytes that last verified — the verdict cache. Only VERIFIED outcomes are
-/// cached; a refusal is never cached, so a late-arriving directory row (the
-/// pipeline record replicating in after registration) flips the gate on the
-/// next Rooted save rather than pinning the downgrade (the transit-gate
-/// don't-cache-refusals honesty rule, CIRISEdge#430).
+/// One stored bundle: the raw bytes plus (when set) what the last
+/// verification of exactly these bytes established — the verdict cache. Only
+/// VERIFIED outcomes are cached; a refusal is never cached, so a late-arriving
+/// directory row (the pipeline record replicating in after registration)
+/// flips the gate on the next Rooted save rather than pinning the downgrade
+/// (the transit-gate don't-cache-refusals honesty rule, CIRISEdge#430).
 #[derive(Debug, Clone)]
 struct StoredPeerBundle {
     bytes: Vec<u8>,
-    verified_sha256: Option<[u8; 32]>,
+    verified: Option<VerifiedBundle>,
+}
+
+/// CIRISEdge#793 — what a verification of one bundle's bytes established.
+/// The bytes-dependent work (decode, the signature chain against the pinned
+/// rows) is cached against `sha256`. The pipeline's STANDING is not a
+/// property of the bytes (CC 3.1.2.1: the reader evaluates it at use, and a
+/// withdrawal, a dropped root or a de-rooted root changes it with the bundle
+/// unchanged), so the blessing the verification ran under is kept only to be
+/// compared with a fresh [`pipeline_blessing`] at every use, and it is
+/// reader-relative: a cached verdict serves only the reader it was asked for.
+#[derive(Debug, Clone)]
+struct VerifiedBundle {
+    sha256: [u8; 32],
+    reader_key_id: String,
+    blessing: PipelineBlessing,
 }
 
 /// CIRISEdge#437 — per-peer store of presented build-attestation bundles.
@@ -211,7 +243,7 @@ impl PeerBundleStore {
             key_id.to_string(),
             StoredPeerBundle {
                 bytes: bytes.to_vec(),
-                verified_sha256: None,
+                verified: None,
             },
         );
         Ok(())
@@ -227,26 +259,74 @@ impl PeerBundleStore {
             .map(|b| b.bytes.clone())
     }
 
-    /// Record that the bytes hashing to `sha256` verified for `key_id`.
+    /// Record that the bytes hashing to `sha256` verified for `key_id`, read
+    /// by `reader_key_id`, under the standing `verdict` names (CIRISEdge#793:
+    /// kept to be re-checked at each use, never trusted from the cache).
     /// No-op if the stored bytes have changed since (a racing re-register
     /// must not inherit the old bytes' verdict).
-    pub fn note_verified(&self, key_id: &str, sha256: [u8; 32]) {
+    pub fn note_verified(
+        &self,
+        key_id: &str,
+        sha256: [u8; 32],
+        reader_key_id: &str,
+        verdict: &BundleVerdict,
+    ) {
         let mut map = self.inner.lock().expect("peer bundle store poisoned");
         if let Some(entry) = map.get_mut(key_id) {
             if sha256_of(&entry.bytes) == sha256 {
-                entry.verified_sha256 = Some(sha256);
+                entry.verified = Some(VerifiedBundle {
+                    sha256,
+                    reader_key_id: reader_key_id.to_owned(),
+                    blessing: PipelineBlessing {
+                        pipeline_key_id: verdict.build.attested_by.clone(),
+                        standing: verdict.build.standing.clone(),
+                    },
+                });
             }
         }
     }
 
     /// Is `key_id`'s stored bundle already verified at exactly these bytes?
+    /// The bytes' answer only — whether the pipeline still has standing is
+    /// asked at use ([`gated_save_provenance`], CIRISEdge#793).
     #[must_use]
     pub fn is_verified(&self, key_id: &str, sha256: [u8; 32]) -> bool {
         self.inner
             .lock()
             .expect("peer bundle store poisoned")
             .get(key_id)
-            .is_some_and(|b| b.verified_sha256 == Some(sha256))
+            .is_some_and(|b| b.verified.as_ref().is_some_and(|v| v.sha256 == sha256))
+    }
+
+    /// CIRISEdge#793 — the blessing `key_id`'s bundle verified under, if
+    /// these exact bytes verified for `reader_key_id`. The caller re-resolves
+    /// the standing and compares; this never answers "still has standing".
+    fn verified_blessing(
+        &self,
+        key_id: &str,
+        sha256: [u8; 32],
+        reader_key_id: &str,
+    ) -> Option<PipelineBlessing> {
+        self.inner
+            .lock()
+            .expect("peer bundle store poisoned")
+            .get(key_id)
+            .and_then(|b| b.verified.as_ref())
+            .filter(|v| v.sha256 == sha256 && v.reader_key_id == reader_key_id)
+            .map(|v| v.blessing.clone())
+    }
+
+    /// CIRISEdge#793 — drop `key_id`'s cached verdict (its pipeline lost
+    /// standing): the next use verifies from scratch.
+    fn forget_verified(&self, key_id: &str) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .expect("peer bundle store poisoned")
+            .get_mut(key_id)
+        {
+            entry.verified = None;
+        }
     }
 
     /// Number of peers with a stored bundle.
@@ -274,6 +354,7 @@ pub fn sha256_of(bytes: &[u8]) -> [u8; 32] {
 /// chain. Every variant is a hard refusal — under the gate they all read as
 /// "no verified bundle" (fail-closed).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BundleGateRefusal {
     /// No federation directory is wired (the `RootingDirectory` default
     /// impl) — nothing can be pinned, so nothing can verify.
@@ -289,12 +370,11 @@ pub enum BundleGateRefusal {
     /// The pipeline key named by the carried manifest has no
     /// `federation_keys` row.
     PipelineNotInDirectory { key_id: String },
-    /// The pipeline's directory row would not convert to verify's
-    /// `KeyRecord` wire shape (should be unreachable — same wire shape).
-    MalformedPipelineRecord { key_id: String },
-    /// The directory holds no `accord_holder` rows to pin the co-scrub
-    /// quorum against. Fail-closed: no anchors ⇒ no Rooted-save evidence.
-    NoAccordAnchors,
+    /// Neither standing plane blesses the pipeline for `infra:attest`: the
+    /// capability walk from this node found no grant from a root it accepts,
+    /// and the ceremony plane finds no effective accord co-scrub (absent, or
+    /// withdrawn by quorum). See [`pipeline_blessing`].
+    PipelineWithoutStanding { key_id: String },
     /// A directory read failed (transient) — refuse now, retry at the next
     /// Rooted save (refusals are never cached).
     DirectoryUnavailable(String),
@@ -316,10 +396,10 @@ impl std::fmt::Display for BundleGateRefusal {
             Self::PipelineNotInDirectory { key_id } => {
                 write!(f, "pipeline key {key_id} not in federation directory")
             }
-            Self::MalformedPipelineRecord { key_id } => {
-                write!(f, "pipeline directory row for {key_id} malformed")
-            }
-            Self::NoAccordAnchors => write!(f, "no accord_holder rows in directory"),
+            Self::PipelineWithoutStanding { key_id } => write!(
+                f,
+                "pipeline key {key_id} holds infra:attest on neither standing plane"
+            ),
             Self::DirectoryUnavailable(e) => write!(f, "directory unavailable: {e}"),
             Self::Rejected(r) => write!(f, "bundle rejected: {r}"),
         }
@@ -364,8 +444,10 @@ pub fn manifest_commitment_of_bundle(bundle_bytes: &[u8]) -> Option<[u8; 32]> {
 }
 
 /// Pin the pipeline `key_id` NAME out of a bundle's carried manifest — the
-/// only thing ever read from the object itself (all pubkeys, roles, and the
-/// co-scrub quorum come from the directory rows this name selects).
+/// only thing ever read from the object itself (all pubkeys come from the
+/// directory row this name selects, and the standing from
+/// [`pipeline_blessing`]). Verify 19 signs the attester into the envelope's
+/// `row` mirror (CIRISPersist#643) and checks it against the pinned member.
 #[must_use]
 pub fn bundle_pipeline_key_id(bundle: &SignedCegObject) -> Option<&str> {
     bundle
@@ -373,6 +455,7 @@ pub fn bundle_pipeline_key_id(bundle: &SignedCegObject) -> Option<&str> {
         .get("manifest_contribution")?
         .get("body")?
         .get("signed_envelope")?
+        .get("row")?
         .get("attesting_key_id")?
         .as_str()
 }
@@ -389,45 +472,71 @@ pub fn threshold_member_from_row(row: &PersistKeyRecord) -> ThresholdMember {
     }
 }
 
-/// A persist directory row as verify's `KeyRecord`. The two are the same
-/// wire shape by contract (verify's producer docs: "Serializes to
-/// CIRISPersist's `KeyRecord` wire shape"), so this is a serde round-trip —
-/// `registration_envelope`, scrub signatures, and `additional_scrubs` ride
-/// verbatim, which is exactly what the co-scrub verification signs over.
-#[must_use]
-pub fn verify_key_record_from_row(row: &PersistKeyRecord) -> Option<VerifyKeyRecord> {
-    let value = serde_json::to_value(row).ok()?;
-    serde_json::from_value(value).ok()
+/// CC 3.1.2.1 (rc6 22ea349) — does `pipeline_key_id` hold `infra:attest`,
+/// asked from `reader_key_id`'s trust root? Both standing planes, in order,
+/// and `None` only when both say no:
+///
+/// 1. persist's capability walk, `capability_roots_to_trusted_root(dir,
+///    reader, pipeline, "infra:attest")` — reader-relative: a grant from a
+///    root this node accepts. Its `AccordCoScrub` arm answers the ceremony
+///    question (the co-scrubbed role, not withdrawn) for a subject that is
+///    also a valid root, so it maps to [`PipelineBlessing::accord_role`], as
+///    CIRISRegistry's door does.
+/// 2. Only if the walk finds nothing: `admission::is_infra_attest_effective`
+///    — the accord co-scrub of `infra:attest` onto the pipeline's own key
+///    record, minus any quorum withdrawal. Not reader-relative.
+///
+/// # Errors
+///
+/// A directory read failure from either plane (transient; the caller refuses
+/// now and asks again at the next save).
+pub async fn pipeline_blessing(
+    directory: &dyn FederationDirectory,
+    reader_key_id: &str,
+    pipeline_key_id: &str,
+) -> Result<Option<PipelineBlessing>, ciris_persist::federation::Error> {
+    if let Some(grant) = capability_roots_to_trusted_root(
+        directory,
+        reader_key_id,
+        pipeline_key_id,
+        MANIFEST_PUBLISH_SCOPE,
+    )
+    .await?
+    {
+        let conferred = |plane| {
+            PipelineBlessing::conferred(
+                pipeline_key_id,
+                grant.root_key_id.clone(),
+                grant.grant_attestation_id.clone(),
+                plane,
+            )
+        };
+        return Ok(Some(match grant.conferral_plane {
+            ConferralPlane::Delegation => conferred(WalkPlane::Delegation),
+            ConferralPlane::FamilyQuorum => conferred(WalkPlane::FamilyQuorum),
+            ConferralPlane::AccordCoScrub => PipelineBlessing::accord_role(pipeline_key_id),
+        }));
+    }
+    let by_role =
+        ciris_persist::federation::admission::is_infra_attest_effective(directory, pipeline_key_id)
+            .await?;
+    Ok(by_role.then(|| PipelineBlessing::accord_role(pipeline_key_id)))
 }
 
-/// The pure verification core: verify `bundle` against directory rows the
-/// caller already pinned. Split from the directory-reading seam
+/// The pure verification core: verify `bundle` against directory rows and a
+/// [`PipelineBlessing`] the caller already pinned. Split from the
+/// directory-reading seam
 /// ([`crate::verify::RootingDirectory::verify_peer_build_bundle`]) so the
 /// crypto chain is unit-testable against the EXACT stored row shapes.
 pub fn verify_bundle_with_directory_rows(
     bundle: &SignedCegObject,
     presenter_row: &PersistKeyRecord,
     pipeline_row: &PersistKeyRecord,
-    anchor_rows: &[PersistKeyRecord],
+    blessing: &PipelineBlessing,
 ) -> BundleGateVerdict {
-    if anchor_rows.is_empty() {
-        return BundleGateVerdict::Refused(BundleGateRefusal::NoAccordAnchors);
-    }
     let presenter = threshold_member_from_row(presenter_row);
     let pipeline_member = threshold_member_from_row(pipeline_row);
-    let Some(pipeline_record) = verify_key_record_from_row(pipeline_row) else {
-        return BundleGateVerdict::Refused(BundleGateRefusal::MalformedPipelineRecord {
-            key_id: pipeline_row.key_id.clone(),
-        });
-    };
-    let anchors: Vec<ThresholdMember> = anchor_rows.iter().map(threshold_member_from_row).collect();
-    match verify_build_attestation_bundle(
-        bundle,
-        &presenter,
-        &pipeline_member,
-        &pipeline_record,
-        &anchors,
-    ) {
+    match verify_build_attestation_bundle(bundle, &presenter, &pipeline_member, blessing) {
         Ok(verdict) => BundleGateVerdict::Verified(Box::new(verdict)),
         Err(rejection) => BundleGateVerdict::Refused(BundleGateRefusal::Rejected(rejection)),
     }
@@ -446,10 +555,18 @@ pub fn verify_bundle_with_directory_rows(
 ///   refused/rejected one → the SAVE downgrades to `Advisory` with a loud
 ///   named warn. Refusals are never cached, so a directory row that
 ///   replicates in later un-sticks the gate at the next Rooted save.
+/// - CIRISEdge#793 — a cached verdict skips only the bytes-dependent work.
+///   The pipeline's standing is re-resolved at EVERY use
+///   ([`RootingDirectory::pipeline_standing`](crate::verify::RootingDirectory::pipeline_standing),
+///   [`pipeline_blessing`]) for the reader now asking: the same blessing →
+///   `Rooted`; none (the grant or co-scrub withdrawn, the root no longer
+///   accepted or rooted) → `Advisory` and the cache entry is dropped; a
+///   different blessing → a full re-verification under it.
 pub async fn gated_save_provenance(
     mode: BundleSaveGateMode,
     provenance: BindingProvenance,
     key_id: &str,
+    reader_key_id: &str,
     bundles: &PeerBundleStore,
     rooting: &dyn crate::verify::RootingDirectory,
 ) -> BindingProvenance {
@@ -469,21 +586,59 @@ pub async fn gated_save_provenance(
         return BindingProvenance::Advisory;
     };
     let digest = sha256_of(&bytes);
-    if bundles.is_verified(key_id, digest) {
-        tracing::debug!(
-            key_id,
-            "CIRISEdge#437 bundle_gate: cached verified bundle — Rooted durable save proceeds"
-        );
-        return BindingProvenance::Rooted;
+    if let Some(cached) = bundles.verified_blessing(key_id, digest, reader_key_id) {
+        match rooting
+            .pipeline_standing(reader_key_id, &cached.pipeline_key_id)
+            .await
+        {
+            Ok(Some(now)) if now == cached => {
+                tracing::debug!(
+                    key_id,
+                    "CIRISEdge#437 bundle_gate: cached verified bundle, standing re-checked \
+                     (CIRISEdge#793) — Rooted durable save proceeds"
+                );
+                return BindingProvenance::Rooted;
+            }
+            // The standing moved planes or roots: verify again under it.
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                bundles.forget_verified(key_id);
+                tracing::warn!(
+                    key_id,
+                    gate = mode.as_str(),
+                    pipeline = %cached.pipeline_key_id,
+                    refusal = "pipeline_without_standing",
+                    "CIRISEdge#793 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — the \
+                     cached bundle's pipeline no longer holds infra:attest on either standing \
+                     plane from this node (withdrawn, or its root is no longer accepted)"
+                );
+                return BindingProvenance::Advisory;
+            }
+            Err(refusal) => {
+                tracing::warn!(
+                    key_id,
+                    gate = mode.as_str(),
+                    refusal = %refusal,
+                    "CIRISEdge#793 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — the \
+                     cached bundle's standing could not be re-checked (refusals are not cached; \
+                     the next Rooted save asks again)"
+                );
+                return BindingProvenance::Advisory;
+            }
+        }
     }
-    match rooting.verify_peer_build_bundle(key_id, &bytes).await {
+    match rooting
+        .verify_peer_build_bundle(reader_key_id, key_id, &bytes)
+        .await
+    {
         BundleGateVerdict::Verified(verdict) => {
-            bundles.note_verified(key_id, digest);
+            bundles.note_verified(key_id, digest, reader_key_id, &verdict);
             tracing::info!(
                 key_id,
                 target = %verdict.build.target,
                 build_id = %verdict.build.build_id,
                 binary_version = %verdict.build.binary_version,
+                standing = verdict.build.standing.plane_str(),
                 transparency = ?verdict.transparency,
                 "CIRISEdge#437 bundle_gate: peer bundle VERIFIED against directory pins — \
                  Rooted durable save proceeds"
@@ -517,7 +672,7 @@ pub(crate) mod test_support {
     use ciris_persist::federation::FederationDirectory;
     use ciris_persist::store::MemoryBackend;
     use ciris_verify_core::build_attestation_bundle::{
-        produce_build_attestation_bundle, BundleInputs,
+        produce_build_attestation_bundle, BundleInputs, PresentedBuild,
     };
     use ciris_verify_core::federation_self_record::{produce_multiscrub_key_record, ScrubTarget};
     use ciris_verify_core::manifest_contribution::{
@@ -529,6 +684,16 @@ pub(crate) mod test_support {
     pub(crate) const PRESENTER: &str = "presenter-437";
     pub(crate) const PIPELINE: &str = "ci-pipeline-437";
     pub(crate) const TARGET: &str = "x86_64-unknown-linux-gnu";
+    /// The node READING the bundle — whose trust root the capability walk
+    /// asks from (CIRISEdge#786). Under the ceremony plane it does not matter.
+    pub(crate) const READER: &str = "reader-786";
+
+    /// [`TS`] as the instant verify 19's producers sign.
+    pub(crate) fn ts() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(TS)
+            .expect("fixture instant")
+            .with_timezone(&chrono::Utc)
+    }
 
     /// A minimal well-shaped (but crypto-empty) bundle blob — enough to pass
     /// the registration shape gate, never enough to verify.
@@ -676,10 +841,39 @@ pub(crate) mod test_support {
         .await
         .expect("pipeline record admits through persist's infra:attest co-scrub gate");
 
-        // The presenter — a plain node row with its real pubkeys.
-        let presenter = HybridSigningIdentity::generate(PRESENTER).expect("presenter identity");
+        let bytes = seed_presenter_and_mint_bundle(&backend, &pipeline).await;
+        (backend, bytes)
+    }
+
+    /// CIRISEdge#786 — the same artifact chain with NO standing on either
+    /// plane: the pipeline is a plain `node` row (no `infra:attest`, no
+    /// co-scrub), and nothing grants it the scope. A test adds the grant (the
+    /// walk plane) or leaves it standing-less.
+    pub(crate) async fn plain_pipeline_fixture() -> (MemoryBackend, Vec<u8>) {
+        let backend = MemoryBackend::new();
+        let pipeline = HybridSigningIdentity::generate(PIPELINE).expect("pipeline identity");
         FederationDirectory::put_public_key(
             &backend,
+            ciris_persist::federation::SignedKeyRecord {
+                record: row_for_identity(&pipeline, identity_type::NODE, None),
+            },
+        )
+        .await
+        .expect("seed plain pipeline row");
+        let bytes = seed_presenter_and_mint_bundle(&backend, &pipeline).await;
+        (backend, bytes)
+    }
+
+    /// Seed the presenter's plain node row and mint the pipeline-signed
+    /// manifest + presenter-signed bundle with verify's own producers — the
+    /// exact field artifacts.
+    async fn seed_presenter_and_mint_bundle(
+        backend: &MemoryBackend,
+        pipeline: &HybridSigningIdentity,
+    ) -> Vec<u8> {
+        let presenter = HybridSigningIdentity::generate(PRESENTER).expect("presenter identity");
+        FederationDirectory::put_public_key(
+            backend,
             ciris_persist::federation::SignedKeyRecord {
                 record: row_for_identity(&presenter, identity_type::NODE, None),
             },
@@ -687,37 +881,34 @@ pub(crate) mod test_support {
         .await
         .expect("seed presenter row");
 
-        // The pipeline-signed manifest + the presenter-signed bundle —
-        // verify's own producers, the exact field artifacts.
         let bh = "aa".repeat(32);
         let mh = "bb".repeat(32);
         let manifest = sign_build_manifest_contribution(
-            &pipeline,
+            pipeline,
             &BuildAttestation {
                 target: TARGET,
                 binary_hash: &bh,
                 build_id: "build-437",
                 binary_version: "15.11.0",
                 manifest_hash: &mh,
+                manifest_size: 4096,
             },
-            "human-1",
-            "grant-1",
-            TS,
+            ts(),
         )
         .await
         .expect("pipeline-signed manifest");
         let bundle = produce_build_attestation_bundle(
             &presenter,
             &BundleInputs {
+                presents: PresentedBuild::SelfVerify,
                 manifest_contribution: &manifest,
                 inclusion: None,
             },
-            TS,
+            ts(),
         )
         .await
         .expect("presenter-signed bundle");
-        let bytes = serde_json::to_vec(&bundle).expect("serialize bundle");
-        (backend, bytes)
+        serde_json::to_vec(&bundle).expect("serialize bundle")
     }
 
     /// Flip the carried manifest's binary_hash AFTER signing — the
@@ -733,8 +924,8 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        field_fixture, row_for_identity, shaped_bundle_bytes, tampered, PIPELINE, PRESENTER,
-        TARGET, TS,
+        field_fixture, plain_pipeline_fixture, row_for_identity, shaped_bundle_bytes, tampered,
+        PIPELINE, PRESENTER, READER, TARGET, TS,
     };
     use super::*;
     use ciris_persist::federation::types::identity_type;
@@ -864,6 +1055,30 @@ mod tests {
         );
     }
 
+    /// A verdict as verify returns one, for the cache's unit tests.
+    fn a_verdict() -> BundleVerdict {
+        use ciris_verify_core::build_attestation_bundle::{PresentedBuild, TransparencyCheck};
+        use ciris_verify_core::manifest_contribution::{PipelineStanding, VerifiedManifest};
+        BundleVerdict {
+            presenter_key_id: PRESENTER.to_owned(),
+            presents: PresentedBuild::SelfVerify,
+            build: VerifiedManifest {
+                attested_by: PIPELINE.to_owned(),
+                standing: PipelineStanding::AccordRole,
+                attestation_id: "m-1".to_owned(),
+                asserted_at: TS.to_owned(),
+                target: TARGET.to_owned(),
+                build_id: "build-793".to_owned(),
+                binary_hash: "ab".repeat(32),
+                binary_version: "0.0.0".to_owned(),
+                manifest_hash: "cd".repeat(32),
+                manifest_size: 0,
+                evidence_refs: Vec::new(),
+            },
+            transparency: TransparencyCheck::Absent,
+        }
+    }
+
     #[test]
     fn verdict_cache_is_per_exact_bytes_and_resets_on_replace() {
         let store = PeerBundleStore::new();
@@ -873,11 +1088,17 @@ mod tests {
 
         assert!(!store.is_verified("p", digest), "nothing verified yet");
         // A stale digest (bytes that are not the stored ones) never caches.
-        store.note_verified("p", [0u8; 32]);
+        let verdict = a_verdict();
+        store.note_verified("p", [0u8; 32], READER, &verdict);
         assert!(!store.is_verified("p", [0u8; 32]));
-        // The exact stored bytes' digest caches.
-        store.note_verified("p", digest);
+        // The exact stored bytes' digest caches, for the reader that asked.
+        store.note_verified("p", digest, READER, &verdict);
         assert!(store.is_verified("p", digest));
+        assert_eq!(
+            store.verified_blessing("p", digest, READER),
+            Some(PipelineBlessing::accord_role(PIPELINE))
+        );
+        assert_eq!(store.verified_blessing("p", digest, "another-reader"), None);
         // Re-registration (even of the same bytes) resets the cache — new
         // registration, fresh verification.
         store.register("p", &bytes).expect("re-register");
@@ -898,7 +1119,8 @@ mod tests {
         let (backend, bytes) = field_fixture().await;
 
         // The seam, driven exactly as the gate drives it.
-        let verdict = RootingDirectory::verify_peer_build_bundle(&backend, PRESENTER, &bytes).await;
+        let verdict =
+            RootingDirectory::verify_peer_build_bundle(&backend, READER, PRESENTER, &bytes).await;
         let BundleGateVerdict::Verified(v) = verdict else {
             panic!("expected Verified, got {verdict:?}");
         };
@@ -913,6 +1135,7 @@ mod tests {
             BundleSaveGateMode::RequireBundleForRootedSave,
             BindingProvenance::Rooted,
             PRESENTER,
+            READER,
             &store,
             &backend,
         )
@@ -927,6 +1150,7 @@ mod tests {
             BundleSaveGateMode::RequireBundleForRootedSave,
             BindingProvenance::Rooted,
             PRESENTER,
+            READER,
             &store,
             &backend,
         )
@@ -948,6 +1172,7 @@ mod tests {
                 BundleSaveGateMode::RequireBundleForRootedSave,
                 BindingProvenance::Rooted,
                 PRESENTER,
+                READER,
                 &store,
                 &backend,
             )
@@ -958,7 +1183,8 @@ mod tests {
         // A tampered bundle: the seam rejects it (evidence-commitment
         // mismatch) and the save downgrades.
         let bad = tampered(&bytes);
-        let verdict = RootingDirectory::verify_peer_build_bundle(&backend, PRESENTER, &bad).await;
+        let verdict =
+            RootingDirectory::verify_peer_build_bundle(&backend, READER, PRESENTER, &bad).await;
         assert_eq!(
             verdict,
             BundleGateVerdict::Refused(BundleGateRefusal::Rejected(
@@ -973,6 +1199,7 @@ mod tests {
                 BundleSaveGateMode::RequireBundleForRootedSave,
                 BindingProvenance::Rooted,
                 PRESENTER,
+                READER,
                 &store,
                 &backend,
             )
@@ -990,6 +1217,7 @@ mod tests {
                 BundleSaveGateMode::RequireBundleForRootedSave,
                 BindingProvenance::Advisory,
                 "peer-without-bundle",
+                READER,
                 &store,
                 &backend,
             )
@@ -1011,6 +1239,7 @@ mod tests {
                     BundleSaveGateMode::Off,
                     provenance,
                     PRESENTER,
+                    READER,
                     &store,
                     &NoDirectoryRooting,
                 )
@@ -1032,7 +1261,8 @@ mod tests {
     #[tokio::test]
     async fn a_relayed_bundle_cannot_satisfy_another_peers_gate() {
         let (backend, bytes) = field_fixture().await;
-        let verdict = RootingDirectory::verify_peer_build_bundle(&backend, PIPELINE, &bytes).await;
+        let verdict =
+            RootingDirectory::verify_peer_build_bundle(&backend, READER, PIPELINE, &bytes).await;
         assert!(
             matches!(
                 verdict,
@@ -1054,7 +1284,7 @@ mod tests {
 
         // No presenter row.
         assert_eq!(
-            RootingDirectory::verify_peer_build_bundle(&empty, PRESENTER, &bytes).await,
+            RootingDirectory::verify_peer_build_bundle(&empty, READER, PRESENTER, &bytes).await,
             BundleGateVerdict::Refused(BundleGateRefusal::PresenterNotInDirectory {
                 key_id: PRESENTER.to_string(),
             })
@@ -1074,7 +1304,8 @@ mod tests {
         .await
         .expect("seed presenter row");
         assert_eq!(
-            RootingDirectory::verify_peer_build_bundle(&presenter_only, PRESENTER, &bytes).await,
+            RootingDirectory::verify_peer_build_bundle(&presenter_only, READER, PRESENTER, &bytes)
+                .await,
             BundleGateVerdict::Refused(BundleGateRefusal::PipelineNotInDirectory {
                 key_id: PIPELINE.to_string(),
             })
@@ -1082,14 +1313,15 @@ mod tests {
 
         // Malformed / oversized blobs refuse before any directory read.
         assert_eq!(
-            RootingDirectory::verify_peer_build_bundle(&empty, PRESENTER, b"not json").await,
+            RootingDirectory::verify_peer_build_bundle(&empty, READER, PRESENTER, b"not json")
+                .await,
             BundleGateVerdict::Refused(BundleGateRefusal::MalformedBundle(
                 "not a JSON SignedCegObject"
             ))
         );
         let big = vec![b'x'; MAX_PEER_BUNDLE_BYTES + 1];
         assert_eq!(
-            RootingDirectory::verify_peer_build_bundle(&empty, PRESENTER, &big).await,
+            RootingDirectory::verify_peer_build_bundle(&empty, READER, PRESENTER, &big).await,
             BundleGateVerdict::Refused(BundleGateRefusal::OversizedBundle {
                 actual: MAX_PEER_BUNDLE_BYTES + 1,
                 limit: MAX_PEER_BUNDLE_BYTES,
@@ -1097,34 +1329,21 @@ mod tests {
         );
     }
 
-    /// The anchor pin is fail-closed at the PURE core: zero accord rows →
-    /// `NoAccordAnchors` (never an empty-quorum pass). And the default
-    /// trait impl (no directory at all) refuses as `NoDirectory` — which
-    /// under the gate downgrades the save.
+    /// The default trait impl (no directory at all) refuses as
+    /// `NoDirectory` — which under the gate downgrades the save.
     #[tokio::test]
-    async fn no_anchors_and_no_directory_both_fail_closed() {
-        let (backend, bytes) = field_fixture().await;
-        let bundle: SignedCegObject = serde_json::from_slice(&bytes).expect("parse");
-        let presenter_row = FederationDirectory::lookup_public_key(&backend, PRESENTER)
-            .await
-            .expect("lookup")
-            .expect("presenter row");
-        let pipeline_row = FederationDirectory::lookup_public_key(&backend, PIPELINE)
-            .await
-            .expect("lookup")
-            .expect("pipeline row");
+    async fn no_directory_fails_closed() {
+        let (_backend, bytes) = field_fixture().await;
         assert_eq!(
-            verify_bundle_with_directory_rows(&bundle, &presenter_row, &pipeline_row, &[]),
-            BundleGateVerdict::Refused(BundleGateRefusal::NoAccordAnchors)
-        );
-
-        // Default trait impl: typed NoDirectory refusal…
-        assert_eq!(
-            RootingDirectory::verify_peer_build_bundle(&NoDirectoryRooting, PRESENTER, &bytes)
-                .await,
+            RootingDirectory::verify_peer_build_bundle(
+                &NoDirectoryRooting,
+                READER,
+                PRESENTER,
+                &bytes
+            )
+            .await,
             BundleGateVerdict::Refused(BundleGateRefusal::NoDirectory)
         );
-        // …and under the gate that downgrades the save (fail-closed).
         let store = PeerBundleStore::new();
         store.register(PRESENTER, &bytes).expect("register");
         assert_eq!(
@@ -1132,11 +1351,423 @@ mod tests {
                 BundleSaveGateMode::RequireBundleForRootedSave,
                 BindingProvenance::Rooted,
                 PRESENTER,
+                READER,
                 &store,
                 &NoDirectoryRooting,
             )
             .await,
             BindingProvenance::Advisory
         );
+    }
+
+    // ── CIRISEdge#786: the two standing planes (CC 3.1.2.1, rc6 22ea349) ──
+
+    use ciris_verify_core::build_attestation_bundle::PresentedBuild;
+    use ciris_verify_core::manifest_contribution::{PipelineStanding, WalkPlane};
+
+    /// Register `reader` (a node the bridge fixture signer can sign for) and
+    /// give it the bridge fixtures' common root `root-r`: a charter with a
+    /// recovery pre-commitment and `reader`'s acceptance of it.
+    async fn reader_accepts_common_root(backend: &MemoryBackend, reader: &str) {
+        FederationDirectory::put_public_key(
+            backend,
+            ciris_persist::federation::SignedKeyRecord {
+                record: crate::replication::bridge::tests::fixture_key_record(
+                    reader,
+                    identity_type::NODE,
+                ),
+            },
+        )
+        .await
+        .expect("seed reader row");
+        crate::replication::bridge::tests::seed_common_root(backend, &[reader]).await;
+    }
+
+    /// Witness (a) — plane 1: the pipeline holds no co-scrub and no role,
+    /// but `root-r` grants it `infra:attest` and the reader accepts
+    /// `root-r`. The walk confers → the bundle verifies with
+    /// `Conferred { Delegation }` standing and the Rooted save proceeds.
+    /// The SAME grant read by a node that does not accept `root-r` confers
+    /// nothing (the walk is reader-relative) → refused.
+    #[tokio::test]
+    async fn walk_conferred_pipeline_is_admitted_from_a_reader_that_accepts_the_root() {
+        let (backend, bytes) = plain_pipeline_fixture().await;
+        reader_accepts_common_root(&backend, READER).await;
+        let grant = crate::replication::bridge::tests::seed_delegates_to(
+            &backend,
+            "root-r",
+            PIPELINE,
+            &serde_json::json!([ciris_verify_core::manifest_contribution::MANIFEST_PUBLISH_SCOPE]),
+        )
+        .await;
+
+        let verdict =
+            RootingDirectory::verify_peer_build_bundle(&backend, READER, PRESENTER, &bytes).await;
+        let BundleGateVerdict::Verified(v) = verdict else {
+            panic!("expected Verified via the capability walk, got {verdict:?}");
+        };
+        assert_eq!(
+            v.build.standing,
+            PipelineStanding::Conferred {
+                root_key_id: "root-r".to_string(),
+                grant_attestation_id: grant,
+                plane: WalkPlane::Delegation,
+            }
+        );
+        assert_eq!(v.presents, PresentedBuild::SelfVerify);
+
+        let store = PeerBundleStore::new();
+        store.register(PRESENTER, &bytes).expect("register");
+        assert_eq!(
+            gated_save_provenance(
+                BundleSaveGateMode::RequireBundleForRootedSave,
+                BindingProvenance::Rooted,
+                PRESENTER,
+                READER,
+                &store,
+                &backend,
+            )
+            .await,
+            BindingProvenance::Rooted
+        );
+
+        // A reader that never accepted `root-r`: same rows, no standing.
+        let stranger = "reader-stranger-786";
+        FederationDirectory::put_public_key(
+            &backend,
+            ciris_persist::federation::SignedKeyRecord {
+                record: crate::replication::bridge::tests::fixture_key_record(
+                    stranger,
+                    identity_type::NODE,
+                ),
+            },
+        )
+        .await
+        .expect("seed stranger row");
+        assert_eq!(
+            RootingDirectory::verify_peer_build_bundle(&backend, stranger, PRESENTER, &bytes).await,
+            BundleGateVerdict::Refused(BundleGateRefusal::PipelineWithoutStanding {
+                key_id: PIPELINE.to_string(),
+            })
+        );
+    }
+
+    /// Witness (b) — plane 2 only: the pipeline's record carries the
+    /// accord co-scrub of `infra:attest` (the `/v1/accord/ci-key` ceremony)
+    /// and NOTHING grants it the scope, so the walk finds nothing. The
+    /// ceremony plane blesses it → `AccordRole` standing, admitted. A
+    /// walk-only gate would refuse this, i.e. every production pipeline.
+    #[tokio::test]
+    async fn ceremony_plane_pipeline_is_admitted_when_the_walk_finds_nothing() {
+        let (backend, bytes) = field_fixture().await;
+        assert_eq!(
+            capability_roots_to_trusted_root(
+                &backend,
+                READER,
+                PIPELINE,
+                ciris_verify_core::manifest_contribution::MANIFEST_PUBLISH_SCOPE,
+            )
+            .await
+            .expect("walk"),
+            None,
+            "precondition: no grant — plane 1 says no"
+        );
+        let verdict =
+            RootingDirectory::verify_peer_build_bundle(&backend, READER, PRESENTER, &bytes).await;
+        let BundleGateVerdict::Verified(v) = verdict else {
+            panic!("expected Verified via the ceremony plane, got {verdict:?}");
+        };
+        assert_eq!(v.build.standing, PipelineStanding::AccordRole);
+    }
+
+    /// Witness (c) — neither plane: a plain pipeline row, no grant, no
+    /// co-scrub → refused by name, and the Rooted save downgrades.
+    #[tokio::test]
+    async fn pipeline_with_standing_on_neither_plane_is_refused() {
+        let (backend, bytes) = plain_pipeline_fixture().await;
+        reader_accepts_common_root(&backend, READER).await;
+        assert_eq!(
+            RootingDirectory::verify_peer_build_bundle(&backend, READER, PRESENTER, &bytes).await,
+            BundleGateVerdict::Refused(BundleGateRefusal::PipelineWithoutStanding {
+                key_id: PIPELINE.to_string(),
+            })
+        );
+        let store = PeerBundleStore::new();
+        store.register(PRESENTER, &bytes).expect("register");
+        assert_eq!(
+            gated_save_provenance(
+                BundleSaveGateMode::RequireBundleForRootedSave,
+                BindingProvenance::Rooted,
+                PRESENTER,
+                READER,
+                &store,
+                &backend,
+            )
+            .await,
+            BindingProvenance::Advisory
+        );
+    }
+
+    /// **The pre-19 standing check, reconstructed** (CIRISEdge#786 witness
+    /// (d)). Verify 18's `verify_build_manifest_via_coscrub` step 4, which the
+    /// old seam ran over `(pipeline_record, accord_anchors)` read from the
+    /// directory: the record's declared identity binds its signed envelope,
+    /// names the pipeline, carries `infra:attest` in its envelope roles, and
+    /// at least `MIN_ACCORD_COSCRUBS` (2) distinct accord anchors' scrubs
+    /// hybrid-verify (RequireHybrid) over `JCS(registration_envelope)`. Built
+    /// from verify 19's own public primitives (`KeyRecord::scrubs`,
+    /// `roles_in_envelope`, `check_subject_binding`,
+    /// `verify_threshold_signatures`), which are unchanged from 18; only the
+    /// composition is restated. It reads nothing a withdrawal writes, which
+    /// is the point.
+    fn pre_19_co_scrub_roots(
+        pipeline_row: &PersistKeyRecord,
+        anchors: &[PersistKeyRecord],
+    ) -> bool {
+        use ciris_verify_core::federation_self_record::KeyRecord as VerifyKeyRecord;
+        use ciris_verify_core::threshold::{verify_threshold_signatures, ThresholdSignature};
+        const MIN_ACCORD_COSCRUBS: usize = 2;
+        let Ok(record) =
+            serde_json::to_value(pipeline_row).and_then(serde_json::from_value::<VerifyKeyRecord>)
+        else {
+            return false;
+        };
+        if record.check_subject_binding().is_err() || record.key_id != pipeline_row.key_id {
+            return false;
+        }
+        if !record
+            .roles_in_envelope()
+            .iter()
+            .any(|r| r == MANIFEST_PUBLISH_SCOPE)
+        {
+            return false;
+        }
+        let Ok(canonical) = ciris_verify_core::jcs::canonicalize(&record.registration_envelope)
+        else {
+            return false;
+        };
+        let members: Vec<ThresholdMember> = anchors.iter().map(threshold_member_from_row).collect();
+        let mut verified = std::collections::BTreeSet::new();
+        for scrub in record.scrubs() {
+            let Some(member) = members.iter().find(|m| m.member_id == scrub.scrub_key_id) else {
+                continue;
+            };
+            let sig = ThresholdSignature {
+                member_id: member.member_id.clone(),
+                ed25519_signature_base64: scrub.scrub_signature_classical.clone(),
+                mldsa65_signature_base64: scrub.scrub_signature_pqc.clone(),
+            };
+            if verify_threshold_signatures(&canonical, std::slice::from_ref(member), &[sig], 1)
+                == Ok(1)
+            {
+                verified.insert(scrub.scrub_key_id);
+            }
+        }
+        verified.len() >= MIN_ACCORD_COSCRUBS
+    }
+
+    /// Witness (d) — the bundle the pre-19 path rooted and neither plane
+    /// admits: the accord quorum WITHDREW the pipeline's `infra:attest`.
+    /// The withdrawal is a tombstone and never mutates the row, so the
+    /// stored record still carries the role under its valid 2-anchor
+    /// co-scrub and the directory still holds the `accord_holder` rows —
+    /// exactly the `(pipeline_record, accord_anchors)` the pre-19 seam handed
+    /// verify, whose co-scrub re-check could not see a withdrawal and
+    /// returned Verified (this fixture, un-withdrawn, is the one
+    /// `verified_bundle_with_gate_on_lets_the_rooted_save_proceed` admits).
+    /// Persist sees the tombstone: the ceremony plane says no, the walk has
+    /// no grant → refused.
+    #[tokio::test]
+    async fn a_withdrawn_pipeline_the_co_scrub_path_rooted_is_refused() {
+        use ciris_persist::federation::admission::{is_infra_attest, is_infra_attest_effective};
+        use ciris_persist::federation::types::roles::INFRA_ATTEST;
+
+        let (backend, bytes) = field_fixture().await;
+        FederationDirectory::record_role_withdrawal(
+            &backend,
+            INFRA_ATTEST,
+            PIPELINE,
+            None,
+            &"cd".repeat(32),
+        )
+        .await
+        .expect("record the quorum withdrawal tombstone");
+
+        // What the pre-19 path read is untouched: the co-scrubbed role on the
+        // stored row, and the anchors it verified against.
+        assert!(is_infra_attest(&backend, PIPELINE).await.expect("read"));
+        assert!(
+            !FederationDirectory::list_keys_by_identity_type(
+                &backend,
+                identity_type::ACCORD_HOLDER
+            )
+            .await
+            .expect("anchors")
+            .is_empty(),
+            "the accord anchors the co-scrub path pinned are still there"
+        );
+        // What the substrate answers: withdrawn.
+        assert!(!is_infra_attest_effective(&backend, PIPELINE)
+            .await
+            .expect("read"));
+
+        // The pre-19 path, run: over the same directory rows it read, its
+        // standing check ROOTS this pipeline. And it discriminates: a plain
+        // pipeline row (no co-scrub) does not root under it.
+        let pipeline_row = FederationDirectory::lookup_public_key(&backend, PIPELINE)
+            .await
+            .expect("read")
+            .expect("pipeline row");
+        let anchors =
+            FederationDirectory::list_keys_by_identity_type(&backend, identity_type::ACCORD_HOLDER)
+                .await
+                .expect("anchors");
+        assert!(
+            pre_19_co_scrub_roots(&pipeline_row, &anchors),
+            "the pre-19 co-scrub path roots the withdrawn pipeline"
+        );
+        let (plain, _) = plain_pipeline_fixture().await;
+        let plain_row = FederationDirectory::lookup_public_key(&plain, PIPELINE)
+            .await
+            .expect("read")
+            .expect("plain pipeline row");
+        assert!(
+            !pre_19_co_scrub_roots(&plain_row, &anchors),
+            "control: the reconstruction refuses a pipeline with no co-scrub"
+        );
+        // Neither CC 3.1.2.1 plane admits it.
+        assert_eq!(
+            pipeline_blessing(&backend, READER, PIPELINE)
+                .await
+                .expect("standing"),
+            None
+        );
+
+        assert_eq!(
+            RootingDirectory::verify_peer_build_bundle(&backend, READER, PRESENTER, &bytes).await,
+            BundleGateVerdict::Refused(BundleGateRefusal::PipelineWithoutStanding {
+                key_id: PIPELINE.to_string(),
+            })
+        );
+        let store = PeerBundleStore::new();
+        store.register(PRESENTER, &bytes).expect("register");
+        assert_eq!(
+            gated_save_provenance(
+                BundleSaveGateMode::RequireBundleForRootedSave,
+                BindingProvenance::Rooted,
+                PRESENTER,
+                READER,
+                &store,
+                &backend,
+            )
+            .await,
+            BindingProvenance::Advisory
+        );
+    }
+
+    /// **CIRISEdge#793 — a cached verdict does not outlive the pipeline's
+    /// standing.** The bundle verifies (ceremony plane) and the Rooted save
+    /// proceeds, caching the verdict against its bytes. Then the accord quorum
+    /// withdraws the pipeline's `infra:attest`. The next Rooted save, same
+    /// bytes, no re-register, is Advisory, and the cache entry is dropped.
+    /// Fails with the cache answering `Rooted` by bytes alone (the pre-#793
+    /// `is_verified` short-circuit).
+    #[tokio::test]
+    async fn a_cached_verdict_does_not_outlive_the_pipelines_standing_793() {
+        use ciris_persist::federation::types::roles::INFRA_ATTEST;
+
+        let (backend, bytes) = field_fixture().await;
+        let store = PeerBundleStore::new();
+        store.register(PRESENTER, &bytes).expect("register");
+        let save = || {
+            gated_save_provenance(
+                BundleSaveGateMode::RequireBundleForRootedSave,
+                BindingProvenance::Rooted,
+                PRESENTER,
+                READER,
+                &store,
+                &backend,
+            )
+        };
+        assert_eq!(save().await, BindingProvenance::Rooted);
+        assert!(store.is_verified(PRESENTER, sha256_of(&bytes)), "cached");
+        assert_eq!(save().await, BindingProvenance::Rooted, "the cache hit");
+
+        FederationDirectory::record_role_withdrawal(
+            &backend,
+            INFRA_ATTEST,
+            PIPELINE,
+            None,
+            &"cd".repeat(32),
+        )
+        .await
+        .expect("the quorum withdraws the pipeline's infra:attest");
+        assert_eq!(
+            save().await,
+            BindingProvenance::Advisory,
+            "same bytes, no re-register: the withdrawal reaches the cached peer"
+        );
+        assert!(
+            !store.is_verified(PRESENTER, sha256_of(&bytes)),
+            "the stale verdict is dropped"
+        );
+        assert_eq!(save().await, BindingProvenance::Advisory);
+    }
+
+    /// **CIRISEdge#793 — a cached verdict is the reader's, not the bundle's.**
+    /// The walk confers the pipeline from a root `READER` accepts, and the
+    /// Rooted save for `READER` caches. A node that never accepted that root,
+    /// asking of the same store and bytes, gets Advisory: standing is
+    /// reader-relative (CC 3.1.2.1), so the cache never answers for another
+    /// reader. Fails with the cache keyed by bytes alone.
+    #[tokio::test]
+    async fn a_cached_verdict_answers_only_the_reader_it_was_asked_for_793() {
+        let (backend, bytes) = plain_pipeline_fixture().await;
+        reader_accepts_common_root(&backend, READER).await;
+        crate::replication::bridge::tests::seed_delegates_to(
+            &backend,
+            "root-r",
+            PIPELINE,
+            &serde_json::json!([ciris_verify_core::manifest_contribution::MANIFEST_PUBLISH_SCOPE]),
+        )
+        .await;
+        let stranger = "reader-stranger-793";
+        FederationDirectory::put_public_key(
+            &backend,
+            ciris_persist::federation::SignedKeyRecord {
+                record: crate::replication::bridge::tests::fixture_key_record(
+                    stranger,
+                    identity_type::NODE,
+                ),
+            },
+        )
+        .await
+        .expect("seed stranger row");
+
+        let store = PeerBundleStore::new();
+        store.register(PRESENTER, &bytes).expect("register");
+        let save = |reader: &'static str| {
+            let store = &store;
+            let backend = &backend;
+            async move {
+                gated_save_provenance(
+                    BundleSaveGateMode::RequireBundleForRootedSave,
+                    BindingProvenance::Rooted,
+                    PRESENTER,
+                    reader,
+                    store,
+                    backend,
+                )
+                .await
+            }
+        };
+        assert_eq!(save(READER).await, BindingProvenance::Rooted);
+        assert!(store.is_verified(PRESENTER, sha256_of(&bytes)));
+        assert_eq!(
+            save(stranger).await,
+            BindingProvenance::Advisory,
+            "a reader that does not accept the root gets no standing from another's cache"
+        );
+        assert_eq!(save(READER).await, BindingProvenance::Rooted);
     }
 }

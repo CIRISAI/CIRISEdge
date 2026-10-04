@@ -62,59 +62,57 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // with a `KindPublishSelector` installed, the live `federation`
         // owner-binding of every node in that selector's Key /
         // IdentityOccurrence set (#752, CC 5.4.6 public roster, CIRISServer#701);
-        // and the membership ceremony addressed to the peer's own person (#756:
-        // a proposal naming `owner_of(peer)`; the invitee's reply to a proposal
-        // held here that the peer's person issued), with no Rooted floor on
-        // those two (`FSD/FIRST_CONTACT.md` §2.3–§2.4).
+        // and the membership ceremony addressed to the peer's own person (#756),
+        // with no Rooted floor on it (`FSD/FIRST_CONTACT.md` §2.3–§2.4). Who a
+        // ceremony row is addressed to is persist's `may_receive` (CIRISEdge#761:
+        // a proposal → every node whose principals include its invitee; an
+        // answer → the nodes of the held proposal's proposer).
         EnvelopeKind::Attestation => (
             "per_record_projection",
             "trace:* → capability:infra:serve; first contact → own allegiance facts \
              + live federation owner-bindings of nodes in the Key/IdentityOccurrence \
-             publish set + membership:proposal:v1 naming owner_of(peer) + the invitee's \
-             membership:acceptance|decline:v1 to a held proposal by owner_of(peer); \
-             else public",
+             publish set + a membership:proposal|acceptance|decline:v1 persist \
+             may_receive admits as refers-to; else persist may_receive(peer, row) \
+             (origin, refers-to — never for a key_grant set —, the membership \
+             ceremony: proposal → invitee's nodes, answer → proposer's nodes, every \
+             stage → the group's membership-plane audience; public, the cohort's \
+             per-node audience: self → the owner's personal-class nodes)",
         ),
-        // CIRISEdge#758 (CC 5.4.6, `FSD/FIRST_CONTACT.md` §2.5) — a group
-        // RECORD is not public: it reaches the group's live members and the
-        // invitees of a live proposal held here (the record travels with the
-        // invitation), on the advertise and the fetch twin, at every reach.
-        // CIRISEdge#762 (CC 5.4.6 "from outsiders only", CC 4.4.3.2.1, persist's
-        // #761 ruling) — only a PRIVATE group is gated: a PUBLIC group's record
-        // (`public_group::is_public_group`: an `infrastructure` community; the
-        // accord family, the genesis bundle's family and the deployment's WA
-        // reclaim family) keeps the pre-v38 `public` serve, since every node
-        // resolves its trust root / reclaim authority through it.
-        EnvelopeKind::Family => (
+        // CIRISEdge#758 / #762 / #761 (CC 5.4.6 "from outsiders only", CC
+        // 4.4.3.2.1; persist v53 S1 `ServeAudience::MembershipPlane`) — a
+        // group's RECORD and its five membership planes are served per row,
+        // per peer, by persist's `may_receive_group_plane`: a public group's
+        // (`is_public_group`: an authority-gated `infrastructure` community,
+        // the accord family, a conferring family, the deployment's WA family)
+        // to every peer; a private group's to its members' nodes, its live
+        // invitees' nodes (full plane history) and the nodes of the member a
+        // row names (for a revocation, the removed member). On the advertise
+        // and the fetch twin alike; an unbound requester is served only public
+        // groups' rows. Withheld rows are booked
+        // `group_record_not_member_or_invitee`.
+        EnvelopeKind::Family | EnvelopeKind::Community => (
             "cohort",
-            "public family (accord_family_key_id | genesis bundle family_key_id | \
-             ReclaimPolicy.wa_family_key_id) → public; else group record → \
-             owner_of(peer) is a live member, or a subject_key_ids invitee of a live \
-             membership:proposal:v1 into the group held here; else withheld \
-             (group_record_not_member_or_invitee)",
-        ),
-        EnvelopeKind::Community => (
-            "cohort",
-            "cohort_subkind == infrastructure → public; else group record → \
-             owner_of(peer) is a live member, or a subject_key_ids invitee of a live \
-             membership:proposal:v1 into the group held here; else withheld \
-             (group_record_not_member_or_invitee)",
+            "membership_plane: persist may_receive_group_plane(peer, scope, group, None)",
         ),
         EnvelopeKind::LocationProof => ("cohort", "public"),
-        // The four `global` planes: the two tombstone planes above join the two
-        // membership-revocation planes here — all four fan out over the
-        // hardcoded widest own∪cohort set (`Projection::Global`).
-        EnvelopeKind::IdentityOccurrenceRevocation
-        | EnvelopeKind::Revocation
-        | EnvelopeKind::FamilyMembershipRevocation
+        // The two tombstone planes keep the hardcoded widest own∪cohort set
+        // (`Projection::Global`, the #311 rule) and serve public.
+        EnvelopeKind::IdentityOccurrenceRevocation | EnvelopeKind::Revocation => {
+            ("global", "public")
+        }
+        // The membership planes keep the `Global` advertise projection (every
+        // node that holds the group's record must fold the same events, #860)
+        // and are gated per peer: the revocation names the removed member, the
+        // widening the member it seats (#860 / #910), the listing (#912) its
+        // discloser — gated by default, pending CC on what `listed` means.
+        EnvelopeKind::FamilyMembershipRevocation
         | EnvelopeKind::CommunityMembershipRevocation
-        // #860 — the widening is the revocation's append-plane mirror and rides
-        // its projection: every node that holds the room's record must fold the
-        // same events, or rosters diverge (the fork class the plane replaces).
         | EnvelopeKind::CommunityMembershipWidening
-        // #910 the family twin; #912 the listing — a roster fact, never wider than
-        // the room's membership rows (CC 2: the roster is not globally enumerable).
         | EnvelopeKind::FamilyMembershipWidening
-        | EnvelopeKind::CommunityMembershipListing => ("global", "public"),
+        | EnvelopeKind::CommunityMembershipListing => (
+            "global",
+            "membership_plane: persist may_receive_group_plane(peer, scope, group, named member)",
+        ),
         EnvelopeKind::Organization | EnvelopeKind::OrgMembership | EnvelopeKind::PartnerRecord => {
             ("bulk_since", "public")
         }
@@ -127,7 +125,12 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // advertised and served through the Attestation plane (per-record,
         // `SelfOwn` on persist's side), never as a plane of its own. Stated
         // here so the manifest names where the wraps travel.
-        EnvelopeKind::KeyGrant => ("rides:attestation", "public"),
+        // persist v53 S1 (I397) — a key set follows its cohort's audience
+        // (`may_receive`), never a device it merely names.
+        EnvelopeKind::KeyGrant => (
+            "rides:attestation",
+            "persist may_receive(peer, set): the cohort's audience only",
+        ),
     };
     // CIRISEdge#462 — `receive`: whether this kind answers a subject-scoped Pull
     // (the RECEIVE axis), and under what rule. The FIVE replicated kinds are
@@ -305,8 +308,24 @@ pub fn serve_advertise_policy_sha256() -> String {
 // the pre-v38 `public` serve — CC 5.4.6 "from outsiders only", CC 4.4.3.2.1,
 // persist's #761 ruling; `FSD/FIRST_CONTACT.md` §2.5, I23). **CIRISServer must
 // mirror this pin.**
+//
+// CIRISEdge#761 (persist v53 S1) — RE-PINNED, e3070d53… → e7b1ba86…: the
+// Family / Community cells and the five membership-plane cells move to
+// persist's `may_receive_group_plane` (the planes were `public`; a private
+// group's now reach its members', live invitees' and the named member's
+// nodes), the Attestation cell's row half to persist's `may_receive` (`self`
+// → the owner's personal-class nodes), and the KeyGrant cell to the cohort's
+// audience. **CIRISServer must mirror this pin.**
+//
+// CIRISEdge#761 (persist 8fcbeb9e) — RE-PINNED, e7b1ba86… → 68c5298b…: the
+// Attestation cell's membership ceremony moves into persist's `may_receive`
+// (a proposal → every node whose principals include the invitee, an answer →
+// the proposer's nodes, every stage → the group's membership-plane audience);
+// edge's own invitee/proposer checks are gone, and first contact carries a
+// ceremony row exactly when persist admits it as refers-to. **CIRISServer must
+// mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "e3070d5327d6518b7ef50b0988f1af92790e2ea4efb9833cc4213a4127fc41b0";
+    "68c5298b4bb48bbf8ffdb7ef881b71386b3db6ba8c6026b8bb61ec454ebe3850";
 
 #[cfg(test)]
 mod tests {

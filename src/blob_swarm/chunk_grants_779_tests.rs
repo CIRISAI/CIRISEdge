@@ -13,6 +13,14 @@
 //! These witnesses run that order on two real SQLite substrates (the
 //! `delivery_receipts_738` harness, in-process): the bytes first, the chunk
 //! grants after, the last ones held back.
+//!
+//! **CIRISEdge#797 (persist v53, CIRISPersist#969).** A self/family stream
+//! is sealed under one DEK per `(stream, epoch)`, granted by one
+//! `key_grant:stream:v1` set per epoch, and each epoch ends in a zero-length
+//! terminator chunk at `seq = 2^62 + epoch`. The author here rolls its epoch
+//! label every [`EPOCH_CHUNKS`] chunks, so the file is two epochs (seq 0..=2
+//! and 3..=4) and "chunks 3 and 4's keys arrive last" is epoch 1's stream
+//! set held back: the same order as the field, one set where there were two.
 
 use std::sync::Arc;
 
@@ -23,6 +31,7 @@ use ciris_persist::federation::blobs::BlobStorage as _;
 use ciris_persist::federation::key_grant::{
     KeyGrantAxis, KeyGrantSet, SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
 };
+use ciris_persist::federation::types::device_class;
 use ciris_persist::federation::{Attestation, FederationDirectory as _, SignedAttestation};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
@@ -31,7 +40,7 @@ use ciris_persist::store::sqlite::SqliteBackend;
 use super::pull::{BlobPuller, DagByteFetch, PullConfig, PullOutcome, PullSink};
 use crate::files::{FileError, FileRow, FileWrite};
 use crate::group_content::{GroupContentError, GroupContentStore as _, PersistGroupContentStore};
-use crate::receipts::{self, StreamLog as _};
+use crate::receipts::{self, StreamLog};
 use crate::replication::attestation_bind::{Shared, Signers};
 
 fn ts() -> chrono::DateTime<chrono::Utc> {
@@ -39,10 +48,20 @@ fn ts() -> chrono::DateTime<chrono::Utc> {
 }
 
 /// 1.3 MiB: four 256 KiB chunks and a tail, seq 0..=4.
-const FILE_LEN: usize = 1_300_000;
+pub(crate) const FILE_LEN: usize = 1_300_000;
 
-/// The chunks whose grants arrive LAST — the field's seq 782..1023.
+/// CIRISEdge#797 — the author rolls its epoch label every this many chunks:
+/// epoch 0 is seq 0..=2, epoch 1 is seq 3..=4.
+pub(crate) const EPOCH_CHUNKS: u64 = 3;
+
+/// The chunks whose key arrives LAST — the field's seq 782..1023 — are
+/// epoch 1's: its one stream set is held back.
 const LATE: std::ops::RangeInclusive<u64> = 3..=4;
+const LATE_EPOCH: u64 = 1;
+
+/// persist's terminator position base (`TERMINATOR_SEQ_BASE`, #969): an
+/// epoch's terminator sits at `2^62 + epoch`, after every data chunk.
+const TERMINATOR_SEQ_BASE: u64 = 1 << 62;
 
 fn body_of(len: usize, seed: u32) -> Vec<u8> {
     (0..u32::try_from(len).expect("fits"))
@@ -53,15 +72,15 @@ fn body_of(len: usize, seed: u32) -> Vec<u8> {
         .collect()
 }
 
-struct Ident {
-    key_id: String,
+pub(crate) struct Ident {
+    pub(crate) key_id: String,
     seed: u8,
     ed: Ed25519SoftwareSigner,
     pqc: MlDsa65SoftwareSigner,
 }
 
 impl Ident {
-    fn new(key_id: &str, seed: u8) -> Self {
+    pub(crate) fn new(key_id: &str, seed: u8) -> Self {
         let mut ed = Ed25519SoftwareSigner::new(key_id);
         ed.import_key(&[seed; 32]).expect("import ed key");
         let pqc =
@@ -122,17 +141,26 @@ impl Ident {
     }
 }
 
-struct Node {
-    dir: Arc<SqliteBackend>,
-    store: PersistGroupContentStore,
+pub(crate) struct Node {
+    pub(crate) dir: Arc<SqliteBackend>,
+    pub(crate) store: PersistGroupContentStore,
     identity: String,
-    me: String,
-    signer: Arc<crate::identity::LocalSigner>,
+    pub(crate) me: String,
+    pub(crate) signer: Arc<crate::identity::LocalSigner>,
 }
 
 /// A device of `owner` keyed from `device`, with its owner binding and its
-/// node-class engine occurrence (`delivery_receipts_738::device`).
-async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
+/// engine occurrence of `class` (`delivery_receipts_738::device`). Under
+/// persist v53 S1 the class decides self/family reach (CC 3.3.7): a personal
+/// device (`phone` | `laptop`) is wrapped its owner's self content, a server
+/// is not.
+pub(crate) async fn device(
+    idents: &[&Ident],
+    owner: &Ident,
+    device: &Ident,
+    chunks_per_epoch: Option<u64>,
+    class: &str,
+) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -179,11 +207,15 @@ async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
     )
     .await
     .expect("hybrid content store");
+    let store = match chunks_per_epoch {
+        Some(n) => store.with_chunks_per_epoch(n),
+        None => store,
+    };
     let (me, _) = crate::content_occurrence::provision_engine_occurrence(
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     .expect("provision this node's engine occurrence");
@@ -197,7 +229,7 @@ async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
 }
 
 /// Hand `from`'s node key, owner binding and occurrence to `to`.
-async fn federate(from: &Node, to: &Node) {
+pub(crate) async fn federate(from: &Node, to: &Node) {
     let rec =
         ciris_persist::federation::FederationDirectory::lookup_public_key(&*from.dir, &from.me)
             .await
@@ -270,7 +302,7 @@ impl crate::transport::Transport for NoWire {
     }
 }
 
-fn edge_of(node: &Node) -> Arc<crate::Edge> {
+pub(crate) fn edge_of(node: &Node) -> Arc<crate::Edge> {
     use ciris_persist::federation::FederationDirectory;
     Arc::new(
         crate::Edge::builder()
@@ -285,11 +317,11 @@ fn edge_of(node: &Node) -> Arc<crate::Edge> {
     )
 }
 
-fn puller_of(node: &Node, edge: &Arc<crate::Edge>) -> Arc<BlobPuller<SqliteBackend>> {
+pub(crate) fn puller_of(node: &Node, edge: &Arc<crate::Edge>) -> Arc<BlobPuller<SqliteBackend>> {
     puller_with(node, edge, PullConfig::default())
 }
 
-fn puller_with(
+pub(crate) fn puller_with(
     node: &Node,
     edge: &Arc<crate::Edge>,
     config: PullConfig,
@@ -306,7 +338,7 @@ fn puller_with(
 }
 
 /// The author's peer-serve door: the bytes a holder puts on the wire.
-struct StoreFetch {
+pub(crate) struct StoreFetch {
     engine: ciris_persist::Engine,
     peer: String,
     holders: Vec<String>,
@@ -332,7 +364,7 @@ impl DagByteFetch for StoreFetch {
     }
 }
 
-fn fetch_from(author: &Node, reader: &Node) -> StoreFetch {
+pub(crate) fn fetch_from(author: &Node, reader: &Node) -> StoreFetch {
     StoreFetch {
         engine: author.store.engine().clone(),
         peer: reader.me.clone(),
@@ -340,18 +372,26 @@ fn fetch_from(author: &Node, reader: &Node) -> StoreFetch {
     }
 }
 
-struct Published {
-    row: Attestation,
-    sha: [u8; 32],
-    stream_id: String,
-    plain: Vec<u8>,
-    /// Chunk addresses in `seq` order.
-    chunks: Vec<[u8; 32]>,
+pub(crate) struct Published {
+    pub(crate) row: Attestation,
+    pub(crate) sha: [u8; 32],
+    pub(crate) stream_id: String,
+    pub(crate) plain: Vec<u8>,
+    /// The data chunks' addresses in `seq` order.
+    pub(crate) chunks: Vec<[u8; 32]>,
+    /// CIRISEdge#797 — every chunk of the stream, terminators included, as
+    /// `(seq, plaintext size, address)` in `seq` order.
+    pub(crate) stream: Vec<(u64, u64, [u8; 32])>,
 }
 
-async fn publish_self_file(author: &Node, owner: &Ident) -> Published {
+pub(crate) async fn publish_self_file(author: &Node, owner: &Ident) -> Published {
+    publish_self_file_seeded(author, owner, 0x0779).await
+}
+
+/// [`publish_self_file`] with the body drawn from `seed`, so two files differ.
+pub(crate) async fn publish_self_file_seeded(author: &Node, owner: &Ident, seed: u32) -> Published {
     let room = crate::self_room::room(&owner.key_id);
-    let plain = body_of(FILE_LEN, 0x0779);
+    let plain = body_of(FILE_LEN, seed);
     let published = crate::files::publish(
         &*author.dir,
         &author.store,
@@ -388,28 +428,68 @@ async fn publish_self_file(author: &Node, owner: &Ident) -> Published {
         .await
         .expect("read")
         .expect("the crossed row");
-    let chunks = author
+    let stream: Vec<(u64, u64, [u8; 32])> = author
         .dir
-        .stream_chunk_shas(&stream_id)
+        .stream_chunks(&stream_id)
         .await
-        .expect("stream chunks");
-    assert_eq!(chunks.len(), 5, "four 256 KiB chunks and the tail");
+        .expect("stream chunks")
+        .chunks
+        .into_iter()
+        .map(|c| (c.seq, c.plaintext_size, c.chunk_sha))
+        .collect();
+    // CIRISEdge#797 — five data chunks, then one empty terminator per epoch
+    // (two epochs: the label rolled at seq 3), sorting after every data chunk.
+    let seqs: Vec<u64> = stream.iter().map(|c| c.0).collect();
+    assert_eq!(
+        seqs,
+        vec![0, 1, 2, 3, 4, TERMINATOR_SEQ_BASE, TERMINATOR_SEQ_BASE + 1],
+        "four 256 KiB chunks, the tail, and a terminator per epoch"
+    );
+    assert!(
+        stream[5..].iter().all(|c| c.1 == 0),
+        "terminators are empty"
+    );
+    let chunks = stream[..5].iter().map(|c| c.2).collect();
     Published {
         row,
         sha,
         stream_id,
         plain,
         chunks,
+        stream,
+    }
+}
+
+/// The key sets a crossing holds back.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Withhold {
+    /// Content-axis sets for these rows (the manifest).
+    rows: Vec<[u8; 32]>,
+    /// CIRISEdge#797 — stream-axis sets for these epochs.
+    epochs: Vec<u64>,
+}
+
+impl Withhold {
+    pub(crate) fn none() -> Self {
+        Self::default()
+    }
+
+    /// The late chunks' key: epoch 1's stream set.
+    fn late() -> Self {
+        Self {
+            rows: Vec::new(),
+            epochs: vec![LATE_EPOCH],
+        }
     }
 }
 
 /// Apply the author's `key_grant` sets through `reader`'s key-grant door,
-/// except those for a blob in `withhold`, and hand each admission to `sink`
-/// as the bridge's key-grant door does. Returns how many were applied.
-async fn cross_keys_except(
+/// except those `withhold` names, and hand each admission to `sink` as the
+/// bridge's key-grant door does. Returns how many were applied.
+pub(crate) async fn cross_keys_except(
     author: &Node,
     reader: &Node,
-    withhold: &[[u8; 32]],
+    withhold: &Withhold,
     sink: Option<&PullSink>,
 ) -> usize {
     author
@@ -418,7 +498,7 @@ async fn cross_keys_except(
         .emit_pending_key_grants()
         .await
         .expect("emit");
-    let held_back: Vec<String> = withhold.iter().map(hex::encode).collect();
+    let held_back: Vec<String> = withhold.rows.iter().map(hex::encode).collect();
     let mut applied = 0;
     for s in author
         .dir
@@ -433,10 +513,12 @@ async fn cross_keys_except(
         })
     {
         let set = KeyGrantSet::from_attestation(&s.attestation).expect("a well-formed set");
-        if let KeyGrantAxis::Content { at_rest_sha256, .. } = &set.axis {
-            if held_back.contains(at_rest_sha256) {
+        match &set.axis {
+            KeyGrantAxis::Content { at_rest_sha256, .. } if held_back.contains(at_rest_sha256) => {
                 continue;
             }
+            KeyGrantAxis::Stream { epoch, .. } if withhold.epochs.contains(epoch) => continue,
+            _ => {}
         }
         let admission = reader
             .store
@@ -474,20 +556,30 @@ fn receipts_emitted(edge: &crate::Edge) -> u64 {
         .unwrap_or(0)
 }
 
-async fn two_devices() -> (Ident, Node, Node) {
+pub(crate) async fn two_devices() -> (Ident, Node, Node) {
     let alice = Ident::new("alice-fed", 0x11);
     let alice_phone = Ident::new("alice-phone", 0x33);
-    let node_a = device(&[&alice], &alice, &alice).await;
-    let node_b = device(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    // S1 (CC 3.3.7) — D1 and D2 are alice's own devices: B is wrapped every
+    // chunk of her self file only as a personal-class node.
+    let node_a = device(
+        &[&alice],
+        &alice,
+        &alice,
+        Some(EPOCH_CHUNKS),
+        device_class::LAPTOP,
+    )
+    .await;
+    let node_b = device(
+        &[&alice, &alice_phone],
+        &alice,
+        &alice_phone,
+        None,
+        device_class::PHONE,
+    )
+    .await;
     federate(&node_a, &node_b).await;
     federate(&node_b, &node_a).await;
     (alice, node_a, node_b)
-}
-
-/// The chunks whose grants are held back, by address.
-fn late_chunks(file: &Published) -> Vec<[u8; 32]> {
-    LATE.map(|seq| file.chunks[usize::try_from(seq).expect("fits")])
-        .collect()
 }
 
 /// **The pull does not report a DAG Stored, promote it, or receipt it while
@@ -518,7 +610,7 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
 
     // 2. The manifest's wrap and chunks 0..=2's land; 3 and 4's have not.
     //    Every chunk's BYTES arrive on this pull.
-    assert!(cross_keys_except(&node_a, &node_b, &late_chunks(&file), None).await > 0);
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::late(), None).await > 0);
     let early = puller
         .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
         .await;
@@ -527,10 +619,10 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
         "every chunk's bytes are held but chunks {LATE:?} do not open here: the pull must park \
          on their keys, not report the file pulled; got {early:?}"
     );
-    for (seq, chunk) in file.chunks.iter().enumerate() {
+    for (seq, _, chunk) in &file.stream {
         assert!(
             node_b.dir.has_blob(chunk).await.expect("has_blob"),
-            "chunk {seq}'s bytes were adopted and are kept for the resume"
+            "chunk {seq}'s bytes (terminators too) were adopted and are kept for the resume"
         );
     }
     assert!(
@@ -541,7 +633,7 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
 
     // 3. The last grants land: the resume promotes, receipts once, and the
     //    whole file streams through `FileRow::chunks`.
-    assert!(cross_keys_except(&node_a, &node_b, &[], None).await > 0);
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await > 0);
     assert_eq!(
         puller
             .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
@@ -559,7 +651,10 @@ async fn a_dag_is_not_stored_until_every_chunk_opens_here_779() {
         read.extend_from_slice(&item.expect("every chunk opens as this node"));
         items += 1;
     }
-    assert_eq!(items, 5);
+    assert_eq!(
+        items, 5,
+        "one item per data chunk; the empty terminators hold no byte"
+    );
     assert!(
         read == file.plain,
         "the walk reads the file the author wrote"
@@ -582,7 +677,7 @@ async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
         .await
         .expect("B admits the crossed row");
     let puller = puller_of(&node_b, &edge_b);
-    cross_keys_except(&node_a, &node_b, &late_chunks(&file), None).await;
+    cross_keys_except(&node_a, &node_b, &Withhold::late(), None).await;
     assert!(matches!(
         puller
             .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
@@ -619,6 +714,14 @@ async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
         said.contains(&late) && said.contains("seq 3"),
         "the refusal names chunk 3 by its own sha: {said}"
     );
+    // CIRISEdge#797 — and it is the wait, not the verdict: this node is
+    // authorized on the file and epoch 1's key has not landed yet.
+    assert_eq!(reason.kind(), "awaiting_key", "{said}");
+    assert!(
+        reason.is_pending(),
+        "a chunk's key still arriving is a state to wait through"
+    );
+    assert!(walk.next().await.is_none(), "a refusal ends the walk");
 
     // The store's typed error, directly: the file's sha, AND the chunk.
     let layout = file_row
@@ -640,16 +743,26 @@ async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
         )
         .await
         .expect_err("chunk 3 is not wrapped to this node");
-    let GroupContentError::NotGranted { sha256_hex, chunk } = err else {
-        panic!("NotGranted: {err:?}");
+    // CIRISEdge#797 — persist's `blob_chunk_key_not_yet_granted`, typed:
+    // never `NotGranted`, which is the stranger's refusal.
+    let GroupContentError::ChunkKeyPending {
+        sha256_hex,
+        chunk,
+        key,
+    } = err
+    else {
+        panic!("ChunkKeyPending: {err:?}");
     };
     assert_eq!(
         sha256_hex,
         hex::encode(file.sha),
         "the read targeted the file"
     );
-    let chunk = chunk.expect("the refused chunk is named");
     assert_eq!((chunk.seq, chunk.sha256_hex), (3, late));
+    assert!(
+        key.contains("key_grant:stream:v1") && key.contains(&format!("epoch {LATE_EPOCH}")),
+        "the key to wait for is epoch 1's stream set: {key}"
+    );
 }
 
 async fn promoted(node: &Node, sha: &[u8; 32]) -> bool {
@@ -704,10 +817,11 @@ async fn parked_past_the_ladder_then_woken(manifest_too: bool) {
     );
     let (sink, run) = Arc::clone(&puller).start();
 
-    // Every wrap but chunks 3 and 4's (and the manifest's, on that arm).
-    let mut withhold = late_chunks(&file);
+    // Every key but chunks 3 and 4's — epoch 1's stream set — (and the
+    // manifest's, on that arm).
+    let mut withhold = Withhold::late();
     if manifest_too {
-        withhold.push(file.sha);
+        withhold.rows.push(file.sha);
     }
     cross_keys_except(&node_a, &node_b, &withhold, Some(&sink)).await;
     assert!(matches!(
@@ -734,7 +848,7 @@ async fn parked_past_the_ladder_then_woken(manifest_too: bool) {
     assert!(receipt_rows(&node_b, &file.stream_id).await.is_empty());
 
     // The last grants land. Nothing re-offers the row; the grant wakes it.
-    assert!(cross_keys_except(&node_a, &node_b, &[], Some(&sink)).await > 0);
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::none(), Some(&sink)).await > 0);
     if manifest_too {
         // The woken pull opens the manifest and goes for the chunks, which
         // this harness's loop has no wire to fetch (`NoWire`): it fails the
@@ -789,4 +903,513 @@ async fn parked_past_the_ladder_then_woken(manifest_too: bool) {
     );
     drop(sink);
     run.abort();
+}
+
+/// **CIRISEdge#797 — a multi-epoch v4 DAG, its terminators held, reads and
+/// range-reads as the file.** The file is two stream epochs (seq 0..=2 and
+/// 3..=4) with an empty terminator per epoch at `2^62 + epoch`: the pull
+/// adopts all seven chunks, each at its manifest epoch, and promotes; the
+/// layout carries the terminators as empty extents at the file's end, never
+/// as bytes; whole, streamed and ranged reads (one across the epoch
+/// boundary) are the author's bytes; and the one receipt's `K` is the
+/// stream's tree size, the terminators included, as persist's STH commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // every read shape over one pulled file, in order, on purpose
+async fn a_multi_epoch_dag_reads_and_range_reads_across_its_terminators_797() {
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: file.row.clone(),
+        })
+        .await
+        .expect("B admits the crossed row");
+    cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await;
+    let puller = puller_of(&node_b, &edge_b);
+    assert_eq!(
+        puller
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false }
+    );
+    let held: Vec<(u64, u64, [u8; 32])> = node_b
+        .dir
+        .stream_chunks(&file.stream_id)
+        .await
+        .expect("stream chunks")
+        .chunks
+        .into_iter()
+        .map(|c| (c.seq, c.plaintext_size, c.chunk_sha))
+        .collect();
+    assert_eq!(
+        held, file.stream,
+        "every chunk, terminators too, at its position"
+    );
+
+    let file_row = FileRow::from_row(&file.row).expect("a file row");
+    let layout = file_row
+        .layout(&node_b.store, &node_b.me)
+        .await
+        .expect("layout");
+    assert_eq!(layout.total_size, FILE_LEN as u64);
+    let extents: Vec<(u64, u64, u64)> = layout
+        .chunks
+        .iter()
+        .map(|c| (c.seq, c.offset, c.size))
+        .collect();
+    let chunk = 256 * 1024u64;
+    assert_eq!(
+        extents,
+        vec![
+            (0, 0, chunk),
+            (1, chunk, chunk),
+            (2, 2 * chunk, chunk),
+            (3, 3 * chunk, chunk),
+            (4, 4 * chunk, FILE_LEN as u64 - 4 * chunk),
+            (TERMINATOR_SEQ_BASE, FILE_LEN as u64, 0),
+            (TERMINATOR_SEQ_BASE + 1, FILE_LEN as u64, 0),
+        ],
+        "the terminators are empty extents at the end: no offset moves"
+    );
+    assert!(layout.chunks[5].end_inclusive().is_none());
+
+    let whole = file_row
+        .open(&node_b.store, &node_b.me)
+        .await
+        .expect("the whole file opens");
+    assert!(whole == file.plain, "whole read: the author's bytes");
+    let mut walk = file_row.chunks(&node_b.store, &node_b.me);
+    let mut streamed = Vec::with_capacity(FILE_LEN);
+    let mut items = 0;
+    while let Some(item) = walk.next().await {
+        let item = item.expect("every chunk opens");
+        assert!(!item.is_empty(), "no empty item reaches the reader");
+        streamed.extend_from_slice(&item);
+        items += 1;
+    }
+    assert_eq!(items, 5);
+    assert!(streamed == file.plain, "streamed read: the author's bytes");
+
+    // Ranges: inside epoch 0, across the epoch boundary (chunk 2 → 3), inside
+    // epoch 1, the last byte; past the end is refused, naming the size.
+    let boundary = 3 * chunk;
+    for (offset, len) in [
+        (0u64, 10u64),
+        (boundary - 100, 200),
+        (boundary + 5, 1000),
+        (FILE_LEN as u64 - 1, 1),
+    ] {
+        let got = file_row
+            .open_range(&node_b.store, &node_b.me, offset, len)
+            .await
+            .unwrap_or_else(|e| panic!("range {offset}+{len}: {e}"));
+        let at = usize::try_from(offset).expect("fits");
+        let end = at + usize::try_from(len).expect("fits");
+        assert!(got == file.plain[at..end], "range {offset}+{len}");
+    }
+    assert!(matches!(
+        file_row
+            .open_range(&node_b.store, &node_b.me, FILE_LEN as u64, 1)
+            .await,
+        Err(FileError::RangeNotSatisfiable { .. })
+    ));
+
+    let receipts = StreamLog::list_delivery_receipts_for(&*node_b.dir, &file.stream_id, 16)
+        .await
+        .expect("receipts");
+    assert_eq!(receipts.len(), 1, "one receipt");
+    assert_eq!(
+        receipts[0].k,
+        file.stream.len() as u64,
+        "K is the stream's tree size: the data chunks and a terminator per epoch"
+    );
+}
+
+/// **A wrong-AAD read of a v4 DAG is `SealMismatch`, whole and by range**
+/// (persist v53, CIRISPersist#842 kept at #969). B holds the pulled file
+/// and every key; a read that presents another row's binding (the same
+/// author, the instant off by one second) must say "this did not open under
+/// that row", never "you may not read this" (`NotGranted`) or a substrate
+/// fault: persist's `blob_seal_did_not_open`, which edge types
+/// `GroupContentError::SealMismatch`. The correct binding still opens.
+/// Fails with edge's `SealDidNotOpen` arm removed (the refusal falls through
+/// to `Substrate`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_aad_read_of_a_v4_dag_is_seal_mismatch_whole_and_by_range_797() {
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: file.row.clone(),
+        })
+        .await
+        .expect("B admits the crossed row");
+    cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await;
+    assert_eq!(
+        puller_of(&node_b, &edge_b)
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false }
+    );
+    let file_row = FileRow::from_row(&file.row).expect("a file row");
+    let request = |asserted_at| crate::group_content::OpenRequest {
+        pointer: &file_row.pointer,
+        author_key_id: &file_row.attesting_key_id,
+        asserted_at,
+        viewer_key_id: &node_b.me,
+    };
+    let right = file.row.asserted_at;
+    let wrong = right + chrono::Duration::seconds(1);
+    let whole = node_b.store.open(request(right)).await.expect("opens");
+    assert!(whole == file.plain, "the row's own binding opens");
+
+    let whole_wrong = node_b.store.open(request(wrong)).await;
+    assert!(
+        matches!(whole_wrong, Err(GroupContentError::SealMismatch { .. })),
+        "a whole read under another binding is SealMismatch: {whole_wrong:?}"
+    );
+    // A range inside epoch 0, and one across the epoch boundary.
+    let chunk = 256 * 1024u64;
+    for (start, end_inclusive) in [(10u64, 20u64), (3 * chunk - 100, 3 * chunk + 100)] {
+        let ok = node_b
+            .store
+            .open_range(request(right), start, end_inclusive)
+            .await
+            .expect("the range opens under the row's binding");
+        assert_eq!(ok.len() as u64, end_inclusive - start + 1);
+        let got = node_b
+            .store
+            .open_range(request(wrong), start, end_inclusive)
+            .await;
+        assert!(
+            matches!(got, Err(GroupContentError::SealMismatch { .. })),
+            "range {start}..={end_inclusive} under another binding is SealMismatch: {got:?}"
+        );
+    }
+}
+
+/// Hand `from`'s current signed engine occurrence to `to` (the row a peer
+/// replicates after a reclass: same keys, the new class, a newer
+/// `asserted_at`).
+pub(crate) async fn carry_occurrence(from: &Node, to: &Node) {
+    let occ = from
+        .dir
+        .list_signed_identity_occurrences_since(None, 64)
+        .await
+        .expect("list occurrences")
+        .into_iter()
+        .map(|s| s.occurrence)
+        .filter(|o| {
+            o.identity_occurrence.occurrence_key_id == from.me
+                && o.identity_occurrence.identity_key_id == from.identity
+        })
+        .max_by_key(|o| o.identity_occurrence.asserted_at)
+        .expect("the engine occurrence is on the signed plane");
+    to.dir
+        .put_identity_occurrence(occ)
+        .await
+        .expect("admit the far node's occurrence");
+}
+
+/// **CIRISEdge#799 under persist v53 S1 (CC 3.3.7) — a device its owner
+/// claimed as a `server` is wrapped none of the owner's self file; once
+/// `provision_engine_occurrence` reclasses it `phone` it is wrapped every
+/// chunk and reads the whole file.** The field shape: alice's phone, whose
+/// embedded server provisioned it `server`. A (her laptop) publishes a self
+/// file and B holds the crossed row and every key set A emits, yet B's pull
+/// parks on its keys: S1 keeps a server-class node out of its owner's self
+/// audience, and the wraps follow the audience. Reprovisioned as a `phone`
+/// (`Reclassed`), its new occurrence reaches A, and alice's next self file is
+/// wrapped to it: B's pull is `Stored` and streams the file. Fails without the
+/// #799 reclass (`AlreadyCurrent`, the row stays `server`, B is still refused).
+/// The file published while B was a server reaches it too: persist's
+/// signed-occurrence receive door treats a device re-classed into the self
+/// audience as a newcomer to the self keys A holds (I397b–d, persist
+/// 32fe46f9), and A's next emission carries the re-wraps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reclassed_phone_receives_its_owners_self_file_and_a_server_does_not_799() {
+    use crate::content_occurrence::{provision_engine_occurrence, Provisioned};
+    let alice = Ident::new("alice-fed", 0x11);
+    let alice_phone = Ident::new("alice-phone", 0x33);
+    let node_a = device(
+        &[&alice],
+        &alice,
+        &alice,
+        Some(EPOCH_CHUNKS),
+        device_class::LAPTOP,
+    )
+    .await;
+    let node_b = device(
+        &[&alice, &alice_phone],
+        &alice,
+        &alice_phone,
+        None,
+        device_class::SERVER,
+    )
+    .await;
+    federate(&node_a, &node_b).await;
+    federate(&node_b, &node_a).await;
+    let edge_b = edge_of(&node_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: file.row.clone(),
+        })
+        .await
+        .expect("B admits the crossed row");
+    let puller = puller_of(&node_b, &edge_b);
+
+    // 1. As a `server`: every key set A emits crosses, and B is party to
+    //    none of it — persist's hold refuses the manifest at adopt.
+    cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await;
+    let as_server = puller
+        .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+        .await;
+    assert!(
+        matches!(&as_server, PullOutcome::StoreFailed(e) if e.contains("not party to self content")),
+        "a server-class device of alice's holds none of her self file (CC 3.3.7); \
+         got {as_server:?}"
+    );
+
+    // 2. Reclassed `phone` (#799): same keys, the new class, re-signed.
+    let (_, outcome) = provision_engine_occurrence(
+        node_b.store.engine(),
+        &*node_b.dir,
+        &alice.key_id,
+        device_class::PHONE,
+    )
+    .await
+    .expect("reprovision as a phone");
+    assert_eq!(
+        outcome,
+        Provisioned::Reclassed {
+            from: device_class::SERVER.to_owned(),
+            to: device_class::PHONE.to_owned(),
+        }
+    );
+    carry_occurrence(&node_b, &node_a).await;
+
+    // 3. Alice's next self file is wrapped to the phone: it stores and
+    //    streams there.
+    let next = publish_self_file_seeded(&node_a, &alice, 0x0799).await;
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: next.row.clone(),
+        })
+        .await
+        .expect("B admits the next crossed row");
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await > 0);
+    assert_eq!(
+        puller
+            .pull_dag_with(&next.row, next.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false },
+        "the reclassed phone is in alice's self audience and opens every chunk"
+    );
+    let file_row = FileRow::from_row(&next.row).expect("a file row");
+    let mut walk = file_row.chunks(&node_b.store, &node_b.me);
+    let mut read = Vec::with_capacity(FILE_LEN);
+    while let Some(item) = walk.next().await {
+        read.extend_from_slice(&item.expect("every chunk opens on the phone"));
+    }
+    assert!(read == next.plain, "the phone reads the file alice wrote");
+    // The earlier file, published while B was a server, now opens too.
+    assert_eq!(
+        puller
+            .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false },
+        "a device re-classed into the self audience gets the earlier self keys (I397b–d)"
+    );
+}
+
+/// **CIRISEdge#797 — a legacy v2 DAG (v52's per-chunk-keyed file) written on
+/// A is pulled and read on B through edge's real DAG pull.** persist v53
+/// writes only v4 manifests, so the file is written by persist's one v2
+/// writer (`write_legacy_v2_dag`, test-anchor) as a v52 node did, and A emits
+/// its key-grant sets. B is alice's phone, a personal-class device (under S1
+/// a server-class node is given no self keys). The file is sealed, manifest
+/// and chunks, under edge's `content_aad` of the row that names it, as a v52
+/// edge node sealed it. B learns of the file only
+/// through the crossed sets and a self row pointing at the DAG; edge's
+/// `pull_dag_with` fetches and adopts the sealed manifest and every sealed
+/// chunk. Chunk 0's content grant is held back first: the pull parks on it
+/// (a v2 DAG waits on per-chunk content grants, `awaiting_of` → `Content`),
+/// and that grant's arrival wakes the pull, which promotes. On B: the
+/// manifest is v2 and its chunks carry no epoch (each adopted at epoch 0,
+/// `chunk_adopt_epoch`), persist's readiness reads the DAG readable on
+/// content keys, and the whole file and a range read back exactly. Fails if
+/// edge parks a v2 DAG on anything but its chunks' content grants (the pull
+/// is never woken).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // write, park, wake, then every read, in order
+async fn a_legacy_v2_dag_is_pulled_and_read_on_the_owners_other_device_797() {
+    use ciris_persist::federation::chunk_dag_cascade::test_support::{
+        write_legacy_v2_dag, LegacyV2Dag,
+    };
+    use ciris_persist::federation::types::cohort_scope::SELF;
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+
+    // The row template: a real self file of alice's, whose pointer is then
+    // pointed at the v2 DAG (the pull reads the pointer, never the template's
+    // bytes).
+    let template = publish_self_file_seeded(&node_a, &alice, 0x0797).await;
+    let template_hex = hex::encode(template.sha);
+    let field = template
+        .row
+        .attestation_envelope
+        .as_object()
+        .expect("envelope object")
+        .values()
+        .filter_map(|v| serde_json::from_value::<crate::group_content::BlobPointer>(v.clone()).ok())
+        .find(|p| p.content_sha256 == template_hex)
+        .expect("the template's pointer")
+        .content_field;
+    // The AAD a v52 edge writer bound the file to: the naming row's.
+    let aad = crate::group_content::content_aad(
+        &template.row.attesting_key_id,
+        template.row.asserted_at,
+        field,
+    );
+    let stream = format!("v2-797-{}", uuid::Uuid::new_v4().simple());
+    let segs: Vec<Vec<u8>> = (0..5)
+        .map(|i: usize| {
+            (0..60 + (i % 4) * 17)
+                .map(|j| (i * 29 + j).to_le_bytes()[0])
+                .collect()
+        })
+        .collect();
+    let LegacyV2Dag {
+        manifest_sha256: root,
+        chunk_sha256,
+        plaintext,
+    } = write_legacy_v2_dag(
+        node_a.store.engine(),
+        &*node_a.dir,
+        SELF,
+        &alice.key_id,
+        &stream,
+        &segs,
+        Some(&aad),
+    )
+    .await
+    .expect("A writes a v2 file, as a v52 node did");
+    let mut row = template.row.clone();
+    let slot = row
+        .attestation_envelope
+        .as_object_mut()
+        .expect("envelope object")
+        .values_mut()
+        .find(|v| {
+            v.get("content_sha256").and_then(serde_json::Value::as_str)
+                == Some(template_hex.as_str())
+        })
+        .expect("the template's pointer");
+    slot["content_sha256"] = serde_json::json!(hex::encode(root));
+    slot["stream_id"] = serde_json::json!(stream);
+    slot["size"] = serde_json::json!(plaintext.len());
+    slot["content_digest"] = serde_json::json!(hex::encode(
+        <sha2::Sha256 as sha2::Digest>::digest(&plaintext)
+    ));
+    if let Some(o) = slot.as_object_mut() {
+        o.remove("sealed_descriptor");
+    }
+
+    // A's key-grant sets cross, all but chunk 0's content grant. B's pull
+    // through edge's DAG path fetches and adopts the manifest and every
+    // chunk, then parks on what persist's readiness names for a v2 DAG: the
+    // missing chunk's own content grant (`awaiting_of` → `Content`).
+    let puller = puller_with(
+        &node_b,
+        &edge_b,
+        PullConfig {
+            max_attempts: 2,
+            retry_backoff: std::time::Duration::from_millis(50),
+            ..PullConfig::default()
+        },
+    );
+    let (sink, run) = Arc::clone(&puller).start();
+    let held_back = Withhold {
+        rows: vec![chunk_sha256[0]],
+        epochs: Vec::new(),
+    };
+    assert!(cross_keys_except(&node_a, &node_b, &held_back, Some(&sink)).await > 0);
+    let parked = puller
+        .pull_dag_with(&row, root, &fetch_from(&node_a, &node_b))
+        .await;
+    assert!(
+        matches!(parked, PullOutcome::DagAwaitingKey { .. }),
+        "chunk 0's grant is missing: the v2 DAG parks on it, not Stored; got {parked:?}"
+    );
+    assert!(!promoted(&node_b, &root).await);
+    // Let the retry ladder run out, so only the grant's wake can re-pull.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !puller.ladder_spent(root) {
+        assert!(std::time::Instant::now() < deadline, "the ladder runs out");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!promoted(&node_b, &root).await);
+
+    // Chunk 0's grant lands. Nothing re-offers the row: the grant wakes the
+    // parked pull, which promotes the v2 DAG.
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::none(), Some(&sink)).await > 0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !promoted(&node_b, &root).await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "chunk 0's content grant landed and the parked v2 DAG was never re-pulled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    drop(sink);
+    run.abort();
+
+    let b = node_b.store.engine();
+    let view = b
+        .open_sealed_manifest_as(&root, &node_b.me, Some(&aad))
+        .await
+        .expect("B opens the manifest");
+    assert_eq!(view.version, 2, "B holds a legacy (v2) manifest");
+    assert!(
+        view.chunks.iter().all(|c| c.epoch.is_none()),
+        "a v2 chunk names no epoch: edge adopts each at epoch 0"
+    );
+    assert_eq!(
+        view.chunks
+            .iter()
+            .map(|c| c.sha256_hex.clone())
+            .collect::<Vec<_>>(),
+        chunk_sha256.iter().map(hex::encode).collect::<Vec<_>>()
+    );
+    let ready = b
+        .sealed_dag_readiness(&root, &node_b.me, Some(&aad))
+        .await
+        .expect("readiness");
+    assert_eq!(ready.chunk_keys, "content", "{ready:?}");
+    assert!(
+        ready.held && ready.readable && ready.missing.is_empty(),
+        "{ready:?}"
+    );
+    assert_eq!(
+        b.read_blob_as(&root, &node_b.me, Some(&aad))
+            .await
+            .expect("whole read"),
+        plaintext,
+        "B reads the v2 file whole"
+    );
+    assert_eq!(
+        b.read_blob_range_as(&root, &node_b.me, 70, 200, Some(&aad))
+            .await
+            .expect("range read"),
+        plaintext[70..=200].to_vec(),
+        "a range across chunk boundaries"
+    );
 }

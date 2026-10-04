@@ -11,6 +11,11 @@
 //! This is the other half: the puller records what each parked DAG waits
 //! on, and the bridge's key-grant door ([`super::PullSink::key_grant_admitted`])
 //! marks the DAG woken when a set that wrote a wrap to this node names it.
+//!
+//! CIRISEdge#797 (persist v53, CIRISPersist#969) — a v4 DAG's chunks are
+//! sealed under one DEK per `(stream, epoch)`, so a DAG whose chunks do not
+//! open here yet waits on stream epochs, and a `key_grant:stream:v1` set for
+//! one of them wakes it.
 //! The puller's tick dispatches each woken DAG once, from a fresh ladder.
 //!
 //! Bounded everywhere: at most `capacity` parked DAGs (the oldest is
@@ -29,6 +34,9 @@ pub(crate) enum Awaiting {
     /// Content-axis wraps (self / family): the at-rest addresses of the rows
     /// (the manifest, or the chunks) this node holds no wrap for.
     Content(Vec<[u8; 32]>),
+    /// CIRISEdge#797 — stream-axis grants (a v4 `self` / `family` DAG): the
+    /// `(stream_id, epoch)` of every stream epoch this node holds no key for.
+    Stream(Vec<(String, u64)>),
     /// An epoch-axis grant (`community_dek`): the manifest's sealed-under
     /// epoch, when the pointer names one.
     Epoch(Option<u64>),
@@ -48,17 +56,29 @@ struct Inner {
     parked: HashMap<[u8; 32], Parked>,
     /// Content key → the DAG waiting on it.
     by_key: HashMap<[u8; 32], [u8; 32]>,
+    /// CIRISEdge#797 — stream epoch → the DAG waiting on it.
+    by_stream: HashMap<(String, u64), [u8; 32]>,
     next_order: u64,
 }
 
 impl Inner {
     fn unindex(&mut self, dag: [u8; 32], awaiting: &Awaiting) {
-        if let Awaiting::Content(keys) = awaiting {
-            for k in keys {
-                if self.by_key.get(k) == Some(&dag) {
-                    self.by_key.remove(k);
+        match awaiting {
+            Awaiting::Content(keys) => {
+                for k in keys {
+                    if self.by_key.get(k) == Some(&dag) {
+                        self.by_key.remove(k);
+                    }
                 }
             }
+            Awaiting::Stream(epochs) => {
+                for k in epochs {
+                    if self.by_stream.get(k) == Some(&dag) {
+                        self.by_stream.remove(k);
+                    }
+                }
+            }
+            Awaiting::Epoch(_) => {}
         }
     }
 }
@@ -109,10 +129,18 @@ impl KeyWaits {
             }
             false
         };
-        if let Awaiting::Content(keys) = &awaiting {
-            for k in keys {
-                inner.by_key.insert(*k, dag);
+        match &awaiting {
+            Awaiting::Content(keys) => {
+                for k in keys {
+                    inner.by_key.insert(*k, dag);
+                }
             }
+            Awaiting::Stream(epochs) => {
+                for k in epochs {
+                    inner.by_stream.insert(k.clone(), dag);
+                }
+            }
+            Awaiting::Epoch(_) => {}
         }
         let order = inner.next_order;
         inner.next_order += 1;
@@ -143,6 +171,24 @@ impl KeyWaits {
             return false;
         };
         let Some(dag) = inner.by_key.remove(&sha) else {
+            return false;
+        };
+        match inner.parked.get_mut(&dag) {
+            Some(p) => {
+                p.woken = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// CIRISEdge#797 — a stream-axis wrap to this node landed for
+    /// `(stream_id, epoch)`. Returns whether a parked DAG was waiting on it.
+    pub(crate) fn wake_stream(&self, stream_id: &str, epoch: u64) -> bool {
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        let Some(dag) = inner.by_stream.remove(&(stream_id.to_owned(), epoch)) else {
             return false;
         };
         match inner.parked.get_mut(&dag) {
@@ -248,5 +294,28 @@ mod tests {
         assert!(!waits.wake_content([11u8; 32]), "with its keys");
         assert_eq!(waits.wake_epoch(3), 2, "its epoch, and an unnamed one");
         assert_eq!(waits.wake_epoch(4), 1, "only the unnamed one");
+    }
+
+    /// CIRISEdge#797 — a DAG parked on stream epochs is woken by a stream
+    /// set naming one of them, and by nothing else: not another epoch of its
+    /// stream, not the same epoch of another stream, not an epoch-axis set.
+    #[test]
+    fn a_stream_epoch_wakes_the_dag_parked_on_it_797() {
+        let waits = KeyWaits::new(4);
+        let dag = [5u8; 32];
+        waits.park(
+            dag,
+            &row(),
+            Awaiting::Stream(vec![("file-a".to_owned(), 0), ("file-a".to_owned(), 1)]),
+        );
+        assert!(!waits.wake_stream("file-a", 2), "another epoch");
+        assert!(!waits.wake_stream("file-b", 1), "another stream");
+        assert_eq!(waits.wake_epoch(1), 0, "the community axis");
+        assert!(waits.take_woken(&HashSet::new()).is_empty());
+        assert!(waits.wake_stream("file-a", 1));
+        assert!(!waits.wake_stream("file-a", 1), "a key wakes once");
+        assert_eq!(waits.take_woken(&HashSet::new()).len(), 1, "one dispatch");
+        waits.forget(dag);
+        assert!(!waits.wake_stream("file-a", 0), "forgotten with its keys");
     }
 }

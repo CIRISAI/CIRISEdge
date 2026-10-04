@@ -188,10 +188,25 @@ struct Node {
 /// witness — an in-memory SQLite would hold the whole file in RAM, which is
 /// exactly the residency this lane removes from edge).
 async fn node_at(path: &str, idents: &[&Ident], signer: &Ident) -> Node {
-    build_node_with(path, idents, signer, signer).await
+    // persist v53 S1 (CC 3.3.7) — alice's own device: it reads back her self
+    // file only as a personal-class node.
+    build_node_with(
+        path,
+        idents,
+        signer,
+        signer,
+        ciris_persist::federation::types::device_class::LAPTOP,
+    )
+    .await
 }
 
-async fn build_node_with(path: &str, idents: &[&Ident], owner: &Ident, signer: &Ident) -> Node {
+async fn build_node_with(
+    path: &str,
+    idents: &[&Ident],
+    owner: &Ident,
+    signer: &Ident,
+    class: &str,
+) -> Node {
     let dir = FederationDirectorySqlite::open(path)
         .await
         .expect("open substrate");
@@ -266,7 +281,7 @@ async fn build_node_with(path: &str, idents: &[&Ident], owner: &Ident, signer: &
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     .expect("provision this node's engine occurrence");
@@ -496,15 +511,32 @@ async fn a_2_gib_self_file_publishes_from_a_reader_holding_a_few_chunks() {
         .clone()
         .expect("above the bound: a chunk DAG");
     let chunk_count = usize::try_from(len).expect("fits").div_ceil(CHUNK_BYTES);
+    // CIRISEdge#797 (persist v53, CIRISPersist#969): the producer's chunks are
+    // numbered 0.. in order, and the seal adds ONE empty terminator for the
+    // file's one stream epoch at `2^62 + 0`, after every data chunk.
+    let rows = node
+        .store
+        .engine()
+        .stream_chunks(&stream_id)
+        .await
+        .expect("the stream")
+        .chunks;
     assert_eq!(
-        node.store
-            .engine()
-            .stream_chunks(&stream_id)
-            .await
-            .expect("the stream")
-            .chunks
-            .len(),
-        chunk_count
+        rows.len(),
+        chunk_count + 1,
+        "the data chunks and a terminator"
+    );
+    let (terminator, data) = rows.split_last().expect("rows");
+    assert!(
+        data.iter()
+            .enumerate()
+            .all(|(i, c)| c.seq == i as u64 && c.plaintext_size > 0),
+        "the producer's chunks are seq 0..{chunk_count}, none empty"
+    );
+    assert_eq!(
+        (terminator.seq, terminator.plaintext_size),
+        (1 << 62, 0),
+        "epoch 0's terminator"
     );
     assert!(
         peak_over < 32 * MIB as usize,
@@ -525,7 +557,10 @@ async fn a_2_gib_self_file_publishes_from_a_reader_holding_a_few_chunks() {
         items += 1;
     }
     let got: [u8; 32] = sha.finalize().into();
-    assert_eq!(items, chunk_count, "one item per chunk");
+    assert_eq!(
+        items, chunk_count,
+        "one item per data chunk; the terminator holds none"
+    );
     assert_eq!(total, len);
     assert_eq!(got, want, "SW1: read back byte-identical by sha256");
     eprintln!("SW1: read back {items} chunks, sha256 {}", hex::encode(got));

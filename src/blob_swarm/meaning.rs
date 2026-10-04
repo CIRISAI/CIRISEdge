@@ -259,9 +259,13 @@ impl BlobMeaning {
             .attestation_envelope
             .get("kind")
             .and_then(serde_json::Value::as_str);
-        if row.attestation_type.starts_with(HOLDS_BYTES_TYPE_PREFIX)
-            || envelope_kind == Some(HOLDS_BYTES_KIND)
-        {
+        if is_holds_bytes_type(&row.attestation_type) || envelope_kind == Some(HOLDS_BYTES_KIND) {
+            return Err(MeaningRefusal::PossessionIsNotMeaning);
+        }
+        // CIRISEdge#763 — a custody report (`custody:ack:v1`) cites the blob
+        // in `evidence_refs` as a HOLDING fact: "this device has a copy".
+        // It gives the bytes no meaning.
+        if is_custody_report(&row.attestation_envelope) {
             return Err(MeaningRefusal::PossessionIsNotMeaning);
         }
 
@@ -367,20 +371,16 @@ impl BlobMeaning {
     /// blob too, but as possession, and a puller that fetched on possession
     /// claims would fetch every blob every peer announced. The full
     /// projection refuses it as `PossessionIsNotMeaning`; this pre-check
-    /// keeps the apply path from cloning a row it would then refuse.
+    /// keeps the apply path from cloning a row it would then refuse. A
+    /// custody report (`custody:ack:v1`, CIRISEdge#763) is possession too
+    /// ([`is_possession_row`]).
     ///
     /// Signature is NOT checked here — that is `project`'s job, per sha,
     /// and it runs before any byte moves. This is the cheap "should the
     /// apply path even hand this row to the puller" question.
     #[must_use]
     pub fn referenced_shas(row: &Attestation) -> Vec<[u8; 32]> {
-        if row.attestation_type.starts_with(HOLDS_BYTES_TYPE_PREFIX)
-            || row
-                .attestation_envelope
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                == Some(HOLDS_BYTES_KIND)
-        {
+        if is_possession_row(row) {
             return Vec::new();
         }
         let Some(obj) = row.attestation_envelope.as_object() else {
@@ -573,8 +573,25 @@ impl BlobMeaning {
     }
 }
 
-/// persist's `holds_bytes:sha256:<prefix>` attestation-type prefix.
-const HOLDS_BYTES_TYPE_PREFIX: &str = "holds_bytes:";
+/// CIRISEdge#791 — **is this the `holds_bytes` carrier type, exactly?**
+/// persist v53 (#975, CC 2.4: the row-type slot is closed) admits the
+/// carrier only as the whole string `^holds_bytes:sha256:[0-9a-f]{8}$`, and
+/// refuses any other spelling (`attestation_type_unregistered`) at put and
+/// at apply. Matched whole and byte-exact here too, so edge never reads a
+/// row persist would refuse as a holder claim. Built from persist's own
+/// prefix and length, never re-spelled.
+#[must_use]
+pub fn is_holds_bytes_type(attestation_type: &str) -> bool {
+    use ciris_persist::federation::{
+        HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
+    };
+    attestation_type
+        .strip_prefix(HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
+        .is_some_and(|hex| {
+            hex.len() == HOLDS_BYTES_PREFIX_HEX_LEN
+                && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
 /// The `kind` a `holds_bytes` envelope carries.
 const HOLDS_BYTES_KIND: &str = "holds_bytes";
 /// The envelope member a chat/content row puts its community on.
@@ -636,13 +653,18 @@ fn references_as_evidence(envelope: &serde_json::Value, sha_hex: &str) -> bool {
 /// top-level-only pointer scan, same `evidence_refs` read, so the two can
 /// never disagree about what counts as a reference. A `holds_bytes` row is
 /// possession and references nothing — the caller checks that by type, as
-/// `project` does, before asking.
+/// `project` does, before asking ([`is_possession_row`]). A custody report
+/// (`custody:ack:v1`) is possession by its envelope alone, so this answers
+/// nothing for one even when the caller did not ask (CIRISEdge#763).
 ///
 /// Entries that are not 64 lowercase-or-uppercase hex characters are
 /// skipped: `evidence_refs` may carry other kinds of evidence, and a pointer
 /// with a malformed hash is a row the store gate would refuse anyway.
 #[must_use]
 pub fn referenced_shas(envelope: &serde_json::Value) -> Vec<[u8; 32]> {
+    if is_custody_report(envelope) {
+        return Vec::new();
+    }
     let mut out: Vec<[u8; 32]> = Vec::new();
     let mut push = |hex_str: &str| {
         if let Ok(bytes) = hex::decode(hex_str) {
@@ -671,13 +693,34 @@ pub fn referenced_shas(envelope: &serde_json::Value) -> Vec<[u8; 32]> {
     out
 }
 
+/// CIRISEdge#763 — is this envelope a **custody report** (`custody:ack:v1`,
+/// CC 3.1.3.3)? A device's report that it holds (or lost) its copy of a blob.
+/// It cites the blob in `evidence_refs`, but as a holding fact: it is not a
+/// reference to the content, so it neither gives the bytes meaning nor keeps
+/// them live against a withdrawal. Identified by persist's own dimension
+/// constant.
+#[must_use]
+pub fn is_custody_report(envelope: &serde_json::Value) -> bool {
+    ciris_persist::federation::admission::envelope_dimension(envelope)
+        == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+}
+
+/// **Is this row possession, never a reference?** A `holds_bytes` claim
+/// ([`is_holds_bytes_row`]) or a custody report ([`is_custody_report`]).
+/// The one question every reader that derives "this row references that
+/// content" asks first (CIRISEdge#606, #763).
+#[must_use]
+pub fn is_possession_row(row: &Attestation) -> bool {
+    is_holds_bytes_row(row) || is_custody_report(&row.attestation_envelope)
+}
+
 /// Is this row a `holds_bytes` claim — possession, never a reference?
 ///
 /// The same two checks [`BlobMeaning::project`] step (2) makes, exposed so
 /// the revocation side asks the identical question.
 #[must_use]
 pub fn is_holds_bytes_row(row: &Attestation) -> bool {
-    row.attestation_type.starts_with(HOLDS_BYTES_TYPE_PREFIX)
+    is_holds_bytes_type(&row.attestation_type)
         || row
             .attestation_envelope
             .get("kind")
@@ -963,6 +1006,35 @@ mod tests {
 
     /// CIRISEdge#601 — the apply path's pre-check finds both reference
     /// shapes, dedupes, and returns nothing for a possession claim.
+    /// CIRISEdge#791 — the carrier is matched whole and byte-exact, as
+    /// persist #975 admits it (`^holds_bytes:sha256:[0-9a-f]{8}$`): eight
+    /// lowercase hex is a holder; sixteen, uppercase, seven, another hash or
+    /// a trailing suffix is not.
+    #[test]
+    fn the_holds_bytes_carrier_is_matched_exactly_791() {
+        let eight = &hex::encode(SHA)[..8];
+        assert!(is_holds_bytes_type(&format!("holds_bytes:sha256:{eight}")));
+        assert!(is_holds_bytes_type("holds_bytes:sha256:0a1b2c3d"));
+        for not in [
+            format!("holds_bytes:sha256:{}", &hex::encode(SHA)[..16]),
+            "holds_bytes:sha256:0A1B2C3D".to_owned(),
+            "holds_bytes:sha256:0a1b2c3".to_owned(),
+            "holds_bytes:sha512:0a1b2c3d".to_owned(),
+            "holds_bytes:sha256:0a1b2c3d:v1".to_owned(),
+            "holds_bytes:sha256:0a1b2c3dx".to_owned(),
+            "holds_bytes:sha256:".to_owned(),
+            "holds_bytes:".to_owned(),
+            "xholds_bytes:sha256:0a1b2c3d".to_owned(),
+        ] {
+            assert!(!is_holds_bytes_type(&not), "{not} is not the carrier");
+            // Not the carrier ⇒ the type alone does not make the row
+            // possession; only the envelope `kind` still would.
+            let mut row = bare_row("self");
+            row.attestation_type = not.clone();
+            assert!(!is_holds_bytes_row(&row), "{not}");
+        }
+    }
+
     #[test]
     fn referenced_shas_finds_pointers_and_evidence_refs_and_never_possession() {
         // A typed pointer.
@@ -982,7 +1054,7 @@ mod tests {
         // A holds_bytes row references its blob as POSSESSION; the pre-check
         // returns nothing, matching `project`'s `PossessionIsNotMeaning`.
         let mut holds = bare_row(ps());
-        holds.attestation_type = format!("holds_bytes:sha256:{}", &hex::encode(SHA)[..16]);
+        holds.attestation_type = format!("holds_bytes:sha256:{}", &hex::encode(SHA)[..8]);
         holds.attestation_envelope = serde_json::json!({ "evidence_refs": [hex::encode(SHA)] });
         assert!(BlobMeaning::referenced_shas(&holds).is_empty());
         let mut holds_by_kind = bare_row(ps());

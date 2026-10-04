@@ -483,6 +483,10 @@ mod tests {
             "attesting_key_id": node,
             "attested_key_id": root,
             "attestation_type": "delegates_to",
+            // persist v53 (CIRISPersist#973): a new unlabelled `delegates_to`
+            // gives no acceptance, so the subscription names its job. `root-1`
+            // is a KEY root (no lineage), so no `attached_head_digest` is asked.
+            "dimension": ciris_persist::federation::trust_root::TRUST_ACCEPTS_DIMENSION,
             // Infra duty scopes only — the reject-agency-on-node-key gate
             // (persist #236) refuses a delegation conferring AGENCY on a
             // node-typed key, and an absent scope set reads as agency.

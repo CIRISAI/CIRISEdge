@@ -645,6 +645,31 @@ impl HoldingsScopeGate {
                 };
                 Self::read_verdict(verdict, content_scope, authority)
             }
+            // CIRISEdge#763 (persist v53 S3, CC 6.1.5.3) — `self` and
+            // `family` holdings are within-cohort durability facts, and
+            // persist answers their audience itself: `FountainContent` at
+            // these tiers resolves from the content's AUDIENCE (the owner's
+            // personal-class nodes / the family's allowed nodes), keyed on
+            // the FEDERATION group key. Here the table's group id IS that key
+            // (`ScopeRoom::table_group_id`: the identity for a self room, the
+            // family key for a family room; only a community is namespaced),
+            // so the verb is asked directly and the table's roster — the
+            // installer's assumption — is no longer the rule. The same answer
+            // admits an inbound claim ([`HoldingsPublishGate::admit_claim_and_book`]).
+            ContentScope::Group {
+                scope: CohortScope::SelfOnly | CohortScope::Family,
+                group_id,
+            } => {
+                Self::cohort_audience_verdict(
+                    directory,
+                    content,
+                    group_id,
+                    content_scope,
+                    authority,
+                    peer_key_id,
+                )
+                .await
+            }
             ContentScope::Group { scope, group_id } => {
                 let projection = Self::projection_of(content_scope, authority);
                 match projection {
@@ -699,6 +724,49 @@ impl HoldingsScopeGate {
                 }
             }
         }
+    }
+
+    /// CIRISEdge#763 — the `self` / `family` arm of [`Self::admits`]:
+    /// persist's recipient verb on `Plane::FountainContent`, keyed on the
+    /// content's FEDERATION group key (the identity for a self room, the
+    /// family key for a family room).
+    async fn cohort_audience_verdict(
+        directory: &dyn FederationDirectory,
+        content: &ContentScope,
+        group_id: &str,
+        content_scope: &CohortScope,
+        authority: AuthorityClass,
+        peer_key_id: &str,
+    ) -> HoldingAnnounce {
+        let group_key = match crate::scope_room::ScopeRoom::from_content_scope(content) {
+            Some(crate::scope_room::ScopeRoom::SelfCollective { identity_key_id }) => {
+                identity_key_id
+            }
+            Some(crate::scope_room::ScopeRoom::Family { family_key_id }) => family_key_id,
+            _ => group_id.to_owned(),
+        };
+        let verdict = match resolve_projection_recipients(
+            directory,
+            Plane::FountainContent,
+            persist_scope_token(content_scope),
+            authority,
+            false,
+            &group_key,
+            peer_key_id,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    peer = %peer_key_id,
+                    error = %e,
+                    "holdings gate: resolve_projection_recipients ERRORED — withholding",
+                );
+                return HoldingAnnounce::Withhold(HoldingRefusal::RecipientReadError);
+            }
+        };
+        Self::read_verdict(verdict, content_scope, authority)
     }
 
     /// Read persist's [`RecipientVerdict`] into an announce decision.
@@ -839,6 +907,52 @@ impl HoldingsPublishGate {
     }
 }
 
+impl HoldingsPublishGate {
+    /// CIRISEdge#763 (CC 6.1.5.3, #499) — **may a peer's inbound holding
+    /// claim be counted?** persist's ruling: the one
+    /// `resolve_projection_recipients` answer that decides whom a holding is
+    /// announced to also decides whose holding claim is admitted — the
+    /// claimant must be in the content's own audience. Asked only for
+    /// `self` / `family` content (the tiers whose holders are bounded to the
+    /// cohort; community and commons claims keep their own plane), with the
+    /// CLAIMANT in both the publisher and the peer slot (a holding claim is
+    /// publish-own by construction). Anything else, and an unarmed gate, is
+    /// admitted exactly as before. A refusal is logged by name with the
+    /// claimant and content, and the claim is not counted toward any holder
+    /// total, so a stranger cannot make this node think a family file is
+    /// well replicated and evict its own copy.
+    pub async fn admit_claim_and_book(
+        &self,
+        claimant_key_id: &str,
+        content_id: &str,
+        content: Option<&ContentScope>,
+    ) -> HoldingAnnounce {
+        if !matches!(
+            content,
+            Some(ContentScope::Group {
+                scope: CohortScope::SelfOnly | CohortScope::Family,
+                ..
+            })
+        ) {
+            return HoldingAnnounce::Announce;
+        }
+        let verdict = self
+            .gate
+            .admits(claimant_key_id, content, claimant_key_id)
+            .await;
+        if let HoldingAnnounce::Withhold(refusal) = &verdict {
+            tracing::warn!(
+                claimant = %claimant_key_id,
+                content_id = %content_id,
+                reason = refusal.reason_tag(),
+                "swarm_runtime: inbound holding claim REFUSED — the claimant is outside the \
+                 content's cohort audience (CIRISEdge#763): {refusal}",
+            );
+        }
+        verdict
+    }
+}
+
 /// The short, low-cardinality `detail` for a holdings withhold: the plane
 /// tag plus a bounded content-id prefix. Mirrors the bridge's
 /// `withhold_detail` (kind + 8-byte hash prefix) — the ring is an
@@ -871,7 +985,7 @@ fn warn_holdings_scope_gate_unarmed() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::bundle_gate::test_support::{field_fixture, PIPELINE, PRESENTER};
     use crate::scope_addressing::StubDeriver;
@@ -944,15 +1058,19 @@ mod tests {
     fn persist_owns_the_fountain_content_projection() {
         use AuthorityClass::{AccordCoScrub, ProducerSteward};
         for authority in [ProducerSteward, AccordCoScrub] {
+            // persist v53 S3 (#963, CC 6.1.5.3 "durability at every tier"):
+            // self/family bytes hold-and-forward among their own audience, so
+            // their FountainContent cell moved `SelfOwn` → `Cohort`; the
+            // audience is S1's (the owner's allowed nodes / the family's).
             assert_eq!(
                 HoldingsScopeGate::projection_of(&CohortScope::SelfOnly, authority),
-                Projection::SelfOwn,
-                "self scope must be structurally invisible under {authority:?}",
+                Projection::Cohort,
+                "self bytes relay only within their own audience under {authority:?}",
             );
             assert_eq!(
                 HoldingsScopeGate::projection_of(&CohortScope::Family, authority),
-                Projection::SelfOwn,
-                "family scope must be structurally invisible under {authority:?}",
+                Projection::Cohort,
+                "family bytes relay only within their own audience under {authority:?}",
             );
             assert_eq!(
                 HoldingsScopeGate::projection_of(&cohort("neighbourhood"), authority),
@@ -1174,7 +1292,9 @@ mod tests {
             .admits(PRESENTER, Some(&ContentScope::Federation), OUTSIDER)
             .await;
         // Judged, and the peer is genuinely outside the resolved set.
-        let not_seated = g.admits(PRESENTER, Some(&family_content()), OUTSIDER).await;
+        let not_seated = g
+            .admits(PRESENTER, Some(&community_content()), OUTSIDER)
+            .await;
 
         assert!(!cannot_judge.is_announced() && !not_seated.is_announced());
         let (HoldingAnnounce::Withhold(a), HoldingAnnounce::Withhold(b)) =
@@ -1259,17 +1379,21 @@ mod tests {
 
     // ─── Armed: the leak closes, and only where it should ─────────────
 
-    /// THE test: a family-scoped holding is withheld from a peer outside
-    /// the family, AND a federation-scoped one to the SAME peer still
-    /// goes — so this cannot pass by announcing nothing.
+    /// THE test: a group-scoped holding is withheld from a peer outside
+    /// the group, AND a federation-scoped one to the SAME peer still
+    /// goes — so this cannot pass by announcing nothing. (Run on a
+    /// community: since CIRISEdge#763 a family's holdings answer from
+    /// persist's audience, not the table — see
+    /// `self_and_family_holdings_reach_the_cohort_audience_not_the_table_763`.)
     #[tokio::test]
-    async fn family_holding_withheld_from_outsider_while_federation_still_flows() {
+    async fn group_holding_withheld_from_outsider_while_federation_still_flows() {
         let g = armed().await;
         assert_eq!(
-            g.admits(PIPELINE, Some(&family_content()), OUTSIDER).await,
+            g.admits(PIPELINE, Some(&community_content()), OUTSIDER)
+                .await,
             HoldingAnnounce::Withhold(HoldingRefusal::PeerNotInRoster {
-                content_kind: "family",
-                projection: "self_own",
+                content_kind: "cohort",
+                projection: "cohort",
             }),
         );
         assert!(
@@ -1282,12 +1406,12 @@ mod tests {
              plain producer persist projects Cohort at a commons tier and \
              withholds (CIRISPersist#744)",
         );
-        // …and the family member still learns of it.
+        // …and the group member still learns of it.
         assert!(
-            g.admits(PIPELINE, Some(&family_content()), BOB)
+            g.admits(PIPELINE, Some(&community_content()), BOB)
                 .await
                 .is_announced(),
-            "a family MEMBER must still be told; withholding from everyone \
+            "a group MEMBER must still be told; withholding from everyone \
              is not the fix",
         );
     }
@@ -1312,26 +1436,23 @@ mod tests {
             .is_announced());
     }
 
-    /// Possession of the FAMILY roster says nothing about the COMMUNITY
-    /// one and vice versa: membership is resolved per (scope, group), so a
+    /// Possession of one group's roster says nothing about another's: membership is resolved per (scope, group), so a
     /// member of one group is not admitted to another group's holdings.
     #[tokio::test]
     async fn membership_does_not_cross_groups() {
         let t = ScopeAddressTable::new(Arc::new(StubDeriver));
-        t.install_group(&CohortScope::Family, "fam-1", 1, &[0xA1; 32], &[ALICE])
-            .expect("family install");
+        t.install_group(&cohort("allotment"), "com-2", 1, &[0xA1; 32], &[ALICE])
+            .expect("community install");
         t.install_group(&cohort("neighbourhood"), "com-1", 1, &[0xB2; 32], &[BOB])
             .expect("community install");
         let g = HoldingsScopeGate::new(Some(Arc::new(t)), Some(directory().await));
-        // alice is family-only, bob is community-only.
-        assert!(g
-            .admits(PIPELINE, Some(&family_content()), ALICE)
-            .await
-            .is_announced());
-        assert!(!g
-            .admits(PIPELINE, Some(&family_content()), BOB)
-            .await
-            .is_announced());
+        let other = ContentScope::Group {
+            scope: cohort("allotment"),
+            group_id: "com-2".to_owned(),
+        };
+        // alice is in com-2 only, bob in com-1 only.
+        assert!(g.admits(PIPELINE, Some(&other), ALICE).await.is_announced());
+        assert!(!g.admits(PIPELINE, Some(&other), BOB).await.is_announced());
         assert!(g
             .admits(PIPELINE, Some(&community_content()), BOB)
             .await
@@ -1385,17 +1506,23 @@ mod tests {
     #[tokio::test]
     async fn removed_member_stops_being_announced_to() {
         let t = ScopeAddressTable::new(Arc::new(StubDeriver));
-        t.install_group(&CohortScope::Family, "fam-1", 1, &[0xA1; 32], &[ALICE, BOB])
-            .expect("family install");
+        t.install_group(
+            &cohort("neighbourhood"),
+            "com-1",
+            1,
+            &[0xB2; 32],
+            &[ALICE, BOB],
+        )
+        .expect("community install");
         let t = Arc::new(t);
         let g = HoldingsScopeGate::new(Some(Arc::clone(&t)), Some(directory().await));
         assert!(g
-            .admits(PIPELINE, Some(&family_content()), BOB)
+            .admits(PIPELINE, Some(&community_content()), BOB)
             .await
             .is_announced());
-        t.remove_member(&CohortScope::Family, "fam-1", BOB);
+        t.remove_member(&cohort("neighbourhood"), "com-1", BOB);
         assert!(
-            !g.admits(PIPELINE, Some(&family_content()), BOB)
+            !g.admits(PIPELINE, Some(&community_content()), BOB)
                 .await
                 .is_announced(),
             "the roster must be read per-decision, never cached",
@@ -1522,7 +1649,7 @@ mod tests {
             Some(metrics.clone()),
         );
         let _ = pg
-            .admit_and_book(PIPELINE, "c-secret", Some(&family_content()), OUTSIDER)
+            .admit_and_book(PIPELINE, "c-secret", Some(&community_content()), OUTSIDER)
             .await;
         let _ = pg
             .admit_and_book(PIPELINE, "c-unknown", None, OUTSIDER)
@@ -1555,12 +1682,12 @@ mod tests {
             Some(metrics.clone()),
         );
         // A TRUST-ROOT publisher: federation content reaches everyone,
-        // family content reaches the family member.
+        // community content reaches the community member.
         let _ = pg
             .admit_and_book(PIPELINE, "c-pub", Some(&ContentScope::Federation), OUTSIDER)
             .await;
         let _ = pg
-            .admit_and_book(PIPELINE, "c-fam", Some(&family_content()), BOB)
+            .admit_and_book(PIPELINE, "c-com", Some(&community_content()), BOB)
             .await;
         assert!(metrics.snapshot().withholds_by_reason.is_empty());
     }
@@ -1571,5 +1698,147 @@ mod tests {
         let long = "c".repeat(4096);
         let d = withhold_detail(&long);
         assert_eq!(d, format!("fountain:{}", "c".repeat(16)));
+    }
+
+    // ─── CIRISEdge#763: self/family holdings are the cohort's ─────────
+
+    const ALICE_PHONE: &str = "node-alice-phone";
+    const ALICE_SERVER: &str = "node-alice-server";
+    const MALLORY_PHONE: &str = "node-mallory-phone";
+    const FAMILY_763: &str = "fam-763";
+
+    /// alice (a person) with a personal phone and a server-class node she
+    /// claimed, her family `fam-763` (alice alone), and mallory with a phone
+    /// of her own. Real persist rows, so the audience is persist's.
+    pub(crate) async fn cohort_directory_763() -> Arc<ciris_persist::store::MemoryBackend> {
+        use crate::replication::bridge::tests::{
+            fixture_family_founded, register_fixture_keys, seed_device_occurrence,
+            seed_owner_binding, sign_family_fixture,
+        };
+        use ciris_persist::federation::types::{device_class, identity_type};
+        let backend = Arc::new(ciris_persist::store::MemoryBackend::new());
+        register_fixture_keys(
+            &backend,
+            &[
+                ("person-alice", identity_type::USER),
+                ("person-mallory", identity_type::USER),
+                (ALICE_PHONE, identity_type::NODE),
+                (ALICE_SERVER, identity_type::NODE),
+                (MALLORY_PHONE, identity_type::NODE),
+                (FAMILY_763, identity_type::AGENT),
+            ],
+        )
+        .await;
+        for (owner, node, class) in [
+            ("person-alice", ALICE_PHONE, device_class::PHONE),
+            ("person-alice", ALICE_SERVER, device_class::SERVER),
+            ("person-mallory", MALLORY_PHONE, device_class::PHONE),
+        ] {
+            seed_owner_binding(&backend, owner, node).await;
+            seed_device_occurrence(&backend, owner, node, class).await;
+        }
+        let mut family = fixture_family_founded(FAMILY_763, "person-alice", "person-alice");
+        family.members.truncate(1);
+        backend
+            .put_family(sign_family_fixture("person-alice", family))
+            .await
+            .expect("alice's family");
+        backend
+    }
+
+    fn self_content_763() -> ContentScope {
+        ContentScope::Group {
+            scope: CohortScope::SelfOnly,
+            group_id: "person-alice".to_owned(),
+        }
+    }
+
+    fn family_content_763() -> ContentScope {
+        ContentScope::Group {
+            scope: CohortScope::Family,
+            group_id: FAMILY_763.to_owned(),
+        }
+    }
+
+    /// **CIRISEdge#763 (persist v53 S3, CC 6.1.5.3) — a `self`/`family`
+    /// holding is announced to the content's cohort AUDIENCE, persist's
+    /// answer, and not to whoever the address table seats.** The table here
+    /// (deliberately) seats every node in alice's self and family groups,
+    /// mallory's included: alice's phone is told of both holdings; her
+    /// server-class node of neither (CC 3.3.7); mallory's phone of neither.
+    /// Fails on the pre-#763 gate, which read the table's roster for these
+    /// tiers and announced to all three.
+    #[tokio::test]
+    async fn self_and_family_holdings_reach_the_cohort_audience_not_the_table_763() {
+        let t = ScopeAddressTable::new(Arc::new(StubDeriver));
+        let everyone = [ALICE_PHONE, ALICE_SERVER, MALLORY_PHONE];
+        t.install_group(
+            &CohortScope::SelfOnly,
+            "person-alice",
+            1,
+            &[0xC3; 32],
+            &everyone,
+        )
+        .expect("self install");
+        t.install_group(&CohortScope::Family, FAMILY_763, 1, &[0xD4; 32], &everyone)
+            .expect("family install");
+        let dir: Arc<dyn FederationDirectory> = cohort_directory_763().await;
+        let g = HoldingsScopeGate::new(Some(Arc::new(t)), Some(dir));
+        for content in [self_content_763(), family_content_763()] {
+            assert!(
+                g.admits(ALICE_PHONE, Some(&content), ALICE_PHONE)
+                    .await
+                    .is_announced(),
+                "{content:?}: alice's personal device is in the audience"
+            );
+            for outside in [ALICE_SERVER, MALLORY_PHONE] {
+                assert!(
+                    matches!(
+                        g.admits(ALICE_PHONE, Some(&content), outside).await,
+                        HoldingAnnounce::Withhold(HoldingRefusal::PeerNotInRoster { .. })
+                    ),
+                    "{content:?}: {outside} is outside the cohort audience (persist's answer, \
+                     not the table's roster)"
+                );
+            }
+        }
+    }
+
+    /// **CIRISEdge#763 — a holding claim from outside the cohort is refused;
+    /// one from inside is admitted.** The inbound twin asks the same persist
+    /// answer with the CLAIMANT in the peer slot. A community or federation
+    /// claim is not this gate's (admitted as before). Fails without the
+    /// inbound gate (`admit_claim_and_book` admitting everything, as every
+    /// claim was before).
+    #[tokio::test]
+    async fn a_holding_claim_from_outside_the_cohort_is_refused_763() {
+        let dir: Arc<dyn FederationDirectory> = cohort_directory_763().await;
+        let pg = HoldingsPublishGate::new(
+            Some(Arc::new(ScopeAddressTable::new(Arc::new(StubDeriver)))),
+            Some(dir),
+            None,
+        );
+        for content in [self_content_763(), family_content_763()] {
+            assert!(
+                pg.admit_claim_and_book(ALICE_PHONE, "c-763", Some(&content))
+                    .await
+                    .is_announced(),
+                "{content:?}: alice's phone may claim a holding"
+            );
+            for outside in [MALLORY_PHONE, ALICE_SERVER] {
+                assert!(
+                    !pg.admit_claim_and_book(outside, "c-763", Some(&content))
+                        .await
+                        .is_announced(),
+                    "{content:?}: a claim from {outside}, outside the audience, is refused"
+                );
+            }
+        }
+        assert!(
+            pg.admit_claim_and_book(MALLORY_PHONE, "c-com", Some(&community_content()))
+                .await
+                .is_announced(),
+            "a community claim is not this gate's"
+        );
     }
 }

@@ -213,7 +213,10 @@ struct Node {
 /// A device of `owner` (`self_dag_field_path_717::device`): the node key is
 /// `device`'s, the owner binding is signed by `owner`, the engine occurrence
 /// is provisioned under the owner.
-async fn device(seed_idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
+/// `class` is the occurrence's `device_class` (persist v53 S1, CC 3.3.7): a
+/// person's own device is `phone`, so it is in its family's audience; the
+/// forwarder is a `server`.
+async fn device(seed_idents: &[&Ident], owner: &Ident, device: &Ident, class: &str) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -271,7 +274,7 @@ async fn device(seed_idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     .expect("provision this node's engine occurrence");
@@ -588,6 +591,8 @@ async fn found_family(p1: &Node, p: &Ident) {
         consensus_protocol: "founder_only".to_owned(),
         consensus_protocol_entrenched: false,
         persist_row_hash: String::new(),
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
     };
     let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&record.signing_envelope())
         .expect("canonicalize the family");
@@ -654,7 +659,7 @@ async fn form_family_by_consent(p1: &Member, q1: &Member, p: &Ident, q: &Ident, 
     // widening Q1 is a first-contact stranger to P1 (no consent grant, not a
     // family member's node), and first-contact reach carries no family-scoped
     // row — the #955 invitee arm widens the AUDIENCE, not the send set
-    // (`peer_is_proposal_invitee`). A host whose persons consented to each
+    // (persist's `may_receive`, CIRISEdge#761). A host whose persons consented to each
     // other carries it on the round; `pair_room_consent_955` hands it over
     // the same way.
     assert!(
@@ -1104,9 +1109,27 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
     let n_owner = Ident::new("person-n-736", 0x41);
     let n_id = Ident::new("device-n-736", 0x42);
     let seeds = [&p, &p1_id, &q, &q1_id, &r, &n_owner, &n_id];
-    let node_p1 = device(&seeds, &p, &p1_id).await;
-    let node_q1 = device(&seeds, &q, &q1_id).await;
-    let node_n = device(&seeds, &n_owner, &n_id).await;
+    let node_p1 = device(
+        &seeds,
+        &p,
+        &p1_id,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
+    let node_q1 = device(
+        &seeds,
+        &q,
+        &q1_id,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
+    let node_n = device(
+        &seeds,
+        &n_owner,
+        &n_id,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     for (a, b) in [
         (&node_p1, &node_q1),
         (&node_q1, &node_p1),
@@ -1253,6 +1276,91 @@ async fn family_files_cross_to_the_other_persons_device_and_never_to_a_non_membe
         "no family pull consulted the claim index: {sources:?}"
     );
 
+    // ── (e) CIRISEdge#763 (CC 6.1.5.3) — durability at the family tier. Q1's
+    //    completed pulls filed its `custody:ack:v1` `here` for each file; the
+    //    reports cross Q1 → P1 through the real serve gate (persist's
+    //    may_receive: the family's audience) and never Q1 → N. On P1,
+    //    persist's deficit names the family's audience — the roster's nodes,
+    //    N not among them — in Full mode, with Q1 a live full holder.
+    for f in [&inline, &dag] {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let sha_hex = hex::encode(f.sha);
+        loop {
+            let here = ciris_persist::federation::custody_ack::device_custody_of(
+                &*q1.node.dir,
+                &q1.node.me,
+                &sha_hex,
+                None,
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("custody fold")
+            .state;
+            if here == ciris_persist::federation::custody_ack::CustodyVerdict::Here {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Q1 never filed its `here` for the pulled family file ({here:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    let custody_rows = |carried: &[(String, ApplyOutcome)], node: &Node| {
+        let ids: Vec<String> = carried.iter().map(|(id, _)| id.clone()).collect();
+        let dir = Arc::clone(&node.dir);
+        async move {
+            let mut count = 0;
+            for id in ids {
+                if let Ok(Some(row)) = dir.get_attestation(&id).await {
+                    if ciris_persist::federation::admission::envelope_dimension(
+                        &row.attestation_envelope,
+                    ) == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+                    {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        }
+    };
+    let to_p1 = carry_rows(&q1, &p1).await;
+    assert_eq!(
+        custody_rows(&to_p1, &q1.node).await,
+        2,
+        "both of Q1's custody reports reach P1, a family node: {to_p1:?}"
+    );
+    let to_n_reports = carry_rows(&q1, &n).await;
+    assert_eq!(
+        custody_rows(&to_n_reports, &q1.node).await,
+        0,
+        "no custody report reaches N, outside the family"
+    );
+    for f in [&inline, &dag] {
+        let deficit = ciris_edge::blob_swarm::durability::row_deficit(
+            &*p1.node.dir,
+            &f.row,
+            &f.sha,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("the deficit");
+        assert_eq!(
+            deficit.audience,
+            ciris_persist::federation::durability::DeficitAudience::Nodes(roster.nodes.clone()),
+            "the family file's audience is the roster's nodes"
+        );
+        assert_eq!(
+            deficit.mode,
+            Some(ciris_persist::federation::durability::DurabilityMode::Full),
+            "two nodes < N + K: every audience node a full holder"
+        );
+        assert!(
+            deficit.live_here.contains(&q1.node.me) && !deficit.missing.contains(&q1.node.me),
+            "Q1 is a live full holder of the family file: {deficit:?}"
+        );
+    }
+
     // ── (c) N asks P1 for each file directly: refused on P1's serve gate
     //    by name; N cannot route the family at all.
     assert!(
@@ -1311,10 +1419,28 @@ async fn family_files_cross_through_a_non_member_forwarder_that_learns_nothing_7
     let r = Ident::new("person-r-736f", 0x31);
     let f_id = Ident::new("forwarder-736f", 0x51);
     let seeds = [&p, &p1_id, &q, &q1_id, &r];
-    let node_p1 = device(&seeds, &p, &p1_id).await;
-    let node_q1 = device(&seeds, &q, &q1_id).await;
+    let node_p1 = device(
+        &seeds,
+        &p,
+        &p1_id,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
+    let node_q1 = device(
+        &seeds,
+        &q,
+        &q1_id,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     // F knows only itself: it is in no family and never learns of one.
-    let node_f = device(&[&f_id], &f_id, &f_id).await;
+    let node_f = device(
+        &[&f_id],
+        &f_id,
+        &f_id,
+        ciris_persist::federation::types::device_class::SERVER,
+    )
+    .await;
     federate(&node_p1, &node_q1).await;
     federate(&node_q1, &node_p1).await;
 

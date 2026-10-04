@@ -6562,6 +6562,11 @@ async fn dispatch_inbound(
                             }
                         }
                         Err(refusal) => {
+                            // CIRISEdge#763 — a serve refused because every
+                            // reference to the file was withdrawn (CC 2.3 at
+                            // the bytes plane): counted, so a harness can see
+                            // a withdrawn file stop being served.
+                            metrics.book_chunk_source_refusal(&refusal);
                             // CIRISEdge#717 — a chunk outside the DAG the
                             // request named is a serve-gate refusal: booked
                             // (unthrottled) and spoken (throttled) exactly as
@@ -7101,11 +7106,25 @@ async fn dispatch_inbound(
             envelope.body.get(),
         ) {
             Ok(claim) => {
+                // CIRISEdge#763 (CC 6.1.5.3) — a `self`/`family` holding
+                // claim counts only from a SIGNER inside the content's cohort
+                // audience (persist's answer; the runtime checks the claim's
+                // `peer_id` as well). A refused claim reaches neither the
+                // converged view nor the converger.
+                let admitted = match swarm_runtime {
+                    Some(runtime) => runtime
+                        .claim_admission(&claim.content_id, &envelope.signing_key_id)
+                        .await
+                        .is_announced(),
+                    None => true,
+                };
                 // Tap by reference, then hand the claim to the converger
                 // by value — no clone. Both sides see the identical
                 // post-AV-9 claim.
-                converged_claims.observe(&claim);
-                if let Some(runtime) = swarm_runtime {
+                if admitted {
+                    converged_claims.observe(&claim);
+                }
+                if let Some(runtime) = swarm_runtime.filter(|_| admitted) {
                     // CIRISEdge#582 — SignatureOnly, and precisely that. We
                     // are past the AV-9 verify gate, so the claim's hybrid
                     // signature is real; nothing here or anywhere else in

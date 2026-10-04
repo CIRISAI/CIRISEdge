@@ -404,7 +404,15 @@ struct Node {
 /// the owner's identity (`blob_federation_e2e::device_of`). `db` is the
 /// sqlite path (`":memory:"` for a throwaway); `seed_idents` are the key
 /// records every node must hold.
-async fn device(db: &str, seed_idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
+/// `class` is the occurrence's `device_class` (persist v53 S1, CC 3.3.7): the
+/// owner's phone pulls her self file only as a personal-class device.
+async fn device(
+    db: &str,
+    seed_idents: &[&Ident],
+    owner: &Ident,
+    device: &Ident,
+    class: &str,
+) -> Node {
     let dir = FederationDirectorySqlite::open(db)
         .await
         .expect("open substrate");
@@ -479,7 +487,7 @@ async fn device(db: &str, seed_idents: &[&Ident], owner: &Ident, device: &Ident)
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     {
@@ -721,8 +729,22 @@ const CEILING_FRAME: usize = 4 * 1024 * 1024;
 async fn ceiling(total: u64, lanes: usize, tmp: &Path, tag: &str) -> f64 {
     let alice = Ident::new(&format!("ceil-a-{tag}"), 0x41);
     let bob = Ident::new(&format!("ceil-b-{tag}"), 0x42);
-    let a = device(":memory:", &[&alice, &bob], &alice, &alice).await;
-    let b = device(":memory:", &[&alice, &bob], &bob, &bob).await;
+    let a = device(
+        ":memory:",
+        &[&alice, &bob],
+        &alice,
+        &alice,
+        ciris_persist::federation::types::device_class::SERVER,
+    )
+    .await;
+    let b = device(
+        ":memory:",
+        &[&alice, &bob],
+        &bob,
+        &bob,
+        ciris_persist::federation::types::device_class::SERVER,
+    )
+    .await;
     federate(&a, &b).await;
     federate(&b, &a).await;
     let (rt_a, port_a) = transport_for(&a, tmp.join(format!("ceil-a-{tag}.id")), None).await;
@@ -1506,7 +1528,14 @@ async fn resume_once(
     k: usize,
 ) -> Resumed {
     let (alice, phone, db_str) = (&phone.owner, &phone.ident, phone.db.clone());
-    let node_b = device(&db_str, &[alice, phone], alice, phone).await;
+    let node_b = device(
+        &db_str,
+        &[alice, phone],
+        alice,
+        phone,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     federate(&a.node, &node_b).await;
     federate(&node_b, &a.node).await;
     let b = member(node_b, tmp.join("b-resume.id"), Some(a.port), members).await;
@@ -1560,7 +1589,14 @@ async fn resume_once(
     // THE RESTART: the same store path, a fresh transport on the same
     // identity, a fresh edge, the room re-installed, the row/key planes
     // re-crossed (idempotent), the same pull.
-    let node_b = device(&db_str, &[alice, phone], alice, phone).await;
+    let node_b = device(
+        &db_str,
+        &[alice, phone],
+        alice,
+        phone,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     federate(&a.node, &node_b).await;
     federate(&node_b, &a.node).await;
     let b = member(node_b, tmp.join("b-resume.id"), Some(a.port), members).await;
@@ -1869,7 +1905,14 @@ async fn run(
     // 2. A publishes.
     let alice = Ident::new("alice-739", 0x11);
     let db_a = tmp.path().join("a.sqlite");
-    let node_a = device(db_a.to_str().expect("utf8"), &[&alice], &alice, &alice).await;
+    let node_a = device(
+        db_a.to_str().expect("utf8"),
+        &[&alice],
+        &alice,
+        &alice,
+        ciris_persist::federation::types::device_class::LAPTOP,
+    )
+    .await;
     let me_a = node_a.me.clone();
     // The owner's other devices — one fresh phone per pull in the curve and
     // one for the resume, each its own store (and content-KEM identity).
@@ -1898,7 +1941,14 @@ async fn run(
             .to_str()
             .expect("utf8")
             .to_owned();
-        let node = device(&db, &[&alice, &ident], &alice, &ident).await;
+        let node = device(
+            &db,
+            &[&alice, &ident],
+            &alice,
+            &ident,
+            ciris_persist::federation::types::device_class::PHONE,
+        )
+        .await;
         federate(&node, &node_a).await;
         let phone = Phone {
             owner: Ident::new("alice-739", 0x11),

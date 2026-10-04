@@ -168,7 +168,7 @@ impl std::error::Error for MembershipError {}
 
 /// One persist emit input, stamped, hybrid-signed by `signer` and assembled —
 /// the recipe every edge emit shares (`attestation_bind::widen`'s shape).
-async fn sign_input(
+pub(crate) async fn sign_input(
     mut input: ciris_persist::federation::EmitAttestationInput,
     signer: &crate::identity::LocalSigner,
     what: &str,

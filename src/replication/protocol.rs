@@ -191,7 +191,9 @@ pub enum EnvelopeKind {
     ///
     /// **Not a separately-pulled plane on edge.** Persist emits the set as an
     /// attestation row (`attestation_type` `key_grant:epoch:v1` /
-    /// `key_grant:content:v1`), so it arrives on the `Attestation` cursor
+    /// `key_grant:content:v1` / `key_grant:stream:v1`, the last one per
+    /// self/family stream epoch since persist v53, CIRISPersist#969), so it
+    /// arrives on the `Attestation` cursor
     /// this node already pulls — no new fetch. The kind exists here so the
     /// vocabulary mirrors persist's sixteen in order (`WIRE_VOCABULARY_KINDS.md`)
     /// and so a peer that frames one under this tag still lands on the

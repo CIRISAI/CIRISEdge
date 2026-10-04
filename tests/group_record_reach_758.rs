@@ -207,6 +207,21 @@ impl Node {
             .expect("owner binding"),
         )
         .await;
+        // persist v53 S1 — the node's own signed occurrence, as every host
+        // publishes one: `may_receive_group_plane` resolves a node to its
+        // person through it. The class does not enter the group-plane rule;
+        // these are hosted runtime nodes, so `server`.
+        dir.put_identity_occurrence(
+            common::node_signed_occurrence(
+                &owner.key_id,
+                &key.key_id,
+                &key.signer(),
+                ciris_persist::federation::types::device_class::SERVER,
+            )
+            .await,
+        )
+        .await
+        .expect("the node's own occurrence");
         Self {
             key,
             owner,
@@ -407,6 +422,8 @@ async fn found(node: &Node, scope: GroupScope, group: &str) {
                 consensus_protocol: "founder_only".to_owned(),
                 policy_blob: None,
                 persist_row_hash: String::new(),
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
             };
             let canonical =
                 ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
@@ -441,6 +458,8 @@ async fn found(node: &Node, scope: GroupScope, group: &str) {
                 consensus_protocol: "founder_only".to_owned(),
                 consensus_protocol_entrenched: false,
                 persist_row_hash: String::new(),
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
             };
             let canonical =
                 ciris_persist::prelude::ceg_produce_canonicalize(&family.signing_envelope())

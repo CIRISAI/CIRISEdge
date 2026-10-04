@@ -8,7 +8,8 @@
 //! consent and no membership (first contact):
 //!
 //! - **node A**, owned by **P**, holds four groups P founded: an
-//!   `infrastructure` community (public by its subkind), the deployment's WA
+//!   `infrastructure` community (public by its subkind on a substrate-authority
+//!   key — persist v53's `is_public_group`, CIRISEdge#761), the deployment's WA
 //!   reclaim family (public by `CIRIS_PERSIST_WA_ADJUDICATION_FAMILY_KEY_ID`,
 //!   persist's `ReclaimPolicy::from_deployment_pin`), and a PRIVATE community
 //!   and family;
@@ -430,6 +431,8 @@ async fn found(node: &Node, scope: GroupScope, group: &str, infrastructure: bool
                 consensus_protocol: protocol.to_owned(),
                 policy_blob,
                 persist_row_hash: String::new(),
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
             };
             let canonical =
                 ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
@@ -464,6 +467,8 @@ async fn found(node: &Node, scope: GroupScope, group: &str, infrastructure: bool
                 consensus_protocol: "founder_only".to_owned(),
                 consensus_protocol_entrenched: false,
                 persist_row_hash: String::new(),
+                prev_head_digest: String::new(),
+                charter_digest: String::new(),
             };
             let canonical =
                 ciris_persist::prelude::ceg_produce_canonicalize(&family.signing_envelope())
@@ -527,7 +532,6 @@ async fn standing(node: &Node, community: &str) -> &'static str {
 }
 
 const WA_FAMILY: &str = "wa-reclaim-762";
-const INFRA: &str = "infra-community-762";
 const PRIVATE_COMMUNITY: &str = "private-community-762";
 const PRIVATE_FAMILY: &str = "private-family-762";
 
@@ -559,8 +563,18 @@ async fn a_public_group_resolves_on_a_non_member_762() {
     let q = Ident::new("person-q-762", 0x73).await;
     let a_node = key_a.record("node").await;
     let x_node = key_x.record("node").await;
-    let a = Node::new(key_a, p, vec![x_node]).await;
-    let x = Node::new(key_x, q, vec![a_node]).await;
+    // persist v53 S1 — `is_public_group` honours an `infrastructure` label
+    // only on a community whose own key is the substrate authority
+    // (`is_authorized_infrastructure_community`, SecReview F2), as
+    // `ciris-canonical`'s is. Both directories hold that key.
+    let infra_key = Ident::new("infra-community-762", 0x64).await;
+    let infra_rec = infra_key
+        .record(ciris_persist::federation::types::identity_type::SUBSTRATE_PERSIST)
+        .await;
+    let infra = infra_key.key_id.clone();
+    let infra = infra.as_str();
+    let a = Node::new(key_a, p, vec![x_node, infra_rec.clone()]).await;
+    let x = Node::new(key_x, q, vec![a_node, infra_rec]).await;
 
     let base = tmp.path().to_path_buf();
     let (ta, addr_a) = build_reticulum_with_retry(|| async {
@@ -587,12 +601,12 @@ async fn a_public_group_resolves_on_a_non_member_762() {
     let all = [&rt_a, &rt_x];
 
     // P founds the four groups on A, alone.
-    found(&a, GroupScope::Community, INFRA, true).await;
+    found(&a, GroupScope::Community, infra, true).await;
     found(&a, GroupScope::Family, WA_FAMILY, false).await;
     found(&a, GroupScope::Community, PRIVATE_COMMUNITY, false).await;
     found(&a, GroupScope::Family, PRIVATE_FAMILY, false).await;
     let public = [
-        (GroupScope::Community, INFRA.to_owned()),
+        (GroupScope::Community, infra.to_owned()),
         (GroupScope::Family, WA_FAMILY.to_owned()),
     ];
 
@@ -624,7 +638,7 @@ async fn a_public_group_resolves_on_a_non_member_762() {
 
     // (i) The community arm of `trust_root_valid`: persist's stored standing of
     // the infrastructure community answers on X as on its holder.
-    let (on_a, on_x) = (standing(&a, INFRA).await, standing(&x, INFRA).await);
+    let (on_a, on_x) = (standing(&a, infra).await, standing(&x, infra).await);
     assert_ne!(
         on_x, "absent",
         "(i) X resolves the infrastructure community"

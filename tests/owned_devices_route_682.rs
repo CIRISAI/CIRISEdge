@@ -374,6 +374,36 @@ async fn pair_with(tag: &str, scope: &str, d2: D2Starts) -> Pair {
             .await
             .unwrap_or_else(|e| panic!("owner-binding for D2 at {scope}: {e:?}"));
     }
+    // persist v53 S1 (CC 3.3.7) — each device's own signed occurrence under
+    // O, as its host publishes one: the owner's devices are her laptop (D1)
+    // and her phone (D2), the field's `selffiles` pair. S1 reaches a sibling
+    // with O's `self`-audience rows only through these (an owner-binding
+    // alone makes no device). D1 holds its own; under `Wiped` it also still
+    // holds D2's, as it holds D2's binding.
+    let occ = |key: &Arc<Ident>, class: &'static str| {
+        let key = Arc::clone(key);
+        let owner_id = owner.key_id.clone();
+        async move { common::node_signed_occurrence(&owner_id, &key.key_id, &key.signer(), class).await }
+    };
+    dir1.put_identity_occurrence(
+        occ(&k1, ciris_persist::federation::types::device_class::LAPTOP).await,
+    )
+    .await
+    .expect("D1's occurrence (D1)");
+    match d2 {
+        D2Starts::Claimed => dir2
+            .put_identity_occurrence(
+                occ(&k2, ciris_persist::federation::types::device_class::PHONE).await,
+            )
+            .await
+            .expect("D2's occurrence (D2)"),
+        D2Starts::Wiped => dir1
+            .put_identity_occurrence(
+                occ(&k2, ciris_persist::federation::types::device_class::PHONE).await,
+            )
+            .await
+            .expect("D2's occurrence (D1 remembers it)"),
+    }
 
     let auth = |key: &Arc<Ident>, dir: &Arc<SqliteBackend>| ReticulumAuth {
         signer: Some(key.signer()),

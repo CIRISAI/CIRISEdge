@@ -178,15 +178,30 @@ struct Node {
 }
 
 async fn node(idents: &[&Ident], signer: &Ident) -> Node {
-    build_node_with(idents, signer, signer).await
+    // persist v53 S1 (CC 3.3.7) — alice's laptop.
+    build_node_with(
+        idents,
+        signer,
+        signer,
+        ciris_persist::federation::types::device_class::LAPTOP,
+    )
+    .await
 }
 
 /// A SECOND device of `owner` (CIRISEdge#646).
 async fn device_of(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
-    build_node_with(idents, owner, device).await
+    // persist v53 S1 (CC 3.3.7) — her phone: in her self audience as a
+    // personal-class device.
+    build_node_with(
+        idents,
+        owner,
+        device,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await
 }
 
-async fn build_node_with(idents: &[&Ident], owner: &Ident, signer: &Ident) -> Node {
+async fn build_node_with(idents: &[&Ident], owner: &Ident, signer: &Ident, class: &str) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -261,7 +276,7 @@ async fn build_node_with(idents: &[&Ident], owner: &Ident, signer: &Ident) -> No
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     .expect("provision this node's engine occurrence");
@@ -552,6 +567,8 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
         .expect("32 bytes");
     let chunk_count = file_len.div_ceil(CHUNK_BYTES);
     assert_eq!(chunk_count, 400, "100 MiB as 256 KiB segments");
+    // CIRISEdge#797 (persist v53, CIRISPersist#969): one stream epoch, so one
+    // empty terminator after the data chunks.
     assert_eq!(
         node_a
             .dir
@@ -560,7 +577,7 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
             .expect("A's stream")
             .chunks
             .len(),
-        chunk_count
+        chunk_count + 1
     );
     let crossed_id = match &published.shared {
         ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
@@ -585,7 +602,8 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
         .await
         .expect("B admits the crossed row");
 
-    // ── The keys cross: a set per chunk and one for the manifest ──
+    // ── The keys cross: the manifest's set and ONE stream set for the
+    //    file's one epoch, where v52 sent one per chunk (#969) ──
     node_a
         .store
         .engine()
@@ -604,9 +622,19 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
                 .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
         })
         .collect();
+    assert_eq!(
+        sets.iter()
+            .filter(|s| {
+                s.attestation.attestation_type
+                    == ciris_persist::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
+            })
+            .count(),
+        1,
+        "one stream set for 400 chunks"
+    );
     assert!(
-        sets.len() > chunk_count,
-        "a set per chunk and the manifest: {}",
+        sets.len() < chunk_count,
+        "no set per chunk any more: {}",
         sets.len()
     );
     for s in &sets {
@@ -656,8 +684,8 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
             .expect("B's stream")
             .chunks
             .len(),
-        chunk_count,
-        "every chunk adopted at its position"
+        chunk_count + 1,
+        "every chunk adopted at its position, the terminator too"
     );
     assert_eq!(
         rows_of(&node_b, "holds_bytes:").await,
@@ -700,16 +728,23 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
         }
     );
 
-    // ── The layout B walks: the manifest's 400 chunks, in seq order ──
+    // ── The layout B walks: the manifest's 400 chunks, in seq order, then
+    //    the epoch's empty terminator at the end (no offset moves) ──
     let layout = file
         .layout(&node_b.store, &node_b.me)
         .await
         .expect("B opens the layout");
     assert_eq!(layout.stream_id, stream_id);
     assert_eq!(layout.total_size, file_len as u64);
-    assert_eq!(layout.chunks.len(), chunk_count);
+    assert_eq!(layout.chunks.len(), chunk_count + 1);
+    let terminator = layout.chunks[chunk_count];
+    assert_eq!(
+        (terminator.seq, terminator.offset, terminator.size),
+        (1 << 62, file_len as u64, 0),
+        "epoch 0's terminator: empty, at the file's end"
+    );
     let mut expect_off = 0u64;
-    for (i, c) in layout.chunks.iter().enumerate() {
+    for (i, c) in layout.chunks[..chunk_count].iter().enumerate() {
         assert_eq!(c.seq, i as u64, "seq order");
         assert_eq!(c.offset, expect_off, "contiguous from 0");
         assert_eq!(c.size, CHUNK_BYTES as u64, "every segment is 256 KiB");
@@ -751,7 +786,10 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
         peak_over_baseline / CHUNK_BYTES,
         CHUNK_BYTES,
     );
-    assert_eq!(items, chunk_count, "one item per manifest chunk");
+    assert_eq!(
+        items, chunk_count,
+        "one item per data chunk; the terminator holds none"
+    );
     assert_eq!(off, file_len, "the walk covered the whole file");
     assert_eq!(largest, CHUNK_BYTES);
     assert!(

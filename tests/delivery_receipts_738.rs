@@ -136,7 +136,10 @@ struct Node {
 /// A node of `owner`, its own key from `device` (the owner's first device when
 /// the two are the same identity), with the owner binding and the node-class
 /// engine occurrence provisioned — `blob_federation_e2e::build_node_with`.
-async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
+/// `class` is the occurrence's `device_class`: under persist v53 S1 a
+/// personal device (`phone` | `laptop`) is in its owner's self and family
+/// audience, a server-class node is not (CC 3.3.7).
+async fn device(idents: &[&Ident], owner: &Ident, device: &Ident, class: &str) -> Node {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -207,7 +210,7 @@ async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
         store.engine(),
         &*dir,
         &owner.key_id,
-        "server",
+        class,
     )
     .await
     .expect("provision this node's engine occurrence");
@@ -221,7 +224,13 @@ async fn device(idents: &[&Ident], owner: &Ident, device: &Ident) -> Node {
 }
 
 async fn node(idents: &[&Ident], owner: &Ident) -> Node {
-    device(idents, owner, owner).await
+    device(
+        idents,
+        owner,
+        owner,
+        ciris_persist::federation::types::device_class::LAPTOP,
+    )
+    .await
 }
 
 /// Hand `from`'s node key, owner binding and published occurrence to `to` —
@@ -320,6 +329,8 @@ async fn seed_community(node: &Node, room: &str, members: &[&Ident]) {
         consensus_protocol: "founder_only".to_owned(),
         policy_blob: None,
         persist_row_hash: String::new(),
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
     };
     let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
         .expect("canonicalize the room");
@@ -360,6 +371,8 @@ async fn seed_family(node: &Node, family: &str, members: &[&Ident]) {
         consensus_protocol: "founder_only".to_owned(),
         consensus_protocol_entrenched: false,
         persist_row_hash: String::new(),
+        prev_head_digest: String::new(),
+        charter_digest: String::new(),
     };
     let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&record.signing_envelope())
         .expect("canonicalize the family");
@@ -720,7 +733,13 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
     let alice = Ident::new("alice-fed", 0x11);
     let alice_phone = Ident::new("alice-phone", 0x33);
     let node_a = node(&[&alice], &alice).await;
-    let node_b = device(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    let node_b = device(
+        &[&alice, &alice_phone],
+        &alice,
+        &alice_phone,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     federate_all(&[&node_a, &node_b]).await;
     let edge_b = edge_of(&node_b);
 
@@ -734,10 +753,17 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
         .await
         .expect("read")
         .expect("files::publish published the stream's STH");
-    assert_eq!(sth_a.tree_size, 5, "4 × 256 KiB + the tail");
+    // CIRISEdge#797 (persist v53, CIRISPersist#969): the stream's leaves are
+    // every chunk persist holds for it, epoch 0's empty terminator included,
+    // so the root a receipt names commits to it too (CC 5.3.3.6).
+    assert_eq!(
+        sth_a.tree_size, 6,
+        "4 × 256 KiB + the tail + epoch 0's terminator"
+    );
+    assert_eq!(sth_a.tree_size, file.chunks.len() as u64);
     let claim = receipts::StreamSthClaim::from_row(&file.row).expect("the row carries the STH");
     assert_eq!(claim.root().expect("root"), sth_a.root_hash);
-    assert_eq!(claim.tree_size, 5);
+    assert_eq!(claim.tree_size, 6);
 
     node_b
         .dir
@@ -804,7 +830,7 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
         .await
         .expect("list");
     assert_eq!(held_b.len(), 1);
-    assert_eq!(held_b[0].k, 5, "K = tree_size");
+    assert_eq!(held_b[0].k, 6, "K = tree_size, the terminator included");
     assert_eq!(
         held_b[0].chunk_root, sth_a.root_hash,
         "the root B's own chunks reproduce is A's published root"
@@ -838,7 +864,7 @@ async fn a_self_file_is_receipted_once_by_the_owners_other_device() {
     let received = file_row.received_by(&node_a.store).await.expect("read");
     assert_eq!(received.len(), 1, "exactly one receipt: {received:?}");
     assert_eq!(received[0].node_key_id, node_b.me);
-    assert_eq!((received[0].epoch, received[0].k), (0, 5));
+    assert_eq!((received[0].epoch, received[0].k), (0, 6));
     assert!(
         received[0].at > file.row.asserted_at && received[0].at <= chrono::Utc::now(),
         "`at` is when A's store took the receipt (CIRISPersist#953): {}",
@@ -893,7 +919,13 @@ async fn an_inline_self_file_is_receipted_once_by_the_owners_other_device() {
     let alice = Ident::new("alice-fed", 0x11);
     let alice_phone = Ident::new("alice-phone", 0x33);
     let node_a = node(&[&alice], &alice).await;
-    let node_b = device(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    let node_b = device(
+        &[&alice, &alice_phone],
+        &alice,
+        &alice_phone,
+        ciris_persist::federation::types::device_class::PHONE,
+    )
+    .await;
     federate_all(&[&node_a, &node_b]).await;
     let edge_b = edge_of(&node_b);
 
