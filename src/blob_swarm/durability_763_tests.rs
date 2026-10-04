@@ -649,13 +649,15 @@ async fn a_whole_lost_file_is_repaired_and_reads_with_no_new_key_763() {
 /// **A withdrawn self file reads `Withdrawn` for a device holding its grant,
 /// and the durability pass does not repair it.** B pulled the file; alice
 /// withdraws it (CC 2.3) and the `withdraws` row reaches B. A's read is
-/// refused `Withdrawn`, not `NotGranted` and not a substrate fault (B's is
-/// pinned below on a persist gap). Then B's copy is evicted: the pass lists
+/// refused `Withdrawn`, not `NotGranted` and not a substrate fault, and so is
+/// B's even though B filed a custody `here` (persist v53.0.1: a custody
+/// report never binds content). Then B's copy is evicted: the pass lists
 /// no repair and files no report for it (a retracted file is not
 /// durability's to restore). Fails with the pass
 /// listing withdrawn files (`LifecycleView::IncludeWithdrawn`): the evicted
 /// file comes back as a repair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one scenario: withdraw, read on both, refuse `here`, evict, sweep
 async fn a_withdrawn_file_reads_withdrawn_and_is_not_repaired_763() {
     let (alice, node_a, node_b) = two_devices().await;
     let edge_b = edge_of(&node_b);
@@ -702,35 +704,43 @@ async fn a_withdrawn_file_reads_withdrawn_and_is_not_repaired_763() {
         at_a.as_ref().map(Vec::len)
     );
 
-    // PERSIST GAP (reported, v53.0.0): B filed a custody `here` after its
-    // pull, a federation-tier `scores` row citing the blob in
-    // `evidence_refs`. Persist's tombstone fold (`binding_state` over
-    // `attestations_binding_content`) counts that report as a LIVE binding of
-    // the content, so on every device that reported `here` the withdrawn file
-    // still reads. Pinned by name: when persist stops counting custody
-    // reports as bindings this leg reds, and B's read is asserted `Withdrawn`
-    // like A's.
+    // B filed a custody `here` after its pull: a federation-tier `scores` row
+    // citing the blob in `evidence_refs`. On persist v53.0.0 the tombstone
+    // fold counted that report as a LIVE binding, so every device that
+    // reported `here` kept reading the withdrawn file. Persist v53.0.1 fixed
+    // the shared predicate (a `custody:` row never binds content). On B,
+    // which DID report `here`, the read is now `Withdrawn` like A's, and B's
+    // own report is not among the blob's bindings.
     let bindings = node_b
         .dir
         .attestations_binding_content(&hex::encode(file.sha))
         .await
         .expect("bindings");
     assert!(
-        bindings.iter().any(|r| r.attesting_key_id == node_b.me
+        !bindings.iter().any(|r| r.attesting_key_id == node_b.me
             && ciris_persist::federation::admission::envelope_dimension(&r.attestation_envelope)
                 == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)),
-        "B's own custody report is one of the blob's bindings"
-    );
-    assert_eq!(
-        ciris_persist::federation::blob_tombstone::binding_state(&*node_b.dir, &file.sha)
-            .await
-            .expect("fold"),
-        ciris_persist::federation::blob_tombstone::BindingState::Live,
-        "persist's fold on B: the custody report keeps the withdrawn blob live"
+        "B's own custody report is never a binding of the blob (persist v53.0.1)"
     );
     assert!(
-        file_row.open(&node_b.store, &node_b.me).await.is_ok(),
-        "B (which reported `here`) still reads the withdrawn file on this persist"
+        matches!(
+            ciris_persist::federation::blob_tombstone::binding_state(&*node_b.dir, &file.sha)
+                .await
+                .expect("fold"),
+            ciris_persist::federation::blob_tombstone::BindingState::Withdrawn { .. }
+        ),
+        "persist's fold on B: the withdrawn blob is Withdrawn despite B's custody report"
+    );
+    let at_b = file_row.open(&node_b.store, &node_b.me).await;
+    assert!(
+        matches!(
+            &at_b,
+            Err(crate::files::FileError::Unopened(
+                crate::chat::UnopenedReason::Withdrawn { .. }
+            ))
+        ),
+        "B (which reported `here`) reads the withdrawn file as Withdrawn: {:?}",
+        at_b.as_ref().map(Vec::len)
     );
 
     // Edge never files `here` for a retracted file: not on a direct report
