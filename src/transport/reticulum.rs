@@ -4347,6 +4347,23 @@ impl ReticulumTransport {
         self.peers.lock().await.keys().cloned().collect()
     }
 
+    /// CIRISEdge#809 / leviculum#49 — how many destinations leviculum's
+    /// known-destinations store has evicted at its identity cap, cumulative
+    /// since boot. Read live from the node and mirrored into
+    /// [`EdgeMetrics::known_destination_evictions`](crate::observability::EdgeMetrics)
+    /// so the snapshot an operator reads carries it. Zero on a node with
+    /// room; a rising value means the node runs at its cap and the
+    /// UNRETAINED, least-recently-used destinations are the ones going — a
+    /// destination pinned as load-bearing is never among them.
+    #[must_use]
+    pub fn known_destination_evictions(&self) -> u64 {
+        let evictions = self.node.known_destination_evictions();
+        if let Some(m) = self.metrics.as_ref() {
+            m.set_known_destination_evictions(evictions);
+        }
+        evictions
+    }
+
     /// v0.14.0 (CIRISEdge#32) — return the 16-byte Reticulum
     /// destination hash for a rooted peer. Test seam: the Links FFI
     /// tests need `dest_hash` to drive `link_open(dest_hash)` after
@@ -8803,10 +8820,50 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 );
             }
         }
+        NodeEvent::PacketDropped {
+            destination_hash,
+            reason,
+            interface_in,
+            hops,
+        } => {
+            note_packet_dropped(
+                ctx.metrics,
+                destination_hash.as_ref(),
+                reason,
+                interface_in,
+                hops,
+            );
+        }
         other => {
             tracing::trace!(event = ?other, "unhandled Reticulum event");
         }
     }
+}
+
+/// CIRISEdge#809 — a packet leviculum dropped on arrival (v0.29
+/// `NodeEvent::PacketDropped`): counted once in
+/// [`EdgeMetrics::transport_packets_dropped`](crate::observability::EdgeMetrics)
+/// for every reason, with the reason on a DEBUG line. DEBUG, not WARN:
+/// duplicates and no-path drops are routine on a mesh, and a per-packet
+/// WARN would be attacker-paced noise (the #460 lesson). Split out of
+/// `handle_event` so it is unit-testable without an event-loop context.
+fn note_packet_dropped(
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    destination_hash: &[u8],
+    reason: leviculum_core::transport::DropReason,
+    interface_in: usize,
+    hops: u8,
+) {
+    if let Some(m) = metrics {
+        m.inc_transport_packet_dropped();
+    }
+    tracing::debug!(
+        destination = %hex::encode(&destination_hash[..destination_hash.len().min(8)]),
+        ?reason,
+        interface_in,
+        hops,
+        "transport dropped an inbound packet (CIRISEdge#809)"
+    );
 }
 
 /// CIRISEdge#460 — severity for a `LinkClosed` event, decided PURELY from the
@@ -11846,6 +11903,53 @@ mod tests {
                 2,
                 "the counter must reach the bundle an operator reads, not just the handle"
             );
+        }
+    }
+
+    /// CIRISEdge#809 — the two leviculum v0.29 pressure signals reach the
+    /// snapshot an operator reads: every `PacketDropped` is one increment
+    /// whatever its reason, and the known-destination eviction count is a
+    /// mirror of leviculum's (a `store`, so a re-read never double counts).
+    mod pressure_signals_809 {
+        use super::super::note_packet_dropped;
+        use crate::observability::EdgeMetrics;
+        use leviculum_core::transport::DropReason;
+
+        #[test]
+        fn every_packet_drop_is_counted_once_whatever_the_reason() {
+            let m = EdgeMetrics::new();
+            assert_eq!(
+                m.transport_packets_dropped(),
+                0,
+                "a fresh node dropped nothing"
+            );
+            let dest = [0x11u8; 16];
+            note_packet_dropped(Some(&m), &dest, DropReason::Duplicate, 0, 1);
+            note_packet_dropped(Some(&m), &dest, DropReason::NoPath, 1, 3);
+            note_packet_dropped(Some(&m), &dest, DropReason::AnnounceReplay, 0, 0);
+            assert_eq!(m.transport_packets_dropped(), 3);
+            assert_eq!(
+                m.snapshot().transport_packets_dropped,
+                3,
+                "the counter must reach the bundle, not just the handle"
+            );
+            // No metrics bag: the DEBUG line still goes out and nothing panics.
+            note_packet_dropped(None, &dest, DropReason::Ifac, 0, 1);
+        }
+
+        #[test]
+        fn the_eviction_count_is_mirrored_not_accumulated() {
+            let m = EdgeMetrics::new();
+            assert_eq!(m.known_destination_evictions(), 0);
+            m.set_known_destination_evictions(7);
+            m.set_known_destination_evictions(7);
+            assert_eq!(
+                m.known_destination_evictions(),
+                7,
+                "two readbacks of the same leviculum count must not read as 14"
+            );
+            m.set_known_destination_evictions(9);
+            assert_eq!(m.snapshot().known_destination_evictions, 9);
         }
     }
 
