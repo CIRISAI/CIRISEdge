@@ -1002,11 +1002,32 @@ async fn wait_read_back(p1: &Member, q1: &Member, file: &File, what: &str, budge
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let got = FileRow::from_row(&file.row)
-        .expect("a file row")
-        .open(&q1.node.store, &q1.node.me)
-        .await
-        .unwrap_or_else(|e| panic!("Q1 opens the {what}: {e}"));
+    // The key follows the bytes, in either order (persist I61/I62; CC
+    // 5.3.3.4's reconnect-then-pull shape). Through a forwarder the bytes
+    // can land a few hundred ms before Q1's key_grant does, so the open is
+    // waited for like the bytes were, bounded; a key that never comes still
+    // fails here. (On persist v53.1.1's merge commit the immediate open hit
+    // `not_granted` in 1 of 3 runs and opened within the wait in 4 of 4.)
+    let row = FileRow::from_row(&file.row).expect("a file row");
+    let key_wait = Instant::now();
+    let got = loop {
+        match row.open(&q1.node.store, &q1.node.me).await {
+            Ok(bytes) => {
+                eprintln!(
+                    "family_files_wire_736: Q1 opened the {what} {} ms after holding it",
+                    key_wait.elapsed().as_millis()
+                );
+                break bytes;
+            }
+            Err(e) => {
+                assert!(
+                    key_wait.elapsed() < Duration::from_secs(15),
+                    "Q1 held the {what} but its key never arrived: {e}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
     assert_eq!(
         got.len(),
         file.plain.len(),
