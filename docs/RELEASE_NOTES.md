@@ -1,5 +1,41 @@
 # CIRISEdge Release Notes
 
+# v40.0.2 — persist v53.1.1: the baked final-genesis bundle, the chunk→manifest link, and a withdrawn DAG refused from every door
+
+**2026-10-05.** **PATCH** from v40.0.1. Verify v19.0.0 unchanged; no edge API change.
+Ladder triple: **edge v40.0.2 · persist v53.1.1 · verify v19.0.0**.
+
+| | v40.0.1 | v40.0.2 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v53.0.1"` | **`tag = "v53.1.1"`** |
+| ciris-persist (wheel floor) | `>=53.0.1,<54` | **`>=53.1.1,<54`** |
+
+**Persist v53.1.x brings** (no wire change since v53.0.1):
+- the baked final-genesis bundle (v53.1.1) and the genesis import door
+  (`install_genesis_bundle_roster_json`), which CIRISServer 0.5.221 uses to adopt the new root;
+- CIRISPersist#979: a chunk→manifest link (`federation_dag_chunks`, written by persist at seal and
+  promote, never from a pointer's `stream_id`); a chunk is Withdrawn once every manifest holding it
+  is withdrawn, and the read and peer-serve doors refuse through it; evicting a withdrawn manifest
+  also evicts its exclusively-held chunks; `Engine::chunks_of_manifest` / `dag_contains_chunk`.
+
+**The one edge change.** Under #979 a withdrawn DAG answers `Withdrawn` from every door that reads it:
+`stream_chunks`, a manifest serve, and the chunk serve door. Edge's serve gate already mapped the
+chunk door, but its membership check swallowed the other two on the cold path (a listing error was
+skipped; the manifest-serve fallback read `Withdrawn` as "not a DAG"), so the same door answered
+`Withdrawn` with a warm per-file cache and a false `ChunkNotInNamedDag` cold
+(`self_dag_field_path_717` caught it). `chunk_in_named_dag` now answers Member / NotMember /
+Withdrawn, and a withdrawn DAG's chunk is refused `Withdrawn` on both paths, the refusal the fetcher
+aborts on rather than hunting for another holder.
+
+**Test fix:** `family_files_wire_736`'s forwarder leg now waits (bounded) for Q1's key after the bytes
+are held; through a forwarder the key arrives 11–46 ms after them, and opening immediately raced it.
+The #800 stall in that leg is unchanged and tracked.
+
+**Not in this patch:** the #771 adoption proper (replace the #766 per-file serve cache with
+`dag_contains_chunk`; the two-node withdraw-and-evict witness). That lands as a MINOR. The revocation
+register stays armed for the case persist cannot backfill: a withdrawn DAG with no link (pre-V176, or
+held only by a relay that never promoted it).
+
 # v40.0.1 — six durability fixes from the v40.0.0 review: outsider claims, unread audiences, repair counts, withdrawn files, a blocking sweep, and an unbounded room
 
 **2026-10-04.** **PATCH** from v40.0.0. Same pins (persist v53.0.1, verify v19.0.0), no API change.
