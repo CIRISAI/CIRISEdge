@@ -574,11 +574,14 @@ async fn build_edge_with_transport(
 }
 
 /// The handle the Edge attaches IS the bag `Edge::metrics()` reads: one
-/// increment through the transport's copy is one in the Edge's snapshot. On
-/// the pre-#809 code `attach_metrics` was never called, so a transport's
-/// counters only ever reached a bag the tests built and production read zero.
+/// increment through the transport's copy is one in the Edge's snapshot. It
+/// is attached at BUILD, before any listener can exist, so every spawn site
+/// (`spawn_background_listeners`, `Edge::run`, a host calling `listen`
+/// itself) is covered. On the pre-#809 code nothing attached, so a
+/// transport's counters only reached a bag the tests built and production
+/// read zero.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_edge_attaches_its_metrics_to_every_transport_before_listening_809() {
+async fn the_edge_attaches_its_metrics_to_every_transport_at_build_809() {
     let _guard = ffi_test_lock().lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let (backend, _existing) = fresh_backend().await;
@@ -586,33 +589,22 @@ async fn the_edge_attaches_its_metrics_to_every_transport_before_listening_809()
         attached: std::sync::Mutex::new(None),
         evictions_to_report: 0,
     });
-    let edge = Arc::new(
+    let edge =
         build_edge_with_transport(tmp.path(), backend, transport.clone() as Arc<dyn Transport>)
-            .await,
-    );
-    assert!(
-        transport.attached.lock().expect("attached").is_none(),
-        "building the Edge does not attach; the listener spawn does, so a bag is never \
-         attached after a listener could already have counted into nothing"
-    );
-
-    let tasks = edge.spawn_background_listeners(&tokio::runtime::Handle::current());
+            .await;
 
     let through_transport = transport
         .attached
         .lock()
         .expect("attached")
         .clone()
-        .expect("the Edge attached its metrics before spawning listen");
+        .expect("the Edge attached its metrics at build, before any listener");
     through_transport.inc_transport_packet_dropped();
     assert_eq!(
         edge.metrics().snapshot().transport_packets_dropped,
         1,
         "the transport's bag and the Edge's bag are one bag"
     );
-    for t in tasks {
-        t.abort();
-    }
 }
 
 /// The UniFFI snapshot carries both signals under their catalogued keys, and a

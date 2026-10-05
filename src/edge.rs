@@ -4287,15 +4287,6 @@ impl Edge {
         let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundFrame>(1024);
         let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-        // CIRISEdge#809 — every transport counts into THIS edge's metrics
-        // bag, attached before its listener exists so no event is counted
-        // into a bag nobody reads. (Until this line the Reticulum
-        // transport's counters — #530 evictions, #627 links-before-binding
-        // — only ever reached a bag the tests built; production read zero.)
-        for transport in &self.transports {
-            transport.attach_metrics(self.metrics.clone());
-        }
-
         // One listen task per registered transport. Each `listen()`
         // owns its transport's NodeEvent loop — accepts inbound
         // `LinkRequest`s, drives `LinkEstablished` bookkeeping, and
@@ -8343,6 +8334,18 @@ impl EdgeBuilder {
         }
         let canonical_peers = Arc::new(std::sync::RwLock::new(canonical_id_set));
 
+        // CIRISEdge#809 — every transport counts into THIS edge's metrics
+        // bag, attached here, at build, because no listener can exist yet:
+        // every spawn site (`spawn_background_listeners`, `Edge::run`, a
+        // host that calls `listen` itself as `edge_node` does) comes after.
+        // Until this line the Reticulum transport's counters (#530
+        // evictions, #627 links-before-binding) only ever reached a bag the
+        // tests built; production read zero.
+        let metrics = crate::observability::EdgeMetrics::new();
+        for transport in &self.transports {
+            transport.attach_metrics(metrics.clone());
+        }
+
         Ok(Edge {
             verify,
             queue,
@@ -8389,7 +8392,7 @@ impl EdgeBuilder {
             trust_scoring: self.trust_scoring,
             trust_threshold_override: Arc::new(std::sync::RwLock::new(None)),
             trust_scoring_override: Arc::new(std::sync::RwLock::new(None)),
-            metrics: crate::observability::EdgeMetrics::new(),
+            metrics,
             config: self.config,
         })
     }
