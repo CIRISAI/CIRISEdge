@@ -4287,6 +4287,15 @@ impl Edge {
         let (inbound_tx, mut inbound_rx) = mpsc::channel::<InboundFrame>(1024);
         let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+        // CIRISEdge#809 — every transport counts into THIS edge's metrics
+        // bag, attached before its listener exists so no event is counted
+        // into a bag nobody reads. (Until this line the Reticulum
+        // transport's counters — #530 evictions, #627 links-before-binding
+        // — only ever reached a bag the tests built; production read zero.)
+        for transport in &self.transports {
+            transport.attach_metrics(self.metrics.clone());
+        }
+
         // One listen task per registered transport. Each `listen()`
         // owns its transport's NodeEvent loop — accepts inbound
         // `LinkRequest`s, drives `LinkEstablished` bookkeeping, and

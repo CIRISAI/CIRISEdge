@@ -2470,6 +2470,12 @@ impl PyEdge {
         for entry in &reach_snap {
             m.set_peer_reachability(&entry.peer_key_id, entry.transport_id.0, entry.ratio());
         }
+        // CIRISEdge#809 — gauges a transport mirrors from a value it does
+        // not own (leviculum's eviction count) are refreshed here, so the
+        // snapshot is current without a transport-specific getter first.
+        for transport in self.inner.transports() {
+            transport.refresh_metrics();
+        }
         let bundle = m.snapshot();
         let root = pyo3::types::PyDict::new(py);
 
@@ -2514,6 +2520,16 @@ impl PyEdge {
             bytes_out.set_item(k.0, *v)?;
         }
         root.set_item("transport_bytes_out_total", bytes_out)?;
+
+        // CIRISEdge#809 — the two leviculum pressure signals, as scalars.
+        root.set_item(
+            "transport_packets_dropped",
+            bundle.transport_packets_dropped,
+        )?;
+        root.set_item(
+            "known_destination_evictions",
+            bundle.known_destination_evictions,
+        )?;
 
         let reachability = pyo3::types::PyDict::new(py);
         for ((peer, medium), v) in &bundle.peer_reachability_ratio {
@@ -11826,6 +11842,34 @@ mod pyo3_tier2_tests {
             rows.len(),
             rows.iter().map(|r| &r.queue_id).collect::<Vec<_>>(),
         );
+    }
+
+    /// CIRISEdge#809 — `metrics_snapshot()` carries the two leviculum
+    /// pressure signals as scalars, read from the SAME bag the transports
+    /// count into (`Edge::metrics()`): one increment is one in the dict.
+    #[test]
+    fn metrics_snapshot_carries_both_pressure_signals_809() {
+        init_python();
+        let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
+        let read = |py_edge: &PyEdge| -> (u64, u64) {
+            Python::attach(|py| -> PyResult<(u64, u64)> {
+                let snap = py_edge.metrics_snapshot(py)?;
+                let bound = snap.bind(py);
+                Ok((
+                    bound.get_item("transport_packets_dropped")?.extract()?,
+                    bound.get_item("known_destination_evictions")?.extract()?,
+                ))
+            })
+            .expect("metrics_snapshot")
+        };
+        assert_eq!(
+            read(&py_edge),
+            (0, 0),
+            "a fresh edge has dropped and evicted nothing"
+        );
+        py_edge.inner.metrics().inc_transport_packet_dropped();
+        py_edge.inner.metrics().set_known_destination_evictions(5);
+        assert_eq!(read(&py_edge), (1, 5));
     }
 
     /// v0.19.5 (CIRISEdge#50) — `metrics_snapshot()["durable_queue_depth"]`

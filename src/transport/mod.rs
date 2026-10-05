@@ -662,6 +662,23 @@ pub trait Transport: Send + Sync + 'static {
     fn subscribe_reachability(&self) -> Option<tokio::sync::broadcast::Receiver<PeerReachable>> {
         None
     }
+
+    /// CIRISEdge#809 — hand the transport the Edge's metrics bag, so the
+    /// counters a transport increments from inside its event loop
+    /// (packet drops, announce-intake evictions, links before binding, …)
+    /// land in the SAME `EdgeMetrics` the host reads through
+    /// `Edge::metrics()` / the binding snapshots. `Edge` calls this once
+    /// per transport BEFORE spawning `listen`; a transport with no
+    /// counters of its own ignores it. Every `EdgeMetrics` field is an
+    /// `Arc`, so the clone shares, never copies.
+    fn attach_metrics(&self, _metrics: crate::observability::EdgeMetrics) {}
+
+    /// CIRISEdge#809 — refresh any gauge the transport mirrors from a
+    /// value it does not own (leviculum's known-destination eviction
+    /// count). Called by the snapshot paths right before they read, so an
+    /// ordinary `metrics_snapshot()` is current without a caller first
+    /// invoking a transport-specific getter. Cheap; the default is a no-op.
+    fn refresh_metrics(&self) {}
 }
 
 /// CIRISEdge#454 — a no-op [`Transport`] for tests + downstream consumers whose
