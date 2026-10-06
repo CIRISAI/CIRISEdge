@@ -11868,7 +11868,10 @@ mod pyo3_tier2_tests {
             "a fresh edge has dropped and evicted nothing"
         );
         py_edge.inner.metrics().inc_transport_packet_dropped();
-        py_edge.inner.metrics().set_known_destination_evictions(5);
+        py_edge
+            .inner
+            .metrics()
+            .set_known_destination_evictions(1, 5);
         assert_eq!(read(&py_edge), (1, 5));
     }
 

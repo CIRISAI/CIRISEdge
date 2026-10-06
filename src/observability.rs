@@ -1080,7 +1080,14 @@ pub struct EdgeMetrics {
     /// UNRETAINED, least-recently-used destinations are the ones going; a
     /// retained (load-bearing) destination is never evicted, so it never
     /// counts here. Zero on a node with room.
-    pub known_destination_evictions: Arc<std::sync::atomic::AtomicU64>,
+    ///
+    /// One entry PER TRANSPORT INSTANCE (keyed by the transport's
+    /// process-unique metrics source id), summed on read: an Edge may hold
+    /// several Reticulum transports, each with its own node and its own
+    /// cumulative count, and a single stored value would let the last
+    /// refresh overwrite the others and move the total backward (Codex,
+    /// #810).
+    pub known_destination_evictions: Arc<RwLock<HashMap<u64, u64>>>,
     /// CIRISEdge#627 — links that came up IDENTIFIED before their announcer had
     /// a binding. Under announce-on-link + inline Stage 1 this is 0 in steady
     /// state; nonzero means the ordering the design guarantees broke.
@@ -1513,19 +1520,26 @@ impl EdgeMetrics {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// CIRISEdge#809 — record leviculum's cumulative known-destination
-    /// eviction count. A `store`, not an increment: leviculum owns the
-    /// counter and edge mirrors it on each readback.
-    pub fn set_known_destination_evictions(&self, evictions: u64) {
+    /// CIRISEdge#809 — record one transport's cumulative known-destination
+    /// eviction count. A `store` into that transport's own entry, not an
+    /// increment: leviculum owns each node's counter and edge mirrors it
+    /// on each readback, so two readbacks of one count never double it and
+    /// one transport's refresh never overwrites another's.
+    pub fn set_known_destination_evictions(&self, source: u64, evictions: u64) {
         self.known_destination_evictions
-            .store(evictions, std::sync::atomic::Ordering::Relaxed);
+            .write()
+            .insert(source, evictions);
     }
 
-    /// CIRISEdge#809 — the last mirrored known-destination eviction count.
+    /// CIRISEdge#809 — known-destination evictions across every transport
+    /// that has reported: the sum of each one's last mirrored cumulative
+    /// count. Monotonic as long as each source's count is.
     #[must_use]
     pub fn known_destination_evictions(&self) -> u64 {
         self.known_destination_evictions
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .read()
+            .values()
+            .fold(0u64, |acc, v| acc.saturating_add(*v))
     }
 
     /// CIRISEdge#627 — a link came up identified before its announcer was bound.

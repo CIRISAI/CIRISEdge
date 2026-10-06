@@ -553,7 +553,7 @@ impl Transport for RecordingTransport {
     }
     fn refresh_metrics(&self) {
         if let Some(m) = self.attached.lock().expect("attached").as_ref() {
-            m.set_known_destination_evictions(self.evictions_to_report);
+            m.set_known_destination_evictions(1, self.evictions_to_report);
         }
     }
 }

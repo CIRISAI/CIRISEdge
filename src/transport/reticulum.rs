@@ -2145,6 +2145,10 @@ pub struct ReticulumTransport {
     /// [`AnnounceCtx`]. `None` (the default) keeps every pre-#530 construction
     /// site compiling unchanged and leaves intake evictions loud-but-uncounted.
     metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
+    /// CIRISEdge#809 — this transport's process-unique id for the per-source
+    /// gauges in [`crate::observability::EdgeMetrics`] (several transports
+    /// may share one bag).
+    metrics_source: u64,
     /// The Leviculum node — built + started in `new`. Shared; `send`
     /// borrows it, `listen` drains its event channel.
     node: Arc<ReticulumNode>,
@@ -3333,6 +3337,11 @@ impl ReticulumTransport {
             config,
             // CIRISEdge#530 — off by default; attach with `with_metrics`.
             metrics: std::sync::OnceLock::new(),
+            metrics_source: {
+                static NEXT_METRICS_SOURCE: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                NEXT_METRICS_SOURCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             node: Arc::new(node),
             local_dest_hash,
             local_named_dest_hash,
@@ -4363,7 +4372,7 @@ impl ReticulumTransport {
     pub fn known_destination_evictions(&self) -> u64 {
         let evictions = self.node.known_destination_evictions();
         if let Some(m) = self.metrics.get() {
-            m.set_known_destination_evictions(evictions);
+            m.set_known_destination_evictions(self.metrics_source, evictions);
         }
         evictions
     }
@@ -11969,15 +11978,34 @@ mod tests {
         fn the_eviction_count_is_mirrored_not_accumulated() {
             let m = EdgeMetrics::new();
             assert_eq!(m.known_destination_evictions(), 0);
-            m.set_known_destination_evictions(7);
-            m.set_known_destination_evictions(7);
+            m.set_known_destination_evictions(1, 7);
+            m.set_known_destination_evictions(1, 7);
             assert_eq!(
                 m.known_destination_evictions(),
                 7,
                 "two readbacks of the same leviculum count must not read as 14"
             );
-            m.set_known_destination_evictions(9);
+            m.set_known_destination_evictions(1, 9);
             assert_eq!(m.snapshot().known_destination_evictions, 9);
+        }
+
+        /// Two transports in one Edge each mirror their own node's count;
+        /// the gauge is their SUM, and one's refresh never overwrites the
+        /// other's. On 14a4a28 the last refresh won: nodes at 10 and 0
+        /// read 0, and the cumulative gauge moved backward (Codex, #810).
+        #[test]
+        fn evictions_from_several_transports_are_summed_not_overwritten() {
+            let m = EdgeMetrics::new();
+            m.set_known_destination_evictions(1, 10);
+            m.set_known_destination_evictions(2, 0);
+            assert_eq!(
+                m.known_destination_evictions(),
+                10,
+                "the zero must not erase the ten"
+            );
+            m.set_known_destination_evictions(2, 3);
+            m.set_known_destination_evictions(1, 10);
+            assert_eq!(m.snapshot().known_destination_evictions, 13);
         }
     }
 
