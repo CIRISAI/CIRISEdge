@@ -1,5 +1,33 @@
 # CIRISEdge Release Notes
 
+# v40.0.3 — persist v53.1.4: an upgraded canonical boots Rooted
+
+**2026-10-05.** **PATCH** from v40.0.2. Verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged; no
+edge code change.
+Ladder triple: **edge v40.0.3 · persist v53.1.4 · verify v19.0.0**.
+
+| | v40.0.2 | v40.0.3 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v53.1.1"` | **`tag = "v53.1.4"`** (41fa5548) |
+| ciris-persist (wheel floor) | `>=53.1.1,<54` | **`>=53.1.4,<54`** |
+
+**Why.** The bridge's dry run of CIRISServer 0.5.221 on production data found that an UPGRADED canonical
+boots PreGenesis: persist refused canonical-1's seat in `ciris-canonical`
+(`membership_founding_member_unsigned`) because the held July key record carries one accord scrub
+and the bundle's three-scrub record arrives at an EQUAL `valid_from`, which the supersede path
+refused. Persist v53.1.4 adds the equal-instant authority repair in `verify_canonical_supersede`
+(the refusal becomes an admit) and makes key-row UPDATEs keep `additional_scrubs`. A fresh home was
+never affected. CIRISServer 0.5.222 pins this release.
+
+**Persist v53.1.2–v53.1.4 refusals, and edge's exposure.** The range adds typed refusals on several
+doors; edge calls two of them, and both already fail loud: `put_custody_ack`
+(`custody_ack_malformed` when a named target is not the held row's community or group — edge passes
+the row's own `group_of(row)`, which is exactly that target; `custody_ack_here_node_key_unknown` only
+for an engine with no derived key, which edge never builds) and the stream-keyed chunk append
+(`stream_elsewhere`), where a refused seal evicts the unsealed stream and returns the mapped error.
+The new `carrier_withdraws_not_the_holder` cannot fire from edge: its `ContentMiss` withdrawal is an
+edge envelope that never reaches persist's admit, and a file withdraw is author-signed on its own row.
+
 # v40.0.2 — persist v53.1.1: the baked final-genesis bundle, the chunk→manifest link, and a withdrawn DAG refused from every door
 
 **2026-10-05.** **PATCH** from v40.0.1. Verify v19.0.0 unchanged; no edge API change.
