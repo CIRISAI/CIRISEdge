@@ -1111,6 +1111,72 @@ async fn assert_holds_nothing_of(node: &Node, files: &[&File], who: &str) {
     }
 }
 
+/// (d) — **CIRISConstitution#141, measured, by name**: the non-member
+/// forwarder F's BLOB STORE holds none of the family's bytes. Opening each
+/// file at F — the inline file and the DAG file, through the same door Q1
+/// reads them by — yields no head and is refused; the DAG's manifest relates
+/// no chunk at F (persist V176), and no chunk sha P1 sealed is held at F.
+/// The premise was structural (F is server-class, never admits the
+/// occurrence, so nothing books a pull); this asserts the outcome on F's
+/// stored state, so a regression that lets F adopt a family file fails here
+/// even if it never adopts the row.
+async fn assert_f_blob_store_holds_no_family_bytes(p1: &Member, f: &Relay, files: &[&File]) {
+    for file in files {
+        let name = file
+            .published
+            .pointer
+            .stream_id
+            .as_ref()
+            .map_or("inline file", |_| "DAG file");
+        let head = f.node.dir.blob_head(&file.sha).await.expect("blob_head");
+        assert!(
+            head.is_none(),
+            "F's blob store holds a head for the family {name} {}: {head:?} \
+             (CIRISConstitution#141)",
+            hex::encode(file.sha)
+        );
+        let opened = FileRow::from_row(&file.row)
+            .expect("a file row")
+            .open(&f.node.store, &f.node.me)
+            .await;
+        assert!(
+            opened.is_err(),
+            "F opened the family {name} ({} bytes) (CIRISConstitution#141)",
+            opened.as_ref().map_or(0, Vec::len)
+        );
+        assert!(
+            f.node
+                .store
+                .engine()
+                .chunks_of_manifest(&file.sha)
+                .await
+                .expect("chunks_of_manifest")
+                .is_empty(),
+            "F relates chunks to the family {name}'s manifest (CIRISConstitution#141)"
+        );
+        if let Some(stream) = &file.published.pointer.stream_id {
+            let sealed = p1
+                .node
+                .dir
+                .stream_chunks(stream)
+                .await
+                .expect("P1's stream listing");
+            assert!(
+                !sealed.chunks.is_empty(),
+                "precondition: P1 sealed the DAG's chunks"
+            );
+            for c in &sealed.chunks {
+                assert!(
+                    !f.node.dir.has_blob(&c.chunk_sha).await.expect("has_blob"),
+                    "F's blob store holds chunk {} of the family DAG file \
+                     (CIRISConstitution#141)",
+                    c.seq
+                );
+            }
+        }
+    }
+}
+
 // ─── the witnesses ──────────────────────────────────────────────────────
 
 /// **P1 → Q1 direct, with a non-family node N on the mesh**: both files read
@@ -1606,6 +1672,7 @@ async fn family_files_cross_through_a_non_member_forwarder_that_learns_nothing_7
             .is_none(),
         "F never holds P1's key — it forwards at the Reticulum layer and nothing else"
     );
+    assert_f_blob_store_holds_no_family_bytes(&p1, &f, &[&inline, &dag]).await;
     assert_holds_nothing_of(&f.node, &[&inline, &dag], "F").await;
 
     for (node, who) in [(&p1.node, "P1"), (&q1.node, "Q1"), (&f.node, "F")] {
