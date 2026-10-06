@@ -8343,27 +8343,31 @@ impl EdgeBuilder {
         // tests built; production read zero.
         //
         // A transport a caller already gave a bag (`with_metrics(Some(..))`)
-        // keeps counting into it, so the Edge ADOPTS the first such bag
-        // instead of minting a second one nobody's transport writes to. A
-        // transport holding a DIFFERENT bag cannot be re-pointed (its slot
-        // is set once); that split is reported loudly, never silent.
-        let metrics = self
-            .transports
-            .iter()
-            .find_map(|t| t.attached_metrics())
-            .unwrap_or_default();
+        // keeps counting into it (its slot is set once), so the Edge ADOPTS
+        // that bag instead of minting a second one nobody's transport writes
+        // to. Two transports built with DIFFERENT bags cannot both be read
+        // through one `Edge::metrics()`, so `build` refuses that by name
+        // rather than undercount silently (Codex, #810).
+        let mut preattached: Option<crate::observability::EdgeMetrics> = None;
         for transport in &self.transports {
-            transport.attach_metrics(metrics.clone());
             if let Some(held) = transport.attached_metrics() {
-                if !held.is_same_bag(&metrics) {
-                    tracing::warn!(
-                        transport = ?transport.id(),
-                        "transport was built with its own metrics bag, different from the one \
-                         this Edge reads; its counters will not appear in Edge::metrics() or the \
-                         binding snapshots (CIRISEdge#809) — attach one bag, or none"
-                    );
+                match &preattached {
+                    Some(first) if !first.is_same_bag(&held) => {
+                        return Err(EdgeError::Config(format!(
+                            "transports were built with different metrics bags ({:?} differs \
+                             from an earlier transport's); one Edge reads one bag — attach the \
+                             same bag to every transport, or none (CIRISEdge#809)",
+                            transport.id()
+                        )));
+                    }
+                    Some(_) => {}
+                    None => preattached = Some(held),
                 }
             }
+        }
+        let metrics = preattached.unwrap_or_default();
+        for transport in &self.transports {
+            transport.attach_metrics(metrics.clone());
         }
 
         Ok(Edge {

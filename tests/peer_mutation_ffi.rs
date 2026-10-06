@@ -640,6 +640,64 @@ async fn the_edge_adopts_a_bag_the_transport_was_built_with_809() {
     assert_eq!(edge.metrics().snapshot().transport_packets_dropped, 1);
 }
 
+/// Two transports built with DIFFERENT bags cannot both be read through one
+/// `Edge::metrics()`: `build` refuses by name instead of returning an Edge
+/// that silently undercounts. On 95a3bdf it adopted the first bag and only
+/// WARNed (Codex, #810). One shared bag across both builds fine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_refuses_transports_with_different_metrics_bags_809() {
+    let _guard = ffi_test_lock().lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mk = |bag: Option<ciris_edge::observability::EdgeMetrics>| -> Arc<dyn Transport> {
+        Arc::new(RecordingTransport {
+            attached: std::sync::Mutex::new(bag),
+            evictions_to_report: 0,
+        })
+    };
+    let build = |a: Arc<dyn Transport>, b: Arc<dyn Transport>, tmp: std::path::PathBuf| async move {
+        let (backend, _existing) = fresh_backend().await;
+        let me = FedKey::new("edge-self-metrics-split-809", 0x01);
+        let signer = me.local_signer(&tmp).await;
+        Edge::builder()
+            .directory(backend.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+            .federation_directory(backend.clone() as Arc<dyn FederationDirectory>)
+            .queue(backend)
+            .signer(signer)
+            .transport(a)
+            .transport(b)
+            .config(EdgeConfig {
+                hybrid_policy: HybridPolicy::Ed25519Fallback,
+                ..EdgeConfig::default()
+            })
+            .build()
+    };
+    let split = build(
+        mk(Some(ciris_edge::observability::EdgeMetrics::new())),
+        mk(Some(ciris_edge::observability::EdgeMetrics::new())),
+        tmp.path().join("split"),
+    )
+    .await;
+    match split {
+        Err(ciris_edge::EdgeError::Config(why)) => {
+            assert!(
+                why.contains("different metrics bags"),
+                "named refusal: {why}"
+            );
+        }
+        Err(other) => panic!("expected a Config refusal, got {other:?}"),
+        Ok(_) => panic!("two different bags must not build into one Edge"),
+    }
+    let shared = ciris_edge::observability::EdgeMetrics::new();
+    let edge = build(
+        mk(Some(shared.clone())),
+        mk(None),
+        tmp.path().join("shared"),
+    )
+    .await
+    .expect("one shared bag (and a bag-less transport) builds");
+    assert!(edge.metrics().is_same_bag(&shared));
+}
+
 /// The UniFFI snapshot carries both signals under their catalogued keys, and a
 /// read refreshes the mirrored gauge first — a transport that has evicted
 /// since the last read is reported without anyone asking it directly.

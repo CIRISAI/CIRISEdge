@@ -59,8 +59,9 @@ every real node since they shipped. `EdgeBuilder::build` now attaches the Edge's
 transport (`Transport::attach_metrics`, default no-op) before any listener can exist, covering
 `spawn_background_listeners`, `Edge::run`, and hosts that call `listen` themselves; a transport a
 caller built with its own bag (`with_metrics(Some(..))`) has that bag ADOPTED as the Edge's
-(`Transport::attached_metrics`), and a transport holding a different bag is reported by a WARN,
-never silent. Found across four Codex rounds on #810.
+(`Transport::attached_metrics`), and transports built with DIFFERENT bags are refused by
+`build` (`EdgeError::Config`) rather than returning an Edge that undercounts. Found across five
+Codex rounds on #810.
 
 **Not in this release — #809 item 2, the retain pins.** leviculum#49's design assumes edge feeds
 persist's `is_load_bearing` verdicts through `retain_destination_data`, and edge never has: every
