@@ -1497,7 +1497,7 @@ async fn withdrawn_dag_is_refused_and_evicted_at_the_holder_771(
         "the shared chunk is still served under Z after X's eviction"
     );
 
-    unlinked_withdrawn_dag_is_refused_by_the_register_771(b, owner).await;
+    unlinked_withdrawn_dag_is_refused_by_the_register_771(a, b, owner).await;
     an_unreadable_binding_state_fails_closed_771(b, owner).await;
 }
 
@@ -1519,7 +1519,11 @@ async fn withdrawn_dag_is_refused_and_evicted_at_the_holder_771(
 ///   set, CIRISEdge#606): persist's fold of W stays `Live`, so a bare door
 ///   SERVES every chunk, and the armed door refuses every one `Withdrawn`.
 ///   This is the case the register stays armed for.
-async fn unlinked_withdrawn_dag_is_refused_by_the_register_771(b: &Member, owner: &Ident) {
+async fn unlinked_withdrawn_dag_is_refused_by_the_register_771(
+    a: &Member,
+    b: &Member,
+    owner: &Ident,
+) {
     use ciris_edge::blob_swarm::revocation::{apply_observation, observe};
     use ciris_edge::blob_swarm::{
         BlobChunkSource as _, BlobEvictor, BytesVerdict, PersistBlobChunkSource, RevocationRegister,
@@ -1576,6 +1580,37 @@ async fn unlinked_withdrawn_dag_is_refused_by_the_register_771(b: &Member, owner
          (CIRISEdge#771)"
     );
     whole_blob_never_reaches_the_walk_771(b, owner, w_chunks[0].1).await;
+    // ── The counter lands in the Edge's own bag: B's Edge was built normally
+    // (`EdgeBuilder::build`, its wired source a wrapper forwarding
+    // `attach_metrics`), and A's fetch of W's chunk over the wire is served
+    // by B's door through the legacy walk.
+    let scope = ContentScope::Group {
+        scope: CohortScope::SelfOnly,
+        group_id: ciris_edge::self_room::room(&owner.key_id).table_group_id(),
+    };
+    let to_b = a
+        .edge
+        .blob_scope_router()
+        .route(Some(&scope), &b.node.me)
+        .expect("A routes to B on the self room's address");
+    let before = b.edge.metrics().blob_serve_legacy_dag_walks();
+    let (_, w_chunk) = w_chunks[1];
+    let got = a
+        .edge
+        .fetch_blob_chunk_scoped(&to_b, w_sha, w_chunk, Duration::from_secs(15))
+        .await
+        .expect("B answers");
+    assert!(
+        matches!(&got, ciris_edge::ChunkResult::Bytes(bytes)
+            if <[u8; 32]>::from(sha2::Sha256::digest(bytes)) == w_chunk),
+        "B serves the link-less W's chunk over the wire through the walk: {got:?}"
+    );
+    assert_eq!(
+        b.edge.metrics().blob_serve_legacy_dag_walks(),
+        before + 1,
+        "the legacy walk is counted in edge.metrics() of an Edge built normally — the one bag \
+         EdgeBuilder::build settled on (CIRISEdge#771 on #810)"
+    );
     for row in [&w_crossed, &w.row] {
         let withdraws = ciris_edge::files::withdraw(&*b.node.dir, row, "CC 2.3", ts(), signers)
             .await
