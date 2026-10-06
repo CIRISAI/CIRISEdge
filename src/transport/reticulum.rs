@@ -5023,7 +5023,7 @@ impl ReticulumTransport {
             .ok_or_else(|| {
                 TransportError::Io("open_av_link: the dial registered no inbound queue".to_owned())
             })?;
-        if let Some(m) = self.metrics.as_ref() {
+        if let Some(m) = self.metrics.get() {
             m.inc_av_plane(crate::observability::AV_LINK_OPENED);
         }
         tracing::info!(
@@ -5039,7 +5039,7 @@ impl ReticulumTransport {
                 Arc::clone(&self.node),
                 link_id,
             )
-            .with_metrics(self.metrics.clone()),
+            .with_metrics(self.metrics.get().cloned()),
         })
     }
 

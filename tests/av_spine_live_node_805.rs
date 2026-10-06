@@ -231,10 +231,10 @@ where
     }
 }
 
-async fn build_transport<F, Fut>(
-    metrics: &EdgeMetrics,
-    mut make: F,
-) -> (Arc<ReticulumTransport>, u16)
+/// A transport built with NO metrics bag: the Edge built over it attaches its
+/// own at `EdgeBuilder::build` (#810), which is the production path the
+/// `av_plane` counters must reach.
+async fn build_transport<F, Fut>(mut make: F) -> (Arc<ReticulumTransport>, u16)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = (ReticulumTransportConfig, ReticulumAuth)>,
@@ -243,7 +243,7 @@ where
         let (cfg, auth) = make().await;
         let port = cfg.listen_addr.port();
         match ReticulumTransport::new(cfg, auth).await {
-            Ok(t) => return (Arc::new(t.with_metrics(Some(metrics.clone()))), port),
+            Ok(t) => return (Arc::new(t), port),
             Err(e)
                 if e.to_string().contains("Address already in use")
                     || e.to_string().contains("os error 98") => {}
@@ -328,9 +328,33 @@ async fn side(
     }
 }
 
+/// The production Edge over `transport`, built through `EdgeBuilder` with no
+/// `with_metrics` anywhere: its bag is attached to the transport at build.
+fn build_edge(
+    key: &Ident,
+    dir: &Arc<SqliteBackend>,
+    transport: &Arc<ReticulumTransport>,
+) -> ciris_edge::Edge {
+    ciris_edge::Edge::builder()
+        .directory(Arc::clone(dir) as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+        .federation_directory(Arc::clone(dir) as Arc<dyn FederationDirectory>)
+        .queue(Arc::clone(dir) as Arc<dyn ciris_edge::outbound::OutboundHandle>)
+        .signer(key.signer())
+        .transport(Arc::clone(transport) as Arc<dyn Transport>)
+        .config(ciris_edge::EdgeConfig {
+            hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+            ..ciris_edge::EdgeConfig::default()
+        })
+        .build()
+        .expect("build the edge")
+}
+
 struct Pair {
     a: Side,
     b: Side,
+    /// The Edges whose `metrics()` bag the transports carry.
+    edge_a: ciris_edge::Edge,
+    edge_b: ciris_edge::Edge,
     peers: Vec<Ident>,
     _tmp: tempfile::TempDir,
 }
@@ -353,9 +377,7 @@ async fn pair(tag: &str) -> Pair {
     let a_dir = directory_with(records.clone()).await;
     let b_dir = directory_with(records).await;
 
-    let metrics_a = EdgeMetrics::new();
-    let metrics_b = EdgeMetrics::new();
-    let (transport_a, port_a) = build_transport(&metrics_a, || {
+    let (transport_a, port_a) = build_transport(|| {
         let base = tmp.path().to_path_buf();
         let signer = key_a.signer();
         let dir = Arc::clone(&a_dir);
@@ -367,7 +389,7 @@ async fn pair(tag: &str) -> Pair {
         }
     })
     .await;
-    let (transport_b, _) = build_transport(&metrics_b, || {
+    let (transport_b, _) = build_transport(|| {
         let base = tmp.path().to_path_buf();
         let signer = key_b.signer();
         let dir = Arc::clone(&b_dir);
@@ -399,6 +421,17 @@ async fn pair(tag: &str) -> Pair {
         }
     }
 
+    // The production attach (#810): each Edge hands its bag to its transport.
+    let edge_a = build_edge(&key_a, &a_dir, &transport_a);
+    let edge_b = build_edge(&key_b, &b_dir, &transport_b);
+    let metrics_a = edge_a.metrics();
+    let metrics_b = edge_b.metrics();
+    assert!(
+        transport_a
+            .attached_metrics()
+            .is_some_and(|m| m.is_same_bag(&metrics_a)),
+        "EdgeBuilder::build attached A's bag to A's transport"
+    );
     let peer_of_a = key_b.key_id.clone();
     let peer_of_b = key_a.key_id.clone();
     let a = side(key_a, a_dir, transport_a, metrics_a, &peer_of_a).await;
@@ -412,6 +445,8 @@ async fn pair(tag: &str) -> Pair {
     Pair {
         a,
         b,
+        edge_a,
+        edge_b,
         peers,
         _tmp: tmp,
     }
@@ -878,4 +913,26 @@ async fn av_chunks_ride_the_replicating_node_805() {
         p.a.metrics.av_plane()
     );
     assert_eq!(av(&p.a.metrics, "av_link_opened"), 1);
+
+    // …and every one of those counters is in the bag PRODUCTION reads: the
+    // Edges were built through `EdgeBuilder` with no `with_metrics`, so this
+    // is `Edge::metrics()` — the snapshot the host, pyo3 and UniFFI export.
+    let b_prod = p.edge_b.metrics().snapshot().av_plane;
+    assert_eq!(
+        b_prod.get("av_inbound_delivered").copied(),
+        Some(sent_on_av),
+        "B's Edge::metrics() snapshot: {b_prod:?}"
+    );
+    assert_eq!(b_prod.get("av_link_arrived").copied(), Some(1));
+    let a_prod = p.edge_a.metrics().snapshot().av_plane;
+    assert_eq!(
+        a_prod.get("av_sent").copied(),
+        Some(u64::try_from(sent.len()).expect("small")),
+        "A's Edge::metrics() snapshot: {a_prod:?}"
+    );
+    assert_eq!(
+        a_prod.get("av_send_refused_chunk_too_large").copied(),
+        Some(1)
+    );
+    assert_eq!(a_prod.get("av_link_opened").copied(), Some(1));
 }
