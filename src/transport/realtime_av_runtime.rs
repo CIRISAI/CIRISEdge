@@ -842,11 +842,18 @@ mod leviculum_link {
     impl AvLinkQueue {
         /// A fresh queue for `link_id` and its consumer half.
         pub(crate) fn new(link_id: LinkId) -> (Self, PumpReceiver) {
+            Self::with_dropped(link_id, 0)
+        }
+
+        /// A fresh queue whose first queued frame reports `dropped` frames
+        /// lost before the queue existed (a peer-opened link's frames dropped
+        /// while the arrivals queue was full, CIRISEdge#805).
+        pub(crate) fn with_dropped(link_id: LinkId, dropped: u64) -> (Self, PumpReceiver) {
             let (tx, rx) = mpsc::channel::<InboundWireFrame>(AV_LINK_QUEUE_DEPTH);
             (
                 Self {
                     tx,
-                    dropped_since_queued: 0,
+                    dropped_since_queued: dropped,
                 },
                 PumpReceiver {
                     rx: Mutex::new(rx),

@@ -443,6 +443,11 @@ route and whose control of it the link proof established. An unattributed A/V fr
 (`AvLinkQueue`) shared with `LinkDataPump` — counts it, logs at DEBUG (CIRISEdge#460), and
 reports the count with the next delivered frame so the consumer's dense hop counter skips past
 the gap (`InboundWireFrame::dropped_before`, `hop_counter_candidates`) instead of desyncing.
+A frame costs at most `HOP_COUNTER_MAX_OPENS` (= slack + 2) AEAD opens whatever the gap: the
+counter past the gap, the expected counter, and the slack past the gap — the dropped frames'
+own counters are never tried. Frames of a peer-opened link that find the arrivals queue full
+are dropped `av_inbound_dropped_arrivals_full`, remembered per link, and reported to the
+link's first delivered frame the same way.
 
 **Size (#720).** An A/V chunk is ONE link-Channel message: `LeviculumAvSender` sizes the frame
 against `link_channel_message_limit` — the link MDU minus `CHANNEL_ENVELOPE_HEADER_SIZE`
@@ -469,7 +474,10 @@ process.
   at the 425-byte limit.
 - **I-3.6.4 Overflow drops, never blocks, never desyncs.** `av_sink::tests::
   overflow_drops_newest_without_blocking_and_reports_the_gap`,
+  `..::an_arrivals_full_drop_is_named_and_the_hop_resyncs`,
   `realtime_av_dispatcher::tests::the_subscriber_resyncs_past_dropped_frames`.
+- **I-3.6.5 A resync is bounded.** `realtime_av_dispatcher::tests::
+  a_junk_frame_after_a_thousand_drops_costs_at_most_slack_plus_two_opens`.
 
 ---
 

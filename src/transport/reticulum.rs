@@ -5048,9 +5048,11 @@ impl ReticulumTransport {
     /// is handed over on the link's first frame that passes the #393 gate,
     /// carrying the link's inbound queue (that frame already in it) and a
     /// sender on the same link. Once per transport: `None` after the first
-    /// call. Until it is taken, a peer-opened A/V link's frames are dropped and
-    /// counted (`av_inbound_dropped_no_consumer`) — never queued unboundedly,
-    /// never routed anywhere else.
+    /// call. Up to `av_sink::AV_ARRIVALS_DEPTH` peer-opened links wait for the
+    /// consumer (taken or not yet); past that a link's frames are dropped,
+    /// counted (`av_inbound_dropped_arrivals_full`) and reported to its first
+    /// delivered frame so the hop resyncs. Never queued unboundedly, never
+    /// routed anywhere else.
     pub fn take_av_arrivals(
         &self,
     ) -> Option<tokio::sync::mpsc::Receiver<crate::transport::av_sink::AvArrival>> {
@@ -9962,10 +9964,14 @@ async fn deliver_av_frame(
                 "A/V link arrived — handed to the A/V consumer (CIRISEdge#805)"
             );
         }
-        AvDelivery::DroppedFull | AvDelivery::ConsumerGone | AvDelivery::NoConsumer => {
+        AvDelivery::DroppedFull
+        | AvDelivery::ConsumerGone
+        | AvDelivery::ArrivalsFull
+        | AvDelivery::NoConsumer => {
             let label = match delivery {
                 AvDelivery::DroppedFull => crate::observability::AV_INBOUND_DROPPED_QUEUE_FULL,
                 AvDelivery::ConsumerGone => crate::observability::AV_INBOUND_DROPPED_CONSUMER_GONE,
+                AvDelivery::ArrivalsFull => crate::observability::AV_INBOUND_DROPPED_ARRIVALS_FULL,
                 _ => crate::observability::AV_INBOUND_DROPPED_NO_CONSUMER,
             };
             count(label);

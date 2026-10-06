@@ -169,10 +169,8 @@ pub fn open_hop_outer(
     next_link_seq: u64,
     dropped_before: u64,
 ) -> Option<(u64, InnerSealed)> {
-    hop_counter_candidates(next_link_seq, dropped_before).find_map(|c| {
-        open_av_outer(sealed, transit_key, link_id, c)
-            .ok()
-            .map(|inner| (c, inner))
+    open_at_first_counter(next_link_seq, dropped_before, |c| {
+        open_av_outer(sealed, transit_key, link_id, c).ok()
     })
 }
 
@@ -245,25 +243,51 @@ pub struct InboundWireFrame {
     pub bytes: Vec<u8>,
 }
 
-/// Extra hop-counter values an open loop tries past the reported gap.
+/// Extra hop-counter values an open loop tries PAST the reported gap.
 ///
 /// The reported gap is exact for drops the receiver made, but a counter
 /// can also be burned on the SEND side without a frame (a relay leg whose
-/// caller's send was refused after `RelayNode::forward` advanced it). A
-/// small slack recovers those without making a corrupt frame expensive:
-/// it costs at most this many extra AEAD opens, and only on a frame that
-/// already failed at the expected counter.
+/// caller's send was refused after `RelayNode::forward` advanced it). This
+/// slack recovers up to this many such burned counters beyond the gap.
 pub const HOP_COUNTER_RESYNC_SLACK: u64 = 8;
 
-/// The hop counters an open loop tries for a frame, most likely first:
-/// the counter past the reported drops, then the expected counter (a
-/// gap report that counted a frame which never took a counter — a junk
-/// frame — must not strand the hop), then the slack window. Never a
-/// counter below `next`, so a replayed frame never opens.
+/// The most AEAD opens one frame can cost, WHATEVER the reported gap: the
+/// counter past the gap, the expected counter, and the slack past the gap
+/// ([`hop_counter_candidates`]). A junk frame after a burst of a thousand
+/// drops costs exactly this many opens, not a thousand.
+pub const HOP_COUNTER_MAX_OPENS: u64 = HOP_COUNTER_RESYNC_SLACK + 2;
+
+/// The hop counters an open loop tries for a frame, most likely first, and
+/// never more than [`HOP_COUNTER_MAX_OPENS`] of them:
+///
+/// 1. `skipped = next + dropped_before` — the counter past the frames the
+///    receiver itself dropped;
+/// 2. `next` — the expected counter, for a gap report that over-counted (a
+///    dropped JUNK frame never took a counter, so the next real frame is
+///    still at `next`);
+/// 3. `skipped + 1 ..= skipped + SLACK` — counters burned on the send side.
+///
+/// The counters strictly between `next` and `skipped` are NOT tried: they
+/// belong to frames the receiver dropped, which are gone and never come
+/// back. Never a counter below `next`, so a replayed frame never opens.
 pub fn hop_counter_candidates(next: u64, dropped_before: u64) -> impl Iterator<Item = u64> {
     let skipped = next.saturating_add(dropped_before);
-    let last = skipped.saturating_add(HOP_COUNTER_RESYNC_SLACK);
-    std::iter::once(skipped).chain((next..=last).filter(move |c| *c != skipped))
+    let expected = (skipped != next).then_some(next);
+    std::iter::once(skipped)
+        .chain(expected)
+        .chain((1..=HOP_COUNTER_RESYNC_SLACK).map_while(move |k| skipped.checked_add(k)))
+}
+
+/// Open a frame at the first of its [`hop_counter_candidates`] that
+/// authenticates: the counter it opened at and what `open` returned. The
+/// one place both open loops (subscriber, relay) pick a counter, so the
+/// [`HOP_COUNTER_MAX_OPENS`] bound holds for both.
+pub fn open_at_first_counter<T>(
+    next_link_seq: u64,
+    dropped_before: u64,
+    mut open: impl FnMut(u64) -> Option<T>,
+) -> Option<(u64, T)> {
+    hop_counter_candidates(next_link_seq, dropped_before).find_map(|c| open(c).map(|t| (c, t)))
 }
 
 /// One downstream subscriber link the dispatcher fans out onto. The
@@ -604,10 +628,8 @@ impl AvDispatcher {
                     // transport dropped before this one moves the counter
                     // past it (CIRISEdge#805), never below `next_link_seq`.
                     let Some((used, plaintext)) =
-                        hop_counter_candidates(next_link_seq, frame.dropped_before).find_map(|c| {
-                            open_av_chunk(&sealed, &link.transit_key, &link.link_id, c, dek)
-                                .ok()
-                                .map(|p| (c, p))
+                        open_at_first_counter(next_link_seq, frame.dropped_before, |c| {
+                            open_av_chunk(&sealed, &link.transit_key, &link.link_id, c, dek).ok()
                         })
                     else {
                         continue;
@@ -806,6 +828,10 @@ mod tests {
         let c: Vec<u64> = hop_counter_candidates(10, 3).collect();
         assert_eq!(c[0], 13, "past the reported drops first");
         assert_eq!(c[1], 10, "then the expected counter");
+        assert!(
+            !c.contains(&11) && !c.contains(&12),
+            "the dropped frames' counters are gone"
+        );
         assert!(c.iter().all(|x| *x >= 10), "never below next: no replay");
         assert_eq!(
             *c.iter().max().expect("non-empty"),
@@ -817,6 +843,33 @@ mod tests {
             z.len(),
             usize::try_from(HOP_COUNTER_RESYNC_SLACK).expect("small") + 1
         );
+    }
+
+    /// The review's bound (#813): after a burst of 1000 reported drops, a JUNK
+    /// frame (opens at no counter) costs at most `SLACK + 2` AEAD opens —
+    /// never one per dropped frame — and the legitimate post-gap frame still
+    /// opens, on the first try, through the seam both open loops use.
+    #[test]
+    fn a_junk_frame_after_a_thousand_drops_costs_at_most_slack_plus_two_opens() {
+        let mut opens = 0u64;
+        let junk = open_at_first_counter(5, 1000, |_| {
+            opens += 1;
+            None::<()>
+        });
+        assert!(junk.is_none());
+        assert!(opens <= HOP_COUNTER_MAX_OPENS, "{opens} opens");
+        assert_eq!(opens, HOP_COUNTER_MAX_OPENS);
+
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let transit = [0x41u8; 32];
+        let sealed = seal_av_outer(&inner(&dek, 9, 32), &transit, b"me", 1005).expect("outer");
+        let mut opens = 0u64;
+        let legit = open_at_first_counter(5, 1000, |c| {
+            opens += 1;
+            open_av_chunk(&sealed, &transit, b"me", c, &dek).ok()
+        });
+        assert_eq!(legit.map(|(c, _)| c), Some(1005), "opens past the gap");
+        assert_eq!(opens, 1, "the first candidate");
     }
 
     /// A receiver that replays scripted frames, each with its drop report.

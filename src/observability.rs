@@ -862,8 +862,11 @@ pub const AV_INBOUND_DROPPED_QUEUE_FULL: &str = "av_inbound_dropped_queue_full";
 /// Dropped: the link's peer did not pass the #393 attribution gate.
 pub const AV_INBOUND_DROPPED_UNATTRIBUTED: &str = "av_inbound_dropped_unattributed";
 /// Dropped: a peer-opened A/V link arrived and nobody took the arrivals
-/// receiver (or it was dropped), or the arrivals queue was full.
+/// receiver (or it was dropped) — nobody ever will.
 pub const AV_INBOUND_DROPPED_NO_CONSUMER: &str = "av_inbound_dropped_no_consumer";
+/// Dropped: a peer-opened A/V link found the arrivals queue full (the consumer
+/// is behind taking links). Gap-reported to the link's first delivered frame.
+pub const AV_INBOUND_DROPPED_ARRIVALS_FULL: &str = "av_inbound_dropped_arrivals_full";
 /// Dropped: the link's consumer dropped its receiver.
 pub const AV_INBOUND_DROPPED_CONSUMER_GONE: &str = "av_inbound_dropped_consumer_gone";
 /// Dropped: a Resource completed on an A/V link (A/V rides the Channel only).

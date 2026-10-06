@@ -861,6 +861,7 @@ async fn av_chunks_ride_the_replicating_node_805() {
         "av_inbound_dropped_unattributed",
         "av_inbound_dropped_queue_full",
         "av_inbound_dropped_no_consumer",
+        "av_inbound_dropped_arrivals_full",
         "av_inbound_dropped_resource",
     ] {
         assert_eq!(
