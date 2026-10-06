@@ -745,6 +745,20 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
         "inbound.dropped_low_trust_total".to_string(),
         edge.metrics().inbound_dropped_low_trust(),
     );
+    // CIRISEdge#809 — the two leviculum pressure signals. The eviction
+    // count is a mirror the transport refreshes on request, so refresh
+    // before reading.
+    for transport in edge.transports() {
+        transport.refresh_metrics();
+    }
+    counters.insert(
+        "transport.packets_dropped_total".to_string(),
+        edge.metrics().transport_packets_dropped(),
+    );
+    counters.insert(
+        "transport.known_destination_evictions".to_string(),
+        edge.metrics().known_destination_evictions(),
+    );
     #[allow(clippy::cast_precision_loss)]
     gauges.insert(
         "reachability.peer_medium_count".to_string(),

@@ -2144,7 +2144,11 @@ pub struct ReticulumTransport {
     /// [`ReticulumTransport::with_metrics`] and moved into the announce worker's
     /// [`AnnounceCtx`]. `None` (the default) keeps every pre-#530 construction
     /// site compiling unchanged and leaves intake evictions loud-but-uncounted.
-    metrics: Option<crate::observability::EdgeMetrics>,
+    metrics: std::sync::OnceLock<crate::observability::EdgeMetrics>,
+    /// CIRISEdge#809 — this transport's process-unique id for the per-source
+    /// gauges in [`crate::observability::EdgeMetrics`] (several transports
+    /// may share one bag).
+    metrics_source: u64,
     /// The Leviculum node — built + started in `new`. Shared; `send`
     /// borrows it, `listen` drains its event channel.
     node: Arc<ReticulumNode>,
@@ -2783,7 +2787,7 @@ impl ReticulumTransport {
             own_bundle: self.own_bundle.clone(),
             own_announce_frame: self.own_announce_frame.clone(),
             own_owner_binding: self.own_owner_binding.clone(),
-            metrics: self.metrics.clone(),
+            metrics: self.metrics.get().cloned(),
             dialed_link_dest: Arc::clone(&self.dialed_link_dest),
             link_plane: Arc::clone(&self.link_plane),
             reusable_dialed_link: Arc::clone(&self.reusable_dialed_link),
@@ -3332,7 +3336,12 @@ impl ReticulumTransport {
         Ok(Self {
             config,
             // CIRISEdge#530 — off by default; attach with `with_metrics`.
-            metrics: None,
+            metrics: std::sync::OnceLock::new(),
+            metrics_source: {
+                static NEXT_METRICS_SOURCE: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                NEXT_METRICS_SOURCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            },
             node: Arc::new(node),
             local_dest_hash,
             local_named_dest_hash,
@@ -3407,8 +3416,12 @@ impl ReticulumTransport {
     /// working configuration. Unset, evictions remain loud via the throttled WARN
     /// but contribute to no counter.
     #[must_use]
-    pub fn with_metrics(mut self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
-        self.metrics = metrics;
+    pub fn with_metrics(self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
+        if let Some(m) = metrics {
+            // First handle wins (CIRISEdge#809): a bag set here is the one
+            // `Edge::spawn_background_listeners` finds already attached.
+            let _ = self.metrics.set(m);
+        }
         self
     }
 
@@ -4347,6 +4360,23 @@ impl ReticulumTransport {
         self.peers.lock().await.keys().cloned().collect()
     }
 
+    /// CIRISEdge#809 / leviculum#49 — how many destinations leviculum's
+    /// known-destinations store has evicted at its identity cap, cumulative
+    /// since boot. Read live from the node and mirrored into
+    /// [`EdgeMetrics::known_destination_evictions`](crate::observability::EdgeMetrics)
+    /// so the snapshot an operator reads carries it. Zero on a node with
+    /// room; a rising value means the node runs at its cap and the
+    /// UNRETAINED, least-recently-used destinations are the ones going — a
+    /// destination pinned as load-bearing is never among them.
+    #[must_use]
+    pub fn known_destination_evictions(&self) -> u64 {
+        let evictions = self.node.known_destination_evictions();
+        if let Some(m) = self.metrics.get() {
+            m.set_known_destination_evictions(self.metrics_source, evictions);
+        }
+        evictions
+    }
+
     /// v0.14.0 (CIRISEdge#32) — return the 16-byte Reticulum
     /// destination hash for a rooted peer. Test seam: the Links FFI
     /// tests need `dest_hash` to drive `link_open(dest_hash)` after
@@ -4730,7 +4760,7 @@ impl ReticulumTransport {
         // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
         // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle.
         if let Some(src) = self.own_owner_binding.as_ref() {
-            push_own_owner_binding(&self.node, src.as_ref(), &link_id, self.metrics.as_ref()).await;
+            push_own_owner_binding(&self.node, src.as_ref(), &link_id, self.metrics.get()).await;
         }
         Ok(link_id.into_bytes())
     }
@@ -5708,7 +5738,7 @@ impl ReticulumTransport {
                     .as_ref()
                     .filter(|f| f.len() > CHANNEL_FIRST_MAX_FRAGMENTS)
                 {
-                    if let Some(m) = self.metrics.as_ref() {
+                    if let Some(m) = self.metrics.get() {
                         m.inc_channel_first_skipped_over_cap();
                     }
                     tracing::debug!(
@@ -6073,6 +6103,26 @@ impl ReticulumTransport {
 impl Transport for ReticulumTransport {
     fn id(&self) -> TransportId {
         TransportId::RETICULUM_RS
+    }
+
+    /// CIRISEdge#809 — the Edge's bag becomes this transport's; first
+    /// handle wins, so a bag a test attached through `with_metrics` is
+    /// kept and production (which never calls `with_metrics`) gets the
+    /// Edge's. The listener's per-event context reads the slot on every
+    /// event, so an attach before `listen` is seen by the first one.
+    fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        let _ = self.metrics.set(metrics);
+    }
+
+    fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {
+        self.metrics.get().cloned()
+    }
+
+    /// CIRISEdge#809 — mirror leviculum's known-destination eviction count
+    /// into the bag (a `store`); the announce tick does the same on its
+    /// cadence, this makes a snapshot read current on demand.
+    fn refresh_metrics(&self) {
+        let _ = self.known_destination_evictions();
     }
 
     fn subscribe_reachability(&self) -> Option<tokio::sync::broadcast::Receiver<PeerReachable>> {
@@ -6503,7 +6553,7 @@ impl Transport for ReticulumTransport {
             bundle_save_gate: self.bundle_save_gate,
             local_key_id: Arc::from(self.config.local_key_id.as_str()),
             // CIRISEdge#530 — cheap clone (every `EdgeMetrics` field is an `Arc`).
-            metrics: self.metrics.clone(),
+            metrics: self.metrics.get().cloned(),
         };
         let (announce_tx, mut announce_rx) = mpsc::channel::<AnnounceView>(ANNOUNCE_QUEUE_DEPTH);
         // CIRISEdge#627 — the PRIORITY lane: announces whose Stage 1 installed a
@@ -6535,6 +6585,10 @@ impl Transport for ReticulumTransport {
                     {
                         tracing::warn!(error = %e, "periodic announce (named destination) failed");
                     }
+                    // CIRISEdge#809 — mirror leviculum's eviction count on the
+                    // announce cadence, so the gauge moves without a reader
+                    // asking the transport first (a brief node lock).
+                    let _ = self.known_destination_evictions();
                     // CIRISEdge#406 — re-arm the signed transport-destination
                     // producer on the announce cadence. Memoized once current
                     // (no directory read after success); until then this heals
@@ -6579,7 +6633,7 @@ impl Transport for ReticulumTransport {
                         announce_tx: &announce_tx,
                         announce_priority_tx: &announce_priority_tx,
                         transport_binding_enforcement: self.transport_binding_enforcement,
-                        metrics: self.metrics.as_ref(),
+                        metrics: self.metrics.get(),
                         bundle_save_gate: self.bundle_save_gate,
                         peer_bundles: &self.peer_bundles,
                         own_bundle: self.own_bundle.as_ref(),
@@ -8803,10 +8857,50 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 );
             }
         }
+        NodeEvent::PacketDropped {
+            destination_hash,
+            reason,
+            interface_in,
+            hops,
+        } => {
+            note_packet_dropped(
+                ctx.metrics,
+                destination_hash.as_ref(),
+                reason,
+                interface_in,
+                hops,
+            );
+        }
         other => {
             tracing::trace!(event = ?other, "unhandled Reticulum event");
         }
     }
+}
+
+/// CIRISEdge#809 — a packet leviculum dropped on arrival (v0.29
+/// `NodeEvent::PacketDropped`): counted once in
+/// [`EdgeMetrics::transport_packets_dropped`](crate::observability::EdgeMetrics)
+/// for every reason, with the reason on a DEBUG line. DEBUG, not WARN:
+/// duplicates and no-path drops are routine on a mesh, and a per-packet
+/// WARN would be attacker-paced noise (the #460 lesson). Split out of
+/// `handle_event` so it is unit-testable without an event-loop context.
+fn note_packet_dropped(
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    destination_hash: &[u8],
+    reason: leviculum_core::transport::DropReason,
+    interface_in: usize,
+    hops: u8,
+) {
+    if let Some(m) = metrics {
+        m.inc_transport_packet_dropped();
+    }
+    tracing::debug!(
+        destination = %hex::encode(&destination_hash[..destination_hash.len().min(8)]),
+        ?reason,
+        interface_in,
+        hops,
+        "transport dropped an inbound packet (CIRISEdge#809)"
+    );
 }
 
 /// CIRISEdge#460 — severity for a `LinkClosed` event, decided PURELY from the
@@ -11846,6 +11940,72 @@ mod tests {
                 2,
                 "the counter must reach the bundle an operator reads, not just the handle"
             );
+        }
+    }
+
+    /// CIRISEdge#809 — the two leviculum v0.29 pressure signals reach the
+    /// snapshot an operator reads: every `PacketDropped` is one increment
+    /// whatever its reason, and the known-destination eviction count is a
+    /// mirror of leviculum's (a `store`, so a re-read never double counts).
+    mod pressure_signals_809 {
+        use super::super::note_packet_dropped;
+        use crate::observability::EdgeMetrics;
+        use leviculum_core::transport::DropReason;
+
+        #[test]
+        fn every_packet_drop_is_counted_once_whatever_the_reason() {
+            let m = EdgeMetrics::new();
+            assert_eq!(
+                m.transport_packets_dropped(),
+                0,
+                "a fresh node dropped nothing"
+            );
+            let dest = [0x11u8; 16];
+            note_packet_dropped(Some(&m), &dest, DropReason::Duplicate, 0, 1);
+            note_packet_dropped(Some(&m), &dest, DropReason::NoPath, 1, 3);
+            note_packet_dropped(Some(&m), &dest, DropReason::AnnounceReplay, 0, 0);
+            assert_eq!(m.transport_packets_dropped(), 3);
+            assert_eq!(
+                m.snapshot().transport_packets_dropped,
+                3,
+                "the counter must reach the bundle, not just the handle"
+            );
+            // No metrics bag: the DEBUG line still goes out and nothing panics.
+            note_packet_dropped(None, &dest, DropReason::Ifac, 0, 1);
+        }
+
+        #[test]
+        fn the_eviction_count_is_mirrored_not_accumulated() {
+            let m = EdgeMetrics::new();
+            assert_eq!(m.known_destination_evictions(), 0);
+            m.set_known_destination_evictions(1, 7);
+            m.set_known_destination_evictions(1, 7);
+            assert_eq!(
+                m.known_destination_evictions(),
+                7,
+                "two readbacks of the same leviculum count must not read as 14"
+            );
+            m.set_known_destination_evictions(1, 9);
+            assert_eq!(m.snapshot().known_destination_evictions, 9);
+        }
+
+        /// Two transports in one Edge each mirror their own node's count;
+        /// the gauge is their SUM, and one's refresh never overwrites the
+        /// other's. On 14a4a28 the last refresh won: nodes at 10 and 0
+        /// read 0, and the cumulative gauge moved backward (Codex, #810).
+        #[test]
+        fn evictions_from_several_transports_are_summed_not_overwritten() {
+            let m = EdgeMetrics::new();
+            m.set_known_destination_evictions(1, 10);
+            m.set_known_destination_evictions(2, 0);
+            assert_eq!(
+                m.known_destination_evictions(),
+                10,
+                "the zero must not erase the ten"
+            );
+            m.set_known_destination_evictions(2, 3);
+            m.set_known_destination_evictions(1, 10);
+            assert_eq!(m.snapshot().known_destination_evictions, 13);
         }
     }
 

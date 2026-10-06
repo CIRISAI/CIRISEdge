@@ -1,5 +1,75 @@
 # CIRISEdge Release Notes
 
+# v40.1.0 — leviculum v0.29: known-destinations backpressure, off-lock resource assembly, and the two pressure signals in the metrics snapshot
+
+**2026-10-05.** **MINOR** from v40.0.3. Persist v53.1.4 and verify v19.0.0 unchanged; no wire change. Additive API:
+`Transport::{attach_metrics, attached_metrics, refresh_metrics}` (defaulted),
+`ReticulumTransport::known_destination_evictions()`, `EdgeMetrics::is_same_bag`, two new
+`EdgeMetricsBundle` fields. `EdgeMetrics::set_known_destination_evictions` takes a source id.
+Ladder triple: **edge v40.1.0 · persist v53.1.4 · verify v19.0.0**.
+
+| | v40.0.3 | v40.1.0 |
+|---|---|---|
+| leviculum-core / -std / -lxmf | `tag = "v0.27.0+ciris.1"` | **`tag = "v0.29.0+ciris.1"`** (82a9d601) |
+
+**leviculum v0.28 + v0.29 bring** (CIRISEdge#809; no public fn signature changed — leviculum's parse
+of every pub fn across the three crates: 1479 before, 1530 after, none removed or altered):
+- **leviculum#49 — known-destinations capacity backpressure.** The identity cap evicts UNRETAINED
+  destinations first, least-recently-used (was: lowest hash, which could evict a load-bearing
+  destination before a QA runner's throwaway); each flush holds the on-disk file to the cap instead
+  of resurrecting what memory evicted; retain and last-use state reach the file; pruning is reported
+  by the catalogued `KNOWN_DESTINATIONS_PRUNED` event and `ReticulumNode::known_destination_evictions()`.
+- **leviculum#71 — off-lock resource assembly** (`assemble_resources_off_lock`, default on): a
+  finished transfer is assembled by a worker, not under the core lock. A receiver-side
+  `ResourceCompleted` can now arrive after its link went stale; at edge that is safe by construction
+  — the completion routes through attribution on its link id, and the chunk puller's pending map is
+  keyed on `(blob, chunk sha)` with the body verified against the sha, so a late reply resolves a
+  live waiter for the same content or drops (`AlreadyHeld` on a retried chunk; no double adopt).
+- Codex round four on the resource path: request deadlines are renewed only by received packets
+  (a finished local assembly no longer extends an unrelated request); the completion proof goes out
+  on an active OR a stale link (the rule retransmits already used), so a valid transfer no longer
+  fails for the sender when the link staled during assembly; the resource queue is keyed by arrival
+  order and by link — enqueue, cancel and close are logarithmic, not a scan under the lock.
+- Upstream master +164: links over asymmetric paths to Python RNS 1.5 peers now form (a link-request
+  proof whose hop count disagrees with the frozen tables is re-balanced as RNS 1.5 does, Codeberg
+  #330, without deleting the route it corrects); a local link routes its resource proof to the
+  destination, not back to the initiator; a resource receiver paces its part timeout by the parts it
+  actually sees; a sender waiting on a peer that stopped answering no longer outlives its caller's
+  deadline; a path used five minutes ago no longer expires early.
+- `ResourceError` gained `PartRequestTimeout` and `ProofTimeout` (sender-side timeouts that were
+  `Timeout`); edge names only `TransferInProgress` and folds the rest into `ShipError::Other`, so
+  nothing silently stopped matching. `NodeEvent::PacketDropped` is new.
+
+**The two pressure signals reach the snapshot (#809 item 3).**
+- `EdgeMetrics::transport_packets_dropped` — one increment per `NodeEvent::PacketDropped` whatever
+  its `DropReason` (duplicate, no path, IFAC, announce replay / rate limit / over-max-hops); the
+  reason rides a DEBUG line, never a per-packet WARN (attacker-paced noise, the #460 lesson).
+- `EdgeMetrics::known_destination_evictions` — leviculum's identity-cap eviction count, mirrored
+  per transport (each `ReticulumTransport` has a process-unique source id) and SUMMED on read, so
+  one transport's refresh never overwrites another's and the cumulative value never moves backward.
+  Refreshed on the announce tick and by every snapshot read (`Transport::refresh_metrics`).
+- Both appear in PyO3 `metrics_snapshot()` (`transport_packets_dropped`,
+  `known_destination_evictions`) and in the UniFFI counters (`transport.packets_dropped_total`,
+  `transport.known_destination_evictions`).
+
+**The transport's counters now reach production at all.** `ReticulumTransport::with_metrics` had
+no production caller, so every counter the transport increments from its event loop — not only
+the two above but #530 `announce_intake_evictions` and #627 `link_before_binding` — read zero on
+every real node since they shipped. `EdgeBuilder::build` now attaches the Edge's bag to every
+transport (`Transport::attach_metrics`, default no-op) before any listener can exist, covering
+`spawn_background_listeners`, `Edge::run`, and hosts that call `listen` themselves; a transport a
+caller built with its own bag (`with_metrics(Some(..))`) has that bag ADOPTED as the Edge's
+(`Transport::attached_metrics`), and transports built with DIFFERENT bags are refused by
+`build` (`EdgeError::Config`) rather than returning an Edge that undercounts. Found across five
+Codex rounds on #810.
+
+**Not in this release — #809 item 2, the retain pins.** leviculum#49's design assumes edge feeds
+persist's `is_load_bearing` verdicts through `retain_destination_data`, and edge never has: every
+destination edge knows is unretained, so at the identity cap (50 000 default; 1 000 compact) the
+canonical and the accord holders are as evictable as a throwaway, LRU protecting the busy rather
+than the load-bearing. The pins (`Unknown` counts as load-bearing, fail-secure), with a compact-cap
+witness, land as the next MINOR.
+
 # v40.0.3 — persist v53.1.4: an upgraded canonical boots Rooted
 
 **2026-10-05.** **PATCH** from v40.0.2. Verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged; no

@@ -1066,6 +1066,28 @@ pub struct EdgeMetrics {
     /// rides on the matching throttled DEBUG line, and keying by peer would make
     /// cardinality grow with exactly the pollution this counts.
     pub announce_intake_evictions: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#809 — packets the Reticulum transport dropped on arrival,
+    /// as leviculum reports them (`NodeEvent::PacketDropped`, v0.29). One
+    /// counter for every `DropReason` — duplicates, no path, IFAC, announce
+    /// replay / rate limit / over-max-hops — the reason rides the matching
+    /// DEBUG line. Nonzero is routine on a busy mesh; a step change is the
+    /// signal (a flood, a misconfigured IFAC, a path table gone cold).
+    pub transport_packets_dropped: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#809 / leviculum#49 — identity-cap evictions in leviculum's
+    /// known-destinations store, polled from
+    /// `ReticulumNode::known_destination_evictions()` whenever the transport
+    /// readback runs. A rising value means the node runs at its cap and the
+    /// UNRETAINED, least-recently-used destinations are the ones going; a
+    /// retained (load-bearing) destination is never evicted, so it never
+    /// counts here. Zero on a node with room.
+    ///
+    /// One entry PER TRANSPORT INSTANCE (keyed by the transport's
+    /// process-unique metrics source id), summed on read: an Edge may hold
+    /// several Reticulum transports, each with its own node and its own
+    /// cumulative count, and a single stored value would let the last
+    /// refresh overwrite the others and move the total backward (Codex,
+    /// #810).
+    pub known_destination_evictions: Arc<RwLock<HashMap<u64, u64>>>,
     /// CIRISEdge#627 — links that came up IDENTIFIED before their announcer had
     /// a binding. Under announce-on-link + inline Stage 1 this is 0 in steady
     /// state; nonzero means the ordering the design guarantees broke.
@@ -1205,6 +1227,15 @@ impl EdgeMetrics {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// CIRISEdge#809 — are `self` and `other` handles to the SAME bag
+    /// (clones share every `Arc`), as opposed to two bags with equal
+    /// counts? Used to detect a transport counting into a bag the Edge
+    /// does not read.
+    #[must_use]
+    pub fn is_same_bag(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.envelopes_sent_total, &other.envelopes_sent_total)
     }
 
     /// Increment the `envelopes_sent_total` counter for `mt`.
@@ -1474,6 +1505,43 @@ impl EdgeMetrics {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// CIRISEdge#809 — one packet dropped by the transport on arrival
+    /// (`NodeEvent::PacketDropped`). The reason is on the DEBUG line, not
+    /// the counter.
+    pub fn inc_transport_packet_dropped(&self) {
+        self.transport_packets_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#809 — read the transport packet-drop counter.
+    #[must_use]
+    pub fn transport_packets_dropped(&self) -> u64 {
+        self.transport_packets_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#809 — record one transport's cumulative known-destination
+    /// eviction count. A `store` into that transport's own entry, not an
+    /// increment: leviculum owns each node's counter and edge mirrors it
+    /// on each readback, so two readbacks of one count never double it and
+    /// one transport's refresh never overwrites another's.
+    pub fn set_known_destination_evictions(&self, source: u64, evictions: u64) {
+        self.known_destination_evictions
+            .write()
+            .insert(source, evictions);
+    }
+
+    /// CIRISEdge#809 — known-destination evictions across every transport
+    /// that has reported: the sum of each one's last mirrored cumulative
+    /// count. Monotonic as long as each source's count is.
+    #[must_use]
+    pub fn known_destination_evictions(&self) -> u64 {
+        self.known_destination_evictions
+            .read()
+            .values()
+            .fold(0u64, |acc, v| acc.saturating_add(*v))
+    }
+
     /// CIRISEdge#627 — a link came up identified before its announcer was bound.
     pub fn inc_link_before_binding(&self) {
         self.link_before_binding
@@ -1740,6 +1808,8 @@ impl EdgeMetrics {
             replication_routed_to_initiator_total: self.route_counters().1,
             replication_reply_dropped_total: self.route_counters().2,
             announce_intake_evictions: self.announce_intake_evictions(),
+            transport_packets_dropped: self.transport_packets_dropped(),
+            known_destination_evictions: self.known_destination_evictions(),
             link_before_binding: self.link_before_binding(),
             announce_queue_drop_first_seen: self.announce_queue_drop_first_seen(),
             channel_first_skipped_over_cap: self.channel_first_skipped_over_cap(),
@@ -1827,6 +1897,13 @@ pub struct EdgeMetricsBundle {
     /// announce-intake map under capacity backpressure. Zero on a node with room;
     /// climbing on one at cap. `Rooted` bindings are pinned and never counted.
     pub announce_intake_evictions: u64,
+    /// CIRISEdge#809 — packets the Reticulum transport dropped on arrival
+    /// (every leviculum `DropReason`). Routine nonzero; watch the slope.
+    pub transport_packets_dropped: u64,
+    /// CIRISEdge#809 / leviculum#49 — identity-cap evictions in leviculum's
+    /// known-destinations store, mirrored at the last transport readback.
+    /// Zero with room; climbing = at cap, unretained LRU destinations going.
+    pub known_destination_evictions: u64,
     /// CIRISEdge#627 — links identified before their announcer was bound.
     /// 0 in steady state; nonzero = the announce-before-link ordering broke.
     pub link_before_binding: u64,

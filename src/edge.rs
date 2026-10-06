@@ -8334,6 +8334,42 @@ impl EdgeBuilder {
         }
         let canonical_peers = Arc::new(std::sync::RwLock::new(canonical_id_set));
 
+        // CIRISEdge#809 — every transport counts into THIS edge's metrics
+        // bag, attached here, at build, because no listener can exist yet:
+        // every spawn site (`spawn_background_listeners`, `Edge::run`, a
+        // host that calls `listen` itself as `edge_node` does) comes after.
+        // Until this line the Reticulum transport's counters (#530
+        // evictions, #627 links-before-binding) only ever reached a bag the
+        // tests built; production read zero.
+        //
+        // A transport a caller already gave a bag (`with_metrics(Some(..))`)
+        // keeps counting into it (its slot is set once), so the Edge ADOPTS
+        // that bag instead of minting a second one nobody's transport writes
+        // to. Two transports built with DIFFERENT bags cannot both be read
+        // through one `Edge::metrics()`, so `build` refuses that by name
+        // rather than undercount silently (Codex, #810).
+        let mut preattached: Option<crate::observability::EdgeMetrics> = None;
+        for transport in &self.transports {
+            if let Some(held) = transport.attached_metrics() {
+                match &preattached {
+                    Some(first) if !first.is_same_bag(&held) => {
+                        return Err(EdgeError::Config(format!(
+                            "transports were built with different metrics bags ({:?} differs \
+                             from an earlier transport's); one Edge reads one bag — attach the \
+                             same bag to every transport, or none (CIRISEdge#809)",
+                            transport.id()
+                        )));
+                    }
+                    Some(_) => {}
+                    None => preattached = Some(held),
+                }
+            }
+        }
+        let metrics = preattached.unwrap_or_default();
+        for transport in &self.transports {
+            transport.attach_metrics(metrics.clone());
+        }
+
         Ok(Edge {
             verify,
             queue,
@@ -8380,7 +8416,7 @@ impl EdgeBuilder {
             trust_scoring: self.trust_scoring,
             trust_threshold_override: Arc::new(std::sync::RwLock::new(None)),
             trust_scoring_override: Arc::new(std::sync::RwLock::new(None)),
-            metrics: crate::observability::EdgeMetrics::new(),
+            metrics,
             config: self.config,
         })
     }
