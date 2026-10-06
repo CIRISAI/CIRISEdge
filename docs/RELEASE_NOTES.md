@@ -1,5 +1,31 @@
 # CIRISEdge Release Notes
 
+# v40.0.5 — the proactive push stops at its budget instead of fetching the whole plane
+
+**2026-10-06.** **PATCH** from v40.0.4, cut from the v40.0.4 tag (main carries v40.1.0). Persist
+v53.1.5, verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged. One edge change.
+Ladder triple: **edge v40.0.5 · persist v53.1.5 · verify v19.0.0**.
+
+**The fix (CIRISServer#741).** A self-publishing node's initiator round pushes its advertised set
+alongside the Summary, capped at `PROACTIVE_PUSH_BUDGET_BYTES` (256 KiB, CIRISEdge#927/#380). The
+loop FETCHED every candidate and `continue`d past the budget, so toward a fresh or unreachable peer it
+read and decoded the whole advertised plane, kept about seventeen 15 KiB rows, and discarded the rest.
+That happened every round, per peer, per kind, with nothing on the wire, and spillover rows are never
+marked sent, so they were re-fetched the next round. On the canonical's data a two-peer Attestation
+round took 8–15 minutes and churned 8–23 GB, longer than a link timeout, so rounds overlapped; the
+churn fragments the allocator until cgroup anon memory reaches the cap. The loop predates v40; v40
+made each fetch expensive (per-row trust and audience checks), which is why 0.5.219 survived it. It
+now stops at the first row that overflows the budget. Candidates are seq-sorted, so the spillover
+stays deterministic; the only cost is not back-filling the budget's tail with a later, smaller row.
+
+Witness: `proactive_push_fetches_only_what_fits_its_budget_741`. A fresh peer has 400 pending
+15 KiB rows against the 256 KiB budget; the old loop fetched 400 to ship 17, and the fix fetches 18.
+The existing spillover test passes unchanged.
+
+**Still to come (v40.0.6 / main):** persist v53.1.6 (bounded per-row audience and stewardship
+reads), v53.1.7 (an index for `list_attestations_referencing`), and CIRISEdge#818's per-Deliver
+trust memo on the reply path.
+
 # v40.0.4 — persist v53.1.5: the canonical's memory hotfix
 
 **2026-10-06.** **PATCH** from v40.0.3, cut from the v40.0.3 tag (not from main, which carries
