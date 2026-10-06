@@ -6105,6 +6105,10 @@ impl Transport for ReticulumTransport {
         let _ = self.metrics.set(metrics);
     }
 
+    fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {
+        self.metrics.get().cloned()
+    }
+
     /// CIRISEdge#809 — mirror leviculum's known-destination eviction count
     /// into the bag (a `store`); the announce tick does the same on its
     /// cadence, this makes a snapshot read current on demand.

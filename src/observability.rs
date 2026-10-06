@@ -1222,6 +1222,15 @@ impl EdgeMetrics {
         Self::default()
     }
 
+    /// CIRISEdge#809 — are `self` and `other` handles to the SAME bag
+    /// (clones share every `Arc`), as opposed to two bags with equal
+    /// counts? Used to detect a transport counting into a bag the Edge
+    /// does not read.
+    #[must_use]
+    pub fn is_same_bag(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.envelopes_sent_total, &other.envelopes_sent_total)
+    }
+
     /// Increment the `envelopes_sent_total` counter for `mt`.
     pub fn inc_sent(&self, mt: &MessageType) {
         let mut guard = self.envelopes_sent_total.write();

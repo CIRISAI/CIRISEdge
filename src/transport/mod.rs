@@ -673,6 +673,15 @@ pub trait Transport: Send + Sync + 'static {
     /// `Arc`, so the clone shares, never copies.
     fn attach_metrics(&self, _metrics: crate::observability::EdgeMetrics) {}
 
+    /// CIRISEdge#809 — the bag this transport already counts into, if a
+    /// caller attached one before handing it to `EdgeBuilder` (e.g.
+    /// `ReticulumTransport::with_metrics(Some(..))`). The builder ADOPTS
+    /// it as the Edge's bag rather than minting a second one the
+    /// transport would never count into. Default: none.
+    fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {
+        None
+    }
+
     /// CIRISEdge#809 — refresh any gauge the transport mirrors from a
     /// value it does not own (leviculum's known-destination eviction
     /// count). Called by the snapshot paths right before they read, so an

@@ -542,7 +542,14 @@ impl Transport for RecordingTransport {
         Ok(())
     }
     fn attach_metrics(&self, metrics: ciris_edge::observability::EdgeMetrics) {
-        *self.attached.lock().expect("attached") = Some(metrics);
+        // First handle wins, as `ReticulumTransport`'s `OnceLock` does.
+        let mut slot = self.attached.lock().expect("attached");
+        if slot.is_none() {
+            *slot = Some(metrics);
+        }
+    }
+    fn attached_metrics(&self) -> Option<ciris_edge::observability::EdgeMetrics> {
+        self.attached.lock().expect("attached").clone()
     }
     fn refresh_metrics(&self) {
         if let Some(m) = self.attached.lock().expect("attached").as_ref() {
@@ -605,6 +612,32 @@ async fn the_edge_attaches_its_metrics_to_every_transport_at_build_809() {
         1,
         "the transport's bag and the Edge's bag are one bag"
     );
+}
+
+/// A transport a caller built WITH its own bag (`with_metrics(Some(..))` on
+/// `ReticulumTransport`) keeps counting into it; the Edge must read that
+/// same bag, not mint a second one. On ba3d434 the builder minted a fresh
+/// bag, the transport's first-wins slot kept the caller's, and
+/// `Edge::metrics()` read zero (Codex, #810).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_edge_adopts_a_bag_the_transport_was_built_with_809() {
+    let _guard = ffi_test_lock().lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (backend, _existing) = fresh_backend().await;
+    let callers_bag = ciris_edge::observability::EdgeMetrics::new();
+    let transport = Arc::new(RecordingTransport {
+        attached: std::sync::Mutex::new(Some(callers_bag.clone())),
+        evictions_to_report: 0,
+    });
+    let edge =
+        build_edge_with_transport(tmp.path(), backend, transport.clone() as Arc<dyn Transport>)
+            .await;
+    assert!(
+        edge.metrics().is_same_bag(&callers_bag),
+        "the Edge reads the bag its transport was built with"
+    );
+    callers_bag.inc_transport_packet_dropped();
+    assert_eq!(edge.metrics().snapshot().transport_packets_dropped, 1);
 }
 
 /// The UniFFI snapshot carries both signals under their catalogued keys, and a
