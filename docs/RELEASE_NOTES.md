@@ -1,5 +1,29 @@
 # CIRISEdge Release Notes
 
+# v40.0.4 — persist v53.1.5: the canonical's memory hotfix
+
+**2026-10-06.** **PATCH** from v40.0.3, cut from the v40.0.3 tag (not from main, which carries
+v40.1.0). Verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged; no edge code change.
+Ladder triple: **edge v40.0.4 · persist v53.1.5 · verify v19.0.0**.
+
+| | v40.0.3 | v40.0.4 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v53.1.4"` | **`tag = "v53.1.5"`** (1471835c) |
+| ciris-persist (wheel floor) | `>=53.1.4,<54` | **`>=53.1.5,<54`** |
+
+**Why.** CIRISServer 0.5.222 OOM-looped the canonical in a 2 GB cgroup (resting ~1.3 GB vs ~750 MB
+on 0.5.219, same data). The kill was the capacity scorer's pass, which at the canonical's shape
+decoded ~4.3 M rows / 1.63 GB at once; persist v53.1.5 makes it two-phase (17,100 rows / 48 MB,
+CIRISPersist I538) and bounds the S1 audience and consent reads that scanned an owner's or a
+group's whole row set per decision (V178/V179). Persist's new `FederationDirectory` reads have
+default bodies, so edge compiles against it unchanged.
+
+**Edge's side, checked while localizing it:** edge's attestation reads are paged
+(`sweep_page_rows` 1,024 rows, at most 2 sweeps holding a page, each page dropped before the next)
+and unchanged since v38.1.0; edge added no unbounded long-lived structure between v38.1.0 and
+v40.0.3. CIRISEdge#816 (a minimum interval between kicked rounds, for hosts that kick per sealed
+trace) is a separate, later change.
+
 # v40.0.3 — persist v53.1.4: an upgraded canonical boots Rooted
 
 **2026-10-05.** **PATCH** from v40.0.2. Verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged; no
