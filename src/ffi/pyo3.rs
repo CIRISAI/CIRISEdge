@@ -2507,7 +2507,11 @@ impl PyEdge {
         for (k, v) in &bundle.durable_queue_depth {
             durable_depth.set_item(k.as_str(), *v)?;
         }
-        root.set_item("durable_queue_depth", durable_depth)?;
+        root.set_item("durable_queue_depth", durable_depth.clone())?;
+        // CIRISEdge#814 — the honest name for the same number: cumulative
+        // ENQUEUES, never decremented. `durable_queue_depth` keeps its old
+        // meaning until a resident depth (persist's count) replaces it.
+        root.set_item("durable_enqueued_total", durable_depth)?;
 
         let bytes_in = pyo3::types::PyDict::new(py);
         for (k, v) in &bundle.transport_bytes_in_total {
@@ -8789,6 +8793,40 @@ fn edge_evidence_rows() -> Vec<String> {
     crate::field_conformance::edge_evidence_rows()
 }
 
+/// CIRISEdge#814 — route edge's `tracing` events to stderr in a Python host.
+///
+/// The wheel installs no subscriber by itself, so without this every edge
+/// log line in a Python process — refusals at WARN included — is discarded
+/// and `RUST_LOG` does nothing. Call it once, early. The filter is `filter`
+/// if given, else `RUST_LOG`, else `ciris_edge=info`.
+///
+/// Returns `True` if this call installed the subscriber, `False` if one was
+/// already installed (by an earlier call or by the host), which it leaves in
+/// place: a second call is a no-op, never an error.
+#[pyfunction]
+#[pyo3(signature = (filter=None))]
+fn init_logging(filter: Option<&str>) -> PyResult<bool> {
+    init_logging_with(filter)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("init_logging: {e}")))
+}
+
+/// The testable core of [`init_logging`]: `Err` only for a filter that does
+/// not parse.
+fn init_logging_with(filter: Option<&str>) -> Result<bool, String> {
+    use tracing_subscriber::EnvFilter;
+    let env_filter = match filter {
+        Some(f) => EnvFilter::try_new(f).map_err(|e| format!("bad filter {f:?}: {e}"))?,
+        None => {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("ciris_edge=info"))
+        }
+    };
+    Ok(tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
+        .try_init()
+        .is_ok())
+}
+
 /// Map the pinned §2.4 `"typ"` integer table onto
 /// [`crate::scope_privacy::RecordType`]. `0` is reserved; out-of-set
 /// values raise `ValueError` (strict allowlist, AV-7 posture).
@@ -9423,6 +9461,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // point in a future revision.
     #[cfg(feature = "transport-reticulum")]
     m.add_function(wrap_pyfunction!(init_edge_runtime, m)?)?;
+
+    // CIRISEdge#814 — edge's logs in a Python host.
+    m.add_function(wrap_pyfunction!(init_logging, m)?)?;
 
     // CIRISEdge#123 — cross-wheel conformance surface for
     // realtime_av + federation_session + RNS dest-hash. Lets
@@ -11919,7 +11960,17 @@ mod pyo3_tier2_tests {
             let snap = py_edge.metrics_snapshot(py)?;
             let bound = snap.bind(py);
             let depth = bound.get_item("durable_queue_depth")?;
-            depth.get_item("durable")?.extract()
+            // CIRISEdge#814 — the honestly named alias carries the same count.
+            let enqueued: u64 = bound
+                .get_item("durable_enqueued_total")?
+                .get_item("durable")?
+                .extract()?;
+            let d: u64 = depth.get_item("durable")?.extract()?;
+            assert_eq!(
+                enqueued, d,
+                "durable_enqueued_total mirrors durable_queue_depth"
+            );
+            Ok(d)
         })
         .expect("metrics_snapshot post");
         assert_eq!(
@@ -12126,6 +12177,38 @@ mod node_identity_tests {
             "BridgeConfig has no mode field: the directory role keys on the \
              serve-tier resolver, never on AgentMode (ROLE_MATRIX axis 3) — \
              reintroducing this line is reintroducing the v18.12.1 mis-key"
+        );
+    }
+}
+
+/// CIRISEdge#814 — a Python host can route edge's logs to stderr, once.
+#[cfg(test)]
+mod init_logging_814 {
+    use super::init_logging_with;
+
+    #[test]
+    fn a_bad_filter_is_refused_by_name() {
+        let err = init_logging_with(Some("ciris_edge=not-a-level=x"))
+            .expect_err("an unparseable filter must not install anything");
+        assert!(err.contains("bad filter"), "{err}");
+    }
+
+    /// The first install wins and the second call is a no-op returning
+    /// `false`, never an error — a host that already installed its own
+    /// subscriber (or called twice) is left as it was. Afterwards a
+    /// subscriber IS set, which is the whole point: before #814 nothing
+    /// in the wheel ever set one.
+    #[test]
+    fn a_second_call_is_a_no_op_and_a_subscriber_is_set() {
+        let _first = init_logging_with(Some("ciris_edge=info")).expect("parses");
+        assert!(
+            tracing::dispatcher::has_been_set(),
+            "init_logging must leave a global subscriber installed"
+        );
+        assert_eq!(
+            init_logging_with(None),
+            Ok(false),
+            "a second call must not replace or fail on the installed subscriber"
         );
     }
 }

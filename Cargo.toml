@@ -1216,6 +1216,9 @@ codec-default          = ["codec-fountain", "codec-av1", "codec-opus"]
 pyo3                  = [
     "dep:pyo3",
     "dep:pyo3-async-runtimes",
+    # CIRISEdge#814 — `ciris_edge.init_logging()`: a Python host otherwise
+    # never sees an edge log line (no subscriber is ever installed).
+    "dep:tracing-subscriber",
     # v3.0.0 — `dep:pyo3-stub-gen` dropped pending the upstream 0.29
     # release. See the commented-out `pyo3-stub-gen = ...` block above
     # for the full rationale + the no-op shape this leaves in
@@ -1251,6 +1254,7 @@ pyo3                  = [
 pyo3-sqlite           = [
     "dep:pyo3",
     "dep:pyo3-async-runtimes",
+    "dep:tracing-subscriber",
     "ciris-persist/pyo3-sqlite",
     "transport-reticulum",
     "ffi-uniffi",
