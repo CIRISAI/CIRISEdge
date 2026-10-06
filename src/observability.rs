@@ -996,8 +996,8 @@ pub struct EdgeMetrics {
     /// chunk→manifest link for (sealed or pulled before persist v53.1.0, and
     /// not yet re-related by CIRISPersist#994's backfill, or one this node
     /// cannot open). One per chunk served through it, so the fallback's
-    /// sunset is measured in the field: zero across a fleet means the walk
-    /// can go.
+    /// sunset is measured in the field: it shrinks with #994's backfill, and
+    /// what remains after it is the set of manifests no keyholder re-related.
     pub blob_serve_legacy_dag_walks: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) — which link
     /// each scoped body rode, chosen ONCE per send from the path table:

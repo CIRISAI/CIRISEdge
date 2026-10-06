@@ -164,10 +164,11 @@ impl PersistBlobChunkSource {
     ///    never for a whole blob, which also answers empty. Uncached, so its
     ///    O(chunks) listing is paid per chunk; counted in
     ///    `blob_serve_legacy_dag_walks` and named at INFO once per manifest.
-    ///    **Sunset:** CIRISPersist#994 backfills the relation (a boot/lazy
-    ///    sweep under the re-promote predicate). A manifest this node cannot
-    ///    open stays unrelated after #994, so the walk stays for those until
-    ///    the counter reads zero across the fleet.
+    ///    **Sunset:** the walk shrinks with CIRISPersist#994's backfill (a
+    ///    boot/lazy sweep under the re-promote predicate) — it does not end
+    ///    with it: a manifest this node cannot open stays unrelated after
+    ///    #994, and the walk stays for those. The counter measures what is
+    ///    left.
     ///
     /// Anything unreadable reads as "not a member": this is a refusal gate,
     /// and it fails closed. A `Withdrawn` from ANY of these reads is the
@@ -186,12 +187,18 @@ impl PersistBlobChunkSource {
         match binding_state(&*directory, &dag).await {
             Ok(BindingState::Withdrawn { .. }) => return DagMembership::Withdrawn,
             Ok(_) => {}
-            Err(e) => tracing::warn!(
-                blob = %dag_hex,
-                error = %e,
-                "PersistBlobChunkSource: the named DAG's binding state could not be read — \
-                 judged by its link and the chunk's own fold (CIRISEdge#771)"
-            ),
+            // Fail closed, as every other unreadable read here: a DAG whose
+            // binding state cannot be read may be withdrawn, and a membership
+            // answer must not serve it on the strength of its link alone.
+            Err(e) => {
+                tracing::warn!(
+                    blob = %dag_hex,
+                    error = %e,
+                    "PersistBlobChunkSource: the named DAG's binding state could not be read — \
+                     not a member (fail-closed, CIRISEdge#771)"
+                );
+                return DagMembership::NotMember;
+            }
         }
         match self.engine.dag_contains_chunk(&dag, &chunk).await {
             Ok(true) => return DagMembership::Member,

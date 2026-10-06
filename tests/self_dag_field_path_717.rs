@@ -1498,6 +1498,7 @@ async fn withdrawn_dag_is_refused_and_evicted_at_the_holder_771(
     );
 
     unlinked_withdrawn_dag_is_refused_by_the_register_771(b, owner).await;
+    an_unreadable_binding_state_fails_closed_771(b, owner).await;
 }
 
 /// **CIRISEdge#771 item 2 — a withdrawn DAG persist has NO link for.**
@@ -1855,5 +1856,58 @@ async fn whole_blob_never_reaches_the_walk_771(b: &Member, owner: &Ident, other_
         shape(&door.read_chunk(whole, whole, "a-peer-asking-771").await),
         "bytes",
         "control: the whole blob itself is served"
+    );
+}
+
+/// **CIRISEdge#771 review — an unreadable binding state fails closed.** The
+/// named DAG's fold is read before its link; if that read fails, the DAG may
+/// be withdrawn, so the gate answers `ChunkNotInNamedDag` rather than serving
+/// on the strength of the link alone. The seam: B's `federation_attestations`
+/// table (what persist's binding read selects from) is renamed away for one
+/// request, through B's own SQLite writer, and put back.
+async fn an_unreadable_binding_state_fails_closed_771(b: &Member, owner: &Ident) {
+    use ciris_edge::blob_swarm::{BlobChunkSource as _, PersistBlobChunkSource};
+    let (f, _) = publish_on(b, owner, 0x0775, "live-f.mp4").await;
+    let f_sha = sha_of(&f.pointer);
+    let (_, chunk) = b
+        .node
+        .store
+        .engine()
+        .chunks_of_manifest(&f_sha)
+        .await
+        .expect("F's relation")[0];
+    let door = PersistBlobChunkSource::new(b.node.store.engine().clone());
+    let peer = "a-peer-asking-771";
+    assert_eq!(
+        shape(&door.read_chunk(f_sha, chunk, peer).await),
+        "bytes",
+        "control: F's chunk is served while its binding state reads"
+    );
+    let rename = |from: &str, to: &str| {
+        b.node
+            .dir
+            .conn_handle()
+            .lock()
+            .execute(&format!("ALTER TABLE {from} RENAME TO {to}"), [])
+            .expect("rename");
+    };
+    rename(
+        "federation_attestations",
+        "federation_attestations_away_771",
+    );
+    let answer = shape(&door.read_chunk(f_sha, chunk, peer).await);
+    rename(
+        "federation_attestations_away_771",
+        "federation_attestations",
+    );
+    assert_eq!(
+        answer, "ChunkNotInNamedDag",
+        "a named DAG whose binding state cannot be read is not a member (fail-closed, \
+         CIRISEdge#771)"
+    );
+    assert_eq!(
+        shape(&door.read_chunk(f_sha, chunk, peer).await),
+        "bytes",
+        "control: with the table back, F's chunk is served again"
     );
 }
