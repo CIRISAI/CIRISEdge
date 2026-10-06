@@ -143,11 +143,21 @@ use super::federation_session::PeerKexPubkeys;
 use super::realtime_av::{
     ChunkLayer, ChunkSeq, Epoch, InnerSealed, ReceiverLayerPolicy, StreamId, CODEC_OPAQUE,
 };
-use super::realtime_av_dispatcher::AvSubscriberLink;
+use super::realtime_av_dispatcher::{AvDispatcherError, AvSubscriberLink, ChunkTooLarge};
 use super::realtime_av_relay::{PeerKeyId, RelayError, RelayForwardOut, RelayNode};
 use super::realtime_av_runtime::{AvPublisher, AvRuntimeError};
 use super::realtime_av_session::RosterDelta;
 use ciris_crypto::MlDsa65Signer;
+
+static OVERSIZED_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#720 — the throttle for the spine's oversized-chunk WARN.
+fn oversized_log() -> &'static crate::log_throttle::LogThrottle {
+    OVERSIZED_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(60), 16)
+    })
+}
 
 // ─── errors ─────────────────────────────────────────────────────────
 
@@ -290,6 +300,14 @@ pub enum LegOutcome {
         /// Destinations the chunk reached.
         reached: usize,
     },
+    /// CIRISEdge#720 — the chunk is larger than a link's Channel carries,
+    /// refused by name before it reached the transport. Not a link failure:
+    /// the producer must cut the chunk smaller. The dispatcher stops at the
+    /// first refusing link, so this does not say how many links preceded it.
+    Oversized {
+        /// The size and the limit, typed.
+        refusal: ChunkTooLarge,
+    },
     /// The leg failed. The chunk may have reached some destinations
     /// before it did.
     Failed {
@@ -310,7 +328,7 @@ impl LegOutcome {
     #[must_use]
     pub fn reached(&self) -> usize {
         match self {
-            Self::Idle => 0,
+            Self::Idle | Self::Oversized { .. } => 0,
             Self::Delivered { reached } | Self::Failed { reached, .. } => *reached,
         }
     }
@@ -318,7 +336,7 @@ impl LegOutcome {
     /// Whether this leg failed.
     #[must_use]
     pub fn failed(&self) -> bool {
-        matches!(self, Self::Failed { .. })
+        matches!(self, Self::Failed { .. } | Self::Oversized { .. })
     }
 }
 
@@ -927,6 +945,38 @@ impl AvSpine {
         let direct = match self.publisher.dispatch_inner(inner).await {
             Ok(0) => LegOutcome::Idle,
             Ok(reached) => LegOutcome::Delivered { reached },
+            Err(AvRuntimeError::Dispatcher(AvDispatcherError::ChunkTooLarge(refusal))) => {
+                // A producer sizing bug, not churn — but it repeats per frame
+                // until fixed, so it speaks once per window, never per frame
+                // (CIRISEdge#460). The typed refusal is in the Fanout.
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    oversized_log().check("av-spine-oversized")
+                {
+                    tracing::warn!(
+                        stream = ?stream_id,
+                        chunk_seq = chunk_seq.0,
+                        frame_bytes = refusal.frame_bytes,
+                        channel_limit = refusal.channel_limit,
+                        suppressed_prev,
+                        "AV spine publish: chunk REFUSED — larger than the link Channel \
+                         carries (CIRISEdge#720); cut chunks to fit"
+                    );
+                }
+                LegOutcome::Oversized { refusal }
+            }
+            Err(AvRuntimeError::Dispatcher(AvDispatcherError::Congested)) => {
+                // Routine realtime backpressure: the chunk is dropped for the
+                // congested link, never queued (CIRISEdge#460/#591).
+                tracing::debug!(
+                    stream = ?stream_id,
+                    chunk_seq = chunk_seq.0,
+                    "AV spine publish: a downstream link is congested — chunk dropped for it"
+                );
+                LegOutcome::Failed {
+                    reached: 0,
+                    error: AvDispatcherError::Congested.to_string(),
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     stream = ?stream_id,

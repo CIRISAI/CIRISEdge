@@ -86,6 +86,10 @@ pub mod realtime_av_dispatcher;
 /// behind `_reticulum-module` (their only leviculum dependency).
 pub mod realtime_av_runtime;
 
+/// CIRISEdge#805 item 4 — the A/V plane on the live node: the Reticulum
+/// transport's A/V sink, fed from the same event loop replication uses.
+#[cfg(feature = "_reticulum-module")]
+pub mod av_sink;
 /// The A/V spine (CIRISEdge#499) — the integrating runtime that drives
 /// ONE call from join to media to heal. Owns the publisher, the relay
 /// and the scope-address lifecycle *together*, so an MLS epoch can never

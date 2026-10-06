@@ -76,9 +76,14 @@
 //!   picks the parent from a signed-capacity pool.
 //! - **Stretch (not here)** — multi-parent dedup/heal
 //!   ([`super::realtime_av_alm::MultiParentSubscription`]),
-//!   rekey-on-membership rebuild of a live subscriber loop, real codec
-//!   framing + fragmentation of oversized chunks, and the live two-node
-//!   RNS loopback exercising [`LeviculumAvSender`] / [`LinkDataPump`].
+//!   rekey-on-membership rebuild of a live subscriber loop, and real codec
+//!   framing of chunks larger than a link's Channel (refused by name today,
+//!   [`super::realtime_av_dispatcher::ChunkTooLarge`], CIRISEdge#720).
+//! - **On the live node (CIRISEdge#805 item 4)** — a node that also
+//!   replicates gets [`LeviculumAvSender`] / [`PumpReceiver`] from its
+//!   Reticulum transport (`ReticulumTransport::open_av_link` /
+//!   `take_av_arrivals`), demultiplexed on the transport's own event loop;
+//!   witnessed over two real nodes by `tests/av_spine_live_node_805.rs`.
 
 use tokio::sync::mpsc;
 
@@ -90,8 +95,8 @@ use super::realtime_av_alm::{
     AlmJoinError, AlmJoinPlanner, JoinPlan, ParentCandidate, TransitGate,
 };
 use super::realtime_av_dispatcher::{
-    AvDispatcher, AvDispatcherConfig, AvDispatcherError, AvInboundLink, AvRole, AvSubscriberLink,
-    PeerKeyId, ReconstructedChunk,
+    open_hop_outer, AvDispatcher, AvDispatcherConfig, AvDispatcherError, AvInboundLink, AvRole,
+    AvSubscriberLink, PeerKeyId, ReconstructedChunk,
 };
 use super::realtime_av_session::{AvSession, AvSessionError, EpochRekeyArtifacts, RosterDelta};
 use crate::transport::realtime_av::ReceiverLayerPolicy;
@@ -314,7 +319,9 @@ impl AvPublisher {
             layer,
         )?;
         self.next_chunk_seq = self.next_chunk_seq.wrapping_add(1);
-        tracing::info!(
+        // Per frame, so DEBUG: on the live node this fires at frame
+        // cadence beside replication's log stream (CIRISEdge#460).
+        tracing::debug!(
             stream = %stream_tag(self.stream_id),
             epoch = self.epoch.0,
             chunk_seq = seq.0,
@@ -531,8 +538,8 @@ impl AvRelay {
             let mut inbound_link_seq: u64 = 0;
             tracing::info!(stream = %tag, "AV relay pump: started");
             loop {
-                let bytes = match inbound.inbound_recv.recv().await {
-                    Ok(b) => b,
+                let frame = match inbound.inbound_recv.recv_frame().await {
+                    Ok(f) => f,
                     Err(e) => {
                         // Permanently-closed / dead upstream link — the
                         // pump's only exit. Loud so a stopped relay is
@@ -545,7 +552,7 @@ impl AvRelay {
                         break;
                     }
                 };
-                let sealed = match SealedAvChunk::from_bytes(&bytes) {
+                let sealed = match SealedAvChunk::from_bytes(&frame.bytes) {
                     Ok(s) => s,
                     Err(e) => {
                         // Malformed wire — skip WITHOUT advancing the
@@ -553,7 +560,7 @@ impl AvRelay {
                         // the keystream aligned). Loud per CIRISEdge#425.
                         tracing::warn!(
                             stream = %tag,
-                            bytes = bytes.len(),
+                            bytes = frame.bytes.len(),
                             inbound_link_seq,
                             error = %e,
                             "AV relay pump: malformed inbound frame DROPPED (not forwarded)"
@@ -562,33 +569,53 @@ impl AvRelay {
                     }
                 };
                 let chunk_seq = sealed.chunk_seq.0;
-                match dispatcher
-                    .relay_chunk(
-                        sealed,
-                        &inbound_transit_key,
-                        &inbound_link_id,
+                // Open at the counter past any frames the transport dropped
+                // before this one (CIRISEdge#805). An open failure leaves
+                // the counter where it was: no counter was consumed.
+                let Some((opened_at, inner)) = open_hop_outer(
+                    &sealed,
+                    &inbound_transit_key,
+                    &inbound_link_id,
+                    inbound_link_seq,
+                    frame.dropped_before,
+                ) else {
+                    tracing::warn!(
+                        stream = %tag,
+                        chunk_seq,
                         inbound_link_seq,
-                    )
-                    .await
-                {
+                        dropped_before = frame.dropped_before,
+                        "AV relay: inbound outer open FAILED at every candidate counter — \
+                         frame not forwarded (CIRISEdge#425)"
+                    );
+                    continue;
+                };
+                // The open consumed the counter, whatever the fan-out does.
+                inbound_link_seq = opened_at.wrapping_add(1);
+                match dispatcher.relay_inner(inner).await {
                     Ok(()) => {
-                        tracing::info!(
+                        tracing::debug!(
                             stream = %tag,
                             chunk_seq,
-                            inbound_link_seq,
+                            inbound_link_seq = opened_at,
                             downstream = dispatcher.subscriber_count(),
                             "AV relay: forwarded chunk to downstream subscribers"
                         );
-                        inbound_link_seq = inbound_link_seq.wrapping_add(1);
+                    }
+                    Err(AvDispatcherError::Congested) => {
+                        // Routine realtime backpressure (CIRISEdge#460): the
+                        // chunk is dropped for the congested hop, never queued.
+                        tracing::debug!(
+                            stream = %tag,
+                            chunk_seq,
+                            "AV relay: a downstream hop is congested — chunk dropped for it \
+                             (CIRISEdge#591)"
+                        );
                     }
                     Err(e) => {
-                        // Open / re-seal / send failure. Loud, and DO NOT
-                        // advance the counter (an open failure means this
-                        // link_seq wasn't consumed). CIRISEdge#425.
                         tracing::warn!(
                             stream = %tag,
                             chunk_seq,
-                            inbound_link_seq,
+                            inbound_link_seq = opened_at,
                             error = %e,
                             "AV relay: chunk forward FAILED (not delivered downstream)"
                         );
@@ -757,12 +784,14 @@ impl AvSubscriber {
 
 // ─── Real-RNS transport seam (leviculum) ────────────────────────────
 
+#[cfg(feature = "_reticulum-module")]
+pub(crate) use leviculum_link::{AvLinkQueue, QueueOffer};
 /// Real-RNS implementations of the dispatcher's [`AvLinkSender`] /
 /// [`AvLinkReceiver`] seam over leviculum RNS links. Gated behind
 /// `_reticulum-module` — the only part of the runtime that depends on
 /// leviculum.
 #[cfg(feature = "_reticulum-module")]
-pub use leviculum_link::{LeviculumAvSender, LinkDataPump, PumpReceiver};
+pub use leviculum_link::{LeviculumAvSender, LinkDataPump, PumpReceiver, AV_LINK_QUEUE_DEPTH};
 
 #[cfg(feature = "_reticulum-module")]
 mod leviculum_link {
@@ -776,42 +805,131 @@ mod leviculum_link {
     use leviculum_std::driver::{EventReceiver, ReticulumNode};
 
     use crate::transport::realtime_av_dispatcher::{
-        AvDispatcherError, AvLinkReceiver, AvLinkSender,
+        AvDispatcherError, AvLinkReceiver, AvLinkSender, ChunkTooLarge, InboundWireFrame,
     };
 
     /// Bound on each per-link inbound queue. Realtime A/V is
     /// loss-tolerant: if the consumer falls behind by more than this many
-    /// frames the pump drops the newest and says so loudly (CIRISEdge#425)
-    /// rather than growing the queue unboundedly.
-    const PUMP_QUEUE_DEPTH: usize = 256;
+    /// frames the newest is dropped and counted (CIRISEdge#425/#805)
+    /// rather than the queue growing without bound or the producer — the
+    /// transport's event loop, which replication shares — waiting.
+    pub const AV_LINK_QUEUE_DEPTH: usize = 256;
+
+    /// What [`AvLinkQueue::offer`] did with a frame.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum QueueOffer {
+        /// Queued for the consumer.
+        Queued,
+        /// The consumer is [`AV_LINK_QUEUE_DEPTH`] frames behind: the frame
+        /// was dropped, and the next queued frame carries the count so the
+        /// consumer's hop counter skips past it
+        /// ([`InboundWireFrame::dropped_before`]).
+        DroppedFull,
+        /// The consumer dropped its receiver: nobody will read this link.
+        ConsumerGone,
+    }
+
+    /// **The one A/V inbound drop policy** (CIRISEdge#805): a bounded,
+    /// never-blocking per-link queue that drops the NEWEST frame when full
+    /// and tells the consumer how many it dropped. Shared by
+    /// [`LinkDataPump`] and the Reticulum transport's A/V sink so the two
+    /// cannot drift.
+    pub(crate) struct AvLinkQueue {
+        tx: mpsc::Sender<InboundWireFrame>,
+        dropped_since_queued: u64,
+    }
+
+    impl AvLinkQueue {
+        /// A fresh queue for `link_id` and its consumer half.
+        pub(crate) fn new(link_id: LinkId) -> (Self, PumpReceiver) {
+            let (tx, rx) = mpsc::channel::<InboundWireFrame>(AV_LINK_QUEUE_DEPTH);
+            (
+                Self {
+                    tx,
+                    dropped_since_queued: 0,
+                },
+                PumpReceiver {
+                    rx: Mutex::new(rx),
+                    link_id,
+                },
+            )
+        }
+
+        /// Offer one frame. Never awaits.
+        pub(crate) fn offer(&mut self, bytes: Vec<u8>) -> QueueOffer {
+            let frame = InboundWireFrame {
+                dropped_before: self.dropped_since_queued,
+                bytes,
+            };
+            match self.tx.try_send(frame) {
+                Ok(()) => {
+                    self.dropped_since_queued = 0;
+                    QueueOffer::Queued
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.dropped_since_queued = self.dropped_since_queued.saturating_add(1);
+                    QueueOffer::DroppedFull
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => QueueOffer::ConsumerGone,
+            }
+        }
+    }
 
     /// A real-RNS [`AvLinkSender`] over one leviculum link.
     ///
-    /// [`Self::send`] rides
-    /// [`leviculum_std::driver::LinkHandle::send`] — the pacing- and
-    /// busy-absorbing Channel packet path (the same `send_on_link` core
-    /// the reverse-path reply uses in [`crate::transport::reticulum`]).
-    /// One realtime chunk that fits the link MDU rides as a single link
-    /// packet; oversized chunks need fragmentation (stretch — reuse
-    /// [`crate::transport::frame_fragment`]).
+    /// [`Self::send`] rides `LinkHandle::try_send` — the link's Channel,
+    /// which sequences and retransmits every message (the same
+    /// `send_on_link` core the reverse-path reply uses in
+    /// [`crate::transport::reticulum`]). A chunk rides as ONE Channel
+    /// message; a frame larger than the Channel carries is refused by name
+    /// before it reaches leviculum ([`ChunkTooLarge`], CIRISEdge#720).
     pub struct LeviculumAvSender {
         node: Arc<ReticulumNode>,
         link_id: LinkId,
+        metrics: Option<crate::observability::EdgeMetrics>,
     }
 
     impl LeviculumAvSender {
         /// Wrap `(node, link_id)` as an outbound A/V link. The link MUST
-        /// already be established + identified (via the transport's
-        /// `link_open` or a dialed connect) before any chunk is sent.
+        /// already be established + identified before any chunk is sent;
+        /// [`crate::transport::reticulum::ReticulumTransport::open_av_link`]
+        /// hands out senders that are.
         #[must_use]
         pub fn new(node: Arc<ReticulumNode>, link_id: LinkId) -> Self {
-            Self { node, link_id }
+            Self {
+                node,
+                link_id,
+                metrics: None,
+            }
+        }
+
+        /// Count this sender's refusals on `metrics` (`av_plane`).
+        #[must_use]
+        pub(crate) fn with_metrics(
+            mut self,
+            metrics: Option<crate::observability::EdgeMetrics>,
+        ) -> Self {
+            self.metrics = metrics;
+            self
         }
 
         /// The link this sender drives.
         #[must_use]
         pub fn link_id(&self) -> &LinkId {
             &self.link_id
+        }
+
+        /// The most one Channel message on this link carries, or `None`
+        /// when leviculum no longer holds the link.
+        #[must_use]
+        pub fn channel_limit(&self) -> Option<usize> {
+            crate::transport::reticulum::link_channel_message_limit(&self.node, &self.link_id)
+        }
+
+        fn count(&self, label: &'static str) {
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_av_plane(label);
+            }
         }
     }
 
@@ -831,31 +949,57 @@ mod leviculum_link {
         /// `try_send` refuses instead, and the refusal is mapped to
         /// [`AvDispatcherError::Congested`] rather than `SendFailed` so the
         /// caller can tell "defer this" from "this went wrong".
+        ///
+        /// CIRISEdge#720 — the frame is sized against the link's Channel
+        /// limit FIRST. leviculum refuses an oversized Channel message as
+        /// `TooLarge` and `send_on_link` folds that into `LinkFailed`, so
+        /// without this check an oversized chunk read as a link failure.
         async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
             use leviculum_core::SendError;
             use leviculum_std::error::Error as LevError;
 
+            let Some(channel_limit) = self.channel_limit() else {
+                self.count(crate::observability::AV_SEND_LINK_GONE);
+                return Err(AvDispatcherError::SendFailed(format!(
+                    "leviculum link {:?} is no longer held — no Channel to send on",
+                    self.link_id
+                )));
+            };
+            if bytes.len() > channel_limit {
+                self.count(crate::observability::AV_SEND_REFUSED_CHUNK_TOO_LARGE);
+                return Err(AvDispatcherError::ChunkTooLarge(ChunkTooLarge {
+                    frame_bytes: bytes.len(),
+                    channel_limit,
+                }));
+            }
             match self.node.link_handle(&self.link_id).try_send(bytes).await {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    self.count(crate::observability::AV_SENT);
+                    Ok(())
+                }
                 // The two backpressure arms. `PacingDelay`'s `ready_at_ms`
                 // is on leviculum's clock and is deliberately dropped here
                 // — see `AvDispatcherError::Congested`.
                 Err(LevError::Send(SendError::Busy | SendError::PacingDelay { .. })) => {
+                    self.count(crate::observability::AV_SEND_CONGESTED);
                     Err(AvDispatcherError::Congested)
                 }
-                Err(e) => Err(AvDispatcherError::SendFailed(format!(
-                    "leviculum link {:?} send failed: {e}",
-                    self.link_id
-                ))),
+                Err(e) => {
+                    self.count(crate::observability::AV_SEND_FAILED);
+                    Err(AvDispatcherError::SendFailed(format!(
+                        "leviculum link {:?} send failed: {e}",
+                        self.link_id
+                    )))
+                }
             }
         }
     }
 
-    /// The inbound half of the real-RNS seam: an [`AvLinkReceiver`] fed
-    /// by [`LinkDataPump`]. Wraps the per-link `mpsc` receiver the pump
-    /// routes wire frames into.
+    /// The inbound half of the real-RNS seam: an [`AvLinkReceiver`] over
+    /// one link's [`AvLinkQueue`], fed by the Reticulum transport's A/V
+    /// sink or by [`LinkDataPump`].
     pub struct PumpReceiver {
-        rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+        rx: Mutex<mpsc::Receiver<InboundWireFrame>>,
         link_id: LinkId,
     }
 
@@ -870,9 +1014,13 @@ mod leviculum_link {
     #[async_trait::async_trait]
     impl AvLinkReceiver for PumpReceiver {
         async fn recv(&self) -> Result<Vec<u8>, AvDispatcherError> {
+            self.recv_frame().await.map(|f| f.bytes)
+        }
+
+        async fn recv_frame(&self) -> Result<InboundWireFrame, AvDispatcherError> {
             self.rx.lock().await.recv().await.ok_or_else(|| {
                 AvDispatcherError::RecvFailed(format!(
-                    "leviculum link {:?} pump queue closed",
+                    "leviculum link {:?} inbound queue closed (link closed or node down)",
                     self.link_id
                 ))
             })
@@ -880,20 +1028,18 @@ mod leviculum_link {
     }
 
     /// Demultiplexes a leviculum node's single [`EventReceiver`] into
-    /// per-link A/V inbound queues.
+    /// per-link A/V inbound queues — for a node DEDICATED to A/V.
     ///
-    /// A leviculum node funnels ALL link traffic (across every link) into
-    /// one event stream. This pump owns that stream and routes each
-    /// [`NodeEvent::LinkDataReceived`] / [`NodeEvent::MessageReceived`] to
-    /// the per-`LinkId` queue a caller registered via [`Self::register`],
-    /// surfaced as a [`PumpReceiver`] the dispatcher's subscriber /
-    /// relay loop drains. A node dedicated to A/V hands its event
-    /// receiver here; a node also carrying edge control-plane traffic
-    /// cannot (the [`crate::transport::reticulum`] listener already owns
-    /// that receiver) — bridging the two is a stretch follow-up.
+    /// A node that also carries edge's control plane cannot use this: the
+    /// [`crate::transport::reticulum`] listener owns that node's event
+    /// receiver. Such a node gets the same demultiplexing from the
+    /// transport itself, on the same event loop as replication
+    /// (`ReticulumTransport::open_av_link` / `take_av_arrivals`,
+    /// CIRISEdge#805 item 4), with the same per-link queue
+    /// ([`AvLinkQueue`]).
     #[derive(Default)]
     pub struct LinkDataPump {
-        registry: Arc<Mutex<HashMap<LinkId, mpsc::Sender<Vec<u8>>>>>,
+        registry: Arc<Mutex<HashMap<LinkId, AvLinkQueue>>>,
     }
 
     impl LinkDataPump {
@@ -909,24 +1055,20 @@ mod leviculum_link {
         /// [`PumpReceiver`] half. Wire frames the pump routes for
         /// `link_id` after this call land on the returned receiver.
         pub async fn register(&self, link_id: LinkId) -> PumpReceiver {
-            let (tx, rx) = mpsc::channel::<Vec<u8>>(PUMP_QUEUE_DEPTH);
-            self.registry.lock().await.insert(link_id, tx);
+            let (queue, rx) = AvLinkQueue::new(link_id);
+            self.registry.lock().await.insert(link_id, queue);
             tracing::info!(link = ?link_id, "AV link pump: registered inbound queue");
-            PumpReceiver {
-                rx: Mutex::new(rx),
-                link_id,
-            }
+            rx
         }
 
         /// Drive the node's event stream, routing link data to the
         /// registered per-link queues. Runs until the event receiver
-        /// closes (node shutdown). Consumes the pump handle; clone-free
-        /// because the registry is `Arc`-shared with the [`PumpReceiver`]
-        /// producers.
+        /// closes (node shutdown). Consumes the pump handle.
         ///
         /// No routing decision is silent (CIRISEdge#425): an unroutable
         /// frame (queue full, or an unregistered A/V link) is logged
-        /// before it is dropped.
+        /// before it is dropped, at DEBUG — overflow is routine realtime
+        /// churn, not a fault (CIRISEdge#460).
         pub async fn run(self, mut events: EventReceiver) {
             tracing::info!("AV link pump: event loop started");
             while let Some(event) = events.recv().await {
@@ -939,8 +1081,8 @@ mod leviculum_link {
                 else {
                     continue;
                 };
-                let sender = self.registry.lock().await.get(&link_id).cloned();
-                let Some(sender) = sender else {
+                let mut registry = self.registry.lock().await;
+                let Some(queue) = registry.get_mut(&link_id) else {
                     // Data on a link no A/V consumer registered — not our
                     // traffic. Trace (not warn): a shared node legitimately
                     // carries non-A/V links.
@@ -951,16 +1093,20 @@ mod leviculum_link {
                     );
                     continue;
                 };
-                if let Err(e) = sender.try_send(data) {
-                    // Queue full or receiver dropped. Loud — a realtime
-                    // drop under backpressure must be visible, never
-                    // silent (CIRISEdge#425). The stream's own retransmit /
-                    // heal owns recovery; the pump just refuses to hide it.
-                    tracing::warn!(
+                match queue.offer(data) {
+                    QueueOffer::Queued => {}
+                    QueueOffer::DroppedFull => tracing::debug!(
                         link = ?link_id,
-                        error = %e,
-                        "AV link pump: inbound frame DROPPED (per-link queue full or closed)"
-                    );
+                        "AV link pump: inbound frame DROPPED — the consumer is \
+                         AV_LINK_QUEUE_DEPTH frames behind (CIRISEdge#425)"
+                    ),
+                    QueueOffer::ConsumerGone => {
+                        registry.remove(&link_id);
+                        tracing::debug!(
+                            link = ?link_id,
+                            "AV link pump: consumer dropped its receiver — link unregistered"
+                        );
+                    }
                 }
             }
             tracing::info!("AV link pump: event loop ended (node event stream closed)");

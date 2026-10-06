@@ -836,6 +836,39 @@ pub struct WithholdRecord {
 /// operator reading a snapshot, not a log. Oldest is evicted first.
 pub const RECENT_WITHHOLDS_CAP: usize = 64;
 
+// ─── CIRISEdge#805 — `EdgeMetrics::av_plane` labels ──────────────────
+
+/// A frame an A/V link's Channel accepted.
+pub const AV_SENT: &str = "av_sent";
+/// CIRISEdge#720 — a frame larger than the link Channel carries, refused by
+/// name before it reached leviculum.
+pub const AV_SEND_REFUSED_CHUNK_TOO_LARGE: &str = "av_send_refused_chunk_too_large";
+/// The link refused under backpressure (`Busy` / `PacingDelay`, #591).
+pub const AV_SEND_CONGESTED: &str = "av_send_congested";
+/// The link is no longer held — nothing to send on.
+pub const AV_SEND_LINK_GONE: &str = "av_send_link_gone";
+/// Any other send failure.
+pub const AV_SEND_FAILED: &str = "av_send_failed";
+/// A link this node dialled to a peer's A/V address, established and
+/// identified.
+pub const AV_LINK_OPENED: &str = "av_link_opened";
+/// A peer-opened A/V link handed to the A/V consumer (its first attributed
+/// frame).
+pub const AV_LINK_ARRIVED: &str = "av_link_arrived";
+/// An inbound A/V frame queued for its consumer.
+pub const AV_INBOUND_DELIVERED: &str = "av_inbound_delivered";
+/// Dropped: the consumer is a full queue behind (the never-block policy).
+pub const AV_INBOUND_DROPPED_QUEUE_FULL: &str = "av_inbound_dropped_queue_full";
+/// Dropped: the link's peer did not pass the #393 attribution gate.
+pub const AV_INBOUND_DROPPED_UNATTRIBUTED: &str = "av_inbound_dropped_unattributed";
+/// Dropped: a peer-opened A/V link arrived and nobody took the arrivals
+/// receiver (or it was dropped), or the arrivals queue was full.
+pub const AV_INBOUND_DROPPED_NO_CONSUMER: &str = "av_inbound_dropped_no_consumer";
+/// Dropped: the link's consumer dropped its receiver.
+pub const AV_INBOUND_DROPPED_CONSUMER_GONE: &str = "av_inbound_dropped_consumer_gone";
+/// Dropped: a Resource completed on an A/V link (A/V rides the Channel only).
+pub const AV_INBOUND_DROPPED_RESOURCE: &str = "av_inbound_dropped_resource";
+
 /// The live counter/gauge bag every [`crate::Edge`] owns.
 ///
 /// # Concurrency
@@ -1123,6 +1156,14 @@ pub struct EdgeMetrics {
     /// `first_contact_unsolicited_introductions` on the requester's side. The
     /// refusals are drops; this ledger is how an operator reads them.
     pub first_contact_outcomes: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#805 item 4 — the A/V plane on the live node, by label
+    /// (`AV_*` constants in this module): frames sent on A/V links and each
+    /// way a send was refused (`av_send_refused_chunk_too_large` is the
+    /// #720 named refusal), A/V links that arrived, frames delivered to the
+    /// transport's A/V sink, and each way an inbound A/V frame was dropped
+    /// (`av_inbound_dropped_queue_full` is the never-block overflow policy).
+    /// Every `av_inbound_dropped_*` label is a drop.
+    pub av_plane: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#640 — blob holders dropped from a pull's candidate set, by the
     /// router's refusal BRANCH (`ScopeRouteRefusal::reason_tag`):
     /// `blob_group_not_installed` (the host's lifecycle never installed the
@@ -1676,6 +1717,22 @@ impl EdgeMetrics {
     #[must_use]
     pub fn transport_inbound_drops(&self) -> HashMap<String, u64> {
         self.transport_inbound_drops
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#805 — count one A/V-plane event by its `AV_*` label.
+    pub fn inc_av_plane(&self, label: &'static str) {
+        *self.av_plane.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#805 — the A/V-plane ledger by label (tests + the operator
+    /// readback).
+    #[must_use]
+    pub fn av_plane(&self) -> HashMap<String, u64> {
+        self.av_plane
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -2255,6 +2312,7 @@ impl EdgeMetrics {
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
             transport_inbound_drops: self.transport_inbound_drops(),
+            av_plane: self.av_plane(),
             first_contact_outcomes: self
                 .first_contact_outcomes
                 .read()
@@ -2479,6 +2537,8 @@ pub struct EdgeMetricsBundle {
     pub transport_inbound_drops: HashMap<String, u64>,
     /// CIRISEdge#683 — the opaque-plane first-contact door by label.
     pub first_contact_outcomes: HashMap<String, u64>,
+    /// CIRISEdge#805 — the A/V plane on the live node by `AV_*` label.
+    pub av_plane: HashMap<String, u64>,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
     pub replication_routed_to_responder_total: u64,
     /// CIRISEdge#634 — replies routed into an initiator's round inbox.
