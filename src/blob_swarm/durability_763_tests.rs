@@ -1021,6 +1021,7 @@ async fn assert_pass_index_agrees(on: &Node, files: &[&Published], devices: &[&s
 /// verdicts equal persist's per-file fold on both nodes, and the passes still
 /// report and repair what they did. Fails on v40.0.3 (12 folds).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // two nodes' passes and the parity check, in order, on purpose
 async fn a_durability_pass_folds_each_audience_device_once_817() {
     let (alice, node_a, node_b) = two_devices().await;
     let (edge_a, edge_b) = (edge_of(&node_a), edge_of(&node_b));
