@@ -34,11 +34,14 @@
 //! family's audience). Nothing here is a `holds_bytes` claim, at any audience
 //! (CC 5.2, CIRISEdge#499: self/family bytes are delivered, never discovered).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
+use ciris_persist::federation::custody_ack::{
+    fold_device_custody, parse_custody_ack, CustodyAck, DeviceCustody,
+};
 use ciris_persist::federation::durability::{
-    content_audience, deficit_over, durability_mode, DurabilityDeficit, DurabilityMode,
-    DEFAULT_FEASIBILITY_FLOOR,
+    content_audience, deficit_over, durability_mode, ContentAudience, DurabilityDeficit,
+    DurabilityMode, DEFAULT_FEASIBILITY_FLOOR,
 };
 use ciris_persist::federation::types::cohort_scope;
 use ciris_persist::federation::{Attestation, FederationDirectory};
@@ -106,6 +109,149 @@ pub async fn row_deficit(
         now,
     )
     .await
+}
+
+/// **CIRISEdge#817 — one durability pass's custody reads.**
+///
+/// [`row_deficit`] hands persist's `deficit_over` an EMPTY `known` map, so
+/// every audience node is folded afresh for every file: one
+/// `list_attestations_by(device)` (≈ 7 KB of heap per row the device signed)
+/// per audience node per file, plus one more for this node's own verdict.
+/// A pass over F files and D audience devices paid F × D + F full-history
+/// reads, which is what made the pass's churn quadratic in the field.
+///
+/// This holds each device's admitted custody reports, indexed by blob, read
+/// ONCE per device per pass, and folds every `(device, file)` verdict from
+/// that index with persist's own [`fold_device_custody`]. The reports are
+/// re-derived exactly as persist's `custody_acks_of` derives them: the rows
+/// the device signed, its retired rows (persist's `retired_ids`) folded out, a
+/// row that does not parse skipped, and only the device's own reports kept.
+/// Every `known` entry handed to `deficit_over` is therefore the verdict its
+/// own fold would have reached, and no audience node is folded there.
+///
+/// One value per pass, never kept across passes: a report filed or
+/// replicated after a device's index was read is seen by the NEXT pass. Within
+/// a pass that is exact for this node's own filings too, because a pass
+/// visits each blob once and a filing only moves that blob's verdict, which
+/// the pass has already read. A read that fails is not cached: the file it
+/// was for is skipped, as before, and the next file asks again.
+#[derive(Debug, Default)]
+pub struct PassCustody {
+    by_device: HashMap<String, HashMap<String, Vec<CustodyAck>>>,
+    folds: usize,
+}
+
+impl PassCustody {
+    /// A pass with nothing read yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many device histories this pass has read from the directory: one
+    /// per device it met, plus any audience node handed to persist without a
+    /// verdict (none, since every audience node is filled). The pass's
+    /// witness, booked on the pass log line.
+    #[must_use]
+    pub fn folds(&self) -> usize {
+        self.folds
+    }
+
+    /// `device`'s custody reports, by blob, read once per pass.
+    async fn reports_of(
+        &mut self,
+        directory: &dyn FederationDirectory,
+        device: &str,
+    ) -> Result<&HashMap<String, Vec<CustodyAck>>, ciris_persist::federation::Error> {
+        if !self.by_device.contains_key(device) {
+            let rows = directory.list_attestations_by(device).await?;
+            self.folds += 1;
+            let refs: Vec<&Attestation> = rows.iter().collect();
+            let retired = ciris_persist::federation::precedence::retired_ids(&refs);
+            let mut by_blob: HashMap<String, Vec<CustodyAck>> = HashMap::new();
+            for row in rows.iter().filter(|r| !retired.contains(&r.attestation_id)) {
+                let ack = match parse_custody_ack(row) {
+                    Ok(Some(a)) => a,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            attestation_id = %row.attestation_id,
+                            error = %e,
+                            "custody fold skips a malformed report"
+                        );
+                        continue;
+                    }
+                };
+                if ack.device_key_id == device {
+                    by_blob
+                        .entry(ack.blob_sha256_hex.clone())
+                        .or_default()
+                        .push(ack);
+                }
+            }
+            self.by_device.insert(device.to_owned(), by_blob);
+        }
+        Ok(&self.by_device[device])
+    }
+
+    /// **`device`'s custody of the blob `sha256_hex`** at `now`, with no
+    /// receipt: persist's `device_custody_of`, over this pass's index.
+    ///
+    /// # Errors
+    /// The device's history could not be read.
+    pub async fn custody_of(
+        &mut self,
+        directory: &dyn FederationDirectory,
+        device: &str,
+        sha256_hex: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<DeviceCustody, ciris_persist::federation::Error> {
+        let reports = self.reports_of(directory, device).await?;
+        let acks = reports.get(sha256_hex).map_or(&[][..], Vec::as_slice);
+        Ok(fold_device_custody(device, acks, None, now))
+    }
+
+    /// **[`row_deficit`], inside a pass**: the same audience and the same
+    /// deficit, with every audience node's verdict taken from this pass's
+    /// index instead of re-folded per file.
+    ///
+    /// # Errors
+    /// The directory read failed.
+    pub async fn row_deficit(
+        &mut self,
+        directory: &dyn FederationDirectory,
+        row: &Attestation,
+        sha: &[u8; 32],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<DurabilityDeficit, ciris_persist::federation::Error> {
+        let audience = content_audience(
+            directory,
+            &row.cohort_scope,
+            Some(&row.attesting_key_id),
+            group_of(row),
+        )
+        .await?;
+        let sha_hex = hex::encode(sha);
+        let mut known = BTreeMap::new();
+        if let ContentAudience::Nodes(nodes) = &audience {
+            for node in nodes {
+                let state = self.custody_of(directory, node, &sha_hex, now).await?.state;
+                known.insert(node.clone(), state);
+            }
+            // Every node persist would still fold itself: zero, by the loop
+            // above. Counted rather than assumed, so the witness measures it.
+            self.folds += nodes.iter().filter(|n| !known.contains_key(*n)).count();
+        }
+        deficit_over(
+            directory,
+            &sha_hex,
+            audience,
+            &known,
+            FEASIBILITY_FLOOR,
+            now,
+        )
+        .await
+    }
 }
 
 /// The audience nodes a deficit names, or `None` when it is not enumerable

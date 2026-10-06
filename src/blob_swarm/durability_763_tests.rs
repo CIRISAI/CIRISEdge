@@ -972,3 +972,158 @@ async fn the_durability_pass_rolls_past_its_file_budget_802() {
         "the second pass resumed past the first pass's stop, not at the room's head"
     );
 }
+
+/// Every `(device, file)` custody verdict and every file's deficit, read
+/// twice on `on`: persist's own per-file fold (`row_deficit` over an empty
+/// `known`, `device_custody_of`) and one CIRISEdge#817 pass index. They must
+/// agree field for field, since they are the only directory-derived inputs a
+/// pass's repair and report decisions read.
+async fn assert_pass_index_agrees(on: &Node, files: &[&Published], devices: &[&str]) {
+    let now = chrono::Utc::now();
+    let mut pass = super::durability::PassCustody::new();
+    for f in files {
+        let per_file = row_deficit(&*on.dir, &f.row, &f.sha, now)
+            .await
+            .expect("persist's per-file deficit");
+        let in_pass = pass
+            .row_deficit(&*on.dir, &f.row, &f.sha, now)
+            .await
+            .expect("the pass's deficit");
+        assert_eq!(
+            in_pass, per_file,
+            "{}: the pass's deficit is persist's per-file deficit",
+            on.me
+        );
+        for d in devices {
+            let folded = device_custody_of(&*on.dir, d, &hex::encode(f.sha), None, now)
+                .await
+                .expect("persist's fold");
+            let indexed = pass
+                .custody_of(&*on.dir, d, &hex::encode(f.sha), now)
+                .await
+                .expect("the pass's fold");
+            assert_eq!(indexed, folded, "{}: {d}'s verdict agrees", on.me);
+        }
+    }
+}
+
+/// **CIRISEdge#817 item 3 — a durability pass folds each audience device's
+/// custody ONCE, not once per file.** alice's laptop A and phone B (audience
+/// of two) share four self files; A's pass reads all four (two pages under
+/// the test budget). The pass reads two device histories, the audience, where
+/// v40.0.3 read F × D + F = 12: `row_deficit` handed persist's `deficit_over`
+/// an empty `known`, so every audience node was re-folded
+/// (`list_attestations_by(device)`) for every file, plus one more fold per
+/// file for A's own verdict. The decisions do not move: across states
+/// covering `here` (A, then B after a pull and its pass), `unknown` (B before
+/// any report) and a report the cohort never carried, the pass's deficits and
+/// verdicts equal persist's per-file fold on both nodes, and the passes still
+/// report and repair what they did. Fails on v40.0.3 (12 folds).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durability_pass_folds_each_audience_device_once_817() {
+    let (alice, node_a, node_b) = two_devices().await;
+    let (edge_a, edge_b) = (edge_of(&node_a), edge_of(&node_b));
+    let (puller_a, puller_b) = (puller_of(&node_a, &edge_a), puller_of(&node_b, &edge_b));
+    let mut files = Vec::new();
+    for seed in 0..4u32 {
+        files.push(publish_self_file_seeded(&node_a, &alice, 0x0817_0000 + seed).await);
+    }
+    for f in &files {
+        deliver_row(f, &node_b).await;
+    }
+    cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await;
+    let refs: Vec<&Published> = files.iter().collect();
+    let devices = [node_a.me.as_str(), node_b.me.as_str()];
+    // Before any report: every verdict is `unknown`.
+    assert_pass_index_agrees(&node_a, &refs, &devices).await;
+
+    let sweep_a = puller_a.durability_sweep().await;
+    assert_eq!(
+        sweep_a.reported_here.len(),
+        4,
+        "A holds and reports all four"
+    );
+    let audience = super::durability::audience_of(
+        &row_deficit(
+            &*node_a.dir,
+            &files[0].row,
+            &files[0].sha,
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("deficit"),
+    )
+    .expect("a self file's audience is enumerable")
+    .len();
+    assert_eq!(audience, 2, "the audience is alice's two personal devices");
+    assert_eq!(
+        puller_a.last_durability_custody_folds(),
+        audience,
+        "a pass over {} files folds each of the {audience} audience devices once, \
+         not F x D + F = {}",
+        files.len(),
+        files.len() * audience + files.len()
+    );
+
+    // B: two of A's four reports carried, one file pulled, B's own pass.
+    let carried_hex: Vec<String> = files[..2].iter().map(|f| hex::encode(f.sha)).collect();
+    for row in node_a
+        .dir
+        .list_attestations_by(&node_a.me)
+        .await
+        .expect("list")
+    {
+        let ack = ciris_persist::federation::custody_ack::parse_custody_ack(&row)
+            .ok()
+            .flatten();
+        if ack.is_some_and(|a| carried_hex.contains(&a.blob_sha256_hex)) {
+            node_b
+                .dir
+                .apply_replicated_attestation(SignedAttestation { attestation: row })
+                .await
+                .expect("B admits A's report");
+        }
+    }
+    assert_eq!(
+        puller_b
+            .pull_dag_with(&files[0].row, files[0].sha, &fetch_from(&node_a, &node_b))
+            .await,
+        PullOutcome::Stored { announced: false }
+    );
+    assert_pass_index_agrees(&node_b, &refs, &devices).await;
+    let sweep_b = puller_b.durability_sweep().await;
+    assert_eq!(
+        puller_b.last_durability_custody_folds(),
+        audience,
+        "B's pass folds each audience device once"
+    );
+    let mut repaired: Vec<[u8; 32]> = sweep_b.repairs.iter().map(|r| r.sha).collect();
+    repaired.sort_unstable();
+    let mut expected: Vec<[u8; 32]> = files[1..].iter().map(|f| f.sha).collect();
+    expected.sort_unstable();
+    assert_eq!(
+        repaired, expected,
+        "B repairs the three files it does not hold"
+    );
+    let carried = sweep_b
+        .repairs
+        .iter()
+        .find(|r| r.sha == files[1].sha)
+        .expect("F1 is a repair");
+    assert_eq!(
+        carried.live_here,
+        vec![node_a.me.clone()],
+        "a carried `here` makes A a holder B pulls from"
+    );
+    assert!(
+        sweep_b
+            .repairs
+            .iter()
+            .filter(|r| r.sha != files[1].sha)
+            .all(|r| r.live_here.is_empty()),
+        "an uncarried report is unknown to B: no live holder"
+    );
+    // After B's pass filed its `here`, the index still agrees on both nodes.
+    assert_pass_index_agrees(&node_b, &refs, &devices).await;
+    assert_pass_index_agrees(&node_a, &refs, &devices).await;
+}
