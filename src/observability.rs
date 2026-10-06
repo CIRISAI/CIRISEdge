@@ -991,6 +991,14 @@ pub struct EdgeMetrics {
     /// and `no_chunk_source_wired`. The serve-side twin of `blob_route_refusals`;
     /// the withhold ledger carries the same events keyed coarser.
     pub blob_serve_refusals: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#771 — chunk serves whose DAG membership was answered by the
+    /// LEGACY stream walk: a sealed `chunk_dag` manifest persist holds NO
+    /// chunk→manifest link for (sealed or pulled before persist v53.1.0, and
+    /// not yet re-related by CIRISPersist#994's backfill, or one this node
+    /// cannot open). One per chunk served through it, so the fallback's
+    /// sunset is measured in the field: zero across a fleet means the walk
+    /// can go.
+    pub blob_serve_legacy_dag_walks: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) — which link
     /// each scoped body rode, chosen ONCE per send from the path table:
     /// `send:derived_address` (a one-hop path — the zero-observer path),
@@ -1591,6 +1599,20 @@ impl EdgeMetrics {
     /// CIRISEdge#48-B (v0.19.6) — increment the
     /// `inbound_dropped_low_trust` counter. Called from
     /// `dispatch_inbound` once per drop.
+    /// CIRISEdge#771 — count one chunk serve answered by the legacy DAG
+    /// stream walk (see the field).
+    pub fn inc_blob_serve_legacy_dag_walk(&self) {
+        self.blob_serve_legacy_dag_walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#771 — chunk serves answered by the legacy DAG stream walk.
+    #[must_use]
+    pub fn blob_serve_legacy_dag_walks(&self) -> u64 {
+        self.blob_serve_legacy_dag_walks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn inc_inbound_dropped_low_trust(&self) {
         self.inbound_dropped_low_trust
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1752,6 +1774,7 @@ impl EdgeMetrics {
             transport_bytes_out_total: self.transport_bytes_out_total.read().clone(),
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
             inbound_dropped_low_trust: self.inbound_dropped_low_trust(),
+            blob_serve_legacy_dag_walks: self.blob_serve_legacy_dag_walks(),
             replication_round_outcomes_total: self.replication_round_outcomes_total.read().clone(),
             replication_inbound_backpressure_drops: self.inbound_backpressure_drops(),
             replication_inbound_backpressure_drops_by_role: self
@@ -1864,6 +1887,8 @@ pub struct EdgeMetricsBundle {
     pub blob_route_refusals: HashMap<String, u64>,
     /// CIRISEdge#640 — `BlobChunkFetch`es received and not served, by branch.
     pub blob_serve_refusals: HashMap<String, u64>,
+    /// CIRISEdge#771 — chunk serves answered by the legacy DAG stream walk.
+    pub blob_serve_legacy_dag_walks: u64,
     /// CIRISEdge#718 — which link each scoped body rode (`send:*`) and
     /// identity-link admissions (`serve:identity_link_admitted`).
     pub blob_scoped_carriers: HashMap<String, u64>,

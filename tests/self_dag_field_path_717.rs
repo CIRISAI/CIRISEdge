@@ -407,6 +407,12 @@ impl ciris_edge::blob_swarm::BlobChunkSource for RowScopedSource {
     fn answers_scope(&self) -> bool {
         true
     }
+
+    // CIRISEdge#771 — a wrapper forwards the Edge's metrics bag to the
+    // source it wraps, or the legacy-walk counter never reaches it.
+    fn attach_metrics(&self, metrics: ciris_edge::observability::EdgeMetrics) {
+        self.inner.attach_metrics(metrics);
+    }
 }
 
 struct Member {
@@ -925,6 +931,12 @@ async fn chunk_membership_is_the_named_dags(
         withheld(),
         before + 1,
         "the refusal is booked chunk_not_in_named_dag on A"
+    );
+    assert_eq!(
+        a.edge.metrics().blob_serve_legacy_dag_walks(),
+        0,
+        "A's serve door judged the linked X by persist's link alone — no legacy walk, counted \
+         in the bag EdgeBuilder::build attached through the wrapper (CIRISEdge#771)"
     );
 
     // The controls.
@@ -1536,8 +1548,10 @@ async fn unlinked_withdrawn_dag_is_refused_by_the_register_771(b: &Member, owner
         .is_empty());
 
     let register = Arc::new(RevocationRegister::default());
-    let armed =
-        PersistBlobChunkSource::new(engine_b.clone()).with_revocations(Some(Arc::clone(&register)));
+    let walks = ciris_edge::observability::EdgeMetrics::new();
+    let armed = PersistBlobChunkSource::new(engine_b.clone())
+        .with_revocations(Some(Arc::clone(&register)))
+        .with_metrics(Some(walks.clone()));
     for row in [&w.row, &w_crossed] {
         let _ = apply_observation(
             &register,
@@ -1554,6 +1568,13 @@ async fn unlinked_withdrawn_dag_is_refused_by_the_register_771(b: &Member, owner
             "control: W's chunk {seq} is served while W is live, with no link (legacy reading)"
         );
     }
+    assert_eq!(
+        walks.blob_serve_legacy_dag_walks(),
+        w_chunks.len() as u64,
+        "each of W's chunks was served THROUGH the legacy walk, and each is counted \
+         (CIRISEdge#771)"
+    );
+    whole_blob_never_reaches_the_walk_771(b, owner, w_chunks[0].1).await;
     for row in [&w_crossed, &w.row] {
         let withdraws = ciris_edge::files::withdraw(&*b.node.dir, row, "CC 2.3", ts(), signers)
             .await
@@ -1739,10 +1760,100 @@ async fn a_forged_pointer_widens_no_dag_771(
         })
         .await
         .expect("A admits a second row referencing X, its pointer naming Y's stream");
-    let door = PersistBlobChunkSource::new(a.node.store.engine().clone());
+    assert!(
+        !a.node
+            .store
+            .engine()
+            .chunks_of_manifest(&x)
+            .await
+            .expect("chunks_of_manifest")
+            .is_empty(),
+        "precondition: persist relates X on A (A sealed it)"
+    );
+    let metrics = ciris_edge::observability::EdgeMetrics::new();
+    let door = PersistBlobChunkSource::new(a.node.store.engine().clone())
+        .with_metrics(Some(metrics.clone()));
     let answer = shape(&door.read_chunk(x, y_chunk, "a-peer-asking-771").await);
     assert_eq!(
         answer, "ChunkNotInNamedDag",
         "a row's stream_id does not make Y's chunk one of X's (CIRISEdge#771, persist I485)"
+    );
+    assert_eq!(
+        metrics.blob_serve_legacy_dag_walks(),
+        0,
+        "a LINKED DAG refuses a chunk it does not hold with no legacy walk performed: \
+         'not a member' is not 'not linked' (CIRISEdge#771)"
+    );
+}
+
+/// **CIRISEdge#771 — a whole blob never reaches the legacy walk.** Persist's
+/// `chunks_of_manifest` answers empty for a WHOLE blob as for an unrelated
+/// DAG (CIRISPersist#994's caveat), so the fallback keys on the head being a
+/// `chunk_dag` as well. A request naming B's whole sealed file as the DAG and
+/// some other chunk is refused `ChunkNotInNamedDag` with no walk performed.
+async fn whole_blob_never_reaches_the_walk_771(b: &Member, owner: &Ident, other_chunk: [u8; 32]) {
+    use ciris_edge::blob_swarm::{BlobChunkSource as _, PersistBlobChunkSource};
+    let person = person_signer(owner);
+    let small = ciris_edge::files::publish(
+        &*b.node.dir,
+        &b.node.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &b.node.signer,
+            actor: Some(&person),
+        },
+        &ciris_edge::files::FileWrite {
+            room: &ciris_edge::self_room::room(&owner.key_id),
+            bytes: &content(64 * 1024, 0x0774),
+            media_type: "image/png",
+            codec: None,
+            filename: Some("whole.png"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("publish a whole file");
+    let whole = sha_of(&small.pointer);
+    let head = b
+        .node
+        .dir
+        .blob_head(&whole)
+        .await
+        .expect("blob_head")
+        .expect("B holds it");
+    assert_ne!(
+        head.storage_kind, "chunk_dag",
+        "precondition: a whole blob, not a DAG"
+    );
+    assert!(
+        b.node
+            .store
+            .engine()
+            .chunks_of_manifest(&whole)
+            .await
+            .expect("chunks_of_manifest")
+            .is_empty(),
+        "precondition: persist answers empty for a whole blob, as for an unrelated DAG"
+    );
+    let walks = ciris_edge::observability::EdgeMetrics::new();
+    let door = PersistBlobChunkSource::new(b.node.store.engine().clone())
+        .with_metrics(Some(walks.clone()));
+    assert_eq!(
+        shape(
+            &door
+                .read_chunk(whole, other_chunk, "a-peer-asking-771")
+                .await
+        ),
+        "ChunkNotInNamedDag",
+        "a whole blob has no chunks to be a member of"
+    );
+    assert_eq!(
+        walks.blob_serve_legacy_dag_walks(),
+        0,
+        "a whole blob never reaches the legacy walk (CIRISEdge#771, CIRISPersist#994 caveat)"
+    );
+    assert_eq!(
+        shape(&door.read_chunk(whole, whole, "a-peer-asking-771").await),
+        "bytes",
+        "control: the whole blob itself is served"
     );
 }

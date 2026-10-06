@@ -38,7 +38,8 @@
 //! cohabitation-only capability, which matters precisely because the
 //! Pi/iOS hosts that run sovereign are the ones that hit disk pressure.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{serve_result_to_chunk, BlobChunkSource, ChunkSourceRefusal, ContentScope};
 
@@ -66,7 +67,19 @@ pub struct PersistBlobChunkSource {
     /// been evicted. Production wires it on every source
     /// (`replication::runtime`, `edge_node`).
     revocations: Option<Arc<super::RevocationRegister>>,
+    /// CIRISEdge#771 — where the legacy DAG walk is counted
+    /// (`blob_serve_legacy_dag_walks`). Attached by [`crate::EdgeBuilder::build`]
+    /// through [`BlobChunkSource::attach_metrics`], or given with
+    /// [`with_metrics`](Self::with_metrics); the first one set wins.
+    metrics: OnceLock<crate::observability::EdgeMetrics>,
+    /// CIRISEdge#771 — manifests already named at INFO as served through the
+    /// legacy walk (once per manifest, bounded by [`LEGACY_LOGGED_CAP`]).
+    legacy_logged: Mutex<HashSet<[u8; 32]>>,
 }
+
+/// CIRISEdge#771 — how many distinct manifests the legacy-walk INFO line
+/// names before it stops naming new ones. The counter keeps counting past it.
+pub const LEGACY_LOGGED_CAP: usize = 4_096;
 
 impl std::fmt::Debug for PersistBlobChunkSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,6 +98,8 @@ impl PersistBlobChunkSource {
         Self {
             engine,
             revocations: None,
+            metrics: OnceLock::new(),
+            legacy_logged: Mutex::new(HashSet::new()),
         }
     }
 
@@ -93,6 +108,17 @@ impl PersistBlobChunkSource {
     #[must_use]
     pub fn with_revocations(mut self, register: Option<Arc<super::RevocationRegister>>) -> Self {
         self.revocations = register;
+        self
+    }
+
+    /// CIRISEdge#771 — count legacy DAG walks into `metrics`, for a source
+    /// that is not handed to an [`crate::EdgeBuilder`] (which attaches its own
+    /// bag). `None` leaves the source as it is.
+    #[must_use]
+    pub fn with_metrics(self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
+        if let Some(m) = metrics {
+            let _ = self.metrics.set(m);
+        }
         self
     }
 
@@ -131,9 +157,17 @@ impl PersistBlobChunkSource {
     /// 4. **Legacy, a sealed DAG with no link** (sealed or pulled before
     ///    persist v53.1.0 and never promoted again): the pre-#771 reading —
     ///    the stream a referencing row names, counted only where the stream's
-    ///    own row (V143) agrees with the row's cohort and community. Uncached,
-    ///    so its O(chunks) listing is paid per chunk; it serves only such
-    ///    DAGs, and goes when persist backfills their link.
+    ///    own row (V143) agrees with the row's cohort and community. Reached
+    ///    ONLY when persist holds no relation for the manifest at all
+    ///    (`chunks_of_manifest` empty) AND the head is a `chunk_dag` — never
+    ///    because a linked DAG lacks the chunk (that is step 2's refusal), and
+    ///    never for a whole blob, which also answers empty. Uncached, so its
+    ///    O(chunks) listing is paid per chunk; counted in
+    ///    `blob_serve_legacy_dag_walks` and named at INFO once per manifest.
+    ///    **Sunset:** CIRISPersist#994 backfills the relation (a boot/lazy
+    ///    sweep under the re-promote predicate). A manifest this node cannot
+    ///    open stays unrelated after #994, so the walk stays for those until
+    ///    the counter reads zero across the fleet.
     ///
     /// Anything unreadable reads as "not a member": this is a refusal gate,
     /// and it fails closed. A `Withdrawn` from ANY of these reads is the
@@ -187,6 +221,14 @@ impl PersistBlobChunkSource {
                 return DagMembership::NotMember;
             }
         }
+        // No relation for this manifest. Persist's contract (CIRISPersist#994):
+        // an empty list means "no relation", and a WHOLE blob answers empty
+        // too — so only a `chunk_dag` head goes on. A whole blob named as a
+        // DAG has no chunks to be a member of, and never reaches the walk.
+        match self.blob_head_kind(&dag).await {
+            Some(kind) if kind == "chunk_dag" => {}
+            _ => return DagMembership::NotMember,
+        }
         match self.engine.serve_blob_to_peer(&dag, requester).await {
             Ok(BlobBody::ChunkDag(manifest)) => {
                 return if manifest.chunks.iter().any(|c| c.sha == chunk) {
@@ -197,11 +239,60 @@ impl PersistBlobChunkSource {
             }
             // persist v53.1 (#979): the manifest itself is refused Withdrawn.
             Err(BlobError::Withdrawn { .. }) => return DagMembership::Withdrawn,
-            // A sealed root is an inline envelope: the legacy reading below.
+            // A sealed `chunk_dag` root serves as its inline envelope: the
+            // legacy reading below.
             Ok(BlobBody::Inline(_)) => {}
             _ => return DagMembership::NotMember,
         }
-        self.legacy_stream_membership(dag, chunk).await
+        let answer = self.legacy_stream_membership(dag, chunk).await;
+        self.note_legacy_walk(&dag, answer);
+        answer
+    }
+
+    /// The head's `storage_kind`, or `None` when nothing is held (or the head
+    /// cannot be read: fail-closed, no walk).
+    #[allow(unreachable_patterns)] // the wildcard is live only when persist builds without `postgres`
+    async fn blob_head_kind(&self, sha: &[u8; 32]) -> Option<String> {
+        use ciris_persist::federation::BlobStorage as _;
+        let head = match self.engine.backend() {
+            ciris_persist::BackendDispatch::Sqlite(b) => b.blob_head(sha).await,
+            #[cfg(feature = "pyo3")]
+            ciris_persist::BackendDispatch::Postgres(b) => b.blob_head(sha).await,
+            _ => return None,
+        };
+        match head {
+            Ok(head) => head.map(|h| h.storage_kind),
+            Err(e) => {
+                tracing::warn!(
+                    blob = %hex::encode(sha),
+                    error = %e,
+                    "PersistBlobChunkSource: the named DAG's head could not be read — not a \
+                     member (fail-closed, CIRISEdge#771)"
+                );
+                None
+            }
+        }
+    }
+
+    /// CIRISEdge#771 — count one legacy walk, and name its manifest at INFO
+    /// the first time, so the fallback's sunset is measured, not guessed.
+    fn note_legacy_walk(&self, dag: &[u8; 32], answer: DagMembership) {
+        if let Some(m) = self.metrics.get() {
+            m.inc_blob_serve_legacy_dag_walk();
+        }
+        let first = self
+            .legacy_logged
+            .lock()
+            .is_ok_and(|mut seen| seen.len() < LEGACY_LOGGED_CAP && seen.insert(*dag));
+        if first {
+            tracing::info!(
+                blob = %hex::encode(dag),
+                answer = ?answer,
+                "PersistBlobChunkSource: a sealed chunk_dag with no chunk→manifest link — \
+                 membership read by the legacy stream walk until persist relates it \
+                 (CIRISEdge#771, CIRISPersist#994); counted in blob_serve_legacy_dag_walks"
+            );
+        }
     }
 
     /// CIRISEdge#717's reading, kept for a sealed DAG persist has not linked
@@ -415,5 +506,10 @@ impl BlobChunkSource for PersistBlobChunkSource {
     /// withholding every scoped fetch at runtime.
     async fn chunk_scope(&self, _blob_sha256: [u8; 32]) -> Option<ContentScope> {
         None
+    }
+
+    /// CIRISEdge#771 — the Edge's metrics bag, for the legacy-walk counter.
+    fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        let _ = self.metrics.set(metrics);
     }
 }
