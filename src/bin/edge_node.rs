@@ -43,23 +43,29 @@
 //!
 //! # What is a SEAM (stubbed, and named)
 //!
-//! Two things the harness cannot reach today, each behind a narrow
-//! trait so the real API drops in as a second impl without touching the
-//! measurement or the reporting. Both are APIs being built concurrently
-//! (`av_spine`, scope-native blob fetch):
+//! - [`MediaLink`] — how a sealed chunk crosses the wire. Since
+//!   CIRISEdge#805 item 4 the impl ([`AvPlaneMediaLink`]) rides the
+//!   transport's **A/V plane**: one link per member, dialled to the
+//!   member's derived address in the call's `av-stream:` group
+//!   (`ReticulumTransport::open_av_link`), carrying each chunk as ONE
+//!   link-Channel message (`LeviculumAvSender` — sequenced and
+//!   retransmitted by the Channel, sized against the link's Channel limit,
+//!   a too-large chunk refused by name, CIRISEdge#720). The member reads
+//!   them from the transport's A/V sink (`take_av_arrivals`), on the SAME
+//!   node and event loop its replication runs on. It replaced
+//!   `TransportMediaLink`, which carried media on the Resource path through
+//!   `Transport::send`. The harness still seals with its own
+//!   community-derived keys ([`epoch_keys`]), not through `AvSession`: one
+//!   seal and one DEK are #805 items 1–2.
 //!
-//! - [`MediaLink`] — how a sealed chunk crosses the wire. Today's impl
-//!   ([`TransportMediaLink`]) uses `Transport::send`, the real RNS
-//!   resource path. `src/transport/av_spine.rs` (join→subscribe→relay→
-//!   heal) is the intended production driver; when it lands it becomes a
-//!   second `MediaLink` impl and nothing else here changes.
+//! The observers' refusal probe ([`observer_probe`]) keeps the federation
+//! send: an observer is not on the call, so it has no address in the
+//! call's group, and the probe's point is that it receives the ciphertext
+//! and cannot open it.
 //!
-//!   *Why the seam is needed at all*: `AvPublisher`/`AvRelay`/
-//!   `LeviculumAvSender`/`LinkDataPump` in `realtime_av_runtime.rs`
-//!   require an `Arc<ReticulumNode>`, and `ReticulumTransport::node()`
-//!   is `pub(crate)` + `#[cfg(feature = "pyo3")]`. A downstream consumer
-//!   holding a `ReticulumTransport` **cannot** reach the node, so it
-//!   cannot construct the real-RNS A/V sender. See the report.
+//! One thing the harness cannot reach today stays behind a narrow trait so
+//! the real API drops in as a second impl without touching the measurement
+//! or the reporting (scope-native blob fetch, being built concurrently):
 //!
 //! Blob fetch is scope-*gated* here but not yet scope-*native*:
 //! `src/blob_swarm/` is being extended concurrently. See [`BlobPlane`].
@@ -137,11 +143,17 @@ use ciris_edge::replication::convergence::ConvergenceWaiter;
 use ciris_edge::replication::protocol::EnvelopeKind;
 use ciris_edge::replication::ReplicationPeer;
 use ciris_edge::scope_addressing::{MemberAddress, ScopeAddressTable, ScopePrivacyDeriver};
-use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink, TransitionOutcome};
+use ciris_edge::scope_lifecycle::{
+    ScopeGroupSnapshot, ScopeLifecycle, ScopedDestinationSink, TransitionOutcome,
+};
 use ciris_edge::transport::realtime_av::{
     open_av_chunk, seal_av_inner, seal_av_outer, ChunkLayer, ChunkSeq, Epoch, EpochDek,
     SealedAvChunk, StreamId, CODEC_OPAQUE,
 };
+use ciris_edge::transport::realtime_av_dispatcher::{
+    AvDispatcherError, AvLinkReceiver as _, AvLinkSender as _,
+};
+use ciris_edge::transport::realtime_av_runtime::LeviculumAvSender;
 use ciris_edge::transport::reticulum::{
     ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
 };
@@ -1393,6 +1405,7 @@ fn spawn_inbound(
     let (tx, mut rx) = mpsc::channel::<InboundFrame>(4096);
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let (med_tx, med_rx) = mpsc::unbounded_channel();
+    let av_med_tx = med_tx.clone();
     let (blb_tx, blb_rx) = mpsc::unbounded_channel();
 
     let t = Arc::clone(transport);
@@ -1441,6 +1454,34 @@ fn spawn_inbound(
             }
         }
     });
+
+    // CIRISEdge#805 — media rides the transport's A/V plane: each call link
+    // the publisher opens to this node arrives here (attributed through the
+    // #393 gate), and its frames feed the SAME media mailbox the receive loop
+    // reads. Nothing from an A/V link ever reaches the listener above.
+    if let Some(mut arrivals) = transport.take_av_arrivals() {
+        tokio::spawn(async move {
+            while let Some(arrival) = arrivals.recv().await {
+                let med_tx = av_med_tx.clone();
+                let peer = arrival.peer.as_str().to_owned();
+                tracing::info!(peer = %peer, "A/V call link arrived (CIRISEdge#805)");
+                tokio::spawn(async move {
+                    while let Ok(bytes) = arrival.inbound.recv().await {
+                        if let Some((KIND_MEDIA, header, payload)) = decode_frame(&bytes) {
+                            let _ = med_tx.send((Some(peer.clone()), header, payload.to_vec()));
+                        } else {
+                            tracing::debug!(
+                                peer = %peer,
+                                bytes = bytes.len(),
+                                "non-media frame on an A/V call link — skipped"
+                            );
+                        }
+                    }
+                    tracing::debug!(peer = %peer, "A/V call link closed");
+                });
+            }
+        });
+    }
 
     Arc::new(Mailbox {
         control: Mutex::new(ctl_rx),
@@ -1557,23 +1598,13 @@ async fn send_control(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// The two in-flight seams
+// The media link and the remaining in-flight seam
 // ═══════════════════════════════════════════════════════════════════
 
-/// **SEAM 1 — how a sealed A/V chunk crosses the wire.**
+/// **How a sealed A/V chunk crosses the wire.**
 ///
-/// `src/transport/av_spine.rs` (join→subscribe→relay→heal) is being
-/// built concurrently and is the intended production driver. It cannot
-/// be used from here today for a structural reason worth recording:
-/// `AvPublisher` / `AvRelay` / `LeviculumAvSender` / `LinkDataPump` all
-/// need an `Arc<ReticulumNode>`, and `ReticulumTransport::node()` is
-/// `pub(crate)` + `#[cfg(feature = "pyo3")]` — a downstream consumer
-/// holding a `ReticulumTransport` cannot reach the node, and a second
-/// node would need the event receiver the transport's listener already
-/// owns.
-///
-/// So the harness drives the wire through the verb it *can* reach, and
-/// keeps it behind this trait so the spine slots in as a second impl.
+/// Kept as a trait so the measurement and the reporting do not name the
+/// mechanism; [`AvPlaneMediaLink`] is the one impl (CIRISEdge#805 item 4).
 #[async_trait::async_trait]
 trait MediaLink: Send + Sync {
     /// Name of the mechanism actually used, for the JSON output.
@@ -1587,15 +1618,57 @@ trait MediaLink: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// Today's `MediaLink`: the real RNS resource path.
-struct TransportMediaLink {
+/// The A/V plane on the live node (CIRISEdge#805 item 4): one Channel-path
+/// link per call member, opened with [`ReticulumTransport::open_av_link`].
+struct AvPlaneMediaLink {
     transport: Arc<ReticulumTransport>,
+    links: Mutex<BTreeMap<String, Arc<LeviculumAvSender>>>,
+    /// CIRISEdge#720 — chunks refused because they exceed the link's
+    /// Channel limit. Reported; never folded into a generic failure.
+    refused_too_large: std::sync::atomic::AtomicUsize,
+    /// Backpressure refusals (#591): the chunk was dropped for that member,
+    /// never queued.
+    congested: std::sync::atomic::AtomicUsize,
+}
+
+impl AvPlaneMediaLink {
+    fn new(transport: Arc<ReticulumTransport>) -> Self {
+        Self {
+            transport,
+            links: Mutex::new(BTreeMap::new()),
+            refused_too_large: std::sync::atomic::AtomicUsize::new(0),
+            congested: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Dial `member`'s address in the call's group. The member installs the
+    /// call's addresses before it says `Ready`, so a member that is Ready is
+    /// listening.
+    async fn open(&self, member: &str, address: &MemberAddress) -> Result<(), String> {
+        let link = self
+            .transport
+            .open_av_link(member, address)
+            .await
+            .map_err(|e| format!("open_av_link to {member}: {e}"))?;
+        // The inbound half is unused: members send nothing back on the call
+        // link. Dropping it leaves frames on it counted, never routed.
+        drop(link.inbound);
+        self.links
+            .lock()
+            .await
+            .insert(member.to_owned(), Arc::new(link.sender));
+        Ok(())
+    }
+
+    async fn opened(&self) -> usize {
+        self.links.lock().await.len()
+    }
 }
 
 #[async_trait::async_trait]
-impl MediaLink for TransportMediaLink {
+impl MediaLink for AvPlaneMediaLink {
     fn mechanism(&self) -> &'static str {
-        "reticulum_transport_send"
+        "reticulum_av_plane_channel"
     }
     async fn deliver(
         &self,
@@ -1603,13 +1676,44 @@ impl MediaLink for TransportMediaLink {
         header: &serde_json::Value,
         chunk: &[u8],
     ) -> Result<(), String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The guard is released before the send's await (CIRISEdge#217).
+        let sender = self.links.lock().await.get(to).cloned();
+        let Some(sender) = sender else {
+            return Err(format!("no A/V link to {to} (its Ready has not arrived)"));
+        };
         let bytes = encode_frame(KIND_MEDIA, header, chunk);
-        self.transport
-            .send(to, &bytes)
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        match sender.send(&bytes).await {
+            Ok(()) => Ok(()),
+            Err(AvDispatcherError::ChunkTooLarge(refusal)) => {
+                self.refused_too_large.fetch_add(1, Relaxed);
+                Err(refusal.to_string())
+            }
+            Err(AvDispatcherError::Congested) => {
+                self.congested.fetch_add(1, Relaxed);
+                Err(AvDispatcherError::Congested.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
+}
+
+/// The observers' refusal probe: the identical ciphertext over the
+/// federation send (Resource path). An observer is not on the call, so it
+/// has no address in the call's group and no A/V link can reach it; the
+/// probe exists so its failure to OPEN the chunk is falsifiable.
+async fn observer_probe(
+    transport: &ReticulumTransport,
+    to: &str,
+    header: &serde_json::Value,
+    chunk: &[u8],
+) -> Result<(), String> {
+    let bytes = encode_frame(KIND_MEDIA, header, chunk);
+    transport
+        .send(to, &bytes)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2800,6 +2904,66 @@ impl Occurrence {
 
     fn group_id(&self) -> String {
         format!("cohort:{}", self.cfg.community_id)
+    }
+
+    /// The call's stream id: derived from the community, so every member
+    /// computes it without being told.
+    fn stream_id(&self) -> StreamId {
+        let mut b = [0u8; 32];
+        b.copy_from_slice(&Sha256::digest(self.cfg.community_id.as_bytes()));
+        StreamId(b)
+    }
+
+    /// CIRISEdge#805 — the CALL's address snapshot: the community's roster
+    /// and epoch, in the call's own `av-stream:` group, under a labelled
+    /// derivation of the community's destination secret (so the call's
+    /// addresses differ from the community's, as `av_addressing` requires).
+    /// A link dialled to one is on the transport's A/V plane.
+    async fn call_snapshot(&self, group: &CohortGroup) -> Result<ScopeGroupSnapshot, String> {
+        let mut snap = ciris_edge::cohort_addressing::snapshot(group)
+            .await
+            .map_err(|e| format!("cohort_addressing::snapshot: {e}"))?;
+        let stream = self.stream_id();
+        let mut info = Vec::with_capacity(64);
+        info.extend_from_slice(b"ciris-edge/bench-mesh/av-call-address/v1");
+        info.extend_from_slice(&stream.0);
+        info.extend_from_slice(&snap.epoch.to_be_bytes());
+        let derived = kdf::hkdf_sha256(&snap.destination_secret, b"bench-mesh-av-call", &info, 32)
+            .map_err(|e| format!("call address kdf: {e}"))?;
+        snap.destination_secret.copy_from_slice(&derived);
+        snap.group_id = ciris_edge::av_addressing::stream_group_id(stream);
+        Ok(snap)
+    }
+
+    /// Install the call's addresses (members do this before `Ready`).
+    async fn install_call_addresses(
+        &self,
+        group: &CohortGroup,
+    ) -> Result<TransitionOutcome, String> {
+        let snap = self.call_snapshot(group).await?;
+        self.lifecycle
+            .install(&self.cfg.scope, &snap)
+            .map_err(|e| format!("lifecycle.install (call): {e}"))
+    }
+
+    /// Advance them with the community's epoch.
+    async fn advance_call_addresses(
+        &self,
+        group: &CohortGroup,
+    ) -> Result<TransitionOutcome, String> {
+        let snap = self.call_snapshot(group).await?;
+        self.lifecycle
+            .advance(&self.cfg.scope, &snap, Instant::now())
+            .map_err(|e| format!("lifecycle.advance (call): {e}"))
+    }
+
+    /// `member`'s address in the call's group at the live epoch.
+    fn call_address(&self, member: &str) -> Option<MemberAddress> {
+        self.table.send_address(
+            &self.cfg.scope,
+            &ciris_edge::av_addressing::stream_group_id(self.stream_id()),
+            member,
+        )
     }
 }
 
@@ -4230,6 +4394,9 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
 
     // ── Scope addresses, through the documented two lines ────────────
     let installed = occ.install_addresses(&group).await?;
+    // CIRISEdge#805 — and the call's, so links to members land on the A/V
+    // plane.
+    occ.install_call_addresses(&group).await?;
     rep.ran(
         "scope.install",
         true,
@@ -4293,9 +4460,25 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
         .await;
     }
 
-    let link = TransportMediaLink {
-        transport: Arc::clone(&occ.transport),
-    };
+    // CIRISEdge#805 — one A/V-plane link per member, dialled now: every
+    // admitted member said Ready, i.e. it listens on its call address. A
+    // member whose link does not open is reported and its frames fail
+    // visibly; the run does not stop.
+    let link = AvPlaneMediaLink::new(Arc::clone(&occ.transport));
+    let mut av_open_failures: Vec<String> = Vec::new();
+    for m in &admitted {
+        let opened = match occ.call_address(m) {
+            Some(addr) => link.open(m, &addr).await,
+            None => Err(format!("no call address for {m} in the table")),
+        };
+        if let Err(e) = opened {
+            tracing::warn!(peer = %m, error = %e, "A/V link did not open (CIRISEdge#805)");
+            av_open_failures.push(e);
+        }
+    }
+    // A member admitted mid-stream gets its link when its Ready arrives.
+    let mut pending_av_open: Option<String> = None;
+    let mut delivery_failures = 0usize;
     let mut record = *group
         .record_secret()
         .await
@@ -4397,6 +4580,8 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 .await;
             }
             let advanced = occ.advance_addresses(&group).await?;
+            occ.advance_call_addresses(&group).await?;
+            pending_av_open.clone_from(&joiner);
             record = *group
                 .record_secret()
                 .await
@@ -4425,6 +4610,26 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
             rotation_stall += rotation_started.elapsed();
         }
 
+        // The late joiner's A/V link, once its Ready says it listens on its
+        // call address at the new epoch. Polled, never awaited: the stream
+        // does not wait for one member.
+        if let Some(j) = pending_av_open.clone() {
+            let ready = occ
+                .mailbox
+                .try_control_where(|c| matches!(c, Control::Ready { key_id, .. } if *key_id == j))
+                .await;
+            if ready.is_some() {
+                pending_av_open = None;
+                let opened = match occ.call_address(&j) {
+                    Some(addr) => link.open(&j, &addr).await,
+                    None => Err(format!("no call address for {j} in the table")),
+                };
+                if let Err(e) = opened {
+                    tracing::warn!(peer = %j, error = %e, "A/V link did not open (CIRISEdge#805)");
+                    av_open_failures.push(e);
+                }
+            }
+        }
         let plaintext = &units[seq % units.len()];
         let dek = EpochDek::from_bytes(dek_bytes);
         let inner = seal_av_inner(
@@ -4458,7 +4663,12 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
             });
             let t0 = Instant::now();
             let is_member = live.iter().any(|l| l == m);
-            match link.deliver(m, &header, &wire).await {
+            let delivered = if is_member {
+                link.deliver(m, &header, &wire).await
+            } else {
+                observer_probe(&occ.transport, m, &header, &wire).await
+            };
+            match delivered {
                 Ok(()) => {
                     // Only member deliveries are the fan-out being timed;
                     // observer sends exist for the refusal leg and would
@@ -4469,7 +4679,12 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(peer = %m, error = %e, "chunk delivery failed");
+                    // Per frame, so DEBUG (CIRISEdge#460): the count is in
+                    // `perf.publish_fanout`, split by cause.
+                    if is_member {
+                        delivery_failures += 1;
+                    }
+                    tracing::debug!(peer = %m, error = %e, "chunk delivery failed");
                 }
             }
         }
@@ -4505,6 +4720,14 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
             "fanout_bytes_per_s": bytes_per_s,
             "send_latency": latency_json(&mut send_lat),
             "link_mechanism": link.mechanism(),
+            // CIRISEdge#805/#720 — the A/V plane's own numbers.
+            "av_links_opened": link.opened().await,
+            "av_link_open_failures": av_open_failures,
+            "member_delivery_failures": delivery_failures,
+            "chunks_refused_too_large": link
+                .refused_too_large
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "chunks_congested": link.congested.load(std::sync::atomic::Ordering::Relaxed),
             "observers": cfg.observers.len(),
             "observer_frames_each": OBSERVER_FRAMES.min(cfg.frames),
             "observer_sends_excluded_from_throughput": true,
@@ -4975,6 +5198,11 @@ async fn handle_commit_control(
             if let Err(e) = occ.advance_addresses(group).await {
                 return CommitDisposition::Failed(format!("advance_addresses: {e}"));
             }
+            // CIRISEdge#805 — the call's addresses follow the epoch too. A
+            // live A/V link is keyed by its LinkId and survives the move.
+            if let Err(e) = occ.advance_call_addresses(group).await {
+                return CommitDisposition::Failed(format!("advance_call_addresses: {e}"));
+            }
             let secret = match group.record_secret().await {
                 Ok(s) => *s.as_bytes(),
                 Err(e) => return CommitDisposition::Failed(format!("record_secret: {e}")),
@@ -5204,6 +5432,9 @@ async fn run_subscriber(occ: Occurrence) -> Result<(), String> {
     // ── Addresses ────────────────────────────────────────────────────
     let installed = occ.install_addresses(&group).await?;
     let own_hash = *installed.own_address.as_bytes();
+    // CIRISEdge#805 — the call's addresses BEFORE `Ready`: the publisher
+    // dials this node's call address on Ready, so Ready means listening.
+    occ.install_call_addresses(&group).await?;
     rep.ran(
         "scope.install",
         true,
