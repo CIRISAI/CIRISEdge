@@ -129,8 +129,15 @@ pub async fn row_deficit(
 /// Every `known` entry handed to `deficit_over` is therefore the verdict its
 /// own fold would have reached, and no audience node is folded there.
 ///
+/// The audience is the other per-file read the pass repeated: persist's
+/// `content_audience` depends only on the row's `(cohort_scope, author,
+/// group)`, which every file in one room shares, and it was re-resolved for
+/// each of them (68 ms a file on the author's node at 1,024 files). It is
+/// resolved once per key per pass too.
+///
 /// One value per pass, never kept across passes: a report filed or
-/// replicated after a device's index was read is seen by the NEXT pass. Within
+/// replicated after a device's index was read, or a device claimed after an
+/// audience was resolved, is seen by the NEXT pass. Within
 /// a pass that is exact for this node's own filings too, because a pass
 /// visits each blob once and a filing only moves that blob's verdict, which
 /// the pass has already read. A read that fails is not cached: the file it
@@ -139,6 +146,12 @@ pub async fn row_deficit(
 pub struct PassCustody {
     by_device: HashMap<String, HashMap<String, Vec<CustodyAck>>>,
     folds: usize,
+    /// The audience of each `(cohort_scope, author, group)` the pass met:
+    /// persist's `content_audience` is a function of exactly those three, and
+    /// every file a person stores in one room shares them, so it is resolved
+    /// once per pass rather than once per file.
+    audiences: HashMap<(String, String, Option<String>), ContentAudience>,
+    audience_reads: usize,
 }
 
 impl PassCustody {
@@ -155,6 +168,34 @@ impl PassCustody {
     #[must_use]
     pub fn folds(&self) -> usize {
         self.folds
+    }
+
+    /// How many audiences this pass resolved from the directory: one per
+    /// distinct `(cohort_scope, author, group)` it met.
+    #[must_use]
+    pub fn audience_reads(&self) -> usize {
+        self.audience_reads
+    }
+
+    /// persist's `content_audience` for `row`, resolved once per pass per
+    /// `(cohort_scope, author, group)`. A failed read is not cached.
+    async fn audience_of_row(
+        &mut self,
+        directory: &dyn FederationDirectory,
+        row: &Attestation,
+    ) -> Result<ContentAudience, ciris_persist::federation::Error> {
+        let key = (
+            row.cohort_scope.clone(),
+            row.attesting_key_id.clone(),
+            group_of(row).map(str::to_owned),
+        );
+        if let Some(hit) = self.audiences.get(&key) {
+            return Ok(hit.clone());
+        }
+        let audience = content_audience(directory, &key.0, Some(&key.1), key.2.as_deref()).await?;
+        self.audience_reads += 1;
+        self.audiences.insert(key, audience.clone());
+        Ok(audience)
     }
 
     /// `device`'s custody reports, by blob, read once per pass.
@@ -213,7 +254,8 @@ impl PassCustody {
 
     /// **[`row_deficit`], inside a pass**: the same audience and the same
     /// deficit, with every audience node's verdict taken from this pass's
-    /// index instead of re-folded per file.
+    /// index instead of re-folded per file, and the audience itself resolved
+    /// once per `(cohort_scope, author, group)` for the pass.
     ///
     /// # Errors
     /// The directory read failed.
@@ -224,13 +266,7 @@ impl PassCustody {
         sha: &[u8; 32],
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<DurabilityDeficit, ciris_persist::federation::Error> {
-        let audience = content_audience(
-            directory,
-            &row.cohort_scope,
-            Some(&row.attesting_key_id),
-            group_of(row),
-        )
-        .await?;
+        let audience = self.audience_of_row(directory, row).await?;
         let sha_hex = hex::encode(sha);
         let mut known = BTreeMap::new();
         if let ContentAudience::Nodes(nodes) = &audience {

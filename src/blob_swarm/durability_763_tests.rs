@@ -1014,7 +1014,8 @@ async fn assert_pass_index_agrees(on: &Node, files: &[&Published], devices: &[&s
 /// v40.0.3 read F × D + F = 12: `row_deficit` handed persist's `deficit_over`
 /// an empty `known`, so every audience node was re-folded
 /// (`list_attestations_by(device)`) for every file, plus one more fold per
-/// file for A's own verdict. The decisions do not move: across states
+/// file for A's own verdict. The four files' shared audience is resolved once
+/// for the pass, not once per file. The decisions do not move: across states
 /// covering `here` (A, then B after a pull and its pass), `unknown` (B before
 /// any report) and a report the cohort never carried, the pass's deficits and
 /// verdicts equal persist's per-file fold on both nodes, and the passes still
@@ -1063,6 +1064,11 @@ async fn a_durability_pass_folds_each_audience_device_once_817() {
          not F x D + F = {}",
         files.len(),
         files.len() * audience + files.len()
+    );
+    assert_eq!(
+        puller_a.last_durability_audience_reads(),
+        1,
+        "four self files by one author share one audience, resolved once per pass"
     );
 
     // B: two of A's four reports carried, one file pulled, B's own pass.

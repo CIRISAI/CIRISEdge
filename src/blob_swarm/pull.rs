@@ -1269,6 +1269,9 @@ pub struct BlobPuller<B> {
     /// read ([`super::durability::PassCustody::folds`]): one per audience
     /// device it met, where it used to be one per device per file.
     last_pass_custody_folds: AtomicUsize,
+    /// CIRISEdge#817 — how many content audiences the LAST durability pass
+    /// resolved ([`super::durability::PassCustody::audience_reads`]).
+    last_pass_audience_reads: AtomicUsize,
 }
 
 /// CIRISEdge#646 — the `scope:source` label for `blob_pull_sources`. A
@@ -1349,6 +1352,7 @@ where
             dispatched: AtomicUsize::new(0),
             durability_resume: Mutex::new(None),
             last_pass_custody_folds: AtomicUsize::new(0),
+            last_pass_audience_reads: AtomicUsize::new(0),
         })
     }
 
@@ -1611,6 +1615,13 @@ where
         self.last_pass_custody_folds.load(Ordering::Relaxed)
     }
 
+    /// CIRISEdge#817 — how many content audiences the last
+    /// [`Self::durability_sweep`] resolved: one per `(scope, author, group)`.
+    #[must_use]
+    pub fn last_durability_audience_reads(&self) -> usize {
+        self.last_pass_audience_reads.load(Ordering::Relaxed)
+    }
+
     /// CIRISEdge#763 (CC 6.1.5.3) — **one durability pass** over the `self`
     /// and `family` files this node's persons can read: the self room of each
     /// principal behind this node, and every family that principal is an
@@ -1733,9 +1744,12 @@ where
         super::durability::rarest_first(&mut out.repairs);
         self.last_pass_custody_folds
             .store(custody.folds(), Ordering::Relaxed);
+        self.last_pass_audience_reads
+            .store(custody.audience_reads(), Ordering::Relaxed);
         tracing::info!(
             files = read,
             custody_folds = custody.folds(),
+            audience_reads = custody.audience_reads(),
             repairs = out.repairs.len(),
             reported_here = out.reported_here.len(),
             not_in_audience = out.not_in_audience,
