@@ -79,6 +79,16 @@ ignore = [
     "RUSTSEC-2024-0388",  # derivative unmaintained (via ciris-keyring TPM derive stack)
     "RUSTSEC-2024-0384",  # instant unmaintained (Phase 3 Reticulum may obsolete)
 
+    # 2026-10-07 — TEMPORARY, tracked on CIRISEdge#822 (decision: Eric).
+    # libcrux-kem 0.0.7 X-Wing / X25519-ML-KEM panics on short input, reached
+    # via openmls_libcrux_crypto 0.3.1 -> hpke-rs-libcrux 0.6.1 (an exact
+    # 0.0.x pin). Fixed only in libcrux-kem >= 0.0.10 (hpke-rs-libcrux 0.8.0);
+    # NO openmls_libcrux_crypto release uses it yet. Already shipped since
+    # v38.1.0, so ignoring changes no exposure; a panic unwinds the task, not
+    # the node. Remove when #822 lands the upgrade or the fork.
+    "RUSTSEC-2026-0330",  # libcrux-kem encapsulate_derand panic on short seed
+    "RUSTSEC-2026-0331",  # libcrux-kem hybrid public/private key decode panic on short input
+
     # rustls / webpki / DNS branch — transitive via ciris-verify-core's
     # verification stack. Persist's deny.toml documents the rationale;
     # edge inherits.
