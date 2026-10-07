@@ -1,5 +1,30 @@
 # CIRISEdge Release Notes
 
+# v40.0.8 — persist v53.1.8, and v40.0.7 actually ships
+
+**2026-10-07.** **PATCH** from v40.0.7, cut from the v40.0.7 tag (main carries v40.1.0). Verify
+v19.0.0 and leviculum v0.27.0+ciris.1 unchanged.
+Ladder triple: **edge v40.0.8 · persist v53.1.8 · verify v19.0.0**.
+
+**v40.0.7 has no release.** Its tag exists, but the tag run's `cargo deny` gate refused two new
+advisories (below) and published nothing. v40.0.8 carries all of v40.0.7: the #819 dial-pool reap
+and the #820 P0 telemetry. Read v40.0.7's section for those.
+
+**Persist v53.1.8.** The capacity emit gate asks the precheck's consent fold (CIRISPersist#1013),
+and persist's read and fold counters are always on, with an Engine telemetry snapshot (#1014). The
+tag's tree is identical to the commit edge's gates ran on. Persist's larger futures tripped
+`clippy::large_futures`, so the production call sites of `dispatch_inbound` and
+`resolve_serve_tier` now box them; test-only scopes carry a scoped allow. Persist #1017 will box
+inside persist.
+
+**Advisories ignored, temporarily (CIRISEdge#822).** RUSTSEC-2026-0330 and RUSTSEC-2026-0331:
+libcrux-kem 0.0.7 can panic on short input in X-Wing key handling. Edge reaches it through
+`openmls_libcrux_crypto` 0.3.1 → `hpke-rs-libcrux` 0.6.1, which pins libcrux-kem exactly. The fix
+(≥ 0.0.10) exists only in `hpke-rs-libcrux` 0.8.0, and no `openmls_libcrux_crypto` release uses it
+yet. The code has shipped since v38.1.0, so the ignore changes no exposure; edge builds with
+`panic = "unwind"`, so a malformed peer KeyPackage fails one task, not the node. #822 tracks the
+upgrade (or a fork onto 0.8) and hardening the decode path; the ignores come out when it lands.
+
 # v40.0.7 — the dial pools stop growing, and the node can be seen: P0 telemetry
 
 **2026-10-07.** **PATCH** from v40.0.6, cut from the v40.0.6 tag (main carries v40.1.0). Persist
