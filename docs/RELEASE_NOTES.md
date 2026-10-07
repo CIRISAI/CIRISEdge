@@ -1,5 +1,44 @@
 # CIRISEdge Release Notes
 
+# v40.0.6 — persist v53.1.7 and bounded per-peer reads: the canonical passes its capped acceptance
+
+**2026-10-07.** **PATCH** from v40.0.5, cut from the v40.0.5 tag (main carries v40.1.0). Verify
+v19.0.0 and leviculum v0.27.0+ciris.1 unchanged.
+Ladder triple: **edge v40.0.6 · persist v53.1.7 · verify v19.0.0**.
+
+| | v40.0.5 | v40.0.6 |
+|---|---|---|
+| ciris-persist (Cargo, both entries) | `tag = "v53.1.5"` | **`tag = "v53.1.7"`** |
+| ciris-persist (wheel floor) | `>=53.1.5,<54` | **`>=53.1.7,<54`** |
+
+**Why.** v40.0.5 still failed CIRISServer#741's capped acceptance: +1.7 GB in 16 s on the canonical's
+production copy while only rounds of EMPTY kinds were open. Each round toward a client peer reads the
+group plane, and on persist v53.1.5 `may_receive_group_plane` → `live_invitees_of` loaded every row
+of every member (the post-genesis `ciris-canonical` community includes canonical-1's 5,840-row
+history), per private group, per peer. Edge ran that read outside its sweep permit, behind owner
+and consent memos that weren't single-flight, so N concurrent rounds made N whole-history copies at
+once. The candidate of this exact code passed the bridge's 12-minute capped run (2 GiB,
+`--network none`, the live home with the genesis install at boot): max anon 439 MB at boot, a steady
+85–275 MB with no trend, no OOM, and the scorer ticking with no spike.
+
+**Persist v53.1.6 + v53.1.7:** bounded per-row reads (`live_invitees_of`,
+`live_delegation_granters`, `custody_acks_of`, the once-per-owner allow list, `nodes_owned_by` /
+`nodes_stewarded_by`), the five trust-root walks reading only what their predicates test
+(`trusted_roots_of`, `trust_root_valid`, the capability and transit walks, `owner_granted_scope`),
+and a V181 index so `list_attestations_referencing` seeks instead of full-scanning.
+
+**Edge (back-ported from CIRISEdge#818, items 1–2 of #817):**
+- the consent send-set and owner-of memos are single-flight: one refresh serves every concurrent
+  sweep, with TTLs unchanged and an invalidation dropping in-flight reads;
+- the advertise sweep permit now bounds the send-set read, the group-plane gate and recipient
+  resolution, so these copies are capped by `advertise_sweep_permits`.
+Witnesses fail with each fix reverted: 8 reads → 1 per expired memo; 11 reads in flight → 2 under
+two permits; plus a one-permit no-deadlock test.
+
+On the canonical-shape harness, a two-peer Attestation round went 716 s / 22.7 GB (v40.0.4) →
+110 s / 2.9 GB (v40.0.5) → ~10 s with persist 53.1.7. #818's per-Deliver trust memo, on main,
+brings it to 0.3 s.
+
 # v40.0.5 — the proactive push stops at its budget instead of fetching the whole plane
 
 **2026-10-06.** **PATCH** from v40.0.4, cut from the v40.0.4 tag (main carries v40.1.0). Persist
