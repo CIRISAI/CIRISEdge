@@ -419,7 +419,8 @@ async fn an_inbound_transfer_keeps_its_lane_from_the_reaper_819() {
             .first()
             .expect("one lane pooled");
     // Let the lane age to just under its bound, then start the transfer.
-    tokio::time::sleep(BOUND - Duration::from_millis(200)).await;
+    // 800 ms: 200 ms short of `BOUND`.
+    tokio::time::sleep(Duration::from_millis(800)).await;
     let body = vec![0x3cu8; 8 * 1024 * 1024 - 4096];
     let len = body.len();
     let a = Arc::clone(&p.a);
