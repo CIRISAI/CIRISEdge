@@ -512,3 +512,251 @@ fn edge_peer_trust_variants_align_with_persist_trust_class_wire_strings() {
         assert_eq!(persist_variant.as_wire_str(), persist_wire);
     }
 }
+
+// ---------------------------------------------------------------------------
+// CIRISEdge#809 (back-ported to v40.0.x) — the Edge's metrics bag is the
+// transport's; and the P0 telemetry parity of the UniFFI snapshot.
+// ---------------------------------------------------------------------------
+
+/// A transport that records the metrics bag the Edge attaches and counts the
+/// snapshot paths' refreshes — the shape `ReticulumTransport` has, without a
+/// Reticulum node.
+struct RecordingTransport {
+    attached: std::sync::Mutex<Option<ciris_edge::observability::EdgeMetrics>>,
+    refreshes: std::sync::atomic::AtomicUsize,
+}
+
+impl RecordingTransport {
+    fn new(bag: Option<ciris_edge::observability::EdgeMetrics>) -> Self {
+        Self {
+            attached: std::sync::Mutex::new(bag),
+            refreshes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Transport for RecordingTransport {
+    fn id(&self) -> TransportId {
+        TransportId::RETICULUM_RS
+    }
+    async fn send(
+        &self,
+        _destination_key_id: &str,
+        _envelope_bytes: &[u8],
+    ) -> Result<TransportSendOutcome, TransportError> {
+        Ok(TransportSendOutcome::Delivered)
+    }
+    async fn listen(&self, _sink: mpsc::Sender<InboundFrame>) -> Result<(), TransportError> {
+        Ok(())
+    }
+    fn attach_metrics(&self, metrics: ciris_edge::observability::EdgeMetrics) {
+        // First handle wins, as `ReticulumTransport`'s `OnceLock` does.
+        let mut slot = self.attached.lock().expect("attached");
+        if slot.is_none() {
+            *slot = Some(metrics);
+        }
+    }
+    fn attached_metrics(&self) -> Option<ciris_edge::observability::EdgeMetrics> {
+        self.attached.lock().expect("attached").clone()
+    }
+    fn refresh_metrics(&self) {
+        self.refreshes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn build_edge_with_transports(
+    tmp: &Path,
+    backend: Arc<SqliteBackend>,
+    transports: Vec<Arc<dyn Transport>>,
+) -> Result<Edge, ciris_edge::EdgeError> {
+    let me = FedKey::new("edge-self-metrics-809", 0x01);
+    let signer = me.local_signer(tmp).await;
+    let mut builder = Edge::builder()
+        .directory(backend.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+        .federation_directory(backend.clone() as Arc<dyn FederationDirectory>)
+        .queue(backend)
+        .signer(signer);
+    for t in transports {
+        builder = builder.transport(t);
+    }
+    builder
+        .config(EdgeConfig {
+            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            ..EdgeConfig::default()
+        })
+        .build()
+}
+
+/// The handle the Edge attaches IS the bag `Edge::metrics()` reads: one
+/// increment through the transport's copy is one in the Edge's snapshot. It
+/// is attached at BUILD, before any listener can exist, so every spawn site
+/// (`spawn_background_listeners`, `Edge::run`, a host calling `listen`
+/// itself) is covered. On v40.0.6 nothing attached, so the Reticulum
+/// transport's counters (#530 evictions, #627 links-before-binding) read zero
+/// in production.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_edge_attaches_its_metrics_to_every_transport_at_build_809() {
+    let _guard = ffi_test_lock().lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (backend, _existing) = fresh_backend().await;
+    let transport = Arc::new(RecordingTransport::new(None));
+    let edge = build_edge_with_transports(
+        tmp.path(),
+        backend,
+        vec![transport.clone() as Arc<dyn Transport>],
+    )
+    .await
+    .expect("build edge");
+
+    let through_transport = transport
+        .attached
+        .lock()
+        .expect("attached")
+        .clone()
+        .expect("the Edge attached its metrics at build, before any listener");
+    through_transport.inc_link_before_binding();
+    assert_eq!(
+        edge.metrics().snapshot().link_before_binding,
+        1,
+        "the transport's bag and the Edge's bag are one bag"
+    );
+}
+
+/// A transport a caller built WITH its own bag (`with_metrics(Some(..))` on
+/// `ReticulumTransport`) keeps counting into it; the Edge must read that same
+/// bag, not mint a second one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_edge_adopts_a_bag_the_transport_was_built_with_809() {
+    let _guard = ffi_test_lock().lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (backend, _existing) = fresh_backend().await;
+    let callers_bag = ciris_edge::observability::EdgeMetrics::new();
+    let transport = Arc::new(RecordingTransport::new(Some(callers_bag.clone())));
+    let edge = build_edge_with_transports(
+        tmp.path(),
+        backend,
+        vec![transport.clone() as Arc<dyn Transport>],
+    )
+    .await
+    .expect("build edge");
+    assert!(
+        edge.metrics().is_same_bag(&callers_bag),
+        "the Edge reads the bag its transport was built with"
+    );
+    callers_bag.inc_link_before_binding();
+    assert_eq!(edge.metrics().snapshot().link_before_binding, 1);
+}
+
+/// Two transports built with DIFFERENT bags cannot both be read through one
+/// `Edge::metrics()`: `build` refuses by name instead of returning an Edge
+/// that silently undercounts. One shared bag (plus a bag-less transport)
+/// builds fine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn build_refuses_transports_with_different_metrics_bags_809() {
+    let _guard = ffi_test_lock().lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mk = |bag: Option<ciris_edge::observability::EdgeMetrics>| -> Arc<dyn Transport> {
+        Arc::new(RecordingTransport::new(bag))
+    };
+    let split_dir = tmp.path().join("split");
+    std::fs::create_dir_all(&split_dir).expect("split dir");
+    let (backend, _existing) = fresh_backend().await;
+    let split = build_edge_with_transports(
+        &split_dir,
+        backend,
+        vec![
+            mk(Some(ciris_edge::observability::EdgeMetrics::new())),
+            mk(Some(ciris_edge::observability::EdgeMetrics::new())),
+        ],
+    )
+    .await;
+    match split {
+        Err(ciris_edge::EdgeError::Config(why)) => {
+            assert!(
+                why.contains("different metrics bags"),
+                "named refusal: {why}"
+            );
+        }
+        Err(other) => panic!("expected a Config refusal, got {other:?}"),
+        Ok(_) => panic!("two different bags must not build into one Edge"),
+    }
+    let shared = ciris_edge::observability::EdgeMetrics::new();
+    let shared_dir = tmp.path().join("shared");
+    std::fs::create_dir_all(&shared_dir).expect("shared dir");
+    let (backend, _existing) = fresh_backend().await;
+    let edge = build_edge_with_transports(
+        &shared_dir,
+        backend,
+        vec![mk(Some(shared.clone())), mk(None)],
+    )
+    .await
+    .expect("one shared bag (and a bag-less transport) builds");
+    assert!(edge.metrics().is_same_bag(&shared));
+}
+
+/// CIRISEdge P0 telemetry — PARITY: the UniFFI snapshot carries every
+/// `EdgeMetricsBundle` field (as a counter or gauge key), walked from
+/// `EDGE_METRICS_BUNDLE_FIELDS`, on a fresh Edge where nothing has been
+/// recorded; it refreshes the transports before reading; and `queue_depth`
+/// reports the bundle's durable figure instead of a hard-coded 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_uniffi_snapshot_projects_every_bundle_field_and_queue_depth_is_real() {
+    let _guard = ffi_test_lock().lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (backend, _existing) = fresh_backend().await;
+    let transport = Arc::new(RecordingTransport::new(None));
+    let edge = Arc::new(
+        build_edge_with_transports(
+            tmp.path(),
+            backend,
+            vec![transport.clone() as Arc<dyn Transport>],
+        )
+        .await
+        .expect("build edge"),
+    );
+    ciris_edge::ffi::uniffi_impl::install_edge_handle(&edge);
+
+    let snap = ciris_edge::ffi::uniffi_impl::metrics_snapshot().expect("snapshot");
+    let missing: Vec<&str> = ciris_edge::observability::EDGE_METRICS_BUNDLE_FIELDS
+        .iter()
+        .copied()
+        .filter(|f| !snap.counters.contains_key(*f) && !snap.gauges.contains_key(*f))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "UniFFI metrics_snapshot omits bundle fields: {missing:?}"
+    );
+    assert!(
+        transport
+            .refreshes
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1,
+        "the snapshot refreshes every transport before reading"
+    );
+    // The pre-existing keys stay (additive change).
+    for legacy in [
+        "reachability.attempts_total",
+        "reachability.successes_total",
+        "inbound.dropped_low_trust_total",
+    ] {
+        assert!(snap.counters.contains_key(legacy), "{legacy} kept");
+    }
+
+    edge.metrics()
+        .inc_durable_queue(ciris_edge::observability::DeliveryClass::Durable);
+    edge.metrics()
+        .inc_durable_queue(ciris_edge::observability::DeliveryClass::Durable);
+    let one = ciris_edge::ffi::uniffi_impl::queue_depth(Some("durable".to_string()))
+        .expect("queue_depth(durable)");
+    assert_eq!(one.get("durable").copied(), Some(2));
+    let all = ciris_edge::ffi::uniffi_impl::queue_depth(None).expect("queue_depth(all)");
+    assert_eq!(all.get("all").copied(), Some(2));
+    assert_eq!(all.get("durable").copied(), Some(2));
+    let snap = ciris_edge::ffi::uniffi_impl::metrics_snapshot().expect("snapshot");
+    assert_eq!(
+        snap.counters.get("durable_queue_depth.durable").copied(),
+        Some(2)
+    );
+}

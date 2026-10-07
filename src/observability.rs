@@ -853,6 +853,112 @@ pub const RECENT_WITHHOLDS_CAP: usize = 64;
 /// cheap. [`crate::Edge`] stores one and threads clones into
 /// `dispatch_inbound` / the durable dispatcher loop / transport listen
 /// loops.
+/// CIRISEdge P0 telemetry (CIRISServer `FSD/UNIFIED_TELEMETRY.md` §4) — the
+/// upper bounds, in seconds, of
+/// [`EdgeMetrics::replication_round_duration_seconds`]'s buckets. A final
+/// `+Inf` bucket is implicit. OTel/Prometheus metric name:
+/// [`REPLICATION_ROUND_DURATION_METRIC`].
+pub const REPLICATION_ROUND_DURATION_BUCKETS_SECONDS: &[f64] =
+    &[0.1, 0.5, 1.0, 5.0, 15.0, 60.0, 300.0];
+
+/// The exported name of the round-duration histogram (`_bucket` / `_count` /
+/// `_sum` series, label `kind`).
+pub const REPLICATION_ROUND_DURATION_METRIC: &str = "edge_replication_round_duration_seconds";
+
+/// CIRISEdge P0 telemetry — the upper bounds, in seconds, of
+/// [`EdgeMetrics::sweep_permit_wait_seconds`]'s buckets. A final `+Inf`
+/// bucket is implicit. Metric name: [`SWEEP_PERMIT_WAIT_METRIC`].
+pub const SWEEP_PERMIT_WAIT_BUCKETS_SECONDS: &[f64] = &[0.01, 0.1, 1.0, 5.0, 30.0];
+
+/// The exported name of the advertise-sweep permit-wait histogram.
+pub const SWEEP_PERMIT_WAIT_METRIC: &str = "edge_sweep_permit_wait_seconds";
+
+/// A fixed-bucket duration histogram: one counter per bucket plus a `+Inf`
+/// bucket, a count and an exact nanosecond sum. No histogram crate — the
+/// buckets are fixed at the call site's `const`, so recording is an index
+/// search over a handful of bounds and two additions.
+///
+/// The bounds are passed in rather than stored so `Default` (which
+/// [`EdgeMetrics`] derives) is the empty histogram; the counts grow to
+/// `bounds.len() + 1` on the first observation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FixedHistogram {
+    /// NON-cumulative per-bucket counts; the last entry is `+Inf`.
+    counts: Vec<u64>,
+    /// Exact sum of every observation, in nanoseconds (saturating).
+    sum_ns: u64,
+}
+
+impl FixedHistogram {
+    /// Record one observation of `d` against `bounds` (ascending seconds).
+    /// A value lands in the FIRST bucket whose bound is `>=` it (Prometheus
+    /// `le` semantics); one above every bound lands in `+Inf`.
+    pub fn observe(&mut self, bounds: &[f64], d: std::time::Duration) {
+        if self.counts.len() != bounds.len() + 1 {
+            self.counts.resize(bounds.len() + 1, 0);
+        }
+        let secs = d.as_secs_f64();
+        let idx = bounds
+            .iter()
+            .position(|b| secs <= *b)
+            .unwrap_or(bounds.len());
+        self.counts[idx] = self.counts[idx].saturating_add(1);
+        let ns = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.sum_ns = self.sum_ns.saturating_add(ns);
+    }
+
+    /// The point-in-time projection, with CUMULATIVE bucket counts as a
+    /// Prometheus/OTel exporter emits them.
+    #[must_use]
+    pub fn snapshot(&self, bounds: &'static [f64]) -> HistogramSnapshot {
+        let mut cumulative = Vec::with_capacity(bounds.len() + 1);
+        let mut running = 0u64;
+        for i in 0..=bounds.len() {
+            running = running.saturating_add(self.counts.get(i).copied().unwrap_or(0));
+            cumulative.push(running);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let sum_seconds = self.sum_ns as f64 / 1e9;
+        HistogramSnapshot {
+            bounds,
+            cumulative,
+            count: running,
+            sum_seconds,
+        }
+    }
+}
+
+/// Snapshot of one [`FixedHistogram`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramSnapshot {
+    /// The finite upper bounds, seconds, ascending.
+    pub bounds: &'static [f64],
+    /// CUMULATIVE count per bucket: `cumulative[i]` = observations `<=
+    /// bounds[i]`; the final entry (index `bounds.len()`) is `+Inf` and
+    /// equals [`Self::count`].
+    pub cumulative: Vec<u64>,
+    /// Number of observations (`_count`).
+    pub count: u64,
+    /// Sum of every observation in seconds (`_sum`).
+    pub sum_seconds: f64,
+}
+
+impl HistogramSnapshot {
+    /// `(le label, cumulative count)` for every bucket including `+Inf`,
+    /// as the bindings and an exporter render them (`"0.1"`, …, `"+Inf"`).
+    #[must_use]
+    pub fn buckets(&self) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = self
+            .bounds
+            .iter()
+            .zip(&self.cumulative)
+            .map(|(b, n)| (format!("{b}"), *n))
+            .collect();
+        out.push(("+Inf".to_string(), self.count));
+        out
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EdgeMetrics {
     /// Per-[`MessageType`] count of envelopes the local edge has
@@ -1189,6 +1295,19 @@ pub struct EdgeMetrics {
     /// idle. Keyed on the SAME [`EnvelopeKind`] the replication wire uses (one
     /// kind list, not two).
     pub replication_envelopes_served_total: Arc<RwLock<HashMap<EnvelopeKind, u64>>>,
+    /// CIRISEdge P0 telemetry — wall time of each anti-entropy round the
+    /// scheduler drives, per [`EnvelopeKind`], from the moment the round
+    /// holds its round-gate permit to its outcome (completed, refused, timed
+    /// out or errored — a round that failed slowly is the one to see).
+    /// Buckets: [`REPLICATION_ROUND_DURATION_BUCKETS_SECONDS`]. Cardinality
+    /// is bounded by the closed `EnvelopeKind` set.
+    pub replication_round_duration_seconds: Arc<RwLock<HashMap<EnvelopeKind, FixedHistogram>>>,
+    /// CIRISEdge P0 telemetry — how long a bulk advertise sweep waited for
+    /// its `SweepGate` permit (CIRISEdge#531's node-wide sweep bound), one
+    /// observation per BOUNDED acquire. A rising tail means sweeps are
+    /// queueing behind the bound — the shape the canonical's slow
+    /// diagnosis could not see. Buckets: [`SWEEP_PERMIT_WAIT_BUCKETS_SECONDS`].
+    pub sweep_permit_wait_seconds: Arc<RwLock<FixedHistogram>>,
 }
 
 /// A `&'static str`-keyed counter map, cloned out with owned keys for the
@@ -1205,6 +1324,15 @@ impl EdgeMetrics {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// CIRISEdge#809 — are `self` and `other` handles to the SAME bag
+    /// (clones share every `Arc`), as opposed to two bags with equal
+    /// counts? Used to detect a transport counting into a bag the Edge
+    /// does not read.
+    #[must_use]
+    pub fn is_same_bag(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.envelopes_sent_total, &other.envelopes_sent_total)
     }
 
     /// Increment the `envelopes_sent_total` counter for `mt`.
@@ -1666,6 +1794,24 @@ impl EdgeMetrics {
         guard.insert((peer_key_id.to_string(), medium.to_string()), ratio);
     }
 
+    /// CIRISEdge P0 telemetry — record one anti-entropy round's wall time
+    /// for `kind` into [`Self::replication_round_duration_seconds`].
+    pub fn observe_round_duration(&self, kind: EnvelopeKind, d: std::time::Duration) {
+        self.replication_round_duration_seconds
+            .write()
+            .entry(kind)
+            .or_default()
+            .observe(REPLICATION_ROUND_DURATION_BUCKETS_SECONDS, d);
+    }
+
+    /// CIRISEdge P0 telemetry — record one advertise-sweep permit wait into
+    /// [`Self::sweep_permit_wait_seconds`].
+    pub fn observe_sweep_permit_wait(&self, d: std::time::Duration) {
+        self.sweep_permit_wait_seconds
+            .write()
+            .observe(SWEEP_PERMIT_WAIT_BUCKETS_SECONDS, d);
+    }
+
     /// Snapshot all counters + gauges as plain `HashMap`s — the
     /// projection consumers (PyO3 / UniFFI / Prometheus exposition)
     /// render into their respective wire shapes. Each `HashMap` is a
@@ -1760,6 +1906,16 @@ impl EdgeMetrics {
             replication_applied_total: self.replication_applied_total.read().clone(),
             replication_duplicate_total: self.replication_duplicate_total.read().clone(),
             removal_delivery: self.removal_receipts.read().delta(),
+            replication_round_duration_seconds: self
+                .replication_round_duration_seconds
+                .read()
+                .iter()
+                .map(|(k, h)| (*k, h.snapshot(REPLICATION_ROUND_DURATION_BUCKETS_SECONDS)))
+                .collect(),
+            sweep_permit_wait_seconds: self
+                .sweep_permit_wait_seconds
+                .read()
+                .snapshot(SWEEP_PERMIT_WAIT_BUCKETS_SECONDS),
         }
     }
 }
@@ -1768,7 +1924,11 @@ impl EdgeMetrics {
 /// [`EdgeMetrics::snapshot`]; consumed by the PyO3 / UniFFI projection
 /// methods. Owned `HashMap`s — emitters can keep writing through the
 /// underlying `Arc<RwLock<_>>` while a consumer renders the bundle.
-#[derive(Debug, Clone, Default)]
+///
+/// A field added here MUST be added to [`EDGE_METRICS_BUNDLE_FIELDS`]'s
+/// macro list too (the build fails otherwise), and the binding parity tests
+/// then fail until BOTH the PyO3 and the UniFFI snapshot project it.
+#[derive(Debug, Clone)]
 pub struct EdgeMetricsBundle {
     pub envelopes_sent_total: HashMap<MessageType, u64>,
     pub envelopes_received_total: HashMap<MessageType, u64>,
@@ -1867,7 +2027,333 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#441 — the removal-delivery delta: per tracked removal row,
     /// offered/acked counts + peers still lacking a receipt.
     pub removal_delivery: Vec<RemovalRowDelta>,
+    /// CIRISEdge P0 telemetry — anti-entropy round wall time per kind
+    /// (exported as [`REPLICATION_ROUND_DURATION_METRIC`]).
+    pub replication_round_duration_seconds: HashMap<EnvelopeKind, HistogramSnapshot>,
+    /// CIRISEdge P0 telemetry — advertise-sweep permit wait (exported as
+    /// [`SWEEP_PERMIT_WAIT_METRIC`]).
+    pub sweep_permit_wait_seconds: HistogramSnapshot,
 }
+
+/// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
+/// string-keyed maps, the shape the UniFFI `EdgeMetricsSnapshot` carries
+/// (and any flat exporter can). Built by [`EdgeMetricsBundle::flatten`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FlatMetrics {
+    /// Counters and integer gauges.
+    pub counters: HashMap<String, u64>,
+    /// Real-valued gauges (ratios, histogram sums in seconds).
+    pub gauges: HashMap<String, f64>,
+}
+
+impl FlatMetrics {
+    /// A labelled `u64` family: `name` = the sum over labels (present even
+    /// when the family is empty, so the name is always projected), and
+    /// `name.<label>` = each entry.
+    fn family<'a, L: std::fmt::Display + 'a>(
+        &mut self,
+        name: &str,
+        entries: impl IntoIterator<Item = (L, &'a u64)>,
+    ) {
+        let mut total = 0u64;
+        for (label, v) in entries {
+            total = total.saturating_add(*v);
+            self.counters.insert(format!("{name}.{label}"), *v);
+        }
+        self.counters.insert(name.to_string(), total);
+    }
+
+    /// One histogram under `prefix`: `prefix.bucket.<le>` (cumulative),
+    /// `prefix.count`, and the gauge `prefix.sum` (seconds).
+    fn histogram(&mut self, prefix: &str, h: &HistogramSnapshot) {
+        for (le, n) in h.buckets() {
+            self.counters.insert(format!("{prefix}.bucket.{le}"), n);
+        }
+        self.counters.insert(format!("{prefix}.count"), h.count);
+        self.gauges.insert(format!("{prefix}.sum"), h.sum_seconds);
+    }
+}
+
+impl EdgeMetricsBundle {
+    /// CIRISEdge P0 telemetry — flatten every field into dotted keys. Each
+    /// field `f` of [`EDGE_METRICS_BUNDLE_FIELDS`] appears as the key `f`
+    /// (a scalar's value; a labelled family's total; a list's length; a
+    /// histogram's observation count) — present even when nothing was
+    /// recorded — and labelled detail as `f.<label>`. The UniFFI binding
+    /// projects exactly this, so it can never drop a field PyO3 carries.
+    ///
+    /// Shapes beyond `f.<label>`:
+    /// - `send_failures_total.<transport>:<class>`;
+    ///   `peer_reachability_ratio.<peer>:<medium>` is a GAUGE (the ratio),
+    ///   and the counter `peer_reachability_ratio` is the entry count.
+    /// - `blob_dag_phases.<phase>.total_ns` / `.samples`; the base key is
+    ///   the total sample count.
+    /// - `recent_withholds` is the attribution window's length (the
+    ///   per-reason counts are `withholds_by_reason`; the string detail is
+    ///   PyO3-only, a `u64` map cannot carry it).
+    /// - `removal_delivery` is the tracked row count, with
+    ///   `.offered_total` / `.acked_total` / `.unacked_peers_total`.
+    /// - `replication_round_duration_seconds.<kind>.bucket.<le>` /
+    ///   `.count` / gauge `.sum`; `sweep_permit_wait_seconds.bucket.<le>` /
+    ///   `.count` / gauge `.sum`.
+    // Straight-line field→key emission, one block per bundle field; its
+    // length grows with the bundle, not with branching.
+    #[allow(clippy::too_many_lines)]
+    #[must_use]
+    pub fn flatten(&self) -> FlatMetrics {
+        let mut f = FlatMetrics::default();
+        f.family(
+            "envelopes_sent_total",
+            self.envelopes_sent_total
+                .iter()
+                .map(|(k, v)| (format!("{k:?}"), v)),
+        );
+        f.family(
+            "envelopes_received_total",
+            self.envelopes_received_total
+                .iter()
+                .map(|(k, v)| (format!("{k:?}"), v)),
+        );
+        f.family(
+            "send_failures_total",
+            self.send_failures_total
+                .iter()
+                .map(|((t, c), v)| (format!("{}:{c}", t.0), v)),
+        );
+        f.family(
+            "verify_failures_total",
+            self.verify_failures_total
+                .iter()
+                .map(|(k, v)| (k.as_str(), v)),
+        );
+        f.family(
+            "durable_queue_depth",
+            self.durable_queue_depth
+                .iter()
+                .map(|(k, v)| (k.as_str(), v)),
+        );
+        f.family(
+            "transport_bytes_in_total",
+            self.transport_bytes_in_total.iter().map(|(k, v)| (k.0, v)),
+        );
+        f.family(
+            "transport_bytes_out_total",
+            self.transport_bytes_out_total.iter().map(|(k, v)| (k.0, v)),
+        );
+        for ((peer, medium), ratio) in &self.peer_reachability_ratio {
+            f.gauges
+                .insert(format!("peer_reachability_ratio.{peer}:{medium}"), *ratio);
+        }
+        f.counters.insert(
+            "peer_reachability_ratio".to_string(),
+            self.peer_reachability_ratio.len() as u64,
+        );
+        f.counters.insert(
+            "inbound_dropped_low_trust".to_string(),
+            self.inbound_dropped_low_trust,
+        );
+        f.family(
+            "replication_round_outcomes_total",
+            self.replication_round_outcomes_total
+                .iter()
+                .map(|(k, v)| (k.as_str(), v)),
+        );
+        f.counters.insert(
+            "replication_inbound_backpressure_drops".to_string(),
+            self.replication_inbound_backpressure_drops,
+        );
+        f.family(
+            "replication_inbound_backpressure_drops_by_role",
+            &self.replication_inbound_backpressure_drops_by_role,
+        );
+        f.family("blob_route_refusals", &self.blob_route_refusals);
+        f.family("blob_serve_refusals", &self.blob_serve_refusals);
+        f.family("blob_scoped_carriers", &self.blob_scoped_carriers);
+        f.family("blob_pull_sources", &self.blob_pull_sources);
+        f.family("blob_pull_refusals", &self.blob_pull_refusals);
+        let mut dag_samples = 0u64;
+        for (phase, (total_ns, samples)) in &self.blob_dag_phases {
+            dag_samples = dag_samples.saturating_add(*samples);
+            f.counters
+                .insert(format!("blob_dag_phases.{phase}.total_ns"), *total_ns);
+            f.counters
+                .insert(format!("blob_dag_phases.{phase}.samples"), *samples);
+        }
+        f.counters
+            .insert("blob_dag_phases".to_string(), dag_samples);
+        f.family("blob_dag_chunks", &self.blob_dag_chunks);
+        f.family("delivery_receipts", &self.delivery_receipts);
+        f.family("bootstrap_door_outcomes", &self.bootstrap_door_outcomes);
+        f.family("transport_inbound_drops", &self.transport_inbound_drops);
+        f.family("first_contact_outcomes", &self.first_contact_outcomes);
+        for (name, v) in [
+            (
+                "replication_routed_to_responder_total",
+                self.replication_routed_to_responder_total,
+            ),
+            (
+                "replication_routed_to_initiator_total",
+                self.replication_routed_to_initiator_total,
+            ),
+            (
+                "replication_reply_dropped_total",
+                self.replication_reply_dropped_total,
+            ),
+            ("announce_intake_evictions", self.announce_intake_evictions),
+            ("link_before_binding", self.link_before_binding),
+            (
+                "announce_queue_drop_first_seen",
+                self.announce_queue_drop_first_seen,
+            ),
+            (
+                "channel_first_skipped_over_cap",
+                self.channel_first_skipped_over_cap,
+            ),
+            (
+                "announce_to_binding_ms_last",
+                self.announce_to_binding_ms_last,
+            ),
+        ] {
+            f.counters.insert(name.to_string(), v);
+        }
+        f.family(
+            "withholds_by_reason",
+            self.withholds_by_reason
+                .iter()
+                .map(|(k, v)| (k.as_str(), v)),
+        );
+        f.counters.insert(
+            "recent_withholds".to_string(),
+            self.recent_withholds.len() as u64,
+        );
+        for (name, map) in [
+            (
+                "replication_envelopes_served_total",
+                &self.replication_envelopes_served_total,
+            ),
+            ("apply_refusals_by_kind", &self.apply_refusals_by_kind),
+            ("replication_applied_total", &self.replication_applied_total),
+            (
+                "replication_duplicate_total",
+                &self.replication_duplicate_total,
+            ),
+        ] {
+            f.family(name, map.iter().map(|(k, v)| (k.as_wire_str(), v)));
+        }
+        f.family(
+            "key_apply_refusals_by_reason",
+            &self.key_apply_refusals_by_reason,
+        );
+        f.family(
+            "attestation_apply_refusals_by_reason",
+            &self.attestation_apply_refusals_by_reason,
+        );
+        f.family("apply_refusals_by_class", &self.apply_refusals_by_class);
+        let (mut offered, mut acked, mut unacked) = (0u64, 0u64, 0u64);
+        for row in &self.removal_delivery {
+            offered = offered.saturating_add(row.offered as u64);
+            acked = acked.saturating_add(row.acked as u64);
+            unacked = unacked.saturating_add(row.unacked_peers.len() as u64);
+        }
+        f.counters.insert(
+            "removal_delivery".to_string(),
+            self.removal_delivery.len() as u64,
+        );
+        f.counters
+            .insert("removal_delivery.offered_total".to_string(), offered);
+        f.counters
+            .insert("removal_delivery.acked_total".to_string(), acked);
+        f.counters
+            .insert("removal_delivery.unacked_peers_total".to_string(), unacked);
+        let mut rounds = 0u64;
+        for (kind, h) in &self.replication_round_duration_seconds {
+            rounds = rounds.saturating_add(h.count);
+            f.histogram(
+                &format!("replication_round_duration_seconds.{}", kind.as_wire_str()),
+                h,
+            );
+        }
+        f.counters
+            .insert("replication_round_duration_seconds".to_string(), rounds);
+        f.histogram("sweep_permit_wait_seconds", &self.sweep_permit_wait_seconds);
+        f.counters.insert(
+            "sweep_permit_wait_seconds".to_string(),
+            self.sweep_permit_wait_seconds.count,
+        );
+        f
+    }
+}
+
+impl Default for EdgeMetricsBundle {
+    fn default() -> Self {
+        EdgeMetrics::new().snapshot()
+    }
+}
+
+/// Declares [`EDGE_METRICS_BUNDLE_FIELDS`] from one list AND destructures
+/// [`EdgeMetricsBundle`] exhaustively against the same list, so a field
+/// added to the bundle but not to the list is a compile error, never a
+/// silent omission from the binding parity tests.
+macro_rules! edge_metrics_bundle_fields {
+    ($($field:ident),* $(,)?) => {
+        /// Every [`EdgeMetricsBundle`] field name, in declaration order. Both
+        /// binding snapshots (PyO3 `metrics_snapshot()` dict keys; UniFFI
+        /// counter/gauge keys, as the name itself or a `name.` prefix) must
+        /// carry each one; the parity tests walk this list.
+        pub const EDGE_METRICS_BUNDLE_FIELDS: &[&str] = &[$(stringify!($field)),*];
+
+        #[allow(dead_code)]
+        fn edge_metrics_bundle_fields_are_exhaustive(bundle: &EdgeMetricsBundle) {
+            let EdgeMetricsBundle { $($field: _),* } = bundle;
+        }
+    };
+}
+
+edge_metrics_bundle_fields!(
+    envelopes_sent_total,
+    envelopes_received_total,
+    send_failures_total,
+    verify_failures_total,
+    durable_queue_depth,
+    transport_bytes_in_total,
+    transport_bytes_out_total,
+    peer_reachability_ratio,
+    inbound_dropped_low_trust,
+    replication_round_outcomes_total,
+    replication_inbound_backpressure_drops,
+    replication_inbound_backpressure_drops_by_role,
+    blob_route_refusals,
+    blob_serve_refusals,
+    blob_scoped_carriers,
+    blob_pull_sources,
+    blob_pull_refusals,
+    blob_dag_phases,
+    blob_dag_chunks,
+    delivery_receipts,
+    bootstrap_door_outcomes,
+    transport_inbound_drops,
+    first_contact_outcomes,
+    replication_routed_to_responder_total,
+    replication_routed_to_initiator_total,
+    replication_reply_dropped_total,
+    announce_intake_evictions,
+    link_before_binding,
+    announce_queue_drop_first_seen,
+    channel_first_skipped_over_cap,
+    announce_to_binding_ms_last,
+    withholds_by_reason,
+    recent_withholds,
+    replication_envelopes_served_total,
+    apply_refusals_by_kind,
+    key_apply_refusals_by_reason,
+    attestation_apply_refusals_by_reason,
+    apply_refusals_by_class,
+    replication_applied_total,
+    replication_duplicate_total,
+    removal_delivery,
+    replication_round_duration_seconds,
+    sweep_permit_wait_seconds,
+);
 
 #[cfg(test)]
 mod liveness_tests {
@@ -2169,5 +2655,132 @@ mod tests {
         let snap = m.snapshot();
         let v = snap.peer_reachability_ratio[&("peer-1".to_string(), "reticulum-rs".to_string())];
         assert!((v - 0.9).abs() < f64::EPSILON);
+    }
+}
+
+#[cfg(test)]
+mod p0_telemetry_tests {
+    //! CIRISEdge P0 telemetry (CIRISServer `FSD/UNIFIED_TELEMETRY.md` §4):
+    //! the two duration histograms and the flat projection's parity.
+    use super::{
+        EdgeMetrics, EdgeMetricsBundle, EDGE_METRICS_BUNDLE_FIELDS,
+        REPLICATION_ROUND_DURATION_BUCKETS_SECONDS, SWEEP_PERMIT_WAIT_BUCKETS_SECONDS,
+    };
+    use crate::replication::EnvelopeKind;
+    use std::time::Duration;
+
+    /// Known round durations land in the right `le` buckets (cumulative),
+    /// the count and the exact sum, per kind, and reach the snapshot.
+    #[test]
+    fn round_durations_land_in_their_buckets_per_kind() {
+        let m = EdgeMetrics::new();
+        // 0.05 → le 0.1; 0.1 (on the bound) → le 0.1; 3 → le 5;
+        // 301 → +Inf only.
+        for ms in [50, 100, 3_000, 301_000] {
+            m.observe_round_duration(EnvelopeKind::Attestation, Duration::from_millis(ms));
+        }
+        m.observe_round_duration(EnvelopeKind::Key, Duration::from_secs(20));
+        let snap = m.snapshot();
+        let att = &snap.replication_round_duration_seconds[&EnvelopeKind::Attestation];
+        assert_eq!(att.bounds, REPLICATION_ROUND_DURATION_BUCKETS_SECONDS);
+        // le:      0.1 0.5 1  5  15 60 300 +Inf
+        assert_eq!(att.cumulative, vec![2, 2, 2, 3, 3, 3, 3, 4]);
+        assert_eq!(att.count, 4);
+        assert!(
+            (att.sum_seconds - 304.15).abs() < 1e-9,
+            "{}",
+            att.sum_seconds
+        );
+        let key = &snap.replication_round_duration_seconds[&EnvelopeKind::Key];
+        assert_eq!(key.cumulative, vec![0, 0, 0, 0, 0, 1, 1, 1]);
+        assert_eq!(
+            key.buckets().last(),
+            Some(&("+Inf".to_string(), 1)),
+            "the +Inf bucket is the count"
+        );
+        assert!(
+            !snap
+                .replication_round_duration_seconds
+                .contains_key(&EnvelopeKind::Revocation),
+            "a kind with no rounds has no series"
+        );
+    }
+
+    /// Permit waits land in their buckets; an empty histogram snapshots as
+    /// all-zero buckets (present, not absent).
+    #[test]
+    fn sweep_permit_waits_land_in_their_buckets() {
+        let m = EdgeMetrics::new();
+        let empty = m.snapshot().sweep_permit_wait_seconds;
+        assert_eq!(empty.bounds, SWEEP_PERMIT_WAIT_BUCKETS_SECONDS);
+        assert_eq!(empty.cumulative, vec![0; 6]);
+        assert_eq!(empty.count, 0);
+        for ms in [0, 5, 20, 2_000, 60_000] {
+            m.observe_sweep_permit_wait(Duration::from_millis(ms));
+        }
+        let snap = m.snapshot().sweep_permit_wait_seconds;
+        // le:     0.01 0.1 1 5 30 +Inf
+        assert_eq!(snap.cumulative, vec![2, 3, 3, 4, 4, 5]);
+        assert_eq!(snap.count, 5);
+        assert!((snap.sum_seconds - 62.025).abs() < 1e-9);
+        let labels: Vec<String> = snap.buckets().into_iter().map(|(le, _)| le).collect();
+        assert_eq!(labels, ["0.01", "0.1", "1", "5", "30", "+Inf"]);
+    }
+
+    /// PARITY (the UniFFI side): every bundle field is a key of the flat
+    /// projection, on an EMPTY bundle — a field nothing has recorded into
+    /// is still projected, so "absent" can never be confused with "zero".
+    /// `EDGE_METRICS_BUNDLE_FIELDS` is tied to the struct at compile time.
+    #[test]
+    fn flatten_projects_every_bundle_field_even_when_empty() {
+        let flat = EdgeMetricsBundle::default().flatten();
+        let missing: Vec<&&str> = EDGE_METRICS_BUNDLE_FIELDS
+            .iter()
+            .filter(|f| !flat.counters.contains_key(**f) && !flat.gauges.contains_key(**f))
+            .collect();
+        assert!(missing.is_empty(), "flatten() omits: {missing:?}");
+    }
+
+    /// The flat projection carries labelled detail and totals.
+    #[test]
+    fn flatten_carries_labels_totals_and_histograms() {
+        let m = EdgeMetrics::new();
+        m.inc_durable_queue(super::DeliveryClass::Durable);
+        m.inc_durable_queue(super::DeliveryClass::Durable);
+        m.inc_link_before_binding();
+        m.observe_round_duration(EnvelopeKind::Attestation, Duration::from_millis(700));
+        m.observe_sweep_permit_wait(Duration::from_millis(50));
+        let flat = m.snapshot().flatten();
+        assert_eq!(flat.counters["durable_queue_depth"], 2);
+        assert_eq!(flat.counters["durable_queue_depth.durable"], 2);
+        assert_eq!(flat.counters["link_before_binding"], 1);
+        assert_eq!(flat.counters["replication_round_duration_seconds"], 1);
+        assert_eq!(
+            flat.counters["replication_round_duration_seconds.attestation.bucket.0.5"],
+            0
+        );
+        assert_eq!(
+            flat.counters["replication_round_duration_seconds.attestation.bucket.1"],
+            1
+        );
+        assert_eq!(
+            flat.counters["replication_round_duration_seconds.attestation.count"],
+            1
+        );
+        assert!(
+            (flat.gauges["replication_round_duration_seconds.attestation.sum"] - 0.7).abs() < 1e-9
+        );
+        assert_eq!(flat.counters["sweep_permit_wait_seconds"], 1);
+        assert_eq!(flat.counters["sweep_permit_wait_seconds.bucket.0.1"], 1);
+        assert_eq!(flat.counters["sweep_permit_wait_seconds.bucket.+Inf"], 1);
+    }
+
+    /// CIRISEdge#809 — clones are one bag; two `new()`s are two, even with
+    /// equal counts.
+    #[test]
+    fn is_same_bag_tells_a_clone_from_a_twin() {
+        let a = EdgeMetrics::new();
+        assert!(a.is_same_bag(&a.clone()));
+        assert!(!a.is_same_bag(&EdgeMetrics::new()));
     }
 }

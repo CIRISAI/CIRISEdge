@@ -902,6 +902,10 @@ struct SweepGate {
     /// to a test, and holding it across the drain is the exact starvation shape
     /// the width bound was built to avoid.
     entries: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge P0 telemetry — where a bounded acquire's wait is recorded
+    /// ([`EdgeMetrics::sweep_permit_wait_seconds`](crate::observability::EdgeMetrics::sweep_permit_wait_seconds)).
+    /// Installed by [`ReplicationBridge::with_metrics`]; `None` records nothing.
+    metrics: Option<crate::observability::EdgeMetrics>,
 }
 
 impl SweepGate {
@@ -930,6 +934,7 @@ impl SweepGate {
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             max_in_flight: std::sync::atomic::AtomicUsize::new(0),
             entries: std::sync::atomic::AtomicUsize::new(0),
+            metrics: None,
         }
     }
 
@@ -943,7 +948,18 @@ impl SweepGate {
     async fn enter(&self) -> SweepPermit<'_> {
         let permit = match self.sem.as_ref() {
             None => None,
-            Some(sem) => Arc::clone(sem).acquire_owned().await.ok(),
+            Some(sem) => {
+                // CIRISEdge P0 telemetry — the wait for a BOUNDED permit,
+                // recorded once per acquire at the one place every sweep
+                // entry point passes. The unbounded gate never waits, so it
+                // records nothing rather than a stream of zeros.
+                let waiting_since = std::time::Instant::now();
+                let permit = Arc::clone(sem).acquire_owned().await.ok();
+                if let Some(m) = self.metrics.as_ref() {
+                    m.observe_sweep_permit_wait(waiting_since.elapsed());
+                }
+                permit
+            }
         };
         let now = self
             .in_flight
@@ -2377,6 +2393,9 @@ impl FederationDirectoryReplicationBridge {
     /// `ReplicationRuntimeConfig`. `None` makes every increment a no-op.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
+        // CIRISEdge P0 telemetry — the sweep gate records its permit wait
+        // into the same bag.
+        self.sweep_gate.metrics.clone_from(&metrics);
         self.metrics = metrics;
         self
     }
@@ -23311,6 +23330,44 @@ mod sweep_width_tests {
             },
         );
         (backend, bridge)
+    }
+
+    /// CIRISEdge P0 telemetry — a BOUNDED acquire's wait is recorded into
+    /// the bag `ReplicationBridge::with_metrics` installed (the same one the
+    /// runtime hands the bridge), once per acquire, at the gate every sweep
+    /// entry point passes. An unbounded gate never waits and records nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bounded_permit_wait_is_recorded_in_the_bridge_metrics_p0() {
+        let m = crate::observability::EdgeMetrics::new();
+        let (_backend, bridge) = make_bridge_with_permits(1);
+        let bridge = Arc::new(bridge.with_metrics(Some(m.clone())));
+        let held = bridge.sweep_gate.enter().await;
+        let waiter = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move {
+                let _permit = bridge.sweep_gate.enter().await;
+            })
+        };
+        tokio::time::sleep(StdDuration::from_millis(60)).await;
+        drop(held);
+        waiter.await.expect("the waiting sweep got its permit");
+        let wait = m.snapshot().sweep_permit_wait_seconds;
+        assert_eq!(wait.count, 2, "both bounded acquires are observed");
+        assert_eq!(
+            wait.cumulative[0], 1,
+            "the uncontended acquire waited under 10 ms"
+        );
+        assert!(
+            wait.sum_seconds >= 0.05,
+            "the contended acquire waited for the held permit: {}",
+            wait.sum_seconds
+        );
+
+        let m0 = crate::observability::EdgeMetrics::new();
+        let (_backend0, unbounded) = make_bridge_with_permits(0);
+        let unbounded = unbounded.with_metrics(Some(m0.clone()));
+        let _permit = unbounded.sweep_gate.enter().await;
+        assert_eq!(m0.snapshot().sweep_permit_wait_seconds.count, 0);
     }
 
     /// The DEFAULT is what production runs — CIRISServer never constructs a
