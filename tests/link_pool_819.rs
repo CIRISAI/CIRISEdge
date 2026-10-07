@@ -89,7 +89,6 @@ where
 
 struct Pair {
     a_key: String,
-    #[allow(dead_code)]
     a: Arc<ReticulumTransport>,
     b: Arc<ReticulumTransport>,
     metrics_b: ciris_edge::EdgeMetrics,
@@ -321,6 +320,15 @@ async fn a_lane_handed_out_is_not_trimmed_before_its_sender_claims_it_819() {
     // A long bound: only the cap is under test.
     p.b.set_link_pool_policy(Duration::from_secs(600), 2);
     let dest = p.a_key.clone();
+    // The pool is per DESTINATION. A's first announce heals B's primed route
+    // to A's announced destination, and lanes dialed either side of that heal
+    // sit in two different pools; wait for it, so both lanes share one pool.
+    let named = p.a.local_named_dest_hash();
+    let healed = wait_for(Duration::from_secs(30), || async {
+        p.b.peer_dest_hash_for_test(&dest).await == Some(named)
+    })
+    .await;
+    assert!(healed, "B routes to A's announced destination");
     p.b.send(&dest, b"lane one").await.expect("send 1");
     recv_one(&mut p.rx_a, "A receives send 1").await;
     // Hold lane one busy so the second send dials lane two.
@@ -330,6 +338,11 @@ async fn a_lane_handed_out_is_not_trimmed_before_its_sender_claims_it_819() {
     p.b.hold_pooled_links_busy_for_test(false).await;
     let lanes = p.b.pooled_link_ids_for_test().await;
     assert_eq!(lanes.len(), 2, "two idle lanes pooled under a cap of 2");
+    assert_eq!(
+        p.b.peer_dest_hash_for_test(&dest).await,
+        Some(named),
+        "both lanes were dialed to the one destination"
+    );
 
     let taken =
         p.b.take_pooled_link_for_test(&dest)
