@@ -7189,10 +7189,19 @@ impl std::fmt::Debug for ScopedLinkLease {
 /// is `active` (a `Started`/`Progress` event: busy for the pool reaper) or has
 /// concluded (completion or failure: no longer busy). Either way the link was
 /// just used, so its idle time restarts here.
-fn note_inbound_transfer(ctx: &EventCtx<'_>, link_id: LinkId, active: bool) {
+///
+/// The receiver-side `Started` / `Progress` events ride leviculum's droppable
+/// data plane, so under load they can arrive late (even after the transfer's
+/// completion) or not at all: the mark is best effort, strongest for exactly
+/// the long transfers an idle bound can catch mid-flight.
+fn note_inbound_transfer(
+    inbound_active: &std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    last_used: &std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    link_id: LinkId,
+    active: bool,
+) {
     {
-        let mut busy = ctx
-            .inbound_resource_active
+        let mut busy = inbound_active
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if active {
@@ -7201,7 +7210,7 @@ fn note_inbound_transfer(ctx: &EventCtx<'_>, link_id: LinkId, active: bool) {
             busy.remove(&link_id);
         }
     }
-    stamp_pool_use(ctx.pool_last_used, link_id);
+    stamp_pool_use(last_used, link_id);
 }
 
 /// CIRISEdge#819 — record a use of a pooled link (hand-out, publish, release).
@@ -9045,7 +9054,12 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             if !is_sender {
                 // CIRISEdge#819 — an inbound transfer keeps its link busy for
                 // the pool reaper, and every event of it is a use of the link.
-                note_inbound_transfer(ctx, link_id, true);
+                note_inbound_transfer(
+                    ctx.inbound_resource_active,
+                    ctx.pool_last_used,
+                    link_id,
+                    true,
+                );
             }
             if is_sender {
                 let mut guard = ctx.sent_resource_progress.lock().await;
@@ -9070,7 +9084,12 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             ..
         } => {
             if !is_sender {
-                note_inbound_transfer(ctx, link_id, false);
+                note_inbound_transfer(
+                    ctx.inbound_resource_active,
+                    ctx.pool_last_used,
+                    link_id,
+                    false,
+                );
             }
             ctx.sent_resource_progress
                 .lock()
@@ -9116,7 +9135,12 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // transfer's event (`segment_index == total_segments`); an earlier
             // segment's leaves the transfer running.
             if !is_sender && resource_delivery_is_whole(segment_index, total_segments) {
-                note_inbound_transfer(ctx, link_id, false);
+                note_inbound_transfer(
+                    ctx.inbound_resource_active,
+                    ctx.pool_last_used,
+                    link_id,
+                    false,
+                );
             }
             if is_sender {
                 // choke-ok: sender-side completion is NOT an inbound drop — our own
@@ -15437,6 +15461,49 @@ mod scope_native_addressing_tests {
         assert!(
             last_used.lock().unwrap()[&lane] >= before_release,
             "the release is the lane's last use"
+        );
+    }
+
+    /// **Codex on #821, finding 4 — a lane carrying an INBOUND transfer is
+    /// busy for the reaper.** A pooled lane idle 10 s past a 1 s bound, with
+    /// a receiver-side transfer event just recorded on it (the function the
+    /// event loop's `Started`/`Progress` arms call), survives the reaper's
+    /// per-destination pass; once the transfer concludes it does not. Fails on
+    /// 03277e3, whose busy predicate saw only outbound transfers.
+    #[tokio::test]
+    async fn an_inbound_transfer_keeps_its_lane_from_the_reaper_819() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = bare_transport(dir.path(), "node-819-inbound").await;
+        t.set_link_pool_policy(Duration::from_secs(1), 4);
+        let lane = link819(7);
+        let dest = DestinationHash::new([7u8; 16]);
+        t.reusable_dialed_link.lock().await.insert(dest, vec![lane]);
+        let idle_for_10s = || {
+            t.pool_last_used.lock().unwrap().insert(
+                lane,
+                std::time::Instant::now()
+                    .checked_sub(Duration::from_secs(10))
+                    .expect("monotonic clock"),
+            );
+        };
+        // A peer's transfer is arriving on the lane.
+        note_inbound_transfer(&t.inbound_resource_active, &t.pool_last_used, lane, true);
+        idle_for_10s();
+        t.shrink_identity_pool(dest, Some(Duration::from_secs(1)))
+            .await;
+        assert_eq!(
+            t.reusable_dialed_link.lock().await.get(&dest),
+            Some(&vec![lane]),
+            "a lane mid-receive is busy: the reaper leaves it"
+        );
+        // The transfer concludes; the lane goes idle past the bound.
+        note_inbound_transfer(&t.inbound_resource_active, &t.pool_last_used, lane, false);
+        idle_for_10s();
+        t.shrink_identity_pool(dest, Some(Duration::from_secs(1)))
+            .await;
+        assert!(
+            !t.reusable_dialed_link.lock().await.contains_key(&dest),
+            "once the transfer is over, the idle lane is reaped"
         );
     }
 
