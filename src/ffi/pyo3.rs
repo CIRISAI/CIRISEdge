@@ -5870,6 +5870,7 @@ pub fn init_edge_runtime(
 
     let (verify_dir, rooting_dir): (Arc<dyn VerifyDirectory>, Arc<dyn RootingDirectory>) =
         match &queue_dispatch {
+            #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
             BackendDispatch::Postgres(b) => (b.clone(), b.clone()),
             BackendDispatch::Sqlite(b) => (b.clone(), b.clone()),
         };
@@ -5881,6 +5882,7 @@ pub fn init_edge_runtime(
     // table lives in the same DB as the outbound queue).
     let blackhole_rules: Arc<dyn ciris_persist::federation::BlackholeRules> = match &queue_dispatch
     {
+        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
         BackendDispatch::Postgres(b) => b.clone(),
         BackendDispatch::Sqlite(b) => b.clone(),
     };
@@ -5893,6 +5895,7 @@ pub fn init_edge_runtime(
     // `crate::detector` lifts them to the trait object the
     // `ProbePatternObserver` consumes for `put_edge_detection_event`.
     let derived_schema: Arc<dyn crate::detector::EdgeDetectionAdmission> = match &queue_dispatch {
+        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
         BackendDispatch::Postgres(b) => b.clone(),
         BackendDispatch::Sqlite(b) => b.clone(),
     };
@@ -5950,7 +5953,10 @@ pub fn init_edge_runtime(
                 return Err(e);
             }
         };
+    // One arm under `pyo3-sqlite` (no Postgres backend), two under `pyo3`.
+    #[allow(clippy::infallible_destructuring_match)]
     let queue: Arc<dyn OutboundHandle> = match queue_dispatch {
+        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
         BackendDispatch::Postgres(b) => b,
         BackendDispatch::Sqlite(b) => b,
     };

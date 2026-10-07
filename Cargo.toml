@@ -1214,6 +1214,7 @@ codec-default          = ["codec-fountain", "codec-av1", "codec-opus"]
 # this, the maturin wheel build (`features = ["pyo3"]` per pyproject) leaves
 # the reticulum-gated items unused and `-D warnings` fails the build.
 pyo3                  = [
+    "_pyffi",
     "dep:pyo3",
     "dep:pyo3-async-runtimes",
     # v3.0.0 — `dep:pyo3-stub-gen` dropped pending the upstream 0.29
@@ -1248,7 +1249,15 @@ pyo3                  = [
 # `BackendDispatch` runtime arm the sqlite-only wheel never matches.
 # iOS/Android PyO3 lanes can adopt this too and drop their vendored-
 # openssl cross-compile builds.
+# CIRISEdge#824 — the binding code compiles under `_pyffi`, which BOTH Python
+# features enable. Before this, every gate named `pyo3`, so a `pyo3-sqlite`
+# wheel (Windows, Android) carried the pyo3 dependency and none of the module:
+# no `PyInit_ciris_edge`, and `import ciris_edge` failed. Internal: enable
+# `pyo3` or `pyo3-sqlite`, never `_pyffi` alone.
+_pyffi                = []
+
 pyo3-sqlite           = [
+    "_pyffi",
     "dep:pyo3",
     "dep:pyo3-async-runtimes",
     "ciris-persist/pyo3-sqlite",
