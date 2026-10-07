@@ -40,7 +40,9 @@ use super::protocol::{
     PullMessage, ReplicationMessage, SummaryMessage,
 };
 use super::retention::{retention_for, Retention};
-use super::summary::{diff_refs, ApplyOutcome, StalenessSignal, StateApplier, StateProvider};
+use super::summary::{
+    diff_refs, ApplyOutcome, FetchBatch, StalenessSignal, StateApplier, StateProvider,
+};
 
 /// What role a session is playing in this round. Initiator emits
 /// the first Summary; Responder waits for one.
@@ -427,8 +429,14 @@ impl Session {
             candidates.sort_by_key(|r| r.seq);
             let mut envelopes: Vec<Vec<u8>> = Vec::new();
             let mut budget_used = 0usize;
+            // CIRISEdge#817 — one push is one Deliver: its fetches share one
+            // batch, dropped when the push is packed.
+            let mut batch = FetchBatch::new();
             for r in candidates {
-                let Some(bytes) = provider.fetch_envelope(self.kind, &r.envelope_hash).await else {
+                let Some(bytes) = provider
+                    .fetch_envelope_in(self.kind, &r.envelope_hash, &mut batch)
+                    .await
+                else {
                     continue;
                 };
                 if budget_used + bytes.len() > PROACTIVE_PUSH_BUDGET_BYTES && !envelopes.is_empty()
@@ -836,8 +844,12 @@ impl Session {
         let mut envelopes: Vec<Vec<u8>> = Vec::new();
         let mut dropped: Vec<[u8; 32]> = Vec::new();
         let mut packed_bytes = 0usize;
+        // CIRISEdge#817 — the packing's fetches share one batch, so the serve
+        // gates fold each peer-scoped verdict once per Deliver, not once per
+        // row. Dropped at return: the next Deliver asks persist again.
+        let mut batch = FetchBatch::new();
         for h in want {
-            let Some(bytes) = provider.fetch_envelope(self.kind, h).await else {
+            let Some(bytes) = provider.fetch_envelope_in(self.kind, h, &mut batch).await else {
                 dropped.push(*h);
                 continue;
             };
@@ -3154,6 +3166,77 @@ mod tests {
     /// round's re-diff. This bounds the per-round wire frame so its fragment count
     /// stays reassemblable under packet loss — the belt to the transport
     /// fragmenter's suspenders.
+    /// CIRISEdge#817 — the responder's Deliver packing passes ONE
+    /// `FetchBatch` to every fetch of the packing, and a fresh one to the next
+    /// Diff's, so the bridge's peer-scoped serve verdicts live exactly one
+    /// Deliver. Fails if `pack_bounded_deliver` fetches through the per-hash
+    /// `fetch_envelope` (this provider panics there) or shares a batch across
+    /// Delivers.
+    #[tokio::test]
+    async fn the_deliver_packing_shares_one_batch_per_deliver_817() {
+        #[derive(Default)]
+        struct Tag(usize);
+        struct BatchTagging {
+            next: std::sync::atomic::AtomicUsize,
+            seen: std::sync::Mutex<Vec<usize>>,
+        }
+        #[async_trait::async_trait]
+        impl StateProvider for BatchTagging {
+            async fn local_refs(
+                &self,
+                _kind: EnvelopeKind,
+            ) -> Vec<super::super::protocol::EnvelopeRef> {
+                Vec::new()
+            }
+            async fn fetch_envelope(&self, _k: EnvelopeKind, _h: &[u8; 32]) -> Option<Vec<u8>> {
+                panic!("the packing must fetch through its batch");
+            }
+            async fn fetch_envelope_in(
+                &self,
+                _k: EnvelopeKind,
+                _h: &[u8; 32],
+                batch: &mut FetchBatch,
+            ) -> Option<Vec<u8>> {
+                let tag = batch.scratch::<Tag>();
+                if tag.0 == 0 {
+                    tag.0 = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.seen.lock().unwrap().push(tag.0);
+                Some(vec![0u8; 64])
+            }
+        }
+        let provider = BatchTagging {
+            next: std::sync::atomic::AtomicUsize::new(1),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let want: Vec<[u8; 32]> = (1..=6u8).map(h).collect();
+        for _ in 0..2 {
+            let mut responder = Session::new(SessionRole::Responder, EnvelopeKind::Attestation);
+            let diff = DiffMessage {
+                kind: EnvelopeKind::Attestation,
+                want: want.clone(),
+            };
+            let ReplicationOutcome::Send(msgs) = responder.on_diff(&diff, &provider, None).await
+            else {
+                panic!("on_diff must Send a Deliver");
+            };
+            let ReplicationMessage::Deliver(d) = &msgs[0] else {
+                panic!("expected a Deliver, got {:?}", msgs[0]);
+            };
+            assert_eq!(d.envelopes.len(), 6);
+        }
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 12, "six fetches per Deliver, two Delivers");
+        assert!(
+            seen[..6].iter().all(|t| *t == seen[0]) && seen[6..].iter().all(|t| *t == seen[6]),
+            "one batch per Deliver: {seen:?}"
+        );
+        assert_ne!(
+            seen[0], seen[6],
+            "the second Deliver starts with a fresh batch"
+        );
+    }
+
     #[tokio::test]
     async fn on_diff_bounds_the_deliver_by_byte_budget() {
         // Eight 100 KiB envelopes = 800 KiB wanted, well over the 512 KiB budget.

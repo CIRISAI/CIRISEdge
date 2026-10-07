@@ -398,7 +398,9 @@ pub use scheduler::{
 };
 #[doc(inline)]
 pub use session::{ReplicationOutcome, Session, SessionRole};
-pub use summary::{ApplyOutcome, LocalState, StalenessSignal, StateApplier, StateProvider};
+pub use summary::{
+    ApplyOutcome, FetchBatch, LocalState, StalenessSignal, StateApplier, StateProvider,
+};
 #[doc(inline)]
 pub use wire_frame::{
     try_unwrap as try_unwrap_replication_frame, wrap as wrap_replication_frame,

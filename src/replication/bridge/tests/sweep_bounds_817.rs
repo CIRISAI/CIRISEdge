@@ -267,3 +267,106 @@ async fn the_send_set_permit_does_not_re_enter_the_gate_817() {
     .await
     .expect("one permit: the recipient read and the sweep pages take it in turn");
 }
+
+/// The attesting key of a fetched Attestation's wire bytes.
+fn author_of(bytes: &[u8]) -> String {
+    let v: serde_json::Value = serde_json::from_slice(bytes).expect("attestation json");
+    let inner = v.get("attestation").unwrap_or(&v);
+    inner["attesting_key_id"]
+        .as_str()
+        .expect("attesting_key_id")
+        .to_owned()
+}
+
+/// **Item 4 — one Deliver walks the trust root ONCE, and a revocation between
+/// two Delivers is seen by the second.** A Rooted peer in the send set fetches
+/// a third party's five rows (and the rest of what it is offered) in one
+/// Deliver's batch: `rooted_with` walks once, where the fetch twin used to
+/// walk once per row (2.75 s a row at the harness's full scale, 96% of its
+/// sweep). Then the peer withdraws its acceptance of the root, and the NEXT
+/// Deliver walks again, finds it no longer Rooted, and withholds the third
+/// party's rows: nothing of the first batch's verdict survived it. Fails on
+/// v40.1.0 with one walk per fetched row.
+#[tokio::test]
+async fn one_deliver_walks_the_trust_root_once_and_the_next_sees_a_revocation_817() {
+    let local = "local-node";
+    let producer = "producer";
+    let peer = "rooted-peer";
+    let backend = Arc::new(MemoryBackend::new());
+    register_fixture_keys(
+        &backend,
+        &[
+            (local, identity_type::USER),
+            (producer, identity_type::USER),
+            (peer, identity_type::NODE),
+        ],
+    )
+    .await;
+    for _ in 0..5 {
+        seed_advertised_attestation(&backend, producer).await;
+    }
+    seed_common_root(&backend, &[local]).await;
+    let scope = serde_json::json!(["infra:attest", "infra:serve"]);
+    let peer_accepts = seed_acceptance_edge(&backend, peer, "root-r", &scope).await;
+    seed_consent_membership_unrooted(&backend, local, peer).await;
+    let bridge =
+        bridge_over(&backend, &[local, producer, peer]).with_local_key_id(Some(local.to_owned()));
+
+    let offered = bridge.list_attestations_for_peer(Some(peer)).await;
+    let walks = || bridge.rooted_walks.load(Ordering::SeqCst);
+
+    let before = walks();
+    let mut batch = crate::replication::FetchBatch::new();
+    let mut first = Vec::new();
+    for r in &offered {
+        first.push(
+            bridge
+                .fetch_envelope_bytes_for_peer_in(
+                    EnvelopeKind::Attestation,
+                    &r.envelope_hash,
+                    Some(peer),
+                    &mut batch,
+                )
+                .await,
+        );
+    }
+    drop(batch);
+    let from_producer: Vec<usize> = first
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.as_deref().is_some_and(|b| author_of(b) == producer))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        from_producer.len(),
+        5,
+        "the Rooted peer is served the third party's five rows in one Deliver"
+    );
+    assert_eq!(
+        walks() - before,
+        1,
+        "one Deliver of {} rows walks the trust root once",
+        offered.len()
+    );
+
+    // Between the Delivers: the peer withdraws its acceptance of the root.
+    seed_withdraws(&backend, peer, &peer_accepts).await;
+    let before = walks();
+    let mut batch = crate::replication::FetchBatch::new();
+    for &i in &from_producer {
+        assert!(
+            bridge
+                .fetch_envelope_bytes_for_peer_in(
+                    EnvelopeKind::Attestation,
+                    &offered[i].envelope_hash,
+                    Some(peer),
+                    &mut batch,
+                )
+                .await
+                .is_none(),
+            "the next Deliver sees the withdrawal: no longer Rooted, the third party's \
+             row is withheld"
+        );
+    }
+    assert_eq!(walks() - before, 1, "the next Deliver walked afresh, once");
+}
