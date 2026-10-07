@@ -1349,6 +1349,12 @@ impl ciris_edge::blob_swarm::BlobChunkSource for RowScopedChunkSource {
     fn answers_scope(&self) -> bool {
         true
     }
+
+    // CIRISEdge#771 — a wrapper forwards the Edge's metrics bag to the
+    // source it wraps, or the legacy-walk counter never reaches it.
+    fn attach_metrics(&self, metrics: ciris_edge::observability::EdgeMetrics) {
+        self.inner.attach_metrics(metrics);
+    }
 }
 
 /// CIRISEdge#768 — the blob plane's counters, for the chat legs' detail: which
