@@ -1639,3 +1639,15 @@ path = "src/bin/edge_node.rs"
 # Without it the harness could not root a single peer, so requiring it states a
 # fact rather than adding a constraint.
 required-features = ["transport-reticulum", "mesh-harness", "test-anchor"]
+
+# CIRISEdge#822 — libcrux-kem <= 0.0.9 panics decoding a short X-Wing public
+# key (RUSTSEC-2026-0331) or encapsulation seed (RUSTSEC-2026-0330), and a
+# peer's KeyPackage init_key reaches that decode when we seal its Welcome.
+# The fix (libcrux-kem 0.0.10) ships only in hpke-rs 0.8, which no
+# openmls_libcrux_crypto release uses (0.4.0 is on hpke-rs 0.7 and needs
+# openmls 0.9). The CIRISAI fork is the 0.3.1 source with ONLY the hpke-rs
+# 0.8 / libcrux 0.0.9-0.0.10 bump and the API fixes it forces; X-Wing stays
+# KemAlgorithm::XWingDraft06, so the wire is unchanged. Drop this patch when
+# an upstream release on openmls 0.8 or our openmls bump carries hpke-rs 0.8.
+[patch.crates-io]
+openmls_libcrux_crypto = { path = "/tmp/claude-1000/-home-emoore-CIRISEdge/5aada876-b698-4ddb-b67b-6f4aba443cf2/scratchpad/fork-822/openmls/libcrux_crypto" }
