@@ -94,6 +94,8 @@ struct Pair {
     b: Arc<ReticulumTransport>,
     metrics_b: ciris_edge::EdgeMetrics,
     rx_a: mpsc::Receiver<InboundFrame>,
+    b_key: String,
+    rx_b: mpsc::Receiver<InboundFrame>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
     _tmp: tempfile::TempDir,
 }
@@ -101,6 +103,11 @@ struct Pair {
 /// A and B, primed with each other's route, B's pool bounded at
 /// `IDLE_BOUND` / `IDLE_CAP`, both listening (B's listen loop runs the reaper).
 async fn pair(tag: &str) -> Pair {
+    pair_with(tag, IDLE_BOUND).await
+}
+
+/// [`pair`] with B's idle bound at `bound` (the reaper's cadence follows it).
+async fn pair_with(tag: &str, bound: Duration) -> Pair {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,ciris_edge=info")
         .try_init();
@@ -147,11 +154,11 @@ async fn pair(tag: &str) -> Pair {
     )
     .await;
     // Before `listen`, so the reaper's cadence follows the short bound.
-    b.set_link_pool_policy(IDLE_BOUND, IDLE_CAP);
-    assert_eq!(b.link_pool_policy(), (IDLE_BOUND, IDLE_CAP));
+    b.set_link_pool_policy(bound, IDLE_CAP);
+    assert_eq!(b.link_pool_policy(), (bound, IDLE_CAP));
     prime_v7_peer_pair(&a, &key_a.key_id, &b, &key_b.key_id).await;
     let (tx_a, rx_a) = mpsc::channel::<InboundFrame>(256);
-    let (tx_b, _rx_b) = mpsc::channel::<InboundFrame>(256);
+    let (tx_b, rx_b) = mpsc::channel::<InboundFrame>(256);
     let (la, lb) = (Arc::clone(&a), Arc::clone(&b));
     let tasks = vec![
         tokio::spawn(async move {
@@ -168,6 +175,8 @@ async fn pair(tag: &str) -> Pair {
         b,
         metrics_b,
         rx_a,
+        b_key: key_b.key_id.clone(),
+        rx_b,
         _tasks: tasks,
         _tmp: tmp,
     }
@@ -288,5 +297,141 @@ async fn a_busy_lane_is_never_reaped_819() {
         bundle.link_pool_closed_by_reason.get("idle_expired"),
         Some(&1),
         "the one lane closed for idleness, once released"
+    );
+}
+
+async fn recv_one(rx: &mut mpsc::Receiver<InboundFrame>, what: &str) -> InboundFrame {
+    tokio::time::timeout(Duration::from_secs(60), rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("{what}: timed out"))
+        .unwrap_or_else(|| panic!("{what}: sink closed"))
+}
+
+/// **Codex on #821, finding 1 — a lane handed out is RESERVED until its
+/// sender owns the transfer.** B holds two idle lanes to A under a cap of 2;
+/// a send takes one from the pool (the `reusable_link_to` hand-out), the cap
+/// drops to 1, and before the sender claims its lane another transfer
+/// releases the other lane, which applies the cap. The handed-out lane must
+/// survive: it is the one a sender is about to ship on. Fails on 03277e3,
+/// where the hand-out only stamped the lane: the release stamped the other
+/// one newer, and the cap trim closed the lane that had just been handed out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lane_handed_out_is_not_trimmed_before_its_sender_claims_it_819() {
+    let mut p = pair("handout").await;
+    // A long bound: only the cap is under test.
+    p.b.set_link_pool_policy(Duration::from_secs(600), 2);
+    let dest = p.a_key.clone();
+    p.b.send(&dest, b"lane one").await.expect("send 1");
+    recv_one(&mut p.rx_a, "A receives send 1").await;
+    // Hold lane one busy so the second send dials lane two.
+    assert_eq!(p.b.hold_pooled_links_busy_for_test(true).await, 1);
+    p.b.send(&dest, b"lane two").await.expect("send 2");
+    recv_one(&mut p.rx_a, "A receives send 2").await;
+    p.b.hold_pooled_links_busy_for_test(false).await;
+    let lanes = p.b.pooled_link_ids_for_test().await;
+    assert_eq!(lanes.len(), 2, "two idle lanes pooled under a cap of 2");
+
+    let taken =
+        p.b.take_pooled_link_for_test(&dest)
+            .await
+            .expect("a send takes an idle lane");
+    let other = *lanes.iter().find(|l| **l != taken).expect("the other lane");
+    p.b.set_link_pool_policy(Duration::from_secs(600), 1);
+    // Another transfer ends on the other lane: the release applies the cap.
+    p.b.release_link_for_test(other).await;
+
+    assert!(
+        p.b.pooled_link_ids_for_test().await.contains(&taken),
+        "the lane handed to a sender is still pooled"
+    );
+    assert!(
+        p.b.node_link_established_for_test(taken),
+        "and still open: the sender ships on it next"
+    );
+    p.b.release_link_for_test(taken).await;
+}
+
+/// **Codex on #821, finding 5 — a pooled victim is closed at the NODE even
+/// if the listener has not mirrored it as established.** The lane's entry in
+/// the listener's `established_links` mirror is dropped (as when its
+/// `LinkEstablished` event has not been processed yet); once it is idle past
+/// the bound the reaper takes it out of the pool and closes it, and the node
+/// must no longer hold it. Fails on 03277e3: `link_teardown` returned early on
+/// the mirror, so the lane left the pool, was counted closed, and stayed open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reaped_lane_closes_at_the_node_without_the_mirror_819() {
+    let mut p = pair("mirror").await;
+    let dest = p.a_key.clone();
+    p.b.send(&dest, b"one lane").await.expect("send");
+    recv_one(&mut p.rx_a, "A receives").await;
+    let lane =
+        *p.b.pooled_link_ids_for_test()
+            .await
+            .first()
+            .expect("one lane pooled");
+    p.b.forget_established_mirror_for_test(lane).await;
+    let closed = wait_for(IDLE_BOUND * 4, || async {
+        !p.b.node_link_established_for_test(lane)
+    })
+    .await;
+    assert!(
+        p.b.pooled_link_ids_for_test().await.is_empty(),
+        "the reaper took the idle lane out of the pool"
+    );
+    assert!(
+        closed,
+        "and closed it at the node, though the listener's mirror never listed it"
+    );
+}
+
+/// **Codex on #821, finding 4 — a lane carrying an INBOUND transfer is busy.**
+/// B dials A (one pooled lane). Just before that lane's idle bound runs out,
+/// A sends B a 6 MiB envelope on it (A's reverse path rides the link B
+/// dialed). B's reaper must not close the lane while the transfer is still
+/// arriving: B receives the whole envelope, and the lane is open after it.
+/// Fails on 03277e3, where only outbound transfers counted as busy: the reaper
+/// closed the lane mid-receive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inbound_transfer_keeps_its_lane_from_the_reaper_819() {
+    // A 1 s bound puts B's reaper on a 250 ms cadence, so a pass is certain
+    // to land while the transfer is still arriving.
+    const BOUND: Duration = Duration::from_secs(1);
+    let mut p = pair_with("inbound", BOUND).await;
+    let dest = p.a_key.clone();
+    p.b.send(&dest, b"dial the lane").await.expect("B -> A");
+    recv_one(&mut p.rx_a, "A receives").await;
+    let lane =
+        *p.b.pooled_link_ids_for_test()
+            .await
+            .first()
+            .expect("one lane pooled");
+    // Let the lane age to just under its bound, then start the transfer.
+    tokio::time::sleep(BOUND - Duration::from_millis(200)).await;
+    let body = vec![0x3cu8; 8 * 1024 * 1024 - 4096];
+    let len = body.len();
+    let a = Arc::clone(&p.a);
+    let b_key = p.b_key.clone();
+    let started = tokio::time::Instant::now();
+    let send = tokio::spawn(async move { a.send(&b_key, &body).await });
+    let frame = recv_one(&mut p.rx_b, "B receives A's envelope").await;
+    let took = started.elapsed();
+    let open_after = p.b.node_link_established_for_test(lane);
+    send.await
+        .expect("A's send task")
+        .expect("A's send completes");
+    assert_eq!(frame.envelope_bytes.len(), len);
+    assert_eq!(
+        p.a.pooled_link_counts_for_test().await.0,
+        0,
+        "A answered on B's lane (the reverse path) rather than dialing its own"
+    );
+    assert!(
+        took > Duration::from_millis(200) + BOUND / 4 * 2,
+        "the transfer must outlast the lane's remaining idle time plus two reaper \
+         ticks for this to test anything (took {took:?})"
+    );
+    assert!(
+        open_after,
+        "the lane that carried the inbound transfer is still open"
     );
 }
