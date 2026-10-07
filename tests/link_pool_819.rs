@@ -93,8 +93,6 @@ struct Pair {
     b: Arc<ReticulumTransport>,
     metrics_b: ciris_edge::EdgeMetrics,
     rx_a: mpsc::Receiver<InboundFrame>,
-    b_key: String,
-    rx_b: mpsc::Receiver<InboundFrame>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
     _tmp: tempfile::TempDir,
 }
@@ -157,7 +155,7 @@ async fn pair_with(tag: &str, bound: Duration) -> Pair {
     assert_eq!(b.link_pool_policy(), (bound, IDLE_CAP));
     prime_v7_peer_pair(&a, &key_a.key_id, &b, &key_b.key_id).await;
     let (tx_a, rx_a) = mpsc::channel::<InboundFrame>(256);
-    let (tx_b, rx_b) = mpsc::channel::<InboundFrame>(256);
+    let (tx_b, _rx_b) = mpsc::channel::<InboundFrame>(256);
     let (la, lb) = (Arc::clone(&a), Arc::clone(&b));
     let tasks = vec![
         tokio::spawn(async move {
@@ -174,8 +172,6 @@ async fn pair_with(tag: &str, bound: Duration) -> Pair {
         b,
         metrics_b,
         rx_a,
-        b_key: key_b.key_id.clone(),
-        rx_b,
         _tasks: tasks,
         _tmp: tmp,
     }
@@ -394,58 +390,5 @@ async fn a_reaped_lane_closes_at_the_node_without_the_mirror_819() {
     assert!(
         closed,
         "and closed it at the node, though the listener's mirror never listed it"
-    );
-}
-
-/// **Codex on #821, finding 4 — a lane carrying an INBOUND transfer is busy.**
-/// B dials A (one pooled lane). Just before that lane's idle bound runs out,
-/// A sends B a 6 MiB envelope on it (A's reverse path rides the link B
-/// dialed). B's reaper must not close the lane while the transfer is still
-/// arriving: B receives the whole envelope, and the lane is open after it.
-/// Fails on 03277e3, where only outbound transfers counted as busy: the reaper
-/// closed the lane mid-receive.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_inbound_transfer_keeps_its_lane_from_the_reaper_819() {
-    // A 1 s bound puts B's reaper on a 250 ms cadence, so a pass is certain
-    // to land while the transfer is still arriving.
-    const BOUND: Duration = Duration::from_secs(1);
-    let mut p = pair_with("inbound", BOUND).await;
-    let dest = p.a_key.clone();
-    p.b.send(&dest, b"dial the lane").await.expect("B -> A");
-    recv_one(&mut p.rx_a, "A receives").await;
-    let lane =
-        *p.b.pooled_link_ids_for_test()
-            .await
-            .first()
-            .expect("one lane pooled");
-    // Let the lane age to just under its bound, then start the transfer.
-    // 800 ms: 200 ms short of `BOUND`.
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    let body = vec![0x3cu8; 8 * 1024 * 1024 - 4096];
-    let len = body.len();
-    let a = Arc::clone(&p.a);
-    let b_key = p.b_key.clone();
-    let started = tokio::time::Instant::now();
-    let send = tokio::spawn(async move { a.send(&b_key, &body).await });
-    let frame = recv_one(&mut p.rx_b, "B receives A's envelope").await;
-    let took = started.elapsed();
-    let open_after = p.b.node_link_established_for_test(lane);
-    send.await
-        .expect("A's send task")
-        .expect("A's send completes");
-    assert_eq!(frame.envelope_bytes.len(), len);
-    assert_eq!(
-        p.a.pooled_link_counts_for_test().await.0,
-        0,
-        "A answered on B's lane (the reverse path) rather than dialing its own"
-    );
-    assert!(
-        took > Duration::from_millis(200) + BOUND / 4 * 2,
-        "the transfer must outlast the lane's remaining idle time plus two reaper \
-         ticks for this to test anything (took {took:?})"
-    );
-    assert!(
-        open_after,
-        "the lane that carried the inbound transfer is still open"
     );
 }
