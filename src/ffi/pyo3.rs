@@ -2850,6 +2850,18 @@ fn metrics_bundle_to_pydict<'py>(
         scoped_carriers.set_item(label.as_str(), *n)?;
     }
     root.set_item("blob_scoped_carriers", scoped_carriers)?;
+
+    // CIRISEdge#819 / #820 — the dial pools: size gauges and closes by reason.
+    root.set_item("link_pool_links", bundle.link_pool_links)?;
+    root.set_item(
+        "link_pool_max_per_destination",
+        bundle.link_pool_max_per_destination,
+    )?;
+    let pool_closed = pyo3::types::PyDict::new(py);
+    for (reason, n) in &bundle.link_pool_closed_by_reason {
+        pool_closed.set_item(reason.as_str(), *n)?;
+    }
+    root.set_item("link_pool_closed_by_reason", pool_closed)?;
     root.set_item(
         "replication_routed_to_responder_total",
         bundle.replication_routed_to_responder_total,

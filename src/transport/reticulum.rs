@@ -92,6 +92,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::observability::LinkPoolCloseReason;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
@@ -3528,6 +3530,18 @@ impl ReticulumTransport {
     /// host or a test can run it on demand. Returns how many links it closed.
     pub async fn reap_idle_pooled_links(&self) -> usize {
         let (bound, _) = self.link_pool_policy();
+        // Entries whose link already closed leave first, counted as
+        // `link_closed` (the scoped pool is pruned only here and at lease).
+        let mut dead = 0;
+        for pool in [&self.reusable_dialed_link, &self.reusable_scoped_link] {
+            pool.lock().await.retain(|_, links| {
+                let before = links.len();
+                links.retain(|id| self.node.link_is_established(id));
+                dead += before - links.len();
+                !links.is_empty()
+            });
+        }
+        note_pool_links_closed(self.metrics.get(), dead);
         let dests: Vec<DestinationHash> = self
             .reusable_dialed_link
             .lock()
@@ -3545,7 +3559,24 @@ impl ReticulumTransport {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|id, _| node.link_is_established(id));
+        if let Some(m) = self.metrics.get() {
+            let (total, max) = self.pool_sizes().await;
+            m.set_link_pool_size(total as u64, max as u64);
+        }
         closed
+    }
+
+    /// CIRISEdge#819 — `(total, max for one destination)` over both pools.
+    async fn pool_sizes(&self) -> (usize, usize) {
+        let mut total = 0;
+        let mut max = 0;
+        for pool in [&self.reusable_dialed_link, &self.reusable_scoped_link] {
+            for links in pool.lock().await.values() {
+                total += links.len();
+                max = max.max(links.len());
+            }
+        }
+        (total, max)
     }
 
     /// CIRISEdge#819 — take `dest`'s identity-pool victims out of the pool (so
@@ -3574,15 +3605,14 @@ impl ReticulumTransport {
                 )
             };
             drop(in_flight);
-            pool.retain(|id| !victims.contains(id));
+            pool.retain(|id| !victims.iter().any(|(v, _)| v == id));
             if pool.is_empty() {
                 map.remove(&dest);
             }
             victims
         };
-        let why = if bound.is_some() { "idle" } else { "over_cap" };
-        for id in &victims {
-            self.close_pooled_link(*id, why, "identity").await;
+        for (id, why) in &victims {
+            self.close_pooled_link(*id, *why, "identity").await;
         }
         victims.len()
     }
@@ -3590,7 +3620,7 @@ impl ReticulumTransport {
     /// CIRISEdge#819 — the scoped pools' pass: a lane under a lease is busy.
     async fn shrink_scoped_pools(&self, bound: Duration) -> usize {
         let (_, cap) = self.link_pool_policy();
-        let victims: Vec<LinkId> = {
+        let victims: Vec<(LinkId, LinkPoolCloseReason)> = {
             let mut map = self.reusable_scoped_link.lock().await;
             let leased = self
                 .scoped_link_leased
@@ -3612,26 +3642,34 @@ impl ReticulumTransport {
                     Some(bound),
                     cap,
                 );
-                pool.retain(|id| !victims.contains(id));
+                pool.retain(|id| !victims.iter().any(|(v, _)| v == id));
                 all.extend(victims);
                 !pool.is_empty()
             });
             all
         };
-        for id in &victims {
-            self.close_pooled_link(*id, "idle", "scoped").await;
+        for (id, why) in &victims {
+            self.close_pooled_link(*id, *why, "scoped").await;
         }
         victims.len()
     }
 
     /// CIRISEdge#819 — close one pooled link through the normal teardown, so
     /// every bookkeeping map lets go of it.
-    async fn close_pooled_link(&self, link_id: LinkId, why: &'static str, pool: &'static str) {
+    async fn close_pooled_link(
+        &self,
+        link_id: LinkId,
+        why: LinkPoolCloseReason,
+        pool: &'static str,
+    ) {
         self.pool_links_closed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(m) = self.metrics.get() {
+            m.add_link_pool_closed(why, 1);
+        }
         tracing::debug!(
             link = %hex::encode(link_id.as_bytes()),
-            why,
+            why = why.as_str(),
             pool,
             "closing a pooled link (CIRISEdge#819: idle past the bound, or over the \
              per-destination idle cap)"
@@ -4273,6 +4311,7 @@ impl ReticulumTransport {
             &self.scoped_link_leased,
             &self.link_plane,
             &self.pool_last_used,
+            self.metrics.get(),
             &dest_hash,
         )
         .await
@@ -4307,6 +4346,7 @@ impl ReticulumTransport {
                 &leased,
                 &ctx.link_plane,
                 &last_used,
+                ctx.metrics.as_ref(),
                 &dest_hash,
             )
             .await
@@ -4406,10 +4446,15 @@ impl ReticulumTransport {
     /// until its lease drops; it is simply never handed out again).
     async fn evict_scoped_link(&self, link_id: LinkId) {
         let mut map = self.reusable_scoped_link.lock().await;
+        let mut dropped = 0;
         map.retain(|_, links| {
+            let before = links.len();
             links.retain(|id| *id != link_id);
+            dropped += before - links.len();
             !links.is_empty()
         });
+        // CIRISEdge#819 — evicted because the lane failed and is not established.
+        note_pool_links_closed(self.metrics.get(), dropped);
     }
 
     /// CIRISEdge#739 test seam — the next `n` reply-path answers tear their
@@ -5029,10 +5074,13 @@ impl ReticulumTransport {
         // CIRISEdge#532 — an explicitly torn-down link must stop being offered
         // for reuse here too, not only via the event loop's LinkClosed. Same
         // identity guard: only retract THIS link, never a newer one to the peer.
+        let mut dropped = 0;
         if let Some(dest) = self.dialed_link_dest.lock().await.remove(&link_id) {
             let mut reusable = self.reusable_dialed_link.lock().await;
             if let Some(pool) = reusable.get_mut(&dest) {
+                let before = pool.len();
                 pool.retain(|id| *id != link_id);
+                dropped += before - pool.len();
                 if pool.is_empty() {
                     reusable.remove(&dest);
                 }
@@ -5048,9 +5096,14 @@ impl ReticulumTransport {
             .remove(&link_id);
         // The scoped pool too, so a torn-down lane is never leased again.
         self.reusable_scoped_link.lock().await.retain(|_, links| {
+            let before = links.len();
             links.retain(|id| *id != link_id);
+            dropped += before - links.len();
             !links.is_empty()
         });
+        // A pooled link torn down by anything but the pool reaper (which takes
+        // its victims out of the pool first, and counts them by reason).
+        note_pool_links_closed(self.metrics.get(), dropped);
         Ok(())
     }
 
@@ -7017,6 +7070,9 @@ fn stamp_pool_use(
 ///   victim.
 /// - Of the idle links that remain, the `cap` most recently used are kept and
 ///   the rest are victims.
+///
+/// Each victim carries its reason: `IdleExpired` (past the bound) or
+/// `PoolFull` (over the cap).
 fn select_pool_victims(
     pool: &[LinkId],
     busy: impl Fn(&LinkId) -> bool,
@@ -7024,7 +7080,7 @@ fn select_pool_victims(
     now: std::time::Instant,
     bound: Option<Duration>,
     cap: usize,
-) -> Vec<LinkId> {
+) -> Vec<(LinkId, LinkPoolCloseReason)> {
     let mut idle: Vec<(LinkId, std::time::Instant)> = Vec::new();
     for id in pool {
         if busy(id) {
@@ -7039,15 +7095,28 @@ fn select_pool_victims(
         idle.retain(|(id, at)| {
             let expired = now.saturating_duration_since(*at) >= bound;
             if expired {
-                victims.push(*id);
+                victims.push((*id, LinkPoolCloseReason::IdleExpired));
             }
             !expired
         });
     }
     // Most recently used first; keep `cap`.
     idle.sort_by_key(|&(_, at)| std::cmp::Reverse(at));
-    victims.extend(idle.iter().skip(cap).map(|(id, _)| *id));
+    victims.extend(
+        idle.iter()
+            .skip(cap)
+            .map(|(id, _)| (*id, LinkPoolCloseReason::PoolFull)),
+    );
     victims
+}
+
+/// CIRISEdge#819 — count `n` pool entries dropped because their link closed.
+fn note_pool_links_closed(metrics: Option<&crate::observability::EdgeMetrics>, n: usize) {
+    if n > 0 {
+        if let Some(m) = metrics {
+            m.add_link_pool_closed(LinkPoolCloseReason::LinkClosed, n as u64);
+        }
+    }
 }
 
 /// CIRISEdge#739 — the scoped pool's IDLE-only selector, shared by the
@@ -7062,11 +7131,14 @@ async fn lease_pooled_scoped_link(
     leased: &Arc<std::sync::Mutex<HashSet<LinkId>>>,
     planes: &Mutex<HashMap<LinkId, LinkPlane>>,
     last_used: &std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    metrics: Option<&crate::observability::EdgeMetrics>,
     dest: &DestinationHash,
 ) -> Option<ScopedLinkLease> {
     let mut map = pool.lock().await;
     let links = map.get_mut(dest)?;
+    let before = links.len();
     links.retain(|id| node.link_is_established(id));
+    note_pool_links_closed(metrics, before - links.len());
     if links.is_empty() {
         map.remove(dest);
         return None;
@@ -7409,7 +7481,9 @@ impl DialCtx {
         // Drop links leviculum no longer holds, so a dead entry cannot occupy a
         // pool slot forever. The map is a cache over the link registry and the
         // registry is the authority.
+        let before = pool.len();
         pool.retain(|id| self.node.link_is_established(id));
+        note_pool_links_closed(self.metrics.as_ref(), before - pool.len());
         if pool.is_empty() {
             map.remove(dest);
             return None;
@@ -8994,7 +9068,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             if let Some(dest) = closed_dest {
                 let mut reusable = ctx.reusable_dialed_link.lock().await;
                 if let Some(pool) = reusable.get_mut(&dest) {
+                    let before = pool.len();
                     pool.retain(|id| *id != link_id);
+                    // CIRISEdge#819 — a pooled lane whose link closed.
+                    note_pool_links_closed(ctx.metrics, before - pool.len());
                     if pool.is_empty() {
                         reusable.remove(&dest);
                     }
@@ -15023,18 +15100,26 @@ mod scope_native_addressing_tests {
             Some(Duration::from_secs(120)),
             2,
         );
-        assert!(
-            !victims.contains(&link819(1)),
-            "a busy link is never closed"
-        );
+        let why = |n: u8| {
+            victims
+                .iter()
+                .find(|(id, _)| *id == link819(n))
+                .map(|(_, r)| *r)
+        };
+        assert_eq!(why(1), None, "a busy link is never closed");
         assert_eq!(used[&link819(1)], now, "being busy is being used");
-        assert!(victims.contains(&link819(2)), "idle past the bound: closed");
+        assert_eq!(
+            why(2),
+            Some(LinkPoolCloseReason::IdleExpired),
+            "idle past the bound: closed"
+        );
         assert!(
-            !victims.contains(&link819(3)) && !victims.contains(&link819(4)),
+            why(3).is_none() && why(4).is_none(),
             "the two most recently used idle links are kept (cap 2)"
         );
-        assert!(
-            victims.contains(&link819(5)),
+        assert_eq!(
+            why(5),
+            Some(LinkPoolCloseReason::PoolFull),
             "the third idle link is over the cap"
         );
         assert_eq!(victims.len(), 2);
@@ -15055,6 +15140,12 @@ mod scope_native_addressing_tests {
         let mut used = HashMap::new();
         let victims = select_pool_victims(&pool, |_| false, &mut used, now, None, 1);
         assert_eq!(victims.len(), 2, "cap 1 keeps one idle lane");
+        assert!(
+            victims
+                .iter()
+                .all(|(_, r)| *r == LinkPoolCloseReason::PoolFull),
+            "the release path closes for the cap only"
+        );
         assert_eq!(used.len(), 3, "every idle link is stamped");
     }
 

@@ -1,5 +1,44 @@
 # CIRISEdge Release Notes
 
+# v40.0.7 — the dial pools stop growing, and the node can be seen: P0 telemetry
+
+**2026-10-07.** **PATCH** from v40.0.6, cut from the v40.0.6 tag (main carries v40.1.0). Persist
+v53.1.7, verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged.
+Ladder triple: **edge v40.0.7 · persist v53.1.7 · verify v19.0.0**.
+
+**The leak (CIRISEdge#819).** On v40.0.6 the canonical's established Reticulum links climbed by about
+1,024 every 35 minutes. Leviculum showed by code that these were real open links, kept alive from
+both ends. The cause was edge's: its per-destination dial pools (`reusable_dialed_link`, and the
+#739 scoped pool) reuse a link only while idle, because Reticulum allows one resource transfer per
+link, and they grow to demand. Nothing ever shrank them. Edge is the initiator on those links, so
+its own keepalives held every pooled idle link open forever, and each concurrency peak toward a
+peer left its extra links behind for good. Now a pooled link idle past a bound is closed (default
+120 s), and a destination keeps at most a capped number of idle links (default 4); a link released
+into a full pool is closed. Busy lanes are never touched, so parallel transfers survive. Both
+bounds are configurable (`with_link_pool_policy` / `set_link_pool_policy`). Witness:
+`tests/link_pool_819.rs` (two loopback nodes): a burst of 8 concurrent sends leaves at most the
+cap pooled, and none after the bound; with the reap reverted all 8 stay open.
+
+**P0 telemetry (CIRISEdge#820, CIRISServer#746 unified telemetry).**
+- **Transport counters reach production:** v40.1.0's attach-at-build wiring is back-ported. Before
+  it, `ReticulumTransport::with_metrics` had no production caller, so the transport's counters
+  (#530 announce-intake evictions, #627 links-before-binding and its siblings, #722) read zero on
+  every real node. `EdgeBuilder::build` now attaches the Edge's bag to every transport, adopts a bag
+  a transport was built with, and refuses two different pre-attached bags.
+- **Dial-pool metrics:** the gauges `link_pool_links` (identity + scoped pools) and
+  `link_pool_max_per_destination`, refreshed on every reaper pass, and `link_pool_closed_by_reason`
+  (`idle_expired`, `pool_full`, and `link_closed` for a pooled link that died on its own; a future
+  leak shows as pool size climbing while these stay flat). Same names as main (#821).
+- **Histograms (fixed buckets):** `replication_round_duration_seconds` by envelope kind (recorded
+  around every scheduled round) and `sweep_permit_wait_seconds` (recorded inside the sweep gate,
+  so all 13 acquire sites are covered). The OTel names are exported as constants for the coming
+  `metrics` facade.
+- **Binding parity:** a macro ties the field list to `EdgeMetricsBundle`, so a field missing from
+  the list is a compile error, and tests check that both bindings carry every listed field. PyO3
+  gained the 8 fields it omitted, both histograms, `link_count()` and `link_list()`. UniFFI had
+  projected none of the bundle and now projects all of it. UniFFI `queue_depth()` returns the real
+  count (documented as cumulative enqueues until CIRISPersist#996).
+
 # v40.0.6 — persist v53.1.7 and bounded per-peer reads: the canonical passes its capped acceptance
 
 **2026-10-07.** **PATCH** from v40.0.5, cut from the v40.0.5 tag (main carries v40.1.0). Verify

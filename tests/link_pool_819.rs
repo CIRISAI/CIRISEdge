@@ -26,7 +26,8 @@ use ciris_edge::verify::RootingDirectory;
 use tokio::sync::mpsc;
 
 use common::{
-    build_reticulum_with_retry, directory_with, prime_v7_peer_pair, signed_record, TestFedKey,
+    build_reticulum_with_retry, build_reticulum_with_retry_metrics, directory_with,
+    prime_v7_peer_pair, signed_record, TestFedKey,
 };
 
 const IDLE_BOUND: Duration = Duration::from_secs(3);
@@ -91,6 +92,7 @@ struct Pair {
     #[allow(dead_code)]
     a: Arc<ReticulumTransport>,
     b: Arc<ReticulumTransport>,
+    metrics_b: ciris_edge::EdgeMetrics,
     rx_a: mpsc::Receiver<InboundFrame>,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
     _tmp: tempfile::TempDir,
@@ -126,19 +128,23 @@ async fn pair(tag: &str) -> Pair {
     })
     .await;
     let port_a = addr_a.port();
-    let (b, _) = build_reticulum_with_retry(|| {
-        let key = &key_b;
-        let dir = directory.clone();
-        let base = tmp.path().to_path_buf();
-        async move {
-            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), &key.key_id);
-            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
-            c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
-            c.announce_interval = Duration::from_secs(2);
-            let auth = auth_for(key, dir, &base).await;
-            (c, auth)
-        }
-    })
+    let metrics_b = ciris_edge::EdgeMetrics::new();
+    let (b, _) = build_reticulum_with_retry_metrics(
+        || {
+            let key = &key_b;
+            let dir = directory.clone();
+            let base = tmp.path().to_path_buf();
+            async move {
+                let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), &key.key_id);
+                c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+                c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
+                c.announce_interval = Duration::from_secs(2);
+                let auth = auth_for(key, dir, &base).await;
+                (c, auth)
+            }
+        },
+        metrics_b.clone(),
+    )
     .await;
     // Before `listen`, so the reaper's cadence follows the short bound.
     b.set_link_pool_policy(IDLE_BOUND, IDLE_CAP);
@@ -160,6 +166,7 @@ async fn pair(tag: &str) -> Pair {
         a_key: key_a.key_id.clone(),
         a,
         b,
+        metrics_b,
         rx_a,
         _tasks: tasks,
         _tmp: tmp,
@@ -216,6 +223,32 @@ async fn a_burst_leaves_at_most_the_idle_cap_and_none_after_the_bound_819() {
         p.b.pooled_link_counts_for_test().await,
         p.b.link_count().await
     );
+    // The telemetry tells the same story (CIRISServer#746): what the burst
+    // left over the cap closed as `pool_full`, the rest as `idle_expired`, and
+    // the pool gauges read zero once the reaper has run on the empty pool.
+    let reaped = wait_for(IDLE_BOUND * 2, || async {
+        p.metrics_b.snapshot().link_pool_links == 0
+    })
+    .await;
+    let bundle = p.metrics_b.snapshot();
+    let by = |r: &str| bundle.link_pool_closed_by_reason.get(r).copied();
+    assert!(reaped, "the pool-size gauge returns to 0: {bundle:?}");
+    assert_eq!(bundle.link_pool_max_per_destination, 0);
+    assert_eq!(
+        by("pool_full").unwrap_or(0) + by("idle_expired").unwrap_or(0),
+        p.b.pooled_links_closed(),
+        "every close the transport made is in the bundle, by reason"
+    );
+    assert!(
+        by("idle_expired").unwrap_or(0) >= 1,
+        "the last idle lane closed for idleness: {:?}",
+        bundle.link_pool_closed_by_reason
+    );
+    assert_eq!(
+        by("link_closed"),
+        Some(0),
+        "every reason token is present, and no pooled link closed on its own"
+    );
 }
 
 /// **A busy lane is never closed.** B dials A once; the lane is then held
@@ -250,4 +283,10 @@ async fn a_busy_lane_is_never_reaped_819() {
     })
     .await;
     assert!(drained, "released, it is reaped once idle past the bound");
+    let bundle = p.metrics_b.snapshot();
+    assert_eq!(
+        bundle.link_pool_closed_by_reason.get("idle_expired"),
+        Some(&1),
+        "the one lane closed for idleness, once released"
+    );
 }
