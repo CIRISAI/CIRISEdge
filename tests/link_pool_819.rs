@@ -1,0 +1,253 @@
+//! **CIRISEdge#819 — the dial pool shrinks.** Two Reticulum nodes on
+//! loopback; B dials A.
+//!
+//! The pools (#531/#532 identity, #739 scoped) grow to demand and, before
+//! #819, let go of a link only when it CLOSED. Edge is the initiator on these
+//! links, so its keepalives kept every idle lane open for good: each
+//! concurrency peak toward a peer left its extra lanes behind, and the
+//! canonical's established links climbed ~1,024 per 35 min.
+//!
+//! - a burst of concurrent sends to one peer leaves at most the idle cap of
+//!   lanes pooled once it is over, and none after the idle bound;
+//! - a busy lane is never closed, however long it is busy.
+#![cfg(feature = "transport-reticulum")]
+
+mod common;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use ciris_edge::identity::LocalSigner;
+use ciris_edge::transport::reticulum::{
+    ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
+};
+use ciris_edge::transport::{InboundFrame, Transport};
+use ciris_edge::verify::RootingDirectory;
+use tokio::sync::mpsc;
+
+use common::{
+    build_reticulum_with_retry, directory_with, prime_v7_peer_pair, signed_record, TestFedKey,
+};
+
+const IDLE_BOUND: Duration = Duration::from_secs(3);
+const IDLE_CAP: usize = 1;
+const BURST: usize = 8;
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+async fn signer_for(key: &TestFedKey, base: &std::path::Path) -> Arc<LocalSigner> {
+    let seed_dir = key.write_seed_dir(base);
+    let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
+        key_id: key.key_id.clone(),
+        key_path: seed_dir.join("ed25519.seed"),
+        pqc_key_id: None,
+        pqc_key_path: None,
+    })
+    .await
+    .expect("load_local_seed");
+    let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(key.pqc_signer());
+    Arc::new(LocalSigner::new(key.key_id.clone(), classical, Some(pqc)))
+}
+
+async fn auth_for(
+    key: &TestFedKey,
+    directory: Arc<ciris_persist::store::sqlite::SqliteBackend>,
+    base: &std::path::Path,
+) -> ReticulumAuth {
+    ReticulumAuth {
+        signer: Some(signer_for(key, base).await),
+        rooting: Some(directory as Arc<dyn RootingDirectory>),
+        resolver: None,
+        hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        ..ReticulumAuth::default()
+    }
+}
+
+async fn wait_for<F, Fut>(timeout: Duration, mut cond: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if cond().await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+struct Pair {
+    a_key: String,
+    #[allow(dead_code)]
+    a: Arc<ReticulumTransport>,
+    b: Arc<ReticulumTransport>,
+    rx_a: mpsc::Receiver<InboundFrame>,
+    _tasks: Vec<tokio::task::JoinHandle<()>>,
+    _tmp: tempfile::TempDir,
+}
+
+/// A and B, primed with each other's route, B's pool bounded at
+/// `IDLE_BOUND` / `IDLE_CAP`, both listening (B's listen loop runs the reaper).
+async fn pair(tag: &str) -> Pair {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("warn,ciris_edge=info")
+        .try_init();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let steward = TestFedKey::new(&format!("steward-819-{tag}"), 0x01);
+    let key_a = TestFedKey::new(&format!("edge-a-819-{tag}"), 0x0a);
+    let key_b = TestFedKey::new(&format!("edge-b-819-{tag}"), 0x0b);
+    let directory = directory_with(vec![
+        signed_record(&steward, &steward, "steward"),
+        signed_record(&key_a, &steward, "agent"),
+        signed_record(&key_b, &steward, "agent"),
+    ])
+    .await;
+    let (a, addr_a) = build_reticulum_with_retry(|| {
+        let key = &key_a;
+        let dir = directory.clone();
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), &key.key_id);
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.announce_interval = Duration::from_secs(2);
+            let auth = auth_for(key, dir, &base).await;
+            (c, auth)
+        }
+    })
+    .await;
+    let port_a = addr_a.port();
+    let (b, _) = build_reticulum_with_retry(|| {
+        let key = &key_b;
+        let dir = directory.clone();
+        let base = tmp.path().to_path_buf();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), &key.key_id);
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
+            c.announce_interval = Duration::from_secs(2);
+            let auth = auth_for(key, dir, &base).await;
+            (c, auth)
+        }
+    })
+    .await;
+    // Before `listen`, so the reaper's cadence follows the short bound.
+    b.set_link_pool_policy(IDLE_BOUND, IDLE_CAP);
+    assert_eq!(b.link_pool_policy(), (IDLE_BOUND, IDLE_CAP));
+    prime_v7_peer_pair(&a, &key_a.key_id, &b, &key_b.key_id).await;
+    let (tx_a, rx_a) = mpsc::channel::<InboundFrame>(256);
+    let (tx_b, _rx_b) = mpsc::channel::<InboundFrame>(256);
+    let (la, lb) = (Arc::clone(&a), Arc::clone(&b));
+    let tasks = vec![
+        tokio::spawn(async move {
+            let _ = la.listen(tx_a).await;
+        }),
+        tokio::spawn(async move {
+            let _ = lb.listen(tx_b).await;
+        }),
+    ];
+    assert!(b.knows_peer(&key_a.key_id).await, "B knows A after priming");
+    Pair {
+        a_key: key_a.key_id.clone(),
+        a,
+        b,
+        rx_a,
+        _tasks: tasks,
+        _tmp: tmp,
+    }
+}
+
+/// **A burst leaves at most the cap behind, and nothing after the bound.**
+/// Eight concurrent sends B→A dial parallel lanes (one Resource per link);
+/// once they are done B's pool holds at most `IDLE_CAP` lanes, and after
+/// `IDLE_BOUND` of quiet it holds none and the lanes are closed. Fails on
+/// v40.0.6, where every lane the burst dialed stays pooled and open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_leaves_at_most_the_idle_cap_and_none_after_the_bound_819() {
+    let mut p = pair("burst").await;
+    let dest = p.a_key.clone();
+    let body = vec![0x5au8; 256 * 1024];
+    let sends = (0..BURST).map(|_| {
+        let b = Arc::clone(&p.b);
+        let dest = dest.clone();
+        let body = body.clone();
+        tokio::spawn(async move { b.send(&dest, &body).await })
+    });
+    for s in futures::future::join_all(sends).await {
+        s.expect("send task").expect("send B -> A");
+    }
+    let mut got = 0;
+    while got < BURST {
+        tokio::time::timeout(Duration::from_secs(60), p.rx_a.recv())
+            .await
+            .expect("A receives the burst")
+            .expect("A's sink open");
+        got += 1;
+    }
+    let (pooled, _) = p.b.pooled_link_counts_for_test().await;
+    let closed = p.b.pooled_links_closed();
+    assert!(
+        pooled + usize::try_from(closed).unwrap() >= 2,
+        "the burst needed parallel lanes (pooled {pooled} + closed {closed}); a burst \
+         carried on one lane would not exercise the pool"
+    );
+    assert!(
+        pooled <= IDLE_CAP,
+        "right after the burst B keeps at most {IDLE_CAP} idle lane(s) to A, not every \
+         lane the burst dialed: {pooled} pooled"
+    );
+    let drained = wait_for(IDLE_BOUND * 4, || async {
+        p.b.pooled_link_counts_for_test().await.0 == 0 && p.b.link_count().await == 0
+    })
+    .await;
+    assert!(
+        drained,
+        "after {IDLE_BOUND:?} of quiet B's pool is empty and its dialed links are closed: \
+         pooled {:?}, established {}",
+        p.b.pooled_link_counts_for_test().await,
+        p.b.link_count().await
+    );
+}
+
+/// **A busy lane is never closed.** B dials A once; the lane is then held
+/// busy (as a transfer in flight holds it) for three idle bounds and is still
+/// pooled and open. Released, it is closed after the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_busy_lane_is_never_reaped_819() {
+    let mut p = pair("busy").await;
+    let dest = p.a_key.clone();
+    p.b.send(&dest, b"one lane").await.expect("send B -> A");
+    tokio::time::timeout(Duration::from_secs(60), p.rx_a.recv())
+        .await
+        .expect("A receives")
+        .expect("A's sink open");
+    assert_eq!(
+        p.b.pooled_link_counts_for_test().await.0,
+        1,
+        "one lane pooled"
+    );
+    assert_eq!(p.b.hold_pooled_links_busy_for_test(true).await, 1);
+    tokio::time::sleep(IDLE_BOUND * 3).await;
+    assert_eq!(
+        p.b.pooled_link_counts_for_test().await.0,
+        1,
+        "a busy lane is still pooled after three idle bounds"
+    );
+    assert_eq!(p.b.link_count().await, 1, "and still open");
+    assert_eq!(p.b.pooled_links_closed(), 0, "nothing was closed");
+    p.b.hold_pooled_links_busy_for_test(false).await;
+    let drained = wait_for(IDLE_BOUND * 4, || async {
+        p.b.pooled_link_counts_for_test().await.0 == 0
+    })
+    .await;
+    assert!(drained, "released, it is reaped once idle past the bound");
+}
