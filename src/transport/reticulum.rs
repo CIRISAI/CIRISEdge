@@ -3493,7 +3493,7 @@ impl ReticulumTransport {
     /// the PyEdge wrapper is the sole consumer — non-`pyo3` builds
     /// (lib tests, the `transport-reticulum`-only matrix combo) would
     /// trip `-D dead_code` otherwise.
-    #[cfg(feature = "pyo3")]
+    #[cfg(feature = "_pyffi")]
     #[must_use]
     pub(crate) fn node(&self) -> &Arc<ReticulumNode> {
         &self.node

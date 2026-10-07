@@ -8449,7 +8449,7 @@ impl DurableHandle {
 /// surface consumes it today (CIRISEdge#22 Tier 2; v0.9.0); the
 /// `#[cfg]` gate matches the consumer so the non-pyo3 build doesn't
 /// see a dead-code warning.
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub(crate) fn map_outbound_row_to_status(
     row: &ciris_persist::prelude::OutboundRow,
 ) -> DurableStatus {
