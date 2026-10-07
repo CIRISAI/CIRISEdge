@@ -7021,7 +7021,7 @@ fn select_pool_victims(
         });
     }
     // Most recently used first; keep `cap`.
-    idle.sort_by(|a, b| b.1.cmp(&a.1));
+    idle.sort_by_key(|&(_, at)| std::cmp::Reverse(at));
     victims.extend(idle.iter().skip(cap).map(|(id, _)| *id));
     victims
 }
