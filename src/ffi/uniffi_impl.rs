@@ -727,8 +727,23 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
     let tracker = edge.reachability_tracker();
     let snap = tracker.snapshot_all();
 
-    let mut counters: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let mut gauges: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    // CIRISEdge P0 telemetry — every `EdgeMetricsBundle` field, flattened
+    // (`EdgeMetricsBundle::flatten`): the key `f` for each field `f` of
+    // `EDGE_METRICS_BUNDLE_FIELDS`, labelled detail as `f.<label>`. Before
+    // this the snapshot carried five keys and none of the bundle. Mirror the
+    // reachability tracker into its gauge first, as PyO3 does, and refresh
+    // any transport-mirrored gauge (CIRISEdge#809).
+    let m = edge.metrics();
+    for entry in &snap {
+        m.set_peer_reachability(&entry.peer_key_id, entry.transport_id.0, entry.ratio());
+    }
+    for transport in edge.transports() {
+        transport.refresh_metrics();
+    }
+    let crate::observability::FlatMetrics {
+        mut counters,
+        mut gauges,
+    } = m.snapshot().flatten();
 
     let mut total_attempts: u64 = 0;
     let mut total_successes: u64 = 0;
@@ -776,13 +791,36 @@ pub fn recent_errors(_limit: u32) -> Result<Vec<crate::EdgeErrorEvent>, crate::E
     Ok(Vec::new())
 }
 
+/// The durable queue's per-delivery-class figure from
+/// `EdgeMetricsBundle::durable_queue_depth`. With `Some(class)` the map holds
+/// that class (`0` when nothing was counted for it); with `None` it holds
+/// every counted class plus `"all"`, their sum.
+///
+/// **Semantics until CIRISPersist#996 lands: CUMULATIVE ENQUEUES, not the
+/// live depth.** Edge increments the gauge at enqueue and nothing on the
+/// persist side decrements it at delivery yet, so the number only rises.
+/// Before this it was hard-coded to `0`, which read as "empty queue" on a
+/// node with a backlog.
 pub fn queue_depth(
     delivery_class: Option<String>,
 ) -> Result<std::collections::HashMap<String, u64>, crate::EdgeBindingsError> {
-    let _edge = current_edge()?;
+    let edge = current_edge()?;
+    let depth = edge.metrics().snapshot().durable_queue_depth;
     let mut out = std::collections::HashMap::new();
-    let class = delivery_class.unwrap_or_else(|| "all".to_string());
-    out.insert(class, 0_u64);
+    if let Some(class) = delivery_class {
+        let n = depth
+            .iter()
+            .find(|(k, _)| k.as_str() == class)
+            .map_or(0, |(_, v)| *v);
+        out.insert(class, n);
+    } else {
+        let mut all = 0u64;
+        for (k, v) in &depth {
+            all = all.saturating_add(*v);
+            out.insert(k.as_str().to_string(), *v);
+        }
+        out.insert("all".to_string(), all);
+    }
     Ok(out)
 }
 

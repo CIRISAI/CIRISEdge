@@ -942,6 +942,49 @@ impl PyEdge {
         }
     }
 
+    /// CIRISEdge P0 telemetry — the number of live Reticulum links, the
+    /// PyO3 twin of the UniFFI `link_count()`. `0` for HTTPS-only /
+    /// transport-less builds (as `rooted_peers` returns `[]`), where UniFFI
+    /// raises `Unsupported`.
+    fn link_count(&self, py: Python<'_>) -> usize {
+        #[cfg(feature = "_reticulum-module")]
+        {
+            let Some(transport) = self.inner.reticulum_transport() else {
+                return 0;
+            };
+            py.detach(|| run_async(&self.executor, async move { transport.link_count().await }))
+        }
+        #[cfg(not(feature = "_reticulum-module"))]
+        {
+            let _ = py;
+            0
+        }
+    }
+
+    /// CIRISEdge P0 telemetry — the live Reticulum links, the PyO3 twin of
+    /// the UniFFI `link_list()`: one dict per link with `link_id` /
+    /// `peer_identity_hash` (hex), `state` (`pending` / `active` /
+    /// `closing` / `closed` / `stale`), `age_seconds`, `rssi_dbm`,
+    /// `snr_db`, `establishment_rate_kbps` (each `None` when unmeasured),
+    /// `mtu`, `mdu`, `transport_id`, `transport_kind`. `[]` for
+    /// HTTPS-only / transport-less builds.
+    fn link_list(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        #[cfg(feature = "_reticulum-module")]
+        let links = match self.inner.reticulum_transport() {
+            Some(transport) => {
+                py.detach(|| run_async(&self.executor, async move { transport.link_list().await }))
+            }
+            None => Vec::new(),
+        };
+        #[cfg(not(feature = "_reticulum-module"))]
+        let links: Vec<crate::ffi::uniffi_types::EdgeLinkInfo> = Vec::new();
+        let out = pyo3::types::PyList::empty(py);
+        for link in &links {
+            out.append(link_info_to_pydict(py, link)?)?;
+        }
+        Ok(out.unbind().into_any())
+    }
+
     /// Local agent's federation `key_id` — the identity peers seed
     /// into their `federation_keys` directory to root inbound traffic
     /// from this agent. CIRISAgent 2.9.4 displays this on the
@@ -2456,12 +2499,12 @@ impl PyEdge {
     ///   "apply_refusals_by_class": {"retry_after_roster": 4, ...},
     /// }
     /// ```
-    // A flat projection of EdgeMetricsBundle into a PyDict — one block per
-    // counter family, growing by a few lines each time the observability
-    // surface gains a counter (#433/#441/#457/…). It is straight-line
-    // key→dict emission with no branching to factor, so the line count is
-    // inherent, not complexity.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// Every `EdgeMetricsBundle` field is a key here, named as the field
+    /// (`ciris_edge::observability::EDGE_METRICS_BUNDLE_FIELDS`); the two P0
+    /// histograms (`replication_round_duration_seconds` by kind,
+    /// `sweep_permit_wait_seconds`) are `{"buckets": {le: n}, "count": n,
+    /// "sum": seconds}`.
     fn metrics_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Mirror the live reachability tracker into the gauge before
         // snapshotting — consumers expect the gauge to be current.
@@ -2470,257 +2513,14 @@ impl PyEdge {
         for entry in &reach_snap {
             m.set_peer_reachability(&entry.peer_key_id, entry.transport_id.0, entry.ratio());
         }
+        // CIRISEdge#809 — gauges a transport mirrors from a value it does
+        // not own are refreshed here (a no-op for every v40.0.x transport;
+        // the hook is the seam a mirrored gauge plugs into).
+        for transport in self.inner.transports() {
+            transport.refresh_metrics();
+        }
         let bundle = m.snapshot();
-        let root = pyo3::types::PyDict::new(py);
-
-        let envelopes_sent = pyo3::types::PyDict::new(py);
-        for (k, v) in &bundle.envelopes_sent_total {
-            envelopes_sent.set_item(format!("{k:?}"), *v)?;
-        }
-        root.set_item("envelopes_sent_total", envelopes_sent)?;
-
-        let envelopes_received = pyo3::types::PyDict::new(py);
-        for (k, v) in &bundle.envelopes_received_total {
-            envelopes_received.set_item(format!("{k:?}"), *v)?;
-        }
-        root.set_item("envelopes_received_total", envelopes_received)?;
-
-        let send_failures = pyo3::types::PyDict::new(py);
-        for ((t, c), v) in &bundle.send_failures_total {
-            send_failures.set_item(format!("{}:{c}", t.0), *v)?;
-        }
-        root.set_item("send_failures_total", send_failures)?;
-
-        let verify_failures = pyo3::types::PyDict::new(py);
-        for (k, v) in &bundle.verify_failures_total {
-            verify_failures.set_item(k.as_str(), *v)?;
-        }
-        root.set_item("verify_failures_total", verify_failures)?;
-
-        let durable_depth = pyo3::types::PyDict::new(py);
-        for (k, v) in &bundle.durable_queue_depth {
-            durable_depth.set_item(k.as_str(), *v)?;
-        }
-        root.set_item("durable_queue_depth", durable_depth)?;
-
-        let bytes_in = pyo3::types::PyDict::new(py);
-        for (k, v) in &bundle.transport_bytes_in_total {
-            bytes_in.set_item(k.0, *v)?;
-        }
-        root.set_item("transport_bytes_in_total", bytes_in)?;
-
-        let bytes_out = pyo3::types::PyDict::new(py);
-        for (k, v) in &bundle.transport_bytes_out_total {
-            bytes_out.set_item(k.0, *v)?;
-        }
-        root.set_item("transport_bytes_out_total", bytes_out)?;
-
-        let reachability = pyo3::types::PyDict::new(py);
-        for ((peer, medium), v) in &bundle.peer_reachability_ratio {
-            reachability.set_item(format!("{peer}:{medium}"), *v)?;
-        }
-        root.set_item("peer_reachability_ratio", reachability)?;
-
-        // CIRISEdge#370 — per-outcome anti-entropy round counts
-        // (completed / refused / timed_out / error). A `timed_out` share
-        // that climbs with active-peer count is the field signature of the
-        // transport concurrency ceiling (leviculum#29).
-        let round_outcomes = pyo3::types::PyDict::new(py);
-        for (outcome, v) in &bundle.replication_round_outcomes_total {
-            round_outcomes.set_item(outcome.as_str(), *v)?;
-        }
-        root.set_item("replication_round_outcomes_total", round_outcomes)?;
-
-        // CIRISEdge#373 — inbound frames dropped on coordinator channel
-        // back-pressure (a stalled responder reply parking the drain). Was a
-        // silent WARN; a non-zero value is the tripwire for the #353 reply stall.
-        root.set_item(
-            "replication_inbound_backpressure_drops",
-            bundle.replication_inbound_backpressure_drops,
-        )?;
-        // CIRISEdge#662 — the same drops by ROLE; `responder` is the one that
-        // means "a peer kept sending while our single drain was busy".
-        let backpressure_by_role = pyo3::types::PyDict::new(py);
-        for (role, n) in &bundle.replication_inbound_backpressure_drops_by_role {
-            backpressure_by_role.set_item(role, *n)?;
-        }
-        root.set_item(
-            "replication_inbound_backpressure_drops_by_role",
-            backpressure_by_role,
-        )?;
-
-        // CIRISEdge#634 — the route choke's three counters. On a healthy mutual
-        // pair both `routed_to_*` climb; `reply_dropped` counts replies that
-        // answered no round we were driving (late replies to timed-out rounds).
-        // CIRISEdge#636 — how bootstrap-kind Delivers on identified links were
-        // attributed: attributed / unbound / not_applicable. Never a drop.
-        let door = pyo3::types::PyDict::new(py);
-        for (label, n) in &bundle.bootstrap_door_outcomes {
-            door.set_item(label.as_str(), *n)?;
-        }
-        root.set_item("bootstrap_door_outcomes", door)?;
-        // CIRISEdge#728 — transport receive-side refusals by reason tag
-        // (`identity_frame_on_scoped_link`: an identity-plane frame on a link
-        // dialled to a scope-derived address). Refusals are drops.
-        let transport_drops = pyo3::types::PyDict::new(py);
-        for (label, n) in &bundle.transport_inbound_drops {
-            transport_drops.set_item(label.as_str(), *n)?;
-        }
-        root.set_item("transport_inbound_drops", transport_drops)?;
-        // CIRISEdge#683 — the opaque-plane first-contact door: admitted, known
-        // key, and each named refusal (refusals are drops).
-        let first_contact = pyo3::types::PyDict::new(py);
-        for (label, n) in &bundle.first_contact_outcomes {
-            first_contact.set_item(label.as_str(), *n)?;
-        }
-        root.set_item("first_contact_outcomes", first_contact)?;
-        // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
-        // a missing install and a membership refusal are two numbers.
-        let route_refusals = pyo3::types::PyDict::new(py);
-        for (label, n) in &bundle.blob_route_refusals {
-            route_refusals.set_item(label.as_str(), *n)?;
-        }
-        root.set_item("blob_route_refusals", route_refusals)?;
-        let serve_refusals = pyo3::types::PyDict::new(py);
-        for (label, n) in &bundle.blob_serve_refusals {
-            serve_refusals.set_item(label.as_str(), *n)?;
-        }
-        root.set_item("blob_serve_refusals", serve_refusals)?;
-        // CIRISEdge#646 — where each pull found its holders: a self/family
-        // pull reads `author_nodes`, never `claim_index`.
-        let pull_sources = pyo3::types::PyDict::new(py);
-        for (label, n) in &bundle.blob_pull_sources {
-            pull_sources.set_item(label.as_str(), *n)?;
-        }
-        root.set_item("blob_pull_sources", pull_sources)?;
-        // CIRISEdge#717 — pulls that refused to store, by reason.
-        let pull_refusals = pyo3::types::PyDict::new(py);
-        for (label, n) in &bundle.blob_pull_refusals {
-            pull_refusals.set_item(label.as_str(), *n)?;
-        }
-        root.set_item("blob_pull_refusals", pull_refusals)?;
-        // CIRISEdge#738 — delivery receipts for files, by tag.
-        let delivery_receipts = pyo3::types::PyDict::new(py);
-        for (label, n) in &bundle.delivery_receipts {
-            delivery_receipts.set_item(label.as_str(), *n)?;
-        }
-        root.set_item("delivery_receipts", delivery_receipts)?;
-        // CIRISEdge#718 — which link each scoped body rode, and identity-link
-        // admissions (CC 5.4.6 / CIRISConstitution#132).
-        let scoped_carriers = pyo3::types::PyDict::new(py);
-        for (label, n) in &bundle.blob_scoped_carriers {
-            scoped_carriers.set_item(label.as_str(), *n)?;
-        }
-        root.set_item("blob_scoped_carriers", scoped_carriers)?;
-        root.set_item(
-            "replication_routed_to_responder_total",
-            bundle.replication_routed_to_responder_total,
-        )?;
-        root.set_item(
-            "replication_routed_to_initiator_total",
-            bundle.replication_routed_to_initiator_total,
-        )?;
-        root.set_item(
-            "replication_reply_dropped_total",
-            bundle.replication_reply_dropped_total,
-        )?;
-
-        // CIRISEdge#433 — the WITHHOLD LEDGER. A serving-path gate that declines
-        // to serve a row now emits a counted event keyed by the BRANCH that
-        // decided, so an operator can finally distinguish "nothing to send" from
-        // "refusing to send" — the two states that reported identically before.
-        let withholds = pyo3::types::PyDict::new(py);
-        for (reason, v) in &bundle.withholds_by_reason {
-            withholds.set_item(reason.as_str(), *v)?;
-        }
-        root.set_item("withholds_by_reason", withholds)?;
-
-        // CIRISEdge#433 — the bounded attribution window (≤ 64, oldest evicted):
-        // WHO the row was withheld from and WHAT it was, without turning on debug
-        // logging in the field.
-        let recent = pyo3::types::PyList::empty(py);
-        for record in &bundle.recent_withholds {
-            let entry = pyo3::types::PyDict::new(py);
-            entry.set_item("reason", record.reason.as_str())?;
-            entry.set_item("peer_key_id", record.peer_key_id.as_str())?;
-            entry.set_item("detail", record.detail.as_str())?;
-            recent.append(entry)?;
-        }
-        root.set_item("recent_withholds", recent)?;
-
-        // CIRISEdge#433 — the replication plane's own send counter. `envelopes_
-        // sent_total` is bumped only from the application/durable paths, so a node
-        // moving rows through anti-entropy rounds reported zero sends: reporting
-        // broken while working, the mirror image of the withhold blindness.
-        let served = pyo3::types::PyDict::new(py);
-        for (kind, v) in &bundle.replication_envelopes_served_total {
-            served.set_item(kind.as_wire_str(), *v)?;
-        }
-        root.set_item("replication_envelopes_served_total", served)?;
-
-        // persist v24.2.0 / CIRISPersist#565 — the receive-plane mirror of the
-        // withhold ledger: refused applies per envelope kind, and the typed
-        // Key-plane refusals by persist's stable token (closed, append-only
-        // 9-token contract — key on the token, never on message prose).
-        let refusals_kind = pyo3::types::PyDict::new(py);
-        for (kind, v) in &bundle.apply_refusals_by_kind {
-            refusals_kind.set_item(kind.as_wire_str(), *v)?;
-        }
-        root.set_item("apply_refusals_by_kind", refusals_kind)?;
-        let refusals_reason = pyo3::types::PyDict::new(py);
-        for (token, v) in &bundle.key_apply_refusals_by_reason {
-            refusals_reason.set_item(token.as_str(), *v)?;
-        }
-        root.set_item("key_apply_refusals_by_reason", refusals_reason)?;
-        // CIRISEdge#459 — the Attestation plane's typed-refusal axis.
-        let att_refusals_reason = pyo3::types::PyDict::new(py);
-        for (token, v) in &bundle.attestation_apply_refusals_by_reason {
-            att_refusals_reason.set_item(token.as_str(), *v)?;
-        }
-        root.set_item("attestation_apply_refusals_by_reason", att_refusals_reason)?;
-
-        // CIRISEdge#522 (persist v38.2.0) — the apply-door CLASS axis. Without
-        // it, `apply_refusals_by_kind` mixes a node mid-sync whose roster has
-        // not landed (transient, self-healing) with a third-party-row policy
-        // verdict and with a community roster FORK — three situations, one
-        // number. Tokens come from the closed `ApplyRefusalClass` set.
-        let refusals_class = pyo3::types::PyDict::new(py);
-        for (token, v) in &bundle.apply_refusals_by_class {
-            refusals_class.set_item(token.as_str(), *v)?;
-        }
-        root.set_item("apply_refusals_by_class", refusals_class)?;
-
-        // CIRISEdge#457 — the receive plane's accepted-apply counters
-        // (Admitted = new state, Duplicate = already held), the mirror of the
-        // #434 send-side served counter. Together with apply_refusals_by_kind
-        // they let a scrape tell "applied all N" from "offered nothing".
-        let applied = pyo3::types::PyDict::new(py);
-        for (kind, v) in &bundle.replication_applied_total {
-            applied.set_item(kind.as_wire_str(), *v)?;
-        }
-        root.set_item("replication_applied_total", applied)?;
-        let duplicate = pyo3::types::PyDict::new(py);
-        for (kind, v) in &bundle.replication_duplicate_total {
-            duplicate.set_item(kind.as_wire_str(), *v)?;
-        }
-        root.set_item("replication_duplicate_total", duplicate)?;
-
-        // CIRISEdge#441 — the removal-delivery delta: per removal-class row,
-        // offered/acked counts + peers still lacking a protocol-native ack
-        // (the peer's own Summary). The server's ops ladder consumes this.
-        let removal = pyo3::types::PyList::empty(py);
-        for row in &bundle.removal_delivery {
-            let entry = pyo3::types::PyDict::new(py);
-            entry.set_item("kind", row.kind.as_wire_str())?;
-            entry.set_item("envelope_hash", hex::encode(row.envelope_hash))?;
-            entry.set_item("offered", row.offered)?;
-            entry.set_item("acked", row.acked)?;
-            entry.set_item("unacked_peers", row.unacked_peers.clone())?;
-            removal.append(entry)?;
-        }
-        root.set_item("removal_delivery", removal)?;
-
-        Ok(root.unbind().into_any())
+        Ok(metrics_bundle_to_pydict(py, &bundle)?.unbind().into_any())
     }
 
     // ── CIRISEdge#65 v1.6.3 — PyO3 init wiring for replication ──────
@@ -2891,6 +2691,374 @@ impl PyEdge {
             executor: self.executor.clone(),
         })
     }
+}
+
+/// CIRISEdge P0 telemetry — project an [`EdgeMetricsBundle`] into the dict
+/// `PyEdge.metrics_snapshot()` returns: one key per bundle field, named as
+/// the field (`EDGE_METRICS_BUNDLE_FIELDS`). A free function over the bundle
+/// so the parity test can drive it without an Edge.
+///
+/// [`EdgeMetricsBundle`]: crate::observability::EdgeMetricsBundle
+// A flat projection of EdgeMetricsBundle into a PyDict — one block per
+// counter family, growing by a few lines each time the observability
+// surface gains a counter (#433/#441/#457/…). It is straight-line
+// key→dict emission with no branching to factor, so the line count is
+// inherent, not complexity.
+#[allow(clippy::too_many_lines)]
+fn metrics_bundle_to_pydict<'py>(
+    py: Python<'py>,
+    bundle: &crate::observability::EdgeMetricsBundle,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let root = pyo3::types::PyDict::new(py);
+
+    let envelopes_sent = pyo3::types::PyDict::new(py);
+    for (k, v) in &bundle.envelopes_sent_total {
+        envelopes_sent.set_item(format!("{k:?}"), *v)?;
+    }
+    root.set_item("envelopes_sent_total", envelopes_sent)?;
+
+    let envelopes_received = pyo3::types::PyDict::new(py);
+    for (k, v) in &bundle.envelopes_received_total {
+        envelopes_received.set_item(format!("{k:?}"), *v)?;
+    }
+    root.set_item("envelopes_received_total", envelopes_received)?;
+
+    let send_failures = pyo3::types::PyDict::new(py);
+    for ((t, c), v) in &bundle.send_failures_total {
+        send_failures.set_item(format!("{}:{c}", t.0), *v)?;
+    }
+    root.set_item("send_failures_total", send_failures)?;
+
+    let verify_failures = pyo3::types::PyDict::new(py);
+    for (k, v) in &bundle.verify_failures_total {
+        verify_failures.set_item(k.as_str(), *v)?;
+    }
+    root.set_item("verify_failures_total", verify_failures)?;
+
+    let durable_depth = pyo3::types::PyDict::new(py);
+    for (k, v) in &bundle.durable_queue_depth {
+        durable_depth.set_item(k.as_str(), *v)?;
+    }
+    root.set_item("durable_queue_depth", durable_depth)?;
+
+    let bytes_in = pyo3::types::PyDict::new(py);
+    for (k, v) in &bundle.transport_bytes_in_total {
+        bytes_in.set_item(k.0, *v)?;
+    }
+    root.set_item("transport_bytes_in_total", bytes_in)?;
+
+    let bytes_out = pyo3::types::PyDict::new(py);
+    for (k, v) in &bundle.transport_bytes_out_total {
+        bytes_out.set_item(k.0, *v)?;
+    }
+    root.set_item("transport_bytes_out_total", bytes_out)?;
+
+    let reachability = pyo3::types::PyDict::new(py);
+    for ((peer, medium), v) in &bundle.peer_reachability_ratio {
+        reachability.set_item(format!("{peer}:{medium}"), *v)?;
+    }
+    root.set_item("peer_reachability_ratio", reachability)?;
+
+    // CIRISEdge#370 — per-outcome anti-entropy round counts
+    // (completed / refused / timed_out / error). A `timed_out` share
+    // that climbs with active-peer count is the field signature of the
+    // transport concurrency ceiling (leviculum#29).
+    let round_outcomes = pyo3::types::PyDict::new(py);
+    for (outcome, v) in &bundle.replication_round_outcomes_total {
+        round_outcomes.set_item(outcome.as_str(), *v)?;
+    }
+    root.set_item("replication_round_outcomes_total", round_outcomes)?;
+
+    // CIRISEdge#373 — inbound frames dropped on coordinator channel
+    // back-pressure (a stalled responder reply parking the drain). Was a
+    // silent WARN; a non-zero value is the tripwire for the #353 reply stall.
+    root.set_item(
+        "replication_inbound_backpressure_drops",
+        bundle.replication_inbound_backpressure_drops,
+    )?;
+    // CIRISEdge#662 — the same drops by ROLE; `responder` is the one that
+    // means "a peer kept sending while our single drain was busy".
+    let backpressure_by_role = pyo3::types::PyDict::new(py);
+    for (role, n) in &bundle.replication_inbound_backpressure_drops_by_role {
+        backpressure_by_role.set_item(role, *n)?;
+    }
+    root.set_item(
+        "replication_inbound_backpressure_drops_by_role",
+        backpressure_by_role,
+    )?;
+
+    // CIRISEdge#634 — the route choke's three counters. On a healthy mutual
+    // pair both `routed_to_*` climb; `reply_dropped` counts replies that
+    // answered no round we were driving (late replies to timed-out rounds).
+    // CIRISEdge#636 — how bootstrap-kind Delivers on identified links were
+    // attributed: attributed / unbound / not_applicable. Never a drop.
+    let door = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.bootstrap_door_outcomes {
+        door.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("bootstrap_door_outcomes", door)?;
+    // CIRISEdge#728 — transport receive-side refusals by reason tag
+    // (`identity_frame_on_scoped_link`: an identity-plane frame on a link
+    // dialled to a scope-derived address). Refusals are drops.
+    let transport_drops = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.transport_inbound_drops {
+        transport_drops.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("transport_inbound_drops", transport_drops)?;
+    // CIRISEdge#683 — the opaque-plane first-contact door: admitted, known
+    // key, and each named refusal (refusals are drops).
+    let first_contact = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.first_contact_outcomes {
+        first_contact.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("first_contact_outcomes", first_contact)?;
+    // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
+    // a missing install and a membership refusal are two numbers.
+    let route_refusals = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.blob_route_refusals {
+        route_refusals.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("blob_route_refusals", route_refusals)?;
+    let serve_refusals = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.blob_serve_refusals {
+        serve_refusals.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("blob_serve_refusals", serve_refusals)?;
+    // CIRISEdge#646 — where each pull found its holders: a self/family
+    // pull reads `author_nodes`, never `claim_index`.
+    let pull_sources = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.blob_pull_sources {
+        pull_sources.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("blob_pull_sources", pull_sources)?;
+    // CIRISEdge#717 — pulls that refused to store, by reason.
+    let pull_refusals = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.blob_pull_refusals {
+        pull_refusals.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("blob_pull_refusals", pull_refusals)?;
+    // CIRISEdge#738 — delivery receipts for files, by tag.
+    let delivery_receipts = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.delivery_receipts {
+        delivery_receipts.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("delivery_receipts", delivery_receipts)?;
+    // CIRISEdge#718 — which link each scoped body rode, and identity-link
+    // admissions (CC 5.4.6 / CIRISConstitution#132).
+    let scoped_carriers = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.blob_scoped_carriers {
+        scoped_carriers.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("blob_scoped_carriers", scoped_carriers)?;
+    root.set_item(
+        "replication_routed_to_responder_total",
+        bundle.replication_routed_to_responder_total,
+    )?;
+    root.set_item(
+        "replication_routed_to_initiator_total",
+        bundle.replication_routed_to_initiator_total,
+    )?;
+    root.set_item(
+        "replication_reply_dropped_total",
+        bundle.replication_reply_dropped_total,
+    )?;
+
+    // CIRISEdge#433 — the WITHHOLD LEDGER. A serving-path gate that declines
+    // to serve a row now emits a counted event keyed by the BRANCH that
+    // decided, so an operator can finally distinguish "nothing to send" from
+    // "refusing to send" — the two states that reported identically before.
+    let withholds = pyo3::types::PyDict::new(py);
+    for (reason, v) in &bundle.withholds_by_reason {
+        withholds.set_item(reason.as_str(), *v)?;
+    }
+    root.set_item("withholds_by_reason", withholds)?;
+
+    // CIRISEdge#433 — the bounded attribution window (≤ 64, oldest evicted):
+    // WHO the row was withheld from and WHAT it was, without turning on debug
+    // logging in the field.
+    let recent = pyo3::types::PyList::empty(py);
+    for record in &bundle.recent_withholds {
+        let entry = pyo3::types::PyDict::new(py);
+        entry.set_item("reason", record.reason.as_str())?;
+        entry.set_item("peer_key_id", record.peer_key_id.as_str())?;
+        entry.set_item("detail", record.detail.as_str())?;
+        recent.append(entry)?;
+    }
+    root.set_item("recent_withholds", recent)?;
+
+    // CIRISEdge#433 — the replication plane's own send counter. `envelopes_
+    // sent_total` is bumped only from the application/durable paths, so a node
+    // moving rows through anti-entropy rounds reported zero sends: reporting
+    // broken while working, the mirror image of the withhold blindness.
+    let served = pyo3::types::PyDict::new(py);
+    for (kind, v) in &bundle.replication_envelopes_served_total {
+        served.set_item(kind.as_wire_str(), *v)?;
+    }
+    root.set_item("replication_envelopes_served_total", served)?;
+
+    // persist v24.2.0 / CIRISPersist#565 — the receive-plane mirror of the
+    // withhold ledger: refused applies per envelope kind, and the typed
+    // Key-plane refusals by persist's stable token (closed, append-only
+    // 9-token contract — key on the token, never on message prose).
+    let refusals_kind = pyo3::types::PyDict::new(py);
+    for (kind, v) in &bundle.apply_refusals_by_kind {
+        refusals_kind.set_item(kind.as_wire_str(), *v)?;
+    }
+    root.set_item("apply_refusals_by_kind", refusals_kind)?;
+    let refusals_reason = pyo3::types::PyDict::new(py);
+    for (token, v) in &bundle.key_apply_refusals_by_reason {
+        refusals_reason.set_item(token.as_str(), *v)?;
+    }
+    root.set_item("key_apply_refusals_by_reason", refusals_reason)?;
+    // CIRISEdge#459 — the Attestation plane's typed-refusal axis.
+    let att_refusals_reason = pyo3::types::PyDict::new(py);
+    for (token, v) in &bundle.attestation_apply_refusals_by_reason {
+        att_refusals_reason.set_item(token.as_str(), *v)?;
+    }
+    root.set_item("attestation_apply_refusals_by_reason", att_refusals_reason)?;
+
+    // CIRISEdge#522 (persist v38.2.0) — the apply-door CLASS axis. Without
+    // it, `apply_refusals_by_kind` mixes a node mid-sync whose roster has
+    // not landed (transient, self-healing) with a third-party-row policy
+    // verdict and with a community roster FORK — three situations, one
+    // number. Tokens come from the closed `ApplyRefusalClass` set.
+    let refusals_class = pyo3::types::PyDict::new(py);
+    for (token, v) in &bundle.apply_refusals_by_class {
+        refusals_class.set_item(token.as_str(), *v)?;
+    }
+    root.set_item("apply_refusals_by_class", refusals_class)?;
+
+    // CIRISEdge#457 — the receive plane's accepted-apply counters
+    // (Admitted = new state, Duplicate = already held), the mirror of the
+    // #434 send-side served counter. Together with apply_refusals_by_kind
+    // they let a scrape tell "applied all N" from "offered nothing".
+    let applied = pyo3::types::PyDict::new(py);
+    for (kind, v) in &bundle.replication_applied_total {
+        applied.set_item(kind.as_wire_str(), *v)?;
+    }
+    root.set_item("replication_applied_total", applied)?;
+    let duplicate = pyo3::types::PyDict::new(py);
+    for (kind, v) in &bundle.replication_duplicate_total {
+        duplicate.set_item(kind.as_wire_str(), *v)?;
+    }
+    root.set_item("replication_duplicate_total", duplicate)?;
+
+    // CIRISEdge#441 — the removal-delivery delta: per removal-class row,
+    // offered/acked counts + peers still lacking a protocol-native ack
+    // (the peer's own Summary). The server's ops ladder consumes this.
+    let removal = pyo3::types::PyList::empty(py);
+    for row in &bundle.removal_delivery {
+        let entry = pyo3::types::PyDict::new(py);
+        entry.set_item("kind", row.kind.as_wire_str())?;
+        entry.set_item("envelope_hash", hex::encode(row.envelope_hash))?;
+        entry.set_item("offered", row.offered)?;
+        entry.set_item("acked", row.acked)?;
+        entry.set_item("unacked_peers", row.unacked_peers.clone())?;
+        removal.append(entry)?;
+    }
+    root.set_item("removal_delivery", removal)?;
+
+    // CIRISEdge P0 telemetry (FSD/UNIFIED_TELEMETRY.md §4) — the eight
+    // bundle fields this dict omitted until the parity test
+    // (`metrics_snapshot_projects_every_bundle_field`) named them.
+    root.set_item(
+        "inbound_dropped_low_trust",
+        bundle.inbound_dropped_low_trust,
+    )?;
+    root.set_item(
+        "announce_intake_evictions",
+        bundle.announce_intake_evictions,
+    )?;
+    root.set_item("link_before_binding", bundle.link_before_binding)?;
+    root.set_item(
+        "announce_queue_drop_first_seen",
+        bundle.announce_queue_drop_first_seen,
+    )?;
+    root.set_item(
+        "channel_first_skipped_over_cap",
+        bundle.channel_first_skipped_over_cap,
+    )?;
+    root.set_item(
+        "announce_to_binding_ms_last",
+        bundle.announce_to_binding_ms_last,
+    )?;
+    // CIRISEdge#739 — chunk-DAG phase clocks: `{phase: {"total_ns", "samples"}}`.
+    let dag_phases = pyo3::types::PyDict::new(py);
+    for (phase, (total_ns, samples)) in &bundle.blob_dag_phases {
+        let entry = pyo3::types::PyDict::new(py);
+        entry.set_item("total_ns", *total_ns)?;
+        entry.set_item("samples", *samples)?;
+        dag_phases.set_item(phase.as_str(), entry)?;
+    }
+    root.set_item("blob_dag_phases", dag_phases)?;
+    let dag_chunks = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.blob_dag_chunks {
+        dag_chunks.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("blob_dag_chunks", dag_chunks)?;
+
+    // CIRISEdge P0 telemetry — the two duration histograms, as
+    // `{"buckets": {le: cumulative}, "count": n, "sum": seconds}`; the
+    // round histogram is keyed by envelope kind.
+    let round_duration = pyo3::types::PyDict::new(py);
+    for (kind, h) in &bundle.replication_round_duration_seconds {
+        round_duration.set_item(kind.as_wire_str(), histogram_to_pydict(py, h)?)?;
+    }
+    root.set_item("replication_round_duration_seconds", round_duration)?;
+    root.set_item(
+        "sweep_permit_wait_seconds",
+        histogram_to_pydict(py, &bundle.sweep_permit_wait_seconds)?,
+    )?;
+
+    Ok(root)
+}
+
+/// One [`EdgeLinkInfo`](crate::ffi::uniffi_types::EdgeLinkInfo) as the dict
+/// `PyEdge.link_list()` returns — the same fields as the UniFFI record.
+fn link_info_to_pydict<'py>(
+    py: Python<'py>,
+    link: &crate::ffi::uniffi_types::EdgeLinkInfo,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    use crate::ffi::uniffi_types::EdgeLinkState;
+    let out = pyo3::types::PyDict::new(py);
+    out.set_item("link_id", hex::encode(&link.link_id))?;
+    out.set_item("peer_identity_hash", hex::encode(&link.peer_identity_hash))?;
+    out.set_item(
+        "state",
+        match link.state {
+            EdgeLinkState::Pending => "pending",
+            EdgeLinkState::Active => "active",
+            EdgeLinkState::Closing => "closing",
+            EdgeLinkState::Closed => "closed",
+            EdgeLinkState::Stale => "stale",
+        },
+    )?;
+    out.set_item("age_seconds", link.age_seconds)?;
+    out.set_item("rssi_dbm", link.rssi_dbm)?;
+    out.set_item("snr_db", link.snr_db)?;
+    out.set_item("establishment_rate_kbps", link.establishment_rate_kbps)?;
+    out.set_item("mtu", link.mtu)?;
+    out.set_item("mdu", link.mdu)?;
+    out.set_item("transport_id", link.transport_id.as_str())?;
+    out.set_item("transport_kind", link.transport_kind.as_str())?;
+    Ok(out)
+}
+
+/// One histogram as `{"buckets": {"0.1": n, …, "+Inf": n}, "count": n,
+/// "sum": seconds}` (cumulative buckets, Prometheus `le` semantics).
+fn histogram_to_pydict<'py>(
+    py: Python<'py>,
+    h: &crate::observability::HistogramSnapshot,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let out = pyo3::types::PyDict::new(py);
+    let buckets = pyo3::types::PyDict::new(py);
+    for (le, n) in h.buckets() {
+        buckets.set_item(le, n)?;
+    }
+    out.set_item("buckets", buckets)?;
+    out.set_item("count", h.count)?;
+    out.set_item("sum", h.sum_seconds)?;
+    Ok(out)
 }
 
 /// The comma-separated valid-token list for [`parse_envelope_kind`]'s error
@@ -11826,6 +11994,93 @@ mod pyo3_tier2_tests {
             rows.len(),
             rows.iter().map(|r| &r.queue_id).collect::<Vec<_>>(),
         );
+    }
+
+    /// CIRISEdge P0 telemetry — PARITY: every `EdgeMetricsBundle` field is
+    /// a key of `metrics_snapshot()`, walked from
+    /// `EDGE_METRICS_BUNDLE_FIELDS` (which the build ties to the struct), so
+    /// a new field can never be left out of the PyO3 dict again. Before
+    /// this, eight were missing.
+    #[test]
+    fn metrics_snapshot_projects_every_bundle_field() {
+        init_python();
+        let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
+        let missing: Vec<&str> = Python::attach(|py| -> PyResult<Vec<&str>> {
+            let snap = py_edge.metrics_snapshot(py)?;
+            let bound = snap.bind(py);
+            let mut missing = Vec::new();
+            for field in crate::observability::EDGE_METRICS_BUNDLE_FIELDS {
+                if !bound.contains(*field)? {
+                    missing.push(*field);
+                }
+            }
+            Ok(missing)
+        })
+        .expect("metrics_snapshot");
+        assert!(
+            missing.is_empty(),
+            "PyO3 metrics_snapshot() omits bundle fields: {missing:?}"
+        );
+    }
+
+    /// CIRISEdge P0 telemetry — the histograms reach the dict with their
+    /// buckets, count and sum, read from the Edge's own bag.
+    #[test]
+    fn metrics_snapshot_carries_both_duration_histograms() {
+        init_python();
+        let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
+        let m = py_edge.inner.metrics();
+        m.observe_round_duration(
+            crate::replication::EnvelopeKind::Attestation,
+            std::time::Duration::from_millis(700),
+        );
+        m.observe_sweep_permit_wait(std::time::Duration::from_millis(50));
+        Python::attach(|py| -> PyResult<()> {
+            let snap = py_edge.metrics_snapshot(py)?;
+            let bound = snap.bind(py);
+            let round = bound
+                .get_item("replication_round_duration_seconds")?
+                .get_item("attestation")?;
+            assert_eq!(round.get_item("count")?.extract::<u64>()?, 1);
+            let buckets = round.get_item("buckets")?;
+            assert_eq!(buckets.get_item("0.5")?.extract::<u64>()?, 0);
+            assert_eq!(buckets.get_item("1")?.extract::<u64>()?, 1);
+            assert_eq!(buckets.get_item("+Inf")?.extract::<u64>()?, 1);
+            let sum: f64 = round.get_item("sum")?.extract()?;
+            assert!((sum - 0.7).abs() < 1e-9, "sum {sum}");
+            let wait = bound.get_item("sweep_permit_wait_seconds")?;
+            assert_eq!(wait.get_item("count")?.extract::<u64>()?, 1);
+            assert_eq!(
+                wait.get_item("buckets")?
+                    .get_item("0.1")?
+                    .extract::<u64>()?,
+                1
+            );
+            assert_eq!(
+                wait.get_item("buckets")?
+                    .get_item("0.01")?
+                    .extract::<u64>()?,
+                0
+            );
+            Ok(())
+        })
+        .expect("metrics_snapshot");
+    }
+
+    /// CIRISEdge P0 telemetry — `link_count()` / `link_list()` exist on the
+    /// PyO3 surface (UniFFI had them; PyO3 did not). The fixture has no
+    /// Reticulum transport, so both read empty rather than raising.
+    #[test]
+    fn link_count_and_link_list_exist_and_read_empty_without_reticulum() {
+        init_python();
+        let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
+        Python::attach(|py| -> PyResult<()> {
+            assert_eq!(py_edge.link_count(py), 0);
+            let links = py_edge.link_list(py)?;
+            assert_eq!(links.bind(py).len()?, 0);
+            Ok(())
+        })
+        .expect("link readbacks");
     }
 
     /// v0.19.5 (CIRISEdge#50) — `metrics_snapshot()["durable_queue_depth"]`
