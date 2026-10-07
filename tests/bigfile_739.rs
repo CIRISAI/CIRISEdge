@@ -37,6 +37,9 @@
 //! Requires the `transport-reticulum` feature:
 //! `cargo test --release --features transport-reticulum --test bigfile_739 -- --nocapture`
 
+// Awaits persist's large futures inline (~19 KB at v53.1.8); a test's stack
+// frame is not a production cost, so the lint is allowed for this test file.
+#![allow(clippy::large_futures)]
 #![cfg(feature = "transport-reticulum")]
 #![allow(
     clippy::too_many_lines,

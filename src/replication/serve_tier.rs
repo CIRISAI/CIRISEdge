@@ -188,11 +188,13 @@ impl ServeTierResolver for DirectoryServeTierResolver {
         // walk reuses persist's ONE scope-parse and ONE CEG-tombstone fold, and
         // forking either into a consumer doubles the policy the FSD insists
         // lives in a single authority.
-        match ciris_persist::federation::trust_root::resolve_serve_tier(
+        // Boxed: persist's resolver future is ~29 KB at v53.1.8
+        // (clippy::large_futures); it runs at most once a minute (single-flight).
+        match Box::pin(ciris_persist::federation::trust_root::resolve_serve_tier(
             &*self.directory,
             subject_key_id,
             &self.resolver_key_id,
-        )
+        ))
         .await
         {
             Ok(tier) => ServeTier::from_persist(tier),

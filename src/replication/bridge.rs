@@ -10091,6 +10091,9 @@ pub(crate) mod test_fixtures {
 }
 
 #[cfg(test)]
+// Test code awaits persist's large futures inline (~17–19 KB at v53.1.8); the
+// stack cost is irrelevant here, so the lint is scoped to the test module only.
+#[allow(clippy::large_futures)]
 pub(crate) mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;

@@ -4073,7 +4073,10 @@ impl Edge {
         // this door would read back "plane not armed" and never see its
         // own claims.
         self.converged_claims.arm();
-        dispatch_inbound(
+        // The inbound dispatch future is ~19 KB (persist v53.1.8's consent gate
+        // added reads to the apply path it awaits); box it so this frame holds a
+        // pointer, not the whole state machine (clippy::large_futures).
+        Box::pin(dispatch_inbound(
             frame,
             &self.verify,
             &self.handlers,
@@ -4109,7 +4112,7 @@ impl Edge {
             &self.converged_claims,
             &self.blob_scope_router(),
             &self.first_contact_wiring(),
-        )
+        ))
         .await;
     }
 
@@ -4924,7 +4927,8 @@ impl Edge {
                     #[cfg(not(feature = "_reticulum-module"))]
                     let blob_scope_router = crate::blob_swarm::BlobScopeRouter::default();
                     tokio::spawn(async move {
-                        dispatch_inbound(
+                        // Boxed: the inbound dispatch future is ~19 KB (clippy::large_futures).
+                        Box::pin(dispatch_inbound(
                             frame,
                             &verify_clone,
                             &handlers_clone,
@@ -4960,7 +4964,8 @@ impl Edge {
                             &converged_claims_clone,
                             &blob_scope_router,
                             &first_contact_clone,
-                        ).await;
+                        ))
+                        .await;
                     });
                 }
                 else => break,
