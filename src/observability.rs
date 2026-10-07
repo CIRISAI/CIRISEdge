@@ -1088,6 +1088,23 @@ pub struct EdgeMetrics {
     /// refresh overwrite the others and move the total backward (Codex,
     /// #810).
     pub known_destination_evictions: Arc<RwLock<HashMap<u64, u64>>>,
+    /// CIRISEdge#819 — the Reticulum dial pools' size (identity + scoped
+    /// lanes, busy and idle), set by the transport's pool reaper each pass.
+    /// A gauge: steady under load and back toward zero when quiet; a climb
+    /// that never comes back down is the #819 link leak.
+    pub link_pool_links: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#819 — the most pooled links held for any ONE destination at
+    /// the last reaper pass (per-destination labels would explode).
+    pub link_pool_max_per_destination: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#819 — pooled links closed because they sat idle past the
+    /// pool's idle bound.
+    pub link_pool_closed_idle_expired: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#819 — pooled links closed because their destination's pool
+    /// already held its cap of idle lanes.
+    pub link_pool_closed_pool_full: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#819 — pooled links dropped from a pool because the link
+    /// itself closed (the peer, leviculum's reap, or another teardown).
+    pub link_pool_closed_link_closed: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#627 — links that came up IDENTIFIED before their announcer had
     /// a binding. Under announce-on-link + inline Stage 1 this is 0 in steady
     /// state; nonzero means the ordering the design guarantees broke.
@@ -1542,6 +1559,53 @@ impl EdgeMetrics {
             .fold(0u64, |acc, v| acc.saturating_add(*v))
     }
 
+    /// CIRISEdge#819 — set the dial-pool gauges: total pooled links and the
+    /// largest pool for one destination.
+    pub fn set_link_pool_size(&self, total: u64, max_per_destination: u64) {
+        self.link_pool_links
+            .store(total, std::sync::atomic::Ordering::Relaxed);
+        self.link_pool_max_per_destination
+            .store(max_per_destination, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#819 — count `n` pooled links closed for `reason`.
+    pub fn add_link_pool_closed(&self, reason: LinkPoolCloseReason, n: u64) {
+        let counter = match reason {
+            LinkPoolCloseReason::IdleExpired => &self.link_pool_closed_idle_expired,
+            LinkPoolCloseReason::PoolFull => &self.link_pool_closed_pool_full,
+            LinkPoolCloseReason::LinkClosed => &self.link_pool_closed_link_closed,
+        };
+        counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#819 — pooled links closed, by reason token, every reason
+    /// present (a zero is an answer).
+    #[must_use]
+    pub fn link_pool_closed_by_reason(&self) -> HashMap<String, u64> {
+        [
+            (
+                LinkPoolCloseReason::IdleExpired,
+                &self.link_pool_closed_idle_expired,
+            ),
+            (
+                LinkPoolCloseReason::PoolFull,
+                &self.link_pool_closed_pool_full,
+            ),
+            (
+                LinkPoolCloseReason::LinkClosed,
+                &self.link_pool_closed_link_closed,
+            ),
+        ]
+        .into_iter()
+        .map(|(r, c)| {
+            (
+                r.as_str().to_owned(),
+                c.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+    }
+
     /// CIRISEdge#627 — a link came up identified before its announcer was bound.
     pub fn inc_link_before_binding(&self) {
         self.link_before_binding
@@ -1810,6 +1874,13 @@ impl EdgeMetrics {
             announce_intake_evictions: self.announce_intake_evictions(),
             transport_packets_dropped: self.transport_packets_dropped(),
             known_destination_evictions: self.known_destination_evictions(),
+            link_pool_links: self
+                .link_pool_links
+                .load(std::sync::atomic::Ordering::Relaxed),
+            link_pool_max_per_destination: self
+                .link_pool_max_per_destination
+                .load(std::sync::atomic::Ordering::Relaxed),
+            link_pool_closed_by_reason: self.link_pool_closed_by_reason(),
             link_before_binding: self.link_before_binding(),
             announce_queue_drop_first_seen: self.announce_queue_drop_first_seen(),
             channel_first_skipped_over_cap: self.channel_first_skipped_over_cap(),
@@ -1830,6 +1901,31 @@ impl EdgeMetrics {
             replication_applied_total: self.replication_applied_total.read().clone(),
             replication_duplicate_total: self.replication_duplicate_total.read().clone(),
             removal_delivery: self.removal_receipts.read().delta(),
+        }
+    }
+}
+
+/// CIRISEdge#819 — why a pooled Reticulum link left its pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinkPoolCloseReason {
+    /// Idle past the pool's idle bound; edge closed it.
+    IdleExpired,
+    /// Released into a pool already holding its cap of idle lanes; edge
+    /// closed it.
+    PoolFull,
+    /// The link closed on its own (the peer, leviculum's reap, or another
+    /// teardown) and its pool entry was dropped.
+    LinkClosed,
+}
+
+impl LinkPoolCloseReason {
+    /// The stable token.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IdleExpired => "idle_expired",
+            Self::PoolFull => "pool_full",
+            Self::LinkClosed => "link_closed",
         }
     }
 }
@@ -1904,6 +2000,14 @@ pub struct EdgeMetricsBundle {
     /// known-destinations store, mirrored at the last transport readback.
     /// Zero with room; climbing = at cap, unretained LRU destinations going.
     pub known_destination_evictions: u64,
+    /// CIRISEdge#819 — pooled Reticulum links (identity + scoped), at the
+    /// transport's last pool-reaper pass.
+    pub link_pool_links: u64,
+    /// CIRISEdge#819 — the largest pool for one destination at that pass.
+    pub link_pool_max_per_destination: u64,
+    /// CIRISEdge#819 — pooled links closed, by [`LinkPoolCloseReason`] token
+    /// (`idle_expired`, `pool_full`, `link_closed`); every token present.
+    pub link_pool_closed_by_reason: HashMap<String, u64>,
     /// CIRISEdge#627 — links identified before their announcer was bound.
     /// 0 in steady state; nonzero = the announce-before-link ordering broke.
     pub link_before_binding: u64,
