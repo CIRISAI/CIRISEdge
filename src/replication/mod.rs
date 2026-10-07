@@ -155,6 +155,7 @@ pub mod serve_tier;
 pub mod session;
 #[cfg(test)]
 mod sim;
+pub(crate) mod single_flight;
 pub mod storage_contention;
 pub mod summary;
 pub mod wire_frame;

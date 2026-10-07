@@ -95,6 +95,7 @@ use async_trait::async_trait;
 
 use super::refusal_backoff::{RefusalBackoff, RetryDisposition};
 use super::resolved_state::{Reach, ResolvedPeerSet, ResolvedRecipient};
+use super::single_flight::SingleFlight;
 use ciris_persist::federation::admission::has_accord_conferred_role;
 use ciris_persist::federation::consent_grammar::{self, ConsentTransferPolicy};
 use ciris_persist::federation::namespace::{self, Projection};
@@ -983,6 +984,60 @@ impl Drop for SweepPermit<'_> {
     }
 }
 
+/// CIRISEdge#817 — the test-only probe at the persist reads whose copies the
+/// sweep permit must bound (the consent send-set read, the membership-plane
+/// audience read) and at the owner-of read. Each probed read is held for
+/// `delay_ms` before it runs, so concurrent callers really do overlap on an
+/// in-memory directory that never yields, and a BOUNDED read is counted in
+/// `in_flight` for its whole duration, so `max_in_flight` is the high-water
+/// mark the permit must cap.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ReadProbe {
+    pub(crate) delay_ms: std::sync::atomic::AtomicU64,
+    pub(crate) in_flight: std::sync::atomic::AtomicUsize,
+    pub(crate) max_in_flight: std::sync::atomic::AtomicUsize,
+    pub(crate) group_plane_reads: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl ReadProbe {
+    /// Enter one probed read. `bounded`: counted toward the in-flight mark.
+    pub(crate) async fn enter(&self, bounded: bool) -> ReadProbeGuard<'_> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if bounded {
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, SeqCst);
+        }
+        let guard = ReadProbeGuard {
+            probe: self,
+            bounded,
+        };
+        let ms = self.delay_ms.load(SeqCst);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+        guard
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ReadProbeGuard<'a> {
+    probe: &'a ReadProbe,
+    bounded: bool,
+}
+
+#[cfg(test)]
+impl Drop for ReadProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.bounded {
+            self.probe
+                .in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 // ─── CIRISEdge#531 DEPTH — the advertise WATERMARK ───────────────────
 
 /// persist v36 (CIRISPersist#668) keyset-pagination cursor: the
@@ -1587,6 +1642,23 @@ pub struct FederationDirectoryReplicationBridge {
     /// read; the [`CONSENT_SEND_SET_MEMO_TTL`] window sits under the anti-entropy
     /// cadence so a between-round withdraw still takes effect next round.
     consent_memo: Mutex<Option<(ResolvedPeerSet, Instant)>>,
+    /// CIRISEdge#817 — the consent memo's miss is SINGLE-FLIGHT: when it
+    /// expires while N peer sweeps run, one of them re-reads the send-set and
+    /// the rest await that read, instead of N full-history reads at once. The
+    /// value carries the instant the read landed (`None` for a re-checked
+    /// memo hit or a failed read, neither of which is stored). See
+    /// [`crate::replication::single_flight`].
+    consent_flight: SingleFlight<(), (Option<ResolvedPeerSet>, Option<Instant>)>,
+    /// CIRISEdge#817 — how many times the consent send-set was actually read
+    /// from persist (`consent_peers_by_principals` plus its walks): the
+    /// single-flight's witness, as [`Self::owner_reads`] is the owner memo's.
+    /// `Relaxed`.
+    consent_set_reads: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#817 — test-only read probe: an injected delay and an
+    /// in-flight high-water mark at the persist reads the sweep permit must
+    /// bound. See [`ReadProbe`].
+    #[cfg(test)]
+    read_probe: ReadProbe,
     /// CIRISEdge#433 — the live metrics handle backing the WITHHOLD LEDGER + the
     /// replication-plane served counter. `None` makes every increment a no-op, so
     /// the (extensive) test constructions below stay untouched; every PRODUCTION
@@ -1648,6 +1720,10 @@ pub struct FederationDirectoryReplicationBridge {
     /// CIRISEdge#523 — the resolved owner-binding memo backing the Cohort-scoped
     /// advertise widening (`node_key_id → owner`). See [`OwnerCache`].
     owner_cache: Mutex<OwnerCache>,
+    /// CIRISEdge#817 — the owner memo's miss is SINGLE-FLIGHT per node, as
+    /// [`Self::consent_flight`] is for the send-set. The instant is `None` for
+    /// a re-checked hit and for an unresolved answer (never cached).
+    owner_flight: SingleFlight<String, (OwnerLookup, Option<Instant>)>,
     /// CIRISEdge#682 — the announce-state memo behind the identity-plane serve
     /// gate (`occurrence key → who may be handed its IdOcc/TD rows`). Same TTL
     /// and the same invalidation events as [`Self::owner_cache`], plus the
@@ -1958,6 +2034,10 @@ impl FederationDirectoryReplicationBridge {
             config,
             operational: None,
             consent_memo: Mutex::new(None),
+            consent_flight: SingleFlight::default(),
+            consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            read_probe: ReadProbe::default(),
             metrics: None,
             convergence: None,
             revocation_observer: None,
@@ -1967,6 +2047,7 @@ impl FederationDirectoryReplicationBridge {
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
+            owner_flight: SingleFlight::default(),
             announce_cache: Mutex::new(HashMap::new()),
             announce_reads: std::sync::atomic::AtomicUsize::new(0),
             kind_publish_selector: None,
@@ -2045,6 +2126,10 @@ impl FederationDirectoryReplicationBridge {
             config,
             operational: Some(operational),
             consent_memo: Mutex::new(None),
+            consent_flight: SingleFlight::default(),
+            consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            read_probe: ReadProbe::default(),
             metrics: None,
             convergence: None,
             revocation_observer: None,
@@ -2054,6 +2139,7 @@ impl FederationDirectoryReplicationBridge {
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
+            owner_flight: SingleFlight::default(),
             announce_cache: Mutex::new(HashMap::new()),
             announce_reads: std::sync::atomic::AtomicUsize::new(0),
             kind_publish_selector: None,
@@ -7115,14 +7201,62 @@ impl FederationDirectoryReplicationBridge {
     ///   "never cache a failure", and the difference is deliberate: #523 caches
     ///   ONE node's verdict (a cached failure pins that node dark), while this
     ///   caches a SET whose failure only omits members.
+    ///
+    /// # CIRISEdge#817 — one read per miss, under the sweep permit
+    ///
+    /// A miss is single-flight ([`Self::consent_flight`]): concurrent callers
+    /// await the one read in progress rather than each re-reading the full
+    /// history. The read itself runs under a sweep permit, so its copy counts
+    /// against [`BridgeConfig::advertise_sweep_permits`] like every other
+    /// page of the sweep. No caller of this holds a permit (it runs before
+    /// the attestation sweep's first page, and on the fetch path, which takes
+    /// none), so the acquire cannot re-enter the gate; the waiters hold no
+    /// permit while they wait.
     async fn resolved_peer_set(&self, local: &str) -> Option<ResolvedPeerSet> {
-        if let Ok(memo) = self.consent_memo.lock() {
-            if let Some((set, resolved_at)) = memo.as_ref() {
-                if resolved_at.elapsed() < CONSENT_SEND_SET_MEMO_TTL {
-                    return Some(set.clone());
-                }
-            }
+        if let Some(hit) = self.fresh_consent_memo() {
+            return Some(hit);
         }
+        let (set, _) = self
+            .consent_flight
+            .run(
+                &(),
+                || async {
+                    // A flight that landed between our miss and our joining
+                    // has filled the memo already.
+                    if let Some(hit) = self.fresh_consent_memo() {
+                        return (Some(hit), None);
+                    }
+                    let _permit = self.sweep_gate.enter().await;
+                    let set = self.read_peer_set(local).await;
+                    (set, Some(Instant::now()))
+                },
+                |(set, at)| {
+                    if let (Some(set), Some(at)) = (set, at) {
+                        if let Ok(mut memo) = self.consent_memo.lock() {
+                            *memo = Some((set.clone(), *at));
+                        }
+                    }
+                },
+            )
+            .await;
+        set
+    }
+
+    /// The consent memo's value iff it is younger than
+    /// [`CONSENT_SEND_SET_MEMO_TTL`].
+    fn fresh_consent_memo(&self) -> Option<ResolvedPeerSet> {
+        let memo = self.consent_memo.lock().ok()?;
+        let (set, resolved_at) = memo.as_ref()?;
+        (resolved_at.elapsed() < CONSENT_SEND_SET_MEMO_TTL).then(|| set.clone())
+    }
+
+    /// One read of the consent send-set from persist: the body of a
+    /// [`Self::resolved_peer_set`] miss. `None` on a directory error.
+    async fn read_peer_set(&self, local: &str) -> Option<ResolvedPeerSet> {
+        self.consent_set_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        let _probe = self.read_probe.enter(true).await;
         // CIRISEdge#609 / CIRISPersist#857 (v44.6.0) — consent is authored by
         // the HUMAN, for THIS machine. A node key holds topology, not consent:
         // the owner's opt-in is the owner's act, so the grant row is keyed by
@@ -7167,9 +7301,6 @@ impl FederationDirectoryReplicationBridge {
             "attestation send-set resolved (consent ∪ owner-bound ∪ self-collective; \
              CIRISEdge#396/#524, CIRISPersist#884)"
         );
-        if let Ok(mut memo) = self.consent_memo.lock() {
-            *memo = Some((set.clone(), Instant::now()));
-        }
         Some(set)
     }
 
@@ -7876,27 +8007,68 @@ impl FederationDirectoryReplicationBridge {
     /// apply path invalidates on the events that move the answer.
     ///
     /// A failed resolution is NOT cached (see [`CachedOwner::owner`]).
+    ///
+    /// CIRISEdge#817 — a miss is single-flight per node
+    /// ([`Self::owner_flight`]): concurrent sweeps that miss the same node
+    /// await one `owner_of` rather than each walking it. No sweep permit is
+    /// taken here: this runs inside permit-holding sections (the attestation
+    /// page's audience gates), and the gate is not re-entrant.
     async fn owner_of_cached(&self, node_key_id: &str) -> OwnerLookup {
-        if let Ok(cache) = self.owner_cache.lock() {
-            if let Some(hit) = cache.get_fresh(node_key_id, Instant::now()) {
-                return hit;
-            }
+        if let Some(hit) = self.fresh_owner(node_key_id) {
+            return hit;
         }
+        self.owner_flight
+            .run(
+                &node_key_id.to_owned(),
+                || async {
+                    if let Some(hit) = self.fresh_owner(node_key_id) {
+                        return (hit, None);
+                    }
+                    self.read_owner_of(node_key_id).await
+                },
+                |(lookup, at)| {
+                    let Some(at) = at else { return };
+                    let owner = match lookup {
+                        OwnerLookup::Owner(o) => Some(o.clone()),
+                        OwnerLookup::Unowned => None,
+                        OwnerLookup::Unresolved => return,
+                    };
+                    if let Ok(mut cache) = self.owner_cache.lock() {
+                        cache.put(node_key_id, owner, *at);
+                    }
+                },
+            )
+            .await
+            .0
+    }
+
+    /// The owner memo's answer for `node_key_id` iff it is still fresh.
+    fn fresh_owner(&self, node_key_id: &str) -> Option<OwnerLookup> {
+        self.owner_cache
+            .lock()
+            .ok()?
+            .get_fresh(node_key_id, Instant::now())
+    }
+
+    /// One `owner_of` read: the body of an [`Self::owner_of_cached`] miss.
+    /// The instant is when the answer landed, and `None` for an unresolved
+    /// answer, which is never cached.
+    async fn read_owner_of(&self, node_key_id: &str) -> (OwnerLookup, Option<Instant>) {
         // The `std` mutex is never held across the await (the #400 shape).
         self.owner_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        let _probe = self.read_probe.enter(false).await;
         let resolved = ciris_persist::federation::admission::owner_of(
             &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
             node_key_id,
         )
         .await;
         match resolved {
-            Ok(owner) => {
-                if let Ok(mut cache) = self.owner_cache.lock() {
-                    cache.put(node_key_id, owner.clone(), Instant::now());
-                }
-                owner.map_or(OwnerLookup::Unowned, OwnerLookup::Owner)
-            }
+            Ok(owner) => (
+                owner.map_or(OwnerLookup::Unowned, OwnerLookup::Owner),
+                Some(Instant::now()),
+            ),
             // Mirrors `edge.rs`'s `key_is_own_node` error handling exactly:
             // `AmbiguousNodeOwner` and a read error are the SAME fail-closed
             // outcome — a `self`/ownership boundary is never resolved from an
@@ -7908,7 +8080,7 @@ impl FederationDirectoryReplicationBridge {
                     "owner_of unresolved — the Cohort-scoped advertise keeps the \
                      direct-key test only (CIRISEdge#523 fail-closed)"
                 );
-                OwnerLookup::Unresolved
+                (OwnerLookup::Unresolved, None)
             }
         }
     }
@@ -7938,6 +8110,11 @@ impl FederationDirectoryReplicationBridge {
     /// [`CONSENT_SEND_SET_MEMO_TTL`]. Same trade the #523 memo took, made in
     /// the same direction.
     fn invalidate_owner_memo(&self, key_id: &str) {
+        // CIRISEdge#817 — the flights first, so a read already in progress can
+        // neither store its pre-event answer nor serve a caller arriving after
+        // the event (see [`crate::replication::single_flight`]).
+        self.owner_flight.invalidate();
+        self.consent_flight.invalidate();
         if let Ok(mut cache) = self.owner_cache.lock() {
             cache.invalidate(key_id);
         }
@@ -8004,6 +8181,8 @@ impl FederationDirectoryReplicationBridge {
     /// no key_id to evict by. Revocations are rare; the memos refill on the
     /// next resolve.
     fn invalidate_owner_memo_all(&self) {
+        self.owner_flight.invalidate();
+        self.consent_flight.invalidate();
         if let Ok(mut cache) = self.owner_cache.lock() {
             cache.by_node.clear();
         }
@@ -8369,6 +8548,11 @@ impl FederationDirectoryReplicationBridge {
     /// alone (it proves no person, so no member, invitee or named arm can
     /// hold). Memoized per gate; a refusal is booked at every row it refuses.
     /// Fail-closed: a directory error refuses.
+    ///
+    /// CIRISEdge#817 — every caller holds a sweep permit across this: the
+    /// advertise through `sweep_paged_gated`'s per-page permit, the fetch twin
+    /// through its own ([`Self::group_plane_fetch_serves`]). It takes none
+    /// itself, because the advertise caller already holds one.
     async fn group_plane_admits(
         &self,
         gate: &mut GroupPlaneGate<'_>,
@@ -8381,6 +8565,12 @@ impl FederationDirectoryReplicationBridge {
         let verdict = if let Some(v) = gate.memo.get(plane) {
             *v
         } else {
+            #[cfg(test)]
+            self.read_probe
+                .group_plane_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            let _probe = self.read_probe.enter(true).await;
             let dir = &*self.directory as &dyn ciris_persist::federation::FederationDirectory;
             let answer = match gate.peer {
                 Some(p) => may_receive_group_plane(
@@ -8450,6 +8640,14 @@ impl FederationDirectoryReplicationBridge {
             );
             return false;
         };
+        // CIRISEdge#817 — the fetch twin's `may_receive_group_plane` (and its
+        // `live_invitees_of`) copies count against the sweep permits, as the
+        // advertise's do: there the read runs inside `sweep_paged_gated`'s
+        // per-page permit; here, per fetch, nothing held one. Taken only after
+        // the no-group refusal above, so refusing stays instant, and nothing
+        // on the fetch path holds a permit already (the gate is not
+        // re-entrant).
+        let _permit = self.sweep_gate.enter().await;
         self.group_plane_admits(&mut gate, kind, &plane).await
     }
 
@@ -23071,6 +23269,10 @@ pub(crate) mod tests {
             );
         }
     }
+
+    // CIRISEdge#817 — the sweep-bound witnesses: single-flight memos and the
+    // permit around the membership-plane and send-set reads.
+    mod sweep_bounds_817;
 }
 
 // ─── CIRISEdge#531 — the advertise-sweep WIDTH bound ─────────────────
