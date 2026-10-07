@@ -182,6 +182,7 @@ impl DirectoryServeTierResolver {
 
 #[async_trait::async_trait]
 impl ServeTierResolver for DirectoryServeTierResolver {
+    #[tracing::instrument(level = "info", name = "edge_persist_resolve_serve_tier", skip_all)]
     async fn resolve(&self, subject_key_id: &str) -> ServeTier {
         // CIRISPersist#788 (v38.8.0) — persist owns BOTH rungs now, and edge
         // asks rather than re-deriving. That was always the right split: the

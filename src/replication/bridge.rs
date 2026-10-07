@@ -2266,6 +2266,7 @@ impl FederationDirectoryReplicationBridge {
     /// behind the directory.
     ///
     /// [`CachedServeTier::TTL`]: crate::replication::serve_tier::CachedServeTier::TTL
+    #[tracing::instrument(level = "info", name = "edge_refresh_serve_tier", skip_all)]
     async fn refresh_serve_tier(&self) {
         // The ADVERTISED identity, not the actor. Building the resolver with the
         // right subject and then refreshing against the wrong one leaves the fix
@@ -3022,6 +3023,7 @@ impl FederationDirectoryReplicationBridge {
     /// for every other plane. The re-entrancy discipline is unchanged in
     /// substance and stronger in statement: a permit is held around ONE PAGE and
     /// never around a caller of one. `sweep_gate_is_not_re_entrant` pins it.
+    #[tracing::instrument(level = "info", name = "edge_list_refs_unbounded", skip_all)]
     async fn list_envelope_refs_unbounded(
         &self,
         kind: EnvelopeKind,
@@ -3316,6 +3318,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
 
     /// CIRISEdge#379 — recipient-aware listing: the Attestation plane routes
     /// through the `infra:serve`-gated sweep; every other kind is peer-invariant.
+    #[tracing::instrument(level = "info", name = "edge_list_refs_for_peer", skip_all, fields(kind = ?kind))]
     async fn list_envelope_refs_for_peer(
         &self,
         kind: EnvelopeKind,
@@ -3388,6 +3391,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// construction. [`Self::cohort_set_with_owners`] widens the FILTER, which
     /// repairs both axes at once and keeps advertise == holdings, exactly as
     /// this arm's `_ =>` fall-through assumes.
+    #[tracing::instrument(level = "info", name = "edge_list_holdings", skip_all, fields(kind = ?kind))]
     async fn list_holdings(&self, kind: EnvelopeKind) -> Vec<EnvelopeRef> {
         // ROLE_MATRIX Axis 3 — the RESPONDER receive path's refresh point.
         //
@@ -3438,6 +3442,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// the byte-for-byte round trip persist's re-tally admit expects. A read error
     /// is a loud empty (the round re-pulls next pass), never a panic. Non-cursor
     /// kinds return empty: they converge over Summary/Diff/Fetch, not here.
+    #[tracing::instrument(level = "info", name = "edge_accord_evidence_since", skip_all, fields(kind = ?kind))]
     async fn accord_evidence_since(
         &self,
         kind: EnvelopeKind,
@@ -3570,6 +3575,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// `owner_of` and is still a deliberate follow-up, not silently permitted.) The refs themselves come from
     /// [`Self::subject_holdings_inner`], which hashes the SAME struct the wire
     /// index keys on and applies the G2 capacity carve.
+    #[tracing::instrument(level = "info", name = "edge_subject_holdings", skip_all, fields(kind = ?kind))]
     async fn subject_holdings(
         &self,
         kind: EnvelopeKind,
@@ -5155,6 +5161,7 @@ impl FederationDirectoryReplicationBridge {
     /// [`Self::identity_rows_withheld_from`] (one reach walk per subject, not
     /// per row), then the plane's ordinary since-cursor page runs over what is
     /// left. Each withheld subject is booked once per sweep under its reason.
+    #[tracing::instrument(level = "info", name = "edge_list_identity_plane_for_peer", skip_all)]
     async fn list_identity_plane_for_peer(
         &self,
         kind: EnvelopeKind,
@@ -6858,6 +6865,7 @@ impl FederationDirectoryReplicationBridge {
             && self.may_receive_cached(att, peer, memo).await == Verdict::Yes(Reason::RefersTo)
     }
 
+    #[tracing::instrument(level = "info", name = "edge_resolve_attestation_recipient", skip_all)]
     async fn resolve_attestation_recipient(&self, peer: &str) -> Option<ResolvedRecipient> {
         use crate::observability::WithholdReason;
         // CIRISEdge#524 — every withhold on this path names the peer it
@@ -7115,6 +7123,7 @@ impl FederationDirectoryReplicationBridge {
     ///   "never cache a failure", and the difference is deliberate: #523 caches
     ///   ONE node's verdict (a cached failure pins that node dark), while this
     ///   caches a SET whose failure only omits members.
+    #[tracing::instrument(level = "info", name = "edge_resolved_peer_set", skip_all)]
     async fn resolved_peer_set(&self, local: &str) -> Option<ResolvedPeerSet> {
         if let Ok(memo) = self.consent_memo.lock() {
             if let Some((set, resolved_at)) = memo.as_ref() {
@@ -7294,6 +7303,7 @@ impl FederationDirectoryReplicationBridge {
     /// held-but-unlisted rows back in `want` forever — #416 by a new door — so
     /// the window here is hard-coded [`SweepWindow::Full`], not a parameter a
     /// caller could get wrong.
+    #[tracing::instrument(level = "info", name = "edge_attestation_holdings_drain", skip_all)]
     async fn list_attestation_holdings(&self) -> Vec<EnvelopeRef> {
         let budget = self.sweep_page_budget().await;
         let mut refs = Vec::new();
@@ -7378,6 +7388,7 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    #[tracing::instrument(level = "info", name = "edge_attestation_advertise", skip_all)]
     async fn list_attestations(
         &self,
         recipient: Option<&str>,
@@ -7505,6 +7516,7 @@ impl FederationDirectoryReplicationBridge {
     /// before returning: the loop is where the `serde_json::Value` per row is
     /// built, so it is part of the materialisation the width bound is about.
     #[allow(clippy::too_many_lines)] // one gate loop; every gate is a named helper already
+    #[tracing::instrument(level = "info", name = "edge_attestation_page", skip_all)]
     async fn attestation_page(
         &self,
         since: Option<ResumeCursor>,
@@ -8332,6 +8344,7 @@ impl FederationDirectoryReplicationBridge {
     /// persist's `may_receive_group_plane` lets `peer` receive. Every row the
     /// sweep considered and the gate kept back is booked
     /// `group_record_not_member_or_invitee`.
+    #[tracing::instrument(level = "info", name = "edge_list_group_plane_for_peer", skip_all)]
     async fn list_group_plane_for_peer(
         &self,
         kind: EnvelopeKind,
