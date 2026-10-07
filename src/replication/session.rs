@@ -435,7 +435,18 @@ impl Session {
                 {
                     // Spillover — the NEXT round carries it (deterministic:
                     // candidates are seq-sorted). Not marked sent.
-                    continue;
+                    //
+                    // CIRISServer#741 — STOP here. This used to `continue`,
+                    // which FETCHED every remaining candidate only to discard
+                    // it: toward a fresh or unreachable peer that is the whole
+                    // advertised plane, every round, per peer, with nothing on
+                    // the wire. Each fetch is a full row read and decode (and,
+                    // at v40, a per-row trust walk), so a 256 KiB push paid for
+                    // the whole plane. Candidates are seq-sorted, so stopping
+                    // at the first overflow keeps the spillover deterministic;
+                    // the only cost is not back-filling the budget's tail with
+                    // a later, smaller row.
+                    break;
                 }
                 budget_used += bytes.len();
                 self.proactive_sent
@@ -1992,6 +2003,71 @@ mod tests {
         assert!(
             round_envelopes(&mut s, &provider).await.is_empty(),
             "round 4: everything sent"
+        );
+    }
+
+    /// CIRISServer#741 — the proactive push fetches at most what fits its
+    /// budget (plus the one row that overflows it), never the whole candidate
+    /// set. Toward a fresh peer with 400 rows of ~15 KiB pending and a 256 KiB
+    /// budget, a round must not read all 400 to ship ~17. On the pre-fix code
+    /// (`continue` past the budget) this read 400.
+    #[tokio::test]
+    async fn proactive_push_fetches_only_what_fits_its_budget_741() {
+        struct CountingProvider {
+            inner: TestProvider,
+            fetches: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl StateProvider for CountingProvider {
+            async fn local_refs(
+                &self,
+                kind: EnvelopeKind,
+            ) -> Vec<super::super::protocol::EnvelopeRef> {
+                self.inner.local_refs(kind).await
+            }
+            async fn fetch_envelope(&self, kind: EnvelopeKind, h: &[u8; 32]) -> Option<Vec<u8>> {
+                self.fetches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.fetch_envelope(kind, h).await
+            }
+        }
+        const ROWS: u64 = 400;
+        const ROW_BYTES: usize = 15 * 1024;
+        let rows: Vec<(EnvelopeKind, [u8; 32], Vec<u8>, u64)> = (0..ROWS)
+            .map(|i| {
+                let mut hash = [0u8; 32];
+                hash[..8].copy_from_slice(&i.to_be_bytes());
+                (
+                    EnvelopeKind::Attestation,
+                    hash,
+                    vec![0x5Au8; ROW_BYTES],
+                    i + 1,
+                )
+            })
+            .collect();
+        let provider = CountingProvider {
+            inner: provider_with(&rows),
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut s = Session::new(SessionRole::Initiator, EnvelopeKind::Attestation)
+            .with_proactive_publish(true);
+        let shipped = match s.start_round(&provider).await {
+            ReplicationOutcome::Send(msgs) => msgs
+                .into_iter()
+                .find_map(|m| match m {
+                    ReplicationMessage::Deliver(d) => Some(d.envelopes.len()),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            o => panic!("expected Send, got {o:?}"),
+        };
+        let fits = PROACTIVE_PUSH_BUDGET_BYTES / ROW_BYTES;
+        assert_eq!(shipped, fits, "the budget's worth of rows ships");
+        let fetched = provider.fetches.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            fetched <= fits + 1,
+            "a round fetched {fetched} rows to ship {shipped}: it must stop at the \
+             first row that overflows the budget, not read all {ROWS} candidates"
         );
     }
 
