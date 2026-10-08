@@ -7,9 +7,11 @@
 //! concurrency peak toward a peer left its extra lanes behind, and the
 //! canonical's established links climbed ~1,024 per 35 min.
 //!
-//! - a burst of concurrent sends to one peer leaves at most the idle cap of
-//!   lanes pooled once it is over, and none after the idle bound;
-//! - a busy lane is never closed, however long it is busy.
+//! - a burst of concurrent sends to one peer closes nothing when its sends
+//!   release their lanes, and leaves none after the idle bound (CIRISEdge#853,
+//!   v40.0.11: the per-release trim to the idle cap WAS the Datum link storm);
+//! - a busy lane is never closed, however long it is busy;
+//! - a send cancelled mid-ship gives its lane back to the pool.
 #![cfg(feature = "transport-reticulum")]
 
 mod common;
@@ -32,7 +34,8 @@ use common::{
 
 const IDLE_BOUND: Duration = Duration::from_secs(3);
 const IDLE_CAP: usize = 1;
-const BURST: usize = 8;
+/// The Datum trace's coordinator count: 14 coordinators ticking together.
+const BURST: usize = 14;
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -177,13 +180,16 @@ async fn pair_with(tag: &str, bound: Duration) -> Pair {
     }
 }
 
-/// **A burst leaves at most the cap behind, and nothing after the bound.**
-/// Eight concurrent sends B→A dial parallel lanes (one Resource per link);
-/// once they are done B's pool holds at most `IDLE_CAP` lanes, and after
-/// `IDLE_BOUND` of quiet it holds none and the lanes are closed. Fails on
-/// v40.0.6, where every lane the burst dialed stays pooled and open.
+/// **CIRISEdge#853 — releases close nothing; the idle bound retires the
+/// lanes.** Fourteen concurrent sends B→A (the Datum trace's coordinator
+/// count) dial parallel lanes (one Resource per link). As each send releases
+/// its lane, nothing is closed, even under an idle cap of 1: every lane the
+/// burst dialed is still pooled and open once it is over. After `IDLE_BOUND`
+/// of quiet the reaper has closed every one, each as `idle_expired`. Fails on
+/// v40.0.10, where each release trimmed the pool to the cap (`pool_full`) —
+/// under C concurrent coordinators, `C − cap` closes and re-dials per tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_burst_leaves_at_most_the_idle_cap_and_none_after_the_bound_819() {
+async fn a_burst_closes_nothing_on_release_and_the_bound_retires_it_853() {
     let mut p = pair("burst").await;
     let dest = p.a_key.clone();
     let body = vec![0x5au8; 256 * 1024];
@@ -205,17 +211,26 @@ async fn a_burst_leaves_at_most_the_idle_cap_and_none_after_the_bound_819() {
         got += 1;
     }
     let (pooled, _) = p.b.pooled_link_counts_for_test().await;
-    let closed = p.b.pooled_links_closed();
     assert!(
-        pooled + usize::try_from(closed).unwrap() >= 2,
-        "the burst needed parallel lanes (pooled {pooled} + closed {closed}); a burst \
-         carried on one lane would not exercise the pool"
+        pooled >= 2,
+        "the burst needed parallel lanes; a burst carried on one lane would not \
+         exercise the pool: {pooled} pooled"
     );
-    assert!(
-        pooled <= IDLE_CAP,
-        "right after the burst B keeps at most {IDLE_CAP} idle lane(s) to A, not every \
-         lane the burst dialed: {pooled} pooled"
+    let bundle = p.metrics_b.snapshot();
+    assert_eq!(
+        p.b.pooled_links_closed(),
+        0,
+        "no lane is closed as its send releases it, though the idle cap is \
+         {IDLE_CAP}: {:?}",
+        bundle.link_pool_closed_by_reason
     );
+    assert_eq!(bundle.link_pool_closed_by_reason.get("pool_full"), Some(&0));
+    assert_eq!(
+        p.b.link_count().await,
+        pooled,
+        "every lane the burst dialed is still open"
+    );
+
     let drained = wait_for(IDLE_BOUND * 4, || async {
         p.b.pooled_link_counts_for_test().await.0 == 0 && p.b.link_count().await == 0
     })
@@ -227,9 +242,6 @@ async fn a_burst_leaves_at_most_the_idle_cap_and_none_after_the_bound_819() {
         p.b.pooled_link_counts_for_test().await,
         p.b.link_count().await
     );
-    // The telemetry tells the same story (CIRISServer#746): what the burst
-    // left over the cap closed as `pool_full`, the rest as `idle_expired`, and
-    // the pool gauges read zero once the reaper has run on the empty pool.
     let reaped = wait_for(IDLE_BOUND * 2, || async {
         p.metrics_b.snapshot().link_pool_links == 0
     })
@@ -239,19 +251,67 @@ async fn a_burst_leaves_at_most_the_idle_cap_and_none_after_the_bound_819() {
     assert!(reaped, "the pool-size gauge returns to 0: {bundle:?}");
     assert_eq!(bundle.link_pool_max_per_destination, 0);
     assert_eq!(
-        by("pool_full").unwrap_or(0) + by("idle_expired").unwrap_or(0),
-        p.b.pooled_links_closed(),
-        "every close the transport made is in the bundle, by reason"
-    );
-    assert!(
-        by("idle_expired").unwrap_or(0) >= 1,
-        "the last idle lane closed for idleness: {:?}",
+        by("idle_expired"),
+        Some(u64::try_from(pooled).unwrap()),
+        "every lane closed for idleness, and only for idleness: {:?}",
         bundle.link_pool_closed_by_reason
     );
+    assert_eq!(by("pool_full"), Some(0));
     assert_eq!(
         by("link_closed"),
         Some(0),
         "every reason token is present, and no pooled link closed on its own"
+    );
+}
+
+/// **CIRISEdge#853 — a send cancelled mid-ship gives its lane back.** B holds
+/// one idle lane to A; a large send takes it and is dropped mid-ship (as the
+/// responder's 60 s reply timeout drops a ship that may run 120 s). The lane
+/// is idle in the pool again — the next send would take it rather than dial.
+/// Fails on v40.0.10, where the claim was released only after the ship
+/// returned: a dropped future leaked it, and the lane was never handed out
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_send_gives_its_lane_back_853() {
+    let mut p = pair_with("cancel", Duration::from_secs(600)).await;
+    let dest = p.a_key.clone();
+    // The pool is per destination; wait for A's announce to heal B's primed
+    // route, so the big send looks for its lane in the same pool.
+    let named = p.a.local_named_dest_hash();
+    let healed = wait_for(Duration::from_secs(30), || async {
+        p.b.peer_dest_hash_for_test(&dest).await == Some(named)
+    })
+    .await;
+    assert!(healed, "B routes to A's announced destination");
+    p.b.send(&dest, b"one lane").await.expect("send");
+    recv_one(&mut p.rx_a, "A receives").await;
+    let lane =
+        *p.b.pooled_link_ids_for_test()
+            .await
+            .first()
+            .expect("one lane pooled");
+    let big = vec![0x6bu8; 2 * 1024 * 1024];
+    let cancelled = tokio::time::timeout(Duration::from_millis(200), p.b.send(&dest, &big)).await;
+    assert!(cancelled.is_err(), "the send was dropped mid-ship");
+    assert_eq!(
+        p.b.pooled_link_ids_for_test().await,
+        vec![lane],
+        "the big send rode the pooled lane"
+    );
+    let idle = wait_for(Duration::from_secs(5), || async {
+        match p.b.take_pooled_link_for_test(&dest).await {
+            Some(taken) => {
+                p.b.release_link_for_test(taken).await;
+                taken == lane
+            }
+            None => false,
+        }
+    })
+    .await;
+    assert!(
+        idle,
+        "the cancelled send's lane is idle in the pool again, not retired by a \
+         leaked claim"
     );
 }
 

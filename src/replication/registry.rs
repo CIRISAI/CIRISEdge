@@ -438,6 +438,22 @@ impl ReplicationRegistry {
         peer_key_id: &str,
         bytes: &[u8],
     ) -> Result<RouteOutcome, RegistryError> {
+        self.route_inbound_bytes_on(peer_key_id, bytes, None).await
+    }
+
+    /// [`Self::route_inbound_bytes`], naming the transport link the frame
+    /// arrived on (CIRISEdge#853: recorded on the responder for its round
+    /// lifecycle lines; never used to route).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::route_inbound_bytes`].
+    pub async fn route_inbound_bytes_on(
+        &self,
+        peer_key_id: &str,
+        bytes: &[u8],
+        link: Option<[u8; 16]>,
+    ) -> Result<RouteOutcome, RegistryError> {
         let framed = match wire_frame::try_unwrap_framed(bytes) {
             Ok(Some(f)) => f,
             Ok(None) => return Ok(RouteOutcome::NotAReplicationFrame),
@@ -503,7 +519,7 @@ impl ReplicationRegistry {
                     return Ok(RouteOutcome::NoCoordinatorRegistered { kind });
                 };
                 responder
-                    .deliver_inbound_framed(framed.msg, meta)
+                    .deliver_inbound_framed_on(framed.msg, meta, link)
                     .map_err(|_| RegistryError::BackPressure {
                         peer_key_id: peer_key_id.to_string(),
                         kind,

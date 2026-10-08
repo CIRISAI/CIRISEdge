@@ -594,6 +594,17 @@ impl OwnerBindingCarveOut {
             return OwnerBindingOutcome::NotApplicable;
         };
         let outcome = self.admit_deliver(&deliver).await;
+        if let OwnerBindingOutcome::Consumed { .. } = &outcome {
+            // CIRISEdge#853 — the owner-binding stage of this link's link-up.
+            if let (Some(m), Some(path)) = (&self.metrics, frame.reply_path.as_ref()) {
+                if path.transport() == crate::transport::TransportId::RETICULUM_RS {
+                    m.responder_link_up_stage(
+                        path.token(),
+                        crate::observability::LINK_UP_STAGE_OWNER_BINDING,
+                    );
+                }
+            }
+        }
         if let OwnerBindingOutcome::Consumed { subjects, .. } = &outcome {
             // The answer rides only a NEW admission (never `held`), and only
             // the reply path the frame names — never a by-key dial of our
