@@ -2507,11 +2507,13 @@ impl PyEdge {
         for (k, v) in &bundle.durable_queue_depth {
             durable_depth.set_item(k.as_str(), *v)?;
         }
-        root.set_item("durable_queue_depth", durable_depth.clone())?;
         // CIRISEdge#814 — the honest name for the same number: cumulative
         // ENQUEUES, never decremented. `durable_queue_depth` keeps its old
-        // meaning until a resident depth (persist's count) replaces it.
-        root.set_item("durable_enqueued_total", durable_depth)?;
+        // meaning until a resident depth (persist's count) replaces it. Two
+        // dicts, not one aliased: a consumer that edits one must not see the
+        // edit under the other name (#815 review).
+        root.set_item("durable_enqueued_total", durable_depth.copy()?)?;
+        root.set_item("durable_queue_depth", durable_depth)?;
 
         let bytes_in = pyo3::types::PyDict::new(py);
         for (k, v) in &bundle.transport_bytes_in_total {
@@ -8827,18 +8829,32 @@ fn init_logging(filter: Option<&str>) -> PyResult<bool> {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("init_logging: {e}")))
 }
 
-/// The default `init_logging` directive: the crate path AND edge's custom
-/// `edge::*` targets (e.g. `edge::detector::verdict`), which a crate-path
-/// directive alone would drop.
-pub(crate) const DEFAULT_LOG_FILTER: &str = "ciris_edge=info,edge=info";
+/// The default `init_logging` directive: the crate path AND edge's one custom
+/// target, `edge::detector::verdict`, which a crate-path directive alone
+/// would drop. Named exactly: `EnvFilter` target directives match by PREFIX,
+/// so a bare `edge=info` would also admit a cohabiting `edge_runtime` or
+/// `edgedb` (#815 review). A new custom target must be added here, and the
+/// capture test below pins the list.
+pub(crate) const DEFAULT_LOG_FILTER: &str = "ciris_edge=info,edge::detector::verdict=info";
+
+/// Whether a global `tracing` dispatcher is installed. Outside any scoped
+/// dispatcher, `get_default` yields the global one, or `NoSubscriber` when
+/// none was ever set.
+fn global_subscriber_installed() -> bool {
+    tracing::dispatcher::get_default(|d| !d.is::<tracing::subscriber::NoSubscriber>())
+}
 
 /// The testable core of [`init_logging`]: `Err` only for a filter that does
 /// not parse, and only when a subscriber would be installed.
 fn init_logging_with(filter: Option<&str>) -> Result<bool, String> {
     use tracing_subscriber::EnvFilter;
     // Already installed (an earlier call or the host): a no-op, before the
-    // filter is looked at, so a defensive second call never raises.
-    if tracing::dispatcher::has_been_set() {
+    // filter is looked at, so a defensive second call never raises. This
+    // asks for the GLOBAL dispatcher: `has_been_set()` also turns true after
+    // any scoped `with_default`/`set_default` that has since been dropped,
+    // which would report "installed" while every edge log is still
+    // discarded (#815 review).
+    if global_subscriber_installed() {
         return Ok(false);
     }
     let env_filter = match filter {
@@ -12234,7 +12250,7 @@ mod init_logging_814 {
     /// checked before the filter is looked at).
     #[test]
     fn install_once_then_every_call_is_a_quiet_no_op() {
-        if tracing::dispatcher::has_been_set() {
+        if super::global_subscriber_installed() {
             // Another test in this binary installed one first; the
             // pre-install half cannot be observed here, the rest can.
         } else {
@@ -12242,13 +12258,13 @@ mod init_logging_814 {
                 .expect_err("an unparseable filter must not install anything");
             assert!(err.contains("bad filter"), "{err}");
             assert!(
-                !tracing::dispatcher::has_been_set(),
+                !super::global_subscriber_installed(),
                 "a refused filter must leave no subscriber behind"
             );
             assert_eq!(init_logging_with(Some("ciris_edge=info")), Ok(true));
         }
         assert!(
-            tracing::dispatcher::has_been_set(),
+            super::global_subscriber_installed(),
             "init_logging must leave a global subscriber installed"
         );
         assert_eq!(
@@ -12290,6 +12306,8 @@ mod init_logging_814 {
             tracing::warn!(target: "edge::detector::verdict", "verdict-marker");
             tracing::warn!("crate-path-marker");
             tracing::info!(target: "some_other_crate", "foreign-marker");
+            // A prefix collision: `edge=info` would admit this (#815 review).
+            tracing::info!(target: "edge_runtime", "prefix-marker");
         });
         let text = String::from_utf8(out.0.lock().expect("capture lock").clone())
             .expect("utf8 log output");
@@ -12304,6 +12322,10 @@ mod init_logging_814 {
         assert!(
             !text.contains("foreign-marker"),
             "the default must stay edge-only: {text}"
+        );
+        assert!(
+            !text.contains("prefix-marker"),
+            "a target that merely starts with `edge` is not edge's: {text}"
         );
     }
 }
