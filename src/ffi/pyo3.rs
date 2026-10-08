@@ -2606,6 +2606,12 @@ impl PyEdge {
             serve_refusals.set_item(label.as_str(), *n)?;
         }
         root.set_item("blob_serve_refusals", serve_refusals)?;
+        // CIRISEdge#771 — chunk serves answered by the legacy DAG stream walk
+        // (the fallback for a sealed DAG persist holds no link for).
+        root.set_item(
+            "blob_serve_legacy_dag_walks",
+            bundle.blob_serve_legacy_dag_walks,
+        )?;
         // CIRISEdge#646 — where each pull found its holders: a self/family
         // pull reads `author_nodes`, never `claim_index`.
         let pull_sources = pyo3::types::PyDict::new(py);

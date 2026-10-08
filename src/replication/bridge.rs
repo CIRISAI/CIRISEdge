@@ -95,6 +95,7 @@ use async_trait::async_trait;
 
 use super::refusal_backoff::{RefusalBackoff, RetryDisposition};
 use super::resolved_state::{Reach, ResolvedPeerSet, ResolvedRecipient};
+use super::single_flight::SingleFlight;
 use ciris_persist::federation::admission::has_accord_conferred_role;
 use ciris_persist::federation::consent_grammar::{self, ConsentTransferPolicy};
 use ciris_persist::federation::namespace::{self, Projection};
@@ -983,6 +984,60 @@ impl Drop for SweepPermit<'_> {
     }
 }
 
+/// CIRISEdge#817 — the test-only probe at the persist reads whose copies the
+/// sweep permit must bound (the consent send-set read, the membership-plane
+/// audience read) and at the owner-of read. Each probed read is held for
+/// `delay_ms` before it runs, so concurrent callers really do overlap on an
+/// in-memory directory that never yields, and a BOUNDED read is counted in
+/// `in_flight` for its whole duration, so `max_in_flight` is the high-water
+/// mark the permit must cap.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ReadProbe {
+    pub(crate) delay_ms: std::sync::atomic::AtomicU64,
+    pub(crate) in_flight: std::sync::atomic::AtomicUsize,
+    pub(crate) max_in_flight: std::sync::atomic::AtomicUsize,
+    pub(crate) group_plane_reads: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl ReadProbe {
+    /// Enter one probed read. `bounded`: counted toward the in-flight mark.
+    pub(crate) async fn enter(&self, bounded: bool) -> ReadProbeGuard<'_> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if bounded {
+            let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, SeqCst);
+        }
+        let guard = ReadProbeGuard {
+            probe: self,
+            bounded,
+        };
+        let ms = self.delay_ms.load(SeqCst);
+        if ms > 0 {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+        }
+        guard
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ReadProbeGuard<'a> {
+    probe: &'a ReadProbe,
+    bounded: bool,
+}
+
+#[cfg(test)]
+impl Drop for ReadProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.bounded {
+            self.probe
+                .in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
 // ─── CIRISEdge#531 DEPTH — the advertise WATERMARK ───────────────────
 
 /// persist v36 (CIRISPersist#668) keyset-pagination cursor: the
@@ -1264,6 +1319,35 @@ struct AudienceMemo {
     /// every row field it reads ([`MayReceiveKey`]), so rows that differ only
     /// in body share one resolver walk.
     may_receive: HashMap<MayReceiveKey, ciris_persist::federation::replication_audience::Verdict>,
+}
+
+/// **CIRISEdge#817 — the direct-fetch twin's peer-scoped memos, for one
+/// fetch or one Deliver** ([`crate::replication::FetchBatch`]). The fetch twin
+/// used to rebuild each of these per row, so a Deliver of N rows walked
+/// `rooted_with` (the trust root, through persist's `live_conferrals`) N times.
+/// Every entry is a verdict about the bound peer or about a row's author, the
+/// same facts the advertise memoizes for one sweep, kept for at most one
+/// Deliver. [`Self::bind`] empties it if a batch is ever reused for another
+/// peer, so a verdict can never cross peers.
+#[derive(Default)]
+struct ServeMemos {
+    peer: Option<String>,
+    audience: AudienceMemo,
+    quarantine: HashMap<String, QuarantineConsult>,
+    grants: HashMap<String, Vec<ConsentTransferPolicy>>,
+}
+
+impl ServeMemos {
+    /// Bind the memos to `peer`, dropping everything if they were holding
+    /// another peer's verdicts.
+    fn bind(&mut self, peer: Option<&str>) {
+        if self.peer.as_deref() != peer {
+            *self = Self {
+                peer: peer.map(str::to_owned),
+                ..Self::default()
+            };
+        }
+    }
 }
 
 /// CIRISEdge#761 — the inputs persist's `may_receive(recipient, row)` reads
@@ -1587,6 +1671,26 @@ pub struct FederationDirectoryReplicationBridge {
     /// read; the [`CONSENT_SEND_SET_MEMO_TTL`] window sits under the anti-entropy
     /// cadence so a between-round withdraw still takes effect next round.
     consent_memo: Mutex<Option<(ResolvedPeerSet, Instant)>>,
+    /// CIRISEdge#817 — the consent memo's miss is SINGLE-FLIGHT: when it
+    /// expires while N peer sweeps run, one of them re-reads the send-set and
+    /// the rest await that read, instead of N full-history reads at once. The
+    /// value carries the instant the read landed (`None` for a re-checked
+    /// memo hit or a failed read, neither of which is stored). See
+    /// [`crate::replication::single_flight`].
+    consent_flight: SingleFlight<(), (Option<ResolvedPeerSet>, Option<Instant>)>,
+    /// CIRISEdge#817 — how many times the consent send-set was actually read
+    /// from persist (`consent_peers_by_principals` plus its walks): the
+    /// single-flight's witness, as [`Self::owner_reads`] is the owner memo's.
+    /// `Relaxed`.
+    consent_set_reads: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#817 — how many times `rooted_with` actually walked the trust
+    /// root (its memo missed): the per-Deliver memo's witness. `Relaxed`.
+    rooted_walks: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#817 — test-only read probe: an injected delay and an
+    /// in-flight high-water mark at the persist reads the sweep permit must
+    /// bound. See [`ReadProbe`].
+    #[cfg(test)]
+    read_probe: ReadProbe,
     /// CIRISEdge#433 — the live metrics handle backing the WITHHOLD LEDGER + the
     /// replication-plane served counter. `None` makes every increment a no-op, so
     /// the (extensive) test constructions below stay untouched; every PRODUCTION
@@ -1648,6 +1752,10 @@ pub struct FederationDirectoryReplicationBridge {
     /// CIRISEdge#523 — the resolved owner-binding memo backing the Cohort-scoped
     /// advertise widening (`node_key_id → owner`). See [`OwnerCache`].
     owner_cache: Mutex<OwnerCache>,
+    /// CIRISEdge#817 — the owner memo's miss is SINGLE-FLIGHT per node, as
+    /// [`Self::consent_flight`] is for the send-set. The instant is `None` for
+    /// a re-checked hit and for an unresolved answer (never cached).
+    owner_flight: SingleFlight<String, (OwnerLookup, Option<Instant>)>,
     /// CIRISEdge#682 — the announce-state memo behind the identity-plane serve
     /// gate (`occurrence key → who may be handed its IdOcc/TD rows`). Same TTL
     /// and the same invalidation events as [`Self::owner_cache`], plus the
@@ -1958,6 +2066,11 @@ impl FederationDirectoryReplicationBridge {
             config,
             operational: None,
             consent_memo: Mutex::new(None),
+            consent_flight: SingleFlight::default(),
+            consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
+            rooted_walks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            read_probe: ReadProbe::default(),
             metrics: None,
             convergence: None,
             revocation_observer: None,
@@ -1967,6 +2080,7 @@ impl FederationDirectoryReplicationBridge {
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
+            owner_flight: SingleFlight::default(),
             announce_cache: Mutex::new(HashMap::new()),
             announce_reads: std::sync::atomic::AtomicUsize::new(0),
             kind_publish_selector: None,
@@ -2045,6 +2159,11 @@ impl FederationDirectoryReplicationBridge {
             config,
             operational: Some(operational),
             consent_memo: Mutex::new(None),
+            consent_flight: SingleFlight::default(),
+            consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
+            rooted_walks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            read_probe: ReadProbe::default(),
             metrics: None,
             convergence: None,
             revocation_observer: None,
@@ -2054,6 +2173,7 @@ impl FederationDirectoryReplicationBridge {
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
+            owner_flight: SingleFlight::default(),
             announce_cache: Mutex::new(HashMap::new()),
             announce_reads: std::sync::atomic::AtomicUsize::new(0),
             kind_publish_selector: None,
@@ -3696,265 +3816,33 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// CIRISEdge#379 — recipient-aware fetch: the serve-side twin of the
     /// listing gate, so a peer excluded from the listing cannot obtain a
     /// `trace:*` envelope anyway by Diff/Fetch-ing a hash it learned
-    /// out-of-band.
-    #[allow(clippy::too_many_lines)] // the serve-side twin set: five gates + the v18 projection twin
+    /// out-of-band. One fetch on its own: its peer-scoped memos live for this
+    /// call only. A Deliver's packing uses [`Self::fetch_envelope_bytes_for_peer_in`].
     async fn fetch_envelope_bytes_for_peer(
         &self,
         kind: EnvelopeKind,
         envelope_hash: &[u8; 32],
         peer_key_id: Option<&str>,
     ) -> Option<Vec<u8>> {
-        // CIRISEdge#433 / #429 — the requester asked for a hash we just claimed to
-        // hold and we cannot resolve it to bytes. This is the bridge-level ORIGIN
-        // of the advertised-then-unfetchable event `session::pack_bounded_deliver`
-        // reports in its `dropped` set (every entry there is this `None`); counting
-        // it HERE keeps it disjoint from the policy gates below — "we could not
-        // find it" never hides inside "we chose not to serve it". The `detail`
-        // string is built INSIDE the branch: this is the per-envelope serve path,
-        // and the happy path must not pay for an attribution nobody reads.
-        let Some(bytes) = self.fetch_envelope_bytes(kind, envelope_hash).await else {
-            self.withhold(
-                crate::observability::WithholdReason::EnvelopeUnfetchable,
-                peer_key_id.unwrap_or("<unattributed>"),
-                &Self::withhold_detail(kind, envelope_hash),
-            );
-            return None;
-        };
-        // CIRISEdge#682 — the direct-fetch twin of the announce-gated identity
-        // advertise: a peer that learned an unannounced node's occurrence or
-        // route hash out-of-band (or from a holder that relayed it) is not
-        // handed the bytes unless it is one of that node's owner's nodes. Keyed
-        // on the ROW's occurrence, so it covers a relayed row as well as our own.
-        if matches!(
-            kind,
-            EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination
-        ) && self
-            .identity_row_fetch_withholds(kind, &bytes, envelope_hash, peer_key_id)
+        self.serve_fetch(kind, envelope_hash, peer_key_id, &mut ServeMemos::default())
             .await
-        {
-            return None;
-        }
-        // CIRISEdge#758 / #761 (CC 5.4.6) — the direct-fetch twin of the
-        // per-peer membership-plane advertise: a peer that learned a group
-        // record's or a membership row's hash out-of-band is handed it only
-        // when persist's `may_receive_group_plane` admits it, the same
-        // predicate over the same `(scope, group, named)` the advertise read,
-        // so the two agree. A public group's rows reach any requester.
-        if is_membership_plane(kind)
-            && !self
-                .group_plane_fetch_serves(kind, &bytes, peer_key_id)
-                .await
-        {
-            return None;
-        }
-        if kind == EnvelopeKind::Attestation {
-            // CIRISEdge#440 — the direct-fetch twins of the advertise-sweep
-            // pause + quarantine gates, so a peer cannot obtain a paused
-            // `trace:*` row or a quarantined author's row by Diff/Fetch-ing a
-            // hash it learned out-of-band (the same twin discipline #379/#396
-            // established). Parse tolerance matches the sweep: an unparseable
-            // wire row is not gated here (the existing gates below keep their
-            // own parse-and-tolerate shape untouched).
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                let inner = value.get("attestation").unwrap_or(&value);
-                let peer_label = peer_key_id.unwrap_or("<unattributed>");
-                if Self::attestation_requires_serve(inner) && self.trace_plane_paused().await {
-                    self.withhold_config_paused(peer_label, "config-paused-fetch");
-                    return None;
-                }
-                if self
-                    .author_quarantine_withholds(inner, &mut HashMap::new(), peer_label)
-                    .await
-                {
-                    return None;
-                }
-                // Workstream F — the direct-fetch twin of the advertise sweep's
-                // relay gate, so a peer cannot obtain an `accord:*` row this
-                // node may not CARRY by Diff/Fetch-ing a hash it learned
-                // out-of-band (the twin discipline #379/#396/#440 established).
-                if self
-                    .accord_relay_withholds(inner, peer_label, "fetch")
-                    .await
-                {
-                    return None;
-                }
-                // v18 — the PROJECTION twin (the last un-twinned advertise gate).
-                // `attestation_is_advertised` structurally hides a `SelfOwn`-
-                // projecting row this node did not produce (a `self`/`family`
-                // attestation is published by its own producer, never relayed —
-                // the structural-invisibility discipline), but until now ONLY on
-                // the listing: a peer that learned the hash out-of-band was
-                // served the bytes anyway. The twin matches the advertise gate's
-                // semantics INCLUDING the v16 first-party override: a peer that
-                // is this row's author or data-subject fetches its OWN testimony
-                // (the same carve `pull_ref_is_serveable` grants the subject-Pull
-                // LIST — the #462 recovery right), and that carve deliberately
-                // bypasses the whole advertise predicate, malformed-scope decline
-                // included, so LIST and FETCH agree on the subject-Pull axis.
-                // An unattributed fetch has no first party and fails closed.
-                //
-                // The booked reason BORROWS `RecipientNotInSendSet` — the
-                // closest documented audience-membership variant (the enum is a
-                // closed operator vocabulary; no variant names the projection
-                // gate, and widening the enum is not this change's to make). The
-                // `detail` string names the true branch so a ledger reader is
-                // not misled toward the consent plane.
-                let first_party = match peer_key_id {
-                    Some(p) => self.fetch_is_first_party(inner, p).await,
-                    None => false,
-                };
-                if !first_party {
-                    let self_set: HashSet<String> = self
-                        .self_provider
-                        .as_ref()
-                        .map(|p| p())
-                        .unwrap_or_default()
-                        .into_iter()
-                        .collect();
-                    if !Self::attestation_is_advertised(inner, &self_set) {
-                        self.withhold(
-                            crate::observability::WithholdReason::RecipientNotInSendSet,
-                            peer_label,
-                            "projection: row not advertised by this node (SelfOwn fetch twin)",
-                        );
-                        tracing::debug!(
-                            peer = peer_label,
-                            envelope_hash = %hex::encode(&envelope_hash[..8]),
-                            "attestation withheld from direct fetch — the projection \
-                             structurally hides this row from third parties (SelfOwn \
-                             publish-own; only a first party may fetch it) (v18 \
-                             projection twin)"
-                        );
-                        return None;
-                    }
-                    // CC 5.2 (v19.0.0) — the AUDIENCE gate's fetch twin: agrees
-                    // with the advertise, so a row is never offered-then-refused
-                    // nor fetchable-when-unoffered. The recipient is resolved
-                    // FIRST (memoized; the same mint the consent bound below
-                    // repeats) so its reach feeds the gate exactly as on the
-                    // advertise (CIRISPersist#884).
-                    if let Some(peer) = peer_key_id {
-                        let resolved = self.resolve_attestation_recipient(peer).await?;
-                        let Ok(typed) = serde_json::from_value::<Attestation>(inner.clone()) else {
-                            self.withhold(
-                                crate::observability::WithholdReason::RecipientNotInSendSet,
-                                peer_label,
-                                "fetch: attestation does not decode — audience unreadable",
-                            );
-                            return None;
-                        };
-                        if self
-                            .audience_withholds(
-                                Self::audience_of_row_value(inner),
-                                inner,
-                                &typed,
-                                peer,
-                                resolved.reach(),
-                                &mut AudienceMemo::default(),
-                                "fetch",
-                            )
-                            .await
-                        {
-                            return None;
-                        }
-                    }
-                }
-            }
-            if let Some(peer) = peer_key_id {
-                // v16 review: FIRST-PARTY right overrides #396 producer-advertise-
-                // consent. If `peer` is this attestation's AUTHOR or DATA-SUBJECT it is
-                // fetching its OWN testimony — the same first-party carve the subject-
-                // Pull LIST gate (`pull_ref_is_serveable`) applies — so list and fetch
-                // AGREE (no advertised-then-unfetchable, no ref disclosed-then-withheld).
-                // For a first-party fetch the recipient IS the peer; #396 item-1
-                // consent-membership and item-6 recipient_capability do not apply. The
-                // E3 trace serve-cap gate below STILL does (a subject pulling its own
-                // `trace:*` row needs `infra:serve`, exactly as the list requires).
-                let first_party = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    Ok(v) => {
-                        self.fetch_is_first_party(v.get("attestation").unwrap_or(&v), peer)
-                            .await
-                    }
-                    Err(_) => false,
-                };
-                // #396 item 1 — the same consent-membership bound the listing applies,
-                // so a THIRD-party peer excluded from the advertise cannot obtain an
-                // attestation by fetching a hash it learned out-of-band. Fail-closed:
-                // no `ResolvedRecipient`, no bytes. (#433: `resolve_attestation_recipient`
-                // books its OWN branch's reason — no re-count here.)
-                let recipient: String = if first_party {
-                    peer.to_owned()
-                } else {
-                    self.resolve_attestation_recipient(peer)
-                        .await?
-                        .as_str()
-                        .to_owned()
-                };
-                // #379 `infra:serve` + #396 item 6 `recipient_capability`, over the WIRE
-                // bytes — the direct-fetch twins of the listing gates. The wire is the
-                // BARE `Attestation` (§3); tolerate the legacy `{"attestation": …}` wrap.
-                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                    let inner = value.get("attestation").unwrap_or(&value);
-                    if Self::attestation_requires_serve(inner)
-                        && !self.peer_has_serve_capability(&recipient).await
-                    {
-                        // #433: `peer_has_serve_capability` books the specific leg
-                        // (no-role / read-error / not-rooted / walk-error) — its
-                        // `bool` return is exactly the disjunction the ledger must
-                        // not report, so this site logs and does not count.
-                        tracing::debug!(
-                            peer,
-                            envelope_hash = %hex::encode(&envelope_hash[..8]),
-                            "trace attestation withheld — recipient lacks an effective \
-                             `infra:serve` capability (CIRISEdge#379)"
-                        );
-                        return None;
-                    }
-                    // #396 item 6 — recipient_capability gates a THIRD-party recipient
-                    // (an author-chosen audience). A first-party subject/author is not
-                    // such a recipient, so it does not apply (matches the list gate).
-                    if !first_party
-                        && self
-                            .recipient_capability_withholds(inner, &recipient, &mut HashMap::new())
-                            .await
-                    {
-                        // #433 — item 6 was the purest silent withhold on this path.
-                        // Countable now, booked inside `recipient_capability_withholds`
-                        // at the deciding branch, so this site does not re-count.
-                        return None;
-                    }
-                }
-            }
-        }
-        // CIRISEdge#433 — the replication plane's metric-visible moment. This is
-        // where the bridge hands the wire bytes back to `pack_bounded_deliver`;
-        // every gate has cleared and local state resolved the row, so THIS layer's
-        // part of the transaction is definitely complete. Mirrors the CIRISEdge#28
-        // precedent (`edge.rs`: "durable enqueue is the metric-visible moment"):
-        // count where success is definite for the layer doing the counting, not at
-        // a peer acknowledgement this layer never observes. Two known, deliberate
-        // imprecisions, both bounded and both in the honest direction: the caller
-        // may drop the LAST fetched envelope when it would exceed
-        // `MAX_DELIVER_ENVELOPE_BYTES` (at most one per Deliver, re-served next
-        // round), and a Deliver frame lost in flight still counts as served — the
-        // same semantics `envelopes_sent_total` has carried since v0.19.0.
-        if let Some(m) = self.metrics.as_ref() {
-            m.inc_replication_served(kind);
-            // CIRISEdge#441 — a removal-class serve is an OFFER in the receipt
-            // ledger: this peer was handed the row; the ack arrives when its
-            // own next Summary advertises the hash.
-            if is_removal_kind(kind) {
-                if let Some(p) = peer_key_id {
-                    m.removal_offer(
-                        kind,
-                        *envelope_hash,
-                        p,
-                        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
-                    );
-                }
-            }
-        }
-        Some(bytes)
+    }
+
+    /// CIRISEdge#817 — the fetch inside one Deliver's batch: the gates are
+    /// [`Self::fetch_envelope_bytes_for_peer`]'s, and the peer-scoped verdicts
+    /// they fold ([`ServeMemos`]) are shared by the batch's fetches and dropped
+    /// with it.
+    async fn fetch_envelope_bytes_for_peer_in(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: &[u8; 32],
+        peer_key_id: Option<&str>,
+        batch: &mut crate::replication::FetchBatch,
+    ) -> Option<Vec<u8>> {
+        let memos = batch.scratch::<ServeMemos>();
+        memos.bind(peer_key_id);
+        self.serve_fetch(kind, envelope_hash, peer_key_id, memos)
+            .await
     }
 
     async fn apply_envelope_bytes(
@@ -4040,6 +3928,277 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
 }
 
 impl FederationDirectoryReplicationBridge {
+    /// The body of [`ReplicationDirectory::fetch_envelope_bytes_for_peer`]:
+    /// every serve gate of the direct-fetch twin, with the peer-scoped memos in
+    /// `memos` (CIRISEdge#817: one call's, or one Deliver's).
+    #[allow(clippy::too_many_lines)] // the serve-side twin set: five gates + the v18 projection twin
+    async fn serve_fetch(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: &[u8; 32],
+        peer_key_id: Option<&str>,
+        memos: &mut ServeMemos,
+    ) -> Option<Vec<u8>> {
+        // CIRISEdge#433 / #429 — the requester asked for a hash we just claimed to
+        // hold and we cannot resolve it to bytes. This is the bridge-level ORIGIN
+        // of the advertised-then-unfetchable event `session::pack_bounded_deliver`
+        // reports in its `dropped` set (every entry there is this `None`); counting
+        // it HERE keeps it disjoint from the policy gates below — "we could not
+        // find it" never hides inside "we chose not to serve it". The `detail`
+        // string is built INSIDE the branch: this is the per-envelope serve path,
+        // and the happy path must not pay for an attribution nobody reads.
+        let Some(bytes) = self.fetch_envelope_bytes(kind, envelope_hash).await else {
+            self.withhold(
+                crate::observability::WithholdReason::EnvelopeUnfetchable,
+                peer_key_id.unwrap_or("<unattributed>"),
+                &Self::withhold_detail(kind, envelope_hash),
+            );
+            return None;
+        };
+        // CIRISEdge#682 — the direct-fetch twin of the announce-gated identity
+        // advertise: a peer that learned an unannounced node's occurrence or
+        // route hash out-of-band (or from a holder that relayed it) is not
+        // handed the bytes unless it is one of that node's owner's nodes. Keyed
+        // on the ROW's occurrence, so it covers a relayed row as well as our own.
+        if matches!(
+            kind,
+            EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination
+        ) && self
+            .identity_row_fetch_withholds(kind, &bytes, envelope_hash, peer_key_id)
+            .await
+        {
+            return None;
+        }
+        // CIRISEdge#758 / #761 (CC 5.4.6) — the direct-fetch twin of the
+        // per-peer membership-plane advertise: a peer that learned a group
+        // record's or a membership row's hash out-of-band is handed it only
+        // when persist's `may_receive_group_plane` admits it, the same
+        // predicate over the same `(scope, group, named)` the advertise read,
+        // so the two agree. A public group's rows reach any requester.
+        if is_membership_plane(kind)
+            && !self
+                .group_plane_fetch_serves(kind, &bytes, peer_key_id)
+                .await
+        {
+            return None;
+        }
+        if kind == EnvelopeKind::Attestation {
+            // CIRISEdge#440 — the direct-fetch twins of the advertise-sweep
+            // pause + quarantine gates, so a peer cannot obtain a paused
+            // `trace:*` row or a quarantined author's row by Diff/Fetch-ing a
+            // hash it learned out-of-band (the same twin discipline #379/#396
+            // established). Parse tolerance matches the sweep: an unparseable
+            // wire row is not gated here (the existing gates below keep their
+            // own parse-and-tolerate shape untouched).
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                let inner = value.get("attestation").unwrap_or(&value);
+                let peer_label = peer_key_id.unwrap_or("<unattributed>");
+                if Self::attestation_requires_serve(inner) && self.trace_plane_paused().await {
+                    self.withhold_config_paused(peer_label, "config-paused-fetch");
+                    return None;
+                }
+                if self
+                    .author_quarantine_withholds(inner, &mut memos.quarantine, peer_label)
+                    .await
+                {
+                    return None;
+                }
+                // Workstream F — the direct-fetch twin of the advertise sweep's
+                // relay gate, so a peer cannot obtain an `accord:*` row this
+                // node may not CARRY by Diff/Fetch-ing a hash it learned
+                // out-of-band (the twin discipline #379/#396/#440 established).
+                if self
+                    .accord_relay_withholds(inner, peer_label, "fetch")
+                    .await
+                {
+                    return None;
+                }
+                // v18 — the PROJECTION twin (the last un-twinned advertise gate).
+                // `attestation_is_advertised` structurally hides a `SelfOwn`-
+                // projecting row this node did not produce (a `self`/`family`
+                // attestation is published by its own producer, never relayed —
+                // the structural-invisibility discipline), but until now ONLY on
+                // the listing: a peer that learned the hash out-of-band was
+                // served the bytes anyway. The twin matches the advertise gate's
+                // semantics INCLUDING the v16 first-party override: a peer that
+                // is this row's author or data-subject fetches its OWN testimony
+                // (the same carve `pull_ref_is_serveable` grants the subject-Pull
+                // LIST — the #462 recovery right), and that carve deliberately
+                // bypasses the whole advertise predicate, malformed-scope decline
+                // included, so LIST and FETCH agree on the subject-Pull axis.
+                // An unattributed fetch has no first party and fails closed.
+                //
+                // The booked reason BORROWS `RecipientNotInSendSet` — the
+                // closest documented audience-membership variant (the enum is a
+                // closed operator vocabulary; no variant names the projection
+                // gate, and widening the enum is not this change's to make). The
+                // `detail` string names the true branch so a ledger reader is
+                // not misled toward the consent plane.
+                let first_party = match peer_key_id {
+                    Some(p) => {
+                        self.fetch_is_first_party(inner, p, &mut memos.audience)
+                            .await
+                    }
+                    None => false,
+                };
+                if !first_party {
+                    let self_set: HashSet<String> = self
+                        .self_provider
+                        .as_ref()
+                        .map(|p| p())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
+                    if !Self::attestation_is_advertised(inner, &self_set) {
+                        self.withhold(
+                            crate::observability::WithholdReason::RecipientNotInSendSet,
+                            peer_label,
+                            "projection: row not advertised by this node (SelfOwn fetch twin)",
+                        );
+                        tracing::debug!(
+                            peer = peer_label,
+                            envelope_hash = %hex::encode(&envelope_hash[..8]),
+                            "attestation withheld from direct fetch — the projection \
+                             structurally hides this row from third parties (SelfOwn \
+                             publish-own; only a first party may fetch it) (v18 \
+                             projection twin)"
+                        );
+                        return None;
+                    }
+                    // CC 5.2 (v19.0.0) — the AUDIENCE gate's fetch twin: agrees
+                    // with the advertise, so a row is never offered-then-refused
+                    // nor fetchable-when-unoffered. The recipient is resolved
+                    // FIRST (memoized; the same mint the consent bound below
+                    // repeats) so its reach feeds the gate exactly as on the
+                    // advertise (CIRISPersist#884).
+                    if let Some(peer) = peer_key_id {
+                        let resolved = self.resolve_attestation_recipient(peer).await?;
+                        let Ok(typed) = serde_json::from_value::<Attestation>(inner.clone()) else {
+                            self.withhold(
+                                crate::observability::WithholdReason::RecipientNotInSendSet,
+                                peer_label,
+                                "fetch: attestation does not decode — audience unreadable",
+                            );
+                            return None;
+                        };
+                        if self
+                            .audience_withholds(
+                                Self::audience_of_row_value(inner),
+                                inner,
+                                &typed,
+                                peer,
+                                resolved.reach(),
+                                &mut memos.audience,
+                                "fetch",
+                            )
+                            .await
+                        {
+                            return None;
+                        }
+                    }
+                }
+            }
+            if let Some(peer) = peer_key_id {
+                // v16 review: FIRST-PARTY right overrides #396 producer-advertise-
+                // consent. If `peer` is this attestation's AUTHOR or DATA-SUBJECT it is
+                // fetching its OWN testimony — the same first-party carve the subject-
+                // Pull LIST gate (`pull_ref_is_serveable`) applies — so list and fetch
+                // AGREE (no advertised-then-unfetchable, no ref disclosed-then-withheld).
+                // For a first-party fetch the recipient IS the peer; #396 item-1
+                // consent-membership and item-6 recipient_capability do not apply. The
+                // E3 trace serve-cap gate below STILL does (a subject pulling its own
+                // `trace:*` row needs `infra:serve`, exactly as the list requires).
+                let first_party = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(v) => {
+                        self.fetch_is_first_party(
+                            v.get("attestation").unwrap_or(&v),
+                            peer,
+                            &mut memos.audience,
+                        )
+                        .await
+                    }
+                    Err(_) => false,
+                };
+                // #396 item 1 — the same consent-membership bound the listing applies,
+                // so a THIRD-party peer excluded from the advertise cannot obtain an
+                // attestation by fetching a hash it learned out-of-band. Fail-closed:
+                // no `ResolvedRecipient`, no bytes. (#433: `resolve_attestation_recipient`
+                // books its OWN branch's reason — no re-count here.)
+                let recipient: String = if first_party {
+                    peer.to_owned()
+                } else {
+                    self.resolve_attestation_recipient(peer)
+                        .await?
+                        .as_str()
+                        .to_owned()
+                };
+                // #379 `infra:serve` + #396 item 6 `recipient_capability`, over the WIRE
+                // bytes — the direct-fetch twins of the listing gates. The wire is the
+                // BARE `Attestation` (§3); tolerate the legacy `{"attestation": …}` wrap.
+                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    let inner = value.get("attestation").unwrap_or(&value);
+                    if Self::attestation_requires_serve(inner)
+                        && !self.peer_has_serve_capability(&recipient).await
+                    {
+                        // #433: `peer_has_serve_capability` books the specific leg
+                        // (no-role / read-error / not-rooted / walk-error) — its
+                        // `bool` return is exactly the disjunction the ledger must
+                        // not report, so this site logs and does not count.
+                        tracing::debug!(
+                            peer,
+                            envelope_hash = %hex::encode(&envelope_hash[..8]),
+                            "trace attestation withheld — recipient lacks an effective \
+                             `infra:serve` capability (CIRISEdge#379)"
+                        );
+                        return None;
+                    }
+                    // #396 item 6 — recipient_capability gates a THIRD-party recipient
+                    // (an author-chosen audience). A first-party subject/author is not
+                    // such a recipient, so it does not apply (matches the list gate).
+                    if !first_party
+                        && self
+                            .recipient_capability_withholds(inner, &recipient, &mut memos.grants)
+                            .await
+                    {
+                        // #433 — item 6 was the purest silent withhold on this path.
+                        // Countable now, booked inside `recipient_capability_withholds`
+                        // at the deciding branch, so this site does not re-count.
+                        return None;
+                    }
+                }
+            }
+        }
+        // CIRISEdge#433 — the replication plane's metric-visible moment. This is
+        // where the bridge hands the wire bytes back to `pack_bounded_deliver`;
+        // every gate has cleared and local state resolved the row, so THIS layer's
+        // part of the transaction is definitely complete. Mirrors the CIRISEdge#28
+        // precedent (`edge.rs`: "durable enqueue is the metric-visible moment"):
+        // count where success is definite for the layer doing the counting, not at
+        // a peer acknowledgement this layer never observes. Two known, deliberate
+        // imprecisions, both bounded and both in the honest direction: the caller
+        // may drop the LAST fetched envelope when it would exceed
+        // `MAX_DELIVER_ENVELOPE_BYTES` (at most one per Deliver, re-served next
+        // round), and a Deliver frame lost in flight still counts as served — the
+        // same semantics `envelopes_sent_total` has carried since v0.19.0.
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_replication_served(kind);
+            // CIRISEdge#441 — a removal-class serve is an OFFER in the receipt
+            // ledger: this peer was handed the row; the ack arrives when its
+            // own next Summary advertises the hash.
+            if is_removal_kind(kind) {
+                if let Some(p) = peer_key_id {
+                    m.removal_offer(
+                        kind,
+                        *envelope_hash,
+                        p,
+                        u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0),
+                    );
+                }
+            }
+        }
+        Some(bytes)
+    }
+
     /// CIRISEdge#776 — an admitted owner binding or identity occurrence made
     /// its node / occurrence key an occurrence of an identity: release the rows
     /// refused while that SIGNER was unbound (keyed on the signer — never a
@@ -4466,6 +4625,10 @@ impl FederationDirectoryReplicationBridge {
                 }
             }
             EnvelopeKind::Attestation => {
+                // CIRISEdge#817 — one Pull's rows share one set of peer-scoped
+                // memos: the requester is the same for every row, and the
+                // answer is one sweep (the advertise's freshness class).
+                let mut memos = ServeMemos::default();
                 // DATA-SUBJECT axis — records ABOUT the subject (the 84-family
                 // revocation-reachability set), MINUS the G2 self-non-retainable
                 // scores.
@@ -4479,7 +4642,10 @@ impl FederationDirectoryReplicationBridge {
                     let seq = Self::ms_seq(att.asserted_at);
                     match content_hash_of(&att) {
                         Some((hash, _)) => {
-                            if self.pull_ref_is_serveable(&att, subject_key_id).await {
+                            if self
+                                .pull_ref_is_serveable(&att, subject_key_id, &mut memos)
+                                .await
+                            {
                                 push(hash, seq);
                             }
                         }
@@ -4497,7 +4663,10 @@ impl FederationDirectoryReplicationBridge {
                     let seq = Self::ms_seq(att.asserted_at);
                     match content_hash_of(&att) {
                         Some((hash, _)) => {
-                            if self.pull_ref_is_serveable(&att, subject_key_id).await {
+                            if self
+                                .pull_ref_is_serveable(&att, subject_key_id, &mut memos)
+                                .await
+                            {
                                 push(hash, seq);
                             }
                         }
@@ -4536,7 +4705,12 @@ impl FederationDirectoryReplicationBridge {
     /// — so the fetch twin's first-party carve keeps `fetch_envelope_bytes_for_peer`
     /// in agreement with this LIST on every ref it discloses. No projection gate
     /// is needed here.)
-    async fn pull_ref_is_serveable(&self, att: &Attestation, requester: &str) -> bool {
+    async fn pull_ref_is_serveable(
+        &self,
+        att: &Attestation,
+        requester: &str,
+        memos: &mut ServeMemos,
+    ) -> bool {
         let Ok(value) = serde_json::to_value(att) else {
             // An unserializable row is not disclosed — and it is BOOKED, exactly
             // as the advertise twins book the identical failure (#433: eligible
@@ -4567,7 +4741,7 @@ impl FederationDirectoryReplicationBridge {
         }
         // A quarantined author's row is withheld on every path.
         if self
-            .author_quarantine_withholds(&value, &mut HashMap::new(), requester)
+            .author_quarantine_withholds(&value, &mut memos.quarantine, requester)
             .await
         {
             return false;
@@ -4590,7 +4764,7 @@ impl FederationDirectoryReplicationBridge {
         // fetch twin ([`Self::fetch_is_first_party`]) serves it.
         if Self::is_key_grant_set(&value)
             && !self
-                .may_receive_cached(att, requester, &mut AudienceMemo::default())
+                .may_receive_cached(att, requester, &mut memos.audience)
                 .await
                 .allowed()
         {
@@ -5734,6 +5908,8 @@ impl FederationDirectoryReplicationBridge {
         if let Some(hit) = memo.rooted.get(peer_key_id) {
             return *hit;
         }
+        self.rooted_walks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let verdict = self.rooted_with_uncached(peer_key_id).await;
         memo.rooted.insert(peer_key_id.to_owned(), verdict);
         verdict
@@ -6382,7 +6558,12 @@ impl FederationDirectoryReplicationBridge {
     /// is no reason to send it there, or a deny would be cosmetic). The
     /// subject-Pull list ([`Self::pull_ref_is_serveable`]) asks the same, so
     /// list and fetch agree.
-    async fn fetch_is_first_party(&self, inner: &serde_json::Value, peer: &str) -> bool {
+    async fn fetch_is_first_party(
+        &self,
+        inner: &serde_json::Value,
+        peer: &str,
+        memo: &mut AudienceMemo,
+    ) -> bool {
         if !Self::attestation_is_first_party_to(inner, peer) {
             return false;
         }
@@ -6390,10 +6571,7 @@ impl FederationDirectoryReplicationBridge {
             return true;
         }
         match serde_json::from_value::<Attestation>(inner.clone()) {
-            Ok(att) => self
-                .may_receive_cached(&att, peer, &mut AudienceMemo::default())
-                .await
-                .allowed(),
+            Ok(att) => self.may_receive_cached(&att, peer, memo).await.allowed(),
             Err(_) => false,
         }
     }
@@ -7115,14 +7293,62 @@ impl FederationDirectoryReplicationBridge {
     ///   "never cache a failure", and the difference is deliberate: #523 caches
     ///   ONE node's verdict (a cached failure pins that node dark), while this
     ///   caches a SET whose failure only omits members.
+    ///
+    /// # CIRISEdge#817 — one read per miss, under the sweep permit
+    ///
+    /// A miss is single-flight ([`Self::consent_flight`]): concurrent callers
+    /// await the one read in progress rather than each re-reading the full
+    /// history. The read itself runs under a sweep permit, so its copy counts
+    /// against [`BridgeConfig::advertise_sweep_permits`] like every other
+    /// page of the sweep. No caller of this holds a permit (it runs before
+    /// the attestation sweep's first page, and on the fetch path, which takes
+    /// none), so the acquire cannot re-enter the gate; the waiters hold no
+    /// permit while they wait.
     async fn resolved_peer_set(&self, local: &str) -> Option<ResolvedPeerSet> {
-        if let Ok(memo) = self.consent_memo.lock() {
-            if let Some((set, resolved_at)) = memo.as_ref() {
-                if resolved_at.elapsed() < CONSENT_SEND_SET_MEMO_TTL {
-                    return Some(set.clone());
-                }
-            }
+        if let Some(hit) = self.fresh_consent_memo() {
+            return Some(hit);
         }
+        let (set, _) = self
+            .consent_flight
+            .run(
+                &(),
+                || async {
+                    // A flight that landed between our miss and our joining
+                    // has filled the memo already.
+                    if let Some(hit) = self.fresh_consent_memo() {
+                        return (Some(hit), None);
+                    }
+                    let _permit = self.sweep_gate.enter().await;
+                    let set = self.read_peer_set(local).await;
+                    (set, Some(Instant::now()))
+                },
+                |(set, at)| {
+                    if let (Some(set), Some(at)) = (set, at) {
+                        if let Ok(mut memo) = self.consent_memo.lock() {
+                            *memo = Some((set.clone(), *at));
+                        }
+                    }
+                },
+            )
+            .await;
+        set
+    }
+
+    /// The consent memo's value iff it is younger than
+    /// [`CONSENT_SEND_SET_MEMO_TTL`].
+    fn fresh_consent_memo(&self) -> Option<ResolvedPeerSet> {
+        let memo = self.consent_memo.lock().ok()?;
+        let (set, resolved_at) = memo.as_ref()?;
+        (resolved_at.elapsed() < CONSENT_SEND_SET_MEMO_TTL).then(|| set.clone())
+    }
+
+    /// One read of the consent send-set from persist: the body of a
+    /// [`Self::resolved_peer_set`] miss. `None` on a directory error.
+    async fn read_peer_set(&self, local: &str) -> Option<ResolvedPeerSet> {
+        self.consent_set_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        let _probe = self.read_probe.enter(true).await;
         // CIRISEdge#609 / CIRISPersist#857 (v44.6.0) — consent is authored by
         // the HUMAN, for THIS machine. A node key holds topology, not consent:
         // the owner's opt-in is the owner's act, so the grant row is keyed by
@@ -7167,9 +7393,6 @@ impl FederationDirectoryReplicationBridge {
             "attestation send-set resolved (consent ∪ owner-bound ∪ self-collective; \
              CIRISEdge#396/#524, CIRISPersist#884)"
         );
-        if let Ok(mut memo) = self.consent_memo.lock() {
-            *memo = Some((set.clone(), Instant::now()));
-        }
         Some(set)
     }
 
@@ -7876,27 +8099,68 @@ impl FederationDirectoryReplicationBridge {
     /// apply path invalidates on the events that move the answer.
     ///
     /// A failed resolution is NOT cached (see [`CachedOwner::owner`]).
+    ///
+    /// CIRISEdge#817 — a miss is single-flight per node
+    /// ([`Self::owner_flight`]): concurrent sweeps that miss the same node
+    /// await one `owner_of` rather than each walking it. No sweep permit is
+    /// taken here: this runs inside permit-holding sections (the attestation
+    /// page's audience gates), and the gate is not re-entrant.
     async fn owner_of_cached(&self, node_key_id: &str) -> OwnerLookup {
-        if let Ok(cache) = self.owner_cache.lock() {
-            if let Some(hit) = cache.get_fresh(node_key_id, Instant::now()) {
-                return hit;
-            }
+        if let Some(hit) = self.fresh_owner(node_key_id) {
+            return hit;
         }
+        self.owner_flight
+            .run(
+                &node_key_id.to_owned(),
+                || async {
+                    if let Some(hit) = self.fresh_owner(node_key_id) {
+                        return (hit, None);
+                    }
+                    self.read_owner_of(node_key_id).await
+                },
+                |(lookup, at)| {
+                    let Some(at) = at else { return };
+                    let owner = match lookup {
+                        OwnerLookup::Owner(o) => Some(o.clone()),
+                        OwnerLookup::Unowned => None,
+                        OwnerLookup::Unresolved => return,
+                    };
+                    if let Ok(mut cache) = self.owner_cache.lock() {
+                        cache.put(node_key_id, owner, *at);
+                    }
+                },
+            )
+            .await
+            .0
+    }
+
+    /// The owner memo's answer for `node_key_id` iff it is still fresh.
+    fn fresh_owner(&self, node_key_id: &str) -> Option<OwnerLookup> {
+        self.owner_cache
+            .lock()
+            .ok()?
+            .get_fresh(node_key_id, Instant::now())
+    }
+
+    /// One `owner_of` read: the body of an [`Self::owner_of_cached`] miss.
+    /// The instant is when the answer landed, and `None` for an unresolved
+    /// answer, which is never cached.
+    async fn read_owner_of(&self, node_key_id: &str) -> (OwnerLookup, Option<Instant>) {
         // The `std` mutex is never held across the await (the #400 shape).
         self.owner_reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        let _probe = self.read_probe.enter(false).await;
         let resolved = ciris_persist::federation::admission::owner_of(
             &*self.directory as &dyn ciris_persist::federation::FederationDirectory,
             node_key_id,
         )
         .await;
         match resolved {
-            Ok(owner) => {
-                if let Ok(mut cache) = self.owner_cache.lock() {
-                    cache.put(node_key_id, owner.clone(), Instant::now());
-                }
-                owner.map_or(OwnerLookup::Unowned, OwnerLookup::Owner)
-            }
+            Ok(owner) => (
+                owner.map_or(OwnerLookup::Unowned, OwnerLookup::Owner),
+                Some(Instant::now()),
+            ),
             // Mirrors `edge.rs`'s `key_is_own_node` error handling exactly:
             // `AmbiguousNodeOwner` and a read error are the SAME fail-closed
             // outcome — a `self`/ownership boundary is never resolved from an
@@ -7908,7 +8172,7 @@ impl FederationDirectoryReplicationBridge {
                     "owner_of unresolved — the Cohort-scoped advertise keeps the \
                      direct-key test only (CIRISEdge#523 fail-closed)"
                 );
-                OwnerLookup::Unresolved
+                (OwnerLookup::Unresolved, None)
             }
         }
     }
@@ -7938,6 +8202,11 @@ impl FederationDirectoryReplicationBridge {
     /// [`CONSENT_SEND_SET_MEMO_TTL`]. Same trade the #523 memo took, made in
     /// the same direction.
     fn invalidate_owner_memo(&self, key_id: &str) {
+        // CIRISEdge#817 — the flights first, so a read already in progress can
+        // neither store its pre-event answer nor serve a caller arriving after
+        // the event (see [`crate::replication::single_flight`]).
+        self.owner_flight.invalidate();
+        self.consent_flight.invalidate();
         if let Ok(mut cache) = self.owner_cache.lock() {
             cache.invalidate(key_id);
         }
@@ -8004,6 +8273,8 @@ impl FederationDirectoryReplicationBridge {
     /// no key_id to evict by. Revocations are rare; the memos refill on the
     /// next resolve.
     fn invalidate_owner_memo_all(&self) {
+        self.owner_flight.invalidate();
+        self.consent_flight.invalidate();
         if let Ok(mut cache) = self.owner_cache.lock() {
             cache.by_node.clear();
         }
@@ -8369,6 +8640,11 @@ impl FederationDirectoryReplicationBridge {
     /// alone (it proves no person, so no member, invitee or named arm can
     /// hold). Memoized per gate; a refusal is booked at every row it refuses.
     /// Fail-closed: a directory error refuses.
+    ///
+    /// CIRISEdge#817 — every caller holds a sweep permit across this: the
+    /// advertise through `sweep_paged_gated`'s per-page permit, the fetch twin
+    /// through its own ([`Self::group_plane_fetch_serves`]). It takes none
+    /// itself, because the advertise caller already holds one.
     async fn group_plane_admits(
         &self,
         gate: &mut GroupPlaneGate<'_>,
@@ -8381,6 +8657,12 @@ impl FederationDirectoryReplicationBridge {
         let verdict = if let Some(v) = gate.memo.get(plane) {
             *v
         } else {
+            #[cfg(test)]
+            self.read_probe
+                .group_plane_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(test)]
+            let _probe = self.read_probe.enter(true).await;
             let dir = &*self.directory as &dyn ciris_persist::federation::FederationDirectory;
             let answer = match gate.peer {
                 Some(p) => may_receive_group_plane(
@@ -8450,6 +8732,14 @@ impl FederationDirectoryReplicationBridge {
             );
             return false;
         };
+        // CIRISEdge#817 — the fetch twin's `may_receive_group_plane` (and its
+        // `live_invitees_of`) copies count against the sweep permits, as the
+        // advertise's do: there the read runs inside `sweep_paged_gated`'s
+        // per-page permit; here, per fetch, nothing held one. Taken only after
+        // the no-group refusal above, so refusing stays instant, and nothing
+        // on the fetch path holds a permit already (the gate is not
+        // re-entrant).
+        let _permit = self.sweep_gate.enter().await;
         self.group_plane_admits(&mut gate, kind, &plane).await
     }
 
@@ -23071,6 +23361,10 @@ pub(crate) mod tests {
             );
         }
     }
+
+    // CIRISEdge#817 — the sweep-bound witnesses: single-flight memos and the
+    // permit around the membership-plane and send-set reads.
+    mod sweep_bounds_817;
 }
 
 // ─── CIRISEdge#531 — the advertise-sweep WIDTH bound ─────────────────

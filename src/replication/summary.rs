@@ -116,6 +116,59 @@ impl LocalState {
 /// [`DirectoryStateAdapter`]: super::directory::DirectoryStateAdapter
 /// [`ReplicationDirectory`]: super::directory::ReplicationDirectory
 /// [`Session`]: super::session::Session
+/// **CIRISEdge#817 — one Deliver's fetch scope.**
+///
+/// A responder packs a `Deliver` by fetching the requester's wants one at a
+/// time until the byte budget is reached; the initiator's proactive push does
+/// the same under its own budget. Every fetch on the Attestation plane runs
+/// the serve gates, and those gates fold persist state that is a fact about
+/// the PEER, not the row (`rooted_with`, the author's quarantine standing, the
+/// consent grant). With a fresh memo per row, a Deliver of N rows walked the
+/// trust root N times: at full scale 2.75 s a row, 96% of a sweep.
+///
+/// A `FetchBatch` is the scratch space for ONE such packing: one peer, one
+/// message, seconds long, then dropped. That is the freshness class the
+/// advertise's per-sweep memo already has (CIRISEdge#659: "never cached past a
+/// `withdraws`, a halt or persist's `bounded_until`, because a sweep is
+/// seconds and the next one asks again"), so a verdict reused inside a batch
+/// is never older than one the advertise would reuse. Nothing in it survives
+/// the batch: the next Deliver starts empty and asks persist again.
+///
+/// The contents are the implementation's own ([`Self::scratch`]); the session
+/// only creates the batch and drops it.
+#[derive(Default)]
+pub struct FetchBatch {
+    slot: Option<Box<dyn std::any::Any + Send>>,
+}
+
+impl std::fmt::Debug for FetchBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FetchBatch")
+            .field("in_use", &self.slot.is_some())
+            .finish()
+    }
+}
+
+impl FetchBatch {
+    /// An empty batch, for one Deliver.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The implementation's scratch of type `T` for this batch, created empty
+    /// on first use. A batch holds one type; asking for another replaces it.
+    pub fn scratch<T: Default + Send + 'static>(&mut self) -> &mut T {
+        if !self.slot.as_ref().is_some_and(|s| s.is::<T>()) {
+            self.slot = Some(Box::new(T::default()));
+        }
+        self.slot
+            .as_mut()
+            .and_then(|s| s.downcast_mut::<T>())
+            .expect("the slot was just set to a T")
+    }
+}
+
 #[async_trait]
 pub trait StateProvider: Send + Sync {
     /// Snapshot the refs this node OFFERS to the round's peer for `kind` — the
@@ -241,6 +294,19 @@ pub trait StateProvider: Send + Sync {
     /// during the Deliver-message construction step.
     async fn fetch_envelope(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32])
         -> Option<Vec<u8>>;
+
+    /// CIRISEdge#817 — [`Self::fetch_envelope`] inside one Deliver's
+    /// [`FetchBatch`]. The session calls this for every fetch of one packing,
+    /// with the same batch. Defaults to the per-hash fetch, ignoring the
+    /// batch; the production adapter forwards it to the bridge.
+    async fn fetch_envelope_in(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: &[u8; 32],
+        _batch: &mut FetchBatch,
+    ) -> Option<Vec<u8>> {
+        self.fetch_envelope(kind, envelope_hash).await
+    }
 
     /// CIRISEdge#462 — the RECEIVE-axis SERVE reader: the refs this node holds
     /// for `kind` where `subject_key_id` is the data-subject (`list_signed_records`)

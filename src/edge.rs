@@ -8369,6 +8369,11 @@ impl EdgeBuilder {
         for transport in &self.transports {
             transport.attach_metrics(metrics.clone());
         }
+        // CIRISEdge#771 — the wired chunk source counts into the SAME bag
+        // (the legacy DAG walk): the one settled on above, never a second.
+        if let Some(source) = self.blob_chunk_source.as_deref() {
+            source.attach_metrics(metrics.clone());
+        }
 
         Ok(Edge {
             verify,

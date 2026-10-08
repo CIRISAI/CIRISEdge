@@ -38,103 +38,10 @@
 //! cohabitation-only capability, which matters precisely because the
 //! Pi/iOS hosts that run sovereign are the ones that hit disk pressure.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{serve_result_to_chunk, BlobChunkSource, ChunkSourceRefusal, ContentScope};
-
-/// CIRISEdge#766 — **how many files' chunk sets the serve gate remembers.**
-///
-/// The #717 membership check is a question about a whole file (is this
-/// chunk one of the DAG's?), and answering it from the stream listing costs
-/// the whole listing: asked once per chunk served, that is O(n²) per file
-/// (≈ 645 ms per chunk at 2 GiB). The answer is the same set for every chunk
-/// of the file, so it is read once and kept, keyed by the DAG's address.
-///
-/// Bounded by FILE count, least-recently-used out: at most this many files'
-/// sets are held. A set is 32 bytes per chunk (a sorted slice), so the bound
-/// in bytes is `32 × Σ chunks` — at the ~2.5 GiB file ceiling in 256 KiB
-/// chunks (≈ 10,240 chunks, 320 KiB a file), ≤ 10 MiB for 32 files. A node
-/// serving more files than this at once re-reads a listing per file it
-/// brings back, never per chunk.
-pub const MEMBERSHIP_CACHE_FILES: usize = 32;
-
-/// One file's chunk set, and the inputs it was read under.
-struct Membership {
-    /// The ids of the rows referencing the DAG when the set was read,
-    /// sorted. The set is valid only while the same rows reference it: a
-    /// row withdrawn out of the directory, or a new widening naming another
-    /// stream, changes this and the set is read again.
-    rows: Vec<String>,
-    /// The chunk shas of every stream those rows name (and agree with),
-    /// sorted and deduplicated — a lookup is a binary search.
-    chunks: Box<[[u8; 32]]>,
-    /// The cache's clock at the last hit, for least-recently-used eviction.
-    used: u64,
-}
-
-/// CIRISEdge#766 — the per-file membership sets, LRU-bounded by file count.
-/// Pure (no I/O), so its rules are unit-tested alone.
-#[derive(Default)]
-struct MembershipCache {
-    entries: HashMap<[u8; 32], Membership>,
-    clock: u64,
-}
-
-impl MembershipCache {
-    /// Is `chunk` in the set held for `dag`, read under exactly `rows`?
-    /// `false` covers "no set", "a set read under other rows" and "not in
-    /// the set" alike: each sends the caller to the listing.
-    fn hit(&mut self, dag: &[u8; 32], rows: &[String], chunk: &[u8; 32]) -> bool {
-        self.clock += 1;
-        let clock = self.clock;
-        match self.entries.get_mut(dag) {
-            Some(m) if m.rows == rows && m.chunks.binary_search(chunk).is_ok() => {
-                m.used = clock;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Hold `chunks` as `dag`'s set, read under `rows`, evicting the
-    /// least-recently-used file when `cap` files are already held.
-    fn put(&mut self, dag: [u8; 32], rows: Vec<String>, mut chunks: Vec<[u8; 32]>, cap: usize) {
-        if cap == 0 {
-            return;
-        }
-        chunks.sort_unstable();
-        chunks.dedup();
-        self.clock += 1;
-        if !self.entries.contains_key(&dag) && self.entries.len() >= cap {
-            if let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, m)| m.used)
-                .map(|(k, _)| *k)
-            {
-                self.entries.remove(&oldest);
-            }
-        }
-        self.entries.insert(
-            dag,
-            Membership {
-                rows,
-                chunks: chunks.into_boxed_slice(),
-                used: self.clock,
-            },
-        );
-    }
-
-    /// Drop `dag`'s set (its references were withdrawn, or none remain).
-    fn forget(&mut self, dag: &[u8; 32]) {
-        self.entries.remove(dag);
-    }
-
-    fn holds(&self, dag: &[u8; 32]) -> bool {
-        self.entries.contains_key(dag)
-    }
-}
 
 /// A [`BlobChunkSource`] that answers from a persist substrate through
 /// the gated peer-serve door.
@@ -148,11 +55,31 @@ pub struct PersistBlobChunkSource {
     /// serve-side refusal: a blob whose every known reference has been
     /// withdrawn answers [`ChunkSourceRefusal::Withdrawn`] instead of being
     /// served. `None` is pre-#606 behaviour.
+    ///
+    /// **CIRISEdge#771 — still load-bearing after persist #979.** Persist's
+    /// chunk→manifest link (V176) is written only where a manifest becomes a
+    /// DAG on this node (the seal, the promote). A withdrawn DAG with NO link
+    /// — sealed or pulled before persist v53.1.0, or held by a node that never
+    /// promoted it — is never backfilled, because promote refuses a withdrawn
+    /// manifest; and a row that cites its blob only through a `BlobPointer`
+    /// (no `evidence_refs`) is invisible to persist's own fold. For both, this
+    /// register is the only refusal of the DAG's chunks once the manifest has
+    /// been evicted. Production wires it on every source
+    /// (`replication::runtime`, `edge_node`).
     revocations: Option<Arc<super::RevocationRegister>>,
-    /// CIRISEdge#766 — each served file's chunk set, read once per file
-    /// instead of once per chunk ([`MEMBERSHIP_CACHE_FILES`]).
-    membership: Mutex<MembershipCache>,
+    /// CIRISEdge#771 — where the legacy DAG walk is counted
+    /// (`blob_serve_legacy_dag_walks`). Attached by [`crate::EdgeBuilder::build`]
+    /// through [`BlobChunkSource::attach_metrics`], or given with
+    /// [`with_metrics`](Self::with_metrics); the first one set wins.
+    metrics: OnceLock<crate::observability::EdgeMetrics>,
+    /// CIRISEdge#771 — manifests already named at INFO as served through the
+    /// legacy walk (once per manifest, bounded by [`LEGACY_LOGGED_CAP`]).
+    legacy_logged: Mutex<HashSet<[u8; 32]>>,
 }
+
+/// CIRISEdge#771 — how many distinct manifests the legacy-walk INFO line
+/// names before it stops naming new ones. The counter keeps counting past it.
+pub const LEGACY_LOGGED_CAP: usize = 4_096;
 
 impl std::fmt::Debug for PersistBlobChunkSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -171,7 +98,8 @@ impl PersistBlobChunkSource {
         Self {
             engine,
             revocations: None,
-            membership: Mutex::new(MembershipCache::default()),
+            metrics: OnceLock::new(),
+            legacy_logged: Mutex::new(HashSet::new()),
         }
     }
 
@@ -180,6 +108,17 @@ impl PersistBlobChunkSource {
     #[must_use]
     pub fn with_revocations(mut self, register: Option<Arc<super::RevocationRegister>>) -> Self {
         self.revocations = register;
+        self
+    }
+
+    /// CIRISEdge#771 — count legacy DAG walks into `metrics`, for a source
+    /// that is not handed to an [`crate::EdgeBuilder`] (which attaches its own
+    /// bag). `None` leaves the source as it is.
+    #[must_use]
+    pub fn with_metrics(self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
+        if let Some(m) = metrics {
+            let _ = self.metrics.set(m);
+        }
         self
     }
 
@@ -193,63 +132,180 @@ impl PersistBlobChunkSource {
     ) -> Self {
         Self::new(ciris_persist::Engine::from_shared(backend, signer))
     }
-
-    /// CIRISEdge#766 — whether the serve gate currently holds `dag`'s chunk
-    /// set. For witnesses that the membership cache was warm (or dropped)
-    /// when they asked.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn holds_membership_of(&self, dag: &[u8; 32]) -> bool {
-        self.membership.lock().is_ok_and(|c| c.holds(dag))
-    }
-
-    fn forget_membership(&self, dag: &[u8; 32]) {
-        if let Ok(mut c) = self.membership.lock() {
-            c.forget(dag);
-        }
-    }
 }
 
 impl PersistBlobChunkSource {
-    /// CIRISEdge#717 — **is `chunk` one of the chunks of the DAG at `dag`,
-    /// in this store?** Two readings, either sufficient, neither guessed:
+    /// CIRISEdge#717 / #771 — **is `chunk` one of the chunks of the DAG at
+    /// `dag`, in this store, and is that DAG still live?**
     ///
-    /// 1. **The stream a referencing row names.** A sealed DAG's manifest is
-    ///    an envelope this door does not open, but every row referencing the
-    ///    DAG carries its pointer in clear, and the pointer's `stream_id` is
-    ///    the stream the chunks were written (or adopted) at. The chunk must
-    ///    be listed there — AND the stream's own row (`federation_streams`,
-    ///    V143: the cohort and community its first append named) must agree
-    ///    with the row naming it, so a row cannot borrow another room's
-    ///    stream by naming its id.
-    /// 2. **A clear manifest.** A plaintext DAG's root is its manifest,
-    ///    which lists the chunks by sha — including a DAG pulled whole
-    ///    through `put_blob_chunks`, which writes no stream rows.
+    /// 1. **The named DAG's own fold.** Persist's `binding_state` of the
+    ///    DAG's address: a DAG every referencing row of which is withdrawn
+    ///    answers `Withdrawn` for every chunk named under it — including a
+    ///    chunk another, live DAG also holds (which persist's chunk fold
+    ///    rightly reads `Live`, and which would otherwise be served under the
+    ///    withdrawn file's name).
+    /// 2. **Persist's link** (CIRISPersist#979, V176):
+    ///    [`Engine::dag_contains_chunk`](ciris_persist::Engine::dag_contains_chunk),
+    ///    a point query over the relation persist itself wrote at the seal or
+    ///    the promote — never an author's claim. A DAG that HAS a link is
+    ///    answered by it alone: a chunk outside it is not a member, whatever
+    ///    any row names (CIRISEdge#771 replaced the #766 per-file cache and
+    ///    edge's own stream walk with this).
+    /// 3. **A clear manifest.** A plaintext DAG's root is its manifest, which
+    ///    lists the chunks by sha — a DAG pulled whole through
+    ///    `put_blob_chunks`, which persist does not link.
+    /// 4. **Legacy, a sealed DAG with no link** (sealed or pulled before
+    ///    persist v53.1.0 and never promoted again): the pre-#771 reading —
+    ///    the stream a referencing row names, counted only where the stream's
+    ///    own row (V143) agrees with the row's cohort and community. Reached
+    ///    ONLY when persist holds no relation for the manifest at all
+    ///    (`chunks_of_manifest` empty) AND the head is a `chunk_dag` — never
+    ///    because a linked DAG lacks the chunk (that is step 2's refusal), and
+    ///    never for a whole blob, which also answers empty. Uncached, so its
+    ///    O(chunks) listing is paid per chunk; counted in
+    ///    `blob_serve_legacy_dag_walks` and named at INFO once per manifest.
+    ///    **Sunset:** the walk shrinks with CIRISPersist#994's backfill (a
+    ///    boot/lazy sweep under the re-promote predicate) — it does not end
+    ///    with it: a manifest this node cannot open stays unrelated after
+    ///    #994, and the walk stays for those. The counter measures what is
+    ///    left.
     ///
     /// Anything unreadable reads as "not a member": this is a refusal gate,
-    /// and it fails closed.
-    ///
-    /// **CIRISEdge#766 — once per file, not once per chunk.** Reading (1)
-    /// lists the whole stream; the set it yields is the same for every chunk
-    /// of the file, so it is kept ([`MEMBERSHIP_CACHE_FILES`]) under the ids
-    /// of the rows it was read through. The rows are read fresh on every
-    /// call (an indexed lookup, as before), and a set read under other rows
-    /// is not used: the membership answer rests on exactly the inputs the
-    /// uncached check read, except the listing itself. A chunk NOT in the
-    /// held set re-reads the listing (a relay still adopting the stream
-    /// grows it), so a cached miss never refuses what the listing would
-    /// admit. Withdrawal is honoured where it always was — the revocation
-    /// register's `Revoked` verdict, checked before this gate on every
-    /// chunk, which also drops the file's set — and the bytes are still
-    /// read through the gated door per chunk: a held set says only "a
-    /// member", never "servable".
+    /// and it fails closed. A `Withdrawn` from ANY of these reads is the
+    /// answer, never skipped (v40.0.2: a swallowed `Withdrawn` on a secondary
+    /// door read as `ChunkNotInNamedDag`).
     async fn chunk_in_named_dag(
         &self,
         dag: [u8; 32],
         chunk: [u8; 32],
         requester: &str,
     ) -> DagMembership {
+        use ciris_persist::federation::blob_tombstone::{binding_state, BindingState};
         use ciris_persist::federation::{BlobBody, BlobError};
+        let dag_hex = hex::encode(dag);
+        let directory = self.engine.federation_directory();
+        match binding_state(&*directory, &dag).await {
+            Ok(BindingState::Withdrawn { .. }) => return DagMembership::Withdrawn,
+            Ok(_) => {}
+            // Fail closed, as every other unreadable read here: a DAG whose
+            // binding state cannot be read may be withdrawn, and a membership
+            // answer must not serve it on the strength of its link alone.
+            Err(e) => {
+                tracing::warn!(
+                    blob = %dag_hex,
+                    error = %e,
+                    "PersistBlobChunkSource: the named DAG's binding state could not be read — \
+                     not a member (fail-closed, CIRISEdge#771)"
+                );
+                return DagMembership::NotMember;
+            }
+        }
+        match self.engine.dag_contains_chunk(&dag, &chunk).await {
+            Ok(true) => return DagMembership::Member,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    blob = %dag_hex,
+                    error = %e,
+                    "PersistBlobChunkSource: persist's chunk→manifest link could not be read — \
+                     not a member (fail-closed, CIRISEdge#771)"
+                );
+                return DagMembership::NotMember;
+            }
+        }
+        match self.engine.chunks_of_manifest(&dag).await {
+            // The DAG is linked and the chunk is not in it: the link is the
+            // answer, and no row can widen it (persist I485).
+            Ok(linked) if !linked.is_empty() => return DagMembership::NotMember,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    blob = %dag_hex,
+                    error = %e,
+                    "PersistBlobChunkSource: persist's chunk→manifest link could not be read — \
+                     not a member (fail-closed, CIRISEdge#771)"
+                );
+                return DagMembership::NotMember;
+            }
+        }
+        // No relation for this manifest. Persist's contract (CIRISPersist#994):
+        // an empty list means "no relation", and a WHOLE blob answers empty
+        // too — so only a `chunk_dag` head goes on. A whole blob named as a
+        // DAG has no chunks to be a member of, and never reaches the walk.
+        match self.blob_head_kind(&dag).await {
+            Some(kind) if kind == "chunk_dag" => {}
+            _ => return DagMembership::NotMember,
+        }
+        match self.engine.serve_blob_to_peer(&dag, requester).await {
+            Ok(BlobBody::ChunkDag(manifest)) => {
+                return if manifest.chunks.iter().any(|c| c.sha == chunk) {
+                    DagMembership::Member
+                } else {
+                    DagMembership::NotMember
+                };
+            }
+            // persist v53.1 (#979): the manifest itself is refused Withdrawn.
+            Err(BlobError::Withdrawn { .. }) => return DagMembership::Withdrawn,
+            // A sealed `chunk_dag` root serves as its inline envelope: the
+            // legacy reading below.
+            Ok(BlobBody::Inline(_)) => {}
+            _ => return DagMembership::NotMember,
+        }
+        let answer = self.legacy_stream_membership(dag, chunk).await;
+        self.note_legacy_walk(&dag, answer);
+        answer
+    }
+
+    /// The head's `storage_kind`, or `None` when nothing is held (or the head
+    /// cannot be read: fail-closed, no walk).
+    #[allow(unreachable_patterns)] // the wildcard is live only when persist builds without `postgres`
+    async fn blob_head_kind(&self, sha: &[u8; 32]) -> Option<String> {
+        use ciris_persist::federation::BlobStorage as _;
+        let head = match self.engine.backend() {
+            ciris_persist::BackendDispatch::Sqlite(b) => b.blob_head(sha).await,
+            #[cfg(feature = "pyo3")]
+            ciris_persist::BackendDispatch::Postgres(b) => b.blob_head(sha).await,
+            _ => return None,
+        };
+        match head {
+            Ok(head) => head.map(|h| h.storage_kind),
+            Err(e) => {
+                tracing::warn!(
+                    blob = %hex::encode(sha),
+                    error = %e,
+                    "PersistBlobChunkSource: the named DAG's head could not be read — not a \
+                     member (fail-closed, CIRISEdge#771)"
+                );
+                None
+            }
+        }
+    }
+
+    /// CIRISEdge#771 — count one legacy walk, and name its manifest at INFO
+    /// the first time, so the fallback's sunset is measured, not guessed.
+    fn note_legacy_walk(&self, dag: &[u8; 32], answer: DagMembership) {
+        if let Some(m) = self.metrics.get() {
+            m.inc_blob_serve_legacy_dag_walk();
+        }
+        let first = self
+            .legacy_logged
+            .lock()
+            .is_ok_and(|mut seen| seen.len() < LEGACY_LOGGED_CAP && seen.insert(*dag));
+        if first {
+            tracing::info!(
+                blob = %hex::encode(dag),
+                answer = ?answer,
+                "PersistBlobChunkSource: a sealed chunk_dag with no chunk→manifest link — \
+                 membership read by the legacy stream walk until persist relates it \
+                 (CIRISEdge#771, CIRISPersist#994); counted in blob_serve_legacy_dag_walks"
+            );
+        }
+    }
+
+    /// CIRISEdge#717's reading, kept for a sealed DAG persist has not linked
+    /// (see [`chunk_in_named_dag`](Self::chunk_in_named_dag), step 4).
+    async fn legacy_stream_membership(&self, dag: [u8; 32], chunk: [u8; 32]) -> DagMembership {
+        use ciris_persist::federation::BlobError;
         let dag_hex = hex::encode(dag);
         // CIRISEdge#736 — the widenings too: a family file's placement on its
         // author's node is the `supersedes` widening its own `self` row, and
@@ -268,23 +324,9 @@ impl PersistBlobChunkSource {
                     "PersistBlobChunkSource: the rows referencing the named DAG could not be \
                      read — its stream is unknown (CIRISEdge#717)"
                 );
-                Vec::new()
+                return DagMembership::NotMember;
             }
         };
-        let mut row_ids: Vec<String> = rows.iter().map(|r| r.attestation_id.clone()).collect();
-        row_ids.sort_unstable();
-        if row_ids.is_empty() {
-            // Nothing references the DAG any more: no stream is its stream.
-            self.forget_membership(&dag);
-        } else if self
-            .membership
-            .lock()
-            .is_ok_and(|mut c| c.hit(&dag, &row_ids, &chunk))
-        {
-            return DagMembership::Member;
-        }
-        let mut members: Vec<[u8; 32]> = Vec::new();
-        let mut listed = false;
         for row in &rows {
             let Some(fields) = row.attestation_envelope.as_object() else {
                 continue;
@@ -302,13 +344,9 @@ impl PersistBlobChunkSource {
                 };
                 let listing = match self.engine.stream_chunks(stream_id).await {
                     Ok(l) => l,
-                    // persist v53.1 (#979): a withdrawn DAG's stream refuses
-                    // through the chunk→manifest link. That IS the answer:
-                    // the chunk is in the DAG, and the DAG is withdrawn.
-                    Err(BlobError::Withdrawn { .. }) => {
-                        self.forget_membership(&dag);
-                        return DagMembership::Withdrawn;
-                    }
+                    // The stream refuses through a link persist holds for it:
+                    // the chunk's DAG is withdrawn. That IS the answer.
+                    Err(BlobError::Withdrawn { .. }) => return DagMembership::Withdrawn,
                     Err(_) => continue,
                 };
                 if let Some(head) = &listing.stream {
@@ -330,44 +368,23 @@ impl PersistBlobChunkSource {
                         continue;
                     }
                 }
-                listed = true;
-                members.extend(listing.chunks.iter().map(|c| c.chunk_sha));
+                if listing.chunks.iter().any(|c| c.chunk_sha == chunk) {
+                    return DagMembership::Member;
+                }
             }
         }
-        if listed {
-            let found = members.contains(&chunk);
-            if let Ok(mut c) = self.membership.lock() {
-                c.put(dag, row_ids, members, MEMBERSHIP_CACHE_FILES);
-            }
-            if found {
-                return DagMembership::Member;
-            }
-        }
-        match self.engine.serve_blob_to_peer(&dag, requester).await {
-            Ok(BlobBody::ChunkDag(manifest)) if manifest.chunks.iter().any(|c| c.sha == chunk) => {
-                DagMembership::Member
-            }
-            // persist v53.1 (#979): the manifest itself is refused Withdrawn.
-            Err(BlobError::Withdrawn { .. }) => {
-                self.forget_membership(&dag);
-                DagMembership::Withdrawn
-            }
-            _ => DagMembership::NotMember,
-        }
+        DagMembership::NotMember
     }
 }
 
-/// CIRISEdge#717 / #766 — what the serve gate learns about `(dag, chunk)`.
+/// CIRISEdge#717 / #771 — what the serve gate learns about `(dag, chunk)`.
 ///
 /// Three answers, because two of them are refusals with different remedies:
 /// a chunk that is not one of the named DAG's is `ChunkNotInNamedDag` (the
-/// requester named the wrong file); a chunk of a DAG whose every reference
-/// is withdrawn is `Withdrawn` (CC 2.3 at the bytes plane, the one refusal
-/// the fetcher aborts on). Since persist v53.1 (#979) the store answers the
-/// second itself, through the chunk→manifest link, when the DAG's stream
-/// or manifest is read; before this enum that answer was swallowed on the
-/// cold path and reported as the first, while a warm cache reached the serve
-/// door and reported the second: the same door answering two ways.
+/// requester named the wrong file); a chunk of a withdrawn DAG is `Withdrawn`
+/// (CC 2.3 at the bytes plane, the one refusal the fetcher aborts on). Every
+/// read [`PersistBlobChunkSource::chunk_in_named_dag`] makes can return the
+/// second, and each returns it rather than falling through to the first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DagMembership {
     Member,
@@ -401,8 +418,6 @@ impl BlobChunkSource for PersistBlobChunkSource {
                     "PersistBlobChunkSource: every reference to this blob was withdrawn — \
                      refusing Withdrawn (CC 2.3 at the bytes plane, CIRISEdge#606)",
                 );
-                // CIRISEdge#766 — and the file's held chunk set goes with it.
-                self.forget_membership(&blob_sha256);
                 return Err(ChunkSourceRefusal::Withdrawn);
             }
         }
@@ -499,63 +514,9 @@ impl BlobChunkSource for PersistBlobChunkSource {
     async fn chunk_scope(&self, _blob_sha256: [u8; 32]) -> Option<ContentScope> {
         None
     }
-}
 
-#[cfg(test)]
-mod membership_cache_tests {
-    use super::MembershipCache;
-
-    fn rows(ids: &[&str]) -> Vec<String> {
-        ids.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    #[test]
-    fn a_held_set_answers_only_its_own_chunks_under_its_own_rows_766() {
-        let mut c = MembershipCache::default();
-        let (x, y) = ([1u8; 32], [2u8; 32]);
-        c.put(x, rows(&["r1"]), vec![[9; 32], [7; 32], [9; 32]], 4);
-        assert!(c.hit(&x, &rows(&["r1"]), &[7; 32]), "a member of X's set");
-        assert!(
-            c.hit(&x, &rows(&["r1"]), &[9; 32]),
-            "dedup keeps the member"
-        );
-        assert!(!c.hit(&x, &rows(&["r1"]), &[8; 32]), "not a member of X");
-        assert!(
-            !c.hit(&y, &rows(&["r1"]), &[7; 32]),
-            "X's set says nothing about Y"
-        );
-        assert!(
-            !c.hit(&x, &rows(&["r1", "r2"]), &[7; 32]),
-            "a set read under other rows is not used (a row added)"
-        );
-        assert!(!c.hit(&x, &rows(&[]), &[7; 32]), "or a row gone");
-        c.forget(&x);
-        assert!(
-            !c.holds(&x) && !c.hit(&x, &rows(&["r1"]), &[7; 32]),
-            "forgotten"
-        );
-    }
-
-    #[test]
-    fn the_cache_holds_at_most_cap_files_least_recently_used_out_766() {
-        let mut c = MembershipCache::default();
-        let r = rows(&["r"]);
-        for i in 0..3u8 {
-            c.put([i; 32], r.clone(), vec![[i; 32]], 3);
-        }
-        // Touch file 0, so file 1 is the least recently used.
-        assert!(c.hit(&[0; 32], &r, &[0; 32]));
-        c.put([3; 32], r.clone(), vec![[3; 32]], 3);
-        assert_eq!(c.entries.len(), 3, "bounded by file count");
-        assert!(!c.holds(&[1; 32]), "the least recently used file went");
-        assert!(c.holds(&[0; 32]) && c.holds(&[2; 32]) && c.holds(&[3; 32]));
-        // Re-putting a held file replaces it without evicting another.
-        c.put([3; 32], r.clone(), vec![[4; 32]], 3);
-        assert_eq!(c.entries.len(), 3);
-        assert!(c.hit(&[3; 32], &r, &[4; 32]) && !c.hit(&[3; 32], &r, &[3; 32]));
-        // A zero cap holds nothing.
-        let mut z = MembershipCache::default();
-        z.put([5; 32], r.clone(), vec![[5; 32]], 0);
-        assert!(!z.holds(&[5; 32]));
+    /// CIRISEdge#771 — the Edge's metrics bag, for the legacy-walk counter.
+    fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
+        let _ = self.metrics.set(metrics);
     }
 }
