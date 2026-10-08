@@ -465,11 +465,12 @@ pub use verify::{
 // visible at the crate root before `include_scaffolding!` runs.
 #[cfg(feature = "ffi-uniffi")]
 pub use ffi::uniffi_types::{
-    EdgeBindingsError, EdgeBlackholeEntry, EdgeErrorEvent, EdgeInFlightAnnounce, EdgeLinkHandle,
-    EdgeLinkInfo, EdgeLinkState, EdgeMetricsSnapshot, EdgeNetworkEvent, EdgePathEntry,
-    EdgePeerFilter, EdgePeerHandle, EdgePeerHealth, EdgePeerInfo, EdgePeerPolicy, EdgePeerTrust,
-    EdgeProbeResult, EdgeRateEntry, EdgeReverseEntry, EdgeRoutingPathEntry, EdgeTransportHandle,
-    EdgeTransportHealth, EdgeTransportInfo, EdgeTransportSpec, EdgeTransportStats, EdgeTunnelInfo,
+    EdgeBindingsError, EdgeBlackholeEntry, EdgeErrorEvent, EdgeInFlightAnnounce, EdgeLinkDirection,
+    EdgeLinkHandle, EdgeLinkInfo, EdgeLinkState, EdgeMetricsSnapshot, EdgeNetworkEvent,
+    EdgePathEntry, EdgePeerFilter, EdgePeerHandle, EdgePeerHealth, EdgePeerInfo, EdgePeerPolicy,
+    EdgePeerTrust, EdgeProbeResult, EdgeRateEntry, EdgeReverseEntry, EdgeRoutingPathEntry,
+    EdgeTransportHandle, EdgeTransportHealth, EdgeTransportInfo, EdgeTransportSpec,
+    EdgeTransportStats, EdgeTunnelInfo,
 };
 
 // UDL function bodies live in `ffi::uniffi_impl` — re-exported here

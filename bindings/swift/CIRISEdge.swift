@@ -796,10 +796,11 @@ public struct EdgeLinkInfo: Equatable, Hashable {
     public var mdu: UInt32
     public var transportId: String
     public var transportKind: String
+    public var direction: EdgeLinkDirection
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(linkId: Data, peerIdentityHash: Data, state: EdgeLinkState, ageSeconds: UInt64, rssiDbm: Double?, snrDb: Double?, establishmentRateKbps: Double?, mtu: UInt32, mdu: UInt32, transportId: String, transportKind: String) {
+    public init(linkId: Data, peerIdentityHash: Data, state: EdgeLinkState, ageSeconds: UInt64, rssiDbm: Double?, snrDb: Double?, establishmentRateKbps: Double?, mtu: UInt32, mdu: UInt32, transportId: String, transportKind: String, direction: EdgeLinkDirection) {
         self.linkId = linkId
         self.peerIdentityHash = peerIdentityHash
         self.state = state
@@ -811,6 +812,7 @@ public struct EdgeLinkInfo: Equatable, Hashable {
         self.mdu = mdu
         self.transportId = transportId
         self.transportKind = transportKind
+        self.direction = direction
     }
 
     
@@ -839,7 +841,8 @@ public struct FfiConverterTypeEdgeLinkInfo: FfiConverterRustBuffer {
                 mtu: FfiConverterUInt32.read(from: &buf), 
                 mdu: FfiConverterUInt32.read(from: &buf), 
                 transportId: FfiConverterString.read(from: &buf), 
-                transportKind: FfiConverterString.read(from: &buf)
+                transportKind: FfiConverterString.read(from: &buf), 
+                direction: FfiConverterTypeEdgeLinkDirection.read(from: &buf)
         )
     }
 
@@ -855,6 +858,7 @@ public struct FfiConverterTypeEdgeLinkInfo: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.mdu, into: &buf)
         FfiConverterString.write(value.transportId, into: &buf)
         FfiConverterString.write(value.transportKind, into: &buf)
+        FfiConverterTypeEdgeLinkDirection.write(value.direction, into: &buf)
     }
 }
 
@@ -2214,6 +2218,80 @@ public func FfiConverterTypeEdgeBindingsError_lift(_ buf: RustBuffer) throws -> 
 public func FfiConverterTypeEdgeBindingsError_lower(_ value: EdgeBindingsError) -> RustBuffer {
     return FfiConverterTypeEdgeBindingsError.lower(value)
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum EdgeLinkDirection: Equatable, Hashable {
+    
+    case inbound
+    case outbound
+    case unknown
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension EdgeLinkDirection: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEdgeLinkDirection: FfiConverterRustBuffer {
+    typealias SwiftType = EdgeLinkDirection
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EdgeLinkDirection {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .inbound
+        
+        case 2: return .outbound
+        
+        case 3: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EdgeLinkDirection, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .inbound:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .outbound:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeLinkDirection_lift(_ buf: RustBuffer) throws -> EdgeLinkDirection {
+    return try FfiConverterTypeEdgeLinkDirection.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEdgeLinkDirection_lower(_ value: EdgeLinkDirection) -> RustBuffer {
+    return FfiConverterTypeEdgeLinkDirection.lower(value)
+}
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
