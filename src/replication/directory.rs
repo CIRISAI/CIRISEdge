@@ -57,7 +57,7 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use super::protocol::{EnvelopeKind, EnvelopeRef};
-use super::summary::{ApplyOutcome, StateApplier, StateProvider};
+use super::summary::{ApplyOutcome, FetchBatch, StateApplier, StateProvider};
 
 /// Narrow API the replication module needs from a federation directory
 /// backing. Implementations:
@@ -172,6 +172,21 @@ pub trait ReplicationDirectory: Send + Sync {
         _peer_key_id: Option<&str>,
     ) -> Option<Vec<u8>> {
         self.fetch_envelope_bytes(kind, envelope_hash).await
+    }
+
+    /// CIRISEdge#817 — [`Self::fetch_envelope_bytes_for_peer`] inside one
+    /// Deliver's [`FetchBatch`]: the same gates, with the peer-scoped verdicts
+    /// they fold shared across the batch and dropped with it. Defaults to the
+    /// per-hash fetch; the bridge overrides.
+    async fn fetch_envelope_bytes_for_peer_in(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: &[u8; 32],
+        peer_key_id: Option<&str>,
+        _batch: &mut FetchBatch,
+    ) -> Option<Vec<u8>> {
+        self.fetch_envelope_bytes_for_peer(kind, envelope_hash, peer_key_id)
+            .await
     }
 
     /// CIRISEdge#544 — has this node already refused `(kind, envelope_hash)`
@@ -368,6 +383,22 @@ impl StateProvider for DirectoryStateAdapter {
     ) -> Option<Vec<u8>> {
         self.inner
             .fetch_envelope_bytes_for_peer(kind, envelope_hash, self.peer_key_id.as_deref())
+            .await
+    }
+
+    async fn fetch_envelope_in(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: &[u8; 32],
+        batch: &mut FetchBatch,
+    ) -> Option<Vec<u8>> {
+        self.inner
+            .fetch_envelope_bytes_for_peer_in(
+                kind,
+                envelope_hash,
+                self.peer_key_id.as_deref(),
+                batch,
+            )
             .await
     }
 
