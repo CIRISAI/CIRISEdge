@@ -432,6 +432,14 @@ enum EdgeLinkState {
     "Stale",
 };
 
+// CIRISEdge#853 — which end opened the link. `Unknown` only for a link whose
+// establishment event the listener has not processed yet.
+enum EdgeLinkDirection {
+    "Inbound",
+    "Outbound",
+    "Unknown",
+};
+
 dictionary EdgeLinkHandle {
     bytes link_id;
 };
@@ -448,6 +456,7 @@ dictionary EdgeLinkInfo {
     u32 mdu;
     string transport_id;
     string transport_kind;
+    EdgeLinkDirection direction;
 };
 
 // ─── #33 Routing-table types (v0.15.0) ──────────────────────────────

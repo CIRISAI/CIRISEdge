@@ -167,6 +167,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::MlsMessageBodyIn;
 use openmls::prelude::{
     BasicCredential, Ciphersuite, CredentialWithKey, KeyPackage, KeyPackageBundle, MlsGroup,
@@ -184,6 +185,7 @@ use ciris_crypto::hpke::{HpkeSealed, XWingRecipientPublic, XWingRecipientSecret}
 use ciris_crypto::hybrid_kex::HybridHandshakeMsg;
 use ciris_crypto::MlDsa65Signer;
 
+use crate::mls::crypto_panic::{catch_crypto_panic, check_key_package_key_lengths, guard_group_op};
 use crate::mls::welcome_wrap::{self, FederationDirectoryEntry, WelcomeWrapError, WrappedWelcome};
 use crate::transport::federation_session::{OwnKexKeys, PeerKexPubkeys};
 
@@ -412,6 +414,13 @@ pub enum MlsError {
     /// from an authentication failure.
     #[error("realtime Welcome wrap/unwrap failed: {0}")]
     WelcomeWrapFailed(String),
+    /// openmls panicked inside its crypto provider and the panic was
+    /// contained (CIRISEdge#822: `libcrux-kem` 0.0.7 panics on a short
+    /// X-Wing key, RUSTSEC-2026-0330/0331). The message carries the panic
+    /// text and whether the session's group was restored to its
+    /// pre-operation state; see [`crate::mls::crypto_panic`].
+    #[error("MLS crypto panicked (contained): {0}")]
+    CryptoPanic(String),
 }
 
 /// A CIRIS-shaped wrapper around an [`openmls::prelude::MlsGroup`]
@@ -528,26 +537,33 @@ impl MlsSession {
             .use_ratchet_tree_extension(true)
             .build();
 
-        let mut group = MlsGroup::new(
-            provider.as_ref(),
-            &signer,
-            &create_config,
-            own_credential_with_key,
-        )
-        .map_err(|e| MlsError::CreateFailed(format!("MlsGroup::new: {e:?}")))?;
+        // Group creation plus the initial Add (CIRISEdge#822): no session
+        // exists until this returns, so a contained panic drops the fresh
+        // provider and group with the error and there is nothing to restore.
+        let group = catch_crypto_panic(|| {
+            let mut group = MlsGroup::new(
+                provider.as_ref(),
+                &signer,
+                &create_config,
+                own_credential_with_key,
+            )
+            .map_err(|e| MlsError::CreateFailed(format!("MlsGroup::new: {e:?}")))?;
 
-        // Add the initial members. openmls returns (commit,
-        // welcome, group_info); for the create-time call we
-        // immediately merge our own pending commit (we ARE the
-        // committer; there's no one else to wait on).
-        if !member_key_packages.is_empty() {
-            group
-                .add_members(provider.as_ref(), &signer, &member_key_packages)
-                .map_err(|e| MlsError::CreateFailed(format!("initial add_members: {e:?}")))?;
-            group
-                .merge_pending_commit(provider.as_ref())
-                .map_err(|e| MlsError::CreateFailed(format!("merge initial commit: {e:?}")))?;
-        }
+            // Add the initial members. openmls returns (commit,
+            // welcome, group_info); for the create-time call we
+            // immediately merge our own pending commit (we ARE the
+            // committer; there's no one else to wait on).
+            if !member_key_packages.is_empty() {
+                group
+                    .add_members(provider.as_ref(), &signer, &member_key_packages)
+                    .map_err(|e| MlsError::CreateFailed(format!("initial add_members: {e:?}")))?;
+                group
+                    .merge_pending_commit(provider.as_ref())
+                    .map_err(|e| MlsError::CreateFailed(format!("merge initial commit: {e:?}")))?;
+            }
+            Ok::<_, MlsError>(group)
+        })
+        .map_err(MlsError::CryptoPanic)??;
 
         let root = export_root_secret(&group, provider.as_ref())?;
 
@@ -576,14 +592,7 @@ impl MlsSession {
     ) -> Result<(Commit, Welcome, RootSecret), MlsError> {
         let (kp, sig_pub) = mint_member_key_package(&self.provider, &new_member.key_id)?;
 
-        let (commit_msg, welcome_msg, _group_info) = self
-            .group
-            .add_members(self.provider.as_ref(), &self.signer, &[kp])
-            .map_err(|e| MlsError::CommitAddFailed(format!("{e:?}")))?;
-
-        self.group
-            .merge_pending_commit(self.provider.as_ref())
-            .map_err(|e| MlsError::CommitAddFailed(format!("merge_pending_commit: {e:?}")))?;
+        let (commit_msg, welcome_msg, _group_info) = self.guarded_add(kp)?;
 
         self.member_signature_keys
             .insert(new_member.key_id.clone(), sig_pub);
@@ -610,21 +619,31 @@ impl MlsSession {
     ///
     /// Returns the [`Commit`] (for existing members), the [`Welcome`]
     /// (for the joiner), and the new epoch's [`RootSecret`].
+    ///
+    /// The KeyPackage came from the joiner, so it is refused with
+    /// [`MlsError::KeyPackageBuildFailed`] unless its `init_key` and leaf
+    /// `encryption_key` are exactly the X-Wing public-key length
+    /// (CIRISEdge#822; [`crate::mls::crypto_panic`]).
     pub fn commit_add_published(
+        &mut self,
+        key_id: &str,
+        key_package: KeyPackage,
+    ) -> Result<(Commit, Welcome, RootSecret), MlsError> {
+        check_key_package_key_lengths(&key_package).map_err(MlsError::KeyPackageBuildFailed)?;
+        self.commit_add_published_unchecked(key_id, key_package)
+    }
+
+    /// [`Self::commit_add_published`] past its key-length gate. Separate
+    /// so a test can hand the Add a short-keyed KeyPackage and watch the
+    /// panic guard, not the gate, refuse it.
+    fn commit_add_published_unchecked(
         &mut self,
         key_id: &str,
         key_package: KeyPackage,
     ) -> Result<(Commit, Welcome, RootSecret), MlsError> {
         let sig_pub = key_package.leaf_node().signature_key().as_slice().to_vec();
 
-        let (commit_msg, welcome_msg, _group_info) = self
-            .group
-            .add_members(self.provider.as_ref(), &self.signer, &[key_package])
-            .map_err(|e| MlsError::CommitAddFailed(format!("{e:?}")))?;
-
-        self.group
-            .merge_pending_commit(self.provider.as_ref())
-            .map_err(|e| MlsError::CommitAddFailed(format!("merge_pending_commit: {e:?}")))?;
+        let (commit_msg, welcome_msg, _group_info) = self.guarded_add(key_package)?;
 
         self.member_signature_keys
             .insert(key_id.to_string(), sig_pub);
@@ -709,6 +728,28 @@ impl MlsSession {
         ))
     }
 
+    /// `add_members` + `merge_pending_commit` for one KeyPackage, under
+    /// [`guard_group_op`]. The Add HPKE-encrypts the Welcome to the
+    /// KeyPackage's `init_key` and path secrets to the copath; on a
+    /// contained panic the group is restored to its pre-Add state and the
+    /// caller has not yet touched `member_signature_keys`.
+    fn guarded_add(
+        &mut self,
+        key_package: KeyPackage,
+    ) -> Result<(MlsMessageOut, MlsMessageOut, Option<GroupInfo>), MlsError> {
+        let signer = &self.signer;
+        guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
+            let out = group
+                .add_members(provider, signer, &[key_package])
+                .map_err(|e| MlsError::CommitAddFailed(format!("{e:?}")))?;
+            group
+                .merge_pending_commit(provider)
+                .map_err(|e| MlsError::CommitAddFailed(format!("merge_pending_commit: {e:?}")))?;
+            Ok(out)
+        })
+        .map_err(MlsError::CryptoPanic)?
+    }
+
     /// Remove a member from the group by CIRIS `key_id`. Returns the
     /// serialized [`Commit`] + the new epoch's [`RootSecret`].
     ///
@@ -731,14 +772,21 @@ impl MlsSession {
             .map(|m| m.index)
             .ok_or_else(|| MlsError::MemberNotFound(member_key_id.to_string()))?;
 
-        let (commit_msg, _welcome_opt, _group_info) = self
-            .group
-            .remove_members(self.provider.as_ref(), &self.signer, &[target_idx])
-            .map_err(|e| MlsError::CommitRemoveFailed(format!("{e:?}")))?;
-
-        self.group
-            .merge_pending_commit(self.provider.as_ref())
-            .map_err(|e| MlsError::CommitRemoveFailed(format!("merge_pending_commit: {e:?}")))?;
+        // Path secrets go to every copath leaf's encryption_key. On a
+        // contained panic the group is restored to its pre-Remove state
+        // and `member_signature_keys` (updated below) is untouched.
+        let signer = &self.signer;
+        let (commit_msg, _welcome_opt, _group_info) =
+            guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
+                let out = group
+                    .remove_members(provider, signer, &[target_idx])
+                    .map_err(|e| MlsError::CommitRemoveFailed(format!("{e:?}")))?;
+                group.merge_pending_commit(provider).map_err(|e| {
+                    MlsError::CommitRemoveFailed(format!("merge_pending_commit: {e:?}"))
+                })?;
+                Ok::<_, MlsError>(out)
+            })
+            .map_err(MlsError::CryptoPanic)??;
 
         self.member_signature_keys.remove(member_key_id);
 
@@ -761,19 +809,21 @@ impl MlsSession {
             .try_into_protocol_message()
             .map_err(|e| MlsError::WireDecodeFailed(format!("not a protocol message: {e:?}")))?;
 
-        let processed = self
-            .group
-            .process_message(self.provider.as_ref(), proto)
-            .map_err(|e| MlsError::ProcessFailed(format!("{e:?}")))?;
-
-        match processed.into_content() {
-            ProcessedMessageContent::StagedCommitMessage(staged) => {
-                self.group
-                    .merge_staged_commit(self.provider.as_ref(), *staged)
-                    .map_err(|e| MlsError::ProcessFailed(format!("merge_staged: {e:?}")))?;
+        // Decrypts the path secret and installs the committer's new path
+        // keys; a contained panic leaves the session at the epoch it was
+        // in, as an `Err` from `process_message` does.
+        guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
+            let processed = group
+                .process_message(provider, proto)
+                .map_err(|e| MlsError::ProcessFailed(format!("{e:?}")))?;
+            match processed.into_content() {
+                ProcessedMessageContent::StagedCommitMessage(staged) => group
+                    .merge_staged_commit(provider, *staged)
+                    .map_err(|e| MlsError::ProcessFailed(format!("merge_staged: {e:?}"))),
+                _ => Err(MlsError::NotACommit),
             }
-            _ => return Err(MlsError::NotACommit),
-        }
+        })
+        .map_err(MlsError::CryptoPanic)??;
 
         export_root_secret(&self.group, self.provider.as_ref())
     }
@@ -954,32 +1004,31 @@ impl MlsSession {
         }
 
         // ── Build + stage the single batched commit ──────────────
-        let bundle = {
-            let builder = self.group.commit_builder();
+        // Then merge our own pending commit — we are the committer, no
+        // remote to wait on. Build encrypts the Welcome and the path
+        // secrets; on a contained panic the group is restored to its
+        // pre-batch state and the member map below is untouched.
+        let signer = &self.signer;
+        let bundle = guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
+            let builder = group.commit_builder();
             let builder = builder
                 .propose_adds(add_key_packages)
                 .propose_removals(remove_indices);
             let loaded = builder
-                .load_psks(self.provider.storage())
+                .load_psks(provider.storage())
                 .map_err(|e| MlsError::CommitAddFailed(format!("load_psks: {e:?}")))?;
             let complete = loaded
-                .build(
-                    self.provider.rand(),
-                    self.provider.crypto(),
-                    &self.signer,
-                    |_| true,
-                )
+                .build(provider.rand(), provider.crypto(), signer, |_| true)
                 .map_err(|e| MlsError::CommitAddFailed(format!("commit_builder build: {e:?}")))?;
-            complete
-                .stage_commit(self.provider.as_ref())
-                .map_err(|e| MlsError::CommitAddFailed(format!("stage_commit: {e:?}")))?
-        };
-
-        // Merge our own pending commit — we are the committer, no
-        // remote to wait on.
-        self.group
-            .merge_pending_commit(self.provider.as_ref())
-            .map_err(|e| MlsError::CommitAddFailed(format!("merge_pending_commit: {e:?}")))?;
+            let bundle = complete
+                .stage_commit(provider)
+                .map_err(|e| MlsError::CommitAddFailed(format!("stage_commit: {e:?}")))?;
+            group
+                .merge_pending_commit(provider)
+                .map_err(|e| MlsError::CommitAddFailed(format!("merge_pending_commit: {e:?}")))?;
+            Ok::<_, MlsError>(bundle)
+        })
+        .map_err(MlsError::CryptoPanic)??;
 
         // ── Build the wire artifacts ─────────────────────────────
         let commit_msg = bundle.commit().clone();
@@ -1058,9 +1107,15 @@ impl MlsSession {
             .use_ratchet_tree_extension(true)
             .build();
 
-        let group = StagedWelcome::new_from_welcome(provider.as_ref(), &join_config, welcome, None)
-            .and_then(|sw| sw.into_group(provider.as_ref()))
-            .map_err(|e| MlsError::WelcomeFailed(format!("{e:?}")))?;
+        // Decrypts the group secrets and reads the Welcome's ratchet tree.
+        // No session exists until this returns: a contained panic drops
+        // the joiner material with the error, as any other refusal does.
+        let group = catch_crypto_panic(|| {
+            StagedWelcome::new_from_welcome(provider.as_ref(), &join_config, welcome, None)
+                .and_then(|sw| sw.into_group(provider.as_ref()))
+        })
+        .map_err(MlsError::CryptoPanic)?
+        .map_err(|e| MlsError::WelcomeFailed(format!("{e:?}")))?;
 
         let root = export_root_secret(&group, provider.as_ref())?;
 
@@ -1563,6 +1618,50 @@ mod tests {
             mlkem768_priv: Some(vec![0xCD; 2400]),
             mlkem768_pub: Some(vec![0xAB; 1184]),
         }
+    }
+
+    /// CIRISEdge#822 — the A/V admit of a joiner-published KeyPackage
+    /// refuses a signed one with a short `init_key` at its key-length
+    /// gate; past the gate the Add panics inside `libcrux-kem` 0.0.7 and
+    /// the guard returns `CryptoPanic` with the session unchanged; a
+    /// following valid admit commits and its Welcome joins.
+    #[test]
+    fn a_short_init_key_is_refused_and_past_the_gate_is_a_contained_panic() {
+        use crate::mls::crypto_panic::test_support::{
+            forge_short_keys, validate_without_length_gate,
+        };
+
+        let (mut session, _root) = MlsSession::create("creator", Vec::new()).expect("create");
+        let (bad, bad_kp) = mint_joiner_key_material("mallory").expect("mint");
+        let short =
+            validate_without_length_gate(&forge_short_keys(&bad_kp, &bad.signer, Some(32), None));
+
+        match session.commit_add_published("mallory", short.clone()) {
+            Err(MlsError::KeyPackageBuildFailed(m)) => {
+                assert!(m.contains("init_key length 32"), "{m}");
+            }
+            other => panic!("expected the init_key length refusal, got {other:?}"),
+        }
+
+        let epoch = session.epoch();
+        match session.commit_add_published_unchecked("mallory", short) {
+            Err(MlsError::CryptoPanic(m)) => {
+                assert!(m.contains("restored to its pre-operation state"), "{m}");
+            }
+            other => panic!("expected a contained crypto panic, got {other:?}"),
+        }
+        assert_eq!(session.epoch(), epoch, "no epoch advanced");
+        assert_eq!(session.member_key_ids(), vec!["creator".to_owned()]);
+        assert!(!session.member_signature_keys.contains_key("mallory"));
+
+        let (good, good_kp) = mint_joiner_key_material("bob").expect("mint");
+        let (_commit, welcome, root) = session
+            .commit_add_published("bob", good_kp)
+            .expect("the session still commits");
+        assert_eq!(session.epoch(), epoch + 1);
+        let (_bob, bob_root) =
+            MlsSession::join_from_welcome(good, &welcome.0).expect("the Welcome joins");
+        assert_eq!(bob_root.as_bytes(), root.as_bytes());
     }
 
     /// `ciphersuite_id` returns the X-Wing code point.

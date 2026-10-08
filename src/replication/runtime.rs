@@ -514,12 +514,31 @@ fn spawn_scheduler_task(
     })
 }
 
+// One driver loop with a lifecycle line and counter per arm (CIRISEdge#853);
+// splitting the arms out would separate each log line from the step it reports.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
     use crate::replication::coordinator::DriverPhase;
     tokio::spawn(async move {
+        use crate::observability as obs;
         let peer = coord.peer_key_id().to_string();
         let kind = coord.kind();
-        tracing::debug!(peer = %peer, ?kind, "responder driver started (CIRISEdge#348)");
+        // CIRISEdge#853 — the responder's round lifecycle at INFO, counted in
+        // `responder_rounds_total{kind, outcome}`: without it the canonical
+        // cannot tell a link that served a round and closed from one opened
+        // and closed empty.
+        let count = |outcome: &'static str| {
+            if let Some(m) = coord.metrics() {
+                m.inc_responder_round(kind, outcome);
+            }
+        };
+        tracing::info!(
+            peer = %peer, ?kind, link = %coord.last_inbound_link_hex(),
+            "responder driver started (CIRISEdge#348)"
+        );
+        count(obs::RESPONDER_ROUND_STARTED);
+        // When the round being served began: its first inbound frame.
+        let mut round_began: Option<std::time::Instant> = None;
         loop {
             // CIRISEdge#662 — the phase gauge: this loop is the responder's ONE
             // drain, and when its inbox fills the drop site reads which of the
@@ -534,6 +553,7 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                 tracing::debug!(peer = %peer, ?kind, "responder driver ending (channel closed)");
                 break;
             };
+            let began = *round_began.get_or_insert_with(std::time::Instant::now);
             coord.set_driver_phase(DriverPhase::Stepping);
             match coord.drive_round_step_framed(Some(inbound)).await {
                 Ok(DriveStep::SendThenWait(msgs)) => {
@@ -559,13 +579,19 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                             Ok(Err(e)) => {
                                 tracing::warn!(
                                     peer = %peer, ?kind, error = %e,
+                                    link = %coord.last_inbound_link_hex(),
                                     "responder reply send failed — round will not complete (CIRISEdge#348)"
                                 );
+                                count(obs::RESPONDER_ROUND_REPLY_SEND_FAILED);
+                                round_began = None;
                                 break;
                             }
                             Err(_elapsed) => {
+                                count(obs::RESPONDER_ROUND_REPLY_SEND_FAILED);
+                                round_began = None;
                                 tracing::warn!(
                                     peer = %peer, ?kind,
+                                    link = %coord.last_inbound_link_hex(),
                                     timeout_secs = RESPONDER_REPLY_SEND_TIMEOUT.as_secs(),
                                     "responder reply send TIMED OUT — abandoning it so the inbound \
                                      drain resumes and the peer's trace is not dropped (CIRISEdge#373); \
@@ -580,23 +606,37 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                 // (`start_round` emits it; responders never start rounds). If it
                 // ever appears here, honor its semantics: send, then done.
                 Ok(DriveStep::SendThenComplete(msgs, report)) => {
+                    let mut failed = false;
                     for m in &msgs {
                         if let Err(e) = coord.send_message(m).await {
                             tracing::warn!(
                                 peer = %peer, ?kind, error = %e,
+                                link = %coord.last_inbound_link_hex(),
                                 "responder SendThenComplete send failed (CIRISEdge#380)"
                             );
+                            count(obs::RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED);
+                            failed = true;
                             break;
                         }
                     }
-                    tracing::debug!(
-                        peer = %peer, ?kind, ?report,
-                        "responder round complete (initiator-final path, CIRISEdge#380)"
-                    );
+                    round_began = None;
+                    if !failed {
+                        count(obs::RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL);
+                        tracing::info!(
+                            peer = %peer, ?kind, ?report,
+                            link = %coord.last_inbound_link_hex(),
+                            duration_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            "responder round complete (initiator-final path, CIRISEdge#380)"
+                        );
+                    }
                 }
                 Ok(DriveStep::Complete(report)) => {
-                    tracing::debug!(
+                    round_began = None;
+                    count(obs::RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL);
+                    tracing::info!(
                         peer = %peer, ?kind, ?report,
+                        link = %coord.last_inbound_link_hex(),
+                        duration_ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "responder served an anti-entropy round to completion (CIRISEdge#348)"
                     );
                 }
