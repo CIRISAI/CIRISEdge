@@ -63,7 +63,9 @@ use ciris_edge::transport::federation_session::{OwnKexKeys, PeerKexPubkeys};
 use ciris_edge::transport::realtime_av::{
     seal_av_inner, seal_av_outer, ChunkLayer, ChunkSeq, Epoch, EpochDek, StreamId, CODEC_OPAQUE,
 };
-use ciris_edge::transport::realtime_av_dispatcher::{AvInboundLink, AvSubscriberLink};
+use ciris_edge::transport::realtime_av_dispatcher::{
+    AvInboundLink, AvLinkReceiver as _, AvLinkSender as _, AvSubscriberLink,
+};
 use ciris_edge::transport::realtime_av_mls::{mint_joiner_key_material, Member};
 use ciris_edge::transport::realtime_av_runtime::{AvPublisher, AvSubscriber};
 use ciris_edge::transport::realtime_av_session::AvSession;
@@ -1015,4 +1017,134 @@ async fn av_chunks_ride_the_replicating_node_805() {
         Some(1)
     );
     assert_eq!(a_prod.get("av_link_opened").copied(), Some(1));
+}
+
+/// Whether `inbound` ends (the link closed) within a bound, after yielding
+/// whatever was still queued on it.
+async fn receiver_ends(inbound: &ciris_edge::transport::realtime_av_runtime::PumpReceiver) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while let Ok(next) = tokio::time::timeout_at(deadline, inbound.recv()).await {
+        if next.is_err() {
+            return true;
+        }
+    }
+    false
+}
+
+/// CIRISEdge#853 × #805 — the responder's inbound idle reap closes an A/V link
+/// that went QUIET, and leaves one carrying media alone.
+///
+/// A dials B's call address twice. Both links arrive at B's A/V consumer on
+/// their first frame. Then one carries a frame every 250 ms and the other
+/// carries nothing. With B's inbound idle bound at 2 s, B's reap passes (two
+/// observations of the same idle snapshot, #853) close the quiet link — its
+/// consumer sees the receiver end — and never the live one, whose frames
+/// `deliver_av_frame` stamps as last-inbound liveness. Without that stamp the
+/// live link reads as idle too and is reaped mid-call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quiet_av_link_is_reaped_and_a_live_one_is_not_853() {
+    let p = pair("reap").await;
+    let call = open_call(&p).await;
+    let group = av_addressing::stream_group_id(call.stream);
+    let b_addr =
+        p.a.table
+            .send_address(&scope(), &group, &p.b.key.key_id)
+            .expect("B's call address");
+    let mut arrivals = p.b.transport.take_av_arrivals().expect("B's arrivals");
+
+    let live =
+        p.a.transport
+            .open_av_link(&p.b.key.key_id, &b_addr)
+            .await
+            .expect("the live link");
+    let quiet =
+        p.a.transport
+            .open_av_link(&p.b.key.key_id, &b_addr)
+            .await
+            .expect("the quiet link");
+    assert_ne!(live.link_id, quiet.link_id);
+    live.sender
+        .send(b"live-first")
+        .await
+        .expect("live first frame");
+    quiet
+        .sender
+        .send(b"quiet-only")
+        .await
+        .expect("quiet's only frame");
+
+    // B's consumer holds both links.
+    let mut held = std::collections::HashMap::new();
+    while held.len() < 2 {
+        let a = tokio::time::timeout(Duration::from_secs(20), arrivals.recv())
+            .await
+            .expect("both links arrive at B")
+            .expect("arrivals open");
+        held.insert(a.link_id, a);
+    }
+    let live_in = held.remove(&live.link_id).expect("live arrived");
+    let quiet_in = held.remove(&quiet.link_id).expect("quiet arrived");
+    let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&received);
+    let drain = tokio::spawn(async move {
+        while live_in.inbound.recv().await.is_ok() {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+
+    let inbound_at_b = |id: [u8; 16]| {
+        p.b.transport
+            .link_directions_for_test()
+            .into_iter()
+            .any(|(l, d)| l == id && d == ciris_edge::transport::reticulum::LinkDirection::Inbound)
+    };
+    assert!(inbound_at_b(live.link_id) && inbound_at_b(quiet.link_id));
+
+    // A 2 s bound; the live link carries a frame every 250 ms; B reaps once a
+    // second until the quiet link is gone (or the budget runs out).
+    p.b.transport
+        .set_inbound_link_idle_bound(Duration::from_secs(2));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut reaped = 0usize;
+    let mut tick = 0u32;
+    while tokio::time::Instant::now() < deadline && inbound_at_b(quiet.link_id) {
+        live.sender.send(b"live-frame").await.expect("live frame");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        tick += 1;
+        if tick % 4 == 0 {
+            reaped += p.b.transport.reap_idle_inbound_links().await;
+        }
+    }
+    assert!(
+        !inbound_at_b(quiet.link_id),
+        "the quiet A/V link was reaped past the 2 s bound (passes reaped {reaped})"
+    );
+    assert!(
+        receiver_ends(&quiet_in.inbound).await,
+        "the reaped link's receiver ended"
+    );
+
+    // The live link survived every pass and still carries media.
+    assert!(
+        inbound_at_b(live.link_id),
+        "the live A/V link carrying media must not be reaped"
+    );
+    let before = received.load(std::sync::atomic::Ordering::Relaxed);
+    for _ in 0..4 {
+        live.sender
+            .send(b"after-reap")
+            .await
+            .expect("live after reap");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let delivered_after = wait_until(Duration::from_secs(10), || {
+        let received = Arc::clone(&received);
+        async move { received.load(std::sync::atomic::Ordering::Relaxed) >= before + 4 }
+    })
+    .await;
+    assert!(
+        delivered_after,
+        "the live link still delivers after the reap passes"
+    );
+    drain.abort();
 }
