@@ -966,7 +966,8 @@ impl PyEdge {
     /// `peer_identity_hash` (hex), `state` (`pending` / `active` /
     /// `closing` / `closed` / `stale`), `age_seconds`, `rssi_dbm`,
     /// `snr_db`, `establishment_rate_kbps` (each `None` when unmeasured),
-    /// `mtu`, `mdu`, `transport_id`, `transport_kind`. `[]` for
+    /// `mtu`, `mdu`, `transport_id`, `transport_kind`, and `direction`
+    /// (`inbound` / `outbound` / `unknown`, CIRISEdge#853). `[]` for
     /// HTTPS-only / transport-less builds.
     fn link_list(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         #[cfg(feature = "_reticulum-module")]
@@ -2862,6 +2863,14 @@ fn metrics_bundle_to_pydict<'py>(
         pool_closed.set_item(reason.as_str(), *n)?;
     }
     root.set_item("link_pool_closed_by_reason", pool_closed)?;
+    // CIRISEdge#853 — links by direction, and inbound closes by reason.
+    root.set_item("inbound_links", bundle.inbound_links)?;
+    root.set_item("outbound_links", bundle.outbound_links)?;
+    let inbound_closed = pyo3::types::PyDict::new(py);
+    for (reason, n) in &bundle.inbound_link_closed_by_reason {
+        inbound_closed.set_item(reason.as_str(), *n)?;
+    }
+    root.set_item("inbound_link_closed_by_reason", inbound_closed)?;
     root.set_item(
         "replication_routed_to_responder_total",
         bundle.replication_routed_to_responder_total,
@@ -3031,7 +3040,7 @@ fn link_info_to_pydict<'py>(
     py: Python<'py>,
     link: &crate::ffi::uniffi_types::EdgeLinkInfo,
 ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-    use crate::ffi::uniffi_types::EdgeLinkState;
+    use crate::ffi::uniffi_types::{EdgeLinkDirection, EdgeLinkState};
     let out = pyo3::types::PyDict::new(py);
     out.set_item("link_id", hex::encode(&link.link_id))?;
     out.set_item("peer_identity_hash", hex::encode(&link.peer_identity_hash))?;
@@ -3053,6 +3062,15 @@ fn link_info_to_pydict<'py>(
     out.set_item("mdu", link.mdu)?;
     out.set_item("transport_id", link.transport_id.as_str())?;
     out.set_item("transport_kind", link.transport_kind.as_str())?;
+    // CIRISEdge#853 — which end opened the link.
+    out.set_item(
+        "direction",
+        match link.direction {
+            EdgeLinkDirection::Inbound => "inbound",
+            EdgeLinkDirection::Outbound => "outbound",
+            EdgeLinkDirection::Unknown => "unknown",
+        },
+    )?;
     Ok(out)
 }
 

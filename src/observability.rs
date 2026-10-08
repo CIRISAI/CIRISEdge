@@ -1191,6 +1191,20 @@ pub struct EdgeMetrics {
     /// CIRISEdge#819 — pooled links dropped from a pool because the link
     /// itself closed (the peer, leviculum's reap, or another teardown).
     pub link_pool_closed_link_closed: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#853 — established Reticulum links by direction, ONE entry PER
+    /// TRANSPORT INSTANCE (keyed by its metrics source id, as
+    /// `link_pool_sizes` is): `(inbound, outbound)` — links a peer opened to
+    /// this node, and links this node dialled. Set on every link establish and
+    /// close. Read as [`Self::inbound_links`] / [`Self::outbound_links`]. An
+    /// `inbound` that climbs while the pools stay small is the #853 leak: the
+    /// node is the responder for peers that never let their links go.
+    pub link_directions: Arc<RwLock<HashMap<u64, (u64, u64)>>>,
+    /// CIRISEdge#853 — inbound links this node closed because they sat idle
+    /// past the inbound idle bound.
+    pub inbound_link_closed_idle_expired: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#853 — inbound links that closed otherwise (the peer, leviculum's
+    /// own reap, or another teardown).
+    pub inbound_link_closed_link_closed: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#627 — links that came up IDENTIFIED before their announcer had
     /// a binding. Under announce-on-link + inline Stage 1 this is 0 in steady
     /// state; nonzero means the ordering the design guarantees broke.
@@ -1689,6 +1703,67 @@ impl EdgeMetrics {
         .collect()
     }
 
+    /// CIRISEdge#853 — set one transport's link-direction gauges. `source` is
+    /// the transport's process-unique metrics source id.
+    pub fn set_link_directions(&self, source: u64, inbound: u64, outbound: u64) {
+        self.link_directions
+            .write()
+            .insert(source, (inbound, outbound));
+    }
+
+    /// CIRISEdge#853 — established links a peer opened to this node, across
+    /// every transport that has reported.
+    #[must_use]
+    pub fn inbound_links(&self) -> u64 {
+        self.link_directions
+            .read()
+            .values()
+            .fold(0u64, |acc, (inbound, _)| acc.saturating_add(*inbound))
+    }
+
+    /// CIRISEdge#853 — established links this node dialled, across every
+    /// transport that has reported.
+    #[must_use]
+    pub fn outbound_links(&self) -> u64 {
+        self.link_directions
+            .read()
+            .values()
+            .fold(0u64, |acc, (_, outbound)| acc.saturating_add(*outbound))
+    }
+
+    /// CIRISEdge#853 — count `n` inbound links closed for `reason`.
+    pub fn add_inbound_link_closed(&self, reason: InboundLinkCloseReason, n: u64) {
+        let counter = match reason {
+            InboundLinkCloseReason::IdleExpired => &self.inbound_link_closed_idle_expired,
+            InboundLinkCloseReason::LinkClosed => &self.inbound_link_closed_link_closed,
+        };
+        counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 — inbound links closed, by reason token, every reason
+    /// present (a zero is an answer).
+    #[must_use]
+    pub fn inbound_link_closed_by_reason(&self) -> HashMap<String, u64> {
+        [
+            (
+                InboundLinkCloseReason::IdleExpired,
+                &self.inbound_link_closed_idle_expired,
+            ),
+            (
+                InboundLinkCloseReason::LinkClosed,
+                &self.inbound_link_closed_link_closed,
+            ),
+        ]
+        .into_iter()
+        .map(|(r, c)| {
+            (
+                r.as_str().to_owned(),
+                c.load(std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+    }
+
     /// CIRISEdge#627 — a link came up identified before its announcer was bound.
     pub fn inc_link_before_binding(&self) {
         self.link_before_binding
@@ -1977,6 +2052,9 @@ impl EdgeMetrics {
             link_pool_links: self.link_pool_links(),
             link_pool_max_per_destination: self.link_pool_max_per_destination(),
             link_pool_closed_by_reason: self.link_pool_closed_by_reason(),
+            inbound_links: self.inbound_links(),
+            outbound_links: self.outbound_links(),
+            inbound_link_closed_by_reason: self.inbound_link_closed_by_reason(),
             link_before_binding: self.link_before_binding(),
             announce_queue_drop_first_seen: self.announce_queue_drop_first_seen(),
             channel_first_skipped_over_cap: self.channel_first_skipped_over_cap(),
@@ -2031,6 +2109,28 @@ impl LinkPoolCloseReason {
         match self {
             Self::IdleExpired => "idle_expired",
             Self::PoolFull => "pool_full",
+            Self::LinkClosed => "link_closed",
+        }
+    }
+}
+
+/// CIRISEdge#853 — why an INBOUND Reticulum link (one a peer opened to this
+/// node) closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InboundLinkCloseReason {
+    /// Idle past the inbound idle bound; edge closed it.
+    IdleExpired,
+    /// The link closed on its own (the peer, leviculum's reap, or another
+    /// teardown).
+    LinkClosed,
+}
+
+impl InboundLinkCloseReason {
+    /// The stable token.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IdleExpired => "idle_expired",
             Self::LinkClosed => "link_closed",
         }
     }
@@ -2111,6 +2211,13 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#819 — pooled links closed, by [`LinkPoolCloseReason`] token
     /// (`idle_expired`, `pool_full`, `link_closed`); every token present.
     pub link_pool_closed_by_reason: HashMap<String, u64>,
+    /// CIRISEdge#853 — established links a peer opened to this node.
+    pub inbound_links: u64,
+    /// CIRISEdge#853 — established links this node dialled.
+    pub outbound_links: u64,
+    /// CIRISEdge#853 — inbound links closed, by [`InboundLinkCloseReason`]
+    /// token (`idle_expired`, `link_closed`); every token present.
+    pub inbound_link_closed_by_reason: HashMap<String, u64>,
     /// CIRISEdge#627 — links identified before their announcer was bound.
     /// 0 in steady state; nonzero = the announce-before-link ordering broke.
     pub link_before_binding: u64,
@@ -2304,6 +2411,15 @@ impl EdgeMetricsBundle {
             "link_pool_closed_by_reason",
             &self.link_pool_closed_by_reason,
         );
+        // CIRISEdge#853 — links by direction, and inbound closes by reason.
+        f.counters
+            .insert("inbound_links".to_string(), self.inbound_links);
+        f.counters
+            .insert("outbound_links".to_string(), self.outbound_links);
+        f.family(
+            "inbound_link_closed_by_reason",
+            &self.inbound_link_closed_by_reason,
+        );
         f.family("blob_pull_sources", &self.blob_pull_sources);
         f.family("blob_pull_refusals", &self.blob_pull_refusals);
         let mut dag_samples = 0u64;
@@ -2463,6 +2579,9 @@ edge_metrics_bundle_fields!(
     link_pool_links,
     link_pool_max_per_destination,
     link_pool_closed_by_reason,
+    inbound_links,
+    outbound_links,
+    inbound_link_closed_by_reason,
     blob_pull_sources,
     blob_pull_refusals,
     blob_dag_phases,

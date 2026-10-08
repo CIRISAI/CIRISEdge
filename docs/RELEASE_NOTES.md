@@ -1,5 +1,61 @@
 # CIRISEdge Release Notes
 
+# v40.0.10 — the responder closes idle inbound links
+
+**2026-10-08.** **PATCH** from v40.0.9, cut from the v40.0.9 tag (main carries v40.1.0). Persist
+v53.1.8, verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged.
+Ladder triple: **edge v40.0.10 · persist v53.1.8 · verify v19.0.0**.
+
+**Field read (CIRISEdge#853).** On the canonical (CIRISServer 0.5.224 = edge v40.0.8),
+`reticulum_link_count` went from 78 to 529 in five minutes, about 90 links a minute, while
+`link_pool_links` read 0 and `link_pool_closed_by_reason` stayed at 0. Over ~277 s the log showed
+466 `link established … peer=None dest=None`, each followed by `link identified … peer=Some(..)`.
+Those are INBOUND links that peers opened. Only ~74 closed (~63 Timeout, ~11 Stale), over just 9
+new TCP connections. At that rate the canonical hits leviculum's 1,024-link envelope in about
+11 minutes.
+
+**Cause.** #819's reap closes idle links in the pools of the node that DIALLED them. The canonical
+is the responder for every other node's pool. Nothing on the responder side closed an inbound
+link that was idle at the application layer. The initiator's keepalives kept such a link alive
+forever, and a v40.0.6 initiator never shrinks its pool. The canonical can't depend on every peer
+running a fixed edge, and an adversarial peer wouldn't.
+
+**Fix.**
+- **Link direction.** Each link's direction comes from leviculum's own
+  `LinkEstablished { is_initiator }`. That event fires before LINKIDENTIFY, so an inbound link
+  has a direction from the moment it exists. `link_list()` carries `direction`
+  (`inbound` / `outbound` / `unknown`) in both bindings. New gauges `inbound_links` and
+  `outbound_links` are kept per transport and updated on every establish and close.
+- **Responder-side idle reap.** On the pool reaper's tick, this node closes an INBOUND link that
+  has carried no inbound frame for `inbound_link_idle_bound`. The default is 120 s, the same as
+  the pool bound. Set it with `with_inbound_link_idle_bound` / `set_inbound_link_idle_bound`; 0
+  disables it. The idle clock starts at the link's #353 `last_inbound` stamp, or at its
+  establishment if it has never carried a frame. The close goes through `link_teardown`, which
+  checks the node's own link state (#821 finding 5). It's counted in
+  `inbound_link_closed_by_reason{idle_expired}`. Inbound links that close any other way count as
+  `link_closed`. The reap skips:
+  - a pool transfer in flight;
+  - an inbound transfer still making progress;
+  - an outbound transfer on the link (the reverse path answers on the peer's link);
+  - an LXMF serve link;
+  - a link a host holds open (`hold_link_open`, for A/V);
+  - a link still in its attribution handshake (no LINKIDENTIFY yet), for the dialer's 30 s
+    establish window.
+
+  Links this node dialled are never touched here; the pool reaper owns those.
+- **The initiator self-heals.** The close sends LINKCLOSE, so the peer drops the lane from its
+  pool and its next send dials a fresh link. This works for v40.0.6 initiators too.
+
+**Witness.** `tests/inbound_reap_853.rs`, two loopback nodes:
+- (a) B dials A and goes quiet. A closes the link after the bound (`idle_expired` = 1). B observes
+  the close and drops the lane. B's next send re-dials and is delivered.
+- (b) A link marked mid-receive survives three bounds and is reaped once the transfer ends.
+- (c) With the bound at 0, the link stays open past the bound.
+- (d) The gauges read one inbound link on A and one outbound on B.
+
+With the reap removed, (a) and (b) fail. With the busy exemptions and the zero guard removed,
+(b) and (c) fail.
+
 # v40.0.9 — a peer's short key can no longer crash the node, the pool reaper's races are closed, and Windows/Android Python can import edge
 
 **2026-10-08.** **PATCH** from v40.0.8, cut from the v40.0.8 tag (main carries v40.1.0). Persist

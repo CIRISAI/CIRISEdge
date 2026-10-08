@@ -386,6 +386,16 @@ pub enum EdgeLinkState {
     Stale,
 }
 
+/// CIRISEdge#853 — which end opened a link: `Inbound` (a peer dialled this
+/// node), `Outbound` (this node dialled it), or `Unknown` (its establishment
+/// event has not been processed yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeLinkDirection {
+    Inbound,
+    Outbound,
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub struct EdgeLinkHandle {
     pub link_id: Vec<u8>,
@@ -404,4 +414,5 @@ pub struct EdgeLinkInfo {
     pub mdu: u32,
     pub transport_id: String,
     pub transport_kind: String,
+    pub direction: EdgeLinkDirection,
 }

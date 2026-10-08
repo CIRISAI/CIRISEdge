@@ -1572,6 +1572,8 @@ data class EdgeLinkInfo (
     var `transportId`: kotlin.String
     , 
     var `transportKind`: kotlin.String
+    , 
+    var `direction`: EdgeLinkDirection
     
 ){
     
@@ -1599,6 +1601,7 @@ public object FfiConverterTypeEdgeLinkInfo: FfiConverterRustBuffer<EdgeLinkInfo>
             FfiConverterUInt.read(buf),
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterTypeEdgeLinkDirection.read(buf),
         )
     }
 
@@ -1613,7 +1616,8 @@ public object FfiConverterTypeEdgeLinkInfo: FfiConverterRustBuffer<EdgeLinkInfo>
             FfiConverterUInt.allocationSize(value.`mtu`) +
             FfiConverterUInt.allocationSize(value.`mdu`) +
             FfiConverterString.allocationSize(value.`transportId`) +
-            FfiConverterString.allocationSize(value.`transportKind`)
+            FfiConverterString.allocationSize(value.`transportKind`) +
+            FfiConverterTypeEdgeLinkDirection.allocationSize(value.`direction`)
     )
 
     override fun write(value: EdgeLinkInfo, buf: ByteBuffer) {
@@ -1628,6 +1632,7 @@ public object FfiConverterTypeEdgeLinkInfo: FfiConverterRustBuffer<EdgeLinkInfo>
             FfiConverterUInt.write(value.`mdu`, buf)
             FfiConverterString.write(value.`transportId`, buf)
             FfiConverterString.write(value.`transportKind`, buf)
+            FfiConverterTypeEdgeLinkDirection.write(value.`direction`, buf)
     }
 }
 
@@ -2702,6 +2707,41 @@ public object FfiConverterTypeEdgeBindingsError : FfiConverterRustBuffer<EdgeBin
     }
 
 }
+
+
+
+
+enum class EdgeLinkDirection {
+    
+    INBOUND,
+    OUTBOUND,
+    UNKNOWN;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeEdgeLinkDirection: FfiConverterRustBuffer<EdgeLinkDirection> {
+    override fun read(buf: ByteBuffer) = try {
+        EdgeLinkDirection.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: EdgeLinkDirection) = 4UL
+
+    override fun write(value: EdgeLinkDirection, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
 
 
 
