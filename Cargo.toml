@@ -1647,7 +1647,13 @@ required-features = ["transport-reticulum", "mesh-harness", "test-anchor"]
 # openmls_libcrux_crypto release uses (0.4.0 is on hpke-rs 0.7 and needs
 # openmls 0.9). The CIRISAI fork is the 0.3.1 source with ONLY the hpke-rs
 # 0.8 / libcrux 0.0.9-0.0.10 bump and the API fixes it forces; X-Wing stays
-# KemAlgorithm::XWingDraft06, so the wire is unchanged. Drop this patch when
-# an upstream release on openmls 0.8 or our openmls bump carries hpke-rs 0.8.
+# KemAlgorithm::XWingDraft06, and it turns on hpke-rs's
+# `draft-connolly-cfrg-hpke-mlkem` so X-Wing DeriveKeyPair stays the 0.6
+# unlabeled SHAKE256(ikm) — without it a 0.3.1 peer's ratchet tree fails with
+# PublicKeyMismatch (tests/libcrux_cross_version_822.rs is the cross-build
+# witness). The wire and at-rest state are unchanged. Drop this patch when
+# an upstream release on openmls 0.8 or our openmls bump carries hpke-rs 0.8
+# WITH the 0.6 X-Wing derive; an upstream on the labeled derive is a
+# fleet-wide MLS break, so run the witness against it first.
 [patch.crates-io]
 openmls_libcrux_crypto = { path = "/tmp/claude-1000/-home-emoore-CIRISEdge/5aada876-b698-4ddb-b67b-6f4aba443cf2/scratchpad/fork-822/openmls/libcrux_crypto" }
