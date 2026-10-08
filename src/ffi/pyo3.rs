@@ -2871,6 +2871,11 @@ fn metrics_bundle_to_pydict<'py>(
         inbound_closed.set_item(reason.as_str(), *n)?;
     }
     root.set_item("inbound_link_closed_by_reason", inbound_closed)?;
+    let outbound_closed = pyo3::types::PyDict::new(py);
+    for (reason, n) in &bundle.outbound_link_closed_by_reason {
+        outbound_closed.set_item(reason.as_str(), *n)?;
+    }
+    root.set_item("outbound_link_closed_by_reason", outbound_closed)?;
     root.set_item(
         "replication_routed_to_responder_total",
         bundle.replication_routed_to_responder_total,

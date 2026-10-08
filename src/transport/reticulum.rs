@@ -92,7 +92,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crate::observability::{InboundLinkCloseReason, LinkPoolCloseReason};
+use crate::observability::{LinkCloseCause, LinkPoolCloseReason};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -2502,6 +2502,14 @@ pub struct ReticulumTransport {
     /// (an A/V session or sink riding a peer's link):
     /// [`ReticulumTransport::hold_link_open`]. Pruned like `lxmf_serve_links`.
     held_links: Arc<std::sync::Mutex<HashSet<LinkId>>>,
+    /// CIRISEdge#853 — links the reconciliation pass has seen gone at the node
+    /// while edge still holds them, with when it first saw that (see
+    /// [`ReticulumTransport::reconcile_vanished_links`]).
+    vanish_suspects: std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    /// CIRISEdge#853 test seam — `LinkClosed` events the listener drops
+    /// unprocessed ([`ReticulumTransport::close_link_silently_for_test`]).
+    /// Empty in production.
+    swallow_link_closed: Arc<std::sync::Mutex<HashSet<LinkId>>>,
     /// CIRISEdge#532 — per-destination dial gate: BOUNDED concurrency, not
     /// exclusion.
     ///
@@ -3466,6 +3474,8 @@ impl ReticulumTransport {
             outbound_ship_active: Arc::new(std::sync::Mutex::new(HashMap::new())),
             lxmf_serve_links: Arc::new(std::sync::Mutex::new(HashSet::new())),
             held_links: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            vanish_suspects: std::sync::Mutex::new(HashMap::new()),
+            swallow_link_closed: Arc::new(std::sync::Mutex::new(HashSet::new())),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -3628,38 +3638,16 @@ impl ReticulumTransport {
     /// - a link still in its attribution handshake (see
     ///   [`inbound_link_idle_expired`]).
     ///
-    /// Also forgets the direction records of links leviculum no longer holds
-    /// (a missed `LinkClosed`), counted as `link_closed`. Runs on
+    /// Starts with [`Self::reconcile_vanished_links`]. Runs on
     /// [`Transport::listen`]'s pool tick; public so a host or a test can run
     /// it on demand. Returns how many links it closed.
     pub async fn reap_idle_inbound_links(&self) -> usize {
-        let metrics = self.metrics.get();
-        let candidates = {
-            let mut dirs = self
-                .link_direction
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let gone: Vec<LinkId> = dirs
-                .by_link
-                .keys()
-                .filter(|id| !self.node.link_is_established(id))
-                .copied()
-                .collect();
-            for id in &gone {
-                if dirs.remove(id) == Some(LinkDirection::Inbound) {
-                    if let Some(m) = metrics {
-                        m.add_inbound_link_closed(InboundLinkCloseReason::LinkClosed, 1);
-                    }
-                }
-            }
-            publish_link_directions(metrics, self.metrics_source, &dirs);
-            dirs.inbound_ids()
-        };
-        for set in [&self.lxmf_serve_links, &self.held_links] {
-            set.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .retain(|id| self.node.link_is_established(id));
-        }
+        self.reconcile_vanished_links().await;
+        let candidates = self
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inbound_ids();
         let bound = self.inbound_link_idle_bound();
         if bound.is_zero() || candidates.is_empty() {
             return 0;
@@ -3701,35 +3689,124 @@ impl ReticulumTransport {
                 })
             })
             .collect();
-        // Take each victim's record out first (so neither the teardown nor the
-        // `LinkClosed` event counts it again as `link_closed`), then close it.
-        let victims: Vec<LinkId> = {
-            let mut dirs = self
-                .link_direction
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let victims: Vec<LinkId> = due
-                .into_iter()
-                .filter(|id| dirs.remove(id) == Some(LinkDirection::Inbound))
-                .collect();
-            publish_link_directions(metrics, self.metrics_source, &dirs);
-            victims
-        };
-        for id in &victims {
-            if let Some(m) = metrics {
-                m.add_inbound_link_closed(InboundLinkCloseReason::IdleExpired, 1);
-            }
+        for id in &due {
             tracing::debug!(
                 link = %hex::encode(id.as_bytes()),
                 bound_secs = bound.as_secs(),
                 "closing an idle inbound link (CIRISEdge#853: no inbound frame for the \
                  inbound idle bound; the peer re-dials on its next send)"
             );
-            if let Err(e) = self.link_teardown(id.as_bytes()).await {
+            if let Err(e) = self
+                .link_teardown_as(*id, LinkCloseCause::IdleExpired)
+                .await
+            {
                 tracing::debug!(error = %e, "inbound link teardown failed (CIRISEdge#853)");
             }
         }
-        victims.len()
+        due.len()
+    }
+
+    /// **CIRISEdge#853 — reconcile edge's link book against the node.** A
+    /// link edge still holds (the `established_links` mirror or a direction
+    /// record) that the NODE no longer holds left without a `LinkClosed` edge
+    /// processed: the event was dropped at a full control plane
+    /// (`ControlPlaneOverflow`), or the link left by some other path that
+    /// emits none. Seen gone on one pass, it is pruned on the first pass at
+    /// least [`VANISH_GRACE`] later (so a `LinkClosed` still queued behind the
+    /// listener is counted under its real reason, not here): removed from
+    /// the mirror and every per-link map, and counted as
+    /// `{inbound,outbound}_link_closed_by_reason{vanished}`. Returns how many
+    /// it pruned. Leviculum v0.30's `link_count_check` does the same; the
+    /// v40.0.x line pins v0.27.
+    pub async fn reconcile_vanished_links(&self) -> usize {
+        let mut tracked: HashSet<LinkId> = self.established_links.lock().await.clone();
+        tracked.extend(
+            self.link_direction
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .by_link
+                .keys()
+                .copied(),
+        );
+        let now = std::time::Instant::now();
+        let vanished: Vec<LinkId> = {
+            let mut suspects = self
+                .vanish_suspects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let gone: HashSet<LinkId> = tracked
+                .into_iter()
+                .filter(|id| !self.node.link_is_established(id))
+                .collect();
+            suspects.retain(|id, _| gone.contains(id));
+            gone.into_iter()
+                .filter(|id| {
+                    let first = *suspects.entry(*id).or_insert(now);
+                    now.saturating_duration_since(first) >= VANISH_GRACE
+                })
+                .collect()
+        };
+        for id in &vanished {
+            self.vanish_suspects
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+            self.link_book().forget(*id, LinkCloseCause::Vanished).await;
+            self.reusable_scoped_link.lock().await.retain(|_, links| {
+                links.retain(|l| l != id);
+                !links.is_empty()
+            });
+            self.pool_last_used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(id);
+        }
+        for set in [&self.lxmf_serve_links, &self.held_links] {
+            set.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|id| self.node.link_is_established(id));
+        }
+        if !vanished.is_empty() {
+            tracing::warn!(
+                vanished = vanished.len(),
+                "links the node no longer holds left without a LinkClosed edge processed \
+                 (CIRISEdge#853: a control-plane overflow drops it); pruned and counted as \
+                 `vanished`"
+            );
+        }
+        vanished.len()
+    }
+
+    /// CIRISEdge#853 — the per-link maps a close clears, borrowed from this
+    /// transport (the event loop borrows the same maps through [`EventCtx`]).
+    fn link_book(&self) -> LinkBook<'_> {
+        LinkBook {
+            established_links: &self.established_links,
+            link_established_at: &self.link_established_at,
+            link_to_peer_key_id: &self.link_to_peer_key_id,
+            link_last_inbound_at: &self.link_last_inbound_at,
+            dialed_link_dest: &self.dialed_link_dest,
+            reusable_dialed_link: &self.reusable_dialed_link,
+            link_in_flight: &self.link_in_flight,
+            inbound_resource_active: &self.inbound_resource_active,
+            link_plane: &self.link_plane,
+            link_direction: &self.link_direction,
+            metrics: self.metrics.get(),
+            metrics_source: self.metrics_source,
+        }
+    }
+
+    /// CIRISEdge#853 test seam — close `link` at the node and DROP the
+    /// `LinkClosed` event it emits before edge's listener handles it: the
+    /// silent departure a control-plane overflow produces.
+    #[doc(hidden)]
+    pub async fn close_link_silently_for_test(&self, link: [u8; 16]) {
+        let id = LinkId::new(link);
+        self.swallow_link_closed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id);
+        let _ = self.node.close_link(&id).await;
     }
 
     /// CIRISEdge#819 — pooled links this transport has closed, for idleness or
@@ -3997,7 +4074,11 @@ impl ReticulumTransport {
             "closing a pooled link (CIRISEdge#819: idle past the bound, or over the \
              per-destination idle cap)"
         );
-        if let Err(e) = self.link_teardown(link_id.as_bytes()).await {
+        let cause = match why {
+            LinkPoolCloseReason::PoolFull => LinkCloseCause::PoolFull,
+            _ => LinkCloseCause::PoolIdleExpired,
+        };
+        if let Err(e) = self.link_teardown_as(link_id, cause).await {
             tracing::debug!(error = %e, "pooled link teardown failed (CIRISEdge#819)");
         }
     }
@@ -5388,8 +5469,18 @@ impl ReticulumTransport {
                 link_id_bytes.len()
             ))
         })?;
-        let link_id = LinkId::new(link_id_array);
+        self.link_teardown_as(LinkId::new(link_id_array), LinkCloseCause::LocalTeardown)
+            .await
+    }
 
+    /// [`Self::link_teardown`], counting the close under `cause`
+    /// (CIRISEdge#853: the inbound reaper, the pool reaper and the host's own
+    /// teardown each name theirs).
+    async fn link_teardown_as(
+        &self,
+        link_id: LinkId,
+        cause: LinkCloseCause,
+    ) -> Result<(), TransportError> {
         // Idempotent — if the link is neither in the established set NOR live
         // at the node, the peer already closed or we already tore it down.
         //
@@ -5410,20 +5501,22 @@ impl ReticulumTransport {
         // before returning (leviculum v0.16), so no send is in flight by the time a
         // caller reaches teardown. The `sent_resources` mirror is deleted with it.
 
+        // CIRISEdge#853 — count the close under `cause` BEFORE asking the node,
+        // so the `LinkClosed` event `close_link` emits finds no record and
+        // cannot count it again as `normal`.
+        forget_link_direction(
+            &self.link_direction,
+            self.metrics.get(),
+            self.metrics_source,
+            &link_id,
+            cause,
+        );
         // close_link emits a LinkClosed event on the loop; the loop's
         // handle_event removes the link from `established_links`.
         let _ = self.node.close_link(&link_id).await;
         // Eagerly remove so a second teardown is the no-op above.
         self.established_links.lock().await.remove(&link_id);
         self.link_established_at.lock().await.remove(&link_id);
-        // CIRISEdge#853 — its direction record (an inbound link closed by any
-        // teardown but the inbound reaper's counts as `link_closed`).
-        forget_link_direction(
-            &self.link_direction,
-            self.metrics.get(),
-            self.metrics_source,
-            &link_id,
-        );
         for set in [&self.lxmf_serve_links, &self.held_links] {
             set.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7342,6 +7435,7 @@ impl Transport for ReticulumTransport {
                         metrics_source: self.metrics_source,
                         #[cfg(feature = "lxmf")]
                         lxmf_serve_links: &self.lxmf_serve_links,
+                        swallow_link_closed: &self.swallow_link_closed,
                     };
                     handle_event(event, &ctx).await;
 
@@ -7627,24 +7721,109 @@ fn publish_link_directions(
     }
 }
 
-/// CIRISEdge#853 — remove `link_id`'s direction record (the link closed by
-/// anything but the inbound reaper, which takes its victims out first and
-/// counts them as `idle_expired`); an inbound link counts as `link_closed`.
+/// CIRISEdge#853 — remove `link_id`'s direction record and count its close
+/// under `cause`, on its side. A link with no record (already counted, or
+/// never seen established) counts nothing. Returns the direction it had.
 fn forget_link_direction(
     dirs: &std::sync::Mutex<LinkDirections>,
     metrics: Option<&crate::observability::EdgeMetrics>,
     source: u64,
     link_id: &LinkId,
-) {
+    cause: LinkCloseCause,
+) -> Option<LinkDirection> {
     let mut dirs = dirs
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if dirs.remove(link_id) == Some(LinkDirection::Inbound) {
-        if let Some(m) = metrics {
-            m.add_inbound_link_closed(InboundLinkCloseReason::LinkClosed, 1);
-        }
+    let dir = dirs.remove(link_id);
+    if let (Some(d), Some(m)) = (dir, metrics) {
+        m.add_link_closed(d == LinkDirection::Inbound, cause, 1);
     }
     publish_link_directions(metrics, source, &dirs);
+    dir
+}
+
+/// CIRISEdge#853 — the cause a leviculum `LinkClosed` reason counts under.
+fn close_cause(reason: leviculum_core::link::LinkCloseReason) -> LinkCloseCause {
+    use leviculum_core::link::LinkCloseReason;
+    match reason {
+        LinkCloseReason::Normal => LinkCloseCause::Normal,
+        LinkCloseReason::PeerClosed => LinkCloseCause::PeerClosed,
+        LinkCloseReason::Timeout => LinkCloseCause::Timeout,
+        LinkCloseReason::Stale => LinkCloseCause::Stale,
+        LinkCloseReason::InvalidProof => LinkCloseCause::InvalidProof,
+        LinkCloseReason::ChannelExhausted => LinkCloseCause::ChannelExhausted,
+        LinkCloseReason::Blackholed => LinkCloseCause::Blackholed,
+        _ => LinkCloseCause::Other,
+    }
+}
+
+/// CIRISEdge#853 — the per-link maps a link's close clears. One author for
+/// the event loop's `LinkClosed` arm and the reaper's reconciliation, so a
+/// link that vanished is forgotten exactly as one that closed.
+struct LinkBook<'a> {
+    established_links: &'a Mutex<HashSet<LinkId>>,
+    link_established_at: &'a Mutex<HashMap<LinkId, u64>>,
+    link_to_peer_key_id: &'a Mutex<HashMap<LinkId, String>>,
+    link_last_inbound_at: &'a Mutex<HashMap<LinkId, u64>>,
+    dialed_link_dest: &'a Mutex<HashMap<LinkId, DestinationHash>>,
+    reusable_dialed_link: &'a Mutex<HashMap<DestinationHash, Vec<LinkId>>>,
+    link_in_flight: &'a Mutex<HashSet<LinkId>>,
+    inbound_resource_active: &'a std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    link_plane: &'a Mutex<HashMap<LinkId, LinkPlane>>,
+    link_direction: &'a std::sync::Mutex<LinkDirections>,
+    metrics: Option<&'a crate::observability::EdgeMetrics>,
+    metrics_source: u64,
+}
+
+impl LinkBook<'_> {
+    /// Forget `link_id` everywhere, counting its departure under `cause`.
+    async fn forget(&self, link_id: LinkId, cause: LinkCloseCause) {
+        self.established_links.lock().await.remove(&link_id);
+        self.link_established_at.lock().await.remove(&link_id);
+        // CIRISEdge#853 — its direction record, counted under `cause`.
+        forget_link_direction(
+            self.link_direction,
+            self.metrics,
+            self.metrics_source,
+            &link_id,
+            cause,
+        );
+        // v3.5.1 (CIRISEdge#119 + #120) — drop the link's rooted
+        // peer attribution when the link closes.
+        self.link_to_peer_key_id.lock().await.remove(&link_id);
+        // CIRISEdge#353 — drop the link's last-inbound stamp too, so a
+        // closed link can never win the reverse-path selector.
+        self.link_last_inbound_at.lock().await.remove(&link_id);
+        // CIRISEdge#424 — drop the dialed-dest record for the closed link.
+        let closed_dest = self.dialed_link_dest.lock().await.remove(&link_id);
+        // CIRISEdge#532 — and drop it as this dest's REUSABLE link, so the
+        // next send dials instead of handing a dead link to every
+        // coordinator. Keyed by dest, so remove only if THIS link is the one
+        // published: a newer link to the same peer must survive an older
+        // one's close event.
+        if let Some(dest) = closed_dest {
+            let mut reusable = self.reusable_dialed_link.lock().await;
+            if let Some(pool) = reusable.get_mut(&dest) {
+                let before = pool.len();
+                pool.retain(|id| *id != link_id);
+                // CIRISEdge#819 — a pooled lane whose link closed.
+                note_pool_links_closed(self.metrics, before - pool.len());
+                if pool.is_empty() {
+                    reusable.remove(&dest);
+                }
+            }
+        }
+        // CIRISEdge#532 — a closed link cannot still be "transferring"; leaving
+        // it marked would leak a pool slot that is never handed out again.
+        self.link_in_flight.lock().await.remove(&link_id);
+        // CIRISEdge#819 — nor be receiving.
+        self.inbound_resource_active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&link_id);
+        // CIRISEdge#728 — and its plane record.
+        self.link_plane.lock().await.remove(&link_id);
+    }
 }
 
 /// **CIRISEdge#853 — is this idle INBOUND link due to be closed?** Pure over
@@ -8247,6 +8426,28 @@ struct EventCtx<'a> {
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     #[cfg(feature = "lxmf")]
     lxmf_serve_links: &'a std::sync::Mutex<HashSet<LinkId>>,
+    /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
+    swallow_link_closed: &'a std::sync::Mutex<HashSet<LinkId>>,
+}
+
+impl EventCtx<'_> {
+    /// CIRISEdge#853 — the per-link maps a close clears.
+    fn link_book(&self) -> LinkBook<'_> {
+        LinkBook {
+            established_links: self.established_links,
+            link_established_at: self.link_established_at,
+            link_to_peer_key_id: self.link_to_peer_key_id,
+            link_last_inbound_at: self.link_last_inbound_at,
+            dialed_link_dest: self.dialed_link_dest,
+            reusable_dialed_link: self.reusable_dialed_link,
+            link_in_flight: self.link_in_flight,
+            inbound_resource_active: self.inbound_resource_active,
+            link_plane: self.link_plane,
+            link_direction: self.link_direction,
+            metrics: self.metrics,
+            metrics_source: self.metrics_source,
+        }
+    }
 }
 
 /// CIRISEdge#728 — the plane a Reticulum link belongs to, decided ONCE at
@@ -9699,51 +9900,20 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         NodeEvent::LinkClosed {
             link_id, reason, ..
         } => {
-            ctx.established_links.lock().await.remove(&link_id);
-            ctx.link_established_at.lock().await.remove(&link_id);
-            // CIRISEdge#853 — its direction record; an inbound link closing
-            // here (the peer, leviculum) counts as `link_closed`.
-            forget_link_direction(
-                ctx.link_direction,
-                ctx.metrics,
-                ctx.metrics_source,
-                &link_id,
-            );
-            // v3.5.1 (CIRISEdge#119 + #120) — drop the link's rooted
-            // peer attribution when the link closes.
-            ctx.link_to_peer_key_id.lock().await.remove(&link_id);
-            // CIRISEdge#353 — drop the link's last-inbound stamp too, so a
-            // closed link can never win the reverse-path selector.
-            ctx.link_last_inbound_at.lock().await.remove(&link_id);
-            // CIRISEdge#424 — drop the dialed-dest record for the closed link.
-            let closed_dest = ctx.dialed_link_dest.lock().await.remove(&link_id);
-            // CIRISEdge#532 — and drop it as this dest's REUSABLE link, so the
-            // next send dials instead of handing a dead link to every
-            // coordinator. Keyed by dest, so remove only if THIS link is the one
-            // published: a newer link to the same peer must survive an older
-            // one's close event.
-            if let Some(dest) = closed_dest {
-                let mut reusable = ctx.reusable_dialed_link.lock().await;
-                if let Some(pool) = reusable.get_mut(&dest) {
-                    let before = pool.len();
-                    pool.retain(|id| *id != link_id);
-                    // CIRISEdge#819 — a pooled lane whose link closed.
-                    note_pool_links_closed(ctx.metrics, before - pool.len());
-                    if pool.is_empty() {
-                        reusable.remove(&dest);
-                    }
-                }
-            }
-            // CIRISEdge#532 — a closed link cannot still be "transferring"; leaving
-            // it marked would leak a pool slot that is never handed out again.
-            ctx.link_in_flight.lock().await.remove(&link_id);
-            // CIRISEdge#819 — nor be receiving.
-            ctx.inbound_resource_active
+            // CIRISEdge#853 test seam — a close the test made silent (as a
+            // control-plane overflow would): edge never hears it.
+            if ctx
+                .swallow_link_closed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&link_id);
-            // CIRISEdge#728 — and its plane record.
-            ctx.link_plane.lock().await.remove(&link_id);
+                .remove(&link_id)
+            {
+                return;
+            }
+            // Every per-link map lets go; the close is counted under its
+            // reason, on its side (CIRISEdge#853), unless this node's own
+            // teardown already counted it.
+            ctx.link_book().forget(link_id, close_cause(reason)).await;
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
             // CIRISEdge#34 link half (v0.14.0) — emit `link_closed`
             // event. Severity reflects whether the close was graceful.
@@ -15987,26 +16157,82 @@ mod scope_native_addressing_tests {
         assert!(active.lock().unwrap().is_empty());
     }
 
-    /// A pass forgets the record of an inbound link the node no longer holds
-    /// (its `LinkClosed` was missed), counts it `link_closed`, and moves the
-    /// gauge; it closes nothing.
+    /// **A silent departure is counted `vanished`.** A link edge still holds
+    /// (mirror + direction record) that the node does not: the first pass only
+    /// suspects it (a `LinkClosed` may still be queued); a pass after
+    /// [`VANISH_GRACE`] prunes it from every map, counts `vanished` on its
+    /// side, and moves the gauge. It closes nothing.
     #[tokio::test]
-    async fn the_inbound_reaper_forgets_links_the_node_no_longer_holds_853() {
+    async fn the_reconciliation_counts_a_link_the_node_no_longer_holds_as_vanished_853() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let t = bare_transport(dir.path(), "node-853-prune").await;
+        let t = bare_transport(dir.path(), "node-853-vanish").await;
         let m = crate::observability::EdgeMetrics::new();
         let _ = t.metrics.set(m.clone());
-        let ghost = LinkId::new([9; 16]);
-        t.link_direction
-            .lock()
-            .unwrap()
-            .insert(ghost, LinkDirection::Inbound);
-        assert_eq!(t.link_direction_counts(), (1, 0));
-        assert_eq!(t.reap_idle_inbound_links().await, 0);
+        let (ghost_in, ghost_out) = (LinkId::new([9; 16]), LinkId::new([8; 16]));
+        for (id, d) in [
+            (ghost_in, LinkDirection::Inbound),
+            (ghost_out, LinkDirection::Outbound),
+        ] {
+            t.established_links.lock().await.insert(id);
+            t.link_established_at.lock().await.insert(id, 1);
+            t.link_direction.lock().unwrap().insert(id, d);
+        }
+        assert_eq!(t.link_direction_counts(), (1, 1));
+        assert_eq!(
+            t.reconcile_vanished_links().await,
+            0,
+            "first sight: suspect only"
+        );
+        assert_eq!(t.link_count().await, 2);
+        for at in t.vanish_suspects.lock().unwrap().values_mut() {
+            *at = std::time::Instant::now()
+                .checked_sub(VANISH_GRACE)
+                .expect("monotonic clock past the grace");
+        }
+        assert_eq!(
+            t.reap_idle_inbound_links().await,
+            0,
+            "a pass closes nothing"
+        );
         assert_eq!(t.link_direction_counts(), (0, 0));
+        assert_eq!(t.link_count().await, 0, "pruned from the mirror");
+        assert!(t.link_established_at.lock().await.is_empty());
         assert_eq!(m.inbound_links(), 0);
-        assert_eq!(m.inbound_link_closed_by_reason()["link_closed"], 1);
-        assert_eq!(m.inbound_link_closed_by_reason()["idle_expired"], 0);
+        assert_eq!(m.inbound_link_closed_by_reason()["vanished"], 1);
+        assert_eq!(m.outbound_link_closed_by_reason()["vanished"], 1);
+        let total: u64 = m.inbound_link_closed_by_reason().values().sum();
+        assert_eq!(total, 1, "counted once, under one cause");
+        assert!(t.vanish_suspects.lock().unwrap().is_empty());
+    }
+
+    /// Every leviculum close reason has its own token, and every token is
+    /// present in both families.
+    #[test]
+    fn every_close_reason_has_a_cause_and_every_cause_a_token_853() {
+        use leviculum_core::link::LinkCloseReason as R;
+        for (r, token) in [
+            (R::Normal, "normal"),
+            (R::PeerClosed, "peer_closed"),
+            (R::Timeout, "timeout"),
+            (R::Stale, "stale"),
+            (R::InvalidProof, "invalid_proof"),
+            (R::ChannelExhausted, "channel_exhausted"),
+            (R::Blackholed, "blackholed"),
+        ] {
+            assert_eq!(close_cause(r).as_str(), token);
+        }
+        let m = crate::observability::EdgeMetrics::new();
+        let tokens: HashSet<String> = m.outbound_link_closed_by_reason().into_keys().collect();
+        assert_eq!(tokens.len(), LinkCloseCause::COUNT);
+        for t in [
+            "idle_expired",
+            "pool_idle_expired",
+            "pool_full",
+            "local_teardown",
+            "vanished",
+        ] {
+            assert!(tokens.contains(t), "{t}");
+        }
     }
 
     /// The bound: zero disables, a short non-zero bound is raised to 1 s.
@@ -16506,6 +16732,12 @@ pub const DEFAULT_INBOUND_LINK_IDLE_BOUND: Duration = DEFAULT_LINK_POOL_IDLE_BOU
 /// CIRISEdge#853 — the shortest non-zero inbound idle bound a setter accepts:
 /// the `last_inbound` stamps are whole seconds.
 const MIN_INBOUND_LINK_IDLE_BOUND: Duration = Duration::from_secs(1);
+
+/// CIRISEdge#853 — how long a link must have been gone at the node, while
+/// edge still holds it, before the reconciliation pass counts it `vanished`:
+/// a `LinkClosed` still queued behind the listener gets this long to be
+/// counted under its real reason.
+const VANISH_GRACE: Duration = Duration::from_secs(2);
 
 /// CIRISEdge#532 — how many dials to one peer may be in flight at once.
 ///

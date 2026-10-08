@@ -13,7 +13,9 @@
 //!   close, and B's next send re-dials and is delivered;
 //! - (b) a link with an inbound transfer in progress is not reaped;
 //! - (c) with the inbound bound at 0 the link stays open past the bound;
-//! - (d) the gauges count one inbound link on A and one outbound on B.
+//! - (d) the gauges count one inbound link on A and one outbound on B;
+//! - (e) a link that leaves at the node without a `LinkClosed` edge hears is
+//!   reconciled: pruned, counted `vanished`, and the gauge drops.
 #![cfg(feature = "transport-reticulum")]
 
 mod common;
@@ -290,8 +292,14 @@ async fn a_quiet_inbound_link_is_closed_by_the_responder_and_the_initiator_redia
     let reasons = p.metrics_a.inbound_link_closed_by_reason();
     assert_eq!(reasons["idle_expired"], 1, "{reasons:?}");
     assert_eq!(
-        reasons["link_closed"], 0,
-        "the reaped link's own LinkClosed event is not counted twice: {reasons:?}"
+        reasons.values().sum::<u64>(),
+        1,
+        "the reaped link's own LinkClosed event is not counted again: {reasons:?}"
+    );
+    let on_b = p.metrics_b.outbound_link_closed_by_reason();
+    assert_eq!(
+        on_b["peer_closed"], 1,
+        "B counts its dialled link as closed by the peer: {on_b:?}"
     );
 }
 
@@ -387,4 +395,58 @@ async fn a_zero_bound_disables_the_reap_and_the_gauges_count_directions_853() {
     assert!(p.a.node_link_established_for_test(link));
     assert!(p.b.node_link_established_for_test(link));
     assert_eq!(idle_expired(&p.metrics_a), 0, "the reap is off");
+}
+
+/// **(e) A link that leaves without a `LinkClosed` edge hears is reconciled
+/// as `vanished`.** A's node closes B's link and A's listener never handles
+/// the event (as when a full control plane drops it): A's mirror and gauge
+/// still count the link. The reaper's reconciliation finds the node no longer
+/// holds it, prunes it, counts `inbound_link_closed_by_reason{vanished}`, and
+/// the gauge drops. Fails on v40.0.9, where the mirror keeps such a link
+/// forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_that_leaves_silently_is_counted_vanished_853() {
+    let mut p = pair("vanish", Duration::ZERO).await;
+    let dest = p.a_key.clone();
+    p.b.send(&dest, b"one frame").await.expect("send B -> A");
+    recv_one(&mut p.rx_a, "A receives").await;
+    let link = a_inbound_link(&p).await;
+    let up = wait_for(Duration::from_secs(10), || async {
+        p.metrics_a.inbound_links() == 1
+    })
+    .await;
+    assert!(up, "A's gauge counts the link");
+
+    p.a.close_link_silently_for_test(link).await;
+    assert!(
+        !p.a.node_link_established_for_test(link),
+        "gone at A's node"
+    );
+    assert_eq!(
+        p.a.link_count().await,
+        1,
+        "but A's mirror never heard: the stale count the canonical reports"
+    );
+
+    let reconciled = wait_for(Duration::from_secs(15), || async {
+        p.metrics_a.inbound_link_closed_by_reason()["vanished"] == 1
+            && p.metrics_a.inbound_links() == 0
+            && p.a.link_count().await == 0
+    })
+    .await;
+    let reasons = p.metrics_a.inbound_link_closed_by_reason();
+    assert!(
+        reconciled,
+        "the reaper prunes the vanished link and counts it: {reasons:?}, gauge {}, mirror {}",
+        p.metrics_a.inbound_links(),
+        p.a.link_count().await
+    );
+    assert_eq!(reasons.values().sum::<u64>(), 1, "once: {reasons:?}");
+    assert_eq!(p.a.link_direction_counts(), (0, 0));
+    // B heard the LINKCLOSE: its side is an ordinary peer close.
+    let b_saw = wait_for(Duration::from_secs(10), || async {
+        p.metrics_b.outbound_link_closed_by_reason()["peer_closed"] == 1
+    })
+    .await;
+    assert!(b_saw, "{:?}", p.metrics_b.outbound_link_closed_by_reason());
 }

@@ -1,6 +1,6 @@
 # CIRISEdge Release Notes
 
-# v40.0.10 — the responder closes idle inbound links
+# v40.0.10 — the responder closes idle inbound links, and every link departure is counted
 
 **2026-10-08.** **PATCH** from v40.0.9, cut from the v40.0.9 tag (main carries v40.1.0). Persist
 v53.1.8, verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged.
@@ -31,9 +31,8 @@ running a fixed edge, and an adversarial peer wouldn't.
   the pool bound. Set it with `with_inbound_link_idle_bound` / `set_inbound_link_idle_bound`; 0
   disables it. The idle clock starts at the link's #353 `last_inbound` stamp, or at its
   establishment if it has never carried a frame. The close goes through `link_teardown`, which
-  checks the node's own link state (#821 finding 5). It's counted in
-  `inbound_link_closed_by_reason{idle_expired}`. Inbound links that close any other way count as
-  `link_closed`. The reap skips:
+  checks the node's own link state (#821 finding 5), and is counted as
+  `inbound_link_closed_by_reason{idle_expired}`. The reap skips:
   - a pool transfer in flight;
   - an inbound transfer still making progress;
   - an outbound transfer on the link (the reverse path answers on the peer's link);
@@ -45,6 +44,49 @@ running a fixed edge, and an adversarial peer wouldn't.
   Links this node dialled are never touched here; the pool reaper owns those.
 - **The initiator self-heals.** The close sends LINKCLOSE, so the peer drops the lane from its
   pool and its next send dials a fresh link. This works for v40.0.6 initiators too.
+- **Every departure is counted, by direction.** `inbound_link_closed_by_reason` and
+  `outbound_link_closed_by_reason` carry one token per way a link leaves. Every token is always
+  present.
+  - Closes this node asks for: `idle_expired` (the inbound reap), `pool_idle_expired` and
+    `pool_full` (the #819 pool reaper), and `local_teardown` (any other `link_teardown`).
+  - leviculum's `LinkClosed` reason, for every other close: `normal`, `peer_closed`, `timeout`,
+    `stale`, `invalid_proof`, `channel_exhausted`, `blackholed`, and `other` for a reason edge
+    doesn't know.
+  - `vanished`, from reconciliation (next item).
+
+  Each close counts once. A teardown this node makes counts itself before it asks the node, so
+  the `LinkClosed` event that follows adds nothing. The existing `link_pool_closed_by_reason`
+  family is unchanged.
+- **Reconciliation of silent departures.** The reaper's pass compares edge's link book (the
+  `established_links` mirror and the direction records) with the node's
+  `link_is_established`. A link the node no longer holds has left without a `LinkClosed` edge
+  processed. leviculum drops the newest control event when the control plane is full
+  (`ControlPlaneOverflow`). Such a link is pruned from the mirror and every per-link map and
+  counted as `vanished` on its side, and the gauges drop. It is pruned on the first pass at least
+  2 s after it was first seen gone. That gives a `LinkClosed` still queued behind the listener the
+  chance to count under its real reason. On the production tick that means within about one
+  minute. leviculum v0.30's `link_count_check` does the same; this line pins v0.27.
+
+**No implicit link cap at ~1.5k.** The canonical's link count plateaued near 1,500 while about 450
+links established per 5 minutes and only 6 to 10 closed with `Timeout`. That plateau isn't a
+leviculum limit. At v0.27.0+ciris.1:
+1. `TransportConfig::max_links` (`leviculum-core/src/transport.rs:687`; std `config.rs:142/347`)
+   is the only hard cap. It defaults to `None`, and edge doesn't set it. When set, it REFUSES
+   inbound links (`LINK_REFUSED reason=budget`) and fails outbound ones with `TableFull`; a closed
+   link frees its slot (`node/mvr_link_cap.rs`).
+2. `ESTABLISHED_MIRROR_CAP` = 1024 (`leviculum-std/src/driver/completions.rs:63`) is an envelope
+   with no eviction (leviculum#56). Past it, `completions.rs:440-470` only logs
+   `COMPLETION_MIRROR_OVER_ENVELOPE` on a doubling ladder.
+3. The `memory_storage` link table is a FIFO drop-oldest map sized by the `TableCaps` profile:
+   8,192 on desktop (the default), 1,024 on embedded (`memory_storage.rs:144/159/419`). That
+   eviction is silent.
+
+Every path in `leviculum-core/src/node/link_management.rs` that removes an established link
+emits `LinkClosed`. So a departure edge doesn't see is an event lost on the way: a full control
+plane drops the newest. The plateau is therefore an equilibrium of departures nobody logged.
+v40.0.10 names them: `vanished` for the lost ones, and the per-reason tokens for the rest.
+`normal` and `stale` closes log at INFO, so a WARN-only read misses them; the tokens count every
+one.
 
 **Witness.** `tests/inbound_reap_853.rs`, two loopback nodes:
 - (a) B dials A and goes quiet. A closes the link after the bound (`idle_expired` = 1). B observes
@@ -52,9 +94,13 @@ running a fixed edge, and an adversarial peer wouldn't.
 - (b) A link marked mid-receive survives three bounds and is reaped once the transfer ends.
 - (c) With the bound at 0, the link stays open past the bound.
 - (d) The gauges read one inbound link on A and one outbound on B.
+- (e) A's node closes the link and A's listener drops the `LinkClosed`, as an overflow would.
+  A's mirror still counts the link. The next passes prune it, count `vanished` = 1, and drop the
+  gauge. B counts `peer_closed`.
 
-With the reap removed, (a) and (b) fail. With the busy exemptions and the zero guard removed,
-(b) and (c) fail.
+With the reap and the reconciliation removed, (a), (b) and (e) fail; (e) runs with the idle reap
+off, so it depends on the reconciliation alone. With the busy exemptions and the zero guard
+removed, (b) and (c) fail.
 
 # v40.0.9 — a peer's short key can no longer crash the node, the pool reaper's races are closed, and Windows/Android Python can import edge
 
