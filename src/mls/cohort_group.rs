@@ -2873,12 +2873,15 @@ mod tests {
     }
 
     /// Past the ingress gate, the Add HPKE-encrypts the Welcome to the
-    /// short `init_key` and `libcrux-kem` 0.0.7 panics. The guard returns
-    /// `CryptoPanic`, the group is still at its epoch with its roster after
+    /// short `init_key`. `libcrux-kem` 0.0.7 panicked there (the guard
+    /// contained it as `CryptoPanic`); 0.0.10 (CIRISEdge#822) refuses with
+    /// an error, so the Add fails cleanly and the guard never fires. A
+    /// `CryptoPanic` here means the lock regressed to a panicking libcrux.
+    /// Either way the group is still at its epoch with its roster after
     /// every attempt, and a following valid Add commits, persists, and
     /// admits a joiner whose secrets agree with the creator's.
     #[tokio::test]
-    async fn a_short_init_key_past_the_gate_is_a_contained_panic_and_the_group_survives() {
+    async fn a_short_init_key_past_the_gate_is_refused_and_the_group_survives() {
         let store = open_store();
         let a = CohortGroup::create(store.clone(), "c-822", "node-a", 16)
             .await
@@ -2889,16 +2892,8 @@ mod tests {
             let forged = forge_short_keys(&bad_kp, &bad_material.signer, Some(len), None);
             let short = validate_without_length_gate(&forged);
             match a.add_member("mallory", short).await {
-                Err(CohortGroupError::CryptoPanic(m)) => {
-                    assert!(
-                        m.contains("restored to its pre-operation state"),
-                        "len {len}: {m}"
-                    );
-                }
-                // At or above the ML-KEM boundary libcrux may refuse with
-                // an error instead of panicking; either way, no Add.
-                Err(CohortGroupError::AddFailed(_)) if len >= 1184 => {}
-                other => panic!("len {len}: expected a contained crypto panic, got {other:?}"),
+                Err(CohortGroupError::AddFailed(_)) => {}
+                other => panic!("len {len}: expected a clean Add refusal, got {other:?}"),
             }
             assert_eq!(a.epoch().await, epoch, "len {len}: no epoch advanced");
             assert_eq!(a.member_key_ids().await, vec!["node-a".to_owned()]);

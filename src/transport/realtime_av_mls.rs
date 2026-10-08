@@ -1622,11 +1622,13 @@ mod tests {
 
     /// CIRISEdge#822 — the A/V admit of a joiner-published KeyPackage
     /// refuses a signed one with a short `init_key` at its key-length
-    /// gate; past the gate the Add panics inside `libcrux-kem` 0.0.7 and
-    /// the guard returns `CryptoPanic` with the session unchanged; a
-    /// following valid admit commits and its Welcome joins.
+    /// gate; past the gate `libcrux-kem` 0.0.10 refuses the short key with
+    /// an error (0.0.7 panicked, and the guard contained it as
+    /// `CryptoPanic`; seeing that now means the lock regressed), leaving
+    /// the session unchanged; a following valid admit commits and its
+    /// Welcome joins.
     #[test]
-    fn a_short_init_key_is_refused_and_past_the_gate_is_a_contained_panic() {
+    fn a_short_init_key_is_refused_at_the_gate_and_past_it() {
         use crate::mls::crypto_panic::test_support::{
             forge_short_keys, validate_without_length_gate,
         };
@@ -1645,10 +1647,8 @@ mod tests {
 
         let epoch = session.epoch();
         match session.commit_add_published_unchecked("mallory", short) {
-            Err(MlsError::CryptoPanic(m)) => {
-                assert!(m.contains("restored to its pre-operation state"), "{m}");
-            }
-            other => panic!("expected a contained crypto panic, got {other:?}"),
+            Err(MlsError::CommitAddFailed(_)) => {}
+            other => panic!("expected a clean Add refusal, got {other:?}"),
         }
         assert_eq!(session.epoch(), epoch, "no epoch advanced");
         assert_eq!(session.member_key_ids(), vec!["creator".to_owned()]);
