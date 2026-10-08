@@ -737,9 +737,8 @@ impl MlsSession {
         &mut self,
         key_package: KeyPackage,
     ) -> Result<(MlsMessageOut, MlsMessageOut, Option<GroupInfo>), MlsError> {
-        let provider = self.provider.as_ref();
         let signer = &self.signer;
-        guard_group_op(provider, &mut self.group, |group| {
+        guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
             let out = group
                 .add_members(provider, signer, &[key_package])
                 .map_err(|e| MlsError::CommitAddFailed(format!("{e:?}")))?;
@@ -776,10 +775,9 @@ impl MlsSession {
         // Path secrets go to every copath leaf's encryption_key. On a
         // contained panic the group is restored to its pre-Remove state
         // and `member_signature_keys` (updated below) is untouched.
-        let provider = self.provider.as_ref();
         let signer = &self.signer;
         let (commit_msg, _welcome_opt, _group_info) =
-            guard_group_op(provider, &mut self.group, |group| {
+            guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
                 let out = group
                     .remove_members(provider, signer, &[target_idx])
                     .map_err(|e| MlsError::CommitRemoveFailed(format!("{e:?}")))?;
@@ -814,8 +812,7 @@ impl MlsSession {
         // Decrypts the path secret and installs the committer's new path
         // keys; a contained panic leaves the session at the epoch it was
         // in, as an `Err` from `process_message` does.
-        let provider = self.provider.as_ref();
-        guard_group_op(provider, &mut self.group, |group| {
+        guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
             let processed = group
                 .process_message(provider, proto)
                 .map_err(|e| MlsError::ProcessFailed(format!("{e:?}")))?;
@@ -1011,9 +1008,8 @@ impl MlsSession {
         // remote to wait on. Build encrypts the Welcome and the path
         // secrets; on a contained panic the group is restored to its
         // pre-batch state and the member map below is untouched.
-        let provider = self.provider.as_ref();
         let signer = &self.signer;
-        let bundle = guard_group_op(provider, &mut self.group, |group| {
+        let bundle = guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
             let builder = group.commit_builder();
             let builder = builder
                 .propose_adds(add_key_packages)
