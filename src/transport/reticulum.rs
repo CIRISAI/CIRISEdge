@@ -4961,6 +4961,98 @@ impl ReticulumTransport {
         destination_key_id: &str,
         address: &MemberAddress,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
+        let (dest_hash, transport_ed25519) =
+            self.av_dial_target(destination_key_id, address).await?;
+        let inbound: Arc<
+            std::sync::Mutex<Option<crate::transport::realtime_av_runtime::PumpReceiver>>,
+        > = Arc::new(std::sync::Mutex::new(None));
+        // The link id the dial dispatched, so a dial that fails AFTER
+        // registering its consumer can be torn down (Codex on #813).
+        let dispatched: Arc<std::sync::Mutex<Option<LinkId>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let link_id = {
+            let sink = Arc::clone(&self.av_sink);
+            let dialed = Arc::clone(&self.av_dialed_peer);
+            let slot = Arc::clone(&inbound);
+            let dispatched = Arc::clone(&dispatched);
+            let peer = destination_key_id.to_owned();
+            self.dial_ctx()
+                .dial_derived_link(
+                    destination_key_id,
+                    dest_hash,
+                    &transport_ed25519,
+                    LinkPlane::Av,
+                    move |link_id| {
+                        *dispatched
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(link_id);
+                        dialed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(link_id, peer);
+                        *slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(sink.claim(link_id));
+                    },
+                )
+                .await
+        };
+        let link_id = match link_id {
+            Ok(id) => id,
+            Err(e) => {
+                // The dial failed after it registered this link's consumer and
+                // attribution basis (an identify failure on an established
+                // link, an establish timeout). No `AvLink` reaches the caller,
+                // so nobody else can tear it down: undo both records and close
+                // the link here, or repeated failures hold live links and sink
+                // queues against the node's bounded link capacity.
+                let partial = *dispatched
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(id) = partial {
+                    self.undo_partial_av_dial(id, &e).await;
+                }
+                return Err(e);
+            }
+        };
+        let inbound = inbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                TransportError::Io("open_av_link: the dial registered no inbound queue".to_owned())
+            })?;
+        if let Some(m) = self.metrics.get() {
+            m.inc_av_plane(crate::observability::AV_LINK_OPENED);
+        }
+        tracing::info!(
+            key_id = %destination_key_id,
+            link = %hex::encode(link_id.as_bytes()),
+            "A/V link opened on the live node (CIRISEdge#805)"
+        );
+        Ok(crate::transport::av_sink::AvLink {
+            link_id: link_id.into_bytes(),
+            peer: destination_key_id.to_owned(),
+            inbound,
+            sender: crate::transport::realtime_av_runtime::LeviculumAvSender::new(
+                Arc::clone(&self.node),
+                link_id,
+            )
+            .with_metrics(self.metrics.get().cloned()),
+        })
+    }
+
+    /// CIRISEdge#805 — every check an A/V dial passes before it is made, and
+    /// what it dials with: the derived address must be an A/V session address
+    /// (§3.6), must be `destination_key_id`'s own, must clear the operator
+    /// deny-list together with every federation candidate of the peer, and the
+    /// peer's transport key must resolve (no key ⇒ no link proof).
+    async fn av_dial_target(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+    ) -> Result<(DestinationHash, [u8; 32]), TransportError> {
         let dest_hash = DestinationHash::new(*address.as_bytes());
         let plane = classify_link_plane(self.scope_addresses.get().map(Arc::as_ref), &dest_hash);
         if plane != LinkPlane::Av {
@@ -5010,95 +5102,28 @@ impl ReticulumTransport {
                  address (CIRISEdge#805)"
             )));
         };
-        let inbound: Arc<
-            std::sync::Mutex<Option<crate::transport::realtime_av_runtime::PumpReceiver>>,
-        > = Arc::new(std::sync::Mutex::new(None));
-        // The link id the dial dispatched, so a dial that fails AFTER
-        // registering its consumer can be torn down (Codex on #813).
-        let dispatched: Arc<std::sync::Mutex<Option<LinkId>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let link_id = {
-            let sink = Arc::clone(&self.av_sink);
-            let dialed = Arc::clone(&self.av_dialed_peer);
-            let slot = Arc::clone(&inbound);
-            let dispatched = Arc::clone(&dispatched);
-            let peer = destination_key_id.to_owned();
-            self.dial_ctx()
-                .dial_derived_link(
-                    destination_key_id,
-                    dest_hash,
-                    &transport_ed25519,
-                    LinkPlane::Av,
-                    move |link_id| {
-                        *dispatched
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(link_id);
-                        dialed
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(link_id, peer);
-                        *slot
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(sink.claim(link_id));
-                    },
-                )
-                .await
-        };
-        let link_id = match link_id {
-            Ok(id) => id,
-            Err(e) => {
-                // The dial failed after it registered this link's consumer and
-                // attribution basis (an identify failure on an established
-                // link, an establish timeout). No `AvLink` reaches the caller,
-                // so nobody else can tear it down: undo both records and close
-                // the link here, or repeated failures hold live links and sink
-                // queues against the node's bounded link capacity.
-                let partial = *dispatched
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if let Some(id) = partial {
-                    self.av_sink.forget(&id);
-                    self.av_dialed_peer
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&id);
-                    let _ = self.node.close_link(&id).await;
-                    tracing::debug!(
-                        link = %hex::encode(id.as_bytes()),
-                        error = %e,
-                        "A/V dial failed after registering its link — records undone, link \
-                         closed (CIRISEdge#805)"
-                    );
-                }
-                return Err(e);
-            }
-        };
-        let inbound = inbound
+        Ok((dest_hash, transport_ed25519))
+    }
+
+    /// CIRISEdge#805 — undo an A/V dial that failed after registering its link
+    /// (an identify failure on an established link, an establish timeout): no
+    /// `AvLink` reaches the caller, so nobody else can tear it down. Removes
+    /// the sink queue and the dial record and closes the link, or repeated
+    /// failures hold live links and sink queues against the node's bounded
+    /// link capacity (Codex on #813).
+    async fn undo_partial_av_dial(&self, id: LinkId, error: &TransportError) {
+        self.av_sink.forget(&id);
+        self.av_dialed_peer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-            .ok_or_else(|| {
-                TransportError::Io("open_av_link: the dial registered no inbound queue".to_owned())
-            })?;
-        if let Some(m) = self.metrics.get() {
-            m.inc_av_plane(crate::observability::AV_LINK_OPENED);
-        }
-        tracing::info!(
-            key_id = %destination_key_id,
-            link = %hex::encode(link_id.as_bytes()),
-            "A/V link opened on the live node (CIRISEdge#805)"
+            .remove(&id);
+        let _ = self.node.close_link(&id).await;
+        tracing::debug!(
+            link = %hex::encode(id.as_bytes()),
+            error = %error,
+            "A/V dial failed after registering its link — records undone, link closed \
+             (CIRISEdge#805)"
         );
-        Ok(crate::transport::av_sink::AvLink {
-            link_id: link_id.into_bytes(),
-            peer: destination_key_id.to_owned(),
-            inbound,
-            sender: crate::transport::realtime_av_runtime::LeviculumAvSender::new(
-                Arc::clone(&self.node),
-                link_id,
-            )
-            .with_metrics(self.metrics.get().cloned()),
-        })
     }
 
     /// CIRISEdge#805 item 4 — take the receiver of A/V links PEERS open to this
