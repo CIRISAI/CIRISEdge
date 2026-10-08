@@ -12252,7 +12252,9 @@ mod init_logging_814 {
     use std::sync::{Arc, Mutex};
 
     /// ONE test for the global install, because the subscriber is
-    /// process-wide: split tests would depend on run order.
+    /// process-wide: split tests would depend on run order and, under the
+    /// default parallel runner, race each other (#815 review, round 4). The
+    /// scoped-dispatcher probe check lives here for the same reason.
     ///
     /// Before anything is installed, a bad filter is refused by name and
     /// installs nothing; a good call installs (`true`). After that every
@@ -12261,6 +12263,22 @@ mod init_logging_814 {
     /// checked before the filter is looked at).
     #[test]
     fn install_once_then_every_call_is_a_quiet_no_op() {
+        // A scoped dispatcher on the CALLING thread is not a global one: the
+        // probe's answer must not change inside one (#815 review, round 3).
+        // Checked here, before any install, so no parallel test can flip the
+        // global between the two probes.
+        {
+            let scoped = tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish();
+            let before = super::global_subscriber_installed();
+            let inside =
+                tracing::subscriber::with_default(scoped, super::global_subscriber_installed);
+            assert_eq!(
+                inside, before,
+                "entering a scoped dispatcher must not change what the GLOBAL probe reports"
+            );
+        }
         if super::global_subscriber_installed() {
             // Another test in this binary installed one first; the
             // pre-install half cannot be observed here, the rest can.
@@ -12300,21 +12318,6 @@ mod init_logging_814 {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
-    }
-
-    /// A scoped dispatcher on the CALLING thread is not a global one: the
-    /// probe must not report it as installed (#815 review, round 3).
-    #[test]
-    fn a_scoped_dispatcher_on_this_thread_is_not_a_global_one() {
-        let scoped = tracing_subscriber::fmt()
-            .with_writer(std::io::sink)
-            .finish();
-        let before = super::global_subscriber_installed();
-        let inside = tracing::subscriber::with_default(scoped, super::global_subscriber_installed);
-        assert_eq!(
-            inside, before,
-            "entering a scoped dispatcher must not change what the GLOBAL probe reports"
-        );
     }
 
     /// The default directive keeps edge's custom-target warnings (the
