@@ -22,7 +22,11 @@
 //!   use, and is not reaped while the sends continue;
 //! - (h) Codex on #854: a link is closed only on the second consecutive pass
 //!   that finds it idle and unchanged, so activity queued behind the timer
-//!   saves it.
+//!   saves it;
+//! - (i) Codex round two: a link whose `LinkEstablished` was lost is recovered
+//!   from its next event, counted, and reaped like any other;
+//! - (j) Codex round two: a reply waiting on the Channel holds its link busy
+//!   across reaper passes.
 #![cfg(feature = "transport-reticulum")]
 
 mod common;
@@ -629,4 +633,83 @@ async fn a_link_is_reaped_only_on_the_second_idle_observation_854() {
         "idle and unchanged on the second: closed"
     );
     assert_eq!(idle_expired(&p.metrics_a), 1);
+}
+
+/// **(i) Codex round two on #854, finding 1 — a link whose `LinkEstablished`
+/// edge never processed is recovered.** A drops the next inbound
+/// `LinkEstablished` (as a full control plane does) before recording
+/// anything. B's frame on that link rebuilds A's bookkeeping: the link is
+/// tracked as inbound, counted in `recovered_links_total`, and reaped once
+/// idle. Fails without the recovery: A never records the link, so it is
+/// never a reap candidate and stays open for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_whose_establish_event_was_lost_is_recovered_and_reaped_854() {
+    let mut p = pair("recover", BOUND).await;
+    let a_key = p.a_key.clone();
+    p.a.drop_next_inbound_link_established_for_test();
+    p.b.send(&a_key, b"one frame on a link A never saw established")
+        .await
+        .expect("send B -> A");
+    recv_one(&mut p.rx_a, "A receives").await;
+    let link = a_inbound_link(&p).await;
+    assert_eq!(
+        p.metrics_a.recovered_links_total(),
+        1,
+        "the link's bookkeeping was rebuilt from its later events"
+    );
+    let closed = wait_for(BOUND * 6, || async {
+        idle_expired(&p.metrics_a) == 1 && !p.a.node_link_established_for_test(link)
+    })
+    .await;
+    assert!(
+        closed,
+        "the recovered link is reaped once idle: {:?}",
+        p.metrics_a.inbound_link_closed_by_reason()
+    );
+}
+
+/// **(j) Codex round two on #854, finding 2 — a reply waiting on the Channel
+/// holds its link busy.** A's reaper runs only when the witness calls it. B's
+/// link is idle past the bound and the first pass has noted it; A then starts
+/// a reply on it that waits 3 s inside the send (as pacing can, up to the
+/// 15 s frame budget). The second pass runs mid-send and must not close the
+/// link; the reply completes. Fails when only a COMPLETED Channel send marks
+/// the link: the second pass finds it idle and unchanged and closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reply_waiting_on_the_channel_holds_its_link_854() {
+    let mut p = pair_ticking("chanbusy", BOUND, false).await;
+    let (a_key, b_key) = (p.a_key.clone(), p.b_key.clone());
+    p.b.send(&a_key, b"one frame").await.expect("send B -> A");
+    let frame = recv_one(&mut p.rx_a, "A receives").await;
+    let path = frame
+        .reply_path
+        .expect("a link frame carries its reply path");
+    p.a.set_inbound_link_idle_bound(BOUND);
+    let link = a_inbound_link(&p).await;
+    tokio::time::sleep(BOUND + Duration::from_millis(1500)).await;
+    assert_eq!(
+        p.a.reap_idle_inbound_links().await,
+        0,
+        "first idle observation"
+    );
+
+    p.a.delay_channel_sends_for_test(3000);
+    let a = Arc::clone(&p.a);
+    let reply = tokio::spawn(async move {
+        a.send_on_reply_path_only(&b_key, &path, b"a reply held in the Channel")
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        p.a.reap_idle_inbound_links().await,
+        0,
+        "the second pass runs while the reply is in flight: the link is busy"
+    );
+    assert!(p.a.node_link_established_for_test(link));
+    reply
+        .await
+        .expect("reply task")
+        .expect("the reply completes on its link");
+    p.a.delay_channel_sends_for_test(0);
+    assert_eq!(idle_expired(&p.metrics_a), 0);
 }
