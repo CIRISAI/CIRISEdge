@@ -1656,4 +1656,4 @@ required-features = ["transport-reticulum", "mesh-harness", "test-anchor"]
 # WITH the 0.6 X-Wing derive; an upstream on the labeled derive is a
 # fleet-wide MLS break, so run the witness against it first.
 [patch.crates-io]
-openmls_libcrux_crypto = { path = "/tmp/claude-1000/-home-emoore-CIRISEdge/5aada876-b698-4ddb-b67b-6f4aba443cf2/scratchpad/fork-822/openmls/libcrux_crypto" }
+openmls_libcrux_crypto = { git = "https://github.com/CIRISAI/openmls", tag = "openmls_libcrux_crypto-v0.3.1+ciris.1" }

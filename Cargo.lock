@@ -4545,6 +4545,7 @@ dependencies = [
 [[package]]
 name = "openmls_libcrux_crypto"
 version = "0.3.1+ciris.1"
+source = "git+https://github.com/CIRISAI/openmls?tag=openmls_libcrux_crypto-v0.3.1+ciris.1#c8106f8c9b20fb12fac332bd259157a8814fcc7f"
 dependencies = [
  "hpke-rs",
  "hpke-rs-crypto",
