@@ -2570,6 +2570,9 @@ pub struct ReticulumTransport {
     /// still passes the same #393 gate on that key id. Removed on
     /// `LinkClosed`.
     av_dialed_peer: Arc<std::sync::Mutex<HashMap<LinkId, String>>>,
+    /// CIRISEdge#805 test seam — fail the next N derived-link identifies
+    /// ([`Self::fail_next_derived_identifies_for_test`]). Zero in production.
+    fail_derived_identify: Arc<std::sync::atomic::AtomicU32>,
     /// CIRISEdge#739 test seam — the next `n` answers on a reply path TEAR
     /// DOWN the link they would ride just before riding it: the request has
     /// arrived and been admitted on that link, and its answer finds the link
@@ -2881,6 +2884,7 @@ impl ReticulumTransport {
             reusable_dialed_link: Arc::clone(&self.reusable_dialed_link),
             pool_last_used: Arc::clone(&self.pool_last_used),
             link_in_flight: Arc::clone(&self.link_in_flight),
+            fail_derived_identify: Arc::clone(&self.fail_derived_identify),
         }
     }
 
@@ -3504,6 +3508,7 @@ impl ReticulumTransport {
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            fail_derived_identify: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             tear_down_reply_link: std::sync::atomic::AtomicU32::new(0),
             scoped_pool_bypass: std::sync::atomic::AtomicBool::new(false),
             blackhole: blackhole_rules,
@@ -4968,13 +4973,37 @@ impl ReticulumTransport {
                 crate::av_addressing::AV_STREAM_GROUP_PREFIX,
             )));
         }
+        // The address must be THIS peer's: its table entry names the member it
+        // was derived for. Dialling B's address under C's key id would record C
+        // as the link's peer, and B's reverse frames would then be attributed
+        // through C's #393 binding (two key ids can share one transport
+        // identity, so the link proof alone does not catch it — Codex on #813).
+        let member = self
+            .scope_addresses
+            .get()
+            .and_then(|t| t.accepts_inbound(address.as_bytes()))
+            .map(|a| a.member_key_id().to_owned());
+        if member.as_deref() != Some(destination_key_id) {
+            return Err(TransportError::Config(format!(
+                "open_av_link: A/V address {} belongs to member {} of the call's group, not to \
+                 destination_key_id={destination_key_id} — refused, so a link to one member is \
+                 never attributed to another (CIRISEdge#805)",
+                hex::encode(address.as_bytes()),
+                member.as_deref().unwrap_or("<none>"),
+            )));
+        }
+        // The operator deny-list, on the DERIVED hash and on EVERY federation
+        // candidate the peer resolves to — the regular send path's rule. A
+        // peer blackholed by its announced destination must not stay reachable
+        // through a session-derived address the operator never saw (Codex on
+        // #813).
         self.check_blackhole(&dest_hash.into_bytes()).await?;
-        let Some(transport_ed25519) = self
-            .resolve_dial_candidates(destination_key_id)
-            .await
-            .first()
-            .map(|c| c.transport_ed25519)
-        else {
+        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        for candidate in &candidates {
+            self.check_blackhole(&candidate.dest_hash.into_bytes())
+                .await?;
+        }
+        let Some(transport_ed25519) = candidates.first().map(|c| c.transport_ed25519) else {
             return Err(TransportError::Unreachable(format!(
                 "open_av_link: no transport identity resolved for \
                  destination_key_id={destination_key_id} — cannot prove a link to its A/V \
@@ -4984,10 +5013,15 @@ impl ReticulumTransport {
         let inbound: Arc<
             std::sync::Mutex<Option<crate::transport::realtime_av_runtime::PumpReceiver>>,
         > = Arc::new(std::sync::Mutex::new(None));
+        // The link id the dial dispatched, so a dial that fails AFTER
+        // registering its consumer can be torn down (Codex on #813).
+        let dispatched: Arc<std::sync::Mutex<Option<LinkId>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let link_id = {
             let sink = Arc::clone(&self.av_sink);
             let dialed = Arc::clone(&self.av_dialed_peer);
             let slot = Arc::clone(&inbound);
+            let dispatched = Arc::clone(&dispatched);
             let peer = destination_key_id.to_owned();
             self.dial_ctx()
                 .dial_derived_link(
@@ -4996,6 +5030,9 @@ impl ReticulumTransport {
                     &transport_ed25519,
                     LinkPlane::Av,
                     move |link_id| {
+                        *dispatched
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(link_id);
                         dialed
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5011,8 +5048,29 @@ impl ReticulumTransport {
         let link_id = match link_id {
             Ok(id) => id,
             Err(e) => {
-                // The dial registered nothing that outlives it: a link that
-                // never established closes, and `LinkClosed` forgets both.
+                // The dial failed after it registered this link's consumer and
+                // attribution basis (an identify failure on an established
+                // link, an establish timeout). No `AvLink` reaches the caller,
+                // so nobody else can tear it down: undo both records and close
+                // the link here, or repeated failures hold live links and sink
+                // queues against the node's bounded link capacity.
+                let partial = *dispatched
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(id) = partial {
+                    self.av_sink.forget(&id);
+                    self.av_dialed_peer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&id);
+                    let _ = self.node.close_link(&id).await;
+                    tracing::debug!(
+                        link = %hex::encode(id.as_bytes()),
+                        error = %e,
+                        "A/V dial failed after registering its link — records undone, link \
+                         closed (CIRISEdge#805)"
+                    );
+                }
                 return Err(e);
             }
         };
@@ -5068,6 +5126,25 @@ impl ReticulumTransport {
             .await
             .get(&LinkId::new(link_id))
             .copied()
+    }
+
+    /// CIRISEdge#805 test seam — A/V links this node dialled whose attribution
+    /// record is held.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn av_dialed_peer_count_for_test(&self) -> usize {
+        self.av_dialed_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// CIRISEdge#805 test seam — the next `n` derived-link dials fail at
+    /// identify, AFTER the link established (the partial-open arm).
+    #[doc(hidden)]
+    pub fn fail_next_derived_identifies_for_test(&self, n: u32) {
+        self.fail_derived_identify
+            .store(n, std::sync::atomic::Ordering::Release);
     }
 
     /// CIRISEdge#805 test seam — links the A/V sink routes for right now.
@@ -8378,6 +8455,8 @@ struct DialCtx {
     /// CIRISEdge#819 — see `ReticulumTransport::pool_last_used`.
     pool_last_used: Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
     link_in_flight: Arc<Mutex<HashSet<LinkId>>>,
+    /// CIRISEdge#805 — see `ReticulumTransport::fail_derived_identify`.
+    fail_derived_identify: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DialCtx {
@@ -8463,6 +8542,21 @@ impl DialCtx {
             });
         }
 
+        // CIRISEdge#805 test seam: fail identify on an ESTABLISHED link, the
+        // partial-open arm a caller must clean up after.
+        if self
+            .fail_derived_identify
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(TransportError::Io(
+                "reticulum identify_link (scoped): forced failure (test seam)".to_owned(),
+            ));
+        }
         // CIRISEdge#340 — IDENTIFY before shipping, so the responder can
         // attribute the frame. Same ordering as the federation send path.
         self.node
@@ -9942,6 +10036,10 @@ async fn deliver_av_frame(
             dest.map_or_else(|| "-".to_owned(), |d| hex::encode(d.into_bytes())),
         );
         drop_inbound(Some(link_id), DROP_AV_FRAME_UNATTRIBUTED, &detail);
+        // The frame consumed a counter on the sender's side: count it, so the
+        // next ADMITTED frame on this link reports the gap and the consumer's
+        // hop counter skips past it once the binding recovers (Codex on #813).
+        ctx.av_sink.note_dropped_before_sink(link_id);
         return;
     };
     // CIRISEdge#353 / #853 — an attributed A/V frame is proof the peer is alive

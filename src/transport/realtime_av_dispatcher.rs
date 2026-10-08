@@ -278,6 +278,40 @@ pub fn hop_counter_candidates(next: u64, dropped_before: u64) -> impl Iterator<I
         .chain((1..=HOP_COUNTER_RESYNC_SLACK).map_while(move |k| skipped.checked_add(k)))
 }
 
+/// The drop report a hop has not yet resolved (Codex on #813).
+///
+/// A receiver reports the frames it dropped ONCE, on the next frame it
+/// queues, and then resets its own count. If that frame cannot be parsed or
+/// opened — a junk frame from the peer, a corrupt one — the report must
+/// survive it: discarding it leaves the next real frame reporting zero while
+/// the sender's counter is past the slack, and every later frame on the hop
+/// then fails authentication. So an open loop folds each frame's report in
+/// here and spends it only when a frame authenticates.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HopGap {
+    pending: u64,
+}
+
+impl HopGap {
+    /// Fold in the drops reported with the frame just received; the gap to
+    /// try this frame at.
+    pub fn report(&mut self, dropped_before: u64) -> u64 {
+        self.pending = self.pending.saturating_add(dropped_before);
+        self.pending
+    }
+
+    /// A frame authenticated: the gap is resolved.
+    pub fn resolved(&mut self) {
+        self.pending = 0;
+    }
+
+    /// The gap still unresolved.
+    #[must_use]
+    pub const fn pending(&self) -> u64 {
+        self.pending
+    }
+}
+
 /// Open a frame at the first of its [`hop_counter_candidates`] that
 /// authenticates: the counter it opened at and what `open` returned. The
 /// one place both open loops (subscriber, relay) pick a counter, so the
@@ -603,6 +637,7 @@ impl AvDispatcher {
             tokio::spawn(async move {
                 let dek = dek_bytes.map(EpochDek::from_bytes);
                 let mut next_link_seq: u64 = 0;
+                let mut gap = HopGap::default();
                 loop {
                     // A permanently-closed link surfaces as a recv error;
                     // exit the loop. A transient error also lands here —
@@ -612,6 +647,9 @@ impl AvDispatcher {
                     let Ok(frame) = link.inbound_recv.recv_frame().await else {
                         break;
                     };
+                    // The drop report rides THIS frame; it is kept until a
+                    // frame authenticates, whatever happens to this one.
+                    let dropped_before = gap.report(frame.dropped_before);
                     // Malformed wire — skip this frame, keep pulling.
                     let Ok(sealed) = SealedAvChunk::from_bytes(&frame.bytes) else {
                         continue;
@@ -628,13 +666,14 @@ impl AvDispatcher {
                     // transport dropped before this one moves the counter
                     // past it (CIRISEdge#805), never below `next_link_seq`.
                     let Some((used, plaintext)) =
-                        open_at_first_counter(next_link_seq, frame.dropped_before, |c| {
+                        open_at_first_counter(next_link_seq, dropped_before, |c| {
                             open_av_chunk(&sealed, &link.transit_key, &link.link_id, c, dek).ok()
                         })
                     else {
                         continue;
                     };
                     next_link_seq = used.wrapping_add(1);
+                    gap.resolved();
                     let chunk = ReconstructedChunk {
                         stream_id: sealed.stream_id,
                         epoch: sealed.epoch,
@@ -937,6 +976,75 @@ mod tests {
                 .expect("open");
             assert_eq!(got.chunk_seq, ChunkSeq(want));
         }
+    }
+
+    /// Codex on #813: the drop report rides ONE frame. If that frame is junk
+    /// — unparseable, or parseable but opening at no counter — the report
+    /// must survive it, or the next real frame (reporting zero) is past the
+    /// slack and the hop fails authentication forever. Both junk shapes,
+    /// each carrying a gap larger than the slack reaches.
+    #[tokio::test]
+    async fn a_junk_frame_does_not_swallow_the_drop_report() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let transit = [0x51u8; 32];
+        let wire = |chunk_seq: u64, link_seq: u64| {
+            seal_av_outer(&inner(&dek, chunk_seq, 32), &transit, b"me", link_seq)
+                .expect("outer")
+                .to_bytes()
+        };
+        let big_gap = HOP_COUNTER_RESYNC_SLACK + 4;
+        // Parseable (header-sized) but sealed under nothing this hop knows.
+        let opaque_junk = vec![0xEE; 200];
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut d = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(7),
+            local_role: AvRole::Subscriber,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: vec![],
+            inbound_links: vec![AvInboundLink {
+                transit_key: transit,
+                link_id: b"me".to_vec(),
+                inbound_recv: Box::new(Scripted {
+                    rx: tokio::sync::Mutex::new(rx),
+                }),
+            }],
+        })
+        .expect("subscriber");
+        let mut out = d.spawn_subscriber_loop();
+        let after_first = 1 + big_gap;
+        let after_second = after_first + 1 + big_gap;
+        for (dropped_before, bytes) in [
+            (0, wire(0, 0)),
+            // 12 dropped, reported on an UNPARSEABLE frame.
+            (big_gap, b"junk".to_vec()),
+            (0, wire(1, after_first)),
+            // 12 more, reported on a parseable frame that opens nowhere.
+            (big_gap, opaque_junk),
+            (0, wire(2, after_second)),
+        ] {
+            tx.send(InboundWireFrame {
+                dropped_before,
+                bytes,
+            })
+            .expect("feed");
+        }
+        for want in 0..3u64 {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+                .await
+                .unwrap_or_else(|_| panic!("chunk {want}: the hop lost its drop report"))
+                .expect("open");
+            assert_eq!(got.chunk_seq, ChunkSeq(want));
+        }
+    }
+
+    #[test]
+    fn a_hop_gap_accumulates_until_resolved() {
+        let mut g = HopGap::default();
+        assert_eq!(g.report(3), 3);
+        assert_eq!(g.report(0), 3, "a frame with no report keeps the old one");
+        assert_eq!(g.report(2), 5);
+        g.resolved();
+        assert_eq!(g.pending(), 0);
     }
 
     /// Subscriber WITH a DEK still constructs (the inverse of the

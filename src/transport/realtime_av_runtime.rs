@@ -96,7 +96,7 @@ use super::realtime_av_alm::{
 };
 use super::realtime_av_dispatcher::{
     open_hop_outer, AvDispatcher, AvDispatcherConfig, AvDispatcherError, AvInboundLink, AvRole,
-    AvSubscriberLink, PeerKeyId, ReconstructedChunk,
+    AvSubscriberLink, HopGap, PeerKeyId, ReconstructedChunk,
 };
 use super::realtime_av_session::{AvSession, AvSessionError, EpochRekeyArtifacts, RosterDelta};
 use crate::transport::realtime_av::ReceiverLayerPolicy;
@@ -536,6 +536,9 @@ impl AvRelay {
         let mut dispatcher = self.dispatcher;
         tokio::spawn(async move {
             let mut inbound_link_seq: u64 = 0;
+            // The upstream's drop report, kept until a frame authenticates
+            // (Codex on #813 — a junk frame must not swallow it).
+            let mut gap = HopGap::default();
             tracing::info!(stream = %tag, "AV relay pump: started");
             loop {
                 let frame = match inbound.inbound_recv.recv_frame().await {
@@ -552,6 +555,7 @@ impl AvRelay {
                         break;
                     }
                 };
+                let dropped_before = gap.report(frame.dropped_before);
                 let sealed = match SealedAvChunk::from_bytes(&frame.bytes) {
                     Ok(s) => s,
                     Err(e) => {
@@ -577,20 +581,22 @@ impl AvRelay {
                     &inbound_transit_key,
                     &inbound_link_id,
                     inbound_link_seq,
-                    frame.dropped_before,
+                    dropped_before,
                 ) else {
                     tracing::warn!(
                         stream = %tag,
                         chunk_seq,
                         inbound_link_seq,
-                        dropped_before = frame.dropped_before,
+                        dropped_before,
                         "AV relay: inbound outer open FAILED at every candidate counter — \
                          frame not forwarded (CIRISEdge#425)"
                     );
                     continue;
                 };
-                // The open consumed the counter, whatever the fan-out does.
+                // The open consumed the counter, whatever the fan-out does,
+                // and resolved any reported gap.
                 inbound_link_seq = opened_at.wrapping_add(1);
+                gap.resolved();
                 match dispatcher.relay_inner(inner).await {
                     Ok(()) => {
                         tracing::debug!(
@@ -860,6 +866,13 @@ mod leviculum_link {
                     link_id,
                 },
             )
+        }
+
+        /// Count one frame dropped BEFORE it reached this queue (the #393
+        /// gate refused it while the binding was stale): reported with the
+        /// next queued frame like an overflow drop (Codex on #813).
+        pub(crate) fn note_dropped(&mut self) {
+            self.dropped_since_queued = self.dropped_since_queued.saturating_add(1);
         }
 
         /// Offer one frame. Never awaits.
@@ -1276,5 +1289,100 @@ mod tests {
                 .await
                 .ok_or_else(|| AvDispatcherError::RecvFailed("closed".into()))
         }
+    }
+
+    /// Codex on #813, relay side: the relay pump keeps an upstream drop
+    /// report across a junk frame exactly as the subscriber loop does, so the
+    /// next real chunk is still forwarded downstream.
+    #[tokio::test]
+    async fn the_relay_pump_keeps_the_drop_report_across_junk() {
+        use crate::transport::realtime_av::seal_av_outer;
+        use crate::transport::realtime_av_dispatcher::{
+            AvLinkReceiver, AvLinkSender, InboundWireFrame, HOP_COUNTER_RESYNC_SLACK,
+        };
+
+        struct Scripted(tokio::sync::Mutex<mpsc::UnboundedReceiver<InboundWireFrame>>);
+        #[async_trait::async_trait]
+        impl AvLinkReceiver for Scripted {
+            async fn recv(&self) -> Result<Vec<u8>, AvDispatcherError> {
+                self.recv_frame().await.map(|f| f.bytes)
+            }
+            async fn recv_frame(&self) -> Result<InboundWireFrame, AvDispatcherError> {
+                self.0
+                    .lock()
+                    .await
+                    .recv()
+                    .await
+                    .ok_or_else(|| AvDispatcherError::RecvFailed("closed".into()))
+            }
+        }
+        struct Down(mpsc::UnboundedSender<Vec<u8>>);
+        #[async_trait::async_trait]
+        impl AvLinkSender for Down {
+            async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+                self.0
+                    .send(bytes.to_vec())
+                    .map_err(|e| AvDispatcherError::SendFailed(e.to_string()))
+            }
+        }
+
+        let s = stream(0x61);
+        let dek = EpochDek::from_bytes([0x62; 32]);
+        let up = [0x63u8; 32];
+        let inner = |seq: u64| {
+            seal_av_inner(
+                b"relayed",
+                &dek,
+                s,
+                Epoch(1),
+                ChunkSeq(seq),
+                CODEC_OPAQUE,
+                ChunkLayer::BASE,
+            )
+            .expect("inner")
+        };
+        let (down_tx, mut down_rx) = mpsc::unbounded_channel();
+        let relay = AvRelay::new(
+            s,
+            vec![AvSubscriberLink {
+                subscriber: "sub".to_owned(),
+                transit_key: [0x64; 32],
+                link_id: b"sub".to_vec(),
+                outbound_send: Box::new(Down(down_tx)),
+            }],
+        )
+        .expect("relay");
+        let (up_tx, up_rx) = mpsc::unbounded_channel();
+        let _pump = relay.spawn_pump(
+            AvInboundLink {
+                transit_key: up,
+                link_id: b"relay".to_vec(),
+                inbound_recv: Box::new(Scripted(tokio::sync::Mutex::new(up_rx))),
+            },
+            up,
+            b"relay".to_vec(),
+        );
+        let gap = HOP_COUNTER_RESYNC_SLACK + 4;
+        for (dropped_before, bytes) in [
+            (gap, b"junk".to_vec()),
+            (
+                0,
+                seal_av_outer(&inner(0), &up, b"relay", gap)
+                    .expect("outer")
+                    .to_bytes(),
+            ),
+        ] {
+            up_tx
+                .send(InboundWireFrame {
+                    dropped_before,
+                    bytes,
+                })
+                .expect("feed");
+        }
+        let fwd = tokio::time::timeout(std::time::Duration::from_secs(5), down_rx.recv())
+            .await
+            .expect("the relay lost the drop report: nothing forwarded")
+            .expect("forwarded");
+        assert!(SealedAvChunk::from_bytes(&fwd).is_ok());
     }
 }

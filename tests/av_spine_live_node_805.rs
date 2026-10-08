@@ -210,6 +210,9 @@ fn auth(signer: Arc<LocalSigner>, dir: &Arc<SqliteBackend>) -> ReticulumAuth {
         rooting: Some(Arc::clone(dir) as Arc<dyn RootingDirectory>),
         resolver: None,
         hybrid_policy: ciris_edge::HybridPolicy::Ed25519Fallback,
+        // The operator deny-list (persist V052), so the A/V dial's blackhole
+        // rule is exercised against a real store.
+        blackhole_rules: Some(Arc::clone(dir) as Arc<dyn ciris_persist::federation::BlackholeRules>),
         ..ReticulumAuth::default()
     }
 }
@@ -677,6 +680,73 @@ async fn av_chunks_ride_the_replicating_node_805() {
         }
         other => panic!("a non-A/V address must be refused by name: {other:?}"),
     }
+
+    // A peer the operator blackholed by its FEDERATION destination is refused
+    // an A/V link too, though the A/V address is one the operator never saw
+    // (Codex on #813: the regular send path checks every candidate).
+    let b_fed =
+        p.a.transport
+            .peer_dest_hash_for_test(&p.b.key.key_id)
+            .await
+            .expect("A knows B's federation destination");
+    p.a.transport
+        .routing_blackhole_add(&b_fed, None, Some("805 witness"))
+        .await
+        .expect("blackhole B");
+    match p.a.transport.open_av_link(&p.b.key.key_id, &b_addr).await {
+        Err(TransportError::PeerBlackholed { identity_hash, .. }) => {
+            assert_eq!(
+                identity_hash,
+                b_fed.to_vec(),
+                "refused on B's federation hash"
+            );
+        }
+        other => panic!("a blackholed peer must be refused an A/V link: {other:?}"),
+    }
+    p.a.transport
+        .routing_blackhole_remove(&b_fed)
+        .await
+        .expect("lift the blackhole");
+
+    // The address must be the named peer's: B's call address under another
+    // key id is refused by name, before any dial, so a link to B can never be
+    // attributed to someone else (Codex on #813).
+    let other = p.peers[0].key_id.clone();
+    match p.a.transport.open_av_link(&other, &b_addr).await {
+        Err(TransportError::Config(msg)) => assert!(
+            msg.contains("belongs to member") && msg.contains(&p.b.key.key_id),
+            "{msg}"
+        ),
+        other => panic!("B's address under another key id must be refused by name: {other:?}"),
+    }
+
+    // A dial that fails AFTER the link established (identify) leaves nothing
+    // behind: no sink queue, no attribution record, no live A/V link (Codex on
+    // #813). Two forced failures, then back to baseline.
+    let sink_before = p.a.transport.av_sink_link_count_for_test();
+    let dialed_before = p.a.transport.av_dialed_peer_count_for_test();
+    p.a.transport.fail_next_derived_identifies_for_test(2);
+    for _ in 0..2 {
+        match p.a.transport.open_av_link(&p.b.key.key_id, &b_addr).await {
+            Err(TransportError::Io(msg)) => assert!(msg.contains("forced failure"), "{msg}"),
+            other => panic!("the forced identify failure must surface: {other:?}"),
+        }
+    }
+    assert_eq!(p.a.transport.av_sink_link_count_for_test(), sink_before);
+    assert_eq!(p.a.transport.av_dialed_peer_count_for_test(), dialed_before);
+    let no_partial_links = wait_until(Duration::from_secs(20), || async {
+        !p.a.transport
+            .link_planes_for_test()
+            .await
+            .iter()
+            .any(|(_, plane, _)| *plane == LinkPlane::Av)
+    })
+    .await;
+    assert!(
+        no_partial_links,
+        "the partially opened A/V links were closed: {:?}",
+        p.a.transport.link_planes_for_test().await
+    );
 
     // B's A/V consumer, then A's link to B on the live node.
     let mut arrivals = p.b.transport.take_av_arrivals().expect("B's arrivals");

@@ -1663,6 +1663,10 @@ impl AvPlaneMediaLink {
     async fn opened(&self) -> usize {
         self.links.lock().await.len()
     }
+
+    async fn has(&self, member: &str) -> bool {
+        self.links.lock().await.contains_key(member)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1696,6 +1700,18 @@ impl MediaLink for AvPlaneMediaLink {
             Err(e) => Err(e.to_string()),
         }
     }
+}
+
+/// The `perf.publish_fanout` verdict (Codex on #813): every source frame was
+/// sealed AND every member's A/V link opened AND every member send was
+/// accepted. A source-frame count alone passed a run in which no link opened.
+fn fanout_verdict(
+    frames_sent: usize,
+    frames_requested: usize,
+    link_open_failures: usize,
+    member_delivery_failures: usize,
+) -> bool {
+    frames_sent == frames_requested && link_open_failures == 0 && member_delivery_failures == 0
 }
 
 /// The observers' refusal probe: the identical ciphertext over the
@@ -4479,6 +4495,7 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
     // A member admitted mid-stream gets its link when its Ready arrives.
     let mut pending_av_open: Option<String> = None;
     let mut delivery_failures = 0usize;
+    let mut frames_awaiting_link = 0usize;
     let mut record = *group
         .record_secret()
         .await
@@ -4661,8 +4678,15 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 "epoch": epoch,
                 "from": cfg.node_id,
             });
-            let t0 = Instant::now();
             let is_member = live.iter().any(|l| l == m);
+            // The late joiner's frames before its Ready opened its link: it
+            // was admitted mid-stream and has no link YET. Counted on their
+            // own, never as a delivery failure and never as a delivery.
+            if is_member && pending_av_open.as_deref() == Some(m.as_str()) && !link.has(m).await {
+                frames_awaiting_link += 1;
+                continue;
+            }
+            let t0 = Instant::now();
             let delivered = if is_member {
                 link.deliver(m, &header, &wire).await
             } else {
@@ -4700,12 +4724,22 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
 
     let secs = stream_elapsed.as_secs_f64();
     #[allow(clippy::cast_precision_loss)]
-    let chunks_per_s = (secs > 0.0).then(|| (frames_sent * live.len()) as f64 / secs);
+    // Delivered throughput: member sends the A/V link ACCEPTED, never source
+    // frames times roster (Codex on #813 — a run with no open link measured
+    // as a full fan-out).
+    let member_sends_delivered = send_lat.len();
+    #[allow(clippy::cast_precision_loss)]
+    let chunks_per_s = (secs > 0.0).then(|| member_sends_delivered as f64 / secs);
     #[allow(clippy::cast_precision_loss)]
     let bytes_per_s = (secs > 0.0).then(|| bytes_sent as f64 / secs);
     rep.ran(
         "perf.publish_fanout",
-        frames_sent == cfg.frames,
+        fanout_verdict(
+            frames_sent,
+            cfg.frames,
+            av_open_failures.len(),
+            delivery_failures,
+        ),
         serde_json::json!({
             "frames_sent": frames_sent,
             "frames_requested": cfg.frames,
@@ -4724,6 +4758,8 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
             "av_links_opened": link.opened().await,
             "av_link_open_failures": av_open_failures,
             "member_delivery_failures": delivery_failures,
+            "member_sends_delivered": member_sends_delivered,
+            "frames_awaiting_link": frames_awaiting_link,
             "chunks_refused_too_large": link
                 .refused_too_large
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -6253,7 +6289,25 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{seal_after_verdict, FedKey, SealAfterVerdict};
+    use super::{fanout_verdict, seal_after_verdict, FedKey, SealAfterVerdict};
+
+    /// Codex on #813: the fan-out leg fails when members did not get the
+    /// stream — a link that never opened, or member sends the link refused —
+    /// even though every source frame was sealed. The old verdict
+    /// (`frames_sent == frames_requested`) passed both.
+    #[test]
+    fn the_fanout_verdict_fails_when_members_did_not_get_the_stream() {
+        assert!(fanout_verdict(120, 120, 0, 0), "a clean run passes");
+        assert!(
+            !fanout_verdict(120, 120, 2, 0),
+            "no A/V link opened to two members: not a fan-out"
+        );
+        assert!(
+            !fanout_verdict(120, 120, 0, 7),
+            "seven member sends refused: not a fan-out"
+        );
+        assert!(!fanout_verdict(119, 120, 0, 0), "a short stream");
+    }
 
     /// CIRISEdge#782 — a loop waiting for one kind never consumes another:
     /// the publisher's admission loop (waiting on KeyPackages) used to eat an

@@ -144,7 +144,9 @@ pub(crate) enum AvDelivery {
     Arrived,
     /// The link's consumer is a full queue behind; dropped.
     DroppedFull,
-    /// The link's consumer dropped its receiver; dropped, link forgotten.
+    /// The link's consumer dropped its receiver; dropped. The link stays
+    /// recorded (a tombstone) until it closes, so its later frames are
+    /// `ConsumerGone` too and it is never re-admitted as a fresh arrival.
     ConsumerGone,
     /// A peer-opened link found the arrivals queue FULL: the consumer is
     /// [`AV_ARRIVALS_DEPTH`] links behind. Dropped, and remembered for the
@@ -237,10 +239,14 @@ impl AvSink {
             return match queue.offer(bytes) {
                 QueueOffer::Queued => AvDelivery::Queued,
                 QueueOffer::DroppedFull => AvDelivery::DroppedFull,
-                QueueOffer::ConsumerGone => {
-                    links.queues.remove(&link_id);
-                    AvDelivery::ConsumerGone
-                }
+                // The queue entry STAYS: it is the record that this link
+                // was claimed or arrived. Removing it would send the next
+                // frame down the unclaimed-link branch and re-surface the
+                // link as a fresh `AvArrival` — a rejected peer link
+                // reappearing, or a link THIS node dialled presented as
+                // peer-opened (Codex on #813). `forget` drops it at
+                // `LinkClosed`, which bounds the map by the live links.
+                QueueOffer::ConsumerGone => AvDelivery::ConsumerGone,
             };
         }
         // A peer-opened link's first deliverable frame: it carries every frame
@@ -272,6 +278,32 @@ impl AvSink {
                 AvDelivery::ArrivalsFull
             }
             Err(mpsc::error::TrySendError::Closed(_)) => AvDelivery::NoConsumer,
+        }
+    }
+
+    /// Record a frame dropped on `link_id` BEFORE it reached the sink — the
+    /// #393 gate refused it (Codex on #813). The binding cache may hold a stale
+    /// refusal for seconds, which at frame cadence is far past the resync
+    /// slack; counted here, the gap is reported with the link's next
+    /// delivered frame and the hop counter skips past it. A link with no
+    /// consumer yet carries it to its first frame, as an arrivals-full drop
+    /// does. Never awaits.
+    pub(crate) fn note_dropped_before_sink(&self, link_id: LinkId) {
+        let mut links = self
+            .links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(queue) = links.queues.get_mut(&link_id) {
+            queue.note_dropped();
+            return;
+        }
+        let tracked = links.dropped_before_arrival.len();
+        match links.dropped_before_arrival.get_mut(&link_id) {
+            Some(n) => *n = n.saturating_add(1),
+            None if tracked < AV_PENDING_ARRIVAL_LINKS_MAX => {
+                links.dropped_before_arrival.insert(link_id, 1);
+            }
+            None => {}
         }
     }
 
@@ -558,6 +590,128 @@ mod tests {
             ChunkSeq(drops),
             "the hop resynced past the drops"
         );
+    }
+
+    /// Codex on #813: a link whose consumer is gone is never re-admitted as
+    /// a fresh arrival — neither a peer-opened link whose arrival was dropped,
+    /// nor a link THIS node dialled and whose inbound half it dropped.
+    #[tokio::test]
+    async fn a_link_whose_consumer_is_gone_never_arrives_again() {
+        let node = test_node();
+        let sink = AvSink::new();
+        let mut arrivals = sink.take_arrivals().expect("arrivals");
+        let arrive = |id: LinkId| {
+            let node = std::sync::Arc::clone(&node);
+            move |rx: PumpReceiver| AvArrival {
+                link_id: id.into_bytes(),
+                peer: SourceKeyId::transport_authenticated("peer"),
+                address: Some(av_address()),
+                inbound: rx,
+                sender: LeviculumAvSender::new(node, id),
+            }
+        };
+
+        // A link we dialled, whose unused inbound half the caller dropped.
+        let dialled = link(0x31);
+        drop(sink.claim(dialled));
+        for _ in 0..3 {
+            assert_eq!(
+                sink.deliver(dialled, b"reverse".to_vec(), arrive(dialled)),
+                AvDelivery::ConsumerGone
+            );
+        }
+
+        // A peer-opened link the consumer took and then rejected.
+        let peer = link(0x32);
+        assert_eq!(
+            sink.deliver(peer, b"first".to_vec(), arrive(peer)),
+            AvDelivery::Arrived
+        );
+        drop(arrivals.recv().await.expect("the one arrival"));
+        for _ in 0..3 {
+            assert_eq!(
+                sink.deliver(peer, b"again".to_vec(), arrive(peer)),
+                AvDelivery::ConsumerGone
+            );
+        }
+
+        assert!(
+            arrivals.try_recv().is_err(),
+            "neither link was surfaced again as a fresh arrival"
+        );
+        // Closing the links is what clears the record.
+        sink.forget(&dialled);
+        sink.forget(&peer);
+        assert_eq!(sink.link_count(), 0);
+    }
+
+    /// Codex on #813: frames the #393 gate refuses while a binding is stale
+    /// never reach the queue, so they must still be counted — or the first
+    /// frame admitted after recovery is far past the slack and the hop never
+    /// authenticates again. A stretch of gated frames (more than the slack)
+    /// on a live hop, then recovery: a real subscriber opens the next frame.
+    #[tokio::test]
+    async fn frames_refused_by_the_gate_still_resync_the_hop() {
+        use crate::transport::realtime_av::{
+            seal_av_inner, seal_av_outer, ChunkLayer, ChunkSeq, Epoch, EpochDek, StreamId,
+            CODEC_OPAQUE,
+        };
+        use crate::transport::realtime_av_dispatcher::{
+            AvDispatcher, AvDispatcherConfig, AvInboundLink, AvRole, HOP_COUNTER_RESYNC_SLACK,
+        };
+        let dek = EpochDek::from_bytes([0x46; 32]);
+        let transit = [0x47u8; 32];
+        let wire = |seq: u64| {
+            let inner = seal_av_inner(
+                &[0x5a; 24],
+                &dek,
+                StreamId([4; 32]),
+                Epoch(1),
+                ChunkSeq(seq),
+                CODEC_OPAQUE,
+                ChunkLayer::BASE,
+            )
+            .expect("inner");
+            seal_av_outer(&inner, &transit, b"hop", seq)
+                .expect("outer")
+                .to_bytes()
+        };
+        let sink = AvSink::new();
+        let hop = link(0x44);
+        let rx = sink.claim(hop);
+        assert_eq!(
+            sink.deliver(hop, wire(0), |_| unreachable!()),
+            AvDelivery::Queued
+        );
+        // ~3 s at 15 fps — every one sent, every one refused at the gate.
+        let gated = HOP_COUNTER_RESYNC_SLACK * 5 + 5;
+        for _ in 0..gated {
+            sink.note_dropped_before_sink(hop);
+        }
+        assert_eq!(
+            sink.deliver(hop, wire(1 + gated), |_| unreachable!()),
+            AvDelivery::Queued
+        );
+        let mut d = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: StreamId([4; 32]),
+            local_role: AvRole::Subscriber,
+            epoch_dek: Some([0x46; 32]),
+            initial_subscribers: vec![],
+            inbound_links: vec![AvInboundLink {
+                transit_key: transit,
+                link_id: b"hop".to_vec(),
+                inbound_recv: Box::new(rx),
+            }],
+        })
+        .expect("subscriber");
+        let mut out = d.spawn_subscriber_loop();
+        for want in [0, 1 + gated] {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+                .await
+                .unwrap_or_else(|_| panic!("chunk {want}: the hop never re-authenticated"))
+                .expect("opened");
+            assert_eq!(got.chunk_seq, ChunkSeq(want));
+        }
     }
 
     #[tokio::test]

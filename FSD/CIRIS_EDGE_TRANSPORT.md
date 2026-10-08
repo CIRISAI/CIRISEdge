@@ -435,7 +435,9 @@ advertisement (`AcceptNone`), and one that completes anyway is dropped
 (`gate_attribution`: `Rooted ∧ owns_key` + the hybrid-bound route), per frame. The candidate
 is the link's `LinkIdentified` peer (a peer dialled our call address) or, on a link this node
 dialled (`open_av_link`), the peer it dialled — whose transport key came from its verified
-route and whose control of it the link proof established. An unattributed A/V frame is dropped
+route and whose control of it the link proof established. `open_av_link` applies the operator deny-list to the
+derived address AND to every federation candidate the peer resolves to, as the regular send
+path does, so a blackholed peer is not reachable through a call address. An unattributed A/V frame is dropped
 `av_inbound_dropped_unattributed`; there is no unattributed A/V path.
 
 **Backpressure.** The sink never awaits. Each A/V link has a bounded queue
@@ -447,7 +449,11 @@ A frame costs at most `HOP_COUNTER_MAX_OPENS` (= slack + 2) AEAD opens whatever 
 counter past the gap, the expected counter, and the slack past the gap — the dropped frames'
 own counters are never tried. Frames of a peer-opened link that find the arrivals queue full
 are dropped `av_inbound_dropped_arrivals_full`, remembered per link, and reported to the
-link's first delivered frame the same way.
+link's first delivered frame the same way. A reported gap is kept (`HopGap`) until a frame
+authenticates, so a junk frame that carries the report cannot discard it. A link whose
+consumer dropped its receiver stays recorded in the sink until `LinkClosed`: its later
+frames are `av_inbound_dropped_consumer_gone`, and it is never re-surfaced as a fresh
+arrival.
 
 **Size (#720).** An A/V chunk is ONE link-Channel message: `LeviculumAvSender` sizes the frame
 against `link_channel_message_limit` — the link MDU minus `CHANNEL_ENVELOPE_HEADER_SIZE`
