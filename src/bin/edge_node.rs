@@ -1349,6 +1349,12 @@ impl ciris_edge::blob_swarm::BlobChunkSource for RowScopedChunkSource {
     fn answers_scope(&self) -> bool {
         true
     }
+
+    // CIRISEdge#771 — a wrapper forwards the Edge's metrics bag to the
+    // source it wraps, or the legacy-walk counter never reaches it.
+    fn attach_metrics(&self, metrics: ciris_edge::observability::EdgeMetrics) {
+        self.inner.attach_metrics(metrics);
+    }
 }
 
 /// CIRISEdge#768 — the blob plane's counters, for the chat legs' detail: which
@@ -4897,32 +4903,19 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
 /// Returns `(welcome, commit, epoch)`: the Welcome goes to the joiner,
 /// the Commit goes to every existing member so they advance in step.
 ///
-/// Edge exposes no KeyPackage byte codec — `mint_cohort_key_material`
-/// hands back an openmls `KeyPackage` by value and `add_member` takes
-/// one by value, so a cross-process join has to do the tls-codec hop
-/// itself. Recorded as a DX finding; done here rather than worked around.
+/// The bytes go through `key_package_from_bytes`, the same ingress the
+/// library uses: wire decode, validation, and the X-Wing key-length gate
+/// (CIRISEdge#822).
 async fn admit(
     group: &CohortGroup,
     key_id: &str,
     kp_b64: &str,
 ) -> Result<(Vec<u8>, Vec<u8>, u64), String> {
-    use openmls::prelude::{
-        tls_codec::Deserialize as _, MlsMessageBodyIn, MlsMessageIn, ProtocolVersion,
-    };
-    use openmls_traits::OpenMlsProvider as _;
-
     let raw = B64
         .decode(kp_b64)
         .map_err(|e| format!("decode KeyPackage: {e}"))?;
-    let msg = MlsMessageIn::tls_deserialize(&mut raw.as_slice())
-        .map_err(|e| format!("KeyPackage wire decode: {e:?}"))?;
-    let MlsMessageBodyIn::KeyPackage(kp_in) = msg.extract() else {
-        return Err("the joiner did not send a KeyPackage".to_owned());
-    };
-    let provider = openmls_libcrux_crypto::Provider::default();
-    let kp = kp_in
-        .validate(provider.crypto(), ProtocolVersion::Mls10)
-        .map_err(|e| format!("KeyPackage validate: {e:?}"))?;
+    let kp = ciris_edge::mls::cohort_group::key_package_from_bytes(&raw)
+        .map_err(|e| format!("KeyPackage: {e}"))?;
     let commit = group
         .add_member(key_id, kp)
         .await

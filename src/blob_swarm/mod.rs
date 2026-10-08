@@ -469,6 +469,14 @@ pub trait BlobChunkSource: Send + Sync + 'static {
     fn answers_scope(&self) -> bool {
         false
     }
+
+    /// CIRISEdge#771 — hand the source the Edge's metrics bag, so a counter
+    /// it keeps (the persist source's `blob_serve_legacy_dag_walks`) lands in
+    /// the SAME `EdgeMetrics` the host reads through `Edge::metrics()`.
+    /// [`crate::EdgeBuilder::build`] calls this once on the wired source,
+    /// as it attaches its transports (CIRISEdge#809). A source with no
+    /// counters ignores it; a WRAPPER around another source must forward it.
+    fn attach_metrics(&self, _metrics: crate::observability::EdgeMetrics) {}
 }
 
 /// Refusal reasons surfaced by a [`BlobChunkSource::read_chunk`]

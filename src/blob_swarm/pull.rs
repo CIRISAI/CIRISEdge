@@ -1265,6 +1265,13 @@ pub struct BlobPuller<B> {
             Option<ciris_persist::ceg::AttestationCursor>,
         )>,
     >,
+    /// CIRISEdge#817 — how many device histories the LAST durability pass
+    /// read ([`super::durability::PassCustody::folds`]): one per audience
+    /// device it met, where it used to be one per device per file.
+    last_pass_custody_folds: AtomicUsize,
+    /// CIRISEdge#817 — how many content audiences the LAST durability pass
+    /// resolved ([`super::durability::PassCustody::audience_reads`]).
+    last_pass_audience_reads: AtomicUsize,
 }
 
 /// CIRISEdge#646 — the `scope:source` label for `blob_pull_sources`. A
@@ -1344,6 +1351,8 @@ where
             chunk_keys_missing: Mutex::new(HashMap::new()),
             dispatched: AtomicUsize::new(0),
             durability_resume: Mutex::new(None),
+            last_pass_custody_folds: AtomicUsize::new(0),
+            last_pass_audience_reads: AtomicUsize::new(0),
         })
     }
 
@@ -1599,6 +1608,20 @@ where
         true
     }
 
+    /// CIRISEdge#817 — how many device custody histories the last
+    /// [`Self::durability_sweep`] read: the audience devices it met, once each.
+    #[must_use]
+    pub fn last_durability_custody_folds(&self) -> usize {
+        self.last_pass_custody_folds.load(Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#817 — how many content audiences the last
+    /// [`Self::durability_sweep`] resolved: one per `(scope, author, group)`.
+    #[must_use]
+    pub fn last_durability_audience_reads(&self) -> usize {
+        self.last_pass_audience_reads.load(Ordering::Relaxed)
+    }
+
     /// CIRISEdge#763 (CC 6.1.5.3) — **one durability pass** over the `self`
     /// and `family` files this node's persons can read: the self room of each
     /// principal behind this node, and every family that principal is an
@@ -1634,6 +1657,9 @@ where
         let mut out = super::durability::DurabilitySweep::default();
         let now = chrono::Utc::now();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        // CIRISEdge#817 — each audience device's custody history is read once
+        // for the whole pass, not once per file; built fresh every pass.
+        let mut custody = super::durability::PassCustody::new();
         let mut read = 0usize;
         // CIRISEdge#802 review — a ROLLING bounded scan. Resume where the
         // last pass stopped (room + page cursor), visit up to `MAX_FILES`,
@@ -1684,7 +1710,7 @@ where
                 Some(page) => {
                     for file in page.files {
                         read += 1;
-                        self.durability_of_file(&file, now, &mut seen, &mut out)
+                        self.durability_of_file(&file, now, &mut seen, &mut custody, &mut out)
                             .await;
                     }
                     page.resume
@@ -1716,8 +1742,14 @@ where
             *g = next_resume;
         }
         super::durability::rarest_first(&mut out.repairs);
+        self.last_pass_custody_folds
+            .store(custody.folds(), Ordering::Relaxed);
+        self.last_pass_audience_reads
+            .store(custody.audience_reads(), Ordering::Relaxed);
         tracing::info!(
             files = read,
+            custody_folds = custody.folds(),
+            audience_reads = custody.audience_reads(),
             repairs = out.repairs.len(),
             reported_here = out.reported_here.len(),
             not_in_audience = out.not_in_audience,
@@ -1767,12 +1799,11 @@ where
         file: &crate::files::FileRow,
         now: chrono::DateTime<chrono::Utc>,
         seen: &mut HashSet<[u8; 32]>,
+        custody: &mut super::durability::PassCustody,
         out: &mut super::durability::DurabilitySweep,
     ) {
         use super::durability::{self, Repair};
-        use ciris_persist::federation::custody_ack::{
-            device_custody_of, CustodyState, CustodyVerdict,
-        };
+        use ciris_persist::federation::custody_ack::{CustodyState, CustodyVerdict};
         let me = self.local_key_id.as_str();
         let dir: &dyn FederationDirectory = &*self.backend;
         let Ok(sha) =
@@ -1790,7 +1821,7 @@ where
             return;
         }
         let blob = hex::encode(sha);
-        let deficit = match durability::row_deficit(dir, &row, &sha, now).await {
+        let deficit = match custody.row_deficit(dir, &row, &sha, now).await {
             Ok(d) => d,
             Err(e) => {
                 tracing::debug!(blob = %blob, error = %e, "durability pass: deficit unreadable");
@@ -1817,7 +1848,8 @@ where
                 return;
             }
         };
-        let mine = device_custody_of(dir, me, &deficit.sha256_hex, None, now)
+        let mine = custody
+            .custody_of(dir, me, &deficit.sha256_hex, now)
             .await
             .ok();
         let live_here = mine

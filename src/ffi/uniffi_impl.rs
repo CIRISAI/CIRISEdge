@@ -759,6 +759,11 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
         "transport.known_destination_evictions".to_string(),
         edge.metrics().known_destination_evictions(),
     );
+    // CIRISEdge#771 — chunk serves answered by the legacy DAG stream walk.
+    counters.insert(
+        "blob.serve_legacy_dag_walks_total".to_string(),
+        edge.metrics().blob_serve_legacy_dag_walks(),
+    );
     #[allow(clippy::cast_precision_loss)]
     gauges.insert(
         "reachability.peer_medium_count".to_string(),
