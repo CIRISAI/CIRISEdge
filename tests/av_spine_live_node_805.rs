@@ -892,6 +892,16 @@ async fn av_chunks_ride_the_replicating_node_805() {
         p.b.metrics.av_plane()
     );
     assert_eq!(av(&p.b.metrics, "av_link_arrived"), 1);
+    // #853 — the A/V frames stamped the link's last-inbound liveness at B
+    // (the responder), which the inbound idle reap reads: a call carrying
+    // media is never read as idle.
+    assert!(
+        p.b.transport
+            .link_last_inbound_for_test(av_link_id)
+            .await
+            .is_some(),
+        "B stamped last-inbound for the A/V link it carries media on"
+    );
     for drop in [
         "av_inbound_dropped_unattributed",
         "av_inbound_dropped_queue_full",

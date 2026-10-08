@@ -5059,6 +5059,17 @@ impl ReticulumTransport {
         self.av_sink.take_arrivals()
     }
 
+    /// CIRISEdge#805/#853 test seam — the link's last-inbound stamp (unix
+    /// seconds), the liveness the idle reap and the reply selector read.
+    #[doc(hidden)]
+    pub async fn link_last_inbound_for_test(&self, link_id: [u8; 16]) -> Option<u64> {
+        self.link_last_inbound_at
+            .lock()
+            .await
+            .get(&LinkId::new(link_id))
+            .copied()
+    }
+
     /// CIRISEdge#805 test seam — links the A/V sink routes for right now.
     #[doc(hidden)]
     #[must_use]
@@ -9933,6 +9944,21 @@ async fn deliver_av_frame(
         drop_inbound(Some(link_id), DROP_AV_FRAME_UNATTRIBUTED, &detail);
         return;
     };
+    // CIRISEdge#353 / #853 — an attributed A/V frame is proof the peer is alive
+    // on THIS link right now: stamp it, exactly as `attribute_and_deliver`
+    // stamps every envelope-path frame. The responder-side idle reap (#853)
+    // reads this stamp, so a call carrying media is never reaped mid-call,
+    // while an A/V link that really goes quiet still ages out. Stamped only
+    // AFTER the #393 gate: an unattributed flood must not keep a link alive.
+    // The reverse-path reply selector also reads this map, but it selects by
+    // `(peer, plane)` and never picks an `Av` link (#728/§3.6).
+    {
+        let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+        ctx.link_last_inbound_at
+            .lock()
+            .await
+            .insert(link_id, now_secs);
+    }
     let address = dest.and_then(|d| {
         ctx.scope_addresses
             .get()
