@@ -9908,6 +9908,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&link_id)
             {
+                // choke-ok: a test-only seam (`swallow_link_closed` is empty in
+                // production); the swallowed close is still counted, as
+                // `vanished`, by the next reconciliation pass (#853).
                 return;
             }
             // Every per-link map lets go; the close is counted under its
