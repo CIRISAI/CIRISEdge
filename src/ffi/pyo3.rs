@@ -2590,6 +2590,13 @@ impl PyEdge {
             first_contact.set_item(label.as_str(), *n)?;
         }
         root.set_item("first_contact_outcomes", first_contact)?;
+        // CIRISEdge#805 — the A/V plane on the live node: sends, the #720
+        // named refusal, arrivals, sink deliveries, and each drop label.
+        let av_plane = pyo3::types::PyDict::new(py);
+        for (label, n) in &bundle.av_plane {
+            av_plane.set_item(label.as_str(), *n)?;
+        }
+        root.set_item("av_plane", av_plane)?;
         // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
         // a missing install and a membership refusal are two numbers.
         let route_refusals = pyo3::types::PyDict::new(py);
