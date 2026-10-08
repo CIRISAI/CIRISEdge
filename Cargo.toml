@@ -562,7 +562,25 @@ zeroize     = "1"
 # (provisional, not IANA-assigned) and the migration path when the
 # IETF draft RFCs.
 openmls                  = { version = "0.8.1", default-features = false }
-openmls_libcrux_crypto   = { version = "0.3.1" }
+# CIRISEdge#822 — libcrux-kem <= 0.0.9 panics decoding a short X-Wing public
+# key (RUSTSEC-2026-0331) or encapsulation seed (RUSTSEC-2026-0330), and a
+# peer's KeyPackage init_key reaches that decode when we seal its Welcome.
+# The fix (libcrux-kem 0.0.10) ships only in hpke-rs 0.8, which no
+# openmls_libcrux_crypto release uses (0.4.0 is on hpke-rs 0.7 and needs
+# openmls 0.9). The CIRISAI fork is the 0.3.1 source with ONLY the hpke-rs
+# 0.8 / libcrux 0.0.9-0.0.10 bump and the API fixes it forces; X-Wing stays
+# KemAlgorithm::XWingDraft06, and it turns on hpke-rs's
+# `draft-connolly-cfrg-hpke-mlkem` so X-Wing DeriveKeyPair stays the 0.6
+# unlabeled SHAKE256(ikm) — without it a 0.3.1 peer's ratchet tree fails with
+# PublicKeyMismatch (tests/libcrux_cross_version_822.rs is the cross-build
+# witness). The wire and at-rest state are unchanged. Return to crates.io when
+# an upstream release on openmls 0.8 or our openmls bump carries hpke-rs 0.8
+# WITH the 0.6 X-Wing derive; an upstream on the labeled derive is a
+# fleet-wide MLS break, so run the witness against it first.
+# It is the DEPENDENCY itself, not a [patch.crates-io]: a patch is honoured
+# only at the workspace root, so CIRISServer (edge as a git dep) would
+# silently resolve crates.io 0.3.1 and keep libcrux-kem 0.0.7.
+openmls_libcrux_crypto   = { git = "https://github.com/CIRISAI/openmls", tag = "openmls_libcrux_crypto-v0.3.1+ciris.1", version = "0.3.1" }
 openmls_basic_credential = { version = "0.5.0", features = ["clonable"] }
 openmls_traits           = { version = "0.5.0" }
 tls_codec                = { version = "0.4.2", features = ["derive"] }
@@ -1639,21 +1657,3 @@ path = "src/bin/edge_node.rs"
 # Without it the harness could not root a single peer, so requiring it states a
 # fact rather than adding a constraint.
 required-features = ["transport-reticulum", "mesh-harness", "test-anchor"]
-
-# CIRISEdge#822 — libcrux-kem <= 0.0.9 panics decoding a short X-Wing public
-# key (RUSTSEC-2026-0331) or encapsulation seed (RUSTSEC-2026-0330), and a
-# peer's KeyPackage init_key reaches that decode when we seal its Welcome.
-# The fix (libcrux-kem 0.0.10) ships only in hpke-rs 0.8, which no
-# openmls_libcrux_crypto release uses (0.4.0 is on hpke-rs 0.7 and needs
-# openmls 0.9). The CIRISAI fork is the 0.3.1 source with ONLY the hpke-rs
-# 0.8 / libcrux 0.0.9-0.0.10 bump and the API fixes it forces; X-Wing stays
-# KemAlgorithm::XWingDraft06, and it turns on hpke-rs's
-# `draft-connolly-cfrg-hpke-mlkem` so X-Wing DeriveKeyPair stays the 0.6
-# unlabeled SHAKE256(ikm) — without it a 0.3.1 peer's ratchet tree fails with
-# PublicKeyMismatch (tests/libcrux_cross_version_822.rs is the cross-build
-# witness). The wire and at-rest state are unchanged. Drop this patch when
-# an upstream release on openmls 0.8 or our openmls bump carries hpke-rs 0.8
-# WITH the 0.6 X-Wing derive; an upstream on the labeled derive is a
-# fleet-wide MLS break, so run the witness against it first.
-[patch.crates-io]
-openmls_libcrux_crypto = { git = "https://github.com/CIRISAI/openmls", tag = "openmls_libcrux_crypto-v0.3.1+ciris.1" }

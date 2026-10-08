@@ -123,8 +123,8 @@ ignore = [
     # The libcrux advisories once ignored here (RUSTSEC-2026-0073/0075/0124,
     # 0207-0212) and RUSTSEC-2026-0330/0331 (libcrux-kem X-Wing short-input
     # panic) are GONE: CIRISEdge#822 moved openmls_libcrux_crypto onto
-    # hpke-rs 0.8 / libcrux-kem 0.0.10 (CIRISAI fork, see Cargo.toml
-    # [patch.crates-io]). If any resurfaces, the patch regressed.
+    # hpke-rs 0.8 / libcrux-kem 0.0.10 (the CIRISAI/openmls fork Cargo.toml
+    # declares). If any resurfaces, the fork pin regressed.
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained.
     # Build-time dev-dep only (procedural-macro support crate); ships
     # in zero production binaries. Pulled transitively via openmls's
@@ -170,6 +170,6 @@ allow-git = [
     # substrate's canonical wire.
     "https://github.com/CIRISAI/leviculum",
     # CIRISEdge#822 — openmls_libcrux_crypto 0.3.1+ciris.1 (hpke-rs 0.8 /
-    # libcrux-kem 0.0.10 backport for openmls 0.8.1), via [patch.crates-io].
+    # libcrux-kem 0.0.10 backport for openmls 0.8.1), edge's direct git dep.
     "https://github.com/CIRISAI/openmls",
 ]
