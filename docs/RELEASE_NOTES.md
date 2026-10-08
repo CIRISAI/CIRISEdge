@@ -1,5 +1,61 @@
 # CIRISEdge Release Notes
 
+# v40.0.9 — a peer's short key can no longer crash the node, the pool reaper's races are closed, and Windows/Android Python can import edge
+
+**2026-10-08.** **PATCH** from v40.0.8, cut from the v40.0.8 tag (main carries v40.1.0). Persist
+v53.1.8, verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged.
+Ladder triple: **edge v40.0.9 · persist v53.1.8 · verify v19.0.0**.
+
+**Correction to v40.0.8.** v40.0.8's notes said a libcrux panic from a malformed peer KeyPackage
+"fails one task, not the node". That was wrong. Nothing in edge caught openmls panics, so the panic
+unwound into whatever awaited the call. Where that was a host's main future, the process died.
+This release adds the missing isolation.
+
+**MLS: libcrux panics contained, short keys refused (CIRISEdge#822, #823).** libcrux-kem 0.0.7
+(RUSTSEC-2026-0330/0331) panics on an X-Wing public key shorter than 1,184 bytes. A peer could
+publish a validly signed KeyPackage with a short init key. Edge's KeyPackage validation accepted
+it, and `add_member` then panicked while sealing the Welcome.
+- **Refused at ingress.** `key_package_from_bytes` and the A/V `commit_add_published` refuse any
+  init or leaf encryption key whose length isn't the suite's HPKE public-key length. That length
+  is measured from the provider: 1,216 bytes for X-Wing draft-06. `edge_node`'s admit path now
+  goes through the same check.
+- **Contained everywhere else.** Every openmls call that encrypts, decrypts or decodes a key runs
+  under `catch_unwind`, in both the chat-room and the A/V MLS stacks. A panic becomes a typed
+  `CryptoPanic` error. For group operations the storage is copied first. After a panic,
+  the group is reloaded from that copy into a fresh provider, with new locks and a new RNG, which
+  replaces the old one. The group is exactly as it was before the call and can still commit, even
+  if the panic poisoned a lock. No panic hook is installed or changed.
+- **Witness.** Re-signed KeyPackages with 0/1/32/1,183/1,215-byte init keys are refused at
+  ingress. Past ingress, the Add is a contained `CryptoPanic`, and the group then commits normally.
+  With `catch_unwind` removed, both bypass tests panic inside libcrux.
+- **Also fixed:** in `contest()`, if the winning commit failed to apply after the rollback, the
+  node stayed at the fork epoch in memory while its store and its peers had moved on. It now
+  returns to the persisted head.
+- The deny ignores stay, with an honest comment. A fork of `openmls_libcrux_crypto` on hpke-rs 0.8
+  (github.com/CIRISAI/openmls) removes them in a later cut. It keeps hpke-rs 0.6's X-Wing key
+  derivation, which a cross-version witness showed is required for upgraded and older nodes to
+  share rooms.
+
+**Dial-pool reaper races (CIRISEdge#821 review, #819).** Codex found five issues in v40.0.7's pool
+reaper. All five were real, and each fix has a test that fails without it.
+- A link handed to a sender is reserved before the sender claims it, so a cap trim can no longer
+  close it underneath the send.
+- A link with an inbound resource transfer in progress counts as busy, so the reaper won't cut a
+  transfer mid-receive. The busy mark comes from leviculum's receiver-side progress events, which
+  can arrive late; a short transfer is then protected by its completion stamp.
+- Teardown checks the node's own link state, not only the listener's mirror. A reaped link the
+  mirror hadn't recorded yet used to stay open while counted as closed.
+- A scoped lease restarts its link's idle clock when released, not when handed out.
+- Pool gauges are kept per transport and summed on read, not overwritten by whichever transport
+  reaped last.
+
+**Windows, Android and iOS wheels carry the Python module (CIRISEdge#824).** These lanes build
+with `pyo3-sqlite` alone, and every binding gate named `pyo3`. Their wheels carried the pyo3
+dependency and none of the module: no `PyInit_ciris_edge`, so `import ciris_edge` failed. This
+had been true since about v8.1. The binding code now compiles under an internal `_pyffi` feature
+that both Python features enable. Every wheel lane now fails if its module lacks
+`PyInit_ciris_edge`, and that guard rejects v40.0.6's Windows wheel.
+
 # v40.0.8 — persist v53.1.8, and v40.0.7 actually ships
 
 **2026-10-07.** **PATCH** from v40.0.7, cut from the v40.0.7 tag (main carries v40.1.0). Verify
