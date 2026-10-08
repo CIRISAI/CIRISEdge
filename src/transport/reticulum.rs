@@ -92,6 +92,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::observability::LinkPoolCloseReason;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
@@ -2441,6 +2443,33 @@ pub struct ReticulumTransport {
     /// fix has to remove the re-establishing without removing the parallelism,
     /// so links are reused only while IDLE and the pool grows to demand.
     reusable_dialed_link: Arc<Mutex<HashMap<DestinationHash, Vec<LinkId>>>>,
+    /// CIRISEdge#819 — when each POOLED link (identity or scoped) was last
+    /// handed out, published or released. The pools grow to demand (#531/#532)
+    /// and, until #819, only a link's CLOSE removed it: edge is the initiator
+    /// on these links, so its own keepalives kept every idle lane open for
+    /// good and each concurrency peak toward a peer left its extra links
+    /// behind (the canonical's ~1,024 established links per 35 min). The
+    /// reaper ([`ReticulumTransport::reap_idle_pooled_links`]) closes a lane
+    /// idle past the bound, and a lane released into a full pool is closed
+    /// rather than pooled. A `std` mutex: never held across an `.await`.
+    pool_last_used: Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
+    /// CIRISEdge#819 (Codex on #821) — links carrying an INBOUND resource
+    /// transfer, with the instant of its last `Started`/`Progress` event. The
+    /// pool reaper treats such a link as busy, so a peer's transfer over a
+    /// pooled lane (the reverse path rides the link WE dialed) is never cut
+    /// off mid-receive. Cleared on the transfer's completion or failure and on
+    /// the link's close; an entry with no event for
+    /// [`INBOUND_TRANSFER_STALL`] stops counting, so a lost completion event
+    /// cannot pin a lane open.
+    inbound_resource_active: Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
+    /// CIRISEdge#819 — the idle bound, in milliseconds (see
+    /// [`ReticulumTransport::with_link_pool_policy`]).
+    pool_idle_bound_ms: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#819 — the idle-lane cap per destination.
+    pool_idle_cap: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#819 — pooled links this transport closed for idleness or
+    /// over the cap. `Relaxed`.
+    pool_links_closed: std::sync::atomic::AtomicU64,
     /// CIRISEdge#532 — links with a resource transfer in flight. A link in here
     /// is NOT handed out for reuse; a concurrent send takes another pooled link
     /// or dials one. This is what keeps reuse from becoming a queue.
@@ -2791,12 +2820,15 @@ impl ReticulumTransport {
             dialed_link_dest: Arc::clone(&self.dialed_link_dest),
             link_plane: Arc::clone(&self.link_plane),
             reusable_dialed_link: Arc::clone(&self.reusable_dialed_link),
+            pool_last_used: Arc::clone(&self.pool_last_used),
             link_in_flight: Arc::clone(&self.link_in_flight),
         }
     }
 
     /// Delegates to [`DialCtx::reusable_link_to`] — the pool lives on the ctx
-    /// now, but every existing caller keeps its shape.
+    /// now, but every existing caller keeps its shape. CIRISEdge#819: the
+    /// returned link is RESERVED (in flight) for the caller, who must release
+    /// it.
     async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
         self.dial_ctx().reusable_link_to(dest).await
     }
@@ -3390,6 +3422,13 @@ impl ReticulumTransport {
             dialed_link_dest: Arc::new(Mutex::new(HashMap::new())),
             link_plane: Arc::new(Mutex::new(HashMap::new())),
             reusable_dialed_link: Arc::new(Mutex::new(HashMap::new())),
+            pool_last_used: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            inbound_resource_active: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pool_idle_bound_ms: std::sync::atomic::AtomicU64::new(
+                u64::try_from(DEFAULT_LINK_POOL_IDLE_BOUND.as_millis()).unwrap_or(u64::MAX),
+            ),
+            pool_idle_cap: std::sync::atomic::AtomicUsize::new(DEFAULT_LINK_POOL_IDLE_CAP),
+            pool_links_closed: std::sync::atomic::AtomicU64::new(0),
             link_in_flight: Arc::new(Mutex::new(HashSet::new())),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
@@ -3403,6 +3442,316 @@ impl ReticulumTransport {
             store_and_forward: None,
             delivery: crate::transport::PendingDelivery::LiveOnly,
         })
+    }
+
+    /// **CIRISEdge#819 — the link-pool bounds** (builder): a pooled link idle
+    /// for `idle_bound` is closed, and each destination keeps at most
+    /// `idle_cap` IDLE lanes (a lane released into a full pool is closed).
+    /// Busy lanes are never closed. Defaults:
+    /// [`DEFAULT_LINK_POOL_IDLE_BOUND`] (120 s) and
+    /// [`DEFAULT_LINK_POOL_IDLE_CAP`] (4); a bound under 100 ms is raised to
+    /// 100 ms and a cap of 0 to 1. A running transport's bounds are changed
+    /// through [`Self::set_link_pool_policy`].
+    #[must_use]
+    pub fn with_link_pool_policy(self, idle_bound: Duration, idle_cap: usize) -> Self {
+        self.set_link_pool_policy(idle_bound, idle_cap);
+        self
+    }
+
+    /// CIRISEdge#819 — change the link-pool bounds on a running transport
+    /// (see [`Self::with_link_pool_policy`]). The reaper's cadence is fixed
+    /// when [`Transport::listen`] starts, from the bound in force then.
+    pub fn set_link_pool_policy(&self, idle_bound: Duration, idle_cap: usize) {
+        let bound = idle_bound.max(MIN_LINK_POOL_IDLE_BOUND);
+        self.pool_idle_bound_ms.store(
+            u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.pool_idle_cap
+            .store(idle_cap.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#819 — the link-pool bounds in force: `(idle_bound, idle_cap)`.
+    #[must_use]
+    pub fn link_pool_policy(&self) -> (Duration, usize) {
+        (
+            Duration::from_millis(
+                self.pool_idle_bound_ms
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            self.pool_idle_cap
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// CIRISEdge#819 — pooled links this transport has closed, for idleness or
+    /// over the per-destination cap.
+    #[must_use]
+    pub fn pooled_links_closed(&self) -> u64 {
+        self.pool_links_closed
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#819 test seam — `(identity, scoped)` pooled link counts,
+    /// busy and idle alike.
+    #[doc(hidden)]
+    pub async fn pooled_link_counts_for_test(&self) -> (usize, usize) {
+        let identity = self
+            .reusable_dialed_link
+            .lock()
+            .await
+            .values()
+            .map(Vec::len)
+            .sum();
+        let scoped = self
+            .reusable_scoped_link
+            .lock()
+            .await
+            .values()
+            .map(Vec::len)
+            .sum();
+        (identity, scoped)
+    }
+
+    /// CIRISEdge#819 test seam — the pooled identity-link ids (busy and idle).
+    #[doc(hidden)]
+    pub async fn pooled_link_ids_for_test(&self) -> Vec<[u8; 16]> {
+        self.reusable_dialed_link
+            .lock()
+            .await
+            .values()
+            .flatten()
+            .map(|id| id.into_bytes())
+            .collect()
+    }
+
+    /// CIRISEdge#819 test seam — take an idle pooled lane to `peer` exactly as
+    /// `send` does (`reusable_link_to`), without shipping on it yet. Release it
+    /// with [`Self::release_link_for_test`].
+    #[doc(hidden)]
+    pub async fn take_pooled_link_for_test(&self, peer: &str) -> Option<[u8; 16]> {
+        let dest = self.resolve_peer(peer).await?.dest_hash;
+        self.reusable_link_to(&dest).await.map(LinkId::into_bytes)
+    }
+
+    /// CIRISEdge#819 test seam — end a transfer on `link`, exactly as `send`
+    /// does after its ship (`release_link_after_transfer`, which applies the
+    /// pool's idle cap).
+    #[doc(hidden)]
+    pub async fn release_link_for_test(&self, link: [u8; 16]) {
+        self.release_link_after_transfer(LinkId::new(link)).await;
+    }
+
+    /// CIRISEdge#819 test seam — is `link` established at the NODE (the
+    /// authority, not the listener's mirror)?
+    #[doc(hidden)]
+    #[must_use]
+    pub fn node_link_established_for_test(&self, link: [u8; 16]) -> bool {
+        self.node.link_is_established(&LinkId::new(link))
+    }
+
+    /// CIRISEdge#819 test seam — drop `link` from the listener's
+    /// `established_links` mirror only, as when its `LinkEstablished` event has
+    /// not been processed yet.
+    #[doc(hidden)]
+    pub async fn forget_established_mirror_for_test(&self, link: [u8; 16]) {
+        self.established_links
+            .lock()
+            .await
+            .remove(&LinkId::new(link));
+    }
+
+    /// CIRISEdge#819 test seam — mark every pooled identity link busy (as a
+    /// transfer in flight would) or release them all, so a witness can hold a
+    /// lane past the idle bound without a transfer that long.
+    #[doc(hidden)]
+    pub async fn hold_pooled_links_busy_for_test(&self, busy: bool) -> usize {
+        let links: Vec<LinkId> = self
+            .reusable_dialed_link
+            .lock()
+            .await
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        let mut in_flight = self.link_in_flight.lock().await;
+        for id in &links {
+            if busy {
+                in_flight.insert(*id);
+            } else {
+                in_flight.remove(id);
+            }
+        }
+        links.len()
+    }
+
+    /// **CIRISEdge#819 — one reaper pass**: close every pooled link (identity
+    /// and scoped) idle past the bound, trim each destination to its idle cap,
+    /// and forget the stamps of links leviculum no longer holds. Busy lanes
+    /// are untouched. Runs on [`Transport::listen`]'s pool tick; public so a
+    /// host or a test can run it on demand. Returns how many links it closed.
+    pub async fn reap_idle_pooled_links(&self) -> usize {
+        let (bound, _) = self.link_pool_policy();
+        // Entries whose link already closed leave first, counted as
+        // `link_closed` (the scoped pool is pruned only here and at lease).
+        let mut dead = 0;
+        for pool in [&self.reusable_dialed_link, &self.reusable_scoped_link] {
+            pool.lock().await.retain(|_, links| {
+                let before = links.len();
+                links.retain(|id| self.node.link_is_established(id));
+                dead += before - links.len();
+                !links.is_empty()
+            });
+        }
+        note_pool_links_closed(self.metrics.get(), dead);
+        let dests: Vec<DestinationHash> = self
+            .reusable_dialed_link
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .collect();
+        let mut closed = 0;
+        for dest in dests {
+            closed += self.shrink_identity_pool(dest, Some(bound)).await;
+        }
+        closed += self.shrink_scoped_pools(bound).await;
+        let node = Arc::clone(&self.node);
+        self.pool_last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|id, _| node.link_is_established(id));
+        if let Some(m) = self.metrics.get() {
+            let (total, max) = self.pool_sizes().await;
+            m.set_link_pool_size(self.metrics_source, total as u64, max as u64);
+        }
+        closed
+    }
+
+    /// CIRISEdge#819 — links with an inbound resource transfer that has made
+    /// progress within [`INBOUND_TRANSFER_STALL`]: busy for the pool reaper.
+    fn inbound_busy_links(&self) -> HashSet<LinkId> {
+        let mut active = self
+            .inbound_resource_active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.retain(|_, at| at.elapsed() < INBOUND_TRANSFER_STALL);
+        active.keys().copied().collect()
+    }
+
+    /// CIRISEdge#819 — `(total, max for one destination)` over both pools.
+    async fn pool_sizes(&self) -> (usize, usize) {
+        let mut total = 0;
+        let mut max = 0;
+        for pool in [&self.reusable_dialed_link, &self.reusable_scoped_link] {
+            for links in pool.lock().await.values() {
+                total += links.len();
+                max = max.max(links.len());
+            }
+        }
+        (total, max)
+    }
+
+    /// CIRISEdge#819 — take `dest`'s identity-pool victims out of the pool (so
+    /// nothing can hand them out) and close them. `bound` `None` applies the
+    /// cap only (the release path).
+    async fn shrink_identity_pool(&self, dest: DestinationHash, bound: Option<Duration>) -> usize {
+        let (_, cap) = self.link_pool_policy();
+        let victims = {
+            let mut map = self.reusable_dialed_link.lock().await;
+            let Some(pool) = map.get_mut(&dest) else {
+                return 0;
+            };
+            let in_flight = self.link_in_flight.lock().await;
+            let inbound = self.inbound_busy_links();
+            let victims = {
+                let mut last_used = self
+                    .pool_last_used
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                select_pool_victims(
+                    pool,
+                    |id| in_flight.contains(id) || inbound.contains(id),
+                    &mut last_used,
+                    std::time::Instant::now(),
+                    bound,
+                    cap,
+                )
+            };
+            drop(in_flight);
+            pool.retain(|id| !victims.iter().any(|(v, _)| v == id));
+            if pool.is_empty() {
+                map.remove(&dest);
+            }
+            victims
+        };
+        for (id, why) in &victims {
+            self.close_pooled_link(*id, *why, "identity").await;
+        }
+        victims.len()
+    }
+
+    /// CIRISEdge#819 — the scoped pools' pass: a lane under a lease is busy.
+    async fn shrink_scoped_pools(&self, bound: Duration) -> usize {
+        let (_, cap) = self.link_pool_policy();
+        let victims: Vec<(LinkId, LinkPoolCloseReason)> = {
+            let mut map = self.reusable_scoped_link.lock().await;
+            let mut leased = self
+                .scoped_link_leased
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            leased.extend(self.inbound_busy_links());
+            let mut last_used = self
+                .pool_last_used
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let now = std::time::Instant::now();
+            let mut all = Vec::new();
+            map.retain(|_, pool| {
+                let victims = select_pool_victims(
+                    pool,
+                    |id| leased.contains(id),
+                    &mut last_used,
+                    now,
+                    Some(bound),
+                    cap,
+                );
+                pool.retain(|id| !victims.iter().any(|(v, _)| v == id));
+                all.extend(victims);
+                !pool.is_empty()
+            });
+            all
+        };
+        for (id, why) in &victims {
+            self.close_pooled_link(*id, *why, "scoped").await;
+        }
+        victims.len()
+    }
+
+    /// CIRISEdge#819 — close one pooled link through the normal teardown, so
+    /// every bookkeeping map lets go of it.
+    async fn close_pooled_link(
+        &self,
+        link_id: LinkId,
+        why: LinkPoolCloseReason,
+        pool: &'static str,
+    ) {
+        self.pool_links_closed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(m) = self.metrics.get() {
+            m.add_link_pool_closed(why, 1);
+        }
+        tracing::debug!(
+            link = %hex::encode(link_id.as_bytes()),
+            why = why.as_str(),
+            pool,
+            "closing a pooled link (CIRISEdge#819: idle past the bound, or over the \
+             per-destination idle cap)"
+        );
+        if let Err(e) = self.link_teardown(link_id.as_bytes()).await {
+            tracing::debug!(error = %e, "pooled link teardown failed (CIRISEdge#819)");
+        }
     }
 
     /// CIRISEdge#530 — attach a metrics handle so announce-intake capacity
@@ -4036,6 +4385,8 @@ impl ReticulumTransport {
             &self.reusable_scoped_link,
             &self.scoped_link_leased,
             &self.link_plane,
+            &self.pool_last_used,
+            self.metrics.get(),
             &dest_hash,
         )
         .await
@@ -4055,6 +4406,7 @@ impl ReticulumTransport {
         let ctx = self.dial_ctx();
         let pool = Arc::clone(&self.reusable_scoped_link);
         let leased = Arc::clone(&self.scoped_link_leased);
+        let last_used = Arc::clone(&self.pool_last_used);
         let dkid = destination_key_id.to_owned();
         let dial = tokio::spawn(async move {
             let _dial_permit = gate
@@ -4063,9 +4415,16 @@ impl ReticulumTransport {
                 .map_err(|e| TransportError::Io(format!("dial gate closed: {e}")))?;
             // Double-check behind the gate: a dial we queued behind may have
             // just published an idle lane.
-            if let Some(lease) =
-                lease_pooled_scoped_link(&ctx.node, &pool, &leased, &ctx.link_plane, &dest_hash)
-                    .await
+            if let Some(lease) = lease_pooled_scoped_link(
+                &ctx.node,
+                &pool,
+                &leased,
+                &ctx.link_plane,
+                &last_used,
+                ctx.metrics.as_ref(),
+                &dest_hash,
+            )
+            .await
             {
                 return Ok(lease);
             }
@@ -4074,7 +4433,8 @@ impl ReticulumTransport {
                 .await?;
             // Claim BEFORE publishing, so no concurrent lease can take the
             // lane between the publish and this caller's first send.
-            let lease = ScopedLinkLease::claim(link_id, &leased);
+            let lease = ScopedLinkLease::claim(link_id, &leased).stamping(&last_used);
+            stamp_pool_use(&last_used, link_id);
             // PUBLISH LAST: established AND identified — what a reuser skips.
             pool.lock()
                 .await
@@ -4161,10 +4521,15 @@ impl ReticulumTransport {
     /// until its lease drops; it is simply never handed out again).
     async fn evict_scoped_link(&self, link_id: LinkId) {
         let mut map = self.reusable_scoped_link.lock().await;
+        let mut dropped = 0;
         map.retain(|_, links| {
+            let before = links.len();
             links.retain(|id| *id != link_id);
+            dropped += before - links.len();
             !links.is_empty()
         });
+        // CIRISEdge#819 — evicted because the lane failed and is not established.
+        note_pool_links_closed(self.metrics.get(), dropped);
     }
 
     /// CIRISEdge#739 test seam — the next `n` reply-path answers tear their
@@ -4781,9 +5146,18 @@ impl ReticulumTransport {
         })?;
         let link_id = LinkId::new(link_id_array);
 
-        // Idempotent — if the link isn't in the established set, the
-        // peer already closed or we already tore it down.
-        if !self.established_links.lock().await.contains(&link_id) {
+        // Idempotent — if the link is neither in the established set NOR live
+        // at the node, the peer already closed or we already tore it down.
+        //
+        // CIRISEdge#819 (Codex on #821) — the node is the authority. The
+        // `established_links` mirror is filled by the listener's
+        // `LinkEstablished` event, which can lag a link `connect_awaited`
+        // already established (and is never filled when nothing drains the
+        // events); gating on the mirror alone left such a link open while the
+        // pool reaper had already removed and counted it as closed.
+        if !self.established_links.lock().await.contains(&link_id)
+            && !self.node.link_is_established(&link_id)
+        {
             return Ok(());
         }
 
@@ -4801,10 +5175,13 @@ impl ReticulumTransport {
         // CIRISEdge#532 — an explicitly torn-down link must stop being offered
         // for reuse here too, not only via the event loop's LinkClosed. Same
         // identity guard: only retract THIS link, never a newer one to the peer.
+        let mut dropped = 0;
         if let Some(dest) = self.dialed_link_dest.lock().await.remove(&link_id) {
             let mut reusable = self.reusable_dialed_link.lock().await;
             if let Some(pool) = reusable.get_mut(&dest) {
+                let before = pool.len();
                 pool.retain(|id| *id != link_id);
+                dropped += before - pool.len();
                 if pool.is_empty() {
                     reusable.remove(&dest);
                 }
@@ -4813,6 +5190,21 @@ impl ReticulumTransport {
         self.link_in_flight.lock().await.remove(&link_id);
         // CIRISEdge#728 — the plane record goes with the link.
         self.link_plane.lock().await.remove(&link_id);
+        // CIRISEdge#819 — and its pool stamp.
+        self.pool_last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&link_id);
+        // The scoped pool too, so a torn-down lane is never leased again.
+        self.reusable_scoped_link.lock().await.retain(|_, links| {
+            let before = links.len();
+            links.retain(|id| *id != link_id);
+            dropped += before - links.len();
+            !links.is_empty()
+        });
+        // A pooled link torn down by anything but the pool reaper (which takes
+        // its victims out of the pool first, and counts them by reason).
+        note_pool_links_closed(self.metrics.get(), dropped);
         Ok(())
     }
 
@@ -5580,6 +5972,14 @@ impl ReticulumTransport {
 
     async fn release_link_after_transfer(&self, link_id: LinkId) {
         self.link_in_flight.lock().await.remove(&link_id);
+        // CIRISEdge#819 — the release is a use, and the moment the lane goes
+        // back to its pool: a pool already holding its cap of idle lanes
+        // closes this one instead of keeping it.
+        stamp_pool_use(&self.pool_last_used, link_id);
+        let dest = self.dialed_link_dest.lock().await.get(&link_id).copied();
+        if let Some(dest) = dest {
+            self.shrink_identity_pool(dest, None).await;
+        }
     }
 
     /// CIRISEdge#532 — the per-destination dial gate handle (single-flight).
@@ -6290,14 +6690,16 @@ impl Transport for ReticulumTransport {
         // and the initiator-side bundle serve (#436) — is per-LINK setup that
         // already happened for a reused link. Skipping it is not an omission;
         // repeating it per send was the waste.
+        // CIRISEdge#819 — `reserved`: the lane came from the pool already
+        // marked in flight for this send (see `DialCtx::reusable_link_to`).
         let reused = self.reusable_link_to(&peer.dest_hash).await;
-        let link_id = if let Some(existing) = reused {
+        let (link_id, reserved) = if let Some(existing) = reused {
             tracing::trace!(
                 key_id = %destination_key_id,
                 link = ?existing,
                 "reusing the live identified link to this peer (CIRISEdge#532)"
             );
-            existing
+            (existing, true)
         } else {
             // SINGLE-FLIGHT. Without this, N coordinators firing at the same
             // peer all observe "no link" and all dial — the establish:identify
@@ -6343,10 +6745,11 @@ impl Transport for ReticulumTransport {
                         "another send established this peer's link while we waited on \
                          the dial gate — reusing it (CIRISEdge#532)"
                     );
-                    return Ok(existing);
+                    return Ok((existing, true));
                 }
                 ctx.dial_and_identify(&dkid, &peer_owned, has_path, establish_timeout)
                     .await
+                    .map(|id| (id, false))
             });
             dial.await
                 .map_err(|e| TransportError::Io(format!("dial task failed: {e}")))??
@@ -6361,7 +6764,7 @@ impl Transport for ReticulumTransport {
         // Released on EVERY exit path, including the error paths the durable
         // dispatcher retries through — a leaked marker would retire the link
         // from the pool permanently while it sat there perfectly usable.
-        let claimed = self.claim_link_for_transfer(link_id).await;
+        let claimed = reserved || self.claim_link_for_transfer(link_id).await;
         // A `Busy` collision here is not the reverse-path retry case, so both
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
@@ -6528,6 +6931,15 @@ impl Transport for ReticulumTransport {
         }
         let mut announce_tick = tokio::time::interval(self.config.announce_interval);
         announce_tick.tick().await; // consume the immediate first tick
+                                    // CIRISEdge#819 — the link-pool reaper's cadence: a quarter of the
+                                    // idle bound, kept within [250 ms, 30 s], so a lane is closed within
+                                    // a quarter-bound of going stale.
+        let (pool_bound, _) = self.link_pool_policy();
+        let mut pool_tick = tokio::time::interval(
+            (pool_bound / 4).clamp(Duration::from_millis(250), Duration::from_secs(30)),
+        );
+        pool_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        pool_tick.tick().await;
 
         // CIRISEdge#336 (fast heal) — rate-limit gate for event-driven announces.
         // `None` until the first link-up, so the first connecting peer triggers an
@@ -6577,6 +6989,15 @@ impl Transport for ReticulumTransport {
 
         loop {
             tokio::select! {
+                _ = pool_tick.tick() => {
+                    let closed = self.reap_idle_pooled_links().await;
+                    if closed > 0 {
+                        tracing::debug!(
+                            closed,
+                            "link-pool reaper closed idle pooled links (CIRISEdge#819)"
+                        );
+                    }
+                }
                 _ = announce_tick.tick() => {
                     if let Err(e) = self
                         .node
@@ -6642,6 +7063,8 @@ impl Transport for ReticulumTransport {
                         link_established_at: &self.link_established_at,
                         reusable_dialed_link: &self.reusable_dialed_link,
                         link_in_flight: &self.link_in_flight,
+                        inbound_resource_active: &self.inbound_resource_active,
+                        pool_last_used: &self.pool_last_used,
                         link_to_peer_key_id: &self.link_to_peer_key_id,
                         link_last_inbound_at: &self.link_last_inbound_at,
                         inbound_reasm: &self.inbound_reasm,
@@ -6705,6 +7128,10 @@ impl Transport for ReticulumTransport {
 pub struct ScopedLinkLease {
     link_id: LinkId,
     leased: Arc<std::sync::Mutex<HashSet<LinkId>>>,
+    /// CIRISEdge#819 (Codex on #821) — the pool's use stamps: the lease
+    /// stamps its lane when it is DROPPED, so the idle bound starts at
+    /// release, not at hand-out or at the reaper's last busy pass.
+    last_used: Option<Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>>,
 }
 
 impl ScopedLinkLease {
@@ -6716,7 +7143,17 @@ impl ScopedLinkLease {
         Self {
             link_id,
             leased: Arc::clone(leased),
+            last_used: None,
         }
+    }
+
+    /// CIRISEdge#819 — stamp the lane in `last_used` when this lease drops.
+    fn stamping(
+        mut self,
+        last_used: &Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
+    ) -> Self {
+        self.last_used = Some(Arc::clone(last_used));
+        self
     }
 
     /// The leased link's id (leviculum's 16-byte truncated hash).
@@ -6728,6 +7165,11 @@ impl ScopedLinkLease {
 
 impl Drop for ScopedLinkLease {
     fn drop(&mut self) {
+        // Stamp first, then free the lane: a reaper pass that sees the lane
+        // idle also sees the release as its last use.
+        if let Some(last_used) = self.last_used.as_ref() {
+            stamp_pool_use(last_used, self.link_id);
+        }
         self.leased
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6743,6 +7185,104 @@ impl std::fmt::Debug for ScopedLinkLease {
     }
 }
 
+/// CIRISEdge#819 (Codex on #821) — an inbound resource transfer on `link_id`
+/// is `active` (a `Started`/`Progress` event: busy for the pool reaper) or has
+/// concluded (completion or failure: no longer busy). Either way the link was
+/// just used, so its idle time restarts here.
+///
+/// The receiver-side `Started` / `Progress` events ride leviculum's droppable
+/// data plane, so under load they can arrive late (even after the transfer's
+/// completion) or not at all: the mark is best effort, strongest for exactly
+/// the long transfers an idle bound can catch mid-flight.
+fn note_inbound_transfer(
+    inbound_active: &std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    last_used: &std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    link_id: LinkId,
+    active: bool,
+) {
+    {
+        let mut busy = inbound_active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active {
+            busy.insert(link_id, std::time::Instant::now());
+        } else {
+            busy.remove(&link_id);
+        }
+    }
+    stamp_pool_use(last_used, link_id);
+}
+
+/// CIRISEdge#819 — record a use of a pooled link (hand-out, publish, release).
+fn stamp_pool_use(
+    last_used: &std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    link_id: LinkId,
+) {
+    last_used
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(link_id, std::time::Instant::now());
+}
+
+/// **CIRISEdge#819 — which of a pool's links to close.** Pure over its inputs,
+/// so the policy is testable without a link.
+///
+/// - A BUSY link (`busy`: a transfer in flight, or a scoped lease) is never a
+///   victim, and its stamp is refreshed to `now`: being busy is being used.
+/// - An idle link with no stamp is stamped `now` (it starts ageing here).
+/// - With `bound`, an idle link whose last use is at least `bound` ago is a
+///   victim.
+/// - Of the idle links that remain, the `cap` most recently used are kept and
+///   the rest are victims.
+///
+/// Each victim carries its reason: `IdleExpired` (past the bound) or
+/// `PoolFull` (over the cap).
+fn select_pool_victims(
+    pool: &[LinkId],
+    busy: impl Fn(&LinkId) -> bool,
+    last_used: &mut HashMap<LinkId, std::time::Instant>,
+    now: std::time::Instant,
+    bound: Option<Duration>,
+    cap: usize,
+) -> Vec<(LinkId, LinkPoolCloseReason)> {
+    let mut idle: Vec<(LinkId, std::time::Instant)> = Vec::new();
+    for id in pool {
+        if busy(id) {
+            last_used.insert(*id, now);
+            continue;
+        }
+        let at = *last_used.entry(*id).or_insert(now);
+        idle.push((*id, at));
+    }
+    let mut victims = Vec::new();
+    if let Some(bound) = bound {
+        idle.retain(|(id, at)| {
+            let expired = now.saturating_duration_since(*at) >= bound;
+            if expired {
+                victims.push((*id, LinkPoolCloseReason::IdleExpired));
+            }
+            !expired
+        });
+    }
+    // Most recently used first; keep `cap`.
+    idle.sort_by_key(|&(_, at)| std::cmp::Reverse(at));
+    victims.extend(
+        idle.iter()
+            .skip(cap)
+            .map(|(id, _)| (*id, LinkPoolCloseReason::PoolFull)),
+    );
+    victims
+}
+
+/// CIRISEdge#819 — count `n` pool entries dropped because their link closed.
+fn note_pool_links_closed(metrics: Option<&crate::observability::EdgeMetrics>, n: usize) {
+    if n > 0 {
+        if let Some(m) = metrics {
+            m.add_link_pool_closed(LinkPoolCloseReason::LinkClosed, n as u64);
+        }
+    }
+}
+
 /// CIRISEdge#739 — the scoped pool's IDLE-only selector, shared by the
 /// transport and the detached dial (`DialCtx`): an established, `Scoped`-plane
 /// link to `dest` that no lease holds, claimed atomically under the lease set's
@@ -6754,11 +7294,15 @@ async fn lease_pooled_scoped_link(
     pool: &Mutex<HashMap<DestinationHash, Vec<LinkId>>>,
     leased: &Arc<std::sync::Mutex<HashSet<LinkId>>>,
     planes: &Mutex<HashMap<LinkId, LinkPlane>>,
+    last_used: &Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
+    metrics: Option<&crate::observability::EdgeMetrics>,
     dest: &DestinationHash,
 ) -> Option<ScopedLinkLease> {
     let mut map = pool.lock().await;
     let links = map.get_mut(dest)?;
+    let before = links.len();
     links.retain(|id| node.link_is_established(id));
+    note_pool_links_closed(metrics, before - links.len());
     if links.is_empty() {
         map.remove(dest);
         return None;
@@ -6773,9 +7317,12 @@ async fn lease_pooled_scoped_link(
         .copied()?;
     held.insert(id);
     drop(held);
+    // CIRISEdge#819 — a hand-out is a use (see `reusable_link_to`).
+    stamp_pool_use(last_used, id);
     Some(ScopedLinkLease {
         link_id: id,
         leased: Arc::clone(leased),
+        last_used: Some(Arc::clone(last_used)),
     })
 }
 
@@ -6813,6 +7360,8 @@ struct DialCtx {
     /// link `Identity` at connect; the pool hands out identity-plane links only.
     link_plane: Arc<Mutex<HashMap<LinkId, LinkPlane>>>,
     reusable_dialed_link: Arc<Mutex<HashMap<DestinationHash, Vec<LinkId>>>>,
+    /// CIRISEdge#819 — see `ReticulumTransport::pool_last_used`.
+    pool_last_used: Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
     link_in_flight: Arc<Mutex<HashSet<LinkId>>>,
 }
 
@@ -7067,6 +7616,7 @@ impl DialCtx {
         // bundle-served — the three things a reusing sender skips. Publishing
         // any earlier would hand another coordinator a link the responder will
         // drop frames on (`SkippedNoSourceKeyId`, #317/#340).
+        stamp_pool_use(&self.pool_last_used, link_id);
         self.reusable_dialed_link
             .lock()
             .await
@@ -7096,19 +7646,33 @@ impl DialCtx {
         // Drop links leviculum no longer holds, so a dead entry cannot occupy a
         // pool slot forever. The map is a cache over the link registry and the
         // registry is the authority.
+        let before = pool.len();
         pool.retain(|id| self.node.link_is_established(id));
+        note_pool_links_closed(self.metrics.as_ref(), before - pool.len());
         if pool.is_empty() {
             map.remove(dest);
             return None;
         }
-        let in_flight = self.link_in_flight.lock().await;
+        let mut in_flight = self.link_in_flight.lock().await;
         let planes = self.link_plane.lock().await;
         // IDLE only. A link mid-transfer is not available: Reticulum runs one
         // resource per link, so handing it out serialises the caller behind the
         // transfer already on it — which is the regression the M=4 sweep caught.
-        pool.iter()
+        let picked = pool
+            .iter()
             .find(|id| !in_flight.contains(*id) && planes.get(*id) == Some(&LinkPlane::Identity))
-            .copied()
+            .copied();
+        // CIRISEdge#819 (Codex on #821) — a hand-out RESERVES the lane: it is
+        // marked in flight here, under the pool lock, so the caller owns the
+        // transfer from this instant. A stamp alone was not enough: a
+        // concurrent release could stamp a newer lane and trim this one to the
+        // cap before the caller claimed it, leaving it to ship on a closed
+        // link. The caller releases it with `release_link_after_transfer`.
+        if let Some(id) = picked {
+            in_flight.insert(id);
+            stamp_pool_use(&self.pool_last_used, id);
+        }
+        picked
     }
 }
 
@@ -7199,6 +7763,10 @@ struct EventCtx<'a> {
     reusable_dialed_link: &'a Mutex<HashMap<DestinationHash, Vec<LinkId>>>,
     /// CIRISEdge#532 — so a closed link does not leak an in-flight marker.
     link_in_flight: &'a Mutex<HashSet<LinkId>>,
+    /// CIRISEdge#819 — see `ReticulumTransport::inbound_resource_active`.
+    inbound_resource_active: &'a std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    /// CIRISEdge#819 — see `ReticulumTransport::pool_last_used`.
+    pool_last_used: &'a std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
     /// v3.5.1 (CIRISEdge#119 + #120) — per-link rooted-peer
     /// attribution. Populated on `NodeEvent::LinkIdentified` after
     /// matching the link's remote identity to a rooted peer; consumed
@@ -8483,6 +9051,16 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             is_sender,
             ..
         } => {
+            if !is_sender {
+                // CIRISEdge#819 — an inbound transfer keeps its link busy for
+                // the pool reaper, and every event of it is a use of the link.
+                note_inbound_transfer(
+                    ctx.inbound_resource_active,
+                    ctx.pool_last_used,
+                    link_id,
+                    true,
+                );
+            }
             if is_sender {
                 let mut guard = ctx.sent_resource_progress.lock().await;
                 if guard.len() >= SENT_RESOURCE_PROGRESS_PRUNE_THRESHOLD {
@@ -8499,11 +9077,20 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             }
         }
         NodeEvent::ResourceFailed {
+            link_id,
             resource_hash,
             is_sender,
             error,
             ..
         } => {
+            if !is_sender {
+                note_inbound_transfer(
+                    ctx.inbound_resource_active,
+                    ctx.pool_last_used,
+                    link_id,
+                    false,
+                );
+            }
             ctx.sent_resource_progress
                 .lock()
                 .await
@@ -8543,6 +9130,18 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 .lock()
                 .await
                 .remove(&resource_hash);
+            // CIRISEdge#819 — the inbound transfer concluded: its link is no
+            // longer busy, and its idle time starts now. Only the whole
+            // transfer's event (`segment_index == total_segments`); an earlier
+            // segment's leaves the transfer running.
+            if !is_sender && resource_delivery_is_whole(segment_index, total_segments) {
+                note_inbound_transfer(
+                    ctx.inbound_resource_active,
+                    ctx.pool_last_used,
+                    link_id,
+                    false,
+                );
+            }
             if is_sender {
                 // choke-ok: sender-side completion is NOT an inbound drop — our own
                 // outbound envelope finished transferring. CIRISEdge#484 — it is now
@@ -8673,7 +9272,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             if let Some(dest) = closed_dest {
                 let mut reusable = ctx.reusable_dialed_link.lock().await;
                 if let Some(pool) = reusable.get_mut(&dest) {
+                    let before = pool.len();
                     pool.retain(|id| *id != link_id);
+                    // CIRISEdge#819 — a pooled lane whose link closed.
+                    note_pool_links_closed(ctx.metrics, before - pool.len());
                     if pool.is_empty() {
                         reusable.remove(&dest);
                     }
@@ -8682,6 +9284,11 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // CIRISEdge#532 — a closed link cannot still be "transferring"; leaving
             // it marked would leak a pool slot that is never handed out again.
             ctx.link_in_flight.lock().await.remove(&link_id);
+            // CIRISEdge#819 — nor be receiving.
+            ctx.inbound_resource_active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&link_id);
             // CIRISEdge#728 — and its plane record.
             ctx.link_plane.lock().await.remove(&link_id);
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
@@ -14775,6 +15382,155 @@ mod scope_native_addressing_tests {
         .expect("transport")
     }
 
+    // ── CIRISEdge#819 — the pool's victim selection ─────────────────
+
+    fn link819(n: u8) -> LinkId {
+        LinkId::new([n; 16])
+    }
+
+    /// A busy link is never a victim, however old its last use, and its stamp
+    /// is refreshed; an idle link past the bound is; the rest are trimmed to
+    /// the cap, most recently used kept.
+    #[test]
+    fn pool_victims_spare_busy_links_and_keep_the_most_recent_idle_819() {
+        let now = std::time::Instant::now();
+        let ago = |s: u64| {
+            now.checked_sub(Duration::from_secs(s))
+                .expect("monotonic clock")
+        };
+        let pool = [link819(1), link819(2), link819(3), link819(4), link819(5)];
+        let mut used = HashMap::from([
+            (link819(1), ago(600)), // busy, ancient
+            (link819(2), ago(200)), // idle, past the bound
+            (link819(3), ago(10)),
+            (link819(4), ago(20)),
+            (link819(5), ago(30)),
+        ]);
+        let busy = |id: &LinkId| *id == link819(1);
+        let victims = select_pool_victims(
+            &pool,
+            busy,
+            &mut used,
+            now,
+            Some(Duration::from_secs(120)),
+            2,
+        );
+        let why = |n: u8| {
+            victims
+                .iter()
+                .find(|(id, _)| *id == link819(n))
+                .map(|(_, r)| *r)
+        };
+        assert_eq!(why(1), None, "a busy link is never closed");
+        assert_eq!(used[&link819(1)], now, "being busy is being used");
+        assert_eq!(
+            why(2),
+            Some(LinkPoolCloseReason::IdleExpired),
+            "idle past the bound: closed"
+        );
+        assert!(
+            why(3).is_none() && why(4).is_none(),
+            "the two most recently used idle links are kept (cap 2)"
+        );
+        assert_eq!(
+            why(5),
+            Some(LinkPoolCloseReason::PoolFull),
+            "the third idle link is over the cap"
+        );
+        assert_eq!(victims.len(), 2);
+    }
+
+    /// **Codex on #821, finding 3 — a scoped lease stamps its lane when it is
+    /// released**, so the idle bound starts at release rather than at the
+    /// hand-out (or the reaper's last busy pass). Fails on 03277e3, whose drop
+    /// only freed the lane and left the hand-out's stamp.
+    #[test]
+    fn a_scoped_lease_stamps_its_lane_on_release_819() {
+        let leased = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let last_used = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let lane = link819(9);
+        let handed_out = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(300))
+            .expect("monotonic clock");
+        last_used.lock().unwrap().insert(lane, handed_out);
+        let lease = ScopedLinkLease::claim(lane, &leased).stamping(&last_used);
+        assert!(leased.lock().unwrap().contains(&lane));
+        let before_release = std::time::Instant::now();
+        drop(lease);
+        assert!(!leased.lock().unwrap().contains(&lane), "the lane is free");
+        assert!(
+            last_used.lock().unwrap()[&lane] >= before_release,
+            "the release is the lane's last use"
+        );
+    }
+
+    /// **Codex on #821, finding 4 — a lane carrying an INBOUND transfer is
+    /// busy for the reaper.** A pooled lane idle 10 s past a 1 s bound, with
+    /// a receiver-side transfer event just recorded on it (the function the
+    /// event loop's `Started`/`Progress` arms call), survives the reaper's
+    /// per-destination pass; once the transfer concludes it does not. Fails on
+    /// 03277e3, whose busy predicate saw only outbound transfers.
+    #[tokio::test]
+    async fn an_inbound_transfer_keeps_its_lane_from_the_reaper_819() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = bare_transport(dir.path(), "node-819-inbound").await;
+        t.set_link_pool_policy(Duration::from_secs(1), 4);
+        let lane = link819(7);
+        let dest = DestinationHash::new([7u8; 16]);
+        t.reusable_dialed_link.lock().await.insert(dest, vec![lane]);
+        let idle_for_10s = || {
+            t.pool_last_used.lock().unwrap().insert(
+                lane,
+                std::time::Instant::now()
+                    .checked_sub(Duration::from_secs(10))
+                    .expect("monotonic clock"),
+            );
+        };
+        // A peer's transfer is arriving on the lane.
+        note_inbound_transfer(&t.inbound_resource_active, &t.pool_last_used, lane, true);
+        idle_for_10s();
+        t.shrink_identity_pool(dest, Some(Duration::from_secs(1)))
+            .await;
+        assert_eq!(
+            t.reusable_dialed_link.lock().await.get(&dest),
+            Some(&vec![lane]),
+            "a lane mid-receive is busy: the reaper leaves it"
+        );
+        // The transfer concludes; the lane goes idle past the bound.
+        note_inbound_transfer(&t.inbound_resource_active, &t.pool_last_used, lane, false);
+        idle_for_10s();
+        t.shrink_identity_pool(dest, Some(Duration::from_secs(1)))
+            .await;
+        assert!(
+            !t.reusable_dialed_link.lock().await.contains_key(&dest),
+            "once the transfer is over, the idle lane is reaped"
+        );
+    }
+
+    /// The release path applies the cap only; an unstamped link starts ageing
+    /// now; a pool of busy links is left whole.
+    #[test]
+    fn pool_victims_cap_only_and_unstamped_links_819() {
+        let now = std::time::Instant::now();
+        let pool = [link819(1), link819(2), link819(3)];
+        let mut used = HashMap::new();
+        let none = select_pool_victims(&pool, |_| true, &mut used, now, Some(Duration::ZERO), 1);
+        assert!(
+            none.is_empty(),
+            "every link busy: nothing closed, even at a zero bound"
+        );
+        let mut used = HashMap::new();
+        let victims = select_pool_victims(&pool, |_| false, &mut used, now, None, 1);
+        assert_eq!(victims.len(), 2, "cap 1 keeps one idle lane");
+        assert!(
+            victims
+                .iter()
+                .all(|(_, r)| *r == LinkPoolCloseReason::PoolFull),
+            "the release path closes for the cap only"
+        );
+        assert_eq!(used.len(), 3, "every idle link is stamped");
+    }
+
     // ── CIRISEdge#568 — the dial outlives the round ─────────────────
 
     /// **The load-bearing property of the detach.** A spawned dial publishes
@@ -15224,6 +15980,29 @@ impl crate::scope_lifecycle::ScopedDestinationSink for ReticulumTransport {
             .map_err(|e| e.to_string())
     }
 }
+
+/// CIRISEdge#819 — how long a pooled link may sit idle before the reaper
+/// closes it: 120 s since it was last handed out, published or released.
+/// Well over a replication round and its cadence's jitter, so a lane a peer's
+/// next round will want is still there; far under leviculum's ~13 min stale
+/// reap, which an initiator's own keepalives never let fire.
+pub const DEFAULT_LINK_POOL_IDLE_BOUND: Duration = Duration::from_secs(120);
+
+/// CIRISEdge#819 — the most IDLE lanes a pool keeps per destination. Busy
+/// lanes are not counted and never closed, so a burst still dials as many
+/// lanes as it needs (#531/#532: one Resource per link, so lanes are the
+/// parallelism); what the cap bounds is what the burst leaves behind.
+pub const DEFAULT_LINK_POOL_IDLE_CAP: usize = 4;
+
+/// CIRISEdge#819 — how long an inbound transfer may go without a
+/// `Started`/`Progress` event and still keep its link busy for the pool
+/// reaper. The outbound no-progress window, the same "a transfer this quiet
+/// has stalled" judgement.
+const INBOUND_TRANSFER_STALL: Duration = DIAL_NO_PROGRESS_WINDOW;
+
+/// CIRISEdge#819 — the shortest idle bound a setter accepts (a zero bound
+/// would close every lane the moment it was released).
+const MIN_LINK_POOL_IDLE_BOUND: Duration = Duration::from_millis(100);
 
 /// CIRISEdge#532 — how many dials to one peer may be in flight at once.
 ///
