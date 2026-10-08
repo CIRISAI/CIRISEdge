@@ -34,6 +34,7 @@
 pub mod archive_mode;
 pub mod boot;
 pub mod cohort_group;
+pub(crate) mod crypto_panic;
 pub mod scope_state;
 pub mod welcome_wrap;
 
