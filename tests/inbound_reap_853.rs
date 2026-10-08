@@ -17,7 +17,12 @@
 //! - (e) a link that leaves at the node without a `LinkClosed` edge hears is
 //!   reconciled: pruned, counted `vanished`, and the gauge drops;
 //! - (f) an LXMF serve link is exempt for one bound after its last LXMF
-//!   activity, then reaped like any other.
+//!   activity, then reaped like any other;
+//! - (g) Codex on #854: a peer-opened link this node keeps SENDING on is in
+//!   use, and is not reaped while the sends continue;
+//! - (h) Codex on #854: a link is closed only on the second consecutive pass
+//!   that finds it idle and unchanged, so activity queued behind the timer
+//!   saves it.
 #![cfg(feature = "transport-reticulum")]
 
 mod common;
@@ -98,6 +103,7 @@ where
 
 struct Pair {
     a_key: String,
+    b_key: String,
     a: Arc<ReticulumTransport>,
     b: Arc<ReticulumTransport>,
     metrics_a: ciris_edge::EdgeMetrics,
@@ -112,6 +118,14 @@ struct Pair {
 /// keeps its lanes for 600 s, so the only thing that can close B's link to A
 /// is A.
 async fn pair(tag: &str, inbound_bound: Duration) -> Pair {
+    pair_ticking(tag, inbound_bound, true).await
+}
+
+/// [`pair`]; with `fast_tick` false, A's bounds are 600 s when `listen` fixes
+/// the reaper's cadence (30 s), and `inbound_bound` is NOT applied: the
+/// witness sets it once A's listener has provably started (it has delivered a
+/// frame), then drives the passes itself with `reap_idle_inbound_links`.
+async fn pair_ticking(tag: &str, inbound_bound: Duration, fast_tick: bool) -> Pair {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,ciris_edge=info")
         .try_init();
@@ -164,9 +178,13 @@ async fn pair(tag: &str, inbound_bound: Duration) -> Pair {
     // Before `listen`: the reaper's cadence is fixed there. A's pool bound is
     // short only so its tick is (A has no pool); its inbound bound is the one
     // under test.
-    a.set_link_pool_policy(BOUND, 4);
-    a.set_inbound_link_idle_bound(inbound_bound);
-    assert_eq!(a.inbound_link_idle_bound(), inbound_bound);
+    if fast_tick {
+        a.set_link_pool_policy(BOUND, 4);
+        a.set_inbound_link_idle_bound(inbound_bound);
+    } else {
+        a.set_link_pool_policy(Duration::from_secs(600), 4);
+        a.set_inbound_link_idle_bound(Duration::from_secs(600));
+    }
     b.set_link_pool_policy(Duration::from_secs(600), 4);
     prime_v7_peer_pair(&a, &key_a.key_id, &b, &key_b.key_id).await;
     let (tx_a, rx_a) = mpsc::channel::<InboundFrame>(256);
@@ -181,8 +199,12 @@ async fn pair(tag: &str, inbound_bound: Duration) -> Pair {
         }),
     ];
     assert!(b.knows_peer(&key_a.key_id).await, "B knows A after priming");
+    if fast_tick {
+        assert_eq!(a.inbound_link_idle_bound(), inbound_bound);
+    }
     Pair {
         a_key: key_a.key_id.clone(),
+        b_key: key_b.key_id.clone(),
         a,
         b,
         metrics_a,
@@ -193,11 +215,11 @@ async fn pair(tag: &str, inbound_bound: Duration) -> Pair {
     }
 }
 
-async fn recv_one(rx: &mut mpsc::Receiver<InboundFrame>, what: &str) {
+async fn recv_one(rx: &mut mpsc::Receiver<InboundFrame>, what: &str) -> InboundFrame {
     tokio::time::timeout(Duration::from_secs(60), rx.recv())
         .await
         .unwrap_or_else(|_| panic!("{what}: timed out"))
-        .unwrap_or_else(|| panic!("{what}: sink closed"));
+        .unwrap_or_else(|| panic!("{what}: sink closed"))
 }
 
 /// The one inbound link on A (B's dial), once A's listener has recorded it.
@@ -498,4 +520,113 @@ async fn an_lxmf_serve_link_is_exempt_for_one_bound_after_its_last_activity_853(
         "not before the bound since the last LXMF activity: {:?}",
         lxmf_at.elapsed()
     );
+}
+
+/// **(g) Codex on #854, finding 1 — outbound use keeps a link.** B dials A
+/// once and then only listens; A keeps answering on that same link (the
+/// reverse path: no dial of its own). For three bounds of A's sends the link
+/// stays; once A stops, it is reaped. Fails when only inbound frames restart
+/// the idle clock: A's own link to B is closed under its sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_this_node_keeps_sending_on_is_not_reaped_854() {
+    let mut p = pair("sending", BOUND).await;
+    let (a_key, b_key) = (p.a_key.clone(), p.b_key.clone());
+    p.b.send(&a_key, b"one frame, then only listening")
+        .await
+        .expect("send B -> A");
+    let frame = recv_one(&mut p.rx_a, "A receives").await;
+    let path = frame
+        .reply_path
+        .expect("a link frame carries its reply path");
+    let link = a_inbound_link(&p).await;
+    let started = std::time::Instant::now();
+    while started.elapsed() < BOUND * 3 {
+        // On the link the request arrived on, never a dial of A's own.
+        p.a.send_on_reply_path_only(&b_key, &path, b"A answers on B's link")
+            .await
+            .expect("send A -> B on B's link");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+    assert_eq!(
+        p.a.link_direction_counts(),
+        (1, 0),
+        "A's sends rode B's link (no dial of its own) and the link is still open"
+    );
+    assert!(p.a.node_link_established_for_test(link));
+    assert_eq!(idle_expired(&p.metrics_a), 0, "a link in use is not idle");
+
+    let closed = wait_for(BOUND * 6, || async {
+        idle_expired(&p.metrics_a) == 1 && !p.a.node_link_established_for_test(link)
+    })
+    .await;
+    assert!(
+        closed,
+        "once A stops sending, the link is idle and reaped: {:?}",
+        p.metrics_a.inbound_link_closed_by_reason()
+    );
+}
+
+/// **(h) Codex on #854, finding 4 — two consecutive idle observations.** A's
+/// reaper runs only when the witness calls it. A link idle past the bound is
+/// NOT closed by the first pass that finds it so; activity that lands
+/// between two passes (here a fresh frame from B, as a queued frame would
+/// once the loop drains it) saves it; a link found idle and unchanged on two
+/// passes in a row is closed by the second. Fails with a single observation:
+/// the first pass closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_is_reaped_only_on_the_second_idle_observation_854() {
+    let mut p = pair_ticking("twice", BOUND, false).await;
+    let a_key = p.a_key.clone();
+    // B's pool is per destination, and A's first announce heals B's primed
+    // route to A's announced one; wait for it, so both of B's sends share one
+    // pooled link.
+    let named = p.a.local_named_dest_hash();
+    let healed = wait_for(Duration::from_secs(30), || async {
+        p.b.peer_dest_hash_for_test(&a_key).await == Some(named)
+    })
+    .await;
+    assert!(healed, "B routes to A's announced destination");
+    p.b.send(&a_key, b"one frame").await.expect("send B -> A");
+    recv_one(&mut p.rx_a, "A receives").await;
+    // A's listener is running, so its reaper's 30 s cadence is fixed: only
+    // this witness's calls run a pass from here.
+    p.a.set_inbound_link_idle_bound(BOUND);
+    let link = a_inbound_link(&p).await;
+    tokio::time::sleep(BOUND + Duration::from_millis(1500)).await;
+    assert_eq!(
+        p.a.reap_idle_inbound_links().await,
+        0,
+        "the first pass that finds the link idle only notes it"
+    );
+    assert!(p.a.node_link_established_for_test(link));
+
+    // Activity between the passes: a frame on the same link.
+    p.b.send(&a_key, b"a frame between the passes")
+        .await
+        .expect("send B -> A");
+    recv_one(&mut p.rx_a, "A receives the second frame").await;
+    assert_eq!(
+        a_inbound_link(&p).await,
+        link,
+        "B's second frame rode the same pooled link"
+    );
+    assert_eq!(
+        p.a.reap_idle_inbound_links().await,
+        0,
+        "activity since the first observation saves the link"
+    );
+    assert!(p.a.node_link_established_for_test(link));
+
+    tokio::time::sleep(BOUND + Duration::from_millis(1500)).await;
+    assert_eq!(
+        p.a.reap_idle_inbound_links().await,
+        0,
+        "first idle observation"
+    );
+    assert_eq!(
+        p.a.reap_idle_inbound_links().await,
+        1,
+        "idle and unchanged on the second: closed"
+    );
+    assert_eq!(idle_expired(&p.metrics_a), 1);
 }
