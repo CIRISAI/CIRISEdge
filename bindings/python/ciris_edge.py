@@ -1617,9 +1617,57 @@ class _UniffiFfiConverterOptionalFloat64(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+
+
+
+
+
+class EdgeLinkDirection(enum.Enum):
+    
+    INBOUND = 0
+    
+    OUTBOUND = 1
+    
+    UNKNOWN = 2
+    
+
+
+class _UniffiFfiConverterTypeEdgeLinkDirection(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return EdgeLinkDirection.INBOUND
+        if variant == 2:
+            return EdgeLinkDirection.OUTBOUND
+        if variant == 3:
+            return EdgeLinkDirection.UNKNOWN
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == EdgeLinkDirection.INBOUND:
+            return
+        if value == EdgeLinkDirection.OUTBOUND:
+            return
+        if value == EdgeLinkDirection.UNKNOWN:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == EdgeLinkDirection.INBOUND:
+            buf.write_i32(1)
+        if value == EdgeLinkDirection.OUTBOUND:
+            buf.write_i32(2)
+        if value == EdgeLinkDirection.UNKNOWN:
+            buf.write_i32(3)
+
+
+
 @dataclass
 class EdgeLinkInfo:
-    def __init__(self, *, link_id:bytes, peer_identity_hash:bytes, state:EdgeLinkState, age_seconds:int, rssi_dbm:typing.Optional[float], snr_db:typing.Optional[float], establishment_rate_kbps:typing.Optional[float], mtu:int, mdu:int, transport_id:str, transport_kind:str):
+    def __init__(self, *, link_id:bytes, peer_identity_hash:bytes, state:EdgeLinkState, age_seconds:int, rssi_dbm:typing.Optional[float], snr_db:typing.Optional[float], establishment_rate_kbps:typing.Optional[float], mtu:int, mdu:int, transport_id:str, transport_kind:str, direction:EdgeLinkDirection):
         self.link_id = link_id
         self.peer_identity_hash = peer_identity_hash
         self.state = state
@@ -1631,12 +1679,13 @@ class EdgeLinkInfo:
         self.mdu = mdu
         self.transport_id = transport_id
         self.transport_kind = transport_kind
+        self.direction = direction
         
         
 
     
     def __str__(self):
-        return "EdgeLinkInfo(link_id={}, peer_identity_hash={}, state={}, age_seconds={}, rssi_dbm={}, snr_db={}, establishment_rate_kbps={}, mtu={}, mdu={}, transport_id={}, transport_kind={})".format(self.link_id, self.peer_identity_hash, self.state, self.age_seconds, self.rssi_dbm, self.snr_db, self.establishment_rate_kbps, self.mtu, self.mdu, self.transport_id, self.transport_kind)
+        return "EdgeLinkInfo(link_id={}, peer_identity_hash={}, state={}, age_seconds={}, rssi_dbm={}, snr_db={}, establishment_rate_kbps={}, mtu={}, mdu={}, transport_id={}, transport_kind={}, direction={})".format(self.link_id, self.peer_identity_hash, self.state, self.age_seconds, self.rssi_dbm, self.snr_db, self.establishment_rate_kbps, self.mtu, self.mdu, self.transport_id, self.transport_kind, self.direction)
     def __eq__(self, other):
         if self.link_id != other.link_id:
             return False
@@ -1660,6 +1709,8 @@ class EdgeLinkInfo:
             return False
         if self.transport_kind != other.transport_kind:
             return False
+        if self.direction != other.direction:
+            return False
         return True
 
 class _UniffiFfiConverterTypeEdgeLinkInfo(_UniffiConverterRustBuffer):
@@ -1677,6 +1728,7 @@ class _UniffiFfiConverterTypeEdgeLinkInfo(_UniffiConverterRustBuffer):
             mdu=_UniffiFfiConverterUInt32.read(buf),
             transport_id=_UniffiFfiConverterString.read(buf),
             transport_kind=_UniffiFfiConverterString.read(buf),
+            direction=_UniffiFfiConverterTypeEdgeLinkDirection.read(buf),
         )
 
     @staticmethod
@@ -1692,6 +1744,7 @@ class _UniffiFfiConverterTypeEdgeLinkInfo(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.check_lower(value.mdu)
         _UniffiFfiConverterString.check_lower(value.transport_id)
         _UniffiFfiConverterString.check_lower(value.transport_kind)
+        _UniffiFfiConverterTypeEdgeLinkDirection.check_lower(value.direction)
 
     @staticmethod
     def write(value, buf):
@@ -1706,6 +1759,7 @@ class _UniffiFfiConverterTypeEdgeLinkInfo(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.write(value.mdu, buf)
         _UniffiFfiConverterString.write(value.transport_id, buf)
         _UniffiFfiConverterString.write(value.transport_kind, buf)
+        _UniffiFfiConverterTypeEdgeLinkDirection.write(value.direction, buf)
 
 class _UniffiFfiConverterMapStringUInt64(_UniffiConverterRustBuffer):
     @classmethod
@@ -4234,6 +4288,7 @@ def transport_stats(handle: EdgeTransportHandle) -> EdgeTransportStats:
 __all__ = [
     "InternalError",
     "EdgeLinkState",
+    "EdgeLinkDirection",
     "EdgePeerTrust",
     "EdgeBindingsError",
     "EdgeBlackholeEntry",
