@@ -130,6 +130,7 @@ use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize};
 use tokio::sync::Mutex;
 use zeroize::Zeroize;
 
+use super::crypto_panic;
 use super::scope_state::{ScopeStateProvider, ScopeStateProviderError};
 
 /// The openmls storage type backing [`LibcruxProvider`]. Named
@@ -156,7 +157,8 @@ type MemStorage = <LibcruxProvider as OpenMlsProvider>::StorageProvider;
 pub const CIPHERSUITE_ID: u16 = 0x004D;
 
 /// The openmls enum value [`CIPHERSUITE_ID`] maps to.
-const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+pub(crate) const CIPHERSUITE: Ciphersuite =
+    Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 
 // The exporter labels for cohort secrets are NOT defined here. They are
 // CIRISVerify's (`RECORD_EXPORTER_LABEL` / `DESTINATION_EXPORTER_LABEL`,
@@ -317,9 +319,17 @@ pub enum CohortGroupError {
     /// A member lookup by `key_id` found nothing.
     #[error("member not found in cohort group: {0}")]
     MemberNotFound(String),
-    /// KeyPackage minting failed.
+    /// KeyPackage minting failed, or a received KeyPackage was refused
+    /// (validation, or a key length the 0x004D suite cannot hold).
     #[error("MLS KeyPackage build failed: {0}")]
     KeyPackageBuildFailed(String),
+    /// openmls panicked inside its crypto provider and the panic was
+    /// contained (CIRISEdge#822: `libcrux-kem` 0.0.7 panics on a short
+    /// X-Wing key, RUSTSEC-2026-0330/0331). The message carries the panic
+    /// text and whether the group was restored to its pre-operation state;
+    /// see [`super::crypto_panic`].
+    #[error("MLS crypto panicked (contained): {0}")]
+    CryptoPanic(String),
     /// Exporter-secret derivation failed — would indicate corrupted
     /// group state.
     #[error("MLS exporter_secret derivation failed: {0}")]
@@ -1054,8 +1064,14 @@ pub fn key_package_to_bytes(key_package: KeyPackage) -> Result<Vec<u8>, CohortGr
 /// lifetime, ciphersuite) under the same provider every edge group runs on.
 /// A validated [`KeyPackage`] is what [`CohortGroup::add_member`] takes.
 ///
+/// Then refuse it unless its `init_key` and leaf `encryption_key` are both
+/// exactly the X-Wing public-key length: a validly signed KeyPackage with a
+/// short key panics `libcrux-kem` 0.0.7 when this node encrypts to it
+/// (CIRISEdge#822; see [`super::crypto_panic`]).
+///
 /// # Errors
-/// Wire decode failure, a non-KeyPackage message, or validation failure.
+/// Wire decode failure, a non-KeyPackage message, validation failure, or
+/// a key of the wrong length ([`CohortGroupError::KeyPackageBuildFailed`]).
 pub fn key_package_from_bytes(bytes: &[u8]) -> Result<KeyPackage, CohortGroupError> {
     use openmls::prelude::{MlsMessageBodyIn, ProtocolVersion};
     use openmls_traits::OpenMlsProvider as _;
@@ -1068,9 +1084,14 @@ pub fn key_package_from_bytes(bytes: &[u8]) -> Result<KeyPackage, CohortGroupErr
         ));
     };
     let provider = LibcruxProvider::default();
-    kp_in
-        .validate(provider.crypto(), ProtocolVersion::Mls10)
-        .map_err(|e| CohortGroupError::KeyPackageBuildFailed(format!("validate: {e:?}")))
+    let key_package = crypto_panic::catch_crypto_panic(|| {
+        kp_in.validate(provider.crypto(), ProtocolVersion::Mls10)
+    })
+    .map_err(CohortGroupError::CryptoPanic)?
+    .map_err(|e| CohortGroupError::KeyPackageBuildFailed(format!("validate: {e:?}")))?;
+    crypto_panic::check_key_package_key_lengths(&key_package)
+        .map_err(CohortGroupError::KeyPackageBuildFailed)?;
+    Ok(key_package)
 }
 
 struct CohortGroupInner {
@@ -1316,6 +1337,11 @@ impl CohortGroupInner {
     /// current epoch. Does NOT persist — [`CohortGroup::apply_remote_commit`]
     /// persists once, after any held-commit drain, and only then
     /// reports the epoch.
+    ///
+    /// Decrypting the commit's path secret and installing the committer's
+    /// new path keys run under [`crypto_panic::guard_group_op`]: a panic
+    /// leaves the group at the epoch it was in, exactly as an `Err` from
+    /// `process_message` does, and every caller already handles that.
     fn process_and_merge_commit(&mut self, commit: &[u8]) -> Result<(), CohortGroupError> {
         let msg_in = MlsMessageIn::tls_deserialize(&mut &*commit)
             .map_err(|e| CohortGroupError::WireDecodeFailed(format!("commit decode: {e:?}")))?;
@@ -1323,18 +1349,18 @@ impl CohortGroupInner {
             CohortGroupError::WireDecodeFailed(format!("not a protocol message: {e:?}"))
         })?;
 
-        let processed = self
-            .group
-            .process_message(self.provider.as_ref(), proto)
-            .map_err(|e| CohortGroupError::ApplyFailed(format!("{e:?}")))?;
-
-        match processed.into_content() {
-            ProcessedMessageContent::StagedCommitMessage(staged) => self
-                .group
-                .merge_staged_commit(self.provider.as_ref(), *staged)
-                .map_err(|e| CohortGroupError::ApplyFailed(format!("merge_staged: {e:?}"))),
-            _ => Err(CohortGroupError::NotACommit),
-        }
+        crypto_panic::guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
+            let processed = group
+                .process_message(provider, proto)
+                .map_err(|e| CohortGroupError::ApplyFailed(format!("{e:?}")))?;
+            match processed.into_content() {
+                ProcessedMessageContent::StagedCommitMessage(staged) => group
+                    .merge_staged_commit(provider, *staged)
+                    .map_err(|e| CohortGroupError::ApplyFailed(format!("merge_staged: {e:?}"))),
+                _ => Err(CohortGroupError::NotACommit),
+            }
+        })
+        .map_err(CohortGroupError::CryptoPanic)?
     }
 
     /// Hold a future-epoch commit until its predecessors land.
@@ -1384,13 +1410,21 @@ impl CohortGroupInner {
     ) -> Result<CohortCommit, CohortGroupError> {
         let key_package_bytes = key_package_to_bytes(key_package.clone())?;
         let framed = self.epoch();
-        let (commit_msg, welcome_msg, _group_info) = self
-            .group
-            .add_members(self.provider.as_ref(), &self.signer, &[key_package])
-            .map_err(|e| CohortGroupError::AddFailed(format!("{e:?}")))?;
-        self.group
-            .merge_pending_commit(self.provider.as_ref())
-            .map_err(|e| CohortGroupError::AddFailed(format!("merge_pending_commit: {e:?}")))?;
+        // HPKE-encrypts the Welcome to the KeyPackage's init_key and path
+        // secrets to the copath: a panic restores the pre-Add group, and
+        // nothing below (claim, join map, persist) has run.
+        let signer = &self.signer;
+        let (commit_msg, welcome_msg, _group_info) =
+            crypto_panic::guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
+                let out = group
+                    .add_members(provider, signer, &[key_package])
+                    .map_err(|e| CohortGroupError::AddFailed(format!("{e:?}")))?;
+                group.merge_pending_commit(provider).map_err(|e| {
+                    CohortGroupError::AddFailed(format!("merge_pending_commit: {e:?}"))
+                })?;
+                Ok::<_, CohortGroupError>(out)
+            })
+            .map_err(CohortGroupError::CryptoPanic)??;
         let commit = serialize_mls_message(&commit_msg)?;
         let welcome = Some(serialize_mls_message(&welcome_msg)?);
         let claim = self.claim_local(
@@ -1414,13 +1448,20 @@ impl CohortGroupInner {
     ) -> Result<CohortCommit, CohortGroupError> {
         let idx = self.leaf_of(key_id)?;
         let framed = self.epoch();
-        let (commit_msg, welcome_msg, _group_info) = self
-            .group
-            .remove_members(self.provider.as_ref(), &self.signer, &[idx])
-            .map_err(|e| CohortGroupError::RemoveFailed(format!("{e:?}")))?;
-        self.group
-            .merge_pending_commit(self.provider.as_ref())
-            .map_err(|e| CohortGroupError::RemoveFailed(format!("merge_pending_commit: {e:?}")))?;
+        // Path secrets go to every copath leaf's encryption_key: a panic
+        // restores the pre-Remove group before anything else has run.
+        let signer = &self.signer;
+        let (commit_msg, welcome_msg, _group_info) =
+            crypto_panic::guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
+                let out = group
+                    .remove_members(provider, signer, &[idx])
+                    .map_err(|e| CohortGroupError::RemoveFailed(format!("{e:?}")))?;
+                group.merge_pending_commit(provider).map_err(|e| {
+                    CohortGroupError::RemoveFailed(format!("merge_pending_commit: {e:?}"))
+                })?;
+                Ok::<_, CohortGroupError>(out)
+            })
+            .map_err(CohortGroupError::CryptoPanic)??;
         let commit = serialize_mls_message(&commit_msg)?;
         let welcome = welcome_msg.map(|m| serialize_mls_message(&m)).transpose()?;
         let claim = self.claim_local(
@@ -1438,17 +1479,19 @@ impl CohortGroupInner {
     /// Rotate the own leaf: the committer's half of [`CohortGroup::rotate_at`].
     async fn commit_rotate(&mut self, at: DateTime<Utc>) -> Result<CohortCommit, CohortGroupError> {
         let framed = self.epoch();
-        let bundle = self
-            .group
-            .self_update(
-                self.provider.as_ref(),
-                &self.signer,
-                LeafNodeParameters::default(),
-            )
-            .map_err(|e| CohortGroupError::RotateFailed(format!("{e:?}")))?;
-        self.group
-            .merge_pending_commit(self.provider.as_ref())
-            .map_err(|e| CohortGroupError::RotateFailed(format!("merge_pending_commit: {e:?}")))?;
+        // Same path-secret encryption as a Remove, same restore on panic.
+        let signer = &self.signer;
+        let bundle =
+            crypto_panic::guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
+                let bundle = group
+                    .self_update(provider, signer, LeafNodeParameters::default())
+                    .map_err(|e| CohortGroupError::RotateFailed(format!("{e:?}")))?;
+                group.merge_pending_commit(provider).map_err(|e| {
+                    CohortGroupError::RotateFailed(format!("merge_pending_commit: {e:?}"))
+                })?;
+                Ok::<_, CohortGroupError>(bundle)
+            })
+            .map_err(CohortGroupError::CryptoPanic)??;
         let commit = serialize_mls_message(bundle.commit())?;
         let welcome = bundle
             .to_welcome_msg()
@@ -1635,13 +1678,18 @@ impl CohortGroup {
             .use_ratchet_tree_extension(true)
             .build();
 
-        let group = MlsGroup::new_with_group_id(
-            provider.as_ref(),
-            &signer,
-            &create_config,
-            cohort_group_id(community_id),
-            cred_with_key,
-        )
+        // Nothing exists yet to restore: on a panic the fresh provider is
+        // dropped with the error.
+        let group = crypto_panic::catch_crypto_panic(|| {
+            MlsGroup::new_with_group_id(
+                provider.as_ref(),
+                &signer,
+                &create_config,
+                cohort_group_id(community_id),
+                cred_with_key,
+            )
+        })
+        .map_err(CohortGroupError::CryptoPanic)?
         .map_err(|e| CohortGroupError::CreateFailed(format!("MlsGroup::new: {e:?}")))?;
         let created_at = now_ms();
 
@@ -1766,12 +1814,19 @@ impl CohortGroup {
         let join_config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .build();
-        let staged = StagedWelcome::new_from_welcome(
-            key_material.provider.as_ref(),
-            &join_config,
-            welcome_body,
-            None,
-        )
+        // Decrypts the group secrets with the init private key and reads
+        // the Welcome's ratchet tree. A panic here or in `into_group` drops
+        // `key_material` with the error, as any other refusal does, and
+        // nothing has been persisted.
+        let staged = crypto_panic::catch_crypto_panic(|| {
+            StagedWelcome::new_from_welcome(
+                key_material.provider.as_ref(),
+                &join_config,
+                welcome_body,
+                None,
+            )
+        })
+        .map_err(CohortGroupError::CryptoPanic)?
         .map_err(|e| CohortGroupError::WelcomeRejected(format!("{e:?}")))?;
 
         // Check the group id on the STAGED welcome, so a Welcome for a
@@ -1786,9 +1841,10 @@ impl CohortGroup {
             });
         }
 
-        let group = staged
-            .into_group(key_material.provider.as_ref())
-            .map_err(|e| CohortGroupError::WelcomeRejected(format!("into_group: {e:?}")))?;
+        let group =
+            crypto_panic::catch_crypto_panic(|| staged.into_group(key_material.provider.as_ref()))
+                .map_err(CohortGroupError::CryptoPanic)?
+                .map_err(|e| CohortGroupError::WelcomeRejected(format!("into_group: {e:?}")))?;
 
         // Every member the Welcome shows is 'added' as of the join, for the
         // joiner's own restart-signal bookkeeping (FSD §4.1).
@@ -2357,13 +2413,23 @@ impl CohortGroupInner {
              (CC 3 convergent merge, CIRISEdge#604)"
         );
 
+        let ledger_before = self.ledger.clone();
         self.restore_epoch(framed_epoch).await?;
         self.ledger.claims.retain(|e, _| *e < framed_epoch);
         self.ledger.intents.retain(|e, _| *e < framed_epoch);
         // CIRISEdge#697 — the commits this rollback discards are superseded,
         // not owed: placing one would fork the room. Re-proposals re-enter.
         self.ledger.outbox.retain(|e, _| *e <= framed_epoch);
-        self.process_and_merge_commit(commit)?;
+        if let Err(e) = self.process_and_merge_commit(commit) {
+            // The winner did not apply (an openmls refusal, or a contained
+            // crypto panic, CIRISEdge#822). Nothing has been persisted since
+            // the rollback, so the durable head is still `current`: return
+            // to it, ledger included, rather than leave this node in memory
+            // at the fork point while its store and its peers say `current`.
+            self.restore_epoch(current).await?;
+            self.ledger = ledger_before;
+            return Err(e);
+        }
         self.ledger.claims.insert(framed_epoch, arrival.clone());
         self.ledger.prune(self.epoch(), self.retained_epochs);
         let _ = self
@@ -2743,6 +2809,129 @@ mod tests {
     fn open_store() -> ScopeStateProvider {
         let kv = XChaChaKvStore::open_in_memory(b"cohort-group-test-passphrase").unwrap();
         ScopeStateProvider::new(Arc::new(kv))
+    }
+
+    // ── Short X-Wing keys (CIRISEdge#822, RUSTSEC-2026-0330/0331) ──
+
+    use crate::mls::crypto_panic::test_support::{forge_short_keys, validate_without_length_gate};
+
+    /// Short `init_key` lengths: empty, one byte, an X25519-sized key, and
+    /// one byte short of each X-Wing half boundary (1184 ML-KEM-768 ‖ 32
+    /// X25519). Below 1184 `libcrux-kem` 0.0.7 slices past the end and
+    /// panics (kem.rs:250, found by fork-822 on CIRISEdge#822).
+    const SHORT_KEY_LENS: [usize; 5] = [0, 1, 32, 1183, 1215];
+
+    /// The forging fixture is honest: re-encoded through the same splice
+    /// at FULL length it passes the whole ingress, so the refusals below
+    /// are about the key length, not a broken signature.
+    #[test]
+    fn the_short_key_fixture_resigns_a_valid_key_package() {
+        let (material, kp) = mint_cohort_key_material("mallory").unwrap();
+        let same = forge_short_keys(&kp, &material.signer, None, None);
+        key_package_from_bytes(&same).expect("a full-length re-signed KeyPackage is admitted");
+    }
+
+    /// A real 0x004D KeyPackage re-encoded with a truncated `init_key` and
+    /// re-signed by its own key — the bytes a hostile joiner can publish.
+    /// The signature holds (validation passes), so only the length gate
+    /// refuses it.
+    #[test]
+    fn key_package_from_bytes_refuses_a_signed_short_init_key() {
+        let (material, kp) = mint_cohort_key_material("mallory").unwrap();
+        for len in SHORT_KEY_LENS {
+            let forged = forge_short_keys(&kp, &material.signer, Some(len), None);
+            let typed = validate_without_length_gate(&forged);
+            assert_eq!(typed.hpke_init_key().as_slice().len(), len);
+            match key_package_from_bytes(&forged) {
+                Err(CohortGroupError::KeyPackageBuildFailed(m)) => {
+                    assert!(
+                        m.contains(&format!("init_key length {len},")) && m.contains("1216"),
+                        "len {len}: {m}"
+                    );
+                }
+                other => panic!("len {len}: expected the init_key length refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// The same for the leaf `encryption_key`, the key every LATER commit
+    /// encrypts path secrets to once the leaf is in the tree.
+    #[test]
+    fn key_package_from_bytes_refuses_a_signed_short_encryption_key() {
+        let (material, kp) = mint_cohort_key_material("mallory").unwrap();
+        let forged = forge_short_keys(&kp, &material.signer, None, Some(1000));
+        validate_without_length_gate(&forged);
+        match key_package_from_bytes(&forged) {
+            Err(CohortGroupError::KeyPackageBuildFailed(m)) => {
+                assert!(
+                    m.contains("encryption_key length 1000") && m.contains("1216"),
+                    "{m}"
+                );
+            }
+            other => panic!("expected the encryption_key length refusal, got {other:?}"),
+        }
+    }
+
+    /// Past the ingress gate, the Add HPKE-encrypts the Welcome to the
+    /// short `init_key` and `libcrux-kem` 0.0.7 panics. The guard returns
+    /// `CryptoPanic`, the group is still at its epoch with its roster after
+    /// every attempt, and a following valid Add commits, persists, and
+    /// admits a joiner whose secrets agree with the creator's.
+    #[tokio::test]
+    async fn a_short_init_key_past_the_gate_is_a_contained_panic_and_the_group_survives() {
+        let store = open_store();
+        let a = CohortGroup::create(store.clone(), "c-822", "node-a", 16)
+            .await
+            .unwrap();
+        let epoch = a.epoch().await;
+        let (bad_material, bad_kp) = mint_cohort_key_material("mallory").unwrap();
+        for len in SHORT_KEY_LENS {
+            let forged = forge_short_keys(&bad_kp, &bad_material.signer, Some(len), None);
+            let short = validate_without_length_gate(&forged);
+            match a.add_member("mallory", short).await {
+                Err(CohortGroupError::CryptoPanic(m)) => {
+                    assert!(
+                        m.contains("restored to its pre-operation state"),
+                        "len {len}: {m}"
+                    );
+                }
+                // At or above the ML-KEM boundary libcrux may refuse with
+                // an error instead of panicking; either way, no Add.
+                Err(CohortGroupError::AddFailed(_)) if len >= 1184 => {}
+                other => panic!("len {len}: expected a contained crypto panic, got {other:?}"),
+            }
+            assert_eq!(a.epoch().await, epoch, "len {len}: no epoch advanced");
+            assert_eq!(a.member_key_ids().await, vec!["node-a".to_owned()]);
+            assert!(
+                a.unplaced_commits().await.is_empty(),
+                "nothing entered the outbox"
+            );
+        }
+
+        let (material, kp) = mint_cohort_key_material("node-b").unwrap();
+        let add = a
+            .add_member("node-b", kp)
+            .await
+            .expect("the group still commits");
+        assert_eq!(add.epoch(), epoch + 1);
+        let b = CohortGroup::join(
+            open_store(),
+            "c-822",
+            material,
+            add.welcome().expect("an Add produces a Welcome"),
+            16,
+        )
+        .await
+        .expect("the Welcome from the restored group is consumable");
+        assert_eq!(
+            b.destination_secret().await.unwrap().as_bytes(),
+            a.destination_secret().await.unwrap().as_bytes(),
+        );
+        let reloaded = CohortGroup::load(store, "c-822", 16)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.epoch().await, epoch + 1);
     }
 
     // ── Join (CIRISEdge#500) ────────────────────────────────────────
