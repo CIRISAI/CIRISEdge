@@ -2502,6 +2502,13 @@ pub struct ReticulumTransport {
     /// (an A/V session or sink riding a peer's link):
     /// [`ReticulumTransport::hold_link_open`]. Pruned like `lxmf_serve_links`.
     held_links: Arc<std::sync::Mutex<HashSet<LinkId>>>,
+    /// CIRISEdge#853 (Codex on #854) — when each link last carried a successful
+    /// outbound send (unix seconds); see [`note_outbound_use`]. Cleared with
+    /// the link ([`LinkBook::forget`]).
+    link_last_outbound_at: Arc<std::sync::Mutex<HashMap<LinkId, u64>>>,
+    /// CIRISEdge#853 (Codex on #854) — inbound links the previous reaper pass
+    /// found idle, with what it saw; see `reap_idle_inbound_links`.
+    inbound_idle_seen: std::sync::Mutex<HashMap<LinkId, IdleSnapshot>>,
     /// CIRISEdge#853 — links the reconciliation pass has seen gone at the node
     /// while edge still holds them, with when it first saw that (see
     /// [`ReticulumTransport::reconcile_vanished_links`]).
@@ -3475,6 +3482,8 @@ impl ReticulumTransport {
             lxmf_serve_links: Arc::new(std::sync::Mutex::new(HashSet::new())),
             held_links: Arc::new(std::sync::Mutex::new(HashSet::new())),
             vanish_suspects: std::sync::Mutex::new(HashMap::new()),
+            link_last_outbound_at: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            inbound_idle_seen: std::sync::Mutex::new(HashMap::new()),
             swallow_link_closed: Arc::new(std::sync::Mutex::new(HashSet::new())),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
@@ -3671,24 +3680,61 @@ impl ReticulumTransport {
         }
         let established_at = self.link_established_at.lock().await.clone();
         let last_inbound = self.link_last_inbound_at.lock().await.clone();
+        let last_outbound = self
+            .link_last_outbound_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis().max(0)).unwrap_or(0);
-        let due: Vec<LinkId> = candidates
+        let due_now: HashMap<LinkId, IdleSnapshot> = candidates
             .into_iter()
             .filter(|id| !busy.contains(id))
-            .filter(|id| {
+            // Codex on #854 — a link the node no longer holds is left to its
+            // queued `LinkClosed` (or to reconciliation, after the grace), so
+            // its departure is counted under its real reason, never as ours.
+            .filter(|id| self.node.link_is_established(id))
+            .filter_map(|id| {
                 // No establishment stamp: the link's event has not been
                 // processed in full yet — leave it to the next pass.
-                established_at.get(id).is_some_and(|at| {
-                    inbound_link_idle_expired(
-                        now_ms,
-                        *at,
-                        last_inbound.get(id).copied(),
-                        self.node.get_remote_identity(id).is_some(),
-                        bound,
-                    )
-                })
+                let at = *established_at.get(&id)?;
+                let snapshot = (
+                    last_inbound.get(&id).copied(),
+                    last_outbound.get(&id).copied(),
+                );
+                inbound_link_idle_expired(
+                    now_ms,
+                    at,
+                    snapshot.0.max(snapshot.1),
+                    self.node.get_remote_identity(&id).is_some(),
+                    bound,
+                )
+                .then_some((id, snapshot))
             })
             .collect();
+        // Codex on #854 — TWO consecutive idle observations, unchanged between
+        // them. The reaper shares the listen loop with the event consumer, so
+        // a frame or `ResourceProgress` already queued at the node is not yet
+        // in these maps on the pass that first finds the link idle; by the
+        // next tick the loop has drained it, and the stamp (or busy mark) it
+        // brings makes the link no longer due. leviculum 0.27's std handle
+        // does not surface the link's own last-inbound time (`link_stats`
+        // has none, and core's `last_inbound_secs` counts keepalives anyway).
+        let due: Vec<LinkId> = {
+            let mut seen = self
+                .inbound_idle_seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let due = due_now
+                .iter()
+                .filter(|(id, snap)| seen.get(*id) == Some(*snap))
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>();
+            *seen = due_now
+                .into_iter()
+                .filter(|(id, _)| !due.contains(id))
+                .collect();
+            due
+        };
         for id in &due {
             tracing::debug!(
                 link = %hex::encode(id.as_bytes()),
@@ -3791,6 +3837,7 @@ impl ReticulumTransport {
             inbound_resource_active: &self.inbound_resource_active,
             link_plane: &self.link_plane,
             link_direction: &self.link_direction,
+            link_last_outbound_at: &self.link_last_outbound_at,
             metrics: self.metrics.get(),
             metrics_source: self.metrics_source,
         }
@@ -4807,6 +4854,8 @@ impl ReticulumTransport {
         {
             let outcome = send_fragments_on_channel(&self.node, &link_id, &fragments).await;
             if outcome.complete() {
+                // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
+                note_outbound_use(&self.link_last_outbound_at, link_id);
                 tracing::trace!(
                     link = %hex::encode(link_id.as_bytes()),
                     bytes = envelope_bytes.len(),
@@ -5511,49 +5560,35 @@ impl ReticulumTransport {
             &link_id,
             cause,
         );
-        // close_link emits a LinkClosed event on the loop; the loop's
-        // handle_event removes the link from `established_links`.
+        // close_link emits a LinkClosed event on the loop.
         let _ = self.node.close_link(&link_id).await;
-        // Eagerly remove so a second teardown is the no-op above.
-        self.established_links.lock().await.remove(&link_id);
-        self.link_established_at.lock().await.remove(&link_id);
+        // Codex on #854 — forget the link EVERYWHERE now, not when that event
+        // arrives: a `LinkClosed` lost to a full control plane would otherwise
+        // leave its attribution, last-inbound stamp and transfer marks behind,
+        // and with the mirror and direction record already gone no
+        // reconciliation pass could find them. Also makes a second teardown
+        // the no-op above. A pooled link torn down by anything but the pool
+        // reaper (which takes its victims out of the pool first, and counts
+        // them by reason) is counted as `link_closed` in the pool family.
+        self.link_book().forget(link_id, cause).await;
         for set in [&self.lxmf_serve_links, &self.held_links] {
             set.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&link_id);
         }
-        // CIRISEdge#532 — an explicitly torn-down link must stop being offered
-        // for reuse here too, not only via the event loop's LinkClosed. Same
-        // identity guard: only retract THIS link, never a newer one to the peer.
-        let mut dropped = 0;
-        if let Some(dest) = self.dialed_link_dest.lock().await.remove(&link_id) {
-            let mut reusable = self.reusable_dialed_link.lock().await;
-            if let Some(pool) = reusable.get_mut(&dest) {
-                let before = pool.len();
-                pool.retain(|id| *id != link_id);
-                dropped += before - pool.len();
-                if pool.is_empty() {
-                    reusable.remove(&dest);
-                }
-            }
-        }
-        self.link_in_flight.lock().await.remove(&link_id);
-        // CIRISEdge#728 — the plane record goes with the link.
-        self.link_plane.lock().await.remove(&link_id);
-        // CIRISEdge#819 — and its pool stamp.
+        // CIRISEdge#819 — its pool stamp.
         self.pool_last_used
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&link_id);
         // The scoped pool too, so a torn-down lane is never leased again.
+        let mut dropped = 0;
         self.reusable_scoped_link.lock().await.retain(|_, links| {
             let before = links.len();
             links.retain(|id| *id != link_id);
             dropped += before - links.len();
             !links.is_empty()
         });
-        // A pooled link torn down by anything but the pool reaper (which takes
-        // its victims out of the pool first, and counts them by reason).
         note_pool_links_closed(self.metrics.get(), dropped);
         Ok(())
     }
@@ -6507,6 +6542,8 @@ impl ReticulumTransport {
                 {
                     let outcome = send_fragments_on_channel(&self.node, &link_id, &fragments).await;
                     if outcome.complete() {
+                        // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
+                        note_outbound_use(&self.link_last_outbound_at, link_id);
                         tracing::debug!(
                             destination_key_id,
                             link = ?link_id,
@@ -6597,6 +6634,8 @@ impl ReticulumTransport {
                             send_fragments_on_channel(&self.node, &link_id, &fragments).await;
                         let (sent, total) = (outcome.sent, outcome.total);
                         if outcome.complete() {
+                            // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
+                            note_outbound_use(&self.link_last_outbound_at, link_id);
                             tracing::debug!(
                                 destination_key_id,
                                 link = ?link_id,
@@ -6768,7 +6807,12 @@ impl ReticulumTransport {
                 result = &mut sent => {
                     self.sent_resource_progress.lock().await.remove(&resource_hash);
                     return match result {
-                        Ok(_info) => Ok(()),
+                        Ok(_info) => {
+                            // CIRISEdge#853 (Codex on #854) — a completed
+                            // send is a use of the link.
+                            note_outbound_use(&self.link_last_outbound_at, *link_id);
+                            Ok(())
+                        }
                         Err(CompletionError::LinkClosed { .. }) => {
                             tracing::warn!(
                                 resource = %hex::encode(&resource_hash[..8]),
@@ -7436,6 +7480,7 @@ impl Transport for ReticulumTransport {
                         #[cfg(feature = "lxmf")]
                         lxmf_serve_links: &self.lxmf_serve_links,
                         swallow_link_closed: &self.swallow_link_closed,
+                        link_last_outbound_at: &self.link_last_outbound_at,
                     };
                     handle_event(event, &ctx).await;
 
@@ -7710,6 +7755,23 @@ impl LinkDirections {
     }
 }
 
+/// CIRISEdge#853 — what the inbound reaper saw of a link it found idle:
+/// `(last inbound, last outbound)` stamps. A link is closed only when a later
+/// pass finds it idle with the SAME snapshot (Codex on #854).
+type IdleSnapshot = (Option<u64>, Option<u64>);
+
+/// CIRISEdge#853 (Codex on #854) — a successful outbound send on `link_id`
+/// (a Channel frame fully sent, or a Resource completed): the link is in use,
+/// so its idle clock restarts. Kept apart from `link_last_inbound_at`, which
+/// the #353 reverse-path selector reads as "the peer is alive here".
+fn note_outbound_use(links: &std::sync::Mutex<HashMap<LinkId, u64>>, link_id: LinkId) {
+    let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+    links
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(link_id, now_secs);
+}
+
 /// CIRISEdge#853 — publish one transport's link-direction gauges.
 fn publish_link_directions(
     metrics: Option<&crate::observability::EdgeMetrics>,
@@ -7771,6 +7833,7 @@ struct LinkBook<'a> {
     inbound_resource_active: &'a std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
     link_plane: &'a Mutex<HashMap<LinkId, LinkPlane>>,
     link_direction: &'a std::sync::Mutex<LinkDirections>,
+    link_last_outbound_at: &'a std::sync::Mutex<HashMap<LinkId, u64>>,
     metrics: Option<&'a crate::observability::EdgeMetrics>,
     metrics_source: u64,
 }
@@ -7794,6 +7857,11 @@ impl LinkBook<'_> {
         // CIRISEdge#353 — drop the link's last-inbound stamp too, so a
         // closed link can never win the reverse-path selector.
         self.link_last_inbound_at.lock().await.remove(&link_id);
+        // CIRISEdge#853 — and its last-outbound stamp.
+        self.link_last_outbound_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&link_id);
         // CIRISEdge#424 — drop the dialed-dest record for the closed link.
         let closed_dest = self.dialed_link_dest.lock().await.remove(&link_id);
         // CIRISEdge#532 — and drop it as this dest's REUSABLE link, so the
@@ -7831,9 +7899,10 @@ impl LinkBook<'_> {
 /// already excluded every busy link (a transfer either way, an A/V hold, an
 /// LXMF serve link) and every link this node dialled.
 ///
-/// - The idle clock starts at the link's last inbound frame (#353
-///   `link_last_inbound_at`), or at its establishment when it has carried
-///   none. Both stamps are whole unix seconds, so a stamp is read as the END
+/// - The idle clock starts at the link's last use: its last inbound frame
+///   (#353 `link_last_inbound_at`) or its last successful outbound send
+///   (`link_last_outbound_at`, Codex on #854), or at its establishment when
+///   it has carried neither. Both stamps are whole unix seconds, so a stamp is read as the END
 ///   of its second: the reaper may close up to a second late, never early.
 /// - A link whose remote has not identified yet (no LINKIDENTIFY) is in the
 ///   #393/E3 attribution handshake: it is left alone until the handshake's
@@ -7842,7 +7911,7 @@ impl LinkBook<'_> {
 fn inbound_link_idle_expired(
     now_ms: u64,
     established_at_secs: u64,
-    last_inbound_secs: Option<u64>,
+    last_used_secs: Option<u64>,
     identified: bool,
     bound: Duration,
 ) -> bool {
@@ -7851,7 +7920,7 @@ fn inbound_link_idle_expired(
     if !identified && u128::from(since_established) < LINK_ESTABLISH_TIMEOUT.as_millis() {
         return false;
     }
-    let start = last_inbound_secs.map_or(established_at_secs, |t| t.max(established_at_secs));
+    let start = last_used_secs.map_or(established_at_secs, |t| t.max(established_at_secs));
     u128::from(now_ms.saturating_sub(end_of(start))) >= bound.as_millis()
 }
 
@@ -8428,6 +8497,8 @@ struct EventCtx<'a> {
     lxmf_serve_links: &'a std::sync::Mutex<HashSet<LinkId>>,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     swallow_link_closed: &'a std::sync::Mutex<HashSet<LinkId>>,
+    /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
+    link_last_outbound_at: &'a std::sync::Mutex<HashMap<LinkId, u64>>,
 }
 
 impl EventCtx<'_> {
@@ -8444,6 +8515,7 @@ impl EventCtx<'_> {
             inbound_resource_active: self.inbound_resource_active,
             link_plane: self.link_plane,
             link_direction: self.link_direction,
+            link_last_outbound_at: self.link_last_outbound_at,
             metrics: self.metrics,
             metrics_source: self.metrics_source,
         }
@@ -16206,6 +16278,92 @@ mod scope_native_addressing_tests {
         let total: u64 = m.inbound_link_closed_by_reason().values().sum();
         assert_eq!(total, 1, "counted once, under one cause");
         assert!(t.vanish_suspects.lock().unwrap().is_empty());
+    }
+
+    /// **Codex on #854, finding 2 — the idle reap never pre-empts a close the
+    /// node already made.** An inbound link edge still holds, idle far past the
+    /// bound, that the node no longer holds: however many passes run, it is not
+    /// closed as `idle_expired`; its departure waits for its `LinkClosed` or,
+    /// after the grace, reconciliation's `vanished`. Fails without the
+    /// `link_is_established` filter: the second pass tears it down and counts
+    /// it as our idle close.
+    #[tokio::test]
+    async fn the_idle_reap_skips_links_the_node_no_longer_holds_854() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = bare_transport(dir.path(), "node-854-gone").await;
+        let m = crate::observability::EdgeMetrics::new();
+        let _ = t.metrics.set(m.clone());
+        t.set_inbound_link_idle_bound(Duration::from_secs(1));
+        let gone = LinkId::new([4; 16]);
+        t.established_links.lock().await.insert(gone);
+        t.link_established_at.lock().await.insert(gone, 1);
+        t.link_direction
+            .lock()
+            .unwrap()
+            .insert(gone, LinkDirection::Inbound);
+        for _ in 0..3 {
+            assert_eq!(t.reap_idle_inbound_links().await, 0);
+        }
+        assert_eq!(m.inbound_link_closed_by_reason()["idle_expired"], 0);
+        for at in t.vanish_suspects.lock().unwrap().values_mut() {
+            *at = std::time::Instant::now()
+                .checked_sub(VANISH_GRACE)
+                .expect("monotonic clock past the grace");
+        }
+        t.reap_idle_inbound_links().await;
+        let reasons = m.inbound_link_closed_by_reason();
+        assert_eq!(reasons["vanished"], 1, "{reasons:?}");
+        assert_eq!(reasons.values().sum::<u64>(), 1, "{reasons:?}");
+    }
+
+    /// **Codex on #854, finding 3 — a local teardown forgets the link
+    /// everywhere at once.** If its `LinkClosed` is lost, nothing is left
+    /// behind: attribution, last-inbound and last-outbound stamps, transfer
+    /// marks, plane, direction (counted under the teardown's cause). Fails
+    /// when the teardown leaves those maps to the event.
+    #[tokio::test]
+    async fn a_local_teardown_forgets_the_link_everywhere_854() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let t = bare_transport(dir.path(), "node-854-teardown").await;
+        let m = crate::observability::EdgeMetrics::new();
+        let _ = t.metrics.set(m.clone());
+        let id = LinkId::new([5; 16]);
+        t.established_links.lock().await.insert(id);
+        t.link_established_at.lock().await.insert(id, 1);
+        t.link_to_peer_key_id
+            .lock()
+            .await
+            .insert(id, "peer".to_owned());
+        t.link_last_inbound_at.lock().await.insert(id, 2);
+        note_outbound_use(&t.link_last_outbound_at, id);
+        t.inbound_resource_active
+            .lock()
+            .unwrap()
+            .insert(id, std::time::Instant::now());
+        t.link_plane.lock().await.insert(id, LinkPlane::Identity);
+        t.link_direction
+            .lock()
+            .unwrap()
+            .insert(id, LinkDirection::Inbound);
+        t.link_teardown(id.as_bytes()).await.expect("teardown");
+        assert!(t.established_links.lock().await.is_empty());
+        assert!(t.link_established_at.lock().await.is_empty());
+        assert!(t.link_to_peer_key_id.lock().await.is_empty(), "attribution");
+        assert!(
+            t.link_last_inbound_at.lock().await.is_empty(),
+            "last inbound"
+        );
+        assert!(
+            t.link_last_outbound_at.lock().unwrap().is_empty(),
+            "last outbound"
+        );
+        assert!(
+            t.inbound_resource_active.lock().unwrap().is_empty(),
+            "transfer"
+        );
+        assert!(t.link_plane.lock().await.is_empty(), "plane");
+        assert_eq!(t.link_direction_counts(), (0, 0));
+        assert_eq!(m.inbound_link_closed_by_reason()["local_teardown"], 1);
     }
 
     /// Every leviculum close reason has its own token, and every token is

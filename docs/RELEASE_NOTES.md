@@ -1,5 +1,45 @@
 # CIRISEdge Release Notes
 
+# v40.0.11 — v40.0.10 had no release (the #425 scanner); the four reaper review fixes
+
+**2026-10-08.** **PATCH** from v40.0.10, cut from the v40.0.10 tag (main carries v40.1.0). Persist
+v53.1.8, verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged.
+Ladder triple: **edge v40.0.11 · persist v53.1.8 · verify v19.0.0**.
+
+**v40.0.10 has no release.** Its tag exists, but the tag run failed
+`transport::reticulum::tests::inbound_exits_are_instrumented_or_marked`, the #425 scanner that
+requires every early exit from the event handler to be counted or marked. The `LinkClosed` arm
+had a bare `return;` after the `swallow_link_closed` test seam. That seam is empty in production,
+and a swallowed close is still counted as `vanished` by the next reconciliation pass, so the
+exit is now marked `choke-ok`. v40.0.11 carries all of v40.0.10; read that section for the
+responder-side inbound reap, the link-direction gauges, the closed-by-reason families and the
+reconciliation.
+
+**Four fixes from the reaper's review (Codex on CIRISEdge#854).** Each has a witness that fails
+without its fix.
+- **Outbound use keeps a link.** A successful outbound send now restarts a link's idle clock: a
+  Channel frame fully sent on the reverse path or a scoped lease, or a Resource whose transfer
+  completed. Before, a link a peer opened aged only from its last INBOUND frame. A NAT'd,
+  initiator-only peer that this node kept answering could have its link reaped under the answers,
+  and this node could not dial it back. The send stamp is kept apart from the inbound stamp, so
+  the #353 reverse-path selector still reads only "the peer is alive here". Witness
+  `a_link_this_node_keeps_sending_on_is_not_reaped_854`.
+- **The idle reap never pre-empts a close the node already made.** A link the node no longer
+  holds is skipped, so a queued `LinkClosed` is counted under its real reason (`peer_closed`,
+  `stale`, …), or after the grace as `vanished`, never as this node's `idle_expired`. Witness
+  `the_idle_reap_skips_links_the_node_no_longer_holds_854`.
+- **A local teardown forgets the link everywhere at once.** It counts the close under its cause,
+  closes the link at the node, and then clears every per-link map straight away. Before, a
+  `LinkClosed` lost to a full control plane left the link's attribution, inbound stamp and
+  transfer marks behind for good. Witness `a_local_teardown_forgets_the_link_everywhere_854`.
+- **Two consecutive idle observations.** The reaper shares the listen loop with the event
+  consumer, so a frame or transfer-progress event already queued at the node may not have been
+  applied when a pass runs. leviculum 0.27 doesn't expose a link's own last-inbound time
+  (`link_stats` has none, and core's counter includes keepalives). So a link is now closed only
+  by the second pass in a row that finds it idle with unchanged stamps. That adds one reaper tick
+  (30 s at the default bound) before a close. Witness
+  `a_link_is_reaped_only_on_the_second_idle_observation_854`.
+
 # v40.0.10 — the responder closes idle inbound links, and every link departure is counted
 
 **2026-10-08.** **PATCH** from v40.0.9, cut from the v40.0.9 tag (main carries v40.1.0). Persist
