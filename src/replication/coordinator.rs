@@ -172,6 +172,10 @@ pub struct ReplicationCoordinator {
     /// Summary on a removal-class kind folds into the removal-receipt
     /// ledger (the peer's Summary IS the protocol-native delivery ack).
     metrics: Option<crate::observability::EdgeMetrics>,
+    /// CIRISEdge#853 — the transport link the responder's latest inbound frame
+    /// arrived on (a Reticulum link id), for the round lifecycle log lines.
+    /// Observability only: never consulted for routing.
+    last_inbound_link: std::sync::Mutex<Option<[u8; 16]>>,
     transport: Arc<dyn Transport>,
     peer_key_id: String,
     kind: EnvelopeKind,
@@ -261,6 +265,7 @@ impl ReplicationCoordinator {
         };
         Self {
             metrics: None,
+            last_inbound_link: std::sync::Mutex::new(None),
             transport,
             peer_key_id: peer_key_id.into(),
             kind,
@@ -345,6 +350,44 @@ impl ReplicationCoordinator {
                 .map_err(|_| CoordinatorError::NoRoundInProgress),
             RoleInbox::Initiator { .. } => Err(CoordinatorError::NoRoundInProgress),
         }
+    }
+
+    /// [`Self::deliver_inbound_framed`], recording the transport link the
+    /// frame arrived on (CIRISEdge#853: the responder's round lifecycle lines
+    /// name it).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::deliver_inbound_framed`].
+    pub fn deliver_inbound_framed_on(
+        &self,
+        msg: ReplicationMessage,
+        meta: Option<RoundMeta>,
+        link: Option<[u8; 16]>,
+    ) -> Result<(), CoordinatorError> {
+        if link.is_some() {
+            *self
+                .last_inbound_link
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = link;
+        }
+        self.deliver_inbound_framed(msg, meta)
+    }
+
+    /// CIRISEdge#853 — the link the latest inbound frame arrived on, hex, or
+    /// `-` when unknown (a non-Reticulum transport or a legacy route).
+    #[must_use]
+    pub fn last_inbound_link_hex(&self) -> String {
+        self.last_inbound_link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map_or_else(|| "-".to_owned(), hex::encode)
+    }
+
+    /// CIRISEdge#853 — the metrics handle, if one was installed.
+    #[must_use]
+    pub fn metrics(&self) -> Option<&crate::observability::EdgeMetrics> {
+        self.metrics.as_ref()
     }
 
     /// Deliver a REPLY (`FROM_RESPONDER = 1`) to this initiator: into the

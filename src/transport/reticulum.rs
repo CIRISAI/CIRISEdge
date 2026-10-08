@@ -3500,9 +3500,10 @@ impl ReticulumTransport {
     }
 
     /// **CIRISEdge#819 — the link-pool bounds** (builder): a pooled link idle
-    /// for `idle_bound` is closed, and each destination keeps at most
-    /// `idle_cap` IDLE lanes (a lane released into a full pool is closed).
-    /// Busy lanes are never closed. Defaults:
+    /// for `idle_bound` is closed. Busy lanes are never closed.
+    /// CIRISEdge#853 (v40.0.11): `idle_cap` is stored and reported but no
+    /// longer enforced — trimming to it on every release WAS the Datum link
+    /// storm; the idle bound alone retires lanes. Defaults:
     /// [`DEFAULT_LINK_POOL_IDLE_BOUND`] (120 s) and
     /// [`DEFAULT_LINK_POOL_IDLE_CAP`] (4); a bound under 100 ms is raised to
     /// 100 ms and a cap of 0 to 1. A running transport's bounds are changed
@@ -4028,7 +4029,11 @@ impl ReticulumTransport {
     /// nothing can hand them out) and close them. `bound` `None` applies the
     /// cap only (the release path).
     async fn shrink_identity_pool(&self, dest: DestinationHash, bound: Option<Duration>) -> usize {
-        let (_, cap) = self.link_pool_policy();
+        // CIRISEdge#853 (v40.0.11) — no idle cap: a pooled lane is closed only
+        // for idleness, by this reaper. Trimming to the cap on every release
+        // closed and re-dialled `C − cap` lanes per coordinator tick under a
+        // concurrency of C (the Datum link storm, ~20–48 links/min).
+        let cap = usize::MAX;
         let victims = {
             let mut map = self.reusable_dialed_link.lock().await;
             let Some(pool) = map.get_mut(&dest) else {
@@ -4065,7 +4070,8 @@ impl ReticulumTransport {
 
     /// CIRISEdge#819 — the scoped pools' pass: a lane under a lease is busy.
     async fn shrink_scoped_pools(&self, bound: Duration) -> usize {
-        let (_, cap) = self.link_pool_policy();
+        // CIRISEdge#853 (v40.0.11) — no idle cap (see `shrink_identity_pool`).
+        let cap = usize::MAX;
         let victims: Vec<(LinkId, LinkPoolCloseReason)> = {
             let mut map = self.reusable_scoped_link.lock().await;
             let mut leased = self
@@ -4872,7 +4878,10 @@ impl ReticulumTransport {
                 "scoped Channel-first send stalled; trying the Resource path (CIRISEdge#739)"
             );
         }
-        let claimed = self.claim_link_for_transfer(link_id).await;
+        let claim = self
+            .claim_link_for_transfer(link_id)
+            .await
+            .then(|| self.link_claim(link_id));
         let shipped = self
             .ship_resource_on_link(
                 &link_id,
@@ -4881,8 +4890,8 @@ impl ReticulumTransport {
                 RESOURCE_TRANSFER_TIMEOUT,
             )
             .await;
-        if claimed {
-            self.release_link_after_transfer(link_id).await;
+        if let Some(claim) = claim {
+            claim.release().await;
         }
         match shipped {
             Ok(()) => Ok(TransportSendOutcome::Delivered),
@@ -6357,13 +6366,20 @@ impl ReticulumTransport {
 
     async fn release_link_after_transfer(&self, link_id: LinkId) {
         self.link_in_flight.lock().await.remove(&link_id);
-        // CIRISEdge#819 — the release is a use, and the moment the lane goes
-        // back to its pool: a pool already holding its cap of idle lanes
-        // closes this one instead of keeping it.
+        // CIRISEdge#819 — the release is a use: the lane's idle clock restarts.
+        // CIRISEdge#853 (v40.0.11) — and nothing is closed here: a released
+        // lane stays pooled until the reaper finds it idle past the bound.
         stamp_pool_use(&self.pool_last_used, link_id);
-        let dest = self.dialed_link_dest.lock().await.get(&link_id).copied();
-        if let Some(dest) = dest {
-            self.shrink_identity_pool(dest, None).await;
+    }
+
+    /// CIRISEdge#853 — wrap a claimed lane in a [`LinkClaim`], so the claim is
+    /// released on every exit, a cancelled send's included.
+    fn link_claim(&self, link_id: LinkId) -> LinkClaim {
+        LinkClaim {
+            in_flight: Arc::clone(&self.link_in_flight),
+            last_used: Arc::clone(&self.pool_last_used),
+            link_id,
+            armed: true,
         }
     }
 
@@ -7153,7 +7169,11 @@ impl Transport for ReticulumTransport {
         // Released on EVERY exit path, including the error paths the durable
         // dispatcher retries through — a leaked marker would retire the link
         // from the pool permanently while it sat there perfectly usable.
-        let claimed = reserved || self.claim_link_for_transfer(link_id).await;
+        // CIRISEdge#853 — and a CANCELLED send: the claim is a guard released
+        // on drop (the responder's 60 s reply timeout cancels ships that may
+        // run 120 s), so a dropped future no longer retires the lane.
+        let claim = (reserved || self.claim_link_for_transfer(link_id).await)
+            .then(|| self.link_claim(link_id));
         // A `Busy` collision here is not the reverse-path retry case, so both
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
@@ -7166,8 +7186,8 @@ impl Transport for ReticulumTransport {
                 RESOURCE_TRANSFER_TIMEOUT,
             )
             .await;
-        if claimed {
-            self.release_link_after_transfer(link_id).await;
+        if let Some(claim) = claim {
+            claim.release().await;
         }
         shipped.map_err(ShipError::into_transport)?;
 
@@ -7393,6 +7413,11 @@ impl Transport for ReticulumTransport {
                             closed,
                             "link-pool reaper closed idle pooled links (CIRISEdge#819)"
                         );
+                    }
+                    // CIRISEdge#853 — link-ups that never reached an
+                    // application frame within the establish window.
+                    if let Some(m) = self.metrics.get() {
+                        m.responder_link_up_expire();
                     }
                     let closed = self.reap_idle_inbound_links().await;
                     if closed > 0 {
@@ -7755,6 +7780,47 @@ impl LinkDirections {
     }
 }
 
+static STARVED_POOL_CLOSE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+static POOL_CLOSED_CHANNEL_EXHAUSTED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static POOL_CLOSED_STALE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// CIRISEdge#853 — a pooled lane closed `ChannelExhausted` (its Channel gave
+/// up retransmitting) or `Stale` (leviculum's own idle reap of a link the far
+/// end stopped answering): the field signature of a starved responder. Counted
+/// process-wide and logged at WARN with both running counts, throttled per
+/// reason. Any other reason is routine and says nothing here.
+fn note_starved_pool_close(reason: leviculum_core::link::LinkCloseReason, link_id: &LinkId) {
+    use leviculum_core::link::LinkCloseReason;
+    let tag = match reason {
+        LinkCloseReason::ChannelExhausted => {
+            POOL_CLOSED_CHANNEL_EXHAUSTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            "channel_exhausted"
+        }
+        LinkCloseReason::Stale => {
+            POOL_CLOSED_STALE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            "stale"
+        }
+        _ => return,
+    };
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } = STARVED_POOL_CLOSE_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 8))
+        .check(tag)
+    {
+        tracing::warn!(
+            link = %hex::encode(link_id.as_bytes()),
+            reason = tag,
+            pooled_closed_channel_exhausted =
+                POOL_CLOSED_CHANNEL_EXHAUSTED.load(std::sync::atomic::Ordering::Relaxed),
+            pooled_closed_stale = POOL_CLOSED_STALE.load(std::sync::atomic::Ordering::Relaxed),
+            suppressed_prev,
+            "a pooled lane closed {tag} — the far end stopped answering on it; sustained, \
+             this is a starved responder (CIRISEdge#853)"
+        );
+    }
+}
+
 /// CIRISEdge#853 — what the inbound reaper saw of a link it found idle:
 /// `(last inbound, last outbound)` stamps. A link is closed only when a later
 /// pass finds it idle with the SAME snapshot (Codex on #854).
@@ -7851,6 +7917,14 @@ impl LinkBook<'_> {
             &link_id,
             cause,
         );
+        // CIRISEdge#853 — a responder link-up still in progress ends with
+        // the link, however it left.
+        if let Some(m) = self.metrics {
+            m.responder_link_up_end(
+                link_id.into_bytes(),
+                crate::observability::LINK_UP_LINK_GONE,
+            );
+        }
         // v3.5.1 (CIRISEdge#119 + #120) — drop the link's rooted
         // peer attribution when the link closes.
         self.link_to_peer_key_id.lock().await.remove(&link_id);
@@ -7922,6 +7996,42 @@ fn inbound_link_idle_expired(
     }
     let start = last_used_secs.map_or(established_at_secs, |t| t.max(established_at_secs));
     u128::from(now_ms.saturating_sub(end_of(start))) >= bound.as_millis()
+}
+
+/// CIRISEdge#853 — a pool lane's transfer claim (`link_in_flight`), released
+/// on every exit: [`LinkClaim::release`] on the normal path, `Drop` when the
+/// send future is cancelled mid-ship. Either way the release is a use of the
+/// lane (its idle clock restarts).
+struct LinkClaim {
+    in_flight: Arc<Mutex<HashSet<LinkId>>>,
+    last_used: Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
+    link_id: LinkId,
+    armed: bool,
+}
+
+impl LinkClaim {
+    async fn release(mut self) {
+        self.armed = false;
+        self.in_flight.lock().await.remove(&self.link_id);
+        stamp_pool_use(&self.last_used, self.link_id);
+    }
+}
+
+impl Drop for LinkClaim {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        stamp_pool_use(&self.last_used, self.link_id);
+        if let Ok(mut in_flight) = self.in_flight.try_lock() {
+            in_flight.remove(&self.link_id);
+        } else if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let (in_flight, link_id) = (Arc::clone(&self.in_flight), self.link_id);
+            rt.spawn(async move {
+                in_flight.lock().await.remove(&link_id);
+            });
+        }
+    }
 }
 
 /// CIRISEdge#853 — marks an outbound resource transfer on a link for as long
@@ -9113,16 +9223,33 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // inside `handle_announce_frame`.
     if crate::transport::announce_frame::is_announce_frame(&data) {
         handle_announce_frame(ctx, link_id, &data).await;
+        if let Some(m) = ctx.metrics {
+            m.responder_link_up_stage(
+                link_id.into_bytes(),
+                crate::observability::LINK_UP_STAGE_ANNOUNCE_INTAKE,
+            );
+        }
         // choke-ok: consumed as a transport control frame; every refusal
         // inside goes through `drop_inbound` by name.
         return;
     }
     if crate::transport::peer_bundle_frame::is_peer_bundle_frame(&data) {
         handle_peer_bundle_frame(ctx, link_id, candidate_key_id, &data).await;
+        if let Some(m) = ctx.metrics {
+            m.responder_link_up_stage(
+                link_id.into_bytes(),
+                crate::observability::LINK_UP_STAGE_BUNDLE_GATE,
+            );
+        }
         // choke-ok: consumed as a transport control frame, not a drop — every
         // outcome inside `handle_peer_bundle_frame` speaks (INFO on the
         // one-motion upgrade; `drop_inbound` / throttled WARN on any refusal).
         return;
+    }
+    // CIRISEdge#853 — the first application frame on a link a peer dialled
+    // ends its link-up (a no-op for a link not being timed).
+    if let Some(m) = ctx.metrics {
+        m.responder_link_up_end(link_id.into_bytes(), crate::observability::LINK_UP_OK);
     }
     // Gate (CIRISEdge#393): admit the attribution only if the candidate's binding
     // is `Rooted ∧ owns_key` (item 1) AND its transport identity is bound by a
@@ -9467,6 +9594,12 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 dirs.insert(link_id, LinkDirection::from_initiator(is_initiator));
                 publish_link_directions(ctx.metrics, ctx.metrics_source, &dirs);
+            }
+            // CIRISEdge#853 — time the responder's link-up from here.
+            if !is_initiator {
+                if let Some(m) = ctx.metrics {
+                    m.responder_link_up_begin(link_id.into_bytes());
+                }
             }
             // CIRISEdge#728 — classify the link's PLANE from the destination
             // leviculum names on the event (the dialled dest, on both ends:
@@ -9988,7 +10121,22 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // Every per-link map lets go; the close is counted under its
             // reason, on its side (CIRISEdge#853), unless this node's own
             // teardown already counted it.
+            // CIRISEdge#853 — a POOLED lane closing ChannelExhausted or Stale
+            // is the field signature of a starved responder (its proofs stopped
+            // coming back): say so, with running counts.
+            let pooled = match ctx.dialed_link_dest.lock().await.get(&link_id).copied() {
+                Some(dest) => ctx
+                    .reusable_dialed_link
+                    .lock()
+                    .await
+                    .get(&dest)
+                    .is_some_and(|pool| pool.contains(&link_id)),
+                None => false,
+            };
             ctx.link_book().forget(link_id, close_cause(reason)).await;
+            if pooled {
+                note_starved_pool_close(reason, &link_id);
+            }
             tracing::debug!(link = ?link_id, reason = ?reason, "link closed");
             // CIRISEdge#34 link half (v0.14.0) — emit `link_closed`
             // event. Severity reflects whether the close was graceful.
@@ -11405,6 +11553,17 @@ async fn handle_peer_bundle_frame(
             );
         }
         PeerBundleOutcome::Refused(refusal) => {
+            // CIRISEdge#853 — the link-up ends here, refused.
+            if let Some(m) = ctx.metrics {
+                m.responder_link_up_stage(
+                    link_id.into_bytes(),
+                    crate::observability::LINK_UP_STAGE_BUNDLE_GATE,
+                );
+                m.responder_link_up_end(
+                    link_id.into_bytes(),
+                    crate::observability::LINK_UP_BUNDLE_REFUSED,
+                );
+            }
             if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                 peer_bundle_arrival_log().check(refusal.tag())
             {

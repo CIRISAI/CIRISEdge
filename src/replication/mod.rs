@@ -279,7 +279,14 @@ impl InboundRouter {
         };
         match self
             .registry
-            .route_inbound_bytes(&peer, &frame.envelope_bytes)
+            .route_inbound_bytes_on(
+                &peer,
+                &frame.envelope_bytes,
+                frame
+                    .reply_path
+                    .filter(|p| p.transport() == crate::transport::TransportId::RETICULUM_RS)
+                    .map(|p| p.token()),
+            )
             .await
         {
             Ok(RouteOutcome::NotAReplicationFrame) => RouteDisposition::NotReplication,

@@ -40,6 +40,49 @@ without its fix.
   (30 s at the default bound) before a close. Witness
   `a_link_is_reaped_only_on_the_second_idle_observation_854`.
 
+**The Datum link storm (storm-v4006).** The canonical sees ~890 `link identified` and ~825
+`PeerClosed` per 10 minutes from ONE v40.0.6 initiator, and no responder line at all. Two pool
+behaviours fed that storm, and the responder side was silent:
+- **A release closes nothing.** Each send's release trimmed its destination's pool to the idle
+  cap of 4, closing the rest as `pool_full`. With 14 coordinators ticking together (14 to 28
+  concurrent sends per peer), that closed and re-dialled `C − 4` lanes every tick, about 20 to 48
+  links a minute. Now a pooled lane is closed only by the reaper's idle bound. The idle cap is
+  still accepted by `with_link_pool_policy` but no longer enforced, and the `pool_full` token is
+  retired: it always reads 0 and stays for its series. Witness
+  `a_burst_closes_nothing_on_release_and_the_bound_retires_it_853`: 14 concurrent sends under a
+  cap of 1 close nothing on release, and every lane closes `idle_expired` after the bound.
+- **A cancelled send gives its lane back.** A send claimed its lane and released the claim only
+  after the ship returned. The responder's 60 s reply timeout cancels ships that can run 120 s,
+  and each cancellation leaked the claim, so that lane was never handed out again and the next
+  send dialled. The claim is now released when the send ends, however it ends, cancellation
+  included. Witness `a_cancelled_send_gives_its_lane_back_853`.
+- **A starved responder now shows in the log.** A pooled lane that closes `ChannelExhausted` or
+  `Stale` logs a throttled WARN with running counts of both. That is the field signature of a
+  responder whose proofs stopped coming back.
+
+**The responder speaks at INFO.**
+- **Round lifecycle.** These lines now log at INFO, with peer, kind and the link the round
+  arrived on: the responder driver starting, a round completing on either path (with its
+  duration), and a reply failing to send. The two failure lines stay at WARN.
+- **`responder_rounds_total{kind, outcome}`** counts them, with outcome one of `started`,
+  `completed_responder_final`, `completed_initiator_final`, `reply_send_failed` or
+  `send_then_complete_failed`. `started` counts a responder driver starting, once per peer and
+  kind.
+
+  Together they tell a link that served a round and closed apart from one that opened and closed
+  empty.
+- **Link-up timing.** `responder_link_up_seconds{stage}` measures each link-up stage on a link a
+  peer dialled, from `LinkEstablished` to the end of that stage: `bundle_gate` (the #436 bundle
+  intake and verify), `announce_intake` (#627) and `owner_binding` (#727, the sibling carve-out).
+  This tests the storm hypothesis that the canonical's link-up frames are slow.
+  `responder_link_up_total{outcome}` counts each link-up's outcome:
+  - `ok`: the first application frame arrived.
+  - `bundle_refused`: the dialer's bundle was refused.
+  - `timeout`: no application frame within 30 s.
+  - `link_gone`: the link closed first.
+
+All three new metrics are in both bindings.
+
 # v40.0.10 — the responder closes idle inbound links, and every link departure is counted
 
 **2026-10-08.** **PATCH** from v40.0.9, cut from the v40.0.9 tag (main carries v40.1.0). Persist

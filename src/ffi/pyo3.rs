@@ -3035,6 +3035,22 @@ fn metrics_bundle_to_pydict<'py>(
         "sweep_permit_wait_seconds",
         histogram_to_pydict(py, &bundle.sweep_permit_wait_seconds)?,
     )?;
+    // CIRISEdge#853 — the responder's round lifecycle and link-up.
+    let responder_rounds = pyo3::types::PyDict::new(py);
+    for (key, n) in &bundle.responder_rounds_total {
+        responder_rounds.set_item(key.as_str(), *n)?;
+    }
+    root.set_item("responder_rounds_total", responder_rounds)?;
+    let link_up = pyo3::types::PyDict::new(py);
+    for (stage, h) in &bundle.responder_link_up_seconds {
+        link_up.set_item(stage.as_str(), histogram_to_pydict(py, h)?)?;
+    }
+    root.set_item("responder_link_up_seconds", link_up)?;
+    let link_up_total = pyo3::types::PyDict::new(py);
+    for (outcome, n) in &bundle.responder_link_up_total {
+        link_up_total.set_item(outcome.as_str(), *n)?;
+    }
+    root.set_item("responder_link_up_total", link_up_total)?;
 
     Ok(root)
 }

@@ -873,6 +873,66 @@ pub const SWEEP_PERMIT_WAIT_BUCKETS_SECONDS: &[f64] = &[0.01, 0.1, 1.0, 5.0, 30.
 /// The exported name of the advertise-sweep permit-wait histogram.
 pub const SWEEP_PERMIT_WAIT_METRIC: &str = "edge_sweep_permit_wait_seconds";
 
+/// CIRISEdge#853 — `responder_rounds_total` outcome: a responder driver
+/// started for a `(peer, kind)` (the peer's first round reached us).
+pub const RESPONDER_ROUND_STARTED: &str = "started";
+/// CIRISEdge#853 — the responder served a round to completion (the
+/// responder-final path, `DriveStep::Complete`).
+pub const RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL: &str = "completed_responder_final";
+/// CIRISEdge#853 — a round completed on the initiator-final path
+/// (`DriveStep::SendThenComplete`, CIRISEdge#380).
+pub const RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL: &str = "completed_initiator_final";
+/// CIRISEdge#853 — a responder reply failed to send (an error or the
+/// CIRISEdge#373 reply timeout); the round will not complete.
+pub const RESPONDER_ROUND_REPLY_SEND_FAILED: &str = "reply_send_failed";
+/// CIRISEdge#853 — a send on the initiator-final path failed.
+pub const RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED: &str = "send_then_complete_failed";
+/// Every `responder_rounds_total` outcome token.
+pub const RESPONDER_ROUND_OUTCOMES: [&str; 5] = [
+    RESPONDER_ROUND_STARTED,
+    RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL,
+    RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL,
+    RESPONDER_ROUND_REPLY_SEND_FAILED,
+    RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED,
+];
+
+/// CIRISEdge#853 — `responder_link_up_seconds` stage: the dialer's link-borne
+/// build-attestation bundle (`CBND`, #436) taken in and verified.
+pub const LINK_UP_STAGE_BUNDLE_GATE: &str = "bundle_gate";
+/// CIRISEdge#853 — stage: the dialer's link-borne announce (`CANN`, #627)
+/// taken in.
+pub const LINK_UP_STAGE_ANNOUNCE_INTAKE: &str = "announce_intake";
+/// CIRISEdge#853 — stage: the dialer's owner binding (#727) admitted.
+pub const LINK_UP_STAGE_OWNER_BINDING: &str = "owner_binding";
+/// CIRISEdge#853 — `responder_link_up_total` outcome: the link-up work ended
+/// and the link carried its first application frame.
+pub const LINK_UP_OK: &str = "ok";
+/// CIRISEdge#853 — outcome: the dialer's bundle was refused.
+pub const LINK_UP_BUNDLE_REFUSED: &str = "bundle_refused";
+/// CIRISEdge#853 — outcome: no application frame within the establish
+/// window ([`RESPONDER_LINK_UP_TIMEOUT`]) of link-up.
+pub const LINK_UP_TIMEOUT: &str = "timeout";
+/// CIRISEdge#853 — outcome: the link closed before its link-up work ended.
+pub const LINK_UP_LINK_GONE: &str = "link_gone";
+/// Every `responder_link_up_total` outcome token.
+pub const LINK_UP_OUTCOMES: [&str; 4] = [
+    LINK_UP_OK,
+    LINK_UP_BUNDLE_REFUSED,
+    LINK_UP_TIMEOUT,
+    LINK_UP_LINK_GONE,
+];
+/// CIRISEdge#853 — how long a responder's link-up may run before it counts
+/// as `timeout`: the dialer's own establish-and-identify window.
+pub const RESPONDER_LINK_UP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// CIRISEdge#853 — the most responder link-ups tracked at once; past it a new
+/// link-up is not timed (the counter still sees its outcome as nothing), so a
+/// link flood cannot grow the tracker.
+pub const RESPONDER_LINK_UP_TRACKED_MAX: usize = 4096;
+/// CIRISEdge#853 — the upper bounds, in seconds, of
+/// [`EdgeMetrics::responder_link_up_seconds`]'s buckets (time from
+/// `LinkEstablished` on the responder to the end of each link-up stage).
+pub const RESPONDER_LINK_UP_BUCKETS_SECONDS: &[f64] = &[0.01, 0.1, 0.5, 1.0, 5.0, 30.0];
+
 /// A fixed-bucket duration histogram: one counter per bucket plus a `+Inf`
 /// bucket, a count and an exact nanosecond sum. No histogram crate — the
 /// buckets are fixed at the call site's `const`, so recording is an index
@@ -1342,6 +1402,20 @@ pub struct EdgeMetrics {
     /// queueing behind the bound — the shape the canonical's slow
     /// diagnosis could not see. Buckets: [`SWEEP_PERMIT_WAIT_BUCKETS_SECONDS`].
     pub sweep_permit_wait_seconds: Arc<RwLock<FixedHistogram>>,
+    /// CIRISEdge#853 — responder round lifecycle, by `(kind, outcome)` with
+    /// the outcome one of [`RESPONDER_ROUND_OUTCOMES`]. Lets the canonical tell
+    /// a link that served a round and closed from one opened and closed empty.
+    pub responder_rounds_total: Arc<RwLock<HashMap<(EnvelopeKind, &'static str), u64>>>,
+    /// CIRISEdge#853 — responder link-up latency by stage (one of the
+    /// `LINK_UP_STAGE_*` tokens): from `LinkEstablished` on a link a peer
+    /// dialled to the end of that stage's intake. Buckets:
+    /// [`RESPONDER_LINK_UP_BUCKETS_SECONDS`].
+    pub responder_link_up_seconds: Arc<RwLock<HashMap<&'static str, FixedHistogram>>>,
+    /// CIRISEdge#853 — responder link-ups by outcome ([`LINK_UP_OUTCOMES`]).
+    pub responder_link_up_total: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#853 — link-ups in progress: link id → when it established.
+    /// Bounded by [`RESPONDER_LINK_UP_TRACKED_MAX`].
+    pub responder_link_up_pending: Arc<RwLock<HashMap<[u8; 16], std::time::Instant>>>,
 }
 
 /// A `&'static str`-keyed counter map, cloned out with owned keys for the
@@ -1959,6 +2033,88 @@ impl EdgeMetrics {
             .observe(REPLICATION_ROUND_DURATION_BUCKETS_SECONDS, d);
     }
 
+    /// CIRISEdge#853 — count one responder round lifecycle `outcome` (one of
+    /// [`RESPONDER_ROUND_OUTCOMES`]) for `kind`.
+    pub fn inc_responder_round(&self, kind: EnvelopeKind, outcome: &'static str) {
+        *self
+            .responder_rounds_total
+            .write()
+            .entry((kind, outcome))
+            .or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#853 — a link a peer dialled established: start timing its
+    /// link-up. Not tracked past [`RESPONDER_LINK_UP_TRACKED_MAX`] (after
+    /// shedding entries older than [`RESPONDER_LINK_UP_TIMEOUT`], counted as
+    /// `timeout`).
+    pub fn responder_link_up_begin(&self, link: [u8; 16]) {
+        let mut pending = self.responder_link_up_pending.write();
+        if pending.len() >= RESPONDER_LINK_UP_TRACKED_MAX {
+            let before = pending.len();
+            pending.retain(|_, at| at.elapsed() < RESPONDER_LINK_UP_TIMEOUT);
+            let shed = (before - pending.len()) as u64;
+            if shed > 0 {
+                *self
+                    .responder_link_up_total
+                    .write()
+                    .entry(LINK_UP_TIMEOUT)
+                    .or_insert(0) += shed;
+            }
+            if pending.len() >= RESPONDER_LINK_UP_TRACKED_MAX {
+                return;
+            }
+        }
+        pending.insert(link, std::time::Instant::now());
+    }
+
+    /// CIRISEdge#853 — a link-up `stage` (a `LINK_UP_STAGE_*` token) finished
+    /// on `link`: record the time since its link-up began. A link not being
+    /// timed (one this node dialled, or past the tracker's cap) records nothing.
+    pub fn responder_link_up_stage(&self, link: [u8; 16], stage: &'static str) {
+        let Some(at) = self.responder_link_up_pending.read().get(&link).copied() else {
+            return;
+        };
+        self.responder_link_up_seconds
+            .write()
+            .entry(stage)
+            .or_default()
+            .observe(RESPONDER_LINK_UP_BUCKETS_SECONDS, at.elapsed());
+    }
+
+    /// CIRISEdge#853 — `link`'s link-up ended with `outcome` (one of
+    /// [`LINK_UP_OUTCOMES`]); counted once, and only for a link being timed.
+    pub fn responder_link_up_end(&self, link: [u8; 16], outcome: &'static str) {
+        if self
+            .responder_link_up_pending
+            .write()
+            .remove(&link)
+            .is_none()
+        {
+            return;
+        }
+        *self
+            .responder_link_up_total
+            .write()
+            .entry(outcome)
+            .or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#853 — end every link-up older than
+    /// [`RESPONDER_LINK_UP_TIMEOUT`] as `timeout`. Run on the reaper's tick.
+    pub fn responder_link_up_expire(&self) {
+        let mut pending = self.responder_link_up_pending.write();
+        let before = pending.len();
+        pending.retain(|_, at| at.elapsed() < RESPONDER_LINK_UP_TIMEOUT);
+        let expired = (before - pending.len()) as u64;
+        if expired > 0 {
+            *self
+                .responder_link_up_total
+                .write()
+                .entry(LINK_UP_TIMEOUT)
+                .or_insert(0) += expired;
+        }
+    }
+
     /// CIRISEdge P0 telemetry — record one advertise-sweep permit wait into
     /// [`Self::sweep_permit_wait_seconds`].
     pub fn observe_sweep_permit_wait(&self, d: std::time::Duration) {
@@ -2079,6 +2235,31 @@ impl EdgeMetrics {
                 .sweep_permit_wait_seconds
                 .read()
                 .snapshot(SWEEP_PERMIT_WAIT_BUCKETS_SECONDS),
+            responder_rounds_total: {
+                let rounds = self.responder_rounds_total.read();
+                rounds
+                    .iter()
+                    .map(|((kind, outcome), n)| (format!("{}:{outcome}", kind.as_wire_str()), *n))
+                    .collect()
+            },
+            responder_link_up_seconds: self
+                .responder_link_up_seconds
+                .read()
+                .iter()
+                .map(|(stage, h)| {
+                    (
+                        (*stage).to_string(),
+                        h.snapshot(RESPONDER_LINK_UP_BUCKETS_SECONDS),
+                    )
+                })
+                .collect(),
+            responder_link_up_total: {
+                let totals = self.responder_link_up_total.read();
+                LINK_UP_OUTCOMES
+                    .iter()
+                    .map(|o| ((*o).to_string(), totals.get(o).copied().unwrap_or(0)))
+                    .collect()
+            },
         }
     }
 }
@@ -2089,7 +2270,9 @@ pub enum LinkPoolCloseReason {
     /// Idle past the pool's idle bound; edge closed it.
     IdleExpired,
     /// Released into a pool already holding its cap of idle lanes; edge
-    /// closed it.
+    /// closed it. RETIRED in v40.0.11 (CIRISEdge#853): no release trims a
+    /// pool any more, so this always reads 0; the token stays so a dashboard
+    /// keyed on it keeps a series.
     PoolFull,
     /// The link closed on its own (the peer, leviculum's reap, or another
     /// teardown) and its pool entry was dropped.
@@ -2117,7 +2300,8 @@ pub enum LinkCloseCause {
     IdleExpired,
     /// The pool reaper: a pooled lane idle past the pool bound (#819).
     PoolIdleExpired,
-    /// The pool reaper: a lane released into a full pool (#819).
+    /// The pool reaper: a lane released into a full pool (#819). RETIRED in
+    /// v40.0.11 (no release trims a pool); always 0, kept for its series.
     PoolFull,
     /// Any other teardown this node asked for (the host's `link_teardown`, a
     /// scoped-lane eviction).
@@ -2338,6 +2522,14 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge P0 telemetry — advertise-sweep permit wait (exported as
     /// [`SWEEP_PERMIT_WAIT_METRIC`]).
     pub sweep_permit_wait_seconds: HistogramSnapshot,
+    /// CIRISEdge#853 — responder round lifecycle, keyed `<kind>:<outcome>`
+    /// (outcomes: [`RESPONDER_ROUND_OUTCOMES`]).
+    pub responder_rounds_total: HashMap<String, u64>,
+    /// CIRISEdge#853 — responder link-up latency by stage
+    /// (`bundle_gate` / `announce_intake` / `owner_binding`).
+    pub responder_link_up_seconds: HashMap<String, HistogramSnapshot>,
+    /// CIRISEdge#853 — responder link-ups by outcome; every token present.
+    pub responder_link_up_total: HashMap<String, u64>,
 }
 
 /// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
@@ -2609,6 +2801,16 @@ impl EdgeMetricsBundle {
             "sweep_permit_wait_seconds".to_string(),
             self.sweep_permit_wait_seconds.count,
         );
+        // CIRISEdge#853 — the responder's round lifecycle and link-up.
+        f.family("responder_rounds_total", &self.responder_rounds_total);
+        let mut link_ups = 0u64;
+        for (stage, h) in &self.responder_link_up_seconds {
+            link_ups = link_ups.saturating_add(h.count);
+            f.histogram(&format!("responder_link_up_seconds.{stage}"), h);
+        }
+        f.counters
+            .insert("responder_link_up_seconds".to_string(), link_ups);
+        f.family("responder_link_up_total", &self.responder_link_up_total);
         f
     }
 }
@@ -2689,6 +2891,9 @@ edge_metrics_bundle_fields!(
     removal_delivery,
     replication_round_duration_seconds,
     sweep_permit_wait_seconds,
+    responder_rounds_total,
+    responder_link_up_seconds,
+    responder_link_up_total,
 );
 
 #[cfg(test)]
@@ -3004,6 +3209,58 @@ mod p0_telemetry_tests {
     };
     use crate::replication::EnvelopeKind;
     use std::time::Duration;
+
+    /// CIRISEdge#853 — each responder round outcome increments its own
+    /// `<kind>:<outcome>` token once, and nothing else.
+    #[test]
+    fn each_responder_round_outcome_increments_its_token_once_853() {
+        let m = EdgeMetrics::new();
+        for outcome in super::RESPONDER_ROUND_OUTCOMES {
+            m.inc_responder_round(EnvelopeKind::Attestation, outcome);
+        }
+        let snap = m.snapshot().responder_rounds_total;
+        assert_eq!(snap.len(), super::RESPONDER_ROUND_OUTCOMES.len());
+        for outcome in super::RESPONDER_ROUND_OUTCOMES {
+            assert_eq!(snap[&format!("attestation:{outcome}")], 1, "{outcome}");
+        }
+        let flat = m.snapshot().flatten();
+        assert_eq!(
+            flat.counters["responder_rounds_total"],
+            super::RESPONDER_ROUND_OUTCOMES.len() as u64
+        );
+    }
+
+    /// CIRISEdge#853 — a recorded link-up stage lands in a bucket, its
+    /// outcome token increments once, and a second end for the same link
+    /// counts nothing; an untracked link records nothing.
+    #[test]
+    fn a_responder_link_up_lands_in_a_bucket_and_counts_its_outcome_853() {
+        let m = EdgeMetrics::new();
+        let link = [7u8; 16];
+        m.responder_link_up_begin(link);
+        m.responder_link_up_stage(link, super::LINK_UP_STAGE_ANNOUNCE_INTAKE);
+        m.responder_link_up_stage([9u8; 16], super::LINK_UP_STAGE_BUNDLE_GATE);
+        m.responder_link_up_end(link, super::LINK_UP_OK);
+        m.responder_link_up_end(link, super::LINK_UP_OK);
+        let snap = m.snapshot();
+        let h = &snap.responder_link_up_seconds["announce_intake"];
+        assert_eq!(h.count, 1);
+        assert_eq!(
+            h.cumulative[0], 1,
+            "an immediate stage is in the first bucket"
+        );
+        assert!(!snap.responder_link_up_seconds.contains_key("bundle_gate"));
+        assert_eq!(snap.responder_link_up_total["ok"], 1);
+        for outcome in super::LINK_UP_OUTCOMES {
+            assert!(
+                snap.responder_link_up_total.contains_key(outcome),
+                "{outcome}"
+            );
+        }
+        let flat = snap.flatten();
+        assert_eq!(flat.counters["responder_link_up_seconds"], 1);
+        assert_eq!(flat.counters["responder_link_up_total.ok"], 1);
+    }
 
     /// Known round durations land in the right `le` buckets (cumulative),
     /// the count and the exact sum, per kind, and reach the snapshot.
