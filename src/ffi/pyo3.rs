@@ -8837,11 +8837,22 @@ fn init_logging(filter: Option<&str>) -> PyResult<bool> {
 /// capture test below pins the list.
 pub(crate) const DEFAULT_LOG_FILTER: &str = "ciris_edge=info,edge::detector::verdict=info";
 
-/// Whether a global `tracing` dispatcher is installed. Outside any scoped
-/// dispatcher, `get_default` yields the global one, or `NoSubscriber` when
-/// none was ever set.
+/// Whether a GLOBAL `tracing` dispatcher is installed. `get_default` yields
+/// the current thread's scoped dispatcher first (`with_default` /
+/// `set_default`) and the global one only as the fallback, so probing on
+/// the caller's thread would report a host's scoped subscriber as "installed"
+/// and leave edge's background logs discarded once that scope ends (#815
+/// review). A fresh thread has no scope, so its `get_default` is the global
+/// dispatcher, or `NoSubscriber` when none was ever set.
 fn global_subscriber_installed() -> bool {
-    tracing::dispatcher::get_default(|d| !d.is::<tracing::subscriber::NoSubscriber>())
+    std::thread::Builder::new()
+        .name("ciris-edge-log-probe".to_owned())
+        .spawn(|| {
+            tracing::dispatcher::get_default(|d| !d.is::<tracing::subscriber::NoSubscriber>())
+        })
+        .ok()
+        .and_then(|probe| probe.join().ok())
+        .unwrap_or(false)
 }
 
 /// The testable core of [`init_logging`]: `Err` only for a filter that does
@@ -12289,6 +12300,21 @@ mod init_logging_814 {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A scoped dispatcher on the CALLING thread is not a global one: the
+    /// probe must not report it as installed (#815 review, round 3).
+    #[test]
+    fn a_scoped_dispatcher_on_this_thread_is_not_a_global_one() {
+        let scoped = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .finish();
+        let before = super::global_subscriber_installed();
+        let inside = tracing::subscriber::with_default(scoped, super::global_subscriber_installed);
+        assert_eq!(
+            inside, before,
+            "entering a scoped dispatcher must not change what the GLOBAL probe reports"
+        );
     }
 
     /// The default directive keeps edge's custom-target warnings (the
