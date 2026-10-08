@@ -20,7 +20,9 @@
 //!   use, and is not reaped while the sends continue;
 //! - (h) Codex on #854: a link is closed only on the second consecutive pass
 //!   that finds it idle and unchanged, so activity queued behind the timer
-//!   saves it.
+//!   saves it;
+//! - (i) Codex round two: a link whose `LinkEstablished` was lost is recovered
+//!   from its next event, counted, and reaped like any other.
 #![cfg(feature = "transport-reticulum")]
 
 mod common;
@@ -580,4 +582,37 @@ async fn a_link_is_reaped_only_on_the_second_idle_observation_854() {
         "idle and unchanged on the second: closed"
     );
     assert_eq!(idle_expired(&p.metrics_a), 1);
+}
+
+/// **(i) Codex round two on #854, finding 1 — a link whose `LinkEstablished`
+/// edge never processed is recovered.** A drops the next inbound
+/// `LinkEstablished` (as a full control plane does) before recording
+/// anything. B's frame on that link rebuilds A's bookkeeping: the link is
+/// tracked as inbound, counted in `recovered_links_total`, and reaped once
+/// idle. Fails without the recovery: A never records the link, so it is
+/// never a reap candidate and stays open for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_whose_establish_event_was_lost_is_recovered_and_reaped_854() {
+    let mut p = pair("recover", BOUND).await;
+    let a_key = p.a_key.clone();
+    p.a.drop_next_inbound_link_established_for_test();
+    p.b.send(&a_key, b"one frame on a link A never saw established")
+        .await
+        .expect("send B -> A");
+    recv_one(&mut p.rx_a, "A receives").await;
+    let link = a_inbound_link(&p).await;
+    assert_eq!(
+        p.metrics_a.recovered_links_total(),
+        1,
+        "the link's bookkeeping was rebuilt from its later events"
+    );
+    let closed = wait_for(BOUND * 6, || async {
+        idle_expired(&p.metrics_a) == 1 && !p.a.node_link_established_for_test(link)
+    })
+    .await;
+    assert!(
+        closed,
+        "the recovered link is reaped once idle: {:?}",
+        p.metrics_a.inbound_link_closed_by_reason()
+    );
 }

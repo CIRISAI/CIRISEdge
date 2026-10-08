@@ -2513,6 +2513,11 @@ pub struct ReticulumTransport {
     /// while edge still holds them, with when it first saw that (see
     /// [`ReticulumTransport::reconcile_vanished_links`]).
     vanish_suspects: std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    /// CIRISEdge#853 test seam — when set, the next INBOUND `LinkEstablished`
+    /// is dropped after the resource strategy is set, as a full control plane
+    /// would drop it ([`ReticulumTransport::drop_next_inbound_link_established_for_test`]).
+    /// `false` in production.
+    swallow_link_established: std::sync::atomic::AtomicBool,
     /// CIRISEdge#853 test seam — `LinkClosed` events the listener drops
     /// unprocessed ([`ReticulumTransport::close_link_silently_for_test`]).
     /// Empty in production.
@@ -3485,6 +3490,7 @@ impl ReticulumTransport {
             link_last_outbound_at: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inbound_idle_seen: std::sync::Mutex::new(HashMap::new()),
             swallow_link_closed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            swallow_link_established: std::sync::atomic::AtomicBool::new(false),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -3842,6 +3848,15 @@ impl ReticulumTransport {
             metrics: self.metrics.get(),
             metrics_source: self.metrics_source,
         }
+    }
+
+    /// CIRISEdge#853 test seam — drop the next inbound `LinkEstablished` before
+    /// edge records anything for it (after its resource strategy is set), as a
+    /// control-plane overflow drops it.
+    #[doc(hidden)]
+    pub fn drop_next_inbound_link_established_for_test(&self) {
+        self.swallow_link_established
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// CIRISEdge#853 test seam — close `link` at the node and DROP the
@@ -7505,6 +7520,7 @@ impl Transport for ReticulumTransport {
                         #[cfg(feature = "lxmf")]
                         lxmf_serve_links: &self.lxmf_serve_links,
                         swallow_link_closed: &self.swallow_link_closed,
+                        swallow_link_established: &self.swallow_link_established,
                         link_last_outbound_at: &self.link_last_outbound_at,
                     };
                     handle_event(event, &ctx).await;
@@ -8607,6 +8623,9 @@ struct EventCtx<'a> {
     lxmf_serve_links: &'a std::sync::Mutex<HashSet<LinkId>>,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     swallow_link_closed: &'a std::sync::Mutex<HashSet<LinkId>>,
+    /// CIRISEdge#853 test seam — see the field of the same name on
+    /// [`ReticulumTransport`].
+    swallow_link_established: &'a std::sync::atomic::AtomicBool,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     link_last_outbound_at: &'a std::sync::Mutex<HashMap<LinkId, u64>>,
 }
@@ -8996,6 +9015,8 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             .await
             .insert(link_id, now_secs);
     }
+    // CIRISEdge#853 — a link whose `LinkEstablished` edge never saw.
+    recover_unknown_link(ctx, link_id).await;
     // CIRISEdge#414 / CIRISAgent#932 — REASSEMBLE before attributing/routing. A
     // whole (`CRPL…`) frame passes straight through unchanged; a `CFRG` fragment
     // (the send side split an oversized reverse-path reply onto the packet path)
@@ -9529,6 +9550,72 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     }
 }
 
+/// **CIRISEdge#853 (Codex round two on #854, back-ported from #859) — rebuild
+/// the bookkeeping of a link whose `LinkEstablished` this node never
+/// processed** (a full control plane drops the newest event; leviculum 0.27
+/// offers no way to list its links). Called on the link's next per-link event
+/// (`LinkIdentified`, or any frame): a link the node holds but edge has no
+/// direction record for is recorded INBOUND unless this node dialled it
+/// (`dialed_link_dest` is written at every own dial), mirrored as established,
+/// given `now` as its establishment time (so the idle reap starts its clock
+/// here) and its plane, and counted in `recovered_links_total`. Without it
+/// such a link was never a reap candidate and never counted: the exact growth
+/// #853 stops.
+async fn recover_unknown_link(ctx: &EventCtx<'_>, link_id: LinkId) {
+    if ctx
+        .link_direction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .by_link
+        .contains_key(&link_id)
+        || !ctx.node.link_is_established(&link_id)
+    {
+        return;
+    }
+    let dialled = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
+    let direction = if dialled {
+        LinkDirection::Outbound
+    } else {
+        LinkDirection::Inbound
+    };
+    {
+        let mut dirs = ctx
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if dirs.by_link.contains_key(&link_id) {
+            return;
+        }
+        dirs.insert(link_id, direction);
+        publish_link_directions(ctx.metrics, ctx.metrics_source, &dirs);
+    }
+    ctx.established_links.lock().await.insert(link_id);
+    let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+    ctx.link_established_at
+        .lock()
+        .await
+        .entry(link_id)
+        .or_insert(now_secs);
+    if let Some(dest) = ctx.node.link_destination(&link_id) {
+        ctx.link_plane
+            .lock()
+            .await
+            .entry(link_id)
+            .or_insert_with(|| {
+                classify_link_plane(ctx.scope_addresses.get().map(Arc::as_ref), &dest)
+            });
+    }
+    if let Some(m) = ctx.metrics {
+        m.inc_recovered_links();
+    }
+    tracing::info!(
+        link = %hex::encode(link_id.as_bytes()),
+        direction = ?direction,
+        "recovered a link whose LinkEstablished was never processed (a control-plane \
+         overflow drops it); it is now tracked, counted and reapable (CIRISEdge#853)"
+    );
+}
+
 /// CIRISEdge#353 — choose which of a peer's live links a reply rides.
 ///
 /// Prefer the link with the most recent INBOUND activity (RNS's `last_inbound`
@@ -9584,6 +9671,18 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             let _ = ctx
                 .node
                 .set_resource_strategy(&link_id, ResourceStrategy::AcceptAll);
+            // CIRISEdge#853 test seam — model a `LinkEstablished` lost to a full
+            // control plane: edge records nothing for this link.
+            if !is_initiator
+                && ctx
+                    .swallow_link_established
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                // choke-ok: a test-only seam (false in production); the link's
+                // bookkeeping is recovered from its next event (#853,
+                // `recover_unknown_link`).
+                return;
+            }
             ctx.established_links.lock().await.insert(link_id);
             // CIRISEdge#853 — which end opened it, from the node's own link
             // state: known here for every link, before any LINKIDENTIFY.
@@ -9671,6 +9770,8 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             link_id,
             identity_hash,
         } => {
+            // CIRISEdge#853 — a link whose `LinkEstablished` edge never saw.
+            recover_unknown_link(ctx, link_id).await;
             // CIRISEdge#34 link half (v0.14.0) — emit `link_identified`
             // event with the peer's truncated identity hash. The peer
             // proved its identity over an already-established link via

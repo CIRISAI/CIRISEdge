@@ -3051,6 +3051,7 @@ fn metrics_bundle_to_pydict<'py>(
         link_up_total.set_item(outcome.as_str(), *n)?;
     }
     root.set_item("responder_link_up_total", link_up_total)?;
+    root.set_item("recovered_links_total", bundle.recovered_links_total)?;
 
     Ok(root)
 }

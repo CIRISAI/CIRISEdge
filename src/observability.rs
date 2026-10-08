@@ -1416,6 +1416,10 @@ pub struct EdgeMetrics {
     /// CIRISEdge#853 — link-ups in progress: link id → when it established.
     /// Bounded by [`RESPONDER_LINK_UP_TRACKED_MAX`].
     pub responder_link_up_pending: Arc<RwLock<HashMap<[u8; 16], std::time::Instant>>>,
+    /// CIRISEdge#853 — links whose `LinkEstablished` this node never processed
+    /// (dropped at a full control plane) and whose bookkeeping was rebuilt from
+    /// a later per-link event. Non-zero means establish events are being lost.
+    pub recovered_links_total: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A `&'static str`-keyed counter map, cloned out with owned keys for the
@@ -2033,6 +2037,20 @@ impl EdgeMetrics {
             .observe(REPLICATION_ROUND_DURATION_BUCKETS_SECONDS, d);
     }
 
+    /// CIRISEdge#853 — one link's bookkeeping rebuilt after a lost
+    /// `LinkEstablished`.
+    pub fn inc_recovered_links(&self) {
+        self.recovered_links_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 — read `recovered_links_total`.
+    #[must_use]
+    pub fn recovered_links_total(&self) -> u64 {
+        self.recovered_links_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// CIRISEdge#853 — count one responder round lifecycle `outcome` (one of
     /// [`RESPONDER_ROUND_OUTCOMES`]) for `kind`.
     pub fn inc_responder_round(&self, kind: EnvelopeKind, outcome: &'static str) {
@@ -2253,6 +2271,7 @@ impl EdgeMetrics {
                     )
                 })
                 .collect(),
+            recovered_links_total: self.recovered_links_total(),
             responder_link_up_total: {
                 let totals = self.responder_link_up_total.read();
                 LINK_UP_OUTCOMES
@@ -2530,6 +2549,8 @@ pub struct EdgeMetricsBundle {
     pub responder_link_up_seconds: HashMap<String, HistogramSnapshot>,
     /// CIRISEdge#853 — responder link-ups by outcome; every token present.
     pub responder_link_up_total: HashMap<String, u64>,
+    /// CIRISEdge#853 — links recovered after a lost `LinkEstablished`.
+    pub recovered_links_total: u64,
 }
 
 /// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
@@ -2811,6 +2832,10 @@ impl EdgeMetricsBundle {
         f.counters
             .insert("responder_link_up_seconds".to_string(), link_ups);
         f.family("responder_link_up_total", &self.responder_link_up_total);
+        f.counters.insert(
+            "recovered_links_total".to_string(),
+            self.recovered_links_total,
+        );
         f
     }
 }
@@ -2894,6 +2919,7 @@ edge_metrics_bundle_fields!(
     responder_rounds_total,
     responder_link_up_seconds,
     responder_link_up_total,
+    recovered_links_total,
 );
 
 #[cfg(test)]
