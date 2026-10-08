@@ -2518,6 +2518,11 @@ pub struct ReticulumTransport {
     /// would drop it ([`ReticulumTransport::drop_next_inbound_link_established_for_test`]).
     /// `false` in production.
     swallow_link_established: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#853 — resources that concluded (completed or failed) in the
+    /// last [`INBOUND_TRANSFER_STALL`], by hash: a data-plane `Started` /
+    /// `Progress` arriving after its own control-plane completion is ignored
+    /// rather than re-marking the transfer's link busy.
+    concluded_resources: std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
     /// CIRISEdge#853 test seam — `LinkClosed` events the listener drops
     /// unprocessed ([`ReticulumTransport::close_link_silently_for_test`]).
     /// Empty in production.
@@ -3491,6 +3496,7 @@ impl ReticulumTransport {
             inbound_idle_seen: std::sync::Mutex::new(HashMap::new()),
             swallow_link_closed: Arc::new(std::sync::Mutex::new(HashSet::new())),
             swallow_link_established: std::sync::atomic::AtomicBool::new(false),
+            concluded_resources: std::sync::Mutex::new(HashMap::new()),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -7521,6 +7527,7 @@ impl Transport for ReticulumTransport {
                         lxmf_serve_links: &self.lxmf_serve_links,
                         swallow_link_closed: &self.swallow_link_closed,
                         swallow_link_established: &self.swallow_link_established,
+                        concluded_resources: &self.concluded_resources,
                         link_last_outbound_at: &self.link_last_outbound_at,
                     };
                     handle_event(event, &ctx).await;
@@ -7835,6 +7842,38 @@ fn note_starved_pool_close(reason: leviculum_core::link::LinkCloseReason, link_i
              this is a starved responder (CIRISEdge#853)"
         );
     }
+}
+
+/// CIRISEdge#853 — the most concluded resource hashes remembered before the
+/// memo prunes entries older than [`INBOUND_TRANSFER_STALL`].
+const CONCLUDED_RESOURCES_PRUNE_THRESHOLD: usize = 4096;
+
+/// CIRISEdge#853 — record that the resource `hash` concluded (completed or
+/// failed), so a late data-plane `Started`/`Progress` for it is ignored.
+fn note_resource_concluded(
+    memo: &std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
+    hash: [u8; 32],
+) {
+    let mut memo = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if memo.len() >= CONCLUDED_RESOURCES_PRUNE_THRESHOLD {
+        memo.retain(|_, at| at.elapsed() < INBOUND_TRANSFER_STALL);
+    }
+    memo.insert(hash, std::time::Instant::now());
+}
+
+/// CIRISEdge#853 — did the resource `hash` conclude within the stall window?
+/// A `Started`/`Progress` for it is then a straggler from the data plane, not
+/// a transfer in flight.
+fn resource_concluded(
+    memo: &std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
+    hash: &[u8; 32],
+) -> bool {
+    memo.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(hash)
+        .is_some_and(|at| at.elapsed() < INBOUND_TRANSFER_STALL)
 }
 
 /// CIRISEdge#853 — what the inbound reaper saw of a link it found idle:
@@ -8626,6 +8665,8 @@ struct EventCtx<'a> {
     /// CIRISEdge#853 test seam — see the field of the same name on
     /// [`ReticulumTransport`].
     swallow_link_established: &'a std::sync::atomic::AtomicBool,
+    /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
+    concluded_resources: &'a std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     link_last_outbound_at: &'a std::sync::Mutex<HashMap<LinkId, u64>>,
 }
@@ -10003,6 +10044,16 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             is_sender,
             ..
         } => {
+            // CIRISEdge#853 — a data-plane Started/Progress that arrives AFTER
+            // its own control-plane completion (the two planes are separate
+            // channels) must not re-mark a finished transfer: it held the link
+            // "busy" for the full stall window and delayed both reaps by up to
+            // 30 s.
+            if resource_concluded(ctx.concluded_resources, &resource_hash) {
+                // choke-ok: a progress tick for a transfer that already
+                // concluded carries no frame; nothing inbound is dropped.
+                return;
+            }
             if !is_sender {
                 // CIRISEdge#819 — an inbound transfer keeps its link busy for
                 // the pool reaper, and every event of it is a use of the link.
@@ -10035,6 +10086,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             error,
             ..
         } => {
+            note_resource_concluded(ctx.concluded_resources, resource_hash);
             if !is_sender {
                 note_inbound_transfer(
                     ctx.inbound_resource_active,
@@ -10076,6 +10128,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             resource_hash,
             ..
         } => {
+            note_resource_concluded(ctx.concluded_resources, resource_hash);
             // CIRISEdge#353b/v13.6.1 — the transfer concluded; drop its progress
             // mirror (bounds the map for both sent + received resources).
             ctx.sent_resource_progress
@@ -16624,6 +16677,23 @@ mod scope_native_addressing_tests {
         assert!(t.link_plane.lock().await.is_empty(), "plane");
         assert_eq!(t.link_direction_counts(), (0, 0));
         assert_eq!(m.inbound_link_closed_by_reason()["local_teardown"], 1);
+    }
+
+    /// **CIRISEdge#853 — a straggler Progress cannot revive a finished
+    /// transfer.** `ResourceProgress` rides leviculum's data plane and
+    /// `ResourceCompleted` its control plane, so a Progress can arrive after
+    /// its own completion. Once concluded, the hash reads as concluded (the
+    /// event arm then ignores the straggler); an unrelated hash does not. Fails
+    /// without the memo: the straggler re-marks the link busy for the stall
+    /// window and the idle reap waits up to 30 s.
+    #[test]
+    fn a_straggler_progress_after_completion_is_recognised_853() {
+        let memo = std::sync::Mutex::new(HashMap::new());
+        let (done, live) = ([1u8; 32], [2u8; 32]);
+        assert!(!resource_concluded(&memo, &done));
+        note_resource_concluded(&memo, done);
+        assert!(resource_concluded(&memo, &done));
+        assert!(!resource_concluded(&memo, &live));
     }
 
     /// Every leviculum close reason has its own token, and every token is
