@@ -52,23 +52,26 @@
 //! storage, and [`MlsGroup::load`] rebuilds the whole group from that
 //! storage. That is the invariant the cohort plane's snapshot persistence
 //! already rests on. [`guard_group_op`] takes a copy of the storage map
-//! before the operation; if the operation panics it puts the copy back and
-//! reloads the group from it. The group is then exactly the group the
-//! operation started from, including no pending commit, whatever the
-//! panic interrupted.
+//! before the operation. If the operation panics, it builds a FRESH
+//! provider holding that copy, swaps it in for the old one, and reloads
+//! the group from it. The group is then exactly the group the operation
+//! started from, including no pending commit, whatever the panic
+//! interrupted.
 //!
-//! The libcrux panic fires inside a crypto call, and
-//! `openmls_memory_storage` holds its lock only inside its own get/put
-//! methods, never across a crypto call, so this panic leaves the storage
-//! lock unpoisoned. A poisoned lock is still checked for rather than
-//! assumed away: that store `unwrap`s its lock, so reloading from it would
-//! panic outside the guard. The guard then reports a failed restore
-//! instead. (`RwLock::clear_poison` would recover it, but is newer than
-//! the crate's 1.75 MSRV.)
+//! The provider is replaced rather than repaired because of its std
+//! locks: the storage map's `RwLock` and the RNG's `Mutex`.
+//! `openmls_memory_storage` `unwrap`s its lock, so a poisoned one would
+//! turn every later operation on the group into a panic, and
+//! `RwLock::clear_poison` is newer than the crate's 1.75 MSRV. The
+//! libcrux panic fires inside an HPKE call, which holds neither lock
+//! (`hpke_seal`/`hpke_open` build their own `hpke-rs` context and PRNG;
+//! the store holds its lock only around map operations), so in practice
+//! nothing is poisoned. A fresh provider makes that irrelevant: whatever
+//! the panic held, the group continues on locks it never touched.
 
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock, PoisonError};
 
 use openmls::prelude::{Ciphersuite, KeyPackage, MlsGroup};
 use openmls_libcrux_crypto::Provider as LibcruxProvider;
@@ -117,12 +120,15 @@ fn copy_storage(provider: &LibcruxProvider) -> StorageMap {
         .clone()
 }
 
-/// Put `map` back as the provider's storage. `false` if the storage lock
-/// is poisoned, in which case nothing may read through it again.
-fn put_back_storage(provider: &LibcruxProvider, map: StorageMap) -> bool {
-    let values = &provider.storage().values;
-    *values.write().unwrap_or_else(PoisonError::into_inner) = map;
-    !values.is_poisoned()
+/// A new provider whose storage is `map`: fresh locks, fresh RNG.
+fn provider_holding(map: StorageMap) -> Arc<LibcruxProvider> {
+    let provider = LibcruxProvider::default();
+    *provider
+        .storage()
+        .values
+        .write()
+        .unwrap_or_else(PoisonError::into_inner) = map;
+    Arc::new(provider)
 }
 
 /// Run a state-changing openmls operation on `group`, turning a panic
@@ -132,31 +138,31 @@ fn put_back_storage(provider: &LibcruxProvider, map: StorageMap) -> bool {
 /// `Ok` carries `op`'s own result, which is NOT rolled back on `Err`:
 /// openmls's error paths are the caller's to handle, as before.
 ///
+/// On a panic `*provider` is REPLACED (module docs): callers must hold
+/// the provider only through the field passed here, never a clone of the
+/// `Arc` taken before the call.
+///
 /// The returned message says whether the restore succeeded. A restore can
-/// fail only if the storage lock was poisoned or `MlsGroup::load` cannot
-/// read back a map that a live group was just running on; the group is
-/// then left as the panic left it, and the message says so. Later
-/// operations on it still run under this guard, so they too end in an
-/// `Err`, never an unwind.
+/// fail only if `MlsGroup::load` cannot read back a map that a live group
+/// was just running on; the group and provider are then left as the panic
+/// left them, and the message says so.
 pub(crate) fn guard_group_op<T>(
-    provider: &LibcruxProvider,
+    provider: &mut Arc<LibcruxProvider>,
     group: &mut MlsGroup,
-    op: impl FnOnce(&mut MlsGroup) -> T,
+    op: impl FnOnce(&mut MlsGroup, &LibcruxProvider) -> T,
 ) -> Result<T, String> {
     let before = copy_storage(provider);
     let group_id = group.group_id().clone();
-    let message = match catch_unwind(AssertUnwindSafe(|| op(group))) {
+    let current = Arc::clone(provider);
+    let message = match catch_unwind(AssertUnwindSafe(|| op(group, &current))) {
         Ok(out) => return Ok(out),
         Err(payload) => panic_message(payload.as_ref()),
     };
-    let loaded = if put_back_storage(provider, before) {
-        MlsGroup::load(provider.storage(), &group_id).map_err(|e| format!("{e:?}"))
-    } else {
-        Err("the storage lock is poisoned".to_owned())
-    };
-    match loaded {
+    let fresh = provider_holding(before);
+    match MlsGroup::load(fresh.storage(), &group_id) {
         Ok(Some(reloaded)) => {
             *group = reloaded;
+            *provider = fresh;
             tracing::error!(
                 panic = %message,
                 epoch = group.epoch().as_u64(),
@@ -170,7 +176,7 @@ pub(crate) fn guard_group_op<T>(
         other => {
             let why = match other {
                 Ok(_) => "no group under its id in the restored storage".to_owned(),
-                Err(e) => e,
+                Err(e) => format!("{e:?}"),
             };
             tracing::error!(
                 panic = %message,
@@ -380,6 +386,72 @@ mod tests {
                 "len {len}: sealed to a short key"
             );
         }
+    }
+
+    /// A panic that fires while holding the provider's storage write
+    /// guard poisons that `RwLock`, and `openmls_memory_storage` would
+    /// panic on it forever after. The guard leaves the poisoned provider
+    /// behind: afterwards the provider is a different, unpoisoned one, the
+    /// group is at its pre-call epoch, and it goes on committing.
+    #[test]
+    fn a_poisoned_storage_lock_is_left_behind_and_the_group_keeps_committing() {
+        use openmls::prelude::{
+            BasicCredential, CredentialWithKey, LeafNodeParameters, MlsGroupCreateConfig,
+        };
+        use openmls_basic_credential::SignatureKeyPair;
+        use openmls_traits::types::SignatureScheme;
+
+        let mut provider = Arc::new(LibcruxProvider::default());
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        signer.store(provider.storage()).unwrap();
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(super::super::cohort_group::CIPHERSUITE)
+            .build();
+        let mut group = MlsGroup::new(
+            provider.as_ref(),
+            &signer,
+            &config,
+            CredentialWithKey {
+                credential: BasicCredential::new(b"node-a".to_vec()).into(),
+                signature_key: signer.to_public_vec().into(),
+            },
+        )
+        .unwrap();
+        let epoch = group.epoch().as_u64();
+        let old = Arc::clone(&provider);
+
+        let r: Result<(), String> = guard_group_op(&mut provider, &mut group, |group, p| {
+            group
+                .self_update(p, &signer, LeafNodeParameters::default())
+                .unwrap();
+            let _held = p.storage().values.write().unwrap();
+            panic!("poisoned on purpose");
+        });
+        let message = r.expect_err("the panic is contained");
+        assert!(
+            message.contains("restored to its pre-operation state"),
+            "{message}"
+        );
+        assert!(
+            old.storage().values.is_poisoned(),
+            "the test did poison the old lock"
+        );
+        assert!(!Arc::ptr_eq(&old, &provider), "the provider was replaced");
+        assert!(!provider.storage().values.is_poisoned());
+        assert_eq!(group.epoch().as_u64(), epoch);
+        assert!(
+            group.pending_commit().is_none(),
+            "the staged commit is gone"
+        );
+
+        guard_group_op(&mut provider, &mut group, |group, p| {
+            group
+                .self_update(p, &signer, LeafNodeParameters::default())
+                .unwrap();
+            group.merge_pending_commit(p).unwrap();
+        })
+        .expect("the group commits on the fresh provider");
+        assert_eq!(group.epoch().as_u64(), epoch + 1);
     }
 
     #[test]

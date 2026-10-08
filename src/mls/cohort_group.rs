@@ -1349,8 +1349,7 @@ impl CohortGroupInner {
             CohortGroupError::WireDecodeFailed(format!("not a protocol message: {e:?}"))
         })?;
 
-        let provider = self.provider.as_ref();
-        crypto_panic::guard_group_op(provider, &mut self.group, |group| {
+        crypto_panic::guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
             let processed = group
                 .process_message(provider, proto)
                 .map_err(|e| CohortGroupError::ApplyFailed(format!("{e:?}")))?;
@@ -1414,10 +1413,9 @@ impl CohortGroupInner {
         // HPKE-encrypts the Welcome to the KeyPackage's init_key and path
         // secrets to the copath: a panic restores the pre-Add group, and
         // nothing below (claim, join map, persist) has run.
-        let provider = self.provider.as_ref();
         let signer = &self.signer;
         let (commit_msg, welcome_msg, _group_info) =
-            crypto_panic::guard_group_op(provider, &mut self.group, |group| {
+            crypto_panic::guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
                 let out = group
                     .add_members(provider, signer, &[key_package])
                     .map_err(|e| CohortGroupError::AddFailed(format!("{e:?}")))?;
@@ -1452,10 +1450,9 @@ impl CohortGroupInner {
         let framed = self.epoch();
         // Path secrets go to every copath leaf's encryption_key: a panic
         // restores the pre-Remove group before anything else has run.
-        let provider = self.provider.as_ref();
         let signer = &self.signer;
         let (commit_msg, welcome_msg, _group_info) =
-            crypto_panic::guard_group_op(provider, &mut self.group, |group| {
+            crypto_panic::guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
                 let out = group
                     .remove_members(provider, signer, &[idx])
                     .map_err(|e| CohortGroupError::RemoveFailed(format!("{e:?}")))?;
@@ -1483,18 +1480,18 @@ impl CohortGroupInner {
     async fn commit_rotate(&mut self, at: DateTime<Utc>) -> Result<CohortCommit, CohortGroupError> {
         let framed = self.epoch();
         // Same path-secret encryption as a Remove, same restore on panic.
-        let provider = self.provider.as_ref();
         let signer = &self.signer;
-        let bundle = crypto_panic::guard_group_op(provider, &mut self.group, |group| {
-            let bundle = group
-                .self_update(provider, signer, LeafNodeParameters::default())
-                .map_err(|e| CohortGroupError::RotateFailed(format!("{e:?}")))?;
-            group.merge_pending_commit(provider).map_err(|e| {
-                CohortGroupError::RotateFailed(format!("merge_pending_commit: {e:?}"))
-            })?;
-            Ok::<_, CohortGroupError>(bundle)
-        })
-        .map_err(CohortGroupError::CryptoPanic)??;
+        let bundle =
+            crypto_panic::guard_group_op(&mut self.provider, &mut self.group, |group, provider| {
+                let bundle = group
+                    .self_update(provider, signer, LeafNodeParameters::default())
+                    .map_err(|e| CohortGroupError::RotateFailed(format!("{e:?}")))?;
+                group.merge_pending_commit(provider).map_err(|e| {
+                    CohortGroupError::RotateFailed(format!("merge_pending_commit: {e:?}"))
+                })?;
+                Ok::<_, CohortGroupError>(bundle)
+            })
+            .map_err(CohortGroupError::CryptoPanic)??;
         let commit = serialize_mls_message(bundle.commit())?;
         let welcome = bundle
             .to_welcome_msg()
