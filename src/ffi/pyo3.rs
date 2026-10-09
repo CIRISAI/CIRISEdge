@@ -2737,15 +2737,12 @@ impl PyEdge {
         root.set_item("signer_releases", bundle.signer_releases)?;
         root.set_item("retry_suppressions", bundle.retry_suppressions)?;
         root.set_item("signer_park_evictions", bundle.signer_park_evictions)?;
-        root.set_item("refusal_memory_len", bundle.refusal_memory.len)?;
-        root.set_item("refusal_memory_capacity", bundle.refusal_memory.capacity)?;
-        root.set_item(
-            "parked_on_signer_len",
-            bundle.refusal_memory.parked_on_signer_len,
-        )?;
+        root.set_item("refusal_memory_len", bundle.refusal_memory_len)?;
+        root.set_item("refusal_memory_capacity", bundle.refusal_memory_capacity)?;
+        root.set_item("parked_on_signer_len", bundle.parked_on_signer_len)?;
         root.set_item(
             "parked_on_signer_capacity",
-            bundle.refusal_memory.parked_on_signer_capacity,
+            bundle.parked_on_signer_capacity,
         )?;
 
         // CIRISEdge#457 — the receive plane's accepted-apply counters

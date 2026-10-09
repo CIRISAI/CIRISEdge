@@ -2372,7 +2372,10 @@ impl EdgeMetrics {
             signer_releases: self.signer_releases(),
             retry_suppressions: self.retry_suppressions(),
             signer_park_evictions: self.signer_park_evictions(),
-            refusal_memory: self.refusal_memory(),
+            refusal_memory_len: self.refusal_memory().len,
+            refusal_memory_capacity: self.refusal_memory().capacity,
+            parked_on_signer_len: self.refusal_memory().parked_on_signer_len,
+            parked_on_signer_capacity: self.refusal_memory().parked_on_signer_capacity,
             replication_applied_total: self.replication_applied_total.read().clone(),
             replication_duplicate_total: self.replication_duplicate_total.read().clone(),
             removal_delivery: self.removal_receipts.read().delta(),
@@ -2653,8 +2656,15 @@ pub struct EdgeMetricsBundle {
     pub retry_suppressions: u64,
     /// CIRISEdge#858 — parks evicted by the park capacity since start.
     pub signer_park_evictions: u64,
-    /// CIRISEdge#858 — the refusal memory's size and bounds, as last set.
-    pub refusal_memory: RefusalMemoryGauges,
+    /// CIRISEdge#858 — rows remembered as refused (both classes), as last
+    /// set by the bridge.
+    pub refusal_memory_len: u64,
+    /// CIRISEdge#858 — the bound on `refusal_memory_len` (ordinary + park cap).
+    pub refusal_memory_capacity: u64,
+    /// CIRISEdge#858 — rows parked on a signer right now.
+    pub parked_on_signer_len: u64,
+    /// CIRISEdge#858 — the bound on `parked_on_signer_len`.
+    pub parked_on_signer_capacity: u64,
     /// CIRISEdge#457 — per-kind accepted applies that changed local state.
     pub replication_applied_total: HashMap<EnvelopeKind, u64>,
     /// CIRISEdge#457 — per-kind already-held applies (distinct from applied).

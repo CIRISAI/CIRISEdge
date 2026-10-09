@@ -760,13 +760,18 @@ async fn the_park_ledger_is_in_the_metrics_snapshot_858() {
     );
     let as_u64 = |n: usize| u64::try_from(n).expect("fits");
     assert_eq!(
-        snap.refusal_memory,
-        crate::observability::RefusalMemoryGauges {
-            len: 4,
-            capacity: as_u64(DEFAULT_MAX_KEYS + DEFAULT_MAX_PARKED),
-            parked_on_signer_len: 3,
-            parked_on_signer_capacity: as_u64(DEFAULT_MAX_PARKED),
-        },
+        (
+            snap.refusal_memory_len,
+            snap.refusal_memory_capacity,
+            snap.parked_on_signer_len,
+            snap.parked_on_signer_capacity,
+        ),
+        (
+            4,
+            as_u64(DEFAULT_MAX_KEYS + DEFAULT_MAX_PARKED),
+            3,
+            as_u64(DEFAULT_MAX_PARKED),
+        ),
         "the memory's size against its bounds, current after the release"
     );
     assert_eq!(snap.signer_park_evictions, 0);

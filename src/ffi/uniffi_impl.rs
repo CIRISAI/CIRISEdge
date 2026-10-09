@@ -816,14 +816,19 @@ fn insert_park_ledger(
     ] {
         counters.insert(name.to_string(), value);
     }
-    let rm = bundle.refusal_memory;
     for (name, value) in [
-        ("replication.refusal_memory_len", rm.len),
-        ("replication.refusal_memory_capacity", rm.capacity),
-        ("replication.parked_on_signer_len", rm.parked_on_signer_len),
+        ("replication.refusal_memory_len", bundle.refusal_memory_len),
+        (
+            "replication.refusal_memory_capacity",
+            bundle.refusal_memory_capacity,
+        ),
+        (
+            "replication.parked_on_signer_len",
+            bundle.parked_on_signer_len,
+        ),
         (
             "replication.parked_on_signer_capacity",
-            rm.parked_on_signer_capacity,
+            bundle.parked_on_signer_capacity,
         ),
     ] {
         #[allow(clippy::cast_precision_loss)]
