@@ -55,15 +55,18 @@ use ciris_persist::federation::FederationDirectory;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::common::{
-    build_reticulum_with_retry_metrics, directory_with, prime_v7_peer_pair, signed_record,
-    TestFedKey,
+    build_reticulum_with_retry_metrics, directory_with, signed_record, TestFedKey,
 };
 
 /// The plane every scripted round runs on.
 pub const KIND: EnvelopeKind = EnvelopeKind::Key;
 
 /// How long a peer waits for a reply frame before calling a round unserved.
-pub const REPLY_WAIT: Duration = Duration::from_millis(2_500);
+pub const REPLY_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a peer waits for the responder's Deliver once it has sent its
+/// Diff: a multi-MB Deliver under three concurrent harnesses takes a while.
+pub const DELIVER_WAIT: Duration = Duration::from_secs(30);
 
 /// The framing a peer opens rounds with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,6 +294,31 @@ async fn auth_for(
     }
 }
 
+/// Root `a` and `b` on each other with their FULL transport identities, so a
+/// link is attributed by its proven identity (Branch A) and stays attributed
+/// when an announce later re-binds the peer's route: `prime_v7_peer_pair`
+/// injects only the Ed25519 half, and a round opened after the first
+/// announces could then miss attribution and read as unserved.
+async fn prime_full_identity_pair(
+    a: &ReticulumTransport,
+    key_a: &str,
+    b: &ReticulumTransport,
+    key_b: &str,
+) {
+    b.inject_rooted_peer_with_transport_identity_for_test(
+        key_a,
+        a.local_dest_hash(),
+        a.local_transport_pubkey(),
+    )
+    .await;
+    a.inject_rooted_peer_with_transport_identity_for_test(
+        key_b,
+        b.local_dest_hash(),
+        b.local_transport_pubkey(),
+    )
+    .await;
+}
+
 /// Poll `cond` every 100 ms until it holds or `timeout` passes.
 pub async fn wait_for<F, Fut>(timeout: Duration, mut cond: F) -> bool
 where
@@ -443,7 +471,7 @@ impl Harness {
                 )
                 .await;
                 pt.set_link_pool_policy(Duration::from_secs(600), 4);
-                prime_v7_peer_pair(&transport, &r_key.key_id, &pt, &key.key_id).await;
+                prime_full_identity_pair(&transport, &r_key.key_id, &pt, &key.key_id).await;
                 let (ptx, prx) = mpsc::channel::<InboundFrame>(256);
                 let lt = Arc::clone(&pt);
                 tasks.push(tokio::spawn(async move {
@@ -464,6 +492,30 @@ impl Harness {
                 }));
             }
             out_groups.push(group);
+        }
+        // Warm-up: every dialling peer has a PATH to the responder before the
+        // test starts, so a first round is not lost to path discovery (that
+        // read as `NotServed` under load and failed a healthy peer's round).
+        let r_dests = [
+            transport.local_dest_hash(),
+            transport.local_named_dest_hash(),
+        ];
+        for peer in out_groups.iter().flatten().filter(|p| p.knobs.dial_at_all) {
+            let pt = Arc::clone(&peer.transport);
+            assert!(
+                wait_for(Duration::from_secs(30), || {
+                    let pt = Arc::clone(&pt);
+                    async move {
+                        pt.path_table_rows_for_test()
+                            .iter()
+                            .any(|(dest, _, _)| r_dests.contains(dest))
+                    }
+                })
+                .await,
+                "{} learns a path to the responder: {:?}",
+                peer.key.key_id,
+                peer.transport.path_table_rows_for_test()
+            );
         }
         Self {
             responder: Responder {
@@ -597,7 +649,7 @@ impl Peer {
             return RoundResult::NoDeliver;
         }
         let mut delivered = false;
-        let deadline = tokio::time::Instant::now() + REPLY_WAIT * 4;
+        let deadline = tokio::time::Instant::now() + DELIVER_WAIT;
         while !delivered {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             match self.reply(round, left).await {
