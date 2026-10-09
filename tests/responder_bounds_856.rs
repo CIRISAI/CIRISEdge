@@ -346,7 +346,7 @@ async fn e_a_rooted_peer_that_never_dials_is_reported_silent_856() {
         "the healthy peer's last completion is reported: {last:?}"
     );
     let flat = r.metrics.snapshot().flatten();
-    assert_eq!(flat.gauges["rooted_peers_silent.3s"], 1.0);
+    assert!((flat.gauges["rooted_peers_silent.3s"] - 1.0).abs() < f64::EPSILON);
     assert_eq!(r.refused("rate_identity") + r.refused("rate_source"), 0);
 }
 

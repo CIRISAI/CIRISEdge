@@ -123,8 +123,8 @@ impl Knobs {
     }
 }
 
-/// The responder's bounds for one run.
-#[derive(Debug, Clone)]
+/// The responder's bounds for one run; `Default` is production's.
+#[derive(Debug, Clone, Default)]
 pub struct ResponderConfig {
     pub link_up: LinkUpRatePolicy,
     pub no_progress: NoProgressPolicy,
@@ -132,17 +132,6 @@ pub struct ResponderConfig {
     /// Extra `Key` rows the responder holds and publishes, so a peer that
     /// wants them all gets a reply past one Resource segment.
     pub bulk_keys: usize,
-}
-
-impl Default for ResponderConfig {
-    fn default() -> Self {
-        Self {
-            link_up: LinkUpRatePolicy::default(),
-            no_progress: NoProgressPolicy::default(),
-            silence_bounds: Vec::new(),
-            bulk_keys: 0,
-        }
-    }
 }
 
 /// The node under test.
@@ -342,8 +331,9 @@ impl Harness {
         let bulk: Vec<TestFedKey> = (0..config.bulk_keys)
             .map(|i| {
                 let mut k = TestFedKey::new(&format!("bulk-856-{tag}-{i:04}"), 0x80);
-                k.seed[1] = (i & 0xff) as u8;
-                k.seed[2] = ((i >> 8) & 0xff) as u8;
+                let [lo, hi, ..] = i.to_le_bytes();
+                k.seed[1] = lo;
+                k.seed[2] = hi;
                 k
             })
             .collect();
