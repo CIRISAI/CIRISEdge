@@ -680,12 +680,24 @@ jobs:
           name: ciris-edge-android-${{ matrix.abi }}-${{ matrix.variant }}
           path: dist/${{ matrix.abi }}/
       # CIRISEdge#229 — save edge-self-warm on main, per-ABI.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - id: cache-save-android
+        uses: CIRISAI/CIRISCache/save@v1.1
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true  # a cache SAVE must never fail a build or a release (v34.3.0: setup-oras HTTP 500 skipped the upload)
         with:
           key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          # CIRISPersist#1022 — a tag run's blob is what downstream exact-pins
+          # restore, so a non-publish there is an ::error:: (still under the
+          # continue-on-error above: loud, never release-gating).
+          strict: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
+      - name: report unpublished cache save (main)
+        if: github.ref == 'refs/heads/main' && steps.cache-save-android.outputs.published != 'true'
+        env:
+          REASON: ${{ steps.cache-save-android.outputs.reason || 'save step did not reach the push (e.g. setup-oras failed)' }}
+        shell: bash
+        run: |
+          echo "::warning::CIRISCache save not published: ${REASON}"
 
   # ─── android-package: collect per-ABI artifacts (CIRISEdge#17) ──────
   #
@@ -1218,12 +1230,24 @@ jobs:
       # because the attempts had warmed nothing. `continue-on-error` rather
       # than deletion so the lane still reports the write attempt without
       # gating a release on it; re-enable when the save is resource-bounded.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - id: cache-save-ios
+        uses: CIRISAI/CIRISCache/save@v1.1
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true
         with:
           key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          # CIRISPersist#1022 — a tag run's blob is what downstream exact-pins
+          # restore, so a non-publish there is an ::error:: (still under the
+          # continue-on-error above: loud, never release-gating).
+          strict: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
+      - name: report unpublished cache save (main)
+        if: github.ref == 'refs/heads/main' && steps.cache-save-ios.outputs.published != 'true'
+        env:
+          REASON: ${{ steps.cache-save-ios.outputs.reason || 'save step did not reach the push (e.g. setup-oras failed)' }}
+        shell: bash
+        run: |
+          echo "::warning::CIRISCache save not published: ${REASON}"
 
   # ─── ios-pyo3-package: collect device + simulator (CIRISEdge#17) ────
   #
@@ -1934,12 +1958,24 @@ jobs:
       # the `linux-x86_64-test` `pyo3-full` lane (debug profile + all
       # feature combos + incremental → ~7.5 GB blob). Moved here so
       # consumers get a release blob like every other PLAT.
-      - uses: CIRISAI/CIRISCache/save@v1
+      - id: cache-save-wheel
+        uses: CIRISAI/CIRISCache/save@v1.1
         if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         continue-on-error: true  # a cache SAVE must never fail a build or a release (v34.3.0: setup-oras HTTP 500 skipped the upload)
         with:
           key: ${{ steps.cachekey.outputs.key }}
           token: ${{ secrets.GITHUB_TOKEN }}
+          # CIRISPersist#1022 — a tag run's blob is what downstream exact-pins
+          # restore, so a non-publish there is an ::error:: (still under the
+          # continue-on-error above: loud, never release-gating).
+          strict: ${{ startsWith(github.ref, 'refs/tags/v') && 'true' || 'false' }}
+      - name: report unpublished cache save (main)
+        if: github.ref == 'refs/heads/main' && steps.cache-save-wheel.outputs.published != 'true'
+        env:
+          REASON: ${{ steps.cache-save-wheel.outputs.reason || 'save step did not reach the push (e.g. setup-oras failed)' }}
+        shell: bash
+        run: |
+          echo "::warning::CIRISCache save not published: ${REASON}"
 
   # ─── build-manifest: hybrid-signed release provenance ───────────────
   #

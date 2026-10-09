@@ -28,7 +28,7 @@
 # eyeball notice below makes that visible in the run log.
 #
 # Emits the densest **edge** key as `outputs.key` — callers pass this
-# to a downstream `CIRISAI/CIRISCache/save@v1` step on main-branch
+# to a downstream `CIRISAI/CIRISCache/save@v1.1` step on main-branch
 # canonical-lane runs.
 name: 'CIRISCache canonical layered restore'
 description: 'Layered verify → persist → edge restore on the canonical cross-repo key. Emits the edge key for downstream save.'
@@ -38,7 +38,7 @@ inputs:
     required: true
 outputs:
   key:
-    description: 'Canonical edge cache key (densest layer). Pass to CIRISAI/CIRISCache/save@v1.'
+    description: 'Canonical edge cache key (densest layer). Pass to CIRISAI/CIRISCache/save@v1.1.'
     value: ${{ steps.cachekey.outputs.key }}
 runs:
   using: 'composite'
@@ -83,15 +83,15 @@ runs:
         echo "::notice::  verify  key: ${KEY_VERIFY}"
         echo "::notice::  persist key: ${KEY_PERSIST}"
         echo "::notice::  edge    key: ${KEY_EDGE}"
-    - uses: CIRISAI/CIRISCache/restore@v1
+    - uses: CIRISAI/CIRISCache/restore@v1.1
       continue-on-error: true
       with:
         key: ${{ steps.cachekey.outputs.key-verify }}
-    - uses: CIRISAI/CIRISCache/restore@v1
+    - uses: CIRISAI/CIRISCache/restore@v1.1
       continue-on-error: true
       with:
         key: ${{ steps.cachekey.outputs.key-persist }}
-    - uses: CIRISAI/CIRISCache/restore@v1
+    - uses: CIRISAI/CIRISCache/restore@v1.1
       continue-on-error: true
       with:
         key: ${{ steps.cachekey.outputs.key }}
