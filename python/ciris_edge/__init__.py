@@ -61,6 +61,7 @@ from .ciris_edge import (
     VerifiedFeedSubscription,
     __version__,
     init_edge_runtime,
+    init_logging,
 )
 
 __all__ = [
@@ -73,4 +74,5 @@ __all__ = [
     "VerifiedFeedSubscription",
     "__version__",
     "init_edge_runtime",
+    "init_logging",
 ]
