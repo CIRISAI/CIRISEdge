@@ -79,21 +79,6 @@ ignore = [
     "RUSTSEC-2024-0388",  # derivative unmaintained (via ciris-keyring TPM derive stack)
     "RUSTSEC-2024-0384",  # instant unmaintained (Phase 3 Reticulum may obsolete)
 
-    # 2026-10-07 — TEMPORARY, tracked on CIRISEdge#822 (decision: Eric).
-    # libcrux-kem 0.0.7 X-Wing / X25519-ML-KEM PANICS on short input, reached
-    # via openmls_libcrux_crypto 0.3.1 -> hpke-rs-libcrux 0.6.1 (an exact
-    # 0.0.x pin). Fixed only in libcrux-kem >= 0.0.10 (hpke-rs-libcrux 0.8.0);
-    # NO openmls_libcrux_crypto release uses it yet. Exposure: a peer's
-    # validly signed KeyPackage with a short init_key / encryption_key panics
-    # this node when it HPKE-encrypts to that key. Mitigation in this tree
-    # (src/mls/crypto_panic.rs): every KeyPackage ingress refuses a key that
-    # is not exactly the X-Wing public-key length, and every openmls call
-    # that can encrypt, decrypt, or decode a key runs under catch_unwind,
-    # surfacing CryptoPanic and restoring the group to its pre-call state.
-    # Remove when #822 lands the upgrade or the fork.
-    "RUSTSEC-2026-0330",  # libcrux-kem encapsulate_derand panic on short seed
-    "RUSTSEC-2026-0331",  # libcrux-kem hybrid public/private key decode panic on short input
-
     # rustls / webpki / DNS branch — transitive via ciris-verify-core's
     # verification stack. Persist's deny.toml documents the rationale;
     # edge inherits.
@@ -129,57 +114,17 @@ ignore = [
     # the icount harness migrates to gungraun (the post-rename iai successor).
     "RUSTSEC-2025-0141",  # bincode 1.3.3 unmaintained (dev-only, via iai-callgrind)
 
-    # 2026-07-17 — six same-day libcrux advisories, ALL from the ONE dep
-    # `openmls_libcrux_crypto v0.3.1` (RFC 9420 MLS backend, CIRISEdge#66) via
-    # hpke-rs-libcrux / libcrux-{aead,kem,ml-kem,sha3}. NONE reach the
-    # load-bearing federation path: `cargo tree -i` confirms every flagged crate
-    # roots only at openmls_libcrux_crypto, and it is the ONLY MLS provider that
-    # supports edge's PQC ciphersuite 0x004D (the rust_crypto provider panics on
-    # it), so the fix is an UPSTREAM openmls bump (libcrux-aesgcm was renamed to
-    # libcrux-aes 0.0.9 — a crate openmls 0.3.1 does not yet adopt; no in-place
-    # patch exists). Time-boxed until openmls_libcrux_crypto ships the renamed
-    # backend — tracked CIRISVerify#211 (crypto owner) + CIRISEdge#367.
-    "RUSTSEC-2026-0207",  # libcrux SHAKE incremental-squeeze incorrect output (openmls MLS only)
-    "RUSTSEC-2026-0208",  # libcrux AVX2 SHAKE-256 potential panic (openmls MLS only)
-    "RUSTSEC-2026-0209",  # libcrux AES-GCM AAD-length limit (openmls MLS only)
-    "RUSTSEC-2026-0210",  # libcrux-aesgcm renamed→libcrux-aes / unmaintained (openmls MLS only)
-    "RUSTSEC-2026-0211",  # libcrux AES-GCM non-constant-time tag check (openmls MLS only)
-    "RUSTSEC-2026-0212",  # libcrux constant-time swap/select on aarch64 (openmls MLS only)
-
     # v3.0.0 (CIRISEdge#89) — the pyo3 0.28 → 0.29 family lockstep
     # landed. RUSTSEC-2026-0176 + RUSTSEC-2026-0177 are GONE from the
     # tree (pyo3 0.29 ships both fixes); the ignores that lived here
     # since v2.1.1 are removed. If `cargo deny check advisories`
     # surfaces either again, something regressed the substrate pin.
 
-    # v3.8.0 (CIRISEdge#66 / PR #131) — openmls 0.8.1 + libcrux
-    # ciphersuite 0x004D (MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519,
-    # X-Wing PQ-hybrid). Cryspen's libcrux family has four open
-    # advisories — all non-exploitable in our usage pattern; each
-    # ignore documents why.
-    "RUSTSEC-2026-0124",  # libcrux-chacha20poly1305: panic when
-    # `encrypt(ptxt, ciphertext_buffer)` is called with
-    # `ciphertext_buffer.len() > ptxt.len() + TAG_LEN`. NOT exploitable
-    # in our tree: openmls's libcrux-backed AEAD wrapper sizes the
-    # output buffer at exactly `ptxt.len() + TAG_LEN`; the buffer
-    # length is never attacker-controlled at our wire layer. The
-    # realtime_av path uses ring-backed AES-256-GCM (not libcrux's
-    # ChaCha20-Poly1305); the libcrux ChaCha lane runs only inside
-    # openmls's internal HPKE wrap for the X-Wing combiner.
-    "RUSTSEC-2026-0075",  # libcrux-ed25519 keygen samples Ed25519
-    # secret keys in a loop for ≤100 attempts; on catastrophic CSPRNG
-    # failure (100 consecutive zero samples) it silently continues
-    # with an all-zero key. P(100 zero samples | working CSPRNG)
-    # ≈ 2^-2000. OS-level CSPRNG failure is the threat model edge
-    # already addresses at the federation_session layer via
-    # ciris-crypto's RNG fail-secure latch (CIRISVerify #74, v5.6.0
-    # RC7). The libcrux-ed25519 keygen here is openmls-internal MLS
-    # signature key minting, not edge's federation signing path.
-    "RUSTSEC-2026-0073",  # libcrux-poly1305 standalone MAC panic
-    # via incorrect key-length constant. Per the advisory's own
-    # impact note: "use of libcrux-poly1305 in libcrux-chacha20poly1305
-    # is unaffected." We use it only via openmls's internal HPKE
-    # wrap (libcrux-chacha20poly1305 path), never as a standalone MAC.
+    # The libcrux advisories once ignored here (RUSTSEC-2026-0073/0075/0124,
+    # 0207-0212) and RUSTSEC-2026-0330/0331 (libcrux-kem X-Wing short-input
+    # panic) are GONE: CIRISEdge#822 moved openmls_libcrux_crypto onto
+    # hpke-rs 0.8 / libcrux-kem 0.0.10 (the CIRISAI/openmls fork Cargo.toml
+    # declares). If any resurfaces, the fork pin regressed.
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained.
     # Build-time dev-dep only (procedural-macro support crate); ships
     # in zero production binaries. Pulled transitively via openmls's
@@ -224,4 +169,7 @@ allow-git = [
     # by exact rev pin in Cargo.toml; ships as the Reticulum transport
     # substrate's canonical wire.
     "https://github.com/CIRISAI/leviculum",
+    # CIRISEdge#822 — openmls_libcrux_crypto 0.3.1+ciris.1 (hpke-rs 0.8 /
+    # libcrux-kem 0.0.10 backport for openmls 0.8.1), edge's direct git dep.
+    "https://github.com/CIRISAI/openmls",
 ]
