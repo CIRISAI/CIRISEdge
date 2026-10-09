@@ -7,37 +7,50 @@ v53.1.8, verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged.
 Ladder triple: **edge v40.0.12 · persist v53.1.8 · verify v19.0.0**.
 
 **v40.0.10 and v40.0.11 have no release.** Their tags exist; neither tag run published.
-- v40.0.10 failed the #425 scanner `inbound_exits_are_instrumented_or_marked` (a bare `return;`
-  after a test seam in the `LinkClosed` arm). v40.0.11 marked it and carries all of v40.0.10.
-- v40.0.11 failed on the burst witness (`transfer in progress`). That was a real race from
-  #532/#819, which v40.0.11's no-trim-on-release exposed by making lane reuse far more common:
-  `dial_and_identify` published a fresh lane into the pool UNCLAIMED, a concurrent send took it in
-  the gap, the dialler's claim failed, and `send` shipped anyway — two Resources on one link.
+v40.0.10 failed the #425 scanner `inbound_exits_are_instrumented_or_marked` (a bare `return;` after
+a test seam in the `LinkClosed` arm); v40.0.11 marked it and carries all of v40.0.10. v40.0.11's
+tag run failed the pool burst witness (`tests/link_pool_819.rs`, "transfer in progress") on the
+dial-publish race this cut fixes. v40.0.12 carries all of v40.0.11; read that section (and
+v40.0.10's) for the four reaper review fixes, the pool-churn changes and the responder telemetry.
 
-v40.0.12 carries all of v40.0.10 and v40.0.11 (read their sections for the responder-side inbound
-reap, the link-direction gauges and the four reaper review fixes), plus:
+## A dialled lane is published claimed (#853)
 
-## The dial-publish race is closed (#853, from #859)
+A fresh dial put its lane into the pool unclaimed, and the send that dialled it claimed it only
+after the dial returned. A concurrent send could take the lane in that gap, and the dialler then
+shipped on it anyway, so two Resources rode one link (leviculum `TransferInProgress`). v40.0.11
+stopped trimming the pool on release, so lanes are reused far more, which exposed the race at 14
+concurrent sends.
+- **The fix:** a dial marks its lane in use before publishing it and hands that claim to its
+  sender. A lane taken from the pool comes back already claimed too. A send always holds the claim
+  of the lane it ships on.
+- **Cancellation during the dial:** if the waiting send is cancelled while the dial runs, the claim
+  is released when the dial finishes. This also closes v40.0.11's leak of a lane reserved by a send
+  cancelled during the dial wait.
+- **The scoped-lease path:** it now refuses rather than ships if its claim fails, counted in
+  `unclaimed_ship_refused_total`. That is unreachable by construction, so a non-zero value is a
+  regression.
+- **Witnesses:** `a_dialled_lane_is_published_claimed_853` is new.
+  `a_cancelled_send_gives_its_lane_back_853` no longer depends on timing: a test seam holds the
+  ship inside its claim. With the old behaviour the burst witness fails every time.
 
-- A dialled lane is marked in flight BEFORE it is published, and the dialler holds its
-  `LinkClaim`. `send` always holds the claim of the lane it ships on; the "claim lost, ship
-  anyway" path is gone. A send cancelled during the dial wait gives its lane back (the claim's
-  `Drop`), closing the reservation leak reported for v40.0.11.
-- `send_on_scoped_lease` refuses rather than ships when its claim fails, counted in
-  `unclaimed_ship_refused_total` (unreachable by construction; loud if a regression reaches it).
-- Witnesses `a_dialled_lane_is_published_claimed_853` (new) and
-  `a_cancelled_send_gives_its_lane_back_853` (now deterministic); the burst witness fails
-  deterministically with the publish left unclaimed.
+## A link whose `LinkEstablished` was lost is recovered (from #859)
 
-## Links the canonical loses under load are recovered (#853, from #859)
+When a full control plane drops a `LinkEstablished`, edge never recorded the link, so it was never
+reaped, counted or gauged. Its bookkeeping is now rebuilt from its next `LinkIdentified` or frame:
+inbound unless this node dialled it, with its idle clock starting then. It is counted in
+`recovered_links_total`, where a non-zero value means establish events are being lost. Witness
+`a_link_whose_establish_event_was_lost_is_recovered_and_reaped_854`.
 
-- A link whose `LinkEstablished` the control plane dropped never entered the direction table, so
-  it was never reaped, counted or gauged — the #853 leak at exactly the moment of load. Its next
-  `LinkIdentified` or frame now rebuilds its bookkeeping, counted in `recovered_links_total`.
-  Witness `a_link_whose_establish_event_was_lost_is_recovered_and_reaped_854`.
-- A straggler resource `Started`/`Progress` (droppable data plane) arriving after its own
-  completion no longer re-marks the link busy for the 30 s stall window. Witness
-  `a_straggler_progress_after_completion_is_recognised_853`.
+## A straggler transfer event cannot revive a finished transfer (from #859)
+
+leviculum delivers resource progress on its droppable data plane and completion on its control
+plane, so a progress tick can arrive after its own completion. That re-marked the link busy for the
+30 s stall window and delayed both reaps. Concluded transfers are now remembered and late ticks for
+them ignored. This was found as a 1-in-4 witness flake; it is the likely cause, not a proven one.
+Witness `a_straggler_progress_after_completion_is_recognised_853`.
+
+Both new counters, `recovered_links_total` and `unclaimed_ship_refused_total`, are in both
+bindings.
 
 ## A fresh node parks what it cannot verify, once, and the host releases it after a claim (#858)
 
