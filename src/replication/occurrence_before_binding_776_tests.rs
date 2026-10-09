@@ -476,11 +476,16 @@ async fn the_release_kicks_a_re_ask_of_the_peer_that_offered_the_row_776() {
     rt_d.shutdown().await;
 }
 
-/// No kick loop: a refusal whose signer IS bound was about something else —
-/// it waits on the ordinary window and is never indexed on the signer, so no
-/// later binding admission can release-and-kick it.
+/// No kick loop, and no WARN per round (CIRISEdge#858 fix 4): a refusal whose
+/// signer IS held and bound was about something else. Since #858 it is indexed
+/// on its signer in every case (before, only an UNBOUND signer was, and a bound
+/// one rode the transient ladder — ~12 asks and 12 WARNs an hour, forever):
+/// its first refusal keeps the transient window, its second earns the terminal
+/// schedule. It is released only by an ADMITTED binding or occurrence of that
+/// signer — never by a duplicate re-delivery of the binding it already has, so
+/// a peer re-pushing the binding cannot turn the index into a kick loop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refusal_whose_signer_is_bound_is_not_indexed_for_a_kick_776() {
+async fn a_refusal_whose_signer_is_bound_parks_terminally_and_no_duplicate_releases_it_776() {
     let owner = Ident::new("person-o-776n", 0x91);
     let dev = Ident::new("node-d-776n", 0x92);
     let watcher_owner = Ident::new("person-w-776n", 0x93);
@@ -503,7 +508,7 @@ async fn a_refusal_whose_signer_is_bound_is_not_indexed_for_a_kick_776() {
         .apply_envelope_bytes(EnvelopeKind::Attestation, &d_binding, Some(&d.me))
         .await;
     assert!(bound.is_admitted());
-    // A tampered occurrence from D: refused for its signature, not its binding.
+    // A tampered occurrence from D: refused for its envelope, not its binding.
     let mut v: serde_json::Value = serde_json::from_slice(&d_occ).expect("occurrence json");
     let env = v
         .get_mut("signed_envelope")
@@ -516,18 +521,49 @@ async fn a_refusal_whose_signer_is_bound_is_not_indexed_for_a_kick_776() {
         .apply_envelope_bytes(EnvelopeKind::IdentityOccurrence, &tampered, Some(&d.me))
         .await;
     assert!(
-        !refused.is_admitted(),
-        "the tampered occurrence is refused: {refused:?}"
+        matches!(
+            refused.retry_disposition(),
+            Some(crate::replication::RetryDisposition::Transient)
+        ),
+        "the tampered occurrence is refused, transient: {refused:?}"
     );
     assert_eq!(
         bridge.parked_on_signer_len(),
-        0,
-        "a bound signer's refusal is never indexed for a release kick"
+        1,
+        "a held signer's occurrence refusal is indexed on the signer (CIRISEdge#858)"
     );
-    if refused.retry_disposition().is_some() {
-        assert!(
-            bridge.retry_suppressed(EnvelopeKind::IdentityOccurrence, &hash),
-            "it waits on the ordinary window"
-        );
-    }
+    let backoff = bridge.refusal_backoff_for_test();
+    let past_transient = Instant::now()
+        + crate::replication::refusal_backoff::TRANSIENT_BASE
+        + Duration::from_secs(1);
+    assert!(
+        !backoff.suppressed_at(EnvelopeKind::IdentityOccurrence, &hash, past_transient),
+        "the first refusal keeps its transient window (the #776 standup race)"
+    );
+    // The second refusal earns the terminal schedule.
+    let again = bridge
+        .apply_envelope_bytes(EnvelopeKind::IdentityOccurrence, &tampered, Some(&d.me))
+        .await;
+    assert!(!again.is_admitted());
+    let past_transient_cap = Instant::now()
+        + crate::replication::refusal_backoff::TRANSIENT_CAP
+        + Duration::from_secs(60);
+    assert!(
+        backoff.suppressed_at(EnvelopeKind::IdentityOccurrence, &hash, past_transient_cap),
+        "from the second refusal the row is quiet on the TERMINAL schedule"
+    );
+    // A duplicate re-delivery of the binding releases nothing.
+    let dup = bridge
+        .apply_envelope_bytes(EnvelopeKind::Attestation, &d_binding, Some(&d.me))
+        .await;
+    assert!(
+        !dup.is_admitted(),
+        "the re-delivered binding is a duplicate"
+    );
+    assert_eq!(
+        bridge.signer_releases(),
+        0,
+        "a duplicate binding binds nothing new"
+    );
+    assert!(bridge.retry_suppressed(EnvelopeKind::IdentityOccurrence, &hash));
 }

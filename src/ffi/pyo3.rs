@@ -2498,6 +2498,12 @@ impl PyEdge {
     ///   # roster applies), "third_party_row" (AV-84 verdict about the row),
     ///   # "community_roster_fork" (two authorities, one community id).
     ///   "apply_refusals_by_class": {"retry_after_roster": 4, ...},
+    ///   # CIRISEdge#858 — the refusal memory's park ledger.
+    ///   "rows_parked_on_signer": {"identity_occurrence": 52, ...},
+    ///   "signer_releases": 3, "retry_suppressions": 410,
+    ///   "signer_park_evictions": 0,
+    ///   "refusal_memory_len": 61, "refusal_memory_capacity": 69632,
+    ///   "parked_on_signer_len": 54, "parked_on_signer_capacity": 65536,
     /// }
     /// ```
     ///
@@ -3052,6 +3058,25 @@ fn metrics_bundle_to_pydict<'py>(
     }
     root.set_item("responder_link_up_total", link_up_total)?;
     root.set_item("recovered_links_total", bundle.recovered_links_total)?;
+    // CIRISEdge#858 — the refusal memory's park ledger: rows parked on a
+    // signer per plane (since start), rows released, wanted hashes the memory
+    // dropped, parks evicted by the park capacity, and the memory's size
+    // against its bounds.
+    let parked = pyo3::types::PyDict::new(py);
+    for (kind, v) in &bundle.rows_parked_on_signer {
+        parked.set_item(kind.as_wire_str(), *v)?;
+    }
+    root.set_item("rows_parked_on_signer", parked)?;
+    root.set_item("signer_releases", bundle.signer_releases)?;
+    root.set_item("retry_suppressions", bundle.retry_suppressions)?;
+    root.set_item("signer_park_evictions", bundle.signer_park_evictions)?;
+    root.set_item("refusal_memory_len", bundle.refusal_memory_len)?;
+    root.set_item("refusal_memory_capacity", bundle.refusal_memory_capacity)?;
+    root.set_item("parked_on_signer_len", bundle.parked_on_signer_len)?;
+    root.set_item(
+        "parked_on_signer_capacity",
+        bundle.parked_on_signer_capacity,
+    )?;
     root.set_item(
         "unclaimed_ship_refused_total",
         bundle.unclaimed_ship_refused_total,
@@ -3275,6 +3300,59 @@ impl PyReplicationHandle {
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
             })
         })
+    }
+
+    /// CIRISEdge#858 — release every row this node parked on `key_id` (a row
+    /// it could not verify because `key_id`'s Key was absent, or because
+    /// `key_id` did not yet act for the identity it signed for) and ask the
+    /// peers that offered them again now. Returns how many rows were released.
+    ///
+    /// Call it after ANY local key registration (`key_id` = the registered
+    /// key) and after an owner-binding write on a claim (the owner's key and
+    /// the bound node's — or use `release_bound_signer` with the binding's
+    /// bytes). Those writes bypass the replication apply path that releases a
+    /// park on its own, so without the call the rows wait out their terminal
+    /// window (up to 6 h). Idempotent; returns 0 after `stop()`.
+    fn release_signer(&self, py: Python<'_>, key_id: &str) -> usize {
+        let key_id = key_id.to_owned();
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        py.detach(|| {
+            run_async(&executor, async move {
+                inner
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map_or(0, |rt| rt.release_signer(&key_id))
+            })
+        })
+    }
+
+    /// CIRISEdge#858 — `release_signer` for a row the host just wrote
+    /// locally, given as its wire bytes on plane `kind` (e.g. `"attestation"`
+    /// for the signed owner binding a claim writes): releases the rows waiting
+    /// on the signer the row binds AND on the key that signed it. Returns how
+    /// many rows were released; 0 after `stop()`. Raises `ValueError` for an
+    /// unknown kind.
+    fn release_bound_signer(
+        &self,
+        py: Python<'_>,
+        kind: &str,
+        envelope_bytes: &[u8],
+    ) -> PyResult<usize> {
+        let kind = parse_envelope_kind(kind)?;
+        let envelope_bytes = envelope_bytes.to_vec();
+        let inner = self.inner.clone();
+        let executor = self.executor.clone();
+        Ok(py.detach(|| {
+            run_async(&executor, async move {
+                inner
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map_or(0, |rt| rt.release_bound_signer(kind, &envelope_bytes))
+            })
+        }))
     }
 
     /// CIRISEdge#794 — every peer this node's anti-entropy has backed off
@@ -12143,6 +12221,47 @@ mod pyo3_tier2_tests {
             Ok(())
         })
         .expect("link readbacks");
+    }
+
+    /// CIRISEdge#858 — `metrics_snapshot()` carries the park ledger, read
+    /// from the SAME bag the replication bridge books into (`Edge::metrics()`,
+    /// which `start_replication` hands the runtime).
+    #[test]
+    fn metrics_snapshot_carries_the_park_ledger_858() {
+        init_python();
+        let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
+        let read = |py_edge: &PyEdge| -> (u64, u64, u64, u64, u64, u64) {
+            Python::attach(|py| -> PyResult<(u64, u64, u64, u64, u64, u64)> {
+                let snap = py_edge.metrics_snapshot(py)?;
+                let bound = snap.bind(py);
+                let parked: u64 = bound
+                    .get_item("rows_parked_on_signer")?
+                    .get_item("identity_occurrence")
+                    .and_then(|v| v.extract())
+                    .unwrap_or(0);
+                Ok((
+                    parked,
+                    bound.get_item("signer_releases")?.extract()?,
+                    bound.get_item("retry_suppressions")?.extract()?,
+                    bound.get_item("refusal_memory_len")?.extract()?,
+                    bound.get_item("parked_on_signer_len")?.extract()?,
+                    bound.get_item("parked_on_signer_capacity")?.extract()?,
+                ))
+            })
+            .expect("metrics_snapshot")
+        };
+        assert_eq!(read(&py_edge), (0, 0, 0, 0, 0, 0));
+        let m = py_edge.inner.metrics();
+        m.inc_rows_parked_on_signer(crate::replication::EnvelopeKind::IdentityOccurrence);
+        m.add_signer_releases(2);
+        m.inc_retry_suppressions();
+        m.set_refusal_memory(crate::observability::RefusalMemoryGauges {
+            len: 4,
+            capacity: 8,
+            parked_on_signer_len: 3,
+            parked_on_signer_capacity: 6,
+        });
+        assert_eq!(read(&py_edge), (1, 2, 1, 4, 3, 6));
     }
 
     /// v0.19.5 (CIRISEdge#50) — `metrics_snapshot()["durable_queue_depth"]`

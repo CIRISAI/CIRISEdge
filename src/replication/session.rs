@@ -41,6 +41,23 @@ use super::protocol::{
 };
 use super::retention::{retention_for, Retention};
 use super::summary::{diff_refs, ApplyOutcome, StalenessSignal, StateApplier, StateProvider};
+use crate::log_throttle::{LogThrottle, ThrottleDecision};
+
+/// CIRISEdge#858 — the apply choke's refusal WARN: one line per (plane,
+/// signer) per [`TERMINAL_BASE`](super::refusal_backoff::TERMINAL_BASE), the
+/// window of the park those refusals end in. Process-global, like every
+/// `LogThrottle` site: it bounds the log, and the log is per process. Keyed on
+/// a peer-influenced signer id, so the key map is capped.
+fn refusal_log() -> &'static LogThrottle {
+    static THROTTLE: std::sync::OnceLock<LogThrottle> = std::sync::OnceLock::new();
+    THROTTLE.get_or_init(|| {
+        LogThrottle::new(
+            1,
+            super::refusal_backoff::TERMINAL_BASE,
+            super::refusal_backoff::DEFAULT_MAX_KEYS,
+        )
+    })
+}
 
 /// What role a session is playing in this round. Initiator emits
 /// the first Summary; Responder waits for one.
@@ -1128,19 +1145,45 @@ impl Session {
                     // question. Deliberately keyed on the DISPOSITION, not on
                     // the reason prose — consumers key on stable tokens, and a
                     // spurious note costs one deduped lookup at the drain.
+                    let signer =
+                        crate::replication::missing_signer::missing_signer_of(self.kind, env_bytes);
                     if !retry.is_terminal() {
-                        if let Some(signer) = crate::replication::missing_signer::missing_signer_of(
-                            self.kind, env_bytes,
-                        ) {
-                            provider.note_missing_signer(self.kind, &signer, source_peer);
+                        if let Some(signer) = &signer {
+                            provider.note_missing_signer(self.kind, signer, source_peer);
                         }
                     }
-                    tracing::warn!(
-                        kind = ?self.kind,
-                        reason = %reason,
-                        retry = retry.as_str(),
-                        "delivered envelope REFUSED — not applied (CIRISEdge#425 apply choke point)"
-                    );
+                    // CIRISEdge#858 — ONE WARN per (plane, signer) per window,
+                    // repeats at DEBUG. A fresh node refuses the same signer's
+                    // rows on every round and every proactive push until the
+                    // signer's Key or standing lands; a WARN per row per round
+                    // drowned the log in the field. The signer comes from the
+                    // bytes (the same pure extractor as the note above), and a
+                    // row that names none is keyed on its disposition — never
+                    // on the reason prose.
+                    let throttle_key = match &signer {
+                        Some(s) => format!("{}:{s}", self.kind.as_wire_str()),
+                        None => format!("{}:{}", self.kind.as_wire_str(), retry.as_str()),
+                    };
+                    match refusal_log().check(&throttle_key) {
+                        ThrottleDecision::Emit { suppressed_prev } => tracing::warn!(
+                            kind = ?self.kind,
+                            signer = signer.as_deref().unwrap_or("<none>"),
+                            reason = %reason,
+                            retry = retry.as_str(),
+                            suppressed_prev,
+                            "delivered envelope REFUSED — not applied (CIRISEdge#425 apply choke \
+                             point); further refusals naming this signer on this plane log at \
+                             DEBUG for the next 30 min (CIRISEdge#858)"
+                        ),
+                        ThrottleDecision::Suppress => tracing::debug!(
+                            kind = ?self.kind,
+                            signer = signer.as_deref().unwrap_or("<none>"),
+                            reason = %reason,
+                            retry = retry.as_str(),
+                            "delivered envelope REFUSED — not applied (a repeat for this signer \
+                             inside the window; CIRISEdge#858)"
+                        ),
+                    }
                 }
                 ApplyOutcome::Deserialize(err) => {
                     refused += 1;

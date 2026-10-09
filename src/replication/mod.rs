@@ -141,6 +141,8 @@ pub mod no_route_backoff;
 mod no_route_backoff_794_tests;
 #[cfg(test)]
 mod occurrence_before_binding_776_tests;
+#[cfg(test)]
+mod park_fresh_858_tests;
 pub mod protocol;
 pub mod refusal_backoff;
 pub mod registry;

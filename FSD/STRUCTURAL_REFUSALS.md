@@ -59,7 +59,24 @@ either observability or a wire change, and is classified below as such.
   `RefusalBackoff::record_waiting_on_at(kind, hash, signer)`. The park installs the **terminal**
   schedule (`1800 s → 6 h` cap; never silence) and indexes the row under the signer.
 - if the outcome is a **`Key` admit or duplicate** → **release** every row parked on that key:
-  `RefusalBackoff::release_signer(key_id)`. The next round's `want` asks for them at once.
+  `RefusalBackoff::release_signer(key_id)`. The next round's `want` asks for them at once, and
+  the release kicks a round toward the peer that offered each row (CIRISEdge#858).
+- CIRISEdge#858 — the park is booked on the refusal the choke ALREADY recorded
+  (`RefusalBackoff::park_booked_at`), so the first park window is `TERMINAL_BASE` (1800 s). Before
+  #858 the park counted the one refusal twice and the first window was 3600 s.
+- CIRISEdge#858 — if the outcome is a transient **identity-occurrence** refusal whose signer this
+  directory **holds** (`signer S is neither identity I nor an active occurrence of it, nor a node it
+  owns`, a legacy `asserted_at` divergence, a bad signature), the row is **indexed on that signer in
+  every case** (`RefusalBackoff::index_held_signer_at`): its first refusal keeps the transient
+  window (the #776 standup race clears in seconds), and from its second it is quiet on the terminal
+  schedule. It is released by the ADMITTED owner binding or occurrence that makes the signer act
+  for the identity (#776) — admitted only: a duplicate re-delivery of a binding binds nothing new.
+- CIRISEdge#858 — **the host's release hook.** A dependency written LOCALLY (a key registration;
+  the server's `apply_signed_owner_binding` on a claim) bypasses the choke and releases nothing on
+  its own. The host calls `release_signer(key_id)` after any local key registration, and
+  `release_bound_signer(kind, envelope_bytes)` after writing a binding or occurrence (it releases
+  the signer the row binds and the key that signed it), on the bridge, `ReplicationRuntime` and the
+  PyO3 `ReplicationHandle`.
 
 Why the sender is told nothing: it never chose. The Summary it sends is its full offer; the
 receiver's `want` is the only thing that puts bytes on the wire (`Deliver` packs `want`). Quieting
@@ -71,15 +88,28 @@ strictly better served: the key's admit **releases** the row on the next round i
 row re-asking on a 20/40/80 s ladder hoping to land after it. A park costs ≤ ~4 asks/day per row
 if the key never lands; the un-parked loop cost 12/hour.
 
-**Bounds.** The park lives in the same front-drop-capped memory (`DEFAULT_MAX_KEYS = 4096`, the
-`LogThrottle` cure); the signer index is kept in lockstep with entries (`clear`, eviction,
-re-park). Eviction costs one re-ask. Restart empties it (a restart is the one event that can
-change a verdict without a row moving — a new build, a re-wired provider).
+**Bounds.** Two front-drop rings (the `LogThrottle` cure): ordinary #544 windows
+(`DEFAULT_MAX_KEYS = 4096`) and rows parked on a signer (`DEFAULT_MAX_PARKED = 65,536`,
+CIRISEdge#858). Before #858 one 4096 ring held both, and the Attestation plane's ordinary refusals
+front-dropped a fresh node's occurrence parks, which then came straight back into `want`. An
+ordinary refusal can no longer evict a park; a park evicted by the park ring is counted
+(`signer_park_evictions`) and WARNed once per window. The signer index is kept in lockstep with
+entries (`clear`, eviction, re-park, release). Eviction costs one re-ask. Restart empties it (a
+restart is the one event that can change a verdict without a row moving — a new build, a re-wired
+provider); each still-absent row is then refused once and re-parked.
 
-**Ledger tokens.** `rows_parked_on_signer` (parks since construction) and `signer_releases`
-(rows released by a `Key` admit) on the bridge, beside `retry_suppressions`; the park logs at
-DEBUG (the refusal itself already WARNs at the choke with reason + disposition) with
-`signer`, `backoff_secs`, `parked`; the release logs at INFO with `signer`, `released`.
+**Ledger tokens.** CIRISEdge#858 — in `EdgeMetrics` / the metrics snapshot / PyO3
+`metrics_snapshot()` / the UniFFI `metrics_snapshot` counters (they were bridge accessors only
+before #858, invisible to every scrape): `rows_parked_on_signer{kind}` (parks since start),
+`signer_releases` (rows released by a `Key` admit, a binding admit or the host hook),
+`retry_suppressions` (wanted hashes the memory dropped), `signer_park_evictions`, and the gauges
+`refusal_memory_len` / `refusal_memory_capacity` / `parked_on_signer_len` /
+`parked_on_signer_capacity`. Logs: the choke's refusal WARN is **one line per (plane, signer) per
+30 min** (keyed on the signer the bytes name, or on the disposition when they name none; repeats
+at DEBUG; the next line carries `suppressed_prev`); the park writes **one INFO per signer per
+window** — "parked N rows on absent Key K", and on a node no owner binding names, "this node is
+UNCLAIMED … rows attested by keys it has not met wait here until a claim or the Key arrives"; the
+release logs at INFO with `signer`, `released`, `kicked`.
 `apply_refusals_by_kind` is **not** changed: it still counts the first refusal of each row. What
 stops is the *repeat* — the pollution the issue names is the 2nd…Nth refusal of the same bytes,
 and those no longer happen, because the bytes are no longer asked for.
@@ -173,7 +203,7 @@ memory) and **holding**.
 | # | Receiver: holds? | Receiver memory | Receiver `want` | Sender `Deliver` | Wire cost / round | Leaves by |
 |---|---|---|---|---|---|---|
 | S0 | no | none | asks | delivers | 1 body | admit → S4; refuse → S1/S2/S3 |
-| S1 | no | transient window (20 s → 5 min) | asks after window | delivers | ≤ 12/h | admit → S4; signer absent → S3; terminal → S2 |
+| S1 | no | transient window (20 s → 5 min) | asks after window | delivers | ≤ 12/h | admit → S4; signer absent → S3; terminal → S2; **3 windows at the 5 min cap with no named dependency → S2** (#858) |
 | S2 | no | terminal window (30 min → 6 h) | asks after window | delivers | ≤ 2/h → ~4/day | admit → S4; window → S0 |
 | **S3** | no | **parked on `Key <signer>`** (terminal schedule + index) | quiet | — | 0 until window (≤ 2/h → ~4/day), **0 wire-side deliveries otherwise** | **`Key <signer>` admits → S0 on the next round**; window elapses → S0 (re-ask, re-park if still absent); eviction → S0 |
 | S4 | yes | cleared | — | — | 0 | never re-offered (diff drops it) |
@@ -193,8 +223,13 @@ named S2 with an early exit. Row P is why nothing here can withhold state.
 | I3 | Parks are bounded and the signer index never outlives its entry (clear, eviction, re-park). | `refusal_backoff::tests_679::clear_and_eviction_keep_the_signer_index_in_lockstep`, `…a_re_park_moves_the_index_and_keeps_doubling` |
 | I4 | A row parked on signer A is untouched by signer B's admit; release is idempotent. | `refusal_backoff::tests_679::rows_parked_on_a_signer_stay_quiet_until_that_signer_is_released` |
 | I5 | The park never classifies: dispositions, `ApplyRefusalClass` and the Key-plane mapping are unchanged. | I1 asserts the outcome is still `Transient`; `conflicting_version_is_terminal_and_the_ambiguous_key_reasons_stay_transient` unchanged |
-| I6 | A transient refusal whose named signer **is** held (a roster/race refusal) keeps the ordinary #544 window — no park. | by construction (`lookup_public_key == Some` returns before the park); `a_community_scoped_row_ahead_of_its_roster_refuses_as_named_transient` still reads transient with no park counter movement |
+| I6 | A transient refusal whose named signer **is** held (a roster/race refusal) keeps the ordinary #544 window — no park — on every plane but the occurrence plane (I9). | by construction (`lookup_public_key == Some` returns before the park); `a_community_scoped_row_ahead_of_its_roster_refuses_as_named_transient` still reads transient with no park counter movement |
 | I7 | An unsolicited push of parked bytes is applied on its merits. | `a_suppressed_row_is_still_applied_when_a_peer_pushes_it_anyway` (#544; unchanged) |
+| I8 | The first park window is `TERMINAL_BASE`; a host's `release_signer` after a LOCAL key write releases the park at once. | `park_fresh_858_tests` (e); `refusal_backoff::tests_679::a_booked_refusal_parks_on_the_first_terminal_window_858` |
+| I9 | A transient occurrence refusal with a held signer is indexed on it; terminal from attempt 2; only an ADMITTED binding/occurrence releases it. | `park_fresh_858_tests` (b); `occurrence_before_binding_776_tests::a_refusal_whose_signer_is_bound_parks_terminally_and_no_duplicate_releases_it_776` |
+| I10 | Ordinary refusals never evict a park. | `park_fresh_858_tests` (f); `refusal_backoff::tests_679::ordinary_refusals_never_evict_a_park_858` |
+| I11 | One refusal WARN per (plane, signer) per window; one park line per signer per window; the park ledger is in the metrics snapshot. | `park_fresh_858_tests` (c), (g), (h) |
+| I12 | A transient refusal with no named dependency leaves the transient ladder after 3 windows at its cap (S1 → S2). | `park_fresh_858_tests` (b); `refusal_backoff::tests_679::a_transient_refusal_stuck_at_the_cap_moves_to_the_terminal_schedule_858` |
 
 ---
 
@@ -208,11 +243,16 @@ named S2 with an early exit. Row P is why nothing here can withhold state.
   bytes the receiver refuses — and a refused row is by definition one the receiver would not
   admit. A corrected, superseding record is different bytes → a different hash → never parked.
 - **Can the park mask a key that later lands through a path other than the choke?** A `Key`
-  written locally (`put_public_key` by the host, a genesis seed) does not pass the choke and does
-  not release. The row is then re-asked when its terminal window elapses (≤ 6 h) and admits. This
-  is the same bound #544 accepts for terminal rows; if the host wants the early exit it calls the
-  same `release_signer` after a local registration (a one-line host follow-up, not a wire
-  concern).
+  written locally (`put_public_key` by the host, a genesis seed, a claim's owner Key) does not pass
+  the choke and does not release by itself. Without the host hook the row is re-asked when its
+  terminal window elapses (≤ 6 h) and admits; with it (`release_signer` / `release_bound_signer`,
+  CIRISEdge#858) the row is re-asked at once. The field case (#858): a fresh, unclaimed node holds
+  no owner Key, so its owner's earlier occurrences park; the claim writes the Key and the binding
+  locally, and the server's call to the hook is what lets them admit on the next round.
+- **Can a peer make the park ring forget real parks?** It can fill it, with junk signed by keys
+  this node never met: each costs the peer a delivered row and a refusal, and the ring holds 65,536.
+  An evicted park costs one re-ask, is counted (`signer_park_evictions`) and is WARNed once per
+  window. Ordinary refusals cannot evict parks at all (I10).
 - **Enumeration via ask 1.** A `Refused` that named the missing key would tell a sender which
   keys the receiver lacks. Hash + tokens only (§1, ask 1). Deferred anyway.
 - **Amplification via ask 1.** One `Refused` per `Deliver`, bounded by the `Deliver` it answers;
@@ -240,5 +280,11 @@ On the canonical's logs over 6 h after adopting this cut:
 - **Ask 1** as wire version `0x04` at the next `SERVE_ADVERTISE_POLICY_HASH` re-pin (§1).
 - **#459** — adopt persist's typed `AttestationRefusalReason`; when it lands, the park keys on
   the typed `attester unknown` reason *and* the absence read (I5 stays true).
-- Host follow-up: call `release_signer` after a local `put_public_key` so a locally registered
-  signer releases its parked rows without waiting for the terminal window (§4).
+- ~~Host follow-up: call `release_signer` after a local `put_public_key`~~ — the hook ships in
+  CIRISEdge#858 (bridge, `ReplicationRuntime`, PyO3 `ReplicationHandle`); what remains is the
+  host's CALL: CIRISServer after every local key registration and after
+  `apply_signed_owner_binding` (§4).
+- CIRISEdge#858 items 7–10 (main, persist v54): classify persist's typed `attester_key_unknown`
+  (park) vs `signature_invalid` (terminal) (CIRISPersist#1042); adopt the serve filter for rows
+  that can never verify (CIRISPersist#1043); offer an occurrence only when its attester is in the
+  Key relay set (the dependency closure on the serve side).
