@@ -1417,6 +1417,9 @@ pub struct EdgeMetrics {
     /// (dropped at a full control plane) and whose bookkeeping was rebuilt from
     /// a later per-link event. Non-zero means establish events are being lost.
     pub recovered_links_total: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#853 — ships refused because their lane was already claimed by
+    /// another transfer. Unreachable by construction; non-zero is a regression.
+    pub unclaimed_ship_refused_total: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A `&'static str`-keyed counter map, cloned out with owned keys for the
@@ -2080,6 +2083,19 @@ impl EdgeMetrics {
     pub fn inc_recovered_links(&self) {
         self.recovered_links_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 — a ship refused on a lane another transfer holds.
+    pub fn inc_unclaimed_ship_refused(&self) {
+        self.unclaimed_ship_refused_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 — read `unclaimed_ship_refused_total`.
+    #[must_use]
+    pub fn unclaimed_ship_refused_total(&self) -> u64 {
+        self.unclaimed_ship_refused_total
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// CIRISEdge#853 — read `recovered_links_total`.

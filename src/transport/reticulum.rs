@@ -2287,6 +2287,12 @@ pub struct ReticulumTransport {
     /// CIRISEdge#853 test seam — see
     /// [`ReticulumTransport::delay_channel_sends_for_test`]. 0 in production.
     test_channel_delay_ms: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_resource_ships_for_test`]. 0 in production.
+    test_ship_delay_ms: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_dial_publish_for_test`]. 0 in production.
+    test_publish_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Optional out-of-band directory-backed resolver. When `None`,
     /// only the authenticated announce cold-start path is available.
     resolver: Option<Arc<dyn PeerResolver>>,
@@ -2870,14 +2876,14 @@ impl ReticulumTransport {
             reusable_dialed_link: Arc::clone(&self.reusable_dialed_link),
             pool_last_used: Arc::clone(&self.pool_last_used),
             link_in_flight: Arc::clone(&self.link_in_flight),
+            test_publish_delay_ms: Arc::clone(&self.test_publish_delay_ms),
         }
     }
 
-    /// Delegates to [`DialCtx::reusable_link_to`] — the pool lives on the ctx
-    /// now, but every existing caller keeps its shape. CIRISEdge#819: the
-    /// returned link is RESERVED (in flight) for the caller, who must release
-    /// it.
-    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
+    /// Delegates to [`DialCtx::reusable_link_to`]. CIRISEdge#819: the returned
+    /// lane is RESERVED (in flight) for the caller; CIRISEdge#853: as a
+    /// [`LinkClaim`], released on every exit, cancellation included.
+    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkClaim> {
         self.dial_ctx().reusable_link_to(dest).await
     }
 
@@ -3450,6 +3456,8 @@ impl ReticulumTransport {
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
             test_force_busy: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             test_channel_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            test_ship_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            test_publish_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             resolver,
             rooting,
             hybrid_policy,
@@ -3919,7 +3927,9 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub async fn take_pooled_link_for_test(&self, peer: &str) -> Option<[u8; 16]> {
         let dest = self.resolve_peer(peer).await?.dest_hash;
-        self.reusable_link_to(&dest).await.map(LinkId::into_bytes)
+        self.reusable_link_to(&dest)
+            .await
+            .map(|claim| claim.keep().into_bytes())
     }
 
     /// CIRISEdge#819 test seam — end a transfer on `link`, exactly as `send`
@@ -4893,10 +4903,24 @@ impl ReticulumTransport {
                 "scoped Channel-first send stalled; trying the Resource path (CIRISEdge#739)"
             );
         }
-        let claim = self
-            .claim_link_for_transfer(link_id)
-            .await
-            .then(|| self.link_claim(link_id));
+        // CIRISEdge#853 — never ship on a lane another transfer holds: two
+        // Resources on one link is leviculum `TransferInProgress` for one of
+        // them. A lease is exclusive, so this is unreachable; if a regression
+        // makes it reachable it is a loud, counted refusal, not a collision.
+        if !self.claim_link_for_transfer(link_id).await {
+            if let Some(m) = self.metrics.get() {
+                m.inc_unclaimed_ship_refused();
+            }
+            tracing::warn!(
+                link = %hex::encode(link_id.as_bytes()),
+                "refusing to ship on a lane another transfer holds (CIRISEdge#853); \
+                 this path should be unreachable"
+            );
+            return Err(TransportError::Io(
+                "scoped lane already carries a transfer (CIRISEdge#853)".to_owned(),
+            ));
+        }
+        let claim = Some(self.link_claim(link_id));
         let shipped = self
             .ship_resource_on_link(
                 &link_id,
@@ -5186,6 +5210,24 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub fn delay_channel_sends_for_test(&self, ms: u64) {
         self.test_channel_delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 test seam — every Resource ship waits `ms` inside its
+    /// lane claim before sending, so a witness can cancel a send while it
+    /// provably holds its lane. 0 in production.
+    #[doc(hidden)]
+    pub fn delay_resource_ships_for_test(&self, ms: u64) {
+        self.test_ship_delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 test seam — a dial waits `ms` after publishing its lane
+    /// to the pool and before handing it to its sender: the window in which a
+    /// concurrent send could take a lane published unclaimed. 0 in production.
+    #[doc(hidden)]
+    pub fn delay_dial_publish_for_test(&self, ms: u64) {
+        self.test_publish_delay_ms
             .store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -6846,6 +6888,12 @@ impl ReticulumTransport {
         }
         // CIRISEdge#853 — busy for the inbound reaper until this returns.
         let _ship = OutboundShipGuard::new(&self.outbound_ship_active, *link_id);
+        let delay = self
+            .test_ship_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         // Auto-accept any resources the peer pushes back on this link
         // (e.g. an ACK envelope), and ship our envelope as a resource.
         let _ = self
@@ -7165,13 +7213,13 @@ impl Transport for ReticulumTransport {
         // CIRISEdge#819 — `reserved`: the lane came from the pool already
         // marked in flight for this send (see `DialCtx::reusable_link_to`).
         let reused = self.reusable_link_to(&peer.dest_hash).await;
-        let (link_id, reserved) = if let Some(existing) = reused {
+        let claim = if let Some(existing) = reused {
             tracing::trace!(
                 key_id = %destination_key_id,
-                link = ?existing,
+                link = ?existing.link_id(),
                 "reusing the live identified link to this peer (CIRISEdge#532)"
             );
-            (existing, true)
+            existing
         } else {
             // SINGLE-FLIGHT. Without this, N coordinators firing at the same
             // peer all observe "no link" and all dial — the establish:identify
@@ -7213,15 +7261,14 @@ impl Transport for ReticulumTransport {
                 if let Some(existing) = ctx.reusable_link_to(&peer_owned.dest_hash).await {
                     tracing::trace!(
                         key_id = %dkid,
-                        link = ?existing,
+                        link = ?existing.link_id(),
                         "another send established this peer's link while we waited on \
                          the dial gate — reusing it (CIRISEdge#532)"
                     );
-                    return Ok((existing, true));
+                    return Ok(existing);
                 }
                 ctx.dial_and_identify(&dkid, &peer_owned, has_path, establish_timeout)
                     .await
-                    .map(|id| (id, false))
             });
             dial.await
                 .map_err(|e| TransportError::Io(format!("dial task failed: {e}")))??
@@ -7238,9 +7285,11 @@ impl Transport for ReticulumTransport {
         // from the pool permanently while it sat there perfectly usable.
         // CIRISEdge#853 — and a CANCELLED send: the claim is a guard released
         // on drop (the responder's 60 s reply timeout cancels ships that may
-        // run 120 s), so a dropped future no longer retires the lane.
-        let claim = (reserved || self.claim_link_for_transfer(link_id).await)
-            .then(|| self.link_claim(link_id));
+        // run 120 s), so a dropped future no longer retires the lane. Both
+        // arms above return the lane ALREADY CLAIMED (a pool take reserves it;
+        // a dial publishes it claimed), so there is no unclaimed lane to ship
+        // on: the "claim lost, ship anyway" path is gone.
+        let link_id = claim.link_id();
         // A `Busy` collision here is not the reverse-path retry case, so both
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
@@ -7253,9 +7302,7 @@ impl Transport for ReticulumTransport {
                 RESOURCE_TRANSFER_TIMEOUT,
             )
             .await;
-        if let Some(claim) = claim {
-            claim.release().await;
-        }
+        claim.release().await;
         shipped.map_err(ShipError::into_transport)?;
 
         Ok(TransportSendOutcome::Delivered)
@@ -8144,6 +8191,18 @@ struct LinkClaim {
 }
 
 impl LinkClaim {
+    /// The lane this claim holds.
+    fn link_id(&self) -> LinkId {
+        self.link_id
+    }
+
+    /// Keep the lane claimed past this guard (a test seam that releases it
+    /// later by hand): disarm and hand back the id.
+    fn keep(mut self) -> LinkId {
+        self.armed = false;
+        self.link_id
+    }
+
     async fn release(mut self) {
         self.armed = false;
         self.in_flight.lock().await.remove(&self.link_id);
@@ -8283,9 +8342,23 @@ struct DialCtx {
     /// CIRISEdge#819 — see `ReticulumTransport::pool_last_used`.
     pool_last_used: Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
     link_in_flight: Arc<Mutex<HashSet<LinkId>>>,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_dial_publish_for_test`]. 0 in production.
+    test_publish_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DialCtx {
+    /// CIRISEdge#853 — a [`LinkClaim`] over a lane this ctx already marked in
+    /// flight.
+    fn link_claim(&self, link_id: LinkId) -> LinkClaim {
+        LinkClaim {
+            in_flight: Arc::clone(&self.link_in_flight),
+            last_used: Arc::clone(&self.pool_last_used),
+            link_id,
+            armed: true,
+        }
+    }
+
     /// CIRISEdge#739 — dial `dest_hash` (a scope-derived member address) and
     /// identify the link: the body `send_to_scoped_destination` ran inline
     /// before the scoped pool, unchanged in its steps — record the dialled
@@ -8427,7 +8500,7 @@ impl DialCtx {
         peer: &ResolvedPeer,
         has_path: bool,
         establish_timeout: Duration,
-    ) -> Result<LinkId, TransportError> {
+    ) -> Result<LinkClaim, TransportError> {
         // CIRISEdge#484 — leviculum v0.16 `connect_awaited` returns the handle
         // immediately AND a completion future for `LinkEstablished`, registered
         // BEFORE dispatch (edge no longer needs to observe the event loop `listen`
@@ -8536,15 +8609,31 @@ impl DialCtx {
         // bundle-served — the three things a reusing sender skips. Publishing
         // any earlier would hand another coordinator a link the responder will
         // drop frames on (`SkippedNoSourceKeyId`, #317/#340).
+        //
+        // CIRISEdge#853 — and publish it CLAIMED, for the send that dialled
+        // it. Published unclaimed, a concurrent send could take the lane from
+        // the pool in the gap before the dialler claimed it, and both shipped
+        // on one link (leviculum `TransferInProgress`). The claim rides back
+        // to the dialler as a `LinkClaim`; if the dialler was cancelled while
+        // it waited (the #568 detach), the task's output is dropped when the
+        // task finishes and the claim's `Drop` gives the lane back to the pool.
         stamp_pool_use(&self.pool_last_used, link_id);
+        self.link_in_flight.lock().await.insert(link_id);
+        let claim = self.link_claim(link_id);
         self.reusable_dialed_link
             .lock()
             .await
             .entry(peer.dest_hash)
             .or_default()
             .push(link_id);
+        let delay = self
+            .test_publish_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
 
-        Ok(link_id)
+        Ok(claim)
     }
 
     /// CIRISEdge#532 — the live, identified link we already hold to this dest,
@@ -8560,7 +8649,7 @@ impl DialCtx {
     /// the way out regardless, so this lookup is `(dest, Identity)` by
     /// construction AND by check, and a scoped link can never be handed to an
     /// identity-plane sender through this door either.
-    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
+    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkClaim> {
         let mut map = self.reusable_dialed_link.lock().await;
         let pool = map.get_mut(dest)?;
         // Drop links leviculum no longer holds, so a dead entry cannot occupy a
@@ -8592,7 +8681,7 @@ impl DialCtx {
             in_flight.insert(id);
             stamp_pool_use(&self.pool_last_used, id);
         }
-        picked
+        picked.map(|id| self.link_claim(id))
     }
 }
 
