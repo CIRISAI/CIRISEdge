@@ -37,7 +37,7 @@
 //!   `subscribe_path_events` and `subscribe_resource_events`. Path
 //!   events emit on Reticulum announce-arrival + on dispatch-side
 //!   reachability transitions; resource events emit on durable-queue
-//!   pressure (substrate-tier `inc_durable_queue` accumulation) and
+//!   pressure (substrate-tier `inc_durable_enqueued` accumulation) and
 //!   transport-buffer pressure observations.
 //! - `subscribe_all` is the union stream; it re-broadcasts every
 //!   category's emissions into a single channel.
@@ -140,7 +140,8 @@ pub struct NetworkEvent {
     pub hops: Option<u32>,
     /// Resource-kind classifier (`ResourceEvent` only). Free-form
     /// snake_case label — values used in v0.19.0:
-    /// `durable_queue_depth`, `transport_buffer_pressure`,
+    /// `durable_enqueued_total` (named `durable_queue_depth` before
+    /// CIRISEdge#845), `transport_buffer_pressure`,
     /// `inbound_queue_pressure`. Future versions add memory / disk /
     /// bandwidth.
     pub resource_kind: Option<String>,
@@ -252,7 +253,7 @@ impl NetworkEvent {
 
     /// CIRISEdge#34 v0.19.0 — construct a resource event. `kind`
     /// classifies what kind of pressure (snake_case label, e.g.
-    /// `durable_queue_depth`); `measurement` + `unit` carry the value.
+    /// `durable_enqueued_total`); `measurement` + `unit` carry the value.
     /// Conservative wire: severity = Info for steady-state metrics,
     /// Warning when the value crosses a configured threshold (today
     /// the call-sites set severity directly).

@@ -2402,8 +2402,8 @@ impl PyEdge {
     /// Subscribe to resource events (CIRISEdge#34 v0.19.0). Yields
     /// ResourcePressure dicts carrying (`resource_kind`, `measurement`,
     /// `unit`). v0.19.0 emission sites: `send_durable` /
-    /// `send_mandatory` / `send_federation` (durable_queue_depth
-    /// gauges).
+    /// `send_mandatory` / `send_federation` (the cumulative
+    /// `durable_enqueued_total`).
     fn subscribe_resource_events(&self) -> PyNetworkEventSubscription {
         PyNetworkEventSubscription::new(self.inner.events().subscribe_resources())
     }
@@ -2428,7 +2428,10 @@ impl PyEdge {
     ///   "envelopes_received_total": {"FederationAnnouncement": 7, ...},
     ///   "send_failures_total":      {"reticulum-rs:unreachable": 1, ...},
     ///   "verify_failures_total":    {"replay_detected": 3, ...},
-    ///   "durable_queue_depth":      {"durable": 5, "mandatory": 0, ...},
+    ///   # CIRISEdge#845 — rows pending / sending / awaiting_ack now, from
+    ///   # persist's outbound_counts (None when the queue can't be counted).
+    ///   "durable_queue_depth":      3,
+    ///   "durable_enqueued_total":   {"durable": 5, "mandatory": 0, ...},
     ///   "transport_bytes_in_total": {"reticulum-rs": 24576, ...},
     ///   "transport_bytes_out_total":{"http": 1024, ...},
     ///   "peer_reachability_ratio":  {"peer-x:reticulum-rs": 0.75, ...},
@@ -2509,17 +2512,28 @@ impl PyEdge {
         }
         root.set_item("verify_failures_total", verify_failures)?;
 
-        let durable_depth = pyo3::types::PyDict::new(py);
-        for (k, v) in &bundle.durable_queue_depth {
-            durable_depth.set_item(k.as_str(), *v)?;
+        let durable_enqueued = pyo3::types::PyDict::new(py);
+        for (k, v) in &bundle.durable_enqueued_total {
+            durable_enqueued.set_item(k.as_str(), *v)?;
         }
-        // CIRISEdge#814 — the honest name for the same number: cumulative
-        // ENQUEUES, never decremented. `durable_queue_depth` keeps its old
-        // meaning until a resident depth (persist's count) replaces it. Two
-        // dicts, not one aliased: a consumer that edits one must not see the
-        // edit under the other name (#815 review).
-        root.set_item("durable_enqueued_total", durable_depth.copy()?)?;
-        root.set_item("durable_queue_depth", durable_depth)?;
+        root.set_item("durable_enqueued_total", durable_enqueued)?;
+        // CIRISEdge#845 — `durable_queue_depth` is the RESIDENT depth now,
+        // one grouped COUNT on persist's queue (CIRISPersist#996). A failed
+        // count reads `None`, never 0: a zero would say the queue drained.
+        let edge = self.inner.clone();
+        let resident = py.detach(|| {
+            run_async(
+                &self.executor,
+                async move { edge.durable_queue_depth().await },
+            )
+        });
+        match resident {
+            Ok(depth) => root.set_item("durable_queue_depth", depth)?,
+            Err(e) => {
+                tracing::warn!(error = %e, "metrics_snapshot: durable_queue_depth unavailable");
+                root.set_item("durable_queue_depth", py.None())?;
+            }
+        }
 
         let bytes_in = pyo3::types::PyDict::new(py);
         for (k, v) in &bundle.transport_bytes_in_total {
@@ -12107,33 +12121,39 @@ mod pyo3_tier2_tests {
         assert_eq!(read(&py_edge), (1, 2, 1, 4, 3, 6));
     }
 
-    /// v0.19.5 (CIRISEdge#50) — `metrics_snapshot()["durable_queue_depth"]`
-    /// must increment by 1 per `send_durable_inline_text` call. The
-    /// `Edge::send_durable_with_cohort_scope` body fires
-    /// `metrics.inc_durable_queue(DeliveryClass::Durable)` AFTER the
-    /// successful `enqueue_outbound`; the snapshot path projects it.
+    /// CIRISEdge#845 (persist v54 `outbound_counts`) — the snapshot's
+    /// `durable_queue_depth` is the RESIDENT depth and
+    /// `durable_enqueued_total` the cumulative count. One enqueue raises
+    /// both by 1; once the row is delivered (and acknowledged, when it waits
+    /// for an ACK) the depth is back at its baseline while the cumulative
+    /// count keeps the enqueue. Before #845 the depth read the cumulative
+    /// count, so it never came back down.
     #[test]
-    fn send_opaque_event_increments_durable_queue_depth_metric() {
+    fn durable_queue_depth_is_resident_and_enqueued_total_is_cumulative_845() {
+        use ciris_persist::prelude::OutboundStatus;
         init_python();
-        let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
+        let (py_edge, queue, runtime) = build_sync_cohab_fixture();
+        let read = |py_edge: &PyEdge| -> (u64, u64) {
+            Python::attach(|py| -> PyResult<(u64, u64)> {
+                let snap = py_edge.metrics_snapshot(py)?;
+                let bound = snap.bind(py);
+                let depth: u64 = bound.get_item("durable_queue_depth")?.extract()?;
+                // Keyed by DeliveryClass::as_str(); a missing key is 0.
+                let enqueued: u64 = match bound
+                    .get_item("durable_enqueued_total")?
+                    .get_item("durable")
+                {
+                    Ok(v) => v.extract()?,
+                    Err(_) => 0,
+                };
+                Ok((depth, enqueued))
+            })
+            .expect("metrics_snapshot")
+        };
+        let (depth0, enqueued0) = read(&py_edge);
 
-        // Baseline: 0 (fresh Edge, no prior durable sends).
-        let baseline: u64 = Python::attach(|py| -> PyResult<u64> {
-            let snap = py_edge.metrics_snapshot(py)?;
-            let bound = snap.bind(py);
-            let depth = bound.get_item("durable_queue_depth")?;
-            // `durable_queue_depth` dict is keyed by DeliveryClass::as_str().
-            // Missing key = 0 (no enqueue yet).
-            match depth.get_item("durable") {
-                Ok(v) => v.extract::<u64>(),
-                Err(_) => Ok(0),
-            }
-        })
-        .expect("metrics_snapshot baseline");
-
-        // Single enqueue.
-        Python::attach(|py| -> PyResult<()> {
-            py_edge.send_opaque_event(
+        let queue_id = Python::attach(|py| -> PyResult<String> {
+            let h = py_edge.send_opaque_event(
                 py,
                 "recipient-key",
                 1,
@@ -12142,33 +12162,45 @@ mod pyo3_tier2_tests {
                 false,
                 false,
             )?;
-            Ok(())
+            Ok(h.queue_id().to_string())
         })
-        .expect("send_durable_inline_text");
-
-        // Post: baseline + 1.
-        let post: u64 = Python::attach(|py| -> PyResult<u64> {
-            let snap = py_edge.metrics_snapshot(py)?;
-            let bound = snap.bind(py);
-            let depth = bound.get_item("durable_queue_depth")?;
-            // CIRISEdge#814 — the honestly named alias carries the same count.
-            let enqueued: u64 = bound
-                .get_item("durable_enqueued_total")?
-                .get_item("durable")?
-                .extract()?;
-            let d: u64 = depth.get_item("durable")?.extract()?;
-            assert_eq!(
-                enqueued, d,
-                "durable_enqueued_total mirrors durable_queue_depth"
-            );
-            Ok(d)
-        })
-        .expect("metrics_snapshot post");
+        .expect("send_opaque_event");
         assert_eq!(
-            post,
-            baseline + 1,
-            "durable_queue_depth[durable] must increment by 1 per send_durable_inline_text \
-             (baseline={baseline}, post={post})"
+            read(&py_edge),
+            (depth0 + 1, enqueued0 + 1),
+            "one enqueue: one resident row, one more enqueue"
+        );
+
+        // Drain the row the way the dispatcher would.
+        runtime.block_on(async {
+            let claimed = queue
+                .claim_pending_outbound(16, 60, "test-845")
+                .await
+                .expect("claim");
+            assert!(
+                claimed.iter().any(|r| r.queue_id == queue_id),
+                "claimed the row"
+            );
+            queue
+                .mark_transport_delivered(&queue_id, "test")
+                .await
+                .expect("mark delivered");
+            let row = queue
+                .outbound_status(&queue_id)
+                .await
+                .expect("status")
+                .expect("row");
+            if row.status == OutboundStatus::AwaitingAck {
+                queue
+                    .mark_ack_received(&queue_id, b"ack")
+                    .await
+                    .expect("mark ack");
+            }
+        });
+        assert_eq!(
+            read(&py_edge),
+            (depth0, enqueued0 + 1),
+            "delivered: the depth drains, the cumulative count keeps the enqueue"
         );
     }
 }
