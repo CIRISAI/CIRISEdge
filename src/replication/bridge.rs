@@ -499,7 +499,7 @@ fn key_refusal_retry(reason: KeyRefusalReason) -> RetryDisposition {
 /// - **The reason is the branch**: the refusal message carries persist's stable
 ///   token (`pubkey_swap`, `downgrade`, …) — the #565 twin of the #433 rule.
 ///   Consumers key on the token constant, never on message prose.
-fn key_outcome_to_apply(
+pub(crate) fn key_outcome_to_apply(
     result: Result<ReplicatedKeyOutcome, ciris_persist::federation::Error>,
     content_hash: &str,
 ) -> (ApplyOutcome, Option<&'static str>) {
@@ -515,7 +515,12 @@ fn key_outcome_to_apply(
             // keep serving the pre-#659 bytes every verify v15.2.0 node
             // refuses — the exact stall #864 names.
             | ReplicatedKeyOutcome::Rebound
-            | ReplicatedKeyOutcome::Superseded,
+            | ReplicatedKeyOutcome::Superseded
+            // persist v54.0.0 (#995 row 2) — a row a pre-v53.1.4 door stranded
+            // without its `additional_scrubs` had them written back. Same shape
+            // as `Rebound`: the held row changed and persist moved its serve
+            // position, so this is an admission, never a duplicate.
+            | ReplicatedKeyOutcome::ScrubsRehydrated,
         ) => (ApplyOutcome::Admitted, None),
         Ok(
             ReplicatedKeyOutcome::Unchanged
@@ -11130,12 +11135,13 @@ pub(crate) mod tests {
     /// mirror to count.
     #[test]
     fn key_outcome_mapping_is_exhaustive_and_names_the_branch() {
-        // The three progress outcomes admit, no token.
+        // The progress outcomes admit, no token.
         for o in [
             ReplicatedKeyOutcome::Inserted,
             ReplicatedKeyOutcome::Upgraded,
             ReplicatedKeyOutcome::Rebound,
             ReplicatedKeyOutcome::Superseded,
+            ReplicatedKeyOutcome::ScrubsRehydrated,
         ] {
             let (a, t) = key_outcome_to_apply(Ok(o), "h");
             assert!(matches!(a, ApplyOutcome::Admitted), "{a:?}");
@@ -18306,6 +18312,13 @@ pub(crate) mod tests {
         // federates content keyed on a room only if the room has one
         // (`CommunityHasNoModerator`).
         let mut affiliation = fixture_community("aff-352", other);
+        // persist v54.0.0 (#1034) — a row placed at `affiliations` must name a
+        // room that declares itself one; a plain community is refused
+        // `AffiliationCohortMismatch`.
+        affiliation.policy_blob = Some(serde_json::json!({
+            ciris_persist::federation::affiliation_config::POLICY_COHORT_FIELD:
+                ciris_persist::federation::types::cohort_scope::AFFILIATIONS,
+        }));
         affiliation.members[0].role =
             Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_string());
         backend
@@ -20392,8 +20405,20 @@ pub(crate) mod tests {
     /// The pair room "chat-room" in its #955 end state (alice and bob both
     /// founders), seeded into `backend`.
     async fn seed_alice_bob_room(backend: &MemoryBackend) {
+        seed_alice_bob_room_declared(backend, None).await;
+    }
+
+    /// [`seed_alice_bob_room`] with an explicit `policy_blob`, so a test can
+    /// found the room as a declared affiliation (persist v54, #1034).
+    async fn seed_alice_bob_room_declared(
+        backend: &MemoryBackend,
+        policy_blob: Option<serde_json::Value>,
+    ) {
         let mut room = crate::chat::pair_community("person-alice", "person-bob", Utc::now());
         room.community_key_id = "chat-room".to_owned();
+        if policy_blob.is_some() {
+            room.policy_blob = policy_blob;
+        }
         room.members
             .push(ciris_persist::federation::types::CommunityMember {
                 key_id: "person-bob".to_owned(),
@@ -20601,6 +20626,11 @@ pub(crate) mod tests {
     /// on the advertise and the fetch twin; dave's node is not. Fails on
     /// persist 0df60dcf: `live_invitees_of` matched the proposal's scope
     /// exactly, so carol was no invitee of the room.
+    ///
+    /// persist v54.0.0 (#1034): a row placed at `affiliations` must name a
+    /// room that DECLARES itself an affiliation (`policy_blob.cohort_scope`);
+    /// one naming a plain community is refused `AffiliationCohortMismatch`. So
+    /// the room here is founded as a declared affiliation.
     #[tokio::test]
     async fn an_affiliations_proposal_is_a_live_invitation_into_the_room_761() {
         let backend = audience_backend().await;
@@ -20614,7 +20644,14 @@ pub(crate) mod tests {
         .await;
         seed_owner_binding(&backend, "person-dave", "node-dave").await;
         seed_device_occurrence(&backend, "person-dave", "node-dave", device_class::PHONE).await;
-        seed_alice_bob_room(&backend).await;
+        seed_alice_bob_room_declared(
+            &backend,
+            Some(serde_json::json!({
+                ciris_persist::federation::affiliation_config::POLICY_COHORT_FIELD:
+                    ciris_persist::federation::types::cohort_scope::AFFILIATIONS,
+            })),
+        )
+        .await;
         let proposal = crate::membership::sign_input(
             ciris_persist::federation::membership_acceptance::proposal_input(
                 ciris_persist::federation::types::cohort_scope::AFFILIATIONS,

@@ -969,8 +969,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-crypto"
-version = "19.0.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v19.0.0#3398091bbfc6adc5da4452ffc3b32a43f424a63d"
+version = "20.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v20.1.0#f4ea1a2d12179f7d9eafe40f89a6c81b7306476a"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -1061,8 +1061,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-keyring"
-version = "19.0.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v19.0.0#3398091bbfc6adc5da4452ffc3b32a43f424a63d"
+version = "20.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v20.1.0#f4ea1a2d12179f7d9eafe40f89a6c81b7306476a"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1097,8 +1097,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "53.1.4"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v53.1.4#41fa5548f0dc99ea0a0b5acf338ed0f4ff679aef"
+version = "54.0.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v54.0.0#d10f9d8ff6e9c7698d559590e0a500b76894d304"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1115,6 +1115,7 @@ dependencies = [
  "hex",
  "jsonschema",
  "libc",
+ "metrics",
  "parking_lot",
  "postgres-types",
  "pyo3",
@@ -1137,8 +1138,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-verify-core"
-version = "19.0.0"
-source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v19.0.0#3398091bbfc6adc5da4452ffc3b32a43f424a63d"
+version = "20.1.0"
+source = "git+https://github.com/CIRISAI/CIRISVerify?tag=v20.1.0#f4ea1a2d12179f7d9eafe40f89a6c81b7306476a"
 dependencies = [
  "android_system_properties",
  "async-trait",
@@ -1176,6 +1177,7 @@ dependencies = [
  "windows-sys 0.52.0",
  "x509-parser",
  "zeroize",
+ "zip",
 ]
 
 [[package]]
@@ -2088,6 +2090,15 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "flate2"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
+dependencies = [
+ "zlib-rs",
+]
 
 [[package]]
 name = "float_eq"
@@ -6626,6 +6637,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7724,6 +7741,25 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "zip"
+version = "7.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "typed-path",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"
