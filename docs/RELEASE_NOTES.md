@@ -1,5 +1,108 @@
 # CIRISEdge Release Notes
 
+# v40.0.12 — a fresh node parks what it cannot verify, once, and the host releases it after a claim; links the canonical loses under load are recovered; the dial-publish race is closed
+
+**2026-10-08/09.** **PATCH** from v40.0.11, cut from the v40.0.11 tag (main carries v40.1.0). Persist
+v53.1.8, verify v19.0.0 and leviculum v0.27.0+ciris.1 unchanged.
+Ladder triple: **edge v40.0.12 · persist v53.1.8 · verify v19.0.0**.
+
+**v40.0.10 and v40.0.11 have no release.** Their tags exist; neither tag run published.
+- v40.0.10 failed the #425 scanner `inbound_exits_are_instrumented_or_marked` (a bare `return;`
+  after a test seam in the `LinkClosed` arm). v40.0.11 marked it and carries all of v40.0.10.
+- v40.0.11 failed on the burst witness (`transfer in progress`). That was a real race from
+  #532/#819, which v40.0.11's no-trim-on-release exposed by making lane reuse far more common:
+  `dial_and_identify` published a fresh lane into the pool UNCLAIMED, a concurrent send took it in
+  the gap, the dialler's claim failed, and `send` shipped anyway — two Resources on one link.
+
+v40.0.12 carries all of v40.0.10 and v40.0.11 (read their sections for the responder-side inbound
+reap, the link-direction gauges and the four reaper review fixes), plus:
+
+## The dial-publish race is closed (#853, from #859)
+
+- A dialled lane is marked in flight BEFORE it is published, and the dialler holds its
+  `LinkClaim`. `send` always holds the claim of the lane it ships on; the "claim lost, ship
+  anyway" path is gone. A send cancelled during the dial wait gives its lane back (the claim's
+  `Drop`), closing the reservation leak reported for v40.0.11.
+- `send_on_scoped_lease` refuses rather than ships when its claim fails, counted in
+  `unclaimed_ship_refused_total` (unreachable by construction; loud if a regression reaches it).
+- Witnesses `a_dialled_lane_is_published_claimed_853` (new) and
+  `a_cancelled_send_gives_its_lane_back_853` (now deterministic); the burst witness fails
+  deterministically with the publish left unclaimed.
+
+## Links the canonical loses under load are recovered (#853, from #859)
+
+- A link whose `LinkEstablished` the control plane dropped never entered the direction table, so
+  it was never reaped, counted or gauged — the #853 leak at exactly the moment of load. Its next
+  `LinkIdentified` or frame now rebuilds its bookkeeping, counted in `recovered_links_total`.
+  Witness `a_link_whose_establish_event_was_lost_is_recovered_and_reaped_854`.
+- A straggler resource `Started`/`Progress` (droppable data plane) arriving after its own
+  completion no longer re-marks the link busy for the 30 s stall window. Witness
+  `a_straggler_progress_after_completion_is_recognised_853`.
+
+## A fresh node parks what it cannot verify, once, and the host releases it after a claim (#858)
+
+**The field.** A fresh, unclaimed agent install (server 0.5.223, edge v40.0.6) against the
+canonical refused the same `IdentityOccurrence` rows every round, one WARN per row per round: ~50
+attesters whose Keys the node had never met (the Key plane is `SelfOwn`, so the canonical never
+serves them), the owner's occurrences of the laptop's previous node, "signer S is neither identity
+I nor an active occurrence of it, nor a node it owns", and legacy rows whose typed `asserted_at`
+diverges from the signed envelope.
+
+**The mechanism.** The park already existed (#679): a row refused because its signer's Key is
+absent is parked on that signer, quiet on the terminal schedule, and released when the Key admits.
+Three things defeated it:
+- **eviction** — parks shared one 4096-entry ring with every ordinary refusal, and the Attestation
+  plane's refusals front-dropped them;
+- **refusals that never parked** — "signer does not act for the identity" (a held signer) rode the
+  transient ladder, ~12 asks and 12 WARNs an hour, forever;
+- **the claim's local write** — claiming the node writes the owner Key and binding locally, which
+  bypasses the replication apply choke, the only thing that released a park; the owner's rows then
+  waited out the park window (3600 s on the first park, not the documented 1800 s).
+
+**The fixes.**
+1. **The park ledger is in the metrics** (`EdgeMetricsBundle`, so PyO3 `metrics_snapshot()` and
+   the UniFFI snapshot both carry it): `rows_parked_on_signer{kind}`, `signer_releases`,
+   `retry_suppressions`, `signer_park_evictions`, and the gauges `refusal_memory_len` /
+   `refusal_memory_capacity` / `parked_on_signer_len` / `parked_on_signer_capacity`. Before, they
+   were bridge accessors no scrape could see.
+2. **One line per signer per window.** The apply choke's refusal WARN is one line per (plane,
+   signer) per 30 min (the signer comes from the bytes; a row naming none is keyed on its
+   disposition), repeats at DEBUG, with `suppressed_prev` on the next line. The park writes one
+   INFO per signer per window — "parked N row(s) on absent Key K" — and on a node no owner binding
+   names: "this node is UNCLAIMED … rows attested by keys it has not met wait here until a claim
+   or the Key arrives".
+3. **The host's release hook**, and the first park window is 1800 s. `release_signer(key_id)` and
+   `release_bound_signer(kind, envelope_bytes)` on the bridge, `ReplicationRuntime` and the PyO3
+   `ReplicationHandle` release every row parked on a signer and kick a re-ask of the peer that
+   offered it. The park no longer counts the choke's one refusal twice.
+4. **A held signer's occurrence refusal parks.** It is indexed on the signer in every case and is
+   terminal from its second refusal; the binding or occurrence that makes the signer act for the
+   identity releases it (#776). **Contract change:** that release fires on an ADMITTED binding or
+   occurrence only, not on a duplicate re-delivery (which binds nothing new, and would otherwise
+   re-ask every row indexed on an already-bound signer at each proactive push). The Key-admit
+   release still fires on duplicates.
+5. **A ring of its own for parks** (65,536 rows). Ordinary refusals can no longer evict a park;
+   a park the park ring evicts is counted and WARNed once per window.
+6. **A transient refusal that names no dependency** leaves the transient ladder after three windows
+   at its 5-minute cap (FSD `STRUCTURAL_REFUSALS.md` §2, S1 → S2): 30 min, doubling to 6 h.
+
+**The server's new call.** After `apply_signed_owner_binding` (the claim), call
+`handle.release_bound_signer("attestation", <the signed owner-binding bytes>)` on the PyO3
+`ReplicationHandle`: it releases the rows waiting on the bound node and on the owner key the claim
+just wrote, and the owner's rows admit on the next round instead of up to 6 h later. After any
+other local key registration, `handle.release_signer(key_id)`. Both return the rows released.
+
+**The witness** (`src/replication/park_fresh_858_tests.rs`): the real bridge, apply choke and
+`Session` over two sqlite directories; a seeded responder serves occurrences attested by keys a
+fresh, unclaimed node has not met, plus two legacy rows (a diverging `asserted_at`, which parks on
+its absent attester; and a row naming no signer). Round 1 refuses all five and parks four; a held
+signer's row and the signerless row escalate as above; ten rounds and eight unsolicited pushes
+write exactly one refusal WARN and one park line per signer; the Key through the choke releases its
+row, which admits; a LOCAL claim releases nothing until `release_signer`, then the owner's row
+admits; 20 Attestation refusals into an 8-row ordinary ring leave every park in place; a restart
+refuses each row once and re-parks it; the snapshot carries the ledger. Each fix was mutated alone
+and its witness fails.
+
 # v40.0.11 — v40.0.10 had no release (the #425 scanner); the four reaper review fixes
 
 **2026-10-08.** **PATCH** from v40.0.10, cut from the v40.0.10 tag (main carries v40.1.0). Persist
