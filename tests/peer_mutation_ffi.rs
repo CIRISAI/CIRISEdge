@@ -698,7 +698,8 @@ async fn build_refuses_transports_with_different_metrics_bags_809() {
     assert!(edge.metrics().is_same_bag(&shared));
 }
 
-/// The UniFFI snapshot carries both signals under their catalogued keys, and a
+/// The UniFFI snapshot carries both signals under their bundle field names
+/// (`EdgeMetricsBundle::flatten`, CIRISEdge#848; `transport.*` before), and a
 /// read refreshes the mirrored gauge first — a transport that has evicted
 /// since the last read is reported without anyone asking it directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -721,17 +722,13 @@ async fn the_uniffi_snapshot_carries_both_pressure_signals_and_refreshes_first_8
 
     let snap = ciris_edge::ffi::uniffi_impl::metrics_snapshot().expect("snapshot");
     assert_eq!(
-        snap.counters
-            .get("transport.packets_dropped_total")
-            .copied(),
+        snap.counters.get("transport_packets_dropped").copied(),
         Some(2),
         "packet drops reach the UniFFI counters: {:?}",
         snap.counters
     );
     assert_eq!(
-        snap.counters
-            .get("transport.known_destination_evictions")
-            .copied(),
+        snap.counters.get("known_destination_evictions").copied(),
         Some(42),
         "the eviction gauge is refreshed by the snapshot read itself, not by a prior \
          transport-specific getter: {:?}",
@@ -779,5 +776,83 @@ async fn the_uniffi_snapshot_carries_the_av_plane_ledger_805() {
         Some(1),
         "{:?}",
         snap.counters
+    );
+}
+
+/// CIRISEdge#848 — PARITY: the UniFFI snapshot carries every
+/// `EdgeMetricsBundle` field (as a counter or gauge key), walked from
+/// `EDGE_METRICS_BUNDLE_FIELDS`, on a fresh Edge where nothing has been
+/// recorded, so "absent" never stands in for "zero". And `queue_depth()` is
+/// the RESIDENT durable depth (#845), not the constant 0 it returned before:
+/// one enqueue is one resident row, in `queue_depth` and in the snapshot's
+/// `durable.queue_depth` gauge, while the cumulative count rides the bundle's
+/// `durable_enqueued_total`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_uniffi_snapshot_projects_every_bundle_field_and_queue_depth_is_resident_848() {
+    let _guard = ffi_test_lock().lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (backend, existing) = fresh_backend().await;
+    // The outbound queue references the sender's key row, so the Edge's own
+    // key (the one `build_edge_with_transport` signs with) is registered.
+    let steward = FedKey::new("steward-peer-mut-ffi", 0xA0);
+    let me = FedKey::new("edge-self-metrics-809", 0x01);
+    backend
+        .put_public_key(SignedKeyRecord {
+            record: signed_record(&me, &steward, "agent"),
+        })
+        .await
+        .expect("put_public_key(self)");
+    let transport = Arc::new(RecordingTransport {
+        attached: std::sync::Mutex::new(None),
+        evictions_to_report: 0,
+    });
+    let edge = Arc::new(
+        build_edge_with_transport(tmp.path(), backend, transport as Arc<dyn Transport>).await,
+    );
+    ciris_edge::ffi::uniffi_impl::install_edge_handle(&edge);
+
+    let snap = ciris_edge::ffi::uniffi_impl::metrics_snapshot().expect("snapshot");
+    let missing: Vec<&str> = ciris_edge::observability::EDGE_METRICS_BUNDLE_FIELDS
+        .iter()
+        .copied()
+        .filter(|f| !snap.counters.contains_key(*f) && !snap.gauges.contains_key(*f))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "UniFFI metrics_snapshot omits bundle fields: {missing:?}"
+    );
+    for legacy in [
+        "reachability.attempts_total",
+        "reachability.successes_total",
+        "inbound.dropped_low_trust_total",
+    ] {
+        assert!(snap.counters.contains_key(legacy), "{legacy} kept");
+    }
+
+    let all = ciris_edge::ffi::uniffi_impl::queue_depth(None).expect("queue_depth(all)");
+    assert_eq!(all.get("all").copied(), Some(0));
+    edge.send_durable(
+        &existing.key_id,
+        ciris_edge::OpaqueEvent {
+            kind: 0x0000_0001,
+            payload: b"durable text".to_vec(),
+        },
+    )
+    .await
+    .expect("send_durable");
+    let all = ciris_edge::ffi::uniffi_impl::queue_depth(None).expect("queue_depth(all)");
+    assert_eq!(all.get("all").copied(), Some(1), "one resident row");
+    assert!(
+        matches!(
+            ciris_edge::ffi::uniffi_impl::queue_depth(Some("durable".to_string())),
+            Err(ciris_edge::EdgeBindingsError::Unsupported)
+        ),
+        "persist's count has no delivery class; a named class is refused, not a made-up 0"
+    );
+    let snap = ciris_edge::ffi::uniffi_impl::metrics_snapshot().expect("snapshot");
+    assert_eq!(snap.gauges.get("durable.queue_depth").copied(), Some(1.0));
+    assert_eq!(
+        snap.counters.get("durable_enqueued_total.durable").copied(),
+        Some(1)
     );
 }
