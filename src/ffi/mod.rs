@@ -12,7 +12,7 @@
 //! Phase 3: swift-bridge (iOS) + uniffi (Android), composing against
 //!          the same Rust surface this module gates.
 
-#[cfg(feature = "pyo3")]
+#[cfg(feature = "_pyffi")]
 pub mod pyo3;
 
 // v0.13.0 (CIRISEdge#36 GO) — UniFFI bindings surface (#25 transport

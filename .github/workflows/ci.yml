@@ -752,6 +752,11 @@ jobs:
 
             cp "artifacts/ciris-edge-android-${ABI_DIR}-pyo3/libciris_edge_pyo3.so" \
                "${WORK}/ciris_edge/ciris_edge.so"
+            # CIRISEdge#824 — the module must actually be IN the .so: a
+            # `pyo3-sqlite` build once compiled no binding code at all, and
+            # `import ciris_edge` failed on every Android device.
+            grep -a -q PyInit_ciris_edge "${WORK}/ciris_edge/ciris_edge.so" \
+              || { echo "::error::${ABI}: ciris_edge.so exports no PyInit_ciris_edge (#824)"; exit 1; }
             cp python/ciris_edge/__init__.py "${WORK}/ciris_edge/"
             # .pyi stubs are optional — copy only if present (edge has
             # not shipped them yet; persist's wheel does). Resistant
@@ -1202,6 +1207,10 @@ jobs:
             "$SRC"
           cp "$SRC" "$DST"
           echo "✓ ${{ matrix.dir }}: $(stat -f%z "$DST" 2>/dev/null || stat -c%s "$DST") bytes"
+          # CIRISEdge#824 — the PyO3 module must be in the binary (see the
+          # Android wheel step).
+          grep -a -q PyInit_ciris_edge "$DST" \
+            || { echo "::error::${{ matrix.dir }}: no PyInit_ciris_edge in $DST (#824)"; exit 1; }
           otool -D "$DST"
           file "$DST"
       - uses: actions/upload-artifact@v4
@@ -1898,6 +1907,19 @@ jobs:
             ls target/wheels/*.whl 2>/dev/null || echo "  (no wheels)"
             exit 1
           fi
+          # CIRISEdge#824 — every wheel's extension module must export
+          # PyInit_ciris_edge. The Windows `pyo3-sqlite` wheel shipped for
+          # many releases with none (no binding code compiled), so
+          # `import ciris_edge` failed there while this lane stayed green.
+          for whl in target/wheels/*-cp310-abi3-*.whl; do
+            python -c 'import sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          mods = [n for n in z.namelist() if n.startswith("ciris_edge/ciris_edge") and n.endswith((".so", ".pyd"))]
+          ok = bool(mods) and all(b"PyInit_ciris_edge" in z.read(n) for n in mods)
+          print(sys.argv[1], mods, "PyInit_ciris_edge:", ok)
+          sys.exit(0 if ok else 1)' "$whl" \
+              || { echo "::error::$whl: extension module has no PyInit_ciris_edge (#824)"; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: ciris_edge-wheel-${{ matrix.label }}
