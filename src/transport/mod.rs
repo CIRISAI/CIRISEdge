@@ -165,6 +165,11 @@ pub mod peer_bundle_frame;
 #[cfg(feature = "_reticulum-module")]
 pub mod identity_model;
 
+/// CIRISEdge#856 — the responder's per-peer link-up rate, per proven identity
+/// and per source address.
+#[cfg(feature = "_reticulum-module")]
+pub mod link_up_bounds;
+
 /// Reticulum-native transport (OQ-07 first impl). Backed by Leviculum
 /// (`reticulum-core` + `reticulum-std`). Canonical wire per
 /// `MISSION.md` §2; HTTP is the documented fallback.

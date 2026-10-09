@@ -33,6 +33,8 @@ Every existing limiter is this module with different settings:
 | invite gate | sender fedID | 1 stranger / 8 contact | 24 h | stranger, contact | no |
 | refusal backoff | (kind, envelope hash) | 1 | grows per consecutive refusal | transient, terminal | yes |
 | **identifier lookup** (new) | requesting peer | N per window | fixed | — | optional |
+| link-up rate (#856) | proven transport identity; source address | 6 / 24 per window | 60 s | — | no |
+| no-progress backoff (#856) | (peer, kind) responder | — | — | — | yes (`Backoff` only: one served round per window) |
 
 So the superset is: **a keyed, bounded, clock-injected limiter whose quota and
 window are chosen per key CLASS, with optional exponential backoff on

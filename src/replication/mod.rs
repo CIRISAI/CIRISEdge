@@ -147,6 +147,8 @@ pub mod protocol;
 pub mod refusal_backoff;
 pub mod registry;
 pub mod resolved_state;
+/// CIRISEdge#856 — the responder's no-progress backoff.
+pub mod responder_bounds;
 /// CIRISEdge#552/#553 — how much of a plane this node keeps, and the
 /// revocation carve-out a configured retention cannot reach.
 pub mod retention;
@@ -374,7 +376,9 @@ pub use bridge::{
     KeyDirectoryProvider, OperationalProviders, RootStewardsProvider, StewardRosterProvider,
 };
 #[doc(inline)]
-pub use coordinator::{CoordinatorError, DriveStep, ReplicationCoordinator, RoundReport};
+pub use coordinator::{
+    CoordinatorError, DriveStep, ReplicationCoordinator, ReplySend, RoundReport,
+};
 #[doc(inline)]
 pub use directory::{DirectoryStateAdapter, MutableDirectoryStateAdapter, ReplicationDirectory};
 #[doc(inline)]

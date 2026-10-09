@@ -493,6 +493,11 @@ fn spawn_scheduler_task(
         while let Some((peer, event)) = evt_rx.recv().await {
             if let Some(m) = &metrics {
                 m.inc_round_outcome(round_outcome_of(&event));
+                // CIRISEdge#856 — a completed round in OUR direction is this
+                // peer's liveness evidence too.
+                if matches!(event, RoundEvent::Completed(_)) {
+                    m.note_peer_round_completed(&peer);
+                }
             }
             if let RoundEvent::Completed(report) = &event {
                 if report.admitted > 0 {
@@ -538,7 +543,8 @@ fn responder_round_clock(
 // splitting the arms out would separate each log line from the step it reports.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
-    use crate::replication::coordinator::DriverPhase;
+    use crate::replication::coordinator::{DriverPhase, ReplySend};
+    use crate::replication::responder_bounds::{NoProgress, RoundAdmission};
     tokio::spawn(async move {
         use crate::observability as obs;
         let peer = coord.peer_key_id().to_string();
@@ -561,6 +567,11 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
         let mut round_began: Option<std::time::Instant> = None;
         // The round id the timer is anchored to (0: none / legacy).
         let mut timed_round: u64 = 0;
+        // CIRISEdge#856 — the no-progress backoff, and the round it is
+        // dropping (its id; 0 for a legacy round), so the dropped round's later
+        // frames go with it instead of each reading as a fresh open.
+        let mut progress = NoProgress::new(coord.no_progress_policy());
+        let mut dropping: Option<u64> = None;
         loop {
             // CIRISEdge#662 — the phase gauge: this loop is the responder's ONE
             // drain, and when its inbox fills the drop site reads which of the
@@ -575,6 +586,31 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                 tracing::debug!(peer = %peer, ?kind, "responder driver ending (channel closed)");
                 break;
             };
+            let incoming_round = inbound.meta.map_or(0, |m| m.round);
+            if incoming_round != 0 && dropping == Some(incoming_round) {
+                continue;
+            }
+            if coord.opens_round(&inbound) {
+                match progress.on_round_open(std::time::Instant::now()) {
+                    RoundAdmission::Serve => dropping = None,
+                    RoundAdmission::BackedOff => {
+                        if dropping.is_none() {
+                            tracing::info!(
+                                peer = %peer, ?kind, streak = progress.streak(),
+                                link = %coord.last_inbound_link_hex(),
+                                "responder BACKING OFF this peer's rounds — its last served \
+                                 rounds opened and never completed; one round per backoff \
+                                 window is served until one completes (CIRISEdge#856)"
+                            );
+                        }
+                        count(obs::RESPONDER_ROUND_BACKED_OFF);
+                        dropping = Some(incoming_round);
+                        continue;
+                    }
+                }
+            } else if incoming_round == 0 && dropping == Some(0) {
+                continue;
+            }
             let began = responder_round_clock(
                 &mut round_began,
                 &mut timed_round,
@@ -598,11 +634,29 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                         // and the anti-entropy protocol is idempotent + retried).
                         match tokio::time::timeout(
                             RESPONDER_REPLY_SEND_TIMEOUT,
-                            coord.send_message(m),
+                            coord.send_reply(m),
                         )
                         .await
                         {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(ReplySend::Sent)) => {}
+                            // CIRISEdge#856 — a reply shape the peer cannot
+                            // consume is never sent; the round ends here.
+                            Ok(Ok(ReplySend::RefusedCapability {
+                                wire_version,
+                                bytes,
+                            })) => {
+                                count(obs::RESPONDER_ROUND_REFUSED_CAPABILITY);
+                                round_began = None;
+                                tracing::warn!(
+                                    peer = %peer, ?kind, wire_version, bytes,
+                                    floor = crate::replication::wire_frame::MULTI_SEGMENT_REPLY_WIRE_FLOOR,
+                                    link = %coord.last_inbound_link_hex(),
+                                    "responder REFUSED a reply the peer cannot consume — it needs \
+                                     more than one Resource segment and the peer opened its round \
+                                     below the multi-segment wire floor; not sent (CIRISEdge#856)"
+                                );
+                                break;
+                            }
                             Ok(Err(e)) => {
                                 tracing::warn!(
                                     peer = %peer, ?kind, error = %e,
@@ -635,19 +689,40 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                 Ok(DriveStep::SendThenComplete(msgs, report)) => {
                     let mut failed = false;
                     for m in &msgs {
-                        if let Err(e) = coord.send_message(m).await {
-                            tracing::warn!(
-                                peer = %peer, ?kind, error = %e,
-                                link = %coord.last_inbound_link_hex(),
-                                "responder SendThenComplete send failed (CIRISEdge#380)"
-                            );
-                            count(obs::RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED);
-                            failed = true;
-                            break;
+                        match coord.send_reply(m).await {
+                            Ok(ReplySend::Sent) => {}
+                            Ok(ReplySend::RefusedCapability {
+                                wire_version,
+                                bytes,
+                            }) => {
+                                tracing::warn!(
+                                    peer = %peer, ?kind, wire_version, bytes,
+                                    link = %coord.last_inbound_link_hex(),
+                                    "responder REFUSED a final reply the peer cannot consume \
+                                     (CIRISEdge#856)"
+                                );
+                                count(obs::RESPONDER_ROUND_REFUSED_CAPABILITY);
+                                failed = true;
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    peer = %peer, ?kind, error = %e,
+                                    link = %coord.last_inbound_link_hex(),
+                                    "responder SendThenComplete send failed (CIRISEdge#380)"
+                                );
+                                count(obs::RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED);
+                                failed = true;
+                                break;
+                            }
                         }
                     }
                     round_began = None;
                     if !failed {
+                        progress.on_round_completed();
+                        if let Some(m) = coord.metrics() {
+                            m.note_peer_round_completed(&peer);
+                        }
                         count(obs::RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL);
                         tracing::info!(
                             peer = %peer, ?kind, ?report,
@@ -659,6 +734,10 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                 }
                 Ok(DriveStep::Complete(report)) => {
                     round_began = None;
+                    progress.on_round_completed();
+                    if let Some(m) = coord.metrics() {
+                        m.note_peer_round_completed(&peer);
+                    }
                     count(obs::RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL);
                     tracing::info!(
                         peer = %peer, ?kind, ?report,
@@ -862,6 +941,13 @@ pub struct ReplicationRuntimeConfig {
     /// issued (see [`crate::membership`]). `None` (the default): acceptances
     /// are stored and nothing is widened by this node.
     pub membership_widener: Option<crate::membership::MembershipWidener>,
+    /// CIRISEdge#856 — the responder's no-progress backoff: after this many
+    /// served rounds from one `(peer, kind)` open and never complete, that
+    /// peer's rounds are served at a backed-off cadence until one completes.
+    /// Default K = 3, 60 s doubling to 900 s;
+    /// [`NoProgressPolicy::DISABLED`](super::responder_bounds::NoProgressPolicy::DISABLED)
+    /// turns it off.
+    pub responder_no_progress: super::responder_bounds::NoProgressPolicy,
 }
 
 /// Live replication runtime — bridge + registry + scheduler task +
@@ -1059,6 +1145,7 @@ impl ReplicationRuntime {
             // CIRISEdge#441 — the responder coordinators fold peer Summaries
             // into the removal-receipt ledger; same handle the bridge uses.
             let factory_metrics = config.metrics.clone();
+            let factory_no_progress = config.responder_no_progress;
             registry.set_responder_factory(Arc::new(move |peer_key_id: &str, kind| {
                 let bridge_dir: Arc<dyn ReplicationDirectory> = Arc::clone(&factory_bridge) as _;
                 // CIRISEdge#379 — peer-bound provider: the observer-capability
@@ -1075,7 +1162,8 @@ impl ReplicationRuntime {
                         provider,
                         applier,
                     )
-                    .with_metrics(factory_metrics.clone()),
+                    .with_metrics(factory_metrics.clone())
+                    .with_no_progress_policy(factory_no_progress),
                 );
                 // CIRISEdge#348 — DRIVE the responder. The registry only stores
                 // the coordinator; the scheduler drives INITIATORS only. Without

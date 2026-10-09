@@ -3127,6 +3127,21 @@ fn metrics_bundle_to_pydict<'py>(
         "unclaimed_ship_refused_total",
         bundle.unclaimed_ship_refused_total,
     )?;
+    // CIRISEdge#856 — the responder's per-peer bounds.
+    for (name, map) in [
+        ("link_ups_refused_total", &bundle.link_ups_refused_total),
+        ("rooted_peers_silent", &bundle.rooted_peers_silent),
+        (
+            "rooted_peer_last_completed_unix",
+            &bundle.rooted_peer_last_completed_unix,
+        ),
+    ] {
+        let d = pyo3::types::PyDict::new(py);
+        for (k, v) in map {
+            d.set_item(k.as_str(), *v)?;
+        }
+        root.set_item(name, d)?;
+    }
 
     Ok(root)
 }

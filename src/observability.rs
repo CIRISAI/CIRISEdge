@@ -906,13 +906,23 @@ pub const RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL: &str = "completed_initiator
 pub const RESPONDER_ROUND_REPLY_SEND_FAILED: &str = "reply_send_failed";
 /// CIRISEdge#853 — a send on the initiator-final path failed.
 pub const RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED: &str = "send_then_complete_failed";
+/// CIRISEdge#856 — a round the peer opened was dropped unserved: its last
+/// served rounds opened and never completed, and the no-progress backoff
+/// serves one round per window until one does.
+pub const RESPONDER_ROUND_BACKED_OFF: &str = "backed_off";
+/// CIRISEdge#856 — a reply was not sent because the peer cannot consume its
+/// shape: it needs more than one Resource segment and the peer opened its round
+/// below the multi-segment wire floor.
+pub const RESPONDER_ROUND_REFUSED_CAPABILITY: &str = "refused_capability";
 /// Every `responder_rounds_total` outcome token.
-pub const RESPONDER_ROUND_OUTCOMES: [&str; 5] = [
+pub const RESPONDER_ROUND_OUTCOMES: [&str; 7] = [
     RESPONDER_ROUND_STARTED,
     RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL,
     RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL,
     RESPONDER_ROUND_REPLY_SEND_FAILED,
     RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED,
+    RESPONDER_ROUND_BACKED_OFF,
+    RESPONDER_ROUND_REFUSED_CAPABILITY,
 ];
 
 /// CIRISEdge#853 — `responder_link_up_seconds` stage: the dialer's link-borne
@@ -933,13 +943,36 @@ pub const LINK_UP_BUNDLE_REFUSED: &str = "bundle_refused";
 pub const LINK_UP_TIMEOUT: &str = "timeout";
 /// CIRISEdge#853 — outcome: the link closed before its link-up work ended.
 pub const LINK_UP_LINK_GONE: &str = "link_gone";
+/// CIRISEdge#856 — outcome: the link was closed after identification by the
+/// per-peer link-up rate (`link_ups_refused_total` says which axis).
+pub const LINK_UP_REFUSED: &str = "refused";
 /// Every `responder_link_up_total` outcome token.
-pub const LINK_UP_OUTCOMES: [&str; 4] = [
+pub const LINK_UP_OUTCOMES: [&str; 5] = [
     LINK_UP_OK,
     LINK_UP_BUNDLE_REFUSED,
     LINK_UP_TIMEOUT,
     LINK_UP_LINK_GONE,
+    LINK_UP_REFUSED,
 ];
+/// CIRISEdge#856 — `link_ups_refused_total` reason: one identity dialled past
+/// its link-up quota.
+pub const LINK_UP_REFUSED_RATE_IDENTITY: &str = "rate_identity";
+/// CIRISEdge#856 — `link_ups_refused_total` reason: one source address dialled
+/// past its quota, its identities each within theirs.
+pub const LINK_UP_REFUSED_RATE_SOURCE: &str = "rate_source";
+/// Every `link_ups_refused_total` reason.
+pub const LINK_UP_REFUSED_REASONS: [&str; 2] =
+    [LINK_UP_REFUSED_RATE_IDENTITY, LINK_UP_REFUSED_RATE_SOURCE];
+/// CIRISEdge#856 — the default `rooted_peers_silent` bounds: one hour, six
+/// hours, a day.
+pub const DEFAULT_ROOTED_SILENCE_BOUNDS: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(3_600),
+    std::time::Duration::from_secs(21_600),
+    std::time::Duration::from_secs(86_400),
+];
+/// CIRISEdge#856 — peers whose last completed round is remembered. Past it the
+/// stalest entry goes; the rooted set is far smaller in practice.
+pub const PEER_ROUND_COMPLETED_TRACKED_MAX: usize = 4_096;
 /// CIRISEdge#853 — how long a responder's link-up may run before it counts
 /// as `timeout`: the dialer's own establish-and-identify window.
 pub const RESPONDER_LINK_UP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1510,6 +1543,25 @@ pub struct EdgeMetrics {
     /// CIRISEdge#853 — ships refused because their lane was already claimed by
     /// another transfer. Unreachable by construction; non-zero is a regression.
     pub unclaimed_ship_refused_total: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#856 — inbound link-ups closed right after identification by
+    /// the per-peer link-up rate, by reason (`rate_identity` / `rate_source`).
+    pub link_ups_refused_total: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#856 — per peer, when a round with it last completed in either
+    /// direction (unix seconds). Bounded by [`PEER_ROUND_COMPLETED_TRACKED_MAX`].
+    pub peer_round_completed_at: Arc<RwLock<HashMap<String, u64>>>,
+    /// CIRISEdge#856 — the transport's rooted peers and when each was first
+    /// seen rooted (unix seconds), republished on the transport's reaper tick.
+    pub rooted_peers_seen: Arc<RwLock<HashMap<String, u64>>>,
+    /// CIRISEdge#856 — the `rooted_peers_silent` bounds; empty until set means
+    /// [`DEFAULT_ROOTED_SILENCE_BOUNDS`].
+    pub rooted_silence_bounds: Arc<RwLock<Vec<std::time::Duration>>>,
+}
+
+/// Unix seconds now (0 before the epoch).
+fn unix_secs_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A `&'static str`-keyed counter map, cloned out with owned keys for the
@@ -2266,6 +2318,102 @@ impl EdgeMetrics {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// CIRISEdge#856 — one inbound link-up refused by the per-peer link-up
+    /// rate; `reason` is one of [`LINK_UP_REFUSED_REASONS`].
+    pub fn inc_link_up_refused(&self, reason: &'static str) {
+        *self
+            .link_ups_refused_total
+            .write()
+            .entry(reason)
+            .or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#856 — `link_ups_refused_total`, both reasons always present.
+    #[must_use]
+    pub fn link_ups_refused_total(&self) -> HashMap<String, u64> {
+        let totals = self.link_ups_refused_total.read();
+        LINK_UP_REFUSED_REASONS
+            .iter()
+            .map(|r| ((*r).to_string(), totals.get(r).copied().unwrap_or(0)))
+            .collect()
+    }
+
+    /// CIRISEdge#856 — a round with `peer` completed, in either direction.
+    pub fn note_peer_round_completed(&self, peer: &str) {
+        let now = unix_secs_now();
+        let mut at = self.peer_round_completed_at.write();
+        if !at.contains_key(peer) && at.len() >= PEER_ROUND_COMPLETED_TRACKED_MAX {
+            if let Some(stalest) = at.iter().min_by_key(|(_, t)| **t).map(|(k, _)| k.clone()) {
+                at.remove(&stalest);
+            }
+        }
+        at.insert(peer.to_owned(), now);
+    }
+
+    /// CIRISEdge#856 — the transport's current rooted peers. A peer keeps the
+    /// instant it was first seen rooted for as long as it stays rooted; a peer
+    /// no longer rooted is dropped.
+    pub fn set_rooted_peers<'a>(&self, rooted: impl IntoIterator<Item = &'a str>) {
+        let now = unix_secs_now();
+        let mut seen = self.rooted_peers_seen.write();
+        let fresh: HashMap<String, u64> = rooted
+            .into_iter()
+            .map(|p| (p.to_owned(), seen.get(p).copied().unwrap_or(now)))
+            .collect();
+        *seen = fresh;
+    }
+
+    /// CIRISEdge#856 — set the `rooted_peers_silent` bounds (an empty list
+    /// restores [`DEFAULT_ROOTED_SILENCE_BOUNDS`]).
+    pub fn set_rooted_silence_bounds(&self, bounds: Vec<std::time::Duration>) {
+        *self.rooted_silence_bounds.write() = bounds;
+    }
+
+    /// CIRISEdge#856 — `rooted_peers_silent{bound}`: per bound (keyed
+    /// `"<secs>s"`), how many rooted peers have had no completed round in
+    /// either direction for at least that long. A peer that never completed
+    /// one is measured from when it was first seen rooted. Evidence only:
+    /// nothing acts on it.
+    #[must_use]
+    pub fn rooted_peers_silent(&self) -> HashMap<String, u64> {
+        let now = unix_secs_now();
+        let bounds = {
+            let b = self.rooted_silence_bounds.read();
+            if b.is_empty() {
+                DEFAULT_ROOTED_SILENCE_BOUNDS.to_vec()
+            } else {
+                b.clone()
+            }
+        };
+        let seen = self.rooted_peers_seen.read();
+        let completed = self.peer_round_completed_at.read();
+        bounds
+            .iter()
+            .map(|bound| {
+                let silent = seen
+                    .iter()
+                    .filter(|(peer, since)| {
+                        let last = completed.get(*peer).copied().unwrap_or(**since);
+                        now.saturating_sub(last) >= bound.as_secs()
+                    })
+                    .count() as u64;
+                (format!("{}s", bound.as_secs()), silent)
+            })
+            .collect()
+    }
+
+    /// CIRISEdge#856 — per rooted peer, its last completed round in either
+    /// direction (unix seconds; 0 = none since this node started).
+    #[must_use]
+    pub fn rooted_peer_last_completed_unix(&self) -> HashMap<String, u64> {
+        let completed = self.peer_round_completed_at.read();
+        self.rooted_peers_seen
+            .read()
+            .keys()
+            .map(|p| (p.clone(), completed.get(p).copied().unwrap_or(0)))
+            .collect()
+    }
+
     /// CIRISEdge#853 — count one responder round lifecycle `outcome` (one of
     /// [`RESPONDER_ROUND_OUTCOMES`]) for `kind`.
     pub fn inc_responder_round(&self, kind: EnvelopeKind, outcome: &'static str) {
@@ -2534,6 +2682,9 @@ impl EdgeMetrics {
             responder_link_up_total: self.responder_link_up_total(),
             recovered_links_total: self.recovered_links_total(),
             unclaimed_ship_refused_total: self.unclaimed_ship_refused_total(),
+            link_ups_refused_total: self.link_ups_refused_total(),
+            rooted_peers_silent: self.rooted_peers_silent(),
+            rooted_peer_last_completed_unix: self.rooted_peer_last_completed_unix(),
         }
     }
 }
@@ -2852,6 +3003,15 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#853 — ships refused on a lane another transfer held.
     /// Unreachable by construction; non-zero is a regression.
     pub unclaimed_ship_refused_total: u64,
+    /// CIRISEdge#856 — inbound link-ups refused by the per-peer link-up rate,
+    /// by reason (`rate_identity` / `rate_source`); both always present.
+    pub link_ups_refused_total: HashMap<String, u64>,
+    /// CIRISEdge#856 — gauge: rooted peers with no completed round in either
+    /// direction for at least each bound, keyed `"<secs>s"`.
+    pub rooted_peers_silent: HashMap<String, u64>,
+    /// CIRISEdge#856 — per rooted peer, its last completed round (unix
+    /// seconds; 0 = none since start).
+    pub rooted_peer_last_completed_unix: HashMap<String, u64>,
 }
 
 /// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
@@ -3154,6 +3314,29 @@ impl EdgeMetricsBundle {
             "unclaimed_ship_refused_total".to_string(),
             self.unclaimed_ship_refused_total,
         );
+        // CIRISEdge#856 — the responder's per-peer bounds.
+        f.family("link_ups_refused_total", &self.link_ups_refused_total);
+        // The bare gauge is the count at the tightest bound (the largest).
+        let mut silent_max = 0u64;
+        for (bound, n) in &self.rooted_peers_silent {
+            silent_max = silent_max.max(*n);
+            #[allow(clippy::cast_precision_loss)]
+            f.gauges
+                .insert(format!("rooted_peers_silent.{bound}"), *n as f64);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        f.gauges
+            .insert("rooted_peers_silent".to_string(), silent_max as f64);
+        // The bare key is the number of rooted peers (a sum of timestamps
+        // would mean nothing); each peer's instant is `f.<peer>`.
+        for (peer, at) in &self.rooted_peer_last_completed_unix {
+            f.counters
+                .insert(format!("rooted_peer_last_completed_unix.{peer}"), *at);
+        }
+        f.counters.insert(
+            "rooted_peer_last_completed_unix".to_string(),
+            self.rooted_peer_last_completed_unix.len() as u64,
+        );
         // CIRISEdge#858 — the refusal memory's park ledger.
         f.family(
             "rows_parked_on_signer",
@@ -3274,6 +3457,9 @@ edge_metrics_bundle_fields!(
     responder_link_up_total,
     recovered_links_total,
     unclaimed_ship_refused_total,
+    link_ups_refused_total,
+    rooted_peers_silent,
+    rooted_peer_last_completed_unix,
 );
 
 #[cfg(test)]
@@ -3646,6 +3832,65 @@ mod p0_telemetry_tests {
         assert!((snap.sum_seconds - 62.025).abs() < 1e-9);
         let labels: Vec<String> = snap.buckets().into_iter().map(|(le, _)| le).collect();
         assert_eq!(labels, ["0.01", "0.1", "1", "5", "30", "+Inf"]);
+    }
+
+    /// CIRISEdge#856 — silence is counted per bound over the ROOTED set only;
+    /// a peer that never completed a round is measured from when it was first
+    /// seen rooted, and re-publishing the set keeps that instant.
+    #[test]
+    fn rooted_peers_silent_counts_rooted_peers_without_a_recent_round() {
+        let m = EdgeMetrics::new();
+        m.set_rooted_silence_bounds(vec![Duration::from_secs(60), Duration::from_secs(3600)]);
+        m.set_rooted_peers(["fresh", "stale", "never"]);
+        let now = super::unix_secs_now();
+        m.note_peer_round_completed("fresh");
+        m.peer_round_completed_at
+            .write()
+            .insert("stale".into(), now - 120);
+        m.rooted_peers_seen
+            .write()
+            .insert("never".into(), now - 7200);
+        m.note_peer_round_completed("not-rooted");
+        let silent = m.rooted_peers_silent();
+        assert_eq!(silent["60s"], 2, "stale and never");
+        assert_eq!(silent["3600s"], 1, "never");
+        let last = m.rooted_peer_last_completed_unix();
+        assert_eq!(last.len(), 3, "the rooted set only");
+        assert_eq!(last["never"], 0);
+        m.set_rooted_peers(["never", "fresh", "stale"]);
+        assert_eq!(m.rooted_peers_silent()["3600s"], 1, "first-seen survives");
+        m.set_rooted_peers(["fresh"]);
+        assert_eq!(m.rooted_peers_silent()["60s"], 0, "unrooted peers leave");
+        m.set_rooted_silence_bounds(Vec::new());
+        assert_eq!(m.rooted_peers_silent().len(), 3, "the default bounds");
+        let flat = m.snapshot().flatten();
+        assert_eq!(flat.counters["rooted_peer_last_completed_unix"], 1);
+        assert!(flat.gauges.contains_key("rooted_peers_silent.3600s"));
+    }
+
+    /// CIRISEdge#856 — the completion ledger is bounded; the stalest goes.
+    #[test]
+    fn peer_round_completed_ledger_is_bounded() {
+        let m = EdgeMetrics::new();
+        m.peer_round_completed_at.write().insert("oldest".into(), 1);
+        for i in 0..super::PEER_ROUND_COMPLETED_TRACKED_MAX {
+            m.note_peer_round_completed(&format!("p{i}"));
+        }
+        let at = m.peer_round_completed_at.read();
+        assert_eq!(at.len(), super::PEER_ROUND_COMPLETED_TRACKED_MAX);
+        assert!(!at.contains_key("oldest"));
+    }
+
+    /// CIRISEdge#856 — both refusal reasons are always projected.
+    #[test]
+    fn link_ups_refused_carries_both_reasons() {
+        let m = EdgeMetrics::new();
+        assert_eq!(m.link_ups_refused_total()["rate_source"], 0);
+        m.inc_link_up_refused("rate_identity");
+        let snap = m.snapshot();
+        assert_eq!(snap.link_ups_refused_total["rate_identity"], 1);
+        assert_eq!(snap.link_ups_refused_total.len(), 2);
+        assert_eq!(snap.flatten().counters["link_ups_refused_total"], 1);
     }
 
     /// PARITY (the UniFFI side): every bundle field is a key of the flat

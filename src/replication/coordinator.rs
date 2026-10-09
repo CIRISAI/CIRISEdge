@@ -61,6 +61,32 @@ pub struct Inbound {
     pub meta: Option<RoundMeta>,
 }
 
+/// CIRISEdge#856 — does `inbound` open a new round on a responder bound to
+/// `bound`? A v3 frame naming another round, or a legacy (round 0) Summary.
+fn inbound_opens_round(inbound: &Inbound, bound: u64) -> bool {
+    let incoming = inbound.meta.map_or(0, |r| r.round);
+    if incoming == 0 {
+        matches!(inbound.msg, ReplicationMessage::Summary(_))
+    } else {
+        incoming != bound
+    }
+}
+
+/// CIRISEdge#856 — what [`ReplicationCoordinator::send_reply`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplySend {
+    /// Handed to the transport.
+    Sent,
+    /// Not sent: the reply needs more than one Resource segment and the peer
+    /// opened its round below the multi-segment wire floor.
+    RefusedCapability {
+        /// The round-open wire version the gate judged.
+        wire_version: u8,
+        /// The reply's wire length.
+        bytes: usize,
+    },
+}
+
 /// Why an initiator refused a reply frame handed to it by the registry.
 /// Every variant is a VISIBLE drop: counted and logged at the route
 /// choke, never queued (CIRISEdge#634 §4).
@@ -172,6 +198,9 @@ pub struct ReplicationCoordinator {
     /// Summary on a removal-class kind folds into the removal-receipt
     /// ledger (the peer's Summary IS the protocol-native delivery ack).
     metrics: Option<crate::observability::EdgeMetrics>,
+    /// CIRISEdge#856 — when the responder driver backs off this peer's rounds
+    /// for lack of progress. Read once, by the driver, at its start.
+    no_progress: super::responder_bounds::NoProgressPolicy,
     /// CIRISEdge#853 — the transport link the responder's latest inbound frame
     /// arrived on (a Reticulum link id), for the round lifecycle log lines.
     /// Observability only: never consulted for routing.
@@ -265,6 +294,7 @@ impl ReplicationCoordinator {
         };
         Self {
             metrics: None,
+            no_progress: super::responder_bounds::NoProgressPolicy::default(),
             last_inbound_link: std::sync::Mutex::new(None),
             transport,
             peer_key_id: peer_key_id.into(),
@@ -389,6 +419,24 @@ impl ReplicationCoordinator {
     #[must_use]
     pub fn metrics(&self) -> Option<&crate::observability::EdgeMetrics> {
         self.metrics.as_ref()
+    }
+
+    /// CIRISEdge#856 — install the responder's no-progress backoff policy
+    /// (builder; the runtime's responder factory sets it from
+    /// [`super::runtime::ReplicationRuntimeConfig::responder_no_progress`]).
+    #[must_use]
+    pub fn with_no_progress_policy(
+        mut self,
+        policy: super::responder_bounds::NoProgressPolicy,
+    ) -> Self {
+        self.no_progress = policy;
+        self
+    }
+
+    /// CIRISEdge#856 — the responder's no-progress backoff policy.
+    #[must_use]
+    pub fn no_progress_policy(&self) -> super::responder_bounds::NoProgressPolicy {
+        self.no_progress
     }
 
     /// Deliver a REPLY (`FROM_RESPONDER = 1`) to this initiator: into the
@@ -671,13 +719,11 @@ impl ReplicationCoordinator {
                 self.begin_round().await;
                 session.start_round(self.provider.as_ref()).await
             }
-            Some(Inbound { msg: m, meta }) => {
+            Some(inbound) => {
                 if let RoleInbox::Responder { bound_round, .. } = &self.inbox {
-                    let incoming = meta.map_or(0, |r| r.round);
+                    let incoming = inbound.meta.map_or(0, |r| r.round);
                     let bound = bound_round.load(Ordering::Acquire);
-                    let legacy_open = incoming == 0 && matches!(m, ReplicationMessage::Summary(_));
-                    let new_round = incoming != 0 && incoming != bound;
-                    if new_round || legacy_open {
+                    if inbound_opens_round(&inbound, bound) {
                         if bound != 0 || !session.is_fresh() {
                             tracing::debug!(
                                 peer = %self.peer_key_id,
@@ -692,6 +738,7 @@ impl ReplicationCoordinator {
                         bound_round.store(incoming, Ordering::Release);
                     }
                 }
+                let Inbound { msg: m, .. } = inbound;
                 if let (Some(metrics), ReplicationMessage::Summary(sm)) = (&self.metrics, &m) {
                     if crate::replication::bridge::is_removal_kind(sm.kind) {
                         let hashes: Vec<[u8; 32]> =
@@ -822,6 +869,59 @@ impl ReplicationCoordinator {
         }
     }
 
+    /// CIRISEdge#856 — does `inbound` open a NEW round on this responder: a v3
+    /// frame naming a round other than the bound one, or a legacy Summary? The
+    /// same predicate [`Self::drive_round_step_framed`] rebinds on, read before
+    /// the step so the driver can decide whether to serve the round at all.
+    /// Always `false` on an initiator.
+    pub fn opens_round(&self, inbound: &Inbound) -> bool {
+        match &self.inbox {
+            RoleInbox::Responder { bound_round, .. } => {
+                inbound_opens_round(inbound, bound_round.load(Ordering::Acquire))
+            }
+            RoleInbox::Initiator { .. } => false,
+        }
+    }
+
+    /// CIRISEdge#856 — a RESPONDER's reply, gated on what the peer can consume.
+    ///
+    /// The wire bytes are built exactly as [`Self::send_message`] builds them;
+    /// a responder bound to a LEGACY round (the peer opened it with v1/v2
+    /// framing, below [`super::wire_frame::MULTI_SEGMENT_REPLY_WIRE_FLOOR`])
+    /// whose reply would need more than one Resource segment does not send it:
+    /// [`ReplySend::RefusedCapability`]. Nothing goes on the wire — a reply the
+    /// peer cannot reassemble is dropped at its end after costing both sides
+    /// the transfer, and a legacy peer has no refusal message to receive. On an
+    /// initiator this is [`Self::send_message`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send_message`].
+    pub async fn send_reply(
+        &self,
+        msg: &ReplicationMessage,
+    ) -> Result<ReplySend, CoordinatorError> {
+        let bytes = self.wire_bytes(msg);
+        if let RoleInbox::Responder { bound_round, .. } = &self.inbox {
+            let version = if bound_round.load(Ordering::Acquire) == 0 {
+                msg.kind().min_wire_version()
+            } else {
+                super::wire_frame::WIRE_PROTOCOL_VERSION_V3
+            };
+            if !super::wire_frame::reply_shape_consumable(version, bytes.len()) {
+                return Ok(ReplySend::RefusedCapability {
+                    wire_version: version,
+                    bytes: bytes.len(),
+                });
+            }
+        }
+        self.transport
+            .send(&self.peer_key_id, &bytes)
+            .await
+            .map(|_| ReplySend::Sent)
+            .map_err(CoordinatorError::from)
+    }
+
     /// Emit a [`ReplicationMessage`] on the underlying transport.
     /// Wraps via [`super::wire_frame::wrap`] (4-byte CRPL magic
     /// prefix + JSON body), then hands to [`Transport::send`]
@@ -838,7 +938,17 @@ impl ReplicationCoordinator {
         // it is bound to; unbound (a pre-v26 initiator's legacy round) it
         // answers on the v1/v2 raw path exactly as before — the wire version
         // then follows the message's EnvelopeKind (FSD §3.7).
-        let bytes = match &self.inbox {
+        let bytes = self.wire_bytes(msg);
+        self.transport
+            .send(&self.peer_key_id, &bytes)
+            .await
+            .map(|_| ())
+            .map_err(CoordinatorError::from)
+    }
+
+    /// The frame [`Self::send_message`] puts on the wire for `msg`.
+    fn wire_bytes(&self, msg: &ReplicationMessage) -> Vec<u8> {
+        match &self.inbox {
             RoleInbox::Initiator { .. } => {
                 super::wire_frame::wrap_v3(msg, RoundSide::Initiator, self.on_demand_round())
             }
@@ -846,12 +956,7 @@ impl ReplicationCoordinator {
                 0 => super::wire_frame::wrap_for_kind(msg),
                 round => super::wire_frame::wrap_v3(msg, RoundSide::Responder, round),
             },
-        };
-        self.transport
-            .send(&self.peer_key_id, &bytes)
-            .await
-            .map(|_| ())
-            .map_err(CoordinatorError::from)
+        }
     }
 
     /// CIRISEdge#462 — INITIATE a subject-scoped RECEIVE-axis pull: send this

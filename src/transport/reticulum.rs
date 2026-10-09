@@ -2531,6 +2531,10 @@ pub struct ReticulumTransport {
     /// would drop it ([`ReticulumTransport::drop_next_inbound_link_established_for_test`]).
     /// `false` in production.
     swallow_link_established: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#856 — the per-peer link-up rate (per proven identity, per
+    /// source address), judged on `LinkIdentified`. A `std` mutex: the critical
+    /// section is two map lookups.
+    link_up_bounds: std::sync::Mutex<crate::transport::link_up_bounds::LinkUpBounds>,
     /// CIRISEdge#853 — resources that concluded (completed or failed) in the
     /// last [`INBOUND_TRANSFER_STALL`], by hash: a data-plane `Started` /
     /// `Progress` arriving after its own control-plane completion is ignored
@@ -3526,6 +3530,11 @@ impl ReticulumTransport {
             inbound_idle_seen: std::sync::Mutex::new(HashMap::new()),
             swallow_link_closed: Arc::new(std::sync::Mutex::new(HashSet::new())),
             swallow_link_established: std::sync::atomic::AtomicBool::new(false),
+            link_up_bounds: std::sync::Mutex::new(
+                crate::transport::link_up_bounds::LinkUpBounds::new(
+                    crate::transport::link_up_bounds::LinkUpRatePolicy::default(),
+                ),
+            ),
             concluded_resources: std::sync::Mutex::new(HashMap::new()),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
@@ -3621,6 +3630,25 @@ impl ReticulumTransport {
             self.inbound_idle_bound_ms
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
+    }
+
+    /// **CIRISEdge#856 — the per-peer link-up rate** (builder): an inbound
+    /// link whose dialer has spent its link-up quota — per proven transport
+    /// identity, then per source address — is closed right after it
+    /// identifies, before it is attributed, and counted in
+    /// `link_ups_refused_total{rate_identity|rate_source}`. Default
+    /// [`LinkUpRatePolicy::default`](crate::transport::link_up_bounds::LinkUpRatePolicy)
+    /// (6 per identity, 24 per source, refilling 60 s after the last). Setting
+    /// the policy starts both ledgers fresh.
+    pub fn set_link_up_rate_policy(
+        &self,
+        policy: crate::transport::link_up_bounds::LinkUpRatePolicy,
+    ) {
+        *self
+            .link_up_bounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            crate::transport::link_up_bounds::LinkUpBounds::new(policy);
     }
 
     /// CIRISEdge#853 test seam — record LXMF serve activity on `link`, exactly
@@ -3940,6 +3968,18 @@ impl ReticulumTransport {
             .map(Vec::len)
             .sum();
         (identity, scoped)
+    }
+
+    /// CIRISEdge#856 test seam — drop every pooled identity link from the pool
+    /// WITHOUT closing it, so the next send dials a fresh link while the old
+    /// one stays up until something reaps it: the shape of a peer that dials
+    /// per round and leaves its links to go stale. Returns how many it leaked.
+    #[doc(hidden)]
+    pub async fn leak_pooled_links_for_test(&self) -> usize {
+        let mut pool = self.reusable_dialed_link.lock().await;
+        let n = pool.values().map(Vec::len).sum();
+        pool.clear();
+        n
     }
 
     /// CIRISEdge#819 test seam — the pooled identity-link ids (busy and idle).
@@ -7817,6 +7857,22 @@ impl Transport for ReticulumTransport {
                     // application frame within the establish window.
                     if let Some(m) = self.metrics.get() {
                         m.responder_link_up_expire();
+                        // CIRISEdge#856 — the rooted set the silence gauge
+                        // counts over, refreshed on the same tick.
+                        let rooted: Vec<String> = self
+                            .peers
+                            .lock()
+                            .await
+                            .iter()
+                            .filter(|(_, rp)| {
+                                matches!(
+                                    rp.provenance,
+                                    ciris_persist::federation::self_at_login::BindingProvenance::Rooted
+                                )
+                            })
+                            .map(|(k, _)| k.clone())
+                            .collect();
+                        m.set_rooted_peers(rooted.iter().map(String::as_str));
                     }
                     let closed = self.reap_idle_inbound_links().await;
                     if closed > 0 {
@@ -7911,6 +7967,7 @@ impl Transport for ReticulumTransport {
                         reusable_scoped_link: &self.reusable_scoped_link,
                         concluded_resources: &self.concluded_resources,
                         swallow_link_established: &self.swallow_link_established,
+                        link_up_bounds: &self.link_up_bounds,
                         link_last_outbound_at: &self.link_last_outbound_at,
                         av_sink: &self.av_sink,
                         av_node: &self.node,
@@ -9177,6 +9234,8 @@ struct EventCtx<'a> {
     /// CIRISEdge#853 test seam — see the field of the same name on
     /// [`ReticulumTransport`].
     swallow_link_established: &'a std::sync::atomic::AtomicBool,
+    /// CIRISEdge#856 — see the field of the same name on [`ReticulumTransport`].
+    link_up_bounds: &'a std::sync::Mutex<crate::transport::link_up_bounds::LinkUpBounds>,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     link_last_outbound_at: &'a std::sync::Mutex<HashMap<LinkId, u64>>,
     /// CIRISEdge#805 — see the field of the same name on [`ReticulumTransport`].
@@ -9629,6 +9688,82 @@ async fn transport_binding_of(
         transport: TransportIdentityPub::from_pub64(&stored.transport_pubkey64),
         source: BindingSource::StoredTransportDestination,
     })
+}
+
+/// CIRISEdge#856 — would this link-up by `identity` exceed the per-peer
+/// link-up rate? The source is the address of the connection the link arrived
+/// on (its interface, cached by id; a cache miss reads the interface table
+/// once). Spends the identity's (and source's) quota when it does not.
+fn link_up_refusal(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    identity: [u8; 16],
+) -> Option<crate::transport::link_up_bounds::LinkUpRefusal> {
+    let iface = ctx
+        .node
+        .link_list()
+        .into_iter()
+        .find(|l| l.link_id == link_id)
+        .and_then(|l| l.interface_index);
+    let cached = {
+        let bounds = ctx
+            .link_up_bounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        iface.and_then(|i| bounds.cached_source(i))
+    };
+    let names = if iface.is_some() && cached.is_none() {
+        ctx.node.interface_stats()
+    } else {
+        Vec::new()
+    };
+    let now = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+    let mut bounds = ctx
+        .link_up_bounds
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !names.is_empty() {
+        bounds.cache_sources(names.iter().map(|n| (n.interface_id.0, n.name.as_str())));
+    }
+    let source = iface.and_then(|i| bounds.cached_source(i)).flatten();
+    bounds.admit(identity, source.as_deref(), now).err()
+}
+
+/// CIRISEdge#856 — close a link refused by the link-up rate, count it, and say
+/// so (throttled per identity: the dialer that earns this is the one that
+/// would flood the log).
+async fn refuse_link_up(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    identity: [u8; 16],
+    refusal: crate::transport::link_up_bounds::LinkUpRefusal,
+) {
+    if let Some(m) = ctx.metrics {
+        m.inc_link_up_refused(refusal.as_str());
+        m.responder_link_up_end(link_id.into_bytes(), crate::observability::LINK_UP_REFUSED);
+    }
+    let key = hex::encode(identity);
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        link_up_refused_log().check(&key)
+    {
+        tracing::warn!(
+            link = ?link_id,
+            link_identity = %key,
+            reason = refusal.as_str(),
+            suppressed_prev,
+            "inbound link REFUSED after identification — this dialer is over its link-up \
+             rate; closed before attribution (CIRISEdge#856)"
+        );
+    }
+    let _ = ctx.node.close_link(&link_id).await;
+}
+
+/// CIRISEdge#856 — the link-up refusal WARN: one line per dialer identity per
+/// minute, the key map capped.
+fn link_up_refused_log() -> &'static crate::log_throttle::LogThrottle {
+    static THROTTLE: OnceLock<crate::log_throttle::LogThrottle> = OnceLock::new();
+    THROTTLE
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_secs(60), 1_024))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -10595,6 +10730,13 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
         } => {
             // CIRISEdge#853 — a link whose `LinkEstablished` edge never saw.
             recover_unknown_link(ctx, link_id).await;
+            // CIRISEdge#856 — the per-peer link-up rate, judged on the PROVEN
+            // identity before anything attributes or serves this link: a
+            // refused link is closed here and never carries a frame anywhere.
+            if let Some(refusal) = link_up_refusal(ctx, link_id, identity_hash) {
+                refuse_link_up(ctx, link_id, identity_hash, refusal).await;
+                return;
+            }
             // CIRISEdge#34 link half (v0.14.0) — emit `link_identified`
             // event with the peer's truncated identity hash. The peer
             // proved its identity over an already-established link via
@@ -18315,6 +18457,16 @@ const _: () = assert!(
 // edge's seam (both are `segment_index == total_segments`) — it would be routed
 // and fail verification downstream. Holding the body cap under the ceiling means
 // edge never submits a body that can reach that state.
+// CIRISEdge#856 — the responder's multi-segment reply gate judges against edge's
+// own copy of the segmentation threshold (the replication module builds without
+// leviculum); it must be leviculum's at the pin.
+const _: () = assert!(
+    crate::replication::wire_frame::SINGLE_SEGMENT_MAX_BYTES
+        == leviculum_core::resource::RESOURCE_MAX_EFFICIENT_SIZE,
+    "CIRISEdge#856: wire_frame::SINGLE_SEGMENT_MAX_BYTES drifted from leviculum's \
+     RESOURCE_MAX_EFFICIENT_SIZE — the multi-segment reply gate would misjudge"
+);
+
 const _: () = assert!(
     MAX_BODY_BYTES <= leviculum_std::driver::DEFAULT_MAX_ASSEMBLED_RESOURCE_SIZE,
     "CIRISEdge#537: edge admits a body larger than the transport will assemble — \

@@ -162,6 +162,32 @@ pub const WIRE_PROTOCOL_VERSION_V2: u8 = 0x02;
 /// (CIRISEdge#634, `FSD/REPLICATION_ROUND_CORRELATION.md` §3).
 pub const WIRE_PROTOCOL_VERSION_V3: u8 = 0x03;
 
+/// CIRISEdge#856 — the lowest round-open wire version the responder sends a
+/// MULTI-SEGMENT reply to. Pinned with the wire version, not configured.
+///
+/// The capability is reassembling a Resource past
+/// [`SINGLE_SEGMENT_MAX_BYTES`], which edge gained in v18.8.0 (leviculum#62).
+/// The responder cannot verify a peer's build, but it can verify what the peer
+/// put on the wire: v3 framing exists only in edge v26.0.0 and later
+/// (CIRISEdge#634), so a peer that opened its round with a v3 frame takes a
+/// multi-segment reply. A peer that opened with v1/v2 framing may predate
+/// v18.8.0, and a reply it cannot reassemble is never sent to it.
+pub const MULTI_SEGMENT_REPLY_WIRE_FLOOR: u8 = WIRE_PROTOCOL_VERSION_V3;
+
+/// CIRISEdge#856 — the largest frame that crosses as ONE Resource segment:
+/// the reference RNS `Resource.MAX_EFFICIENT_SIZE` (1 MiB − 1), past which the
+/// sender splits the transfer. The Reticulum transport asserts this equals
+/// leviculum's `RESOURCE_MAX_EFFICIENT_SIZE` at the pin.
+pub const SINGLE_SEGMENT_MAX_BYTES: usize = 1024 * 1024 - 1;
+
+/// CIRISEdge#856 — may a reply of `wire_len` bytes go to a peer whose round
+/// opened at `round_wire_version`? Everything fits one segment, or the peer is
+/// at the floor.
+#[must_use]
+pub const fn reply_shape_consumable(round_wire_version: u8, wire_len: usize) -> bool {
+    wire_len <= SINGLE_SEGMENT_MAX_BYTES || round_wire_version >= MULTI_SEGMENT_REPLY_WIRE_FLOOR
+}
+
 /// v3 `FLAGS` bit 0 — set when the sender is the round's RESPONDER (the
 /// frame is a reply to a round the receiver opened); clear when the sender
 /// is the round's INITIATOR (the frame opens or drives a round on the
