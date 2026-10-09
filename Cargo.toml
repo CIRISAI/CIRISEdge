@@ -910,8 +910,16 @@ tempfile       = { version = "3", optional = true }
 # transfer. What that completion carries for a SPLIT transfer is the FINAL
 # segment's `resource_hash`, not the one `send_resource_awaited` returned — see
 # `ship_resource_on_link`.
-leviculum-core = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.29.0+ciris.1", version = "0.29", optional = true }
-leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.29.0+ciris.1", version = "0.29", optional = true }
+# v0.30.0+ciris.1 (leviculum#74–#77) — SOURCE-COMPAT for edge: no edge call site
+# moved. New: direct links (#74), inert by default (`direct_connect_policy`
+# reject, no facilitator; edge sets neither); node telemetry (#76/#77:
+# `link_list`/`link_census`/`link_lifecycle`/`link_count_check`/`heap_census`,
+# `publish_metrics` onto the `metrics` facade, names in `METRIC_CATALOG`) — the
+# input for CIRISEdge#820 P1. `reject_link` now refuses only a pending inbound
+# request and CLOSES anything else; edge never calls it. `LinkCloseReason` is
+# unchanged.
+leviculum-core ={ git = "https://github.com/CIRISAI/leviculum", tag = "v0.30.0+ciris.1", version = "0.30", optional = true }
+leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.30.0+ciris.1", version = "0.30", optional = true }
 # v15.20.0 (CIRISEdge#169) — LXMF store-and-forward propagation. The
 # `leviculum-lxmf` workspace member (same pinned tag) ships the whole
 # LXMF wire protocol: propagation-node discovery/upload/`/get` codecs,
@@ -921,7 +929,7 @@ leviculum-std  = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.29.0+
 # features keep `pow` on (the stamp/ticket cost we validate at
 # admission). Gated behind the `lxmf` feature — see the `[features]`
 # block. Edge INTEGRATES this crate's protocol; it never reimplements it.
-leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.29.0+ciris.1", version = "0.29", optional = true }
+leviculum-lxmf = { git = "https://github.com/CIRISAI/leviculum", tag = "v0.30.0+ciris.1", version = "0.30", optional = true }
 
 # v0.11.0 (CIRISEdge#31) — Identity FFI QR codec. `qrcodegen` is the
 # canonical pure-Rust QR encoder (Apache-2.0, no_std, zero unsafe in
