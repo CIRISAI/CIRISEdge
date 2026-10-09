@@ -871,27 +871,34 @@ impl ReplicationCoordinator {
     /// Returns the name Pulled, or `None` when nothing is queued for this peer —
     /// the common case, and the caller then runs an ordinary round.
     ///
-    /// # What can be recovered, and why only that
+    /// # What can be recovered, and from whom
     ///
-    /// Exactly one thing: **this peer's own `Key`**, asked of this peer. The
-    /// responder answers an identifier `Pull` for the subject itself or for its
-    /// OWN record, and refuses a third-party probe — that refusal is what stops
-    /// a body-holding node becoming an address-book oracle for records it never
-    /// advertised. So "you signed a row I cannot verify, send me your key" is
-    /// the recoverable case, and a third-party signer is not fetchable by
-    /// identifier at all. Nothing else is ever queued, which is also what bounds
-    /// the queue: a peer can enqueue one name, its own.
+    /// The name queued is the signer a transient refusal named, asked of the
+    /// peer that delivered the row. The responder answers an identifier `Pull`
+    /// for three requesters (`subject_holdings` in the bridge): the subject
+    /// itself, anyone asking for the responder's OWN record, and — for any
+    /// other subject on a public plane — a requester that shares a TRUST ROOT
+    /// with it (rate limited). So "you signed a row I cannot verify, send me
+    /// your key" always recovers, and a third-party signer's key recovers only
+    /// between rooted peers: an unrooted fresh node asking the canonical for an
+    /// attester's key gets an empty Summary (logged at DEBUG on the responder,
+    /// "no mutual trust root"). That refusal is what stops a body-holding node
+    /// becoming an address-book oracle for records it never advertised.
     ///
     /// Only the `Key` coordinator recovers, because `start_pull` sends
     /// `PullMessage { kind: self.kind, .. }` and the row every stalled record
     /// waits on is a `Key` row.
     ///
-    /// # Failure
+    /// # Failure, and the park
     ///
     /// A send error is returned to the caller and the name is NOT re-queued
     /// here. The record that named it re-notes it on its next transient
-    /// refusal, so the retry rides #544's existing backoff rather than a second
-    /// unbounded timer (FSD-SIGNER-RECOVERY D6).
+    /// refusal. When the signer is absent from this directory that next
+    /// refusal is far off: the row is PARKED on the signer (CIRISEdge#679) on
+    /// the terminal schedule (30 min doubling to 6 h), and is re-asked early
+    /// only when the signer's `Key` admits through the apply path, or when the
+    /// host calls `release_signer` after writing the key locally
+    /// (CIRISEdge#858). There is no second timer here (FSD-SIGNER-RECOVERY D6).
     pub async fn send_recovery_pull(&self) -> Result<Option<String>, CoordinatorError> {
         if self.kind != EnvelopeKind::Key {
             return Ok(None);

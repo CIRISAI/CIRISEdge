@@ -1619,6 +1619,25 @@ impl ReplicationRuntime {
         self.scheduler_handle.round_bound()
     }
 
+    /// CIRISEdge#858 — the host's release hook: release every row this node
+    /// parked on `key_id` and ask the peers that offered them again now. Call
+    /// it after ANY local key registration and after an owner-binding write
+    /// (a claim): those bypass the apply choke that would otherwise release
+    /// the park, and the rows would wait out their terminal window. See
+    /// [`FederationDirectoryReplicationBridge::release_signer`].
+    pub fn release_signer(&self, key_id: &str) -> usize {
+        self.bridge.release_signer(key_id)
+    }
+
+    /// CIRISEdge#858 — [`Self::release_signer`] for a row written locally,
+    /// given as its wire bytes: releases the signer the row binds and the key
+    /// that signed it. One call after `apply_signed_owner_binding` covers a
+    /// claim. See
+    /// [`FederationDirectoryReplicationBridge::release_bound_signer`].
+    pub fn release_bound_signer(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> usize {
+        self.bridge.release_bound_signer(kind, envelope_bytes)
+    }
+
     /// The runtime's bridge. Useful for telemetry or tests that
     /// want to inspect cache state.
     pub fn bridge(&self) -> Arc<FederationDirectoryReplicationBridge> {
