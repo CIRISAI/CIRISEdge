@@ -27,7 +27,6 @@
 use std::sync::Arc;
 
 use ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome as AttestationOutcome;
-use ciris_persist::federation::register::ReplicatedKeyOutcome as KeyOutcome;
 use ciris_persist::federation::{FederationDirectory, SignedAttestation, SignedKeyRecord};
 
 use crate::messages::{
@@ -353,15 +352,16 @@ impl AdmissionDoors {
                 }
             };
         }
-        match self
+        // One mapping with the bridge door above: a persist outcome variant
+        // added later (v54's `ScrubsRehydrated`) lands in the bridge's
+        // exhaustive match, not in this arm's catch-all as a refusal.
+        let result = self
             .directory
             .apply_replicated_key_record(record.clone())
-            .await
-        {
-            Ok(KeyOutcome::Inserted | KeyOutcome::Upgraded | KeyOutcome::Rebound) => {
-                Ok(KeyAdmit::Admitted)
-            }
-            Ok(KeyOutcome::Unchanged) => Ok(KeyAdmit::Held),
+            .await;
+        match crate::replication::bridge::key_outcome_to_apply(result, "first-contact").0 {
+            crate::replication::summary::ApplyOutcome::Admitted => Ok(KeyAdmit::Admitted),
+            crate::replication::summary::ApplyOutcome::Duplicate => Ok(KeyAdmit::Held),
             other => {
                 tracing::warn!(
                     key_id = %record.record.key_id,
