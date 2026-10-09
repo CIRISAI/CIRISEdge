@@ -766,6 +766,12 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
     );
     // CIRISEdge#858 — the replication refusal memory's park ledger.
     insert_park_ledger(&edge.metrics().snapshot(), &mut counters, &mut gauges);
+    // CIRISEdge#805 — the A/V plane ledger (`EdgeMetrics::av_plane`): sends,
+    // the #720 named refusal, arrivals, sink deliveries and every drop label,
+    // one counter per label, as the Rust snapshot and the pyo3 dict carry it.
+    for (label, n) in edge.metrics().av_plane() {
+        counters.insert(format!("av_plane.{label}"), n);
+    }
     #[allow(clippy::cast_precision_loss)]
     gauges.insert(
         "reachability.peer_medium_count".to_string(),
