@@ -1145,6 +1145,7 @@ dependencies = [
  "tokio-rustls",
  "tower",
  "tracing",
+ "tracing-log",
  "tracing-subscriber",
  "uniffi",
  "uuid",

@@ -544,6 +544,9 @@ tracing     = "0.1"
 # every `tracing::info!`/`error!` it emitted went nowhere — five consecutive
 # mesh runs were debugged blind with the diagnostics compiled in and silent.
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+# CIRISEdge#815 — init_logging bridges `log` records itself, so a host-owned
+# `log` logger is a separate, non-fatal outcome (not tracing-subscriber's try_init).
+tracing-log = { version = "0.2", optional = true }
 
 # Federation-session KEX (CIRISEdge#54). `zeroize` for explicit
 # scrub of session keys + KEX private material — same crate used
@@ -1232,8 +1235,12 @@ codec-default          = ["codec-fountain", "codec-av1", "codec-opus"]
 # this, the maturin wheel build (`features = ["pyo3"]` per pyproject) leaves
 # the reticulum-gated items unused and `-D warnings` fails the build.
 pyo3                  = [
+    "_pyffi",
     "dep:pyo3",
     "dep:pyo3-async-runtimes",
+    # CIRISEdge#814 — `ciris_edge.init_logging()`: a Python host otherwise
+    # never sees an edge log line (no subscriber is ever installed).
+    "dep:tracing-subscriber",
     # v3.0.0 — `dep:pyo3-stub-gen` dropped pending the upstream 0.29
     # release. See the commented-out `pyo3-stub-gen = ...` block above
     # for the full rationale + the no-op shape this leaves in
@@ -1266,9 +1273,18 @@ pyo3                  = [
 # `BackendDispatch` runtime arm the sqlite-only wheel never matches.
 # iOS/Android PyO3 lanes can adopt this too and drop their vendored-
 # openssl cross-compile builds.
+# CIRISEdge#824 — the binding code compiles under `_pyffi`, which BOTH Python
+# features enable. Before this, every gate named `pyo3`, so a `pyo3-sqlite`
+# wheel (Windows, Android) carried the pyo3 dependency and none of the module:
+# no `PyInit_ciris_edge`, and `import ciris_edge` failed. Internal: enable
+# `pyo3` or `pyo3-sqlite`, never `_pyffi` alone.
+_pyffi                = ["dep:tracing-log"]
+
 pyo3-sqlite           = [
+    "_pyffi",
     "dep:pyo3",
     "dep:pyo3-async-runtimes",
+    "dep:tracing-subscriber",
     "ciris-persist/pyo3-sqlite",
     "transport-reticulum",
     "ffi-uniffi",
