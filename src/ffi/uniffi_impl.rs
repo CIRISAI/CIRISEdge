@@ -764,6 +764,8 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
         "blob.serve_legacy_dag_walks_total".to_string(),
         edge.metrics().blob_serve_legacy_dag_walks(),
     );
+    // CIRISEdge#858 — the replication refusal memory's park ledger.
+    insert_park_ledger(&edge.metrics().snapshot(), &mut counters, &mut gauges);
     #[allow(clippy::cast_precision_loss)]
     gauges.insert(
         "reachability.peer_medium_count".to_string(),
@@ -781,6 +783,52 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
         snapshot_at: chrono::Utc::now().to_rfc3339(),
         window_seconds: tracker.window_seconds(),
     })
+}
+
+/// CIRISEdge#858 — the replication refusal memory's park ledger, flattened
+/// into the UniFFI snapshot's maps: parks per plane and in total, releases,
+/// dropped re-asks and park evictions as counters; the memory's size and
+/// bounds as gauges.
+fn insert_park_ledger(
+    bundle: &crate::observability::EdgeMetricsBundle,
+    counters: &mut std::collections::HashMap<String, u64>,
+    gauges: &mut std::collections::HashMap<String, f64>,
+) {
+    let mut parked_total: u64 = 0;
+    for (kind, n) in &bundle.rows_parked_on_signer {
+        parked_total = parked_total.saturating_add(*n);
+        counters.insert(
+            format!("replication.rows_parked_on_signer.{}", kind.as_wire_str()),
+            *n,
+        );
+    }
+    for (name, value) in [
+        ("replication.rows_parked_on_signer_total", parked_total),
+        ("replication.signer_releases_total", bundle.signer_releases),
+        (
+            "replication.retry_suppressions_total",
+            bundle.retry_suppressions,
+        ),
+        (
+            "replication.signer_park_evictions_total",
+            bundle.signer_park_evictions,
+        ),
+    ] {
+        counters.insert(name.to_string(), value);
+    }
+    let rm = bundle.refusal_memory;
+    for (name, value) in [
+        ("replication.refusal_memory_len", rm.len),
+        ("replication.refusal_memory_capacity", rm.capacity),
+        ("replication.parked_on_signer_len", rm.parked_on_signer_len),
+        (
+            "replication.parked_on_signer_capacity",
+            rm.parked_on_signer_capacity,
+        ),
+    ] {
+        #[allow(clippy::cast_precision_loss)]
+        gauges.insert(name.to_string(), value as f64);
+    }
 }
 
 pub fn recent_events(

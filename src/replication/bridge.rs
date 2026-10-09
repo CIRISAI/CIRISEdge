@@ -1893,6 +1893,11 @@ pub struct FederationDirectoryReplicationBridge {
     /// CIRISEdge#679 — rows RELEASED because their signer's `Key` admitted
     /// through this choke. The convergence half of the same witness.
     signer_releases: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge#858 — one park line per signer per window (and one
+    /// park-eviction WARN per window). On the bridge rather than a static so a
+    /// restarted runtime logs its first park of each signer again, exactly as
+    /// a restarted process would.
+    park_log: crate::log_throttle::LogThrottle,
 }
 
 /// CIRISEdge#523 — one memoized owner-binding resolution for one node.
@@ -2122,6 +2127,7 @@ impl FederationDirectoryReplicationBridge {
             retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
             rows_parked_on_signer: std::sync::atomic::AtomicUsize::new(0),
             signer_releases: std::sync::atomic::AtomicUsize::new(0),
+            park_log: park_log_throttle(),
         }
     }
 
@@ -2215,6 +2221,7 @@ impl FederationDirectoryReplicationBridge {
             retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
             rows_parked_on_signer: std::sync::atomic::AtomicUsize::new(0),
             signer_releases: std::sync::atomic::AtomicUsize::new(0),
+            park_log: park_log_throttle(),
         }
     }
 
@@ -2443,6 +2450,18 @@ impl FederationDirectoryReplicationBridge {
     /// scheduler. Without it a released row waits for the next cadence tick.
     pub fn install_release_kick(&self, scheduler: super::scheduler::SchedulerHandle) {
         let _ = self.release_kick.set(scheduler);
+    }
+
+    /// CIRISEdge#858 — size the refusal memory: `max_keys` ordinary rows
+    /// ([`refusal_backoff::DEFAULT_MAX_KEYS`](super::refusal_backoff::DEFAULT_MAX_KEYS)
+    /// by default) and `max_parked` rows parked on a signer
+    /// ([`refusal_backoff::DEFAULT_MAX_PARKED`](super::refusal_backoff::DEFAULT_MAX_PARKED)).
+    /// For tests and a host with an unusually wide stuck set; replaces the
+    /// (empty) memory, so call it at construction.
+    #[must_use]
+    pub fn with_refusal_capacities(mut self, max_keys: usize, max_parked: usize) -> Self {
+        self.refusal_backoff = RefusalBackoff::with_capacities(max_keys, max_parked);
+        self
     }
 
     /// persist v52.0.0 (CIRISPersist#955, CIRISConstitution#133) — install the
@@ -3922,6 +3941,10 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         if hit {
             self.retry_suppressions
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // CIRISEdge#858 — and into the metrics bag a scrape reads.
+            if let Some(m) = &self.metrics {
+                m.inc_retry_suppressions();
+            }
         }
         hit
     }
@@ -4199,73 +4222,213 @@ impl FederationDirectoryReplicationBridge {
         Some(bytes)
     }
 
-    /// CIRISEdge#776 — an admitted owner binding or identity occurrence made
-    /// its node / occurrence key an occurrence of an identity: release the rows
-    /// refused while that SIGNER was unbound (keyed on the signer — never a
-    /// blanket clear) and ask the peers that offered them again NOW, through
-    /// the scheduler's per-coordinator kick (one per (plane, peer); coalesced,
-    /// never a doubled round, never blocking this apply). The release forgets
-    /// the rows, so a kicked re-ask refused again is booked afresh on the
-    /// ordinary window and is never kicked twice by one release.
-    fn release_newly_bound_signer(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) {
-        let Some(signer) = newly_bound_signer_of(kind, envelope_bytes) else {
-            return;
-        };
-        let (released, ask) = self.refusal_backoff.release_signer_from(&signer);
+    /// CIRISEdge#679 / #776 / #858 — release every row indexed on `signer` (a
+    /// park on its absent `Key`, or an occurrence waiting on its standing) and
+    /// ask the peers that offered them again NOW, through the scheduler's
+    /// per-coordinator kick (one per (plane, peer); coalesced, never a doubled
+    /// round, never blocking the caller). Keyed on the signer — never a blanket
+    /// clear. The release forgets the rows, so a kicked re-ask refused again is
+    /// booked afresh and is never kicked twice by one release. Returns how many
+    /// rows were released.
+    fn release_and_kick(&self, signer: &str, cause: ReleaseCause) -> usize {
+        let (released, ask) = self.refusal_backoff.release_signer_from(signer);
         if released == 0 {
-            return;
+            return 0;
         }
         self.signer_releases
             .fetch_add(released, std::sync::atomic::Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.add_signer_releases(u64::try_from(released).unwrap_or(u64::MAX));
+        }
+        self.book_refusal_memory();
         let kicked = self.release_kick.get().map_or(0, |scheduler| {
             ask.iter()
                 .filter(|(plane, peer)| scheduler.try_kick(peer, *plane))
                 .count()
         });
-        tracing::info!(
-            signer = %signer,
-            released,
-            kicked,
-            "signer is now bound to its identity — released the rows refused while it \
-             was not, and asked their peers again now (CIRISEdge#776)"
-        );
+        match cause {
+            ReleaseCause::KeyAdmitted => tracing::info!(
+                signer = %signer,
+                released,
+                kicked,
+                "signer's Key landed — released the rows parked on it and asked their \
+                 peers again now (CIRISEdge#679)"
+            ),
+            ReleaseCause::SignerBound => tracing::info!(
+                signer = %signer,
+                released,
+                kicked,
+                "signer is now bound to its identity — released the rows refused while it \
+                 was not, and asked their peers again now (CIRISEdge#776)"
+            ),
+            ReleaseCause::Host => tracing::info!(
+                signer = %signer,
+                released,
+                kicked,
+                "the host released the rows parked on this signer after a local key \
+                 registration or owner binding, and asked their peers again now \
+                 (CIRISEdge#858)"
+            ),
+        }
+        released
     }
 
-    /// CIRISEdge#776 — a `Transient` identity-occurrence refusal whose signer's
-    /// Key IS held but which no live owner binding names: persist's gated door
-    /// refused it because the binding has not arrived yet (the standup race).
-    /// It keeps its transient window but is indexed on the signer (and the peer
-    /// that offered it), so the binding's admission releases and re-asks it at
-    /// once. A signer that IS bound is never indexed: its refusal was about
-    /// something else, and it waits on the ordinary window — which is what
-    /// keeps a release from turning into a kick loop.
-    async fn index_unbound_occurrence(
-        &self,
-        kind: EnvelopeKind,
-        envelope_bytes: &[u8],
-        signer: &str,
-        source_peer: Option<&str>,
-    ) {
-        use sha2::{Digest as _, Sha256};
-        if kind != EnvelopeKind::IdentityOccurrence
-            || !matches!(
-                ciris_persist::federation::admission::owner_of(&*self.directory, signer).await,
-                Ok(None)
-            )
-        {
+    /// CIRISEdge#858 — **the host's release hook.** Release every row this node
+    /// parked on `key_id` and ask the peers that offered them again now.
+    ///
+    /// The bridge releases a park itself when the dependency arrives THROUGH
+    /// the replication apply choke (a `Key` admit; an owner binding or
+    /// occurrence that binds the signer). A host that writes the dependency
+    /// LOCALLY — a key registration, the server's `apply_signed_owner_binding`
+    /// on a claim — bypasses the choke, and without this call the parked rows
+    /// wait out their terminal window (up to 6 h) although they would now
+    /// admit. Call it after ANY local key registration (`key_id` = the
+    /// registered key) and after an owner-binding write (the owner's key, and
+    /// the bound node's; or use [`Self::release_bound_signer`] with the
+    /// binding's bytes). Idempotent and cheap; releasing a signer nothing is
+    /// parked on is a no-op. Returns how many rows were released.
+    pub fn release_signer(&self, key_id: &str) -> usize {
+        self.release_and_kick(key_id, ReleaseCause::Host)
+    }
+
+    /// CIRISEdge#858 — [`Self::release_signer`] for a row the host just wrote
+    /// locally, given as its wire bytes on `kind`: releases the rows waiting on
+    /// the signer the row BINDS (an owner binding's node, an occurrence's
+    /// occurrence key — the #776 release the apply choke would have fired) AND
+    /// on the key that SIGNED it (the owner, whose Key a claim has just
+    /// written). One call after `apply_signed_owner_binding` covers both.
+    /// Returns how many rows were released.
+    pub fn release_bound_signer(&self, kind: EnvelopeKind, envelope_bytes: &[u8]) -> usize {
+        let bound = newly_bound_signer_of(kind, envelope_bytes);
+        let signed_by = crate::replication::missing_signer::missing_signer_of(kind, envelope_bytes);
+        let mut released = 0;
+        if let Some(bound) = &bound {
+            released += self.release_and_kick(bound, ReleaseCause::Host);
+        }
+        if let Some(signed_by) = signed_by.filter(|s| Some(s) != bound.as_ref()) {
+            released += self.release_and_kick(&signed_by, ReleaseCause::Host);
+        }
+        released
+    }
+
+    /// CIRISEdge#858 — mirror the refusal memory's size and bounds into the
+    /// metrics bag (a gauge that is set where the memory changes, so a scrape
+    /// is current without reaching into the runtime).
+    fn book_refusal_memory(&self) {
+        let Some(m) = &self.metrics else {
+            return;
+        };
+        let as_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        let b = &self.refusal_backoff;
+        m.set_refusal_memory(crate::observability::RefusalMemoryGauges {
+            len: as_u64(b.len()),
+            capacity: as_u64(b.capacity().saturating_add(b.park_capacity())),
+            parked_on_signer_len: as_u64(b.parked_on_signer_len()),
+            parked_on_signer_capacity: as_u64(b.park_capacity()),
+        });
+    }
+
+    /// CIRISEdge#858 — count one park, on the bridge and in the metrics bag.
+    fn book_park(&self, kind: EnvelopeKind) {
+        self.rows_parked_on_signer
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(m) = &self.metrics {
+            m.inc_rows_parked_on_signer(kind);
+        }
+    }
+
+    /// CIRISEdge#858 — a park that evicted older parks from the park ring
+    /// costs each of them one re-ask: count it, and say so once per window.
+    fn note_park_evictions(&self, before: u64) {
+        let after = self.refusal_backoff.park_evictions();
+        let evicted = after.saturating_sub(before);
+        if evicted == 0 {
             return;
         }
-        let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
-        if self
-            .refusal_backoff
-            .index_waiting_on(kind, hash, signer, source_peer)
+        if let Some(m) = &self.metrics {
+            m.add_signer_park_evictions(evicted);
+        }
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            self.park_log.check("park-capacity-eviction")
         {
-            tracing::debug!(
-                envelope_hash = %hex::encode(&hash[..8]),
+            tracing::warn!(
+                capacity = self.refusal_backoff.park_capacity(),
+                evicted_total = after,
+                suppressed_prev,
+                "the park capacity is full: evicted the oldest parked row(s); each will be \
+                 asked for once more and re-parked if its signer is still absent \
+                 (CIRISEdge#858)"
+            );
+        }
+    }
+
+    /// CIRISEdge#858 — is this node UNCLAIMED: does no owner binding name any
+    /// of its own keys? A directory read, made only when a park line is about
+    /// to be written (once per signer per window). A read error answers
+    /// `false` — the line must not claim what the node could not check.
+    async fn node_is_unclaimed(&self) -> bool {
+        let own: Vec<&str> = [
+            self.local_key_id.as_deref(),
+            self.serve_tier_subject.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if own.is_empty() {
+            return false;
+        }
+        for key in own {
+            if !matches!(
+                ciris_persist::federation::admission::owner_of(&*self.directory, key).await,
+                Ok(None)
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// CIRISEdge#858 — the park's one line per signer per window, at INFO:
+    /// how many rows wait on `signer` now, and on what. The refusal itself
+    /// already WARNed (once per signer per window, at the session's choke);
+    /// this line says the row is parked rather than retried, and — on a fresh
+    /// node — why: an unclaimed node holds no owner Key, so the rows of
+    /// identities it has not met wait for a claim or the Key.
+    async fn log_park(&self, kind: EnvelopeKind, signer: &str, absent_key: bool) {
+        let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            self.park_log.check(signer)
+        else {
+            return;
+        };
+        let parked = self.refusal_backoff.parked_on(signer);
+        if !absent_key {
+            tracing::info!(
+                kind = ?kind,
                 signer = %signer,
-                from = source_peer.unwrap_or("<unattributed>"),
-                "occurrence refused before its signer was bound — indexed on the \
-                 signer; its binding releases and re-asks it (CIRISEdge#776)"
+                parked,
+                suppressed_prev,
+                "parked {parked} row(s) on signer {signer}: it is registered here but does \
+                 not (yet) act for the identity it signed for; released when its binding \
+                 or occurrence lands (CIRISEdge#858)"
+            );
+        } else if self.node_is_unclaimed().await {
+            tracing::info!(
+                kind = ?kind,
+                signer = %signer,
+                parked,
+                suppressed_prev,
+                "parked {parked} row(s) on absent Key {signer}: this node is UNCLAIMED (no \
+                 owner yet), so rows attested by keys it has not met wait here until a \
+                 claim or the Key arrives (CIRISEdge#858)"
+            );
+        } else {
+            tracing::info!(
+                kind = ?kind,
+                signer = %signer,
+                parked,
+                suppressed_prev,
+                "parked {parked} row(s) on absent Key {signer}: waiting on a key this node \
+                 has not met; released when it lands (CIRISEdge#858)"
             );
         }
     }
@@ -4282,14 +4445,26 @@ impl FederationDirectoryReplicationBridge {
     ///   schedule — instead of re-asked every 20…300 s forever. Measured on the
     ///   canonical: 107 unknown-attester refusals in 6 h, the same keys a month
     ///   later (CIRISServer#488).
+    /// - CIRISEdge#858 — a **transient identity-occurrence refusal whose
+    ///   signer IS held** ("signer S is neither identity I nor an active
+    ///   occurrence of it, nor a node it owns", or any other refusal of a row
+    ///   whose signer this node has met) is indexed on the signer in every
+    ///   case and, from its second refusal, quiet on the terminal schedule. The
+    ///   #776 standup race clears on the first window; anything still refused
+    ///   after it is waiting on a binding or occurrence that releases it.
     /// - A **`Key` admit** RELEASES every row parked on that key at once, so a
     ///   row parked at 09:00 whose signer registers at 09:01 is re-asked on the
     ///   next round, not at 09:30. This is the convergence the park waits for.
+    /// - An **admitted owner binding or identity occurrence** releases the rows
+    ///   indexed on the signer it binds (#776). Admitted only, never a
+    ///   duplicate: a re-delivered binding binds nothing new, and releasing on
+    ///   it would re-ask every row indexed on an already-bound signer each time
+    ///   a peer re-pushes the binding.
     ///
     /// Gates the ASK only, like all of #544: an unsolicited push of parked
     /// bytes is still applied on its merits. Never touches how the refusal was
-    /// classified — it reads the outcome's disposition and the row's named
-    /// signer, both already decided.
+    /// classified — it reads the outcome's disposition, the row's named signer
+    /// and the directory, all already decided.
     async fn park_or_release(
         &self,
         kind: EnvelopeKind,
@@ -4299,21 +4474,20 @@ impl FederationDirectoryReplicationBridge {
     ) {
         use sha2::{Digest as _, Sha256};
         match outcome.retry_disposition() {
-            // CIRISEdge#776 — an admitted owner binding or identity occurrence
-            // makes its node/occurrence key an occurrence of an identity: rows
-            // refused because that SIGNER was not yet bound are released now,
-            // keyed on the signer (never a blanket clear).
-            None if matches!(
-                kind,
-                EnvelopeKind::Attestation | EnvelopeKind::IdentityOccurrence
-            ) =>
+            None if outcome.is_admitted()
+                && matches!(
+                    kind,
+                    EnvelopeKind::Attestation | EnvelopeKind::IdentityOccurrence
+                ) =>
             {
-                self.release_newly_bound_signer(kind, envelope_bytes);
+                if let Some(signer) = newly_bound_signer_of(kind, envelope_bytes) {
+                    self.release_and_kick(&signer, ReleaseCause::SignerBound);
+                }
             }
             None if kind == EnvelopeKind::Key => {
                 // The admitted (or already-held) key's id sits on the wrapper's
                 // `record` or at the top level (the legacy wire).
-                let Some(key_id) = serde_json::from_slice::<serde_json::Value>(envelope_bytes)
+                if let Some(key_id) = serde_json::from_slice::<serde_json::Value>(envelope_bytes)
                     .ok()
                     .and_then(|v| {
                         v.pointer("/record/key_id")
@@ -4321,56 +4495,102 @@ impl FederationDirectoryReplicationBridge {
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_owned)
                     })
-                else {
-                    return;
-                };
-                let released = self.refusal_backoff.release_signer(&key_id);
-                if released > 0 {
-                    self.signer_releases
-                        .fetch_add(released, std::sync::atomic::Ordering::Relaxed);
-                    tracing::info!(
-                        signer = %key_id,
-                        released,
-                        "signer's Key landed — released the rows parked on it; the next \
-                         round asks for them again (CIRISEdge#679)"
-                    );
+                {
+                    self.release_and_kick(&key_id, ReleaseCause::KeyAdmitted);
                 }
             }
             Some(RetryDisposition::Transient) => {
-                let Some(signer) =
+                if let Some(signer) =
                     crate::replication::missing_signer::missing_signer_of(kind, envelope_bytes)
-                else {
-                    return;
-                };
-                // The store lookup the apply loop could not afford: is the named
-                // signer GENUINELY absent? A present signer means the refusal was
-                // about something else (a roster, a race) and the ordinary #544
-                // window stands — with one exception below.
-                if !matches!(self.directory.lookup_public_key(&signer).await, Ok(None)) {
-                    // CIRISEdge#776 — an identity occurrence whose (registered)
-                    // signer is not yet BOUND: indexed on the signer.
-                    self.index_unbound_occurrence(kind, envelope_bytes, &signer, source_peer)
-                        .await;
-                    return;
+                {
+                    let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+                    // The store lookup the apply loop could not afford: is the
+                    // named signer GENUINELY absent? A held signer on any plane
+                    // but the occurrence plane means the refusal was about
+                    // something else (a roster, a race) and the ordinary #544
+                    // window stands; a read error parks nothing.
+                    match self.directory.lookup_public_key(&signer).await {
+                        Ok(None) => {
+                            self.park_on_absent_key(kind, hash, &signer, source_peer)
+                                .await;
+                        }
+                        Ok(Some(_)) if kind == EnvelopeKind::IdentityOccurrence => {
+                            self.park_on_held_signer(kind, hash, &signer, source_peer)
+                                .await;
+                        }
+                        _ => {}
+                    }
                 }
-                let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
-                let window =
-                    self.refusal_backoff
-                        .record_waiting_on_at(kind, hash, &signer, Instant::now());
-                self.rows_parked_on_signer
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                tracing::debug!(
-                    kind = ?kind,
-                    envelope_hash = %hex::encode(&hash[..8]),
-                    signer = %signer,
-                    backoff_secs = window.as_secs(),
-                    parked = self.refusal_backoff.parked_on_signer_len(),
-                    "apply refused STRUCTURALLY — the signer's Key is not held; parked \
-                     until it lands, quiet meanwhile (CIRISEdge#679)"
-                );
             }
             _ => {}
         }
+        self.book_refusal_memory();
+    }
+
+    /// CIRISEdge#679 — park a refused row on its signer's ABSENT `Key`, on the
+    /// terminal schedule. CIRISEdge#858 — the refusal is already booked by
+    /// [`Self::remember_outcome`], so the park does not count it again (the
+    /// first window is `TERMINAL_BASE`, 1800 s), and it remembers the peer
+    /// that offered the bytes so the Key's arrival kicks a re-ask of it.
+    async fn park_on_absent_key(
+        &self,
+        kind: EnvelopeKind,
+        hash: [u8; 32],
+        signer: &str,
+        source_peer: Option<&str>,
+    ) {
+        let evictions = self.refusal_backoff.park_evictions();
+        let window =
+            self.refusal_backoff
+                .park_booked_at(kind, hash, signer, source_peer, Instant::now());
+        self.book_park(kind);
+        self.note_park_evictions(evictions);
+        tracing::debug!(
+            kind = ?kind,
+            envelope_hash = %hex::encode(&hash[..8]),
+            signer = %signer,
+            backoff_secs = window.as_secs(),
+            parked = self.refusal_backoff.parked_on_signer_len(),
+            "apply refused STRUCTURALLY — the signer's Key is not held; parked \
+             until it lands, quiet meanwhile (CIRISEdge#679)"
+        );
+        self.log_park(kind, signer, true).await;
+    }
+
+    /// CIRISEdge#858 (generalising #776) — index a refused identity
+    /// occurrence on its HELD signer, in every case, and from the second
+    /// refusal put it on the terminal schedule. Its release is the #776 one:
+    /// the admitted binding or occurrence that makes the signer act for the
+    /// identity. Directory reads only (the Key lookup the caller made).
+    async fn park_on_held_signer(
+        &self,
+        kind: EnvelopeKind,
+        hash: [u8; 32],
+        signer: &str,
+        source_peer: Option<&str>,
+    ) {
+        let evictions = self.refusal_backoff.park_evictions();
+        let Some(window) = self.refusal_backoff.index_held_signer_at(
+            kind,
+            hash,
+            signer,
+            source_peer,
+            Instant::now(),
+        ) else {
+            return;
+        };
+        self.book_park(kind);
+        self.note_park_evictions(evictions);
+        tracing::debug!(
+            envelope_hash = %hex::encode(&hash[..8]),
+            signer = %signer,
+            from = source_peer.unwrap_or("<unattributed>"),
+            backoff_secs = window.as_secs(),
+            "occurrence refused while its (registered) signer does not act for the \
+             identity — indexed on the signer; its binding or occurrence releases and \
+             re-asks it (CIRISEdge#776/#858)"
+        );
+        self.log_park(kind, signer, false).await;
     }
 
     /// CIRISEdge#679/#776 — rows CURRENTLY indexed on a signer (an absent
@@ -4380,18 +4600,26 @@ impl FederationDirectoryReplicationBridge {
         self.refusal_backoff.parked_on_signer_len()
     }
 
-    /// CIRISEdge#679 — rows parked on an absent signer since construction.
+    /// CIRISEdge#679 — rows parked on a signer since construction.
     #[must_use]
     pub fn rows_parked_on_signer(&self) -> usize {
         self.rows_parked_on_signer
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// CIRISEdge#679 — rows released by a signer's `Key` admit since construction.
+    /// CIRISEdge#679 — rows released from a park since construction (a `Key`
+    /// admit, a binding admit, or the host's [`Self::release_signer`]).
     #[must_use]
     pub fn signer_releases(&self) -> usize {
         self.signer_releases
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#858 — the refusal memory, for tests that drive its schedule
+    /// at an instant of their choosing.
+    #[cfg(test)]
+    pub(crate) fn refusal_backoff_for_test(&self) -> &RefusalBackoff {
+        &self.refusal_backoff
     }
 }
 
@@ -4948,9 +5176,13 @@ impl FederationDirectoryReplicationBridge {
     }
 
     /// CIRISEdge#544 — how many `(plane, content hash)` rows are currently
-    /// remembered as refused. Bounded by
-    /// [`refusal_backoff::DEFAULT_MAX_KEYS`](super::refusal_backoff::DEFAULT_MAX_KEYS);
-    /// a bound nobody can read is a bound that silently stops holding.
+    /// remembered as refused, both classes. Bounded by
+    /// [`refusal_backoff::DEFAULT_MAX_KEYS`](super::refusal_backoff::DEFAULT_MAX_KEYS)
+    /// ordinary rows plus
+    /// [`refusal_backoff::DEFAULT_MAX_PARKED`](super::refusal_backoff::DEFAULT_MAX_PARKED)
+    /// parked ones (CIRISEdge#858); a bound nobody can read is a bound that
+    /// silently stops holding. Also in the metrics snapshot as
+    /// `refusal_memory_len` / `refusal_memory_capacity`.
     #[must_use]
     pub fn refusal_memory_len(&self) -> usize {
         self.refusal_backoff.len()
@@ -23684,6 +23916,28 @@ mod sweep_width_tests {
 /// The `attestation_type` an owner binding carries, as bytes for the scan.
 const DELEGATES_TO_BYTES: &[u8] =
     ciris_persist::federation::types::attestation_type::DELEGATES_TO.as_bytes();
+
+/// CIRISEdge#858 — why a park was released (the release line's wording).
+#[derive(Debug, Clone, Copy)]
+enum ReleaseCause {
+    /// The signer's `Key` admitted through the apply choke.
+    KeyAdmitted,
+    /// An owner binding or occurrence that binds the signer admitted.
+    SignerBound,
+    /// The host's release hook, after a local write.
+    Host,
+}
+
+/// CIRISEdge#858 — the window of the park log: one line per signer per
+/// `TERMINAL_BASE`, the park's own first window, so a row that is still parked
+/// when its window lapses earns a fresh line and nothing in between does.
+fn park_log_throttle() -> crate::log_throttle::LogThrottle {
+    crate::log_throttle::LogThrottle::new(
+        1,
+        super::refusal_backoff::TERMINAL_BASE,
+        super::refusal_backoff::DEFAULT_MAX_KEYS,
+    )
+}
 
 /// CIRISEdge#776 — the key an admitted row makes an occurrence of an identity:
 /// an owner binding's bound node (`delegates_to` with an owner-binding
