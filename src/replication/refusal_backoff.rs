@@ -43,7 +43,9 @@
 //! The map key contains a content hash a peer chooses by choosing what to offer.
 //! An unbounded map would relocate the exhaustion vector into the mitigation —
 //! the [`crate::log_throttle`] lesson. Same cure: a front-drop cap
-//! ([`DEFAULT_MAX_KEYS`]). Evicting an entry only costs one re-ask.
+//! ([`DEFAULT_MAX_KEYS`]). Evicting an entry only costs one re-ask. Rows
+//! parked on a signer have a ring of their own ([`DEFAULT_MAX_PARKED`],
+//! CIRISEdge#858), so ordinary refusals cannot evict them.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -152,11 +154,33 @@ pub const TERMINAL_BASE: Duration = Duration::from_secs(1800);
 /// genuinely moves (the conflicting local row is pruned) is re-asked within 6
 /// hours with no operator action and no knowledge that this memory exists.
 pub const TERMINAL_CAP: Duration = Duration::from_secs(21_600);
-/// Front-drop cap on the memory. Sized like [`crate::log_throttle`]'s key cap
-/// and leviculum's live-link ring: large enough that a real mesh's genuinely
-/// stuck rows all fit, small enough that a peer cycling junk hashes cannot
-/// grow it without bound. Eviction costs exactly one re-ask.
+/// Front-drop cap on the memory's ORDINARY rows (the #544 windows). Sized
+/// like [`crate::log_throttle`]'s key cap and leviculum's live-link ring:
+/// large enough that a real mesh's genuinely stuck rows all fit, small enough
+/// that a peer cycling junk hashes cannot grow it without bound. Eviction
+/// costs exactly one re-ask.
 pub const DEFAULT_MAX_KEYS: usize = 4096;
+/// CIRISEdge#858 — front-drop cap on rows PARKED on a signer (an absent `Key`,
+/// or an occurrence signer whose standing has not landed), held apart from
+/// [`DEFAULT_MAX_KEYS`]. Until #858 one 4096-entry ring held both, and the
+/// Attestation plane's ordinary refusals (the canonical books them by the
+/// thousand) front-dropped a fresh node's occurrence parks, so the parked
+/// rows came straight back into `want` and were refused again every round.
+/// A park is worth more than an ordinary window — it is the only thing
+/// standing between a row that cannot verify yet and a WARN per round — so it
+/// gets a ring of its own, sixteen times wider. Still bounded: the key is
+/// peer-influenced (an attacker can sign junk with keys this node never met),
+/// and an eviction here costs one re-ask and one throttled WARN.
+pub const DEFAULT_MAX_PARKED: usize = 65_536;
+/// CIRISEdge#858 (FSD `STRUCTURAL_REFUSALS.md` §2, S1 → S2) — how many
+/// consecutive windows a transient refusal with NO named dependency may spend
+/// at [`TRANSIENT_CAP`] before it moves to the terminal schedule. A transient
+/// verdict that has not moved through 20 minutes of re-asks (20 + 40 + 80 +
+/// 160 + 3 × 300 s) is not waiting on state that is replicating; at the
+/// transient cap it would cost 12 asks and 12 WARNs an hour forever (the
+/// legacy never-verifiable rows of #858). The terminal schedule still re-asks
+/// (30 min doubling to 6 h), so a verdict that does move converges.
+pub const TRANSIENT_CAP_HITS_BEFORE_TERMINAL: u32 = 3;
 
 /// `(plane, content hash)` — the same identity the wire uses. `EnvelopeKind` is
 /// part of the key because the hash spaces are per-plane and a refusal is a
@@ -165,7 +189,7 @@ type RowKey = (EnvelopeKind, [u8; 32]);
 
 struct Entry {
     /// Consecutive refusals of these bytes. Drives the doubling; reset only by
-    /// [`RefusalBackoff::clear`] (an admit) or eviction.
+    /// [`RefusalBackoff::clear`] (an admit), a release, or eviction.
     attempts: u32,
     /// The MOST RECENT verdict. A row can change disposition — a signer key
     /// lands and `unverifiable_signature` becomes `conflicting_version` — and
@@ -182,16 +206,173 @@ struct Entry {
     /// waits on a dependency another plane delivers: the release asks THAT
     /// peer again at once (a kick), not at the next cadence tick.
     waiting_from: Option<String>,
+    /// CIRISEdge#858 — consecutive transient windows booked AT
+    /// [`TRANSIENT_CAP`] while the row named no dependency. Past
+    /// [`TRANSIENT_CAP_HITS_BEFORE_TERMINAL`] the row moves to the terminal
+    /// schedule.
+    cap_hits: u32,
+    /// CIRISEdge#858 — `Some(stamp)` iff the row is in the PARKED class (its
+    /// live stamp in [`State::parked_order`]); `None` for an ordinary row
+    /// (which sits in [`State::order`]). Set together with `waiting_on`.
+    park_stamp: Option<u64>,
 }
 
 struct State {
     entries: HashMap<RowKey, Entry>,
-    /// Eviction order; front is oldest. Capped at `max_keys`.
+    /// Eviction order of the ORDINARY rows; front is oldest. Exact (every key
+    /// here is an ordinary entry), capped at `max_keys`.
     order: VecDeque<RowKey>,
+    /// CIRISEdge#858 — eviction order of the PARKED rows, front oldest, as
+    /// `(stamp, key)`. LAZY: a release or clear leaves its stamp behind and
+    /// eviction skips any stamp that no longer matches its entry, so releasing
+    /// a signer's rows never scans a 65,536-entry ring per row. Compacted when
+    /// the dead stamps outnumber the live ones.
+    parked_order: VecDeque<(u64, RowKey)>,
+    /// Live parked entries (the ones `parked_order` would keep).
+    parked: usize,
+    next_stamp: u64,
+    /// CIRISEdge#858 — parks evicted by the park capacity since construction.
+    park_evictions: u64,
     /// CIRISEdge#679 — signer → the rows parked on its `Key`. Kept in
     /// lockstep with `entries` (insert on park, remove on clear/evict), so a
     /// release never touches a row that was already forgotten.
     by_signer: HashMap<String, Vec<RowKey>>,
+}
+
+impl State {
+    /// Forget `key` entirely, whichever class it is in, keeping the order and
+    /// the signer index in lockstep. A parked row's stamp is left for the lazy
+    /// ring to skip.
+    fn remove(&mut self, key: &RowKey) -> Option<Entry> {
+        let entry = self.entries.remove(key)?;
+        if entry.park_stamp.is_some() {
+            self.parked = self.parked.saturating_sub(1);
+        } else {
+            self.order.retain(|k| k != key);
+        }
+        if let Some(signer) = &entry.waiting_on {
+            RefusalBackoff::unindex(&mut self.by_signer, signer, key);
+        }
+        Some(entry)
+    }
+
+    /// Front-drop one ORDINARY entry when the ordinary class is at capacity
+    /// (matching `LogThrottle`), so a peer cycling hashes cannot grow the
+    /// memory unbounded. Never touches a parked row (#858).
+    fn evict_ordinary_if_full(&mut self, max_keys: usize) {
+        if self.order.len() >= max_keys {
+            if let Some(evict) = self.order.pop_front() {
+                if let Some(e) = self.entries.remove(&evict) {
+                    if let Some(signer) = e.waiting_on {
+                        RefusalBackoff::unindex(&mut self.by_signer, &signer, &evict);
+                    }
+                }
+            }
+        }
+    }
+
+    /// CIRISEdge#858 — front-drop the oldest LIVE park when the parked class is
+    /// at capacity. Returns `true` when a park was evicted.
+    fn evict_parked_if_full(&mut self, max_parked: usize) -> bool {
+        if self.parked < max_parked {
+            return false;
+        }
+        while let Some((stamp, key)) = self.parked_order.pop_front() {
+            let live = self
+                .entries
+                .get(&key)
+                .is_some_and(|e| e.park_stamp == Some(stamp));
+            if live {
+                self.remove(&key);
+                self.park_evictions = self.park_evictions.saturating_add(1);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// CIRISEdge#858 — move an existing entry into the PARKED class (no-op if
+    /// it is already there): out of the ordinary ring, into the parked one,
+    /// evicting the oldest park first if that ring is full. Returns `true`
+    /// when a park was evicted to make room.
+    fn move_to_parked(&mut self, key: &RowKey, max_parked: usize) -> bool {
+        match self.entries.get(key) {
+            Some(e) if e.park_stamp.is_none() => {}
+            _ => return false,
+        }
+        self.order.retain(|k| k != key);
+        let evicted = self.evict_parked_if_full(max_parked);
+        let stamp = self.next_stamp;
+        self.next_stamp = self.next_stamp.wrapping_add(1);
+        if let Some(e) = self.entries.get_mut(key) {
+            e.park_stamp = Some(stamp);
+        }
+        self.parked += 1;
+        self.parked_order.push_back((stamp, *key));
+        // Amortised compaction: dead stamps (released / cleared parks) are
+        // dropped once they outnumber the live ones.
+        if self.parked_order.len() > self.parked.saturating_mul(2).saturating_add(64) {
+            let entries = &self.entries;
+            self.parked_order.retain(|(stamp, key)| {
+                entries
+                    .get(key)
+                    .is_some_and(|e| e.park_stamp == Some(*stamp))
+            });
+        }
+        evicted
+    }
+
+    /// Point `key`'s signer index at `signer` (moving it off any previous
+    /// signer). The entry must exist.
+    fn index_on(&mut self, key: &RowKey, signer: &str) {
+        let previous = self
+            .entries
+            .get_mut(key)
+            .and_then(|e| e.waiting_on.replace(signer.to_owned()));
+        if let Some(old) = previous {
+            if old != signer {
+                RefusalBackoff::unindex(&mut self.by_signer, &old, key);
+            }
+        }
+        let rows = self.by_signer.entry(signer.to_owned()).or_default();
+        if !rows.contains(key) {
+            rows.push(*key);
+        }
+    }
+
+    /// Book one refusal of a NEW key as an ordinary entry, or bump an existing
+    /// one's attempt count. Returns the attempt count after the booking.
+    fn bump_or_insert(&mut self, key: RowKey, max_keys: usize, now: Instant) -> u32 {
+        if let Some(e) = self.entries.get_mut(&key) {
+            e.attempts = e.attempts.saturating_add(1);
+            return e.attempts;
+        }
+        self.insert_ordinary(key, RetryDisposition::Terminal, now, max_keys);
+        1
+    }
+
+    fn insert_ordinary(
+        &mut self,
+        key: RowKey,
+        disposition: RetryDisposition,
+        retry_at: Instant,
+        max_keys: usize,
+    ) {
+        self.evict_ordinary_if_full(max_keys);
+        self.entries.insert(
+            key,
+            Entry {
+                attempts: 1,
+                disposition,
+                retry_at,
+                waiting_on: None,
+                waiting_from: None,
+                cap_hits: 0,
+                park_stamp: None,
+            },
+        );
+        self.order.push_back(key);
+    }
 }
 
 /// The node-wide refusal memory.
@@ -210,9 +391,14 @@ struct State {
 /// new build parses bytes the old one could not; an operator wires the
 /// operational providers that were absent), so forgetting on restart is correct
 /// rather than a limitation.
+///
+/// CIRISEdge#858 — two classes, two rings: ORDINARY rows (the #544 windows,
+/// [`DEFAULT_MAX_KEYS`]) and rows PARKED on a signer ([`DEFAULT_MAX_PARKED`]).
+/// An ordinary refusal can never evict a park.
 pub struct RefusalBackoff {
     state: Mutex<State>,
     max_keys: usize,
+    max_parked: usize,
 }
 
 impl Default for RefusalBackoff {
@@ -222,24 +408,44 @@ impl Default for RefusalBackoff {
 }
 
 impl RefusalBackoff {
-    /// A memory capped at [`DEFAULT_MAX_KEYS`].
+    /// A memory capped at [`DEFAULT_MAX_KEYS`] ordinary rows and
+    /// [`DEFAULT_MAX_PARKED`] parked ones.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_capacity(DEFAULT_MAX_KEYS)
+        Self::with_capacities(DEFAULT_MAX_KEYS, DEFAULT_MAX_PARKED)
     }
 
-    /// A memory capped at `max_keys` front-drop entries (tests; a host with an
-    /// unusually wide stuck set).
+    /// A memory capped at `max_keys` front-drop ORDINARY entries (tests; a
+    /// host with an unusually wide stuck set). Parks keep
+    /// [`DEFAULT_MAX_PARKED`].
     #[must_use]
     pub fn with_capacity(max_keys: usize) -> Self {
+        Self::with_capacities(max_keys, DEFAULT_MAX_PARKED)
+    }
+
+    /// CIRISEdge#858 — a memory capped at `max_keys` ordinary entries and
+    /// `max_parked` parked ones.
+    #[must_use]
+    pub fn with_capacities(max_keys: usize, max_parked: usize) -> Self {
         Self {
             state: Mutex::new(State {
                 entries: HashMap::new(),
                 order: VecDeque::new(),
+                parked_order: VecDeque::new(),
+                parked: 0,
+                next_stamp: 0,
+                park_evictions: 0,
                 by_signer: HashMap::new(),
             }),
             max_keys: max_keys.max(1),
+            max_parked: max_parked.max(1),
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Book one refusal of `(kind, envelope_hash)` and install the resulting
@@ -248,6 +454,12 @@ impl RefusalBackoff {
     ///
     /// `now` is passed in rather than read here so the whole schedule is
     /// testable without sleeping.
+    ///
+    /// CIRISEdge#858 (FSD §2 S1 → S2) — a TRANSIENT refusal of a row that names
+    /// no dependency (not parked, not indexed on a signer) that has already
+    /// spent [`TRANSIENT_CAP_HITS_BEFORE_TERMINAL`] windows at
+    /// [`TRANSIENT_CAP`] moves to the terminal schedule: its verdict is not
+    /// waiting on anything this node can see replicating.
     pub fn record_at(
         &self,
         kind: EnvelopeKind,
@@ -256,34 +468,33 @@ impl RefusalBackoff {
         now: Instant,
     ) -> Duration {
         let key = (kind, envelope_hash);
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self.lock();
 
         if let Some(e) = st.entries.get_mut(&key) {
             e.attempts = e.attempts.saturating_add(1);
+            if disposition == RetryDisposition::Transient && e.park_stamp.is_none() {
+                if RetryDisposition::Transient.window(e.attempts) >= TRANSIENT_CAP {
+                    e.cap_hits = e.cap_hits.saturating_add(1);
+                }
+                if e.cap_hits > TRANSIENT_CAP_HITS_BEFORE_TERMINAL {
+                    let window = RetryDisposition::Terminal
+                        .window(e.cap_hits - TRANSIENT_CAP_HITS_BEFORE_TERMINAL);
+                    e.disposition = RetryDisposition::Terminal;
+                    e.retry_at = now + window;
+                    return window;
+                }
+            }
             e.disposition = disposition;
             let window = disposition.window(e.attempts);
             e.retry_at = now + window;
             return window;
         }
 
-        // New key — evict oldest first if at capacity (front-drop, matching
-        // `LogThrottle`), so a peer cycling hashes cannot grow this unbounded.
-        Self::evict_if_full(&mut st, self.max_keys);
+        // New key — evict the oldest ORDINARY row first if at capacity
+        // (front-drop, matching `LogThrottle`), so a peer cycling hashes cannot
+        // grow this unbounded.
         let window = disposition.window(1);
-        st.entries.insert(
-            key,
-            Entry {
-                attempts: 1,
-                disposition,
-                retry_at: now + window,
-                waiting_on: None,
-                waiting_from: None,
-            },
-        );
-        st.order.push_back(key);
+        st.insert_ordinary(key, disposition, now + window, self.max_keys);
         window
     }
 
@@ -305,6 +516,10 @@ impl RefusalBackoff {
     /// What DOES move the verdict is the key landing, and that is what the
     /// index is for. A row parked here costs at most ~4 asks a day instead of
     /// 12 an hour.
+    ///
+    /// This BOOKS the refusal (one attempt) and parks it. A refusal already
+    /// booked by [`Self::record_at`] is parked with [`Self::park_booked_at`],
+    /// which does not count it twice (#858).
     pub fn record_waiting_on_at(
         &self,
         kind: EnvelopeKind,
@@ -313,45 +528,61 @@ impl RefusalBackoff {
         now: Instant,
     ) -> Duration {
         let key = (kind, envelope_hash);
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let attempts = if let Some(e) = st.entries.get_mut(&key) {
-            e.attempts = e.attempts.saturating_add(1);
-            e.attempts
-        } else {
-            Self::evict_if_full(&mut st, self.max_keys);
-            st.entries.insert(
-                key,
-                Entry {
-                    attempts: 1,
-                    disposition: RetryDisposition::Terminal,
-                    retry_at: now,
-                    waiting_on: None,
-                    waiting_from: None,
-                },
-            );
-            st.order.push_back(key);
-            1
-        };
-        let window = RetryDisposition::Terminal.window(attempts);
-        let previous = {
-            let e = st.entries.get_mut(&key).expect("inserted above");
-            e.disposition = RetryDisposition::Terminal;
-            e.retry_at = now + window;
-            e.waiting_on.replace(signer.to_owned())
-        };
-        // Re-parked on a different signer: drop the old index entry.
-        if let Some(old) = previous {
-            if old != signer {
-                Self::unindex(&mut st.by_signer, &old, &key);
-            }
+        let mut st = self.lock();
+        st.bump_or_insert(key, self.max_keys, now);
+        self.park_locked(&mut st, &key, signer, None, now)
+    }
+
+    /// CIRISEdge#858 — park a refusal [`Self::record_at`] ALREADY booked on
+    /// `signer`'s absent `Key`, without counting it a second time.
+    ///
+    /// The apply choke books every refusal (`record_at`, one attempt) and then
+    /// decides the park. Parking through [`Self::record_waiting_on_at`] there
+    /// counted the one refusal twice, so the FIRST park installed the terminal
+    /// window for attempt 2 — 3600 s, not the 1800 s the FSD states — and every
+    /// later window was doubled once more than earned. `from_peer` is the peer
+    /// that offered the bytes, so the release kicks a re-ask of it at once.
+    /// A row evicted between the two calls is booked afresh (one attempt).
+    pub fn park_booked_at(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: [u8; 32],
+        signer: &str,
+        from_peer: Option<&str>,
+        now: Instant,
+    ) -> Duration {
+        let key = (kind, envelope_hash);
+        let mut st = self.lock();
+        if !st.entries.contains_key(&key) {
+            st.insert_ordinary(key, RetryDisposition::Terminal, now, self.max_keys);
         }
-        let rows = st.by_signer.entry(signer.to_owned()).or_default();
-        if !rows.contains(&key) {
-            rows.push(key);
+        self.park_locked(&mut st, &key, signer, from_peer, now)
+    }
+
+    /// The shared park: terminal window for the entry's CURRENT attempt count,
+    /// indexed on `signer`, moved into the parked class.
+    fn park_locked(
+        &self,
+        st: &mut State,
+        key: &RowKey,
+        signer: &str,
+        from_peer: Option<&str>,
+        now: Instant,
+    ) -> Duration {
+        st.move_to_parked(key, self.max_parked);
+        let Some(e) = st.entries.get_mut(key) else {
+            // Unreachable: the entry was inserted or found above, and the park
+            // eviction never evicts the row being parked (it is not in the
+            // parked ring yet). Fail open — nothing is suppressed.
+            return Duration::ZERO;
+        };
+        let window = RetryDisposition::Terminal.window(e.attempts);
+        e.disposition = RetryDisposition::Terminal;
+        e.retry_at = now + window;
+        if let Some(peer) = from_peer {
+            e.waiting_from = Some(peer.to_owned());
         }
+        st.index_on(key, signer);
         window
     }
 
@@ -368,25 +599,52 @@ impl RefusalBackoff {
         from_peer: Option<&str>,
     ) -> bool {
         let key = (kind, envelope_hash);
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self.lock();
         let Some(entry) = st.entries.get_mut(&key) else {
             return false;
         };
         entry.waiting_from = from_peer.map(str::to_owned);
-        let previous = entry.waiting_on.replace(signer.to_owned());
-        if let Some(old) = previous {
-            if old != signer {
-                Self::unindex(&mut st.by_signer, &old, &key);
-            }
-        }
-        let rows = st.by_signer.entry(signer.to_owned()).or_default();
-        if !rows.contains(&key) {
-            rows.push(key);
-        }
+        st.move_to_parked(&key, self.max_parked);
+        st.index_on(&key, signer);
         true
+    }
+
+    /// CIRISEdge#858 — index an already-booked refusal on a signer this node
+    /// HOLDS but whose standing for the row's identity has not landed ("signer
+    /// S is neither identity I nor an active occurrence of it, nor a node it
+    /// owns"), and from the SECOND consecutive refusal put it on the terminal
+    /// schedule (attempt 2 earns `TERMINAL_BASE`, then doubling).
+    ///
+    /// The first refusal keeps its transient window: the common case is the
+    /// standup race #776 named (the binding is a round behind), and it clears
+    /// in seconds. A row refused again after that window is not racing
+    /// anything: on the transient ladder it cost ~12 asks and 12 WARNs an hour
+    /// forever. The index stays, so the binding or occurrence that WOULD make
+    /// the signer act for the identity still releases it at once. Returns the
+    /// window now installed, or `None` when no refusal is booked for the row.
+    pub fn index_held_signer_at(
+        &self,
+        kind: EnvelopeKind,
+        envelope_hash: [u8; 32],
+        signer: &str,
+        from_peer: Option<&str>,
+        now: Instant,
+    ) -> Option<Duration> {
+        let key = (kind, envelope_hash);
+        let mut st = self.lock();
+        let entry = st.entries.get_mut(&key)?;
+        entry.waiting_from = from_peer.map(str::to_owned);
+        let window = if entry.attempts >= 2 {
+            let window = RetryDisposition::Terminal.window(entry.attempts - 1);
+            entry.disposition = RetryDisposition::Terminal;
+            entry.retry_at = now + window;
+            window
+        } else {
+            entry.retry_at.saturating_duration_since(now)
+        };
+        st.move_to_parked(&key, self.max_parked);
+        st.index_on(&key, signer);
+        Some(window)
     }
 
     /// CIRISEdge#679 — `signer`'s `Key` row landed: forget every row parked on
@@ -407,18 +665,14 @@ impl RefusalBackoff {
     /// re-ask that is refused again is booked afresh on the ordinary window,
     /// never kicked twice by one release.
     pub fn release_signer_from(&self, signer: &str) -> (usize, Vec<(EnvelopeKind, String)>) {
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self.lock();
         let Some(rows) = st.by_signer.remove(signer) else {
             return (0, Vec::new());
         };
         let mut released = 0;
         let mut ask: Vec<(EnvelopeKind, String)> = Vec::new();
         for key in rows {
-            if let Some(entry) = st.entries.remove(&key) {
-                st.order.retain(|k| *k != key);
+            if let Some(entry) = st.remove(&key) {
                 released += 1;
                 if let Some(peer) = entry.waiting_from {
                     if !ask.iter().any(|(k, p)| *k == key.0 && *p == peer) {
@@ -435,28 +689,33 @@ impl RefusalBackoff {
     /// kind that silently stops holding.
     #[must_use]
     pub fn parked_on_signer_len(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .by_signer
-            .values()
-            .map(Vec::len)
-            .sum()
+        self.lock().parked
     }
 
-    /// Front-drop one entry when at capacity (matching `LogThrottle`), so a
-    /// peer cycling hashes cannot grow the memory unbounded. Keeps the signer
-    /// index in lockstep.
-    fn evict_if_full(st: &mut State, max_keys: usize) {
-        if st.order.len() >= max_keys {
-            if let Some(evict) = st.order.pop_front() {
-                if let Some(e) = st.entries.remove(&evict) {
-                    if let Some(signer) = e.waiting_on {
-                        Self::unindex(&mut st.by_signer, &signer, &evict);
-                    }
-                }
-            }
-        }
+    /// CIRISEdge#858 — how many rows are parked on `signer` right now (the
+    /// `N` of the one-line-per-signer park log).
+    #[must_use]
+    pub fn parked_on(&self, signer: &str) -> usize {
+        self.lock().by_signer.get(signer).map_or(0, Vec::len)
+    }
+
+    /// CIRISEdge#858 — parks the park capacity has evicted since construction.
+    /// Each eviction costs one re-ask of a row that still cannot verify.
+    #[must_use]
+    pub fn park_evictions(&self) -> u64 {
+        self.lock().park_evictions
+    }
+
+    /// CIRISEdge#858 — the ORDINARY-row cap ([`DEFAULT_MAX_KEYS`] by default).
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.max_keys
+    }
+
+    /// CIRISEdge#858 — the PARKED-row cap ([`DEFAULT_MAX_PARKED`] by default).
+    #[must_use]
+    pub fn park_capacity(&self) -> usize {
+        self.max_parked
     }
 
     fn unindex(by_signer: &mut HashMap<String, Vec<RowKey>>, signer: &str, key: &RowKey) {
@@ -481,11 +740,8 @@ impl RefusalBackoff {
         envelope_hash: &[u8; 32],
         now: Instant,
     ) -> bool {
-        let st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        st.entries
+        self.lock()
+            .entries
             .get(&(kind, *envelope_hash))
             .is_some_and(|e| now < e.retry_at)
     }
@@ -495,28 +751,15 @@ impl RefusalBackoff {
     /// every non-refusing apply outcome so a row that recovers does not carry a
     /// stale attempt count into a future refusal of the same bytes.
     pub fn clear(&self, kind: EnvelopeKind, envelope_hash: &[u8; 32]) {
-        let key = (kind, *envelope_hash);
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(e) = st.entries.remove(&key) {
-            st.order.retain(|k| *k != key);
-            if let Some(signer) = e.waiting_on {
-                Self::unindex(&mut st.by_signer, &signer, &key);
-            }
-        }
+        self.lock().remove(&(kind, *envelope_hash));
     }
 
-    /// How many rows are currently remembered. The memory's own witness — a
-    /// bound nobody can observe is the kind that silently stops holding.
+    /// How many rows are currently remembered, both classes. The memory's own
+    /// witness — a bound nobody can observe is the kind that silently stops
+    /// holding.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entries
-            .len()
+        self.lock().entries.len()
     }
 
     /// `true` iff nothing is remembered.
@@ -568,10 +811,11 @@ mod tests_679 {
 
     /// The index never outlives its entry: `clear` (the row landed) and
     /// front-drop eviction both drop the park, so a later release cannot
-    /// resurrect a forgotten row or miscount.
+    /// resurrect a forgotten row or miscount. Since #858 the eviction that
+    /// drops a park is the PARK ring's own, never an ordinary refusal.
     #[test]
     fn clear_and_eviction_keep_the_signer_index_in_lockstep() {
-        let b = RefusalBackoff::with_capacity(2);
+        let b = RefusalBackoff::with_capacities(2, 2);
         let now = Instant::now();
         b.record_waiting_on_at(EnvelopeKind::Attestation, h(1), "s", now);
         b.clear(EnvelopeKind::Attestation, &h(1));
@@ -579,16 +823,154 @@ mod tests_679 {
         assert_eq!(b.release_signer("s"), 0);
         b.record_waiting_on_at(EnvelopeKind::Attestation, h(1), "s", now);
         b.record_waiting_on_at(EnvelopeKind::Attestation, h(2), "s", now);
-        // A third entry evicts h(1) (front-drop).
-        b.record_at(EnvelopeKind::Key, h(9), RetryDisposition::Transient, now);
+        // A third PARK evicts h(1) (front-drop within the park ring).
+        b.record_waiting_on_at(EnvelopeKind::Attestation, h(3), "t", now);
         assert_eq!(b.len(), 2);
+        assert_eq!(b.park_evictions(), 1);
         assert_eq!(
             b.parked_on_signer_len(),
-            1,
+            2,
             "the evicted park left the index"
         );
-        assert_eq!(b.release_signer("s"), 1);
-        assert_eq!(b.len(), 1, "only the unrelated Key entry remains");
+        assert_eq!(b.release_signer("s"), 1, "only h(2) is still parked on s");
+        assert_eq!(b.release_signer("t"), 1);
+        assert!(b.is_empty());
+    }
+
+    /// CIRISEdge#858 (fix 5) — ordinary refusals never evict a park. Before
+    /// #858 one 4096 ring held both, and the Attestation plane's ordinary
+    /// refusals front-dropped a fresh node's occurrence parks.
+    #[test]
+    fn ordinary_refusals_never_evict_a_park_858() {
+        let b = RefusalBackoff::with_capacity(8);
+        let now = Instant::now();
+        b.record_waiting_on_at(EnvelopeKind::IdentityOccurrence, h(1), "absent", now);
+        for i in 10..30u8 {
+            b.record_at(
+                EnvelopeKind::Attestation,
+                h(i),
+                RetryDisposition::Transient,
+                now,
+            );
+        }
+        assert_eq!(b.parked_on_signer_len(), 1, "the park survived the churn");
+        assert!(b.suppressed_at(EnvelopeKind::IdentityOccurrence, &h(1), now));
+        assert_eq!(b.len(), 9, "8 ordinary + 1 parked");
+        assert_eq!(b.park_evictions(), 0);
+    }
+
+    /// CIRISEdge#858 (fix 3) — a refusal the choke already booked parks on
+    /// its FIRST attempt's terminal window (1800 s), not attempt 2's.
+    #[test]
+    fn a_booked_refusal_parks_on_the_first_terminal_window_858() {
+        let b = RefusalBackoff::new();
+        let now = Instant::now();
+        b.record_at(
+            EnvelopeKind::IdentityOccurrence,
+            h(1),
+            RetryDisposition::Transient,
+            now,
+        );
+        let w = b.park_booked_at(EnvelopeKind::IdentityOccurrence, h(1), "p", Some("r"), now);
+        assert_eq!(w, TERMINAL_BASE);
+        // The second refusal of the same bytes doubles once.
+        b.record_at(
+            EnvelopeKind::IdentityOccurrence,
+            h(1),
+            RetryDisposition::Transient,
+            now,
+        );
+        let w2 = b.park_booked_at(EnvelopeKind::IdentityOccurrence, h(1), "p", Some("r"), now);
+        assert_eq!(w2, TERMINAL_BASE * 2);
+        let (n, ask) = b.release_signer_from("p");
+        assert_eq!(n, 1);
+        assert_eq!(
+            ask,
+            vec![(EnvelopeKind::IdentityOccurrence, "r".to_owned())],
+            "a park remembers the peer that offered it, so its release kicks"
+        );
+    }
+
+    /// CIRISEdge#858 (fix 4) — a row indexed on a HELD signer keeps its
+    /// transient window on the first refusal and earns the terminal schedule
+    /// from the second.
+    #[test]
+    fn a_held_signer_index_goes_terminal_from_attempt_two_858() {
+        let b = RefusalBackoff::new();
+        let now = Instant::now();
+        let k = EnvelopeKind::IdentityOccurrence;
+        b.record_at(k, h(1), RetryDisposition::Transient, now);
+        assert_eq!(
+            b.index_held_signer_at(k, h(1), "s", None, now),
+            Some(TRANSIENT_BASE)
+        );
+        b.record_at(k, h(1), RetryDisposition::Transient, now);
+        assert_eq!(
+            b.index_held_signer_at(k, h(1), "s", None, now),
+            Some(TERMINAL_BASE)
+        );
+        assert!(b.suppressed_at(k, &h(1), now + TRANSIENT_CAP + Duration::from_secs(1)));
+        assert_eq!(b.parked_on("s"), 1);
+        assert_eq!(b.index_held_signer_at(k, h(9), "s", None, now), None);
+    }
+
+    /// CIRISEdge#858 (fix 6, FSD §2 S1 → S2) — a transient refusal with no
+    /// named dependency spends three windows at the transient cap, then moves
+    /// to the terminal schedule (and keeps doubling there).
+    #[test]
+    fn a_transient_refusal_stuck_at_the_cap_moves_to_the_terminal_schedule_858() {
+        let b = RefusalBackoff::new();
+        let now = Instant::now();
+        let windows: Vec<Duration> = (0..10)
+            .map(|_| b.record_at(EnvelopeKind::Key, h(1), RetryDisposition::Transient, now))
+            .collect();
+        let s = Duration::from_secs;
+        assert_eq!(
+            windows,
+            vec![
+                s(20),
+                s(40),
+                s(80),
+                s(160),
+                TRANSIENT_CAP,
+                TRANSIENT_CAP,
+                TRANSIENT_CAP,
+                TERMINAL_BASE,
+                TERMINAL_BASE * 2,
+                TERMINAL_BASE * 4,
+            ]
+        );
+        // A PARKED row is governed by its park, never escalated here.
+        let p = RefusalBackoff::new();
+        p.record_waiting_on_at(EnvelopeKind::Key, h(2), "s", now);
+        for _ in 0..10 {
+            p.record_at(EnvelopeKind::Key, h(2), RetryDisposition::Transient, now);
+        }
+        assert_eq!(
+            p.record_at(EnvelopeKind::Key, h(2), RetryDisposition::Transient, now),
+            TRANSIENT_CAP,
+            "record_at alone leaves a parked row on its booked disposition; the \
+             choke re-parks it"
+        );
+    }
+
+    /// The lazy park ring stays bounded under park/release churn.
+    #[test]
+    fn the_lazy_park_ring_is_compacted_under_churn_858() {
+        let b = RefusalBackoff::with_capacities(4, 4);
+        let now = Instant::now();
+        for round in 0..200u32 {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&round.to_be_bytes());
+            b.record_waiting_on_at(EnvelopeKind::Attestation, hash, "s", now);
+            b.release_signer("s");
+        }
+        assert!(b.is_empty());
+        assert!(
+            b.lock().parked_order.len() <= 2 + 64 + 1,
+            "dead stamps are compacted"
+        );
+        assert_eq!(b.park_evictions(), 0, "a released park is never evicted");
     }
 
     /// Re-parking the same row on a different signer moves the index; the
@@ -663,7 +1045,10 @@ mod tests {
         let b = RefusalBackoff::new();
         let mut t = Instant::now();
         let mut windows = Vec::new();
-        for _ in 0..8 {
+        // Seven refusals: the ladder up to its third window at the cap. The
+        // eighth leaves the transient schedule (CIRISEdge#858, pinned by
+        // `a_transient_refusal_stuck_at_the_cap_moves_to_the_terminal_schedule_858`).
+        for _ in 0..7 {
             let w = b.record_at(EnvelopeKind::Key, hash(1), RetryDisposition::Transient, t);
             windows.push(w);
             t += w;
@@ -678,7 +1063,7 @@ mod tests {
             "no window may exceed the cap: {windows:?}"
         );
         assert_eq!(
-            *windows.last().expect("8 windows"),
+            *windows.last().expect("7 windows"),
             TRANSIENT_CAP,
             "the schedule settles AT the cap, it does not keep growing"
         );

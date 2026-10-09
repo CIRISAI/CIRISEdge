@@ -1385,6 +1385,24 @@ pub struct EdgeMetrics {
     /// Booked at the bridge's single `refuse` site, alongside — never instead
     /// of — the kind axis, so a class-carrying refusal appears on both.
     pub apply_refusals_by_class: Arc<RwLock<HashMap<String, u64>>>,
+    /// CIRISEdge#858 — the refusal memory's park ledger (the bridge kept
+    /// these as accessors only, so no scrape could see a park hold or fail):
+    /// rows PARKED on a signer, per plane, since start (an absent `Key`, or an
+    /// occurrence signer whose standing has not landed).
+    pub rows_parked_on_signer: Arc<RwLock<HashMap<EnvelopeKind, u64>>>,
+    /// CIRISEdge#858 — rows RELEASED from a park since start (a `Key` admit, a
+    /// binding / occurrence admit, or the host's `release_signer` hook).
+    pub signer_releases: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#858 — wanted hashes the refusal memory dropped from a round's
+    /// `want` since start: the traffic that did NOT happen.
+    pub retry_suppressions: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#858 — parks the park capacity evicted since start; each costs
+    /// one re-ask of a row that still cannot verify.
+    pub signer_park_evictions: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#858 — gauges, set by the bridge after every change to the
+    /// memory: `(rows remembered, total capacity, rows parked on a signer,
+    /// park capacity)`. Read as [`Self::refusal_memory`].
+    pub refusal_memory: Arc<RwLock<RefusalMemoryGauges>>,
     /// CIRISEdge#441 — the removal-receipt ledger (revocation-class rows'
     /// per-peer delivery states; the pull-plane's missing arrival
     /// instrument). Fed by the bridge's serve exit (offers) + the
@@ -2063,6 +2081,61 @@ impl EdgeMetrics {
         *guard.entry(token.to_string()).or_insert(0) += 1;
     }
 
+    /// CIRISEdge#858 — count one row parked on a signer on `kind`.
+    pub fn inc_rows_parked_on_signer(&self, kind: EnvelopeKind) {
+        *self.rows_parked_on_signer.write().entry(kind).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#858 — count `n` rows released from a park.
+    pub fn add_signer_releases(&self, n: u64) {
+        self.signer_releases
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#858 — count one wanted hash dropped by the refusal memory.
+    pub fn inc_retry_suppressions(&self) {
+        self.retry_suppressions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#858 — count `n` parks evicted by the park capacity.
+    pub fn add_signer_park_evictions(&self, n: u64) {
+        self.signer_park_evictions
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#858 — set the refusal-memory gauges.
+    pub fn set_refusal_memory(&self, gauges: RefusalMemoryGauges) {
+        *self.refusal_memory.write() = gauges;
+    }
+
+    /// CIRISEdge#858 — the refusal-memory gauges as last set.
+    #[must_use]
+    pub fn refusal_memory(&self) -> RefusalMemoryGauges {
+        *self.refusal_memory.read()
+    }
+
+    /// CIRISEdge#858 — rows released from a park since start.
+    #[must_use]
+    pub fn signer_releases(&self) -> u64 {
+        self.signer_releases
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#858 — wanted hashes dropped by the refusal memory since start.
+    #[must_use]
+    pub fn retry_suppressions(&self) -> u64 {
+        self.retry_suppressions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#858 — parks evicted by the park capacity since start.
+    #[must_use]
+    pub fn signer_park_evictions(&self) -> u64 {
+        self.signer_park_evictions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Update the per-peer reachability ratio gauge. Replaces (does
     /// not accumulate) — the underlying tracker computes the rolling
     /// ratio and the gauge mirrors it.
@@ -2196,6 +2269,10 @@ impl EdgeMetrics {
     /// fresh clone of the live state; the live map is unlocked
     /// immediately after the clone so emitters aren't blocked across
     /// the projection step.
+    // A flat field-by-field projection, one line per counter family; it
+    // grows with every counter until CIRISEdge#848's bundle-fields macro
+    // generates it. Straight-line, nothing to factor.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn snapshot(&self) -> EdgeMetricsBundle {
         EdgeMetricsBundle {
@@ -2291,6 +2368,14 @@ impl EdgeMetrics {
                 .read()
                 .clone(),
             apply_refusals_by_class: self.apply_refusals_by_class.read().clone(),
+            rows_parked_on_signer: self.rows_parked_on_signer.read().clone(),
+            signer_releases: self.signer_releases(),
+            retry_suppressions: self.retry_suppressions(),
+            signer_park_evictions: self.signer_park_evictions(),
+            refusal_memory_len: self.refusal_memory().len,
+            refusal_memory_capacity: self.refusal_memory().capacity,
+            parked_on_signer_len: self.refusal_memory().parked_on_signer_len,
+            parked_on_signer_capacity: self.refusal_memory().parked_on_signer_capacity,
             replication_applied_total: self.replication_applied_total.read().clone(),
             replication_duplicate_total: self.replication_duplicate_total.read().clone(),
             removal_delivery: self.removal_receipts.read().delta(),
@@ -2425,6 +2510,21 @@ fn link_closed_by_cause(
         .collect()
 }
 
+/// CIRISEdge#858 — the replication refusal memory's size and bounds. A gauge
+/// set by the one production bridge after every change to the memory, so the
+/// snapshot is current without reaching into the replication runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefusalMemoryGauges {
+    /// Rows remembered as refused, both classes (`refusal_memory_len`).
+    pub len: u64,
+    /// The bound on `len`: the ordinary cap plus the park cap.
+    pub capacity: u64,
+    /// Rows parked on a signer right now (`parked_on_signer_len`).
+    pub parked_on_signer_len: u64,
+    /// The bound on `parked_on_signer_len`.
+    pub parked_on_signer_capacity: u64,
+}
+
 /// Point-in-time projection of [`EdgeMetrics`]. Returned by
 /// [`EdgeMetrics::snapshot`]; consumed by the PyO3 / UniFFI projection
 /// methods. Owned `HashMap`s — emitters can keep writing through the
@@ -2548,6 +2648,23 @@ pub struct EdgeMetricsBundle {
     /// [`EdgeMetrics::apply_refusals_by_class`]: the three v38.2.0 apply-door
     /// classes by their stable tokens.
     pub apply_refusals_by_class: HashMap<String, u64>,
+    /// CIRISEdge#858 — rows parked on a signer since start, per plane.
+    pub rows_parked_on_signer: HashMap<EnvelopeKind, u64>,
+    /// CIRISEdge#858 — rows released from a park since start.
+    pub signer_releases: u64,
+    /// CIRISEdge#858 — wanted hashes dropped by the refusal memory since start.
+    pub retry_suppressions: u64,
+    /// CIRISEdge#858 — parks evicted by the park capacity since start.
+    pub signer_park_evictions: u64,
+    /// CIRISEdge#858 — rows remembered as refused (both classes), as last
+    /// set by the bridge.
+    pub refusal_memory_len: u64,
+    /// CIRISEdge#858 — the bound on `refusal_memory_len` (ordinary + park cap).
+    pub refusal_memory_capacity: u64,
+    /// CIRISEdge#858 — rows parked on a signer right now.
+    pub parked_on_signer_len: u64,
+    /// CIRISEdge#858 — the bound on `parked_on_signer_len`.
+    pub parked_on_signer_capacity: u64,
     /// CIRISEdge#457 — per-kind accepted applies that changed local state.
     pub replication_applied_total: HashMap<EnvelopeKind, u64>,
     /// CIRISEdge#457 — per-kind already-held applies (distinct from applied).
