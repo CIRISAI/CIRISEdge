@@ -45,7 +45,7 @@
     clippy::field_reassign_with_default,
     clippy::needless_raw_string_hashes
 )]
-#![cfg(feature = "pyo3")]
+#![cfg(feature = "_pyffi")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
