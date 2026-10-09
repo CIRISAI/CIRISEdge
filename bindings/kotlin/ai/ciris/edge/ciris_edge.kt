@@ -685,6 +685,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Short
     external fun uniffi_ciris_edge_checksum_func_recent_events(
     ): Short
+    external fun uniffi_ciris_edge_checksum_func_rooted_peer_rounds(
+    ): Short
     external fun uniffi_ciris_edge_checksum_func_routing_announce_table(
     ): Short
     external fun uniffi_ciris_edge_checksum_func_routing_blackhole_add(
@@ -795,6 +797,8 @@ external fun uniffi_ciris_edge_fn_func_queue_depth(`deliveryClass`: RustBuffer.B
 external fun uniffi_ciris_edge_fn_func_recent_errors(`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_recent_events(`limit`: Int,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+external fun uniffi_ciris_edge_fn_func_rooted_peer_rounds(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 external fun uniffi_ciris_edge_fn_func_routing_announce_table(uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1036,6 +1040,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_recent_events() != 602.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_ciris_edge_checksum_func_rooted_peer_rounds() != 37847.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_ciris_edge_checksum_func_routing_announce_table() != 19407.toShort()) {
@@ -3908,6 +3915,17 @@ public object FfiConverterMapStringByteArray: FfiConverterRustBuffer<Map<kotlin.
     UniffiLib.uniffi_ciris_edge_fn_func_recent_events(
     
         FfiConverterUInt.lower(`limit`),_status)
+}
+    )
+    }
+    
+
+    @Throws(EdgeBindingsException::class) fun `rootedPeerRounds`(): Map<kotlin.String, kotlin.ULong> {
+            return FfiConverterMapStringULong.lift(
+    uniffiRustCallWithError(EdgeBindingsException) { _status ->
+    UniffiLib.uniffi_ciris_edge_fn_func_rooted_peer_rounds(
+    
+        _status)
 }
     )
     }

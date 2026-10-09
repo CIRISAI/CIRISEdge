@@ -378,6 +378,12 @@ RustBuffer uniffi_ciris_edge_fn_func_recent_errors(uint32_t limit, RustCallStatu
 RustBuffer uniffi_ciris_edge_fn_func_recent_events(uint32_t limit, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROOTED_PEER_ROUNDS
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROOTED_PEER_ROUNDS
+RustBuffer uniffi_ciris_edge_fn_func_rooted_peer_rounds(RustCallStatus *_Nonnull out_status
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_ANNOUNCE_TABLE
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_FN_FUNC_ROUTING_ANNOUNCE_TABLE
 RustBuffer uniffi_ciris_edge_fn_func_routing_announce_table(RustCallStatus *_Nonnull out_status
@@ -914,6 +920,12 @@ uint16_t uniffi_ciris_edge_checksum_func_recent_errors(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_RECENT_EVENTS
 #define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_RECENT_EVENTS
 uint16_t uniffi_ciris_edge_checksum_func_recent_events(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROOTED_PEER_ROUNDS
+#define UNIFFI_FFIDEF_UNIFFI_CIRIS_EDGE_CHECKSUM_FUNC_ROOTED_PEER_ROUNDS
+uint16_t uniffi_ciris_edge_checksum_func_rooted_peer_rounds(void
     
 );
 #endif

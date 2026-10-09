@@ -3301,6 +3301,12 @@ public func recentEvents(limit: UInt32)throws  -> [EdgeNetworkEvent]  {
     )
 })
 }
+public func rootedPeerRounds()throws  -> [String: UInt64]  {
+    return try  FfiConverterDictionaryStringUInt64.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
+    uniffi_ciris_edge_fn_func_rooted_peer_rounds($0
+    )
+})
+}
 public func routingAnnounceTable()throws  -> [EdgeInFlightAnnounce]  {
     return try  FfiConverterSequenceTypeEdgeInFlightAnnounce.lift(try rustCallWithError(FfiConverterTypeEdgeBindingsError_lift) {
     uniffi_ciris_edge_fn_func_routing_announce_table($0
@@ -3545,6 +3551,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_recent_events() != 602) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_ciris_edge_checksum_func_rooted_peer_rounds() != 37847) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_ciris_edge_checksum_func_routing_announce_table() != 19407) {

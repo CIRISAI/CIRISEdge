@@ -528,6 +528,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_recent_events() != 602:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_ciris_edge_checksum_func_rooted_peer_rounds() != 37847:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_routing_announce_table() != 19407:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_ciris_edge_checksum_func_routing_blackhole_add() != 9306:
@@ -967,6 +969,10 @@ _UniffiLib.uniffi_ciris_edge_fn_func_recent_events.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_ciris_edge_fn_func_recent_events.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_ciris_edge_fn_func_rooted_peer_rounds.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_ciris_edge_fn_func_rooted_peer_rounds.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_ciris_edge_fn_func_routing_announce_table.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -1161,6 +1167,9 @@ _UniffiLib.uniffi_ciris_edge_checksum_func_recent_errors.restype = ctypes.c_uint
 _UniffiLib.uniffi_ciris_edge_checksum_func_recent_events.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_recent_events.restype = ctypes.c_uint16
+_UniffiLib.uniffi_ciris_edge_checksum_func_rooted_peer_rounds.argtypes = (
+)
+_UniffiLib.uniffi_ciris_edge_checksum_func_rooted_peer_rounds.restype = ctypes.c_uint16
 _UniffiLib.uniffi_ciris_edge_checksum_func_routing_announce_table.argtypes = (
 )
 _UniffiLib.uniffi_ciris_edge_checksum_func_routing_announce_table.restype = ctypes.c_uint16
@@ -3960,6 +3969,17 @@ def recent_events(limit: int) -> typing.List[EdgeNetworkEvent]:
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
+def rooted_peer_rounds() -> dict[str, int]:
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterMapStringUInt64.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeEdgeBindingsError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_ciris_edge_fn_func_rooted_peer_rounds,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 def routing_announce_table() -> typing.List[EdgeInFlightAnnounce]:
     _uniffi_lowered_args = (
     )
@@ -4339,6 +4359,7 @@ __all__ = [
     "queue_depth",
     "recent_errors",
     "recent_events",
+    "rooted_peer_rounds",
     "routing_announce_table",
     "routing_blackhole_add",
     "routing_blackhole_list",
