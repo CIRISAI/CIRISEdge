@@ -514,6 +514,26 @@ fn spawn_scheduler_task(
     })
 }
 
+/// CIRISEdge#853 (Codex round two on #854) — when the round the responder is
+/// serving began, for its completion line's `duration_ms`. The clock starts at
+/// a round's first inbound frame and RESTARTS when a frame names a different
+/// round id (the initiator abandoned a round and opened a new one, and the
+/// coordinator rebinds to it): a replacement round's duration must not include
+/// the time spent in the abandoned one. A legacy frame (round 0) never moves
+/// it.
+fn responder_round_clock(
+    began: &mut Option<std::time::Instant>,
+    timed_round: &mut u64,
+    incoming_round: u64,
+    now: std::time::Instant,
+) -> std::time::Instant {
+    if incoming_round != 0 && incoming_round != *timed_round {
+        *timed_round = incoming_round;
+        *began = Some(now);
+    }
+    *began.get_or_insert(now)
+}
+
 // One driver loop with a lifecycle line and counter per arm (CIRISEdge#853);
 // splitting the arms out would separate each log line from the step it reports.
 #[allow(clippy::too_many_lines)]
@@ -539,6 +559,8 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
         count(obs::RESPONDER_ROUND_STARTED);
         // When the round being served began: its first inbound frame.
         let mut round_began: Option<std::time::Instant> = None;
+        // The round id the timer is anchored to (0: none / legacy).
+        let mut timed_round: u64 = 0;
         loop {
             // CIRISEdge#662 — the phase gauge: this loop is the responder's ONE
             // drain, and when its inbox fills the drop site reads which of the
@@ -553,7 +575,12 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                 tracing::debug!(peer = %peer, ?kind, "responder driver ending (channel closed)");
                 break;
             };
-            let began = *round_began.get_or_insert_with(std::time::Instant::now);
+            let began = responder_round_clock(
+                &mut round_began,
+                &mut timed_round,
+                inbound.meta.map_or(0, |m| m.round),
+                std::time::Instant::now(),
+            );
             coord.set_driver_phase(DriverPhase::Stepping);
             match coord.drive_round_step_framed(Some(inbound)).await {
                 Ok(DriveStep::SendThenWait(msgs)) => {
@@ -1622,6 +1649,33 @@ mod tests {
     use super::*;
     use ciris_persist::store::MemoryBackend;
     use std::sync::Arc;
+
+    /// CIRISEdge#853 (Codex round two on #854) — a frame naming a NEW round
+    /// restarts the responder's round clock; frames of the same round and
+    /// legacy frames do not.
+    #[test]
+    fn the_round_clock_restarts_when_the_responder_rebinds_854() {
+        let t0 = std::time::Instant::now();
+        let t1 = t0 + std::time::Duration::from_secs(40);
+        let t2 = t1 + std::time::Duration::from_secs(5);
+        let (mut began, mut round) = (None, 0u64);
+        assert_eq!(responder_round_clock(&mut began, &mut round, 7, t0), t0);
+        assert_eq!(
+            responder_round_clock(&mut began, &mut round, 7, t1),
+            t0,
+            "the same round keeps its start"
+        );
+        assert_eq!(
+            responder_round_clock(&mut began, &mut round, 0, t1),
+            t0,
+            "a legacy frame does not move it"
+        );
+        assert_eq!(
+            responder_round_clock(&mut began, &mut round, 8, t2),
+            t2,
+            "a new round id: the abandoned round's 45 s are not this round's"
+        );
+    }
 
     use crate::transport::{InboundFrame, TransportError, TransportId, TransportSendOutcome};
     use async_trait::async_trait;

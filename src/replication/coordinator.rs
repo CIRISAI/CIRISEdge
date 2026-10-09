@@ -365,12 +365,13 @@ impl ReplicationCoordinator {
         meta: Option<RoundMeta>,
         link: Option<[u8; 16]>,
     ) -> Result<(), CoordinatorError> {
-        if link.is_some() {
-            *self
-                .last_inbound_link
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = link;
-        }
+        // Unconditionally (Codex round two on #854): a frame on a transport
+        // with no link (`None`) clears the last one, so the lifecycle lines
+        // never name a stale link after a failover.
+        *self
+            .last_inbound_link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = link;
         self.deliver_inbound_framed(msg, meta)
     }
 
@@ -2094,6 +2095,36 @@ mod tests {
             alice.end_round().await;
             assert_eq!(alice.current_round(), 0);
             assert_eq!(alice.inbound_depth(), 0);
+        }
+
+        /// CIRISEdge#853 (Codex round two on #854) — a frame on a transport
+        /// with no link clears the link the lifecycle lines name; it never
+        /// keeps reporting the last Reticulum link after a failover.
+        #[tokio::test]
+        async fn a_frame_without_a_link_clears_the_logged_link_854() {
+            let (_alice_t, bob_t, provider, applier) = empty_pair();
+            let bob = ReplicationCoordinator::new(
+                bob_t.clone(),
+                "alice",
+                EnvelopeKind::Key,
+                SessionRole::Responder,
+                provider,
+                applier,
+            );
+            let open = ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            });
+            assert_eq!(bob.last_inbound_link_hex(), "-");
+            bob.deliver_inbound_framed_on(open.clone(), None, Some([0xab; 16]))
+                .unwrap();
+            assert_eq!(bob.last_inbound_link_hex(), "ab".repeat(16));
+            bob.deliver_inbound_framed_on(open, None, None).unwrap();
+            assert_eq!(
+                bob.last_inbound_link_hex(),
+                "-",
+                "an HTTPS frame names no link, not the stale Reticulum one"
+            );
         }
 
         /// A responder echoes the round of the frame it is answering, and

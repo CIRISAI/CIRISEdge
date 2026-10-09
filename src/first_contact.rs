@@ -602,6 +602,9 @@ impl OwnerBindingCarveOut {
                         path.token(),
                         crate::observability::LINK_UP_STAGE_OWNER_BINDING,
                     );
+                    // The transport left an unattributed frame's link-up
+                    // open for this stage; the binding admitted, it ends.
+                    m.responder_link_up_end(path.token(), crate::observability::LINK_UP_OK);
                 }
             }
         }
