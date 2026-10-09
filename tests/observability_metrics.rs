@@ -372,10 +372,11 @@ async fn metrics_send_failure_classified_by_transport_and_error() {
     );
 }
 
-/// `durable_queue_depth` accumulates per delivery class on
-/// `send_durable`. The metric is a monotonic cumulative count of
-/// enqueues — consumers diff it against persist's `queue_depth` for
-/// the resident count (see EdgeMetrics docstring).
+/// `durable_enqueued_total` accumulates per delivery class on
+/// `send_durable`, and `Edge::durable_queue_depth` is the RESIDENT count
+/// from persist's `outbound_counts` (CIRISEdge#845): it rises with the
+/// enqueue and drains when the row is delivered, while the cumulative
+/// counter keeps the enqueue.
 #[tokio::test]
 async fn metrics_durable_queue_depth_tracks_send_durable() {
     let tmp = tempfile::tempdir().unwrap();
@@ -388,11 +389,48 @@ async fn metrics_durable_queue_depth_tracks_send_durable() {
         kind: 0x0000_0001,
         payload: b"durable text".to_vec(),
     };
-    let _ = edge.send_durable(&peer_key_id, msg).await;
+    let depth0 = edge.durable_queue_depth().await.expect("count");
+    let handle = edge
+        .send_durable(&peer_key_id, msg)
+        .await
+        .expect("send_durable");
+    assert_eq!(
+        edge.durable_queue_depth().await.expect("count"),
+        depth0 + 1,
+        "the enqueued row is resident"
+    );
+
+    // Drain the row the way the dispatcher would.
+    let queue = edge.outbound_queue_handle();
+    let claimed = queue
+        .claim_pending_outbound(16, 60, "test-845")
+        .await
+        .expect("claim");
+    assert!(claimed.iter().any(|r| r.queue_id == handle.queue_id));
+    queue
+        .mark_transport_delivered(&handle.queue_id, "test")
+        .await
+        .expect("mark delivered");
+    let row = queue
+        .outbound_status(&handle.queue_id)
+        .await
+        .expect("status")
+        .expect("row");
+    if row.status == ciris_persist::prelude::OutboundStatus::AwaitingAck {
+        queue
+            .mark_ack_received(&handle.queue_id, b"ack")
+            .await
+            .expect("mark ack");
+    }
+    assert_eq!(
+        edge.durable_queue_depth().await.expect("count"),
+        depth0,
+        "delivered: the resident depth drains"
+    );
 
     let snap = edge.metrics().snapshot();
     assert_eq!(
-        snap.durable_queue_depth
+        snap.durable_enqueued_total
             .get(&DeliveryClass::Durable)
             .copied()
             .unwrap_or(0),

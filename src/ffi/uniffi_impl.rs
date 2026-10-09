@@ -764,6 +764,23 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
         "blob.serve_legacy_dag_walks_total".to_string(),
         edge.metrics().blob_serve_legacy_dag_walks(),
     );
+    // CIRISEdge#845 — the cumulative durable enqueues per delivery class,
+    // and the RESIDENT depth from persist's outbound_counts (#996). A
+    // failed count leaves the gauge out rather than reporting 0.
+    for (class, n) in edge.metrics().snapshot().durable_enqueued_total {
+        counters.insert(format!("durable.enqueued_total.{}", class.as_str()), n);
+    }
+    let counted = Arc::clone(&edge);
+    let resident = block_on_runtime(&edge, async move {
+        counted.durable_queue_depth().await.map_err(|e| {
+            tracing::warn!(error = %e, "metrics_snapshot: durable queue depth");
+            crate::EdgeBindingsError::Persist
+        })
+    });
+    if let Ok(depth) = resident {
+        #[allow(clippy::cast_precision_loss)]
+        gauges.insert("durable.queue_depth".to_string(), depth as f64);
+    }
     #[allow(clippy::cast_precision_loss)]
     gauges.insert(
         "reachability.peer_medium_count".to_string(),
@@ -795,14 +812,27 @@ pub fn recent_errors(_limit: u32) -> Result<Vec<crate::EdgeErrorEvent>, crate::E
     Ok(Vec::new())
 }
 
+/// CIRISEdge#845 — the RESIDENT durable depth (rows `pending`, `sending` or
+/// `awaiting_ack`), from persist's `outbound_counts` (CIRISPersist#996).
+/// Persist's count carries no delivery class, so only `None` / `"all"` is
+/// answerable; a named class is `Unsupported` rather than a made-up 0 (this
+/// door returned a constant 0 before #845).
 pub fn queue_depth(
     delivery_class: Option<String>,
 ) -> Result<std::collections::HashMap<String, u64>, crate::EdgeBindingsError> {
-    let _edge = current_edge()?;
-    let mut out = std::collections::HashMap::new();
+    let edge = current_edge()?;
     let class = delivery_class.unwrap_or_else(|| "all".to_string());
-    out.insert(class, 0_u64);
-    Ok(out)
+    if class != "all" {
+        return Err(crate::EdgeBindingsError::Unsupported);
+    }
+    let counted = Arc::clone(&edge);
+    let depth = block_on_runtime(&edge, async move {
+        counted.durable_queue_depth().await.map_err(|e| {
+            tracing::warn!(error = %e, "queue_depth");
+            crate::EdgeBindingsError::Persist
+        })
+    })?;
+    Ok(std::collections::HashMap::from([(class, depth)]))
 }
 
 pub fn peer_health_summary() -> Result<Vec<crate::EdgePeerHealth>, crate::EdgeBindingsError> {

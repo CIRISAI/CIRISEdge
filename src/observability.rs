@@ -59,8 +59,11 @@
 //!
 //! Gauges:
 //!
-//! - `durable_queue_depth[DeliveryClass]` — count of currently-queued
-//!   send_durable / send_mandatory / send_federation envelopes
+//! - `durable_queue_depth` — the RESIDENT durable depth (rows `pending`,
+//!   `sending` or `awaiting_ack`), read from persist's
+//!   `OutboundQueue::outbound_counts` at snapshot time (CIRISEdge#845), not
+//!   kept here. The cumulative enqueue count per delivery class is the
+//!   counter `durable_enqueued_total[DeliveryClass]`.
 //! - `peer_reachability_ratio[(peer_key_id, medium)]` — rolling
 //!   reachability window ratio, mirror of `ReachabilityTracker::snapshot_all`
 
@@ -1022,19 +1025,11 @@ pub struct EdgeMetrics {
     /// Incremented in `dispatch_inbound` when `VerifyPipeline::verify`
     /// returns `Err`.
     pub verify_failures_total: Arc<RwLock<HashMap<VerifyErrorClass, u64>>>,
-    /// Gauge — current count of in-flight durable-class envelopes
-    /// per delivery class. Incremented at enqueue, decremented at
-    /// dispatch (success OR terminal abandon).
-    ///
-    /// **Note**: v0.19.0 wires the increment side only — the
-    /// dispatcher's terminal-state handling lives on persist's
-    /// `OutboundHandle` surface, and the bookkeeping there isn't
-    /// edge-internal. The gauge captures cumulative enqueues and
-    /// consumers diff it against the persist-side `queue_depth` UDL
-    /// read for the resident count. The metric name was held stable
-    /// for downstream consumers; the semantic gap is documented on
-    /// the pymethod surface.
-    pub durable_queue_depth: Arc<RwLock<HashMap<DeliveryClass, u64>>>,
+    /// Counter — cumulative durable enqueues per delivery class, never
+    /// decremented. Until CIRISEdge#845 this was reported under the name
+    /// `durable_queue_depth`; the resident depth now comes from persist's
+    /// `outbound_counts` (see [`crate::outbound::resident_depth`]).
+    pub durable_enqueued_total: Arc<RwLock<HashMap<DeliveryClass, u64>>>,
     /// Per-transport byte count for inbound frames. Incremented by
     /// the inbound listener side when it pushes an [`crate::transport::InboundFrame`].
     pub transport_bytes_in_total: Arc<RwLock<HashMap<TransportId, u64>>>,
@@ -1479,9 +1474,9 @@ impl EdgeMetrics {
         *guard.entry(transport).or_insert(0) += bytes;
     }
 
-    /// Record an enqueue against the durable-queue gauge.
-    pub fn inc_durable_queue(&self, class: DeliveryClass) {
-        let mut guard = self.durable_queue_depth.write();
+    /// Record an enqueue against the cumulative durable-enqueue counter.
+    pub fn inc_durable_enqueued(&self, class: DeliveryClass) {
+        let mut guard = self.durable_enqueued_total.write();
         *guard.entry(class).or_insert(0) += 1;
     }
 
@@ -2203,7 +2198,7 @@ impl EdgeMetrics {
             envelopes_received_total: self.envelopes_received_total.read().clone(),
             send_failures_total: self.send_failures_total.read().clone(),
             verify_failures_total: self.verify_failures_total.read().clone(),
-            durable_queue_depth: self.durable_queue_depth.read().clone(),
+            durable_enqueued_total: self.durable_enqueued_total.read().clone(),
             transport_bytes_in_total: self.transport_bytes_in_total.read().clone(),
             transport_bytes_out_total: self.transport_bytes_out_total.read().clone(),
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
@@ -2435,7 +2430,7 @@ pub struct EdgeMetricsBundle {
     pub envelopes_received_total: HashMap<MessageType, u64>,
     pub send_failures_total: HashMap<(TransportId, String), u64>,
     pub verify_failures_total: HashMap<VerifyErrorClass, u64>,
-    pub durable_queue_depth: HashMap<DeliveryClass, u64>,
+    pub durable_enqueued_total: HashMap<DeliveryClass, u64>,
     pub transport_bytes_in_total: HashMap<TransportId, u64>,
     pub transport_bytes_out_total: HashMap<TransportId, u64>,
     pub peer_reachability_ratio: HashMap<(String, String), f64>,

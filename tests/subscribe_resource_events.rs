@@ -1,7 +1,7 @@
 //! CIRISEdge#34 (v0.19.0) — subscribe_resource_events acceptance gate.
 //!
 //! Verifies the ResourceEvent emission path: `send_durable` enqueues
-//! surface a `durable_queue_depth` ResourcePressure event, and direct
+//! surface a `durable_enqueued_total` ResourcePressure event, and direct
 //! `events.emit_resource` calls (transport-buffer pressure observation
 //! sites) land on the subscribe_resources channel.
 
@@ -140,7 +140,7 @@ impl Transport for NopTransport {
     }
 }
 
-/// `send_durable` increments the durable_queue_depth gauge AND emits a
+/// `send_durable` increments the durable_enqueued_total counter AND emits a
 /// `ResourcePressure` event on the resource channel. Verifies the
 /// emission path edge-internal.
 #[tokio::test]
@@ -192,7 +192,8 @@ async fn subscribe_resource_events_yields_durable_queue_pressure() {
         .expect("did not close");
     assert_eq!(ev.kind, EventKind::ResourcePressure);
     let proj = ResourceEvent::from_event(&ev).expect("projection");
-    assert_eq!(proj.resource_kind, "durable_queue_depth");
+    // CIRISEdge#845 — the cumulative count is named for what it is.
+    assert_eq!(proj.resource_kind, "durable_enqueued_total");
     assert!(proj.measurement >= 1.0);
     assert_eq!(proj.unit, "count");
 }
