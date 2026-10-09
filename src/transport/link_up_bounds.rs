@@ -37,16 +37,24 @@
 use crate::observability::{LINK_UP_REFUSED_RATE_IDENTITY, LINK_UP_REFUSED_RATE_SOURCE};
 use crate::rate_limit::{Decision, Policy, Quota, RateLimiter, Ts};
 
-/// The two link-up quotas. A quota is the limiter's: `permits` link-ups, and
-/// the key refills `window_secs` after its last permitted one — so a peer that
-/// dials now and then is never refused, and a peer that never pauses gets
-/// `permits` per window.
+/// The link-up quotas, per axis a BURST quota and an optional SUSTAINED one.
+///
+/// The burst quota is the limiter's: `permits` link-ups, refilled
+/// `window_secs` after the last permitted one — so a peer that dials now and
+/// then is never refused, and a peer that never pauses gets `permits` before
+/// it must. The sustained quota is a fixed window (the limiter's slow-drain
+/// ceiling): a peer that dials just under the burst quota forever is held to
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinkUpRatePolicy {
-    /// Per proven transport identity.
+    /// Per proven transport identity, burst.
     pub identity: Quota,
-    /// Per source address, all identities on it together.
+    /// Per proven transport identity, sustained (`None`: burst only).
+    pub identity_sustained: Option<Quota>,
+    /// Per source address, all identities on it together, burst.
     pub source: Quota,
+    /// Per source address, sustained (`None`: burst only).
+    pub source_sustained: Option<Quota>,
     /// Identities tracked at once.
     pub max_identities: usize,
     /// Source addresses tracked at once.
@@ -54,12 +62,21 @@ pub struct LinkUpRatePolicy {
 }
 
 impl LinkUpRatePolicy {
-    /// A healthy peer holds its links (CIRISEdge#819's pool, #853's reap) and
-    /// re-dials a handful of times a minute at most, with a burst at boot for
-    /// its lanes. Six covers that.
-    pub const DEFAULT_IDENTITY: Quota = Quota::new(6, 60);
+    /// A healthy edge dials a burst of parallel lanes when its coordinators
+    /// fan out at once — one Resource per link, so every busy lane is a dial
+    /// (CIRISEdge#531/#819: fourteen concurrent sends is the Datum trace's
+    /// coordinator count, nineteen kinds the ceiling). Thirty-two covers the
+    /// burst with room for its retries.
+    pub const DEFAULT_IDENTITY: Quota = Quota::new(32, 60);
+    /// Sustained: eight link-ups a minute averaged over an hour. A healthy
+    /// peer's pooled lanes are reaped idle after two minutes (#853) and
+    /// re-dialled on its next round; the field storm (#856) was ~23 a minute
+    /// per identity.
+    pub const DEFAULT_IDENTITY_SUSTAINED: Quota = Quota::new(480, 3_600);
     /// Four identities' worth per source address.
-    pub const DEFAULT_SOURCE: Quota = Quota::new(24, 60);
+    pub const DEFAULT_SOURCE: Quota = Quota::new(128, 60);
+    /// Four identities' worth, sustained.
+    pub const DEFAULT_SOURCE_SUSTAINED: Quota = Quota::new(1_920, 3_600);
     /// Keys tracked per axis.
     pub const DEFAULT_MAX_KEYS: usize = 4_096;
 }
@@ -68,7 +85,9 @@ impl Default for LinkUpRatePolicy {
     fn default() -> Self {
         Self {
             identity: Self::DEFAULT_IDENTITY,
+            identity_sustained: Some(Self::DEFAULT_IDENTITY_SUSTAINED),
             source: Self::DEFAULT_SOURCE,
+            source_sustained: Some(Self::DEFAULT_SOURCE_SUSTAINED),
             max_identities: Self::DEFAULT_MAX_KEYS,
             max_sources: Self::DEFAULT_MAX_KEYS,
         }
@@ -113,16 +132,22 @@ impl LinkUpBounds {
     #[must_use]
     pub fn new(policy: LinkUpRatePolicy) -> Self {
         Self {
-            identity: RateLimiter::new(Policy::quota(
-                policy.identity.permits,
-                policy.identity.window_secs,
-                policy.max_identities,
-            )),
-            source: RateLimiter::new(Policy::quota(
-                policy.source.permits,
-                policy.source.window_secs,
-                policy.max_sources,
-            )),
+            identity: RateLimiter::new(
+                Policy::quota(
+                    policy.identity.permits,
+                    policy.identity.window_secs,
+                    policy.max_identities,
+                )
+                .with_long_windows([policy.identity_sustained, None]),
+            ),
+            source: RateLimiter::new(
+                Policy::quota(
+                    policy.source.permits,
+                    policy.source.window_secs,
+                    policy.max_sources,
+                )
+                .with_long_windows([policy.source_sustained, None]),
+            ),
             iface_source: std::collections::HashMap::new(),
         }
     }
@@ -196,8 +221,37 @@ mod tests {
     fn policy(identity: u32, source: u32) -> LinkUpRatePolicy {
         LinkUpRatePolicy {
             identity: Quota::new(identity, 60),
+            identity_sustained: None,
             source: Quota::new(source, 60),
+            source_sustained: None,
             ..LinkUpRatePolicy::default()
+        }
+    }
+
+    #[test]
+    fn the_sustained_quota_holds_a_peer_that_never_spends_its_burst() {
+        let mut b = LinkUpBounds::new(LinkUpRatePolicy {
+            identity_sustained: Some(Quota::new(5, 3_600)),
+            ..policy(3, 100)
+        });
+        // Two link-ups a minute and a quiet minute between pairs: the burst
+        // quota refills every time, the sustained one does not.
+        let mut refused = 0;
+        for minute in 0..10u64 {
+            for s in 0..2 {
+                if b.admit(A, None, 1_000 + minute * 120 + s).is_err() {
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!(refused, 15, "five of twenty inside the hour");
+    }
+
+    #[test]
+    fn the_default_admits_a_healthy_fan_out_burst() {
+        let mut b = LinkUpBounds::new(LinkUpRatePolicy::default());
+        for _ in 0..19 {
+            assert_eq!(b.admit(A, Some("10.0.0.1"), 1000), Ok(()));
         }
     }
 

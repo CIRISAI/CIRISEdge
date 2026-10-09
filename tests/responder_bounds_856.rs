@@ -39,7 +39,9 @@ const HEALTHY_LANES: usize = 2;
 fn link_up(identity: u32, source: u32) -> LinkUpRatePolicy {
     LinkUpRatePolicy {
         identity: Quota::new(identity, 600),
+        identity_sustained: None,
         source: Quota::new(source, 600),
+        source_sustained: None,
         ..LinkUpRatePolicy::default()
     }
 }

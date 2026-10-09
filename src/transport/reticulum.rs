@@ -3638,7 +3638,8 @@ impl ReticulumTransport {
     /// identifies, before it is attributed, and counted in
     /// `link_ups_refused_total{rate_identity|rate_source}`. Default
     /// [`LinkUpRatePolicy::default`](crate::transport::link_up_bounds::LinkUpRatePolicy)
-    /// (6 per identity, 24 per source, refilling 60 s after the last). Setting
+    /// (bursts of 32 per identity and 128 per source, refilling 60 s after the
+    /// last; 480 and 1,920 an hour sustained). Setting
     /// the policy starts both ledgers fresh.
     pub fn set_link_up_rate_policy(
         &self,
@@ -10735,6 +10736,8 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // refused link is closed here and never carries a frame anywhere.
             if let Some(refusal) = link_up_refusal(ctx, link_id, identity_hash) {
                 refuse_link_up(ctx, link_id, identity_hash, refusal).await;
+                // choke-ok: counted in `link_ups_refused_total` and logged
+                // (throttled) by `refuse_link_up`, which closed the link.
                 return;
             }
             // CIRISEdge#34 link half (v0.14.0) — emit `link_identified`

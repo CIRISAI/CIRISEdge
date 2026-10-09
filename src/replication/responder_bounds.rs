@@ -136,18 +136,19 @@ mod tests {
     fn rounds_are_served_until_k_never_complete() {
         let t0 = Instant::now();
         let mut p = NoProgress::new(policy(3, 60, 900));
-        for i in 0..4 {
+        for i in 0..3 {
             assert_eq!(
                 p.on_round_open(t0 + Duration::from_secs(i)),
                 RoundAdmission::Serve,
                 "round {i}"
             );
         }
-        assert_eq!(p.streak(), 3);
+        // The fourth open is what shows the third never completed.
         assert_eq!(
             p.on_round_open(t0 + Duration::from_secs(5)),
             RoundAdmission::BackedOff
         );
+        assert_eq!(p.streak(), 3);
     }
 
     #[test]
