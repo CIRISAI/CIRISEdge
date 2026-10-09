@@ -1420,6 +1420,9 @@ pub struct EdgeMetrics {
     /// (dropped at a full control plane) and whose bookkeeping was rebuilt from
     /// a later per-link event. Non-zero means establish events are being lost.
     pub recovered_links_total: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#853 — ships refused because their lane was already claimed by
+    /// another transfer. Unreachable by construction; non-zero is a regression.
+    pub unclaimed_ship_refused_total: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A `&'static str`-keyed counter map, cloned out with owned keys for the
@@ -2044,6 +2047,19 @@ impl EdgeMetrics {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// CIRISEdge#853 — a ship refused on a lane another transfer holds.
+    pub fn inc_unclaimed_ship_refused(&self) {
+        self.unclaimed_ship_refused_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 — read `unclaimed_ship_refused_total`.
+    #[must_use]
+    pub fn unclaimed_ship_refused_total(&self) -> u64 {
+        self.unclaimed_ship_refused_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// CIRISEdge#853 — read `recovered_links_total`.
     #[must_use]
     pub fn recovered_links_total(&self) -> u64 {
@@ -2272,6 +2288,7 @@ impl EdgeMetrics {
                 })
                 .collect(),
             recovered_links_total: self.recovered_links_total(),
+            unclaimed_ship_refused_total: self.unclaimed_ship_refused_total(),
             responder_link_up_total: {
                 let totals = self.responder_link_up_total.read();
                 LINK_UP_OUTCOMES
@@ -2551,6 +2568,9 @@ pub struct EdgeMetricsBundle {
     pub responder_link_up_total: HashMap<String, u64>,
     /// CIRISEdge#853 — links recovered after a lost `LinkEstablished`.
     pub recovered_links_total: u64,
+    /// CIRISEdge#853 — ships refused on a lane another transfer held.
+    /// Unreachable by construction; non-zero is a regression.
+    pub unclaimed_ship_refused_total: u64,
 }
 
 /// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
@@ -2836,6 +2856,10 @@ impl EdgeMetricsBundle {
             "recovered_links_total".to_string(),
             self.recovered_links_total,
         );
+        f.counters.insert(
+            "unclaimed_ship_refused_total".to_string(),
+            self.unclaimed_ship_refused_total,
+        );
         f
     }
 }
@@ -2920,6 +2944,7 @@ edge_metrics_bundle_fields!(
     responder_link_up_seconds,
     responder_link_up_total,
     recovered_links_total,
+    unclaimed_ship_refused_total,
 );
 
 #[cfg(test)]

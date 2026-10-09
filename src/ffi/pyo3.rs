@@ -3052,6 +3052,10 @@ fn metrics_bundle_to_pydict<'py>(
     }
     root.set_item("responder_link_up_total", link_up_total)?;
     root.set_item("recovered_links_total", bundle.recovered_links_total)?;
+    root.set_item(
+        "unclaimed_ship_refused_total",
+        bundle.unclaimed_ship_refused_total,
+    )?;
 
     Ok(root)
 }
