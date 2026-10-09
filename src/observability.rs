@@ -911,17 +911,23 @@ pub const RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED: &str = "send_then_complete_
 /// serves one round per window until one does.
 pub const RESPONDER_ROUND_BACKED_OFF: &str = "backed_off";
 /// CIRISEdge#856 — a reply was not sent because the peer cannot consume its
-/// shape: it needs more than one Resource segment and the peer opened its round
-/// below the multi-segment wire floor.
+/// shape: it needs more than one Resource segment, the peer opened its round
+/// below the multi-segment wire floor, and the transport had no single-segment
+/// form for it (no live inbound link, or the frame does not fragment).
 pub const RESPONDER_ROUND_REFUSED_CAPABILITY: &str = "refused_capability";
+/// CIRISEdge#856 — a reply that needs more than one Resource segment went to
+/// a peer below the multi-segment wire floor in a single-segment form (link
+/// Channel fragments) instead. Counted per reply, not per round.
+pub const RESPONDER_ROUND_DOWN_PACKED: &str = "down_packed";
 /// Every `responder_rounds_total` outcome token.
-pub const RESPONDER_ROUND_OUTCOMES: [&str; 7] = [
+pub const RESPONDER_ROUND_OUTCOMES: [&str; 8] = [
     RESPONDER_ROUND_STARTED,
     RESPONDER_ROUND_COMPLETED_RESPONDER_FINAL,
     RESPONDER_ROUND_COMPLETED_INITIATOR_FINAL,
     RESPONDER_ROUND_REPLY_SEND_FAILED,
     RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED,
     RESPONDER_ROUND_BACKED_OFF,
+    RESPONDER_ROUND_DOWN_PACKED,
     RESPONDER_ROUND_REFUSED_CAPABILITY,
 ];
 
@@ -964,7 +970,8 @@ pub const LINK_UP_REFUSED_RATE_SOURCE: &str = "rate_source";
 pub const LINK_UP_REFUSED_REASONS: [&str; 2] =
     [LINK_UP_REFUSED_RATE_IDENTITY, LINK_UP_REFUSED_RATE_SOURCE];
 /// CIRISEdge#856 — the default `rooted_peers_silent` bounds: one hour, six
-/// hours, a day.
+/// hours, a day. First guesses, like every #856 default: tune them from what
+/// the gauge reads in the field.
 pub const DEFAULT_ROOTED_SILENCE_BOUNDS: [std::time::Duration; 3] = [
     std::time::Duration::from_secs(3_600),
     std::time::Duration::from_secs(21_600),
@@ -1549,9 +1556,11 @@ pub struct EdgeMetrics {
     /// CIRISEdge#856 — per peer, when a round with it last completed in either
     /// direction (unix seconds). Bounded by [`PEER_ROUND_COMPLETED_TRACKED_MAX`].
     pub peer_round_completed_at: Arc<RwLock<HashMap<String, u64>>>,
-    /// CIRISEdge#856 — the transport's rooted peers and when each was first
-    /// seen rooted (unix seconds), republished on the transport's reaper tick.
-    pub rooted_peers_seen: Arc<RwLock<HashMap<String, u64>>>,
+    /// CIRISEdge#856 — per transport metrics source, its rooted peers and when
+    /// each was first seen rooted (unix seconds), republished on that
+    /// transport's reaper tick. Read as the UNION across sources, so one
+    /// transport's set never overwrites another's.
+    pub rooted_peers_seen: Arc<RwLock<HashMap<u64, HashMap<String, u64>>>>,
     /// CIRISEdge#856 — the `rooted_peers_silent` bounds; empty until set means
     /// [`DEFAULT_ROOTED_SILENCE_BOUNDS`].
     pub rooted_silence_bounds: Arc<RwLock<Vec<std::time::Duration>>>,
@@ -2350,17 +2359,35 @@ impl EdgeMetrics {
         at.insert(peer.to_owned(), now);
     }
 
-    /// CIRISEdge#856 — the transport's current rooted peers. A peer keeps the
-    /// instant it was first seen rooted for as long as it stays rooted; a peer
-    /// no longer rooted is dropped.
-    pub fn set_rooted_peers<'a>(&self, rooted: impl IntoIterator<Item = &'a str>) {
+    /// CIRISEdge#856 — transport `source`'s current rooted peers (its
+    /// `metrics_source`). A peer keeps the instant it was first seen rooted for
+    /// as long as it stays rooted; a peer no longer rooted by this source is
+    /// dropped from it. Other sources' sets are untouched.
+    pub fn set_rooted_peers<'a>(&self, source: u64, rooted: impl IntoIterator<Item = &'a str>) {
         let now = unix_secs_now();
         let mut seen = self.rooted_peers_seen.write();
+        let mine = seen.entry(source).or_default();
         let fresh: HashMap<String, u64> = rooted
             .into_iter()
-            .map(|p| (p.to_owned(), seen.get(p).copied().unwrap_or(now)))
+            .map(|p| (p.to_owned(), mine.get(p).copied().unwrap_or(now)))
             .collect();
-        *seen = fresh;
+        *mine = fresh;
+    }
+
+    /// CIRISEdge#856 — the rooted set across every source: each peer rooted by
+    /// any transport, with the earliest instant any of them first saw it.
+    #[must_use]
+    pub fn rooted_peers(&self) -> HashMap<String, u64> {
+        let mut union: HashMap<String, u64> = HashMap::new();
+        for set in self.rooted_peers_seen.read().values() {
+            for (peer, since) in set {
+                union
+                    .entry(peer.clone())
+                    .and_modify(|at| *at = (*at).min(*since))
+                    .or_insert(*since);
+            }
+        }
+        union
     }
 
     /// CIRISEdge#856 — set the `rooted_peers_silent` bounds (an empty list
@@ -2385,7 +2412,7 @@ impl EdgeMetrics {
                 b.clone()
             }
         };
-        let seen = self.rooted_peers_seen.read();
+        let seen = self.rooted_peers();
         let completed = self.peer_round_completed_at.read();
         bounds
             .iter()
@@ -2393,7 +2420,7 @@ impl EdgeMetrics {
                 let silent = seen
                     .iter()
                     .filter(|(peer, since)| {
-                        let last = completed.get(*peer).copied().unwrap_or(**since);
+                        let last = completed.get(peer.as_str()).copied().unwrap_or(**since);
                         now.saturating_sub(last) >= bound.as_secs()
                     })
                     .count() as u64;
@@ -2403,14 +2430,18 @@ impl EdgeMetrics {
     }
 
     /// CIRISEdge#856 — per rooted peer, its last completed round in either
-    /// direction (unix seconds; 0 = none since this node started).
+    /// direction (unix seconds; 0 = none since this node started). A listing,
+    /// NOT a bundle field: a label per peer does not belong in a scrape. The
+    /// bindings expose it as `rooted_peer_rounds()`.
     #[must_use]
     pub fn rooted_peer_last_completed_unix(&self) -> HashMap<String, u64> {
         let completed = self.peer_round_completed_at.read();
-        self.rooted_peers_seen
-            .read()
-            .keys()
-            .map(|p| (p.clone(), completed.get(p).copied().unwrap_or(0)))
+        self.rooted_peers()
+            .into_keys()
+            .map(|p| {
+                let at = completed.get(&p).copied().unwrap_or(0);
+                (p, at)
+            })
             .collect()
     }
 
@@ -2684,7 +2715,6 @@ impl EdgeMetrics {
             unclaimed_ship_refused_total: self.unclaimed_ship_refused_total(),
             link_ups_refused_total: self.link_ups_refused_total(),
             rooted_peers_silent: self.rooted_peers_silent(),
-            rooted_peer_last_completed_unix: self.rooted_peer_last_completed_unix(),
         }
     }
 }
@@ -3009,9 +3039,6 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#856 — gauge: rooted peers with no completed round in either
     /// direction for at least each bound, keyed `"<secs>s"`.
     pub rooted_peers_silent: HashMap<String, u64>,
-    /// CIRISEdge#856 — per rooted peer, its last completed round (unix
-    /// seconds; 0 = none since start).
-    pub rooted_peer_last_completed_unix: HashMap<String, u64>,
 }
 
 /// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
@@ -3327,16 +3354,6 @@ impl EdgeMetricsBundle {
         #[allow(clippy::cast_precision_loss)]
         f.gauges
             .insert("rooted_peers_silent".to_string(), silent_max as f64);
-        // The bare key is the number of rooted peers (a sum of timestamps
-        // would mean nothing); each peer's instant is `f.<peer>`.
-        for (peer, at) in &self.rooted_peer_last_completed_unix {
-            f.counters
-                .insert(format!("rooted_peer_last_completed_unix.{peer}"), *at);
-        }
-        f.counters.insert(
-            "rooted_peer_last_completed_unix".to_string(),
-            self.rooted_peer_last_completed_unix.len() as u64,
-        );
         // CIRISEdge#858 — the refusal memory's park ledger.
         f.family(
             "rows_parked_on_signer",
@@ -3459,7 +3476,6 @@ edge_metrics_bundle_fields!(
     unclaimed_ship_refused_total,
     link_ups_refused_total,
     rooted_peers_silent,
-    rooted_peer_last_completed_unix,
 );
 
 #[cfg(test)]
@@ -3841,7 +3857,7 @@ mod p0_telemetry_tests {
     fn rooted_peers_silent_counts_rooted_peers_without_a_recent_round() {
         let m = EdgeMetrics::new();
         m.set_rooted_silence_bounds(vec![Duration::from_secs(60), Duration::from_secs(3600)]);
-        m.set_rooted_peers(["fresh", "stale", "never"]);
+        m.set_rooted_peers(1, ["fresh", "stale", "never"]);
         let now = super::unix_secs_now();
         m.note_peer_round_completed("fresh");
         m.peer_round_completed_at
@@ -3849,6 +3865,8 @@ mod p0_telemetry_tests {
             .insert("stale".into(), now - 120);
         m.rooted_peers_seen
             .write()
+            .get_mut(&1)
+            .expect("source 1")
             .insert("never".into(), now - 7200);
         m.note_peer_round_completed("not-rooted");
         let silent = m.rooted_peers_silent();
@@ -3857,15 +3875,56 @@ mod p0_telemetry_tests {
         let last = m.rooted_peer_last_completed_unix();
         assert_eq!(last.len(), 3, "the rooted set only");
         assert_eq!(last["never"], 0);
-        m.set_rooted_peers(["never", "fresh", "stale"]);
+        m.set_rooted_peers(1, ["never", "fresh", "stale"]);
         assert_eq!(m.rooted_peers_silent()["3600s"], 1, "first-seen survives");
-        m.set_rooted_peers(["fresh"]);
+        m.set_rooted_peers(1, ["fresh"]);
         assert_eq!(m.rooted_peers_silent()["60s"], 0, "unrooted peers leave");
         m.set_rooted_silence_bounds(Vec::new());
         assert_eq!(m.rooted_peers_silent().len(), 3, "the default bounds");
         let flat = m.snapshot().flatten();
-        assert_eq!(flat.counters["rooted_peer_last_completed_unix"], 1);
+        assert!(
+            !flat.counters.keys().any(|k| k.contains("rooted_peer_last")),
+            "the per-peer listing is not in the bundle"
+        );
         assert!(flat.gauges.contains_key("rooted_peers_silent.3600s"));
+    }
+
+    /// CIRISEdge#856 — two transports publish their rooted sets under their
+    /// own metrics sources; the read is the union, and neither publish
+    /// overwrites the other's.
+    #[test]
+    fn rooted_sets_from_two_sources_are_unioned_not_overwritten() {
+        let m = EdgeMetrics::new();
+        m.set_rooted_silence_bounds(vec![Duration::from_secs(60)]);
+        m.set_rooted_peers(1, ["a", "shared"]);
+        m.set_rooted_peers(2, ["b", "shared"]);
+        let union = m.rooted_peers();
+        let mut keys: Vec<&str> = union.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["a", "b", "shared"]);
+        // Source 2 republishing a smaller set leaves source 1's intact.
+        m.set_rooted_peers(2, ["b"]);
+        let mut keys: Vec<String> = m.rooted_peers().into_keys().collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["a", "b", "shared"],
+            "`shared` is still rooted by source 1"
+        );
+        // The earliest first-seen across sources wins.
+        let now = super::unix_secs_now();
+        m.rooted_peers_seen
+            .write()
+            .get_mut(&2)
+            .expect("source 2")
+            .insert("a".into(), now - 600);
+        assert_eq!(m.rooted_peers()["a"], now - 600);
+        assert_eq!(
+            m.rooted_peers_silent()["60s"],
+            1,
+            "a, measured from source 2's sighting"
+        );
+        assert_eq!(m.rooted_peer_last_completed_unix().len(), 3);
     }
 
     /// CIRISEdge#856 — the completion ledger is bounded; the stalest goes.

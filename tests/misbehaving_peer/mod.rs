@@ -18,8 +18,12 @@
 //!   link-up rate. `None`: one pooled link, reused.
 //! - `complete_rounds` — `false`: the peer opens a round, takes the reply and
 //!   goes silent, so no round it opens ever completes.
-//! - `max_segments` — `Some(n)`: a reply needing more than `n` Resource
-//!   segments is dropped on arrival, as a build that cannot reassemble it does.
+//! - `max_segments` — `Some(n)`: a frame that arrived as a Resource of more
+//!   than `n` segments is dropped, as a build that cannot reassemble it does.
+//!   The peer's transport records each whole inbound Resource's segment count
+//!   (`inbound_resources_by_segments_for_test`); a frame that crossed as link
+//!   Channel fragments is not a Resource and passes, as it does on such a
+//!   build.
 //! - `dial_at_all` — `false`: the peer roots and never dials.
 //! - `identities_per_source` — how many identities share this peer's source
 //!   address.
@@ -37,7 +41,7 @@ use ciris_edge::replication::protocol::{
     DeliverMessage, DiffMessage, EnvelopeRef, ReplicationMessage, SummaryMessage,
 };
 use ciris_edge::replication::responder_bounds::NoProgressPolicy;
-use ciris_edge::replication::wire_frame::{self, RoundSide, SINGLE_SEGMENT_MAX_BYTES};
+use ciris_edge::replication::wire_frame::{self, RoundSide};
 use ciris_edge::replication::{
     self_publish_set, EnvelopeKind, InboundRouter, ReplicationRuntime, ReplicationRuntimeConfig,
 };
@@ -214,6 +218,8 @@ pub struct Peer {
     pub max_frame_seen: AtomicUsize,
     /// Frames dropped by `max_segments`.
     pub oversized_dropped: AtomicU64,
+    /// Resources of more than `max_segments` already accounted for.
+    over_segment_seen: AtomicU64,
     responder_key: String,
 }
 
@@ -453,6 +459,7 @@ impl Harness {
                     complete: AtomicBool::new(knobs.complete_rounds),
                     max_frame_seen: AtomicUsize::new(0),
                     oversized_dropped: AtomicU64::new(0),
+                    over_segment_seen: AtomicU64::new(0),
                     responder_key: r_key.key_id.clone(),
                 }));
             }
@@ -498,7 +505,10 @@ impl Peer {
             let len = frame.envelope_bytes.len();
             self.max_frame_seen.fetch_max(len, Ordering::Relaxed);
             if let Some(n) = self.knobs.max_segments {
-                if len > n.saturating_mul(SINGLE_SEGMENT_MAX_BYTES) {
+                // The Resource's segment count is recorded before its frame is
+                // delivered, so a new over-limit Resource is this frame.
+                let over = self.resources_over(n);
+                if over > self.over_segment_seen.swap(over, Ordering::Relaxed) {
                     self.oversized_dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -515,6 +525,17 @@ impl Peer {
                 return Some(framed.msg);
             }
         }
+    }
+
+    /// Whole Resources of more than `n` segments this peer's transport took in.
+    #[must_use]
+    pub fn resources_over(&self, n: usize) -> u64 {
+        self.transport
+            .inbound_resources_by_segments_for_test()
+            .into_iter()
+            .filter(|(segments, _)| usize::try_from(*segments).unwrap_or(usize::MAX) > n)
+            .map(|(_, count)| count)
+            .sum()
     }
 
     /// Switch `complete_rounds` mid-run.

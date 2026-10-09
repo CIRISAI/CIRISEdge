@@ -77,8 +77,17 @@ fn inbound_opens_round(inbound: &Inbound, bound: u64) -> bool {
 pub enum ReplySend {
     /// Handed to the transport.
     Sent,
-    /// Not sent: the reply needs more than one Resource segment and the peer
-    /// opened its round below the multi-segment wire floor.
+    /// The reply needs more than one Resource segment and the peer opened its
+    /// round below the multi-segment wire floor, so it went in a form needing
+    /// none ([`Transport::send_without_segmenting`]).
+    DownPacked {
+        /// The round-open wire version the gate judged.
+        wire_version: u8,
+        /// The reply's wire length.
+        bytes: usize,
+    },
+    /// Not sent: as [`Self::DownPacked`], but the transport had no
+    /// single-segment form for it.
     RefusedCapability {
         /// The round-open wire version the gate judged.
         wire_version: u8,
@@ -888,11 +897,15 @@ impl ReplicationCoordinator {
     /// The wire bytes are built exactly as [`Self::send_message`] builds them;
     /// a responder bound to a LEGACY round (the peer opened it with v1/v2
     /// framing, below [`super::wire_frame::MULTI_SEGMENT_REPLY_WIRE_FLOOR`])
-    /// whose reply would need more than one Resource segment does not send it:
-    /// [`ReplySend::RefusedCapability`]. Nothing goes on the wire — a reply the
-    /// peer cannot reassemble is dropped at its end after costing both sides
-    /// the transfer, and a legacy peer has no refusal message to receive. On an
-    /// initiator this is [`Self::send_message`].
+    /// whose reply would need more than one Resource segment is DOWN-PACKED:
+    /// sent through [`Transport::send_without_segmenting`] (on Reticulum, `CFRG`
+    /// fragments on the link Channel, which every edge since v15.2.0
+    /// reassembles), so the legacy peer converges instead of dropping a
+    /// Resource it cannot assemble — [`ReplySend::DownPacked`]. Only a reply
+    /// the transport has no single-segment form for is refused,
+    /// [`ReplySend::RefusedCapability`], with nothing on the wire (a legacy
+    /// peer has no refusal message to receive). On an initiator this is
+    /// [`Self::send_message`].
     ///
     /// # Errors
     ///
@@ -909,10 +922,21 @@ impl ReplicationCoordinator {
                 super::wire_frame::WIRE_PROTOCOL_VERSION_V3
             };
             if !super::wire_frame::reply_shape_consumable(version, bytes.len()) {
-                return Ok(ReplySend::RefusedCapability {
-                    wire_version: version,
-                    bytes: bytes.len(),
-                });
+                return match self
+                    .transport
+                    .send_without_segmenting(&self.peer_key_id, &bytes)
+                    .await
+                {
+                    Ok(Some(_)) => Ok(ReplySend::DownPacked {
+                        wire_version: version,
+                        bytes: bytes.len(),
+                    }),
+                    Ok(None) => Ok(ReplySend::RefusedCapability {
+                        wire_version: version,
+                        bytes: bytes.len(),
+                    }),
+                    Err(e) => Err(CoordinatorError::from(e)),
+                };
             }
         }
         self.transport

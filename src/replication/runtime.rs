@@ -639,8 +639,22 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                         .await
                         {
                             Ok(Ok(ReplySend::Sent)) => {}
+                            // CIRISEdge#856 — a below-floor peer's reply went
+                            // in a form it can take; counted per reply.
+                            Ok(Ok(ReplySend::DownPacked {
+                                wire_version,
+                                bytes,
+                            })) => {
+                                count(obs::RESPONDER_ROUND_DOWN_PACKED);
+                                tracing::debug!(
+                                    peer = %peer, ?kind, wire_version, bytes,
+                                    "responder DOWN-PACKED a reply for a peer below the \
+                                     multi-segment wire floor (CIRISEdge#856)"
+                                );
+                            }
                             // CIRISEdge#856 — a reply shape the peer cannot
-                            // consume is never sent; the round ends here.
+                            // consume, with no single-segment form, is never
+                            // sent; the round ends here.
                             Ok(Ok(ReplySend::RefusedCapability {
                                 wire_version,
                                 bytes,
@@ -652,8 +666,9 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                                     floor = crate::replication::wire_frame::MULTI_SEGMENT_REPLY_WIRE_FLOOR,
                                     link = %coord.last_inbound_link_hex(),
                                     "responder REFUSED a reply the peer cannot consume — it needs \
-                                     more than one Resource segment and the peer opened its round \
-                                     below the multi-segment wire floor; not sent (CIRISEdge#856)"
+                                     more than one Resource segment, the peer opened its round \
+                                     below the multi-segment wire floor, and the transport has no \
+                                     single-segment form for it; not sent (CIRISEdge#856)"
                                 );
                                 break;
                             }
@@ -691,6 +706,9 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                     for m in &msgs {
                         match coord.send_reply(m).await {
                             Ok(ReplySend::Sent) => {}
+                            Ok(ReplySend::DownPacked { .. }) => {
+                                count(obs::RESPONDER_ROUND_DOWN_PACKED);
+                            }
                             Ok(ReplySend::RefusedCapability {
                                 wire_version,
                                 bytes,

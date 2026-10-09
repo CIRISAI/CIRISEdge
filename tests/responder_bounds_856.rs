@@ -10,8 +10,9 @@
 //!   aggregate: `rate_source` counts, `rate_identity` does not;
 //! - (c) a peer that never completes rounds: backed off after K, recovers on
 //!   one completion;
-//! - (d) a peer below the wire floor: typed refusal, no multi-segment reply
-//!   sent — while the v3 healthy peer gets the same reply multi-segment;
+//! - (d) a peer below the wire floor: its reply DOWN-PACKED (no multi-segment
+//!   Resource reaches it) and the round completes — while the v3 healthy peer
+//!   gets the same reply as a multi-segment Resource;
 //! - (e) a rooted peer that never dials: reported silent after the bound;
 //! - (f) a healthy peer under the production defaults: zero refusals, every
 //!   round completes.
@@ -242,12 +243,14 @@ async fn c_a_peer_that_never_completes_is_backed_off_and_recovers_856() {
 }
 
 /// **(d)** The responder holds enough `Key` rows that a peer wanting them all
-/// gets a Deliver past one Resource segment. A peer that opened its round with
-/// LEGACY framing — below the multi-segment wire floor — gets a typed refusal
-/// and NO multi-segment frame; the v3 healthy peer asking for the same rows
-/// gets the multi-segment Deliver (the gate is the wire version, not the size).
+/// gets a Deliver past one Resource segment. The v3 healthy peer gets it as a
+/// multi-segment Resource. A peer that opened its round with LEGACY framing —
+/// below the multi-segment wire floor, and dropping any Resource past one
+/// segment — gets the same Deliver DOWN-PACKED (link Channel fragments, no
+/// Resource) and COMPLETES: counted `down_packed`, nothing refused, nothing it
+/// had to drop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn d_a_peer_below_the_wire_floor_gets_a_typed_refusal_not_a_multi_segment_reply_856() {
+async fn d_a_peer_below_the_wire_floor_gets_its_reply_down_packed_and_completes_856() {
     let old = Knobs {
         wire: Wire::Legacy,
         max_segments: Some(1),
@@ -273,32 +276,42 @@ async fn d_a_peer_below_the_wire_floor_gets_a_typed_refusal_not_a_multi_segment_
     );
     let big = healthy.max_frame_seen.load(Ordering::Relaxed);
     assert!(
-        big > SINGLE_SEGMENT_MAX_BYTES,
-        "the fixture's Deliver must need more than one segment to test the floor: {big} B"
+        big > SINGLE_SEGMENT_MAX_BYTES && healthy.resources_over(1) >= 1,
+        "the fixture's Deliver must cross as a multi-segment Resource to test the \
+         floor: {big} B, {:?}",
+        healthy.transport.inbound_resources_by_segments_for_test()
     );
-    assert_eq!(r.rounds("refused_capability"), 0, "nothing refused to v3");
+    assert_eq!(r.rounds("down_packed"), 0, "nothing down-packed for v3");
 
     assert_eq!(
         p.round(true).await,
-        RoundResult::NoDeliver,
-        "the legacy peer's Deliver is refused, not sent"
+        RoundResult::Completed,
+        "the legacy peer takes the down-packed Deliver and completes"
     );
     assert!(
-        wait_for(Duration::from_secs(5), || async {
-            r.rounds("refused_capability") >= 1
-        })
-        .await,
-        "refused_capability counts: {:?}",
-        r.metrics.responder_rounds_total()
+        p.max_frame_seen.load(Ordering::Relaxed) > SINGLE_SEGMENT_MAX_BYTES,
+        "the whole Deliver reached it"
     );
-    assert!(
-        p.max_frame_seen.load(Ordering::Relaxed) <= SINGLE_SEGMENT_MAX_BYTES,
-        "no multi-segment frame reached the legacy peer"
+    assert_eq!(
+        p.resources_over(1),
+        0,
+        "no multi-segment Resource reached the legacy peer: {:?}",
+        p.transport.inbound_resources_by_segments_for_test()
     );
     assert_eq!(
         p.oversized_dropped.load(Ordering::Relaxed),
         0,
         "nothing was sent that the peer had to drop"
+    );
+    assert!(
+        r.rounds("down_packed") >= 1,
+        "down_packed counts: {:?}",
+        r.metrics.responder_rounds_total()
+    );
+    assert_eq!(
+        r.rounds("refused_capability"),
+        0,
+        "a reply with a single-segment form is never refused"
     );
     // Small replies still flow to it: a round wanting nothing completes.
     assert_eq!(p.round(false).await, RoundResult::Completed);

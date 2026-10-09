@@ -30,9 +30,25 @@
 //! serial, a local shared-instance client) yields no source, and the source
 //! axis is skipped for it: a broadcast medium is not one host.
 //!
-//! The address is the IMMEDIATE hop. Peers reaching this node through one
-//! transport relay share that relay's address, and peers behind one NAT share
-//! the NAT's; the default leaves room for several honest identities per source.
+//! The address is the IMMEDIATE hop (ruled acceptable, #856). Peers reaching
+//! this node through one transport relay share that relay's address, and peers
+//! behind one NAT or CGNAT share the NAT's; the default leaves room for several
+//! honest identities per source.
+//!
+//! ## What this does not charge
+//!
+//! A link that never identifies is never judged here: no identity, so no
+//! verdict, and the source axis is charged only alongside an identity. Such a
+//! link carries nothing (no attribution, so its frames route nowhere) and is
+//! bounded by #853's inbound idle reap and `TransportConfig::max_links` (ruled
+//! acceptable, #856).
+//!
+//! ## The defaults are first guesses
+//!
+//! Every quota in [`LinkUpRatePolicy::default`] was chosen from one field
+//! reading and one healthy-burst test (`link_pool_819`), not measured. Tune
+//! them from `link_ups_refused_total` and `responder_link_up_total` in the
+//! field.
 
 use crate::observability::{LINK_UP_REFUSED_RATE_IDENTITY, LINK_UP_REFUSED_RATE_SOURCE};
 use crate::rate_limit::{Decision, Policy, Quota, RateLimiter, Ts};

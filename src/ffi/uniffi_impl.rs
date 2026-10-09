@@ -831,6 +831,15 @@ pub fn queue_depth(
     Ok(std::collections::HashMap::from([(class, depth)]))
 }
 
+/// CIRISEdge#856 — every rooted peer and the unix second its last round
+/// completed, in either direction (0: none since this node started). The
+/// per-peer listing behind the snapshot's `rooted_peers_silent` gauge; not in
+/// the snapshot itself, where it would be a label per peer.
+pub fn rooted_peer_rounds(
+) -> Result<std::collections::HashMap<String, u64>, crate::EdgeBindingsError> {
+    Ok(current_edge()?.metrics().rooted_peer_last_completed_unix())
+}
+
 pub fn peer_health_summary() -> Result<Vec<crate::EdgePeerHealth>, crate::EdgeBindingsError> {
     let edge = current_edge()?;
     let snap = edge.reachability_tracker().snapshot_all();

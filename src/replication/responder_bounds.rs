@@ -12,6 +12,12 @@
 //! "Progress" is the responder's own observation — the driver reached a
 //! completion arm — never anything the peer asserts. A round dropped by the
 //! backoff was not served, so it neither extends nor clears the streak.
+//!
+//! The record is per `(peer, kind)` responder, not per peer across kinds: a
+//! peer that completes its Key rounds and fails its Attestation rounds is
+//! backed off on Attestation only. The defaults ([`NoProgressPolicy::default`])
+//! are first guesses; tune them from `responder_rounds_total{backed_off}` in
+//! the field.
 
 use std::time::{Duration, Instant};
 

@@ -624,6 +624,26 @@ pub trait Transport: Send + Sync + 'static {
         sink: tokio::sync::mpsc::Sender<InboundFrame>,
     ) -> Result<(), TransportError>;
 
+    /// CIRISEdge#856 — send `envelope_bytes` to `destination_key_id` so that no
+    /// transfer unit needs more than ONE Resource segment: the form a peer that
+    /// cannot reassemble a multi-segment Resource still consumes. `Ok(None)`:
+    /// this transport has no such form for this frame right now, and the caller
+    /// refuses the reply rather than send one the peer would drop.
+    ///
+    /// The default is a plain [`Self::send`]: correct for every transport that
+    /// does not split a frame into Resource segments (HTTP, packet radio). The
+    /// Reticulum transport overrides it — a delegating wrapper around a
+    /// segmenting transport MUST forward it.
+    async fn send_without_segmenting(
+        &self,
+        destination_key_id: &str,
+        envelope_bytes: &[u8],
+    ) -> Result<Option<TransportSendOutcome>, TransportError> {
+        self.send(destination_key_id, envelope_bytes)
+            .await
+            .map(Some)
+    }
+
     /// CIRISEdge#683 — send `envelope_bytes` back along `path`, the path a
     /// request from `destination_key_id` arrived on (#353: answer on the link
     /// the requester opened). A transport that keeps no per-sender path sends

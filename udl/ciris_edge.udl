@@ -136,6 +136,10 @@ namespace ciris_edge {
     [Throws=EdgeBindingsError]
     record<string, u64> queue_depth(string? delivery_class);
 
+    // CIRISEdge#856 — rooted peer → unix second of its last completed round.
+    [Throws=EdgeBindingsError]
+    record<string, u64> rooted_peer_rounds();
+
     [Throws=EdgeBindingsError]
     sequence<EdgePeerHealth> peer_health_summary();
 

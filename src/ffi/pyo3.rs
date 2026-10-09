@@ -942,6 +942,15 @@ impl PyEdge {
         }
     }
 
+    /// CIRISEdge#856 — every rooted peer and the unix second its last round
+    /// completed, in either direction (0: none since this node started). The
+    /// per-peer listing behind the bundle's `rooted_peers_silent` gauge, kept
+    /// out of the bundle because a label per peer does not belong in a scrape.
+    /// The PyO3 twin of the UniFFI `rooted_peer_rounds()`.
+    fn rooted_peer_rounds(&self) -> std::collections::HashMap<String, u64> {
+        self.inner.metrics().rooted_peer_last_completed_unix()
+    }
+
     /// CIRISEdge P0 telemetry — the number of live Reticulum links, the
     /// PyO3 twin of the UniFFI `link_count()`. `0` for HTTPS-only /
     /// transport-less builds (as `rooted_peers` returns `[]`), where UniFFI
@@ -3131,10 +3140,6 @@ fn metrics_bundle_to_pydict<'py>(
     for (name, map) in [
         ("link_ups_refused_total", &bundle.link_ups_refused_total),
         ("rooted_peers_silent", &bundle.rooted_peers_silent),
-        (
-            "rooted_peer_last_completed_unix",
-            &bundle.rooted_peer_last_completed_unix,
-        ),
     ] {
         let d = pyo3::types::PyDict::new(py);
         for (k, v) in map {

@@ -396,6 +396,10 @@ const CHANNEL_FRAGMENT_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 /// Generous: a 20 KB Attestation Deliver at the 431 B RNS MDU is ~47 fragments
 /// and paces at window×RTT, which is seconds, not tens of seconds.
 const CHANNEL_FRAME_SEND_BUDGET: Duration = Duration::from_secs(15);
+/// CIRISEdge#856 — the frame budget for a DOWN-PACKED reply (a whole Deliver as
+/// link-Channel fragments): under the responder driver's 60 s reply bound, so
+/// a stall here is this send's failure, not the driver's timeout.
+const DOWN_PACK_SEND_BUDGET: Duration = Duration::from_secs(50);
 /// CIRISEdge#636 (production speed) — a reverse-path reply that fragments into
 /// at most this many pieces rides the link Channel FIRST (reliable, sequenced,
 /// interleaves any in-flight resource transfer) instead of opening a Resource
@@ -467,11 +471,21 @@ async fn send_fragments_on_channel(
     link_id: &LinkId,
     fragments: &[Vec<u8>],
 ) -> FragmentSendOutcome {
+    send_fragments_on_channel_within(node, link_id, fragments, CHANNEL_FRAME_SEND_BUDGET).await
+}
+
+/// [`send_fragments_on_channel`] under a caller-chosen frame budget.
+async fn send_fragments_on_channel_within(
+    node: &ReticulumNode,
+    link_id: &LinkId,
+    fragments: &[Vec<u8>],
+    budget: Duration,
+) -> FragmentSendOutcome {
     let total = fragments.len();
     let started = tokio::time::Instant::now();
     let mut sent = 0usize;
     for frag in fragments {
-        if started.elapsed() > CHANNEL_FRAME_SEND_BUDGET {
+        if started.elapsed() > budget {
             return FragmentSendOutcome {
                 sent,
                 total,
@@ -2535,6 +2549,10 @@ pub struct ReticulumTransport {
     /// source address), judged on `LinkIdentified`. A `std` mutex: the critical
     /// section is two map lookups.
     link_up_bounds: std::sync::Mutex<crate::transport::link_up_bounds::LinkUpBounds>,
+    /// CIRISEdge#856 — whole inbound Resources by their segment count: the
+    /// receive-side witness that a peer was (or was not) sent a multi-segment
+    /// transfer. Keys are segment counts (a handful), so the map stays tiny.
+    inbound_resource_segments: std::sync::Mutex<HashMap<u32, u64>>,
     /// CIRISEdge#853 — resources that concluded (completed or failed) in the
     /// last [`INBOUND_TRANSFER_STALL`], by hash: a data-plane `Started` /
     /// `Progress` arriving after its own control-plane completion is ignored
@@ -3536,6 +3554,7 @@ impl ReticulumTransport {
                 ),
             ),
             concluded_resources: std::sync::Mutex::new(HashMap::new()),
+            inbound_resource_segments: std::sync::Mutex::new(HashMap::new()),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -3969,6 +3988,18 @@ impl ReticulumTransport {
             .map(Vec::len)
             .sum();
         (identity, scoped)
+    }
+
+    /// CIRISEdge#856 test seam — whole inbound Resources received, by their
+    /// segment count: what a peer that cannot reassemble past N segments
+    /// would have dropped.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn inbound_resources_by_segments_for_test(&self) -> HashMap<u32, u64> {
+        self.inbound_resource_segments
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// CIRISEdge#856 test seam — drop every pooled identity link from the pool
@@ -6801,6 +6832,19 @@ impl ReticulumTransport {
         send_fragments_on_channel(&self.node, &link_id, fragments).await
     }
 
+    /// CIRISEdge#856 — [`Self::send_channel_marked`] under `budget` for the whole
+    /// fragment sequence instead of [`CHANNEL_FRAME_SEND_BUDGET`]: a down-packed
+    /// reply is a full Deliver, not a control frame.
+    async fn send_channel_marked_within(
+        &self,
+        link_id: LinkId,
+        fragments: &[Vec<u8>],
+        budget: Duration,
+    ) -> FragmentSendOutcome {
+        let _busy = OutboundShipGuard::new(&self.outbound_ship_active, link_id);
+        send_fragments_on_channel_within(&self.node, &link_id, fragments, budget).await
+    }
+
     /// CIRISEdge#853 — wrap a claimed lane in a [`LinkClaim`], so the claim is
     /// released on every exit, a cancelled send's included.
     fn link_claim(&self, link_id: LinkId) -> LinkClaim {
@@ -7638,6 +7682,58 @@ impl Transport for ReticulumTransport {
     /// by another transport, or a link that has since closed, falls back to the
     /// by-key [`Self::send`] (which still tries the peer's attributed links and
     /// then a dial).
+    /// CIRISEdge#856 — the down-pack: the frame as `CFRG` fragments on the
+    /// peer's live inbound link's Channel — the packet path every edge since
+    /// v15.2.0 reassembles (#414/#421), so no piece is a Resource, let alone a
+    /// multi-segment one. `Ok(None)` when the peer holds no live inbound link
+    /// (a below-floor peer opens its round on a link it dialled, so this is the
+    /// reply's link) or the frame cannot be fragmented at this link's MDU.
+    async fn send_without_segmenting(
+        &self,
+        destination_key_id: &str,
+        envelope_bytes: &[u8],
+    ) -> Result<Option<TransportSendOutcome>, TransportError> {
+        if envelope_bytes.len() > MAX_BODY_BYTES {
+            return Err(TransportError::BodyTooLarge {
+                actual: envelope_bytes.len(),
+                limit: MAX_BODY_BYTES,
+            });
+        }
+        let Some(link_id) = self
+            .live_link_to(destination_key_id, LinkPlane::Identity)
+            .await
+        else {
+            return Ok(None);
+        };
+        let mdu = link_channel_mdu(&self.node, &link_id);
+        let Some(fragments) = crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
+        else {
+            return Ok(None);
+        };
+        let outcome = self
+            .send_channel_marked_within(link_id, &fragments, DOWN_PACK_SEND_BUDGET)
+            .await;
+        if outcome.complete() {
+            note_outbound_use(&self.link_last_outbound_at, link_id);
+            tracing::debug!(
+                destination_key_id,
+                link = ?link_id,
+                mdu,
+                bytes = envelope_bytes.len(),
+                fragments = outcome.total,
+                "down-packed reply delivered as link PACKETs — the peer cannot take a \
+                 multi-segment Resource (CIRISEdge#856)"
+            );
+            return Ok(Some(TransportSendOutcome::Delivered));
+        }
+        Err(TransportError::Io(format!(
+            "down-packed reply stalled after {}/{} fragments: {} (CIRISEdge#856)",
+            outcome.sent,
+            outcome.total,
+            outcome.stalled.unwrap_or("-")
+        )))
+    }
+
     async fn send_on_reply_path(
         &self,
         destination_key_id: &str,
@@ -7873,7 +7969,10 @@ impl Transport for ReticulumTransport {
                             })
                             .map(|(k, _)| k.clone())
                             .collect();
-                        m.set_rooted_peers(rooted.iter().map(String::as_str));
+                        m.set_rooted_peers(
+                            self.metrics_source,
+                            rooted.iter().map(String::as_str),
+                        );
                     }
                     let closed = self.reap_idle_inbound_links().await;
                     if closed > 0 {
@@ -7969,6 +8068,7 @@ impl Transport for ReticulumTransport {
                         concluded_resources: &self.concluded_resources,
                         swallow_link_established: &self.swallow_link_established,
                         link_up_bounds: &self.link_up_bounds,
+                        inbound_resource_segments: &self.inbound_resource_segments,
                         link_last_outbound_at: &self.link_last_outbound_at,
                         av_sink: &self.av_sink,
                         av_node: &self.node,
@@ -9237,6 +9337,8 @@ struct EventCtx<'a> {
     swallow_link_established: &'a std::sync::atomic::AtomicBool,
     /// CIRISEdge#856 — see the field of the same name on [`ReticulumTransport`].
     link_up_bounds: &'a std::sync::Mutex<crate::transport::link_up_bounds::LinkUpBounds>,
+    /// CIRISEdge#856 — see the field of the same name on [`ReticulumTransport`].
+    inbound_resource_segments: &'a std::sync::Mutex<HashMap<u32, u64>>,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     link_last_outbound_at: &'a std::sync::Mutex<HashMap<LinkId, u64>>,
     /// CIRISEdge#805 — see the field of the same name on [`ReticulumTransport`].
@@ -11073,6 +11175,11 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     link_id,
                     false,
                 );
+                *ctx.inbound_resource_segments
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(total_segments)
+                    .or_insert(0) += 1;
             }
             if is_sender {
                 // choke-ok: sender-side completion is NOT an inbound drop — our own

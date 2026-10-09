@@ -829,6 +829,19 @@ async fn the_uniffi_snapshot_projects_every_bundle_field_and_queue_depth_is_resi
         assert!(snap.counters.contains_key(legacy), "{legacy} kept");
     }
 
+    // CIRISEdge#856 — the rooted-peer listing is its own door, not the
+    // snapshot (a label per peer); a fresh Edge roots no one.
+    assert!(
+        !snap
+            .counters
+            .keys()
+            .any(|k| k.starts_with("rooted_peer_last")),
+        "the per-peer listing stays out of the snapshot"
+    );
+    assert!(ciris_edge::ffi::uniffi_impl::rooted_peer_rounds()
+        .expect("rooted_peer_rounds")
+        .is_empty());
+
     let all = ciris_edge::ffi::uniffi_impl::queue_depth(None).expect("queue_depth(all)");
     assert_eq!(all.get("all").copied(), Some(0));
     edge.send_durable(

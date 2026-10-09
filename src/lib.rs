@@ -489,9 +489,9 @@ pub use ffi::uniffi_impl::{
     crate_version, current_ratchet_id, identity_hash, identity_pubkeys, last_rotation_at,
     metrics_snapshot, path_table, peer_add, peer_get, peer_health_summary, peer_list, peer_probe,
     peer_remove, peer_set_alias, peer_set_notes, peer_set_policy, peer_set_trust, queue_depth,
-    recent_errors, recent_events, transport_add, transport_config_blob, transport_disable,
-    transport_enable, transport_health, transport_list, transport_remove, transport_set_mode,
-    transport_stats,
+    recent_errors, recent_events, rooted_peer_rounds, transport_add, transport_config_blob,
+    transport_disable, transport_enable, transport_health, transport_list, transport_remove,
+    transport_set_mode, transport_stats,
 };
 
 // v0.14.0 (CIRISEdge#32) — Links FFI bodies. The scaffolding looks
