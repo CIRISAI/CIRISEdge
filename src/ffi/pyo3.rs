@@ -2513,6 +2513,12 @@ impl PyEdge {
         for (k, v) in &bundle.durable_queue_depth {
             durable_depth.set_item(k.as_str(), *v)?;
         }
+        // CIRISEdge#814 — the honest name for the same number: cumulative
+        // ENQUEUES, never decremented. `durable_queue_depth` keeps its old
+        // meaning until a resident depth (persist's count) replaces it. Two
+        // dicts, not one aliased: a consumer that edits one must not see the
+        // edit under the other name (#815 review).
+        root.set_item("durable_enqueued_total", durable_depth.copy()?)?;
         root.set_item("durable_queue_depth", durable_depth)?;
 
         let bytes_in = pyo3::types::PyDict::new(py);
@@ -5795,6 +5801,7 @@ pub fn init_edge_runtime(
 
     let (verify_dir, rooting_dir): (Arc<dyn VerifyDirectory>, Arc<dyn RootingDirectory>) =
         match &queue_dispatch {
+            #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
             BackendDispatch::Postgres(b) => (b.clone(), b.clone()),
             BackendDispatch::Sqlite(b) => (b.clone(), b.clone()),
         };
@@ -5806,6 +5813,7 @@ pub fn init_edge_runtime(
     // table lives in the same DB as the outbound queue).
     let blackhole_rules: Arc<dyn ciris_persist::federation::BlackholeRules> = match &queue_dispatch
     {
+        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
         BackendDispatch::Postgres(b) => b.clone(),
         BackendDispatch::Sqlite(b) => b.clone(),
     };
@@ -5818,6 +5826,7 @@ pub fn init_edge_runtime(
     // `crate::detector` lifts them to the trait object the
     // `ProbePatternObserver` consumes for `put_edge_detection_event`.
     let derived_schema: Arc<dyn crate::detector::EdgeDetectionAdmission> = match &queue_dispatch {
+        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
         BackendDispatch::Postgres(b) => b.clone(),
         BackendDispatch::Sqlite(b) => b.clone(),
     };
@@ -5875,7 +5884,10 @@ pub fn init_edge_runtime(
                 return Err(e);
             }
         };
+    // One arm under `pyo3-sqlite` (no Postgres backend), two under `pyo3`.
+    #[allow(clippy::infallible_destructuring_match)]
     let queue: Arc<dyn OutboundHandle> = match queue_dispatch {
+        #[cfg(feature = "pyo3")] // postgres exists only with persist/pyo3 (#824)
         BackendDispatch::Postgres(b) => b,
         BackendDispatch::Sqlite(b) => b,
     };
@@ -8878,6 +8890,89 @@ fn edge_evidence_rows() -> Vec<String> {
     crate::field_conformance::edge_evidence_rows()
 }
 
+/// CIRISEdge#814 — route edge's `tracing` events to stderr in a Python host.
+///
+/// The wheel installs no subscriber by itself, so without this every edge
+/// log line in a Python process — refusals at WARN included — is discarded
+/// and `RUST_LOG` does nothing. Call it once, early. The filter is `filter`
+/// if given, else `RUST_LOG`, else [`DEFAULT_LOG_FILTER`] (every edge target:
+/// the `ciris_edge` crate path and the custom `edge::*` targets).
+///
+/// Returns `True` if this call installed the subscriber, `False` if one was
+/// already installed (by an earlier call or by the host), which it leaves in
+/// place: a second call is a no-op, never an error, and its `filter` is not
+/// even parsed. `ValueError` only when this call would install and `filter`
+/// does not parse. Rust `log` records are bridged into the subscriber when no
+/// `log` logger exists yet; a host-owned `log` logger is left alone and does
+/// not change the return value.
+#[pyfunction]
+#[pyo3(signature = (filter=None))]
+fn init_logging(filter: Option<&str>) -> PyResult<bool> {
+    init_logging_with(filter)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("init_logging: {e}")))
+}
+
+/// The default `init_logging` directive: the crate path AND edge's one custom
+/// target, `edge::detector::verdict`, which a crate-path directive alone
+/// would drop. Named exactly: `EnvFilter` target directives match by PREFIX,
+/// so a bare `edge=info` would also admit a cohabiting `edge_runtime` or
+/// `edgedb` (#815 review). A new custom target must be added here, and the
+/// capture test below pins the list.
+pub(crate) const DEFAULT_LOG_FILTER: &str = "ciris_edge=info,edge::detector::verdict=info";
+
+/// Whether a GLOBAL `tracing` dispatcher is installed. `get_default` yields
+/// the current thread's scoped dispatcher first (`with_default` /
+/// `set_default`) and the global one only as the fallback, so probing on
+/// the caller's thread would report a host's scoped subscriber as "installed"
+/// and leave edge's background logs discarded once that scope ends (#815
+/// review). A fresh thread has no scope, so its `get_default` is the global
+/// dispatcher, or `NoSubscriber` when none was ever set.
+fn global_subscriber_installed() -> bool {
+    std::thread::Builder::new()
+        .name("ciris-edge-log-probe".to_owned())
+        .spawn(|| {
+            tracing::dispatcher::get_default(|d| !d.is::<tracing::subscriber::NoSubscriber>())
+        })
+        .ok()
+        .and_then(|probe| probe.join().ok())
+        .unwrap_or(false)
+}
+
+/// The testable core of [`init_logging`]: `Err` only for a filter that does
+/// not parse, and only when a subscriber would be installed.
+fn init_logging_with(filter: Option<&str>) -> Result<bool, String> {
+    use tracing_subscriber::EnvFilter;
+    // Already installed (an earlier call or the host): a no-op, before the
+    // filter is looked at, so a defensive second call never raises. This
+    // asks for the GLOBAL dispatcher: `has_been_set()` also turns true after
+    // any scoped `with_default`/`set_default` that has since been dropped,
+    // which would report "installed" while every edge log is still
+    // discarded (#815 review).
+    if global_subscriber_installed() {
+        return Ok(false);
+    }
+    let env_filter = match filter {
+        Some(f) => EnvFilter::try_new(f).map_err(|e| format!("bad filter {f:?}: {e}"))?,
+        None => {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER))
+        }
+    };
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
+        .finish();
+    // Install the tracing dispatcher on its own: `try_init` would also set the
+    // `log` bridge and report a host-owned `log` logger as "already installed"
+    // after it had in fact installed this subscriber. A race with another
+    // installer between the check above and here is the same "already set".
+    if tracing::subscriber::set_global_default(subscriber).is_err() {
+        return Ok(false);
+    }
+    // Best-effort `log` bridge; a host that already owns `log` keeps it.
+    let _ = tracing_log::LogTracer::init();
+    Ok(true)
+}
+
 /// Map the pinned §2.4 `"typ"` integer table onto
 /// [`crate::scope_privacy::RecordType`]. `0` is reserved; out-of-set
 /// values raise `ValueError` (strict allowlist, AV-7 posture).
@@ -9512,6 +9607,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // point in a future revision.
     #[cfg(feature = "transport-reticulum")]
     m.add_function(wrap_pyfunction!(init_edge_runtime, m)?)?;
+
+    // CIRISEdge#814 — edge's logs in a Python host.
+    m.add_function(wrap_pyfunction!(init_logging, m)?)?;
 
     // CIRISEdge#123 — cross-wheel conformance surface for
     // realtime_av + federation_session + RNS dest-hash. Lets
@@ -12049,7 +12147,17 @@ mod pyo3_tier2_tests {
             let snap = py_edge.metrics_snapshot(py)?;
             let bound = snap.bind(py);
             let depth = bound.get_item("durable_queue_depth")?;
-            depth.get_item("durable")?.extract()
+            // CIRISEdge#814 — the honestly named alias carries the same count.
+            let enqueued: u64 = bound
+                .get_item("durable_enqueued_total")?
+                .get_item("durable")?
+                .extract()?;
+            let d: u64 = depth.get_item("durable")?.extract()?;
+            assert_eq!(
+                enqueued, d,
+                "durable_enqueued_total mirrors durable_queue_depth"
+            );
+            Ok(d)
         })
         .expect("metrics_snapshot post");
         assert_eq!(
@@ -12256,6 +12364,121 @@ mod node_identity_tests {
             "BridgeConfig has no mode field: the directory role keys on the \
              serve-tier resolver, never on AgentMode (ROLE_MATRIX axis 3) — \
              reintroducing this line is reintroducing the v18.12.1 mis-key"
+        );
+    }
+}
+
+/// CIRISEdge#814 — a Python host can route edge's logs to stderr, once.
+#[cfg(test)]
+mod init_logging_814 {
+    use super::{init_logging_with, DEFAULT_LOG_FILTER};
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    /// ONE test for the global install, because the subscriber is
+    /// process-wide: split tests would depend on run order and, under the
+    /// default parallel runner, race each other (#815 review, round 4). The
+    /// scoped-dispatcher probe check lives here for the same reason.
+    ///
+    /// Before anything is installed, a bad filter is refused by name and
+    /// installs nothing; a good call installs (`true`). After that every
+    /// call is a no-op returning `false` and never an error — including one
+    /// whose filter does not parse (#815 review: the installed case is
+    /// checked before the filter is looked at).
+    #[test]
+    fn install_once_then_every_call_is_a_quiet_no_op() {
+        // A scoped dispatcher on the CALLING thread is not a global one: the
+        // probe's answer must not change inside one (#815 review, round 3).
+        // Checked here, before any install, so no parallel test can flip the
+        // global between the two probes.
+        {
+            let scoped = tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish();
+            let before = super::global_subscriber_installed();
+            let inside =
+                tracing::subscriber::with_default(scoped, super::global_subscriber_installed);
+            assert_eq!(
+                inside, before,
+                "entering a scoped dispatcher must not change what the GLOBAL probe reports"
+            );
+        }
+        if super::global_subscriber_installed() {
+            // Another test in this binary installed one first; the
+            // pre-install half cannot be observed here, the rest can.
+        } else {
+            let err = init_logging_with(Some("ciris_edge=not-a-level=x"))
+                .expect_err("an unparseable filter must not install anything");
+            assert!(err.contains("bad filter"), "{err}");
+            assert!(
+                !super::global_subscriber_installed(),
+                "a refused filter must leave no subscriber behind"
+            );
+            assert_eq!(init_logging_with(Some("ciris_edge=info")), Ok(true));
+        }
+        assert!(
+            super::global_subscriber_installed(),
+            "init_logging must leave a global subscriber installed"
+        );
+        assert_eq!(
+            init_logging_with(None),
+            Ok(false),
+            "a second call must not replace or fail on the installed subscriber"
+        );
+        assert_eq!(
+            init_logging_with(Some("ciris_edge=not-a-level=x")),
+            Ok(false),
+            "once installed, a call is a no-op even with a filter that would not parse"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The default directive keeps edge's custom-target warnings (the
+    /// detector's `edge::detector::verdict`), not only the crate path: the
+    /// exact event the #815 review found dropped under `ciris_edge=info`.
+    #[test]
+    fn the_default_filter_keeps_edge_custom_targets() {
+        let out = Captured::default();
+        let sink = out.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || sink.clone())
+            .with_env_filter(tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "edge::detector::verdict", "verdict-marker");
+            tracing::warn!("crate-path-marker");
+            tracing::info!(target: "some_other_crate", "foreign-marker");
+            // A prefix collision: `edge=info` would admit this (#815 review).
+            tracing::info!(target: "edge_runtime", "prefix-marker");
+        });
+        let text = String::from_utf8(out.0.lock().expect("capture lock").clone())
+            .expect("utf8 log output");
+        assert!(
+            text.contains("verdict-marker"),
+            "edge::* target dropped: {text}"
+        );
+        assert!(
+            text.contains("crate-path-marker"),
+            "ciris_edge target dropped: {text}"
+        );
+        assert!(
+            !text.contains("foreign-marker"),
+            "the default must stay edge-only: {text}"
+        );
+        assert!(
+            !text.contains("prefix-marker"),
+            "a target that merely starts with `edge` is not edge's: {text}"
         );
     }
 }

@@ -57,7 +57,7 @@
 //!   *Why the seam is needed at all*: `AvPublisher`/`AvRelay`/
 //!   `LeviculumAvSender`/`LinkDataPump` in `realtime_av_runtime.rs`
 //!   require an `Arc<ReticulumNode>`, and `ReticulumTransport::node()`
-//!   is `pub(crate)` + `#[cfg(feature = "pyo3")]`. A downstream consumer
+//!   is `pub(crate)` + `#[cfg(feature = "_pyffi")]`. A downstream consumer
 //!   holding a `ReticulumTransport` **cannot** reach the node, so it
 //!   cannot construct the real-RNS A/V sender. See the report.
 //!
@@ -1567,7 +1567,7 @@ async fn send_control(
 /// be used from here today for a structural reason worth recording:
 /// `AvPublisher` / `AvRelay` / `LeviculumAvSender` / `LinkDataPump` all
 /// need an `Arc<ReticulumNode>`, and `ReticulumTransport::node()` is
-/// `pub(crate)` + `#[cfg(feature = "pyo3")]` — a downstream consumer
+/// `pub(crate)` + `#[cfg(feature = "_pyffi")]` — a downstream consumer
 /// holding a `ReticulumTransport` cannot reach the node, and a second
 /// node would need the event receiver the transport's listener already
 /// owns.
