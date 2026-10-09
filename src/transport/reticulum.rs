@@ -2284,6 +2284,15 @@ pub struct ReticulumTransport {
     /// drains too fast to collide). Zero in production: one relaxed atomic
     /// load per ship. Set via [`Self::force_next_sends_busy_for_test`].
     test_force_busy: Arc<std::sync::atomic::AtomicU32>,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_channel_sends_for_test`]. 0 in production.
+    test_channel_delay_ms: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_resource_ships_for_test`]. 0 in production.
+    test_ship_delay_ms: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_dial_publish_for_test`]. 0 in production.
+    test_publish_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Optional out-of-band directory-backed resolver. When `None`,
     /// only the authenticated announce cold-start path is available.
     resolver: Option<Arc<dyn PeerResolver>>,
@@ -2505,6 +2514,16 @@ pub struct ReticulumTransport {
     /// while edge still holds them, with when it first saw that (see
     /// [`ReticulumTransport::reconcile_vanished_links`]).
     vanish_suspects: std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    /// CIRISEdge#853 test seam — when set, the next INBOUND `LinkEstablished`
+    /// is dropped after the resource strategy is set, as a full control plane
+    /// would drop it ([`ReticulumTransport::drop_next_inbound_link_established_for_test`]).
+    /// `false` in production.
+    swallow_link_established: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#853 — resources that concluded (completed or failed) in the
+    /// last [`INBOUND_TRANSFER_STALL`], by hash: a data-plane `Started` /
+    /// `Progress` arriving after its own control-plane completion is ignored
+    /// rather than re-marking the transfer's link busy.
+    concluded_resources: std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
     /// CIRISEdge#853 test seam — `LinkClosed` events the listener drops
     /// unprocessed ([`ReticulumTransport::close_link_silently_for_test`]).
     /// Empty in production.
@@ -2857,14 +2876,14 @@ impl ReticulumTransport {
             reusable_dialed_link: Arc::clone(&self.reusable_dialed_link),
             pool_last_used: Arc::clone(&self.pool_last_used),
             link_in_flight: Arc::clone(&self.link_in_flight),
+            test_publish_delay_ms: Arc::clone(&self.test_publish_delay_ms),
         }
     }
 
-    /// Delegates to [`DialCtx::reusable_link_to`] — the pool lives on the ctx
-    /// now, but every existing caller keeps its shape. CIRISEdge#819: the
-    /// returned link is RESERVED (in flight) for the caller, who must release
-    /// it.
-    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
+    /// Delegates to [`DialCtx::reusable_link_to`]. CIRISEdge#819: the returned
+    /// lane is RESERVED (in flight) for the caller; CIRISEdge#853: as a
+    /// [`LinkClaim`], released on every exit, cancellation included.
+    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkClaim> {
         self.dial_ctx().reusable_link_to(dest).await
     }
 
@@ -3436,6 +3455,9 @@ impl ReticulumTransport {
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
             test_force_busy: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            test_channel_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            test_ship_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            test_publish_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             resolver,
             rooting,
             hybrid_policy,
@@ -3475,6 +3497,8 @@ impl ReticulumTransport {
             link_last_outbound_at: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inbound_idle_seen: std::sync::Mutex::new(HashMap::new()),
             swallow_link_closed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            swallow_link_established: std::sync::atomic::AtomicBool::new(false),
+            concluded_resources: std::sync::Mutex::new(HashMap::new()),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -3834,6 +3858,15 @@ impl ReticulumTransport {
         }
     }
 
+    /// CIRISEdge#853 test seam — drop the next inbound `LinkEstablished` before
+    /// edge records anything for it (after its resource strategy is set), as a
+    /// control-plane overflow drops it.
+    #[doc(hidden)]
+    pub fn drop_next_inbound_link_established_for_test(&self) {
+        self.swallow_link_established
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// CIRISEdge#853 test seam — close `link` at the node and DROP the
     /// `LinkClosed` event it emits before edge's listener handles it: the
     /// silent departure a control-plane overflow produces.
@@ -3894,7 +3927,9 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub async fn take_pooled_link_for_test(&self, peer: &str) -> Option<[u8; 16]> {
         let dest = self.resolve_peer(peer).await?.dest_hash;
-        self.reusable_link_to(&dest).await.map(LinkId::into_bytes)
+        self.reusable_link_to(&dest)
+            .await
+            .map(|claim| claim.keep().into_bytes())
     }
 
     /// CIRISEdge#819 test seam — end a transfer on `link`, exactly as `send`
@@ -4848,7 +4883,7 @@ impl ReticulumTransport {
         if let Some(fragments) = crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
             .filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
         {
-            let outcome = send_fragments_on_channel(&self.node, &link_id, &fragments).await;
+            let outcome = self.send_channel_marked(link_id, &fragments).await;
             if outcome.complete() {
                 // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
                 note_outbound_use(&self.link_last_outbound_at, link_id);
@@ -4868,10 +4903,24 @@ impl ReticulumTransport {
                 "scoped Channel-first send stalled; trying the Resource path (CIRISEdge#739)"
             );
         }
-        let claim = self
-            .claim_link_for_transfer(link_id)
-            .await
-            .then(|| self.link_claim(link_id));
+        // CIRISEdge#853 — never ship on a lane another transfer holds: two
+        // Resources on one link is leviculum `TransferInProgress` for one of
+        // them. A lease is exclusive, so this is unreachable; if a regression
+        // makes it reachable it is a loud, counted refusal, not a collision.
+        if !self.claim_link_for_transfer(link_id).await {
+            if let Some(m) = self.metrics.get() {
+                m.inc_unclaimed_ship_refused();
+            }
+            tracing::warn!(
+                link = %hex::encode(link_id.as_bytes()),
+                "refusing to ship on a lane another transfer holds (CIRISEdge#853); \
+                 this path should be unreachable"
+            );
+            return Err(TransportError::Io(
+                "scoped lane already carries a transfer (CIRISEdge#853)".to_owned(),
+            ));
+        }
+        let claim = Some(self.link_claim(link_id));
         let shipped = self
             .ship_resource_on_link(
                 &link_id,
@@ -5155,6 +5204,33 @@ impl ReticulumTransport {
     /// CIRISEdge#353 test seam — force the next `n` resource ships to fail
     /// [`ShipError::Busy`] (the one-transfer-per-link collision), so a test can
     /// drive the reverse-path busy-retry loop deterministically.
+    /// CIRISEdge#853 test seam — every Channel-first send this transport makes
+    /// on a link waits `ms` inside its busy mark before sending, so a witness
+    /// can hold a send in flight across reaper passes. 0 in production.
+    #[doc(hidden)]
+    pub fn delay_channel_sends_for_test(&self, ms: u64) {
+        self.test_channel_delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 test seam — every Resource ship waits `ms` inside its
+    /// lane claim before sending, so a witness can cancel a send while it
+    /// provably holds its lane. 0 in production.
+    #[doc(hidden)]
+    pub fn delay_resource_ships_for_test(&self, ms: u64) {
+        self.test_ship_delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 test seam — a dial waits `ms` after publishing its lane
+    /// to the pool and before handing it to its sender: the window in which a
+    /// concurrent send could take a lane published unclaimed. 0 in production.
+    #[doc(hidden)]
+    pub fn delay_dial_publish_for_test(&self, ms: u64) {
+        self.test_publish_delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn force_next_sends_busy_for_test(&self, n: u32) {
         self.test_force_busy
             .store(n, std::sync::atomic::Ordering::Relaxed);
@@ -6378,6 +6454,27 @@ impl ReticulumTransport {
         stamp_pool_use(&self.pool_last_used, link_id);
     }
 
+    /// CIRISEdge#853 (Codex round two on #854) — a Channel-first send on
+    /// `link_id`, marked busy for the inbound reaper for as long as it runs
+    /// (up to [`CHANNEL_FRAME_SEND_BUDGET`] under pacing), exactly as a
+    /// Resource ship is ([`OutboundShipGuard`]). Without the mark, a reply
+    /// still waiting on the Channel window could be closed under it by the
+    /// second idle observation: its use is stamped only once it completes.
+    async fn send_channel_marked(
+        &self,
+        link_id: LinkId,
+        fragments: &[Vec<u8>],
+    ) -> FragmentSendOutcome {
+        let _busy = OutboundShipGuard::new(&self.outbound_ship_active, link_id);
+        let delay = self
+            .test_channel_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        send_fragments_on_channel(&self.node, &link_id, fragments).await
+    }
+
     /// CIRISEdge#853 — wrap a claimed lane in a [`LinkClaim`], so the claim is
     /// released on every exit, a cancelled send's included.
     fn link_claim(&self, link_id: LinkId) -> LinkClaim {
@@ -6562,7 +6659,7 @@ impl ReticulumTransport {
                 if let Some(fragments) =
                     fragments.filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
                 {
-                    let outcome = send_fragments_on_channel(&self.node, &link_id, &fragments).await;
+                    let outcome = self.send_channel_marked(link_id, &fragments).await;
                     if outcome.complete() {
                         // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
                         note_outbound_use(&self.link_last_outbound_at, link_id);
@@ -6652,8 +6749,7 @@ impl ReticulumTransport {
                     {
                         // CIRISEdge#636 — absorb the Channel's pacing instead of
                         // reading it as failure (the `fragments_sent=0` signature).
-                        let outcome =
-                            send_fragments_on_channel(&self.node, &link_id, &fragments).await;
+                        let outcome = self.send_channel_marked(link_id, &fragments).await;
                         let (sent, total) = (outcome.sent, outcome.total);
                         if outcome.complete() {
                             // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
@@ -6792,6 +6888,12 @@ impl ReticulumTransport {
         }
         // CIRISEdge#853 — busy for the inbound reaper until this returns.
         let _ship = OutboundShipGuard::new(&self.outbound_ship_active, *link_id);
+        let delay = self
+            .test_ship_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         // Auto-accept any resources the peer pushes back on this link
         // (e.g. an ACK envelope), and ship our envelope as a resource.
         let _ = self
@@ -7111,13 +7213,13 @@ impl Transport for ReticulumTransport {
         // CIRISEdge#819 — `reserved`: the lane came from the pool already
         // marked in flight for this send (see `DialCtx::reusable_link_to`).
         let reused = self.reusable_link_to(&peer.dest_hash).await;
-        let (link_id, reserved) = if let Some(existing) = reused {
+        let claim = if let Some(existing) = reused {
             tracing::trace!(
                 key_id = %destination_key_id,
-                link = ?existing,
+                link = ?existing.link_id(),
                 "reusing the live identified link to this peer (CIRISEdge#532)"
             );
-            (existing, true)
+            existing
         } else {
             // SINGLE-FLIGHT. Without this, N coordinators firing at the same
             // peer all observe "no link" and all dial — the establish:identify
@@ -7159,15 +7261,14 @@ impl Transport for ReticulumTransport {
                 if let Some(existing) = ctx.reusable_link_to(&peer_owned.dest_hash).await {
                     tracing::trace!(
                         key_id = %dkid,
-                        link = ?existing,
+                        link = ?existing.link_id(),
                         "another send established this peer's link while we waited on \
                          the dial gate — reusing it (CIRISEdge#532)"
                     );
-                    return Ok((existing, true));
+                    return Ok(existing);
                 }
                 ctx.dial_and_identify(&dkid, &peer_owned, has_path, establish_timeout)
                     .await
-                    .map(|id| (id, false))
             });
             dial.await
                 .map_err(|e| TransportError::Io(format!("dial task failed: {e}")))??
@@ -7184,9 +7285,11 @@ impl Transport for ReticulumTransport {
         // from the pool permanently while it sat there perfectly usable.
         // CIRISEdge#853 — and a CANCELLED send: the claim is a guard released
         // on drop (the responder's 60 s reply timeout cancels ships that may
-        // run 120 s), so a dropped future no longer retires the lane.
-        let claim = (reserved || self.claim_link_for_transfer(link_id).await)
-            .then(|| self.link_claim(link_id));
+        // run 120 s), so a dropped future no longer retires the lane. Both
+        // arms above return the lane ALREADY CLAIMED (a pool take reserves it;
+        // a dial publishes it claimed), so there is no unclaimed lane to ship
+        // on: the "claim lost, ship anyway" path is gone.
+        let link_id = claim.link_id();
         // A `Busy` collision here is not the reverse-path retry case, so both
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
@@ -7199,9 +7302,7 @@ impl Transport for ReticulumTransport {
                 RESOURCE_TRANSFER_TIMEOUT,
             )
             .await;
-        if let Some(claim) = claim {
-            claim.release().await;
-        }
+        claim.release().await;
         shipped.map_err(ShipError::into_transport)?;
 
         Ok(TransportSendOutcome::Delivered)
@@ -7522,6 +7623,9 @@ impl Transport for ReticulumTransport {
                         #[cfg(feature = "lxmf")]
                         lxmf_serve_links: &self.lxmf_serve_links,
                         swallow_link_closed: &self.swallow_link_closed,
+                        reusable_scoped_link: &self.reusable_scoped_link,
+                        concluded_resources: &self.concluded_resources,
+                        swallow_link_established: &self.swallow_link_established,
                         link_last_outbound_at: &self.link_last_outbound_at,
                     };
                     handle_event(event, &ctx).await;
@@ -7797,6 +7901,53 @@ impl LinkDirections {
     }
 }
 
+/// CIRISEdge#853 — the most concluded resource hashes remembered before the
+/// memo prunes entries older than [`INBOUND_TRANSFER_STALL`].
+const CONCLUDED_RESOURCES_PRUNE_THRESHOLD: usize = 4096;
+
+/// CIRISEdge#853 — record that the resource `hash` concluded (completed or
+/// failed), so a late data-plane `Started`/`Progress` for it is ignored.
+fn note_resource_concluded(
+    memo: &std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
+    hash: [u8; 32],
+) {
+    let mut memo = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if memo.len() >= CONCLUDED_RESOURCES_PRUNE_THRESHOLD {
+        memo.retain(|_, at| at.elapsed() < INBOUND_TRANSFER_STALL);
+    }
+    memo.insert(hash, std::time::Instant::now());
+}
+
+/// CIRISEdge#853 — did the resource `hash` conclude within the stall window?
+/// A `Started`/`Progress` for it is then a straggler from the data plane, not
+/// a transfer in flight.
+fn resource_concluded(
+    memo: &std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
+    hash: &[u8; 32],
+) -> bool {
+    memo.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(hash)
+        .is_some_and(|at| at.elapsed() < INBOUND_TRANSFER_STALL)
+}
+
+/// CIRISEdge#853 (Codex round two on #854) — is `link_id` a pooled lane, in
+/// either pool family (identity `reusable_dialed_link` or scoped
+/// `reusable_scoped_link`)? A linear scan over the pools' lanes: both are small
+/// (bounded by live concurrency per destination).
+fn link_is_pooled(
+    identity: &HashMap<DestinationHash, Vec<LinkId>>,
+    scoped: &HashMap<DestinationHash, Vec<LinkId>>,
+    link_id: LinkId,
+) -> bool {
+    identity
+        .values()
+        .chain(scoped.values())
+        .any(|lanes| lanes.contains(&link_id))
+}
+
 static STARVED_POOL_CLOSE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
 static POOL_CLOSED_CHANNEL_EXHAUSTED: std::sync::atomic::AtomicU64 =
@@ -8040,6 +8191,18 @@ struct LinkClaim {
 }
 
 impl LinkClaim {
+    /// The lane this claim holds.
+    fn link_id(&self) -> LinkId {
+        self.link_id
+    }
+
+    /// Keep the lane claimed past this guard (a test seam that releases it
+    /// later by hand): disarm and hand back the id.
+    fn keep(mut self) -> LinkId {
+        self.armed = false;
+        self.link_id
+    }
+
     async fn release(mut self) {
         self.armed = false;
         self.in_flight.lock().await.remove(&self.link_id);
@@ -8179,9 +8342,23 @@ struct DialCtx {
     /// CIRISEdge#819 — see `ReticulumTransport::pool_last_used`.
     pool_last_used: Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
     link_in_flight: Arc<Mutex<HashSet<LinkId>>>,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_dial_publish_for_test`]. 0 in production.
+    test_publish_delay_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DialCtx {
+    /// CIRISEdge#853 — a [`LinkClaim`] over a lane this ctx already marked in
+    /// flight.
+    fn link_claim(&self, link_id: LinkId) -> LinkClaim {
+        LinkClaim {
+            in_flight: Arc::clone(&self.link_in_flight),
+            last_used: Arc::clone(&self.pool_last_used),
+            link_id,
+            armed: true,
+        }
+    }
+
     /// CIRISEdge#739 — dial `dest_hash` (a scope-derived member address) and
     /// identify the link: the body `send_to_scoped_destination` ran inline
     /// before the scoped pool, unchanged in its steps — record the dialled
@@ -8323,7 +8500,7 @@ impl DialCtx {
         peer: &ResolvedPeer,
         has_path: bool,
         establish_timeout: Duration,
-    ) -> Result<LinkId, TransportError> {
+    ) -> Result<LinkClaim, TransportError> {
         // CIRISEdge#484 — leviculum v0.16 `connect_awaited` returns the handle
         // immediately AND a completion future for `LinkEstablished`, registered
         // BEFORE dispatch (edge no longer needs to observe the event loop `listen`
@@ -8432,15 +8609,31 @@ impl DialCtx {
         // bundle-served — the three things a reusing sender skips. Publishing
         // any earlier would hand another coordinator a link the responder will
         // drop frames on (`SkippedNoSourceKeyId`, #317/#340).
+        //
+        // CIRISEdge#853 — and publish it CLAIMED, for the send that dialled
+        // it. Published unclaimed, a concurrent send could take the lane from
+        // the pool in the gap before the dialler claimed it, and both shipped
+        // on one link (leviculum `TransferInProgress`). The claim rides back
+        // to the dialler as a `LinkClaim`; if the dialler was cancelled while
+        // it waited (the #568 detach), the task's output is dropped when the
+        // task finishes and the claim's `Drop` gives the lane back to the pool.
         stamp_pool_use(&self.pool_last_used, link_id);
+        self.link_in_flight.lock().await.insert(link_id);
+        let claim = self.link_claim(link_id);
         self.reusable_dialed_link
             .lock()
             .await
             .entry(peer.dest_hash)
             .or_default()
             .push(link_id);
+        let delay = self
+            .test_publish_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
 
-        Ok(link_id)
+        Ok(claim)
     }
 
     /// CIRISEdge#532 — the live, identified link we already hold to this dest,
@@ -8456,7 +8649,7 @@ impl DialCtx {
     /// the way out regardless, so this lookup is `(dest, Identity)` by
     /// construction AND by check, and a scoped link can never be handed to an
     /// identity-plane sender through this door either.
-    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
+    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkClaim> {
         let mut map = self.reusable_dialed_link.lock().await;
         let pool = map.get_mut(dest)?;
         // Drop links leviculum no longer holds, so a dead entry cannot occupy a
@@ -8488,7 +8681,7 @@ impl DialCtx {
             in_flight.insert(id);
             stamp_pool_use(&self.pool_last_used, id);
         }
-        picked
+        picked.map(|id| self.link_claim(id))
     }
 }
 
@@ -8637,6 +8830,13 @@ struct EventCtx<'a> {
     lxmf_serve_links: &'a std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     swallow_link_closed: &'a std::sync::Mutex<HashSet<LinkId>>,
+    /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
+    reusable_scoped_link: &'a Mutex<HashMap<DestinationHash, Vec<LinkId>>>,
+    /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
+    concluded_resources: &'a std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
+    /// CIRISEdge#853 test seam — see the field of the same name on
+    /// [`ReticulumTransport`].
+    swallow_link_established: &'a std::sync::atomic::AtomicBool,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     link_last_outbound_at: &'a std::sync::Mutex<HashMap<LinkId, u64>>,
 }
@@ -9026,6 +9226,8 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             .await
             .insert(link_id, now_secs);
     }
+    // CIRISEdge#853 — a link whose `LinkEstablished` edge never saw.
+    recover_unknown_link(ctx, link_id).await;
     // CIRISEdge#414 / CIRISAgent#932 — REASSEMBLE before attributing/routing. A
     // whole (`CRPL…`) frame passes straight through unchanged; a `CFRG` fragment
     // (the send side split an oversized reverse-path reply onto the packet path)
@@ -9275,11 +9477,6 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         // outcome inside `handle_peer_bundle_frame` speaks (INFO on the
         // one-motion upgrade; `drop_inbound` / throttled WARN on any refusal).
         return;
-    }
-    // CIRISEdge#853 — the first application frame on a link a peer dialled
-    // ends its link-up (a no-op for a link not being timed).
-    if let Some(m) = ctx.metrics {
-        m.responder_link_up_end(link_id.into_bytes(), crate::observability::LINK_UP_OK);
     }
     // Gate (CIRISEdge#393): admit the attribution only if the candidate's binding
     // is `Rooted ∧ owns_key` (item 1) AND its transport identity is bound by a
@@ -9554,8 +9751,91 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             link_id.into_bytes(),
         )),
     };
+    note_link_up_frame(ctx.metrics, link_id, frame.source_key_id.is_some());
     if let Err(e) = ctx.sink.send(frame).await {
         tracing::error!(error = %e, "inbound channel send failed");
+    }
+}
+
+/// **CIRISEdge#853 (Codex round two on #854) — rebuild the bookkeeping of a
+/// link whose `LinkEstablished` this node never processed** (a full control
+/// plane drops the newest event; leviculum 0.27 offers no way to list its
+/// links). Called on the link's next per-link event (`LinkIdentified`, or any
+/// frame): a link the node holds but edge has no direction record for is
+/// recorded INBOUND unless this node dialled it (`dialed_link_dest` is written
+/// at every own dial), mirrored as established, given `now` as its
+/// establishment time (so the idle reap starts its clock here) and its plane,
+/// and counted in `recovered_links_total`. Without it such a link was never a
+/// reap candidate and never counted: the exact growth #853 stops.
+async fn recover_unknown_link(ctx: &EventCtx<'_>, link_id: LinkId) {
+    if ctx
+        .link_direction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .by_link
+        .contains_key(&link_id)
+        || !ctx.node.link_is_established(&link_id)
+    {
+        return;
+    }
+    let dialled = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
+    let direction = if dialled {
+        LinkDirection::Outbound
+    } else {
+        LinkDirection::Inbound
+    };
+    {
+        let mut dirs = ctx
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if dirs.by_link.contains_key(&link_id) {
+            return;
+        }
+        dirs.insert(link_id, direction);
+        publish_link_directions(ctx.metrics, ctx.metrics_source, &dirs);
+    }
+    ctx.established_links.lock().await.insert(link_id);
+    let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+    ctx.link_established_at
+        .lock()
+        .await
+        .entry(link_id)
+        .or_insert(now_secs);
+    if let Some(dest) = ctx.node.link_destination(&link_id) {
+        ctx.link_plane
+            .lock()
+            .await
+            .entry(link_id)
+            .or_insert_with(|| {
+                classify_link_plane(ctx.scope_addresses.get().map(Arc::as_ref), &dest)
+            });
+    }
+    if let Some(m) = ctx.metrics {
+        m.inc_recovered_links();
+    }
+    tracing::info!(
+        link = %hex::encode(link_id.as_bytes()),
+        direction = ?direction,
+        "recovered a link whose LinkEstablished was never processed (a control-plane \
+         overflow drops it); it is now tracked, counted and reapable (CIRISEdge#853)"
+    );
+}
+
+/// CIRISEdge#853 (Codex round two on #854) — an application frame on a link
+/// a peer dialled ends its link-up as `ok`, but only an ATTRIBUTED one. An
+/// unattributed frame may be the sibling's owner-binding push, whose stage is
+/// recorded downstream at the carve-out (`OwnerBindingCarveOut::admit_frame`),
+/// which then ends the link-up itself; ending it here first left that stage
+/// with no start time, so it was never recorded. An unattributed frame that is
+/// not an owner binding leaves the link-up to time out, as it should.
+fn note_link_up_frame(
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    link_id: LinkId,
+    attributed: bool,
+) {
+    if let (true, Some(m)) = (attributed, metrics) {
+        m.responder_link_up_end(link_id.into_bytes(), crate::observability::LINK_UP_OK);
     }
 }
 
@@ -9614,6 +9894,18 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             let _ = ctx
                 .node
                 .set_resource_strategy(&link_id, ResourceStrategy::AcceptAll);
+            // CIRISEdge#853 test seam — model a `LinkEstablished` lost to a full
+            // control plane: edge records nothing for this link.
+            if !is_initiator
+                && ctx
+                    .swallow_link_established
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                // choke-ok: a test-only seam (false in production); the link's
+                // bookkeeping is recovered from its next event (#853,
+                // `recover_unknown_link`).
+                return;
+            }
             ctx.established_links.lock().await.insert(link_id);
             // CIRISEdge#853 — which end opened it, from the node's own link
             // state: known here for every link, before any LINKIDENTIFY.
@@ -9701,6 +9993,8 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             link_id,
             identity_hash,
         } => {
+            // CIRISEdge#853 — a link whose `LinkEstablished` edge never saw.
+            recover_unknown_link(ctx, link_id).await;
             // CIRISEdge#34 link half (v0.14.0) — emit `link_identified`
             // event with the peer's truncated identity hash. The peer
             // proved its identity over an already-established link via
@@ -9932,6 +10226,16 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             is_sender,
             ..
         } => {
+            // CIRISEdge#853 — a data-plane Started/Progress that arrives AFTER
+            // its own control-plane completion (the two planes are separate
+            // channels) must not re-mark a finished transfer: it held the link
+            // "busy" for the full stall window and delayed both reaps by up to
+            // 30 s.
+            if resource_concluded(ctx.concluded_resources, &resource_hash) {
+                // choke-ok: a progress tick for a transfer that already
+                // concluded carries no frame; nothing inbound is dropped.
+                return;
+            }
             if !is_sender {
                 // CIRISEdge#819 — an inbound transfer keeps its link busy for
                 // the pool reaper, and every event of it is a use of the link.
@@ -9964,6 +10268,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             error,
             ..
         } => {
+            note_resource_concluded(ctx.concluded_resources, resource_hash);
             if !is_sender {
                 note_inbound_transfer(
                     ctx.inbound_resource_active,
@@ -10005,6 +10310,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             resource_hash,
             ..
         } => {
+            note_resource_concluded(ctx.concluded_resources, resource_hash);
             // CIRISEdge#353b/v13.6.1 — the transfer concluded; drop its progress
             // mirror (bounds the map for both sent + received resources).
             ctx.sent_resource_progress
@@ -10154,15 +10460,11 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // CIRISEdge#853 — a POOLED lane closing ChannelExhausted or Stale
             // is the field signature of a starved responder (its proofs stopped
             // coming back): say so, with running counts.
-            let pooled = match ctx.dialed_link_dest.lock().await.get(&link_id).copied() {
-                Some(dest) => ctx
-                    .reusable_dialed_link
-                    .lock()
-                    .await
-                    .get(&dest)
-                    .is_some_and(|pool| pool.contains(&link_id)),
-                None => false,
-            };
+            let pooled = link_is_pooled(
+                &*ctx.reusable_dialed_link.lock().await,
+                &*ctx.reusable_scoped_link.lock().await,
+                link_id,
+            );
             ctx.link_book().forget(link_id, close_cause(reason)).await;
             if pooled {
                 note_starved_pool_close(reason, &link_id);
@@ -16657,6 +16959,74 @@ mod scope_native_addressing_tests {
         assert!(t.link_plane.lock().await.is_empty(), "plane");
         assert_eq!(t.link_direction_counts(), (0, 0));
         assert_eq!(m.inbound_link_closed_by_reason()["local_teardown"], 1);
+    }
+
+    /// **Codex round two on #854, finding 3 — an unattributed frame leaves the
+    /// link-up open for the owner-binding stage.** The transport ends a
+    /// link-up `ok` only on an ATTRIBUTED frame; the carve-out records the
+    /// owner-binding stage and ends it. Fails when the first frame ends the
+    /// link-up whatever its attribution: the stage then has no start time and
+    /// records nothing.
+    #[test]
+    fn an_unattributed_frame_leaves_the_link_up_for_the_owner_binding_stage_854() {
+        let m = crate::observability::EdgeMetrics::new();
+        let (sibling, peer) = (LinkId::new([3; 16]), LinkId::new([4; 16]));
+        m.responder_link_up_begin(sibling.into_bytes());
+        m.responder_link_up_begin(peer.into_bytes());
+        // The sibling's owner-binding push arrives unattributed…
+        note_link_up_frame(Some(&m), sibling, false);
+        // …and the carve-out records its stage, then ends the link-up.
+        m.responder_link_up_stage(
+            sibling.into_bytes(),
+            crate::observability::LINK_UP_STAGE_OWNER_BINDING,
+        );
+        m.responder_link_up_end(sibling.into_bytes(), crate::observability::LINK_UP_OK);
+        // An attributed peer's first frame ends its link-up at the transport.
+        note_link_up_frame(Some(&m), peer, true);
+        let stages = m.responder_link_up_seconds();
+        assert_eq!(
+            stages.get("owner_binding").map(|h| h.count),
+            Some(1),
+            "the owner-binding stage was recorded: {stages:?}"
+        );
+        assert_eq!(m.responder_link_up_total()["ok"], 2);
+    }
+
+    /// **Codex round two on #854, finding 6 — a scoped lane is a pooled lane.**
+    /// The starved-pool diagnostic asks both pool families. Fails when only the
+    /// identity pool is consulted.
+    #[test]
+    fn a_scoped_lane_counts_as_pooled_854() {
+        let (identity_lane, scoped_lane, stray) = (
+            LinkId::new([1; 16]),
+            LinkId::new([2; 16]),
+            LinkId::new([3; 16]),
+        );
+        let identity = HashMap::from([(DestinationHash::new([9; 16]), vec![identity_lane])]);
+        let scoped = HashMap::from([(DestinationHash::new([8; 16]), vec![scoped_lane])]);
+        assert!(link_is_pooled(&identity, &scoped, identity_lane));
+        assert!(
+            link_is_pooled(&identity, &scoped, scoped_lane),
+            "a scoped lane closing ChannelExhausted/Stale is a starved pooled lane"
+        );
+        assert!(!link_is_pooled(&identity, &scoped, stray));
+    }
+
+    /// **CIRISEdge#853 — a straggler Progress cannot revive a finished
+    /// transfer.** `ResourceProgress` rides leviculum's data plane and
+    /// `ResourceCompleted` its control plane, so a Progress can arrive after
+    /// its own completion. Once concluded, the hash reads as concluded (the
+    /// event arm then ignores the straggler); an unrelated hash does not. Fails
+    /// without the memo: the straggler re-marks the link busy for the stall
+    /// window and the idle reap waits up to 30 s.
+    #[test]
+    fn a_straggler_progress_after_completion_is_recognised_853() {
+        let memo = std::sync::Mutex::new(HashMap::new());
+        let (done, live) = ([1u8; 32], [2u8; 32]);
+        assert!(!resource_concluded(&memo, &done));
+        note_resource_concluded(&memo, done);
+        assert!(resource_concluded(&memo, &done));
+        assert!(!resource_concluded(&memo, &live));
     }
 
     /// Every leviculum close reason has its own token, and every token is
