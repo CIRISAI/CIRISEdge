@@ -2167,21 +2167,30 @@ jobs:
           path: dist/manifests/*.manifest.json
           if-no-files-found: error
       - name: pre-flight registry steward-key check
-        # Surfaces the registry's active steward key_id to the step
-        # summary. Persist + lens log this for human-visible
-        # confirmation that the registry isn't running in ephemeral
-        # mode (registry AV-28).
+        # Registry AV-28 (ephemeral-mode guard): refuse to sign a release
+        # manifest against a registry with no real trust root.
         #
-        # v0.8.1 — registry response evolved to per-install stewards
-        # (US/EU/APAC per CIRISRegistry FSD-002 §2.1 decentralization;
-        # same surface CIRISEdge#20 / persist#105 chase). Shape is now
-        # `{stewards: [{key_id, classical_pubkey, fingerprint,
-        # hardware_class, deployed}, ...]}` — not the old singleton
-        # `{classical: {...}}`. Pre-flight filters to `deployed: true`
-        # rows; in v0.8.x most installs ship with one deployed steward
-        # (US) and two `placeholder_pending_provisioning` rows for the
-        # not-yet-provisioned regions. Fail loudly if NO rows are
-        # deployed (registry running in ephemeral mode — AV-28).
+        # CIRISEdge#575 — the bundle quorum is a GATE again. #571 asserted it,
+        # #575 downgraded it to a warning while CIRISRegistry v3.0.0's trust
+        # root moved (the CIRISPersist#809 reasoning), and persist restored its
+        # twin in v50.0.0 (CIRISPersist#926 ruling (b)). The two repos run ONE
+        # check: scripts/preflight_trust_root.py is persist's file, byte for
+        # byte (CIRISPersist aefca217, blob 36d6156a), so the threshold cannot
+        # drift between them. Change it there first and re-vendor.
+        #
+        # What the script gates: a v3.0.0 `bundle` needs `consensus_protocol`
+        # = quorum:M/N (1 <= M <= N; anything else is refused, never guessed)
+        # and DISTINCT authorizations by holders the bundle itself seats >= M;
+        # the pre-v3.0.0 `stewards` shape needs a deployed steward; any other
+        # shape or an unreadable body fails closed. It counts authorizations
+        # and does not verify their signatures (an unauthenticated read in a
+        # CI step; consumers run persist's verify_bundle_quorum).
+        # `served_by.accepts_this_root=false` stays a warning: it cannot move
+        # before the registry folds into a Server node (CIRISServer#537).
+        #
+        # The self-test runs first, every time, so a guard that quietly stopped
+        # refusing reds instead of passing. No pipe carries an exit status the
+        # step depends on (the default shell has no pipefail).
         env:
           REGISTRY_URL: ${{ vars.REGISTRY_URL }}
         run: |
@@ -2189,105 +2198,23 @@ jobs:
             REGISTRY_URL="https://api.registry.ciris-services-1.ai"
             echo "::warning::REGISTRY_URL repo variable unset; defaulting to ${REGISTRY_URL}"
           fi
+          python3 scripts/preflight_trust_root.py --self-test
           echo "Registry steward-key snapshot for ${REGISTRY_URL}:"
           curl -sf "${REGISTRY_URL}/v1/steward-key" | tee dist/steward-key.json | python3 -m json.tool
-          KIDS=$(python3 <<'PY'
+          python3 scripts/preflight_trust_root.py dist/steward-key.json >> "$GITHUB_STEP_SUMMARY"
+          # Edge-only, and stricter than persist's script (CIRISEdge#571): a
+          # bundle that names no charter root is not a root to sign against.
+          python3 - <<'PY'
           import json, sys
           data = json.load(open("dist/steward-key.json"))
-
-          def fail(msg):
-              print(f"::error::{msg} (AV-28 ephemeral-mode guard)", file=sys.stderr)
+          if isinstance(data.get("bundle"), dict) and not data.get("charter_root_key_id"):
+              print(
+                  "::error::registry response names no charter_root_key_id "
+                  "(AV-28 ephemeral-mode guard)",
+                  file=sys.stderr,
+              )
               raise SystemExit(1)
-
-          # SHAPE 2 (current) — CEG 0.2 accord bundle. `/v1/steward-key` no
-          # longer returns `stewards` at all: the root is an accord family with
-          # HOLDERS and a quorum of AUTHORIZATIONS over the bundle. There is no
-          # `deployed` flag to read, so the old filter silently produced [] and
-          # hard-failed a healthy registry (v20.2.0's manifest job).
-          #
-          # AV-28's intent is unchanged and is what is enforced here: refuse to
-          # sign a release manifest against a registry with no real root. Under
-          # this shape that means holders present AND the bundle's own declared
-          # quorum actually met — checked rather than assumed, because a bundle
-          # carrying one signature under `quorum:2/3` is exactly the ephemeral
-          # state the guard exists to catch.
-          bundle = data.get("bundle")
-          if isinstance(bundle, dict):
-              holders = [h.get("record", {}) for h in bundle.get("holders") or []]
-              holder_ids = [h.get("key_id") for h in holders if h.get("key_id")]
-              if not holder_ids:
-                  fail("registry accord bundle carries no holders")
-              signed_by = {
-                  a.get("holder_key_id")
-                  for a in bundle.get("authorizations") or []
-                  if a.get("holder_key_id")
-              }
-              proto = str(bundle.get("consensus_protocol") or "")
-              need = 0
-              if proto.startswith("quorum:"):
-                  try:
-                      need = int(proto.split(":", 1)[1].split("/", 1)[0])
-                  except (ValueError, IndexError):
-                      fail(f"unparseable consensus_protocol {proto!r}")
-              else:
-                  fail(f"unrecognised consensus_protocol {proto!r} — refusing to guess a quorum")
-              # CIRISEdge#575 — REPORT, not gate, while the trust root moves.
-              #
-              # This was a hard failure, matching what the guard is for. It is
-              # downgraded to match CIRISPersist#809, whose reasoning applies
-              # here unchanged: CIRISRegistry v3.0.0 went live 2026-09-04 and
-              # holders and authorizations move during that migration, so a tag
-              # run blocked on a mid-migration count is a release blocked on
-              # somebody else's deploy window. Edge has already lost one release
-              # (v20.2.0, no artifacts at all) to a registry state it does not
-              # control, and that is the risk being weighed against.
-              #
-              # Say plainly what it costs, because a check that cannot fail is a
-              # report: for the length of the transition this leg CANNOT catch a
-              # registry serving a bundle whose quorum has collapsed. What still
-              # fails in that case is the registration step below — this leg is
-              # early warning, and this half of it is warning only.
-              #
-              # Restore it when the root settles; CIRISEdge#575 tracks that, and
-              # the two repos should restore together rather than drift again.
-              if len(signed_by) < need:
-                  print(
-                      f"::warning::accord bundle has {len(signed_by)} "
-                      f"authorization(s) under {proto} — quorum NOT met. Not "
-                      f"gating while the trust root transitions (CIRISEdge#575 / "
-                      f"CIRISPersist#809)",
-                      file=sys.stderr,
-                  )
-              root = data.get("charter_root_key_id")
-              if not root:
-                  fail("registry response names no charter_root_key_id")
-              # Informational, never fatal: the SERVING node's own stance on
-              # this root. False is normal for an unauthenticated read, so it
-              # must not gate a release — but it should be visible.
-              served_by = data.get("served_by") or {}
-              if not served_by.get("accepts_this_root"):
-                  print(
-                      "::warning::serving node reports accepts_this_root=false for "
-                      f"{root} (informational; does not gate the release)",
-                      file=sys.stderr,
-                  )
-              print(",".join(sorted(holder_ids)))
-              raise SystemExit(0)
-
-          # SHAPE 1 (v0.8.x, kept so a registry rollback does not red the lane).
-          if "stewards" in data:
-              deployed = [s for s in data.get("stewards") or [] if s.get("deployed")]
-              if not deployed:
-                  fail("No deployed stewards in registry response")
-              print(",".join(s["key_id"] for s in deployed))
-              raise SystemExit(0)
-
-          # Neither shape. Fail CLOSED and say what arrived — a third shape is a
-          # thing to look at, never a thing to wave through.
-          fail(f"unrecognised steward-key response; top-level keys={sorted(data)}")
           PY
-          )
-          echo "registry deployed steward key_ids=${KIDS}" >> "$GITHUB_STEP_SUMMARY"
       - name: register binary manifest with CIRISRegistry
         # POST the binary catalog to /v1/verify/binary-manifest with
         # project=ciris-edge. Bridge provisioned the trusted-primitive
