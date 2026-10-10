@@ -1127,7 +1127,11 @@ impl Session {
                 // reader can tell "this converges once more state lands" from "this
                 // will be refused identically forever" without knowing which persist
                 // token maps to which. It is a stable token, never prose.
-                ApplyOutcome::Refused { reason, retry } => {
+                ApplyOutcome::Refused {
+                    reason,
+                    retry,
+                    awaits_signer,
+                } => {
                     refused += 1;
                     // CIRISEdge#552 — an explicitly requested body that refuses
                     // TRANSIENTLY must stay expected. The expectation is the only
@@ -1157,8 +1161,13 @@ impl Session {
                     // question. Deliberately keyed on the DISPOSITION, not on
                     // the reason prose — consumers key on stable tokens, and a
                     // spurious note costs one deduped lookup at the drain.
-                    let signer =
-                        crate::replication::missing_signer::missing_signer_of(self.kind, env_bytes);
+                    //
+                    // CIRISEdge#858 fix 7 — the signer persist SAID it lacks
+                    // (v54.1.0 `AttesterKeyUnknown`) wins over the bytes'
+                    // guess: a co-signer is not the row's attester.
+                    let signer = awaits_signer.clone().or_else(|| {
+                        crate::replication::missing_signer::missing_signer_of(self.kind, env_bytes)
+                    });
                     if !retry.is_terminal() {
                         if let Some(signer) = &signer {
                             provider.note_missing_signer(self.kind, signer, source_peer);

@@ -81,14 +81,14 @@ fn sha(bytes: &[u8]) -> [u8; 32] {
 
 /// One identity: a persist-minted, self-scrubbed hybrid Key record (so the
 /// Key plane admits it through the choke) and the signer it was minted from.
-struct Ident {
+pub(super) struct Ident {
     alias: String,
     seed: u8,
-    record: KeyRecord,
+    pub(super) record: KeyRecord,
 }
 
 impl Ident {
-    async fn mint(alias: &str, identity_type: &str, seed: u8) -> Self {
+    pub(super) async fn mint(alias: &str, identity_type: &str, seed: u8) -> Self {
         let record =
             crate::replication::bridge::tests::minted_key_record(alias, identity_type, seed).await;
         Self {
@@ -98,11 +98,11 @@ impl Ident {
         }
     }
 
-    fn key_id(&self) -> &str {
+    pub(super) fn key_id(&self) -> &str {
         &self.record.key_id
     }
 
-    fn signer(&self) -> Arc<crate::identity::LocalSigner> {
+    pub(super) fn signer(&self) -> Arc<crate::identity::LocalSigner> {
         let hw: Arc<dyn HardwareSigner> = Arc::new(
             Ed25519SoftwareSigner::from_bytes(&[self.seed; 32], &self.alias)
                 .expect("rebuild the ed25519 half"),
@@ -121,7 +121,7 @@ impl Ident {
         ))
     }
 
-    fn signed_key_bytes(&self) -> Vec<u8> {
+    pub(super) fn signed_key_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(&SignedKeyRecord {
             record: self.record.clone(),
         })
@@ -131,7 +131,7 @@ impl Ident {
 
 /// A content-only signed occurrence of `identity` through `occurrence`,
 /// attested by `attester` (persist's CIRISPersist#851 form).
-async fn occurrence(
+pub(super) async fn occurrence(
     identity: &str,
     occurrence: &str,
     attester: &Ident,
@@ -179,7 +179,7 @@ async fn occurrence(
     }
 }
 
-async fn substrate() -> Arc<SqliteBackend> {
+pub(super) async fn substrate() -> Arc<SqliteBackend> {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -187,7 +187,7 @@ async fn substrate() -> Arc<SqliteBackend> {
     dir
 }
 
-async fn hold(dir: &SqliteBackend, id: &Ident) {
+pub(super) async fn hold(dir: &SqliteBackend, id: &Ident) {
     dir.put_public_key(SignedKeyRecord {
         record: id.record.clone(),
     })

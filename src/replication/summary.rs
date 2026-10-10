@@ -394,9 +394,19 @@ pub enum ApplyOutcome {
     /// A new apply branch must now state the disposition; it cannot default into
     /// the spin. [`RetryDisposition`] documents both directions of getting it
     /// wrong.
+    ///
+    /// CIRISEdge#858 fix 7 (persist v54.1.0, CIRISPersist#1042) — `awaits_signer`
+    /// is the key persist SAID it lacked (`Error::AttesterKeyUnknown`'s
+    /// `attesting_key_id`), when it said one. The park reads it ahead of the
+    /// signer the bytes name, because the two differ exactly where it matters:
+    /// a co-signer (`additional_scrubs`, a touch-claim `NOfMCosigner`) is not
+    /// the row's `attesting_key_id`. `None` everywhere else, including every
+    /// door that predates the variant; the bytes-and-directory park still
+    /// covers those (FSD/STRUCTURAL_REFUSALS.md I1).
     Refused {
         reason: String,
         retry: RetryDisposition,
+        awaits_signer: Option<String>,
     },
     /// The delivered bytes failed to deserialize into the plane's record type — a
     /// producer/consumer wire-shape skew, not absence of work. WARN with the error.
@@ -424,6 +434,19 @@ impl ApplyOutcome {
         ApplyOutcome::Refused {
             reason: reason.into(),
             retry: RetryDisposition::Transient,
+            awaits_signer: None,
+        }
+    }
+
+    /// CIRISEdge#858 fix 7 — a TRANSIENT `Refused` for a row persist refused
+    /// because it holds no Key row for `signer` yet (persist v54.1.0's typed
+    /// `AttesterKeyUnknown`). The ordering gap the park exists for: the row is
+    /// parked on `signer` and released when that Key admits.
+    pub fn refused_awaiting_signer(reason: impl Into<String>, signer: impl Into<String>) -> Self {
+        ApplyOutcome::Refused {
+            reason: reason.into(),
+            retry: RetryDisposition::Transient,
+            awaits_signer: Some(signer.into()),
         }
     }
 
@@ -437,6 +460,7 @@ impl ApplyOutcome {
         ApplyOutcome::Refused {
             reason: reason.into(),
             retry: RetryDisposition::Terminal,
+            awaits_signer: None,
         }
     }
 
@@ -455,6 +479,16 @@ impl ApplyOutcome {
             ApplyOutcome::Admitted | ApplyOutcome::Duplicate => None,
             ApplyOutcome::Refused { retry, .. } => Some(*retry),
             ApplyOutcome::Deserialize(_) => Some(RetryDisposition::Terminal),
+        }
+    }
+
+    /// CIRISEdge#858 fix 7 — the signer persist said it lacked, if it said one
+    /// (see the `awaits_signer` field). `None` for every other outcome.
+    #[must_use]
+    pub fn awaits_signer(&self) -> Option<&str> {
+        match self {
+            ApplyOutcome::Refused { awaits_signer, .. } => awaits_signer.as_deref(),
+            _ => None,
         }
     }
 }

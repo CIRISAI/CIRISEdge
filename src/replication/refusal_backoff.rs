@@ -76,8 +76,8 @@ use super::protocol::EnvelopeKind;
 /// have converged. That one is worse — the first burns transport visibly, the
 /// second withholds state invisibly — so where a persist token collapses a
 /// recoverable arm and an unrecoverable one into the SAME value (`re_scrub`,
-/// `unverifiable_signature`), the call is `Transient`, and the backoff is what
-/// makes that safe to say.
+/// and until persist v54.1.0 `unverifiable_signature`), the call is
+/// `Transient`, and the backoff is what makes that safe to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RetryDisposition {
     /// The verdict was decided by state that is still MOVING — a roster that
@@ -192,7 +192,7 @@ struct Entry {
     /// [`RefusalBackoff::clear`] (an admit), a release, or eviction.
     attempts: u32,
     /// The MOST RECENT verdict. A row can change disposition — a signer key
-    /// lands and `unverifiable_signature` becomes `conflicting_version` — and
+    /// lands and `attester_key_unknown` becomes `conflicting_version` — and
     /// the latest reading is the one that should govern the next window.
     disposition: RetryDisposition,
     /// When this node may ask for these bytes again.
