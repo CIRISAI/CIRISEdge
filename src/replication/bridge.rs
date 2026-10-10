@@ -496,6 +496,14 @@ fn signature_refusal(
 /// - `Error::AccordProposalNonceReused` — a different proposal reusing a nonce
 ///   its family already spent. A nonce names one proposal per family for good,
 ///   so no later state admits these bytes.
+/// - `Error::PurgeRefused` — persist v54.1.0's steward purge (CIRISPersist#1046).
+///   At an admission door it is `purge_tombstoned` (the record was purged; no
+///   door brings it back) or `trace_run_kind_mock` (a federation-tier trace
+///   attestation that signs `run_kind = mock`). Every token is terminal but
+///   `purge_unauthorised`: a replicated bundle is re-verified against THIS
+///   node's state, so it can mean the claimant root's community row or a
+///   cosigner's Key is not held yet — an ordering gap, left on the transient
+///   rule and its re-offer cap until CIRISPersist#1055 types the two apart.
 pub(crate) fn typed_terminal_verdict(
     err: &ciris_persist::federation::Error,
 ) -> Option<&'static str> {
@@ -512,6 +520,11 @@ pub(crate) fn typed_terminal_verdict(
         .find(|terminal| *reason == *terminal),
         E::AccordProposalNonceReused { .. } => {
             Some(ciris_persist::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED)
+        }
+        E::PurgeRefused { token, .. }
+            if *token != ciris_persist::federation::steward_purge::token::UNAUTHORISED =>
+        {
+            Some(token)
         }
         _ => None,
     }
@@ -11745,7 +11758,7 @@ pub(crate) mod tests {
     /// (`admission::check_licensure_delegator_is_authority`,
     /// `accord_quorum::nonce_reused`).
     #[test]
-    fn unrepairable_licence_reasons_and_a_reused_accord_nonce_are_terminal() {
+    fn unrepairable_licences_a_reused_accord_nonce_and_a_purge_are_terminal() {
         use ciris_persist::federation::admission::licensure_refusal as R;
         use ciris_persist::federation::Error as E;
         let licence = |reason: &'static str| E::LicensureDelegatorNotAuthority {
@@ -11763,6 +11776,10 @@ pub(crate) mod tests {
             family_key_id: "humanity-accord".to_owned(),
             nonce: "n-1".to_owned(),
             existing_proposal_digest: "digest-a".to_owned(),
+        };
+        let purge = |token: &'static str| E::PurgeRefused {
+            token,
+            body: serde_json::json!({"record_id": "r-1", "notice_id": "n-1"}),
         };
         let (_backend, bridge) = make_bridge(&[]);
         for (err, want) in [
@@ -11783,6 +11800,22 @@ pub(crate) mod tests {
                 RetryDisposition::Terminal,
             ),
             (nonce, RetryDisposition::Terminal),
+            // persist v54.1.0 — a purged record, and a mock trace at the
+            // federation tier, are refused at every admission door for good.
+            (
+                purge(ciris_persist::federation::steward_purge::token::TOMBSTONED),
+                RetryDisposition::Terminal,
+            ),
+            (
+                purge(ciris_persist::federation::steward_purge::TRACE_RUN_KIND_MOCK),
+                RetryDisposition::Terminal,
+            ),
+            // …but an unauthorised replicated bundle may be waiting on a
+            // community row or cosigner Key this node does not hold yet.
+            (
+                purge(ciris_persist::federation::steward_purge::token::UNAUTHORISED),
+                RetryDisposition::Transient,
+            ),
             // A delegation row still replicating can move these: unclassified.
             (licence(R::NAMED_EDGE_ABSENT), RetryDisposition::Transient),
             (licence(R::NOT_ON_LIVE_CHAIN), RetryDisposition::Transient),

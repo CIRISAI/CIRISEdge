@@ -26,7 +26,7 @@
 //! (defence: persist 02c2b27d no longer emits it), and the typed
 //! licensure refusals no later row repairs and `AccordProposalNonceReused`
 //! are pinned terminal in
-//! `bridge::tests::unrepairable_licence_reasons_and_a_reused_accord_nonce_are_terminal`.
+//! `bridge::tests::unrepairable_licences_a_reused_accord_nonce_and_a_purge_are_terminal`.
 //!
 //! `cargo test --lib typed_refusal_858`
 
