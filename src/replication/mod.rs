@@ -410,7 +410,8 @@ pub use scheduler::{
 #[doc(inline)]
 pub use session::{ReplicationOutcome, Session, SessionRole};
 pub use summary::{
-    ApplyOutcome, FetchBatch, LocalState, StalenessSignal, StateApplier, StateProvider,
+    ApplyOutcome, AwaitedSigner, FetchBatch, LocalState, StalenessSignal, StateApplier,
+    StateProvider,
 };
 #[doc(inline)]
 pub use wire_frame::{

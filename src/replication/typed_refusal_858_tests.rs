@@ -1,5 +1,6 @@
 //! **CIRISEdge#858 fix 7 — persist v54.1.0's typed refusals (CIRISPersist#1042
-//! and #1044) reach the park as types, not as guesses.**
+//! and #1044, with the #1042 follow-ups in 02c2b27d) reach the park as types,
+//! not as guesses.**
 //!
 //! Before v54.1.0 an unregistered signer and a signature that does not verify
 //! were one token, so every signature refusal was transient and the park
@@ -17,15 +18,14 @@
 //! | (2) | `FederationTierUnverified` ⇒ terminal | a forged signature rides the transient ladder |
 //! | (3) | key plane `unverifiable_signature` ⇒ terminal | the invalid self-scrubbed Key parks on itself |
 //! | (4) | `ReplicatedKeyOutcome::InvalidReplaced` ⇒ admitted | the replacement does not count as an admit |
-//!
-//! (5) pins what does NOT move at this pin: a bare `SignatureInvalid` still
-//! carries persist's signer-acts-for refusal (the #776 ordering gap), so a
-//! forged occurrence stays transient (see `bridge::SignatureVerdict`).
+//! | (5) | `SignatureInvalid` ⇒ terminal | a forged occurrence rides the transient ladder |
+//! | (6) | `SignerDoesNotActFor` ⇒ indexed on the held signer | the row is never indexed, so its binding releases nothing |
+//! | (7) | the same, bounded | a never-bound signer is re-asked on the transient ladder forever |
 //!
 //! Beside these: `AttesterKeyUnknown` naming an EMPTY key id is not a park
-//! (`park_fresh_858_tests`' O5, which names no signer, would park on ""), and
-//! the two prefix-only verdicts (`authority_acts_by_quorum`,
-//! `accord_proposal_nonce_reused`) are pinned terminal in
+//! (defence: persist 02c2b27d no longer emits it), and the typed
+//! `authority_acts_by_quorum` licensure refusal and `AccordProposalNonceReused`
+//! are pinned terminal in
 //! `bridge::tests::a_quorum_authority_licence_and_a_reused_accord_nonce_are_terminal`.
 //!
 //! `cargo test --lib typed_refusal_858`
@@ -312,12 +312,12 @@ async fn an_invalid_replaced_key_is_admitted_and_releases_the_rows_parked_on_it(
     );
 }
 
-/// (5) What does NOT move at this pin. A forged occurrence signature is
-/// `SignatureInvalid`, and so is persist's signer-acts-for refusal (the #776
-/// ordering gap), so the token stays transient on the occurrence plane. Flip
-/// this when persist types acts-for apart.
+/// (5) A bare `SignatureInvalid` is TERMINAL. persist 02c2b27d moved its
+/// signer-acts-for arm out to `SignerDoesNotActFor` (see (6)), and what is left
+/// is a function of the bytes on every door: a forged occurrence signature
+/// against a held attester. Not parked, not on the transient ladder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_forged_occurrence_stays_transient_while_signature_invalid_carries_acts_for() {
+async fn a_forged_occurrence_signature_is_terminal() {
     let p = Ident::mint("person-p-fix7e", "user", 0x91).await;
     let n = Ident::mint("node-n-fix7e", "node", 0x92).await;
     let forger = Ident::mint("person-x-fix7e", "user", 0x93).await;
@@ -342,8 +342,203 @@ async fn a_forged_occurrence_stays_transient_while_signature_invalid_carries_act
     );
     assert_eq!(
         disposition(&outcome),
-        RetryDisposition::Transient,
-        "SignatureInvalid also carries acts-for at this pin, so it stays transient: {reason}"
+        RetryDisposition::Terminal,
+        "SignatureInvalid is terminal on every door once acts-for left it: {reason}"
     );
     assert_eq!(outcome.awaits_signer(), None);
+    assert_eq!(outcome.awaits_acts_for(), None);
+    assert_eq!(b.rows_parked_on_signer(), 0, "never parked");
+    assert!(
+        b.refusal_backoff_for_test()
+            .suppressed_at(KIND_OCC, &sha(&bytes), past_transient_ladder()),
+        "terminal from the first refusal"
+    );
+}
+
+const KIND_OCC: EnvelopeKind = EnvelopeKind::IdentityOccurrence;
+
+/// U's occurrence of P, attested by U, on a node that holds both Keys but not
+/// P's binding of U: persist refuses `SignerDoesNotActFor { attesting_key_id:
+/// U, identity_key_id: P }`.
+async fn unbound_occurrence(tag: &str, seed: u8) -> (Ident, Ident, Arc<SqliteBackend>, Vec<u8>) {
+    let p = Ident::mint(&format!("person-p-{tag}"), "user", seed).await;
+    let u = Ident::mint(&format!("node-u-{tag}"), "node", seed + 1).await;
+    let f = substrate().await;
+    hold(&f, &p).await;
+    hold(&f, &u).await;
+    let occ = occurrence(p.key_id(), u.key_id(), &u).await;
+    let bytes = serde_json::to_vec(&occ).expect("encode");
+    (p, u, f, bytes)
+}
+
+/// (6) `SignerDoesNotActFor` is indexed on the HELD signer persist named, and
+/// the owner binding that makes it act for the identity releases the row,
+/// which then admits (the #776 shape, now typed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_signer_not_acting_for_is_indexed_on_it_and_its_binding_releases_it() {
+    let (p, u, f, bytes) = unbound_occurrence("fix7f", 0xa1).await;
+    let h = sha(&bytes);
+    let b = bridge(&f);
+
+    let outcome = b.apply_envelope_bytes(KIND_OCC, &bytes, Some(PEER)).await;
+    let ApplyOutcome::Refused { reason, .. } = &outcome else {
+        panic!("an unbound signer's occurrence is refused, got {outcome:?}");
+    };
+    assert!(
+        reason.contains("federation_signer_not_acting_for"),
+        "precondition: persist's verdict is SignerDoesNotActFor: {reason}"
+    );
+    assert_eq!(
+        disposition(&outcome),
+        RetryDisposition::Transient,
+        "{reason}"
+    );
+    assert_eq!(outcome.awaits_acts_for(), Some(u.key_id()), "{outcome:?}");
+    assert_eq!(
+        outcome.awaits_signer(),
+        None,
+        "U's Key is held: nothing to fetch"
+    );
+    let backoff = b.refusal_backoff_for_test();
+    assert_eq!(
+        backoff.parked_on(u.key_id()),
+        1,
+        "indexed on the held signer persist named (the #858 index)"
+    );
+
+    // P's binding of U, through the choke, makes U act for P.
+    let (binding_att, _) = binding(&p, &u).await;
+    let bound = b
+        .apply_envelope_bytes(EnvelopeKind::Attestation, &wire(binding_att), Some(PEER))
+        .await;
+    assert!(bound.is_admitted(), "P's binding of U admits: {bound:?}");
+    assert_eq!(
+        b.signer_releases(),
+        1,
+        "the binding releases the row indexed on U"
+    );
+    assert!(!b.retry_suppressed(KIND_OCC, &h));
+    let again = b.apply_envelope_bytes(KIND_OCC, &bytes, Some(PEER)).await;
+    assert!(
+        again.is_admitted(),
+        "the re-offered occurrence admits: {again:?}"
+    );
+}
+
+/// `attester`'s signed route for `occurrence`'s identity: the shape persist's
+/// CHANGELOG names for a signer that will never be bound, "a peer asserting a
+/// victim's route".
+async fn route_for(occurrence: &Ident, attester: &Ident) -> Vec<u8> {
+    use ciris_persist::federation::self_at_login::{
+        BindingProvenance, SignedTransportDestination, TransportDestination,
+    };
+    use ciris_verify_core::transport_binding::TransportBindingSignature;
+    let row = TransportDestination {
+        occurrence_key_id: occurrence.key_id().to_owned(),
+        transport_kind: "reticulum".to_owned(),
+        destination: "ab".repeat(16),
+        asserted_at: ciris_persist::federation::admission::truncate_to_substrate_resolution(
+            chrono::Utc::now(),
+        ),
+        last_seen_at: None,
+        transport_ed25519_pubkey_base64: Some(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            [0xbb; 32],
+        )),
+        transport_x25519_pubkey_base64: Some(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            [0xcc; 32],
+        )),
+        binding_provenance: BindingProvenance::Rooted,
+        epoch: 1,
+        retired_at: None,
+    };
+    let envelope = serde_json::to_value(&row).expect("route row serializes");
+    let canonical =
+        ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canonicalize");
+    let (ed, pqc) = crate::identity::sign_bound_hybrid(&attester.signer(), &canonical, "route")
+        .await
+        .expect("sign the route");
+    serde_json::to_vec(&SignedTransportDestination {
+        attesting_key_id: attester.key_id().to_owned(),
+        transport_destination: row,
+        signed_envelope: envelope,
+        signature: TransportBindingSignature {
+            ed25519_signature_base64: ed,
+            mldsa65_signature_base64: pqc,
+        },
+    })
+    .expect("encode")
+}
+
+/// (7) A signer that is NEVER bound gets the same retryable token, and the
+/// index bounds it. Driven on the route door, where only the typed arm indexes
+/// (the occurrence plane also has the untyped held-signer fallback). The first
+/// refusal waits the first transient window (`TRANSIENT_BASE`, 20 s); the
+/// second moves the row to the terminal schedule (`TERMINAL_BASE`, 1800 s,
+/// doubling to the 6 h `TERMINAL_CAP`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_never_bound_signer_settles_on_the_terminal_schedule_after_two_offers() {
+    use crate::replication::refusal_backoff::{TERMINAL_BASE, TRANSIENT_BASE};
+    const TD: EnvelopeKind = EnvelopeKind::TransportDestination;
+    let victim = Ident::mint("node-v-fix7g", "node", 0xb1).await;
+    let x = Ident::mint("node-x-fix7g", "node", 0xb2).await;
+    let f = substrate().await;
+    hold(&f, &victim).await;
+    hold(&f, &x).await;
+    let bytes = route_for(&victim, &x).await;
+    let h = sha(&bytes);
+    let b = bridge(&f);
+    let backoff = b.refusal_backoff_for_test();
+
+    let first = b.apply_envelope_bytes(TD, &bytes, Some(PEER)).await;
+    let ApplyOutcome::Refused { reason, .. } = &first else {
+        panic!("a route by a signer that does not act for it is refused, got {first:?}");
+    };
+    assert!(
+        reason.contains("federation_signer_not_acting_for"),
+        "precondition: persist's verdict is SignerDoesNotActFor: {reason}"
+    );
+    assert_eq!(first.awaits_acts_for(), Some(x.key_id()), "{first:?}");
+    assert_eq!(
+        backoff.parked_on(x.key_id()),
+        1,
+        "indexed on the held signer"
+    );
+    let t1 = Instant::now();
+    assert!(
+        backoff.suppressed_at(
+            TD,
+            &h,
+            t1 + TRANSIENT_BASE.saturating_sub(Duration::from_secs(5))
+        ),
+        "refusal 1: inside the first transient window"
+    );
+    assert!(
+        !backoff.suppressed_at(TD, &h, t1 + TRANSIENT_BASE + Duration::from_secs(5)),
+        "refusal 1: re-asked after the first transient window (the binding may land)"
+    );
+
+    // The second offer of the same bytes; X is still bound to nothing.
+    let second = b.apply_envelope_bytes(TD, &bytes, Some(PEER)).await;
+    assert_eq!(second.awaits_acts_for(), Some(x.key_id()), "{second:?}");
+    let t2 = Instant::now();
+    assert!(
+        backoff.suppressed_at(
+            TD,
+            &h,
+            t2 + TERMINAL_BASE.saturating_sub(Duration::from_secs(60))
+        ),
+        "refusal 2: on the TERMINAL schedule — a never-bound signer is not re-asked on \
+         the transient ladder (CIRISEdge#858)"
+    );
+    assert!(
+        !backoff.suppressed_at(TD, &h, t2 + TERMINAL_BASE + Duration::from_secs(60)),
+        "refusal 2: the terminal window is bounded, never infinite"
+    );
+    assert_eq!(
+        backoff.parked_on(x.key_id()),
+        1,
+        "still indexed: a binding releases it"
+    );
 }

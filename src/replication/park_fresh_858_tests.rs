@@ -31,6 +31,11 @@
 //!   every round, which is what the field needs);
 //! - `O5` = O1 naming no signer at all: a transient refusal with no
 //!   dependency to wait on, the case fix 6 moves to the terminal schedule.
+//!   persist 02c2b27d refuses it at the source as a malformed
+//!   `InvalidArgument` ("the row names no signer"), never
+//!   `AttesterKeyUnknown { "" }`; edge keeps an unclassified `InvalidArgument`
+//!   transient, so O5 is still the dependency-less row fix 6 bounds (asserted
+//!   at the top of (a)).
 //!
 //! | letter | fix | fails before the fix because |
 //! |---|---|---|
@@ -66,10 +71,11 @@ use sha2::Digest as _;
 use crate::replication::refusal_backoff::{
     DEFAULT_MAX_KEYS, DEFAULT_MAX_PARKED, TERMINAL_BASE, TRANSIENT_CAP,
 };
+use crate::replication::summary::ApplyOutcome;
 use crate::replication::{
     BridgeConfig, DeliverMessage, DirectoryStateAdapter, EnvelopeKind, EnvelopeRef,
     FederationDirectoryReplicationBridge, MutableDirectoryStateAdapter, ReplicationDirectory,
-    ReplicationMessage, ReplicationOutcome, Session, SessionRole, SummaryMessage,
+    ReplicationMessage, ReplicationOutcome, RetryDisposition, Session, SessionRole, SummaryMessage,
 };
 
 const KIND: EnvelopeKind = EnvelopeKind::IdentityOccurrence;
@@ -426,8 +432,43 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
+/// A process-wide subscriber that is interested `sometimes` in every callsite
+/// and enabled for none, so the scoped capture below is always consulted.
+///
+/// Without it, a callsite first registered by a concurrent test thread while
+/// no dispatcher wanted it can cache `never`, and this module's captures read
+/// empty or miss one line (seen 3 times in 10 runs of the replication third,
+/// once the #858 fix 7 witnesses began emitting the same park lines from
+/// other threads). It changes no output: it records nothing.
+struct DeferToScoped;
+
+impl tracing::Subscriber for DeferToScoped {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 impl Captured {
     fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        static DEFER: std::sync::Once = std::sync::Once::new();
+        DEFER.call_once(|| {
+            // Another test may own the global slot; then this is a no-op.
+            let _ = tracing::subscriber::set_global_default(DeferToScoped);
+        });
         tracing_subscriber::fmt()
             .with_writer(self.clone())
             .with_max_level(tracing::Level::INFO)
@@ -462,6 +503,27 @@ async fn a_fresh_node_parks_round_one_and_escalates_what_cannot_move_858() {
         "precondition: F applies bodies on this plane"
     );
     let h = w.hashes();
+
+    // O5's meaning, on a throwaway bridge (its own refusal memory): persist
+    // refuses a row that names no signer as malformed, naming no dependency.
+    let o5 = w
+        .bridge(None)
+        .apply_envelope_bytes(KIND, &w.rows[4], Some(R_PEER))
+        .await;
+    let ApplyOutcome::Refused { reason, retry, .. } = &o5 else {
+        panic!("O5 is refused, got {o5:?}");
+    };
+    assert!(
+        reason.contains("federation_invalid_argument") && reason.contains("names no signer"),
+        "precondition: persist refuses O5 as malformed at the source: {reason}"
+    );
+    assert_eq!(
+        *retry,
+        RetryDisposition::Transient,
+        "unclassified: {reason}"
+    );
+    assert_eq!(o5.awaits_signer(), None, "no dependency named");
+    assert_eq!(o5.awaits_acts_for(), None, "no dependency named");
 
     // (a) Round 1: F wants all five, every one is refused.
     let want = round(&bridge, &w.rows).await;

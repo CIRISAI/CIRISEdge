@@ -41,7 +41,8 @@ use super::protocol::{
 };
 use super::retention::{retention_for, Retention};
 use super::summary::{
-    diff_refs, ApplyOutcome, FetchBatch, StalenessSignal, StateApplier, StateProvider,
+    diff_refs, ApplyOutcome, AwaitedSigner, FetchBatch, StalenessSignal, StateApplier,
+    StateProvider,
 };
 use crate::log_throttle::{LogThrottle, ThrottleDecision};
 
@@ -1165,10 +1166,21 @@ impl Session {
                     // CIRISEdge#858 fix 7 — the signer persist SAID it lacks
                     // (v54.1.0 `AttesterKeyUnknown`) wins over the bytes'
                     // guess: a co-signer is not the row's attester.
-                    let signer = awaits_signer.clone().or_else(|| {
-                        crate::replication::missing_signer::missing_signer_of(self.kind, env_bytes)
-                    });
-                    if !retry.is_terminal() {
+                    //
+                    // persist v54.1.0 — an `ActsFor` signer's Key is HELD (its
+                    // signature verified), so there is nothing to fetch; it
+                    // still names the signer for the WARN throttle below.
+                    let (signer, key_missing) = match awaits_signer {
+                        Some(AwaitedSigner::Key(s)) => (Some(s.clone()), true),
+                        Some(AwaitedSigner::ActsFor(s)) => (Some(s.clone()), false),
+                        None => (
+                            crate::replication::missing_signer::missing_signer_of(
+                                self.kind, env_bytes,
+                            ),
+                            true,
+                        ),
+                    };
+                    if !retry.is_terminal() && key_missing {
                         if let Some(signer) = &signer {
                             provider.note_missing_signer(self.kind, signer, source_peer);
                         }
