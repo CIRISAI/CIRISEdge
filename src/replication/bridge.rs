@@ -483,14 +483,16 @@ fn signature_refusal(
 /// persist v54.1.0 — two typed verdicts edge reads as TERMINAL. Returns the
 /// token, or `None` when the error is neither.
 ///
-/// - `Error::LicensureDelegatorNotAuthority` with `reason ==
-///   licensure_refusal::AUTHORITY_ACTS_BY_QUORUM` — the licensing authority is
-///   a community whose `consensus_protocol` is anything but `founder_only`, so
-///   it acts only by a quorum act and no single-signed chain stands for it.
-///   The row's signer and its claimed authority are in the bytes. The other
-///   reasons (`named_edge_absent`, `not_on_live_chain_at_asserted_at`, …) can
-///   turn on a delegation row that is still replicating, so they keep the
-///   unclassified transient rule.
+/// - `Error::LicensureDelegatorNotAuthority` with a `reason` no later row
+///   repairs (persist's ruling on release-54.1.0, e165a2ac):
+///   `named_edge_not_license_delegation` and `named_edge_not_onto_emitter`
+///   are properties of the signed named edge; `authority_acts_by_quorum` is
+///   the authority's protocol (a community that acts only by a quorum act,
+///   until CIRISPersist#1036); `not_authority_at_receipt` is the emitter's
+///   standing at receipt. `named_edge_absent` (the delegates_to row is not
+///   held yet) and `not_on_live_chain_at_asserted_at` (an upstream `license`
+///   edge may still be replicating) turn on rows still in flight, so they keep
+///   the transient rule and its re-offer cap.
 /// - `Error::AccordProposalNonceReused` — a different proposal reusing a nonce
 ///   its family already spent. A nonce names one proposal per family for good,
 ///   so no later state admits these bytes.
@@ -500,11 +502,14 @@ pub(crate) fn typed_terminal_verdict(
     use ciris_persist::federation::admission::licensure_refusal;
     use ciris_persist::federation::Error as E;
     match err {
-        E::LicensureDelegatorNotAuthority { reason, .. }
-            if *reason == licensure_refusal::AUTHORITY_ACTS_BY_QUORUM =>
-        {
-            Some(licensure_refusal::AUTHORITY_ACTS_BY_QUORUM)
-        }
+        E::LicensureDelegatorNotAuthority { reason, .. } => [
+            licensure_refusal::NAMED_EDGE_NOT_LICENSE,
+            licensure_refusal::NAMED_EDGE_NOT_ONTO_EMITTER,
+            licensure_refusal::AUTHORITY_ACTS_BY_QUORUM,
+            licensure_refusal::NOT_AUTHORITY_AT_RECEIPT,
+        ]
+        .into_iter()
+        .find(|terminal| *reason == *terminal),
         E::AccordProposalNonceReused { .. } => {
             Some(ciris_persist::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED)
         }
@@ -11734,13 +11739,13 @@ pub(crate) mod tests {
     }
 
     /// persist v54.1.0 — the two typed verdicts (`LicensureDelegatorNotAuthority`
-    /// under `authority_acts_by_quorum`, `AccordProposalNonceReused`) reach the
-    /// apply-door choke (`refuse`) as TERMINAL, and their recoverable
-    /// neighbours do not. The fields are the ones persist's doors fill
+    /// under the four reasons no later row repairs, `AccordProposalNonceReused`)
+    /// reach the apply-door choke (`refuse`) as TERMINAL, and the two chain
+    /// reasons a replicating row can move do not. The fields are the ones persist's doors fill
     /// (`admission::check_licensure_delegator_is_authority`,
     /// `accord_quorum::nonce_reused`).
     #[test]
-    fn a_quorum_authority_licence_and_a_reused_accord_nonce_are_terminal() {
+    fn unrepairable_licence_reasons_and_a_reused_accord_nonce_are_terminal() {
         use ciris_persist::federation::admission::licensure_refusal as R;
         use ciris_persist::federation::Error as E;
         let licence = |reason: &'static str| E::LicensureDelegatorNotAuthority {
@@ -11763,6 +11768,18 @@ pub(crate) mod tests {
         for (err, want) in [
             (
                 licence(R::AUTHORITY_ACTS_BY_QUORUM),
+                RetryDisposition::Terminal,
+            ),
+            (
+                licence(R::NAMED_EDGE_NOT_LICENSE),
+                RetryDisposition::Terminal,
+            ),
+            (
+                licence(R::NAMED_EDGE_NOT_ONTO_EMITTER),
+                RetryDisposition::Terminal,
+            ),
+            (
+                licence(R::NOT_AUTHORITY_AT_RECEIPT),
                 RetryDisposition::Terminal,
             ),
             (nonce, RetryDisposition::Terminal),
