@@ -7678,10 +7678,6 @@ impl Transport for ReticulumTransport {
         Ok(TransportSendOutcome::Delivered)
     }
 
-    /// CIRISEdge#683 — answer on the link the request arrived on. A path minted
-    /// by another transport, or a link that has since closed, falls back to the
-    /// by-key [`Self::send`] (which still tries the peer's attributed links and
-    /// then a dial).
     /// CIRISEdge#856 — the down-pack: the frame as `CFRG` fragments on the
     /// peer's live inbound link's Channel — the packet path every edge since
     /// v15.2.0 reassembles (#414/#421), so no piece is a Resource, let alone a
@@ -7734,6 +7730,10 @@ impl Transport for ReticulumTransport {
         )))
     }
 
+    /// CIRISEdge#683 — answer on the link the request arrived on. A path minted
+    /// by another transport, or a link that has since closed, falls back to the
+    /// by-key [`Self::send`] (which still tries the peer's attributed links and
+    /// then a dial).
     async fn send_on_reply_path(
         &self,
         destination_key_id: &str,
