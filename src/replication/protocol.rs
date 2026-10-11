@@ -408,7 +408,7 @@ impl EnvelopeKind {
     /// (CIRISEdge#393 item 3). Stable across releases; a rename is a wire-policy
     /// change that must flip `SERVE_ADVERTISE_POLICY_HASH`.
     #[must_use]
-    pub fn as_wire_str(self) -> &'static str {
+    pub const fn as_wire_str(self) -> &'static str {
         match self {
             Self::Key => "key",
             Self::Attestation => "attestation",

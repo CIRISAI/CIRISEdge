@@ -2143,6 +2143,22 @@ impl Edge {
         self.metrics.clone()
     }
 
+    /// CIRISEdge#820 — publish this node's telemetry through the `metrics`
+    /// facade, for a host that installed a recorder: every transport's
+    /// [`crate::transport::Transport::refresh_metrics`] (leviculum's series on
+    /// Reticulum), then this `Edge`'s bag
+    /// ([`crate::observability::EdgeMetrics::publish_metrics`]). Call it once
+    /// per scrape, before rendering. The bag is published last even when a
+    /// transport already published it (counters are `absolute`, so a second
+    /// publish of the same snapshot changes nothing), so an `Edge` whose
+    /// transports own no facade series still publishes.
+    pub fn publish_metrics(&self) {
+        for transport in self.transports() {
+            transport.refresh_metrics();
+        }
+        self.metrics.publish_metrics();
+    }
+
     /// CIRISEdge#31 — read the operator-set local display name. Returns
     /// `None` when no name was ever set, OR when the configured
     /// `display_name_path` couldn't be read at `Edge::build` time.

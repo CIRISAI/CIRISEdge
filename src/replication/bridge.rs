@@ -278,7 +278,7 @@ impl ApplyRefusalClass {
     /// on message prose — edge deleted a `reason.contains("conflict")`
     /// discriminator in v18.2.0 and must not grow another.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::CommunityRosterFork => "community_roster_fork",
             Self::RetryAfterRoster => "retry_after_roster",
@@ -592,7 +592,7 @@ fn attestation_refusal_retry(
 ///   is returned so the caller books it on
 ///   `attestation_apply_refusals_by_reason`. Consumers key on the constant,
 ///   never on message prose.
-fn attestation_outcome_to_apply(
+pub(crate) fn attestation_outcome_to_apply(
     outcome: ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome,
     content_hash: &str,
 ) -> (ApplyOutcome, Option<&'static str>) {

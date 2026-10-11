@@ -267,6 +267,88 @@ pub enum MessageType {
     FountainHoldingClaim,
 }
 
+impl MessageType {
+    /// How many message types there are.
+    pub const COUNT: usize = 31;
+
+    /// Every message type, in declaration order (CIRISEdge#820: the
+    /// telemetry catalogue's `message_type` label set is drift-tested
+    /// against this).
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::OpaqueRequest,
+        Self::OpaqueResponse,
+        Self::OpaqueEvent,
+        Self::EphemeralResponse,
+        Self::BuildManifestPublication,
+        Self::DSARRequest,
+        Self::DSARResponse,
+        Self::AttestationGossip,
+        Self::PublicKeyRegistration,
+        Self::ContributionSubmit,
+        Self::VoteCast,
+        Self::ExpertiseAttestationPublish,
+        Self::ModerationEventPublish,
+        Self::SlashingAttestationPublish,
+        Self::ReconsiderationRequest,
+        Self::DeferralRequest,
+        Self::DeferralResponse,
+        Self::FederationAnnouncement,
+        Self::DeliveryAttestation,
+        Self::DeliveryRefusalAttestation,
+        Self::ContentFetch,
+        Self::ContentBody,
+        Self::ContentMiss,
+        Self::BlobChunkFetch,
+        Self::BlobChunkBody,
+        Self::BlobChunkMiss,
+        Self::StewardDirective,
+        Self::GoalDeclaration,
+        Self::GoalRetirement,
+        Self::Withdraws,
+        Self::FountainHoldingClaim,
+    ];
+
+    /// The stable snake_case token: the `message_type` label on edge's
+    /// `metrics` facade series (CIRISEdge#820). NOT the wire form (serde
+    /// keeps the variant name) and not `Debug`.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpaqueRequest => "opaque_request",
+            Self::OpaqueResponse => "opaque_response",
+            Self::OpaqueEvent => "opaque_event",
+            Self::EphemeralResponse => "ephemeral_response",
+            Self::BuildManifestPublication => "build_manifest_publication",
+            Self::DSARRequest => "dsar_request",
+            Self::DSARResponse => "dsar_response",
+            Self::AttestationGossip => "attestation_gossip",
+            Self::PublicKeyRegistration => "public_key_registration",
+            Self::ContributionSubmit => "contribution_submit",
+            Self::VoteCast => "vote_cast",
+            Self::ExpertiseAttestationPublish => "expertise_attestation_publish",
+            Self::ModerationEventPublish => "moderation_event_publish",
+            Self::SlashingAttestationPublish => "slashing_attestation_publish",
+            Self::ReconsiderationRequest => "reconsideration_request",
+            Self::DeferralRequest => "deferral_request",
+            Self::DeferralResponse => "deferral_response",
+            Self::FederationAnnouncement => "federation_announcement",
+            Self::DeliveryAttestation => "delivery_attestation",
+            Self::DeliveryRefusalAttestation => "delivery_refusal_attestation",
+            Self::ContentFetch => "content_fetch",
+            Self::ContentBody => "content_body",
+            Self::ContentMiss => "content_miss",
+            Self::BlobChunkFetch => "blob_chunk_fetch",
+            Self::BlobChunkBody => "blob_chunk_body",
+            Self::BlobChunkMiss => "blob_chunk_miss",
+            Self::StewardDirective => "steward_directive",
+            Self::GoalDeclaration => "goal_declaration",
+            Self::GoalRetirement => "goal_retirement",
+            Self::Withdraws => "withdraws",
+            Self::FountainHoldingClaim => "fountain_holding_claim",
+        }
+    }
+}
+
 /// CIRISEdge#37 — `testimonial_witness` envelope slot per FSD-002
 /// §3.6.3 v1.4 + §5.14. A **preservation primitive**: edge propagates
 /// the witness verbatim across federation forwarding and does NOT

@@ -99,6 +99,21 @@ pub enum VerifyErrorClass {
 }
 
 impl VerifyErrorClass {
+    /// Every variant (CIRISEdge#820: the `class` label set of `ciris.edge.verify.failure` is drift-tested against it).
+    pub const ALL: &'static [Self] = &[
+        Self::BodyTooLarge,
+        Self::SchemaInvalid,
+        Self::UnsupportedSchemaVersion,
+        Self::Misrouted,
+        Self::ReplayDetected,
+        Self::UnknownKey,
+        Self::SignatureMismatch,
+        Self::PqcPendingStrictReject,
+        Self::CanonicalizationFailed,
+        Self::VerifyUnavailable,
+        Self::ContentIntegrity,
+    ];
+
     /// Snake-case stable label string. Used as the dict-key on the
     /// PyO3 `metrics_snapshot` surface.
     #[must_use]
@@ -152,6 +167,14 @@ pub enum DeliveryClass {
 }
 
 impl DeliveryClass {
+    /// Every variant (CIRISEdge#820: the `class` label set of `ciris.edge.durable.enqueued` is drift-tested against it).
+    pub const ALL: &'static [Self] = &[
+        Self::Ephemeral,
+        Self::Durable,
+        Self::Mandatory,
+        Self::Federation,
+    ];
+
     /// Snake-case stable label string.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -195,6 +218,9 @@ pub enum RoundOutcome {
 }
 
 impl RoundOutcome {
+    /// Every variant (CIRISEdge#820: the `outcome` label set of `ciris.edge.replication.round.outcome` is drift-tested against it).
+    pub const ALL: &'static [Self] = &[Self::Completed, Self::Refused, Self::TimedOut, Self::Error];
+
     /// Snake-case stable label string. Used as the dict-key on the
     /// PyO3 `metrics_snapshot` surface.
     #[must_use]
@@ -605,6 +631,61 @@ pub enum WithholdReason {
 }
 
 impl WithholdReason {
+    /// Every variant (CIRISEdge#820: the `reason` label set of `ciris.edge.withhold` is drift-tested against it).
+    pub const ALL: &'static [Self] = &[
+        Self::EnvelopeUnfetchable,
+        Self::LocalIdentityMissing,
+        Self::SendSetUnresolved,
+        Self::RecipientNotInSendSet,
+        Self::ServeCapabilityMissing,
+        Self::ServeCapabilityReadError,
+        Self::ServeCapabilityNotRooted,
+        Self::TrustRootWalkError,
+        Self::RecipientNotRooted,
+        Self::RecipientCapabilityRestriction,
+        Self::RowNotSerializable,
+        Self::RowHashUndecodable,
+        Self::ConfigPaused,
+        Self::QuarantinedAuthor,
+        Self::QuarantineReadError,
+        Self::AccordRelayRosterUnresolvable,
+        Self::AccordRelaySignerNotSeated,
+        Self::AccordRelayNoTrustEdge,
+        Self::AccordRelayUnresolved,
+        Self::AccordRelayObjectUnreadable,
+        Self::AccordRelayMirrorUnbound,
+        Self::AccordRelayObjectNotAccord,
+        Self::AccordRelayObjectRootUnnamed,
+        Self::AccordRelayObjectRootDisagrees,
+        Self::BlobScopeUndeterminable,
+        Self::ChunkNotInNamedDag,
+        Self::BlobArrivalScopeInsufficient,
+        Self::BlobArrivalGroupMismatch,
+        Self::BlobDiscriminatorUnheld,
+        Self::BlobDiscriminatorOnDerivedAddress,
+        Self::HoldingScopeUndeterminable,
+        Self::HoldingScopePublicGroup,
+        Self::HoldingScopePeerNotInRoster,
+        Self::HoldingScopeDirectoryMissing,
+        Self::HoldingScopeAuthorityUnresolved,
+        Self::HoldingScopeRecipientSetUnresolved,
+        Self::HoldingScopeRecipientReadError,
+        Self::HoldingScopeProjectionUnsupported,
+        Self::LxmfPropagationDisabled,
+        Self::LxmfDestinationNotServed,
+        Self::LxmfRequesterUnidentified,
+        Self::LxmfMailboxScopeMismatch,
+        Self::LxmfStampBelowCost,
+        Self::LxmfWireUnparseable,
+        Self::LxmfPeerSyncUnsupported,
+        Self::LxmfFrameOversized,
+        Self::LxmfMailboxFull,
+        Self::LxmfRetentionExpired,
+        Self::IdentityRowNodeNotAnnounced,
+        Self::IdentityRowAnnounceUnresolved,
+        Self::GroupRecordNotMemberOrInvitee,
+    ];
+
     /// Snake-case stable label string. Used as the dict-key on the PyO3
     /// `metrics_snapshot` surface; stable across releases.
     #[must_use]
@@ -1630,7 +1711,7 @@ impl EdgeMetrics {
     }
 
     /// CIRISEdge#662 — count an inbound-backpressure drop under its role.
-    pub fn inc_inbound_backpressure_drop_by_role(&self, role: &str) {
+    pub fn inc_inbound_backpressure_drop_by_role(&self, role: &'static str) {
         let mut guard = self.replication_inbound_backpressure_drops_by_role.write();
         *guard.entry(role.to_owned()).or_insert(0) += 1;
     }
@@ -2154,7 +2235,7 @@ impl EdgeMetrics {
     /// persist's stable token. `token` comes from `KeyRefusalReason::as_str()`
     /// — a closed, append-only set, so this map's cardinality is bounded by
     /// the persist contract, never by traffic.
-    pub fn inc_key_apply_refusal(&self, token: &str) {
+    pub fn inc_key_apply_refusal(&self, token: &'static str) {
         let mut guard = self.key_apply_refusals_by_reason.write();
         *guard.entry(token.to_string()).or_insert(0) += 1;
     }
@@ -2162,7 +2243,7 @@ impl EdgeMetrics {
     /// CIRISEdge#459 — count one TYPED Attestation-plane policy refusal by
     /// persist's stable token (`AttestationRefusalReason::as_str()` — a closed,
     /// append-only set, so cardinality is bounded by the persist contract).
-    pub fn inc_attestation_apply_refusal(&self, token: &str) {
+    pub fn inc_attestation_apply_refusal(&self, token: &'static str) {
         let mut guard = self.attestation_apply_refusals_by_reason.write();
         *guard.entry(token.to_string()).or_insert(0) += 1;
     }
@@ -2171,7 +2252,7 @@ impl EdgeMetrics {
     /// token. `token` comes from
     /// [`ApplyRefusalClass::as_str`](crate::replication::bridge::ApplyRefusalClass::as_str)
     /// — a closed set, so this map's cardinality is bounded by that enum.
-    pub fn inc_apply_refusal_class(&self, token: &str) {
+    pub fn inc_apply_refusal_class(&self, token: &'static str) {
         let mut guard = self.apply_refusals_by_class.write();
         *guard.entry(token.to_string()).or_insert(0) += 1;
     }
@@ -2312,6 +2393,11 @@ impl EdgeMetrics {
             .entry(stage)
             .or_default()
             .observe(RESPONDER_LINK_UP_BUCKETS_SECONDS, at.elapsed());
+        crate::telemetry_catalog::record_histogram(
+            crate::telemetry_catalog::RESPONDER_LINK_UP_DURATION,
+            &[stage],
+            at.elapsed().as_secs_f64(),
+        );
     }
 
     /// CIRISEdge#853 — `link`'s link-up ended with `outcome` (one of
@@ -2356,6 +2442,11 @@ impl EdgeMetrics {
             .entry(kind)
             .or_default()
             .observe(REPLICATION_ROUND_DURATION_BUCKETS_SECONDS, d);
+        crate::telemetry_catalog::record_histogram(
+            crate::telemetry_catalog::ROUND_DURATION,
+            &[kind.as_wire_str()],
+            d.as_secs_f64(),
+        );
     }
 
     /// CIRISEdge P0 telemetry — record one advertise-sweep permit wait into
@@ -2364,6 +2455,26 @@ impl EdgeMetrics {
         self.sweep_permit_wait_seconds
             .write()
             .observe(SWEEP_PERMIT_WAIT_BUCKETS_SECONDS, d);
+        crate::telemetry_catalog::record_histogram(
+            crate::telemetry_catalog::SWEEP_PERMIT_WAIT,
+            &[],
+            d.as_secs_f64(),
+        );
+    }
+
+    /// CIRISEdge#820 — publish this bag's counters and gauges through the
+    /// `metrics` facade ([`crate::telemetry_catalog::publish_bundle`]), from
+    /// the same [`Self::snapshot`] the bindings read. Call it on the scrape
+    /// cadence; with no recorder installed it records nothing.
+    ///
+    /// The facade identifies a series by name and labels only, so two
+    /// `EdgeMetrics` bags publishing to ONE global recorder write the SAME
+    /// series and `absolute` from each flip-flops it: pull publishing does
+    /// not keep two `Edge`s apart. That is acceptable because production runs
+    /// one `Edge` per process (a node has exactly one owner), and tests
+    /// isolate with `metrics::with_local_recorder`.
+    pub fn publish_metrics(&self) {
+        crate::telemetry_catalog::publish_bundle(&self.snapshot());
     }
 
     /// CIRISEdge#853 — `responder_rounds_total`, keyed `<kind>:<outcome>`
@@ -2554,9 +2665,13 @@ pub enum LinkPoolCloseReason {
 }
 
 impl LinkPoolCloseReason {
+    /// Every reason (CIRISEdge#820: the `reason` label set of
+    /// `ciris.edge.link.pool.closed` is built from it).
+    pub const ALL: &'static [Self] = &[Self::IdleExpired, Self::PoolFull, Self::LinkClosed];
+
     /// The stable token.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::IdleExpired => "idle_expired",
             Self::PoolFull => "pool_full",
@@ -2626,7 +2741,7 @@ impl LinkCloseCause {
 
     /// The stable token.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::IdleExpired => "idle_expired",
             Self::PoolIdleExpired => "pool_idle_expired",

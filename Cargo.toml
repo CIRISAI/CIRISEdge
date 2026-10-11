@@ -538,6 +538,13 @@ memchr      = "2"
 # Errors / logs
 thiserror   = "1"
 tracing     = "0.1"
+# CIRISEdge#820 (CIRISServer `FSD/UNIFIED_TELEMETRY.md` §3.2, §5) — the
+# `metrics` FACADE only: edge emits counters, gauges and histograms through it
+# and installs no recorder (the host does). The SAME minor as leviculum's
+# (0.24): each 0.x minor owns its own global recorder, so a second minor in the
+# graph would publish into a recorder nobody installed. `tests/one_metrics_crate.rs`
+# fails the build on a duplicate.
+metrics     = "0.24"
 # CIRISEdge#554 — the mesh-harness binary's log subscriber. OPTIONAL, enabled
 # only by `mesh-harness`, so library consumers and every PyO3 wheel are
 # unaffected. Without it the `edge_node` binary installed NO subscriber, so
@@ -1558,6 +1565,9 @@ proptest = "1"
 tempfile           = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex                = "0.4"
+# CIRISEdge#820 — `DebuggingRecorder` for the telemetry completeness gate and
+# the end-to-end publish test (a local recorder per test, never a global one).
+metrics-util       = { version = "0.19", default-features = false, features = ["debugging"] }
 sha2               = "0.10"
 # v0.10.x — criterion bench harness (docs/BENCHMARKS.md). The
 # `html_reports` feature produces the per-bench HTML report uploaded

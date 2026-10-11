@@ -7326,8 +7326,20 @@ impl Transport for ReticulumTransport {
     /// CIRISEdge#809 — mirror leviculum's known-destination eviction count
     /// into the bag (a `store`); the announce tick does the same on its
     /// cadence, this makes a snapshot read current on demand.
+    ///
+    /// CIRISEdge#820 — then publish through the `metrics` facade: leviculum's
+    /// series (`ReticulumNode::publish_metrics`, names in leviculum's
+    /// `METRIC_CATALOG`) and the attached bag's ([`EdgeMetrics::publish_metrics`],
+    /// names in edge's), so one scrape-cadence call lands both in the host's
+    /// recorder. With no recorder installed both record nothing.
+    ///
+    /// [`EdgeMetrics::publish_metrics`]: crate::observability::EdgeMetrics::publish_metrics
     fn refresh_metrics(&self) {
         let _ = self.known_destination_evictions();
+        self.node.publish_metrics();
+        if let Some(m) = self.metrics.get() {
+            m.publish_metrics();
+        }
     }
 
     fn subscribe_reachability(&self) -> Option<tokio::sync::broadcast::Receiver<PeerReachable>> {

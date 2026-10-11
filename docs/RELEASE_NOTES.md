@@ -1,5 +1,48 @@
 # CIRISEdge Release Notes
 
+# Unreleased (draft) — CIRISEdge#820 P1: EdgeMetrics on the `metrics` facade, a telemetry catalogue, and its completeness gate
+
+**Additive (MINOR); no wire change, no binding-key change.** Edge now depends on the `metrics` 0.24
+facade (the minor leviculum already pulls; exactly one `metrics` in the graph, gated by
+`tests/one_metrics_crate.rs`) and installs no recorder: the host does (CIRISServer
+`FSD/UNIFIED_TELEMETRY.md` §3.2, §5).
+
+- **`telemetry_catalog`** (new module): `METRIC_CATALOG` (name, kind, unit, label keys with bounded
+  value sets, HELP, histogram buckets, the bundle field(s) each projects, histogram record sites),
+  `NOT_METRICS` (`peer_reachability_ratio`, `recent_withholds`, `removal_delivery`: per peer or per
+  row, so no series), `SPAN_CATALOG`. OpenTelemetry-style names (`ciris.edge.*`), one label style
+  (snake keys, the code's stable snake tokens as values); a value outside its set publishes as
+  `other`, so no runtime string mints a series. Enum-backed label sets are built from each enum's
+  `ALL`; persist's key/attestation refusal reasons are imported from persist's `ALL`, less the token
+  edge books as a duplicate.
+- **Pull publish:** `EdgeMetrics::publish_metrics()` and `Edge::publish_metrics()` publish counters
+  (`absolute`) and gauges (`set`) from the same snapshot the bindings read; `ReticulumTransport::
+  refresh_metrics` also calls leviculum's `ReticulumNode::publish_metrics()`. Histograms (round
+  duration by kind, sweep permit wait, responder link-up by stage) are recorded at their sites. One
+  `Edge` per process is assumed: two bags publishing to one global recorder write the same series.
+- **Gate:** every published series catalogued with only declared labels; every entry published;
+  every bundle field a metric or in `NOT_METRICS`; no rendered Prometheus name collides within
+  edge's catalogue or against leviculum's; the facade used only in `telemetry_catalog`; histograms
+  recorded only from their listed sites; every span name catalogued; and an end-to-end test that
+  one `refresh_metrics` lands both leviculum's and edge's series in a recorder.
+- **API:** `MessageType::{ALL, COUNT, as_str}`; `ALL` on `VerifyErrorClass`, `DeliveryClass`,
+  `RoundOutcome`, `WithholdReason`, `LinkPoolCloseReason`; several token fns are now `const fn`. The
+  `EdgeMetrics` writers `inc_inbound_backpressure_drop_by_role`, `inc_key_apply_refusal`,
+  `inc_attestation_apply_refusal` and `inc_apply_refusal_class` take `&'static str` (was `&str`).
+
+**Planned for the next MAJOR (wire-visible to the server, not in this cut):**
+- Once the server serves `/metrics` from its recorder (its P1), the `EdgeMetricsBundle` keys the
+  bindings return (`metrics_snapshot()` / UniFFI `metrics_snapshot`) retire in favour of the
+  catalogue names; the server's `federation_surface.rs` hand-copy goes with them. Per-peer and
+  per-row views stay as their own reads.
+- `durable_queue_depth` is already the resident depth (CIRISEdge#845, persist's
+  `outbound_counts()`, CIRISPersist#996), read async at snapshot time and not held in the bag, so
+  it is not a facade series in this cut. The next MAJOR makes it one gauge
+  (`ciris.edge.durable.queue.depth`, by delivery state) published from `Edge::publish_metrics`, and
+  the binding key keeps its name until the bundle keys retire with the rest. A failed count stays
+  unpublished, never 0. `durable_enqueued_total` stays the cumulative counter
+  (`ciris.edge.durable.enqueued`).
+
 # v40.1.0 — leviculum v0.29: known-destinations backpressure, off-lock resource assembly, and the two pressure signals in the metrics snapshot
 
 **2026-10-05.** **MINOR** from v40.0.3. Persist v53.1.4 and verify v19.0.0 unchanged; no wire change. Additive API:

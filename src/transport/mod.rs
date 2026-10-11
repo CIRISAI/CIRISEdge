@@ -691,6 +691,10 @@ pub trait Transport: Send + Sync + 'static {
     /// count). Called by the snapshot paths right before they read, so an
     /// ordinary `metrics_snapshot()` is current without a caller first
     /// invoking a transport-specific getter. Cheap; the default is a no-op.
+    ///
+    /// CIRISEdge#820 — a transport that owns facade series (Reticulum:
+    /// leviculum's, plus the attached bag's) also publishes them here, so the
+    /// host's scrape-cadence call to this lands them in its recorder.
     fn refresh_metrics(&self) {}
 }
 

@@ -115,8 +115,10 @@ pub mod messages;
 pub mod mls;
 pub mod multimedia;
 pub mod observability;
+// CIRISEdge#820 — the telemetry catalogue + the facade publish.
 pub mod outbound;
 pub mod reachability;
+pub mod telemetry_catalog;
 // CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files.
 pub mod receipts;
 pub mod replication;
