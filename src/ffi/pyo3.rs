@@ -3127,6 +3127,12 @@ fn metrics_bundle_to_pydict<'py>(
         "unclaimed_ship_refused_total",
         bundle.unclaimed_ship_refused_total,
     )?;
+    // CIRISEdge#820 — log lines suppressed per throttle site (process-wide).
+    let log_suppressed = pyo3::types::PyDict::new(py);
+    for (site, n) in &bundle.log_suppressed {
+        log_suppressed.set_item(site.as_str(), *n)?;
+    }
+    root.set_item("log_suppressed", log_suppressed)?;
 
     Ok(root)
 }

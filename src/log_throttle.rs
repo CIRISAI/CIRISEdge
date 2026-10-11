@@ -33,8 +33,194 @@
 //! where the key is attacker-chosen (`link_id`) the cap is the backstop.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// CIRISEdge#820 — every [`LogThrottle`] site, one variant per construction.
+/// [`LogThrottle::new`] takes one, so a throttle without a catalogued site
+/// does not compile; the telemetry catalogue builds the `site` label of
+/// `ciris.edge.log.suppressed` from [`Self::ALL`]. Tokens are
+/// `<module>.<what>`, the site's accessor name less `_log`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LogSite {
+    /// `contact.rung_waiting`.
+    ContactRungWaiting,
+    /// `edge.inbound_unroutable_crpl`.
+    EdgeInboundUnroutableCrpl,
+    /// `edge.blob_scope_withheld`.
+    EdgeBlobScopeWithheld,
+    /// `edge.chunk_reply_fallback`.
+    EdgeChunkReplyFallback,
+    /// `edge.inbound_verify_reject`.
+    EdgeInboundVerifyReject,
+    /// `edge.first_contact_refusal`.
+    EdgeFirstContactRefusal,
+    /// `edge.inbound_backpressure_drop`.
+    EdgeInboundBackpressureDrop,
+    /// `edge.inbound_reply_dropped`.
+    EdgeInboundReplyDropped,
+    /// `edge.inbound_ingest`.
+    EdgeInboundIngest,
+    /// `edge.inbound_routed`.
+    EdgeInboundRouted,
+    /// `edge.inbound_bootstrap_carveout`.
+    EdgeInboundBootstrapCarveout,
+    /// `bridge.serve_gate_withheld`.
+    BridgeServeGateWithheld,
+    /// `bridge.lookup_limit`.
+    BridgeLookupLimit,
+    /// `bridge.signer_park`.
+    BridgeSignerPark,
+    /// `session.apply_refusal`.
+    SessionApplyRefusal,
+    /// `swarm.config_plane`.
+    SwarmConfigPlane,
+    /// `av_spine.oversized`.
+    AvSpineOversized,
+    /// `reticulum.announce_intake_evict`.
+    ReticulumAnnounceIntakeEvict,
+    /// `reticulum.peer_admitted`.
+    ReticulumPeerAdmitted,
+    /// `reticulum.link_attribution_miss`.
+    ReticulumLinkAttributionMiss,
+    /// `reticulum.control_plane_overflow`.
+    ReticulumControlPlaneOverflow,
+    /// `reticulum.initiator_attribution_miss`.
+    ReticulumInitiatorAttributionMiss,
+    /// `reticulum.route_supersession`.
+    ReticulumRouteSupersession,
+    /// `reticulum.reverse_path_fallback`.
+    ReticulumReversePathFallback,
+    /// `reticulum.inbound_drop`.
+    ReticulumInboundDrop,
+    /// `reticulum.oversized_frame_drop`.
+    ReticulumOversizedFrameDrop,
+    /// `reticulum.own_bundle_push`.
+    ReticulumOwnBundlePush,
+    /// `reticulum.peer_bundle_arrival`.
+    ReticulumPeerBundleArrival,
+    /// `reticulum.non_ciris_announce`.
+    ReticulumNonCirisAnnounce,
+    /// `reticulum.nat_topology_diagnosis`.
+    ReticulumNatTopologyDiagnosis,
+    /// `reticulum.starved_pool_close`.
+    ReticulumStarvedPoolClose,
+    /// `reticulum.av_sink_drop`.
+    ReticulumAvSinkDrop,
+}
+
+impl LogSite {
+    /// How many sites there are.
+    pub const COUNT: usize = 32;
+
+    /// Every site, in token order.
+    pub const ALL: [Self; Self::COUNT] = [
+        Self::ContactRungWaiting,
+        Self::EdgeInboundUnroutableCrpl,
+        Self::EdgeBlobScopeWithheld,
+        Self::EdgeChunkReplyFallback,
+        Self::EdgeInboundVerifyReject,
+        Self::EdgeFirstContactRefusal,
+        Self::EdgeInboundBackpressureDrop,
+        Self::EdgeInboundReplyDropped,
+        Self::EdgeInboundIngest,
+        Self::EdgeInboundRouted,
+        Self::EdgeInboundBootstrapCarveout,
+        Self::BridgeServeGateWithheld,
+        Self::BridgeLookupLimit,
+        Self::BridgeSignerPark,
+        Self::SessionApplyRefusal,
+        Self::SwarmConfigPlane,
+        Self::AvSpineOversized,
+        Self::ReticulumAnnounceIntakeEvict,
+        Self::ReticulumPeerAdmitted,
+        Self::ReticulumLinkAttributionMiss,
+        Self::ReticulumControlPlaneOverflow,
+        Self::ReticulumInitiatorAttributionMiss,
+        Self::ReticulumRouteSupersession,
+        Self::ReticulumReversePathFallback,
+        Self::ReticulumInboundDrop,
+        Self::ReticulumOversizedFrameDrop,
+        Self::ReticulumOwnBundlePush,
+        Self::ReticulumPeerBundleArrival,
+        Self::ReticulumNonCirisAnnounce,
+        Self::ReticulumNatTopologyDiagnosis,
+        Self::ReticulumStarvedPoolClose,
+        Self::ReticulumAvSinkDrop,
+    ];
+
+    /// The stable `site` label token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ContactRungWaiting => "contact.rung_waiting",
+            Self::EdgeInboundUnroutableCrpl => "edge.inbound_unroutable_crpl",
+            Self::EdgeBlobScopeWithheld => "edge.blob_scope_withheld",
+            Self::EdgeChunkReplyFallback => "edge.chunk_reply_fallback",
+            Self::EdgeInboundVerifyReject => "edge.inbound_verify_reject",
+            Self::EdgeFirstContactRefusal => "edge.first_contact_refusal",
+            Self::EdgeInboundBackpressureDrop => "edge.inbound_backpressure_drop",
+            Self::EdgeInboundReplyDropped => "edge.inbound_reply_dropped",
+            Self::EdgeInboundIngest => "edge.inbound_ingest",
+            Self::EdgeInboundRouted => "edge.inbound_routed",
+            Self::EdgeInboundBootstrapCarveout => "edge.inbound_bootstrap_carveout",
+            Self::BridgeServeGateWithheld => "bridge.serve_gate_withheld",
+            Self::BridgeLookupLimit => "bridge.lookup_limit",
+            Self::BridgeSignerPark => "bridge.signer_park",
+            Self::SessionApplyRefusal => "session.apply_refusal",
+            Self::SwarmConfigPlane => "swarm.config_plane",
+            Self::AvSpineOversized => "av_spine.oversized",
+            Self::ReticulumAnnounceIntakeEvict => "reticulum.announce_intake_evict",
+            Self::ReticulumPeerAdmitted => "reticulum.peer_admitted",
+            Self::ReticulumLinkAttributionMiss => "reticulum.link_attribution_miss",
+            Self::ReticulumControlPlaneOverflow => "reticulum.control_plane_overflow",
+            Self::ReticulumInitiatorAttributionMiss => "reticulum.initiator_attribution_miss",
+            Self::ReticulumRouteSupersession => "reticulum.route_supersession",
+            Self::ReticulumReversePathFallback => "reticulum.reverse_path_fallback",
+            Self::ReticulumInboundDrop => "reticulum.inbound_drop",
+            Self::ReticulumOversizedFrameDrop => "reticulum.oversized_frame_drop",
+            Self::ReticulumOwnBundlePush => "reticulum.own_bundle_push",
+            Self::ReticulumPeerBundleArrival => "reticulum.peer_bundle_arrival",
+            Self::ReticulumNonCirisAnnounce => "reticulum.non_ciris_announce",
+            Self::ReticulumNatTopologyDiagnosis => "reticulum.nat_topology_diagnosis",
+            Self::ReticulumStarvedPoolClose => "reticulum.starved_pool_close",
+            Self::ReticulumAvSinkDrop => "reticulum.av_sink_drop",
+        }
+    }
+
+    /// This site's counter slot.
+    #[must_use]
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
+    }
+}
+
+/// CIRISEdge#820 — lines each site suppressed, process-wide. The throttles
+/// are process-global statics, so their counts are too: they NEVER reset per
+/// fold, and a host must treat `ciris.edge.log.suppressed` as a monotonic
+/// counter (`rate`), not a per-fold total.
+static SUPPRESSED: [AtomicU64; LogSite::COUNT] = [ZERO; LogSite::COUNT];
+/// The repeat operand for [`SUPPRESSED`] (a named const, not an inline
+/// `const {}` block, which needs a newer compiler than the declared MSRV). Each
+/// array element is a fresh copy; the const is never shared as one atomic.
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO: AtomicU64 = AtomicU64::new(0);
+
+/// Lines suppressed so far, per site token, every site present (zeros
+/// included). Process-wide; see [`SUPPRESSED`].
+#[must_use]
+pub fn suppressed_counts() -> HashMap<String, u64> {
+    LogSite::ALL
+        .iter()
+        .map(|s| {
+            (
+                s.as_str().to_owned(),
+                SUPPRESSED[s.index()].load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
 
 /// The caller's decision after consulting the throttle.
 #[derive(Debug, PartialEq, Eq)]
@@ -67,6 +253,9 @@ struct State {
 /// instances is correct, and it never affects program behavior (only whether a
 /// line is written).
 pub struct LogThrottle {
+    /// The site whose suppressions this throttle counts; `None` only for the
+    /// `#[cfg(test)]` [`LogThrottle::untracked`].
+    site: Option<LogSite>,
     state: Mutex<State>,
     max_per_window: u32,
     window: Duration,
@@ -77,8 +266,27 @@ impl LogThrottle {
     /// `max_per_window` full lines per key per `window`; the per-key map is
     /// capped at `max_keys` (front-drop) so an attacker cycling keys can't grow
     /// it unbounded.
-    pub fn new(max_per_window: u32, window: Duration, max_keys: usize) -> Self {
+    ///
+    /// CIRISEdge#820 — `site` names the throttle; every suppressed line is
+    /// counted on it.
+    pub fn new(site: LogSite, max_per_window: u32, window: Duration, max_keys: usize) -> Self {
+        Self::with_site(Some(site), max_per_window, window, max_keys)
+    }
+
+    /// A throttle that counts nowhere, for this module's own tests.
+    #[cfg(test)]
+    fn untracked(max_per_window: u32, window: Duration, max_keys: usize) -> Self {
+        Self::with_site(None, max_per_window, window, max_keys)
+    }
+
+    fn with_site(
+        site: Option<LogSite>,
+        max_per_window: u32,
+        window: Duration,
+        max_keys: usize,
+    ) -> Self {
         Self {
+            site,
             state: Mutex::new(State {
                 buckets: HashMap::new(),
                 order: VecDeque::new(),
@@ -112,6 +320,9 @@ impl LogThrottle {
                 return ThrottleDecision::Emit { suppressed_prev: 0 };
             }
             b.suppressed += 1;
+            if let Some(site) = self.site {
+                SUPPRESSED[site.index()].fetch_add(1, Ordering::Relaxed);
+            }
             return ThrottleDecision::Suppress;
         }
 
@@ -146,7 +357,7 @@ mod tests {
 
     #[test]
     fn first_n_emit_then_suppress_within_window() {
-        let t = LogThrottle::new(3, Duration::from_secs(60), 16);
+        let t = LogThrottle::untracked(3, Duration::from_secs(60), 16);
         let t0 = Instant::now();
         // First 3 within budget.
         for _ in 0..3 {
@@ -163,7 +374,7 @@ mod tests {
 
     #[test]
     fn window_roll_surfaces_suppressed_count() {
-        let t = LogThrottle::new(1, Duration::from_secs(60), 16);
+        let t = LogThrottle::untracked(1, Duration::from_secs(60), 16);
         let t0 = Instant::now();
         assert_eq!(
             t.check_at("k", t0),
@@ -184,7 +395,7 @@ mod tests {
     #[test]
     fn key_map_is_bounded_under_churn() {
         // max_keys = 4; cycle 1000 distinct keys → map never exceeds the cap.
-        let t = LogThrottle::new(1, Duration::from_secs(60), 4);
+        let t = LogThrottle::untracked(1, Duration::from_secs(60), 4);
         let t0 = Instant::now();
         for i in 0..1000 {
             let _ = t.check_at(&format!("attacker-key-{i}"), t0);
@@ -196,7 +407,7 @@ mod tests {
 
     #[test]
     fn independent_keys_have_independent_budgets() {
-        let t = LogThrottle::new(1, Duration::from_secs(60), 16);
+        let t = LogThrottle::untracked(1, Duration::from_secs(60), 16);
         let t0 = Instant::now();
         assert_eq!(
             t.check_at("a", t0),
@@ -208,5 +419,20 @@ mod tests {
             ThrottleDecision::Emit { suppressed_prev: 0 }
         );
         assert_eq!(t.check_at("a", t0), ThrottleDecision::Suppress);
+    }
+
+    /// CIRISEdge#820 — a tracked site counts exactly its suppressed lines.
+    #[test]
+    fn a_tracked_site_counts_its_suppressed_lines() {
+        let site = LogSite::SwarmConfigPlane;
+        let before = suppressed_counts()[site.as_str()];
+        let t = LogThrottle::new(site, 2, Duration::from_secs(60), 16);
+        let t0 = Instant::now();
+        for _ in 0..7 {
+            let _ = t.check_at("k", t0);
+        }
+        // Other tests may share the process-wide counter; this one adds 5.
+        assert!(suppressed_counts()[site.as_str()] >= before + 5);
+        assert_eq!(suppressed_counts().len(), LogSite::COUNT);
     }
 }

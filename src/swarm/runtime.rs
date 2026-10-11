@@ -1646,8 +1646,14 @@ static SWARM_CONFIG_PLANE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrot
     std::sync::OnceLock::new();
 
 fn swarm_config_plane_log() -> &'static crate::log_throttle::LogThrottle {
-    SWARM_CONFIG_PLANE_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(300), 8))
+    SWARM_CONFIG_PLANE_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::SwarmConfigPlane,
+            5,
+            Duration::from_secs(300),
+            8,
+        )
+    })
 }
 
 fn current_unix_ms() -> i64 {

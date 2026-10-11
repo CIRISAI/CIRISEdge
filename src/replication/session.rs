@@ -54,6 +54,7 @@ fn refusal_log() -> &'static LogThrottle {
     static THROTTLE: std::sync::OnceLock<LogThrottle> = std::sync::OnceLock::new();
     THROTTLE.get_or_init(|| {
         LogThrottle::new(
+            crate::log_throttle::LogSite::SessionApplyRefusal,
             1,
             super::refusal_backoff::TERMINAL_BASE,
             super::refusal_backoff::DEFAULT_MAX_KEYS,

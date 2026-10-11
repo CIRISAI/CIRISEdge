@@ -635,8 +635,14 @@ static SERVE_GATE_WITHHELD_LOG: std::sync::OnceLock<crate::log_throttle::LogThro
 /// per (peer, reason), a PERIODIC repeat that resets each window, NEVER to silence:
 /// a persistently-dark plane is exactly the failure you must not go quiet about.
 fn serve_gate_withheld_log() -> &'static crate::log_throttle::LogThrottle {
-    SERVE_GATE_WITHHELD_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(300), 256))
+    SERVE_GATE_WITHHELD_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::BridgeServeGateWithheld,
+            3,
+            Duration::from_secs(300),
+            256,
+        )
+    })
 }
 
 /// CIRISEdge#425 — a single-shape plane: deserialize `$ty`, admit via `$put`, and
@@ -1608,7 +1614,12 @@ enum QuarantineConsult {
 fn lookup_limit_log() -> &'static crate::log_throttle::LogThrottle {
     static T: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(60), 1024)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::BridgeLookupLimit,
+            3,
+            std::time::Duration::from_secs(60),
+            1024,
+        )
     })
 }
 
@@ -24027,6 +24038,7 @@ enum ReleaseCause {
 /// when its window lapses earns a fresh line and nothing in between does.
 fn park_log_throttle() -> crate::log_throttle::LogThrottle {
     crate::log_throttle::LogThrottle::new(
+        crate::log_throttle::LogSite::BridgeSignerPark,
         1,
         super::refusal_backoff::TERMINAL_BASE,
         super::refusal_backoff::DEFAULT_MAX_KEYS,

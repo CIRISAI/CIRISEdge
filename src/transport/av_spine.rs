@@ -155,7 +155,12 @@ static OVERSIZED_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 /// CIRISEdge#720 — the throttle for the spine's oversized-chunk WARN.
 fn oversized_log() -> &'static crate::log_throttle::LogThrottle {
     OVERSIZED_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(60), 16)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::AvSpineOversized,
+            3,
+            std::time::Duration::from_secs(60),
+            16,
+        )
     })
 }
 

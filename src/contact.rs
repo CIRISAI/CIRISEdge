@@ -1092,7 +1092,12 @@ static RUNG_WAITING_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
 fn rung_waiting_log() -> &'static crate::log_throttle::LogThrottle {
     RUNG_WAITING_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(1, std::time::Duration::from_secs(10), 64)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ContactRungWaiting,
+            1,
+            std::time::Duration::from_secs(10),
+            64,
+        )
     })
 }
 

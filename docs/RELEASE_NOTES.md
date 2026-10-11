@@ -30,6 +30,25 @@ facade (the minor leviculum already pulls; exactly one `metrics` in the graph, g
   `EdgeMetrics` writers `inc_inbound_backpressure_drop_by_role`, `inc_key_apply_refusal`,
   `inc_attestation_apply_refusal` and `inc_apply_refusal_class` take `&'static str` (was `&str`).
 
+- **Every inbound drop is counted (P1b).** The Reticulum receive-side choke point `drop_inbound`
+  takes the event context and a typed `InboundDropReason` (15 reasons), and books every drop on
+  `transport_inbound_drops` (`ciris.edge.transport.inbound.drop{reason}`); before, only
+  `identity_frame_on_scoped_link` was counted. LXMF serve withholds are also booked on
+  `withholds_by_reason`. The WARN line's `reason` field is now the snake token for the formerly
+  hyphenated reasons (`inbound_resource_failed`, `empty_resource`, `resource_assembly_degraded`,
+  `empty_packet`, `lxmf_response_undeliverable`, `bundle_unattributed_link`,
+  `bundle_no_rooting_directory`), and the two A/V drops read `av_frame_unattributed` /
+  `av_resource` (the `av_plane` counter tokens are unchanged). Gate: every `drop_inbound(` call
+  passes `ctx` and an `InboundDropReason`.
+- **Log suppression is counted (P1b).** Every `LogThrottle` names a `LogSite` (32 sites,
+  `<module>.<what>`); each suppressed line is counted, read as the new bundle field
+  `log_suppressed` and published as `ciris.edge.log.suppressed{site}`. The counts are
+  PROCESS-WIDE (the throttles are process-global statics) and never reset per fold: a host reads
+  them as a rate, not a per-fold total. Gate: every `LogThrottle::new` names exactly one site.
+- **API (P1b):** `LogThrottle::new` takes a `LogSite` first; `EdgeMetrics::inc_transport_inbound_drop`
+  takes an `InboundDropReason`; new `log_throttle::{LogSite, suppressed_counts}`,
+  `observability::InboundDropReason`, bundle field `log_suppressed`.
+
 **Planned for the next MAJOR (wire-visible to the server, not in this cut):**
 - Once the server serves `/metrics` from its recorder (its P1), the `EdgeMetricsBundle` keys the
   bindings return (`metrics_snapshot()` / UniFFI `metrics_snapshot`) retire in favour of the

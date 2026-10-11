@@ -92,7 +92,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crate::observability::{LinkCloseCause, LinkPoolCloseReason};
+use crate::observability::{InboundDropReason, LinkCloseCause, LinkPoolCloseReason};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -803,23 +803,41 @@ static ANNOUNCE_INTAKE_EVICT_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
 /// number of times per window and carries `suppressed_prev` for the rest — the
 /// exact count lives on the metrics counter, which is never throttled.
 fn announce_intake_evict_log() -> &'static crate::log_throttle::LogThrottle {
-    ANNOUNCE_INTAKE_EVICT_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1))
+    ANNOUNCE_INTAKE_EVICT_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumAnnounceIntakeEvict,
+            5,
+            Duration::from_secs(60),
+            1,
+        )
+    })
 }
 
 /// Point 1 — peer-admitted (INFO). Keyed on `provenance` (2 values), so the
 /// rare `Rooted` admit logs freely while a flood of junk `Advisory` admits is
 /// capped. A tiny key map suffices.
 fn peer_admitted_log() -> &'static crate::log_throttle::LogThrottle {
-    PEER_ADMITTED_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_secs(60), 8))
+    PEER_ADMITTED_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumPeerAdmitted,
+            8,
+            Duration::from_secs(60),
+            8,
+        )
+    })
 }
 
 /// Point 2 — link-attribution miss (WARN). Keyed on the link-proven identity
 /// hash (attacker-chosen), so the key map is capped as the DoS backstop.
 fn link_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
-    LINK_ATTRIBUTION_MISS_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 1024))
+    LINK_ATTRIBUTION_MISS_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumLinkAttributionMiss,
+            5,
+            Duration::from_secs(60),
+            1024,
+        )
+    })
 }
 
 static CONTROL_PLANE_OVERFLOW_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -835,8 +853,14 @@ static CONTROL_PLANE_OVERFLOW_LOG: std::sync::OnceLock<crate::log_throttle::LogT
 /// marker every drain window, which an announce/link flood can influence —
 /// first 6 per minute log loudly, the rest collapse to a suppressed count.
 fn control_plane_overflow_log() -> &'static crate::log_throttle::LogThrottle {
-    CONTROL_PLANE_OVERFLOW_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(6, Duration::from_secs(60), 1))
+    CONTROL_PLANE_OVERFLOW_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumControlPlaneOverflow,
+            6,
+            Duration::from_secs(60),
+            1,
+        )
+    })
 }
 
 static INITIATOR_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -849,8 +873,14 @@ static INITIATOR_ATTRIBUTION_MISS_LOG: std::sync::OnceLock<crate::log_throttle::
 /// link, capped map as the backstop) so the miss can NEVER again read as absence
 /// of work — the #414/#416/#932/#423/#424 silent-refusal class.
 fn initiator_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle {
-    INITIATOR_ATTRIBUTION_MISS_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+    INITIATOR_ATTRIBUTION_MISS_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumInitiatorAttributionMiss,
+            5,
+            Duration::from_secs(60),
+            256,
+        )
+    })
 }
 
 /// CIRISEdge#337 — route supersession decisions (verified-only refusal + belt
@@ -860,8 +890,14 @@ fn initiator_attribution_miss_log() -> &'static crate::log_throttle::LogThrottle
 /// per-key log line. The refusal is a genuine attack signal, so it logs the
 /// first few per window loudly then summarizes.
 fn route_supersession_log() -> &'static crate::log_throttle::LogThrottle {
-    ROUTE_SUPERSESSION_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(8, Duration::from_secs(60), 4))
+    ROUTE_SUPERSESSION_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumRouteSupersession,
+            8,
+            Duration::from_secs(60),
+            4,
+        )
+    })
 }
 
 static REVERSE_PATH_FALLBACK_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -873,8 +909,14 @@ static NAT_TOPOLOGY_DIAGNOSIS_LOG: std::sync::OnceLock<crate::log_throttle::LogT
 /// back to an outbound dial. Keyed on the peer key_id (rooted peers only —
 /// bounded by the admit gate, capped map as backstop).
 fn reverse_path_fallback_log() -> &'static crate::log_throttle::LogThrottle {
-    REVERSE_PATH_FALLBACK_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+    REVERSE_PATH_FALLBACK_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumReversePathFallback,
+            5,
+            Duration::from_secs(60),
+            256,
+        )
+    })
 }
 
 static INBOUND_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -883,8 +925,14 @@ static INBOUND_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 /// CIRISEdge#425 — throttle backing [`drop_inbound`]. Keyed on the low-cardinality
 /// reason TAG (a fixed set), a floor per window (periodic repeat), never silence.
 fn inbound_drop_log() -> &'static crate::log_throttle::LogThrottle {
-    INBOUND_DROP_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 64))
+    INBOUND_DROP_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumInboundDrop,
+            3,
+            Duration::from_secs(60),
+            64,
+        )
+    })
 }
 
 /// CIRISEdge#425 structural-2 — the ONE blessed way for the listen loop to NOT
@@ -895,7 +943,22 @@ fn inbound_drop_log() -> &'static crate::log_throttle::LogThrottle {
 /// characterization pin greps `handle_event` / `attribute_and_deliver` for
 /// `return;` / `continue;` NOT adjacent to a `drop_inbound` or `tracing::` call, so
 /// a NEW silent drop fails the build.
-fn drop_inbound(link_id: Option<LinkId>, reason_tag: &str, detail: &str) {
+///
+/// CIRISEdge#820 — every drop is COUNTED here, on the event context's bag
+/// (`transport_inbound_drops`, catalogued as `ciris.edge.transport.inbound.drop`),
+/// by a typed [`crate::observability::InboundDropReason`]: a caller cannot pass
+/// an uncatalogued reason, and cannot skip the count. The bag is absent only on
+/// a transport no `Edge` attached one to (a bare transport in a test).
+fn drop_inbound(
+    ctx: &EventCtx<'_>,
+    link_id: Option<LinkId>,
+    reason: crate::observability::InboundDropReason,
+    detail: &str,
+) {
+    if let Some(m) = ctx.metrics {
+        m.inc_transport_inbound_drop(reason);
+    }
+    let reason_tag = reason.as_str();
     if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
         inbound_drop_log().check(reason_tag)
     {
@@ -920,8 +983,14 @@ static OVERSIZED_FRAME_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThr
 /// now LOUD (throttled WARN, keyed per peer) so the fragmentation gap is a log
 /// line, never an interrogation. Bounded like the reverse-path fallback log.
 fn oversized_frame_drop_log() -> &'static crate::log_throttle::LogThrottle {
-    OVERSIZED_FRAME_DROP_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+    OVERSIZED_FRAME_DROP_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumOversizedFrameDrop,
+            5,
+            Duration::from_secs(60),
+            256,
+        )
+    })
 }
 
 static OWN_BUNDLE_PUSH_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -933,8 +1002,14 @@ static OWN_BUNDLE_PUSH_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle
 /// silent: a peer that can never receive the bundle can never root us at first
 /// contact, which would otherwise read as an unexplained Advisory plateau.
 fn own_bundle_push_log() -> &'static crate::log_throttle::LogThrottle {
-    OWN_BUNDLE_PUSH_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 8))
+    OWN_BUNDLE_PUSH_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumOwnBundlePush,
+            3,
+            Duration::from_secs(60),
+            8,
+        )
+    })
 }
 
 static PEER_BUNDLE_ARRIVAL_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -945,8 +1020,14 @@ static PEER_BUNDLE_ARRIVAL_LOG: std::sync::OnceLock<crate::log_throttle::LogThro
 /// floor per window, never silence: a refused package must never look like a
 /// stored/verified one (the #423 apply-loud discipline).
 fn peer_bundle_arrival_log() -> &'static crate::log_throttle::LogThrottle {
-    PEER_BUNDLE_ARRIVAL_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 32))
+    PEER_BUNDLE_ARRIVAL_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumPeerBundleArrival,
+            3,
+            Duration::from_secs(60),
+            32,
+        )
+    })
 }
 
 static NON_CIRIS_ANNOUNCE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
@@ -959,8 +1040,14 @@ static NON_CIRIS_ANNOUNCE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrot
 /// a couple of DEBUG lines per minute + a suppressed-count, keyed on a single
 /// fixed discriminant (this is not a per-peer condition — it's "not us").
 fn non_ciris_announce_log() -> &'static crate::log_throttle::LogThrottle {
-    NON_CIRIS_ANNOUNCE_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(60), 4))
+    NON_CIRIS_ANNOUNCE_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumNonCirisAnnounce,
+            2,
+            Duration::from_secs(60),
+            4,
+        )
+    })
 }
 
 /// CIRISEdge#353 ask 2 — the NAT'd/initiator-only topology diagnosis. Before
@@ -968,8 +1055,14 @@ fn non_ciris_announce_log() -> &'static crate::log_throttle::LogThrottle {
 /// kind per round FOREVER (the field symptom: 3 WARNs every 30 s, no cause).
 /// One diagnosis per peer per window, then a suppressed-count.
 fn nat_topology_diagnosis_log() -> &'static crate::log_throttle::LogThrottle {
-    NAT_TOPOLOGY_DIAGNOSIS_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(300), 256))
+    NAT_TOPOLOGY_DIAGNOSIS_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumNatTopologyDiagnosis,
+            2,
+            Duration::from_secs(300),
+            256,
+        )
+    })
 }
 
 /// CIRISEdge#353 ask 2 — emit the topology diagnosis (throttled). Fired when a
@@ -8273,7 +8366,14 @@ fn note_starved_pool_close(reason: leviculum_core::link::LinkCloseReason, link_i
         _ => return,
     };
     if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } = STARVED_POOL_CLOSE_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 8))
+        .get_or_init(|| {
+            crate::log_throttle::LogThrottle::new(
+                crate::log_throttle::LogSite::ReticulumStarvedPoolClose,
+                5,
+                Duration::from_secs(60),
+                8,
+            )
+        })
         .check(tag)
     {
         tracing::warn!(
@@ -9367,7 +9467,8 @@ fn identity_plane_frame_class(data: &[u8]) -> Option<&'static str> {
 
 /// The `drop_inbound` reason tag for an identity-plane frame on a scoped link
 /// (CIRISEdge#728); the `transport_inbound_drops` key.
-pub const DROP_IDENTITY_FRAME_ON_SCOPED_LINK: &str = "identity_frame_on_scoped_link";
+pub const DROP_IDENTITY_FRAME_ON_SCOPED_LINK: &str =
+    InboundDropReason::IdentityFrameOnScopedLink.as_str();
 
 /// CIRISEdge#424 — the classified result of attributing an inbound frame's link to
 /// a source peer. Every arm is explicit so a `None` attribution can NEVER again be
@@ -9413,13 +9514,18 @@ enum LinkAttribution {
 /// CIRISEdge#621 — the one drop for [`LinkAttribution::ResolvedToSelf`], through
 /// the #425 choke point with its own reason tag. Split out so the arm in
 /// `attribute_and_deliver` stays one call (that fn is at clippy's line cap).
-fn drop_resolved_to_self(link_id: LinkId, key_id: &str) {
+fn drop_resolved_to_self(ctx: &EventCtx<'_>, link_id: LinkId, key_id: &str) {
     let detail = format!(
         "inbound link resolved to THIS node's own key {key_id} — the peers map holds a \
          self-entry (CIRISServer#607); an inbound link's source is never us, so no \
          responder is built for it (CIRISEdge#621)"
     );
-    drop_inbound(Some(link_id), "attribution_resolved_to_self", &detail);
+    drop_inbound(
+        ctx,
+        Some(link_id),
+        InboundDropReason::AttributionResolvedToSelf,
+        &detail,
+    );
 }
 
 /// Pure attribution decision (unit-tested — the layer the server's loopback round
@@ -9753,10 +9859,12 @@ async fn attribute_and_deliver(
                 data.len(),
                 dest.map_or_else(|| "-".to_owned(), |d| hex::encode(d.into_bytes())),
             );
-            if let Some(m) = ctx.metrics {
-                m.inc_transport_inbound_drop(DROP_IDENTITY_FRAME_ON_SCOPED_LINK);
-            }
-            drop_inbound(Some(link_id), DROP_IDENTITY_FRAME_ON_SCOPED_LINK, &detail);
+            drop_inbound(
+                ctx,
+                Some(link_id),
+                InboundDropReason::IdentityFrameOnScopedLink,
+                &detail,
+            );
             return;
         }
     }
@@ -9804,7 +9912,7 @@ async fn attribute_and_deliver(
             // build a responder that replies to itself (CIRISServer#607's 0
             // rounds served). Dropped through the one choke point, named.
             LinkAttribution::ResolvedToSelf(key_id) => {
-                drop_resolved_to_self(link_id, &key_id);
+                drop_resolved_to_self(ctx, link_id, &key_id);
                 // choke-ok: `drop_resolved_to_self` IS a `drop_inbound` call (#621).
                 return;
             }
@@ -10307,8 +10415,14 @@ static AV_SINK_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 /// no consumer): DEBUG, a few per minute per link, never per frame
 /// (CIRISEdge#460). The exact count is the `av_plane` counter, never throttled.
 fn av_sink_drop_log() -> &'static crate::log_throttle::LogThrottle {
-    AV_SINK_DROP_LOG
-        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+    AV_SINK_DROP_LOG.get_or_init(|| {
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::ReticulumAvSinkDrop,
+            5,
+            Duration::from_secs(60),
+            256,
+        )
+    })
 }
 
 /// CIRISEdge#805 item 4 — **one inbound frame on an A/V link.**
@@ -10363,11 +10477,16 @@ async fn deliver_av_frame(
             data.len(),
             dest.map_or_else(|| "-".to_owned(), |d| hex::encode(d.into_bytes())),
         );
-        drop_inbound(Some(link_id), DROP_AV_FRAME_UNATTRIBUTED, &detail);
         // The frame consumed a counter on the sender's side: count it, so the
         // next ADMITTED frame on this link reports the gap and the consumer's
         // hop counter skips past it once the binding recovers (Codex on #813).
         ctx.av_sink.note_dropped_before_sink(link_id);
+        drop_inbound(
+            ctx,
+            Some(link_id),
+            InboundDropReason::AvFrameUnattributed,
+            &detail,
+        );
         return;
     };
     // CIRISEdge#353 / #853 — an attributed A/V frame is proof the peer is alive
@@ -10903,8 +11022,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 // CIRISEdge#425 — an INBOUND envelope resource that began arriving
                 // and never completed used to leave no trace on the receive side.
                 drop_inbound(
+                    ctx,
                     None,
-                    "inbound-resource-failed",
+                    InboundDropReason::InboundResourceFailed,
                     &format!(
                         "an inbound envelope resource transfer failed mid-flight \
                          (resource={}): {error}",
@@ -10954,8 +11074,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // `drop_inbound` choke.
             if data.is_empty() {
                 drop_inbound(
+                    ctx,
                     Some(link_id),
-                    "empty-resource",
+                    InboundDropReason::EmptyResource,
                     "receiver-side resource completed with no data",
                 );
                 return;
@@ -11002,7 +11123,12 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                      second reassembly layer — raise \
                      ReticulumNodeBuilder::max_assembled_resource_size. Segment dropped"
                 );
-                drop_inbound(Some(link_id), "resource-assembly-degraded", &detail);
+                drop_inbound(
+                    ctx,
+                    Some(link_id),
+                    InboundDropReason::ResourceAssemblyDegraded,
+                    &detail,
+                );
                 return;
             }
             tracing::debug!(
@@ -11024,8 +11150,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                         m.inc_av_plane(crate::observability::AV_INBOUND_DROPPED_RESOURCE);
                     }
                     drop_inbound(
+                        ctx,
                         Some(link_id),
-                        crate::observability::AV_INBOUND_DROPPED_RESOURCE,
+                        InboundDropReason::AvResource,
                         "a Resource completed on an A/V link — A/V rides the link Channel \
                          only; not routed to replication nor to the A/V sink (CIRISEdge#805)",
                     );
@@ -11056,8 +11183,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 // CIRISEdge#425 — an empty packet on the link-Channel path was a
                 // silent `return` too; route it through the choke point.
                 drop_inbound(
+                    ctx,
                     Some(link_id),
-                    "empty-packet",
+                    InboundDropReason::EmptyPacket,
                     "inbound link packet had no data",
                 );
                 return;
@@ -11170,16 +11298,22 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
 
             let result = serve.serve_get(requester, data, std::time::Instant::now());
 
-            // The notices carry typed `WithholdReason`s and BELONG in the
-            // counted ledger — but the transport holds no `EdgeMetrics`
-            // handle (`inc_withhold` is never called from this file). That is
-            // the serve/inbound attribution asymmetry recorded in
-            // `crate::contextual_integrity`, meeting a serve path that happens
-            // to live in the event loop. Until the transport carries a metrics
-            // handle these are LOUD but uncounted, which is stated rather than
-            // silently accepted.
+            // The notices carry typed `WithholdReason`s and belong in the
+            // counted ledger. CIRISEdge#820 — the event context now carries the
+            // `Edge`'s bag, so each is booked on `withholds_by_reason` (the
+            // static leg descriptor as detail, the destination as peer) and the
+            // drop itself on `transport_inbound_drops` as `lxmf_serve_withheld`.
             for notice in &result.notices {
-                drop_inbound(Some(link_id), notice.reason.as_str(), notice.detail);
+                if let Some(m) = ctx.metrics {
+                    let peer = notice.destination.map(hex::encode).unwrap_or_default();
+                    m.inc_withhold(notice.reason, &peer, notice.detail);
+                }
+                drop_inbound(
+                    ctx,
+                    Some(link_id),
+                    InboundDropReason::LxmfServeWithheld,
+                    &format!("{}: {}", notice.reason.as_str(), notice.detail),
+                );
             }
 
             if let ServeOutcome::Respond(ref bytes) = result.outcome {
@@ -11205,8 +11339,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                         // A link known to be dead answers `LinkNotFound` — the
                         // typed signal, and the honest one.
                         drop_inbound(
+                            ctx,
                             Some(link_id),
-                            "lxmf-response-undeliverable",
+                            InboundDropReason::LxmfResponseUndeliverable,
                             &format!("{e}"),
                         );
                     }
@@ -12358,16 +12493,18 @@ async fn commit_one_motion_upgrade(
 async fn handle_announce_frame(ctx: &EventCtx<'_>, link_id: LinkId, frame: &[u8]) {
     let Some(decoded) = crate::transport::announce_frame::decode(frame) else {
         drop_inbound(
+            ctx,
             Some(link_id),
-            "announce_frame_malformed",
+            InboundDropReason::AnnounceFrameMalformed,
             "CANN frame did not decode (magic/version/length) — dropped (CIRISEdge#627)",
         );
         return;
     };
     let Some(remote) = ctx.node.get_remote_identity(&link_id) else {
         drop_inbound(
+            ctx,
             Some(link_id),
-            "announce_frame_link_unidentified",
+            InboundDropReason::AnnounceFrameLinkUnidentified,
             "CANN frame on a link with no proven remote identity — dropped; an announce \
              binds only the identity the link proved (CIRISEdge#627)",
         );
@@ -12378,8 +12515,9 @@ async fn handle_announce_frame(ctx: &EventCtx<'_>, link_id: LinkId, frame: &[u8]
         .unwrap_or([0u8; 64]);
     let Some(view) = announce_view_bound_to_link(&decoded, &link_pubkey) else {
         drop_inbound(
+            ctx,
             Some(link_id),
-            "announce_frame_identity_mismatch",
+            InboundDropReason::AnnounceFrameIdentityMismatch,
             "CANN frame's transport key is not this link's proven remote identity — \
              dropped by name (a relayed/replayed announce cannot bind a link it did not \
              come from; CIRISEdge#627)",
@@ -12512,8 +12650,9 @@ async fn handle_peer_bundle_frame(
 ) {
     let Some(key_id) = candidate_key_id else {
         drop_inbound(
+            ctx,
             Some(link_id),
-            "bundle-unattributed-link",
+            InboundDropReason::BundleUnattributedLink,
             "a CBND bundle frame arrived on a link attributed to no peer key_id — there \
              is no announced commitment to bind it to; the peer's announce (or our dial \
              record) must land first (CIRISEdge#436)",
@@ -12522,8 +12661,9 @@ async fn handle_peer_bundle_frame(
     };
     let Some(rooting) = ctx.rooting else {
         drop_inbound(
+            ctx,
             Some(link_id),
-            "bundle-no-rooting-directory",
+            InboundDropReason::BundleNoRootingDirectory,
             "a CBND bundle frame arrived but no rooting directory is wired — nothing can \
              verify, nothing can root (fail-closed) (CIRISEdge#436)",
         );

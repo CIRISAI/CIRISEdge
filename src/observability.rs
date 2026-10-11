@@ -1021,6 +1021,91 @@ pub const LINK_UP_OUTCOMES: [&str; 4] = [
     LINK_UP_TIMEOUT,
     LINK_UP_LINK_GONE,
 ];
+/// CIRISEdge#820 — why the Reticulum transport dropped an inbound frame at
+/// its receive-side choke point (`drop_inbound`, CIRISEdge#425). Every drop
+/// is booked on `transport_inbound_drops` under [`Self::as_str`]; the
+/// telemetry catalogue's `reason` set is built from [`Self::ALL`], so a new
+/// reason is counted and catalogued by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InboundDropReason {
+    /// The link's attribution resolved to this node's own key (CIRISEdge#621).
+    AttributionResolvedToSelf,
+    /// An identity-plane frame on a link dialled to a scope-derived address
+    /// (CIRISEdge#728).
+    IdentityFrameOnScopedLink,
+    /// An A/V frame on a link attributed to no peer (CIRISEdge#805).
+    AvFrameUnattributed,
+    /// An inbound envelope resource failed mid-transfer.
+    InboundResourceFailed,
+    /// A receiver-side resource completed with no data.
+    EmptyResource,
+    /// A resource completed but its assembly degraded.
+    ResourceAssemblyDegraded,
+    /// A Resource completed on an A/V link (A/V rides the link Channel only).
+    AvResource,
+    /// An inbound link packet carried no data.
+    EmptyPacket,
+    /// The LXMF propagation serve withheld from a request; the typed
+    /// [`WithholdReason`] is booked on `withholds_by_reason`.
+    LxmfServeWithheld,
+    /// An LXMF propagation response could not be sent back.
+    LxmfResponseUndeliverable,
+    /// A `CANN` announce frame did not decode (CIRISEdge#627).
+    AnnounceFrameMalformed,
+    /// A `CANN` frame on a link with no proven remote identity.
+    AnnounceFrameLinkUnidentified,
+    /// A `CANN` frame whose transport key is not the link's proven identity.
+    AnnounceFrameIdentityMismatch,
+    /// A `CBND` bundle frame on a link attributed to no peer.
+    BundleUnattributedLink,
+    /// A `CBND` bundle frame with no rooting directory wired (CIRISEdge#436).
+    BundleNoRootingDirectory,
+}
+
+impl InboundDropReason {
+    /// Every reason, in token order.
+    pub const ALL: &'static [Self] = &[
+        Self::AttributionResolvedToSelf,
+        Self::IdentityFrameOnScopedLink,
+        Self::AvFrameUnattributed,
+        Self::InboundResourceFailed,
+        Self::EmptyResource,
+        Self::ResourceAssemblyDegraded,
+        Self::AvResource,
+        Self::EmptyPacket,
+        Self::LxmfServeWithheld,
+        Self::LxmfResponseUndeliverable,
+        Self::AnnounceFrameMalformed,
+        Self::AnnounceFrameLinkUnidentified,
+        Self::AnnounceFrameIdentityMismatch,
+        Self::BundleUnattributedLink,
+        Self::BundleNoRootingDirectory,
+    ];
+
+    /// The stable snake_case token: the WARN line's `reason` field and the
+    /// `reason` label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AttributionResolvedToSelf => "attribution_resolved_to_self",
+            Self::IdentityFrameOnScopedLink => "identity_frame_on_scoped_link",
+            Self::AvFrameUnattributed => "av_frame_unattributed",
+            Self::InboundResourceFailed => "inbound_resource_failed",
+            Self::EmptyResource => "empty_resource",
+            Self::ResourceAssemblyDegraded => "resource_assembly_degraded",
+            Self::AvResource => "av_resource",
+            Self::EmptyPacket => "empty_packet",
+            Self::LxmfServeWithheld => "lxmf_serve_withheld",
+            Self::LxmfResponseUndeliverable => "lxmf_response_undeliverable",
+            Self::AnnounceFrameMalformed => "announce_frame_malformed",
+            Self::AnnounceFrameLinkUnidentified => "announce_frame_link_unidentified",
+            Self::AnnounceFrameIdentityMismatch => "announce_frame_identity_mismatch",
+            Self::BundleUnattributedLink => "bundle_unattributed_link",
+            Self::BundleNoRootingDirectory => "bundle_no_rooting_directory",
+        }
+    }
+}
+
 /// CIRISEdge#853 — how long a responder's link-up may run before it counts
 /// as `timeout`: the dialer's own establish-and-identify window.
 pub const RESPONDER_LINK_UP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1840,12 +1925,13 @@ impl EdgeMetrics {
     }
 
     /// CIRISEdge#728 — count one transport receive-side refusal by its
-    /// `drop_inbound` reason tag.
-    pub fn inc_transport_inbound_drop(&self, reason_tag: &'static str) {
+    /// `drop_inbound` reason (typed since CIRISEdge#820, so every reason is a
+    /// catalogued token).
+    pub fn inc_transport_inbound_drop(&self, reason: InboundDropReason) {
         *self
             .transport_inbound_drops
             .write()
-            .entry(reason_tag)
+            .entry(reason.as_str())
             .or_insert(0) += 1;
     }
 
@@ -2645,6 +2731,7 @@ impl EdgeMetrics {
             responder_link_up_total: self.responder_link_up_total(),
             recovered_links_total: self.recovered_links_total(),
             unclaimed_ship_refused_total: self.unclaimed_ship_refused_total(),
+            log_suppressed: crate::log_throttle::suppressed_counts(),
         }
     }
 }
@@ -2967,6 +3054,11 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#853 — ships refused on a lane another transfer held.
     /// Unreachable by construction; non-zero is a regression.
     pub unclaimed_ship_refused_total: u64,
+    /// CIRISEdge#820 — log lines each `LogThrottle` site suppressed, keyed by
+    /// its `LogSite` token, every site present. PROCESS-WIDE (the throttles
+    /// are process-global): never reset per `Edge` or per fold, so a host
+    /// reads it as a monotonic counter (`rate`), not a per-fold total.
+    pub log_suppressed: HashMap<String, u64>,
 }
 
 /// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
@@ -3269,6 +3361,8 @@ impl EdgeMetricsBundle {
             "unclaimed_ship_refused_total".to_string(),
             self.unclaimed_ship_refused_total,
         );
+        // CIRISEdge#820 — log lines suppressed, per throttle site.
+        f.family("log_suppressed", &self.log_suppressed);
         // CIRISEdge#858 — the refusal memory's park ledger.
         f.family(
             "rows_parked_on_signer",
@@ -3389,6 +3483,7 @@ edge_metrics_bundle_fields!(
     responder_link_up_total,
     recovered_links_total,
     unclaimed_ship_refused_total,
+    log_suppressed,
 );
 
 #[cfg(test)]

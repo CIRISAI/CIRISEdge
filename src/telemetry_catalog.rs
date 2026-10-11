@@ -55,10 +55,11 @@ use ciris_persist::federation::attestation_apply::AttestationRefusalReason;
 use ciris_persist::federation::register::KeyRefusalReason;
 use metrics::{Label, Unit};
 
+use crate::log_throttle::LogSite;
 use crate::messages::MessageType;
 use crate::observability::{
-    DeliveryClass, LinkCloseCause, LinkPoolCloseReason, RoundOutcome, VerifyErrorClass,
-    WithholdReason, LINK_UP_OUTCOMES, RESPONDER_ROUND_OUTCOMES,
+    DeliveryClass, InboundDropReason, LinkCloseCause, LinkPoolCloseReason, RoundOutcome,
+    VerifyErrorClass, WithholdReason, LINK_UP_OUTCOMES, RESPONDER_ROUND_OUTCOMES,
 };
 use crate::replication::bridge::ApplyRefusalClass;
 use crate::replication::EnvelopeKind;
@@ -500,7 +501,9 @@ const BLOB_SCOPED_CARRIERS: &[&str] = &[
     "serve:reply_queued_fallback",
 ];
 const BOOTSTRAP_DOOR_DECISIONS: &[&str] = &["not_applicable", "attributed", "unbound"];
-const TRANSPORT_INBOUND_DROPS: &[&str] = &["identity_frame_on_scoped_link"];
+const TRANSPORT_INBOUND_DROPS: [&str; InboundDropReason::ALL.len()] =
+    tokens!(InboundDropReason::ALL, as_str);
+const LOG_SITES: [&str; LogSite::COUNT] = tokens!(LogSite::ALL, as_str);
 const AV_EVENTS: &[&str] = &[
     crate::observability::AV_SENT,
     crate::observability::AV_SEND_REFUSED_CHUNK_TOO_LARGE,
@@ -587,7 +590,7 @@ pub const METRIC_CATALOG: &[MetricSpec] = &[
     gauge("ciris.edge.blob.dag.chunks.peak", Unit::Count, &[label("peak", BLOB_DAG_CHUNK_PEAKS)], &["blob_dag_chunks"], "Blob DAG chunk peaks (in flight, adopt batch)."),
     counter("ciris.edge.delivery.receipt", Unit::Count, &[label("outcome", DELIVERY_RECEIPTS)], &["delivery_receipts"], "File delivery receipts, by outcome."),
     counter("ciris.edge.bootstrap.door", Unit::Count, &[label("decision", BOOTSTRAP_DOOR_DECISIONS)], &["bootstrap_door_outcomes"], "Bootstrap attribution door decisions."),
-    counter("ciris.edge.transport.inbound.drop", Unit::Count, &[label("reason", TRANSPORT_INBOUND_DROPS)], &["transport_inbound_drops"], "Inbound transport frames dropped, by reason."),
+    counter("ciris.edge.transport.inbound.drop", Unit::Count, &[label("reason", &TRANSPORT_INBOUND_DROPS)], &["transport_inbound_drops"], "Inbound transport frames dropped, by reason."),
     counter("ciris.edge.first_contact", Unit::Count, &[label("outcome", FIRST_CONTACT_OUTCOMES)], &["first_contact_outcomes"], "First-contact and owner-binding outcomes."),
     counter("ciris.edge.av.event", Unit::Count, &[label("event", AV_EVENTS)], &["av_plane"], "A/V plane events."),
     counter("ciris.edge.replication.routed", Unit::Count, &[label("role", SESSION_ROLES)], &["replication_routed_to_responder_total", "replication_routed_to_initiator_total"], "Inbound replication frames routed, by the receiving session's role."),
@@ -627,6 +630,7 @@ pub const METRIC_CATALOG: &[MetricSpec] = &[
     counter("ciris.edge.responder.link_up", Unit::Count, &[label("outcome", &LINK_UP_OUTCOMES)], &["responder_link_up_total"], "Responder link-ups, by outcome."),
     counter("ciris.edge.link.recovered", Unit::Count, &[], &["recovered_links_total"], "Links recovered after a transient failure."),
     counter("ciris.edge.ship.unclaimed_refused", Unit::Count, &[], &["unclaimed_ship_refused_total"], "Ships refused for a lane whose claim failed."),
+    counter("ciris.edge.log.suppressed", Unit::Count, &[label("site", &LOG_SITES)], &["log_suppressed"], "Log lines a LogThrottle site suppressed. PROCESS-WIDE and never reset per fold: read it as a rate."),
 ];
 
 /// Bundle fields that are deliberately not metrics.
@@ -749,6 +753,7 @@ pub fn publish_bundle(b: &crate::observability::EdgeMetricsBundle) {
         ),
         ("ciris.edge.apply.refusal.class", &b.apply_refusals_by_class),
         ("ciris.edge.responder.link_up", &b.responder_link_up_total),
+        ("ciris.edge.log.suppressed", &b.log_suppressed),
     ] {
         for (k, v) in map {
             p.count(name, &[k.as_str()], *v);
@@ -1013,7 +1018,8 @@ mod telemetry_catalog_gate {
         b.blob_dag_chunks.extend(strs(BLOB_DAG_CHUNK_PEAKS));
         b.delivery_receipts = strs(DELIVERY_RECEIPTS);
         b.bootstrap_door_outcomes = strs(BOOTSTRAP_DOOR_DECISIONS);
-        b.transport_inbound_drops = strs(TRANSPORT_INBOUND_DROPS);
+        b.transport_inbound_drops = strs(&TRANSPORT_INBOUND_DROPS);
+        b.log_suppressed = strs(&LOG_SITES);
         b.first_contact_outcomes = strs(FIRST_CONTACT_OUTCOMES);
         b.av_plane = strs(AV_EVENTS);
         b.link_pool_closed_by_reason = strs(&POOL_CLOSE_REASONS);
@@ -1416,5 +1422,112 @@ mod telemetry_catalog_gate {
         ];
         let ids: Vec<&str> = consts.iter().map(|t| t.0).collect();
         assert_eq!(ids, TRANSPORTS);
+    }
+
+    /// The argument text of the call starting at `start` (up to its closing
+    /// paren, nesting counted).
+    fn call_args(text: &str, start: usize) -> &str {
+        let rest = &text[start..];
+        let open = rest.find('(').expect("call has a paren");
+        let mut depth = 0usize;
+        for (i, c) in rest[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &rest[open + 1..open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest
+    }
+
+    /// Every `drop_inbound(` call in `src/` passes the event context first
+    /// (so the drop is booked on the `Edge`'s bag, never skipped) and a typed
+    /// `InboundDropReason` (so its token is catalogued). A new uncounted or
+    /// uncatalogued drop fails here.
+    #[test]
+    fn every_inbound_drop_is_counted_by_a_catalogued_reason() {
+        let call = concat!("drop_inbound", "(");
+        let mut bad = Vec::new();
+        let mut calls = 0;
+        for (file, text) in sources() {
+            if file == THIS_FILE {
+                continue;
+            }
+            for (i, _) in text.match_indices(call) {
+                let before = &text[..i];
+                // Skip the definition and prose mentions (doc / line comments,
+                // string literals in the #425 pin).
+                let line_start = before.rfind('\n').map_or(0, |n| n + 1);
+                let line_head = &text[line_start..i];
+                if line_head.trim_end().ends_with("fn")
+                    || line_head.contains("//")
+                    || line_head.contains('"')
+                    || line_head.contains('`')
+                    || before.ends_with('_')
+                {
+                    continue;
+                }
+                calls += 1;
+                let args = call_args(&text, i);
+                let first = args.split(',').next().unwrap_or("").trim();
+                let line = before.matches('\n').count() + 1;
+                if first != "ctx" {
+                    bad.push(format!(
+                        "{file}:{line}: first argument `{first}`, not `ctx`"
+                    ));
+                }
+                if !args.contains("InboundDropReason::") {
+                    bad.push(format!(
+                        "{file}:{line}: reason is not an `InboundDropReason`"
+                    ));
+                }
+            }
+        }
+        assert!(calls > 0, "found no drop_inbound calls to check");
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// Every `LogThrottle::new(` in `src/` names a `LogSite`, and every site
+    /// is named by exactly one construction.
+    #[test]
+    fn every_log_throttle_names_one_site() {
+        let call = concat!("LogThrottle", "::new(");
+        let mut seen: HashMap<String, Vec<String>> = HashMap::new();
+        let mut bad = Vec::new();
+        for (file, text) in sources() {
+            if file == THIS_FILE || file == "src/log_throttle.rs" {
+                continue;
+            }
+            for (i, _) in text.match_indices(call) {
+                let line = text[..i].matches('\n').count() + 1;
+                let args = call_args(&text, i);
+                let first = args.split(',').next().unwrap_or("").trim();
+                match first.rsplit_once("LogSite::") {
+                    Some((_, v)) => seen
+                        .entry(v.to_owned())
+                        .or_default()
+                        .push(format!("{file}:{line}")),
+                    None => bad.push(format!("{file}:{line}: no LogSite (`{first}`)")),
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+        let shared: Vec<_> = seen.iter().filter(|(_, at)| at.len() > 1).collect();
+        assert!(
+            shared.is_empty(),
+            "a LogSite named by more than one throttle: {shared:?}"
+        );
+        let names: BTreeSet<String> = LogSite::ALL.iter().map(|s| format!("{s:?}")).collect();
+        let used: BTreeSet<String> = seen.keys().cloned().collect();
+        let unused: Vec<_> = names.difference(&used).collect();
+        assert!(
+            unused.is_empty(),
+            "LogSite variants no throttle names: {unused:?}"
+        );
     }
 }

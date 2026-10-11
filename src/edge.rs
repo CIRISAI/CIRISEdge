@@ -5242,7 +5242,12 @@ static INBOUND_VERIFY_REJECT_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
 /// `source_key_id`). Keyed on transport id (a handful of values).
 fn inbound_unroutable_crpl_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_UNROUTABLE_CRPL_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::EdgeInboundUnroutableCrpl,
+            5,
+            std::time::Duration::from_secs(60),
+            16,
+        )
     })
 }
 
@@ -5256,7 +5261,12 @@ static BLOB_SCOPE_WITHHELD_LOG: std::sync::OnceLock<crate::log_throttle::LogThro
 
 fn blob_scope_withheld_log() -> &'static crate::log_throttle::LogThrottle {
     BLOB_SCOPE_WITHHELD_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(3, std::time::Duration::from_secs(300), 16)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::EdgeBlobScopeWithheld,
+            3,
+            std::time::Duration::from_secs(300),
+            16,
+        )
     })
 }
 
@@ -5267,7 +5277,12 @@ static CHUNK_REPLY_FALLBACK_LOG: std::sync::OnceLock<crate::log_throttle::LogThr
 /// took the durable queue instead. One label.
 fn chunk_reply_fallback_log() -> &'static crate::log_throttle::LogThrottle {
     CHUNK_REPLY_FALLBACK_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(1, std::time::Duration::from_secs(60), 4)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::EdgeChunkReplyFallback,
+            1,
+            std::time::Duration::from_secs(60),
+            4,
+        )
     })
 }
 
@@ -5275,7 +5290,12 @@ fn chunk_reply_fallback_log() -> &'static crate::log_throttle::LogThrottle {
 /// the verify-error class (a small closed set).
 fn inbound_verify_reject_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_VERIFY_REJECT_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 32)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::EdgeInboundVerifyReject,
+            5,
+            std::time::Duration::from_secs(60),
+            32,
+        )
     })
 }
 
@@ -5286,7 +5306,12 @@ static FIRST_CONTACT_REFUSAL_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
     std::sync::OnceLock::new();
 fn first_contact_refusal_log() -> &'static crate::log_throttle::LogThrottle {
     FIRST_CONTACT_REFUSAL_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::EdgeFirstContactRefusal,
+            5,
+            std::time::Duration::from_secs(60),
+            16,
+        )
     })
 }
 
@@ -5312,7 +5337,12 @@ static INBOUND_BOOTSTRAP_CARVEOUT_LOG: std::sync::OnceLock<crate::log_throttle::
 /// the true magnitude, the WARN just needs to name the peer + kind without flooding.
 fn inbound_backpressure_drop_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_BACKPRESSURE_DROP_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 256)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::EdgeInboundBackpressureDrop,
+            5,
+            std::time::Duration::from_secs(60),
+            256,
+        )
     })
 }
 
@@ -5325,7 +5355,12 @@ static INBOUND_REPLY_DROPPED_LOG: std::sync::OnceLock<crate::log_throttle::LogTh
 /// of a slow peer, so the WARN is throttled and the counter carries the count.
 fn inbound_reply_dropped_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_REPLY_DROPPED_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 256)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::EdgeInboundReplyDropped,
+            5,
+            std::time::Duration::from_secs(60),
+            256,
+        )
     })
 }
 
@@ -5333,7 +5368,12 @@ fn inbound_reply_dropped_log() -> &'static crate::log_throttle::LogThrottle {
 /// of values). Makes the previously-invisible hop VISIBLE at `ciris_edge=debug`.
 fn inbound_ingest_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_INGEST_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(8, std::time::Duration::from_secs(60), 16)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::EdgeInboundIngest,
+            8,
+            std::time::Duration::from_secs(60),
+            16,
+        )
     })
 }
 
@@ -5341,7 +5381,12 @@ fn inbound_ingest_log() -> &'static crate::log_throttle::LogThrottle {
 /// that was silent). Keyed on peer key_id (attacker-influenceable ⇒ capped map).
 fn inbound_routed_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_ROUTED_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(8, std::time::Duration::from_secs(60), 256)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::EdgeInboundRouted,
+            8,
+            std::time::Duration::from_secs(60),
+            256,
+        )
     })
 }
 
@@ -5351,7 +5396,12 @@ fn inbound_routed_log() -> &'static crate::log_throttle::LogThrottle {
 /// peer's multi-frame round doesn't flood; verification still gates at admission.
 fn inbound_bootstrap_carveout_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_BOOTSTRAP_CARVEOUT_LOG.get_or_init(|| {
-        crate::log_throttle::LogThrottle::new(5, std::time::Duration::from_secs(60), 16)
+        crate::log_throttle::LogThrottle::new(
+            crate::log_throttle::LogSite::EdgeInboundBootstrapCarveout,
+            5,
+            std::time::Duration::from_secs(60),
+            16,
+        )
     })
 }
 
