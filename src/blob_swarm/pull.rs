@@ -1185,6 +1185,24 @@ enum DagFetchStop {
     HashMismatch { got: [u8; 32] },
 }
 
+/// A DAG fetch a holder answered withdrawn, purged or revoked: the pull
+/// ends [`PullOutcome::Refused`] with NO retry booked, the disposition the
+/// whole-blob scheduler gives `GoneFederationWide`. Re-asking cannot help:
+/// every holder is bound by the same retraction.
+fn dag_gone(row: &Attestation, blob_hex: &str, what: &str, reason: &str) -> PullOutcome {
+    tracing::info!(
+        blob = %blob_hex,
+        attestation_id = %row.attestation_id,
+        what,
+        reason,
+        "DAG pull ended: the bytes are withdrawn, purged or revoked federation-wide — \
+         not retried, no other holder asked"
+    );
+    PullOutcome::Refused(format!(
+        "withdrawn or revoked federation-wide: {what}: {reason}"
+    ))
+}
+
 /// The declared-size check (CIRISEdge#638 item 2): the hash already matched,
 /// so a length that is not the declared one is the ROW misdescribing its
 /// bytes — refused, never adopted.
@@ -2354,9 +2372,7 @@ where
                     retrying: false,
                 }
             }
-            Err(DagFetchStop::Gone(reason)) => {
-                return self.dag_gone(row, &blob_hex, "blob", &reason)
-            }
+            Err(DagFetchStop::Gone(reason)) => return dag_gone(row, &blob_hex, "blob", &reason),
             Err(DagFetchStop::HashMismatch { got }) => {
                 return PullOutcome::Refused(format!(
                     "pull_inline_with: the fetched body hashes to {}, not {blob_hex}",
@@ -2609,24 +2625,6 @@ where
     }
 
     /// A fetch that did not arrive: booked for retry, named.
-    /// A DAG fetch a holder answered withdrawn, purged or revoked: the pull
-    /// ends [`PullOutcome::Refused`] with NO retry booked, the disposition the
-    /// whole-blob scheduler gives `GoneFederationWide`. Re-asking cannot help:
-    /// every holder is bound by the same retraction.
-    fn dag_gone(&self, row: &Attestation, blob_hex: &str, what: &str, reason: &str) -> PullOutcome {
-        tracing::info!(
-            blob = %blob_hex,
-            attestation_id = %row.attestation_id,
-            what,
-            reason,
-            "DAG pull ended: the bytes are withdrawn, purged or revoked federation-wide — \
-             not retried, no other holder asked"
-        );
-        PullOutcome::Refused(format!(
-            "withdrawn or revoked federation-wide: {what}: {reason}"
-        ))
-    }
-
     fn dag_fetch_failed(
         &self,
         row: &Attestation,
@@ -2716,7 +2714,7 @@ where
                     return self.dag_fetch_failed(row, sha, attempts, "manifest", &reason)
                 }
                 Err(DagFetchStop::Gone(reason)) => {
-                    return self.dag_gone(row, &blob_hex, "manifest", &reason)
+                    return dag_gone(row, &blob_hex, "manifest", &reason)
                 }
                 Err(DagFetchStop::HashMismatch { got }) => {
                     return self.dag_refused(
@@ -2985,7 +2983,7 @@ where
                                 &reason,
                             ))
                         }
-                        Err(LaneStop::Fetch(DagFetchStop::Gone(reason))) => Some(self.dag_gone(
+                        Err(LaneStop::Fetch(DagFetchStop::Gone(reason))) => Some(dag_gone(
                             row,
                             &blob_hex,
                             &format!("chunk seq {}", w.seq),
@@ -3237,7 +3235,7 @@ where
                 return self.dag_fetch_failed(row, sha, attempts, "manifest", &reason)
             }
             Err(DagFetchStop::Gone(reason)) => {
-                return self.dag_gone(row, &blob_hex, "manifest", &reason)
+                return dag_gone(row, &blob_hex, "manifest", &reason)
             }
             Err(DagFetchStop::HashMismatch { got }) => {
                 return self.dag_refused(
@@ -3298,7 +3296,7 @@ where
                     )
                 }
                 Err(DagFetchStop::Gone(reason)) => {
-                    return self.dag_gone(row, &blob_hex, &format!("chunk seq {seq}"), &reason)
+                    return dag_gone(row, &blob_hex, &format!("chunk seq {seq}"), &reason)
                 }
                 Err(DagFetchStop::HashMismatch { got }) => {
                     return self.dag_refused(
