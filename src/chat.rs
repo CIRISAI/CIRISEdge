@@ -1633,7 +1633,9 @@ impl UnopenedReason {
             E::NotGranted { .. } => Self::NotGranted { detail },
             E::ChunkKeyPending { .. } => Self::AwaitingKey { detail },
             E::Evicted { .. } => Self::Evicted { detail },
-            E::Withdrawn { .. } => Self::Withdrawn { detail },
+            // persist v54.1.0 — a purge withholds the bytes as a withdrawal
+            // does, and the reader's remedy is the same (none).
+            E::Withdrawn { .. } | E::Purged { .. } => Self::Withdrawn { detail },
             E::SealMismatch { .. } => Self::SealMismatch { detail },
             // CIRISEdge#737 — a range past the end is the file reader's to
             // name (`FileError::RangeNotSatisfiable`) before it reaches here;

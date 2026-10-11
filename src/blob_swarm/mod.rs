@@ -618,7 +618,15 @@ pub fn serve_result_to_chunk(
         // it to the wildcard below answered `PolicyDenied` — "this node HAS
         // the bytes and is declining" — and sent the peer hunting for bytes
         // every holder had been told to refuse.
-        Err(BlobError::Withdrawn { .. }) => Err(ChunkSourceRefusal::Withdrawn),
+        //
+        // persist v54.1.0 (Codex round 3 on CIRISPersist#1057) — `Purged`: a
+        // steward purge tombstoned these bytes (or every manifest a sealed-DAG
+        // chunk belongs to). Persist's own contract is Withdrawn's: never
+        // `NotHeld`, because every holder rooted at the same trust root is
+        // bound by the same purge. So it is the same abort word on the wire.
+        Err(BlobError::Withdrawn { .. } | BlobError::Purged { .. }) => {
+            Err(ChunkSourceRefusal::Withdrawn)
+        }
 
         // Capacity: clears when the host disk recovers, never on retry.
         Err(BlobError::DiskPressureProxyRefused { .. }) => Err(ChunkSourceRefusal::DiskPressure),
@@ -2094,6 +2102,14 @@ mod tests {
                 },
                 Err(ChunkSourceRefusal::Withdrawn),
             ),
+            // persist v54.1.0 — a purged blob is the same abort word.
+            (
+                BlobError::Purged {
+                    sha256_hex: sha.clone(),
+                    notice_id: "notice-1".into(),
+                },
+                Err(ChunkSourceRefusal::Withdrawn),
+            ),
         ];
 
         for (err, want) in cases {
@@ -2119,6 +2135,29 @@ mod tests {
             refusal.to_miss_reason(),
             crate::messages::MissReason::Withdrawn,
             "the peer is told to STOP hunting, not that this node is declining"
+        );
+    }
+
+    /// persist v54.1.0 (Codex round 3 on CIRISPersist#1057) — a
+    /// `BlobError::Purged` from the serve door reaches the peer as
+    /// `MissReason::Withdrawn`, the word both fetchers abort on
+    /// (`SwarmScheduler` → `GoneFederationWide`, the DAG `SwarmFetch` → no
+    /// next holder). Mapped to anything else it would read as "not here" or
+    /// "declining", and the fetcher would walk to the next holder, which the
+    /// same purge binds.
+    #[test]
+    fn a_purged_blob_from_the_persist_door_is_withdrawn_on_the_wire() {
+        use ciris_persist::federation::BlobError;
+        let refusal = serve_result_to_chunk(Err(BlobError::Purged {
+            sha256_hex: "ab".repeat(32),
+            notice_id: "purge-notice-1".into(),
+        }))
+        .expect_err("a purged blob is a refusal, not an absence");
+        assert_eq!(refusal, ChunkSourceRefusal::Withdrawn);
+        assert_eq!(
+            refusal.to_miss_reason(),
+            crate::messages::MissReason::Withdrawn,
+            "the peer is told to STOP hunting: another holder is bound by the same purge"
         );
     }
 

@@ -89,6 +89,18 @@ pub enum GroupContentError {
         /// The `withdraws` (or `recants`) that retired it.
         withdraws_id: String,
     },
+    /// persist v54.1.0 (Codex round 3 on CIRISPersist#1057) — a steward purge
+    /// tombstoned the bytes (or every manifest a sealed-DAG chunk belongs
+    /// to): withheld at every byte door from execution onward. Not
+    /// [`Self::NotHeld`] and not a substrate fault; a reader gets what a
+    /// [`Self::Withdrawn`] gets.
+    #[error("purged: {sha256_hex} — steward purge {notice_id} tombstoned it")]
+    Purged {
+        /// Hex at-rest sha the read targeted.
+        sha256_hex: String,
+        /// The purge notice whose tombstone withholds it.
+        notice_id: String,
+    },
     /// The bytes were swept by a retention sweep. persist distinguishes
     /// this from [`Self::NotHeld`] so an operator can tell "swept" from
     /// "wrong handle"; the remedy differs (there is none for swept).

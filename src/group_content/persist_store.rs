@@ -291,6 +291,13 @@ fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> Grou
             attestation_id: attestation_id.clone(),
             withdraws_id: withdraws_id.clone(),
         },
+        // persist v54.1.0 (Codex round 3 on CIRISPersist#1057): a steward
+        // purge withholds the bytes. Typed for the same reason as Withdrawn:
+        // never "not here", never a substrate fault.
+        B::Purged { notice_id, .. } => GroupContentError::Purged {
+            sha256_hex,
+            notice_id: notice_id.clone(),
+        },
         // CIRISEdge#737 — RFC 9110 §14.4 at the range door: typed, because
         // "you asked past the end" carries the size and is the caller's to
         // act on, never a substrate fault.
@@ -1056,6 +1063,36 @@ mod tests {
             }
             other => panic!("a withdrawn reference must be typed Withdrawn, got {other:?}"),
         }
+    }
+
+    /// persist v54.1.0 (Codex round 3 on CIRISPersist#1057) — a purged blob
+    /// is typed `Purged`, never `Substrate(..)` (the wildcard), and the
+    /// reader sees what a withdrawn one gets: `UnopenedReason::Withdrawn`.
+    #[test]
+    fn a_purged_blob_is_a_typed_answer_and_reads_as_withdrawn() {
+        use ciris_persist::federation::BlobError;
+        let e = BlobError::Purged {
+            sha256_hex: "cd".repeat(32),
+            notice_id: "purge-notice-9".into(),
+        };
+        let mapped = super::map_err("cd".repeat(32), &e);
+        match &mapped {
+            super::GroupContentError::Purged {
+                sha256_hex,
+                notice_id,
+            } => {
+                assert_eq!(sha256_hex, &"cd".repeat(32));
+                assert_eq!(notice_id, "purge-notice-9");
+            }
+            other => panic!("a purged blob must be typed Purged, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                crate::chat::UnopenedReason::from_store_error(&mapped),
+                crate::chat::UnopenedReason::Withdrawn { .. }
+            ),
+            "a reader gets the withdrawn answer for a purged blob"
+        );
     }
 
     use super::*;

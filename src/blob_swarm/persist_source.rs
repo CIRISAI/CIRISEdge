@@ -245,7 +245,10 @@ impl PersistBlobChunkSource {
                 };
             }
             // persist v53.1 (#979): the manifest itself is refused Withdrawn.
-            Err(BlobError::Withdrawn { .. }) => return DagMembership::Withdrawn,
+            // persist v54.1.0: a purged manifest is refused the same way.
+            Err(BlobError::Withdrawn { .. } | BlobError::Purged { .. }) => {
+                return DagMembership::Withdrawn
+            }
             // A sealed `chunk_dag` root serves as its inline envelope: the
             // legacy reading below.
             Ok(BlobBody::Inline(_)) => {}
@@ -346,7 +349,10 @@ impl PersistBlobChunkSource {
                     Ok(l) => l,
                     // The stream refuses through a link persist holds for it:
                     // the chunk's DAG is withdrawn. That IS the answer.
-                    Err(BlobError::Withdrawn { .. }) => return DagMembership::Withdrawn,
+                    // persist v54.1.0: a purge withholds it the same way.
+                    Err(BlobError::Withdrawn { .. } | BlobError::Purged { .. }) => {
+                        return DagMembership::Withdrawn
+                    }
                     Err(_) => continue,
                 };
                 if let Some(head) = &listing.stream {
