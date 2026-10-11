@@ -16,3 +16,4 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 5.3.2.4	CLM-nsproc-recipient-capability	CIRISEdge	src/replication/bridge.rs#recipient_capability_withholds	ciris-edge@v40.1.0
 5.3.2.4	CLM-nsproc-attestation-prefixes	CIRISEdge	src/replication/bridge.rs#recipient_capability_withholds	ciris-edge@v40.1.0
 5.4.6	CLM-scoped-body-identity-link	CIRISEdge	src/blob_swarm/scope.rs#choose_scoped_carrier	ciris-edge@v40.1.0
+3.1.4	CLM-capacity-relay-delivery	CIRISEdge	src/transport/realtime_av_alm/delivered.rs#CAPACITY_RELAY_DELIVERY_DIMENSION	ciris-edge@v40.1.0

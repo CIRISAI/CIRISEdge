@@ -123,17 +123,34 @@ pub struct ClaimConformance {
 }
 
 /// The transport-rule claims edge carries evidence for (CIRISEdge#718).
-pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[ClaimConformance {
-    cc: "5.4.6",
-    clm: "CLM-scoped-body-identity-link",
-    property:
-        "a scoped body rides the derived address at one hop and the identity-plane link only \
+pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[
+    ClaimConformance {
+        cc: "5.4.6",
+        clm: "CLM-scoped-body-identity-link",
+        property:
+            "a scoped body rides the derived address at one hop and the identity-plane link only \
                beyond it, chosen once from the path table; an in-link discriminator is admitted \
                against the same ScopeAddressTable and only for an address this node holds; a \
                discriminator on a derived-address arrival is a mismatch",
-    check: check_scoped_body_identity_link,
-    evidence: "src/blob_swarm/scope.rs#choose_scoped_carrier",
-}];
+        check: check_scoped_body_identity_link,
+        evidence: "src/blob_swarm/scope.rs#choose_scoped_carrier",
+    },
+    ClaimConformance {
+        // CIRISEdge#715 — the row v33.0.0 shipped the spelling for
+        // (CIRISConstitution#129, landed `651140a`).
+        cc: "3.1.4",
+        clm: "CLM-capacity-relay-delivery",
+        property: "the production relay-delivery dimension is the registered edge-owned leaf \
+               capacity:relay_delivery:v1 under the capacity: stem, admitted by persist's \
+               matcher as its own family (never capacity:composite); the emitted envelope \
+               names it; and persist's no-self-emit rule the emitter calls refuses a row \
+               whose attester is its subject (the relay) and admits a consumer's row about \
+               it. The analyze-consent gate is async and is witnessed by delivered.rs's \
+               emitter tests, not here",
+        check: check_capacity_relay_delivery,
+        evidence: "src/transport/realtime_av_alm/delivered.rs#CAPACITY_RELAY_DELIVERY_DIMENSION",
+    },
+];
 
 /// Every edge-tagged field edge does NOT process with a runtime value-check —
 /// each with the concrete upstream reason. Deferring is NOT skipping: the field
@@ -288,6 +305,69 @@ pub fn run_edge_field_conformance() -> Result<(), Vec<String>> {
 }
 
 // ─── the pure value-semantics checks ────────────────────────────────────────
+
+/// CIRISEdge#715 — `CLM-capacity-relay-delivery` (CC 3.1.4,
+/// CIRISConstitution#129), against the LIVE constant, envelope builder and
+/// the B1 gate [`emit_delivered_observation`] runs.
+///
+/// [`emit_delivered_observation`]: crate::transport::realtime_av_alm::emit_delivered_observation
+fn check_capacity_relay_delivery() -> Result<(), String> {
+    use crate::transport::realtime_av::{Epoch, StreamId};
+    use crate::transport::realtime_av_alm::{
+        delivery_envelope, DeliveredObservation, ObservationKey,
+        CAPACITY_RELAY_DELIVERY_DIMENSION as DIM,
+    };
+    use ciris_persist::federation::admission::check_capacity_not_self_attested;
+
+    const RELAY: &str = "ed25519:relay-node";
+    const CONSUMER: &str = "ed25519:consumer-node";
+
+    if DIM != "capacity:relay_delivery:v1" {
+        return Err(format!("the wire spelling moved: {DIM}"));
+    }
+    // The registered leaf, through the matcher persist's admission gate runs.
+    let m = ciris_persist::federation::namespace::matcher::match_family(DIM);
+    if let Some(refusal) = m.refusal {
+        return Err(format!(
+            "{DIM} is refused by the registry: {}",
+            refusal.as_str()
+        ));
+    }
+    match m.family {
+        Some("capacity:relay_delivery") => {}
+        other => {
+            return Err(format!(
+                "{DIM} matched family {other:?}, not capacity:relay_delivery"
+            ))
+        }
+    }
+
+    // The envelope the emitter signs names exactly this dimension.
+    let observation = DeliveredObservation {
+        key: ObservationKey {
+            advertiser_key_id: RELAY.to_owned(),
+            stream_id: StreamId([0x71; 32]),
+            epoch: Epoch(5),
+        },
+        claimed_uplink_mbps: 8,
+        delivered_bytes: 1_000_000,
+        delivered_chunks: 10,
+        window_start_unix_ms: 1_000,
+        window_end_unix_ms: 2_000,
+    };
+    if delivery_envelope(&observation)["dimension"] != DIM {
+        return Err("the emitted envelope does not name the registered dimension".into());
+    }
+
+    // B1 / AV-62: subject = the relay, attester = the consumer; never self.
+    if check_capacity_not_self_attested(Some(DIM), RELAY, RELAY).is_ok() {
+        return Err("a relay's row about itself must be refused (no-self-emit)".into());
+    }
+    if let Err(e) = check_capacity_not_self_attested(Some(DIM), CONSUMER, RELAY) {
+        return Err(format!("a consumer's row about the relay must admit: {e}"));
+    }
+    Ok(())
+}
 
 /// CIRISEdge#718 — `CLM-scoped-body-identity-link` (CC 5.4.6 at `4fd2e9e`,
 /// CIRISConstitution#132), against the LIVE decision and admission functions.
