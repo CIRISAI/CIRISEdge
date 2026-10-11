@@ -1607,6 +1607,43 @@ enum QuarantineConsult {
     ReadError,
 }
 
+/// CIRISEdge#820 P1 — one advertise sweep's pages and rows, recorded on the
+/// bag once, when the sweep ends however it ends (`Drop`: every `return`, and
+/// a cancelled sweep's partial read). Two integer adds per page; one bag
+/// write per sweep.
+struct SweepTally<'a> {
+    metrics: Option<&'a crate::observability::EdgeMetrics>,
+    kind: EnvelopeKind,
+    pages: u64,
+    rows: u64,
+}
+
+impl<'a> SweepTally<'a> {
+    fn new(metrics: Option<&'a crate::observability::EdgeMetrics>, kind: EnvelopeKind) -> Self {
+        Self {
+            metrics,
+            kind,
+            pages: 0,
+            rows: 0,
+        }
+    }
+
+    fn page(&mut self, rows: usize) {
+        self.pages = self.pages.saturating_add(1);
+        self.rows = self
+            .rows
+            .saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
+    }
+}
+
+impl Drop for SweepTally<'_> {
+    fn drop(&mut self) {
+        if let Some(m) = self.metrics {
+            m.observe_sweep(self.kind, self.pages, self.rows);
+        }
+    }
+}
+
 // ─── The bridge ──────────────────────────────────────────────────────
 
 /// Throttle for the rate-limit denial WARN. A denied peer keeps sending, so
@@ -2435,7 +2472,12 @@ impl FederationDirectoryReplicationBridge {
                 .as_deref()
                 .or(self.local_key_id.as_deref()),
         ) {
-            self.serve_tier.refresh_if_stale(resolver, subject).await;
+            // CIRISEdge#820 P1 — time the trust walk only when one ran.
+            if let Some(walked) = self.serve_tier.refresh_if_stale(resolver, subject).await {
+                if let Some(m) = &self.metrics {
+                    m.observe_serve_tier_refresh(walked);
+                }
+            }
         }
     }
 
@@ -2995,6 +3037,9 @@ impl FederationDirectoryReplicationBridge {
         let budget = self.sweep_page_budget().await;
         let mut refs = Vec::new();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        // CIRISEdge#820 P1 — pages and rows this sweep read, recorded once on
+        // every exit (and on cancellation) by the guard's `Drop`.
+        let mut tally = SweepTally::new(self.metrics.as_ref(), kind);
         let Some(key) = Self::watermark_key(window, kind) else {
             // ── FULL drain: page for MEMORY, keep every page's refs. ──
             let mut since: Option<ResumeCursor> = None;
@@ -3003,6 +3048,7 @@ impl FederationDirectoryReplicationBridge {
                     let _permit = self.sweep_gate.enter().await;
                     let rows = read(since.clone(), budget).await;
                     self.record_page(rows.len());
+                    tally.page(rows.len());
                     let mask = self.page_mask(kind, &rows, &in_scope, &mut gate).await;
                     self.advertise_page_into(
                         &rows,
@@ -3056,6 +3102,7 @@ impl FederationDirectoryReplicationBridge {
             let _permit = self.sweep_gate.enter().await;
             let rows = read(head, budget).await;
             self.record_page(rows.len());
+            tally.page(rows.len());
             let mask = self.page_mask(kind, &rows, &in_scope, &mut gate).await;
             self.advertise_page_into(
                 &rows,
@@ -3073,6 +3120,7 @@ impl FederationDirectoryReplicationBridge {
                 let _permit = self.sweep_gate.enter().await;
                 let rows = read(plan.since, plan.budget).await;
                 self.record_page(rows.len());
+                tally.page(rows.len());
                 let mask = self.page_mask(kind, &rows, &in_scope, &mut gate).await;
                 self.advertise_page_into(
                     &rows,
@@ -7303,7 +7351,27 @@ impl FederationDirectoryReplicationBridge {
             && self.may_receive_cached(att, peer, memo).await == Verdict::Yes(Reason::RefersTo)
     }
 
+    /// CIRISEdge#820 P1 — [`Self::resolve_attestation_recipient_untimed`],
+    /// timed into `peer_resolve_seconds` by outcome. Per peer per round on
+    /// the attestation plane: one `Instant` pair and one bag write beside
+    /// the persist reads the resolution makes.
     async fn resolve_attestation_recipient(&self, peer: &str) -> Option<ResolvedRecipient> {
+        let started = std::time::Instant::now();
+        let resolved = self.resolve_attestation_recipient_untimed(peer).await;
+        if let Some(m) = &self.metrics {
+            m.observe_peer_resolve(
+                if resolved.is_some() {
+                    crate::observability::PeerResolveOutcome::Resolved
+                } else {
+                    crate::observability::PeerResolveOutcome::Withheld
+                },
+                started.elapsed(),
+            );
+        }
+        resolved
+    }
+
+    async fn resolve_attestation_recipient_untimed(&self, peer: &str) -> Option<ResolvedRecipient> {
         use crate::observability::WithholdReason;
         // CIRISEdge#524 — every withhold on this path names the peer it
         // evaluated, including the one the field measured as `peer=` empty.

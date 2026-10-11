@@ -998,12 +998,12 @@ pub const RESPONDER_ROUND_OUTCOMES: [&str; 5] = [
 
 /// CIRISEdge#853 — `responder_link_up_seconds` stage: the dialer's link-borne
 /// build-attestation bundle (`CBND`, #436) taken in and verified.
-pub const LINK_UP_STAGE_BUNDLE_GATE: &str = "bundle_gate";
+pub const LINK_UP_STAGE_BUNDLE_GATE: &str = LinkUpStage::BundleGate.as_str();
 /// CIRISEdge#853 — stage: the dialer's link-borne announce (`CANN`, #627)
 /// taken in.
-pub const LINK_UP_STAGE_ANNOUNCE_INTAKE: &str = "announce_intake";
+pub const LINK_UP_STAGE_ANNOUNCE_INTAKE: &str = LinkUpStage::AnnounceIntake.as_str();
 /// CIRISEdge#853 — stage: the dialer's owner binding (#727) admitted.
-pub const LINK_UP_STAGE_OWNER_BINDING: &str = "owner_binding";
+pub const LINK_UP_STAGE_OWNER_BINDING: &str = LinkUpStage::OwnerBinding.as_str();
 /// CIRISEdge#853 — `responder_link_up_total` outcome: the link-up work ended
 /// and the link carried its first application frame.
 pub const LINK_UP_OK: &str = "ok";
@@ -1106,6 +1106,57 @@ impl InboundDropReason {
     }
 }
 
+/// CIRISEdge#820 P1 — a responder link-up stage: the closed `stage` label of
+/// `responder_link_up_seconds`. The `LINK_UP_STAGE_*` consts are its tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinkUpStage {
+    /// The CBND build-attestation bundle gate.
+    BundleGate,
+    /// The link-borne announce's intake.
+    AnnounceIntake,
+    /// The owner-binding exchange.
+    OwnerBinding,
+}
+
+impl LinkUpStage {
+    /// Every stage, in token order.
+    pub const ALL: &'static [Self] = &[Self::BundleGate, Self::AnnounceIntake, Self::OwnerBinding];
+
+    /// The stable `stage` label token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BundleGate => "bundle_gate",
+            Self::AnnounceIntake => "announce_intake",
+            Self::OwnerBinding => "owner_binding",
+        }
+    }
+}
+
+/// CIRISEdge#820 P1 — how a peer resolution ended: the closed `outcome` label
+/// of `peer_resolve_seconds`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PeerResolveOutcome {
+    /// The peer resolved to a recipient.
+    Resolved,
+    /// The peer was withheld (it gets nothing this round).
+    Withheld,
+}
+
+impl PeerResolveOutcome {
+    /// Every outcome, in token order.
+    pub const ALL: &'static [Self] = &[Self::Resolved, Self::Withheld];
+
+    /// The stable `outcome` label token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::Withheld => "withheld",
+        }
+    }
+}
+
 /// CIRISEdge#853 — how long a responder's link-up may run before it counts
 /// as `timeout`: the dialer's own establish-and-identify window.
 pub const RESPONDER_LINK_UP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1137,6 +1188,32 @@ pub const SWEEP_PERMIT_WAIT_BUCKETS_SECONDS: &[f64] = &[0.01, 0.1, 1.0, 5.0, 30.
 
 /// The exported name of the advertise-sweep permit-wait histogram.
 pub const SWEEP_PERMIT_WAIT_METRIC: &str = "edge_sweep_permit_wait_seconds";
+
+/// CIRISEdge#820 P1 — the upper bounds of
+/// [`EdgeMetrics::sweep_pages`]: pages one advertise sweep read. The last
+/// finite bound is the full drain's page cap (4096), so `+Inf` is empty unless
+/// that cap moves.
+pub const SWEEP_PAGES_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 64.0, 256.0, 1024.0, 4096.0];
+/// CIRISEdge#820 P1 — the upper bounds of [`EdgeMetrics::sweep_rows`]: rows
+/// one advertise sweep read (every row read, in scope or not). `0` is its own
+/// bucket: a sweep that read nothing is a signal.
+pub const SWEEP_ROWS_BUCKETS: &[f64] = &[
+    0.0,
+    16.0,
+    128.0,
+    1_024.0,
+    8_192.0,
+    65_536.0,
+    524_288.0,
+    4_194_304.0,
+];
+/// CIRISEdge#820 P1 — the upper bounds, in seconds, of
+/// [`EdgeMetrics::peer_resolve_seconds`]: one peer's attestation-recipient
+/// resolution (its consent send-set, rooting and serve gate).
+pub const PEER_RESOLVE_BUCKETS_SECONDS: &[f64] = &[0.001, 0.005, 0.025, 0.1, 0.5, 2.5, 10.0];
+/// CIRISEdge#820 P1 — the upper bounds, in seconds, of
+/// [`EdgeMetrics::serve_tier_refresh_seconds`]: one serve-tier trust walk.
+pub const SERVE_TIER_REFRESH_BUCKETS_SECONDS: &[f64] = &[0.001, 0.01, 0.1, 1.0, 5.0, 30.0];
 
 /// A fixed-bucket duration histogram: one counter per bucket plus a `+Inf`
 /// bucket, a count and an exact nanosecond sum. No histogram crate — the
@@ -1189,11 +1266,64 @@ impl FixedHistogram {
             cumulative,
             count: running,
             sum_seconds,
+            unit: HISTOGRAM_UNIT_SECONDS,
         }
     }
 }
 
-/// Snapshot of one [`FixedHistogram`].
+/// A [`HistogramSnapshot`] of durations: bounds and sum in seconds.
+pub const HISTOGRAM_UNIT_SECONDS: &str = "seconds";
+/// A [`HistogramSnapshot`] of counts (pages, rows): bounds and sum are counts.
+pub const HISTOGRAM_UNIT_COUNT: &str = "count";
+
+/// CIRISEdge#820 P1 — a fixed-bucket histogram of COUNTS (pages, rows): one
+/// counter per bucket plus `+Inf`, a count and an exact sum. Same `le`
+/// semantics as [`FixedHistogram`]; memory is `bounds.len() + 2` words,
+/// whatever the traffic. Snapshots into a [`HistogramSnapshot`] whose
+/// `sum_seconds` carries the sum of the counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CountHistogram {
+    /// NON-cumulative per-bucket counts; the last entry is `+Inf`.
+    counts: Vec<u64>,
+    /// Exact sum of every observation (saturating).
+    sum: u64,
+}
+
+impl CountHistogram {
+    /// Record one observation `v` against `bounds` (ascending).
+    pub fn observe(&mut self, bounds: &[f64], v: u64) {
+        if self.counts.len() != bounds.len() + 1 {
+            self.counts.resize(bounds.len() + 1, 0);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let x = v as f64;
+        let idx = bounds.iter().position(|b| x <= *b).unwrap_or(bounds.len());
+        self.counts[idx] = self.counts[idx].saturating_add(1);
+        self.sum = self.sum.saturating_add(v);
+    }
+
+    /// The point-in-time projection, CUMULATIVE as an exporter emits it.
+    #[must_use]
+    pub fn snapshot(&self, bounds: &'static [f64]) -> HistogramSnapshot {
+        let mut cumulative = Vec::with_capacity(bounds.len() + 1);
+        let mut running = 0u64;
+        for i in 0..=bounds.len() {
+            running = running.saturating_add(self.counts.get(i).copied().unwrap_or(0));
+            cumulative.push(running);
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let sum = self.sum as f64;
+        HistogramSnapshot {
+            bounds,
+            cumulative,
+            count: running,
+            sum_seconds: sum,
+            unit: HISTOGRAM_UNIT_COUNT,
+        }
+    }
+}
+
+/// Snapshot of one [`FixedHistogram`] (or [`CountHistogram`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HistogramSnapshot {
     /// The finite upper bounds, seconds, ascending.
@@ -1204,8 +1334,14 @@ pub struct HistogramSnapshot {
     pub cumulative: Vec<u64>,
     /// Number of observations (`_count`).
     pub count: u64,
-    /// Sum of every observation in seconds (`_sum`).
+    /// Sum of every observation (`_sum`), in the histogram's unit: seconds
+    /// for every `*_seconds` histogram, the summed count for a
+    /// [`CountHistogram`] (`sweep_pages`, `sweep_rows`). [`Self::unit`] says
+    /// which; the name stays for the bindings.
     pub sum_seconds: f64,
+    /// CIRISEdge#820 P1 — what the bounds and `sum_seconds` measure:
+    /// [`HISTOGRAM_UNIT_SECONDS`] or [`HISTOGRAM_UNIT_COUNT`].
+    pub unit: &'static str,
 }
 
 impl HistogramSnapshot {
@@ -1664,6 +1800,20 @@ pub struct EdgeMetrics {
     /// dialled to the end of that stage's intake. Buckets:
     /// [`RESPONDER_LINK_UP_BUCKETS_SECONDS`].
     pub responder_link_up_seconds: Arc<RwLock<HashMap<&'static str, FixedHistogram>>>,
+    /// CIRISEdge#820 P1 — pages one advertise sweep read, per plane. Buckets:
+    /// [`SWEEP_PAGES_BUCKETS`].
+    pub sweep_pages: Arc<RwLock<HashMap<EnvelopeKind, CountHistogram>>>,
+    /// CIRISEdge#820 P1 — rows one advertise sweep read, per plane. Buckets:
+    /// [`SWEEP_ROWS_BUCKETS`].
+    pub sweep_rows: Arc<RwLock<HashMap<EnvelopeKind, CountHistogram>>>,
+    /// CIRISEdge#820 P1 — one peer's attestation-recipient resolution, by
+    /// outcome ([`PeerResolveOutcome`]). Buckets:
+    /// [`PEER_RESOLVE_BUCKETS_SECONDS`].
+    pub peer_resolve_seconds: Arc<RwLock<HashMap<&'static str, FixedHistogram>>>,
+    /// CIRISEdge#820 P1 — one serve-tier trust walk (a stale-cache refresh;
+    /// a fresh cache records nothing). Buckets:
+    /// [`SERVE_TIER_REFRESH_BUCKETS_SECONDS`].
+    pub serve_tier_refresh_seconds: Arc<RwLock<FixedHistogram>>,
     /// CIRISEdge#853 — responder link-ups by outcome ([`LINK_UP_OUTCOMES`]).
     pub responder_link_up_total: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#853 — link-ups in progress: link id → when it established.
@@ -2470,18 +2620,18 @@ impl EdgeMetrics {
     /// CIRISEdge#853 — a link-up `stage` (a `LINK_UP_STAGE_*` token) finished
     /// on `link`: record the time since its link-up began. A link not being
     /// timed (one this node dialled, or past the tracker's cap) records nothing.
-    pub fn responder_link_up_stage(&self, link: [u8; 16], stage: &'static str) {
+    pub fn responder_link_up_stage(&self, link: [u8; 16], stage: LinkUpStage) {
         let Some(at) = self.responder_link_up_pending.read().get(&link).copied() else {
             return;
         };
         self.responder_link_up_seconds
             .write()
-            .entry(stage)
+            .entry(stage.as_str())
             .or_default()
             .observe(RESPONDER_LINK_UP_BUCKETS_SECONDS, at.elapsed());
         crate::telemetry_catalog::record_histogram(
             crate::telemetry_catalog::RESPONDER_LINK_UP_DURATION,
-            &[stage],
+            &[stage.as_str()],
             at.elapsed().as_secs_f64(),
         );
     }
@@ -2548,10 +2698,69 @@ impl EdgeMetrics {
         );
     }
 
+    /// CIRISEdge#820 P1 — one advertise sweep of `kind` read `pages` pages
+    /// holding `rows` rows. Once per sweep, not per page or row.
+    // The facade records f64; page and row counts are far below 2^52.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn observe_sweep(&self, kind: EnvelopeKind, pages: u64, rows: u64) {
+        self.sweep_pages
+            .write()
+            .entry(kind)
+            .or_default()
+            .observe(SWEEP_PAGES_BUCKETS, pages);
+        self.sweep_rows
+            .write()
+            .entry(kind)
+            .or_default()
+            .observe(SWEEP_ROWS_BUCKETS, rows);
+        crate::telemetry_catalog::record_histogram(
+            crate::telemetry_catalog::SWEEP_PAGES,
+            &[kind.as_wire_str()],
+            pages as f64,
+        );
+        crate::telemetry_catalog::record_histogram(
+            crate::telemetry_catalog::SWEEP_ROWS,
+            &[kind.as_wire_str()],
+            rows as f64,
+        );
+    }
+
+    /// CIRISEdge#820 P1 — one peer resolution took `d` and ended `outcome`.
+    pub fn observe_peer_resolve(&self, outcome: PeerResolveOutcome, d: std::time::Duration) {
+        self.peer_resolve_seconds
+            .write()
+            .entry(outcome.as_str())
+            .or_default()
+            .observe(PEER_RESOLVE_BUCKETS_SECONDS, d);
+        crate::telemetry_catalog::record_histogram(
+            crate::telemetry_catalog::PEER_RESOLVE,
+            &[outcome.as_str()],
+            d.as_secs_f64(),
+        );
+    }
+
+    /// CIRISEdge#820 P1 — one serve-tier trust walk took `d`.
+    pub fn observe_serve_tier_refresh(&self, d: std::time::Duration) {
+        self.serve_tier_refresh_seconds
+            .write()
+            .observe(SERVE_TIER_REFRESH_BUCKETS_SECONDS, d);
+        crate::telemetry_catalog::record_histogram(
+            crate::telemetry_catalog::SERVE_TIER_REFRESH,
+            &[],
+            d.as_secs_f64(),
+        );
+    }
+
     /// CIRISEdge#820 — publish this bag's counters and gauges through the
     /// `metrics` facade ([`crate::telemetry_catalog::publish_bundle`]), from
     /// the same [`Self::snapshot`] the bindings read. Call it on the scrape
     /// cadence; with no recorder installed it records nothing.
+    ///
+    /// HISTOGRAMS ARE NOT PULLED. A facade histogram takes samples, not bucket
+    /// counts, so every histogram is recorded at OBSERVE time, by the bag
+    /// method that takes the sample (`observe_round_duration`,
+    /// `observe_sweep`, …), into whatever recorder is installed then. This
+    /// call publishes counters and gauges only.
     ///
     /// The facade identifies a series by name and labels only, so two
     /// `EdgeMetrics` bags publishing to ONE global recorder write the SAME
@@ -2732,6 +2941,28 @@ impl EdgeMetrics {
             recovered_links_total: self.recovered_links_total(),
             unclaimed_ship_refused_total: self.unclaimed_ship_refused_total(),
             log_suppressed: crate::log_throttle::suppressed_counts(),
+            sweep_pages: self
+                .sweep_pages
+                .read()
+                .iter()
+                .map(|(k, h)| (*k, h.snapshot(SWEEP_PAGES_BUCKETS)))
+                .collect(),
+            sweep_rows: self
+                .sweep_rows
+                .read()
+                .iter()
+                .map(|(k, h)| (*k, h.snapshot(SWEEP_ROWS_BUCKETS)))
+                .collect(),
+            peer_resolve_seconds: self
+                .peer_resolve_seconds
+                .read()
+                .iter()
+                .map(|(o, h)| ((*o).to_string(), h.snapshot(PEER_RESOLVE_BUCKETS_SECONDS)))
+                .collect(),
+            serve_tier_refresh_seconds: self
+                .serve_tier_refresh_seconds
+                .read()
+                .snapshot(SERVE_TIER_REFRESH_BUCKETS_SECONDS),
         }
     }
 }
@@ -3059,6 +3290,17 @@ pub struct EdgeMetricsBundle {
     /// are process-global): never reset per `Edge` or per fold, so a host
     /// reads it as a monotonic counter (`rate`), not a per-fold total.
     pub log_suppressed: HashMap<String, u64>,
+    /// CIRISEdge#820 P1 — pages per advertise sweep, by plane (a count
+    /// histogram: `sum_seconds` is the summed page count).
+    pub sweep_pages: HashMap<EnvelopeKind, HistogramSnapshot>,
+    /// CIRISEdge#820 P1 — rows per advertise sweep, by plane (a count
+    /// histogram).
+    pub sweep_rows: HashMap<EnvelopeKind, HistogramSnapshot>,
+    /// CIRISEdge#820 P1 — peer attestation-recipient resolution latency, by
+    /// outcome.
+    pub peer_resolve_seconds: HashMap<String, HistogramSnapshot>,
+    /// CIRISEdge#820 P1 — serve-tier trust-walk latency.
+    pub serve_tier_refresh_seconds: HistogramSnapshot,
 }
 
 /// CIRISEdge P0 telemetry — an [`EdgeMetricsBundle`] flattened to two
@@ -3097,6 +3339,9 @@ impl FlatMetrics {
         }
         self.counters.insert(format!("{prefix}.count"), h.count);
         self.gauges.insert(format!("{prefix}.sum"), h.sum_seconds);
+        // CIRISEdge#820 P1 — the unit, as a flat marker key (`1`): a u64 map
+        // carries no string, and a count histogram's `.sum` is not seconds.
+        self.counters.insert(format!("{prefix}.unit.{}", h.unit), 1);
     }
 }
 
@@ -3363,6 +3608,35 @@ impl EdgeMetricsBundle {
         );
         // CIRISEdge#820 — log lines suppressed, per throttle site.
         f.family("log_suppressed", &self.log_suppressed);
+        // CIRISEdge#820 P1 — the sweep, resolve and serve-tier histograms:
+        // `<field>.<label>.bucket.<le>` / `.count` / gauge `.sum`; the bare
+        // key is the total observation count.
+        for (name, by_kind) in [
+            ("sweep_pages", &self.sweep_pages),
+            ("sweep_rows", &self.sweep_rows),
+        ] {
+            let mut n = 0u64;
+            for (kind, h) in by_kind {
+                n = n.saturating_add(h.count);
+                f.histogram(&format!("{name}.{}", kind.as_wire_str()), h);
+            }
+            f.counters.insert(name.to_string(), n);
+        }
+        let mut resolves = 0u64;
+        for (outcome, h) in &self.peer_resolve_seconds {
+            resolves = resolves.saturating_add(h.count);
+            f.histogram(&format!("peer_resolve_seconds.{outcome}"), h);
+        }
+        f.counters
+            .insert("peer_resolve_seconds".to_string(), resolves);
+        f.histogram(
+            "serve_tier_refresh_seconds",
+            &self.serve_tier_refresh_seconds,
+        );
+        f.counters.insert(
+            "serve_tier_refresh_seconds".to_string(),
+            self.serve_tier_refresh_seconds.count,
+        );
         // CIRISEdge#858 — the refusal memory's park ledger.
         f.family(
             "rows_parked_on_signer",
@@ -3484,6 +3758,10 @@ edge_metrics_bundle_fields!(
     recovered_links_total,
     unclaimed_ship_refused_total,
     log_suppressed,
+    sweep_pages,
+    sweep_rows,
+    peer_resolve_seconds,
+    serve_tier_refresh_seconds,
 );
 
 #[cfg(test)]
@@ -3794,14 +4072,51 @@ mod p0_telemetry_tests {
     //! CIRISEdge P0 telemetry (CIRISServer `FSD/UNIFIED_TELEMETRY.md` §4):
     //! the two duration histograms and the flat projection's parity.
     use super::{
-        EdgeMetrics, EdgeMetricsBundle, EDGE_METRICS_BUNDLE_FIELDS,
+        CountHistogram, EdgeMetrics, EdgeMetricsBundle, EDGE_METRICS_BUNDLE_FIELDS,
         REPLICATION_ROUND_DURATION_BUCKETS_SECONDS, SWEEP_PERMIT_WAIT_BUCKETS_SECONDS,
+        SWEEP_ROWS_BUCKETS,
     };
     use crate::replication::EnvelopeKind;
     use std::time::Duration;
 
     /// Known round durations land in the right `le` buckets (cumulative),
     /// the count and the exact sum, per kind, and reach the snapshot.
+    /// CIRISEdge#820 P1 — a count histogram buckets by `le` (a value equal to
+    /// a bound lands in that bound's bucket), keeps 0 in its own bucket,
+    /// overflows to `+Inf`, and sums the raw counts.
+    #[test]
+    fn count_histogram_buckets_by_le_and_sums_counts() {
+        let mut h = CountHistogram::default();
+        for v in [0, 16, 17, 5_000_000] {
+            h.observe(SWEEP_ROWS_BUCKETS, v);
+        }
+        let s = h.snapshot(SWEEP_ROWS_BUCKETS);
+        assert_eq!(s.count, 4);
+        assert_eq!(
+            s.unit,
+            super::HISTOGRAM_UNIT_COUNT,
+            "a count histogram says so"
+        );
+        assert_eq!(
+            EdgeMetrics::new().snapshot().sweep_permit_wait_seconds.unit,
+            super::HISTOGRAM_UNIT_SECONDS
+        );
+        assert_eq!(s.cumulative[0], 1, "0 is its own bucket");
+        assert_eq!(s.cumulative[1], 2, "16 lands in le=16");
+        assert_eq!(s.cumulative[2], 3, "17 lands in le=128");
+        assert_eq!(*s.cumulative.last().unwrap(), 4, "+Inf holds everything");
+        assert_eq!(
+            s.cumulative[SWEEP_ROWS_BUCKETS.len() - 1],
+            3,
+            "5,000,000 overflows the last finite bound"
+        );
+        assert!(
+            (s.sum_seconds - 5_000_033.0).abs() < 0.5,
+            "{}",
+            s.sum_seconds
+        );
+    }
+
     #[test]
     fn round_durations_land_in_their_buckets_per_kind() {
         let m = EdgeMetrics::new();
@@ -3977,8 +4292,8 @@ mod responder_telemetry_853_tests {
         let m = EdgeMetrics::new();
         let link = [7u8; 16];
         m.responder_link_up_begin(link);
-        m.responder_link_up_stage(link, super::LINK_UP_STAGE_ANNOUNCE_INTAKE);
-        m.responder_link_up_stage([9u8; 16], super::LINK_UP_STAGE_BUNDLE_GATE);
+        m.responder_link_up_stage(link, super::LinkUpStage::AnnounceIntake);
+        m.responder_link_up_stage([9u8; 16], super::LinkUpStage::BundleGate);
         m.responder_link_up_end(link, super::LINK_UP_OK);
         m.responder_link_up_end(link, super::LINK_UP_OK);
         let stages = m.responder_link_up_seconds();

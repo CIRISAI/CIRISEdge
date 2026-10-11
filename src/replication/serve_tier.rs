@@ -297,9 +297,17 @@ impl CachedServeTier {
     /// Re-resolve through `resolver` if the cache is stale. Concurrent callers
     /// may race to refresh; the result is idempotent and the extra walk is
     /// bounded by TTL, so no lock is held across the await.
-    pub async fn refresh_if_stale(&self, resolver: &dyn ServeTierResolver, subject_key_id: &str) {
+    ///
+    /// CIRISEdge#820 P1 — returns how long the trust walk took when this call
+    /// walked, `None` when the cache was fresh (or another caller's walk
+    /// refreshed it while this one queued).
+    pub async fn refresh_if_stale(
+        &self,
+        resolver: &dyn ServeTierResolver,
+        subject_key_id: &str,
+    ) -> Option<std::time::Duration> {
         if self.is_fresh() {
-            return;
+            return None;
         }
         // SINGLE-FLIGHT. One walk per window, and the last writer is the one
         // that started last — without this, a refresh begun against older state
@@ -309,9 +317,11 @@ impl CachedServeTier {
         // Re-check under the gate: a caller that queued behind the walk we were
         // waiting on has nothing to do.
         if self.is_fresh() {
-            return;
+            return None;
         }
+        let started = std::time::Instant::now();
         let tier = resolver.resolve(subject_key_id).await;
+        let walked = started.elapsed();
         let prev = self.read();
         if tier != prev {
             tracing::info!(
@@ -321,6 +331,7 @@ impl CachedServeTier {
             );
         }
         self.store(tier);
+        Some(walked)
     }
 }
 

@@ -10001,7 +10001,7 @@ async fn attribute_and_deliver(
         if let Some(m) = ctx.metrics {
             m.responder_link_up_stage(
                 link_id.into_bytes(),
-                crate::observability::LINK_UP_STAGE_ANNOUNCE_INTAKE,
+                crate::observability::LinkUpStage::AnnounceIntake,
             );
         }
         // choke-ok: consumed as a transport control frame; every refusal
@@ -10013,7 +10013,7 @@ async fn attribute_and_deliver(
         if let Some(m) = ctx.metrics {
             m.responder_link_up_stage(
                 link_id.into_bytes(),
-                crate::observability::LINK_UP_STAGE_BUNDLE_GATE,
+                crate::observability::LinkUpStage::BundleGate,
             );
         }
         // choke-ok: consumed as a transport control frame, not a drop — every
@@ -12710,7 +12710,7 @@ async fn handle_peer_bundle_frame(
             if let Some(m) = ctx.metrics {
                 m.responder_link_up_stage(
                     link_id.into_bytes(),
-                    crate::observability::LINK_UP_STAGE_BUNDLE_GATE,
+                    crate::observability::LinkUpStage::BundleGate,
                 );
                 m.responder_link_up_end(
                     link_id.into_bytes(),
@@ -17765,7 +17765,7 @@ mod scope_native_addressing_tests {
         // …and the carve-out records its stage, then ends the link-up.
         m.responder_link_up_stage(
             sibling.into_bytes(),
-            crate::observability::LINK_UP_STAGE_OWNER_BINDING,
+            crate::observability::LinkUpStage::OwnerBinding,
         );
         m.responder_link_up_end(sibling.into_bytes(), crate::observability::LINK_UP_OK);
         // An attributed peer's first frame ends its link-up at the transport.

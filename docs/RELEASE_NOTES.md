@@ -49,6 +49,29 @@ facade (the minor leviculum already pulls; exactly one `metrics` in the graph, g
   takes an `InboundDropReason`; new `log_throttle::{LogSite, suppressed_counts}`,
   `observability::InboundDropReason`, bundle field `log_suppressed`.
 
+- **P1 histograms (P1c).** Four new histograms, each a bounded fixed-bucket histogram in the
+  `EdgeMetrics` bag (bundle + both bindings) whose samples are also recorded to the facade at the
+  bag's observe method:
+  - `ciris.edge.sweep.pages{kind}` and `ciris.edge.sweep.rows{kind}`: pages and rows one advertise
+    sweep read (count histograms; bundle `sweep_pages` / `sweep_rows`, whose `sum_seconds` is the
+    summed count). Recorded once per sweep on every exit, a cancelled sweep's partial read
+    included.
+  - `ciris.edge.replication.peer_resolve.duration{outcome=resolved|withheld}`: one peer's
+    attestation-recipient resolution (bundle `peer_resolve_seconds`).
+  - `ciris.edge.replication.serve_tier.refresh.duration`: one serve-tier trust walk, recorded only
+    when the cache was stale and a walk ran (bundle `serve_tier_refresh_seconds`).
+  `CachedServeTier::refresh_if_stale` now returns the walk's duration (`None` when fresh).
+  `HistogramSnapshot` gains `unit` (`"seconds"` / `"count"`), carried to PyO3 (`"unit"` in each
+  histogram dict) and UniFFI (a `<histogram>.unit.<unit>` = 1 marker key): `sum_seconds` keeps its
+  name for the bindings, and for a count histogram it holds the summed count. Histogram labels are
+  closed enums only: `EdgeMetrics::responder_link_up_stage` takes a `LinkUpStage` (the
+  `LINK_UP_STAGE_*` consts remain as its tokens), `observe_peer_resolve` a `PeerResolveOutcome`,
+  and `record_histogram` takes `&'static str` label values; a gate holds every call to
+  `<enum>.as_str()` values and pins the untimed resolution and the serve-tier walk to their timed
+  callers.
+  `Edge::publish_metrics` carries no histograms: the facade takes samples, so histograms are
+  recorded at their sites; the host builds the histogram from the samples.
+
 **Planned for the next MAJOR (wire-visible to the server, not in this cut):**
 - Once the server serves `/metrics` from its recorder (its P1), the `EdgeMetricsBundle` keys the
   bindings return (`metrics_snapshot()` / UniFFI `metrics_snapshot`) retire in favour of the

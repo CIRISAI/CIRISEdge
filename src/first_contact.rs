@@ -600,7 +600,7 @@ impl OwnerBindingCarveOut {
                 if path.transport() == crate::transport::TransportId::RETICULUM_RS {
                     m.responder_link_up_stage(
                         path.token(),
-                        crate::observability::LINK_UP_STAGE_OWNER_BINDING,
+                        crate::observability::LinkUpStage::OwnerBinding,
                     );
                     // The transport left an unattributed frame's link-up
                     // open for this stage; the binding admitted, it ends.

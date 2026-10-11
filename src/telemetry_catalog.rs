@@ -58,8 +58,9 @@ use metrics::{Label, Unit};
 use crate::log_throttle::LogSite;
 use crate::messages::MessageType;
 use crate::observability::{
-    DeliveryClass, InboundDropReason, LinkCloseCause, LinkPoolCloseReason, RoundOutcome,
-    VerifyErrorClass, WithholdReason, LINK_UP_OUTCOMES, RESPONDER_ROUND_OUTCOMES,
+    DeliveryClass, InboundDropReason, LinkCloseCause, LinkPoolCloseReason, LinkUpStage,
+    PeerResolveOutcome, RoundOutcome, VerifyErrorClass, WithholdReason, LINK_UP_OUTCOMES,
+    RESPONDER_ROUND_OUTCOMES,
 };
 use crate::replication::bridge::ApplyRefusalClass;
 use crate::replication::EnvelopeKind;
@@ -194,6 +195,27 @@ const fn histogram(
     }
 }
 
+/// As [`histogram`], for a histogram of counts (pages, rows): unit `Count`.
+const fn count_histogram(
+    name: &'static str,
+    labels: &'static [LabelSpec],
+    buckets: &'static [f64],
+    bundle_fields: &'static [&'static str],
+    sites: &'static [&'static str],
+    description: &'static str,
+) -> MetricSpec {
+    MetricSpec {
+        name,
+        kind: MetricKind::Histogram,
+        unit: Unit::Count,
+        labels,
+        description,
+        buckets,
+        bundle_fields,
+        sites,
+    }
+}
+
 const fn label(key: &'static str, values: &'static [&'static str]) -> LabelSpec {
     LabelSpec { key, values }
 }
@@ -238,13 +260,17 @@ fn labels_of(spec: &'static MetricSpec, values: &[&str]) -> Vec<Label> {
         .collect()
 }
 
-/// Record one observation of `seconds` into histogram `name` with
-/// `label_values` (in the spec's label order). Called only from the sites
-/// the spec lists.
-pub fn record_histogram(name: &str, label_values: &[&str], seconds: f64) {
+/// Record one observation `value` (in the spec's unit) into histogram `name`
+/// with `label_values` (in the spec's label order). Called only from the
+/// sites the spec lists.
+///
+/// Label values are `&'static str`, so a runtime string (a `format!`, a peer
+/// id) cannot reach a histogram label; the gate also holds every call to
+/// `<closed enum>.as_str()` / `.as_wire_str()` values.
+pub fn record_histogram(name: &str, label_values: &[&'static str], value: f64) {
     let spec = spec(name);
     debug_assert_eq!(spec.kind, MetricKind::Histogram, "{name}");
-    metrics::histogram!(spec.name, labels_of(spec, label_values)).record(seconds);
+    metrics::histogram!(spec.name, labels_of(spec, label_values)).record(value);
 }
 
 /// Describe every catalogued metric to the installed recorder (unit + HELP).
@@ -548,11 +574,9 @@ const FIRST_CONTACT_OUTCOMES: &[&str] = &[
     "owner_binding_malformed",
     "owner_binding_door_refused",
 ];
-const LINK_UP_STAGES: &[&str] = &[
-    crate::observability::LINK_UP_STAGE_BUNDLE_GATE,
-    crate::observability::LINK_UP_STAGE_ANNOUNCE_INTAKE,
-    crate::observability::LINK_UP_STAGE_OWNER_BINDING,
-];
+const LINK_UP_STAGES: [&str; LinkUpStage::ALL.len()] = tokens!(LinkUpStage::ALL, as_str);
+const PEER_RESOLVE_OUTCOMES: [&str; PeerResolveOutcome::ALL.len()] =
+    tokens!(PeerResolveOutcome::ALL, as_str);
 
 // ─── Histogram names (recorded at their sites) ─────────────────────────────
 
@@ -562,6 +586,14 @@ pub const ROUND_DURATION: &str = "ciris.edge.replication.round.duration";
 pub const SWEEP_PERMIT_WAIT: &str = "ciris.edge.sweep.permit.wait";
 /// A responder link-up stage's time since `LinkEstablished`, by stage.
 pub const RESPONDER_LINK_UP_DURATION: &str = "ciris.edge.responder.link_up.duration";
+/// Pages one advertise sweep read, by kind (P1).
+pub const SWEEP_PAGES: &str = "ciris.edge.sweep.pages";
+/// Rows one advertise sweep read, by kind (P1).
+pub const SWEEP_ROWS: &str = "ciris.edge.sweep.rows";
+/// One peer's attestation-recipient resolution, by outcome (P1).
+pub const PEER_RESOLVE: &str = "ciris.edge.replication.peer_resolve.duration";
+/// One serve-tier trust walk (P1).
+pub const SERVE_TIER_REFRESH: &str = "ciris.edge.replication.serve_tier.refresh.duration";
 
 const KIND: LabelSpec = label("kind", &ENVELOPE_KINDS);
 
@@ -626,11 +658,15 @@ pub const METRIC_CATALOG: &[MetricSpec] = &[
     histogram(ROUND_DURATION, &[KIND], crate::observability::REPLICATION_ROUND_DURATION_BUCKETS_SECONDS, &["replication_round_duration_seconds"], &["src/observability.rs::observe_round_duration"], "One anti-entropy round's wall time, from holding the permit to its outcome."),
     histogram(SWEEP_PERMIT_WAIT, &[], crate::observability::SWEEP_PERMIT_WAIT_BUCKETS_SECONDS, &["sweep_permit_wait_seconds"], &["src/observability.rs::observe_sweep_permit_wait"], "The wait for a bounded advertise-sweep permit."),
     counter("ciris.edge.responder.round", Unit::Count, &[KIND, label("outcome", &RESPONDER_ROUND_OUTCOMES)], &["responder_rounds_total"], "Responder-side rounds, by kind and lifecycle outcome."),
-    histogram(RESPONDER_LINK_UP_DURATION, &[label("stage", LINK_UP_STAGES)], crate::observability::RESPONDER_LINK_UP_BUCKETS_SECONDS, &["responder_link_up_seconds"], &["src/observability.rs::responder_link_up_stage"], "Time from a responder's LinkEstablished to the end of each link-up stage."),
+    histogram(RESPONDER_LINK_UP_DURATION, &[label("stage", &LINK_UP_STAGES)], crate::observability::RESPONDER_LINK_UP_BUCKETS_SECONDS, &["responder_link_up_seconds"], &["src/observability.rs::responder_link_up_stage"], "Time from a responder's LinkEstablished to the end of each link-up stage."),
     counter("ciris.edge.responder.link_up", Unit::Count, &[label("outcome", &LINK_UP_OUTCOMES)], &["responder_link_up_total"], "Responder link-ups, by outcome."),
     counter("ciris.edge.link.recovered", Unit::Count, &[], &["recovered_links_total"], "Links recovered after a transient failure."),
     counter("ciris.edge.ship.unclaimed_refused", Unit::Count, &[], &["unclaimed_ship_refused_total"], "Ships refused for a lane whose claim failed."),
     counter("ciris.edge.log.suppressed", Unit::Count, &[label("site", &LOG_SITES)], &["log_suppressed"], "Log lines a LogThrottle site suppressed. PROCESS-WIDE and never reset per fold: read it as a rate."),
+    count_histogram(SWEEP_PAGES, &[KIND], crate::observability::SWEEP_PAGES_BUCKETS, &["sweep_pages"], &["src/observability.rs::observe_sweep"], "Pages one advertise sweep read (each page under one sweep permit)."),
+    count_histogram(SWEEP_ROWS, &[KIND], crate::observability::SWEEP_ROWS_BUCKETS, &["sweep_rows"], &["src/observability.rs::observe_sweep"], "Rows one advertise sweep read, in scope or not."),
+    histogram(PEER_RESOLVE, &[label("outcome", &PEER_RESOLVE_OUTCOMES)], crate::observability::PEER_RESOLVE_BUCKETS_SECONDS, &["peer_resolve_seconds"], &["src/observability.rs::observe_peer_resolve"], "One peer's attestation-recipient resolution (consent send-set, rooting, serve gate)."),
+    histogram(SERVE_TIER_REFRESH, &[], crate::observability::SERVE_TIER_REFRESH_BUCKETS_SECONDS, &["serve_tier_refresh_seconds"], &["src/observability.rs::observe_serve_tier_refresh"], "One serve-tier trust walk (a stale cache's refresh)."),
 ];
 
 /// Bundle fields that are deliberately not metrics.
@@ -1049,10 +1085,17 @@ mod telemetry_catalog_gate {
             m.observe_round_duration(k, std::time::Duration::from_millis(200));
         }
         m.observe_sweep_permit_wait(std::time::Duration::from_millis(20));
-        for (i, stage) in LINK_UP_STAGES.iter().enumerate() {
+        for k in EnvelopeKind::ALL {
+            m.observe_sweep(k, 3, 2_000);
+        }
+        for o in PeerResolveOutcome::ALL {
+            m.observe_peer_resolve(*o, std::time::Duration::from_millis(4));
+        }
+        m.observe_serve_tier_refresh(std::time::Duration::from_millis(30));
+        for (i, stage) in LinkUpStage::ALL.iter().enumerate() {
             let link = [u8::try_from(i).unwrap_or(0); 16];
             m.responder_link_up_begin(link);
-            m.responder_link_up_stage(link, stage);
+            m.responder_link_up_stage(link, *stage);
         }
     }
 
@@ -1247,6 +1290,10 @@ mod telemetry_catalog_gate {
             ("ROUND_DURATION", ROUND_DURATION),
             ("SWEEP_PERMIT_WAIT", SWEEP_PERMIT_WAIT),
             ("RESPONDER_LINK_UP_DURATION", RESPONDER_LINK_UP_DURATION),
+            ("SWEEP_PAGES", SWEEP_PAGES),
+            ("SWEEP_ROWS", SWEEP_ROWS),
+            ("PEER_RESOLVE", PEER_RESOLVE),
+            ("SERVE_TIER_REFRESH", SERVE_TIER_REFRESH),
         ];
         let mut found: Vec<(String, &str)> = Vec::new();
         let mut stray = Vec::new();
@@ -1528,6 +1575,111 @@ mod telemetry_catalog_gate {
         assert!(
             unused.is_empty(),
             "LogSite variants no throttle names: {unused:?}"
+        );
+    }
+
+    /// `args` split on its top-level commas (brackets and parens nest),
+    /// trimmed, empty pieces dropped.
+    fn top_level_args(args: &str) -> Vec<&str> {
+        let (mut out, mut depth, mut start) = (Vec::new(), 0i32, 0usize);
+        for (i, c) in args.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push(args[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        out.push(args[start..].trim());
+        out.retain(|a| !a.is_empty());
+        out
+    }
+
+    /// Every histogram label value is a closed enum's token
+    /// (`<value>.as_str()` / `.as_wire_str()`), never a runtime string.
+    #[test]
+    fn histogram_labels_come_from_closed_enums() {
+        let call = concat!("record", "_histogram(");
+        let mut bad = Vec::new();
+        for (file, text) in sources() {
+            if file == THIS_FILE {
+                continue;
+            }
+            for (i, _) in text.match_indices(call) {
+                let line = text[..i].matches('\n').count() + 1;
+                let args = top_level_args(call_args(&text, i));
+                let labels = args.get(1).copied().unwrap_or("");
+                let inner = labels
+                    .strip_prefix("&[")
+                    .and_then(|l| l.strip_suffix(']'))
+                    .unwrap_or_else(|| panic!("{file}:{line}: labels are not a `&[...]` literal"));
+                for el in inner.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+                    let closed = el.ends_with(".as_str()") || el.ends_with(".as_wire_str()");
+                    let ident = el
+                        .trim_end_matches(".as_str()")
+                        .trim_end_matches(".as_wire_str()");
+                    if !closed || !ident.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                        bad.push(format!(
+                            "{file}:{line}: label `{el}` is not a closed enum's token"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// No caller skips a timer: the untimed resolution has exactly one caller
+    /// (its timed wrapper), and the serve-tier walk is reached only through
+    /// the bridge's timed `refresh_serve_tier`.
+    #[test]
+    fn the_timed_paths_are_the_only_paths() {
+        fn callers(needle: &str, skip_file: Option<&str>) -> Vec<String> {
+            let mut out = Vec::new();
+            for (file, text) in sources() {
+                if file == THIS_FILE || Some(file.as_str()) == skip_file {
+                    continue;
+                }
+                let lines: Vec<&str> = text.lines().collect();
+                for (n, l) in lines.iter().enumerate() {
+                    let code = l.split("//").next().unwrap_or("");
+                    if !code.contains(needle) || code.contains("fn ") {
+                        continue;
+                    }
+                    let site = lines[..n]
+                        .iter()
+                        .rev()
+                        .find_map(|l| {
+                            let l = l.trim_start();
+                            let rest = l
+                                .strip_prefix("pub fn ")
+                                .or_else(|| l.strip_prefix("async fn "))
+                                .or_else(|| l.strip_prefix("pub async fn "))
+                                .or_else(|| l.strip_prefix("fn "))?;
+                            Some(rest.split(['(', '<']).next().unwrap_or(rest).to_owned())
+                        })
+                        .unwrap_or_default();
+                    out.push(format!("{file}::{site}"));
+                }
+            }
+            out
+        }
+        assert_eq!(
+            callers(concat!("resolve_attestation_recipient", "_untimed("), None),
+            ["src/replication/bridge.rs::resolve_attestation_recipient"],
+            "the untimed resolution is called only by its timed wrapper"
+        );
+        // serve_tier.rs's own unit tests drive the cache directly.
+        assert_eq!(
+            callers(
+                concat!("refresh", "_if_stale("),
+                Some("src/replication/serve_tier.rs")
+            ),
+            ["src/replication/bridge.rs::refresh_serve_tier"],
+            "the serve-tier walk is reached only through the timed refresh"
         );
     }
 }

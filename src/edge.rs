@@ -2152,6 +2152,10 @@ impl Edge {
     /// transport already published it (counters are `absolute`, so a second
     /// publish of the same snapshot changes nothing), so an `Edge` whose
     /// transports own no facade series still publishes.
+    ///
+    /// Histograms are not part of this call: they are recorded at observe
+    /// time, as each sample is taken (see
+    /// [`crate::observability::EdgeMetrics::publish_metrics`]).
     pub fn publish_metrics(&self) {
         for transport in self.transports() {
             transport.refresh_metrics();

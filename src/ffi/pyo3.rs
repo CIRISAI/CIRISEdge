@@ -3106,6 +3106,27 @@ fn metrics_bundle_to_pydict<'py>(
         "sweep_permit_wait_seconds",
         histogram_to_pydict(py, &bundle.sweep_permit_wait_seconds)?,
     )?;
+    // CIRISEdge#820 P1 — pages and rows per sweep (count histograms: "sum"
+    // is the summed count), peer resolution by outcome, serve-tier walks.
+    for (name, by_kind) in [
+        ("sweep_pages", &bundle.sweep_pages),
+        ("sweep_rows", &bundle.sweep_rows),
+    ] {
+        let d = pyo3::types::PyDict::new(py);
+        for (kind, h) in by_kind {
+            d.set_item(kind.as_wire_str(), histogram_to_pydict(py, h)?)?;
+        }
+        root.set_item(name, d)?;
+    }
+    let peer_resolve = pyo3::types::PyDict::new(py);
+    for (outcome, h) in &bundle.peer_resolve_seconds {
+        peer_resolve.set_item(outcome.as_str(), histogram_to_pydict(py, h)?)?;
+    }
+    root.set_item("peer_resolve_seconds", peer_resolve)?;
+    root.set_item(
+        "serve_tier_refresh_seconds",
+        histogram_to_pydict(py, &bundle.serve_tier_refresh_seconds)?,
+    )?;
     // CIRISEdge#853 — the responder's round lifecycle and link-up.
     let responder_rounds = pyo3::types::PyDict::new(py);
     for (key, n) in &bundle.responder_rounds_total {
@@ -3191,6 +3212,9 @@ fn histogram_to_pydict<'py>(
     out.set_item("buckets", buckets)?;
     out.set_item("count", h.count)?;
     out.set_item("sum", h.sum_seconds)?;
+    // CIRISEdge#820 P1 — "seconds" or "count": a count histogram's "sum" is
+    // not seconds.
+    out.set_item("unit", h.unit)?;
     Ok(out)
 }
 
