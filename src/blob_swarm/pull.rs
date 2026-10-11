@@ -787,6 +787,39 @@ pub trait DagByteFetch: Send + Sync {
     /// [`PullOutcome::FetchFailed`] (retried; a sealed pull resumes from
     /// whatever it adopted before the failure).
     async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String>;
+
+    /// [`Self::fetch`], with the one failure that is NOT retried typed apart:
+    /// a holder answered that the bytes are withdrawn, purged or revoked
+    /// federation-wide ([`DagFetchError::Gone`]). The puller calls this; the
+    /// default reads every `fetch` error as [`DagFetchError::Transport`], so
+    /// a fetcher that cannot tell the two apart keeps the retried behaviour.
+    async fn fetch_typed(&self, sha: [u8; 32]) -> Result<Vec<u8>, DagFetchError> {
+        self.fetch(sha).await.map_err(DagFetchError::Transport)
+    }
+}
+
+/// Why a [`DagByteFetch`] produced no bytes for an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DagFetchError {
+    /// May clear: transport, timeout, no holder accepted the request. The
+    /// pull ends [`PullOutcome::FetchFailed`] and is retried.
+    Transport(String),
+    /// A holder answered `MissReason::Withdrawn` or `Revoked`: the bytes were
+    /// withdrawn, purged (persist v54.1.0 `BlobError::Purged` is the same
+    /// wire word) or revoked federation-wide, and every holder is bound by
+    /// the same retraction. The pull ends [`PullOutcome::Refused`], terminal,
+    /// as the whole-blob scheduler ends one on `GoneFederationWide`: no other
+    /// holder is asked and no retry is booked.
+    Gone(String),
+}
+
+impl std::fmt::Display for DagFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(reason) => f.write_str(reason),
+            Self::Gone(reason) => write!(f, "withdrawn or revoked federation-wide: {reason}"),
+        }
+    }
 }
 
 /// The production [`DagByteFetch`] (CIRISEdge#739): the pull's holders
@@ -909,7 +942,11 @@ impl DagByteFetch for SwarmFetch {
     }
 
     async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String> {
-        let routes = self.routes().await?;
+        self.fetch_typed(sha).await.map_err(|e| e.to_string())
+    }
+
+    async fn fetch_typed(&self, sha: [u8; 32]) -> Result<Vec<u8>, DagFetchError> {
+        let routes = self.routes().await.map_err(DagFetchError::Transport)?;
         let alpha = self.swarm.ewma_alpha;
         let strike_limit = self.swarm.error_strike_limit;
         let timeout = self.swarm.per_request_timeout;
@@ -918,7 +955,10 @@ impl DagByteFetch for SwarmFetch {
         let mut last = String::from("no holder accepted the request");
         for _ in 0..max_attempts {
             let Some(peer) = self.pick() else {
-                return Err(format!("no holders left for {}: {last}", hex::encode(sha)));
+                return Err(DagFetchError::Transport(format!(
+                    "no holders left for {}: {last}",
+                    hex::encode(sha)
+                )));
             };
             let Some(recipient) = routes.get(&peer) else {
                 // Unroutable holders were dropped by `resolve_holder_routes`
@@ -949,7 +989,7 @@ impl DagByteFetch for SwarmFetch {
                         }
                     });
                     if gone {
-                        return Err(format!("withdrawn or revoked federation-wide: {reason}"));
+                        return Err(DagFetchError::Gone(reason));
                     }
                     last = format!("{peer}: chunk miss {reason}");
                 }
@@ -962,7 +1002,7 @@ impl DagByteFetch for SwarmFetch {
                 }
             }
         }
-        Err(last)
+        Err(DagFetchError::Transport(last))
     }
 }
 
@@ -1138,6 +1178,9 @@ enum LaneStop {
 enum DagFetchStop {
     /// The fetcher could not produce it (transport, timeout, no holder).
     Transport(String),
+    /// A holder said the bytes are gone federation-wide
+    /// ([`DagFetchError::Gone`]): terminal, never retried.
+    Gone(String),
     /// It arrived, but does not hash to the address asked for.
     HashMismatch { got: [u8; 32] },
 }
@@ -2311,6 +2354,9 @@ where
                     retrying: false,
                 }
             }
+            Err(DagFetchStop::Gone(reason)) => {
+                return self.dag_gone(row, &blob_hex, "blob", &reason)
+            }
             Err(DagFetchStop::HashMismatch { got }) => {
                 return PullOutcome::Refused(format!(
                     "pull_inline_with: the fetched body hashes to {}, not {blob_hex}",
@@ -2534,7 +2580,10 @@ where
         sha: [u8; 32],
     ) -> Result<Vec<u8>, DagFetchStop> {
         use sha2::{Digest as _, Sha256};
-        let bytes = fetch.fetch(sha).await.map_err(DagFetchStop::Transport)?;
+        let bytes = fetch.fetch_typed(sha).await.map_err(|e| match e {
+            DagFetchError::Transport(reason) => DagFetchStop::Transport(reason),
+            DagFetchError::Gone(reason) => DagFetchStop::Gone(reason),
+        })?;
         let got: [u8; 32] = Sha256::digest(&bytes).into();
         if got != sha {
             return Err(DagFetchStop::HashMismatch { got });
@@ -2560,6 +2609,24 @@ where
     }
 
     /// A fetch that did not arrive: booked for retry, named.
+    /// A DAG fetch a holder answered withdrawn, purged or revoked: the pull
+    /// ends [`PullOutcome::Refused`] with NO retry booked, the disposition the
+    /// whole-blob scheduler gives `GoneFederationWide`. Re-asking cannot help:
+    /// every holder is bound by the same retraction.
+    fn dag_gone(&self, row: &Attestation, blob_hex: &str, what: &str, reason: &str) -> PullOutcome {
+        tracing::info!(
+            blob = %blob_hex,
+            attestation_id = %row.attestation_id,
+            what,
+            reason,
+            "DAG pull ended: the bytes are withdrawn, purged or revoked federation-wide — \
+             not retried, no other holder asked"
+        );
+        PullOutcome::Refused(format!(
+            "withdrawn or revoked federation-wide: {what}: {reason}"
+        ))
+    }
+
     fn dag_fetch_failed(
         &self,
         row: &Attestation,
@@ -2647,6 +2714,9 @@ where
                 Ok(b) => b,
                 Err(DagFetchStop::Transport(reason)) => {
                     return self.dag_fetch_failed(row, sha, attempts, "manifest", &reason)
+                }
+                Err(DagFetchStop::Gone(reason)) => {
+                    return self.dag_gone(row, &blob_hex, "manifest", &reason)
                 }
                 Err(DagFetchStop::HashMismatch { got }) => {
                     return self.dag_refused(
@@ -2915,6 +2985,12 @@ where
                                 &reason,
                             ))
                         }
+                        Err(LaneStop::Fetch(DagFetchStop::Gone(reason))) => Some(self.dag_gone(
+                            row,
+                            &blob_hex,
+                            &format!("chunk seq {}", w.seq),
+                            &reason,
+                        )),
                         Err(LaneStop::Fetch(DagFetchStop::HashMismatch { got })) => {
                             Some(self.dag_refused(
                                 row,
@@ -3160,6 +3236,9 @@ where
             Err(DagFetchStop::Transport(reason)) => {
                 return self.dag_fetch_failed(row, sha, attempts, "manifest", &reason)
             }
+            Err(DagFetchStop::Gone(reason)) => {
+                return self.dag_gone(row, &blob_hex, "manifest", &reason)
+            }
             Err(DagFetchStop::HashMismatch { got }) => {
                 return self.dag_refused(
                     row,
@@ -3217,6 +3296,9 @@ where
                         &format!("chunk seq {seq}"),
                         &reason,
                     )
+                }
+                Err(DagFetchStop::Gone(reason)) => {
+                    return self.dag_gone(row, &blob_hex, &format!("chunk seq {seq}"), &reason)
                 }
                 Err(DagFetchStop::HashMismatch { got }) => {
                     return self.dag_refused(

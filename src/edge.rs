@@ -947,8 +947,16 @@ pub enum ContentResult {
     /// `dispatch_inbound` ContentBody gate validates this before
     /// signalling the pending channel).
     Bytes(Vec<u8>),
-    /// The peer returned a `ContentMiss` (typed reason). Fetcher
-    /// SHOULD try another peer per the MissReason taxonomy.
+    /// The peer returned a `ContentMiss` (typed reason). Edge does not
+    /// retry; the host decides, per the
+    /// [`MissReason`](crate::messages::MissReason) taxonomy:
+    /// `NotHeld`, `PolicyDenied` and `DiskPressure` MAY be tried at another
+    /// peer, but `Withdrawn` and `Revoked` mean STOP — the bytes were
+    /// retracted (or purged, which reaches the wire as `Withdrawn`) or their
+    /// signer revoked federation-wide, every holder is bound by the same
+    /// verdict, and asking another peer must not be attempted. This is the
+    /// disposition edge's own fetchers give the same words (whole blob:
+    /// `GoneFederationWide`; DAG: `DagFetchError::Gone`).
     ContentMiss { reason: String },
     /// CIRISEdge#52 (v0.20.1) — multimedia tier: the peer returned a
     /// `BlobBody::External` pointer (MEDIA_SHARING.md §2.6). Edge
