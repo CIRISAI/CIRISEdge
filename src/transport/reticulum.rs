@@ -10439,6 +10439,9 @@ fn av_sink_drop_log() -> &'static crate::log_throttle::LogThrottle {
 /// There is no reassembly and no envelope parse here: an A/V chunk is one
 /// Channel message by construction (CIRISEdge#720 refuses a larger one at
 /// send), and the frame is opaque until the consumer opens it.
+// CIRISEdge#820 — the typed, counted `drop_inbound` call took it past the
+// cap; the drop must stay inline (the #425 pin wants it beside the `return`).
+#[allow(clippy::too_many_lines)]
 async fn deliver_av_frame(
     ctx: &EventCtx<'_>,
     link_id: LinkId,

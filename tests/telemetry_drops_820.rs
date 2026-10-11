@@ -79,8 +79,16 @@ fn runtime(name: &str) -> Arc<tokio::runtime::Runtime> {
     )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn real_inbound_drops_and_suppressed_lines_reach_the_hosts_read() {
+/// A real `Edge` A and a real `Edge` B on loopback, primed with each other's
+/// route, both listening.
+struct Pair {
+    edge_a: Arc<Edge>,
+    transport_b: Arc<ciris_edge::transport::reticulum::ReticulumTransport>,
+    _edge_b: Arc<Edge>,
+    _tmp: tempfile::TempDir,
+}
+
+async fn pair() -> Pair {
     let _ = tracing_subscriber::fmt()
         .with_env_filter("warn,ciris_edge=info")
         .try_init();
@@ -144,9 +152,28 @@ async fn real_inbound_drops_and_suppressed_lines_reach_the_hosts_read() {
     let edge_a = build(signer_for(&key_a, tmp.path()).await, &transport_a);
     let edge_b = build(signer_for(&key_b, tmp.path()).await, &transport_b);
     let (rt_a, rt_b) = (runtime("drops-820-a"), runtime("drops-820-b"));
-    let _handles_a = edge_a.spawn_background_listeners(rt_a.handle());
-    let _handles_b = edge_b.spawn_background_listeners(rt_b.handle());
+    // The listeners run on their own runtimes for the life of the test.
+    std::mem::forget(edge_a.spawn_background_listeners(rt_a.handle()));
+    std::mem::forget(edge_b.spawn_background_listeners(rt_b.handle()));
+    // The runtimes live to process exit: dropping one inside an async test
+    // panics, as in `reticulum_loopback`.
+    std::mem::forget(rt_a);
+    std::mem::forget(rt_b);
+    Pair {
+        edge_a,
+        transport_b,
+        _edge_b: edge_b,
+        _tmp: tmp,
+    }
+}
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_inbound_drops_and_suppressed_lines_reach_the_hosts_read() {
+    let Pair {
+        edge_a,
+        transport_b,
+        ..
+    } = pair().await;
     let suppressed_before = edge_a.metrics().snapshot().log_suppressed["reticulum.inbound_drop"];
 
     // A `CANN` frame that does not decode: magic, then a truncated body.
@@ -209,7 +236,4 @@ async fn real_inbound_drops_and_suppressed_lines_reach_the_hosts_read() {
         Some(DebugValue::Counter(n)) => assert!(*n >= FRAMES - 3, "published suppressed: {n}"),
         other => panic!("ciris.edge.log.suppressed{{site=reticulum.inbound_drop}}: {other:?}"),
     }
-
-    std::mem::forget(rt_a);
-    std::mem::forget(rt_b);
 }
