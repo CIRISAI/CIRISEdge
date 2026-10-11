@@ -1046,7 +1046,7 @@ mod telemetry_catalog_gate {
         for (i, stage) in LINK_UP_STAGES.iter().enumerate() {
             let link = [u8::try_from(i).unwrap_or(0); 16];
             m.responder_link_up_begin(link);
-            m.responder_link_up_stage(link, *stage);
+            m.responder_link_up_stage(link, stage);
         }
     }
 
@@ -1343,7 +1343,7 @@ mod telemetry_catalog_gate {
                             names.insert(n);
                         }
                         None => {
-                            unnamed.push(format!("{file}: #[instrument] without `name = \"…\"`"))
+                            unnamed.push(format!("{file}: #[instrument] without `name = \"…\"`"));
                         }
                     }
                 }
