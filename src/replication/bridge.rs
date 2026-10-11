@@ -504,6 +504,14 @@ fn signature_refusal(
 ///   node's state, so it can mean the claimant root's community row or a
 ///   cosigner's Key is not held yet — an ordering gap, left on the transient
 ///   rule and its re-offer cap until CIRISPersist#1055 types the two apart.
+/// - `Error::TraceDimensionInvalid` — a `trace:*` row refused for its SHAPE by
+///   `admission::check_trace_dimension_admission` at the attestation put door
+///   the replicated apply goes through: the attester absent from
+///   `subject_key_ids`, a missing `trace_id` / `agent_id_hash`, not exactly one
+///   of the inline and manifest forms, or (v54.1.0) a `run_kind` outside the
+///   closed vocabulary in either form. Every arm judges the signed row itself,
+///   so re-offering the same bytes can never admit. The token is persist's own
+///   `kind()`.
 pub(crate) fn typed_terminal_verdict(
     err: &ciris_persist::federation::Error,
 ) -> Option<&'static str> {
@@ -526,6 +534,7 @@ pub(crate) fn typed_terminal_verdict(
         {
             Some(token)
         }
+        E::TraceDimensionInvalid { .. } => Some(err.kind()),
         _ => None,
     }
 }
@@ -11808,6 +11817,16 @@ pub(crate) mod tests {
             ),
             (
                 purge(ciris_persist::federation::steward_purge::TRACE_RUN_KIND_MOCK),
+                RetryDisposition::Terminal,
+            ),
+            // A malformed trace:* row (persist's shape gate): the same bytes
+            // never admit.
+            (
+                E::TraceDimensionInvalid {
+                    detail: "trace:* manifest form: \"run_kind\" \"bogus\" is not one of \
+                             [\"production\", \"qa\", \"battery\", \"mock\"] (CC 3.1.5)"
+                        .to_owned(),
+                },
                 RetryDisposition::Terminal,
             ),
             // …but an unauthorised replicated bundle may be waiting on a
