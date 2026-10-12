@@ -1272,6 +1272,56 @@ mod telemetry_catalog_gate {
 
     const THIS_FILE: &str = "src/telemetry_catalog.rs";
 
+    /// The name of the fn whose body holds line `n`: the nearest preceding
+    /// `fn` declaration, whatever its qualifiers (`pub`, `pub(crate)`,
+    /// `async`, `const`, `unsafe`). The one spelling every source-scan gate
+    /// here uses to name a site.
+    fn enclosing_fn(lines: &[&str], n: usize) -> String {
+        lines[..n]
+            .iter()
+            .rev()
+            .find_map(|l| {
+                let mut rest = l.trim_start();
+                loop {
+                    let next = rest
+                        .strip_prefix("pub(crate) ")
+                        .or_else(|| rest.strip_prefix("pub(super) "))
+                        .or_else(|| rest.strip_prefix("pub "))
+                        .or_else(|| rest.strip_prefix("async "))
+                        .or_else(|| rest.strip_prefix("const "))
+                        .or_else(|| rest.strip_prefix("unsafe "));
+                    match next {
+                        Some(r) => rest = r,
+                        None => break,
+                    }
+                }
+                let name = rest.strip_prefix("fn ")?;
+                Some(name.split(['(', '<']).next().unwrap_or(name).to_owned())
+            })
+            .unwrap_or_default()
+    }
+
+    /// The fn-name scan names `async fn` and qualified sites exactly.
+    #[test]
+    fn enclosing_fn_names_every_fn_spelling() {
+        for (decl, want) in [
+            (
+                "    async fn refresh_serve_tier(&self) {",
+                "refresh_serve_tier",
+            ),
+            ("    pub async fn go<T>(&self) {", "go"),
+            (
+                "pub(crate) fn key_outcome_to_apply(",
+                "key_outcome_to_apply",
+            ),
+            ("    pub const fn as_str(self) -> &'static str {", "as_str"),
+            ("fn plain() {", "plain"),
+        ] {
+            let lines = [decl, "        body();"];
+            assert_eq!(enclosing_fn(&lines, 1), want, "{decl}");
+        }
+    }
+
     /// (e) the facade is touched only from this module, and (h) every
     /// histogram is recorded only from the sites its spec lists (each a sync
     /// fn on `EdgeMetrics`, so no span guard can be held across an await
@@ -1310,17 +1360,7 @@ mod telemetry_catalog_gate {
                 if !code.contains(call) {
                     continue;
                 }
-                let site_fn = lines[..n]
-                    .iter()
-                    .rev()
-                    .find_map(|l| {
-                        let l = l.trim_start();
-                        let rest = l
-                            .strip_prefix("pub fn ")
-                            .or_else(|| l.strip_prefix("fn "))?;
-                        Some(rest.split(['(', '<']).next().unwrap_or(rest).to_owned())
-                    })
-                    .unwrap_or_default();
+                let site_fn = enclosing_fn(&lines, n);
                 let window = lines[n..lines.len().min(n + 3)].join(" ");
                 let (_, name) = consts
                     .iter()
@@ -1649,19 +1689,7 @@ mod telemetry_catalog_gate {
                     if !code.contains(needle) || code.contains("fn ") {
                         continue;
                     }
-                    let site = lines[..n]
-                        .iter()
-                        .rev()
-                        .find_map(|l| {
-                            let l = l.trim_start();
-                            let rest = l
-                                .strip_prefix("pub fn ")
-                                .or_else(|| l.strip_prefix("async fn "))
-                                .or_else(|| l.strip_prefix("pub async fn "))
-                                .or_else(|| l.strip_prefix("fn "))?;
-                            Some(rest.split(['(', '<']).next().unwrap_or(rest).to_owned())
-                        })
-                        .unwrap_or_default();
+                    let site = enclosing_fn(&lines, n);
                     out.push(format!("{file}::{site}"));
                 }
             }
