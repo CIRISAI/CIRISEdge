@@ -257,10 +257,15 @@ subscribe_direct_path_events, direct_path_state, direct_link_interface, fall_bac
   proposal and its outcome; past it, or on any failure, the A/V dial proceeds exactly as today. A
   failed punch costs a facilitator round trip and leviculum's 60 s per-link cooldown, nothing else.
   The A/V leg born on a punched interface runs at the base MTU (Channel 425, chunk budget 341).
-- **Default: inert.** No facilitator (never proposes), none served, every request refused. A
-  configured facilitator means "propose" (no second switch). Accepting is a SEPARATE operator
-  setting, `DirectAccept::IdentifiedOnly`, which discloses this node's public address to any
-  identified link peer that asks (leviculum#82 will let edge restrict it to room peers).
+- **Defaults.** Proposing needs a facilitator (none by default; a configured one means "propose",
+  no second switch). Accepting is ON for ROOM PEERS ONLY (`DirectAccept::RoomPeers`): a direct
+  path is the more private one (no relay member sees the call's traffic, timing or volume), and
+  the only party that learns this node's address is someone it shares a room with
+  (`ReticulumTransport::should_accept_direct`). `DirectAccept::Off` is the operator override.
+  `DirectAccept::IdentifiedOnly` (leviculum's node-wide policy, which discloses the address to ANY
+  identified link peer) exists for tests and an explicit operator choice only. Until the
+  host-decided accept (leviculum#82) is pinned, `RoomPeers` maps to leviculum's REJECT, so nothing
+  ships with node-wide exposure.
 - **MTU.** leviculum lowers a link moved onto a punched interface to MTU 1400 (Channel 1321) and
   never raises it; `DirectPathEvent::Established` carries the Channel limit before and after, which
   item 5's `CallEvent::BudgetChanged` reads (#720).

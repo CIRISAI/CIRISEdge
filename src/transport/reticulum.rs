@@ -5421,6 +5421,28 @@ impl ReticulumTransport {
         }
     }
 
+    /// CIRISEdge#805 item 8 — THE accept decision for a peer's direct-link
+    /// request: true iff accepting is on for room peers (the default) and
+    /// `peer_key_id` shares a room with this node (a live member of a group
+    /// installed in this transport's scope table). No table installed: false.
+    ///
+    /// Accepting discloses this node's public address to the peer, so the
+    /// only party that may learn it is someone this node shares a room with.
+    /// TODO(leviculum#82): leviculum asks edge per request (AskHost); until
+    /// then `RoomPeers` maps to leviculum's REJECT and this is not consulted.
+    #[must_use]
+    pub fn should_accept_direct(&self, peer_key_id: &str) -> bool {
+        use crate::transport::direct_path::DirectAccept;
+        match self.direct_paths.config.accept {
+            DirectAccept::Off => false,
+            DirectAccept::IdentifiedOnly => true,
+            DirectAccept::RoomPeers => self
+                .scope_addresses
+                .get()
+                .is_some_and(|table| table.shares_group_with(peer_key_id)),
+        }
+    }
+
     /// CIRISEdge#805 item 8 — every direct-path event this node sees (either
     /// side of a proposal). Lagging receivers lose the oldest.
     #[must_use]
