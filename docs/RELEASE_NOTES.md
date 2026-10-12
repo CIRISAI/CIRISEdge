@@ -40,6 +40,12 @@ landing.
   CIRISPersist#1064's predicate),
   and every steward-purge token except a retryable `purge_unauthorised` reason (persist's
   `unauthorised_reason::is_retryable`) and `takedown_content_unbound`, which stay transient.
+- **New metric family `durability_custody`** (`EdgeMetricsBundle`, the UniFFI counters and the
+  PyO3 `metrics_snapshot()` dict): what each durability pass found, per file in this node's audience
+  — `filed_here`, `already_here` (since v55 the write doors file the claim as they store),
+  `filed_none`, `report_refused`, `repair`. `DurabilitySweep` gains `already_here`.
+  **Merge note for #820 (local/820-p1c):** the catalogue completeness gate needs a spec for this
+  family — a counter with a closed `outcome` label drawn from an enum of the five tags above.
 
 # v40.1.0 — leviculum v0.29: known-destinations backpressure, off-lock resource assembly, and the two pressure signals in the metrics snapshot
 
