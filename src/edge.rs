@@ -48,6 +48,13 @@ use crate::verify::{
 /// spec-pinned default the [`Default`] impl on [`EdgeConfig`] reads.
 /// Lives at the crate root (not behind the reticulum-feature gate) so
 /// non-reticulum builds compile EdgeConfig::default unchanged.
+///
+/// **Deprecated and INERT since the persist v55.0.0 adopt; removed at the next
+/// edge MAJOR.** persist retired `holds_bytes` (CIRISPersist#989, CC 2.4 rc7):
+/// the holding claim is `custody:ack:v1`, and persist's custody fold owns its
+/// liveness (72 h from the signed instant, renewed by the re-ack sweeper). No
+/// edge path reads this value for a holder decision any more. Kept so hosts
+/// that set it keep compiling.
 pub const DEFAULT_HOLDS_BYTES_TTL_SECONDS: u64 = 24 * 60 * 60;
 
 /// Default rolling window for the per-holder ContentMiss downweight
@@ -331,6 +338,13 @@ pub struct EdgeConfig {
     /// 24 hours per CEG §10.1.2 spec). Test deployments may shorten
     /// this to verify the staleness logic; production should leave it
     /// at the default.
+    ///
+    /// **Deprecated and INERT since the persist v55.0.0 adopt; removed at the
+    /// next edge MAJOR.** `holds_bytes` is retired (CIRISPersist#989): the
+    /// holding claim is `custody:ack:v1`, live for 72 h by persist's custody
+    /// fold and renewed by the re-ack sweeper
+    /// ([`crate::group_content::PersistGroupContentStore::spawn_holding_claim_reack`]).
+    /// Setting it changes nothing; it is kept so hosts that set it compile.
     pub holds_bytes_ttl_seconds: u64,
     /// CIRISEdge#42 (v0.12.0, CEG §10.1.2) — rolling window in seconds
     /// for the per-holder ContentMiss downweight tracker. A holder

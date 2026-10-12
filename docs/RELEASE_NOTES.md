@@ -1,5 +1,46 @@
 # CIRISEdge Release Notes
 
+# Unreleased (draft) — persist v55.0.0 adopt: one holding claim, key grants as rows
+
+**MAJOR.** Edge adopts persist v55.0.0 (CIRISConstitution v1.0-rc7). The version bump is made at
+landing.
+
+- **The fleet moves together.** A v55 node and a v54 node exchange neither holding claims nor key
+  wraps: v55 retired the `holds_bytes` claim (the holding claim is `custody:ack:v1`, at the
+  content's own scope) and the key-grant SET (one `scores` row per recipient on
+  `key_grant:{axis}:v1`). A v55 node does not read a v54 `holds_bytes` claim, and refuses a v54 set
+  (`set_retired` / `attestation_type_unregistered`); a v54 node admits neither v55 row. During a
+  mixed fleet, discovery of bytes held only by v54 peers, and every key a v54 peer wraps, waits until
+  those peers upgrade.
+- **The holding claim is re-acked.** A v55 claim lapses 72 h after it was signed unless renewed.
+  `PersistGroupContentStore::spawn_holding_claim_reack` starts persist's re-ack sweeper over the
+  store's engine (a host's Rust `Engine` view starts nothing on its own; persist's Python engine
+  starts its own); `edge_node` starts it and stops it on exit.
+- **`EdgeConfig::holds_bytes_ttl_seconds` and `DEFAULT_HOLDS_BYTES_TTL_SECONDS` are INERT**
+  (deprecated; removed at the next MAJOR). persist's custody fold owns the claim's liveness.
+- **`BlobPuller::key_grant_admitted` takes persist v55's `KeyGrantAdmission`** (`{axis,
+  recipient_key_id, attestation, projected, pending}`; it was `wraps_offered` / `wraps_written`). A
+  parked pull wakes on a wrap projected to this node.
+- **`blob_swarm::meaning::is_holds_bytes_type` matches the whole retired `holds_bytes:` stem**
+  (persist's `RETIRED_HOLDING_CLAIM_STEM`), not only the rc6 `holds_bytes:sha256:` + 8-hex
+  spelling: every spelling is possession and never meaning, as persist refuses every spelling.
+- **Key grants are routed by dimension.** A key-grant row (`scores` on `key_grant:{axis}:v1`) goes to
+  persist's key-grant door (its projection wakes a parked pull); a retired v54 SET goes there too,
+  for the typed `set_retired`. Key-grant rows travel only by persist's `may_receive` refers-to
+  delivery to the recipient's own node; a subject's Pull still carves them (G2).
+- **Room file DAGs sealed by a v55 writer are stream-keyed.** The pull adopts their chunks with no
+  community epoch and waits for their `key_grant:stream:v1` keys before promoting, as for a
+  self/family DAG; a room DAG sealed per chunk before v55 pulls as before. A sealed DAG's manifest is
+  adopted `LocalOnly` and announced at promotion.
+- **Refusal dispositions (replication).** Terminal: `federation_malformed_row`,
+  `federation_attestation_type_unregistered`, `federation_payment_processor_identifier`,
+  `federation_dimension_rejected` for `registered_family_held_shut` / `ledger_l1_binding_violation`,
+  `KeyGrantRefused` for `malformed` / `set_retired` / `wrap_algorithm_not_v2` / `signer_not_self` /
+  `signer_not_minter` / `signer_not_author` / `signer_not_stream_owner` (edge's table until
+  CIRISPersist#1064's predicate),
+  and every steward-purge token except a retryable `purge_unauthorised` reason (persist's
+  `unauthorised_reason::is_retryable`) and `takedown_content_unbound`, which stay transient.
+
 # v40.1.0 — leviculum v0.29: known-destinations backpressure, off-lock resource assembly, and the two pressure signals in the metrics snapshot
 
 **2026-10-05.** **MINOR** from v40.0.3. Persist v53.1.4 and verify v19.0.0 unchanged; no wire change. Additive API:
