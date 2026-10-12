@@ -138,18 +138,27 @@ impl PullSink {
         }
     }
 
-    /// CIRISEdge#779 — **a key_grant set was admitted.** If it wrote a wrap
-    /// to this node, wake the parked DAG pull waiting on it: a content-axis
-    /// set names the row (manifest or chunk) it opens, an epoch-axis set the
-    /// epoch, a stream-axis set (CIRISEdge#797) the stream epoch. Never blocks and never awaits (the apply path's door, like
+    /// CIRISEdge#779 — **a key_grant row was admitted.** If its wrap is now
+    /// in this node's grant tables, wake the parked DAG pull waiting on it: a
+    /// content-axis row names the row (manifest or chunk) it opens, an
+    /// epoch-axis row the epoch, a stream-axis row (CIRISEdge#797) the stream
+    /// epoch. Never blocks and never awaits (the apply path's door, like
     /// [`Self::offer`]); the puller's next tick re-pulls each woken DAG once,
     /// from a fresh retry ladder, however many of its grants landed.
+    ///
+    /// persist v55.0.0 (#989) — one row per recipient: the admission reports
+    /// `projected` (the wrap is in this node's grant tables; persist projects
+    /// only a wrap to an occurrence this node holds the private half for) and
+    /// `pending` (a content-axis wrap whose bytes have not arrived, projected
+    /// later by the adopt). A wrap not projected here wakes nothing. A re-offer
+    /// reports `projected` again (a union), so a pull may be woken twice for
+    /// one key, which costs one re-pull.
     pub fn key_grant_admitted(
         &self,
         admission: &ciris_persist::federation::key_grant::KeyGrantAdmission,
     ) {
         use ciris_persist::federation::key_grant::KeyGrantAxis;
-        if admission.wraps_written == 0 {
+        if !admission.projected || admission.pending {
             return;
         }
         match &admission.axis {
@@ -1155,6 +1164,45 @@ pub fn chunk_adopt_epoch(manifest_epoch: Option<u64>) -> u64 {
     manifest_epoch.unwrap_or(crate::group_content::persist_store::STREAM_EPOCH)
 }
 
+/// persist v55.0.0 (#977) — **is this a STREAM-KEYED room DAG?** A
+/// `community_dek` DAG whose manifest names each chunk's epoch (a v4
+/// manifest): sealed per `(stream_id, epoch)` by a v55 writer, its chunks
+/// carry no community binding and open under the stream epoch's key. A room
+/// DAG whose chunks name no epoch was sealed per chunk under the community
+/// epoch (before v55) and keeps that reading.
+#[must_use]
+fn is_stream_keyed_room(
+    tier: CryptoTier,
+    view: &ciris_persist::federation::chunk_dag_cascade::orchestrate::SealedManifestView,
+) -> bool {
+    tier == CryptoTier::CommunityDek && view.chunks.iter().any(|c| c.epoch.is_some())
+}
+
+/// The provenance a sealed DAG's CHUNKS are adopted under: the manifest's,
+/// except that a stream-keyed room DAG's chunks name no community epoch
+/// (persist v55.0.0, #977: "pass a provenance with `tier = community_dek`,
+/// the community, and `epoch = None`; the chunk adopt's own `epoch` argument
+/// is the stream epoch"). `BlobProvenance::from_attestation` falls back to the
+/// pointer's epoch when given none, so the epoch is cleared here.
+#[must_use]
+fn chunk_provenance_of(manifest: &BlobProvenance, stream_keyed_room: bool) -> BlobProvenance {
+    let mut chunks = manifest.clone();
+    if stream_keyed_room {
+        chunks.epoch = None;
+    }
+    chunks
+}
+
+/// Whether the pull must ask persist's readiness door for the chunks' keys
+/// before promoting: a self/family DAG (per-chunk or per-stream-epoch keys,
+/// CIRISEdge#779/#797) and a stream-keyed room DAG (persist v55.0.0, #977).
+/// A per-chunk-bound room DAG shares the manifest's community epoch, which
+/// the manifest opening as this node already answered.
+#[must_use]
+fn needs_chunk_key_readiness(tier: CryptoTier, stream_keyed_room: bool) -> bool {
+    tier == CryptoTier::InvisibleEncrypted || stream_keyed_room
+}
+
 /// CIRISEdge#797 — **how many of the waiting chunks (front first) share the
 /// first one's epoch.** Persist's batch adopt takes ONE epoch per call, so a
 /// batch never crosses an epoch: [`adopt_batch_take`]'s count is capped at
@@ -1813,6 +1861,7 @@ where
             audience_reads = custody.audience_reads(),
             repairs = out.repairs.len(),
             reported_here = out.reported_here.len(),
+            already_here = out.already_here.len(),
             not_in_audience = out.not_in_audience,
             "durability pass (CIRISEdge#763, CC 6.1.5.3)"
         );
@@ -1922,7 +1971,10 @@ where
             .is_some_and(|at| now.signed_duration_since(at) < durability::CUSTODY_REFRESH);
         let report = match (whole, live_here) {
             // Held, reported, and the report is recent: nothing to do.
-            (true, true) if fresh => return,
+            (true, true) if fresh => {
+                out.already_here.push(sha);
+                return;
+            }
             (true, _) => Some(CustodyState::Here),
             // The copy this node reported is gone: say so, so the cohort's
             // deficit lists this node until it is repaired.
@@ -2690,19 +2742,23 @@ where
         };
 
         // ── manifest ── held from an earlier attempt, or fetched now.
+        //
+        // persist v55.0.0 (#951) — the manifest is adopted `LocalOnly`, ALWAYS:
+        // a sealed DAG is announced at PROMOTION (`promote_adopted_manifest_to_dag`
+        // with the gate's `adopt`), once every chunk is held, never at the
+        // manifest. `announced` here is only the REPAIR path's answer (a DAG
+        // already promoted, re-filled below): the claim that exists.
         let announced;
         let held = match self.backend.has_blob(&sha).await {
             Ok(h) => h,
             Err(e) => return PullOutcome::StoreFailed(format!("has_blob: {e}")),
         };
         if held {
-            // CIRISEdge#735 — a RESUME. The manifest was adopted, and its
-            // `holds_bytes` emitted or not, by an earlier attempt; this one
-            // skips the adopt, so `announced` is read off the claim that
-            // exists rather than reported false for a door not called. At
-            // `community_dek` the first attempt announced and the resume
-            // used to deny it; at `invisible_encrypted` no claim exists
-            // (CC 5.2) and this reads false, as before.
+            // CIRISEdge#735 — a RESUME. The manifest was adopted by an earlier
+            // attempt; this one skips the adopt, so `announced` is read off the
+            // holding claim that exists (persist v55: `custody:ack:v1`, through
+            // the same `list_holders` fold) rather than reported false for a
+            // door not called.
             announced = match self.backend.list_holders(&sha).await {
                 Ok(holders) => holders.contains(&self.local_key_id),
                 Err(e) => return PullOutcome::StoreFailed(format!("list_holders: {e}")),
@@ -2731,7 +2787,12 @@ where
             };
             announced = match self
                 .engine
-                .adopt_sealed_blob(&bytes, provenance.clone(), Some(&aad), adopt)
+                .adopt_sealed_blob(
+                    &bytes,
+                    provenance.clone(),
+                    Some(&aad),
+                    AdoptDisposition::LocalOnly,
+                )
                 .await
             {
                 Ok(outcome) => outcome.announced,
@@ -2809,6 +2870,17 @@ where
         if let Err(refusal) = check_dag_plan(stream_id, pointer.size, &plan) {
             return self.dag_refused(row, &blob_hex, refusal);
         }
+        // persist v55.0.0 (#977) — a room stream (`community_dek`) sealed by a
+        // v55 writer is STREAM-KEYED: one DEK per `(stream_id, epoch)`, the
+        // manifest naming each chunk's epoch (a v4 manifest; `epoch` is `Some`
+        // on its chunks). Its chunks carry NO community binding — their key is
+        // the stream epoch's, wrapped as a `key_grant:stream:v1` row — so they
+        // are adopted with no community epoch in their provenance, and the
+        // pull waits for those stream keys below as a self/family DAG does. A
+        // room DAG sealed per chunk under the community epoch (written before
+        // v55; no chunk names an epoch) keeps the manifest's provenance and
+        // needs no separate chunk keys.
+        let stream_keyed_room = is_stream_keyed_room(pointer.tier, &view);
 
         // ── chunks ── each by its sha, adopted at its position; held ones skipped.
         let held_chunks: HashMap<u64, [u8; 32]> =
@@ -2885,7 +2957,8 @@ where
         let adopters = if batch_max == 1 { lanes } else { 1 };
         let overhead = AT_REST_ENVELOPE_OVERHEAD as u64;
         let stream = view.stream_id.as_str();
-        let provenance = &provenance;
+        let chunk_provenance = chunk_provenance_of(&provenance, stream_keyed_room);
+        let provenance = &chunk_provenance;
         let engine = &self.engine;
         let mut fetching = FuturesUnordered::new();
         let mut adopting = FuturesUnordered::new();
@@ -3084,10 +3157,11 @@ where
         // door, ONE call for both manifest versions, answered from the grant
         // rows with no chunk opened: per stream EPOCH for a v4 DAG (one DEK
         // per `(stream, epoch)`, CIRISPersist#969), per chunk for a v2 one
-        // (persist I314c). At `community_dek` the chunks share the manifest's
-        // epoch binding (one provenance per stream, adopted above), so the
-        // manifest opening as this node already answered it.
-        if pointer.tier == CryptoTier::InvisibleEncrypted {
+        // (persist I314c). A per-chunk-bound room DAG (`community_dek`, pre-v55)
+        // shares the manifest's epoch binding, so the manifest opening as this
+        // node already answered it; a STREAM-KEYED room DAG (persist v55.0.0,
+        // #977) does not, and asks the door like a self/family one.
+        if needs_chunk_key_readiness(pointer.tier, stream_keyed_room) {
             let readiness = match self
                 .engine
                 .sealed_dag_readiness(&sha, &self.local_key_id, Some(&aad))
@@ -3158,9 +3232,12 @@ where
 
         // ── promoted ── persist checks every chunk row against the manifest.
         let promoting = Instant::now();
+        // persist v55.0.0 (#951) — the gate's disposition is carried HERE: under
+        // `Announce` the promotion emits this node's holding claim for the
+        // root once its checks pass; `LocalOnly` emits nothing.
         let promoted = self
             .engine
-            .promote_adopted_manifest_to_dag(&sha, &self.local_key_id, Some(&aad))
+            .promote_adopted_manifest_to_dag(&sha, &self.local_key_id, Some(&aad), adopt)
             .await;
         metrics.add_blob_dag_phase("dag_promote", promoting.elapsed());
         match promoted {
@@ -3172,11 +3249,13 @@ where
                     chunk_count = promotion.chunk_count,
                     total_size = promotion.total_size,
                     promoted = promotion.promoted,
-                    announced,
+                    announced = promotion.announced,
                     "DAG pulled: the manifest row is a chunk_dag and reads as the file \
                      (CIRISEdge#717)"
                 );
-                PullOutcome::Stored { announced }
+                PullOutcome::Stored {
+                    announced: promotion.announced,
+                }
             }
             Err(BlobError::InvalidArgument(detail)) => {
                 self.dag_refused(row, &blob_hex, DagPullRefusal::ChunkMissing { detail })
@@ -3477,6 +3556,88 @@ where
 mod tests {
     use super::super::meaning::fixture::{bare_row, content_row};
     use super::*;
+
+    /// persist v55.0.0 (#977) — a room DAG whose manifest names each chunk's
+    /// epoch is STREAM-KEYED: its chunks are adopted with no community epoch
+    /// and the pull waits for their stream keys before promoting. A room DAG
+    /// whose chunks name no epoch (sealed per chunk under the community epoch
+    /// before v55) keeps the manifest's provenance and asks for no chunk keys.
+    /// A self/family DAG asks the readiness door either way.
+    #[test]
+    fn a_stream_keyed_room_dag_waits_for_stream_keys_and_a_legacy_one_does_not() {
+        use ciris_persist::federation::chunk_dag_cascade::orchestrate::{
+            SealedManifestChunk, SealedManifestView,
+        };
+        let view = |epochs: &[Option<u64>]| SealedManifestView {
+            sha256_hex: "ab".repeat(32),
+            storage_kind: "inline".into(),
+            tier: "community_dek".into(),
+            stream_id: "room-stream".into(),
+            total_size: 2,
+            version: 4,
+            chunks: epochs
+                .iter()
+                .enumerate()
+                .map(|(i, e)| SealedManifestChunk {
+                    sha256_hex: "cd".repeat(32),
+                    size: 1,
+                    seq: i as u64,
+                    epoch: *e,
+                })
+                .collect(),
+            children: Vec::new(),
+            inline_bytes_cap: 1 << 20,
+            whole_read_cap_bytes: 1 << 30,
+            max_chunks: 1 << 20,
+        };
+        let manifest = BlobProvenance {
+            author_key_id: "alice".into(),
+            cohort_scope: "community".into(),
+            community_key_id: Some("room-1".into()),
+            epoch: Some(3),
+            tier: CryptoTier::CommunityDek,
+            minter_key_id: None,
+        };
+
+        // Stream-keyed room DAG (a v55 writer).
+        let keyed = is_stream_keyed_room(CryptoTier::CommunityDek, &view(&[Some(0), Some(0)]));
+        assert!(keyed, "chunks naming their epoch: stream-keyed");
+        assert!(
+            needs_chunk_key_readiness(CryptoTier::CommunityDek, keyed),
+            "a stream-keyed room DAG waits for its key_grant:stream:v1 keys"
+        );
+        let chunks = chunk_provenance_of(&manifest, keyed);
+        assert_eq!(chunks.epoch, None, "its chunks carry no community epoch");
+        assert_eq!(
+            chunks.community_key_id.as_deref(),
+            Some("room-1"),
+            "but their room"
+        );
+        assert_eq!(chunks.tier, CryptoTier::CommunityDek);
+
+        // Legacy per-chunk-bound room DAG (sealed before v55).
+        let legacy = is_stream_keyed_room(CryptoTier::CommunityDek, &view(&[None, None]));
+        assert!(!legacy, "chunks naming no epoch: per-chunk-bound");
+        assert!(
+            !needs_chunk_key_readiness(CryptoTier::CommunityDek, legacy),
+            "a per-chunk-bound room DAG shares the manifest's epoch: no chunk keys to wait for"
+        );
+        assert_eq!(
+            chunk_provenance_of(&manifest, legacy),
+            manifest,
+            "its chunks keep the manifest's provenance, community epoch included"
+        );
+
+        // Self/family DAGs ask the door whatever their manifest says.
+        assert!(!is_stream_keyed_room(
+            CryptoTier::InvisibleEncrypted,
+            &view(&[Some(0)])
+        ));
+        assert!(needs_chunk_key_readiness(
+            CryptoTier::InvisibleEncrypted,
+            false
+        ));
+    }
 
     /// CIRISEdge#739 — the pipeline's admission rule (§6.7.5): `K` bounds
     /// the requests, the byte budget bounds the memory, and an empty

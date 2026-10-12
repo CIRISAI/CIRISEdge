@@ -18,7 +18,6 @@
 use ciris_persist::federation::blobs::BlobStorage as _;
 use ciris_persist::federation::custody_ack::{device_custody_of, CustodyVerdict};
 use ciris_persist::federation::durability::{DeficitAudience, DurabilityMode};
-use ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX;
 use ciris_persist::federation::types::device_class;
 use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
 
@@ -150,11 +149,16 @@ async fn a_self_file_reaches_every_personal_device_as_a_full_holder_not_a_server
         !matches!(at_s, PullOutcome::Stored { .. }),
         "a server-class node of alice's holds none of her self file: {at_s:?}"
     );
+    assert_eq!(
+        verdict(&node_a, &node_a.me, &file.sha).await,
+        CustodyVerdict::Here,
+        "persist v55's write door filed A's holding claim as it stored the file (CIRISPersist#989)"
+    );
     let sweep_a = puller_a.durability_sweep().await;
     assert_eq!(
-        sweep_a.reported_here,
-        vec![file.sha],
-        "A holds its own file whole and reports it"
+        (sweep_a.reported_here.clone(), sweep_a.already_here.clone()),
+        (Vec::new(), vec![file.sha]),
+        "A holds its own file whole, and its report is live and fresh: nothing to re-file"
     );
     assert!(sweep_a.repairs.is_empty());
     let sweep_s = puller_s.durability_sweep().await;
@@ -212,8 +216,8 @@ async fn a_device_that_lost_its_copy_is_missing_and_repaired_rarest_first_763() 
             .await,
         PullOutcome::Stored { announced: false }
     );
-    // A reports both; only F1's report reaches B.
-    assert_eq!(puller_a.durability_sweep().await.reported_here.len(), 2);
+    // A's write door reported both (v55); only F1's report reaches B.
+    assert_eq!(puller_a.durability_sweep().await.already_here.len(), 2);
     let f1_hex = hex::encode(f1.sha);
     for row in node_a
         .dir
@@ -334,11 +338,7 @@ async fn key_grant_rows(node: &Node) -> usize {
         .await
         .expect("list")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
         .count()
 }
 
@@ -466,9 +466,11 @@ async fn a_dag_missing_a_chunk_is_not_held_and_files_no_here_763() {
     let repair = puller
         .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
         .await;
+    // persist v55 (CIRISPersist#989): B's `here`, filed after its first pull,
+    // IS its holding claim, so the repair reports the claim that exists.
     assert_eq!(
         repair,
-        PullOutcome::Stored { announced: false },
+        PullOutcome::Stored { announced: true },
         "the pull fetched the lost chunk and persist re-adopted it at its kept position \
          (not AlreadyHeld, not a seq conflict)"
     );
@@ -950,16 +952,18 @@ async fn the_durability_pass_rolls_past_its_file_budget_802() {
                 .sha,
         );
     }
+    // Persist v55's write door filed each file's `here` (CIRISPersist#989),
+    // so a pass that reaches a file finds it live and fresh.
     let first = puller_a.durability_sweep().await;
     assert_eq!(
-        first.reported_here.len(),
+        first.already_here.len(),
         4,
-        "the first pass stops after two pages (budget 3): {} reported",
-        first.reported_here.len()
+        "the first pass stops after two pages (budget 3): {} reached",
+        first.already_here.len()
     );
     let second = puller_a.durability_sweep().await;
-    let mut reached: Vec<[u8; 32]> = first.reported_here.clone();
-    reached.extend(second.reported_here.iter().copied());
+    let mut reached: Vec<[u8; 32]> = first.already_here.clone();
+    reached.extend(second.already_here.iter().copied());
     for sha in &shas {
         assert!(
             reached.contains(sha),
@@ -968,7 +972,7 @@ async fn the_durability_pass_rolls_past_its_file_budget_802() {
         );
     }
     assert!(
-        !second.reported_here.is_empty(),
+        !second.already_here.is_empty(),
         "the second pass resumed past the first pass's stop, not at the room's head"
     );
 }
@@ -1041,9 +1045,9 @@ async fn a_durability_pass_folds_each_audience_device_once_817() {
 
     let sweep_a = puller_a.durability_sweep().await;
     assert_eq!(
-        sweep_a.reported_here.len(),
+        sweep_a.already_here.len(),
         4,
-        "A holds and reports all four"
+        "A holds all four, each reported by persist v55's write door"
     );
     let audience = super::durability::audience_of(
         &row_deficit(

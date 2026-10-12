@@ -332,6 +332,11 @@ pub struct DurabilitySweep {
     pub repairs: Vec<Repair>,
     /// Files this node holds whole and (re-)filed its `here` for.
     pub reported_here: Vec<[u8; 32]>,
+    /// Files this node holds whole whose `here` is live and fresh, so nothing
+    /// was filed. Since persist v55 (CIRISPersist#989) the write doors file
+    /// the holding claim as they store, so a file this node wrote lands here
+    /// on its first pass, not in [`Self::reported_here`].
+    pub already_here: Vec<[u8; 32]>,
     /// Files this node read but is not in the audience of.
     pub not_in_audience: usize,
 }
