@@ -53,7 +53,8 @@ over `CohortGroup::record_secret`, but with a bench-only HKDF label; §10 V1.)
 - `CallId([u8; 32])` (**new**) = the content hash of the call's genesis row (the ring row, §7),
   so a call is named by a signed room row and two members never disagree about it.
 - Per-publisher `StreamId` = `SHA-256("ciris-edge:call-stream:v1" ‖ CallId ‖ utf8(publisher
-  key_id))`. The persist / STREAM-nonce label is `realtime_av::stream_label(stream_id)` (lowercase
+  NODE key_id))`. The stream's writer is a NODE key (persist, P5): one person publishing from two
+  devices is two streams. The persist / STREAM-nonce label is `realtime_av::stream_label(stream_id)` (lowercase
   hex), as #846 fixes; a kept stream's persist stream is named by that hex.
 
 ### 3.2 The MLS group IS the room's
@@ -155,8 +156,8 @@ walks the list.
 | DEK | room MLS exporter (§3.2), in memory, zeroized at the roll | the same exporter secret |
 | persist DEK door | **never touched** | `register_stream_epoch_dek(cohort_scope, room, stream_label, epoch, &dek, …, None)` once per epoch, BEFORE that epoch's first chunk |
 | key grants | none (forward secrecy: an unkept call wraps to nobody) | persist wraps to the stream's audience, `key_grant:stream:v1` |
-| seal | `seal_av_inner` (persist's pure seal, #846) | same bytes; item 3 writes them into the stream |
-| bytes at rest | ciphertext only (§10 P1: which door) | the stream's chunks |
+| seal | `seal_av_inner` (persist's pure seal, #846) | the same bytes |
+| bytes at rest | the live ciphertext, ADOPTED by its author: `adopt_sealed_chunk(s)` under `for_stream_keyed_chunk` provenance, no DEK row (persist P1, BELIEVED; witnessed in persist's final head). How long it is kept is edge's choice: the reconnect horizon, CC 5.3.3.4 | the live ciphertext, ADOPTED by its author into the supplied epoch (item 3, below) |
 
 - **The keep layer is item 2's** (`transport::av_keep`, CIRISEdge `local/805-2-one-dek`):
   `KeptAvPublisher<R: StreamDekRegistrar>` wraps `AvPublisher`; its async `create`, `admit_joiner`
@@ -175,7 +176,14 @@ walks the list.
   next epoch (through the keep layer) and resends; nothing was stored.
 - **A second registration with a DIFFERENT DEK** is persist's `StreamEpochDekConflict` from v55.1
   (CIRISPersist#1069); `AlreadyRegisteredHere` is the same-DEK idempotent case.
-- `register_stream_epoch_dek` closes the open epoch with its terminator (persist-side); the live
+- **Item 3 is "the author adopts its live ciphertext"** (persist P4, CIRISPersist#1067 v55.1): a
+  supplied epoch is V2 (no form argument), and stored == live bytes because the author ADOPTS the
+  exact chunks it sealed live into the supplied epoch. Never a re-seal through
+  `put_blob_chunk_scoped`. Still open on #1067: the counter bookkeeping for adopted chunks, and the
+  STH leaf order (edge asked for `(epoch, counter)` order, each epoch's terminator its last leaf).
+- `register_stream_epoch_dek`'s `aad` seals the terminator persist writes, so it MUST equal the
+  chunks' caller AAD: `None`, i.e. #846's `AV_CHUNK_CALLER_AAD` (persist P2; the final v55 has no
+  `keep` argument). It closes the open epoch with that terminator (persist-side); the live
   side seals the same terminator with `seal_av_terminator` (counter = the epoch's chunk count, last
   set, #846).
 - **Where the keep decision comes from:** the caller (`CallOptions::keep`) until CIRISPersist#1068
@@ -191,12 +199,14 @@ walks the list.
 - Cadence: a publisher produces an STH over its stream every **K = 64 chunks or T = 2 s**,
   whichever comes first (CC 5.3.3.3), and on `leave`.
 - Producer: `stream_sth::produce_stream_sth(local, stream_label, chunk_shas, tree_size, now)` under
-  the node's full hybrid signer (the same one call `receipts::stream_sth_for_file` makes), published
-  through `BlobStorage::put_stream_sth`, whose gate recomputes the root from the chunk hashes the
-  store holds.
-- **That gate needs the chunks in the store.** A kept stream's chunks are there (item 3). An unkept
-  stream's are there only if its ciphertext is stored (§10 P1); and how a live STH reaches the
-  participants (on a row, like a file's `stream_sth` claim, or another plane) is §10 P3.
+  the node's full hybrid signer (the same one call `receipts::stream_sth_for_file` makes). It works
+  over IN-MEMORY leaf hashes with nothing stored (persist P1), so a live STH never waits on the
+  store.
+- `BlobStorage::put_stream_sth` is called only over chunks this node has ADOPTED: its gate
+  recomputes the root from the node's own store and refuses a `tree_size` larger than what it holds.
+- **Carrier:** there is no replicated STH carrier; `stream_sth` rows are node-local (persist P3).
+  Live STHs ride edge's own wire to the call's participants for now; whether CC 5.3.3.3 needs a
+  durable, replicated carrier is §10 C5.
 
 ## 7. Signalling as room rows (item 6)
 
@@ -269,23 +279,19 @@ refused frame).
   distinguishable)?
 
 **Persist**
-- **P1.** An unkept call stores "ciphertext only": through which door? `put_blob_chunk_scoped`
-  takes plaintext and seals with a registered DEK (not allowed: an unkept call never registers);
-  `adopt_sealed_chunk` is the holder path for another author's stream. Is there (or will there be) an
-  author door for pre-sealed chunks of one's own unkept stream, so `put_stream_sth`'s gate can see
-  its chunk hashes? Or is an unkept call's STH produced without storing its chunks?
-- **P2.** `register_stream_epoch_dek`'s final v55 signature. At `8c2d88f7` it takes `keep: bool`;
-  the 2026-10-12 ruling makes "registered" mean "kept". Item 2's `StreamDekRegistrar` hides the
-  call shape from this API, but confirm `keep` is removed and `aad` is `None` for a call (so it
-  matches #846's `AV_CHUNK_CALLER_AAD`).
-- **P3.** How a live stream's STH reaches participants: on a row (a file carries `stream_sth` on its
-  row), on the hang-up row, or replicated another way?
-- **P4.** Item 3 writes a kept call's chunks: the store must seal them in the v2 form
-  (CIRISPersist#1067 says supplied epochs seal V2) with `caller_aad = None`, so the stored bytes ARE
-  the live bytes. Confirm the store door that takes them.
-- **P5.** One stream per publisher: `register_stream_epoch_dek` names the writer as the stream's
-  single sender. Confirm a call's N publishers are N streams under one room, each its own
-  `stream_not_authored` gate.
+- **P1 (answered, BELIEVED).** An unkept call's author stores its ciphertext with
+  `adopt_sealed_chunk(s)` under `for_stream_keyed_chunk` provenance, no DEK row (the holders' door);
+  persist is witnessing it in its final head. STHs: `produce_stream_sth` over in-memory leaves;
+  `put_stream_sth` only over adopted chunks (§6).
+- **P2 (answered).** The final v55 `register_stream_epoch_dek` has no `keep`; its `aad` seals the
+  terminator persist writes, so it is `None`, equal to the chunks' caller AAD.
+- **P3 (answered).** No replicated STH carrier; `stream_sth` rows are node-local. Live STHs ride
+  edge's wire; the durable question is C5.
+- **P4 (answered, CIRISPersist#1067 v55.1).** No form argument; a supplied epoch is V2; stored ==
+  live by the author ADOPTING its live ciphertext. OPEN on #1067: adopted-chunk counter bookkeeping,
+  and the STH leaf order (`(epoch, counter)`, each epoch's terminator last, as edge asked).
+- **P5 (answered).** One stream per publisher; the writer is a NODE key (two devices, two
+  streams).
 
 **The CC**
 - **C1.** Who may make a call kept (recorded / `history_on_join: full`): the opener, any
@@ -298,18 +304,27 @@ refused frame).
   community-encrypted like chat messages (proposed: yes; the row's existence and time still leak).
 - **C4.** Presence is local D6 reachability only, never attested (proposed): confirm nothing in the
   CC asks for a presence row.
+- **C5.** Does CC 5.3.3.3 require a live stream's STHs to have a durable, replicated carrier (persist
+  has none; `stream_sth` rows are node-local), or is edge's wire to the participants enough?
 
 ## 11. Sequencing
 
 1. #846 part 2 (persist v55.1) — the one seal.
-2. CIRISPersist#981 / item 2 — one DEK; answers P2, P4.
-3. Item 3 — live chunks into the stream, STHs; answers P1, P3.
-4. V1 / V2 from verify; C1–C4 from the CC.
+2. CIRISPersist#981 / item 2 — one DEK (`KeptAvPublisher`, `local/805-2-one-dek`).
+3. Item 3 — **the author adopts its live ciphertext** (`adopt_sealed_chunk(s)`): into the supplied
+   epoch when kept, under `for_stream_keyed_chunk` with no DEK row when unkept; live STHs from
+   in-memory leaves, `put_stream_sth` over adopted chunks. Waits on #1067's counter bookkeeping and
+   leaf order.
+4. V1 / V2 from verify; C1–C5 from the CC.
 5. This API (item 5) and the signalling rows (item 6), behind those.
 
 ## 12. Changelog
 
 - 2026-10-12 — first draft (CIRISEdge#805 items 5–6).
+- 2026-10-12 — persist's P1–P5 answers: an author ADOPTS its own live ciphertext (unkept: no DEK
+  row; kept: into the supplied V2 epoch), live STHs from in-memory leaves and `put_stream_sth` only
+  over adopted chunks, no replicated STH carrier (C5 added), register `aad` = `None`, one stream per
+  publisher NODE.
 - 2026-10-12 — the call API builds on item 2's `KeptAvPublisher` / `AvKeep` / `KeepOutcome`; a
   refused keep is the typed `CallEvent::KeepRefused` (partial recording), rotation without a roster
   change is a self-update commit, `StreamEpochDekConflict` (#1069) named, keep comes from the row
