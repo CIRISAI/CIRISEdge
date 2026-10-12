@@ -707,6 +707,19 @@ pub struct RemovalReceiptLedger {
 /// Removal primitives are rare; 1024 covers years of fleet churn.
 pub const REMOVAL_LEDGER_CAP: usize = 1024;
 
+/// CIRISEdge#763 — a durability pass filed this node's `here` (no live
+/// report, or one older than the refresh).
+pub const DURABILITY_FILED_HERE: &str = "filed_here";
+/// CIRISEdge#763 — a durability pass found this node's `here` live and fresh
+/// (persist v55: the write door filed it as it stored).
+pub const DURABILITY_ALREADY_HERE: &str = "already_here";
+/// CIRISEdge#763 — a durability pass corrected a live `here` to `none`.
+pub const DURABILITY_FILED_NONE: &str = "filed_none";
+/// CIRISEdge#763 — persist refused a durability pass's custody report.
+pub const DURABILITY_REPORT_REFUSED: &str = "report_refused";
+/// CIRISEdge#763 — a durability pass queued a repair.
+pub const DURABILITY_REPAIR: &str = "repair";
+
 /// CIRISEdge#763 — the `blob_serve_refusals` tag for a chunk serve refused
 /// `Withdrawn`: every reference to the file was withdrawn (CC 2.3), by edge's
 /// revocation register or persist's tombstone fold.
@@ -1250,6 +1263,12 @@ pub struct EdgeMetrics {
     /// chunk count exactly once — the witness for "each chunk adopted exactly
     /// once".
     pub blob_dag_chunks: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#763 (CC 6.1.5.3), persist v55 (CIRISPersist#989) — what each
+    /// durability pass found, per file in this node's audience, by tag
+    /// (`DURABILITY_*`): a `here` filed (absent, lapsed or stale), a `here`
+    /// already live and fresh (since v55 the write doors file it), a `none`
+    /// filed for a lost copy, a report persist refused, a repair queued.
+    pub durability_custody: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files, by tag
     /// (`receipts`): `emitted` / `not_emitted_*` on the receiving node;
     /// `admitted` and the named refusals (`receipt_root_unpublished`,
@@ -1713,6 +1732,11 @@ impl EdgeMetrics {
         let slot = phases.entry(phase).or_insert((0, 0));
         slot.0 = slot.0.saturating_add(ns);
         slot.1 = slot.1.saturating_add(1);
+    }
+
+    /// CIRISEdge#763 — count one durability-pass custody outcome by tag.
+    pub fn inc_durability_custody(&self, tag: &'static str) {
+        *self.durability_custody.write().entry(tag).or_insert(0) += 1;
     }
 
     /// CIRISEdge#739 — count chunks in the DAG pull's ledger by outcome.
@@ -2451,6 +2475,7 @@ impl EdgeMetrics {
                 .collect(),
             blob_dag_phases: owned_keys(&self.blob_dag_phases),
             blob_dag_chunks: owned_keys(&self.blob_dag_chunks),
+            durability_custody: owned_keys(&self.durability_custody),
             delivery_receipts: owned_keys(&self.delivery_receipts),
             blob_route_refusals: self
                 .blob_route_refusals
@@ -2728,6 +2753,8 @@ pub struct EdgeMetricsBundle {
     /// CIRISEdge#739 — chunk-DAG chunk ledger by outcome (`adopted`,
     /// `skipped_held`, `in_flight_peak`).
     pub blob_dag_chunks: HashMap<String, u64>,
+    /// CIRISEdge#763 — durability-pass custody outcomes by tag.
+    pub durability_custody: HashMap<String, u64>,
     /// CIRISEdge#738 — delivery receipts for files, by tag.
     pub delivery_receipts: HashMap<String, u64>,
     /// CIRISEdge#636 — bootstrap-door decisions by label (`attributed` /
@@ -3030,6 +3057,7 @@ impl EdgeMetricsBundle {
         f.counters
             .insert("blob_dag_phases".to_string(), dag_samples);
         f.family("blob_dag_chunks", &self.blob_dag_chunks);
+        f.family("durability_custody", &self.durability_custody);
         f.family("delivery_receipts", &self.delivery_receipts);
         f.family("bootstrap_door_outcomes", &self.bootstrap_door_outcomes);
         f.family("transport_inbound_drops", &self.transport_inbound_drops);
@@ -3227,6 +3255,7 @@ edge_metrics_bundle_fields!(
     blob_pull_refusals,
     blob_dag_phases,
     blob_dag_chunks,
+    durability_custody,
     delivery_receipts,
     bootstrap_door_outcomes,
     transport_inbound_drops,

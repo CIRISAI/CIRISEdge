@@ -1138,3 +1138,112 @@ async fn a_durability_pass_folds_each_audience_device_once_817() {
     assert_pass_index_agrees(&node_b, &refs, &devices).await;
     assert_pass_index_agrees(&node_a, &refs, &devices).await;
 }
+
+/// Does `node`'s holder fold, read at `at`, name `node` itself for `sha`?
+async fn names_itself(node: &Node, sha: &[u8; 32], at: chrono::DateTime<chrono::Utc>) -> bool {
+    ciris_persist::federation::holding_claim::live_holders(&*node.dir, sha, at)
+        .await
+        .expect("live_holders")
+        .contains(&node.me)
+}
+
+/// **The pass still FILES a `here` whenever this node's claim is not live
+/// and fresh.** Since persist v55 the write door files the holding claim as it
+/// stores, so a fresh file is `already_here` on the first pass; this is the
+/// pass's own filing job, which those first passes no longer reach. alice's
+/// laptop A publishes a self file, and:
+///
+/// 1. A retracts its claim (a `none`, CC 3.1.3.3 rule 4): its holder fold
+///    drops it, and the next pass files a `here` again, so the fold names A.
+/// 2. Read 25 h on, the claim is live but past the daily refresh
+///    (`CUSTODY_REFRESH`): the pass re-files it.
+/// 3. Read 73 h on, every claim A filed has lapsed (72 h liveness): the pass
+///    files a fresh one, which the fold at the real clock names.
+///
+/// Each filing is booked `filed_here` in `durability_custody`; the
+/// fresh-claim pass is booked `already_here`. Fails with the filing arm
+/// removed (nothing re-files, and a lapsed claim stays lapsed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pass_files_here_when_the_claim_is_retracted_stale_or_lapsed_763() {
+    use crate::observability::{DURABILITY_ALREADY_HERE, DURABILITY_FILED_HERE};
+    use ciris_persist::federation::custody_ack::CustodyState;
+    let (alice, node_a, _node_b) = two_devices().await;
+    let edge_a = edge_of(&node_a);
+    let puller_a = puller_of(&node_a, &edge_a);
+    let booked = |tag: &str| {
+        edge_a
+            .metrics()
+            .snapshot()
+            .durability_custody
+            .get(tag)
+            .copied()
+            .unwrap_or(0)
+    };
+    let file = publish_self_file(&node_a, &alice).await;
+    let now = chrono::Utc::now;
+    assert!(
+        names_itself(&node_a, &file.sha, now()).await,
+        "the write door filed A's claim"
+    );
+    let first = puller_a.durability_sweep().await;
+    assert_eq!(first.already_here, vec![file.sha]);
+    assert_eq!(booked(DURABILITY_ALREADY_HERE), 1);
+    assert_eq!(booked(DURABILITY_FILED_HERE), 0);
+
+    // 1. Retracted.
+    let file_row = crate::files::FileRow::from_row(&file.row).expect("a file row");
+    super::durability::file_custody(
+        node_a.store.engine(),
+        &file.row,
+        &file.sha,
+        &file_row.pointer,
+        CustodyState::None,
+    )
+    .await
+    .expect("A retracts its claim");
+    assert!(
+        !names_itself(&node_a, &file.sha, now()).await,
+        "a `none` retracts A's claim"
+    );
+    let refiled = puller_a.durability_sweep().await;
+    assert_eq!(
+        refiled.reported_here,
+        vec![file.sha],
+        "the pass files a `here` for a retracted claim it still holds whole"
+    );
+    assert!(
+        names_itself(&node_a, &file.sha, now()).await,
+        "the fold names A again"
+    );
+    assert_eq!(booked(DURABILITY_FILED_HERE), 1);
+
+    // 2. Stale: live, but past the daily refresh.
+    let stale = puller_a
+        .durability_sweep_at(now() + chrono::Duration::hours(25))
+        .await;
+    assert_eq!(
+        stale.reported_here,
+        vec![file.sha],
+        "a claim past the refresh is re-filed"
+    );
+    assert_eq!(booked(DURABILITY_FILED_HERE), 2);
+
+    // 3. Lapsed: past the 72 h liveness of every claim A filed.
+    let lapsed_at = now() + chrono::Duration::hours(73);
+    assert!(
+        !names_itself(&node_a, &file.sha, lapsed_at).await,
+        "73 h on, every claim A filed has lapsed"
+    );
+    let lapsed = puller_a.durability_sweep_at(lapsed_at).await;
+    assert_eq!(
+        lapsed.reported_here,
+        vec![file.sha],
+        "a lapsed claim is filed afresh"
+    );
+    assert_eq!(booked(DURABILITY_FILED_HERE), 3);
+    assert!(
+        names_itself(&node_a, &file.sha, now()).await,
+        "the fresh claim is live at the real clock"
+    );
+    assert!(lapsed.repairs.is_empty() && refiled.repairs.is_empty());
+}

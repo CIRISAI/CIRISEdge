@@ -1753,6 +1753,17 @@ where
     /// node's audience (a server-class node and the owner's self content, CC
     /// 3.3.7) is counted and left alone.
     pub async fn durability_sweep(&self) -> super::durability::DurabilitySweep {
+        self.durability_sweep_at(chrono::Utc::now()).await
+    }
+
+    /// [`Self::durability_sweep`] read at `now`: every liveness and refresh
+    /// decision of the pass is taken at that instant. A test runs a pass a
+    /// day or three days on to reach a stale or lapsed `here`; the reports
+    /// the pass files are signed at the real clock.
+    pub(crate) async fn durability_sweep_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> super::durability::DurabilitySweep {
         // Small in tests, so the rolling scan's budget can be exercised
         // (CIRISEdge#802 review) without thousands of fixture files.
         #[cfg(not(test))]
@@ -1764,7 +1775,6 @@ where
         #[cfg(test)]
         const MAX_FILES: usize = 3;
         let mut out = super::durability::DurabilitySweep::default();
-        let now = chrono::Utc::now();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         // CIRISEdge#817 — each audience device's custody history is read once
         // for the whole pass, not once per file; built fresh every pass.
@@ -1913,6 +1923,7 @@ where
         out: &mut super::durability::DurabilitySweep,
     ) {
         use super::durability::{self, Repair};
+        use crate::observability as obs;
         use ciris_persist::federation::custody_ack::{CustodyState, CustodyVerdict};
         let me = self.local_key_id.as_str();
         let dir: &dyn FederationDirectory = &*self.backend;
@@ -1969,9 +1980,11 @@ where
             .as_ref()
             .and_then(|c| c.reported_at)
             .is_some_and(|at| now.signed_duration_since(at) < durability::CUSTODY_REFRESH);
+        let metrics = self.edge.metrics();
         let report = match (whole, live_here) {
             // Held, reported, and the report is recent: nothing to do.
             (true, true) if fresh => {
+                metrics.inc_durability_custody(obs::DURABILITY_ALREADY_HERE);
                 out.already_here.push(sha);
                 return;
             }
@@ -1983,17 +1996,24 @@ where
         };
         if let Some(state) = report {
             match durability::file_custody(&self.engine, &row, &sha, &file.pointer, state).await {
-                Ok(_) if state == CustodyState::Here => out.reported_here.push(sha),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    blob = %blob,
-                    state = state.as_str(),
-                    error = %e,
-                    "durability pass: custody report not filed"
-                ),
+                Ok(_) if state == CustodyState::Here => {
+                    metrics.inc_durability_custody(obs::DURABILITY_FILED_HERE);
+                    out.reported_here.push(sha);
+                }
+                Ok(_) => metrics.inc_durability_custody(obs::DURABILITY_FILED_NONE),
+                Err(e) => {
+                    metrics.inc_durability_custody(obs::DURABILITY_REPORT_REFUSED);
+                    tracing::warn!(
+                        blob = %blob,
+                        state = state.as_str(),
+                        error = %e,
+                        "durability pass: custody report not filed"
+                    );
+                }
             }
         }
         if !whole {
+            metrics.inc_durability_custody(obs::DURABILITY_REPAIR);
             out.repairs.push(Repair {
                 row,
                 sha,

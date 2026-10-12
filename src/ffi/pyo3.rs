@@ -3093,6 +3093,11 @@ fn metrics_bundle_to_pydict<'py>(
         dag_chunks.set_item(label.as_str(), *n)?;
     }
     root.set_item("blob_dag_chunks", dag_chunks)?;
+    let durability = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.durability_custody {
+        durability.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("durability_custody", durability)?;
 
     // CIRISEdge P0 telemetry — the two duration histograms, as
     // `{"buckets": {le: cumulative}, "count": n, "sum": seconds}`; the
