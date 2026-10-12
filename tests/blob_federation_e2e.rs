@@ -6907,3 +6907,284 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
         .expect("carol still opens the e0 file after the rotation");
     assert!(still == plain, "byte-identical on C after the rotation");
 }
+
+/// **persist v55.0.0 (CIRISPersist#977) — a stream-keyed room chunk is never
+/// held under a community epoch: refused at the adopt once this node knows
+/// the stream is stream-keyed, and remedied at the promote when it landed
+/// before that.** alice publishes a file into a two-member room (a v55
+/// writer: the DAG is stream-keyed, one `(stream, epoch)` DEK, the manifest
+/// under the room's epoch DEK). bob's node receives the room row and the
+/// room's epoch key rows, but not yet the stream's:
+///
+/// 1. chunk 0, adopted under the ROW's provenance (the community epoch), is
+///    accepted and bound to that epoch: the chunk door cannot yet tell it
+///    from a legacy chunk (the ordering gap persist names);
+/// 2. the stream's key rows land; now chunk 1 under the same provenance is
+///    refused `StreamKeyedChunkCommunityEpoch` at the adopt, the whole batch,
+///    nothing written;
+/// 3. edge's pull (chunks under `for_stream_keyed_chunk`, chunk 0 held and
+///    skipped) reaches the promote, which refuses chunk 0's binding; the pull
+///    evicts it, re-fetches and re-adopts it stream-keyed, promotes again, and
+///    is `Stored`. One chunk booked `remediated`; no community epoch binds any
+///    chunk afterwards; the file reads back byte-identical.
+///
+/// Fails without the remediation (the pull ends
+/// `DagRefused(StreamKeyedChunkCommunityEpoch)`, never `Stored`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // the gap, the refusal, then the remedy, in order, on purpose
+async fn a_room_chunk_bound_to_the_community_epoch_is_refused_at_adopt_and_remedied_at_promote_977()
+{
+    use ciris_edge::blob_swarm::{BlobPuller, DagByteFetch as _, PullConfig, PullOutcome};
+    use ciris_edge::files::FileRow;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::key_grant::{KeyGrantAxis, KeyGrantRow, SignedKeyGrantRow};
+    use ciris_persist::federation::{
+        AdoptChunkItem, BlobError, BlobProvenance, FederationDirectory, SignedAttestation,
+    };
+    const ROOM: &str = "room-977";
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let room_key = Ident::new(ROOM, 0x99);
+    let idents = [&alice, &bob, &room_key];
+    let node_a = node(&idents, &alice).await;
+    let node_b = node(&idents, &bob).await;
+    for n in [&node_a, &node_b] {
+        seed_room(n, ROOM, &[&alice, &bob]).await;
+    }
+    federate(&node_a, &node_b).await;
+    federate(&node_b, &node_a).await;
+    let (_wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
+    let puller_b = BlobPuller::new(
+        Arc::clone(&edge_b),
+        node_b.store.engine().clone(),
+        node_b.dir.clone(),
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        node_b.me.clone(),
+        PullConfig::default(),
+    );
+
+    let file_len = 1_300_000usize;
+    let plain = body_of(file_len, 0x977);
+    let room = ciris_edge::scope_room::ScopeRoom::community(ROOM);
+    let published = ciris_edge::files::publish(
+        &*node_a.dir,
+        &node_a.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &ciris_edge::files::FileWrite {
+            room: &room,
+            bytes: &plain,
+            media_type: "video/mp4",
+            codec: None,
+            filename: Some("gap.mp4"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("publish a chunked file into the room");
+    let e0 = published
+        .pointer
+        .epoch
+        .expect("a room pointer names its epoch");
+    let stream_id = published.pointer.stream_id.clone().expect("a chunk DAG");
+    let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let crossed_id = match &published.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!("the room file must cross: {other:?}")
+        }
+    };
+    let row = node_a
+        .dir
+        .get_attestation(&crossed_id)
+        .await
+        .expect("read")
+        .expect("the crossed row");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("bob's node admits the room row");
+    let aad = ciris_edge::group_content::content_aad(
+        &row.attesting_key_id,
+        row.asserted_at,
+        published.pointer.content_field,
+    );
+    let view = node_a
+        .store
+        .engine()
+        .open_sealed_manifest_as(&sha, &node_a.me, Some(&aad))
+        .await
+        .expect("alice opens her manifest");
+    assert!(
+        view.chunks.iter().all(|c| c.epoch == Some(0)),
+        "a v55 room DAG is stream-keyed (#977)"
+    );
+    let chunk_at = |i: usize| -> [u8; 32] {
+        hex::decode(&view.chunks[i].sha256_hex)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes")
+    };
+    let (chunk0, chunk1) = (chunk_at(0), chunk_at(1));
+
+    // Key rows: the room's epoch rows cross now, the stream's later.
+    node_a
+        .store
+        .engine()
+        .emit_pending_key_grants()
+        .await
+        .expect("alice emits");
+    let (mut stream_rows, mut epoch_rows) = (Vec::new(), Vec::new());
+    for r in node_a
+        .dir
+        .list_attestations_since(None, 500)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|a| a.attestation)
+        .filter(ciris_persist::federation::key_grant::is_key_grant_row)
+    {
+        match KeyGrantRow::from_attestation(&r)
+            .expect("a key_grant row")
+            .axis
+        {
+            KeyGrantAxis::Stream { .. } => stream_rows.push(r),
+            _ => epoch_rows.push(r),
+        }
+    }
+    assert!(!stream_rows.is_empty() && !epoch_rows.is_empty());
+    let apply_rows = |rows: Vec<ciris_persist::federation::Attestation>| {
+        let engine = node_b.store.engine().clone();
+        async move {
+            for r in rows {
+                let _ = engine
+                    .apply_replicated_key_grant(SignedKeyGrantRow { attestation: r })
+                    .await;
+            }
+        }
+    };
+    apply_rows(epoch_rows).await;
+
+    // The ROW's provenance: the pointer's community epoch.
+    let row_provenance =
+        BlobProvenance::from_attestation(&row, &sha, published.pointer.epoch, None)
+            .expect("the row's provenance");
+    assert_eq!(
+        row_provenance.epoch,
+        Some(e0),
+        "the pointer's community epoch"
+    );
+    let fetch = MeshFetch::new(&node_b.me, vec![node_a.me.clone()], &[&node_a]);
+    let adopt_under_row = |seq: u64, chunk: [u8; 32], size: u64| {
+        let engine = node_b.store.engine().clone();
+        let stream = stream_id.clone();
+        let provenance = row_provenance.clone();
+        let fetch = &fetch;
+        async move {
+            let bytes = fetch.fetch(chunk).await.expect("alice serves the chunk");
+            engine
+                .adopt_sealed_chunks(
+                    &stream,
+                    &[AdoptChunkItem {
+                        seq,
+                        envelope: &bytes,
+                        plaintext_size: size,
+                    }],
+                    0,
+                    provenance,
+                )
+                .await
+        }
+    };
+
+    // 1. The gap: before the stream's rows, a community-epoch chunk lands bound.
+    let gap = adopt_under_row(0, chunk0, u64::from(view.chunks[0].size))
+        .await
+        .expect("the door answers per item");
+    assert!(
+        matches!(&gap[..], [Ok(_)]),
+        "before the stream's key rows the door cannot tell it from a legacy chunk: {gap:?}"
+    );
+    assert!(
+        node_b
+            .dir
+            .community_dek_blob_epoch(&chunk0)
+            .await
+            .expect("binding")
+            .is_some(),
+        "chunk 0 is bound to the community epoch"
+    );
+
+    // 2. The stream's rows land: now the same provenance is refused at adopt.
+    apply_rows(stream_rows).await;
+    let refused = adopt_under_row(1, chunk1, u64::from(view.chunks[1].size)).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(BlobError::StreamKeyedChunkCommunityEpoch {
+                chunk_sha256_hex: None,
+                community_epoch,
+                ..
+            }) if *community_epoch == e0
+        ),
+        "a stream-keyed chunk under the community epoch is refused at adopt: {refused:?}"
+    );
+    assert!(
+        !node_b.dir.has_blob(&chunk1).await.expect("has_blob"),
+        "nothing written"
+    );
+
+    // 3. edge's pull: the promote names chunk 0, the pull remedies it once.
+    let outcome = puller_b.pull_dag_with(&row, sha, &fetch).await;
+    assert!(
+        matches!(outcome, PullOutcome::Stored { .. }),
+        "the pull evicts and re-adopts the bound chunk, then promotes: {outcome:?} \
+         (refusals {:?})",
+        edge_b.metrics().snapshot().blob_pull_refusals
+    );
+    assert_eq!(
+        edge_b
+            .metrics()
+            .snapshot()
+            .blob_dag_chunks
+            .get("remediated")
+            .copied(),
+        Some(1),
+        "exactly the one bound chunk was remedied"
+    );
+    for c in &view.chunks {
+        let chunk: [u8; 32] = hex::decode(&c.sha256_hex)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes");
+        assert!(
+            node_b
+                .dir
+                .community_dek_blob_epoch(&chunk)
+                .await
+                .expect("binding")
+                .is_none(),
+            "no community epoch binds stream-keyed chunk seq {}",
+            c.seq
+        );
+    }
+    let got = FileRow::from_row(&row)
+        .expect("a file row")
+        .open(&node_b.store, &node_b.me)
+        .await
+        .expect("bob opens the file");
+    assert!(got == plain, "byte-identical on bob's node");
+}

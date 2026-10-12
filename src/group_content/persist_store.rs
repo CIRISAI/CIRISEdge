@@ -359,6 +359,21 @@ fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> Grou
             range_start: *range_start,
             size: *size,
         },
+        // persist v55.0.0 (CIRISPersist#977) — typed, because its remedy is
+        // named (re-adopt under `for_stream_keyed_chunk`), never a substrate
+        // fault to retry as is.
+        B::StreamKeyedChunkCommunityEpoch {
+            stream_id,
+            epoch,
+            community_epoch,
+            chunk_sha256_hex,
+        } => GroupContentError::StreamKeyedChunkCommunityEpoch {
+            sha256_hex,
+            stream_id: stream_id.clone(),
+            epoch: *epoch,
+            community_epoch: *community_epoch,
+            chunk_sha256_hex: chunk_sha256_hex.clone(),
+        },
         other => GroupContentError::Substrate(other.to_string()),
     }
 }

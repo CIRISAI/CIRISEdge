@@ -1642,7 +1642,10 @@ impl UnopenedReason {
             // a chat body is never read by range, so here it is a fault.
             // CIRISEdge#744 — the two streamed-WRITE refusals never arise on
             // a read; if one reached here it is a fault, not a reader state.
+            // persist v55 — a stream-keyed chunk under a community epoch is an
+            // adopt/promote fault, never a read state.
             E::RangeNotSatisfiable { .. }
+            | E::StreamKeyedChunkCommunityEpoch { .. }
             | E::DeclaredLengthMismatch { .. }
             | E::Reader { .. }
             | E::Substrate(_) => Self::Substrate { detail },

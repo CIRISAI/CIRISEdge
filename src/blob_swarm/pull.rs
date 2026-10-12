@@ -435,6 +435,10 @@ pub const PULL_REFUSAL_DAG_OVER_CAP: &str = "dag_over_cap";
 pub const PULL_REFUSAL_DAG_CHUNK_MISMATCH: &str = "dag_chunk_mismatch";
 /// The `blob_pull_refusals` tag for [`DagPullRefusal::ChunkMissing`].
 pub const PULL_REFUSAL_DAG_CHUNK_MISSING: &str = "dag_chunk_missing";
+/// The `blob_pull_refusals` tag for
+/// [`DagPullRefusal::StreamKeyedChunkCommunityEpoch`].
+pub const PULL_REFUSAL_DAG_STREAM_KEYED_COMMUNITY_EPOCH: &str =
+    "dag_stream_keyed_chunk_community_epoch";
 
 /// CIRISEdge#717 — **why a chunk-DAG pull stopped**, by rung
 /// (`FSD/CONTENT_TRANSFER.md` §6.7, the pull state table). Every arm is a
@@ -495,6 +499,18 @@ pub enum DagPullRefusal {
         /// Persist's finding.
         detail: String,
     },
+    /// persist v55.0.0 (CIRISPersist#977) — a stream-keyed room chunk under a
+    /// COMMUNITY epoch (`blob_stream_keyed_chunk_community_epoch`), refused at
+    /// `stage`: `adopt` (the chunk door refused the provenance edge built —
+    /// an edge bug, since every stream-keyed chunk's provenance comes from
+    /// `BlobProvenance::for_stream_keyed_chunk`), or `promote` after this pull
+    /// attempt already evicted and re-adopted every bound chunk once.
+    StreamKeyedChunkCommunityEpoch {
+        /// `adopt` or `promote`.
+        stage: &'static str,
+        /// Persist's finding.
+        detail: String,
+    },
 }
 
 impl DagPullRefusal {
@@ -507,6 +523,9 @@ impl DagPullRefusal {
             Self::OverCap { .. } => PULL_REFUSAL_DAG_OVER_CAP,
             Self::ChunkMismatch { .. } => PULL_REFUSAL_DAG_CHUNK_MISMATCH,
             Self::ChunkMissing { .. } => PULL_REFUSAL_DAG_CHUNK_MISSING,
+            Self::StreamKeyedChunkCommunityEpoch { .. } => {
+                PULL_REFUSAL_DAG_STREAM_KEYED_COMMUNITY_EPOCH
+            }
         }
     }
 }
@@ -1181,19 +1200,27 @@ fn is_stream_keyed_room(
     tier == CryptoTier::CommunityDek && view.chunks.iter().any(|c| c.epoch.is_some())
 }
 
-/// The provenance a sealed DAG's CHUNKS are adopted under: the manifest's,
-/// except that a stream-keyed room DAG's chunks name no community epoch
-/// (persist v55.0.0, #977: "pass a provenance with `tier = community_dek`,
-/// the community, and `epoch = None`; the chunk adopt's own `epoch` argument
-/// is the stream epoch"). `BlobProvenance::from_attestation` falls back to the
-/// pointer's epoch when given none, so the epoch is cleared here.
-#[must_use]
-fn chunk_provenance_of(manifest: &BlobProvenance, stream_keyed_room: bool) -> BlobProvenance {
-    let mut chunks = manifest.clone();
+/// The provenance a sealed DAG's CHUNKS are adopted under, built from the
+/// row's provenance: unchanged for a self/family DAG and a per-chunk-bound
+/// (pre-v55) room DAG, and persist's own
+/// [`BlobProvenance::for_stream_keyed_chunk`] for a stream-keyed room DAG
+/// (persist v55.0.0, #977: no community epoch, no minter; the chunk adopt's
+/// own `epoch` argument is the stream epoch). Never the row's provenance
+/// as is for a stream-keyed chunk: a room row's pointer carries the COMMUNITY
+/// epoch, which did not seal the chunk.
+///
+/// # Errors
+/// persist's `InvalidArgument` for a stream-keyed DAG whose row provenance is
+/// not a `community_dek` one naming its community.
+fn chunk_provenance_of(
+    row_provenance: &BlobProvenance,
+    stream_keyed_room: bool,
+) -> Result<BlobProvenance, ciris_persist::federation::BlobError> {
     if stream_keyed_room {
-        chunks.epoch = None;
+        row_provenance.for_stream_keyed_chunk()
+    } else {
+        Ok(row_provenance.clone())
     }
-    chunks
 }
 
 /// Whether the pull must ask persist's readiness door for the chunks' keys
@@ -2700,6 +2727,121 @@ where
         PullOutcome::DagRefused(refusal)
     }
 
+    /// persist v55.0.0 (CIRISPersist#977) — **the promote's remedy for a
+    /// stream-keyed room chunk bound to a community epoch**: every chunk the
+    /// manifest names that a community epoch binds here is evicted through
+    /// persist's one eviction door (`Engine::evict_blob`), re-fetched,
+    /// verified against its address, and re-adopted under `chunk_provenance`
+    /// (persist's `for_stream_keyed_chunk`) at its stream epoch. Returns how
+    /// many chunks were re-adopted; `Err` is the pull's outcome when a step
+    /// fails (a fetch that did not arrive is booked for retry, as any chunk's).
+    #[allow(clippy::too_many_arguments)] // the pull's own context, passed through
+    async fn remediate_community_bound_chunks(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        attempts: u32,
+        blob_hex: &str,
+        view: &ciris_persist::federation::chunk_dag_cascade::orchestrate::SealedManifestView,
+        chunk_provenance: &BlobProvenance,
+        fetch: &dyn DagByteFetch,
+    ) -> Result<u64, PullOutcome> {
+        let mut readopted = 0u64;
+        for c in &view.chunks {
+            let mut chunk = [0u8; 32];
+            if hex::decode_to_slice(&c.sha256_hex, &mut chunk).is_err() {
+                continue;
+            }
+            let bound = self
+                .backend
+                .community_dek_blob_epoch(&chunk)
+                .await
+                .map_err(|e| PullOutcome::StoreFailed(format!("community_dek_blob_epoch: {e}")))?;
+            if bound.is_none() {
+                continue;
+            }
+            self.engine
+                .evict_blob(&chunk, chrono::Utc::now())
+                .await
+                .map_err(|e| {
+                    PullOutcome::StoreFailed(format!("evict a community-bound chunk: {e}"))
+                })?;
+            let bytes = match self.fetch_verified(fetch, chunk).await {
+                Ok(b) => b,
+                // Evicted and not re-fetched: the retry's walk fetches it
+                // again under the stream-keyed provenance.
+                Err(DagFetchStop::Transport(reason)) => {
+                    return Err(self.dag_fetch_failed(
+                        row,
+                        sha,
+                        attempts,
+                        &format!("re-fetch of chunk seq {}", c.seq),
+                        &reason,
+                    ))
+                }
+                Err(DagFetchStop::Gone(reason)) => {
+                    return Err(dag_gone(
+                        row,
+                        blob_hex,
+                        &format!("chunk seq {}", c.seq),
+                        &reason,
+                    ))
+                }
+                Err(DagFetchStop::HashMismatch { got }) => {
+                    return Err(self.dag_refused(
+                        row,
+                        blob_hex,
+                        DagPullRefusal::ChunkMismatch {
+                            seq: c.seq,
+                            detail: format!(
+                                "the bytes served for {} hash to {}",
+                                hex::encode(chunk),
+                                hex::encode(got)
+                            ),
+                        },
+                    ))
+                }
+            };
+            let item = ciris_persist::federation::AdoptChunkItem {
+                seq: c.seq,
+                envelope: &bytes,
+                plaintext_size: u64::from(c.size),
+            };
+            let answer = self
+                .engine
+                .adopt_sealed_chunks(
+                    &view.stream_id,
+                    std::slice::from_ref(&item),
+                    chunk_adopt_epoch(c.epoch),
+                    chunk_provenance.clone(),
+                )
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|mut per_item| match per_item.pop() {
+                    Some(r) => r.map(|_| ()).map_err(|e| e.to_string()),
+                    None => Err("the adopt answered no item".to_owned()),
+                });
+            if let Err(e) = answer {
+                return Err(PullOutcome::StoreFailed(format!(
+                    "re-adopt chunk seq {} under for_stream_keyed_chunk: {e}",
+                    c.seq
+                )));
+            }
+            readopted += 1;
+        }
+        self.edge
+            .metrics()
+            .add_blob_dag_chunks("remediated", readopted);
+        tracing::info!(
+            blob = %blob_hex,
+            stream_id = %view.stream_id,
+            readopted,
+            "DAG pull: community-bound stream-keyed chunks evicted and re-adopted \
+             (CIRISPersist#977)"
+        );
+        Ok(readopted)
+    }
+
     /// A fetch that did not arrive: booked for retry, named.
     fn dag_fetch_failed(
         &self,
@@ -2981,7 +3123,14 @@ where
         let adopters = if batch_max == 1 { lanes } else { 1 };
         let overhead = AT_REST_ENVELOPE_OVERHEAD as u64;
         let stream = view.stream_id.as_str();
-        let chunk_provenance = chunk_provenance_of(&provenance, stream_keyed_room);
+        let chunk_provenance = match chunk_provenance_of(&provenance, stream_keyed_room) {
+            Ok(p) => p,
+            Err(e) => {
+                return PullOutcome::StoreFailed(format!(
+                    "a stream-keyed room chunk's provenance (for_stream_keyed_chunk): {e}"
+                ))
+            }
+        };
         let provenance = &chunk_provenance;
         let engine = &self.engine;
         let mut fetching = FuturesUnordered::new();
@@ -3051,8 +3200,7 @@ where
                     let started = Instant::now();
                     let adopted = engine
                         .adopt_sealed_chunks(stream, &items, epoch, provenance.clone())
-                        .await
-                        .map_err(|e| e.to_string());
+                        .await;
                     let elapsed = started.elapsed();
                     drop(items);
                     let wants: Vec<DagWant> = batch.into_iter().map(|(w, _)| w).collect();
@@ -3139,7 +3287,37 @@ where
                             .into_iter()
                             .map(|r| r.map(|_| ()).map_err(|e| e.to_string()))
                             .collect(),
-                        Err(e) => wants.iter().map(|_| Err(e.clone())).collect(),
+                        // persist v55.0.0 (#977) — the chunk door refused a
+                        // stream-keyed chunk's provenance for naming a
+                        // community epoch, the whole batch with nothing
+                        // written. Edge builds every such provenance with
+                        // `for_stream_keyed_chunk`, so reaching this is an
+                        // edge bug: terminal for the pull, named.
+                        Err(e @ BlobError::StreamKeyedChunkCommunityEpoch { .. }) => {
+                            tracing::error!(
+                                blob = %blob_hex,
+                                stream_id = %stream,
+                                error = %e,
+                                "DAG pull: persist refused a stream-keyed room chunk's \
+                                 provenance for naming a community epoch — an EDGE BUG \
+                                 (CIRISPersist#977)"
+                            );
+                            if stop.is_none() {
+                                stop = Some(self.dag_refused(
+                                    row,
+                                    &blob_hex,
+                                    DagPullRefusal::StreamKeyedChunkCommunityEpoch {
+                                        stage: "adopt",
+                                        detail: e.to_string(),
+                                    },
+                                ));
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            let e = e.to_string();
+                            wants.iter().map(|_| Err(e.clone())).collect()
+                        }
                     };
                     for (w, answer) in wants.iter().zip(answers) {
                         match answer {
@@ -3255,15 +3433,72 @@ where
         }
 
         // ── promoted ── persist checks every chunk row against the manifest.
-        let promoting = Instant::now();
         // persist v55.0.0 (#951) — the gate's disposition is carried HERE: under
         // `Announce` the promotion emits this node's holding claim for the
         // root once its checks pass; `LocalOnly` emits nothing.
-        let promoted = self
-            .engine
-            .promote_adopted_manifest_to_dag(&sha, &self.local_key_id, Some(&aad), adopt)
-            .await;
-        metrics.add_blob_dag_phase("dag_promote", promoting.elapsed());
+        let mut remediated = false;
+        let promoted = loop {
+            let promoting = Instant::now();
+            let promoted = self
+                .engine
+                .promote_adopted_manifest_to_dag(&sha, &self.local_key_id, Some(&aad), adopt)
+                .await;
+            metrics.add_blob_dag_phase("dag_promote", promoting.elapsed());
+            // persist v55.0.0 (#977) — the promote refuses a stream-keyed
+            // chunk that a COMMUNITY epoch binds: one adopted before the
+            // stream's key rows landed, which the chunk door could not tell
+            // from a legacy chunk. persist's remedy, ONCE per pull attempt:
+            // evict every bound chunk, re-fetch and re-adopt it under
+            // `for_stream_keyed_chunk`, promote again. A second refusal is
+            // terminal and an edge bug, never a loop.
+            match promoted {
+                Err(ref e @ BlobError::StreamKeyedChunkCommunityEpoch { .. })
+                    if stream_keyed_room && !remediated =>
+                {
+                    remediated = true;
+                    tracing::warn!(
+                        blob = %blob_hex,
+                        stream_id = %view.stream_id,
+                        error = %e,
+                        "DAG pull: a stream-keyed room chunk is bound to a community epoch — \
+                         evicting and re-adopting every bound chunk, once (CIRISPersist#977)"
+                    );
+                    if let Err(outcome) = self
+                        .remediate_community_bound_chunks(
+                            row,
+                            sha,
+                            attempts,
+                            &blob_hex,
+                            &view,
+                            &chunk_provenance,
+                            fetch,
+                        )
+                        .await
+                    {
+                        return outcome;
+                    }
+                }
+                Err(ref e @ BlobError::StreamKeyedChunkCommunityEpoch { .. }) => {
+                    tracing::error!(
+                        blob = %blob_hex,
+                        stream_id = %view.stream_id,
+                        remediated,
+                        error = %e,
+                        "DAG pull: the promote still finds a stream-keyed room chunk under a \
+                         community epoch — an EDGE BUG (CIRISPersist#977)"
+                    );
+                    return self.dag_refused(
+                        row,
+                        &blob_hex,
+                        DagPullRefusal::StreamKeyedChunkCommunityEpoch {
+                            stage: "promote",
+                            detail: e.to_string(),
+                        },
+                    );
+                }
+                other => break other,
+            }
+        };
         match promoted {
             Ok(promotion) => {
                 tracing::info!(
@@ -3620,7 +3855,7 @@ mod tests {
             community_key_id: Some("room-1".into()),
             epoch: Some(3),
             tier: CryptoTier::CommunityDek,
-            minter_key_id: None,
+            minter_key_id: Some("minter".into()),
         };
 
         // Stream-keyed room DAG (a v55 writer).
@@ -3630,14 +3865,30 @@ mod tests {
             needs_chunk_key_readiness(CryptoTier::CommunityDek, keyed),
             "a stream-keyed room DAG waits for its key_grant:stream:v1 keys"
         );
-        let chunks = chunk_provenance_of(&manifest, keyed);
+        let chunks = chunk_provenance_of(&manifest, keyed).expect("a room provenance");
+        assert_eq!(
+            chunks,
+            manifest
+                .for_stream_keyed_chunk()
+                .expect("persist's constructor"),
+            "persist's for_stream_keyed_chunk, never the row's provenance as is"
+        );
         assert_eq!(chunks.epoch, None, "its chunks carry no community epoch");
+        assert_eq!(chunks.minter_key_id, None, "and no minter");
         assert_eq!(
             chunks.community_key_id.as_deref(),
             Some("room-1"),
             "but their room"
         );
         assert_eq!(chunks.tier, CryptoTier::CommunityDek);
+        // persist's tier guard: a stream-keyed chunk's provenance is a room's.
+        let not_a_room = BlobProvenance {
+            tier: CryptoTier::InvisibleEncrypted,
+            cohort_scope: "self".into(),
+            community_key_id: None,
+            ..manifest.clone()
+        };
+        assert!(chunk_provenance_of(&not_a_room, true).is_err());
 
         // Legacy per-chunk-bound room DAG (sealed before v55).
         let legacy = is_stream_keyed_room(CryptoTier::CommunityDek, &view(&[None, None]));
@@ -3647,7 +3898,7 @@ mod tests {
             "a per-chunk-bound room DAG shares the manifest's epoch: no chunk keys to wait for"
         );
         assert_eq!(
-            chunk_provenance_of(&manifest, legacy),
+            chunk_provenance_of(&manifest, legacy).expect("unchanged"),
             manifest,
             "its chunks keep the manifest's provenance, community epoch included"
         );

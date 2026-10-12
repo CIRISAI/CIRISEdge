@@ -28,10 +28,16 @@ landing.
   persist's key-grant door (its projection wakes a parked pull); a retired v54 SET goes there too,
   for the typed `set_retired`. Key-grant rows travel only by persist's `may_receive` refers-to
   delivery to the recipient's own node; a subject's Pull still carves them (G2).
-- **Room file DAGs sealed by a v55 writer are stream-keyed.** The pull adopts their chunks with no
-  community epoch and waits for their `key_grant:stream:v1` keys before promoting, as for a
-  self/family DAG; a room DAG sealed per chunk before v55 pulls as before. A sealed DAG's manifest is
-  adopted `LocalOnly` and announced at promotion.
+- **Room file DAGs sealed by a v55 writer are stream-keyed.** The pull adopts their chunks under
+  persist's `BlobProvenance::for_stream_keyed_chunk()` (no community epoch, no minter) and waits for
+  their `key_grant:stream:v1` keys before promoting, as for a self/family DAG; a room DAG sealed per
+  chunk before v55 pulls as before. A chunk that landed bound to the community epoch before the
+  stream's key rows (persist's promote refuses it, `blob_stream_keyed_chunk_community_epoch`) is
+  evicted, re-fetched and re-adopted once per pull attempt, then promoted again; a refusal at the
+  chunk adopt, or a second one at the promote, is terminal (`DagPullRefusal::StreamKeyedChunkCommunityEpoch`,
+  tag `dag_stream_keyed_chunk_community_epoch`) and an edge bug. `GroupContentError` gains the typed
+  `StreamKeyedChunkCommunityEpoch`. A sealed DAG's manifest is adopted `LocalOnly` and announced at
+  promotion.
 - **Refusal dispositions (replication).** Terminal: `federation_malformed_row`,
   `federation_attestation_type_unregistered`, `federation_payment_processor_identifier`,
   `federation_dimension_rejected` for `registered_family_held_shut` / `ledger_l1_binding_violation`,
