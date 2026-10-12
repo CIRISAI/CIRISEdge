@@ -96,6 +96,10 @@ pub mod av_leg_choice;
 /// stored DEK, wrapped to the audience; an unkept call registers nothing.
 pub mod av_keep;
 
+/// CIRISEdge#805 item 5 — a room call's media keys: the room's MLS group,
+/// one DEK per stream (`FSD/AV_CALL_API.md` §3.2).
+pub mod av_call_key;
+
 /// CIRISEdge#805 item 4 — the A/V plane on the live node: the Reticulum
 /// transport's A/V sink, fed from the same event loop replication uses.
 #[cfg(feature = "_reticulum-module")]

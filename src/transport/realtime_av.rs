@@ -103,6 +103,13 @@ use crate::transport::TransportId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub [u8; 32]);
 
+/// A stream's label: the lowercase hex of its 32-byte id, the UTF-8 form the
+/// stream's DEK binds (`av_call_key::stream_dek_info`).
+#[must_use]
+pub fn stream_label(stream_id: StreamId) -> String {
+    hex::encode(stream_id.0)
+}
+
 /// Monotonic epoch counter per stream. Each epoch corresponds to one
 /// `EpochDek`. Rotation cadence is per-stream policy (typical: every
 /// 60s or every Nth chunk, whichever first).
