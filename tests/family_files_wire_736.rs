@@ -1045,12 +1045,18 @@ async fn attestation_ids_served_to(writer: &Node, peer: &str) -> Vec<String> {
     use ciris_edge::replication::{
         BridgeConfig, EnvelopeKind, FederationDirectoryReplicationBridge, ReplicationDirectory as _,
     };
+    // A fresh bridge shaped as `member` wires production's (its own rows
+    // published, the engine behind the serve), so no earlier round's
+    // per-peer watermark hides a row from this listing.
+    let publish = vec![writer.me.clone(), writer.identity.clone()];
     let bridge = FederationDirectoryReplicationBridge::with_config(
-        Arc::clone(&writer.dir) as Arc<dyn ciris_persist::federation::FederationDirectory>,
+        writer.dir.clone() as Arc<dyn FederationDirectory>,
         Arc::new(Vec::new),
         BridgeConfig::default(),
     )
-    .with_local_key_id(Some(writer.me.clone()));
+    .with_engine(Some(BridgeEngine(writer.store.engine().clone())))
+    .with_local_key_id(Some(writer.me.clone()))
+    .with_self_provider(Some(Arc::new(move || publish.clone())));
     let mut ids = Vec::new();
     for r in bridge
         .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))

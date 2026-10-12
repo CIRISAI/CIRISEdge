@@ -483,7 +483,13 @@ async fn attestation_ids_served_to(writer: &Node, peer: &str) -> Vec<String> {
         Arc::new(Vec::new),
         BridgeConfig::default(),
     )
-    .with_local_key_id(Some(writer.me.clone()));
+    .with_local_key_id(Some(writer.me.clone()))
+    // As production wires it: this node publishes its own rows, so its
+    // `SelfOwn` rows (a self-scoped claim among them) are advertised.
+    .with_self_provider(Some(Arc::new({
+        let me = writer.me.clone();
+        move || vec![me.clone()]
+    })));
     let mut ids = Vec::new();
     for r in bridge
         .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))

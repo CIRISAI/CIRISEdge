@@ -6058,7 +6058,13 @@ async fn attestation_ids_served_to(writer: &Node, peer: &str) -> Vec<String> {
         Arc::new(Vec::new),
         BridgeConfig::default(),
     )
-    .with_local_key_id(Some(writer.me.clone()));
+    .with_local_key_id(Some(writer.me.clone()))
+    // As production wires it: this node publishes its own rows, so its
+    // `SelfOwn` rows (a self-scoped claim among them) are advertised.
+    .with_self_provider(Some(Arc::new({
+        let me = writer.me.clone();
+        move || vec![me.clone()]
+    })));
     let mut ids = Vec::new();
     for r in bridge
         .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
@@ -6203,12 +6209,14 @@ async fn own_holder_claims(
 /// door on the receiving side is the production one.
 ///
 /// 1. A publishes a 1,300,000-byte file through the file door into the
-///    community room: five 256 KiB chunks and a manifest, each its own
-///    at-rest envelope under the room's epoch-`e0` DEK; the pointer carries
+///    community room: five 256 KiB chunks and epoch 0's terminator under the
+///    stream's epoch DEK (persist v55, #977: a room stream is stream-keyed),
+///    and a manifest under the room's epoch-`e0` DEK; the pointer carries
 ///    `epoch: Some(e0)` (CIRISEdge#601) and `stream_id`. The row, A's
-///    `key_grant` sets and A's `holds_bytes` cross to B and C.
+///    `key_grant` rows and A's holding claim (`custody:ack:v1` `here`) cross
+///    to B and C.
 /// 2. B pulls from A: manifest → opened as B → chunks → promoted;
-///    `storage_kind = chunk_dag`, byte-identical, B's own `holds_bytes`
+///    `storage_kind = chunk_dag`, byte-identical, B's own holding claim
 ///    names the DAG root and is admitted on C through the gated door.
 /// 3. C discovers B through `list_holders`, is refused a tampered chunk 1
 ///    from B `ChunkMismatch { seq: 1 }` (counted `dag_chunk_mismatch`,
@@ -6378,7 +6386,16 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
         .open_sealed_manifest_as(&sha, &node_a.me, Some(&aad))
         .await
         .expect("A opens its own manifest");
-    assert_eq!(view_a.chunks.len(), 5, "4 × 256 KiB + 251,424 bytes");
+    // persist v55 (CIRISPersist#977): a room DAG is stream-keyed, so it is a
+    // v4 DAG, one stream epoch, whose empty terminator sorts after the data.
+    assert_eq!(
+        view_a.chunks.len(),
+        6,
+        "4 × 256 KiB + 251,424 bytes, and epoch 0's terminator"
+    );
+    assert_eq!(view_a.chunks[5].seq, TERMINATOR_SEQ_BASE);
+    assert_eq!(view_a.chunks[5].size, 0);
+    assert!(view_a.chunks.iter().all(|c| c.epoch == Some(0)));
     let chunk1: [u8; 32] = hex::decode(&view_a.chunks[1].sha256_hex)
         .expect("hex")
         .try_into()
@@ -6527,9 +6544,9 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
         .collect();
     assert_eq!(
         positions,
-        vec![0, 2, 3, 4],
-        "chunk 1 refused at its position; the rest (all in flight at the default K, \
-         CIRISEdge#739: the lanes drain on a stop) kept"
+        vec![0, 2, 3, 4, TERMINATOR_SEQ_BASE],
+        "chunk 1 refused at its position; the rest and the terminator (all in flight \
+         at the default K, CIRISEdge#739: the lanes drain on a stop) kept"
     );
     assert_eq!(
         node_c
