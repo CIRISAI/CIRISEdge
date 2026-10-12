@@ -143,8 +143,10 @@ impl std::fmt::Debug for EpochDek {
     }
 }
 
-/// Newtype around the chunk sequence number per `(stream_id, epoch)`.
-/// Used for deterministic nonce derivation — see [`derive_inner_nonce`].
+/// Newtype around the chunk sequence number per `(stream_id, epoch)`: the
+/// chunk's EPOCH-LOCAL index, which CC 5.3.3.2.5 makes the inner seal's
+/// STREAM counter (CIRISEdge#846). `u64` on the wire; a seal refuses it above
+/// `u32::MAX` (never truncates) and the sender rolls the epoch first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkSeq(pub u64);
 
@@ -409,6 +411,19 @@ pub enum RealtimeAvError {
     OuterAead(ciris_crypto::CryptoError),
     #[error("sealed wire too short: got {got} bytes, need at least {need}")]
     WireTooShort { got: usize, need: usize },
+    /// CIRISEdge#846 — `chunk_seq` is the STREAM counter, a `u32` within an
+    /// epoch (CC 5.3.3.1); the sender rolls the epoch before it would pass
+    /// `u32::MAX`. Refused, never truncated.
+    #[error("chunk_seq {chunk_seq} is past the epoch's u32 counter space; roll the epoch")]
+    ChunkSeqBeyondEpoch { chunk_seq: u64 },
+}
+
+/// CIRISEdge#846 — the STREAM counter for `chunk_seq`: its epoch-local
+/// index as a `u32`, refused above `u32::MAX` (never truncated).
+fn epoch_counter(chunk_seq: ChunkSeq) -> Result<u32, RealtimeAvError> {
+    u32::try_from(chunk_seq.0).map_err(|_| RealtimeAvError::ChunkSeqBeyondEpoch {
+        chunk_seq: chunk_seq.0,
+    })
 }
 
 /// Derive the inner-AEAD nonce deterministically from `(stream_id,
@@ -540,6 +555,7 @@ pub fn seal_av_inner(
     codec_id: u8,
     layer: ChunkLayer,
 ) -> Result<InnerSealed, RealtimeAvError> {
+    epoch_counter(chunk_seq)?;
     let inner_nonce = derive_inner_nonce(stream_id, epoch, chunk_seq);
     let inner_ciphertext = aes_gcm::encrypt(epoch_dek.as_bytes(), &inner_nonce, plaintext)
         .map_err(RealtimeAvError::InnerAead)?;
@@ -1026,7 +1042,7 @@ mod tests {
             &dek,
             StreamId([0xAB; 32]),
             Epoch(0x1234_5678_9ABC_DEF0),
-            ChunkSeq(0xFEDC_BA98_7654_3210),
+            ChunkSeq(0x7654_3210),
             CODEC_AV1_SVC,
             ChunkLayer {
                 spatial: 2,
@@ -1089,6 +1105,36 @@ mod tests {
         assert_ne!(n1, n3);
         let n4 = derive_inner_nonce(StreamId([2; 32]), Epoch(5), ChunkSeq(99));
         assert_ne!(n1, n4);
+    }
+
+    /// CIRISEdge#846 — `chunk_seq` past the epoch's `u32` counter space is
+    /// refused, never truncated (the sender rolls the epoch first).
+    #[test]
+    fn chunk_seq_past_u32_is_refused_not_truncated() {
+        let dek = dummy_dek();
+        let past = ChunkSeq(u64::from(u32::MAX) + 1);
+        let r = seal_av_inner(
+            b"x",
+            &dek,
+            dummy_stream(),
+            Epoch(0),
+            past,
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
+        );
+        assert!(
+            matches!(r, Err(RealtimeAvError::ChunkSeqBeyondEpoch { chunk_seq }) if chunk_seq == past.0)
+        );
+        seal_av_inner(
+            b"x",
+            &dek,
+            dummy_stream(),
+            Epoch(0),
+            ChunkSeq(u64::from(u32::MAX)),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
+        )
+        .expect("u32::MAX is in range");
     }
 
     /// EpochDek Debug output redacts the bytes — no accidental log leaks.
@@ -1338,7 +1384,7 @@ mod tests {
             &dek,
             StreamId([0x55; 32]),
             Epoch(0x0123_4567_89AB_CDEF),
-            ChunkSeq(0xFEDC_BA98_7654_3210),
+            ChunkSeq(0x7654_3210),
             CODEC_JPEG_XS,
             layer,
         )
