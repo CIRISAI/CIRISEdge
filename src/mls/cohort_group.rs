@@ -167,6 +167,16 @@ pub(crate) const CIPHERSUITE: Ciphersuite =
 // would put two owners on it. This module previously defined its own
 // `COHORT_SECRET_LABEL`; it was retired when verify settled the family.
 
+/// CIRISEdge#805 item 5 — PLACEHOLDER for `L`, the label of a stream's epoch
+/// DEK (CC 5.1 "one DEK per (stream_id, epoch)"; the candidate staged on
+/// CIRISConstitution#169, KATs on CIRISVerify#308): the room group's exporter
+/// label AND the HKDF info tag of `transport::av_call_key::stream_epoch_dek`.
+/// It mirrors the candidate `"ciris-stream-dek/v1"` but is NOT that string:
+/// labels are CIRISVerify's, and this one is replaced by verify's when #169 is
+/// ruled. Distinct from both scope-privacy labels and from the per-stream A/V
+/// DEK-seed label.
+pub const STREAM_DEK_LABEL_PENDING: &str = "ciris-stream-dek/pending-v1";
+
 /// Length of a [`CohortSecret`], in bytes.
 pub const COHORT_SECRET_LEN: usize = 32;
 
@@ -2134,6 +2144,22 @@ impl CohortGroup {
             .lock()
             .await
             .scope_secret(crate::scope_privacy::RECORD_EXPORTER_LABEL)
+    }
+
+    /// CIRISEdge#805 item 5 — the room's STREAM key seed: the current epoch's
+    /// MLS exporter secret under [`STREAM_DEK_LABEL_PENDING`] (with the same
+    /// empty exporter context every other cohort secret uses), and the epoch it
+    /// was exported at, read under ONE lock so the pair cannot straddle a
+    /// commit. Each stream's epoch DEK is derived from this seed
+    /// (`transport::av_call_key::stream_epoch_dek`); a room call never mints an
+    /// MLS group of its own.
+    ///
+    /// # Errors
+    /// [`CohortGroupError::ExportFailed`] on a corrupted group state.
+    pub async fn stream_key_seed(&self) -> Result<(u64, CohortSecret), CohortGroupError> {
+        let inner = self.inner.lock().await;
+        let seed = inner.scope_secret(STREAM_DEK_LABEL_PENDING)?;
+        Ok((inner.epoch(), seed))
     }
 
     /// Add a member from a KeyPackage that member published, advance
