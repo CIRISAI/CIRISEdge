@@ -1730,6 +1730,10 @@ pub struct ReticulumTransportConfig {
     /// makes the `listen_addr` server + every bootstrap client a member-only port;
     /// `None` = open. Typed `interfaces` carry their own IFAC.
     pub ifac: Option<IfacConfig>,
+    /// CIRISEdge#805 item 8 — direct links through NAT (leviculum#70). The
+    /// default is inert: no facilitator (never proposes), none served, every
+    /// peer's request refused. See [`crate::transport::direct_path`].
+    pub direct_links: crate::transport::direct_path::DirectLinksConfig,
 }
 
 impl ReticulumTransportConfig {
@@ -1755,7 +1759,19 @@ impl ReticulumTransportConfig {
             control_channel_capacity: None,
             transit: None,
             ifac: None,
+            direct_links: crate::transport::direct_path::DirectLinksConfig::default(),
         }
+    }
+
+    /// CIRISEdge#805 item 8 — set this node's direct-link posture
+    /// ([`crate::transport::direct_path::DirectLinksConfig`]). Builder-style.
+    #[must_use]
+    pub fn with_direct_links(
+        mut self,
+        direct_links: crate::transport::direct_path::DirectLinksConfig,
+    ) -> Self {
+        self.direct_links = direct_links;
+        self
     }
 
     /// CIRISEdge#492 — set the node-wide scoped-transit posture for the legacy
@@ -2589,6 +2605,10 @@ pub struct ReticulumTransport {
     /// still passes the same #393 gate on that key id. Removed on
     /// `LinkClosed`.
     av_dialed_peer: Arc<std::sync::Mutex<HashMap<LinkId, String>>>,
+    /// CIRISEdge#805 item 8 — direct paths to call members through NAT: the
+    /// knob, the per-peer state machine, the dials waiting on a proposal, the
+    /// event broadcast and the anchored identity links.
+    direct_paths: Arc<crate::transport::direct_path::DirectPaths>,
     /// CIRISEdge#805 test seam — fail the next N derived-link identifies
     /// ([`Self::fail_next_derived_identifies_for_test`]). Zero in production.
     fail_derived_identify: Arc<std::sync::atomic::AtomicU32>,
@@ -3078,7 +3098,17 @@ impl ReticulumTransport {
         let mut builder = ReticulumNodeBuilder::new()
             .identity(identity.clone())
             .storage_path(storage_path)
-            .enable_transport(config.enable_transport);
+            .enable_transport(config.enable_transport)
+            // CIRISEdge#805 item 8 — always explicit, so the node never runs on
+            // a leviculum default (or a stray config file's keys) edge did not
+            // choose. The default is inert.
+            .direct_link(config.direct_links.leviculum_settings());
+        tracing::info!(
+            proposes = config.direct_links.proposes(),
+            serves_facilitator = ?config.direct_links.serve_facilitator,
+            accept = ?config.direct_links.accept,
+            "reticulum direct links (CIRISEdge#805 item 8, leviculum#70)"
+        );
         // CIRISEdge#363 — apply the bootstrap link keepalive so an advisory /
         // bootstrap link is not reaped (stale at ~10 s, dead at ~16 s under the
         // RTT-clamped 5 s default) before the Key + IdentityOccurrence
@@ -3447,6 +3477,9 @@ impl ReticulumTransport {
             }
         }
 
+        let direct_paths = Arc::new(crate::transport::direct_path::DirectPaths::new(
+            config.direct_links.clone(),
+        ));
         Ok(Self {
             config,
             // CIRISEdge#530 — off by default; attach with `with_metrics`.
@@ -3532,6 +3565,7 @@ impl ReticulumTransport {
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
             av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
             av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            direct_paths,
             fail_derived_identify: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             tear_down_reply_link: std::sync::atomic::AtomicU32::new(0),
             scoped_pool_bypass: std::sync::atomic::AtomicBool::new(false),
@@ -4104,9 +4138,16 @@ impl ReticulumTransport {
                     .pool_last_used
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // CIRISEdge#805 item 8 — a held direct path's identity link is
+                // busy: closing it would tear down the punched interface the
+                // call's A/V legs run on.
                 select_pool_victims(
                     pool,
-                    |id| in_flight.contains(id) || inbound.contains(id),
+                    |id| {
+                        in_flight.contains(id)
+                            || inbound.contains(id)
+                            || self.direct_paths.is_anchored(id)
+                    },
                     &mut last_used,
                     std::time::Instant::now(),
                     bound,
@@ -5012,6 +5053,29 @@ impl ReticulumTransport {
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
         let (dest_hash, transport_ed25519) =
             self.av_dial_target(destination_key_id, address).await?;
+        // CIRISEdge#805 item 8 — a derived address answers only a one-hop
+        // neighbour, so a member behind NAT is reachable here only once the two
+        // nodes share a punched interface: bring the path direct first, when
+        // this node can (CC 5.4.6). Whatever the outcome, the dial below is the
+        // same; the guard keeps the punched interface for this leg's life.
+        let direct_path = match self.ensure_direct_path(destination_key_id).await {
+            crate::transport::direct_path::DirectPath::Direct { interface, guard } => {
+                tracing::debug!(
+                    key_id = %destination_key_id,
+                    interface,
+                    "open_av_link: the member is reachable over a punched interface"
+                );
+                Some(guard)
+            }
+            other => {
+                tracing::debug!(
+                    key_id = %destination_key_id,
+                    outcome = ?other,
+                    "open_av_link: no direct path; dialling as without one"
+                );
+                None
+            }
+        };
         let inbound: Arc<
             std::sync::Mutex<Option<crate::transport::realtime_av_runtime::PumpReceiver>>,
         > = Arc::new(std::sync::Mutex::new(None));
@@ -5088,7 +5152,8 @@ impl ReticulumTransport {
                 Arc::clone(&self.node),
                 link_id,
             )
-            .with_metrics(self.metrics.get().cloned()),
+            .with_metrics(self.metrics.get().cloned())
+            .with_direct_path(direct_path),
         })
     }
 
@@ -5152,6 +5217,236 @@ impl ReticulumTransport {
             )));
         };
         Ok((dest_hash, transport_ed25519))
+    }
+
+    /// CIRISEdge#805 item 8 — bring the path to call member
+    /// `destination_key_id` direct, if this node can and it is not already.
+    ///
+    /// Proposes a direct-link upgrade on the IDENTITY link to the member (the
+    /// lane a send would use; dialled if none is live) and waits up to
+    /// [`crate::transport::direct_path::DIRECT_PATH_BUDGET`] for the outcome.
+    /// On success the two nodes share a punched interface, so a derived-address
+    /// (A/V) dial, which only a one-hop neighbour can answer, reaches the
+    /// member over it. Never an error: whatever the outcome, the caller dials
+    /// exactly as it would have without a proposal.
+    ///
+    /// Called only by [`Self::open_av_link`], for a member of the call's group:
+    /// a proposal reveals this node's public address to the peer, so nothing
+    /// else proposes (`direct_path` module docs).
+    pub(crate) async fn ensure_direct_path(
+        &self,
+        destination_key_id: &str,
+    ) -> crate::transport::direct_path::DirectPath {
+        use crate::transport::direct_path::{
+            DirectOutcome, DirectPath, DirectPathState, DIRECT_PATH_BUDGET,
+        };
+        if !self.direct_paths.config.proposes() {
+            return DirectPath::NotConfigured;
+        }
+        let count = |label: &'static str| {
+            if let Some(m) = self.metrics.get() {
+                m.inc_direct_link(label);
+            }
+        };
+        // Already direct: a new hold on the same punched interface.
+        let known = self.direct_paths.tracker().state(destination_key_id);
+        if let Some(DirectPathState::Direct { link, interface }) = known {
+            if self.node.direct_link_interface(&link) == Some(interface) {
+                return DirectPath::Direct {
+                    interface,
+                    guard: self.direct_paths.anchor(link),
+                };
+            }
+        }
+        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        if candidates.is_empty() {
+            count(crate::observability::DIRECT_LINK_SKIPPED_NO_LINK);
+            return DirectPath::Unavailable { reason: "no_link" };
+        }
+        // A one-hop neighbour (a shared interface) is already direct.
+        if candidates
+            .iter()
+            .any(|c| self.node.hops_to(&c.dest_hash) == Some(1))
+        {
+            count(crate::observability::DIRECT_LINK_SKIPPED_NEIGHBOUR);
+            return DirectPath::AlreadyNeighbour;
+        }
+        let link = match self.identity_lane(destination_key_id, &candidates).await {
+            Ok(claim) => {
+                let link = claim.link_id();
+                // Proposing sends two channel signals, not a resource: the lane
+                // goes back to the pool for sends at once.
+                claim.release().await;
+                link
+            }
+            Err(e) => {
+                count(crate::observability::DIRECT_LINK_SKIPPED_NO_LINK);
+                tracing::debug!(
+                    key_id = %destination_key_id,
+                    error = %e,
+                    "direct path: no identity link to the member (CIRISEdge#805 item 8)"
+                );
+                return DirectPath::Unavailable { reason: "no_link" };
+            }
+        };
+        let (link, rx) = match self.start_or_join_proposal(destination_key_id, link).await {
+            Ok(waiting) => waiting,
+            Err(done) => return done,
+        };
+        match with_timeout(DIRECT_PATH_BUDGET, rx).await {
+            Some(Ok(DirectOutcome::Established { interface })) => DirectPath::Direct {
+                interface,
+                guard: self.direct_paths.anchor(link),
+            },
+            Some(Ok(DirectOutcome::Failed(failure))) => DirectPath::Unavailable {
+                reason: crate::transport::direct_path::failure_label(failure),
+            },
+            // Lost before the dial got to use it, the waiter dropped, or still
+            // running past the budget (its outcome still reaches the tracker).
+            Some(Ok(DirectOutcome::Lost) | Err(_)) | None => {
+                DirectPath::Unavailable { reason: "pending" }
+            }
+        }
+    }
+
+    /// CIRISEdge#805 item 8 — the proposal half of [`Self::ensure_direct_path`]:
+    /// start a proposal to `destination_key_id` on its identity `link`, or join
+    /// the one already running. `Ok` is the link whose outcome to await and the
+    /// registration to await it on; `Err` is the answer when there is nothing
+    /// to await.
+    async fn start_or_join_proposal(
+        &self,
+        destination_key_id: &str,
+        link: LinkId,
+    ) -> Result<
+        (
+            LinkId,
+            tokio::sync::oneshot::Receiver<crate::transport::direct_path::DirectOutcome>,
+        ),
+        crate::transport::direct_path::DirectPath,
+    > {
+        use crate::transport::direct_path::{DirectPath, DirectPathState, ProposeSkip};
+        let count = |label: &'static str| {
+            if let Some(m) = self.metrics.get() {
+                m.inc_direct_link(label);
+            }
+        };
+        let now = std::time::Instant::now();
+        let admitted = self
+            .direct_paths
+            .tracker()
+            .admit(destination_key_id, link, now);
+        match admitted {
+            Err(ProposeSkip::InFlight) => {
+                // Another dial is already proposing to this member: share its
+                // outcome rather than racing it.
+                let running = match self.direct_paths.tracker().state(destination_key_id) {
+                    Some(DirectPathState::Proposing { link }) => Some(link),
+                    _ => None,
+                };
+                let Some(running) = running else {
+                    return Err(DirectPath::Unavailable { reason: "pending" });
+                };
+                Ok((running, self.direct_paths.wait_for(running)))
+            }
+            Err(skip @ (ProposeSkip::BackingOff | ProposeSkip::RejectedOnThisLink)) => {
+                count(crate::observability::DIRECT_LINK_SKIPPED_BACKOFF);
+                tracing::debug!(
+                    key_id = %destination_key_id,
+                    skip = skip.as_str(),
+                    "direct path: not proposing (CIRISEdge#805 item 8)"
+                );
+                Err(DirectPath::Unavailable {
+                    reason: "backing_off",
+                })
+            }
+            Err(ProposeSkip::AlreadyDirect) => {
+                // The tracker says direct but leviculum no longer holds the
+                // interface: the Lost event is on its way. Dial as without.
+                Err(DirectPath::Unavailable { reason: "pending" })
+            }
+            Ok(()) => {
+                // Registered BEFORE the dispatch, so the outcome cannot precede
+                // the registration.
+                let rx = self.direct_paths.wait_for(link);
+                let before = link_channel_message_limit(&self.node, &link);
+                self.direct_paths
+                    .tracker()
+                    .proposed(destination_key_id, link, before);
+                if let Err(e) = self.node.propose_direct_link(&link).await {
+                    self.direct_paths.forget(link);
+                    self.direct_paths
+                        .tracker()
+                        .propose_refused(destination_key_id, link, now);
+                    count(crate::observability::DIRECT_LINK_PROPOSE_REFUSED);
+                    tracing::info!(
+                        key_id = %destination_key_id,
+                        link = %hex::encode(link.as_bytes()),
+                        error = %e,
+                        "direct path: leviculum refused the proposal (CIRISEdge#805 item 8)"
+                    );
+                    return Err(DirectPath::Unavailable {
+                        reason: "propose_refused",
+                    });
+                }
+                count(crate::observability::DIRECT_LINK_PROPOSED);
+                tracing::info!(
+                    key_id = %destination_key_id,
+                    link = %hex::encode(link.as_bytes()),
+                    channel_limit_before = ?before,
+                    "direct path: PROPOSED on the identity link to a call member \
+                     (CIRISEdge#805 item 8)"
+                );
+                Ok((link, rx))
+            }
+        }
+    }
+
+    /// CIRISEdge#805 item 8 — every direct-path event this node sees (either
+    /// side of a proposal). Lagging receivers lose the oldest.
+    #[must_use]
+    pub fn subscribe_direct_path_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::transport::direct_path::DirectPathEvent> {
+        self.direct_paths.subscribe()
+    }
+
+    /// CIRISEdge#805 item 8 — where the direct path to `peer` stands, if this
+    /// node ever proposed to it or accepted from it.
+    #[must_use]
+    pub fn direct_path_state(
+        &self,
+        peer: &str,
+    ) -> Option<crate::transport::direct_path::DirectPathState> {
+        self.direct_paths.tracker().state(peer)
+    }
+
+    /// CIRISEdge#805 item 8 — the interface `link_id` runs over, if leviculum
+    /// moved it onto a punched one.
+    #[must_use]
+    pub fn direct_link_interface(&self, link_id: [u8; 16]) -> Option<usize> {
+        self.node.direct_link_interface(&LinkId::new(link_id))
+    }
+
+    /// CIRISEdge#805 item 8 — the action [`crate::transport::direct_path::direct_leg_stalled`]
+    /// triggers: a direct A/V leg whose path is gone falls back. The A/V link
+    /// was born on the punched interface and has no relayed path to return
+    /// to, so it is closed, and the call's heal redials the member the way it
+    /// would with no direct path (the relay leg).
+    ///
+    /// TODO(leviculum#83): also `retire_direct_link` on the member's identity
+    /// link, so it leaves the dead punched interface at once instead of after
+    /// leviculum's stale window.
+    pub async fn fall_back_from_direct(&self, av_link_id: [u8; 16]) {
+        if let Some(m) = self.metrics.get() {
+            m.inc_direct_link(crate::observability::DIRECT_LINK_LEG_FELL_BACK);
+        }
+        tracing::info!(
+            link = %hex::encode(av_link_id),
+            "direct A/V leg stalled: closing it so the call heals over the relay leg \
+             (CIRISEdge#805 item 8)"
+        );
+        let _ = self.link_teardown(&av_link_id).await;
     }
 
     /// CIRISEdge#805 — undo an A/V dial that failed after registering its link
@@ -6783,6 +7078,159 @@ impl ReticulumTransport {
         }))
     }
 
+    /// CIRISEdge#805 item 8 — an identity-plane lane to `destination_key_id`,
+    /// CLAIMED: a reusable pooled link if one is live, else a gated,
+    /// single-flight dial to the route-table-first candidate. The dial half of
+    /// [`Transport::send`], extracted unchanged so a direct-path proposal rides
+    /// the same lane a send would. `candidates` are the peer's
+    /// (`resolve_dial_candidates`), already cleared against the deny-list.
+    async fn identity_lane(
+        &self,
+        destination_key_id: &str,
+        candidates: &[DialCandidate],
+    ) -> Result<LinkClaim, TransportError> {
+        // CIRISEdge#336 (v13.8.0) — ROUTE-TABLE-FIRST dial selection. The route
+        // table is the source of dial truth; identity math only proposed the
+        // candidates (`resolve_dial_candidates`). `select_dial_candidate` picks a PATHED candidate
+        // whenever one exists, so dialing an unroutable dest while a routable
+        // one exists is impossible by construction (the field failure this
+        // closes: ×24 no-route dials at a pathless dest while the same peer's
+        // routable dest sat in the path table, direct, 1 hop). With no pathed
+        // candidate the order degrades to the pre-v13.8.0 bootstrap dial
+        // (broadcast, fast-fail, loud) — prime_peer cold-start keeps working.
+        let flags: Vec<(DialSource, bool)> = candidates
+            .iter()
+            .map(|c| (c.source, self.node.has_path(&c.dest_hash)))
+            .collect();
+        let Some(chosen_idx) = select_dial_candidate(&flags) else {
+            // Unreachable in practice (non-empty candidates always select) —
+            // defensive, never a silent fallthrough.
+            return Err(TransportError::Unreachable(format!(
+                "dial selection yielded no candidate for {destination_key_id}"
+            )));
+        };
+        let has_path = flags[chosen_idx].1;
+        let peer = ResolvedPeer {
+            dest_hash: candidates[chosen_idx].dest_hash,
+            transport_ed25519: candidates[chosen_idx].transport_ed25519,
+        };
+        {
+            // The candidate set + winner, always visible at debug; INFO when
+            // routing OVERRODE the legacy preference (the diagnosable case the
+            // field was blind to — which address won, and why).
+            let set: Vec<String> = candidates
+                .iter()
+                .zip(&flags)
+                .map(|(c, (s, p))| {
+                    format!(
+                        "{}:{}{}",
+                        s.as_str(),
+                        hex::encode(c.dest_hash.as_bytes()),
+                        if *p { " (path)" } else { "" }
+                    )
+                })
+                .collect();
+            if chosen_idx != 0 && has_path {
+                tracing::info!(
+                    destination_key_id,
+                    chosen = %set[chosen_idx],
+                    candidates = %set.join(", "),
+                    "dial target chosen by ROUTABILITY over legacy preference \
+                     (CIRISEdge#336 v13.8.0)"
+                );
+            } else {
+                tracing::debug!(
+                    destination_key_id,
+                    chosen = %set[chosen_idx],
+                    candidates = %set.join(", "),
+                    "dial candidate selection (CIRISEdge#336)"
+                );
+            }
+        }
+        let establish_timeout = if has_path {
+            LINK_ESTABLISH_TIMEOUT
+        } else {
+            NO_PATH_ESTABLISH_TIMEOUT
+        };
+
+        // ── CIRISEdge#532: REUSE BEFORE DIALING ──────────────────────────────
+        // A live, identified link to this dest is a finished handshake. Sending
+        // on it is the whole point of having established it; dialing a second
+        // one pays the establish cost again and abandons the first. This is the
+        // 29-establishes-per-minute loop, and the reason it scaled with planes:
+        // every coordinator's send took the dial path independently.
+        //
+        // Everything the dial path does after `connect_awaited` — recording the
+        // dialed dest (#424), awaiting establishment, `identify_link` (#340),
+        // and the initiator-side bundle serve (#436) — is per-LINK setup that
+        // already happened for a reused link. Skipping it is not an omission;
+        // repeating it per send was the waste.
+        // CIRISEdge#819 — `reserved`: the lane came from the pool already
+        // marked in flight for this send (see `DialCtx::reusable_link_to`).
+        let reused = self.reusable_link_to(&peer.dest_hash).await;
+        let claim = if let Some(existing) = reused {
+            tracing::trace!(
+                key_id = %destination_key_id,
+                link = ?existing.link_id(),
+                "reusing the live identified link to this peer (CIRISEdge#532)"
+            );
+            existing
+        } else {
+            // SINGLE-FLIGHT. Without this, N coordinators firing at the same
+            // peer all observe "no link" and all dial — the establish:identify
+            // gap in #532, where the cost of a link is paid and then discarded.
+            // The gate is per-destination so other peers still dial in parallel.
+            // CIRISEdge#568 — the dial runs in a SPAWNED task, not inline.
+            //
+            // `round_timeout` is 10 s; a pathed peer's `establish_timeout` is
+            // `LINK_ESTABLISH_TIMEOUT` (30 s). Inline, a cold dial could never
+            // finish inside the round that started it, and the scheduler
+            // abandoning that round dropped the half-built link — so every
+            // retry began cold and the peer converged only when IT dialed US.
+            // Measured on the two-node ladder: the first Attestation round to a
+            // fresh peer timed out at +10 s and the next completed round landed
+            // ~150 s (five cadence ticks) later.
+            //
+            // Detached, an abandoned round abandons the WAIT and not the LINK:
+            // the task runs to completion and publishes into
+            // `reusable_dialed_link` (the "PUBLISH LAST" step in
+            // `dial_and_identify`), so the next round takes the fast path above
+            // instead of dialling cold again.
+            //
+            // The gate permit is acquired INSIDE the task on purpose. Held by
+            // the caller, dropping the caller would release it while the dial
+            // it is meant to gate is still running — the single-flight property
+            // #532 installed would hold only for callers that survive.
+            let gate = self.dial_gate_for(peer.dest_hash).await;
+            let ctx = self.dial_ctx();
+            let peer_owned = peer;
+            let dkid = destination_key_id.to_owned();
+            let dial = tokio::spawn(async move {
+                let _dial_permit = gate
+                    .acquire()
+                    .await
+                    .map_err(|e| TransportError::Io(format!("dial gate closed: {e}")))?;
+                // Double-check: a concurrent dial we queued behind may have just
+                // published a reusable link. Checking only before the gate would
+                // make the gate a queue of redundant dials rather than a filter.
+                if let Some(existing) = ctx.reusable_link_to(&peer_owned.dest_hash).await {
+                    tracing::trace!(
+                        key_id = %dkid,
+                        link = ?existing.link_id(),
+                        "another send established this peer's link while we waited on \
+                         the dial gate — reusing it (CIRISEdge#532)"
+                    );
+                    return Ok(existing);
+                }
+                ctx.dial_and_identify(&dkid, &peer_owned, has_path, establish_timeout)
+                    .await
+            });
+            dial.await
+                .map_err(|e| TransportError::Io(format!("dial task failed: {e}")))??
+        };
+        Ok(claim)
+    }
+
     /// CIRISEdge#353 — the peer's freshest LIVE link that it dialled and
     /// identified to us (the reverse path), ON `plane`.
     ///
@@ -7419,145 +7867,7 @@ impl Transport for ReticulumTransport {
             return Ok(TransportSendOutcome::Delivered);
         }
 
-        // CIRISEdge#336 (v13.8.0) — ROUTE-TABLE-FIRST dial selection. The route
-        // table is the source of dial truth; identity math only proposed the
-        // candidates above. `select_dial_candidate` picks a PATHED candidate
-        // whenever one exists, so dialing an unroutable dest while a routable
-        // one exists is impossible by construction (the field failure this
-        // closes: ×24 no-route dials at a pathless dest while the same peer's
-        // routable dest sat in the path table, direct, 1 hop). With no pathed
-        // candidate the order degrades to the pre-v13.8.0 bootstrap dial
-        // (broadcast, fast-fail, loud) — prime_peer cold-start keeps working.
-        let flags: Vec<(DialSource, bool)> = candidates
-            .iter()
-            .map(|c| (c.source, self.node.has_path(&c.dest_hash)))
-            .collect();
-        let Some(chosen_idx) = select_dial_candidate(&flags) else {
-            // Unreachable in practice (non-empty candidates always select) —
-            // defensive, never a silent fallthrough.
-            return Err(TransportError::Unreachable(format!(
-                "dial selection yielded no candidate for {destination_key_id}"
-            )));
-        };
-        let has_path = flags[chosen_idx].1;
-        let peer = ResolvedPeer {
-            dest_hash: candidates[chosen_idx].dest_hash,
-            transport_ed25519: candidates[chosen_idx].transport_ed25519,
-        };
-        {
-            // The candidate set + winner, always visible at debug; INFO when
-            // routing OVERRODE the legacy preference (the diagnosable case the
-            // field was blind to — which address won, and why).
-            let set: Vec<String> = candidates
-                .iter()
-                .zip(&flags)
-                .map(|(c, (s, p))| {
-                    format!(
-                        "{}:{}{}",
-                        s.as_str(),
-                        hex::encode(c.dest_hash.as_bytes()),
-                        if *p { " (path)" } else { "" }
-                    )
-                })
-                .collect();
-            if chosen_idx != 0 && has_path {
-                tracing::info!(
-                    destination_key_id,
-                    chosen = %set[chosen_idx],
-                    candidates = %set.join(", "),
-                    "dial target chosen by ROUTABILITY over legacy preference \
-                     (CIRISEdge#336 v13.8.0)"
-                );
-            } else {
-                tracing::debug!(
-                    destination_key_id,
-                    chosen = %set[chosen_idx],
-                    candidates = %set.join(", "),
-                    "dial candidate selection (CIRISEdge#336)"
-                );
-            }
-        }
-        let establish_timeout = if has_path {
-            LINK_ESTABLISH_TIMEOUT
-        } else {
-            NO_PATH_ESTABLISH_TIMEOUT
-        };
-
-        // ── CIRISEdge#532: REUSE BEFORE DIALING ──────────────────────────────
-        // A live, identified link to this dest is a finished handshake. Sending
-        // on it is the whole point of having established it; dialing a second
-        // one pays the establish cost again and abandons the first. This is the
-        // 29-establishes-per-minute loop, and the reason it scaled with planes:
-        // every coordinator's send took the dial path independently.
-        //
-        // Everything the dial path does after `connect_awaited` — recording the
-        // dialed dest (#424), awaiting establishment, `identify_link` (#340),
-        // and the initiator-side bundle serve (#436) — is per-LINK setup that
-        // already happened for a reused link. Skipping it is not an omission;
-        // repeating it per send was the waste.
-        // CIRISEdge#819 — `reserved`: the lane came from the pool already
-        // marked in flight for this send (see `DialCtx::reusable_link_to`).
-        let reused = self.reusable_link_to(&peer.dest_hash).await;
-        let claim = if let Some(existing) = reused {
-            tracing::trace!(
-                key_id = %destination_key_id,
-                link = ?existing.link_id(),
-                "reusing the live identified link to this peer (CIRISEdge#532)"
-            );
-            existing
-        } else {
-            // SINGLE-FLIGHT. Without this, N coordinators firing at the same
-            // peer all observe "no link" and all dial — the establish:identify
-            // gap in #532, where the cost of a link is paid and then discarded.
-            // The gate is per-destination so other peers still dial in parallel.
-            // CIRISEdge#568 — the dial runs in a SPAWNED task, not inline.
-            //
-            // `round_timeout` is 10 s; a pathed peer's `establish_timeout` is
-            // `LINK_ESTABLISH_TIMEOUT` (30 s). Inline, a cold dial could never
-            // finish inside the round that started it, and the scheduler
-            // abandoning that round dropped the half-built link — so every
-            // retry began cold and the peer converged only when IT dialed US.
-            // Measured on the two-node ladder: the first Attestation round to a
-            // fresh peer timed out at +10 s and the next completed round landed
-            // ~150 s (five cadence ticks) later.
-            //
-            // Detached, an abandoned round abandons the WAIT and not the LINK:
-            // the task runs to completion and publishes into
-            // `reusable_dialed_link` (the "PUBLISH LAST" step in
-            // `dial_and_identify`), so the next round takes the fast path above
-            // instead of dialling cold again.
-            //
-            // The gate permit is acquired INSIDE the task on purpose. Held by
-            // the caller, dropping the caller would release it while the dial
-            // it is meant to gate is still running — the single-flight property
-            // #532 installed would hold only for callers that survive.
-            let gate = self.dial_gate_for(peer.dest_hash).await;
-            let ctx = self.dial_ctx();
-            let peer_owned = peer;
-            let dkid = destination_key_id.to_owned();
-            let dial = tokio::spawn(async move {
-                let _dial_permit = gate
-                    .acquire()
-                    .await
-                    .map_err(|e| TransportError::Io(format!("dial gate closed: {e}")))?;
-                // Double-check: a concurrent dial we queued behind may have just
-                // published a reusable link. Checking only before the gate would
-                // make the gate a queue of redundant dials rather than a filter.
-                if let Some(existing) = ctx.reusable_link_to(&peer_owned.dest_hash).await {
-                    tracing::trace!(
-                        key_id = %dkid,
-                        link = ?existing.link_id(),
-                        "another send established this peer's link while we waited on \
-                         the dial gate — reusing it (CIRISEdge#532)"
-                    );
-                    return Ok(existing);
-                }
-                ctx.dial_and_identify(&dkid, &peer_owned, has_path, establish_timeout)
-                    .await
-            });
-            dial.await
-                .map_err(|e| TransportError::Io(format!("dial task failed: {e}")))??
-        };
+        let claim = self.identity_lane(destination_key_id, &candidates).await?;
 
         // CIRISEdge#532 — hold the link for the duration of the transfer, so a
         // concurrent send to this peer takes another pooled link or dials one
@@ -7915,6 +8225,7 @@ impl Transport for ReticulumTransport {
                         av_sink: &self.av_sink,
                         av_node: &self.node,
                         av_dialed_peer: &self.av_dialed_peer,
+                        direct_paths: &self.direct_paths,
                     };
                     handle_event(event, &ctx).await;
 
@@ -9186,6 +9497,9 @@ struct EventCtx<'a> {
     av_node: &'a Arc<ReticulumNode>,
     /// CIRISEdge#805 — see the field of the same name on [`ReticulumTransport`].
     av_dialed_peer: &'a std::sync::Mutex<HashMap<LinkId, String>>,
+    /// CIRISEdge#805 item 8 — see the field of the same name on
+    /// [`ReticulumTransport`].
+    direct_paths: &'a crate::transport::direct_path::DirectPaths,
 }
 
 impl EventCtx<'_> {
@@ -11290,10 +11604,141 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 hops,
             );
         }
+        // CIRISEdge#805 item 8 — direct links (leviculum#70).
+        NodeEvent::DirectLinkEstablished {
+            link_id,
+            interface_index,
+            proposed,
+        } => direct_link_established(ctx, link_id, interface_index, proposed).await,
+        NodeEvent::DirectLinkFailed {
+            link_id,
+            failure,
+            proposed,
+        } => direct_link_failed(ctx, link_id, failure, proposed).await,
+        NodeEvent::DirectLinkLost {
+            link_id,
+            interface_index,
+        } => direct_link_lost(ctx, link_id, interface_index).await,
         other => {
             tracing::trace!(event = ?other, "unhandled Reticulum event");
         }
     }
+}
+
+/// CIRISEdge#805 item 8 — a link moved onto a punched interface. Either side:
+/// the proposer finds the peer in the tracker, the accepter through the
+/// link's attribution.
+async fn direct_link_established(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    interface: usize,
+    proposed: bool,
+) {
+    let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    let after = link_channel_message_limit(ctx.node, &link_id);
+    let (peer, before, active) = {
+        let mut tracker = ctx.direct_paths.tracker();
+        let (peer, before) = match tracker.established(link_id, interface, hint.as_deref()) {
+            Some((peer, before)) => (Some(peer), before),
+            None => (hint, None),
+        };
+        (peer, before, tracker.direct_count())
+    };
+    if let Some(m) = ctx.metrics {
+        m.inc_direct_link(crate::observability::DIRECT_LINK_ESTABLISHED);
+        m.set_direct_links_active(ctx.metrics_source, active as u64);
+    }
+    tracing::info!(
+        link = %hex::encode(link_id.as_bytes()),
+        peer = peer.as_deref().unwrap_or("<unattributed>"),
+        interface,
+        proposed,
+        channel_limit_before = ?before,
+        channel_limit_after = ?after,
+        "direct link ESTABLISHED: the link runs over a punched interface (CIRISEdge#805 item 8)"
+    );
+    ctx.direct_paths.resolve(
+        link_id,
+        crate::transport::direct_path::DirectOutcome::Established { interface },
+    );
+    ctx.direct_paths.emit(
+        crate::transport::direct_path::DirectPathEvent::Established {
+            peer,
+            link_id: link_id.into_bytes(),
+            interface,
+            proposed,
+            channel_limit_before: before,
+            channel_limit_after: after,
+        },
+    );
+}
+
+/// CIRISEdge#805 item 8 — a proposal ended without a direct path; the link is
+/// untouched and keeps its relayed path.
+async fn direct_link_failed(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    failure: leviculum_core::direct_link::Failure,
+    proposed: bool,
+) {
+    let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    let peer = ctx
+        .direct_paths
+        .tracker()
+        .failed(link_id, failure, std::time::Instant::now())
+        .or(hint);
+    let reason = crate::transport::direct_path::failure_label(failure);
+    if let Some(m) = ctx.metrics {
+        m.inc_direct_link(reason);
+    }
+    tracing::info!(
+        link = %hex::encode(link_id.as_bytes()),
+        peer = peer.as_deref().unwrap_or("<unattributed>"),
+        ?failure,
+        proposed,
+        "direct link FAILED: the link keeps its relayed path (CIRISEdge#805 item 8)"
+    );
+    ctx.direct_paths.resolve(
+        link_id,
+        crate::transport::direct_path::DirectOutcome::Failed(failure),
+    );
+    ctx.direct_paths
+        .emit(crate::transport::direct_path::DirectPathEvent::Failed {
+            peer,
+            link_id: link_id.into_bytes(),
+            reason,
+            proposed,
+        });
+}
+
+/// CIRISEdge#805 item 8 — a punched interface went down; leviculum put its link
+/// back on the interface it left (or closed it, with none left).
+async fn direct_link_lost(ctx: &EventCtx<'_>, link_id: LinkId, interface: usize) {
+    let hint = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    let (peer, active) = {
+        let mut tracker = ctx.direct_paths.tracker();
+        let peer = tracker.lost(link_id, std::time::Instant::now()).or(hint);
+        (peer, tracker.direct_count())
+    };
+    if let Some(m) = ctx.metrics {
+        m.inc_direct_link(crate::observability::DIRECT_LINK_LOST);
+        m.set_direct_links_active(ctx.metrics_source, active as u64);
+    }
+    tracing::info!(
+        link = %hex::encode(link_id.as_bytes()),
+        peer = peer.as_deref().unwrap_or("<unattributed>"),
+        interface,
+        "direct link LOST: the punched interface went down, the link is back on its relayed \
+         path (CIRISEdge#805 item 8)"
+    );
+    ctx.direct_paths
+        .resolve(link_id, crate::transport::direct_path::DirectOutcome::Lost);
+    ctx.direct_paths
+        .emit(crate::transport::direct_path::DirectPathEvent::Lost {
+            peer,
+            link_id: link_id.into_bytes(),
+            interface,
+        });
 }
 
 /// CIRISEdge#809 — a packet leviculum dropped on arrival (v0.29

@@ -772,6 +772,16 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
     for (label, n) in edge.metrics().av_plane() {
         counters.insert(format!("av_plane.{label}"), n);
     }
+    // CIRISEdge#805 item 8 — direct links (`EdgeMetrics::direct_link`): one
+    // counter per label, and the peers with a direct path now.
+    for (label, n) in edge.metrics().direct_link() {
+        counters.insert(format!("direct_link.{label}"), n);
+    }
+    #[allow(clippy::cast_precision_loss)]
+    gauges.insert(
+        "direct_link.active".to_string(),
+        edge.metrics().direct_links_active() as f64,
+    );
     // CIRISEdge#845 — the cumulative durable enqueues per delivery class,
     // and the RESIDENT depth from persist's outbound_counts (#996). A
     // failed count leaves the gauge out rather than reporting 0.

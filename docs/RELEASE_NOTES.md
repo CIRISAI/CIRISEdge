@@ -1,5 +1,34 @@
 # CIRISEdge Release Notes
 
+# Unreleased — CIRISEdge#805 item 8: call members behind NAT reach each other directly
+
+**Branch `local/805-8-direct-links`** (from `local/main-next`; leviculum v0.30.0+ciris.1, no pin change).
+Additive API: `ReticulumTransportConfig::direct_links` / `with_direct_links`
+(`transport::direct_path::{DirectLinksConfig, DirectAccept}`), `ReticulumTransport::{
+subscribe_direct_path_events, direct_path_state, direct_link_interface, fall_back_from_direct}`,
+`LeviculumAvSender::is_direct`, two new `EdgeMetricsBundle` fields. No wire change of edge's own.
+
+- **What it does.** An A/V leg dials a member's derived address, which answers only a one-hop
+  neighbour, so two members behind NAT could never link directly (#805 item 8). `open_av_link` now
+  first proposes a leviculum direct-link upgrade (leviculum#70) on the IDENTITY link to that member;
+  on success the two nodes share a punched UDP interface and the A/V dial reaches the member over
+  it. CC 5.4.6 makes the direct path a MUST wherever the endpoints can bring it direct.
+- **Default: inert.** No facilitator (never proposes), none served, every request refused. A
+  configured facilitator means "propose" (no second switch). Accepting is a SEPARATE operator
+  setting, `DirectAccept::IdentifiedOnly`, which discloses this node's public address to any
+  identified link peer that asks (leviculum#82 will let edge restrict it to room peers).
+- **MTU.** leviculum lowers a link moved onto a punched interface to MTU 1400 (Channel 1321) and
+  never raises it; `DirectPathEvent::Established` carries the Channel limit before and after, which
+  item 5's `CallEvent::BudgetChanged` reads (#720).
+- **New metric family `direct_link`** (`EdgeMetricsBundle`, the UniFFI counters as
+  `direct_link.<label>`, the PyO3 `metrics_snapshot()` dict): `direct_link_proposed`,
+  `_propose_refused`, `_skipped_neighbour`, `_skipped_backoff`, `_skipped_no_link`, `_established`,
+  `_failed_rejected`, `_failed_probe`, `_failed_timeout`, `_failed_punch`, `_lost`,
+  `_leg_fell_back`; and the gauge `direct_links_active` (UniFFI `direct_link.active`).
+  **Merge note for #820 (local/820-p1c):** the catalogue completeness gate needs specs for this
+  family — a counter with a closed `outcome` label drawn from an enum of the twelve tags above, and
+  a gauge with no labels.
+
 # v40.1.0 — leviculum v0.29: known-destinations backpressure, off-lock resource assembly, and the two pressure signals in the metrics snapshot
 
 **2026-10-05.** **MINOR** from v40.0.3. Persist v53.1.4 and verify v19.0.0 unchanged; no wire change. Additive API:
