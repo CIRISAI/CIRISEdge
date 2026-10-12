@@ -595,13 +595,21 @@ impl With {
         )
     }
 
-    /// Can a non-member tell the content EXISTS? `false` means no holding
-    /// claim reaches a non-member (since v55 the claim is placed at the
-    /// content's own cohort) — true only of `self` and `family` (CC 5.2). Undiscoverable is NOT un-replicated: those rows
-    /// still reach the owner's / the family's nodes by consent fan-out.
+    /// Can a non-member tell the content EXISTS? `true` only of `self` and
+    /// `family` (CC 5.2), asked of persist's own predicate
+    /// (`cohort_scope::is_structurally_invisible`). Undiscoverable is NOT
+    /// un-replicated: those rows still reach the owner's / the family's nodes
+    /// by consent fan-out.
+    ///
+    /// Not `!Audience::discoverable()`: since persist v55 (CIRISPersist#989)
+    /// only a Commons placement is discoverable, because a room's holding
+    /// claims stay in the room too, yet a room is a cohort non-members can
+    /// know of, so its content is filtered, not structurally invisible.
     #[must_use]
     pub fn is_structurally_invisible(&self) -> bool {
-        !self.audience().discoverable()
+        ciris_persist::federation::types::cohort_scope::is_structurally_invisible(
+            self.cohort_scope(),
+        )
     }
 }
 

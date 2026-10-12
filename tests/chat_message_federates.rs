@@ -343,8 +343,9 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
         "the actor signs the widening"
     );
     assert!(
-        widened.replicates.discoverable,
-        "community: served on discovery"
+        !widened.replicates.discoverable,
+        "community: replicated to its members; since persist v55 (#989) its holding \
+         claims stay in the room, so nothing about it is discoverable"
     );
     assert_eq!(
         crossing.shared,
@@ -2077,9 +2078,26 @@ async fn carry_key_grants(from: &Peer, to: &Peer) -> usize {
     use ciris_persist::federation::key_grant::{is_key_grant_row, SignedKeyGrantRow};
     // persist v55.0.0 (#989) — one key-grant row per recipient; count the
     // wraps projected HERE (a row for another recipient projects nothing).
+    // Each row goes only to its recipient's node, as persist's `may_receive`
+    // refers-to delivery carries it; another node refuses a row for a
+    // recipient it does not hold (`recipient_not_in_audience`). A row `to`
+    // already holds is not re-offered, as the replication want-diff skips it:
+    // after carol's removal her node refuses her own old-epoch row again.
     let mut wraps = 0;
     for row in from.dir.list_attestations_since(None, 512).await.unwrap() {
-        if is_key_grant_row(&row.attestation) {
+        if is_key_grant_row(&row.attestation)
+            && to
+                .dir
+                .get_attestation(&row.attestation.attestation_id)
+                .await
+                .expect("read")
+                .is_none()
+            && ciris_persist::federation::key_grant::KeyGrantRow::from_attestation(&row.attestation)
+                .expect("a well-formed key_grant row")
+                .wrap
+                .recipient_key_id
+                == to.me
+        {
             wraps += usize::from(
                 to.store
                     .engine()

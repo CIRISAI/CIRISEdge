@@ -1248,7 +1248,9 @@ async fn a_community_file_is_receipted_per_member_and_stops_being_offered() {
         .await
         .expect("read")
         .into_iter()
-        .inspect(|r| assert_eq!((r.epoch, r.k), (epoch, 5)))
+        // persist v55 (#977): a room stream is stream-keyed, so its tree
+        // holds the five chunks and epoch 0's terminator: K = 6.
+        .inspect(|r| assert_eq!((r.epoch, r.k), (epoch, 6)))
         .map(|r| r.node_key_id)
         .collect();
     who.sort();
@@ -1299,14 +1301,22 @@ async fn a_community_file_is_receipted_per_member_and_stops_being_offered() {
         &file.stream_id,
         epoch + 1,
         sth.root_hash,
-        5,
+        sth.tree_size,
     )
     .await;
     assert!(matches!(
         receipts::admit_receipt_row(&*node_a.dir, &*node_a.dir, &wrong_epoch, &ledger).await,
         Err(ReceiptRefusal::EpochMismatch { .. })
     ));
-    let past_tree = forged_row(&node_b, &file.row, &file.stream_id, epoch, sth.root_hash, 6).await;
+    let past_tree = forged_row(
+        &node_b,
+        &file.row,
+        &file.stream_id,
+        epoch,
+        sth.root_hash,
+        sth.tree_size + 1,
+    )
+    .await;
     assert!(matches!(
         receipts::admit_receipt_row(&*node_a.dir, &*node_a.dir, &past_tree, &ledger).await,
         Err(ReceiptRefusal::TreeSizeShort { .. })
