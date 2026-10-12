@@ -97,7 +97,10 @@ Edge::open_call(&self, room: &str /* community_key_id */, opts: CallOptions) -> 
 Edge::join_call(&self, room: &str, call: CallId, opts: CallOptions) -> Result<Call, CallError>;
 
 pub struct CallOptions {
-    pub retention: CallRetention,          // Unkept (default) | Recorded | HistoryOnJoinFull
+    /// Item 2's `transport::av_keep::AvKeep` — `Unkept` (default) | `Kept`. Caller-supplied until
+    /// CIRISPersist#1068 ships the row-borne keep decision (`history_on_join` / recorded); then
+    /// `open_call` reads it from the room and this field goes.
+    pub keep: AvKeep,
     pub relay: bool,                       // this node relays for others (AvSpine::open relay_node)
     pub default_policy: ReceiverLayerPolicy,
 }
@@ -119,6 +122,8 @@ impl Call {
     /// Hang up: final terminator, final STH, the hang-up row (§7).
     pub async fn leave(self) -> Result<CallSummary, CallError>;
     pub fn state(&self) -> CallState;                              // Live | Degraded(StrandedEpoch) | Ended(EndCause)
+    /// Typed call events (§5, §8): `KeepRefused`, `EpochRolled`, `MemberJoined/Left`, `Stranded`.
+    pub fn events(&mut self) -> CallEventStream;                   // impl Stream<Item = CallEvent>
 }
 
 pub struct Frame { pub codec_id: u8, pub layer: ChunkLayer, pub bytes: Vec<u8> }
@@ -126,16 +131,22 @@ pub struct ReceivedFrame { pub publisher: String, pub stream: StreamId, pub epoc
                            pub chunk_seq: ChunkSeq, pub codec_id: u8, pub layer: ChunkLayer, pub bytes: Vec<u8> }
 ```
 
+**The publisher underneath is item 2's `KeptAvPublisher<R: StreamDekRegistrar>`, never the bare
+`AvPublisher`.** `Call` owns the spine; the spine owns the `KeptAvPublisher`, so every epoch move
+(create, `admit_joiner`, `advance_epoch`) passes through the keep layer and a kept call cannot move
+an epoch without registering it.
+
 `publish` maps onto `AvSpine::publish_chunk` (one inner seal per chunk, `RelayNode::forward` + the
 publisher's direct links, `LegOutcome` per leg); `frames` reads the A/V sink's arrivals through
 `AvSubscriber` / `open_av_chunk`; `set_layer_policy` is `AvSpine::subscribe` with the policy. The
 spine's `seal_deadline()` is the one timer an idle call's host loop waits on (unchanged).
 
-**PyO3 twin** (`ciris_edge.PyEdge`): `open_call(room, retention="unkept", relay=False)`,
+**PyO3 twin** (`ciris_edge.PyEdge`): `open_call(room, keep="unkept", relay=False)`,
 `join_call(room, call_id, ...)` → `PyCall` with `id()`, `epoch()`, `chunk_plaintext_budget()`,
 `publish(bytes, codec_id=CODEC_OPAQUE, layer=(0,0,0))`, `frames()` (an async iterator on the
 edge-owned executor, the `run_async` pattern), `set_layer_policy(subscriber, (s,t,q))`, `leave()`,
-`state()`. Every Rust verb has a Python twin; the PyO3 parity test walks the list.
+`state()`, `events()` (an async iterator). Every Rust verb has a Python twin; the PyO3 parity test
+walks the list.
 
 ## 5. Keys — unkept vs kept (CC 5.1, ruled 2026-10-12)
 
@@ -147,16 +158,33 @@ edge-owned executor, the `run_async` pattern), `set_layer_policy(subscriber, (s,
 | seal | `seal_av_inner` (persist's pure seal, #846) | same bytes; item 3 writes them into the stream |
 | bytes at rest | ciphertext only (§10 P1: which door) | the stream's chunks |
 
-- **Edge rolls the epoch; persist never does after a supply.** Edge registers the next epoch's DEK
-  when the room commits. A retryable `BlobError::StreamEpochRotationRequired { reason, .. }` on a
-  kept chunk is the signal to roll: `reason: Removal` names a recipient who left (the room's
-  `remove_member` commit must exist), `reason: Cap` means only the terminator's counter slot is left
-  (the room `rotate`s). Edge registers the next epoch and resends; nothing was stored.
+- **The keep layer is item 2's** (`transport::av_keep`, CIRISEdge `local/805-2-one-dek`):
+  `KeptAvPublisher<R: StreamDekRegistrar>` wraps `AvPublisher`; its async `create`, `admit_joiner`
+  and `advance_epoch` register each epoch's exporter DEK when the call is `AvKeep::Kept` and return
+  `KeepOutcome { NotKept, Registered, AlreadyRegisteredHere, Refused }`. The call API consumes the
+  outcome; it never calls `register_stream_epoch_dek` itself.
+- **A refused keep does not end the call.** On `KeepOutcome::Refused` the call stays live and goes
+  UNKEPT from that epoch; epochs registered before it stay kept, so the recording is PARTIAL. Item 2
+  signals it today as the resource-bus event `av_keep_refused`; the call API surfaces it as the typed
+  `CallEvent::KeepRefused { epoch, reason }`, and `CallSummary` names the kept epoch range.
+- **Edge rolls the epoch; persist never does after a supply.** A retryable
+  `BlobError::StreamEpochRotationRequired { reason, .. }` on a kept chunk is the signal: `reason:
+  Removal` names a recipient who left (the room's `remove_member` commit must exist), `reason: Cap`
+  means only the terminator's counter slot is left. A roll with no roster change is an MLS
+  SELF-UPDATE commit through `advance_epoch` (openmls refuses an empty batch). Edge registers the
+  next epoch (through the keep layer) and resends; nothing was stored.
+- **A second registration with a DIFFERENT DEK** is persist's `StreamEpochDekConflict` from v55.1
+  (CIRISPersist#1069); `AlreadyRegisteredHere` is the same-DEK idempotent case.
 - `register_stream_epoch_dek` closes the open epoch with its terminator (persist-side); the live
   side seals the same terminator with `seal_av_terminator` (counter = the epoch's chunk count, last
   set, #846).
-- **Who decides `kept`** (any participant? all participants' consent to recording?) is §10 C1. The
-  API takes it as a call option and does not guess the rule.
+- **Where the keep decision comes from:** the caller (`CallOptions::keep`) until CIRISPersist#1068
+  ships the row-borne decision (`history_on_join` / recorded, v55.1 or v56); then the room's row.
+  Who may set it is still §10 C1.
+- **The room-group binding (§3.2) sits UNDER the keep layer.** `KeptAvPublisher` registers whatever
+  exporter DEK its `AvPublisher`'s session yields; moving that session from a per-stream
+  `AvSession` group to the room's `CohortGroup` changes the DEK's source, not the keep layer's
+  contract. Under §3.2 the self-update commit above is a ROOM commit (§10 C2).
 
 ## 6. STHs — every live stream, kept or not
 
@@ -199,7 +227,7 @@ edge-owned executor, the `run_async` pattern), `set_layer_policy(subscriber, (s,
 | `NoBudget` | no downstream link reports a Channel limit yet | `publish` before any link is up refuses rather than guessing a size |
 | `Congested` (per leg, in `PublishReport`) | link backpressure (`AvDispatcherError::Congested`) | a frame is dropped for that leg, never queued; other legs deliver |
 | `EpochRollFailed(..)` | a kept chunk got `StreamEpochRotationRequired` and the room commit or the next registration failed | the call goes `Degraded`, never seals under a stale epoch |
-| `DekRegistrationRefused(BlobError)` | `stream_not_authored` / `stream_epoch_dek_exists` / `InvalidArgument` | a duplicate epoch registration is refused by persist's kind, surfaced, not retried |
+| `CallEvent::KeepRefused { epoch, reason }` (an EVENT, not an error) | the keep layer returned `KeepOutcome::Refused` (`stream_not_authored`, `InvalidArgument`, from v55.1 `StreamEpochDekConflict`) | the call stays live and unkept from that epoch; earlier epochs stay readable through the key-grant plane |
 | `SthRefused(BlobError)` | `put_stream_sth`'s gate refused (root mismatch, too few chunks) | a tampered STH never publishes |
 | `Stranded(StrandedEpoch)` | the room commit landed but the spine's re-address failed | `state()` is `Degraded`; publish serves what is live (#813's semantics) |
 | `CallEnded(EndCause)` | `Revoked` (this member left the room), `RingExpired`, `HungUp` | a revoked member's `publish` refuses; the room's next epoch excludes it |
@@ -222,6 +250,7 @@ Inbound failures are NOT call errors: a chunk that does not open (`RealtimeAvErr
 | A9 | STH every 64 chunks or 2 s and on leave; each accepted by `put_stream_sth` | a 200-chunk call: STHs at 64, 128, 192 and the leave |
 | A10 | Ring / accept / decline / hang-up reach the room's members only; no row anywhere carries reachability | an outsider node receives none of the four rows |
 | A11 | PyO3 parity: every `Call` verb has its Python twin | the parity test walks the verb list |
+| A12 | A keep refused mid-call: the call continues, `CallEvent::KeepRefused` fires once, epochs before it stay openable via key grants and epochs after it are never registered | a registrar double refusing epoch 3 of a kept call |
 
 Each criterion carries a fail-before: A1 (DEK from the per-stream `AvSession` group → a non-member
 in that group opens), A3 (no roll on removal → the departed member opens), A4 (a register on an
@@ -246,8 +275,9 @@ refused frame).
   author door for pre-sealed chunks of one's own unkept stream, so `put_stream_sth`'s gate can see
   its chunk hashes? Or is an unkept call's STH produced without storing its chunks?
 - **P2.** `register_stream_epoch_dek`'s final v55 signature. At `8c2d88f7` it takes `keep: bool`;
-  the 2026-10-12 ruling makes "registered" mean "kept". Is `keep` removed, and is `aad` `None` for a
-  call (so it matches #846's `AV_CHUNK_CALLER_AAD`)?
+  the 2026-10-12 ruling makes "registered" mean "kept". Item 2's `StreamDekRegistrar` hides the
+  call shape from this API, but confirm `keep` is removed and `aad` is `None` for a call (so it
+  matches #846's `AV_CHUNK_CALLER_AAD`).
 - **P3.** How a live stream's STH reaches participants: on a row (a file carries `stream_sth` on its
   row), on the hang-up row, or replicated another way?
 - **P4.** Item 3 writes a kept call's chunks: the store must seal them in the v2 form
@@ -259,7 +289,8 @@ refused frame).
 
 **The CC**
 - **C1.** Who may make a call kept (recorded / `history_on_join: full`): the opener, any
-  participant, or only with every participant's consent? Can retention change mid-call?
+  participant, or only with every participant's consent? Can retention change mid-call? (The
+  decision's CARRIER is CIRISPersist#1068's row; this is the rule for setting it.)
 - **C2.** A call rolls the whole room's epoch (a room commit). Acceptable for a room with traffic
   besides the call, or does the CC want a call sub-epoch (exporter context only, no commit) for the
   `Cap` case?
@@ -279,3 +310,7 @@ refused frame).
 ## 12. Changelog
 
 - 2026-10-12 — first draft (CIRISEdge#805 items 5–6).
+- 2026-10-12 — the call API builds on item 2's `KeptAvPublisher` / `AvKeep` / `KeepOutcome`; a
+  refused keep is the typed `CallEvent::KeepRefused` (partial recording), rotation without a roster
+  change is a self-update commit, `StreamEpochDekConflict` (#1069) named, keep comes from the row
+  once CIRISPersist#1068 ships.
