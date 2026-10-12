@@ -239,7 +239,8 @@ pub enum MessageType {
     /// CEG 0.1 §10.1.2 — consumer-side feedback emitted when a
     /// `ContentFetch` attempt returned a `ContentMiss` (or otherwise
     /// failed full-SHA verify) against a holder that advertised
-    /// `holds_bytes:sha256:{prefix}` for the requested SHA. The
+    /// a holding claim for the requested SHA (`custody:ack:v1` `here` since
+    /// v55; `holds_bytes:sha256:{prefix}` before). The
     /// withdrawal is signed by the consumer's local key and shipped
     /// via the existing federation evidence path (`Delivery::Durable`).
     /// Receivers aggregate per `(holder_key_id, sha256)` and apply the
@@ -2242,15 +2243,16 @@ impl GoalRetirement {
 // ─── CIRISEdge#42 (v0.12.0) — Withdraws (CEG §10.1.2) ───────────────
 //
 // Consumer-side feedback: when a `ContentFetch` returns a `ContentMiss`
-// (the holder advertised `holds_bytes:sha256:{prefix}` but didn't
+// (the holder advertised a holding claim, `custody:ack:v1` `here` since
+// v55, but didn't
 // actually serve the bytes), the consumer signs a `Withdraws`
 // attestation against the `(holder_key_id, sha256)` pair and ships it
 // via the existing federation evidence path. Receivers aggregate per
 // holder and apply the downweight policy in their own `PeerResolver`.
 //
-// The withdrawal is NOT the same as a `holds_bytes` retraction by the
-// holder itself — that would be a `holds_bytes` attestation with
-// `is_active = false` (or a `superseded` row) at the substrate tier.
+// The withdrawal is NOT the same as a holding-claim retraction by the
+// holder itself — that is the holder's own later `none` or `withdraws`
+// of its `custody:ack:v1` claim (CC 3.1.3.3 rule 4).
 // `Withdraws` is consumer-emitted: the consumer is saying "this
 // holder advertised holding these bytes but failed to deliver".
 
@@ -2263,8 +2265,7 @@ pub enum WithdrawalReason {
     /// The holder responded with [`MessageType::ContentMiss`] — the
     /// canonical CEG §10.1.2 case. The consumer's fetch attempt
     /// completed (no transport failure) but the holder declined to
-    /// serve the bytes despite advertising the `holds_bytes`
-    /// attestation.
+    /// serve the bytes despite advertising its holding claim.
     ContentMiss,
     /// The holder served a [`ContentBody`] but the SHA-256 of
     /// `body.bytes` did not match `body.sha256`. CEG §10.1.1
@@ -2285,8 +2286,8 @@ pub enum WithdrawalReason {
 /// downweight policy in their own [`crate::transport::reticulum::PeerResolver`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Withdraws {
-    /// The holder whose `holds_bytes:sha256:{prefix}` attestation is
-    /// being withdrawn against. `federation_keys.key_id`.
+    /// The holder whose holding claim (`custody:ack:v1` `here` since v55)
+    /// is being withdrawn against. `federation_keys.key_id`.
     pub holder_key_id: String,
     /// The SHA-256 the holder advertised holding. 32 bytes raw,
     /// base64-standard on the wire (44 chars), same convention as

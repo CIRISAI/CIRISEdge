@@ -48,25 +48,28 @@
 //! somebody the audience gate would have to accept anyway. That is the
 //! property axis 2 was missing.
 //!
-//! # `holds_bytes` is POSSESSION, and possession is not meaning
+//! # A holding claim is POSSESSION, and possession is not meaning
 //!
-//! The one distinction this module exists to make. persist's
-//! `put_blob_scoped` auto-emits a `holds_bytes:sha256:*` row, so *every*
-//! stored blob already has a signed attestation pointing at it. It is not
-//! the one we mean:
+//! The one distinction this module exists to make. persist's write doors
+//! file a holding claim as they store (v55.0.0, CIRISPersist#989: a
+//! `custody:ack:v1` row with `custody_state: here`, at the content's own
+//! scope), so *every* stored blob already has a signed attestation pointing
+//! at it. It is not the one we mean:
 //!
-//! | | `holds_bytes` | a content row |
+//! | | a holding claim | a content row |
 //! |---|---|---|
 //! | says | "I have these bytes" | "these bytes are X, for Y" |
 //! | `attesting_key_id` | the holder | the author |
 //! | `attested_key_id` | **itself** | the author |
-//! | `cohort_scope` | always `federation` | the content's actual cohort |
+//! | `cohort_scope` | the content's (`federation` for the commons) | the content's actual cohort |
 //!
-//! Reading a `holds_bytes` row as meaning would classify **every** blob on
-//! the node as commons content — the one default this stack must never
-//! adopt, arrived at by accident. So the projection refuses it by name
-//! ([`MeaningRefusal::PossessionIsNotMeaning`]) rather than falling through
-//! to the `federation` arm its column would otherwise select.
+//! Reading a holding claim as meaning would classify the bytes by the
+//! claim's column and fetch on every claim a peer announced. So the
+//! projection refuses it by name ([`MeaningRefusal::PossessionIsNotMeaning`]).
+//! The carrier retired in v55, `holds_bytes:sha256:*` (whose column was
+//! always `federation`, so reading it as meaning classified **every** blob as
+//! commons), is refused by name too: persist keeps legacy rows stored and
+//! refuses new ones, and edge still never reads one as meaning.
 //!
 //! # Fail-closed, and what "closed" costs
 //!
@@ -99,10 +102,9 @@ pub enum MeaningRefusal {
     /// directory; this function is pure so it can be tested at the exact
     /// inputs the field produces.
     Unsigned,
-    /// The row is a `holds_bytes` possession claim. See the module docs:
-    /// it proves someone has the bytes and says nothing about what they
-    /// are, and its `federation` column would silently classify every blob
-    /// on the node as commons.
+    /// The row is a possession claim — a holding claim (`custody:ack:v1`) or
+    /// a legacy `holds_bytes` row (retired in v55). See the module docs: it
+    /// proves someone has the bytes and says nothing about what they are.
     PossessionIsNotMeaning,
     /// The row is signed and is not a possession claim, but nothing in its
     /// envelope names THIS blob. A row about some other content cannot
@@ -162,7 +164,7 @@ impl std::fmt::Display for MeaningRefusal {
             Self::Unsigned => write!(f, "the referencing row carries no signature"),
             Self::PossessionIsNotMeaning => write!(
                 f,
-                "a holds_bytes row is possession, not meaning — it says who has \
+                "a holding claim is possession, not meaning — it says who has \
                  the bytes, never what they are"
             ),
             Self::DoesNotReference { sha256_hex } => {
@@ -207,7 +209,8 @@ impl BlobMeaning {
     ///
     /// 1. **signed by someone** — an empty signature column is refused
     ///    before anything else is read;
-    /// 2. **not a possession claim** — `holds_bytes` is refused by name;
+    /// 2. **not a possession claim** — a holding claim (`custody:ack:v1`)
+    ///    and the retired `holds_bytes` carrier are refused by name;
     /// 3. **references THIS blob** — the envelope must carry a
     ///    [`BlobPointer`] (or an `evidence_refs` entry) naming `blob_sha256`;
     /// 4. **the scope is one we can name**, and a scoped row names its
@@ -367,8 +370,8 @@ impl BlobMeaning {
     /// `evidence_refs` entry that is a 64-hex sha. Deduplicated, in envelope
     /// order.
     ///
-    /// A `holds_bytes` row returns **nothing**, by name: it references its
-    /// blob too, but as possession, and a puller that fetched on possession
+    /// A legacy `holds_bytes` row (retired in v55) returns **nothing**, by
+    /// name: it references its blob too, but as possession, and a puller that fetched on possession
     /// claims would fetch every blob every peer announced. The full
     /// projection refuses it as `PossessionIsNotMeaning`; this pre-check
     /// keeps the apply path from cloning a row it would then refuse. A
@@ -647,8 +650,8 @@ fn references_as_evidence(envelope: &serde_json::Value, sha_hex: &str) -> bool {
 /// side that starts from the row — a `withdraws` landing against it
 /// (CIRISEdge#606) needs to know which bytes just lost a reference. Same
 /// top-level-only pointer scan, same `evidence_refs` read, so the two can
-/// never disagree about what counts as a reference. A `holds_bytes` row is
-/// possession and references nothing — the caller checks that by type, as
+/// never disagree about what counts as a reference. A legacy `holds_bytes`
+/// row (retired in v55) is possession and references nothing — the caller checks that by type, as
 /// `project` does, before asking ([`is_possession_row`]). A custody report
 /// (`custody:ack:v1`) is possession by its envelope alone, so this answers
 /// nothing for one even when the caller did not ask (CIRISEdge#763).
@@ -701,8 +704,9 @@ pub fn is_custody_report(envelope: &serde_json::Value) -> bool {
         == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
 }
 
-/// **Is this row possession, never a reference?** A `holds_bytes` claim
-/// ([`is_holds_bytes_row`]) or a custody report ([`is_custody_report`]).
+/// **Is this row possession, never a reference?** A holding claim or custody
+/// report ([`is_custody_report`], the one holding claim since v55) or a
+/// legacy `holds_bytes` row ([`is_holds_bytes_row`], retired in v55).
 /// The one question every reader that derives "this row references that
 /// content" asks first (CIRISEdge#606, #763).
 #[must_use]
@@ -710,7 +714,8 @@ pub fn is_possession_row(row: &Attestation) -> bool {
     is_holds_bytes_row(row) || is_custody_report(&row.attestation_envelope)
 }
 
-/// Is this row a `holds_bytes` claim — possession, never a reference?
+/// Is this row a legacy `holds_bytes` claim (retired in v55) — possession,
+/// never a reference?
 ///
 /// The same two checks [`BlobMeaning::project`] step (2) makes, exposed so
 /// the revocation side asks the identical question.
@@ -1057,8 +1062,9 @@ mod tests {
         // Nothing referenced.
         assert!(BlobMeaning::referenced_shas(&bare_row(ps())).is_empty());
 
-        // A holds_bytes row references its blob as POSSESSION; the pre-check
-        // returns nothing, matching `project`'s `PossessionIsNotMeaning`.
+        // A legacy holds_bytes row (retired in v55) references its blob as
+        // POSSESSION; the pre-check returns nothing, matching `project`'s
+        // `PossessionIsNotMeaning`.
         let mut holds = bare_row(ps());
         holds.attestation_type = format!("holds_bytes:sha256:{}", &hex::encode(SHA)[..8]);
         holds.attestation_envelope = serde_json::json!({ "evidence_refs": [hex::encode(SHA)] });

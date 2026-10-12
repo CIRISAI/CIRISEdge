@@ -17,9 +17,10 @@
 //!
 //! # Why it could not be bolted on later
 //!
-//! - **Storing IS announcing.** persist's `put_blob` auto-emits a
-//!   `holds_bytes:sha256:*` holder attestation, and `list_holders` is how the
-//!   swarm finds you. You cannot quietly hold federation-tier content. That
+//! - **Storing IS announcing.** persist's `put_blob` files this node's
+//!   holding claim as it stores (since v55 a `custody:ack:v1` `here` row at
+//!   the content's scope; the `holds_bytes:sha256:*` carrier before), and
+//!   `list_holders` is how the swarm finds you. You cannot quietly hold federation-tier content. That
 //!   is why this gate returns a *trichotomy* rather than a boolean — persist's
 //!   two write doors make "store and announce" and "store silently" genuinely
 //!   different consents.
@@ -77,10 +78,11 @@ pub enum StoreAdmission {
     /// `store_blob_local`. The bytes are ours to read and the substrate
     /// publishes no claim that we hold them.
     ///
-    /// Two independent reasons to land here: the scope suppresses
-    /// `holds_bytes` structurally (`self` / `family` — announcing would
-    /// defeat the invisibility the scope exists for), or the operator
-    /// consented to hold this class but not to advertise holding it.
+    /// Two independent reasons to land here: the scope is structurally
+    /// invisible (`self` / `family` — edge keeps the adopt local and the
+    /// completed pull files the holding claim itself, at the row's own
+    /// cohort, so it never reaches a non-member), or the operator consented
+    /// to hold this class but not to advertise holding it.
     StoreLocalOnly,
     /// Do not accept the bytes. The reason names WHICH axis refused,
     /// because the three have different remedies: join the community, get
@@ -95,7 +97,7 @@ impl StoreAdmission {
         matches!(self, Self::StoreAndAnnounce | Self::StoreLocalOnly)
     }
 
-    /// `true` iff a `holds_bytes` attestation may be emitted.
+    /// `true` iff persist's write door may emit this node's holding claim.
     #[must_use]
     pub fn may_announce(&self) -> bool {
         matches!(self, Self::StoreAndAnnounce)
@@ -135,8 +137,9 @@ impl StoreAdmission {
 /// point of those scopes being that it is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreDisposition {
-    /// persist's `put_blob*` — store AND emit `holds_bytes:sha256:*`, so
-    /// `list_holders` names this node and the swarm can fetch from it.
+    /// persist's `put_blob*` — store AND emit this node's holding claim
+    /// (`custody:ack:v1` `here`, v55), so `list_holders` names this node and
+    /// the swarm can fetch from it.
     Announce,
     /// persist's `store_blob_local` — store and publish NOTHING. The bytes
     /// are readable locally and the substrate makes no claim that this node
@@ -309,14 +312,18 @@ impl OperatorStoreConsent {
 
 /// Whether the substrate would announce a hold at this scope AT ALL.
 ///
-/// `self` and `family` suppress `holds_bytes` structurally — that is what
-/// makes them invisible, and it is persist's rule, not a preference. So a
+/// `self` and `family` are structurally invisible — no holding claim of
+/// theirs reaches a non-member, and it is persist's rule
+/// (`is_structurally_invisible`), not a preference. Edge keeps their adopt
+/// local; the completed pull files the claim inside the cohort
+/// (`BlobPuller::report_here`). So a
 /// `ConsentDisposition::Announce` at those scopes cannot be honoured and
 /// resolves to local-only rather than being treated as a conflict: the
 /// operator asked for something the tier does not offer, and the tier wins.
 fn announce_is_possible(scope: &CohortScope) -> bool {
     // CIRISEdge#646 ask 1 — the substrate's predicate, not a restatement
-    // of it: CC 5.2 is persist's rule (`suppresses_holds_bytes`), and edge
+    // of it: CC 5.2 is persist's rule (`is_structurally_invisible`, named
+    // `suppresses_holds_bytes` before v55), and edge
     // asking it means the two cannot drift. The token mapping is the one
     // `CohortScope::crypto_tier` already performs against persist's lattice.
     use ciris_persist::federation::types::cohort_scope as ps;
@@ -651,7 +658,7 @@ mod tests {
         );
         assert_eq!(a, StoreAdmission::StoreLocalOnly);
         assert!(a.is_admitted(), "the bytes are accepted");
-        assert!(!a.may_announce(), "and no holds_bytes is emitted");
+        assert!(!a.may_announce(), "and the write door emits no claim");
     }
 
     /// An operator asking to announce `self`/`family` content asked for
@@ -674,7 +681,7 @@ mod tests {
             assert_eq!(
                 a,
                 StoreAdmission::StoreLocalOnly,
-                "{scope:?} suppresses holds_bytes structurally",
+                "{scope:?} is structurally invisible",
             );
         }
     }

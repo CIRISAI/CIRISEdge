@@ -553,7 +553,8 @@ pub(crate) fn typed_terminal_verdict(
             Some(reason)
         }
         // persist v55.0.0 (#989 / #975) — a row type the row-type gate refuses
-        // (a retired carrier: a new `holds_bytes` claim, a key-grant SET), and
+        // (a retired carrier: a new `holds_bytes` claim, retired in v55, or a
+        // key-grant SET), and
         // a settlement row naming a payment-processor identifier (#753). Both
         // are the bytes'; the terminal schedule still re-asks after an upgrade.
         E::AttestationTypeUnregistered { .. } | E::PaymentProcessorIdentifier { .. } => {

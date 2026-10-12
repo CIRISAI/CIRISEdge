@@ -26,7 +26,8 @@
 //!
 //! # What it refuses to do
 //!
-//! - It never fetches on a `holds_bytes` row. Possession is not meaning
+//! - It never fetches on a holding claim (`custody:ack:v1`, or a legacy
+//!   `holds_bytes` row retired in v55). Possession is not meaning
 //!   ([`BlobMeaning::referenced_shas`] returns nothing for one), and a
 //!   puller that fetched on possession claims would fetch every blob every
 //!   peer announced.
@@ -75,7 +76,7 @@ pub struct PullRequest {
 pub enum PullOffer {
     /// Queued for the puller.
     Queued,
-    /// The row references no blob (or is a `holds_bytes` row); nothing to do.
+    /// The row references no blob (or is a holding claim); nothing to do.
     NotAReference,
     /// The queue is full; the offer was DROPPED, logged and counted. The
     /// row is still in persist, so a later re-read (a peer re-advertising
@@ -322,8 +323,9 @@ impl Default for PullConfig {
 pub enum PullOutcome {
     /// The bytes were already here; nothing fetched.
     AlreadyHeld,
-    /// Fetched, gated, stored. `announced` is whether a `holds_bytes` claim
-    /// went out — the gate's verdict, carried into persist's door.
+    /// Fetched, gated, stored. `announced` is whether this node's holding
+    /// claim (`custody:ack:v1` `here`, persist v55) went out or already
+    /// exists — the gate's verdict, carried into persist's door.
     Stored { announced: bool },
     /// Another pull for this sha is in flight; this one stood down.
     InFlight,
@@ -335,8 +337,9 @@ pub enum PullOutcome {
     /// `attempts` reached the ceiling).
     NoHolders { attempts: u32, retrying: bool },
     /// CIRISEdge#646 — a self/family pull found no node of the author to
-    /// ask. These tiers never consult the claim index (CC 5.2: no
-    /// `holds_bytes` exists for them by construction); the holders are the
+    /// ask. These tiers never consult the claim index (CC 5.2: their
+    /// holding claims reach only the cohort, never a discovery surface);
+    /// the holders are the
     /// author's nodes, resolved through the directory
     /// (`FSD/CONTENT_TRANSFER.md` §6.2). `retrying` when the directory has
     /// not converged on the author yet (`NotYetDiscovered`) or every node
@@ -2322,8 +2325,9 @@ where
     /// CIRISEdge#763 (CC 6.1.5.3, 3.1.3.3) — **a completed self/family pull
     /// files this node's `here`**, so the cohort can count the copy and the
     /// durability deficit stops listing this node. Acts on `Stored` only, and
-    /// only at `self` / `family` (the tiers whose copies are otherwise
-    /// unobservable: no `holds_bytes` at any audience, CC 5.2). For a chunk
+    /// only at `self` / `family` (the tiers whose adopt the store gate keeps
+    /// `LocalOnly`, so this report IS the copy's holding claim, placed at the
+    /// row's own cohort, CC 5.2 / 3.1.3.3). For a chunk
     /// DAG `here` means the manifest and every chunk
     /// ([`durability::file_custody`](super::durability::file_custody)), so the
     /// `Stored` a chunk repair ends in re-files it for the whole DAG. A
@@ -3299,7 +3303,7 @@ where
     /// puller reads it itself, bounds the work, fetches every chunk, and
     /// stores the whole DAG in one shot through persist's
     /// `put_blob_chunks_signing` — every chunk verified against the manifest
-    /// again inside the door, and the manifest's `holds_bytes` announced as
+    /// again inside the door, and the manifest's holding claim announced as
     /// `store_plaintext` announces a whole blob. Held in memory until the
     /// door takes it, bounded by the plan's `in_memory_cap_bytes` (persist's
     /// whole-read constant, reused as this walk's buffer bound — CIRISEdge#737).
@@ -3450,7 +3454,7 @@ where
 
     /// Commons bytes (a manifest, a public attachment): persist's plaintext
     /// door, `put_blob_signing` — stores AND emits this node's hybrid-signed
-    /// `holds_bytes`.
+    /// holding claim (`custody:ack:v1` `here` at `federation`).
     ///
     /// There is no `LocalOnly` plaintext door a consumer can reach:
     /// `store_blob_local` takes a `StorageFloor` that only persist can mint
@@ -4174,7 +4178,8 @@ mod tests {
     }
 
     /// A row that references nothing costs the apply path no clone and no
-    /// channel slot — and a `holds_bytes` row counts as referencing nothing.
+    /// channel slot — and a legacy `holds_bytes` row (retired in v55)
+    /// counts as referencing nothing.
     #[tokio::test]
     async fn non_references_never_enter_the_queue() {
         let (sink, mut rx) = sink_with(4);
@@ -4187,7 +4192,7 @@ mod tests {
         assert_eq!(
             sink.offer(&holds),
             PullOffer::NotAReference,
-            "possession is not meaning: a holds_bytes row never triggers a pull"
+            "possession is not meaning: a legacy holds_bytes row never triggers a pull"
         );
         assert!(rx.try_recv().is_err(), "nothing was queued");
         assert_eq!(sink.dropped(), 0);

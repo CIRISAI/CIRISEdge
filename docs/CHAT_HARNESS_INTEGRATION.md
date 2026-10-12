@@ -72,7 +72,7 @@ is keyed, when its epoch moved, and when stragglers have had long enough:
 
 ```rust
 // The room's MLS roster names PERSONS; the table's members are NODES (the
-// keys that sign holds_bytes claims, the key this node listens on). Walk
+// keys that sign custody:ack holding claims, the key this node listens on). Walk
 // persons to nodes through the one resolution the contact ladder uses:
 let roster = cohort_addressing::snapshot_for_nodes(&room_group, &lens).await?;
 let scope = cohort_addressing::scope_for(&room_id);

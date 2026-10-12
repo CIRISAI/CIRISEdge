@@ -1012,8 +1012,9 @@ fn log_nat_topology_diagnosis(destination_key_id: &str, establish_timeout: Durat
 /// `ContentFetch` family needs. The default impl returns an empty
 /// `Vec` so v0.7.x-era impls don't break; a production impl wraps
 /// persist's `BlobStorage::list_holders` (CIRISPersist#103 / v2.3+)
-/// which queries the `holds_bytes:sha256:<prefix>` attestation index
-/// and returns `Vec<key_id>`. Each returned `key_id` is then routable
+/// which folds the holding claims (since v55 the `custody:ack:v1` `here`
+/// rows; the `holds_bytes:sha256:<prefix>` index before) and returns
+/// `Vec<key_id>`. Each returned `key_id` is then routable
 /// via the existing [`PeerResolver::resolve`] path — the holder list
 /// IS a list of `key_id` "transport identities" in the existing
 /// edge-layer sense (the federation_keys row's id is the addressing
@@ -1035,9 +1036,9 @@ pub trait PeerResolver: Send + Sync + 'static {
     ///
     /// The CIRISPersist#103 (v2.3+) production impl maps onto
     /// `BlobStorage::list_holders(&sha256_array) -> Vec<String>`
-    /// (returns `key_id`s pulled from the
-    /// `holds_bytes:sha256:<8-hex-prefix>` attestation index on the
-    /// `federation_attestations` table). The returned `key_id`s are
+    /// (returns the `key_id`s of the live holding claims: since v55 the
+    /// `custody:ack:v1` `here` rows, the `holds_bytes:sha256:<8-hex-prefix>`
+    /// index before). The returned `key_id`s are
     /// then routable through this trait's existing [`Self::resolve`].
     ///
     /// `BlobStorage` is NOT object-safe in persist v2.3 (uses
@@ -1055,9 +1056,12 @@ pub trait PeerResolver: Send + Sync + 'static {
     ///
     /// # CEG §10.1.2 TTL discipline (v0.12.0 / CIRISEdge#42)
     ///
-    /// CEG 0.1 §10.1.2 requires `holds_bytes:sha256:{prefix}`
+    /// CEG 0.1 §10.1.2 required `holds_bytes:sha256:{prefix}`
     /// attestations to be considered **stale** after 24h from
-    /// `signed_at` (configurable via [`crate::EdgeConfig::holds_bytes_ttl_seconds`]).
+    /// `signed_at`. Since v55 the holding claim is `custody:ack:v1`, live
+    /// 72 h from its signed instant by persist's own fold (`list_holders`
+    /// returns only live claims), and the edge TTL knob
+    /// ([`crate::EdgeConfig::holds_bytes_ttl_seconds`]) is inert.
     /// Stale attestations MUST NOT be returned here. Impls that wrap
     /// persist's `BlobStorage::list_holders` are expected to either (a)
     /// filter at the persist query layer (preferred — the persist row's
@@ -1072,8 +1076,7 @@ pub trait PeerResolver: Send + Sync + 'static {
     }
 
     /// TTL-aware companion to [`Self::resolve_holders`] — returns each
-    /// candidate holder with the `signed_at` of its `holds_bytes`
-    /// attestation, so the caller (edge's content-fetch dispatcher) can
+    /// candidate holder with the `signed_at` of its holding claim, so the caller (edge's content-fetch dispatcher) can
     /// apply the §10.1.2 24h TTL filter centrally without each
     /// impl re-rolling the staleness logic.
     ///
@@ -1082,7 +1085,7 @@ pub trait PeerResolver: Send + Sync + 'static {
     /// contract for resolvers that don't track attestation timestamps
     /// (every returned holder counts as fresh). Production impls
     /// override this with the real `(key_id, signed_at)` rows from
-    /// persist's `holds_bytes:sha256:*` attestation index.
+    /// persist's holding claims (`custody:ack:v1` since v55).
     ///
     /// # CEG §10.1.2 (CIRISEdge#42)
     ///
@@ -1127,13 +1130,14 @@ pub trait PeerResolver: Send + Sync + 'static {
     }
 }
 
-/// A `holds_bytes:sha256:*` attestation row — the `(holder_key_id,
+/// A holding claim (`custody:ack:v1` `here` since v55; a
+/// `holds_bytes:sha256:*` row before) — the `(holder_key_id,
 /// signed_at)` pair edge's content-fetch dispatcher needs to apply the
 /// CEG §10.1.2 24h TTL filter + the rolling ContentMiss downweight.
 ///
 /// Returned from [`PeerResolver::resolve_holders_with_signed_at`].
-/// `signed_at` is the wall-clock time the holder signed its
-/// `holds_bytes` attestation — NOT the time the row was fetched from
+/// `signed_at` is the wall-clock time the holder signed its holding
+/// claim — NOT the time the row was fetched from
 /// persist. The TTL window is computed against `signed_at` so a slow
 /// persist round-trip cannot extend the effective freshness.
 #[derive(Debug, Clone)]
@@ -1141,9 +1145,9 @@ pub struct HolderAttestation {
     /// The holder's federation `key_id` — addressable via
     /// [`PeerResolver::resolve`].
     pub key_id: String,
-    /// Wall-clock time the holder signed the `holds_bytes:sha256:*`
-    /// attestation. CEG §10.1.2 — staleness is 24h from this stamp
-    /// (configurable via [`crate::EdgeConfig::holds_bytes_ttl_seconds`]).
+    /// Wall-clock time the holder signed its holding claim. CEG §10.1.2 —
+    /// staleness is `ttl_seconds` from this stamp in
+    /// [`filter_holders_with_policy`].
     pub signed_at: DateTime<Utc>,
 }
 
@@ -1277,8 +1281,9 @@ fn evict_window(buf: &mut VecDeque<DateTime<Utc>>, now: DateTime<Utc>, window_se
 ///
 /// - `holders`: `(key_id, signed_at)` rows from
 ///   [`PeerResolver::resolve_holders_with_signed_at`].
-/// - `ttl_seconds`: [`crate::EdgeConfig::holds_bytes_ttl_seconds`]
-///   (default 24h per CEG §10.1.2).
+/// - `ttl_seconds`: the staleness window (24h per CEG §10.1.2). No
+///   production path passes [`crate::EdgeConfig::holds_bytes_ttl_seconds`]
+///   since v55; persist's fold owns the claim's 72 h liveness.
 /// - `tracker`: per-holder ContentMiss tracker; `None` skips the
 ///   downweight sort (e.g. tests that want pure-TTL behaviour).
 /// - `now`: wall-clock anchor — caller-supplied so tests can drive the

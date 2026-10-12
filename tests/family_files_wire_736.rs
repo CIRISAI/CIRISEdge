@@ -22,9 +22,11 @@
 //! this file calls `pull_one` or `pull_dag_with`, and nothing copies a byte.
 //!
 //! What each witness pins, from the side that must show it:
-//! - **(a) delivered, never discovered** (CC 5.2): no node holds a
-//!   `holds_bytes` row for either sha, at any audience — the discovery index
-//!   (`list_holders`, `list_local_holders`) and the federation stream both.
+//! - **(a) delivered, never discovered** (CC 5.2): no node outside the
+//!   family learns either sha is held — no retired `holds_bytes` row exists
+//!   anywhere, and P1's holding claim (`custody:ack:v1` `here` at `family`
+//!   scope, persist v55) is served to Q1 and never to N or F, whose holder
+//!   reads (`list_holders`, `live_holders`) are empty.
 //! - **(b) the send set is the roster**: for each file row, P1's bridge
 //!   offers it to exactly `family_room::roster(..).nodes` (minus P1), and the
 //!   roster's unresolved member R is NAMED on the publish
@@ -1285,7 +1287,7 @@ async fn assert_f_blob_store_holds_no_family_bytes(p1: &Member, f: &Relay, files
 
 /// **P1 → Q1 direct, with a non-family node N on the mesh**: both files read
 /// byte-identical on Q1 through the real replication → sink → puller path;
-/// (a) no `holds_bytes` anywhere; (b) the send set is the roster and R is
+/// (a) the holding claim stays inside the family; (b) the send set is the roster and R is
 /// named unresolved; (c) N holds nothing, is offered nothing, is served
 /// nothing, by name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

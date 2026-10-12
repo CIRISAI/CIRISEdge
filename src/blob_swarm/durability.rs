@@ -31,8 +31,10 @@
 //! chunk repair re-files it. The `custody:ack:v1` rows replicate only within
 //! their cohort through the existing audience gate (persist's `may_receive`:
 //! a `self` row reaches the owner's personal nodes, a `family` row the
-//! family's audience). Nothing here is a `holds_bytes` claim, at any audience
-//! (CC 5.2, CIRISEdge#499: self/family bytes are delivered, never discovered).
+//! family's audience). Its `here` IS the copy's holding claim (persist v55,
+//! CIRISPersist#989), placed at the content's own cohort, so it reaches the
+//! cohort and no one else (CC 5.2, CIRISEdge#499: self/family bytes are
+//! delivered, never discovered).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -62,8 +64,10 @@ pub fn target_mode(audience_size: usize) -> DurabilityMode {
 }
 
 /// Is `row` placed at a tier whose files this module keeps durable? `self`
-/// and `family`: the tiers whose bytes are delivered to the cohort and never
-/// claimed (`community` and the commons keep their `holds_bytes` plane).
+/// and `family`: the tiers whose bytes are delivered to the cohort, whose
+/// holding claims reach only the cohort, and whose adopt the store gate keeps
+/// local (`community` and the commons are announced by persist's write door
+/// and discovered through `list_holders`).
 #[must_use]
 pub fn is_cohort_delivered(row: &Attestation) -> bool {
     matches!(

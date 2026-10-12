@@ -42,8 +42,8 @@ use crate::verify::{
 
 // ─── CEG §10.1.2 spec constants (CIRISEdge#42, v0.12.0) ─────────────
 
-/// Default TTL for a `holds_bytes:sha256:*` attestation row — 24
-/// hours from `signed_at`, per CEG 0.1 §10.1.2. Configurable via
+/// Default TTL the `holds_bytes:sha256:*` carrier (retired in v55) was
+/// given — 24 hours from `signed_at`, per CEG 0.1 §10.1.2. Configurable via
 /// [`EdgeConfig::holds_bytes_ttl_seconds`]; this constant is the
 /// spec-pinned default the [`Default`] impl on [`EdgeConfig`] reads.
 /// Lives at the crate root (not behind the reticulum-feature gate) so
@@ -330,11 +330,11 @@ pub struct EdgeConfig {
     /// snapshot to render `peer_reachability(key_id) → dict[str, float]`.
     pub reachability_window_seconds: u64,
     /// CIRISEdge#42 (v0.12.0, CEG §10.1.2) — TTL in seconds for
-    /// `holds_bytes:sha256:{prefix}` attestations. After this many
-    /// seconds elapse from `signed_at`, the attestation is **stale**
-    /// and `PeerResolver::resolve_holders_with_signed_at` results are
-    /// filtered to exclude it before `filter_holders_with_policy`
-    /// returns. Default [`DEFAULT_HOLDS_BYTES_TTL_SECONDS`] (86_400s =
+    /// `holds_bytes:sha256:{prefix}` attestations (the carrier retired in
+    /// v55). Before v55, after this many seconds from `signed_at` the
+    /// attestation was **stale** and `PeerResolver::resolve_holders_with_signed_at`
+    /// results were filtered to exclude it before `filter_holders_with_policy`
+    /// returned. Default [`DEFAULT_HOLDS_BYTES_TTL_SECONDS`] (86_400s =
     /// 24 hours per CEG §10.1.2 spec). Test deployments may shorten
     /// this to verify the staleness logic; production should leave it
     /// at the default.
@@ -484,8 +484,8 @@ pub struct EdgeConfig {
     /// CIRISEdge#52 (v0.20.1) — L1-as-CDN-edge opt-in per
     /// MEDIA_SHARING.md §2.7. When `true` AND
     /// [`Self::agent_mode`] is `AgentMode::Server` (L1), edge
-    /// pre-fetches external multimedia content + re-emits its own
-    /// `holds_bytes:sha256:{hash}` attestation so federation peers
+    /// pre-fetches external multimedia content + files its own holding
+    /// claim (`custody:ack:v1` `here` since v55) so federation peers
     /// can fetch through the operator's CDN tier. Default `false`
     /// (opt-in per the spec); Client and Proxy modes ignore the
     /// flag regardless of its value.
@@ -501,8 +501,8 @@ pub struct EdgeConfig {
     /// L1-as-CDN-edge re-publication. Required when
     /// [`Self::l1_cdn_edge_enabled`] is `true`; ignored otherwise.
     /// The prefetch stub re-publishes content at
-    /// `{l1_cdn_edge_external_uri_base}/{sha256_hex}` and emits a
-    /// fresh `holds_bytes` attestation against that URI.
+    /// `{l1_cdn_edge_external_uri_base}/{sha256_hex}` and files a
+    /// fresh holding claim (`custody:ack:v1` `here`) for it.
     ///
     /// `None` when L1-CDN-edge is disabled (the default); operators
     /// who flip the boolean MUST also supply this base before
@@ -6922,8 +6922,9 @@ async fn dispatch_inbound(
 
     // CIRISEdge#42 (v0.12.0, CEG §10.1.2) — `ContentMiss` is the
     // canonical CEG §10.1.2 trigger for emitting a `Withdraws`
-    // attestation against the holder. The peer (the holder) advertised
-    // `holds_bytes:sha256:{prefix}` for this SHA, we asked, and the
+    // attestation against the holder. The peer (the holder) advertised a
+    // holding claim for this SHA (`custody:ack:v1` `here` since v55;
+    // `holds_bytes:sha256:{prefix}` before), we asked, and the
     // holder responded with a typed miss. The withdrawal is shipped
     // via the existing federation evidence path; receivers aggregate
     // per `(holder_key_id, sha256)` and apply the downweight policy in
@@ -7529,7 +7530,7 @@ async fn dispatch_inbound(
                     // holders: best-effort observability emission via
                     // the resource event channel. The federation-tier
                     // emission lands in a future cut (when persist's
-                    // holds_bytes index reachable at edge); for now
+                    // holder index reachable at edge); for now
                     // the tracing span IS the cross-peer observable
                     // (lens-core consumes the span and ships it).
                     events.emit_resource(crate::events::NetworkEvent::resource(
@@ -9035,7 +9036,7 @@ async fn emit_delivery_attestation(
 /// downweight policy in their own
 /// [`crate::transport::reticulum::PeerResolver`]. The destination of
 /// the withdrawal envelope is the **holder itself** — the peer who
-/// advertised the `holds_bytes` attestation we are withdrawing against
+/// advertised the holding claim we are withdrawing against
 /// (so the holder sees its own observability). Future federation
 /// collectors that aggregate withdrawals can subscribe via the
 /// `Delivery::Mandatory` retransmission path; v0.12.0 ships the

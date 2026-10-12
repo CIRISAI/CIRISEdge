@@ -1460,7 +1460,8 @@ async fn content_store_maybe_provisioned(
 
     let signer: std::sync::Arc<dyn ciris_keyring::HardwareSigner> = w.alice_node.classical.clone();
 
-    // The seal emits a `holds_bytes` attestation, whose FK is onto the key
+    // The seal emits a holding claim (`custody:ack:v1` `here`), whose FK is
+    // onto the key
     // persist DERIVES for this signer — `derive_key_id(alias, pubkey)` — not
     // onto the friendly name the world registers it under. In production
     // those are the same value because the derived id IS how a key id is

@@ -25,10 +25,11 @@
 //!
 //! The gap is narrow and specific, and both halves of it are discovery:
 //!
-//! - `holds_bytes:sha256:*` — auto-emitted by `put_blob` — is
-//!   `{"kind":"holds_bytes","evidence_refs":["<sha>"]}` with
-//!   `attesting_key_id == attested_key_id`. It says *"I hold these bytes"*.
-//!   Nothing about what they are.
+//! - The holding claim — filed by `put_blob` as it stores; since persist v55
+//!   a `custody:ack:v1` row with `custody_state: here` and the blob in
+//!   `evidence_refs` (before v55 the `holds_bytes:sha256:*` carrier, now
+//!   retired) — has `attesting_key_id == attested_key_id`. It says *"I hold
+//!   these bytes"*. Nothing about what they are.
 //! - `FountainHoldingClaim` is `{peer_id, content_id, symbol_ids, at}` —
 //!   `content_id` is documented as opaque. Also pure possession.
 //!
@@ -39,9 +40,10 @@
 //! **Edge now enforces the difference.**
 //! [`BlobMeaning::project`](ciris_edge::blob_swarm::BlobMeaning::project) is
 //! the only way to obtain the scope the store gate consumes, it takes a
-//! signed attestation that names the blob, and it refuses a `holds_bytes`
-//! row **by name** rather than letting its `federation` column classify
-//! every blob on the node as commons. The substrate still stores whatever it
+//! signed attestation that names the blob, and it refuses a holding claim
+//! **by name** (and a legacy `holds_bytes` row, whose `federation` column
+//! would classify every blob on the node as commons) rather than letting
+//! possession stand in for meaning. The substrate still stores whatever it
 //! is handed — that is the substrate's job — but nothing in edge will fetch
 //! or admit bytes on possession alone.
 //!
@@ -213,7 +215,7 @@ async fn build_node_with(
 
     // persist signs the holder attestation with the key it DERIVES from the
     // signer — `derive_key_id(alias, pubkey)` — not the friendly name. The
-    // FK on `holds_bytes` is onto that derived id, so it must be registered
+    // FK on the holding claim is onto that derived id, so it must be registered
     // or the write fails from deep inside the door.
     let ed_pub = signer.ed.public_key().await.expect("pubkey");
     let derived = ciris_verify_core::fedcode::derive_key_id(signer.ed.current_alias(), &ed_pub);
@@ -646,8 +648,8 @@ async fn a_commons_blob_opens_on_any_node_because_no_key_is_involved() {
 
 /// **States the gap this harness exists to close.**
 ///
-/// A blob written through `put_blob_scoped` gets a `holds_bytes`
-/// attestation — signed, replicated, and saying only *"I hold these
+/// A blob written through `put_blob_scoped` gets a holding claim
+/// (`custody:ack:v1` `here`, persist v55) — signed, replicated, and saying only *"I hold these
 /// bytes."* It carries no media type, no dimension, no author of the
 /// CONTENT, and no reference to any row.
 ///
@@ -2372,8 +2374,9 @@ async fn federation_content_row(
 /// **`FSD/CONTENT_TRANSFER.md` §5.3 R4 — a self row's pull asks the author's
 /// nodes, never `list_holders`** (CIRISEdge#646).
 ///
-/// A's node seals a file at `self` (invisible tier: no `holds_bytes` exists
-/// anywhere, by construction — CC 5.2 / persist I52). The row reaches B's
+/// A's node seals a file at `self` (invisible tier: its holding claim is at
+/// `self` scope and never reaches a discovery surface — CC 5.2 / persist
+/// I52). The row reaches B's
 /// node. Before this cut B's pull consulted the claim index and read
 /// `NoHolders` — the wrong rung, and a silent one. Now the puller resolves
 /// the row's author to the person and their nodes (CC 4.4.3.2.4.1(b)), asks
@@ -3024,7 +3027,7 @@ fn file_pointer(sha: &[u8; 32], size: u64, stream_id: Option<&str>) -> BlobPoint
     serde_json::from_value(v).expect("pointer")
 }
 
-/// CIRISEdge#717 — B admits A's `holds_bytes` rows, as anti-entropy would.
+/// CIRISEdge#717 — B admits A's holding claims, as anti-entropy would.
 async fn admit_holder_claims(from: &Node, to: &Node) {
     use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
     for bytes in holding_claims_of(from, None).await {
@@ -3058,7 +3061,7 @@ fn body_of(len: usize, seed: u32) -> Vec<u8> {
 /// by name; now the pull walks the DAG — manifest → verified → chunks →
 /// promoted — through persist's `put_blob_chunks_signing`, and B serves the
 /// 1,048,577-byte file byte-identical with `storage_kind = chunk_dag` and
-/// its own `holds_bytes` on the manifest.
+/// its own holding claim on the manifest.
 ///
 /// A writes it exactly as `files::publish` chunks a commons file: 256 KiB
 /// segments into a stream, sealed into a v1 manifest at the plaintext tier.
@@ -3134,7 +3137,7 @@ async fn a_plaintext_chunk_dag_pulls_through_the_real_doors_and_reads_back_whole
             .await
             .expect("list_holders")
             .contains(&t.node_b.me),
-        "B announced its own holds_bytes on the manifest (persist#947 ask 3): a pulled \
+        "B announced its own holding claim on the manifest (persist#947 ask 3): a pulled \
          commons DAG is not a silent holder"
     );
     assert!(
@@ -6492,7 +6495,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     assert_eq!(
         claims_b.len(),
         1,
-        "B's own holds_bytes names the DAG root exactly once: {claims_b:?}"
+        "B's own holding claim names the DAG root exactly once: {claims_b:?}"
     );
     assert_eq!(claims_b[0].attesting_key_id, node_b.me, "the claim names B");
     assert!(
@@ -6518,7 +6521,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     assert_eq!(
         holders_on(&node_c, sha).await,
         expect_holders_c,
-        "C discovers B (and A) through holds_bytes"
+        "C discovers B (and A) through their holding claims"
     );
 
     // ── 3. C pulls FROM B: a tampered chunk first, then the honest resume. ──

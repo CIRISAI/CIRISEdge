@@ -47,7 +47,7 @@ const ALIAS: &str = "e2e";
 
 /// A substrate with the signing key REGISTERED.
 ///
-/// The seal path emits a `holds_bytes` holder attestation, and that row has
+/// The seal path emits a holding claim (`custody:ack:v1` `here`), and that row has
 /// an FK onto `federation_keys` — so a signer whose key is not in the
 /// directory produces "FOREIGN KEY constraint failed" from deep inside
 /// `put_blob_scoped`. Registering it is not test scaffolding around the
@@ -132,8 +132,8 @@ async fn store() -> PersistGroupContentStore {
     // HYBRID, matching the hybrid record registered above.
     //
     // persist v44.4.0 §20.5 removed the classical claim path outright rather
-    // than deprecating it: `put_blob*` announces a federation-tier
-    // `holds_bytes` claim, the federation tier is PQC-mandatory (CC
+    // than deprecating it: `put_blob*` announces a federation-tier holding
+    // claim (`custody:ack:v1` `here` since v55), the federation tier is PQC-mandatory (CC
     // 5.3.2.4.3.1), and a classical-only claim is refused by every peer. So an
     // engine that cannot hybrid-sign now refuses BEFORE storing anything it
     // means to announce, rather than storing bytes whose announcement no one

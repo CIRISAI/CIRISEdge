@@ -161,11 +161,15 @@ Two traps live in that table:
    including unknown future scopes — falls through to plaintext. A `community`
    whose `cohort_subkind` is `infrastructure` is plaintext too, so even
    "community ⇒ encrypted" cannot be hardcoded.
-2. **Only `self` and `family` are structurally invisible.** The `holds_bytes`
-   row *is* the discovery surface, so declining to emit it is the privacy
-   primitive. Community content is deliberately NOT suppressed (CEG 0.8
-   §8.1.13.3): communities can be large and per-member byte-level invisibility
-   is infeasible. So a community gives **cohort-filtered visibility**. "Only
+2. **Only `self` and `family` are structurally invisible.** The holding claim
+   *is* the discovery surface. Since persist v55 it is a `custody:ack:v1`
+   `scores` row with `custody_state: here` (the `holds_bytes` carrier is
+   retired), placed at the content's own `cohort_scope`, so a self or family
+   claim replicates only inside that cohort and is never observable at
+   federation (CC 5.2) — that confinement is the privacy primitive. Community
+   content is deliberately NOT suppressed (CEG 0.8 §8.1.13.3): its claim is
+   visible to the community's members, because communities can be large and
+   per-member byte-level invisibility is infeasible. So a community gives **cohort-filtered visibility**. "Only
    members can read it" is true; "nobody can tell it exists" is true only of
    self and family.
 
@@ -175,10 +179,10 @@ Two traps live in that table:
 |---|---|
 | `local` × anything | stays on this node. Nothing crosses a wire. |
 | `federation` × `self` | **replicates to the owner's OWN device set.** A node has exactly one owner (CIRISConstitution#23), and recipient admission resolves through `owner_of`, so "self" spans your devices — not one machine. |
-| `federation` × `family` | replicates to the family cohort; emits no `holds_bytes`. |
+| `federation` × `family` | replicates to the family cohort; its holding claim stays at `family` scope and is never observable at federation. |
 | `federation` × `community` | replicates to the room; discoverable, encrypted under the room DEK. |
 | `federation` × `affiliations` | replicates to **one named affiliation's roster** (the institution the row is placed in), not to every organisation you belong to. Encrypted under that affiliation's DEK, the same tier and machinery as `community` (CC 4.4.3.2.1, 4.4.3.2.8). Public records are **promoted to a commons row**, not read from `affiliations`. ⚠ Not yet expressible: the audience carries no room, so edge withholds these rows from every peer until CIRISPersist#897 lands (`CONTENT_TRANSFER.md` §4.1). |
-| `federation` × `species` / `biosphere` | replicates to a narrower AUDIENCE than the whole federation — **but plaintext**, with a discoverable `holds_bytes`. Commons tier. |
+| `federation` × `species` / `biosphere` | replicates to a narrower AUDIENCE than the whole federation — **but plaintext**, with a holding claim (`custody:ack:v1` `here`) discoverable at `federation`. Commons tier. |
 | `federation` × `federation` | **published.** World-readable, plaintext. |
 
 **So promotion to federation tier is not a technical step — it is the act of
@@ -243,7 +247,7 @@ wrong, from the value rather than the function name:
 
 ```rust
 With::Community { .. }.is_encrypted_at_rest()      // true  (shared room DEK)
-With::Community { .. }.is_structurally_invisible() // FALSE (holds_bytes IS emitted)
+With::Community { .. }.is_structurally_invisible() // FALSE (its holding claim is visible to the room)
 With::MyFamily { .. }.is_structurally_invisible()  // true  — replicated to the family's nodes, never advertised
 With::Species.is_encrypted_at_rest()               // FALSE — narrower audience, plaintext bytes
 ```
@@ -516,7 +520,7 @@ that counted rows after a share now sees two.
      `federation/self` **replicates** — to the owner's own node set
      (`CohortScope::SelfOnly`, `src/edge.rs:2777`; the single-owner boundary),
      and `family` to the family's nodes, by consent fan-out over resolved
-     recipients rather than by `holds_bytes` discovery. CC 5.2 makes them
+     recipients rather than by holder discovery. CC 5.2 makes them
      *undiscoverable*, not un-replicated. Persist can state what the row **is**
      (`discoverable: bool`); only edge can state where it goes
      (`routes_to: OwnerNodes | Family | Community | Everyone`). Rename the
@@ -540,12 +544,12 @@ noted; where they diverge it is flagged rather than smoothed over.
 
 | claim in this FSD | constitution |
 |---|---|
-| promotion IS sharing | CC 5.3.2.4.2: "**promotion *is* the federation-emit moment**" — the tiered-scope promotion and `holds_bytes` emission fire at that instant, exactly as for any federation write |
+| promotion IS sharing | CC 5.3.2.4.2: "**promotion *is* the federation-emit moment**" — the tiered-scope promotion and the holding claim (`holds_bytes` emission until it was retired in v55; now a `custody:ack:v1` `here` row) fire at that instant, exactly as for any federation write |
 | `local` never crosses a wire — and is stricter than that | CC 5.3.2.4.3 tier table: `local` is readable by **only the producing occurrence**; "every other caller — even an authorized family/community peer — sees nothing". The read-gate is *orthogonal* to `cohort_scope` and composes with it (threat entries AV-59 / AV-60 / AV-61) |
 | `tier = federation ⟹ hybrid signature present`, both halves verified | CC 5.3.2.4.3 invariant + 5.3.2.4.3.1: immediate, no phased cutover, no `require_hybrid: false` posture. A key without a PQC half is confined to local tier until it has one |
 | `self` = the owner's own devices, not one machine | CC 1.13.3.4: "the `self` cohort is one owner's own devices, so its boundary is well-defined only because ownership is **single-valued**" (CC 3.2). For `self`, *outsider* means "any node not owner-bound to my owner" |
 | publishing is the opt-in, not the default | CC 1.13.3.4: "**federation (public-commons) scope is the opt-in**, not anonymity" — a deliberate correction of opt-in-anonymity designs, because opt-in fails the non-savvy vulnerable |
-| the encrypted / clear grouping | CC 4.4.3.2.1 table: self/family (per-write DEK, no discovery) · Community = `community` + `affiliations` (community DEK, **mandatory**, `holds_bytes` with cleartext provenance) · Commons = `species` + `biosphere` + `federation` (plaintext, anyone) |
+| the encrypted / clear grouping | CC 4.4.3.2.1 table: self/family (per-write DEK, no discovery) · Community = `community` + `affiliations` (community DEK, **mandatory**, a holding claim with cleartext provenance — `holds_bytes` when ruled, retired in v55; the holding claim is now `custody:ack:v1`) · Commons = `species` + `biosphere` + `federation` (plaintext, anyone) |
 | only self/family are structurally invisible; it is unconditional; at-rest crypto is defense-in-depth and may default off | CC 5.2, "Two layers, not one" |
 | group-scoped destinations do not announce | CC 5.3 (transport): a destination whose `cohort_scope` is below federation — `self`, `family`, `community`, `affiliations` — MUST NOT emit a Reticulum announce, directed or broadcast; only Commons scopes and the `infrastructure` opt-out may. Edge's `announce_suppression.rs` is that rule |
 | the lightnet / darknet split | CC 5.3 adopts the name from edge's `docs/LIGHTNET_DARKNET.md`: identity plane public (lightnet), group plane derived (darknet) |
@@ -602,7 +606,7 @@ flow — which is the strongest evidence that they are live.
 | `check_node_agency_admission` | an `agency:*` scope on a node-role key | CC 1.13.5 — "no agency for infra" is cryptographic, not policy |
 | the put door's `cohort_scope` check | a `community`-scoped row from **any** signer — only a promotion may place one, and it re-signs | why a message is authored `self` and promoted, never authored at the room |
 | `cohort_scope::crypto_tier` | nothing — it *classifies*, negative-default (#188): only self/family and community/affiliations encrypt; everything else, including unknown future scopes, is plaintext | this FSD's `EncryptedCohort` / `ClearCohort` are pinned to it by test, not restated |
-| `cohort_scope::suppresses_holds_bytes` | emitting the discovery row for `self` / `family` | CC 5.2 — the privacy primitive itself |
+| `cohort_scope::suppresses_holds_bytes` (retired with `holds_bytes` in v55; the holding claim is now `custody:ack:v1` `here`, placed at the content's own `cohort_scope`) | before v55, emitting the discovery row for `self` / `family`; since v55 a new `holds_bytes:*` row is refused `attestation_type_unregistered` at every door, and a self/family claim replicates only inside its cohort | CC 5.2 — the privacy primitive itself |
 | closed tier vocabulary | any `tier` other than `local` / `federation` | v38.2.0 (#761): an unknown tier was a **signature-exempt** tier, so the doors now refuse unknown tiers on every backend as a pure tier-1 check |
 
 Two things the table makes visible that a prose spec cannot: every gate is

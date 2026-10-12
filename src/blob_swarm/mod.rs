@@ -325,12 +325,12 @@ pub trait BlobChunkVerifier: Send + Sync {
     /// CIRISEdge#581 — `disposition` says WHICH of persist's two write doors
     /// this chunk may go through, and it is a parameter rather than an
     /// implementation choice because **storing is announcing**: `put_blob`
-    /// auto-emits `holds_bytes:sha256:*` and `list_holders` then names this
-    /// node, while `store_blob_local` publishes nothing.
+    /// files this node's holding claim (`custody:ack:v1` `here`, v55) and
+    /// `list_holders` then names this node, while `store_blob_local` publishes nothing.
     ///
     /// An implementation MUST honour it. Ignoring it and always announcing
-    /// defeats `self`/`family` invisibility — those scopes suppress
-    /// `holds_bytes` structurally — and overrides an operator who agreed to
+    /// defeats `self`/`family` invisibility — edge keeps those adopts local
+    /// and files their claim inside the cohort after the pull — and overrides an operator who agreed to
     /// hold a class but not to advertise holding it.
     fn verify_and_store(
         &self,

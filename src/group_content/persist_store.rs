@@ -905,7 +905,7 @@ impl PersistGroupContentStore {
     /// forever unless a door deletes them), so without this a 2 GiB upload
     /// refused at its last chunk would hold 2 GiB of chunks no manifest and
     /// no row will ever name. Each chunk goes through persist's ONE eviction
-    /// door, `Engine::evict_blob` (retract this node's `holds_bytes` for the
+    /// door, `Engine::evict_blob` (retract this node's holding claims for the
     /// sha — a chunk has none — then delete the row with its grants and
     /// epoch binding in one transaction).
     ///

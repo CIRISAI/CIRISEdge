@@ -226,8 +226,8 @@ pub struct BlobPointer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sealed_descriptor: Option<String>,
     /// CIRISEdge#698 / CC 5.3.2.5 — the plaintext size in bytes, in clear:
-    /// every holder checks it before hashing, and a self/family file emits
-    /// no `holds_bytes` row a reader could learn it from. `None` on a
+    /// every holder checks it before hashing, and a self/family file's
+    /// holding claim never reaches a reader outside the cohort. `None` on a
     /// pointer written before #698.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,

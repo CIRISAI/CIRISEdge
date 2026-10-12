@@ -7,8 +7,8 @@
 //! CEG-organic replication discipline: replication is
 //! `trust(source) ≥ threshold AND capacity_available` at every byte-
 //! attempt; **locality** (`cohort_scope`) is structurally enforced —
-//! self/family-scope content never emits `holds_bytes`, never crosses
-//! to inter-host paths. The producer-side refusal at
+//! self/family-scope content's holding claims stay inside the cohort, and
+//! the content never crosses to inter-host paths. The producer-side refusal at
 //! `Edge::send` / `send_durable` / `send_mandatory` / `send_federation`
 //! is the wire-format invariant the locality dividend depends on.
 //!
