@@ -73,18 +73,15 @@ fn facade_samples(snapshotter: &Snapshotter) -> HashMap<String, u64> {
     out
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sweep_resolve_and_serve_tier_histograms_reach_both_production_readers() {
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    recorder
-        .install()
-        .expect("the binary's one global recorder");
-    // Facade baseline: a snapshot drains histogram samples, so everything
-    // drained from here on was recorded after this point.
-    let _ = facade_samples(&snapshotter);
-
-    let tmp = tempfile::tempdir().expect("tempdir");
+/// A real `Edge` A over loopback Reticulum, with the directory and transport
+/// its replication runtime is started on.
+async fn build_edge_a(
+    tmp: &tempfile::TempDir,
+) -> (
+    Edge,
+    Arc<ciris_edge::transport::reticulum::ReticulumTransport>,
+    Arc<ciris_persist::store::sqlite::SqliteBackend>,
+) {
     let steward = TestFedKey::new("steward-hist-820", 0x01);
     let key_a = TestFedKey::new(KEY_A, 0x4a);
     let key_b = TestFedKey::new(KEY_B, 0x4b);
@@ -112,7 +109,7 @@ async fn sweep_resolve_and_serve_tier_histograms_reach_both_production_readers()
         }
     })
     .await;
-    let edge_a = Edge::builder()
+    let edge = Edge::builder()
         .directory(directory.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
         .queue(directory.clone())
         .signer(signer_for(&key_a, tmp.path()).await)
@@ -125,6 +122,22 @@ async fn sweep_resolve_and_serve_tier_histograms_reach_both_production_readers()
         })
         .build()
         .expect("build edge");
+    (edge, transport_a, directory)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sweep_resolve_and_serve_tier_histograms_reach_both_production_readers() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    recorder
+        .install()
+        .expect("the binary's one global recorder");
+    // Facade baseline: a snapshot drains histogram samples, so everything
+    // drained from here on was recorded after this point.
+    let _ = facade_samples(&snapshotter);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (edge_a, transport_a, directory) = build_edge_a(&tmp).await;
 
     // Bag baseline, before the runtime starts: every assertion is a delta.
     let baseline = Counts::of(&edge_a.metrics().snapshot());
