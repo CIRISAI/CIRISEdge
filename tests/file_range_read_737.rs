@@ -471,15 +471,139 @@ impl ciris_edge::blob_swarm::DagByteFetch for StoreFetch {
     }
 }
 
-async fn rows_of(node: &Node, type_prefix: &str) -> usize {
-    use ciris_persist::federation::FederationDirectory;
-    node.dir
-        .list_attestations_since(None, 5000)
+/// The attestation ids `writer`'s replication serve path hands `peer`: every
+/// Attestation-plane ref listed FOR that peer, fetched FOR that peer (the two
+/// halves of the per-peer gate, persist's `may_receive` behind both).
+async fn attestation_ids_served_to(writer: &Node, peer: &str) -> Vec<String> {
+    use ciris_edge::replication::{
+        BridgeConfig, EnvelopeKind, FederationDirectoryReplicationBridge, ReplicationDirectory as _,
+    };
+    let bridge = FederationDirectoryReplicationBridge::with_config(
+        Arc::clone(&writer.dir) as Arc<dyn ciris_persist::federation::FederationDirectory>,
+        Arc::new(Vec::new),
+        BridgeConfig::default(),
+    )
+    .with_local_key_id(Some(writer.me.clone()));
+    let mut ids = Vec::new();
+    for r in bridge
+        .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+        .await
+    {
+        if let Some(bytes) = bridge
+            .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &r.envelope_hash, Some(peer))
+            .await
+        {
+            if let Ok(a) = serde_json::from_slice::<ciris_persist::federation::Attestation>(&bytes)
+            {
+                ids.push(a.attestation_id);
+            }
+        }
+    }
+    ids
+}
+
+/// **CC 5.2 (part 5 §5.2), as persist v55.0.0 places it (#989, CC 3.1.3.3):**
+/// `writer`'s holding claim for cohort bytes `sha` is OBSERVABLE ONLY INSIDE
+/// THE COHORT. (neg) `outsider` is never served it and its holder reads for
+/// `sha` are empty; (pos) `member` is served it and, once admitted, its live
+/// holders name the writer. No retired `holds_bytes` row exists on the writer.
+async fn assert_holding_claim_confined(
+    writer: &Node,
+    sha: &[u8; 32],
+    member: &Node,
+    outsider: &Node,
+) {
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
+    let hex_sha = hex::encode(sha);
+    let rows: Vec<ciris_persist::federation::Attestation> = writer
+        .dir
+        .list_attestations_since(None, 100_000)
         .await
         .expect("list rows")
         .into_iter()
-        .filter(|a| a.attestation.attestation_type.starts_with(type_prefix))
-        .count()
+        .map(|a| a.attestation)
+        .collect();
+    assert!(
+        !rows.iter().any(|a| a.attestation_type.starts_with(
+            ciris_persist::federation::namespace::registry::RETIRED_HOLDING_CLAIM_STEM
+        )),
+        "no retired holds_bytes row on the writer"
+    );
+    let claims: Vec<ciris_persist::federation::Attestation> = rows
+        .into_iter()
+        .filter(|a| {
+            ciris_persist::federation::admission::envelope_dimension(&a.attestation_envelope)
+                == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+                && a.attesting_key_id == writer.me
+                && a.attestation_envelope["evidence_refs"]
+                    .as_array()
+                    .is_some_and(|refs| refs.iter().any(|r| r.as_str() == Some(&hex_sha)))
+        })
+        .collect();
+    assert!(
+        !claims.is_empty(),
+        "the writer claims its own cohort bytes inside the cohort (persist v55, CC 3.1.3.3)"
+    );
+
+    // (neg) never served outside the cohort, and nothing to discover there.
+    let to_outsider = attestation_ids_served_to(writer, &outsider.me).await;
+    for c in &claims {
+        assert!(
+            !to_outsider.contains(&c.attestation_id),
+            "CC 5.2: the holding claim {} (scope {}) is served OUTSIDE the cohort",
+            c.attestation_id,
+            c.cohort_scope
+        );
+    }
+    assert!(
+        outsider
+            .dir
+            .list_holders(sha)
+            .await
+            .expect("list_holders")
+            .is_empty(),
+        "CC 5.2: an outsider lists a holder of cohort bytes"
+    );
+    assert!(
+        ciris_persist::federation::holding_claim::live_holders(
+            &*outsider.dir,
+            sha,
+            chrono::Utc::now()
+        )
+        .await
+        .expect("live_holders")
+        .is_empty(),
+        "CC 5.2: an outsider's live holders name someone for cohort bytes"
+    );
+
+    // (pos) served to a co-member, who then knows the writer holds them.
+    let to_member = attestation_ids_served_to(writer, &member.me).await;
+    for c in &claims {
+        assert!(
+            to_member.contains(&c.attestation_id),
+            "the holding claim {} reaches a co-member (CC 3.1.3.3)",
+            c.attestation_id
+        );
+    }
+    for claim in claims {
+        member
+            .dir
+            .apply_replicated_attestation(SignedAttestation { attestation: claim })
+            .await
+            .expect("the co-member admits the writer's claim");
+    }
+    assert!(
+        ciris_persist::federation::holding_claim::live_holders(
+            &*member.dir,
+            sha,
+            chrono::Utc::now()
+        )
+        .await
+        .expect("live_holders")
+        .contains(&writer.me),
+        "the co-member's live holders name the writer"
+    );
 }
 
 fn init_tracing() {
@@ -512,9 +636,7 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
     use ciris_edge::files::Descriptor;
     use ciris_edge::group_content::store::CHUNK_BYTES;
     use ciris_persist::federation::blobs::{BlobStorage as _, DEFAULT_INLINE_BYTES_CAP};
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::types::cohort_scope::CryptoTier;
     use ciris_persist::federation::FederationDirectory;
     init_tracing();
@@ -616,21 +738,30 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
+        .collect();
+    // persist v55.0.0 (#989) — one stream-axis row per RECIPIENT, all for the
+    // file's ONE stream epoch: never one per chunk.
+    let stream_epochs: std::collections::BTreeSet<u64> = sets
+        .iter()
+        .filter_map(
+            |s| match ciris_persist::federation::key_grant::KeyGrantRow::from_attestation(
+                &s.attestation,
+            )
+            .ok()?
+            .axis
+            {
+                ciris_persist::federation::key_grant::KeyGrantAxis::Stream { epoch, .. } => {
+                    Some(epoch)
+                }
+                _ => None,
+            },
+        )
         .collect();
     assert_eq!(
-        sets.iter()
-            .filter(|s| {
-                s.attestation.attestation_type
-                    == ciris_persist::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
-            })
-            .count(),
+        stream_epochs.len(),
         1,
-        "one stream set for 400 chunks"
+        "one stream epoch's key for 400 chunks: {stream_epochs:?}"
     );
     assert!(
         sets.len() < chunk_count,
@@ -641,7 +772,7 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
         node_b
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: s.attestation.clone(),
             })
             .await
@@ -687,11 +818,13 @@ async fn a_100_mib_self_file_streams_on_the_owners_other_device_by_chunk_and_by_
         chunk_count + 1,
         "every chunk adopted at its position, the terminator too"
     );
-    assert_eq!(
-        rows_of(&node_b, "holds_bytes:").await,
-        0,
-        "CC 5.2: no holder claim for self bytes"
-    );
+    // CC 5.2, as persist v55.0.0 places it (#989, CC 3.1.3.3): A's claim for
+    // its self bytes is observable only inside alice's self-collective.
+    {
+        let mallory = Ident::new("mallory-fed", 0x66);
+        let node_x = node(&[&alice, &mallory], &mallory).await;
+        assert_holding_claim_confined(&node_a, &sha, &node_b, &node_x).await;
+    }
     drop(fetch);
 
     let file = FileRow::from_row(&row).expect("a file row");

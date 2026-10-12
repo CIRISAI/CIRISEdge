@@ -718,13 +718,23 @@ async fn holds_bytes_says_possession_and_never_meaning() {
     // byte length, bound into the signed bytes; this fixture is a hand-built
     // row for a meaning-projection assertion, never a door write, so the
     // length is the one true value for the bytes above.
-    let mut holder_row = ciris_persist::federation::blobs::holds_bytes_attestation_row(
+    // persist v55.0.0 (#989) — the claim is `custody:ack:v1`, the one row
+    // every door emits (`holding_claim::holding_claim_row`), a Commons claim
+    // at `federation` citing the full digest.
+    let mut holder_row = ciris_persist::federation::holding_claim::holding_claim_row(
         &sha,
         &alice.key_id,
-        "hb-1",
+        "hc-1",
         ts(),
         u64::try_from(b"\x00\x01\x02 unexplained bytes".len()).expect("len"),
-    );
+        &ciris_persist::federation::holding_claim::ClaimScope::of_content(
+            ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
+            ciris_persist::federation::types::cohort_scope::FEDERATION,
+            None,
+        )
+        .expect("the Commons claim scope"),
+    )
+    .expect("the holding claim row");
     assert_eq!(
         holder_row.cohort_scope,
         ciris_persist::federation::types::cohort_scope::FEDERATION,
@@ -1210,9 +1220,7 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
 #[allow(clippy::too_many_lines)] // three crossings and their preconditions, in one place on purpose
 async fn a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive() {
     use ciris_persist::federation::blobs::BlobBody;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::{AdoptDisposition, BlobProvenance, FederationDirectory as _};
 
     let alice = Ident::new("alice-fed", 0x11);
@@ -1302,11 +1310,7 @@ async fn a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive() {
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
         .collect();
     assert!(
         !sets.is_empty(),
@@ -1319,12 +1323,12 @@ async fn a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive() {
         let admission = node_b
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: row.attestation.clone(),
             })
             .await
             .expect("B admits A's key_grant set through the key-grant door");
-        wraps_written += admission.wraps_written;
+        wraps_written += usize::from(admission.projected);
     }
     assert!(
         wraps_written >= 1,
@@ -1504,9 +1508,7 @@ async fn cross_key_and_bytes(
     body: &[u8],
 ) -> [u8; 32] {
     use ciris_persist::federation::blobs::BlobBody;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::{AdoptDisposition, BlobProvenance};
 
     let sha: [u8; 32] = hex::decode(&sealed.pointer.content_sha256)
@@ -1519,16 +1521,12 @@ async fn cross_key_and_bytes(
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
     {
         node_b
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: row.attestation,
             })
             .await
@@ -2428,10 +2426,6 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         ciris_persist::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
         "precondition: a self write seals at the invisible tier"
     );
-    assert!(
-        rows_of(&node_a, "holds_bytes:").await.is_empty(),
-        "precondition (CC 5.2): a self write emits NO holder claim anywhere"
-    );
     let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
         .expect("hex")
         .try_into()
@@ -2626,6 +2620,11 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         !node_b.dir.has_blob(&sha).await.expect("has_blob"),
         "nothing was stored past the router's refusal"
     );
+    // CC 5.2, as persist v55.0.0 places it (#989, CC 3.1.3.3): A's claim for
+    // its self bytes is observable only inside alice's self-collective.
+    let mallory = Ident::new("mallory-fed", 0x66);
+    let node_x = node(&[&alice, &mallory], &mallory).await;
+    assert_holding_claim_confined(&node_a, &sha, &node_b, &node_x).await;
 }
 
 /// A federation-tier row that references `sha` by `evidence_refs` — the
@@ -2719,6 +2718,27 @@ async fn commons_row(
 
 /// A's rows of one attestation-type prefix, as B's bridge would receive
 /// them over the cursor: BARE `Attestation` JSON.
+/// persist v55.0.0 (#989, CC 3.1.3.3) — this node's holding claims, as wire
+/// bytes: `scores` rows on `custody:ack:v1` (the one holding claim at every
+/// tier; `holds_bytes` is retired). `None` = every scope; `Some(s)` = only the
+/// claims placed at cohort scope `s`.
+async fn holding_claims_of(node: &Node, scope: Option<&str>) -> Vec<Vec<u8>> {
+    use ciris_persist::federation::FederationDirectory;
+    node.dir
+        .list_attestations_since(None, 200)
+        .await
+        .expect("list rows")
+        .into_iter()
+        .filter(|a| {
+            ciris_persist::federation::admission::envelope_dimension(
+                &a.attestation.attestation_envelope,
+            ) == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+        })
+        .filter(|a| scope.is_none_or(|s| a.attestation.cohort_scope == s))
+        .map(|a| serde_json::to_vec(&a.attestation).expect("wire"))
+        .collect()
+}
+
 async fn rows_of(node: &Node, type_prefix: &str) -> Vec<Vec<u8>> {
     use ciris_persist::federation::FederationDirectory;
     node.dir
@@ -2858,7 +2878,7 @@ async fn a_far_node_holds_what_the_pull_brought_home() {
 
     // ── The HOLDER plane crosses after it, so the retry completes the pull. ──
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let holders = rows_of(&node_a, "holds_bytes:").await;
+    let holders = holding_claims_of(&node_a, None).await;
     assert!(
         !holders.is_empty(),
         "precondition: put_blob announced a holder claim"
@@ -2970,7 +2990,7 @@ impl CommonsPull {
             )
             .await
             .expect("A stores and announces");
-        for bytes in rows_of(&self.node_a, "holds_bytes:").await {
+        for bytes in holding_claims_of(&self.node_a, None).await {
             let h: ciris_persist::federation::Attestation =
                 serde_json::from_slice(&bytes).expect("row");
             // Idempotent on a re-admit of an earlier claim.
@@ -3007,7 +3027,7 @@ fn file_pointer(sha: &[u8; 32], size: u64, stream_id: Option<&str>) -> BlobPoint
 /// CIRISEdge#717 — B admits A's `holds_bytes` rows, as anti-entropy would.
 async fn admit_holder_claims(from: &Node, to: &Node) {
     use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
-    for bytes in rows_of(from, "holds_bytes:").await {
+    for bytes in holding_claims_of(from, None).await {
         let h: ciris_persist::federation::Attestation =
             serde_json::from_slice(&bytes).expect("row");
         // Idempotent on a re-admit of an earlier claim.
@@ -3308,9 +3328,7 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
     use ciris_edge::blob_swarm::{BlobPuller, DagPullRefusal, PullConfig, PullOutcome};
     use ciris_edge::files::FileRow;
     use ciris_persist::federation::blobs::BlobStorage as _;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::types::cohort_scope::CryptoTier;
     use ciris_persist::federation::FederationDirectory;
     init_tracing();
@@ -3469,35 +3487,45 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
         .collect();
-    let stream_sets = sets
+    // persist v55.0.0 (#989) — one stream-axis row per RECIPIENT, all for the
+    // file's one stream epoch: never one per chunk.
+    let stream_epochs: std::collections::BTreeSet<u64> = sets
         .iter()
-        .filter(|s| {
-            s.attestation.attestation_type
-                == ciris_persist::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
-        })
-        .count();
+        .filter_map(
+            |s| match ciris_persist::federation::key_grant::KeyGrantRow::from_attestation(
+                &s.attestation,
+            )
+            .ok()?
+            .axis
+            {
+                ciris_persist::federation::key_grant::KeyGrantAxis::Stream { epoch, .. } => {
+                    Some(epoch)
+                }
+                _ => None,
+            },
+        )
+        .collect();
     assert_eq!(
-        stream_sets, 1,
-        "one stream set for the file's one epoch, never one per chunk"
+        stream_epochs.len(),
+        1,
+        "one stream epoch's key for the file, never one per chunk: {stream_epochs:?}"
     );
     assert!(sets.len() >= 2, "and the manifest's: {}", sets.len());
     let mut wraps = 0;
     for s in &sets {
-        wraps += node_b
-            .store
-            .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
-                attestation: s.attestation.clone(),
-            })
-            .await
-            .expect("B applies A's set")
-            .wraps_written;
+        wraps += usize::from(
+            node_b
+                .store
+                .engine()
+                .apply_replicated_key_grant(SignedKeyGrantRow {
+                    attestation: s.attestation.clone(),
+                })
+                .await
+                .expect("B applies A's set")
+                .projected,
+        );
     }
     // Projected now: the wraps for the bytes B already HOLDS (the manifest —
     // the seal's set and the descriptor's), and the stream epoch's.
@@ -3562,10 +3590,6 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
         file_len as u64,
         "the view's total is the plaintext size; the row's size_bytes stays the envelope's"
     );
-    assert!(
-        rows_of(&node_b, "holds_bytes:").await.is_empty(),
-        "CC 5.2: no holder claim for self bytes, before or after the pull"
-    );
 
     // 5. Held is held: the production path offers nothing past the head.
     assert_eq!(
@@ -3576,6 +3600,11 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
         puller.pull_dag_with(&row, sha, &fetch(None)).await,
         PullOutcome::AlreadyHeld
     );
+    // CC 5.2, as persist v55.0.0 places it (#989, CC 3.1.3.3): A's claim for
+    // its self bytes is observable only inside alice's self-collective.
+    let mallory = Ident::new("mallory-fed", 0x66);
+    let node_x = node(&[&alice, &mallory], &mallory).await;
+    assert_holding_claim_confined(&node_a, &sha, &node_b, &node_x).await;
 }
 
 /// **CIRISEdge#717 / #638 item 2 — a whole blob whose length is not its
@@ -3666,9 +3695,7 @@ async fn a_community_pull_stops_at_the_scope_router_on_a_legacy_node() {
     use ciris_edge::blob_swarm::{BlobPuller, PullConfig, PullOutcome};
     use ciris_edge::chat::{Body, ChatMessage, UnopenedReason};
     use ciris_persist::federation::blobs::BlobStorage as _;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::{FederationDirectory, SignedAttestation};
     init_tracing();
 
@@ -3729,22 +3756,18 @@ async fn a_community_pull_stops_at_the_scope_router_on_a_legacy_node() {
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
     {
         node_b
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: set.attestation.clone(),
             })
             .await
             .expect("B admits A's key_grant set");
     }
-    for bytes in rows_of(&node_a, "holds_bytes:").await {
+    for bytes in holding_claims_of(&node_a, None).await {
         let h: ciris_persist::federation::Attestation =
             serde_json::from_slice(&bytes).expect("row");
         node_b
@@ -3932,9 +3955,7 @@ async fn a_community_pull_resolves_through_the_rooms_group_and_stops_at_the_scop
     use ciris_edge::scope_lifecycle::ScopeLifecycle;
     use ciris_persist::encrypted_kv::XChaChaKvStore;
     use ciris_persist::federation::blobs::BlobStorage as _;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::{FederationDirectory, SignedAttestation};
     init_tracing();
     let alice = Ident::new("alice-fed", 0x11);
@@ -4087,22 +4108,18 @@ async fn a_community_pull_resolves_through_the_rooms_group_and_stops_at_the_scop
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
     {
         node_b
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: set.attestation.clone(),
             })
             .await
             .expect("B admits A's key_grant set");
     }
-    for bytes in rows_of(&node_a, "holds_bytes:").await {
+    for bytes in holding_claims_of(&node_a, None).await {
         let h: ciris_persist::federation::Attestation =
             serde_json::from_slice(&bytes).expect("row");
         node_b
@@ -4288,10 +4305,6 @@ async fn a_file_over_the_inline_bound_is_chunked_and_still_opens() {
         "a self file is sealed whatever its shape"
     );
     assert!(published.crossed, "and it crosses like any other row");
-    assert!(
-        rows_of(&node_a, "holds_bytes:").await.is_empty(),
-        "CC 5.2 does not care how many chunks it took: still no holder claim"
-    );
 
     // It is a FILE to the drive, not a special case.
     let drive = ciris_edge::files::in_room(node_a.store.engine(), &room, &node_a.me, 10, None)
@@ -4321,6 +4334,21 @@ async fn a_file_over_the_inline_bound_is_chunked_and_still_opens() {
         .expect("the author opens what it sealed");
     assert_eq!(opened.len(), big.len(), "every chunk came back");
     assert_eq!(opened, big, "and in order, with the tail chunk intact");
+
+    // CC 5.2, as persist v55.0.0 places it (#989, CC 3.1.3.3): however many
+    // chunks it took, A's claim for its self bytes is observable only inside
+    // alice's self-collective — her other device sees it, a stranger never.
+    let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let alice_phone = Ident::new("alice-phone", 0x33);
+    let node_b = device_of(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+    let mallory = Ident::new("mallory-fed", 0x66);
+    let node_x = node(&[&alice, &mallory], &mallory).await;
+    assert_holding_claim_confined(&node_a, &sha, &node_b, &node_x).await;
 }
 
 /// **CIRISEdge#687 — every file size around the inline bound publishes and
@@ -6018,13 +6046,137 @@ impl ciris_edge::blob_swarm::DagByteFetch for MeshFetch {
     }
 }
 
-/// A node's own `holds_bytes` rows naming `sha`.
+/// The attestation ids `writer`'s replication serve path hands `peer`: every
+/// Attestation-plane ref listed FOR that peer, fetched FOR that peer (the two
+/// halves of the per-peer gate, persist's `may_receive` behind both).
+async fn attestation_ids_served_to(writer: &Node, peer: &str) -> Vec<String> {
+    use ciris_edge::replication::{
+        BridgeConfig, EnvelopeKind, FederationDirectoryReplicationBridge, ReplicationDirectory as _,
+    };
+    let bridge = FederationDirectoryReplicationBridge::with_config(
+        Arc::clone(&writer.dir) as Arc<dyn ciris_persist::federation::FederationDirectory>,
+        Arc::new(Vec::new),
+        BridgeConfig::default(),
+    )
+    .with_local_key_id(Some(writer.me.clone()));
+    let mut ids = Vec::new();
+    for r in bridge
+        .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+        .await
+    {
+        if let Some(bytes) = bridge
+            .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &r.envelope_hash, Some(peer))
+            .await
+        {
+            if let Ok(a) = serde_json::from_slice::<ciris_persist::federation::Attestation>(&bytes)
+            {
+                ids.push(a.attestation_id);
+            }
+        }
+    }
+    ids
+}
+
+/// **CC 5.2 (part 5 §5.2), as persist v55.0.0 (#989, CC 3.1.3.3) places it:**
+/// the writer's holding claim for self/family bytes `sha` is OBSERVABLE ONLY
+/// INSIDE THE COHORT.
+///
+/// - (neg) `outsider`, a node outside the cohort, is never served the claim
+///   row, and its holder reads (`list_holders`, `live_holders`) for `sha` are
+///   empty.
+/// - (pos) `member`, a co-member (the owner's own device for `self`, a roster
+///   member for `family`), is served the claim, and once it admits it, its
+///   `live_holders` names the writer.
+/// - No retired `holds_bytes` row exists on the writer.
+async fn assert_holding_claim_confined(
+    writer: &Node,
+    sha: &[u8; 32],
+    member: &Node,
+    outsider: &Node,
+) {
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
+    assert!(
+        rows_of(
+            writer,
+            ciris_persist::federation::namespace::registry::RETIRED_HOLDING_CLAIM_STEM
+        )
+        .await
+        .is_empty(),
+        "no retired holds_bytes row on the writer"
+    );
+    let claims = own_holder_claims(writer, sha).await;
+    assert!(
+        !claims.is_empty(),
+        "the writer claims its own self/family bytes inside the cohort (persist v55, \
+         CC 3.1.3.3)"
+    );
+    let claim_ids: Vec<&str> = claims.iter().map(|c| c.attestation_id.as_str()).collect();
+
+    // (neg) never served outside the cohort, and nothing to discover there.
+    let to_outsider = attestation_ids_served_to(writer, &outsider.me).await;
+    for id in &claim_ids {
+        assert!(
+            !to_outsider.iter().any(|s| s == id),
+            "CC 5.2: the holding claim {id} is served to a node OUTSIDE the cohort"
+        );
+    }
+    assert!(
+        outsider
+            .dir
+            .list_holders(sha)
+            .await
+            .expect("list_holders")
+            .is_empty(),
+        "CC 5.2: an outsider lists a holder of cohort bytes"
+    );
+    assert!(
+        ciris_persist::federation::holding_claim::live_holders(
+            &*outsider.dir,
+            sha,
+            chrono::Utc::now()
+        )
+        .await
+        .expect("live_holders")
+        .is_empty(),
+        "CC 5.2: an outsider's live holders name someone for cohort bytes"
+    );
+
+    // (pos) served to a co-member, who then knows the writer holds them.
+    let to_member = attestation_ids_served_to(writer, &member.me).await;
+    for id in &claim_ids {
+        assert!(
+            to_member.iter().any(|s| s == id),
+            "the holding claim {id} reaches a co-member (CC 3.1.3.3)"
+        );
+    }
+    for claim in claims {
+        member
+            .dir
+            .apply_replicated_attestation(SignedAttestation { attestation: claim })
+            .await
+            .expect("the co-member admits the writer's claim");
+    }
+    assert!(
+        ciris_persist::federation::holding_claim::live_holders(
+            &*member.dir,
+            sha,
+            chrono::Utc::now()
+        )
+        .await
+        .expect("live_holders")
+        .contains(&writer.me),
+        "the co-member's live holders name the writer"
+    );
+}
+
+/// A node's own holding claims (`custody:ack:v1`) naming `sha`.
 async fn own_holder_claims(
     node: &Node,
     sha: &[u8; 32],
 ) -> Vec<ciris_persist::federation::Attestation> {
     let hex_sha = hex::encode(sha);
-    rows_of(node, "holds_bytes:")
+    holding_claims_of(node, None)
         .await
         .into_iter()
         .map(|b| serde_json::from_slice::<ciris_persist::federation::Attestation>(&b).expect("row"))
@@ -6078,9 +6230,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     use ciris_edge::chat::UnopenedReason;
     use ciris_edge::files::FileRow;
     use ciris_persist::federation::blobs::BlobStorage as _;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::types::cohort_scope::CryptoTier;
     use ciris_persist::federation::{FederationDirectory, SignedAttestation};
     const ROOM: &str = "room-735";
@@ -6250,11 +6400,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
                 .await
                 .expect("list rows")
                 .into_iter()
-                .filter(|a| {
-                    a.attestation
-                        .attestation_type
-                        .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-                })
+                .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
                 .map(|a| a.attestation)
                 .collect::<Vec<_>>()
         }
@@ -6271,15 +6417,16 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     for n in [&node_b, &node_c] {
         let mut wraps = 0;
         for s in &sets_a {
-            wraps += n
-                .store
-                .engine()
-                .apply_replicated_key_grant(SignedKeyGrantSet {
-                    attestation: s.clone(),
-                })
-                .await
-                .expect("a member applies A's set")
-                .wraps_written;
+            wraps += usize::from(
+                n.store
+                    .engine()
+                    .apply_replicated_key_grant(SignedKeyGrantRow {
+                        attestation: s.clone(),
+                    })
+                    .await
+                    .expect("a member applies A's set")
+                    .projected,
+            );
         }
         assert!(
             wraps >= 1,
@@ -6490,32 +6637,33 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
         own_holder_claims(&node_d, &sha).await.is_empty(),
         "D claims nothing"
     );
-    // A's e0 set names no occurrence of D: the cascade enumerated the
-    // room's members. (D still admits and stores the carrier — a wrap is
-    // ciphertext addressed to someone else, and `wraps_written` counts rows
-    // inserted, not rows this node can unwrap.)
-    let recipients_of = |set: &ciris_persist::federation::Attestation| {
-        ciris_persist::federation::key_grant::KeyGrantSet::from_attestation(set)
-            .expect("persist reads its own set back")
-            .wraps
-            .into_iter()
-            .map(|w| w.recipient_key_id)
-            .collect::<Vec<_>>()
+    // A's e0 rows name no occurrence of D: the cascade enumerated the
+    // room's members. persist v55.0.0 (#989) — one key-grant row per
+    // recipient, its recipient the row's `attested_key_id`. (D still admits a
+    // row addressed to a member — a wrap is ciphertext addressed to someone
+    // else — and projects nothing from it.)
+    let recipients_of = |row: &ciris_persist::federation::Attestation| {
+        vec![
+            ciris_persist::federation::key_grant::KeyGrantRow::from_attestation(row)
+                .expect("persist reads its own row back")
+                .wrap
+                .recipient_key_id,
+        ]
     };
+    let e0_recipients: Vec<String> = sets_a.iter().flat_map(|s| recipients_of(s)).collect();
+    assert!(
+        e0_recipients.contains(&node_b.me) && e0_recipients.contains(&node_c.me),
+        "the e0 rows wrap to the members' nodes: {e0_recipients:?}"
+    );
+    assert!(
+        !e0_recipients.contains(&node_d.me),
+        "A's cascade wrapped nothing to a non-member's occurrence: {e0_recipients:?}"
+    );
     for s in &sets_a {
-        let recipients = recipients_of(s);
-        assert!(
-            recipients.contains(&node_b.me) && recipients.contains(&node_c.me),
-            "the e0 set wraps to the members' nodes: {recipients:?}"
-        );
-        assert!(
-            !recipients.contains(&node_d.me),
-            "A's cascade wrapped nothing to a non-member's occurrence: {recipients:?}"
-        );
         node_d
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: s.clone(),
             })
             .await
@@ -6617,19 +6765,22 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     let mut wrapped_to_d = Vec::new();
     for s in sets_of(&node_a).await {
         if recipients_of(&s).contains(&node_d.me) {
-            wrapped_to_d.push(s.attestation_type.clone());
+            wrapped_to_d.push(
+                ciris_persist::federation::key_grant::key_grant_dimension_of(&s)
+                    .unwrap_or("not a key-grant row"),
+            );
         }
         node_d
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet { attestation: s })
+            .apply_replicated_key_grant(SignedKeyGrantRow { attestation: s })
             .await
             .expect("D applies A's sets");
     }
     assert_eq!(
         wrapped_to_d.len(),
         1,
-        "exactly one set wraps to D — the e1 set, minted after it joined: {wrapped_to_d:?}"
+        "exactly one row wraps to D — the e1 row, minted after it joined: {wrapped_to_d:?}"
     );
     // Positive control: D reads what was sealed after it joined. The bytes
     // cross as the whole-blob path carries them.
