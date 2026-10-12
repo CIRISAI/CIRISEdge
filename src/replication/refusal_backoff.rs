@@ -779,6 +779,45 @@ mod tests_679 {
         x
     }
 
+    /// CIRISEdge#858 fix 6 (FSD §2 S1 → S2) — a TRANSIENT refusal of a row
+    /// that names no dependency (not parked, not indexed) spends three windows
+    /// at `TRANSIENT_CAP` and then moves to the terminal schedule: refusals
+    /// 1–7 book transient windows (20, 40, 80, 160, then 300 s three times),
+    /// the 8th books `TERMINAL_BASE`. A parked row is exempt.
+    ///
+    /// A unit witness since the persist v55.0.0 adopt: the production row
+    /// `park_fresh_858`'s O5 used to drive this (a row naming no signer, an
+    /// untyped `InvalidArgument`) is now persist's TERMINAL `MalformedRow`
+    /// (#1055), and no other production row is still an untyped,
+    /// dependency-less transient.
+    #[test]
+    fn a_dependency_less_transient_moves_to_the_terminal_schedule_at_refusal_8() {
+        let b = RefusalBackoff::new();
+        let k = EnvelopeKind::Attestation;
+        let now = Instant::now();
+        for refusal in 1..=8u32 {
+            let window = b.record_at(k, h(5), RetryDisposition::Transient, now);
+            if refusal < 8 {
+                assert!(
+                    window <= TRANSIENT_CAP,
+                    "refusal {refusal}: still on the transient ladder ({window:?})"
+                );
+            } else {
+                assert_eq!(
+                    window, TERMINAL_BASE,
+                    "refusal 8, after three windows at the cap: the terminal schedule"
+                );
+            }
+        }
+        // A parked row never escalates on the transient counter.
+        b.record_at(k, h(6), RetryDisposition::Transient, now);
+        b.park_booked_at(k, h(6), "absent-key", None, now);
+        for _ in 0..12 {
+            b.record_at(k, h(6), RetryDisposition::Transient, now);
+        }
+        assert_eq!(b.parked_on("absent-key"), 1, "a parked row stays indexed");
+    }
+
     /// CIRISEdge#679 — a parked row is quiet on the TERMINAL schedule (every
     /// transient window would have elapsed long before) and is released the
     /// instant its signer's key lands; a row parked on another signer is

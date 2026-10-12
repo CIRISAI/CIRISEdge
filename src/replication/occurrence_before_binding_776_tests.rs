@@ -477,13 +477,14 @@ async fn the_release_kicks_a_re_ask_of_the_peer_that_offered_the_row_776() {
 }
 
 /// No kick loop, and no WARN per round (CIRISEdge#858 fix 4): a refusal whose
-/// signer IS held and bound was about something else. Since #858 it is indexed
-/// on its signer in every case (before, only an UNBOUND signer was, and a bound
-/// one rode the transient ladder — ~12 asks and 12 WARNs an hour, forever):
-/// its first refusal keeps the transient window, its second earns the terminal
-/// schedule. It is released only by an ADMITTED binding or occurrence of that
-/// signer — never by a duplicate re-delivery of the binding it already has, so
-/// a peer re-pushing the binding cannot turn the index into a kick loop.
+/// signer IS held and bound was about something else. A typed field diverging
+/// from the signed envelope is, since persist v55.0.0 (#1055), a TERMINAL
+/// `MalformedRow { reason: typed_diverges_from_envelope }`: it is quiet on
+/// the terminal schedule from its FIRST refusal and is NOT indexed on its
+/// signer (no binding or occurrence could ever admit those bytes). Before v55
+/// it was an untyped `InvalidArgument`, indexed on the held signer by the
+/// #858 fallback, transient once and terminal from the second refusal. A
+/// duplicate re-delivery of the binding still releases nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refusal_whose_signer_is_bound_parks_terminally_and_no_duplicate_releases_it_776() {
     let owner = Ident::new("person-o-776n", 0x91);
@@ -520,37 +521,32 @@ async fn a_refusal_whose_signer_is_bound_parks_terminally_and_no_duplicate_relea
     let refused = bridge
         .apply_envelope_bytes(EnvelopeKind::IdentityOccurrence, &tampered, Some(&d.me))
         .await;
+    let crate::replication::summary::ApplyOutcome::Refused { reason, .. } = &refused else {
+        panic!("the tampered occurrence is refused, got {refused:?}");
+    };
+    assert!(
+        reason.contains("federation_malformed_row"),
+        "precondition: persist v55 types the divergence as MalformedRow: {reason}"
+    );
     assert!(
         matches!(
             refused.retry_disposition(),
-            Some(crate::replication::RetryDisposition::Transient)
+            Some(crate::replication::RetryDisposition::Terminal)
         ),
-        "the tampered occurrence is refused, transient: {refused:?}"
+        "a malformed row is terminal at its first refusal: {refused:?}"
     );
     assert_eq!(
         bridge.parked_on_signer_len(),
-        1,
-        "a held signer's occurrence refusal is indexed on the signer (CIRISEdge#858)"
+        0,
+        "a terminal malformed row is not indexed on its signer"
     );
     let backoff = bridge.refusal_backoff_for_test();
-    let past_transient = Instant::now()
-        + crate::replication::refusal_backoff::TRANSIENT_BASE
-        + Duration::from_secs(1);
-    assert!(
-        !backoff.suppressed_at(EnvelopeKind::IdentityOccurrence, &hash, past_transient),
-        "the first refusal keeps its transient window (the #776 standup race)"
-    );
-    // The second refusal earns the terminal schedule.
-    let again = bridge
-        .apply_envelope_bytes(EnvelopeKind::IdentityOccurrence, &tampered, Some(&d.me))
-        .await;
-    assert!(!again.is_admitted());
     let past_transient_cap = Instant::now()
         + crate::replication::refusal_backoff::TRANSIENT_CAP
         + Duration::from_secs(60);
     assert!(
         backoff.suppressed_at(EnvelopeKind::IdentityOccurrence, &hash, past_transient_cap),
-        "from the second refusal the row is quiet on the TERMINAL schedule"
+        "quiet on the TERMINAL schedule from the first refusal"
     );
     // A duplicate re-delivery of the binding releases nothing.
     let dup = bridge
