@@ -96,10 +96,8 @@ pub const DIRECT_LEG_NO_PROGRESS: Duration = Duration::from_secs(2);
 pub enum DirectAccept {
     /// Accept only from a peer that shares a room with this node
     /// ([`crate::transport::reticulum::ReticulumTransport::should_accept_direct`]).
-    ///
-    /// TODO(leviculum#82): leviculum's policy is node-wide and cannot ask edge
-    /// per request, so until the host-decided accept lands this maps to
-    /// REJECT: production never accepts with node-wide exposure.
+    /// leviculum asks edge per request (`AskHost`, leviculum#82): it holds
+    /// the request, probes nothing and reveals nothing until edge answers.
     #[default]
     RoomPeers,
     /// The operator override: refuse every peer's upgrade request
@@ -143,9 +141,9 @@ impl DirectLinksConfig {
     pub fn leviculum_settings(&self) -> leviculum_std::direct_link::DirectLinkSettings {
         leviculum_std::direct_link::DirectLinkSettings {
             policy: match self.accept {
-                // TODO(leviculum#82): RoomPeers -> AskHost, answered by
-                // `should_accept_direct`.
-                DirectAccept::RoomPeers | DirectAccept::Off => DirectLinkPolicy::Reject,
+                // Asked per request, answered by `should_accept_direct`.
+                DirectAccept::RoomPeers => DirectLinkPolicy::AskHost,
+                DirectAccept::Off => DirectLinkPolicy::Reject,
                 DirectAccept::IdentifiedOnly => DirectLinkPolicy::IdentifiedOnly,
             },
             facilitator: self.facilitator.clone(),
@@ -181,6 +179,18 @@ pub fn retry_after(failure: Failure, attempts: u32) -> DirectRetry {
                     .min(DIRECT_RETRY_CAP),
             )
         }
+    }
+}
+
+/// THE accept rule for a peer's direct-link request, given whether the peer
+/// shares a room with this node. One function, so the transport's
+/// `should_accept_direct` and the event loop's answer cannot drift.
+#[must_use]
+pub const fn accepts_direct(accept: DirectAccept, shares_room: bool) -> bool {
+    match accept {
+        DirectAccept::RoomPeers => shares_room,
+        DirectAccept::Off => false,
+        DirectAccept::IdentifiedOnly => true,
     }
 }
 
@@ -466,6 +476,14 @@ pub enum DirectPathEvent {
         reason: &'static str,
         proposed: bool,
     },
+    /// A peer asked this node to take a link direct, and this node answered.
+    /// `peer` is `None` when the link is not attributed to a known peer
+    /// (always refused).
+    Requested {
+        peer: Option<String>,
+        link_id: [u8; 16],
+        accepted: bool,
+    },
     /// A punched interface went down; the link is back on its relayed path.
     Lost {
         peer: Option<String>,
@@ -649,8 +667,8 @@ mod tests {
         let s = c.leviculum_settings();
         assert_eq!(
             s.policy,
-            DirectLinkPolicy::Reject,
-            "no node-wide accept until the host-decided one (leviculum#82)"
+            DirectLinkPolicy::AskHost,
+            "asked per request, never node-wide"
         );
         assert!(s.facilitator.is_none());
         assert!(s.facilitator_port.is_none());
@@ -663,7 +681,7 @@ mod tests {
             ..DirectLinksConfig::default()
         };
         assert!(c.proposes());
-        assert_eq!(c.leviculum_settings().policy, DirectLinkPolicy::Reject);
+        assert_eq!(c.leviculum_settings().policy, DirectLinkPolicy::AskHost);
         let off = DirectLinksConfig {
             accept: DirectAccept::Off,
             ..c.clone()
@@ -677,6 +695,14 @@ mod tests {
             c.leviculum_settings().policy,
             DirectLinkPolicy::IdentifiedOnly
         );
+    }
+
+    #[test]
+    fn room_peers_accepts_only_a_room_peer() {
+        assert!(accepts_direct(DirectAccept::RoomPeers, true));
+        assert!(!accepts_direct(DirectAccept::RoomPeers, false));
+        assert!(!accepts_direct(DirectAccept::Off, true));
+        assert!(accepts_direct(DirectAccept::IdentifiedOnly, false));
     }
 
     #[test]
