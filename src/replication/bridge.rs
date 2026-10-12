@@ -532,13 +532,13 @@ pub(crate) fn typed_terminal_verdict(
             Some(ciris_persist::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED)
         }
         E::PurgeRefused { token, body } => purge_refusal_terminal(token, body),
-        E::TraceDimensionInvalid { .. } => Some(err.kind()),
-        // persist v55.0.0 (#1055) — a signed row whose own bytes cannot be
-        // read as the claim they carry (an empty signer, a missing or ill-typed
-        // envelope member, a typed column diverging from its envelope, a
-        // non-canonical envelope, a malformed custody report). Terminal at the
-        // first refusal by persist's own reading.
-        E::MalformedRow { .. } => Some(err.kind()),
+        // A trace dimension persist cannot read; and persist v55.0.0 (#1055) —
+        // a signed row whose own bytes cannot be read as the claim they carry
+        // (an empty signer, a missing or ill-typed envelope member, a typed
+        // column diverging from its envelope, a non-canonical envelope, a
+        // malformed custody report). Both terminal at the first refusal by
+        // persist's own reading.
+        E::TraceDimensionInvalid { .. } | E::MalformedRow { .. } => Some(err.kind()),
         // persist v55.0.0 (#753) — the two DimensionRejected reasons that are
         // functions of the row: a family held shut until its door
         // (`registered_family_held_shut`; a later persist may open it, and the
@@ -11983,41 +11983,35 @@ pub(crate) mod tests {
         }
     }
 
-    /// persist v55.0.0 — the typed verdicts this adopt classifies, through the
-    /// apply-door choke (`refuse`). Terminal: `MalformedRow`,
-    /// `AttestationTypeUnregistered`, `PaymentProcessorIdentifier`, the two
-    /// named `DimensionRejected` reasons, a terminal `purge_unauthorised`
-    /// reason, the takedown tokens but `takedown_content_unbound`, and the
-    /// `KeyGrantRefused` reasons that are the row's own. Transient: every
-    /// other `DimensionRejected`, a retryable `purge_unauthorised` reason,
-    /// `takedown_content_unbound`, and the `KeyGrantRefused` reasons that wait
-    /// on state that can land. Every `KeyGrantRefusalReason` is walked, so a
-    /// new one cannot slip in unclassified.
+    /// persist v55.0.0 — each typed verdict through the apply-door choke
+    /// (`refuse`) earns `want`.
+    fn assert_v55_dispositions(rows: Vec<(ciris_persist::federation::Error, RetryDisposition)>) {
+        let (_backend, bridge) = make_bridge(&[]);
+        for (err, want) in rows {
+            let outcome = bridge.refuse("Attestation", "h", &err);
+            assert_eq!(
+                outcome.retry_disposition(),
+                Some(want),
+                "{} ({err}): must be {}",
+                err.kind(),
+                want.as_str()
+            );
+        }
+    }
+
+    /// persist v55.0.0 — the row-shape verdicts. Terminal: `MalformedRow`,
+    /// `AttestationTypeUnregistered`, `PaymentProcessorIdentifier`, and the two
+    /// named `DimensionRejected` reasons. Every other `DimensionRejected` keeps
+    /// the unclassified transient rule.
     #[test]
-    fn v55_typed_refusals_follow_persists_dispositions() {
+    fn v55_row_shape_refusals_follow_persists_dispositions() {
         use ciris_persist::federation::admission;
-        use ciris_persist::federation::key_grant::KeyGrantRefusalReason as K;
-        use ciris_persist::federation::steward_purge::{token as purge, unauthorised_reason as UR};
-        use ciris_persist::federation::takedown_tombstone::token as takedown;
         use ciris_persist::federation::Error as E;
-        let unauthorised = |reason: &'static str| E::PurgeRefused {
-            token: purge::UNAUTHORISED,
-            body: serde_json::json!({
-                "notice_id": "n-1",
-                "reason": reason,
-                "retryable": UR::is_retryable(reason),
-                "detail": "…",
-            }),
-        };
-        let takedown = |token: &'static str| E::PurgeRefused {
-            token,
-            body: serde_json::json!({"notice_id": "t-1"}),
-        };
         let dim = |reason: &'static str| E::DimensionRejected {
             dimension: "key_grant:content:v1".to_owned(),
             reason,
         };
-        let mut rows: Vec<(E, RetryDisposition)> = vec![
+        assert_v55_dispositions(vec![
             (
                 E::MalformedRow {
                     plane: "identity_occurrence",
@@ -12047,8 +12041,34 @@ pub(crate) mod tests {
                 dim(admission::LEDGER_BINDING_REASON),
                 RetryDisposition::Terminal,
             ),
-            // Any other DimensionRejected keeps the unclassified rule.
             (dim("missing_version_segment"), RetryDisposition::Transient),
+        ]);
+    }
+
+    /// persist v55.0.0 (#1055, #1007) — the purge and takedown verdicts.
+    /// Terminal: a terminal `purge_unauthorised` reason and the takedown tokens
+    /// but `takedown_content_unbound`. Transient: a retryable
+    /// `purge_unauthorised` reason (`unauthorised_reason::is_retryable`) and
+    /// `takedown_content_unbound`.
+    #[test]
+    fn v55_purge_refusals_follow_persists_dispositions() {
+        use ciris_persist::federation::steward_purge::{token as purge, unauthorised_reason as UR};
+        use ciris_persist::federation::takedown_tombstone::token as takedown;
+        use ciris_persist::federation::Error as E;
+        let unauthorised = |reason: &'static str| E::PurgeRefused {
+            token: purge::UNAUTHORISED,
+            body: serde_json::json!({
+                "notice_id": "n-1",
+                "reason": reason,
+                "retryable": UR::is_retryable(reason),
+                "detail": "…",
+            }),
+        };
+        let takedown = |token: &'static str| E::PurgeRefused {
+            token,
+            body: serde_json::json!({"notice_id": "t-1"}),
+        };
+        assert_v55_dispositions(vec![
             (unauthorised(UR::ROOT_NOT_HELD), RetryDisposition::Transient),
             (unauthorised(UR::NOT_YET_VALID), RetryDisposition::Transient),
             (
@@ -12065,39 +12085,42 @@ pub(crate) mod tests {
                 takedown(takedown::NOT_BYTES_PLANE),
                 RetryDisposition::Terminal,
             ),
-        ];
-        for reason in K::ALL {
-            let want = match reason {
-                K::Malformed
-                | K::SetRetired
-                | K::WrapAlgorithmNotV2
-                | K::SignerNotSelf
-                | K::SignerNotMinter
-                | K::SignerNotAuthor
-                | K::SignerNotStreamOwner => RetryDisposition::Terminal,
-                K::SignerNotActiveMember | K::AttestationRefused | K::RecipientNotInAudience => {
-                    RetryDisposition::Transient
-                }
-            };
-            rows.push((
-                E::KeyGrantRefused {
-                    reason: reason.as_str(),
-                    detail: "…".to_owned(),
-                },
-                want,
-            ));
-        }
-        let (_backend, bridge) = make_bridge(&[]);
-        for (err, want) in rows {
-            let outcome = bridge.refuse("Attestation", "h", &err);
-            assert_eq!(
-                outcome.retry_disposition(),
-                Some(want),
-                "{} ({err}): must be {}",
-                err.kind(),
-                want.as_str()
-            );
-        }
+        ]);
+    }
+
+    /// persist v55.0.0 (#989) — every `KeyGrantRefusalReason`, walked with an
+    /// exhaustive match so a new one cannot slip in unclassified. Terminal: the
+    /// reasons that are the row's own; transient: the ones that wait on state
+    /// that can land (CIRISPersist#1064 will export the predicate).
+    #[test]
+    fn v55_key_grant_refusals_follow_persists_dispositions() {
+        use ciris_persist::federation::key_grant::KeyGrantRefusalReason as K;
+        use ciris_persist::federation::Error as E;
+        let rows = K::ALL
+            .iter()
+            .map(|reason| {
+                let want = match reason {
+                    K::Malformed
+                    | K::SetRetired
+                    | K::WrapAlgorithmNotV2
+                    | K::SignerNotSelf
+                    | K::SignerNotMinter
+                    | K::SignerNotAuthor
+                    | K::SignerNotStreamOwner => RetryDisposition::Terminal,
+                    K::SignerNotActiveMember
+                    | K::AttestationRefused
+                    | K::RecipientNotInAudience => RetryDisposition::Transient,
+                };
+                (
+                    E::KeyGrantRefused {
+                        reason: reason.as_str(),
+                        detail: "…".to_owned(),
+                    },
+                    want,
+                )
+            })
+            .collect();
+        assert_v55_dispositions(rows);
     }
 
     /// CIRISEdge#544 — the whole loop, end to end, on the real apply choke: a

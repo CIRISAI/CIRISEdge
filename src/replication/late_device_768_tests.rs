@@ -379,7 +379,7 @@ async fn carry_key_grants(from: &Node, to: &ReplicationRuntime) {
         .expect("list the minter's rows")
         .into_iter()
         .map(|r| r.attestation)
-        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a))
+        .filter(ciris_persist::federation::key_grant::is_key_grant_row)
     {
         let bytes = serde_json::to_vec(&row).expect("encode set");
         let _ = to

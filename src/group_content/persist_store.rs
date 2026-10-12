@@ -1275,12 +1275,12 @@ mod tests {
             backend.clone() as Arc<dyn ciris_persist::federation::FederationDirectory>,
             node.classical.clone(),
         );
-        let none = plain.spawn_holding_claim_reack();
+        let unsigned = plain.spawn_holding_claim_reack();
         assert!(
-            !none.is_running(),
+            !unsigned.is_running(),
             "no local signer: no sweeper, nothing to sign with"
         );
-        assert!(!none.stop().await);
+        assert!(!unsigned.stop().await);
     }
 
     /// CIRISEdge#768 — the hybrid sealing constructor tells the SHARED backend
