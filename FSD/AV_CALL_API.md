@@ -183,6 +183,17 @@ publisher's direct links, `LegOutcome` per leg); `frames` reads the A/V sink's a
 `AvSubscriber` / `open_av_chunk`; `set_layer_policy` is `AvSpine::subscribe` with the policy. The
 spine's `seal_deadline()` is the one timer an idle call's host loop waits on (unchanged).
 
+**`frames()` needs a reorder window** (item 8, cut 2). A subscriber can hear a stream on two legs,
+the publisher's direct link and a relay member, and `AvSubscriber::subscribe_legs` dedupes them
+above the per-leg opens (`av_leg_choice`, the ALM `DedupRing` on `(epoch, chunk_seq)`). That
+guarantees each chunk is delivered ONCE, not in order. During a make-before-break overlap, or after
+a fallback to the relay, a relay copy can lag a direct one, so chunks can surface out of
+`chunk_seq` order. The Call's frame stream holds a per-stream reorder window keyed on
+`(epoch, chunk_seq)` and releases in order. It is sized against the relay-versus-direct latency
+gap (the extra relay hop's RTT plus its queueing), not against loss, which the window does not
+wait out: a chunk missing past the window's deadline is skipped and counted. The witness is a
+two-leg subscriber whose relay leg is delayed: `frames()` yields strictly increasing `chunk_seq`.
+
 **PyO3 twin** (`ciris_edge.PyEdge`): `join_call(room, keep="unkept", relay=False)`,
 `ring(invitees, valid_until, ...)` → `PyCall` with `id()`, `epoch()`, `chunk_plaintext_budget()`,
 `publish(bytes, codec_id=CODEC_OPAQUE, layer=(0,0,0))`, `frames()` (an async iterator on the
@@ -321,7 +332,7 @@ Inbound failures are NOT call errors: a chunk that does not open (`RealtimeAvErr
 | A5 | Kept: each epoch registered before its first chunk; a member NOT in the live call opens the call through the key-grant plane | item 2's witness, over the room |
 | A6 | `StreamEpochRotationRequired` (both reasons) rolls and resends with no chunk lost | a forced `Removal` and a forced `Cap` |
 | A7 | `publish` cuts to the budget: at budget delivered, one over `FrameTooLarge` with no nonce consumed | #720's exact-budget test, through `Call` |
-| A8 | `frames()` yields every other publisher's frames byte-identical, in chunk order per stream; per-subscriber layer policy drops above-policy layers at the relay | a 3-member loopback call with an SVC stream |
+| A8 | `frames()` yields every other publisher's frames byte-identical, in chunk order per stream (the reorder window over the two-leg dedupe, §4); per-subscriber layer policy drops above-policy layers at the relay | a 3-member loopback call with an SVC stream; a two-leg subscriber with a delayed relay leg |
 | A9 | In-band STH every 64 chunks or 2 s and on leave; a kept stream's manifest carries its roots in `evidence_refs`; no STH row is written | a 200-chunk call: STHs at 64, 128, 192 and the leave; a `stream_sth` row count of 0 |
 | A10 | Signalling adds no wire: ring / accept / decline / hang-up are the existing membership rows, and no row anywhere carries reachability | an ad-hoc call's rows are all `membership:*:v1`; an outsider receives none of them |
 | A11 | PyO3 parity: every `Call` verb has its Python twin | the parity test walks the verb list |
@@ -417,3 +428,5 @@ refused frame).
   refuses a bare 64-hex stream id (reserved for an inline blob's one-leaf log, #953). One spelling
   (`realtime_av::stream_label`) feeds the persist stream id, the STREAM nonce (#846) and the
   per-stream DEK's info.
+- 2026-10-12 — item 8 cut 2: a two-leg subscriber is deduped exactly-once, not ordered; the Call's
+  `frames()` holds a reorder window sized against the relay-versus-direct latency gap (§4, A8).
