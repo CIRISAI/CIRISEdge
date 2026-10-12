@@ -4,8 +4,9 @@
 before them (#846 one seal, CIRISPersist#981 one DEK, #805 item 3 live-into-the-DAG). Every type
 named below exists on `local/805-1-one-seal` unless it is marked **new**. Open questions for
 persist, verify and the CC are in §10; nothing there is guessed in the body. The CC answered
-C1–C5 and V1 on 2026-10-12; the one proposed deviation still open (a DEK per stream rather than
-per epoch) is CIRISConstitution#169.
+C1–C5 and V1 on 2026-10-12, and ruled CIRISConstitution#169 (CC rc8, a93974e): one DEK per
+stream per epoch, and keep changed mid-stream. Edge vendors CC rc7 today; rc8 is vendored when
+persist vendors it.
 
 **Inputs:** `CIRISEdge#805` (items 5–6), `docs/AV_ALM_DESIGN.md`, `FSD/CONTENT_TRANSFER.md`,
 the spine (`src/transport/av_spine.rs`, #813), the room (`src/chat.rs`, `src/mls/cohort_group.rs`),
@@ -91,13 +92,12 @@ over `CohortGroup::record_secret`, but with a bench-only HKDF label; §10 V1.)
   exporter context stays EMPTY, as verify requires; the stream is bound by the KDF step after it.
   `CallId` is not an input. A DEK is derived only at the room group's CURRENT epoch
   (`StreamKeyError::EpochNotCurrent` otherwise).
-- **This is a PROPOSED deviation, awaiting CIRISConstitution#169.** The CC pins no A/V label and,
-  by design, shares ONE DEK per epoch across the call. Because keep is per STREAM (C1), one DEK
-  per epoch would let a `key_grant` for a kept publisher's stream open an unkept publisher's stream
-  in the same epoch. That is #169's first item, and the per-stream binding above is its candidate.
-  `L` is the PLACEHOLDER `STREAM_DEK_LABEL_PENDING` (`"ciris-stream-dek/pending-v1"`). It is not a
-  final label; verify's replaces it when #169 is ruled (KATs on CIRISVerify#308). If #169 keeps one
-  DEK per epoch, `stream_epoch_dek` becomes a plain exporter call; it is the one place that changes.
+- **Normative: CC 5.1 (rc8, CIRISConstitution#169).** `L` = `STREAM_DEK_LABEL` =
+  `"ciris-stream-dek/v1"`; ONE label serves both the exporter call and the info tag. A
+  `key_grant:stream:v1` wraps this per-stream DEK and opens exactly one stream; the exporter secret
+  is never wrapped, so one participant's kept stream never opens another's unkept stream in the
+  same epoch. Conformance is CIRISVerify#308's KAT set: when verify lands its `stream_dek` fn and
+  vectors, `stream_epoch_dek` calls it and runs them (a TODO in the code); that graduates the claim.
 - **The call's epoch is the room's MLS epoch** (`CohortGroup::epoch`, C2), with no call sub-epoch.
   A call never commits on its own: an epoch moves only on a room commit. **Every Add and every
   Remove rotates** (`CohortGroup::add_member*` / `remove_member*`): an Add rotates the DEK too, and
@@ -191,9 +191,12 @@ walks the list.
 ## 5. Keys — unkept vs kept, per STREAM (CC 5.1, ruled 2026-10-12; C1)
 
 Keep is a property of a STREAM, set by its producer, not of the call: one participant's stream can
-be kept while another's in the same call is not.
+be kept while another's in the same call is not. **"Recorded" is not a field** (CC 5.1, rc8): a
+stream is kept when its genesis carries `history_on_join: full` or when `key_grant:stream:v1` wraps
+exist for it, and the recording is the after-the-fact CC 3.3.13 blob. No row or option names
+"recorded".
 
-| | Unkept stream (default) | Kept stream (`Recorded` / `HistoryOnJoinFull`) |
+| | Unkept stream (default) | Kept stream (genesis `history_on_join: full`, or existing `key_grant:stream:v1` wraps) |
 |---|---|---|
 | DEK | `stream_epoch_dek` (§3.2), in memory, zeroized at the roll | the same DEK |
 | persist DEK door | **never touched** | `register_stream_epoch_dek(cohort_scope, room, stream_label, epoch, &dek, …, None)` once per epoch, BEFORE that epoch's first chunk |
@@ -231,8 +234,13 @@ be kept while another's in the same call is not.
 - **Where the keep decision comes from (C1):** the PRODUCER of each stream, through its own
   `history_on_join` on the stream's genesis. Until CIRISPersist#1068 ships that row (v55.1 or v56),
   the producer's caller supplies it (`CallOptions::keep`). No other participant sets it, and there
-  is no call-wide keep. A mid-call change of keep is not specified; it is filed on
-  CIRISConstitution#169.
+  is no call-wide keep.
+- **Keep changed mid-stream (normative, CC 5.1 rc8):** turning keep ON wraps the CURRENT and later
+  epochs only. Earlier epochs' DEKs were never wrapped and are gone, so the keep layer registers
+  the current epoch at once and every epoch after. Turning it OFF is forward-only: the keep layer
+  stops registering from the next epoch, and wraps already issued are not unmade (a `withdraws` on
+  a `key_grant` is refused). A refused keep (`CallEvent::KeepRefused`, below) has the same shape as
+  OFF.
 - **The room-group binding (§3.2) sits UNDER the keep layer.** `KeptAvPublisher` registers whatever
   DEK its `AvPublisher`'s session yields; moving that session from a per-stream `AvSession` group
   to `stream_epoch_dek` over the room's `CohortGroup` changes the DEK's source, not the keep
@@ -327,12 +335,11 @@ refused frame).
 ## 10. Open questions — for persist, verify and the CC (not guessed here)
 
 **Verify**
-- **V1 (answered by the CC, 2026-10-12).** The CC pins no A/V label and shares ONE DEK per epoch
-  by design. Edge keeps the per-stream binding (§3.2) under a PENDING label, as a proposed
-  deviation; it is the first item on CIRISConstitution#169 (KATs on CIRISVerify#308).
+- **V1 (RULED, CC 5.1 rc8, CIRISConstitution#169).** One DEK per `(stream_id, epoch)` under the
+  room group's exporter, label `"ciris-stream-dek/v1"` (§3.2). KATs come from CIRISVerify#308.
 - **V2.** A/V link addressing for a room call: the room's derived addresses, or an A/V-labelled
   derivation of the room's destination secret (so call links and room replication links are
-  distinguishable)? Waits on V1 / #169.
+  distinguishable)? V1 is ruled, so this is open for verify.
 
 **Persist**
 - **P1 (answered, BELIEVED).** An unkept call's author stores its ciphertext with
@@ -351,7 +358,8 @@ refused frame).
 
 **The CC (answered 2026-10-12)**
 - **C1.** Keep is per STREAM, set by its producer's own `history_on_join` on the stream's genesis
-  (§5). A mid-call change is filed on CIRISConstitution#169.
+  (§5). Mid-stream (#169, rc8): ON wraps the current and later epochs; OFF is forward-only.
+  "Recorded" is not a field.
 - **C2.** The call epoch is the room's MLS epoch. Any member may commit an Update at the cap, and
   there is no sub-epoch. Every Add and every Remove rotates (the CC table that exempts Add is an
   erratum) (§3.2).
@@ -361,8 +369,7 @@ refused frame).
 - **C4.** No presence row (confirmed).
 - **C5.** Best-effort in-band live STHs are conformant. A kept stream's roots ride the manifest and
   recording blob (CC 3.3.13 `evidence_refs`), with no STH row (§6).
-- **Open, on CIRISConstitution#169:** one DEK per stream vs per epoch (V1), and a mid-call keep
-  change (C1).
+- **#169 (ruled, rc8):** one DEK per stream per epoch (V1), and keep changed mid-stream (C1).
 
 ## 11. Sequencing
 
@@ -372,7 +379,8 @@ refused frame).
    epoch when kept, under `for_stream_keyed_chunk` with no DEK row when unkept; live STHs from
    in-memory leaves, `put_stream_sth` over adopted chunks. Waits on #1067's counter bookkeeping
    (the leaf order is settled).
-4. CIRISConstitution#169 (the per-stream DEK and its label, then V2). C1–C5 are answered.
+4. CIRISVerify#308's `stream_dek` fn and KATs (#169 is ruled), and V2 from verify. C1–C5 are
+   answered.
 5. This API (item 5) and the signalling rows (item 6), behind those.
 
 ## 12. Changelog
@@ -397,3 +405,9 @@ refused frame).
   with no STH row (`SthRefused` → `RecordingRootMismatch`). The DEK is `stream_epoch_dek` (code on
   `local/805-5-call-key`): a per-stream binding under a PENDING label, a proposed deviation awaiting
   CIRISConstitution#169. `CallId` is an API handle only, never key input.
+- 2026-10-12 — CIRISConstitution#169 RULED (CC rc8, a93974e): the per-stream DEK is normative,
+  `L` = `"ciris-stream-dek/v1"` for both the exporter and the info tag (`STREAM_DEK_LABEL`),
+  and a `key_grant:stream:v1` opens one stream. Keep changed mid-stream: ON wraps the current and
+  later epochs, OFF is forward-only. "Recorded" is not a field (`history_on_join: full` or existing
+  wraps; the recording is the CC 3.3.13 blob). verify#308's `stream_dek` and KATs replace edge's
+  derivation when they land.

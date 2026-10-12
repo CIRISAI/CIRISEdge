@@ -10,19 +10,18 @@
 //! dek  = HKDF-SHA256(ikm = seed, salt = ∅, info = L ‖ stream_id_utf8 ‖ u64_be(epoch))
 //! ```
 //!
-//! `L` is [`STREAM_DEK_LABEL_PENDING`]; `stream_id_utf8` is the stream label
+//! `L` is [`STREAM_DEK_LABEL`]; `stream_id_utf8` is the stream label
 //! (`realtime_av::stream_label`, the lowercase hex of the 32-byte id). No
 //! length prefixes: the fixed label, the fixed 64-char stream label and the
 //! fixed 8-byte epoch parse unambiguously.
 //!
-//! **STATUS: a proposed reading, not yet ruled.** CC 5.1 says "one DEK per
-//! (stream_id, epoch)"; an epoch-wide DEK shared by every stream in a call would
-//! let a `key_grant` for a KEPT publisher's stream open an UNKEPT publisher's
-//! stream in the same epoch. The per-stream derivation above is the candidate
-//! staged for ruling on CIRISConstitution#169 (KATs on CIRISVerify#308), and
-//! `L` stays a PLACEHOLDER until then. If #169 instead keeps keeping
-//! all-or-nothing per call, this becomes a plain exporter call; this module is
-//! the one place that changes.
+//! **Normative: CC 5.1 (rc8, CIRISConstitution#169).** One DEK per
+//! `(stream_id, epoch)`: a `key_grant:stream:v1` wraps this per-stream DEK and
+//! opens that one stream only; the exporter secret is never wrapped. KATs come
+//! from CIRISVerify#308.
+//!
+//! TODO(CIRISVerify#308): when verify lands its `stream_dek` fn and vectors,
+//! call it here instead of this derivation and run its KATs.
 //!
 //! **Why the bind is a KDF step, not the exporter context:** the room group
 //! exports with an EMPTY context, deliberately and per verify (a context edge
@@ -37,7 +36,7 @@
 //! epoch. A DEK for any other epoch is refused ([`StreamKeyError::EpochNotCurrent`]),
 //! never derived from the wrong secret.
 
-pub use crate::mls::cohort_group::STREAM_DEK_LABEL_PENDING;
+pub use crate::mls::cohort_group::STREAM_DEK_LABEL;
 use crate::mls::{CohortGroup, CohortGroupError};
 use crate::transport::realtime_av::{stream_label, Epoch, EpochDek, StreamId};
 
@@ -67,8 +66,8 @@ pub enum StreamKeyError {
 #[must_use]
 pub fn stream_dek_info(stream_id: StreamId, epoch: Epoch) -> Vec<u8> {
     let label = stream_label(stream_id);
-    let mut info = Vec::with_capacity(STREAM_DEK_LABEL_PENDING.len() + label.len() + 8);
-    info.extend_from_slice(STREAM_DEK_LABEL_PENDING.as_bytes());
+    let mut info = Vec::with_capacity(STREAM_DEK_LABEL.len() + label.len() + 8);
+    info.extend_from_slice(STREAM_DEK_LABEL.as_bytes());
     info.extend_from_slice(label.as_bytes());
     info.extend_from_slice(&epoch.0.to_be_bytes());
     info
@@ -154,11 +153,13 @@ mod tests {
     }
 
     /// The info layout is `L ‖ stream_id_utf8 ‖ u64_be(epoch)`, no length
-    /// prefixes; the stream part is the 64-char lowercase hex label.
+    /// prefixes, with `L` the ruled `"ciris-stream-dek/v1"`; the stream part is
+    /// the 64-char lowercase hex label.
     #[test]
     fn the_info_layout_is_pinned() {
         let info = stream_dek_info(STREAM_A, Epoch(0x0102_0304_0506_0708));
-        let l = STREAM_DEK_LABEL_PENDING.as_bytes();
+        let l = STREAM_DEK_LABEL.as_bytes();
+        assert_eq!(l, b"ciris-stream-dek/v1", "the label CC 5.1 (rc8) rules");
         assert_eq!(info.len(), l.len() + 64 + 8);
         assert_eq!(&info[..l.len()], l);
         assert_eq!(&info[l.len()..l.len() + 64], "a1".repeat(32).as_bytes());
@@ -176,7 +177,7 @@ mod tests {
     }
 
     /// One DEK per stream: a key grant for one publisher's stream opens no
-    /// other stream (CIRISConstitution#169).
+    /// other stream (CC 5.1, rc8, CIRISConstitution#169).
     #[tokio::test]
     async fn the_dek_is_per_stream() {
         let (a, _) = room("room-call-3").await;
@@ -207,21 +208,14 @@ mod tests {
     #[tokio::test]
     async fn the_stream_key_is_separated_from_the_rooms_other_secrets() {
         assert_ne!(
-            STREAM_DEK_LABEL_PENDING,
+            STREAM_DEK_LABEL,
             crate::scope_privacy::RECORD_EXPORTER_LABEL
         );
         assert_ne!(
-            STREAM_DEK_LABEL_PENDING,
+            STREAM_DEK_LABEL,
             crate::scope_privacy::DESTINATION_EXPORTER_LABEL
         );
-        assert_ne!(
-            STREAM_DEK_LABEL_PENDING,
-            "ciris-realtime-av-epoch-dek-seed-v1"
-        );
-        assert_ne!(
-            STREAM_DEK_LABEL_PENDING, "ciris-stream-dek/v1",
-            "the candidate is not shipped as final"
-        );
+        assert_ne!(STREAM_DEK_LABEL, "ciris-realtime-av-epoch-dek-seed-v1");
         let (a, _) = room("room-call-5").await;
         let (_, seed) = a.stream_key_seed().await.unwrap();
         assert_ne!(seed.as_bytes(), a.record_secret().await.unwrap().as_bytes());
