@@ -49,10 +49,16 @@ use leviculum_core::direct_link::{Failure, ProbeProtocol};
 use leviculum_core::node::DirectLinkPolicy;
 use leviculum_core::LinkId;
 
-/// How long [`crate::transport::reticulum::ReticulumTransport::open_av_link`]
-/// waits for a proposal's outcome before dialling the leg the way it would
-/// without one. Covers a facilitator probe plus leviculum's punch window.
+/// The most [`crate::transport::reticulum::ReticulumTransport::open_av_link`]
+/// spends on a direct path before dialling the leg the way it would without
+/// one: getting the identity link, the proposal, and its outcome, together.
+/// Covers a facilitator probe plus leviculum's punch window.
 pub const DIRECT_PATH_BUDGET: Duration = Duration::from_secs(20);
+
+/// A proposal with no outcome after this long is treated as gone (its dial
+/// was cancelled before the proposal was dispatched, or its event was lost),
+/// so a peer can never be wedged `InFlight`.
+pub const DIRECT_PROPOSING_STALE: Duration = Duration::from_secs(40);
 
 /// The first retry after a proposal that timed out, failed its probe, or lost
 /// its direct path: leviculum's own per-link proposal cooldown
@@ -231,6 +237,7 @@ enum Entry {
     Proposing {
         link: LinkId,
         channel_limit_before: Option<usize>,
+        since: Instant,
     },
     Direct {
         link: LinkId,
@@ -269,7 +276,11 @@ impl DirectPathTracker {
             return Ok(());
         };
         match p.entry {
-            Entry::Proposing { .. } => Err(ProposeSkip::InFlight),
+            Entry::Proposing { since, .. }
+                if now.saturating_duration_since(since) < DIRECT_PROPOSING_STALE =>
+            {
+                Err(ProposeSkip::InFlight)
+            }
             Entry::Direct { .. } => Err(ProposeSkip::AlreadyDirect),
             Entry::BackingOff {
                 rejected_link: Some(rejected),
@@ -278,13 +289,20 @@ impl DirectPathTracker {
             Entry::BackingOff {
                 until: Some(until), ..
             } if until > now => Err(ProposeSkip::BackingOff),
-            Entry::BackingOff { .. } => Ok(()),
+            // A proposal gone stale, or a backoff that ran out.
+            Entry::Proposing { .. } | Entry::BackingOff { .. } => Ok(()),
         }
     }
 
-    /// A proposal to `peer` started on `link`, whose Channel carried
+    /// A proposal to `peer` started on `link` at `now`, whose Channel carried
     /// `channel_limit_before` bytes per message.
-    pub fn proposed(&mut self, peer: &str, link: LinkId, channel_limit_before: Option<usize>) {
+    pub fn proposed(
+        &mut self,
+        peer: &str,
+        link: LinkId,
+        channel_limit_before: Option<usize>,
+        now: Instant,
+    ) {
         let attempts = self.peers.get(peer).map_or(0, |p| p.attempts);
         self.link_peer.insert(link, peer.to_owned());
         self.peers.insert(
@@ -293,6 +311,7 @@ impl DirectPathTracker {
                 entry: Entry::Proposing {
                     link,
                     channel_limit_before,
+                    since: now,
                 },
                 attempts,
             },
@@ -334,6 +353,7 @@ impl DirectPathTracker {
             Some(Entry::Proposing {
                 link: l,
                 channel_limit_before,
+                ..
             }) if l == link => channel_limit_before,
             _ => None,
         };
@@ -666,7 +686,7 @@ mod tests {
         let now = Instant::now();
         let mut t = DirectPathTracker::default();
         assert_eq!(t.admit("b", link(1), now), Ok(()));
-        t.proposed("b", link(1), Some(16_000));
+        t.proposed("b", link(1), Some(16_000), now);
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::InFlight));
         assert_eq!(
             t.failed(link(1), Failure::Timeout, now).as_deref(),
@@ -675,7 +695,7 @@ mod tests {
         assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::BackingOff));
         assert_eq!(t.admit("b", link(1), now + DIRECT_RETRY_BASE), Ok(()));
         // A second timeout doubles the wait.
-        t.proposed("b", link(1), None);
+        t.proposed("b", link(1), None, now);
         t.failed(link(1), Failure::Timeout, now);
         assert_eq!(
             t.admit("b", link(1), now + DIRECT_RETRY_BASE),
@@ -685,10 +705,23 @@ mod tests {
     }
 
     #[test]
+    fn a_proposal_with_no_outcome_goes_stale() {
+        let now = Instant::now();
+        let mut t = DirectPathTracker::default();
+        t.proposed("b", link(1), None, now);
+        assert_eq!(t.admit("b", link(1), now), Err(ProposeSkip::InFlight));
+        assert_eq!(
+            t.admit("b", link(1), now + DIRECT_PROPOSING_STALE),
+            Ok(()),
+            "a cancelled or unanswered proposal cannot wedge the peer"
+        );
+    }
+
+    #[test]
     fn a_rejection_blocks_that_link_only() {
         let now = Instant::now();
         let mut t = DirectPathTracker::default();
-        t.proposed("b", link(1), None);
+        t.proposed("b", link(1), None, now);
         t.failed(link(1), Failure::Rejected(1), now);
         let much_later = now + Duration::from_secs(24 * 3600);
         assert_eq!(
@@ -702,7 +735,7 @@ mod tests {
     fn established_records_the_limit_before_and_lost_backs_off_once() {
         let now = Instant::now();
         let mut t = DirectPathTracker::default();
-        t.proposed("b", link(1), Some(16_000));
+        t.proposed("b", link(1), Some(16_000), now);
         assert_eq!(
             t.established(link(1), 7, None),
             Some(("b".to_owned(), Some(16_000)))
