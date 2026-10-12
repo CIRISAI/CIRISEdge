@@ -21,9 +21,10 @@
 //!   the event carries both limits, which item 5's `BudgetChanged` reads. The
 //!   A/V leg itself is born on the punched interface at the base MTU 500
 //!   (Channel 425).
-//! - **W3** (`a_refused_upgrade_leaves_the_dial_as_it_was`): B at the default
-//!   `Reject`. The proposal fails `Rejected`, the dial behaves exactly as with
-//!   no proposal, and a second dial does NOT propose again on the refused link.
+//! - **W3** (`a_refused_upgrade_leaves_the_dial_as_it_was`): B with accepting
+//!   turned `Off` (the operator override). The proposal fails `Rejected`, the
+//!   dial behaves exactly as with no proposal, and a second dial does NOT
+//!   propose again on the refused link.
 //!
 //! Requires the `transport-reticulum` feature:
 //! `cargo test --features transport-reticulum --test direct_links_805`
@@ -621,12 +622,16 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
     assert_eq!(got, b"direct-805-2", "the leg never needed T");
 }
 
-/// **W3** — B refuses (the default). The proposal fails `Rejected`, the dial
+/// **W3** — B refuses (accepting `Off`). The proposal fails `Rejected`, the dial
 /// behaves exactly as with no proposal, and a second dial does not propose
 /// again on the refused link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_upgrade_leaves_the_dial_as_it_was() {
-    let mut p = trio("w3", proposer(), DirectLinksConfig::default()).await;
+    let refuser = DirectLinksConfig {
+        accept: DirectAccept::Off,
+        ..DirectLinksConfig::default()
+    };
+    let mut p = trio("w3", proposer(), refuser).await;
     let (_spine, b_addr) = open_call(&p).await;
     match p.a.transport.open_av_link(&p.b.key.key_id, &b_addr).await {
         Err(TransportError::NoRouteToPeer { .. }) => {}

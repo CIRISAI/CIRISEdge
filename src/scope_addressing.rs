@@ -1021,6 +1021,22 @@ impl ScopeAddressTable {
         MemberStatus::NotAMember { live }
     }
 
+    /// CIRISEdge#805 item 8 — whether `member_key_id` shares a group with this
+    /// node: it is addressable at a LIVE epoch (current, next or previous) of
+    /// any group installed here. The installed groups are exactly the rooms and
+    /// calls this node's host joined, so this is "someone we share a room
+    /// with". A member sealed out by a rotation no longer counts.
+    #[must_use]
+    pub fn shares_group_with(&self, member_key_id: &str) -> bool {
+        let guard = self.inner.read();
+        guard.groups.values().flat_map(HashMap::values).any(|g| {
+            [Some(&g.current), g.next.as_ref(), g.previous.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|slot| slot.members.contains_key(member_key_id))
+        })
+    }
+
     /// CIRISEdge#640 — every installed group with its live epochs and
     /// current-epoch member count: the one read that makes "the table is
     /// empty" a fact rather than an inference from a refusal. Sorted by
@@ -1307,6 +1323,36 @@ mod tests {
         t.install_group(&family(), "g-1", 7, &secret(0xA1), &MEMBERS)
             .expect("seed install");
         t
+    }
+
+    // ── CIRISEdge#805 item 8 — shares_group_with ──
+
+    #[test]
+    fn a_member_shares_a_group_until_a_seal_drops_it() {
+        let t = table();
+        assert!(!t.shares_group_with(MEMBERS[1]), "no group installed");
+        t.install_group(&family(), "g-1", 7, &secret(0xA1), &MEMBERS)
+            .expect("install");
+        assert!(t.shares_group_with(MEMBERS[1]));
+        assert!(!t.shares_group_with("ed25519:mallory"), "never a member");
+        // Bob leaves at epoch 8: still a member at the previous epoch until
+        // the rotation seals, then not at all.
+        t.install_next(
+            &family(),
+            "g-1",
+            8,
+            &secret(0xB2),
+            &[MEMBERS[0], MEMBERS[2]],
+        )
+        .expect("install next");
+        t.activate_next(&family(), "g-1").expect("activate");
+        assert!(
+            t.shares_group_with(MEMBERS[1]),
+            "live at the previous epoch"
+        );
+        t.seal_rotation(&family(), "g-1").expect("seal");
+        assert!(!t.shares_group_with(MEMBERS[1]), "sealed out");
+        assert!(t.shares_group_with(MEMBERS[2]));
     }
 
     // ── CIRISEdge#648 — refresh_current: same epoch, different members ──
