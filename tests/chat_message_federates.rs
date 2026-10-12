@@ -905,7 +905,7 @@ fn only_self_and_family_are_structurally_invisible() {
     ] {
         assert!(
             c.is_structurally_invisible(),
-            "{c:?} must emit no holds_bytes"
+            "{c:?} must emit no discoverable holding claim"
         );
     }
     for c in [
@@ -918,7 +918,7 @@ fn only_self_and_family_are_structurally_invisible() {
     ] {
         assert!(
             !c.is_structurally_invisible(),
-            "{c:?} DOES emit holds_bytes; its property is cohort-filtered visibility"
+            "{c:?} DOES emit a discoverable holding claim; its property is cohort-filtered visibility"
         );
     }
 }
@@ -1156,7 +1156,7 @@ async fn publish_places_at_the_public_tier() {
 #[test]
 fn with_answers_both_questions_from_persist() {
     use ciris_persist::federation::types::cohort_scope::{
-        crypto_tier, suppresses_holds_bytes, CryptoTier,
+        crypto_tier, is_structurally_invisible, CryptoTier,
     };
     for w in [
         With::MyDevices,
@@ -1176,7 +1176,7 @@ fn with_answers_both_questions_from_persist() {
         assert_eq!(w.is_encrypted_at_rest(), expect_enc, "{w:?} encryption");
         assert_eq!(
             w.is_structurally_invisible(),
-            suppresses_holds_bytes(w.cohort_scope()),
+            is_structurally_invisible(w.cohort_scope()),
             "{w:?} invisibility"
         );
         assert_ne!(w.cohort_scope(), "federation");
@@ -2073,25 +2073,22 @@ async fn carry_identity(from: &Peer, to: &Peer) {
 /// What the Attestation cursor carries after a seal: every `key_grant:*`
 /// row `from` emitted, admitted through `to`'s key-grant door.
 async fn carry_key_grants(from: &Peer, to: &Peer) -> usize {
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::{is_key_grant_row, SignedKeyGrantRow};
+    // persist v55.0.0 (#989) — one key-grant row per recipient; count the
+    // wraps projected HERE (a row for another recipient projects nothing).
     let mut wraps = 0;
     for row in from.dir.list_attestations_since(None, 512).await.unwrap() {
-        if row
-            .attestation
-            .attestation_type
-            .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        {
-            wraps += to
-                .store
-                .engine()
-                .apply_replicated_key_grant(SignedKeyGrantSet {
-                    attestation: row.attestation,
-                })
-                .await
-                .expect("admit the key_grant set")
-                .wraps_written;
+        if is_key_grant_row(&row.attestation) {
+            wraps += usize::from(
+                to.store
+                    .engine()
+                    .apply_replicated_key_grant(SignedKeyGrantRow {
+                        attestation: row.attestation,
+                    })
+                    .await
+                    .expect("admit the key_grant row")
+                    .projected,
+            );
         }
     }
     wraps

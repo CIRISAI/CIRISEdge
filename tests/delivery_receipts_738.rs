@@ -28,7 +28,7 @@ use ciris_edge::receipts::{self, ReceiptLedger, ReceiptRefusal, StreamLog as _};
 use ciris_edge::replication::attestation_bind::{Shared, Signers};
 use ciris_edge::scope_room::ScopeRoom;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
-use ciris_persist::federation::key_grant::{SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX};
+use ciris_persist::federation::key_grant::SignedKeyGrantRow;
 use ciris_persist::federation::{Attestation, FederationDirectory as _, SignedAttestation};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
@@ -584,16 +584,12 @@ async fn cross_keys(author: &Node, reader: &Node) {
         .await
         .expect("list")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
     {
         let _ = reader
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: s.attestation.clone(),
             })
             .await;

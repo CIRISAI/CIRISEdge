@@ -61,7 +61,7 @@ use ciris_edge::{Edge, EdgeConfig, HybridPolicy};
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::encrypted_kv::XChaChaKvStore;
 use ciris_persist::federation::blobs::BlobStorage as _;
-use ciris_persist::federation::key_grant::{SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX};
+use ciris_persist::federation::key_grant::SignedKeyGrantRow;
 use ciris_persist::federation::{FederationDirectory, SignedAttestation};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
@@ -810,16 +810,12 @@ async fn author_body(
             .await
             .expect("list A's rows")
             .into_iter()
-            .filter(|a| {
-                a.attestation
-                    .attestation_type
-                    .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-            })
+            .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
     {
         m.b.node
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: set.attestation.clone(),
             })
             .await
@@ -832,7 +828,12 @@ async fn author_body(
             .await
             .expect("list A's rows")
             .into_iter()
-            .filter(|a| a.attestation.attestation_type.starts_with("holds_bytes:"))
+            // persist v55.0.0 (#989) — the holding claim is `custody:ack:v1`.
+            .filter(|a| {
+                ciris_persist::federation::admission::envelope_dimension(
+                    &a.attestation.attestation_envelope,
+                ) == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+            })
     {
         let _ =
             m.b.node

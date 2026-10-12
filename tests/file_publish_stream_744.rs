@@ -419,13 +419,15 @@ async fn file_rows(node: &Node) -> usize {
         .count()
 }
 
-async fn rows_with_prefix(node: &Node, prefix: &str) -> usize {
+/// persist v55.0.0 (#989) — key-grant ROWS (`scores` on `key_grant:{axis}:v1`,
+/// one per recipient), where v54 counted SETS by `attestation_type` prefix.
+async fn key_grant_rows(node: &Node) -> usize {
     node.dir
         .list_attestations_since(None, 100_000)
         .await
         .expect("list rows")
         .into_iter()
-        .filter(|a| a.attestation.attestation_type.starts_with(prefix))
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
         .count()
 }
 
@@ -569,7 +571,6 @@ async fn a_2_gib_self_file_publishes_from_a_reader_holding_a_few_chunks() {
 /// **SW2** — a reader that disagrees with its declaration publishes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reader_that_does_not_yield_its_declared_length_publishes_nothing_by_name() {
-    use ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX;
     init_tracing();
     let alice = Ident::new("alice-fed", 0x11);
     let node = node_at(":memory:", &[&alice], &alice).await;
@@ -593,7 +594,7 @@ async fn a_reader_that_does_not_yield_its_declared_length_publishes_nothing_by_n
         .federation_blob_bytes()
         .await
         .expect("blob bytes");
-    let grants_before = rows_with_prefix(&node, KEY_GRANT_ATTESTATION_TYPE_PREFIX).await;
+    let grants_before = key_grant_rows(&node).await;
 
     // ── Short: declared 10 MiB, yields 9 MiB ──
     let refused = ciris_edge::files::publish_stream(
@@ -634,9 +635,9 @@ async fn a_reader_that_does_not_yield_its_declared_length_publishes_nothing_by_n
         bytes_before,
         "no manifest and no chunk held: the 36 chunks it wrote were evicted"
     );
-    let grants_after = rows_with_prefix(&node, KEY_GRANT_ATTESTATION_TYPE_PREFIX).await;
+    let grants_after = key_grant_rows(&node).await;
     eprintln!(
-        "SW2: key_grant sets before {grants_before}, after {grants_after} (the per-chunk sets \
+        "SW2: key_grant rows before {grants_before}, after {grants_after} (the rows \
          put_blob_chunk_scoped emitted before the refusal stay; their ciphertext is gone)"
     );
 

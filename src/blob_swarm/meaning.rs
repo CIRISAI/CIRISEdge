@@ -573,24 +573,20 @@ impl BlobMeaning {
     }
 }
 
-/// CIRISEdge#791 — **is this the `holds_bytes` carrier type, exactly?**
-/// persist v53 (#975, CC 2.4: the row-type slot is closed) admits the
-/// carrier only as the whole string `^holds_bytes:sha256:[0-9a-f]{8}$`, and
-/// refuses any other spelling (`attestation_type_unregistered`) at put and
-/// at apply. Matched whole and byte-exact here too, so edge never reads a
-/// row persist would refuse as a holder claim. Built from persist's own
-/// prefix and length, never re-spelled.
+/// CIRISEdge#791 — **is this the retired `holds_bytes` carrier type?**
+///
+/// persist v55.0.0 (CIRISPersist#989, CC 2.4 rc7) retired the carrier: the
+/// holding claim is `custody:ack:v1` ([`is_custody_report`]), and EVERY
+/// spelling under the `holds_bytes:` stem is refused at every door and left
+/// out of every serve read (`registry::RETIRED_CARRIER_STEMS`, a prefix
+/// match). Edge matches the same stem, persist's own constant, so a legacy
+/// row that still reaches it is possession and never meaning, whatever its
+/// spelling. (Before v55 this matched the exact rc6 `holds_bytes:sha256:` +
+/// 8-hex form, the only one persist admitted then.)
 #[must_use]
 pub fn is_holds_bytes_type(attestation_type: &str) -> bool {
-    use ciris_persist::federation::{
-        HOLDS_BYTES_ATTESTATION_TYPE_PREFIX, HOLDS_BYTES_PREFIX_HEX_LEN,
-    };
     attestation_type
-        .strip_prefix(HOLDS_BYTES_ATTESTATION_TYPE_PREFIX)
-        .is_some_and(|hex| {
-            hex.len() == HOLDS_BYTES_PREFIX_HEX_LEN
-                && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        })
+        .starts_with(ciris_persist::federation::namespace::registry::RETIRED_HOLDING_CLAIM_STEM)
 }
 /// The `kind` a `holds_bytes` envelope carries.
 const HOLDS_BYTES_KIND: &str = "holds_bytes";
@@ -1006,25 +1002,35 @@ mod tests {
 
     /// CIRISEdge#601 — the apply path's pre-check finds both reference
     /// shapes, dedupes, and returns nothing for a possession claim.
-    /// CIRISEdge#791 — the carrier is matched whole and byte-exact, as
-    /// persist #975 admits it (`^holds_bytes:sha256:[0-9a-f]{8}$`): eight
-    /// lowercase hex is a holder; sixteen, uppercase, seven, another hash or
-    /// a trailing suffix is not.
+    /// CIRISEdge#791, widened at persist v55.0.0 (CIRISPersist#989) — the
+    /// retired carrier is the whole `holds_bytes:` STEM, as persist refuses
+    /// it (`registry::RETIRED_CARRIER_STEMS` is a prefix match): every
+    /// spelling under it is possession, the rc6 8-hex form and any other.
+    /// A type that only resembles it, outside the stem, is not.
     #[test]
-    fn the_holds_bytes_carrier_is_matched_exactly_791() {
+    fn the_holds_bytes_carrier_is_the_whole_retired_stem_791() {
         let eight = &hex::encode(SHA)[..8];
-        assert!(is_holds_bytes_type(&format!("holds_bytes:sha256:{eight}")));
-        assert!(is_holds_bytes_type("holds_bytes:sha256:0a1b2c3d"));
-        for not in [
+        for spelling in [
+            format!("holds_bytes:sha256:{eight}"),
+            "holds_bytes:sha256:0a1b2c3d".to_owned(),
             format!("holds_bytes:sha256:{}", &hex::encode(SHA)[..16]),
             "holds_bytes:sha256:0A1B2C3D".to_owned(),
-            "holds_bytes:sha256:0a1b2c3".to_owned(),
             "holds_bytes:sha512:0a1b2c3d".to_owned(),
             "holds_bytes:sha256:0a1b2c3d:v1".to_owned(),
-            "holds_bytes:sha256:0a1b2c3dx".to_owned(),
-            "holds_bytes:sha256:".to_owned(),
             "holds_bytes:".to_owned(),
+        ] {
+            assert!(
+                is_holds_bytes_type(&spelling),
+                "{spelling} is under the retired stem"
+            );
+            let mut row = bare_row("self");
+            row.attestation_type = spelling.clone();
+            assert!(is_holds_bytes_row(&row), "{spelling}");
+        }
+        for not in [
             "xholds_bytes:sha256:0a1b2c3d".to_owned(),
+            "holds_bytes".to_owned(),
+            "scores".to_owned(),
         ] {
             assert!(!is_holds_bytes_type(&not), "{not} is not the carrier");
             // Not the carrier ⇒ the type alone does not make the row
@@ -1107,27 +1113,38 @@ mod tests {
         assert_eq!(m.media_type(), Some("text/plain"));
     }
 
-    /// **The invariant.** persist auto-emits a `holds_bytes` row for every
-    /// blob it stores, so if possession counted as meaning, every blob on
-    /// the node would classify as commons — the exact default this stack
+    /// **The invariant.** persist emits a holding claim for every blob it
+    /// stores and announces, so if possession counted as meaning, every blob
+    /// on the node would classify as commons — the exact default this stack
     /// must never reach, arrived at by accident.
+    ///
+    /// persist v55.0.0 (CIRISPersist#989) — the claim is `custody:ack:v1`
+    /// (`holding_claim::holding_claim_row`, the one row every door emits); a
+    /// Commons claim sits at `federation` and cites the full digest.
     #[test]
-    fn a_holds_bytes_row_is_possession_and_never_meaning() {
-        // v45.0.0 (CIRISPersist#871, AV-89) — the claim carries the blob's
-        // byte length; any value serves a projection test that never stores.
-        let real = ciris_persist::federation::blobs::holds_bytes_attestation_row(
+    fn a_holding_claim_row_is_possession_and_never_meaning() {
+        use ciris_persist::federation::holding_claim::{holding_claim_row, ClaimScope};
+        let scope = ClaimScope::of_content(
+            CryptoTier::Plaintext,
+            ciris_persist::federation::types::cohort_scope::FEDERATION,
+            None,
+        )
+        .expect("the Commons claim scope");
+        let real = holding_claim_row(
             &SHA,
             "alice",
-            "hb-1",
+            "hc-1",
             chrono::DateTime::from_timestamp(1_767_225_296, 0).expect("ts"),
             42,
-        );
+            &scope,
+        )
+        .expect("the real holding claim row");
         // It genuinely references the blob, and its column genuinely says
         // `federation` — so only the by-name refusal stands between this row
         // and a commons classification.
         assert!(
             references_as_evidence(&real.attestation_envelope, &hex::encode(SHA)),
-            "fixture drift: the real holds_bytes row must reference the blob",
+            "fixture drift: the real holding claim must reference the blob",
         );
         assert_eq!(
             real.cohort_scope,

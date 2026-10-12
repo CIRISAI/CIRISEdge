@@ -326,7 +326,7 @@ fn announce_is_possible(scope: &CohortScope) -> bool {
         CohortScope::Family => ps::FAMILY,
         CohortScope::Cohort { .. } => ps::COMMUNITY,
     };
-    !ps::suppresses_holds_bytes(token)
+    !ps::is_structurally_invisible(token)
 }
 
 /// Whether a sender's standing authorises placing content of this scope.

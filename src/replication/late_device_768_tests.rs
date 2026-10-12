@@ -53,7 +53,6 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::blobs::BlobStorage as _;
-use ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX;
 use ciris_persist::federation::{FederationDirectory, SignedAttestation};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
@@ -380,10 +379,7 @@ async fn carry_key_grants(from: &Node, to: &ReplicationRuntime) {
         .expect("list the minter's rows")
         .into_iter()
         .map(|r| r.attestation)
-        .filter(|a| {
-            a.attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a))
     {
         let bytes = serde_json::to_vec(&row).expect("encode set");
         let _ = to

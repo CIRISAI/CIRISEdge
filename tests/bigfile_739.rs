@@ -69,7 +69,7 @@ use ciris_edge::verify::RootingDirectory;
 use ciris_edge::{CohortScope, Edge, EdgeConfig, HybridPolicy};
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::blobs::BlobStorage as _;
-use ciris_persist::federation::key_grant::{SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX};
+use ciris_persist::federation::key_grant::SignedKeyGrantRow;
 use ciris_persist::federation::{Attestation, FederationDirectory, SignedAttestation};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
@@ -914,9 +914,7 @@ async fn publish_on(a: &Node, owner: &Ident, total: u64) -> Published {
             .map(|r| (r.admitted_at, r.attestation.attestation_id.clone()));
         let n = page.len();
         for r in page {
-            if r.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
+            if ciris_persist::federation::key_grant::is_key_grant_row(&r.attestation)
                 && !grants
                     .iter()
                     .any(|g: &Attestation| g.attestation_id == r.attestation.attestation_id)
@@ -958,7 +956,7 @@ async fn cross_to(b: &Node, p: &Published) -> Duration {
             match b
                 .store
                 .engine()
-                .apply_replicated_key_grant(SignedKeyGrantSet {
+                .apply_replicated_key_grant(SignedKeyGrantRow {
                     attestation: g.clone(),
                 })
                 .await
