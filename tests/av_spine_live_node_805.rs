@@ -797,6 +797,17 @@ async fn av_chunks_ride_the_replicating_node_805() {
     // The stream: CHUNKS chunks, the middle one followed by a replication
     // frame forced onto the A/V link.
     let overhead = wire_overhead();
+    // #720 — the producer budget is the measured seal overhead: a seal that
+    // grows the frame (CIRISEdge#846) without moving the budget goes RED here.
+    assert_eq!(
+        overhead,
+        ciris_edge::transport::realtime_av::AV_CHUNK_WIRE_OVERHEAD
+    );
+    assert_eq!(
+        call.spine.chunk_plaintext_budget(),
+        ciris_edge::transport::realtime_av::max_chunk_plaintext(channel_limit),
+        "the spine's budget is the live link's"
+    );
     let body_len = (channel_limit - overhead).min(1200);
     let forced = small_bootstrap_frame(b'v');
     let mut sent = Vec::with_capacity(CHUNKS + 1);

@@ -306,6 +306,33 @@ pub struct SealedAvChunk {
 /// `chunk_seq`). Stable across v3.7.0 / v3.8.0.
 pub const CHUNK_HEADER_LEN: usize = 48;
 
+/// CIRISEdge#720 — bytes the INNER seal adds over a chunk's plaintext: the
+/// AES-256-GCM tag appended to the ciphertext. (CIRISEdge#846 makes the inner
+/// bytes persist's stream-chunk envelope, and this becomes persist's
+/// `AT_REST_ENVELOPE_OVERHEAD`: magic, nonce and tag.)
+pub const AV_CHUNK_INNER_OVERHEAD: usize =
+    ciris_persist::federation::at_rest_cascade::AES_GCM_TAG_LEN;
+
+/// CIRISEdge#720 — bytes the A/V wire adds over a chunk's plaintext: the
+/// clear header and codec/layer block, the outer per-link AES-256-GCM tag,
+/// and the inner seal's overhead ([`AV_CHUNK_INNER_OVERHEAD`]). Built from
+/// the imported constants, never retyped, so a seal change moves the budget
+/// with it.
+pub const AV_CHUNK_WIRE_OVERHEAD: usize = CHUNK_HEADER_LEN
+    + CHUNK_CODEC_LAYER_LEN
+    + ciris_persist::federation::at_rest_cascade::AES_GCM_TAG_LEN
+    + AV_CHUNK_INNER_OVERHEAD;
+
+/// CIRISEdge#720 — the largest chunk PLAINTEXT whose sealed wire fits one
+/// Channel message of `channel_limit` bytes (the link's
+/// `link_channel_message_limit`). `None` when not even an empty chunk fits.
+/// A producer cuts its chunks to this; a larger one is refused at send as
+/// `ChunkTooLarge`, never sent and never a link failure.
+#[must_use]
+pub fn max_chunk_plaintext(channel_limit: usize) -> Option<usize> {
+    channel_limit.checked_sub(AV_CHUNK_WIRE_OVERHEAD)
+}
+
 /// Length of the CIRISEdge#128 codec + layer block that follows the
 /// fixed header on new wires. 1 byte `codec_id` + 3 bytes
 /// [`ChunkLayer`] = 4 bytes. Absent on a v3.7.0 wire — the read side

@@ -204,6 +204,15 @@ pub trait AvLinkSender: Send + Sync + 'static {
     /// one: absorbing the condition here makes it unobservable to every
     /// layer above, which is exactly the defect leviculum#66 documents.
     async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError>;
+
+    /// CIRISEdge#720 — the most ONE message on this link carries, when the
+    /// sender knows it (a Reticulum link's Channel limit). `None`: no known
+    /// limit (a test pipe, a link no longer held). A producer sizes its
+    /// chunks from the smallest limit across its links
+    /// ([`AvDispatcher::chunk_plaintext_budget`]).
+    fn channel_limit(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// The async byte-stream recv half the caller plugs in. `recv` resolves
@@ -490,6 +499,19 @@ impl AvDispatcher {
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
         self.subscribers.len()
+    }
+
+    /// CIRISEdge#720 — the largest chunk plaintext that fits EVERY
+    /// downstream link's Channel ([`super::realtime_av::max_chunk_plaintext`]
+    /// over the smallest known limit). `None` when no link reports a limit,
+    /// or one is too small to carry even an empty chunk.
+    #[must_use]
+    pub fn chunk_plaintext_budget(&self) -> Option<usize> {
+        self.subscribers
+            .values()
+            .filter_map(|s| s.sender.channel_limit())
+            .min()
+            .and_then(super::realtime_av::max_chunk_plaintext)
     }
 
     /// Publisher path: outer-seal a caller-supplied (already inner-
@@ -808,6 +830,10 @@ mod tests {
                 .send(bytes.to_vec())
                 .map_err(|e| AvDispatcherError::SendFailed(e.to_string()))
         }
+
+        fn channel_limit(&self) -> Option<usize> {
+            Some(self.limit)
+        }
     }
 
     fn inner(dek: &EpochDek, seq: u64, len: usize) -> InnerSealed {
@@ -860,6 +886,80 @@ mod tests {
             open_av_chunk(&sealed, &transit, b"sub", 0, &dek).is_ok(),
             "the first frame that went out is link_seq 0"
         );
+    }
+
+    /// #720 — the producer budget at the 500-byte MTU: the dispatcher reports
+    /// the largest plaintext whose sealed frame fits the 425-byte Channel
+    /// (MTU 500 → link MDU 431 → Channel 425 → 425 − `AV_CHUNK_WIRE_OVERHEAD`),
+    /// a chunk of exactly that size is sent and fills the Channel exactly, and
+    /// one byte more is refused by name.
+    #[tokio::test]
+    async fn the_budget_is_exactly_what_the_channel_carries() {
+        use crate::transport::realtime_av::{max_chunk_plaintext, AV_CHUNK_WIRE_OVERHEAD};
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut d = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(7),
+            local_role: AvRole::Publisher,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: vec![AvSubscriberLink {
+                subscriber: "sub".to_owned(),
+                transit_key: [0x21u8; 32],
+                link_id: b"sub".to_vec(),
+                outbound_send: Box::new(LimitedSender { limit: 425, tx }),
+            }],
+            inbound_links: vec![],
+        })
+        .expect("publisher");
+        let budget = d
+            .chunk_plaintext_budget()
+            .expect("a link reports its limit");
+        assert_eq!(Some(budget), max_chunk_plaintext(425));
+        assert_eq!(budget, 425 - AV_CHUNK_WIRE_OVERHEAD);
+        assert_eq!(
+            budget, 341,
+            "the base-MTU budget, pinned (seal overhead 84 B)"
+        );
+
+        d.publish_inner(inner(&dek, 0, budget))
+            .await
+            .expect("the budget fits");
+        assert_eq!(
+            rx.try_recv().expect("sent").len(),
+            425,
+            "and fills the Channel exactly"
+        );
+        match d.publish_inner(inner(&dek, 1, budget + 1)).await {
+            Err(AvDispatcherError::ChunkTooLarge(r)) => {
+                assert_eq!((r.frame_bytes, r.channel_limit), (426, 425));
+            }
+            other => panic!("one byte over the budget must be refused: {other:?}"),
+        }
+    }
+
+    /// #720 — the budget is the SMALLEST link's: one chunk size serves the
+    /// whole fan-out.
+    #[test]
+    fn the_budget_is_the_smallest_links() {
+        use crate::transport::realtime_av::max_chunk_plaintext;
+        let link = |name: &str, limit: usize| AvSubscriberLink {
+            subscriber: name.to_owned(),
+            transit_key: [0x21u8; 32],
+            link_id: name.as_bytes().to_vec(),
+            outbound_send: Box::new(LimitedSender {
+                limit,
+                tx: mpsc::unbounded_channel().0,
+            }),
+        };
+        let d = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(7),
+            local_role: AvRole::Publisher,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: vec![link("big", 16_000), link("base", 425), link("mid", 1_200)],
+            inbound_links: vec![],
+        })
+        .expect("publisher");
+        assert_eq!(d.chunk_plaintext_budget(), max_chunk_plaintext(425));
     }
 
     #[test]

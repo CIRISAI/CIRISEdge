@@ -258,6 +258,15 @@ impl AvPublisher {
         self.dispatcher.subscriber_count()
     }
 
+    /// CIRISEdge#720 — the largest chunk plaintext that fits every
+    /// downstream link's Channel ([`AvDispatcher::chunk_plaintext_budget`]).
+    /// A producer cuts its chunks to this; `None` when no link reports a
+    /// limit.
+    #[must_use]
+    pub fn chunk_plaintext_budget(&self) -> Option<usize> {
+        self.dispatcher.chunk_plaintext_budget()
+    }
+
     /// Inner-seal `plaintext` under the current epoch DEK and fan it out
     /// to every downstream subscriber. Returns the [`ChunkSeq`] the chunk
     /// was stamped with.
@@ -955,6 +964,13 @@ mod leviculum_link {
 
     #[async_trait::async_trait]
     impl AvLinkSender for LeviculumAvSender {
+        /// CIRISEdge#720 — the live link's Channel message limit (the
+        /// inherent [`LeviculumAvSender::channel_limit`]), so the dispatcher
+        /// can size a producer's chunks before any is refused.
+        fn channel_limit(&self) -> Option<usize> {
+            LeviculumAvSender::channel_limit(self)
+        }
+
         /// CIRISEdge#591 item 1 — `try_send`, never the absorbing `send`.
         ///
         /// This is the A/V path, edge's highest-rate producer, and until
@@ -978,7 +994,7 @@ mod leviculum_link {
             use leviculum_core::SendError;
             use leviculum_std::error::Error as LevError;
 
-            let Some(channel_limit) = self.channel_limit() else {
+            let Some(channel_limit) = LeviculumAvSender::channel_limit(self) else {
                 self.count(crate::observability::AV_SEND_LINK_GONE);
                 return Err(AvDispatcherError::SendFailed(format!(
                     "leviculum link {:?} is no longer held — no Channel to send on",

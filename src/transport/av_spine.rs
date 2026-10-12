@@ -639,6 +639,14 @@ impl AvSpine {
         self.relay.as_ref()
     }
 
+    /// CIRISEdge#720 — the largest chunk plaintext the call's direct links
+    /// carry in one Channel message ([`AvPublisher::chunk_plaintext_budget`]):
+    /// what a codec cuts its chunks to, so none is refused at send.
+    #[must_use]
+    pub fn chunk_plaintext_budget(&self) -> Option<usize> {
+        self.publisher.chunk_plaintext_budget()
+    }
+
     /// The call's degraded state, if it has one.
     #[must_use]
     pub fn stranded(&self) -> Option<&StrandedEpoch> {
