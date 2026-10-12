@@ -101,6 +101,11 @@ pub mod av_sink;
 /// owns a [`realtime_av_relay::RelayNode`].
 #[cfg(feature = "_reticulum-module")]
 pub mod av_spine;
+/// CIRISEdge#805 item 8 — a direct path between two call members behind NAT
+/// (leviculum v0.30 direct links): the knob, the per-peer state machine, its
+/// retry policy and the A/V-leg liveness decision.
+#[cfg(feature = "_reticulum-module")]
+pub mod direct_path;
 
 /// Application-Layer Multicast (ALM) — mesh-tree video built on the
 /// per-peer [`realtime_av_relay::RelayNode`] primitive (CIRISEdge#131 +

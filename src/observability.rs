@@ -891,6 +891,36 @@ pub const AV_INBOUND_DROPPED_CONSUMER_GONE: &str = "av_inbound_dropped_consumer_
 /// Dropped: a Resource completed on an A/V link (A/V rides the Channel only).
 pub const AV_INBOUND_DROPPED_RESOURCE: &str = "av_inbound_dropped_resource";
 
+// ─── CIRISEdge#805 item 8 — `EdgeMetrics::direct_link` labels ─────────
+
+/// A direct-link upgrade proposed on the identity link to a call member.
+pub const DIRECT_LINK_PROPOSED: &str = "direct_link_proposed";
+/// leviculum refused to start a proposal (cooldown, already upgrading, busy
+/// channel, no active link).
+pub const DIRECT_LINK_PROPOSE_REFUSED: &str = "direct_link_propose_refused";
+/// No proposal: the member is already a one-hop neighbour.
+pub const DIRECT_LINK_SKIPPED_NEIGHBOUR: &str = "direct_link_skipped_neighbour";
+/// No proposal: the member's last proposal failed and is backing off (or was
+/// refused on this link).
+pub const DIRECT_LINK_SKIPPED_BACKOFF: &str = "direct_link_skipped_backoff";
+/// No proposal: no identity link to the member could be had.
+pub const DIRECT_LINK_SKIPPED_NO_LINK: &str = "direct_link_skipped_no_link";
+/// A link moved onto a punched interface (either side).
+pub const DIRECT_LINK_ESTABLISHED: &str = "direct_link_established";
+/// The peer refused the upgrade.
+pub const DIRECT_LINK_FAILED_REJECTED: &str = "direct_link_failed_rejected";
+/// The facilitator did not answer this node's probe.
+pub const DIRECT_LINK_FAILED_PROBE: &str = "direct_link_failed_probe";
+/// The peer stopped answering partway through.
+pub const DIRECT_LINK_FAILED_TIMEOUT: &str = "direct_link_failed_timeout";
+/// No punch got through (symmetric NAT, a firewall, no route).
+pub const DIRECT_LINK_FAILED_PUNCH: &str = "direct_link_failed_punch";
+/// A punched interface went down; its link is back on its relayed path.
+pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
+/// A direct A/V leg's path was judged gone and the leg fell back
+/// (`direct_path::direct_leg_stalled`).
+pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
+
 /// The live counter/gauge bag every [`crate::Edge`] owns.
 ///
 /// # Concurrency
@@ -1198,6 +1228,15 @@ pub struct EdgeMetrics {
     /// (`av_inbound_dropped_queue_full` is the never-block overflow policy).
     /// Every `av_inbound_dropped_*` label is a drop.
     pub av_plane: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#805 item 8 — direct links (leviculum#70) by label
+    /// (`DIRECT_LINK_*` constants in this module): proposals made, skipped
+    /// and refused, and each outcome. Every `direct_link_failed_*` label is a
+    /// proposal that ended without a direct path, the link untouched.
+    pub direct_link: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#805 item 8 — peers with a direct path now, per reporting
+    /// transport (keyed by its metrics source id, like `link_pool_sizes`).
+    /// Read as [`Self::direct_links_active`] (the sum).
+    pub direct_links_active: Arc<RwLock<HashMap<u64, u64>>>,
     /// CIRISEdge#640 — blob holders dropped from a pull's candidate set, by the
     /// router's refusal BRANCH (`ScopeRouteRefusal::reason_tag`):
     /// `blob_group_not_installed` (the host's lifecycle never installed the
@@ -1821,6 +1860,37 @@ impl EdgeMetrics {
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
             .collect()
+    }
+
+    /// CIRISEdge#805 item 8 — count one direct-link event by its
+    /// `DIRECT_LINK_*` label.
+    pub fn inc_direct_link(&self, label: &'static str) {
+        *self.direct_link.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#805 item 8 — the direct-link ledger by label.
+    #[must_use]
+    pub fn direct_link(&self) -> HashMap<String, u64> {
+        self.direct_link
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#805 item 8 — `source`'s count of peers with a direct path.
+    pub fn set_direct_links_active(&self, source: u64, active: u64) {
+        self.direct_links_active.write().insert(source, active);
+    }
+
+    /// CIRISEdge#805 item 8 — peers with a direct path, over every transport
+    /// that has reported.
+    #[must_use]
+    pub fn direct_links_active(&self) -> u64 {
+        self.direct_links_active
+            .read()
+            .values()
+            .fold(0u64, |acc, n| acc.saturating_add(*n))
     }
 
     /// CIRISEdge#683 — count one first-contact door outcome by its label.
@@ -2501,6 +2571,8 @@ impl EdgeMetrics {
                 .collect(),
             transport_inbound_drops: self.transport_inbound_drops(),
             av_plane: self.av_plane(),
+            direct_link: self.direct_link(),
+            direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
                 .read()
@@ -2771,6 +2843,10 @@ pub struct EdgeMetricsBundle {
     pub first_contact_outcomes: HashMap<String, u64>,
     /// CIRISEdge#805 — the A/V plane on the live node by `AV_*` label.
     pub av_plane: HashMap<String, u64>,
+    /// CIRISEdge#805 item 8 — direct links by `DIRECT_LINK_*` label.
+    pub direct_link: HashMap<String, u64>,
+    /// CIRISEdge#805 item 8 — peers with a direct path now.
+    pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
     pub replication_routed_to_responder_total: u64,
     /// CIRISEdge#634 — replies routed into an initiator's round inbox.
@@ -3068,6 +3144,14 @@ impl EdgeMetricsBundle {
         f.family("first_contact_outcomes", &self.first_contact_outcomes);
         // CIRISEdge#805 — the A/V plane ledger, `av_plane.<label>`.
         f.family("av_plane", &self.av_plane);
+        // CIRISEdge#805 item 8 — direct links, `direct_link.<label>`, and the
+        // gauge of peers with a direct path now.
+        f.family("direct_link", &self.direct_link);
+        #[allow(clippy::cast_precision_loss)] // a peer count
+        f.gauges.insert(
+            "direct_links_active".to_string(),
+            self.direct_links_active as f64,
+        );
         for (name, v) in [
             (
                 "replication_routed_to_responder_total",
@@ -3265,6 +3349,8 @@ edge_metrics_bundle_fields!(
     transport_inbound_drops,
     first_contact_outcomes,
     av_plane,
+    direct_link,
+    direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,
     replication_reply_dropped_total,

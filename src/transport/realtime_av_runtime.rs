@@ -907,6 +907,9 @@ mod leviculum_link {
         node: Arc<ReticulumNode>,
         link_id: LinkId,
         metrics: Option<crate::observability::EdgeMetrics>,
+        /// CIRISEdge#805 item 8 — the hold on the punched interface this leg
+        /// runs over, when it does: released when the leg is dropped.
+        direct_path: Option<crate::transport::direct_path::DirectPathGuard>,
     }
 
     impl LeviculumAvSender {
@@ -920,7 +923,26 @@ mod leviculum_link {
                 node,
                 link_id,
                 metrics: None,
+                direct_path: None,
             }
+        }
+
+        /// CIRISEdge#805 item 8 — hold `guard`'s punched interface for as long
+        /// as this leg lives.
+        #[must_use]
+        pub(crate) fn with_direct_path(
+            mut self,
+            guard: Option<crate::transport::direct_path::DirectPathGuard>,
+        ) -> Self {
+            self.direct_path = guard;
+            self
+        }
+
+        /// CIRISEdge#805 item 8 — whether this leg runs over a punched
+        /// interface it holds.
+        #[must_use]
+        pub fn is_direct(&self) -> bool {
+            self.direct_path.is_some()
         }
 
         /// Count this sender's refusals on `metrics` (`av_plane`).

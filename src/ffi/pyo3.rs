@@ -2857,6 +2857,14 @@ fn metrics_bundle_to_pydict<'py>(
         av_plane.set_item(label.as_str(), *n)?;
     }
     root.set_item("av_plane", av_plane)?;
+    // CIRISEdge#805 item 8 — direct links by label, and the peers with a
+    // direct path now.
+    let direct_link = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.direct_link {
+        direct_link.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("direct_link", direct_link)?;
+    root.set_item("direct_links_active", bundle.direct_links_active)?;
     // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
     // a missing install and a membership refusal are two numbers.
     let route_refusals = pyo3::types::PyDict::new(py);
