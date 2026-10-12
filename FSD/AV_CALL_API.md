@@ -52,10 +52,22 @@ over `CohortGroup::record_secret`, but with a bench-only HKDF label; §10 V1.)
 
 - `CallId([u8; 32])` (**new**) = the content hash of the call's genesis row (the ring row, §7),
   so a call is named by a signed room row and two members never disagree about it.
-- Per-publisher `StreamId` = `SHA-256("ciris-edge:call-stream:v1" ‖ CallId ‖ utf8(publisher
-  NODE key_id))`. The stream's writer is a NODE key (persist, P5): one person publishing from two
-  devices is two streams. The persist / STREAM-nonce label is `realtime_av::stream_label(stream_id)` (lowercase
-  hex), as #846 fixes; a kept stream's persist stream is named by that hex.
+- Per-publisher `StreamId` = `SHA-256("ciris-edge:call-stream:v2" ‖ utf8(room community_key_id)
+  ‖ utf8(publisher NODE key_id) ‖ join_nonce)`, where `join_nonce` is 32 bytes from the OS CSPRNG,
+  minted on every `open_call` / `join_call` and never persisted. The stream's writer is a NODE key
+  (persist, P5): one person publishing from two devices is two streams. The persist label is
+  `realtime_av::stream_label(stream_id)` (lowercase hex); a kept stream's persist stream is named by
+  that hex.
+- **Invariant: a call never reuses a `stream_id`, including after a crash or a rejoin.** The
+  derivation guarantees it: every open or join mints a fresh `join_nonce`, so a publisher that
+  crashes and rejoins, or leaves and rejoins, gets a new stream, never its old one. A derivation
+  with no fresh input would not: the stream DEK (§3.2) and the STREAM nonce are both functions of
+  `(stream_id, epoch, chunk_seq)`, so a rejoin inside the same room epoch would restart `chunk_seq`
+  at 0 under the same key, which is nonce reuse. Nothing is persisted to remember "streams already
+  used", so a lost store cannot break the invariant. Every stream is born V2 (#1067): there is no
+  V1 prefix to carry across a rejoin. Witness (later, with item 5's code): a publisher that drops
+  its `Call` without `leave` and rejoins the same room in the same epoch gets a different
+  `stream_id`, and no `(dek, nonce)` pair appears twice across the two streams.
 
 ### 3.2 The MLS group IS the room's
 
@@ -179,8 +191,8 @@ walks the list.
 - **Item 3 is "the author adopts its live ciphertext"** (persist P4, CIRISPersist#1067 v55.1): a
   supplied epoch is V2 (no form argument), and stored == live bytes because the author ADOPTS the
   exact chunks it sealed live into the supplied epoch. Never a re-seal through
-  `put_blob_chunk_scoped`. Still open on #1067: the counter bookkeeping for adopted chunks, and the
-  STH leaf order (edge asked for `(epoch, counter)` order, each epoch's terminator its last leaf).
+  `put_blob_chunk_scoped`. STH leaf order (#1067): `(epoch, counter)`, each epoch's terminator its
+  last leaf; streams are born V2. Still open on #1067: the counter bookkeeping for adopted chunks.
 - `register_stream_epoch_dek`'s `aad` seals the terminator persist writes, so it MUST equal the
   chunks' caller AAD: `None`, i.e. #846's `AV_CHUNK_CALLER_AAD` (persist P2; the final v55 has no
   `keep` argument). It closes the open epoch with that terminator (persist-side); the live
@@ -288,8 +300,8 @@ refused frame).
 - **P3 (answered).** No replicated STH carrier; `stream_sth` rows are node-local. Live STHs ride
   edge's wire; the durable question is C5.
 - **P4 (answered, CIRISPersist#1067 v55.1).** No form argument; a supplied epoch is V2; stored ==
-  live by the author ADOPTING its live ciphertext. OPEN on #1067: adopted-chunk counter bookkeeping,
-  and the STH leaf order (`(epoch, counter)`, each epoch's terminator last, as edge asked).
+  live by the author ADOPTING its live ciphertext. Leaf order `(epoch, counter)`, each epoch's
+  terminator last; streams are born V2. OPEN on #1067: adopted-chunk counter bookkeeping.
 - **P5 (answered).** One stream per publisher; the writer is a NODE key (two devices, two
   streams).
 
@@ -313,8 +325,8 @@ refused frame).
 2. CIRISPersist#981 / item 2 — one DEK (`KeptAvPublisher`, `local/805-2-one-dek`).
 3. Item 3 — **the author adopts its live ciphertext** (`adopt_sealed_chunk(s)`): into the supplied
    epoch when kept, under `for_stream_keyed_chunk` with no DEK row when unkept; live STHs from
-   in-memory leaves, `put_stream_sth` over adopted chunks. Waits on #1067's counter bookkeeping and
-   leaf order.
+   in-memory leaves, `put_stream_sth` over adopted chunks. Waits on #1067's counter bookkeeping
+   (the leaf order is settled).
 4. V1 / V2 from verify; C1–C5 from the CC.
 5. This API (item 5) and the signalling rows (item 6), behind those.
 
@@ -329,3 +341,6 @@ refused frame).
   refused keep is the typed `CallEvent::KeepRefused` (partial recording), rotation without a roster
   change is a self-update commit, `StreamEpochDekConflict` (#1069) named, keep comes from the row
   once CIRISPersist#1068 ships.
+- 2026-10-12 — #1067: the STH leaf order is `(epoch, counter)` with each epoch's terminator last,
+  and streams are born V2. A call never reuses a `stream_id` (crash or rejoin): `StreamId` gains a
+  fresh per-join `join_nonce` and drops `CallId`; the witness lands with item 5's code.
