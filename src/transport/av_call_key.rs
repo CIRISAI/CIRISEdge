@@ -11,8 +11,9 @@
 //! ```
 //!
 //! `L` is [`STREAM_DEK_LABEL`]; `stream_id_utf8` is the stream label
-//! (`realtime_av::stream_label`, the lowercase hex of the 32-byte id). No
-//! length prefixes: the fixed label, the fixed 64-char stream label and the
+//! (`realtime_av::stream_label`: `av-` + the lowercase hex of the 32-byte id,
+//! the one spelling persist and the STREAM nonce use too). No length
+//! prefixes: the fixed label, the fixed 67-byte stream label and the
 //! fixed 8-byte epoch parse unambiguously.
 //!
 //! **Normative: CC 5.1 (rc8, CIRISConstitution#169).** One DEK per
@@ -154,16 +155,17 @@ mod tests {
 
     /// The info layout is `L ‖ stream_id_utf8 ‖ u64_be(epoch)`, no length
     /// prefixes, with `L` the ruled `"ciris-stream-dek/v1"`; the stream part is
-    /// the 64-char lowercase hex label.
+    /// the stream label, `av-` + 64 lowercase hex.
     #[test]
     fn the_info_layout_is_pinned() {
         let info = stream_dek_info(STREAM_A, Epoch(0x0102_0304_0506_0708));
         let l = STREAM_DEK_LABEL.as_bytes();
         assert_eq!(l, b"ciris-stream-dek/v1", "the label CC 5.1 (rc8) rules");
-        assert_eq!(info.len(), l.len() + 64 + 8);
+        assert_eq!(info.len(), l.len() + 3 + 64 + 8);
         assert_eq!(&info[..l.len()], l);
-        assert_eq!(&info[l.len()..l.len() + 64], "a1".repeat(32).as_bytes());
-        assert_eq!(&info[l.len() + 64..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&info[l.len()..l.len() + 3], b"av-");
+        assert_eq!(&info[l.len() + 3..l.len() + 67], "a1".repeat(32).as_bytes());
+        assert_eq!(&info[l.len() + 67..], &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     /// Two members of the room derive the same DEK for a stream without

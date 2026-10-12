@@ -63,8 +63,9 @@ over `CohortGroup::record_secret`, but with a bench-only HKDF label; §10 V1.)
   ‖ utf8(publisher NODE key_id) ‖ join_nonce)`, where `join_nonce` is 32 bytes from the OS CSPRNG,
   minted on every `join_call` / `ring` and never persisted. The stream's writer is a NODE key
   (persist, P5): one person publishing from two devices is two streams. The persist label is
-  `realtime_av::stream_label(stream_id)` (lowercase hex); a kept stream's persist stream is named by
-  that hex.
+  `realtime_av::stream_label(stream_id)` = `av-` + lowercase hex (persist refuses a bare 64-hex
+  stream id, reserved for an inline blob's one-leaf log, #953); a kept stream's persist stream is
+  named by that label.
 - **Invariant: a call never reuses a `stream_id`, including after a crash or a rejoin.** The
   derivation guarantees it: every open or join mints a fresh `join_nonce`, so a publisher that
   crashes and rejoins, or leaves and rejoins, gets a new stream, never its old one. A derivation
@@ -88,7 +89,8 @@ over `CohortGroup::record_secret`, but with a bench-only HKDF label; §10 V1.)
   dek  = HKDF-SHA256(ikm = seed, salt = EMPTY, info = L ‖ stream_id_utf8 ‖ u64_be(epoch))
   ```
 
-  `stream_id_utf8` is `stream_label(stream_id)` (64 lowercase hex chars); no length prefixes. The
+  `stream_id_utf8` is `stream_label(stream_id)` (`av-` + 64 lowercase hex chars, the same string
+  persist and the STREAM nonce bind); no length prefixes. The
   exporter context stays EMPTY, as verify requires; the stream is bound by the KDF step after it.
   `CallId` is not an input. A DEK is derived only at the room group's CURRENT epoch
   (`StreamKeyError::EpochNotCurrent` otherwise).
@@ -411,3 +413,7 @@ refused frame).
   later epochs, OFF is forward-only. "Recorded" is not a field (`history_on_join: full` or existing
   wraps; the recording is the CC 3.3.13 blob). verify#308's `stream_dek` and KATs replace edge's
   derivation when they land.
+- 2026-10-12 — the stream label is `av-` + lowercase hex, not the bare hex: persist's chunk door
+  refuses a bare 64-hex stream id (reserved for an inline blob's one-leaf log, #953). One spelling
+  (`realtime_av::stream_label`) feeds the persist stream id, the STREAM nonce (#846) and the
+  per-stream DEK's info.

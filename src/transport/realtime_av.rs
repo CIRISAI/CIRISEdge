@@ -103,11 +103,15 @@ use crate::transport::TransportId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub [u8; 32]);
 
-/// A stream's label: the lowercase hex of its 32-byte id, the UTF-8 form the
-/// stream's DEK binds (`av_call_key::stream_dek_info`).
+/// THE spelling of a stream's id as a string: `av-` + the lowercase hex of its
+/// 32 bytes (67 bytes of UTF-8). The one string the persist stream id, the
+/// STREAM nonce (#846) and the per-stream DEK's info
+/// (`av_call_key::stream_dek_info`, CC 5.1 rc8) all bind, so live and stored
+/// never diverge. Not the bare hex: persist's chunk door refuses a bare 64-hex
+/// stream id, which is reserved for an inline blob's one-leaf log (#953).
 #[must_use]
 pub fn stream_label(stream_id: StreamId) -> String {
-    hex::encode(stream_id.0)
+    format!("av-{}", hex::encode(stream_id.0))
 }
 
 /// Monotonic epoch counter per stream. Each epoch corresponds to one
