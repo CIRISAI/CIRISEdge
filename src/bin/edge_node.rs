@@ -2006,6 +2006,9 @@ struct Occurrence {
     /// to it; the chat legs seal and open through it. Two views would be two
     /// sets of grant tables that never meet.
     engine: ciris_edge::replication::BridgeEngine,
+    /// persist v55.0.0 — the holding-claim re-ack sweeper, taken by `main` and
+    /// stopped when the role completes.
+    reack: Option<ciris_edge::group_content::HoldingClaimReack>,
     /// The engine's derived signing key — this node's occurrence of its
     /// owner, and therefore the viewer key for every read here.
     me: String,
@@ -2278,6 +2281,14 @@ async fn stand_up(
     .await
     .map_err(|e| format!("hybrid content engine: {e}"))?;
     let engine = ciris_edge::replication::BridgeEngine(content_store.engine().clone());
+    // persist v55.0.0 (#989, CC 3.1.3.3 rule 5) — this node's holding claims
+    // lapse at 72 h unless re-acked. The engine is a VIEW this binary built,
+    // so nothing else starts persist's re-ack sweeper; `main` stops it.
+    let reack = content_store.spawn_holding_claim_reack();
+    tracing::info!(
+        running = reack.is_running(),
+        "holding-claim re-ack sweeper (CC 3.1.3.3 rule 5; persist v55)"
+    );
 
     // CIRISEdge#599 — this node as a CONTENT OCCURRENCE of its owner.
     //
@@ -2821,6 +2832,7 @@ async fn stand_up(
         directory,
         engine,
         me,
+        reack: Some(reack),
     })
 }
 
@@ -6242,7 +6254,8 @@ fn main() -> std::process::ExitCode {
         ));
         let role = cfg.role;
 
-        let occ = match stand_up(cfg, Arc::clone(&reporter), budget.max_blocking_threads).await {
+        let mut occ = match stand_up(cfg, Arc::clone(&reporter), budget.max_blocking_threads).await
+        {
             Ok(o) => o,
             Err(e) => {
                 reporter.not_run("mesh.standup", e);
@@ -6266,6 +6279,7 @@ fn main() -> std::process::ExitCode {
             }),
         );
 
+        let reack = occ.reack.take();
         let outcome = match role {
             Role::Publisher => run_publisher(occ).await,
             Role::Relay => run_relay(occ).await,
@@ -6274,6 +6288,10 @@ fn main() -> std::process::ExitCode {
         };
         if let Err(e) = outcome {
             reporter.not_run("mesh.role_completion", e);
+        }
+        if let Some(reack) = reack {
+            let stopped = reack.stop().await;
+            tracing::info!(stopped, "holding-claim re-ack sweeper stopped");
         }
 
         let (any, all_ok) = reporter.verdict();

@@ -222,6 +222,59 @@ impl PersistGroupContentStore {
     pub fn engine(&self) -> &ciris_persist::Engine {
         &self.engine
     }
+
+    /// persist v55.0.0 (#989, CC 3.1.3.3 rule 5) — start the **re-ack
+    /// sweeper** that keeps this node's holding claims live.
+    ///
+    /// A v55 holding claim (`custody:ack:v1` `here`) lapses 72 h after it was
+    /// signed; persist renews this node's own claims once they are a day old,
+    /// for bytes it still holds, through `Engine::spawn_reack_sweeper` (hourly).
+    /// persist's Python engine starts it at construction, but an `Engine` VIEW
+    /// a Rust host builds (this store's) starts nothing, so a host that seals
+    /// and serves through this store must start it or its bytes drop out of
+    /// holder discovery after 72 h. Not running without a local (PQC) signer:
+    /// [`HoldingClaimReack::is_running`] is `false` for a store built with
+    /// [`Self::from_shared`], which cannot sign a claim.
+    #[must_use]
+    pub fn spawn_holding_claim_reack(&self) -> HoldingClaimReack {
+        HoldingClaimReack {
+            sweeper: self.engine.spawn_reack_sweeper(),
+        }
+    }
+}
+
+/// The handle [`PersistGroupContentStore::spawn_holding_claim_reack`] returns.
+/// Stop it on shutdown ([`Self::stop`]); dropping it signals the sweeper to
+/// stop without waiting for it.
+pub struct HoldingClaimReack {
+    sweeper: Option<ciris_persist::federation::EvictionSweeper>,
+}
+
+impl HoldingClaimReack {
+    /// Whether a sweeper was started (a local PQC signer is present).
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.sweeper.is_some()
+    }
+
+    /// Stop the sweeper and wait for its task. `true` when one was running
+    /// and its task ended cleanly.
+    pub async fn stop(mut self) -> bool {
+        match self.sweeper.take() {
+            Some(sweeper) => sweeper.stop().await.is_ok(),
+            None => false,
+        }
+    }
+}
+
+impl Drop for HoldingClaimReack {
+    fn drop(&mut self) {
+        if let Some(sweeper) = self.sweeper.take() {
+            // Signal only: the task ends at its next select, and a drop
+            // cannot await it.
+            drop(sweeper.stop());
+        }
+    }
 }
 
 /// Tell the concrete backend behind `backend` which federation key is this
@@ -1194,6 +1247,40 @@ mod tests {
             .await
             .expect("register self");
         twin.node_key_id()
+    }
+
+    /// persist v55.0.0 (#989) — a hybrid store starts the holding-claim
+    /// re-ack sweeper and stops it; a classical-only store (no local signer)
+    /// starts none, since it could not sign a claim.
+    #[tokio::test]
+    async fn the_hybrid_store_runs_the_reack_sweeper_and_stops_it() {
+        let backend = migrated_backend().await;
+        let node = hybrid_signer("node-reack", 7).await;
+        let store = PersistGroupContentStore::from_shared_hybrid(
+            ciris_persist::BackendDispatch::Sqlite(backend.clone()),
+            backend.clone() as Arc<dyn ciris_persist::federation::FederationDirectory>,
+            &node,
+        )
+        .await
+        .expect("hybrid store");
+        let reack = store.spawn_holding_claim_reack();
+        assert!(
+            reack.is_running(),
+            "a hybrid store starts the re-ack sweeper"
+        );
+        assert!(reack.stop().await, "and it stops cleanly");
+
+        let plain = PersistGroupContentStore::from_shared(
+            ciris_persist::BackendDispatch::Sqlite(backend.clone()),
+            backend.clone() as Arc<dyn ciris_persist::federation::FederationDirectory>,
+            node.classical.clone(),
+        );
+        let none = plain.spawn_holding_claim_reack();
+        assert!(
+            !none.is_running(),
+            "no local signer: no sweeper, nothing to sign with"
+        );
+        assert!(!none.stop().await);
     }
 
     /// CIRISEdge#768 — the hybrid sealing constructor tells the SHARED backend
