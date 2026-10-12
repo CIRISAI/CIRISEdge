@@ -13,7 +13,8 @@
 //!   the inert default proposes nothing, and A's A/V dial to B fails with
 //!   `NoRouteToPeer`. This is what item 8 fixes, and the fail-before of W1.
 //! - **W1 + W5** (`a_member_behind_nat_is_reached_over_a_punched_interface`):
-//!   A configured with `T`'s facilitator, B accepting `IdentifiedOnly`. A's A/V
+//!   A configured with `T`'s facilitator, B on the DEFAULT accept (room peers,
+//!   asked per request): B shares the call with A, so B accepts. A's A/V
 //!   dial proposes on the identity link first. Both ends see the upgrade, the
 //!   dial establishes over the punched interface, frames cross, and they still
 //!   cross with `T` stopped. The identity link's Channel limit drops to
@@ -25,6 +26,10 @@
 //!   turned `Off` (the operator override). The proposal fails `Rejected`, the
 //!   dial behaves exactly as with no proposal, and a second dial does NOT
 //!   propose again on the refused link.
+//! - **W6** (`a_peer_outside_our_rooms_is_refused_and_learns_nothing`): B on the
+//!   default accept, but B never joined the call, so A shares no room with B.
+//!   B's host refuses; A's proposal ends `Rejected`; B probed nothing, so A
+//!   learned nothing about B's address.
 //!
 //! Requires the `transport-reticulum` feature:
 //! `cargo test --features transport-reticulum --test direct_links_805`
@@ -403,6 +408,12 @@ fn fresh_joiner_xwing() -> (PeerKexPubkeys, OwnKexKeys) {
 /// installing the call's derived addresses through its own lifecycle. Returns
 /// the spine (holding A's addresses) and B's address as A derives it.
 async fn open_call(p: &Trio) -> (AvSpine, MemberAddress) {
+    open_call_with(p, true).await
+}
+
+/// [`open_call`], with B installing the call (`b_joins`) or not: a B that
+/// never installs it shares no room with A.
+async fn open_call_with(p: &Trio, b_joins: bool) -> (AvSpine, MemberAddress) {
     let stream = StreamId(sha2::Sha256::digest(b"av-stream-805-direct").into());
     let (mut session, _dek0) = AvSession::create(
         stream,
@@ -448,11 +459,13 @@ async fn open_call(p: &Trio) -> (AvSpine, MemberAddress) {
     let publisher = AvPublisher::from_session(stream, session, pub_dek, vec![]).expect("publisher");
     let spine =
         AvSpine::open(scope(), Arc::clone(&p.a.lifecycle), publisher, None).expect("open the call");
-    let snap = av_addressing::snapshot(&sub_session).expect("B's snapshot");
-    let _ =
-        p.b.lifecycle
-            .install(&scope(), &snap)
-            .expect("B installs the call");
+    if b_joins {
+        let snap = av_addressing::snapshot(&sub_session).expect("B's snapshot");
+        let _ =
+            p.b.lifecycle
+                .install(&scope(), &snap)
+                .expect("B installs the call");
+    }
     let group = av_addressing::stream_group_id(stream);
     let b_addr =
         p.a.table
@@ -489,13 +502,6 @@ fn proposer() -> DirectLinksConfig {
     }
 }
 
-fn accepter() -> DirectLinksConfig {
-    DirectLinksConfig {
-        accept: DirectAccept::IdentifiedOnly,
-        ..DirectLinksConfig::default()
-    }
-}
-
 /// **W4** — the inert default: no proposal anywhere, and a call member behind
 /// `T` cannot be reached on its derived address. This is the gap item 8
 /// closes; W1 is the same dial with a facilitator configured.
@@ -528,7 +534,8 @@ async fn the_default_never_proposes_and_a_member_behind_t_is_unreachable() {
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
-    let mut p = trio("w1", proposer(), accepter()).await;
+    // B on the default: accept room peers, asked per request.
+    let mut p = trio("w1", proposer(), DirectLinksConfig::default()).await;
     assert!(!p.facilitator.is_empty());
     let (_spine, b_addr) = open_call(&p).await;
     let mut arrivals = p.b.transport.take_av_arrivals().expect("B's arrivals");
@@ -568,6 +575,12 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
             if peer.as_deref() == Some(p.a.key.key_id.as_str())),
         "B accepted, attributed to A: {b_up:?}"
     );
+    assert_eq!(
+        dl(&p.b.metrics, "direct_link_request_accepted"),
+        1,
+        "B's host was asked and said yes: A is in B's call"
+    );
+    assert!(p.b.transport.should_accept_direct(&p.a.key.key_id));
     assert!(matches!(
         p.a.transport.direct_path_state(&p.b.key.key_id),
         Some(DirectPathState::Direct { .. })
@@ -662,4 +675,43 @@ async fn a_refused_upgrade_leaves_the_dial_as_it_was() {
         p.a.metrics.direct_link()
     );
     assert_eq!(dl(&p.a.metrics, "direct_link_skipped_backoff"), 1);
+}
+
+/// **W6** — a peer this node shares no room with is refused, and learns
+/// nothing. A has B in its call; B never joined it, so to B, A is an
+/// identified peer outside every room it holds. B's host refuses: A's
+/// proposal ends `Rejected` (a REJECT B sent without probing, so no reflexive
+/// address of B's was learned or sent), and B never moves anything direct.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_outside_our_rooms_is_refused_and_learns_nothing() {
+    let mut p = trio("w6", proposer(), DirectLinksConfig::default()).await;
+    let (_spine, b_addr) = open_call_with(&p, false).await;
+    assert!(!p.b.transport.should_accept_direct(&p.a.key.key_id));
+    let _ = p.a.transport.open_av_link(&p.b.key.key_id, &b_addr).await;
+
+    let asked = next_event(&mut p.b.events, Duration::from_secs(10), |e| {
+        matches!(e, DirectPathEvent::Requested { .. })
+    })
+    .await
+    .expect("B's host was asked");
+    assert!(
+        matches!(&asked, DirectPathEvent::Requested { accepted: false, peer, .. }
+            if peer.as_deref() == Some(p.a.key.key_id.as_str())),
+        "attributed to A, refused: {asked:?}"
+    );
+    let failed = next_event(&mut p.a.events, Duration::from_secs(10), |e| {
+        matches!(e, DirectPathEvent::Failed { .. })
+    })
+    .await
+    .expect("A's Failed");
+    assert!(
+        matches!(&failed, DirectPathEvent::Failed { reason, .. }
+            if *reason == "direct_link_failed_rejected"),
+        "{failed:?}"
+    );
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_refused"), 1);
+    assert_eq!(dl(&p.b.metrics, "direct_link_request_accepted"), 0);
+    assert_eq!(dl(&p.b.metrics, "direct_link_established"), 0);
+    assert_eq!(p.b.transport.direct_path_state(&p.a.key.key_id), None);
+    assert_eq!(p.b.metrics.direct_links_active(), 0);
 }

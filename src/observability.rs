@@ -889,6 +889,11 @@ pub const DIRECT_LINK_SKIPPED_NEIGHBOUR: &str = "direct_link_skipped_neighbour";
 pub const DIRECT_LINK_SKIPPED_BACKOFF: &str = "direct_link_skipped_backoff";
 /// No proposal: no identity link to the member could be had.
 pub const DIRECT_LINK_SKIPPED_NO_LINK: &str = "direct_link_skipped_no_link";
+/// A peer's direct-link request, accepted: it shares a room with this node.
+pub const DIRECT_LINK_REQUEST_ACCEPTED: &str = "direct_link_request_accepted";
+/// A peer's direct-link request, refused: not a room peer, unattributed, or
+/// accepting turned off. Nothing about this node's address was sent.
+pub const DIRECT_LINK_REQUEST_REFUSED: &str = "direct_link_request_refused";
 /// A link moved onto a punched interface (either side).
 pub const DIRECT_LINK_ESTABLISHED: &str = "direct_link_established";
 /// The peer refused the upgrade.
