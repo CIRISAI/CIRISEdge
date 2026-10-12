@@ -18,7 +18,9 @@
 //!   dial establishes over the punched interface, frames cross, and they still
 //!   cross with `T` stopped. The identity link's Channel limit drops to
 //!   1400-MTU size on the move (leviculum lowers the MTU and never raises it);
-//!   the event carries both limits, which item 5's `BudgetChanged` reads.
+//!   the event carries both limits, which item 5's `BudgetChanged` reads. The
+//!   A/V leg itself is born on the punched interface at the base MTU 500
+//!   (Channel 425).
 //! - **W3** (`a_refused_upgrade_leaves_the_dial_as_it_was`): B at the default
 //!   `Reject`. The proposal fails `Rejected`, the dial behaves exactly as with
 //!   no proposal, and a second dial does NOT propose again on the refused link.
@@ -591,10 +593,10 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
         "the move lowered the limit: {before} -> {after}"
     );
     let av_limit = link.sender.channel_limit().expect("the A/V link is held");
-    assert!(
-        av_limit <= after,
-        "an A/V leg born on the punched interface carries no more than it: {av_limit}"
-    );
+    // The A/V leg is BORN on the punched interface, which signals no hardware
+    // MTU, so it negotiates the base 500: Channel 425 (link MDU 431 less the
+    // 6-byte envelope), an A/V chunk budget of 341 (#720; 321 after #846).
+    assert_eq!(av_limit, 425, "the A/V leg runs at the base MTU");
 
     // Frames cross the A/V leg, then still cross with T gone.
     link.sender.send(b"direct-805-1").await.expect("send 1");

@@ -5249,6 +5249,11 @@ impl ReticulumTransport {
         if !self.direct_paths.config.proposes() {
             return DirectPath::NotConfigured;
         }
+        // ONE deadline over the identity-link dial, the proposal and its
+        // outcome: the A/V dial never waits on a direct path past the budget,
+        // and on any timeout today's path is exactly as it was.
+        let deadline = std::time::Instant::now() + DIRECT_PATH_BUDGET;
+        let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
         let count = |label: &'static str| {
             if let Some(m) = self.metrics.get() {
                 m.inc_direct_link(label);
@@ -5277,15 +5282,23 @@ impl ReticulumTransport {
             count(crate::observability::DIRECT_LINK_SKIPPED_NEIGHBOUR);
             return DirectPath::AlreadyNeighbour;
         }
-        let link = match self.identity_lane(destination_key_id, &candidates).await {
-            Ok(claim) => {
+        // The dial behind `identity_lane` is a detached task: a timeout here
+        // abandons the wait, not the link.
+        let lane = with_timeout(
+            remaining(),
+            self.identity_lane(destination_key_id, &candidates),
+        )
+        .await;
+        let link = match lane {
+            None => return DirectPath::Unavailable { reason: "pending" },
+            Some(Ok(claim)) => {
                 let link = claim.link_id();
                 // Proposing sends two channel signals, not a resource: the lane
                 // goes back to the pool for sends at once.
                 claim.release().await;
                 link
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 count(crate::observability::DIRECT_LINK_SKIPPED_NO_LINK);
                 tracing::debug!(
                     key_id = %destination_key_id,
@@ -5299,7 +5312,7 @@ impl ReticulumTransport {
             Ok(waiting) => waiting,
             Err(done) => return done,
         };
-        match with_timeout(DIRECT_PATH_BUDGET, rx).await {
+        match with_timeout(remaining(), rx).await {
             Some(Ok(DirectOutcome::Established { interface })) => DirectPath::Direct {
                 interface,
                 guard: self.direct_paths.anchor(link),
@@ -5378,7 +5391,7 @@ impl ReticulumTransport {
                 let before = link_channel_message_limit(&self.node, &link);
                 self.direct_paths
                     .tracker()
-                    .proposed(destination_key_id, link, before);
+                    .proposed(destination_key_id, link, before, now);
                 if let Err(e) = self.node.propose_direct_link(&link).await {
                     self.direct_paths.forget(link);
                     self.direct_paths
