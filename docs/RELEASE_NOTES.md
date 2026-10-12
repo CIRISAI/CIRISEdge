@@ -47,6 +47,13 @@ landing.
   **Merge note for #820 (local/820-p1c):** the catalogue completeness gate needs a spec for this
   family — a counter with a closed `outcome` label drawn from an enum of the five tags above.
 
+**Follow-ups (not in this cut).**
+- persist v55's I52 allows an in-cohort `Announce` for a self/family adopt; edge still keeps those
+  adopts `LocalOnly` and files the holding claim itself after the pull (`BlobPuller::report_here`,
+  `put_custody_ack` at the row's scope). Same claim, same scope; adopting the allowance is a
+  separate decision.
+- `durability_custody` needs its catalogue spec when this branch meets #820 (above).
+
 # v40.1.0 — leviculum v0.29: known-destinations backpressure, off-lock resource assembly, and the two pressure signals in the metrics snapshot
 
 **2026-10-05.** **MINOR** from v40.0.3. Persist v53.1.4 and verify v19.0.0 unchanged; no wire change. Additive API:
