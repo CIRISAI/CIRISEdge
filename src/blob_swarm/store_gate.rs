@@ -20,8 +20,9 @@
 //! - **Storing IS announcing.** persist's `put_blob` files this node's
 //!   holding claim as it stores (since v55 a `custody:ack:v1` `here` row at
 //!   the content's scope; the `holds_bytes:sha256:*` carrier before), and
-//!   `list_holders` is how the swarm finds you. You cannot quietly hold federation-tier content. That
-//!   is why this gate returns a *trichotomy* rather than a boolean — persist's
+//!   `list_holders` is how the swarm finds you. You cannot quietly hold
+//!   federation-tier content. That is why this gate returns a *trichotomy*
+//!   rather than a boolean — persist's
 //!   two write doors make "store and announce" and "store silently" genuinely
 //!   different consents.
 //! - **The fountain swarm pushes.** On a pull, consent is implicit in the

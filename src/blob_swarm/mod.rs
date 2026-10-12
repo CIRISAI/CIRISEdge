@@ -330,8 +330,9 @@ pub trait BlobChunkVerifier: Send + Sync {
     ///
     /// An implementation MUST honour it. Ignoring it and always announcing
     /// defeats `self`/`family` invisibility — edge keeps those adopts local
-    /// and files their claim inside the cohort after the pull — and overrides an operator who agreed to
-    /// hold a class but not to advertise holding it.
+    /// and files their claim inside the cohort after the pull — and
+    /// overrides an operator who agreed to hold a class but not to advertise
+    /// holding it.
     fn verify_and_store(
         &self,
         blob_sha256: [u8; 32],

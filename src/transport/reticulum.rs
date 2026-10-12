@@ -1076,8 +1076,9 @@ pub trait PeerResolver: Send + Sync + 'static {
     }
 
     /// TTL-aware companion to [`Self::resolve_holders`] — returns each
-    /// candidate holder with the `signed_at` of its holding claim, so the caller (edge's content-fetch dispatcher) can
-    /// apply the §10.1.2 24h TTL filter centrally without each
+    /// candidate holder with the `signed_at` of its holding claim, so the
+    /// caller (edge's content-fetch dispatcher) can apply the §10.1.2 24h TTL
+    /// filter centrally without each
     /// impl re-rolling the staleness logic.
     ///
     /// Default impl returns the [`Self::resolve_holders`] result
