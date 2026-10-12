@@ -405,40 +405,9 @@ async fn push(bridge: &Arc<FederationDirectoryReplicationBridge>, rows: &[Vec<u8
         .await;
 }
 
-/// A `tracing` writer into a shared buffer, for the witness that counts lines.
-#[derive(Clone, Default)]
-struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("capture").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-    type Writer = Self;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
+use crate::test_log_capture::Captured;
 
 impl Captured {
-    fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
-        tracing_subscriber::fmt()
-            .with_writer(self.clone())
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .finish()
-    }
-
-    fn text(&self) -> String {
-        String::from_utf8(self.0.lock().expect("capture").clone()).expect("utf8")
-    }
-
     /// Lines at `level` containing `needle` whose `signer` FIELD is `signer`
     /// (a reason's prose may name other keys; the field is the throttle key).
     fn lines(&self, level: &str, needle: &str, signer: &str) -> usize {
@@ -522,7 +491,7 @@ async fn one_refusal_warn_and_one_park_line_per_signer_858() {
     let h = w.hashes();
     let captured = Captured::default();
     {
-        let _guard = tracing::subscriber::set_default(captured.subscriber());
+        let _guard = tracing::subscriber::set_default(captured.info_subscriber());
         round(&bridge, &w.rows).await;
         for _ in 3..=10 {
             let want = round(&bridge, &w.rows).await;
@@ -714,7 +683,7 @@ async fn a_restart_refuses_each_row_once_and_re_parks_it_858() {
     let restarted = w.bridge(None);
     let captured = Captured::default();
     {
-        let _guard = tracing::subscriber::set_default(captured.subscriber());
+        let _guard = tracing::subscriber::set_default(captured.info_subscriber());
         for _ in 0..3 {
             round(&restarted, &w.rows).await;
         }

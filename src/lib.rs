@@ -119,6 +119,9 @@ pub mod observability;
 pub mod outbound;
 pub mod reachability;
 pub mod telemetry_catalog;
+// CIRISEdge#858 — the shared, race-free log capture for `src/` tests.
+#[cfg(test)]
+mod test_log_capture;
 // CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files.
 pub mod receipts;
 pub mod replication;

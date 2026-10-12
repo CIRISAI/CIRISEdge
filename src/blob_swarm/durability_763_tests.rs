@@ -783,27 +783,7 @@ async fn a_withdrawn_file_reads_withdrawn_and_is_not_repaired_763() {
     assert!(!sweep.reported_here.contains(&file.sha));
 }
 
-/// A `tracing` writer into a shared buffer, for a witness that names a log
-/// line.
-#[derive(Clone, Default)]
-struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("capture").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-    type Writer = Self;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
+use crate::test_log_capture::Captured;
 
 /// **A withdrawn self file is refused to peers by the device that reported
 /// holding it.** B pulled the file and filed its custody `here`, a row that
@@ -889,13 +869,8 @@ async fn a_withdrawn_file_is_refused_to_peers_despite_this_devices_custody_repor
     let source = super::PersistBlobChunkSource::new(node_b.store.engine().clone())
         .with_revocations(Some(std::sync::Arc::clone(&register)));
     let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_max_level(tracing::Level::INFO)
-        .with_ansi(false)
-        .finish();
     let refused = {
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let _guard = tracing::subscriber::set_default(captured.info_subscriber());
         source
             .read_chunk(file.sha, file.stream[0].2, &node_a.me)
             .await
@@ -905,7 +880,7 @@ async fn a_withdrawn_file_is_refused_to_peers_despite_this_devices_custody_repor
         Err(ChunkSourceRefusal::Withdrawn),
         "B refuses the withdrawn file's chunk to a peer"
     );
-    let logged = String::from_utf8(captured.0.lock().expect("capture").clone()).expect("utf8");
+    let logged = captured.text();
     assert!(
         logged.contains("INFO") && logged.contains("refusing Withdrawn"),
         "the refusal is logged at INFO: {logged:?}"
