@@ -263,9 +263,13 @@ subscribe_direct_path_events, direct_path_state, direct_link_interface, fall_bac
   the only party that learns this node's address is someone it shares a room with
   (`ReticulumTransport::should_accept_direct`). `DirectAccept::Off` is the operator override.
   `DirectAccept::IdentifiedOnly` (leviculum's node-wide policy, which discloses the address to ANY
-  identified link peer) exists for tests and an explicit operator choice only. Until the
-  host-decided accept (leviculum#82) is pinned, `RoomPeers` maps to leviculum's REJECT, so nothing
-  ships with node-wide exposure.
+  identified link peer) exists for tests and an explicit operator choice only. `RoomPeers` rides
+  leviculum's host-decided accept (`AskHost`, leviculum#82): each request is held, nothing probed
+  or sent, until edge answers by the room rule; an unattributed link is refused.
+- **leviculum pinned by rev** `a1d75799` (CIRISAI/leviculum `ciris/82-83-direct-host`, on
+  v0.30.0+ciris.1): adds #82 (`AskHost`, `DirectLinkRequested`, `accept_direct_link` /
+  `reject_direct_link`) and #83 (`retire_direct_link`). Additive; a tag pin at the fork's next
+  release.
 - **MTU.** leviculum lowers a link moved onto a punched interface to MTU 1400 (Channel 1321) and
   never raises it; `DirectPathEvent::Established` carries the Channel limit before and after, which
   item 5's `CallEvent::BudgetChanged` reads (#720).
@@ -273,10 +277,11 @@ subscribe_direct_path_events, direct_path_state, direct_link_interface, fall_bac
   `direct_link.<label>`, the PyO3 `metrics_snapshot()` dict): `direct_link_proposed`,
   `_propose_refused`, `_skipped_neighbour`, `_skipped_backoff`, `_skipped_no_link`, `_established`,
   `_failed_rejected`, `_failed_probe`, `_failed_timeout`, `_failed_punch`, `_lost`,
-  `_leg_fell_back`; and the gauge `direct_links_active` (UniFFI `direct_link.active`).
+  `_leg_fell_back`, `_request_accepted`, `_request_refused`; and the gauge `direct_links_active`
+  (UniFFI `direct_link.active`).
   **Merge note for #820 (local/820-p1c):** the catalogue completeness gate needs specs for this
-  family — a counter with a closed `outcome` label drawn from an enum of the twelve tags above, and
-  a gauge with no labels.
+  family — a counter with a closed `outcome` label drawn from an enum of the fourteen tags above,
+  and a gauge with no labels.
 
 # v40.1.0 — leviculum v0.29: known-destinations backpressure, off-lock resource assembly, and the two pressure signals in the metrics snapshot
 

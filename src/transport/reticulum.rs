@@ -5428,19 +5428,15 @@ impl ReticulumTransport {
     ///
     /// Accepting discloses this node's public address to the peer, so the
     /// only party that may learn it is someone this node shares a room with.
-    /// TODO(leviculum#82): leviculum asks edge per request (AskHost); until
-    /// then `RoomPeers` maps to leviculum's REJECT and this is not consulted.
+    /// The event loop answers leviculum's `DirectLinkRequested` by the same
+    /// rule ([`crate::transport::direct_path::accepts_direct`]).
     #[must_use]
     pub fn should_accept_direct(&self, peer_key_id: &str) -> bool {
-        use crate::transport::direct_path::DirectAccept;
-        match self.direct_paths.config.accept {
-            DirectAccept::Off => false,
-            DirectAccept::IdentifiedOnly => true,
-            DirectAccept::RoomPeers => self
-                .scope_addresses
-                .get()
-                .is_some_and(|table| table.shares_group_with(peer_key_id)),
-        }
+        let shares_room = self
+            .scope_addresses
+            .get()
+            .is_some_and(|table| table.shares_group_with(peer_key_id));
+        crate::transport::direct_path::accepts_direct(self.direct_paths.config.accept, shares_room)
     }
 
     /// CIRISEdge#805 item 8 — every direct-path event this node sees (either
@@ -11651,6 +11647,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             interface_index,
             proposed,
         } => direct_link_established(ctx, link_id, interface_index, proposed).await,
+        NodeEvent::DirectLinkRequested { link_id, .. } => {
+            direct_link_requested(ctx, link_id).await;
+        }
         NodeEvent::DirectLinkFailed {
             link_id,
             failure,
@@ -11712,6 +11711,78 @@ async fn direct_link_established(
             channel_limit_after: after,
         },
     );
+}
+
+/// CIRISEdge#805 item 8 — a peer asked to take a link direct (leviculum#82
+/// `AskHost`; this node's default `DirectAccept::RoomPeers`). leviculum holds
+/// the request, having probed and sent nothing; edge answers by
+/// [`crate::transport::direct_path::accepts_direct`]: accept iff the link's
+/// peer shares a room with this node. An unattributed link is refused.
+///
+/// The answer is SPAWNED: it hands leviculum an action, and the event loop
+/// must never wait on the action channel it is itself draining.
+async fn direct_link_requested(ctx: &EventCtx<'_>, link_id: LinkId) {
+    // The peer the link belongs to: one that dialled and identified to us,
+    // else one we dialled (by the destination we dialled).
+    let mut peer = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    if peer.is_none() {
+        let dialed = ctx.dialed_link_dest.lock().await.get(&link_id).copied();
+        if let Some(dest) = dialed {
+            peer = ctx
+                .peers
+                .lock()
+                .await
+                .iter()
+                .find(|(_, p)| p.peer.dest_hash == dest)
+                .map(|(key_id, _)| key_id.clone());
+        }
+    }
+    let shares_room = peer.as_deref().is_some_and(|p| {
+        ctx.scope_addresses
+            .get()
+            .is_some_and(|table| table.shares_group_with(p))
+    });
+    let accepted = peer.is_some()
+        && crate::transport::direct_path::accepts_direct(
+            ctx.direct_paths.config.accept,
+            shares_room,
+        );
+    if let Some(m) = ctx.metrics {
+        m.inc_direct_link(if accepted {
+            crate::observability::DIRECT_LINK_REQUEST_ACCEPTED
+        } else {
+            crate::observability::DIRECT_LINK_REQUEST_REFUSED
+        });
+    }
+    tracing::info!(
+        link = %hex::encode(link_id.as_bytes()),
+        peer = peer.as_deref().unwrap_or("<unattributed>"),
+        shares_room,
+        accepted,
+        "direct link REQUESTED by a peer (CIRISEdge#805 item 8)"
+    );
+    ctx.direct_paths
+        .emit(crate::transport::direct_path::DirectPathEvent::Requested {
+            peer,
+            link_id: link_id.into_bytes(),
+            accepted,
+        });
+    let node = Arc::clone(ctx.av_node);
+    tokio::spawn(async move {
+        let answer = if accepted {
+            node.accept_direct_link(&link_id).await
+        } else {
+            node.reject_direct_link(&link_id).await
+        };
+        if let Err(e) = answer {
+            tracing::debug!(
+                link = %hex::encode(link_id.as_bytes()),
+                accepted,
+                error = %e,
+                "direct link: the answer found no request (timed out or the link closed)"
+            );
+        }
+    });
 }
 
 /// CIRISEdge#805 item 8 — a proposal ended without a direct path; the link is
