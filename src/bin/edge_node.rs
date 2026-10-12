@@ -4560,6 +4560,9 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
         .as_bytes();
     let mut epoch = group.epoch().await;
     let (mut dek_bytes, mut transit) = epoch_keys(&record, &stream_id, epoch)?;
+    // CIRISEdge#846 — the chunk seq is the STREAM counter, epoch-local (CC
+    // 5.3.3.2.5): it restarts where each epoch began.
+    let mut epoch_start_seq = 0usize;
 
     let mut send_lat: Vec<u128> = Vec::new();
     let mut rotation: Option<serde_json::Value> = None;
@@ -4662,6 +4665,7 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                 .map_err(|e| format!("record_secret after advance: {e}"))?
                 .as_bytes();
             epoch = new_epoch;
+            epoch_start_seq = seq;
             let keys = epoch_keys(&record, &stream_id, epoch)?;
             dek_bytes = keys.0;
             transit = keys.1;
@@ -4711,7 +4715,7 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
             &dek,
             stream_id,
             Epoch(epoch),
-            ChunkSeq(seq as u64),
+            ChunkSeq((seq - epoch_start_seq) as u64),
             CODEC_OPAQUE,
             ChunkLayer::BASE,
         )

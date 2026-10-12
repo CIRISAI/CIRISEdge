@@ -160,9 +160,10 @@ pub struct AvPublisher {
     /// Current epoch's MLS-derived DEK. Replaced on rekey.
     dek: EpochDek,
     dispatcher: AvDispatcher,
-    /// Monotonic chunk sequence across the publisher's life. The inner
-    /// nonce binds `(stream, epoch, chunk_seq)`, so this need not reset
-    /// on an epoch bump — a fresh epoch already re-domains the nonce.
+    /// CIRISEdge#846 — the next chunk's EPOCH-LOCAL index: the CC 5.3.3.1
+    /// STREAM nonce counter, which CC 5.3.3.2.5 makes the header's
+    /// `chunk_seq`. Reset to 0 at every epoch roll; the seal refuses it past
+    /// `u32::MAX` (the epoch must roll first).
     next_chunk_seq: u64,
 }
 
@@ -325,7 +326,7 @@ impl AvPublisher {
             codec_id,
             layer,
         )?;
-        self.next_chunk_seq = self.next_chunk_seq.wrapping_add(1);
+        self.next_chunk_seq += 1;
         // Per frame, so DEBUG: on the live node this fires at frame
         // cadence beside replication's log stream (CIRISEdge#460).
         tracing::debug!(
@@ -430,6 +431,8 @@ impl AvPublisher {
         // copy.
         self.dek = EpochDek::from_bytes(*artifacts.new_dek.as_bytes());
         self.epoch = artifacts.new_epoch;
+        // CIRISEdge#846 — the STREAM counter is epoch-local (CC 5.3.3.2.5).
+        self.next_chunk_seq = 0;
         tracing::info!(
             stream = %stream_tag(self.stream_id),
             peer = %key_id,
@@ -455,6 +458,8 @@ impl AvPublisher {
         let artifacts = self.session.advance_epoch(delta)?;
         self.dek = EpochDek::from_bytes(*artifacts.new_dek.as_bytes());
         self.epoch = artifacts.new_epoch;
+        // CIRISEdge#846 — the STREAM counter is epoch-local (CC 5.3.3.2.5).
+        self.next_chunk_seq = 0;
         tracing::info!(
             stream = %stream_tag(self.stream_id),
             epoch = self.epoch.0,
