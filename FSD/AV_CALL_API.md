@@ -3,7 +3,9 @@
 **Status:** DESIGN. Written ahead of items 1–3 so the program keeps moving; it must not LAND
 before them (#846 one seal, CIRISPersist#981 one DEK, #805 item 3 live-into-the-DAG). Every type
 named below exists on `local/805-1-one-seal` unless it is marked **new**. Open questions for
-persist, verify and the CC are in §10; nothing there is guessed in the body.
+persist, verify and the CC are in §10; nothing there is guessed in the body. The CC answered
+C1–C5 and V1 on 2026-10-12; the one proposed deviation still open (a DEK per stream rather than
+per epoch) is CIRISConstitution#169.
 
 **Inputs:** `CIRISEdge#805` (items 5–6), `docs/AV_ALM_DESIGN.md`, `FSD/CONTENT_TRANSFER.md`,
 the spine (`src/transport/av_spine.rs`, #813), the room (`src/chat.rs`, `src/mls/cohort_group.rs`),
@@ -39,10 +41,12 @@ over `CohortGroup::record_secret`, but with a bench-only HKDF label; §10 V1.)
 
 - **A call is a set of streams in one room.** CC streams have a single sender
   (`register_stream_epoch_dek`: "the writer is this Engine's signer (the stream's single sender)"),
-  so each participant that publishes owns ONE stream of the call. `CallId` (**new**) names the
-  call; each publisher's `StreamId` is derived from it (§3.1).
+  so each participant that publishes owns ONE stream of the call. **The CC has no call object:**
+  a call is the room's set of live streams. `CallId` (**new**) is an API handle only (§3.1), never
+  on the wire as a row of its own and never key input.
 - **The room is the control plane.** The call's admission is the room's membership; the call's
-  key epochs are the room's MLS epochs; its signalling is room rows (§7).
+  key epochs are the room's MLS epochs; its signalling is the room's EXISTING membership rows, with
+  no new wire (§7).
 - **Live and stored differ only by subscriber offset** (#805): the live chunk IS the stored chunk
   (#846); a kept call's chunks are written into the stream asynchronously (item 3).
 
@@ -50,11 +54,13 @@ over `CohortGroup::record_secret`, but with a bench-only HKDF label; §10 V1.)
 
 ### 3.1 Identifiers
 
-- `CallId([u8; 32])` (**new**) = the content hash of the call's genesis row (the ring row, §7),
-  so a call is named by a signed room row and two members never disagree about it.
+- `CallId([u8; 32])` (**new**, `transport::av_call_key::CallId`) is a signalling and API handle:
+  `SHA-256("ciris-edge:call:v1" ‖ utf8(community_key_id))` of the room the call lives in (an
+  ad-hoc call's room is its ephemeral community, §7). There is no call row to hash (C3), so a room
+  has at most one call: its live streams. `CallId` is never key input (§3.2).
 - Per-publisher `StreamId` = `SHA-256("ciris-edge:call-stream:v2" ‖ utf8(room community_key_id)
   ‖ utf8(publisher NODE key_id) ‖ join_nonce)`, where `join_nonce` is 32 bytes from the OS CSPRNG,
-  minted on every `open_call` / `join_call` and never persisted. The stream's writer is a NODE key
+  minted on every `join_call` / `ring` and never persisted. The stream's writer is a NODE key
   (persist, P5): one person publishing from two devices is two streams. The persist label is
   `realtime_av::stream_label(stream_id)` (lowercase hex); a kept stream's persist stream is named by
   that hex.
@@ -73,14 +79,31 @@ over `CohortGroup::record_secret`, but with a bench-only HKDF label; §10 V1.)
 
 - Opening a call opens the room's group: `CohortGroups::open(community_key_id)` → `CohortGroup`.
   No `AvSession::create` for a room call.
-- **The call DEK for `(stream, room epoch)`** is an MLS exporter secret of the ROOM group under an
-  A/V label with the stream bound in the exporter context. The label and context are verify's
-  (`cohort_group.rs`: labels are a cross-impl wire fact, owned by CIRISVerify); §10 V1. Until verify
-  rules, nothing here derives a DEK.
-- **The call's epoch is the room's MLS epoch** (`CohortGroup::epoch`). A call never commits on its
-  own: an epoch moves only on a room commit — `CohortGroup::add_member*` / `remove_member*` /
-  `rotate*` — and every live call in the room rolls with it (new DEK; `chunk_seq` back to 0 per
-  #846 part 1; the old epoch's terminator sealed with `seal_av_terminator`).
+- **The DEK for `(stream, room epoch)`** is `transport::av_call_key::stream_epoch_dek(room_group,
+  stream_id, epoch)` (CIRISEdge `local/805-5-call-key`):
+
+  ```text
+  seed = MLS-Exporter(L, context = EMPTY, 32)                    (the ROOM group)
+  dek  = HKDF-SHA256(ikm = seed, salt = EMPTY, info = L ‖ stream_id_utf8 ‖ u64_be(epoch))
+  ```
+
+  `stream_id_utf8` is `stream_label(stream_id)` (64 lowercase hex chars); no length prefixes. The
+  exporter context stays EMPTY, as verify requires; the stream is bound by the KDF step after it.
+  `CallId` is not an input. A DEK is derived only at the room group's CURRENT epoch
+  (`StreamKeyError::EpochNotCurrent` otherwise).
+- **This is a PROPOSED deviation, awaiting CIRISConstitution#169.** The CC pins no A/V label and,
+  by design, shares ONE DEK per epoch across the call. Because keep is per STREAM (C1), one DEK
+  per epoch would let a `key_grant` for a kept publisher's stream open an unkept publisher's stream
+  in the same epoch. That is #169's first item, and the per-stream binding above is its candidate.
+  `L` is the PLACEHOLDER `STREAM_DEK_LABEL_PENDING` (`"ciris-stream-dek/pending-v1"`). It is not a
+  final label; verify's replaces it when #169 is ruled (KATs on CIRISVerify#308). If #169 keeps one
+  DEK per epoch, `stream_epoch_dek` becomes a plain exporter call; it is the one place that changes.
+- **The call's epoch is the room's MLS epoch** (`CohortGroup::epoch`, C2), with no call sub-epoch.
+  A call never commits on its own: an epoch moves only on a room commit. **Every Add and every
+  Remove rotates** (`CohortGroup::add_member*` / `remove_member*`): an Add rotates the DEK too, and
+  the CC table that says otherwise is an erratum. At the cap, ANY member may commit an Update
+  (`rotate*`). Every live stream in the room rolls with the commit: a new DEK, `chunk_seq` back to
+  0 (#846 part 1), and the old epoch's terminator sealed with `seal_av_terminator`.
 - **Addressing**: `AvSpine::open` installs addresses from the session's `destination_secret`. For a
   room call that secret is the room group's (`CohortGroup::destination_secret`), so the spine's
   `ScopeLifecycle` and the room's installed addresses (`mls::boot::readdress_persisted_rooms`) are
@@ -104,15 +127,18 @@ over `CohortGroup::record_secret`, but with a bench-only HKDF label; §10 V1.)
 ## 4. The Rust surface (**new** unless named)
 
 ```rust
-/// Open a call in `room` and start publishing this node's stream in it.
-Edge::open_call(&self, room: &str /* community_key_id */, opts: CallOptions) -> Result<Call, CallError>;
-/// Join a call that a ring row (§7) named.
-Edge::join_call(&self, room: &str, call: CallId, opts: CallOptions) -> Result<Call, CallError>;
+/// Start publishing this node's stream in `room`'s call (an in-room call needs no ring, §7).
+/// Opening and joining are one verb: the room's call is its live streams.
+Edge::join_call(&self, room: &str /* community_key_id */, opts: CallOptions) -> Result<Call, CallError>;
+/// An ad-hoc call: mint an ephemeral community with a short `valid_until` and ring each invitee
+/// with `membership:proposal:v1` (§7). This node joins it like any room.
+Edge::ring(&self, invitees: &[&str], valid_until: Timestamp, opts: CallOptions) -> Result<Call, CallError>;
 
 pub struct CallOptions {
-    /// Item 2's `transport::av_keep::AvKeep` — `Unkept` (default) | `Kept`. Caller-supplied until
-    /// CIRISPersist#1068 ships the row-borne keep decision (`history_on_join` / recorded); then
-    /// `open_call` reads it from the room and this field goes.
+    /// Item 2's `transport::av_keep::AvKeep` — `Unkept` (default) | `Kept`, for THIS node's stream
+    /// only (C1: keep is per stream, set by its producer). Caller-supplied until
+    /// CIRISPersist#1068 ships the row-borne decision (the producer's `history_on_join` on its
+    /// stream's genesis); then it is read from that row and this field goes.
     pub keep: AvKeep,
     pub relay: bool,                       // this node relays for others (AvSpine::open relay_node)
     pub default_policy: ReceiverLayerPolicy,
@@ -132,7 +158,8 @@ impl Call {
     pub fn frames(&mut self) -> FrameStream;                       // impl Stream<Item = ReceivedFrame>
     /// Per-subscriber layer policy (AvSpine::subscribe(.., policy, ..)).
     pub fn set_layer_policy(&mut self, subscriber: &str, policy: ReceiverLayerPolicy) -> Result<(), CallError>;
-    /// Hang up: final terminator, final STH, the hang-up row (§7).
+    /// Hang up: final terminator and final in-band STH; for an ad-hoc call, the forward-only
+    /// withdraw (§7).
     pub async fn leave(self) -> Result<CallSummary, CallError>;
     pub fn state(&self) -> CallState;                              // Live | Degraded(StrandedEpoch) | Ended(EndCause)
     /// Typed call events (§5, §8): `KeepRefused`, `EpochRolled`, `MemberJoined/Left`, `Stranded`.
@@ -154,18 +181,21 @@ publisher's direct links, `LegOutcome` per leg); `frames` reads the A/V sink's a
 `AvSubscriber` / `open_av_chunk`; `set_layer_policy` is `AvSpine::subscribe` with the policy. The
 spine's `seal_deadline()` is the one timer an idle call's host loop waits on (unchanged).
 
-**PyO3 twin** (`ciris_edge.PyEdge`): `open_call(room, keep="unkept", relay=False)`,
-`join_call(room, call_id, ...)` → `PyCall` with `id()`, `epoch()`, `chunk_plaintext_budget()`,
+**PyO3 twin** (`ciris_edge.PyEdge`): `join_call(room, keep="unkept", relay=False)`,
+`ring(invitees, valid_until, ...)` → `PyCall` with `id()`, `epoch()`, `chunk_plaintext_budget()`,
 `publish(bytes, codec_id=CODEC_OPAQUE, layer=(0,0,0))`, `frames()` (an async iterator on the
 edge-owned executor, the `run_async` pattern), `set_layer_policy(subscriber, (s,t,q))`, `leave()`,
 `state()`, `events()` (an async iterator). Every Rust verb has a Python twin; the PyO3 parity test
 walks the list.
 
-## 5. Keys — unkept vs kept (CC 5.1, ruled 2026-10-12)
+## 5. Keys — unkept vs kept, per STREAM (CC 5.1, ruled 2026-10-12; C1)
 
-| | Unkept call (default) | Kept call (`Recorded` / `HistoryOnJoinFull`) |
+Keep is a property of a STREAM, set by its producer, not of the call: one participant's stream can
+be kept while another's in the same call is not.
+
+| | Unkept stream (default) | Kept stream (`Recorded` / `HistoryOnJoinFull`) |
 |---|---|---|
-| DEK | room MLS exporter (§3.2), in memory, zeroized at the roll | the same exporter secret |
+| DEK | `stream_epoch_dek` (§3.2), in memory, zeroized at the roll | the same DEK |
 | persist DEK door | **never touched** | `register_stream_epoch_dek(cohort_scope, room, stream_label, epoch, &dek, …, None)` once per epoch, BEFORE that epoch's first chunk |
 | key grants | none (forward secrecy: an unkept call wraps to nobody) | persist wraps to the stream's audience, `key_grant:stream:v1` |
 | seal | `seal_av_inner` (persist's pure seal, #846) | the same bytes |
@@ -198,13 +228,16 @@ walks the list.
   `keep` argument). It closes the open epoch with that terminator (persist-side); the live
   side seals the same terminator with `seal_av_terminator` (counter = the epoch's chunk count, last
   set, #846).
-- **Where the keep decision comes from:** the caller (`CallOptions::keep`) until CIRISPersist#1068
-  ships the row-borne decision (`history_on_join` / recorded, v55.1 or v56); then the room's row.
-  Who may set it is still §10 C1.
+- **Where the keep decision comes from (C1):** the PRODUCER of each stream, through its own
+  `history_on_join` on the stream's genesis. Until CIRISPersist#1068 ships that row (v55.1 or v56),
+  the producer's caller supplies it (`CallOptions::keep`). No other participant sets it, and there
+  is no call-wide keep. A mid-call change of keep is not specified; it is filed on
+  CIRISConstitution#169.
 - **The room-group binding (§3.2) sits UNDER the keep layer.** `KeptAvPublisher` registers whatever
-  exporter DEK its `AvPublisher`'s session yields; moving that session from a per-stream
-  `AvSession` group to the room's `CohortGroup` changes the DEK's source, not the keep layer's
-  contract. Under §3.2 the self-update commit above is a ROOM commit (§10 C2).
+  DEK its `AvPublisher`'s session yields; moving that session from a per-stream `AvSession` group
+  to `stream_epoch_dek` over the room's `CohortGroup` changes the DEK's source, not the keep
+  layer's contract. Under §3.2 the self-update commit above is a ROOM Update commit, which any
+  member may make (C2).
 
 ## 6. STHs — every live stream, kept or not
 
@@ -214,27 +247,37 @@ walks the list.
   the node's full hybrid signer (the same one call `receipts::stream_sth_for_file` makes). It works
   over IN-MEMORY leaf hashes with nothing stored (persist P1), so a live STH never waits on the
   store.
-- `BlobStorage::put_stream_sth` is called only over chunks this node has ADOPTED: its gate
-  recomputes the root from the node's own store and refuses a `tree_size` larger than what it holds.
-- **Carrier:** there is no replicated STH carrier; `stream_sth` rows are node-local (persist P3).
-  Live STHs ride edge's own wire to the call's participants for now; whether CC 5.3.3.3 needs a
-  durable, replicated carrier is §10 C5.
+- **Carrier (C5):** live STHs ride IN-BAND, best-effort, on edge's own wire to the call's
+  participants. That is conformant to CC 5.3.3.3; a lost live STH is not a failure.
+- **A kept stream's roots ride its recording,** in the manifest and recording blob, as CC 3.3.13
+  `evidence_refs`. Nothing writes an STH row: no replicated carrier exists, and none is wanted.
+  Before the roots go into the manifest, edge recomputes them from the chunks it ADOPTED and refuses
+  a `tree_size` larger than what it holds (the check `put_stream_sth` does, without its row).
 
-## 7. Signalling as room rows (item 6)
+## 7. Signalling — the room's existing rows, no new wire (item 6, C3)
 
-- Four row dimensions in the room (**new**; names are §10 C3): `chat:call:ring:v1`
-  (`call_id` genesis, media kinds, retention, ring expiry), `chat:call:accept:v1`,
-  `chat:call:decline:v1`, `chat:call:hangup:v1` (final epoch, final `tree_size`).
-- Placement: `community` at the room, built exactly like a chat message
-  (`chat::chat_message_attestation_in`: the body is a blob under the room's community DEK, the row
-  carries the pointer). Audience: S1, the room's members' devices (`may_receive`). **Delivered to
-  the room, never discovered.**
-- `CallId` = the ring row's content hash (§3.1). Accept = `join_call`. Decline is final for that
-  ring for that member. Hang-up is per participant; the call ends when the last publisher hangs up
-  or the ring expires unanswered.
+There is no `chat:call:*` dimension and no call row of any kind. Signalling reuses what exists:
+
+- **An in-room call needs no ring.** Every member of the room already may join; `join_call(room)`
+  starts this node's stream, and the others see it arrive. "Accept" is joining, and "decline" is
+  not joining.
+- **An ad-hoc call is an ephemeral community** with a short `valid_until`, built like any room
+  (`community_key_id`, its `CohortGroup`), through #955 and nothing else:
+
+  | Call step | Row (existing) |
+  |---|---|
+  | ring | `membership:proposal:v1` from the caller to each invitee (`membership::propose`) |
+  | accept | `membership:acceptance:v1` (`membership::reply`), then `widen_on_acceptance` and the group's Add commit; the Add rotates (§3.2) |
+  | decline | `membership:decline:v1` (`membership::reply`) |
+  | hang up | forward-only withdraws: the leaver's membership is withdrawn going forward; what was delivered stays delivered |
+
+  The call ends when the community's `valid_until` passes or its last member hangs up.
+- **An in-room hang-up writes nothing:** the stream's final terminator and in-band STH end it
+  (§6). The leaver stays a member of the room.
+- Delivery is the membership rows' own: to the invitee and the community, never discovered.
 - **Presence comes from the D6 reachable set** (`reachability::ReachabilityTracker`, the
   `RealtimeFanout::plan` filter), read locally. It is never attested, never a row, never on the
-  wire: a "who is reachable now" view is this node's measurement, not a claim.
+  wire (C4, confirmed): a "who is reachable now" view is this node's measurement, not a claim.
 
 ## 8. Failure modes and typed errors
 
@@ -250,9 +293,9 @@ walks the list.
 | `Congested` (per leg, in `PublishReport`) | link backpressure (`AvDispatcherError::Congested`) | a frame is dropped for that leg, never queued; other legs deliver |
 | `EpochRollFailed(..)` | a kept chunk got `StreamEpochRotationRequired` and the room commit or the next registration failed | the call goes `Degraded`, never seals under a stale epoch |
 | `CallEvent::KeepRefused { epoch, reason }` (an EVENT, not an error) | the keep layer returned `KeepOutcome::Refused` (`stream_not_authored`, `InvalidArgument`, from v55.1 `StreamEpochDekConflict`) | the call stays live and unkept from that epoch; earlier epochs stay readable through the key-grant plane |
-| `SthRefused(BlobError)` | `put_stream_sth`'s gate refused (root mismatch, too few chunks) | a tampered STH never publishes |
+| `RecordingRootMismatch { tree_size, held }` | a kept stream's manifest roots do not recompute from the adopted chunks, or name more chunks than are held (§6) | a tampered root never reaches `evidence_refs` |
 | `Stranded(StrandedEpoch)` | the room commit landed but the spine's re-address failed | `state()` is `Degraded`; publish serves what is live (#813's semantics) |
-| `CallEnded(EndCause)` | `Revoked` (this member left the room), `RingExpired`, `HungUp` | a revoked member's `publish` refuses; the room's next epoch excludes it |
+| `CallEnded(EndCause)` | `Revoked` (this member left the room), `Expired` (an ad-hoc community's `valid_until` passed), `HungUp` | a revoked member's `publish` refuses; the room's next epoch excludes it |
 
 Inbound failures are NOT call errors: a chunk that does not open (`RealtimeAvError::InnerSeal`,
 `ChunkSeqMismatch`, `WireTooShort`) is dropped and counted on the A/V plane, and the call carries on.
@@ -261,34 +304,35 @@ Inbound failures are NOT call errors: a chunk that does not open (`RealtimeAvErr
 
 | # | Criterion | Witness |
 |---|---|---|
-| A1 | The call key is the room's: two members derive the same call DEK for `(stream, epoch)` without exchanging it; a non-member cannot | two `CohortGroup` members over a loopback room; a third key outside the group fails |
+| A1 | The call key is the room's: two members derive the same DEK for `(stream, epoch)` without exchanging it; a non-member cannot; two streams in one epoch get different DEKs | `av_call_key` tests (`local/805-5-call-key`), then two `CohortGroup` members over a loopback room with a third key outside the group |
 | A2 | Join is membership: a non-member and a member without consent are refused by name | `NotARoomMember`, `ConsentMissing` |
-| A3 | A room roster change rolls every live call: new DEK, `chunk_seq` 0, the old epoch's terminator, and a removed member cannot open post-roll chunks | the departed member's last DEK fails on the first new-epoch chunk |
+| A3 | Every Add and every Remove rolls every live stream: new DEK, `chunk_seq` 0, the old epoch's terminator; a removed member cannot open post-roll chunks, and an added member cannot open pre-Add chunks | the departed member's last DEK fails on the first new-epoch chunk; the joiner's first DEK fails on the last pre-Add chunk |
 | A4 | Unkept: zero `register_stream_epoch_dek` calls and zero `key_grant:stream:v1` rows; the exporter secret is never persisted | a counting persist double + a scope-state scan |
 | A5 | Kept: each epoch registered before its first chunk; a member NOT in the live call opens the call through the key-grant plane | item 2's witness, over the room |
 | A6 | `StreamEpochRotationRequired` (both reasons) rolls and resends with no chunk lost | a forced `Removal` and a forced `Cap` |
 | A7 | `publish` cuts to the budget: at budget delivered, one over `FrameTooLarge` with no nonce consumed | #720's exact-budget test, through `Call` |
 | A8 | `frames()` yields every other publisher's frames byte-identical, in chunk order per stream; per-subscriber layer policy drops above-policy layers at the relay | a 3-member loopback call with an SVC stream |
-| A9 | STH every 64 chunks or 2 s and on leave; each accepted by `put_stream_sth` | a 200-chunk call: STHs at 64, 128, 192 and the leave |
-| A10 | Ring / accept / decline / hang-up reach the room's members only; no row anywhere carries reachability | an outsider node receives none of the four rows |
+| A9 | In-band STH every 64 chunks or 2 s and on leave; a kept stream's manifest carries its roots in `evidence_refs`; no STH row is written | a 200-chunk call: STHs at 64, 128, 192 and the leave; a `stream_sth` row count of 0 |
+| A10 | Signalling adds no wire: ring / accept / decline / hang-up are the existing membership rows, and no row anywhere carries reachability | an ad-hoc call's rows are all `membership:*:v1`; an outsider receives none of them |
 | A11 | PyO3 parity: every `Call` verb has its Python twin | the parity test walks the verb list |
 | A12 | A keep refused mid-call: the call continues, `CallEvent::KeepRefused` fires once, epochs before it stay openable via key grants and epochs after it are never registered | a registrar double refusing epoch 3 of a kept call |
 
-Each criterion carries a fail-before: A1 (DEK from the per-stream `AvSession` group → a non-member
-in that group opens), A3 (no roll on removal → the departed member opens), A4 (a register on an
+Each criterion carries a fail-before: A1 (the stream dropped from the KDF info →
+`the_dek_is_per_stream` RED; the epoch check removed → the old-epoch test RED; both run on
+`local/805-5-call-key`), A3 (no roll on removal → the departed member opens; no roll on Add → the
+joiner opens pre-Add chunks), A4 (a register on an
 unkept call → the counter is nonzero), A7 (the pre-seal check removed → a nonce is consumed by a
 refused frame).
 
 ## 10. Open questions — for persist, verify and the CC (not guessed here)
 
 **Verify**
-- **V1.** The A/V DEK label and exporter context for a call keyed from the ROOM group: may the room
-  group export under the A/V DEK-seed label (`cohort_group.rs` anticipated "a future deployment that
-  points both at one group"), and is the stream bound in the exporter context or by a KDF step after
-  it? The bench's HKDF over `record_secret` is not a production derivation.
+- **V1 (answered by the CC, 2026-10-12).** The CC pins no A/V label and shares ONE DEK per epoch
+  by design. Edge keeps the per-stream binding (§3.2) under a PENDING label, as a proposed
+  deviation; it is the first item on CIRISConstitution#169 (KATs on CIRISVerify#308).
 - **V2.** A/V link addressing for a room call: the room's derived addresses, or an A/V-labelled
   derivation of the room's destination secret (so call links and room replication links are
-  distinguishable)?
+  distinguishable)? Waits on V1 / #169.
 
 **Persist**
 - **P1 (answered, BELIEVED).** An unkept call's author stores its ciphertext with
@@ -305,19 +349,20 @@ refused frame).
 - **P5 (answered).** One stream per publisher; the writer is a NODE key (two devices, two
   streams).
 
-**The CC**
-- **C1.** Who may make a call kept (recorded / `history_on_join: full`): the opener, any
-  participant, or only with every participant's consent? Can retention change mid-call? (The
-  decision's CARRIER is CIRISPersist#1068's row; this is the rule for setting it.)
-- **C2.** A call rolls the whole room's epoch (a room commit). Acceptable for a room with traffic
-  besides the call, or does the CC want a call sub-epoch (exporter context only, no commit) for the
-  `Cap` case?
-- **C3.** The signalling dimension names (`chat:call:*:v1` proposed) and whether their bodies are
-  community-encrypted like chat messages (proposed: yes; the row's existence and time still leak).
-- **C4.** Presence is local D6 reachability only, never attested (proposed): confirm nothing in the
-  CC asks for a presence row.
-- **C5.** Does CC 5.3.3.3 require a live stream's STHs to have a durable, replicated carrier (persist
-  has none; `stream_sth` rows are node-local), or is edge's wire to the participants enough?
+**The CC (answered 2026-10-12)**
+- **C1.** Keep is per STREAM, set by its producer's own `history_on_join` on the stream's genesis
+  (§5). A mid-call change is filed on CIRISConstitution#169.
+- **C2.** The call epoch is the room's MLS epoch. Any member may commit an Update at the cap, and
+  there is no sub-epoch. Every Add and every Remove rotates (the CC table that exempts Add is an
+  erratum) (§3.2).
+- **C3.** No `chat:call:*`. An ad-hoc call is an ephemeral community with a short `valid_until`;
+  ring, accept and decline are `membership:proposal|acceptance|decline:v1`; hang-up is forward-only
+  withdraws; an in-room call needs no ring (§7).
+- **C4.** No presence row (confirmed).
+- **C5.** Best-effort in-band live STHs are conformant. A kept stream's roots ride the manifest and
+  recording blob (CC 3.3.13 `evidence_refs`), with no STH row (§6).
+- **Open, on CIRISConstitution#169:** one DEK per stream vs per epoch (V1), and a mid-call keep
+  change (C1).
 
 ## 11. Sequencing
 
@@ -327,7 +372,7 @@ refused frame).
    epoch when kept, under `for_stream_keyed_chunk` with no DEK row when unkept; live STHs from
    in-memory leaves, `put_stream_sth` over adopted chunks. Waits on #1067's counter bookkeeping
    (the leaf order is settled).
-4. V1 / V2 from verify; C1–C5 from the CC.
+4. CIRISConstitution#169 (the per-stream DEK and its label, then V2). C1–C5 are answered.
 5. This API (item 5) and the signalling rows (item 6), behind those.
 
 ## 12. Changelog
@@ -344,3 +389,11 @@ refused frame).
 - 2026-10-12 — #1067: the STH leaf order is `(epoch, counter)` with each epoch's terminator last,
   and streams are born V2. A call never reuses a `stream_id` (crash or rejoin): `StreamId` gains a
   fresh per-join `join_nonce` and drops `CallId`; the witness lands with item 5's code.
+- 2026-10-12 — the CC's answers to C1–C5 and V1. Keep is per stream, set by its producer. The call
+  epoch is the room's, with no sub-epoch; every Add and every Remove rotates; any member may make
+  the Update at the cap. Signalling reuses the membership rows: no `chat:call:*`, an ad-hoc call is
+  an ephemeral community, and an in-room call needs no ring (`open_call` folds into `join_call`;
+  `ring` added). No presence row. Live STHs are in-band; a kept stream's roots ride `evidence_refs`
+  with no STH row (`SthRefused` → `RecordingRootMismatch`). The DEK is `stream_epoch_dek` (code on
+  `local/805-5-call-key`): a per-stream binding under a PENDING label, a proposed deviation awaiting
+  CIRISConstitution#169. `CallId` is an API handle only, never key input.
