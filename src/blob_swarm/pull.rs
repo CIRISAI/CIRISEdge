@@ -93,6 +93,9 @@ pub struct PullSink {
     /// CIRISEdge#779 — the puller's parked-DAG register, so the key-grant
     /// door can wake the DAG a grant names.
     key_waits: Arc<KeyWaits>,
+    /// This node's key (the puller's `local_key_id`): only a key-grant row
+    /// addressed to it wakes a parked DAG (persist v55.0.0, #989).
+    local_key_id: String,
 }
 
 impl std::fmt::Debug for PullSink {
@@ -151,15 +154,20 @@ impl PullSink {
     /// `projected` (the wrap is in this node's grant tables; persist projects
     /// only a wrap to an occurrence this node holds the private half for) and
     /// `pending` (a content-axis wrap whose bytes have not arrived, projected
-    /// later by the adopt). A wrap not projected here wakes nothing. A re-offer
-    /// reports `projected` again (a union), so a pull may be woken twice for
-    /// one key, which costs one re-pull.
+    /// later by the adopt). Only a projected, non-pending wrap addressed to
+    /// THIS node's key wakes: a pending or unprojected one, or one for another
+    /// node's key (a shared backend can project a sibling occurrence's wrap),
+    /// wakes nothing. A re-offer reports `projected` again (a union), so a pull
+    /// may be woken twice for one key, which costs one re-pull.
     pub fn key_grant_admitted(
         &self,
         admission: &ciris_persist::federation::key_grant::KeyGrantAdmission,
     ) {
         use ciris_persist::federation::key_grant::KeyGrantAxis;
-        if !admission.projected || admission.pending {
+        if !admission.projected
+            || admission.pending
+            || admission.recipient_key_id != self.local_key_id
+        {
             return;
         }
         match &admission.axis {
@@ -200,6 +208,7 @@ impl PullSink {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
             key_waits: Arc::new(KeyWaits::new(1)),
+            local_key_id: String::new(),
         }
     }
 }
@@ -1503,6 +1512,7 @@ where
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
             key_waits: Arc::clone(&self.key_waits),
+            local_key_id: self.local_key_id.clone(),
         };
         let handle = tokio::spawn(self.run(rx));
         (sink, handle)
@@ -3914,6 +3924,72 @@ mod tests {
         ));
     }
 
+    /// persist v55.0.0 (#989) — **a parked DAG wakes only on a projected,
+    /// non-pending key-grant row addressed to THIS node's key.** A sha parked
+    /// on its content key is not woken by a pending admission (the bytes have
+    /// not arrived, so the wrap is not projected yet), by an unprojected one,
+    /// or by a projected one for another node's key; it is woken by the
+    /// projected, non-pending row to this node. Fails with either half of the
+    /// projection guard dropped, or with the recipient check dropped (each a
+    /// spurious re-pull).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_dag_wakes_only_on_a_projected_grant_to_this_node() {
+        use crate::blob_swarm::chunk_grants_779_tests::{edge_of, puller_of, two_devices};
+        use ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome;
+        use ciris_persist::federation::key_grant::{KeyGrantAdmission, KeyGrantAxis};
+        let (alice, _node_a, node_b) = two_devices().await;
+        let edge = edge_of(&node_b);
+        let puller = puller_of(&node_b, &edge);
+        let sha = [0x5a; 32];
+        let row = bare_row(ciris_persist::federation::types::cohort_scope::SELF);
+        let admission = |recipient: &str, projected: bool, pending: bool| KeyGrantAdmission {
+            axis: KeyGrantAxis::Content {
+                at_rest_sha256: hex::encode(sha),
+                cohort_scope: "self".into(),
+                owner_key_id: alice.key_id.clone(),
+            },
+            recipient_key_id: recipient.to_owned(),
+            attestation: ReplicatedAttestationOutcome::Inserted,
+            projected,
+            pending,
+        };
+        puller
+            .key_waits
+            .park(sha, &row, key_wake::Awaiting::Content(vec![sha]));
+        // The sink the bridge holds, built here rather than by `start` so no
+        // run loop's tick takes the woken DAG first.
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = PullSink {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            key_waits: Arc::clone(&puller.key_waits),
+            local_key_id: puller.local_key_id.clone(),
+        };
+        let me = node_b.me.clone();
+        for (what, a) in [
+            ("a pending row", admission(&me, false, true)),
+            (
+                "a pending row reported projected",
+                admission(&me, true, true),
+            ),
+            ("an unprojected row", admission(&me, false, false)),
+            (
+                "another node's row",
+                admission("alice-fed-sibling", true, false),
+            ),
+        ] {
+            sink.key_grant_admitted(&a);
+            assert!(puller.woken_dags().is_empty(), "{what} wakes nothing");
+        }
+        sink.key_grant_admitted(&admission(&me, true, false));
+        let woken: Vec<[u8; 32]> = puller.woken_dags().into_iter().map(|(s, _)| s).collect();
+        assert_eq!(
+            woken,
+            vec![sha],
+            "the projected row to this node wakes the DAG"
+        );
+    }
+
     /// CIRISEdge#739 — the pipeline's admission rule (§6.7.5): `K` bounds
     /// the requests, the byte budget bounds the memory, and an empty
     /// pipeline always admits one so a budget below one chunk degrades to
@@ -4386,6 +4462,7 @@ mod tests {
                 tx,
                 dropped: Arc::new(AtomicU64::new(0)),
                 key_waits: Arc::new(KeyWaits::new(4)),
+                local_key_id: "local".to_owned(),
             },
             rx,
         )
