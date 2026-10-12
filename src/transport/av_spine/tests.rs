@@ -975,6 +975,37 @@ async fn a_non_relaying_node_still_re_addresses_and_says_so() {
     assert!(call.table.accepts_inbound(&before).is_none());
 }
 
+/// CIRISEdge#846 — the chunk seq is the epoch-local STREAM counter (CC
+/// 5.3.3.2.5): a join rolls the epoch, and the next chunk is seq 0 again.
+/// Before #846 the publisher's seq ran on across epochs.
+#[tokio::test]
+async fn the_chunk_seq_restarts_at_every_epoch_roll_846() {
+    let mut call = TestCall::open(0xE9);
+    let t0 = call.t0;
+    let (alice, _) = call.join("peer-alice", [0x11u8; 32], t0);
+    let _subscribed = call
+        .spine
+        .subscribe(
+            &alice.key_id,
+            alice.transit_key,
+            ReceiverLayerPolicy::UNCAPPED,
+            t0,
+        )
+        .expect("subscribe");
+    let a = call.spine.publish(b"a", t0).await.expect("publish");
+    let b = call.spine.publish(b"b", t0).await.expect("publish");
+    assert_eq!((a.chunk_seq.0, b.chunk_seq.0), (0, 1));
+
+    let before = call.spine.epoch();
+    let _bob = call.join("peer-bob", [0x22u8; 32], t0);
+    assert!(call.spine.epoch().0 > before.0, "the join rolled the epoch");
+    let c = call.spine.publish(b"c", t0).await.expect("publish");
+    assert_eq!(
+        c.chunk_seq.0, 0,
+        "the STREAM counter restarts in the new epoch"
+    );
+}
+
 /// One inner seal feeds both fan-out legs. Sealing twice would re-derive
 /// the same `(stream, epoch, chunk_seq)` inner nonce for a second
 /// ciphertext, so the sequence must advance once per chunk no matter how
