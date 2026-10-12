@@ -249,6 +249,14 @@ subscribe_direct_path_events, direct_path_state, direct_link_interface, fall_bac
   first proposes a leviculum direct-link upgrade (leviculum#70) on the IDENTITY link to that member;
   on success the two nodes share a punched UDP interface and the A/V dial reaches the member over
   it. CC 5.4.6 makes the direct path a MUST wherever the endpoints can bring it direct.
+- **The peer's replication goes direct too.** The upgraded link is the member's identity-plane
+  link, so after a punch everything that rides it (replication rounds, Delivers, the scoped-body
+  carrier) runs over the punched interface, not through the transport node. That is what CC 5.4.6
+  asks for: the forwarder drops out wherever the endpoints can go direct.
+- **Bounded.** One deadline (`DIRECT_PATH_BUDGET`, 20 s) covers the identity-link dial, the
+  proposal and its outcome; past it, or on any failure, the A/V dial proceeds exactly as today. A
+  failed punch costs a facilitator round trip and leviculum's 60 s per-link cooldown, nothing else.
+  The A/V leg born on a punched interface runs at the base MTU (Channel 425, chunk budget 341).
 - **Default: inert.** No facilitator (never proposes), none served, every request refused. A
   configured facilitator means "propose" (no second switch). Accepting is a SEPARATE operator
   setting, `DirectAccept::IdentifiedOnly`, which discloses this node's public address to any
