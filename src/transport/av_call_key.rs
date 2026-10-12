@@ -41,8 +41,9 @@ pub use crate::mls::cohort_group::STREAM_DEK_LABEL_PENDING;
 use crate::mls::{CohortGroup, CohortGroupError};
 use crate::transport::realtime_av::{stream_label, Epoch, EpochDek, StreamId};
 
-/// A call's identity: the content hash of its genesis row in the room
-/// (FSD/AV_CALL_API.md §3.1). A signalling and API handle, NEVER key input.
+/// A call's handle: `SHA-256("ciris-edge:call:v1" ‖ utf8(community_key_id))` of
+/// the room the call lives in (FSD/AV_CALL_API.md §3.1; the CC has no call
+/// row). A signalling and API handle, NEVER key input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallId(pub [u8; 32]);
 
