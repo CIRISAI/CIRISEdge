@@ -1975,6 +1975,44 @@ where
         rooms
     }
 
+    /// persist v55.0.0 r3 (Codex r3 on #1065) — **are this file's bytes
+    /// withheld by a takedown or a steward purge?** Asked through persist's
+    /// own predicate (`steward_purge::purge_withheld`, the one its doors ask)
+    /// before anything is filed or queued: withheld bytes are no holding of
+    /// ours to advertise (persist refuses a `here` about them) or to repair
+    /// (a repair would pull taken-down content back toward this node). A
+    /// withheld file is booked `withheld` once per pass (the pass's `seen`
+    /// set) at DEBUG, since it repeats every pass while the takedown stands.
+    /// `true` when the pass must leave the file alone (withheld, or the
+    /// predicate unreadable this pass).
+    async fn withheld_in_pass(
+        &self,
+        dir: &dyn FederationDirectory,
+        sha: &[u8; 32],
+        blob: &str,
+        out: &mut super::durability::DurabilitySweep,
+    ) -> bool {
+        match ciris_persist::federation::steward_purge::purge_withheld(dir, sha).await {
+            Ok(Some(notice_id)) => {
+                self.edge
+                    .metrics()
+                    .inc_durability_custody(crate::observability::DURABILITY_WITHHELD);
+                out.withheld.push(*sha);
+                tracing::debug!(
+                    blob = %blob,
+                    notice_id = %notice_id,
+                    "durability pass: withheld by a takedown — no `here`, no repair"
+                );
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::debug!(blob = %blob, error = %e, "durability pass: withholding unreadable");
+                true
+            }
+        }
+    }
+
     /// One file of a durability pass — see [`Self::durability_sweep`].
     async fn durability_of_file(
         &self,
@@ -2015,33 +2053,8 @@ where
             out.not_in_audience += 1;
             return;
         }
-        // persist v55.0.0 r3 (Codex r3 on #1065) — bytes a takedown or a
-        // steward purge WITHHOLDS are no holding of ours to advertise or
-        // repair: persist refuses a `here` about them
-        // (`custody_ack_here_withheld`), and a repair would pull taken-down
-        // content back toward this node. Asked through persist's own
-        // predicate (`steward_purge::purge_withheld`, the one its doors ask),
-        // before anything is filed or queued; booked `withheld` once per
-        // pass (the pass's `seen` set), at DEBUG, since it repeats every pass
-        // for as long as the takedown stands.
-        match ciris_persist::federation::steward_purge::purge_withheld(dir, &sha).await {
-            Ok(Some(notice_id)) => {
-                self.edge
-                    .metrics()
-                    .inc_durability_custody(obs::DURABILITY_WITHHELD);
-                out.withheld.push(sha);
-                tracing::debug!(
-                    blob = %blob,
-                    notice_id = %notice_id,
-                    "durability pass: withheld by a takedown — no `here`, no repair"
-                );
-                return;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::debug!(blob = %blob, error = %e, "durability pass: withholding unreadable");
-                return;
-            }
+        if self.withheld_in_pass(dir, &sha, &blob, out).await {
+            return;
         }
         let whole = match durability::holds_whole(
             &self.engine,

@@ -1345,7 +1345,11 @@ async fn take_down(node: &Node, sha: &[u8; 32]) -> String {
 /// nothing (persist would refuse a `here` as `custody_ack_here_withheld`, and
 /// a `none` would be a report about withheld bytes) and queues NO repair (a
 /// repair would pull taken-down content back). Fails with the withholding
-/// check removed: the lost chunk queues a repair and a report is filed.
+/// check removed: nothing is booked `withheld`. (Without the check the pass
+/// still files nothing and repairs nothing here — persist's readiness door
+/// refuses a withheld manifest, so the pass stops at "holding unreadable" —
+/// but silently; the check is what makes the outcome named and keeps the
+/// pass from leaning on that read failing.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_durability_pass_leaves_withheld_bytes_alone() {
     use crate::observability::DURABILITY_WITHHELD;
