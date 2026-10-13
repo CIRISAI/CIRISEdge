@@ -243,7 +243,7 @@ impl Node {
 
     async fn roster(&self, scope: GroupScope, group: &str) -> Vec<String> {
         let mut out: Vec<String> = match scope {
-            GroupScope::Community => self
+            GroupScope::Community | GroupScope::Affiliations => self
                 .dir
                 .active_community_members(group)
                 .await
@@ -408,7 +408,7 @@ async fn found(node: &Node, scope: GroupScope, group: &str, infrastructure: bool
     );
     let founder = &node.owner;
     match scope {
-        GroupScope::Community => {
+        GroupScope::Community | GroupScope::Affiliations => {
             let (protocol, policy_blob) = if infrastructure {
                 (
                     "quorum:1/1",
@@ -494,7 +494,7 @@ async fn found(node: &Node, scope: GroupScope, group: &str, infrastructure: bool
 /// Does `node` hold the record of `group`?
 async fn holds_record(node: &Node, scope: GroupScope, group: &str) -> bool {
     match scope {
-        GroupScope::Community => node
+        GroupScope::Community | GroupScope::Affiliations => node
             .dir
             .lookup_community(group)
             .await

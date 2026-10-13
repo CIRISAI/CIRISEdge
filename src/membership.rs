@@ -57,6 +57,14 @@ pub enum GroupScope {
     Family,
     /// A community / room (`cohort_scope: community`, `community_key_id`).
     Community,
+    /// An affiliation (`cohort_scope: affiliations`, `community_key_id`).
+    /// CC 4.4.3.2.8: an affiliation is a community record and runs "all the
+    /// community machinery" at its own tier, so it names its group with the
+    /// community member and widens through the community roster. persist
+    /// v54.0.0 (#1034) places its membership rows at `affiliations` (the
+    /// record's declared cohort) and refuses one addressed as `community`
+    /// (`federation_affiliation_cohort_mismatch`).
+    Affiliations,
 }
 
 impl GroupScope {
@@ -66,6 +74,7 @@ impl GroupScope {
         match self {
             Self::Family => cohort_scope::FAMILY,
             Self::Community => cohort_scope::COMMUNITY,
+            Self::Affiliations => cohort_scope::AFFILIATIONS,
         }
     }
 
@@ -74,7 +83,7 @@ impl GroupScope {
     pub fn target_member(self) -> &'static str {
         match self {
             Self::Family => "family_key_id",
-            Self::Community => "community_key_id",
+            Self::Community | Self::Affiliations => "community_key_id",
         }
     }
 
@@ -84,6 +93,7 @@ impl GroupScope {
         match row.cohort_scope.as_str() {
             cohort_scope::FAMILY => Some(Self::Family),
             cohort_scope::COMMUNITY => Some(Self::Community),
+            cohort_scope::AFFILIATIONS => Some(Self::Affiliations),
             _ => None,
         }
     }
@@ -591,7 +601,9 @@ async fn widen_at_door(
 ) -> Result<bool, MembershipError> {
     use crate::replication::attestation_bind::truncate_to_substrate_resolution;
     match scope {
-        GroupScope::Community => {
+        // An affiliation widens through the community roster: the same
+        // machinery at its own tier (CC 4.4.3.2.8).
+        GroupScope::Community | GroupScope::Affiliations => {
             let (member, spec) = crate::community_roster::community_membership_widening(
                 directory,
                 group_key_id,
@@ -679,4 +691,75 @@ fn role_of(row: &Attestation) -> Option<String> {
         .get("role")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod affiliations_tests {
+    use super::*;
+    use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
+
+    fn signer(key_id: &str) -> crate::identity::LocalSigner {
+        let mut seed = [0x22u8; 32];
+        for (i, b) in key_id.bytes().take(32).enumerate() {
+            seed[i] = b;
+        }
+        let mut pqc_seed = seed;
+        pqc_seed[0] ^= 0x55;
+        let classical: Arc<dyn HardwareSigner> =
+            Arc::new(Ed25519SoftwareSigner::from_bytes(&seed, key_id).expect("ed25519"));
+        let pqc: Arc<dyn PqcSigner> = Arc::new(
+            MlDsa65SoftwareSigner::from_seed_bytes(&pqc_seed, format!("{key_id}-pqc"))
+                .expect("ml_dsa_65"),
+        );
+        crate::identity::LocalSigner::new(key_id, classical, Some(pqc))
+    }
+
+    /// **An affiliation proposal is placed at `affiliations` and reads back
+    /// as an affiliation.** persist v54.0.0 (#1034) refuses a proposal for a
+    /// group declared `affiliations` when it is addressed as `community`
+    /// (`federation_affiliation_cohort_mismatch`), so a host must be able to
+    /// address one at its own tier, and the invite / accept / widen paths
+    /// (which recover the scope with `of_row`) must see it. The group is
+    /// named by the community member: an affiliation is a community record
+    /// (CC 4.4.3.2.8).
+    #[tokio::test]
+    async fn an_affiliations_proposal_round_trips_through_of_row() {
+        let row = proposal_attestation(
+            GroupScope::Affiliations,
+            "affiliation-group",
+            "person-invitee",
+            None,
+            chrono::Utc::now() + chrono::Duration::days(1),
+            &signer("person-inviter"),
+        )
+        .await
+        .expect("an affiliations proposal builds");
+        assert_eq!(row.cohort_scope, cohort_scope::AFFILIATIONS);
+        assert_eq!(GroupScope::of_row(&row), Some(GroupScope::Affiliations));
+        assert_eq!(dimension_of(&row), Some(PROPOSAL_DIMENSION));
+        assert_eq!(
+            group_of(&row, GroupScope::Affiliations).as_deref(),
+            Some("affiliation-group"),
+            "the group rides the community member, as persist reads it"
+        );
+        // The three scopes stay distinct on the wire and on the way back.
+        for scope in [
+            GroupScope::Family,
+            GroupScope::Community,
+            GroupScope::Affiliations,
+        ] {
+            let r = proposal_attestation(
+                scope,
+                "g",
+                "person-invitee",
+                None,
+                chrono::Utc::now() + chrono::Duration::days(1),
+                &signer("person-inviter"),
+            )
+            .await
+            .expect("proposal builds");
+            assert_eq!(r.cohort_scope, scope.cohort_scope());
+            assert_eq!(GroupScope::of_row(&r), Some(scope));
+        }
+    }
 }
