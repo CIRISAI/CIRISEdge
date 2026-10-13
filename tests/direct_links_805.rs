@@ -47,15 +47,22 @@ use ciris_edge::identity::{sign_bound_hybrid, LocalSigner};
 use ciris_edge::mls::welcome_wrap::FederationDirectoryEntry;
 use ciris_edge::scope_addressing::{MemberAddress, ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
+use ciris_edge::transport::av_leg_choice::{Leg, LegAction};
+use ciris_edge::transport::av_sink::AvArrival;
 use ciris_edge::transport::av_spine::AvSpine;
 use ciris_edge::transport::direct_path::{
     DirectAccept, DirectLinksConfig, DirectPathEvent, DirectPathState,
 };
 use ciris_edge::transport::federation_session::{OwnKexKeys, PeerKexPubkeys};
-use ciris_edge::transport::realtime_av::{EpochDek, StreamId};
-use ciris_edge::transport::realtime_av_dispatcher::{AvLinkReceiver as _, AvLinkSender as _};
+use ciris_edge::transport::realtime_av::{
+    seal_av_inner, ChunkLayer, ChunkSeq, Epoch, EpochDek, InnerSealed, StreamId, CODEC_OPAQUE,
+};
+use ciris_edge::transport::realtime_av_dispatcher::{
+    AvDispatcher, AvDispatcherConfig, AvInboundLink, AvLinkReceiver as _, AvLinkSender as _,
+    AvRole, AvSubscriberLink,
+};
 use ciris_edge::transport::realtime_av_mls::{mint_joiner_key_material, Member};
-use ciris_edge::transport::realtime_av_runtime::AvPublisher;
+use ciris_edge::transport::realtime_av_runtime::{AvPublisher, AvRelay, AvSubscriber, LegStreams};
 use ciris_edge::transport::realtime_av_session::AvSession;
 use ciris_edge::transport::reticulum::{
     ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
@@ -245,6 +252,8 @@ async fn transport_node(tcp_port: u16, facilitator_port: u16) -> ReticulumNode {
 /// installed, its listener running (it drives the event loop).
 struct Side {
     key: Ident,
+    /// The port this node's TCP server listens on.
+    port: u16,
     transport: Arc<ReticulumTransport>,
     metrics: EdgeMetrics,
     table: Arc<ScopeAddressTable>,
@@ -261,13 +270,30 @@ async fn side(
     t_port: u16,
     direct: DirectLinksConfig,
 ) -> Side {
-    let mut transport = None;
-    for _ in 0..16 {
-        let mut c = ReticulumTransportConfig::new(base.join("transport.id"), &key.key_id)
-            .with_direct_links(direct.clone());
-        c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    side_cfg(key, dir, base, move |c| {
+        let mut c = c.with_direct_links(direct.clone());
         c.bootstrap_peers = vec![format!("127.0.0.1:{t_port}").parse().unwrap()];
+        c
+    })
+    .await
+}
+
+/// [`side`], with the config shaped by `shape` (listen address, announce
+/// cadence and identity path are set first).
+async fn side_cfg(
+    key: Ident,
+    dir: &Arc<SqliteBackend>,
+    base: &std::path::Path,
+    shape: impl Fn(ReticulumTransportConfig) -> ReticulumTransportConfig,
+) -> Side {
+    let mut transport = None;
+    let mut port = 0;
+    for _ in 0..16 {
+        let mut c = ReticulumTransportConfig::new(base.join("transport.id"), &key.key_id);
+        port = free_port();
+        c.listen_addr = format!("127.0.0.1:{port}").parse().unwrap();
         c.announce_interval = Duration::from_secs(5);
+        let c = shape(c);
         match ReticulumTransport::new(c, auth(key.signer(), dir)).await {
             Ok(t) => {
                 transport = Some(Arc::new(t));
@@ -314,6 +340,7 @@ async fn side(
     ];
     Side {
         key,
+        port,
         transport,
         metrics,
         table,
@@ -714,4 +741,467 @@ async fn a_peer_outside_our_rooms_is_refused_and_learns_nothing() {
     assert_eq!(dl(&p.b.metrics, "direct_link_established"), 0);
     assert_eq!(p.b.transport.direct_path_state(&p.a.key.key_id), None);
     assert_eq!(p.b.metrics.direct_links_active(), 0);
+}
+
+// ─── W2: the subscriber's choice of leg (CIRISEdge#805 item 8, cut 2) ─
+
+/// R is the field's reachable member: an EDGE node that is the transport
+/// node, the facilitator, and a call member that relays. A, B and C are TCP
+/// clients of R only. A publishes; B subscribes; C is not in the call.
+struct Quad {
+    r: Side,
+    a: Side,
+    b: Side,
+    c: Side,
+    _tmp: tempfile::TempDir,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn quad(tag: &str) -> Quad {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let f_port = free_udp_port();
+    let keys = [
+        Ident::new(&format!("node-r-dl-{tag}"), 0x3a).await,
+        Ident::new(&format!("node-a-dl-{tag}"), 0x3b).await,
+        Ident::new(&format!("node-b-dl-{tag}"), 0x3c).await,
+        Ident::new(&format!("node-c-dl-{tag}"), 0x3d).await,
+    ];
+    let mut records = Vec::new();
+    for k in &keys {
+        records.push(k.record().await);
+    }
+    let mut dirs = Vec::new();
+    for _ in 0..4 {
+        dirs.push(directory_with(records.clone()).await);
+    }
+    let [key_r, key_a, key_b, key_c] = keys;
+    let r = side_cfg(key_r, &dirs[0], &tmp.path().join("r"), move |c| {
+        c.with_transport_node(true)
+            .with_direct_links(DirectLinksConfig {
+                serve_facilitator: Some(f_port),
+                ..DirectLinksConfig::default()
+            })
+    })
+    .await;
+    let r_port = r.port;
+    let client = |direct: DirectLinksConfig| {
+        move |c: ReticulumTransportConfig| {
+            let mut c = c.with_direct_links(direct.clone());
+            c.bootstrap_peers = vec![format!("127.0.0.1:{r_port}").parse().unwrap()];
+            c
+        }
+    };
+    let a_direct = DirectLinksConfig {
+        facilitator: Some(format!("127.0.0.1:{f_port}")),
+        ..DirectLinksConfig::default()
+    };
+    let a = side_cfg(key_a, &dirs[1], &tmp.path().join("a"), client(a_direct)).await;
+    let b = side_cfg(
+        key_b,
+        &dirs[2],
+        &tmp.path().join("b"),
+        client(DirectLinksConfig::default()),
+    )
+    .await;
+    let c = side_cfg(
+        key_c,
+        &dirs[3],
+        &tmp.path().join("c"),
+        client(DirectLinksConfig::default()),
+    )
+    .await;
+    let sides = [&r, &a, &b, &c];
+    for (i, from) in sides.iter().enumerate() {
+        let routes = dirs[i]
+            .list_signed_transport_destinations_for(&from.key.key_id)
+            .await
+            .expect("list routes");
+        for (j, to) in dirs.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            for route in &routes {
+                FederationDirectory::put_signed_transport_destination(&**to, route)
+                    .await
+                    .expect("seed the route");
+            }
+        }
+    }
+    let known = wait_until(Duration::from_secs(90), || async {
+        a.transport.knows_peer(&b.key.key_id).await
+            && b.transport.knows_peer(&a.key.key_id).await
+            && a.transport.knows_peer(&r.key.key_id).await
+            && b.transport.knows_peer(&r.key.key_id).await
+            && c.transport.knows_peer(&r.key.key_id).await
+            && r.transport.knows_peer(&c.key.key_id).await
+    })
+    .await;
+    assert!(known, "every node learns the others it needs through R");
+    Quad {
+        r,
+        a,
+        b,
+        c,
+        _tmp: tmp,
+    }
+}
+
+const LEGS_DEK: [u8; 32] = [0x44; 32];
+const K_AR: [u8; 32] = [0x51; 32];
+const K_RB: [u8; 32] = [0x52; 32];
+const K_AB: [u8; 32] = [0x53; 32];
+const K_RB2: [u8; 32] = [0x54; 32];
+const K_RC: [u8; 32] = [0x55; 32];
+
+fn legs_stream() -> StreamId {
+    StreamId(sha2::Sha256::digest(b"av-stream-805-legs").into())
+}
+
+/// The call's group on `side`, as `members` (A, B and R; C installs a copy
+/// naming itself too, as a leaked or stale view would).
+fn install_legs_group(side: &Side, members: &[&str]) {
+    side.lifecycle
+        .joined(
+            &scope(),
+            &av_addressing::stream_group_id(legs_stream()),
+            1,
+            &[0x77; 32],
+            members,
+        )
+        .expect("install the call's group");
+}
+
+fn legs_address(side: &Side, member: &str) -> MemberAddress {
+    side.table
+        .send_address(
+            &scope(),
+            &av_addressing::stream_group_id(legs_stream()),
+            member,
+        )
+        .expect("the member's call address")
+}
+
+fn legs_chunk(seq: u64) -> InnerSealed {
+    let mut body = format!("legs-805-{seq:04}-").into_bytes();
+    body.resize(64, 0x2e);
+    seal_av_inner(
+        &body,
+        &EpochDek::from_bytes(LEGS_DEK),
+        legs_stream(),
+        Epoch(1),
+        ChunkSeq(seq),
+        CODEC_OPAQUE,
+        ChunkLayer::BASE,
+    )
+    .expect("seal")
+}
+
+async fn next_arrival(arrivals: &mut mpsc::Receiver<AvArrival>, from: &str) -> AvArrival {
+    let arrival = tokio::time::timeout(Duration::from_secs(20), arrivals.recv())
+        .await
+        .expect("an A/V link arrives in time")
+        .expect("arrivals open");
+    assert_eq!(arrival.peer.as_str(), from, "the arrival is {from}'s");
+    arrival
+}
+
+/// Dial R's call address from `side` and subscribe: a subscription is the
+/// dialled link plus its first frame.
+async fn dial_r(side: &Side, r_id: &str) -> ciris_edge::transport::av_sink::AvLink {
+    let link = side
+        .transport
+        .open_av_link(r_id, &legs_address(side, r_id))
+        .await
+        .expect("dial R");
+    link.sender
+        .send(b"subscribe")
+        .await
+        .expect("the first frame");
+    link
+}
+
+/// **W2** — B hears A's stream over the relay member R, then directly once a
+/// punched path exists, then over R again when the direct path is judged
+/// dead:
+///
+/// - every chunk B delivers is delivered once (the overlap's copies are
+///   counted as duplicates, never delivered);
+/// - the relay leg is dropped once the direct leg is confirmed, and from then
+///   the relay carries nothing to B (one delivery path at steady state);
+/// - `fall_back_from_direct` retires A's identity link off the punched
+///   interface (leviculum#83) and closes the leg; B rejoins R and chunks
+///   resume, the final run complete;
+/// - C, which is not in R's view of the call, dials R and gets nothing.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
+    let q = quad("w2").await;
+    let (a_id, b_id, r_id, c_id) = (
+        q.a.key.key_id.clone(),
+        q.b.key.key_id.clone(),
+        q.r.key.key_id.clone(),
+        q.c.key.key_id.clone(),
+    );
+    let members = [a_id.as_str(), b_id.as_str(), r_id.as_str()];
+    for side in [&q.r, &q.a, &q.b] {
+        install_legs_group(side, &members);
+    }
+    install_legs_group(
+        &q.c,
+        &[a_id.as_str(), b_id.as_str(), r_id.as_str(), c_id.as_str()],
+    );
+    let mut r_arrivals = q.r.transport.take_av_arrivals().expect("R's arrivals");
+    let mut b_arrivals = q.b.transport.take_av_arrivals().expect("B's arrivals");
+
+    // A → R, the relay leg's upstream. R starts its pump on A's first frame.
+    let a_r =
+        q.a.transport
+            .open_av_link(&r_id, &legs_address(&q.a, &r_id))
+            .await
+            .expect("A dials R");
+    let mut publisher = AvDispatcher::new(AvDispatcherConfig {
+        stream_id: legs_stream(),
+        local_role: AvRole::Publisher,
+        epoch_dek: Some(LEGS_DEK),
+        initial_subscribers: vec![AvSubscriberLink {
+            subscriber: r_id.clone(),
+            transit_key: K_AR,
+            link_id: a_r.link_id.to_vec(),
+            outbound_send: Box::new(a_r.sender),
+        }],
+        inbound_links: vec![],
+    })
+    .expect("A's publisher");
+    let mut seq = 0u64;
+    let _ = publisher.publish_inner(legs_chunk(seq)).await;
+    seq += 1;
+    let upstream = next_arrival(&mut r_arrivals, &a_id).await;
+    let (_pump, admissions) = AvRelay::new(legs_stream(), Vec::new())
+        .expect("R's relay")
+        .spawn_pump_admitting(
+            AvInboundLink {
+                transit_key: K_AR,
+                link_id: upstream.link_id.to_vec(),
+                inbound_recv: Box::new(upstream.inbound),
+            },
+            K_AR,
+            upstream.link_id.to_vec(),
+        );
+
+    // B subscribes by DIALLING R (its first frame is the subscription).
+    let b_r = dial_r(&q.b, &r_id).await;
+    let arrival = next_arrival(&mut r_arrivals, &b_id).await;
+    assert!(
+        q.r.transport
+            .admit_dialled_subscriber(arrival, &admissions, K_RB)
+            .await,
+        "B is in R's call: admitted"
+    );
+    let LegStreams {
+        legs,
+        chunks: mut b_chunks,
+        actions: mut b_actions,
+    } = AvSubscriber::subscribe_legs(
+        legs_stream(),
+        &EpochDek::from_bytes(LEGS_DEK),
+        a_id.clone(),
+        r_id.clone(),
+        AvInboundLink {
+            transit_key: K_RB,
+            link_id: b_r.link_id.to_vec(),
+            inbound_recv: Box::new(b_r.inbound),
+        },
+        Some(q.b.metrics.clone()),
+    )
+    .expect("B's legs");
+    let delivered: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+    let sink = Arc::clone(&delivered);
+    tokio::spawn(async move {
+        while let Some(chunk) = b_chunks.recv().await {
+            sink.lock().unwrap().push(chunk.chunk_seq.0);
+        }
+    });
+    for _ in 0..20 {
+        let _ = publisher.publish_inner(legs_chunk(seq)).await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            delivered.lock().unwrap().contains(&(seq - 1))
+        })
+        .await,
+        "B hears A over R: {:?}",
+        delivered.lock().unwrap()
+    );
+
+    // The direct leg: A's dial punches through R and reaches B directly.
+    let a_b =
+        q.a.transport
+            .open_av_link(&b_id, &legs_address(&q.a, &b_id))
+            .await
+            .expect("A reaches B directly");
+    let anchor = a_b.sender.direct_anchor();
+    assert!(anchor.is_some(), "the leg holds a punched path");
+    let a_b_link = a_b.link_id;
+    publisher
+        .add_subscriber(AvSubscriberLink {
+            subscriber: b_id.clone(),
+            transit_key: K_AB,
+            link_id: a_b.link_id.to_vec(),
+            outbound_send: Box::new(a_b.sender),
+        })
+        .expect("A adds B's direct leg");
+    let _ = publisher.publish_inner(legs_chunk(seq)).await;
+    seq += 1;
+    let direct = next_arrival(&mut b_arrivals, &a_id).await;
+    legs.add_leg(
+        Leg::Direct,
+        AvInboundLink {
+            transit_key: K_AB,
+            link_id: direct.link_id.to_vec(),
+            inbound_recv: Box::new(direct.inbound),
+        },
+    )
+    .await
+    .expect("B adds the direct leg");
+
+    // The overlap: both legs deliver until the direct one is confirmed.
+    let mut dropped = None;
+    for _ in 0..40 {
+        let _ = publisher.publish_inner(legs_chunk(seq)).await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+        if let Ok(action) = b_actions.try_recv() {
+            dropped = Some(action);
+            break;
+        }
+    }
+    assert_eq!(dropped, Some(LegAction::DropRelay), "make-before-break");
+    q.b.transport
+        .link_teardown(&b_r.link_id)
+        .await
+        .expect("B closes its relay leg");
+    let duplicates =
+        q.b.metrics
+            .av_plane()
+            .get("av_inbound_duplicate_leg")
+            .copied()
+            .unwrap_or(0);
+    assert!(duplicates > 0, "the overlap delivered copies, deduped");
+    // One delivery path at steady state: the relay leg no longer exists at
+    // either end, so R has nothing to carry to B (its fan-out prunes the
+    // gone link).
+    let relay_leg = b_r.link_id;
+    let gone = wait_until(Duration::from_secs(10), || async {
+        let held = |planes: Vec<([u8; 16], ciris_edge::transport::reticulum::LinkPlane, bool)>| {
+            planes.iter().any(|(id, _, _)| *id == relay_leg)
+        };
+        !held(q.b.transport.link_planes_for_test().await)
+            && !held(q.r.transport.link_planes_for_test().await)
+    })
+    .await;
+    assert!(gone, "B's relay leg is closed at B and at R");
+    for _ in 0..20 {
+        let _ = publisher.publish_inner(legs_chunk(seq)).await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+
+    // The direct path is judged dead: A falls back on both planes.
+    let mut a_events = q.a.transport.subscribe_direct_path_events();
+    q.a.transport.fall_back_from_direct(a_b_link, anchor).await;
+    assert!(
+        next_event(&mut a_events, Duration::from_secs(5), |e| {
+            matches!(e, DirectPathEvent::Lost { .. })
+        })
+        .await
+        .is_some(),
+        "#83: the identity link left the punched interface"
+    );
+    assert_eq!(
+        q.a.transport.direct_link_interface(anchor.expect("anchor")),
+        None
+    );
+    let rejoin = tokio::time::timeout(Duration::from_secs(10), b_actions.recv())
+        .await
+        .expect("B notices the direct leg closed")
+        .expect("actions open");
+    assert_eq!(rejoin, LegAction::RejoinRelay);
+    let b_r2 = dial_r(&q.b, &r_id).await;
+    let arrival = next_arrival(&mut r_arrivals, &b_id).await;
+    assert!(
+        q.r.transport
+            .admit_dialled_subscriber(arrival, &admissions, K_RB2)
+            .await
+    );
+    legs.add_leg(
+        Leg::Relay,
+        AvInboundLink {
+            transit_key: K_RB2,
+            link_id: b_r2.link_id.to_vec(),
+            inbound_recv: Box::new(b_r2.inbound),
+        },
+    )
+    .await
+    .expect("B rejoins R");
+    let resumed_from = seq;
+    for _ in 0..40 {
+        let _ = publisher.publish_inner(legs_chunk(seq)).await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let last = seq - 1;
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            delivered.lock().unwrap().contains(&last)
+        })
+        .await,
+        "chunks resume over R"
+    );
+    let got = delivered.lock().unwrap().clone();
+    let mut unique = got.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        got.len(),
+        "every chunk delivered ONCE: {got:?}"
+    );
+    // A FRESH relay link refuses with `Congested` for its first few hundred
+    // ms (the Channel's opening window), and the fan-out drops, never queues,
+    // a refused frame (CIRISEdge#591; pacing is #863 item 5). So the rejoin
+    // has a bounded ramp: steady state is complete from ~20 chunks (~0.66 s
+    // at 30 fps) after it.
+    for s in (resumed_from + 20)..=last {
+        assert!(
+            got.contains(&s),
+            "chunk {s} after the rejoin settled: {got:?}"
+        );
+    }
+
+    // C is not in R's view of the call: refused, and hears nothing.
+    let c_r = dial_r(&q.c, &r_id).await;
+    let arrival = next_arrival(&mut r_arrivals, &c_id).await;
+    assert!(
+        !q.r.transport
+            .admit_dialled_subscriber(arrival, &admissions, K_RC)
+            .await,
+        "C is refused"
+    );
+    assert_eq!(
+        q.r.metrics
+            .av_plane()
+            .get("av_relay_dialler_refused")
+            .copied(),
+        Some(1)
+    );
+    for _ in 0..10 {
+        let _ = publisher.publish_inner(legs_chunk(seq)).await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let heard = tokio::time::timeout(Duration::from_secs(2), c_r.inbound.recv()).await;
+    assert!(!matches!(heard, Ok(Ok(_))), "C received nothing: {heard:?}");
 }

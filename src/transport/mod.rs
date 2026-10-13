@@ -86,6 +86,10 @@ pub mod realtime_av_dispatcher;
 /// behind `_reticulum-module` (their only leviculum dependency).
 pub mod realtime_av_runtime;
 
+/// CIRISEdge#805 item 8, cut 2 — a subscriber's choice of leg (direct or
+/// relay), make-before-break, deduped above the per-leg opens; and the relay's
+/// admission rule for a subscriber that dials it.
+pub mod av_leg_choice;
 /// CIRISEdge#805 item 4 — the A/V plane on the live node: the Reticulum
 /// transport's A/V sink, fed from the same event loop replication uses.
 #[cfg(feature = "_reticulum-module")]

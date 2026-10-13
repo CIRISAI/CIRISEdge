@@ -211,7 +211,8 @@ pub const fn failure_label(failure: Failure) -> &'static str {
 ///
 /// One function, so the action it triggers
 /// ([`crate::transport::reticulum::ReticulumTransport::fall_back_from_direct`])
-/// is the one place leviculum#83 changes.
+/// retires the member's identity link off the punched interface (leviculum#83)
+/// and closes the leg.
 #[must_use]
 pub fn direct_leg_stalled(congested_streak: u32, since_progress: Duration) -> bool {
     congested_streak >= DIRECT_LEG_CONGESTED_STREAK || since_progress >= DIRECT_LEG_NO_PROGRESS
