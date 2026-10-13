@@ -28,7 +28,7 @@ use ciris_edge::receipts::{self, ReceiptLedger, ReceiptRefusal, StreamLog as _};
 use ciris_edge::replication::attestation_bind::{Shared, Signers};
 use ciris_edge::scope_room::ScopeRoom;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
-use ciris_persist::federation::key_grant::{SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX};
+use ciris_persist::federation::key_grant::SignedKeyGrantRow;
 use ciris_persist::federation::{Attestation, FederationDirectory as _, SignedAttestation};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
 use ciris_persist::store::backend::Backend as _;
@@ -584,16 +584,12 @@ async fn cross_keys(author: &Node, reader: &Node) {
         .await
         .expect("list")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
     {
         let _ = reader
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: s.attestation.clone(),
             })
             .await;
@@ -1252,7 +1248,9 @@ async fn a_community_file_is_receipted_per_member_and_stops_being_offered() {
         .await
         .expect("read")
         .into_iter()
-        .inspect(|r| assert_eq!((r.epoch, r.k), (epoch, 5)))
+        // persist v55 (#977): a room stream is stream-keyed, so its tree
+        // holds the five chunks and epoch 0's terminator: K = 6.
+        .inspect(|r| assert_eq!((r.epoch, r.k), (epoch, 6)))
         .map(|r| r.node_key_id)
         .collect();
     who.sort();
@@ -1303,14 +1301,22 @@ async fn a_community_file_is_receipted_per_member_and_stops_being_offered() {
         &file.stream_id,
         epoch + 1,
         sth.root_hash,
-        5,
+        sth.tree_size,
     )
     .await;
     assert!(matches!(
         receipts::admit_receipt_row(&*node_a.dir, &*node_a.dir, &wrong_epoch, &ledger).await,
         Err(ReceiptRefusal::EpochMismatch { .. })
     ));
-    let past_tree = forged_row(&node_b, &file.row, &file.stream_id, epoch, sth.root_hash, 6).await;
+    let past_tree = forged_row(
+        &node_b,
+        &file.row,
+        &file.stream_id,
+        epoch,
+        sth.root_hash,
+        sth.tree_size + 1,
+    )
+    .await;
     assert!(matches!(
         receipts::admit_receipt_row(&*node_a.dir, &*node_a.dir, &past_tree, &ledger).await,
         Err(ReceiptRefusal::TreeSizeShort { .. })

@@ -325,13 +325,14 @@ pub trait BlobChunkVerifier: Send + Sync {
     /// CIRISEdge#581 — `disposition` says WHICH of persist's two write doors
     /// this chunk may go through, and it is a parameter rather than an
     /// implementation choice because **storing is announcing**: `put_blob`
-    /// auto-emits `holds_bytes:sha256:*` and `list_holders` then names this
-    /// node, while `store_blob_local` publishes nothing.
+    /// files this node's holding claim (`custody:ack:v1` `here`, v55) and
+    /// `list_holders` then names this node, while `store_blob_local` publishes nothing.
     ///
     /// An implementation MUST honour it. Ignoring it and always announcing
-    /// defeats `self`/`family` invisibility — those scopes suppress
-    /// `holds_bytes` structurally — and overrides an operator who agreed to
-    /// hold a class but not to advertise holding it.
+    /// defeats `self`/`family` invisibility — edge keeps those adopts local
+    /// and files their claim inside the cohort after the pull — and
+    /// overrides an operator who agreed to hold a class but not to advertise
+    /// holding it.
     fn verify_and_store(
         &self,
         blob_sha256: [u8; 32],
@@ -352,6 +353,8 @@ pub mod meaning;
 pub use meaning::{BlobMeaning, MeaningRefusal};
 #[cfg(test)]
 pub(crate) mod chunk_grants_779_tests;
+#[cfg(test)]
+mod dag_gone_terminal_tests;
 pub mod durability;
 #[cfg(test)]
 mod durability_763_tests;
@@ -359,11 +362,13 @@ pub use durability::{rarest_first, target_mode, DurabilitySweep, Repair};
 mod key_wake;
 pub mod pull;
 pub use pull::{
-    check_dag_plan, parse_clear_manifest, BlobPuller, DagByteFetch, DagPlan, DagPullRefusal,
-    PullConfig, PullOffer, PullOutcome, PullRequest, PullSink, DEFAULT_DAG_ADOPT_BATCH_CHUNKS,
-    DEFAULT_DAG_BYTES_IN_FLIGHT, DEFAULT_DAG_CHUNKS_IN_FLIGHT, PULL_REFUSAL_DAG_CHUNK_MISMATCH,
-    PULL_REFUSAL_DAG_CHUNK_MISSING, PULL_REFUSAL_DAG_MANIFEST_MISMATCH, PULL_REFUSAL_DAG_OVER_CAP,
-    PULL_REFUSAL_DAG_TOTAL_SIZE_MISMATCH, PULL_REFUSAL_NO_EPOCH, PULL_REFUSAL_SIZE_MISMATCH,
+    check_dag_plan, parse_clear_manifest, store_refusal_tag, BlobPuller, DagByteFetch,
+    DagFetchError, DagPlan, DagPullRefusal, PullConfig, PullOffer, PullOutcome, PullRequest,
+    PullSink, DEFAULT_DAG_ADOPT_BATCH_CHUNKS, DEFAULT_DAG_BYTES_IN_FLIGHT,
+    DEFAULT_DAG_CHUNKS_IN_FLIGHT, PULL_REFUSAL_DAG_CHUNK_MISMATCH, PULL_REFUSAL_DAG_CHUNK_MISSING,
+    PULL_REFUSAL_DAG_MANIFEST_MISMATCH, PULL_REFUSAL_DAG_OVER_CAP,
+    PULL_REFUSAL_DAG_STREAM_KEYED_COMMUNITY_EPOCH, PULL_REFUSAL_DAG_TOTAL_SIZE_MISMATCH,
+    PULL_REFUSAL_DISK_PRESSURE, PULL_REFUSAL_NO_EPOCH, PULL_REFUSAL_SIZE_MISMATCH,
 };
 
 pub mod persist_store_policy;
@@ -618,7 +623,15 @@ pub fn serve_result_to_chunk(
         // it to the wildcard below answered `PolicyDenied` — "this node HAS
         // the bytes and is declining" — and sent the peer hunting for bytes
         // every holder had been told to refuse.
-        Err(BlobError::Withdrawn { .. }) => Err(ChunkSourceRefusal::Withdrawn),
+        //
+        // persist v54.1.0 (Codex round 3 on CIRISPersist#1057) — `Purged`: a
+        // steward purge tombstoned these bytes (or every manifest a sealed-DAG
+        // chunk belongs to). Persist's own contract is Withdrawn's: never
+        // `NotHeld`, because every holder rooted at the same trust root is
+        // bound by the same purge. So it is the same abort word on the wire.
+        Err(BlobError::Withdrawn { .. } | BlobError::Purged { .. }) => {
+            Err(ChunkSourceRefusal::Withdrawn)
+        }
 
         // Capacity: clears when the host disk recovers, never on retry.
         Err(BlobError::DiskPressureProxyRefused { .. }) => Err(ChunkSourceRefusal::DiskPressure),
@@ -2094,6 +2107,14 @@ mod tests {
                 },
                 Err(ChunkSourceRefusal::Withdrawn),
             ),
+            // persist v54.1.0 — a purged blob is the same abort word.
+            (
+                BlobError::Purged {
+                    sha256_hex: sha.clone(),
+                    notice_id: "notice-1".into(),
+                },
+                Err(ChunkSourceRefusal::Withdrawn),
+            ),
         ];
 
         for (err, want) in cases {
@@ -2119,6 +2140,29 @@ mod tests {
             refusal.to_miss_reason(),
             crate::messages::MissReason::Withdrawn,
             "the peer is told to STOP hunting, not that this node is declining"
+        );
+    }
+
+    /// persist v54.1.0 (Codex round 3 on CIRISPersist#1057) — a
+    /// `BlobError::Purged` from the serve door reaches the peer as
+    /// `MissReason::Withdrawn`, the word both fetchers abort on
+    /// (`SwarmScheduler` → `GoneFederationWide`, the DAG `SwarmFetch` → no
+    /// next holder). Mapped to anything else it would read as "not here" or
+    /// "declining", and the fetcher would walk to the next holder, which the
+    /// same purge binds.
+    #[test]
+    fn a_purged_blob_from_the_persist_door_is_withdrawn_on_the_wire() {
+        use ciris_persist::federation::BlobError;
+        let refusal = serve_result_to_chunk(Err(BlobError::Purged {
+            sha256_hex: "ab".repeat(32),
+            notice_id: "purge-notice-1".into(),
+        }))
+        .expect_err("a purged blob is a refusal, not an absence");
+        assert_eq!(refusal, ChunkSourceRefusal::Withdrawn);
+        assert_eq!(
+            refusal.to_miss_reason(),
+            crate::messages::MissReason::Withdrawn,
+            "the peer is told to STOP hunting: another holder is bound by the same purge"
         );
     }
 

@@ -25,17 +25,23 @@
 //! them), no owner. F applies exactly the bytes R serves. Two legacy rows R
 //! cannot hold are hand-built from O1's bytes:
 //!
-//! - `O4` = O1 with its typed `asserted_at` diverging from the signed envelope
-//!   (persist refuses it before it reads the attester's Key, but the park
-//!   reads the DIRECTORY, not the reason, so it parks on P — never re-asked
-//!   every round, which is what the field needs);
-//! - `O5` = O1 naming no signer at all: a transient refusal with no
-//!   dependency to wait on, the case fix 6 moves to the terminal schedule.
+//! - `O4` = O1 with its typed `asserted_at` diverging from the signed envelope;
+//! - `O5` = O1 naming no signer at all.
+//!
+//! Since persist v55.0.0 both are refused at the source as typed
+//! `Error::MalformedRow` (`federation_malformed_row`), which edge holds
+//! TERMINAL from the first refusal: neither parks, and neither is re-asked
+//! while its terminal window runs (asserted at the top of (a)). Before v55,
+//! O4 parked on P and O5 was the dependency-less transient row fix 6 moves to
+//! the terminal schedule after three windows at the transient cap; no
+//! occurrence row now reaches that path, so fix 6's witness is the
+//! `RefusalBackoff` unit test
+//! `a_dependency_less_transient_moves_to_the_terminal_schedule_at_refusal_8`.
 //!
 //! | letter | fix | fails before the fix because |
 //! |---|---|---|
-//! | (a) | — | round 1: every row refused, four parked (O1, O4 on P; O2 on A; O3 indexed on U) |
-//! | (b) | 4, 6 | O3's second refusal stayed on the transient ladder; O5 never left it |
+//! | (a) | — | round 1: every row refused, three parked (O1 on P; O2 on A; O3 indexed on U) |
+//! | (b) | 4 | O3's second refusal stayed on the transient ladder |
 //! | (c) | 2 | one WARN per row per Deliver |
 //! | (d) | — | Key(A) through the choke releases O2, which admits |
 //! | (e) | 3 | no host hook (O1 waits out the window), and the first window was 3600 s |
@@ -66,10 +72,11 @@ use sha2::Digest as _;
 use crate::replication::refusal_backoff::{
     DEFAULT_MAX_KEYS, DEFAULT_MAX_PARKED, TERMINAL_BASE, TRANSIENT_CAP,
 };
+use crate::replication::summary::ApplyOutcome;
 use crate::replication::{
     BridgeConfig, DeliverMessage, DirectoryStateAdapter, EnvelopeKind, EnvelopeRef,
     FederationDirectoryReplicationBridge, MutableDirectoryStateAdapter, ReplicationDirectory,
-    ReplicationMessage, ReplicationOutcome, Session, SessionRole, SummaryMessage,
+    ReplicationMessage, ReplicationOutcome, RetryDisposition, Session, SessionRole, SummaryMessage,
 };
 
 const KIND: EnvelopeKind = EnvelopeKind::IdentityOccurrence;
@@ -81,14 +88,14 @@ fn sha(bytes: &[u8]) -> [u8; 32] {
 
 /// One identity: a persist-minted, self-scrubbed hybrid Key record (so the
 /// Key plane admits it through the choke) and the signer it was minted from.
-struct Ident {
+pub(super) struct Ident {
     alias: String,
     seed: u8,
-    record: KeyRecord,
+    pub(super) record: KeyRecord,
 }
 
 impl Ident {
-    async fn mint(alias: &str, identity_type: &str, seed: u8) -> Self {
+    pub(super) async fn mint(alias: &str, identity_type: &str, seed: u8) -> Self {
         let record =
             crate::replication::bridge::tests::minted_key_record(alias, identity_type, seed).await;
         Self {
@@ -98,11 +105,11 @@ impl Ident {
         }
     }
 
-    fn key_id(&self) -> &str {
+    pub(super) fn key_id(&self) -> &str {
         &self.record.key_id
     }
 
-    fn signer(&self) -> Arc<crate::identity::LocalSigner> {
+    pub(super) fn signer(&self) -> Arc<crate::identity::LocalSigner> {
         let hw: Arc<dyn HardwareSigner> = Arc::new(
             Ed25519SoftwareSigner::from_bytes(&[self.seed; 32], &self.alias)
                 .expect("rebuild the ed25519 half"),
@@ -121,7 +128,7 @@ impl Ident {
         ))
     }
 
-    fn signed_key_bytes(&self) -> Vec<u8> {
+    pub(super) fn signed_key_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(&SignedKeyRecord {
             record: self.record.clone(),
         })
@@ -131,7 +138,7 @@ impl Ident {
 
 /// A content-only signed occurrence of `identity` through `occurrence`,
 /// attested by `attester` (persist's CIRISPersist#851 form).
-async fn occurrence(
+pub(super) async fn occurrence(
     identity: &str,
     occurrence: &str,
     attester: &Ident,
@@ -179,7 +186,7 @@ async fn occurrence(
     }
 }
 
-async fn substrate() -> Arc<SqliteBackend> {
+pub(super) async fn substrate() -> Arc<SqliteBackend> {
     let dir = FederationDirectorySqlite::open(":memory:")
         .await
         .expect("open substrate");
@@ -187,7 +194,7 @@ async fn substrate() -> Arc<SqliteBackend> {
     dir
 }
 
-async fn hold(dir: &SqliteBackend, id: &Ident) {
+pub(super) async fn hold(dir: &SqliteBackend, id: &Ident) {
     dir.put_public_key(SignedKeyRecord {
         record: id.record.clone(),
     })
@@ -426,8 +433,43 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
     }
 }
 
+/// A process-wide subscriber that is interested `sometimes` in every callsite
+/// and enabled for none, so the scoped capture below is always consulted.
+///
+/// Without it, a callsite first registered by a concurrent test thread while
+/// no dispatcher wanted it can cache `never`, and this module's captures read
+/// empty or miss one line (seen 3 times in 10 runs of the replication third,
+/// once the #858 fix 7 witnesses began emitting the same park lines from
+/// other threads). It changes no output: it records nothing.
+struct DeferToScoped;
+
+impl tracing::Subscriber for DeferToScoped {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, _: &tracing::Event<'_>) {}
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 impl Captured {
     fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+        static DEFER: std::sync::Once = std::sync::Once::new();
+        DEFER.call_once(|| {
+            // Another test may own the global slot; then this is a no-op.
+            let _ = tracing::subscriber::set_global_default(DeferToScoped);
+        });
         tracing_subscriber::fmt()
             .with_writer(self.clone())
             .with_max_level(tracing::Level::INFO)
@@ -463,24 +505,54 @@ async fn a_fresh_node_parks_round_one_and_escalates_what_cannot_move_858() {
     );
     let h = w.hashes();
 
+    // O4's and O5's meaning, each on a throwaway bridge (its own refusal
+    // memory): persist v55 refuses both as a typed malformed row, which edge
+    // holds terminal and parks on no signer.
+    for (name, row, why) in [
+        ("O4", &w.rows[3], "asserted_at"),
+        ("O5", &w.rows[4], "names no signer"),
+    ] {
+        let out = w
+            .bridge(None)
+            .apply_envelope_bytes(KIND, row, Some(R_PEER))
+            .await;
+        let ApplyOutcome::Refused { reason, retry, .. } = &out else {
+            panic!("{name} is refused, got {out:?}");
+        };
+        assert!(
+            reason.contains("federation_malformed_row") && reason.contains(why),
+            "precondition: persist refuses {name} as a malformed row at the source: {reason}"
+        );
+        assert_eq!(*retry, RetryDisposition::Terminal, "{name}: {reason}");
+        assert_eq!(out.awaits_signer(), None, "{name} names no dependency");
+        assert_eq!(out.awaits_acts_for(), None, "{name} names no dependency");
+    }
+
     // (a) Round 1: F wants all five, every one is refused.
     let want = round(&bridge, &w.rows).await;
     assert_eq!(want.len(), 5, "round 1 asks for every row");
     assert_eq!(bridge.refusal_memory_len(), 5, "all five refused");
     assert_eq!(
         bridge.rows_parked_on_signer(),
-        4,
-        "O1 and O4 park on P, O2 on A (absent Keys), O3 is indexed on U (held)"
+        3,
+        "O1 parks on P, O2 on A (absent Keys), O3 is indexed on U (held)"
     );
     let backoff = bridge.refusal_backoff_for_test();
-    assert_eq!(backoff.parked_on(w.p.key_id()), 2);
+    assert_eq!(backoff.parked_on(w.p.key_id()), 1);
     assert_eq!(backoff.parked_on(w.a.key_id()), 1);
     assert_eq!(backoff.parked_on(w.u.key_id()), 1);
     assert_eq!(
         bridge.parked_on_signer_len(),
-        4,
-        "O5 names no signer: not parked"
+        3,
+        "O4 and O5 are malformed rows: terminal, not parked"
     );
+    let past_transient_cap = Instant::now() + TRANSIENT_CAP + Duration::from_secs(60);
+    for (name, i) in [("O4", 3), ("O5", 4)] {
+        assert!(
+            backoff.suppressed_at(KIND, &h[i], past_transient_cap),
+            "{name} is on the terminal schedule from its first refusal"
+        );
+    }
 
     // (b) O3 again (a push, as the canonical's proactive publish does): its
     // signer is held and does not act for P here — terminal from attempt 2.
@@ -492,25 +564,11 @@ async fn a_fresh_node_parks_round_one_and_escalates_what_cannot_move_858() {
          ladder it is re-asked (and WARNed) ~12 times an hour forever (CIRISEdge#858 fix 4)"
     );
     assert_eq!(backoff.parked_on(w.u.key_id()), 1, "still indexed on U");
-
-    // (b) O5 names no dependency: three windows at the transient cap, then the
-    // terminal schedule (FSD §2 S1 → S2). Round 1 was refusal 1; seven more.
-    for refusal in 2..=8 {
-        push(&bridge, std::slice::from_ref(&w.rows[4])).await;
-        let quiet_past_cap = backoff.suppressed_at(
-            KIND,
-            &h[4],
-            Instant::now() + TRANSIENT_CAP + Duration::from_secs(60),
-        );
-        assert_eq!(
-            quiet_past_cap,
-            refusal == 8,
-            "refusal {refusal} of a row with no named dependency: only the 8th (after \
-             three windows at the transient cap) moves it to the terminal schedule \
-             (CIRISEdge#858 fix 6)"
-        );
-    }
-    assert_eq!(bridge.parked_on_signer_len(), 4, "O5 is still not a park");
+    assert_eq!(
+        bridge.parked_on_signer_len(),
+        3,
+        "O4 and O5 are still not parks"
+    );
 }
 
 /// (c) rounds 3–10: no re-ask of a parked row, and ONE refusal WARN and ONE
@@ -529,7 +587,7 @@ async fn one_refusal_warn_and_one_park_line_per_signer_858() {
             for (i, row) in ["O1", "O2", "O3", "O4"].iter().enumerate() {
                 assert!(
                     !want.contains(&h[i]),
-                    "{row} is parked: no round re-asks for it"
+                    "{row} is parked (O4: terminal): no round re-asks for it"
                 );
             }
             // The canonical's proactive push re-delivers every row anyway.
@@ -628,8 +686,8 @@ async fn the_key_releases_its_rows_and_the_host_hook_releases_a_local_claim_858(
     );
     let released = bridge.release_signer(w.p.key_id());
     assert_eq!(
-        released, 2,
-        "the host hook releases O1 and O4, parked on P (CIRISEdge#858 fix 3)"
+        released, 1,
+        "the host hook releases O1, parked on P (CIRISEdge#858 fix 3)"
     );
     assert!(!bridge.retry_suppressed(KIND, &h[0]));
     let want = round(&bridge, &w.rows).await;
@@ -668,7 +726,7 @@ async fn ordinary_refusals_cannot_evict_the_occurrence_parks_858() {
     );
     let h = w.hashes();
     round(&bridge, &w.rows).await;
-    assert_eq!(bridge.parked_on_signer_len(), 4);
+    assert_eq!(bridge.parked_on_signer_len(), 3);
     for i in 0..20u32 {
         let junk = format!("{{\"not_an_attestation\":{i}}}").into_bytes();
         let out = bridge
@@ -678,10 +736,10 @@ async fn ordinary_refusals_cannot_evict_the_occurrence_parks_858() {
     }
     assert_eq!(
         bridge.parked_on_signer_len(),
-        4,
+        3,
         "20 Attestation refusals into an 8-row ordinary ring left the parks alone"
     );
-    for (i, row) in ["O1", "O2", "O3", "O4"].iter().enumerate() {
+    for (i, row) in ["O1", "O2", "O3"].iter().enumerate() {
         assert!(
             bridge.retry_suppressed(KIND, &h[i]),
             "{row} is still parked: the Attestation churn must not evict it \
@@ -701,7 +759,7 @@ async fn ordinary_refusals_cannot_evict_the_occurrence_parks_858() {
     );
     round(&tight, &w.rows).await;
     assert_eq!(tight.parked_on_signer_len(), 2);
-    assert_eq!(metrics.snapshot().signer_park_evictions, 2);
+    assert_eq!(metrics.snapshot().signer_park_evictions, 1);
 }
 
 /// (g) a restart forgets the memory by design: each still-absent row is
@@ -720,7 +778,7 @@ async fn a_restart_refuses_each_row_once_and_re_parks_it_858() {
         }
     }
     assert_eq!(restarted.refusal_memory_len(), 5, "each row refused once");
-    assert_eq!(restarted.rows_parked_on_signer(), 4, "and re-parked once");
+    assert_eq!(restarted.rows_parked_on_signer(), 3, "and re-parked once");
     for signer in [w.p.key_id(), w.a.key_id(), w.u.key_id()] {
         assert_eq!(
             captured.lines("INFO", "parked", signer),
@@ -749,7 +807,7 @@ async fn the_park_ledger_is_in_the_metrics_snapshot_858() {
     let snap = metrics.snapshot();
     assert_eq!(
         snap.rows_parked_on_signer.get(&KIND).copied(),
-        Some(4),
+        Some(3),
         "rows parked on a signer, per plane, in the snapshot (CIRISEdge#858 fix 1)"
     );
     assert_eq!(snap.signer_releases, 1, "Key(A) released O2");
@@ -769,7 +827,7 @@ async fn the_park_ledger_is_in_the_metrics_snapshot_858() {
         (
             4,
             as_u64(DEFAULT_MAX_KEYS + DEFAULT_MAX_PARKED),
-            3,
+            2,
             as_u64(DEFAULT_MAX_PARKED),
         ),
         "the memory's size against its bounds, current after the release"

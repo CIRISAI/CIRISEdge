@@ -3,7 +3,7 @@
 //!
 //! CC publishes two generated files beside Part 3: `namespace_registry.json`
 //! (every family row — prefix, segments, closed leaves) and
-//! `namespace_match_vectors.json` (968 `(dimension, family, refusal)` triples,
+//! `namespace_match_vectors.json` (1103 `(dimension, family, refusal)` triples,
 //! exactly as the reference matcher `tools/cc_namespace_match.py` answers them).
 //! The contract on the vectors file: *every consumer replays these against its
 //! own matcher*. Both are vendored byte-for-byte under
@@ -20,23 +20,24 @@
 //!
 //! Test-only: the files are ~325 KB and nothing in production reads them.
 
-/// The CIRISConstitution commit both files are vendored from: `651140a` on
-/// `rc6` (`cc_version 1.0-rc6`), the commit that registered edge's
-/// `capacity:relay_delivery` row (CIRISConstitution#129). Byte-identical to
-/// what persist v51 vendors (CIRISPersist#924 follow-on) — so the replay
-/// persist runs and the one edge runs read the same bytes. (Was rc5
-/// `a4d29a6` until the v33.0.0 adopt.)
-pub const VENDORED_CC_COMMIT: &str = "651140a2a553e2276bf5d80c77a32feaa9968f75";
+/// The CIRISConstitution commit both files are vendored from: `536b8cb`, the
+/// commit the `v1.0-rc7` tag names (`cc_version 1.0-rc7`), copied with
+/// `git show v1.0-rc7:manifests/…`. Byte-identical to what persist v55
+/// vendors (its `VENDORED_REGISTRY_FILE_SHA256` / `VENDORED_VECTORS_FILE_SHA256`)
+/// — so the replay persist runs and the one edge runs read the same bytes.
+/// (Was rc6 `651140a` until the persist v55 adopt, rc5 `a4d29a6` until the
+/// v33.0.0 adopt.)
+pub const VENDORED_CC_COMMIT: &str = "536b8cbb931da1f4549425284af24cd227587c36";
 
 /// `_meta.registry_sha256` — the hash of the GRAMMAR (families + `_meta`
 /// minus the prose hash), CSD/3's pin. A wording edit to Part 3 moves only
 /// `source_sha256`; a grammar edit moves this.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "c22dc0874b4c5ade08d8a691effdee36464eeaa76e3c57de28bdd0d0b2328d3e";
+    "796f609981434b838edab1165462484f1be67889eed7f60c26b210ede5984464";
 
-/// The number of vectors the pinned file carries (rc6 at `651140a`: rc5's
-/// 962 plus the six for edge's registered relay-delivery row).
-pub const VENDORED_N_VECTORS: usize = 968;
+/// The number of vectors the pinned file carries (rc7 at `536b8cb`; rc6 at
+/// `651140a` carried 968).
+pub const VENDORED_N_VECTORS: usize = 1103;
 
 /// `vendor/constitution/namespace_registry.json`, byte-for-byte.
 pub const REGISTRY_JSON: &str = include_str!("../vendor/constitution/namespace_registry.json");
@@ -207,7 +208,7 @@ mod tests {
             vroot["_meta"]["registry_sha256"], VENDORED_REGISTRY_SHA256,
             "the vectors were generated from a different grammar than the vendored registry"
         );
-        assert_eq!(meta["cc_version"], "1.0-rc6");
+        assert_eq!(meta["cc_version"], "1.0-rc7");
         // The commit is a full 40-hex SHA — a re-vendor records exactly where the bytes came from.
         assert!(
             VENDORED_CC_COMMIT.len() == 40

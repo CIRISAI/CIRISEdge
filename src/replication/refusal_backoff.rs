@@ -76,8 +76,8 @@ use super::protocol::EnvelopeKind;
 /// have converged. That one is worse — the first burns transport visibly, the
 /// second withholds state invisibly — so where a persist token collapses a
 /// recoverable arm and an unrecoverable one into the SAME value (`re_scrub`,
-/// `unverifiable_signature`), the call is `Transient`, and the backoff is what
-/// makes that safe to say.
+/// and until persist v54.1.0 `unverifiable_signature`), the call is
+/// `Transient`, and the backoff is what makes that safe to say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RetryDisposition {
     /// The verdict was decided by state that is still MOVING — a roster that
@@ -192,7 +192,7 @@ struct Entry {
     /// [`RefusalBackoff::clear`] (an admit), a release, or eviction.
     attempts: u32,
     /// The MOST RECENT verdict. A row can change disposition — a signer key
-    /// lands and `unverifiable_signature` becomes `conflicting_version` — and
+    /// lands and `attester_key_unknown` becomes `conflicting_version` — and
     /// the latest reading is the one that should govern the next window.
     disposition: RetryDisposition,
     /// When this node may ask for these bytes again.
@@ -777,6 +777,45 @@ mod tests_679 {
         let mut x = [0u8; 32];
         x[0] = seed;
         x
+    }
+
+    /// CIRISEdge#858 fix 6 (FSD §2 S1 → S2) — a TRANSIENT refusal of a row
+    /// that names no dependency (not parked, not indexed) spends three windows
+    /// at `TRANSIENT_CAP` and then moves to the terminal schedule: refusals
+    /// 1–7 book transient windows (20, 40, 80, 160, then 300 s three times),
+    /// the 8th books `TERMINAL_BASE`. A parked row is exempt.
+    ///
+    /// A unit witness since the persist v55.0.0 adopt: the production row
+    /// `park_fresh_858`'s O5 used to drive this (a row naming no signer, an
+    /// untyped `InvalidArgument`) is now persist's TERMINAL `MalformedRow`
+    /// (#1055), and no other production row is still an untyped,
+    /// dependency-less transient.
+    #[test]
+    fn a_dependency_less_transient_moves_to_the_terminal_schedule_at_refusal_8() {
+        let b = RefusalBackoff::new();
+        let k = EnvelopeKind::Attestation;
+        let now = Instant::now();
+        for refusal in 1..=8u32 {
+            let window = b.record_at(k, h(5), RetryDisposition::Transient, now);
+            if refusal < 8 {
+                assert!(
+                    window <= TRANSIENT_CAP,
+                    "refusal {refusal}: still on the transient ladder ({window:?})"
+                );
+            } else {
+                assert_eq!(
+                    window, TERMINAL_BASE,
+                    "refusal 8, after three windows at the cap: the terminal schedule"
+                );
+            }
+        }
+        // A parked row never escalates on the transient counter.
+        b.record_at(k, h(6), RetryDisposition::Transient, now);
+        b.park_booked_at(k, h(6), "absent-key", None, now);
+        for _ in 0..12 {
+            b.record_at(k, h(6), RetryDisposition::Transient, now);
+        }
+        assert_eq!(b.parked_on("absent-key"), 1, "a parked row stays indexed");
     }
 
     /// CIRISEdge#679 — a parked row is quiet on the TERMINAL schedule (every

@@ -18,7 +18,6 @@
 use ciris_persist::federation::blobs::BlobStorage as _;
 use ciris_persist::federation::custody_ack::{device_custody_of, CustodyVerdict};
 use ciris_persist::federation::durability::{DeficitAudience, DurabilityMode};
-use ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX;
 use ciris_persist::federation::types::device_class;
 use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
 
@@ -150,11 +149,16 @@ async fn a_self_file_reaches_every_personal_device_as_a_full_holder_not_a_server
         !matches!(at_s, PullOutcome::Stored { .. }),
         "a server-class node of alice's holds none of her self file: {at_s:?}"
     );
+    assert_eq!(
+        verdict(&node_a, &node_a.me, &file.sha).await,
+        CustodyVerdict::Here,
+        "persist v55's write door filed A's holding claim as it stored the file (CIRISPersist#989)"
+    );
     let sweep_a = puller_a.durability_sweep().await;
     assert_eq!(
-        sweep_a.reported_here,
-        vec![file.sha],
-        "A holds its own file whole and reports it"
+        (sweep_a.reported_here.clone(), sweep_a.already_here.clone()),
+        (Vec::new(), vec![file.sha]),
+        "A holds its own file whole, and its report is live and fresh: nothing to re-file"
     );
     assert!(sweep_a.repairs.is_empty());
     let sweep_s = puller_s.durability_sweep().await;
@@ -212,8 +216,8 @@ async fn a_device_that_lost_its_copy_is_missing_and_repaired_rarest_first_763() 
             .await,
         PullOutcome::Stored { announced: false }
     );
-    // A reports both; only F1's report reaches B.
-    assert_eq!(puller_a.durability_sweep().await.reported_here.len(), 2);
+    // A's write door reported both (v55); only F1's report reaches B.
+    assert_eq!(puller_a.durability_sweep().await.already_here.len(), 2);
     let f1_hex = hex::encode(f1.sha);
     for row in node_a
         .dir
@@ -334,11 +338,7 @@ async fn key_grant_rows(node: &Node) -> usize {
         .await
         .expect("list")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
         .count()
 }
 
@@ -400,7 +400,7 @@ async fn a_dag_missing_a_chunk_is_not_held_and_files_no_here_763() {
     )
     .await;
     assert!(
-        matches!(&refused, Err(e) if e.contains("custody_ack_here_dag_incomplete")),
+        matches!(&refused, Err(e) if e.to_string().contains("custody_ack_here_dag_incomplete")),
         "persist's door refuses `here` for a DAG missing a chunk: {refused:?}"
     );
 
@@ -466,9 +466,11 @@ async fn a_dag_missing_a_chunk_is_not_held_and_files_no_here_763() {
     let repair = puller
         .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
         .await;
+    // persist v55 (CIRISPersist#989): B's `here`, filed after its first pull,
+    // IS its holding claim, so the repair reports the claim that exists.
     assert_eq!(
         repair,
-        PullOutcome::Stored { announced: false },
+        PullOutcome::Stored { announced: true },
         "the pull fetched the lost chunk and persist re-adopted it at its kept position \
          (not AlreadyHeld, not a seq conflict)"
     );
@@ -755,7 +757,7 @@ async fn a_withdrawn_file_reads_withdrawn_and_is_not_repaired_763() {
     )
     .await;
     assert!(
-        matches!(&direct, Err(e) if e.contains("is retracted")),
+        matches!(&direct, Err(e) if e.to_string().contains("is retracted")),
         "`here` for a withdrawn file is refused by edge: {direct:?}"
     );
     let resweep = puller.durability_sweep().await;
@@ -950,16 +952,18 @@ async fn the_durability_pass_rolls_past_its_file_budget_802() {
                 .sha,
         );
     }
+    // Persist v55's write door filed each file's `here` (CIRISPersist#989),
+    // so a pass that reaches a file finds it live and fresh.
     let first = puller_a.durability_sweep().await;
     assert_eq!(
-        first.reported_here.len(),
+        first.already_here.len(),
         4,
-        "the first pass stops after two pages (budget 3): {} reported",
-        first.reported_here.len()
+        "the first pass stops after two pages (budget 3): {} reached",
+        first.already_here.len()
     );
     let second = puller_a.durability_sweep().await;
-    let mut reached: Vec<[u8; 32]> = first.reported_here.clone();
-    reached.extend(second.reported_here.iter().copied());
+    let mut reached: Vec<[u8; 32]> = first.already_here.clone();
+    reached.extend(second.already_here.iter().copied());
     for sha in &shas {
         assert!(
             reached.contains(sha),
@@ -968,7 +972,7 @@ async fn the_durability_pass_rolls_past_its_file_budget_802() {
         );
     }
     assert!(
-        !second.reported_here.is_empty(),
+        !second.already_here.is_empty(),
         "the second pass resumed past the first pass's stop, not at the room's head"
     );
 }
@@ -1041,9 +1045,9 @@ async fn a_durability_pass_folds_each_audience_device_once_817() {
 
     let sweep_a = puller_a.durability_sweep().await;
     assert_eq!(
-        sweep_a.reported_here.len(),
+        sweep_a.already_here.len(),
         4,
-        "A holds and reports all four"
+        "A holds all four, each reported by persist v55's write door"
     );
     let audience = super::durability::audience_of(
         &row_deficit(
@@ -1133,4 +1137,317 @@ async fn a_durability_pass_folds_each_audience_device_once_817() {
     // After B's pass filed its `here`, the index still agrees on both nodes.
     assert_pass_index_agrees(&node_b, &refs, &devices).await;
     assert_pass_index_agrees(&node_a, &refs, &devices).await;
+}
+
+/// Does `node`'s holder fold, read at `at`, name `node` itself for `sha`?
+async fn names_itself(node: &Node, sha: &[u8; 32], at: chrono::DateTime<chrono::Utc>) -> bool {
+    ciris_persist::federation::holding_claim::live_holders(&*node.dir, sha, at)
+        .await
+        .expect("live_holders")
+        .contains(&node.me)
+}
+
+/// **The pass still FILES a `here` whenever this node's claim is not live
+/// and fresh.** Since persist v55 the write door files the holding claim as it
+/// stores, so a fresh file is `already_here` on the first pass; this is the
+/// pass's own filing job, which those first passes no longer reach. alice's
+/// laptop A publishes a self file, and:
+///
+/// 1. A retracts its claim (a `none`, CC 3.1.3.3 rule 4): its holder fold
+///    drops it, and the next pass files a `here` again, so the fold names A.
+/// 2. Read 25 h on, the claim is live but past the daily refresh
+///    (`CUSTODY_REFRESH`): the pass re-files it.
+/// 3. Read 73 h on, every claim A filed has lapsed (72 h liveness): the pass
+///    files a fresh one, which the fold at the real clock names.
+///
+/// Each filing is booked `filed_here` in `durability_custody`; the
+/// fresh-claim pass is booked `already_here`. Fails with the filing arm
+/// removed (nothing re-files, and a lapsed claim stays lapsed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pass_files_here_when_the_claim_is_retracted_stale_or_lapsed_763() {
+    use crate::observability::{DURABILITY_ALREADY_HERE, DURABILITY_FILED_HERE};
+    use ciris_persist::federation::custody_ack::CustodyState;
+    let (alice, node_a, _node_b) = two_devices().await;
+    let edge_a = edge_of(&node_a);
+    let puller_a = puller_of(&node_a, &edge_a);
+    let booked = |tag: &str| {
+        edge_a
+            .metrics()
+            .snapshot()
+            .durability_custody
+            .get(tag)
+            .copied()
+            .unwrap_or(0)
+    };
+    let file = publish_self_file(&node_a, &alice).await;
+    let now = chrono::Utc::now;
+    assert!(
+        names_itself(&node_a, &file.sha, now()).await,
+        "the write door filed A's claim"
+    );
+    let first = puller_a.durability_sweep().await;
+    assert_eq!(first.already_here, vec![file.sha]);
+    assert_eq!(booked(DURABILITY_ALREADY_HERE), 1);
+    assert_eq!(booked(DURABILITY_FILED_HERE), 0);
+
+    // 1. Retracted.
+    let file_row = crate::files::FileRow::from_row(&file.row).expect("a file row");
+    super::durability::file_custody(
+        node_a.store.engine(),
+        &file.row,
+        &file.sha,
+        &file_row.pointer,
+        CustodyState::None,
+    )
+    .await
+    .expect("A retracts its claim");
+    assert!(
+        !names_itself(&node_a, &file.sha, now()).await,
+        "a `none` retracts A's claim"
+    );
+    let refiled = puller_a.durability_sweep().await;
+    assert_eq!(
+        refiled.reported_here,
+        vec![file.sha],
+        "the pass files a `here` for a retracted claim it still holds whole"
+    );
+    assert!(
+        names_itself(&node_a, &file.sha, now()).await,
+        "the fold names A again"
+    );
+    assert_eq!(booked(DURABILITY_FILED_HERE), 1);
+
+    // 2. Stale: live, but past the daily refresh.
+    let stale = puller_a
+        .durability_sweep_at(now() + chrono::Duration::hours(25))
+        .await;
+    assert_eq!(
+        stale.reported_here,
+        vec![file.sha],
+        "a claim past the refresh is re-filed"
+    );
+    assert_eq!(booked(DURABILITY_FILED_HERE), 2);
+
+    // 3. Lapsed: past the 72 h liveness of every claim A filed.
+    let lapsed_at = now() + chrono::Duration::hours(73);
+    assert!(
+        !names_itself(&node_a, &file.sha, lapsed_at).await,
+        "73 h on, every claim A filed has lapsed"
+    );
+    let lapsed = puller_a.durability_sweep_at(lapsed_at).await;
+    assert_eq!(
+        lapsed.reported_here,
+        vec![file.sha],
+        "a lapsed claim is filed afresh"
+    );
+    assert_eq!(booked(DURABILITY_FILED_HERE), 3);
+    assert!(
+        names_itself(&node_a, &file.sha, now()).await,
+        "the fresh claim is live at the real clock"
+    );
+    assert!(lapsed.repairs.is_empty() && refiled.repairs.is_empty());
+}
+
+/// Tombstone `sha` on `node` with a counter-notice takedown (`dmca_512`: the
+/// bytes stay on disk through its window, withheld), as persist's own I778
+/// does: a claimant who is the signed subject of the content's establishing
+/// row files a signed `takedown_notice`, and the node records it.
+async fn take_down(node: &Node, sha: &[u8; 32]) -> String {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use ciris_crypto::{ClassicalSigner as _, Ed25519Signer};
+    use ciris_persist::federation::takedown_tombstone::{takedown_tombstone, TakedownNotice};
+    use ciris_persist::federation::tier_ingest::test_support as ts;
+    use ciris_persist::federation::FederationDirectory;
+    let dir: &dyn FederationDirectory = &*node.dir;
+    let sha_hex = hex::encode(sha);
+    let claimant = Ed25519Signer::from_seed(&[0xa1; 32]).expect("claimant seed");
+    let claimant_id = B64.encode(claimant.public_key().expect("claimant pk"));
+    let producer = "takedown-producer";
+    for k in [producer, claimant_id.as_str()] {
+        if dir.lookup_public_key(k).await.expect("lookup").is_none() {
+            ts::register_hybrid_key(dir, k).await;
+        }
+    }
+    let now = chrono::Utc::now();
+    let establishing = ts::seal_row(
+        producer,
+        ciris_persist::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: producer.into(),
+            attested_key_id: producer.into(),
+            attestation_type: ciris_persist::federation::types::attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "content:established:v1",
+                "evidence_refs": [sha_hex],
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: producer.into(),
+            scrub_timestamp: now,
+            pqc_completed_at: Some(now),
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![claimant_id.clone()],
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
+            tier: ciris_persist::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        },
+    );
+    dir.put_attestation(SignedAttestation {
+        attestation: establishing,
+    })
+    .await
+    .expect("the establishing row");
+    let ts_of = |t: chrono::DateTime<chrono::Utc>| serde_json::to_value(t).expect("ts");
+    let mut envelope = serde_json::json!({
+        "contribution_id": uuid::Uuid::new_v4().to_string(),
+        "contribution_type": "proposal",
+        "author_id": claimant_id,
+        "subject": {"domain": "media", "language": "en", "subject": "takedown_notice"},
+        "payload": {
+            "content_sha256": sha_hex,
+            "claimant_key_id": claimant_id,
+            "legal_basis": "dmca_512",
+            "jurisdiction": "US",
+            "good_faith_statement": "good faith",
+            "claim_text": "claim",
+            "asserted_at": ts_of(now),
+            "expires_at": ts_of(now + chrono::Duration::days(30)),
+        },
+        "witness_set": null,
+        "signature": {"ed25519": "", "ml_dsa_65": null, "signed_at": ts_of(now)},
+        "submitted_at": ts_of(now),
+    });
+    let canonical = ciris_persist::verify::canonical::canonicalize_envelope_for_signing(&envelope)
+        .expect("canonical");
+    envelope["signature"]["ed25519"] =
+        serde_json::json!(B64.encode(claimant.sign(&canonical).expect("sign")));
+    let report = takedown_tombstone(dir, &TakedownNotice { envelope }, "takedown-node")
+        .await
+        .expect("the takedown");
+    assert!(report.tombstoned, "tombstoned: {report:?}");
+    ciris_persist::federation::steward_purge::purge_withheld(dir, sha)
+        .await
+        .expect("withholding")
+        .expect("the bytes are withheld")
+}
+
+/// **persist v55 r3 (Codex r3 on #1065) — a durability pass leaves bytes a
+/// takedown withholds alone.** alice's laptop holds a self file; a
+/// counter-notice takedown tombstones it (the bytes stay on disk, withheld)
+/// and the copy then loses a chunk. The pass books it `withheld`, files
+/// nothing (persist would refuse a `here` as `custody_ack_here_withheld`, and
+/// a `none` would be a report about withheld bytes) and queues NO repair (a
+/// repair would pull taken-down content back). Fails with the withholding
+/// check removed: nothing is booked `withheld`. (Without the check the pass
+/// still files nothing and repairs nothing here — persist's readiness door
+/// refuses a withheld manifest, so the pass stops at "holding unreadable" —
+/// but silently; the check is what makes the outcome named and keeps the
+/// pass from leaning on that read failing.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durability_pass_leaves_withheld_bytes_alone() {
+    use crate::observability::DURABILITY_WITHHELD;
+    let (alice, node_a, _node_b) = two_devices().await;
+    let edge_a = edge_of(&node_a);
+    let puller_a = puller_of(&node_a, &edge_a);
+    let file = publish_self_file(&node_a, &alice).await;
+    let notice = take_down(&node_a, &file.sha).await;
+    assert!(!notice.is_empty());
+    // Whatever the takedown itself retracted, the pass must add nothing.
+    let reports_before = node_a
+        .dir
+        .list_attestations_by(&node_a.me)
+        .await
+        .expect("list")
+        .len();
+    let (_, _, lost) = file.stream[1];
+    let _ = node_a.dir.delete_blob(&lost).await.expect("delete");
+
+    let sweep = puller_a.durability_sweep().await;
+    assert_eq!(sweep.withheld, vec![file.sha], "booked withheld: {sweep:?}");
+    assert!(
+        sweep.repairs.is_empty(),
+        "no repair pulls taken-down bytes back: {:?}",
+        sweep.repairs.iter().map(|r| r.sha).collect::<Vec<_>>()
+    );
+    assert!(sweep.reported_here.is_empty() && sweep.already_here.is_empty());
+    assert_eq!(
+        node_a
+            .dir
+            .list_attestations_by(&node_a.me)
+            .await
+            .expect("list")
+            .len(),
+        reports_before,
+        "no custody report was filed about withheld bytes"
+    );
+    assert_eq!(
+        edge_a
+            .metrics()
+            .snapshot()
+            .durability_custody
+            .get(DURABILITY_WITHHELD)
+            .copied(),
+        Some(1),
+        "booked once for the pass"
+    );
+}
+
+/// **persist v55.0.0 (5ee68307) — a takedown that lands between the pass's
+/// withholding guard and its custody report is booked `withheld`, not
+/// `report_refused`.** The guard is bypassed: alice's laptop files `here`
+/// straight through `durability::file_custody` for a self file a real
+/// counter-notice takedown withholds. persist's custody door refuses it TYPED
+/// (`PurgeRefused` with `steward_purge::token::BLOB_PURGED`, naming the
+/// notice), and the pass's booking reads it as `withheld` (DEBUG), never a
+/// refused report. Fails with the `withheld_notice` match removed from
+/// `book_custody_report`: it books `report_refused`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withheld_here_refused_by_persist_books_withheld_not_report_refused() {
+    use crate::observability::{DURABILITY_REPORT_REFUSED, DURABILITY_WITHHELD};
+    use ciris_persist::federation::custody_ack::CustodyState;
+    let (alice, node_a, _node_b) = two_devices().await;
+    let edge_a = edge_of(&node_a);
+    let puller_a = puller_of(&node_a, &edge_a);
+    let file = publish_self_file(&node_a, &alice).await;
+    let notice = take_down(&node_a, &file.sha).await;
+    let file_row = crate::files::FileRow::from_row(&file.row).expect("a file row");
+    let filed = super::durability::file_custody(
+        node_a.store.engine(),
+        &file.row,
+        &file.sha,
+        &file_row.pointer,
+        CustodyState::Here,
+    )
+    .await;
+    assert_eq!(
+        filed.as_ref().err().and_then(|e| e.withheld_notice()),
+        Some(notice.as_str()),
+        "persist refuses `here` about withheld bytes, typed, naming the notice: {filed:?}"
+    );
+    let mut out = super::durability::DurabilitySweep::default();
+    assert!(
+        puller_a.book_custody_report(
+            &hex::encode(file.sha),
+            file.sha,
+            CustodyState::Here,
+            filed,
+            &mut out
+        ),
+        "the report's refusal says the bytes are withheld"
+    );
+    assert_eq!(out.withheld, vec![file.sha]);
+    let booked = edge_a.metrics().snapshot().durability_custody;
+    assert_eq!(
+        booked.get(DURABILITY_WITHHELD).copied(),
+        Some(1),
+        "{booked:?}"
+    );
+    assert_eq!(booked.get(DURABILITY_REPORT_REFUSED), None, "{booked:?}");
 }

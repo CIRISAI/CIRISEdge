@@ -160,6 +160,8 @@ mod sim;
 pub(crate) mod single_flight;
 pub mod storage_contention;
 pub mod summary;
+#[cfg(test)]
+mod typed_refusal_858_tests;
 pub mod wire_frame;
 
 /// What [`InboundRouter::try_route`] did with a frame.
@@ -408,7 +410,8 @@ pub use scheduler::{
 #[doc(inline)]
 pub use session::{ReplicationOutcome, Session, SessionRole};
 pub use summary::{
-    ApplyOutcome, FetchBatch, LocalState, StalenessSignal, StateApplier, StateProvider,
+    ApplyOutcome, AwaitedSigner, FetchBatch, LocalState, StalenessSignal, StateApplier,
+    StateProvider,
 };
 #[doc(inline)]
 pub use wire_frame::{

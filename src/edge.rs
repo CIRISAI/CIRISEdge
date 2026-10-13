@@ -42,12 +42,19 @@ use crate::verify::{
 
 // ─── CEG §10.1.2 spec constants (CIRISEdge#42, v0.12.0) ─────────────
 
-/// Default TTL for a `holds_bytes:sha256:*` attestation row — 24
-/// hours from `signed_at`, per CEG 0.1 §10.1.2. Configurable via
+/// Default TTL the `holds_bytes:sha256:*` carrier (retired in v55) was
+/// given — 24 hours from `signed_at`, per CEG 0.1 §10.1.2. Configurable via
 /// [`EdgeConfig::holds_bytes_ttl_seconds`]; this constant is the
 /// spec-pinned default the [`Default`] impl on [`EdgeConfig`] reads.
 /// Lives at the crate root (not behind the reticulum-feature gate) so
 /// non-reticulum builds compile EdgeConfig::default unchanged.
+///
+/// **Deprecated and INERT since the persist v55.0.0 adopt; removed at the next
+/// edge MAJOR.** persist retired `holds_bytes` (CIRISPersist#989, CC 2.4 rc7):
+/// the holding claim is `custody:ack:v1`, and persist's custody fold owns its
+/// liveness (72 h from the signed instant, renewed by the re-ack sweeper). No
+/// edge path reads this value for a holder decision any more. Kept so hosts
+/// that set it keep compiling.
 pub const DEFAULT_HOLDS_BYTES_TTL_SECONDS: u64 = 24 * 60 * 60;
 
 /// Default rolling window for the per-holder ContentMiss downweight
@@ -323,14 +330,21 @@ pub struct EdgeConfig {
     /// snapshot to render `peer_reachability(key_id) → dict[str, float]`.
     pub reachability_window_seconds: u64,
     /// CIRISEdge#42 (v0.12.0, CEG §10.1.2) — TTL in seconds for
-    /// `holds_bytes:sha256:{prefix}` attestations. After this many
-    /// seconds elapse from `signed_at`, the attestation is **stale**
-    /// and `PeerResolver::resolve_holders_with_signed_at` results are
-    /// filtered to exclude it before `filter_holders_with_policy`
-    /// returns. Default [`DEFAULT_HOLDS_BYTES_TTL_SECONDS`] (86_400s =
+    /// `holds_bytes:sha256:{prefix}` attestations (the carrier retired in
+    /// v55). Before v55, after this many seconds from `signed_at` the
+    /// attestation was **stale** and `PeerResolver::resolve_holders_with_signed_at`
+    /// results were filtered to exclude it before `filter_holders_with_policy`
+    /// returned. Default [`DEFAULT_HOLDS_BYTES_TTL_SECONDS`] (86_400s =
     /// 24 hours per CEG §10.1.2 spec). Test deployments may shorten
     /// this to verify the staleness logic; production should leave it
     /// at the default.
+    ///
+    /// **Deprecated and INERT since the persist v55.0.0 adopt; removed at the
+    /// next edge MAJOR.** `holds_bytes` is retired (CIRISPersist#989): the
+    /// holding claim is `custody:ack:v1`, live for 72 h by persist's custody
+    /// fold and renewed by the re-ack sweeper
+    /// ([`crate::group_content::PersistGroupContentStore::spawn_holding_claim_reack`]).
+    /// Setting it changes nothing; it is kept so hosts that set it compile.
     pub holds_bytes_ttl_seconds: u64,
     /// CIRISEdge#42 (v0.12.0, CEG §10.1.2) — rolling window in seconds
     /// for the per-holder ContentMiss downweight tracker. A holder
@@ -470,8 +484,8 @@ pub struct EdgeConfig {
     /// CIRISEdge#52 (v0.20.1) — L1-as-CDN-edge opt-in per
     /// MEDIA_SHARING.md §2.7. When `true` AND
     /// [`Self::agent_mode`] is `AgentMode::Server` (L1), edge
-    /// pre-fetches external multimedia content + re-emits its own
-    /// `holds_bytes:sha256:{hash}` attestation so federation peers
+    /// pre-fetches external multimedia content + files its own holding
+    /// claim (`custody:ack:v1` `here` since v55) so federation peers
     /// can fetch through the operator's CDN tier. Default `false`
     /// (opt-in per the spec); Client and Proxy modes ignore the
     /// flag regardless of its value.
@@ -487,8 +501,8 @@ pub struct EdgeConfig {
     /// L1-as-CDN-edge re-publication. Required when
     /// [`Self::l1_cdn_edge_enabled`] is `true`; ignored otherwise.
     /// The prefetch stub re-publishes content at
-    /// `{l1_cdn_edge_external_uri_base}/{sha256_hex}` and emits a
-    /// fresh `holds_bytes` attestation against that URI.
+    /// `{l1_cdn_edge_external_uri_base}/{sha256_hex}` and files a
+    /// fresh holding claim (`custody:ack:v1` `here`) for it.
     ///
     /// `None` when L1-CDN-edge is disabled (the default); operators
     /// who flip the boolean MUST also supply this base before
@@ -947,8 +961,16 @@ pub enum ContentResult {
     /// `dispatch_inbound` ContentBody gate validates this before
     /// signalling the pending channel).
     Bytes(Vec<u8>),
-    /// The peer returned a `ContentMiss` (typed reason). Fetcher
-    /// SHOULD try another peer per the MissReason taxonomy.
+    /// The peer returned a `ContentMiss` (typed reason). Edge does not
+    /// retry; the host decides, per the
+    /// [`MissReason`](crate::messages::MissReason) taxonomy:
+    /// `NotHeld`, `PolicyDenied` and `DiskPressure` MAY be tried at another
+    /// peer, but `Withdrawn` and `Revoked` mean STOP — the bytes were
+    /// retracted (or purged, which reaches the wire as `Withdrawn`) or their
+    /// signer revoked federation-wide, every holder is bound by the same
+    /// verdict, and asking another peer must not be attempted. This is the
+    /// disposition edge's own fetchers give the same words (whole blob:
+    /// `GoneFederationWide`; DAG: `DagFetchError::Gone`).
     ContentMiss { reason: String },
     /// CIRISEdge#52 (v0.20.1) — multimedia tier: the peer returned a
     /// `BlobBody::External` pointer (MEDIA_SHARING.md §2.6). Edge
@@ -6900,8 +6922,9 @@ async fn dispatch_inbound(
 
     // CIRISEdge#42 (v0.12.0, CEG §10.1.2) — `ContentMiss` is the
     // canonical CEG §10.1.2 trigger for emitting a `Withdraws`
-    // attestation against the holder. The peer (the holder) advertised
-    // `holds_bytes:sha256:{prefix}` for this SHA, we asked, and the
+    // attestation against the holder. The peer (the holder) advertised a
+    // holding claim for this SHA (`custody:ack:v1` `here` since v55;
+    // `holds_bytes:sha256:{prefix}` before), we asked, and the
     // holder responded with a typed miss. The withdrawal is shipped
     // via the existing federation evidence path; receivers aggregate
     // per `(holder_key_id, sha256)` and apply the downweight policy in
@@ -7507,7 +7530,7 @@ async fn dispatch_inbound(
                     // holders: best-effort observability emission via
                     // the resource event channel. The federation-tier
                     // emission lands in a future cut (when persist's
-                    // holds_bytes index reachable at edge); for now
+                    // holder index reachable at edge); for now
                     // the tracing span IS the cross-peer observable
                     // (lens-core consumes the span and ships it).
                     events.emit_resource(crate::events::NetworkEvent::resource(
@@ -9013,7 +9036,7 @@ async fn emit_delivery_attestation(
 /// downweight policy in their own
 /// [`crate::transport::reticulum::PeerResolver`]. The destination of
 /// the withdrawal envelope is the **holder itself** — the peer who
-/// advertised the `holds_bytes` attestation we are withdrawing against
+/// advertised the holding claim we are withdrawing against
 /// (so the holder sees its own observability). Future federation
 /// collectors that aggregate withdrawals can subscribe via the
 /// `Delivery::Mandatory` retransmission path; v0.12.0 ships the

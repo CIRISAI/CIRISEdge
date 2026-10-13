@@ -41,7 +41,8 @@ use super::protocol::{
 };
 use super::retention::{retention_for, Retention};
 use super::summary::{
-    diff_refs, ApplyOutcome, FetchBatch, StalenessSignal, StateApplier, StateProvider,
+    diff_refs, ApplyOutcome, AwaitedSigner, FetchBatch, StalenessSignal, StateApplier,
+    StateProvider,
 };
 use crate::log_throttle::{LogThrottle, ThrottleDecision};
 
@@ -1127,7 +1128,11 @@ impl Session {
                 // reader can tell "this converges once more state lands" from "this
                 // will be refused identically forever" without knowing which persist
                 // token maps to which. It is a stable token, never prose.
-                ApplyOutcome::Refused { reason, retry } => {
+                ApplyOutcome::Refused {
+                    reason,
+                    retry,
+                    awaits_signer,
+                } => {
                     refused += 1;
                     // CIRISEdge#552 — an explicitly requested body that refuses
                     // TRANSIENTLY must stay expected. The expectation is the only
@@ -1157,9 +1162,25 @@ impl Session {
                     // question. Deliberately keyed on the DISPOSITION, not on
                     // the reason prose — consumers key on stable tokens, and a
                     // spurious note costs one deduped lookup at the drain.
-                    let signer =
-                        crate::replication::missing_signer::missing_signer_of(self.kind, env_bytes);
-                    if !retry.is_terminal() {
+                    //
+                    // CIRISEdge#858 fix 7 — the signer persist SAID it lacks
+                    // (v54.1.0 `AttesterKeyUnknown`) wins over the bytes'
+                    // guess: a co-signer is not the row's attester.
+                    //
+                    // persist v54.1.0 — an `ActsFor` signer's Key is HELD (its
+                    // signature verified), so there is nothing to fetch; it
+                    // still names the signer for the WARN throttle below.
+                    let (signer, key_missing) = match awaits_signer {
+                        Some(AwaitedSigner::Key(s)) => (Some(s.clone()), true),
+                        Some(AwaitedSigner::ActsFor(s)) => (Some(s.clone()), false),
+                        None => (
+                            crate::replication::missing_signer::missing_signer_of(
+                                self.kind, env_bytes,
+                            ),
+                            true,
+                        ),
+                    };
+                    if !retry.is_terminal() && key_missing {
                         if let Some(signer) = &signer {
                             provider.note_missing_signer(self.kind, signer, source_peer);
                         }

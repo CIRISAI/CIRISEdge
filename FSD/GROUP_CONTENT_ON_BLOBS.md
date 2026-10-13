@@ -437,8 +437,9 @@ that ignores them has not used the substrate.
   serve gate and no store gate, so the converger can push a shard to a node
   outside the community. A `Cohort`-ceiling tombstone does not reach that
   node, and the violation is silent. persist exposes `crypto_tier` on every
-  blob row and every `holds_bytes` announcement, so the ceiling choice keys
-  off the tier without a new primitive.
+  blob row and every `holds_bytes` announcement (retired in v55; the
+  holding claim is now `custody:ack:v1`), so the ceiling choice keys off
+  the tier without a new primitive.
 
   This makes #581 a **prerequisite for narrowing the ceiling**, not only for
   claiming recall — the wide ceiling is the interim cost of not having it.
@@ -516,7 +517,7 @@ that reveals the content.
 | `content_sha256` | the at-rest sha to read |
 | `content_field` | which field this blob is; **AAD input** |
 | `media_type` | so a reader knows what it got before opening it — **in clear iff `sealed_descriptor` is absent** (CC 3.3.13 / CIRISConstitution#114: one description, never two) |
-| `size` | bytes of the plaintext; REQUIRED in clear (CC 5.3.2.5 — checked before hashing; self/family emit no `holds_bytes` row to learn it from) — added with `sealed_descriptor` |
+| `size` | bytes of the plaintext; REQUIRED in clear (CC 5.3.2.5 — checked before hashing; a self/family holding claim is never observable outside its cohort, so a reader cannot count on one to learn it from) — added with `sealed_descriptor` |
 | `content_digest` | sha256 of the plaintext; REQUIRED in clear in the encrypted case (the ruled second hash) |
 | `placeholder` | optional thumbhash, images only — the one thing a UI may show before CC 5.3.2.5 passes |
 | `sealed_descriptor` | CIRISEdge#698 — base64 AEAD under the **same DEK as the bytes** over JCS `{name, format, codec?}`, AAD = this blob's address digest; opens only for a reader who can open the bytes; the file row's `filename` is then absent in clear. Lives here, inside `content`, not in persist's `media` struct, until CIRISPersist#922 (mixed-fleet rule, `CONTENT_TRANSFER.md` §6.7.1). Producer blocked on a persist seal/open door for an existing blob's DEK (§6.7.1). |
@@ -630,7 +631,7 @@ they hold now.
 | **G6** | Destroying an epoch makes content sealed under it unopenable **through every persist read door on this node**, with no path that bypasses it. Deliberately not "unopenable everywhere": that is the tombstone plane's reach, not this one's, and asserting it here would be the precondition-that-cannot-be-checked persist's §11.4 warns about. | ❌ none — edge has no epoch-destroy path |
 | **G7** | A range read returns the plaintext range requested, never a ciphertext substring. | ❌ none — no range read on edge yet |
 | **G8** | Two blobs in one row cannot be exchanged for one another. | ✅ `each_field_binds_distinctly` + `a_pointer_to_another_field_rebuilds_a_different_binding` |
-| **G9** | **A blob with no signed attestation saying what it is cannot be fetched or admitted.** `holds_bytes` is possession and is refused BY NAME — it is signed, it references the blob, and its `cohort_scope` column reads `federation`, so a projection that merely mapped the column would classify every blob on the node as commons. | ✅ `a_holds_bytes_row_is_possession_and_never_meaning` + `holds_bytes_says_possession_and_never_meaning` (cross-node) |
+| **G9** | **A blob with no signed attestation saying what it is cannot be fetched or admitted.** `holds_bytes` (retired in v55, the holding claim is now `custody:ack:v1`; legacy rows a node already holds stay stored, and edge still reads any of them as possession) is possession and is refused BY NAME — it is signed, it references the blob, and its `cohort_scope` column reads `federation`, so a projection that merely mapped the column would classify every blob on the node as commons. | ✅ `a_holds_bytes_row_is_possession_and_never_meaning` + `holds_bytes_says_possession_and_never_meaning` (cross-node) |
 | **G10** | A signed row grants meaning only to the blob it NAMES — a legitimate row cannot be paired with other bytes. | ✅ `a_row_about_other_content_cannot_lend_these_bytes_its_scope` |
 
 **G3 needs a witness with sub-resolution precision.** A test using an

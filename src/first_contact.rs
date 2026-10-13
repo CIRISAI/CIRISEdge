@@ -359,7 +359,13 @@ impl AdmissionDoors {
             .directory
             .apply_replicated_key_record(record.clone())
             .await;
-        match crate::replication::bridge::key_outcome_to_apply(result, "first-contact").0 {
+        match crate::replication::bridge::key_outcome_to_apply(
+            result,
+            "first-contact",
+            &record.record.scrub_key_id,
+        )
+        .0
+        {
             crate::replication::summary::ApplyOutcome::Admitted => Ok(KeyAdmit::Admitted),
             crate::replication::summary::ApplyOutcome::Duplicate => Ok(KeyAdmit::Held),
             other => {

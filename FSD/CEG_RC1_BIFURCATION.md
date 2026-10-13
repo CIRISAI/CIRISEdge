@@ -9,7 +9,8 @@ so the 0.10 text does not propagate citations that don't resolve.
 CEG = **The CIRIS Epistemic Grammar** (a federation attestation
 grammar), not a streaming layer. §3 defines exactly five primitives:
 `scores`, `delegates_to`, `supersedes`, `withdraws`, `recants`.
-`holds_bytes` / `key_grant` are §10 endpoint constructs;
+`holds_bytes` / `key_grant` are §10 endpoint constructs (`holds_bytes`
+retired in v55; the holding claim is now a `custody:ack:v1` `scores` row);
 `live_stream` / chunk-DAG / multicast are **net-new §10 surface**, not
 grammar primitives.
 
@@ -58,7 +59,8 @@ Full rationale in [`OPEN_QUESTIONS.md`](OPEN_QUESTIONS.md) OQ-14–OQ-17.
   `THREAT_MODEL.md` AV-15 ("Edge does NOT add a third encryption
   layer"), `multimedia.rs` (`ExternalRefWithAcl`).
 - **E2 — RC1 multicast = pull-only (OQ-15):** producer seals →
-  `holds_bytes` directory → subscribers pull. Already implemented:
+  `holds_bytes` directory (retired in v55; the holding claim is now
+  `custody:ack:v1` `here`) → subscribers pull. Already implemented:
   `ContentFetch`/`ContentBody`/`ContentMiss` (#42, §10.1.1).
   Relay/fan-out tree → 1.x.
 - **E3 — live-delivery ownership = `entitled ∧ reachable` (OQ-16):**
@@ -79,15 +81,20 @@ Full rationale in [`OPEN_QUESTIONS.md`](OPEN_QUESTIONS.md) OQ-14–OQ-17.
   or any attestation, never replicated, never logged. Precedent: the
   `cohort_scope` discipline (`cohort_scope.rs`, #48-A: "self/family-
   scope content never emits `holds_bytes`, never crosses to inter-host
-  paths"). Write as an invariant, not a default.
+  paths"). Write as an invariant, not a default. (`holds_bytes` is
+  retired in v55; the holding claim is now `custody:ack:v1` `here`,
+  placed at the content's own scope, so a self/family claim stays
+  inside its cohort. Presence is still never an attestation.)
 - **P4 — fail-honest on evicted epochs:** catch-up returns
   `ContentMiss` for epochs evicted below the chunk-retention horizon
   even when the grant still exists. No silent gap. Anchor:
   MISSION fail-loud doctrine ("CIRISEdge fails **loud**: it never
   drops … silently", AV-42; `ContentFetch`/`ContentBody`/`ContentMiss`
   #21). Retention windows are operator/Lens-core knobs, not substrate
-  constants — precedent: `EdgeConfig::holds_bytes_ttl_seconds`
-  (configurable; 24h is the spec-pinned default, CEG §10.1.2).
+  constants — precedent at the time: `EdgeConfig::holds_bytes_ttl_seconds`
+  (configurable; 24h was the spec-pinned default, CEG §10.1.2). Since
+  v55 that knob is deprecated and inert: a holding claim lives 72 h
+  from its signed instant and persist's re-ack sweeper renews it.
 
 ---
 
@@ -102,7 +109,7 @@ the corrected anchors below in the 0.10 text:
 | `MISSION:66` / `MISSION:148` ("evidence that can't replicate…") | Those lines are peer-separability / outbound-queue | MISSION fail-loud doctrine (l.182/197/414) |
 | `validated-not-adjudicated (MISSION §1.4)` | "adjudicated" does not appear in MISSION; §1.4 is the apophatic bound | CEG validate/adjudicate language (not MISSION §1.4) |
 | `Policy E (locality-scaled)` | No "Policy E" exists; policies are K/L/M (§8.1.11–13) | CEG **§8.1.5 locality-scaled-quorum** (+ §8.1.5.1 sub-quorum fallback) |
-| `cohort_scope::suppresses_holds_bytes` (v3.9.2) | No such symbol; mechanism is producer-side refusal | `cohort_scope.rs` (v0.19.1, #48-A) |
+| `cohort_scope::suppresses_holds_bytes` (v3.9.2) | No such symbol; mechanism is producer-side refusal (and `holds_bytes` itself is retired in v55; the holding claim is now `custody:ack:v1`) | `cohort_scope.rs` (v0.19.1, #48-A) |
 | `transit-key / #857` | 0 occurrences in Edge | `THREAT_MODEL.md` AV-15 (Reticulum/TLS) |
 | `#46/#43` (fan-out deferral) | #46 = canonical bootstrap-peer hard-remove | net-new; no Edge issue yet |
 | `#41` (durable cutover) | not in Edge tree | OQ-04 + OQ-09 (`edge_outbound_queue`) |

@@ -68,7 +68,8 @@ Lens/Persist-side artifact. Spec cites AV-15, not "transit-key."
 ### OQ-15: RC1 multicast transport shape — RESOLVED A (pull-only) — 2026-06-01
 
 RC1 multicast is pull-only: producer seals chunks under the epoch DEK
-→ `holds_bytes` directory → subscribers pull. This is the *current*
+→ `holds_bytes` directory (retired in v55; the holding claim is now
+`custody:ack:v1` `here`) → subscribers pull. This is the *current*
 Edge posture, not a deferral — `ContentFetch`/`ContentBody`/
 `ContentMiss` (CIRISEdge#42, CEG §10.1.1) plus `ExternalRefWithAcl`
 already implement pull. No media relay/fan-out tree exists in the
@@ -91,7 +92,9 @@ epoch-key grants, propagated as CEG envelopes). The fan-out filter is
 Edge #29. **Subscriber-presence rides the existing #29 tracker** — it
 is node-local, TTL'd, never minted as an attestation, never
 replicated, never logged (P2 invariant + the `cohort_scope` "never
-emits `holds_bytes`" discipline). No new substrate ⇒ it ships at RC1.
+emits `holds_bytes`" discipline — retired in v55; the holding claim
+is now `custody:ack:v1` `here`, kept inside its cohort). No new
+substrate ⇒ it ships at RC1.
 
 This supersedes the original E3 framing ("Persist holds the live set,
 Edge just sends"), which conflated Edge's existing reachability

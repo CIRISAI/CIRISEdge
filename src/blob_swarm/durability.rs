@@ -31,8 +31,10 @@
 //! chunk repair re-files it. The `custody:ack:v1` rows replicate only within
 //! their cohort through the existing audience gate (persist's `may_receive`:
 //! a `self` row reaches the owner's personal nodes, a `family` row the
-//! family's audience). Nothing here is a `holds_bytes` claim, at any audience
-//! (CC 5.2, CIRISEdge#499: self/family bytes are delivered, never discovered).
+//! family's audience). Its `here` IS the copy's holding claim (persist v55,
+//! CIRISPersist#989), placed at the content's own cohort, so it reaches the
+//! cohort and no one else (CC 5.2, CIRISEdge#499: self/family bytes are
+//! delivered, never discovered).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -62,8 +64,10 @@ pub fn target_mode(audience_size: usize) -> DurabilityMode {
 }
 
 /// Is `row` placed at a tier whose files this module keeps durable? `self`
-/// and `family`: the tiers whose bytes are delivered to the cohort and never
-/// claimed (`community` and the commons keep their `holds_bytes` plane).
+/// and `family`: the tiers whose bytes are delivered to the cohort, whose
+/// holding claims reach only the cohort, and whose adopt the store gate keeps
+/// local (`community` and the commons are announced by persist's write door
+/// and discovered through `list_holders`).
 #[must_use]
 pub fn is_cohort_delivered(row: &Attestation) -> bool {
     matches!(
@@ -332,8 +336,16 @@ pub struct DurabilitySweep {
     pub repairs: Vec<Repair>,
     /// Files this node holds whole and (re-)filed its `here` for.
     pub reported_here: Vec<[u8; 32]>,
+    /// Files this node holds whole whose `here` is live and fresh, so nothing
+    /// was filed. Since persist v55 (CIRISPersist#989) the write doors file
+    /// the holding claim as they store, so a file this node wrote lands here
+    /// on its first pass, not in [`Self::reported_here`].
+    pub already_here: Vec<[u8; 32]>,
     /// Files this node read but is not in the audience of.
     pub not_in_audience: usize,
+    /// Files whose bytes a takedown or a steward purge withholds (persist's
+    /// `steward_purge::purge_withheld`): nothing filed, nothing repaired.
+    pub withheld: Vec<[u8; 32]>,
 }
 
 /// A report older than this is re-filed on the next sweep, well inside its
@@ -414,15 +426,18 @@ pub async fn file_custody(
     sha: &[u8; 32],
     pointer: &crate::group_content::BlobPointer,
     state: ciris_persist::federation::custody_ack::CustodyState,
-) -> Result<String, String> {
+) -> Result<String, CustodyFileError> {
     use crate::files::FileLifecycle;
     if state == ciris_persist::federation::custody_ack::CustodyState::Here {
-        match crate::files::row_lifecycle(engine, row).await? {
+        match crate::files::row_lifecycle(engine, row)
+            .await
+            .map_err(CustodyFileError::Unreadable)?
+        {
             FileLifecycle::Withdrawn | FileLifecycle::Recanted => {
-                return Err(format!(
+                return Err(CustodyFileError::Retracted(format!(
                     "custody: `here` not filed — {} is retracted (CC 2.3)",
                     row.attestation_id
-                ));
+                )));
             }
             FileLifecycle::Live | FileLifecycle::Superseded => {}
         }
@@ -441,7 +456,47 @@ pub async fn file_custody(
             Some(&aad),
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(CustodyFileError::Persist)
+}
+
+/// Why [`file_custody`] filed nothing. persist's own refusal stays TYPED
+/// (persist v55.0.0), so a caller can tell bytes a takedown withholds from
+/// any other refusal without reading prose.
+#[derive(Debug, thiserror::Error)]
+pub enum CustodyFileError {
+    /// `here` for a file whose row is withdrawn or recanted (CC 2.3).
+    #[error("{0}")]
+    Retracted(String),
+    /// The file's composers could not be read.
+    #[error("{0}")]
+    Unreadable(String),
+    /// persist's custody door refused the report.
+    #[error("{0}")]
+    Persist(ciris_persist::federation::Error),
+}
+
+impl CustodyFileError {
+    /// The takedown notice when persist refused the report because a
+    /// tombstone withholds the bytes: `PurgeRefused` with persist's one
+    /// "taken down" token (`steward_purge::token::BLOB_PURGED`, the same
+    /// token `BlobError::Purged.kind()` names). `None` for every other
+    /// refusal.
+    #[must_use]
+    pub fn withheld_notice(&self) -> Option<&str> {
+        use ciris_persist::federation::steward_purge::token::BLOB_PURGED;
+        match self {
+            Self::Persist(ciris_persist::federation::Error::PurgeRefused { token, body })
+                if *token == BLOB_PURGED =>
+            {
+                Some(
+                    body.get("notice_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                )
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

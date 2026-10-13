@@ -197,7 +197,10 @@ The projection gate applies on both advertise and fetch paths
 served is neither listed to it nor resolvable by it.
 
 > **Structural invisibility (Part 5 §5.2, normative).** A `self`/`family` claim
-> projects `SelfOwn` and emits **no `holds_bytes:sha256:*` directory attestation** —
+> projects `SelfOwn`, and its holding claim (a `custody:ack:v1` `here` row, which
+> retired the `holds_bytes:sha256:*` directory attestation in v55) is placed at the
+> content's own `self`/`family` scope, so it replicates only inside that cohort and
+> is **never observable at federation** —
 > "outsiders cannot route to it, read it, or even learn that it exists." This is
 > the *unconditional* privacy promise; at-rest encryption is defense-in-depth on
 > top, never a substitute.

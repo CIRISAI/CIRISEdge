@@ -595,13 +595,21 @@ impl With {
         )
     }
 
-    /// Can a non-member tell the content EXISTS? `false` means the
-    /// `holds_bytes` discovery row is withheld — true only of `self` and
-    /// `family` (CC 5.2). Undiscoverable is NOT un-replicated: those rows
-    /// still reach the owner's / the family's nodes by consent fan-out.
+    /// Can a non-member tell the content EXISTS? `true` only of `self` and
+    /// `family` (CC 5.2), asked of persist's own predicate
+    /// (`cohort_scope::is_structurally_invisible`). Undiscoverable is NOT
+    /// un-replicated: those rows still reach the owner's / the family's nodes
+    /// by consent fan-out.
+    ///
+    /// Not `!Audience::discoverable()`: since persist v55 (CIRISPersist#989)
+    /// only a Commons placement is discoverable, because a room's holding
+    /// claims stay in the room too, yet a room is a cohort non-members can
+    /// know of, so its content is filtered, not structurally invisible.
     #[must_use]
     pub fn is_structurally_invisible(&self) -> bool {
-        !self.audience().discoverable()
+        ciris_persist::federation::types::cohort_scope::is_structurally_invisible(
+            self.cohort_scope(),
+        )
     }
 }
 
@@ -617,8 +625,9 @@ impl With {
 /// | [`Community`](EncryptedCohort::Community) | shared per-community DEK (mandatory) | yes |
 /// | [`Affiliations`](EncryptedCohort::Affiliations) | shared DEK | yes |
 ///
-/// ("invisible" here means the `holds_bytes` discovery row is withheld; the
-/// bytes still replicate to the cohort's nodes.) Community content is
+/// ("invisible" here means no holding claim reaches a non-member: since v55
+/// it is a `custody:ack:v1` row at the cohort's own scope; the bytes still
+/// replicate to the cohort's nodes.) Community content is
 /// deliberately NOT suppressed (CEG 0.8 §8.1.13.3) — communities can be large
 /// and per-member byte-level invisibility is infeasible, so the community
 /// property is **cohort-filtered visibility**. "Only members can read it" is
@@ -662,7 +671,7 @@ pub enum EncryptedCohort {
 /// This type exists to stop a caller reading `species` as "more private than
 /// federation". It is not: persist's negative-default dispatch encrypts only
 /// self/family and community/affiliations, so these tiers are stored in the
-/// clear and emit `holds_bytes` normally. They narrow the intended AUDIENCE;
+/// clear and file their holding claim at `federation` normally. They narrow the intended AUDIENCE;
 /// they do not protect the bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClearCohort {
@@ -696,7 +705,7 @@ impl EncryptedCohort {
         self.with().cohort_scope()
     }
 
-    /// Does this tier withhold the `holds_bytes` discovery row entirely, so a
+    /// Does this tier keep its holding claim inside the cohort, so a
     /// non-member cannot learn the content exists? `self` and `family` only.
     #[must_use]
     pub fn is_structurally_invisible(&self) -> bool {
@@ -838,9 +847,11 @@ pub async fn custody_for(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "to", rename_all = "snake_case")]
 pub enum RoutesTo {
-    /// `self` — the owner's own node set, by consent fan-out; no `holds_bytes`.
+    /// `self` — the owner's own node set, by consent fan-out; holding claims
+    /// stay inside it.
     OwnerNodes,
-    /// `family` — the family's nodes, by consent fan-out; no `holds_bytes`.
+    /// `family` — the family's nodes, by consent fan-out; holding claims stay
+    /// inside it.
     FamilyNodes { family_key_id: String },
     /// `community` — members, served on discovery.
     CommunityMembers { community_key_id: String },
@@ -911,8 +922,8 @@ pub struct Crossing {
     pub ci: ContextualIntegrity,
     /// Where edge routes it.
     pub routes_to: RoutesTo,
-    /// CC 5.2 — whether a `holds_bytes` row advertises it. `false` for
-    /// `self`/`family`: replicated, not discoverable.
+    /// CC 5.2 — whether a holding claim outside the cohort advertises it.
+    /// `false` for `self`/`family`: replicated, not discoverable.
     pub discoverable: bool,
     /// `enter_mesh`'s outcome for the row passed in.
     pub entered: MeshCrossingOutcome,
@@ -1066,7 +1077,8 @@ pub async fn share_encrypted_privately(
 /// **Share a row with a narrower AUDIENCE, but in the clear.**
 ///
 /// `species` and `biosphere` name an audience smaller than the federation and
-/// are nonetheless stored plaintext with a normal `holds_bytes` row. Separate
+/// are nonetheless stored plaintext with a normal holding claim at
+/// `federation`. Separate
 /// from [`share_encrypted_privately`] so the difference cannot be missed by
 /// picking a neighbouring enum variant.
 ///
@@ -1083,7 +1095,7 @@ pub async fn share_clear_privately(
         attestation_id = %row.attestation_id,
         cohort_scope = cohort.cohort_scope(),
         "sharing to a narrower audience but IN THE CLEAR — plaintext at rest, \
-         and a discoverable holds_bytes row"
+         and a discoverable holding claim"
     );
     share(directory, row, cohort.with(), basis, signers).await
 }

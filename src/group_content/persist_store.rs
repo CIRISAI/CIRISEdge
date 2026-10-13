@@ -222,6 +222,59 @@ impl PersistGroupContentStore {
     pub fn engine(&self) -> &ciris_persist::Engine {
         &self.engine
     }
+
+    /// persist v55.0.0 (#989, CC 3.1.3.3 rule 5) — start the **re-ack
+    /// sweeper** that keeps this node's holding claims live.
+    ///
+    /// A v55 holding claim (`custody:ack:v1` `here`) lapses 72 h after it was
+    /// signed; persist renews this node's own claims once they are a day old,
+    /// for bytes it still holds, through `Engine::spawn_reack_sweeper` (hourly).
+    /// persist's Python engine starts it at construction, but an `Engine` VIEW
+    /// a Rust host builds (this store's) starts nothing, so a host that seals
+    /// and serves through this store must start it or its bytes drop out of
+    /// holder discovery after 72 h. Not running without a local (PQC) signer:
+    /// [`HoldingClaimReack::is_running`] is `false` for a store built with
+    /// [`Self::from_shared`], which cannot sign a claim.
+    #[must_use]
+    pub fn spawn_holding_claim_reack(&self) -> HoldingClaimReack {
+        HoldingClaimReack {
+            sweeper: self.engine.spawn_reack_sweeper(),
+        }
+    }
+}
+
+/// The handle [`PersistGroupContentStore::spawn_holding_claim_reack`] returns.
+/// Stop it on shutdown ([`Self::stop`]); dropping it signals the sweeper to
+/// stop without waiting for it.
+pub struct HoldingClaimReack {
+    sweeper: Option<ciris_persist::federation::EvictionSweeper>,
+}
+
+impl HoldingClaimReack {
+    /// Whether a sweeper was started (a local PQC signer is present).
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.sweeper.is_some()
+    }
+
+    /// Stop the sweeper and wait for its task. `true` when one was running
+    /// and its task ended cleanly.
+    pub async fn stop(mut self) -> bool {
+        match self.sweeper.take() {
+            Some(sweeper) => sweeper.stop().await.is_ok(),
+            None => false,
+        }
+    }
+}
+
+impl Drop for HoldingClaimReack {
+    fn drop(&mut self) {
+        if let Some(sweeper) = self.sweeper.take() {
+            // Signal only: the task ends at its next select, and a drop
+            // cannot await it.
+            drop(sweeper.stop());
+        }
+    }
 }
 
 /// Tell the concrete backend behind `backend` which federation key is this
@@ -291,6 +344,13 @@ fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> Grou
             attestation_id: attestation_id.clone(),
             withdraws_id: withdraws_id.clone(),
         },
+        // persist v54.1.0 (Codex round 3 on CIRISPersist#1057): a steward
+        // purge withholds the bytes. Typed for the same reason as Withdrawn:
+        // never "not here", never a substrate fault.
+        B::Purged { notice_id, .. } => GroupContentError::Purged {
+            sha256_hex,
+            notice_id: notice_id.clone(),
+        },
         // CIRISEdge#737 — RFC 9110 §14.4 at the range door: typed, because
         // "you asked past the end" carries the size and is the caller's to
         // act on, never a substrate fault.
@@ -298,6 +358,21 @@ fn map_err(sha256_hex: String, e: &ciris_persist::federation::BlobError) -> Grou
             sha256_hex,
             range_start: *range_start,
             size: *size,
+        },
+        // persist v55.0.0 (CIRISPersist#977) — typed, because its remedy is
+        // named (re-adopt under `for_stream_keyed_chunk`), never a substrate
+        // fault to retry as is.
+        B::StreamKeyedChunkCommunityEpoch {
+            stream_id,
+            epoch,
+            community_epoch,
+            chunk_sha256_hex,
+        } => GroupContentError::StreamKeyedChunkCommunityEpoch {
+            sha256_hex,
+            stream_id: stream_id.clone(),
+            epoch: *epoch,
+            community_epoch: *community_epoch,
+            chunk_sha256_hex: chunk_sha256_hex.clone(),
         },
         other => GroupContentError::Substrate(other.to_string()),
     }
@@ -845,7 +920,7 @@ impl PersistGroupContentStore {
     /// forever unless a door deletes them), so without this a 2 GiB upload
     /// refused at its last chunk would hold 2 GiB of chunks no manifest and
     /// no row will ever name. Each chunk goes through persist's ONE eviction
-    /// door, `Engine::evict_blob` (retract this node's `holds_bytes` for the
+    /// door, `Engine::evict_blob` (retract this node's holding claims for the
     /// sha — a chunk has none — then delete the row with its grants and
     /// epoch binding in one transaction).
     ///
@@ -1058,6 +1133,36 @@ mod tests {
         }
     }
 
+    /// persist v54.1.0 (Codex round 3 on CIRISPersist#1057) — a purged blob
+    /// is typed `Purged`, never `Substrate(..)` (the wildcard), and the
+    /// reader sees what a withdrawn one gets: `UnopenedReason::Withdrawn`.
+    #[test]
+    fn a_purged_blob_is_a_typed_answer_and_reads_as_withdrawn() {
+        use ciris_persist::federation::BlobError;
+        let e = BlobError::Purged {
+            sha256_hex: "cd".repeat(32),
+            notice_id: "purge-notice-9".into(),
+        };
+        let mapped = super::map_err("cd".repeat(32), &e);
+        match &mapped {
+            super::GroupContentError::Purged {
+                sha256_hex,
+                notice_id,
+            } => {
+                assert_eq!(sha256_hex, &"cd".repeat(32));
+                assert_eq!(notice_id, "purge-notice-9");
+            }
+            other => panic!("a purged blob must be typed Purged, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                crate::chat::UnopenedReason::from_store_error(&mapped),
+                crate::chat::UnopenedReason::Withdrawn { .. }
+            ),
+            "a reader gets the withdrawn answer for a purged blob"
+        );
+    }
+
     use super::*;
     use crate::group_content::ContentField;
 
@@ -1157,6 +1262,40 @@ mod tests {
             .await
             .expect("register self");
         twin.node_key_id()
+    }
+
+    /// persist v55.0.0 (#989) — a hybrid store starts the holding-claim
+    /// re-ack sweeper and stops it; a classical-only store (no local signer)
+    /// starts none, since it could not sign a claim.
+    #[tokio::test]
+    async fn the_hybrid_store_runs_the_reack_sweeper_and_stops_it() {
+        let backend = migrated_backend().await;
+        let node = hybrid_signer("node-reack", 7).await;
+        let store = PersistGroupContentStore::from_shared_hybrid(
+            ciris_persist::BackendDispatch::Sqlite(backend.clone()),
+            backend.clone() as Arc<dyn ciris_persist::federation::FederationDirectory>,
+            &node,
+        )
+        .await
+        .expect("hybrid store");
+        let reack = store.spawn_holding_claim_reack();
+        assert!(
+            reack.is_running(),
+            "a hybrid store starts the re-ack sweeper"
+        );
+        assert!(reack.stop().await, "and it stops cleanly");
+
+        let plain = PersistGroupContentStore::from_shared(
+            ciris_persist::BackendDispatch::Sqlite(backend.clone()),
+            backend.clone() as Arc<dyn ciris_persist::federation::FederationDirectory>,
+            node.classical.clone(),
+        );
+        let unsigned = plain.spawn_holding_claim_reack();
+        assert!(
+            !unsigned.is_running(),
+            "no local signer: no sweeper, nothing to sign with"
+        );
+        assert!(!unsigned.stop().await);
     }
 
     /// CIRISEdge#768 — the hybrid sealing constructor tells the SHARED backend

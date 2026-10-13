@@ -25,10 +25,11 @@
 //!
 //! The gap is narrow and specific, and both halves of it are discovery:
 //!
-//! - `holds_bytes:sha256:*` — auto-emitted by `put_blob` — is
-//!   `{"kind":"holds_bytes","evidence_refs":["<sha>"]}` with
-//!   `attesting_key_id == attested_key_id`. It says *"I hold these bytes"*.
-//!   Nothing about what they are.
+//! - The holding claim — filed by `put_blob` as it stores; since persist v55
+//!   a `custody:ack:v1` row with `custody_state: here` and the blob in
+//!   `evidence_refs` (before v55 the `holds_bytes:sha256:*` carrier, now
+//!   retired) — has `attesting_key_id == attested_key_id`. It says *"I hold
+//!   these bytes"*. Nothing about what they are.
 //! - `FountainHoldingClaim` is `{peer_id, content_id, symbol_ids, at}` —
 //!   `content_id` is documented as opaque. Also pure possession.
 //!
@@ -39,9 +40,10 @@
 //! **Edge now enforces the difference.**
 //! [`BlobMeaning::project`](ciris_edge::blob_swarm::BlobMeaning::project) is
 //! the only way to obtain the scope the store gate consumes, it takes a
-//! signed attestation that names the blob, and it refuses a `holds_bytes`
-//! row **by name** rather than letting its `federation` column classify
-//! every blob on the node as commons. The substrate still stores whatever it
+//! signed attestation that names the blob, and it refuses a holding claim
+//! **by name** (and a legacy `holds_bytes` row, whose `federation` column
+//! would classify every blob on the node as commons) rather than letting
+//! possession stand in for meaning. The substrate still stores whatever it
 //! is handed — that is the substrate's job — but nothing in edge will fetch
 //! or admit bytes on possession alone.
 //!
@@ -213,7 +215,7 @@ async fn build_node_with(
 
     // persist signs the holder attestation with the key it DERIVES from the
     // signer — `derive_key_id(alias, pubkey)` — not the friendly name. The
-    // FK on `holds_bytes` is onto that derived id, so it must be registered
+    // FK on the holding claim is onto that derived id, so it must be registered
     // or the write fails from deep inside the door.
     let ed_pub = signer.ed.public_key().await.expect("pubkey");
     let derived = ciris_verify_core::fedcode::derive_key_id(signer.ed.current_alias(), &ed_pub);
@@ -646,8 +648,8 @@ async fn a_commons_blob_opens_on_any_node_because_no_key_is_involved() {
 
 /// **States the gap this harness exists to close.**
 ///
-/// A blob written through `put_blob_scoped` gets a `holds_bytes`
-/// attestation — signed, replicated, and saying only *"I hold these
+/// A blob written through `put_blob_scoped` gets a holding claim
+/// (`custody:ack:v1` `here`, persist v55) — signed, replicated, and saying only *"I hold these
 /// bytes."* It carries no media type, no dimension, no author of the
 /// CONTENT, and no reference to any row.
 ///
@@ -718,13 +720,23 @@ async fn holds_bytes_says_possession_and_never_meaning() {
     // byte length, bound into the signed bytes; this fixture is a hand-built
     // row for a meaning-projection assertion, never a door write, so the
     // length is the one true value for the bytes above.
-    let mut holder_row = ciris_persist::federation::blobs::holds_bytes_attestation_row(
+    // persist v55.0.0 (#989) — the claim is `custody:ack:v1`, the one row
+    // every door emits (`holding_claim::holding_claim_row`), a Commons claim
+    // at `federation` citing the full digest.
+    let mut holder_row = ciris_persist::federation::holding_claim::holding_claim_row(
         &sha,
         &alice.key_id,
-        "hb-1",
+        "hc-1",
         ts(),
         u64::try_from(b"\x00\x01\x02 unexplained bytes".len()).expect("len"),
-    );
+        &ciris_persist::federation::holding_claim::ClaimScope::of_content(
+            ciris_persist::federation::types::cohort_scope::CryptoTier::Plaintext,
+            ciris_persist::federation::types::cohort_scope::FEDERATION,
+            None,
+        )
+        .expect("the Commons claim scope"),
+    )
+    .expect("the holding claim row");
     assert_eq!(
         holder_row.cohort_scope,
         ciris_persist::federation::types::cohort_scope::FEDERATION,
@@ -1210,9 +1222,7 @@ async fn seed_room(node: &Node, room: &str, members: &[&Ident]) {
 #[allow(clippy::too_many_lines)] // three crossings and their preconditions, in one place on purpose
 async fn a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive() {
     use ciris_persist::federation::blobs::BlobBody;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::{AdoptDisposition, BlobProvenance, FederationDirectory as _};
 
     let alice = Ident::new("alice-fed", 0x11);
@@ -1302,11 +1312,7 @@ async fn a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive() {
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
         .collect();
     assert!(
         !sets.is_empty(),
@@ -1319,12 +1325,12 @@ async fn a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive() {
         let admission = node_b
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: row.attestation.clone(),
             })
             .await
             .expect("B admits A's key_grant set through the key-grant door");
-        wraps_written += admission.wraps_written;
+        wraps_written += usize::from(admission.projected);
     }
     assert!(
         wraps_written >= 1,
@@ -1504,9 +1510,7 @@ async fn cross_key_and_bytes(
     body: &[u8],
 ) -> [u8; 32] {
     use ciris_persist::federation::blobs::BlobBody;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::{AdoptDisposition, BlobProvenance};
 
     let sha: [u8; 32] = hex::decode(&sealed.pointer.content_sha256)
@@ -1519,16 +1523,12 @@ async fn cross_key_and_bytes(
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
     {
         node_b
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: row.attestation,
             })
             .await
@@ -2374,8 +2374,9 @@ async fn federation_content_row(
 /// **`FSD/CONTENT_TRANSFER.md` §5.3 R4 — a self row's pull asks the author's
 /// nodes, never `list_holders`** (CIRISEdge#646).
 ///
-/// A's node seals a file at `self` (invisible tier: no `holds_bytes` exists
-/// anywhere, by construction — CC 5.2 / persist I52). The row reaches B's
+/// A's node seals a file at `self` (invisible tier: its holding claim is at
+/// `self` scope and never reaches a discovery surface — CC 5.2 / persist
+/// I52). The row reaches B's
 /// node. Before this cut B's pull consulted the claim index and read
 /// `NoHolders` — the wrong rung, and a silent one. Now the puller resolves
 /// the row's author to the person and their nodes (CC 4.4.3.2.4.1(b)), asks
@@ -2427,10 +2428,6 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         published.tier,
         ciris_persist::federation::types::cohort_scope::CryptoTier::InvisibleEncrypted,
         "precondition: a self write seals at the invisible tier"
-    );
-    assert!(
-        rows_of(&node_a, "holds_bytes:").await.is_empty(),
-        "precondition (CC 5.2): a self write emits NO holder claim anywhere"
     );
     let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
         .expect("hex")
@@ -2626,6 +2623,11 @@ async fn a_self_rows_pull_asks_the_authors_nodes_and_never_the_claim_index() {
         !node_b.dir.has_blob(&sha).await.expect("has_blob"),
         "nothing was stored past the router's refusal"
     );
+    // CC 5.2, as persist v55.0.0 places it (#989, CC 3.1.3.3): A's claim for
+    // its self bytes is observable only inside alice's self-collective.
+    let mallory = Ident::new("mallory-fed", 0x66);
+    let node_x = node(&[&alice, &mallory], &mallory).await;
+    assert_holding_claim_confined(&node_a, &sha, &node_b, &node_x).await;
 }
 
 /// A federation-tier row that references `sha` by `evidence_refs` — the
@@ -2719,6 +2721,27 @@ async fn commons_row(
 
 /// A's rows of one attestation-type prefix, as B's bridge would receive
 /// them over the cursor: BARE `Attestation` JSON.
+/// persist v55.0.0 (#989, CC 3.1.3.3) — this node's holding claims, as wire
+/// bytes: `scores` rows on `custody:ack:v1` (the one holding claim at every
+/// tier; `holds_bytes` is retired). `None` = every scope; `Some(s)` = only the
+/// claims placed at cohort scope `s`.
+async fn holding_claims_of(node: &Node, scope: Option<&str>) -> Vec<Vec<u8>> {
+    use ciris_persist::federation::FederationDirectory;
+    node.dir
+        .list_attestations_since(None, 200)
+        .await
+        .expect("list rows")
+        .into_iter()
+        .filter(|a| {
+            ciris_persist::federation::admission::envelope_dimension(
+                &a.attestation.attestation_envelope,
+            ) == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
+        })
+        .filter(|a| scope.map_or(true, |s| a.attestation.cohort_scope == s))
+        .map(|a| serde_json::to_vec(&a.attestation).expect("wire"))
+        .collect()
+}
+
 async fn rows_of(node: &Node, type_prefix: &str) -> Vec<Vec<u8>> {
     use ciris_persist::federation::FederationDirectory;
     node.dir
@@ -2858,7 +2881,7 @@ async fn a_far_node_holds_what_the_pull_brought_home() {
 
     // ── The HOLDER plane crosses after it, so the retry completes the pull. ──
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    let holders = rows_of(&node_a, "holds_bytes:").await;
+    let holders = holding_claims_of(&node_a, None).await;
     assert!(
         !holders.is_empty(),
         "precondition: put_blob announced a holder claim"
@@ -2970,7 +2993,7 @@ impl CommonsPull {
             )
             .await
             .expect("A stores and announces");
-        for bytes in rows_of(&self.node_a, "holds_bytes:").await {
+        for bytes in holding_claims_of(&self.node_a, None).await {
             let h: ciris_persist::federation::Attestation =
                 serde_json::from_slice(&bytes).expect("row");
             // Idempotent on a re-admit of an earlier claim.
@@ -3004,10 +3027,10 @@ fn file_pointer(sha: &[u8; 32], size: u64, stream_id: Option<&str>) -> BlobPoint
     serde_json::from_value(v).expect("pointer")
 }
 
-/// CIRISEdge#717 — B admits A's `holds_bytes` rows, as anti-entropy would.
+/// CIRISEdge#717 — B admits A's holding claims, as anti-entropy would.
 async fn admit_holder_claims(from: &Node, to: &Node) {
     use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
-    for bytes in rows_of(from, "holds_bytes:").await {
+    for bytes in holding_claims_of(from, None).await {
         let h: ciris_persist::federation::Attestation =
             serde_json::from_slice(&bytes).expect("row");
         // Idempotent on a re-admit of an earlier claim.
@@ -3038,7 +3061,7 @@ fn body_of(len: usize, seed: u32) -> Vec<u8> {
 /// by name; now the pull walks the DAG — manifest → verified → chunks →
 /// promoted — through persist's `put_blob_chunks_signing`, and B serves the
 /// 1,048,577-byte file byte-identical with `storage_kind = chunk_dag` and
-/// its own `holds_bytes` on the manifest.
+/// its own holding claim on the manifest.
 ///
 /// A writes it exactly as `files::publish` chunks a commons file: 256 KiB
 /// segments into a stream, sealed into a v1 manifest at the plaintext tier.
@@ -3114,7 +3137,7 @@ async fn a_plaintext_chunk_dag_pulls_through_the_real_doors_and_reads_back_whole
             .await
             .expect("list_holders")
             .contains(&t.node_b.me),
-        "B announced its own holds_bytes on the manifest (persist#947 ask 3): a pulled \
+        "B announced its own holding claim on the manifest (persist#947 ask 3): a pulled \
          commons DAG is not a silent holder"
     );
     assert!(
@@ -3308,9 +3331,7 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
     use ciris_edge::blob_swarm::{BlobPuller, DagPullRefusal, PullConfig, PullOutcome};
     use ciris_edge::files::FileRow;
     use ciris_persist::federation::blobs::BlobStorage as _;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::types::cohort_scope::CryptoTier;
     use ciris_persist::federation::FederationDirectory;
     init_tracing();
@@ -3469,35 +3490,45 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
         .collect();
-    let stream_sets = sets
+    // persist v55.0.0 (#989) — one stream-axis row per RECIPIENT, all for the
+    // file's one stream epoch: never one per chunk.
+    let stream_epochs: std::collections::BTreeSet<u64> = sets
         .iter()
-        .filter(|s| {
-            s.attestation.attestation_type
-                == ciris_persist::federation::key_grant::KEY_GRANT_STREAM_ATTESTATION_TYPE
-        })
-        .count();
+        .filter_map(
+            |s| match ciris_persist::federation::key_grant::KeyGrantRow::from_attestation(
+                &s.attestation,
+            )
+            .ok()?
+            .axis
+            {
+                ciris_persist::federation::key_grant::KeyGrantAxis::Stream { epoch, .. } => {
+                    Some(epoch)
+                }
+                _ => None,
+            },
+        )
+        .collect();
     assert_eq!(
-        stream_sets, 1,
-        "one stream set for the file's one epoch, never one per chunk"
+        stream_epochs.len(),
+        1,
+        "one stream epoch's key for the file, never one per chunk: {stream_epochs:?}"
     );
     assert!(sets.len() >= 2, "and the manifest's: {}", sets.len());
     let mut wraps = 0;
     for s in &sets {
-        wraps += node_b
-            .store
-            .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
-                attestation: s.attestation.clone(),
-            })
-            .await
-            .expect("B applies A's set")
-            .wraps_written;
+        wraps += usize::from(
+            node_b
+                .store
+                .engine()
+                .apply_replicated_key_grant(SignedKeyGrantRow {
+                    attestation: s.attestation.clone(),
+                })
+                .await
+                .expect("B applies A's set")
+                .projected,
+        );
     }
     // Projected now: the wraps for the bytes B already HOLDS (the manifest —
     // the seal's set and the descriptor's), and the stream epoch's.
@@ -3562,10 +3593,6 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
         file_len as u64,
         "the view's total is the plaintext size; the row's size_bytes stays the envelope's"
     );
-    assert!(
-        rows_of(&node_b, "holds_bytes:").await.is_empty(),
-        "CC 5.2: no holder claim for self bytes, before or after the pull"
-    );
 
     // 5. Held is held: the production path offers nothing past the head.
     assert_eq!(
@@ -3576,6 +3603,11 @@ async fn a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_wh
         puller.pull_dag_with(&row, sha, &fetch(None)).await,
         PullOutcome::AlreadyHeld
     );
+    // CC 5.2, as persist v55.0.0 places it (#989, CC 3.1.3.3): A's claim for
+    // its self bytes is observable only inside alice's self-collective.
+    let mallory = Ident::new("mallory-fed", 0x66);
+    let node_x = node(&[&alice, &mallory], &mallory).await;
+    assert_holding_claim_confined(&node_a, &sha, &node_b, &node_x).await;
 }
 
 /// **CIRISEdge#717 / #638 item 2 — a whole blob whose length is not its
@@ -3666,9 +3698,7 @@ async fn a_community_pull_stops_at_the_scope_router_on_a_legacy_node() {
     use ciris_edge::blob_swarm::{BlobPuller, PullConfig, PullOutcome};
     use ciris_edge::chat::{Body, ChatMessage, UnopenedReason};
     use ciris_persist::federation::blobs::BlobStorage as _;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::{FederationDirectory, SignedAttestation};
     init_tracing();
 
@@ -3729,22 +3759,18 @@ async fn a_community_pull_stops_at_the_scope_router_on_a_legacy_node() {
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
     {
         node_b
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: set.attestation.clone(),
             })
             .await
             .expect("B admits A's key_grant set");
     }
-    for bytes in rows_of(&node_a, "holds_bytes:").await {
+    for bytes in holding_claims_of(&node_a, None).await {
         let h: ciris_persist::federation::Attestation =
             serde_json::from_slice(&bytes).expect("row");
         node_b
@@ -3932,9 +3958,7 @@ async fn a_community_pull_resolves_through_the_rooms_group_and_stops_at_the_scop
     use ciris_edge::scope_lifecycle::ScopeLifecycle;
     use ciris_persist::encrypted_kv::XChaChaKvStore;
     use ciris_persist::federation::blobs::BlobStorage as _;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::{FederationDirectory, SignedAttestation};
     init_tracing();
     let alice = Ident::new("alice-fed", 0x11);
@@ -4087,22 +4111,18 @@ async fn a_community_pull_resolves_through_the_rooms_group_and_stops_at_the_scop
         .await
         .expect("list A's rows")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
     {
         node_b
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: set.attestation.clone(),
             })
             .await
             .expect("B admits A's key_grant set");
     }
-    for bytes in rows_of(&node_a, "holds_bytes:").await {
+    for bytes in holding_claims_of(&node_a, None).await {
         let h: ciris_persist::federation::Attestation =
             serde_json::from_slice(&bytes).expect("row");
         node_b
@@ -4288,10 +4308,6 @@ async fn a_file_over_the_inline_bound_is_chunked_and_still_opens() {
         "a self file is sealed whatever its shape"
     );
     assert!(published.crossed, "and it crosses like any other row");
-    assert!(
-        rows_of(&node_a, "holds_bytes:").await.is_empty(),
-        "CC 5.2 does not care how many chunks it took: still no holder claim"
-    );
 
     // It is a FILE to the drive, not a special case.
     let drive = ciris_edge::files::in_room(node_a.store.engine(), &room, &node_a.me, 10, None)
@@ -4321,6 +4337,21 @@ async fn a_file_over_the_inline_bound_is_chunked_and_still_opens() {
         .expect("the author opens what it sealed");
     assert_eq!(opened.len(), big.len(), "every chunk came back");
     assert_eq!(opened, big, "and in order, with the tail chunk intact");
+
+    // CC 5.2, as persist v55.0.0 places it (#989, CC 3.1.3.3): however many
+    // chunks it took, A's claim for its self bytes is observable only inside
+    // alice's self-collective — her other device sees it, a stranger never.
+    let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let alice_phone = Ident::new("alice-phone", 0x33);
+    let node_b = device_of(&[&alice, &alice_phone], &alice, &alice_phone).await;
+    federate(&node_b, &node_a).await;
+    federate(&node_a, &node_b).await;
+    let mallory = Ident::new("mallory-fed", 0x66);
+    let node_x = node(&[&alice, &mallory], &mallory).await;
+    assert_holding_claim_confined(&node_a, &sha, &node_b, &node_x).await;
 }
 
 /// **CIRISEdge#687 — every file size around the inline bound publishes and
@@ -6018,13 +6049,143 @@ impl ciris_edge::blob_swarm::DagByteFetch for MeshFetch {
     }
 }
 
-/// A node's own `holds_bytes` rows naming `sha`.
+/// The attestation ids `writer`'s replication serve path hands `peer`: every
+/// Attestation-plane ref listed FOR that peer, fetched FOR that peer (the two
+/// halves of the per-peer gate, persist's `may_receive` behind both).
+async fn attestation_ids_served_to(writer: &Node, peer: &str) -> Vec<String> {
+    use ciris_edge::replication::{
+        BridgeConfig, EnvelopeKind, FederationDirectoryReplicationBridge, ReplicationDirectory as _,
+    };
+    let bridge = FederationDirectoryReplicationBridge::with_config(
+        Arc::clone(&writer.dir) as Arc<dyn ciris_persist::federation::FederationDirectory>,
+        Arc::new(Vec::new),
+        BridgeConfig::default(),
+    )
+    .with_local_key_id(Some(writer.me.clone()))
+    // As production wires it: this node publishes its own rows, so its
+    // `SelfOwn` rows (a self-scoped claim among them) are advertised.
+    .with_self_provider(Some(Arc::new({
+        let me = writer.me.clone();
+        move || vec![me.clone()]
+    })));
+    let mut ids = Vec::new();
+    for r in bridge
+        .list_envelope_refs_for_peer(EnvelopeKind::Attestation, Some(peer))
+        .await
+    {
+        if let Some(bytes) = bridge
+            .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &r.envelope_hash, Some(peer))
+            .await
+        {
+            if let Ok(a) = serde_json::from_slice::<ciris_persist::federation::Attestation>(&bytes)
+            {
+                ids.push(a.attestation_id);
+            }
+        }
+    }
+    ids
+}
+
+/// **CC 5.2 (part 5 §5.2), as persist v55.0.0 (#989, CC 3.1.3.3) places it:**
+/// the writer's holding claim for self/family bytes `sha` is OBSERVABLE ONLY
+/// INSIDE THE COHORT.
+///
+/// - (neg) `outsider`, a node outside the cohort, is never served the claim
+///   row, and its holder reads (`list_holders`, `live_holders`) for `sha` are
+///   empty.
+/// - (pos) `member`, a co-member (the owner's own device for `self`, a roster
+///   member for `family`), is served the claim, and once it admits it, its
+///   `live_holders` names the writer.
+/// - No retired `holds_bytes` row exists on the writer.
+async fn assert_holding_claim_confined(
+    writer: &Node,
+    sha: &[u8; 32],
+    member: &Node,
+    outsider: &Node,
+) {
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::{FederationDirectory as _, SignedAttestation};
+    assert!(
+        rows_of(
+            writer,
+            ciris_persist::federation::namespace::registry::RETIRED_HOLDING_CLAIM_STEM
+        )
+        .await
+        .is_empty(),
+        "no retired holds_bytes row on the writer"
+    );
+    let claims = own_holder_claims(writer, sha).await;
+    assert!(
+        !claims.is_empty(),
+        "the writer claims its own self/family bytes inside the cohort (persist v55, \
+         CC 3.1.3.3)"
+    );
+    let claim_ids: Vec<&str> = claims.iter().map(|c| c.attestation_id.as_str()).collect();
+
+    // (neg) never served outside the cohort, and nothing to discover there.
+    let to_outsider = attestation_ids_served_to(writer, &outsider.me).await;
+    for id in &claim_ids {
+        assert!(
+            !to_outsider.iter().any(|s| s == id),
+            "CC 5.2: the holding claim {id} is served to a node OUTSIDE the cohort"
+        );
+    }
+    assert!(
+        outsider
+            .dir
+            .list_holders(sha)
+            .await
+            .expect("list_holders")
+            .is_empty(),
+        "CC 5.2: an outsider lists a holder of cohort bytes"
+    );
+    assert!(
+        ciris_persist::federation::holding_claim::live_holders(
+            &*outsider.dir,
+            sha,
+            chrono::Utc::now()
+        )
+        .await
+        .expect("live_holders")
+        .is_empty(),
+        "CC 5.2: an outsider's live holders name someone for cohort bytes"
+    );
+
+    // (pos) served to a co-member, who then knows the writer holds them.
+    let to_member = attestation_ids_served_to(writer, &member.me).await;
+    for id in &claim_ids {
+        assert!(
+            to_member.iter().any(|s| s == id),
+            "the holding claim {id} reaches a co-member (CC 3.1.3.3)"
+        );
+    }
+    for claim in claims {
+        member
+            .dir
+            .apply_replicated_attestation(SignedAttestation { attestation: claim })
+            .await
+            .expect("the co-member admits the writer's claim");
+    }
+    assert!(
+        ciris_persist::federation::holding_claim::live_holders(
+            &*member.dir,
+            sha,
+            chrono::Utc::now()
+        )
+        .await
+        .expect("live_holders")
+        .contains(&writer.me),
+        "the co-member's live holders name the writer"
+    );
+}
+
+/// A node's own holding claims (`custody:ack:v1`) naming `sha`.
 async fn own_holder_claims(
     node: &Node,
     sha: &[u8; 32],
 ) -> Vec<ciris_persist::federation::Attestation> {
     let hex_sha = hex::encode(sha);
-    rows_of(node, "holds_bytes:")
+    holding_claims_of(node, None)
         .await
         .into_iter()
         .map(|b| serde_json::from_slice::<ciris_persist::federation::Attestation>(&b).expect("row"))
@@ -6051,12 +6212,14 @@ async fn own_holder_claims(
 /// door on the receiving side is the production one.
 ///
 /// 1. A publishes a 1,300,000-byte file through the file door into the
-///    community room: five 256 KiB chunks and a manifest, each its own
-///    at-rest envelope under the room's epoch-`e0` DEK; the pointer carries
+///    community room: five 256 KiB chunks and epoch 0's terminator under the
+///    stream's epoch DEK (persist v55, #977: a room stream is stream-keyed),
+///    and a manifest under the room's epoch-`e0` DEK; the pointer carries
 ///    `epoch: Some(e0)` (CIRISEdge#601) and `stream_id`. The row, A's
-///    `key_grant` sets and A's `holds_bytes` cross to B and C.
+///    `key_grant` rows and A's holding claim (`custody:ack:v1` `here`) cross
+///    to B and C.
 /// 2. B pulls from A: manifest → opened as B → chunks → promoted;
-///    `storage_kind = chunk_dag`, byte-identical, B's own `holds_bytes`
+///    `storage_kind = chunk_dag`, byte-identical, B's own holding claim
 ///    names the DAG root and is admitted on C through the gated door.
 /// 3. C discovers B through `list_holders`, is refused a tampered chunk 1
 ///    from B `ChunkMismatch { seq: 1 }` (counted `dag_chunk_mismatch`,
@@ -6078,9 +6241,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     use ciris_edge::chat::UnopenedReason;
     use ciris_edge::files::FileRow;
     use ciris_persist::federation::blobs::BlobStorage as _;
-    use ciris_persist::federation::key_grant::{
-        SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
     use ciris_persist::federation::types::cohort_scope::CryptoTier;
     use ciris_persist::federation::{FederationDirectory, SignedAttestation};
     const ROOM: &str = "room-735";
@@ -6228,7 +6389,16 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
         .open_sealed_manifest_as(&sha, &node_a.me, Some(&aad))
         .await
         .expect("A opens its own manifest");
-    assert_eq!(view_a.chunks.len(), 5, "4 × 256 KiB + 251,424 bytes");
+    // persist v55 (CIRISPersist#977): a room DAG is stream-keyed, so it is a
+    // v4 DAG, one stream epoch, whose empty terminator sorts after the data.
+    assert_eq!(
+        view_a.chunks.len(),
+        6,
+        "4 × 256 KiB + 251,424 bytes, and epoch 0's terminator"
+    );
+    assert_eq!(view_a.chunks[5].seq, TERMINATOR_SEQ_BASE);
+    assert_eq!(view_a.chunks[5].size, 0);
+    assert!(view_a.chunks.iter().all(|c| c.epoch == Some(0)));
     let chunk1: [u8; 32] = hex::decode(&view_a.chunks[1].sha256_hex)
         .expect("hex")
         .try_into()
@@ -6250,11 +6420,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
                 .await
                 .expect("list rows")
                 .into_iter()
-                .filter(|a| {
-                    a.attestation
-                        .attestation_type
-                        .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-                })
+                .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
                 .map(|a| a.attestation)
                 .collect::<Vec<_>>()
         }
@@ -6271,15 +6437,16 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     for n in [&node_b, &node_c] {
         let mut wraps = 0;
         for s in &sets_a {
-            wraps += n
-                .store
-                .engine()
-                .apply_replicated_key_grant(SignedKeyGrantSet {
-                    attestation: s.clone(),
-                })
-                .await
-                .expect("a member applies A's set")
-                .wraps_written;
+            wraps += usize::from(
+                n.store
+                    .engine()
+                    .apply_replicated_key_grant(SignedKeyGrantRow {
+                        attestation: s.clone(),
+                    })
+                    .await
+                    .expect("a member applies A's set")
+                    .projected,
+            );
         }
         assert!(
             wraps >= 1,
@@ -6328,7 +6495,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     assert_eq!(
         claims_b.len(),
         1,
-        "B's own holds_bytes names the DAG root exactly once: {claims_b:?}"
+        "B's own holding claim names the DAG root exactly once: {claims_b:?}"
     );
     assert_eq!(claims_b[0].attesting_key_id, node_b.me, "the claim names B");
     assert!(
@@ -6354,7 +6521,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     assert_eq!(
         holders_on(&node_c, sha).await,
         expect_holders_c,
-        "C discovers B (and A) through holds_bytes"
+        "C discovers B (and A) through their holding claims"
     );
 
     // ── 3. C pulls FROM B: a tampered chunk first, then the honest resume. ──
@@ -6380,9 +6547,9 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
         .collect();
     assert_eq!(
         positions,
-        vec![0, 2, 3, 4],
-        "chunk 1 refused at its position; the rest (all in flight at the default K, \
-         CIRISEdge#739: the lanes drain on a stop) kept"
+        vec![0, 2, 3, 4, TERMINATOR_SEQ_BASE],
+        "chunk 1 refused at its position; the rest and the terminator (all in flight \
+         at the default K, CIRISEdge#739: the lanes drain on a stop) kept"
     );
     assert_eq!(
         node_c
@@ -6490,32 +6657,33 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
         own_holder_claims(&node_d, &sha).await.is_empty(),
         "D claims nothing"
     );
-    // A's e0 set names no occurrence of D: the cascade enumerated the
-    // room's members. (D still admits and stores the carrier — a wrap is
-    // ciphertext addressed to someone else, and `wraps_written` counts rows
-    // inserted, not rows this node can unwrap.)
-    let recipients_of = |set: &ciris_persist::federation::Attestation| {
-        ciris_persist::federation::key_grant::KeyGrantSet::from_attestation(set)
-            .expect("persist reads its own set back")
-            .wraps
-            .into_iter()
-            .map(|w| w.recipient_key_id)
-            .collect::<Vec<_>>()
+    // A's e0 rows name no occurrence of D: the cascade enumerated the
+    // room's members. persist v55.0.0 (#989) — one key-grant row per
+    // recipient, its recipient the row's `attested_key_id`. (D still admits a
+    // row addressed to a member — a wrap is ciphertext addressed to someone
+    // else — and projects nothing from it.)
+    let recipients_of = |row: &ciris_persist::federation::Attestation| {
+        vec![
+            ciris_persist::federation::key_grant::KeyGrantRow::from_attestation(row)
+                .expect("persist reads its own row back")
+                .wrap
+                .recipient_key_id,
+        ]
     };
+    let e0_recipients: Vec<String> = sets_a.iter().flat_map(&recipients_of).collect();
+    assert!(
+        e0_recipients.contains(&node_b.me) && e0_recipients.contains(&node_c.me),
+        "the e0 rows wrap to the members' nodes: {e0_recipients:?}"
+    );
+    assert!(
+        !e0_recipients.contains(&node_d.me),
+        "A's cascade wrapped nothing to a non-member's occurrence: {e0_recipients:?}"
+    );
     for s in &sets_a {
-        let recipients = recipients_of(s);
-        assert!(
-            recipients.contains(&node_b.me) && recipients.contains(&node_c.me),
-            "the e0 set wraps to the members' nodes: {recipients:?}"
-        );
-        assert!(
-            !recipients.contains(&node_d.me),
-            "A's cascade wrapped nothing to a non-member's occurrence: {recipients:?}"
-        );
         node_d
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: s.clone(),
             })
             .await
@@ -6617,19 +6785,22 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     let mut wrapped_to_d = Vec::new();
     for s in sets_of(&node_a).await {
         if recipients_of(&s).contains(&node_d.me) {
-            wrapped_to_d.push(s.attestation_type.clone());
+            wrapped_to_d.push(
+                ciris_persist::federation::key_grant::key_grant_dimension_of(&s)
+                    .unwrap_or("not a key-grant row"),
+            );
         }
         node_d
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet { attestation: s })
+            .apply_replicated_key_grant(SignedKeyGrantRow { attestation: s })
             .await
             .expect("D applies A's sets");
     }
     assert_eq!(
         wrapped_to_d.len(),
         1,
-        "exactly one set wraps to D — the e1 set, minted after it joined: {wrapped_to_d:?}"
+        "exactly one row wraps to D — the e1 row, minted after it joined: {wrapped_to_d:?}"
     );
     // Positive control: D reads what was sealed after it joined. The bytes
     // cross as the whole-blob path carries them.
@@ -6735,4 +6906,507 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
         .await
         .expect("carol still opens the e0 file after the rotation");
     assert!(still == plain, "byte-identical on C after the rotation");
+}
+
+/// **persist v55.0.0 (CIRISPersist#977) — a stream-keyed room chunk is never
+/// held under a community epoch: refused at the adopt once this node knows
+/// the stream is stream-keyed, and remedied at the promote when it landed
+/// before that.** alice publishes a file into a two-member room (a v55
+/// writer: the DAG is stream-keyed, one `(stream, epoch)` DEK, the manifest
+/// under the room's epoch DEK). bob's node receives the room row and the
+/// room's epoch key rows, but not yet the stream's:
+///
+/// 1. chunk 0, adopted under the ROW's provenance (the community epoch), is
+///    accepted and bound to that epoch: the chunk door cannot yet tell it
+///    from a legacy chunk (the ordering gap persist names);
+/// 2. the stream's key rows land; now chunk 1 under the same provenance is
+///    refused `StreamKeyedChunkCommunityEpoch` at the adopt, the whole batch,
+///    nothing written;
+/// 3. edge's pull (chunks under `for_stream_keyed_chunk`, chunk 0 held and
+///    skipped) reaches the promote, which refuses chunk 0's binding; the pull
+///    evicts it, re-fetches and re-adopts it stream-keyed, promotes again, and
+///    is `Stored`. One chunk booked `remediated`; no community epoch binds any
+///    chunk afterwards; the file reads back byte-identical.
+///
+/// Fails without the remediation (the pull ends
+/// `DagRefused(StreamKeyedChunkCommunityEpoch)`, never `Stored`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // the gap, the refusal, then the remedy, in order, on purpose
+async fn a_room_chunk_bound_to_the_community_epoch_is_refused_at_adopt_and_remedied_at_promote_977()
+{
+    use ciris_edge::blob_swarm::{BlobPuller, DagByteFetch as _, PullConfig, PullOutcome};
+    use ciris_edge::files::FileRow;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::key_grant::{KeyGrantAxis, KeyGrantRow, SignedKeyGrantRow};
+    use ciris_persist::federation::{
+        AdoptChunkItem, BlobError, BlobProvenance, FederationDirectory, SignedAttestation,
+    };
+    const ROOM: &str = "room-977";
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let room_key = Ident::new(ROOM, 0x99);
+    let idents = [&alice, &bob, &room_key];
+    let node_a = node(&idents, &alice).await;
+    let node_b = node(&idents, &bob).await;
+    for n in [&node_a, &node_b] {
+        seed_room(n, ROOM, &[&alice, &bob]).await;
+    }
+    federate(&node_a, &node_b).await;
+    federate(&node_b, &node_a).await;
+    let (_wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
+    let puller_b = BlobPuller::new(
+        Arc::clone(&edge_b),
+        node_b.store.engine().clone(),
+        node_b.dir.clone(),
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        node_b.me.clone(),
+        PullConfig::default(),
+    );
+
+    let file_len = 1_300_000usize;
+    let plain = body_of(file_len, 0x977);
+    let room = ciris_edge::scope_room::ScopeRoom::community(ROOM);
+    let published = ciris_edge::files::publish(
+        &*node_a.dir,
+        &node_a.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &ciris_edge::files::FileWrite {
+            room: &room,
+            bytes: &plain,
+            media_type: "video/mp4",
+            codec: None,
+            filename: Some("gap.mp4"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("publish a chunked file into the room");
+    let e0 = published
+        .pointer
+        .epoch
+        .expect("a room pointer names its epoch");
+    let stream_id = published.pointer.stream_id.clone().expect("a chunk DAG");
+    let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let crossed_id = match &published.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!("the room file must cross: {other:?}")
+        }
+    };
+    let row = node_a
+        .dir
+        .get_attestation(&crossed_id)
+        .await
+        .expect("read")
+        .expect("the crossed row");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("bob's node admits the room row");
+    let aad = ciris_edge::group_content::content_aad(
+        &row.attesting_key_id,
+        row.asserted_at,
+        published.pointer.content_field,
+    );
+    let view = node_a
+        .store
+        .engine()
+        .open_sealed_manifest_as(&sha, &node_a.me, Some(&aad))
+        .await
+        .expect("alice opens her manifest");
+    assert!(
+        view.chunks.iter().all(|c| c.epoch == Some(0)),
+        "a v55 room DAG is stream-keyed (#977)"
+    );
+    let chunk_at = |i: usize| -> [u8; 32] {
+        hex::decode(&view.chunks[i].sha256_hex)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes")
+    };
+    let (chunk0, chunk1) = (chunk_at(0), chunk_at(1));
+
+    // Key rows: the room's epoch rows cross now, the stream's later.
+    node_a
+        .store
+        .engine()
+        .emit_pending_key_grants()
+        .await
+        .expect("alice emits");
+    let (mut stream_rows, mut epoch_rows) = (Vec::new(), Vec::new());
+    for r in node_a
+        .dir
+        .list_attestations_since(None, 500)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|a| a.attestation)
+        .filter(ciris_persist::federation::key_grant::is_key_grant_row)
+    {
+        match KeyGrantRow::from_attestation(&r)
+            .expect("a key_grant row")
+            .axis
+        {
+            KeyGrantAxis::Stream { .. } => stream_rows.push(r),
+            _ => epoch_rows.push(r),
+        }
+    }
+    assert!(!stream_rows.is_empty() && !epoch_rows.is_empty());
+    let apply_rows = |rows: Vec<ciris_persist::federation::Attestation>| {
+        let engine = node_b.store.engine().clone();
+        async move {
+            for r in rows {
+                let _ = engine
+                    .apply_replicated_key_grant(SignedKeyGrantRow { attestation: r })
+                    .await;
+            }
+        }
+    };
+    apply_rows(epoch_rows).await;
+
+    // The ROW's provenance: the pointer's community epoch.
+    let row_provenance =
+        BlobProvenance::from_attestation(&row, &sha, published.pointer.epoch, None)
+            .expect("the row's provenance");
+    assert_eq!(
+        row_provenance.epoch,
+        Some(e0),
+        "the pointer's community epoch"
+    );
+    let fetch = MeshFetch::new(&node_b.me, vec![node_a.me.clone()], &[&node_a]);
+    let adopt_under_row = |seq: u64, chunk: [u8; 32], size: u64| {
+        let engine = node_b.store.engine().clone();
+        let stream = stream_id.clone();
+        let provenance = row_provenance.clone();
+        let fetch = &fetch;
+        async move {
+            let bytes = fetch.fetch(chunk).await.expect("alice serves the chunk");
+            engine
+                .adopt_sealed_chunks(
+                    &stream,
+                    &[AdoptChunkItem {
+                        seq,
+                        envelope: &bytes,
+                        plaintext_size: size,
+                    }],
+                    0,
+                    provenance,
+                )
+                .await
+        }
+    };
+
+    // 1. The gap: before the stream's rows, a community-epoch chunk lands bound.
+    let gap = adopt_under_row(0, chunk0, u64::from(view.chunks[0].size))
+        .await
+        .expect("the door answers per item");
+    assert!(
+        matches!(&gap[..], [Ok(_)]),
+        "before the stream's key rows the door cannot tell it from a legacy chunk: {gap:?}"
+    );
+    assert!(
+        node_b
+            .dir
+            .community_dek_blob_epoch(&chunk0)
+            .await
+            .expect("binding")
+            .is_some(),
+        "chunk 0 is bound to the community epoch"
+    );
+
+    // 2. The stream's rows land: now the same provenance is refused at adopt.
+    apply_rows(stream_rows).await;
+    let refused = adopt_under_row(1, chunk1, u64::from(view.chunks[1].size)).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(BlobError::StreamKeyedChunkCommunityEpoch {
+                chunk_sha256_hex: None,
+                community_epoch,
+                ..
+            }) if *community_epoch == e0
+        ),
+        "a stream-keyed chunk under the community epoch is refused at adopt: {refused:?}"
+    );
+    assert!(
+        !node_b.dir.has_blob(&chunk1).await.expect("has_blob"),
+        "nothing written"
+    );
+
+    // 3. edge's pull: the promote names chunk 0, the pull remedies it once.
+    let outcome = puller_b.pull_dag_with(&row, sha, &fetch).await;
+    assert!(
+        matches!(outcome, PullOutcome::Stored { .. }),
+        "the pull evicts and re-adopts the bound chunk, then promotes: {outcome:?} \
+         (refusals {:?})",
+        edge_b.metrics().snapshot().blob_pull_refusals
+    );
+    assert_eq!(
+        edge_b
+            .metrics()
+            .snapshot()
+            .blob_dag_chunks
+            .get("remediated")
+            .copied(),
+        Some(1),
+        "exactly the one bound chunk was remedied"
+    );
+    for c in &view.chunks {
+        let chunk: [u8; 32] = hex::decode(&c.sha256_hex)
+            .expect("hex")
+            .try_into()
+            .expect("32 bytes");
+        assert!(
+            node_b
+                .dir
+                .community_dek_blob_epoch(&chunk)
+                .await
+                .expect("binding")
+                .is_none(),
+            "no community epoch binds stream-keyed chunk seq {}",
+            c.seq
+        );
+    }
+    let got = FileRow::from_row(&row)
+        .expect("a file row")
+        .open(&node_b.store, &node_b.me)
+        .await
+        .expect("bob opens the file");
+    assert!(got == plain, "byte-identical on bob's node");
+}
+
+/// **persist v55.0.0 (#1065: `would_hold` on the chunk doors) — a pull
+/// refused for disk pressure is booked by name.** alice publishes a file
+/// into a room bob's node is in; bob's puller runs over an engine whose
+/// disk-pressure snapshot is at the `Stop` tier, where persist refuses
+/// content held for others (`DiskPressureProxyRefused`, `operation:
+/// "accept"`). Two doors, both a `StoreFailed` (not retried) AND a
+/// `disk_pressure` entry in `blob_pull_refusals`:
+///
+/// 1. the manifest adopt, on a fresh pull;
+/// 2. the CHUNK adopt — the door v55 added the gate to — with the manifest
+///    already adopted (a resume), so the pull reaches the chunks.
+///
+/// One refused pull is ONE count: leg 1 books 1, leg 2 brings the total to
+/// exactly 2, though leg 2's walk refuses every chunk it had in flight (each
+/// is the same pressure verdict, and only the refusal that becomes the pull's
+/// outcome is booked). Fails with the store-refusal booking removed (`disk_pressure` absent: the
+/// refusal is a silent `StoreFailed`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // two doors, in order, on purpose
+async fn a_pull_under_disk_pressure_books_its_store_refusal_by_name() {
+    use ciris_edge::blob_swarm::{
+        BlobPuller, DagByteFetch as _, PullConfig, PullOutcome, PULL_REFUSAL_DISK_PRESSURE,
+    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
+    use ciris_persist::federation::{
+        AdoptDisposition, BlobProvenance, DiskPressureConfig, DiskPressureSnapshot,
+        FederationDirectory, PressureTier, SignedAttestation,
+    };
+    const ROOM: &str = "room-pressure";
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let room_key = Ident::new(ROOM, 0x99);
+    let idents = [&alice, &bob, &room_key];
+    let node_a = node(&idents, &alice).await;
+    let node_b = node(&idents, &bob).await;
+    for n in [&node_a, &node_b] {
+        seed_room(n, ROOM, &[&alice, &bob]).await;
+    }
+    federate(&node_a, &node_b).await;
+    federate(&node_b, &node_a).await;
+    let (_wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
+    let stop = DiskPressureSnapshot::from_free_bytes(0, &DiskPressureConfig::default());
+    assert!(stop.tier >= PressureTier::Stop && stop.refuses_proxy_writes);
+    let (_pressure_tx, pressure_rx) = tokio::sync::watch::channel(stop);
+    let pressured = node_b
+        .store
+        .engine()
+        .clone()
+        .with_disk_pressure_state_shared(pressure_rx);
+    // One chunk per adopt call: the walk then makes one refused adopt CALL
+    // per chunk (six here), so a booking per call and a booking per chunk
+    // both overcount, and only one booking per refused PULL reads exactly.
+    // (At the default batch size the six chunks fit one call, which could
+    // not tell per-call from per-pull.)
+    let puller_b = BlobPuller::new(
+        Arc::clone(&edge_b),
+        pressured,
+        node_b.dir.clone(),
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        node_b.me.clone(),
+        PullConfig {
+            dag_adopt_batch_chunks: 1,
+            ..PullConfig::default()
+        },
+    );
+    let booked = || {
+        edge_b
+            .metrics()
+            .snapshot()
+            .blob_pull_refusals
+            .get(PULL_REFUSAL_DISK_PRESSURE)
+            .copied()
+            .unwrap_or(0)
+    };
+
+    let plain = body_of(1_300_000, 0xd15c);
+    let room = ciris_edge::scope_room::ScopeRoom::community(ROOM);
+    let published = ciris_edge::files::publish(
+        &*node_a.dir,
+        &node_a.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &ciris_edge::files::FileWrite {
+            room: &room,
+            bytes: &plain,
+            media_type: "video/mp4",
+            codec: None,
+            filename: Some("pressure.mp4"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("publish a chunked file into the room");
+    let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let crossed_id = match &published.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!("the room file must cross: {other:?}")
+        }
+    };
+    let row = node_a
+        .dir
+        .get_attestation(&crossed_id)
+        .await
+        .expect("read")
+        .expect("the crossed row");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("bob's node admits the room row");
+    node_a
+        .store
+        .engine()
+        .emit_pending_key_grants()
+        .await
+        .expect("alice emits");
+    for r in node_a
+        .dir
+        .list_attestations_since(None, 1000)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|a| a.attestation)
+        .filter(ciris_persist::federation::key_grant::is_key_grant_row)
+    {
+        let _ = node_b
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantRow { attestation: r })
+            .await;
+    }
+    let fetch = MeshFetch::new(&node_b.me, vec![node_a.me.clone()], &[&node_a]);
+    // The once-per-pull count only bites if the walk refuses MORE than one
+    // chunk: the file spans several (five data chunks and a terminator), all
+    // refused by the same pressure verdict.
+    let aad_a = ciris_edge::group_content::content_aad(
+        &row.attesting_key_id,
+        row.asserted_at,
+        published.pointer.content_field,
+    );
+    let chunks = node_a
+        .store
+        .engine()
+        .open_sealed_manifest_as(&sha, &node_a.me, Some(&aad_a))
+        .await
+        .expect("alice opens her manifest")
+        .chunks
+        .len();
+    assert!(
+        chunks >= 2,
+        "the walk has several chunks to refuse: {chunks}"
+    );
+
+    // 1. The manifest adopt is refused for pressure, by name.
+    let refused = puller_b.pull_dag_with(&row, sha, &fetch).await;
+    assert!(
+        matches!(&refused, PullOutcome::StoreFailed(e) if e.contains("adopt manifest")),
+        "the manifest adopt is refused under Stop pressure: {refused:?}"
+    );
+    assert_eq!(
+        booked(),
+        1,
+        "booked as disk_pressure, not a silent StoreFailed"
+    );
+
+    // 2. The manifest held (adopted with no pressure, a resume): the chunk
+    //    adopt is the door that refuses.
+    let aad = ciris_edge::group_content::content_aad(
+        &row.attesting_key_id,
+        row.asserted_at,
+        published.pointer.content_field,
+    );
+    let manifest = fetch.fetch(sha).await.expect("alice serves the manifest");
+    node_b
+        .store
+        .engine()
+        .adopt_sealed_blob(
+            &manifest,
+            BlobProvenance::from_attestation(&row, &sha, published.pointer.epoch, None)
+                .expect("the row's provenance"),
+            Some(&aad),
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("the manifest adopts with no pressure");
+    let refused = puller_b.pull_dag_with(&row, sha, &fetch).await;
+    assert!(
+        matches!(&refused, PullOutcome::StoreFailed(e) if e.contains("adopt chunk")),
+        "the chunk adopt is refused under Stop pressure: {refused:?}"
+    );
+    let batches = edge_b
+        .metrics()
+        .snapshot()
+        .blob_dag_chunks
+        .get("adopt_batches")
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        batches >= 2,
+        "the walk made several refused adopt calls (batch = 1): {batches}"
+    );
+    assert_eq!(
+        booked(),
+        2,
+        "the chunk door's refusal is booked by name, ONCE for the refused pull — however \
+         many chunks or adopt batches the walk had in flight when it stopped"
+    );
 }

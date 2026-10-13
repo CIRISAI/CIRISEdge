@@ -130,7 +130,8 @@ pub enum EmitPass {
     DirtyOnly,
 }
 
-/// Run one pass. `Ok(n)` is the number of sets emitted.
+/// Run one pass. `Ok(n)` is the number of key-grant ROWS emitted (persist
+/// v55.0.0, #989: one row per recipient; a v54 pass counted sets).
 ///
 /// # Errors
 /// persist's error text, from the derivation, the ledger read or an emission.
@@ -146,15 +147,17 @@ pub async fn emit_pass(engine: &ciris_persist::Engine, pass: EmitPass) -> Result
                 .await
                 .map_err(|e| format!("this engine's key: {e}"))?;
             let axes = dirty_axes_of(engine, &me).await?;
+            // persist v55.0.0 (#989) — one emission per axis carries one row
+            // per recipient; the pass counts ROWS, as `emit_pending_key_grants`
+            // does.
             let mut emitted = 0usize;
             for axis in &axes {
-                if engine
+                if let Some(emission) = engine
                     .emit_key_grant(axis)
                     .await
                     .map_err(|e| e.to_string())?
-                    .is_some()
                 {
-                    emitted += 1;
+                    emitted += emission.attestation_ids.len();
                 }
             }
             Ok(emitted)

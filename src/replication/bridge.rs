@@ -117,7 +117,7 @@ use ciris_verify_core::threshold::ThresholdMember;
 use super::directory::ReplicationDirectory;
 use super::group_plane::{is_membership_plane, GroupPlane};
 use super::protocol::{EnvelopeKind, EnvelopeRef};
-use super::summary::ApplyOutcome;
+use super::summary::{ApplyOutcome, AwaitedSigner};
 
 // ─── CIRISEdge#423 → #425 — apply-refusal diagnostics, now by construction ──
 //
@@ -392,6 +392,235 @@ fn classified_refusal_reason(
     )
 }
 
+/// CIRISEdge#858 fix 7 (persist v54.1.0, CIRISPersist#1042) — what a persist
+/// `Err` says about the row's SIGNATURE, when it says anything.
+///
+/// Before v54.1.0 one token covered "this signer is not registered here yet"
+/// and "this signature does not verify", so every signature refusal had to be
+/// transient (the rule for an ambiguous token) and the park guessed the
+/// missing signer from the bytes. persist now types the first apart:
+///
+/// - [`Self::SignerUnknown`] — `Error::AttesterKeyUnknown { attesting_key_id,
+///   plane }`. An ordering gap, retryable by persist's own table: the same row
+///   admits when it is re-offered after that Key row lands. The park keys on
+///   `attesting_key_id`, which is the co-signer and not the row's attester
+///   when a co-signer is the missing one.
+/// - [`Self::SignerNotActingFor`] — `Error::SignerDoesNotActFor {
+///   attesting_key_id, identity_key_id, plane }` (persist v54.1.0's #1042
+///   follow-up, split out of `SignatureInvalid`). The signature VERIFIED
+///   against a held signer that is not yet the identity, an active occurrence
+///   of it, or a node it owns: the #776 ordering gap, retryable by persist's
+///   table. The row is indexed on the held signer (the #858 index) and
+///   released by the binding or occurrence that makes it act. A signer that
+///   will NEVER be bound gets the same token, and the index is what bounds
+///   it: the second refusal moves the row to the terminal schedule
+///   ([`RefusalBackoff::index_held_signer_at`]).
+/// - [`Self::Invalid`] — `Error::FederationTierUnverified` and
+///   `Error::SignatureInvalid`: the signature was checked against a signer this
+///   node holds and refused, or the signed bytes are malformed or unbound. A
+///   function of the offered bytes, so terminal (persist: "terminal on every
+///   door" once acts-for left `SignatureInvalid`). A corrected record is
+///   different bytes and is never suppressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignatureVerdict<'a> {
+    /// persist holds no Key row for this signer yet.
+    SignerUnknown(&'a str),
+    /// The signer's Key is held and its signature verified, but it does not
+    /// act for the row's identity yet.
+    SignerNotActingFor(&'a str),
+    /// The signature was checked and refused.
+    Invalid,
+}
+
+impl<'a> SignatureVerdict<'a> {
+    /// `None` = the error is not typed on the signature axis; the caller's own
+    /// mapping stands.
+    #[must_use]
+    pub(crate) fn of(err: &'a ciris_persist::federation::Error) -> Option<Self> {
+        use ciris_persist::federation::Error as E;
+        match err {
+            // An EMPTY key id names no Key that could ever land. persist no
+            // longer emits one (02c2b27d: `Error::unknown_signer` refuses an
+            // empty or blank id as `InvalidArgument` at the source); kept as
+            // defence, so a regression there cannot park a row on "".
+            E::AttesterKeyUnknown {
+                attesting_key_id, ..
+            } if !attesting_key_id.trim().is_empty() => Some(Self::SignerUnknown(attesting_key_id)),
+            E::SignerDoesNotActFor {
+                attesting_key_id, ..
+            } if !attesting_key_id.trim().is_empty() => {
+                Some(Self::SignerNotActingFor(attesting_key_id))
+            }
+            E::FederationTierUnverified { .. } | E::SignatureInvalid(_) => Some(Self::Invalid),
+            _ => None,
+        }
+    }
+
+    /// The [`ApplyOutcome`] this verdict maps to, carrying `reason`.
+    fn outcome(self, reason: String) -> ApplyOutcome {
+        match self {
+            Self::SignerUnknown(signer) => ApplyOutcome::refused_awaiting_signer(reason, signer),
+            Self::SignerNotActingFor(signer) => {
+                ApplyOutcome::refused_awaiting_acts_for(reason, signer)
+            }
+            Self::Invalid => ApplyOutcome::refused_terminal(reason),
+        }
+    }
+}
+
+/// The [`ApplyOutcome`] for a persist `Err` on the signature axis
+/// ([`SignatureVerdict`]), or `None` when the error is about something else.
+/// The message is [`apply_refusal_reason`]'s, unchanged, so the `kind()` token
+/// still correlates.
+fn signature_refusal(
+    plane: &str,
+    content_hash: &str,
+    err: &ciris_persist::federation::Error,
+) -> Option<ApplyOutcome> {
+    Some(SignatureVerdict::of(err)?.outcome(apply_refusal_reason(plane, content_hash, err)))
+}
+
+/// persist v54.1.0 — two typed verdicts edge reads as TERMINAL. Returns the
+/// token, or `None` when the error is neither.
+///
+/// - `Error::LicensureDelegatorNotAuthority` with a `reason` no later row
+///   repairs (persist's ruling on release-54.1.0, e165a2ac):
+///   `named_edge_not_license_delegation` and `named_edge_not_onto_emitter`
+///   are properties of the signed named edge; `authority_acts_by_quorum` is
+///   the authority's protocol (a community that acts only by a quorum act,
+///   until CIRISPersist#1036); `not_authority_at_receipt` is the emitter's
+///   standing at receipt. `named_edge_absent` (the delegates_to row is not
+///   held yet) and `not_on_live_chain_at_asserted_at` (an upstream `license`
+///   edge may still be replicating) turn on rows still in flight, so they keep
+///   the transient rule and its re-offer cap.
+/// - `Error::AccordProposalNonceReused` — a different proposal reusing a nonce
+///   its family already spent. A nonce names one proposal per family for good,
+///   so no later state admits these bytes.
+/// - `Error::PurgeRefused` — persist v54.1.0's steward purge (CIRISPersist#1046).
+///   At an admission door it is `purge_tombstoned` (the record was purged; no
+///   door brings it back) or `trace_run_kind_mock` (a federation-tier trace
+///   attestation that signs `run_kind = mock`). Every token is terminal but a
+///   retryable `purge_unauthorised` reason and `takedown_content_unbound`
+///   (persist v55.0.0, #1055/#1007; [`purge_refusal_terminal`]).
+/// - persist v55.0.0: `MalformedRow`, `DimensionRejected` for
+///   `registered_family_held_shut` / `ledger_l1_binding_violation`,
+///   `AttestationTypeUnregistered`, `PaymentProcessorIdentifier`, and the
+///   terminal `KeyGrantRefused` reasons ([`key_grant_refusal_terminal`]).
+/// - `Error::TraceDimensionInvalid` — a `trace:*` row refused for its SHAPE by
+///   `admission::check_trace_dimension_admission` at the attestation put door
+///   the replicated apply goes through: the attester absent from
+///   `subject_key_ids`, a missing `trace_id` / `agent_id_hash`, not exactly one
+///   of the inline and manifest forms, or (v54.1.0) a `run_kind` outside the
+///   closed vocabulary in either form. Every arm judges the signed row itself,
+///   so re-offering the same bytes can never admit. The token is persist's own
+///   `kind()`.
+pub(crate) fn typed_terminal_verdict(
+    err: &ciris_persist::federation::Error,
+) -> Option<&'static str> {
+    use ciris_persist::federation::admission::licensure_refusal;
+    use ciris_persist::federation::Error as E;
+    match err {
+        E::LicensureDelegatorNotAuthority { reason, .. } => [
+            licensure_refusal::NAMED_EDGE_NOT_LICENSE,
+            licensure_refusal::NAMED_EDGE_NOT_ONTO_EMITTER,
+            licensure_refusal::AUTHORITY_ACTS_BY_QUORUM,
+            licensure_refusal::NOT_AUTHORITY_AT_RECEIPT,
+        ]
+        .into_iter()
+        .find(|terminal| *reason == *terminal),
+        E::AccordProposalNonceReused { .. } => {
+            Some(ciris_persist::federation::accord_quorum::ACCORD_PROPOSAL_NONCE_REUSED)
+        }
+        E::PurgeRefused { token, body } => purge_refusal_terminal(token, body),
+        // A trace dimension persist cannot read; and persist v55.0.0 (#1055) —
+        // a signed row whose own bytes cannot be read as the claim they carry
+        // (an empty signer, a missing or ill-typed envelope member, a typed
+        // column diverging from its envelope, a non-canonical envelope, a
+        // malformed custody report). Both terminal at the first refusal by
+        // persist's own reading.
+        E::TraceDimensionInvalid { .. } | E::MalformedRow { .. } => Some(err.kind()),
+        // persist v55.0.0 (#753) — the two DimensionRejected reasons that are
+        // functions of the row: a family held shut until its door
+        // (`registered_family_held_shut`; a later persist may open it, and the
+        // terminal schedule still re-asks) and a ledger row breaking its L1
+        // triple binding. Every other DimensionRejected keeps the
+        // unclassified transient rule.
+        E::DimensionRejected { reason, .. }
+            if *reason
+                == ciris_persist::federation::admission::REGISTERED_FAMILY_HELD_SHUT_REASON
+                || *reason == ciris_persist::federation::admission::LEDGER_BINDING_REASON =>
+        {
+            Some(reason)
+        }
+        // persist v55.0.0 (#989 / #975) — a row type the row-type gate refuses
+        // (a retired carrier: a new `holds_bytes` claim, retired in v55, or a
+        // key-grant SET), and
+        // a settlement row naming a payment-processor identifier (#753). Both
+        // are the bytes'; the terminal schedule still re-asks after an upgrade.
+        E::AttestationTypeUnregistered { .. } | E::PaymentProcessorIdentifier { .. } => {
+            Some(err.kind())
+        }
+        // persist v55.0.0 (#989) — key-grant rows. persist exports no
+        // retryability predicate for `KeyGrantRefusalReason`, so the table is
+        // edge's (`key_grant_refusal_terminal`), keyed on persist's tokens.
+        E::KeyGrantRefused { reason, .. } if key_grant_refusal_terminal(reason) => Some(reason),
+        _ => None,
+    }
+}
+
+/// persist v55.0.0 (#1055, #1007) — a `PurgeRefused` is terminal unless
+/// persist says the refusal can turn: a `purge_unauthorised` whose `reason`
+/// token is retryable by `steward_purge::unauthorised_reason::is_retryable`
+/// (an ordering gap: the root, a cosigner's key, or this node's clock), or a
+/// `takedown_content_unbound` (no row binding the content is held yet). Every
+/// other token (`purge_tombstoned`, `trace_run_kind_mock`, the other takedown
+/// tokens, a terminal `purge_unauthorised` reason) is a verdict on the bytes.
+fn purge_refusal_terminal(token: &'static str, body: &serde_json::Value) -> Option<&'static str> {
+    use ciris_persist::federation::steward_purge::{token as purge, unauthorised_reason};
+    use ciris_persist::federation::takedown_tombstone::token as takedown;
+    if token == purge::UNAUTHORISED {
+        let retryable = body
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(unauthorised_reason::is_retryable);
+        return (!retryable).then_some(token);
+    }
+    if token == takedown::CONTENT_UNBOUND {
+        return None;
+    }
+    Some(token)
+}
+
+/// persist v55.0.0 (#989) — the `KeyGrantRefused` reasons edge reads as
+/// TERMINAL, per persist's documented intent for each reason: the row's own
+/// shape (`malformed`, `set_retired` for a retired v54 SET,
+/// `wrap_algorithm_not_v2`), a signer that is not the party it speaks for
+/// (`signer_not_self`), and a sealer that does not hold the authority the
+/// axis needs (`signer_not_minter`, `signer_not_author`,
+/// `signer_not_stream_owner`). TRANSIENT: `recipient_not_in_audience` (the
+/// occurrence, roster or allow list may not have landed),
+/// `signer_not_active_member` (the sealer's occurrence may not have landed)
+/// and `attestation_refused` (a lost store race; persist does not classify
+/// it). The self-axis owner leg is `SignerDoesNotActFor` (plane
+/// `key_grant`), already typed acts-for.
+///
+/// Edge's own table only because persist v55.0.0 exports no predicate:
+/// CIRISPersist#1064 adds one for v55.1. Replace this table with it then.
+fn key_grant_refusal_terminal(reason: &str) -> bool {
+    use ciris_persist::federation::key_grant::KeyGrantRefusalReason as R;
+    [
+        R::Malformed,
+        R::SetRetired,
+        R::WrapAlgorithmNotV2,
+        R::SignerNotSelf,
+        R::SignerNotMinter,
+        R::SignerNotAuthor,
+        R::SignerNotStreamOwner,
+    ]
+    .iter()
+    .any(|r| r.as_str() == reason)
+}
+
 /// CIRISEdge#544 — does re-offering the IDENTICAL bytes that earned this
 /// Key-plane refusal have any chance of a different answer?
 ///
@@ -404,6 +633,14 @@ fn classified_refusal_reason(
 ///
 /// # TERMINAL — the verdict is a function of state replication cannot move
 ///
+/// - `UnverifiableSignature` — persist v54.1.0 (CIRISPersist#1042) split the
+///   unregistered signer OUT of this token into `AttesterKeyUnknown`. What is
+///   left is a record whose signature does not verify against a scrubber this
+///   node HOLDS, or that is malformed: a function of the offered bytes. Until
+///   v54.1.0 it was transient, because the two arms were one token, and an
+///   invalid SELF-scrubbed Key then parked on its own key id, which only its own
+///   admit could release (CIRISEdge#858 fix 7). A corrected record from the
+///   holder is different bytes, and persist's `InvalidReplaced` admits it.
 /// - `PubkeySwap` — "replication may never swap an identity's keys". The verdict
 ///   compares the stored pubkey with the offered one; replication is structurally
 ///   barred from changing the first, and the second is fixed by the bytes.
@@ -418,11 +655,12 @@ fn classified_refusal_reason(
 ///
 /// - `StoreConflict` — persist says it outright: "the record is safe to re-offer".
 ///   A lost plan/act race on a planning backend.
-/// - `UnverifiableSignature` — the token covers a malformed record (terminal) AND
-///   an **unregistered signer** (recoverable: the scrub key is itself a Key-plane
-///   row that replicates, so this is ordinary bootstrap ordering). Indistinguishable
-///   from here, and dropping a record whose signer key is merely still in flight
-///   would silently strand a key registration — so: transient, bounded by backoff.
+/// - `AttesterKeyUnknown` — persist v54.1.0 (CIRISPersist#1042): the record's
+///   scrubber is not registered HERE yet. The scrub key is itself a Key-plane row
+///   that replicates, so this is ordinary bootstrap ordering, and persist names it
+///   retryable. The row is parked on the scrubber
+///   ([`FederationDirectoryReplicationBridge::park_or_release`]) and released by
+///   its admit.
 /// - `ReScrub` — likewise mixed: "not canonical-scoped" / "valid_from not newer"
 ///   cannot move, but "the m-of-n quorum re-verify … failed" can — quorum evidence
 ///   replicates on its own cursor plane (#474). A canonical KEY SUPERSEDE is the
@@ -462,7 +700,11 @@ fn key_refusal_retry(reason: KeyRefusalReason) -> RetryDisposition {
         // offered bytes are fixed, so no later state admits this offer: the key
         // re-mints instead. Terminal, the `ConflictingVersion` argument again.
         | KeyRefusalReason::NodeIdentityFused
-        | KeyRefusalReason::NodeIdentityChanged => RetryDisposition::Terminal,
+        | KeyRefusalReason::NodeIdentityChanged
+        // persist v54.1.0 (CIRISPersist#1042) — a signature that does not
+        // verify against a scrubber this node holds; the unregistered-scrubber
+        // arm is `AttesterKeyUnknown` now. See the doc above.
+        | KeyRefusalReason::UnverifiableSignature => RetryDisposition::Terminal,
         // v44.7.0 (#864) — `NotSelfSigned` / `RecordAbsent` are verdicts of the
         // LOCAL rebind door (`rebind_key_record`), which the replication plane
         // never runs: a fresh node INSERTS a bound record, a holder REBINDS.
@@ -474,7 +716,9 @@ fn key_refusal_retry(reason: KeyRefusalReason) -> RetryDisposition {
         }
         KeyRefusalReason::ReScrub
         | KeyRefusalReason::AlreadyAnchoredIdentical
-        | KeyRefusalReason::UnverifiableSignature
+        // persist v54.1.0 (CIRISPersist#1042) — retryable by persist's own
+        // table: re-offered after the scrubber's Key row lands.
+        | KeyRefusalReason::AttesterKeyUnknown
         | KeyRefusalReason::OwnerAbsent
         | KeyRefusalReason::OwnerAmbiguous
         | KeyRefusalReason::StoreConflict => RetryDisposition::Transient,
@@ -499,9 +743,14 @@ fn key_refusal_retry(reason: KeyRefusalReason) -> RetryDisposition {
 /// - **The reason is the branch**: the refusal message carries persist's stable
 ///   token (`pubkey_swap`, `downgrade`, …) — the #565 twin of the #433 rule.
 ///   Consumers key on the token constant, never on message prose.
+///
+/// `scrubber` is the offered record's `scrub_key_id`. persist v54.1.0's
+/// `attester_key_unknown` token names no key, and the scrubber is the key it
+/// lacks, so the refusal carries it for the park (CIRISEdge#858 fix 7).
 pub(crate) fn key_outcome_to_apply(
     result: Result<ReplicatedKeyOutcome, ciris_persist::federation::Error>,
     content_hash: &str,
+    scrubber: &str,
 ) -> (ApplyOutcome, Option<&'static str>) {
     match result {
         Ok(
@@ -520,7 +769,13 @@ pub(crate) fn key_outcome_to_apply(
             // without its `additional_scrubs` had them written back. Same shape
             // as `Rebound`: the held row changed and persist moved its serve
             // position, so this is an admission, never a duplicate.
-            | ReplicatedKeyOutcome::ScrubsRehydrated,
+            | ReplicatedKeyOutcome::ScrubsRehydrated
+            // persist v54.1.0 (CIRISPersist#1044) — the held row FAILED
+            // verification and was replaced in place by this record, which
+            // passes (same pubkeys, same claim). The held row changed and
+            // persist moved `mutated_at`: an admission, so rows parked on this
+            // key are released by the Key arm of `park_or_release`.
+            | ReplicatedKeyOutcome::InvalidReplaced,
         ) => (ApplyOutcome::Admitted, None),
         Ok(
             ReplicatedKeyOutcome::Unchanged
@@ -542,15 +797,23 @@ pub(crate) fn key_outcome_to_apply(
                         retry.as_str(),
                     ),
                     retry,
+                    // An empty scrubber names nothing to wait for (see
+                    // `SignatureVerdict::of`).
+                    awaits_signer: (matches!(reason, KeyRefusalReason::AttesterKeyUnknown)
+                        && !scrubber.is_empty())
+                    .then(|| AwaitedSigner::Key(scrubber.to_owned())),
                 },
                 Some(reason.as_str()),
             )
         }
         // A persist `Err` on this door is NOT one of the typed policy branches —
         // it is a backend/plumbing failure, which is the definition of moving
-        // state. Transient (bounded by the short backoff), never terminal.
+        // state. Transient (bounded by the short backoff), never terminal —
+        // unless persist typed it on the signature axis, which says what it is.
         Err(e) => (
-            ApplyOutcome::refused(apply_refusal_reason("Key", content_hash, &e)),
+            signature_refusal("Key", content_hash, &e).unwrap_or_else(|| {
+                ApplyOutcome::refused(apply_refusal_reason("Key", content_hash, &e))
+            }),
             None,
         ),
     }
@@ -617,6 +880,7 @@ fn attestation_outcome_to_apply(
                         retry.as_str(),
                     ),
                     retry,
+                    awaits_signer: None,
                 },
                 Some(reason.as_str()),
             )
@@ -907,6 +1171,10 @@ struct SweepGate {
     /// to a test, and holding it across the drain is the exact starvation shape
     /// the width bound was built to avoid.
     entries: std::sync::atomic::AtomicUsize,
+    /// CIRISEdge P0 telemetry — where a bounded acquire's wait is recorded
+    /// ([`EdgeMetrics::sweep_permit_wait_seconds`](crate::observability::EdgeMetrics::sweep_permit_wait_seconds)).
+    /// Installed by [`ReplicationBridge::with_metrics`]; `None` records nothing.
+    metrics: Option<crate::observability::EdgeMetrics>,
 }
 
 impl SweepGate {
@@ -935,6 +1203,7 @@ impl SweepGate {
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             max_in_flight: std::sync::atomic::AtomicUsize::new(0),
             entries: std::sync::atomic::AtomicUsize::new(0),
+            metrics: None,
         }
     }
 
@@ -948,7 +1217,18 @@ impl SweepGate {
     async fn enter(&self) -> SweepPermit<'_> {
         let permit = match self.sem.as_ref() {
             None => None,
-            Some(sem) => Arc::clone(sem).acquire_owned().await.ok(),
+            Some(sem) => {
+                // CIRISEdge P0 telemetry — the wait for a BOUNDED permit,
+                // recorded once per acquire at the one place every sweep
+                // entry point passes. The unbounded gate never waits, so it
+                // records nothing rather than a stream of zeros.
+                let waiting_since = std::time::Instant::now();
+                let permit = Arc::clone(sem).acquire_owned().await.ok();
+                if let Some(m) = self.metrics.as_ref() {
+                    m.observe_sweep_permit_wait(waiting_since.elapsed());
+                }
+                permit
+            }
         };
         let now = self
             .in_flight
@@ -2423,6 +2703,9 @@ impl FederationDirectoryReplicationBridge {
     /// `ReplicationRuntimeConfig`. `None` makes every increment a no-op.
     #[must_use]
     pub fn with_metrics(mut self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
+        // CIRISEdge P0 telemetry — the sweep gate records its permit wait
+        // into the same bag.
+        self.sweep_gate.metrics.clone_from(&metrics);
         self.metrics = metrics;
         self
     }
@@ -4505,10 +4788,30 @@ impl FederationDirectoryReplicationBridge {
                 }
             }
             Some(RetryDisposition::Transient) => {
-                if let Some(signer) =
-                    crate::replication::missing_signer::missing_signer_of(kind, envelope_bytes)
+                let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
+                // persist v54.1.0 (#1042 follow-up) — a HELD signer persist
+                // said does not act for the row's identity yet
+                // (`SignerDoesNotActFor`): the #776 index on that signer, on
+                // any door that asks acts-for (occurrence, its revocation,
+                // route, touch claim). No Key read: its signature verified.
+                if let Some(signer) = outcome.awaits_acts_for() {
+                    self.park_on_held_signer(kind, hash, signer, source_peer)
+                        .await;
+                } else if let Some(signer) =
+                    // CIRISEdge#858 fix 7 — the signer persist SAID it lacks
+                    // (`AttesterKeyUnknown`) first, then the one the bytes
+                    // name. The absence read below runs on either: it is what
+                    // parks when persist does not type the refusal (I5), and
+                    // on a typed one it catches a Key that landed between the
+                    // refusal and this read, which leaves the row on the short
+                    // window.
+                    outcome.awaits_signer().map(str::to_owned).or_else(|| {
+                            crate::replication::missing_signer::missing_signer_of(
+                                kind,
+                                envelope_bytes,
+                            )
+                        })
                 {
-                    let hash: [u8; 32] = Sha256::digest(envelope_bytes).into();
                     // The store lookup the apply loop could not afford: is the
                     // named signer GENUINELY absent? A held signer on any plane
                     // but the occurrence plane means the refusal was about
@@ -4519,7 +4822,19 @@ impl FederationDirectoryReplicationBridge {
                             self.park_on_absent_key(kind, hash, &signer, source_peer)
                                 .await;
                         }
-                        Ok(Some(_)) if kind == EnvelopeKind::IdentityOccurrence => {
+                        // An UNTYPED occurrence refusal with a held signer
+                        // (acts-for is the typed arm above now; what is left
+                        // is e.g. a typed field diverging from the signed
+                        // envelope, `InvalidArgument`). Indexed on the signer
+                        // anyway, so its second refusal is on the terminal
+                        // schedule rather than the transient ladder (#858 fix
+                        // 4). Not on a typed `AttesterKeyUnknown`: persist said
+                        // the KEY was missing, and it is here now, so the next
+                        // ask admits.
+                        Ok(Some(_))
+                            if kind == EnvelopeKind::IdentityOccurrence
+                                && outcome.awaits_signer().is_none() =>
+                        {
                             self.park_on_held_signer(kind, hash, &signer, source_peer)
                                 .await;
                         }
@@ -4562,9 +4877,10 @@ impl FederationDirectoryReplicationBridge {
         self.log_park(kind, signer, true).await;
     }
 
-    /// CIRISEdge#858 (generalising #776) — index a refused identity
-    /// occurrence on its HELD signer, in every case, and from the second
-    /// refusal put it on the terminal schedule. Its release is the #776 one:
+    /// CIRISEdge#858 (generalising #776) — index a refused row on its HELD
+    /// signer, and from the second refusal put it on the terminal schedule.
+    /// Since persist v54.1.0 the trigger is the typed `SignerDoesNotActFor`,
+    /// on every door that asks acts-for, not only the occurrence plane. Its release is the #776 one:
     /// the admitted binding or occurrence that makes the signer act for the
     /// identity. Directory reads only (the Key lookup the caller made).
     async fn park_on_held_signer(
@@ -4591,7 +4907,7 @@ impl FederationDirectoryReplicationBridge {
             signer = %signer,
             from = source_peer.unwrap_or("<unattributed>"),
             backoff_secs = window.as_secs(),
-            "occurrence refused while its (registered) signer does not act for the \
+            "row refused while its (registered) signer does not act for the \
              identity — indexed on the signer; its binding or occurrence releases and \
              re-asks it (CIRISEdge#776/#858)"
         );
@@ -4869,6 +5185,11 @@ impl FederationDirectoryReplicationBridge {
                     self.directory.list_attestations_for(subject_key_id),
                     "attestation (data-subject axis)"
                 ) {
+                    // persist v55.0.0 (#989) — key-grant rows stay carved here
+                    // too: a grant is authored by its sealer, not its recipient,
+                    // and travels only by `may_receive` refers-to delivery to the
+                    // recipient occurrence's own node (persist I743/I745/I188),
+                    // never by a subject's Pull.
                     if Self::is_non_retainable_score(&att) {
                         continue;
                     }
@@ -5087,6 +5408,15 @@ impl FederationDirectoryReplicationBridge {
         content_hash: &str,
         err: &ciris_persist::federation::Error,
     ) -> ApplyOutcome {
+        // CIRISEdge#858 fix 7 — the signature axis first: persist v54.1.0 types
+        // an unknown signer (park) apart from a bad signature (terminal).
+        if let Some(outcome) = signature_refusal(plane, content_hash, err) {
+            return outcome;
+        }
+        // persist v54.1.0 — a typed verdict about the bytes (`typed_terminal_verdict`).
+        if typed_terminal_verdict(err).is_some() {
+            return ApplyOutcome::refused_terminal(apply_refusal_reason(plane, content_hash, err));
+        }
         match ApplyRefusalClass::classify(err) {
             Some(class) => self.refuse_as(plane, content_hash, err, class),
             // CIRISEdge#544 — an UNCLASSIFIED persist error keeps the pre-#522
@@ -5120,6 +5450,7 @@ impl FederationDirectoryReplicationBridge {
         ApplyOutcome::Refused {
             reason: classified_refusal_reason(plane, content_hash, err, class),
             retry: class.retry(),
+            awaits_signer: None,
         }
     }
 
@@ -6813,16 +7144,33 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// Is `inner` a `key_grant:` set (CIRISPersist#848)?
+    /// Is `inner` a key-grant row (CIRISPersist#848)? persist v55.0.0 (#989):
+    /// a `scores` row on a `key_grant:{axis}:v1` dimension, one per recipient
+    /// (`key_grant::is_key_grant_row`'s test, read off the JSON view), or a
+    /// retired v54 key-grant SET (`attestation_type = key_grant:{axis}:v1`),
+    /// which persist no longer serves but a peer may still hold.
     fn is_key_grant_set(inner: &serde_json::Value) -> bool {
-        inner
+        use ciris_persist::federation::key_grant;
+        let ty = inner
             .get("attestation_type")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|t| {
-                t.starts_with(
-                    ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-                )
-            })
+            .and_then(serde_json::Value::as_str);
+        if ty.is_some_and(key_grant::is_retired_key_grant_set_type) {
+            return true;
+        }
+        ty == Some(ciris_persist::federation::types::attestation_type::SCORES)
+            && inner
+                .get("attestation_envelope")
+                .and_then(ciris_persist::federation::admission::envelope_dimension)
+                .is_some_and(|d| d.starts_with(key_grant::KEY_GRANT_DIMENSION_PREFIX))
+    }
+
+    /// persist v55.0.0 (#989) — the row persist routes to the key-grant door:
+    /// a per-recipient key-grant row, or a retired v54 SET (so its refusal is
+    /// the typed `set_retired`, not the row-type gate's).
+    fn routes_to_key_grant(att: &Attestation) -> bool {
+        use ciris_persist::federation::key_grant;
+        key_grant::is_key_grant_row(att)
+            || key_grant::is_retired_key_grant_set_type(&att.attestation_type)
     }
 
     /// v19.0.0 — the AUDIENCE a row names (CC 4.5.1.1 `recipient_see`), read
@@ -9428,9 +9776,11 @@ impl FederationDirectoryReplicationBridge {
             Ok(record) => {
                 let content_hash =
                     content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
+                let scrubber = record.record.scrub_key_id.clone();
                 let (outcome, refusal_token) = key_outcome_to_apply(
                     self.directory.apply_replicated_key_record(record).await,
                     &content_hash,
+                    &scrubber,
                 );
                 if let Some(token) = refusal_token {
                     if let Some(m) = &self.metrics {
@@ -9466,7 +9816,7 @@ impl FederationDirectoryReplicationBridge {
         source_peer: Option<&str>,
     ) -> ApplyOutcome {
         use ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome;
-        use ciris_persist::federation::key_grant::{KeyGrantSet, SignedKeyGrantSet};
+        use ciris_persist::federation::key_grant::{KeyGrantRow, SignedKeyGrantRow};
 
         let Some(engine) = self.engine.as_ref() else {
             // Unreachable by the guard in `apply_attestation`; refuse loudly
@@ -9476,33 +9826,34 @@ impl FederationDirectoryReplicationBridge {
             );
         };
 
-        // Parse under persist's own reading FIRST so a malformed set is
-        // refused TERMINAL — the bytes will not become well-formed on retry
-        // — rather than surfacing as a transient refusal from the door.
-        if let Err(e) = KeyGrantSet::from_attestation(&record.attestation) {
+        // Parse under persist's own reading FIRST so a malformed row (or a
+        // retired v54 SET, `set_retired`) is refused TERMINAL — the bytes
+        // will not become well-formed on retry — rather than surfacing as a
+        // transient refusal from the door.
+        if let Err(e) = KeyGrantRow::from_attestation(&record.attestation) {
             return ApplyOutcome::refused_terminal(format!(
-                "key_grant: not a well-formed set ({e}) — attestation_id={} type={}",
+                "key_grant: not a well-formed key-grant row ({e}) — attestation_id={} type={}",
                 record.attestation.attestation_id, record.attestation.attestation_type
             ));
         }
         let attestation_id = record.attestation.attestation_id.clone();
         let attestation_type = record.attestation.attestation_type.clone();
         let minter = record.attestation.attesting_key_id.clone();
-        let set = SignedKeyGrantSet {
+        let row = SignedKeyGrantRow {
             attestation: record.attestation,
         };
 
-        match engine.0.apply_replicated_key_grant(set).await {
+        match engine.0.apply_replicated_key_grant(row).await {
             Ok(admission) => {
                 tracing::info!(
                     axis = ?admission.axis,
-                    wraps_offered = admission.wraps_offered,
-                    wraps_written = admission.wraps_written,
+                    recipient = %admission.recipient_key_id,
+                    projected = admission.projected,
                     pending = admission.pending,
-                    carrier = ?admission.attestation,
+                    row = ?admission.attestation,
                     source_peer = source_peer.unwrap_or("<unattributed>"),
-                    "key_grant set admitted — wraps addressed to this node's occurrences \
-                     projected as grants (CIRISPersist#848)"
+                    "key_grant row admitted — a wrap to this node's occurrence is projected as \
+                     a grant (CIRISPersist#848, #989)"
                 );
                 // CIRISEdge#779 — a DAG pull parked on this key is woken now,
                 // not when (or if) its retry ladder comes round again.
@@ -9511,30 +9862,44 @@ impl FederationDirectoryReplicationBridge {
                 }
                 match admission.attestation {
                     ReplicatedAttestationOutcome::Inserted => ApplyOutcome::Admitted,
-                    // The carrier was already held (or deduplicated by hash).
-                    // Wraps may STILL have been written — a newly provisioned
-                    // occurrence, a late device — union semantics — but for
-                    // the sweep's accounting the row did not change.
+                    // The row was already held (or deduplicated by hash). The
+                    // projection is a union keyed by the row's identity, so a
+                    // re-offer projects nothing new; for the sweep's
+                    // accounting the row did not change.
                     ReplicatedAttestationOutcome::Unchanged
                     | ReplicatedAttestationOutcome::Deduplicated => ApplyOutcome::Duplicate,
-                    // The door admitted the SET (wraps projected) but the
-                    // carrier row was refused at the attestation plane. Say so
-                    // with persist's reason; the refusal is the row's, the
-                    // grants this node could use are already on disk.
+                    // The row was refused at the attestation plane. Say so with
+                    // persist's reason.
                     ReplicatedAttestationOutcome::Refused { reason } => {
                         ApplyOutcome::refused(format!(
-                            "key_grant: carrier row refused at the attestation plane ({reason:?}) \
+                            "key_grant: row refused at the attestation plane ({reason:?}) \
                              — attestation_id={attestation_id} type={attestation_type} \
-                             minter={minter}; wraps_written={}",
-                            admission.wraps_written
+                             sealer={minter}; projected={}",
+                            admission.projected
                         ))
                     }
                 }
             }
-            Err(e) => ApplyOutcome::refused(format!(
-                "key_grant: persist refused the set ({e}) — attestation_id={attestation_id} \
-                 type={attestation_type} minter={minter}"
-            )),
+            // CIRISEdge#858 fix 7 — the carrier is admitted through the
+            // attestation plane, so its signer refusals arrive typed: an
+            // unknown signer parks on it, a bad signature is terminal.
+            //
+            // persist v55.0.0 (#989) — a `KeyGrantRefused` reason that is the
+            // row's own (`key_grant_refusal_terminal`) is terminal; the others
+            // wait on state that can land and keep the transient rule.
+            Err(e) => {
+                let reason = format!(
+                    "key_grant: persist refused the row ({e}) — attestation_id={attestation_id} \
+                     type={attestation_type} sealer={minter}"
+                );
+                match SignatureVerdict::of(&e) {
+                    Some(verdict) => verdict.outcome(reason),
+                    None if typed_terminal_verdict(&e).is_some() => {
+                        ApplyOutcome::refused_terminal(reason)
+                    }
+                    None => ApplyOutcome::refused(reason),
+                }
+            }
         }
     }
 
@@ -9556,18 +9921,20 @@ impl FederationDirectoryReplicationBridge {
             // must not reach the general door below, which admits the carrier
             // and projects no wraps. Decided on `attestation_type` alone —
             // persist's own routing key — before anything else reads the row.
+            //
+            // persist v55.0.0 (#989) — a key grant is a per-recipient `scores`
+            // row on `key_grant:{axis}:v1`, routed by DIMENSION
+            // (`routes_to_key_grant`): the general door would project it too,
+            // but only the key-grant door reports the projection that wakes a
+            // parked pull (#779). A retired v54 SET goes there as well, for the
+            // typed `set_retired`.
             Ok(record)
-                if self.engine.is_some()
-                    && record.attestation.attestation_type.starts_with(
-                        ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-                    ) =>
+                if self.engine.is_some() && Self::routes_to_key_grant(&record.attestation) =>
             {
                 self.apply_key_grant(record, source_peer).await
             }
             Ok(record) => {
-                if record.attestation.attestation_type.starts_with(
-                    ciris_persist::federation::key_grant::KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-                ) {
+                if Self::routes_to_key_grant(&record.attestation) {
                     // Reached only with NO engine installed (the arm above
                     // took every other key_grant row). Stored through the
                     // general door rather than refused: admission is a
@@ -10013,10 +10380,21 @@ impl FederationDirectoryReplicationBridge {
             // replicating, and the cursor plane re-pulls from a watermark
             // rather than from a want-diff, so the backoff is the only rate
             // limit it has.
-            Err(e) => ApplyOutcome::refused(format!(
-                "AccordQuorumEvidence: admission refused (refusal={}): {e}",
-                e.kind(),
-            )),
+            //
+            // persist v54.1.0 (CIRISPersist#1047) — except a proposal that
+            // reuses its family's spent nonce: first-seen wins for good, so
+            // these bytes never admit (`typed_terminal_verdict`).
+            Err(e) => {
+                let reason = format!(
+                    "AccordQuorumEvidence: admission refused (refusal={}): {e}",
+                    e.kind(),
+                );
+                if typed_terminal_verdict(&e).is_some() {
+                    ApplyOutcome::refused_terminal(reason)
+                } else {
+                    ApplyOutcome::refused(reason)
+                }
+            }
         }
     }
 
@@ -10177,10 +10555,26 @@ impl FederationDirectoryReplicationBridge {
                 // over rows that replicate). Dropping a route because its
                 // attesting key is still in flight would strand reachability, so
                 // the ambiguous token stays re-askable under backoff.
-                Err(e) => ApplyOutcome::refused(format!(
-                    "TransportDestination: authenticated apply gate rejected (signature / \
-                     attesting-key / acts-for, CIRISEdge#337 CRITICAL-2): {e}"
-                )),
+                //
+                // CIRISEdge#858 fix 7 — persist v54.1.0 types all three apart
+                // (see `SignatureVerdict`): an unregistered attesting key
+                // (`AttesterKeyUnknown`) parks on the key, a held signer that
+                // does not act for the route's occurrence yet
+                // (`SignerDoesNotActFor`) is indexed on that signer, and a bad
+                // signature (`SignatureInvalid`) is terminal. Anything else
+                // keeps the conservative transient rule.
+                Err(e) => signature_refusal(
+                    "TransportDestination",
+                    &content_hash_of(&signed).map_or_else(String::new, |(h, _)| hex::encode(h)),
+                    &e,
+                )
+                .unwrap_or_else(|| {
+                    ApplyOutcome::refused(format!(
+                        "TransportDestination: authenticated apply gate rejected \
+                             (signature / attesting-key / acts-for, CIRISEdge#337 \
+                             CRITICAL-2): {e}"
+                    ))
+                }),
             },
             // A pre-v17 bare row from an un-upgraded peer (intended breaking
             // behavior) — no longer silent (CIRISEdge#425).
@@ -11374,13 +11768,14 @@ pub(crate) mod tests {
             ReplicatedKeyOutcome::Rebound,
             ReplicatedKeyOutcome::Superseded,
             ReplicatedKeyOutcome::ScrubsRehydrated,
+            ReplicatedKeyOutcome::InvalidReplaced,
         ] {
-            let (a, t) = key_outcome_to_apply(Ok(o), "h");
+            let (a, t) = key_outcome_to_apply(Ok(o), "h", "s");
             assert!(matches!(a, ApplyOutcome::Admitted), "{a:?}");
             assert!(t.is_none());
         }
         // Both duplicate halves: Duplicate, never counted as a refusal.
-        let (a, t) = key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Unchanged), "h");
+        let (a, t) = key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Unchanged), "h", "s");
         assert!(matches!(a, ApplyOutcome::Duplicate), "{a:?}");
         assert!(t.is_none());
         let (a, t) = key_outcome_to_apply(
@@ -11388,6 +11783,7 @@ pub(crate) mod tests {
                 reason: KeyRefusalReason::AlreadyAnchoredIdentical,
             }),
             "h",
+            "s",
         );
         assert!(
             matches!(a, ApplyOutcome::Duplicate),
@@ -11401,7 +11797,8 @@ pub(crate) mod tests {
             if matches!(reason, KeyRefusalReason::AlreadyAnchoredIdentical) {
                 continue;
             }
-            let (a, t) = key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Refused { reason }), "h");
+            let (a, t) =
+                key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Refused { reason }), "h", "s");
             let ApplyOutcome::Refused { reason: msg, .. } = &a else {
                 panic!("{} must map to Refused, got {a:?}", reason.as_str());
             };
@@ -11437,11 +11834,15 @@ pub(crate) mod tests {
             // or node-changing offer is refused in every successor state.
             KeyRefusalReason::NodeIdentityFused,
             KeyRefusalReason::NodeIdentityChanged,
+            // v54.1.0 (CIRISPersist#1042) — the unregistered-scrubber arm left
+            // this token for `attester_key_unknown`; what remains is a
+            // signature refused against a scrubber this node holds.
+            KeyRefusalReason::UnverifiableSignature,
         ];
         for &reason in KeyRefusalReason::ALL {
             // Drive the mapping the field drives, not the private fn alone.
             let (outcome, _) =
-                key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Refused { reason }), "h");
+                key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Refused { reason }), "h", "s");
             let want = if terminal.contains(&reason) {
                 RetryDisposition::Terminal
             } else {
@@ -11469,6 +11870,298 @@ pub(crate) mod tests {
                  from supersede-it: {msg}"
             );
         }
+    }
+
+    /// persist v54.1.0 — the two typed verdicts (`LicensureDelegatorNotAuthority`
+    /// under the four reasons no later row repairs, `AccordProposalNonceReused`)
+    /// reach the apply-door choke (`refuse`) as TERMINAL, and the two chain
+    /// reasons a replicating row can move do not. The fields are the ones persist's doors fill
+    /// (`admission::check_licensure_delegator_is_authority`,
+    /// `accord_quorum::nonce_reused`).
+    #[test]
+    fn unrepairable_licences_a_reused_accord_nonce_and_a_purge_are_terminal() {
+        use ciris_persist::federation::admission::licensure_refusal as R;
+        use ciris_persist::federation::Error as E;
+        let licence = |reason: &'static str| E::LicensureDelegatorNotAuthority {
+            attesting_key_id: "officer2".to_owned(),
+            authority_id: "aff-mj".to_owned(),
+            reason,
+            message: format!(
+                "licensure_delegator_not_authority: {reason}: \"officer2\" emitted \
+                 \"licensure:aff-mj\" under delegation Some(\"del-1\") signed at \
+                 2026-10-09 12:00:00 UTC, and it is not the authority's own issuance on a \
+                 live `license` chain from \"aff-mj\" at receipt"
+            ),
+        };
+        let nonce = E::AccordProposalNonceReused {
+            family_key_id: "humanity-accord".to_owned(),
+            nonce: "n-1".to_owned(),
+            existing_proposal_digest: "digest-a".to_owned(),
+        };
+        let purge = |token: &'static str| E::PurgeRefused {
+            token,
+            body: serde_json::json!({"record_id": "r-1", "notice_id": "n-1"}),
+        };
+        let (_backend, bridge) = make_bridge(&[]);
+        for (err, want) in [
+            (
+                licence(R::AUTHORITY_ACTS_BY_QUORUM),
+                RetryDisposition::Terminal,
+            ),
+            (
+                licence(R::NAMED_EDGE_NOT_LICENSE),
+                RetryDisposition::Terminal,
+            ),
+            (
+                licence(R::NAMED_EDGE_NOT_ONTO_EMITTER),
+                RetryDisposition::Terminal,
+            ),
+            (
+                licence(R::NOT_AUTHORITY_AT_RECEIPT),
+                RetryDisposition::Terminal,
+            ),
+            (nonce, RetryDisposition::Terminal),
+            // persist v54.1.0 — a purged record, and a mock trace at the
+            // federation tier, are refused at every admission door for good.
+            (
+                purge(ciris_persist::federation::steward_purge::token::TOMBSTONED),
+                RetryDisposition::Terminal,
+            ),
+            (
+                purge(ciris_persist::federation::steward_purge::TRACE_RUN_KIND_MOCK),
+                RetryDisposition::Terminal,
+            ),
+            // A malformed trace:* row (persist's shape gate): the same bytes
+            // never admit.
+            (
+                E::TraceDimensionInvalid {
+                    detail: "trace:* manifest form: \"run_kind\" \"bogus\" is not one of \
+                             [\"production\", \"qa\", \"battery\", \"mock\"] (CC 3.1.5)"
+                        .to_owned(),
+                },
+                RetryDisposition::Terminal,
+            ),
+            // …but an unauthorised replicated bundle may be waiting on a
+            // community row or cosigner Key this node does not hold yet:
+            // persist v55.0.0 (#1055) says which by a reason token.
+            (
+                E::PurgeRefused {
+                    token: ciris_persist::federation::steward_purge::token::UNAUTHORISED,
+                    body: serde_json::json!({
+                        "notice_id": "n-1",
+                        "reason": ciris_persist::federation::steward_purge::unauthorised_reason::ROOT_NOT_HELD,
+                        "retryable": true,
+                        "detail": "the claimant root's community row is not held here yet",
+                    }),
+                },
+                RetryDisposition::Transient,
+            ),
+            // A delegation row still replicating can move these: unclassified.
+            (licence(R::NAMED_EDGE_ABSENT), RetryDisposition::Transient),
+            (licence(R::NOT_ON_LIVE_CHAIN), RetryDisposition::Transient),
+            // The pre-02c2b27d prose shapes are no longer read: only the type.
+            (
+                E::InvalidArgument(format!(
+                    "licensure_delegator_not_authority: {}: …",
+                    R::AUTHORITY_ACTS_BY_QUORUM
+                )),
+                RetryDisposition::Transient,
+            ),
+            (
+                E::Conflict("accord_proposal_nonce_reused: nonce \"n-1\" …".to_owned()),
+                RetryDisposition::Transient,
+            ),
+        ] {
+            let outcome = bridge.refuse("Attestation", "h", &err);
+            assert_eq!(
+                outcome.retry_disposition(),
+                Some(want),
+                "{err}: must be {}",
+                want.as_str()
+            );
+            assert_eq!(outcome.awaits_signer(), None, "{err}");
+        }
+    }
+
+    /// persist v55.0.0 — each typed verdict through the apply-door choke
+    /// (`refuse`) earns `want`.
+    fn assert_v55_dispositions(rows: Vec<(ciris_persist::federation::Error, RetryDisposition)>) {
+        let (_backend, bridge) = make_bridge(&[]);
+        for (err, want) in rows {
+            let outcome = bridge.refuse("Attestation", "h", &err);
+            assert_eq!(
+                outcome.retry_disposition(),
+                Some(want),
+                "{} ({err}): must be {}",
+                err.kind(),
+                want.as_str()
+            );
+        }
+    }
+
+    /// persist v55.0.0 — the row-shape verdicts. Terminal: `MalformedRow`,
+    /// `AttestationTypeUnregistered`, `PaymentProcessorIdentifier`, and the two
+    /// named `DimensionRejected` reasons. Every other `DimensionRejected` keeps
+    /// the unclassified transient rule.
+    #[test]
+    fn v55_row_shape_refusals_follow_persists_dispositions() {
+        use ciris_persist::federation::admission;
+        use ciris_persist::federation::Error as E;
+        let dim = |reason: &'static str| E::DimensionRejected {
+            dimension: "key_grant:content:v1".to_owned(),
+            reason,
+        };
+        assert_v55_dispositions(vec![
+            (
+                E::MalformedRow {
+                    plane: "identity_occurrence",
+                    reason: ciris_persist::federation::malformed_row::TYPED_DIVERGES_FROM_ENVELOPE,
+                    message: "typed device_class diverges from the signed envelope".to_owned(),
+                },
+                RetryDisposition::Terminal,
+            ),
+            (
+                E::AttestationTypeUnregistered {
+                    attestation_type: "holds_bytes:sha256:0a1b2c3d".to_owned(),
+                    reason: "attestation_type_unregistered",
+                },
+                RetryDisposition::Terminal,
+            ),
+            (
+                E::PaymentProcessorIdentifier {
+                    matched_prefix: "cus_",
+                },
+                RetryDisposition::Terminal,
+            ),
+            (
+                dim(admission::REGISTERED_FAMILY_HELD_SHUT_REASON),
+                RetryDisposition::Terminal,
+            ),
+            (
+                dim(admission::LEDGER_BINDING_REASON),
+                RetryDisposition::Terminal,
+            ),
+            (dim("missing_version_segment"), RetryDisposition::Transient),
+        ]);
+    }
+
+    /// persist v55.0.0 (#753) — `ledger:*` rows reach the attestation door
+    /// with two new refusals, where they were `namespace_family_unregistered`
+    /// before. A signer that does not act for the attested owner is persist's
+    /// RETRYABLE `federation_signer_not_acting_for` (plane `"ledger"`): it
+    /// parks on the held signer like every other acts-for refusal, never
+    /// terminal. A row breaking its L1 triple binding is
+    /// `ledger_l1_binding_violation`: terminal.
+    #[test]
+    fn v55_ledger_refusals_follow_persists_dispositions() {
+        use ciris_persist::federation::admission;
+        use ciris_persist::federation::Error as E;
+        let (_backend, bridge) = make_bridge(&[]);
+        let acts_for = E::SignerDoesNotActFor {
+            attesting_key_id: "ledger-signer".to_owned(),
+            identity_key_id: "ledger-owner".to_owned(),
+            plane: "ledger",
+        };
+        assert_eq!(acts_for.kind(), "federation_signer_not_acting_for");
+        match bridge.refuse("Attestation", "h", &acts_for) {
+            ApplyOutcome::Refused {
+                retry,
+                awaits_signer,
+                ..
+            } => {
+                assert_eq!(retry, RetryDisposition::Transient);
+                assert_eq!(
+                    awaits_signer,
+                    Some(AwaitedSigner::ActsFor("ledger-signer".to_owned()))
+                );
+            }
+            other => panic!("a ledger acts-for refusal must be Refused: {other:?}"),
+        }
+        assert_v55_dispositions(vec![(
+            E::DimensionRejected {
+                dimension: "ledger:head:hours:v1".to_owned(),
+                reason: admission::LEDGER_BINDING_REASON,
+            },
+            RetryDisposition::Terminal,
+        )]);
+    }
+
+    /// persist v55.0.0 (#1055, #1007) — the purge and takedown verdicts.
+    /// Terminal: a terminal `purge_unauthorised` reason and the takedown tokens
+    /// but `takedown_content_unbound`. Transient: a retryable
+    /// `purge_unauthorised` reason (`unauthorised_reason::is_retryable`) and
+    /// `takedown_content_unbound`.
+    #[test]
+    fn v55_purge_refusals_follow_persists_dispositions() {
+        use ciris_persist::federation::steward_purge::{token as purge, unauthorised_reason as UR};
+        use ciris_persist::federation::takedown_tombstone::token as takedown;
+        use ciris_persist::federation::Error as E;
+        let unauthorised = |reason: &'static str| E::PurgeRefused {
+            token: purge::UNAUTHORISED,
+            body: serde_json::json!({
+                "notice_id": "n-1",
+                "reason": reason,
+                "retryable": UR::is_retryable(reason),
+                "detail": "…",
+            }),
+        };
+        let takedown = |token: &'static str| E::PurgeRefused {
+            token,
+            body: serde_json::json!({"notice_id": "t-1"}),
+        };
+        assert_v55_dispositions(vec![
+            (unauthorised(UR::ROOT_NOT_HELD), RetryDisposition::Transient),
+            (unauthorised(UR::NOT_YET_VALID), RetryDisposition::Transient),
+            (
+                unauthorised(UR::SIGNATURE_INVALID),
+                RetryDisposition::Terminal,
+            ),
+            (unauthorised(UR::QUORUM_NOT_MET), RetryDisposition::Terminal),
+            (
+                takedown(takedown::CONTENT_UNBOUND),
+                RetryDisposition::Transient,
+            ),
+            (takedown(takedown::UNAUTHORISED), RetryDisposition::Terminal),
+            (
+                takedown(takedown::NOT_BYTES_PLANE),
+                RetryDisposition::Terminal,
+            ),
+        ]);
+    }
+
+    /// persist v55.0.0 (#989) — every `KeyGrantRefusalReason`, walked with an
+    /// exhaustive match so a new one cannot slip in unclassified. Terminal: the
+    /// reasons that are the row's own; transient: the ones that wait on state
+    /// that can land (CIRISPersist#1064 will export the predicate).
+    #[test]
+    fn v55_key_grant_refusals_follow_persists_dispositions() {
+        use ciris_persist::federation::key_grant::KeyGrantRefusalReason as K;
+        use ciris_persist::federation::Error as E;
+        let rows = K::ALL
+            .iter()
+            .map(|reason| {
+                let want = match reason {
+                    K::Malformed
+                    | K::SetRetired
+                    | K::WrapAlgorithmNotV2
+                    | K::SignerNotSelf
+                    | K::SignerNotMinter
+                    | K::SignerNotAuthor
+                    | K::SignerNotStreamOwner => RetryDisposition::Terminal,
+                    K::SignerNotActiveMember
+                    | K::AttestationRefused
+                    | K::RecipientNotInAudience => RetryDisposition::Transient,
+                };
+                (
+                    E::KeyGrantRefused {
+                        reason: reason.as_str(),
+                        detail: "…".to_owned(),
+                    },
+                    want,
+                )
+            })
+            .collect();
+        assert_v55_dispositions(rows);
     }
 
     /// CIRISEdge#544 — the whole loop, end to end, on the real apply choke: a
@@ -11551,7 +12244,7 @@ pub(crate) mod tests {
         let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::Attestation, &bytes, Some("peer-relay"))
             .await;
-        let ApplyOutcome::Refused { reason, retry } = &outcome else {
+        let ApplyOutcome::Refused { reason, retry, .. } = &outcome else {
             panic!("an unknown attester must be refused, got {outcome:?}");
         };
         assert_eq!(
@@ -11681,7 +12374,10 @@ pub(crate) mod tests {
                     assert_eq!(token, None, "{reason}: never on the refusal ledger");
                 }
                 R::ConflictingAttestation | R::StoreConflict => {
-                    let ApplyOutcome::Refused { reason: msg, retry } = &outcome else {
+                    let ApplyOutcome::Refused {
+                        reason: msg, retry, ..
+                    } = &outcome
+                    else {
                         panic!("{reason}: must be Refused, got {outcome:?}");
                     };
                     assert_eq!(token, Some(reason.as_str()), "{reason}: booked by token");
@@ -11758,7 +12454,10 @@ pub(crate) mod tests {
         let attributed = bridge
             .apply_envelope_bytes(EnvelopeKind::Attestation, &wire, Some("node-bob"))
             .await;
-        let ApplyOutcome::Refused { reason: msg, retry } = &attributed else {
+        let ApplyOutcome::Refused {
+            reason: msg, retry, ..
+        } = &attributed
+        else {
             panic!("a same-id conflict must be Refused, got {attributed:?}");
         };
         assert!(
@@ -11782,6 +12481,7 @@ pub(crate) mod tests {
         let ApplyOutcome::Refused {
             reason: msg2,
             retry: retry2,
+            ..
         } = &unattributed
         else {
             panic!("a same-id conflict must be Refused on the typed door, got {unattributed:?}");
@@ -16517,7 +17217,7 @@ pub(crate) mod tests {
         // CIRISEdge#425 — fail-closed AND named: the escaped early return now yields
         // a `Refused` reason the choke point logs, not a silent `false`.
         assert!(
-            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry } if r.contains("operational providers") && retry.is_terminal()),
+            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry, .. } if r.contains("operational providers") && retry.is_terminal()),
             "v2 operational admission MUST fail-close with a NAMED refusal without \
              OperationalProviders — and TERMINAL (CIRISEdge#544): the providers are \
              fixed at construction, so re-asking every round for a plane this node \
@@ -16544,7 +17244,7 @@ pub(crate) mod tests {
             .apply_envelope_bytes(EnvelopeKind::OrgMembership, bytes, None)
             .await;
         assert!(
-            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry } if r.contains("operational providers") && retry.is_terminal()),
+            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry, .. } if r.contains("operational providers") && retry.is_terminal()),
             "org_membership must fail-close with a named TERMINAL refusal \
              (CIRISEdge#544), got {outcome:?}"
         );
@@ -16569,7 +17269,7 @@ pub(crate) mod tests {
             .apply_envelope_bytes(EnvelopeKind::PartnerRecord, bytes, None)
             .await;
         assert!(
-            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry } if r.contains("operational providers") && retry.is_terminal()),
+            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry, .. } if r.contains("operational providers") && retry.is_terminal()),
             "partner_record must fail-close with a named TERMINAL refusal \
              (CIRISEdge#544), got {outcome:?}"
         );
@@ -23672,6 +24372,44 @@ mod sweep_width_tests {
             },
         );
         (backend, bridge)
+    }
+
+    /// CIRISEdge P0 telemetry — a BOUNDED acquire's wait is recorded into
+    /// the bag `ReplicationBridge::with_metrics` installed (the same one the
+    /// runtime hands the bridge), once per acquire, at the gate every sweep
+    /// entry point passes. An unbounded gate never waits and records nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bounded_permit_wait_is_recorded_in_the_bridge_metrics_p0() {
+        let m = crate::observability::EdgeMetrics::new();
+        let (_backend, bridge) = make_bridge_with_permits(1);
+        let bridge = Arc::new(bridge.with_metrics(Some(m.clone())));
+        let held = bridge.sweep_gate.enter().await;
+        let waiter = {
+            let bridge = Arc::clone(&bridge);
+            tokio::spawn(async move {
+                let _permit = bridge.sweep_gate.enter().await;
+            })
+        };
+        tokio::time::sleep(StdDuration::from_millis(60)).await;
+        drop(held);
+        waiter.await.expect("the waiting sweep got its permit");
+        let wait = m.snapshot().sweep_permit_wait_seconds;
+        assert_eq!(wait.count, 2, "both bounded acquires are observed");
+        assert_eq!(
+            wait.cumulative[0], 1,
+            "the uncontended acquire waited under 10 ms"
+        );
+        assert!(
+            wait.sum_seconds >= 0.05,
+            "the contended acquire waited for the held permit: {}",
+            wait.sum_seconds
+        );
+
+        let m0 = crate::observability::EdgeMetrics::new();
+        let (_backend0, unbounded) = make_bridge_with_permits(0);
+        let unbounded = unbounded.with_metrics(Some(m0.clone()));
+        let _permit = unbounded.sweep_gate.enter().await;
+        assert_eq!(m0.snapshot().sweep_permit_wait_seconds.count, 0);
     }
 
     /// The DEFAULT is what production runs — CIRISServer never constructs a

@@ -116,8 +116,9 @@ pub enum BytesVerdict {
 /// `FSD/BYTES_PLANE_TOMBSTONE.md` §3.6): claims retracted FIRST, then bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EvictReport {
-    /// This node's live `holds_bytes` claims retracted — a hybrid-signed
-    /// federation-tier `withdraws` each.
+    /// This node's live holding claims retracted (since persist v55,
+    /// `custody:ack:v1` `here`) — a hybrid-signed `withdraws` each, at the
+    /// claim's scope.
     pub withdraws_emitted: usize,
     /// Whether a blob row was deleted (`false`: nothing was held).
     pub blob_deleted: bool,
@@ -126,13 +127,14 @@ pub struct EvictReport {
 /// Evicts a blob on this node **in the sweep's order**. Object-safe so the
 /// register can hold it behind `dyn`; persist's `Engine` is the one
 /// implementation, because eviction is not a delete: this node's live
-/// `holds_bytes` claims are retracted first (each a hybrid-signed
-/// `withdraws`, which needs the node's `LocalSigner`), and only then are the
+/// holding claims (`custody:ack:v1` since persist v55) are retracted first
+/// (each a hybrid-signed `withdraws`, which needs the node's `LocalSigner`),
+/// and only then are the
 /// bytes deleted. Deleting first — what the pre-#669 `BlobStorage::delete_blob`
 /// path did — left a live claim naming bytes the node no longer held.
 #[async_trait]
 pub trait BlobEvictor: Send + Sync {
-    /// Retract this node's live `holds_bytes` claims on `sha256`, THEN delete
+    /// Retract this node's live holding claims on `sha256`, THEN delete
     /// the blob row and its satellites. **A refused retraction aborts**: the
     /// bytes and the binding stay and the error names why; a retry after a
     /// partial failure never double-retracts (persist's retraction fold at
@@ -344,8 +346,9 @@ impl RevocationRegister {
 }
 
 /// What the apply path saw in an ADMITTED row, captured before the row moves
-/// into persist. Cheap for every row that is neither: a `holds_bytes` claim,
-/// a row with no reference and no target, contributes nothing.
+/// into persist. Cheap for every row that is neither: a holding claim
+/// (`custody:ack:v1`, or a legacy `holds_bytes` row retired in v55), a row
+/// with no reference and no target, contributes nothing.
 #[derive(Debug, Clone)]
 pub enum Observation {
     /// A row that references blobs — index it, and replay any withdrawal
@@ -365,7 +368,8 @@ pub fn observe(row: &Attestation) -> Option<Observation> {
         return Some(Observation::Withdraws(Box::new(row.clone())));
     }
     // Possession is not a reference (memory trap 4 / `BlobMeaning` step 2):
-    // a `holds_bytes` claim, or a custody report (CIRISEdge#763).
+    // a holding claim or custody report (`custody:ack:v1`, CIRISEdge#763),
+    // or a legacy `holds_bytes` row (retired in v55).
     if is_possession_row(row) {
         return None;
     }
@@ -480,7 +484,7 @@ async fn resolve_withdraws_target(
             return None;
         }
     };
-    // A holder retracting its own `holds_bytes` claim is the FSD's own
+    // A holder retracting its own holding claim is the FSD's own
     // content-location plane (ContentMiss / eviction announcements), not a
     // revocation of content. persist's gate skips the consent rules for it
     // (`Ok(None)`); so do we, by the same predicate `BlobMeaning` uses.
@@ -609,19 +613,19 @@ async fn evict_revoked(
                     claims_retracted = report.withdraws_emitted,
                     blob_deleted = report.blob_deleted,
                     "revocation: every reference withdrawn by an AUTHORIZED withdrawal — \
-                     this node's holds_bytes claims retracted, then the bytes deleted; \
+                     this node's holding claims retracted, then the bytes deleted; \
                      serve now answers Withdrawn; the converger sees Revoked (CC 2.3 at the \
                      bytes plane, CIRISEdge#606; the order is persist's, CIRISEdge#669)"
                 );
                 evicted.push(sha);
             }
             // A refused retraction ABORTS the eviction: bytes and binding stay
-            // (a live holds_bytes claim must never name bytes we no longer
+            // (a live holding claim must never name bytes we no longer
             // hold). Serve still refuses Withdrawn; the converger will retry.
             Err(e) => tracing::warn!(
                 sha = %hex_sha,
                 error = %e,
-                "revocation: blob revoked but the eviction was REFUSED (a holds_bytes \
+                "revocation: blob revoked but the eviction was REFUSED (a holding-claim \
                  retraction did not admit, or the delete failed) — bytes and claim stay; \
                  serve refuses Withdrawn and the converger will retry through EjectHardDelete"
             ),
@@ -728,7 +732,8 @@ mod tests {
             Some(Observation::References { shas, .. }) if shas == vec![sha(3)]
         ));
 
-        // A holds_bytes claim naming the same sha is possession, not a reference.
+        // A legacy holds_bytes claim (retired in v55) naming the same sha is
+        // possession, not a reference.
         row.attestation_type = "holds_bytes:sha256:03030303".into();
         assert!(observe(&row).is_none());
 
@@ -824,7 +829,7 @@ mod tests {
         async fn evict_blob_bytes(&self, _sha256: &[u8; 32]) -> Result<EvictReport, String> {
             // persist's contract (I18): a retraction that cannot be admitted
             // aborts BEFORE the delete — so a refusing door never counts one.
-            Err("holds_bytes retraction refused: federation_tier_unverified".into())
+            Err("holding-claim retraction refused: federation_tier_unverified".into())
         }
     }
 
@@ -852,7 +857,7 @@ mod tests {
         let evicted = evict_revoked(Some(&refusing), &row, "t", 1, vec![sha(1)]).await;
         assert!(
             evicted.is_empty(),
-            "a refused holds_bytes retraction ABORTS the eviction — bytes and claim stay"
+            "a refused holding-claim retraction ABORTS the eviction — bytes and claim stay"
         );
         assert_eq!(
             refusing.deletes.load(std::sync::atomic::Ordering::Relaxed),

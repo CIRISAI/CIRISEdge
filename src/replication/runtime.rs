@@ -1098,8 +1098,9 @@ impl ReplicationRuntime {
         // (#370 — apply is `&self`; the store owns serialization). The
         // scheduler carries the mesh-config reader so a #440 cadence relief
         // takes effect on the next round.
-        let mut scheduler =
-            ReplicationScheduler::new(config.scheduler).with_mesh_config(mesh_config.clone());
+        let mut scheduler = ReplicationScheduler::new(config.scheduler)
+            .with_mesh_config(mesh_config.clone())
+            .with_metrics(config.metrics.clone());
         let scheduler_handle = with_release_kick(&bridge, scheduler.install_control_channel());
         // CIRISEdge#794 — inbound frames clear their sender's no-route backoff.
         registry.install_no_route_backoff(&scheduler_handle);

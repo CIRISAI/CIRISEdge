@@ -8,8 +8,9 @@
 //! `attesting_key_id` for a row, `revoking_key_id` for a revocation. So NO plane
 //! admits while its signer's Key body is absent.
 //!
-//! Today that resolves itself: the bridge classifies `UnverifiableSignature` as
-//! TRANSIENT precisely because *"the scrub key is itself a Key-plane row that
+//! Today that resolves itself: the bridge classifies an unregistered signer
+//! (persist v54.1.0's `AttesterKeyUnknown`; before it, `UnverifiableSignature`)
+//! as TRANSIENT precisely because *"the scrub key is itself a Key-plane row that
 //! replicates, so this is ordinary bootstrap ordering"* — the key arrives on its
 //! own and the backoff retry admits the row.
 //!

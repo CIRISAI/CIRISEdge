@@ -440,7 +440,7 @@ where
 ///    `key_grant` set every encrypted seal now carries.
 /// 2. `me` is registered in `federation_keys` (both pubkeys, via
 ///    `register_self_federation_key`) if it is not already — the occurrence
-///    column is an FK, and the `holds_bytes` claim a seal emits points here.
+///    column is an FK, and the holding claim a seal emits points here.
 /// 3. `me` becomes an occurrence of `identity_key_id` with
 ///    `load_or_init_content_kem_identity()`'s pubkeys. This is what makes
 ///    the node **both** an admissible emitter (persist resolves `me` → a

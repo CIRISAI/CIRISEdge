@@ -9,7 +9,7 @@
 //! 1. **Contribution `subject_kind` discriminator** — recognises [`ContributionSubjectKind::TakedownNotice`] and [`ContributionSubjectKind::KeyGrant`] inside `MessageType::ContributionSubmit` envelopes so the [`crate::edge`] dispatch sub-dispatch can route fast-path vs addressed-delivery semantics.
 //! 2. **Fast-path `legal_basis` vocabulary** — [`FastPathLegalBasis`] pins the legal-compliance triggers (TVEC, GIFCT-CIP, NCMEC) that bump dispatch priority + emit a synthetic `FederationAnnouncement` to known holders. Matches the CIRISRegistry CEG 0.3 §5.6.8 LegalBasis enum.
 //! 3. **`BlobBody::External` wire shape** — [`ExternalRefWithAcl`] is the `ContentBody` variant for external bytes (films, episodes, long-form video). Edge does NOT fetch the bytes; the consumer's client fetches directly from `external_uri`.
-//! 4. **L1-as-CDN-edge opt-in** — operator-side `EdgeConfig::l1_cdn_edge_enabled` + `l1_cdn_edge_external_uri_base` let an L1 server pre-fetch external content and re-emit `holds_bytes` with the operator's own `external_ref`. v0.20.1 ships the wire shape + dispatch hook; the actual prefetch implementation is a stub ([`cdn_edge_prefetch_stub`]) — full bytes-fetching is a post-v1.0 follow-up.
+//! 4. **L1-as-CDN-edge opt-in** — operator-side `EdgeConfig::l1_cdn_edge_enabled` + `l1_cdn_edge_external_uri_base` let an L1 server pre-fetch external content and file its own holding claim (`custody:ack:v1` `here` since v55; `holds_bytes` before) with the operator's own `external_ref`. v0.20.1 ships the wire shape + dispatch hook; the actual prefetch implementation is a stub ([`cdn_edge_prefetch_stub`]) — full bytes-fetching is a post-v1.0 follow-up.
 //!
 //! See [`MEDIA_SHARING.md`](../../../CIRISNodeCore/FSD/MEDIA_SHARING.md)
 //! §2.6 (BlobBody::External), §2.7 (L1-as-CDN-edge), §5.2 (takedown
@@ -241,8 +241,9 @@ impl ExternalRefWithAcl {
 }
 
 /// L1-as-CDN-edge prefetch stub. Per MEDIA_SHARING.md §2.7, an L1
-/// server may opt in to pre-fetch external content + re-emit
-/// `holds_bytes` with its own `external_ref`. v0.20.1 locks the wire
+/// server may opt in to pre-fetch external content + file its own
+/// holding claim (`custody:ack:v1` `here` since v55) with its own
+/// `external_ref`. v0.20.1 locks the wire
 /// shape + dispatch hook; the actual `HTTP GET` + persist re-emission
 /// is deferred to a post-v1.0 cut.
 ///
@@ -267,8 +268,8 @@ impl ExternalRefWithAcl {
 /// (1) `reqwest`-driven `HTTP GET` against `external_uri`;
 /// (2) SHA verification against `external_sha256_hex`;
 /// (3) PUT to `{operator_base}/{sha256_hex}`;
-/// (4) emit a fresh `holds_bytes:sha256:{hash}` attestation through
-///     the existing federation evidence path.
+/// (4) file a fresh holding claim (`custody:ack:v1` `here`, persist's
+///     write door) for the bytes.
 #[allow(clippy::needless_pass_by_value)]
 pub async fn cdn_edge_prefetch_stub(
     external_uri: String,

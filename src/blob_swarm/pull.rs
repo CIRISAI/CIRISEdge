@@ -26,7 +26,8 @@
 //!
 //! # What it refuses to do
 //!
-//! - It never fetches on a `holds_bytes` row. Possession is not meaning
+//! - It never fetches on a holding claim (`custody:ack:v1`, or a legacy
+//!   `holds_bytes` row retired in v55). Possession is not meaning
 //!   ([`BlobMeaning::referenced_shas`] returns nothing for one), and a
 //!   puller that fetched on possession claims would fetch every blob every
 //!   peer announced.
@@ -75,7 +76,7 @@ pub struct PullRequest {
 pub enum PullOffer {
     /// Queued for the puller.
     Queued,
-    /// The row references no blob (or is a `holds_bytes` row); nothing to do.
+    /// The row references no blob (or is a holding claim); nothing to do.
     NotAReference,
     /// The queue is full; the offer was DROPPED, logged and counted. The
     /// row is still in persist, so a later re-read (a peer re-advertising
@@ -92,6 +93,9 @@ pub struct PullSink {
     /// CIRISEdge#779 — the puller's parked-DAG register, so the key-grant
     /// door can wake the DAG a grant names.
     key_waits: Arc<KeyWaits>,
+    /// This node's key (the puller's `local_key_id`): only a key-grant row
+    /// addressed to it wakes a parked DAG (persist v55.0.0, #989).
+    local_key_id: String,
 }
 
 impl std::fmt::Debug for PullSink {
@@ -138,18 +142,32 @@ impl PullSink {
         }
     }
 
-    /// CIRISEdge#779 — **a key_grant set was admitted.** If it wrote a wrap
-    /// to this node, wake the parked DAG pull waiting on it: a content-axis
-    /// set names the row (manifest or chunk) it opens, an epoch-axis set the
-    /// epoch, a stream-axis set (CIRISEdge#797) the stream epoch. Never blocks and never awaits (the apply path's door, like
+    /// CIRISEdge#779 — **a key_grant row was admitted.** If its wrap is now
+    /// in this node's grant tables, wake the parked DAG pull waiting on it: a
+    /// content-axis row names the row (manifest or chunk) it opens, an
+    /// epoch-axis row the epoch, a stream-axis row (CIRISEdge#797) the stream
+    /// epoch. Never blocks and never awaits (the apply path's door, like
     /// [`Self::offer`]); the puller's next tick re-pulls each woken DAG once,
     /// from a fresh retry ladder, however many of its grants landed.
+    ///
+    /// persist v55.0.0 (#989) — one row per recipient: the admission reports
+    /// `projected` (the wrap is in this node's grant tables; persist projects
+    /// only a wrap to an occurrence this node holds the private half for) and
+    /// `pending` (a content-axis wrap whose bytes have not arrived, projected
+    /// later by the adopt). Only a projected, non-pending wrap addressed to
+    /// THIS node's key wakes: a pending or unprojected one, or one for another
+    /// node's key (a shared backend can project a sibling occurrence's wrap),
+    /// wakes nothing. A re-offer reports `projected` again (a union), so a pull
+    /// may be woken twice for one key, which costs one re-pull.
     pub fn key_grant_admitted(
         &self,
         admission: &ciris_persist::federation::key_grant::KeyGrantAdmission,
     ) {
         use ciris_persist::federation::key_grant::KeyGrantAxis;
-        if admission.wraps_written == 0 {
+        if !admission.projected
+            || admission.pending
+            || admission.recipient_key_id != self.local_key_id
+        {
             return;
         }
         match &admission.axis {
@@ -190,6 +208,7 @@ impl PullSink {
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
             key_waits: Arc::new(KeyWaits::new(1)),
+            local_key_id: String::new(),
         }
     }
 }
@@ -313,8 +332,9 @@ impl Default for PullConfig {
 pub enum PullOutcome {
     /// The bytes were already here; nothing fetched.
     AlreadyHeld,
-    /// Fetched, gated, stored. `announced` is whether a `holds_bytes` claim
-    /// went out — the gate's verdict, carried into persist's door.
+    /// Fetched, gated, stored. `announced` is whether this node's holding
+    /// claim (`custody:ack:v1` `here`, persist v55) went out or already
+    /// exists — the gate's verdict, carried into persist's door.
     Stored { announced: bool },
     /// Another pull for this sha is in flight; this one stood down.
     InFlight,
@@ -326,8 +346,9 @@ pub enum PullOutcome {
     /// `attempts` reached the ceiling).
     NoHolders { attempts: u32, retrying: bool },
     /// CIRISEdge#646 — a self/family pull found no node of the author to
-    /// ask. These tiers never consult the claim index (CC 5.2: no
-    /// `holds_bytes` exists for them by construction); the holders are the
+    /// ask. These tiers never consult the claim index (CC 5.2: their
+    /// holding claims reach only the cohort, never a discovery surface);
+    /// the holders are the
     /// author's nodes, resolved through the directory
     /// (`FSD/CONTENT_TRANSFER.md` §6.2). `retrying` when the directory has
     /// not converged on the author yet (`NotYetDiscovered`) or every node
@@ -423,6 +444,31 @@ pub const PULL_REFUSAL_DAG_OVER_CAP: &str = "dag_over_cap";
 pub const PULL_REFUSAL_DAG_CHUNK_MISMATCH: &str = "dag_chunk_mismatch";
 /// The `blob_pull_refusals` tag for [`DagPullRefusal::ChunkMissing`].
 pub const PULL_REFUSAL_DAG_CHUNK_MISSING: &str = "dag_chunk_missing";
+/// The `blob_pull_refusals` tag for a store door that refused the bytes
+/// because this node is under disk pressure (persist's
+/// `BlobError::DiskPressureProxyRefused`, `operation: "accept"`): content held
+/// for others, refused at the `Stop` tier and tighter. Still
+/// [`PullOutcome::StoreFailed`], never retried (persist: it clears only when
+/// the host disk recovers), but named, so an operator sees it.
+pub const PULL_REFUSAL_DISK_PRESSURE: &str = "disk_pressure";
+
+/// persist v55.0.0 (#1065: `would_hold` runs on the chunk doors too) — the
+/// `blob_pull_refusals` tag a STORE door's refusal is booked under, when it
+/// names a cause an operator acts on; `None` for the rest (they stay
+/// [`PullOutcome::StoreFailed`]'s message only).
+#[must_use]
+pub fn store_refusal_tag(e: &ciris_persist::federation::BlobError) -> Option<&'static str> {
+    matches!(
+        e,
+        ciris_persist::federation::BlobError::DiskPressureProxyRefused { .. }
+    )
+    .then_some(PULL_REFUSAL_DISK_PRESSURE)
+}
+
+/// The `blob_pull_refusals` tag for
+/// [`DagPullRefusal::StreamKeyedChunkCommunityEpoch`].
+pub const PULL_REFUSAL_DAG_STREAM_KEYED_COMMUNITY_EPOCH: &str =
+    "dag_stream_keyed_chunk_community_epoch";
 
 /// CIRISEdge#717 — **why a chunk-DAG pull stopped**, by rung
 /// (`FSD/CONTENT_TRANSFER.md` §6.7, the pull state table). Every arm is a
@@ -483,6 +529,18 @@ pub enum DagPullRefusal {
         /// Persist's finding.
         detail: String,
     },
+    /// persist v55.0.0 (CIRISPersist#977) — a stream-keyed room chunk under a
+    /// COMMUNITY epoch (`blob_stream_keyed_chunk_community_epoch`), refused at
+    /// `stage`: `adopt` (the chunk door refused the provenance edge built —
+    /// an edge bug, since every stream-keyed chunk's provenance comes from
+    /// `BlobProvenance::for_stream_keyed_chunk`), or `promote` after this pull
+    /// attempt already evicted and re-adopted every bound chunk once.
+    StreamKeyedChunkCommunityEpoch {
+        /// `adopt` or `promote`.
+        stage: &'static str,
+        /// Persist's finding.
+        detail: String,
+    },
 }
 
 impl DagPullRefusal {
@@ -495,6 +553,9 @@ impl DagPullRefusal {
             Self::OverCap { .. } => PULL_REFUSAL_DAG_OVER_CAP,
             Self::ChunkMismatch { .. } => PULL_REFUSAL_DAG_CHUNK_MISMATCH,
             Self::ChunkMissing { .. } => PULL_REFUSAL_DAG_CHUNK_MISSING,
+            Self::StreamKeyedChunkCommunityEpoch { .. } => {
+                PULL_REFUSAL_DAG_STREAM_KEYED_COMMUNITY_EPOCH
+            }
         }
     }
 }
@@ -787,6 +848,39 @@ pub trait DagByteFetch: Send + Sync {
     /// [`PullOutcome::FetchFailed`] (retried; a sealed pull resumes from
     /// whatever it adopted before the failure).
     async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String>;
+
+    /// [`Self::fetch`], with the one failure that is NOT retried typed apart:
+    /// a holder answered that the bytes are withdrawn, purged or revoked
+    /// federation-wide ([`DagFetchError::Gone`]). The puller calls this; the
+    /// default reads every `fetch` error as [`DagFetchError::Transport`], so
+    /// a fetcher that cannot tell the two apart keeps the retried behaviour.
+    async fn fetch_typed(&self, sha: [u8; 32]) -> Result<Vec<u8>, DagFetchError> {
+        self.fetch(sha).await.map_err(DagFetchError::Transport)
+    }
+}
+
+/// Why a [`DagByteFetch`] produced no bytes for an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DagFetchError {
+    /// May clear: transport, timeout, no holder accepted the request. The
+    /// pull ends [`PullOutcome::FetchFailed`] and is retried.
+    Transport(String),
+    /// A holder answered `MissReason::Withdrawn` or `Revoked`: the bytes were
+    /// withdrawn, purged (persist v54.1.0 `BlobError::Purged` is the same
+    /// wire word) or revoked federation-wide, and every holder is bound by
+    /// the same retraction. The pull ends [`PullOutcome::Refused`], terminal,
+    /// as the whole-blob scheduler ends one on `GoneFederationWide`: no other
+    /// holder is asked and no retry is booked.
+    Gone(String),
+}
+
+impl std::fmt::Display for DagFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(reason) => f.write_str(reason),
+            Self::Gone(reason) => write!(f, "withdrawn or revoked federation-wide: {reason}"),
+        }
+    }
 }
 
 /// The production [`DagByteFetch`] (CIRISEdge#739): the pull's holders
@@ -909,7 +1003,11 @@ impl DagByteFetch for SwarmFetch {
     }
 
     async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String> {
-        let routes = self.routes().await?;
+        self.fetch_typed(sha).await.map_err(|e| e.to_string())
+    }
+
+    async fn fetch_typed(&self, sha: [u8; 32]) -> Result<Vec<u8>, DagFetchError> {
+        let routes = self.routes().await.map_err(DagFetchError::Transport)?;
         let alpha = self.swarm.ewma_alpha;
         let strike_limit = self.swarm.error_strike_limit;
         let timeout = self.swarm.per_request_timeout;
@@ -918,7 +1016,10 @@ impl DagByteFetch for SwarmFetch {
         let mut last = String::from("no holder accepted the request");
         for _ in 0..max_attempts {
             let Some(peer) = self.pick() else {
-                return Err(format!("no holders left for {}: {last}", hex::encode(sha)));
+                return Err(DagFetchError::Transport(format!(
+                    "no holders left for {}: {last}",
+                    hex::encode(sha)
+                )));
             };
             let Some(recipient) = routes.get(&peer) else {
                 // Unroutable holders were dropped by `resolve_holder_routes`
@@ -949,7 +1050,7 @@ impl DagByteFetch for SwarmFetch {
                         }
                     });
                     if gone {
-                        return Err(format!("withdrawn or revoked federation-wide: {reason}"));
+                        return Err(DagFetchError::Gone(reason));
                     }
                     last = format!("{peer}: chunk miss {reason}");
                 }
@@ -962,7 +1063,7 @@ impl DagByteFetch for SwarmFetch {
                 }
             }
         }
-        Err(last)
+        Err(DagFetchError::Transport(last))
     }
 }
 
@@ -1115,6 +1216,53 @@ pub fn chunk_adopt_epoch(manifest_epoch: Option<u64>) -> u64 {
     manifest_epoch.unwrap_or(crate::group_content::persist_store::STREAM_EPOCH)
 }
 
+/// persist v55.0.0 (#977) — **is this a STREAM-KEYED room DAG?** A
+/// `community_dek` DAG whose manifest names each chunk's epoch (a v4
+/// manifest): sealed per `(stream_id, epoch)` by a v55 writer, its chunks
+/// carry no community binding and open under the stream epoch's key. A room
+/// DAG whose chunks name no epoch was sealed per chunk under the community
+/// epoch (before v55) and keeps that reading.
+#[must_use]
+fn is_stream_keyed_room(
+    tier: CryptoTier,
+    view: &ciris_persist::federation::chunk_dag_cascade::orchestrate::SealedManifestView,
+) -> bool {
+    tier == CryptoTier::CommunityDek && view.chunks.iter().any(|c| c.epoch.is_some())
+}
+
+/// The provenance a sealed DAG's CHUNKS are adopted under, built from the
+/// row's provenance: unchanged for a self/family DAG and a per-chunk-bound
+/// (pre-v55) room DAG, and persist's own
+/// [`BlobProvenance::for_stream_keyed_chunk`] for a stream-keyed room DAG
+/// (persist v55.0.0, #977: no community epoch, no minter; the chunk adopt's
+/// own `epoch` argument is the stream epoch). Never the row's provenance
+/// as is for a stream-keyed chunk: a room row's pointer carries the COMMUNITY
+/// epoch, which did not seal the chunk.
+///
+/// # Errors
+/// persist's `InvalidArgument` for a stream-keyed DAG whose row provenance is
+/// not a `community_dek` one naming its community.
+fn chunk_provenance_of(
+    row_provenance: &BlobProvenance,
+    stream_keyed_room: bool,
+) -> Result<BlobProvenance, ciris_persist::federation::BlobError> {
+    if stream_keyed_room {
+        row_provenance.for_stream_keyed_chunk()
+    } else {
+        Ok(row_provenance.clone())
+    }
+}
+
+/// Whether the pull must ask persist's readiness door for the chunks' keys
+/// before promoting: a self/family DAG (per-chunk or per-stream-epoch keys,
+/// CIRISEdge#779/#797) and a stream-keyed room DAG (persist v55.0.0, #977).
+/// A per-chunk-bound room DAG shares the manifest's community epoch, which
+/// the manifest opening as this node already answered.
+#[must_use]
+fn needs_chunk_key_readiness(tier: CryptoTier, stream_keyed_room: bool) -> bool {
+    tier == CryptoTier::InvisibleEncrypted || stream_keyed_room
+}
+
 /// CIRISEdge#797 — **how many of the waiting chunks (front first) share the
 /// first one's epoch.** Persist's batch adopt takes ONE epoch per call, so a
 /// batch never crosses an epoch: [`adopt_batch_take`]'s count is capped at
@@ -1138,8 +1286,29 @@ enum LaneStop {
 enum DagFetchStop {
     /// The fetcher could not produce it (transport, timeout, no holder).
     Transport(String),
+    /// A holder said the bytes are gone federation-wide
+    /// ([`DagFetchError::Gone`]): terminal, never retried.
+    Gone(String),
     /// It arrived, but does not hash to the address asked for.
     HashMismatch { got: [u8; 32] },
+}
+
+/// A DAG fetch a holder answered withdrawn, purged or revoked: the pull
+/// ends [`PullOutcome::Refused`] with NO retry booked, the disposition the
+/// whole-blob scheduler gives `GoneFederationWide`. Re-asking cannot help:
+/// every holder is bound by the same retraction.
+fn dag_gone(row: &Attestation, blob_hex: &str, what: &str, reason: &str) -> PullOutcome {
+    tracing::info!(
+        blob = %blob_hex,
+        attestation_id = %row.attestation_id,
+        what,
+        reason,
+        "DAG pull ended: the bytes are withdrawn, purged or revoked federation-wide — \
+         not retried, no other holder asked"
+    );
+    PullOutcome::Refused(format!(
+        "withdrawn or revoked federation-wide: {what}: {reason}"
+    ))
 }
 
 /// The declared-size check (CIRISEdge#638 item 2): the hash already matched,
@@ -1364,6 +1533,7 @@ where
             tx,
             dropped: Arc::new(AtomicU64::new(0)),
             key_waits: Arc::clone(&self.key_waits),
+            local_key_id: self.local_key_id.clone(),
         };
         let handle = tokio::spawn(self.run(rx));
         (sink, handle)
@@ -1644,6 +1814,17 @@ where
     /// node's audience (a server-class node and the owner's self content, CC
     /// 3.3.7) is counted and left alone.
     pub async fn durability_sweep(&self) -> super::durability::DurabilitySweep {
+        self.durability_sweep_at(chrono::Utc::now()).await
+    }
+
+    /// [`Self::durability_sweep`] read at `now`: every liveness and refresh
+    /// decision of the pass is taken at that instant. A test runs a pass a
+    /// day or three days on to reach a stale or lapsed `here`; the reports
+    /// the pass files are signed at the real clock.
+    pub(crate) async fn durability_sweep_at(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> super::durability::DurabilitySweep {
         // Small in tests, so the rolling scan's budget can be exercised
         // (CIRISEdge#802 review) without thousands of fixture files.
         #[cfg(not(test))]
@@ -1655,7 +1836,6 @@ where
         #[cfg(test)]
         const MAX_FILES: usize = 3;
         let mut out = super::durability::DurabilitySweep::default();
-        let now = chrono::Utc::now();
         let mut seen: HashSet<[u8; 32]> = HashSet::new();
         // CIRISEdge#817 — each audience device's custody history is read once
         // for the whole pass, not once per file; built fresh every pass.
@@ -1752,6 +1932,8 @@ where
             audience_reads = custody.audience_reads(),
             repairs = out.repairs.len(),
             reported_here = out.reported_here.len(),
+            already_here = out.already_here.len(),
+            withheld = out.withheld.len(),
             not_in_audience = out.not_in_audience,
             "durability pass (CIRISEdge#763, CC 6.1.5.3)"
         );
@@ -1793,6 +1975,89 @@ where
         rooms
     }
 
+    /// persist v55.0.0 — **are this file's bytes withheld by a takedown or a
+    /// steward purge?** Read off the file's durability deficit, which persist's
+    /// `deficit_over` fills from its canonical predicate
+    /// (`steward_purge::purge_withheld`, the one its byte and custody doors
+    /// ask) — the same read, already made for this file, so no second walk.
+    /// Withheld bytes are no holding of ours to advertise (persist refuses a
+    /// `here` about them) or to repair (a repair would pull taken-down
+    /// content back; persist's deficit lists nothing missing for them). A
+    /// withheld file is booked `withheld` once per pass (the pass's `seen`
+    /// set) at DEBUG, since it repeats every pass while the takedown stands.
+    /// `true` when the pass must leave the file alone.
+    fn withheld_in_pass(
+        &self,
+        withheld: Option<&str>,
+        sha: &[u8; 32],
+        blob: &str,
+        out: &mut super::durability::DurabilitySweep,
+    ) -> bool {
+        let Some(notice_id) = withheld else {
+            return false;
+        };
+        self.edge
+            .metrics()
+            .inc_durability_custody(crate::observability::DURABILITY_WITHHELD);
+        out.withheld.push(*sha);
+        tracing::debug!(
+            blob = %blob,
+            notice_id = %notice_id,
+            "durability pass: withheld by a takedown — no `here`, no repair"
+        );
+        true
+    }
+
+    /// Book what one custody report did, in the pass's `durability_custody`
+    /// outcomes. A report persist refused because a takedown withholds the
+    /// bytes (`PurgeRefused` with `steward_purge::token::BLOB_PURGED`: a
+    /// takedown that landed after [`Self::withheld_in_pass`] asked) is
+    /// `withheld` at DEBUG, as the guard books it, never `report_refused`.
+    /// `true` when the bytes turned out to be withheld.
+    pub(crate) fn book_custody_report(
+        &self,
+        blob: &str,
+        sha: [u8; 32],
+        state: ciris_persist::federation::custody_ack::CustodyState,
+        filed: Result<String, super::durability::CustodyFileError>,
+        out: &mut super::durability::DurabilitySweep,
+    ) -> bool {
+        use crate::observability as obs;
+        use ciris_persist::federation::custody_ack::CustodyState;
+        let metrics = self.edge.metrics();
+        match filed {
+            Ok(_) if state == CustodyState::Here => {
+                metrics.inc_durability_custody(obs::DURABILITY_FILED_HERE);
+                out.reported_here.push(sha);
+                false
+            }
+            Ok(_) => {
+                metrics.inc_durability_custody(obs::DURABILITY_FILED_NONE);
+                false
+            }
+            Err(e) => {
+                if let Some(notice_id) = e.withheld_notice() {
+                    metrics.inc_durability_custody(obs::DURABILITY_WITHHELD);
+                    out.withheld.push(sha);
+                    tracing::debug!(
+                        blob = %blob,
+                        notice_id = %notice_id,
+                        "durability pass: withheld by a takedown — persist refused the report"
+                    );
+                    return true;
+                }
+                metrics.inc_durability_custody(obs::DURABILITY_REPORT_REFUSED);
+                tracing::warn!(
+                    blob = %blob,
+                    state = state.as_str(),
+                    error = %e,
+                    "durability pass: custody report not filed"
+                );
+                false
+            }
+        }
+    }
+
     /// One file of a durability pass — see [`Self::durability_sweep`].
     async fn durability_of_file(
         &self,
@@ -1803,6 +2068,7 @@ where
         out: &mut super::durability::DurabilitySweep,
     ) {
         use super::durability::{self, Repair};
+        use crate::observability as obs;
         use ciris_persist::federation::custody_ack::{CustodyState, CustodyVerdict};
         let me = self.local_key_id.as_str();
         let dir: &dyn FederationDirectory = &*self.backend;
@@ -1832,6 +2098,9 @@ where
             out.not_in_audience += 1;
             return;
         }
+        if self.withheld_in_pass(deficit.withheld.as_deref(), &sha, &blob, out) {
+            return;
+        }
         let whole = match durability::holds_whole(
             &self.engine,
             &*self.backend,
@@ -1859,9 +2128,14 @@ where
             .as_ref()
             .and_then(|c| c.reported_at)
             .is_some_and(|at| now.signed_duration_since(at) < durability::CUSTODY_REFRESH);
+        let metrics = self.edge.metrics();
         let report = match (whole, live_here) {
             // Held, reported, and the report is recent: nothing to do.
-            (true, true) if fresh => return,
+            (true, true) if fresh => {
+                metrics.inc_durability_custody(obs::DURABILITY_ALREADY_HERE);
+                out.already_here.push(sha);
+                return;
+            }
             (true, _) => Some(CustodyState::Here),
             // The copy this node reported is gone: say so, so the cohort's
             // deficit lists this node until it is repaired.
@@ -1869,18 +2143,16 @@ where
             (false, false) => None,
         };
         if let Some(state) = report {
-            match durability::file_custody(&self.engine, &row, &sha, &file.pointer, state).await {
-                Ok(_) if state == CustodyState::Here => out.reported_here.push(sha),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    blob = %blob,
-                    state = state.as_str(),
-                    error = %e,
-                    "durability pass: custody report not filed"
-                ),
+            let filed =
+                durability::file_custody(&self.engine, &row, &sha, &file.pointer, state).await;
+            if self.book_custody_report(&blob, sha, state, filed, out) {
+                // Withheld between the guard and the file (a takedown racing
+                // the pass): nothing to repair either.
+                return;
             }
         }
         if !whole {
+            metrics.inc_durability_custody(obs::DURABILITY_REPAIR);
             out.repairs.push(Repair {
                 row,
                 sha,
@@ -2189,8 +2461,9 @@ where
     /// CIRISEdge#763 (CC 6.1.5.3, 3.1.3.3) — **a completed self/family pull
     /// files this node's `here`**, so the cohort can count the copy and the
     /// durability deficit stops listing this node. Acts on `Stored` only, and
-    /// only at `self` / `family` (the tiers whose copies are otherwise
-    /// unobservable: no `holds_bytes` at any audience, CC 5.2). For a chunk
+    /// only at `self` / `family` (the tiers whose adopt the store gate keeps
+    /// `LocalOnly`, so this report IS the copy's holding claim, placed at the
+    /// row's own cohort, CC 5.2 / 3.1.3.3). For a chunk
     /// DAG `here` means the manifest and every chunk
     /// ([`durability::file_custody`](super::durability::file_custody)), so the
     /// `Stored` a chunk repair ends in re-files it for the whole DAG. A
@@ -2224,6 +2497,13 @@ where
                 attestation_id = %row.attestation_id,
                 report = %report,
                 "custody `here` filed for a pulled file (CIRISEdge#763, CC 3.1.3.3)"
+            ),
+            // A takedown withholds the bytes: no `here` about them, by rule.
+            Err(e) if e.withheld_notice().is_some() => tracing::debug!(
+                blob = %hex::encode(sha),
+                attestation_id = %row.attestation_id,
+                notice_id = e.withheld_notice().unwrap_or(""),
+                "custody `here` not filed: the bytes are withheld by a takedown"
             ),
             Err(e) => tracing::warn!(
                 blob = %hex::encode(sha),
@@ -2311,6 +2591,7 @@ where
                     retrying: false,
                 }
             }
+            Err(DagFetchStop::Gone(reason)) => return dag_gone(row, &blob_hex, "blob", &reason),
             Err(DagFetchStop::HashMismatch { got }) => {
                 return PullOutcome::Refused(format!(
                     "pull_inline_with: the fetched body hashes to {}, not {blob_hex}",
@@ -2534,7 +2815,10 @@ where
         sha: [u8; 32],
     ) -> Result<Vec<u8>, DagFetchStop> {
         use sha2::{Digest as _, Sha256};
-        let bytes = fetch.fetch(sha).await.map_err(DagFetchStop::Transport)?;
+        let bytes = fetch.fetch_typed(sha).await.map_err(|e| match e {
+            DagFetchError::Transport(reason) => DagFetchStop::Transport(reason),
+            DagFetchError::Gone(reason) => DagFetchStop::Gone(reason),
+        })?;
         let got: [u8; 32] = Sha256::digest(&bytes).into();
         if got != sha {
             return Err(DagFetchStop::HashMismatch { got });
@@ -2557,6 +2841,149 @@ where
             "DAG pull refused (CIRISEdge#717, FSD/CONTENT_TRANSFER.md §6.7)"
         );
         PullOutcome::DagRefused(refusal)
+    }
+
+    /// persist v55.0.0 (CIRISPersist#977) — **the promote's remedy for a
+    /// stream-keyed room chunk bound to a community epoch**: every chunk the
+    /// manifest names that a community epoch binds here is evicted through
+    /// persist's one eviction door (`Engine::evict_blob`), re-fetched,
+    /// verified against its address, and re-adopted under `chunk_provenance`
+    /// (persist's `for_stream_keyed_chunk`) at its stream epoch. Returns how
+    /// many chunks were re-adopted; `Err` is the pull's outcome when a step
+    /// fails (a fetch that did not arrive is booked for retry, as any chunk's).
+    #[allow(clippy::too_many_arguments)] // the pull's own context, passed through
+    async fn remediate_community_bound_chunks(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        attempts: u32,
+        blob_hex: &str,
+        view: &ciris_persist::federation::chunk_dag_cascade::orchestrate::SealedManifestView,
+        chunk_provenance: &BlobProvenance,
+        fetch: &dyn DagByteFetch,
+    ) -> Result<u64, PullOutcome> {
+        let mut readopted = 0u64;
+        for c in &view.chunks {
+            let mut chunk = [0u8; 32];
+            if hex::decode_to_slice(&c.sha256_hex, &mut chunk).is_err() {
+                continue;
+            }
+            let bound = self
+                .backend
+                .community_dek_blob_epoch(&chunk)
+                .await
+                .map_err(|e| PullOutcome::StoreFailed(format!("community_dek_blob_epoch: {e}")))?;
+            if bound.is_none() {
+                continue;
+            }
+            self.engine
+                .evict_blob(&chunk, chrono::Utc::now())
+                .await
+                .map_err(|e| {
+                    PullOutcome::StoreFailed(format!("evict a community-bound chunk: {e}"))
+                })?;
+            let bytes = match self.fetch_verified(fetch, chunk).await {
+                Ok(b) => b,
+                // Evicted and not re-fetched: the retry's walk fetches it
+                // again under the stream-keyed provenance.
+                Err(DagFetchStop::Transport(reason)) => {
+                    return Err(self.dag_fetch_failed(
+                        row,
+                        sha,
+                        attempts,
+                        &format!("re-fetch of chunk seq {}", c.seq),
+                        &reason,
+                    ))
+                }
+                Err(DagFetchStop::Gone(reason)) => {
+                    return Err(dag_gone(
+                        row,
+                        blob_hex,
+                        &format!("chunk seq {}", c.seq),
+                        &reason,
+                    ))
+                }
+                Err(DagFetchStop::HashMismatch { got }) => {
+                    return Err(self.dag_refused(
+                        row,
+                        blob_hex,
+                        DagPullRefusal::ChunkMismatch {
+                            seq: c.seq,
+                            detail: format!(
+                                "the bytes served for {} hash to {}",
+                                hex::encode(chunk),
+                                hex::encode(got)
+                            ),
+                        },
+                    ))
+                }
+            };
+            let item = ciris_persist::federation::AdoptChunkItem {
+                seq: c.seq,
+                envelope: &bytes,
+                plaintext_size: u64::from(c.size),
+            };
+            let answer = self
+                .engine
+                .adopt_sealed_chunks(
+                    &view.stream_id,
+                    std::slice::from_ref(&item),
+                    chunk_adopt_epoch(c.epoch),
+                    chunk_provenance.clone(),
+                )
+                .await
+                .and_then(|mut per_item| match per_item.pop() {
+                    Some(r) => r.map(|_| ()),
+                    None => Err(ciris_persist::federation::BlobError::Backend(
+                        "the adopt answered no item".to_owned(),
+                    )),
+                });
+            if let Err(e) = answer {
+                self.book_store_refusal("re-adopt chunk", &e);
+                return Err(PullOutcome::StoreFailed(format!(
+                    "re-adopt chunk seq {} under for_stream_keyed_chunk: {e}",
+                    c.seq
+                )));
+            }
+            readopted += 1;
+        }
+        self.edge
+            .metrics()
+            .add_blob_dag_chunks("remediated", readopted);
+        tracing::info!(
+            blob = %blob_hex,
+            stream_id = %view.stream_id,
+            readopted,
+            "DAG pull: community-bound stream-keyed chunks evicted and re-adopted \
+             (CIRISPersist#977)"
+        );
+        Ok(readopted)
+    }
+
+    /// A store door refused (`door` names it): book the refusal under its
+    /// `blob_pull_refusals` tag when it names one ([`store_refusal_tag`]), so a
+    /// disk-pressure refusal is never a silent `StoreFailed`. The caller still
+    /// returns `StoreFailed`; nothing here retries.
+    ///
+    /// Once per refused PULL: each caller books the one refusal that becomes
+    /// the pull's `StoreFailed`, never one per chunk or per batch of a walk.
+    fn book_store_refusal(&self, door: &str, e: &ciris_persist::federation::BlobError) {
+        if let Some(tag) = store_refusal_tag(e) {
+            self.book_store_refusal_tag(door, tag, &e.to_string());
+        }
+    }
+
+    /// [`Self::book_store_refusal`] for a refusal already reduced to its tag
+    /// and message (the chunk walk keeps both per item).
+    fn book_store_refusal_tag(&self, door: &str, tag: &'static str, error: &str) {
+        self.edge.metrics().inc_blob_pull_refusal(tag);
+        tracing::warn!(
+            door,
+            refusal = tag,
+            error,
+            "pull: a store door refused the bytes — this node is under disk pressure and \
+             holds no content for others until the host disk recovers"
+        );
     }
 
     /// A fetch that did not arrive: booked for retry, named.
@@ -2625,19 +3052,23 @@ where
         };
 
         // ── manifest ── held from an earlier attempt, or fetched now.
+        //
+        // persist v55.0.0 (#951) — the manifest is adopted `LocalOnly`, ALWAYS:
+        // a sealed DAG is announced at PROMOTION (`promote_adopted_manifest_to_dag`
+        // with the gate's `adopt`), once every chunk is held, never at the
+        // manifest. `announced` here is only the REPAIR path's answer (a DAG
+        // already promoted, re-filled below): the claim that exists.
         let announced;
         let held = match self.backend.has_blob(&sha).await {
             Ok(h) => h,
             Err(e) => return PullOutcome::StoreFailed(format!("has_blob: {e}")),
         };
         if held {
-            // CIRISEdge#735 — a RESUME. The manifest was adopted, and its
-            // `holds_bytes` emitted or not, by an earlier attempt; this one
-            // skips the adopt, so `announced` is read off the claim that
-            // exists rather than reported false for a door not called. At
-            // `community_dek` the first attempt announced and the resume
-            // used to deny it; at `invisible_encrypted` no claim exists
-            // (CC 5.2) and this reads false, as before.
+            // CIRISEdge#735 — a RESUME. The manifest was adopted by an earlier
+            // attempt; this one skips the adopt, so `announced` is read off the
+            // holding claim that exists (persist v55: `custody:ack:v1`, through
+            // the same `list_holders` fold) rather than reported false for a
+            // door not called.
             announced = match self.backend.list_holders(&sha).await {
                 Ok(holders) => holders.contains(&self.local_key_id),
                 Err(e) => return PullOutcome::StoreFailed(format!("list_holders: {e}")),
@@ -2647,6 +3078,9 @@ where
                 Ok(b) => b,
                 Err(DagFetchStop::Transport(reason)) => {
                     return self.dag_fetch_failed(row, sha, attempts, "manifest", &reason)
+                }
+                Err(DagFetchStop::Gone(reason)) => {
+                    return dag_gone(row, &blob_hex, "manifest", &reason)
                 }
                 Err(DagFetchStop::HashMismatch { got }) => {
                     return self.dag_refused(
@@ -2663,11 +3097,19 @@ where
             };
             announced = match self
                 .engine
-                .adopt_sealed_blob(&bytes, provenance.clone(), Some(&aad), adopt)
+                .adopt_sealed_blob(
+                    &bytes,
+                    provenance.clone(),
+                    Some(&aad),
+                    AdoptDisposition::LocalOnly,
+                )
                 .await
             {
                 Ok(outcome) => outcome.announced,
-                Err(e) => return PullOutcome::StoreFailed(format!("adopt manifest: {e}")),
+                Err(e) => {
+                    self.book_store_refusal("adopt manifest", &e);
+                    return PullOutcome::StoreFailed(format!("adopt manifest: {e}"));
+                }
             };
         }
 
@@ -2741,6 +3183,17 @@ where
         if let Err(refusal) = check_dag_plan(stream_id, pointer.size, &plan) {
             return self.dag_refused(row, &blob_hex, refusal);
         }
+        // persist v55.0.0 (#977) — a room stream (`community_dek`) sealed by a
+        // v55 writer is STREAM-KEYED: one DEK per `(stream_id, epoch)`, the
+        // manifest naming each chunk's epoch (a v4 manifest; `epoch` is `Some`
+        // on its chunks). Its chunks carry NO community binding — their key is
+        // the stream epoch's, wrapped as a `key_grant:stream:v1` row — so they
+        // are adopted with no community epoch in their provenance, and the
+        // pull waits for those stream keys below as a self/family DAG does. A
+        // room DAG sealed per chunk under the community epoch (written before
+        // v55; no chunk names an epoch) keeps the manifest's provenance and
+        // needs no separate chunk keys.
+        let stream_keyed_room = is_stream_keyed_room(pointer.tier, &view);
 
         // ── chunks ── each by its sha, adopted at its position; held ones skipped.
         let held_chunks: HashMap<u64, [u8; 32]> =
@@ -2817,7 +3270,15 @@ where
         let adopters = if batch_max == 1 { lanes } else { 1 };
         let overhead = AT_REST_ENVELOPE_OVERHEAD as u64;
         let stream = view.stream_id.as_str();
-        let provenance = &provenance;
+        let chunk_provenance = match chunk_provenance_of(&provenance, stream_keyed_room) {
+            Ok(p) => p,
+            Err(e) => {
+                return PullOutcome::StoreFailed(format!(
+                    "a stream-keyed room chunk's provenance (for_stream_keyed_chunk): {e}"
+                ))
+            }
+        };
+        let provenance = &chunk_provenance;
         let engine = &self.engine;
         let mut fetching = FuturesUnordered::new();
         let mut adopting = FuturesUnordered::new();
@@ -2886,8 +3347,7 @@ where
                     let started = Instant::now();
                     let adopted = engine
                         .adopt_sealed_chunks(stream, &items, epoch, provenance.clone())
-                        .await
-                        .map_err(|e| e.to_string());
+                        .await;
                     let elapsed = started.elapsed();
                     drop(items);
                     let wants: Vec<DagWant> = batch.into_iter().map(|(w, _)| w).collect();
@@ -2915,6 +3375,12 @@ where
                                 &reason,
                             ))
                         }
+                        Err(LaneStop::Fetch(DagFetchStop::Gone(reason))) => Some(dag_gone(
+                            row,
+                            &blob_hex,
+                            &format!("chunk seq {}", w.seq),
+                            &reason,
+                        )),
                         Err(LaneStop::Fetch(DagFetchStop::HashMismatch { got })) => {
                             Some(self.dag_refused(
                                 row,
@@ -2962,18 +3428,56 @@ where
                         "DAG pull: one adopt batch returned (CIRISPersist#957)"
                     );
                     // Either the batch was refused whole (nothing written),
-                    // or each item answered in its slot, in order.
-                    let answers: Vec<Result<(), String>> = match adopted {
+                    // or each item answered in its slot, in order. A refusal
+                    // keeps its `blob_pull_refusals` tag ([`store_refusal_tag`])
+                    // beside its message; it is booked ONCE, by the refusal
+                    // that becomes the pull's outcome (the first stop below),
+                    // never per chunk or per batch, so one refused pull is
+                    // one count.
+                    let answers: Vec<Result<(), (String, Option<&'static str>)>> = match adopted {
                         Ok(per_item) => per_item
                             .into_iter()
-                            .map(|r| r.map(|_| ()).map_err(|e| e.to_string()))
+                            .map(|r| {
+                                r.map(|_| ())
+                                    .map_err(|e| (e.to_string(), store_refusal_tag(&e)))
+                            })
                             .collect(),
-                        Err(e) => wants.iter().map(|_| Err(e.clone())).collect(),
+                        // persist v55.0.0 (#977) — the chunk door refused a
+                        // stream-keyed chunk's provenance for naming a
+                        // community epoch, the whole batch with nothing
+                        // written. Edge builds every such provenance with
+                        // `for_stream_keyed_chunk`, so reaching this is an
+                        // edge bug: terminal for the pull, named.
+                        Err(e @ BlobError::StreamKeyedChunkCommunityEpoch { .. }) => {
+                            tracing::error!(
+                                blob = %blob_hex,
+                                stream_id = %stream,
+                                error = %e,
+                                "DAG pull: persist refused a stream-keyed room chunk's \
+                                 provenance for naming a community epoch — an EDGE BUG \
+                                 (CIRISPersist#977)"
+                            );
+                            if stop.is_none() {
+                                stop = Some(self.dag_refused(
+                                    row,
+                                    &blob_hex,
+                                    DagPullRefusal::StreamKeyedChunkCommunityEpoch {
+                                        stage: "adopt",
+                                        detail: e.to_string(),
+                                    },
+                                ));
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            let refused = (e.to_string(), store_refusal_tag(&e));
+                            wants.iter().map(|_| Err(refused.clone())).collect()
+                        }
                     };
                     for (w, answer) in wants.iter().zip(answers) {
                         match answer {
                             Ok(()) => metrics.add_blob_dag_chunks("adopted", 1),
-                            Err(e) => {
+                            Err((e, tag)) => {
                                 tracing::warn!(
                                     blob = %blob_hex,
                                     stream_id = %stream,
@@ -2982,6 +3486,9 @@ where
                                     "DAG pull: persist refused a chunk's adopt"
                                 );
                                 if stop.is_none() {
+                                    if let Some(tag) = tag {
+                                        self.book_store_refusal_tag("adopt chunk", tag, &e);
+                                    }
                                     stop = Some(PullOutcome::StoreFailed(format!(
                                         "adopt chunk seq {}: {e}",
                                         w.seq
@@ -3010,10 +3517,11 @@ where
         // door, ONE call for both manifest versions, answered from the grant
         // rows with no chunk opened: per stream EPOCH for a v4 DAG (one DEK
         // per `(stream, epoch)`, CIRISPersist#969), per chunk for a v2 one
-        // (persist I314c). At `community_dek` the chunks share the manifest's
-        // epoch binding (one provenance per stream, adopted above), so the
-        // manifest opening as this node already answered it.
-        if pointer.tier == CryptoTier::InvisibleEncrypted {
+        // (persist I314c). A per-chunk-bound room DAG (`community_dek`, pre-v55)
+        // shares the manifest's epoch binding, so the manifest opening as this
+        // node already answered it; a STREAM-KEYED room DAG (persist v55.0.0,
+        // #977) does not, and asks the door like a self/family one.
+        if needs_chunk_key_readiness(pointer.tier, stream_keyed_room) {
             let readiness = match self
                 .engine
                 .sealed_dag_readiness(&sha, &self.local_key_id, Some(&aad))
@@ -3083,12 +3591,72 @@ where
         }
 
         // ── promoted ── persist checks every chunk row against the manifest.
-        let promoting = Instant::now();
-        let promoted = self
-            .engine
-            .promote_adopted_manifest_to_dag(&sha, &self.local_key_id, Some(&aad))
-            .await;
-        metrics.add_blob_dag_phase("dag_promote", promoting.elapsed());
+        // persist v55.0.0 (#951) — the gate's disposition is carried HERE: under
+        // `Announce` the promotion emits this node's holding claim for the
+        // root once its checks pass; `LocalOnly` emits nothing.
+        let mut remediated = false;
+        let promoted = loop {
+            let promoting = Instant::now();
+            let promoted = self
+                .engine
+                .promote_adopted_manifest_to_dag(&sha, &self.local_key_id, Some(&aad), adopt)
+                .await;
+            metrics.add_blob_dag_phase("dag_promote", promoting.elapsed());
+            // persist v55.0.0 (#977) — the promote refuses a stream-keyed
+            // chunk that a COMMUNITY epoch binds: one adopted before the
+            // stream's key rows landed, which the chunk door could not tell
+            // from a legacy chunk. persist's remedy, ONCE per pull attempt:
+            // evict every bound chunk, re-fetch and re-adopt it under
+            // `for_stream_keyed_chunk`, promote again. A second refusal is
+            // terminal and an edge bug, never a loop.
+            match promoted {
+                Err(ref e @ BlobError::StreamKeyedChunkCommunityEpoch { .. })
+                    if stream_keyed_room && !remediated =>
+                {
+                    remediated = true;
+                    tracing::warn!(
+                        blob = %blob_hex,
+                        stream_id = %view.stream_id,
+                        error = %e,
+                        "DAG pull: a stream-keyed room chunk is bound to a community epoch — \
+                         evicting and re-adopting every bound chunk, once (CIRISPersist#977)"
+                    );
+                    if let Err(outcome) = self
+                        .remediate_community_bound_chunks(
+                            row,
+                            sha,
+                            attempts,
+                            &blob_hex,
+                            &view,
+                            &chunk_provenance,
+                            fetch,
+                        )
+                        .await
+                    {
+                        return outcome;
+                    }
+                }
+                Err(ref e @ BlobError::StreamKeyedChunkCommunityEpoch { .. }) => {
+                    tracing::error!(
+                        blob = %blob_hex,
+                        stream_id = %view.stream_id,
+                        remediated,
+                        error = %e,
+                        "DAG pull: the promote still finds a stream-keyed room chunk under a \
+                         community epoch — an EDGE BUG (CIRISPersist#977)"
+                    );
+                    return self.dag_refused(
+                        row,
+                        &blob_hex,
+                        DagPullRefusal::StreamKeyedChunkCommunityEpoch {
+                            stage: "promote",
+                            detail: e.to_string(),
+                        },
+                    );
+                }
+                other => break other,
+            }
+        };
         match promoted {
             Ok(promotion) => {
                 tracing::info!(
@@ -3098,11 +3666,13 @@ where
                     chunk_count = promotion.chunk_count,
                     total_size = promotion.total_size,
                     promoted = promotion.promoted,
-                    announced,
+                    announced = promotion.announced,
                     "DAG pulled: the manifest row is a chunk_dag and reads as the file \
                      (CIRISEdge#717)"
                 );
-                PullOutcome::Stored { announced }
+                PullOutcome::Stored {
+                    announced: promotion.announced,
+                }
             }
             Err(BlobError::InvalidArgument(detail)) => {
                 self.dag_refused(row, &blob_hex, DagPullRefusal::ChunkMissing { detail })
@@ -3126,7 +3696,7 @@ where
     /// puller reads it itself, bounds the work, fetches every chunk, and
     /// stores the whole DAG in one shot through persist's
     /// `put_blob_chunks_signing` — every chunk verified against the manifest
-    /// again inside the door, and the manifest's `holds_bytes` announced as
+    /// again inside the door, and the manifest's holding claim announced as
     /// `store_plaintext` announces a whole blob. Held in memory until the
     /// door takes it, bounded by the plan's `in_memory_cap_bytes` (persist's
     /// whole-read constant, reused as this walk's buffer bound — CIRISEdge#737).
@@ -3159,6 +3729,9 @@ where
             Ok(b) => b,
             Err(DagFetchStop::Transport(reason)) => {
                 return self.dag_fetch_failed(row, sha, attempts, "manifest", &reason)
+            }
+            Err(DagFetchStop::Gone(reason)) => {
+                return dag_gone(row, &blob_hex, "manifest", &reason)
             }
             Err(DagFetchStop::HashMismatch { got }) => {
                 return self.dag_refused(
@@ -3218,6 +3791,9 @@ where
                         &reason,
                     )
                 }
+                Err(DagFetchStop::Gone(reason)) => {
+                    return dag_gone(row, &blob_hex, &format!("chunk seq {seq}"), &reason)
+                }
                 Err(DagFetchStop::HashMismatch { got }) => {
                     return self.dag_refused(
                         row,
@@ -3265,13 +3841,16 @@ where
                 );
                 PullOutcome::Stored { announced: true }
             }
-            Err(e) => PullOutcome::StoreFailed(format!("put_blob_chunks_signing: {e}")),
+            Err(e) => {
+                self.book_store_refusal("put_blob_chunks_signing", &e);
+                PullOutcome::StoreFailed(format!("put_blob_chunks_signing: {e}"))
+            }
         }
     }
 
     /// Commons bytes (a manifest, a public attachment): persist's plaintext
     /// door, `put_blob_signing` — stores AND emits this node's hybrid-signed
-    /// `holds_bytes`.
+    /// holding claim (`custody:ack:v1` `here` at `federation`).
     ///
     /// There is no `LocalOnly` plaintext door a consumer can reach:
     /// `store_blob_local` takes a `StorageFloor` that only persist can mint
@@ -3311,7 +3890,10 @@ where
             .await
         {
             Ok(()) => PullOutcome::Stored { announced: true },
-            Err(e) => PullOutcome::StoreFailed(e.to_string()),
+            Err(e) => {
+                self.book_store_refusal("put_blob_signing", &e);
+                PullOutcome::StoreFailed(e.to_string())
+            }
         }
     }
 
@@ -3388,7 +3970,10 @@ where
                     announced: outcome.announced,
                 }
             }
-            Err(e) => PullOutcome::StoreFailed(e.to_string()),
+            Err(e) => {
+                self.book_store_refusal("adopt_sealed_blob", &e);
+                PullOutcome::StoreFailed(e.to_string())
+            }
         }
     }
 }
@@ -3397,6 +3982,207 @@ where
 mod tests {
     use super::super::meaning::fixture::{bare_row, content_row};
     use super::*;
+
+    /// persist v55.0.0 (#977) — a room DAG whose manifest names each chunk's
+    /// epoch is STREAM-KEYED: its chunks are adopted with no community epoch
+    /// and the pull waits for their stream keys before promoting. A room DAG
+    /// whose chunks name no epoch (sealed per chunk under the community epoch
+    /// before v55) keeps the manifest's provenance and asks for no chunk keys.
+    /// A self/family DAG asks the readiness door either way.
+    #[test]
+    fn a_stream_keyed_room_dag_waits_for_stream_keys_and_a_legacy_one_does_not() {
+        use ciris_persist::federation::chunk_dag_cascade::orchestrate::{
+            SealedManifestChunk, SealedManifestView,
+        };
+        let view = |epochs: &[Option<u64>]| SealedManifestView {
+            sha256_hex: "ab".repeat(32),
+            storage_kind: "inline".into(),
+            tier: "community_dek".into(),
+            stream_id: "room-stream".into(),
+            total_size: 2,
+            version: 4,
+            chunks: epochs
+                .iter()
+                .enumerate()
+                .map(|(i, e)| SealedManifestChunk {
+                    sha256_hex: "cd".repeat(32),
+                    size: 1,
+                    seq: i as u64,
+                    epoch: *e,
+                })
+                .collect(),
+            children: Vec::new(),
+            inline_bytes_cap: 1 << 20,
+            whole_read_cap_bytes: 1 << 30,
+            max_chunks: 1 << 20,
+        };
+        let manifest = BlobProvenance {
+            author_key_id: "alice".into(),
+            cohort_scope: "community".into(),
+            community_key_id: Some("room-1".into()),
+            epoch: Some(3),
+            tier: CryptoTier::CommunityDek,
+            minter_key_id: Some("minter".into()),
+        };
+
+        // Stream-keyed room DAG (a v55 writer).
+        let keyed = is_stream_keyed_room(CryptoTier::CommunityDek, &view(&[Some(0), Some(0)]));
+        assert!(keyed, "chunks naming their epoch: stream-keyed");
+        assert!(
+            needs_chunk_key_readiness(CryptoTier::CommunityDek, keyed),
+            "a stream-keyed room DAG waits for its key_grant:stream:v1 keys"
+        );
+        let chunks = chunk_provenance_of(&manifest, keyed).expect("a room provenance");
+        assert_eq!(
+            chunks,
+            manifest
+                .for_stream_keyed_chunk()
+                .expect("persist's constructor"),
+            "persist's for_stream_keyed_chunk, never the row's provenance as is"
+        );
+        assert_eq!(chunks.epoch, None, "its chunks carry no community epoch");
+        assert_eq!(chunks.minter_key_id, None, "and no minter");
+        assert_eq!(
+            chunks.community_key_id.as_deref(),
+            Some("room-1"),
+            "but their room"
+        );
+        assert_eq!(chunks.tier, CryptoTier::CommunityDek);
+        // persist's tier guard: a stream-keyed chunk's provenance is a room's.
+        let not_a_room = BlobProvenance {
+            tier: CryptoTier::InvisibleEncrypted,
+            cohort_scope: "self".into(),
+            community_key_id: None,
+            ..manifest.clone()
+        };
+        assert!(chunk_provenance_of(&not_a_room, true).is_err());
+
+        // Legacy per-chunk-bound room DAG (sealed before v55).
+        let legacy = is_stream_keyed_room(CryptoTier::CommunityDek, &view(&[None, None]));
+        assert!(!legacy, "chunks naming no epoch: per-chunk-bound");
+        assert!(
+            !needs_chunk_key_readiness(CryptoTier::CommunityDek, legacy),
+            "a per-chunk-bound room DAG shares the manifest's epoch: no chunk keys to wait for"
+        );
+        assert_eq!(
+            chunk_provenance_of(&manifest, legacy).expect("unchanged"),
+            manifest,
+            "its chunks keep the manifest's provenance, community epoch included"
+        );
+
+        // Self/family DAGs ask the door whatever their manifest says.
+        assert!(!is_stream_keyed_room(
+            CryptoTier::InvisibleEncrypted,
+            &view(&[Some(0)])
+        ));
+        assert!(needs_chunk_key_readiness(
+            CryptoTier::InvisibleEncrypted,
+            false
+        ));
+    }
+
+    /// persist v55.0.0 (#1065) — **a store door's disk-pressure refusal is
+    /// named, never a silent `StoreFailed`.** persist's
+    /// `DiskPressureProxyRefused` maps to the `disk_pressure` tag and is booked
+    /// in `blob_pull_refusals` by the puller's store-refusal hook; any other
+    /// store refusal books nothing. Fails with the booking removed. (The real
+    /// refusal, driven through a pull under `Stop` pressure, is
+    /// `blob_federation_e2e::a_pull_under_disk_pressure_books_its_store_refusal_by_name`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disk_pressure_store_refusal_is_booked_by_name() {
+        use crate::blob_swarm::chunk_grants_779_tests::{edge_of, puller_of, two_devices};
+        use ciris_persist::federation::BlobError;
+        let pressure = BlobError::DiskPressureProxyRefused {
+            operation: "accept",
+            tier: "stop",
+        };
+        let other = BlobError::NotHeld {
+            sha256_hex: "00".repeat(32),
+        };
+        assert_eq!(
+            store_refusal_tag(&pressure),
+            Some(PULL_REFUSAL_DISK_PRESSURE)
+        );
+        assert_eq!(store_refusal_tag(&other), None);
+        let (_alice, _node_a, node_b) = two_devices().await;
+        let edge = edge_of(&node_b);
+        let puller = puller_of(&node_b, &edge);
+        puller.book_store_refusal("adopt chunk", &other);
+        puller.book_store_refusal("adopt chunk", &pressure);
+        let refusals = edge.metrics().snapshot().blob_pull_refusals;
+        assert_eq!(
+            refusals.get(PULL_REFUSAL_DISK_PRESSURE).copied(),
+            Some(1),
+            "booked by name: {refusals:?}"
+        );
+        assert_eq!(refusals.len(), 1, "nothing else booked: {refusals:?}");
+    }
+
+    /// persist v55.0.0 (#989) — **a parked DAG wakes only on a projected,
+    /// non-pending key-grant row addressed to THIS node's key.** A sha parked
+    /// on its content key is not woken by a pending admission (the bytes have
+    /// not arrived, so the wrap is not projected yet), by an unprojected one,
+    /// or by a projected one for another node's key; it is woken by the
+    /// projected, non-pending row to this node. Fails with either half of the
+    /// projection guard dropped, or with the recipient check dropped (each a
+    /// spurious re-pull).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_dag_wakes_only_on_a_projected_grant_to_this_node() {
+        use crate::blob_swarm::chunk_grants_779_tests::{edge_of, puller_of, two_devices};
+        use ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome;
+        use ciris_persist::federation::key_grant::{KeyGrantAdmission, KeyGrantAxis};
+        let (alice, _node_a, node_b) = two_devices().await;
+        let edge = edge_of(&node_b);
+        let puller = puller_of(&node_b, &edge);
+        let sha = [0x5a; 32];
+        let row = bare_row(ciris_persist::federation::types::cohort_scope::SELF);
+        let admission = |recipient: &str, projected: bool, pending: bool| KeyGrantAdmission {
+            axis: KeyGrantAxis::Content {
+                at_rest_sha256: hex::encode(sha),
+                cohort_scope: "self".into(),
+                owner_key_id: alice.key_id.clone(),
+            },
+            recipient_key_id: recipient.to_owned(),
+            attestation: ReplicatedAttestationOutcome::Inserted,
+            projected,
+            pending,
+        };
+        puller
+            .key_waits
+            .park(sha, &row, key_wake::Awaiting::Content(vec![sha]));
+        // The sink the bridge holds, built here rather than by `start` so no
+        // run loop's tick takes the woken DAG first.
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = PullSink {
+            tx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            key_waits: Arc::clone(&puller.key_waits),
+            local_key_id: puller.local_key_id.clone(),
+        };
+        let me = node_b.me.clone();
+        for (what, a) in [
+            ("a pending row", admission(&me, false, true)),
+            (
+                "a pending row reported projected",
+                admission(&me, true, true),
+            ),
+            ("an unprojected row", admission(&me, false, false)),
+            (
+                "another node's row",
+                admission("alice-fed-sibling", true, false),
+            ),
+        ] {
+            sink.key_grant_admitted(&a);
+            assert!(puller.woken_dags().is_empty(), "{what} wakes nothing");
+        }
+        sink.key_grant_admitted(&admission(&me, true, false));
+        let woken: Vec<[u8; 32]> = puller.woken_dags().into_iter().map(|(s, _)| s).collect();
+        assert_eq!(
+            woken,
+            vec![sha],
+            "the projected row to this node wakes the DAG"
+        );
+    }
 
     /// CIRISEdge#739 — the pipeline's admission rule (§6.7.5): `K` bounds
     /// the requests, the byte budget bounds the memory, and an empty
@@ -3870,6 +4656,7 @@ mod tests {
                 tx,
                 dropped: Arc::new(AtomicU64::new(0)),
                 key_waits: Arc::new(KeyWaits::new(4)),
+                local_key_id: "local".to_owned(),
             },
             rx,
         )
@@ -3913,7 +4700,8 @@ mod tests {
     }
 
     /// A row that references nothing costs the apply path no clone and no
-    /// channel slot — and a `holds_bytes` row counts as referencing nothing.
+    /// channel slot — and a legacy `holds_bytes` row (retired in v55)
+    /// counts as referencing nothing.
     #[tokio::test]
     async fn non_references_never_enter_the_queue() {
         let (sink, mut rx) = sink_with(4);
@@ -3926,7 +4714,7 @@ mod tests {
         assert_eq!(
             sink.offer(&holds),
             PullOffer::NotAReference,
-            "possession is not meaning: a holds_bytes row never triggers a pull"
+            "possession is not meaning: a legacy holds_bytes row never triggers a pull"
         );
         assert!(rx.try_recv().is_err(), "nothing was queued");
         assert_eq!(sink.dropped(), 0);

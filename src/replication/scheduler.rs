@@ -323,6 +323,9 @@ pub struct ReplicationScheduler {
     /// (every pre-#440 construction) leaves the interval object untouched —
     /// byte-identical behavior.
     mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
+    /// CIRISEdge P0 telemetry — the Edge's metrics bag, for the per-kind
+    /// round-duration histogram. `None` (the default) records nothing.
+    metrics: Option<crate::observability::EdgeMetrics>,
 }
 
 /// Runtime control command for an actively-running scheduler.
@@ -566,7 +569,18 @@ impl ReplicationScheduler {
             round_gate: Arc::new(RoundGate::new(config.max_concurrent_rounds)),
             backoff: Arc::new(NoRouteBackoff::new()),
             mesh_config: None,
+            metrics: None,
         }
+    }
+
+    /// CIRISEdge P0 telemetry — install the Edge's metrics bag (builder), so
+    /// every round this scheduler drives records its wall time into
+    /// [`EdgeMetrics::replication_round_duration_seconds`](crate::observability::EdgeMetrics::replication_round_duration_seconds).
+    /// `None` records nothing.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Option<crate::observability::EdgeMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// CIRISEdge#740 — the round bound and its counters.
@@ -702,6 +716,7 @@ impl ReplicationScheduler {
         let mut wakes = backoff.take_wakes();
 
         let mesh_config = self.mesh_config.take();
+        let metrics = self.metrics.take();
         for coord in self.coordinators.drain(..) {
             spawn_coord(
                 &mut per_coord,
@@ -713,6 +728,7 @@ impl ReplicationScheduler {
                 mesh_config.clone(),
                 Arc::clone(&round_gate),
                 Arc::clone(&backoff),
+                metrics.clone(),
             );
         }
 
@@ -755,6 +771,7 @@ impl ReplicationScheduler {
                                 mesh_config.clone(),
                                 Arc::clone(&round_gate),
                                 Arc::clone(&backoff),
+                                metrics.clone(),
                             );
                         }
                         SchedulerCommand::RemoveInitiator { peer_key_id, kind } => {
@@ -811,6 +828,7 @@ fn spawn_coord(
     mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
     round_gate: Arc<RoundGate>,
     backoff: Arc<NoRouteBackoff>,
+    metrics: Option<crate::observability::EdgeMetrics>,
 ) {
     debug_assert_eq!(
         coord.role(),
@@ -838,6 +856,7 @@ fn spawn_coord(
             mesh_config,
             round_gate,
             backoff,
+            metrics,
         )
         .await;
     });
@@ -855,6 +874,7 @@ async fn run_one_coordinator_forever(
     mesh_config: Option<Arc<crate::replication::mesh_config::MeshConfigReader>>,
     round_gate: Arc<RoundGate>,
     backoff: Arc<NoRouteBackoff>,
+    metrics: Option<crate::observability::EdgeMetrics>,
 ) {
     let mut interval = tokio::time::interval(cadence);
     // `Burst` is the default; with `MissedTickBehavior::Skip` a
@@ -878,6 +898,7 @@ async fn run_one_coordinator_forever(
         kind_str: &kind_str,
         round_gate: &round_gate,
         backoff: &backoff,
+        metrics: metrics.as_ref(),
     };
 
     loop {
@@ -954,6 +975,8 @@ struct GatedRound<'a> {
     kind_str: &'a str,
     round_gate: &'a RoundGate,
     backoff: &'a NoRouteBackoff,
+    /// CIRISEdge P0 telemetry — where the round's wall time is recorded.
+    metrics: Option<&'a crate::observability::EdgeMetrics>,
 }
 
 impl GatedRound<'_> {
@@ -971,6 +994,10 @@ impl GatedRound<'_> {
         if ticket.overtaken() {
             return false;
         }
+        // CIRISEdge P0 telemetry — the round's wall time, from holding the
+        // permit to its outcome, whatever that outcome is: a round that
+        // timed out after its full budget is exactly the one to see.
+        let started = std::time::Instant::now();
         let class = round_and_report(
             self.coord,
             self.round_timeout,
@@ -978,6 +1005,9 @@ impl GatedRound<'_> {
             self.peer_id,
         )
         .await;
+        if let Some(m) = self.metrics {
+            m.observe_round_duration(self.coord.kind(), started.elapsed());
+        }
         ticket.finish(class);
         true
     }
@@ -1498,6 +1528,7 @@ mod tests {
     /// admitted=2 + StalenessSignal::InSync — the long-lived session
     /// + scheduler + inbound channel are all wired correctly.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // the full Alice↔Bob round fixture + its P0 duration check
     async fn scheduler_drives_initiator_round_to_completion() {
         // Build Alice-and-Bob channels (transport mailboxes).
         let (alice_to_bob_tx, mut alice_to_bob_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1587,8 +1618,12 @@ mod tests {
             }
         });
 
-        // Wire the scheduler with Alice as the Initiator.
-        let mut sched = ReplicationScheduler::new(fast_config());
+        // Wire the scheduler with Alice as the Initiator. CIRISEdge P0
+        // telemetry — with the Edge's metrics bag, so the round's wall time
+        // is recorded where the round runs.
+        let metrics = crate::observability::EdgeMetrics::new();
+        let mut sched =
+            ReplicationScheduler::new(fast_config()).with_metrics(Some(metrics.clone()));
         sched.add_initiator(alice_coord.clone());
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -1613,6 +1648,30 @@ mod tests {
             }
             o => panic!("expected Completed, got {o:?}"),
         }
+
+        // CIRISEdge P0 telemetry — the completed round is in the Key plane's
+        // duration histogram. The event is sent from inside the round, the
+        // observation right after it returns, so wait for it briefly.
+        let recorded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(h) = metrics
+                    .snapshot()
+                    .replication_round_duration_seconds
+                    .get(&EnvelopeKind::Key)
+                {
+                    break h.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the round's duration is recorded under its kind");
+        assert!(recorded.count >= 1);
+        assert_eq!(
+            recorded.cumulative.last().copied(),
+            Some(recorded.count),
+            "+Inf is the count"
+        );
 
         // Shut the scheduler down.
         cancel_tx.send(true).unwrap();

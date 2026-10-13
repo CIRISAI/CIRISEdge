@@ -89,6 +89,41 @@ pub enum GroupContentError {
         /// The `withdraws` (or `recants`) that retired it.
         withdraws_id: String,
     },
+    /// persist v54.1.0 (Codex round 3 on CIRISPersist#1057) — a steward purge
+    /// tombstoned the bytes (or every manifest a sealed-DAG chunk belongs
+    /// to): withheld at every byte door from execution onward. Not
+    /// [`Self::NotHeld`] and not a substrate fault; a reader gets what a
+    /// [`Self::Withdrawn`] gets.
+    #[error("purged: {sha256_hex} — steward purge {notice_id} tombstoned it")]
+    Purged {
+        /// Hex at-rest sha the read targeted.
+        sha256_hex: String,
+        /// The purge notice whose tombstone withholds it.
+        notice_id: String,
+    },
+    /// persist v55.0.0 (CIRISPersist#977) — a stream-keyed room chunk was
+    /// offered (or is held) under a COMMUNITY epoch. Its provenance must be
+    /// built with `BlobProvenance::for_stream_keyed_chunk`, so at an adopt
+    /// this is an edge fault; at a promote it names a chunk adopted before the
+    /// stream's key rows landed, which the pull evicts and re-adopts. Not
+    /// retryable as offered.
+    #[error(
+        "stream-keyed chunk under a community epoch for {sha256_hex}: stream {stream_id} \
+         epoch {epoch}, community epoch {community_epoch}{}",
+        chunk_sha256_hex.as_deref().map(|c| format!(" (chunk {c})")).unwrap_or_default()
+    )]
+    StreamKeyedChunkCommunityEpoch {
+        /// Hex at-rest sha the call targeted.
+        sha256_hex: String,
+        /// The stream.
+        stream_id: String,
+        /// The chunk's STREAM epoch.
+        epoch: u64,
+        /// The community epoch the provenance named, or the binding holds.
+        community_epoch: u64,
+        /// The bound chunk, at a promote; `None` at an adopt.
+        chunk_sha256_hex: Option<String>,
+    },
     /// The bytes were swept by a retention sweep. persist distinguishes
     /// this from [`Self::NotHeld`] so an operator can tell "swept" from
     /// "wrong handle"; the remedy differs (there is none for swept).

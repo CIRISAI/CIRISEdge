@@ -1,5 +1,160 @@
 # CIRISEdge Release Notes
 
+# v41.0.0 — persist v55.0.0 + CIRISVerify v20.1.0: one holding claim, key grants as rows, typed refusals that park or end, and the P0 telemetry on main
+
+**2026-10-13.** **MAJOR** from v40.1.0. Edge adopts persist v55.0.0 (CIRISConstitution v1.0-rc7,
+through v54.0.0 and v54.1.0) and CIRISVerify v20.1.0. A v55 node and a v54 node exchange neither
+holding claims nor key wraps (below): **upgrade the fleet together.** Public API changes:
+`durability::file_custody` returns a typed error, `BlobPuller::key_grant_admitted` takes persist's
+`KeyGrantAdmission`, `ApplyOutcome::Refused` gains `awaits_signer`, three public enums gain a variant
+(#813), and the UniFFI `metrics_snapshot()` keys move to the bundle's field names (#848).
+`EdgeMetricsBundle.durable_queue_depth` (and `EdgeMetrics::durable_queue_depth`) is **gone**
+(#845): it counted enqueues, never the resident depth. Read the resident depth from
+`Edge::durable_queue_depth().await` (UniFFI `queue_depth()`); the cumulative per-class count is
+`durable_enqueued_total`.
+Ladder triple: **edge v41.0.0 · persist v55.0.0 · verify v20.1.0** (leviculum v0.30.0+ciris.1).
+
+## persist v55.0.0 — one holding claim, key grants as rows
+
+- **The fleet moves together.** A v55 node and a v54 node exchange neither holding claims nor key
+  wraps: v55 retired the `holds_bytes` claim (the holding claim is `custody:ack:v1`, at the
+  content's own scope) and the key-grant SET (one `scores` row per recipient on
+  `key_grant:{axis}:v1`). A v55 node does not read a v54 `holds_bytes` claim, and refuses a v54 set
+  (`set_retired` / `attestation_type_unregistered`); a v54 node admits neither v55 row. During a
+  mixed fleet, discovery of bytes held only by v54 peers, and every key a v54 peer wraps, waits until
+  those peers upgrade.
+- **The holding claim is re-acked.** A v55 claim lapses 72 h after it was signed unless renewed.
+  `PersistGroupContentStore::spawn_holding_claim_reack` starts persist's re-ack sweeper over the
+  store's engine (a host's Rust `Engine` view starts nothing on its own; persist's Python engine
+  starts its own); `edge_node` starts it and stops it on exit.
+- **`EdgeConfig::holds_bytes_ttl_seconds` and `DEFAULT_HOLDS_BYTES_TTL_SECONDS` are INERT**
+  (deprecated; removed at the next MAJOR). persist's custody fold owns the claim's liveness.
+- **`BlobPuller::key_grant_admitted` takes persist v55's `KeyGrantAdmission`** (`{axis,
+  recipient_key_id, attestation, projected, pending}`; it was `wraps_offered` / `wraps_written`). A
+  parked pull wakes on a wrap projected to this node.
+- **`blob_swarm::meaning::is_holds_bytes_type` matches the whole retired `holds_bytes:` stem**
+  (persist's `RETIRED_HOLDING_CLAIM_STEM`), not only the rc6 `holds_bytes:sha256:` + 8-hex
+  spelling: every spelling is possession and never meaning, as persist refuses every spelling.
+- **Key grants are routed by dimension.** A key-grant row (`scores` on `key_grant:{axis}:v1`) goes to
+  persist's key-grant door (its projection wakes a parked pull); a retired v54 SET goes there too,
+  for the typed `set_retired`. Key-grant rows travel only by persist's `may_receive` refers-to
+  delivery to the recipient's own node; a subject's Pull still carves them (G2).
+- **Room file DAGs sealed by a v55 writer are stream-keyed.** The pull adopts their chunks under
+  persist's `BlobProvenance::for_stream_keyed_chunk()` (no community epoch, no minter) and waits for
+  their `key_grant:stream:v1` keys before promoting, as for a self/family DAG; a room DAG sealed per
+  chunk before v55 pulls as before. A chunk that landed bound to the community epoch before the
+  stream's key rows (persist's promote refuses it, `blob_stream_keyed_chunk_community_epoch`) is
+  evicted, re-fetched and re-adopted once per pull attempt, then promoted again; a refusal at the
+  chunk adopt, or a second one at the promote, is terminal (`DagPullRefusal::StreamKeyedChunkCommunityEpoch`,
+  tag `dag_stream_keyed_chunk_community_epoch`) and an edge bug. `GroupContentError` gains the typed
+  `StreamKeyedChunkCommunityEpoch`. A sealed DAG's manifest is adopted `LocalOnly` and announced at
+  promotion.
+- **Refusal dispositions (replication).** Terminal: `federation_malformed_row`,
+  `federation_attestation_type_unregistered`, `federation_payment_processor_identifier`,
+  `federation_dimension_rejected` for `registered_family_held_shut` / `ledger_l1_binding_violation`,
+  `KeyGrantRefused` for `malformed` / `set_retired` / `wrap_algorithm_not_v2` / `signer_not_self` /
+  `signer_not_minter` / `signer_not_author` / `signer_not_stream_owner` (edge's table until
+  CIRISPersist#1064's predicate),
+  and every steward-purge token except a retryable `purge_unauthorised` reason (persist's
+  `unauthorised_reason::is_retryable`) and `takedown_content_unbound`, which stay transient.
+- **New metric family `durability_custody`** (`EdgeMetricsBundle`, the UniFFI counters and the
+  PyO3 `metrics_snapshot()` dict): what each durability pass found, per file in this node's audience
+  — `filed_here`, `already_here` (since v55 the write doors file the claim as they store),
+  `filed_none`, `report_refused`, `repair`, `withheld` (bytes a takedown or purge withholds:
+  no `here` filed, no repair). `DurabilitySweep` gains `already_here` and `withheld`.
+  **Merge note for #820 (local/820-p1c):** the catalogue completeness gate needs a spec for this
+  family — a counter with a closed `outcome` label drawn from an enum of the six tags above.
+- **`blob_swarm::durability::file_custody` returns `CustodyFileError`** (was `String`): persist's
+  custody refusal stays typed, and `CustodyFileError::withheld_notice()` names the takedown when
+  persist refused a `here` about withheld bytes (`PurgeRefused` with
+  `steward_purge::token::BLOB_PURGED`). The durability pass reads a withheld blob off persist's
+  deficit (`DurabilityDeficit.withheld`) and books it `withheld`: nothing filed, nothing repaired.
+- **`blob_pull_refusals` gains `disk_pressure`**: a store door that refused the bytes under disk
+  pressure (persist's `DiskPressureProxyRefused`; v55 runs `would_hold` on the chunk doors too) is
+  booked by name, once per refused pull, instead of an unnamed `StoreFailed`. Still not retried.
+
+## persist v55.0.0 — what edge checked and needed no code
+
+- **`ledger:*` rows** (#753) now refuse `federation_signer_not_acting_for` (retryable, plane
+  `"ledger"`) and `federation_dimension_rejected` / `ledger_l1_binding_violation`. Both reach the
+  attestation door's one refusal mapping: the first parks on the held signer like every acts-for
+  refusal (#858 index), the second is terminal. Witness:
+  `bridge::tests::v55_ledger_refusals_follow_persists_dispositions`.
+- **Matcher answers that moved** (`key_grant:{axis}:v1`, `membership:{widening|removal|resignation}:v1`,
+  the ledger and settlement leaves, `holds_bytes:sha256:*` no longer a family): edge asks persist's
+  `namespace::matcher::match_family` and `registry::authority_for` directly and keeps no table of
+  its own, so the answers move with the pin. The rc6 carrier exception
+  (`RC6_RETIRED_CARRIERS_ADMITTED_UNTIL_989`) is deleted in the integrated v55: no rc6 carrier
+  spelling is admitted, and edge reads that refusal (`attestation_type_unregistered`) as terminal.
+- **Slice C doors.** The sealed-DAG pull adopts its manifest `local_only` and promotes with
+  `announce`; a byte write of purged content is `blob_purged`, read as withdrawn at every door
+  (v54.1, below).
+- **CIRISVerify v20.1** moved the accord invoke signing domain to `ciris.accord_invoke.v2`
+  (LIFECYCLE stays v1). Edge neither canonicalizes nor verifies accord invoke rows: they go to
+  persist's door as bytes; edge's only `accord:invoke` row is a test seed.
+
+## persist v54.0.0 / v54.1.0 — typed refusals that park or end (#862, #858 fix 7)
+
+- **Pins.** `ciris-persist` v53.1.4 → v55.0.0 (through v54.0.0, v54.1.0); `ciris-verify-core`,
+  `ciris-keyring`, `ciris-crypto` v19.0.0 → v20.1.0. pyproject `ciris-persist>=55,<56`.
+- **`ScrubsRehydrated`** (persist v54) maps to `Admitted` on the bridge and at the first-contact
+  Key door, which now reuses the bridge's one exhaustive mapping (it read `ScrubsRehydrated` and
+  `Superseded` as `KeyRefused`).
+- **Typed signer refusals.** `AttesterKeyUnknown` parks on the named signer and its Key's admit
+  releases it; `SignerDoesNotActFor` is indexed on the held signer and released by the binding or
+  occurrence that makes it act, on the terminal schedule from its second refusal;
+  `SignatureInvalid` and `FederationTierUnverified` are terminal. `ApplyOutcome::Refused` gains
+  `awaits_signer: Option<AwaitedSigner>` (`Key` | `ActsFor`). `InvalidReplaced` is admitted and
+  releases rows parked on that key.
+- **Terminal by persist's ruling:** the licensure reasons no later row repairs
+  (`named_edge_not_license_delegation`, `named_edge_not_onto_emitter`, `authority_acts_by_quorum`,
+  `not_authority_at_receipt`), `accord_proposal_nonce_reused`, `federation_trace_dimension_invalid`,
+  and the steward purge tokens (`purge_tombstoned`, `trace_run_kind_mock`, …) but the exceptions
+  named above.
+- **A purged blob is refused as a withdrawn one, at every door.** persist's `BlobError::Purged`
+  reaches the wire as `MissReason::Withdrawn`, the DAG membership as `Withdrawn`, and the readers as
+  `GroupContentError::Purged` → `UnopenedReason::Withdrawn`. It was `PolicyDenied` at the serve door,
+  which demoted the peer and walked to the next holder.
+- **A withdrawn, purged or revoked DAG chunk ends the pull terminally.** The DAG fetcher's gone
+  miss is `DagFetchError::Gone` (new `DagByteFetch::fetch_typed`, defaulted), and every
+  `DagFetchStop::Gone` site ends `PullOutcome::Refused` with no retry booked. Before, it ended
+  `FetchFailed` and climbed the retry ladder though every holder is bound by the same verdict.
+
+## Since v40.1.0 on main
+
+- **The v40.0.x P0 telemetry, forward-ported (#848).** One field list,
+  `EDGE_METRICS_BUNDLE_FIELDS`, destructures `EdgeMetricsBundle` exhaustively; the UniFFI
+  `metrics_snapshot()` is now `EdgeMetricsBundle::flatten()` (key `f`, detail `f.<label>`), and its
+  hand-written projections (`insert_park_ledger`, the A/V ledger, `durable.enqueued_total.*`,
+  `transport.packets_dropped_total`, `transport.known_destination_evictions`,
+  `blob.serve_legacy_dag_walks_total`) report under their bundle field names. The PyO3 dict projects
+  the same bundle (it omitted 22 fields). New: `replication_round_duration_seconds` (by kind),
+  `sweep_permit_wait_seconds`, the #853 responder telemetry, `recovered_links_total`,
+  `unclaimed_ship_refused_total`, PyO3 `link_count()` / `link_list()`.
+- **A fresh node parks what it cannot verify, once (#858, #860).** A separate park ring
+  (`DEFAULT_MAX_PARKED = 65_536`), one log line per signer per window, held-signer occurrence
+  refusals park, transient refusals escalate after three capped windows, and the host release hook
+  `release_signer` / `release_bound_signer` (bridge and `ReplicationRuntime`). The #776 binding
+  release fires on admitted rows only, not on duplicates. Park-ledger metrics in every binding.
+- **The A/V spine on the live node (#805 item 4, #813, #720).** `LinkPlane::Av`, a bounded per-link
+  queue with a gap report, `ReticulumTransport::open_av_link` / `take_av_arrivals`, the `av_plane`
+  ledger. `LinkPlane`, `LegOutcome` (`Oversized`) and `AvDispatcherError` (`ChunkTooLarge`) gain a
+  variant. Open follow-ups: #863.
+- **The #854 review round two (#859)**, the responder closes idle inbound links (#853/#854), the dial
+  pools shrink (#819/#821), bounded v40 sweeps (#817/#818), the serve gate on persist's
+  chunk→manifest link (#771/#812), resident `durable_queue_depth` (#845).
+- **Python hosts can see edge's logs** — `ciris_edge.init_logging()` (#814/#815).
+- **leviculum v0.30.0+ciris.1** (#825), source-compatible for edge.
+- **MLS: libcrux panics isolated and short KeyPackage keys refused (#823); libcrux-kem ≥ 0.0.10**
+  through the CIRISAI openmls fork (#822/#857), which clears RUSTSEC-2026-0330/0331. Wire unchanged.
+
+**Follow-ups (not in this cut).**
+- persist v55's I52 allows an in-cohort `Announce` for a self/family adopt; edge still keeps those
+  adopts `LocalOnly` and files the holding claim itself after the pull (`BlobPuller::report_here`,
+  `put_custody_ack` at the row's scope). Same claim, same scope; adopting the allowance is a
+  separate decision.
+- `durability_custody` needs its catalogue spec when this branch meets #820 (above).
+
 # v40.1.0 — leviculum v0.29: known-destinations backpressure, off-lock resource assembly, and the two pressure signals in the metrics snapshot
 
 **2026-10-05.** **MINOR** from v40.0.3. Persist v53.1.4 and verify v19.0.0 unchanged; no wire change. Additive API:

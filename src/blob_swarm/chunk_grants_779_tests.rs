@@ -28,9 +28,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::blobs::BlobStorage as _;
-use ciris_persist::federation::key_grant::{
-    KeyGrantAxis, KeyGrantSet, SignedKeyGrantSet, KEY_GRANT_ATTESTATION_TYPE_PREFIX,
-};
+use ciris_persist::federation::key_grant::{KeyGrantAxis, KeyGrantRow, SignedKeyGrantRow};
 use ciris_persist::federation::types::device_class;
 use ciris_persist::federation::{Attestation, FederationDirectory as _, SignedAttestation};
 use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
@@ -483,7 +481,8 @@ impl Withhold {
     }
 }
 
-/// Apply the author's `key_grant` sets through `reader`'s key-grant door,
+/// Apply the author's `key_grant` rows (persist v55.0.0, #989: one per
+/// recipient) through `reader`'s key-grant door,
 /// except those `withhold` names, and hand each admission to `sink` as the
 /// bridge's key-grant door does. Returns how many were applied.
 pub(crate) async fn cross_keys_except(
@@ -506,14 +505,10 @@ pub(crate) async fn cross_keys_except(
         .await
         .expect("list")
         .into_iter()
-        .filter(|a| {
-            a.attestation
-                .attestation_type
-                .starts_with(KEY_GRANT_ATTESTATION_TYPE_PREFIX)
-        })
+        .filter(|a| ciris_persist::federation::key_grant::is_key_grant_row(&a.attestation))
     {
-        let set = KeyGrantSet::from_attestation(&s.attestation).expect("a well-formed set");
-        match &set.axis {
+        let row = KeyGrantRow::from_attestation(&s.attestation).expect("a well-formed row");
+        match &row.axis {
             KeyGrantAxis::Content { at_rest_sha256, .. } if held_back.contains(at_rest_sha256) => {
                 continue;
             }
@@ -523,11 +518,11 @@ pub(crate) async fn cross_keys_except(
         let admission = reader
             .store
             .engine()
-            .apply_replicated_key_grant(SignedKeyGrantSet {
+            .apply_replicated_key_grant(SignedKeyGrantRow {
                 attestation: s.attestation.clone(),
             })
             .await
-            .expect("the reader admits the set");
+            .expect("the reader admits the row");
         if let Some(sink) = sink {
             sink.key_grant_admitted(&admission);
         }
@@ -693,7 +688,12 @@ async fn a_chunk_refusal_names_the_chunk_not_the_file_779() {
     node_b
         .store
         .engine()
-        .promote_adopted_manifest_to_dag(&file.sha, &node_b.me, Some(&aad))
+        .promote_adopted_manifest_to_dag(
+            &file.sha,
+            &node_b.me,
+            Some(&aad),
+            ciris_persist::federation::AdoptDisposition::LocalOnly,
+        )
         .await
         .expect("promote, as v38.0.0's puller did");
 

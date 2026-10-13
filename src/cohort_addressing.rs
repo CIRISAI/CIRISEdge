@@ -107,7 +107,7 @@ pub fn scope_for(community_id: &str) -> crate::cohort_scope::CohortScope {
 /// that consent and converse — while everything the address table is for
 /// is a node: the lifecycle requires this node's own key in the roster
 /// (`SelfNotInRoster`), the blob router looks a holder up by the key that
-/// signed its `holds_bytes` claim (persist §6.1 (4): the node), and a derived
+/// signed its holding claim (persist §6.1 (4): the node), and a derived
 /// destination is something a node listens on. Handing [`snapshot`]'s roster
 /// to `install` therefore cannot work for a community; this is the variant
 /// that can.

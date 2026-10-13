@@ -1,5 +1,6 @@
 //! Acceptance gate for CIRISEdge#42 — CEG 0.1 §10.1.1 (consumer
-//! full-SHA verify) + §10.1.2 (24h holds_bytes TTL, ContentMiss →
+//! full-SHA verify) + §10.1.2 (24h holder TTL — written for the
+//! `holds_bytes` carrier, retired in v55 — ContentMiss →
 //! withdraws feedback, holder-downweight on consistent failure).
 //!
 //! Cross-references:
@@ -471,8 +472,9 @@ fn content_integrity_error_displays_both_hashes() {
 
 // ─── §10.1.2 tests — holder TTL + downweight + Withdraws emission ──
 
-/// **CEG §10.1.2 24h TTL**: a `holds_bytes:sha256:*` attestation row
-/// with `signed_at` 25h ago is **stale**. `filter_holders_with_policy`
+/// **CEG §10.1.2 24h TTL**: a holder row (written for the
+/// `holds_bytes:sha256:*` carrier, retired in v55) with `signed_at` 25h ago
+/// is **stale**. `filter_holders_with_policy`
 /// MUST NOT return it. Drives the filter directly with a 24h TTL.
 #[tokio::test]
 async fn holds_bytes_attestation_expires_after_24h() {
@@ -503,7 +505,9 @@ async fn holds_bytes_attestation_expires_after_24h() {
 
 /// **CEG §10.1.2 TTL configurability**: the 24h default is
 /// `EdgeConfig::holds_bytes_ttl_seconds`. Tests reduce it to 60s and
-/// verify the filter applies the shorter window.
+/// verify the filter applies the shorter window. Since v55 the knob is
+/// inert in production (persist's fold owns the holding claim's 72 h
+/// liveness); this witnesses the filter helper alone.
 #[tokio::test]
 async fn holds_bytes_ttl_configurable_via_edge_config() {
     let now = chrono::Utc::now();

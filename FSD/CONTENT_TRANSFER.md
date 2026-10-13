@@ -51,7 +51,7 @@ These do not move. Every row in §4 and §5 traces to one of them.
 
 | # | ruling | consequence for transfer |
 |---|---|---|
-| **CC 5.2** | *"When a Contribution carries `cohort_scope: self` OR `family`, the substrate MUST NOT emit a corresponding `holds_bytes:sha256:{prefix}` directory attestation … MUST NOT propagate C beyond the self-collective / family scope via any other directory or discovery surface."* Headed **UNCONDITIONAL**. | No holder claim for self/family **at any audience** — the prohibition is on the attestation type, not its scope. No substitute discovery surface either. |
+| **CC 5.2** | *"When a Contribution carries `cohort_scope: self` OR `family`, the substrate MUST NOT emit a corresponding `holds_bytes:sha256:{prefix}` directory attestation … MUST NOT propagate C beyond the self-collective / family scope via any other directory or discovery surface."* Headed **UNCONDITIONAL**. (Text as ruled before persist v55, which retired the `holds_bytes` carrier; the holding claim is now `custody:ack:v1`.) | Since v55 the one holding claim is a `custody:ack:v1` `scores` row with `custody_state: here` placed at the content's own `cohort_scope`: a self/family claim replicates only inside its cohort and is **never observable at federation** or to anyone outside the cohort. No substitute discovery surface outside the cohort either. |
 | **CC 5.2** (same sentence) | *"the content's bytes are delivered to admitted members of the relevant self-collective (CC 3.3.6) or family (CC 3.3.4) via the at-rest encryption flow, NOT via the public holder-discovery directory."* | Self/family bytes move by **delivery**, not discovery. The mechanism is named. |
 | **CC 1.13.3.2** | *"a non-member cannot discover that the bytes exist via the substrate and cannot fetch them … the bytes are delivered only to admitted members via the at-rest key cascade. That is the whole of what omission buys."* | Content-holding confidentiality only; link metadata is out of scope, so fetching from a known node over an encrypted link is inside the ruling. |
 | **CC 3.3.6** | `identity_occurrence` *"is what makes 'this is me, on another device' a cryptographic fact"*; without it *"`cohort_scope: self` content cannot reach the user's other devices."* | The self-collective is knowable without a roster or a grant. |
@@ -59,11 +59,11 @@ These do not move. Every row in §4 and §5 traces to one of them.
 | **CC 3.2** | A node has exactly one owner. | An owner "consenting" to their own node is a category error; the self-collective's membership is not a grant. |
 | **CC 4.4.3.2.1** | Three crypto tiers: self/family per-write DEK (invisibility is the floor, encryption defence-in-depth); community shared epoch DEK (**sole** boundary, federates); commons plaintext. | The tier is a fact about the bytes; the pointer carries it (§3). |
 | **CC 4.4.3.3.1 / 8.1.5** | Widening is a `supersedes`, strictly wider, actor-signed. | A row reaches a community only as its widening; the authored `self` row never leaves the owner's nodes (`chat_two_person_community.rs`). |
-| **CC 5.3.2 / 5.3.2.1** | `ContentFetch` / `ContentBody` / `ContentMiss`; holder discovery via `holds_bytes:sha256:*`, 24 h TTL, at most 2 holders in parallel, `ContentMiss` ⇒ `withdraws`. | The **community / commons** byte path. Not self/family. |
+| **CC 5.3.2 / 5.3.2.1** | `ContentFetch` / `ContentBody` / `ContentMiss`; holder discovery via the holding claim — since v55 a `custody:ack:v1` `here` row living 72 h from its signed instant and re-acked about daily by persist's sweeper (before v55, `holds_bytes:sha256:*` with a 24 h TTL) — at most 2 holders in parallel, `ContentMiss` ⇒ `withdraws`. | The **community / commons** byte path. Not self/family. |
 | **CC 5.3.2.5 / 3.3.13** | Every blob carries `size`; every consumer checks it before hashing; the multimedia Source struct. | persist v45 puts `size` on the holder claim; the reader bounds the fetch by it. |
 | **CC 5.3.2.6** | Render tier from verified, sniffed bytes. | The reader's job after adopt; out of scope here beyond "verify-then-sniff". |
 | **CC 5.4.6** | Scoped destinations are derived per member and never announced; one hop. | Addressing for any non-public cohort is the derived address; the serve gate keys on arrival scope. |
-| **CC 3.1.9.1** | `holds_bytes:sha256:{prefix}`: *"Substrate auto-emission per `federation_blobs.put_blob` … full SHA lives in `evidence_refs[]`."* | The citation, not the pointer, is what the substrate indexes (§3, CIRISEdge#646). |
+| **CC 3.1.9.1** | `holds_bytes:sha256:{prefix}`: *"Substrate auto-emission per `federation_blobs.put_blob` … full SHA lives in `evidence_refs[]`."* (Retired in v55; the holding claim is now `custody:ack:v1` `here`, CC 3.1.3.3.) | The citation, not the pointer, is what the substrate indexes (§3, CIRISEdge#646). |
 
 ## 2. Where this table sits — three tables, one frame
 
@@ -108,7 +108,7 @@ by construction.
 | **Citation** (`evidence_refs[sha]`) | the relation *this row is about these bytes*; what persist indexes (`attestations_binding_content`, `envelope_binds_content`) | how to open | CIRISEdge#646 `chat::cite_evidence`; every producer MUST cite |
 | **Pointer** (`BlobPointer` under a named field) | the key plane — `tier`, `community_key_id`, `epoch`, `content_field`; how to open | the audience (a pointer never widens a cohort — persist#878) | `group_content::BlobPointer`; `BlobMeaning::project`; persist `BlobProvenance::from_attestation` |
 | **Key-grant set** | who can decrypt. Two axes (persist `key_grant.rs`): **epoch** `(community, minter, epoch)` — the signer is the **minter**, named or derived, never the author; **content** `(sha, cohort_scope, owner)` for self/family — admission REQUIRES the signer to equal the blob row's `author_key_id` (`key_grant.rs` §12), so on this axis the minter *is* the author, by rule, and the row already names it | discovery for community (that is the claim); a minter read keyed by epoch for self/family (a self/family pointer has `epoch: None` — `BlobPointer::epoch` is `CommunityDek` only) | persist `key_grant:*`, `Engine::apply_replicated_key_grant`; `FSD/EPOCH_MINTER.md` |
-| **Holder claim** (`holds_bytes:sha256:*`) | possession, at community / affiliations / commons only; 24 h TTL | meaning (`PossessionIsNotMeaning`); self/family (CC 5.2) | persist `put_blob_scoped`; edge `store_gate::announce_is_possible` |
+| **Holder claim** (`custody:ack:v1` `scores` row, `custody_state: here`; the `holds_bytes:sha256:*` carrier is retired in v55, and a legacy row is still possession, never meaning) | possession, at the content's own `cohort_scope` — `federation` for commons, the bytes' own `self` / `family` / `community` / `affiliations` cohort otherwise, observable only inside that cohort; lives 72 h from its signed instant, re-acked about daily by persist's sweeper; retracted only by its signer (a later `none`, or its own `withdraws`) | meaning (`PossessionIsNotMeaning`); visibility outside its cohort (CC 5.2) | persist write doors (`put_blob_with_scope`, `adopt_sealed_blob_at`, sealed-DAG promotion under `AdoptDisposition::Announce`), `list_holders` / `holding_claim::live_holders`; edge `store_gate::announce_is_possible` |
 | **Occurrence** (`identity_occurrence`) | the self-collective: every device/agent of one identity; a **content-KEM / grant target** (CC 3.3.6.1); its `transport_destination` (CC 3.3.6) is the signed binding to the NODE that hosts it | consent (CC 3.2); **a peer** — an occurrence is not a replication endpoint; node-class and device-class occurrences exist, and under `use_node_identity` (CIRISEdge#541) the actor/engine key is an occurrence while peers see the NODE key | persist `list_identity_occurrences_active`; edge `contact::resolve` → `Subject.nodes` |
 | **Node** (the advertised identity) | what a round is run against and a fetch is addressed to; the key a `TransportBinding` (#636) proves on a link; the member of every scope-address group; `Edge::advertised_key_id` | authorship (stored rows are the actor's) | CC 4.4.3.2.4.1(b) `resolve_member_transport`: occurrence → `transport_destination` → destination; edge `contact::resolve`, `cohort_addressing::snapshot_for_nodes` |
 | **Roster** (community / family record) | the recipient set for community / family content | the key plane | persist `resolve_community().members`, `list_families_for_member_active` |
@@ -127,7 +127,7 @@ row, always; `tier` / `community_key_id` / `epoch` from the pointer; the floor b
 | row projection (persist `namespace`) | `SelfOwn` | `SelfOwn` | `Cohort` | `Cohort` / `Global` (trust root) |
 | **rows reach** | the **nodes** hosting the identity's active occurrences — **implicit** (CC 3.3.6 / 3.2), no grant | the nodes hosting the family members' occurrences — implicit per member | consent peers ∩ roster; the room sees the **widening** (CC 4.4.3.3.1) | consent peers (`consent_peers_by_principals`); the allowlist gates the STORE, not the send |
 | keys reach | every occurrence, wrapped at write; **retroactively on new occurrence** (CC 8.1.12.4) | every member's occurrence, wrapped at write; retroactively on new member | roster, via the epoch cascade + `key_grant` set | none |
-| **holder discovery** | **none** (CC 5.2) | **none** (CC 5.2) | `holds_bytes` at community visibility, 24 h TTL (CC 5.3.2.1) | `holds_bytes`, plaintext provenance |
+| **holder discovery** | **none** outside the cohort (CC 5.2): the claim sits at `self` and replicates only to the owner's nodes | **none** outside the cohort (CC 5.2): the claim sits at `family` and replicates only to the family | `custody:ack:v1` `here` at the room's scope, members only; 72 h, re-acked (CC 5.3.2.1) | `custody:ack:v1` `here` at `federation`, plaintext provenance |
 | **holder set** | **known by construction**: the author's nodes (`contact::resolve(author_key_id).nodes` — the sealing node is among them; on the content axis author = minter by admission rule) | the author's nodes, as self; the family's other nodes only opportunistically | `list_holders` (+ `list_holders_sized`, v45) | `list_holders` |
 | byte movement | **delivery**: addressed fetch from the author's nodes; push-on-write optional | delivery, as self | discovery + swarm pull (`BlobPuller`, up to 2 holders) | discovery + swarm pull |
 | **file shape** (§6.7) | inline ≤ 1 MiB (CC 2.6.1.3), else a sealed **chunk DAG** (CC 5.3.3.1) ✓ v30.1.0 — `files::publish` routes at the bound; the pointer's `stream_id` says which | same | same | same |
@@ -173,7 +173,8 @@ one gate against a constant doesn't prove anything about the stack. The witness 
 asked of every gate**, with each answer compared against the others.
 
 **One legitimate asymmetry, and it's about bytes, not rows.** CC 4.4.3.2.1 lets *non-members* hold
-community ciphertext: `holds_bytes` carries *"cleartext provenance … so non-member holders can make an
+community ciphertext: the holder claim (`holds_bytes` as ruled; retired in v55, the holding claim is now
+`custody:ack:v1`) carries *"cleartext provenance … so non-member holders can make an
 informed keep/evict decision without reading content"*. Holding sealed bytes isn't reading them, since
 the DEK is the boundary. That covers **blob ciphertext at the Community tier only**. It never covers
 the row, a self/family byte (CC 5.2), or a key.
@@ -249,7 +250,7 @@ witness column is the work.
 | **R1** row widened to the room | `share(.., With::Community, ProducerAuthority)` — the supersedes the room receives | host (server `share_in_room`; harness) | `AudienceNotWider`, `CustodyIsNotTheActor` | `chat_two_person_community.rs` (the widen), `chat_message_federates::the_share_plan_is_decided_before_any_directory_and_refuses_a_narrowing` |
 | **R2** row reaches a member's node | consent peer ∩ roster; round completes (§5.4.2) | edge replication | `RecipientNotInSendSet`, `ReplyDropped{…}` | `runtime.rs::mutual_initiators_634`, ladder `sent` |
 | **R3** key reaches the member | `key_grant` set admitted, wraps projected to the member's occurrences | persist `apply_replicated_key_grant`; host wires `SealedContentWiring` | `key_grant set … projected as grants` (INFO) / `NotGranted` | `blob_federation_e2e::a_far_node_opens_once_the_key_grant_and_the_bytes_both_arrive`; `chat_harness_dx` (config shape) |
-| **R4** holder discovered | `holds_bytes` at community visibility, indexed with the row (v44.8.1) | persist `put_blob_scoped` | `NoHolders` | persist I113/I113c; `blob_federation_e2e::holds_bytes_says_possession_and_never_meaning` |
+| **R4** holder discovered | a `custody:ack:v1` `here` claim at the room's own scope, read by `list_holders` (v55; before it, `holds_bytes` at community visibility, indexed with the row, v44.8.1) | persist write doors (`put_blob_with_scope`, `adopt_sealed_blob_at`) | `NoHolders` | persist I113/I113c; `blob_federation_e2e::holds_bytes_says_possession_and_never_meaning` |
 | **R5** holder addressed | the room installed in the scope table (nodes, not persons); route to the derived address | host drives `ScopeLifecycle` with `snapshot_for_nodes` | `blob_group_not_installed` / `blob_holder_not_in_group` / `blob_holder_sealed_out` (`blob_route_refusals`) | `scope.rs::a_group_that_was_never_installed_is_named_as_such_not_as_a_membership_refusal`, `cohort_addressing::a_community_of_persons_installs_as_its_nodes` |
 | **R5′** carrier chosen (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132, CIRISEdge#718) | ONE choice per send, from the path table, BEFORE any dial: the holder's announced destination at **one hop** ⇒ the derived address (the zero-observer path, exactly R5); at **more than one hop** ⇒ the members' end-to-end encrypted **identity-plane link**, the room discriminated INSIDE the link (`BlobChunkFetch.scope_discriminator` = the holder's own derived address, in the envelope body); **no path** ⇒ the derived address (a forwarder is never chosen on a guess). Never a fallback after a failed direct dial | edge `blob_swarm::scope::choose_scoped_carrier` over `ReticulumTransport::scoped_path_shape` (`fetch_blob_chunk_scoped`) | none — both branches are counted (`blob_scoped_carriers`: `send:derived_address` / `send:identity_link` / `send:path_unknown_derived`) and logged with the hop count; a transient direct-link failure stays `NoRouteToPeer` and never re-routes | `scope.rs::the_carrier_is_the_derived_address_at_one_hop_and_the_identity_link_beyond`, `reticulum.rs::scoped_path_shape_tests`, `scoped_body_identity_link_718.rs` (three nodes on real Reticulum, C a non-member transport node) |
 | **R6** holder serves | arrival on the matching group; `chunk_scope` answered (`answers_scope`). A request on the identity-plane link is admitted **only if** its in-link discriminator names a derived address THIS node holds (own member address, any live epoch — the same `ScopeAddressTable` reverse index the arrival path consults); then it is stamped as that arrival and every gate below reads it identically. A discriminator on a frame that ALSO arrived on a derived address is a mismatch | edge `BlobScopeRouter::scoped_arrival` → `admit_blob_serve`; host wires a scope-answering source | `blob_serve_scope_undeterminable` / `…arrival_scope_insufficient` / `…group_mismatch` / **`…discriminator_unheld`** / **`…discriminator_on_derived_address`** (`blob_serve_refusals`); build refuses the unwired state | `scope.rs::a_scoped_blob_is_served_to_a_peer_arriving_on_the_matching_address`, `scope.rs::a_discriminator_*`, `edge.rs::scope_native_gate_640`, `scoped_body_identity_link_718.rs::a_forged_discriminator_is_refused_by_name` |
@@ -718,8 +719,8 @@ row, v50 **refuses** a sealed one (the struct is closed; `format` required in cl
 CIRISPersist#922 (the cut after v50). Therefore: **the seal lives inside edge's `content` pointer**
 (`BlobPointer.sealed_descriptor`, §7 table), **and the pointer carries the members the ruling
 requires in clear**, which today's `BlobPointer`/`FileRow` do not all have: `size` (bytes, REQUIRED
-— CC 5.3.2.5 checks it before hashing, and a self/family file emits no `holds_bytes` row from which
-a reader could learn it), `content_digest` (the plaintext sha, REQUIRED in the encrypted case — the
+— CC 5.3.2.5 checks it before hashing, and a self/family file's holding claim is never observable
+outside its cohort, so a reader cannot count on one to learn it), `content_digest` (the plaintext sha, REQUIRED in the encrypted case — the
 producer holds the plaintext and computes it beside the at-rest sha), and `placeholder` (optional,
 images only). These are added to the compat pointer in the same change as `sealed_descriptor`, so a
 pre-#922 row satisfies the Source contract and D2's unauthorized reader gets the promised size and CIRISEdge#638's adoption of persist's `media`
@@ -863,7 +864,7 @@ the same holder rung (§6.2) and the same store gate as a whole blob — over pe
 |---|---|
 | `open_sealed_manifest_as(sha, viewer, aad)` | the chunk list of a held sealed manifest, opened for an authorized viewer (as `read_blob_as` authorizes): `{sha256_hex, size, seq}` per chunk, `stream_id`, `total_size`, the row's `storage_kind`, and the three caps (per-chunk inline cap, whole-read cap, max chunks); refuses a non-manifest by name |
 | `promote_adopted_manifest_to_dag(sha, viewer, aad)` | flips an adopted manifest row to `chunk_dag` once every chunk is held at `(stream_id, seq)` with the named sha and `plaintext_size = size`; otherwise names the first missing `(seq, sha)`; idempotent |
-| `put_blob_chunks_signing(manifest, chunks, author)` | a plaintext DAG in one shot, every chunk verified against the manifest inside the door, the manifest's `holds_bytes` announced as `store_plaintext` announces a whole blob |
+| `put_blob_chunks_signing(manifest, chunks, author)` | a plaintext DAG in one shot, every chunk verified against the manifest inside the door, the manifest's holding claim (`custody:ack:v1` `here`) filed as `store_plaintext` files one for a whole blob |
 
 **The states, in order.** Each rung refuses by name (`PullOutcome::DagRefused`) and counts under
 `blob_pull_refusals`; nothing past a refusal is stored, and nothing stored reads wrong.
@@ -899,7 +900,7 @@ DAG is held whole until `put_blob_chunks_signing` takes it and so keeps that 64 
 bound; chunks are fetched one address at a time through one swarm session.
 
 Witnesses (`tests/blob_federation_e2e.rs`): `a_plaintext_chunk_dag_pulls_through_the_real_doors_and_reads_back_whole`
-(1,048,577 bytes, five chunks, `chunk_dag` on B, byte-identical, B's own `holds_bytes`),
+(1,048,577 bytes, five chunks, `chunk_dag` on B, byte-identical, B's own holding claim — `holds_bytes` when witnessed, `custody:ack:v1` `here` since v55),
 `a_sealed_self_chunk_dag_pulled_by_the_owners_other_device_reads_back_whole` (1,300,000 bytes at
 `invisible_encrypted`: tampered manifest → nothing; honest before the key → `DagAwaitingKey`; tampered
 chunk → refused at `seq 1` with chunk 0 kept; honest → resumed, promoted, `FileRow::open` at full
@@ -914,7 +915,7 @@ above, each asserted from the receiving side:
 |---|---|---|
 | **key** | ONE `key_grant` set per `(community, epoch)` — every chunk and the manifest are sealed under the epoch's DEK and the cascade wraps that DEK once per member occurrence (the self tier emits a set per blob: six for the same file). The set names the members' nodes and no non-member's; a non-member admits the carrier and can unwrap nothing | B and C apply A's e0 set; D's occurrence is in no wrap |
 | **pointer** | carries `epoch: Some(e0)` (CIRISEdge#601); the adopt binds the manifest and every chunk to THAT epoch, never to the room's current one. A pointer at this tier naming no epoch is `NoEpoch` before any fetch, counted **`no_epoch`** (CIRISEdge#735: before that cut the one community-tier refusal the pull could reach was the one it did not count) | a pre-#601 pointer over the same bytes → `NoEpoch`, `no_epoch = 1` |
-| **holder to holder** | B pulls from A, promotes, and its own `holds_bytes` on the DAG root is federation-tier and hybrid-signed — C admits it through `apply_replicated_attestation` and discovers B by `list_holders`. C's reach is B alone; every address C holds was served by B and none by A | `servers()` of C's fetcher = `[B, B, B, B]` |
+| **holder to holder** | B pulls from A, promotes, and its own holding claim on the DAG root is federation-tier and hybrid-signed (as witnessed, a `holds_bytes` row; retired in v55 — the claim is now `custody:ack:v1` `here` at the content's own `community` scope, replicated only inside the room) — C admits it through `apply_replicated_attestation` and discovers B by `list_holders`. C's reach is B alone; every address C holds was served by B and none by A | `servers()` of C's fetcher = `[B, B, B, B]` |
 | **announce** | persist's `adopt_sealed_blob(Announce)` emits the claim when the MANIFEST is adopted, ahead of promotion (the plaintext door announces after every chunk). A RESUME skips that adopt, so `Stored { announced }` now reads the claim off the index (`list_holders` ∋ self) instead of reporting `false` for a door not called — on the base the resumed community pull denied the claim it had made. That a manifest-only holder is discoverable before it holds a chunk is persist's door shape (CIRISPersist#951 asks for the claim at promotion); a puller that reaches one gets `NotHeld` per chunk and walks on (CC 5.3.2.1) | C's tampered attempt announces; the resume reports `announced: true` |
 | **tampered chunk** | refused `ChunkMismatch { seq }` by name, counted `dag_chunk_mismatch`, the earlier chunk kept; the next offer resumes. Rotation to another holder on a dishonest body is the swarm session's (`SwarmConfig::dishonest_strike_limit`, `blob_swarm::tests`), not the walk's: a caller's `DagByteFetch` is one session | B serves a flipped chunk 1 → `seq: 1`, positions `[0]`, then resumed from B |
 | **non-member** | refused at the store gate (`Refused("axis …")`) before the first fetch; holds nothing, claims nothing. The serve side is the scope gate — a non-member derives no room address and holds no discriminator (`tests/scoped_body_identity_link_718.rs`); persist's `serve_blob_to_peer` ignores the requester | D: no fetch, no blob, no claim |
@@ -938,7 +939,7 @@ from the self tier, each asserted from the side that must show it:
 | **serve scope** | a family file on its author's node is TWO rows: the person's `self` row and the `supersedes` placing it in the family. Persist's binding index returns only the first, so the chunk source reads the widenings too (`BlobMeaning::referencing_rows` / `serve_scope`, also used by `chunk_in_named_dag`); before, P1 scoped every family file `self` and withheld Q1 with `blob_serve_arrival_scope_insufficient` | Q1's fetches admitted on the family address |
 | **holder** | the author's nodes, never the claim index (CC 5.2) | `blob_pull_sources`: `family:author_nodes` ≥ 2, `family:claim_index` = 0 |
 | **adopt** | a member's node is party to family content by the ROSTER (persist `hold::is_audience`'s family arm, CIRISPersist#960; before it, the other member's node refused `NotPartyTo`) | Q1 holds the DAG `chunk_dag`, both files open byte-identical |
-| **delivered, never discovered** | no `holds_bytes` row for either sha at any audience, on any node | `list_holders`, `list_local_holders` and the federation stream on P1, Q1, N, F |
+| **delivered, never discovered** | no `holds_bytes` row for either sha at any audience, on any node (as witnessed before v55, which retired `holds_bytes`). Since v55 the holding claim is `custody:ack:v1` `here` at `family` scope: P1's claim is served to Q1, whose `live_holders` names P1, and never to N or F, whose holder reads are empty (`assert_holding_claim_confined`) | `list_holders`, `list_local_holders` and the federation stream on P1, Q1, N, F |
 | **non-member N** | offered neither row, served neither by hash (`recipient_not_in_send_set`); N derives no family address; N's direct ask over the federation address is `PolicyDenied`, booked `blob_serve_arrival_scope_insufficient` ×2 on P1; N holds no row, no byte, no chunk | the direct witness |
 | **forwarder F** | with P1 and Q1 dialling only F, both bodies cross on the identity-plane link with the family discriminated inside (#718): `send:identity_link` ≥ 2, `send:derived_address` = 0, `serve:identity_link_admitted` ≥ 2. F's path table holds no family-derived address, F has no scope table, no row naming the family, no P1 key and no byte | the forwarder witness |
 | **receipt** | Q1's device receipts the file back to P1 inside the family; a non-member's receipt is `receipt_signer_not_member` (§6.10) | `delivery_receipts_738::a_family_file_is_receipted_by_the_other_persons_device_and_no_one_else` |
@@ -1155,11 +1156,11 @@ crosses.
 
 **What the chunks already written become — deterministic, from persist's code at the pin.** Persist has
 no GC (`federation::blobs`, "Why no GC in v0.1": blobs persist until a door deletes them), no chunk
-announces anything (`put_blob_chunk_scoped` writes no `holds_bytes`; only the seal announces, and
-`invisible_encrypted` never does), and no manifest names them, so nothing would ever pull them — they
+announces anything (`put_blob_chunk_scoped` is not a claim-filing door; only the seal files a holding
+claim, at the bytes' own cohort, so an `invisible_encrypted` claim never leaves the cohort), and no manifest names them, so nothing would ever pull them — they
 would sit on the author's disk forever. So the store **evicts them before the refusal returns**, through
-persist's one eviction door `Engine::evict_blob` (retract this node's `holds_bytes` for the sha — a
-chunk has none — then delete the blob row with its at-rest grants and epoch binding in one transaction,
+persist's one eviction door `Engine::evict_blob` (retract this node's holding claims for the sha, a
+hybrid-signed `withdraws` each at the claim's scope — a chunk has none — then delete the blob row with its at-rest grants and epoch binding in one transaction,
 §11.5 I19):
 
 | tier | chunks written before the refusal |
@@ -1438,7 +1439,7 @@ label (0) for self/family.
 
 **Delivery — the room's delivered path, never discovery.** The receipt row is emitted at the file
 row's own cohort with the same cohort target: `self` reaches the owner's devices, `family` the family,
-`community` the room's members. CC 5.2 holds (no `holds_bytes`, no discovery surface at self/family);
+`community` the room's members. CC 5.2 holds (a self/family holding claim never leaves its cohort; no discovery surface outside it);
 nothing is ever emitted at a commons scope.
 
 **Admit — on the author's node, every refusal named** (`receipts::admit_receipt_row`, run by the
@@ -1478,11 +1479,19 @@ community — a receipt per member that pulled (two), each admitted through A's 
 a non-member's receipt, a wrong epoch and a `K` past the tree refused by name; family — the family
 lane's (CIRISPersist#953 item 1).
 
-## 7. Invariants — and the mutant each must kill## 7. Invariants — and the mutant each must kill
+## 7. Invariants — and the mutant each must kill
 
-1. **No `holds_bytes` for self/family at any audience.** persist I52 stays as written; edge
-   `announce_is_possible(SelfOnly | Family) == false` stays, and (CIRISEdge#646 ask 1) asks the
-   substrate's predicate rather than restating it. *Mutant:* a claim emitted at `self` scope → I52 red.
+1. **A self/family holding claim is observable only inside its cohort.** Since persist v55
+   (CIRISPersist#989, CC 3.1.3.3) the claim is a `custody:ack:v1` `here` row at the content's own
+   scope, and persist I52 now asserts a self/family `Announce` claims only inside its cohort (before
+   v55 it refused any self/family claim, when the only claim was the federation-scoped
+   `holds_bytes`, now retired). Edge's store gate still keeps a self/family adopt `LocalOnly`
+   (`announce_is_possible` asks persist's `is_structurally_invisible`, CIRISEdge#646 ask 1), and the
+   completed pull files the claim itself (`report_here`, `put_custody_ack` at the row's scope).
+   *Witness:* `assert_holding_claim_confined` in `blob_federation_e2e`, `file_range_read_737` and
+   `family_files_wire_736` — a non-member is never served the claim and its `list_holders` /
+   `live_holders` are empty, a co-member is served it and its `live_holders` names the writer.
+   *Mutant:* edge's per-row audience gate (`audience_withholds`) opened → all three red.
 2. **Audience from the row, never the pointer.** persist#878 I135. *Mutant:* "scope from the pointer"
    → a non-owner becomes party to a `self` row → I135 red.
 3. **Key plane from the pointer, never the row's scope.** persist#878 I132–I134; edge
@@ -1614,7 +1623,8 @@ template: it is green because each rung has a witness, not because a run passed.
 
 - **2026-09-29 (CIRISEdge#735, lane 2 of #734 — the community chunk DAG, holder to holder).** §6.7
   gains the `community_dek` row: one `key_grant` set per epoch, the pointer's epoch binds the adopt,
-  B's `holds_bytes` on the DAG root is what C discovers and fetches from, the four negatives by
+  B's `holds_bytes` (retired in v55; the holding claim is now `custody:ack:v1`) on the DAG root is
+  what C discovers and fetches from, the four negatives by
   name. Two things the witness proved missing, fixed in `pull.rs`: `NoEpoch` is counted
   (`no_epoch`), and a RESUMED sealed pull reports `announced` from the claim index instead of
   denying the claim the first attempt emitted. Judgement recorded: persist announces a sealed DAG at

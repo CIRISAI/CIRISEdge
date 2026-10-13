@@ -98,8 +98,9 @@
 //! # Where the darknet half lands
 //!
 //! The `self` and `family` scopes are the derived group plane (CC 5.4.6):
-//! persist suppresses `holds_bytes` for them structurally, so holding
-//! that content publishes nothing. That is why
+//! persist keeps their holding claims inside the cohort structurally (since
+//! v55 a `custody:ack:v1` row at the content's own scope), so holding that
+//! content publishes nothing to anyone outside it. That is why
 //! [`StoreAdmission::StoreLocalOnly`](crate::blob_swarm::StoreAdmission)
 //! exists as a distinct verdict rather than a flag — *accept* and
 //! *announce* are two different flows, with two different recipients, and
@@ -418,10 +419,11 @@ pub fn parameter_of_meaning_refusal(refusal: &MeaningRefusal) -> CiParameter {
         // Both of these are edge saying "nothing here tells me WHAT these
         // bytes are", which is the information-type parameter and not the
         // recipient one — and the distinction decides the remedy. A
-        // `holds_bytes` row is a well-formed, signed, correctly-scoped
-        // claim; what it claims is POSSESSION. Reading it as an
-        // information type would classify every blob on the node as
-        // commons content, because that is the cohort its column carries.
+        // holding claim (`custody:ack:v1`, or a legacy `holds_bytes` row
+        // retired in v55) is a well-formed, signed, correctly-scoped claim;
+        // what it claims is POSSESSION. Reading it as an information type
+        // would classify the bytes by the claim's column (for a legacy row,
+        // every blob on the node as commons content).
         //
         // `DoesNotReference` is the same gap from the other side: a row
         // that states an information type, for other bytes.
@@ -719,7 +721,7 @@ mod tests {
         assert_eq!(
             parameter_of_meaning_refusal(&MeaningRefusal::PossessionIsNotMeaning),
             CiParameter::InformationType,
-            "a holds_bytes row is well-formed, signed and correctly scoped; what \
+            "a holding claim is well-formed, signed and correctly scoped; what \
              it does not carry is an information TYPE",
         );
         assert_eq!(

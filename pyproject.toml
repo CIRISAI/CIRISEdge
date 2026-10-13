@@ -99,8 +99,10 @@ classifiers = [
 # are a Rust-trait change, not an ABI one. The floor still moves, because a
 # MAJOR always moves it: the constraint this line expresses is "the wheel in
 # this process is the same crate edge linked", and 40.x and 41.x are not.
+# v55.0.0 (CIRISPersist#989) moves none of the four either; the floor moves
+# with the MAJOR.
 dependencies = [
-    "ciris-persist>=54,<55",
+    "ciris-persist>=55,<56",
 ]
 dynamic = ["version"]
 

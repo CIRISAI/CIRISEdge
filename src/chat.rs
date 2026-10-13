@@ -1633,14 +1633,19 @@ impl UnopenedReason {
             E::NotGranted { .. } => Self::NotGranted { detail },
             E::ChunkKeyPending { .. } => Self::AwaitingKey { detail },
             E::Evicted { .. } => Self::Evicted { detail },
-            E::Withdrawn { .. } => Self::Withdrawn { detail },
+            // persist v54.1.0 — a purge withholds the bytes as a withdrawal
+            // does, and the reader's remedy is the same (none).
+            E::Withdrawn { .. } | E::Purged { .. } => Self::Withdrawn { detail },
             E::SealMismatch { .. } => Self::SealMismatch { detail },
             // CIRISEdge#737 — a range past the end is the file reader's to
             // name (`FileError::RangeNotSatisfiable`) before it reaches here;
             // a chat body is never read by range, so here it is a fault.
             // CIRISEdge#744 — the two streamed-WRITE refusals never arise on
             // a read; if one reached here it is a fault, not a reader state.
+            // persist v55 — a stream-keyed chunk under a community epoch is an
+            // adopt/promote fault, never a read state.
             E::RangeNotSatisfiable { .. }
+            | E::StreamKeyedChunkCommunityEpoch { .. }
             | E::DeclaredLengthMismatch { .. }
             | E::Reader { .. }
             | E::Substrate(_) => Self::Substrate { detail },

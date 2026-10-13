@@ -1375,7 +1375,8 @@ the typed enums.
 `cdn_edge_prefetch_stub` logs the trigger via `tracing::info!`
 but does NOT perform the HTTP GET. The wire shape is locked here;
 the full implementation (reqwest-driven fetch + SHA verification +
-operator-base re-publish + holds_bytes re-emission) is a post-v1.0
+operator-base re-publish + filing the holding claim, a
+`custody:ack:v1` `here` row since v55) is a post-v1.0
 cut. Operators who flip `l1_cdn_edge_enabled = true` at v0.20.1
 see the trigger fire in observability but no bytes move — the
 operator-side opt-in surface is locked; the bytes-fetching wire

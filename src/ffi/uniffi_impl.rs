@@ -727,8 +727,25 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
     let tracker = edge.reachability_tracker();
     let snap = tracker.snapshot_all();
 
-    let mut counters: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let mut gauges: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    // CIRISEdge P0 telemetry — every `EdgeMetricsBundle` field, flattened
+    // (`EdgeMetricsBundle::flatten`): the key `f` for each field `f` of
+    // `EDGE_METRICS_BUNDLE_FIELDS`, labelled detail as `f.<label>`. Before
+    // this (CIRISEdge#848) the snapshot hand-projected a subset under its
+    // own key names, and a field added to the bundle reached PyO3 only if
+    // someone remembered this function. Mirror the
+    // reachability tracker into its gauge first, as PyO3 does, and refresh
+    // any transport-mirrored gauge (CIRISEdge#809).
+    let m = edge.metrics();
+    for entry in &snap {
+        m.set_peer_reachability(&entry.peer_key_id, entry.transport_id.0, entry.ratio());
+    }
+    for transport in edge.transports() {
+        transport.refresh_metrics();
+    }
+    let crate::observability::FlatMetrics {
+        mut counters,
+        mut gauges,
+    } = m.snapshot().flatten();
 
     let mut total_attempts: u64 = 0;
     let mut total_successes: u64 = 0;
@@ -745,39 +762,10 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
         "inbound.dropped_low_trust_total".to_string(),
         edge.metrics().inbound_dropped_low_trust(),
     );
-    // CIRISEdge#809 — the two leviculum pressure signals. The eviction
-    // count is a mirror the transport refreshes on request, so refresh
-    // before reading.
-    for transport in edge.transports() {
-        transport.refresh_metrics();
-    }
-    counters.insert(
-        "transport.packets_dropped_total".to_string(),
-        edge.metrics().transport_packets_dropped(),
-    );
-    counters.insert(
-        "transport.known_destination_evictions".to_string(),
-        edge.metrics().known_destination_evictions(),
-    );
-    // CIRISEdge#771 — chunk serves answered by the legacy DAG stream walk.
-    counters.insert(
-        "blob.serve_legacy_dag_walks_total".to_string(),
-        edge.metrics().blob_serve_legacy_dag_walks(),
-    );
-    // CIRISEdge#858 — the replication refusal memory's park ledger.
-    insert_park_ledger(&edge.metrics().snapshot(), &mut counters, &mut gauges);
-    // CIRISEdge#805 — the A/V plane ledger (`EdgeMetrics::av_plane`): sends,
-    // the #720 named refusal, arrivals, sink deliveries and every drop label,
-    // one counter per label, as the Rust snapshot and the pyo3 dict carry it.
-    for (label, n) in edge.metrics().av_plane() {
-        counters.insert(format!("av_plane.{label}"), n);
-    }
-    // CIRISEdge#845 — the cumulative durable enqueues per delivery class,
-    // and the RESIDENT depth from persist's outbound_counts (#996). A
-    // failed count leaves the gauge out rather than reporting 0.
-    for (class, n) in edge.metrics().snapshot().durable_enqueued_total {
-        counters.insert(format!("durable.enqueued_total.{}", class.as_str()), n);
-    }
+    // CIRISEdge#845 — the RESIDENT durable depth from persist's
+    // outbound_counts (#996); not a bundle field, so read here. A failed
+    // count leaves the gauge out rather than reporting 0. (The cumulative
+    // enqueues are the bundle's `durable_enqueued_total`, flattened above.)
     let counted = Arc::clone(&edge);
     let resident = block_on_runtime(&edge, async move {
         counted.durable_queue_depth().await.map_err(|e| {
@@ -806,57 +794,6 @@ pub fn metrics_snapshot() -> Result<crate::EdgeMetricsSnapshot, crate::EdgeBindi
         snapshot_at: chrono::Utc::now().to_rfc3339(),
         window_seconds: tracker.window_seconds(),
     })
-}
-
-/// CIRISEdge#858 — the replication refusal memory's park ledger, flattened
-/// into the UniFFI snapshot's maps: parks per plane and in total, releases,
-/// dropped re-asks and park evictions as counters; the memory's size and
-/// bounds as gauges.
-fn insert_park_ledger(
-    bundle: &crate::observability::EdgeMetricsBundle,
-    counters: &mut std::collections::HashMap<String, u64>,
-    gauges: &mut std::collections::HashMap<String, f64>,
-) {
-    let mut parked_total: u64 = 0;
-    for (kind, n) in &bundle.rows_parked_on_signer {
-        parked_total = parked_total.saturating_add(*n);
-        counters.insert(
-            format!("replication.rows_parked_on_signer.{}", kind.as_wire_str()),
-            *n,
-        );
-    }
-    for (name, value) in [
-        ("replication.rows_parked_on_signer_total", parked_total),
-        ("replication.signer_releases_total", bundle.signer_releases),
-        (
-            "replication.retry_suppressions_total",
-            bundle.retry_suppressions,
-        ),
-        (
-            "replication.signer_park_evictions_total",
-            bundle.signer_park_evictions,
-        ),
-    ] {
-        counters.insert(name.to_string(), value);
-    }
-    for (name, value) in [
-        ("replication.refusal_memory_len", bundle.refusal_memory_len),
-        (
-            "replication.refusal_memory_capacity",
-            bundle.refusal_memory_capacity,
-        ),
-        (
-            "replication.parked_on_signer_len",
-            bundle.parked_on_signer_len,
-        ),
-        (
-            "replication.parked_on_signer_capacity",
-            bundle.parked_on_signer_capacity,
-        ),
-    ] {
-        #[allow(clippy::cast_precision_loss)]
-        gauges.insert(name.to_string(), value as f64);
-    }
 }
 
 pub fn recent_events(

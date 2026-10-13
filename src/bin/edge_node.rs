@@ -385,7 +385,7 @@ struct Config {
     /// (CC 2.6.8). Holds the name until `stand_up` has loaded the key, and
     /// the derived id from then on — the one id the transport, the edge
     /// signer and the content engine all carry (the production shape: a
-    /// holder's `holds_bytes` signer IS the transport identity peers dial,
+    /// holder's holding-claim signer IS the transport identity peers dial,
     /// CIRISEdge#768). The name lists below are translated to key_ids at the
     /// same moment, from the roster.
     node_id: String,
@@ -2006,6 +2006,9 @@ struct Occurrence {
     /// to it; the chat legs seal and open through it. Two views would be two
     /// sets of grant tables that never meet.
     engine: ciris_edge::replication::BridgeEngine,
+    /// persist v55.0.0 — the holding-claim re-ack sweeper, taken by `main` and
+    /// stopped when the role completes.
+    reack: Option<ciris_edge::group_content::HoldingClaimReack>,
     /// The engine's derived signing key — this node's occurrence of its
     /// owner, and therefore the viewer key for every read here.
     me: String,
@@ -2073,7 +2076,7 @@ async fn stand_up(
     //
     // Its key_id is DERIVED from the node's name and pubkey (CC 2.6.8), and it
     // is the ONE id this node goes by: the transport identity peers dial, the
-    // edge signer, and the content engine (whose `holds_bytes` claims name the
+    // edge signer, and the content engine (whose holding claims name the
     // holder a blob pull then dials — CIRISEdge#768). The harness used to key
     // the node by its bare name and run the engine under a second key, so a
     // holder was a key no transport listened on.
@@ -2255,7 +2258,7 @@ async fn stand_up(
 
     // The signer the content engine is built over: THIS NODE's key, so the
     // engine's derived id is `cfg.node_id` — the node's content occurrence of
-    // its owner, the signer of its `holds_bytes` claims, and the transport
+    // its owner, the signer of its holding claims, and the transport
     // identity peers dial are one key (the production shape, and
     // `tests/scoped_body_identity_link_718.rs`'s). The node's owner binding
     // above is what lets persist resolve it to the owner, a room member.
@@ -2278,6 +2281,14 @@ async fn stand_up(
     .await
     .map_err(|e| format!("hybrid content engine: {e}"))?;
     let engine = ciris_edge::replication::BridgeEngine(content_store.engine().clone());
+    // persist v55.0.0 (#989, CC 3.1.3.3 rule 5) — this node's holding claims
+    // lapse at 72 h unless re-acked. The engine is a VIEW this binary built,
+    // so nothing else starts persist's re-ack sweeper; `main` stops it.
+    let reack = content_store.spawn_holding_claim_reack();
+    tracing::info!(
+        running = reack.is_running(),
+        "holding-claim re-ack sweeper (CC 3.1.3.3 rule 5; persist v55)"
+    );
 
     // CIRISEdge#599 — this node as a CONTENT OCCURRENCE of its owner.
     //
@@ -2320,7 +2331,7 @@ async fn stand_up(
     if engine_key != cfg.node_id {
         return Err(format!(
             "the content engine derives {engine_key:?}, not this node's key {:?} — its \
-             holds_bytes claims would name a holder no transport listens on",
+             holding claims would name a holder no transport listens on",
             cfg.node_id
         ));
     }
@@ -2743,7 +2754,7 @@ async fn stand_up(
                     revocations: Some(ciris_edge::replication::RevocationWiring {
                         register: Arc::clone(&revocations),
                         // CIRISEdge#669 — the ENGINE, not the bare backend:
-                        // eviction retracts this node's holds_bytes claims
+                        // eviction retracts this node's holding claims
                         // (signed withdraws) before it deletes, and only the
                         // engine holds the signer (persist `evict_blob`).
                         evictor: Some(Arc::new(engine.0.clone())
@@ -2821,6 +2832,7 @@ async fn stand_up(
         directory,
         engine,
         me,
+        reack: Some(reack),
     })
 }
 
@@ -6242,7 +6254,8 @@ fn main() -> std::process::ExitCode {
         ));
         let role = cfg.role;
 
-        let occ = match stand_up(cfg, Arc::clone(&reporter), budget.max_blocking_threads).await {
+        let mut occ = match stand_up(cfg, Arc::clone(&reporter), budget.max_blocking_threads).await
+        {
             Ok(o) => o,
             Err(e) => {
                 reporter.not_run("mesh.standup", e);
@@ -6266,6 +6279,7 @@ fn main() -> std::process::ExitCode {
             }),
         );
 
+        let reack = occ.reack.take();
         let outcome = match role {
             Role::Publisher => run_publisher(occ).await,
             Role::Relay => run_relay(occ).await,
@@ -6274,6 +6288,10 @@ fn main() -> std::process::ExitCode {
         };
         if let Err(e) = outcome {
             reporter.not_run("mesh.role_completion", e);
+        }
+        if let Some(reack) = reack {
+            let stopped = reack.stop().await;
+            tracing::info!(stopped, "holding-claim re-ack sweeper stopped");
         }
 
         let (any, all_ok) = reporter.verdict();
@@ -6400,7 +6418,7 @@ mod tests {
 
         // CIRISEdge#768 — the NODE: its edge signer (the transport's), and the
         // persist signer the content engine is built from it with, name ONE
-        // id, so the engine's `holds_bytes` claims name the key peers dial.
+        // id, so the engine's holding claims name the key peers dial.
         let fed = FedKey::from_root_seed([9u8; 32]);
         let node = fed.identity_signer("sub-1").expect("node signer");
         assert_eq!(node.key_id, fed.derived_key_id("sub-1").unwrap());
