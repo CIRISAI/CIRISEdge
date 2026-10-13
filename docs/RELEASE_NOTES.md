@@ -1,5 +1,19 @@
 # CIRISEdge Release Notes
 
+# v41.1.0 — membership at the affiliations tier
+
+**2026-10-13.** **MINOR** from v41.0.0. `membership::GroupScope` gains **`Affiliations`**
+(`cohort_scope: affiliations`). persist v54.0.0 (CIRISPersist#1034, CC 4.4.3.2.8) refuses a
+membership proposal for a group declared `affiliations` when it is addressed as `community`
+(`federation_affiliation_cohort_mismatch`). On v41.0.0 a host could only address an affiliation as a
+community, and `GroupScope::of_row` returned `None` for an `affiliations` row, so the invite list,
+accept and widen paths could not see one. An affiliation is a community record and runs the
+community machinery at its own tier, so `Affiliations` names its group with `community_key_id` and
+widens through the community roster, exactly as `Community` does. A host passes the room's declared
+tier. **API:** `GroupScope` gains a variant. An exhaustive `match` on it outside edge needs an
+`Affiliations` arm (CIRISServer is the one known consumer, and asked for it). No pin changes.
+Ladder triple: **edge v41.1.0 · persist v55.0.0 · verify v20.1.0** (leviculum v0.30.0+ciris.1).
+
 # v41.0.0 — persist v55.0.0 + CIRISVerify v20.1.0: one holding claim, key grants as rows, typed refusals that park or end, and the P0 telemetry on main
 
 **2026-10-13.** **MAJOR** from v40.1.0. Edge adopts persist v55.0.0 (CIRISConstitution v1.0-rc7,
