@@ -339,11 +339,12 @@ impl AvPublisher {
     /// # Errors
     ///
     /// [`AvRuntimeError::Dispatcher`] on outer-seal / transport-send
-    /// failure (fan-out stops at the first failing subscriber).
+    /// failure (every subscriber is attempted; the first error is returned).
+    /// `Ok` counts the subscribers still on the roster: one whose link is
+    /// gone is pruned by the fan-out (CIRISEdge#805 item 8).
     pub async fn dispatch_inner(&mut self, inner: InnerSealed) -> Result<usize, AvRuntimeError> {
-        let reached = self.dispatcher.subscriber_count();
         self.dispatcher.publish_inner(inner).await?;
-        Ok(reached)
+        Ok(self.dispatcher.subscriber_count())
     }
 
     /// Publish an opaque chunk with the substrate default codec + layer.
@@ -1002,7 +1003,7 @@ mod leviculum_link {
 
             let Some(channel_limit) = self.channel_limit() else {
                 self.count(crate::observability::AV_SEND_LINK_GONE);
-                return Err(AvDispatcherError::SendFailed(format!(
+                return Err(AvDispatcherError::LinkGone(format!(
                     "leviculum link {:?} is no longer held — no Channel to send on",
                     self.link_id
                 )));
