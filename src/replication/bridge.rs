@@ -12045,6 +12045,47 @@ pub(crate) mod tests {
         ]);
     }
 
+    /// persist v55.0.0 (#753) — `ledger:*` rows reach the attestation door
+    /// with two new refusals, where they were `namespace_family_unregistered`
+    /// before. A signer that does not act for the attested owner is persist's
+    /// RETRYABLE `federation_signer_not_acting_for` (plane `"ledger"`): it
+    /// parks on the held signer like every other acts-for refusal, never
+    /// terminal. A row breaking its L1 triple binding is
+    /// `ledger_l1_binding_violation`: terminal.
+    #[test]
+    fn v55_ledger_refusals_follow_persists_dispositions() {
+        use ciris_persist::federation::admission;
+        use ciris_persist::federation::Error as E;
+        let (_backend, bridge) = make_bridge(&[]);
+        let acts_for = E::SignerDoesNotActFor {
+            attesting_key_id: "ledger-signer".to_owned(),
+            identity_key_id: "ledger-owner".to_owned(),
+            plane: "ledger",
+        };
+        assert_eq!(acts_for.kind(), "federation_signer_not_acting_for");
+        match bridge.refuse("Attestation", "h", &acts_for) {
+            ApplyOutcome::Refused {
+                retry,
+                awaits_signer,
+                ..
+            } => {
+                assert_eq!(retry, RetryDisposition::Transient);
+                assert_eq!(
+                    awaits_signer,
+                    Some(AwaitedSigner::ActsFor("ledger-signer".to_owned()))
+                );
+            }
+            other => panic!("a ledger acts-for refusal must be Refused: {other:?}"),
+        }
+        assert_v55_dispositions(vec![(
+            E::DimensionRejected {
+                dimension: "ledger:head:hours:v1".to_owned(),
+                reason: admission::LEDGER_BINDING_REASON,
+            },
+            RetryDisposition::Terminal,
+        )]);
+    }
+
     /// persist v55.0.0 (#1055, #1007) — the purge and takedown verdicts.
     /// Terminal: a terminal `purge_unauthorised` reason and the takedown tokens
     /// but `takedown_content_unbound`. Transient: a retryable
