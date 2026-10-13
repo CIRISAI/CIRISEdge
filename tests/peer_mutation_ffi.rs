@@ -741,3 +741,43 @@ async fn the_uniffi_snapshot_carries_both_pressure_signals_and_refreshes_first_8
         t.abort();
     }
 }
+
+/// CIRISEdge#805 — the A/V plane ledger reaches the UniFFI counters as
+/// `av_plane.<label>`, beside the Rust snapshot and the pyo3 dict: a counter
+/// in one binding and not the other is invisible to mobile operators (the
+/// #810 class).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_uniffi_snapshot_carries_the_av_plane_ledger_805() {
+    let _guard = ffi_test_lock().lock().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (backend, _existing) = fresh_backend().await;
+    let transport = Arc::new(RecordingTransport {
+        attached: std::sync::Mutex::new(None),
+        evictions_to_report: 0,
+    });
+    let edge = Arc::new(
+        build_edge_with_transport(tmp.path(), backend, transport.clone() as Arc<dyn Transport>)
+            .await,
+    );
+    ciris_edge::ffi::uniffi_impl::install_edge_handle(&edge);
+    let m = edge.metrics();
+    m.inc_av_plane(ciris_edge::observability::AV_INBOUND_DELIVERED);
+    m.inc_av_plane(ciris_edge::observability::AV_INBOUND_DELIVERED);
+    m.inc_av_plane(ciris_edge::observability::AV_SEND_REFUSED_CHUNK_TOO_LARGE);
+
+    let snap = ciris_edge::ffi::uniffi_impl::metrics_snapshot().expect("snapshot");
+    assert_eq!(
+        snap.counters.get("av_plane.av_inbound_delivered").copied(),
+        Some(2),
+        "the A/V ledger reaches the UniFFI counters: {:?}",
+        snap.counters
+    );
+    assert_eq!(
+        snap.counters
+            .get("av_plane.av_send_refused_chunk_too_large")
+            .copied(),
+        Some(1),
+        "{:?}",
+        snap.counters
+    );
+}

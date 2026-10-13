@@ -428,6 +428,13 @@ pub enum RealtimeAvError {
 /// there). This edge-newtyped wrapper delegates to it byte-for-byte —
 /// `StreamId`/`Epoch`/`ChunkSeq` are edge-only newtypes so a plain
 /// re-export is not type-compatible.
+///
+/// verify v20.0.0 deprecated `inner_nonce`: CIRISConstitution#140 rules the
+/// inner seal is the CC 5.3.3.1 STREAM nonce (`av_inner_nonce`, which needs the
+/// epoch DEK, the epoch-local counter and `last`). That switch changes the
+/// sealed bytes and lands with the A/V spine (#805), not with a pin bump, so
+/// this keeps the v19 construction byte-for-byte until then.
+#[allow(deprecated)]
 pub fn derive_inner_nonce(stream_id: StreamId, epoch: Epoch, chunk_seq: ChunkSeq) -> [u8; 12] {
     ciris_verify_core::holonomic::av_chunk::inner_nonce(&stream_id.0, epoch.0, chunk_seq.0)
 }

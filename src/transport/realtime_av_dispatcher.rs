@@ -63,6 +63,40 @@ use super::realtime_av::{
 /// for every transport.
 pub type PeerKeyId = String;
 
+/// CIRISEdge#720 — an A/V wire frame larger than the link Channel will carry.
+///
+/// A link-Channel send accepts `link_mdu − CHANNEL_ENVELOPE_HEADER_SIZE`
+/// bytes (the #716 six-byte margin: 425 on a base-MTU 500 link). Anything
+/// larger is refused by leviculum as `TooLarge` and folded into a generic
+/// `LinkFailed` on the way out, which is how an oversized chunk used to
+/// read as [`AvDispatcherError::SendFailed`]. A sender that knows its
+/// link's limit checks BEFORE handing the bytes over and refuses with
+/// this, so the producer learns the one thing it can act on — cut the
+/// chunk smaller — instead of seeing a link failure that is not one.
+///
+/// Nothing was handed to the transport: the refusal is final for this
+/// frame and says nothing about the link's health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkTooLarge {
+    /// The wire frame the caller tried to send (sealed chunk, both AEAD
+    /// layers, header included).
+    pub frame_bytes: usize,
+    /// The most this link's Channel carries in one message.
+    pub channel_limit: usize,
+}
+
+impl std::fmt::Display for ChunkTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "A/V frame of {} bytes exceeds the link Channel's {}-byte payload limit \
+             (link MDU minus the Channel envelope header, CIRISEdge#720/#716) — cut the \
+             chunk smaller; it was NOT sent",
+            self.frame_bytes, self.channel_limit
+        )
+    }
+}
+
 /// Errors the dispatcher surface can return.
 #[derive(thiserror::Error, Debug)]
 pub enum AvDispatcherError {
@@ -90,6 +124,12 @@ pub enum AvDispatcherError {
     /// edge's, computed from Reticulum's curve.
     #[error("link is applying backpressure (leviculum#66); defer, do not retry at rate")]
     Congested,
+    /// CIRISEdge#720 — the frame is larger than the link's Channel carries.
+    /// Refused before the transport saw it; see [`ChunkTooLarge`]. Like
+    /// [`Self::Congested`] and unlike [`Self::SendFailed`], nothing left
+    /// the process.
+    #[error("{0}")]
+    ChunkTooLarge(ChunkTooLarge),
     /// A caller-supplied [`AvLinkReceiver::recv`] failed.
     #[error("transport recv failed: {0}")]
     RecvFailed(String),
@@ -114,6 +154,24 @@ pub enum AvDispatcherError {
     /// has no downstream link for.
     #[error("subscriber not found: {0:?}")]
     SubscriberNotFound(PeerKeyId),
+}
+
+/// Open a hop's outer AEAD at the first counter in
+/// [`hop_counter_candidates`] that authenticates, returning the counter
+/// it opened at and the still-E2E-sealed inner chunk. `None` when no
+/// candidate opens (a corrupt, foreign or replayed frame): the caller
+/// skips the frame and keeps its counter.
+#[must_use]
+pub fn open_hop_outer(
+    sealed: &SealedAvChunk,
+    transit_key: &[u8; 32],
+    link_id: &[u8],
+    next_link_seq: u64,
+    dropped_before: u64,
+) -> Option<(u64, InnerSealed)> {
+    open_at_first_counter(next_link_seq, dropped_before, |c| {
+        open_av_outer(sealed, transit_key, link_id, c).ok()
+    })
 }
 
 /// The role a dispatcher instance plays in the A/V wire path. Selects
@@ -155,6 +213,115 @@ pub trait AvLinkSender: Send + Sync + 'static {
 pub trait AvLinkReceiver: Send + Sync + 'static {
     /// Pull the next inbound wire frame.
     async fn recv(&self) -> Result<Vec<u8>, AvDispatcherError>;
+
+    /// Pull the next inbound wire frame together with how many frames the
+    /// transport DROPPED on this link immediately before it.
+    ///
+    /// A hop's outer nonce is a dense per-link counter that is not on the
+    /// wire, so a frame dropped below the dispatcher (an overflowing
+    /// inbound queue — CIRISEdge#805's never-block drop policy) would
+    /// otherwise desync every later frame on the hop. A receiver that
+    /// drops reports the count here and the open loops skip the counter
+    /// past it ([`hop_counter_candidates`]). The default reports no gap,
+    /// which is exact for a receiver that never drops.
+    async fn recv_frame(&self) -> Result<InboundWireFrame, AvDispatcherError> {
+        Ok(InboundWireFrame {
+            dropped_before: 0,
+            bytes: self.recv().await?,
+        })
+    }
+}
+
+/// One inbound wire frame and the drops that preceded it (see
+/// [`AvLinkReceiver::recv_frame`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundWireFrame {
+    /// Frames the transport dropped on this link since the previous frame
+    /// it delivered.
+    pub dropped_before: u64,
+    /// The frame.
+    pub bytes: Vec<u8>,
+}
+
+/// Extra hop-counter values an open loop tries PAST the reported gap.
+///
+/// The reported gap is exact for drops the receiver made, but a counter
+/// can also be burned on the SEND side without a frame (a relay leg whose
+/// caller's send was refused after `RelayNode::forward` advanced it). This
+/// slack recovers up to this many such burned counters beyond the gap.
+pub const HOP_COUNTER_RESYNC_SLACK: u64 = 8;
+
+/// The most AEAD opens one frame can cost, WHATEVER the reported gap: the
+/// counter past the gap, the expected counter, and the slack past the gap
+/// ([`hop_counter_candidates`]). A junk frame after a burst of a thousand
+/// drops costs exactly this many opens, not a thousand.
+pub const HOP_COUNTER_MAX_OPENS: u64 = HOP_COUNTER_RESYNC_SLACK + 2;
+
+/// The hop counters an open loop tries for a frame, most likely first, and
+/// never more than [`HOP_COUNTER_MAX_OPENS`] of them:
+///
+/// 1. `skipped = next + dropped_before` — the counter past the frames the
+///    receiver itself dropped;
+/// 2. `next` — the expected counter, for a gap report that over-counted (a
+///    dropped JUNK frame never took a counter, so the next real frame is
+///    still at `next`);
+/// 3. `skipped + 1 ..= skipped + SLACK` — counters burned on the send side.
+///
+/// The counters strictly between `next` and `skipped` are NOT tried: they
+/// belong to frames the receiver dropped, which are gone and never come
+/// back. Never a counter below `next`, so a replayed frame never opens.
+pub fn hop_counter_candidates(next: u64, dropped_before: u64) -> impl Iterator<Item = u64> {
+    let skipped = next.saturating_add(dropped_before);
+    let expected = (skipped != next).then_some(next);
+    std::iter::once(skipped)
+        .chain(expected)
+        .chain((1..=HOP_COUNTER_RESYNC_SLACK).map_while(move |k| skipped.checked_add(k)))
+}
+
+/// The drop report a hop has not yet resolved (Codex on #813).
+///
+/// A receiver reports the frames it dropped ONCE, on the next frame it
+/// queues, and then resets its own count. If that frame cannot be parsed or
+/// opened — a junk frame from the peer, a corrupt one — the report must
+/// survive it: discarding it leaves the next real frame reporting zero while
+/// the sender's counter is past the slack, and every later frame on the hop
+/// then fails authentication. So an open loop folds each frame's report in
+/// here and spends it only when a frame authenticates.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HopGap {
+    pending: u64,
+}
+
+impl HopGap {
+    /// Fold in the drops reported with the frame just received; the gap to
+    /// try this frame at.
+    pub fn report(&mut self, dropped_before: u64) -> u64 {
+        self.pending = self.pending.saturating_add(dropped_before);
+        self.pending
+    }
+
+    /// A frame authenticated: the gap is resolved.
+    pub fn resolved(&mut self) {
+        self.pending = 0;
+    }
+
+    /// The gap still unresolved.
+    #[must_use]
+    pub const fn pending(&self) -> u64 {
+        self.pending
+    }
+}
+
+/// Open a frame at the first of its [`hop_counter_candidates`] that
+/// authenticates: the counter it opened at and what `open` returned. The
+/// one place both open loops (subscriber, relay) pick a counter, so the
+/// [`HOP_COUNTER_MAX_OPENS`] bound holds for both.
+pub fn open_at_first_counter<T>(
+    next_link_seq: u64,
+    dropped_before: u64,
+    mut open: impl FnMut(u64) -> Option<T>,
+) -> Option<(u64, T)> {
+    hop_counter_candidates(next_link_seq, dropped_before).find_map(|c| open(c).map(|t| (c, t)))
 }
 
 /// One downstream subscriber link the dispatcher fans out onto. The
@@ -391,6 +558,20 @@ impl AvDispatcher {
         self.fan_out(&inner).await
     }
 
+    /// Relay path for a chunk whose outer layer the caller already opened
+    /// ([`open_hop_outer`]): fan the recovered [`InnerSealed`] out to every
+    /// downstream subscriber. Split from [`Self::relay_chunk`] so a pump can
+    /// advance its inbound counter on the OPEN, independent of whether the
+    /// downstream fan-out then succeeds — an opened frame consumed its
+    /// counter whatever happens after.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::publish_inner`].
+    pub async fn relay_inner(&mut self, inner: InnerSealed) -> Result<(), AvDispatcherError> {
+        self.fan_out(&inner).await
+    }
+
     /// Shared outer-seal-and-send fan-out used by both the publisher and
     /// relay paths. Visits every downstream subscriber, seals with its
     /// per-link state, advances its `link_seq`, and sends.
@@ -399,11 +580,26 @@ impl AvDispatcher {
             let link_seq = state.next_link_seq;
             let sealed = seal_av_outer(inner, &state.transit_key, &state.link_id, link_seq)
                 .map_err(|e| AvDispatcherError::ForwardFailed(e.to_string()))?;
-            // Advance only after a successful seal — a seal failure
-            // (handled above by early return) must leave the counter
-            // idle so no nonce is burned.
-            state.next_link_seq = state.next_link_seq.wrapping_add(1);
-            state.sender.send(&sealed.to_bytes()).await?;
+            // The counter advances iff the bytes may have reached the wire.
+            // A seal failure (above) and a send the link REFUSED before
+            // taking anything — backpressure (#591) or a frame larger than
+            // its Channel (#720) — leave it idle: the refused ciphertext
+            // never left the process, so re-using its nonce for the next
+            // frame discloses nothing, and burning it would desync the
+            // receiver's dense counter for the rest of the hop. A send that
+            // failed any other way is ambiguous (the bytes may be out), so
+            // its counter is spent — a nonce that might have been emitted is
+            // never used twice.
+            match state.sender.send(&sealed.to_bytes()).await {
+                Ok(()) => state.next_link_seq = state.next_link_seq.wrapping_add(1),
+                Err(e @ (AvDispatcherError::Congested | AvDispatcherError::ChunkTooLarge(_))) => {
+                    return Err(e);
+                }
+                Err(e) => {
+                    state.next_link_seq = state.next_link_seq.wrapping_add(1);
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }
@@ -441,17 +637,21 @@ impl AvDispatcher {
             tokio::spawn(async move {
                 let dek = dek_bytes.map(EpochDek::from_bytes);
                 let mut next_link_seq: u64 = 0;
+                let mut gap = HopGap::default();
                 loop {
                     // A permanently-closed link surfaces as a recv error;
                     // exit the loop. A transient error also lands here —
                     // the resilient contract is "drop the frame and stop
                     // pulling from a dead link", since the caller's
                     // transport owns reconnection.
-                    let Ok(bytes) = link.inbound_recv.recv().await else {
+                    let Ok(frame) = link.inbound_recv.recv_frame().await else {
                         break;
                     };
+                    // The drop report rides THIS frame; it is kept until a
+                    // frame authenticates, whatever happens to this one.
+                    let dropped_before = gap.report(frame.dropped_before);
                     // Malformed wire — skip this frame, keep pulling.
-                    let Ok(sealed) = SealedAvChunk::from_bytes(&bytes) else {
+                    let Ok(sealed) = SealedAvChunk::from_bytes(&frame.bytes) else {
                         continue;
                     };
                     let Some(dek) = dek.as_ref() else {
@@ -459,20 +659,21 @@ impl AvDispatcher {
                         // subscriber). Skip — nothing to open with.
                         continue;
                     };
-                    // AEAD open failed — skip this frame WITHOUT advancing
-                    // the anti-replay counter, so a single corrupt /
-                    // duplicate frame doesn't desync the keystream for
-                    // subsequent good frames.
-                    let Ok(plaintext) = open_av_chunk(
-                        &sealed,
-                        &link.transit_key,
-                        &link.link_id,
-                        next_link_seq,
-                        dek,
-                    ) else {
+                    // AEAD open failed at every candidate counter — skip
+                    // this frame WITHOUT advancing the anti-replay counter,
+                    // so a single corrupt / duplicate frame doesn't desync
+                    // the keystream for subsequent good frames. A frame the
+                    // transport dropped before this one moves the counter
+                    // past it (CIRISEdge#805), never below `next_link_seq`.
+                    let Some((used, plaintext)) =
+                        open_at_first_counter(next_link_seq, dropped_before, |c| {
+                            open_av_chunk(&sealed, &link.transit_key, &link.link_id, c, dek).ok()
+                        })
+                    else {
                         continue;
                     };
-                    next_link_seq = next_link_seq.wrapping_add(1);
+                    next_link_seq = used.wrapping_add(1);
+                    gap.resolved();
                     let chunk = ReconstructedChunk {
                         stream_id: sealed.stream_id,
                         epoch: sealed.epoch,
@@ -581,6 +782,269 @@ mod tests {
             r,
             Err(AvDispatcherError::PublisherMissingEpochDek)
         ));
+    }
+
+    // ── CIRISEdge#805 / #720 — the hop counter around refusals and drops ──
+
+    use crate::transport::realtime_av::{seal_av_inner, ChunkLayer, CODEC_OPAQUE};
+
+    /// A sender with a Channel limit: refuses larger frames as
+    /// `ChunkTooLarge` (nothing sent), forwards the rest.
+    struct LimitedSender {
+        limit: usize,
+        tx: mpsc::UnboundedSender<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AvLinkSender for LimitedSender {
+        async fn send(&self, bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            if bytes.len() > self.limit {
+                return Err(AvDispatcherError::ChunkTooLarge(ChunkTooLarge {
+                    frame_bytes: bytes.len(),
+                    channel_limit: self.limit,
+                }));
+            }
+            self.tx
+                .send(bytes.to_vec())
+                .map_err(|e| AvDispatcherError::SendFailed(e.to_string()))
+        }
+    }
+
+    fn inner(dek: &EpochDek, seq: u64, len: usize) -> InnerSealed {
+        seal_av_inner(
+            &vec![0x42; len],
+            dek,
+            stream(7),
+            Epoch(1),
+            ChunkSeq(seq),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
+        )
+        .expect("inner seal")
+    }
+
+    /// #720 at the 500-byte MTU: a frame over the 425-byte Channel limit is
+    /// refused by NAME, and it burns no hop counter — the next frame that
+    /// fits opens at link_seq 0, so the subscriber's dense counter never
+    /// desyncs over a refusal.
+    #[tokio::test]
+    async fn an_oversized_frame_is_refused_by_name_and_burns_no_counter() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let transit = [0x21u8; 32];
+        let mut d = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(7),
+            local_role: AvRole::Publisher,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: vec![AvSubscriberLink {
+                subscriber: "sub".to_owned(),
+                transit_key: transit,
+                link_id: b"sub".to_vec(),
+                outbound_send: Box::new(LimitedSender { limit: 425, tx }),
+            }],
+            inbound_links: vec![],
+        })
+        .expect("publisher");
+        match d.publish_inner(inner(&dek, 0, 400)).await {
+            Err(AvDispatcherError::ChunkTooLarge(r)) => {
+                assert_eq!(r.channel_limit, 425);
+                assert!(r.frame_bytes > 425, "{r:?}");
+            }
+            other => panic!("expected ChunkTooLarge, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing was sent");
+        d.publish_inner(inner(&dek, 1, 64)).await.expect("fits");
+        let wire = rx.try_recv().expect("sent");
+        let sealed = SealedAvChunk::from_bytes(&wire).expect("parse");
+        assert!(
+            open_av_chunk(&sealed, &transit, b"sub", 0, &dek).is_ok(),
+            "the first frame that went out is link_seq 0"
+        );
+    }
+
+    #[test]
+    fn hop_counter_candidates_try_the_reported_gap_first_and_never_go_back() {
+        let c: Vec<u64> = hop_counter_candidates(10, 3).collect();
+        assert_eq!(c[0], 13, "past the reported drops first");
+        assert_eq!(c[1], 10, "then the expected counter");
+        assert!(
+            !c.contains(&11) && !c.contains(&12),
+            "the dropped frames' counters are gone"
+        );
+        assert!(c.iter().all(|x| *x >= 10), "never below next: no replay");
+        assert_eq!(
+            *c.iter().max().expect("non-empty"),
+            13 + HOP_COUNTER_RESYNC_SLACK
+        );
+        let z: Vec<u64> = hop_counter_candidates(4, 0).collect();
+        assert_eq!(z[0], 4);
+        assert_eq!(
+            z.len(),
+            usize::try_from(HOP_COUNTER_RESYNC_SLACK).expect("small") + 1
+        );
+    }
+
+    /// The review's bound (#813): after a burst of 1000 reported drops, a JUNK
+    /// frame (opens at no counter) costs at most `SLACK + 2` AEAD opens —
+    /// never one per dropped frame — and the legitimate post-gap frame still
+    /// opens, on the first try, through the seam both open loops use.
+    #[test]
+    fn a_junk_frame_after_a_thousand_drops_costs_at_most_slack_plus_two_opens() {
+        let mut opens = 0u64;
+        let junk = open_at_first_counter(5, 1000, |_| {
+            opens += 1;
+            None::<()>
+        });
+        assert!(junk.is_none());
+        assert!(opens <= HOP_COUNTER_MAX_OPENS, "{opens} opens");
+        assert_eq!(opens, HOP_COUNTER_MAX_OPENS);
+
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let transit = [0x41u8; 32];
+        let sealed = seal_av_outer(&inner(&dek, 9, 32), &transit, b"me", 1005).expect("outer");
+        let mut opens = 0u64;
+        let legit = open_at_first_counter(5, 1000, |c| {
+            opens += 1;
+            open_av_chunk(&sealed, &transit, b"me", c, &dek).ok()
+        });
+        assert_eq!(legit.map(|(c, _)| c), Some(1005), "opens past the gap");
+        assert_eq!(opens, 1, "the first candidate");
+    }
+
+    /// A receiver that replays scripted frames, each with its drop report.
+    struct Scripted {
+        rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<InboundWireFrame>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AvLinkReceiver for Scripted {
+        async fn recv(&self) -> Result<Vec<u8>, AvDispatcherError> {
+            self.recv_frame().await.map(|f| f.bytes)
+        }
+        async fn recv_frame(&self) -> Result<InboundWireFrame, AvDispatcherError> {
+            self.rx
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| AvDispatcherError::RecvFailed("closed".into()))
+        }
+    }
+
+    /// CIRISEdge#805 — the never-block inbound policy drops frames; the
+    /// subscriber skips its hop counter past a REPORTED drop, and past a
+    /// small unreported one (a counter burned on the send side), instead of
+    /// failing every later frame on the hop.
+    #[tokio::test]
+    async fn the_subscriber_resyncs_past_dropped_frames() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let transit = [0x31u8; 32];
+        let wire = |chunk_seq: u64, link_seq: u64| {
+            seal_av_outer(&inner(&dek, chunk_seq, 32), &transit, b"me", link_seq)
+                .expect("outer")
+                .to_bytes()
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut d = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(7),
+            local_role: AvRole::Subscriber,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: vec![],
+            inbound_links: vec![AvInboundLink {
+                transit_key: transit,
+                link_id: b"me".to_vec(),
+                inbound_recv: Box::new(Scripted {
+                    rx: tokio::sync::Mutex::new(rx),
+                }),
+            }],
+        })
+        .expect("subscriber");
+        let mut out = d.spawn_subscriber_loop();
+        // link_seq 0; then 1–2 dropped by the transport and REPORTED; then
+        // 4 with no report (3 burned on the send side).
+        for (chunk_seq, link_seq, dropped_before) in [(0, 0, 0), (3, 3, 2), (5, 5, 0)] {
+            tx.send(InboundWireFrame {
+                dropped_before,
+                bytes: wire(chunk_seq, link_seq),
+            })
+            .expect("feed");
+        }
+        for want in [0u64, 3, 5] {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+                .await
+                .expect("in time")
+                .expect("open");
+            assert_eq!(got.chunk_seq, ChunkSeq(want));
+        }
+    }
+
+    /// Codex on #813: the drop report rides ONE frame. If that frame is junk
+    /// — unparseable, or parseable but opening at no counter — the report
+    /// must survive it, or the next real frame (reporting zero) is past the
+    /// slack and the hop fails authentication forever. Both junk shapes,
+    /// each carrying a gap larger than the slack reaches.
+    #[tokio::test]
+    async fn a_junk_frame_does_not_swallow_the_drop_report() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let transit = [0x51u8; 32];
+        let wire = |chunk_seq: u64, link_seq: u64| {
+            seal_av_outer(&inner(&dek, chunk_seq, 32), &transit, b"me", link_seq)
+                .expect("outer")
+                .to_bytes()
+        };
+        let big_gap = HOP_COUNTER_RESYNC_SLACK + 4;
+        // Parseable (header-sized) but sealed under nothing this hop knows.
+        let opaque_junk = vec![0xEE; 200];
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut d = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(7),
+            local_role: AvRole::Subscriber,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: vec![],
+            inbound_links: vec![AvInboundLink {
+                transit_key: transit,
+                link_id: b"me".to_vec(),
+                inbound_recv: Box::new(Scripted {
+                    rx: tokio::sync::Mutex::new(rx),
+                }),
+            }],
+        })
+        .expect("subscriber");
+        let mut out = d.spawn_subscriber_loop();
+        let after_first = 1 + big_gap;
+        let after_second = after_first + 1 + big_gap;
+        for (dropped_before, bytes) in [
+            (0, wire(0, 0)),
+            // 12 dropped, reported on an UNPARSEABLE frame.
+            (big_gap, b"junk".to_vec()),
+            (0, wire(1, after_first)),
+            // 12 more, reported on a parseable frame that opens nowhere.
+            (big_gap, opaque_junk),
+            (0, wire(2, after_second)),
+        ] {
+            tx.send(InboundWireFrame {
+                dropped_before,
+                bytes,
+            })
+            .expect("feed");
+        }
+        for want in 0..3u64 {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+                .await
+                .unwrap_or_else(|_| panic!("chunk {want}: the hop lost its drop report"))
+                .expect("open");
+            assert_eq!(got.chunk_seq, ChunkSeq(want));
+        }
+    }
+
+    #[test]
+    fn a_hop_gap_accumulates_until_resolved() {
+        let mut g = HopGap::default();
+        assert_eq!(g.report(3), 3);
+        assert_eq!(g.report(0), 3, "a frame with no report keeps the old one");
+        assert_eq!(g.report(2), 5);
+        g.resolved();
+        assert_eq!(g.pending(), 0);
     }
 
     /// Subscriber WITH a DEK still constructs (the inverse of the

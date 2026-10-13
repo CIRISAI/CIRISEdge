@@ -59,8 +59,11 @@
 //!
 //! Gauges:
 //!
-//! - `durable_queue_depth[DeliveryClass]` — count of currently-queued
-//!   send_durable / send_mandatory / send_federation envelopes
+//! - `durable_queue_depth` — the RESIDENT durable depth (rows `pending`,
+//!   `sending` or `awaiting_ack`), read from persist's
+//!   `OutboundQueue::outbound_counts` at snapshot time (CIRISEdge#845), not
+//!   kept here. The cumulative enqueue count per delivery class is the
+//!   counter `durable_enqueued_total[DeliveryClass]`.
 //! - `peer_reachability_ratio[(peer_key_id, medium)]` — rolling
 //!   reachability window ratio, mirror of `ReachabilityTracker::snapshot_all`
 
@@ -836,6 +839,42 @@ pub struct WithholdRecord {
 /// operator reading a snapshot, not a log. Oldest is evicted first.
 pub const RECENT_WITHHOLDS_CAP: usize = 64;
 
+// ─── CIRISEdge#805 — `EdgeMetrics::av_plane` labels ──────────────────
+
+/// A frame an A/V link's Channel accepted.
+pub const AV_SENT: &str = "av_sent";
+/// CIRISEdge#720 — a frame larger than the link Channel carries, refused by
+/// name before it reached leviculum.
+pub const AV_SEND_REFUSED_CHUNK_TOO_LARGE: &str = "av_send_refused_chunk_too_large";
+/// The link refused under backpressure (`Busy` / `PacingDelay`, #591).
+pub const AV_SEND_CONGESTED: &str = "av_send_congested";
+/// The link is no longer held — nothing to send on.
+pub const AV_SEND_LINK_GONE: &str = "av_send_link_gone";
+/// Any other send failure.
+pub const AV_SEND_FAILED: &str = "av_send_failed";
+/// A link this node dialled to a peer's A/V address, established and
+/// identified.
+pub const AV_LINK_OPENED: &str = "av_link_opened";
+/// A peer-opened A/V link handed to the A/V consumer (its first attributed
+/// frame).
+pub const AV_LINK_ARRIVED: &str = "av_link_arrived";
+/// An inbound A/V frame queued for its consumer.
+pub const AV_INBOUND_DELIVERED: &str = "av_inbound_delivered";
+/// Dropped: the consumer is a full queue behind (the never-block policy).
+pub const AV_INBOUND_DROPPED_QUEUE_FULL: &str = "av_inbound_dropped_queue_full";
+/// Dropped: the link's peer did not pass the #393 attribution gate.
+pub const AV_INBOUND_DROPPED_UNATTRIBUTED: &str = "av_inbound_dropped_unattributed";
+/// Dropped: a peer-opened A/V link arrived and nobody took the arrivals
+/// receiver (or it was dropped) — nobody ever will.
+pub const AV_INBOUND_DROPPED_NO_CONSUMER: &str = "av_inbound_dropped_no_consumer";
+/// Dropped: a peer-opened A/V link found the arrivals queue full (the consumer
+/// is behind taking links). Gap-reported to the link's first delivered frame.
+pub const AV_INBOUND_DROPPED_ARRIVALS_FULL: &str = "av_inbound_dropped_arrivals_full";
+/// Dropped: the link's consumer dropped its receiver.
+pub const AV_INBOUND_DROPPED_CONSUMER_GONE: &str = "av_inbound_dropped_consumer_gone";
+/// Dropped: a Resource completed on an A/V link (A/V rides the Channel only).
+pub const AV_INBOUND_DROPPED_RESOURCE: &str = "av_inbound_dropped_resource";
+
 /// The live counter/gauge bag every [`crate::Edge`] owns.
 ///
 /// # Concurrency
@@ -1022,19 +1061,11 @@ pub struct EdgeMetrics {
     /// Incremented in `dispatch_inbound` when `VerifyPipeline::verify`
     /// returns `Err`.
     pub verify_failures_total: Arc<RwLock<HashMap<VerifyErrorClass, u64>>>,
-    /// Gauge — current count of in-flight durable-class envelopes
-    /// per delivery class. Incremented at enqueue, decremented at
-    /// dispatch (success OR terminal abandon).
-    ///
-    /// **Note**: v0.19.0 wires the increment side only — the
-    /// dispatcher's terminal-state handling lives on persist's
-    /// `OutboundHandle` surface, and the bookkeeping there isn't
-    /// edge-internal. The gauge captures cumulative enqueues and
-    /// consumers diff it against the persist-side `queue_depth` UDL
-    /// read for the resident count. The metric name was held stable
-    /// for downstream consumers; the semantic gap is documented on
-    /// the pymethod surface.
-    pub durable_queue_depth: Arc<RwLock<HashMap<DeliveryClass, u64>>>,
+    /// Counter — cumulative durable enqueues per delivery class, never
+    /// decremented. Until CIRISEdge#845 this was reported under the name
+    /// `durable_queue_depth`; the resident depth now comes from persist's
+    /// `outbound_counts` (see [`crate::outbound::resident_depth`]).
+    pub durable_enqueued_total: Arc<RwLock<HashMap<DeliveryClass, u64>>>,
     /// Per-transport byte count for inbound frames. Incremented by
     /// the inbound listener side when it pushes an [`crate::transport::InboundFrame`].
     pub transport_bytes_in_total: Arc<RwLock<HashMap<TransportId, u64>>>,
@@ -1123,6 +1154,14 @@ pub struct EdgeMetrics {
     /// `first_contact_unsolicited_introductions` on the requester's side. The
     /// refusals are drops; this ledger is how an operator reads them.
     pub first_contact_outcomes: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#805 item 4 — the A/V plane on the live node, by label
+    /// (`AV_*` constants in this module): frames sent on A/V links and each
+    /// way a send was refused (`av_send_refused_chunk_too_large` is the
+    /// #720 named refusal), A/V links that arrived, frames delivered to the
+    /// transport's A/V sink, and each way an inbound A/V frame was dropped
+    /// (`av_inbound_dropped_queue_full` is the never-block overflow policy).
+    /// Every `av_inbound_dropped_*` label is a drop.
+    pub av_plane: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#640 — blob holders dropped from a pull's candidate set, by the
     /// router's refusal BRANCH (`ScopeRouteRefusal::reason_tag`):
     /// `blob_group_not_installed` (the host's lifecycle never installed the
@@ -1385,6 +1424,24 @@ pub struct EdgeMetrics {
     /// Booked at the bridge's single `refuse` site, alongside — never instead
     /// of — the kind axis, so a class-carrying refusal appears on both.
     pub apply_refusals_by_class: Arc<RwLock<HashMap<String, u64>>>,
+    /// CIRISEdge#858 — the refusal memory's park ledger (the bridge kept
+    /// these as accessors only, so no scrape could see a park hold or fail):
+    /// rows PARKED on a signer, per plane, since start (an absent `Key`, or an
+    /// occurrence signer whose standing has not landed).
+    pub rows_parked_on_signer: Arc<RwLock<HashMap<EnvelopeKind, u64>>>,
+    /// CIRISEdge#858 — rows RELEASED from a park since start (a `Key` admit, a
+    /// binding / occurrence admit, or the host's `release_signer` hook).
+    pub signer_releases: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#858 — wanted hashes the refusal memory dropped from a round's
+    /// `want` since start: the traffic that did NOT happen.
+    pub retry_suppressions: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#858 — parks the park capacity evicted since start; each costs
+    /// one re-ask of a row that still cannot verify.
+    pub signer_park_evictions: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#858 — gauges, set by the bridge after every change to the
+    /// memory: `(rows remembered, total capacity, rows parked on a signer,
+    /// park capacity)`. Read as [`Self::refusal_memory`].
+    pub refusal_memory: Arc<RwLock<RefusalMemoryGauges>>,
     /// CIRISEdge#441 — the removal-receipt ledger (revocation-class rows'
     /// per-peer delivery states; the pull-plane's missing arrival
     /// instrument). Fed by the bridge's serve exit (offers) + the
@@ -1413,6 +1470,13 @@ pub struct EdgeMetrics {
     /// CIRISEdge#853 — link-ups in progress: link id → when it established.
     /// Bounded by [`RESPONDER_LINK_UP_TRACKED_MAX`].
     pub responder_link_up_pending: Arc<RwLock<HashMap<[u8; 16], std::time::Instant>>>,
+    /// CIRISEdge#853 — links whose `LinkEstablished` this node never processed
+    /// (dropped at a full control plane) and whose bookkeeping was rebuilt from
+    /// a later per-link event. Non-zero means establish events are being lost.
+    pub recovered_links_total: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#853 — ships refused because their lane was already claimed by
+    /// another transfer. Unreachable by construction; non-zero is a regression.
+    pub unclaimed_ship_refused_total: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A `&'static str`-keyed counter map, cloned out with owned keys for the
@@ -1479,9 +1543,9 @@ impl EdgeMetrics {
         *guard.entry(transport).or_insert(0) += bytes;
     }
 
-    /// Record an enqueue against the durable-queue gauge.
-    pub fn inc_durable_queue(&self, class: DeliveryClass) {
-        let mut guard = self.durable_queue_depth.write();
+    /// Record an enqueue against the cumulative durable-enqueue counter.
+    pub fn inc_durable_enqueued(&self, class: DeliveryClass) {
+        let mut guard = self.durable_enqueued_total.write();
         *guard.entry(class).or_insert(0) += 1;
     }
 
@@ -1676,6 +1740,22 @@ impl EdgeMetrics {
     #[must_use]
     pub fn transport_inbound_drops(&self) -> HashMap<String, u64> {
         self.transport_inbound_drops
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#805 — count one A/V-plane event by its `AV_*` label.
+    pub fn inc_av_plane(&self, label: &'static str) {
+        *self.av_plane.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#805 — the A/V-plane ledger by label (tests + the operator
+    /// readback).
+    #[must_use]
+    pub fn av_plane(&self) -> HashMap<String, u64> {
+        self.av_plane
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -2063,12 +2143,94 @@ impl EdgeMetrics {
         *guard.entry(token.to_string()).or_insert(0) += 1;
     }
 
+    /// CIRISEdge#858 — count one row parked on a signer on `kind`.
+    pub fn inc_rows_parked_on_signer(&self, kind: EnvelopeKind) {
+        *self.rows_parked_on_signer.write().entry(kind).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#858 — count `n` rows released from a park.
+    pub fn add_signer_releases(&self, n: u64) {
+        self.signer_releases
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#858 — count one wanted hash dropped by the refusal memory.
+    pub fn inc_retry_suppressions(&self) {
+        self.retry_suppressions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#858 — count `n` parks evicted by the park capacity.
+    pub fn add_signer_park_evictions(&self, n: u64) {
+        self.signer_park_evictions
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#858 — set the refusal-memory gauges.
+    pub fn set_refusal_memory(&self, gauges: RefusalMemoryGauges) {
+        *self.refusal_memory.write() = gauges;
+    }
+
+    /// CIRISEdge#858 — the refusal-memory gauges as last set.
+    #[must_use]
+    pub fn refusal_memory(&self) -> RefusalMemoryGauges {
+        *self.refusal_memory.read()
+    }
+
+    /// CIRISEdge#858 — rows released from a park since start.
+    #[must_use]
+    pub fn signer_releases(&self) -> u64 {
+        self.signer_releases
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#858 — wanted hashes dropped by the refusal memory since start.
+    #[must_use]
+    pub fn retry_suppressions(&self) -> u64 {
+        self.retry_suppressions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#858 — parks evicted by the park capacity since start.
+    #[must_use]
+    pub fn signer_park_evictions(&self) -> u64 {
+        self.signer_park_evictions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Update the per-peer reachability ratio gauge. Replaces (does
     /// not accumulate) — the underlying tracker computes the rolling
     /// ratio and the gauge mirrors it.
     pub fn set_peer_reachability(&self, peer_key_id: &str, medium: &str, ratio: f64) {
         let mut guard = self.peer_reachability_ratio.write();
         guard.insert((peer_key_id.to_string(), medium.to_string()), ratio);
+    }
+
+    /// CIRISEdge#853 — one link's bookkeeping rebuilt after a lost
+    /// `LinkEstablished`.
+    pub fn inc_recovered_links(&self) {
+        self.recovered_links_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 — a ship refused on a lane another transfer holds.
+    pub fn inc_unclaimed_ship_refused(&self) {
+        self.unclaimed_ship_refused_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 — read `unclaimed_ship_refused_total`.
+    #[must_use]
+    pub fn unclaimed_ship_refused_total(&self) -> u64 {
+        self.unclaimed_ship_refused_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// CIRISEdge#853 — read `recovered_links_total`.
+    #[must_use]
+    pub fn recovered_links_total(&self) -> u64 {
+        self.recovered_links_total
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// CIRISEdge#853 — count one responder round lifecycle `outcome` (one of
@@ -2196,6 +2358,10 @@ impl EdgeMetrics {
     /// fresh clone of the live state; the live map is unlocked
     /// immediately after the clone so emitters aren't blocked across
     /// the projection step.
+    // A flat field-by-field projection, one line per counter family; it
+    // grows with every counter until CIRISEdge#848's bundle-fields macro
+    // generates it. Straight-line, nothing to factor.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn snapshot(&self) -> EdgeMetricsBundle {
         EdgeMetricsBundle {
@@ -2203,7 +2369,7 @@ impl EdgeMetrics {
             envelopes_received_total: self.envelopes_received_total.read().clone(),
             send_failures_total: self.send_failures_total.read().clone(),
             verify_failures_total: self.verify_failures_total.read().clone(),
-            durable_queue_depth: self.durable_queue_depth.read().clone(),
+            durable_enqueued_total: self.durable_enqueued_total.read().clone(),
             transport_bytes_in_total: self.transport_bytes_in_total.read().clone(),
             transport_bytes_out_total: self.transport_bytes_out_total.read().clone(),
             peer_reachability_ratio: self.peer_reachability_ratio.read().clone(),
@@ -2255,6 +2421,7 @@ impl EdgeMetrics {
                 .map(|(k, v)| ((*k).to_string(), *v))
                 .collect(),
             transport_inbound_drops: self.transport_inbound_drops(),
+            av_plane: self.av_plane(),
             first_contact_outcomes: self
                 .first_contact_outcomes
                 .read()
@@ -2291,6 +2458,14 @@ impl EdgeMetrics {
                 .read()
                 .clone(),
             apply_refusals_by_class: self.apply_refusals_by_class.read().clone(),
+            rows_parked_on_signer: self.rows_parked_on_signer.read().clone(),
+            signer_releases: self.signer_releases(),
+            retry_suppressions: self.retry_suppressions(),
+            signer_park_evictions: self.signer_park_evictions(),
+            refusal_memory_len: self.refusal_memory().len,
+            refusal_memory_capacity: self.refusal_memory().capacity,
+            parked_on_signer_len: self.refusal_memory().parked_on_signer_len,
+            parked_on_signer_capacity: self.refusal_memory().parked_on_signer_capacity,
             replication_applied_total: self.replication_applied_total.read().clone(),
             replication_duplicate_total: self.replication_duplicate_total.read().clone(),
             removal_delivery: self.removal_receipts.read().delta(),
@@ -2425,6 +2600,21 @@ fn link_closed_by_cause(
         .collect()
 }
 
+/// CIRISEdge#858 — the replication refusal memory's size and bounds. A gauge
+/// set by the one production bridge after every change to the memory, so the
+/// snapshot is current without reaching into the replication runtime.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RefusalMemoryGauges {
+    /// Rows remembered as refused, both classes (`refusal_memory_len`).
+    pub len: u64,
+    /// The bound on `len`: the ordinary cap plus the park cap.
+    pub capacity: u64,
+    /// Rows parked on a signer right now (`parked_on_signer_len`).
+    pub parked_on_signer_len: u64,
+    /// The bound on `parked_on_signer_len`.
+    pub parked_on_signer_capacity: u64,
+}
+
 /// Point-in-time projection of [`EdgeMetrics`]. Returned by
 /// [`EdgeMetrics::snapshot`]; consumed by the PyO3 / UniFFI projection
 /// methods. Owned `HashMap`s — emitters can keep writing through the
@@ -2435,7 +2625,7 @@ pub struct EdgeMetricsBundle {
     pub envelopes_received_total: HashMap<MessageType, u64>,
     pub send_failures_total: HashMap<(TransportId, String), u64>,
     pub verify_failures_total: HashMap<VerifyErrorClass, u64>,
-    pub durable_queue_depth: HashMap<DeliveryClass, u64>,
+    pub durable_enqueued_total: HashMap<DeliveryClass, u64>,
     pub transport_bytes_in_total: HashMap<TransportId, u64>,
     pub transport_bytes_out_total: HashMap<TransportId, u64>,
     pub peer_reachability_ratio: HashMap<(String, String), f64>,
@@ -2479,6 +2669,8 @@ pub struct EdgeMetricsBundle {
     pub transport_inbound_drops: HashMap<String, u64>,
     /// CIRISEdge#683 — the opaque-plane first-contact door by label.
     pub first_contact_outcomes: HashMap<String, u64>,
+    /// CIRISEdge#805 — the A/V plane on the live node by `AV_*` label.
+    pub av_plane: HashMap<String, u64>,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
     pub replication_routed_to_responder_total: u64,
     /// CIRISEdge#634 — replies routed into an initiator's round inbox.
@@ -2548,6 +2740,23 @@ pub struct EdgeMetricsBundle {
     /// [`EdgeMetrics::apply_refusals_by_class`]: the three v38.2.0 apply-door
     /// classes by their stable tokens.
     pub apply_refusals_by_class: HashMap<String, u64>,
+    /// CIRISEdge#858 — rows parked on a signer since start, per plane.
+    pub rows_parked_on_signer: HashMap<EnvelopeKind, u64>,
+    /// CIRISEdge#858 — rows released from a park since start.
+    pub signer_releases: u64,
+    /// CIRISEdge#858 — wanted hashes dropped by the refusal memory since start.
+    pub retry_suppressions: u64,
+    /// CIRISEdge#858 — parks evicted by the park capacity since start.
+    pub signer_park_evictions: u64,
+    /// CIRISEdge#858 — rows remembered as refused (both classes), as last
+    /// set by the bridge.
+    pub refusal_memory_len: u64,
+    /// CIRISEdge#858 — the bound on `refusal_memory_len` (ordinary + park cap).
+    pub refusal_memory_capacity: u64,
+    /// CIRISEdge#858 — rows parked on a signer right now.
+    pub parked_on_signer_len: u64,
+    /// CIRISEdge#858 — the bound on `parked_on_signer_len`.
+    pub parked_on_signer_capacity: u64,
     /// CIRISEdge#457 — per-kind accepted applies that changed local state.
     pub replication_applied_total: HashMap<EnvelopeKind, u64>,
     /// CIRISEdge#457 — per-kind already-held applies (distinct from applied).

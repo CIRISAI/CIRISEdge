@@ -55,7 +55,27 @@ pub enum AvAddressError {
     Exporter(#[from] AvSessionError),
 }
 
-/// The table group id for a session: its [`StreamId`], hex-encoded.
+/// The namespace every A/V session's table group id lives in.
+///
+/// It is load-bearing twice: it keeps a session from colliding with the
+/// community it runs inside ([`session_group_id`]), and it is how the
+/// Reticulum transport tells an A/V link from a scoped-body link
+/// (CIRISEdge#805 item 4). A link dialled to an address whose group is in
+/// this namespace is on the A/V plane for its whole life, and its data
+/// goes to the transport's A/V sink, never to the replication router
+/// (`FSD/CIRIS_EDGE_TRANSPORT.md` §3.6). One constant, two readers, so the
+/// two can never disagree about what an A/V group is.
+pub const AV_STREAM_GROUP_PREFIX: &str = "av-stream:";
+
+/// Whether `group_id` names an A/V session's group (see
+/// [`AV_STREAM_GROUP_PREFIX`]).
+#[must_use]
+pub fn is_av_stream_group(group_id: &str) -> bool {
+    group_id.starts_with(AV_STREAM_GROUP_PREFIX)
+}
+
+/// The table group id for a session: its [`StreamId`], hex-encoded, in
+/// the [`AV_STREAM_GROUP_PREFIX`] namespace.
 ///
 /// Distinct by construction from any community id, so a session and the
 /// community it runs inside can never collide in the table even under
@@ -64,10 +84,18 @@ pub enum AvAddressError {
 /// [`StreamId`]: crate::transport::realtime_av::StreamId
 #[must_use]
 pub fn session_group_id(session: &AvSession) -> String {
+    stream_group_id(session.stream_id())
+}
+
+/// The table group id for `stream_id` — [`session_group_id`] for a caller
+/// that holds the stream id but not the session (a subscriber resolving
+/// where to dial before its session is up, a test).
+#[must_use]
+pub fn stream_group_id(stream_id: crate::transport::realtime_av::StreamId) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(70);
-    out.push_str("av-stream:");
-    for b in session.stream_id().0 {
+    out.push_str(AV_STREAM_GROUP_PREFIX);
+    for b in stream_id.0 {
         write!(out, "{b:02x}").expect("write to String is infallible");
     }
     out

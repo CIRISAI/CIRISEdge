@@ -265,7 +265,9 @@ async fn a_burst_closes_nothing_on_release_and_the_bound_retires_it_853() {
 }
 
 /// **CIRISEdge#853 — a send cancelled mid-ship gives its lane back.** B holds
-/// one idle lane to A; a large send takes it and is dropped mid-ship (as the
+/// one idle lane to A; a send takes it and is dropped while its ship is held
+/// inside the lane's claim (a test seam holds every Resource ship 3 s, so the
+/// 200 ms cancel lands mid-ship by construction, not by timing — as the
 /// responder's 60 s reply timeout drops a ship that may run 120 s). The lane
 /// is idle in the pool again — the next send would take it rather than dial.
 /// Fails on v40.0.10, where the claim was released only after the ship
@@ -290,13 +292,18 @@ async fn a_cancelled_send_gives_its_lane_back_853() {
             .await
             .first()
             .expect("one lane pooled");
-    let big = vec![0x6bu8; 2 * 1024 * 1024];
-    let cancelled = tokio::time::timeout(Duration::from_millis(200), p.b.send(&dest, &big)).await;
+    p.b.delay_resource_ships_for_test(3000);
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(200),
+        p.b.send(&dest, b"held mid-ship"),
+    )
+    .await;
+    p.b.delay_resource_ships_for_test(0);
     assert!(cancelled.is_err(), "the send was dropped mid-ship");
     assert_eq!(
         p.b.pooled_link_ids_for_test().await,
         vec![lane],
-        "the big send rode the pooled lane"
+        "the cancelled send rode the pooled lane"
     );
     let idle = wait_for(Duration::from_secs(5), || async {
         match p.b.take_pooled_link_for_test(&dest).await {
@@ -313,6 +320,61 @@ async fn a_cancelled_send_gives_its_lane_back_853() {
         "the cancelled send's lane is idle in the pool again, not retired by a \
          leaked claim"
     );
+}
+
+/// **CIRISEdge#853 — a dialled lane is published CLAIMED.** B dials A; the
+/// dial is held 1.5 s after it publishes its lane to the pool and before it
+/// hands the lane to its sender (a test seam widening the window that exists
+/// in production). A second send fired inside that window must not take the
+/// lane: it dials its own, so each lane carries one transfer, both sends are
+/// delivered, and no ship is refused. Fails on v40.0.11, where the lane was
+/// published unclaimed: the second send took it from the pool, and the
+/// dialler then shipped on it too (`TransferInProgress` for one of the two
+/// under load, the burst witness's intermittent failure).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dialled_lane_is_published_claimed_853() {
+    let mut p = pair_with("publish", Duration::from_secs(600)).await;
+    let dest = p.a_key.clone();
+    let named = p.a.local_named_dest_hash();
+    let healed = wait_for(Duration::from_secs(30), || async {
+        p.b.peer_dest_hash_for_test(&dest).await == Some(named)
+    })
+    .await;
+    assert!(healed, "B routes to A's announced destination");
+    p.b.delay_dial_publish_for_test(1500);
+    let first = {
+        let (b, dest) = (Arc::clone(&p.b), dest.clone());
+        tokio::spawn(async move { b.send(&dest, b"the dialler").await })
+    };
+    let published = wait_for(Duration::from_secs(30), || async {
+        !p.b.pooled_link_ids_for_test().await.is_empty()
+    })
+    .await;
+    assert!(published, "the first dial published its lane");
+    let dialled = p.b.pooled_link_ids_for_test().await[0];
+    let second = {
+        let (b, dest) = (Arc::clone(&p.b), dest.clone());
+        tokio::spawn(async move { b.send(&dest, b"inside the window").await })
+    };
+    first
+        .await
+        .expect("task")
+        .expect("the dialler's send is delivered");
+    second
+        .await
+        .expect("task")
+        .expect("the second send is delivered");
+    p.b.delay_dial_publish_for_test(0);
+    recv_one(&mut p.rx_a, "A receives one").await;
+    recv_one(&mut p.rx_a, "A receives the other").await;
+    let lanes = p.b.pooled_link_ids_for_test().await;
+    assert_eq!(
+        lanes.len(),
+        2,
+        "the second send dialled its own lane instead of taking the dialler's \
+         from the pool before its dialler claimed it: {lanes:?} (dialled {dialled:?})"
+    );
+    assert_eq!(p.metrics_b.unclaimed_ship_refused_total(), 0);
 }
 
 /// **A busy lane is never closed.** B dials A once; the lane is then held

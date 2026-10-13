@@ -412,6 +412,79 @@ refuses only what it can name without parsing an envelope.
   link is `identity_frame_on_scoped_link`, never `DestUnmatched`. Witness:
   `tests/link_plane_728.rs::an_identity_frame_on_a_scoped_link_is_refused_by_name_728`.
 
+### 3.6 The A/V plane: a call rides the live node (CIRISEdge#805 item 4)
+
+A call's media rides the SAME `ReticulumTransport`, node and event loop as replication. The
+link it rides is a third plane under §3.5's rule: a link dialled to a scope-derived address
+whose GROUP is an A/V session's — the `av-stream:` namespace (`av_addressing::
+AV_STREAM_GROUP_PREFIX`, the namespace `session_group_id` already put every call in) — is
+`LinkPlane::Av` for its whole life, classified at establishment by the same reverse-index
+probe that tells a scoped link from an identity one. Nothing in a frame chooses its route.
+
+**The route.** The event loop resolves each link frame's plane once and matches on it
+(`LinkPlane::route`): `Identity`/`Scoped` go to `attribute_and_deliver` — the only road to the
+replication sink, which takes a plane type with no A/V variant — and `Av` goes to
+`deliver_av_frame`, which feeds the transport's `AvSink`. An A/V frame cannot reach the
+replication router and a replication frame cannot reach the A/V sink: misrouting is
+unrepresentable, not checked. A replication frame forced onto an A/V link is delivered to the
+A/V consumer as an opaque frame it cannot open; an A/V link refuses Resources at the
+advertisement (`AcceptNone`), and one that completes anyway is dropped
+`av_inbound_dropped_resource`.
+
+**Attribution.** Every A/V frame passes the SAME §5.2 gate as a replication frame
+(`gate_attribution`: `Rooted ∧ owns_key` + the hybrid-bound route), per frame. The candidate
+is the link's `LinkIdentified` peer (a peer dialled our call address) or, on a link this node
+dialled (`open_av_link`), the peer it dialled — whose transport key came from its verified
+route and whose control of it the link proof established. `open_av_link` applies the operator deny-list to the
+derived address AND to every federation candidate the peer resolves to, as the regular send
+path does, so a blackholed peer is not reachable through a call address. An unattributed A/V frame is dropped
+`av_inbound_dropped_unattributed`; there is no unattributed A/V path.
+
+**Backpressure.** The sink never awaits. Each A/V link has a bounded queue
+(`AV_LINK_QUEUE_DEPTH`); a full one drops the NEWEST frame — the A/V drop policy, now one type
+(`AvLinkQueue`) shared with `LinkDataPump` — counts it, logs at DEBUG (CIRISEdge#460), and
+reports the count with the next delivered frame so the consumer's dense hop counter skips past
+the gap (`InboundWireFrame::dropped_before`, `hop_counter_candidates`) instead of desyncing.
+A frame costs at most `HOP_COUNTER_MAX_OPENS` (= slack + 2) AEAD opens whatever the gap: the
+counter past the gap, the expected counter, and the slack past the gap — the dropped frames'
+own counters are never tried. Frames of a peer-opened link that find the arrivals queue full
+are dropped `av_inbound_dropped_arrivals_full`, remembered per link, and reported to the
+link's first delivered frame the same way. A reported gap is kept (`HopGap`) until a frame
+authenticates, so a junk frame that carries the report cannot discard it. A link whose
+consumer dropped its receiver stays recorded in the sink until `LinkClosed`: its later
+frames are `av_inbound_dropped_consumer_gone`, and it is never re-surfaced as a fresh
+arrival.
+
+**Size (#720).** An A/V chunk is ONE link-Channel message: `LeviculumAvSender` sizes the frame
+against `link_channel_message_limit` — the link MDU minus `CHANNEL_ENVELOPE_HEADER_SIZE`
+(#716's six bytes: 425 at the base 500-byte MTU), capped at the envelope's `u16` — before
+leviculum sees it, and refuses a larger one as the typed `ChunkTooLarge`, never a
+`SendFailed`. A refused (or backpressured) send burns no hop counter: nothing left the
+process.
+
+**Invariants (named).**
+
+- **I-3.6.1 An A/V link's data reaches only the A/V sink, attributed.** Witness:
+  `tests/av_spine_live_node_805.rs::av_chunks_ride_the_replicating_node_805` — A publishes
+  through `AvSpine` over an A/V link while a replication round and an identity-plane Deliver
+  run between the same two transports; B's consumer receives every chunk in order and
+  byte-identical, the rows land and the round completes, B's replication listener holds no
+  A/V-link frame, and the `av_plane` ledger counts exactly the frames that rode the link.
+  With the route reverted to the envelope path the same test fails: the link never reaches
+  B's A/V consumer and the chunk is in B's replication listener.
+- **I-3.6.2 One plane per link, from its group.** `reticulum::scope_native_addressing_tests::
+  an_av_session_address_on_either_end_is_the_av_plane`, `..::only_the_av_plane_routes_to_the_av_sink`.
+- **I-3.6.3 An oversized chunk is refused by name and costs no counter.** The witness above
+  (`LegOutcome::Oversized`, `av_send_refused_chunk_too_large`, the next chunk still opens) and
+  `realtime_av_dispatcher::tests::an_oversized_frame_is_refused_by_name_and_burns_no_counter`
+  at the 425-byte limit.
+- **I-3.6.4 Overflow drops, never blocks, never desyncs.** `av_sink::tests::
+  overflow_drops_newest_without_blocking_and_reports_the_gap`,
+  `..::an_arrivals_full_drop_is_named_and_the_hop_resyncs`,
+  `realtime_av_dispatcher::tests::the_subscriber_resyncs_past_dropped_frames`.
+- **I-3.6.5 A resync is bounded.** `realtime_av_dispatcher::tests::
+  a_junk_frame_after_a_thousand_drops_costs_at_most_slack_plus_two_opens`.
+
 ---
 
 ## 4. The anti-entropy replication session (OSI 5)
@@ -1187,7 +1260,10 @@ one the network cannot express breaking.*
    destination; identity-plane traffic selects identity-plane links only and dials when none
    is live; a replication/announce/bundle frame on a scoped link is refused
    `identity_frame_on_scoped_link` (§3.5, CIRISEdge#728).
-10. **No sync-over-async on the read path; a kick is bounded** — every provider read
+10. **A call's media never touches the replication router** — a link to an `av-stream:`
+   group's address is `LinkPlane::Av`; its frames go to the A/V sink through the same §5.2
+   gate, and nothing else does (§3.6, CIRISEdge#805).
+11. **No sync-over-async on the read path; a kick is bounded** — every provider read
    and apply a round makes is awaited (no `block_in_place` / `Handle::block_on`), and
    at most `max_blocking_threads / 2` rounds are in flight at once; 3 peers × 14
    kinds = 42 bridged reads wedged a 32-slot pool (§4.5, CIRISEdge#740).

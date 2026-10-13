@@ -2788,18 +2788,21 @@ impl Edge {
         // CIRISEdge#28 (v0.19.0) — durable enqueue is the metric-visible
         // moment for the durable class. Counts toward both
         // `envelopes_sent_total` (the type was offered to the wire
-        // through the durable surface) and `durable_queue_depth`.
+        // through the durable surface) and `durable_enqueued_total`.
         self.metrics.inc_sent(&M::TYPE);
         self.metrics
-            .inc_durable_queue(crate::observability::DeliveryClass::Durable);
+            .inc_durable_enqueued(crate::observability::DeliveryClass::Durable);
         // ResourceEvent — surface the durable-queue accumulation as a
         // resource-pressure observation so consumers' meta-observability
         // streams see queue growth in real time. Conservative: severity
         // = Info; the call site has no threshold view of "pressure",
         // we just emit the delta.
+        // CIRISEdge#845 — the measurement is the cumulative enqueue count,
+        // so the event carries that name; the resident depth is a COUNT
+        // read on the snapshot path, not one per enqueue.
         let depth_snap = self
             .metrics
-            .durable_queue_depth
+            .durable_enqueued_total
             .read()
             .get(&crate::observability::DeliveryClass::Durable)
             .copied()
@@ -2807,7 +2810,7 @@ impl Edge {
         #[allow(clippy::cast_precision_loss)]
         self.events
             .emit_resource(crate::events::NetworkEvent::resource(
-                "durable_queue_depth",
+                "durable_enqueued_total",
                 depth_snap as f64,
                 "count",
                 crate::events::EventSeverity::Info,
@@ -3189,7 +3192,7 @@ impl Edge {
             // signed/enqueued per recipient on Mandatory fan-out).
             self.metrics.inc_sent(&M::TYPE);
             self.metrics
-                .inc_durable_queue(crate::observability::DeliveryClass::Mandatory);
+                .inc_durable_enqueued(crate::observability::DeliveryClass::Mandatory);
         }
         Ok(handles)
     }
@@ -3413,7 +3416,7 @@ impl Edge {
             // CIRISEdge#28 (v0.19.0) — federation fan-out per steward.
             self.metrics.inc_sent(&M::TYPE);
             self.metrics
-                .inc_durable_queue(crate::observability::DeliveryClass::Federation);
+                .inc_durable_enqueued(crate::observability::DeliveryClass::Federation);
         }
         Ok(handles)
     }
@@ -4252,6 +4255,22 @@ impl Edge {
     #[must_use]
     pub fn outbound_queue_handle(&self) -> Arc<dyn OutboundHandle> {
         self.queue.clone()
+    }
+
+    /// CIRISEdge#845 — the resident durable depth: outbound rows `pending`,
+    /// `sending` or `awaiting_ack` right now, from one grouped count on
+    /// persist's queue (CIRISPersist#996). The cumulative enqueue count is
+    /// the `durable_enqueued_total` counter.
+    ///
+    /// # Errors
+    /// [`EdgeError::Persist`] when the queue cannot be counted.
+    pub async fn durable_queue_depth(&self) -> Result<u64, EdgeError> {
+        let counts = self
+            .queue
+            .outbound_counts()
+            .await
+            .map_err(|e| EdgeError::Persist(format!("outbound_counts: {e}")))?;
+        Ok(crate::outbound::resident_depth(&counts))
     }
 
     /// CIRISEdge#220 — spawn the transport listen tasks + inbound

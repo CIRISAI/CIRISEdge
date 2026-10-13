@@ -365,12 +365,13 @@ impl ReplicationCoordinator {
         meta: Option<RoundMeta>,
         link: Option<[u8; 16]>,
     ) -> Result<(), CoordinatorError> {
-        if link.is_some() {
-            *self
-                .last_inbound_link
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = link;
-        }
+        // Unconditionally (Codex round two on #854): a frame on a transport
+        // with no link (`None`) clears the last one, so the lifecycle lines
+        // never name a stale link after a failover.
+        *self
+            .last_inbound_link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = link;
         self.deliver_inbound_framed(msg, meta)
     }
 
@@ -870,27 +871,34 @@ impl ReplicationCoordinator {
     /// Returns the name Pulled, or `None` when nothing is queued for this peer —
     /// the common case, and the caller then runs an ordinary round.
     ///
-    /// # What can be recovered, and why only that
+    /// # What can be recovered, and from whom
     ///
-    /// Exactly one thing: **this peer's own `Key`**, asked of this peer. The
-    /// responder answers an identifier `Pull` for the subject itself or for its
-    /// OWN record, and refuses a third-party probe — that refusal is what stops
-    /// a body-holding node becoming an address-book oracle for records it never
-    /// advertised. So "you signed a row I cannot verify, send me your key" is
-    /// the recoverable case, and a third-party signer is not fetchable by
-    /// identifier at all. Nothing else is ever queued, which is also what bounds
-    /// the queue: a peer can enqueue one name, its own.
+    /// The name queued is the signer a transient refusal named, asked of the
+    /// peer that delivered the row. The responder answers an identifier `Pull`
+    /// for three requesters (`subject_holdings` in the bridge): the subject
+    /// itself, anyone asking for the responder's OWN record, and — for any
+    /// other subject on a public plane — a requester that shares a TRUST ROOT
+    /// with it (rate limited). So "you signed a row I cannot verify, send me
+    /// your key" always recovers, and a third-party signer's key recovers only
+    /// between rooted peers: an unrooted fresh node asking the canonical for an
+    /// attester's key gets an empty Summary (logged at DEBUG on the responder,
+    /// "no mutual trust root"). That refusal is what stops a body-holding node
+    /// becoming an address-book oracle for records it never advertised.
     ///
     /// Only the `Key` coordinator recovers, because `start_pull` sends
     /// `PullMessage { kind: self.kind, .. }` and the row every stalled record
     /// waits on is a `Key` row.
     ///
-    /// # Failure
+    /// # Failure, and the park
     ///
     /// A send error is returned to the caller and the name is NOT re-queued
     /// here. The record that named it re-notes it on its next transient
-    /// refusal, so the retry rides #544's existing backoff rather than a second
-    /// unbounded timer (FSD-SIGNER-RECOVERY D6).
+    /// refusal. When the signer is absent from this directory that next
+    /// refusal is far off: the row is PARKED on the signer (CIRISEdge#679) on
+    /// the terminal schedule (30 min doubling to 6 h), and is re-asked early
+    /// only when the signer's `Key` admits through the apply path, or when the
+    /// host calls `release_signer` after writing the key locally
+    /// (CIRISEdge#858). There is no second timer here (FSD-SIGNER-RECOVERY D6).
     pub async fn send_recovery_pull(&self) -> Result<Option<String>, CoordinatorError> {
         if self.kind != EnvelopeKind::Key {
             return Ok(None);
@@ -2094,6 +2102,36 @@ mod tests {
             alice.end_round().await;
             assert_eq!(alice.current_round(), 0);
             assert_eq!(alice.inbound_depth(), 0);
+        }
+
+        /// CIRISEdge#853 (Codex round two on #854) — a frame on a transport
+        /// with no link clears the link the lifecycle lines name; it never
+        /// keeps reporting the last Reticulum link after a failover.
+        #[tokio::test]
+        async fn a_frame_without_a_link_clears_the_logged_link_854() {
+            let (_alice_t, bob_t, provider, applier) = empty_pair();
+            let bob = ReplicationCoordinator::new(
+                bob_t.clone(),
+                "alice",
+                EnvelopeKind::Key,
+                SessionRole::Responder,
+                provider,
+                applier,
+            );
+            let open = ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![],
+            });
+            assert_eq!(bob.last_inbound_link_hex(), "-");
+            bob.deliver_inbound_framed_on(open.clone(), None, Some([0xab; 16]))
+                .unwrap();
+            assert_eq!(bob.last_inbound_link_hex(), "ab".repeat(16));
+            bob.deliver_inbound_framed_on(open, None, None).unwrap();
+            assert_eq!(
+                bob.last_inbound_link_hex(),
+                "-",
+                "an HTTPS frame names no link, not the stale Reticulum one"
+            );
         }
 
         /// A responder echoes the round of the frame it is answering, and

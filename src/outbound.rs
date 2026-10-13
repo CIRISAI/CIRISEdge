@@ -23,7 +23,7 @@ use ciris_persist::federation::types::identity_type as persist_identity_type;
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::outbound::Error as PersistOutboundError;
 use ciris_persist::prelude::{
-    OutboundFailureOutcome, OutboundFilter, OutboundQueue, OutboundRow, QueueId,
+    OutboundFailureOutcome, OutboundFilter, OutboundQueue, OutboundRow, OutboundStatus, QueueId,
 };
 use futures::stream::StreamExt as _;
 
@@ -237,6 +237,30 @@ pub trait OutboundHandle: Send + Sync + 'static {
         filter: OutboundFilter,
         limit: i64,
     ) -> Result<Vec<OutboundRow>, PersistOutboundError>;
+
+    /// persist v54.0.0 (CIRISPersist#996) — rows per status over the whole
+    /// queue, one grouped `COUNT(*)`; a status with no row is absent.
+    async fn outbound_counts(
+        &self,
+    ) -> Result<std::collections::HashMap<OutboundStatus, u64>, PersistOutboundError>;
+}
+
+/// CIRISEdge#845 — the RESIDENT durable depth: rows still being worked
+/// (`pending`, `sending`, `awaiting_ack`) in an [`OutboundHandle::outbound_counts`]
+/// answer. A missing status counts 0. The two terminal statuses are rows
+/// persist still retains, not queue depth. The match is exhaustive, so a
+/// status persist adds later has to be classified here.
+#[must_use]
+pub fn resident_depth<S: std::hash::BuildHasher>(
+    counts: &std::collections::HashMap<OutboundStatus, u64, S>,
+) -> u64 {
+    counts
+        .iter()
+        .filter(|(status, _)| match status {
+            OutboundStatus::Pending | OutboundStatus::Sending | OutboundStatus::AwaitingAck => true,
+            OutboundStatus::Delivered | OutboundStatus::Abandoned => false,
+        })
+        .fold(0, |depth, (_, rows)| depth.saturating_add(*rows))
 }
 
 #[async_trait]
@@ -355,6 +379,12 @@ impl<Q: OutboundQueue + Send + Sync + 'static> OutboundHandle for Q {
         limit: i64,
     ) -> Result<Vec<OutboundRow>, PersistOutboundError> {
         OutboundQueue::list_outbound(self, filter, limit).await
+    }
+
+    async fn outbound_counts(
+        &self,
+    ) -> Result<std::collections::HashMap<OutboundStatus, u64>, PersistOutboundError> {
+        OutboundQueue::outbound_counts(self).await
     }
 }
 
@@ -825,5 +855,42 @@ mod transport_preference_tests {
             preferred_transport_index(&[RETICULUM, HTTP], "peer-2", Some(&tie)),
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod resident_depth_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    /// CIRISEdge#845 — the resident depth sums the three working statuses,
+    /// ignores the two terminal ones, and reads a missing status as 0.
+    #[test]
+    fn resident_depth_sums_the_working_statuses_845() {
+        assert_eq!(resident_depth(&HashMap::new()), 0, "empty queue");
+        let counts = HashMap::from([
+            (OutboundStatus::Pending, 3),
+            (OutboundStatus::Sending, 2),
+            (OutboundStatus::AwaitingAck, 5),
+            (OutboundStatus::Delivered, 100),
+            (OutboundStatus::Abandoned, 7),
+        ]);
+        assert_eq!(
+            resident_depth(&counts),
+            10,
+            "pending + sending + awaiting_ack"
+        );
+        let only_terminal = HashMap::from([
+            (OutboundStatus::Delivered, 4),
+            (OutboundStatus::Abandoned, 1),
+        ]);
+        assert_eq!(
+            resident_depth(&only_terminal),
+            0,
+            "a drained queue is depth 0"
+        );
+        let sparse = HashMap::from([(OutboundStatus::AwaitingAck, 1)]);
+        assert_eq!(resident_depth(&sparse), 1, "missing statuses are 0");
     }
 }

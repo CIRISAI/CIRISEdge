@@ -429,6 +429,18 @@ fn link_channel_mdu(node: &ReticulumNode, link_id: &LinkId) -> usize {
     node.link_mdu(link_id).map_or(0, channel_payload_mdu)
 }
 
+/// CIRISEdge#720 — the most ONE Channel message on `link_id` carries: the
+/// link's [`channel_payload_mdu`], capped at the Channel envelope's `u16`
+/// length field (leviculum#39's own `Channel::mdu(..).min(u16::MAX)`). This
+/// is what an unfragmented A/V chunk is sized against — the same helper the
+/// fragmenter's MDU comes from, so the A/V plane cannot disagree with the
+/// replication plane about the six-byte margin. `None` when leviculum no
+/// longer holds the link.
+pub(crate) fn link_channel_message_limit(node: &ReticulumNode, link_id: &LinkId) -> Option<usize> {
+    node.link_mdu(link_id)
+        .map(|mdu| channel_payload_mdu(mdu).min(usize::from(u16::MAX)))
+}
+
 /// What [`send_fragments_on_channel`] achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FragmentSendOutcome {
@@ -2284,6 +2296,15 @@ pub struct ReticulumTransport {
     /// drains too fast to collide). Zero in production: one relaxed atomic
     /// load per ship. Set via [`Self::force_next_sends_busy_for_test`].
     test_force_busy: Arc<std::sync::atomic::AtomicU32>,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_channel_sends_for_test`]. 0 in production.
+    test_channel_delay_ms: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_resource_ships_for_test`]. 0 in production.
+    test_ship_delay_ms: std::sync::atomic::AtomicU64,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_dial_publish_for_test`]. 0 in production.
+    test_publish_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Optional out-of-band directory-backed resolver. When `None`,
     /// only the authenticated announce cold-start path is available.
     resolver: Option<Arc<dyn PeerResolver>>,
@@ -2505,6 +2526,16 @@ pub struct ReticulumTransport {
     /// while edge still holds them, with when it first saw that (see
     /// [`ReticulumTransport::reconcile_vanished_links`]).
     vanish_suspects: std::sync::Mutex<HashMap<LinkId, std::time::Instant>>,
+    /// CIRISEdge#853 test seam — when set, the next INBOUND `LinkEstablished`
+    /// is dropped after the resource strategy is set, as a full control plane
+    /// would drop it ([`ReticulumTransport::drop_next_inbound_link_established_for_test`]).
+    /// `false` in production.
+    swallow_link_established: std::sync::atomic::AtomicBool,
+    /// CIRISEdge#853 — resources that concluded (completed or failed) in the
+    /// last [`INBOUND_TRANSFER_STALL`], by hash: a data-plane `Started` /
+    /// `Progress` arriving after its own control-plane completion is ignored
+    /// rather than re-marking the transfer's link busy.
+    concluded_resources: std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
     /// CIRISEdge#853 test seam — `LinkClosed` events the listener drops
     /// unprocessed ([`ReticulumTransport::close_link_silently_for_test`]).
     /// Empty in production.
@@ -2546,6 +2577,21 @@ pub struct ReticulumTransport {
     /// A `std` mutex, because the lease releases in `Drop` (a cancelled
     /// fetch must give its lane back without an executor).
     scoped_link_leased: Arc<std::sync::Mutex<HashSet<LinkId>>>,
+    /// CIRISEdge#805 item 4 — the A/V plane's inbound sink. Every frame on an
+    /// `LinkPlane::Av` link that passes attribution is routed here by the
+    /// event loop; nothing else is (`FSD/CIRIS_EDGE_TRANSPORT.md` §3.6).
+    av_sink: Arc<crate::transport::av_sink::AvSink>,
+    /// CIRISEdge#805 — the peer each A/V link THIS node dialled was dialled
+    /// to ([`Self::open_av_link`]): the initiator-side attribution basis.
+    /// The dial resolved the peer's transport key from its verified route
+    /// and the link proof proved the far end holds it — the trust
+    /// `dialed_link_dest` gives an identity-plane dial — and the frame
+    /// still passes the same #393 gate on that key id. Removed on
+    /// `LinkClosed`.
+    av_dialed_peer: Arc<std::sync::Mutex<HashMap<LinkId, String>>>,
+    /// CIRISEdge#805 test seam — fail the next N derived-link identifies
+    /// ([`Self::fail_next_derived_identifies_for_test`]). Zero in production.
+    fail_derived_identify: Arc<std::sync::atomic::AtomicU32>,
     /// CIRISEdge#739 test seam — the next `n` answers on a reply path TEAR
     /// DOWN the link they would ride just before riding it: the request has
     /// arrived and been admitted on that link, and its answer finds the link
@@ -2857,14 +2903,15 @@ impl ReticulumTransport {
             reusable_dialed_link: Arc::clone(&self.reusable_dialed_link),
             pool_last_used: Arc::clone(&self.pool_last_used),
             link_in_flight: Arc::clone(&self.link_in_flight),
+            test_publish_delay_ms: Arc::clone(&self.test_publish_delay_ms),
+            fail_derived_identify: Arc::clone(&self.fail_derived_identify),
         }
     }
 
-    /// Delegates to [`DialCtx::reusable_link_to`] — the pool lives on the ctx
-    /// now, but every existing caller keeps its shape. CIRISEdge#819: the
-    /// returned link is RESERVED (in flight) for the caller, who must release
-    /// it.
-    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
+    /// Delegates to [`DialCtx::reusable_link_to`]. CIRISEdge#819: the returned
+    /// lane is RESERVED (in flight) for the caller; CIRISEdge#853: as a
+    /// [`LinkClaim`], released on every exit, cancellation included.
+    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkClaim> {
         self.dial_ctx().reusable_link_to(dest).await
     }
 
@@ -3436,6 +3483,9 @@ impl ReticulumTransport {
             established_links: Arc::new(Mutex::new(HashSet::new())),
             sent_resource_progress: Arc::new(Mutex::new(HashMap::new())),
             test_force_busy: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            test_channel_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            test_ship_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            test_publish_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             resolver,
             rooting,
             hybrid_policy,
@@ -3475,9 +3525,14 @@ impl ReticulumTransport {
             link_last_outbound_at: Arc::new(std::sync::Mutex::new(HashMap::new())),
             inbound_idle_seen: std::sync::Mutex::new(HashMap::new()),
             swallow_link_closed: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            swallow_link_established: std::sync::atomic::AtomicBool::new(false),
+            concluded_resources: std::sync::Mutex::new(HashMap::new()),
             dial_gate: Arc::new(Mutex::new(HashMap::new())),
             reusable_scoped_link: Arc::new(Mutex::new(HashMap::new())),
             scoped_link_leased: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            av_sink: Arc::new(crate::transport::av_sink::AvSink::new()),
+            av_dialed_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            fail_derived_identify: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             tear_down_reply_link: std::sync::atomic::AtomicU32::new(0),
             scoped_pool_bypass: std::sync::atomic::AtomicBool::new(false),
             blackhole: blackhole_rules,
@@ -3831,7 +3886,18 @@ impl ReticulumTransport {
             link_last_outbound_at: &self.link_last_outbound_at,
             metrics: self.metrics.get(),
             metrics_source: self.metrics_source,
+            av_sink: &self.av_sink,
+            av_dialed_peer: &self.av_dialed_peer,
         }
+    }
+
+    /// CIRISEdge#853 test seam — drop the next inbound `LinkEstablished` before
+    /// edge records anything for it (after its resource strategy is set), as a
+    /// control-plane overflow drops it.
+    #[doc(hidden)]
+    pub fn drop_next_inbound_link_established_for_test(&self) {
+        self.swallow_link_established
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// CIRISEdge#853 test seam — close `link` at the node and DROP the
@@ -3894,7 +3960,9 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub async fn take_pooled_link_for_test(&self, peer: &str) -> Option<[u8; 16]> {
         let dest = self.resolve_peer(peer).await?.dest_hash;
-        self.reusable_link_to(&dest).await.map(LinkId::into_bytes)
+        self.reusable_link_to(&dest)
+            .await
+            .map(|claim| claim.keep().into_bytes())
     }
 
     /// CIRISEdge#819 test seam — end a transfer on `link`, exactly as `send`
@@ -4848,7 +4916,7 @@ impl ReticulumTransport {
         if let Some(fragments) = crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
             .filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
         {
-            let outcome = send_fragments_on_channel(&self.node, &link_id, &fragments).await;
+            let outcome = self.send_channel_marked(link_id, &fragments).await;
             if outcome.complete() {
                 // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
                 note_outbound_use(&self.link_last_outbound_at, link_id);
@@ -4868,10 +4936,24 @@ impl ReticulumTransport {
                 "scoped Channel-first send stalled; trying the Resource path (CIRISEdge#739)"
             );
         }
-        let claim = self
-            .claim_link_for_transfer(link_id)
-            .await
-            .then(|| self.link_claim(link_id));
+        // CIRISEdge#853 — never ship on a lane another transfer holds: two
+        // Resources on one link is leviculum `TransferInProgress` for one of
+        // them. A lease is exclusive, so this is unreachable; if a regression
+        // makes it reachable it is a loud, counted refusal, not a collision.
+        if !self.claim_link_for_transfer(link_id).await {
+            if let Some(m) = self.metrics.get() {
+                m.inc_unclaimed_ship_refused();
+            }
+            tracing::warn!(
+                link = %hex::encode(link_id.as_bytes()),
+                "refusing to ship on a lane another transfer holds (CIRISEdge#853); \
+                 this path should be unreachable"
+            );
+            return Err(TransportError::Io(
+                "scoped lane already carries a transfer (CIRISEdge#853)".to_owned(),
+            ));
+        }
+        let claim = Some(self.link_claim(link_id));
         let shipped = self
             .ship_resource_on_link(
                 &link_id,
@@ -4892,6 +4974,258 @@ impl ReticulumTransport {
                 Err(e.into_transport())
             }
         }
+    }
+
+    /// CIRISEdge#805 item 4 — **dial an A/V link** to `destination_key_id`'s
+    /// derived address in an A/V session's group, on THIS transport's node and
+    /// event loop.
+    ///
+    /// `address` must be a [`MemberAddress`] the scope table resolves into the
+    /// [`crate::av_addressing::AV_STREAM_GROUP_PREFIX`] namespace (an
+    /// `AvSpine` / `av_addressing::snapshot` install puts it there) — checked
+    /// by the SAME classifier the receive side uses, so the link this returns
+    /// is `LinkPlane::Av` on both ends. The dial is the scoped-lane dial
+    /// (identified, #340; broadcast-only, one hop — see
+    /// [`Self::send_to_scoped_destination`] on why a derived address is never
+    /// relay-routable), tagged `Av` before it can establish, with its inbound
+    /// queue and its attribution basis registered before the peer can send.
+    ///
+    /// The returned [`AvLink`](crate::transport::av_sink::AvLink) is held for
+    /// the call: its sender is the Channel path (`LinkHandle::try_send`;
+    /// backpressure surfaces as `Congested`, an oversized frame as the typed
+    /// `ChunkTooLarge`, CIRISEdge#720), and its receiver yields the frames the
+    /// peer sends back on the link — through the #393 gate, never via the
+    /// replication router. Unlike the scoped pool there is no lease: an A/V
+    /// link carries one stream hop for the call's life, and closing it is the
+    /// caller's `link_teardown`.
+    ///
+    /// # Errors
+    /// [`TransportError::Config`] when `address` is not an A/V session address
+    /// in this transport's scope table (or no table is installed);
+    /// [`TransportError::Unreachable`] when the peer's transport identity
+    /// cannot be resolved; [`TransportError::NoRouteToPeer`] /
+    /// [`TransportError::Io`] when the derived destination does not establish.
+    pub async fn open_av_link(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+    ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
+        let (dest_hash, transport_ed25519) =
+            self.av_dial_target(destination_key_id, address).await?;
+        let inbound: Arc<
+            std::sync::Mutex<Option<crate::transport::realtime_av_runtime::PumpReceiver>>,
+        > = Arc::new(std::sync::Mutex::new(None));
+        // The link id the dial dispatched, so a dial that fails AFTER
+        // registering its consumer can be torn down (Codex on #813).
+        let dispatched: Arc<std::sync::Mutex<Option<LinkId>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let link_id = {
+            let sink = Arc::clone(&self.av_sink);
+            let dialed = Arc::clone(&self.av_dialed_peer);
+            let slot = Arc::clone(&inbound);
+            let dispatched = Arc::clone(&dispatched);
+            let peer = destination_key_id.to_owned();
+            self.dial_ctx()
+                .dial_derived_link(
+                    destination_key_id,
+                    dest_hash,
+                    &transport_ed25519,
+                    LinkPlane::Av,
+                    move |link_id| {
+                        *dispatched
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(link_id);
+                        dialed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(link_id, peer);
+                        *slot
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(sink.claim(link_id));
+                    },
+                )
+                .await
+        };
+        let link_id = match link_id {
+            Ok(id) => id,
+            Err(e) => {
+                // The dial failed after it registered this link's consumer and
+                // attribution basis (an identify failure on an established
+                // link, an establish timeout). No `AvLink` reaches the caller,
+                // so nobody else can tear it down: undo both records and close
+                // the link here, or repeated failures hold live links and sink
+                // queues against the node's bounded link capacity.
+                let partial = *dispatched
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(id) = partial {
+                    self.undo_partial_av_dial(id, &e).await;
+                }
+                return Err(e);
+            }
+        };
+        let inbound = inbound
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                TransportError::Io("open_av_link: the dial registered no inbound queue".to_owned())
+            })?;
+        if let Some(m) = self.metrics.get() {
+            m.inc_av_plane(crate::observability::AV_LINK_OPENED);
+        }
+        tracing::info!(
+            key_id = %destination_key_id,
+            link = %hex::encode(link_id.as_bytes()),
+            "A/V link opened on the live node (CIRISEdge#805)"
+        );
+        Ok(crate::transport::av_sink::AvLink {
+            link_id: link_id.into_bytes(),
+            peer: destination_key_id.to_owned(),
+            inbound,
+            sender: crate::transport::realtime_av_runtime::LeviculumAvSender::new(
+                Arc::clone(&self.node),
+                link_id,
+            )
+            .with_metrics(self.metrics.get().cloned()),
+        })
+    }
+
+    /// CIRISEdge#805 — every check an A/V dial passes before it is made, and
+    /// what it dials with: the derived address must be an A/V session address
+    /// (§3.6), must be `destination_key_id`'s own, must clear the operator
+    /// deny-list together with every federation candidate of the peer, and the
+    /// peer's transport key must resolve (no key ⇒ no link proof).
+    async fn av_dial_target(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+    ) -> Result<(DestinationHash, [u8; 32]), TransportError> {
+        let dest_hash = DestinationHash::new(*address.as_bytes());
+        let plane = classify_link_plane(self.scope_addresses.get().map(Arc::as_ref), &dest_hash);
+        if plane != LinkPlane::Av {
+            return Err(TransportError::Config(format!(
+                "open_av_link: {} is not an A/V session address in this transport's scope \
+                 table (it classifies {}) — an A/V link is dialled to a derived address of an \
+                 `{}` group (CIRISEdge#805)",
+                hex::encode(address.as_bytes()),
+                plane.as_str(),
+                crate::av_addressing::AV_STREAM_GROUP_PREFIX,
+            )));
+        }
+        // The address must be THIS peer's: its table entry names the member it
+        // was derived for. Dialling B's address under C's key id would record C
+        // as the link's peer, and B's reverse frames would then be attributed
+        // through C's #393 binding (two key ids can share one transport
+        // identity, so the link proof alone does not catch it — Codex on #813).
+        let member = self
+            .scope_addresses
+            .get()
+            .and_then(|t| t.accepts_inbound(address.as_bytes()))
+            .map(|a| a.member_key_id().to_owned());
+        if member.as_deref() != Some(destination_key_id) {
+            return Err(TransportError::Config(format!(
+                "open_av_link: A/V address {} belongs to member {} of the call's group, not to \
+                 destination_key_id={destination_key_id} — refused, so a link to one member is \
+                 never attributed to another (CIRISEdge#805)",
+                hex::encode(address.as_bytes()),
+                member.as_deref().unwrap_or("<none>"),
+            )));
+        }
+        // The operator deny-list, on the DERIVED hash and on EVERY federation
+        // candidate the peer resolves to — the regular send path's rule. A
+        // peer blackholed by its announced destination must not stay reachable
+        // through a session-derived address the operator never saw (Codex on
+        // #813).
+        self.check_blackhole(&dest_hash.into_bytes()).await?;
+        let candidates = self.resolve_dial_candidates(destination_key_id).await;
+        for candidate in &candidates {
+            self.check_blackhole(&candidate.dest_hash.into_bytes())
+                .await?;
+        }
+        let Some(transport_ed25519) = candidates.first().map(|c| c.transport_ed25519) else {
+            return Err(TransportError::Unreachable(format!(
+                "open_av_link: no transport identity resolved for \
+                 destination_key_id={destination_key_id} — cannot prove a link to its A/V \
+                 address (CIRISEdge#805)"
+            )));
+        };
+        Ok((dest_hash, transport_ed25519))
+    }
+
+    /// CIRISEdge#805 — undo an A/V dial that failed after registering its link
+    /// (an identify failure on an established link, an establish timeout): no
+    /// `AvLink` reaches the caller, so nobody else can tear it down. Removes
+    /// the sink queue and the dial record and closes the link, or repeated
+    /// failures hold live links and sink queues against the node's bounded
+    /// link capacity (Codex on #813).
+    async fn undo_partial_av_dial(&self, id: LinkId, error: &TransportError) {
+        self.av_sink.forget(&id);
+        self.av_dialed_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+        let _ = self.node.close_link(&id).await;
+        tracing::debug!(
+            link = %hex::encode(id.as_bytes()),
+            error = %error,
+            "A/V dial failed after registering its link — records undone, link closed \
+             (CIRISEdge#805)"
+        );
+    }
+
+    /// CIRISEdge#805 item 4 — take the receiver of A/V links PEERS open to this
+    /// node's A/V addresses. Each [`AvArrival`](crate::transport::av_sink::AvArrival)
+    /// is handed over on the link's first frame that passes the #393 gate,
+    /// carrying the link's inbound queue (that frame already in it) and a
+    /// sender on the same link. Once per transport: `None` after the first
+    /// call. Up to `av_sink::AV_ARRIVALS_DEPTH` peer-opened links wait for the
+    /// consumer (taken or not yet); past that a link's frames are dropped,
+    /// counted (`av_inbound_dropped_arrivals_full`) and reported to its first
+    /// delivered frame so the hop resyncs. Never queued unboundedly, never
+    /// routed anywhere else.
+    pub fn take_av_arrivals(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Receiver<crate::transport::av_sink::AvArrival>> {
+        self.av_sink.take_arrivals()
+    }
+
+    /// CIRISEdge#805/#853 test seam — the link's last-inbound stamp (unix
+    /// seconds), the liveness the idle reap and the reply selector read.
+    #[doc(hidden)]
+    pub async fn link_last_inbound_for_test(&self, link_id: [u8; 16]) -> Option<u64> {
+        self.link_last_inbound_at
+            .lock()
+            .await
+            .get(&LinkId::new(link_id))
+            .copied()
+    }
+
+    /// CIRISEdge#805 test seam — A/V links this node dialled whose attribution
+    /// record is held.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn av_dialed_peer_count_for_test(&self) -> usize {
+        self.av_dialed_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// CIRISEdge#805 test seam — the next `n` derived-link dials fail at
+    /// identify, AFTER the link established (the partial-open arm).
+    #[doc(hidden)]
+    pub fn fail_next_derived_identifies_for_test(&self, n: u32) {
+        self.fail_derived_identify
+            .store(n, std::sync::atomic::Ordering::Release);
+    }
+
+    /// CIRISEdge#805 test seam — links the A/V sink routes for right now.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn av_sink_link_count_for_test(&self) -> usize {
+        self.av_sink.link_count()
     }
 
     /// CIRISEdge#739 — drop `link_id` from the scoped pool (it stays leased
@@ -5155,6 +5489,33 @@ impl ReticulumTransport {
     /// CIRISEdge#353 test seam — force the next `n` resource ships to fail
     /// [`ShipError::Busy`] (the one-transfer-per-link collision), so a test can
     /// drive the reverse-path busy-retry loop deterministically.
+    /// CIRISEdge#853 test seam — every Channel-first send this transport makes
+    /// on a link waits `ms` inside its busy mark before sending, so a witness
+    /// can hold a send in flight across reaper passes. 0 in production.
+    #[doc(hidden)]
+    pub fn delay_channel_sends_for_test(&self, ms: u64) {
+        self.test_channel_delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 test seam — every Resource ship waits `ms` inside its
+    /// lane claim before sending, so a witness can cancel a send while it
+    /// provably holds its lane. 0 in production.
+    #[doc(hidden)]
+    pub fn delay_resource_ships_for_test(&self, ms: u64) {
+        self.test_ship_delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// CIRISEdge#853 test seam — a dial waits `ms` after publishing its lane
+    /// to the pool and before handing it to its sender: the window in which a
+    /// concurrent send could take a lane published unclaimed. 0 in production.
+    #[doc(hidden)]
+    pub fn delay_dial_publish_for_test(&self, ms: u64) {
+        self.test_publish_delay_ms
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn force_next_sends_busy_for_test(&self, n: u32) {
         self.test_force_busy
             .store(n, std::sync::atomic::Ordering::Relaxed);
@@ -6378,6 +6739,27 @@ impl ReticulumTransport {
         stamp_pool_use(&self.pool_last_used, link_id);
     }
 
+    /// CIRISEdge#853 (Codex round two on #854) — a Channel-first send on
+    /// `link_id`, marked busy for the inbound reaper for as long as it runs
+    /// (up to [`CHANNEL_FRAME_SEND_BUDGET`] under pacing), exactly as a
+    /// Resource ship is ([`OutboundShipGuard`]). Without the mark, a reply
+    /// still waiting on the Channel window could be closed under it by the
+    /// second idle observation: its use is stamped only once it completes.
+    async fn send_channel_marked(
+        &self,
+        link_id: LinkId,
+        fragments: &[Vec<u8>],
+    ) -> FragmentSendOutcome {
+        let _busy = OutboundShipGuard::new(&self.outbound_ship_active, link_id);
+        let delay = self
+            .test_channel_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        send_fragments_on_channel(&self.node, &link_id, fragments).await
+    }
+
     /// CIRISEdge#853 — wrap a claimed lane in a [`LinkClaim`], so the claim is
     /// released on every exit, a cancelled send's included.
     fn link_claim(&self, link_id: LinkId) -> LinkClaim {
@@ -6562,7 +6944,7 @@ impl ReticulumTransport {
                 if let Some(fragments) =
                     fragments.filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
                 {
-                    let outcome = send_fragments_on_channel(&self.node, &link_id, &fragments).await;
+                    let outcome = self.send_channel_marked(link_id, &fragments).await;
                     if outcome.complete() {
                         // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
                         note_outbound_use(&self.link_last_outbound_at, link_id);
@@ -6652,8 +7034,7 @@ impl ReticulumTransport {
                     {
                         // CIRISEdge#636 — absorb the Channel's pacing instead of
                         // reading it as failure (the `fragments_sent=0` signature).
-                        let outcome =
-                            send_fragments_on_channel(&self.node, &link_id, &fragments).await;
+                        let outcome = self.send_channel_marked(link_id, &fragments).await;
                         let (sent, total) = (outcome.sent, outcome.total);
                         if outcome.complete() {
                             // CIRISEdge#853 (Codex on #854) — a sent frame is a use of the link.
@@ -6792,6 +7173,12 @@ impl ReticulumTransport {
         }
         // CIRISEdge#853 — busy for the inbound reaper until this returns.
         let _ship = OutboundShipGuard::new(&self.outbound_ship_active, *link_id);
+        let delay = self
+            .test_ship_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         // Auto-accept any resources the peer pushes back on this link
         // (e.g. an ACK envelope), and ship our envelope as a resource.
         let _ = self
@@ -7111,13 +7498,13 @@ impl Transport for ReticulumTransport {
         // CIRISEdge#819 — `reserved`: the lane came from the pool already
         // marked in flight for this send (see `DialCtx::reusable_link_to`).
         let reused = self.reusable_link_to(&peer.dest_hash).await;
-        let (link_id, reserved) = if let Some(existing) = reused {
+        let claim = if let Some(existing) = reused {
             tracing::trace!(
                 key_id = %destination_key_id,
-                link = ?existing,
+                link = ?existing.link_id(),
                 "reusing the live identified link to this peer (CIRISEdge#532)"
             );
-            (existing, true)
+            existing
         } else {
             // SINGLE-FLIGHT. Without this, N coordinators firing at the same
             // peer all observe "no link" and all dial — the establish:identify
@@ -7159,15 +7546,14 @@ impl Transport for ReticulumTransport {
                 if let Some(existing) = ctx.reusable_link_to(&peer_owned.dest_hash).await {
                     tracing::trace!(
                         key_id = %dkid,
-                        link = ?existing,
+                        link = ?existing.link_id(),
                         "another send established this peer's link while we waited on \
                          the dial gate — reusing it (CIRISEdge#532)"
                     );
-                    return Ok((existing, true));
+                    return Ok(existing);
                 }
                 ctx.dial_and_identify(&dkid, &peer_owned, has_path, establish_timeout)
                     .await
-                    .map(|id| (id, false))
             });
             dial.await
                 .map_err(|e| TransportError::Io(format!("dial task failed: {e}")))??
@@ -7184,9 +7570,11 @@ impl Transport for ReticulumTransport {
         // from the pool permanently while it sat there perfectly usable.
         // CIRISEdge#853 — and a CANCELLED send: the claim is a guard released
         // on drop (the responder's 60 s reply timeout cancels ships that may
-        // run 120 s), so a dropped future no longer retires the lane.
-        let claim = (reserved || self.claim_link_for_transfer(link_id).await)
-            .then(|| self.link_claim(link_id));
+        // run 120 s), so a dropped future no longer retires the lane. Both
+        // arms above return the lane ALREADY CLAIMED (a pool take reserves it;
+        // a dial publishes it claimed), so there is no unclaimed lane to ship
+        // on: the "claim lost, ship anyway" path is gone.
+        let link_id = claim.link_id();
         // A `Busy` collision here is not the reverse-path retry case, so both
         // variants surface as the send's transport error (the durable dispatcher
         // retries). Lenient no-progress window, full [`RESOURCE_TRANSFER_TIMEOUT`]
@@ -7199,9 +7587,7 @@ impl Transport for ReticulumTransport {
                 RESOURCE_TRANSFER_TIMEOUT,
             )
             .await;
-        if let Some(claim) = claim {
-            claim.release().await;
-        }
+        claim.release().await;
         shipped.map_err(ShipError::into_transport)?;
 
         Ok(TransportSendOutcome::Delivered)
@@ -7522,7 +7908,13 @@ impl Transport for ReticulumTransport {
                         #[cfg(feature = "lxmf")]
                         lxmf_serve_links: &self.lxmf_serve_links,
                         swallow_link_closed: &self.swallow_link_closed,
+                        reusable_scoped_link: &self.reusable_scoped_link,
+                        concluded_resources: &self.concluded_resources,
+                        swallow_link_established: &self.swallow_link_established,
                         link_last_outbound_at: &self.link_last_outbound_at,
+                        av_sink: &self.av_sink,
+                        av_node: &self.node,
+                        av_dialed_peer: &self.av_dialed_peer,
                     };
                     handle_event(event, &ctx).await;
 
@@ -7797,6 +8189,53 @@ impl LinkDirections {
     }
 }
 
+/// CIRISEdge#853 — the most concluded resource hashes remembered before the
+/// memo prunes entries older than [`INBOUND_TRANSFER_STALL`].
+const CONCLUDED_RESOURCES_PRUNE_THRESHOLD: usize = 4096;
+
+/// CIRISEdge#853 — record that the resource `hash` concluded (completed or
+/// failed), so a late data-plane `Started`/`Progress` for it is ignored.
+fn note_resource_concluded(
+    memo: &std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
+    hash: [u8; 32],
+) {
+    let mut memo = memo
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if memo.len() >= CONCLUDED_RESOURCES_PRUNE_THRESHOLD {
+        memo.retain(|_, at| at.elapsed() < INBOUND_TRANSFER_STALL);
+    }
+    memo.insert(hash, std::time::Instant::now());
+}
+
+/// CIRISEdge#853 — did the resource `hash` conclude within the stall window?
+/// A `Started`/`Progress` for it is then a straggler from the data plane, not
+/// a transfer in flight.
+fn resource_concluded(
+    memo: &std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
+    hash: &[u8; 32],
+) -> bool {
+    memo.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(hash)
+        .is_some_and(|at| at.elapsed() < INBOUND_TRANSFER_STALL)
+}
+
+/// CIRISEdge#853 (Codex round two on #854) — is `link_id` a pooled lane, in
+/// either pool family (identity `reusable_dialed_link` or scoped
+/// `reusable_scoped_link`)? A linear scan over the pools' lanes: both are small
+/// (bounded by live concurrency per destination).
+fn link_is_pooled(
+    identity: &HashMap<DestinationHash, Vec<LinkId>>,
+    scoped: &HashMap<DestinationHash, Vec<LinkId>>,
+    link_id: LinkId,
+) -> bool {
+    identity
+        .values()
+        .chain(scoped.values())
+        .any(|lanes| lanes.contains(&link_id))
+}
+
 static STARVED_POOL_CLOSE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
     std::sync::OnceLock::new();
 static POOL_CLOSED_CHANNEL_EXHAUSTED: std::sync::atomic::AtomicU64 =
@@ -7932,6 +8371,10 @@ struct LinkBook<'a> {
     link_last_outbound_at: &'a std::sync::Mutex<HashMap<LinkId, u64>>,
     metrics: Option<&'a crate::observability::EdgeMetrics>,
     metrics_source: u64,
+    /// CIRISEdge#805 — the A/V sink, whose per-link record a close ends.
+    av_sink: &'a crate::transport::av_sink::AvSink,
+    /// CIRISEdge#805 — the A/V links this node dialled, by peer.
+    av_dialed_peer: &'a std::sync::Mutex<HashMap<LinkId, String>>,
 }
 
 impl LinkBook<'_> {
@@ -7958,6 +8401,15 @@ impl LinkBook<'_> {
         // v3.5.1 (CIRISEdge#119 + #120) — drop the link's rooted
         // peer attribution when the link closes.
         self.link_to_peer_key_id.lock().await.remove(&link_id);
+        // CIRISEdge#805 — an A/V link's consumer sees the close as the end of
+        // its receiver, and its dial record goes with it. Here, not in the
+        // `LinkClosed` arm, so every way a link leaves (the event, this node's
+        // own teardown, the #853 idle reap, a vanished link) clears it.
+        self.av_sink.forget(&link_id);
+        self.av_dialed_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&link_id);
         // CIRISEdge#353 — drop the link's last-inbound stamp too, so a
         // closed link can never win the reverse-path selector.
         self.link_last_inbound_at.lock().await.remove(&link_id);
@@ -8040,6 +8492,18 @@ struct LinkClaim {
 }
 
 impl LinkClaim {
+    /// The lane this claim holds.
+    fn link_id(&self) -> LinkId {
+        self.link_id
+    }
+
+    /// Keep the lane claimed past this guard (a test seam that releases it
+    /// later by hand): disarm and hand back the id.
+    fn keep(mut self) -> LinkId {
+        self.armed = false;
+        self.link_id
+    }
+
     async fn release(mut self) {
         self.armed = false;
         self.in_flight.lock().await.remove(&self.link_id);
@@ -8179,9 +8643,25 @@ struct DialCtx {
     /// CIRISEdge#819 — see `ReticulumTransport::pool_last_used`.
     pool_last_used: Arc<std::sync::Mutex<HashMap<LinkId, std::time::Instant>>>,
     link_in_flight: Arc<Mutex<HashSet<LinkId>>>,
+    /// CIRISEdge#853 test seam — see
+    /// [`ReticulumTransport::delay_dial_publish_for_test`]. 0 in production.
+    test_publish_delay_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// CIRISEdge#805 — see `ReticulumTransport::fail_derived_identify`.
+    fail_derived_identify: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DialCtx {
+    /// CIRISEdge#853 — a [`LinkClaim`] over a lane this ctx already marked in
+    /// flight.
+    fn link_claim(&self, link_id: LinkId) -> LinkClaim {
+        LinkClaim {
+            in_flight: Arc::clone(&self.link_in_flight),
+            last_used: Arc::clone(&self.pool_last_used),
+            link_id,
+            armed: true,
+        }
+    }
+
     /// CIRISEdge#739 — dial `dest_hash` (a scope-derived member address) and
     /// identify the link: the body `send_to_scoped_destination` ran inline
     /// before the scoped pool, unchanged in its steps — record the dialled
@@ -8193,6 +8673,30 @@ impl DialCtx {
         destination_key_id: &str,
         dest_hash: DestinationHash,
         transport_ed25519: &[u8; 32],
+    ) -> Result<LinkId, TransportError> {
+        self.dial_derived_link(
+            destination_key_id,
+            dest_hash,
+            transport_ed25519,
+            LinkPlane::Scoped,
+            |_| {},
+        )
+        .await
+    }
+
+    /// The body of [`Self::dial_scoped_link`], for any plane a derived address
+    /// carries (`Scoped`, or `Av` for CIRISEdge#805). `before_establish` runs
+    /// with the link id the moment the dial is dispatched — before the link
+    /// can establish, so before the peer can send on it — which is where the
+    /// A/V plane registers the link's consumer and its attribution basis, so
+    /// no frame can find the link unregistered.
+    async fn dial_derived_link(
+        &self,
+        destination_key_id: &str,
+        dest_hash: DestinationHash,
+        transport_ed25519: &[u8; 32],
+        plane: LinkPlane,
+        before_establish: impl FnOnce(LinkId) + Send,
     ) -> Result<LinkId, TransportError> {
         let (link, established) = self
             .node
@@ -8207,14 +8711,12 @@ impl DialCtx {
             .lock()
             .await
             .insert(link_id, dest_hash);
-        // CIRISEdge#728 — this link is SCOPED for its whole life: the peer's
-        // reverse-path selector may attribute it to us, but no identity-plane
-        // send on either side may ride it. Tagged here, before establishment,
-        // so no selector can observe an untagged link.
-        self.link_plane
-            .lock()
-            .await
-            .insert(link_id, LinkPlane::Scoped);
+        // CIRISEdge#728 — this link is SCOPED (or, #805, A/V) for its whole
+        // life: the peer's reverse-path selector may attribute it to us, but no
+        // identity-plane send on either side may ride it. Tagged here, before
+        // establishment, so no selector can observe an untagged link.
+        self.link_plane.lock().await.insert(link_id, plane);
+        before_establish(link_id);
 
         // Explicit-hash destinations are never pathed (see the routability note
         // on `send_to_scoped_destination`), so this is always the
@@ -8242,6 +8744,21 @@ impl DialCtx {
             });
         }
 
+        // CIRISEdge#805 test seam: fail identify on an ESTABLISHED link, the
+        // partial-open arm a caller must clean up after.
+        if self
+            .fail_derived_identify
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(TransportError::Io(
+                "reticulum identify_link (scoped): forced failure (test seam)".to_owned(),
+            ));
+        }
         // CIRISEdge#340 — IDENTIFY before shipping, so the responder can
         // attribute the frame. Same ordering as the federation send path.
         self.node
@@ -8323,7 +8840,7 @@ impl DialCtx {
         peer: &ResolvedPeer,
         has_path: bool,
         establish_timeout: Duration,
-    ) -> Result<LinkId, TransportError> {
+    ) -> Result<LinkClaim, TransportError> {
         // CIRISEdge#484 — leviculum v0.16 `connect_awaited` returns the handle
         // immediately AND a completion future for `LinkEstablished`, registered
         // BEFORE dispatch (edge no longer needs to observe the event loop `listen`
@@ -8432,15 +8949,31 @@ impl DialCtx {
         // bundle-served — the three things a reusing sender skips. Publishing
         // any earlier would hand another coordinator a link the responder will
         // drop frames on (`SkippedNoSourceKeyId`, #317/#340).
+        //
+        // CIRISEdge#853 — and publish it CLAIMED, for the send that dialled
+        // it. Published unclaimed, a concurrent send could take the lane from
+        // the pool in the gap before the dialler claimed it, and both shipped
+        // on one link (leviculum `TransferInProgress`). The claim rides back
+        // to the dialler as a `LinkClaim`; if the dialler was cancelled while
+        // it waited (the #568 detach), the task's output is dropped when the
+        // task finishes and the claim's `Drop` gives the lane back to the pool.
         stamp_pool_use(&self.pool_last_used, link_id);
+        self.link_in_flight.lock().await.insert(link_id);
+        let claim = self.link_claim(link_id);
         self.reusable_dialed_link
             .lock()
             .await
             .entry(peer.dest_hash)
             .or_default()
             .push(link_id);
+        let delay = self
+            .test_publish_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
 
-        Ok(link_id)
+        Ok(claim)
     }
 
     /// CIRISEdge#532 — the live, identified link we already hold to this dest,
@@ -8456,7 +8989,7 @@ impl DialCtx {
     /// the way out regardless, so this lookup is `(dest, Identity)` by
     /// construction AND by check, and a scoped link can never be handed to an
     /// identity-plane sender through this door either.
-    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkId> {
+    async fn reusable_link_to(&self, dest: &DestinationHash) -> Option<LinkClaim> {
         let mut map = self.reusable_dialed_link.lock().await;
         let pool = map.get_mut(dest)?;
         // Drop links leviculum no longer holds, so a dead entry cannot occupy a
@@ -8488,7 +9021,7 @@ impl DialCtx {
             in_flight.insert(id);
             stamp_pool_use(&self.pool_last_used, id);
         }
-        picked
+        picked.map(|id| self.link_claim(id))
     }
 }
 
@@ -8638,7 +9171,21 @@ struct EventCtx<'a> {
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     swallow_link_closed: &'a std::sync::Mutex<HashSet<LinkId>>,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
+    reusable_scoped_link: &'a Mutex<HashMap<DestinationHash, Vec<LinkId>>>,
+    /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
+    concluded_resources: &'a std::sync::Mutex<HashMap<[u8; 32], std::time::Instant>>,
+    /// CIRISEdge#853 test seam — see the field of the same name on
+    /// [`ReticulumTransport`].
+    swallow_link_established: &'a std::sync::atomic::AtomicBool,
+    /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
     link_last_outbound_at: &'a std::sync::Mutex<HashMap<LinkId, u64>>,
+    /// CIRISEdge#805 — see the field of the same name on [`ReticulumTransport`].
+    av_sink: &'a crate::transport::av_sink::AvSink,
+    /// CIRISEdge#805 — the node as an `Arc`, for the sender an A/V arrival
+    /// carries (`node` above is the same node, borrowed).
+    av_node: &'a Arc<ReticulumNode>,
+    /// CIRISEdge#805 — see the field of the same name on [`ReticulumTransport`].
+    av_dialed_peer: &'a std::sync::Mutex<HashMap<LinkId, String>>,
 }
 
 impl EventCtx<'_> {
@@ -8658,6 +9205,8 @@ impl EventCtx<'_> {
             link_last_outbound_at: self.link_last_outbound_at,
             metrics: self.metrics,
             metrics_source: self.metrics_source,
+            av_sink: self.av_sink,
+            av_dialed_peer: self.av_dialed_peer,
         }
     }
 }
@@ -8684,6 +9233,13 @@ pub enum LinkPlane {
     Identity,
     /// Dialled to a scope-derived member address (`ScopeAddressTable`).
     Scoped,
+    /// CIRISEdge#805 item 4 — dialled to a scope-derived member address of an
+    /// A/V SESSION's group (the [`crate::av_addressing::AV_STREAM_GROUP_PREFIX`]
+    /// namespace). Its data is A/V wire frames for the transport's A/V sink,
+    /// never an envelope: no replication, announce, bundle or scoped body rides
+    /// it, and none of its frames reaches the replication router
+    /// (`FSD/CIRIS_EDGE_TRANSPORT.md` §3.6).
+    Av,
 }
 
 impl LinkPlane {
@@ -8693,19 +9249,91 @@ impl LinkPlane {
         match self {
             Self::Identity => "identity",
             Self::Scoped => "scoped",
+            Self::Av => "av",
         }
     }
+
+    /// The route an inbound frame on this plane takes — THE one place a plane
+    /// chooses between the envelope path and the A/V sink. Exhaustive, so a
+    /// plane added later must choose here.
+    const fn route(self) -> InboundPlaneRoute {
+        match self {
+            Self::Identity => InboundPlaneRoute::Envelope(EnvelopePlane::Identity),
+            Self::Scoped => InboundPlaneRoute::Envelope(EnvelopePlane::Scoped),
+            Self::Av => InboundPlaneRoute::Av,
+        }
+    }
+}
+
+/// CIRISEdge#805 — the planes whose frames are ENVELOPES (replication,
+/// announce, bundle, scoped bodies). `attribute_and_deliver` — the only road
+/// to the replication sink — takes this type, which has no A/V variant, so an
+/// A/V link's frame cannot be handed to it: misrouting is unrepresentable, not
+/// checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopePlane {
+    Identity,
+    Scoped,
+}
+
+impl EnvelopePlane {
+    const fn link_plane(self) -> LinkPlane {
+        match self {
+            Self::Identity => LinkPlane::Identity,
+            Self::Scoped => LinkPlane::Scoped,
+        }
+    }
+}
+
+/// CIRISEdge#805 — where an inbound link frame goes, by its link's plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundPlaneRoute {
+    /// The envelope path: reassembly, attribution, the replication sink.
+    Envelope(EnvelopePlane),
+    /// The A/V sink, through the same attribution gate.
+    Av,
 }
 
 /// CIRISEdge#728 — classify a link by the destination it was dialled to. Pure
 /// over the table: `Scoped` iff the reverse index resolves the hash. No table
 /// (a node that never opted into scope-native addressing) ⇒ every link is
 /// identity-plane, which is exactly the pre-#499 world.
+///
+/// CIRISEdge#805 — a derived address whose GROUP is an A/V session's (the
+/// [`crate::av_addressing::AV_STREAM_GROUP_PREFIX`] namespace) is `Av`: same
+/// table, same reverse index, one more fact read from the entry it returns.
 fn classify_link_plane(table: Option<&ScopeAddressTable>, dest: &DestinationHash) -> LinkPlane {
     match table.and_then(|t| t.accepts_inbound(dest.as_bytes())) {
+        Some(a) if crate::av_addressing::is_av_stream_group(a.group().group_id()) => LinkPlane::Av,
         Some(_) => LinkPlane::Scoped,
         None => LinkPlane::Identity,
     }
+}
+
+/// CIRISEdge#805 — the destination an inbound frame's link was dialled to, and
+/// the link's plane: the establishment-time record, or — for a link the record
+/// misses (a re-keyed alias the event loop has not tagged) — classified from
+/// that destination the same way. Resolved ONCE per frame, before any route is
+/// chosen.
+async fn resolve_inbound_link(
+    ctx: &EventCtx<'_>,
+    link_id: &LinkId,
+) -> (Option<DestinationHash>, LinkPlane) {
+    // CIRISEdge#353/#424 — leviculum's `link_destination` answers for links a
+    // peer dialed to us but returns `None` for our OWN dialed links (its
+    // `link()` registry misses the initiator direction / a #66 re-key); fall
+    // back to edge's own connect-time record, which is re-key-independent.
+    let dest = match ctx.node.link_destination(link_id) {
+        Some(d) => Some(d),
+        None => ctx.dialed_link_dest.lock().await.get(link_id).copied(),
+    };
+    let recorded_plane = ctx.link_plane.lock().await.get(link_id).copied();
+    let plane = recorded_plane.unwrap_or_else(|| {
+        dest.map_or(LinkPlane::Identity, |d| {
+            classify_link_plane(ctx.scope_addresses.get().map(Arc::as_ref), &d)
+        })
+    });
+    (dest, plane)
 }
 
 /// CIRISEdge#728 — the identity-plane frame classes the transport can name
@@ -9012,7 +9640,16 @@ async fn transport_binding_of(
 /// the `LinkIdentified`-fed table first (a peer dialed us), then the link's
 /// DESTINATION (a link WE dialed — the reverse path), then `None`
 /// (SkippedNoSourceKeyId downstream, never a silent drop).
-async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8>) {
+async fn attribute_and_deliver(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    dest: Option<DestinationHash>,
+    plane: EnvelopePlane,
+    data: Vec<u8>,
+) {
+    // CIRISEdge#805 — an `EnvelopePlane` is Identity or Scoped, never Av:
+    // this fn cannot be entered for an A/V link (see `LinkPlane::route`).
+    let plane = plane.link_plane();
     // CIRISEdge#353 — stamp last-inbound for the reverse-path link selector
     // (RNS `last_inbound`). This frame proves the peer is ALIVE on THIS link
     // right now, so a subsequent reply rides it rather than a dead-but-`Active`
@@ -9026,6 +9663,8 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             .await
             .insert(link_id, now_secs);
     }
+    // CIRISEdge#853 — a link whose `LinkEstablished` edge never saw.
+    recover_unknown_link(ctx, link_id).await;
     // CIRISEdge#414 / CIRISAgent#932 — REASSEMBLE before attributing/routing. A
     // whole (`CRPL…`) frame passes straight through unchanged; a `CFRG` fragment
     // (the send side split an oversized reverse-path reply onto the packet path)
@@ -9046,18 +9685,11 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         };
         frame
     };
-    // CIRISEdge#353/#424 — the link's DESTINATION, the basis of INITIATOR-side
-    // attribution below and (CIRISEdge#499) of the arrival scope. leviculum's
-    // `link_destination` answers this for links a peer dialed to us, but returns
-    // `None` for our OWN dialed links (its `link()` registry misses the initiator
-    // direction / a #66 re-key). That `None` is exactly what dropped every
-    // initiator-side reply `source_key_id=None` (CIRISEdge#424): the arm exited
-    // at step one into an un-instrumented `else`. Fall back to edge's own
-    // connect-time record (`dialed_link_dest`), which is re-key-independent.
-    let dest = match ctx.node.link_destination(&link_id) {
-        Some(d) => Some(d),
-        None => ctx.dialed_link_dest.lock().await.get(&link_id).copied(),
-    };
+    // CIRISEdge#353/#424 — `dest` is the link's DESTINATION, the basis of
+    // INITIATOR-side attribution below and (CIRISEdge#499) of the arrival scope,
+    // resolved by `resolve_inbound_link` (leviculum's `link_destination`, else
+    // edge's own connect-time `dialed_link_dest` record — the `None` that
+    // dropped every initiator-side reply in #424).
     // CIRISEdge#499 — resolve the SCOPE-DERIVED address this frame arrived on,
     // here, once, BEFORE the envelope is parsed. The resolution is a single
     // hash-map probe against the reverse index (the table exists precisely so
@@ -9083,17 +9715,10 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     // can never again read as the generic `DestUnmatched` miss (the initiator's
     // side of a scoped link resolves to the peer's derived address, which the
     // peers map does not — and must not — hold). The plane is the link's
-    // establishment-time record; a link the record misses (a re-keyed alias
-    // the event loop has not tagged) is classified from its destination the
-    // same way. Bootstrap kinds are NOT exempt: `FIRST_CONTACT.md` §2's R1
-    // carve-out (#402) is an attribution carve-out on the identity plane, and
-    // a derived address exists only after first contact.
-    let recorded_plane = ctx.link_plane.lock().await.get(&link_id).copied();
-    let plane = recorded_plane.unwrap_or_else(|| {
-        dest.map_or(LinkPlane::Identity, |d| {
-            classify_link_plane(ctx.scope_addresses.get().map(Arc::as_ref), &d)
-        })
-    });
+    // establishment-time record (`resolve_inbound_link`). Bootstrap kinds are
+    // NOT exempt: `FIRST_CONTACT.md` §2's R1 carve-out (#402) is an attribution
+    // carve-out on the identity plane, and a derived address exists only after
+    // first contact.
     if plane == LinkPlane::Scoped {
         if let Some(class) = identity_plane_frame_class(&data) {
             let scope = arrival_scope.as_ref().map_or_else(
@@ -9276,11 +9901,6 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
         // one-motion upgrade; `drop_inbound` / throttled WARN on any refusal).
         return;
     }
-    // CIRISEdge#853 — the first application frame on a link a peer dialled
-    // ends its link-up (a no-op for a link not being timed).
-    if let Some(m) = ctx.metrics {
-        m.responder_link_up_end(link_id.into_bytes(), crate::observability::LINK_UP_OK);
-    }
     // Gate (CIRISEdge#393): admit the attribution only if the candidate's binding
     // is `Rooted ∧ owns_key` (item 1) AND its transport identity is bound by a
     // hybrid-verified `SignedTransportDestination` (item 2, the PQ half). Any
@@ -9404,131 +10024,7 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
     };
     let link_key_id = candidate_key_id.clone();
     let source_key_id = match candidate_key_id {
-        Some(key_id) => {
-            // Item 1 — owns_key (CIRISEdge#659: provenance is NOT consulted; a
-            // self-signed production agent that owns its key is attributable, and
-            // whether it is SERVED is the bridge's `rooted_with`), plus capture
-            // the peer's dest for the item-2 lookup. `dest` is `None` when the
-            // peer isn't in the map. CIRISEdge#404 — ALSO snapshot the RESOLVED
-            // binding's operands (provenance, owns_key, epoch) so the
-            // attribution-miss log can name the actual operands.
-            let (item1, dest, resolved) = {
-                let peers = ctx.peers.lock().await;
-                match peers.get(&key_id) {
-                    Some(rooted) => (
-                        crate::transport::SourceKeyId::from_attributed_binding(
-                            key_id.clone(),
-                            rooted.owns_key,
-                        ),
-                        Some(rooted.peer.dest_hash.into_bytes()),
-                        Some((rooted.provenance, rooted.owns_key, rooted.epoch)),
-                    ),
-                    None => (None, None, None),
-                }
-            };
-            // Item 2 — the PQ transport binding. Fail-closed without a rooting
-            // directory (can't prove the hybrid route ⇒ not attributable).
-            let gated = match (item1, dest, ctx.rooting) {
-                (Some(sid), Some(d), Some(rooting)) => {
-                    if binding_exists_cached(ctx.binding_cache, rooting, &key_id, d).await {
-                        Some(sid)
-                    } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
-                        link_attribution_miss_log().check(key_id.as_str())
-                    {
-                        // CIRISEdge#722 — name the OTHER operand. `dest` is what
-                        // the peer announced (its peers-map entry); the row this
-                        // node HOLDS for the peer decides the verdict, and the two
-                        // failure classes ("no row has reached me" vs "the row
-                        // names a different dest") were indistinguishable from
-                        // this line alone. Read on the throttled path only.
-                        let held_signed_route = describe_held_route(rooting, &key_id).await;
-                        tracing::warn!(
-                            link = ?link_id,
-                            peer = %key_id,
-                            dest = %hex::encode(d),
-                            %held_signed_route,
-                            suppressed_prev,
-                            "inbound frame DROPPED — item 1 PASSED (owns_key) but \
-                             item 2 FAILED: no hybrid-verified SignedTransportDestination \
-                             binds this (peer, dest) pair (CIRISEdge#393 item 2). This is \
-                             the ONLY failing conjunct. `held_signed_route=none` ⇒ the \
-                             peer's TransportDestination row has not reached this node; a \
-                             held dest ≠ `dest` ⇒ the peer announces on a destination its \
-                             signed route does not name (CIRISEdge#722)"
-                        );
-                        None
-                    } else {
-                        None
-                    }
-                }
-                (Some(_), _, None) => {
-                    // A CONFIG condition that nulls EVERY attribution — throttled on a
-                    // FIXED discriminant (one condition, not per-peer) so a misconfig
-                    // reminds periodically without one-warn-per-frame flooding.
-                    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
-                        link_attribution_miss_log().check("no-rooting-directory")
-                    {
-                        tracing::warn!(
-                            link = ?link_id,
-                            peer = %key_id,
-                            suppressed_prev,
-                            "inbound frame DROPPED — NO ROOTING DIRECTORY wired on this \
-                             transport, so item 2 can never be evaluated (fail-closed). This \
-                             nulls EVERY attribution regardless of kind or path — check the \
-                             Edge builder wires a RootingDirectory (CIRISEdge#393 item 2)"
-                        );
-                    }
-                    None
-                }
-                _ => None,
-            };
-            // CIRISEdge#659 observability ask 2 — the operands of EVERY drop, on
-            // an unthrottled DEBUG line. The WARN below is throttled per key (5 per
-            // minute, by design: an attacker-chosen flood must not own the log),
-            // which meant that after the first miss every further drop from a
-            // peer was invisible — `suppressed_prev=22` on a canonical dropping
-            // every frame. DEBUG is off in production by default and on in the
-            // harness (`RUST_LOG=ciris_edge=debug`), which is where the count
-            // has to be readable frame by frame.
-            if gated.is_none() {
-                tracing::debug!(
-                    link = ?link_id,
-                    peer = %key_id,
-                    resolved_binding = ?resolved,
-                    item1_owns_key = resolved.is_some_and(|(_, owns_key, _)| owns_key),
-                    dest = ?dest.map(hex::encode),
-                    rooting_directory_wired = ctx.rooting.is_some(),
-                    "inbound frame NOT attributed — operands (every drop; the WARN is per-key \
-                     throttled) (CIRISEdge#659)"
-                );
-            }
-            let gated = if gated.is_some() {
-                gated
-            } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
-                // CIRISEdge#404/#432 — the attribution decision has a voice AND a
-                // remedy, both bounded by this per-key_id throttle (the 1024-cap
-                // map bounds an attacker-chosen flood; the throttle's Emit floor
-                // also bounds the heal's directory point-read to a few per window
-                // — and the FIRST failing frame always Emits, so a genuine
-                // divergence heals on frame one, not after a window).
-                link_attribution_miss_log().check(key_id.as_str())
-            {
-                // CIRISEdge#432 — before declaring the miss, consult the DURABLE
-                // store. The live map and the store have independent writers (a
-                // replication-side or server-side rooting updates only the store),
-                // so "resolved Advisory" can be stale while persist holds
-                // `rooted` — the two-day dark-Attestation-plane class. If the
-                // store roots the SAME transport identity this link proved,
-                // upgrade the live entry in place (a one-peer mid-session boot
-                // prime — exactly the motion a process restart performs) and
-                // attribute THIS frame.
-                heal_or_report_attribution_miss(ctx, &key_id, resolved, link_id, suppressed_prev)
-                    .await
-            } else {
-                None
-            };
-            gated
-        }
+        Some(key_id) => gate_attribution(ctx, link_id, key_id).await,
         // NO candidate key_id at all — the frame is dropped unattributed. This is
         // NOT a silent drop: the specific cause (`NoDest` / `DestUnmatched`) was
         // ALREADY logged loudly + throttled by the `resolve_link_attribution` arm
@@ -9554,8 +10050,387 @@ async fn attribute_and_deliver(ctx: &EventCtx<'_>, link_id: LinkId, data: Vec<u8
             link_id.into_bytes(),
         )),
     };
+    note_link_up_frame(ctx.metrics, link_id, frame.source_key_id.is_some());
     if let Err(e) = ctx.sink.send(frame).await {
         tracing::error!(error = %e, "inbound channel send failed");
+    }
+}
+
+/// **CIRISEdge#853 (Codex round two on #854) — rebuild the bookkeeping of a
+/// link whose `LinkEstablished` this node never processed** (a full control
+/// plane drops the newest event; leviculum 0.27 offers no way to list its
+/// links). Called on the link's next per-link event (`LinkIdentified`, or any
+/// frame): a link the node holds but edge has no direction record for is
+/// recorded INBOUND unless this node dialled it (`dialed_link_dest` is written
+/// at every own dial), mirrored as established, given `now` as its
+/// establishment time (so the idle reap starts its clock here) and its plane,
+/// and counted in `recovered_links_total`. Without it such a link was never a
+/// reap candidate and never counted: the exact growth #853 stops.
+async fn recover_unknown_link(ctx: &EventCtx<'_>, link_id: LinkId) {
+    if ctx
+        .link_direction
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .by_link
+        .contains_key(&link_id)
+        || !ctx.node.link_is_established(&link_id)
+    {
+        return;
+    }
+    let dialled = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
+    let direction = if dialled {
+        LinkDirection::Outbound
+    } else {
+        LinkDirection::Inbound
+    };
+    {
+        let mut dirs = ctx
+            .link_direction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if dirs.by_link.contains_key(&link_id) {
+            return;
+        }
+        dirs.insert(link_id, direction);
+        publish_link_directions(ctx.metrics, ctx.metrics_source, &dirs);
+    }
+    ctx.established_links.lock().await.insert(link_id);
+    let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+    ctx.link_established_at
+        .lock()
+        .await
+        .entry(link_id)
+        .or_insert(now_secs);
+    let plane = match ctx.node.link_destination(&link_id) {
+        Some(dest) => Some(
+            *ctx.link_plane
+                .lock()
+                .await
+                .entry(link_id)
+                .or_insert_with(|| {
+                    classify_link_plane(ctx.scope_addresses.get().map(Arc::as_ref), &dest)
+                }),
+        ),
+        None => ctx.link_plane.lock().await.get(&link_id).copied(),
+    };
+    // The resource strategy the lost `LinkEstablished` arm would have set: a
+    // link's default is `AcceptNone`, so without it every Resource the peer
+    // ships on a recovered link is refused. Same mapping as that arm.
+    let strategy = match plane {
+        Some(LinkPlane::Av) => ResourceStrategy::AcceptNone,
+        _ => ResourceStrategy::AcceptAll,
+    };
+    let _ = ctx.node.set_resource_strategy(&link_id, strategy);
+    if let Some(m) = ctx.metrics {
+        m.inc_recovered_links();
+    }
+    tracing::info!(
+        link = %hex::encode(link_id.as_bytes()),
+        direction = ?direction,
+        "recovered a link whose LinkEstablished was never processed (a control-plane \
+         overflow drops it); it is now tracked, counted and reapable (CIRISEdge#853)"
+    );
+}
+
+/// CIRISEdge#853 (Codex round two on #854) — an application frame on a link
+/// a peer dialled ends its link-up as `ok`, but only an ATTRIBUTED one. An
+/// unattributed frame may be the sibling's owner-binding push, whose stage is
+/// recorded downstream at the carve-out (`OwnerBindingCarveOut::admit_frame`),
+/// which then ends the link-up itself; ending it here first left that stage
+/// with no start time, so it was never recorded. An unattributed frame that is
+/// not an owner binding leaves the link-up to time out, as it should.
+fn note_link_up_frame(
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    link_id: LinkId,
+    attributed: bool,
+) {
+    if let (true, Some(m)) = (attributed, metrics) {
+        m.responder_link_up_end(link_id.into_bytes(), crate::observability::LINK_UP_OK);
+    }
+}
+
+/// CIRISEdge#393 — THE attribution gate, for a candidate peer `key_id` a link
+/// resolved to: item 1 (`Rooted ∧ owns_key`) and item 2 (a hybrid-verified
+/// `SignedTransportDestination` binds the peer's dest), with the #432 durable
+/// heal on a miss. `Some` is the only attributed outcome. Extracted unchanged
+/// from `attribute_and_deliver` so the A/V plane (CIRISEdge#805) gates its
+/// links through the SAME function rather than a copy that could drift.
+async fn gate_attribution(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    key_id: String,
+) -> Option<crate::transport::SourceKeyId> {
+    // Item 1 — owns_key (CIRISEdge#659: provenance is NOT consulted; a
+    // self-signed production agent that owns its key is attributable, and
+    // whether it is SERVED is the bridge's `rooted_with`), plus capture
+    // the peer's dest for the item-2 lookup. `dest` is `None` when the
+    // peer isn't in the map. CIRISEdge#404 — ALSO snapshot the RESOLVED
+    // binding's operands (provenance, owns_key, epoch) so the
+    // attribution-miss log can name the actual operands.
+    let (item1, dest, resolved) = {
+        let peers = ctx.peers.lock().await;
+        match peers.get(&key_id) {
+            Some(rooted) => (
+                crate::transport::SourceKeyId::from_attributed_binding(
+                    key_id.clone(),
+                    rooted.owns_key,
+                ),
+                Some(rooted.peer.dest_hash.into_bytes()),
+                Some((rooted.provenance, rooted.owns_key, rooted.epoch)),
+            ),
+            None => (None, None, None),
+        }
+    };
+    // Item 2 — the PQ transport binding. Fail-closed without a rooting
+    // directory (can't prove the hybrid route ⇒ not attributable).
+    let gated = match (item1, dest, ctx.rooting) {
+        (Some(sid), Some(d), Some(rooting)) => {
+            if binding_exists_cached(ctx.binding_cache, rooting, &key_id, d).await {
+                Some(sid)
+            } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                link_attribution_miss_log().check(key_id.as_str())
+            {
+                // CIRISEdge#722 — name the OTHER operand. `dest` is what
+                // the peer announced (its peers-map entry); the row this
+                // node HOLDS for the peer decides the verdict, and the two
+                // failure classes ("no row has reached me" vs "the row
+                // names a different dest") were indistinguishable from
+                // this line alone. Read on the throttled path only.
+                let held_signed_route = describe_held_route(rooting, &key_id).await;
+                tracing::warn!(
+                    link = ?link_id,
+                    peer = %key_id,
+                    dest = %hex::encode(d),
+                    %held_signed_route,
+                    suppressed_prev,
+                    "inbound frame DROPPED — item 1 PASSED (owns_key) but \
+                     item 2 FAILED: no hybrid-verified SignedTransportDestination \
+                     binds this (peer, dest) pair (CIRISEdge#393 item 2). This is \
+                     the ONLY failing conjunct. `held_signed_route=none` ⇒ the \
+                     peer's TransportDestination row has not reached this node; a \
+                     held dest ≠ `dest` ⇒ the peer announces on a destination its \
+                     signed route does not name (CIRISEdge#722)"
+                );
+                None
+            } else {
+                None
+            }
+        }
+        (Some(_), _, None) => {
+            // A CONFIG condition that nulls EVERY attribution — throttled on a
+            // FIXED discriminant (one condition, not per-peer) so a misconfig
+            // reminds periodically without one-warn-per-frame flooding.
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                link_attribution_miss_log().check("no-rooting-directory")
+            {
+                tracing::warn!(
+                    link = ?link_id,
+                    peer = %key_id,
+                    suppressed_prev,
+                    "inbound frame DROPPED — NO ROOTING DIRECTORY wired on this \
+                     transport, so item 2 can never be evaluated (fail-closed). This \
+                     nulls EVERY attribution regardless of kind or path — check the \
+                     Edge builder wires a RootingDirectory (CIRISEdge#393 item 2)"
+                );
+            }
+            None
+        }
+        _ => None,
+    };
+    // CIRISEdge#659 observability ask 2 — the operands of EVERY drop, on
+    // an unthrottled DEBUG line. The WARN below is throttled per key (5 per
+    // minute, by design: an attacker-chosen flood must not own the log),
+    // which meant that after the first miss every further drop from a
+    // peer was invisible — `suppressed_prev=22` on a canonical dropping
+    // every frame. DEBUG is off in production by default and on in the
+    // harness (`RUST_LOG=ciris_edge=debug`), which is where the count
+    // has to be readable frame by frame.
+    if gated.is_none() {
+        tracing::debug!(
+            link = ?link_id,
+            peer = %key_id,
+            resolved_binding = ?resolved,
+            item1_owns_key = resolved.is_some_and(|(_, owns_key, _)| owns_key),
+            dest = ?dest.map(hex::encode),
+            rooting_directory_wired = ctx.rooting.is_some(),
+            "inbound frame NOT attributed — operands (every drop; the WARN is per-key \
+             throttled) (CIRISEdge#659)"
+        );
+    }
+    let gated = if gated.is_some() {
+        gated
+    } else if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        // CIRISEdge#404/#432 — the attribution decision has a voice AND a
+        // remedy, both bounded by this per-key_id throttle (the 1024-cap
+        // map bounds an attacker-chosen flood; the throttle's Emit floor
+        // also bounds the heal's directory point-read to a few per window
+        // — and the FIRST failing frame always Emits, so a genuine
+        // divergence heals on frame one, not after a window).
+        link_attribution_miss_log().check(key_id.as_str())
+    {
+        // CIRISEdge#432 — before declaring the miss, consult the DURABLE
+        // store. The live map and the store have independent writers (a
+        // replication-side or server-side rooting updates only the store),
+        // so "resolved Advisory" can be stale while persist holds
+        // `rooted` — the two-day dark-Attestation-plane class. If the
+        // store roots the SAME transport identity this link proved,
+        // upgrade the live entry in place (a one-peer mid-session boot
+        // prime — exactly the motion a process restart performs) and
+        // attribute THIS frame.
+        heal_or_report_attribution_miss(ctx, &key_id, resolved, link_id, suppressed_prev).await
+    } else {
+        None
+    };
+    gated
+}
+
+/// The `transport_inbound_drops` / `av_plane` tag for an A/V frame whose link's
+/// peer did not pass the #393 gate (CIRISEdge#805).
+pub const DROP_AV_FRAME_UNATTRIBUTED: &str = crate::observability::AV_INBOUND_DROPPED_UNATTRIBUTED;
+
+static AV_SINK_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+/// CIRISEdge#805 — the per-link throttle for routine A/V sink drops (overflow,
+/// no consumer): DEBUG, a few per minute per link, never per frame
+/// (CIRISEdge#460). The exact count is the `av_plane` counter, never throttled.
+fn av_sink_drop_log() -> &'static crate::log_throttle::LogThrottle {
+    AV_SINK_DROP_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(5, Duration::from_secs(60), 256))
+}
+
+/// CIRISEdge#805 item 4 — **one inbound frame on an A/V link.**
+///
+/// Reached only from the `InboundPlaneRoute::Av` arm, i.e. only for a link
+/// whose plane is `Av` (fixed at establishment). The frame is attributed
+/// through the SAME [`gate_attribution`] a replication frame passes —
+/// responder side by the link's `LinkIdentified` peer, initiator side by the
+/// peer this node dialled ([`ReticulumTransport::open_av_link`]) — and an
+/// unattributed frame is dropped by name. An attributed one goes to the
+/// [`crate::transport::av_sink::AvSink`]: never awaited on, never blocking
+/// the loop replication shares.
+///
+/// There is no reassembly and no envelope parse here: an A/V chunk is one
+/// Channel message by construction (CIRISEdge#720 refuses a larger one at
+/// send), and the frame is opaque until the consumer opens it.
+async fn deliver_av_frame(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    dest: Option<DestinationHash>,
+    data: Vec<u8>,
+) {
+    use crate::transport::av_sink::AvDelivery;
+    let count = |label: &'static str| {
+        if let Some(m) = ctx.metrics {
+            m.inc_av_plane(label);
+        }
+    };
+    let identified = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    let candidate = match identified {
+        Some(k) => Some(k),
+        None => ctx
+            .av_dialed_peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&link_id)
+            .cloned(),
+    };
+    let gated = match candidate {
+        // CIRISEdge#621's rule holds on this plane too: a link's source is
+        // never this node.
+        Some(key_id) if key_id == ctx.local_key_id => None,
+        Some(key_id) => gate_attribution(ctx, link_id, key_id).await,
+        None => None,
+    };
+    let Some(peer) = gated else {
+        count(DROP_AV_FRAME_UNATTRIBUTED);
+        let detail = format!(
+            "an A/V frame ({} bytes) on link={link_id:?} dest={} whose peer did not pass the \
+             #393 gate (no LinkIdentified peer and no own dial, or not Rooted∧owns_key with a \
+             hybrid-bound route); not delivered to the A/V sink (CIRISEdge#805)",
+            data.len(),
+            dest.map_or_else(|| "-".to_owned(), |d| hex::encode(d.into_bytes())),
+        );
+        drop_inbound(Some(link_id), DROP_AV_FRAME_UNATTRIBUTED, &detail);
+        // The frame consumed a counter on the sender's side: count it, so the
+        // next ADMITTED frame on this link reports the gap and the consumer's
+        // hop counter skips past it once the binding recovers (Codex on #813).
+        ctx.av_sink.note_dropped_before_sink(link_id);
+        return;
+    };
+    // CIRISEdge#353 / #853 — an attributed A/V frame is proof the peer is alive
+    // on THIS link right now: stamp it, exactly as `attribute_and_deliver`
+    // stamps every envelope-path frame. The responder-side idle reap (#853)
+    // reads this stamp, so a call carrying media is never reaped mid-call,
+    // while an A/V link that really goes quiet still ages out. Stamped only
+    // AFTER the #393 gate: an unattributed flood must not keep a link alive.
+    // The reverse-path reply selector also reads this map, but it selects by
+    // `(peer, plane)` and never picks an `Av` link (#728/§3.6).
+    {
+        let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
+        ctx.link_last_inbound_at
+            .lock()
+            .await
+            .insert(link_id, now_secs);
+    }
+    // CIRISEdge#853 — an A/V link whose `LinkEstablished` was lost is
+    // recovered here too, so it is tracked and reapable like any other.
+    recover_unknown_link(ctx, link_id).await;
+    let address = dest.and_then(|d| {
+        ctx.scope_addresses
+            .get()
+            .and_then(|t| t.accepts_inbound(&d.into_bytes()))
+    });
+    let node = Arc::clone(ctx.av_node);
+    let metrics = ctx.metrics.cloned();
+    let delivery = ctx.av_sink.deliver(link_id, data, |inbound| {
+        crate::transport::av_sink::AvArrival {
+            link_id: link_id.into_bytes(),
+            peer: peer.clone(),
+            // `None` only when the address the link was dialled to has since
+            // been sealed out of the table (a live link outlives its epoch's
+            // window by design, CIRISEdge#499) — the link stays A/V either way.
+            address: address.clone(),
+            inbound,
+            sender: crate::transport::realtime_av_runtime::LeviculumAvSender::new(node, link_id)
+                .with_metrics(metrics),
+        }
+    });
+    match delivery {
+        AvDelivery::Queued => count(crate::observability::AV_INBOUND_DELIVERED),
+        AvDelivery::Arrived => {
+            count(crate::observability::AV_INBOUND_DELIVERED);
+            count(crate::observability::AV_LINK_ARRIVED);
+            tracing::info!(
+                link = ?link_id,
+                peer = %peer.as_str(),
+                "A/V link arrived — handed to the A/V consumer (CIRISEdge#805)"
+            );
+        }
+        AvDelivery::DroppedFull
+        | AvDelivery::ConsumerGone
+        | AvDelivery::ArrivalsFull
+        | AvDelivery::NoConsumer => {
+            let label = match delivery {
+                AvDelivery::DroppedFull => crate::observability::AV_INBOUND_DROPPED_QUEUE_FULL,
+                AvDelivery::ConsumerGone => crate::observability::AV_INBOUND_DROPPED_CONSUMER_GONE,
+                AvDelivery::ArrivalsFull => crate::observability::AV_INBOUND_DROPPED_ARRIVALS_FULL,
+                _ => crate::observability::AV_INBOUND_DROPPED_NO_CONSUMER,
+            };
+            count(label);
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                av_sink_drop_log().check(&format!("{label}:{link_id:?}"))
+            {
+                tracing::debug!(
+                    link = ?link_id,
+                    peer = %peer.as_str(),
+                    reason = label,
+                    suppressed_prev,
+                    "A/V frame dropped at the sink — realtime, never queued behind a slow \
+                     consumer (CIRISEdge#805; the count is `av_plane`)"
+                );
+            }
+        }
     }
 }
 
@@ -9607,13 +10482,18 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             is_initiator,
             destination_hash,
         } => {
-            // Auto-accept inbound resources so envelope transfers
-            // reassemble without app intervention. Covers BOTH responder
-            // (the link the peer just initiated against us) and
-            // initiator (so ACK envelopes pushed back are reassembled).
-            let _ = ctx
-                .node
-                .set_resource_strategy(&link_id, ResourceStrategy::AcceptAll);
+            // CIRISEdge#853 test seam — model a `LinkEstablished` lost to a full
+            // control plane: edge records nothing for this link.
+            if !is_initiator
+                && ctx
+                    .swallow_link_established
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                // choke-ok: a test-only seam (false in production); the link's
+                // bookkeeping is recovered from its next event (#853,
+                // `recover_unknown_link`).
+                return;
+            }
             ctx.established_links.lock().await.insert(link_id);
             // CIRISEdge#853 — which end opened it, from the node's own link
             // state: known here for every link, before any LINKIDENTIFY.
@@ -9652,6 +10532,18 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 plane = plane.as_str(),
                 "link established — plane fixed for its lifetime (CIRISEdge#728)"
             );
+            // Auto-accept inbound resources so envelope transfers
+            // reassemble without app intervention. Covers BOTH responder
+            // (the link the peer just initiated against us) and
+            // initiator (so ACK envelopes pushed back are reassembled).
+            // CIRISEdge#805 — except on an A/V link: A/V rides the Channel
+            // only, so a Resource advertised there is refused at the
+            // advertisement rather than assembled and then dropped.
+            let strategy = match plane {
+                LinkPlane::Av => ResourceStrategy::AcceptNone,
+                LinkPlane::Identity | LinkPlane::Scoped => ResourceStrategy::AcceptAll,
+            };
+            let _ = ctx.node.set_resource_strategy(&link_id, strategy);
             // CIRISEdge#32 (v0.14.0) — record establish time for the
             // Links FFI surface's `age_seconds` derivation.
             let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
@@ -9701,6 +10593,8 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             link_id,
             identity_hash,
         } => {
+            // CIRISEdge#853 — a link whose `LinkEstablished` edge never saw.
+            recover_unknown_link(ctx, link_id).await;
             // CIRISEdge#34 link half (v0.14.0) — emit `link_identified`
             // event with the peer's truncated identity hash. The peer
             // proved its identity over an already-established link via
@@ -9932,6 +10826,16 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             is_sender,
             ..
         } => {
+            // CIRISEdge#853 — a data-plane Started/Progress that arrives AFTER
+            // its own control-plane completion (the two planes are separate
+            // channels) must not re-mark a finished transfer: it held the link
+            // "busy" for the full stall window and delayed both reaps by up to
+            // 30 s.
+            if resource_concluded(ctx.concluded_resources, &resource_hash) {
+                // choke-ok: a progress tick for a transfer that already
+                // concluded carries no frame; nothing inbound is dropped.
+                return;
+            }
             if !is_sender {
                 // CIRISEdge#819 — an inbound transfer keeps its link busy for
                 // the pool reaper, and every event of it is a use of the link.
@@ -9964,6 +10868,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             error,
             ..
         } => {
+            note_resource_concluded(ctx.concluded_resources, resource_hash);
             if !is_sender {
                 note_inbound_transfer(
                     ctx.inbound_resource_active,
@@ -10005,6 +10910,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             resource_hash,
             ..
         } => {
+            note_resource_concluded(ctx.concluded_resources, resource_hash);
             // CIRISEdge#353b/v13.6.1 — the transfer concluded; drop its progress
             // mirror (bounds the map for both sent + received resources).
             ctx.sent_resource_progress
@@ -10093,7 +10999,26 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 segments = total_segments,
                 "inbound envelope resource completed",
             );
-            attribute_and_deliver(ctx, link_id, data).await;
+            let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
+            match plane.route() {
+                InboundPlaneRoute::Envelope(plane) => {
+                    attribute_and_deliver(ctx, link_id, dest, plane, data).await;
+                }
+                // CIRISEdge#805 — A/V rides the Channel only (the link refuses
+                // Resources at the advertisement); a Resource that completed on
+                // an A/V link anyway is neither an envelope nor a chunk.
+                InboundPlaneRoute::Av => {
+                    if let Some(m) = ctx.metrics {
+                        m.inc_av_plane(crate::observability::AV_INBOUND_DROPPED_RESOURCE);
+                    }
+                    drop_inbound(
+                        Some(link_id),
+                        crate::observability::AV_INBOUND_DROPPED_RESOURCE,
+                        "a Resource completed on an A/V link — A/V rides the link Channel \
+                         only; not routed to replication nor to the A/V sink (CIRISEdge#805)",
+                    );
+                }
+            }
         }
         // CIRISEdge#353 ask #2 / #363 — a reverse-path reply that arrived as a
         // link PACKET (a link-Channel send, `LinkHandle::try_send` since
@@ -10125,12 +11050,21 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 );
                 return;
             }
-            tracing::debug!(
-                link = ?link_id,
-                bytes = data.len(),
-                "inbound link packet received (reverse-path reply, CIRISEdge#353 ask #2)",
-            );
-            attribute_and_deliver(ctx, link_id, data).await;
+            // CIRISEdge#805 — the link's PLANE picks the route, once, before
+            // anything reads the bytes: an A/V link's frame goes to the A/V
+            // sink and nowhere else; every other link's to the envelope path.
+            let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
+            match plane.route() {
+                InboundPlaneRoute::Envelope(plane) => {
+                    tracing::debug!(
+                        link = ?link_id,
+                        bytes = data.len(),
+                        "inbound link packet received (reverse-path reply, CIRISEdge#353 ask #2)",
+                    );
+                    attribute_and_deliver(ctx, link_id, dest, plane, data).await;
+                }
+                InboundPlaneRoute::Av => deliver_av_frame(ctx, link_id, dest, data).await,
+            }
         }
         NodeEvent::LinkClosed {
             link_id, reason, ..
@@ -10154,15 +11088,11 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // CIRISEdge#853 — a POOLED lane closing ChannelExhausted or Stale
             // is the field signature of a starved responder (its proofs stopped
             // coming back): say so, with running counts.
-            let pooled = match ctx.dialed_link_dest.lock().await.get(&link_id).copied() {
-                Some(dest) => ctx
-                    .reusable_dialed_link
-                    .lock()
-                    .await
-                    .get(&dest)
-                    .is_some_and(|pool| pool.contains(&link_id)),
-                None => false,
-            };
+            let pooled = link_is_pooled(
+                &*ctx.reusable_dialed_link.lock().await,
+                &*ctx.reusable_scoped_link.lock().await,
+                link_id,
+            );
             ctx.link_book().forget(link_id, close_cause(reason)).await;
             if pooled {
                 note_starved_pool_close(reason, &link_id);
@@ -13694,7 +14624,11 @@ mod tests {
         let src = include_str!("reticulum.rs");
         let lines: Vec<&str> = src.lines().collect();
         let mut violations: Vec<String> = Vec::new();
-        for sig in ["async fn attribute_and_deliver(", "async fn handle_event("] {
+        for sig in [
+            "async fn attribute_and_deliver(",
+            "async fn handle_event(",
+            "async fn deliver_av_frame(",
+        ] {
             let start = lines
                 .iter()
                 .position(|l| l.starts_with(sig))
@@ -16659,6 +17593,74 @@ mod scope_native_addressing_tests {
         assert_eq!(m.inbound_link_closed_by_reason()["local_teardown"], 1);
     }
 
+    /// **Codex round two on #854, finding 3 — an unattributed frame leaves the
+    /// link-up open for the owner-binding stage.** The transport ends a
+    /// link-up `ok` only on an ATTRIBUTED frame; the carve-out records the
+    /// owner-binding stage and ends it. Fails when the first frame ends the
+    /// link-up whatever its attribution: the stage then has no start time and
+    /// records nothing.
+    #[test]
+    fn an_unattributed_frame_leaves_the_link_up_for_the_owner_binding_stage_854() {
+        let m = crate::observability::EdgeMetrics::new();
+        let (sibling, peer) = (LinkId::new([3; 16]), LinkId::new([4; 16]));
+        m.responder_link_up_begin(sibling.into_bytes());
+        m.responder_link_up_begin(peer.into_bytes());
+        // The sibling's owner-binding push arrives unattributed…
+        note_link_up_frame(Some(&m), sibling, false);
+        // …and the carve-out records its stage, then ends the link-up.
+        m.responder_link_up_stage(
+            sibling.into_bytes(),
+            crate::observability::LINK_UP_STAGE_OWNER_BINDING,
+        );
+        m.responder_link_up_end(sibling.into_bytes(), crate::observability::LINK_UP_OK);
+        // An attributed peer's first frame ends its link-up at the transport.
+        note_link_up_frame(Some(&m), peer, true);
+        let stages = m.responder_link_up_seconds();
+        assert_eq!(
+            stages.get("owner_binding").map(|h| h.count),
+            Some(1),
+            "the owner-binding stage was recorded: {stages:?}"
+        );
+        assert_eq!(m.responder_link_up_total()["ok"], 2);
+    }
+
+    /// **Codex round two on #854, finding 6 — a scoped lane is a pooled lane.**
+    /// The starved-pool diagnostic asks both pool families. Fails when only the
+    /// identity pool is consulted.
+    #[test]
+    fn a_scoped_lane_counts_as_pooled_854() {
+        let (identity_lane, scoped_lane, stray) = (
+            LinkId::new([1; 16]),
+            LinkId::new([2; 16]),
+            LinkId::new([3; 16]),
+        );
+        let identity = HashMap::from([(DestinationHash::new([9; 16]), vec![identity_lane])]);
+        let scoped = HashMap::from([(DestinationHash::new([8; 16]), vec![scoped_lane])]);
+        assert!(link_is_pooled(&identity, &scoped, identity_lane));
+        assert!(
+            link_is_pooled(&identity, &scoped, scoped_lane),
+            "a scoped lane closing ChannelExhausted/Stale is a starved pooled lane"
+        );
+        assert!(!link_is_pooled(&identity, &scoped, stray));
+    }
+
+    /// **CIRISEdge#853 — a straggler Progress cannot revive a finished
+    /// transfer.** `ResourceProgress` rides leviculum's data plane and
+    /// `ResourceCompleted` its control plane, so a Progress can arrive after
+    /// its own completion. Once concluded, the hash reads as concluded (the
+    /// event arm then ignores the straggler); an unrelated hash does not. Fails
+    /// without the memo: the straggler re-marks the link busy for the stall
+    /// window and the idle reap waits up to 30 s.
+    #[test]
+    fn a_straggler_progress_after_completion_is_recognised_853() {
+        let memo = std::sync::Mutex::new(HashMap::new());
+        let (done, live) = ([1u8; 32], [2u8; 32]);
+        assert!(!resource_concluded(&memo, &done));
+        note_resource_concluded(&memo, done);
+        assert!(resource_concluded(&memo, &done));
+        assert!(!resource_concluded(&memo, &live));
+    }
+
     /// Every leviculum close reason has its own token, and every token is
     /// present in both families.
     #[test]
@@ -16833,6 +17835,77 @@ mod scope_native_addressing_tests {
             classify_link_plane(None, &DestinationHash::new(*mine.as_bytes())),
             LinkPlane::Identity,
             "no table ⇒ no scoped links: the pre-#499 world"
+        );
+    }
+
+    /// CIRISEdge#805 / FSD §3.6 — a derived address in an A/V session's group
+    /// (`av-stream:` namespace) is an A/V link, on either end; a derived
+    /// address in any other group of the SAME table and scope stays scoped.
+    #[test]
+    fn an_av_session_address_on_either_end_is_the_av_plane() {
+        let call = crate::av_addressing::stream_group_id(crate::transport::realtime_av::StreamId(
+            [0x80; 32],
+        ));
+        let table = table_with_group(&CohortScope::SelfOnly, &call, &["d1", "d2"]);
+        table
+            .install_group(
+                &CohortScope::SelfOnly,
+                "self:owner",
+                1,
+                &[0x11; 32],
+                &["d1", "d2"],
+            )
+            .expect("a scoped group beside the call");
+        for member in ["d1", "d2"] {
+            let av = table
+                .send_address(&CohortScope::SelfOnly, &call, member)
+                .expect("call address");
+            assert_eq!(
+                classify_link_plane(Some(&table), &DestinationHash::new(*av.as_bytes())),
+                LinkPlane::Av,
+                "{member}'s call address"
+            );
+            let scoped = table
+                .send_address(&CohortScope::SelfOnly, "self:owner", member)
+                .expect("scoped address");
+            assert_eq!(
+                classify_link_plane(Some(&table), &DestinationHash::new(*scoped.as_bytes())),
+                LinkPlane::Scoped,
+                "{member}'s self-room address"
+            );
+        }
+    }
+
+    /// CIRISEdge#805 — the one plane→route decision: only `Av` reaches the A/V
+    /// sink, and the envelope path is never entered for it.
+    #[test]
+    fn only_the_av_plane_routes_to_the_av_sink() {
+        assert_eq!(LinkPlane::Av.route(), InboundPlaneRoute::Av);
+        assert_eq!(
+            LinkPlane::Identity.route(),
+            InboundPlaneRoute::Envelope(EnvelopePlane::Identity)
+        );
+        assert_eq!(
+            LinkPlane::Scoped.route(),
+            InboundPlaneRoute::Envelope(EnvelopePlane::Scoped)
+        );
+        assert_eq!(LinkPlane::Av.as_str(), "av");
+    }
+
+    /// CIRISEdge#720 — the A/V size check and the fragmenter read one number:
+    /// at the base 500-byte MTU the link MDU is 431 and one Channel message
+    /// carries 425 (the #716 six-byte margin); a jumbo link is capped at the
+    /// Channel envelope's u16 length field.
+    #[test]
+    fn the_av_channel_limit_is_the_fragmenter_mdu() {
+        assert_eq!(channel_payload_mdu(431), 425);
+        assert_eq!(
+            channel_payload_mdu(431),
+            431 - leviculum_core::constants::CHANNEL_ENVELOPE_HEADER_SIZE
+        );
+        assert_eq!(
+            channel_payload_mdu(262_144).min(usize::from(u16::MAX)),
+            usize::from(u16::MAX)
         );
     }
 
