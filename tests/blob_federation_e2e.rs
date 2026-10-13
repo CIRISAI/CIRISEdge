@@ -2737,7 +2737,7 @@ async fn holding_claims_of(node: &Node, scope: Option<&str>) -> Vec<Vec<u8>> {
                 &a.attestation.attestation_envelope,
             ) == Some(ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION)
         })
-        .filter(|a| scope.is_none_or(|s| a.attestation.cohort_scope == s))
+        .filter(|a| scope.map_or(true, |s| a.attestation.cohort_scope == s))
         .map(|a| serde_json::to_vec(&a.attestation).expect("wire"))
         .collect()
 }
@@ -6670,7 +6670,7 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
                 .recipient_key_id,
         ]
     };
-    let e0_recipients: Vec<String> = sets_a.iter().flat_map(|s| recipients_of(s)).collect();
+    let e0_recipients: Vec<String> = sets_a.iter().flat_map(&recipients_of).collect();
     assert!(
         e0_recipients.contains(&node_b.me) && e0_recipients.contains(&node_c.me),
         "the e0 rows wrap to the members' nodes: {e0_recipients:?}"
