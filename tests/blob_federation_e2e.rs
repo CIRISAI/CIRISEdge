@@ -7326,6 +7326,26 @@ async fn a_pull_under_disk_pressure_books_its_store_refusal_by_name() {
             .await;
     }
     let fetch = MeshFetch::new(&node_b.me, vec![node_a.me.clone()], &[&node_a]);
+    // The once-per-pull count only bites if the walk refuses MORE than one
+    // chunk: the file spans several (five data chunks and a terminator), all
+    // refused by the same pressure verdict.
+    let aad_a = ciris_edge::group_content::content_aad(
+        &row.attesting_key_id,
+        row.asserted_at,
+        published.pointer.content_field,
+    );
+    let chunks = node_a
+        .store
+        .engine()
+        .open_sealed_manifest_as(&sha, &node_a.me, Some(&aad_a))
+        .await
+        .expect("alice opens her manifest")
+        .chunks
+        .len();
+    assert!(
+        chunks >= 2,
+        "the walk has several chunks to refuse: {chunks}"
+    );
 
     // 1. The manifest adopt is refused for pressure, by name.
     let refused = puller_b.pull_dag_with(&row, sha, &fetch).await;
