@@ -278,7 +278,8 @@ subscribe_direct_path_events, direct_path_state, direct_link_interface, fall_bac
   `_propose_refused`, `_skipped_neighbour`, `_skipped_backoff`, `_skipped_no_link`, `_established`,
   `_failed_rejected`, `_failed_probe`, `_failed_timeout`, `_failed_punch`, `_lost`,
   `_leg_fell_back`, `_request_accepted`, `_request_refused`; and the gauge `direct_links_active`
-  (UniFFI `direct_link.active`).
+  (both projected by `EdgeMetricsBundle::flatten`: `direct_link.<label>` counters and the
+  `direct_links_active` gauge).
   **Merge note for #820 (local/820-p1c):** the catalogue completeness gate needs specs for this
   family — a counter with a closed `outcome` label drawn from an enum of the fourteen tags above,
   and a gauge with no labels.
