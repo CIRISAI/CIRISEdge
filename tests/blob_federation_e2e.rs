@@ -7188,3 +7188,186 @@ async fn a_room_chunk_bound_to_the_community_epoch_is_refused_at_adopt_and_remed
         .expect("bob opens the file");
     assert!(got == plain, "byte-identical on bob's node");
 }
+
+/// **persist v55.0.0 (#1065: `would_hold` on the chunk doors) — a pull
+/// refused for disk pressure is booked by name.** alice publishes a file
+/// into a room bob's node is in; bob's puller runs over an engine whose
+/// disk-pressure snapshot is at the `Stop` tier, where persist refuses
+/// content held for others (`DiskPressureProxyRefused`, `operation:
+/// "accept"`). Two doors, both a `StoreFailed` (not retried) AND a
+/// `disk_pressure` entry in `blob_pull_refusals`:
+///
+/// 1. the manifest adopt, on a fresh pull;
+/// 2. the CHUNK adopt — the door v55 added the gate to — with the manifest
+///    already adopted (a resume), so the pull reaches the chunks.
+///
+/// One refused pull is ONE count: leg 1 books 1, leg 2 brings the total to
+/// exactly 2, though leg 2's walk refuses every chunk it had in flight (each
+/// is the same pressure verdict, and only the refusal that becomes the pull's
+/// outcome is booked). Fails with the store-refusal booking removed (`disk_pressure` absent: the
+/// refusal is a silent `StoreFailed`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // two doors, in order, on purpose
+async fn a_pull_under_disk_pressure_books_its_store_refusal_by_name() {
+    use ciris_edge::blob_swarm::{
+        BlobPuller, DagByteFetch as _, PullConfig, PullOutcome, PULL_REFUSAL_DISK_PRESSURE,
+    };
+    use ciris_persist::federation::key_grant::SignedKeyGrantRow;
+    use ciris_persist::federation::{
+        AdoptDisposition, BlobProvenance, DiskPressureConfig, DiskPressureSnapshot,
+        FederationDirectory, PressureTier, SignedAttestation,
+    };
+    const ROOM: &str = "room-pressure";
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let bob = Ident::new("bob-fed", 0x22);
+    let room_key = Ident::new(ROOM, 0x99);
+    let idents = [&alice, &bob, &room_key];
+    let node_a = node(&idents, &alice).await;
+    let node_b = node(&idents, &bob).await;
+    for n in [&node_a, &node_b] {
+        seed_room(n, ROOM, &[&alice, &bob]).await;
+    }
+    federate(&node_a, &node_b).await;
+    federate(&node_b, &node_a).await;
+    let (_wire_a, wire_b) = wire(&node_a.me, &node_b.me);
+    let (edge_b, _stop_b) = spawn_edge(&node_b, wire_b).await;
+    let stop = DiskPressureSnapshot::from_free_bytes(0, &DiskPressureConfig::default());
+    assert!(stop.tier >= PressureTier::Stop && stop.refuses_proxy_writes);
+    let (_pressure_tx, pressure_rx) = tokio::sync::watch::channel(stop);
+    let pressured = node_b
+        .store
+        .engine()
+        .clone()
+        .with_disk_pressure_state_shared(pressure_rx);
+    let puller_b = BlobPuller::new(
+        Arc::clone(&edge_b),
+        pressured,
+        node_b.dir.clone(),
+        node_b.dir.clone() as Arc<dyn FederationDirectory>,
+        node_b.me.clone(),
+        PullConfig::default(),
+    );
+    let booked = || {
+        edge_b
+            .metrics()
+            .snapshot()
+            .blob_pull_refusals
+            .get(PULL_REFUSAL_DISK_PRESSURE)
+            .copied()
+            .unwrap_or(0)
+    };
+
+    let plain = body_of(1_300_000, 0xd15c);
+    let room = ciris_edge::scope_room::ScopeRoom::community(ROOM);
+    let published = ciris_edge::files::publish(
+        &*node_a.dir,
+        &node_a.store,
+        ciris_edge::replication::attestation_bind::Signers {
+            node: &node_a.signer,
+            actor: None,
+        },
+        &ciris_edge::files::FileWrite {
+            room: &room,
+            bytes: &plain,
+            media_type: "video/mp4",
+            codec: None,
+            filename: Some("pressure.mp4"),
+            asserted_at: ts(),
+        },
+    )
+    .await
+    .expect("publish a chunked file into the room");
+    let sha: [u8; 32] = hex::decode(&published.pointer.content_sha256)
+        .expect("hex")
+        .try_into()
+        .expect("32 bytes");
+    let crossed_id = match &published.shared {
+        ciris_edge::replication::attestation_bind::Shared::Placed { attestation_id }
+        | ciris_edge::replication::attestation_bind::Shared::AlreadyThere { attestation_id } => {
+            attestation_id.clone()
+        }
+        other @ ciris_edge::replication::attestation_bind::Shared::AwaitingActor { .. } => {
+            panic!("the room file must cross: {other:?}")
+        }
+    };
+    let row = node_a
+        .dir
+        .get_attestation(&crossed_id)
+        .await
+        .expect("read")
+        .expect("the crossed row");
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .expect("bob's node admits the room row");
+    node_a
+        .store
+        .engine()
+        .emit_pending_key_grants()
+        .await
+        .expect("alice emits");
+    for r in node_a
+        .dir
+        .list_attestations_since(None, 1000)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|a| a.attestation)
+        .filter(ciris_persist::federation::key_grant::is_key_grant_row)
+    {
+        let _ = node_b
+            .store
+            .engine()
+            .apply_replicated_key_grant(SignedKeyGrantRow { attestation: r })
+            .await;
+    }
+    let fetch = MeshFetch::new(&node_b.me, vec![node_a.me.clone()], &[&node_a]);
+
+    // 1. The manifest adopt is refused for pressure, by name.
+    let refused = puller_b.pull_dag_with(&row, sha, &fetch).await;
+    assert!(
+        matches!(&refused, PullOutcome::StoreFailed(e) if e.contains("adopt manifest")),
+        "the manifest adopt is refused under Stop pressure: {refused:?}"
+    );
+    assert_eq!(
+        booked(),
+        1,
+        "booked as disk_pressure, not a silent StoreFailed"
+    );
+
+    // 2. The manifest held (adopted with no pressure, a resume): the chunk
+    //    adopt is the door that refuses.
+    let aad = ciris_edge::group_content::content_aad(
+        &row.attesting_key_id,
+        row.asserted_at,
+        published.pointer.content_field,
+    );
+    let manifest = fetch.fetch(sha).await.expect("alice serves the manifest");
+    node_b
+        .store
+        .engine()
+        .adopt_sealed_blob(
+            &manifest,
+            BlobProvenance::from_attestation(&row, &sha, published.pointer.epoch, None)
+                .expect("the row's provenance"),
+            Some(&aad),
+            AdoptDisposition::LocalOnly,
+        )
+        .await
+        .expect("the manifest adopts with no pressure");
+    let refused = puller_b.pull_dag_with(&row, sha, &fetch).await;
+    assert!(
+        matches!(&refused, PullOutcome::StoreFailed(e) if e.contains("adopt chunk")),
+        "the chunk adopt is refused under Stop pressure: {refused:?}"
+    );
+    assert_eq!(
+        booked(),
+        2,
+        "the chunk door's refusal is booked by name, ONCE for the refused pull — however \
+         many chunks or adopt batches the walk had in flight when it stopped"
+    );
+}

@@ -444,6 +444,27 @@ pub const PULL_REFUSAL_DAG_OVER_CAP: &str = "dag_over_cap";
 pub const PULL_REFUSAL_DAG_CHUNK_MISMATCH: &str = "dag_chunk_mismatch";
 /// The `blob_pull_refusals` tag for [`DagPullRefusal::ChunkMissing`].
 pub const PULL_REFUSAL_DAG_CHUNK_MISSING: &str = "dag_chunk_missing";
+/// The `blob_pull_refusals` tag for a store door that refused the bytes
+/// because this node is under disk pressure (persist's
+/// `BlobError::DiskPressureProxyRefused`, `operation: "accept"`): content held
+/// for others, refused at the `Stop` tier and tighter. Still
+/// [`PullOutcome::StoreFailed`], never retried (persist: it clears only when
+/// the host disk recovers), but named, so an operator sees it.
+pub const PULL_REFUSAL_DISK_PRESSURE: &str = "disk_pressure";
+
+/// persist v55.0.0 (#1065: `would_hold` runs on the chunk doors too) — the
+/// `blob_pull_refusals` tag a STORE door's refusal is booked under, when it
+/// names a cause an operator acts on; `None` for the rest (they stay
+/// [`PullOutcome::StoreFailed`]'s message only).
+#[must_use]
+pub fn store_refusal_tag(e: &ciris_persist::federation::BlobError) -> Option<&'static str> {
+    matches!(
+        e,
+        ciris_persist::federation::BlobError::DiskPressureProxyRefused { .. }
+    )
+    .then_some(PULL_REFUSAL_DISK_PRESSURE)
+}
+
 /// The `blob_pull_refusals` tag for
 /// [`DagPullRefusal::StreamKeyedChunkCommunityEpoch`].
 pub const PULL_REFUSAL_DAG_STREAM_KEYED_COMMUNITY_EPOCH: &str =
@@ -2826,12 +2847,14 @@ where
                     chunk_provenance.clone(),
                 )
                 .await
-                .map_err(|e| e.to_string())
                 .and_then(|mut per_item| match per_item.pop() {
-                    Some(r) => r.map(|_| ()).map_err(|e| e.to_string()),
-                    None => Err("the adopt answered no item".to_owned()),
+                    Some(r) => r.map(|_| ()),
+                    None => Err(ciris_persist::federation::BlobError::Backend(
+                        "the adopt answered no item".to_owned(),
+                    )),
                 });
             if let Err(e) = answer {
+                self.book_store_refusal("re-adopt chunk", &e);
                 return Err(PullOutcome::StoreFailed(format!(
                     "re-adopt chunk seq {} under for_stream_keyed_chunk: {e}",
                     c.seq
@@ -2850,6 +2873,32 @@ where
              (CIRISPersist#977)"
         );
         Ok(readopted)
+    }
+
+    /// A store door refused (`door` names it): book the refusal under its
+    /// `blob_pull_refusals` tag when it names one ([`store_refusal_tag`]), so a
+    /// disk-pressure refusal is never a silent `StoreFailed`. The caller still
+    /// returns `StoreFailed`; nothing here retries.
+    ///
+    /// Once per refused PULL: each caller books the one refusal that becomes
+    /// the pull's `StoreFailed`, never one per chunk or per batch of a walk.
+    fn book_store_refusal(&self, door: &str, e: &ciris_persist::federation::BlobError) {
+        if let Some(tag) = store_refusal_tag(e) {
+            self.book_store_refusal_tag(door, tag, &e.to_string());
+        }
+    }
+
+    /// [`Self::book_store_refusal`] for a refusal already reduced to its tag
+    /// and message (the chunk walk keeps both per item).
+    fn book_store_refusal_tag(&self, door: &str, tag: &'static str, error: &str) {
+        self.edge.metrics().inc_blob_pull_refusal(tag);
+        tracing::warn!(
+            door,
+            refusal = tag,
+            error,
+            "pull: a store door refused the bytes — this node is under disk pressure and \
+             holds no content for others until the host disk recovers"
+        );
     }
 
     /// A fetch that did not arrive: booked for retry, named.
@@ -2972,7 +3021,10 @@ where
                 .await
             {
                 Ok(outcome) => outcome.announced,
-                Err(e) => return PullOutcome::StoreFailed(format!("adopt manifest: {e}")),
+                Err(e) => {
+                    self.book_store_refusal("adopt manifest", &e);
+                    return PullOutcome::StoreFailed(format!("adopt manifest: {e}"));
+                }
             };
         }
 
@@ -3291,11 +3343,19 @@ where
                         "DAG pull: one adopt batch returned (CIRISPersist#957)"
                     );
                     // Either the batch was refused whole (nothing written),
-                    // or each item answered in its slot, in order.
-                    let answers: Vec<Result<(), String>> = match adopted {
+                    // or each item answered in its slot, in order. A refusal
+                    // keeps its `blob_pull_refusals` tag ([`store_refusal_tag`])
+                    // beside its message; it is booked ONCE, by the refusal
+                    // that becomes the pull's outcome (the first stop below),
+                    // never per chunk or per batch, so one refused pull is
+                    // one count.
+                    let answers: Vec<Result<(), (String, Option<&'static str>)>> = match adopted {
                         Ok(per_item) => per_item
                             .into_iter()
-                            .map(|r| r.map(|_| ()).map_err(|e| e.to_string()))
+                            .map(|r| {
+                                r.map(|_| ())
+                                    .map_err(|e| (e.to_string(), store_refusal_tag(&e)))
+                            })
                             .collect(),
                         // persist v55.0.0 (#977) — the chunk door refused a
                         // stream-keyed chunk's provenance for naming a
@@ -3325,14 +3385,14 @@ where
                             continue;
                         }
                         Err(e) => {
-                            let e = e.to_string();
-                            wants.iter().map(|_| Err(e.clone())).collect()
+                            let refused = (e.to_string(), store_refusal_tag(&e));
+                            wants.iter().map(|_| Err(refused.clone())).collect()
                         }
                     };
                     for (w, answer) in wants.iter().zip(answers) {
                         match answer {
                             Ok(()) => metrics.add_blob_dag_chunks("adopted", 1),
-                            Err(e) => {
+                            Err((e, tag)) => {
                                 tracing::warn!(
                                     blob = %blob_hex,
                                     stream_id = %stream,
@@ -3341,6 +3401,9 @@ where
                                     "DAG pull: persist refused a chunk's adopt"
                                 );
                                 if stop.is_none() {
+                                    if let Some(tag) = tag {
+                                        self.book_store_refusal_tag("adopt chunk", tag, &e);
+                                    }
                                     stop = Some(PullOutcome::StoreFailed(format!(
                                         "adopt chunk seq {}: {e}",
                                         w.seq
@@ -3693,7 +3756,10 @@ where
                 );
                 PullOutcome::Stored { announced: true }
             }
-            Err(e) => PullOutcome::StoreFailed(format!("put_blob_chunks_signing: {e}")),
+            Err(e) => {
+                self.book_store_refusal("put_blob_chunks_signing", &e);
+                PullOutcome::StoreFailed(format!("put_blob_chunks_signing: {e}"))
+            }
         }
     }
 
@@ -3739,7 +3805,10 @@ where
             .await
         {
             Ok(()) => PullOutcome::Stored { announced: true },
-            Err(e) => PullOutcome::StoreFailed(e.to_string()),
+            Err(e) => {
+                self.book_store_refusal("put_blob_signing", &e);
+                PullOutcome::StoreFailed(e.to_string())
+            }
         }
     }
 
@@ -3816,7 +3885,10 @@ where
                     announced: outcome.announced,
                 }
             }
-            Err(e) => PullOutcome::StoreFailed(e.to_string()),
+            Err(e) => {
+                self.book_store_refusal("adopt_sealed_blob", &e);
+                PullOutcome::StoreFailed(e.to_string())
+            }
         }
     }
 }
@@ -3922,6 +3994,43 @@ mod tests {
             CryptoTier::InvisibleEncrypted,
             false
         ));
+    }
+
+    /// persist v55.0.0 (#1065) — **a store door's disk-pressure refusal is
+    /// named, never a silent `StoreFailed`.** persist's
+    /// `DiskPressureProxyRefused` maps to the `disk_pressure` tag and is booked
+    /// in `blob_pull_refusals` by the puller's store-refusal hook; any other
+    /// store refusal books nothing. Fails with the booking removed. (The real
+    /// refusal, driven through a pull under `Stop` pressure, is
+    /// `blob_federation_e2e::a_pull_under_disk_pressure_books_its_store_refusal_by_name`.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disk_pressure_store_refusal_is_booked_by_name() {
+        use crate::blob_swarm::chunk_grants_779_tests::{edge_of, puller_of, two_devices};
+        use ciris_persist::federation::BlobError;
+        let pressure = BlobError::DiskPressureProxyRefused {
+            operation: "accept",
+            tier: "stop",
+        };
+        let other = BlobError::NotHeld {
+            sha256_hex: "00".repeat(32),
+        };
+        assert_eq!(
+            store_refusal_tag(&pressure),
+            Some(PULL_REFUSAL_DISK_PRESSURE)
+        );
+        assert_eq!(store_refusal_tag(&other), None);
+        let (_alice, _node_a, node_b) = two_devices().await;
+        let edge = edge_of(&node_b);
+        let puller = puller_of(&node_b, &edge);
+        puller.book_store_refusal("adopt chunk", &other);
+        puller.book_store_refusal("adopt chunk", &pressure);
+        let refusals = edge.metrics().snapshot().blob_pull_refusals;
+        assert_eq!(
+            refusals.get(PULL_REFUSAL_DISK_PRESSURE).copied(),
+            Some(1),
+            "booked by name: {refusals:?}"
+        );
+        assert_eq!(refusals.len(), 1, "nothing else booked: {refusals:?}");
     }
 
     /// persist v55.0.0 (#989) — **a parked DAG wakes only on a projected,

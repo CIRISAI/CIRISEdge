@@ -362,13 +362,13 @@ pub use durability::{rarest_first, target_mode, DurabilitySweep, Repair};
 mod key_wake;
 pub mod pull;
 pub use pull::{
-    check_dag_plan, parse_clear_manifest, BlobPuller, DagByteFetch, DagFetchError, DagPlan,
-    DagPullRefusal, PullConfig, PullOffer, PullOutcome, PullRequest, PullSink,
-    DEFAULT_DAG_ADOPT_BATCH_CHUNKS, DEFAULT_DAG_BYTES_IN_FLIGHT, DEFAULT_DAG_CHUNKS_IN_FLIGHT,
-    PULL_REFUSAL_DAG_CHUNK_MISMATCH, PULL_REFUSAL_DAG_CHUNK_MISSING,
+    check_dag_plan, parse_clear_manifest, store_refusal_tag, BlobPuller, DagByteFetch,
+    DagFetchError, DagPlan, DagPullRefusal, PullConfig, PullOffer, PullOutcome, PullRequest,
+    PullSink, DEFAULT_DAG_ADOPT_BATCH_CHUNKS, DEFAULT_DAG_BYTES_IN_FLIGHT,
+    DEFAULT_DAG_CHUNKS_IN_FLIGHT, PULL_REFUSAL_DAG_CHUNK_MISMATCH, PULL_REFUSAL_DAG_CHUNK_MISSING,
     PULL_REFUSAL_DAG_MANIFEST_MISMATCH, PULL_REFUSAL_DAG_OVER_CAP,
     PULL_REFUSAL_DAG_STREAM_KEYED_COMMUNITY_EPOCH, PULL_REFUSAL_DAG_TOTAL_SIZE_MISMATCH,
-    PULL_REFUSAL_NO_EPOCH, PULL_REFUSAL_SIZE_MISMATCH,
+    PULL_REFUSAL_DISK_PRESSURE, PULL_REFUSAL_NO_EPOCH, PULL_REFUSAL_SIZE_MISMATCH,
 };
 
 pub mod persist_store_policy;
