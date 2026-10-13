@@ -141,6 +141,13 @@ pub enum AvDispatcherError {
     /// The outer re-seal failed during fan-out.
     #[error("relay forward failed: {0}")]
     ForwardFailed(String),
+    /// CIRISEdge#805 item 8 — the link is gone (closed by its peer or
+    /// reaped): nothing was sent and nothing ever will be on it. Distinct from
+    /// [`Self::SendFailed`] so a fan-out can PRUNE the subscriber rather than
+    /// fail every later chunk on it (a subscriber that dropped its relay leg
+    /// closes the link on purpose).
+    #[error("the link is gone: {0}")]
+    LinkGone(String),
     /// An endpoint role (publisher or subscriber) was constructed
     /// without an `epoch_dek`. Structural guard for the relay-vs-
     /// endpoint role split: endpoints inner-seal / inner-open under
@@ -513,10 +520,11 @@ impl AvDispatcher {
     ///
     /// - [`AvDispatcherError::ForwardFailed`] if [`seal_av_outer`]
     ///   fails for any subscriber.
-    /// - [`AvDispatcherError::SendFailed`] (propagated) if the
-    ///   transport send fails. The fan-out stops at the first send
-    ///   error — callers wanting best-effort fan-out across a flaky
-    ///   roster should drive subscribers one at a time.
+    /// - [`AvDispatcherError::SendFailed`] (propagated) if a transport
+    ///   send fails. Every subscriber is attempted first; the first
+    ///   error is returned after the whole roster (CIRISEdge#805 item 8).
+    ///   A subscriber whose link is gone ([`AvDispatcherError::LinkGone`])
+    ///   is pruned from the roster, not reported.
     pub async fn publish_inner(&mut self, inner: InnerSealed) -> Result<(), AvDispatcherError> {
         self.fan_out(&inner).await
     }
@@ -576,7 +584,14 @@ impl AvDispatcher {
     /// relay paths. Visits every downstream subscriber, seals with its
     /// per-link state, advances its `link_seq`, and sends.
     async fn fan_out(&mut self, inner: &InnerSealed) -> Result<(), AvDispatcherError> {
-        for state in self.subscribers.values_mut() {
+        // CIRISEdge#805 item 8 — EVERY subscriber is attempted. This
+        // loop used to return on the first refusal, so one congested or closed
+        // downstream link starved every subscriber after it in (random)
+        // HashMap order. The first error is still returned, after the loop;
+        // a subscriber whose link is GONE is pruned, not reported.
+        let mut first_err: Option<AvDispatcherError> = None;
+        let mut gone: Vec<PeerKeyId> = Vec::new();
+        for (subscriber, state) in &mut self.subscribers {
             let link_seq = state.next_link_seq;
             let sealed = seal_av_outer(inner, &state.transit_key, &state.link_id, link_seq)
                 .map_err(|e| AvDispatcherError::ForwardFailed(e.to_string()))?;
@@ -592,16 +607,27 @@ impl AvDispatcher {
             // never used twice.
             match state.sender.send(&sealed.to_bytes()).await {
                 Ok(()) => state.next_link_seq = state.next_link_seq.wrapping_add(1),
+                Err(AvDispatcherError::LinkGone(why)) => {
+                    tracing::info!(
+                        subscriber = %subscriber,
+                        why = %why,
+                        "AV fan-out: a subscriber's link is gone — pruned (CIRISEdge#805 item 8)"
+                    );
+                    gone.push(subscriber.clone());
+                }
                 Err(e @ (AvDispatcherError::Congested | AvDispatcherError::ChunkTooLarge(_))) => {
-                    return Err(e);
+                    first_err.get_or_insert(e);
                 }
                 Err(e) => {
                     state.next_link_seq = state.next_link_seq.wrapping_add(1);
-                    return Err(e);
+                    first_err.get_or_insert(e);
                 }
             }
         }
-        Ok(())
+        for subscriber in &gone {
+            self.subscribers.remove(subscriber);
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     /// Subscriber-side receive loop. Spawns an async task per inbound
@@ -860,6 +886,95 @@ mod tests {
             open_av_chunk(&sealed, &transit, b"sub", 0, &dek).is_ok(),
             "the first frame that went out is link_seq 0"
         );
+    }
+
+    /// A sender that always refuses with `err`.
+    struct RefusingSender {
+        err: fn() -> AvDispatcherError,
+    }
+
+    #[async_trait::async_trait]
+    impl AvLinkSender for RefusingSender {
+        async fn send(&self, _bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            Err((self.err)())
+        }
+    }
+
+    fn publisher_over(subscribers: Vec<AvSubscriberLink>) -> AvDispatcher {
+        AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(8),
+            local_role: AvRole::Publisher,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: subscribers,
+            inbound_links: vec![],
+        })
+        .expect("publisher")
+    }
+
+    fn healthy(name: &str, tx: mpsc::UnboundedSender<Vec<u8>>) -> AvSubscriberLink {
+        AvSubscriberLink {
+            subscriber: name.to_owned(),
+            transit_key: [0x31; 32],
+            link_id: name.as_bytes().to_vec(),
+            outbound_send: Box::new(LimitedSender { limit: 4096, tx }),
+        }
+    }
+
+    fn refusing(name: &str, err: fn() -> AvDispatcherError) -> AvSubscriberLink {
+        AvSubscriberLink {
+            subscriber: name.to_owned(),
+            transit_key: [0x32; 32],
+            link_id: name.as_bytes().to_vec(),
+            outbound_send: Box::new(RefusingSender { err }),
+        }
+    }
+
+    /// CIRISEdge#805 item 8 — a subscriber whose link is gone is
+    /// pruned, and the others still get every chunk, in any roster order.
+    #[tokio::test]
+    async fn a_gone_link_is_pruned_and_starves_nobody() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut d = publisher_over(vec![
+            refusing("gone", || AvDispatcherError::LinkGone("closed".to_owned())),
+            healthy("ok", tx),
+        ]);
+        d.publish_inner(inner(&dek, 0, 64))
+            .await
+            .expect("a pruned link is no error");
+        assert!(rx.try_recv().is_ok(), "the healthy subscriber got it");
+        assert_eq!(d.subscriber_count(), 1, "the gone one was pruned");
+        d.publish_inner(inner(&dek, 1, 64)).await.expect("again");
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// CIRISEdge#805 item 8 — one congested subscriber does not stop the
+    /// fan-out: every other subscriber gets the chunk, and the refusal is
+    /// still reported. Order-proof: the roster is a HashMap, so a regression
+    /// to return-on-first-error is caught only when the congested one is not
+    /// iterated last; sixteen fresh rosters of eight healthy subscribers each
+    /// (each with its own hash seed) make a lucky green negligible.
+    #[tokio::test]
+    async fn one_congested_subscriber_does_not_starve_the_rest() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        for _ in 0..16 {
+            let mut receivers = Vec::new();
+            let mut roster = vec![refusing("busy", || AvDispatcherError::Congested)];
+            for i in 0..8 {
+                let (tx, rx) = mpsc::unbounded_channel();
+                roster.push(healthy(&format!("ok-{i}"), tx));
+                receivers.push(rx);
+            }
+            let mut d = publisher_over(roster);
+            assert!(matches!(
+                d.publish_inner(inner(&dek, 0, 64)).await,
+                Err(AvDispatcherError::Congested)
+            ));
+            for rx in &mut receivers {
+                assert!(rx.try_recv().is_ok(), "every healthy subscriber got it");
+            }
+            assert_eq!(d.subscriber_count(), 9, "congestion prunes nobody");
+        }
     }
 
     #[test]
