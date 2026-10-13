@@ -343,6 +343,9 @@ pub struct DurabilitySweep {
     pub already_here: Vec<[u8; 32]>,
     /// Files this node read but is not in the audience of.
     pub not_in_audience: usize,
+    /// Files whose bytes a takedown or a steward purge withholds (persist's
+    /// `steward_purge::purge_withheld`): nothing filed, nothing repaired.
+    pub withheld: Vec<[u8; 32]>,
 }
 
 /// A report older than this is re-filed on the next sweep, well inside its

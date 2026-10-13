@@ -49,9 +49,13 @@ landing.
 - **New metric family `durability_custody`** (`EdgeMetricsBundle`, the UniFFI counters and the
   PyO3 `metrics_snapshot()` dict): what each durability pass found, per file in this node's audience
   — `filed_here`, `already_here` (since v55 the write doors file the claim as they store),
-  `filed_none`, `report_refused`, `repair`. `DurabilitySweep` gains `already_here`.
+  `filed_none`, `report_refused`, `repair`, `withheld` (bytes a takedown or purge withholds:
+  no `here` filed, no repair). `DurabilitySweep` gains `already_here` and `withheld`.
   **Merge note for #820 (local/820-p1c):** the catalogue completeness gate needs a spec for this
-  family — a counter with a closed `outcome` label drawn from an enum of the five tags above.
+  family — a counter with a closed `outcome` label drawn from an enum of the six tags above.
+- **`blob_pull_refusals` gains `disk_pressure`**: a store door that refused the bytes under disk
+  pressure (persist's `DiskPressureProxyRefused`; v55 runs `would_hold` on the chunk doors too) is
+  booked by name, once per refused pull, instead of an unnamed `StoreFailed`. Still not retried.
 
 **Follow-ups (not in this cut).**
 - persist v55's I52 allows an in-cohort `Announce` for a self/family adopt; edge still keeps those

@@ -719,6 +719,9 @@ pub const DURABILITY_FILED_NONE: &str = "filed_none";
 pub const DURABILITY_REPORT_REFUSED: &str = "report_refused";
 /// CIRISEdge#763 — a durability pass queued a repair.
 pub const DURABILITY_REPAIR: &str = "repair";
+/// persist v55 r3 — a durability pass met bytes a takedown or a steward purge
+/// withholds: no `here` filed, no repair queued.
+pub const DURABILITY_WITHHELD: &str = "withheld";
 
 /// CIRISEdge#763 — the `blob_serve_refusals` tag for a chunk serve refused
 /// `Withdrawn`: every reference to the file was withdrawn (CC 2.3), by edge's
@@ -1267,7 +1270,8 @@ pub struct EdgeMetrics {
     /// durability pass found, per file in this node's audience, by tag
     /// (`DURABILITY_*`): a `here` filed (absent, lapsed or stale), a `here`
     /// already live and fresh (since v55 the write doors file it), a `none`
-    /// filed for a lost copy, a report persist refused, a repair queued.
+    /// filed for a lost copy, a report persist refused, a repair queued, bytes
+    /// a takedown withholds (nothing filed or repaired).
     pub durability_custody: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#738 — CC 5.3.3.6 delivery receipts for files, by tag
     /// (`receipts`): `emitted` / `not_emitted_*` on the receiving node;

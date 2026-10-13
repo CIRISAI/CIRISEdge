@@ -1247,3 +1247,150 @@ async fn the_pass_files_here_when_the_claim_is_retracted_stale_or_lapsed_763() {
     );
     assert!(lapsed.repairs.is_empty() && refiled.repairs.is_empty());
 }
+
+/// Tombstone `sha` on `node` with a counter-notice takedown (`dmca_512`: the
+/// bytes stay on disk through its window, withheld), as persist's own I778
+/// does: a claimant who is the signed subject of the content's establishing
+/// row files a signed `takedown_notice`, and the node records it.
+async fn take_down(node: &Node, sha: &[u8; 32]) -> String {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use ciris_crypto::{ClassicalSigner as _, Ed25519Signer};
+    use ciris_persist::federation::takedown_tombstone::{takedown_tombstone, TakedownNotice};
+    use ciris_persist::federation::tier_ingest::test_support as ts;
+    use ciris_persist::federation::FederationDirectory;
+    let dir: &dyn FederationDirectory = &*node.dir;
+    let sha_hex = hex::encode(sha);
+    let claimant = Ed25519Signer::from_seed(&[0xa1; 32]).expect("claimant seed");
+    let claimant_id = B64.encode(claimant.public_key().expect("claimant pk"));
+    let producer = "takedown-producer";
+    for k in [producer, claimant_id.as_str()] {
+        if dir.lookup_public_key(k).await.expect("lookup").is_none() {
+            ts::register_hybrid_key(dir, k).await;
+        }
+    }
+    let now = chrono::Utc::now();
+    let establishing = ts::seal_row(
+        producer,
+        ciris_persist::federation::Attestation {
+            attestation_id: uuid::Uuid::new_v4().to_string(),
+            attesting_key_id: producer.into(),
+            attested_key_id: producer.into(),
+            attestation_type: ciris_persist::federation::types::attestation_type::SCORES.into(),
+            weight: None,
+            asserted_at: now,
+            expires_at: None,
+            attestation_envelope: serde_json::json!({
+                "dimension": "content:established:v1",
+                "evidence_refs": [sha_hex],
+            }),
+            original_content_hash: String::new(),
+            scrub_signature_classical: String::new(),
+            scrub_signature_pqc: None,
+            scrub_key_id: producer.into(),
+            scrub_timestamp: now,
+            pqc_completed_at: Some(now),
+            persist_row_hash: String::new(),
+            subject_key_ids: vec![claimant_id.clone()],
+            withdraws_admission_rule: None,
+            cohort_scope: "federation".to_string(),
+            tier: ciris_persist::federation::types::attestation_tier::FEDERATION.to_string(),
+            promoted_at: None,
+            additional_scrubs: Vec::new(),
+        },
+    );
+    dir.put_attestation(SignedAttestation {
+        attestation: establishing,
+    })
+    .await
+    .expect("the establishing row");
+    let ts_of = |t: chrono::DateTime<chrono::Utc>| serde_json::to_value(t).expect("ts");
+    let mut envelope = serde_json::json!({
+        "contribution_id": uuid::Uuid::new_v4().to_string(),
+        "contribution_type": "proposal",
+        "author_id": claimant_id,
+        "subject": {"domain": "media", "language": "en", "subject": "takedown_notice"},
+        "payload": {
+            "content_sha256": sha_hex,
+            "claimant_key_id": claimant_id,
+            "legal_basis": "dmca_512",
+            "jurisdiction": "US",
+            "good_faith_statement": "good faith",
+            "claim_text": "claim",
+            "asserted_at": ts_of(now),
+            "expires_at": ts_of(now + chrono::Duration::days(30)),
+        },
+        "witness_set": null,
+        "signature": {"ed25519": "", "ml_dsa_65": null, "signed_at": ts_of(now)},
+        "submitted_at": ts_of(now),
+    });
+    let canonical = ciris_persist::verify::canonical::canonicalize_envelope_for_signing(&envelope)
+        .expect("canonical");
+    envelope["signature"]["ed25519"] =
+        serde_json::json!(B64.encode(claimant.sign(&canonical).expect("sign")));
+    let report = takedown_tombstone(dir, &TakedownNotice { envelope }, "takedown-node")
+        .await
+        .expect("the takedown");
+    assert!(report.tombstoned, "tombstoned: {report:?}");
+    ciris_persist::federation::steward_purge::purge_withheld(dir, sha)
+        .await
+        .expect("withholding")
+        .expect("the bytes are withheld")
+}
+
+/// **persist v55 r3 (Codex r3 on #1065) — a durability pass leaves bytes a
+/// takedown withholds alone.** alice's laptop holds a self file; a
+/// counter-notice takedown tombstones it (the bytes stay on disk, withheld)
+/// and the copy then loses a chunk. The pass books it `withheld`, files
+/// nothing (persist would refuse a `here` as `custody_ack_here_withheld`, and
+/// a `none` would be a report about withheld bytes) and queues NO repair (a
+/// repair would pull taken-down content back). Fails with the withholding
+/// check removed: the lost chunk queues a repair and a report is filed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_durability_pass_leaves_withheld_bytes_alone() {
+    use crate::observability::DURABILITY_WITHHELD;
+    let (alice, node_a, _node_b) = two_devices().await;
+    let edge_a = edge_of(&node_a);
+    let puller_a = puller_of(&node_a, &edge_a);
+    let file = publish_self_file(&node_a, &alice).await;
+    let notice = take_down(&node_a, &file.sha).await;
+    assert!(!notice.is_empty());
+    // Whatever the takedown itself retracted, the pass must add nothing.
+    let reports_before = node_a
+        .dir
+        .list_attestations_by(&node_a.me)
+        .await
+        .expect("list")
+        .len();
+    let (_, _, lost) = file.stream[1];
+    let _ = node_a.dir.delete_blob(&lost).await.expect("delete");
+
+    let sweep = puller_a.durability_sweep().await;
+    assert_eq!(sweep.withheld, vec![file.sha], "booked withheld: {sweep:?}");
+    assert!(
+        sweep.repairs.is_empty(),
+        "no repair pulls taken-down bytes back: {:?}",
+        sweep.repairs.iter().map(|r| r.sha).collect::<Vec<_>>()
+    );
+    assert!(sweep.reported_here.is_empty() && sweep.already_here.is_empty());
+    assert_eq!(
+        node_a
+            .dir
+            .list_attestations_by(&node_a.me)
+            .await
+            .expect("list")
+            .len(),
+        reports_before,
+        "no custody report was filed about withheld bytes"
+    );
+    assert_eq!(
+        edge_a
+            .metrics()
+            .snapshot()
+            .durability_custody
+            .get(DURABILITY_WITHHELD)
+            .copied(),
+        Some(1),
+        "booked once for the pass"
+    );
+}
