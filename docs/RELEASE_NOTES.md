@@ -53,6 +53,11 @@ landing.
   no `here` filed, no repair). `DurabilitySweep` gains `already_here` and `withheld`.
   **Merge note for #820 (local/820-p1c):** the catalogue completeness gate needs a spec for this
   family — a counter with a closed `outcome` label drawn from an enum of the six tags above.
+- **`blob_swarm::durability::file_custody` returns `CustodyFileError`** (was `String`): persist's
+  custody refusal stays typed, and `CustodyFileError::withheld_notice()` names the takedown when
+  persist refused a `here` about withheld bytes (`PurgeRefused` with
+  `steward_purge::token::BLOB_PURGED`). The durability pass reads a withheld blob off persist's
+  deficit (`DurabilityDeficit.withheld`) and books it `withheld`: nothing filed, nothing repaired.
 - **`blob_pull_refusals` gains `disk_pressure`**: a store door that refused the bytes under disk
   pressure (persist's `DiskPressureProxyRefused`; v55 runs `would_hold` on the chunk doors too) is
   booked by name, once per refused pull, instead of an unnamed `StoreFailed`. Still not retried.

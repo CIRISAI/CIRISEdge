@@ -1975,40 +1975,85 @@ where
         rooms
     }
 
-    /// persist v55.0.0 r3 (Codex r3 on #1065) — **are this file's bytes
-    /// withheld by a takedown or a steward purge?** Asked through persist's
-    /// own predicate (`steward_purge::purge_withheld`, the one its doors ask)
-    /// before anything is filed or queued: withheld bytes are no holding of
-    /// ours to advertise (persist refuses a `here` about them) or to repair
-    /// (a repair would pull taken-down content back toward this node). A
+    /// persist v55.0.0 — **are this file's bytes withheld by a takedown or a
+    /// steward purge?** Read off the file's durability deficit, which persist's
+    /// `deficit_over` fills from its canonical predicate
+    /// (`steward_purge::purge_withheld`, the one its byte and custody doors
+    /// ask) — the same read, already made for this file, so no second walk.
+    /// Withheld bytes are no holding of ours to advertise (persist refuses a
+    /// `here` about them) or to repair (a repair would pull taken-down
+    /// content back; persist's deficit lists nothing missing for them). A
     /// withheld file is booked `withheld` once per pass (the pass's `seen`
     /// set) at DEBUG, since it repeats every pass while the takedown stands.
-    /// `true` when the pass must leave the file alone (withheld, or the
-    /// predicate unreadable this pass).
-    async fn withheld_in_pass(
+    /// `true` when the pass must leave the file alone.
+    fn withheld_in_pass(
         &self,
-        dir: &dyn FederationDirectory,
+        withheld: Option<&str>,
         sha: &[u8; 32],
         blob: &str,
         out: &mut super::durability::DurabilitySweep,
     ) -> bool {
-        match ciris_persist::federation::steward_purge::purge_withheld(dir, sha).await {
-            Ok(Some(notice_id)) => {
-                self.edge
-                    .metrics()
-                    .inc_durability_custody(crate::observability::DURABILITY_WITHHELD);
-                out.withheld.push(*sha);
-                tracing::debug!(
-                    blob = %blob,
-                    notice_id = %notice_id,
-                    "durability pass: withheld by a takedown — no `here`, no repair"
-                );
-                true
+        let Some(notice_id) = withheld else {
+            return false;
+        };
+        self.edge
+            .metrics()
+            .inc_durability_custody(crate::observability::DURABILITY_WITHHELD);
+        out.withheld.push(*sha);
+        tracing::debug!(
+            blob = %blob,
+            notice_id = %notice_id,
+            "durability pass: withheld by a takedown — no `here`, no repair"
+        );
+        true
+    }
+
+    /// Book what one custody report did, in the pass's `durability_custody`
+    /// outcomes. A report persist refused because a takedown withholds the
+    /// bytes (`PurgeRefused` with `steward_purge::token::BLOB_PURGED`: a
+    /// takedown that landed after [`Self::withheld_in_pass`] asked) is
+    /// `withheld` at DEBUG, as the guard books it, never `report_refused`.
+    /// `true` when the bytes turned out to be withheld.
+    pub(crate) fn book_custody_report(
+        &self,
+        blob: &str,
+        sha: [u8; 32],
+        state: ciris_persist::federation::custody_ack::CustodyState,
+        filed: Result<String, super::durability::CustodyFileError>,
+        out: &mut super::durability::DurabilitySweep,
+    ) -> bool {
+        use crate::observability as obs;
+        use ciris_persist::federation::custody_ack::CustodyState;
+        let metrics = self.edge.metrics();
+        match filed {
+            Ok(_) if state == CustodyState::Here => {
+                metrics.inc_durability_custody(obs::DURABILITY_FILED_HERE);
+                out.reported_here.push(sha);
+                false
             }
-            Ok(None) => false,
+            Ok(_) => {
+                metrics.inc_durability_custody(obs::DURABILITY_FILED_NONE);
+                false
+            }
             Err(e) => {
-                tracing::debug!(blob = %blob, error = %e, "durability pass: withholding unreadable");
-                true
+                if let Some(notice_id) = e.withheld_notice() {
+                    metrics.inc_durability_custody(obs::DURABILITY_WITHHELD);
+                    out.withheld.push(sha);
+                    tracing::debug!(
+                        blob = %blob,
+                        notice_id = %notice_id,
+                        "durability pass: withheld by a takedown — persist refused the report"
+                    );
+                    return true;
+                }
+                metrics.inc_durability_custody(obs::DURABILITY_REPORT_REFUSED);
+                tracing::warn!(
+                    blob = %blob,
+                    state = state.as_str(),
+                    error = %e,
+                    "durability pass: custody report not filed"
+                );
+                false
             }
         }
     }
@@ -2053,7 +2098,7 @@ where
             out.not_in_audience += 1;
             return;
         }
-        if self.withheld_in_pass(dir, &sha, &blob, out).await {
+        if self.withheld_in_pass(deficit.withheld.as_deref(), &sha, &blob, out) {
             return;
         }
         let whole = match durability::holds_whole(
@@ -2098,21 +2143,12 @@ where
             (false, false) => None,
         };
         if let Some(state) = report {
-            match durability::file_custody(&self.engine, &row, &sha, &file.pointer, state).await {
-                Ok(_) if state == CustodyState::Here => {
-                    metrics.inc_durability_custody(obs::DURABILITY_FILED_HERE);
-                    out.reported_here.push(sha);
-                }
-                Ok(_) => metrics.inc_durability_custody(obs::DURABILITY_FILED_NONE),
-                Err(e) => {
-                    metrics.inc_durability_custody(obs::DURABILITY_REPORT_REFUSED);
-                    tracing::warn!(
-                        blob = %blob,
-                        state = state.as_str(),
-                        error = %e,
-                        "durability pass: custody report not filed"
-                    );
-                }
+            let filed =
+                durability::file_custody(&self.engine, &row, &sha, &file.pointer, state).await;
+            if self.book_custody_report(&blob, sha, state, filed, out) {
+                // Withheld between the guard and the file (a takedown racing
+                // the pass): nothing to repair either.
+                return;
             }
         }
         if !whole {
@@ -2461,6 +2497,13 @@ where
                 attestation_id = %row.attestation_id,
                 report = %report,
                 "custody `here` filed for a pulled file (CIRISEdge#763, CC 3.1.3.3)"
+            ),
+            // A takedown withholds the bytes: no `here` about them, by rule.
+            Err(e) if e.withheld_notice().is_some() => tracing::debug!(
+                blob = %hex::encode(sha),
+                attestation_id = %row.attestation_id,
+                notice_id = e.withheld_notice().unwrap_or(""),
+                "custody `here` not filed: the bytes are withheld by a takedown"
             ),
             Err(e) => tracing::warn!(
                 blob = %hex::encode(sha),

@@ -426,15 +426,18 @@ pub async fn file_custody(
     sha: &[u8; 32],
     pointer: &crate::group_content::BlobPointer,
     state: ciris_persist::federation::custody_ack::CustodyState,
-) -> Result<String, String> {
+) -> Result<String, CustodyFileError> {
     use crate::files::FileLifecycle;
     if state == ciris_persist::federation::custody_ack::CustodyState::Here {
-        match crate::files::row_lifecycle(engine, row).await? {
+        match crate::files::row_lifecycle(engine, row)
+            .await
+            .map_err(CustodyFileError::Unreadable)?
+        {
             FileLifecycle::Withdrawn | FileLifecycle::Recanted => {
-                return Err(format!(
+                return Err(CustodyFileError::Retracted(format!(
                     "custody: `here` not filed — {} is retracted (CC 2.3)",
                     row.attestation_id
-                ));
+                )));
             }
             FileLifecycle::Live | FileLifecycle::Superseded => {}
         }
@@ -453,7 +456,47 @@ pub async fn file_custody(
             Some(&aad),
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(CustodyFileError::Persist)
+}
+
+/// Why [`file_custody`] filed nothing. persist's own refusal stays TYPED
+/// (persist v55.0.0), so a caller can tell bytes a takedown withholds from
+/// any other refusal without reading prose.
+#[derive(Debug, thiserror::Error)]
+pub enum CustodyFileError {
+    /// `here` for a file whose row is withdrawn or recanted (CC 2.3).
+    #[error("{0}")]
+    Retracted(String),
+    /// The file's composers could not be read.
+    #[error("{0}")]
+    Unreadable(String),
+    /// persist's custody door refused the report.
+    #[error("{0}")]
+    Persist(ciris_persist::federation::Error),
+}
+
+impl CustodyFileError {
+    /// The takedown notice when persist refused the report because a
+    /// tombstone withholds the bytes: `PurgeRefused` with persist's one
+    /// "taken down" token (`steward_purge::token::BLOB_PURGED`, the same
+    /// token `BlobError::Purged.kind()` names). `None` for every other
+    /// refusal.
+    #[must_use]
+    pub fn withheld_notice(&self) -> Option<&str> {
+        use ciris_persist::federation::steward_purge::token::BLOB_PURGED;
+        match self {
+            Self::Persist(ciris_persist::federation::Error::PurgeRefused { token, body })
+                if *token == BLOB_PURGED =>
+            {
+                Some(
+                    body.get("notice_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                )
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

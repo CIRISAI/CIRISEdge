@@ -400,7 +400,7 @@ async fn a_dag_missing_a_chunk_is_not_held_and_files_no_here_763() {
     )
     .await;
     assert!(
-        matches!(&refused, Err(e) if e.contains("custody_ack_here_dag_incomplete")),
+        matches!(&refused, Err(e) if e.to_string().contains("custody_ack_here_dag_incomplete")),
         "persist's door refuses `here` for a DAG missing a chunk: {refused:?}"
     );
 
@@ -757,7 +757,7 @@ async fn a_withdrawn_file_reads_withdrawn_and_is_not_repaired_763() {
     )
     .await;
     assert!(
-        matches!(&direct, Err(e) if e.contains("is retracted")),
+        matches!(&direct, Err(e) if e.to_string().contains("is retracted")),
         "`here` for a withdrawn file is refused by edge: {direct:?}"
     );
     let resweep = puller.durability_sweep().await;
@@ -1397,4 +1397,57 @@ async fn a_durability_pass_leaves_withheld_bytes_alone() {
         Some(1),
         "booked once for the pass"
     );
+}
+
+/// **persist v55.0.0 (5ee68307) — a takedown that lands between the pass's
+/// withholding guard and its custody report is booked `withheld`, not
+/// `report_refused`.** The guard is bypassed: alice's laptop files `here`
+/// straight through `durability::file_custody` for a self file a real
+/// counter-notice takedown withholds. persist's custody door refuses it TYPED
+/// (`PurgeRefused` with `steward_purge::token::BLOB_PURGED`, naming the
+/// notice), and the pass's booking reads it as `withheld` (DEBUG), never a
+/// refused report. Fails with the `withheld_notice` match removed from
+/// `book_custody_report`: it books `report_refused`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withheld_here_refused_by_persist_books_withheld_not_report_refused() {
+    use crate::observability::{DURABILITY_REPORT_REFUSED, DURABILITY_WITHHELD};
+    use ciris_persist::federation::custody_ack::CustodyState;
+    let (alice, node_a, _node_b) = two_devices().await;
+    let edge_a = edge_of(&node_a);
+    let puller_a = puller_of(&node_a, &edge_a);
+    let file = publish_self_file(&node_a, &alice).await;
+    let notice = take_down(&node_a, &file.sha).await;
+    let file_row = crate::files::FileRow::from_row(&file.row).expect("a file row");
+    let filed = super::durability::file_custody(
+        node_a.store.engine(),
+        &file.row,
+        &file.sha,
+        &file_row.pointer,
+        CustodyState::Here,
+    )
+    .await;
+    assert_eq!(
+        filed.as_ref().err().and_then(|e| e.withheld_notice()),
+        Some(notice.as_str()),
+        "persist refuses `here` about withheld bytes, typed, naming the notice: {filed:?}"
+    );
+    let mut out = super::durability::DurabilitySweep::default();
+    assert!(
+        puller_a.book_custody_report(
+            &hex::encode(file.sha),
+            file.sha,
+            CustodyState::Here,
+            filed,
+            &mut out
+        ),
+        "the report's refusal says the bytes are withheld"
+    );
+    assert_eq!(out.withheld, vec![file.sha]);
+    let booked = edge_a.metrics().snapshot().durability_custody;
+    assert_eq!(
+        booked.get(DURABILITY_WITHHELD).copied(),
+        Some(1),
+        "{booked:?}"
+    );
+    assert_eq!(booked.get(DURABILITY_REPORT_REFUSED), None, "{booked:?}");
 }
