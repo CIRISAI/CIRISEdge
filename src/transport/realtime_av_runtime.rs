@@ -99,6 +99,7 @@ use super::realtime_av_dispatcher::{
     AvSubscriberLink, HopGap, PeerKeyId, ReconstructedChunk,
 };
 use super::realtime_av_session::{AvSession, AvSessionError, EpochRekeyArtifacts, RosterDelta};
+use crate::transport::av_leg_choice::{ChunkVerdict, Leg, LegAction, LegChoice};
 use crate::transport::realtime_av::ReceiverLayerPolicy;
 // CIRISEdge#331 (CC-5.4.4) — admitting a published joiner now signs the Welcome
 // with the inviter's long-term ML-DSA-65 federation identity, so the spine must
@@ -532,10 +533,28 @@ impl AvRelay {
         inbound_transit_key: [u8; 32],
         inbound_link_id: Vec<u8>,
     ) -> tokio::task::JoinHandle<()> {
+        self.spawn_pump_admitting(inbound, inbound_transit_key, inbound_link_id)
+            .0
+    }
+
+    /// CIRISEdge#805 item 8, cut 2 — [`Self::spawn_pump`], plus a handle that
+    /// admits subscribers to (and drops them from) the RUNNING pump: a
+    /// subscriber that dials this relay is admitted here once the host has
+    /// checked it is entitled (`av_leg_choice::relay_admits`). An admission
+    /// takes effect from the next forwarded chunk. A subscriber whose link
+    /// closes needs no drop: the fan-out prunes a gone link.
+    #[must_use]
+    pub fn spawn_pump_admitting(
+        self,
+        inbound: AvInboundLink,
+        inbound_transit_key: [u8; 32],
+        inbound_link_id: Vec<u8>,
+    ) -> (tokio::task::JoinHandle<()>, RelayAdmissions) {
+        let (control_tx, mut control_rx) = mpsc::channel::<RelayControl>(16);
         let stream_id = self.stream_id;
         let tag = stream_tag(stream_id);
         let mut dispatcher = self.dispatcher;
-        tokio::spawn(async move {
+        let pump = tokio::spawn(async move {
             let mut inbound_link_seq: u64 = 0;
             // The upstream's drop report, kept until a frame authenticates
             // (Codex on #813 — a junk frame must not swallow it).
@@ -556,6 +575,12 @@ impl AvRelay {
                         break;
                     }
                 };
+                // Admissions and drops since the last frame, before this one
+                // fans out (drained here, not raced against the receive, so
+                // no receive is ever cancelled).
+                while let Ok(control) = control_rx.try_recv() {
+                    apply_relay_control(&mut dispatcher, control, &tag);
+                }
                 let dropped_before = gap.report(frame.dropped_before);
                 let sealed = match SealedAvChunk::from_bytes(&frame.bytes) {
                     Ok(s) => s,
@@ -629,7 +654,76 @@ impl AvRelay {
                     }
                 }
             }
+        });
+        (pump, RelayAdmissions { tx: control_tx })
+    }
+}
+
+/// Apply one roster change to a running relay pump's dispatcher.
+fn apply_relay_control(dispatcher: &mut AvDispatcher, control: RelayControl, tag: &str) {
+    match control {
+        RelayControl::Admit(link) => {
+            let subscriber = link.subscriber.clone();
+            match dispatcher.add_subscriber(link) {
+                Ok(()) => tracing::info!(
+                    stream = %tag,
+                    subscriber = %subscriber,
+                    "AV relay: dialled subscriber ADMITTED (CIRISEdge#805 item 8)"
+                ),
+                Err(e) => tracing::warn!(
+                    stream = %tag,
+                    subscriber = %subscriber,
+                    error = %e,
+                    "AV relay: dialled subscriber not admitted"
+                ),
+            }
+        }
+        RelayControl::Drop(subscriber) => dispatcher.remove_subscriber(&subscriber),
+    }
+}
+
+/// A change to a running relay pump's roster.
+enum RelayControl {
+    Admit(AvSubscriberLink),
+    Drop(PeerKeyId),
+}
+
+/// CIRISEdge#805 item 8, cut 2 — admits subscribers to (and drops them from)
+/// a running [`AvRelay`] pump ([`AvRelay::spawn_pump_admitting`]).
+#[derive(Clone)]
+pub struct RelayAdmissions {
+    tx: mpsc::Sender<RelayControl>,
+}
+
+impl std::fmt::Debug for RelayAdmissions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayAdmissions").finish_non_exhaustive()
+    }
+}
+
+impl RelayAdmissions {
+    /// Admit `link`'s subscriber from the next forwarded chunk. The caller
+    /// has checked it is ENTITLED (`av_leg_choice::relay_admits`).
+    ///
+    /// # Errors
+    /// [`AvRuntimeError::Dispatcher`] when the pump has ended.
+    pub async fn admit(&self, link: AvSubscriberLink) -> Result<(), AvRuntimeError> {
+        self.tx.send(RelayControl::Admit(link)).await.map_err(|_| {
+            AvDispatcherError::SendFailed("the relay pump has ended".to_owned()).into()
         })
+    }
+
+    /// Drop `subscriber` from the next forwarded chunk.
+    ///
+    /// # Errors
+    /// [`AvRuntimeError::Dispatcher`] when the pump has ended.
+    pub async fn drop_subscriber(&self, subscriber: PeerKeyId) -> Result<(), AvRuntimeError> {
+        self.tx
+            .send(RelayControl::Drop(subscriber))
+            .await
+            .map_err(|_| {
+                AvDispatcherError::SendFailed("the relay pump has ended".to_owned()).into()
+            })
     }
 }
 
@@ -786,6 +880,176 @@ impl AvSubscriber {
         // thing the caller needs to drain chunks.
         drop(dispatcher);
         Ok(rx)
+    }
+
+    /// CIRISEdge#805 item 8, cut 2 — subscribe on the RELAY leg with a
+    /// direct leg to come: one stream, up to two legs, ONE delivery path.
+    ///
+    /// Each leg runs its own [`Self::subscribe`] open loop (its own transit
+    /// key and replay counter). A merge task passes every reconstructed chunk
+    /// through [`LegChoice`], so only a first delivery reaches the returned
+    /// chunk receiver; the overlap's duplicates are dropped and counted
+    /// (`av_inbound_duplicate_leg`). The [`LegAction`] receiver tells the host
+    /// what to do: close the relay link ([`LegAction::DropRelay`]) or dial the
+    /// relay again ([`LegAction::RejoinRelay`]). The host adds a leg with
+    /// [`LegSubscription::add_leg`]: the direct leg when the publisher's link
+    /// arrives, the relay leg again after a rejoin.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::subscribe`], for the relay leg.
+    pub fn subscribe_legs(
+        stream_id: StreamId,
+        dek: &EpochDek,
+        publisher: PeerKeyId,
+        relay: PeerKeyId,
+        relay_leg: AvInboundLink,
+        metrics: Option<crate::observability::EdgeMetrics>,
+    ) -> Result<LegStreams, AvRuntimeError> {
+        let (event_tx, mut event_rx) = mpsc::channel::<(Leg, Option<ReconstructedChunk>)>(128);
+        let (control_tx, mut control_rx) = mpsc::channel::<(Leg, AvInboundLink)>(4);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<ReconstructedChunk>(64);
+        let (action_tx, action_rx) = mpsc::channel::<LegAction>(8);
+        // The merge task opens later legs under the same DEK; it holds its own
+        // zeroize-on-drop copy.
+        let dek = EpochDek::from_bytes(*dek.as_bytes());
+        forward_leg(
+            Leg::Relay,
+            Self::subscribe(stream_id, &dek, &relay, relay_leg)?,
+            event_tx.clone(),
+        );
+        let mut choice = LegChoice::new(stream_id, publisher.clone(), relay.clone());
+        let started = std::time::Instant::now();
+        let now_ms = move || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tokio::spawn(async move {
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_millis(
+                crate::transport::realtime_av_alm::HEARTBEAT_INTERVAL_MS,
+            ));
+            loop {
+                let action = tokio::select! {
+                    event = event_rx.recv() => match event {
+                        Some((leg, Some(chunk))) => {
+                            let (verdict, action) =
+                                choice.on_chunk(leg, chunk.epoch, chunk.chunk_seq, now_ms());
+                            match verdict {
+                                ChunkVerdict::Deliver => {
+                                    if chunk_tx.send(chunk).await.is_err() {
+                                        return; // the consumer is gone
+                                    }
+                                }
+                                ChunkVerdict::Duplicate => {
+                                    if let Some(m) = metrics.as_ref() {
+                                        m.inc_av_plane(crate::observability::AV_INBOUND_DUPLICATE_LEG);
+                                    }
+                                }
+                                ChunkVerdict::UnknownLeg => {}
+                            }
+                            action
+                        }
+                        // The direct leg's link ended: the crisp fallback
+                        // signal (the publisher closes it on a dead path).
+                        Some((Leg::Direct, None)) => choice.direct_closed(),
+                        // A relay leg ends when this subscriber dropped it,
+                        // or the relay went away; the host owns rejoining.
+                        Some((Leg::Relay, None)) => None,
+                        None => return,
+                    },
+                    added = control_rx.recv() => match added {
+                        Some((leg, link)) => {
+                            let parent = match leg {
+                                Leg::Direct => &publisher,
+                                Leg::Relay => &relay,
+                            };
+                            match Self::subscribe(stream_id, &dek, parent, link) {
+                                Ok(rx) => {
+                                    match leg {
+                                        Leg::Direct => choice.direct_up(now_ms()),
+                                        Leg::Relay => choice.relay_rejoined(now_ms()),
+                                    }
+                                    forward_leg(leg, rx, event_tx.clone());
+                                }
+                                Err(e) => tracing::warn!(
+                                    stream = %stream_tag(stream_id),
+                                    ?leg,
+                                    error = %e,
+                                    "AV subscriber: a leg could not be opened"
+                                ),
+                            }
+                            None
+                        }
+                        None => None,
+                    },
+                    _ = heartbeat.tick() => choice.tick(now_ms()),
+                };
+                if let Some(action) = action {
+                    tracing::info!(
+                        stream = %stream_tag(stream_id),
+                        ?action,
+                        "AV subscriber: leg choice (CIRISEdge#805 item 8)"
+                    );
+                    if action_tx.send(action).await.is_err() {
+                        return; // the host is gone
+                    }
+                }
+            }
+        });
+        Ok(LegStreams {
+            legs: LegSubscription { tx: control_tx },
+            chunks: chunk_rx,
+            actions: action_rx,
+        })
+    }
+}
+
+/// Carry one leg's reconstructed chunks into the merge, then its end.
+fn forward_leg(
+    leg: Leg,
+    mut rx: mpsc::Receiver<ReconstructedChunk>,
+    tx: mpsc::Sender<(Leg, Option<ReconstructedChunk>)>,
+) {
+    tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            if tx.send((leg, Some(chunk))).await.is_err() {
+                return;
+            }
+        }
+        let _ = tx.send((leg, None)).await;
+    });
+}
+
+/// CIRISEdge#805 item 8, cut 2 — what [`AvSubscriber::subscribe_legs`] hands
+/// back: the leg control, the deduped chunks, and the host's leg actions.
+pub struct LegStreams {
+    /// Add the direct leg (or the relay leg again).
+    pub legs: LegSubscription,
+    /// First deliveries only, from whichever leg.
+    pub chunks: mpsc::Receiver<ReconstructedChunk>,
+    /// [`LegAction::DropRelay`] / [`LegAction::RejoinRelay`] for the host.
+    pub actions: mpsc::Receiver<LegAction>,
+}
+
+/// Adds legs to a running [`AvSubscriber::subscribe_legs`].
+#[derive(Clone)]
+pub struct LegSubscription {
+    tx: mpsc::Sender<(Leg, AvInboundLink)>,
+}
+
+impl std::fmt::Debug for LegSubscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LegSubscription").finish_non_exhaustive()
+    }
+}
+
+impl LegSubscription {
+    /// Add `leg` over `link`: the publisher's direct link when it arrives, or
+    /// the relay's again after a [`LegAction::RejoinRelay`].
+    ///
+    /// # Errors
+    /// [`AvRuntimeError::Dispatcher`] when the subscription has ended.
+    pub async fn add_leg(&self, leg: Leg, link: AvInboundLink) -> Result<(), AvRuntimeError> {
+        self.tx.send((leg, link)).await.map_err(|_| {
+            AvDispatcherError::RecvFailed("the leg subscription has ended".to_owned()).into()
+        })
     }
 }
 
@@ -944,6 +1208,16 @@ mod leviculum_link {
         #[must_use]
         pub fn is_direct(&self) -> bool {
             self.direct_path.is_some()
+        }
+
+        /// CIRISEdge#805 item 8 — the member's IDENTITY link this leg's
+        /// punched interface was made for, when the leg holds one: what
+        /// `retire_direct_link` (leviculum#83) moves back to the relay.
+        #[must_use]
+        pub fn direct_anchor(&self) -> Option<[u8; 16]> {
+            self.direct_path
+                .as_ref()
+                .map(crate::transport::direct_path::DirectPathGuard::link_id)
         }
 
         /// Count this sender's refusals on `metrics` (`av_plane`).

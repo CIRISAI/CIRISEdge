@@ -890,6 +890,17 @@ pub const AV_INBOUND_DROPPED_ARRIVALS_FULL: &str = "av_inbound_dropped_arrivals_
 pub const AV_INBOUND_DROPPED_CONSUMER_GONE: &str = "av_inbound_dropped_consumer_gone";
 /// Dropped: a Resource completed on an A/V link (A/V rides the Channel only).
 pub const AV_INBOUND_DROPPED_RESOURCE: &str = "av_inbound_dropped_resource";
+/// CIRISEdge#805 item 8, cut 2 — a chunk already delivered from the
+/// subscriber's other leg (the make-before-break overlap), dropped by the
+/// dedupe above the per-leg opens. Not a loss.
+pub const AV_INBOUND_DUPLICATE_LEG: &str = "av_inbound_duplicate_leg";
+/// CIRISEdge#805 item 8, cut 2 — a subscriber that dialled this relay was not
+/// entitled (not a live member of the dialled stream's group): refused, sent
+/// nothing, link closed.
+pub const AV_RELAY_DIALLER_REFUSED: &str = "av_relay_dialler_refused";
+/// CIRISEdge#805 item 8, cut 2 — a subscriber that dialled this relay was
+/// entitled and admitted to its fan-out.
+pub const AV_RELAY_DIALLER_ADMITTED: &str = "av_relay_dialler_admitted";
 
 // ─── CIRISEdge#805 item 8 — `EdgeMetrics::direct_link` labels ─────────
 

@@ -5465,24 +5465,98 @@ impl ReticulumTransport {
         self.node.direct_link_interface(&LinkId::new(link_id))
     }
 
-    /// CIRISEdge#805 item 8 — the action [`crate::transport::direct_path::direct_leg_stalled`]
-    /// triggers: a direct A/V leg whose path is gone falls back. The A/V link
-    /// was born on the punched interface and has no relayed path to return
-    /// to, so it is closed, and the call's heal redials the member the way it
-    /// would with no direct path (the relay leg).
+    /// CIRISEdge#805 item 8, cut 2 — a subscriber DIALLED this relay (its A/V
+    /// link arrived): admit it to the relay's fan-out iff it is ENTITLED (CC
+    /// 5.3.3.4: fan-out = entitled ∩ reachable), by
+    /// [`crate::transport::av_leg_choice::relay_admits`] over this node's
+    /// scope table. An unentitled dialler is refused, counted, sent nothing,
+    /// and its link closed. Returns whether it was admitted.
     ///
-    /// TODO(leviculum#83): also `retire_direct_link` on the member's identity
-    /// link, so it leaves the dead punched interface at once instead of after
-    /// leviculum's stale window.
-    pub async fn fall_back_from_direct(&self, av_link_id: [u8; 16]) {
+    /// `transit_key` is the hop's outer-seal key; the subscriber opens with
+    /// the same. TODO(805 item 5): the Call derives it; callers supply it
+    /// until then. The hop's AEAD link id is the leviculum link id, which both
+    /// ends hold.
+    pub async fn admit_dialled_subscriber(
+        &self,
+        arrival: crate::transport::av_sink::AvArrival,
+        admissions: &crate::transport::realtime_av_runtime::RelayAdmissions,
+        transit_key: [u8; 32],
+    ) -> bool {
+        let dialler = arrival.peer.as_str().to_owned();
+        let entitled = self.scope_addresses.get().is_some_and(|table| {
+            crate::transport::av_leg_choice::relay_admits(table, arrival.address.as_ref(), &dialler)
+        });
+        let admitted = entitled
+            && admissions
+                .admit(crate::transport::realtime_av_dispatcher::AvSubscriberLink {
+                    subscriber: dialler.clone(),
+                    transit_key,
+                    link_id: arrival.link_id.to_vec(),
+                    outbound_send: Box::new(arrival.sender),
+                })
+                .await
+                .is_ok();
+        if let Some(m) = self.metrics.get() {
+            m.inc_av_plane(if admitted {
+                crate::observability::AV_RELAY_DIALLER_ADMITTED
+            } else {
+                crate::observability::AV_RELAY_DIALLER_REFUSED
+            });
+        }
+        if admitted {
+            tracing::info!(
+                peer = %dialler,
+                link = %hex::encode(arrival.link_id),
+                "AV relay: a dialling subscriber is entitled and ADMITTED (CIRISEdge#805 item 8)"
+            );
+        } else {
+            tracing::warn!(
+                peer = %dialler,
+                link = %hex::encode(arrival.link_id),
+                entitled,
+                "AV relay: a dialling subscriber REFUSED — not a live member of the dialled \
+                 stream's group (CC 5.3.3.4); nothing sent, link closed"
+            );
+            let _ = self.link_teardown(&arrival.link_id).await;
+        }
+        admitted
+    }
+
+    /// CIRISEdge#805 item 8 — the action [`crate::transport::direct_path::direct_leg_stalled`]
+    /// triggers: a direct A/V leg whose path is gone falls back, at once, on
+    /// both planes.
+    ///
+    /// 1. The member's IDENTITY link leaves the dead punched interface for the
+    ///    interface it came from (`retire_direct_link`, leviculum#83), instead
+    ///    of after leviculum's stale window; the peer is nudged over the relay
+    ///    and follows. A link already off the punched interface is left alone.
+    /// 2. The A/V leg is closed. It was BORN on the punched interface and has
+    ///    no relayed path to return to; closing it is also the subscriber's
+    ///    crisp fallback signal (its direct inbound ends, and its leg choice
+    ///    rejoins the relay, `av_leg_choice`).
+    ///
+    /// `av_link_id` is the leg's link and `anchor` its
+    /// `LeviculumAvSender::direct_anchor`, read before the sender moved into a
+    /// dispatcher.
+    pub async fn fall_back_from_direct(&self, av_link_id: [u8; 16], anchor: Option<[u8; 16]>) {
         if let Some(m) = self.metrics.get() {
             m.inc_direct_link(crate::observability::DIRECT_LINK_LEG_FELL_BACK);
         }
         tracing::info!(
             link = %hex::encode(av_link_id),
-            "direct A/V leg stalled: closing it so the call heals over the relay leg \
-             (CIRISEdge#805 item 8)"
+            anchor = ?anchor.map(hex::encode),
+            "direct A/V leg stalled: retiring the punched path and closing the leg so the \
+             call heals over the relay (CIRISEdge#805 item 8)"
         );
+        if let Some(anchor) = anchor {
+            if let Err(e) = self.node.retire_direct_link(&LinkId::new(anchor)).await {
+                tracing::debug!(
+                    anchor = %hex::encode(anchor),
+                    error = %e,
+                    "direct path already off the punched interface (leviculum#83)"
+                );
+            }
+        }
         let _ = self.link_teardown(&av_link_id).await;
     }
 
