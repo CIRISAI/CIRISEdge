@@ -7240,13 +7240,21 @@ async fn a_pull_under_disk_pressure_books_its_store_refusal_by_name() {
         .engine()
         .clone()
         .with_disk_pressure_state_shared(pressure_rx);
+    // One chunk per adopt call: the walk then makes one refused adopt CALL
+    // per chunk (six here), so a booking per call and a booking per chunk
+    // both overcount, and only one booking per refused PULL reads exactly.
+    // (At the default batch size the six chunks fit one call, which could
+    // not tell per-call from per-pull.)
     let puller_b = BlobPuller::new(
         Arc::clone(&edge_b),
         pressured,
         node_b.dir.clone(),
         node_b.dir.clone() as Arc<dyn FederationDirectory>,
         node_b.me.clone(),
-        PullConfig::default(),
+        PullConfig {
+            dag_adopt_batch_chunks: 1,
+            ..PullConfig::default()
+        },
     );
     let booked = || {
         edge_b
@@ -7383,6 +7391,17 @@ async fn a_pull_under_disk_pressure_books_its_store_refusal_by_name() {
     assert!(
         matches!(&refused, PullOutcome::StoreFailed(e) if e.contains("adopt chunk")),
         "the chunk adopt is refused under Stop pressure: {refused:?}"
+    );
+    let batches = edge_b
+        .metrics()
+        .snapshot()
+        .blob_dag_chunks
+        .get("adopt_batches")
+        .copied()
+        .unwrap_or(0);
+    assert!(
+        batches >= 2,
+        "the walk made several refused adopt calls (batch = 1): {batches}"
     );
     assert_eq!(
         booked(),
