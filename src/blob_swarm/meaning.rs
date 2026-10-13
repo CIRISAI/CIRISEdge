@@ -581,8 +581,12 @@ impl BlobMeaning {
 /// persist v55.0.0 (CIRISPersist#989, CC 2.4 rc7) retired the carrier: the
 /// holding claim is `custody:ack:v1` ([`is_custody_report`]), and EVERY
 /// spelling under the `holds_bytes:` stem is refused at every door and left
-/// out of every serve read (`registry::RETIRED_CARRIER_STEMS`, a prefix
-/// match). Edge matches the same stem, persist's own constant, so a legacy
+/// out of every serve read (`registry::RETIRED_CARRIER_STEMS`: each entry
+/// says how it matches, and the `holds_bytes:` entry is
+/// `RetiredMatch::Stem`, every type that begins with it; the retired
+/// key-grant SET entries are `RetiredMatch::Exact`, whole types only, so
+/// `key_grant:*:v10` / `v1beta` / `v1x` are not retired and are served).
+/// Edge matches the same stem, persist's own constant, so a legacy
 /// row that still reaches it is possession and never meaning, whatever its
 /// spelling. (Before v55 this matched the exact rc6 `holds_bytes:sha256:` +
 /// 8-hex form, the only one persist admitted then.)
@@ -1009,7 +1013,8 @@ mod tests {
     /// shapes, dedupes, and returns nothing for a possession claim.
     /// CIRISEdge#791, widened at persist v55.0.0 (CIRISPersist#989) — the
     /// retired carrier is the whole `holds_bytes:` STEM, as persist refuses
-    /// it (`registry::RETIRED_CARRIER_STEMS` is a prefix match): every
+    /// it (its `registry::RETIRED_CARRIER_STEMS` entry is
+    /// `RetiredMatch::Stem`; the key-grant SET entries are `Exact`): every
     /// spelling under it is possession, the rc6 8-hex form and any other.
     /// A type that only resembles it, outside the stem, is not.
     #[test]
