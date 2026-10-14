@@ -349,24 +349,32 @@ pub async fn pending_proposals_for(
 ) -> Result<Vec<PendingProposal>, MembershipError> {
     const PAGE: u32 = 512;
     let now = chrono::Utc::now();
-    let replied: std::collections::HashSet<String> = directory
-        .list_attestations_for(invitee_key_id)
+    // persist v56 (#1001): the invitee's replies, both dimensions in one walk.
+    // Replies are attested to the key that signed them (`to`, exactly v55's
+    // `list_attestations_for`). Every reply counts, so the walk runs to the
+    // end. A NotServed page is an Err, never "nothing answered".
+    use ciris_persist::federation::attestation_query::{
+        AttestationQuery, DimensionFilter, FOLD_PAGE,
+    };
+    let mut replies = AttestationQuery::to(invitee_key_id, FOLD_PAGE);
+    replies.dimension = DimensionFilter::AnyOf(vec![
+        ACCEPTANCE_DIMENSION.to_owned(),
+        DECLINE_DIMENSION.to_owned(),
+    ]);
+    let mut replies = replies.pages();
+    let mut replied: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while let Some(page) = replies
+        .next(directory)
         .await
         .map_err(|e| MembershipError::from_persist("list replies", &e))?
-        .into_iter()
-        .filter(|r| {
-            matches!(
-                dimension_of(r),
-                Some(ACCEPTANCE_DIMENSION | DECLINE_DIMENSION)
-            )
-        })
-        .filter_map(|r| {
+    {
+        replied.extend(page.into_iter().filter_map(|r| {
             r.attestation_envelope
                 .get("references_attestation_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
-        })
-        .collect();
+        }));
+    }
     let mut out = Vec::new();
     let mut since = None;
     loop {

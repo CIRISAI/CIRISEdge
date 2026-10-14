@@ -480,6 +480,11 @@ pub async fn open_pair_room(
     })
 }
 
+/// Page size of the proposer walk in [`live_proposal_by`]: a proposer's
+/// proposals are few, and the walk is a host call.
+const PROPOSAL_PAGE: std::num::NonZeroU32 =
+    ciris_persist::federation::attestation_query::page_size(64);
+
 /// A live proposal `proposer_key_id` signed inviting `invitee` into `room`
 /// that the invitee has not declined, if one is held here.
 async fn live_proposal_by(
@@ -488,37 +493,49 @@ async fn live_proposal_by(
     room: &str,
     invitee: &str,
 ) -> Result<Option<Attestation>, String> {
+    use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
     let now = chrono::Utc::now();
-    let mut live = directory
-        .list_attestations_by(proposer_key_id)
+    let live_here = |p: &Attestation| {
+        p.subject_key_ids.first().map(String::as_str) == Some(invitee)
+            && p.attestation_envelope
+                .get(FIELD_COMMUNITY_ID)
+                .and_then(serde_json::Value::as_str)
+                == Some(room)
+            && p.expires_at.is_some_and(|t| t > now)
+    };
+    // persist v56 (#1001): the proposer's proposals, newest first. Proposals
+    // are attested to their PROPOSER (emit's default), so the invitee is a
+    // subject filter here, not `to`. A NotServed page is an Err, never "no
+    // live proposal" (which would mint a duplicate).
+    let mut live: Vec<Attestation> = Vec::new();
+    let mut proposals = AttestationQuery::by(proposer_key_id, PROPOSAL_PAGE)
+        .dimension(crate::membership::PROPOSAL_DIMENSION)
+        .pages();
+    while let Some(page) = proposals
+        .next(directory)
         .await
         .map_err(|e| format!("list proposals by {proposer_key_id}: {e}"))?
-        .into_iter()
-        .filter(|p| {
-            crate::membership::dimension_of(p) == Some(crate::membership::PROPOSAL_DIMENSION)
-                && p.subject_key_ids.first().map(String::as_str) == Some(invitee)
-                && p.attestation_envelope
-                    .get(FIELD_COMMUNITY_ID)
-                    .and_then(serde_json::Value::as_str)
-                    == Some(room)
-                && p.expires_at.is_some_and(|t| t > now)
-        })
-        .collect::<Vec<_>>();
-    let declined: std::collections::HashSet<String> = directory
-        .list_attestations_for(invitee)
+    {
+        live.extend(page.into_iter().filter(|p| live_here(p)));
+    }
+    // Declines are attested to the invitee who signed them (`to`, as v55's
+    // `list_attestations_for`). Every one counts, so the walk runs to the end.
+    let mut declined: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut replies = AttestationQuery::to(invitee, FOLD_PAGE)
+        .dimension(crate::membership::DECLINE_DIMENSION)
+        .pages();
+    while let Some(page) = replies
+        .next(directory)
         .await
         .map_err(|e| format!("list replies of {invitee}: {e}"))?
-        .into_iter()
-        .filter(|r| {
-            crate::membership::dimension_of(r) == Some(crate::membership::DECLINE_DIMENSION)
-        })
-        .filter_map(|r| {
+    {
+        declined.extend(page.into_iter().filter_map(|r| {
             r.attestation_envelope
                 .get("references_attestation_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned)
-        })
-        .collect();
+        }));
+    }
     live.retain(|p| !declined.contains(&p.attestation_id));
     live.sort_by_key(|p| std::cmp::Reverse(p.asserted_at));
     Ok(live.into_iter().next())
@@ -1111,7 +1128,9 @@ fn dimension_of(a: &Attestation) -> Option<&str> {
 /// `self` row and its `community` widening are present (on the author's own
 /// devices) the prior is dropped and the widening stands. A peer holds only
 /// the widening.
-/// Every chat-plane row in `room` from `participants`, unopened.
+/// Every chat-plane row of `dimension` in `room` from `participants`,
+/// unopened. The dimension is pushed into the read (persist v56, #1001),
+/// so a caller no longer filters it after the call.
 ///
 /// Public because a caller often wants to know a row ARRIVED without paying
 /// to open its content — a convergence poll asks "has the widening landed",
@@ -1123,15 +1142,40 @@ pub async fn rows_in_room(
     directory: &dyn ciris_persist::federation::FederationDirectory,
     participants: &[String],
     room: &str,
+    dimension: &str,
 ) -> Result<Vec<Attestation>, String> {
+    use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
+    use ciris_persist::federation::types::attestation_type as ty;
+    // persist v56 (#1001): each participant's rows of `dimension`, plus the
+    // composers that can fold one out, each walked page by page. A widening
+    // carries its prior's envelope, dimension included, so it matches the
+    // first walk. The composer walk has no dimension until persist confirms a
+    // retraction carries one. There is no room filter in the query (no
+    // indexed cohort-target column), so the room is matched below as before.
+    // A NotServed page is an Err, never an empty room.
     let mut rows: Vec<Attestation> = Vec::new();
     for who in participants {
-        rows.extend(
-            directory
-                .list_attestations_by(who)
-                .await
-                .map_err(|e| format!("list_attestations_by({who}): {e}"))?,
-        );
+        let mut in_dimension = AttestationQuery::by(who, FOLD_PAGE)
+            .dimension(dimension)
+            .types(&[ty::SCORES, ty::SUPERSEDES])
+            .pages();
+        while let Some(page) = in_dimension
+            .next(directory)
+            .await
+            .map_err(|e| format!("rows by {who} in {dimension}: {e}"))?
+        {
+            rows.extend(page);
+        }
+        let mut composers = AttestationQuery::by(who, FOLD_PAGE)
+            .types(&[ty::WITHDRAWS, ty::RECANTS])
+            .pages();
+        while let Some(page) = composers
+            .next(directory)
+            .await
+            .map_err(|e| format!("composers by {who}: {e}"))?
+        {
+            rows.extend(page);
+        }
     }
     let superseded: std::collections::BTreeSet<String> = rows
         .iter()
@@ -1146,6 +1190,7 @@ pub async fn rows_in_room(
         .into_iter()
         .filter(|a| !superseded.contains(&a.attestation_id))
         .filter(|a| room_of(a).as_deref() == Some(room))
+        .filter(|a| dimension_of(a) == Some(dimension))
         .collect();
     out.sort_by(|a, b| {
         a.asserted_at
@@ -1185,12 +1230,12 @@ pub async fn messages_in_room(
     store: &dyn crate::group_content::GroupContentStore,
     viewer_key_id: &str,
 ) -> Result<Vec<ChatMessage>, String> {
-    let mut out: Vec<ChatMessage> = rows_in_room(directory, participants, room)
-        .await?
-        .iter()
-        .filter(|a| dimension_of(a) == Some(CHAT_MESSAGE_DIMENSION))
-        .filter_map(|a| ChatMessage::from_row(a, room))
-        .collect();
+    let mut out: Vec<ChatMessage> =
+        rows_in_room(directory, participants, room, CHAT_MESSAGE_DIMENSION)
+            .await?
+            .iter()
+            .filter_map(|a| ChatMessage::from_row(a, room))
+            .collect();
     // Corroborate the pre-v39 claims, one owner walk per distinct attester.
     let mut owner_of: std::collections::BTreeMap<String, Option<String>> =
         std::collections::BTreeMap::new();
@@ -1256,12 +1301,13 @@ pub async fn latest_key_package_at(
     from: &str,
     room: &str,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
-    Ok(rows_in_room(directory, &[from.to_owned()], room)
-        .await?
-        .iter()
-        .filter(|a| dimension_of(a) == Some(KEY_PACKAGE_DIMENSION))
-        .map(|a| a.asserted_at)
-        .max())
+    Ok(
+        rows_in_room(directory, &[from.to_owned()], room, KEY_PACKAGE_DIMENSION)
+            .await?
+            .iter()
+            .map(|a| a.asserted_at)
+            .max(),
+    )
 }
 
 /// The KeyPackage `from` shared in `room`, if it has arrived — step 1 of the
@@ -1275,17 +1321,18 @@ pub async fn key_package_from(
     room: &str,
 ) -> Result<Option<Vec<u8>>, String> {
     use base64::Engine as _;
-    Ok(rows_in_room(directory, &[from.to_owned()], room)
-        .await?
-        .iter()
-        .filter(|a| dimension_of(a) == Some(KEY_PACKAGE_DIMENSION))
-        .filter_map(|a| {
-            a.attestation_envelope
-                .get(FIELD_MLS_BYTES)
-                .and_then(serde_json::Value::as_str)
-                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
-        })
-        .next_back())
+    Ok(
+        rows_in_room(directory, &[from.to_owned()], room, KEY_PACKAGE_DIMENSION)
+            .await?
+            .iter()
+            .filter_map(|a| {
+                a.attestation_envelope
+                    .get(FIELD_MLS_BYTES)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+            })
+            .next_back(),
+    )
 }
 
 /// The Welcome `from` shared in `room`, with its epoch, if it has arrived —
@@ -1299,22 +1346,23 @@ pub async fn welcome_from(
     room: &str,
 ) -> Result<Option<(Vec<u8>, u64)>, String> {
     use base64::Engine as _;
-    Ok(rows_in_room(directory, &[from.to_owned()], room)
-        .await?
-        .iter()
-        .filter(|a| dimension_of(a) == Some(WELCOME_DIMENSION))
-        .filter_map(|a| {
-            let env = &a.attestation_envelope;
-            let bytes = env
-                .get(FIELD_MLS_BYTES)
-                .and_then(serde_json::Value::as_str)
-                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())?;
-            let epoch = env
-                .get(FIELD_MLS_EPOCH)
-                .and_then(serde_json::Value::as_u64)?;
-            Some((bytes, epoch))
-        })
-        .next_back())
+    Ok(
+        rows_in_room(directory, &[from.to_owned()], room, WELCOME_DIMENSION)
+            .await?
+            .iter()
+            .filter_map(|a| {
+                let env = &a.attestation_envelope;
+                let bytes = env
+                    .get(FIELD_MLS_BYTES)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())?;
+                let epoch = env
+                    .get(FIELD_MLS_EPOCH)
+                    .and_then(serde_json::Value::as_u64)?;
+                Some((bytes, epoch))
+            })
+            .next_back(),
+    )
 }
 
 /// A Welcome row as placed: its bytes, the epoch it welcomes into, and the
@@ -1375,37 +1423,38 @@ pub async fn welcome_for_row(
 ) -> Result<Option<PlacedWelcome>, String> {
     use base64::Engine as _;
     let pair_room = pair_community_key_id(from, recipient_key_id);
-    Ok(rows_in_room(directory, &[from.to_owned()], room)
-        .await?
-        .iter()
-        .filter(|a| dimension_of(a) == Some(WELCOME_DIMENSION))
-        .filter(|a| {
-            match a
-                .attestation_envelope
-                .get(FIELD_MLS_FOR)
-                .and_then(serde_json::Value::as_str)
-            {
-                Some(named) => named == recipient_key_id,
-                // Pair-era: the room was the address.
-                None => room == pair_room,
-            }
-        })
-        .filter_map(|a| {
-            let env = &a.attestation_envelope;
-            let bytes = env
-                .get(FIELD_MLS_BYTES)
-                .and_then(serde_json::Value::as_str)
-                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())?;
-            let epoch = env
-                .get(FIELD_MLS_EPOCH)
-                .and_then(serde_json::Value::as_u64)?;
-            Some(PlacedWelcome {
-                bytes,
-                epoch,
-                asserted_at: a.asserted_at,
+    Ok(
+        rows_in_room(directory, &[from.to_owned()], room, WELCOME_DIMENSION)
+            .await?
+            .iter()
+            .filter(|a| {
+                match a
+                    .attestation_envelope
+                    .get(FIELD_MLS_FOR)
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some(named) => named == recipient_key_id,
+                    // Pair-era: the room was the address.
+                    None => room == pair_room,
+                }
             })
-        })
-        .next_back())
+            .filter_map(|a| {
+                let env = &a.attestation_envelope;
+                let bytes = env
+                    .get(FIELD_MLS_BYTES)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())?;
+                let epoch = env
+                    .get(FIELD_MLS_EPOCH)
+                    .and_then(serde_json::Value::as_u64)?;
+                Some(PlacedWelcome {
+                    bytes,
+                    epoch,
+                    asserted_at: a.asserted_at,
+                })
+            })
+            .next_back(),
+    )
 }
 
 /// Every commit `from` placed in `room`, oldest claim first, each with the
@@ -1424,22 +1473,23 @@ pub async fn commits_from(
     room: &str,
 ) -> Result<Vec<(Vec<u8>, crate::mls::CommitClaim)>, String> {
     use base64::Engine as _;
-    Ok(rows_in_room(directory, &[from.to_owned()], room)
-        .await?
-        .iter()
-        .filter(|a| dimension_of(a) == Some(COMMIT_DIMENSION))
-        .filter_map(|a| {
-            let bytes = a
-                .attestation_envelope
-                .get(FIELD_MLS_BYTES)
-                .and_then(serde_json::Value::as_str)
-                .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())?;
-            Some((
-                bytes,
-                crate::mls::CommitClaim::new(a.asserted_at, a.attesting_key_id.clone()),
-            ))
-        })
-        .collect())
+    Ok(
+        rows_in_room(directory, &[from.to_owned()], room, COMMIT_DIMENSION)
+            .await?
+            .iter()
+            .filter_map(|a| {
+                let bytes = a
+                    .attestation_envelope
+                    .get(FIELD_MLS_BYTES)
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())?;
+                Some((
+                    bytes,
+                    crate::mls::CommitClaim::new(a.asserted_at, a.attesting_key_id.clone()),
+                ))
+            })
+            .collect(),
+    )
 }
 
 /// What [`apply_room_commits`] did with the commit rows it read (CIRISEdge#604).

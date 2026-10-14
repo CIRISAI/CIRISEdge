@@ -4000,7 +4000,7 @@ async fn run_chat_legs(occ: &Occurrence) {
             // The predicate is "the WIDENING arrived", which is a question
             // about the ROW. Recognising a row needs no content, so this
             // deliberately does not resolve pointers on every poll tick.
-            chat::rows_in_room(dir, &senders, &room)
+            chat::rows_in_room(dir, &senders, &room, chat::CHAT_MESSAGE_DIMENSION)
                 .await
                 .is_ok_and(|rows| {
                     rows.iter().any(|a| {
@@ -4072,15 +4072,15 @@ async fn run_chat_legs(occ: &Occurrence) {
     // the author; persist I128) from a wrap that never reached this node.
     let key_plane = {
         use ciris_persist::federation::blobs::BlobStorage as _;
-        let rows = dir
-            .list_attestations_by(&peer_owner)
-            .await
-            .unwrap_or_default();
         let mut out = Vec::new();
         for m in seen.iter().filter(|m| m.widens.is_some() && !is_open(m)) {
-            let sha = rows
-                .iter()
-                .find(|a| a.attestation_id == m.attestation_id)
+            // persist v56 (#1001): a point read of the one row, not a list of
+            // everything the peer signed.
+            let sha = dir
+                .get_attestation(&m.attestation_id)
+                .await
+                .ok()
+                .flatten()
                 .and_then(|a| a.attestation_envelope.get(chat::FIELD_CONTENT).cloned())
                 .and_then(|v| {
                     serde_json::from_value::<ciris_edge::group_content::BlobPointer>(v).ok()
@@ -4152,10 +4152,26 @@ async fn run_chat_legs(occ: &Occurrence) {
     };
     // The RAW rows: the peer's `self` copy must not be here (CC 5.2), and no
     // chat row may carry the plaintext.
-    let raw = dir
-        .list_attestations_by(&peer_owner)
-        .await
-        .unwrap_or_default();
+    //
+    // persist v56 (#1001): every row the peer signed, page by page. A page not
+    // served FAILS the leg: an unread set must not pass both leak checks
+    // vacuously.
+    let mut raw: Vec<ciris_persist::federation::Attestation> = Vec::new();
+    let mut raw_unread: Option<String> = None;
+    let mut pages = ciris_persist::federation::attestation_query::AttestationQuery::by(
+        &peer_owner,
+        ciris_persist::federation::attestation_query::FOLD_PAGE,
+    )
+    .pages();
+    while let Some(page) = match pages.next(dir).await {
+        Ok(page) => page,
+        Err(e) => {
+            raw_unread = Some(e.to_string());
+            None
+        }
+    } {
+        raw.extend(page);
+    }
     let leaked_self_rows: Vec<String> = raw
         .iter()
         .filter(|a| {
@@ -4176,14 +4192,17 @@ async fn run_chat_legs(occ: &Occurrence) {
         })
         .map(|a| a.attestation_id.clone())
         .collect();
-    let ok = opened && leaked_self_rows.is_empty() && plaintext_on_wire.is_empty();
+    let ok = opened
+        && raw_unread.is_none()
+        && leaked_self_rows.is_empty()
+        && plaintext_on_wire.is_empty();
     if !ok {
         tracing::error!(
             %room, waited_ms = outcome.waited().as_millis(), checks = outcome.checks(),
             messages = seen.len(), opened, leaked_self_rows = ?leaked_self_rows,
-            plaintext_on_wire = ?plaintext_on_wire,
-            "the peer's sealed WIDENING did not arrive and open within the budget, or a \
-             self copy / plaintext leaked here"
+            plaintext_on_wire = ?plaintext_on_wire, raw_unread = ?raw_unread,
+            "the peer's sealed WIDENING did not arrive and open within the budget, a \
+             self copy / plaintext leaked here, or the peer's rows could not be read"
         );
     }
     rep.ran(
@@ -4215,6 +4234,7 @@ async fn run_chat_legs(occ: &Occurrence) {
             "key_plane": key_plane,
             "leaked_self_rows": leaked_self_rows,
             "plaintext_on_wire": plaintext_on_wire,
+            "raw_unread": raw_unread,
             "peer_node": peer_node,
             "inbound": occ.inbound_stats.as_json(),
             "covers": "a community-scoped, SEALED chat row attested and signed by the peer's \

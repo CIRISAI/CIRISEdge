@@ -209,7 +209,32 @@ impl PassCustody {
         device: &str,
     ) -> Result<&HashMap<String, Vec<CustodyAck>>, ciris_persist::federation::Error> {
         if !self.by_device.contains_key(device) {
-            let rows = directory.list_attestations_by(device).await?;
+            // persist v56 (#1001): the device's custody reports, and the
+            // composers that can retire them, each walked page by page. A
+            // NotServed page is an Err here (`Pages::next` is `.served()?`):
+            // the file is skipped and nothing is cached, never an empty index
+            // read as "this device holds nothing".
+            use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
+            use ciris_persist::federation::custody_ack::CUSTODY_ACK_DIMENSION;
+            use ciris_persist::federation::types::attestation_type as ty;
+            let mut rows: Vec<Attestation> = Vec::new();
+            let mut reports = AttestationQuery::by(device, FOLD_PAGE)
+                .dimension(CUSTODY_ACK_DIMENSION)
+                .types(&[ty::SCORES])
+                .pages();
+            while let Some(page) = reports.next(directory).await? {
+                rows.extend(page);
+            }
+            // `retired_ids` applies a retraction only when its composer is in
+            // the same slice. Until persist confirms a composer carries its
+            // prior's dimension, the composers are a second, type-narrowed
+            // walk (no dimension), so none is dropped by the filter above.
+            let mut composers = AttestationQuery::by(device, FOLD_PAGE)
+                .types(&[ty::SUPERSEDES, ty::WITHDRAWS, ty::RECANTS])
+                .pages();
+            while let Some(page) = composers.next(directory).await? {
+                rows.extend(page);
+            }
             self.folds += 1;
             let refs: Vec<&Attestation> = rows.iter().collect();
             let retired = ciris_persist::federation::precedence::retired_ids(&refs);

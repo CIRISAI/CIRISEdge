@@ -5030,6 +5030,39 @@ impl FederationDirectoryReplicationBridge {
     /// [`Self::is_non_retainable_score`] carve) and `list_attestations_by`
     /// (records BY the subject — authorship recovery, no carve: mine to recover).
     /// Non-replicated / cohort kinds are not subject-pullable and return empty.
+    /// persist v56 (#1001): a subject-Pull Attestation read that was NOT
+    /// SERVED. The axis serves empty this round, as any failed read here does,
+    /// but the reason is named: `Refused` (`Unsupported` on persist's ops
+    /// proxy, the pyo3 runtime) is permanent, and a re-pull will not change
+    /// it; anything else is a backend fault and transient.
+    fn subject_read_not_served(
+        subject_key_id: &str,
+        axis: &str,
+        e: &ciris_persist::federation::Error,
+    ) {
+        if matches!(e, ciris_persist::federation::Error::Unsupported { .. }) {
+            tracing::warn!(
+                error = %e,
+                subject = %subject_key_id,
+                axis,
+                "subject-Pull attestation read REFUSED by this directory: serving an \
+                 EMPTY axis. This is permanent on this directory (a proxy that does \
+                 not serve the read), NOT a statement the subject has no testimony, \
+                 and a re-pull will not change it (persist #1001, CIRISEdge#462)"
+            );
+        } else {
+            tracing::warn!(
+                error = %e,
+                subject = %subject_key_id,
+                axis,
+                "subject-Pull attestation read FAILED: serving an EMPTY axis this \
+                 round (a transient backend fault, NOT a statement the subject has \
+                 no testimony; the requester re-pulls next round) \
+                 (CIRISEdge#462/#429, persist #1001)"
+            );
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // five per-plane arms + the v18 loud-read/booking mirrors
     async fn subject_holdings_inner(
         &self,
@@ -5181,10 +5214,27 @@ impl FederationDirectoryReplicationBridge {
                 // DATA-SUBJECT axis — records ABOUT the subject (the 84-family
                 // revocation-reachability set), MINUS the G2 self-non-retainable
                 // scores.
-                for att in subject_read!(
-                    self.directory.list_attestations_for(subject_key_id),
-                    "attestation (data-subject axis)"
-                ) {
+                // persist v56 (#1001): the data-subject axis, page by page
+                // (`to` is v55's `list_attestations_for` exactly). A page not
+                // served ends the axis for this round, named, never read as
+                // "no testimony".
+                let mut about: Vec<Attestation> = Vec::new();
+                let mut pages = ciris_persist::federation::attestation_query::AttestationQuery::to(
+                    subject_key_id,
+                    ciris_persist::federation::attestation_query::FOLD_PAGE,
+                )
+                .pages();
+                while let Some(page) = match pages.next(&*self.directory).await {
+                    Ok(page) => page,
+                    Err(e) => {
+                        Self::subject_read_not_served(subject_key_id, "data-subject", &e);
+                        about.clear();
+                        None
+                    }
+                } {
+                    about.extend(page);
+                }
+                for att in about {
                     // persist v55.0.0 (#989) — key-grant rows stay carved here
                     // too: a grant is authored by its sealer, not its recipient,
                     // and travels only by `may_receive` refers-to delivery to the
@@ -5210,10 +5260,25 @@ impl FederationDirectoryReplicationBridge {
                 // G2 carve (an attestation I authored is mine to recover, even a
                 // `capacity:*` score I asserted about someone else) — but the SAME
                 // serve gate, so a ref and its bytes always agree.
-                for att in subject_read!(
-                    self.directory.list_attestations_by(subject_key_id),
-                    "attestation (sender axis)"
-                ) {
+                // persist v56 (#1001): the sender axis, page by page (`by` is
+                // v55's `list_attestations_by` exactly). Not served: as above.
+                let mut authored: Vec<Attestation> = Vec::new();
+                let mut pages = ciris_persist::federation::attestation_query::AttestationQuery::by(
+                    subject_key_id,
+                    ciris_persist::federation::attestation_query::FOLD_PAGE,
+                )
+                .pages();
+                while let Some(page) = match pages.next(&*self.directory).await {
+                    Ok(page) => page,
+                    Err(e) => {
+                        Self::subject_read_not_served(subject_key_id, "sender", &e);
+                        authored.clear();
+                        None
+                    }
+                } {
+                    authored.extend(page);
+                }
+                for att in authored {
                     let seq = Self::ms_seq(att.asserted_at);
                     match content_hash_of(&att) {
                         Some((hash, _)) => {
@@ -8978,7 +9043,32 @@ impl FederationDirectoryReplicationBridge {
     ) -> Result<HashSet<String>, ciris_persist::federation::Error> {
         use ciris_persist::federation::admission::is_owner_binding_envelope;
         use ciris_persist::federation::types::{attestation_type, cohort_scope};
-        let rows = self.directory.list_attestations_for(node).await?;
+        // persist v56 (#1001): the owner-binding plane about `node` and the
+        // composers that can retire it, page by page. `to` is v55's
+        // `list_attestations_for` exactly; scores (the bulk of rows about a
+        // node) are not read. No `authored_by(owner)`: the node's own
+        // retraction must stay in the slice `retired_ids` folds.
+        //
+        // A page NOT SERVED is an `Err` (`Pages::next` is `.served()?`), so
+        // `node_is_announced` is `Err` and `identity_row_reach` answers
+        // `Unresolved`, which it never memoizes. A refused read must never
+        // become `Ok(false)` "not announced": that answer IS cached, and would
+        // withhold the node's identity rows until the next ownership event.
+        let mut rows: Vec<Attestation> = Vec::new();
+        let mut pages = ciris_persist::federation::attestation_query::AttestationQuery::to(
+            node,
+            ciris_persist::federation::attestation_query::FOLD_PAGE,
+        )
+        .types(&[
+            attestation_type::DELEGATES_TO,
+            attestation_type::SUPERSEDES,
+            attestation_type::WITHDRAWS,
+            attestation_type::RECANTS,
+        ])
+        .pages();
+        while let Some(page) = pages.next(&*self.directory).await? {
+            rows.extend(page);
+        }
         let refs: Vec<&Attestation> = rows.iter().collect();
         let retired = ciris_persist::federation::precedence::retired_ids(&refs);
         let now = chrono::Utc::now();
@@ -20337,6 +20427,60 @@ pub(crate) mod tests {
             bridge.announce_reads(),
             2,
             "one walk per subject in the publish set (node-bob, person-bob)"
+        );
+    }
+
+    /// persist v56 (#1001), the P9 witness. An announce read the directory
+    /// does NOT serve (persist's ops proxy refuses the typed read) is an
+    /// error from `node_is_announced`, never `Ok(false)`, and the reach it
+    /// yields is `Unresolved`, which is never memoized: a refused read must
+    /// not withhold a node's identity rows until the next ownership event.
+    #[tokio::test]
+    async fn a_refused_announce_read_is_unresolved_and_never_memoized_1001() {
+        use ciris_persist::federation::directory_double::FaultInjectingDirectory;
+        let (backend, healthy, _metrics, _hash) = announce_fixture(true).await;
+        // The control: on the healthy directory the node IS announced.
+        assert!(
+            healthy
+                .node_is_announced("person-bob", "node-bob")
+                .await
+                .expect("served"),
+            "control: the announced fixture reads as announced"
+        );
+        let inner: Arc<dyn FederationDirectory> = backend.clone();
+        let refusing: Arc<dyn FederationDirectory> =
+            Arc::new(FaultInjectingDirectory::new(inner).unsupported("execute_attestation_query"));
+        let cohort_cb: CohortProvider = Arc::new(Vec::new);
+        let bridge = FederationDirectoryReplicationBridge::new(refusing, cohort_cb);
+        assert!(
+            bridge
+                .node_is_announced("person-bob", "node-bob")
+                .await
+                .is_err(),
+            "a refused read is an error, not \"not announced\""
+        );
+        assert!(
+            matches!(
+                bridge.identity_row_reach("node-bob").await,
+                IdentityRowReach::Unresolved
+            ),
+            "a refused read leaves the reach unresolved"
+        );
+        assert!(
+            bridge
+                .announce_cache
+                .lock()
+                .expect("memo")
+                .get("node-bob")
+                .is_none(),
+            "an unresolved reach is never memoized"
+        );
+        let walks = bridge.announce_reads();
+        let _ = bridge.identity_row_reach("node-bob").await;
+        assert_eq!(
+            bridge.announce_reads(),
+            walks + 1,
+            "the next ask walks again: no memo entry answered it"
         );
     }
 
