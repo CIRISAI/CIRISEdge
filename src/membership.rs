@@ -353,15 +353,10 @@ pub async fn pending_proposals_for(
     // Replies are attested to the key that signed them (`to`, exactly v55's
     // `list_attestations_for`). Every reply counts, so the walk runs to the
     // end. A NotServed page is an Err, never "nothing answered".
-    use ciris_persist::federation::attestation_query::{
-        AttestationQuery, DimensionFilter, FOLD_PAGE,
-    };
-    let mut replies = AttestationQuery::to(invitee_key_id, FOLD_PAGE);
-    replies.dimension = DimensionFilter::AnyOf(vec![
-        ACCEPTANCE_DIMENSION.to_owned(),
-        DECLINE_DIMENSION.to_owned(),
-    ]);
-    let mut replies = replies.pages();
+    use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
+    let mut replies = AttestationQuery::to(invitee_key_id, FOLD_PAGE)
+        .dimension_any_of(&[ACCEPTANCE_DIMENSION, DECLINE_DIMENSION])
+        .pages();
     let mut replied: std::collections::HashSet<String> = std::collections::HashSet::new();
     while let Some(page) = replies
         .next(directory)

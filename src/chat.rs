@@ -1149,9 +1149,11 @@ pub async fn rows_in_room(
     // persist v56 (#1001): each participant's rows of `dimension`, plus the
     // composers that can fold one out, each walked page by page. A widening
     // carries its prior's envelope, dimension included, so it matches the
-    // first walk. The composer walk has no dimension until persist confirms a
-    // retraction carries one. There is no room filter in the query (no
-    // indexed cohort-target column), so the room is matched below as before.
+    // first walk. A retraction carries no dimension, so the composer walk has
+    // none. The room is matched below, not in the query: `scope()` needs a
+    // cohort_scope, and a room's rows sit at two (the author's original at
+    // `self`, its share at the room's scope), so a scope filter would drop the
+    // originals the fold needs.
     // A NotServed page is an Err, never an empty room.
     let mut rows: Vec<Attestation> = Vec::new();
     for who in participants {
