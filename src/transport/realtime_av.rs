@@ -580,6 +580,79 @@ pub fn inner_sealed_from_parts(
     }
 }
 
+/// CIRISEdge#866 — where each `(transit key, link_id)` pair's outer-seal
+/// counter stopped, so a re-admission resumes it instead of restarting it.
+///
+/// The outer nonce is a function of `(link_id, link_seq)` alone
+/// ([`derive_outer_nonce`]), and it is used under the transit key with
+/// AES-256-GCM. Restarting `link_seq` at 0 for a pair that already sealed
+/// repeats `(key, nonce)`, which leaks the XOR of the two plaintexts and
+/// GCM's authentication key. It also lands below the receiver's replay
+/// window on a live link. So the sender's counter belongs to the PAIR, not
+/// to one admission of it: dropping a subscriber and admitting it again
+/// with the same key and link continues from where it stopped.
+///
+/// The ledger keys on a domain-separated SHA-256 of the pair and never
+/// holds the key. It grows by one entry per distinct pair retired over the
+/// owner's life (one stream's dispatcher, one relay), so it is bounded by
+/// admissions, not by traffic. Use [`Self::resume`] when a pair is
+/// admitted, [`Self::retire`] when it stops sealing, and
+/// [`Self::live_conflict`] to refuse a pair already live under another
+/// admission.
+#[derive(Debug, Default)]
+pub struct LinkSeqLedger {
+    retired: std::collections::HashMap<[u8; 32], u64>,
+}
+
+impl LinkSeqLedger {
+    /// The ledger's key for a pair: SHA-256 over a domain tag, the
+    /// length-prefixed `link_id`, and the transit key.
+    #[must_use]
+    pub fn pair_id(transit_key: &[u8; 32], link_id: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"CIRIS-AV-LINKSEQ-PAIR-V1");
+        h.update(
+            u64::try_from(link_id.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        h.update(link_id);
+        h.update(transit_key);
+        h.finalize().into()
+    }
+
+    /// The first `link_seq` a new admission of this pair may seal with:
+    /// where the pair stopped, or 0 for a pair never retired here.
+    pub fn resume(&mut self, transit_key: &[u8; 32], link_id: &[u8]) -> u64 {
+        self.retired
+            .remove(&Self::pair_id(transit_key, link_id))
+            .unwrap_or(0)
+    }
+
+    /// Record that this pair stopped sealing with `next_link_seq` unused.
+    /// Keeps the higher mark if the pair was retired before.
+    pub fn retire(&mut self, transit_key: &[u8; 32], link_id: &[u8], next_link_seq: u64) {
+        let mark = self
+            .retired
+            .entry(Self::pair_id(transit_key, link_id))
+            .or_insert(0);
+        *mark = (*mark).max(next_link_seq);
+    }
+
+    /// Whether admitting `(transit_key, link_id)` would run two live
+    /// counters under one pair: true if any of `live` is the same pair.
+    #[must_use]
+    pub fn live_conflict<'a>(
+        transit_key: &[u8; 32],
+        link_id: &[u8],
+        mut live: impl Iterator<Item = (&'a [u8; 32], &'a [u8])>,
+    ) -> bool {
+        let id = Self::pair_id(transit_key, link_id);
+        live.any(|(k, l)| Self::pair_id(k, l) == id)
+    }
+}
+
 /// Seal the **outer** AEAD layer for one Link, given a pre-computed
 /// [`InnerSealed`]. The companion to [`seal_av_inner`].
 ///

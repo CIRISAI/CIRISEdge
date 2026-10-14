@@ -8489,16 +8489,17 @@ impl PyAvSession {
 // ─── PyRelayNode (CIRISEdge#66 / L2-C) ──────────────────────────────
 
 /// Map a `RelayError` to the appropriate `PyErr`. `StreamNotFound` /
-/// `SubscriberNotFound` are caller-input issues (PyValueError);
+/// `SubscriberNotFound` / `TransitPairInUse` (a reused transit key,
+/// CIRISEdge#866) are caller-input issues (PyValueError);
 /// `TransitKeyMissing` (internal invariant) + `OuterSealFailed`
 /// (crypto operation failed) map to PyRuntimeError.
 #[cfg(feature = "transport-reticulum")]
 fn map_relay_err(e: &crate::transport::realtime_av_relay::RelayError) -> PyErr {
     use crate::transport::realtime_av_relay::RelayError;
     match e {
-        RelayError::StreamNotFound(_) | RelayError::SubscriberNotFound { .. } => {
-            PyValueError::new_err(format!("{e}"))
-        }
+        RelayError::StreamNotFound(_)
+        | RelayError::SubscriberNotFound { .. }
+        | RelayError::TransitPairInUse { .. } => PyValueError::new_err(format!("{e}")),
         RelayError::TransitKeyMissing { .. } | RelayError::OuterSealFailed(_) => {
             PyRuntimeError::new_err(format!("{e}"))
         }
