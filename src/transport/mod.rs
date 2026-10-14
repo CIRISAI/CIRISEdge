@@ -90,6 +90,12 @@ pub mod realtime_av_runtime;
 /// relay), make-before-break, deduped above the per-leg opens; and the relay's
 /// admission rule for a subscriber that dials it.
 pub mod av_leg_choice;
+
+/// CIRISEdge#847 (#805 item 2) — one DEK per `(stream, epoch)`: a KEPT live
+/// stream registers each epoch's per-(stream, epoch) DEK with persist as the
+/// stored DEK, wrapped to the audience; an unkept call registers nothing.
+pub mod av_keep;
+
 /// CIRISEdge#805 item 4 — the A/V plane on the live node: the Reticulum
 /// transport's A/V sink, fed from the same event loop replication uses.
 #[cfg(feature = "_reticulum-module")]
