@@ -253,6 +253,12 @@ impl AvPublisher {
         &self.session
     }
 
+    /// CIRISEdge#847 — this epoch's per-(stream, epoch) DEK, the key a
+    /// kept stream registers with persist ([`super::av_keep`]).
+    pub(crate) fn epoch_dek(&self) -> &EpochDek {
+        &self.dek
+    }
+
     /// Downstream subscriber count.
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
