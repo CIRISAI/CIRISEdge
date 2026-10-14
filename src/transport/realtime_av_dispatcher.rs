@@ -133,6 +133,14 @@ pub enum AvDispatcherError {
     /// A caller-supplied [`AvLinkReceiver::recv`] failed.
     #[error("transport recv failed: {0}")]
     RecvFailed(String),
+    /// CIRISEdge#866 — the `(transit key, link_id)` pair is already live
+    /// under another subscriber. Two live counters under one pair would
+    /// repeat outer nonces, so the admission is refused and nothing
+    /// changes. See [`crate::transport::realtime_av::LinkSeqLedger`].
+    #[error(
+        "transit key + link_id already live for another subscriber ({0}); refused (CIRISEdge#866)"
+    )]
+    TransitPairInUse(PeerKeyId),
     /// An AEAD open failed — either the inbound outer layer (relay /
     /// subscriber) or the inner layer (subscriber). Most commonly a
     /// wrong transit key or a `link_seq` desync.
@@ -424,6 +432,9 @@ pub struct AvDispatcher {
     subscribers: HashMap<PeerKeyId, OutboundState>,
     /// Inbound links, consumed by [`Self::spawn_subscriber_loop`].
     inbound_links: Vec<AvInboundLink>,
+    /// CIRISEdge#866 — where each retired `(transit key, link_id)` pair's
+    /// counter stopped; a re-admission resumes it, never restarts it.
+    link_seqs: crate::transport::realtime_av::LinkSeqLedger,
 }
 
 impl AvDispatcher {
@@ -459,8 +470,21 @@ impl AvDispatcher {
             AvRole::Publisher | AvRole::Subscriber => config.epoch_dek.map(EpochDek::from_bytes),
         };
 
-        let mut subscribers = HashMap::with_capacity(config.initial_subscribers.len());
+        let mut subscribers: HashMap<PeerKeyId, OutboundState> =
+            HashMap::with_capacity(config.initial_subscribers.len());
         for link in config.initial_subscribers {
+            // CIRISEdge#866 — two initial subscribers on one pair would run
+            // two counters from 0 under one key.
+            if crate::transport::realtime_av::LinkSeqLedger::live_conflict(
+                &link.transit_key,
+                &link.link_id,
+                subscribers
+                    .iter()
+                    .filter(|(who, _)| **who != link.subscriber)
+                    .map(|(_, st)| (&st.transit_key, st.link_id.as_slice())),
+            ) {
+                return Err(AvDispatcherError::TransitPairInUse(link.subscriber));
+            }
             subscribers.insert(
                 link.subscriber,
                 OutboundState {
@@ -478,6 +502,7 @@ impl AvDispatcher {
             epoch_dek,
             subscribers,
             inbound_links: config.inbound_links,
+            link_seqs: crate::transport::realtime_av::LinkSeqLedger::default(),
         })
     }
 
@@ -718,23 +743,41 @@ impl AvDispatcher {
         rx
     }
 
-    /// Add a new downstream subscriber mid-stream. Its `link_seq`
-    /// counter starts at 0 — a fresh transit key is a fresh keystream.
-    /// Idempotent on `subscriber`: re-adding replaces the outbound state
-    /// (and resets the counter).
+    /// Add a downstream subscriber mid-stream. Idempotent on `subscriber`:
+    /// re-adding replaces the outbound state.
+    ///
+    /// CIRISEdge#866 — the `link_seq` counter belongs to the
+    /// `(transit key, link_id)` pair, not to this admission. A pair this
+    /// dispatcher sealed under before (dropped, or replaced, and admitted
+    /// again) resumes where it stopped. A new pair starts at 0. Restarting
+    /// a used pair at 0 would repeat outer nonces under one GCM key.
     ///
     /// # Errors
     ///
-    /// Infallible today; returns `Result` for forward-compat with a
-    /// future validation pass (e.g. rejecting a relay-role add). Never
-    /// returns `Err` in this cut.
+    /// [`AvDispatcherError::TransitPairInUse`] if the pair is already live
+    /// under ANOTHER subscriber; nothing changes.
     pub fn add_subscriber(&mut self, link: AvSubscriberLink) -> Result<(), AvDispatcherError> {
+        if crate::transport::realtime_av::LinkSeqLedger::live_conflict(
+            &link.transit_key,
+            &link.link_id,
+            self.subscribers
+                .iter()
+                .filter(|(who, _)| **who != link.subscriber)
+                .map(|(_, st)| (&st.transit_key, st.link_id.as_slice())),
+        ) {
+            return Err(AvDispatcherError::TransitPairInUse(link.subscriber));
+        }
+        if let Some(old) = self.subscribers.remove(&link.subscriber) {
+            self.link_seqs
+                .retire(&old.transit_key, &old.link_id, old.next_link_seq);
+        }
+        let next_link_seq = self.link_seqs.resume(&link.transit_key, &link.link_id);
         self.subscribers.insert(
             link.subscriber,
             OutboundState {
                 transit_key: link.transit_key,
                 link_id: link.link_id,
-                next_link_seq: 0,
+                next_link_seq,
                 sender: link.outbound_send,
             },
         );
@@ -742,10 +785,15 @@ impl AvDispatcher {
     }
 
     /// Remove a downstream subscriber mid-stream. Drops its outbound
-    /// state (transit key + sender). No-op if the subscriber was not
-    /// registered.
+    /// state (transit key + sender) and keeps only where its pair's
+    /// counter stopped, as a hash (CIRISEdge#866). No-op if the subscriber
+    /// was not registered.
     pub fn remove_subscriber(&mut self, subscriber: &PeerKeyId) {
-        self.subscribers.remove(subscriber);
+        if let Some(old) = self.subscribers.remove(subscriber) {
+            // CIRISEdge#866 — remember where the pair stopped.
+            self.link_seqs
+                .retire(&old.transit_key, &old.link_id, old.next_link_seq);
+        }
     }
 }
 
@@ -1174,5 +1222,97 @@ mod tests {
             inbound_links: vec![],
         });
         assert!(r.is_ok());
+    }
+
+    /// The `link_seq` a wire frame was sealed under, found by opening it.
+    fn sealed_at(wire: &[u8], key: &[u8; 32], link_id: &[u8], dek: &EpochDek) -> u64 {
+        let sealed = SealedAvChunk::from_bytes(wire).expect("parse");
+        (0..64)
+            .find(|c| open_av_chunk(&sealed, key, link_id, *c, dek).is_ok())
+            .expect("the frame opens at some link_seq under its key and link")
+    }
+
+    /// CIRISEdge#866 — re-admitting a subscriber with the same transit key
+    /// and link (after a remove, and by a replacing add) resumes its outer
+    /// counter: across three admissions no `(key, link_id, link_seq)` is
+    /// ever sealed twice, and the sequence the receiver sees stays dense.
+    #[tokio::test]
+    async fn readmission_on_the_same_pair_never_repeats_an_outer_nonce_866() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut d = publisher_over(vec![healthy("sub", tx.clone())]);
+        let key = [0x31u8; 32];
+        let mut seen = std::collections::BTreeSet::new();
+        let mut chunk = 0u64;
+        for round in 0..3 {
+            match round {
+                1 => {
+                    d.remove_subscriber(&"sub".to_owned());
+                    d.add_subscriber(healthy("sub", tx.clone()))
+                        .expect("re-admit after a remove");
+                }
+                2 => d
+                    .add_subscriber(healthy("sub", tx.clone()))
+                    .expect("re-admit by a replacing add"),
+                _ => {}
+            }
+            for _ in 0..3 {
+                d.publish_inner(inner(&dek, chunk, 64))
+                    .await
+                    .expect("publish");
+                chunk += 1;
+                let wire = rx.try_recv().expect("sent");
+                let at = sealed_at(&wire, &key, b"sub", &dek);
+                assert!(
+                    seen.insert(at),
+                    "round {round}: link_seq {at} sealed twice under one key and link"
+                );
+            }
+        }
+        assert_eq!(seen, (0..9).collect(), "dense across re-admissions");
+    }
+
+    /// CIRISEdge#866 — a NEW transit key on the same link is a new pair and
+    /// starts at 0.
+    #[tokio::test]
+    async fn a_new_key_on_the_same_link_starts_its_own_counter_866() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut d = publisher_over(vec![healthy("sub", tx.clone())]);
+        d.publish_inner(inner(&dek, 0, 64)).await.expect("publish");
+        let _ = rx.try_recv().expect("sent");
+        d.remove_subscriber(&"sub".to_owned());
+        let mut fresh = healthy("sub", tx);
+        fresh.transit_key = [0x55; 32];
+        d.add_subscriber(fresh).expect("a new key");
+        d.publish_inner(inner(&dek, 1, 64)).await.expect("publish");
+        let wire = rx.try_recv().expect("sent");
+        assert_eq!(sealed_at(&wire, &[0x55; 32], b"sub", &dek), 0);
+    }
+
+    /// CIRISEdge#866 — the same pair live under two subscribers is refused,
+    /// at an add and at construction, and the roster is unchanged.
+    #[test]
+    fn a_pair_live_under_another_subscriber_is_refused_866() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let twin = |tx: mpsc::UnboundedSender<Vec<u8>>| {
+            let mut l = healthy("b", tx);
+            l.link_id = b"a".to_vec();
+            l
+        };
+        let mut d = publisher_over(vec![healthy("a", tx.clone())]);
+        assert!(matches!(
+            d.add_subscriber(twin(tx.clone())),
+            Err(AvDispatcherError::TransitPairInUse(who)) if who == "b"
+        ));
+        assert_eq!(d.subscriber_count(), 1, "nothing changed");
+        let built = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(8),
+            local_role: AvRole::Publisher,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: vec![healthy("a", tx.clone()), twin(tx)],
+            inbound_links: vec![],
+        });
+        assert!(matches!(built, Err(AvDispatcherError::TransitPairInUse(_))));
     }
 }
