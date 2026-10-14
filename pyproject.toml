@@ -101,8 +101,10 @@ classifiers = [
 # this process is the same crate edge linked", and 40.x and 41.x are not.
 # v55.0.0 (CIRISPersist#989) moves none of the four either; the floor moves
 # with the MAJOR.
+# v56.0.0 (CIRISPersist#1001/#1077/#1089) moves none of the four (and
+# DIRECTORY_ABI_VERSION stays 7); the floor moves with the MAJOR.
 dependencies = [
-    "ciris-persist>=55,<56",
+    "ciris-persist>=56,<57",
 ]
 dynamic = ["version"]
 

@@ -347,18 +347,18 @@ pub async fn pending_proposals_for(
     directory: &dyn FederationDirectory,
     invitee_key_id: &str,
 ) -> Result<Vec<PendingProposal>, MembershipError> {
+    use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
     const PAGE: u32 = 512;
     let now = chrono::Utc::now();
     // persist v56 (#1001): the invitee's replies, both dimensions in one walk.
     // Replies are attested to the key that signed them (`to`, exactly v55's
     // `list_attestations_for`). Every reply counts, so the walk runs to the
     // end. A NotServed page is an Err, never "nothing answered".
-    use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
-    let mut replies = AttestationQuery::to(invitee_key_id, FOLD_PAGE)
+    let mut reply_pages = AttestationQuery::to(invitee_key_id, FOLD_PAGE)
         .dimension_any_of(&[ACCEPTANCE_DIMENSION, DECLINE_DIMENSION])
         .pages();
     let mut replied: std::collections::HashSet<String> = std::collections::HashSet::new();
-    while let Some(page) = replies
+    while let Some(page) = reply_pages
         .next(directory)
         .await
         .map_err(|e| MembershipError::from_persist("list replies", &e))?

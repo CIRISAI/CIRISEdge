@@ -2103,7 +2103,7 @@ async fn a_256_mib_self_file_pulls_within_the_ceiling_and_resumes_after_a_kill_7
     let default_k = env_usize("CIRIS_BIGFILE_K", DEFAULT_K);
     let curve = env_curve(&[1, 4, 16], default_k);
     let do_resume = std::env::var("CIRIS_BIGFILE_RESUME").map_or(true, |v| v != "0");
-    run(total, &curve, default_k, do_resume, true).await;
+    Box::pin(run(total, &curve, default_k, do_resume, true)).await;
 }
 
 /// The 2 GiB variant, run alone: the ceiling, one pull at the default K,
@@ -2115,7 +2115,7 @@ async fn a_2_gib_self_file_pulls_within_the_ceiling_739() {
     let total = env_usize("CIRIS_BIGFILE_BYTES", 2 * 1024 * 1024 * 1024) as u64;
     let default_k = env_usize("CIRIS_BIGFILE_K", DEFAULT_K);
     let curve = env_curve(&[], default_k);
-    run(total, &curve, default_k, false, true).await;
+    Box::pin(run(total, &curve, default_k, false, true)).await;
 }
 
 /// The CI witness (network gauntlet, run alone in its own step): a 256 MiB
@@ -2133,5 +2133,5 @@ async fn a_2_gib_self_file_pulls_within_the_ceiling_739() {
 #[ignore = "256 MiB on the wire; CI runs it alone in the network gauntlet"]
 async fn a_256_mib_self_file_resumes_after_a_kill_quick_739() {
     let total = env_usize("CIRIS_BIGFILE_BYTES", 256 * 1024 * 1024) as u64;
-    run(total, &[], DEFAULT_K, true, false).await;
+    Box::pin(run(total, &[], DEFAULT_K, true, false)).await;
 }

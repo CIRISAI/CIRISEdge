@@ -851,6 +851,7 @@ impl DirectoryOwnerBinding {
     /// inspect what would be pushed.
     pub async fn own_owner_binding(&self) -> Option<ciris_persist::federation::Attestation> {
         use ciris_persist::federation::admission::{is_owner_binding_envelope, owner_of};
+        use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
         use ciris_persist::federation::types::attestation_type;
 
         let owner = match owner_of(self.directory.as_ref(), &self.local_key_id).await {
@@ -871,7 +872,6 @@ impl DirectoryOwnerBinding {
         // retraction by the node itself (the binding's subject) must stay in
         // the slice `retired_ids` folds. Scores, the bulk of rows about a
         // node, are not read.
-        use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
         let mut rows: Vec<ciris_persist::federation::Attestation> = Vec::new();
         let mut pages = AttestationQuery::to(&self.local_key_id, FOLD_PAGE)
             .types(&[

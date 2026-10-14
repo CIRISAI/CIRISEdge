@@ -805,8 +805,10 @@ async fn a_self_files_chunks_arrive_on_the_owners_other_device_through_the_real_
     }
 
     chunk_membership_is_the_named_dags(&a, &b, &alice, &row, sha, &stream_id).await;
-    withdrawn_dag_is_refused_and_evicted_at_the_holder_771(&a, &b, &alice, &row, sha, &stream_id)
-        .await;
+    Box::pin(withdrawn_dag_is_refused_and_evicted_at_the_holder_771(
+        &a, &b, &alice, &row, sha, &stream_id,
+    ))
+    .await;
 }
 
 /// **CIRISEdge#717 review — the widening this fix introduced, closed.**
