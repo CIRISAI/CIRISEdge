@@ -851,6 +851,7 @@ impl DirectoryOwnerBinding {
     /// inspect what would be pushed.
     pub async fn own_owner_binding(&self) -> Option<ciris_persist::federation::Attestation> {
         use ciris_persist::federation::admission::{is_owner_binding_envelope, owner_of};
+        use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
         use ciris_persist::federation::types::attestation_type;
 
         let owner = match owner_of(self.directory.as_ref(), &self.local_key_id).await {
@@ -865,21 +866,48 @@ impl DirectoryOwnerBinding {
                 return None;
             }
         };
-        let rows = match self
-            .directory
-            .list_attestations_for(&self.local_key_id)
-            .await
-        {
-            Ok(rows) => rows,
+        // persist v56 (#1001): the owner-binding plane about this node and the
+        // composers that can retire it, page by page. `to` is v55's
+        // `list_attestations_for` exactly. No `authored_by(owner)`: a
+        // retraction by the node itself (the binding's subject) must stay in
+        // the slice `retired_ids` folds. Scores, the bulk of rows about a
+        // node, are not read.
+        let mut rows: Vec<ciris_persist::federation::Attestation> = Vec::new();
+        let mut pages = AttestationQuery::to(&self.local_key_id, FOLD_PAGE)
+            .types(&[
+                attestation_type::DELEGATES_TO,
+                attestation_type::SUPERSEDES,
+                attestation_type::WITHDRAWS,
+                attestation_type::RECANTS,
+            ])
+            .pages();
+        while let Some(page) = match pages.next(self.directory.as_ref()).await {
+            Ok(page) => page,
+            // NotServed: Refused on persist's ops proxy (the pyo3
+            // runtime), where this read is permanently unsupported, or a
+            // backend Fault. Nothing is pushed, and the reason is named
+            // once per process, not read as "no binding".
             Err(e) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        local = %self.local_key_id,
+                        error = %e,
+                        "own owner-binding: the directory did not serve the read, so \
+                         this node's owner binding is not pushed on dial \
+                         (CIRISEdge#727, persist #1001)"
+                    );
+                });
                 tracing::debug!(
                     local = %self.local_key_id,
                     error = %e,
-                    "own owner-binding: directory unreadable — nothing pushed (CIRISEdge#727)"
+                    "own owner-binding: read not served, nothing pushed (CIRISEdge#727)"
                 );
                 return None;
             }
-        };
+        } {
+            rows.extend(page);
+        }
         let refs: Vec<&ciris_persist::federation::Attestation> = rows.iter().collect();
         let retired = ciris_persist::federation::precedence::retired_ids(&refs);
         let now = chrono::Utc::now();

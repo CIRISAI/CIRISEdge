@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "41.1.0"
+version = "42.0.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1191,8 +1191,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "55.0.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v55.0.0#ca6bdf6004577b4738cf3fd82d196c040f4cf7c3"
+version = "56.0.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v56.0.0#b03965c66f5e24a6f73d86a66b6eee76b7efdcfa"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5822,9 +5822,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",

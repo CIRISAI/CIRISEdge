@@ -123,17 +123,93 @@ pub struct ClaimConformance {
 }
 
 /// The transport-rule claims edge carries evidence for (CIRISEdge#718).
-pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[ClaimConformance {
-    cc: "5.4.6",
-    clm: "CLM-scoped-body-identity-link",
-    property:
-        "a scoped body rides the derived address at one hop and the identity-plane link only \
+///
+/// CIRISEdge#872 — the rows the CIRISServer manifest used to host for edge
+/// at an old version, published here against the live symbol. Withheld from
+/// that list, each because edge does not meet the section yet: `CLM-holder`
+/// (5.3.2.1 — edge still emits `Withdraws` on `ContentMiss`),
+/// `CLM-consent-counter` (3.4.7.2 — no OQ-3 review window),
+/// `CLM-registry-wire` (5.3.3.2.3 — `from_bytes` refuses the header-only
+/// wire the section says MUST read as opaque) and `CLM-transport-edge`
+/// (5.3.3.5 — E1's CIR2 sentence is open as CIRISConstitution#172).
+pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[
+    ClaimConformance {
+        cc: "5.4.6",
+        clm: "CLM-scoped-body-identity-link",
+        property:
+            "a scoped body rides the derived address at one hop and the identity-plane link only \
                beyond it, chosen once from the path table; an in-link discriminator is admitted \
                against the same ScopeAddressTable and only for an address this node holds; a \
                discriminator on a derived-address arrival is a mismatch",
-    check: check_scoped_body_identity_link,
-    evidence: "src/blob_swarm/scope.rs#choose_scoped_carrier",
-}];
+        check: check_scoped_body_identity_link,
+        evidence: "src/blob_swarm/scope.rs#choose_scoped_carrier",
+    },
+    ClaimConformance {
+        cc: "5.3.3.2.1",
+        clm: "CLM-namespace-realtime",
+        property: "codec_id carries the ratified byte per codec and sits with the ChunkLayer at \
+                   offset 48..52 outside both AEADs: a relay can read and rewrite it without \
+                   touching the seal",
+        check: check_namespace_realtime,
+        evidence: "src/transport/realtime_av.rs#CODEC_AV1_SVC",
+    },
+    ClaimConformance {
+        cc: "5.3.3.2.4",
+        clm: "CLM-chunklayer",
+        property: "admits is the per-axis test spatial <= max_spatial AND temporal <= \
+                   max_temporal AND quality <= max_quality; BLINKING_DOT admits only the base \
+                   cell, UNCAPPED admits every cell, and every policy admits the base cell an \
+                   opaque chunk carries",
+        check: check_chunklayer,
+        evidence: "src/transport/realtime_av.rs#ReceiverLayerPolicy::admits",
+    },
+    ClaimConformance {
+        cc: "5.3.3.4",
+        clm: "CLM-liveness",
+        property: "fan_out = entitled ∩ reachable: a reachable peer outside the entitled set is \
+                   never added, an entitled peer with no reachability history or a failing one \
+                   is left out, and the plan reads the node-local tracker without writing to it",
+        check: check_liveness,
+        evidence: "src/transport/realtime_av.rs#RealtimeFanout::plan_layered",
+    },
+    ClaimConformance {
+        cc: "5.4.4",
+        clm: "CLM-welcome-wrap",
+        property: "a Welcome is opened only after an ML-DSA-65 signature over x25519_eph || \
+                   u32_be(len(ct)) || ct verifies against the directory-resolved inviter key; \
+                   a directory miss or a bad signature refuses before HPKE open_base runs",
+        check: check_welcome_wrap,
+        evidence: "src/mls/welcome_wrap.rs#unwrap_welcome",
+    },
+    ClaimConformance {
+        cc: "5.4.6",
+        clm: "CLM-announce-suppress",
+        property: "the announce policy installed on the node suppresses every self, family and \
+                   community destination, lets a federation destination announce, and \
+                   suppresses a destination it has no scope for",
+        check: check_announce_suppress,
+        evidence: "src/announce_suppression.rs#ScopePrivacyAnnouncePolicy::decide",
+    },
+    ClaimConformance {
+        cc: "6.1.5.1",
+        clm: "CLM-registry-replication",
+        property: "the producer-silent policy is (N=20, K=6, min_viable=5, target_holders=30) \
+                   with min_viable >= 1; its distinct-symbol survival is the section's \
+                   0.995039 at q=0.90 and 0.957288 at q=0.85; the planner follows a different \
+                   tuple when one is in force",
+        check: check_registry_replication,
+        evidence: "src/holonomic/fountain_defaults.rs#recommended_policy",
+    },
+    ClaimConformance {
+        cc: "6.1.6",
+        clm: "CLM-deterministic-alm",
+        property: "byte-equal inputs give byte-equal topology under any permutation of ads, \
+                   grants and observations; an unverified capacity ad never enters scoring; a \
+                   self-asserted uplink above the cap does not outscore one at the cap",
+        check: check_deterministic_alm,
+        evidence: "src/holonomic/deterministic_topology.rs#compute_alm_topology_verified",
+    },
+];
 
 /// Every edge-tagged field edge does NOT process with a runtime value-check —
 /// each with the concrete upstream reason. Deferring is NOT skipping: the field
@@ -368,6 +444,505 @@ fn check_scoped_body_identity_link() -> Result<(), String> {
         Err(ServeRefusal::DiscriminatorUnheld)
     ) {
         return Err("a legacy node holds no derived address — must refuse".into());
+    }
+    Ok(())
+}
+
+/// CIRISEdge#872 — `CLM-namespace-realtime` (CC 5.3.3.2.1): the ratified
+/// `codec_id` bytes, and the codec+layer block as clear metadata at 48..52.
+fn check_namespace_realtime() -> Result<(), String> {
+    use crate::transport::realtime_av::{
+        open_av_chunk, seal_av_chunk, ChunkLayer, ChunkSeq, Epoch, EpochDek, SealedAvChunk,
+        StreamId, CODEC_AV1_SVC, CODEC_JPEG_XS, CODEC_MDC, CODEC_OPAQUE,
+    };
+
+    if [CODEC_AV1_SVC, CODEC_JPEG_XS, CODEC_MDC, CODEC_OPAQUE] != [0x01, 0x02, 0x03, 0xFF] {
+        return Err("codec_id bytes differ from the ratified table".into());
+    }
+    let dek = EpochDek::from_bytes([0x5A; 32]);
+    let transit = [0xA5; 32];
+    let layer = ChunkLayer {
+        spatial: 2,
+        temporal: 1,
+        quality: 3,
+    };
+    let sealed = seal_av_chunk(
+        b"frame",
+        &transit,
+        b"link-872",
+        7,
+        &dek,
+        StreamId([0x01; 32]),
+        Epoch(2),
+        ChunkSeq(3),
+        CODEC_AV1_SVC,
+        layer,
+    )
+    .map_err(|e| format!("seal: {e}"))?;
+    let mut wire = sealed.to_bytes();
+    if wire.get(48..52) != Some(&[CODEC_AV1_SVC, 2, 1, 3][..]) {
+        return Err(format!(
+            "codec_id + ChunkLayer must sit at offset 48..52, got {:?}",
+            wire.get(48..52)
+        ));
+    }
+    // A relay rewriting the block (the drop-without-decrypt case) must not
+    // break the seal: the block is outside both AEADs.
+    wire[48..52].copy_from_slice(&[CODEC_OPAQUE, 0, 0, 0]);
+    let rewritten = SealedAvChunk::from_bytes(&wire).map_err(|e| format!("parse: {e}"))?;
+    if rewritten.codec_id != CODEC_OPAQUE || rewritten.layer != ChunkLayer::BASE {
+        return Err("the rewritten codec+layer block must read back as written".into());
+    }
+    match open_av_chunk(&rewritten, &transit, b"link-872", 7, &dek) {
+        Ok(p) if p == b"frame" => Ok(()),
+        other => Err(format!(
+            "codec_id + ChunkLayer must be clear metadata outside both AEADs; rewriting them \
+             changed the open: {other:?}"
+        )),
+    }
+}
+
+/// CIRISEdge#872 — `CLM-chunklayer` (CC 5.3.3.2.4): `admits` is the per-axis
+/// prefix test, over every cell of a small grid rather than a few samples.
+fn check_chunklayer() -> Result<(), String> {
+    use crate::transport::realtime_av::{ChunkLayer, ReceiverLayerPolicy};
+
+    let dot = ReceiverLayerPolicy::BLINKING_DOT;
+    let all = ReceiverLayerPolicy::UNCAPPED;
+    if (dot.max_spatial, dot.max_temporal, dot.max_quality) != (0, 0, 0)
+        || (all.max_spatial, all.max_temporal, all.max_quality) != (255, 255, 255)
+    {
+        return Err("BLINKING_DOT must be {0,0,0} and UNCAPPED {255,255,255}".into());
+    }
+    let capped = ReceiverLayerPolicy {
+        max_spatial: 1,
+        max_temporal: 2,
+        max_quality: 0,
+    };
+    for policy in [capped, dot, all] {
+        for spatial in 0..=3u8 {
+            for temporal in 0..=3u8 {
+                for quality in 0..=3u8 {
+                    let cell = ChunkLayer {
+                        spatial,
+                        temporal,
+                        quality,
+                    };
+                    let want = spatial <= policy.max_spatial
+                        && temporal <= policy.max_temporal
+                        && quality <= policy.max_quality;
+                    if policy.admits(cell) != want {
+                        return Err(format!(
+                            "{policy:?}.admits({cell:?}) must be {want} (per-axis test)"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // An opaque chunk carries the base cell; every policy must admit it.
+    if !all.admits(ChunkLayer {
+        spatial: 255,
+        temporal: 255,
+        quality: 255,
+    }) || ![capped, dot, all]
+        .iter()
+        .all(|p| p.admits(ChunkLayer::BASE))
+    {
+        return Err("UNCAPPED admits every cell, and every policy admits the base cell".into());
+    }
+    Ok(())
+}
+
+/// CIRISEdge#872 — `CLM-liveness` (CC 5.3.3.4): fan-out is the intersection
+/// of the entitled roster the caller passes and the node-local reachable set,
+/// and planning it records nothing.
+fn check_liveness() -> Result<(), String> {
+    use crate::reachability::{AttemptOutcome, ReachabilityTracker};
+    use crate::transport::realtime_av::{
+        ChunkLayer, MeshParticipant, RealtimeFanout, REALTIME_MIN_RATIO,
+    };
+    use crate::transport::TransportId;
+
+    let medium = TransportId("reticulum");
+    let tracker = ReachabilityTracker::new(60);
+    for _ in 0..4 {
+        tracker.record_attempt("alice", medium, AttemptOutcome::SendSuccess);
+        // Reachable but not entitled: must never be added.
+        tracker.record_attempt("outsider", medium, AttemptOutcome::SendSuccess);
+        tracker.record_attempt(
+            "bob",
+            medium,
+            AttemptOutcome::SendFailure {
+                error_class: "Timeout".into(),
+            },
+        );
+    }
+    // carol is entitled but has never been reached.
+    let entitled = [
+        MeshParticipant::new("alice".into(), b"link-a".to_vec()),
+        MeshParticipant::new("bob".into(), b"link-b".to_vec()),
+        MeshParticipant::new("carol".into(), b"link-c".to_vec()),
+    ];
+    let attempts = |t: &ReachabilityTracker| {
+        t.snapshot_all()
+            .iter()
+            .map(|m| (m.peer_key_id.clone(), m.attempts))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let before = attempts(&tracker);
+    let plan = RealtimeFanout::plan_layered(
+        &entitled,
+        ChunkLayer::BASE,
+        &tracker,
+        medium,
+        REALTIME_MIN_RATIO,
+    );
+    let planned: Vec<&str> = plan.iter().map(|p| p.peer_key_id.as_str()).collect();
+    if planned != ["alice"] {
+        return Err(format!(
+            "fan_out must be entitled ∩ reachable = [alice] (no outsider, no unreachable bob, no \
+             never-reached carol), got {planned:?}"
+        ));
+    }
+    if attempts(&tracker) != before {
+        return Err("planning a fan-out must not write to the presence tracker".into());
+    }
+    Ok(())
+}
+
+/// CIRISEdge#872 — `CLM-welcome-wrap` (CC 5.4.4): ML-DSA-65 over the section's
+/// encapsulation bytes, verified against the directory BEFORE HPKE open.
+#[allow(clippy::similar_names)]
+fn check_welcome_wrap() -> Result<(), String> {
+    use crate::mls::{unwrap_welcome, wrap_welcome, FederationDirectoryEntry, WelcomeWrapError};
+    use ciris_crypto::hpke::{XWingRecipientPublic, XWingRecipientSecret, HPKE_SUITE_ID};
+    use ciris_crypto::{ml_kem, x25519, MlDsa65Signer, MlDsa65Verifier, PqcSigner, PqcVerifier};
+
+    if HPKE_SUITE_ID != b"HPKE-xwing-hkdf-sha256-aes256gcm-v1" {
+        return Err("HPKE_SUITE_ID must be the section's byte literal".into());
+    }
+    let crypto = |e: ciris_crypto::CryptoError| format!("crypto: {e}");
+    let (x_sk, x_pk) = x25519::generate_ephemeral_keypair().map_err(crypto)?;
+    let (k_sk, k_pk) = ml_kem::generate_keypair().map_err(crypto)?;
+    let invitee_pk = XWingRecipientPublic {
+        x25519_pub: x_pk,
+        mlkem768_pub: k_pk.clone(),
+    };
+    let invitee_sk = XWingRecipientSecret {
+        x25519_priv: x_sk,
+        mlkem768_priv: k_sk,
+        mlkem768_pub: k_pk,
+    };
+    let inviter = MlDsa65Signer::new().map_err(crypto)?;
+    let inviter_pk = inviter.public_key().map_err(crypto)?;
+    let directory = |pk: Vec<u8>| {
+        move |id: &str| {
+            Some(FederationDirectoryEntry {
+                pk_id: id.to_string(),
+                ml_dsa_pk: pk.clone(),
+                x_wing_pk: None,
+            })
+        }
+    };
+    let wrapped = wrap_welcome(&inviter, "inviter-872", &invitee_pk, b"welcome", b"grp")
+        .map_err(|e| format!("wrap: {e}"))?;
+
+    // The signature covers x25519_eph || u32_be(len(ct)) || ct, built here
+    // from the section rather than from the helper the wrap calls.
+    let enc = &wrapped.hpke_sealed.encapsulation;
+    let ct_len = u32::try_from(enc.mlkem768_ciphertext.len()).map_err(|e| e.to_string())?;
+    let mut spec = enc.x25519_ephemeral_pub.to_vec();
+    spec.extend_from_slice(&ct_len.to_be_bytes());
+    spec.extend_from_slice(&enc.mlkem768_ciphertext);
+    if !MlDsa65Verifier::new()
+        .verify(&inviter_pk, &spec, &wrapped.inviter_signature)
+        .map_err(crypto)?
+    {
+        return Err(
+            "the inviter's ML-DSA-65 signature must cover the section's encap bytes".into(),
+        );
+    }
+
+    match unwrap_welcome(&invitee_sk, &wrapped, b"grp", directory(inviter_pk.clone())) {
+        Ok(w) if w == b"welcome" => {}
+        other => return Err(format!("a well-signed Welcome must open, got {other:?}")),
+    }
+    if !matches!(
+        unwrap_welcome(&invitee_sk, &wrapped, b"grp", |_: &str| None),
+        Err(WelcomeWrapError::InviterUnknown(_))
+    ) {
+        return Err("an inviter the directory cannot resolve must be refused".into());
+    }
+    // Verification is the precondition: a forged signature under the WRONG
+    // aad must be refused as a signature, i.e. before HPKE open ever runs.
+    let mut forged = wrapped.clone();
+    forged.inviter_signature[0] ^= 0x01;
+    if !matches!(
+        unwrap_welcome(&invitee_sk, &forged, b"not-grp", directory(inviter_pk)),
+        Err(WelcomeWrapError::SignatureRejected)
+    ) {
+        return Err("signature verification must precede HPKE open_base".into());
+    }
+    let bystander = MlDsa65Signer::new().map_err(crypto)?;
+    if !matches!(
+        unwrap_welcome(
+            &invitee_sk,
+            &wrapped,
+            b"grp",
+            directory(bystander.public_key().map_err(crypto)?)
+        ),
+        Err(WelcomeWrapError::SignatureRejected)
+    ) {
+        return Err("a signature that does not verify under the directory key must refuse".into());
+    }
+    Ok(())
+}
+
+/// CIRISEdge#872 — `CLM-announce-suppress` (CC 5.4.6), against the policy the
+/// node installs as its `AnnounceControl` (the free `should_suppress_announce`
+/// has no production caller; it must agree).
+fn check_announce_suppress() -> Result<(), String> {
+    use crate::announce_suppression::{should_suppress_announce, ScopePrivacyAnnouncePolicy};
+    use crate::cohort_scope::CohortScope;
+
+    let policy = ScopePrivacyAnnouncePolicy::new();
+    let cases = [
+        ([0x10; 16], CohortScope::SelfOnly, true),
+        ([0x20; 16], CohortScope::Family, true),
+        (
+            [0x30; 16],
+            CohortScope::Cohort {
+                cohort_id: "community-872".into(),
+            },
+            true,
+        ),
+        ([0x40; 16], CohortScope::Public, false),
+    ];
+    for (hash, scope, suppress) in &cases {
+        policy.register_destination_scope(*hash, scope.clone());
+        if policy.decide(hash) != *suppress {
+            return Err(format!(
+                "a {} destination: suppress must be {suppress}",
+                scope.kind_token()
+            ));
+        }
+        if should_suppress_announce(scope) != *suppress {
+            return Err(format!(
+                "the scope rule and the installed policy disagree on {}",
+                scope.kind_token()
+            ));
+        }
+    }
+    if !policy.decide(&[0xEE; 16]) {
+        return Err("a destination with no known scope must fail toward suppression".into());
+    }
+    // Narrowing a destination's scope takes effect on the next decision.
+    policy.register_destination_scope([0x40; 16], CohortScope::Family);
+    if !policy.decide(&[0x40; 16]) {
+        return Err("a destination re-scoped to family must stop announcing".into());
+    }
+    Ok(())
+}
+
+/// CIRISEdge#872 — `CLM-registry-replication` (CC 6.1.5.1 §R-policy).
+fn check_registry_replication() -> Result<(), String> {
+    use crate::holonomic::fountain_defaults::{
+        recommended_policy, recommended_reconstruction_probability, FountainPolicy,
+    };
+    use crate::holonomic::swarm_rarity::{
+        should_eject_above_target, ConsentState, EjectionVerdict, RarityScore,
+    };
+
+    let policy = recommended_policy();
+    let pinned = FountainPolicy {
+        n_source: 20,
+        k_repair: 6,
+        min_viable_symbols: 5,
+        target_holders: 30,
+    };
+    if policy != pinned {
+        return Err(format!(
+            "the producer-silent tuple must be {pinned:?}, got {policy:?}"
+        ));
+    }
+    if policy.min_viable_symbols == 0 {
+        return Err("min_viable_symbols must be >= 1".into());
+    }
+    // The section's distinct-symbol law, not the naive Bin(30, q).
+    for (q, want) in [(0.90, 0.995_039), (0.85, 0.957_288)] {
+        let got = recommended_reconstruction_probability(q);
+        if (got - want).abs() > 5e-7 {
+            return Err(format!(
+                "survival at q={q} must be the section's {want}, got {got}"
+            ));
+        }
+    }
+    // The converger reads the tuple in force, never a hard-coded one.
+    let narrow = FountainPolicy {
+        target_holders: 10,
+        ..policy
+    };
+    let common = RarityScore(u32::MAX);
+    if should_eject_above_target(12, &policy, ConsentState::Active, common) != EjectionVerdict::Keep
+        || should_eject_above_target(12, &narrow, ConsentState::Active, common)
+            != EjectionVerdict::EjectToTier
+    {
+        return Err(
+            "the ejection verdict must follow the target_holders of the tuple in force".into(),
+        );
+    }
+    Ok(())
+}
+
+/// One capacity ad for [`check_deterministic_alm`]. The planner is
+/// signature-blind by design; the verification state is the input.
+fn alm_ad(
+    peer: &str,
+    mbps: f32,
+    verification: crate::holonomic::deterministic_topology::CapacityVerification,
+) -> crate::holonomic::deterministic_topology::VerifiedCapacityAd {
+    use crate::holonomic::deterministic_topology::{SignedRelayCapacity, VerifiedCapacityAd};
+    use crate::transport::realtime_av::{Epoch, ReceiverLayerPolicy, StreamId};
+    use crate::transport::realtime_av_alm::capacity::RelayCapacity;
+
+    VerifiedCapacityAd {
+        ad: SignedRelayCapacity {
+            advertiser_key_id: peer.to_string(),
+            capacity: RelayCapacity::new(
+                mbps,
+                4,
+                16,
+                ReceiverLayerPolicy::UNCAPPED,
+                1_700_000_000_000,
+            ),
+            stream_id: StreamId([0; 32]),
+            epoch: Epoch(1),
+            signature_ed25519_base64: String::new(),
+            signature_ml_dsa_65_base64: String::new(),
+        },
+        verification,
+    }
+}
+
+/// A fully-trusted, mutually-reachable locality for
+/// [`check_deterministic_alm`], with distinct RTTs per directed pair.
+fn alm_full_mesh(
+    peers: &[&str],
+) -> (
+    Vec<crate::holonomic::deterministic_topology::TrustGrant>,
+    Vec<crate::holonomic::deterministic_topology::ReachabilityObservation>,
+) {
+    use crate::holonomic::deterministic_topology::{ReachabilityObservation, TrustGrant};
+
+    let mut grants = Vec::new();
+    let mut reach = Vec::new();
+    for (i, from) in peers.iter().enumerate() {
+        for (j, to) in peers.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            grants.push(TrustGrant {
+                granter_peer_id: (*from).to_string(),
+                grantee_peer_id: (*to).to_string(),
+                granted_at_unix_ms: 1_700_000_000_000,
+                chain_depth: 0,
+                weight: TrustGrant::DEFAULT_WEIGHT,
+            });
+            reach.push(ReachabilityObservation {
+                from_peer_id: (*from).to_string(),
+                to_peer_id: (*to).to_string(),
+                observed_rtt_ms: 40 + u32::try_from(i * 7 + j).unwrap_or(0),
+                observed_at_unix_ms: 1_700_000_000_000,
+            });
+        }
+    }
+    (grants, reach)
+}
+
+/// CIRISEdge#872 — `CLM-deterministic-alm` (CC 6.1.6 §T / N8).
+fn check_deterministic_alm() -> Result<(), String> {
+    use crate::holonomic::deterministic_topology::{
+        compute_alm_topology_verified,
+        CapacityVerification::{HybridSignatureValid as Valid, Unverified},
+        ReachabilityObservation, TrustGrant, VerifiedCapacityAd, VerifiedTopologyInputSnapshot,
+        MAX_SELF_ASSERTED_UPLINK_MBPS,
+    };
+
+    let (grants, reach) = alm_full_mesh(&["p-a", "p-b", "p-c", "p-z"]);
+    let topology = |ads: Vec<VerifiedCapacityAd>,
+                    grants: Vec<TrustGrant>,
+                    reach: Vec<ReachabilityObservation>| {
+        let t = compute_alm_topology_verified(&VerifiedTopologyInputSnapshot {
+            capacity_ads: ads,
+            trust_grants: grants,
+            reachability_observations: reach,
+            locality_id: "loc-872".into(),
+            snapshot_epoch_id: 7,
+        });
+        serde_json::to_vec(&t)
+            .map(|b| (t, b))
+            .map_err(|e| e.to_string())
+    };
+
+    // Determinism under permutation of every input list.
+    let ads = vec![
+        alm_ad("p-a", 80.0, Valid),
+        alm_ad("p-b", 40.0, Valid),
+        alm_ad("p-c", 10.0, Valid),
+        alm_ad("p-z", 20.0, Valid),
+    ];
+    let (base, base_bytes) = topology(ads.clone(), grants.clone(), reach.clone())?;
+    if base.tree.is_empty() {
+        return Err("a fully-trusted, reachable locality must root a tree".into());
+    }
+    let (mut a, mut g, mut r) = (ads.clone(), grants.clone(), reach.clone());
+    a.reverse();
+    g.reverse();
+    r.rotate_left(5);
+    if topology(a, g, r)?.1 != base_bytes {
+        return Err("a permutation of byte-equal inputs must give byte-equal output".into());
+    }
+
+    // N8 filter: an unverified ad never enters scoring, however large.
+    let with_liar = |v| {
+        vec![
+            alm_ad("p-b", 10.0, Valid),
+            alm_ad("p-c", 10.0, Valid),
+            alm_ad("p-z", 1.0e6, v),
+        ]
+    };
+    let (verified_liar, _) = topology(with_liar(Valid), grants.clone(), reach.clone())?;
+    if !verified_liar.tree.iter().any(|e| e.parent_peer_id == "p-z") {
+        return Err("a verified high-capacity ad must be able to win a parent slot".into());
+    }
+    let (unverified_liar, _) = topology(with_liar(Unverified), grants.clone(), reach.clone())?;
+    if unverified_liar
+        .tree
+        .iter()
+        .any(|e| e.parent_peer_id == "p-z" || e.child_peer_id == "p-z")
+    {
+        return Err("an unverified capacity ad must never enter scoring".into());
+    }
+
+    // N8 cap: a self-asserted uplink above the cap scores as the cap, so it
+    // cannot beat an honest peer AT the cap (lex-min p-a wins that tie).
+    let capped = |liar_mbps| {
+        vec![
+            alm_ad("p-a", MAX_SELF_ASSERTED_UPLINK_MBPS, Valid),
+            alm_ad("p-b", 10.0, Valid),
+            alm_ad("p-c", 10.0, Valid),
+            alm_ad("p-z", liar_mbps, Valid),
+        ]
+    };
+    let at_cap = topology(
+        capped(MAX_SELF_ASSERTED_UPLINK_MBPS),
+        grants.clone(),
+        reach.clone(),
+    )?
+    .1;
+    if topology(capped(1.0e6), grants, reach)?.1 != at_cap {
+        return Err("self-asserted uplink above the cap must not outscore the cap".into());
     }
     Ok(())
 }

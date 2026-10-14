@@ -1,5 +1,72 @@
 # CIRISEdge Release Notes
 
+# v42.0.0 — persist v56.0.0: bounded reads, the transit-KEX pair on the wire, and seven CC evidence rows
+
+**2026-10-14.** **MAJOR** from v41.1.0. Edge adopts persist v56.0.0. **No fleet floor:** a v55
+node admits, stores and re-serves every v56 row, so v41 and v42 nodes mix. Public API change:
+`chat::rows_in_room` takes the `dimension` it reads
+(`rows_in_room(directory, participants, room, dimension)`). CIRISServer calls only the wrappers
+(`commits_from`, `key_package_from`, `welcome_from`), whose signatures are unchanged. The Python
+floor moves to `ciris-persist>=56,<57`. No persist ABI constant moved.
+Ladder triple: **edge v42.0.0 · persist v56.0.0 · verify v20.1.0** (leviculum v0.30.0+ciris.1).
+
+## persist v56.0.0 — typed bounded reads (CIRISPersist#1001, #1071)
+
+- **Every wide read edge made is now a paged `AttestationQuery`.** That covers 11 sites:
+  - durability `reports_of`;
+  - the chat proposal and decline lookups;
+  - `rows_in_room`;
+  - the invite inbox's replied set (one `dimension_any_of` walk);
+  - the own owner-binding read;
+  - the subject-holdings axes;
+  - the announce-row read;
+  - the harness's key-plane and leak reads.
+
+  Each reads only the dimension and types it uses, page by page (`FOLD_PAGE`), instead of
+  every row about a key.
+- **A read the backend does not serve is named, never empty.** `Pages::next` maps `NotServed` to
+  an error.
+  - The subject-holdings axis serves empty for that round and logs whether the refusal is
+    permanent (`Unsupported`, e.g. persist's ops proxy under pyo3) or transient.
+  - The announce read becomes `Unresolved`, which is never memoized. The witness is
+    `a_refused_announce_read_is_unresolved_and_never_memoized_1001`.
+  - The own owner-binding read pushes nothing and warns once per process.
+- **Chat rooms filter their room client-side, as before.** A room's rows sit at two scopes: the
+  author's original at `self`, and its share at the room's scope. A persist `scope()` filter would
+  drop the originals the fold needs. A target-only filter is logged for persist v57.
+
+## persist v56.0.0 — also in the pin
+
+- **Transit-KEX pair on the TransportDestination binding** (#1077, CC 3.3.6.2). Persist now
+  admits and resolves `transit_kex_pubkeys`. Edge does not publish or use a pair yet; that is the
+  A/V cut.
+- **trace_format v2.8.0 admission** (#1089). Edge reads no trace members.
+- **rustls 0.23.46** (RUSTSEC-2026-0346 and -0347), lockfile only.
+
+## CC evidence: seven rows the CIRISServer manifest hosted, now published here (#872)
+
+`evidence/CIRISEdge.cc_impl.tsv` gains seven rows. Each one is generated from
+`field_conformance::EDGE_CC_CLAIM_CONFORMANCE` with a pure check that drives the live symbol, and
+`edge_field_conformance` runs them:
+- CLM-namespace-realtime (5.3.3.2.1);
+- CLM-chunklayer (5.3.3.2.4);
+- CLM-liveness (5.3.3.4);
+- CLM-welcome-wrap (5.4.4);
+- CLM-announce-suppress (5.4.6), re-anchored to `ScopePrivacyAnnouncePolicy::decide`, which is
+  what the node installs;
+- CLM-registry-replication (6.1.5.1);
+- CLM-deterministic-alm (6.1.6).
+
+Four rows are **withheld** because edge does not meet the CC text yet:
+- CLM-holder (5.3.2.1): a ContentMiss emits `withdraws`, and the 2-holder parallel cap is not
+  implemented.
+- CLM-consent-counter (3.4.7.2): an `AuthorizedReview` role is never signal-eligible after its
+  window.
+- CLM-registry-wire (5.3.3.2.3): a 48-byte header-only wire is refused rather than read as opaque.
+- CLM-transport-edge (5.3.3.5): E1's CIR2 negotiation; CIRISConstitution#172 is open.
+
+Each stays staged on #872 until it is fixed.
+
 # v41.1.0 — membership at the affiliations tier
 
 **2026-10-13.** **MINOR** from v41.0.0. `membership::GroupScope` gains **`Affiliations`**
