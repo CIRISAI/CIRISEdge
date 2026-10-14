@@ -3994,6 +3994,23 @@ impl ReticulumTransport {
             .collect()
     }
 
+    /// CIRISEdge#863 item 6 test seam — whether `link` is in EITHER link pool
+    /// (identity or scoped), i.e. whether the pooled idle reaper
+    /// (`reap_idle_pooled_links`) can ever judge it. A/V legs are dialled by
+    /// `dial_derived_link`, which publishes to neither pool, so they are
+    /// exempt by construction; this is the named check a pool change must keep
+    /// true.
+    #[doc(hidden)]
+    pub async fn link_is_pooled_for_test(&self, link: [u8; 16]) -> bool {
+        let id = LinkId::new(link);
+        for pool in [&self.reusable_dialed_link, &self.reusable_scoped_link] {
+            if pool.lock().await.values().flatten().any(|l| *l == id) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// CIRISEdge#819 test seam — take an idle pooled lane to `peer` exactly as
     /// `send` does (`reusable_link_to`), without shipping on it yet. Release it
     /// with [`Self::release_link_for_test`].
@@ -5159,7 +5176,8 @@ impl ReticulumTransport {
                 link_id,
             )
             .with_metrics(self.metrics.get().cloned())
-            .with_direct_path(direct_path),
+            .with_direct_path(direct_path)
+            .with_outbound_liveness(Arc::clone(&self.link_last_outbound_at)),
         })
     }
 
@@ -8708,7 +8726,7 @@ type IdleSnapshot = (Option<u64>, Option<u64>);
 /// (a Channel frame fully sent, or a Resource completed): the link is in use,
 /// so its idle clock restarts. Kept apart from `link_last_inbound_at`, which
 /// the #353 reverse-path selector reads as "the peer is alive here".
-fn note_outbound_use(links: &std::sync::Mutex<HashMap<LinkId, u64>>, link_id: LinkId) {
+pub(crate) fn note_outbound_use(links: &std::sync::Mutex<HashMap<LinkId, u64>>, link_id: LinkId) {
     let now_secs = u64::try_from(chrono::Utc::now().timestamp().max(0)).unwrap_or(0);
     links
         .lock()
@@ -9600,7 +9618,9 @@ struct EventCtx<'a> {
     /// [`ReticulumTransport`].
     swallow_link_established: &'a std::sync::atomic::AtomicBool,
     /// CIRISEdge#853 — see the field of the same name on [`ReticulumTransport`].
-    link_last_outbound_at: &'a std::sync::Mutex<HashMap<LinkId, u64>>,
+    /// The `Arc` itself (CIRISEdge#863 item 6): an arrived A/V link's sender
+    /// holds it to stamp its own sends.
+    link_last_outbound_at: &'a Arc<std::sync::Mutex<HashMap<LinkId, u64>>>,
     /// CIRISEdge#805 — see the field of the same name on [`ReticulumTransport`].
     av_sink: &'a crate::transport::av_sink::AvSink,
     /// CIRISEdge#805 — the node as an `Arc`, for the sender an A/V arrival
@@ -10808,6 +10828,7 @@ async fn deliver_av_frame(
     });
     let node = Arc::clone(ctx.av_node);
     let metrics = ctx.metrics.cloned();
+    let outbound_liveness = ctx.link_last_outbound_at;
     let delivery = ctx.av_sink.deliver(link_id, data, |inbound| {
         crate::transport::av_sink::AvArrival {
             link_id: link_id.into_bytes(),
@@ -10818,7 +10839,11 @@ async fn deliver_av_frame(
             address: address.clone(),
             inbound,
             sender: crate::transport::realtime_av_runtime::LeviculumAvSender::new(node, link_id)
-                .with_metrics(metrics),
+                .with_metrics(metrics)
+                // CIRISEdge#863 item 6 — this side may only ever SEND on an
+                // arrived link (a relay forwarding to a subscriber that
+                // dialled it): its sends are its liveness for the reaper.
+                .with_outbound_liveness(Arc::clone(outbound_liveness)),
         }
     });
     match delivery {

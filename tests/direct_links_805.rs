@@ -1205,3 +1205,138 @@ async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
     let heard = tokio::time::timeout(Duration::from_secs(2), c_r.inbound.recv()).await;
     assert!(!matches!(heard, Ok(Ok(_))), "C received nothing: {heard:?}");
 }
+
+/// **W2b** (CIRISEdge#863 item 6) — a relay leg carrying media outlives the
+/// inbound reaper, on BOTH ends.
+///
+/// B subscribes by dialling R, then sends nothing: at R the link is INBOUND
+/// and R only ever SENDS on it, so R's sends must be its liveness, or R's
+/// reaper closes the leg mid-call at its idle bound (120 s in the field; 2 s
+/// here, with reap passes running throughout and media flowing well past
+/// it). The symmetric end: at B the same link is OUTBOUND and B only
+/// receives; it is never the inbound reaper's to close, and it is in no link
+/// pool, so the pooled (outbound) reaper, run here at the same bound, never
+/// judges it either (the exemption is asserted by name).
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_leg_carrying_media_outlives_the_reaper_863() {
+    let q = quad("w2b").await;
+    let (a_id, b_id, r_id) = (
+        q.a.key.key_id.clone(),
+        q.b.key.key_id.clone(),
+        q.r.key.key_id.clone(),
+    );
+    let members = [a_id.as_str(), b_id.as_str(), r_id.as_str()];
+    for side in [&q.r, &q.a, &q.b] {
+        install_legs_group(side, &members);
+    }
+    let mut r_arrivals = q.r.transport.take_av_arrivals().expect("R's arrivals");
+    let a_r =
+        q.a.transport
+            .open_av_link(&r_id, &legs_address(&q.a, &r_id))
+            .await
+            .expect("A dials R");
+    let mut publisher = AvDispatcher::new(AvDispatcherConfig {
+        stream_id: legs_stream(),
+        local_role: AvRole::Publisher,
+        epoch_dek: Some(LEGS_DEK),
+        initial_subscribers: vec![AvSubscriberLink {
+            subscriber: r_id.clone(),
+            transit_key: K_AR,
+            link_id: a_r.link_id.to_vec(),
+            outbound_send: Box::new(a_r.sender),
+        }],
+        inbound_links: vec![],
+    })
+    .expect("A's publisher");
+    let mut seq = 0u64;
+    let _ = publisher.publish_inner(legs_chunk(seq)).await;
+    seq += 1;
+    let upstream = next_arrival(&mut r_arrivals, &a_id).await;
+    let (_pump, admissions) = AvRelay::new(legs_stream(), Vec::new())
+        .expect("R's relay")
+        .spawn_pump_admitting(
+            AvInboundLink {
+                transit_key: K_AR,
+                link_id: upstream.link_id.to_vec(),
+                inbound_recv: Box::new(upstream.inbound),
+            },
+            K_AR,
+            upstream.link_id.to_vec(),
+        );
+    let b_r = dial_r(&q.b, &r_id).await;
+    let arrival = next_arrival(&mut r_arrivals, &b_id).await;
+    assert!(
+        q.r.transport
+            .admit_dialled_subscriber(arrival, &admissions, K_RB)
+            .await
+    );
+    let relay_leg = b_r.link_id;
+    let mut chunks = AvSubscriber::subscribe(
+        legs_stream(),
+        &EpochDek::from_bytes(LEGS_DEK),
+        &r_id,
+        AvInboundLink {
+            transit_key: K_RB,
+            link_id: relay_leg.to_vec(),
+            inbound_recv: Box::new(b_r.inbound),
+        },
+    )
+    .expect("B subscribes over R");
+
+    // A 2 s idle bound on both ends; media every 100 ms for 6 s; a reap
+    // pass on both ends every 500 ms.
+    let bound = Duration::from_secs(2);
+    q.r.transport.set_inbound_link_idle_bound(bound);
+    q.b.transport.set_inbound_link_idle_bound(bound);
+    // The OUTBOUND side's idle reaper too (#819/#821's pooled reap), at the
+    // same bound: B's leg is outbound at B and only receives.
+    let (_, cap) = q.b.transport.link_pool_policy();
+    q.b.transport.set_link_pool_policy(bound, cap);
+    q.r.transport.set_link_pool_policy(bound, cap);
+    let mut reaped = (0usize, 0usize);
+    for i in 0..60 {
+        let _ = publisher.publish_inner(legs_chunk(seq)).await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if i % 5 == 4 {
+            reaped.0 += q.r.transport.reap_idle_inbound_links().await;
+            reaped.0 += q.r.transport.reap_idle_pooled_links().await;
+            reaped.1 += q.b.transport.reap_idle_inbound_links().await;
+            reaped.1 += q.b.transport.reap_idle_pooled_links().await;
+        }
+    }
+    // The exemption, named: an A/V leg is in neither link pool at either end,
+    // so the pooled reaper can never judge it.
+    assert!(!q.b.transport.link_is_pooled_for_test(relay_leg).await);
+    assert!(!q.r.transport.link_is_pooled_for_test(relay_leg).await);
+    let held = |planes: Vec<([u8; 16], ciris_edge::transport::reticulum::LinkPlane, bool)>| {
+        planes.iter().any(|(id, _, _)| *id == relay_leg)
+    };
+    assert!(
+        held(q.r.transport.link_planes_for_test().await),
+        "R kept the leg it only sends on (reaped at R: {})",
+        reaped.0
+    );
+    assert!(
+        held(q.b.transport.link_planes_for_test().await),
+        "B kept the leg it only receives on (reaped at B: {})",
+        reaped.1
+    );
+    // And it is still carrying media: the last chunk arrives.
+    let last = seq - 1;
+    let got_last = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(chunk) = chunks.recv().await {
+            if chunk.chunk_seq.0 == last {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(
+        got_last,
+        Ok(true),
+        "the relay leg still delivers past the bound"
+    );
+}

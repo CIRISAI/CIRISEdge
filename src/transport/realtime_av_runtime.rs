@@ -1175,6 +1175,13 @@ mod leviculum_link {
         /// CIRISEdge#805 item 8 — the hold on the punched interface this leg
         /// runs over, when it does: released when the leg is dropped.
         direct_path: Option<crate::transport::direct_path::DirectPathGuard>,
+        /// CIRISEdge#863 item 6 — the transport's per-link last-OUTBOUND
+        /// stamps. A side that only sends on a link (a relay forwarding to a
+        /// subscriber that dialled it; a publisher on a leg it dialled)
+        /// receives nothing on it, so its sends are the link's liveness: the
+        /// inbound reaper reads this map and would otherwise close a link
+        /// carrying media at its idle bound.
+        outbound_liveness: Option<Arc<std::sync::Mutex<HashMap<LinkId, u64>>>>,
     }
 
     impl LeviculumAvSender {
@@ -1189,7 +1196,19 @@ mod leviculum_link {
                 link_id,
                 metrics: None,
                 direct_path: None,
+                outbound_liveness: None,
             }
+        }
+
+        /// CIRISEdge#863 item 6 — stamp every accepted send into the
+        /// transport's last-outbound map (the inbound reaper's liveness).
+        #[must_use]
+        pub(crate) fn with_outbound_liveness(
+            mut self,
+            stamps: Arc<std::sync::Mutex<HashMap<LinkId, u64>>>,
+        ) -> Self {
+            self.outbound_liveness = Some(stamps);
+            self
         }
 
         /// CIRISEdge#805 item 8 — hold `guard`'s punched interface for as long
@@ -1292,6 +1311,9 @@ mod leviculum_link {
             match self.node.link_handle(&self.link_id).try_send(bytes).await {
                 Ok(()) => {
                     self.count(crate::observability::AV_SENT);
+                    if let Some(stamps) = self.outbound_liveness.as_deref() {
+                        crate::transport::reticulum::note_outbound_use(stamps, self.link_id);
+                    }
                     Ok(())
                 }
                 // The two backpressure arms. `PacingDelay`'s `ready_at_ms`
