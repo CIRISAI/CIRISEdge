@@ -59,6 +59,7 @@ use leviculum_core::link::LinkId;
 use tokio::sync::mpsc;
 
 use crate::scope_addressing::InboundAddress;
+use crate::transport::av_transit_handshake::LinkTransit;
 use crate::transport::realtime_av_runtime::{
     AvLinkQueue, LeviculumAvSender, PumpReceiver, QueueOffer,
 };
@@ -105,6 +106,25 @@ pub struct AvLink {
     pub inbound: PumpReceiver,
     /// The Channel-path sender.
     pub sender: LeviculumAvSender,
+    /// CIRISEdge#805 — the hop's transit keys from the handshake this node
+    /// sent as the link's first message (this node dialled, so it is the
+    /// INITIATOR): seal what it sends with [`LinkTransit::seal_key`], open
+    /// what the peer sends back with [`LinkTransit::open_key`].
+    pub transit: LinkTransit,
+}
+
+/// A peer-opened A/V link whose transit KEX this node answered
+/// ([`ReticulumTransport::accept_av_arrival`]): the handshake was consumed,
+/// its claim matched the link's proven peer, and `transit` holds this node's
+/// RESPONDER keys. The arrival's inbound now yields media only.
+///
+/// [`ReticulumTransport::accept_av_arrival`]: crate::transport::reticulum::ReticulumTransport::accept_av_arrival
+#[derive(Debug)]
+pub struct AcceptedAvArrival {
+    /// The link, its inbound queue past the handshake, and its sender.
+    pub arrival: AvArrival,
+    /// The hop's transit keys, as the responder.
+    pub transit: LinkTransit,
 }
 
 impl std::fmt::Debug for AvLink {

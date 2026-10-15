@@ -412,8 +412,10 @@ pub fn open_at_first_counter<T>(
 
 /// One downstream subscriber link the dispatcher fans out onto. The
 /// `transit_key` + `link_id` are the per-(subscriber, stream) outer-AEAD
-/// state established out-of-band via the hybrid PQC KEX; the dispatcher
-/// owns the monotonic `link_seq` counter internally.
+/// state; on the live node `transit_key` is this end's SEAL key from the
+/// link's transit KEX (`av_transit_handshake::LinkTransit::seal_key`,
+/// CIRISEdge#805). The dispatcher owns the monotonic `link_seq` counter
+/// internally.
 pub struct AvSubscriberLink {
     /// Federation `key_id` of the subscriber — same identifier space as
     /// [`super::realtime_av_relay::PeerKeyId`].
@@ -431,7 +433,9 @@ pub struct AvSubscriberLink {
 /// One inbound link the dispatcher pulls from. The `transit_key` +
 /// `link_id` are the per-link outer-AEAD state for THIS hop — for a
 /// relay, the upstream transit key; for a subscriber, the
-/// relay→subscriber (or publisher→subscriber) transit key.
+/// relay→subscriber (or publisher→subscriber) transit key. On the live node
+/// it is this end's OPEN key from the link's transit KEX
+/// (`av_transit_handshake::LinkTransit::open_key`, CIRISEdge#805).
 pub struct AvInboundLink {
     /// Per-link inbound outer-AEAD transit key (32B).
     pub transit_key: [u8; 32],

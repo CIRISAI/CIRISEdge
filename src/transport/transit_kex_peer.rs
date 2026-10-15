@@ -1,21 +1,24 @@
 //! CIRISEdge#805 (CC 3.3.6.2) — resolve a PEER's transit KEX pair, the static
 //! `{x25519, ml_kem_768}` a dialler runs `transit_kex::initiate` against.
 //!
-//! The only source is persist's per-peer resolver
-//! [`transit_kex_pair_for`]: the pair from a live `Rooted` signed
-//! `transport_destination` binding, `None` when there is none, when two live
-//! Rooted bindings disagree, or when the pair reuses any key on the node's
-//! current occurrence. Never the raw `SignedTransportDestination::
-//! transit_kex_pair` (it skips the provenance and cross-row reuse checks) and
-//! never a bare announce (a routing hint is not a hop key).
+//! The only source is persist's per-peer resolver `transit_kex_pair_for`,
+//! reached through [`RootingDirectory::transit_kex_pair_for`] (the handle
+//! the transport holds; its one real implementation forwards to persist): the
+//! pair from a live `Rooted` signed `transport_destination` binding, `None`
+//! when there is none, when two live Rooted bindings disagree, or when the
+//! pair reuses any key on the node's current occurrence. Never the raw
+//! `SignedTransportDestination::transit_kex_pair` (it skips the provenance
+//! and cross-row reuse checks) and never a bare announce (a routing hint is
+//! not a hop key).
 //!
 //! `None` means the peer cannot relay (CC 3.3.6.2).
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use ciris_persist::federation::self_at_login::{transit_kex_pair_for, TransitKexPair};
-use ciris_persist::federation::FederationDirectory;
+use ciris_persist::federation::self_at_login::TransitKexPair;
+
+use crate::verify::RootingDirectory;
 
 /// Per-peer transit pair resolution with a say-once log for peers that
 /// cannot relay. Holds no pair: every call re-reads the directory, so a
@@ -37,14 +40,15 @@ impl PeerTransitResolver {
     ///
     /// # Errors
     ///
-    /// persist's: a backend read error, or a stored binding whose pair does
-    /// not parse (a corrupted row; it passed admission).
-    pub async fn resolve<D: FederationDirectory + ?Sized>(
+    /// The directory's: a backend read error, a stored binding whose pair
+    /// does not parse (a corrupted row; it passed admission), or no
+    /// directory at all.
+    pub async fn resolve<D: RootingDirectory + ?Sized>(
         &self,
         dir: &D,
         occurrence_key_id: &str,
-    ) -> Result<Option<TransitKexPair>, ciris_persist::federation::Error> {
-        let pair = transit_kex_pair_for(dir, occurrence_key_id).await?;
+    ) -> Result<Option<TransitKexPair>, String> {
+        let pair = dir.transit_kex_pair_for(occurrence_key_id).await?;
         if pair.is_none() {
             let first = self
                 .logged_no_pair

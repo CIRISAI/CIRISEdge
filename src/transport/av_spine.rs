@@ -406,7 +406,10 @@ pub enum DropCause {
 pub struct Redial {
     /// The freshly-KEX'd per-(subscriber, stream) transit key. A re-dial
     /// is a new link, so it is a new transit key; re-using the old one
-    /// across a re-dial would restart a keystream under a used key.
+    /// across a re-dial would restart a keystream under a used key. On the
+    /// live node it is the new link's handshake key: the relay's
+    /// `LinkTransit::seal_key` from `ReticulumTransport::accept_av_arrival`
+    /// (CIRISEdge#805, `av_transit_handshake`).
     pub transit_key: [u8; 32],
     /// The subscriber's layer-admission cap on the new hop.
     pub layer_policy: ReceiverLayerPolicy,

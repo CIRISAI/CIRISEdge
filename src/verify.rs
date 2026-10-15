@@ -364,6 +364,21 @@ pub trait RootingDirectory: Send + Sync + 'static {
         Err("no federation directory wired (RootingDirectory default)".to_string())
     }
 
+    /// CIRISEdge#805 (CC 3.3.6.2) — `occurrence_key_id`'s transit KEX pair,
+    /// the static `{x25519, ml_kem_768}` a dialler keys an A/V hop to that
+    /// node with. Forwards to persist's per-peer resolver
+    /// `self_at_login::transit_kex_pair_for` and nothing else: the pair only
+    /// from a live Rooted binding, `None` when there is none, when two
+    /// disagree, or when it reuses one of the node's keys (`None` = the node
+    /// cannot relay). Default `Err` (test doubles / no directory ⇒ the dial
+    /// is refused by name, never keyed another way).
+    async fn transit_kex_pair_for(
+        &self,
+        _occurrence_key_id: &str,
+    ) -> Result<Option<ciris_persist::federation::self_at_login::TransitKexPair>, String> {
+        Err("no federation directory wired (RootingDirectory default)".to_string())
+    }
+
     /// CIRISEdge#406 — submit a signed route through persist's authenticated
     /// admission (`put_signed_transport_destination`: hybrid 1-of-1 over
     /// `JCS(signed_envelope)` against the attesting key's PINNED federation
@@ -538,6 +553,15 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         Ok(rows
             .into_iter()
             .find(|r| r.transport_destination.transport_kind == "reticulum"))
+    }
+
+    async fn transit_kex_pair_for(
+        &self,
+        occurrence_key_id: &str,
+    ) -> Result<Option<ciris_persist::federation::self_at_login::TransitKexPair>, String> {
+        ciris_persist::federation::self_at_login::transit_kex_pair_for(self, occurrence_key_id)
+            .await
+            .map_err(|e| format!("transit_kex_pair_for: {e}"))
     }
 
     async fn put_signed_transport_destination(

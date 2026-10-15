@@ -466,7 +466,7 @@ ciris-persist = { git = "https://github.com/CIRISAI/CIRISPersist", tag = "v57.0.
 # distinct trait-object vtables that the trait-bound check in
 # `Arc<dyn HardwareSigner>` cannot reconcile.
 ciris-keyring = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v20.2.0", version = "20", features = ["software", "pqc-ml-dsa"] }
-ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v20.2.0", version = "20", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "aes-gcm", "xchacha", "hpke", "scope-privacy", "hmac", "kdf"] }
+ciris-crypto  = { git = "https://github.com/CIRISAI/CIRISVerify", tag = "v20.2.0", version = "20", features = ["ed25519", "pqc-ml-dsa", "hybrid-kex", "aes-gcm", "xchacha", "hpke", "scope-privacy", "hmac", "kdf", "transit-kex"] }
 # v2.0.0 (CIRISEdge#65 v2 wire cycle) — direct dep on ciris-verify-core
 # for `jcs::canonicalize` (the v2 `envelope_hash` basis per FSD §3.2.2:
 # `sha256(JCS(Signed*Record))`) + `threshold::ThresholdMember` (the

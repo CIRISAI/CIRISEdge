@@ -204,6 +204,13 @@ pub mod transit_kex_custody;
 #[cfg(feature = "_reticulum-module")]
 pub mod transit_kex_peer;
 
+/// CIRISEdge#805 (CC 5.3.3.5 E1) — the per-link hybrid transit KEX on an A/V
+/// link: the dialler initiates against the dialled node's published pair, the
+/// dialled end responds and checks the claim, and each end gets its
+/// role's seal and open keys. The only source of an A/V hop's transit key.
+#[cfg(feature = "_reticulum-module")]
+pub mod av_transit_handshake;
+
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
 /// edges (CIRISEdge#169). CEG-native (the Scope-B queue: byte-exact
 /// signed CEG envelopes); pairs with Reticulum Transport-node mode
@@ -346,6 +353,20 @@ pub enum TransportError {
         /// very peer typically appears here, making the explicit-vs-named
         /// mismatch obvious.
         paths: String,
+    },
+    /// CIRISEdge#805 (CC 5.3.3.5 E1) — an A/V link's per-hop transit key
+    /// exchange was refused: the dialled node publishes no usable transit
+    /// pair, the handshake was malformed or too large, its claimed initiator
+    /// is not the link's proven peer, or the KEX failed. The link is closed
+    /// and no key was installed; there is no fallback key.
+    #[error("A/V transit KEX refused ({reason}) for {peer}: {detail}")]
+    AvTransitRefused {
+        /// The peer on the other end of the link.
+        peer: String,
+        /// The stable refusal name (the `av_plane` metric label).
+        reason: &'static str,
+        /// What happened.
+        detail: String,
     },
 }
 

@@ -1459,13 +1459,28 @@ fn spawn_inbound(
     // the publisher opens to this node arrives here (attributed through the
     // #393 gate), and its frames feed the SAME media mailbox the receive loop
     // reads. Nothing from an A/V link ever reaches the listener above.
+    //
+    // Each link opens with the dialler's transit KEX handshake (CIRISEdge#805,
+    // CC 5.3.3.5 E1), answered here before any media is read: a refused
+    // handshake (no handshake, or a claim that is not the link's peer) closes
+    // the link. The harness's media still rides its own room-wide outer key
+    // (`epoch_keys`): see that function on why it has not moved yet.
     if let Some(mut arrivals) = transport.take_av_arrivals() {
+        let transport = Arc::clone(transport);
         tokio::spawn(async move {
             while let Some(arrival) = arrivals.recv().await {
                 let med_tx = av_med_tx.clone();
                 let peer = arrival.peer.as_str().to_owned();
                 tracing::info!(peer = %peer, "A/V call link arrived (CIRISEdge#805)");
+                let transport = Arc::clone(&transport);
                 tokio::spawn(async move {
+                    let arrival = match transport.accept_av_arrival(arrival).await {
+                        Ok(accepted) => accepted.arrival,
+                        Err(e) => {
+                            tracing::warn!(peer = %peer, error = %e, "A/V call link refused");
+                            return;
+                        }
+                    };
                     while let Ok(bytes) = arrival.inbound.recv().await {
                         if let Some((KIND_MEDIA, header, payload)) = decode_frame(&bytes) {
                             let _ = med_tx.send((Some(peer.clone()), header, payload.to_vec()));
@@ -3017,11 +3032,21 @@ fn open_sealed_kv(state_dir: &Path, fed_seed_path: &Path) -> Result<XChaChaKvSto
 /// The media DEK and the per-link transit key for an epoch.
 ///
 /// **Labelled, harness-only derivation.** Production takes the A/V DEK
-/// from an `AvSession`'s own MLS group and the transit key from a
-/// `FederationSession` hybrid KEX. Neither is reachable across process
-/// boundaries today: the A/V session join rides on the in-flight spine,
-/// and `SessionHandshakeMsg` has no serde wire form, so a cross-process
-/// KEX would need a hand-rolled codec.
+/// from an `AvSession`'s own MLS group and the transit key from the per-link
+/// transit KEX the A/V dial runs (CIRISEdge#805, `av_transit_handshake`).
+///
+/// The harness's transit key has not moved to that KEX in the #805 cut, and
+/// cannot by a substitution: it seals each chunk ONCE per member before
+/// choosing a mechanism (`MediaLink` has a Resource path besides the A/V
+/// plane), uses the member's key id as the nonce's `link_id` and the frame
+/// sequence as its counter, and the receiver opens by EPOCH from a key ring
+/// (`open_media`). Per-link keys need per-link seal state on the sender,
+/// per-link open state on the receiver, and a new shape for the observer
+/// refusal leg (an observer has no A/V link, so no handshake key). The A/V
+/// links themselves DO run the handshake (dial and `accept_av_arrival`); only
+/// the harness's own outer layer is still this one. The DEK likewise: the
+/// A/V session join rides on the in-flight spine, so the harness does not
+/// hold an `AvSession` across processes.
 ///
 /// What is used instead is still a *real* MLS exporter — the cohort's
 /// record-plane secret, which every member derives identically and which

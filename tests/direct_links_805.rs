@@ -259,6 +259,8 @@ struct Side {
     table: Arc<ScopeAddressTable>,
     lifecycle: Arc<ScopeLifecycle>,
     events: broadcast::Receiver<DirectPathEvent>,
+    /// This node's own directory.
+    dir: Arc<SqliteBackend>,
     _edge: ciris_edge::Edge,
     _tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -346,6 +348,7 @@ async fn side_cfg(
         table,
         lifecycle,
         events,
+        dir: Arc::clone(dir),
         _edge: edge,
         _tasks: tasks,
     }
@@ -639,13 +642,30 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
     // 6-byte envelope), an A/V chunk budget of 341 (#720; 321 after #846).
     assert_eq!(av_limit, 425, "the A/V leg runs at the base MTU");
 
-    // Frames cross the A/V leg, then still cross with T gone.
-    link.sender.send(b"direct-805-1").await.expect("send 1");
+    // CIRISEdge#805 — the dial's transit KEX handshake rode this base-MTU
+    // leg as several Channel messages (about 1.2 KB at 425 B each), and B
+    // answers it: both ends hold the hop's keys, by role.
     let arrival = tokio::time::timeout(Duration::from_secs(20), arrivals.recv())
         .await
         .expect("B's consumer gets the link")
         .expect("arrivals open");
     assert_eq!(arrival.peer.as_str(), p.a.key.key_id);
+    let handshake_frames = p.a.metrics.av_plane().get("av_sent").copied().unwrap_or(0);
+    assert!(
+        handshake_frames >= 3,
+        "the handshake spans several 425-B Channel messages: {handshake_frames}"
+    );
+    let accepted =
+        p.b.transport
+            .accept_av_arrival(arrival)
+            .await
+            .expect("B answers A's transit KEX over the punched leg");
+    assert_eq!(link.transit.seal_key(), accepted.transit.open_key());
+    assert_eq!(accepted.transit.seal_key(), link.transit.open_key());
+    let arrival = accepted.arrival;
+
+    // Frames cross the A/V leg, then still cross with T gone.
+    link.sender.send(b"direct-805-1").await.expect("send 1");
     let got = tokio::time::timeout(Duration::from_secs(10), arrival.inbound.recv())
         .await
         .expect("frame 1 in time")
@@ -848,11 +868,6 @@ async fn quad(tag: &str) -> Quad {
 }
 
 const LEGS_DEK: [u8; 32] = [0x44; 32];
-const K_AR: [u8; 32] = [0x51; 32];
-const K_RB: [u8; 32] = [0x52; 32];
-const K_AB: [u8; 32] = [0x53; 32];
-const K_RB2: [u8; 32] = [0x54; 32];
-const K_RC: [u8; 32] = [0x55; 32];
 
 fn legs_stream() -> StreamId {
     StreamId(sha2::Sha256::digest(b"av-stream-805-legs").into())
@@ -907,18 +922,35 @@ async fn next_arrival(arrivals: &mut mpsc::Receiver<AvArrival>, from: &str) -> A
 }
 
 /// Dial R's call address from `side` and subscribe: a subscription is the
-/// dialled link plus its first frame.
+/// dialled link, whose first message is the transit KEX handshake
+/// (CIRISEdge#805). The subscriber dialled, so it is the INITIATOR and opens
+/// R's frames with its open key (`responder_to_initiator`).
 async fn dial_r(side: &Side, r_id: &str) -> ciris_edge::transport::av_sink::AvLink {
-    let link = side
-        .transport
+    side.transport
         .open_av_link(r_id, &legs_address(side, r_id))
         .await
-        .expect("dial R");
-    link.sender
-        .send(b"subscribe")
+        .expect("dial R")
+}
+
+/// R answers its upstream's handshake: the publisher dialled R, so R is the
+/// RESPONDER and opens with its open key (`initiator_to_responder`).
+async fn accept_upstream(r: &Side, arrival: AvArrival) -> (AvInboundLink, [u8; 32], Vec<u8>) {
+    let accepted = r
+        .transport
+        .accept_av_arrival(arrival)
         .await
-        .expect("the first frame");
-    link
+        .expect("R answers the publisher's transit KEX");
+    let key = accepted.transit.open_key();
+    let link_id = accepted.arrival.link_id.to_vec();
+    (
+        AvInboundLink {
+            transit_key: key,
+            link_id: link_id.clone(),
+            inbound_recv: Box::new(accepted.arrival.inbound),
+        },
+        key,
+        link_id,
+    )
 }
 
 /// **W2** — B hears A's stream over the relay member R, then directly once a
@@ -966,7 +998,7 @@ async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
         epoch_dek: Some(LEGS_DEK),
         initial_subscribers: vec![AvSubscriberLink {
             subscriber: r_id.clone(),
-            transit_key: K_AR,
+            transit_key: a_r.transit.seal_key(),
             link_id: a_r.link_id.to_vec(),
             outbound_send: Box::new(a_r.sender),
         }],
@@ -977,24 +1009,17 @@ async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
     let _ = publisher.publish_inner(legs_chunk(seq)).await;
     seq += 1;
     let upstream = next_arrival(&mut r_arrivals, &a_id).await;
+    let (upstream, up_key, up_link) = accept_upstream(&q.r, upstream).await;
     let (_pump, admissions) = AvRelay::new(legs_stream(), Vec::new())
         .expect("R's relay")
-        .spawn_pump_admitting(
-            AvInboundLink {
-                transit_key: K_AR,
-                link_id: upstream.link_id.to_vec(),
-                inbound_recv: Box::new(upstream.inbound),
-            },
-            K_AR,
-            upstream.link_id.to_vec(),
-        );
+        .spawn_pump_admitting(upstream, up_key, up_link);
 
     // B subscribes by DIALLING R (its first frame is the subscription).
     let b_r = dial_r(&q.b, &r_id).await;
     let arrival = next_arrival(&mut r_arrivals, &b_id).await;
     assert!(
         q.r.transport
-            .admit_dialled_subscriber(arrival, &admissions, K_RB)
+            .admit_dialled_subscriber(arrival, &admissions)
             .await,
         "B is in R's call: admitted"
     );
@@ -1008,7 +1033,7 @@ async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
         a_id.clone(),
         r_id.clone(),
         AvInboundLink {
-            transit_key: K_RB,
+            transit_key: b_r.transit.open_key(),
             link_id: b_r.link_id.to_vec(),
             inbound_recv: Box::new(b_r.inbound),
         },
@@ -1048,20 +1073,27 @@ async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
     publisher
         .add_subscriber(AvSubscriberLink {
             subscriber: b_id.clone(),
-            transit_key: K_AB,
+            transit_key: a_b.transit.seal_key(),
             link_id: a_b.link_id.to_vec(),
             outbound_send: Box::new(a_b.sender),
         })
         .expect("A adds B's direct leg");
     let _ = publisher.publish_inner(legs_chunk(seq)).await;
     seq += 1;
+    // A dialled B, so B is the RESPONDER on the direct leg: it opens with
+    // `initiator_to_responder`.
     let direct = next_arrival(&mut b_arrivals, &a_id).await;
+    let direct =
+        q.b.transport
+            .accept_av_arrival(direct)
+            .await
+            .expect("B answers A's transit KEX on the direct leg");
     legs.add_leg(
         Leg::Direct,
         AvInboundLink {
-            transit_key: K_AB,
-            link_id: direct.link_id.to_vec(),
-            inbound_recv: Box::new(direct.inbound),
+            transit_key: direct.transit.open_key(),
+            link_id: direct.arrival.link_id.to_vec(),
+            inbound_recv: Box::new(direct.arrival.inbound),
         },
     )
     .await
@@ -1133,13 +1165,13 @@ async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
     let arrival = next_arrival(&mut r_arrivals, &b_id).await;
     assert!(
         q.r.transport
-            .admit_dialled_subscriber(arrival, &admissions, K_RB2)
+            .admit_dialled_subscriber(arrival, &admissions)
             .await
     );
     legs.add_leg(
         Leg::Relay,
         AvInboundLink {
-            transit_key: K_RB2,
+            transit_key: b_r2.transit.open_key(),
             link_id: b_r2.link_id.to_vec(),
             inbound_recv: Box::new(b_r2.inbound),
         },
@@ -1186,7 +1218,7 @@ async fn a_subscriber_moves_between_relay_and_direct_legs_and_back() {
     let arrival = next_arrival(&mut r_arrivals, &c_id).await;
     assert!(
         !q.r.transport
-            .admit_dialled_subscriber(arrival, &admissions, K_RC)
+            .admit_dialled_subscriber(arrival, &admissions)
             .await,
         "C is refused"
     );
@@ -1242,7 +1274,7 @@ async fn a_relay_leg_carrying_media_outlives_the_reaper_863() {
         epoch_dek: Some(LEGS_DEK),
         initial_subscribers: vec![AvSubscriberLink {
             subscriber: r_id.clone(),
-            transit_key: K_AR,
+            transit_key: a_r.transit.seal_key(),
             link_id: a_r.link_id.to_vec(),
             outbound_send: Box::new(a_r.sender),
         }],
@@ -1253,22 +1285,15 @@ async fn a_relay_leg_carrying_media_outlives_the_reaper_863() {
     let _ = publisher.publish_inner(legs_chunk(seq)).await;
     seq += 1;
     let upstream = next_arrival(&mut r_arrivals, &a_id).await;
+    let (upstream, up_key, up_link) = accept_upstream(&q.r, upstream).await;
     let (_pump, admissions) = AvRelay::new(legs_stream(), Vec::new())
         .expect("R's relay")
-        .spawn_pump_admitting(
-            AvInboundLink {
-                transit_key: K_AR,
-                link_id: upstream.link_id.to_vec(),
-                inbound_recv: Box::new(upstream.inbound),
-            },
-            K_AR,
-            upstream.link_id.to_vec(),
-        );
+        .spawn_pump_admitting(upstream, up_key, up_link);
     let b_r = dial_r(&q.b, &r_id).await;
     let arrival = next_arrival(&mut r_arrivals, &b_id).await;
     assert!(
         q.r.transport
-            .admit_dialled_subscriber(arrival, &admissions, K_RB)
+            .admit_dialled_subscriber(arrival, &admissions)
             .await
     );
     let relay_leg = b_r.link_id;
@@ -1277,7 +1302,7 @@ async fn a_relay_leg_carrying_media_outlives_the_reaper_863() {
         &EpochDek::from_bytes(LEGS_DEK),
         &r_id,
         AvInboundLink {
-            transit_key: K_RB,
+            transit_key: b_r.transit.open_key(),
             link_id: relay_leg.to_vec(),
             inbound_recv: Box::new(b_r.inbound),
         },
@@ -1338,5 +1363,166 @@ async fn a_relay_leg_carrying_media_outlives_the_reaper_863() {
         got_last,
         Ok(true),
         "the relay leg still delivers past the bound"
+    );
+}
+
+// ─── CIRISEdge#805 — the per-link transit KEX, refused by name ────────
+
+/// Re-sign `owner`'s reticulum route in `dir` WITHOUT its transit KEX pair, at
+/// a later `asserted_at`: the node, as `dir` now sees it, publishes no pair.
+async fn strip_transit_pair(dir: &Arc<SqliteBackend>, owner: &Ident) {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let route = dir
+        .list_signed_transport_destinations_for(&owner.key_id)
+        .await
+        .expect("list routes")
+        .into_iter()
+        .find(|r| r.transport_destination.transport_kind == "reticulum")
+        .expect("the owner's route");
+    let mut row = route.transport_destination.clone();
+    row.asserted_at += chrono::Duration::seconds(1);
+    let envelope = serde_json::to_value(&row).expect("row to value");
+    let bytes = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canon");
+    let ed = HardwareSigner::sign(owner.ed.as_ref(), &bytes)
+        .await
+        .expect("ed25519 sign");
+    let mut bound = bytes;
+    bound.extend_from_slice(&ed);
+    let mldsa = PqcSigner::sign(owner.pqc.as_ref(), &bound)
+        .await
+        .expect("ml-dsa sign");
+    let stripped = ciris_persist::federation::self_at_login::SignedTransportDestination {
+        attesting_key_id: owner.key_id.clone(),
+        transport_destination: row,
+        signed_envelope: envelope,
+        signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+            ed25519_signature_base64: b64.encode(&ed),
+            mldsa65_signature_base64: Some(b64.encode(&mldsa)),
+        },
+    };
+    FederationDirectory::put_signed_transport_destination(&**dir, &stripped)
+        .await
+        .expect("the pair-less route admits");
+    assert_eq!(
+        ciris_persist::federation::self_at_login::transit_kex_pair_for(&**dir, &owner.key_id)
+            .await
+            .expect("resolve"),
+        None,
+        "the owner now publishes no pair, as this directory sees it"
+    );
+}
+
+/// **W7** (CIRISEdge#805, CC 5.3.3.5 E1) — an A/V hop is keyed by the per-link
+/// transit KEX or not at all:
+///
+/// - a subscriber whose handshake CLAIMS another member is refused at the
+///   relay by name (`av_transit_refused_claim_mismatch`), no key is
+///   installed, and it hears nothing while the stream runs;
+/// - a dial to a node that publishes no transit pair is refused by name
+///   (`AvTransitRefused` / `av_transit_refused_no_pair`) before the link
+///   carries a byte; nothing arrives at the dialled node.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_transit_kex_refuses_a_false_claim_and_a_missing_pair_by_name() {
+    let q = quad("w7").await;
+    let (a_id, b_id, r_id) = (
+        q.a.key.key_id.clone(),
+        q.b.key.key_id.clone(),
+        q.r.key.key_id.clone(),
+    );
+    let members = [a_id.as_str(), b_id.as_str(), r_id.as_str()];
+    for side in [&q.r, &q.a, &q.b] {
+        install_legs_group(side, &members);
+    }
+    let mut r_arrivals = q.r.transport.take_av_arrivals().expect("R's arrivals");
+
+    // A publishes through R, keyed by A's handshake.
+    let a_r =
+        q.a.transport
+            .open_av_link(&r_id, &legs_address(&q.a, &r_id))
+            .await
+            .expect("A dials R");
+    let mut publisher = AvDispatcher::new(AvDispatcherConfig {
+        stream_id: legs_stream(),
+        local_role: AvRole::Publisher,
+        epoch_dek: Some(LEGS_DEK),
+        initial_subscribers: vec![AvSubscriberLink {
+            subscriber: r_id.clone(),
+            transit_key: a_r.transit.seal_key(),
+            link_id: a_r.link_id.to_vec(),
+            outbound_send: Box::new(a_r.sender),
+        }],
+        inbound_links: vec![],
+    })
+    .expect("A's publisher");
+    let upstream = next_arrival(&mut r_arrivals, &a_id).await;
+    let (upstream, up_key, up_link) = accept_upstream(&q.r, upstream).await;
+    let (_pump, admissions) = AvRelay::new(legs_stream(), Vec::new())
+        .expect("R's relay")
+        .spawn_pump_admitting(upstream, up_key, up_link);
+
+    // B dials R but its handshake claims A. R's link proves B: refused.
+    let liar =
+        q.b.transport
+            .open_av_link_claiming_for_test(&r_id, &legs_address(&q.b, &r_id), &a_id)
+            .await
+            .expect("B's dial and handshake go out");
+    let arrival = next_arrival(&mut r_arrivals, &b_id).await;
+    assert!(
+        !q.r.transport
+            .admit_dialled_subscriber(arrival, &admissions)
+            .await,
+        "a handshake claiming another member is refused"
+    );
+    let r_av = q.r.metrics.av_plane();
+    assert_eq!(
+        r_av.get("av_transit_refused_claim_mismatch").copied(),
+        Some(1),
+        "{r_av:?}"
+    );
+    assert_eq!(r_av.get("av_relay_dialler_admitted").copied(), None);
+    let mut seq = 0u64;
+    for _ in 0..15 {
+        let _ = publisher.publish_inner(legs_chunk(seq)).await;
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let heard = tokio::time::timeout(Duration::from_secs(2), liar.inbound.recv()).await;
+    assert!(
+        !matches!(heard, Ok(Ok(_))),
+        "the refused dialler heard nothing: {heard:?}"
+    );
+
+    // R, as A's directory now sees it, publishes no pair: A's dial is refused
+    // by name and never keyed another way.
+    strip_transit_pair(&q.a.dir, &q.r.key).await;
+    match q
+        .a
+        .transport
+        .open_av_link(&r_id, &legs_address(&q.a, &r_id))
+        .await
+    {
+        Err(TransportError::AvTransitRefused { peer, reason, .. }) => {
+            assert_eq!(peer, r_id);
+            assert_eq!(reason, "av_transit_refused_no_pair");
+        }
+        other => panic!("a dial to a pair-less node must be refused by name: {other:?}"),
+    }
+    let a_av = q.a.metrics.av_plane();
+    assert_eq!(
+        a_av.get("av_transit_refused_no_pair").copied(),
+        Some(1),
+        "{a_av:?}"
+    );
+    assert_eq!(
+        a_av.get("av_transit_kex_initiated").copied(),
+        Some(1),
+        "only the first dial was keyed: {a_av:?}"
+    );
+    let nothing = tokio::time::timeout(Duration::from_secs(2), r_arrivals.recv()).await;
+    assert!(
+        nothing.is_err(),
+        "the refused dial sent nothing, so nothing arrived at R"
     );
 }

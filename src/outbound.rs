@@ -659,6 +659,9 @@ async fn dispatch_one(
                 // heals it on the next verified announce, so the dispatcher's
                 // retry will find the routable named dest.
                 TransportError::NoRouteToPeer { .. } => "no_route_to_peer",
+                // CIRISEdge#805 — an A/V hop's transit KEX refused; never a
+                // queued-row failure in practice (A/V rides no outbound queue).
+                TransportError::AvTransitRefused { .. } => "av_transit_refused",
             };
             if let Some(t) = reachability {
                 t.record_attempt(

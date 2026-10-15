@@ -905,6 +905,38 @@ pub const AV_RELAY_DIALLER_REFUSED: &str = "av_relay_dialler_refused";
 /// CIRISEdge#805 item 8, cut 2 — a subscriber that dialled this relay was
 /// entitled and admitted to its fan-out.
 pub const AV_RELAY_DIALLER_ADMITTED: &str = "av_relay_dialler_admitted";
+/// CIRISEdge#805 (CC 5.3.3.5 E1) — this node dialled an A/V link and sent its
+/// transit KEX handshake; the hop's keys are installed.
+pub const AV_TRANSIT_KEX_INITIATED: &str = "av_transit_kex_initiated";
+/// CIRISEdge#805 — a dialler's transit KEX handshake was answered and its
+/// claim matched the link's proven peer; the hop's keys are installed.
+pub const AV_TRANSIT_KEX_ACCEPTED: &str = "av_transit_kex_accepted";
+/// CIRISEdge#805 — the dialled node publishes no usable transit KEX pair
+/// (CC 3.3.6.2: it cannot relay or receive): the dial is refused, never keyed
+/// any other way.
+pub const AV_TRANSIT_REFUSED_NO_PAIR: &str = "av_transit_refused_no_pair";
+/// CIRISEdge#805 — the dialled node's pair could not be read (no directory, or
+/// a directory fault).
+pub const AV_TRANSIT_REFUSED_LOOKUP: &str = "av_transit_refused_lookup";
+/// CIRISEdge#805 — the handshake's claimed initiator is not the link's proven
+/// peer: refused, no key installed.
+pub const AV_TRANSIT_REFUSED_CLAIM_MISMATCH: &str = "av_transit_refused_claim_mismatch";
+/// CIRISEdge#805 — the handshake was addressed to another responder key.
+pub const AV_TRANSIT_REFUSED_RESPONDER_MISMATCH: &str = "av_transit_refused_responder_mismatch";
+/// CIRISEdge#805 — the handshake's frames were not a handshake, malformed,
+/// truncated, over the reassembly bound, or lost a frame.
+pub const AV_TRANSIT_REFUSED_MALFORMED: &str = "av_transit_refused_malformed";
+/// CIRISEdge#805 — the handshake declared more bytes than the reassembly
+/// bound admits.
+pub const AV_TRANSIT_REFUSED_TOO_LARGE: &str = "av_transit_refused_too_large";
+/// CIRISEdge#805 — the handshake did not complete within its budget, or the
+/// link closed under it.
+pub const AV_TRANSIT_REFUSED_TIMEOUT: &str = "av_transit_refused_timeout";
+/// CIRISEdge#805 — the KEX itself failed (a crypto refusal from
+/// `ciris_crypto::transit_kex`, other than a responder mismatch).
+pub const AV_TRANSIT_REFUSED_KEX: &str = "av_transit_refused_kex";
+/// CIRISEdge#805 — the handshake could not be sent on the link.
+pub const AV_TRANSIT_REFUSED_SEND: &str = "av_transit_refused_send";
 
 // ─── CIRISEdge#805 item 8 — `EdgeMetrics::direct_link` labels ─────────
 

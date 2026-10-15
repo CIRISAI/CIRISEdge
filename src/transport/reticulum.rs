@@ -2288,6 +2288,10 @@ pub struct ReticulumTransport {
     /// signed route [`Self::self_route`] emits; the privates answer a
     /// dialler's `transit_kex` handshake.
     transit_kex: crate::transport::transit_kex_custody::TransitKexSecret,
+    /// CIRISEdge#805 — resolves a dialled node's transit pair (Rooted only,
+    /// via [`RootingDirectory::transit_kex_pair_for`]) for the A/V dial's
+    /// handshake.
+    transit_peers: crate::transport::transit_kex_peer::PeerTransitResolver,
     /// The node's single `NodeEvent` receiver. `listen` takes it
     /// exactly once; a second `listen` call is a config error.
     /// Leviculum PR #9 switched this to an unbounded channel so node
@@ -3541,6 +3545,7 @@ impl ReticulumTransport {
             local_signer,
             self_route,
             transit_kex,
+            transit_peers: crate::transport::transit_kex_peer::PeerTransitResolver::new(),
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
@@ -5098,6 +5103,31 @@ impl ReticulumTransport {
         destination_key_id: &str,
         address: &MemberAddress,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
+        self.open_av_link_claiming(destination_key_id, address, &self.config.local_key_id)
+            .await
+    }
+
+    /// CIRISEdge#805 test seam — [`Self::open_av_link`], with the transit
+    /// KEX handshake CLAIMING `claimed_initiator` instead of this node's own
+    /// key id: what a peer lying about who it is would send. The dialled end
+    /// must refuse it (its link proves this node, not the claim).
+    #[doc(hidden)]
+    pub async fn open_av_link_claiming_for_test(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+        claimed_initiator: &str,
+    ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
+        self.open_av_link_claiming(destination_key_id, address, claimed_initiator)
+            .await
+    }
+
+    async fn open_av_link_claiming(
+        &self,
+        destination_key_id: &str,
+        address: &MemberAddress,
+        initiator_key_id: &str,
+    ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
         let (dest_hash, transport_ed25519) =
             self.av_dial_target(destination_key_id, address).await?;
         // CIRISEdge#805 item 8 — a derived address answers only a one-hop
@@ -5183,26 +5213,165 @@ impl ReticulumTransport {
             .ok_or_else(|| {
                 TransportError::Io("open_av_link: the dial registered no inbound queue".to_owned())
             })?;
+        let sender = crate::transport::realtime_av_runtime::LeviculumAvSender::new(
+            Arc::clone(&self.node),
+            link_id,
+        )
+        .with_metrics(self.metrics.get().cloned())
+        .with_direct_path(direct_path)
+        .with_outbound_liveness(Arc::clone(&self.link_last_outbound_at));
+        // CIRISEdge#805 (CC 5.3.3.5 E1) — the hop's transit key: this node
+        // dialled, so it INITIATES, and the handshake is the link's first
+        // message. Nothing else keys the hop; no pair means no link.
+        let transit = match self
+            .initiate_av_transit(destination_key_id, initiator_key_id, link_id, &sender)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                let refused = self.av_transit_refused(destination_key_id, link_id, &e, "dial");
+                drop(inbound);
+                drop(sender);
+                self.undo_partial_av_dial(link_id, &refused).await;
+                return Err(refused);
+            }
+        };
         if let Some(m) = self.metrics.get() {
+            m.inc_av_plane(crate::observability::AV_TRANSIT_KEX_INITIATED);
             m.inc_av_plane(crate::observability::AV_LINK_OPENED);
         }
         tracing::info!(
             key_id = %destination_key_id,
             link = %hex::encode(link_id.as_bytes()),
-            "A/V link opened on the live node (CIRISEdge#805)"
+            "A/V link opened on the live node, transit KEX sent (CIRISEdge#805)"
         );
         Ok(crate::transport::av_sink::AvLink {
             link_id: link_id.into_bytes(),
             peer: destination_key_id.to_owned(),
             inbound,
-            sender: crate::transport::realtime_av_runtime::LeviculumAvSender::new(
-                Arc::clone(&self.node),
-                link_id,
-            )
-            .with_metrics(self.metrics.get().cloned())
-            .with_direct_path(direct_path)
-            .with_outbound_liveness(Arc::clone(&self.link_last_outbound_at)),
+            sender,
+            transit,
         })
+    }
+
+    /// CIRISEdge#805 — the dialler's half of an A/V hop's transit KEX:
+    /// resolve the dialled node's pair (Rooted only), run
+    /// `transit_kex::initiate` and send the handshake on the link.
+    async fn initiate_av_transit(
+        &self,
+        peer: &str,
+        initiator_key_id: &str,
+        link_id: LinkId,
+        sender: &crate::transport::realtime_av_runtime::LeviculumAvSender,
+    ) -> Result<
+        crate::transport::av_transit_handshake::LinkTransit,
+        crate::transport::av_transit_handshake::AvHandshakeError,
+    > {
+        use crate::transport::av_transit_handshake::{initiate_on_link, AvHandshakeError};
+        let Some(rooting) = self.rooting.as_deref() else {
+            return Err(AvHandshakeError::PairLookup {
+                peer: peer.to_owned(),
+                detail: "no rooting directory is wired".to_owned(),
+            });
+        };
+        let pair = self
+            .transit_peers
+            .resolve(rooting, peer)
+            .await
+            .map_err(|detail| AvHandshakeError::PairLookup {
+                peer: peer.to_owned(),
+                detail,
+            })?
+            .ok_or_else(|| AvHandshakeError::NoTransitPair {
+                peer: peer.to_owned(),
+            })?;
+        let frame_limit = sender
+            .channel_limit()
+            .ok_or_else(|| AvHandshakeError::Send("the link is no longer held".to_owned()))?;
+        initiate_on_link(
+            sender,
+            frame_limit,
+            link_id.as_bytes(),
+            initiator_key_id,
+            peer,
+            &pair,
+        )
+        .await
+    }
+
+    /// Count, log and type one transit KEX refusal on `link_id`.
+    fn av_transit_refused(
+        &self,
+        peer: &str,
+        link_id: LinkId,
+        error: &crate::transport::av_transit_handshake::AvHandshakeError,
+        side: &'static str,
+    ) -> TransportError {
+        let reason = error.label();
+        if let Some(m) = self.metrics.get() {
+            m.inc_av_plane(reason);
+        }
+        tracing::warn!(
+            peer = %peer,
+            link = %hex::encode(link_id.as_bytes()),
+            side,
+            reason,
+            error = %error,
+            "A/V transit KEX REFUSED — link closed, no key installed, no fallback key \
+             (CIRISEdge#805, CC 5.3.3.5 E1)"
+        );
+        TransportError::AvTransitRefused {
+            peer: peer.to_owned(),
+            reason,
+            detail: error.to_string(),
+        }
+    }
+
+    /// CIRISEdge#805 (CC 5.3.3.5 E1) — the dialled end's half of an A/V
+    /// hop's transit KEX, for a link a peer opened to this node: read the
+    /// dialler's handshake (the link's first message), answer it under this
+    /// node's transit keys, and check the CLAIM: the handshake's initiator
+    /// must be the peer the link itself proves (`arrival.peer`, the #393
+    /// attribution). Only then are the hop's keys handed out, as the
+    /// responder's [`LinkTransit`](crate::transport::av_transit_handshake::LinkTransit).
+    ///
+    /// Any refusal closes the link and is counted under its name.
+    ///
+    /// # Errors
+    /// [`TransportError::AvTransitRefused`].
+    pub async fn accept_av_arrival(
+        &self,
+        arrival: crate::transport::av_sink::AvArrival,
+    ) -> Result<crate::transport::av_sink::AcceptedAvArrival, TransportError> {
+        let link_id = LinkId::new(arrival.link_id);
+        match crate::transport::av_transit_handshake::respond_on_link(
+            &arrival.inbound,
+            &arrival.link_id,
+            &self.config.local_key_id,
+            &self.transit_kex,
+            arrival.peer.as_str(),
+        )
+        .await
+        {
+            Ok(transit) => {
+                if let Some(m) = self.metrics.get() {
+                    m.inc_av_plane(crate::observability::AV_TRANSIT_KEX_ACCEPTED);
+                }
+                tracing::info!(
+                    peer = %arrival.peer.as_str(),
+                    link = %hex::encode(arrival.link_id),
+                    "A/V transit KEX answered; the claim matches the link's peer \
+                     (CIRISEdge#805)"
+                );
+                Ok(crate::transport::av_sink::AcceptedAvArrival { arrival, transit })
+            }
+            Err(e) => {
+                let refused = self.av_transit_refused(arrival.peer.as_str(), link_id, &e, "accept");
+                drop(arrival);
+                let _ = self.link_teardown(link_id.as_bytes()).await;
+                Err(refused)
+            }
+        }
     }
 
     /// CIRISEdge#805 — every check an A/V dial passes before it is made, and
@@ -5514,16 +5683,24 @@ impl ReticulumTransport {
     /// scope table. An unentitled dialler is refused, counted, sent nothing,
     /// and its link closed. Returns whether it was admitted.
     ///
-    /// `transit_key` is the hop's outer-seal key; the subscriber opens with
-    /// the same. TODO(805 item 5): the Call derives it; callers supply it
-    /// until then. The hop's AEAD link id is the leviculum link id, which both
-    /// ends hold.
+    /// The hop's transit key comes from the subscriber's handshake
+    /// ([`Self::accept_av_arrival`], CIRISEdge#805): the subscriber dialled,
+    /// so this relay is the RESPONDER and seals with its seal key
+    /// (`responder_to_initiator`), which the subscriber opens with. A
+    /// handshake refusal (no handshake, a claim that is not the link's
+    /// peer, ...) refuses the dialler under that name, before entitlement is
+    /// asked. The hop's AEAD link id is the leviculum link id, which both
+    /// ends hold and the KEX binds.
     pub async fn admit_dialled_subscriber(
         &self,
         arrival: crate::transport::av_sink::AvArrival,
         admissions: &crate::transport::realtime_av_runtime::RelayAdmissions,
-        transit_key: [u8; 32],
     ) -> bool {
+        let Ok(crate::transport::av_sink::AcceptedAvArrival { arrival, transit }) =
+            self.accept_av_arrival(arrival).await
+        else {
+            return false;
+        };
         let dialler = arrival.peer.as_str().to_owned();
         let entitled = self.scope_addresses.get().is_some_and(|table| {
             crate::transport::av_leg_choice::relay_admits(table, arrival.address.as_ref(), &dialler)
@@ -5532,7 +5709,7 @@ impl ReticulumTransport {
             && admissions
                 .admit(crate::transport::realtime_av_dispatcher::AvSubscriberLink {
                     subscriber: dialler.clone(),
-                    transit_key,
+                    transit_key: transit.seal_key(),
                     link_id: arrival.link_id.to_vec(),
                     outbound_send: Box::new(arrival.sender),
                 })
