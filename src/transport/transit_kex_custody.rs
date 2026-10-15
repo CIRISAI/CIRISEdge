@@ -70,8 +70,7 @@ impl std::fmt::Debug for TransitKexSecret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransitKexSecret")
             .field("x25519_public", &hex::encode(self.pair.x25519))
-            .field("private", &"<redacted>")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -406,7 +405,7 @@ mod tests {
         let identity = leviculum_std::generate_identity();
         let id_priv = identity.private_key_bytes().expect("identity priv");
         let id_pub = identity.public_key_bytes();
-        std::fs::write(&id, &id_priv).expect("write identity");
+        std::fs::write(&id, id_priv).expect("write identity");
 
         let s = TransitKexSecret::load_or_generate_file(&id).expect("generate");
         let x_pub = s.pair().x25519;
@@ -458,10 +457,11 @@ mod tests {
         let ss2 =
             ciris_crypto::ml_kem::decapsulate(s.ml_kem_768_dk_seed(), &ct).expect("decapsulate");
         assert_eq!(ss, ss2, "the dk seed is the form decapsulate takes");
-        let (eph_sk, eph_pk) = ciris_crypto::x25519::generate_ephemeral_keypair().expect("eph");
+        let (eph_secret, eph_public) =
+            ciris_crypto::x25519::generate_ephemeral_keypair().expect("eph");
         assert_eq!(
-            ciris_crypto::x25519::dh(&eph_sk, &s.pair().x25519).expect("dh i"),
-            ciris_crypto::x25519::dh(s.x25519_private(), &eph_pk).expect("dh r"),
+            ciris_crypto::x25519::dh(&eph_secret, &s.pair().x25519).expect("dh i"),
+            ciris_crypto::x25519::dh(s.x25519_private(), &eph_public).expect("dh r"),
         );
     }
 
