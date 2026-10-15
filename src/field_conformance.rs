@@ -158,8 +158,9 @@ pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[
         clm: "CLM-registry-wire",
         property: "to_bytes lays out stream_id(32) | epoch u64 BE | chunk_seq u64 BE | codec_id | \
                    spatial | temporal | quality | ciphertext and from_bytes reads it back; a wire \
-                   shorter than the 52-byte header is refused at parse, and one whose ciphertext \
-                   cannot carry its AEAD tag never opens",
+                   shorter than the 52-byte header, or whose ciphertext cannot carry the outer \
+                   and inner AEAD tags, is refused at parse; a relay refuses an inner ciphertext \
+                   too short for its tag at the outer open; a tag-less ciphertext never opens",
         check: check_registry_wire,
         evidence: "src/transport/realtime_av.rs#SealedAvChunk::to_bytes",
     },
@@ -515,15 +516,15 @@ fn check_namespace_realtime() -> Result<(), String> {
 /// CIRISEdge#872 / CIRISConstitution#173 — `CLM-registry-wire` (CC 5.3.3.2.3
 /// at `acacce4`): the 52-byte header is always present.
 ///
-/// The tag-less case is refused at the AEAD, not at parse: `from_bytes` checks
-/// only the 52-byte floor, and every receive path (`realtime_av_dispatcher`,
-/// the relay pump in `realtime_av_runtime`) opens the outer seal before it
-/// uses a chunk. So the check proves that such a wire never opens, at either
-/// door, whatever `from_bytes` makes of it.
+/// Each refusal is checked at its own layer: the header and the two AEAD tags
+/// at parse, a tag-less inner ciphertext at the relay's outer open, and the
+/// AEAD for a truncated ciphertext that never went through the parser.
 fn check_registry_wire() -> Result<(), String> {
     use crate::transport::realtime_av::{
-        open_av_chunk, open_av_outer, seal_av_chunk, ChunkLayer, ChunkSeq, Epoch, EpochDek,
-        SealedAvChunk, StreamId, CHUNK_CODEC_LAYER_LEN, CHUNK_HEADER_LEN, CODEC_AV1_SVC,
+        inner_sealed_from_parts, open_av_chunk, open_av_outer, seal_av_chunk, seal_av_outer,
+        ChunkLayer, ChunkSeq, Epoch, EpochDek, RealtimeAvError, SealedAvChunk, StreamId,
+        AEAD_TAG_LEN, CHUNK_CODEC_LAYER_LEN, CHUNK_HEADER_LEN, CODEC_AV1_SVC,
+        MIN_DOUBLE_SEALED_LEN,
     };
 
     if (CHUNK_HEADER_LEN, CHUNK_CODEC_LAYER_LEN) != (48, 4) {
@@ -577,19 +578,48 @@ fn check_registry_wire() -> Result<(), String> {
             ));
         }
     }
-    // A ciphertext too short for its 16-byte AEAD tag never opens, even
-    // under the right keys and counter — at the subscriber or at a relay.
-    for extra in [0, 1, 15] {
-        let Ok(short) = SealedAvChunk::from_bytes(&wire[..52 + extra]) else {
-            continue;
+    // A ciphertext too short for the outer + inner tags is malformed:
+    // refused at parse (CIRISConstitution#173), not left to the AEAD.
+    for extra in [0, 1, AEAD_TAG_LEN - 1, MIN_DOUBLE_SEALED_LEN - 1] {
+        if !matches!(
+            SealedAvChunk::from_bytes(&wire[..52 + extra]),
+            Err(RealtimeAvError::WireTooShort { .. })
+        ) {
+            return Err(format!(
+                "a wire with {extra} ciphertext bytes cannot carry both AEAD tags and must be \
+                 refused at parse"
+            ));
+        }
+        // Built in-process, past the parser, it still never opens — at the
+        // subscriber or at a relay — even under the right keys and counter.
+        let short = SealedAvChunk {
+            double_sealed_ciphertext: sealed.double_sealed_ciphertext[..extra].to_vec(),
+            ..sealed.clone()
         };
         if open_av_chunk(&short, &transit, b"link-173", 9, &dek).is_ok()
             || open_av_outer(&short, &transit, b"link-173", 9).is_ok()
         {
             return Err(format!(
-                "a wire with {extra} ciphertext bytes carries no AEAD tag and must not open"
+                "a ciphertext of {extra} bytes carries no complete seal and must not open"
             ));
         }
+    }
+    // A relay's outer open refuses an inner ciphertext shorter than its tag,
+    // so a tag-less inner chunk is never forwarded.
+    let tagless = inner_sealed_from_parts(
+        StreamId(stream),
+        Epoch(1),
+        ChunkSeq(1),
+        CODEC_AV1_SVC,
+        layer,
+        vec![0u8; AEAD_TAG_LEN - 1],
+    );
+    let outer = seal_av_outer(&tagless, &transit, b"link-173", 10).map_err(|e| e.to_string())?;
+    if !matches!(
+        open_av_outer(&outer, &transit, b"link-173", 10),
+        Err(RealtimeAvError::InnerTooShort { .. })
+    ) {
+        return Err("a relay must refuse an inner ciphertext too short for its tag".into());
     }
     Ok(())
 }
