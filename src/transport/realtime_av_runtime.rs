@@ -565,6 +565,9 @@ impl AvRelay {
             // The upstream's drop report, kept until a frame authenticates
             // (Codex on #813 — a junk frame must not swallow it).
             let mut gap = HopGap::default();
+            // CIRISEdge#867 — an upstream link that never opens a frame runs
+            // under another link_id; end the pump rather than starve.
+            let mut guard = crate::transport::realtime_av_dispatcher::LinkIdGuard::default();
             tracing::info!(stream = %tag, "AV relay pump: started");
             loop {
                 let frame = match inbound.inbound_recv.recv_frame().await {
@@ -623,8 +626,13 @@ impl AvRelay {
                         "AV relay: inbound outer open FAILED at every candidate counter — \
                          frame not forwarded (CIRISEdge#425)"
                     );
+                    if guard.unopened() {
+                        guard.report_mismatch("relay pump", &inbound_link_id, None);
+                        break;
+                    }
                     continue;
                 };
+                guard.opened();
                 // The open consumed the counter, whatever the fan-out does,
                 // and resolved any reported gap.
                 inbound_link_seq = opened_at.wrapping_add(1);
@@ -867,6 +875,18 @@ impl AvSubscriber {
         parent: &PeerKeyId,
         inbound: AvInboundLink,
     ) -> Result<mpsc::Receiver<ReconstructedChunk>, AvRuntimeError> {
+        Self::subscribe_counted(stream_id, dek, parent, inbound, None)
+    }
+
+    /// [`Self::subscribe`], counting a `link_id` mismatch (CIRISEdge#867) on
+    /// `metrics`.
+    fn subscribe_counted(
+        stream_id: StreamId,
+        dek: &EpochDek,
+        parent: &PeerKeyId,
+        inbound: AvInboundLink,
+        metrics: Option<&crate::observability::EdgeMetrics>,
+    ) -> Result<mpsc::Receiver<ReconstructedChunk>, AvRuntimeError> {
         let mut dispatcher = AvDispatcher::new(AvDispatcherConfig {
             stream_id,
             local_role: AvRole::Subscriber,
@@ -874,7 +894,7 @@ impl AvSubscriber {
             initial_subscribers: Vec::new(),
             inbound_links: vec![inbound],
         })?;
-        let rx = dispatcher.spawn_subscriber_loop();
+        let rx = dispatcher.spawn_subscriber_loop_counted(metrics);
         tracing::info!(
             stream = %stream_tag(stream_id),
             parent = %parent,
@@ -921,7 +941,7 @@ impl AvSubscriber {
         let dek = EpochDek::from_bytes(*dek.as_bytes());
         forward_leg(
             Leg::Relay,
-            Self::subscribe(stream_id, &dek, &relay, relay_leg)?,
+            Self::subscribe_counted(stream_id, &dek, &relay, relay_leg, metrics.as_ref())?,
             event_tx.clone(),
         );
         let mut choice = LegChoice::new(stream_id, publisher.clone(), relay.clone());
@@ -955,9 +975,11 @@ impl AvSubscriber {
                         // The direct leg's link ended: the crisp fallback
                         // signal (the publisher closes it on a dead path).
                         Some((Leg::Direct, None)) => choice.direct_closed(),
-                        // A relay leg ends when this subscriber dropped it,
-                        // or the relay went away; the host owns rejoining.
-                        Some((Leg::Relay, None)) => None,
+                        // A relay leg ends when this subscriber dropped it
+                        // (nothing to do), or underneath it: the relay went
+                        // away, or the leg was ended as a link_id mismatch
+                        // (CIRISEdge#867). Then the host dials it again.
+                        Some((Leg::Relay, None)) => choice.relay_closed(),
                         None => return,
                     },
                     added = control_rx.recv() => match added {
@@ -966,7 +988,13 @@ impl AvSubscriber {
                                 Leg::Direct => &publisher,
                                 Leg::Relay => &relay,
                             };
-                            match Self::subscribe(stream_id, &dek, parent, link) {
+                            match Self::subscribe_counted(
+                                stream_id,
+                                &dek,
+                                parent,
+                                link,
+                                metrics.as_ref(),
+                            ) {
                                 Ok(rx) => {
                                     match leg {
                                         Leg::Direct => choice.direct_up(now_ms()),

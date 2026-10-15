@@ -27,6 +27,9 @@
 //!   ([`DedupRing`] inside [`MultiParentSubscription`]): bounded, O(1) per
 //!   chunk, one per stream. It is NOT reset on a switch, so a chunk that
 //!   arrives on both sides of a switch is still caught.
+//! - **A relay leg that ends underneath the subscriber** (the relay went
+//!   away, or the leg was ended as a `link_id` mismatch, CIRISEdge#867) also
+//!   emits [`LegAction::RejoinRelay`]; one the subscriber dropped does not.
 //! - **Fallback.** The direct leg closing (the publisher's
 //!   `fall_back_from_direct` closes it, and the inbound ends) or going silent
 //!   for [`PARENT_SILENCE_HEAL_MS`](crate::transport::realtime_av_alm::PARENT_SILENCE_HEAL_MS)
@@ -203,6 +206,22 @@ impl LegChoice {
     /// still there and nothing needs doing.
     pub fn direct_closed(&mut self) -> Option<LegAction> {
         self.leave_direct()
+    }
+
+    /// The relay leg's link ended. In [`LegState::DirectOnly`] this subscriber
+    /// dropped it ([`LegAction::DropRelay`]) and nothing needs doing. Anywhere
+    /// else the subscriber still relies on it, and it ended underneath them:
+    /// the relay went away, or the leg was ended as a `link_id` mismatch
+    /// (CIRISEdge#867). Returns [`LegAction::RejoinRelay`] so the host dials it
+    /// again instead of the stream going quiet.
+    pub fn relay_closed(&mut self) -> Option<LegAction> {
+        if self.state == LegState::DirectOnly {
+            return None;
+        }
+        self.sub.apply_heal(
+            crate::transport::realtime_av_alm::HealApplyOutcome::RemoveParent(self.relay.clone()),
+        );
+        Some(LegAction::RejoinRelay)
     }
 
     /// Periodic check, every ~`HEARTBEAT_INTERVAL_MS`: a direct leg silent for
@@ -394,5 +413,29 @@ mod tests {
         assert!(relay_admits(&table, dialled.as_ref(), "member"));
         assert!(!relay_admits(&table, dialled.as_ref(), "outsider"));
         assert!(!relay_admits(&table, None, "member"), "no address: refused");
+    }
+
+    /// CIRISEdge#867 — a relay leg that ends underneath the subscriber is
+    /// re-dialled; one the subscriber dropped is not.
+    #[test]
+    fn a_relay_leg_that_ends_underneath_is_rejoined_867() {
+        let mut c = choice();
+        assert_eq!(c.relay_closed(), Some(LegAction::RejoinRelay), "relay only");
+        let mut c = choice();
+        c.direct_up(0);
+        assert_eq!(c.relay_closed(), Some(LegAction::RejoinRelay), "overlap");
+        let mut c = choice();
+        c.direct_up(0);
+        let mut seq = 0;
+        let dropped = loop {
+            let (_, action) = c.on_chunk(Leg::Direct, Epoch(1), ChunkSeq(seq), seq * 100);
+            seq += 1;
+            if action == Some(LegAction::DropRelay) {
+                break true;
+            }
+            assert!(seq < 100, "the direct leg confirms");
+        };
+        assert!(dropped);
+        assert_eq!(c.relay_closed(), None, "the subscriber dropped it itself");
     }
 }
