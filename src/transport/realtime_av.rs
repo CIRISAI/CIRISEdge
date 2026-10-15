@@ -800,6 +800,30 @@ pub fn open_av_chunk(
         .map_err(RealtimeAvError::InnerAead)
 }
 
+/// CIRISEdge#805 item 5 — open the INNER (E2E) layer of a chunk whose outer
+/// hop was already removed ([`open_av_outer`] / a relay's `open_hop_outer`):
+/// the receiver half of [`seal_av_inner`]. A call's receiver opens the outer
+/// per link and the inner per `(stream, epoch)` DEK, which it resolves from
+/// the chunk's own header.
+///
+/// # Errors
+/// [`RealtimeAvError::InnerAead`] when `epoch_dek` is not the chunk's.
+pub fn open_av_inner(
+    inner: &InnerSealed,
+    epoch_dek: &EpochDek,
+) -> Result<Vec<u8>, RealtimeAvError> {
+    let inner_nonce = derive_inner_nonce(inner.stream_id, inner.epoch, inner.chunk_seq);
+    aes_gcm::decrypt(epoch_dek.as_bytes(), &inner_nonce, &inner.inner_ciphertext)
+        .map_err(RealtimeAvError::InnerAead)
+}
+
+/// CIRISEdge#805 item 5 (#720) — the bytes a chunk adds to its plaintext on
+/// the wire: the clear header and codec/layer block plus the inner and the
+/// outer AEAD tags. A link whose Channel carries `limit` bytes carries a
+/// plaintext of at most `limit - AV_CHUNK_WIRE_OVERHEAD`.
+pub const AV_CHUNK_WIRE_OVERHEAD: usize =
+    CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN + 2 * AEAD_TAG_LEN;
+
 /// Open ONLY the per-link outer AEAD, recovering the still-E2E-sealed
 /// inner chunk. The relay holds no [`EpochDek`]; the inner layer is
 /// never opened here — only the outer hop is removed.

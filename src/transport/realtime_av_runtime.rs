@@ -126,6 +126,44 @@ pub enum AvRuntimeError {
     /// ALM parent selection found no feasible parent.
     #[error("parent selection: {0}")]
     Join(#[from] AlmJoinError),
+    /// CIRISEdge#805 item 5 — an MLS verb on a ROOM-keyed publisher: its
+    /// epochs move only on its room's commits ([`AvPublisher::roll_room_epoch`]),
+    /// never on a call verb.
+    #[error("this publisher is keyed by its room ({room}): {verb} is the room's to do")]
+    RoomKeyed {
+        /// The room's `community_key_id`.
+        room: String,
+        /// The refused verb.
+        verb: &'static str,
+    },
+    /// CIRISEdge#805 item 5 — a room roll asked of a publisher keyed by its
+    /// own per-stream session (its own commits move it).
+    #[error("this publisher is keyed by its own MLS session, not a room")]
+    NotRoomKeyed,
+    /// CIRISEdge#805 item 5 — a room roll that does not move the epoch forward.
+    #[error("room epoch roll from {from} to {to} does not move forward")]
+    EpochNotForward {
+        /// The publisher's epoch.
+        from: u64,
+        /// The epoch asked for.
+        to: u64,
+    },
+}
+
+/// CIRISEdge#805 item 5 — where a publisher's epoch DEKs come from
+/// (`FSD/AV_CALL_API.md` §3.2, §5: the room binding sits UNDER the keep
+/// layer and changes the DEK's source, not its contract).
+pub enum AvKeySource {
+    /// The pre-item-5 shape: a per-stream MLS group whose exporter yields the
+    /// DEK and whose own commits move the epoch.
+    Session(AvSession),
+    /// A room call: the DEK is `av_call_key::stream_epoch_dek` over the
+    /// ROOM's MLS group, supplied at each room epoch; the publisher never
+    /// commits (the call's epoch IS the room's, CC C2).
+    Room {
+        /// The room's `community_key_id`.
+        community_key_id: String,
+    },
 }
 
 /// Short, stable, whitespace-free stream tag for structured tracing.
@@ -155,7 +193,7 @@ fn stream_tag(stream_id: StreamId) -> String {
 /// [`EpochDek`] + epoch counter; the dispatcher is untouched.
 pub struct AvPublisher {
     stream_id: StreamId,
-    session: AvSession,
+    key_source: AvKeySource,
     epoch: Epoch,
     /// Current epoch's MLS-derived DEK. Replaced on rekey.
     dek: EpochDek,
@@ -221,12 +259,93 @@ impl AvPublisher {
         );
         Ok(Self {
             stream_id,
-            session,
+            key_source: AvKeySource::Session(session),
             epoch,
             dek,
             dispatcher,
             next_chunk_seq: 0,
         })
+    }
+
+    /// CIRISEdge#805 item 5 — a ROOM-keyed publisher (`FSD/AV_CALL_API.md`
+    /// §3.2): `dek` is `stream_epoch_dek(room, stream_id, epoch)` at the
+    /// room's current epoch. It never mints or commits a group; the room
+    /// moves its epoch and the caller rolls it with [`Self::roll_room_epoch`].
+    ///
+    /// # Errors
+    /// [`AvRuntimeError::Dispatcher`] if the dispatcher rejects its config.
+    pub fn from_room_key(
+        stream_id: StreamId,
+        community_key_id: &str,
+        epoch: Epoch,
+        dek: EpochDek,
+        subscribers: Vec<AvSubscriberLink>,
+    ) -> Result<Self, AvRuntimeError> {
+        let dispatcher = AvDispatcher::new(AvDispatcherConfig {
+            stream_id,
+            local_role: AvRole::Publisher,
+            epoch_dek: Some(*dek.as_bytes()),
+            initial_subscribers: subscribers,
+            inbound_links: Vec::new(),
+        })?;
+        tracing::info!(
+            stream = %stream_tag(stream_id),
+            room = %community_key_id,
+            epoch = epoch.0,
+            "AV publisher created, keyed by its room's MLS group (CIRISEdge#805 item 5)"
+        );
+        Ok(Self {
+            stream_id,
+            key_source: AvKeySource::Room {
+                community_key_id: community_key_id.to_owned(),
+            },
+            epoch,
+            dek,
+            dispatcher,
+            next_chunk_seq: 0,
+        })
+    }
+
+    /// CIRISEdge#805 item 5 — the room moved to `epoch`: adopt its DEK and
+    /// restart the epoch-local chunk counter (#846). Only a room-keyed
+    /// publisher rolls this way, and only forward.
+    ///
+    /// # Errors
+    /// [`AvRuntimeError::NotRoomKeyed`] for a session-keyed publisher (its
+    /// own commits move it); [`AvRuntimeError::EpochNotForward`].
+    pub fn roll_room_epoch(&mut self, epoch: Epoch, dek: EpochDek) -> Result<(), AvRuntimeError> {
+        let AvKeySource::Room { community_key_id } = &self.key_source else {
+            return Err(AvRuntimeError::NotRoomKeyed);
+        };
+        if epoch.0 <= self.epoch.0 {
+            return Err(AvRuntimeError::EpochNotForward {
+                from: self.epoch.0,
+                to: epoch.0,
+            });
+        }
+        tracing::info!(
+            stream = %stream_tag(self.stream_id),
+            room = %community_key_id,
+            from = self.epoch.0,
+            to = epoch.0,
+            "AV publisher ROLL: the room's epoch moved; new DEK, chunk_seq back to 0"
+        );
+        self.dek = dek;
+        self.epoch = epoch;
+        self.next_chunk_seq = 0;
+        Ok(())
+    }
+
+    /// CIRISEdge#805 item 5 — the next chunk's epoch-local sequence number.
+    #[must_use]
+    pub fn next_chunk_seq(&self) -> ChunkSeq {
+        ChunkSeq(self.next_chunk_seq)
+    }
+
+    /// CIRISEdge#805 item 5 — the publisher's dispatcher, for the per-leg
+    /// fan-out and the relay-side layer policy of a room call.
+    pub(crate) fn dispatcher_mut(&mut self) -> &mut AvDispatcher {
+        &mut self.dispatcher
     }
 
     /// The stream this publisher drives.
@@ -249,9 +368,25 @@ impl AvPublisher {
     /// design; every mutation of the session still runs through
     /// [`Self::admit_joiner`] / [`Self::advance_epoch`], so an epoch can
     /// never move without this struct's DEK moving with it.
+    ///
+    /// `None` for a ROOM-keyed publisher (CIRISEdge#805 item 5): its group
+    /// is the room's, addressed by the room's lifecycle.
     #[must_use]
-    pub fn session(&self) -> &AvSession {
-        &self.session
+    pub fn session(&self) -> Option<&AvSession> {
+        match &self.key_source {
+            AvKeySource::Session(session) => Some(session),
+            AvKeySource::Room { .. } => None,
+        }
+    }
+
+    fn session_mut(&mut self, verb: &'static str) -> Result<&mut AvSession, AvRuntimeError> {
+        match &mut self.key_source {
+            AvKeySource::Session(session) => Ok(session),
+            AvKeySource::Room { community_key_id } => Err(AvRuntimeError::RoomKeyed {
+                room: community_key_id.clone(),
+                verb,
+            }),
+        }
     }
 
     /// CIRISEdge#847 — this epoch's per-(stream, epoch) DEK, the key a
@@ -419,7 +554,7 @@ impl AvPublisher {
         inviter_signer: &MlDsa65Signer,
         inviter_pk_id: &str,
     ) -> Result<EpochRekeyArtifacts, AvRuntimeError> {
-        let artifacts = self.session.admit_published_joiner(
+        let artifacts = self.session_mut("admit_joiner")?.admit_published_joiner(
             key_id,
             joiner_key_package,
             invitee_kex,
@@ -455,7 +590,7 @@ impl AvPublisher {
         &mut self,
         delta: RosterDelta,
     ) -> Result<EpochRekeyArtifacts, AvRuntimeError> {
-        let artifacts = self.session.advance_epoch(delta)?;
+        let artifacts = self.session_mut("advance_epoch")?.advance_epoch(delta)?;
         self.dek = EpochDek::from_bytes(*artifacts.new_dek.as_bytes());
         self.epoch = artifacts.new_epoch;
         // CIRISEdge#846 — the STREAM counter is epoch-local (CC 5.3.3.2.5).

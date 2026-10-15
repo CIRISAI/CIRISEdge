@@ -169,6 +169,44 @@ pub trait StreamDekRegistrar: Send + Sync {
     ) -> Result<(), BlobError>;
 }
 
+/// CIRISEdge#805 item 5 — the registrar of a node with no keep door wired:
+/// every registration is refused by name. A kept stream is refused before it
+/// reaches any door today (CIRISPersist#1067), and an unkept one never does.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnwiredRegistrar;
+
+#[async_trait]
+impl StreamDekRegistrar for UnwiredRegistrar {
+    async fn register_stream_epoch_dek(
+        &self,
+        _target: &AvKeepTarget,
+        stream_id: &str,
+        epoch: u64,
+        _dek: &[u8; 32],
+    ) -> Result<(), BlobError> {
+        Err(BlobError::InvalidArgument(format!(
+            "no stream-DEK registrar is wired on this node: {stream_id} epoch {epoch} cannot be \
+             kept"
+        )))
+    }
+}
+
+/// A shared registrar (a `Call` holds its node's as `Arc<dyn …>`).
+#[async_trait]
+impl<T: StreamDekRegistrar + ?Sized> StreamDekRegistrar for Arc<T> {
+    async fn register_stream_epoch_dek(
+        &self,
+        target: &AvKeepTarget,
+        stream_id: &str,
+        epoch: u64,
+        dek: &[u8; 32],
+    ) -> Result<(), BlobError> {
+        (**self)
+            .register_stream_epoch_dek(target, stream_id, epoch, dek)
+            .await
+    }
+}
+
 #[async_trait]
 impl StreamDekRegistrar for ciris_persist::Engine {
     async fn register_stream_epoch_dek(
@@ -253,6 +291,64 @@ impl<R: StreamDekRegistrar> KeptAvPublisher<R> {
         };
         let outcome = me.register_current().await;
         Ok((me, outcome))
+    }
+
+    /// CIRISEdge#805 item 5 — create a ROOM-keyed stream
+    /// ([`AvPublisher::from_room_key`], `FSD/AV_CALL_API.md` §3.2, §5): the
+    /// epoch DEK is the room's `stream_epoch_dek`, and the keep layer runs
+    /// over it exactly as over a session's. When kept, the current epoch is
+    /// registered (today: refused by name, CIRISPersist#1067).
+    ///
+    /// # Errors
+    /// The dispatcher rejected its config ([`AvRuntimeError`]).
+    #[allow(clippy::too_many_arguments)] // the room publisher's inputs plus the keep inputs
+    pub async fn create_room_keyed(
+        stream_id: StreamId,
+        community_key_id: &str,
+        epoch: Epoch,
+        dek: crate::transport::realtime_av::EpochDek,
+        keep: AvKeep,
+        target: AvKeepTarget,
+        registrar: R,
+        events: Option<Arc<crate::events::EventBus>>,
+    ) -> Result<(Self, KeepOutcome), AvRuntimeError> {
+        let inner =
+            AvPublisher::from_room_key(stream_id, community_key_id, epoch, dek, Vec::new())?;
+        let mut me = Self {
+            inner,
+            registrar,
+            target,
+            keep,
+            refused: None,
+            registered: BTreeSet::new(),
+            events,
+        };
+        let outcome = me.register_current().await;
+        Ok((me, outcome))
+    }
+
+    /// CIRISEdge#805 item 5 — the room moved to `epoch`
+    /// ([`AvPublisher::roll_room_epoch`]); register the new epoch when kept.
+    /// Every epoch move of a room-keyed stream passes through here, so a
+    /// kept stream cannot move an epoch without registering it.
+    ///
+    /// # Errors
+    /// The roll was refused (not room-keyed, or not forward).
+    pub async fn roll_room_epoch(
+        &mut self,
+        epoch: Epoch,
+        dek: crate::transport::realtime_av::EpochDek,
+    ) -> Result<KeepOutcome, AvRuntimeError> {
+        self.inner.roll_room_epoch(epoch, dek)?;
+        Ok(self.register_current().await)
+    }
+
+    /// CIRISEdge#805 item 5 — the publisher's dispatcher (per-leg fan-out,
+    /// layer policy, roster).
+    pub(crate) fn dispatcher_mut(
+        &mut self,
+    ) -> &mut crate::transport::realtime_av_dispatcher::AvDispatcher {
+        self.inner.dispatcher_mut()
     }
 
     /// Admit a published joiner ([`AvPublisher::admit_joiner`]) and register
