@@ -288,6 +288,17 @@ async fn side_cfg(
     base: &std::path::Path,
     shape: impl Fn(ReticulumTransportConfig) -> ReticulumTransportConfig,
 ) -> Side {
+    side_cfg_auth(key, dir, base, shape, |a| a).await
+}
+
+/// [`side_cfg`], with the transport's auth shaped by `shape_auth` too.
+async fn side_cfg_auth(
+    key: Ident,
+    dir: &Arc<SqliteBackend>,
+    base: &std::path::Path,
+    shape: impl Fn(ReticulumTransportConfig) -> ReticulumTransportConfig,
+    shape_auth: impl Fn(ReticulumAuth) -> ReticulumAuth,
+) -> Side {
     let mut transport = None;
     let mut port = 0;
     for _ in 0..16 {
@@ -296,7 +307,7 @@ async fn side_cfg(
         c.listen_addr = format!("127.0.0.1:{port}").parse().unwrap();
         c.announce_interval = Duration::from_secs(5);
         let c = shape(c);
-        match ReticulumTransport::new(c, auth(key.signer(), dir)).await {
+        match ReticulumTransport::new(c, shape_auth(auth(key.signer(), dir))).await {
             Ok(t) => {
                 transport = Some(Arc::new(t));
                 break;
@@ -1522,5 +1533,291 @@ async fn the_transit_kex_refuses_a_false_claim_and_a_missing_pair_by_name() {
     assert!(
         nothing.is_err(),
         "the refused dial sent nothing, so nothing arrived at R"
+    );
+}
+
+// ─── CIRISEdge#541/#805 — one occurrence key id under use_node_identity ─
+
+/// A software `TransportIdentityKeystore` in `dir`: the keystore-backed path
+/// `use_node_identity` deployments run.
+fn software_keystore(dir: &std::path::Path) -> Arc<dyn ciris_keyring::TransportIdentityKeystore> {
+    let storage = ciris_keyring::storage::SoftwareSecureBlobStorage::new("split-805", dir)
+        .expect("software blob storage");
+    Arc::new(ciris_keyring::BlobTransportKeystore::new(Box::new(storage)))
+}
+
+/// One node as `use_node_identity` builds it (pyo3's #541 wiring): the
+/// advertised id and the signer are the NODE's, a keystore holds the RNS
+/// identity and the transit seed, and they are stored under the ACTOR's id
+/// (`transport_identity_storage_key`), which differs.
+async fn split_side(
+    key: Ident,
+    actor_id: &str,
+    dir: &Arc<SqliteBackend>,
+    base: &std::path::Path,
+    shape: impl Fn(ReticulumTransportConfig) -> ReticulumTransportConfig,
+) -> (Side, Arc<dyn ciris_keyring::TransportIdentityKeystore>) {
+    let keystore = software_keystore(&base.join("keystore"));
+    let ks = Arc::clone(&keystore);
+    let actor = actor_id.to_owned();
+    let side = side_cfg_auth(
+        key,
+        dir,
+        base,
+        move |c| {
+            let mut c = shape(c);
+            c.transport_identity_storage_key = Some(actor.clone());
+            c
+        },
+        move |a| ReticulumAuth {
+            transport_identity_keystore: Some(Arc::clone(&ks)),
+            ..a
+        },
+    )
+    .await;
+    (side, keystore)
+}
+
+/// **W8** (CIRISEdge#541/#805) — under `use_node_identity` the advertised id
+/// (the node's) and the actor's id differ. ONE occurrence key id is
+/// advertised, published, looked up and named in both halves of the transit
+/// KEX; the actor's id only names keystore entries. A dial between two such
+/// nodes handshakes and carries media.
+#[allow(clippy::too_many_lines)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_occurrence_key_id_keys_a_hop_under_use_node_identity() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key_r = Ident::new("node-r-dl-w8", 0x4a).await;
+    let key_a = Ident::new("node-a-dl-w8", 0x4b).await;
+    let records = vec![key_r.record().await, key_a.record().await];
+    let r_dir = directory_with(records.clone()).await;
+    let a_dir = directory_with(records).await;
+    let (r_id, a_id) = (key_r.key_id.clone(), key_a.key_id.clone());
+    let (r_actor, a_actor) = ("actor-r-w8".to_owned(), "actor-a-w8".to_owned());
+
+    let (r, r_keystore) = split_side(key_r, &r_actor, &r_dir, &tmp.path().join("r"), |c| {
+        c.with_transport_node(true)
+    })
+    .await;
+    let r_port = r.port;
+    let (a, _a_keystore) = split_side(key_a, &a_actor, &a_dir, &tmp.path().join("a"), move |c| {
+        let mut c = c;
+        c.bootstrap_peers = vec![format!("127.0.0.1:{r_port}").parse().unwrap()];
+        c
+    })
+    .await;
+    assert_eq!(r.transport.occurrence_key_id(), r_id);
+    assert_eq!(a.transport.occurrence_key_id(), a_id);
+    assert!(!r.transport.signer_id_mismatch() && !a.transport.signer_id_mismatch());
+    assert_eq!(r.metrics.transport_signer_id_mismatch(), 0);
+    // The actor's id names only the keystore entries, the transit seed's too.
+    assert!(
+        r_keystore
+            .load(&format!("transit-kex:v1:{r_actor}"))
+            .expect("keystore read")
+            .is_some(),
+        "R's transit seed is stored under the actor's id"
+    );
+    assert!(r_keystore
+        .load(&format!("transit-kex:v1:{r_id}"))
+        .expect("keystore read")
+        .is_none());
+
+    // Each holds the other's signed route: published under the node id.
+    for (from, from_id, to) in [(&r_dir, &r_id, &a_dir), (&a_dir, &a_id, &r_dir)] {
+        let routes = from
+            .list_signed_transport_destinations_for(from_id)
+            .await
+            .expect("list routes");
+        assert!(!routes.is_empty(), "{from_id} published its route");
+        for route in &routes {
+            FederationDirectory::put_signed_transport_destination(&**to, route)
+                .await
+                .expect("seed the route");
+        }
+    }
+    assert!(
+        ciris_persist::federation::self_at_login::transit_kex_pair_for(&*a_dir, &r_id)
+            .await
+            .expect("resolve")
+            .is_some(),
+        "R's pair resolves under its node id"
+    );
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            a.transport.knows_peer(&r_id).await && r.transport.knows_peer(&a_id).await
+        })
+        .await,
+        "A and R learn each other"
+    );
+    let members = [a_id.as_str(), r_id.as_str()];
+    install_legs_group(&r, &members);
+    install_legs_group(&a, &members);
+    let mut r_arrivals = r.transport.take_av_arrivals().expect("R's arrivals");
+
+    // A dials R: the handshake names A's node id as initiator and R's as
+    // responder; R answers it as its node id; media flows.
+    let a_r = a
+        .transport
+        .open_av_link(&r_id, &legs_address(&a, &r_id))
+        .await
+        .expect("A's dial handshakes under the node ids");
+    let arrival = next_arrival(&mut r_arrivals, &a_id).await;
+    let accepted = r
+        .transport
+        .accept_av_arrival(arrival)
+        .await
+        .expect("R answers as its node id; the claim is A's node id");
+    let mut publisher = AvDispatcher::new(AvDispatcherConfig {
+        stream_id: legs_stream(),
+        local_role: AvRole::Publisher,
+        epoch_dek: Some(LEGS_DEK),
+        initial_subscribers: vec![AvSubscriberLink {
+            subscriber: r_id.clone(),
+            transit_key: a_r.transit.seal_key(),
+            link_id: a_r.link_id.to_vec(),
+            outbound_send: Box::new(a_r.sender),
+        }],
+        inbound_links: vec![],
+    })
+    .expect("A's publisher");
+    let mut chunks = AvSubscriber::subscribe(
+        legs_stream(),
+        &EpochDek::from_bytes(LEGS_DEK),
+        &a_id,
+        AvInboundLink {
+            transit_key: accepted.transit.open_key(),
+            link_id: accepted.arrival.link_id.to_vec(),
+            inbound_recv: Box::new(accepted.arrival.inbound),
+        },
+    )
+    .expect("R subscribes on the keyed hop");
+    for seq in 0..10u64 {
+        let _ = publisher.publish_inner(legs_chunk(seq)).await;
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+    let got = tokio::time::timeout(Duration::from_secs(10), chunks.recv())
+        .await
+        .expect("media in time")
+        .expect("a chunk");
+    assert_eq!(got.stream_id, legs_stream(), "R opened A's media");
+    assert_eq!(
+        a.metrics
+            .av_plane()
+            .get("av_transit_kex_initiated")
+            .copied(),
+        Some(1)
+    );
+    assert_eq!(
+        r.metrics.av_plane().get("av_transit_kex_accepted").copied(),
+        Some(1)
+    );
+}
+
+/// **W9** (CIRISEdge#541/#805) — a host wired the way CIRISServer's
+/// `build_edge` wires a split node today: it ADVERTISES the node id
+/// (`local_key_id`) but passes the ACTOR's signer. Edge must not brick it:
+///
+/// - the transport still BUILDS, and says so on the
+///   `transport_signer_id_mismatch` gauge (and one startup error log);
+/// - its signed route (and transit pair) is published under the signer's
+///   id, the only id persist lets that signer publish for, so none is
+///   resolvable under the advertised id;
+/// - a dial to it by the advertised id is refused BY NAME as
+///   `av_transit_refused_no_pair` before any link is made, never a silent
+///   drop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_signing_as_another_id_builds_and_is_refused_by_name() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let key_r = Ident::new("node-r-dl-w9", 0x5a).await;
+    let actor_r = Ident::new("actor-r-dl-w9", 0x5b).await;
+    let key_a = Ident::new("node-a-dl-w9", 0x5c).await;
+    let records = vec![
+        key_r.record().await,
+        actor_r.record().await,
+        key_a.record().await,
+    ];
+    let r_dir = directory_with(records.clone()).await;
+    let a_dir = directory_with(records).await;
+    let (r_id, a_id, actor_id) = (
+        key_r.key_id.clone(),
+        key_a.key_id.clone(),
+        actor_r.key_id.clone(),
+    );
+
+    // Server-style: advertises the node id, signs as the actor. It builds.
+    let actor_signer = actor_r.signer();
+    let r = side_cfg_auth(
+        key_r,
+        &r_dir,
+        &tmp.path().join("r"),
+        |c| c,
+        move |a| ReticulumAuth {
+            signer: Some(Arc::clone(&actor_signer)),
+            ..a
+        },
+    )
+    .await;
+    assert_eq!(
+        r.transport.occurrence_key_id(),
+        r_id,
+        "it advertises the node id"
+    );
+    assert!(r.transport.signer_id_mismatch());
+    assert_eq!(
+        r.metrics.transport_signer_id_mismatch(),
+        1,
+        "the mismatch is on the operator's gauge"
+    );
+    assert_eq!(r.metrics.snapshot().transport_signer_id_mismatch, 1);
+
+    // Its route went out under the signer's id, not the advertised one.
+    let under_actor = r_dir
+        .list_signed_transport_destinations_for(&actor_id)
+        .await
+        .expect("list");
+    assert!(!under_actor.is_empty(), "published under the signer's id");
+    assert!(r_dir
+        .list_signed_transport_destinations_for(&r_id)
+        .await
+        .expect("list")
+        .is_empty());
+    for route in &under_actor {
+        FederationDirectory::put_signed_transport_destination(&*a_dir, route)
+            .await
+            .expect("seed the route at A");
+    }
+
+    // A dials R by the id R advertises: refused by name, before any link.
+    let a = side_cfg(key_a, &a_dir, &tmp.path().join("a"), |c| c).await;
+    let members = [a_id.as_str(), r_id.as_str()];
+    install_legs_group(&r, &members);
+    install_legs_group(&a, &members);
+    let mut r_arrivals = r.transport.take_av_arrivals().expect("R's arrivals");
+    match a
+        .transport
+        .open_av_link(&r_id, &legs_address(&a, &r_id))
+        .await
+    {
+        Err(TransportError::AvTransitRefused { peer, reason, .. }) => {
+            assert_eq!(peer, r_id);
+            assert_eq!(reason, "av_transit_refused_no_pair");
+        }
+        other => panic!("a dial to the mismatched host must be refused by name: {other:?}"),
+    }
+    assert_eq!(
+        a.metrics
+            .av_plane()
+            .get("av_transit_refused_no_pair")
+            .copied(),
+        Some(1)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), r_arrivals.recv())
+            .await
+            .is_err(),
+        "nothing was dialled, so nothing arrived"
     );
 }

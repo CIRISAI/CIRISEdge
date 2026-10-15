@@ -1415,6 +1415,14 @@ pub struct EdgeMetrics {
     /// refresh overwrite the others and move the total backward (Codex,
     /// #810).
     pub known_destination_evictions: Arc<RwLock<HashMap<u64, u64>>>,
+    /// CIRISEdge#541/#805 — Reticulum transports whose federation signer is
+    /// NOT the identity they advertise: 1 per such transport (keyed by its
+    /// metrics source id, as `known_destination_evictions` is), summed on
+    /// read. Such a node publishes its signed route and transit KEX pair
+    /// under the signer's id while peers know it by the advertised one, so
+    /// peers cannot root it or key an A/V hop to it. Zero on a correctly
+    /// wired host; the fix is the host's (pass the advertised id's signer).
+    pub transport_signer_id_mismatch: Arc<RwLock<HashMap<u64, u64>>>,
     /// CIRISEdge#819 — the Reticulum dial pools' size, ONE entry PER
     /// TRANSPORT INSTANCE (keyed by its metrics source id, as
     /// `known_destination_evictions` is): `(total pooled links, the most
@@ -1994,6 +2002,24 @@ impl EdgeMetrics {
         self.known_destination_evictions
             .write()
             .insert(source, evictions);
+    }
+
+    /// CIRISEdge#541/#805 — record whether transport `source`'s signer is
+    /// not the identity it advertises (1) or is (0).
+    pub fn set_transport_signer_id_mismatch(&self, source: u64, mismatched: bool) {
+        self.transport_signer_id_mismatch
+            .write()
+            .insert(source, u64::from(mismatched));
+    }
+
+    /// CIRISEdge#541/#805 — transports whose signer is not the identity they
+    /// advertise. Zero on a correctly wired host.
+    #[must_use]
+    pub fn transport_signer_id_mismatch(&self) -> u64 {
+        self.transport_signer_id_mismatch
+            .read()
+            .values()
+            .fold(0u64, |acc, v| acc.saturating_add(*v))
     }
 
     /// CIRISEdge#809 — known-destination evictions across every transport
@@ -2637,6 +2663,7 @@ impl EdgeMetrics {
             announce_intake_evictions: self.announce_intake_evictions(),
             transport_packets_dropped: self.transport_packets_dropped(),
             known_destination_evictions: self.known_destination_evictions(),
+            transport_signer_id_mismatch: self.transport_signer_id_mismatch(),
             link_pool_links: self.link_pool_links(),
             link_pool_max_per_destination: self.link_pool_max_per_destination(),
             link_pool_closed_by_reason: self.link_pool_closed_by_reason(),
@@ -2917,6 +2944,10 @@ pub struct EdgeMetricsBundle {
     /// known-destinations store, mirrored at the last transport readback.
     /// Zero with room; climbing = at cap, unretained LRU destinations going.
     pub known_destination_evictions: u64,
+    /// CIRISEdge#541/#805 — transports whose federation signer is not the
+    /// identity they advertise (peers cannot root them or key an A/V hop to
+    /// them). Zero on a correctly wired host.
+    pub transport_signer_id_mismatch: u64,
     /// CIRISEdge#819 — pooled Reticulum links (identity + scoped), at the
     /// transport's last pool-reaper pass.
     pub link_pool_links: u64,
@@ -3224,6 +3255,10 @@ impl EdgeMetricsBundle {
                 "known_destination_evictions",
                 self.known_destination_evictions,
             ),
+            (
+                "transport_signer_id_mismatch",
+                self.transport_signer_id_mismatch,
+            ),
             ("link_before_binding", self.link_before_binding),
             (
                 "announce_queue_drop_first_seen",
@@ -3409,6 +3444,7 @@ edge_metrics_bundle_fields!(
     announce_intake_evictions,
     transport_packets_dropped,
     known_destination_evictions,
+    transport_signer_id_mismatch,
     link_pool_links,
     link_pool_max_per_destination,
     link_pool_closed_by_reason,

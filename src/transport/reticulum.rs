@@ -3063,6 +3063,29 @@ impl ReticulumTransport {
                     .to_string(),
             ));
         };
+        // CIRISEdge#541/#805 — ONE occurrence key id: the ADVERTISED one,
+        // `config.local_key_id`, what peers know this node by and dial. The
+        // announce advertises it and both halves of every A/V transit KEX
+        // name it ([`Self::occurrence_key_id`]). The signed route (and with
+        // it the transit pair) can only be published under the SIGNER's id,
+        // because persist verifies the signer acts for the row. So a host
+        // that passes a signer for another id (an actor's, on a split node)
+        // runs a node peers cannot root or key an A/V hop to: every dial to
+        // it is refused by name as `av_transit_refused_no_pair`. Refusing to
+        // build would brick such a host on upgrade, so this says so ONCE,
+        // loudly, and the `transport_signer_id_mismatch` gauge carries it;
+        // the structural fix is the host's.
+        if local_signer.key_id != config.local_key_id {
+            tracing::error!(
+                advertised = %config.local_key_id,
+                signer = %local_signer.key_id,
+                "this node's signed route and transit KEX pair are published under {} but it \
+                 advertises {}; peers cannot root it or key an A/V hop to it. Pass the signer \
+                 for the advertised id (CIRISEdge#541)",
+                local_signer.key_id,
+                config.local_key_id,
+            );
+        }
         // CIRISEdge#436 — validate + pin this node's OWN build-attestation
         // bundle BEFORE composing the announce attestation, so the announce
         // can carry the manifest commitment from the very first announce.
@@ -4304,6 +4327,7 @@ impl ReticulumTransport {
             // `Edge::spawn_background_listeners` finds already attached.
             let _ = self.metrics.set(m);
         }
+        self.report_signer_id_mismatch();
         self
     }
 
@@ -5069,6 +5093,35 @@ impl ReticulumTransport {
         }
     }
 
+    /// CIRISEdge#541/#805 — THE occurrence key id this node is known and
+    /// dialled by: the ADVERTISED id (`config.local_key_id`). The announce
+    /// advertises it, its A/V handshakes name it (initiator when it dials,
+    /// responder when it is dialled), and peers look its transit pair up by
+    /// it. Its signed route is published under the signer's id, which a
+    /// correctly wired host makes the same; [`Self::signer_id_mismatch`] says
+    /// when it is not.
+    #[must_use]
+    pub fn occurrence_key_id(&self) -> &str {
+        &self.config.local_key_id
+    }
+
+    /// CIRISEdge#541/#805 — whether the federation signer is NOT the
+    /// identity this node advertises: its route and transit pair are then
+    /// published under an id peers do not know it by, so they cannot root it
+    /// or key an A/V hop to it. Logged once at construction and carried on
+    /// the `transport_signer_id_mismatch` gauge.
+    #[must_use]
+    pub fn signer_id_mismatch(&self) -> bool {
+        self.local_signer.key_id != self.config.local_key_id
+    }
+
+    /// Mirror [`Self::signer_id_mismatch`] into the attached metrics bag.
+    fn report_signer_id_mismatch(&self) {
+        if let Some(m) = self.metrics.get() {
+            m.set_transport_signer_id_mismatch(self.metrics_source, self.signer_id_mismatch());
+        }
+    }
+
     /// CIRISEdge#805 item 4 — **dial an A/V link** to `destination_key_id`'s
     /// derived address in an A/V session's group, on THIS transport's node and
     /// event loop.
@@ -5103,7 +5156,7 @@ impl ReticulumTransport {
         destination_key_id: &str,
         address: &MemberAddress,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
-        self.open_av_link_claiming(destination_key_id, address, &self.config.local_key_id)
+        self.open_av_link_claiming(destination_key_id, address, self.occurrence_key_id())
             .await
     }
 
@@ -5128,7 +5181,7 @@ impl ReticulumTransport {
         address: &MemberAddress,
         initiator_key_id: &str,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
-        let (dest_hash, transport_ed25519) =
+        let (dest_hash, transport_ed25519, pair) =
             self.av_dial_target(destination_key_id, address).await?;
         // CIRISEdge#805 item 8 — a derived address answers only a one-hop
         // neighbour, so a member behind NAT is reachable here only once the two
@@ -5223,6 +5276,7 @@ impl ReticulumTransport {
         self.key_av_dial(
             destination_key_id,
             initiator_key_id,
+            &pair,
             link_id,
             inbound,
             sender,
@@ -5238,17 +5292,19 @@ impl ReticulumTransport {
         &self,
         destination_key_id: &str,
         initiator_key_id: &str,
+        pair: &ciris_persist::federation::self_at_login::TransitKexPair,
         link_id: LinkId,
         inbound: crate::transport::realtime_av_runtime::PumpReceiver,
         sender: crate::transport::realtime_av_runtime::LeviculumAvSender,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
         let transit = match self
-            .initiate_av_transit(destination_key_id, initiator_key_id, link_id, &sender)
+            .initiate_av_transit(destination_key_id, initiator_key_id, pair, link_id, &sender)
             .await
         {
             Ok(t) => t,
             Err(e) => {
-                let refused = self.av_transit_refused(destination_key_id, link_id, &e, "dial");
+                let refused =
+                    self.av_transit_refused(destination_key_id, Some(link_id), &e, "dial");
                 drop(inbound);
                 drop(sender);
                 self.undo_partial_av_dial(link_id, &refused).await;
@@ -5273,28 +5329,24 @@ impl ReticulumTransport {
         })
     }
 
-    /// CIRISEdge#805 — the dialler's half of an A/V hop's transit KEX:
-    /// resolve the dialled node's pair (Rooted only), run
-    /// `transit_kex::initiate` and send the handshake on the link.
-    async fn initiate_av_transit(
+    /// CIRISEdge#805 — the dialled node's transit pair (Rooted only), read
+    /// BEFORE the dial: a node that publishes none cannot be keyed, so it is
+    /// never dialled.
+    async fn resolve_av_transit_pair(
         &self,
         peer: &str,
-        initiator_key_id: &str,
-        link_id: LinkId,
-        sender: &crate::transport::realtime_av_runtime::LeviculumAvSender,
     ) -> Result<
-        crate::transport::av_transit_handshake::LinkTransit,
+        ciris_persist::federation::self_at_login::TransitKexPair,
         crate::transport::av_transit_handshake::AvHandshakeError,
     > {
-        use crate::transport::av_transit_handshake::{initiate_on_link, AvHandshakeError};
+        use crate::transport::av_transit_handshake::AvHandshakeError;
         let Some(rooting) = self.rooting.as_deref() else {
             return Err(AvHandshakeError::PairLookup {
                 peer: peer.to_owned(),
                 detail: "no rooting directory is wired".to_owned(),
             });
         };
-        let pair = self
-            .transit_peers
+        self.transit_peers
             .resolve(rooting, peer)
             .await
             .map_err(|detail| AvHandshakeError::PairLookup {
@@ -5303,7 +5355,24 @@ impl ReticulumTransport {
             })?
             .ok_or_else(|| AvHandshakeError::NoTransitPair {
                 peer: peer.to_owned(),
-            })?;
+            })
+    }
+
+    /// CIRISEdge#805 — the dialler's half of an A/V hop's transit KEX: run
+    /// `transit_kex::initiate` against the dialled node's `pair` and send the
+    /// handshake on the link.
+    async fn initiate_av_transit(
+        &self,
+        peer: &str,
+        initiator_key_id: &str,
+        pair: &ciris_persist::federation::self_at_login::TransitKexPair,
+        link_id: LinkId,
+        sender: &crate::transport::realtime_av_runtime::LeviculumAvSender,
+    ) -> Result<
+        crate::transport::av_transit_handshake::LinkTransit,
+        crate::transport::av_transit_handshake::AvHandshakeError,
+    > {
+        use crate::transport::av_transit_handshake::{initiate_on_link, AvHandshakeError};
         let frame_limit = sender
             .channel_limit()
             .ok_or_else(|| AvHandshakeError::Send("the link is no longer held".to_owned()))?;
@@ -5313,16 +5382,17 @@ impl ReticulumTransport {
             link_id.as_bytes(),
             initiator_key_id,
             peer,
-            &pair,
+            pair,
         )
         .await
     }
 
-    /// Count, log and type one transit KEX refusal on `link_id`.
+    /// Count, log and type one transit KEX refusal (on `link_id`, or before
+    /// any link when `None`).
     fn av_transit_refused(
         &self,
         peer: &str,
-        link_id: LinkId,
+        link_id: Option<LinkId>,
         error: &crate::transport::av_transit_handshake::AvHandshakeError,
         side: &'static str,
     ) -> TransportError {
@@ -5332,7 +5402,7 @@ impl ReticulumTransport {
         }
         tracing::warn!(
             peer = %peer,
-            link = %hex::encode(link_id.as_bytes()),
+            link = ?link_id.map(|l| hex::encode(l.as_bytes())),
             side,
             reason,
             error = %error,
@@ -5366,7 +5436,7 @@ impl ReticulumTransport {
         match crate::transport::av_transit_handshake::respond_on_link(
             &arrival.inbound,
             &arrival.link_id,
-            &self.config.local_key_id,
+            self.occurrence_key_id(),
             &self.transit_kex,
             arrival.peer.as_str(),
         )
@@ -5385,7 +5455,8 @@ impl ReticulumTransport {
                 Ok(crate::transport::av_sink::AcceptedAvArrival { arrival, transit })
             }
             Err(e) => {
-                let refused = self.av_transit_refused(arrival.peer.as_str(), link_id, &e, "accept");
+                let refused =
+                    self.av_transit_refused(arrival.peer.as_str(), Some(link_id), &e, "accept");
                 drop(arrival);
                 let _ = self.link_teardown(link_id.as_bytes()).await;
                 Err(refused)
@@ -5402,7 +5473,14 @@ impl ReticulumTransport {
         &self,
         destination_key_id: &str,
         address: &MemberAddress,
-    ) -> Result<(DestinationHash, [u8; 32]), TransportError> {
+    ) -> Result<
+        (
+            DestinationHash,
+            [u8; 32],
+            ciris_persist::federation::self_at_login::TransitKexPair,
+        ),
+        TransportError,
+    > {
         let dest_hash = DestinationHash::new(*address.as_bytes());
         let plane = classify_link_plane(self.scope_addresses.get().map(Arc::as_ref), &dest_hash);
         if plane != LinkPlane::Av {
@@ -5434,6 +5512,13 @@ impl ReticulumTransport {
                 member.as_deref().unwrap_or("<none>"),
             )));
         }
+        // CIRISEdge#805 (CC 5.3.3.5 E1) — the hop can only be keyed by the
+        // dialled node's published transit pair: no pair, no dial, refused by
+        // name before a link is spent on it.
+        let pair = match self.resolve_av_transit_pair(destination_key_id).await {
+            Ok(pair) => pair,
+            Err(e) => return Err(self.av_transit_refused(destination_key_id, None, &e, "dial")),
+        };
         // The operator deny-list, on the DERIVED hash and on EVERY federation
         // candidate the peer resolves to — the regular send path's rule. A
         // peer blackholed by its announced destination must not stay reachable
@@ -5452,7 +5537,7 @@ impl ReticulumTransport {
                  address (CIRISEdge#805)"
             )));
         };
-        Ok((dest_hash, transport_ed25519))
+        Ok((dest_hash, transport_ed25519, pair))
     }
 
     /// CIRISEdge#805 item 8 — bring the path to call member
@@ -8114,6 +8199,7 @@ impl Transport for ReticulumTransport {
     /// event, so an attach before `listen` is seen by the first one.
     fn attach_metrics(&self, metrics: crate::observability::EdgeMetrics) {
         let _ = self.metrics.set(metrics);
+        self.report_signer_id_mismatch();
     }
 
     fn attached_metrics(&self) -> Option<crate::observability::EdgeMetrics> {
@@ -8125,6 +8211,7 @@ impl Transport for ReticulumTransport {
     /// cadence, this makes a snapshot read current on demand.
     fn refresh_metrics(&self) {
         let _ = self.known_destination_evictions();
+        self.report_signer_id_mismatch();
     }
 
     fn subscribe_reachability(&self) -> Option<tokio::sync::broadcast::Receiver<PeerReachable>> {
@@ -8438,7 +8525,7 @@ impl Transport for ReticulumTransport {
             hybrid_policy: self.hybrid_policy,
             transport_binding_enforcement: self.transport_binding_enforcement,
             bundle_save_gate: self.bundle_save_gate,
-            local_key_id: Arc::from(self.config.local_key_id.as_str()),
+            local_key_id: Arc::from(self.occurrence_key_id()),
             // CIRISEdge#530 — cheap clone (every `EdgeMetrics` field is an `Arc`).
             metrics: self.metrics.get().cloned(),
         };
@@ -8531,7 +8618,7 @@ impl Transport for ReticulumTransport {
                         matches!(event, NodeEvent::LinkEstablished { .. });
                     let ctx = EventCtx {
                         node: &self.node,
-                        local_key_id: &self.config.local_key_id,
+                        local_key_id: self.occurrence_key_id(),
                         peers: &self.peers,
                         established_links: &self.established_links,
                         sent_resource_progress: &self.sent_resource_progress,

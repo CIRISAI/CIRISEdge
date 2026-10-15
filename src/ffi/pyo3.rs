@@ -2790,6 +2790,10 @@ fn metrics_bundle_to_pydict<'py>(
         "known_destination_evictions",
         bundle.known_destination_evictions,
     )?;
+    root.set_item(
+        "transport_signer_id_mismatch",
+        bundle.transport_signer_id_mismatch,
+    )?;
 
     let reachability = pyo3::types::PyDict::new(py);
     for ((peer, medium), v) in &bundle.peer_reachability_ratio {

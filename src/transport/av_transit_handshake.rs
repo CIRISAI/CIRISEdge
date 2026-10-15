@@ -7,12 +7,13 @@
 //!
 //! # Roles
 //!
-//! The **dialler is always the initiator** (verify's rule). Once its A/V link
-//! is established it resolves the dialled node's static transit pair (Rooted
-//! only, persist's `transit_kex_pair_for`), runs [`transit_kex::initiate`],
-//! and sends [`TransitHandshake::to_bytes`] as the link's FIRST message,
-//! before any media. A dialled node with no usable pair cannot relay or
-//! receive: the dial is refused by name ([`AvHandshakeError::NoTransitPair`]).
+//! The **dialler is always the initiator** (verify's rule). Before it dials
+//! it resolves the dialled node's static transit pair (Rooted only, persist's
+//! `transit_kex_pair_for`, by the id it dials); once the A/V link is
+//! established it runs [`transit_kex::initiate`] and sends
+//! [`TransitHandshake::to_bytes`] as the link's FIRST message, before any
+//! media. A dialled node with no usable pair cannot relay or receive: the dial
+//! is refused by name ([`AvHandshakeError::NoTransitPair`]) and never made.
 //! There is no classical fallback and no caller-supplied key (E1 forbids it).
 //!
 //! The **dialled end is the responder**. It reassembles the handshake, runs
