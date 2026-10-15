@@ -894,6 +894,10 @@ pub const AV_INBOUND_DROPPED_RESOURCE: &str = "av_inbound_dropped_resource";
 /// subscriber's other leg (the make-before-break overlap), dropped by the
 /// dedupe above the per-leg opens. Not a loss.
 pub const AV_INBOUND_DUPLICATE_LEG: &str = "av_inbound_duplicate_leg";
+/// CIRISEdge#867 — an inbound A/V link that never opened a frame in
+/// `LINK_ID_MISMATCH_FRAMES` tries was ended as a `link_id` mismatch
+/// (leviculum#86) so it is re-dialled.
+pub const AV_LINK_ID_MISMATCH: &str = "av_link_id_mismatch";
 /// CIRISEdge#805 item 8, cut 2 — a subscriber that dialled this relay was not
 /// entitled (not a live member of the dialled stream's group): refused, sent
 /// nothing, link closed.

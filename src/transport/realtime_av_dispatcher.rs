@@ -171,6 +171,77 @@ pub enum AvDispatcherError {
     SubscriberNotFound(PeerKeyId),
 }
 
+/// CIRISEdge#867 — how many frames a link may fail to open, from its FIRST
+/// frame on, before it is judged to run under a different `link_id` than
+/// the one this end seals and opens with.
+pub const LINK_ID_MISMATCH_FRAMES: u32 = 8;
+
+/// CIRISEdge#867 — tells a link sealed under another `link_id` from a link
+/// with a bad frame or two.
+///
+/// leviculum (Codeberg #66, CIRISAI/leviculum#86) can report a stale
+/// `link_id` on the initiator after a link-establishment retry: the wire id
+/// changed, the handle kept the original. The outer nonce, and the coming
+/// per-hop transit key, are bound to `link_id`, so every frame on such a
+/// link fails its tag. Without this guard that is silent, unbounded media
+/// loss. The signature is exact: a link that has NEVER opened a frame and
+/// has now failed [`LINK_ID_MISMATCH_FRAMES`] in a row. A link that opened
+/// even one frame shares this end's `link_id`, and a later failure there
+/// is a bad frame, never a mismatch.
+///
+/// The receive loop ends the link's subscription on a mismatch. On the
+/// leg path, that is the relay leg ending, and leg choice asks the host to
+/// rejoin (re-dial), which gets a new link and a new id. The real fix
+/// reads the WIRE id from leviculum (`wire_link_id`, leviculum v0.32).
+#[derive(Debug, Default)]
+pub struct LinkIdGuard {
+    opened: bool,
+    unopened: u32,
+}
+
+impl LinkIdGuard {
+    /// A frame opened: this link shares our `link_id` for good.
+    pub fn opened(&mut self) {
+        self.opened = true;
+    }
+
+    /// A frame failed to open at every candidate counter. Returns `true`
+    /// when that makes the link a `link_id` mismatch.
+    pub fn unopened(&mut self) -> bool {
+        if self.opened {
+            return false;
+        }
+        self.unopened = self.unopened.saturating_add(1);
+        self.unopened >= LINK_ID_MISMATCH_FRAMES
+    }
+
+    /// Frames failed so far without a single open.
+    #[must_use]
+    pub fn unopened_count(&self) -> u32 {
+        self.unopened
+    }
+
+    /// Log (and count, where `metrics` is in reach) the end of a link judged
+    /// a `link_id` mismatch. `role` names the loop that ended it.
+    pub(crate) fn report_mismatch(
+        &self,
+        role: &str,
+        link_id: &[u8],
+        metrics: Option<&crate::observability::EdgeMetrics>,
+    ) {
+        if let Some(m) = metrics {
+            m.inc_av_plane(crate::observability::AV_LINK_ID_MISMATCH);
+        }
+        tracing::error!(
+            role,
+            link = %hex::encode(link_id),
+            unopened = self.unopened,
+            "AV: no frame on this link has ever opened — link_id mismatch \
+             (leviculum#86); the link is ENDED so it is re-dialled (CIRISEdge#867)"
+        );
+    }
+}
+
 /// Open a hop's outer AEAD at the first counter in
 /// [`hop_counter_candidates`] that authenticates, returning the counter
 /// it opened at and the still-E2E-sealed inner chunk. `None` when no
@@ -678,6 +749,15 @@ impl AvDispatcher {
     /// the spawned tasks are still created but every frame fails to open
     /// and is skipped.
     pub fn spawn_subscriber_loop(&mut self) -> mpsc::Receiver<ReconstructedChunk> {
+        self.spawn_subscriber_loop_counted(None)
+    }
+
+    /// [`Self::spawn_subscriber_loop`], counting a `link_id` mismatch
+    /// ([`LinkIdGuard`], CIRISEdge#867) on `metrics`.
+    pub(crate) fn spawn_subscriber_loop_counted(
+        &mut self,
+        metrics: Option<&crate::observability::EdgeMetrics>,
+    ) -> mpsc::Receiver<ReconstructedChunk> {
         let (tx, rx) = mpsc::channel::<ReconstructedChunk>(64);
         // Take ownership of the inbound links — the loop consumes them.
         let inbound = std::mem::take(&mut self.inbound_links);
@@ -685,10 +765,12 @@ impl AvDispatcher {
 
         for link in inbound {
             let tx = tx.clone();
+            let metrics = metrics.cloned();
             tokio::spawn(async move {
                 let dek = dek_bytes.map(EpochDek::from_bytes);
                 let mut next_link_seq: u64 = 0;
                 let mut gap = HopGap::default();
+                let mut guard = LinkIdGuard::default();
                 loop {
                     // A permanently-closed link surfaces as a recv error;
                     // exit the loop. A transient error also lands here —
@@ -721,8 +803,16 @@ impl AvDispatcher {
                             open_av_chunk(&sealed, &link.transit_key, &link.link_id, c, dek).ok()
                         })
                     else {
+                        if guard.unopened() {
+                            // CIRISEdge#867 — never opened a frame: this
+                            // link runs under another link_id. End it so
+                            // the leg is re-dialled instead of starving.
+                            guard.report_mismatch("subscriber", &link.link_id, metrics.as_ref());
+                            break;
+                        }
                         continue;
                     };
+                    guard.opened();
                     next_link_seq = used.wrapping_add(1);
                     gap.resolved();
                     let chunk = ReconstructedChunk {
@@ -1314,5 +1404,120 @@ mod tests {
             inbound_links: vec![],
         });
         assert!(matches!(built, Err(AvDispatcherError::TransitPairInUse(_))));
+    }
+
+    /// A subscriber loop over one scripted link that opens with `link_id`.
+    fn scripted_subscriber(
+        link_id: &[u8],
+    ) -> (
+        mpsc::UnboundedSender<InboundWireFrame>,
+        mpsc::Receiver<ReconstructedChunk>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut d = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(7),
+            local_role: AvRole::Subscriber,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: vec![],
+            inbound_links: vec![AvInboundLink {
+                transit_key: [0x31; 32],
+                link_id: link_id.to_vec(),
+                inbound_recv: Box::new(Scripted {
+                    rx: tokio::sync::Mutex::new(rx),
+                }),
+            }],
+        })
+        .expect("subscriber");
+        (tx, d.spawn_subscriber_loop())
+    }
+
+    fn frame_on(link_id: &[u8], chunk_seq: u64, link_seq: u64) -> InboundWireFrame {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        InboundWireFrame {
+            dropped_before: 0,
+            bytes: seal_av_outer(&inner(&dek, chunk_seq, 32), &[0x31; 32], link_id, link_seq)
+                .expect("outer")
+                .to_bytes(),
+        }
+    }
+
+    /// CIRISEdge#867 — the guard: a link that never opened is a mismatch at
+    /// exactly `LINK_ID_MISMATCH_FRAMES` failures; a link that opened once
+    /// never is.
+    #[test]
+    fn a_link_that_never_opens_is_a_link_id_mismatch_867() {
+        let mut g = LinkIdGuard::default();
+        for _ in 1..LINK_ID_MISMATCH_FRAMES {
+            assert!(!g.unopened());
+        }
+        assert!(
+            g.unopened(),
+            "the Nth unopened frame from the first is a mismatch"
+        );
+        let mut g = LinkIdGuard::default();
+        g.opened();
+        for _ in 0..10 * LINK_ID_MISMATCH_FRAMES {
+            assert!(!g.unopened(), "a link that opened once shares our link_id");
+        }
+    }
+
+    /// CIRISEdge#867 — the peer seals under the WIRE link_id while this end
+    /// holds a stale one (leviculum#86): no frame opens, and the loop ENDS
+    /// the link after `LINK_ID_MISMATCH_FRAMES` instead of starving forever.
+    #[tokio::test]
+    async fn a_stale_link_id_ends_the_link_instead_of_starving_867() {
+        let (tx, mut out) = scripted_subscriber(b"stale");
+        for i in 0..u64::from(LINK_ID_MISMATCH_FRAMES) {
+            tx.send(frame_on(b"wire", i, i)).expect("feed");
+        }
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+            .await
+            .expect("the loop answers in time");
+        assert!(ended.is_none(), "the link is ended, not left silent");
+    }
+
+    /// CIRISEdge#867 — a link that opened a frame shares our link_id: any
+    /// number of foreign frames after that are dropped one by one, and the
+    /// link keeps delivering.
+    #[tokio::test]
+    async fn junk_after_a_good_frame_never_ends_the_link_867() {
+        let (tx, mut out) = scripted_subscriber(b"me");
+        tx.send(frame_on(b"me", 0, 0)).expect("feed");
+        for i in 0..4 * u64::from(LINK_ID_MISMATCH_FRAMES) {
+            tx.send(frame_on(b"other", 100 + i, i)).expect("feed");
+        }
+        tx.send(frame_on(b"me", 1, 1)).expect("feed");
+        for want in [0u64, 1] {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+                .await
+                .expect("in time")
+                .expect("still open");
+            assert_eq!(got.chunk_seq, ChunkSeq(want));
+        }
+    }
+
+    /// CIRISEdge#867 item 3 — `link_seq` is edge's own u64 per direction,
+    /// never a Channel u16 sequence: the counter runs past 65535 and the
+    /// frames open there.
+    #[tokio::test]
+    async fn link_seq_is_a_u64_past_the_u16_boundary_867() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut d = publisher_over(vec![healthy("sub", tx)]);
+        d.subscribers.get_mut("sub").expect("sub").next_link_seq = u64::from(u16::MAX);
+        for chunk in 0..2 {
+            d.publish_inner(inner(&dek, chunk, 64))
+                .await
+                .expect("publish");
+        }
+        let key = [0x31u8; 32];
+        let first = SealedAvChunk::from_bytes(&rx.try_recv().expect("sent")).expect("parse");
+        let second = SealedAvChunk::from_bytes(&rx.try_recv().expect("sent")).expect("parse");
+        assert!(open_av_chunk(&first, &key, b"sub", u64::from(u16::MAX), &dek).is_ok());
+        assert!(
+            open_av_chunk(&second, &key, b"sub", u64::from(u16::MAX) + 1, &dek).is_ok(),
+            "65536, not a wrap to 0"
+        );
+        assert!(open_av_chunk(&second, &key, b"sub", 0, &dek).is_err());
     }
 }
