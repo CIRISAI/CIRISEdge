@@ -193,6 +193,17 @@ pub mod reticulum;
 #[cfg(feature = "_reticulum-module")]
 pub mod self_route;
 
+/// CIRISEdge#805 (CC 3.3.6.2) — custody of this node's static transit KEX
+/// pair: one 64-byte root seed, both keys HKDF-derived from it, stored beside
+/// the transport identity. Published on the signed route by [`self_route`].
+#[cfg(feature = "_reticulum-module")]
+pub mod transit_kex_custody;
+
+/// CIRISEdge#805 (CC 3.3.6.2) — a peer's transit KEX pair, Rooted only, via
+/// persist's `transit_kex_pair_for`. `None` = the peer cannot relay.
+#[cfg(feature = "_reticulum-module")]
+pub mod transit_kex_peer;
+
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
 /// edges (CIRISEdge#169). CEG-native (the Scope-B queue: byte-exact
 /// signed CEG envelopes); pairs with Reticulum Transport-node mode

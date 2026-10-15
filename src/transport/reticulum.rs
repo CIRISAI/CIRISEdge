@@ -2283,6 +2283,11 @@ pub struct ReticulumTransport {
     /// the periodic announce tick so a boot-time fault (directory not
     /// yet serving / own key not yet registered) heals in place.
     self_route: crate::transport::self_route::SelfSignedRouteProducer,
+    /// CIRISEdge#805 (CC 3.3.6.2) — this node's static transit KEX keys,
+    /// loaded once beside the transport identity. The public pair rides the
+    /// signed route [`Self::self_route`] emits; the privates answer a
+    /// dialler's `transit_kex` handshake.
+    transit_kex: crate::transport::transit_kex_custody::TransitKexSecret,
     /// The node's single `NodeEvent` receiver. `listen` takes it
     /// exactly once; a second `listen` call is a config error.
     /// Leviculum PR #9 switched this to an unbounded channel so node
@@ -3001,6 +3006,23 @@ impl ReticulumTransport {
             load_or_generate_identity(&config.identity_path)?
         };
 
+        // CIRISEdge#805 — the static transit KEX keys, stored exactly where
+        // the transport identity is (same keystore, or beside its file).
+        let transit_kex = if let Some(keystore) = transport_identity_keystore.as_ref() {
+            crate::transport::transit_kex_custody::TransitKexSecret::load_or_adopt_or_generate_with_keystore(
+                &config.identity_path,
+                config
+                    .transport_identity_storage_key
+                    .as_deref()
+                    .unwrap_or(&config.local_key_id),
+                keystore.as_ref(),
+            )?
+        } else {
+            crate::transport::transit_kex_custody::TransitKexSecret::load_or_generate_file(
+                &config.identity_path,
+            )?
+        };
+
         // v2.1.0 (CIRISPersist LocalIdentityAggregate RET-transport
         // role) — copy the 64-byte dual-key public material to a
         // standalone buffer we stash on `ReticulumTransport`. The
@@ -3451,6 +3473,7 @@ impl ReticulumTransport {
                     rooting_dir,
                     named16,
                     local_transport_pubkey,
+                    transit_kex.pair(),
                     config.local_epoch,
                 )
                 .await;
@@ -3517,6 +3540,7 @@ impl ReticulumTransport {
             local_attestation,
             local_signer,
             self_route,
+            transit_kex,
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
@@ -8291,6 +8315,7 @@ impl Transport for ReticulumTransport {
                                 rooting,
                                 self.local_named_dest_hash(),
                                 self.local_transport_pubkey,
+                                self.transit_kex.pair(),
                                 self.config.local_epoch,
                             )
                             .await;

@@ -44,14 +44,29 @@
 //! and the touch-claim producer). Signing runs through the
 //! ciris-keyring `HardwareSigner` / `PqcSigner` handles on
 //! [`LocalSigner`] — never a raw key.
+//!
+//! # The transit KEX pair (CIRISEdge#805, CC 3.3.6.2)
+//!
+//! The envelope also carries this node's static transit KEX public pair as
+//! the nested member `transit_kex_pubkeys {x25519_base64, ml_kem_768_base64}`
+//! (persist's constants; standard base64). It is envelope-only, never a field
+//! of the typed row, and it is spliced in BEFORE signing, so the signature
+//! covers it. The emit-only-on-change guard compares the stored row's pair
+//! (and transport keys) with ours, so a changed pair re-emits; the re-sign
+//! always carries an `asserted_at` strictly after the stored one, because
+//! persist refuses a same-`(epoch, asserted_at)` re-sign that changes the
+//! pair as a fork.
 
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ciris_persist::federation::self_at_login::{
-    BindingProvenance, SignedTransportDestination, TransportDestination,
-    TransportDestinationApplyOutcome,
+    transit_kex_pair_from_envelope, BindingProvenance, SignedTransportDestination, TransitKexPair,
+    TransportDestination, TransportDestinationApplyOutcome, TRANSIT_KEX_ML_KEM_768_MEMBER,
+    TRANSIT_KEX_PUBKEYS_MEMBER, TRANSIT_KEX_X25519_MEMBER,
 };
 use ciris_persist::prelude::ceg_produce_canonicalize;
 use ciris_verify_core::transport_binding::TransportBindingSignature;
@@ -103,9 +118,30 @@ pub struct SelfSignedRouteProducer {
     warned_no_pqc: AtomicBool,
     /// "Say so once": the stale-epoch / retired-tombstone warn has fired.
     warned_store_conflict: AtomicBool,
-    /// Memo: the store was observed current (or we emitted) — later
-    /// [`Self::ensure`] calls short-circuit without a directory read.
-    current: AtomicBool,
+    /// Memo: the fingerprint of the inputs (dest, transport keys, epoch,
+    /// transit pair) the store was last observed current for, or that we
+    /// emitted. A call with the SAME inputs short-circuits without a
+    /// directory read; any changed input misses the memo and re-consults the
+    /// store, so the memo can never hold a stale row in place.
+    current: Mutex<Option<[u8; 32]>>,
+}
+
+/// SHA-256 over every input that shapes the emitted row's content.
+fn inputs_fingerprint(
+    dest_hash: &[u8; 16],
+    transport_pubkey: &[u8; 64],
+    transit: &TransitKexPair,
+    epoch: u64,
+) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"ciris-edge/self-route/inputs/v1");
+    h.update(dest_hash);
+    h.update(transport_pubkey);
+    h.update(epoch.to_be_bytes());
+    h.update(transit.x25519);
+    h.update(&transit.ml_kem_768[..]);
+    h.finalize().into()
 }
 
 impl SelfSignedRouteProducer {
@@ -124,27 +160,45 @@ impl SelfSignedRouteProducer {
     /// loop emits and therefore the dest peers record in their peers map,
     /// which is the exact operand their item-2 lookup uses.
     /// `transport_pubkey` is the 64-byte `x25519 ‖ ed25519` transport
-    /// identity public material; `epoch` is the announce attestation's
-    /// `local_epoch` (one supersession clock across both planes).
+    /// identity public material; `transit` is this node's static transit KEX
+    /// public pair (CIRISEdge#805), published in the signed envelope; `epoch`
+    /// is the announce attestation's `local_epoch` (one supersession clock
+    /// across both planes).
     pub async fn ensure(
         &self,
         signer: &LocalSigner,
         rooting: &dyn RootingDirectory,
         dest_hash: [u8; 16],
         transport_pubkey: [u8; 64],
+        transit: &TransitKexPair,
         epoch: u64,
     ) -> SelfRouteOutcome {
-        if self.current.load(Ordering::Relaxed) {
+        let fingerprint = inputs_fingerprint(&dest_hash, &transport_pubkey, transit, epoch);
+        if self.memo() == Some(fingerprint) {
             return SelfRouteOutcome::AlreadyCurrent;
         }
 
         let want = hex::encode(dest_hash);
 
         // (1) Emit-only-on-change guard — the #299 write-through discipline
-        // applied to our own row: consult the durable truth first.
-        if let Some(early) = self.consult_store(signer, rooting, &want, epoch).await {
-            return early;
-        }
+        // applied to our own row: consult the durable truth first. A
+        // continue carries the stored signed row's `asserted_at`, the floor
+        // the re-sign must strictly exceed.
+        let wanted = WantedRoute {
+            dest: &want,
+            transport_pubkey: &transport_pubkey,
+            transit,
+            epoch,
+        };
+        let not_after = match self.consult_store(signer, rooting, &wanted).await {
+            ControlFlow::Break(early) => {
+                if early == SelfRouteOutcome::AlreadyCurrent {
+                    self.set_memo(fingerprint);
+                }
+                return early;
+            }
+            ControlFlow::Continue(floor) => floor,
+        };
 
         // (2) The PQC precondition — item 2 exists to be quantum-adversary
         // safe, so an Ed25519-only emission would be admission-refused
@@ -167,13 +221,20 @@ impl SelfSignedRouteProducer {
 
         // (3)+(4) Build + hybrid-sign the row (extracted; see
         // [`build_and_sign_self_route`]).
-        let signed_row =
-            match build_and_sign_self_route(signer, pqc.as_ref(), want, &transport_pubkey, epoch)
-                .await
-            {
-                Ok(s) => s,
-                Err(deferred) => return deferred,
-            };
+        let signed_row = match build_and_sign_self_route(
+            signer,
+            pqc.as_ref(),
+            want,
+            &transport_pubkey,
+            Some(transit),
+            epoch,
+            not_after,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(deferred) => return deferred,
+        };
 
         // (5) Emit through persist's REAL authenticated admission — the same
         // oracle every replicating peer re-runs on this exact record.
@@ -193,7 +254,7 @@ impl SelfSignedRouteProducer {
                         );
                     }
                 } else {
-                    self.current.store(true, Ordering::Relaxed);
+                    self.set_memo(fingerprint);
                     tracing::info!(
                         key_id = %signed_row.transport_destination.occurrence_key_id,
                         dest = %signed_row.transport_destination.destination,
@@ -222,16 +283,31 @@ impl SelfSignedRouteProducer {
         }
     }
 
+    fn memo(&self) -> Option<[u8; 32]> {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_memo(&self, fingerprint: [u8; 32]) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fingerprint);
+    }
+
     /// Step (1) of [`Self::ensure`]: consult the durable store and decide
-    /// whether anything needs emitting. `Some(outcome)` short-circuits
-    /// (current / warned-skip / deferred); `None` means "emit".
+    /// whether anything needs emitting. `Break(outcome)` short-circuits
+    /// (current / warned-skip / deferred); `Continue(floor)` means "emit",
+    /// with `floor` the stored signed row's `asserted_at` (if any).
     async fn consult_store(
         &self,
         signer: &LocalSigner,
         rooting: &dyn RootingDirectory,
-        want: &str,
-        epoch: u64,
-    ) -> Option<SelfRouteOutcome> {
+        wanted: &WantedRoute<'_>,
+    ) -> ControlFlow<SelfRouteOutcome, Option<DateTime<Utc>>> {
+        let (want, epoch) = (wanted.dest, wanted.epoch);
         let row = match rooting.signed_reticulum_route(&signer.key_id).await {
             Err(e) => {
                 tracing::warn!(
@@ -240,12 +316,13 @@ impl SelfSignedRouteProducer {
                     "CIRISEdge#406: cannot read own signed transport-destination state — \
                      bootstrap deferred (will retry on the next announce tick)"
                 );
-                return Some(SelfRouteOutcome::Deferred(e));
+                return ControlFlow::Break(SelfRouteOutcome::Deferred(e));
             }
-            Ok(None) => return None, // No signed reticulum row — emit.
+            Ok(None) => return ControlFlow::Continue(None), // No signed reticulum row — emit.
             Ok(Some(row)) => row,
         };
         let td = &row.transport_destination;
+        let floor = ControlFlow::Continue(Some(td.asserted_at));
         if td.retired_at.is_some() {
             if td.epoch >= epoch {
                 if !self.warned_store_conflict.swap(true, Ordering::Relaxed) {
@@ -259,16 +336,16 @@ impl SelfSignedRouteProducer {
                          to assert a new binding"
                     );
                 }
-                return Some(SelfRouteOutcome::SkippedRetired);
+                return ControlFlow::Break(SelfRouteOutcome::SkippedRetired);
             }
             // Tombstone at an OLDER epoch: our newer-epoch binding
             // legitimately supersedes it — emit.
         } else if td.destination == want
             && td.epoch >= epoch
             && row.signature.mldsa65_signature_base64.is_some()
+            && wanted.content_matches(&row)
         {
-            self.current.store(true, Ordering::Relaxed);
-            return Some(SelfRouteOutcome::AlreadyCurrent);
+            return ControlFlow::Break(SelfRouteOutcome::AlreadyCurrent);
         } else if td.epoch > epoch {
             if !self.warned_store_conflict.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
@@ -281,11 +358,57 @@ impl SelfSignedRouteProducer {
                      config (config stale — a later emission superseded it); not emitting"
                 );
             }
-            return Some(SelfRouteOutcome::SkippedStaleEpoch { stored: td.epoch });
+            return ControlFlow::Break(SelfRouteOutcome::SkippedStaleEpoch { stored: td.epoch });
         }
-        // Absent-equivalent (dest changed at epoch >= stored, or a
-        // signature-less anomaly) — emit.
-        None
+        // Absent-equivalent (dest, transport keys or transit pair changed at
+        // epoch >= stored, or a signature-less anomaly) — emit.
+        floor
+    }
+}
+
+/// What [`SelfSignedRouteProducer::ensure`] wants the store to hold.
+struct WantedRoute<'a> {
+    dest: &'a str,
+    transport_pubkey: &'a [u8; 64],
+    transit: &'a TransitKexPair,
+    epoch: u64,
+}
+
+impl WantedRoute<'_> {
+    /// Does the stored signed row carry OUR transport keys and OUR transit
+    /// pair? A stored row that differs in either is stale, however current
+    /// its dest and epoch (the live-contact rule: never last-stamped).
+    fn content_matches(&self, row: &SignedTransportDestination) -> bool {
+        let td = &row.transport_destination;
+        let keys_match = td.transport_x25519_pubkey_base64.as_deref()
+            == Some(B64.encode(&self.transport_pubkey[0..32]).as_str())
+            && td.transport_ed25519_pubkey_base64.as_deref()
+                == Some(B64.encode(&self.transport_pubkey[32..64]).as_str());
+        // A stored envelope whose pair does not parse cannot be ours.
+        let pair_matches = matches!(
+            transit_kex_pair_from_envelope(&row.signed_envelope),
+            Ok(Some(ref p)) if p == self.transit
+        );
+        keys_match && pair_matches
+    }
+}
+
+/// The `transit_kex_pubkeys` envelope member for `pair` (persist's member
+/// names, standard base64).
+fn transit_kex_member(pair: &TransitKexPair) -> serde_json::Value {
+    serde_json::json!({
+        TRANSIT_KEX_X25519_MEMBER: B64.encode(pair.x25519),
+        TRANSIT_KEX_ML_KEM_768_MEMBER: B64.encode(&pair.ml_kem_768[..]),
+    })
+}
+
+/// The row's `asserted_at`: now, µs-truncated, and strictly after `not_after`
+/// (the stored signed row's), so a re-sign never lands on the stored clock.
+fn next_asserted_at(not_after: Option<DateTime<Utc>>) -> DateTime<Utc> {
+    let now = ciris_persist::federation::admission::truncate_to_substrate_resolution(Utc::now());
+    match not_after {
+        Some(floor) if now <= floor => floor + chrono::Duration::microseconds(1),
+        _ => now,
     }
 }
 
@@ -300,12 +423,19 @@ impl SelfSignedRouteProducer {
 /// `verify_threshold_signatures` re-checks). Signing runs through the
 /// keyring signer handles only. `Err` carries the ready-to-return
 /// [`SelfRouteOutcome::Deferred`].
+///
+/// `transit` (CIRISEdge#805) is spliced into the envelope as the
+/// `transit_kex_pubkeys` member BEFORE canonicalization, so the signature
+/// covers it; the producer always passes `Some`. `not_after` is the stored
+/// signed row's `asserted_at`, which this row's must strictly exceed.
 async fn build_and_sign_self_route(
     signer: &LocalSigner,
     pqc: &dyn ciris_keyring::PqcSigner,
     destination: String,
     transport_pubkey: &[u8; 64],
+    transit: Option<&TransitKexPair>,
     epoch: u64,
+    not_after: Option<DateTime<Utc>>,
 ) -> Result<SignedTransportDestination, SelfRouteOutcome> {
     let row = TransportDestination {
         occurrence_key_id: signer.key_id.clone(),
@@ -317,9 +447,9 @@ async fn build_and_sign_self_route(
         // sub-µs, so a raw ns `Utc::now()` would sign a byte the stored column can't
         // reproduce, diverging the row after storage (Codex on #470). Memory/sqlite
         // tolerate ns, so only a postgres node exposes this — hence untested locally.
-        asserted_at: ciris_persist::federation::admission::truncate_to_substrate_resolution(
-            Utc::now(),
-        ),
+        // #805: strictly after the stored signed row's, so a same-epoch re-sign
+        // with a changed transit pair supersedes instead of forking.
+        asserted_at: next_asserted_at(not_after),
         last_seen_at: None,
         // `[x25519 ‖ ed25519]` — same split as the #299 write-through.
         transport_ed25519_pubkey_base64: Some(B64.encode(&transport_pubkey[32..64])),
@@ -332,12 +462,20 @@ async fn build_and_sign_self_route(
         epoch,
         retired_at: None,
     };
-    let envelope = serde_json::to_value(&row).map_err(|e| {
+    let mut envelope = serde_json::to_value(&row).map_err(|e| {
         // Structural — a typed row always serializes; keep the arm loud
         // rather than unwrap in prod code.
         tracing::warn!(error = %e, "CIRISEdge#406: route envelope serialize failed");
         SelfRouteOutcome::Deferred(format!("envelope serialize: {e}"))
     })?;
+    if let Some(pair) = transit {
+        let Some(obj) = envelope.as_object_mut() else {
+            return Err(SelfRouteOutcome::Deferred(
+                "route envelope is not an object".into(),
+            ));
+        };
+        obj.insert(TRANSIT_KEX_PUBKEYS_MEMBER.into(), transit_kex_member(pair));
+    }
     let bytes = ceg_produce_canonicalize(&envelope).map_err(|e| {
         tracing::warn!(error = %e, "CIRISEdge#406: route envelope JCS canonicalize failed");
         SelfRouteOutcome::Deferred(format!("canonicalize: {e}"))
@@ -452,6 +590,14 @@ mod tests {
             .expect("register federation key");
     }
 
+    /// This test node's transit KEX pair (a fixed root seed).
+    fn pair() -> TransitKexPair {
+        crate::transport::transit_kex_custody::TransitKexSecret::from_root_seed(&[0x77; 64])
+            .expect("transit kex secret")
+            .pair()
+            .clone()
+    }
+
     fn backend() -> Arc<MemoryBackend> {
         Arc::new(MemoryBackend::new())
     }
@@ -476,7 +622,7 @@ mod tests {
         );
 
         let producer = SelfSignedRouteProducer::new();
-        let out = producer.ensure(&signer, dir, DEST, TPK, 0).await;
+        let out = producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await;
         assert_eq!(
             out,
             SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Inserted)
@@ -517,7 +663,7 @@ mod tests {
 
         let producer = SelfSignedRouteProducer::new();
         assert_eq!(
-            producer.ensure(&signer, dir, DEST, TPK, 0).await,
+            producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await,
             SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Inserted)
         );
         let first = dir
@@ -530,12 +676,12 @@ mod tests {
         // restart case) both decline to re-emit; the stored row is
         // byte-identical (asserted_at untouched).
         assert_eq!(
-            producer.ensure(&signer, dir, DEST, TPK, 0).await,
+            producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await,
             SelfRouteOutcome::AlreadyCurrent
         );
         assert_eq!(
             SelfSignedRouteProducer::new()
-                .ensure(&signer, dir, DEST, TPK, 0)
+                .ensure(&signer, dir, DEST, TPK, &pair(), 0)
                 .await,
             SelfRouteOutcome::AlreadyCurrent
         );
@@ -552,7 +698,7 @@ mod tests {
         // Epoch bump (transport-identity rotation) → supersede.
         assert_eq!(
             SelfSignedRouteProducer::new()
-                .ensure(&signer, dir, DEST, TPK, 1)
+                .ensure(&signer, dir, DEST, TPK, &pair(), 1)
                 .await,
             SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Superseded)
         );
@@ -566,7 +712,7 @@ mod tests {
         // reticulum row per key).
         assert_eq!(
             SelfSignedRouteProducer::new()
-                .ensure(&signer, dir, OTHER_DEST, TPK, 1)
+                .ensure(&signer, dir, OTHER_DEST, TPK, &pair(), 1)
                 .await,
             SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Superseded)
         );
@@ -582,7 +728,7 @@ mod tests {
         // Config now STALE (epoch 0 < stored 1) → warned skip, no write.
         assert_eq!(
             SelfSignedRouteProducer::new()
-                .ensure(&signer, dir, DEST, TPK, 0)
+                .ensure(&signer, dir, DEST, TPK, &pair(), 0)
                 .await,
             SelfRouteOutcome::SkippedStaleEpoch { stored: 1 }
         );
@@ -599,7 +745,7 @@ mod tests {
 
         let producer = SelfSignedRouteProducer::new();
         assert_eq!(
-            producer.ensure(&signer, dir, DEST, TPK, 0).await,
+            producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await,
             SelfRouteOutcome::SkippedNoPqc
         );
         assert!(
@@ -609,7 +755,7 @@ mod tests {
         // Second pass: same outcome, warn already spent (the announce-tick
         // re-arm must not spam).
         assert_eq!(
-            producer.ensure(&signer, dir, DEST, TPK, 0).await,
+            producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await,
             SelfRouteOutcome::SkippedNoPqc
         );
 
@@ -650,7 +796,7 @@ mod tests {
         // asserted_at postdates ours' build instant.
         assert_eq!(
             SelfSignedRouteProducer::new()
-                .ensure(&signer, dir, DEST, TPK, 0)
+                .ensure(&signer, dir, DEST, TPK, &pair(), 0)
                 .await,
             SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Superseded)
         );
@@ -681,7 +827,7 @@ mod tests {
 
         let producer = SelfSignedRouteProducer::new();
         assert!(matches!(
-            producer.ensure(&signer, dir, DEST, TPK, 0).await,
+            producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await,
             SelfRouteOutcome::Deferred(_)
         ));
         assert!(
@@ -691,12 +837,262 @@ mod tests {
 
         register(&backend, &signer).await;
         assert_eq!(
-            producer.ensure(&signer, dir, DEST, TPK, 0).await,
+            producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await,
             SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Inserted)
         );
         assert!(
             dir.hybrid_transport_binding_exists(&signer.key_id, DEST)
                 .await
+        );
+    }
+
+    /// A second, distinct transit pair (a rotated root seed).
+    fn other_pair() -> TransitKexPair {
+        crate::transport::transit_kex_custody::TransitKexSecret::from_root_seed(&[0x78; 64])
+            .expect("transit kex secret")
+            .pair()
+            .clone()
+    }
+
+    /// CIRISEdge#805 (b): the emitted row carries the pair as the envelope
+    /// member, persist's REAL admission takes it (no `transit_kex_key_reuse`:
+    /// the derived x25519 is not the link x25519), and persist's per-peer
+    /// resolver then returns exactly this node's pair, through edge's
+    /// Rooted-only resolver too (c).
+    #[tokio::test]
+    async fn emitted_pair_is_admitted_and_resolves_for_the_node() {
+        let backend = backend();
+        let signer = hybrid_signer("self-route-transit");
+        register(&backend, &signer).await;
+        let dir: &dyn RootingDirectory = backend.as_ref();
+
+        assert_eq!(
+            SelfSignedRouteProducer::new()
+                .ensure(&signer, dir, DEST, TPK, &pair(), 0)
+                .await,
+            SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Inserted)
+        );
+        let row = dir
+            .signed_reticulum_route(&signer.key_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.signed_envelope.get(TRANSIT_KEX_PUBKEYS_MEMBER),
+            Some(&transit_kex_member(&pair())),
+            "the pair rides the signed envelope under persist's member names"
+        );
+        assert_eq!(
+            ciris_persist::federation::self_at_login::transit_kex_pair_for(
+                backend.as_ref(),
+                &signer.key_id
+            )
+            .await
+            .expect("resolve"),
+            Some(pair())
+        );
+        assert_eq!(
+            crate::transport::transit_kex_peer::PeerTransitResolver::new()
+                .resolve(backend.as_ref(), &signer.key_id)
+                .await
+                .expect("resolve"),
+            Some(pair())
+        );
+    }
+
+    /// The signature covers the member: the same signed row with its pair
+    /// swapped (or removed) is refused by a fresh peer's admission.
+    #[tokio::test]
+    async fn the_signature_covers_the_transit_member() {
+        let backend = backend();
+        let signer = hybrid_signer("self-route-cover");
+        register(&backend, &signer).await;
+        let dir: &dyn RootingDirectory = backend.as_ref();
+        SelfSignedRouteProducer::new()
+            .ensure(&signer, dir, DEST, TPK, &pair(), 0)
+            .await;
+        let row = dir
+            .signed_reticulum_route(&signer.key_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The untouched row re-admits on a fresh peer: the oracle works.
+        let peer = backend_with(&signer).await;
+        let peer_dir: &dyn RootingDirectory = peer.as_ref();
+        assert!(peer_dir
+            .put_signed_transport_destination(&row)
+            .await
+            .is_ok());
+
+        let mut swapped = row.clone();
+        swapped.signed_envelope.as_object_mut().unwrap().insert(
+            TRANSIT_KEX_PUBKEYS_MEMBER.into(),
+            transit_kex_member(&other_pair()),
+        );
+        let mut removed = row.clone();
+        removed
+            .signed_envelope
+            .as_object_mut()
+            .unwrap()
+            .remove(TRANSIT_KEX_PUBKEYS_MEMBER);
+        for (what, tampered) in [("swapped", swapped), ("removed", removed)] {
+            let peer = backend_with(&signer).await;
+            let peer_dir: &dyn RootingDirectory = peer.as_ref();
+            assert!(
+                peer_dir
+                    .put_signed_transport_destination(&tampered)
+                    .await
+                    .is_err(),
+                "{what}: a pair the signer did not sign must not admit"
+            );
+        }
+    }
+
+    async fn backend_with(signer: &LocalSigner) -> Arc<MemoryBackend> {
+        let b = backend();
+        register(&b, signer).await;
+        b
+    }
+
+    /// A pair change re-emits at a NEW asserted_at and is admitted as a
+    /// supersede (not refused as a same-clock fork); an unchanged pair does
+    /// not re-emit, via the memo or the store. The live-contact rule: the
+    /// stored row follows the current pair.
+    #[tokio::test]
+    async fn pair_change_reemits_and_unchanged_pair_does_not() {
+        let backend = backend();
+        let signer = hybrid_signer("self-route-rotate");
+        register(&backend, &signer).await;
+        let dir: &dyn RootingDirectory = backend.as_ref();
+
+        let producer = SelfSignedRouteProducer::new();
+        assert_eq!(
+            producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await,
+            SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Inserted)
+        );
+        let first = dir
+            .signed_reticulum_route(&signer.key_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Unchanged pair: no re-emit, from the memo or from the store.
+        assert_eq!(
+            producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await,
+            SelfRouteOutcome::AlreadyCurrent
+        );
+        assert_eq!(
+            SelfSignedRouteProducer::new()
+                .ensure(&signer, dir, DEST, TPK, &pair(), 0)
+                .await,
+            SelfRouteOutcome::AlreadyCurrent
+        );
+
+        // Changed pair, same dest and epoch: the SAME producer (memo armed)
+        // and a fresh one both see it. Re-emits, superseding.
+        assert_eq!(
+            producer
+                .ensure(&signer, dir, DEST, TPK, &other_pair(), 0)
+                .await,
+            SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Superseded)
+        );
+        let second = dir
+            .signed_reticulum_route(&signer.key_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            second.transport_destination.asserted_at > first.transport_destination.asserted_at,
+            "the re-sign carries a new asserted_at"
+        );
+        assert_eq!(second.transport_destination.epoch, 0);
+        assert_eq!(
+            ciris_persist::federation::self_at_login::transit_kex_pair_for(
+                backend.as_ref(),
+                &signer.key_id
+            )
+            .await
+            .unwrap(),
+            Some(other_pair())
+        );
+        assert_eq!(
+            SelfSignedRouteProducer::new()
+                .ensure(&signer, dir, DEST, TPK, &other_pair(), 0)
+                .await,
+            SelfRouteOutcome::AlreadyCurrent
+        );
+
+        // And back again, from a fresh producer (a restart with the old seed).
+        assert_eq!(
+            SelfSignedRouteProducer::new()
+                .ensure(&signer, dir, DEST, TPK, &pair(), 0)
+                .await,
+            SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Superseded)
+        );
+    }
+
+    /// The new asserted_at is strictly after the stored one even when the
+    /// stored clock is ahead of ours (skew, or a sub-µs re-sign).
+    #[test]
+    fn next_asserted_at_strictly_exceeds_the_stored_clock() {
+        let ahead = Utc::now() + chrono::Duration::seconds(60);
+        let ahead = ciris_persist::federation::admission::truncate_to_substrate_resolution(ahead);
+        assert_eq!(
+            next_asserted_at(Some(ahead)),
+            ahead + chrono::Duration::microseconds(1)
+        );
+        let behind = Utc::now() - chrono::Duration::seconds(60);
+        assert!(next_asserted_at(Some(behind)) > behind);
+    }
+
+    /// CIRISEdge#805 (c): a Rooted signed binding that publishes NO pair
+    /// resolves to `None` (the peer cannot relay); one with a pair resolves
+    /// to it.
+    #[tokio::test]
+    async fn rooted_binding_without_a_pair_resolves_none() {
+        let backend = backend();
+        let signer = hybrid_signer("self-route-nopair");
+        register(&backend, &signer).await;
+        let dir: &dyn RootingDirectory = backend.as_ref();
+        let pqc = signer.pqc.clone().expect("hybrid");
+
+        let bare = build_and_sign_self_route(
+            &signer,
+            pqc.as_ref(),
+            hex::encode(DEST),
+            &TPK,
+            None,
+            0,
+            None,
+        )
+        .await
+        .expect("sign");
+        assert_eq!(
+            dir.put_signed_transport_destination(&bare).await.unwrap(),
+            TransportDestinationApplyOutcome::Inserted
+        );
+        let resolver = crate::transport::transit_kex_peer::PeerTransitResolver::new();
+        assert_eq!(
+            resolver
+                .resolve(backend.as_ref(), &signer.key_id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // The producer re-signs with the pair (the stored row lacks it).
+        assert_eq!(
+            SelfSignedRouteProducer::new()
+                .ensure(&signer, dir, DEST, TPK, &pair(), 0)
+                .await,
+            SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Superseded)
+        );
+        assert_eq!(
+            resolver
+                .resolve(backend.as_ref(), &signer.key_id)
+                .await
+                .unwrap(),
+            Some(pair())
         );
     }
 }
