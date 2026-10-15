@@ -913,6 +913,9 @@ pub const AV_CALL_FRAME_UNOPENED: &str = "av_call_frame_unopened";
 pub const AV_CALL_FRAME_NO_KEY: &str = "av_call_frame_no_key";
 /// CIRISEdge#805 item 5 — a call frame this node relayed to a member.
 pub const AV_CALL_RELAYED: &str = "av_call_relayed";
+/// CIRISEdge#805 item 6 — this attendee's call row was refused; the call
+/// stays live.
+pub const AV_CALL_RECORD_REFUSED: &str = "av_call_record_refused";
 /// CIRISEdge#805 (CC 5.3.3.5 E1) — this node dialled an A/V link and sent its
 /// transit KEX handshake; the hop's keys are installed.
 pub const AV_TRANSIT_KEX_INITIATED: &str = "av_transit_kex_initiated";

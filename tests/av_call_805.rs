@@ -40,9 +40,10 @@ use ciris_edge::mls::{CohortGroup, ScopeStateProvider};
 use ciris_edge::scope_addressing::{ScopeAddressTable, ScopePrivacyDeriver};
 use ciris_edge::scope_lifecycle::{ScopeLifecycle, ScopedDestinationSink};
 use ciris_edge::transport::av_call::{
-    Call, CallDeps, CallError, CallEvent, CallOptions, CallState, Frame, LegOutcome, ReceivedFrame,
-    RoomRoster,
+    Call, CallAttendance, CallDeps, CallError, CallEvent, CallOptions, CallRecord, CallState,
+    Frame, LegOutcome, ReceivedFrame, RoomRoster,
 };
+use ciris_edge::transport::av_call_key::CallId;
 use ciris_edge::transport::av_keep::{AvKeep, AvKeepTarget, StreamDekRegistrar};
 use ciris_edge::transport::realtime_av::{ChunkLayer, ChunkSeq, ReceiverLayerPolicy, CODEC_OPAQUE};
 use ciris_edge::transport::reticulum::{
@@ -401,6 +402,17 @@ async fn join(
     opts: CallOptions,
     registrar: Arc<dyn StreamDekRegistrar>,
 ) -> Result<Call, CallError> {
+    join_recorded(node, group, tag, opts, registrar, None).await
+}
+
+async fn join_recorded(
+    node: &Node,
+    group: &CohortGroup,
+    tag: &str,
+    opts: CallOptions,
+    registrar: Arc<dyn StreamDekRegistrar>,
+    record: Option<Arc<dyn CallRecord>>,
+) -> Result<Call, CallError> {
     Call::join(
         &room_of(tag),
         &node.key.key_id,
@@ -412,6 +424,7 @@ async fn join(
             registrar,
             events: None,
             metrics: Some(node.metrics.clone()),
+            record,
         },
         opts,
     )
@@ -811,6 +824,7 @@ async fn joining_is_membership_by_name() {
         registrar: Arc::new(CountingRegistrar::default()),
         events: None,
         metrics: None,
+        record: None,
     };
     // A room X is not in.
     let other = CohortGroup::create(store("a2-other"), "room-a2", "someone-else", 16)
@@ -851,4 +865,73 @@ async fn joining_is_membership_by_name() {
         x.lifecycle.groups().is_empty(),
         "no address was installed for a refused join"
     );
+}
+
+/// A call-row door that refuses every write (persist refusing the put).
+struct RefusingRecord(String);
+
+#[async_trait::async_trait]
+impl CallRecord for RefusingRecord {
+    fn attendee(&self) -> &str {
+        &self.0
+    }
+    async fn record_join(
+        &self,
+        _room: &str,
+        _call: CallId,
+        _at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        Err("put call row: refused by the directory double".to_owned())
+    }
+    async fn attendance(&self, _room: &str, _call: CallId) -> Result<CallAttendance, String> {
+        Ok(CallAttendance::default())
+    }
+}
+
+/// **(d)** The call row is refused: `RecordRefused` fires ONCE, the call
+/// stays live, and frames still flow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_refused_call_row_is_one_event_and_the_call_lives() {
+    let tag = "rr";
+    let (nodes, groups, _tmp) = mesh(tag, 2).await;
+    let (a, b) = (&nodes[0], &nodes[1]);
+    let none = || Arc::new(CountingRegistrar::default()) as Arc<dyn StreamDekRegistrar>;
+    let mut call_a = join_recorded(
+        a,
+        &groups[0],
+        tag,
+        CallOptions::default(),
+        none(),
+        Some(Arc::new(RefusingRecord(a.key.key_id.clone())) as Arc<dyn CallRecord>),
+    )
+    .await
+    .expect("A joins though its row is refused");
+    let mut call_b = join(b, &groups[1], tag, CallOptions::default(), none())
+        .await
+        .expect("B joins");
+    let mut events = call_a.events().expect("events");
+    match tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
+        Ok(Some(CallEvent::RecordRefused { reason })) => {
+            assert!(reason.contains("refused"), "{reason}");
+        }
+        other => panic!("RecordRefused at once: {other:?}"),
+    }
+    assert_eq!(call_a.state(), CallState::Live, "the call lives");
+    wait_legs(&call_a, 1).await;
+    let mut frames_b = call_b.frames().expect("B");
+    for s in 0..5u64 {
+        call_a
+            .publish(Frame::opaque(body("a", s)))
+            .await
+            .expect("frames still go out");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut seen = Vec::new();
+    assert!(collect_from(&mut frames_b, &mut seen, &a.key.key_id, 5).await);
+    assert_eq!(av(&a.metrics, "av_call_record_refused"), 1);
+    // Once: nothing more about the row on the event stream.
+    while let Ok(e) = events.try_recv() {
+        assert!(!matches!(e, CallEvent::RecordRefused { .. }), "fired twice");
+    }
+    assert_eq!(call_a.attendees().await, vec![a.key.key_id.clone()]);
 }

@@ -345,6 +345,8 @@ impl<R: StreamDekRegistrar> KeptAvPublisher<R> {
 
     /// CIRISEdge#805 item 5 — the publisher's dispatcher (per-leg fan-out,
     /// layer policy, roster).
+    // Its one caller is the room call (`av_call`), a Reticulum-gated module.
+    #[cfg(feature = "_reticulum-module")]
     pub(crate) fn dispatcher_mut(
         &mut self,
     ) -> &mut crate::transport::realtime_av_dispatcher::AvDispatcher {

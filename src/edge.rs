@@ -4210,6 +4210,23 @@ impl Edge {
         room: &str,
         opts: crate::transport::av_call::CallOptions,
     ) -> Result<crate::transport::av_call::Call, crate::transport::av_call::CallError> {
+        self.join_call_as(room, opts, None).await
+    }
+
+    /// CIRISEdge#805 items 5–6 — [`Self::join_call`], attending as `actor`
+    /// (the room member: the human's signer as they join). The call row
+    /// (`chat:call:v1`) is the actor's, with this node co-scrubbing; `None`
+    /// attends as the node itself.
+    ///
+    /// # Errors
+    /// As [`Self::join_call`].
+    #[cfg(feature = "_reticulum-module")]
+    pub async fn join_call_as(
+        &self,
+        room: &str,
+        opts: crate::transport::av_call::CallOptions,
+        actor: Option<Arc<LocalSigner>>,
+    ) -> Result<crate::transport::av_call::Call, crate::transport::av_call::CallError> {
         use crate::transport::av_call::{Call, CallDeps, CallError};
         let missing = |what: &str| CallError::Plumbing(format!("join_call needs {what}"));
         let transport = self
@@ -4244,6 +4261,11 @@ impl Edge {
                 as Arc<dyn crate::transport::av_keep::StreamDekRegistrar>
         });
         let own = transport.occurrence_key_id().to_owned();
+        let record = Arc::new(crate::transport::av_call::PersistCallRecord {
+            directory: Arc::clone(&directory),
+            actor: actor.unwrap_or_else(|| Arc::clone(&self.signer)),
+            node: Arc::clone(&self.signer),
+        }) as Arc<dyn crate::transport::av_call::CallRecord>;
         Call::join(
             room,
             &own,
@@ -4255,6 +4277,7 @@ impl Edge {
                 registrar,
                 events: Some(Arc::clone(&self.events)),
                 metrics: Some(self.metrics()),
+                record: Some(record),
             },
             opts,
         )

@@ -156,7 +156,7 @@ pub enum AvRuntimeError {
 pub enum AvKeySource {
     /// The pre-item-5 shape: a per-stream MLS group whose exporter yields the
     /// DEK and whose own commits move the epoch.
-    Session(AvSession),
+    Session(Box<AvSession>),
     /// A room call: the DEK is `av_call_key::stream_epoch_dek` over the
     /// ROOM's MLS group, supplied at each room epoch; the publisher never
     /// commits (the call's epoch IS the room's, CC C2).
@@ -259,7 +259,7 @@ impl AvPublisher {
         );
         Ok(Self {
             stream_id,
-            key_source: AvKeySource::Session(session),
+            key_source: AvKeySource::Session(Box::new(session)),
             epoch,
             dek,
             dispatcher,
@@ -344,6 +344,8 @@ impl AvPublisher {
 
     /// CIRISEdge#805 item 5 — the publisher's dispatcher, for the per-leg
     /// fan-out and the relay-side layer policy of a room call.
+    // Its one caller is the room call (`av_call`), a Reticulum-gated module.
+    #[cfg(feature = "_reticulum-module")]
     pub(crate) fn dispatcher_mut(&mut self) -> &mut AvDispatcher {
         &mut self.dispatcher
     }

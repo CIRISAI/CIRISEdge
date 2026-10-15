@@ -283,6 +283,17 @@ pub enum CallEvent {
         /// Why.
         reason: String,
     },
+    /// A key attended the call (its row arrived).
+    AttendeeJoined {
+        /// Its key id.
+        key_id: String,
+    },
+    /// This attendee's call row was refused. Fired once; the call stays live
+    /// and edge never fakes a row.
+    RecordRefused {
+        /// The refusal.
+        reason: String,
+    },
 }
 
 /// Why a call verb was refused (§8).
@@ -379,6 +390,154 @@ impl<F: ciris_persist::federation::FederationDirectory + ?Sized> RoomRoster for 
     }
 }
 
+// ─── the call row (item 6: a call is an attestation of its attendees) ──
+
+/// Who attended a call, as its rows say (`chat::CALL_DIMENSION`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallAttendance {
+    /// Every key that attended: the UNION of the subjects of every row of the
+    /// call, sorted and deduped. A leaver stays: its row stands.
+    pub attendees: Vec<String>,
+    /// The earliest `asserted_at` among the call's rows (derived, never a
+    /// field anyone rewrites).
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// How many rows the set was read from.
+    pub rows: usize,
+}
+
+/// The call-row door: write this attendee's row, read the call's rows.
+#[async_trait::async_trait]
+pub trait CallRecord: Send + Sync {
+    /// The key this node attends as: the row's attester and only subject.
+    fn attendee(&self) -> &str;
+
+    /// Write and share this attendee's row for `call` in `room`.
+    ///
+    /// # Errors
+    /// The row was refused (by persist, or by the share).
+    async fn record_join(
+        &self,
+        room: &str,
+        call: CallId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String>;
+
+    /// The call's attendance, read from its rows.
+    ///
+    /// # Errors
+    /// The read failed.
+    async fn attendance(&self, room: &str, call: CallId) -> Result<CallAttendance, String>;
+}
+
+/// The call-row door over persist: the attendee's row is authored `self` by
+/// `actor` and shared to the room (two rows, like any chat row), so it
+/// reaches exactly the room's members. The read is bounded: per active room
+/// member, its rows of `chat:call:v1` (`chat::rows_in_room`), then this call's.
+pub struct PersistCallRecord {
+    /// The node's directory.
+    pub directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
+    /// The attendee: the attester of its row (the human's signer, or the
+    /// node's when the node attends as itself).
+    pub actor: Arc<crate::identity::LocalSigner>,
+    /// This node: custody for the crossing.
+    pub node: Arc<crate::identity::LocalSigner>,
+}
+
+/// The `call_id` member's spelling of a call: lowercase hex.
+#[must_use]
+pub fn call_id_hex(call: CallId) -> String {
+    hex::encode(call.0)
+}
+
+#[async_trait::async_trait]
+impl CallRecord for PersistCallRecord {
+    fn attendee(&self) -> &str {
+        &self.actor.key_id
+    }
+
+    async fn record_join(
+        &self,
+        room: &str,
+        call: CallId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        use crate::replication::attestation_bind::{share, CrossingBasis, Signers, With};
+        let row =
+            crate::chat::call_attestation_in(&self.actor, room, &call_id_hex(call), at).await?;
+        self.directory
+            .put_attestation(ciris_persist::federation::SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .map_err(|e| format!("put call row: {e}"))?;
+        share(
+            self.directory.as_ref(),
+            &row,
+            With::Community {
+                community_key_id: room.to_owned(),
+            },
+            CrossingBasis::ProducerAuthority,
+            Signers {
+                node: &self.node,
+                actor: Some(&self.actor),
+            },
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("share call row: {e}"))
+    }
+
+    async fn attendance(&self, room: &str, call: CallId) -> Result<CallAttendance, String> {
+        let members: Vec<String> = self
+            .directory
+            .active_community_members(room)
+            .await
+            .map_err(|e| format!("active roster of {room}: {e}"))?
+            .into_iter()
+            .map(|m| m.key_id)
+            .collect();
+        let rows = crate::chat::rows_in_room(
+            self.directory.as_ref(),
+            &members,
+            room,
+            crate::chat::CALL_DIMENSION,
+        )
+        .await?;
+        Ok(attendance_of(&rows, &call_id_hex(call)))
+    }
+}
+
+/// **The attendee set is the UNION** of the subjects of every row of the
+/// call: union commutes, so concurrent joins never fork it, and a leaver's
+/// row keeps it in.
+#[must_use]
+pub fn attendance_of(
+    rows: &[ciris_persist::federation::Attestation],
+    call_hex: &str,
+) -> CallAttendance {
+    let of_call: Vec<&ciris_persist::federation::Attestation> = rows
+        .iter()
+        .filter(|r| crate::chat::call_id_of(r) == Some(call_hex))
+        .collect();
+    let mut attendees: Vec<String> = of_call
+        .iter()
+        .flat_map(|r| {
+            if r.subject_key_ids.is_empty() {
+                vec![r.attesting_key_id.clone()]
+            } else {
+                r.subject_key_ids.clone()
+            }
+        })
+        .collect();
+    attendees.sort();
+    attendees.dedup();
+    CallAttendance {
+        attendees,
+        started_at: of_call.iter().map(|r| r.asserted_at).min(),
+        rows: of_call.len(),
+    }
+}
+
 /// Everything a call runs on.
 pub struct CallDeps {
     /// The room's MLS group (its current epoch keys the call).
@@ -395,6 +554,9 @@ pub struct CallDeps {
     pub events: Option<Arc<crate::events::EventBus>>,
     /// The node's metrics.
     pub metrics: Option<crate::observability::EdgeMetrics>,
+    /// The call-row door (item 6). `None`: this node writes no call row and
+    /// knows only the attendees it hears.
+    pub record: Option<Arc<dyn CallRecord>>,
 }
 
 // ─── identifiers ────────────────────────────────────────────────────
@@ -579,8 +741,7 @@ impl ReorderWindow {
         let Some(w) = self.streams.get_mut(&stream) else {
             return out;
         };
-        loop {
-            let Some(next) = w.next else { break };
+        while let Some(next) = w.next {
             let Some((&head, &(first_seen, _))) = w.buf.iter().next() else {
                 break;
             };
@@ -713,18 +874,15 @@ impl CallRouter {
                         .get(g)
                         .cloned()
                 });
-                match tx {
-                    Some(tx) => {
-                        let _ = tx.send(arrival).await;
-                    }
-                    None => {
-                        r.unrouted.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(
-                            peer = %arrival.peer.as_str(),
-                            group = ?group,
-                            "A/V link for no live call on this node — dropped (CIRISEdge#805)"
-                        );
-                    }
+                if let Some(tx) = tx {
+                    let _ = tx.send(arrival).await;
+                } else {
+                    r.unrouted.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        peer = %arrival.peer.as_str(),
+                        group = ?group,
+                        "A/V link for no live call on this node — dropped (CIRISEdge#805)"
+                    );
                 }
             }
         });
@@ -802,6 +960,15 @@ struct Shared {
     /// Test seam: withhold every `n`th own chunk (`chunk_seq % n == 0`) from
     /// the named member's leg (simulated loss on the direct leg).
     test_withhold: StdMutex<Option<(String, u64)>>,
+    /// The call-row door, if any.
+    record: Option<Arc<dyn CallRecord>>,
+    /// The key this node attends as.
+    attendee: String,
+    /// Attendees already announced on `events()`.
+    attendees_known: StdMutex<std::collections::BTreeSet<String>>,
+    /// The one `RecordRefused` has fired.
+    record_refused: AtomicBool,
+    id: CallId,
 }
 
 impl Shared {
@@ -875,59 +1042,19 @@ impl Call {
             registrar,
             events,
             metrics,
+            record,
         } = deps;
-        let members = room_group.member_key_ids().await;
-        if !members.iter().any(|m| m == own_key_id) {
-            return Err(CallError::NotARoomMember {
-                key_id: own_key_id.to_owned(),
-                room: room.to_owned(),
-            });
-        }
-        let active = roster
-            .is_active_member(room, own_key_id)
-            .await
-            .map_err(|detail| CallError::RoomGroupUnavailable {
-                room: room.to_owned(),
-                detail: format!("active roster unreadable: {detail}"),
-            })?;
-        if !active {
-            return Err(CallError::ConsentMissing {
-                key_id: own_key_id.to_owned(),
-                room: room.to_owned(),
-            });
-        }
-
+        let attendee = record
+            .as_ref()
+            .map_or_else(|| own_key_id.to_owned(), |r| r.attendee().to_owned());
+        let members = admit(room, own_key_id, &attendee, &room_group, roster.as_ref()).await?;
         let id = call_id_for_room(room);
         let group_id = call_group_id(id);
         let scope = CohortScope::Cohort {
             cohort_id: room.to_owned(),
         };
-        let mut join_nonce = [0u8; 32];
-        ciris_crypto::random::fill(&mut join_nonce)
-            .map_err(|e| CallError::Plumbing(format!("join nonce: {e}")))?;
-        let stream = call_stream_id(room, own_key_id, &join_nonce);
-        let epoch = Epoch(room_group.epoch().await);
-        let dek = stream_epoch_dek(&room_group, stream, epoch)
-            .await
-            .map_err(|e| CallError::RoomGroupUnavailable {
-                room: room.to_owned(),
-                detail: e.to_string(),
-            })?;
-        let (publisher, keep) = KeptAvPublisher::create_room_keyed(
-            stream,
-            room,
-            epoch,
-            dek,
-            opts.keep,
-            AvKeepTarget {
-                cohort_scope: "community".to_owned(),
-                group_key_id: room.to_owned(),
-            },
-            registrar,
-            events,
-        )
-        .await
-        .map_err(|e| CallError::Plumbing(e.to_string()))?;
+        let (stream, epoch, publisher, keep) =
+            start_stream(room, own_key_id, &room_group, opts.keep, registrar, events).await?;
 
         // Addresses: the call's group, from the room's destination secret at
         // the room's epoch, for the room's members.
@@ -975,6 +1102,11 @@ impl Call {
             metrics,
             test_relay_delay_ms: AtomicU64::new(0),
             test_withhold: StdMutex::new(None),
+            record,
+            attendee,
+            attendees_known: StdMutex::new(std::collections::BTreeSet::new()),
+            record_refused: AtomicBool::new(false),
+            id,
         });
         if let KeepOutcome::Refused(refused) = keep {
             shared.emit(CallEvent::KeepRefused {
@@ -989,6 +1121,9 @@ impl Call {
             relay = opts.relay,
             "CALL JOINED: this node's stream is live in the room's call (CIRISEdge#805 item 5)"
         );
+
+        Shared::lock(&shared.attendees_known).insert(shared.attendee.clone());
+        write_call_row(&shared).await;
 
         let counts = Arc::new(StdMutex::new(ReorderCounts::default()));
         let tasks = vec![
@@ -1176,6 +1311,28 @@ impl Call {
         *Shared::lock(&self.shared.test_withhold) = Some((member.to_owned(), every));
     }
 
+    /// **Who attended** (item 6): the union of the subjects of every row of
+    /// this call, plus this node's own attendance. A leaver stays.
+    pub async fn attendees(&self) -> Vec<String> {
+        self.attendance().await.attendees
+    }
+
+    /// [`Self::attendees`] with the call's start (its earliest row).
+    pub async fn attendance(&self) -> CallAttendance {
+        let mut a = match &self.shared.record {
+            Some(r) => r
+                .attendance(&self.shared.room, self.id)
+                .await
+                .unwrap_or_default(),
+            None => CallAttendance::default(),
+        };
+        if !a.attendees.contains(&self.shared.attendee) {
+            a.attendees.push(self.shared.attendee.clone());
+            a.attendees.sort();
+        }
+        a
+    }
+
     /// Where the call stands.
     #[must_use]
     pub fn state(&self) -> CallState {
@@ -1234,6 +1391,79 @@ impl Call {
             duplicates: counts.duplicates,
         })
     }
+}
+
+/// §3.3 — joining is presence, not admission: `own_key_id` must be in the
+/// room's MLS group and on persist's active roster. Returns the group's
+/// members.
+async fn admit(
+    room: &str,
+    own_key_id: &str,
+    attendee: &str,
+    room_group: &CohortGroup,
+    roster: &dyn RoomRoster,
+) -> Result<Vec<String>, CallError> {
+    let members = room_group.member_key_ids().await;
+    if !members.iter().any(|m| m == own_key_id) {
+        return Err(CallError::NotARoomMember {
+            key_id: own_key_id.to_owned(),
+            room: room.to_owned(),
+        });
+    }
+    // The roster names the ATTENDEE (the room's member), the group the node.
+    let active = roster
+        .is_active_member(room, attendee)
+        .await
+        .map_err(|detail| CallError::RoomGroupUnavailable {
+            room: room.to_owned(),
+            detail: format!("active roster unreadable: {detail}"),
+        })?;
+    if !active {
+        return Err(CallError::ConsentMissing {
+            key_id: attendee.to_owned(),
+            room: room.to_owned(),
+        });
+    }
+    Ok(members)
+}
+
+/// Mint this join's stream (a fresh nonce: a call never reuses a stream) and
+/// its room-keyed publisher at the room's current epoch.
+async fn start_stream(
+    room: &str,
+    own_key_id: &str,
+    room_group: &CohortGroup,
+    keep: AvKeep,
+    registrar: Arc<dyn StreamDekRegistrar>,
+    events: Option<Arc<crate::events::EventBus>>,
+) -> Result<(StreamId, Epoch, Publisher, KeepOutcome), CallError> {
+    let mut join_nonce = [0u8; 32];
+    ciris_crypto::random::fill(&mut join_nonce)
+        .map_err(|e| CallError::Plumbing(format!("join nonce: {e}")))?;
+    let stream = call_stream_id(room, own_key_id, &join_nonce);
+    let epoch = Epoch(room_group.epoch().await);
+    let dek = stream_epoch_dek(room_group, stream, epoch)
+        .await
+        .map_err(|e| CallError::RoomGroupUnavailable {
+            room: room.to_owned(),
+            detail: e.to_string(),
+        })?;
+    let (publisher, outcome) = KeptAvPublisher::create_room_keyed(
+        stream,
+        room,
+        epoch,
+        dek,
+        keep,
+        AvKeepTarget {
+            cohort_scope: "community".to_owned(),
+            group_key_id: room.to_owned(),
+        },
+        registrar,
+        events,
+    )
+    .await
+    .map_err(|e| CallError::Plumbing(e.to_string()))?;
+    Ok((stream, epoch, publisher, outcome))
 }
 
 fn leg_outcome(leg: LegSend) -> LegOutcome {
@@ -1311,54 +1541,10 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
         publisher.remove_subscriber(m);
     }
     drop(publisher);
-    *Shared::lock(&shared.members) = members.clone();
+    Shared::lock(&shared.members).clone_from(&members);
     Shared::lock(&shared.epochs).push(room_epoch);
-    let mut closing = Vec::new();
-    {
-        let mut legs = Shared::lock(&shared.out_legs);
-        for m in &left {
-            if let Some(l) = legs.remove(m) {
-                closing.push(l.link_id);
-            }
-        }
-    }
-    {
-        let mut ins = Shared::lock(&shared.in_links);
-        ins.retain(|link, peer| {
-            if left.contains(peer) {
-                closing.push(*link);
-                false
-            } else {
-                true
-            }
-        });
-    }
-    for l in closing {
-        let _ = shared.transport.link_teardown(&l).await;
-    }
-    match room_snapshot(&shared.room_group, &shared.group_id, &members).await {
-        Ok(snapshot) => {
-            if let Err(e) = shared
-                .lifecycle
-                .advance(&shared.scope, &snapshot, Instant::now())
-            {
-                *Shared::lock(&shared.state) = CallState::Degraded {
-                    epoch: room_epoch,
-                    reason: e.to_string(),
-                };
-                shared.emit(CallEvent::Stranded {
-                    epoch: room_epoch,
-                    reason: e.to_string(),
-                });
-            }
-        }
-        Err(e) => {
-            *Shared::lock(&shared.state) = CallState::Degraded {
-                epoch: room_epoch,
-                reason: e.to_string(),
-            };
-        }
-    }
+    close_departed(shared, &left).await;
+    readdress(shared, room_epoch, &members).await;
     shared.emit(CallEvent::EpochRolled {
         from,
         to: room_epoch,
@@ -1383,6 +1569,53 @@ async fn roll_if_moved(shared: &Arc<Shared>) -> Result<(), CallError> {
     );
     reconcile_legs(shared);
     Ok(())
+}
+
+/// Close every link to or from a member who left the room.
+async fn close_departed(shared: &Arc<Shared>, left: &[String]) {
+    let mut closing = Vec::new();
+    {
+        let mut legs = Shared::lock(&shared.out_legs);
+        for m in left {
+            if let Some(l) = legs.remove(m) {
+                closing.push(l.link_id);
+            }
+        }
+    }
+    Shared::lock(&shared.in_links).retain(|link, peer| {
+        if left.contains(peer) {
+            closing.push(*link);
+            false
+        } else {
+            true
+        }
+    });
+    for l in closing {
+        let _ = shared.transport.link_teardown(&l).await;
+    }
+}
+
+/// Move the call's addresses to the room's new epoch; a failure strands the
+/// call (Degraded) without stopping its live links.
+async fn readdress(shared: &Arc<Shared>, room_epoch: u64, members: &[String]) {
+    let outcome = match room_snapshot(&shared.room_group, &shared.group_id, members).await {
+        Ok(snapshot) => shared
+            .lifecycle
+            .advance(&shared.scope, &snapshot, Instant::now())
+            .map(|_| ())
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    if let Err(reason) = outcome {
+        *Shared::lock(&shared.state) = CallState::Degraded {
+            epoch: room_epoch,
+            reason: reason.clone(),
+        };
+        shared.emit(CallEvent::Stranded {
+            epoch: room_epoch,
+            reason,
+        });
+    }
 }
 
 /// Dial every member this node has no leg to (and is not already dialling,
@@ -1512,13 +1745,13 @@ async fn accept_loop(shared: Arc<Shared>, mut arrivals: mpsc::Receiver<AvArrival
 /// One member's link to this node: the transit KEX (with the claim check),
 /// the stream hello, then the pump.
 async fn serve_inbound(shared: Arc<Shared>, arrival: AvArrival) {
-    let accepted = match shared.transport.accept_av_arrival(arrival).await {
-        Ok(a) => a,
-        Err(_) => return, // refused by name and counted by the transport
+    // A refusal is named and counted by the transport.
+    let Ok(accepted) = shared.transport.accept_av_arrival(arrival).await else {
+        return;
     };
     let peer = accepted.arrival.peer.as_str().to_owned();
     let link_id = accepted.arrival.link_id;
-    if !Shared::lock(&shared.members).iter().any(|m| *m == peer) {
+    if !Shared::lock(&shared.members).contains(&peer) {
         tracing::warn!(peer = %peer, "call: a link from a non-member — closed");
         let _ = shared.transport.link_teardown(&link_id).await;
         return;
@@ -1678,13 +1911,61 @@ async fn reorder_loop(
     }
 }
 
+/// How often (in watch ticks) a call reads its rows for new attendees.
+const ATTENDANCE_EVERY_TICKS: u64 = 4;
+
+/// Write this attendee's call row. A refusal fires `RecordRefused` once and
+/// the call carries on; nothing is faked.
+async fn write_call_row(shared: &Arc<Shared>) {
+    let Some(record) = &shared.record else {
+        return;
+    };
+    let at = chrono::Utc::now();
+    if let Err(reason) = record.record_join(&shared.room, shared.id, at).await {
+        shared.count(crate::observability::AV_CALL_RECORD_REFUSED);
+        if !shared.record_refused.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                room = %shared.room,
+                reason = %reason,
+                "call row REFUSED — the call stays live; no row is faked (CIRISEdge#805 item 6)"
+            );
+            shared.emit(CallEvent::RecordRefused { reason });
+        }
+    }
+}
+
+/// Announce attendees whose rows arrived since the last read.
+async fn announce_attendees(shared: &Arc<Shared>) {
+    let Some(record) = &shared.record else {
+        return;
+    };
+    let Ok(a) = record.attendance(&shared.room, shared.id).await else {
+        return;
+    };
+    let fresh: Vec<String> = {
+        let mut known = Shared::lock(&shared.attendees_known);
+        a.attendees
+            .into_iter()
+            .filter(|k| known.insert(k.clone()))
+            .collect()
+    };
+    for key_id in fresh {
+        shared.emit(CallEvent::AttendeeJoined { key_id });
+    }
+}
+
 /// Follow the room: roll when its epoch moves, keep every member's leg up.
 async fn watch_loop(shared: Arc<Shared>) {
     let mut tick = tokio::time::interval(WATCH_TICK);
+    let mut n: u64 = 0;
     loop {
         tick.tick().await;
         if shared.ended.load(Ordering::Relaxed) {
             return;
+        }
+        n = n.wrapping_add(1);
+        if n % ATTENDANCE_EVERY_TICKS == 0 {
+            announce_attendees(&shared).await;
         }
         if let Err(CallError::CallEnded(_)) = roll_if_moved(&shared).await {
             return;

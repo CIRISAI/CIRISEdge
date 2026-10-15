@@ -90,7 +90,9 @@ fn a_chunk_lost_on_every_leg_is_skipped_at_its_deadline() {
     assert!(w.push(frame(S1, 1, 3), t).is_empty());
     let deadline = w.next_deadline().expect("a gap is pending");
     assert!(deadline <= t + REORDER_WINDOW_MAX);
-    assert!(w.tick(deadline - Duration::from_millis(1)).is_empty());
+    assert!(w
+        .tick(deadline.checked_sub(Duration::from_millis(1)).unwrap())
+        .is_empty());
     assert_eq!(keys(&w.tick(deadline)), vec![(1, 2), (1, 3)]);
     assert_eq!(w.counts().skipped, 1);
     // The lost chunk turning up after its slot is late, not released.
