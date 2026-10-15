@@ -805,19 +805,17 @@ async fn av_chunks_ride_the_replicating_node_805() {
             outbound_send: Box::new(link.sender),
         })
         .expect("attach the hop");
-    let b_sub = Some(
-        AvSubscriber::subscribe(
-            call.stream,
-            &call.sub_dek,
-            &p.a.key.key_id,
-            AvInboundLink {
-                transit_key: accepted.transit.open_key(),
-                link_id: hop_link_id.clone(),
-                inbound_recv: Box::new(accepted.arrival.inbound),
-            },
-        )
-        .expect("subscribe"),
-    );
+    let mut rx = AvSubscriber::subscribe(
+        call.stream,
+        &call.sub_dek,
+        &p.a.key.key_id,
+        AvInboundLink {
+            transit_key: accepted.transit.open_key(),
+            link_id: hop_link_id.clone(),
+            inbound_recv: Box::new(accepted.arrival.inbound),
+        },
+    )
+    .expect("subscribe");
 
     // Replication, concurrently: an identity-plane Deliver and driven rounds
     // between the same two transports.
@@ -897,7 +895,6 @@ async fn av_chunks_ride_the_replicating_node_805() {
     sent.push((fanout.chunk_seq, after));
 
     // B's consumer: every chunk, in order, byte-identical.
-    let mut rx = b_sub.expect("subscribed");
     for (seq, body) in &sent {
         let got = tokio::time::timeout(Duration::from_secs(20), rx.recv())
             .await

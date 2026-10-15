@@ -5220,9 +5220,28 @@ impl ReticulumTransport {
         .with_metrics(self.metrics.get().cloned())
         .with_direct_path(direct_path)
         .with_outbound_liveness(Arc::clone(&self.link_last_outbound_at));
-        // CIRISEdge#805 (CC 5.3.3.5 E1) — the hop's transit key: this node
-        // dialled, so it INITIATES, and the handshake is the link's first
-        // message. Nothing else keys the hop; no pair means no link.
+        self.key_av_dial(
+            destination_key_id,
+            initiator_key_id,
+            link_id,
+            inbound,
+            sender,
+        )
+        .await
+    }
+
+    /// CIRISEdge#805 (CC 5.3.3.5 E1) — the last step of an A/V dial: key the
+    /// hop. This node dialled, so it INITIATES, and the handshake is the
+    /// link's first message. Nothing else keys the hop; no pair means no
+    /// link, and a refused dial is undone like any other failed one.
+    async fn key_av_dial(
+        &self,
+        destination_key_id: &str,
+        initiator_key_id: &str,
+        link_id: LinkId,
+        inbound: crate::transport::realtime_av_runtime::PumpReceiver,
+        sender: crate::transport::realtime_av_runtime::LeviculumAvSender,
+    ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
         let transit = match self
             .initiate_av_transit(destination_key_id, initiator_key_id, link_id, &sender)
             .await

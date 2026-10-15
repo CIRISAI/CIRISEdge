@@ -1482,10 +1482,8 @@ async fn the_transit_kex_refuses_a_false_claim_and_a_missing_pair_by_name() {
         "{r_av:?}"
     );
     assert_eq!(r_av.get("av_relay_dialler_admitted").copied(), None);
-    let mut seq = 0u64;
-    for _ in 0..15 {
+    for seq in 0..15u64 {
         let _ = publisher.publish_inner(legs_chunk(seq)).await;
-        seq += 1;
         tokio::time::sleep(Duration::from_millis(33)).await;
     }
     let heard = tokio::time::timeout(Duration::from_secs(2), liar.inbound.recv()).await;

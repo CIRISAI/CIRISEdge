@@ -59,7 +59,7 @@ fn relay_secret() -> TransitKexSecret {
 /// the relay responds and checks the claim against `proven`.
 async fn handshake(
     claimed: &str,
-    responder: &str,
+    addressed_to: &str,
     proven: &str,
 ) -> (
     Result<LinkTransit, AvHandshakeError>,
@@ -67,8 +67,15 @@ async fn handshake(
 ) {
     let secret = relay_secret();
     let (tx, rx) = link();
-    let initiated =
-        initiate_on_link(&tx, CHANNEL_LIMIT, &LINK, claimed, responder, secret.pair()).await;
+    let initiated = initiate_on_link(
+        &tx,
+        CHANNEL_LIMIT,
+        &LINK,
+        claimed,
+        addressed_to,
+        secret.pair(),
+    )
+    .await;
     let responded = respond_on_link(&rx, &LINK, RELAY, &secret, proven).await;
     (initiated, responded)
 }
@@ -128,7 +135,9 @@ async fn keys_line_up_by_role_and_both_directions_open() {
 #[test]
 fn fragments_fit_the_channel_and_reassemble() {
     for len in [1usize, 400, 1200, 1300, 4096, MAX_HANDSHAKE_BYTES] {
-        let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let bytes: Vec<u8> = (0..len)
+            .map(|i| u8::try_from(i % 251).expect("< 251"))
+            .collect();
         let frames = fragment(&bytes, CHANNEL_LIMIT).expect("fragment");
         assert!(frames.iter().all(|f| f.len() <= CHANNEL_LIMIT));
         let mut r = Reassembler::new();
