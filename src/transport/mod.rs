@@ -215,6 +215,11 @@ pub mod transit_kex_peer;
 #[cfg(feature = "_reticulum-module")]
 pub mod av_transit_handshake;
 
+/// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
+/// live streams (`FSD/AV_CALL_API.md`).
+#[cfg(feature = "_reticulum-module")]
+pub mod av_call;
+
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
 /// edges (CIRISEdge#169). CEG-native (the Scope-B queue: byte-exact
 /// signed CEG envelopes); pairs with Reticulum Transport-node mode

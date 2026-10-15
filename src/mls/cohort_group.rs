@@ -2691,6 +2691,26 @@ impl CohortGroups {
         }
     }
 
+    /// CIRISEdge#805 item 5 — [`Self::open`] without the create: `None` when
+    /// this node holds no state for `community_id` (it is not in the room). A
+    /// call must never stand up a fresh group for a room it was not admitted to.
+    pub async fn open_existing(
+        &self,
+        community_id: &str,
+    ) -> Result<Option<CohortGroup>, CohortGroupError> {
+        let mut live = self.live.lock().await;
+        if let Some(existing) = live.get(community_id) {
+            return Ok(Some(existing.clone()));
+        }
+        let Some(handle) =
+            CohortGroup::load(self.store.clone(), community_id, self.retained_epochs).await?
+        else {
+            return Ok(None);
+        };
+        live.insert(community_id.to_string(), handle.clone());
+        Ok(Some(handle))
+    }
+
     /// Get the live handle for `community_id`, reloading it from the
     /// sealed KV if this process has not opened it yet, and creating
     /// a fresh group if none has ever been persisted.

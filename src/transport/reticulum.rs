@@ -2292,6 +2292,10 @@ pub struct ReticulumTransport {
     /// via [`RootingDirectory::transit_kex_pair_for`]) for the A/V dial's
     /// handshake.
     transit_peers: crate::transport::transit_kex_peer::PeerTransitResolver,
+    /// CIRISEdge#805 item 5 — the router of peer-opened A/V links to the
+    /// live calls, once one exists. It owns the A/V arrivals; `None` inside
+    /// means another consumer took them first.
+    av_call_router: std::sync::OnceLock<Option<Arc<crate::transport::av_call::CallRouter>>>,
     /// The node's single `NodeEvent` receiver. `listen` takes it
     /// exactly once; a second `listen` call is a config error.
     /// Leviculum PR #9 switched this to an unbounded channel so node
@@ -3569,6 +3573,7 @@ impl ReticulumTransport {
             self_route,
             transit_kex,
             transit_peers: crate::transport::transit_kex_peer::PeerTransitResolver::new(),
+            av_call_router: std::sync::OnceLock::new(),
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
@@ -5902,6 +5907,31 @@ impl ReticulumTransport {
             "A/V dial failed after registering its link — records undone, link closed \
              (CIRISEdge#805)"
         );
+    }
+
+    /// CIRISEdge#805 item 5 — the router that hands peer-opened A/V links to
+    /// the live calls (`av_call::Call`), started on first use. It takes this
+    /// transport's A/V arrivals, so a node either runs calls or reads
+    /// [`Self::take_av_arrivals`] itself, never both.
+    ///
+    /// # Errors
+    /// [`TransportError::Config`] when another consumer took the arrivals.
+    pub fn av_call_router(
+        &self,
+    ) -> Result<Arc<crate::transport::av_call::CallRouter>, TransportError> {
+        self.av_call_router
+            .get_or_init(|| {
+                self.take_av_arrivals()
+                    .map(crate::transport::av_call::CallRouter::start)
+            })
+            .clone()
+            .ok_or_else(|| {
+                TransportError::Config(
+                    "this transport's A/V arrivals were taken by another consumer; calls \
+                     cannot be routed (CIRISEdge#805)"
+                        .to_owned(),
+                )
+            })
     }
 
     /// CIRISEdge#805 item 4 — take the receiver of A/V links PEERS open to this
