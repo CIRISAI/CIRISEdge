@@ -91,6 +91,13 @@ async fn keys_line_up_by_role_and_both_directions_open() {
     assert_eq!(sub.seal_key(), relay.open_key());
     assert_eq!(relay.seal_key(), sub.open_key());
     assert_ne!(sub.seal_key(), sub.open_key(), "one key per direction");
+    // Pinned to verify's role names, not just to each other: the relay
+    // (responder) seals with `responder_to_initiator`, which the subscriber
+    // (initiator) opens with; the initiator seals `initiator_to_responder`.
+    assert_eq!(relay.seal_key(), *relay.keys.responder_to_initiator());
+    assert_eq!(sub.open_key(), *sub.keys.responder_to_initiator());
+    assert_eq!(sub.seal_key(), *sub.keys.initiator_to_responder());
+    assert_eq!(relay.open_key(), *relay.keys.initiator_to_responder());
 
     let dek = EpochDek::from_bytes([0x44; 32]);
     let inner = seal_av_inner(
