@@ -1,5 +1,23 @@
 # CIRISEdge Release Notes
 
+# v41.1.1 — a fresh node completes key exchange with the canonical (#876)
+
+**2026-10-17.** **PATCH** from v41.1.0, a drop-in with no pin changes. Ladder triple: **edge v41.1.1 · persist
+v55.0.0 · verify v20.1.0** (leviculum v0.30.0+ciris.1).
+
+**The bug.** A replication round started by this node closed on the first reply that arrived after the peer's
+Diff, even when the bodies this node had asked for had not come yet. Over a WAN the reply carrying them is the
+round's largest frame and routinely lands after a small empty one. In the field: the canonical sent 277 B, 73 B,
+70 B, then 14,872 B, and the round closed on the 70 B frame. The 14.8 KB reply carrying the canonical's signed
+route arrived about 150 ms later, found no round open, and was dropped (`no_round_in_flight`), round after round.
+A fresh node therefore never held the canonical's signed transport binding, and key exchange with the canonical
+never completed. This affected every fresh node and agent on every platform.
+
+**The fix.** A round that asked for records stays open until a reply carrying records arrives (or the round
+times out); an empty reply no longer closes it. The round's report counts every reply it received. A round that
+asked for nothing completes exactly as before. If a peer can serve none of what was asked, the round now ends at
+its timeout instead of early; records that did arrive are kept either way.
+
 # v41.1.0 — membership at the affiliations tier
 
 **2026-10-13.** **MINOR** from v41.0.0. `membership::GroupScope` gains **`Affiliations`**
