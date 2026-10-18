@@ -20,14 +20,14 @@
 //!
 //! Test-only: the files are ~325 KB and nothing in production reads them.
 
-/// The CIRISConstitution commit both files are vendored from: `c5c8f56`, the
-/// v1.0-rc8.1 patch commit (`cc_version 1.0-rc8.1`), byte-identical to what
+/// The CIRISConstitution commit both files are vendored from: `157039d`, the
+/// `v1.0-rc8.1` tag commit (`cc_version 1.0-rc8.1`), byte-identical to what
 /// persist v58 vendors, so the replay persist runs and the one edge runs read the
 /// same bytes. rc8.1 fixes rc8's six families that baked a literal `:v1` into
 /// the prefix. (Was rc7 `536b8cb` through persist v57; rc6 `651140a` until the
-/// persist v55 adopt, rc5 `a4d29a6` until the v33.0.0 adopt.) Re-pin to the
-/// `v1.0-rc8.1` tag commit when the CC tags it.
-pub const VENDORED_CC_COMMIT: &str = "c5c8f56d476fb561739e96856fb35b073ea2a6f8";
+/// persist v55 adopt, rc5 `a4d29a6` until the v33.0.0 adopt.) The patch commit
+/// `c5c8f56` carried the same two files; the tag commit only adds the PDF.
+pub const VENDORED_CC_COMMIT: &str = "157039d3c73e5f8192e88d07bd87aea7172e6b2f";
 
 /// `_meta.registry_sha256` — the hash of the GRAMMAR (families + `_meta`
 /// minus the prose hash), CSD/3's pin. A wording edit to Part 3 moves only
