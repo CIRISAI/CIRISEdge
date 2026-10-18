@@ -20,18 +20,20 @@
 //!
 //! Test-only: the files are ~325 KB and nothing in production reads them.
 
-/// The CIRISConstitution commit both files are vendored from: `cb77137`, the
-/// commit the `v1.0-rc8` tag names (`cc_version 1.0-rc8`), copied with
-/// `git show v1.0-rc8:manifests/…`. (Was rc7 `536b8cb`, byte-identical to
-/// persist v55–v57; rc6 `651140a` until the persist v55 adopt, rc5 `a4d29a6`
-/// until the v33.0.0 adopt.)
-pub const VENDORED_CC_COMMIT: &str = "cb7713719fc07919595e7c62c125218ac734bd3f";
+/// The CIRISConstitution commit both files are vendored from: `c5c8f56`, the
+/// v1.0-rc8.1 patch commit (`cc_version 1.0-rc8.1`), byte-identical to what
+/// persist v58 vendors, so the replay persist runs and the one edge runs read the
+/// same bytes. rc8.1 fixes rc8's six families that baked a literal `:v1` into
+/// the prefix. (Was rc7 `536b8cb` through persist v57; rc6 `651140a` until the
+/// persist v55 adopt, rc5 `a4d29a6` until the v33.0.0 adopt.) Re-pin to the
+/// `v1.0-rc8.1` tag commit when the CC tags it.
+pub const VENDORED_CC_COMMIT: &str = "c5c8f56d476fb561739e96856fb35b073ea2a6f8";
 
 /// `_meta.registry_sha256` — the hash of the GRAMMAR (families + `_meta`
 /// minus the prose hash), CSD/3's pin. A wording edit to Part 3 moves only
 /// `source_sha256`; a grammar edit moves this.
 pub const VENDORED_REGISTRY_SHA256: &str =
-    "99d4d3380f42941995c3b017b5ab98d6ebc4ddb00bd0e813f806e3906fe34a3b";
+    "22b029cfd977acce779c9481cdb381a4ad274b15e5b8206ac3d502ba7535b495";
 
 /// The number of vectors the pinned file carries (rc8 at `cb77137`; rc7 at
 /// `536b8cb` carried 1103, rc6 at `651140a` 968).
@@ -206,7 +208,7 @@ mod tests {
             vroot["_meta"]["registry_sha256"], VENDORED_REGISTRY_SHA256,
             "the vectors were generated from a different grammar than the vendored registry"
         );
-        assert_eq!(meta["cc_version"], "1.0-rc8");
+        assert_eq!(meta["cc_version"], "1.0-rc8.1");
         // The commit is a full 40-hex SHA — a re-vendor records exactly where the bytes came from.
         assert!(
             VENDORED_CC_COMMIT.len() == 40
