@@ -836,7 +836,16 @@ fn attestation_refusal_retry(
         // A lost plan/act race or a directory that cannot plan: the existing
         // row is untouched and the record is safe to re-offer — the next
         // round's plan names the conflict precisely (persist's own note).
-        R::StoreConflict => RetryDisposition::Transient,
+        //
+        // persist v58.0.0 (CIRISPersist#991) — a key-plane row
+        // (`key:record:v1` / `key:revocation:v1` / `identity:occurrence:v1`)
+        // its family door did not apply. The door's own `KeyRefusalReason`
+        // is logged by persist but collapsed into this one token, and that
+        // set holds transient verdicts (`AttesterKeyUnknown`, `OwnerAbsent`:
+        // re-offered once the signer's or owner's row lands) beside terminal
+        // ones. By the rule for ambiguous tokens it stays transient; the
+        // retry backoff bounds the cost of the terminal half.
+        R::StoreConflict | R::KeyPlaneRefused => RetryDisposition::Transient,
     }
 }
 
@@ -12463,7 +12472,7 @@ pub(crate) mod tests {
                     assert_eq!(outcome, ApplyOutcome::Duplicate, "{reason}: a Duplicate");
                     assert_eq!(token, None, "{reason}: never on the refusal ledger");
                 }
-                R::ConflictingAttestation | R::StoreConflict => {
+                R::ConflictingAttestation | R::StoreConflict | R::KeyPlaneRefused => {
                     let ApplyOutcome::Refused {
                         reason: msg, retry, ..
                     } = &outcome
