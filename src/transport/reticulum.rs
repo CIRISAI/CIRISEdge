@@ -15589,6 +15589,67 @@ fn load_or_adopt_or_generate_identity_with_keystore(
 /// (x25519 ‖ ed25519) and is chmod-600 — readable only by the edge
 /// process owner. This is the transport-tier identity; the federation
 /// signing key is never written here (AV-17).
+/// CC 5.3.4 — what an OFFLINE emit of this node's signed route needs from its
+/// custody, opened exactly as a boot opens it (the file-backed transport
+/// identity at `identity_path`, its transit KEX seed beside it) but WITHOUT
+/// minting: an offline emit of keys no running node holds would publish a
+/// route nobody can answer on. So a missing identity is an error, and a
+/// missing transit seed is `transit: None` (the emit then refuses, by name).
+#[derive(Debug)]
+pub struct OfflineRouteMaterial {
+    /// The NAMED destination the node announces and self-emits its route on.
+    pub named_dest_hash: [u8; 16],
+    /// The 64-byte `x25519 ‖ ed25519` transport identity public material.
+    pub transport_pubkey: [u8; 64],
+    /// The static transit KEX pair, when the node's custody holds one.
+    pub transit: Option<TransitKexPair>,
+}
+
+/// Open [`OfflineRouteMaterial`] from a file-backed node's custody.
+///
+/// # Errors
+/// [`TransportError::Config`] when the identity is missing or unreadable, or
+/// the transit seed is unreadable.
+pub fn offline_route_material(
+    identity_path: &std::path::Path,
+) -> Result<OfflineRouteMaterial, TransportError> {
+    if !identity_path.exists() {
+        return Err(TransportError::Config(format!(
+            "no transport identity at {}: an offline emit opens an existing node, never mints one",
+            identity_path.display()
+        )));
+    }
+    let identity = load_or_generate_identity(identity_path)?;
+    let mut transport_pubkey = [0u8; 64];
+    transport_pubkey.copy_from_slice(&identity.public_key_bytes()[..64]);
+    // The same NAMED destination `ReticulumTransport::new` registers.
+    let named = Destination::new(
+        Some(identity),
+        Direction::In,
+        DestinationType::Single,
+        EDGE_APP_NAME,
+        &[EDGE_APP_ASPECT],
+    )
+    .map_err(|e| TransportError::Config(format!("named destination build: {e}")))?;
+    let seed = crate::transport::transit_kex_custody::seed_path(identity_path);
+    let transit = if seed.exists() {
+        Some(
+            crate::transport::transit_kex_custody::TransitKexSecret::load_or_generate_file(
+                identity_path,
+            )?
+            .pair()
+            .clone(),
+        )
+    } else {
+        None
+    };
+    Ok(OfflineRouteMaterial {
+        named_dest_hash: named.hash().into_bytes(),
+        transport_pubkey,
+        transit,
+    })
+}
+
 fn load_or_generate_identity(path: &std::path::Path) -> Result<Identity, TransportError> {
     if path.exists() {
         let bytes = std::fs::read(path).map_err(|e| {

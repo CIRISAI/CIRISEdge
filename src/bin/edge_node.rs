@@ -6247,7 +6247,104 @@ async fn run_nonmember(occ: Occurrence) -> Result<(), String> {
 // main
 // ═══════════════════════════════════════════════════════════════════
 
+/// CC 5.3.4 (rc9 0d9e7f0) — `edge_node emit-transport-destination`: the
+/// OFFLINE emit of this node's hybrid-signed `transport_destination` row WITH
+/// its transit KEX pair, for the bundle re-mint. No network: it opens the
+/// node's own custody as a boot does (the federation seeds under
+/// `<state-dir>/fed`, the transport identity and its transit seed at
+/// `<state-dir>/transport.id`), never minting any of them, and signs through
+/// the runtime's own producer (`self_route::sign_route_offline`). The row is
+/// written as JSON to `--out`.
+///
+/// ```text
+/// edge_node emit-transport-destination --state-dir <dir> --node-name <name> \
+///     --out <file> [--epoch <n>] [--asserted-at <rfc3339>]
+/// ```
+///
+/// Exit 0 with the row written; exit 2 with a named error on stderr
+/// (`{"error":"<label>","detail":...}`) and nothing written otherwise —
+/// a row without a transit pair among them (`offline_emit_no_transit_pair`).
+fn emit_transport_destination(args: &[String]) -> std::process::ExitCode {
+    fn fail(label: &str, detail: &str) -> std::process::ExitCode {
+        eprintln!("{}", serde_json::json!({"error": label, "detail": detail}));
+        std::process::ExitCode::from(2)
+    }
+    let arg = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let (Some(state_dir), Some(node_name), Some(out)) =
+        (arg("--state-dir"), arg("--node-name"), arg("--out"))
+    else {
+        return fail(
+            "offline_emit_usage",
+            "emit-transport-destination --state-dir <dir> --node-name <name> --out <file> \
+             [--epoch <n>] [--asserted-at <rfc3339>]",
+        );
+    };
+    let epoch = match arg("--epoch").map(|e| e.parse::<u64>()) {
+        None => 0,
+        Some(Ok(e)) => e,
+        Some(Err(e)) => return fail("offline_emit_usage", &format!("--epoch: {e}")),
+    };
+    let asserted_at = match arg("--asserted-at").map(|t| chrono::DateTime::parse_from_rfc3339(&t)) {
+        None => chrono::Utc::now(),
+        Some(Ok(t)) => t.with_timezone(&chrono::Utc),
+        Some(Err(e)) => return fail("offline_emit_usage", &format!("--asserted-at: {e}")),
+    };
+    let state_dir = PathBuf::from(state_dir);
+    let fed_dir = state_dir.join("fed");
+    if !fed_dir.join("ed25519.seed").exists() || !fed_dir.join("mldsa65.seed").exists() {
+        return fail(
+            "offline_emit_no_federation_key",
+            &format!("no federation seeds under {}", fed_dir.display()),
+        );
+    }
+    let signer = match FedKey::load_or_create(&node_name, &fed_dir)
+        .and_then(|fed| fed.identity_signer(&node_name))
+    {
+        Ok(s) => s,
+        Err(e) => return fail("offline_emit_no_federation_key", &e),
+    };
+    let material = match ciris_edge::transport::reticulum::offline_route_material(
+        &state_dir.join("transport.id"),
+    ) {
+        Ok(m) => m,
+        Err(e) => return fail("offline_emit_no_transport_identity", &e.to_string()),
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread().build() {
+        Ok(rt) => rt,
+        Err(e) => return fail("offline_emit_runtime", &e.to_string()),
+    };
+    let row = rt.block_on(ciris_edge::transport::self_route::sign_route_offline(
+        &signer,
+        material.named_dest_hash,
+        &material.transport_pubkey,
+        material.transit.as_ref(),
+        epoch,
+        asserted_at,
+    ));
+    let row = match row {
+        Ok(r) => r,
+        Err(e) => return fail(e.label(), &e.to_string()),
+    };
+    let json = match serde_json::to_vec_pretty(&row) {
+        Ok(j) => j,
+        Err(e) => return fail("offline_emit_serialize", &e.to_string()),
+    };
+    if let Err(e) = std::fs::write(&out, json) {
+        return fail("offline_emit_write", &e.to_string());
+    }
+    std::process::ExitCode::SUCCESS
+}
+
 fn main() -> std::process::ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("emit-transport-destination") {
+        return emit_transport_destination(&args[2..]);
+    }
     // Logs to STDERR (the JSONL owns stdout, and mixing them would corrupt the
     // census's input). Default `info`, overridable with `RUST_LOG`.
     //

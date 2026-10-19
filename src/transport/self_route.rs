@@ -228,7 +228,7 @@ impl SelfSignedRouteProducer {
             &transport_pubkey,
             Some(transit),
             epoch,
-            not_after,
+            next_asserted_at(not_after),
         )
         .await
         {
@@ -427,7 +427,9 @@ fn next_asserted_at(not_after: Option<DateTime<Utc>>) -> DateTime<Utc> {
 /// `transit` (CIRISEdge#805) is spliced into the envelope as the
 /// `transit_kex_pubkeys` member BEFORE canonicalization, so the signature
 /// covers it; the producer always passes `Some`. `not_after` is the stored
-/// signed row's `asserted_at`, which this row's must strictly exceed.
+/// signed row's `asserted_at`, which this row's must strictly exceed: the
+/// runtime passes [`next_asserted_at`] of it; the offline emit
+/// ([`sign_route_offline`]) passes its own.
 async fn build_and_sign_self_route(
     signer: &LocalSigner,
     pqc: &dyn ciris_keyring::PqcSigner,
@@ -435,7 +437,7 @@ async fn build_and_sign_self_route(
     transport_pubkey: &[u8; 64],
     transit: Option<&TransitKexPair>,
     epoch: u64,
-    not_after: Option<DateTime<Utc>>,
+    asserted_at: DateTime<Utc>,
 ) -> Result<SignedTransportDestination, SelfRouteOutcome> {
     let row = TransportDestination {
         occurrence_key_id: signer.key_id.clone(),
@@ -449,7 +451,7 @@ async fn build_and_sign_self_route(
         // tolerate ns, so only a postgres node exposes this — hence untested locally.
         // #805: strictly after the stored signed row's, so a same-epoch re-sign
         // with a changed transit pair supersedes instead of forking.
-        asserted_at: next_asserted_at(not_after),
+        asserted_at,
         last_seen_at: None,
         // `[x25519 ‖ ed25519]` — same split as the #299 write-through.
         transport_ed25519_pubkey_base64: Some(B64.encode(&transport_pubkey[32..64])),
@@ -499,6 +501,105 @@ async fn build_and_sign_self_route(
             mldsa65_signature_base64: Some(B64.encode(&mldsa)),
         },
     })
+}
+
+/// CC 5.3.4 — why an offline emit produced no row. Every variant is named;
+/// the `edge_node emit-transport-destination` command exits non-zero on each.
+#[derive(Debug, thiserror::Error)]
+pub enum OfflineEmitError {
+    /// The node holds no transit KEX pair: a row without one cannot key a
+    /// link (CC 3.3.6.2), so none is produced.
+    #[error(
+        "no transit KEX pair in the node's custody: a transport_destination row without one \
+         is refused (CC 5.3.4, CC 3.3.6.2)"
+    )]
+    NoTransitPair,
+    /// The signer has no ML-DSA-65 half; the row must be hybrid-signed.
+    #[error("the node's signer has no ML-DSA-65 half; the row must be hybrid-signed (CC 5.3.4)")]
+    NoPqc,
+    /// The transit pair reuses one of the node's transport or federation
+    /// keys (CC 3.3.6.2 in-row key separation).
+    #[error("transit KEX pair fails in-row key separation: {0} (CC 3.3.6.2)")]
+    KeySeparation(&'static str),
+    /// Building or signing failed.
+    #[error("building or signing the row failed: {0}")]
+    Sign(String),
+}
+
+impl OfflineEmitError {
+    /// Stable name for the command's error output.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NoTransitPair => "offline_emit_no_transit_pair",
+            Self::NoPqc => "offline_emit_no_pqc",
+            Self::KeySeparation(_) => "offline_emit_key_separation",
+            Self::Sign(_) => "offline_emit_sign",
+        }
+    }
+}
+
+/// CC 5.3.4 (rc9 0d9e7f0) — **the offline emit of this node's signed
+/// `transport_destination` row WITH its transit pair**, for the bundle
+/// re-mint. The same producer the runtime self-emits through
+/// ([`build_and_sign_self_route`], the #1106 shape, hybrid-signed by the
+/// node's own key); no second producer. It differs from the live row only in
+/// `asserted_at` (passed here; bundle rows are never checked for age) and
+/// `last_seen_at` (never set by either).
+///
+/// Refuses ([`OfflineEmitError`]) a row without a transit pair, a signer
+/// without its ML-DSA-65 half, and a pair that reuses any of the node's
+/// transport keys or its federation Ed25519 key (in-row separation, checked
+/// structurally).
+///
+/// # Errors
+/// [`OfflineEmitError`].
+pub async fn sign_route_offline(
+    signer: &LocalSigner,
+    dest_hash: [u8; 16],
+    transport_pubkey: &[u8; 64],
+    transit: Option<&TransitKexPair>,
+    epoch: u64,
+    asserted_at: DateTime<Utc>,
+) -> Result<SignedTransportDestination, OfflineEmitError> {
+    let transit = transit.ok_or(OfflineEmitError::NoTransitPair)?;
+    let pqc = signer.pqc.as_ref().ok_or(OfflineEmitError::NoPqc)?;
+    let federation_ed25519 = signer
+        .classical
+        .public_key()
+        .await
+        .map_err(|e| OfflineEmitError::Sign(format!("federation pubkey: {e}")))?;
+    // TODO(persist v59): replace with
+    // `ciris_persist::federation::self_at_login::check_transit_kex_pair(transit, &[..])`
+    // (CC 3.3.6.2 in-row key separation) once the v59 head lands.
+    let others: [&[u8]; 3] = [
+        &transport_pubkey[0..32],
+        &transport_pubkey[32..64],
+        &federation_ed25519,
+    ];
+    if others.contains(&transit.x25519.as_slice()) {
+        return Err(OfflineEmitError::KeySeparation(
+            "the transit x25519 key is one of the node's transport or federation keys",
+        ));
+    }
+    if others.contains(&&transit.ml_kem_768[..]) {
+        return Err(OfflineEmitError::KeySeparation(
+            "the transit ML-KEM-768 key is one of the node's transport or federation keys",
+        ));
+    }
+    let asserted_at =
+        ciris_persist::federation::admission::truncate_to_substrate_resolution(asserted_at);
+    build_and_sign_self_route(
+        signer,
+        pqc.as_ref(),
+        hex::encode(dest_hash),
+        transport_pubkey,
+        Some(transit),
+        epoch,
+        asserted_at,
+    )
+    .await
+    .map_err(|e| OfflineEmitError::Sign(format!("{e:?}")))
 }
 
 #[cfg(test)]
@@ -1063,7 +1164,7 @@ mod tests {
             &TPK,
             None,
             0,
-            None,
+            next_asserted_at(None),
         )
         .await
         .expect("sign");
