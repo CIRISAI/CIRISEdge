@@ -8077,6 +8077,12 @@ fn assemble_tier_meta_v3(
             "tier fan-in exceeds the u32 wire range",
         ));
     }
+    // CC 6.1.2.1.1 — a repeated leaf is refused before hashing.
+    if let Some(id) = crate::holonomic::aggregation::first_repeated_source_id(&source_member_ids) {
+        return Err(PyValueError::new_err(format!(
+            "source_member_ids repeats {id:?}: a member_commitment leaf list must be unique"
+        )));
+    }
     let meta = crate::holonomic::aggregation::assemble_tier_meta_v3(
         content_id,
         corpus_kind,

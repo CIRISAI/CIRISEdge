@@ -73,6 +73,27 @@ pub use ciris_verify_core::holonomic::preimage::DOMAIN_AGG_META as AGG_META_DOMA
 /// vector tests read unchanged across the #267 re-export cut.
 pub use ciris_verify_core::holonomic::aggregation::member_commitment as compute_member_commitment;
 
+/// CC 6.1.1 / 6.1.2.1.1 (rc9 b3bc620) — the first source id that appears more
+/// than once, or `None` when the list is unique. A `member_commitment` leaf list
+/// MUST be sorted AND deduplicated, and a repeated leaf is refused BEFORE
+/// hashing: under odd-node duplication `[a,b,c]` and `[a,b,c,c]` share a root,
+/// and neither the hybrid signature nor a full-list recomputation tells them
+/// apart. A repeat would also inflate the signed `source_count` and `n_eff`.
+/// The sort happens inside the Merkle; uniqueness is checked here because the
+/// shared owner ([`compute_member_commitment`]) hashes whatever it is given.
+#[must_use]
+pub fn first_repeated_source_id(source_member_ids: &[String]) -> Option<&str> {
+    let mut sorted: Vec<&str> = source_member_ids.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.windows(2).find(|w| w[0] == w[1]).map(|w| w[0])
+}
+
+fn assert_unique_source_ids(source_member_ids: &[String]) {
+    if let Some(id) = first_repeated_source_id(source_member_ids) {
+        panic!("source_member_ids repeats {id:?}: a member_commitment leaf list must be unique (CC 6.1.2.1.1)");
+    }
+}
+
 /// Locked v1 schema version — the pre-#167 layout (no signed `n_eff`).
 /// Preserved for the committed v1 goldens; **new tiers MUST be v2**
 /// ([`AGG_META_VERSION_V2`]) so downstream can dominance-gate.
@@ -116,8 +137,9 @@ pub const AGG_META_VERSION_V3: u32 = 3;
 ///
 /// # Panics
 ///
-/// If `source_member_ids` and `member_masses` lengths differ, or the fan-in
-/// exceeds `u32::MAX` (a tier cannot represent it on the wire).
+/// If `source_member_ids` and `member_masses` lengths differ, the fan-in
+/// exceeds `u32::MAX` (a tier cannot represent it on the wire), or a source id
+/// repeats ([`first_repeated_source_id`], CC 6.1.2.1.1).
 #[must_use]
 pub fn assemble_tier_meta_v2(
     content_id: &str,
@@ -133,6 +155,7 @@ pub fn assemble_tier_meta_v2(
         member_masses.len(),
         "source_member_ids and member_masses must be index-aligned"
     );
+    assert_unique_source_ids(source_member_ids);
     let source_count =
         u32::try_from(source_member_ids.len()).expect("tier fan-in exceeds u32 wire range");
     AggregationMetaV1 {
@@ -178,8 +201,9 @@ pub fn assemble_tier_meta_v2(
 ///
 /// # Panics
 ///
-/// If `source_member_ids` and `member_masses` lengths differ, or the fan-in
-/// exceeds `u32::MAX`.
+/// If `source_member_ids` and `member_masses` lengths differ, the fan-in
+/// exceeds `u32::MAX`, or a source id repeats ([`first_repeated_source_id`],
+/// CC 6.1.2.1.1).
 #[must_use]
 // The §19.7.1.3 producer is a composition site for the full signed tier surface
 // (identity + fan-in + the two measured v3 fields); grouping them into a struct
@@ -201,6 +225,7 @@ pub fn assemble_tier_meta_v3(
         member_masses.len(),
         "source_member_ids and measured member_masses must be index-aligned"
     );
+    assert_unique_source_ids(source_member_ids);
     let source_count =
         u32::try_from(source_member_ids.len()).expect("tier fan-in exceeds u32 wire range");
 
@@ -349,6 +374,59 @@ mod tests {
         // verifiers reject as inconsistent.
         let expected = compute_member_commitment(&fixed_source_ids());
         assert_eq!(fixed_meta().member_commitment, expected);
+    }
+
+    /// CC 6.1.1 / 6.1.2.1.1 (rc9 b3bc620) — why a repeated leaf must be refused:
+    /// under odd-node duplication `[a,b,c]` and `[a,b,c,c]` commit to the SAME
+    /// root, so nothing downstream of the hash can tell them apart.
+    #[test]
+    fn a_repeated_leaf_shares_the_root_of_its_unique_list_611() {
+        let unique: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
+        let repeated: Vec<String> = ["a", "b", "c", "c"].map(String::from).to_vec();
+        assert_eq!(
+            compute_member_commitment(&unique),
+            compute_member_commitment(&repeated),
+            "the CVE-2012-2459 shape the uniqueness rule closes"
+        );
+        assert_eq!(first_repeated_source_id(&unique), None);
+        assert_eq!(first_repeated_source_id(&repeated), Some("c"));
+        let unsorted: Vec<String> = ["m2", "m1", "m2"].map(String::from).to_vec();
+        assert_eq!(
+            first_repeated_source_id(&unsorted),
+            Some("m2"),
+            "found regardless of order"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must be unique")]
+    fn assemble_tier_meta_v2_refuses_a_repeated_source_id_611() {
+        let ids: Vec<String> = ["a", "b", "c", "c"].map(String::from).to_vec();
+        let _ = assemble_tier_meta_v2(
+            "c",
+            "trace",
+            2,
+            "raptorq-pyramid-v1",
+            &ids,
+            &[1.0; 4],
+            "mean+stddev",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must be unique")]
+    fn assemble_tier_meta_v3_refuses_a_repeated_source_id_611() {
+        let ids: Vec<String> = ["a", "b", "c", "c"].map(String::from).to_vec();
+        let _ = assemble_tier_meta_v3(
+            "c",
+            "trace",
+            2,
+            "raptorq-pyramid-v1",
+            &ids,
+            &[1.0; 4],
+            1,
+            "mean+stddev",
+        );
     }
 
     #[test]
