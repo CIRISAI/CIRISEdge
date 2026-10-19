@@ -645,7 +645,7 @@ impl LinkSeals {
         if sealed.pinned.load(Ordering::Relaxed) {
             return Err(SealRefusal::FirstContactOnly);
         }
-        self.seal_with(link, &sealed, lane, plaintext)
+        Ok(self.seal_with(link, &sealed, lane, plaintext))
     }
 
     /// CC 3.2 (f) — seal one first-contact frame on a pairing-pinned link.
@@ -664,7 +664,7 @@ impl LinkSeals {
             Some(State::Sealed(s)) if s.pinned.load(Ordering::Relaxed) => Arc::clone(s),
             _ => return Err(SealRefusal::Unsealed),
         };
-        self.seal_with(link, &sealed, lane, plaintext)
+        Ok(self.seal_with(link, &sealed, lane, plaintext))
     }
 
     fn seal_with(
@@ -673,13 +673,13 @@ impl LinkSeals {
         sealed: &SealedLink,
         lane: Lane,
         plaintext: &[u8],
-    ) -> Result<Vec<u8>, SealRefusal> {
+    ) -> Vec<u8> {
         let mut frame = sealed.seal(lane, plaintext);
         if lane.is_msgpack() {
             frame = msgpack_bin(&frame);
         }
         self.tap_frame(link, &frame);
-        Ok(frame)
+        frame
     }
 
     /// Open one sealed frame received on `link` outside the Channel (a
