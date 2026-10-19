@@ -38,10 +38,12 @@
 //! a claim ([`LinkSeals::claimed_initiator`]). The transport holds it to the
 //! link's attributed peer on every inbound frame. A link whose initiator is
 //! UNATTRIBUTED (an unowned fresh device has no attribution) may still
-//! complete the seal, and may then carry only the first-contact plane
-//! ([`is_first_contact_frame`]); any other frame on it is refused
-//! ([`SealRefusal::FirstContactOnly`]). Confidentiality holds either way:
-//! only the authenticated responder can derive the keys.
+//! complete the seal, and may then carry only the first-contact plane; any
+//! other frame on it is refused ([`SealRefusal::FirstContactOnly`]).
+//! Confidentiality holds either way: only the authenticated responder can
+//! derive the keys. The initiator is unowned but never anonymous
+//! (CLM-first-contact-seal-key-bound): the request must be signed by, and
+//! introduce, the handshake's initiator key ([`admit_unattributed_frame`]).
 //!
 //! # The seal
 //!
@@ -157,6 +159,21 @@ pub enum SealRefusal {
          (CC 5.3.3.5 E1 carve-out)"
     )]
     FirstContactOnly,
+    /// A first-contact request on an unattributed link signed by, or
+    /// introducing, a key other than the handshake's initiator key.
+    #[error(
+        "first-contact request signed by {signer} (key record {record:?}) on a link whose \
+         handshake initiator is {claimed}; the three must be one key \
+         (CLM-first-contact-seal-key-bound)"
+    )]
+    FirstContactSignerMismatch {
+        /// The handshake's initiator key id.
+        claimed: String,
+        /// The request's `signing_key_id`.
+        signer: String,
+        /// The carried key record's `key_id`, if any.
+        record: Option<String>,
+    },
 }
 
 impl SealRefusal {
@@ -170,6 +187,7 @@ impl SealRefusal {
             Self::OpenFailed => o::LINK_SEAL_REFUSED_OPEN_FAILED,
             Self::Unsealed => o::LINK_SEAL_REFUSED_UNSEALED_SEND,
             Self::FirstContactOnly => o::LINK_SEAL_REFUSED_FIRST_CONTACT_ONLY,
+            Self::FirstContactSignerMismatch { .. } => o::LINK_SEAL_REFUSED_FIRST_CONTACT_SIGNER,
         }
     }
 }
@@ -675,19 +693,80 @@ impl LinkSeals {
     }
 }
 
+/// What a first-contact request names about its sender: the envelope's
+/// signer and, when it carries one, the key record's `key_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstContactSender {
+    /// The envelope's `signing_key_id`: the key that signed the request.
+    pub signer: String,
+    /// `key_record.record.key_id`, when the request introduces its key.
+    pub record_key_id: Option<String>,
+}
+
 /// The first-contact plane (`FSD/FIRST_CONTACT.md` §2.2): an
-/// `OpaqueRequest` envelope, which is how an unowned device asks to join
-/// (the server's device-join kind `0x0000_0002`) or makes any other first
-/// contact. The only frame class an unattributed initiator's sealed link may
-/// carry.
+/// `OpaqueRequest` envelope, which is how an unowned device asks to join (the
+/// server's device-join kind `0x0000_0002`) or makes any other first contact.
+/// The only frame class an unattributed initiator's sealed link may carry.
+/// `None` for every other frame.
 #[must_use]
-pub fn is_first_contact_frame(bytes: &[u8]) -> bool {
+pub fn first_contact_sender(bytes: &[u8]) -> Option<FirstContactSender> {
+    #[derive(serde::Deserialize)]
+    struct RecordPeek {
+        key_id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct SignedPeek {
+        record: RecordPeek,
+    }
+    #[derive(serde::Deserialize)]
+    struct BodyPeek {
+        #[serde(default)]
+        key_record: Option<SignedPeek>,
+    }
     #[derive(serde::Deserialize)]
     struct Peek {
         message_type: crate::messages::MessageType,
+        signing_key_id: String,
+        body: Option<BodyPeek>,
     }
-    serde_json::from_slice::<Peek>(bytes)
-        .is_ok_and(|p| p.message_type == crate::messages::MessageType::OpaqueRequest)
+    let p = serde_json::from_slice::<Peek>(bytes).ok()?;
+    if p.message_type != crate::messages::MessageType::OpaqueRequest {
+        return None;
+    }
+    Some(FirstContactSender {
+        signer: p.signing_key_id,
+        record_key_id: p.body.and_then(|b| b.key_record).map(|k| k.record.key_id),
+    })
+}
+
+/// CLM-first-contact-seal-key-bound (CC 3.2 adding-a-device (e), CC 5.3.3.5
+/// E1) — the first-contact initiator is UNOWNED but never ANONYMOUS. On a
+/// sealed link whose initiator has no attribution, a frame is admitted only
+/// if it is a first-contact request whose signer, and whose carried key
+/// record, are the handshake's initiator key `claimed`: the key that opened
+/// the sealed link, the key that signed the request, and the key the
+/// matching code is derived from
+/// ([`crate::first_contact::first_contact_matching_code`]) are one key.
+///
+/// # Errors
+/// [`SealRefusal::FirstContactOnly`] for any other plane;
+/// [`SealRefusal::FirstContactSignerMismatch`] for a request signed by (or
+/// introducing) another key.
+pub fn admit_unattributed_frame(claimed: &str, bytes: &[u8]) -> Result<(), SealRefusal> {
+    let sender = first_contact_sender(bytes).ok_or(SealRefusal::FirstContactOnly)?;
+    let record_matches = sender
+        .record_key_id
+        .as_deref()
+        .map_or(true, |k| k == claimed);
+    if sender.signer == claimed && record_matches {
+        Ok(())
+    } else {
+        Err(SealRefusal::FirstContactSignerMismatch {
+            claimed: claimed.to_owned(),
+            signer: sender.signer,
+            record: sender.record_key_id,
+        })
+    }
 }
 
 #[cfg(test)]

@@ -956,6 +956,10 @@ pub const LINK_SEAL_REFUSED_OPEN_FAILED: &str = "link_seal_refused_open_failed";
 /// A frame other than first contact arrived on a sealed link whose
 /// initiator is not attributed (the first-contact carve-out).
 pub const LINK_SEAL_REFUSED_FIRST_CONTACT_ONLY: &str = "link_seal_refused_first_contact_only";
+/// CLM-first-contact-seal-key-bound — a first-contact request on an
+/// unattributed sealed link was signed by (or introduced) a key other than
+/// the handshake's initiator key.
+pub const LINK_SEAL_REFUSED_FIRST_CONTACT_SIGNER: &str = "link_seal_refused_first_contact_signer";
 /// This node tried to send on a link with no keys: refused, nothing sent.
 pub const LINK_SEAL_REFUSED_UNSEALED_SEND: &str = "link_seal_refused_unsealed_send";
 /// A sealed frame whose counter was already seen, or is older than the

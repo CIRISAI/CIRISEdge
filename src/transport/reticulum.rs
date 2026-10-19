@@ -5300,6 +5300,17 @@ impl ReticulumTransport {
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// CLM-first-contact-seal-key-bound — the handshake's initiator key id on
+    /// a link a peer opened to this node (`None` on a link this node dialled,
+    /// or one not keyed). On first contact this is the device's own key: the
+    /// key its request must be signed by and the matching code is derived
+    /// from ([`crate::first_contact::first_contact_matching_code`]). A frame's
+    /// `reply_path` token names its link.
+    #[must_use]
+    pub fn link_initiator_key_id(&self, link: [u8; 16]) -> Option<String> {
+        self.seals.claimed_initiator(link)
+    }
+
     /// CC 5.3.3.5 E1 test seam — whether `link` carries transit keys.
     #[doc(hidden)]
     pub fn link_is_sealed_for_test(&self, link: [u8; 16]) -> bool {
@@ -11080,14 +11091,19 @@ async fn attribute_and_deliver(
         // `drop_inbound` and closes the link.
         return;
     }
-    if candidate_key_id.is_none()
-        && ctx.seals.claimed_initiator(link_id.into_bytes()).is_some()
-        && !crate::transport::link_seal::is_first_contact_frame(&data)
-    {
-        let refusal = crate::transport::link_seal::SealRefusal::FirstContactOnly;
-        drop_inbound(Some(link_id), refusal.label(), &refusal.to_string());
-        seal_teardown(ctx, link_id, &refusal).await;
-        return;
+    // CLM-first-contact-seal-key-bound — unowned but never anonymous: the
+    // request must be signed by, and introduce, the handshake's initiator.
+    let unattributed_claim = candidate_key_id
+        .is_none()
+        .then(|| ctx.seals.claimed_initiator(link_id.into_bytes()))
+        .flatten();
+    if let Some(claimed) = unattributed_claim {
+        if let Err(refusal) = crate::transport::link_seal::admit_unattributed_frame(&claimed, &data)
+        {
+            drop_inbound(Some(link_id), refusal.label(), &refusal.to_string());
+            seal_teardown(ctx, link_id, &refusal).await;
+            return;
+        }
     }
     let link_key_id = candidate_key_id.clone();
     let source_key_id = match candidate_key_id {

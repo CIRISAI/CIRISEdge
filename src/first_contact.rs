@@ -960,6 +960,74 @@ pub(crate) fn carried_key_record(bytes: &[u8]) -> Option<(EdgeEnvelope, SignedKe
     Some((envelope, record))
 }
 
+/// CLM-first-contact-seal-key-bound — why a first-contact matching code was
+/// not derived.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MatchingCodeError {
+    /// Not an `OpaqueRequest` carrying a key record.
+    #[error("not a first-contact request carrying a key record")]
+    NotFirstContact,
+    /// The request's signer, its key record, and the link's handshake
+    /// initiator are not one key.
+    #[error(
+        "first-contact keys disagree: handshake initiator {initiator}, signer {signer}, \
+         key record {record}; the matching code is derived from one key only"
+    )]
+    KeysDisagree {
+        /// The sealed link's handshake initiator key id.
+        initiator: String,
+        /// The envelope's signer.
+        signer: String,
+        /// The carried record's key id.
+        record: String,
+    },
+    /// The record's Ed25519 key does not decode to 32 bytes.
+    #[error("the key record's ed25519 public key is malformed")]
+    BadKey,
+}
+
+/// CLM-first-contact-seal-key-bound (CC 3.2 adding-a-device (e)) — the
+/// matching code an owner compares on a device join, derived from the ONE key
+/// the first contact is bound to: the sealed link's handshake initiator
+/// (`handshake_initiator`, from
+/// `ReticulumTransport::link_initiator_key_id`), which must also be the
+/// request's signer and its carried key record. The code is the v2 SAS
+/// ([`crate::sas::peer_sas_digits_versioned`]) over this node's Ed25519
+/// federation key and that record's Ed25519 key, six digits.
+///
+/// # Errors
+/// [`MatchingCodeError`] when the request is not a key-carrying first
+/// contact, when the three keys are not one, or when the record's key is
+/// malformed.
+pub fn first_contact_matching_code(
+    local_ed25519_pub: &[u8; 32],
+    request: &[u8],
+    handshake_initiator: &str,
+) -> Result<String, MatchingCodeError> {
+    use base64::Engine as _;
+    let (envelope, record) =
+        carried_key_record(request).ok_or(MatchingCodeError::NotFirstContact)?;
+    if envelope.signing_key_id != handshake_initiator || record.record.key_id != handshake_initiator
+    {
+        return Err(MatchingCodeError::KeysDisagree {
+            initiator: handshake_initiator.to_owned(),
+            signer: envelope.signing_key_id,
+            record: record.record.key_id,
+        });
+    }
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(&record.record.pubkey_ed25519_base64)
+        .map_err(|_| MatchingCodeError::BadKey)?;
+    let peer: [u8; 32] = raw.try_into().map_err(|_| MatchingCodeError::BadKey)?;
+    crate::sas::peer_sas_digits_versioned(
+        local_ed25519_pub,
+        &peer,
+        crate::sas::DEFAULT_SAS_DIGITS,
+        crate::sas::SasVersion::V2,
+    )
+    .map_err(|_| MatchingCodeError::BadKey)
+}
+
 /// The envelope and the introductions an `OpaqueResponse` carries, or `None`.
 pub(crate) fn carried_introductions(bytes: &[u8]) -> Option<(EdgeEnvelope, Introductions)> {
     if !contains(bytes, b"\"introductions\"") {

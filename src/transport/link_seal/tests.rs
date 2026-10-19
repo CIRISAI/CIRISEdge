@@ -247,13 +247,45 @@ fn the_replay_window_slides_e1() {
 
 #[test]
 fn only_an_opaque_request_is_first_contact_e1() {
-    assert!(is_first_contact_frame(
-        br#"{"message_type":"OpaqueRequest","body":{}}"#
+    let req = br#"{"message_type":"OpaqueRequest","signing_key_id":"dev","body":{"kind":2}}"#;
+    assert_eq!(
+        first_contact_sender(req),
+        Some(FirstContactSender {
+            signer: "dev".to_owned(),
+            record_key_id: None,
+        })
+    );
+    assert!(first_contact_sender(
+        br#"{"message_type":"OpaqueResponse","signing_key_id":"dev","body":{}}"#
+    )
+    .is_none());
+    assert!(first_contact_sender(b"CRPL\x01binary").is_none());
+}
+
+#[test]
+fn an_unattributed_link_admits_only_its_initiators_own_request_e1() {
+    let own = br#"{"message_type":"OpaqueRequest","signing_key_id":"dev",
+        "body":{"kind":2,"key_record":{"record":{"key_id":"dev"}}}}"#;
+    assert!(admit_unattributed_frame("dev", own).is_ok());
+    let other_signer = br#"{"message_type":"OpaqueRequest","signing_key_id":"mallory","body":{}}"#;
+    let refused = admit_unattributed_frame("dev", other_signer).unwrap_err();
+    assert_eq!(
+        refused.label(),
+        crate::observability::LINK_SEAL_REFUSED_FIRST_CONTACT_SIGNER
+    );
+    let other_record = br#"{"message_type":"OpaqueRequest","signing_key_id":"dev",
+        "body":{"key_record":{"record":{"key_id":"mallory"}}}}"#;
+    assert!(matches!(
+        admit_unattributed_frame("dev", other_record),
+        Err(SealRefusal::FirstContactSignerMismatch { .. })
     ));
-    assert!(!is_first_contact_frame(
-        br#"{"message_type":"OpaqueResponse","body":{}}"#
+    assert!(matches!(
+        admit_unattributed_frame(
+            "dev",
+            br#"{"message_type":"OpaqueEvent","signing_key_id":"dev","body":{}}"#
+        ),
+        Err(SealRefusal::FirstContactOnly)
     ));
-    assert!(!is_first_contact_frame(b"CRPL\x01binary"));
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {

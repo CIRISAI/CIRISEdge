@@ -229,7 +229,10 @@ async fn seed_route(from: &Node, to: &Node) {
 /// `A` listens; `B` and `C` dial it. `seed_a_at_clients`: whether `B` and `C`
 /// hold `A`'s route (its transit pair). `c_unannounced`: `C` never announces,
 /// on the network or on a link (an unowned fresh device).
-async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool) -> Trio {
+/// `c_fresh`: `C` is a fresh device whose directory holds only the baked
+/// trust bundle (and its own key); it is given nothing about `A` but what
+/// `A`'s announce carries.
+async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool, c_fresh: bool) -> Trio {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let keys = [
@@ -246,7 +249,11 @@ async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool) -> Trio {
     let mut port_a = 0;
     let mut nodes = Vec::new();
     for (i, key) in [key_a, key_b, key_c].into_iter().enumerate() {
-        let dir = directory_with(records.clone()).await;
+        let dir = if i == 2 && c_fresh {
+            fresh_device_directory(records[2].clone()).await
+        } else {
+            directory_with(records.clone()).await
+        };
         let metrics = EdgeMetrics::new();
         let (transport, addr) = common::build_reticulum_with_retry_metrics(
             || {
@@ -298,7 +305,9 @@ async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool) -> Trio {
     let a = nodes.pop().expect("a");
     if seed_a_at_clients {
         seed_route(&a, &b).await;
-        seed_route(&a, &c).await;
+        if !c_fresh {
+            seed_route(&a, &c).await;
+        }
     }
     seed_route(&b, &a).await;
     let known = wait_until(Duration::from_secs(60), || async {
@@ -321,6 +330,46 @@ async fn trio(tag: &str, seed_a_at_clients: bool, c_unannounced: bool) -> Trio {
         _tmp: tmp,
         _tasks: tasks,
     }
+}
+
+/// A fresh device's directory: persist's baked trust bundle (its holders and
+/// serve-nodes, admitted where the build's trust root admits them) and the
+/// device's own key. Nothing about any other node.
+async fn fresh_device_directory(own: ciris_persist::federation::KeyRecord) -> Arc<SqliteBackend> {
+    let dir = directory_with(vec![own]).await;
+    let bundle = ciris_persist::federation::genesis::canonical_genesis_bundle();
+    for rec in bundle.holders.iter().chain(bundle.serve_nodes.iter()) {
+        // A test build's trust root may refuse production rows; what the
+        // fresh device holds is whatever the bundle can give it.
+        let _ = dir.put_public_key(rec.clone()).await;
+    }
+    dir
+}
+
+/// A key-carrying first-contact `OpaqueRequest` (the device-join kind) as it
+/// rides the wire, signed-by `signer` and introducing `record`. The signature
+/// is not checked by the transport; the bindings it checks are the key ids.
+fn first_contact_request(
+    signer: &str,
+    to: &str,
+    record: &ciris_persist::federation::KeyRecord,
+) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "edge_schema_version": "v2_0_0",
+        "signing_key_id": signer,
+        "destination_key_id": to,
+        "message_type": "OpaqueRequest",
+        "sent_at": chrono::Utc::now(),
+        "nonce": vec![7u8; 16],
+        "body": {
+            "kind": 2,
+            "payload": [1, 2, 3],
+            "key_record": {"record": record},
+            "challenge": "00".repeat(32),
+        },
+        "signature": "unchecked-at-the-transport",
+    }))
+    .expect("json")
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -378,7 +427,7 @@ fn dialled_with_handshake(tapped: &[([u8; 16], Vec<u8>)]) -> bool {
 /// a Resource), and nothing on the wire is plaintext.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sealed_exchange_crosses_and_the_wire_carries_no_plaintext_e1() {
-    let t = trio("ok", true, false).await;
+    let t = trio("ok", true, false, false).await;
     t.b.transport.set_link_wire_tap_for_test(true);
     t.a.transport.set_link_wire_tap_for_test(true);
 
@@ -442,7 +491,7 @@ async fn a_sealed_exchange_crosses_and_the_wire_carries_no_plaintext_e1() {
 /// (`link_seal_refused_timeout`) and closes the link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_that_never_sends_the_handshake_is_refused_and_closed_e1() {
-    let t = trio("skip", true, false).await;
+    let t = trio("skip", true, false, false).await;
     t.a.transport.set_link_wire_tap_for_test(true);
     let dest =
         t.b.transport
@@ -491,7 +540,7 @@ async fn a_peer_that_never_sends_the_handshake_is_refused_and_closed_e1() {
 /// plaintext envelope) is refused by name and the link closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_non_ctkx_first_frame_is_refused_by_name_e1() {
-    let t = trio("plain", true, false).await;
+    let t = trio("plain", true, false, false).await;
     t.b.transport
         .set_handshake_override_for_test(HandshakeOverride::FirstFrame(
             br#"{"message_type":"OpaqueRequest","plaintext":true}"#.to_vec(),
@@ -515,7 +564,7 @@ async fn a_non_ctkx_first_frame_is_refused_by_name_e1() {
 /// refused by name (`link_seal_refused_suite`), never answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_classical_only_suite_is_refused_by_name_e1() {
-    let t = trio("suite", true, false).await;
+    let t = trio("suite", true, false, false).await;
     let pair =
         ciris_persist::federation::self_at_login::transit_kex_pair_for(&*t.b.dir, &t.a.key.key_id)
             .await
@@ -557,7 +606,7 @@ async fn a_classical_only_suite_is_refused_by_name_e1() {
 /// A's route) is refused by name and never made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1() {
-    let t = trio("nopair", false, false).await;
+    let t = trio("nopair", false, false, false).await;
     match t.b.transport.send(&t.a.key.key_id, b"never-sent").await {
         Err(TransportError::LinkSealRefused { peer, reason, .. }) => {
             assert_eq!(peer, t.a.key.key_id);
@@ -576,7 +625,7 @@ async fn a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1() {
 /// A by name, nothing B sends on it is delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_claim_that_is_not_the_links_peer_is_refused_e1() {
-    let t = trio("claim", true, false).await;
+    let t = trio("claim", true, false, false).await;
     t.b.transport
         .set_handshake_override_for_test(HandshakeOverride::Claim(t.c.key.key_id.clone()));
     let lie = marked(b"E1-LIAR-", 2_000);
@@ -599,7 +648,7 @@ async fn a_claim_that_is_not_the_links_peer_is_refused_e1() {
 /// any other plane on that link is refused by name and the link closed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn first_contact_rides_sealed_and_nothing_else_on_an_unattributed_link_e1() {
-    let t = trio("fc", true, true).await;
+    let t = trio("fc", true, true, false).await;
     t.c.transport.set_link_wire_tap_for_test(true);
     let request = serde_json::to_vec(&serde_json::json!({
         "message_type": "OpaqueRequest",
@@ -649,4 +698,137 @@ async fn first_contact_rides_sealed_and_nothing_else_on_an_unattributed_link_e1(
         !t.a.received(&other).await,
         "the non-first-contact frame was not delivered"
     );
+}
+
+/// **CLM-first-contact-seal-key-bound** — on an unattributed sealed link the
+/// request must be signed by the handshake's initiator key. An unannounced C
+/// opens the link (its handshake names C) and sends a device-join signed by,
+/// and introducing, B: refused by name (`link_seal_refused_first_contact_signer`),
+/// not delivered, the link closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_contact_request_signed_by_a_key_other_than_the_handshake_initiator_is_refused_e1()
+{
+    let t = trio("fcsigner", true, true, false).await;
+    let b_record = t.b.key.record().await;
+    let forged = first_contact_request(&t.b.key.key_id, &t.a.key.key_id, &b_record);
+    let _ = t.c.transport.send(&t.a.key.key_id, &forged).await;
+    let refused = wait_until(Duration::from_secs(20), || async {
+        t.a.seal("link_seal_refused_first_contact_signer") == 1
+    })
+    .await;
+    assert!(refused, "{:?}", t.a.metrics.link_seal());
+    assert!(
+        !t.a.received(&forged).await,
+        "the mis-signed request was not delivered"
+    );
+    assert_eq!(t.a.seal("link_seal_refused_first_contact_only"), 0);
+}
+
+/// **CLM-first-contact-seal-key-bound** — the matching code an owner compares
+/// is derived from the handshake's initiator key: A reads the initiator off
+/// the sealed link the request arrived on, and the code it derives
+/// (`first_contact::first_contact_matching_code`, the v2 SAS) is the code over
+/// C's own Ed25519 key. Named as any other key, the derivation refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_matching_code_is_derived_from_the_handshake_initiator_key_e1() {
+    use ciris_edge::first_contact::{first_contact_matching_code, MatchingCodeError};
+    let t = trio("fccode", true, true, false).await;
+    let c_record = t.c.key.record().await;
+    let request = first_contact_request(&t.c.key.key_id, &t.a.key.key_id, &c_record);
+    t.c.transport
+        .send(&t.a.key.key_id, &request)
+        .await
+        .expect("C -> A, sealed first contact");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&request).await
+        })
+        .await,
+        "A delivered C's request: {:?}",
+        t.a.metrics.link_seal()
+    );
+    let link = {
+        let seen = t.a.seen.lock().await;
+        seen.iter()
+            .find(|f| f.envelope_bytes == request)
+            .and_then(|f| f.reply_path.as_ref())
+            .expect("the request's link")
+            .token()
+    };
+    let initiator =
+        t.a.transport
+            .link_initiator_key_id(link)
+            .expect("A responded on C's link");
+    assert_eq!(initiator, t.c.key.key_id, "the handshake named C");
+    let a_pub: [u8; 32] = t.a.key.ed_pub.clone().try_into().expect("32-byte key");
+    let c_pub: [u8; 32] = t.c.key.ed_pub.clone().try_into().expect("32-byte key");
+    let code = first_contact_matching_code(&a_pub, &request, &initiator).expect("the code");
+    assert_eq!(
+        code,
+        ciris_edge::sas::peer_sas_digits_versioned(
+            &a_pub,
+            &c_pub,
+            ciris_edge::sas::DEFAULT_SAS_DIGITS,
+            ciris_edge::sas::SasVersion::V2,
+        )
+        .expect("sas"),
+        "the code is over the initiator's own key"
+    );
+    assert!(matches!(
+        first_contact_matching_code(&a_pub, &request, &t.b.key.key_id),
+        Err(MatchingCodeError::KeysDisagree { .. })
+    ));
+}
+
+/// **CLM-first-contact-seal-key-bound / CC 5.3.3.5 E1** — a fresh device that
+/// holds only the baked trust bundle plus the owner node's announce must
+/// resolve the owner node's transit pair as ROOTED (persist's
+/// `transit_kex_pair_for`, never weakened) before it can dial, and then
+/// complete a sealed first contact.
+///
+/// The test records what is true at this pin. If the pair does not resolve,
+/// it asserts the consequence (the dial is refused `link_seal_refused_no_pair`
+/// and never made) and prints `BLOCKER`: the bundle carries no signed
+/// transport destination and an announce carries no transit pair, so the
+/// fresh device has no Rooted source for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_device_roots_the_owner_nodes_transit_pair_from_bundle_and_announce_e1() {
+    let t = trio("fresh", true, true, true).await;
+    assert!(
+        t.c.transport.knows_peer(&t.a.key.key_id).await,
+        "the fresh device heard the owner node's announce"
+    );
+    let pair =
+        ciris_persist::federation::self_at_login::transit_kex_pair_for(&*t.c.dir, &t.a.key.key_id)
+            .await
+            .expect("the directory answers");
+    let c_record = t.c.key.record().await;
+    let request = first_contact_request(&t.c.key.key_id, &t.a.key.key_id, &c_record);
+    let sent = t.c.transport.send(&t.a.key.key_id, &request).await;
+    if pair.is_none() {
+        eprintln!(
+            "BLOCKER (CLM-first-contact-seal-key-bound): a fresh device holding only the baked \
+             bundle and the owner node's announce cannot resolve the owner node's transit pair \
+             as Rooted, so it cannot open a sealed first contact"
+        );
+        match sent {
+            Err(TransportError::LinkSealRefused { reason, .. }) => {
+                assert_eq!(reason, "link_seal_refused_no_pair");
+            }
+            other => panic!("with no Rooted pair the dial must be refused by name: {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(t.a.seal("link_seal_accepted"), 0, "no link was made");
+        return;
+    }
+    sent.expect("C -> A, sealed first contact");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&request).await
+        })
+        .await,
+        "A delivered the fresh device's first contact: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(t.a.seal("link_seal_accepted") >= 1);
 }
