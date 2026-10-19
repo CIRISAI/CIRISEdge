@@ -700,7 +700,8 @@ async fn first_contact_rides_sealed_and_nothing_else_on_an_unattributed_link_e1(
     );
 }
 
-/// **CLM-first-contact-seal-key-bound** — on an unattributed sealed link the
+/// **CLM-first-contact-seal-key-bound (CC 3.2 adding-a-device (e))** — on an
+/// unattributed sealed link the
 /// request must be signed by the handshake's initiator key. An unannounced C
 /// opens the link (its handshake names C) and sends a device-join signed by,
 /// and introducing, B: refused by name (`link_seal_refused_first_contact_signer`),
@@ -724,7 +725,8 @@ async fn a_first_contact_request_signed_by_a_key_other_than_the_handshake_initia
     assert_eq!(t.a.seal("link_seal_refused_first_contact_only"), 0);
 }
 
-/// **CLM-first-contact-seal-key-bound** — the matching code an owner compares
+/// **CLM-first-contact-seal-key-bound (CC 3.2 adding-a-device (e))** — the
+/// matching code an owner compares
 /// is derived from the handshake's initiator key: A reads the initiator off
 /// the sealed link the request arrived on, and the code it derives
 /// (`first_contact::first_contact_matching_code`, the v2 SAS) is the code over
@@ -780,7 +782,8 @@ async fn a_matching_code_is_derived_from_the_handshake_initiator_key_e1() {
     ));
 }
 
-/// **CLM-first-contact-seal-key-bound / CC 5.3.3.5 E1** — a fresh device that
+/// **CLM-first-contact-seal-key-bound (CC 3.2 adding-a-device (e)) / CC 5.3.3.5
+/// E1** — a fresh device that
 /// holds only the baked trust bundle plus the owner node's announce must
 /// resolve the owner node's transit pair as ROOTED (persist's
 /// `transit_kex_pair_for`, never weakened) before it can dial, and then
@@ -831,4 +834,259 @@ async fn a_fresh_device_roots_the_owner_nodes_transit_pair_from_bundle_and_annou
         t.a.metrics.link_seal()
     );
     assert!(t.a.seal("link_seal_accepted") >= 1);
+}
+
+// ─── CC 3.2 adding-a-device (f): the pairing-pinned transit pair ─────
+
+/// An `OpaqueResponse` / any other envelope of `message_type`, as A answers
+/// on the link a request arrived on.
+fn envelope_of(message_type: &str, from: &str, to: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "edge_schema_version": "v2_0_0",
+        "signing_key_id": from,
+        "destination_key_id": to,
+        "message_type": message_type,
+        "sent_at": chrono::Utc::now(),
+        "nonce": vec![9u8; 16],
+        "body": {"kind": 2, "status": 200, "payload": [4, 5, 6]},
+        "signature": "unchecked-at-the-transport",
+    }))
+    .expect("json")
+}
+
+/// A pinned first contact from the fresh, unannounced C to A: returns C's
+/// request and the link it rode, once A has delivered it.
+async fn pinned_first_contact(t: &Trio) -> (Vec<u8>, [u8; 16]) {
+    let pin = t.a.transport.pairing_transit_pin();
+    let c_record = t.c.key.record().await;
+    let request = first_contact_request(&t.c.key.key_id, &t.a.key.key_id, &c_record);
+    let link =
+        t.c.transport
+            .send_first_contact_pinned(&pin, &request)
+            .await
+            .expect("C -> A over the pinned pair");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&request).await
+        })
+        .await,
+        "A delivered C's pinned first contact: {:?}",
+        t.a.metrics.link_seal()
+    );
+    (request, link)
+}
+
+/// The link at A that `request` arrived on.
+async fn arrival_link(node: &Node, bytes: &[u8]) -> ciris_edge::transport::ReplyPath {
+    node.seen
+        .lock()
+        .await
+        .iter()
+        .find(|f| f.envelope_bytes == bytes)
+        .and_then(|f| f.reply_path)
+        .expect("the frame's link")
+}
+
+/// **CLM-pairing-payload-transit-pin (CC 3.2 adding-a-device (f)); CC
+/// 5.3.3.5 E1** — a fresh device that holds no Rooted route for its owner's
+/// node (the BLOCKER the bundle-only witness records) seals its first contact
+/// with the pair the owner's pairing payload pins: the handshake is the first
+/// frame, every frame after it is sealed, A answers it unattributed under
+/// CC 3.2 (e)'s key-bound rules, and A's `OpaqueResponse` comes back on that
+/// link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_device_seals_first_contact_with_a_pairing_pinned_pair_e1() {
+    let t = trio("pinok", true, true, true).await;
+    assert!(
+        ciris_persist::federation::self_at_login::transit_kex_pair_for(&*t.c.dir, &t.a.key.key_id)
+            .await
+            .expect("directory")
+            .is_none(),
+        "precondition: no Rooted pair for A at the fresh device"
+    );
+    t.c.transport.set_link_wire_tap_for_test(true);
+    let (request, link) = pinned_first_contact(&t).await;
+    assert!(t.c.transport.link_is_pinned_for_test(link));
+    assert!(t.a.seal("link_seal_accepted") >= 1);
+    {
+        let seen = t.a.seen.lock().await;
+        let f = seen
+            .iter()
+            .find(|f| f.envelope_bytes == request)
+            .expect("the request");
+        assert!(
+            f.source_key_id.is_none() && f.link_key_id.is_none(),
+            "C is unattributed at A"
+        );
+    }
+    let wire = t.c.transport.link_wire_tapped_for_test();
+    assert!(
+        dialled_with_handshake(&wire),
+        "the pinned link opened with its handshake"
+    );
+    assert_wire_is_sealed(&wire, b"\"key_record\"");
+    // A answers on the link the request arrived on; C delivers it.
+    let path = arrival_link(&t.a, &request).await;
+    let response = envelope_of("OpaqueResponse", &t.a.key.key_id, &t.c.key.key_id);
+    t.a.transport
+        .send_on_reply_path_only(&t.c.key.key_id, &path, &response)
+        .await
+        .expect("A answers on C's link");
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.c.received(&response).await
+        })
+        .await,
+        "C delivered A's answer: {:?}",
+        t.c.metrics.link_seal()
+    );
+}
+
+/// **CLM-pairing-payload-transit-pin (CC 3.2 adding-a-device (f))** — the pin
+/// keys that one link and is never a route: after the pinned first contact the
+/// fresh device's directory holds no signed route for A,
+/// `transit_kex_pair_for` still answers `None`, and an ordinary send to A is
+/// refused `link_seal_refused_no_pair` rather than riding (or re-keying from)
+/// the pinned link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_pair_is_never_stored_or_resolved_as_rooted_e1() {
+    let t = trio("pinroot", true, true, true).await;
+    let (_request, _link) = pinned_first_contact(&t).await;
+    let routes =
+        t.c.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list");
+    assert!(
+        routes.is_empty(),
+        "the pin was never written as a route: {routes:?}"
+    );
+    assert!(
+        ciris_persist::federation::self_at_login::transit_kex_pair_for(&*t.c.dir, &t.a.key.key_id)
+            .await
+            .expect("directory")
+            .is_none(),
+        "the pin never resolves as Rooted"
+    );
+    let keyed = t.c.seal("link_seal_initiated");
+    match t
+        .c
+        .transport
+        .send(&t.a.key.key_id, b"an-ordinary-row")
+        .await
+    {
+        Err(TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_no_pair");
+        }
+        other => panic!("an ordinary send must not ride or reuse the pin: {other:?}"),
+    }
+    assert_eq!(
+        t.c.seal("link_seal_initiated"),
+        keyed,
+        "nothing else was keyed"
+    );
+    assert!(!t.a.received(b"an-ordinary-row").await);
+}
+
+/// **CLM-pairing-payload-transit-pin (CC 3.2 adding-a-device (f));
+/// CLM-first-contact-seal-key-bound (CC 3.2 (e))** — the pinned link carries
+/// the first-contact plane and nothing else, both ways: C cannot seal any
+/// other frame on it (`link_seal_refused_first_contact_only`), a request
+/// signed by another key is refused before any dial
+/// (`link_seal_refused_first_contact_signer`), and a frame from A on that link
+/// other than first contact is refused at C and the link closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_pair_link_carries_only_first_contact_e1() {
+    let t = trio("pinonly", true, true, true).await;
+    let (request, link) = pinned_first_contact(&t).await;
+    // Outbound: nothing but first contact seals on the pinned link.
+    let other = b"{\"message_type\":\"OpaqueEvent\",\"body\":{}}".to_vec();
+    let path = ciris_edge::transport::ReplyPath::new(
+        ciris_edge::transport::TransportId::RETICULUM_RS,
+        link,
+    );
+    assert!(
+        t.c.transport
+            .send_on_reply_path_only(&t.a.key.key_id, &path, &other)
+            .await
+            .is_err(),
+        "no other send path seals on the pinned link"
+    );
+    assert!(!t.a.received(&other).await);
+    // A request signed by another key: refused before any dial.
+    let b_record = t.b.key.record().await;
+    let forged = first_contact_request(&t.b.key.key_id, &t.a.key.key_id, &b_record);
+    match t
+        .c
+        .transport
+        .send_first_contact_pinned(&t.a.transport.pairing_transit_pin(), &forged)
+        .await
+    {
+        Err(TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_first_contact_signer");
+        }
+        other => panic!("a mis-signed pinned request must be refused: {other:?}"),
+    }
+    // Inbound: A's answer of another plane on the pinned link is refused at C.
+    let a_path = arrival_link(&t.a, &request).await;
+    let event = envelope_of("OpaqueEvent", &t.a.key.key_id, &t.c.key.key_id);
+    let _ =
+        t.a.transport
+            .send_on_reply_path_only(&t.c.key.key_id, &a_path, &event)
+            .await;
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.c.seal("link_seal_refused_first_contact_only") >= 1
+        })
+        .await,
+        "{:?}",
+        t.c.metrics.link_seal()
+    );
+    assert!(
+        !t.c.received(&event).await,
+        "the other plane was not delivered at C"
+    );
+}
+
+/// **CLM-pairing-payload-transit-pin (CC 3.2 adding-a-device (f))** — a pin
+/// that is not the dialled node's own transit pair is refused: one whose keys
+/// are another node's (B's) keys a handshake A cannot answer to the same
+/// keys, so A refuses the first sealed frame
+/// (`link_seal_refused_open_failed`) and nothing is delivered; one whose
+/// shape is wrong is refused before any dial (`link_seal_refused_pin`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_pair_that_is_not_the_nodes_responder_keys_is_refused_e1() {
+    let t = trio("pinbad", true, true, true).await;
+    let c_record = t.c.key.record().await;
+    let request = first_contact_request(&t.c.key.key_id, &t.a.key.key_id, &c_record);
+    // B's keys, bound to A's id.
+    let mut wrong = t.b.transport.pairing_transit_pin();
+    wrong.node_key_id = t.a.key.key_id.clone();
+    let _ =
+        t.c.transport
+            .send_first_contact_pinned(&wrong, &request)
+            .await;
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.seal("link_seal_refused_open_failed") + t.a.seal("link_seal_refused_kex") >= 1
+        })
+        .await,
+        "A refuses a link keyed to keys it does not hold: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(!t.a.received(&request).await, "nothing was delivered");
+    // A truncated ML-KEM key: refused before any dial.
+    let mut short = t.a.transport.pairing_transit_pin();
+    short.ml_kem_768_base64 = "AAAA".to_owned();
+    match t
+        .c
+        .transport
+        .send_first_contact_pinned(&short, &request)
+        .await
+    {
+        Err(TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_pin");
+        }
+        other => panic!("a malformed pin must be refused by name: {other:?}"),
+    }
 }

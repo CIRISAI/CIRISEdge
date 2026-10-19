@@ -960,6 +960,9 @@ pub const LINK_SEAL_REFUSED_FIRST_CONTACT_ONLY: &str = "link_seal_refused_first_
 /// unattributed sealed link was signed by (or introduced) a key other than
 /// the handshake's initiator key.
 pub const LINK_SEAL_REFUSED_FIRST_CONTACT_SIGNER: &str = "link_seal_refused_first_contact_signer";
+/// CC 3.2 (f) — a pairing-pinned transit pair was refused before any dial
+/// (bound to another node, or the wrong key lengths).
+pub const LINK_SEAL_REFUSED_PIN: &str = "link_seal_refused_pin";
 /// This node tried to send on a link with no keys: refused, nothing sent.
 pub const LINK_SEAL_REFUSED_UNSEALED_SEND: &str = "link_seal_refused_unsealed_send";
 /// A sealed frame whose counter was already seen, or is older than the

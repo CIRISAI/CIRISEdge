@@ -5311,6 +5311,125 @@ impl ReticulumTransport {
         self.seals.claimed_initiator(link)
     }
 
+    /// CC 3.2 adding-a-device (f) — this node's transit pair as the owner's
+    /// device-join pairing payload carries it (CLM-pairing-payload-transit-pin):
+    /// the host puts it in the payload it shows the new device.
+    #[must_use]
+    pub fn pairing_transit_pin(&self) -> crate::transport::link_seal::PairingTransitPin {
+        crate::transport::link_seal::PairingTransitPin::new(
+            self.occurrence_key_id(),
+            self.seals.secret().pair(),
+        )
+    }
+
+    /// CC 3.2 adding-a-device (f) — **an offline or LAN-only first contact**:
+    /// dial `pin.node_key_id` keyed by the pairing-pinned pair instead of a
+    /// Rooted one, and send `request` (this node's own first-contact
+    /// `OpaqueRequest`) on that link.
+    ///
+    /// The pin keys this ONE link and nothing else: it is checked for shape
+    /// and for its binding to the dialled node, used for the handshake, and
+    /// dropped. It is never written to the directory and never resolvable as
+    /// Rooted. The link is marked first-contact-only: no other send path can
+    /// seal on it, it is published to no pool, nothing else (no announce, no
+    /// bundle) is pushed on it, and only the first-contact plane is delivered
+    /// from it. CC 3.2 (e)'s key-bound rules hold: `request` must be signed
+    /// by, and introduce, this node's own occurrence key, the key the
+    /// handshake claims. A pin that is not the node's real pair yields keys
+    /// the node does not hold, so the node refuses the first sealed frame
+    /// (`link_seal_refused_open_failed`) and closes the link.
+    ///
+    /// Returns the link, whose `reply_path` the answer arrives on.
+    ///
+    /// # Errors
+    /// [`TransportError::LinkSealRefused`] (`link_seal_refused_pin`,
+    /// `link_seal_refused_first_contact_only`,
+    /// `link_seal_refused_first_contact_signer`, or a handshake refusal),
+    /// [`TransportError::Unreachable`] / [`TransportError::NoRouteToPeer`] /
+    /// [`TransportError::Timeout`] from the dial, or [`TransportError::Io`]
+    /// when the request does not go out whole.
+    pub async fn send_first_contact_pinned(
+        &self,
+        pin: &crate::transport::link_seal::PairingTransitPin,
+        request: &[u8],
+    ) -> Result<[u8; 16], TransportError> {
+        use crate::transport::link_seal::{admit_unattributed_frame, Lane};
+        let peer_key_id = pin.node_key_id.as_str();
+        let refused = |r: &crate::transport::link_seal::SealRefusal| {
+            seal_refused(self.metrics.get(), peer_key_id, None, r, "dial")
+        };
+        let pair = pin.pair_for(peer_key_id).map_err(|r| refused(&r))?;
+        admit_unattributed_frame(self.occurrence_key_id(), request).map_err(|r| refused(&r))?;
+        let candidates = self.resolve_dial_candidates(peer_key_id).await;
+        for c in &candidates {
+            self.check_blackhole(&c.dest_hash.into_bytes()).await?;
+        }
+        let flags: Vec<(DialSource, bool)> = candidates
+            .iter()
+            .map(|c| (c.source, self.node.has_path(&c.dest_hash)))
+            .collect();
+        let Some(i) = select_dial_candidate(&flags) else {
+            return Err(TransportError::Unreachable(format!(
+                "first contact: no dial candidate for {peer_key_id} (its announce has not \
+                 reached this node)"
+            )));
+        };
+        let has_path = flags[i].1;
+        let peer = ResolvedPeer {
+            dest_hash: candidates[i].dest_hash,
+            transport_ed25519: candidates[i].transport_ed25519,
+        };
+        let timeout = if has_path {
+            LINK_ESTABLISH_TIMEOUT
+        } else {
+            NO_PATH_ESTABLISH_TIMEOUT
+        };
+        let ctx = self.dial_ctx();
+        let link_id = ctx
+            .connect_and_key(
+                peer_key_id,
+                &peer,
+                has_path,
+                timeout,
+                &pair,
+                self.occurrence_key_id(),
+            )
+            .await?;
+        drop(pair);
+        // Nothing else has this link: it was never published. From here no
+        // other send path can seal on it.
+        self.seals.pin_first_contact_only(link_id.into_bytes());
+        let mdu = link_channel_mdu(&self.node, &link_id);
+        let fragments = crate::transport::frame_fragment::fragment(request, mdu)
+            .ok_or_else(|| TransportError::Io("first contact: link MDU too small".to_owned()))?;
+        for frag in &fragments {
+            let sealed = self
+                .seals
+                .seal_first_contact(link_id.into_bytes(), Lane::Channel, frag)
+                .map_err(|r| refused(&r))?;
+            match tokio::time::timeout(
+                CHANNEL_FRAGMENT_SEND_TIMEOUT,
+                self.node.link_handle(&link_id).send(&sealed),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    return Err(TransportError::Io(format!("first contact send: {e}")));
+                }
+                Err(_) => return Err(TransportError::Timeout(CHANNEL_FRAGMENT_SEND_TIMEOUT)),
+            }
+        }
+        note_outbound_use(&self.link_last_outbound_at, link_id);
+        Ok(link_id.into_bytes())
+    }
+
+    /// CC 3.2 (f) test seam — whether `link` was keyed from a pairing pin.
+    #[doc(hidden)]
+    pub fn link_is_pinned_for_test(&self, link: [u8; 16]) -> bool {
+        self.seals.is_pinned(link)
+    }
+
     /// CC 5.3.3.5 E1 test seam — whether `link` carries transit keys.
     #[doc(hidden)]
     pub fn link_is_sealed_for_test(&self, link: [u8; 16]) -> bool {
@@ -9917,6 +10036,90 @@ impl DialCtx {
         let pair = self
             .dial_transit_pair(destination_key_id, peer, has_path)
             .await?;
+        let link_id = self
+            .connect_and_key(
+                destination_key_id,
+                peer,
+                has_path,
+                establish_timeout,
+                &pair,
+                &self.own_key_id,
+            )
+            .await?;
+
+        let announced = !self
+            .test_unannounced
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // CIRISEdge#627 — announce FIRST (see `link_open`).
+        if let Some(frame) = self.own_announce_frame.as_deref().filter(|_| announced) {
+            push_own_announce_frame(&self.node, &self.seals, frame, &link_id).await;
+        }
+        // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
+        // LINKIDENTIFY (so the responder attributes it) and BEFORE the
+        // resource ship (the fragments ride the link Channel, which never
+        // contends with the resource lane — leviculum#27).
+        if let Some(own) = self.own_bundle.as_ref().filter(|_| announced) {
+            push_own_bundle_frames(&self.node, &self.seals, own, &link_id).await;
+        }
+        // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
+        // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle and
+        // before the resource ship (same Channel lane as the bundle).
+        if let Some(src) = self.own_owner_binding.as_ref().filter(|_| announced) {
+            push_own_owner_binding(
+                &self.node,
+                &self.seals,
+                src.as_ref(),
+                &link_id,
+                self.metrics.as_ref(),
+            )
+            .await;
+        }
+
+        // PUBLISH LAST. Only now is the link established AND identified AND
+        // bundle-served — the three things a reusing sender skips. Publishing
+        // any earlier would hand another coordinator a link the responder will
+        // drop frames on (`SkippedNoSourceKeyId`, #317/#340).
+        //
+        // CIRISEdge#853 — and publish it CLAIMED, for the send that dialled
+        // it. Published unclaimed, a concurrent send could take the lane from
+        // the pool in the gap before the dialler claimed it, and both shipped
+        // on one link (leviculum `TransferInProgress`). The claim rides back
+        // to the dialler as a `LinkClaim`; if the dialler was cancelled while
+        // it waited (the #568 detach), the task's output is dropped when the
+        // task finishes and the claim's `Drop` gives the lane back to the pool.
+        stamp_pool_use(&self.pool_last_used, link_id);
+        self.link_in_flight.lock().await.insert(link_id);
+        let claim = self.link_claim(link_id);
+        self.reusable_dialed_link
+            .lock()
+            .await
+            .entry(peer.dest_hash)
+            .or_default()
+            .push(link_id);
+        let delay = self
+            .test_publish_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+
+        Ok(claim)
+    }
+
+    /// The dial itself, shared by an ordinary identity dial and a
+    /// pairing-pinned first contact: connect, record the dialled dest (#424)
+    /// and the plane (#728), await establishment, identify (#340), and key the
+    /// link with `pair` claiming `claim` (CC 5.3.3.5 E1). Pushes nothing and
+    /// publishes nothing; the caller decides what the link may carry.
+    async fn connect_and_key(
+        &self,
+        destination_key_id: &str,
+        peer: &ResolvedPeer,
+        has_path: bool,
+        establish_timeout: Duration,
+        pair: &TransitKexPair,
+        claim: &str,
+    ) -> Result<LinkId, TransportError> {
         let (link, established) = self
             .node
             .connect_awaited(&peer.dest_hash, &peer.transport_ed25519)
@@ -9999,66 +10202,9 @@ impl DialCtx {
             .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
         // CC 5.3.3.5 E1 — the transit KEX is the link's first frame; every
         // frame below rides sealed.
-        self.key_link(link_id, destination_key_id, &pair, &self.own_key_id)
+        self.key_link(link_id, destination_key_id, pair, claim)
             .await?;
-
-        let announced = !self
-            .test_unannounced
-            .load(std::sync::atomic::Ordering::Relaxed);
-        // CIRISEdge#627 — announce FIRST (see `link_open`).
-        if let Some(frame) = self.own_announce_frame.as_deref().filter(|_| announced) {
-            push_own_announce_frame(&self.node, &self.seals, frame, &link_id).await;
-        }
-        // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
-        // LINKIDENTIFY (so the responder attributes it) and BEFORE the
-        // resource ship (the fragments ride the link Channel, which never
-        // contends with the resource lane — leviculum#27).
-        if let Some(own) = self.own_bundle.as_ref().filter(|_| announced) {
-            push_own_bundle_frames(&self.node, &self.seals, own, &link_id).await;
-        }
-        // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
-        // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle and
-        // before the resource ship (same Channel lane as the bundle).
-        if let Some(src) = self.own_owner_binding.as_ref().filter(|_| announced) {
-            push_own_owner_binding(
-                &self.node,
-                &self.seals,
-                src.as_ref(),
-                &link_id,
-                self.metrics.as_ref(),
-            )
-            .await;
-        }
-
-        // PUBLISH LAST. Only now is the link established AND identified AND
-        // bundle-served — the three things a reusing sender skips. Publishing
-        // any earlier would hand another coordinator a link the responder will
-        // drop frames on (`SkippedNoSourceKeyId`, #317/#340).
-        //
-        // CIRISEdge#853 — and publish it CLAIMED, for the send that dialled
-        // it. Published unclaimed, a concurrent send could take the lane from
-        // the pool in the gap before the dialler claimed it, and both shipped
-        // on one link (leviculum `TransferInProgress`). The claim rides back
-        // to the dialler as a `LinkClaim`; if the dialler was cancelled while
-        // it waited (the #568 detach), the task's output is dropped when the
-        // task finishes and the claim's `Drop` gives the lane back to the pool.
-        stamp_pool_use(&self.pool_last_used, link_id);
-        self.link_in_flight.lock().await.insert(link_id);
-        let claim = self.link_claim(link_id);
-        self.reusable_dialed_link
-            .lock()
-            .await
-            .entry(peer.dest_hash)
-            .or_default()
-            .push(link_id);
-        let delay = self
-            .test_publish_delay_ms
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if delay > 0 {
-            tokio::time::sleep(Duration::from_millis(delay)).await;
-        }
-
-        Ok(claim)
+        Ok(link_id)
     }
 
     /// CIRISEdge#532 — the live, identified link we already hold to this dest,
@@ -11153,6 +11299,16 @@ async fn attribute_and_deliver(
             seal_teardown(ctx, link_id, &refusal).await;
             return;
         }
+    }
+    // CC 3.2 (f) — a link this node keyed from a pairing-pinned pair carries
+    // the first-contact plane and nothing else, inbound too.
+    if ctx.seals.is_pinned(link_id.into_bytes())
+        && !crate::transport::link_seal::is_first_contact_plane(&data)
+    {
+        let refusal = crate::transport::link_seal::SealRefusal::FirstContactOnly;
+        drop_inbound(Some(link_id), refusal.label(), &refusal.to_string());
+        seal_teardown(ctx, link_id, &refusal).await;
+        return;
     }
     let link_key_id = candidate_key_id.clone();
     let source_key_id = match candidate_key_id {

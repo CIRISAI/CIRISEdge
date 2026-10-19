@@ -184,6 +184,10 @@ pub enum SealRefusal {
     /// The handshake was refused (framing, suite, KEX, claim, budget).
     #[error(transparent)]
     Handshake(AvHandshakeError),
+    /// CC 3.2 (f) — a pairing-pinned transit pair was refused before any dial
+    /// (wrong length, bound to another node, ...).
+    #[error("pairing-pinned transit pair refused: {0}")]
+    PinRejected(String),
     /// A frame arrived on a link this node dialled before its own handshake
     /// had gone out.
     #[error("a frame arrived on a link this node dialled before its handshake went out")]
@@ -226,6 +230,7 @@ impl SealRefusal {
         use crate::observability as o;
         match self {
             Self::Handshake(e) => e.label(),
+            Self::PinRejected(_) => o::LINK_SEAL_REFUSED_PIN,
             Self::FrameBeforeKeys => o::LINK_SEAL_REFUSED_FRAME_BEFORE_KEYS,
             Self::OpenFailed => o::LINK_SEAL_REFUSED_OPEN_FAILED,
             Self::Unsealed => o::LINK_SEAL_REFUSED_UNSEALED_SEND,
@@ -308,6 +313,9 @@ pub struct SealedLink {
     windows: Mutex<[ReplayWindow; 4]>,
     /// The handshake's claimed initiator, on a link this node RESPONDED on.
     claimed_initiator: Option<String>,
+    /// CC 3.2 (f) — keyed from a pairing-pinned pair: this link carries the
+    /// first-contact plane only, through [`LinkSeals::seal_first_contact`].
+    pinned: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for SealedLink {
@@ -355,6 +363,7 @@ impl SealedLink {
             next: Default::default(),
             windows: Mutex::new([ReplayWindow::default(); 4]),
             claimed_initiator,
+            pinned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -525,6 +534,26 @@ impl LinkSeals {
         );
     }
 
+    /// CC 3.2 (f) — mark a link this node keyed from a pairing-pinned pair:
+    /// from now on [`Self::seal`] refuses it and only
+    /// [`Self::seal_first_contact`] seals on it. `false` when the link is not
+    /// keyed.
+    pub fn pin_first_contact_only(&self, link: [u8; 16]) -> bool {
+        match self.links().get(&link) {
+            Some(State::Sealed(s)) => {
+                s.pinned.store(true, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// CC 3.2 (f) — whether `link` was keyed from a pairing-pinned pair.
+    #[must_use]
+    pub fn is_pinned(&self, link: [u8; 16]) -> bool {
+        matches!(self.links().get(&link), Some(State::Sealed(s)) if s.pinned.load(Ordering::Relaxed))
+    }
+
     /// Record a link a peer dialled, awaiting its handshake. `true` only when
     /// the link was not known before (the caller then starts its budget).
     pub fn begin_responder(&self, link: [u8; 16]) -> bool {
@@ -611,6 +640,40 @@ impl LinkSeals {
             Some(State::Sealed(s)) => Arc::clone(s),
             _ => return Err(SealRefusal::Unsealed),
         };
+        // CC 3.2 (f) — a pairing-pinned link carries first contact only, and
+        // only through `seal_first_contact`: no other send path can use it.
+        if sealed.pinned.load(Ordering::Relaxed) {
+            return Err(SealRefusal::FirstContactOnly);
+        }
+        self.seal_with(link, &sealed, lane, plaintext)
+    }
+
+    /// CC 3.2 (f) — seal one first-contact frame on a pairing-pinned link.
+    /// Only a link marked by [`Self::pin_first_contact_only`] takes it.
+    ///
+    /// # Errors
+    /// [`SealRefusal::Unsealed`] for a link with no keys or one that is not
+    /// pinned.
+    pub fn seal_first_contact(
+        &self,
+        link: [u8; 16],
+        lane: Lane,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, SealRefusal> {
+        let sealed = match self.links().get(&link) {
+            Some(State::Sealed(s)) if s.pinned.load(Ordering::Relaxed) => Arc::clone(s),
+            _ => return Err(SealRefusal::Unsealed),
+        };
+        self.seal_with(link, &sealed, lane, plaintext)
+    }
+
+    fn seal_with(
+        &self,
+        link: [u8; 16],
+        sealed: &SealedLink,
+        lane: Lane,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, SealRefusal> {
         let mut frame = sealed.seal(lane, plaintext);
         if lane.is_msgpack() {
             frame = msgpack_bin(&frame);
@@ -744,6 +807,103 @@ impl LinkSeals {
             }
         }
     }
+}
+
+/// CC 3.2 adding-a-device (f) — **the owner node's transit pair as the
+/// owner's device-join pairing payload carries it**, for an offline or
+/// LAN-only first contact where the fresh device has no Rooted route for the
+/// node (CLM-pairing-payload-transit-pin).
+///
+/// Edge does not own the pairing payload: the device-join pairing code / QR
+/// is the host's (CIRISServer's device-join flow), and a verify fedcode is
+/// far too small for a 1184-byte ML-KEM key. This is the minimal edge-side
+/// shape the host must carry inside its payload and hand to
+/// `ReticulumTransport::send_first_contact_pinned`; the owner node mints it
+/// with `ReticulumTransport::pairing_transit_pin`.
+///
+/// It is a PIN, never a route: it keys exactly one link, to `node_key_id`,
+/// for the first-contact plane only. It is held in memory for that link, never
+/// written to the directory, and never resolvable as Rooted
+/// (`transit_kex_pair_for` never sees it). All of CC 3.2 (e)'s key-bound rules
+/// apply on the link it keys.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PairingTransitPin {
+    /// The owner node's occurrence key id: the only node this pin may dial.
+    pub node_key_id: String,
+    /// The node's transit X25519 public key, base64 (32 bytes).
+    pub x25519_base64: String,
+    /// The node's transit ML-KEM-768 public key, base64 (1184 bytes).
+    pub ml_kem_768_base64: String,
+}
+
+impl PairingTransitPin {
+    /// The pin for `node_key_id`'s published pair.
+    #[must_use]
+    pub fn new(node_key_id: impl Into<String>, pair: &TransitKexPair) -> Self {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        Self {
+            node_key_id: node_key_id.into(),
+            x25519_base64: b64.encode(pair.x25519),
+            ml_kem_768_base64: b64.encode(&pair.ml_kem_768[..]),
+        }
+    }
+
+    /// The pinned pair, for a dial to `dialled` and nothing else.
+    ///
+    /// Checks the STRUCTURE only: the binding to the dialled node and both
+    /// key lengths.
+    ///
+    /// # Errors
+    /// [`SealRefusal::PinRejected`].
+    pub fn pair_for(&self, dialled: &str) -> Result<TransitKexPair, SealRefusal> {
+        use base64::Engine as _;
+        use ciris_persist::federation::self_at_login::{
+            TRANSIT_KEX_ML_KEM_768_LEN, TRANSIT_KEX_X25519_LEN,
+        };
+        if self.node_key_id != dialled {
+            return Err(SealRefusal::PinRejected(format!(
+                "the pin is bound to {}, not to the dialled node {dialled}",
+                self.node_key_id
+            )));
+        }
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let x = b64
+            .decode(&self.x25519_base64)
+            .map_err(|e| SealRefusal::PinRejected(format!("x25519: {e}")))?;
+        let k = b64
+            .decode(&self.ml_kem_768_base64)
+            .map_err(|e| SealRefusal::PinRejected(format!("ml_kem_768: {e}")))?;
+        let x25519 = <[u8; TRANSIT_KEX_X25519_LEN]>::try_from(x.as_slice()).map_err(|_| {
+            SealRefusal::PinRejected(format!("x25519 is {} bytes, not 32", x.len()))
+        })?;
+        let ml_kem_768 = Box::<[u8; TRANSIT_KEX_ML_KEM_768_LEN]>::try_from(k.into_boxed_slice())
+            .map_err(|k| {
+                SealRefusal::PinRejected(format!("ml_kem_768 is {} bytes, not 1184", k.len()))
+            })?;
+        // TODO(persist v59): validate with
+        // `ciris_persist::federation::self_at_login::check_transit_kex_pair(&pair, &[..the
+        // node's other keys])` (CC 3.3.6.2 in-row key separation) once the v59 head lands;
+        // edge keeps no copy of that rule.
+        Ok(TransitKexPair { x25519, ml_kem_768 })
+    }
+}
+
+/// CC 3.2 (f) — the first-contact plane both ways on a pairing-pinned link:
+/// the request the device sends and the response it is answered with.
+#[must_use]
+pub fn is_first_contact_plane(bytes: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        message_type: crate::messages::MessageType,
+    }
+    serde_json::from_slice::<Peek>(bytes).is_ok_and(|p| {
+        matches!(
+            p.message_type,
+            crate::messages::MessageType::OpaqueRequest
+                | crate::messages::MessageType::OpaqueResponse
+        )
+    })
 }
 
 /// What a first-contact request names about its sender: the envelope's
