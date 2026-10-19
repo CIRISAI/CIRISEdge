@@ -2363,6 +2363,11 @@ pub struct ReticulumTransport {
     /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead
     /// of the real one (see [`HandshakeOverride`]). `None` in production.
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
+    /// CC 5.3.3.5 E1 test seam — model an UNANNOUNCED node (an unowned fresh
+    /// device): no RNS announce and no on-link announce, bundle or owner
+    /// binding, so a peer it dials cannot attribute the link. `false` in
+    /// production.
+    test_unannounced: Arc<std::sync::atomic::AtomicBool>,
     /// The node's single `NodeEvent` receiver. `listen` takes it
     /// exactly once; a second `listen` call is a config error.
     /// Leviculum PR #9 switched this to an unbounded channel so node
@@ -3015,6 +3020,7 @@ impl ReticulumTransport {
             rooting: self.rooting.clone(),
             own_key_id: self.occurrence_key_id().to_owned(),
             handshake_override: Arc::clone(&self.handshake_override),
+            test_unannounced: Arc::clone(&self.test_unannounced),
         }
     }
 
@@ -3651,6 +3657,7 @@ impl ReticulumTransport {
             self_route,
             seals,
             handshake_override: Arc::new(std::sync::Mutex::new(None)),
+            test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
@@ -5283,6 +5290,16 @@ impl ReticulumTransport {
         self.seals.tapped()
     }
 
+    /// CC 5.3.3.5 E1 test seam — run as an UNANNOUNCED node from now on (set
+    /// it before `listen`): no RNS announce, and no on-link announce, bundle
+    /// or owner binding on the links it dials. A peer then cannot attribute
+    /// the links it opens: the first-contact carve-out's subject.
+    #[doc(hidden)]
+    pub fn set_unannounced_for_test(&self, on: bool) {
+        self.test_unannounced
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// CC 5.3.3.5 E1 test seam — whether `link` carries transit keys.
     #[doc(hidden)]
     pub fn link_is_sealed_for_test(&self, link: [u8; 16]) -> bool {
@@ -6620,17 +6637,20 @@ impl ReticulumTransport {
         // after the LINKIDENTIFY (so the responder binds it to the identity it
         // proved), before anything else on this link. Same task, same handle:
         // nothing can reorder ahead of it.
-        if let Some(frame) = self.own_announce_frame.as_deref() {
+        let announced = !self
+            .test_unannounced
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(frame) = self.own_announce_frame.as_deref().filter(|_| announced) {
             push_own_announce_frame(&self.node, &self.seals, frame, &link_id).await;
         }
         // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
         // LINKIDENTIFY so the responder can attribute the frame.
-        if let Some(own) = self.own_bundle.as_ref() {
+        if let Some(own) = self.own_bundle.as_ref().filter(|_| announced) {
             push_own_bundle_frames(&self.node, &self.seals, own, &link_id).await;
         }
         // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
         // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle.
-        if let Some(src) = self.own_owner_binding.as_ref() {
+        if let Some(src) = self.own_owner_binding.as_ref().filter(|_| announced) {
             push_own_owner_binding(
                 &self.node,
                 &self.seals,
@@ -8118,13 +8138,8 @@ impl ReticulumTransport {
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        // Auto-accept any resources the peer pushes back on this link
-        // (e.g. an ACK envelope), and ship our envelope as a resource.
-        let _ = self
-            .node
-            .set_resource_strategy(link_id, ResourceStrategy::AcceptAll);
         // CC 5.3.3.5 E1 — the Resource carries the SEALED envelope; a link
-        // with no keys ships nothing.
+        // with no keys ships nothing (and opens no Resource lane).
         let sealed = self
             .seals
             .seal(
@@ -8141,6 +8156,11 @@ impl ReticulumTransport {
                     "send",
                 ))
             })?;
+        // Auto-accept any resources the peer pushes back on this link
+        // (e.g. an ACK envelope), and ship our envelope as a resource.
+        let _ = self
+            .node
+            .set_resource_strategy(link_id, ResourceStrategy::AcceptAll);
         let (resource_hash, sent) = self
             .node
             .send_resource_awaited(link_id, &sealed, None, true)
@@ -8550,8 +8570,19 @@ impl Transport for ReticulumTransport {
         // binding this transport identity to `local_key_id`. When no
         // signer was supplied the announce carries empty app-data and
         // rooting peers drop it (fail-honest).
+        //
+        // CC 5.3.3.5 E1 — the announce is the one thing this transport sends
+        // OFF a link, and it stays unsealed: it is public by design (a signed
+        // routing hint every node may read and relay; there is no peer to key
+        // it to). Everything edge sends on a link rides the link seal.
         let app_data: &[u8] = self.local_attestation.as_deref().unwrap_or(&[]);
-        if let Err(e) = self
+        let unannounced = || {
+            self.test_unannounced
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        if unannounced() {
+            tracing::debug!("unannounced (test seam): no initial announce");
+        } else if let Err(e) = self
             .node
             .announce_destination(&self.local_named_dest_hash, Some(app_data))
             .await
@@ -8648,7 +8679,9 @@ impl Transport for ReticulumTransport {
                     }
                 }
                 _ = announce_tick.tick() => {
-                    if let Err(e) = self
+                    if unannounced() {
+                        tracing::trace!("unannounced (test seam): no periodic announce");
+                    } else if let Err(e) = self
                         .node
                         .announce_destination(&self.local_named_dest_hash, Some(app_data))
                         .await
@@ -8744,6 +8777,7 @@ impl Transport for ReticulumTransport {
 
                     // `map_or(true, …)` not `is_none_or` — MSRV 1.75 (is_none_or is 1.82).
                     if link_just_established
+                        && !unannounced()
                         && last_event_announce
                             .map_or(true, |t| t.elapsed() >= EVENT_ANNOUNCE_MIN_INTERVAL)
                     {
@@ -9484,6 +9518,8 @@ struct DialCtx {
     own_key_id: String,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::handshake_override`.
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
+    /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_unannounced`.
+    test_unannounced: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DialCtx {
@@ -9691,6 +9727,12 @@ impl DialCtx {
             Some(HandshakeOverride::FirstFrame(raw)) => vec![raw],
             _ => frames,
         };
+        // Keys go in BEFORE the parts go out: the responder may answer (its
+        // announce, sealed) the moment the last part lands, and that frame
+        // must find this end keyed. Nothing else sends on this link yet — it
+        // is not published to any pool or selector until this dial returns —
+        // so no sealed frame can precede the handshake.
+        self.seals.install_initiator(link, transit);
         let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
         for frame in &frames {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -9713,7 +9755,6 @@ impl DialCtx {
                 }
             }
         }
-        self.seals.install_initiator(link, transit);
         if let Some(m) = self.metrics.as_ref() {
             m.inc_link_seal(crate::observability::LINK_SEAL_INITIATED);
         }
@@ -9901,21 +9942,24 @@ impl DialCtx {
         self.key_link(link_id, destination_key_id, &pair, &self.own_key_id)
             .await?;
 
+        let announced = !self
+            .test_unannounced
+            .load(std::sync::atomic::Ordering::Relaxed);
         // CIRISEdge#627 — announce FIRST (see `link_open`).
-        if let Some(frame) = self.own_announce_frame.as_deref() {
+        if let Some(frame) = self.own_announce_frame.as_deref().filter(|_| announced) {
             push_own_announce_frame(&self.node, &self.seals, frame, &link_id).await;
         }
         // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
         // LINKIDENTIFY (so the responder attributes it) and BEFORE the
         // resource ship (the fragments ride the link Channel, which never
         // contends with the resource lane — leviculum#27).
-        if let Some(own) = self.own_bundle.as_ref() {
+        if let Some(own) = self.own_bundle.as_ref().filter(|_| announced) {
             push_own_bundle_frames(&self.node, &self.seals, own, &link_id).await;
         }
         // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
         // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle and
         // before the resource ship (same Channel lane as the bundle).
-        if let Some(src) = self.own_owner_binding.as_ref() {
+        if let Some(src) = self.own_owner_binding.as_ref().filter(|_| announced) {
             push_own_owner_binding(
                 &self.node,
                 &self.seals,
@@ -11553,6 +11597,11 @@ fn note_responder_link(ctx: &EventCtx<'_>, link_id: LinkId, we_dialled: bool) {
             );
             let _ = node.close_link(&link_id).await;
         }
+        // A link the node no longer holds (closed before or by its budget)
+        // leaves no seal entry behind, whatever its close event did.
+        if !node.link_is_established(&link_id) {
+            seals.forget(&link_id.into_bytes());
+        }
     });
 }
 
@@ -11625,12 +11674,14 @@ async fn seal_inbound(
             if let Some(m) = ctx.metrics {
                 m.inc_link_seal(label);
             }
-            drop_inbound(
-                Some(link_id),
-                label,
+            let detail = if label == crate::observability::LINK_SEAL_DROPPED_REPLAY {
                 "a sealed frame whose counter was already seen or is outside the replay \
-                 window; dropped, the link kept (CC 5.3.3.5 E1)",
-            );
+                 window; dropped, the link kept (CC 5.3.3.5 E1)"
+            } else {
+                "a frame off the Channel before the link's handshake was answered; dropped, \
+                 the link kept, its budget still running (CC 5.3.3.5 E1)"
+            };
+            drop_inbound(Some(link_id), label, detail);
             None
         }
         Inbound::Refuse(r) => {
@@ -11765,6 +11816,13 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             // CIRISEdge#805 — except on an A/V link: A/V rides the Channel
             // only, so a Resource advertised there is refused at the
             // advertisement rather than assembled and then dropped.
+            //
+            // CC 5.3.3.5 E1 — a Resource that completes on a link before its
+            // transit KEX did is refused at completion (`seal_inbound`: no keys,
+            // the link is closed), so accepting here delivers nothing early.
+            // Refusing the advertisement until `link_keyed` instead would race
+            // the dialler's first Resource against the event loop's handling
+            // of its last handshake part.
             let strategy = match plane {
                 LinkPlane::Av => ResourceStrategy::AcceptNone,
                 LinkPlane::Identity | LinkPlane::Scoped => ResourceStrategy::AcceptAll,

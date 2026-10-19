@@ -560,13 +560,28 @@ impl LinkSeals {
     /// Open one sealed frame received on `link` outside the Channel (a
     /// Resource, a request, a response): there is no handshake on those
     /// lanes, so a link with no keys is refused.
+    ///
+    /// On a link a peer dialled whose handshake is still being answered the
+    /// frame is DROPPED by name rather than refused: those lanes ride another
+    /// event plane than the Channel, so a dialler's first Resource can reach
+    /// the event loop ahead of its last handshake part. Nothing is delivered
+    /// either way, and the budget still closes a link whose handshake never
+    /// comes.
     pub fn open(&self, link: [u8; 16], lane: Lane, frame: &[u8]) -> Inbound {
-        let sealed = match self.links().get(&link) {
-            Some(State::Sealed(s)) => Arc::clone(s),
-            Some(State::Refused) => return Inbound::Closed,
-            _ => {
-                self.refuse(link);
-                return Inbound::Refuse(SealRefusal::Unsealed);
+        // The guard is held for the whole match: refuse in place, never
+        // through `self.refuse` (which takes the lock again).
+        let sealed = {
+            let mut links = self.links();
+            match links.get(&link) {
+                Some(State::Sealed(s)) => Arc::clone(s),
+                Some(State::Refused) => return Inbound::Closed,
+                Some(State::Awaiting(_)) => {
+                    return Inbound::Drop(crate::observability::LINK_SEAL_DROPPED_BEFORE_KEYS);
+                }
+                _ => {
+                    links.insert(link, State::Refused);
+                    return Inbound::Refuse(SealRefusal::Unsealed);
+                }
             }
         };
         let out = sealed.open(lane, frame);

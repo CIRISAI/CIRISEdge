@@ -107,11 +107,22 @@ fn a_non_ctkx_first_frame_is_refused_and_the_link_stays_refused_e1() {
 }
 
 #[test]
-fn a_resource_before_the_handshake_is_refused_e1() {
+fn a_resource_before_the_handshake_is_dropped_e1() {
     let b = seals(0x22, DIALLED);
     b.begin_responder(LINK);
+    // Dropped, not refused: another event plane may overtake the handshake.
+    match b.open(LINK, Lane::Resource, b"anything") {
+        Inbound::Drop(label) => {
+            assert_eq!(label, crate::observability::LINK_SEAL_DROPPED_BEFORE_KEYS)
+        }
+        other => panic!("{other:?}"),
+    }
+    // On a link this node dialled and has not keyed, the responder spoke
+    // first: refused.
+    let a = seals(0x11, DIALLER);
+    a.begin_initiator(LINK);
     assert!(matches!(
-        b.open(LINK, Lane::Resource, b"anything"),
+        a.open(LINK, Lane::Resource, b"anything"),
         Inbound::Refuse(SealRefusal::Unsealed)
     ));
 }
@@ -183,9 +194,9 @@ fn the_wrong_role_key_does_not_open_e1() {
         a.open(LINK, Lane::Channel, &up),
         Inbound::Refuse(SealRefusal::OpenFailed)
     ));
-    // Another link's keys do not open it either.
+    // A link with no keys of its own opens nothing either.
     let other = [0x77; 16];
-    b.begin_responder(other);
+    b.begin_initiator(other);
     assert!(matches!(
         b.open(other, Lane::Channel, &up),
         Inbound::Refuse(SealRefusal::Unsealed)

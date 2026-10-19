@@ -71,7 +71,9 @@ use crate::transport::SourceKeyId;
 pub const AV_ARRIVALS_DEPTH: usize = 64;
 
 /// An A/V link a PEER opened to one of this node's A/V addresses, handed
-/// to the consumer on its first attributed frame.
+/// to the consumer once the link is keyed (its transit KEX answered by the
+/// link layer, CC 5.3.3.5 E1) and attributed, or on its first attributed
+/// frame.
 ///
 /// Carries both halves of the link: the inbound queue (already holding
 /// that first frame) and a sender, because the far end of a peer-dialled
@@ -106,17 +108,18 @@ pub struct AvLink {
     pub inbound: PumpReceiver,
     /// The Channel-path sender.
     pub sender: LeviculumAvSender,
-    /// CIRISEdge#805 — the hop's transit keys from the handshake this node
+    /// CIRISEdge#805 — the LINK's transit keys, from the handshake this node
     /// sent as the link's first message (this node dialled, so it is the
-    /// INITIATOR): seal what it sends with [`LinkTransit::seal_key`], open
-    /// what the peer sends back with [`LinkTransit::open_key`].
+    /// INITIATOR; CC 5.3.3.5 E1, one KEX per link): seal what it sends with
+    /// [`LinkTransit::seal_key`], open what the peer sends back with
+    /// [`LinkTransit::open_key`].
     pub transit: LinkTransit,
 }
 
-/// A peer-opened A/V link whose transit KEX this node answered
-/// ([`ReticulumTransport::accept_av_arrival`]): the handshake was consumed,
-/// its claim matched the link's proven peer, and `transit` holds this node's
-/// RESPONDER keys. The arrival's inbound now yields media only.
+/// A peer-opened A/V link accepted by
+/// [`ReticulumTransport::accept_av_arrival`]: the link layer answered its
+/// transit KEX (CC 5.3.3.5 E1), its claim matched the link's attributed peer,
+/// and `transit` holds this node's RESPONDER keys for the link.
 ///
 /// [`ReticulumTransport::accept_av_arrival`]: crate::transport::reticulum::ReticulumTransport::accept_av_arrival
 #[derive(Debug)]
