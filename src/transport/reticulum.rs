@@ -9785,6 +9785,47 @@ impl DialCtx {
         let _ = self.node.close_link(&link_id).await;
     }
 
+    /// CC 5.3.3.5 E1 — the transit pair a dial to `destination_key_id`
+    /// needs, resolved BEFORE the dial, with the PATH answer first: a target
+    /// with no path and no Rooted pair is `NoRouteToPeer` (#336); a pathed one
+    /// with no pair is `link_seal_refused_no_pair`.
+    async fn dial_transit_pair(
+        &self,
+        destination_key_id: &str,
+        peer: &ResolvedPeer,
+        has_path: bool,
+    ) -> Result<TransitKexPair, TransportError> {
+        if has_path {
+            self.resolve_transit_pair(destination_key_id).await
+        } else {
+            match self
+                .seals
+                .resolve_pair(self.rooting.as_deref(), destination_key_id)
+                .await
+            {
+                Ok(pair) => Ok(pair),
+                Err(e) => {
+                    let target_dest = hex::encode(peer.dest_hash.into_bytes());
+                    let paths = self.path_table_snapshot();
+                    tracing::error!(
+                        key_id = %destination_key_id,
+                        target_dest = %target_dest,
+                        known_paths = %paths,
+                        seal = %e,
+                        "dial target has no route and no Rooted transit pair — un-routable \
+                         dest, never dialled (CIRISEdge#336, CC 5.3.3.5 E1)"
+                    );
+                    Err(TransportError::NoRouteToPeer {
+                        key_id: destination_key_id.to_string(),
+                        target_dest,
+                        has_path,
+                        paths,
+                    })
+                }
+            }
+        }
+    }
+
     /// Snapshot every known path-table entry. v1.1.0 (CIRISEdge#44) —
     /// backed by leviculum's now-public
     /// `ReticulumNode::path_table_entries` (each row is a deep
@@ -9866,8 +9907,16 @@ impl DialCtx {
         // `Err(LinkClosed)` on link death. Caller owns the wall-clock bound.
         //
         // CC 5.3.3.5 E1 — the dialled node's transit pair FIRST: no Rooted
-        // pair, no dial.
-        let pair = self.resolve_transit_pair(destination_key_id).await?;
+        // pair, no dial. The PATH answer comes before the pair's, though: a
+        // target with no path AND no pair is un-routable before it is
+        // unkeyable, so it fails `NoRouteToPeer` (#336, the truer and
+        // self-diagnosing answer), not a seal refusal. A pathed target with no
+        // pair is refused `link_seal_refused_no_pair`. A no-path target WITH a
+        // pair still gets its broadcast dial (a directly-attached neighbour may
+        // answer); nothing is ever dialled without a pair.
+        let pair = self
+            .dial_transit_pair(destination_key_id, peer, has_path)
+            .await?;
         let (link, established) = self
             .node
             .connect_awaited(&peer.dest_hash, &peer.transport_ed25519)
