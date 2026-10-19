@@ -164,52 +164,72 @@ where
     Ok(out)
 }
 
-/// What a `withdraws` row retracts, as this node holds it (persist v59.0.0:
-/// an occurrence is revoked by a `withdraws` whose target is its
-/// `identity:occurrence:v1` row — persist's own `occurrence_withdrawal_of`
-/// reading: the envelope's `references_attestation_id` names a HELD row
-/// that `key_plane::occurrence_of_row` reads).
+/// What a row on the IdentityOccurrenceRevocation plane is, as this node
+/// holds it — THE family check of that plane, in one place.
+///
+/// persist v59.0.0 — an occurrence revocation travels as a `withdraws` whose
+/// target is a held `identity:occurrence:v1` row, or as an
+/// `identity:occurrence_revocation:v1` carrier (a legacy framed revocation's
+/// row); persist's [`key_plane::occurrence_revoked_by`] names both. The one
+/// reading edge adds is the ordering gap: a `withdraws` whose target this node
+/// does not hold yet ([`OccurrenceRevocation::UnheldTarget`]), which may still
+/// turn out to be one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WithdrawsTarget {
-    /// Not a `withdraws` naming a target.
-    NotWithdraws,
-    /// A `withdraws` whose target this node does not hold (yet).
-    Unheld,
-    /// A `withdraws` of a held `identity:occurrence:v1` row.
-    Occurrence,
-    /// A `withdraws` of a held row of any other kind.
-    Other,
+pub(crate) enum OccurrenceRevocation {
+    /// It revokes an occurrence (persist's predicate).
+    Revokes,
+    /// A `withdraws` naming a row this node does not hold (yet).
+    UnheldTarget,
+    /// Anything else.
+    Not,
 }
 
-/// Classify `row` as a [`WithdrawsTarget`] against what `dir` holds.
+/// Classify `row` as an [`OccurrenceRevocation`] against what `dir` holds.
 ///
 /// # Errors
 /// A read persist did not serve.
-pub(crate) async fn withdraws_target<D>(
+pub(crate) async fn occurrence_revocation<D>(
     dir: &D,
     row: &Attestation,
-) -> Result<WithdrawsTarget, Error>
+) -> Result<OccurrenceRevocation, Error>
 where
     D: FederationDirectory + ?Sized,
 {
     use ciris_persist::federation::types::attestation_type::WITHDRAWS;
-    if row.attestation_type != WITHDRAWS {
-        return Ok(WithdrawsTarget::NotWithdraws);
+    if key_plane::occurrence_revoked_by(dir, row).await?.is_some() {
+        return Ok(OccurrenceRevocation::Revokes);
     }
-    let Some(target_id) =
-        ciris_persist::federation::precedence::references_attestation_id_from_envelope(
-            &row.attestation_envelope,
-        )
-    else {
-        return Ok(WithdrawsTarget::NotWithdraws);
-    };
-    Ok(match dir.get_attestation(target_id).await? {
-        None => WithdrawsTarget::Unheld,
-        Some(target) if key_plane::occurrence_of_row(&target).is_some() => {
-            WithdrawsTarget::Occurrence
+    if row.attestation_type == WITHDRAWS {
+        if let Some(target) =
+            ciris_persist::federation::precedence::references_attestation_id_from_envelope(
+                &row.attestation_envelope,
+            )
+        {
+            if dir.get_attestation(target).await?.is_none() {
+                return Ok(OccurrenceRevocation::UnheldTarget);
+            }
         }
-        Some(_) => WithdrawsTarget::Other,
-    })
+    }
+    Ok(OccurrenceRevocation::Not)
+}
+
+/// Every `identity:occurrence_revocation:v1` carrier this node holds about
+/// `identity_key_id` (the carrier is attested about the identity).
+async fn carriers_about<D>(dir: &D, identity_key_id: &str) -> Result<Vec<Attestation>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use ciris_persist::federation::occurrence_revocation_carrier::{
+        carrier_of_row, CARRIER_DIMENSION,
+    };
+    let mut out = Vec::new();
+    let mut pages = AttestationQuery::to(identity_key_id, FOLD_PAGE)
+        .dimension(CARRIER_DIMENSION)
+        .pages();
+    while let Some(page) = pages.next(dir).await? {
+        out.extend(page.into_iter().filter(|row| carrier_of_row(row).is_some()));
+    }
+    Ok(out)
 }
 
 /// Every `withdraws` this node holds whose target is one of `rows` (the
@@ -232,7 +252,8 @@ where
 }
 
 /// persist v59.0.0 — the occurrence revocations of `occurrence_key_id`: every
-/// held `withdraws` of an `identity:occurrence:v1` row binding it.
+/// held `withdraws` of an `identity:occurrence:v1` row binding it, and every
+/// `identity:occurrence_revocation:v1` carrier naming it.
 ///
 /// # Errors
 /// A read persist did not serve.
@@ -244,11 +265,34 @@ where
     D: FederationDirectory + ?Sized,
 {
     let rows = occurrence_rows_binding(dir, occurrence_key_id).await?;
-    withdrawals_of(dir, rows).await
+    let mut identities: Vec<String> = rows
+        .iter()
+        .filter_map(key_plane::occurrence_of_row)
+        .map(|o| o.identity_occurrence.identity_key_id)
+        .collect();
+    identities.sort();
+    identities.dedup();
+    let mut out = withdrawals_of(dir, rows).await?;
+    // The key as an IDENTITY too: a carrier revoking one of its own
+    // occurrences is attested about it, whether or not this node holds that
+    // occurrence's row.
+    out.extend(carriers_about(dir, occurrence_key_id).await?);
+    for identity in identities {
+        for carrier in carriers_about(dir, &identity).await? {
+            if key_plane::occurrence_revoked_by(dir, &carrier)
+                .await?
+                .is_some_and(|(_, occ)| occ == occurrence_key_id)
+            {
+                out.push(carrier);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// persist v59.0.0 — the occurrence revocations about `identity_key_id`: every
-/// held `withdraws` of an `identity:occurrence:v1` row about it.
+/// held `withdraws` of an `identity:occurrence:v1` row about it, and every
+/// carrier about it.
 ///
 /// # Errors
 /// A read persist did not serve.
@@ -260,7 +304,9 @@ where
     D: FederationDirectory + ?Sized,
 {
     let rows = occurrence_rows_about(dir, identity_key_id).await?;
-    withdrawals_of(dir, rows).await
+    let mut out = withdrawals_of(dir, rows).await?;
+    out.extend(carriers_about(dir, identity_key_id).await?);
+    Ok(out)
 }
 
 /// The occurrence key an `identity:occurrence:v1` row binds.
@@ -281,10 +327,13 @@ mod tests {
             match retired_framed_refusal(kind) {
                 Some(e) => {
                     assert!(kind.is_framed_retired(), "{kind:?}");
-                    assert_eq!(e.kind(), "federation_envelope_kind_retired");
+                    // persist v59.0.0 — the token is persist's const, never a
+                    // literal (the witness the retired token matches it).
+                    assert_eq!(e.kind(), replication_policy::ENVELOPE_KIND_RETIRED);
                     assert!(
                         e.to_string().starts_with(&format!(
-                            "federation_envelope_kind_retired: {}",
+                            "{}: {}",
+                            replication_policy::ENVELOPE_KIND_RETIRED,
                             kind.as_wire_str()
                         )),
                         "{kind:?}: {e}"

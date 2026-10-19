@@ -445,18 +445,19 @@ impl<'a> SignatureVerdict<'a> {
             E::AttesterKeyUnknown {
                 attesting_key_id, ..
             } if !attesting_key_id.trim().is_empty() => Some(Self::SignerUnknown(attesting_key_id)),
-            // persist v59.0.0 (CIRISPersist#1099) — the same token now also
-            // answers an identity's OWN genesis key once its self evicted it
-            // (`check_signer_acts_for` reads `genesis_evicted_at`). That arm
-            // never turns, but persist does not type it apart, so it keeps
-            // the acts-for disposition: indexed on the held signer, and from
-            // its second refusal on the terminal schedule
-            // (`RefusalBackoff::index_held_signer_at`), which bounds it.
+            // persist v59.0.0 (CIRISPersist#1099) — the disposition follows
+            // persist's typed reason: `not_bound` is the #776 ordering gap
+            // (retryable: indexed on the held signer, released by its binding);
+            // `genesis_evicted` is an identity's OWN key after its self evicted
+            // it, which no later row turns — terminal.
             E::SignerDoesNotActFor {
-                attesting_key_id, ..
-            } if !attesting_key_id.trim().is_empty() => {
+                attesting_key_id,
+                reason,
+                ..
+            } if reason.is_retryable() && !attesting_key_id.trim().is_empty() => {
                 Some(Self::SignerNotActingFor(attesting_key_id))
             }
+            E::SignerDoesNotActFor { reason, .. } if !reason.is_retryable() => Some(Self::Invalid),
             E::FederationTierUnverified { .. } | E::SignatureInvalid(_) => Some(Self::Invalid),
             _ => None,
         }
@@ -552,9 +553,8 @@ pub(crate) fn typed_terminal_verdict(
         // persist v59.0.0 (sealed-transport floor) — a framed object of a
         // RETIRED kind (key record, key revocation, identity occurrence,
         // occurrence revocation). persist: "Terminal: the same bytes are never
-        // admitted on this door". Its token is `kind()`
-        // (`federation_envelope_kind_retired`); persist exports no separate
-        // const for it.
+        // admitted on this door". Its token is `kind()`, persist's
+        // `replication_policy::ENVELOPE_KIND_RETIRED` (v59.0.0).
         E::TraceDimensionInvalid { .. }
         | E::MalformedRow { .. }
         | E::EnvelopeKindRetired { .. } => Some(err.kind()),
@@ -590,11 +590,9 @@ pub(crate) fn typed_terminal_verdict(
         // (72 h) behind this node's clock. Every leg only moves one way for
         // these bytes: the row ages, and the eviction that made the key
         // not-live stands. So the same row is never admitted again — terminal.
-        // persist raises it as `InvalidArgument` led by its const
-        // (`self_roster::ASSERTED_AT_STALE`); the const is what is matched.
-        E::InvalidArgument(msg)
-            if msg.starts_with(ciris_persist::federation::self_roster::ASSERTED_AT_STALE) =>
-        {
+        // persist v59.0.0 types it `Error::AssertedAtStale` (its `kind()` stays
+        // `federation_invalid_argument`); the token booked is persist's const.
+        E::AssertedAtStale { .. } => {
             Some(ciris_persist::federation::self_roster::ASSERTED_AT_STALE)
         }
         // persist v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a self-roster
@@ -667,32 +665,25 @@ fn key_grant_refusal_terminal(reason: &str) -> bool {
 }
 
 /// CIRISEdge#459 — the retry disposition of a typed Attestation-plane refusal,
-/// decided on persist's reason (the `key_refusal_retry` twin).
+/// decided by persist's own [`is_retryable`](ciris_persist::federation::attestation_apply::AttestationRefusalReason::is_retryable)
+/// (persist v59.0.0), never re-decided here:
+///
+/// - retryable: `store_conflict` (a lost plan/act race — the row is untouched
+///   and safe to re-offer) and `self_roster_pending` (a roster change held as
+///   an OPEN proposal that may land when an answer arrives or its window
+///   closes);
+/// - not: `conflicting_attestation` (first-seen wins; the #459 storm),
+///   `already_present_identical` (never a refusal on the apply side — mapped
+///   to `Duplicate`), and `key_plane_refused` (a key-plane row its family door
+///   did not apply; since v59.0.0 it no longer folds in the pending proposal,
+///   which persist split out so this token can stop).
 fn attestation_refusal_retry(
     reason: ciris_persist::federation::attestation_apply::AttestationRefusalReason,
 ) -> RetryDisposition {
-    use ciris_persist::federation::attestation_apply::AttestationRefusalReason as R;
-    match reason {
-        // Two producers minted one id; first-seen wins and a re-offer of THIS
-        // row can never succeed. Retrying it is the storm #459 measured.
-        // `AlreadyPresentIdentical` is never a refusal on the apply side
-        // (mapped to `Duplicate` below); it is named here so the closed set
-        // stays exhaustive, and it is Terminal for the same reason: nothing
-        // about a re-offer changes the answer.
-        R::ConflictingAttestation | R::AlreadyPresentIdentical => RetryDisposition::Terminal,
-        // A lost plan/act race or a directory that cannot plan: the existing
-        // row is untouched and the record is safe to re-offer — the next
-        // round's plan names the conflict precisely (persist's own note).
-        //
-        // persist v58.0.0 (CIRISPersist#991) — a key-plane row
-        // (`key:record:v1` / `key:revocation:v1` / `identity:occurrence:v1`)
-        // its family door did not apply. The door's own `KeyRefusalReason`
-        // is logged by persist but collapsed into this one token, and that
-        // set holds transient verdicts (`AttesterKeyUnknown`, `OwnerAbsent`:
-        // re-offered once the signer's or owner's row lands) beside terminal
-        // ones. By the rule for ambiguous tokens it stays transient; the
-        // retry backoff bounds the cost of the terminal half.
-        R::StoreConflict | R::KeyPlaneRefused => RetryDisposition::Transient,
+    if reason.is_retryable() {
+        RetryDisposition::Transient
+    } else {
+        RetryDisposition::Terminal
     }
 }
 
@@ -3603,8 +3594,8 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         if kind.carries_occurrence_withdrawals() {
             let row = key_plane_rows::row_of_bytes(&bytes)?;
             if !matches!(
-                key_plane_rows::withdraws_target(&*self.directory, &row).await,
-                Ok(key_plane_rows::WithdrawsTarget::Occurrence)
+                key_plane_rows::occurrence_revocation(&*self.directory, &row).await,
+                Ok(key_plane_rows::OccurrenceRevocation::Revokes)
             ) {
                 return None;
             }
@@ -5549,9 +5540,13 @@ impl FederationDirectoryReplicationBridge {
         self.refuse_retired_framed(kind, bytes)
     }
 
-    /// persist v59.0.0 — the IdentityOccurrenceRevocation plane's door: a
-    /// `withdraws` whose target is a HELD `identity:occurrence:v1` row goes to
-    /// the attestation door (persist revokes the occurrence there). A
+    /// persist v59.0.0 — the IdentityOccurrenceRevocation plane's door: a row
+    /// persist's `key_plane::occurrence_revoked_by` names — a `withdraws`
+    /// whose target is a HELD `identity:occurrence:v1` row, or an
+    /// `identity:occurrence_revocation:v1` carrier — goes to the attestation
+    /// door (persist revokes the occurrence there; a user-self carrier without
+    /// its roster quorum comes back `federation_malformed_row:
+    /// carrier_without_roster_quorum`, terminal by `typed_terminal_verdict`). A
     /// `withdraws` whose target is not held yet is refused TRANSIENT (the
     /// occurrence may still be on its way; the next round re-offers it). Any
     /// other row — a `withdraws` of another kind of row, or not a `withdraws`
@@ -5563,17 +5558,18 @@ impl FederationDirectoryReplicationBridge {
         bytes: &[u8],
         source_peer: Option<&str>,
     ) -> ApplyOutcome {
-        use key_plane_rows::WithdrawsTarget as T;
-        match key_plane_rows::withdraws_target(&*self.directory, row).await {
-            Ok(T::Occurrence) => self.apply_attestation(bytes, source_peer).await,
-            Ok(T::Unheld) => ApplyOutcome::refused(format!(
+        use key_plane_rows::OccurrenceRevocation as T;
+        match key_plane_rows::occurrence_revocation(&*self.directory, row).await {
+            Ok(T::Revokes) => self.apply_attestation(bytes, source_peer).await,
+            Ok(T::UnheldTarget) => ApplyOutcome::refused(format!(
                 "IdentityOccurrenceRevocation: withdraws {} names a row this node does not hold \
                  yet — re-offered once the occurrence lands (persist v59.0.0)",
                 row.attestation_id
             )),
-            Ok(T::Other | T::NotWithdraws) => ApplyOutcome::refused_terminal(format!(
-                "IdentityOccurrenceRevocation: row {} (type {}) is not a withdraws of an \
-                 identity:occurrence:v1 row — refused, never applied (persist v59.0.0)",
+            Ok(T::Not) => ApplyOutcome::refused_terminal(format!(
+                "IdentityOccurrenceRevocation: row {} (type {}) is neither a withdraws of an \
+                 identity:occurrence:v1 row nor an identity:occurrence_revocation:v1 carrier — \
+                 refused, never applied (persist v59.0.0)",
                 row.attestation_id, row.attestation_type
             )),
             Err(e) => self.refuse("IdentityOccurrenceRevocation", &row.attestation_id, &e),
@@ -5582,8 +5578,9 @@ impl FederationDirectoryReplicationBridge {
 
     /// persist v59.0.0 — refuse a framed object of a retired kind, TERMINAL,
     /// with persist's typed [`EnvelopeKindRetired`](ciris_persist::federation::Error::EnvelopeKindRetired)
-    /// (stable `kind()` token `federation_envelope_kind_retired`; persist
-    /// exports no separate const for it), and book it on the retired ledger.
+    /// (stable `kind()` token, persist's
+    /// `replication_policy::ENVELOPE_KIND_RETIRED`), and book it on the
+    /// retired ledger.
     /// Bytes that are not JSON at all are a `Deserialize` drop, as on every
     /// other plane.
     fn refuse_retired_framed(&self, kind: EnvelopeKind, bytes: &[u8]) -> ApplyOutcome {
@@ -11836,8 +11833,23 @@ pub(crate) mod tests {
             attesting_key_id: "ledger-signer".to_owned(),
             identity_key_id: "ledger-owner".to_owned(),
             plane: "ledger",
+            reason: ciris_persist::federation::SignerNotActingReason::NotBound,
         };
         assert_eq!(acts_for.kind(), "federation_signer_not_acting_for");
+        // persist v59.0.0 — an evicted genesis key never turns: terminal.
+        let evicted = E::SignerDoesNotActFor {
+            attesting_key_id: "ledger-owner".to_owned(),
+            identity_key_id: "ledger-owner".to_owned(),
+            plane: "ledger",
+            reason: ciris_persist::federation::SignerNotActingReason::GenesisEvicted,
+        };
+        assert_eq!(
+            bridge
+                .refuse("Attestation", "h", &evicted)
+                .retry_disposition(),
+            Some(RetryDisposition::Terminal),
+            "genesis_evicted is not retried"
+        );
         match bridge.refuse("Attestation", "h", &acts_for) {
             ApplyOutcome::Refused {
                 retry,
@@ -12148,7 +12160,10 @@ pub(crate) mod tests {
                     assert_eq!(outcome, ApplyOutcome::Duplicate, "{reason}: a Duplicate");
                     assert_eq!(token, None, "{reason}: never on the refusal ledger");
                 }
-                R::ConflictingAttestation | R::StoreConflict | R::KeyPlaneRefused => {
+                R::ConflictingAttestation
+                | R::StoreConflict
+                | R::KeyPlaneRefused
+                | R::SelfRosterPending => {
                     let ApplyOutcome::Refused {
                         reason: msg, retry, ..
                     } = &outcome
@@ -12160,9 +12175,11 @@ pub(crate) mod tests {
                         msg.contains(reason.as_str()),
                         "{reason}: the message names the SAME branch the ledger books: {msg}"
                     );
+                    // persist v59.0.0 — the split: a pending roster proposal is
+                    // retried, a refused key-plane row is not.
                     let expected = match reason {
-                        R::ConflictingAttestation => RetryDisposition::Terminal,
-                        _ => RetryDisposition::Transient,
+                        R::StoreConflict | R::SelfRosterPending => RetryDisposition::Transient,
+                        _ => RetryDisposition::Terminal,
                     };
                     assert_eq!(
                         *retry, expected,
@@ -12379,7 +12396,7 @@ pub(crate) mod tests {
                 "{kind:?}: persist rules the retired refusal terminal"
             );
             assert!(
-                msg.contains("federation_envelope_kind_retired"),
+                msg.contains(ciris_persist::federation::replication_policy::ENVELOPE_KIND_RETIRED),
                 "{kind:?}: the message carries persist's token: {msg}"
             );
         }
@@ -12431,6 +12448,41 @@ pub(crate) mod tests {
         }
     }
 
+    /// persist v59.0.0 (CIRISPersist#1064) — **a pending roster proposal is
+    /// retried; a refused key-plane row is not.** The disposition is
+    /// persist's `AttestationRefusalReason::is_retryable`, through the real
+    /// mapping the apply choke uses.
+    #[test]
+    fn a_pending_roster_refusal_is_retried_and_a_refused_one_is_not_v59() {
+        use ciris_persist::federation::attestation_apply::{
+            AttestationRefusalReason as R, ReplicatedAttestationOutcome as O,
+        };
+        let (pending, token) = attestation_outcome_to_apply(
+            O::Refused {
+                reason: R::SelfRosterPending,
+            },
+            "h",
+        );
+        assert_eq!(token, Some("self_roster_pending"));
+        assert_eq!(
+            pending.retry_disposition(),
+            Some(RetryDisposition::Transient),
+            "an open proposal may land: re-offer it"
+        );
+        let (refused, token) = attestation_outcome_to_apply(
+            O::Refused {
+                reason: R::KeyPlaneRefused,
+            },
+            "h",
+        );
+        assert_eq!(token, Some("key_plane_refused"));
+        assert_eq!(
+            refused.retry_disposition(),
+            Some(RetryDisposition::Terminal),
+            "a refused key-plane row does not turn: stop asking"
+        );
+    }
+
     /// persist v59.0.0 — the new typed refusals reach the apply-door choke
     /// (`refuse`) with the disposition persist's docs give them:
     /// `federation_envelope_kind_retired` TERMINAL and booked on the retired
@@ -12440,7 +12492,6 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_v59_refusals_map_to_their_dispositions_v59() {
         use ciris_persist::federation::replication_policy::EnvelopeKind as PersistKind;
-        use ciris_persist::federation::self_roster::ASSERTED_AT_STALE;
         use ciris_persist::federation::Error as E;
         let (_backend, bridge, metrics) = make_metered_bridge(&[]);
         let roster = |decision: &'static str| E::SelfRosterNotLanded {
@@ -12460,9 +12511,12 @@ pub(crate) mod tests {
                 RetryDisposition::Terminal,
             ),
             (
-                E::InvalidArgument(format!(
-                    "{ASSERTED_AT_STALE}: k signs as f's roster key more than W ago"
-                )),
+                E::AssertedAtStale {
+                    author: "k".to_owned(),
+                    steward: "f".to_owned(),
+                    asserted_at: chrono::Utc::now() - chrono::Duration::days(4),
+                    w_secs: ciris_persist::federation::self_roster::PAST_FRESHNESS_W_SECS,
+                },
                 RetryDisposition::Terminal,
             ),
             (roster("proposer_not_on_roster"), RetryDisposition::Terminal),

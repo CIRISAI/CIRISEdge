@@ -228,6 +228,49 @@ impl NodeA {
     }
 }
 
+impl NodeA {
+    /// N, a node (single-signer: CC 3.1.5 rule A), revokes its occurrence
+    /// `occurrence` as a framed object; A holds its
+    /// `identity:occurrence_revocation:v1` carrier. Returns the row.
+    async fn carrier_revoking_node_occurrence(&self, occurrence: &str) -> Attestation {
+        use ciris_persist::federation::occurrence_revocation_carrier::{
+            carrier_row, FramedOccurrenceRevocation,
+        };
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let envelope = serde_json::json!({
+            "attesting_key_id": self.n.key_id(),
+            "identity_key_id": self.n.key_id(),
+            "occurrence_key_id": occurrence,
+            "revoked_at": now,
+            "effective_at": now,
+        });
+        let canonical = ciris_verify_core::jcs::canonicalize(&envelope).expect("jcs");
+        let (ed, pqc) = crate::identity::sign_bound_hybrid(
+            &self.n.signer(),
+            &canonical,
+            "occurrence revocation",
+        )
+        .await
+        .expect("sign");
+        let row = carrier_row(&FramedOccurrenceRevocation {
+            attesting_key_id: self.n.key_id().to_owned(),
+            signed_envelope: envelope,
+            signature: ciris_verify_core::transport_binding::TransportBindingSignature {
+                ed25519_signature_base64: ed,
+                mldsa65_signature_base64: pqc,
+            },
+        })
+        .expect("carrier row");
+        self.dir
+            .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+                attestation: row.clone(),
+            })
+            .await
+            .expect("A admits the carrier");
+        row
+    }
+}
+
 fn messages(outcome: ReplicationOutcome) -> Vec<ReplicationMessage> {
     match outcome {
         ReplicationOutcome::Send(msgs)
@@ -597,5 +640,37 @@ async fn an_occurrence_withdraws_reaches_a_stranger_holding_the_occurrence_v59()
         )
         .await,
         "B no longer holds P's occurrence of N active: the withdraws landed"
+    );
+
+    // persist v59.0.0 (CIRISPersist#1104) — a legacy framed revocation rides
+    // the same plane as its `identity:occurrence_revocation:v1` CARRIER: N (a
+    // node, single-signer) revokes its occurrence K, A holds the carrier,
+    // and the stranger B receives and applies it.
+    // (The revoked occurrence key is K, a held key: the projection FKs onto it.)
+    let carrier = a.carrier_revoking_node_occurrence(a.k.key_id()).await;
+    round(
+        EnvelopeKind::IdentityOccurrenceRevocation,
+        &a_bridge,
+        a.n.key_id(),
+        &b,
+        b_ident.key_id(),
+    )
+    .await;
+    assert!(
+        b_dir
+            .get_attestation(&carrier.attestation_id)
+            .await
+            .expect("read")
+            .is_some(),
+        "B holds the carrier row"
+    );
+    assert!(
+        b_dir
+            .list_identity_occurrence_revocations_for(a.n.key_id())
+            .await
+            .expect("revocations")
+            .iter()
+            .any(|r| r.occurrence_key_id == a.k.key_id()),
+        "B projects the revocation the carrier carries"
     );
 }
