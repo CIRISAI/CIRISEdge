@@ -647,13 +647,11 @@ impl LinkSeals {
             }
         };
         let frame = if lane.is_msgpack() {
-            match msgpack_unbin(frame) {
-                Some(f) => f,
-                None => {
-                    self.refuse(link);
-                    return Inbound::Refuse(SealRefusal::OpenFailed);
-                }
-            }
+            let Some(f) = msgpack_unbin(frame) else {
+                self.refuse(link);
+                return Inbound::Refuse(SealRefusal::OpenFailed);
+            };
+            f
         } else {
             frame
         };
