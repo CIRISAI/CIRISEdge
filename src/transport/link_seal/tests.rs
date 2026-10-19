@@ -43,7 +43,8 @@ fn frames_open_in_both_directions_on_every_lane_e1() {
     let (a, b) = keyed_pair();
     for lane in [Lane::Channel, Lane::Resource, Lane::Request, Lane::Response] {
         let up = a.seal(LINK, lane, b"row bytes up").expect("seal up");
-        assert_eq!(up.len(), b"row bytes up".len() + SEAL_OVERHEAD);
+        let bin = if lane.is_msgpack() { 2 } else { 0 };
+        assert_eq!(up.len(), b"row bytes up".len() + SEAL_OVERHEAD + bin);
         assert!(!contains(&up, b"row bytes up"), "no plaintext on the wire");
         match b.inbound(LINK, lane, &up, false) {
             Inbound::Open(p) => assert_eq!(p, b"row bytes up"),
@@ -290,4 +291,33 @@ fn an_unattributed_link_admits_only_its_initiators_own_request_e1() {
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// leviculum asserts a request's or response's data is ONE msgpack value:
+/// those lanes ride as a msgpack `bin` holding the sealed frame, and open
+/// back to the caller's own value.
+#[test]
+fn request_and_response_lanes_ride_as_one_msgpack_bin_e1() {
+    let (a, b) = keyed_pair();
+    for (lane, len) in [
+        (Lane::Request, 1usize),
+        (Lane::Response, 300),
+        (Lane::Request, 70_000),
+    ] {
+        let plain = vec![0xc0u8; len];
+        let wire = a.seal(LINK, lane, &plain).expect("seal");
+        assert!(matches!(wire[0], 0xc4..=0xc6), "a msgpack bin");
+        assert_eq!(
+            msgpack_unbin(&wire).map(<[u8]>::len),
+            Some(len + SEAL_OVERHEAD)
+        );
+        match b.open(LINK, lane, &wire) {
+            Inbound::Open(p) => assert_eq!(p, plain),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(matches!(
+        b.open(LINK, Lane::Request, &[0xc0]),
+        Inbound::Refuse(SealRefusal::OpenFailed)
+    ));
 }

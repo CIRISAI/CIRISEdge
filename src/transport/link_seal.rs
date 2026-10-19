@@ -132,6 +132,49 @@ impl Lane {
     const fn index(self) -> usize {
         self as usize - 1
     }
+
+    /// leviculum's request/response API carries exactly ONE msgpack value
+    /// (it asserts it), so a sealed request or response rides as a msgpack
+    /// `bin` holding the sealed frame; the caller's own msgpack value is the
+    /// plaintext inside.
+    const fn is_msgpack(self) -> bool {
+        matches!(self, Self::Request | Self::Response)
+    }
+}
+
+/// Wrap `frame` as one msgpack `bin` value.
+fn msgpack_bin(frame: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(frame.len() + 5);
+    if let Ok(n) = u8::try_from(frame.len()) {
+        out.push(0xc4);
+        out.push(n);
+    } else if let Ok(n) = u16::try_from(frame.len()) {
+        out.push(0xc5);
+        out.extend_from_slice(&n.to_be_bytes());
+    } else {
+        out.push(0xc6);
+        out.extend_from_slice(&u32::try_from(frame.len()).unwrap_or(u32::MAX).to_be_bytes());
+    }
+    out.extend_from_slice(frame);
+    out
+}
+
+/// The frame inside one msgpack `bin` value, or `None` for anything else.
+fn msgpack_unbin(value: &[u8]) -> Option<&[u8]> {
+    let (&tag, rest) = value.split_first()?;
+    let (len, body) = match tag {
+        0xc4 => (usize::from(*rest.first()?), rest.get(1..)?),
+        0xc5 => (
+            usize::from(u16::from_be_bytes(rest.get(..2)?.try_into().ok()?)),
+            rest.get(2..)?,
+        ),
+        0xc6 => (
+            usize::try_from(u32::from_be_bytes(rest.get(..4)?.try_into().ok()?)).ok()?,
+            rest.get(4..)?,
+        ),
+        _ => return None,
+    };
+    (body.len() == len).then_some(body)
 }
 
 /// Why a frame or a link was refused at the seal. Every variant is named and
@@ -495,7 +538,12 @@ impl LinkSeals {
 
     /// One frame received on `link` over `lane`. `we_dialled` is whether
     /// this node opened the link (its connect-time record).
+    /// Only the Channel carries a handshake; any other lane is
+    /// [`Self::open`].
     pub fn inbound(&self, link: [u8; 16], lane: Lane, bytes: &[u8], we_dialled: bool) -> Inbound {
+        if lane != Lane::Channel {
+            return self.open(link, lane, bytes);
+        }
         let mut links = self.links();
         let state = match links.get_mut(&link) {
             Some(s) => s,
@@ -523,14 +571,7 @@ impl LinkSeals {
                 out
             }
             State::Awaiting(reasm) => {
-                // The handshake rides the Channel; anything else first is
-                // not a handshake.
-                let pushed = if lane == Lane::Channel {
-                    reasm.push(bytes)
-                } else {
-                    Err(AvHandshakeError::NotAHandshake)
-                };
-                let answered = match pushed {
+                let answered = match reasm.push(bytes) {
                     Ok(None) => return Inbound::Pending,
                     Ok(Some(hs)) => {
                         av_transit_handshake::respond(&hs, &link, &self.local_key_id, &self.secret)
@@ -570,7 +611,10 @@ impl LinkSeals {
             Some(State::Sealed(s)) => Arc::clone(s),
             _ => return Err(SealRefusal::Unsealed),
         };
-        let frame = sealed.seal(lane, plaintext);
+        let mut frame = sealed.seal(lane, plaintext);
+        if lane.is_msgpack() {
+            frame = msgpack_bin(&frame);
+        }
         self.tap_frame(link, &frame);
         Ok(frame)
     }
@@ -601,6 +645,17 @@ impl LinkSeals {
                     return Inbound::Refuse(SealRefusal::Unsealed);
                 }
             }
+        };
+        let frame = if lane.is_msgpack() {
+            match msgpack_unbin(frame) {
+                Some(f) => f,
+                None => {
+                    self.refuse(link);
+                    return Inbound::Refuse(SealRefusal::OpenFailed);
+                }
+            }
+        } else {
+            frame
         };
         let out = sealed.open(lane, frame);
         if matches!(out, Inbound::Refuse(_)) {
