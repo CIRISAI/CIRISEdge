@@ -905,38 +905,62 @@ pub const AV_RELAY_DIALLER_REFUSED: &str = "av_relay_dialler_refused";
 /// CIRISEdge#805 item 8, cut 2 — a subscriber that dialled this relay was
 /// entitled and admitted to its fan-out.
 pub const AV_RELAY_DIALLER_ADMITTED: &str = "av_relay_dialler_admitted";
-/// CIRISEdge#805 (CC 5.3.3.5 E1) — this node dialled an A/V link and sent its
-/// transit KEX handshake; the hop's keys are installed.
-pub const AV_TRANSIT_KEX_INITIATED: &str = "av_transit_kex_initiated";
-/// CIRISEdge#805 — a dialler's transit KEX handshake was answered and its
-/// claim matched the link's proven peer; the hop's keys are installed.
-pub const AV_TRANSIT_KEX_ACCEPTED: &str = "av_transit_kex_accepted";
-/// CIRISEdge#805 — the dialled node publishes no usable transit KEX pair
-/// (CC 3.3.6.2: it cannot relay or receive): the dial is refused, never keyed
-/// any other way.
-pub const AV_TRANSIT_REFUSED_NO_PAIR: &str = "av_transit_refused_no_pair";
-/// CIRISEdge#805 — the dialled node's pair could not be read (no directory, or
-/// a directory fault).
-pub const AV_TRANSIT_REFUSED_LOOKUP: &str = "av_transit_refused_lookup";
-/// CIRISEdge#805 — the handshake's claimed initiator is not the link's proven
-/// peer: refused, no key installed.
-pub const AV_TRANSIT_REFUSED_CLAIM_MISMATCH: &str = "av_transit_refused_claim_mismatch";
-/// CIRISEdge#805 — the handshake was addressed to another responder key.
-pub const AV_TRANSIT_REFUSED_RESPONDER_MISMATCH: &str = "av_transit_refused_responder_mismatch";
-/// CIRISEdge#805 — the handshake's frames were not a handshake, malformed,
-/// truncated, over the reassembly bound, or lost a frame.
-pub const AV_TRANSIT_REFUSED_MALFORMED: &str = "av_transit_refused_malformed";
-/// CIRISEdge#805 — the handshake declared more bytes than the reassembly
-/// bound admits.
-pub const AV_TRANSIT_REFUSED_TOO_LARGE: &str = "av_transit_refused_too_large";
-/// CIRISEdge#805 — the handshake did not complete within its budget, or the
-/// link closed under it.
-pub const AV_TRANSIT_REFUSED_TIMEOUT: &str = "av_transit_refused_timeout";
-/// CIRISEdge#805 — the KEX itself failed (a crypto refusal from
-/// `ciris_crypto::transit_kex`, other than a responder mismatch).
-pub const AV_TRANSIT_REFUSED_KEX: &str = "av_transit_refused_kex";
-/// CIRISEdge#805 — the handshake could not be sent on the link.
-pub const AV_TRANSIT_REFUSED_SEND: &str = "av_transit_refused_send";
+// ─── CC 5.3.3.5 E1 — `EdgeMetrics::link_seal` labels ─────────────────
+//
+// Every RNS link carries the CC 3.3.6.2 hybrid transit KEX as its first frame
+// and every edge frame after it under the per-link seal
+// (`crate::transport::link_seal`). Each refusal is named; every
+// `link_seal_refused_*` label closed the link (or never dialled it), and
+// every `link_seal_dropped_*` label dropped one frame and kept the link.
+
+/// This node dialled a link and sent its transit KEX handshake; the link's
+/// keys are installed.
+pub const LINK_SEAL_INITIATED: &str = "link_seal_initiated";
+/// A dialler's handshake was answered; the link's keys are installed.
+pub const LINK_SEAL_ACCEPTED: &str = "link_seal_accepted";
+/// The dialled node publishes no usable transit KEX pair (CC 3.3.6.2: it
+/// cannot relay or receive): the dial is refused and never made.
+pub const LINK_SEAL_REFUSED_NO_PAIR: &str = "link_seal_refused_no_pair";
+/// The dialled node's pair could not be read (no directory, or a directory
+/// fault): the dial is refused and never made.
+pub const LINK_SEAL_REFUSED_LOOKUP: &str = "link_seal_refused_lookup";
+/// The handshake's claimed initiator is not the peer the link is attributed
+/// to.
+pub const LINK_SEAL_REFUSED_CLAIM_MISMATCH: &str = "link_seal_refused_claim_mismatch";
+/// The handshake was addressed to another responder key.
+pub const LINK_SEAL_REFUSED_RESPONDER_MISMATCH: &str = "link_seal_refused_responder_mismatch";
+/// The link's first frame is not a transit KEX handshake frame (a peer that
+/// skipped the KEX, or sent plaintext).
+pub const LINK_SEAL_REFUSED_NOT_A_HANDSHAKE: &str = "link_seal_refused_not_a_handshake";
+/// The handshake framing is wrong (unknown version, a continuation first, a
+/// part past the declared length, ...).
+pub const LINK_SEAL_REFUSED_MALFORMED: &str = "link_seal_refused_malformed";
+/// The handshake declared more bytes than the reassembly bound admits.
+pub const LINK_SEAL_REFUSED_TOO_LARGE: &str = "link_seal_refused_too_large";
+/// The handshake names a construction other than the hybrid suite (a
+/// classical-only or unknown suite).
+pub const LINK_SEAL_REFUSED_SUITE: &str = "link_seal_refused_suite";
+/// The KEX itself failed (a crypto refusal from `ciris_crypto::transit_kex`
+/// other than a suite or responder mismatch).
+pub const LINK_SEAL_REFUSED_KEX: &str = "link_seal_refused_kex";
+/// The responder saw no complete handshake within the budget.
+pub const LINK_SEAL_REFUSED_TIMEOUT: &str = "link_seal_refused_timeout";
+/// The dialler could not send its handshake.
+pub const LINK_SEAL_REFUSED_SEND: &str = "link_seal_refused_send";
+/// A frame arrived on a link this node dialled before its own handshake had
+/// gone out: the responder spoke first.
+pub const LINK_SEAL_REFUSED_FRAME_BEFORE_KEYS: &str = "link_seal_refused_frame_before_keys";
+/// A sealed frame failed to open (wrong key, wrong link, tampered or
+/// truncated).
+pub const LINK_SEAL_REFUSED_OPEN_FAILED: &str = "link_seal_refused_open_failed";
+/// A frame other than first contact arrived on a sealed link whose
+/// initiator is not attributed (the first-contact carve-out).
+pub const LINK_SEAL_REFUSED_FIRST_CONTACT_ONLY: &str = "link_seal_refused_first_contact_only";
+/// This node tried to send on a link with no keys: refused, nothing sent.
+pub const LINK_SEAL_REFUSED_UNSEALED_SEND: &str = "link_seal_refused_unsealed_send";
+/// A sealed frame whose counter was already seen, or is older than the
+/// replay window: dropped, the link kept.
+pub const LINK_SEAL_DROPPED_REPLAY: &str = "link_seal_dropped_replay";
 
 // ─── CIRISEdge#805 item 8 — `EdgeMetrics::direct_link` labels ─────────
 
@@ -1280,6 +1304,10 @@ pub struct EdgeMetrics {
     /// (`av_inbound_dropped_queue_full` is the never-block overflow policy).
     /// Every `av_inbound_dropped_*` label is a drop.
     pub av_plane: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CC 5.3.3.5 E1 — the per-link transit seal, by label (`LINK_SEAL_*`
+    /// constants in this module): links keyed (`link_seal_initiated` /
+    /// `link_seal_accepted`), each named refusal, and each dropped frame.
+    pub link_seal: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — direct links (leviculum#70) by label
     /// (`DIRECT_LINK_*` constants in this module): proposals made, skipped
     /// and refused, and each outcome. Every `direct_link_failed_*` label is a
@@ -1916,6 +1944,23 @@ impl EdgeMetrics {
     #[must_use]
     pub fn av_plane(&self) -> HashMap<String, u64> {
         self.av_plane
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CC 5.3.3.5 E1 — count one per-link seal event by its `LINK_SEAL_*`
+    /// label.
+    pub fn inc_link_seal(&self, label: &'static str) {
+        *self.link_seal.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CC 5.3.3.5 E1 — the per-link seal ledger by label (tests + the
+    /// operator readback).
+    #[must_use]
+    pub fn link_seal(&self) -> HashMap<String, u64> {
+        self.link_seal
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -2649,6 +2694,7 @@ impl EdgeMetrics {
                 .collect(),
             transport_inbound_drops: self.transport_inbound_drops(),
             av_plane: self.av_plane(),
+            link_seal: self.link_seal(),
             direct_link: self.direct_link(),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
@@ -2922,6 +2968,8 @@ pub struct EdgeMetricsBundle {
     pub first_contact_outcomes: HashMap<String, u64>,
     /// CIRISEdge#805 — the A/V plane on the live node by `AV_*` label.
     pub av_plane: HashMap<String, u64>,
+    /// CC 5.3.3.5 E1 — the per-link transit seal by `LINK_SEAL_*` label.
+    pub link_seal: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — direct links by `DIRECT_LINK_*` label.
     pub direct_link: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
@@ -3227,6 +3275,8 @@ impl EdgeMetricsBundle {
         f.family("first_contact_outcomes", &self.first_contact_outcomes);
         // CIRISEdge#805 — the A/V plane ledger, `av_plane.<label>`.
         f.family("av_plane", &self.av_plane);
+        // CC 5.3.3.5 E1 — the per-link seal ledger, `link_seal.<label>`.
+        f.family("link_seal", &self.link_seal);
         // CIRISEdge#805 item 8 — direct links, `direct_link.<label>`, and the
         // gauge of peers with a direct path now.
         f.family("direct_link", &self.direct_link);
@@ -3436,6 +3486,7 @@ edge_metrics_bundle_fields!(
     transport_inbound_drops,
     first_contact_outcomes,
     av_plane,
+    link_seal,
     direct_link,
     direct_links_active,
     replication_routed_to_responder_total,

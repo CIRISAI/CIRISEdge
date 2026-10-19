@@ -8618,8 +8618,8 @@ fn transport_error_class(e: &TransportError) -> &'static str {
         // distinct reachability class from a slow-link `timeout`: it is an
         // addressing/rooting fault the belt heals on the next verified announce.
         TransportError::NoRouteToPeer { .. } => "no_route_to_peer",
-        // CIRISEdge#805 — an A/V hop's transit KEX refused by name.
-        TransportError::AvTransitRefused { .. } => "av_transit_refused",
+        // CC 5.3.3.5 E1 — a link's transit seal refused by name.
+        TransportError::LinkSealRefused { .. } => "link_seal_refused",
     }
 }
 

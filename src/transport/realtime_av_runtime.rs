@@ -1205,6 +1205,9 @@ mod leviculum_link {
     pub struct LeviculumAvSender {
         node: Arc<ReticulumNode>,
         link_id: LinkId,
+        /// CC 5.3.3.5 E1 — the transport's per-link seal: every frame is
+        /// sealed under the link's keys before it reaches the Channel.
+        seals: Arc<crate::transport::link_seal::LinkSeals>,
         metrics: Option<crate::observability::EdgeMetrics>,
         /// CIRISEdge#805 item 8 — the hold on the punched interface this leg
         /// runs over, when it does: released when the leg is dropped.
@@ -1220,14 +1223,20 @@ mod leviculum_link {
 
     impl LeviculumAvSender {
         /// Wrap `(node, link_id)` as an outbound A/V link. The link MUST
-        /// already be established + identified before any chunk is sent;
-        /// [`crate::transport::reticulum::ReticulumTransport::open_av_link`]
-        /// hands out senders that are.
+        /// already be established + identified + KEYED before any chunk is
+        /// sent; [`crate::transport::reticulum::ReticulumTransport::open_av_link`]
+        /// hands out senders that are. `seals` is the transport's seal table
+        /// (CC 5.3.3.5 E1): a link it holds no keys for sends nothing.
         #[must_use]
-        pub fn new(node: Arc<ReticulumNode>, link_id: LinkId) -> Self {
+        pub fn new(
+            node: Arc<ReticulumNode>,
+            link_id: LinkId,
+            seals: Arc<crate::transport::link_seal::LinkSeals>,
+        ) -> Self {
             Self {
                 node,
                 link_id,
+                seals,
                 metrics: None,
                 direct_path: None,
                 outbound_liveness: None,
@@ -1289,8 +1298,9 @@ mod leviculum_link {
             &self.link_id
         }
 
-        /// The most one Channel message on this link carries, or `None`
-        /// when leviculum no longer holds the link.
+        /// The most one Channel message on this link carries (its plaintext,
+        /// with room left for the E1 seal), or `None` when leviculum no
+        /// longer holds the link.
         #[must_use]
         pub fn channel_limit(&self) -> Option<usize> {
             crate::transport::reticulum::link_channel_message_limit(&self.node, &self.link_id)
@@ -1342,7 +1352,23 @@ mod leviculum_link {
                     channel_limit,
                 }));
             }
-            match self.node.link_handle(&self.link_id).try_send(bytes).await {
+            // CC 5.3.3.5 E1 — sealed under the link's keys, or not sent.
+            let Ok(sealed) = self.seals.seal(
+                self.link_id.into_bytes(),
+                crate::transport::link_seal::Lane::Channel,
+                bytes,
+            ) else {
+                self.count(crate::observability::AV_SEND_FAILED);
+                if let Some(m) = self.metrics.as_ref() {
+                    m.inc_link_seal(crate::observability::LINK_SEAL_REFUSED_UNSEALED_SEND);
+                }
+                return Err(AvDispatcherError::SendFailed(format!(
+                    "leviculum link {:?} carries no transit keys; nothing is sent in the clear \
+                     (CC 5.3.3.5 E1)",
+                    self.link_id
+                )));
+            };
+            match self.node.link_handle(&self.link_id).try_send(&sealed).await {
                 Ok(()) => {
                     self.count(crate::observability::AV_SENT);
                     if let Some(stamps) = self.outbound_liveness.as_deref() {

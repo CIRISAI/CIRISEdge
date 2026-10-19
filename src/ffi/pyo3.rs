@@ -2861,6 +2861,12 @@ fn metrics_bundle_to_pydict<'py>(
         av_plane.set_item(label.as_str(), *n)?;
     }
     root.set_item("av_plane", av_plane)?;
+    // CC 5.3.3.5 E1 — the per-link seal ledger.
+    let link_seal = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.link_seal {
+        link_seal.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("link_seal", link_seal)?;
     // CIRISEdge#805 item 8 — direct links by label, and the peers with a
     // direct path now.
     let direct_link = pyo3::types::PyDict::new(py);

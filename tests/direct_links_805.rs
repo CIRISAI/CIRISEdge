@@ -642,7 +642,8 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
     // it to 1400 (Channel 1321) and never raises it.
     let before = channel_limit_before.expect("recorded at the proposal");
     let after = channel_limit_after.expect("the link is held");
-    assert_eq!(after, 1321, "1400-MTU Channel limit");
+    // 1400-MTU Channel limit: 1321, less the 25-byte CC 5.3.3.5 E1 seal.
+    assert_eq!(after, 1296, "1400-MTU Channel limit, sealed");
     assert!(
         before > after,
         "the move lowered the limit: {before} -> {after}"
@@ -650,21 +651,25 @@ async fn a_member_behind_nat_is_reached_over_a_punched_interface() {
     let av_limit = link.sender.channel_limit().expect("the A/V link is held");
     // The A/V leg is BORN on the punched interface, which signals no hardware
     // MTU, so it negotiates the base 500: Channel 425 (link MDU 431 less the
-    // 6-byte envelope), an A/V chunk budget of 341 (#720; 321 after #846).
-    assert_eq!(av_limit, 425, "the A/V leg runs at the base MTU");
+    // 6-byte envelope), 400 of it plaintext under the CC 5.3.3.5 E1 seal.
+    assert_eq!(av_limit, 400, "the A/V leg runs at the base MTU");
 
-    // CIRISEdge#805 — the dial's transit KEX handshake rode this base-MTU
-    // leg as several Channel messages (about 1.2 KB at 425 B each), and B
-    // answers it: both ends hold the hop's keys, by role.
+    // CIRISEdge#805 / CC 5.3.3.5 E1 — the link's transit KEX handshake rode
+    // this base-MTU leg as its first Channel messages (about 1.2 KB at 400 B
+    // each), and B answered it: both ends hold the link's keys, by role.
     let arrival = tokio::time::timeout(Duration::from_secs(20), arrivals.recv())
         .await
         .expect("B's consumer gets the link")
         .expect("arrivals open");
     assert_eq!(arrival.peer.as_str(), p.a.key.key_id);
-    let handshake_frames = p.a.metrics.av_plane().get("av_sent").copied().unwrap_or(0);
     assert!(
-        handshake_frames >= 3,
-        "the handshake spans several 425-B Channel messages: {handshake_frames}"
+        p.a.metrics
+            .link_seal()
+            .get("link_seal_initiated")
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "A keyed the A/V leg it dialled"
     );
     let accepted =
         p.b.transport
@@ -1428,10 +1433,11 @@ async fn strip_transit_pair(dir: &Arc<SqliteBackend>, owner: &Ident) {
 /// transit KEX or not at all:
 ///
 /// - a subscriber whose handshake CLAIMS another member is refused at the
-///   relay by name (`av_transit_refused_claim_mismatch`), no key is
-///   installed, and it hears nothing while the stream runs;
+///   relay by name (`link_seal_refused_claim_mismatch`), the link is closed
+///   before it is ever handed to the relay, and it hears nothing while the
+///   stream runs;
 /// - a dial to a node that publishes no transit pair is refused by name
-///   (`AvTransitRefused` / `av_transit_refused_no_pair`) before the link
+///   (`LinkSealRefused` / `link_seal_refused_no_pair`) before the link
 ///   carries a byte; nothing arrives at the dialled node.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1473,26 +1479,29 @@ async fn the_transit_kex_refuses_a_false_claim_and_a_missing_pair_by_name() {
         .expect("R's relay")
         .spawn_pump_admitting(upstream, up_key, up_link);
 
-    // B dials R but its handshake claims A. R's link proves B: refused.
+    // B dials R but its handshake claims A. R's link proves B: refused at
+    // the link layer, and the link never reaches R's A/V consumer.
     let liar =
         q.b.transport
             .open_av_link_claiming_for_test(&r_id, &legs_address(&q.b, &r_id), &a_id)
             .await
             .expect("B's dial and handshake go out");
-    let arrival = next_arrival(&mut r_arrivals, &b_id).await;
+    let refused = wait_until(Duration::from_secs(20), || async {
+        q.r.metrics
+            .link_seal()
+            .get("link_seal_refused_claim_mismatch")
+            .copied()
+            == Some(1)
+    })
+    .await;
     assert!(
-        !q.r.transport
-            .admit_dialled_subscriber(arrival, &admissions)
-            .await,
-        "a handshake claiming another member is refused"
+        refused,
+        "a handshake claiming another member is refused: {:?}",
+        q.r.metrics.link_seal()
     );
     let r_av = q.r.metrics.av_plane();
-    assert_eq!(
-        r_av.get("av_transit_refused_claim_mismatch").copied(),
-        Some(1),
-        "{r_av:?}"
-    );
     assert_eq!(r_av.get("av_relay_dialler_admitted").copied(), None);
+    let _ = &admissions;
     for seq in 0..15u64 {
         let _ = publisher.publish_inner(legs_chunk(seq)).await;
         tokio::time::sleep(Duration::from_millis(33)).await;
@@ -1505,6 +1514,7 @@ async fn the_transit_kex_refuses_a_false_claim_and_a_missing_pair_by_name() {
 
     // R, as A's directory now sees it, publishes no pair: A's dial is refused
     // by name and never keyed another way.
+    let keyed_before = q.a.metrics.link_seal().get("link_seal_initiated").copied();
     strip_transit_pair(&q.a.dir, &q.r.key).await;
     match q
         .a
@@ -1512,22 +1522,22 @@ async fn the_transit_kex_refuses_a_false_claim_and_a_missing_pair_by_name() {
         .open_av_link(&r_id, &legs_address(&q.a, &r_id))
         .await
     {
-        Err(TransportError::AvTransitRefused { peer, reason, .. }) => {
+        Err(TransportError::LinkSealRefused { peer, reason, .. }) => {
             assert_eq!(peer, r_id);
-            assert_eq!(reason, "av_transit_refused_no_pair");
+            assert_eq!(reason, "link_seal_refused_no_pair");
         }
         other => panic!("a dial to a pair-less node must be refused by name: {other:?}"),
     }
-    let a_av = q.a.metrics.av_plane();
+    let a_seal = q.a.metrics.link_seal();
     assert_eq!(
-        a_av.get("av_transit_refused_no_pair").copied(),
+        a_seal.get("link_seal_refused_no_pair").copied(),
         Some(1),
-        "{a_av:?}"
+        "{a_seal:?}"
     );
     assert_eq!(
-        a_av.get("av_transit_kex_initiated").copied(),
-        Some(1),
-        "only the first dial was keyed: {a_av:?}"
+        a_seal.get("link_seal_initiated").copied(),
+        keyed_before,
+        "the refused dial keyed nothing: {a_seal:?}"
     );
     let nothing = tokio::time::timeout(Duration::from_secs(2), r_arrivals.recv()).await;
     assert!(
@@ -1702,16 +1712,21 @@ async fn one_occurrence_key_id_keys_a_hop_under_use_node_identity() {
         .expect("media in time")
         .expect("a chunk");
     assert_eq!(got.stream_id, legs_stream(), "R opened A's media");
-    assert_eq!(
+    assert!(
         a.metrics
-            .av_plane()
-            .get("av_transit_kex_initiated")
-            .copied(),
-        Some(1)
+            .link_seal()
+            .get("link_seal_initiated")
+            .copied()
+            .unwrap_or(0)
+            >= 1
     );
-    assert_eq!(
-        r.metrics.av_plane().get("av_transit_kex_accepted").copied(),
-        Some(1)
+    assert!(
+        r.metrics
+            .link_seal()
+            .get("link_seal_accepted")
+            .copied()
+            .unwrap_or(0)
+            >= 1
     );
 }
 
@@ -1725,7 +1740,7 @@ async fn one_occurrence_key_id_keys_a_hop_under_use_node_identity() {
 ///   id, the only id persist lets that signer publish for, so none is
 ///   resolvable under the advertised id;
 /// - a dial to it by the advertised id is refused BY NAME as
-///   `av_transit_refused_no_pair` before any link is made, never a silent
+///   `link_seal_refused_no_pair` before any link is made, never a silent
 ///   drop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_signing_as_another_id_builds_and_is_refused_by_name() {
@@ -1801,18 +1816,19 @@ async fn a_host_signing_as_another_id_builds_and_is_refused_by_name() {
         .open_av_link(&r_id, &legs_address(&a, &r_id))
         .await
     {
-        Err(TransportError::AvTransitRefused { peer, reason, .. }) => {
+        Err(TransportError::LinkSealRefused { peer, reason, .. }) => {
             assert_eq!(peer, r_id);
-            assert_eq!(reason, "av_transit_refused_no_pair");
+            assert_eq!(reason, "link_seal_refused_no_pair");
         }
         other => panic!("a dial to the mismatched host must be refused by name: {other:?}"),
     }
-    assert_eq!(
+    assert!(
         a.metrics
-            .av_plane()
-            .get("av_transit_refused_no_pair")
-            .copied(),
-        Some(1)
+            .link_seal()
+            .get("link_seal_refused_no_pair")
+            .copied()
+            .unwrap_or(0)
+            >= 1
     );
     assert!(
         tokio::time::timeout(Duration::from_secs(2), r_arrivals.recv())

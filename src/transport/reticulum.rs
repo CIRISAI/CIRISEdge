@@ -124,6 +124,7 @@ use crate::transport::lxmf_serve::ServeOutcome;
 use crate::verify::{
     HybridPolicy, ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict,
 };
+use ciris_persist::federation::self_at_login::TransitKexPair;
 
 // Maximum envelope body size accepted on send (AV-13, 8 MiB); oversized
 // payloads reject before any link is established. IMPORTED from the
@@ -418,9 +419,19 @@ const CHANNEL_FIRST_MAX_FRAGMENTS: usize = 8;
 /// `Channel::send_raw` refused it `TooLarge`, `send_on_link` folded that into
 /// `SendError::LinkFailed`, and every multi-fragment frame stalled at fragment 0
 /// (`link_send_error`) on any link below the u16 envelope ceiling — the MTU-500
-/// reverse-path link in the field. `fragment` still applies the u16 ceiling.
+/// reverse-path link in the field.
+///
+/// CC 5.3.3.5 E1 — and every Channel message is SEALED on its way out
+/// ([`crate::transport::link_seal::SEAL_OVERHEAD`] bytes of header and tag), so
+/// this is the room left for the PLAINTEXT: the Channel's MDU, capped at the
+/// envelope's `u16` length field, less the seal. A sealed message is then never
+/// over the Channel's limit, whatever cut it (the fragmenter, an A/V chunk, a
+/// handshake part).
 fn channel_payload_mdu(link_mdu: usize) -> usize {
-    link_mdu.saturating_sub(leviculum_core::constants::CHANNEL_ENVELOPE_HEADER_SIZE)
+    link_mdu
+        .saturating_sub(leviculum_core::constants::CHANNEL_ENVELOPE_HEADER_SIZE)
+        .min(usize::from(u16::MAX))
+        .saturating_sub(crate::transport::link_seal::SEAL_OVERHEAD)
 }
 
 /// [`channel_payload_mdu`] for a live link; 0 when leviculum no longer holds it
@@ -429,16 +440,59 @@ fn link_channel_mdu(node: &ReticulumNode, link_id: &LinkId) -> usize {
     node.link_mdu(link_id).map_or(0, channel_payload_mdu)
 }
 
-/// CIRISEdge#720 — the most ONE Channel message on `link_id` carries: the
-/// link's [`channel_payload_mdu`], capped at the Channel envelope's `u16`
-/// length field (leviculum#39's own `Channel::mdu(..).min(u16::MAX)`). This
-/// is what an unfragmented A/V chunk is sized against — the same helper the
-/// fragmenter's MDU comes from, so the A/V plane cannot disagree with the
-/// replication plane about the six-byte margin. `None` when leviculum no
-/// longer holds the link.
+/// CIRISEdge#720 — the most plaintext ONE Channel message on `link_id`
+/// carries: the link's [`channel_payload_mdu`] (capped at the Channel
+/// envelope's `u16` length field, leviculum#39's own
+/// `Channel::mdu(..).min(u16::MAX)`, and less the E1 seal). This is what an
+/// unfragmented A/V chunk and a handshake part are sized against — the same
+/// helper the fragmenter's MDU comes from, so no plane can disagree with
+/// another about the margin. `None` when leviculum no longer holds the link.
 pub(crate) fn link_channel_message_limit(node: &ReticulumNode, link_id: &LinkId) -> Option<usize> {
-    node.link_mdu(link_id)
-        .map(|mdu| channel_payload_mdu(mdu).min(usize::from(u16::MAX)))
+    node.link_mdu(link_id).map(channel_payload_mdu)
+}
+
+/// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead of
+/// the real one. Taken (once) by the next link this node keys.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub enum HandshakeOverride {
+    /// Send no handshake at all, and leave the link open and unkeyed: a peer
+    /// that never runs the KEX.
+    Skip,
+    /// Send these bytes as the link's only first frame instead of the
+    /// handshake (a plaintext frame, a classical-only suite, ...).
+    FirstFrame(Vec<u8>),
+    /// Run the real handshake, but CLAIM this initiator id.
+    Claim(String),
+}
+
+/// CC 5.3.3.5 E1 — count, log and type one seal refusal (on `link_id`, or
+/// before any link when `None`).
+fn seal_refused(
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    peer: &str,
+    link_id: Option<LinkId>,
+    refusal: &crate::transport::link_seal::SealRefusal,
+    side: &'static str,
+) -> TransportError {
+    let reason = refusal.label();
+    if let Some(m) = metrics {
+        m.inc_link_seal(reason);
+    }
+    tracing::warn!(
+        peer = %peer,
+        link = ?link_id.map(|l| hex::encode(l.as_bytes())),
+        side,
+        reason,
+        error = %refusal,
+        "link transit seal REFUSED — no key installed, nothing sent in the clear, no \
+         fallback (CC 5.3.3.5 E1)"
+    );
+    TransportError::LinkSealRefused {
+        peer: peer.to_owned(),
+        reason,
+        detail: refusal.to_string(),
+    }
 }
 
 /// What [`send_fragments_on_channel`] achieved.
@@ -462,8 +516,13 @@ impl FragmentSendOutcome {
 /// signals by waiting for the channel (its documented contract), under a
 /// per-fragment and a per-frame bound. The Channel then sequences and
 /// retransmits every fragment; the receiver reassembles in order.
+///
+/// CC 5.3.3.5 E1 — each fragment is SEALED under the link's keys first. A link
+/// with no keys sends nothing (`link_unsealed`, counted by the caller's
+/// metrics as `link_seal_refused_unsealed_send`).
 async fn send_fragments_on_channel(
     node: &ReticulumNode,
+    seals: &crate::transport::link_seal::LinkSeals,
     link_id: &LinkId,
     fragments: &[Vec<u8>],
 ) -> FragmentSendOutcome {
@@ -478,9 +537,20 @@ async fn send_fragments_on_channel(
                 stalled: Some("frame_budget_exhausted"),
             };
         }
+        let Ok(sealed) = seals.seal(
+            link_id.into_bytes(),
+            crate::transport::link_seal::Lane::Channel,
+            frag,
+        ) else {
+            return FragmentSendOutcome {
+                sent,
+                total,
+                stalled: Some("link_unsealed"),
+            };
+        };
         match tokio::time::timeout(
             CHANNEL_FRAGMENT_SEND_TIMEOUT,
-            node.link_handle(link_id).send(frag),
+            node.link_handle(link_id).send(&sealed),
         )
         .await
         {
@@ -2283,15 +2353,16 @@ pub struct ReticulumTransport {
     /// the periodic announce tick so a boot-time fault (directory not
     /// yet serving / own key not yet registered) heals in place.
     self_route: crate::transport::self_route::SelfSignedRouteProducer,
-    /// CIRISEdge#805 (CC 3.3.6.2) — this node's static transit KEX keys,
-    /// loaded once beside the transport identity. The public pair rides the
-    /// signed route [`Self::self_route`] emits; the privates answer a
-    /// dialler's `transit_kex` handshake.
-    transit_kex: crate::transport::transit_kex_custody::TransitKexSecret,
-    /// CIRISEdge#805 — resolves a dialled node's transit pair (Rooted only,
-    /// via [`RootingDirectory::transit_kex_pair_for`]) for the A/V dial's
-    /// handshake.
-    transit_peers: crate::transport::transit_kex_peer::PeerTransitResolver,
+    /// CC 5.3.3.5 E1 — the per-link seal table: this node's static transit
+    /// KEX keys (loaded once beside the transport identity; the public pair
+    /// rides the signed route [`Self::self_route`] emits, the privates answer
+    /// every dialler's handshake), the Rooted-only resolver for a dialled
+    /// node's pair, and every link's keys. Every frame on every link is sealed
+    /// and opened here.
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead
+    /// of the real one (see [`HandshakeOverride`]). `None` in production.
+    handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
     /// The node's single `NodeEvent` receiver. `listen` takes it
     /// exactly once; a second `listen` call is a config error.
     /// Leviculum PR #9 switched this to an unbounded channel so node
@@ -2940,6 +3011,10 @@ impl ReticulumTransport {
             link_in_flight: Arc::clone(&self.link_in_flight),
             test_publish_delay_ms: Arc::clone(&self.test_publish_delay_ms),
             fail_derived_identify: Arc::clone(&self.fail_derived_identify),
+            seals: Arc::clone(&self.seals),
+            rooting: self.rooting.clone(),
+            own_key_id: self.occurrence_key_id().to_owned(),
+            handshake_override: Arc::clone(&self.handshake_override),
         }
     }
 
@@ -3027,6 +3102,13 @@ impl ReticulumTransport {
             )?
         };
 
+        // CC 5.3.3.5 E1 — the per-link seal table, keyed by those transit keys
+        // and answering every dialler's handshake as the advertised id.
+        let seals = Arc::new(crate::transport::link_seal::LinkSeals::new(
+            transit_kex,
+            config.local_key_id.clone(),
+        ));
+
         // v2.1.0 (CIRISPersist LocalIdentityAggregate RET-transport
         // role) — copy the 64-byte dual-key public material to a
         // standalone buffer we stash on `ReticulumTransport`. The
@@ -3071,7 +3153,7 @@ impl ReticulumTransport {
         // because persist verifies the signer acts for the row. So a host
         // that passes a signer for another id (an actor's, on a split node)
         // runs a node peers cannot root or key an A/V hop to: every dial to
-        // it is refused by name as `av_transit_refused_no_pair`. Refusing to
+        // it is refused by name as `link_seal_refused_no_pair`. Refusing to
         // build would brick such a host on upgrade, so this says so ONCE,
         // loudly, and the `transport_signer_id_mismatch` gauge carries it;
         // the structural fix is the host's.
@@ -3500,7 +3582,7 @@ impl ReticulumTransport {
                     rooting_dir,
                     named16,
                     local_transport_pubkey,
-                    transit_kex.pair(),
+                    seals.secret().pair(),
                     config.local_epoch,
                 )
                 .await;
@@ -3567,8 +3649,8 @@ impl ReticulumTransport {
             local_attestation,
             local_signer,
             self_route,
-            transit_kex,
-            transit_peers: crate::transport::transit_kex_peer::PeerTransitResolver::new(),
+            seals,
+            handshake_override: Arc::new(std::sync::Mutex::new(None)),
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
@@ -3980,6 +4062,7 @@ impl ReticulumTransport {
             metrics_source: self.metrics_source,
             av_sink: &self.av_sink,
             av_dialed_peer: &self.av_dialed_peer,
+            seals: &self.seals,
         }
     }
 
@@ -5175,6 +5258,37 @@ impl ReticulumTransport {
             .await
     }
 
+    /// CC 5.3.3.5 E1 test seam — the next link this node keys runs
+    /// `seam` instead of its real handshake (see [`HandshakeOverride`]).
+    #[doc(hidden)]
+    pub fn set_handshake_override_for_test(&self, seam: HandshakeOverride) {
+        *self
+            .handshake_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seam);
+    }
+
+    /// CC 5.3.3.5 E1 test seam — start (or stop and clear) recording every
+    /// frame this node hands leviculum on any link, exactly as sent: the
+    /// handshake parts and every sealed frame.
+    #[doc(hidden)]
+    pub fn set_link_wire_tap_for_test(&self, on: bool) {
+        self.seals.set_tap(on);
+    }
+
+    /// CC 5.3.3.5 E1 test seam — the frames recorded since
+    /// [`Self::set_link_wire_tap_for_test`], oldest first.
+    #[doc(hidden)]
+    pub fn link_wire_tapped_for_test(&self) -> Vec<([u8; 16], Vec<u8>)> {
+        self.seals.tapped()
+    }
+
+    /// CC 5.3.3.5 E1 test seam — whether `link` carries transit keys.
+    #[doc(hidden)]
+    pub fn link_is_sealed_for_test(&self, link: [u8; 16]) -> bool {
+        self.seals.is_sealed(link)
+    }
+
     async fn open_av_link_claiming(
         &self,
         destination_key_id: &str,
@@ -5225,6 +5339,7 @@ impl ReticulumTransport {
                     dest_hash,
                     &transport_ed25519,
                     LinkPlane::Av,
+                    (&pair, initiator_key_id),
                     move |link_id| {
                         *dispatched
                             .lock()
@@ -5269,56 +5384,42 @@ impl ReticulumTransport {
         let sender = crate::transport::realtime_av_runtime::LeviculumAvSender::new(
             Arc::clone(&self.node),
             link_id,
+            Arc::clone(&self.seals),
         )
         .with_metrics(self.metrics.get().cloned())
         .with_direct_path(direct_path)
         .with_outbound_liveness(Arc::clone(&self.link_last_outbound_at));
-        self.key_av_dial(
-            destination_key_id,
-            initiator_key_id,
-            &pair,
-            link_id,
-            inbound,
-            sender,
-        )
-        .await
+        self.finish_av_dial(destination_key_id, link_id, inbound, sender)
+            .await
     }
 
-    /// CIRISEdge#805 (CC 5.3.3.5 E1) — the last step of an A/V dial: key the
-    /// hop. This node dialled, so it INITIATES, and the handshake is the
-    /// link's first message. Nothing else keys the hop; no pair means no
-    /// link, and a refused dial is undone like any other failed one.
-    async fn key_av_dial(
+    /// CC 5.3.3.5 E1 — the last step of an A/V dial. The dial keyed the link
+    /// (its handshake was the link's first frame): A/V's outer seal takes the
+    /// LINK's keys, so a link runs one KEX, not two.
+    async fn finish_av_dial(
         &self,
         destination_key_id: &str,
-        initiator_key_id: &str,
-        pair: &ciris_persist::federation::self_at_login::TransitKexPair,
         link_id: LinkId,
         inbound: crate::transport::realtime_av_runtime::PumpReceiver,
         sender: crate::transport::realtime_av_runtime::LeviculumAvSender,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
-        let transit = match self
-            .initiate_av_transit(destination_key_id, initiator_key_id, pair, link_id, &sender)
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                let refused =
-                    self.av_transit_refused(destination_key_id, Some(link_id), &e, "dial");
-                drop(inbound);
-                drop(sender);
-                self.undo_partial_av_dial(link_id, &refused).await;
-                return Err(refused);
-            }
+        let Some((transit, _)) = self.seals.transit(link_id.into_bytes()) else {
+            let e = TransportError::Io(
+                "open_av_link: the dialled link carries no transit keys".to_owned(),
+            );
+            drop(inbound);
+            drop(sender);
+            self.undo_partial_av_dial(link_id, &e).await;
+            return Err(e);
         };
         if let Some(m) = self.metrics.get() {
-            m.inc_av_plane(crate::observability::AV_TRANSIT_KEX_INITIATED);
             m.inc_av_plane(crate::observability::AV_LINK_OPENED);
         }
         tracing::info!(
             key_id = %destination_key_id,
             link = %hex::encode(link_id.as_bytes()),
-            "A/V link opened on the live node, transit KEX sent (CIRISEdge#805)"
+            "A/V link opened on the live node, keyed by the link's transit KEX \
+             (CIRISEdge#805, CC 5.3.3.5 E1)"
         );
         Ok(crate::transport::av_sink::AvLink {
             link_id: link_id.into_bytes(),
@@ -5329,135 +5430,51 @@ impl ReticulumTransport {
         })
     }
 
-    /// CIRISEdge#805 — the dialled node's transit pair (Rooted only), read
-    /// BEFORE the dial: a node that publishes none cannot be keyed, so it is
-    /// never dialled.
-    async fn resolve_av_transit_pair(
-        &self,
-        peer: &str,
-    ) -> Result<
-        ciris_persist::federation::self_at_login::TransitKexPair,
-        crate::transport::av_transit_handshake::AvHandshakeError,
-    > {
-        use crate::transport::av_transit_handshake::AvHandshakeError;
-        let Some(rooting) = self.rooting.as_deref() else {
-            return Err(AvHandshakeError::PairLookup {
-                peer: peer.to_owned(),
-                detail: "no rooting directory is wired".to_owned(),
-            });
-        };
-        self.transit_peers
-            .resolve(rooting, peer)
-            .await
-            .map_err(|detail| AvHandshakeError::PairLookup {
-                peer: peer.to_owned(),
-                detail,
-            })?
-            .ok_or_else(|| AvHandshakeError::NoTransitPair {
-                peer: peer.to_owned(),
-            })
-    }
-
-    /// CIRISEdge#805 — the dialler's half of an A/V hop's transit KEX: run
-    /// `transit_kex::initiate` against the dialled node's `pair` and send the
-    /// handshake on the link.
-    async fn initiate_av_transit(
-        &self,
-        peer: &str,
-        initiator_key_id: &str,
-        pair: &ciris_persist::federation::self_at_login::TransitKexPair,
-        link_id: LinkId,
-        sender: &crate::transport::realtime_av_runtime::LeviculumAvSender,
-    ) -> Result<
-        crate::transport::av_transit_handshake::LinkTransit,
-        crate::transport::av_transit_handshake::AvHandshakeError,
-    > {
-        use crate::transport::av_transit_handshake::{initiate_on_link, AvHandshakeError};
-        let frame_limit = sender
-            .channel_limit()
-            .ok_or_else(|| AvHandshakeError::Send("the link is no longer held".to_owned()))?;
-        initiate_on_link(
-            sender,
-            frame_limit,
-            link_id.as_bytes(),
-            initiator_key_id,
-            peer,
-            pair,
-        )
-        .await
-    }
-
-    /// Count, log and type one transit KEX refusal (on `link_id`, or before
-    /// any link when `None`).
-    fn av_transit_refused(
-        &self,
-        peer: &str,
-        link_id: Option<LinkId>,
-        error: &crate::transport::av_transit_handshake::AvHandshakeError,
-        side: &'static str,
-    ) -> TransportError {
-        let reason = error.label();
-        if let Some(m) = self.metrics.get() {
-            m.inc_av_plane(reason);
-        }
-        tracing::warn!(
-            peer = %peer,
-            link = ?link_id.map(|l| hex::encode(l.as_bytes())),
-            side,
-            reason,
-            error = %error,
-            "A/V transit KEX REFUSED — link closed, no key installed, no fallback key \
-             (CIRISEdge#805, CC 5.3.3.5 E1)"
-        );
-        TransportError::AvTransitRefused {
-            peer: peer.to_owned(),
-            reason,
-            detail: error.to_string(),
-        }
-    }
-
-    /// CIRISEdge#805 (CC 5.3.3.5 E1) — the dialled end's half of an A/V
-    /// hop's transit KEX, for a link a peer opened to this node: read the
-    /// dialler's handshake (the link's first message), answer it under this
-    /// node's transit keys, and check the CLAIM: the handshake's initiator
-    /// must be the peer the link itself proves (`arrival.peer`, the #393
-    /// attribution). Only then are the hop's keys handed out, as the
-    /// responder's [`LinkTransit`](crate::transport::av_transit_handshake::LinkTransit).
-    ///
-    /// Any refusal closes the link and is counted under its name.
+    /// CIRISEdge#805 (CC 5.3.3.5 E1) — hand a peer-opened A/V link to the A/V
+    /// consumer with its RESPONDER keys. The link's transit KEX already ran
+    /// (it is the first frame of every link, answered by the link layer before
+    /// the arrival existed); here its CLAIM is held to the peer the link is
+    /// attributed to (`arrival.peer`, the #393 attribution), and only then are
+    /// the keys handed out. A refusal closes the link and is counted under its
+    /// name.
     ///
     /// # Errors
-    /// [`TransportError::AvTransitRefused`].
+    /// [`TransportError::LinkSealRefused`].
     pub async fn accept_av_arrival(
         &self,
         arrival: crate::transport::av_sink::AvArrival,
     ) -> Result<crate::transport::av_sink::AcceptedAvArrival, TransportError> {
+        use crate::transport::av_transit_handshake::check_claim;
+        use crate::transport::link_seal::SealRefusal;
         let link_id = LinkId::new(arrival.link_id);
-        match crate::transport::av_transit_handshake::respond_on_link(
-            &arrival.inbound,
-            &arrival.link_id,
-            self.occurrence_key_id(),
-            &self.transit_kex,
-            arrival.peer.as_str(),
-        )
-        .await
-        {
+        let checked = match self.seals.transit(arrival.link_id) {
+            Some((transit, Some(claimed))) => check_claim(&claimed, arrival.peer.as_str())
+                .map(|()| transit)
+                .map_err(SealRefusal::Handshake),
+            // A peer-opened link this node never responded on (it dialled
+            // it, or the seal is gone): nothing to accept.
+            _ => Err(SealRefusal::Unsealed),
+        };
+        match checked {
             Ok(transit) => {
-                if let Some(m) = self.metrics.get() {
-                    m.inc_av_plane(crate::observability::AV_TRANSIT_KEX_ACCEPTED);
-                }
                 tracing::info!(
                     peer = %arrival.peer.as_str(),
                     link = %hex::encode(arrival.link_id),
-                    "A/V transit KEX answered; the claim matches the link's peer \
+                    "A/V arrival accepted; the link's transit KEX claim matches its peer \
                      (CIRISEdge#805)"
                 );
                 Ok(crate::transport::av_sink::AcceptedAvArrival { arrival, transit })
             }
-            Err(e) => {
-                let refused =
-                    self.av_transit_refused(arrival.peer.as_str(), Some(link_id), &e, "accept");
+            Err(r) => {
+                let refused = seal_refused(
+                    self.metrics.get(),
+                    arrival.peer.as_str(),
+                    Some(link_id),
+                    &r,
+                    "accept",
+                );
                 drop(arrival);
+                self.seals.refuse(link_id.into_bytes());
                 let _ = self.link_teardown(link_id.as_bytes()).await;
                 Err(refused)
             }
@@ -5512,13 +5529,13 @@ impl ReticulumTransport {
                 member.as_deref().unwrap_or("<none>"),
             )));
         }
-        // CIRISEdge#805 (CC 5.3.3.5 E1) — the hop can only be keyed by the
+        // CIRISEdge#805 (CC 5.3.3.5 E1) — the link can only be keyed by the
         // dialled node's published transit pair: no pair, no dial, refused by
         // name before a link is spent on it.
-        let pair = match self.resolve_av_transit_pair(destination_key_id).await {
-            Ok(pair) => pair,
-            Err(e) => return Err(self.av_transit_refused(destination_key_id, None, &e, "dial")),
-        };
+        let pair = self
+            .dial_ctx()
+            .resolve_transit_pair(destination_key_id)
+            .await?;
         // The operator deny-list, on the DERIVED hash and on EVERY federation
         // candidate the peer resolves to — the regular send path's rule. A
         // peer blackholed by its announced destination must not stay reachable
@@ -6529,14 +6546,14 @@ impl ReticulumTransport {
             ))
         })?;
         let dest_hash = DestinationHash::new(dest_hash_array);
-        let transport_ed25519 = {
+        let found = {
             let peers = self.peers.lock().await;
             peers
-                .values()
-                .find(|p| p.peer.dest_hash == dest_hash)
-                .map(|p| p.peer.transport_ed25519)
+                .iter()
+                .find(|(_, p)| p.peer.dest_hash == dest_hash)
+                .map(|(key_id, p)| (key_id.clone(), p.peer.transport_ed25519))
         };
-        let Some(transport_ed25519) = transport_ed25519 else {
+        let Some((peer_key_id, transport_ed25519)) = found else {
             return Err(TransportError::Unreachable(format!(
                 "no rooted peer known for destination_hash={dest_hash} \
                  (link_open requires a rooted announce; call link_open after \
@@ -6551,6 +6568,11 @@ impl ReticulumTransport {
         // peer's federation pubkey) and the legacy announce-bound
         // route (when the peer is still on v6.x). The 16 bytes are
         // opaque to leviculum; the receiver's index dispatches.
+        //
+        // CC 5.3.3.5 E1 — the dialled node's transit pair FIRST: no Rooted
+        // pair, no link.
+        let ctx = self.dial_ctx();
+        let pair = ctx.resolve_transit_pair(&peer_key_id).await?;
         // CIRISEdge#484 — leviculum v0.16 `connect_awaited` registers the
         // establishment waiter BEFORE dispatch (the `LinkEstablished` proof can never
         // precede registration), keyed on the ORIGINAL dial id — which is exactly the
@@ -6563,6 +6585,7 @@ impl ReticulumTransport {
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
+        self.seals.begin_initiator(link_id.into_bytes());
         // CIRISEdge#424 — record the dialed dest for own-dialed-link attribution
         // (see `send`); uniform across every link edge initiates.
         self.dialed_link_dest
@@ -6590,22 +6613,32 @@ impl ReticulumTransport {
             .identify_link(&link_id, &self.local_identity)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
-        // CIRISEdge#627 — the announce rides the link FIRST: after the
-        // LINKIDENTIFY (so the responder binds it to the identity it proved),
-        // before anything else on this link. Same task, same handle: nothing
-        // can reorder ahead of it.
+        // CC 5.3.3.5 E1 — the transit KEX is the link's first frame.
+        ctx.key_link(link_id, &peer_key_id, &pair, self.occurrence_key_id())
+            .await?;
+        // CIRISEdge#627 — the announce rides the link FIRST after the KEX:
+        // after the LINKIDENTIFY (so the responder binds it to the identity it
+        // proved), before anything else on this link. Same task, same handle:
+        // nothing can reorder ahead of it.
         if let Some(frame) = self.own_announce_frame.as_deref() {
-            push_own_announce_frame(&self.node, frame, &link_id).await;
+            push_own_announce_frame(&self.node, &self.seals, frame, &link_id).await;
         }
         // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
         // LINKIDENTIFY so the responder can attribute the frame.
         if let Some(own) = self.own_bundle.as_ref() {
-            push_own_bundle_frames(&self.node, own, &link_id).await;
+            push_own_bundle_frames(&self.node, &self.seals, own, &link_id).await;
         }
         // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
         // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle.
         if let Some(src) = self.own_owner_binding.as_ref() {
-            push_own_owner_binding(&self.node, src.as_ref(), &link_id, self.metrics.get()).await;
+            push_own_owner_binding(
+                &self.node,
+                &self.seals,
+                src.as_ref(),
+                &link_id,
+                self.metrics.get(),
+            )
+            .await;
         }
         Ok(link_id.into_bytes())
     }
@@ -6730,6 +6763,7 @@ impl ReticulumTransport {
         data: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, TransportError> {
+        use crate::transport::link_seal::{Inbound, Lane};
         let link_id_array: [u8; 16] = link_id_bytes.try_into().map_err(|_| {
             TransportError::Config(format!(
                 "link_id must be 16 bytes, got {}",
@@ -6739,6 +6773,13 @@ impl ReticulumTransport {
         let link_id = LinkId::new(link_id_array);
 
         let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        // CC 5.3.3.5 E1 — the request's data rides sealed, and so does the
+        // response; a link with no keys carries neither.
+        let data = self
+            .seals
+            .seal(link_id.into_bytes(), Lane::Request, data)
+            .map_err(|r| seal_refused(self.metrics.get(), "-", Some(link_id), &r, "request"))?;
+        let data = data.as_slice();
         // CIRISEdge#484 — leviculum v0.16 completion future replaces the 20 ms
         // `request_responses`/`timed_out_requests` poll loop (both mirror maps + their
         // `handle_event` populate arms are now deleted). The waiter is registered
@@ -6757,7 +6798,23 @@ impl ReticulumTransport {
         // where `tokio::time::*` panics "no reactor running"; the completion future is
         // Timer-free).
         match response.await {
-            Ok(info) => Ok(info.response_data),
+            Ok(info) => {
+                match self
+                    .seals
+                    .open(link_id.into_bytes(), Lane::Response, &info.response_data)
+                {
+                    Inbound::Open(plain) => Ok(plain),
+                    Inbound::Refuse(r) => {
+                        let err =
+                            seal_refused(self.metrics.get(), "-", Some(link_id), &r, "request");
+                        let _ = self.node.close_link(&link_id).await;
+                        Err(err)
+                    }
+                    other => Err(TransportError::Io(format!(
+                        "reticulum request: sealed response not delivered ({other:?})"
+                    ))),
+                }
+            }
             Err(CompletionError::RequestTimedOut) => Err(TransportError::Timeout(timeout)),
             Err(CompletionError::LinkClosed { reason }) => Err(TransportError::Io(format!(
                 "reticulum request: link closed before response ({reason:?})"
@@ -7486,7 +7543,7 @@ impl ReticulumTransport {
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        send_fragments_on_channel(&self.node, &link_id, fragments).await
+        send_fragments_on_channel(&self.node, &self.seals, &link_id, fragments).await
     }
 
     /// CIRISEdge#853 — wrap a claimed lane in a [`LinkClaim`], so the claim is
@@ -8066,9 +8123,27 @@ impl ReticulumTransport {
         let _ = self
             .node
             .set_resource_strategy(link_id, ResourceStrategy::AcceptAll);
+        // CC 5.3.3.5 E1 — the Resource carries the SEALED envelope; a link
+        // with no keys ships nothing.
+        let sealed = self
+            .seals
+            .seal(
+                link_id.into_bytes(),
+                crate::transport::link_seal::Lane::Resource,
+                envelope_bytes,
+            )
+            .map_err(|r| {
+                ShipError::Other(seal_refused(
+                    self.metrics.get(),
+                    "-",
+                    Some(*link_id),
+                    &r,
+                    "send",
+                ))
+            })?;
         let (resource_hash, sent) = self
             .node
-            .send_resource_awaited(link_id, envelope_bytes, None, true)
+            .send_resource_awaited(link_id, &sealed, None, true)
             .await
             .map_err(|e| match e {
                 leviculum_std::error::Error::Resource(
@@ -8598,7 +8673,7 @@ impl Transport for ReticulumTransport {
                                 rooting,
                                 self.local_named_dest_hash(),
                                 self.local_transport_pubkey,
-                                self.transit_kex.pair(),
+                                self.seals.secret().pair(),
                                 self.config.local_epoch,
                             )
                             .await;
@@ -8663,6 +8738,7 @@ impl Transport for ReticulumTransport {
                         av_node: &self.node,
                         av_dialed_peer: &self.av_dialed_peer,
                         direct_paths: &self.direct_paths,
+                        seals: &self.seals,
                     };
                     handle_event(event, &ctx).await;
 
@@ -9123,6 +9199,8 @@ struct LinkBook<'a> {
     av_sink: &'a crate::transport::av_sink::AvSink,
     /// CIRISEdge#805 — the A/V links this node dialled, by peer.
     av_dialed_peer: &'a std::sync::Mutex<HashMap<LinkId, String>>,
+    /// CC 5.3.3.5 E1 — the link's keys go with it.
+    seals: &'a crate::transport::link_seal::LinkSeals,
 }
 
 impl LinkBook<'_> {
@@ -9149,6 +9227,8 @@ impl LinkBook<'_> {
         // v3.5.1 (CIRISEdge#119 + #120) — drop the link's rooted
         // peer attribution when the link closes.
         self.link_to_peer_key_id.lock().await.remove(&link_id);
+        // CC 5.3.3.5 E1 — its transit keys.
+        self.seals.forget(&link_id.into_bytes());
         // CIRISEdge#805 — an A/V link's consumer sees the close as the end of
         // its receiver, and its dial record goes with it. Here, not in the
         // `LinkClosed` arm, so every way a link leaves (the event, this node's
@@ -9396,6 +9476,14 @@ struct DialCtx {
     test_publish_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     /// CIRISEdge#805 — see `ReticulumTransport::fail_derived_identify`.
     fail_derived_identify: Arc<std::sync::atomic::AtomicU32>,
+    /// CC 5.3.3.5 E1 — see `ReticulumTransport::seals`.
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    /// CC 5.3.3.5 E1 — where a dialled node's transit pair is resolved.
+    rooting: Option<Arc<dyn RootingDirectory>>,
+    /// CC 5.3.3.5 E1 — the occurrence key id this node's handshakes claim.
+    own_key_id: String,
+    /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::handshake_override`.
+    handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
 }
 
 impl DialCtx {
@@ -9422,11 +9510,14 @@ impl DialCtx {
         dest_hash: DestinationHash,
         transport_ed25519: &[u8; 32],
     ) -> Result<LinkId, TransportError> {
+        // CC 5.3.3.5 E1 — no Rooted pair, no dial.
+        let pair = self.resolve_transit_pair(destination_key_id).await?;
         self.dial_derived_link(
             destination_key_id,
             dest_hash,
             transport_ed25519,
             LinkPlane::Scoped,
+            (&pair, &self.own_key_id),
             |_| {},
         )
         .await
@@ -9438,12 +9529,18 @@ impl DialCtx {
     /// can establish, so before the peer can send on it — which is where the
     /// A/V plane registers the link's consumer and its attribution basis, so
     /// no frame can find the link unregistered.
+    ///
+    /// CC 5.3.3.5 E1 — `keying` is the dialled node's transit pair (resolved
+    /// by the caller BEFORE this dial) and the initiator id the handshake
+    /// claims; the link is keyed right after its identify and before it is
+    /// returned, so nothing is ever sent on it in the clear.
     async fn dial_derived_link(
         &self,
         destination_key_id: &str,
         dest_hash: DestinationHash,
         transport_ed25519: &[u8; 32],
         plane: LinkPlane,
+        keying: (&TransitKexPair, &str),
         before_establish: impl FnOnce(LinkId) + Send,
     ) -> Result<LinkId, TransportError> {
         let (link, established) = self
@@ -9452,6 +9549,7 @@ impl DialCtx {
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect (scoped): {e}")))?;
         let link_id = *link.link_id();
+        self.seals.begin_initiator(link_id.into_bytes());
         // CIRISEdge#424 — record the dest we dialed so a reply arriving on this
         // link attributes to this peer (leviculum's `link_destination` is `None`
         // for our own dialed links).
@@ -9513,7 +9611,126 @@ impl DialCtx {
             .identify_link(&link_id, &self.local_identity)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum identify_link (scoped): {e}")))?;
+        // CC 5.3.3.5 E1 — the handshake is the link's first frame.
+        let (pair, claim) = keying;
+        self.key_link(link_id, destination_key_id, pair, claim)
+            .await?;
         Ok(link_id)
+    }
+
+    /// CC 5.3.3.5 E1 — the dialled node's transit pair (Rooted only), read
+    /// BEFORE the dial: a node that publishes none cannot be keyed, so it is
+    /// never dialled. A refusal is counted and logged by name.
+    async fn resolve_transit_pair(&self, peer: &str) -> Result<TransitKexPair, TransportError> {
+        match self.seals.resolve_pair(self.rooting.as_deref(), peer).await {
+            Ok(pair) => Ok(pair),
+            Err(e) => Err(seal_refused(
+                self.metrics.as_ref(),
+                peer,
+                None,
+                &crate::transport::link_seal::SealRefusal::Handshake(e),
+                "dial",
+            )),
+        }
+    }
+
+    /// CC 5.3.3.5 E1 — the dialler's half of a link's transit KEX, run as the
+    /// link's FIRST frame: build the handshake against the dialled node's
+    /// `pair`, send every part on the Channel in order, and only then install
+    /// the keys (so no sealed frame can precede the handshake). On any
+    /// failure the link is closed, by name; it carries nothing.
+    async fn key_link(
+        &self,
+        link_id: LinkId,
+        peer: &str,
+        pair: &TransitKexPair,
+        claim: &str,
+    ) -> Result<(), TransportError> {
+        use crate::transport::av_transit_handshake::{AvHandshakeError, HANDSHAKE_BUDGET};
+        use crate::transport::link_seal::SealRefusal;
+        let link = link_id.into_bytes();
+        let seam = self
+            .handshake_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let claim = match &seam {
+            Some(HandshakeOverride::Claim(c)) => c.as_str(),
+            _ => claim,
+        };
+        let refused = |e: AvHandshakeError| {
+            seal_refused(
+                self.metrics.as_ref(),
+                peer,
+                Some(link_id),
+                &SealRefusal::Handshake(e),
+                "dial",
+            )
+        };
+        let built = link_channel_message_limit(&self.node, &link_id)
+            .ok_or_else(|| AvHandshakeError::Send("the link is no longer held".to_owned()))
+            .and_then(|limit| self.seals.initiate(link, claim, peer, pair, limit));
+        let (frames, transit) = match built {
+            Ok(b) => b,
+            Err(e) => {
+                let err = refused(e);
+                self.close_refused(link_id).await;
+                return Err(err);
+            }
+        };
+        let frames = match seam {
+            // Test seam: a peer that never sends its handshake. The link is
+            // left open and unkeyed, so the responder's budget is what ends it.
+            Some(HandshakeOverride::Skip) => {
+                return Err(TransportError::Io(
+                    "handshake skipped (test seam): the link is left open and unkeyed".to_owned(),
+                ));
+            }
+            // Test seam: a peer whose first frame is not a well-formed
+            // hybrid handshake.
+            Some(HandshakeOverride::FirstFrame(raw)) => vec![raw],
+            _ => frames,
+        };
+        let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
+        for frame in &frames {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let sent = tokio::time::timeout(
+                left.min(CHANNEL_FRAGMENT_SEND_TIMEOUT),
+                self.node.link_handle(&link_id).send(frame),
+            )
+            .await;
+            match sent {
+                Ok(Ok(())) => self.seals.tap_frame(link, frame),
+                Ok(Err(e)) => {
+                    let err = refused(AvHandshakeError::Send(e.to_string()));
+                    self.close_refused(link_id).await;
+                    return Err(err);
+                }
+                Err(_elapsed) => {
+                    let err = refused(AvHandshakeError::Timeout(HANDSHAKE_BUDGET));
+                    self.close_refused(link_id).await;
+                    return Err(err);
+                }
+            }
+        }
+        self.seals.install_initiator(link, transit);
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_link_seal(crate::observability::LINK_SEAL_INITIATED);
+        }
+        tracing::debug!(
+            peer = %peer,
+            link = %hex::encode(link),
+            parts = frames.len(),
+            "link keyed: transit KEX sent as the first frame (CC 5.3.3.5 E1)"
+        );
+        Ok(())
+    }
+
+    /// Close a link whose seal was refused: it is marked refused first, so
+    /// nothing is sealed for it while the close is in flight.
+    async fn close_refused(&self, link_id: LinkId) {
+        self.seals.refuse(link_id.into_bytes());
+        let _ = self.node.close_link(&link_id).await;
     }
 
     /// Snapshot every known path-table entry. v1.1.0 (CIRISEdge#44) —
@@ -9595,12 +9812,17 @@ impl DialCtx {
         // owns). The future keys on the ORIGINAL dial id — the #342/#66 alias the old
         // `link_is_established` poll resolved — takes NO node lock, and resolves
         // `Err(LinkClosed)` on link death. Caller owns the wall-clock bound.
+        //
+        // CC 5.3.3.5 E1 — the dialled node's transit pair FIRST: no Rooted
+        // pair, no dial.
+        let pair = self.resolve_transit_pair(destination_key_id).await?;
         let (link, established) = self
             .node
             .connect_awaited(&peer.dest_hash, &peer.transport_ed25519)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
+        self.seals.begin_initiator(link_id.into_bytes());
         // CIRISEdge#424 — record the dest we dialed for THIS link so an inbound
         // reply arriving over it (the initiator-side reverse path a NAT'd peer's
         // responder uses) attributes to this peer even though leviculum's
@@ -9674,23 +9896,34 @@ impl DialCtx {
             .identify_link(&link_id, &self.local_identity)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
+        // CC 5.3.3.5 E1 — the transit KEX is the link's first frame; every
+        // frame below rides sealed.
+        self.key_link(link_id, destination_key_id, &pair, &self.own_key_id)
+            .await?;
 
         // CIRISEdge#627 — announce FIRST (see `link_open`).
         if let Some(frame) = self.own_announce_frame.as_deref() {
-            push_own_announce_frame(&self.node, frame, &link_id).await;
+            push_own_announce_frame(&self.node, &self.seals, frame, &link_id).await;
         }
         // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
         // LINKIDENTIFY (so the responder attributes it) and BEFORE the
         // resource ship (the fragments ride the link Channel, which never
         // contends with the resource lane — leviculum#27).
         if let Some(own) = self.own_bundle.as_ref() {
-            push_own_bundle_frames(&self.node, own, &link_id).await;
+            push_own_bundle_frames(&self.node, &self.seals, own, &link_id).await;
         }
         // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
         // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle and
         // before the resource ship (same Channel lane as the bundle).
         if let Some(src) = self.own_owner_binding.as_ref() {
-            push_own_owner_binding(&self.node, src.as_ref(), &link_id, self.metrics.as_ref()).await;
+            push_own_owner_binding(
+                &self.node,
+                &self.seals,
+                src.as_ref(),
+                &link_id,
+                self.metrics.as_ref(),
+            )
+            .await;
         }
 
         // PUBLISH LAST. Only now is the link established AND identified AND
@@ -9939,6 +10172,9 @@ struct EventCtx<'a> {
     /// CIRISEdge#805 item 8 — see the field of the same name on
     /// [`ReticulumTransport`].
     direct_paths: &'a crate::transport::direct_path::DirectPaths,
+    /// CC 5.3.3.5 E1 — see `ReticulumTransport::seals`. An `Arc` so a link's
+    /// handshake budget can outlive the event that armed it.
+    seals: &'a Arc<crate::transport::link_seal::LinkSeals>,
 }
 
 impl EventCtx<'_> {
@@ -9960,6 +10196,7 @@ impl EventCtx<'_> {
             metrics_source: self.metrics_source,
             av_sink: self.av_sink,
             av_dialed_peer: self.av_dialed_peer,
+            seals: self.seals,
         }
     }
 }
@@ -10619,6 +10856,15 @@ async fn attribute_and_deliver(
             }
         }
     };
+    // CC 5.3.3.5 E1 — THE CLAIM. On a link this node RESPONDED on, the
+    // handshake's initiator id is a claim the KEX does not prove; the link's
+    // attribution must be that id. A link attributed to anyone else is
+    // refused and closed here, before any frame on it is read further.
+    if claim_contradicted(ctx, link_id, candidate_key_id.as_deref()).await {
+        // choke-ok: `claim_contradicted` names the refusal through
+        // `drop_inbound` and closes the link.
+        return;
+    }
     // CIRISEdge#436 — a link-borne build-attestation-bundle frame (`CBND`) is
     // a TRANSPORT-level control frame, consumed here exactly like a `CFRG`
     // fragment — never an envelope, never an `InboundFrame`. Intercepted with
@@ -10775,6 +11021,30 @@ async fn attribute_and_deliver(
             }
         }
     };
+    // CC 5.3.3.5 E1 — the claim again, on the attribution the bootstrap door
+    // may just have made; and the FIRST-CONTACT CARVE-OUT. A responder link
+    // whose initiator is still unattributed (an unowned fresh device has no
+    // attribution) completed the seal — only the responder is authenticated,
+    // and that is enough for confidentiality — and may carry ONLY the
+    // first-contact plane (`FSD/FIRST_CONTACT.md` §2.2: an `OpaqueRequest`,
+    // the device-join request among them), the same carve-out that plane has
+    // at admission. Any other frame on it is refused and the link closed. The
+    // transport control frames that MAKE a link attributable (`CANN`, `CBND`)
+    // were consumed above.
+    if claim_contradicted(ctx, link_id, candidate_key_id.as_deref()).await {
+        // choke-ok: `claim_contradicted` names the refusal through
+        // `drop_inbound` and closes the link.
+        return;
+    }
+    if candidate_key_id.is_none()
+        && ctx.seals.claimed_initiator(link_id.into_bytes()).is_some()
+        && !crate::transport::link_seal::is_first_contact_frame(&data)
+    {
+        let refusal = crate::transport::link_seal::SealRefusal::FirstContactOnly;
+        drop_inbound(Some(link_id), refusal.label(), &refusal.to_string());
+        seal_teardown(ctx, link_id, &refusal).await;
+        return;
+    }
     let link_key_id = candidate_key_id.clone();
     let source_key_id = match candidate_key_id {
         Some(key_id) => gate_attribution(ctx, link_id, key_id).await,
@@ -11066,11 +11336,22 @@ fn av_sink_drop_log() -> &'static crate::log_throttle::LogThrottle {
 /// There is no reassembly and no envelope parse here: an A/V chunk is one
 /// Channel message by construction (CIRISEdge#720 refuses a larger one at
 /// send), and the frame is opaque until the consumer opens it.
+///
+/// CC 5.3.3.5 E1 — `data` is `None` when a peer-dialled A/V link has just been
+/// KEYED (`link_keyed`): the link is handed to the consumer then, with an empty
+/// queue, so a subscriber that sends nothing after its handshake still
+/// arrives. The link's claimed initiator is held to the attributed peer here
+/// too: a frame from a link whose claim contradicts it is refused and the link
+/// closed.
+// The claim check and the keyed-link hand-off (CC 5.3.3.5 E1) took it past
+// clippy's cap; the body is one gate-then-deliver sequence and splitting it
+// would separate the gate from the delivery it guards.
+#[allow(clippy::too_many_lines)]
 async fn deliver_av_frame(
     ctx: &EventCtx<'_>,
     link_id: LinkId,
     dest: Option<DestinationHash>,
-    data: Vec<u8>,
+    data: Option<Vec<u8>>,
 ) {
     use crate::transport::av_sink::AvDelivery;
     let count = |label: &'static str| {
@@ -11088,6 +11369,11 @@ async fn deliver_av_frame(
             .get(&link_id)
             .cloned(),
     };
+    if claim_contradicted(ctx, link_id, candidate.as_deref()).await {
+        // choke-ok: `claim_contradicted` names the refusal through
+        // `drop_inbound` and closes the link.
+        return;
+    }
     let gated = match candidate {
         // CIRISEdge#621's rule holds on this plane too: a link's source is
         // never this node.
@@ -11096,19 +11382,27 @@ async fn deliver_av_frame(
         None => None,
     };
     let Some(peer) = gated else {
+        if data.is_none() {
+            // choke-ok: no frame was dropped — a keyed link whose peer is not
+            // attributable YET is handed over once its identify lands (the
+            // `LinkIdentified` arm) or its first frame passes the gate.
+            return;
+        }
         count(DROP_AV_FRAME_UNATTRIBUTED);
         let detail = format!(
             "an A/V frame ({} bytes) on link={link_id:?} dest={} whose peer did not pass the \
              #393 gate (no LinkIdentified peer and no own dial, or not Rooted∧owns_key with a \
              hybrid-bound route); not delivered to the A/V sink (CIRISEdge#805)",
-            data.len(),
+            data.as_ref().map_or(0, Vec::len),
             dest.map_or_else(|| "-".to_owned(), |d| hex::encode(d.into_bytes())),
         );
         drop_inbound(Some(link_id), DROP_AV_FRAME_UNATTRIBUTED, &detail);
         // The frame consumed a counter on the sender's side: count it, so the
         // next ADMITTED frame on this link reports the gap and the consumer's
         // hop counter skips past it once the binding recovers (Codex on #813).
-        ctx.av_sink.note_dropped_before_sink(link_id);
+        if data.is_some() {
+            ctx.av_sink.note_dropped_before_sink(link_id);
+        }
         return;
     };
     // CIRISEdge#353 / #853 — an attributed A/V frame is proof the peer is alive
@@ -11137,6 +11431,7 @@ async fn deliver_av_frame(
     let node = Arc::clone(ctx.av_node);
     let metrics = ctx.metrics.cloned();
     let outbound_liveness = ctx.link_last_outbound_at;
+    let data_len = data.as_ref().map(Vec::len);
     let delivery = ctx.av_sink.deliver(link_id, data, |inbound| {
         crate::transport::av_sink::AvArrival {
             link_id: link_id.into_bytes(),
@@ -11146,18 +11441,28 @@ async fn deliver_av_frame(
             // window by design, CIRISEdge#499) — the link stays A/V either way.
             address: address.clone(),
             inbound,
-            sender: crate::transport::realtime_av_runtime::LeviculumAvSender::new(node, link_id)
-                .with_metrics(metrics)
-                // CIRISEdge#863 item 6 — this side may only ever SEND on an
-                // arrived link (a relay forwarding to a subscriber that
-                // dialled it): its sends are its liveness for the reaper.
-                .with_outbound_liveness(Arc::clone(outbound_liveness)),
+            sender: crate::transport::realtime_av_runtime::LeviculumAvSender::new(
+                node,
+                link_id,
+                Arc::clone(ctx.seals),
+            )
+            .with_metrics(metrics)
+            // CIRISEdge#863 item 6 — this side may only ever SEND on an
+            // arrived link (a relay forwarding to a subscriber that
+            // dialled it): its sends are its liveness for the reaper.
+            .with_outbound_liveness(Arc::clone(outbound_liveness)),
         }
     });
     match delivery {
-        AvDelivery::Queued => count(crate::observability::AV_INBOUND_DELIVERED),
+        AvDelivery::Queued => {
+            if data_len.is_some() {
+                count(crate::observability::AV_INBOUND_DELIVERED);
+            }
+        }
         AvDelivery::Arrived => {
-            count(crate::observability::AV_INBOUND_DELIVERED);
+            if data_len.is_some() {
+                count(crate::observability::AV_INBOUND_DELIVERED);
+            }
             count(crate::observability::AV_LINK_ARRIVED);
             tracing::info!(
                 link = ?link_id,
@@ -11220,6 +11525,166 @@ fn select_reply_link(
         .map(|(id, _, _)| id)
 }
 
+/// CC 5.3.3.5 E1 — record a link a PEER dialled as awaiting its handshake
+/// (once), and start its budget: no complete handshake within
+/// [`HANDSHAKE_BUDGET`](crate::transport::av_transit_handshake::HANDSHAKE_BUDGET)
+/// is a named refusal (`link_seal_refused_timeout`) and the link is closed.
+/// Called at `LinkEstablished` and again at a link's first frame, because a
+/// full control plane can drop the establishment event (#853).
+fn note_responder_link(ctx: &EventCtx<'_>, link_id: LinkId, we_dialled: bool) {
+    if we_dialled || !ctx.seals.begin_responder(link_id.into_bytes()) {
+        return;
+    }
+    let node = Arc::clone(ctx.av_node);
+    let seals = Arc::clone(ctx.seals);
+    let metrics = ctx.metrics.cloned();
+    tokio::spawn(async move {
+        use crate::transport::av_transit_handshake::{AvHandshakeError, HANDSHAKE_BUDGET};
+        tokio::time::sleep(HANDSHAKE_BUDGET).await;
+        if seals.expire(link_id.into_bytes()) {
+            let _ = seal_refused(
+                metrics.as_ref(),
+                "-",
+                Some(link_id),
+                &crate::transport::link_seal::SealRefusal::Handshake(AvHandshakeError::Timeout(
+                    HANDSHAKE_BUDGET,
+                )),
+                "accept",
+            );
+            let _ = node.close_link(&link_id).await;
+        }
+    });
+}
+
+/// CC 5.3.3.5 E1 — THE CLAIM: on a link this node RESPONDED on, the
+/// handshake's initiator id is a claim the KEX does not prove, so the link's
+/// attribution (`proven`, when there is one) must be that id. A contradiction
+/// refuses and closes the link; `true` means the caller must stop.
+async fn claim_contradicted(ctx: &EventCtx<'_>, link_id: LinkId, proven: Option<&str>) -> bool {
+    let (Some(proven), Some(claimed)) = (proven, ctx.seals.claimed_initiator(link_id.into_bytes()))
+    else {
+        return false;
+    };
+    let Err(e) = crate::transport::av_transit_handshake::check_claim(&claimed, proven) else {
+        return false;
+    };
+    let refusal = crate::transport::link_seal::SealRefusal::Handshake(e);
+    drop_inbound(Some(link_id), refusal.label(), &refusal.to_string());
+    seal_teardown(ctx, link_id, &refusal).await;
+    true
+}
+
+/// CC 5.3.3.5 E1 — refuse a link from the event loop: counted and logged by
+/// name, marked refused (nothing more is sealed or opened on it), closed.
+async fn seal_teardown(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    refusal: &crate::transport::link_seal::SealRefusal,
+) {
+    let peer = ctx
+        .link_to_peer_key_id
+        .lock()
+        .await
+        .get(&link_id)
+        .cloned()
+        .unwrap_or_else(|| "-".to_owned());
+    let _ = seal_refused(ctx.metrics, &peer, Some(link_id), refusal, "receive");
+    ctx.seals.refuse(link_id.into_bytes());
+    let _ = ctx.node.close_link(&link_id).await;
+}
+
+/// CC 5.3.3.5 E1 — **every frame a link delivers passes here first.** A
+/// Channel message on a link still awaiting its handshake feeds the handshake
+/// (and completing it keys the link, [`link_keyed`]); a sealed frame on a
+/// keyed link is opened. `Some` is the plaintext to route; `None` means
+/// nothing is delivered, and every reason is counted and named (a refusal
+/// closes the link, a replay is dropped, a handshake part is buffered).
+async fn seal_inbound(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    lane: crate::transport::link_seal::Lane,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    use crate::transport::link_seal::{Inbound, Lane};
+    let we_dialled = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
+    note_responder_link(ctx, link_id, we_dialled);
+    let link = link_id.into_bytes();
+    let outcome = if lane == Lane::Channel {
+        ctx.seals.inbound(link, lane, data, we_dialled)
+    } else {
+        ctx.seals.open(link, lane, data)
+    };
+    match outcome {
+        Inbound::Open(plain) => Some(plain),
+        Inbound::Pending | Inbound::Closed => None,
+        Inbound::Keyed { claimed } => {
+            link_keyed(ctx, link_id, claimed).await;
+            None
+        }
+        Inbound::Drop(label) => {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_seal(label);
+            }
+            drop_inbound(
+                Some(link_id),
+                label,
+                "a sealed frame whose counter was already seen or is outside the replay \
+                 window; dropped, the link kept (CC 5.3.3.5 E1)",
+            );
+            None
+        }
+        Inbound::Refuse(r) => {
+            seal_teardown(ctx, link_id, &r).await;
+            None
+        }
+    }
+}
+
+/// CC 5.3.3.5 E1 — a peer-dialled link's handshake was answered: the link is
+/// sealed, and only now does this node say anything on it. A claim that
+/// already contradicts the link's attribution is refused here; otherwise the
+/// claim is held to the attribution of every frame that follows
+/// (`attribute_and_deliver`, `deliver_av_frame`). On an identity link the
+/// responder's own announce and build bundle go out (sealed) — what used to
+/// ride the link-up in the clear. On an A/V link the link is handed to the
+/// A/V consumer now, so a subscriber that sends nothing after its handshake
+/// still arrives.
+async fn link_keyed(ctx: &EventCtx<'_>, link_id: LinkId, claimed: String) {
+    use crate::transport::av_transit_handshake::check_claim;
+    use crate::transport::link_seal::SealRefusal;
+    let attributed = ctx.link_to_peer_key_id.lock().await.get(&link_id).cloned();
+    if let Some(proven) = attributed {
+        if let Err(e) = check_claim(&claimed, &proven) {
+            seal_teardown(ctx, link_id, &SealRefusal::Handshake(e)).await;
+            return;
+        }
+    }
+    if let Some(m) = ctx.metrics {
+        m.inc_link_seal(crate::observability::LINK_SEAL_ACCEPTED);
+    }
+    tracing::debug!(
+        link = ?link_id,
+        claimed = %claimed,
+        "link keyed: the dialler's transit KEX was answered (CC 5.3.3.5 E1)"
+    );
+    let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
+    match plane {
+        LinkPlane::Identity => {
+            // CIRISEdge#436/#627 — responder side: our announce rides the
+            // peer's link back to it, FIRST, then the bundle. Not on a scoped
+            // link: those are identity-plane control frames (#728).
+            if let Some(frame) = ctx.own_announce_frame {
+                push_own_announce_frame(ctx.node, ctx.seals, frame, &link_id).await;
+            }
+            if let Some(own) = ctx.own_bundle {
+                push_own_bundle_frames(ctx.node, ctx.seals, own, &link_id).await;
+            }
+        }
+        LinkPlane::Av => deliver_av_frame(ctx, link_id, dest, None).await,
+        LinkPlane::Scoped => {}
+    }
+}
+
 #[allow(clippy::too_many_lines)] // one exhaustive NodeEvent dispatch match; splitting it hurts readability
 async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
     match event {
@@ -11269,6 +11734,9 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     m.responder_link_up_begin(link_id.into_bytes());
                 }
             }
+            // CC 5.3.3.5 E1 — a link a peer dialled delivers and sends nothing
+            // until its handshake completes, within the budget armed here.
+            note_responder_link(ctx, link_id, is_initiator);
             // CIRISEdge#728 — classify the link's PLANE from the destination
             // leviculum names on the event (the dialled dest, on both ends:
             // `link_management.rs:1173/1418` at v0.27.0+ciris.1). The dial
@@ -11321,31 +11789,10 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     "link established",
                 ));
             }
-            // CIRISEdge#436 — serve our own build-attestation bundle on
-            // link-up, RESPONDER side only (a link the peer dialed to us: the
-            // peer attributes our frames via its own dialed-dest record, so no
-            // ordering hazard). For links WE dialed the push happens on the
-            // dial paths right after `identify_link`, so the bundle frame can
-            // never outrun the LINKIDENTIFY the receiver attributes it by.
-            //
-            // CIRISEdge#728 — NOT on a scoped link. The announce and the
-            // bundle are identity-plane control frames; a link dialled to
-            // one of our derived addresses carries scoped bodies only, and
-            // the far end refuses them there by name anyway.
-            {
-                let own_dialed = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
-                if !own_dialed && plane == LinkPlane::Identity {
-                    // CIRISEdge#627 — responder side: our announce rides the
-                    // peer's link back to it, FIRST, so the dialer binds us
-                    // without waiting for our RNS announce either.
-                    if let Some(frame) = ctx.own_announce_frame {
-                        push_own_announce_frame(ctx.node, frame, &link_id).await;
-                    }
-                    if let Some(own) = ctx.own_bundle {
-                        push_own_bundle_frames(ctx.node, own, &link_id).await;
-                    }
-                }
-            }
+            // CIRISEdge#436/#627 — the responder's own announce and bundle are
+            // served once the link is KEYED (`link_keyed`), never here: until
+            // the dialler's transit KEX completes this node sends nothing on
+            // the link (CC 5.3.3.5 E1).
         }
         NodeEvent::LinkIdentified {
             link_id,
@@ -11479,7 +11926,23 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     key_id.clone(),
                     ReachabilityEvidence::LinkUp,
                 ));
-                ctx.link_to_peer_key_id.lock().await.insert(link_id, key_id);
+                ctx.link_to_peer_key_id
+                    .lock()
+                    .await
+                    .insert(link_id, key_id.clone());
+                // CC 5.3.3.5 E1 — the link's attribution landed after its
+                // handshake did (the identify rides the control plane, the
+                // handshake the data plane): hold the claim to it now, and
+                // hand a keyed A/V link to its consumer now that it can be
+                // attributed.
+                if ctx.seals.claimed_initiator(link_id.into_bytes()).is_some()
+                    && !claim_contradicted(ctx, link_id, Some(&key_id)).await
+                {
+                    let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
+                    if plane == LinkPlane::Av {
+                        deliver_av_frame(ctx, link_id, dest, None).await;
+                    }
+                }
             }
         }
         // leviculum#25 (v0.9.3+ciris.1) — the driver DESTROYED frames because
@@ -11757,6 +12220,20 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 segments = total_segments,
                 "inbound envelope resource completed",
             );
+            // CC 5.3.3.5 E1 — the Resource carries a sealed frame; open it on
+            // the link's Resource lane before anything reads it.
+            let Some(data) = seal_inbound(
+                ctx,
+                link_id,
+                crate::transport::link_seal::Lane::Resource,
+                &data,
+            )
+            .await
+            else {
+                // choke-ok: `seal_inbound` counts and names every frame it
+                // does not deliver (a refusal also closes the link).
+                return;
+            };
             let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
             match plane.route() {
                 InboundPlaneRoute::Envelope(plane) => {
@@ -11808,6 +12285,22 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 );
                 return;
             }
+            // CC 5.3.3.5 E1 — the link's transit KEX is its first frame and
+            // every frame after it is sealed: nothing reaches a route before
+            // the seal has answered the handshake or opened the frame.
+            let Some(data) = seal_inbound(
+                ctx,
+                link_id,
+                crate::transport::link_seal::Lane::Channel,
+                &data,
+            )
+            .await
+            else {
+                // choke-ok: `seal_inbound` counts and names every frame it
+                // does not deliver (a handshake part is buffered, a refusal
+                // closes the link).
+                return;
+            };
             // CIRISEdge#805 — the link's PLANE picks the route, once, before
             // anything reads the bytes: an A/V link's frame goes to the A/V
             // sink and nowhere else; every other link's to the envelope path.
@@ -11821,7 +12314,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     );
                     attribute_and_deliver(ctx, link_id, dest, plane, data).await;
                 }
-                InboundPlaneRoute::Av => deliver_av_frame(ctx, link_id, dest, data).await,
+                InboundPlaneRoute::Av => deliver_av_frame(ctx, link_id, dest, Some(data)).await,
             }
         }
         NodeEvent::LinkClosed {
@@ -11910,11 +12403,26 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 out
             });
 
+            // CC 5.3.3.5 E1 — the request's data rides sealed on the link's
+            // Request lane; a link with no keys (a client that never ran the
+            // transit KEX) is refused and closed, and gets nothing.
+            let Some(data) = seal_inbound(
+                ctx,
+                link_id,
+                crate::transport::link_seal::Lane::Request,
+                data,
+            )
+            .await
+            else {
+                // choke-ok: `seal_inbound` counts and names every refusal.
+                return;
+            };
+
             // CIRISEdge#853 — LXMF serve activity: the inbound reaper leaves
             // this link alone for one idle bound from now.
             note_lxmf_serve_activity(ctx.lxmf_serve_links, link_id);
 
-            let result = serve.serve_get(requester, data, std::time::Instant::now());
+            let result = serve.serve_get(requester, &data, std::time::Instant::now());
 
             // The notices carry typed `WithholdReason`s and BELONG in the
             // counted ledger — but the transport holds no `EdgeMetrics`
@@ -11929,7 +12437,20 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             }
 
             if let ServeOutcome::Respond(ref bytes) = result.outcome {
-                match ctx.node.send_response(&link_id, &request_id, bytes).await {
+                // CC 5.3.3.5 E1 — the response rides sealed too.
+                let Ok(bytes) = ctx.seals.seal(
+                    link_id.into_bytes(),
+                    crate::transport::link_seal::Lane::Response,
+                    bytes,
+                ) else {
+                    drop_inbound(
+                        Some(link_id),
+                        crate::observability::LINK_SEAL_REFUSED_UNSEALED_SEND,
+                        "LXMF response not sent: the link lost its transit keys",
+                    );
+                    return;
+                };
+                match ctx.node.send_response(&link_id, &request_id, &bytes).await {
                     Ok(()) => {
                         // MEASURED CONTRACT (leviculum#55): `Ok` means HANDED
                         // TO THE LINK, not delivered. If the peer vanished
@@ -12825,7 +13346,12 @@ fn report_attribution_miss(
 /// like the bundle (`CFRG`), through the same Channel helper so it rides the
 /// same lane in the same order. A lost push is recoverable (the RNS announce
 /// still exists; the next link-up re-serves) and never silent.
-async fn push_own_announce_frame(node: &ReticulumNode, frame: &[u8], link_id: &LinkId) {
+async fn push_own_announce_frame(
+    node: &ReticulumNode,
+    seals: &crate::transport::link_seal::LinkSeals,
+    frame: &[u8],
+    link_id: &LinkId,
+) {
     let mdu = link_channel_mdu(node, link_id);
     let Some(fragments) = crate::transport::frame_fragment::fragment(frame, mdu) else {
         if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
@@ -12842,7 +13368,7 @@ async fn push_own_announce_frame(node: &ReticulumNode, frame: &[u8], link_id: &L
         }
         return;
     };
-    let outcome = send_fragments_on_channel(node, link_id, &fragments).await;
+    let outcome = send_fragments_on_channel(node, seals, link_id, &fragments).await;
     let (sent, total) = (outcome.sent, outcome.total);
     if outcome.complete() {
         tracing::debug!(link = ?link_id, bytes = frame.len(), fragments = total,
@@ -12874,6 +13400,7 @@ async fn push_own_announce_frame(node: &ReticulumNode, frame: &[u8], link_id: &L
 /// / `owner_binding_push_incomplete` under `first_contact_outcomes`.
 async fn push_own_owner_binding(
     node: &ReticulumNode,
+    seals: &crate::transport::link_seal::LinkSeals,
     source: &dyn crate::first_contact::OwnOwnerBindingSource,
     link_id: &LinkId,
     metrics: Option<&crate::observability::EdgeMetrics>,
@@ -12896,7 +13423,7 @@ async fn push_own_owner_binding(
         }
         return;
     };
-    let outcome = send_fragments_on_channel(node, link_id, &fragments).await;
+    let outcome = send_fragments_on_channel(node, seals, link_id, &fragments).await;
     if outcome.complete() {
         if let Some(m) = metrics {
             m.inc_first_contact(crate::first_contact::OWNER_BINDING_PUSHED);
@@ -12927,7 +13454,12 @@ async fn push_own_owner_binding(
     }
 }
 
-async fn push_own_bundle_frames(node: &ReticulumNode, own: &OwnBuildBundle, link_id: &LinkId) {
+async fn push_own_bundle_frames(
+    node: &ReticulumNode,
+    seals: &crate::transport::link_seal::LinkSeals,
+    own: &OwnBuildBundle,
+    link_id: &LinkId,
+) {
     let mdu = link_channel_mdu(node, link_id);
     let Some(fragments) = crate::transport::frame_fragment::fragment(&own.frame, mdu) else {
         if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
@@ -12944,7 +13476,7 @@ async fn push_own_bundle_frames(node: &ReticulumNode, own: &OwnBuildBundle, link
         }
         return;
     };
-    let outcome = send_fragments_on_channel(node, link_id, &fragments).await;
+    let outcome = send_fragments_on_channel(node, seals, link_id, &fragments).await;
     let (sent, total) = (outcome.sent, outcome.total);
     if outcome.complete() {
         tracing::debug!(
@@ -15167,13 +15699,22 @@ mod tests {
     /// hit (431) and across the range up to and past the u16 envelope ceiling.
     #[test]
     fn channel_fragments_fit_leviculums_channel_mdu_716() {
+        use crate::transport::link_seal::SEAL_OVERHEAD;
         let channel = leviculum_core::link::channel::Channel::new();
         for link_mdu in [431usize, 432, 1_000, 8_191, 65_535, 65_541, 65_542, 262_000] {
             let mdu = channel_payload_mdu(link_mdu);
             let ceiling = channel.mdu(link_mdu);
+            // CC 5.3.3.5 E1 — the plaintext budget is the Channel's less the
+            // seal, exactly: a sealed piece fits, and nothing but the seal is
+            // given up.
             assert!(
-                mdu >= ceiling,
-                "link_mdu={link_mdu}: channel_payload_mdu {mdu} must not undercut Channel::mdu {ceiling}"
+                mdu + SEAL_OVERHEAD <= ceiling,
+                "link_mdu={link_mdu}: a sealed {mdu}-byte piece overruns Channel::mdu {ceiling}"
+            );
+            assert!(
+                mdu + SEAL_OVERHEAD >= ceiling.min(usize::from(u16::MAX)),
+                "link_mdu={link_mdu}: channel_payload_mdu {mdu} gives up more than the seal \
+                 under Channel::mdu {ceiling}"
             );
             let frame: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
             let pieces =
@@ -15184,15 +15725,15 @@ mod tests {
             );
             for p in &pieces {
                 assert!(
-                    p.len() <= ceiling,
+                    p.len() + SEAL_OVERHEAD <= ceiling,
                     "link_mdu={link_mdu}: a {}-byte piece exceeds Channel::mdu {ceiling} — \
                      leviculum refuses it TooLarge, reported as link_send_error (#716)",
                     p.len()
                 );
             }
         }
-        // The field value, spelled out: 431 − 6.
-        assert_eq!(channel_payload_mdu(431), 425);
+        // The field value, spelled out: 431 − 6 − the 25-byte seal.
+        assert_eq!(channel_payload_mdu(431), 400);
     }
 
     /// CIRISEdge#530 — the announce-intake capacity bound's victim selection.
@@ -18858,18 +19399,20 @@ mod scope_native_addressing_tests {
 
     /// CIRISEdge#720 — the A/V size check and the fragmenter read one number:
     /// at the base 500-byte MTU the link MDU is 431 and one Channel message
-    /// carries 425 (the #716 six-byte margin); a jumbo link is capped at the
-    /// Channel envelope's u16 length field.
+    /// carries 425 (the #716 six-byte margin), of which 400 are plaintext under
+    /// the CC 5.3.3.5 E1 seal; a jumbo link is capped at the Channel envelope's
+    /// u16 length field, less the seal.
     #[test]
     fn the_av_channel_limit_is_the_fragmenter_mdu() {
-        assert_eq!(channel_payload_mdu(431), 425);
+        use crate::transport::link_seal::SEAL_OVERHEAD;
+        assert_eq!(channel_payload_mdu(431), 400);
         assert_eq!(
             channel_payload_mdu(431),
-            431 - leviculum_core::constants::CHANNEL_ENVELOPE_HEADER_SIZE
+            431 - leviculum_core::constants::CHANNEL_ENVELOPE_HEADER_SIZE - SEAL_OVERHEAD
         );
         assert_eq!(
-            channel_payload_mdu(262_144).min(usize::from(u16::MAX)),
-            usize::from(u16::MAX)
+            channel_payload_mdu(262_144),
+            usize::from(u16::MAX) - SEAL_OVERHEAD
         );
     }
 

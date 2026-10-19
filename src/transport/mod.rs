@@ -204,12 +204,18 @@ pub mod transit_kex_custody;
 #[cfg(feature = "_reticulum-module")]
 pub mod transit_kex_peer;
 
-/// CIRISEdge#805 (CC 5.3.3.5 E1) — the per-link hybrid transit KEX on an A/V
-/// link: the dialler initiates against the dialled node's published pair, the
-/// dialled end responds and checks the claim, and each end gets its
-/// role's seal and open keys. The only source of an A/V hop's transit key.
+/// CC 5.3.3.5 E1 — the hybrid transit KEX every RNS link runs as its first
+/// frame: the dialler initiates against the dialled node's published pair, the
+/// dialled end responds and checks the claim, and each end gets its role's
+/// seal and open keys. (Named for where it began, the A/V hop, CIRISEdge#805.)
 #[cfg(feature = "_reticulum-module")]
 pub mod av_transit_handshake;
+
+/// CC 5.3.3.5 E1 — the per-link seal: every edge frame on every RNS link,
+/// both directions and every lane, under the keys of that link's transit KEX.
+/// No classical fallback, no caller-supplied key, no compat path.
+#[cfg(feature = "_reticulum-module")]
+pub mod link_seal;
 
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
 /// edges (CIRISEdge#169). CEG-native (the Scope-B queue: byte-exact
@@ -354,16 +360,17 @@ pub enum TransportError {
         /// mismatch obvious.
         paths: String,
     },
-    /// CIRISEdge#805 (CC 5.3.3.5 E1) — an A/V link's per-hop transit key
-    /// exchange was refused: the dialled node publishes no usable transit
-    /// pair, the handshake was malformed or too large, its claimed initiator
-    /// is not the link's proven peer, or the KEX failed. The link is closed
-    /// and no key was installed; there is no fallback key.
-    #[error("A/V transit KEX refused ({reason}) for {peer}: {detail}")]
-    AvTransitRefused {
+    /// CC 5.3.3.5 E1 — a link's transit KEX or seal was refused: the dialled
+    /// node publishes no usable transit pair (the dial is never made), the
+    /// handshake was malformed, too large, of the wrong suite or never came,
+    /// its claimed initiator is not the link's attributed peer, or the KEX
+    /// failed. The link is closed and no key was installed; there is no
+    /// fallback key and nothing is sent in the clear.
+    #[error("link transit seal refused ({reason}) for {peer}: {detail}")]
+    LinkSealRefused {
         /// The peer on the other end of the link.
         peer: String,
-        /// The stable refusal name (the `av_plane` metric label).
+        /// The stable refusal name (the `link_seal` metric label).
         reason: &'static str,
         /// What happened.
         detail: String,

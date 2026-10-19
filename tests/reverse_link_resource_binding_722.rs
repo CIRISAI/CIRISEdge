@@ -385,12 +385,13 @@ fn deliver_frame(att: &Attestation) -> Vec<u8> {
 }
 
 /// TCP interfaces negotiate a 16384-byte link MTU (leviculum `TCP_HW_MTU`), so
-/// the link-Channel MDU on loopback is 16297 and eight `CFRG` fragments carry
-/// 8 × (16297 − 16) = 130 248 bytes. A frame above that skips Channel-first and
+/// the link-Channel MDU on loopback is 16297, 16272 of it plaintext under the
+/// 25-byte CC 5.3.3.5 E1 seal, and eight `CFRG` fragments carry
+/// 8 × (16272 − 16) = 130 048 bytes. A frame above that skips Channel-first and
 /// goes Resource-first — the arm this witness exists for. (At the field's
-/// 500-byte base MTU the same threshold is 8 × (425 − 16) = 3272 bytes, which
+/// 500-byte base MTU the same threshold is 8 × (400 − 16) = 3072 bytes, which
 /// every hybrid-signed row exceeds on its own.)
-const RESOURCE_FRAME_MIN: usize = 8 * (16_297 - 16);
+const RESOURCE_FRAME_MIN: usize = 8 * (16_297 - 25 - 16);
 
 /// One Deliver of eight consent rows A → peer_i — above [`RESOURCE_FRAME_MIN`],
 /// so it rides a Resource. Returns the frame and the row ids it carries.
@@ -445,9 +446,10 @@ async fn holds(dir: &SqliteBackend, attestation_id: &str) -> bool {
 }
 
 /// How many link-Channel fragments this frame cuts to at the 500-byte-MTU
-/// loopback link (link MDU 431, Channel MDU 425, `CFRG` payload 409).
+/// loopback link (link MDU 431, Channel MDU 425, 400 of it plaintext under the
+/// E1 seal, `CFRG` payload 384).
 fn fragments_at_field_mdu(frame: &[u8]) -> usize {
-    ciris_edge::transport::frame_fragment::fragment(frame, 425).map_or(0, |f| f.len())
+    ciris_edge::transport::frame_fragment::fragment(frame, 400).map_or(0, |f| f.len())
 }
 
 async fn dump(p: &Pair, label: &str) {

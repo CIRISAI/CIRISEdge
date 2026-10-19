@@ -1,0 +1,680 @@
+//! CC 5.3.3.5 E1 — **every byte edge sends over an RNS link rides under a
+//! hybrid transit seal.**
+//!
+//! Each link runs the CC 3.3.6.2 transit KEX
+//! ([`crate::transport::av_transit_handshake`], verify's
+//! `ciris_crypto::transit_kex`: X25519 + ML-KEM-768) ONCE, as its first
+//! frame, and every edge frame after it, in both directions and on every
+//! lane (Channel messages, Resources, requests and responses), is sealed
+//! under the keys it yields and bound to the link's 16-byte id. This module
+//! holds that per-link state for the Reticulum transport and is the only
+//! place a frame is sealed or opened.
+//!
+//! # Enforced at once
+//!
+//! There is no advisory mode, no flag and no compat path: a peer that does
+//! not run the seal gets nothing.
+//!
+//! - **Dialler (initiator).** Resolves the dialled node's pair (Rooted only)
+//!   BEFORE dialling; no pair means no dial. Once the link is up it sends
+//!   the handshake as the first frame ([`LinkSeals::initiate`]) and installs
+//!   its keys only after the last part is out
+//!   ([`LinkSeals::install_initiator`]); [`LinkSeals::seal`] refuses every
+//!   send before that. A frame that arrives before its own handshake went
+//!   out is refused ([`SealRefusal::FrameBeforeKeys`]): the responder may not
+//!   speak first.
+//! - **Responder.** A link a peer dialled is [`LinkSeals::begin_responder`]
+//!   at establishment (or at its first frame, when the establishment event
+//!   was lost). Until a valid handshake completes it delivers NOTHING upward
+//!   and the seal refuses every send. A non-`CTKX` first frame, a missing
+//!   handshake (budget expiry, [`LinkSeals::expire`]), an oversize
+//!   declaration, a bad or classical-only suite, and a failed respond are
+//!   each a named refusal ([`SealRefusal::label`]), after which the link is
+//!   closed. There is never a plaintext edge frame in either direction.
+//!
+//! # The claim and the first-contact carve-out
+//!
+//! The KEX authenticates only the responder; the handshake's initiator id is
+//! a claim ([`LinkSeals::claimed_initiator`]). The transport holds it to the
+//! link's attributed peer on every inbound frame. A link whose initiator is
+//! UNATTRIBUTED (an unowned fresh device has no attribution) may still
+//! complete the seal, and may then carry only the first-contact plane
+//! ([`is_first_contact_frame`]); any other frame on it is refused
+//! ([`SealRefusal::FirstContactOnly`]). Confidentiality holds either way:
+//! only the authenticated responder can derive the keys.
+//!
+//! # The seal
+//!
+//! ```text
+//! frame = version(1) ‖ counter u64_be ‖ AES-256-GCM(k_dir, nonce, aad, plaintext) ‖ tag(16)
+//! k_dir = HKDF-SHA256(ikm = transit key for this direction, salt = link_id,
+//!                     info = "CIRIS-E1-LINK-SEAL-V1")
+//! nonce = lane(1) ‖ 0x000000 ‖ counter u64_be
+//! aad   = version ‖ lane ‖ link_id
+//! ```
+//!
+//! Each direction has its own key, each lane its own counter that only ever
+//! increases, and the lane is in the nonce, so a `(key, nonce)` pair never
+//! repeats. The key is derived under a label of its own, so it is never the
+//! raw transit key A/V's outer seal uses (`realtime_av::seal_av_outer`), and
+//! the two layers never share a `(key, nonce)` either. The receiver keeps a
+//! replay window per lane ([`REPLAY_WINDOW`]); a counter already seen, or
+//! older than the window, is dropped by name.
+//!
+//! **A frame that fails to open closes the link.** The Channel under it is
+//! reliable and sequenced and RNS already authenticates the link, so a frame
+//! that fails its tag is not loss: it is a peer keyed differently from us (a
+//! stale `link_id`, leviculum#86 / CIRISEdge#867, where every later frame
+//! would fail the same way) or bytes that were never the peer's. Neither
+//! leaves a link worth keeping; closing it makes the dialler re-dial, which
+//! is a new link, a new id and a fresh KEX. A replayed or out-of-window
+//! counter on a frame that DID open is only dropped: it carries a valid tag,
+//! so the peer holds the keys, and a window overrun under reordering is not
+//! an attack worth a teardown.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use ciris_crypto::transit_kex::TransitRole;
+use ciris_persist::federation::self_at_login::TransitKexPair;
+use zeroize::Zeroizing;
+
+use crate::transport::av_transit_handshake::{self, AvHandshakeError, LinkTransit, Reassembler};
+use crate::transport::transit_kex_custody::TransitKexSecret;
+use crate::transport::transit_kex_peer::PeerTransitResolver;
+use crate::verify::RootingDirectory;
+
+/// The seal's framing version.
+pub const SEAL_VERSION: u8 = 0x01;
+
+/// Bytes of header on a sealed frame (version, counter).
+pub const SEAL_HEADER_LEN: usize = 1 + 8;
+
+/// The AEAD tag.
+pub const SEAL_TAG_LEN: usize = 16;
+
+/// What the seal adds to every frame. Every place that sizes a Channel
+/// message leaves room for it (`reticulum::channel_payload_mdu`), so a sealed
+/// frame never exceeds the link's Channel limit.
+pub const SEAL_OVERHEAD: usize = SEAL_HEADER_LEN + SEAL_TAG_LEN;
+
+/// How far behind the highest counter seen on a lane a frame may still be
+/// accepted (once).
+pub const REPLAY_WINDOW: u64 = 128;
+
+/// HKDF info for the per-direction seal key.
+const SEAL_KEY_INFO: &[u8] = b"CIRIS-E1-LINK-SEAL-V1";
+
+/// Bound on the test wire tap (frames kept).
+const TAP_CAP: usize = 4096;
+
+/// The test wire tap: `(link, frame as sent)`, oldest first.
+type WireTap = Vec<([u8; 16], Vec<u8>)>;
+
+/// Which of a link's carriers a frame rides. Each has its own counter and
+/// replay window, because they are not ordered with each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    /// A Channel message (`LinkHandle::send` / `try_send`).
+    Channel = 1,
+    /// A Resource transfer.
+    Resource = 2,
+    /// A link request's data.
+    Request = 3,
+    /// A link response's data.
+    Response = 4,
+}
+
+impl Lane {
+    const fn index(self) -> usize {
+        self as usize - 1
+    }
+}
+
+/// Why a frame or a link was refused at the seal. Every variant is named and
+/// counted under [`Self::label`].
+#[derive(Debug, thiserror::Error)]
+pub enum SealRefusal {
+    /// The handshake was refused (framing, suite, KEX, claim, budget).
+    #[error(transparent)]
+    Handshake(AvHandshakeError),
+    /// A frame arrived on a link this node dialled before its own handshake
+    /// had gone out.
+    #[error("a frame arrived on a link this node dialled before its handshake went out")]
+    FrameBeforeKeys,
+    /// A sealed frame did not open.
+    #[error(
+        "a sealed frame failed to open on this link (wrong key or link, tampered, or truncated)"
+    )]
+    OpenFailed,
+    /// A send on a link with no keys.
+    #[error("the link has no transit keys; nothing is sent in the clear (CC 5.3.3.5 E1)")]
+    Unsealed,
+    /// A non-first-contact frame on a link whose initiator is unattributed.
+    #[error(
+        "the link's initiator is unattributed; only first contact may ride it \
+         (CC 5.3.3.5 E1 carve-out)"
+    )]
+    FirstContactOnly,
+}
+
+impl SealRefusal {
+    /// The `link_seal` metric label.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        use crate::observability as o;
+        match self {
+            Self::Handshake(e) => e.label(),
+            Self::FrameBeforeKeys => o::LINK_SEAL_REFUSED_FRAME_BEFORE_KEYS,
+            Self::OpenFailed => o::LINK_SEAL_REFUSED_OPEN_FAILED,
+            Self::Unsealed => o::LINK_SEAL_REFUSED_UNSEALED_SEND,
+            Self::FirstContactOnly => o::LINK_SEAL_REFUSED_FIRST_CONTACT_ONLY,
+        }
+    }
+}
+
+/// What [`LinkSeals::inbound`] made of one received frame.
+#[derive(Debug)]
+pub enum Inbound {
+    /// A handshake part, buffered. Nothing to deliver.
+    Pending,
+    /// The handshake completed and was answered: the link is sealed from now
+    /// on. `claimed` is the initiator the handshake names (a claim the
+    /// caller holds to the link's attribution). Nothing to deliver.
+    Keyed {
+        /// The handshake's `initiator_key_id`.
+        claimed: String,
+    },
+    /// A sealed frame, opened.
+    Open(Vec<u8>),
+    /// Dropped by name; the link stays.
+    Drop(&'static str),
+    /// Refused by name; the caller closes the link.
+    Refuse(SealRefusal),
+    /// The link was already refused and is closing: dropped without a
+    /// second count.
+    Closed,
+}
+
+/// Highest counter seen plus a bitmap of the [`REPLAY_WINDOW`] below it.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReplayWindow {
+    highest: Option<u64>,
+    /// Bit `i` set ⇔ `highest - i` was accepted.
+    seen: u128,
+}
+
+impl ReplayWindow {
+    /// Accept `c` once, or refuse it.
+    fn accept(&mut self, c: u64) -> bool {
+        let Some(h) = self.highest else {
+            self.highest = Some(c);
+            self.seen = 1;
+            return true;
+        };
+        if c > h {
+            let shift = c - h;
+            self.seen = if shift >= REPLAY_WINDOW {
+                0
+            } else {
+                self.seen << shift
+            };
+            self.seen |= 1;
+            self.highest = Some(c);
+            return true;
+        }
+        let back = h - c;
+        if back >= REPLAY_WINDOW {
+            return false;
+        }
+        let bit = 1u128 << back;
+        if self.seen & bit != 0 {
+            return false;
+        }
+        self.seen |= bit;
+        true
+    }
+}
+
+/// One sealed link's keys and counters.
+pub struct SealedLink {
+    link_id: [u8; 16],
+    transit: LinkTransit,
+    seal_key: Zeroizing<[u8; 32]>,
+    open_key: Zeroizing<[u8; 32]>,
+    next: [AtomicU64; 4],
+    windows: Mutex<[ReplayWindow; 4]>,
+    /// The handshake's claimed initiator, on a link this node RESPONDED on.
+    claimed_initiator: Option<String>,
+}
+
+impl std::fmt::Debug for SealedLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedLink")
+            .field("link_id", &hex::encode(self.link_id))
+            .field("role", &self.transit.role())
+            .field("claimed_initiator", &self.claimed_initiator)
+            .finish_non_exhaustive()
+    }
+}
+
+fn derive_seal_key(transit_key: &[u8; 32], link_id: &[u8; 16]) -> Zeroizing<[u8; 32]> {
+    let okm = Zeroizing::new(
+        ciris_crypto::kdf::hkdf_sha256(transit_key, link_id, SEAL_KEY_INFO, 32)
+            .expect("HKDF-SHA256 expands 32 bytes"),
+    );
+    let mut k = Zeroizing::new([0u8; 32]);
+    k.copy_from_slice(&okm);
+    k
+}
+
+fn nonce(lane: Lane, counter: u64) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n[0] = lane as u8;
+    n[4..].copy_from_slice(&counter.to_be_bytes());
+    n
+}
+
+fn aad(lane: Lane, link_id: &[u8; 16]) -> [u8; 18] {
+    let mut a = [0u8; 18];
+    a[0] = SEAL_VERSION;
+    a[1] = lane as u8;
+    a[2..].copy_from_slice(link_id);
+    a
+}
+
+impl SealedLink {
+    fn new(link_id: [u8; 16], transit: LinkTransit, claimed_initiator: Option<String>) -> Self {
+        Self {
+            link_id,
+            seal_key: derive_seal_key(&transit.seal_key(), &link_id),
+            open_key: derive_seal_key(&transit.open_key(), &link_id),
+            transit,
+            next: Default::default(),
+            windows: Mutex::new([ReplayWindow::default(); 4]),
+            claimed_initiator,
+        }
+    }
+
+    /// Seal one frame on `lane`.
+    fn seal(&self, lane: Lane, plaintext: &[u8]) -> Vec<u8> {
+        let counter = self.next[lane.index()].fetch_add(1, Ordering::Relaxed);
+        let ct = ciris_crypto::aes_gcm::encrypt_aad(
+            &self.seal_key,
+            &nonce(lane, counter),
+            &aad(lane, &self.link_id),
+            plaintext,
+        )
+        .expect("AES-256-GCM seals any input under a 32-byte key");
+        let mut out = Vec::with_capacity(SEAL_HEADER_LEN + ct.len());
+        out.push(SEAL_VERSION);
+        out.extend_from_slice(&counter.to_be_bytes());
+        out.extend_from_slice(&ct);
+        out
+    }
+
+    /// Open one frame received on `lane`.
+    fn open(&self, lane: Lane, frame: &[u8]) -> Inbound {
+        if frame.len() < SEAL_OVERHEAD || frame[0] != SEAL_VERSION {
+            return Inbound::Refuse(SealRefusal::OpenFailed);
+        }
+        let mut be = [0u8; 8];
+        be.copy_from_slice(&frame[1..SEAL_HEADER_LEN]);
+        let counter = u64::from_be_bytes(be);
+        let Ok(plain) = ciris_crypto::aes_gcm::decrypt_aad(
+            &self.open_key,
+            &nonce(lane, counter),
+            &aad(lane, &self.link_id),
+            &frame[SEAL_HEADER_LEN..],
+        ) else {
+            return Inbound::Refuse(SealRefusal::OpenFailed);
+        };
+        // The window moves only for a frame that opened, so forged counters
+        // cannot push real frames out of it.
+        let fresh = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[lane.index()]
+        .accept(counter);
+        if fresh {
+            Inbound::Open(plain)
+        } else {
+            Inbound::Drop(crate::observability::LINK_SEAL_DROPPED_REPLAY)
+        }
+    }
+}
+
+enum State {
+    /// This node dialled; its handshake has not gone out yet.
+    Initiating,
+    /// A peer dialled; its handshake has not completed.
+    Awaiting(Reassembler),
+    /// Keys installed.
+    Sealed(Arc<SealedLink>),
+    /// Refused; the link is closing. Kept so a frame still in flight is not
+    /// counted again or taken for a new link.
+    Refused,
+}
+
+/// The Reticulum transport's per-link seal table. See the module docs.
+pub struct LinkSeals {
+    links: Mutex<HashMap<[u8; 16], State>>,
+    secret: TransitKexSecret,
+    local_key_id: String,
+    resolver: PeerTransitResolver,
+    /// Test seam: every frame handed to leviculum on any link, as sent.
+    tap: Mutex<Option<WireTap>>,
+}
+
+impl std::fmt::Debug for LinkSeals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkSeals")
+            .field("local_key_id", &self.local_key_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LinkSeals {
+    /// A table keyed by this node's static transit keys, answering
+    /// handshakes as `local_key_id` (the occurrence key id it is dialled
+    /// by).
+    #[must_use]
+    pub fn new(secret: TransitKexSecret, local_key_id: impl Into<String>) -> Self {
+        Self {
+            links: Mutex::new(HashMap::new()),
+            secret,
+            local_key_id: local_key_id.into(),
+            resolver: PeerTransitResolver::new(),
+            tap: Mutex::new(None),
+        }
+    }
+
+    fn links(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], State>> {
+        self.links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// This node's static transit keys (the pair it publishes).
+    #[must_use]
+    pub fn secret(&self) -> &TransitKexSecret {
+        &self.secret
+    }
+
+    /// The dialled node's transit pair (Rooted only), read BEFORE the dial:
+    /// a node that publishes none cannot be keyed, so it is never dialled.
+    ///
+    /// # Errors
+    /// [`AvHandshakeError::PairLookup`] (no directory, or a directory fault)
+    /// or [`AvHandshakeError::NoTransitPair`].
+    pub async fn resolve_pair(
+        &self,
+        rooting: Option<&dyn RootingDirectory>,
+        peer: &str,
+    ) -> Result<TransitKexPair, AvHandshakeError> {
+        let Some(rooting) = rooting else {
+            return Err(AvHandshakeError::PairLookup {
+                peer: peer.to_owned(),
+                detail: "no rooting directory is wired".to_owned(),
+            });
+        };
+        self.resolver
+            .resolve(rooting, peer)
+            .await
+            .map_err(|detail| AvHandshakeError::PairLookup {
+                peer: peer.to_owned(),
+                detail,
+            })?
+            .ok_or_else(|| AvHandshakeError::NoTransitPair {
+                peer: peer.to_owned(),
+            })
+    }
+
+    /// Record a link this node dialled, before it can establish: no frame on
+    /// it is delivered, and nothing is sent on it, until
+    /// [`Self::install_initiator`].
+    pub fn begin_initiator(&self, link: [u8; 16]) {
+        self.links().insert(link, State::Initiating);
+    }
+
+    /// Build the dialler's handshake for `link` against `pair`, claiming
+    /// `claimed_initiator` (this node's occurrence key id outside tests),
+    /// cut to `frame_limit`. Keys are returned, not installed: install them
+    /// once every frame is out.
+    ///
+    /// # Errors
+    /// The construction's refusal.
+    pub fn initiate(
+        &self,
+        link: [u8; 16],
+        claimed_initiator: &str,
+        peer: &str,
+        pair: &TransitKexPair,
+        frame_limit: usize,
+    ) -> Result<(Vec<Vec<u8>>, LinkTransit), AvHandshakeError> {
+        av_transit_handshake::initiate(&link, claimed_initiator, peer, pair, frame_limit)
+    }
+
+    /// Install the dialler's keys: the link is sealed from now on.
+    pub fn install_initiator(&self, link: [u8; 16], transit: LinkTransit) {
+        self.links().insert(
+            link,
+            State::Sealed(Arc::new(SealedLink::new(link, transit, None))),
+        );
+    }
+
+    /// Record a link a peer dialled, awaiting its handshake. `true` only when
+    /// the link was not known before (the caller then starts its budget).
+    pub fn begin_responder(&self, link: [u8; 16]) -> bool {
+        let mut links = self.links();
+        if links.contains_key(&link) {
+            return false;
+        }
+        links.insert(link, State::Awaiting(Reassembler::new()));
+        true
+    }
+
+    /// One frame received on `link` over `lane`. `we_dialled` is whether
+    /// this node opened the link (its connect-time record).
+    pub fn inbound(&self, link: [u8; 16], lane: Lane, bytes: &[u8], we_dialled: bool) -> Inbound {
+        let mut links = self.links();
+        let state = match links.get_mut(&link) {
+            Some(s) => s,
+            None if we_dialled => {
+                links.insert(link, State::Refused);
+                return Inbound::Refuse(SealRefusal::FrameBeforeKeys);
+            }
+            None => links
+                .entry(link)
+                .or_insert_with(|| State::Awaiting(Reassembler::new())),
+        };
+        match state {
+            State::Refused => Inbound::Closed,
+            State::Initiating => {
+                *state = State::Refused;
+                Inbound::Refuse(SealRefusal::FrameBeforeKeys)
+            }
+            State::Sealed(sealed) => {
+                let sealed = Arc::clone(sealed);
+                drop(links);
+                let out = sealed.open(lane, bytes);
+                if matches!(out, Inbound::Refuse(_)) {
+                    self.refuse(link);
+                }
+                out
+            }
+            State::Awaiting(reasm) => {
+                // The handshake rides the Channel; anything else first is
+                // not a handshake.
+                let pushed = if lane == Lane::Channel {
+                    reasm.push(bytes)
+                } else {
+                    Err(AvHandshakeError::NotAHandshake)
+                };
+                let answered = match pushed {
+                    Ok(None) => return Inbound::Pending,
+                    Ok(Some(hs)) => {
+                        av_transit_handshake::respond(&hs, &link, &self.local_key_id, &self.secret)
+                    }
+                    Err(e) => Err(e),
+                };
+                match answered {
+                    Ok((transit, claimed)) => {
+                        *state = State::Sealed(Arc::new(SealedLink::new(
+                            link,
+                            transit,
+                            Some(claimed.clone()),
+                        )));
+                        Inbound::Keyed { claimed }
+                    }
+                    Err(e) => {
+                        *state = State::Refused;
+                        Inbound::Refuse(SealRefusal::Handshake(e))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Seal one frame for `link` on `lane`.
+    ///
+    /// # Errors
+    /// [`SealRefusal::Unsealed`] when the link has no keys (not keyed yet,
+    /// refused, or unknown): nothing is ever sent in the clear.
+    pub fn seal(
+        &self,
+        link: [u8; 16],
+        lane: Lane,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, SealRefusal> {
+        let sealed = match self.links().get(&link) {
+            Some(State::Sealed(s)) => Arc::clone(s),
+            _ => return Err(SealRefusal::Unsealed),
+        };
+        let frame = sealed.seal(lane, plaintext);
+        self.tap_frame(link, &frame);
+        Ok(frame)
+    }
+
+    /// Open one sealed frame received on `link` outside the Channel (a
+    /// Resource, a request, a response): there is no handshake on those
+    /// lanes, so a link with no keys is refused.
+    pub fn open(&self, link: [u8; 16], lane: Lane, frame: &[u8]) -> Inbound {
+        let sealed = match self.links().get(&link) {
+            Some(State::Sealed(s)) => Arc::clone(s),
+            Some(State::Refused) => return Inbound::Closed,
+            _ => {
+                self.refuse(link);
+                return Inbound::Refuse(SealRefusal::Unsealed);
+            }
+        };
+        let out = sealed.open(lane, frame);
+        if matches!(out, Inbound::Refuse(_)) {
+            self.refuse(link);
+        }
+        out
+    }
+
+    /// The link's transit keys (A/V's outer seal uses them) and, on a link
+    /// this node responded on, the handshake's claimed initiator.
+    #[must_use]
+    pub fn transit(&self, link: [u8; 16]) -> Option<(LinkTransit, Option<String>)> {
+        match self.links().get(&link) {
+            Some(State::Sealed(s)) => Some((s.transit.clone(), s.claimed_initiator.clone())),
+            _ => None,
+        }
+    }
+
+    /// The claimed initiator of a link this node RESPONDED on; `None` on a
+    /// link it dialled (the KEX authenticated that peer) or one not sealed.
+    #[must_use]
+    pub fn claimed_initiator(&self, link: [u8; 16]) -> Option<String> {
+        match self.links().get(&link) {
+            Some(State::Sealed(s)) if s.transit.role() == TransitRole::Responder => {
+                s.claimed_initiator.clone()
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `link` carries keys.
+    #[must_use]
+    pub fn is_sealed(&self, link: [u8; 16]) -> bool {
+        matches!(self.links().get(&link), Some(State::Sealed(_)))
+    }
+
+    /// The responder's budget ran out: `true` (and the link marked refused)
+    /// when it was still awaiting its handshake.
+    pub fn expire(&self, link: [u8; 16]) -> bool {
+        let mut links = self.links();
+        match links.get_mut(&link) {
+            Some(s @ State::Awaiting(_)) => {
+                *s = State::Refused;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Mark `link` refused: nothing more is sealed for it or opened on it.
+    pub fn refuse(&self, link: [u8; 16]) {
+        self.links().insert(link, State::Refused);
+    }
+
+    /// Forget a closed link.
+    pub fn forget(&self, link: &[u8; 16]) {
+        self.links().remove(link);
+    }
+
+    /// Test seam: start (or stop and clear) recording every frame handed to
+    /// leviculum.
+    pub fn set_tap(&self, on: bool) {
+        *self
+            .tap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = on.then(Vec::new);
+    }
+
+    /// Test seam: the recorded frames, oldest first.
+    #[must_use]
+    pub fn tapped(&self) -> WireTap {
+        self.tap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Record one frame as sent (sealed frames and handshake parts).
+    pub fn tap_frame(&self, link: [u8; 16], frame: &[u8]) {
+        let mut tap = self
+            .tap
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(t) = tap.as_mut() {
+            if t.len() < TAP_CAP {
+                t.push((link, frame.to_vec()));
+            }
+        }
+    }
+}
+
+/// The first-contact plane (`FSD/FIRST_CONTACT.md` §2.2): an
+/// `OpaqueRequest` envelope, which is how an unowned device asks to join
+/// (the server's device-join kind `0x0000_0002`) or makes any other first
+/// contact. The only frame class an unattributed initiator's sealed link may
+/// carry.
+#[must_use]
+pub fn is_first_contact_frame(bytes: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        message_type: crate::messages::MessageType,
+    }
+    serde_json::from_slice::<Peek>(bytes)
+        .is_ok_and(|p| p.message_type == crate::messages::MessageType::OpaqueRequest)
+}
+
+#[cfg(test)]
+#[path = "link_seal/tests.rs"]
+mod tests;

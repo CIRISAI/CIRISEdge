@@ -766,14 +766,21 @@ async fn av_chunks_ride_the_replicating_node_805() {
             .any(|(id, plane, dialed)| *id == av_link_id && *plane == LinkPlane::Av && *dialed),
         "A's link is on the A/V plane: {a_planes:?}"
     );
-    // CIRISEdge#805 — the dial sent A's transit KEX handshake as the link's
-    // first message(s); everything A sends after it is media.
-    let handshake_frames = av(&p.a.metrics, "av_sent");
-    assert!(handshake_frames >= 1, "the handshake rode the link first");
-    assert_eq!(av(&p.a.metrics, "av_transit_kex_initiated"), 1);
-    // B's consumer receives the link on the handshake and answers it: the
-    // hop's keys come from the KEX, A sealing (initiator) what B opens
-    // (responder). The outer nonce binds the RNS link id, as the KEX does.
+    // CIRISEdge#805 / CC 5.3.3.5 E1 — the dial sent A's transit KEX handshake
+    // as the link's first message(s); everything A sends after it is sealed.
+    assert!(
+        p.a.metrics
+            .link_seal()
+            .get("link_seal_initiated")
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "A keyed the link it dialled"
+    );
+    // B answered the handshake at the link layer and handed the keyed link to
+    // its consumer: the hop's keys come from the link's KEX, A sealing
+    // (initiator) what B opens (responder). The outer nonce binds the RNS link
+    // id, as the KEX does.
     let Ok(arrival) = tokio::time::timeout(Duration::from_secs(20), arrivals.recv()).await else {
         panic!(
             "the A/V link never arrived at B's A/V consumer; av_plane={:?}",
@@ -795,7 +802,14 @@ async fn av_chunks_ride_the_replicating_node_805() {
             .accept_av_arrival(arrival)
             .await
             .expect("B answers A's transit KEX");
-    assert_eq!(av(&p.b.metrics, "av_transit_kex_accepted"), 1);
+    assert!(
+        p.b.metrics
+            .link_seal()
+            .get("link_seal_accepted")
+            .copied()
+            .unwrap_or(0)
+            >= 1
+    );
     let hop_link_id = av_link_id.to_vec();
     call.spine
         .attach_downstream(AvSubscriberLink {
@@ -951,8 +965,10 @@ async fn av_chunks_ride_the_replicating_node_805() {
 
     // The A/V sink delivered exactly what rode the A/V link: CHUNKS + 1
     // chunks and the one forced frame — no replication frame from the
-    // identity link, nothing dropped.
-    let sent_on_av = u64::try_from(sent.len()).expect("small") + 1 + handshake_frames;
+    // identity link, nothing dropped. (The link's transit KEX handshake is
+    // consumed by the link layer before the A/V plane sees a frame, CC 5.3.3.5
+    // E1, so it is in neither count.)
+    let sent_on_av = u64::try_from(sent.len()).expect("small") + 1;
     assert_eq!(
         av(&p.b.metrics, "av_inbound_delivered"),
         sent_on_av,
@@ -986,7 +1002,7 @@ async fn av_chunks_ride_the_replicating_node_805() {
     }
     assert_eq!(
         av(&p.a.metrics, "av_sent"),
-        u64::try_from(sent.len()).expect("small") + handshake_frames,
+        u64::try_from(sent.len()).expect("small"),
         "A's sends: {:?}",
         p.a.metrics.av_plane()
     );
@@ -1005,7 +1021,7 @@ async fn av_chunks_ride_the_replicating_node_805() {
     let a_prod = p.edge_a.metrics().snapshot().av_plane;
     assert_eq!(
         a_prod.get("av_sent").copied(),
-        Some(u64::try_from(sent.len()).expect("small") + handshake_frames),
+        Some(u64::try_from(sent.len()).expect("small")),
         "A's Edge::metrics() snapshot: {a_prod:?}"
     );
     assert_eq!(

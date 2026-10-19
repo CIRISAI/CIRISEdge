@@ -66,7 +66,8 @@ pub type PeerKeyId = String;
 /// CIRISEdge#720 — an A/V wire frame larger than the link Channel will carry.
 ///
 /// A link-Channel send accepts `link_mdu − CHANNEL_ENVELOPE_HEADER_SIZE`
-/// bytes (the #716 six-byte margin: 425 on a base-MTU 500 link). Anything
+/// bytes (the #716 six-byte margin: 425 on a base-MTU 500 link), and the
+/// CC 5.3.3.5 E1 seal takes 25 of them, so a frame may carry 400. Anything
 /// larger is refused by leviculum as `TooLarge` and folded into a generic
 /// `LinkFailed` on the way out, which is how an oversized chunk used to
 /// read as [`AvDispatcherError::SendFailed`]. A sender that knows its

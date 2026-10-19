@@ -245,10 +245,14 @@ impl AvSink {
     ///
     /// `arrival` builds the hand-off for a link no consumer holds yet —
     /// called at most once per call, and only on that branch.
+    ///
+    /// CC 5.3.3.5 E1 — `bytes` is `None` when a peer-dialled link has just
+    /// been keyed: the link is handed over with an empty queue (a link
+    /// already held is left as it is).
     pub(crate) fn deliver(
         &self,
         link_id: LinkId,
-        bytes: Vec<u8>,
+        bytes: Option<Vec<u8>>,
         arrival: impl FnOnce(PumpReceiver) -> AvArrival,
     ) -> AvDelivery {
         let mut links = self
@@ -256,6 +260,9 @@ impl AvSink {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(queue) = links.queues.get_mut(&link_id) {
+            let Some(bytes) = bytes else {
+                return AvDelivery::Queued;
+            };
             return match queue.offer(bytes) {
                 QueueOffer::Queued => AvDelivery::Queued,
                 QueueOffer::DroppedFull => AvDelivery::DroppedFull,
@@ -279,7 +286,9 @@ impl AvSink {
             .unwrap_or(0);
         let (mut queue, rx) = AvLinkQueue::with_dropped(link_id, dropped);
         // A fresh queue has room; this cannot be refused.
-        let _first = queue.offer(bytes);
+        if let Some(bytes) = bytes {
+            let _first = queue.offer(bytes);
+        }
         match self.arrivals_tx.try_send(arrival(rx)) {
             Ok(()) => {
                 links.dropped_before_arrival.remove(&link_id);
@@ -363,7 +372,7 @@ mod tests {
         let sink = AvSink::new();
         let rx = sink.claim(link(1));
         for i in 0..3u8 {
-            let d = sink.deliver(link(1), vec![i], |_| unreachable!("claimed link"));
+            let d = sink.deliver(link(1), Some(vec![i]), |_| unreachable!("claimed link"));
             assert_eq!(d, AvDelivery::Queued);
         }
         for i in 0..3u8 {
@@ -383,20 +392,20 @@ mod tests {
         let rx = sink.claim(link(2));
         for i in 0..AV_LINK_QUEUE_DEPTH {
             assert_eq!(
-                sink.deliver(link(2), i.to_be_bytes().to_vec(), |_| unreachable!()),
+                sink.deliver(link(2), Some(i.to_be_bytes().to_vec()), |_| unreachable!()),
                 AvDelivery::Queued
             );
         }
         for _ in 0..5 {
             assert_eq!(
-                sink.deliver(link(2), b"over".to_vec(), |_| unreachable!()),
+                sink.deliver(link(2), Some(b"over".to_vec()), |_| unreachable!()),
                 AvDelivery::DroppedFull
             );
         }
         // Drain one, then the next delivered frame carries the gap.
         let _ = rx.recv_frame().await.expect("first");
         assert_eq!(
-            sink.deliver(link(2), b"after".to_vec(), |_| unreachable!()),
+            sink.deliver(link(2), Some(b"after".to_vec()), |_| unreachable!()),
             AvDelivery::Queued
         );
         let mut last = None;
@@ -430,6 +439,14 @@ mod tests {
                 .build_sync()
                 .expect("test node"),
         )
+    }
+
+    fn test_seals() -> std::sync::Arc<crate::transport::link_seal::LinkSeals> {
+        std::sync::Arc::new(crate::transport::link_seal::LinkSeals::new(
+            crate::transport::transit_kex_custody::TransitKexSecret::from_root_seed(&[9; 64])
+                .expect("transit secret"),
+            "av-sink-test",
+        ))
     }
 
     fn av_address() -> InboundAddress {
@@ -466,14 +483,14 @@ mod tests {
             peer: SourceKeyId::transport_authenticated("peer"),
             address: Some(av_address()),
             inbound: rx,
-            sender: LeviculumAvSender::new(std::sync::Arc::clone(&node), link(3)),
+            sender: LeviculumAvSender::new(std::sync::Arc::clone(&node), link(3), test_seals()),
         };
         assert_eq!(
-            sink.deliver(link(3), b"first".to_vec(), arrive),
+            sink.deliver(link(3), Some(b"first".to_vec()), arrive),
             AvDelivery::Arrived
         );
         assert_eq!(
-            sink.deliver(link(3), b"second".to_vec(), |_| unreachable!(
+            sink.deliver(link(3), Some(b"second".to_vec()), |_| unreachable!(
                 "arrived once"
             )),
             AvDelivery::Queued
@@ -495,12 +512,12 @@ mod tests {
         let node = test_node();
         let sink = AvSink::new();
         drop(sink.take_arrivals());
-        let d = sink.deliver(link(5), b"x".to_vec(), |rx| AvArrival {
+        let d = sink.deliver(link(5), Some(b"x".to_vec()), |rx| AvArrival {
             link_id: link(5).into_bytes(),
             peer: SourceKeyId::transport_authenticated("peer"),
             address: Some(av_address()),
             inbound: rx,
-            sender: LeviculumAvSender::new(std::sync::Arc::clone(&node), link(5)),
+            sender: LeviculumAvSender::new(std::sync::Arc::clone(&node), link(5), test_seals()),
         });
         assert_eq!(d, AvDelivery::NoConsumer);
         assert_eq!(sink.link_count(), 0);
@@ -529,7 +546,7 @@ mod tests {
                 peer: SourceKeyId::transport_authenticated("peer"),
                 address: Some(av_address()),
                 inbound: rx,
-                sender: LeviculumAvSender::new(node, id),
+                sender: LeviculumAvSender::new(node, id, test_seals()),
             }
         };
         // Fill the arrivals queue with links nobody has taken yet.
@@ -538,7 +555,7 @@ mod tests {
             bytes[1] = u8::try_from(n).expect("< 256");
             let id = LinkId::new(bytes);
             assert_eq!(
-                sink.deliver(id, b"f".to_vec(), arrive(id)),
+                sink.deliver(id, Some(b"f".to_vec()), arrive(id)),
                 AvDelivery::Arrived
             );
         }
@@ -566,7 +583,7 @@ mod tests {
         let drops = crate::transport::realtime_av_dispatcher::HOP_COUNTER_RESYNC_SLACK + 4;
         for seq in 0..drops {
             assert_eq!(
-                sink.deliver(x, wire(seq), arrive(x)),
+                sink.deliver(x, Some(wire(seq)), arrive(x)),
                 AvDelivery::ArrivalsFull,
                 "frame {seq} finds the arrivals queue full"
             );
@@ -578,7 +595,10 @@ mod tests {
         );
         // The consumer takes one link; x's next frame arrives.
         let _first = arrivals.recv().await.expect("one arrival");
-        assert_eq!(sink.deliver(x, wire(drops), arrive(x)), AvDelivery::Arrived);
+        assert_eq!(
+            sink.deliver(x, Some(wire(drops)), arrive(x)),
+            AvDelivery::Arrived
+        );
         let mut x_arrival = None;
         while let Ok(a) = arrivals.try_recv() {
             if a.link_id == x.into_bytes() {
@@ -627,7 +647,7 @@ mod tests {
                 peer: SourceKeyId::transport_authenticated("peer"),
                 address: Some(av_address()),
                 inbound: rx,
-                sender: LeviculumAvSender::new(node, id),
+                sender: LeviculumAvSender::new(node, id, test_seals()),
             }
         };
 
@@ -636,7 +656,7 @@ mod tests {
         drop(sink.claim(dialled));
         for _ in 0..3 {
             assert_eq!(
-                sink.deliver(dialled, b"reverse".to_vec(), arrive(dialled)),
+                sink.deliver(dialled, Some(b"reverse".to_vec()), arrive(dialled)),
                 AvDelivery::ConsumerGone
             );
         }
@@ -644,13 +664,13 @@ mod tests {
         // A peer-opened link the consumer took and then rejected.
         let peer = link(0x32);
         assert_eq!(
-            sink.deliver(peer, b"first".to_vec(), arrive(peer)),
+            sink.deliver(peer, Some(b"first".to_vec()), arrive(peer)),
             AvDelivery::Arrived
         );
         drop(arrivals.recv().await.expect("the one arrival"));
         for _ in 0..3 {
             assert_eq!(
-                sink.deliver(peer, b"again".to_vec(), arrive(peer)),
+                sink.deliver(peer, Some(b"again".to_vec()), arrive(peer)),
                 AvDelivery::ConsumerGone
             );
         }
@@ -700,7 +720,7 @@ mod tests {
         let hop = link(0x44);
         let rx = sink.claim(hop);
         assert_eq!(
-            sink.deliver(hop, wire(0), |_| unreachable!()),
+            sink.deliver(hop, Some(wire(0)), |_| unreachable!()),
             AvDelivery::Queued
         );
         // ~3 s at 15 fps — every one sent, every one refused at the gate.
@@ -709,7 +729,7 @@ mod tests {
             sink.note_dropped_before_sink(hop);
         }
         assert_eq!(
-            sink.deliver(hop, wire(1 + gated), |_| unreachable!()),
+            sink.deliver(hop, Some(wire(1 + gated)), |_| unreachable!()),
             AvDelivery::Queued
         );
         let mut d = AvDispatcher::new(AvDispatcherConfig {

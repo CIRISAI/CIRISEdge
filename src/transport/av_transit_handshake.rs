@@ -1,52 +1,54 @@
-//! CIRISEdge#805 (CC 5.3.3.5 E1, CC 3.3.6.2) — the per-link hybrid transit
-//! KEX on an A/V link: where every A/V hop's outer-seal key comes from.
+//! CC 5.3.3.5 E1 / CC 3.3.6.2 — the hybrid transit KEX every RNS link runs
+//! as its FIRST frame: the handshake, its framing, and the keys by role.
 //!
 //! The construction is CIRISVerify#309's [`ciris_crypto::transit_kex`]. This
-//! module carries it over an A/V link and decides what each end may do with
-//! the result.
+//! module is pure and synchronous: it builds the dialler's handshake frames,
+//! reassembles them at the dialled end, answers them, and checks the claim.
+//! [`crate::transport::link_seal`] runs it on every link, inbound and
+//! outbound, before any edge frame is sent or delivered, and seals every
+//! frame after it under the keys it yields. (It began as the A/V hop's KEX,
+//! CIRISEdge#805; A/V's outer seal now uses the link's keys, so a link runs
+//! one KEX, not two.)
 //!
 //! # Roles
 //!
 //! The **dialler is always the initiator** (verify's rule). Before it dials
 //! it resolves the dialled node's static transit pair (Rooted only, persist's
-//! `transit_kex_pair_for`, by the id it dials); once the A/V link is
-//! established it runs [`transit_kex::initiate`] and sends
-//! [`TransitHandshake::to_bytes`] as the link's FIRST message, before any
-//! media. A dialled node with no usable pair cannot relay or receive: the dial
-//! is refused by name ([`AvHandshakeError::NoTransitPair`]) and never made.
-//! There is no classical fallback and no caller-supplied key (E1 forbids it).
+//! `transit_kex_pair_for`, by the id it dials); once the link is established
+//! it runs [`initiate`] and sends the frames as the link's FIRST messages.
+//! A dialled node with no usable pair cannot be keyed: the dial is refused by
+//! name ([`AvHandshakeError::NoTransitPair`]) and never made. There is no
+//! classical fallback and no caller-supplied key (E1 forbids it).
 //!
-//! The **dialled end is the responder**. It reassembles the handshake, runs
-//! [`transit_kex::respond`] under its own transit keys, and then checks the
-//! CLAIM: the handshake's `initiator_key_id` must be the peer the link itself
-//! proves (the #393-attributed peer). The KEX authenticates only the
-//! responder (verify's module docs), so without this check any rooted peer
-//! could key a hop under another member's name. Only after it passes are the
-//! keys handed out.
+//! The **dialled end is the responder**. It reassembles the handshake
+//! ([`Reassembler`]) and runs [`respond`] under its own transit keys. The
+//! KEX authenticates only the responder (verify's module docs), so the
+//! handshake's `initiator_key_id` is a CLAIM: [`check_claim`] holds it to the
+//! peer the link itself is attributed to (#393). The link layer applies it
+//! wherever that attribution is known; see `link_seal` for the first-contact
+//! carve-out (an unattributed initiator).
 //!
 //! # Keys by role
 //!
 //! [`LinkTransit::seal_key`] / [`LinkTransit::open_key`] pick
 //! `TransitKeys::seal_key(role)` / `open_key(role)`: each end seals what it
-//! SENDS and opens what it RECEIVES, whichever end carries media. On a
-//! subscriber's relay leg the subscriber dialled, so the relay (responder)
-//! seals with `responder_to_initiator` and the subscriber (initiator) opens
-//! with it.
+//! SENDS and opens what it RECEIVES. These raw keys are what A/V's outer seal
+//! uses; the link seal derives its own keys from them under a distinct label
+//! (`link_seal`), so the two layers never share a `(key, nonce)`.
 //!
 //! # `link_id`
 //!
-//! The KEX binds the 16-byte RNS `link_id`, the same id both ends feed the
-//! outer nonce. An end that reports a stale id (leviculum#86, CIRISEdge#867)
-//! derives different keys from its peer, so every frame fails its tag: the
-//! #867 `LinkIdGuard` then ends the link and the host re-dials, which is a
-//! new link, a new id and a new handshake.
+//! The KEX binds the 16-byte RNS `link_id`. An end that reports a stale id
+//! (leviculum#86, CIRISEdge#867) derives different keys from its peer, so
+//! every sealed frame fails to open and the link is closed; the dialler
+//! re-dials, which is a new link, a new id and a new handshake.
 //!
 //! # Framing: N parts, length-headed, bounded
 //!
 //! A handshake is about 1.2 KB under the current suite and larger under a
-//! future one, and an A/V leg runs at the base MTU (a Channel message of
-//! about 425 B). So the handshake rides as N Channel messages, sized to the
-//! link's Channel limit, with no fixed count:
+//! future one, and a link may run at the base MTU (a Channel message of about
+//! 400 B). So the handshake rides as N Channel messages, sized to the link's
+//! Channel limit, with no fixed count:
 //!
 //! ```text
 //! start:        "CTKX" ‖ version(1) ‖ 0x00 ‖ total_len u32_be ‖ bytes[1..]
@@ -55,33 +57,28 @@
 //!
 //! The receiver refuses a declared length over [`MAX_HANDSHAKE_BYTES`] at the
 //! START frame, before buffering anything, and never holds more than the
-//! declared length; a frame past it, a lost frame, or a budget overrun
-//! ([`HANDSHAKE_BUDGET`]) is a named refusal.
+//! declared length; a frame past it or a budget overrun ([`HANDSHAKE_BUDGET`])
+//! is a named refusal.
 //!
-//! **Telling handshake frames from media is positional, and the tag makes a
-//! mistake loud.** On an A/V link the dialler's first message is the
-//! handshake and nothing else precedes it: the dialler cannot send media
-//! until [`initiate_on_link`] has sent every part (the transport's dial
-//! returns only then), and the link's Channel is sequenced, so the responder
-//! reads exactly the handshake's frames, by its declared length, before any
-//! media consumer exists. The responder never sends a handshake, so the
-//! dialler's inbound is media only. A media frame in the handshake's place
-//! (a peer that skipped the KEX) carries no `"CTKX"` tag and is refused by
-//! name ([`AvHandshakeError::NotAHandshake`]) rather than misparsed; a
-//! handshake frame can never reach a media pump, because the responder
-//! consumes all of it first. One handshake per link: a re-admission is a
-//! re-dial, so a new link and a new handshake.
+//! **Telling handshake frames from sealed frames is positional, and the tag
+//! makes a mistake loud.** The dialler's first messages are the handshake and
+//! nothing precedes them: it sends no edge frame until every part is out, and
+//! the link's Channel is sequenced, so the responder reads exactly the
+//! handshake's frames, by its declared length, before anything else. The
+//! responder never sends a handshake and sends nothing until it has answered
+//! one. A frame in the handshake's place without the `"CTKX"` tag (a peer
+//! that skipped the KEX) is refused by name
+//! ([`AvHandshakeError::NotAHandshake`]) rather than misparsed. One handshake
+//! per link: a re-key is a re-dial.
 
 use std::time::Duration;
 
 use ciris_crypto::transit_kex::{
-    self, TransitHandshake, TransitKexError, TransitKeys, TransitRole, LINK_ID_LEN,
+    self, TransitHandshake, TransitKexError, TransitRole, LINK_ID_LEN, TRANSIT_KEY_LEN,
 };
 use ciris_persist::federation::self_at_login::TransitKexPair;
+use zeroize::Zeroizing;
 
-use crate::transport::realtime_av_dispatcher::{
-    AvDispatcherError, AvLinkReceiver, AvLinkSender, InboundWireFrame,
-};
 use crate::transport::transit_kex_custody::TransitKexSecret;
 
 /// The tag every handshake frame opens with.
@@ -104,21 +101,19 @@ pub const CONTINUATION_HEADER_LEN: usize = 4 + 1 + 1;
 /// ciphertext alone is 1568 B) without letting a peer make us buffer more.
 pub const MAX_HANDSHAKE_BYTES: usize = 8 * 1024;
 
-/// How long either end spends on the handshake before refusing it.
+/// How long either end spends on the handshake before refusing it: the
+/// dialler on sending it, the responder on receiving all of it.
 pub const HANDSHAKE_BUDGET: Duration = Duration::from_secs(10);
 
-/// Pause between sends the link refused under backpressure (`Congested`).
-const CONGESTED_RETRY: Duration = Duration::from_millis(25);
-
-/// Why a transit KEX on an A/V link was refused. Every variant is a named
-/// refusal: the link is closed and no key is installed.
+/// Why a link's transit KEX was refused. Every variant is a named refusal:
+/// the link is closed (or never dialled) and no key is installed.
 #[derive(Debug, thiserror::Error)]
 pub enum AvHandshakeError {
     /// The dialled node publishes no usable transit KEX pair (no live Rooted
     /// binding carrying one, two disagreeing, or one reusing its keys): it
-    /// cannot relay or receive (CC 3.3.6.2).
+    /// cannot be keyed (CC 3.3.6.2).
     #[error(
-        "{peer} publishes no usable transit KEX pair, so it cannot relay or receive A/V \
+        "{peer} publishes no usable transit KEX pair, so no link to it can be sealed \
          (CC 3.3.6.2); refused, never keyed any other way (CC 5.3.3.5 E1)"
     )]
     NoTransitPair {
@@ -133,8 +128,12 @@ pub enum AvHandshakeError {
         /// The directory's error, or that there is no directory.
         detail: String,
     },
-    /// The construction refused (bad key id, low-order point, wrong suite,
-    /// malformed body, ...).
+    /// The handshake names a construction other than the hybrid suite: a
+    /// classical-only or unknown suite. Never answered.
+    #[error("transit KEX handshake names a suite other than the hybrid one; refused")]
+    Suite,
+    /// The construction refused (bad key id, low-order point, malformed
+    /// body, ...).
     #[error("transit KEX: {0}")]
     Kex(TransitKexError),
     /// The handshake was addressed to another responder key.
@@ -142,8 +141,8 @@ pub enum AvHandshakeError {
     ResponderMismatch,
     /// The handshake's claimed initiator is not the peer the link proves.
     #[error(
-        "transit KEX handshake claims initiator {claimed} but the link proves {proven}; \
-         refused, no key installed"
+        "transit KEX handshake claims initiator {claimed} but the link is attributed to \
+         {proven}; refused, no key installed"
     )]
     ClaimMismatch {
         /// `initiator_key_id` from the handshake.
@@ -152,7 +151,7 @@ pub enum AvHandshakeError {
         proven: String,
     },
     /// A frame in the handshake's place does not carry the handshake tag.
-    #[error("first frame on the A/V link is not a transit KEX handshake frame")]
+    #[error("first frame on the link is not a transit KEX handshake frame")]
     NotAHandshake,
     /// A handshake frame of a framing version this build does not speak.
     #[error("transit KEX handshake framing version {0} is not supported")]
@@ -169,44 +168,34 @@ pub enum AvHandshakeError {
         /// [`MAX_HANDSHAKE_BYTES`].
         max: usize,
     },
-    /// The transport dropped a handshake frame.
-    #[error("{dropped} transit KEX handshake frame(s) were dropped on the link")]
-    FrameDropped {
-        /// Frames the transport reported dropped.
-        dropped: u64,
-    },
     /// The handshake did not complete within [`HANDSHAKE_BUDGET`].
     #[error("transit KEX handshake did not complete within {0:?}")]
     Timeout(Duration),
-    /// The link closed before the handshake completed.
-    #[error("A/V link closed during the transit KEX handshake: {0}")]
-    LinkClosed(String),
     /// The handshake could not be sent.
     #[error("transit KEX handshake send failed: {0}")]
     Send(String),
     /// The link's id is not the 16-byte RNS link id the KEX binds.
-    #[error("A/V link id is {0} bytes; the transit KEX binds a 16-byte RNS link id")]
+    #[error("link id is {0} bytes; the transit KEX binds a 16-byte RNS link id")]
     LinkIdLength(usize),
 }
 
 impl AvHandshakeError {
-    /// The `av_plane` metric label this refusal counts under.
+    /// The `link_seal` metric label this refusal counts under.
     #[must_use]
     pub fn label(&self) -> &'static str {
         use crate::observability as o;
         match self {
-            Self::NoTransitPair { .. } => o::AV_TRANSIT_REFUSED_NO_PAIR,
-            Self::PairLookup { .. } => o::AV_TRANSIT_REFUSED_LOOKUP,
-            Self::Kex(_) | Self::LinkIdLength(_) => o::AV_TRANSIT_REFUSED_KEX,
-            Self::ResponderMismatch => o::AV_TRANSIT_REFUSED_RESPONDER_MISMATCH,
-            Self::ClaimMismatch { .. } => o::AV_TRANSIT_REFUSED_CLAIM_MISMATCH,
-            Self::NotAHandshake
-            | Self::UnsupportedVersion(_)
-            | Self::Malformed(_)
-            | Self::FrameDropped { .. } => o::AV_TRANSIT_REFUSED_MALFORMED,
-            Self::TooLarge { .. } => o::AV_TRANSIT_REFUSED_TOO_LARGE,
-            Self::Timeout(_) | Self::LinkClosed(_) => o::AV_TRANSIT_REFUSED_TIMEOUT,
-            Self::Send(_) => o::AV_TRANSIT_REFUSED_SEND,
+            Self::NoTransitPair { .. } => o::LINK_SEAL_REFUSED_NO_PAIR,
+            Self::PairLookup { .. } => o::LINK_SEAL_REFUSED_LOOKUP,
+            Self::Suite => o::LINK_SEAL_REFUSED_SUITE,
+            Self::Kex(_) | Self::LinkIdLength(_) => o::LINK_SEAL_REFUSED_KEX,
+            Self::ResponderMismatch => o::LINK_SEAL_REFUSED_RESPONDER_MISMATCH,
+            Self::ClaimMismatch { .. } => o::LINK_SEAL_REFUSED_CLAIM_MISMATCH,
+            Self::NotAHandshake => o::LINK_SEAL_REFUSED_NOT_A_HANDSHAKE,
+            Self::UnsupportedVersion(_) | Self::Malformed(_) => o::LINK_SEAL_REFUSED_MALFORMED,
+            Self::TooLarge { .. } => o::LINK_SEAL_REFUSED_TOO_LARGE,
+            Self::Timeout(_) => o::LINK_SEAL_REFUSED_TIMEOUT,
+            Self::Send(_) => o::LINK_SEAL_REFUSED_SEND,
         }
     }
 }
@@ -215,15 +204,18 @@ impl From<TransitKexError> for AvHandshakeError {
     fn from(e: TransitKexError) -> Self {
         match e {
             TransitKexError::ResponderMismatch => Self::ResponderMismatch,
+            TransitKexError::WrongIdentifier => Self::Suite,
             other => Self::Kex(other),
         }
     }
 }
 
-/// One A/V hop's transit keys, held by the end that ran the handshake in
-/// `role`. Zeroized on drop (verify's `TransitKeys`).
+/// One link's transit keys, held by the end that ran the handshake in
+/// `role`. Zeroized on drop.
+#[derive(Clone)]
 pub struct LinkTransit {
-    keys: TransitKeys,
+    seal: Zeroizing<[u8; TRANSIT_KEY_LEN]>,
+    open: Zeroizing<[u8; TRANSIT_KEY_LEN]>,
     role: TransitRole,
 }
 
@@ -236,7 +228,15 @@ impl std::fmt::Debug for LinkTransit {
 }
 
 impl LinkTransit {
-    /// This end's role on the hop.
+    fn from_keys(keys: &transit_kex::TransitKeys, role: TransitRole) -> Self {
+        Self {
+            seal: Zeroizing::new(*keys.seal_key(role)),
+            open: Zeroizing::new(*keys.open_key(role)),
+            role,
+        }
+    }
+
+    /// This end's role on the link.
     #[must_use]
     pub fn role(&self) -> TransitRole {
         self.role
@@ -247,7 +247,7 @@ impl LinkTransit {
     /// `transit_key`.
     #[must_use]
     pub fn seal_key(&self) -> [u8; 32] {
-        *self.keys.seal_key(self.role)
+        *self.seal
     }
 
     /// The key this end OPENS inbound frames with: an
@@ -255,7 +255,7 @@ impl LinkTransit {
     /// `transit_key`.
     #[must_use]
     pub fn open_key(&self) -> [u8; 32] {
-        *self.keys.open_key(self.role)
+        *self.open
     }
 }
 
@@ -336,13 +336,7 @@ impl Reassembler {
     /// # Errors
     /// Every [`AvHandshakeError`] framing refusal; after one, the
     /// reassembler is spent.
-    pub fn push(&mut self, frame: &InboundWireFrame) -> Result<Option<Vec<u8>>, AvHandshakeError> {
-        if frame.dropped_before > 0 {
-            return Err(AvHandshakeError::FrameDropped {
-                dropped: frame.dropped_before,
-            });
-        }
-        let b = frame.bytes.as_slice();
+    pub fn push(&mut self, b: &[u8]) -> Result<Option<Vec<u8>>, AvHandshakeError> {
         if b.len() < CONTINUATION_HEADER_LEN || b[..4] != HANDSHAKE_MAGIC {
             return Err(AvHandshakeError::NotAHandshake);
         }
@@ -394,23 +388,23 @@ impl Reassembler {
     }
 }
 
-/// Dialler side: run the hop KEX against the dialled node's `pair` and send
-/// the handshake on the link, part by part, before anything else.
+/// Dialler side: run the link's KEX against the dialled node's `pair` and
+/// cut the handshake into frames of at most `frame_limit` bytes (the link's
+/// Channel limit), to be sent in order as the link's first messages.
 ///
-/// `frame_limit` is the link's Channel limit. `own_key_id` is the identity
-/// this node's links are attributed to; `peer_key_id` is the node dialled.
+/// `own_key_id` is the identity this node's links are attributed to;
+/// `peer_key_id` is the node dialled.
 ///
 /// # Errors
-/// [`AvHandshakeError`] on a KEX refusal, a send failure, or a send that
-/// stays congested past [`HANDSHAKE_BUDGET`].
-pub async fn initiate_on_link(
-    sender: &dyn AvLinkSender,
-    frame_limit: usize,
+/// [`AvHandshakeError`] on a KEX refusal or a `frame_limit` too small for a
+/// frame.
+pub fn initiate(
     link_id: &[u8],
     own_key_id: &str,
     peer_key_id: &str,
     pair: &TransitKexPair,
-) -> Result<LinkTransit, AvHandshakeError> {
+    frame_limit: usize,
+) -> Result<(Vec<Vec<u8>>, LinkTransit), AvHandshakeError> {
     let link_id = kex_link_id(link_id)?;
     let (hs, keys) = transit_kex::initiate(
         &link_id,
@@ -420,69 +414,28 @@ pub async fn initiate_on_link(
         &pair.ml_kem_768[..],
     )?;
     let frames = fragment(&hs.to_bytes(), frame_limit)?;
-    let deadline = tokio::time::Instant::now() + HANDSHAKE_BUDGET;
-    for frame in &frames {
-        loop {
-            match sender.send(frame).await {
-                Ok(()) => break,
-                Err(AvDispatcherError::Congested) if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(CONGESTED_RETRY).await;
-                }
-                Err(AvDispatcherError::Congested) => {
-                    return Err(AvHandshakeError::Timeout(HANDSHAKE_BUDGET));
-                }
-                Err(e) => return Err(AvHandshakeError::Send(e.to_string())),
-            }
-        }
-    }
-    Ok(LinkTransit {
-        keys,
-        role: TransitRole::Initiator,
-    })
+    Ok((
+        frames,
+        LinkTransit::from_keys(&keys, TransitRole::Initiator),
+    ))
 }
 
-/// Read and reassemble one handshake from `receiver`, within
-/// [`HANDSHAKE_BUDGET`].
+/// Dialled side: answer a reassembled handshake under this node's transit
+/// keys as `local_key_id`. Returns the responder's keys and the handshake's
+/// CLAIMED initiator, which the caller must hold to the link's attributed
+/// peer ([`check_claim`]) before trusting it.
 ///
 /// # Errors
-/// Every framing refusal, [`AvHandshakeError::Timeout`], and
-/// [`AvHandshakeError::LinkClosed`].
-pub async fn recv_handshake(receiver: &dyn AvLinkReceiver) -> Result<Vec<u8>, AvHandshakeError> {
-    let mut reassembler = Reassembler::new();
-    let read = async {
-        loop {
-            let frame = receiver
-                .recv_frame()
-                .await
-                .map_err(|e| AvHandshakeError::LinkClosed(e.to_string()))?;
-            if let Some(bytes) = reassembler.push(&frame)? {
-                return Ok(bytes);
-            }
-        }
-    };
-    tokio::time::timeout(HANDSHAKE_BUDGET, read)
-        .await
-        .unwrap_or(Err(AvHandshakeError::Timeout(HANDSHAKE_BUDGET)))
-}
-
-/// Dialled side: read the handshake off the link, answer it under this
-/// node's transit keys as `local_key_id`, and check the claim: the
-/// handshake's initiator must be `proven_peer`, the peer the link itself
-/// proves. Only then are the keys returned.
-///
-/// # Errors
-/// [`AvHandshakeError`]: framing, KEX, responder mismatch, or
-/// [`AvHandshakeError::ClaimMismatch`].
-pub async fn respond_on_link(
-    receiver: &dyn AvLinkReceiver,
+/// [`AvHandshakeError`]: a wrong suite, a malformed body, a responder
+/// mismatch, or any other KEX refusal.
+pub fn respond(
+    bytes: &[u8],
     link_id: &[u8],
     local_key_id: &str,
     secret: &TransitKexSecret,
-    proven_peer: &str,
-) -> Result<LinkTransit, AvHandshakeError> {
+) -> Result<(LinkTransit, String), AvHandshakeError> {
     let link_id = kex_link_id(link_id)?;
-    let bytes = recv_handshake(receiver).await?;
-    let hs = TransitHandshake::from_bytes(&bytes)?;
+    let hs = TransitHandshake::from_bytes(bytes)?;
     let keys = transit_kex::respond(
         &link_id,
         local_key_id,
@@ -491,17 +444,26 @@ pub async fn respond_on_link(
         &secret.pair().ml_kem_768[..],
         &hs,
     )?;
-    // The KEX authenticates only this end: the initiator's id is a CLAIM.
-    if hs.initiator_key_id() != proven_peer {
-        return Err(AvHandshakeError::ClaimMismatch {
-            claimed: hs.initiator_key_id().to_owned(),
-            proven: proven_peer.to_owned(),
-        });
+    Ok((
+        LinkTransit::from_keys(&keys, TransitRole::Responder),
+        hs.initiator_key_id().to_owned(),
+    ))
+}
+
+/// The KEX authenticates only the responder: the initiator's id is a CLAIM,
+/// held here to `proven`, the peer the link itself is attributed to.
+///
+/// # Errors
+/// [`AvHandshakeError::ClaimMismatch`].
+pub fn check_claim(claimed: &str, proven: &str) -> Result<(), AvHandshakeError> {
+    if claimed == proven {
+        Ok(())
+    } else {
+        Err(AvHandshakeError::ClaimMismatch {
+            claimed: claimed.to_owned(),
+            proven: proven.to_owned(),
+        })
     }
-    Ok(LinkTransit {
-        keys,
-        role: TransitRole::Responder,
-    })
 }
 
 #[cfg(test)]
