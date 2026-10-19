@@ -747,6 +747,13 @@ impl LinkSeals {
         }
     }
 
+    /// Whether this table holds any state for `link` (keyed, awaiting,
+    /// initiating or refused).
+    #[must_use]
+    pub fn knows(&self, link: [u8; 16]) -> bool {
+        self.links().contains_key(&link)
+    }
+
     /// Whether `link` carries keys.
     #[must_use]
     pub fn is_sealed(&self, link: [u8; 16]) -> bool {
@@ -851,12 +858,17 @@ impl PairingTransitPin {
 
     /// The pinned pair, for a dial to `dialled` and nothing else.
     ///
-    /// Checks the STRUCTURE only: the binding to the dialled node and both
-    /// key lengths.
+    /// Checks the STRUCTURE: the binding to the dialled node, both key
+    /// lengths, and in-row separation against `other_keys` (the dialled
+    /// node's keys this device holds; see the TODO below for the groups).
     ///
     /// # Errors
     /// [`SealRefusal::PinRejected`].
-    pub fn pair_for(&self, dialled: &str) -> Result<TransitKexPair, SealRefusal> {
+    pub fn pair_for(
+        &self,
+        dialled: &str,
+        other_keys: &[&[u8]],
+    ) -> Result<TransitKexPair, SealRefusal> {
         use base64::Engine as _;
         use ciris_persist::federation::self_at_login::{
             TRANSIT_KEX_ML_KEM_768_LEN, TRANSIT_KEX_X25519_LEN,
@@ -881,10 +893,24 @@ impl PairingTransitPin {
             .map_err(|k| {
                 SealRefusal::PinRejected(format!("ml_kem_768 is {} bytes, not 1184", k.len()))
             })?;
-        // TODO(persist v59): validate with
-        // `ciris_persist::federation::self_at_login::check_transit_kex_pair(&pair, &[..the
-        // node's other keys])` (CC 3.3.6.2 in-row key separation) once the v59 head lands;
-        // edge keeps no copy of that rule.
+        // TODO(persist v59): replace this check with
+        // `ciris_persist::federation::self_at_login::check_transit_kex_pair(&pair, other_keys)`
+        // (CC 3.3.6.2 in-row key separation) once the #1106 head lands, passing persist's
+        // other_keys groups a device holds:
+        //   (a) the node's federation signing keys (Ed25519, ML-DSA-65), when the device's
+        //       directory holds the node's key record;
+        //   (b) the node's transport identity (RNS x25519 + Ed25519 halves), from its
+        //       announce [passed by `send_first_contact_pinned`].
+        if other_keys
+            .iter()
+            .any(|k| *k == x25519.as_slice() || *k == &ml_kem_768[..])
+        {
+            return Err(SealRefusal::PinRejected(
+                "the pinned pair reuses one of the node's own keys (CC 3.3.6.2 in-row \
+                 separation)"
+                    .to_owned(),
+            ));
+        }
         Ok(TransitKexPair { x25519, ml_kem_768 })
     }
 }

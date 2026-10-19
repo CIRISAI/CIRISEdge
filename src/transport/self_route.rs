@@ -574,13 +574,23 @@ pub async fn sign_route_offline(
         .public_key()
         .await
         .map_err(|e| OfflineEmitError::Sign(format!("federation pubkey: {e}")))?;
+    let federation_ml_dsa_65 = pqc
+        .public_key()
+        .await
+        .map_err(|e| OfflineEmitError::Sign(format!("federation ML-DSA-65 pubkey: {e}")))?;
     // TODO(persist v59): replace with
-    // `ciris_persist::federation::self_at_login::check_transit_kex_pair(transit, &[..])`
-    // (CC 3.3.6.2 in-row key separation) once the v59 head lands.
-    let others: [&[u8]; 3] = [
+    // `ciris_persist::federation::self_at_login::check_transit_kex_pair(transit, &other_keys)`
+    // (CC 3.3.6.2 in-row key separation) once the #1106 head lands, passing
+    // persist's other_keys groups:
+    //   (a) the node's federation signing keys: Ed25519 + ML-DSA-65  [passed below]
+    //   (b) its transport identity, RNS x25519 + Ed25519 halves        [passed below]
+    //   (c) its occurrence's encryption_pubkeys (x25519, ML-KEM-768)    [NOT in edge's
+    //       custody: the occurrence row is persist's; add when the emitter reads it]
+    let others: [&[u8]; 4] = [
+        &federation_ed25519,
+        &federation_ml_dsa_65,
         &transport_pubkey[0..32],
         &transport_pubkey[32..64],
-        &federation_ed25519,
     ];
     if others.contains(&transit.x25519.as_slice()) {
         return Err(OfflineEmitError::KeySeparation(

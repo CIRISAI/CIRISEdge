@@ -5358,7 +5358,22 @@ impl ReticulumTransport {
         let refused = |r: &crate::transport::link_seal::SealRefusal| {
             seal_refused(self.metrics.get(), peer_key_id, None, r, "dial")
         };
-        let pair = pin.pair_for(peer_key_id).map_err(|r| refused(&r))?;
+        // CC 3.3.6.2 in-row separation against the dialled node's keys this
+        // device holds: its announced transport identity, (b) of persist's
+        // other_keys groups.
+        let transport_keys = self
+            .peers
+            .lock()
+            .await
+            .get(peer_key_id)
+            .map(|rp| rp.transport_pubkey64);
+        let other_keys: Vec<&[u8]> = transport_keys
+            .as_ref()
+            .map(|k| vec![&k[0..32], &k[32..64]])
+            .unwrap_or_default();
+        let pair = pin
+            .pair_for(peer_key_id, &other_keys)
+            .map_err(|r| refused(&r))?;
         admit_unattributed_frame(self.occurrence_key_id(), request).map_err(|r| refused(&r))?;
         let candidates = self.resolve_dial_candidates(peer_key_id).await;
         for c in &candidates {
@@ -11877,6 +11892,20 @@ async fn seal_inbound(
 ) -> Option<Vec<u8>> {
     use crate::transport::link_seal::{Inbound, Lane};
     let we_dialled = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
+    // A frame still in flight when its link closed: the close forgot the
+    // link's seal state, and the node no longer holds the link. It must not
+    // open a fresh handshake budget (and a second refusal) for a dead link.
+    if !we_dialled
+        && !ctx.seals.knows(link_id.into_bytes())
+        && !ctx.node.link_is_established(&link_id)
+    {
+        drop_inbound(
+            Some(link_id),
+            "link_seal_frame_after_close",
+            "a frame on a link that already closed; nothing to key or open (CC 5.3.3.5 E1)",
+        );
+        return None;
+    }
     note_responder_link(ctx, link_id, we_dialled);
     let link = link_id.into_bytes();
     let outcome = if lane == Lane::Channel {
