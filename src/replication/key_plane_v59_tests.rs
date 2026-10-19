@@ -543,11 +543,12 @@ async fn a_revocation_row_reaches_a_stranger_holding_the_key_v59() {
     assert!(snap.envelope_kind_retired_refusals.is_empty());
 }
 
-/// **An occurrence's revocation reaches a node holding the occurrence**, over
+/// **An occurrence's revocation reaches a stranger holding the occurrence** (B
+/// holds no consent grant and is in no cohort of A's), over
 /// the IdentityOccurrenceRevocation plane (the occurrence's own tombstone
 /// plane), as the `withdraws` of its `identity:occurrence:v1` row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_occurrence_withdrawal_reaches_a_node_holding_the_occurrence_v59() {
+async fn an_occurrence_withdraws_reaches_a_stranger_holding_the_occurrence_v59() {
     let a = NodeA::build("v59-occrev", 0xa1).await;
     let b_ident = Ident::mint("node-b-v59-occrev", "node", 0xb1).await;
     let b_dir = substrate().await;
