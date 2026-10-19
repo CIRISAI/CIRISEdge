@@ -56,13 +56,18 @@ fn b64(bytes: &[u8]) -> String {
 
 /// One person: a hybrid signer, because the federation tier is PQC-mandatory
 /// (CC 5.3.2.4.3.1) and a classical-only row is refused at admission.
-fn signer(key_id: &str, seed: u8) -> ciris_edge::identity::LocalSigner {
+///
+/// persist #1103 (CC 2.6.8): the `key_id` is DERIVED from the signer's own
+/// Ed25519 pubkey, `derive_key_id(label, pubkey)`, never hand-written.
+fn signer(label: &str, seed: u8) -> ciris_edge::identity::LocalSigner {
     let classical: Arc<dyn HardwareSigner> =
-        Arc::new(Ed25519SoftwareSigner::from_bytes(&[seed; 32], key_id).expect("ed25519"));
+        Arc::new(Ed25519SoftwareSigner::from_bytes(&[seed; 32], label).expect("ed25519"));
     let pqc: Arc<dyn PqcSigner> = Arc::new(
-        MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{key_id}-pqc"))
+        MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{label}-pqc"))
             .expect("ml-dsa-65"),
     );
+    let pubkey = futures::executor::block_on(classical.public_key()).expect("ed pubkey");
+    let key_id = ciris_verify_core::fedcode::derive_key_id(label, &pubkey);
     ciris_edge::identity::LocalSigner::new(key_id, classical, Some(pqc))
 }
 
@@ -123,14 +128,16 @@ struct Party {
 }
 
 impl Party {
+    /// The ids are the signers' DERIVED key ids (persist #1103), labelled
+    /// `<name>-fed` / `<name>-node`.
     fn new(name: &str, seed: u8) -> Self {
-        let fed_id = format!("{name}-fed");
-        let node_id = format!("{name}-node");
+        let person = signer(&format!("{name}-fed"), seed);
+        let node_signer = signer(&format!("{name}-node"), seed.wrapping_add(64));
         Self {
-            signer: signer(&fed_id, seed),
-            node_signer: signer(&node_id, seed.wrapping_add(64)),
-            fed_id,
-            node_id,
+            fed_id: person.key_id.clone(),
+            node_id: node_signer.key_id.clone(),
+            signer: person,
+            node_signer,
         }
     }
 }
@@ -227,7 +234,7 @@ async fn register_room(dir: &SqliteBackend, room: &str, alice: &Party, bob: &Par
     let widened = membership::widen_on_acceptance(
         dir,
         &acceptance,
-        &MembershipWidener::new(vec![Arc::new(signer(&alice.fed_id, 1))]),
+        &MembershipWidener::new(vec![Arc::new(signer("alice-fed", 1))]),
     )
     .await
     .expect("alice widens on the acceptance");

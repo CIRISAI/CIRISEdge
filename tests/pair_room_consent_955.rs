@@ -42,14 +42,18 @@ fn ts() -> chrono::DateTime<chrono::Utc> {
         .into()
 }
 
-/// One hybrid keypair from a seed, as an edge signer under `key_id`.
-fn signer(key_id: &str, seed: u8) -> ciris_edge::identity::LocalSigner {
+/// One hybrid keypair from a seed, as an edge signer. persist #1103 (CC
+/// 2.6.8): its `key_id` is DERIVED from its own Ed25519 pubkey,
+/// `derive_key_id(label, pubkey)`, never hand-written.
+fn signer(label: &str, seed: u8) -> ciris_edge::identity::LocalSigner {
     let classical: Arc<dyn HardwareSigner> =
-        Arc::new(Ed25519SoftwareSigner::from_bytes(&[seed; 32], key_id).expect("ed25519"));
+        Arc::new(Ed25519SoftwareSigner::from_bytes(&[seed; 32], label).expect("ed25519"));
     let pqc: Arc<dyn PqcSigner> = Arc::new(
-        MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{key_id}-pqc"))
+        MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{label}-pqc"))
             .expect("ml-dsa-65"),
     );
+    let pubkey = futures::executor::block_on(classical.public_key()).expect("ed pubkey");
+    let key_id = ciris_verify_core::fedcode::derive_key_id(label, &pubkey);
     ciris_edge::identity::LocalSigner::new(key_id, classical, Some(pqc))
 }
 

@@ -42,10 +42,20 @@ struct FedKey {
 }
 
 impl FedKey {
-    fn new(key_id: &str, seed_byte: u8) -> Self {
+    /// persist #1103 (CC 2.6.8) — the `key_id` is DERIVED from the key's own
+    /// Ed25519 pubkey (`derive_key_id(label, pubkey)`), never hand-written:
+    /// `put_public_key` refuses a `-<fp>` suffix that is not its key's
+    /// fingerprint. Tests reference `key_id`, never the label.
+    fn new(label: &str, seed_byte: u8) -> Self {
+        use ciris_crypto::ClassicalSigner as _;
+        let seed = [seed_byte; 32];
+        let pubkey = ciris_crypto::Ed25519Signer::from_seed(&seed)
+            .expect("ed25519 from seed")
+            .public_key()
+            .expect("pubkey");
         Self {
-            key_id: key_id.to_string(),
-            seed: [seed_byte; 32],
+            key_id: ciris_verify_core::fedcode::derive_key_id(label, &pubkey),
+            seed,
         }
     }
 
@@ -415,12 +425,14 @@ async fn edge_peer_cohort_scope_from_persist_accessor_returns_decoded() {
     // Direct accessor test — `Edge::peer_cohort_scope_from_persist`
     // returns the decoded `CohortScope` for the remote peer.
     let tmp = tempfile::tempdir().expect("tempdir");
-    let (edge, _remote_signer, _local_key_id, _dir) = build_edge_with_remote_policy(
+    let (edge, remote_signer, _local_key_id, _dir) = build_edge_with_remote_policy(
         &tmp,
         Some(serde_json::json!({"cohort_scope": {"kind": "family"}})),
     )
     .await;
-    let observed = edge.peer_cohort_scope_from_persist("remote-peer").await;
+    let observed = edge
+        .peer_cohort_scope_from_persist(&remote_signer.key_id)
+        .await;
     assert_eq!(observed, Some(CohortScope::Family));
     let absent = edge.peer_cohort_scope_from_persist("never-seeded").await;
     assert_eq!(absent, None, "no row → None (defaults to Public at caller)");

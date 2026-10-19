@@ -105,6 +105,9 @@ async fn test_anchor_peer_roots_through_edge_root_binding() {
     let peer_ed = Ed25519Signer::from_seed(&[0x0a; 32]).expect("peer ed25519");
     let peer_pqc = MlDsa65Signer::from_seed(&[0x0b; 32]).expect("peer ml-dsa");
     let peer_ed_pub = peer_ed.public_key().expect("peer ed pub");
+    // persist #1103 (CC 2.6.8): the peer's key_id is DERIVED from its own
+    // Ed25519 pubkey, never hand-written.
+    let peer_key_id = ciris_verify_core::fedcode::derive_key_id("edge-key-peer", &peer_ed_pub);
     let peer_pqc_pub = PqcSigner::public_key(&peer_pqc).expect("peer pqc pub");
     // v31.0.0: the provenance link's subject binding now REFUSES a registration
     // whose SIGNED bytes omit any of `identity_type`/`pubkey_ed25519_base64`/
@@ -113,7 +116,7 @@ async fn test_anchor_peer_roots_through_edge_root_binding() {
     // Bind the full subject set into the envelope the scrub covers so it matches
     // the columns below.
     let peer_env = serde_json::json!({
-        "key_id": "edge-key-peer",
+        "key_id": &peer_key_id,
         "identity_type": "agent",
         "pubkey_ed25519_base64": B64.encode(&peer_ed_pub),
         "pubkey_ml_dsa_65_base64": B64.encode(&peer_pqc_pub),
@@ -124,12 +127,12 @@ async fn test_anchor_peer_roots_through_edge_root_binding() {
         .expect("peer scrub by root");
     let ts: chrono::DateTime<chrono::Utc> = "2026-05-01T00:00:00Z".parse().unwrap();
     let peer = KeyRecord {
-        key_id: "edge-key-peer".to_string(),
+        key_id: peer_key_id.clone(),
         pubkey_ed25519_base64: B64.encode(&peer_ed_pub),
         pubkey_ml_dsa_65_base64: Some(B64.encode(&peer_pqc_pub)),
         algorithm: "hybrid".to_string(),
         identity_type: "agent".to_string(),
-        identity_ref: "edge-key-peer".to_string(),
+        identity_ref: peer_key_id.clone(),
         valid_from: ts,
         valid_until: None,
         registration_envelope: peer_env,
@@ -165,7 +168,7 @@ async fn test_anchor_peer_roots_through_edge_root_binding() {
     // ── 7. Edge's rooting path CONFIRMS the peer through the SW test anchor. ─
     let rooting: Arc<dyn RootingDirectory> = backend;
     let verdict = rooting
-        .root_binding("edge-key-peer", &B64.encode(&peer_ed_pub))
+        .root_binding(&peer_key_id, &B64.encode(&peer_ed_pub))
         .await;
 
     match verdict {

@@ -133,14 +133,25 @@ struct Ident {
 }
 
 impl Ident {
-    fn new(key_id: &str, seed: u8) -> Self {
-        let mut ed = Ed25519SoftwareSigner::new(key_id);
+    /// `label`'s identity over `[seed; 32]`. Its key id is DERIVED from its
+    /// own Ed25519 key (`fedcode::derive_key_id(label, pubkey)`): persist v59
+    /// (CIRISPersist#1103) refuses a registered id that is not.
+    fn new(label: &str, seed: u8) -> Self {
+        use ciris_crypto::ClassicalSigner as _;
+        // The alias is `<label>-engine`, so the device's engine-derived id
+        // (`derive_key_id(alias, pk)`) is a separate row from this
+        // identity's own derived id over the same key.
+        let mut ed = Ed25519SoftwareSigner::new(format!("{label}-engine"));
         ed.import_key(&[seed; 32]).expect("import ed key");
         let pqc =
-            MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{key_id}-pqc"))
+            MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{label}-pqc"))
                 .expect("ml-dsa from seed");
+        let ed_pub = ciris_crypto::Ed25519Signer::from_seed(&[seed; 32])
+            .expect("ed25519 from seed")
+            .public_key()
+            .expect("ed pubkey");
         Self {
-            key_id: key_id.to_owned(),
+            key_id: ciris_verify_core::fedcode::derive_key_id(label, &ed_pub),
             seed,
             ed,
             pqc,
@@ -149,6 +160,14 @@ impl Ident {
 
     async fn record(&self) -> KeyRecord {
         let ed_pub = self.ed.public_key().await.expect("ed pubkey");
+        assert_eq!(
+            self.key_id,
+            ciris_verify_core::fedcode::derive_key_id(
+                self.ed.current_alias().trim_end_matches("-engine"),
+                &ed_pub
+            ),
+            "the registered key id is derived from its own key (CIRISPersist#1103)"
+        );
         let pqc_pub = self.pqc.public_key().await.expect("pqc pubkey");
         let envelope = serde_json::json!({ "key_id": self.key_id });
         let canonical = serde_json::to_vec(&envelope).expect("serialize");

@@ -116,13 +116,15 @@ async fn paired_transports(
     let port_a = free_port();
 
     let cfg_a = {
-        let mut c = ReticulumTransportConfig::new(tmp.join("a/transport.id"), "edge-link-aaaa");
+        let mut c =
+            ReticulumTransportConfig::new(tmp.join("a/transport.id"), key_a.key_id.as_str());
         c.listen_addr = format!("127.0.0.1:{port_a}").parse().unwrap();
         c.announce_interval = Duration::from_secs(2);
         c
     };
     let cfg_b = {
-        let mut c = ReticulumTransportConfig::new(tmp.join("b/transport.id"), "edge-link-bbbb");
+        let mut c =
+            ReticulumTransportConfig::new(tmp.join("b/transport.id"), key_b.key_id.as_str());
         c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
         c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
         c.announce_interval = Duration::from_secs(2);
@@ -157,9 +159,9 @@ async fn paired_transports(
     // anti-entropy path (CIRISEdge#175) production uses.
     prime_v7_peer_pair(
         &transport_a,
-        "edge-link-aaaa",
+        key_a.key_id.as_str(),
         &transport_b,
-        "edge-link-bbbb",
+        key_b.key_id.as_str(),
     )
     .await;
 
@@ -170,7 +172,7 @@ async fn paired_transports(
 
     // Sanity: post-prime, B knows A (and A knows B). No await on the
     // announce mechanism — explicit-hash destinations can't announce.
-    let discovered = transport_b.knows_peer("edge-link-aaaa").await;
+    let discovered = transport_b.knows_peer(key_a.key_id.as_str()).await;
     assert!(
         discovered,
         "post-prime `knows_peer` must be true — v7.0.0 explicit-hash discovery is out-of-band",
@@ -242,7 +244,7 @@ async fn link_open_returns_handle() {
 
     // B knows A (rooted). The destination hash for A's ciris.edge
     // endpoint is the dest_hash B cached on A's announce.
-    let dest_hash_a = b_dest_hash_for(&transport_b, "edge-link-aaaa").await;
+    let dest_hash_a = b_dest_hash_for(&transport_b, &link_a_id()).await;
 
     let link_id_bytes = transport_b
         .link_open(&dest_hash_a, Duration::from_secs(20))
@@ -329,7 +331,7 @@ async fn link_teardown_idempotent() {
 
     // Open a link, tear it down, then call teardown again — both must
     // succeed.
-    let dest_hash_a = b_dest_hash_for(&transport_b, "edge-link-aaaa").await;
+    let dest_hash_a = b_dest_hash_for(&transport_b, &link_a_id()).await;
     let link_id_bytes = transport_b
         .link_open(&dest_hash_a, Duration::from_secs(20))
         .await
@@ -358,7 +360,7 @@ async fn link_teardown_drains_in_flight_requests() {
     let (_transport_a, transport_b, listen_a, listen_b, _bus_a, _bus_b, _rx_a) =
         paired_transports(tmp.path()).await;
 
-    let dest_hash_a = b_dest_hash_for(&transport_b, "edge-link-aaaa").await;
+    let dest_hash_a = b_dest_hash_for(&transport_b, &link_a_id()).await;
     let link_id_bytes = transport_b
         .link_open(&dest_hash_a, Duration::from_secs(20))
         .await
@@ -400,7 +402,7 @@ async fn link_state_transitions_emit_events() {
 
     let mut rx_links = bus_b.subscribe_links();
 
-    let dest_hash_a = b_dest_hash_for(&transport_b, "edge-link-aaaa").await;
+    let dest_hash_a = b_dest_hash_for(&transport_b, &link_a_id()).await;
     let link_id_bytes = transport_b
         .link_open(&dest_hash_a, Duration::from_secs(20))
         .await
@@ -469,7 +471,7 @@ async fn link_request_round_trip() {
     let (_transport_a, transport_b, listen_a, listen_b, _bus_a, _bus_b, _rx_a) =
         paired_transports(tmp.path()).await;
 
-    let dest_hash_a = b_dest_hash_for(&transport_b, "edge-link-aaaa").await;
+    let dest_hash_a = b_dest_hash_for(&transport_b, &link_a_id()).await;
     let link_id_bytes = transport_b
         .link_open(&dest_hash_a, Duration::from_secs(20))
         .await
@@ -568,4 +570,10 @@ async fn b_dest_hash_for(transport: &ReticulumTransport, peer_key_id: &str) -> V
         .await
         .expect("peer dest_hash must be known after rooting")
         .to_vec()
+}
+
+/// `edge-link-aaaa`'s derived key id (persist v59, CIRISPersist#1103: a registered
+/// key id is `derive_key_id(label, pubkey)`, never the bare label).
+fn link_a_id() -> String {
+    TestFedKey::new("edge-link-aaaa", 0x2a).key_id
 }
