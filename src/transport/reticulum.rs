@@ -15650,6 +15650,37 @@ pub fn offline_route_material(
     })
 }
 
+/// CC 5.3.4 — **the offline emit, end to end**: open the file-backed custody
+/// at `identity_path` ([`offline_route_material`]) and sign this node's row
+/// through the runtime's own producer
+/// ([`crate::transport::self_route::sign_route_offline`]). The one function
+/// both entry points call: the `edge_node emit-transport-destination` harness
+/// command and the production PyO3 `emit_transport_destination`.
+///
+/// # Errors
+/// [`crate::transport::self_route::OfflineEmitError`].
+pub async fn emit_route_from_custody(
+    signer: &LocalSigner,
+    identity_path: &std::path::Path,
+    epoch: u64,
+    asserted_at: DateTime<Utc>,
+) -> Result<
+    ciris_persist::federation::self_at_login::SignedTransportDestination,
+    crate::transport::self_route::OfflineEmitError,
+> {
+    let material = offline_route_material(identity_path)
+        .map_err(|e| crate::transport::self_route::OfflineEmitError::Custody(e.to_string()))?;
+    crate::transport::self_route::sign_route_offline(
+        signer,
+        material.named_dest_hash,
+        &material.transport_pubkey,
+        material.transit.as_ref(),
+        epoch,
+        asserted_at,
+    )
+    .await
+}
+
 fn load_or_generate_identity(path: &std::path::Path) -> Result<Identity, TransportError> {
     if path.exists() {
         let bytes = std::fs::read(path).map_err(|e| {

@@ -7990,6 +7990,82 @@ fn federation_session_respond(
     Ok(out)
 }
 
+/// CC 5.3.4 (rc9 0d9e7f0) — **the production offline emit** of this node's
+/// hybrid-signed `transport_destination` row WITH its transit KEX pair, for
+/// the bundle re-mint. The host (CIRISServer) wraps it in its own ceremony
+/// CLI; edge's `edge_node emit-transport-destination` is the harness twin.
+/// Both call ONE function, `reticulum::emit_route_from_custody`, which signs
+/// through the runtime's own producer (`self_route::sign_route_offline`).
+///
+/// No network and no running node: `engine` supplies the node's own hybrid
+/// federation signer (`local_signer_capsule()`, the same identity
+/// `init_edge_runtime` hands the transport), `identity_path` is the node's
+/// FILE-backed transport identity (its transit seed sits beside it as
+/// `<identity_path>.transit-kex`), and `node_key_id` is the occurrence key id
+/// the node is dialled by (`init_edge_runtime`'s local key id). Nothing is
+/// minted: a missing identity or seed is a refusal.
+///
+/// Returns the `SignedTransportDestination` as JSON. Raises `ValueError`
+/// carrying the refusal label (`offline_emit_no_transit_pair`,
+/// `offline_emit_no_pqc`, `offline_emit_key_separation`,
+/// `offline_emit_custody`, `offline_emit_sign`, `offline_emit_no_signer`,
+/// `offline_emit_usage`) as `"<label>: <detail>"`.
+#[cfg(feature = "transport-reticulum")]
+#[pyfunction]
+#[pyo3(signature = (engine, identity_path, node_key_id, epoch = None, asserted_at = None))]
+#[allow(clippy::needless_pass_by_value)] // pyo3 surface takes owned values
+fn emit_transport_destination(
+    py: Python<'_>,
+    engine: &Bound<'_, PyAny>,
+    identity_path: std::path::PathBuf,
+    node_key_id: String,
+    epoch: Option<u64>,
+    asserted_at: Option<String>,
+) -> PyResult<String> {
+    let refuse = |label: &str, detail: String| PyValueError::new_err(format!("{label}: {detail}"));
+    let asserted_at = match asserted_at {
+        None => chrono::Utc::now(),
+        Some(t) => chrono::DateTime::parse_from_rfc3339(&t)
+            .map_err(|e| refuse("offline_emit_usage", format!("asserted_at: {e}")))?
+            .with_timezone(&chrono::Utc),
+    };
+    let persist_signer = extract_local_signer(engine).map_err(|e| {
+        refuse(
+            "offline_emit_no_signer",
+            match e {
+                LocalSignerCapsuleError::MethodAbsent => {
+                    "engine exposes no local_signer_capsule()".to_owned()
+                }
+                LocalSignerCapsuleError::Unavailable => {
+                    "engine has no local signer (local_signer_unavailable)".to_owned()
+                }
+                LocalSignerCapsuleError::Other(err) => err.to_string(),
+            },
+        )
+    })?;
+    // The same adaptation `init_edge_runtime` applies to the capsule: the
+    // classical half through persist's adapter, the ML-DSA-65 half forwarded.
+    let pqc = persist_signer.pqc_signer();
+    let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+        ciris_persist::signing::LocalSignerHardwareAdapter::new(persist_signer),
+    );
+    let signer = LocalSigner::new(node_key_id, classical, pqc);
+    let row = py.detach(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(|e| ("offline_emit_runtime", e.to_string()))?;
+        rt.block_on(crate::transport::reticulum::emit_route_from_custody(
+            &signer,
+            &identity_path,
+            epoch.unwrap_or(0),
+            asserted_at,
+        ))
+        .map_err(|e| (e.label(), e.to_string()))
+    });
+    let row = row.map_err(|(label, detail)| refuse(label, detail))?;
+    serde_json::to_string(&row).map_err(|e| refuse("offline_emit_serialize", e.to_string()))
+}
+
 /// CEG §5.6.8.8.1.1 — RC6-pinned two-stage RNS destination-hash recompute.
 /// Lets a conformance verifier independently derive an arbitrary peer's
 /// `destination_hash` from its advertised `(x25519_pub, ed25519_pub)`
@@ -9889,6 +9965,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(federation_session_respond, m)?)?;
     #[cfg(feature = "transport-reticulum")]
     m.add_function(wrap_pyfunction!(rns_destination_hash, m)?)?;
+    // CC 5.3.4 — the production offline emit of the node's signed route.
+    #[cfg(feature = "transport-reticulum")]
+    m.add_function(wrap_pyfunction!(emit_transport_destination, m)?)?;
 
     // CIRISEdge#328 — the §19.7.1.3 v3 producer. Persist >= 16 fail-closes
     // pre-v3 tiers (CIRISVerify#191 flag-day), and edge is the only point
@@ -11706,6 +11785,98 @@ mod pyo3_tier2_tests {
     /// does NOT contain "32 bytes, got 65" (the v0.13.0 blocker shape)
     /// and does NOT contain "local_signer_capsule" (capsule extraction
     /// failure).
+    /// CC 5.3.4 — the production offline emit, through PyO3: an engine with a
+    /// hybrid local signer and a file-backed node custody give a row carrying
+    /// the custody's transit pair, signed under `node_key_id`; with no transit
+    /// seed beside the identity the call raises `ValueError` naming
+    /// `offline_emit_no_transit_pair`, and mints no seed.
+    #[cfg(feature = "transport-reticulum")]
+    #[test]
+    fn py_emit_transport_destination_signs_from_custody_and_refuses_without_a_pair_e1() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let local_seed_path = tmp.path().join("local.seed");
+        std::fs::write(&local_seed_path, [0x43_u8; 32]).expect("write local seed");
+        let pqc_seed_path = tmp.path().join("ml_dsa_65.seed");
+        std::fs::write(&pqc_seed_path, [0x78_u8; 32]).expect("write ml_dsa_65 seed");
+        // A node with a transit seed, and one without.
+        let with_pair = tmp.path().join("with/transport.id");
+        let without_pair = tmp.path().join("without/transport.id");
+        for p in [&with_pair, &without_pair] {
+            std::fs::create_dir_all(p.parent().expect("dir")).expect("mkdir");
+            std::fs::write(
+                p,
+                leviculum_std::generate_identity()
+                    .private_key_bytes()
+                    .expect("identity bytes"),
+            )
+            .expect("identity");
+        }
+        let custody =
+            crate::transport::transit_kex_custody::TransitKexSecret::load_or_generate_file(
+                &with_pair,
+            )
+            .expect("transit seed");
+
+        let outcome: PyResult<(String, String)> = Python::attach(|py| {
+            install_ciris_persist_module(py)?;
+            let engine_cls = py.import("ciris_persist")?.getattr("Engine")?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("dsn", "sqlite::memory:")?;
+            kwargs.set_item("signing_key_id", "edge-offline-emit-signer")?;
+            kwargs.set_item("local_key_id", "edge-offline-emit-local")?;
+            kwargs.set_item("local_key_path", local_seed_path.to_string_lossy().as_ref())?;
+            kwargs.set_item("local_pqc_key_id", "edge-offline-emit-local-pqc")?;
+            kwargs.set_item(
+                "local_pqc_key_path",
+                pqc_seed_path.to_string_lossy().as_ref(),
+            )?;
+            kwargs.set_item("pqc_sweep_on_init", false)?;
+            let engine = engine_cls.call((), Some(&kwargs))?;
+            let row = emit_transport_destination(
+                py,
+                &engine,
+                with_pair.clone(),
+                "node-offline-emit".to_owned(),
+                Some(3),
+                Some("2026-10-01T00:00:00Z".to_owned()),
+            )?;
+            let refused = emit_transport_destination(
+                py,
+                &engine,
+                without_pair.clone(),
+                "node-offline-emit".to_owned(),
+                None,
+                None,
+            )
+            .expect_err("a pair-less node must not emit");
+            Ok((row, refused.value(py).to_string()))
+        });
+        let (row, refused) = outcome.expect("python side");
+        let row: ciris_persist::federation::self_at_login::SignedTransportDestination =
+            serde_json::from_str(&row).expect("row json");
+        assert_eq!(row.attesting_key_id, "node-offline-emit");
+        assert_eq!(row.transport_destination.epoch, 3);
+        assert!(
+            row.signature.mldsa65_signature_base64.is_some(),
+            "hybrid-signed"
+        );
+        assert_eq!(
+            row.transit_kex_pair().expect("pair parses"),
+            Some(custody.pair().clone()),
+            "the custody's own transit pair"
+        );
+        assert!(
+            refused.starts_with("offline_emit_no_transit_pair"),
+            "{refused}"
+        );
+        assert!(
+            !crate::transport::transit_kex_custody::seed_path(&without_pair).exists(),
+            "the emit never mints a transit seed"
+        );
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // verbose 30-arg init call + #458 PQC provisioning
     fn py_init_edge_runtime_local_signer_capsule_supplies_reticulum_identity() {

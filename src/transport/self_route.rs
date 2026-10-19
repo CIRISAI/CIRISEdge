@@ -524,6 +524,10 @@ pub enum OfflineEmitError {
     /// Building or signing failed.
     #[error("building or signing the row failed: {0}")]
     Sign(String),
+    /// The node's custody could not be opened (no transport identity, an
+    /// unreadable seed); nothing is ever minted by an offline emit.
+    #[error("the node's custody could not be opened: {0}")]
+    Custody(String),
 }
 
 impl OfflineEmitError {
@@ -535,6 +539,7 @@ impl OfflineEmitError {
             Self::NoPqc => "offline_emit_no_pqc",
             Self::KeySeparation(_) => "offline_emit_key_separation",
             Self::Sign(_) => "offline_emit_sign",
+            Self::Custody(_) => "offline_emit_custody",
         }
     }
 }

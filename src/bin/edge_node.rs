@@ -6254,7 +6254,9 @@ async fn run_nonmember(occ: Occurrence) -> Result<(), String> {
 /// `<state-dir>/fed`, the transport identity and its transit seed at
 /// `<state-dir>/transport.id`), never minting any of them, and signs through
 /// the runtime's own producer (`self_route::sign_route_offline`). The row is
-/// written as JSON to `--out`.
+/// written as JSON to `--out`. Production hosts call the same function
+/// (`reticulum::emit_route_from_custody`) through PyO3
+/// `emit_transport_destination`.
 ///
 /// ```text
 /// edge_node emit-transport-destination --state-dir <dir> --node-name <name> \
@@ -6308,21 +6310,13 @@ fn emit_transport_destination(args: &[String]) -> std::process::ExitCode {
         Ok(s) => s,
         Err(e) => return fail("offline_emit_no_federation_key", &e),
     };
-    let material = match ciris_edge::transport::reticulum::offline_route_material(
-        &state_dir.join("transport.id"),
-    ) {
-        Ok(m) => m,
-        Err(e) => return fail("offline_emit_no_transport_identity", &e.to_string()),
-    };
     let rt = match tokio::runtime::Builder::new_current_thread().build() {
         Ok(rt) => rt,
         Err(e) => return fail("offline_emit_runtime", &e.to_string()),
     };
-    let row = rt.block_on(ciris_edge::transport::self_route::sign_route_offline(
+    let row = rt.block_on(ciris_edge::transport::reticulum::emit_route_from_custody(
         &signer,
-        material.named_dest_hash,
-        &material.transport_pubkey,
-        material.transit.as_ref(),
+        &state_dir.join("transport.id"),
         epoch,
         asserted_at,
     ));
