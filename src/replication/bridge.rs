@@ -10707,13 +10707,31 @@ pub(crate) mod tests {
     // ciris-verify-core directly so the canonical bytes match without
     // persist exposing the helper.
 
-    /// Deterministic 32-byte seed for `key_id`.
+    /// Deterministic 32-byte seed for `key_id`, from its LABEL (the id less
+    /// its `-<fingerprint>` suffix, [`fixture_label`]): a derived fixture id
+    /// and the label it was derived from name one keypair.
     fn seed_for(key_id: &str) -> [u8; 32] {
         let mut seed = [0x11u8; 32];
-        for (i, b) in key_id.bytes().take(32).enumerate() {
+        for (i, b) in fixture_label(key_id).bytes().take(32).enumerate() {
             seed[i] = b;
         }
         seed
+    }
+
+    /// CIRISPersist#1103 — the label a fixture key id carries: the id less a
+    /// trailing `-<fingerprint>` (KEY_ID_FINGERPRINT_LEN lowercase base32).
+    pub(crate) fn fixture_label(key_id: &str) -> &str {
+        match key_id.rsplit_once('-') {
+            Some((label, fp))
+                if fp.len() == ciris_verify_core::fedcode::KEY_ID_FINGERPRINT_LEN
+                    && fp
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)) =>
+            {
+                label
+            }
+            _ => key_id,
+        }
     }
 
     /// persist v52.0.0 (CIRISPersist#955) — `key_id`'s deterministic fixture
@@ -15614,7 +15632,7 @@ pub(crate) mod tests {
 
     /// persist v59.0.0 — a signed route for each key (the public subject-pull
     /// plane a fixture key can still carry).
-    async fn seed_routes(backend: &MemoryBackend, keys: &[&str]) {
+    pub(crate) async fn seed_routes(backend: &MemoryBackend, keys: &[&str]) {
         let now = Utc::now().trunc_subsecs(6);
         for key in keys {
             backend

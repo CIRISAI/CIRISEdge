@@ -681,8 +681,39 @@ pub(crate) mod test_support {
     use ciris_verify_core::self_at_login::HybridSigningIdentity;
 
     pub(crate) const TS: &str = "2026-08-02T00:00:00Z";
-    pub(crate) const PRESENTER: &str = "presenter-437";
-    pub(crate) const PIPELINE: &str = "ci-pipeline-437";
+    // CIRISPersist#1103 — both register through `put_public_key`, so each id
+    // is `derive_key_id(label, its own Ed25519 key)`: the key comes from the
+    // seed beside it ([`fixed_identity`]), and
+    // `the_bundle_fixture_ids_are_derived_from_their_keys` pins the pair.
+    pub(crate) const PRESENTER: &str = "presenter-437-pwylahzz2f";
+    pub(crate) const PRESENTER_SEED: [u8; 32] = [0x43; 32];
+    pub(crate) const PIPELINE: &str = "ci-pipeline-437-mrz5uafq57";
+    pub(crate) const PIPELINE_SEED: [u8; 32] = [0x37; 32];
+
+    /// The hybrid identity behind `key_id`, its Ed25519 half from `seed` (so
+    /// the id can be derived from it ahead of time), its ML-DSA half fresh.
+    pub(crate) fn fixed_identity(key_id: &str, seed: &[u8; 32]) -> HybridSigningIdentity {
+        HybridSigningIdentity::new(
+            key_id,
+            ciris_crypto::Ed25519Signer::from_seed(seed).expect("ed25519 from seed"),
+            ciris_crypto::MlDsa65Signer::new().expect("ml-dsa-65"),
+        )
+    }
+
+    #[test]
+    fn the_bundle_fixture_ids_are_derived_from_their_keys() {
+        use ciris_crypto::ClassicalSigner as _;
+        for (id, label, seed) in [
+            (PRESENTER, "presenter-437", PRESENTER_SEED),
+            (PIPELINE, "ci-pipeline-437", PIPELINE_SEED),
+        ] {
+            let pk = ciris_crypto::Ed25519Signer::from_seed(&seed)
+                .expect("seed")
+                .public_key()
+                .expect("pk");
+            assert_eq!(id, ciris_verify_core::fedcode::derive_key_id(label, &pk));
+        }
+    }
     pub(crate) const TARGET: &str = "x86_64-unknown-linux-gnu";
     /// The node READING the bundle — whose trust root the capability walk
     /// asks from (CIRISEdge#786). Under the ceremony plane it does not matter.
@@ -803,7 +834,7 @@ pub(crate) mod test_support {
         // The pipeline key, blessed for `infra:attest` by a REAL 2-anchor
         // co-scrub (verify's own producer), admitted through persist's REAL
         // role gate — no fixture backdoor.
-        let pipeline = HybridSigningIdentity::generate(PIPELINE).expect("pipeline identity");
+        let pipeline = fixed_identity(PIPELINE, &PIPELINE_SEED);
         let pm = pipeline.directory_member().expect("pipeline member");
         let pipeline_record = produce_multiscrub_key_record(
             &[&a1, &a2],
@@ -851,7 +882,7 @@ pub(crate) mod test_support {
     /// walk plane) or leaves it standing-less.
     pub(crate) async fn plain_pipeline_fixture() -> (MemoryBackend, Vec<u8>) {
         let backend = MemoryBackend::new();
-        let pipeline = HybridSigningIdentity::generate(PIPELINE).expect("pipeline identity");
+        let pipeline = fixed_identity(PIPELINE, &PIPELINE_SEED);
         FederationDirectory::put_public_key(
             &backend,
             ciris_persist::federation::SignedKeyRecord {
@@ -871,7 +902,7 @@ pub(crate) mod test_support {
         backend: &MemoryBackend,
         pipeline: &HybridSigningIdentity,
     ) -> Vec<u8> {
-        let presenter = HybridSigningIdentity::generate(PRESENTER).expect("presenter identity");
+        let presenter = fixed_identity(PRESENTER, &PRESENTER_SEED);
         FederationDirectory::put_public_key(
             backend,
             ciris_persist::federation::SignedKeyRecord {
@@ -924,14 +955,13 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::test_support::{
-        field_fixture, plain_pipeline_fixture, row_for_identity, shaped_bundle_bytes, tampered,
-        PIPELINE, PRESENTER, READER, TARGET, TS,
+        field_fixture, fixed_identity, plain_pipeline_fixture, row_for_identity,
+        shaped_bundle_bytes, tampered, PIPELINE, PRESENTER, PRESENTER_SEED, READER, TARGET, TS,
     };
     use super::*;
     use ciris_persist::federation::types::identity_type;
     use ciris_persist::federation::FederationDirectory;
     use ciris_persist::store::MemoryBackend;
-    use ciris_verify_core::self_at_login::HybridSigningIdentity;
 
     use crate::verify::{ProvenanceChain, RootingDirectory, RootingRejection, RootingVerdict};
 
@@ -1294,7 +1324,7 @@ mod tests {
         // match the bundle for THIS arm — the pin failure fires before any
         // signature check.)
         let presenter_only = MemoryBackend::new();
-        let presenter = HybridSigningIdentity::generate(PRESENTER).expect("presenter");
+        let presenter = fixed_identity(PRESENTER, &PRESENTER_SEED);
         FederationDirectory::put_public_key(
             &presenter_only,
             ciris_persist::federation::SignedKeyRecord {

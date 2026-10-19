@@ -1534,6 +1534,12 @@ mod tests {
         );
     }
 
+    /// CIRISPersist#1103 — the id a [`key`] fixture registers under:
+    /// `derive_key_id(label, <the zero placeholder pubkey>)`.
+    fn zid(label: &str) -> String {
+        ciris_verify_core::fedcode::derive_key_id(label, &[0u8; 32])
+    }
+
     /// A minimal registered key. persist requires every family member to be a
     /// registered `federation_keys` row (members MUST be registered keys), and
     /// `put_public_key` does not hybrid-verify the registration row, so
@@ -1543,6 +1549,13 @@ mod tests {
         use base64::Engine as _;
         use ciris_persist::federation::types::{algorithm, identity_type};
         use ciris_persist::federation::{KeyRecord, SignedKeyRecord};
+        // CIRISPersist#1103 — the registered id is derived from the key the
+        // row carries (the zero placeholder): see [`zid`].
+        assert_eq!(
+            key_id,
+            zid(crate::replication::bridge::tests::fixture_label(key_id)),
+            "fixture key id {key_id:?} is not derived from its own key (CIRISPersist#1103)"
+        );
         let b64 = base64::engine::general_purpose::STANDARD;
         let now = chrono::Utc::now();
         SignedKeyRecord {
@@ -1615,10 +1628,10 @@ mod tests {
     /// indistinguishable from a gate that is dead.
     #[tokio::test]
     async fn the_refusal_legs_through_the_real_resolver() {
-        let root = "relay-accord-root";
-        let seated = "relay-holder-a";
-        let stranger = "relay-stranger";
-        let us = "relay-this-node";
+        let root: &str = &zid("relay-accord-root");
+        let seated: &str = &zid("relay-holder-a");
+        let stranger: &str = &zid("relay-stranger");
+        let us: &str = &zid("relay-this-node");
 
         let backend = Arc::new(MemoryBackend::new());
         for who in [root, seated, stranger, us] {
@@ -1699,16 +1712,19 @@ mod tests {
     /// `bridge::tests::an_object_belonging_to_another_accord_is_not_relayed_on_this_ones_roster`.
     #[tokio::test]
     async fn an_object_naming_another_root_is_judged_against_that_root() {
-        let us = "x-node";
-        let signer = "x-holder-on-a";
+        let accord_a: &str = &zid("accord-a");
+        let accord_b: &str = &zid("accord-b");
+        let other_holder: &str = &zid("some-other-holder");
+        let us: &str = &zid("x-node");
+        let signer: &str = &zid("x-holder-on-a");
         let backend = Arc::new(MemoryBackend::new());
-        for who in [us, signer, "some-other-holder", "accord-a", "accord-b"] {
+        for who in [us, signer, other_holder, accord_a, accord_b] {
             backend.put_public_key(key(who)).await.expect("register");
         }
         // The node holds a family for BOTH accords — so "cannot judge" is not
         // what is doing the work here; the roster resolves either way.
-        seed_family(&backend, "accord-a", &[signer]).await;
-        seed_family(&backend, "accord-b", &["some-other-holder"]).await;
+        seed_family(&backend, accord_a, &[signer]).await;
+        seed_family(&backend, accord_b, &[other_holder]).await;
 
         let dir: Arc<dyn FederationDirectory> = backend;
         let gate = AccordRelayGate::new(dir, Some(us.to_owned()));
@@ -1717,7 +1733,7 @@ mod tests {
         // The object says `accord-b`. The signer is seated on `accord-a`.
         let decision = gate
             .may_relay_attestation(
-                &accord_row_value(ACCORD_HEARTBEAT_DIMENSION, signer, "accord-b", None),
+                &accord_row_value(ACCORD_HEARTBEAT_DIMENSION, signer, accord_b, None),
                 t0,
             )
             .await;
@@ -1734,7 +1750,7 @@ mod tests {
         // leg after seating passes.)
         assert_eq!(
             gate.may_relay_attestation(
-                &accord_row_value(ACCORD_HEARTBEAT_DIMENSION, signer, "accord-a", None),
+                &accord_row_value(ACCORD_HEARTBEAT_DIMENSION, signer, accord_a, None),
                 t0,
             )
             .await,
@@ -1772,10 +1788,10 @@ mod tests {
     /// everything.
     #[tokio::test]
     async fn the_serve_entry_point_refuses_every_row_it_cannot_judge() {
-        let us = "e-node";
-        let signer = "e-holder";
-        let root = "e-accord";
-        let other = "e-other-accord";
+        let us: &str = &zid("e-node");
+        let signer: &str = &zid("e-holder");
+        let root: &str = &zid("e-accord");
+        let other: &str = &zid("e-other-accord");
         let backend = Arc::new(MemoryBackend::new());
         for who in [us, signer, root, other] {
             backend.put_public_key(key(who)).await.expect("register");
@@ -1880,10 +1896,10 @@ mod tests {
     /// available on every namespace. Asserted here rather than assumed.
     #[tokio::test]
     async fn the_type_namespace_row_is_judged_not_skipped_and_both_namespaces_gate_once() {
-        let us = "t-node";
-        let signer = "t-holder";
-        let second = "t-holder-second";
-        let root = "t-accord";
+        let us: &str = &zid("t-node");
+        let signer: &str = &zid("t-holder");
+        let second: &str = &zid("t-holder-second");
+        let root: &str = &zid("t-accord");
         let backend = Arc::new(MemoryBackend::new());
         for who in [us, signer, second, root] {
             backend.put_public_key(key(who)).await.expect("register");
@@ -2093,14 +2109,17 @@ mod tests {
     /// — a trust edge needs the bridge module's hybrid-signing fixtures.)
     #[tokio::test]
     async fn a_signed_accord_root_naming_another_accord_is_judged_against_that_one() {
-        let us = "sk-node";
-        let signer = "sk-holder-on-a";
+        let accord_a: &str = &zid("accord-a");
+        let accord_b: &str = &zid("accord-b");
+        let other_holder: &str = &zid("sk-other-holder");
+        let us: &str = &zid("sk-node");
+        let signer: &str = &zid("sk-holder-on-a");
         let backend = Arc::new(MemoryBackend::new());
-        for who in [us, signer, "sk-other-holder", "accord-a", "accord-b"] {
+        for who in [us, signer, other_holder, accord_a, accord_b] {
             backend.put_public_key(key(who)).await.expect("register");
         }
-        seed_family(&backend, "accord-a", &[signer]).await;
-        seed_family(&backend, "accord-b", &["sk-other-holder"]).await;
+        seed_family(&backend, accord_a, &[signer]).await;
+        seed_family(&backend, accord_b, &[other_holder]).await;
 
         let dir: Arc<dyn FederationDirectory> = backend;
         let gate = AccordRelayGate::new(dir, Some(us.to_owned()));
@@ -2115,7 +2134,7 @@ mod tests {
                     "accord:human_dignity:v1",
                     signer,
                     "some-scored-agent",
-                    Some("accord-b")
+                    Some(accord_b)
                 ),
                 t0
             )
@@ -2133,7 +2152,7 @@ mod tests {
                     "accord:human_dignity:v1",
                     signer,
                     "some-scored-agent",
-                    Some("accord-a")
+                    Some(accord_a)
                 ),
                 t0
             )

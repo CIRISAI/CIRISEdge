@@ -94,13 +94,18 @@ struct Ident {
 
 impl Ident {
     fn new(key_id: &str, seed: u8) -> Self {
-        let mut ed = Ed25519SoftwareSigner::new(key_id);
+        // The alias is `<label>-engine`, so a device's engine-derived id
+        // (`derive_key_id(alias, pk)`) stays apart from this identity's own
+        // derived id over the same key (CIRISPersist#1103).
+        let mut ed = Ed25519SoftwareSigner::new(format!("{key_id}-engine"));
         ed.import_key(&[seed; 32]).expect("import ed key");
         let pqc =
             MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{key_id}-pqc"))
                 .expect("ml-dsa from seed");
         Self {
-            key_id: key_id.to_owned(),
+            // CIRISPersist#1103 — registered under the id derived from its own
+            // key.
+            key_id: crate::identity::derived_fixture_key_id(key_id, &[seed; 32]),
             seed,
             ed,
             pqc,

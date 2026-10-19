@@ -329,8 +329,13 @@ mod tests {
     //    modules cannot import each other's cfg(test) items. ──
 
     fn seed_for(key_id: &str) -> [u8; 32] {
+        // CIRISPersist#1103 — from the id's LABEL, the bridge fixtures' rule.
         let mut seed = [0x11u8; 32];
-        for (i, b) in key_id.bytes().take(32).enumerate() {
+        for (i, b) in crate::replication::bridge::tests::fixture_label(key_id)
+            .bytes()
+            .take(32)
+            .enumerate()
+        {
             seed[i] = b;
         }
         seed

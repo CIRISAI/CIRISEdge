@@ -399,7 +399,12 @@ mod tests {
             MlDsa65SoftwareSigner::from_seed_bytes(&pqc_seed, format!("{key_id}-pqc"))
                 .expect("ml_dsa_65 from_seed_bytes"),
         );
-        Arc::new(LocalSigner::new(key_id, classical, Some(pqc)))
+        Arc::new(LocalSigner::new(
+            // CIRISPersist#1103 — the id derived from its own key.
+            crate::identity::derived_fixture_key_id(key_id, &ed_seed),
+            classical,
+            Some(pqc),
+        ))
     }
 
     /// An Ed25519-ONLY signer — the hybrid-pending node that cannot satisfy
@@ -407,7 +412,12 @@ mod tests {
     fn classical_only_signer(key_id: &str) -> Arc<LocalSigner> {
         let classical: Arc<dyn HardwareSigner> =
             Arc::new(Ed25519SoftwareSigner::from_bytes(&seed32(key_id), key_id).expect("ed25519"));
-        Arc::new(LocalSigner::new(key_id, classical, None))
+        Arc::new(LocalSigner::new(
+            // CIRISPersist#1103 — the id derived from its own key.
+            crate::identity::derived_fixture_key_id(key_id, &seed32(key_id)),
+            classical,
+            None,
+        ))
     }
 
     /// Register `signer`'s pubkeys as a federation key so its signatures

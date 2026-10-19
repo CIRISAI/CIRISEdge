@@ -325,7 +325,18 @@ mod admit_tests {
             .into()
     }
 
-    fn signer(key_id: &str, seed: u8) -> crate::identity::LocalSigner {
+    /// A person's signer, registered under the id derived from its own key
+    /// (CIRISPersist#1103); the seed is the person's ([`fed`]).
+    fn signer(label: &str, seed: u8) -> crate::identity::LocalSigner {
+        signer_as(
+            &crate::identity::derived_fixture_key_id(label, &[seed; 32]),
+            seed,
+        )
+    }
+
+    /// A signer under `key_id` verbatim — for the room id, which persist's
+    /// fixture convention registers as a key (a group id: not derived).
+    fn signer_as(key_id: &str, seed: u8) -> crate::identity::LocalSigner {
         let classical: Arc<dyn HardwareSigner> =
             Arc::new(Ed25519SoftwareSigner::from_bytes(&[seed; 32], key_id).unwrap());
         let pqc: Arc<dyn PqcSigner> = Arc::new(
@@ -333,6 +344,18 @@ mod admit_tests {
                 .unwrap(),
         );
         crate::identity::LocalSigner::new(key_id, classical, Some(pqc))
+    }
+
+    /// The registered id of the fixture person `label` (CIRISPersist#1103).
+    fn fed(label: &str) -> String {
+        let seed = match label {
+            "alice-fed" => 1,
+            "bob-fed" => 2,
+            "carol-fed" => 3,
+            "dave-fed" => 4,
+            other => panic!("no fixture person {other}"),
+        };
+        crate::identity::derived_fixture_key_id(label, &[seed; 32])
     }
 
     async fn user_record(s: &crate::identity::LocalSigner) -> KeyRecord {
@@ -442,7 +465,7 @@ mod admit_tests {
             // key material is throwaway — nothing signs AS the room here; the
             // founder signs everything — the row exists to satisfy the FK.
             dir.put_public_key(SignedKeyRecord {
-                record: user_record(&signer(&room, 9)).await,
+                record: user_record(&signer_as(&room, 9)).await,
             })
             .await
             .expect("register the room id as a key (persist fixture convention)");
@@ -451,7 +474,7 @@ mod admit_tests {
             &room,
             "the room",
             &[(
-                "alice-fed",
+                &fed("alice-fed"),
                 Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER),
             )],
             ciris_persist::federation::types::consensus_protocol::FOUNDER_ONLY,
@@ -466,9 +489,11 @@ mod admit_tests {
         .await
         .expect("persist admits the room");
         consent(&dir, &room, &alice, &bob, None).await;
-        assert!(widen_community(&*dir, &room, "bob-fed", None, ts(), &alice)
-            .await
-            .expect("bob joins on his acceptance"));
+        assert!(
+            widen_community(&*dir, &room, &fed("bob-fed"), None, ts(), &alice)
+                .await
+                .expect("bob joins on his acceptance")
+        );
         (dir, alice, room, carol)
     }
 
@@ -489,22 +514,25 @@ mod admit_tests {
     #[tokio::test]
     async fn a_widening_is_admitted_and_the_active_roster_grows() {
         let (dir, alice, room, carol) = room_of_two(false).await;
-        assert_eq!(active(&dir, &room).await, ["alice-fed", "bob-fed"]);
+        assert_eq!(
+            active(&dir, &room).await,
+            [fed("alice-fed"), fed("bob-fed")]
+        );
 
         consent(&dir, &room, &alice, &carol, None).await;
-        let added = widen_community(&*dir, &room, "carol-fed", None, ts(), &alice)
+        let added = widen_community(&*dir, &room, &fed("carol-fed"), None, ts(), &alice)
             .await
             .expect("persist must ADMIT the widening this producer builds");
         assert!(added, "a genuine add reports true");
         assert_eq!(
             active(&dir, &room).await,
-            ["alice-fed", "bob-fed", "carol-fed"],
+            [fed("alice-fed"), fed("bob-fed"), fed("carol-fed")],
             "the ACTIVE roster — what the DEK cascade wraps to — must include the new member",
         );
 
         // Idempotent: the same widening again is the no-op the door promises,
         // and the signature over the (unchanged) grown record still verifies.
-        let again = widen_community(&*dir, &room, "carol-fed", None, ts(), &alice)
+        let again = widen_community(&*dir, &room, &fed("carol-fed"), None, ts(), &alice)
             .await
             .expect("a second identical widening is not an error");
         assert!(
@@ -523,10 +551,10 @@ mod admit_tests {
         // Carol's key signs, but the spec CLAIMS alice as the authority — the
         // registered pubkeys for alice do not verify carol's signature.
         let (member, mut spec) =
-            community_membership_widening(&*dir, &room, "carol-fed", None, ts(), &carol)
+            community_membership_widening(&*dir, &room, &fed("carol-fed"), None, ts(), &carol)
                 .await
                 .expect("build");
-        spec.authority_key_id = "alice-fed".to_owned();
+        spec.authority_key_id = fed("alice-fed");
         let err = dir
             .add_community_member(&room, member, &spec)
             .await
@@ -540,7 +568,7 @@ mod admit_tests {
         );
         assert_eq!(
             active(&dir, &room).await,
-            ["alice-fed", "bob-fed"],
+            [fed("alice-fed"), fed("bob-fed")],
             "and nothing was written",
         );
     }
@@ -561,10 +589,10 @@ mod admit_tests {
         consent(&dir, &room, &alice, &carol, None).await;
         consent(&dir, &room, &alice, &dave, None).await;
         let (member, spec) =
-            community_membership_widening(&*dir, &room, "carol-fed", None, ts(), &alice)
+            community_membership_widening(&*dir, &room, &fed("carol-fed"), None, ts(), &alice)
                 .await
                 .expect("build");
-        widen_community(&*dir, &room, "dave-fed", None, ts(), &alice)
+        widen_community(&*dir, &room, &fed("dave-fed"), None, ts(), &alice)
             .await
             .expect("first add");
         assert!(
@@ -575,11 +603,16 @@ mod admit_tests {
         );
         assert_eq!(
             active(&dir, &room).await,
-            ["alice-fed", "bob-fed", "carol-fed", "dave-fed"],
+            [
+                fed("alice-fed"),
+                fed("bob-fed"),
+                fed("carol-fed"),
+                fed("dave-fed")
+            ],
         );
         // Idempotent on the plane: a re-add of an active member writes nothing.
         assert!(
-            !widen_community(&*dir, &room, "carol-fed", None, ts(), &alice)
+            !widen_community(&*dir, &room, &fed("carol-fed"), None, ts(), &alice)
                 .await
                 .expect("re-add is not an error"),
             "a member already active at effective_at is Ok(false)"
@@ -601,7 +634,7 @@ mod admit_tests {
         revoke_community_member(
             &*dir,
             &room,
-            "bob-fed",
+            &fed("bob-fed"),
             ts(),
             Some("left the room"),
             &[],
@@ -612,7 +645,7 @@ mod admit_tests {
 
         assert_eq!(
             active(&dir, &room).await,
-            ["alice-fed"],
+            [fed("alice-fed")],
             "the ACTIVE roster excludes the removed member — the roster record itself is \
              untouched (append-only revocation, composed at read)",
         );
@@ -621,11 +654,11 @@ mod admit_tests {
             .await
             .expect("list");
         assert_eq!(revs.len(), 1);
-        assert_eq!(revs[0].removed_identity_key_id, "bob-fed");
+        assert_eq!(revs[0].removed_identity_key_id, fed("bob-fed"));
         assert_eq!(revs[0].reason.as_deref(), Some("left the room"));
 
         // Idempotent on (community, member).
-        revoke_community_member(&*dir, &room, "bob-fed", ts(), None, &[], &alice)
+        revoke_community_member(&*dir, &room, &fed("bob-fed"), ts(), None, &[], &alice)
             .await
             .expect("a repeated removal is not an error");
     }
@@ -636,16 +669,17 @@ mod admit_tests {
     #[tokio::test]
     async fn a_removal_under_a_forged_authority_is_refused_before_any_rotation() {
         let (dir, _alice, room, carol) = room_of_two(true).await;
-        let mut signed = community_membership_revocation(&room, "bob-fed", ts(), None, &[], &carol)
-            .await
-            .expect("build");
-        signed.authority_key_id = "alice-fed".to_owned();
+        let mut signed =
+            community_membership_revocation(&room, &fed("bob-fed"), ts(), None, &[], &carol)
+                .await
+                .expect("build");
+        signed.authority_key_id = fed("alice-fed");
         dir.put_community_membership_revocation(signed)
             .await
             .expect_err("a forged removal is refused at the signature, before the epoch bump");
         assert_eq!(
             active(&dir, &room).await,
-            ["alice-fed", "bob-fed"],
+            [fed("alice-fed"), fed("bob-fed")],
             "nothing was written",
         );
     }
@@ -658,7 +692,7 @@ mod admit_tests {
     async fn a_future_dated_removal_is_refused() {
         let (dir, alice, room, _carol) = room_of_two(true).await;
         let future = chrono::Utc::now() + chrono::Duration::days(1);
-        let err = revoke_community_member(&*dir, &room, "bob-fed", future, None, &[], &alice)
+        let err = revoke_community_member(&*dir, &room, &fed("bob-fed"), future, None, &[], &alice)
             .await
             .expect_err("persist refuses a future-dated community removal");
         assert!(
@@ -677,20 +711,25 @@ mod admit_tests {
         let t1 = ts() + chrono::Duration::seconds(1);
         let t2 = ts() + chrono::Duration::seconds(2);
         let t3 = ts() + chrono::Duration::seconds(3);
-        revoke_community_member(&*dir, &room, "bob-fed", t1, None, &[], &alice)
+        revoke_community_member(&*dir, &room, &fed("bob-fed"), t1, None, &[], &alice)
             .await
             .expect("a room that is not a registered key can revoke now");
-        assert_eq!(active(&dir, &room).await, ["alice-fed"]);
+        assert_eq!(active(&dir, &room).await, [fed("alice-fed")]);
         // Re-add, later than the removal: the fold takes the latest event.
-        assert!(widen_community(&*dir, &room, "bob-fed", None, t2, &alice)
-            .await
-            .expect("re-add"));
-        assert_eq!(active(&dir, &room).await, ["alice-fed", "bob-fed"]);
+        assert!(
+            widen_community(&*dir, &room, &fed("bob-fed"), None, t2, &alice)
+                .await
+                .expect("re-add")
+        );
+        assert_eq!(
+            active(&dir, &room).await,
+            [fed("alice-fed"), fed("bob-fed")]
+        );
         // …and remove again: a second revocation row, a different PK.
-        revoke_community_member(&*dir, &room, "bob-fed", t3, None, &[], &alice)
+        revoke_community_member(&*dir, &room, &fed("bob-fed"), t3, None, &[], &alice)
             .await
             .expect("a re-added member can be removed again");
-        assert_eq!(active(&dir, &room).await, ["alice-fed"]);
+        assert_eq!(active(&dir, &room).await, [fed("alice-fed")]);
         assert_eq!(
             dir.list_community_membership_revocations_for(&room)
                 .await
@@ -711,7 +750,7 @@ mod admit_tests {
             &*dir,
             crate::membership::GroupScope::Community,
             &room,
-            "carol-fed",
+            &fed("carol-fed"),
             None,
             ts(),
             &alice,
@@ -724,7 +763,10 @@ mod admit_tests {
             "{err}"
         );
         assert!(err.is_retryable(), "the acceptance may still arrive");
-        assert_eq!(active(&dir, &room).await, ["alice-fed", "bob-fed"]);
+        assert_eq!(
+            active(&dir, &room).await,
+            [fed("alice-fed"), fed("bob-fed")]
+        );
     }
 
     /// persist v52.0.0 (CIRISPersist#955) — **a decline is final**: a later
@@ -737,7 +779,7 @@ mod admit_tests {
             &*dir,
             crate::membership::GroupScope::Community,
             &room,
-            "carol-fed",
+            &fed("carol-fed"),
             None,
             chrono::Utc::now() + chrono::Duration::days(7),
             &alice,
@@ -751,7 +793,7 @@ mod admit_tests {
             &*dir,
             crate::membership::GroupScope::Community,
             &room,
-            "carol-fed",
+            &fed("carol-fed"),
             None,
             ts(),
             &alice,
@@ -760,11 +802,14 @@ mod admit_tests {
         .expect_err("declined");
         assert_eq!(err.rule(), Some(crate::membership::RULE_DECLINED), "{err}");
         assert!(!err.is_retryable());
-        assert_eq!(active(&dir, &room).await, ["alice-fed", "bob-fed"]);
+        assert_eq!(
+            active(&dir, &room).await,
+            [fed("alice-fed"), fed("bob-fed")]
+        );
         // And the classifier the apply path uses agrees: terminal.
         let persist_err = ciris_persist::federation::Error::MembershipAcceptanceRefused {
             group_key_id: room.clone(),
-            member_key_id: "carol-fed".into(),
+            member_key_id: fed("carol-fed"),
             rule: crate::membership::RULE_DECLINED,
         };
         let class = crate::replication::bridge::ApplyRefusalClass::classify(&persist_err)
