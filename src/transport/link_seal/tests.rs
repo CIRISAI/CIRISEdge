@@ -113,7 +113,7 @@ fn a_resource_before_the_handshake_is_dropped_e1() {
     // Dropped, not refused: another event plane may overtake the handshake.
     match b.open(LINK, Lane::Resource, b"anything") {
         Inbound::Drop(label) => {
-            assert_eq!(label, crate::observability::LINK_SEAL_DROPPED_BEFORE_KEYS)
+            assert_eq!(label, crate::observability::LINK_SEAL_DROPPED_BEFORE_KEYS);
         }
         other => panic!("{other:?}"),
     }
