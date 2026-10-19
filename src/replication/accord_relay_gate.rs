@@ -1549,13 +1549,6 @@ mod tests {
         use base64::Engine as _;
         use ciris_persist::federation::types::{algorithm, identity_type};
         use ciris_persist::federation::{KeyRecord, SignedKeyRecord};
-        // CIRISPersist#1103 — the registered id is derived from the key the
-        // row carries (the zero placeholder): see [`zid`].
-        assert_eq!(
-            key_id,
-            zid(crate::replication::bridge::tests::fixture_label(key_id)),
-            "fixture key id {key_id:?} is not derived from its own key (CIRISPersist#1103)"
-        );
         let b64 = base64::engine::general_purpose::STANDARD;
         let now = chrono::Utc::now();
         SignedKeyRecord {

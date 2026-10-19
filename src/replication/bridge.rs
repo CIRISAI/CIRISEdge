@@ -10865,6 +10865,15 @@ pub(crate) mod tests {
     /// persist v9.0.0's `verify_federation_tier_ingest`. Scrub
     /// fields stay placeholders — `put_public_key` does NOT
     /// hybrid-verify the registration row.
+    ///
+    /// CIRISPersist#1103: these fixture ids stay LITERAL (not
+    /// `derive_key_id(label, pk)`). They register through persist's in-process
+    /// trait method, which is ungated: #1103 refuses an underived id only at
+    /// the capsule `PutPublicKey`, Python `put_public_key`,
+    /// `register_federation_key` and the first-contact `key:record:v1` row. A
+    /// persist change that gates the trait door turns every caller of this
+    /// fixture red; re-mint here (`fixture_label` already strips a derived
+    /// suffix for the seed).
     pub(crate) fn fixture_key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
         let now = Utc::now();
         let (ed_pk, mldsa_pk) = hybrid_pubkeys(key_id);
