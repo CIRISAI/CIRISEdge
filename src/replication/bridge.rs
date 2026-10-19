@@ -3598,6 +3598,17 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 return None;
             }
         }
+        // …and the occurrence-revocation plane serves only a `withdraws` of an
+        // `identity:occurrence:v1` row this node holds.
+        if kind.carries_occurrence_withdrawals() {
+            let row = key_plane_rows::row_of_bytes(&bytes)?;
+            if !matches!(
+                key_plane_rows::withdraws_target(&*self.directory, &row).await,
+                Ok(key_plane_rows::WithdrawsTarget::Occurrence)
+            ) {
+                return None;
+            }
+        }
         Some(bytes)
     }
 
@@ -4826,13 +4837,16 @@ impl FederationDirectoryReplicationBridge {
             // set is the node's own keys (SelfOwn) or own ∪ cohort (Global), so
             // there is no corpus-wide page to keep a watermark on; the width
             // permit is taken per subject read. The occurrence-revocation plane
-            // is retired and offers nothing: an occurrence is revoked by a
-            // `withdraws` on its row, which the Attestation plane carries.
+            // keeps its global tombstone reach, carrying the `withdraws` rows
+            // whose target is an `identity:occurrence:v1` row.
             EnvelopeKind::Key => self.list_key_record_rows(None).await,
             EnvelopeKind::IdentityOccurrence => self.list_occurrence_rows(None).await,
             EnvelopeKind::TransportDestination => self.list_transport_destinations(window).await,
             EnvelopeKind::Attestation => self.list_attestations(None, window).await,
             EnvelopeKind::Revocation => self.list_revocation_rows().await,
+            EnvelopeKind::IdentityOccurrenceRevocation => {
+                self.list_occurrence_withdrawal_rows().await
+            }
             EnvelopeKind::Family => self.list_families(window).await,
             EnvelopeKind::Community => self.list_communities(window).await,
             EnvelopeKind::Organization => self.list_organizations(window).await,
@@ -4870,11 +4884,7 @@ impl FederationDirectoryReplicationBridge {
             // #848 — a key_grant set is an attestation row and is advertised
             // by the Attestation arm above; listing it under its own kind
             // would offer every row twice.
-            // persist v59.0.0 — the retired occurrence-revocation plane offers
-            // nothing (see the key-plane arms above).
-            EnvelopeKind::AccordQuorumEvidence
-            | EnvelopeKind::KeyGrant
-            | EnvelopeKind::IdentityOccurrenceRevocation => Vec::new(),
+            EnvelopeKind::AccordQuorumEvidence | EnvelopeKind::KeyGrant => Vec::new(),
         }
     }
 
@@ -5050,6 +5060,22 @@ impl FederationDirectoryReplicationBridge {
                     }
                 }
             }
+            // persist v59.0.0 — the occurrence revocations about the subject:
+            // the `withdraws` of its `identity:occurrence:v1` rows.
+            EnvelopeKind::IdentityOccurrenceRevocation => {
+                for row in subject_read!(
+                    key_plane_rows::occurrence_withdrawals_about(&*self.directory, subject_key_id),
+                    "identity-occurrence-revocation row"
+                ) {
+                    let seq = Self::ms_seq(row.asserted_at);
+                    match content_hash_of(&row) {
+                        Some((hash, _)) => push(hash, seq),
+                        None => {
+                            book_unhashable("subject_holdings/idocc-rev: content_hash_of failed");
+                        }
+                    }
+                }
+            }
             EnvelopeKind::Attestation => {
                 // CIRISEdge#817 — one Pull's rows share one set of peer-scoped
                 // memos: the requester is the same for every row, and the
@@ -5137,8 +5163,7 @@ impl FederationDirectoryReplicationBridge {
                     }
                 }
             }
-            // Revocation (key-level), the retired occurrence-revocation plane
-            // (persist v59.0.0), the cohort planes (Family/Community/
+            // Revocation (key-level), the cohort planes (Family/Community/
             // LocationProof), the membership-revocation planes, and the
             // operational trio are not subject-scoped-pullable via this axis.
             _ => {}
@@ -5499,6 +5524,13 @@ impl FederationDirectoryReplicationBridge {
         bytes: &[u8],
         source_peer: Option<&str>,
     ) -> ApplyOutcome {
+        if kind.carries_occurrence_withdrawals() {
+            if let Some(row) = key_plane_rows::row_of_bytes(bytes) {
+                return self
+                    .apply_occurrence_withdrawal(&row, bytes, source_peer)
+                    .await;
+            }
+        }
         if let Some(family) = kind.key_plane_family() {
             if let Some((found, row)) = key_plane_rows::key_plane_row_of_bytes(bytes) {
                 if found == family {
@@ -5515,6 +5547,37 @@ impl FederationDirectoryReplicationBridge {
             }
         }
         self.refuse_retired_framed(kind, bytes)
+    }
+
+    /// persist v59.0.0 — the IdentityOccurrenceRevocation plane's door: a
+    /// `withdraws` whose target is a HELD `identity:occurrence:v1` row goes to
+    /// the attestation door (persist revokes the occurrence there). A
+    /// `withdraws` whose target is not held yet is refused TRANSIENT (the
+    /// occurrence may still be on its way; the next round re-offers it). Any
+    /// other row — a `withdraws` of another kind of row, or not a `withdraws`
+    /// at all — is refused TERMINAL and never applied: this plane keeps the
+    /// #311 global reach, and it must not carry anything else on it.
+    async fn apply_occurrence_withdrawal(
+        &self,
+        row: &Attestation,
+        bytes: &[u8],
+        source_peer: Option<&str>,
+    ) -> ApplyOutcome {
+        use key_plane_rows::WithdrawsTarget as T;
+        match key_plane_rows::withdraws_target(&*self.directory, row).await {
+            Ok(T::Occurrence) => self.apply_attestation(bytes, source_peer).await,
+            Ok(T::Unheld) => ApplyOutcome::refused(format!(
+                "IdentityOccurrenceRevocation: withdraws {} names a row this node does not hold \
+                 yet — re-offered once the occurrence lands (persist v59.0.0)",
+                row.attestation_id
+            )),
+            Ok(T::Other | T::NotWithdraws) => ApplyOutcome::refused_terminal(format!(
+                "IdentityOccurrenceRevocation: row {} (type {}) is not a withdraws of an \
+                 identity:occurrence:v1 row — refused, never applied (persist v59.0.0)",
+                row.attestation_id, row.attestation_type
+            )),
+            Err(e) => self.refuse("IdentityOccurrenceRevocation", &row.attestation_id, &e),
+        }
     }
 
     /// persist v59.0.0 — refuse a framed object of a retired kind, TERMINAL,
@@ -6060,7 +6123,8 @@ impl FederationDirectoryReplicationBridge {
             EnvelopeKind::Attestation
             | EnvelopeKind::Key
             | EnvelopeKind::IdentityOccurrence
-            | EnvelopeKind::Revocation => self.list_attestation_holdings().await,
+            | EnvelopeKind::Revocation
+            | EnvelopeKind::IdentityOccurrenceRevocation => self.list_attestation_holdings().await,
             EnvelopeKind::TransportDestination => self.list_transport_destination_holdings().await,
             _ => {
                 self.list_envelope_refs_unbounded(kind, SweepWindow::Full)
@@ -8372,6 +8436,28 @@ impl FederationDirectoryReplicationBridge {
             }
         }
         self.key_plane_refs(rows, "list_revocation_rows")
+    }
+
+    /// persist v59.0.0 — the IdentityOccurrenceRevocation plane: every held
+    /// `withdraws` whose target is an `identity:occurrence:v1` row binding a
+    /// key in the widest own ∪ cohort set (`Projection::Global`, the #311
+    /// tombstone rule: a node that holds an occurrence learns of its
+    /// revocation whether or not it consents to the revoker's rows — the
+    /// consent-gated Attestation plane would not reach it).
+    async fn list_occurrence_withdrawal_rows(&self) -> Vec<EnvelopeRef> {
+        let mut rows: Vec<Attestation> = Vec::new();
+        for subject in self.subjects_for_projection(Projection::Global) {
+            let _permit = self.sweep_gate.enter().await;
+            match key_plane_rows::occurrence_withdrawals_binding(&*self.directory, &subject).await {
+                Ok(found) => rows.extend(found),
+                Err(e) => Self::key_plane_read_failed(
+                    EnvelopeKind::IdentityOccurrenceRevocation,
+                    &subject,
+                    &e,
+                ),
+            }
+        }
+        self.key_plane_refs(rows, "list_occurrence_withdrawal_rows")
     }
 
     // ── CIRISEdge#504 — the 5 E4 keyless-declaration planes advertise via

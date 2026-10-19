@@ -17,7 +17,11 @@
 //!   holding all three: the rows carry what the framed objects carried, so
 //!   routes still form;
 //! - **a wrong-family row** on a key-plane plane is refused terminal and never
-//!   applied.
+//!   applied;
+//! - **the revocation planes keep their global reach** — a key's
+//!   `key:revocation:v1` row reaches a stranger that holds the key and
+//!   consents to nothing, and an occurrence's `withdraws` reaches a node that
+//!   holds the occurrence, each over its own session plane.
 //!
 //! `cargo test --lib key_plane_v59`
 
@@ -191,6 +195,39 @@ impl NodeA {
     }
 }
 
+impl NodeA {
+    /// P withdraws its occurrence of N: the `withdraws` of N's
+    /// `identity:occurrence:v1` row (persist v59.0.0's occurrence revocation),
+    /// authored at A. Returns the row.
+    async fn withdraw_occurrence(&self) -> Attestation {
+        let target =
+            crate::replication::key_plane_rows::occurrence_rows_about(&*self.dir, self.p.key_id())
+                .await
+                .expect("rows")
+                .into_iter()
+                .find(|r| {
+                    crate::replication::key_plane_rows::occurrence_key_of(r).as_deref()
+                        == Some(self.n.key_id())
+                })
+                .expect("P's occurrence row of N");
+        let withdraws = crate::replication::attestation_bind::withdraws_attestation(
+            &target,
+            "device_retired",
+            chrono::Utc::now(),
+            &self.p.signer(),
+        )
+        .await
+        .expect("build the withdraws");
+        self.dir
+            .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+                attestation: withdraws.clone(),
+            })
+            .await
+            .expect("A admits P's withdraws");
+        withdraws
+    }
+}
+
 fn messages(outcome: ReplicationOutcome) -> Vec<ReplicationMessage> {
     match outcome {
         ReplicationOutcome::Send(msgs)
@@ -246,6 +283,7 @@ async fn round(
 async fn an_outbound_serve_offers_no_framed_key_plane_object_v59() {
     const PEER: &str = "peer-b-v59";
     let a = NodeA::build("v59-serve", 0x31).await;
+    let withdraws = a.withdraw_occurrence().await;
     let bridge = a.bridge();
 
     let mut served_on: Vec<(EnvelopeKind, [u8; 32])> = Vec::new();
@@ -255,10 +293,14 @@ async fn an_outbound_serve_offers_no_framed_key_plane_object_v59() {
     {
         let refs = bridge.list_envelope_refs_for_peer(kind, Some(PEER)).await;
         let Some(family) = kind.key_plane_family() else {
-            assert!(
-                refs.is_empty(),
-                "{kind:?}: the retired plane offers nothing: {refs:?}"
-            );
+            // The occurrence-revocation plane: only the occurrence's withdraws.
+            assert_eq!(refs.len(), 1, "{kind:?}: the one withdraws: {refs:?}");
+            let bytes = bridge
+                .fetch_envelope_bytes_for_peer(kind, &refs[0].envelope_hash, Some(PEER))
+                .await
+                .expect("served");
+            let row: Attestation = serde_json::from_slice(&bytes).expect("a row");
+            assert_eq!(row.attestation_id, withdraws.attestation_id);
             continue;
         };
         assert!(!refs.is_empty(), "{kind:?}: A has a row to offer");
@@ -436,4 +478,123 @@ async fn a_wrong_family_row_on_a_key_plane_plane_is_refused_terminal_v59() {
         .apply_envelope_bytes(EnvelopeKind::IdentityOccurrence, &bytes, Some("peer-x"))
         .await;
     assert!(own.is_admitted(), "{own:?}");
+}
+
+/// **A key's revocation reaches a stranger that holds the key.** S holds K's
+/// key and nothing else of A's: no consent grant, no cohort, not a subject of
+/// the revoker's rows — exactly the node the consent-gated Attestation plane
+/// would never reach. One Revocation round over the replication `Session`
+/// and S holds K's revocation (the #311 tombstone rule, kept by the
+/// Revocation plane carrying the `key:revocation:v1` row).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revocation_row_reaches_a_stranger_holding_the_key_v59() {
+    let a = NodeA::build("v59-revoke", 0x81).await;
+    let s_ident = Ident::mint("node-s-v59-revoke", "node", 0x91).await;
+    let s_dir = substrate().await;
+    hold(&s_dir, &s_ident).await;
+    hold(&s_dir, &a.k).await;
+    let metrics = crate::observability::EdgeMetrics::new();
+    let s = bridge(
+        &s_dir,
+        s_ident.key_id(),
+        vec![s_ident.key_id().to_owned()],
+        Some(metrics.clone()),
+    );
+    assert!(
+        s_dir
+            .revocations_for(a.k.key_id())
+            .await
+            .expect("read")
+            .is_empty(),
+        "precondition: S does not know K is revoked"
+    );
+    assert!(
+        s_dir
+            .list_live_consent_grants_by(a.n.key_id())
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "precondition: S holds no consent grant from A"
+    );
+
+    round(
+        EnvelopeKind::Revocation,
+        &a.bridge(),
+        a.n.key_id(),
+        &s,
+        s_ident.key_id(),
+    )
+    .await;
+
+    let revocations = s_dir.revocations_for(a.k.key_id()).await.expect("read");
+    assert_eq!(
+        revocations.len(),
+        1,
+        "S holds K's revocation, carried as its key:revocation:v1 row"
+    );
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.replication_applied_total
+            .get(&EnvelopeKind::Revocation)
+            .copied(),
+        Some(1),
+        "admitted on the Revocation plane"
+    );
+    assert!(snap.envelope_kind_retired_refusals.is_empty());
+}
+
+/// **An occurrence's revocation reaches a node holding the occurrence**, over
+/// the IdentityOccurrenceRevocation plane (the occurrence's own tombstone
+/// plane), as the `withdraws` of its `identity:occurrence:v1` row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_occurrence_withdrawal_reaches_a_node_holding_the_occurrence_v59() {
+    let a = NodeA::build("v59-occrev", 0xa1).await;
+    let b_ident = Ident::mint("node-b-v59-occrev", "node", 0xb1).await;
+    let b_dir = substrate().await;
+    hold(&b_dir, &b_ident).await;
+    let b = bridge(
+        &b_dir,
+        b_ident.key_id(),
+        vec![b_ident.key_id().to_owned()],
+        None,
+    );
+    let a_bridge = a.bridge();
+    for kind in [EnvelopeKind::Key, EnvelopeKind::IdentityOccurrence] {
+        round(kind, &a_bridge, a.n.key_id(), &b, b_ident.key_id()).await;
+    }
+    let active = |dir: Arc<SqliteBackend>, p: String, n: String| async move {
+        dir.list_identity_occurrences_active(&p)
+            .await
+            .expect("occurrences")
+            .iter()
+            .any(|o| o.occurrence_key_id == n)
+    };
+    assert!(
+        active(
+            Arc::clone(&b_dir),
+            a.p.key_id().to_owned(),
+            a.n.key_id().to_owned()
+        )
+        .await,
+        "precondition: B holds P's occurrence of N"
+    );
+
+    a.withdraw_occurrence().await;
+    round(
+        EnvelopeKind::IdentityOccurrenceRevocation,
+        &a_bridge,
+        a.n.key_id(),
+        &b,
+        b_ident.key_id(),
+    )
+    .await;
+    assert!(
+        !active(
+            Arc::clone(&b_dir),
+            a.p.key_id().to_owned(),
+            a.n.key_id().to_owned()
+        )
+        .await,
+        "B no longer holds P's occurrence of N active: the withdraws landed"
+    );
 }

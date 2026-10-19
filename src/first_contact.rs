@@ -956,8 +956,13 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 /// The key a first-contact `OpaqueRequest` carries.
 #[derive(Debug, Clone)]
 pub(crate) enum CarriedKey {
-    /// persist v59.0.0 — the sender's `key:record:v1` row.
-    Row(Box<Attestation>),
+    /// persist v59.0.0 — the sender's `key:record:v1` row, and the key id it
+    /// carries ([`OpaqueRequestWire::carried_key_id`]; `None` when the row
+    /// carries no key record).
+    Row {
+        row: Box<Attestation>,
+        key_id: Option<String>,
+    },
     /// A pre-v59 sender's framed record: retired, refused by name.
     Framed,
 }
@@ -974,8 +979,14 @@ pub(crate) fn carried_key_record(bytes: &[u8]) -> Option<(EdgeEnvelope, CarriedK
         return None;
     }
     let body: OpaqueRequestWire = serde_json::from_str(envelope.body.get()).ok()?;
+    // The key id through the wire type's ONE accessor, the field every
+    // key-bound check reads.
+    let key_id = body.carried_key_id();
     let carried = match (body.key_record_row, body.key_record) {
-        (Some(row), _) => CarriedKey::Row(Box::new(row)),
+        (Some(row), _) => CarriedKey::Row {
+            row: Box::new(row),
+            key_id,
+        },
         (None, Some(_)) => CarriedKey::Framed,
         (None, None) => return None,
     };
@@ -1022,16 +1033,19 @@ pub(crate) async fn admit_first_contact(
     }
     // persist v59.0.0 — a framed record is never admitted (nor re-minted
     // locally as a row): refused by name, before any budget is spent.
-    let row = match carried {
-        CarriedKey::Row(row) => *row,
+    let (row, key_id) = match carried {
+        CarriedKey::Row { row, key_id } => (*row, key_id),
         CarriedKey::Framed => {
             return FirstContactOutcome::Refused(FirstContactRefusal::FramedKeyRetired);
         }
     };
-    let Some(record) = ciris_persist::federation::key_plane::key_record_of_row(&row) else {
+    let (Some(key_id), Some(record)) = (
+        key_id,
+        ciris_persist::federation::key_plane::key_record_of_row(&row),
+    ) else {
         return FirstContactOutcome::Refused(FirstContactRefusal::NotAKeyRecordRow);
     };
-    if record.key_id != sender {
+    if key_id != sender {
         return FirstContactOutcome::Refused(FirstContactRefusal::RecordNamesOtherKey);
     }
     if record.scrub_key_id != record.key_id {
@@ -1137,6 +1151,41 @@ pub(crate) async fn admit_introduced_attestations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// persist v59.0.0 — `OpaqueRequestWire::carried_key_id` reads the key id
+    /// from the `key:record:v1` row, never the retired framed record; the
+    /// first-contact door and the per-link seal both bind to it.
+    #[tokio::test]
+    async fn the_carried_key_id_is_the_rows_v59() {
+        let record = crate::replication::bridge::tests::minted_key_record(
+            "fc-carried-v59",
+            ciris_persist::federation::types::identity_type::NODE,
+            0x5a,
+        )
+        .await;
+        let row =
+            ciris_persist::federation::key_plane::plan_key_record_row(&record, &None).expect("row");
+        let with_row = OpaqueRequestWire {
+            kind: 1,
+            payload: Vec::new(),
+            key_record: None,
+            key_record_row: Some(row),
+            challenge: None,
+        };
+        assert_eq!(with_row.carried_key_id(), Some(record.key_id.clone()));
+        let framed_only = OpaqueRequestWire {
+            kind: 1,
+            payload: Vec::new(),
+            key_record: Some(ciris_persist::federation::SignedKeyRecord { record }),
+            key_record_row: None,
+            challenge: None,
+        };
+        assert_eq!(
+            framed_only.carried_key_id(),
+            None,
+            "a framed record introduces nothing"
+        );
+    }
 
     #[test]
     fn a_sender_gets_three_tries_per_window_683() {

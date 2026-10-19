@@ -557,6 +557,25 @@ pub(crate) struct OpaqueRequestWire {
     pub challenge: Option<String>,
 }
 
+impl OpaqueRequestWire {
+    /// persist v59.0.0 — THE key id this first-contact request introduces: the
+    /// key its `key_record_row` carries (persist's own projection of the
+    /// `key:record:v1` row). `None` without a row: a framed `key_record` is
+    /// retired and introduces nothing. The one accessor every key-bound check
+    /// reads (the first-contact door; the per-link seal's handshake binding),
+    /// so they cannot read two different fields. The row is admitted only
+    /// through persist's key-plane door, which verifies the record's proof of
+    /// possession, so binding a check to this id still binds it to a proven
+    /// key.
+    #[must_use]
+    pub(crate) fn carried_key_id(&self) -> Option<String> {
+        self.key_record_row
+            .as_ref()
+            .and_then(ciris_persist::federation::key_plane::key_record_of_row)
+            .map(|record| record.key_id)
+    }
+}
+
 impl Message for OpaqueRequestWire {
     const TYPE: MessageType = MessageType::OpaqueRequest;
     const DELIVERY: Delivery = Delivery::Ephemeral;

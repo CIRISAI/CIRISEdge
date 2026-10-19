@@ -106,12 +106,12 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // (`Projection::Global`, the #311 rule) and serves public — its
         // `key:revocation:v1` rows since persist v59.0.0.
         EnvelopeKind::Revocation => ("global; rides:attestation key:revocation:v1 rows", "public"),
-        // persist v59.0.0 — retired: the plane offers and serves nothing, and
-        // refuses every inbound body `federation_envelope_kind_retired`. An
-        // occurrence is revoked by a `withdraws` on its row (Attestation plane).
+        // persist v59.0.0 — the occurrence's tombstone plane keeps the same
+        // widest set and public serve, carrying the `withdraws` rows whose
+        // target is an `identity:occurrence:v1` row.
         EnvelopeKind::IdentityOccurrenceRevocation => (
-            "retired",
-            "retired: federation_envelope_kind_retired (a withdraws on the identity:occurrence:v1 row rides the attestation plane)",
+            "global; rides:attestation withdraws of identity:occurrence:v1 rows",
+            "public",
         ),
         // The membership planes keep the `Global` advertise projection (every
         // node that holds the group's record must fold the same events, #860)
@@ -171,7 +171,10 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // reaches a stranger. An unconferred node still answers only for
         // itself, so the enumeration surface stays with nodes that opted into
         // the corpus. Derived from `is_public_subject_pull` (test-locked below).
-        EnvelopeKind::Key | EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination => {
+        EnvelopeKind::Key
+        | EnvelopeKind::IdentityOccurrence
+        | EnvelopeKind::TransportDestination
+        | EnvelopeKind::IdentityOccurrenceRevocation => {
             "subject_pull:data_subject+own_record; +any_attributed when the \
              responder is CANONICAL (holds bodies; ROLE_MATRIX axis 3)"
         }
@@ -181,8 +184,6 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
              (G2: attestation_type==scores AND !persist::is_subject_retainable(dimension))"
         }
         EnvelopeKind::Revocation
-        // persist v59.0.0 — retired; answers no Pull.
-        | EnvelopeKind::IdentityOccurrenceRevocation
         | EnvelopeKind::Family
         | EnvelopeKind::Community
         | EnvelopeKind::LocationProof
@@ -337,14 +338,14 @@ pub fn serve_advertise_policy_sha256() -> String {
 // ceremony row exactly when persist admits it as refers-to. **CIRISServer must
 // mirror this pin.**
 //
-// persist v59.0.0 (sealed-transport floor) — RE-PINNED, 68c5298b… → 275d0449…:
+// persist v59.0.0 (sealed-transport floor) — RE-PINNED, 68c5298b… → ead63aac…:
 // the Key, IdentityOccurrence and Revocation cells state that the planes carry
 // their family's attestation ROWS (`key:record:v1`, `identity:occurrence:v1`,
-// `key:revocation:v1`), the framed objects being retired; the
-// IdentityOccurrenceRevocation cells move to `retired` (it offers, serves and
-// answers nothing). **CIRISServer must mirror this pin.**
+// `key:revocation:v1`, and for IdentityOccurrenceRevocation the `withdraws`
+// of an `identity:occurrence:v1` row), the framed objects being retired. Reach,
+// serve and receive are unchanged. **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "275d044999b1226ee3b8665af61360dcab5dc079fbc000ed9c33ee621a35ba03";
+    "ead63aac63f6736b12084a07278557b7b273e6a98c9d52b77504f512d9fc5439";
 
 #[cfg(test)]
 mod tests {
@@ -369,7 +370,7 @@ mod tests {
     /// the manifest column moves (and the pinned hash flips deliberately) —
     /// the earlier hardcoded 5-string vec asserted nothing about the predicate.
     #[test]
-    fn only_the_four_replicated_kinds_answer_a_subject_pull() {
+    fn only_the_five_replicated_kinds_answer_a_subject_pull() {
         let manifest = serve_advertise_manifest();
         let policies = manifest["policies"].as_array().unwrap();
         let pullable: Vec<&str> = policies
@@ -387,11 +388,7 @@ mod tests {
             "the manifest's subject_pull kinds must be EXACTLY \
              EnvelopeKind::is_subject_pullable over ALL (RECEIVE axis)"
         );
-        assert_eq!(
-            expected.len(),
-            4,
-            "the four replicated kinds (persist v59.0.0)"
-        );
+        assert_eq!(expected.len(), 5, "the five replicated kinds");
         // The Attestation plane is the one that sweeps both axes + carves scores.
         let att = policies
             .iter()

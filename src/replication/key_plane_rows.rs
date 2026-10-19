@@ -164,6 +164,105 @@ where
     Ok(out)
 }
 
+/// What a `withdraws` row retracts, as this node holds it (persist v59.0.0:
+/// an occurrence is revoked by a `withdraws` whose target is its
+/// `identity:occurrence:v1` row — persist's own `occurrence_withdrawal_of`
+/// reading: the envelope's `references_attestation_id` names a HELD row
+/// that `key_plane::occurrence_of_row` reads).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WithdrawsTarget {
+    /// Not a `withdraws` naming a target.
+    NotWithdraws,
+    /// A `withdraws` whose target this node does not hold (yet).
+    Unheld,
+    /// A `withdraws` of a held `identity:occurrence:v1` row.
+    Occurrence,
+    /// A `withdraws` of a held row of any other kind.
+    Other,
+}
+
+/// Classify `row` as a [`WithdrawsTarget`] against what `dir` holds.
+///
+/// # Errors
+/// A read persist did not serve.
+pub(crate) async fn withdraws_target<D>(
+    dir: &D,
+    row: &Attestation,
+) -> Result<WithdrawsTarget, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use ciris_persist::federation::types::attestation_type::WITHDRAWS;
+    if row.attestation_type != WITHDRAWS {
+        return Ok(WithdrawsTarget::NotWithdraws);
+    }
+    let Some(target_id) =
+        ciris_persist::federation::precedence::references_attestation_id_from_envelope(
+            &row.attestation_envelope,
+        )
+    else {
+        return Ok(WithdrawsTarget::NotWithdraws);
+    };
+    Ok(match dir.get_attestation(target_id).await? {
+        None => WithdrawsTarget::Unheld,
+        Some(target) if key_plane::occurrence_of_row(&target).is_some() => {
+            WithdrawsTarget::Occurrence
+        }
+        Some(_) => WithdrawsTarget::Other,
+    })
+}
+
+/// Every `withdraws` this node holds whose target is one of `rows` (the
+/// occurrence rows), through persist's indexed composer read.
+async fn withdrawals_of<D>(dir: &D, rows: Vec<Attestation>) -> Result<Vec<Attestation>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    use ciris_persist::federation::types::attestation_type::WITHDRAWS;
+    let ids: Vec<String> = rows.into_iter().map(|r| r.attestation_id).collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(dir
+        .list_composers_referencing_any(&ids, None, None)
+        .await?
+        .into_iter()
+        .filter(|r| r.attestation_type == WITHDRAWS)
+        .collect())
+}
+
+/// persist v59.0.0 — the occurrence revocations of `occurrence_key_id`: every
+/// held `withdraws` of an `identity:occurrence:v1` row binding it.
+///
+/// # Errors
+/// A read persist did not serve.
+pub(crate) async fn occurrence_withdrawals_binding<D>(
+    dir: &D,
+    occurrence_key_id: &str,
+) -> Result<Vec<Attestation>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let rows = occurrence_rows_binding(dir, occurrence_key_id).await?;
+    withdrawals_of(dir, rows).await
+}
+
+/// persist v59.0.0 — the occurrence revocations about `identity_key_id`: every
+/// held `withdraws` of an `identity:occurrence:v1` row about it.
+///
+/// # Errors
+/// A read persist did not serve.
+pub(crate) async fn occurrence_withdrawals_about<D>(
+    dir: &D,
+    identity_key_id: &str,
+) -> Result<Vec<Attestation>, Error>
+where
+    D: FederationDirectory + ?Sized,
+{
+    let rows = occurrence_rows_about(dir, identity_key_id).await?;
+    withdrawals_of(dir, rows).await
+}
+
 /// The occurrence key an `identity:occurrence:v1` row binds.
 #[must_use]
 pub(crate) fn occurrence_key_of(row: &Attestation) -> Option<String> {
