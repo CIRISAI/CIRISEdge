@@ -322,18 +322,17 @@ async fn device_rows(from: &Node) -> (KeyRecord, Vec<u8>, Vec<u8>) {
                 )
         })
         .expect("the node's owner binding");
-    let occ = from
-        .dir
-        .list_signed_identity_occurrences_since(None, 64)
+    // persist v59.0.0 — the occurrence travels as its `identity:occurrence:v1`
+    // row; the framed object is retired.
+    let occ = crate::replication::key_plane_rows::occurrence_rows_about(&*from.dir, &from.owner)
         .await
-        .expect("list the signed occurrence plane")
+        .expect("list the occurrence rows")
         .into_iter()
-        .map(|s| s.occurrence)
-        .find(|o| {
-            o.identity_occurrence.occurrence_key_id == from.me
-                && o.identity_occurrence.identity_key_id == from.owner
+        .find(|row| {
+            crate::replication::key_plane_rows::occurrence_key_of(row).as_deref()
+                == Some(from.me.as_str())
         })
-        .expect("the engine occurrence is on the signed plane");
+        .expect("the engine occurrence is on the row plane");
     (
         rec,
         serde_json::to_vec(&binding).expect("encode binding"),

@@ -843,31 +843,35 @@ async fn federate(from: &Node, to: &Node) {
     // key_grant admission needs on the FAR node had no replicable form and
     // every receiving node refused every set with `signer_not_active_member`.
     //
-    // Reading it off `list_signed_identity_occurrences_since` and admitting it
-    // through the GATED `put_identity_occurrence` is therefore the assertion,
-    // not the plumbing: it passes only because the occurrence was PUBLISHED
+    // Reading its `identity:occurrence:v1` ROW off the attestation plane and
+    // admitting it through the attestation apply door (persist v59.0.0: the
+    // row is the occurrence's only carriage) is therefore the assertion, not
+    // the plumbing: a row exists only because the occurrence was PUBLISHED
     // (`Engine::publish_self_occurrence`, via `provision_engine_occurrence`).
     // Revert edge to the local door and this line finds nothing to carry.
-    let served = from
-        .dir
-        .list_signed_identity_occurrences_since(None, 64)
-        .await
-        .expect("list the signed occurrence plane");
-    let occ = served
-        .into_iter()
-        .map(|s| s.occurrence)
-        .find(|o| {
+    let occ = ciris_persist::federation::FederationDirectory::list_attestations_since(
+        &*from.dir, None, 4096,
+    )
+    .await
+    .expect("list the attestation plane")
+    .into_iter()
+    .map(|row| row.attestation)
+    .find(|att| {
+        ciris_persist::federation::key_plane::occurrence_of_row(att).is_some_and(|o| {
             o.identity_occurrence.occurrence_key_id == from.me
                 && o.identity_occurrence.identity_key_id == from.identity
         })
-        .expect(
-            "the engine occurrence is ON the signed plane — if this is None the node wrote it \
-             through the trusted-local door and CIRISPersist#851 is back",
-        );
+    })
+    .expect(
+        "the engine occurrence is ON the row plane — if this is None the node wrote it \
+         through the trusted-local door and CIRISPersist#851 is back",
+    );
     to.dir
-        .put_identity_occurrence(occ)
+        .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: occ,
+        })
         .await
-        .expect("admit the far node's published occurrence through the gated door");
+        .expect("admit the far node's published occurrence row");
 }
 
 // ─── #851 / PR #607 review: what a republish is allowed to overwrite ──
@@ -895,17 +899,19 @@ async fn a_legacy_occurrence_is_healed_onto_the_plane_and_keeps_its_expiry() {
     use ciris_persist::federation::{EncryptionPubkeys, FederationDirectory as _};
 
     // The plane membership question, asked the way a peer asks it.
+    // persist v59.0.0 — the occurrence's `identity:occurrence:v1` row.
     async fn on_plane(dir: &Arc<SqliteBackend>, identity: &str, occ: &str) -> bool {
-        ciris_persist::federation::FederationDirectory::list_signed_identity_occurrences_since(
-            &**dir, None, 256,
-        )
-        .await
-        .expect("list the signed plane")
-        .into_iter()
-        .any(|s| {
-            let o = &s.occurrence.identity_occurrence;
-            o.identity_key_id == identity && o.occurrence_key_id == occ
-        })
+        ciris_persist::federation::FederationDirectory::list_attestations_since(&**dir, None, 4096)
+            .await
+            .expect("list the attestation plane")
+            .into_iter()
+            .any(|row| {
+                ciris_persist::federation::key_plane::occurrence_of_row(&row.attestation)
+                    .is_some_and(|s| {
+                        let o = &s.identity_occurrence;
+                        o.identity_key_id == identity && o.occurrence_key_id == occ
+                    })
+            })
     }
 
     async fn enc_of(dir: &Arc<SqliteBackend>) -> EncryptionPubkeys {

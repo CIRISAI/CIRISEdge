@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome as AttestationOutcome;
-use ciris_persist::federation::{FederationDirectory, SignedAttestation, SignedKeyRecord};
+use ciris_persist::federation::{Attestation, FederationDirectory, KeyRecord, SignedAttestation};
 
 use crate::messages::{
     EdgeEnvelope, Introductions, MessageType, OpaqueRequestWire, OpaqueResponse, OpaqueResponseWire,
@@ -53,8 +53,8 @@ pub struct OpaqueRequestContext {
 
 /// A handler's answer: the response, plus the records the requester needs.
 ///
-/// On a first-contact answer edge adds this node's own key record to
-/// `introductions.keys`, so the requester can verify the answer. The host
+/// On a first-contact answer edge adds this node's own `key:record:v1` row to
+/// `introductions.key_rows`, so the requester can verify the answer. The host
 /// adds the owner's binding to this node and, once it has minted it, the
 /// owner's binding to the requester (I14).
 #[derive(Debug, Clone)]
@@ -125,6 +125,12 @@ pub enum FirstContactRefusal {
     DirectoryUnreadable,
     /// No federation directory is wired, so no key can be admitted.
     NoDirectory,
+    /// persist v59.0.0 — the request carried its key as a FRAMED record,
+    /// which persist refuses at every door (`federation_envelope_kind_retired:
+    /// key`); a pre-v59 sender. Never admitted, never re-minted as a row.
+    FramedKeyRetired,
+    /// persist v59.0.0 — the carried row is not a `key:record:v1` row.
+    NotAKeyRecordRow,
 }
 
 impl FirstContactRefusal {
@@ -142,6 +148,8 @@ impl FirstContactRefusal {
             Self::KeyRefused => "first_contact_key_refused",
             Self::DirectoryUnreadable => "first_contact_directory_unreadable",
             Self::NoDirectory => "first_contact_no_directory",
+            Self::FramedKeyRetired => "first_contact_framed_key_retired",
+            Self::NotAKeyRecordRow => "first_contact_not_a_key_record_row",
         }
     }
 }
@@ -316,61 +324,61 @@ impl AdmissionDoors {
             })
     }
 
-    /// Proof of possession, then the replicated Key door.
+    /// Proof of possession, then the Key plane's row door.
+    ///
+    /// persist v59.0.0 — the key arrives as its `key:record:v1` ROW (`row`,
+    /// whose record is `record`, persist's own projection of it). The row
+    /// goes through the bridge's Key plane door when a runtime is installed
+    /// (the same door replication uses, so the bridge's memos and parks see
+    /// it), else straight to persist's attestation apply door: the framed
+    /// `apply_replicated_key_record` is retired.
     pub(crate) async fn admit_key(
         &self,
-        record: &SignedKeyRecord,
+        row: &Attestation,
+        record: &KeyRecord,
     ) -> Result<KeyAdmit, FirstContactRefusal> {
-        if let Err(e) = ciris_persist::federation::verify_key_registration(
-            self.directory.as_ref(),
-            &record.record,
-        )
-        .await
+        if let Err(e) =
+            ciris_persist::federation::verify_key_registration(self.directory.as_ref(), record)
+                .await
         {
             tracing::warn!(
-                key_id = %record.record.key_id,
+                key_id = %record.key_id,
                 error = %e,
                 "first contact: proof of possession refused (CIRISEdge#683)"
             );
             return Err(FirstContactRefusal::ProofOfPossessionFailed);
         }
-        if let Some(bridge) = &self.replication {
-            let bytes = serde_json::to_vec(record).map_err(|_| FirstContactRefusal::KeyRefused)?;
-            let outcome = bridge
+        let outcome = if let Some(bridge) = &self.replication {
+            let bytes = serde_json::to_vec(row).map_err(|_| FirstContactRefusal::KeyRefused)?;
+            bridge
                 .apply_envelope_bytes(EnvelopeKind::Key, &bytes, None)
-                .await;
-            return match outcome {
-                crate::replication::summary::ApplyOutcome::Admitted => Ok(KeyAdmit::Admitted),
-                crate::replication::summary::ApplyOutcome::Duplicate => Ok(KeyAdmit::Held),
-                other => {
-                    tracing::warn!(
-                        key_id = %record.record.key_id,
-                        outcome = ?other,
-                        "first contact: the Key door refused a proven record (CIRISEdge#683)"
-                    );
-                    Err(FirstContactRefusal::KeyRefused)
+                .await
+        } else {
+            match self
+                .directory
+                .apply_replicated_attestation(SignedAttestation {
+                    attestation: row.clone(),
+                })
+                .await
+            {
+                Ok(AttestationOutcome::Inserted) => {
+                    crate::replication::summary::ApplyOutcome::Admitted
                 }
-            };
-        }
-        // One mapping with the bridge door above: a persist outcome variant
-        // added later (v54's `ScrubsRehydrated`) lands in the bridge's
-        // exhaustive match, not in this arm's catch-all as a refusal.
-        let result = self
-            .directory
-            .apply_replicated_key_record(record.clone())
-            .await;
-        match crate::replication::bridge::key_outcome_to_apply(
-            result,
-            "first-contact",
-            &record.record.scrub_key_id,
-        )
-        .0
-        {
+                Ok(AttestationOutcome::Unchanged | AttestationOutcome::Deduplicated) => {
+                    crate::replication::summary::ApplyOutcome::Duplicate
+                }
+                Ok(other) => {
+                    crate::replication::summary::ApplyOutcome::refused(format!("{other:?}"))
+                }
+                Err(e) => crate::replication::summary::ApplyOutcome::refused(e.to_string()),
+            }
+        };
+        match outcome {
             crate::replication::summary::ApplyOutcome::Admitted => Ok(KeyAdmit::Admitted),
             crate::replication::summary::ApplyOutcome::Duplicate => Ok(KeyAdmit::Held),
             other => {
                 tracing::warn!(
-                    key_id = %record.record.key_id,
+                    key_id = %record.key_id,
                     outcome = ?other,
                     "first contact: the Key door refused a proven record (CIRISEdge#683)"
                 );
@@ -945,10 +953,20 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(hay, needle).is_some()
 }
 
-/// The envelope and the key record a first-contact `OpaqueRequest` carries, or
-/// `None` for every other frame.
-pub(crate) fn carried_key_record(bytes: &[u8]) -> Option<(EdgeEnvelope, SignedKeyRecord)> {
-    if !contains(bytes, b"\"key_record\"") {
+/// The key a first-contact `OpaqueRequest` carries.
+#[derive(Debug, Clone)]
+pub(crate) enum CarriedKey {
+    /// persist v59.0.0 — the sender's `key:record:v1` row.
+    Row(Box<Attestation>),
+    /// A pre-v59 sender's framed record: retired, refused by name.
+    Framed,
+}
+
+/// The envelope and the key a first-contact `OpaqueRequest` carries, or
+/// `None` for every other frame. The row wins when a body carries both.
+pub(crate) fn carried_key_record(bytes: &[u8]) -> Option<(EdgeEnvelope, CarriedKey)> {
+    // Matches both `"key_record"` and `"key_record_row"`.
+    if !contains(bytes, b"\"key_record") {
         return None;
     }
     let envelope: EdgeEnvelope = serde_json::from_slice(bytes).ok()?;
@@ -956,8 +974,12 @@ pub(crate) fn carried_key_record(bytes: &[u8]) -> Option<(EdgeEnvelope, SignedKe
         return None;
     }
     let body: OpaqueRequestWire = serde_json::from_str(envelope.body.get()).ok()?;
-    let record = body.key_record?;
-    Some((envelope, record))
+    let carried = match (body.key_record_row, body.key_record) {
+        (Some(row), _) => CarriedKey::Row(Box::new(row)),
+        (None, Some(_)) => CarriedKey::Framed,
+        (None, None) => return None,
+    };
+    Some((envelope, carried))
 }
 
 /// The envelope and the introductions an `OpaqueResponse` carries, or `None`.
@@ -986,7 +1008,7 @@ pub(crate) async fn admit_first_contact(
     gate: &std::sync::Mutex<FirstContactGate>,
     now: Ts,
 ) -> FirstContactOutcome {
-    let Some((envelope, record)) = carried_key_record(bytes) else {
+    let Some((envelope, carried)) = carried_key_record(bytes) else {
         return FirstContactOutcome::NotApplicable;
     };
     let Some(doors) = doors else {
@@ -998,10 +1020,21 @@ pub(crate) async fn admit_first_contact(
         Ok(false) => {}
         Err(r) => return FirstContactOutcome::Refused(r),
     }
-    if record.record.key_id != sender {
+    // persist v59.0.0 — a framed record is never admitted (nor re-minted
+    // locally as a row): refused by name, before any budget is spent.
+    let row = match carried {
+        CarriedKey::Row(row) => *row,
+        CarriedKey::Framed => {
+            return FirstContactOutcome::Refused(FirstContactRefusal::FramedKeyRetired);
+        }
+    };
+    let Some(record) = ciris_persist::federation::key_plane::key_record_of_row(&row) else {
+        return FirstContactOutcome::Refused(FirstContactRefusal::NotAKeyRecordRow);
+    };
+    if record.key_id != sender {
         return FirstContactOutcome::Refused(FirstContactRefusal::RecordNamesOtherKey);
     }
-    if record.record.scrub_key_id != record.record.key_id {
+    if record.scrub_key_id != record.key_id {
         return FirstContactOutcome::Refused(FirstContactRefusal::RecordNotSelfSigned);
     }
     if let Err(r) = gate
@@ -1011,7 +1044,7 @@ pub(crate) async fn admit_first_contact(
     {
         return FirstContactOutcome::Refused(r);
     }
-    match doors.admit_key(&record).await {
+    match doors.admit_key(&row, &record).await {
         // `Held` here is a lost race with another path admitting the same key
         // between the lookup and the door: the key is known either way.
         Ok(KeyAdmit::Admitted | KeyAdmit::Held) => FirstContactOutcome::Admitted {
@@ -1021,16 +1054,33 @@ pub(crate) async fn admit_first_contact(
     }
 }
 
-/// The requester's key half (§2.2 requester step 1): each carried key, known
-/// ones skipped, unknown ones proven and admitted. Runs before the answer is
-/// verified. Capped at [`MAX_INTRODUCED_KEYS`].
+/// The requester's key half (§2.2 requester step 1): each carried key row,
+/// known ones skipped, unknown ones proven and admitted. Runs before the answer
+/// is verified. Capped at [`MAX_INTRODUCED_KEYS`].
+///
+/// persist v59.0.0 — every FRAMED record a pre-v59 answer carries in
+/// `introductions.keys` is refused by name
+/// (`first_contact_framed_key_retired`), never admitted.
 pub(crate) async fn admit_introduced_keys(
     doors: &AdmissionDoors,
-    keys: &[SignedKeyRecord],
+    introductions: &Introductions,
     report: &mut IntroductionReport,
 ) {
-    for (i, record) in keys.iter().enumerate() {
-        let key_id = record.record.key_id.clone();
+    for framed in &introductions.keys {
+        report.refused.push((
+            framed.record.key_id.clone(),
+            FirstContactRefusal::FramedKeyRetired.as_str().to_string(),
+        ));
+    }
+    for (i, row) in introductions.key_rows.iter().enumerate() {
+        let Some(record) = ciris_persist::federation::key_plane::key_record_of_row(row) else {
+            report.refused.push((
+                row.attestation_id.clone(),
+                FirstContactRefusal::NotAKeyRecordRow.as_str().to_string(),
+            ));
+            continue;
+        };
+        let key_id = record.key_id.clone();
         if i >= MAX_INTRODUCED_KEYS {
             report.refused.push((key_id, "over_key_cap".to_string()));
             continue;
@@ -1046,7 +1096,7 @@ pub(crate) async fn admit_introduced_keys(
                 continue;
             }
         }
-        match doors.admit_key(record).await {
+        match doors.admit_key(row, &record).await {
             Ok(KeyAdmit::Admitted) => report.keys_admitted.push(key_id),
             Ok(KeyAdmit::Held) => report.keys_held.push(key_id),
             Err(r) => report.refused.push((key_id, r.as_str().to_string())),

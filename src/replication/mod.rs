@@ -129,6 +129,9 @@ pub mod group_plane;
 /// hold. NEVER holdings; see the module docs for why that distinction is the
 /// whole safety of the design.
 pub mod key_grant_emitter;
+pub(crate) mod key_plane_rows;
+#[cfg(test)]
+mod key_plane_v59_tests;
 pub mod known_hashes;
 #[cfg(test)]
 mod late_device_768_tests;

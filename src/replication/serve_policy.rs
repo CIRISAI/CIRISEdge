@@ -44,14 +44,21 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // may replace the self set for any of the three; the projection is
         // still `self_own` (the host names what it speaks for), so the cell
         // does not move.
-        EnvelopeKind::Key => ("self_own", "public"),
+        // persist v59.0.0 (sealed-transport floor) — the three key-plane
+        // session planes carry their family's attestation ROW, never the
+        // retired framed object, and serve only that family's rows.
+        EnvelopeKind::Key => ("self_own; rides:attestation key:record:v1 rows", "public"),
         // CIRISEdge#682 (CC 5.4.6, CIRISServer#655) — announce is per node. An
         // OWNED node's occurrence and route are served (advertise, direct
         // fetch, subject Pull) to every peer only when the node is announced
         // (a live owner-binding at `cohort_scope: federation`); otherwise only
         // to its owner's own nodes, booked `identity_row_node_not_announced`.
         // An unowned node is its own trust subject and serves as before.
-        EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination => (
+        EnvelopeKind::IdentityOccurrence => (
+            "self_own; rides:attestation identity:occurrence:v1 rows",
+            "owned node: announced → public; unannounced → owner's nodes only",
+        ),
+        EnvelopeKind::TransportDestination => (
             "self_own",
             "owned node: announced → public; unannounced → owner's nodes only",
         ),
@@ -95,11 +102,17 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
             "membership_plane: persist may_receive_group_plane(peer, scope, group, None)",
         ),
         EnvelopeKind::LocationProof => ("cohort", "public"),
-        // The two tombstone planes keep the hardcoded widest own∪cohort set
-        // (`Projection::Global`, the #311 rule) and serve public.
-        EnvelopeKind::IdentityOccurrenceRevocation | EnvelopeKind::Revocation => {
-            ("global", "public")
-        }
+        // The key revocation plane keeps the hardcoded widest own∪cohort set
+        // (`Projection::Global`, the #311 rule) and serves public — its
+        // `key:revocation:v1` rows since persist v59.0.0.
+        EnvelopeKind::Revocation => ("global; rides:attestation key:revocation:v1 rows", "public"),
+        // persist v59.0.0 — retired: the plane offers and serves nothing, and
+        // refuses every inbound body `federation_envelope_kind_retired`. An
+        // occurrence is revoked by a `withdraws` on its row (Attestation plane).
+        EnvelopeKind::IdentityOccurrenceRevocation => (
+            "retired",
+            "retired: federation_envelope_kind_retired (a withdraws on the identity:occurrence:v1 row rides the attestation plane)",
+        ),
         // The membership planes keep the `Global` advertise projection (every
         // node that holds the group's record must fold the same events, #860)
         // and are gated per peer: the revocation names the removed member, the
@@ -158,10 +171,7 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // reaches a stranger. An unconferred node still answers only for
         // itself, so the enumeration surface stays with nodes that opted into
         // the corpus. Derived from `is_public_subject_pull` (test-locked below).
-        EnvelopeKind::Key
-        | EnvelopeKind::IdentityOccurrence
-        | EnvelopeKind::TransportDestination
-        | EnvelopeKind::IdentityOccurrenceRevocation => {
+        EnvelopeKind::Key | EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination => {
             "subject_pull:data_subject+own_record; +any_attributed when the \
              responder is CANONICAL (holds bodies; ROLE_MATRIX axis 3)"
         }
@@ -171,6 +181,8 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
              (G2: attestation_type==scores AND !persist::is_subject_retainable(dimension))"
         }
         EnvelopeKind::Revocation
+        // persist v59.0.0 — retired; answers no Pull.
+        | EnvelopeKind::IdentityOccurrenceRevocation
         | EnvelopeKind::Family
         | EnvelopeKind::Community
         | EnvelopeKind::LocationProof
@@ -324,8 +336,15 @@ pub fn serve_advertise_policy_sha256() -> String {
 // edge's own invitee/proposer checks are gone, and first contact carries a
 // ceremony row exactly when persist admits it as refers-to. **CIRISServer must
 // mirror this pin.**
+//
+// persist v59.0.0 (sealed-transport floor) — RE-PINNED, 68c5298b… → 275d0449…:
+// the Key, IdentityOccurrence and Revocation cells state that the planes carry
+// their family's attestation ROWS (`key:record:v1`, `identity:occurrence:v1`,
+// `key:revocation:v1`), the framed objects being retired; the
+// IdentityOccurrenceRevocation cells move to `retired` (it offers, serves and
+// answers nothing). **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "68c5298b4bb48bbf8ffdb7ef881b71386b3db6ba8c6026b8bb61ec454ebe3850";
+    "275d044999b1226ee3b8665af61360dcab5dc079fbc000ed9c33ee621a35ba03";
 
 #[cfg(test)]
 mod tests {
@@ -350,7 +369,7 @@ mod tests {
     /// the manifest column moves (and the pinned hash flips deliberately) —
     /// the earlier hardcoded 5-string vec asserted nothing about the predicate.
     #[test]
-    fn only_the_five_replicated_kinds_answer_a_subject_pull() {
+    fn only_the_four_replicated_kinds_answer_a_subject_pull() {
         let manifest = serve_advertise_manifest();
         let policies = manifest["policies"].as_array().unwrap();
         let pullable: Vec<&str> = policies
@@ -368,7 +387,11 @@ mod tests {
             "the manifest's subject_pull kinds must be EXACTLY \
              EnvelopeKind::is_subject_pullable over ALL (RECEIVE axis)"
         );
-        assert_eq!(expected.len(), 5, "the five replicated kinds");
+        assert_eq!(
+            expected.len(),
+            4,
+            "the four replicated kinds (persist v59.0.0)"
+        );
         // The Attestation plane is the one that sweeps both axes + carves scores.
         let att = policies
             .iter()

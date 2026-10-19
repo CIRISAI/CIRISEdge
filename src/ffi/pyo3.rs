@@ -2501,6 +2501,9 @@ impl PyEdge {
     ///   # roster applies), "third_party_row" (AV-84 verdict about the row),
     ///   # "community_roster_fork" (two authorities, one community id).
     ///   "apply_refusals_by_class": {"retry_after_roster": 4, ...},
+    ///   # persist v59.0.0 — framed key-plane objects refused
+    ///   # `federation_envelope_kind_retired`, per kind label.
+    ///   "envelope_kind_retired_refusals": {"key": 1, ...},
     ///   # CIRISEdge#858 — the refusal memory's park ledger.
     ///   "rows_parked_on_signer": {"identity_occurrence": 52, ...},
     ///   "signer_releases": 3, "retry_suppressions": 410,
@@ -2978,6 +2981,13 @@ fn metrics_bundle_to_pydict<'py>(
         refusals_class.set_item(token.as_str(), *v)?;
     }
     root.set_item("apply_refusals_by_class", refusals_class)?;
+    // persist v59.0.0 — framed key-plane objects refused
+    // `federation_envelope_kind_retired`, per kind label.
+    let retired = pyo3::types::PyDict::new(py);
+    for (kind, v) in &bundle.envelope_kind_retired_refusals {
+        retired.set_item(kind.as_str(), *v)?;
+    }
+    root.set_item("envelope_kind_retired_refusals", retired)?;
 
     // CIRISEdge#858 — the refusal memory's park ledger: rows parked on a
     // signer per plane (since start), rows released, wanted hashes the

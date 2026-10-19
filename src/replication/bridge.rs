@@ -102,22 +102,21 @@ use ciris_persist::federation::namespace::{self, Projection};
 use ciris_persist::federation::operational::{
     OrgMembership, Organization, SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
 };
-use ciris_persist::federation::register::{KeyRefusalReason, ReplicatedKeyOutcome};
 use ciris_persist::federation::trust_root::capability_roots_to_trusted_root;
 use ciris_persist::federation::types::delegation_scope;
 use ciris_persist::federation::types::{
-    Attestation, KeyRecord, SignedAttestation, SignedCommunity, SignedCommunityMembershipListing,
+    Attestation, SignedAttestation, SignedCommunity, SignedCommunityMembershipListing,
     SignedCommunityMembershipRevocation, SignedCommunityMembershipWidening, SignedFamily,
-    SignedFamilyMembershipRevocation, SignedFamilyMembershipWidening, SignedIdentityOccurrence,
-    SignedIdentityOccurrenceRevocation, SignedKeyRecord, SignedLocationProof, SignedRevocation,
+    SignedFamilyMembershipRevocation, SignedFamilyMembershipWidening, SignedLocationProof,
 };
 use ciris_persist::federation::FederationDirectory;
 use ciris_verify_core::threshold::ThresholdMember;
 
 use super::directory::ReplicationDirectory;
 use super::group_plane::{is_membership_plane, GroupPlane};
+use super::key_plane_rows;
 use super::protocol::{EnvelopeKind, EnvelopeRef};
-use super::summary::{ApplyOutcome, AwaitedSigner};
+use super::summary::ApplyOutcome;
 
 // ─── CIRISEdge#423 → #425 — apply-refusal diagnostics, now by construction ──
 //
@@ -446,6 +445,13 @@ impl<'a> SignatureVerdict<'a> {
             E::AttesterKeyUnknown {
                 attesting_key_id, ..
             } if !attesting_key_id.trim().is_empty() => Some(Self::SignerUnknown(attesting_key_id)),
+            // persist v59.0.0 (CIRISPersist#1099) — the same token now also
+            // answers an identity's OWN genesis key once its self evicted it
+            // (`check_signer_acts_for` reads `genesis_evicted_at`). That arm
+            // never turns, but persist does not type it apart, so it keeps
+            // the acts-for disposition: indexed on the held signer, and from
+            // its second refusal on the terminal schedule
+            // (`RefusalBackoff::index_held_signer_at`), which bounds it.
             E::SignerDoesNotActFor {
                 attesting_key_id, ..
             } if !attesting_key_id.trim().is_empty() => {
@@ -514,6 +520,10 @@ fn signature_refusal(
 ///   closed vocabulary in either form. Every arm judges the signed row itself,
 ///   so re-offering the same bytes can never admit. The token is persist's own
 ///   `kind()`.
+/// - persist v59.0.0: `EnvelopeKindRetired` (a retired framed key-plane
+///   object), an `InvalidArgument` led by `self_roster::ASSERTED_AT_STALE`,
+///   and a `SelfRosterNotLanded` whose decision is not `pending`. Each arm
+///   carries its reasoning.
 pub(crate) fn typed_terminal_verdict(
     err: &ciris_persist::federation::Error,
 ) -> Option<&'static str> {
@@ -538,7 +548,16 @@ pub(crate) fn typed_terminal_verdict(
         // column diverging from its envelope, a non-canonical envelope, a
         // malformed custody report). Both terminal at the first refusal by
         // persist's own reading.
-        E::TraceDimensionInvalid { .. } | E::MalformedRow { .. } => Some(err.kind()),
+        //
+        // persist v59.0.0 (sealed-transport floor) — a framed object of a
+        // RETIRED kind (key record, key revocation, identity occurrence,
+        // occurrence revocation). persist: "Terminal: the same bytes are never
+        // admitted on this door". Its token is `kind()`
+        // (`federation_envelope_kind_retired`); persist exports no separate
+        // const for it.
+        E::TraceDimensionInvalid { .. }
+        | E::MalformedRow { .. }
+        | E::EnvelopeKindRetired { .. } => Some(err.kind()),
         // persist v55.0.0 (#753) — the two DimensionRejected reasons that are
         // functions of the row: a family held shut until its door
         // (`registered_family_held_shut`; a later persist may open it, and the
@@ -564,6 +583,32 @@ pub(crate) fn typed_terminal_verdict(
         // retryability predicate for `KeyGrantRefusalReason`, so the table is
         // edge's (`key_grant_refusal_terminal`), keyed on persist's tokens.
         E::KeyGrantRefused { reason, .. } if key_grant_refusal_terminal(reason) => Some(reason),
+        // persist v59.0.0 (CIRISPersist#1049 on #1099's steward predicate) —
+        // `asserted_at_stale`: the row's author stood for a steward as a
+        // roster key at its signed `asserted_at`, is NOT a live roster key
+        // now (evicted or revoked since), and that instant is more than W
+        // (72 h) behind this node's clock. Every leg only moves one way for
+        // these bytes: the row ages, and the eviction that made the key
+        // not-live stands. So the same row is never admitted again — terminal.
+        // persist raises it as `InvalidArgument` led by its const
+        // (`self_roster::ASSERTED_AT_STALE`); the const is what is matched.
+        E::InvalidArgument(msg)
+            if msg.starts_with(ciris_persist::federation::self_roster::ASSERTED_AT_STALE) =>
+        {
+            Some(ciris_persist::federation::self_roster::ASSERTED_AT_STALE)
+        }
+        // persist v59.0.0 (CIRISPersist#1099, CC 3.3.6.3) — a self-roster
+        // change that did not land. `pending` is a proposal persist HOLDS and
+        // lands by itself when its answers or window allow; a re-offer of the
+        // same row can only find it pending again or already landed, so it
+        // keeps the transient rule (the ambiguous-token rule: re-asking is
+        // cheap and bounded). Any other decision is a two-path refusal token
+        // (`proposer_not_on_roster`, `target_already_on_roster`, …) or
+        // `cancelled`: a verdict on the proposal's shape that no answer mends
+        // — terminal. On the replicated path persist folds this error into
+        // `KeyPlaneRefused` (transient, `attestation_refusal_retry`); this arm
+        // is for any door that returns it typed.
+        E::SelfRosterNotLanded { decision, .. } if *decision != "pending" => Some(*decision),
         _ => None,
     }
 }
@@ -619,204 +664,6 @@ fn key_grant_refusal_terminal(reason: &str) -> bool {
     ]
     .iter()
     .any(|r| r.as_str() == reason)
-}
-
-/// CIRISEdge#544 — does re-offering the IDENTICAL bytes that earned this
-/// Key-plane refusal have any chance of a different answer?
-///
-/// The issue's measured row is here: `conflicting_version`, one `Key` record,
-/// 55 re-offers in 30 minutes, same content hash every time. The disposition is
-/// read off persist's own doc-comments on
-/// [`KeyRefusalReason`](ciris_persist::federation::register::KeyRefusalReason) —
-/// they are the authority on what each branch is a function of, and edge keys on
-/// the typed variant, never on the message prose (#565's whole point).
-///
-/// # TERMINAL — the verdict is a function of state replication cannot move
-///
-/// - `UnverifiableSignature` — persist v54.1.0 (CIRISPersist#1042) split the
-///   unregistered signer OUT of this token into `AttesterKeyUnknown`. What is
-///   left is a record whose signature does not verify against a scrubber this
-///   node HOLDS, or that is malformed: a function of the offered bytes. Until
-///   v54.1.0 it was transient, because the two arms were one token, and an
-///   invalid SELF-scrubbed Key then parked on its own key id, which only its own
-///   admit could release (CIRISEdge#858 fix 7). A corrected record from the
-///   holder is different bytes, and persist's `InvalidReplaced` admits it.
-/// - `PubkeySwap` — "replication may never swap an identity's keys". The verdict
-///   compares the stored pubkey with the offered one; replication is structurally
-///   barred from changing the first, and the second is fixed by the bytes.
-/// - `Downgrade` — "Monotonic — never demote an anchored row". The stored row can
-///   only become MORE anchored, so a self-signed record's answer can only stay no.
-/// - `ConflictingVersion` — "First-seen wins", and these bytes did not. Terminal
-///   in every reachable successor state too: if the stored self-signed row is
-///   later anchor-scrubbed, the same offer becomes a `Downgrade` — still refused.
-///
-/// # TRANSIENT — decided by state that is still moving, or by a token that
-/// collapses a recoverable arm with an unrecoverable one
-///
-/// - `StoreConflict` — persist says it outright: "the record is safe to re-offer".
-///   A lost plan/act race on a planning backend.
-/// - `AttesterKeyUnknown` — persist v54.1.0 (CIRISPersist#1042): the record's
-///   scrubber is not registered HERE yet. The scrub key is itself a Key-plane row
-///   that replicates, so this is ordinary bootstrap ordering, and persist names it
-///   retryable. The row is parked on the scrubber
-///   ([`FederationDirectoryReplicationBridge::park_or_release`]) and released by
-///   its admit.
-/// - `ReScrub` — likewise mixed: "not canonical-scoped" / "valid_from not newer"
-///   cannot move, but "the m-of-n quorum re-verify … failed" can — quorum evidence
-///   replicates on its own cursor plane (#474). A canonical KEY SUPERSEDE is the
-///   single worst row to drop for being early, so it stays re-askable.
-/// - `OwnerAbsent` / `OwnerAmbiguous` — `owner_of` is resolved from replicated
-///   ownership rows; both readings change when those rows (or a revocation of a
-///   duplicate claim) land. Fail-closed, per persist — not permanent.
-/// - `AlreadyAnchoredIdentical` — unreachable here: [`key_outcome_to_apply`] maps
-///   it to [`ApplyOutcome::Duplicate`] (the receiver already holds what was
-///   offered), so it never reaches a refusal memory. Listed transient because a
-///   duplicate is the opposite of a thing to stop asking for, and because the
-///   compiler must see every variant answered.
-///
-/// The asymmetry is deliberate and is the rule for any future variant: a
-/// permanent refusal called transient costs a decaying trickle of re-asks; a
-/// recoverable one called terminal withholds state. When a token is ambiguous,
-/// it is transient.
-#[must_use]
-fn key_refusal_retry(reason: KeyRefusalReason) -> RetryDisposition {
-    match reason {
-        KeyRefusalReason::PubkeySwap
-        | KeyRefusalReason::Downgrade
-        | KeyRefusalReason::ConflictingVersion
-        // persist v44.7.0 (#864) — `RebindChangesRecord`: the offered
-        // self-signed record wears the rebind shape (same key, same pubkeys,
-        // bound envelope over an unbound stored row) but its CLAIM differs
-        // from the stored row's. The verdict compares fixed bytes with a
-        // stored claim replication cannot move in this direction: if the
-        // stored row later becomes anchored the same offer is a `Downgrade`,
-        // if it is rebound by its holder the same offer is `ConflictingVersion`
-        // — refused in every successor state, the `ConflictingVersion`
-        // argument verbatim.
-        | KeyRefusalReason::RebindChangesRecord
-        // persist v50.0.0 (CC 3.4.7.3 Clause A, #925 review H3) — a replicated
-        // record that would FUSE `node` with `agent`/`user`, or add/remove
-        // `node` from a stored `identity_type`. `node` is fixed at mint and the
-        // offered bytes are fixed, so no later state admits this offer: the key
-        // re-mints instead. Terminal, the `ConflictingVersion` argument again.
-        | KeyRefusalReason::NodeIdentityFused
-        | KeyRefusalReason::NodeIdentityChanged
-        // persist v54.1.0 (CIRISPersist#1042) — a signature that does not
-        // verify against a scrubber this node holds; the unregistered-scrubber
-        // arm is `AttesterKeyUnknown` now. See the doc above.
-        | KeyRefusalReason::UnverifiableSignature => RetryDisposition::Terminal,
-        // v44.7.0 (#864) — `NotSelfSigned` / `RecordAbsent` are verdicts of the
-        // LOCAL rebind door (`rebind_key_record`), which the replication plane
-        // never runs: a fresh node INSERTS a bound record, a holder REBINDS.
-        // Unreachable here, and if a future door did surface one, "no row yet"
-        // is exactly the bootstrap-ordering shape — so by the rule for
-        // ambiguous tokens they stay transient.
-        KeyRefusalReason::NotSelfSigned | KeyRefusalReason::RecordAbsent => {
-            RetryDisposition::Transient
-        }
-        KeyRefusalReason::ReScrub
-        | KeyRefusalReason::AlreadyAnchoredIdentical
-        // persist v54.1.0 (CIRISPersist#1042) — retryable by persist's own
-        // table: re-offered after the scrubber's Key row lands.
-        | KeyRefusalReason::AttesterKeyUnknown
-        | KeyRefusalReason::OwnerAbsent
-        | KeyRefusalReason::OwnerAmbiguous
-        | KeyRefusalReason::StoreConflict => RetryDisposition::Transient,
-    }
-}
-
-/// persist v24.2.0 (CIRISPersist#565) — map the typed Key-plane apply outcome to
-/// edge's [`ApplyOutcome`], returning alongside it the stable refusal TOKEN to
-/// count on the receive-plane mirror ledger (`None` when nothing was refused).
-///
-/// Pure so the whole mapping is unit-testable over [`KeyRefusalReason::ALL`]
-/// without a backend. Two load-bearing decisions:
-///
-/// - **Both duplicate halves map to `Duplicate`** (persist's #565 finding, not
-///   just the ask): a byte-identical re-offer already resolved `Unchanged` at
-///   the `persist_row_hash` comparison, and `AlreadyAnchoredIdentical` is its
-///   sibling — a same-envelope-DIFFERENT-BYTES legitimate re-encoding of a
-///   record this node already anchors (every baked-seed node re-offered the
-///   canonical's own record hits it). Before v24.2.0 that read as a
-///   security-shaped refusal on the COMMON path. Neither half counts on the
-///   refusal ledger: the receiver already holds what was offered.
-/// - **The reason is the branch**: the refusal message carries persist's stable
-///   token (`pubkey_swap`, `downgrade`, …) — the #565 twin of the #433 rule.
-///   Consumers key on the token constant, never on message prose.
-///
-/// `scrubber` is the offered record's `scrub_key_id`. persist v54.1.0's
-/// `attester_key_unknown` token names no key, and the scrubber is the key it
-/// lacks, so the refusal carries it for the park (CIRISEdge#858 fix 7).
-pub(crate) fn key_outcome_to_apply(
-    result: Result<ReplicatedKeyOutcome, ciris_persist::federation::Error>,
-    content_hash: &str,
-    scrubber: &str,
-) -> (ApplyOutcome, Option<&'static str>) {
-    match result {
-        Ok(
-            ReplicatedKeyOutcome::Inserted
-            | ReplicatedKeyOutcome::Upgraded
-            // persist v44.7.0 (#864) — a stored self-signed UNBOUND record
-            // healed to its holder's bound bytes over the same pubkeys and
-            // the same claim. The row this node holds CHANGED (persist moves
-            // `mutated_at`, so cursors re-serve it), which is an admission,
-            // not a duplicate: a peer that counted it as held-already would
-            // keep serving the pre-#659 bytes every verify v15.2.0 node
-            // refuses — the exact stall #864 names.
-            | ReplicatedKeyOutcome::Rebound
-            | ReplicatedKeyOutcome::Superseded
-            // persist v54.0.0 (#995 row 2) — a row a pre-v53.1.4 door stranded
-            // without its `additional_scrubs` had them written back. Same shape
-            // as `Rebound`: the held row changed and persist moved its serve
-            // position, so this is an admission, never a duplicate.
-            | ReplicatedKeyOutcome::ScrubsRehydrated
-            // persist v54.1.0 (CIRISPersist#1044) — the held row FAILED
-            // verification and was replaced in place by this record, which
-            // passes (same pubkeys, same claim). The held row changed and
-            // persist moved `mutated_at`: an admission, so rows parked on this
-            // key are released by the Key arm of `park_or_release`.
-            | ReplicatedKeyOutcome::InvalidReplaced,
-        ) => (ApplyOutcome::Admitted, None),
-        Ok(
-            ReplicatedKeyOutcome::Unchanged
-            | ReplicatedKeyOutcome::Refused {
-                reason: KeyRefusalReason::AlreadyAnchoredIdentical,
-            },
-        ) => (ApplyOutcome::Duplicate, None),
-        // CIRISEdge#544 — the disposition rides the SAME typed value the token
-        // does. `key_refusal_retry` carries the per-variant reasoning; the
-        // message states the verdict so an operator reading one WARN line knows
-        // whether to wait or to supersede.
-        Ok(ReplicatedKeyOutcome::Refused { reason }) => {
-            let retry = key_refusal_retry(reason);
-            (
-                ApplyOutcome::Refused {
-                    reason: format!(
-                        "Key: admission refused ({}; content_hash={content_hash}) [retry={}]",
-                        reason.as_str(),
-                        retry.as_str(),
-                    ),
-                    retry,
-                    // An empty scrubber names nothing to wait for (see
-                    // `SignatureVerdict::of`).
-                    awaits_signer: (matches!(reason, KeyRefusalReason::AttesterKeyUnknown)
-                        && !scrubber.is_empty())
-                    .then(|| AwaitedSigner::Key(scrubber.to_owned())),
-                },
-                Some(reason.as_str()),
-            )
-        }
-        // A persist `Err` on this door is NOT one of the typed policy branches —
-        // it is a backend/plumbing failure, which is the definition of moving
-        // state. Transient (bounded by the short backoff), never terminal —
-        // unless persist typed it on the signature axis, which says what it is.
-        Err(e) => (
-            signature_refusal("Key", content_hash, &e).unwrap_or_else(|| {
-                ApplyOutcome::refused(apply_refusal_reason("Key", content_hash, &e))
-            }),
-            None,
-        ),
-    }
 }
 
 /// CIRISEdge#459 — the retry disposition of a typed Attestation-plane refusal,
@@ -3727,27 +3574,31 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         envelope_hash: &[u8; 32],
     ) -> Option<Vec<u8>> {
         // CIRISEdge#397 §3 — the content-hash point-read. Every indexed kind
-        // (all 13 except `Revocation`) resolves its bytes from persist's
-        // `signed_wire_index` keyed on `(kind, content_hash)`. Because edge
-        // advertised `sha256(serde_json::to_vec(row))` and persist reloads +
-        // re-serializes that SAME row, the returned bytes hash back to
-        // `envelope_hash` by construction.
-        if let Some(k) = kind.persist_index_kind() {
-            return self
-                .directory
-                .lookup_signed_record_by_content_hash(k, &hex::encode(envelope_hash))
-                .await
-                .ok()
-                .flatten();
+        // resolves its bytes from persist's `signed_wire_index` keyed on
+        // `(kind, content_hash)`. Because edge advertised
+        // `sha256(serde_json::to_vec(row))` and persist reloads + re-serializes
+        // that SAME row, the returned bytes hash back to `envelope_hash` by
+        // construction. persist v59.0.0 retired the one row-hash plane (the
+        // framed `Revocation`); its `key:revocation:v1` row is point-read here
+        // through the Attestation index like the other two key-plane planes.
+        let k = kind.persist_index_kind()?;
+        let bytes = self
+            .directory
+            .lookup_signed_record_by_content_hash(k, &hex::encode(envelope_hash))
+            .await
+            .ok()
+            .flatten()?;
+        // persist v59.0.0 — a key-plane session plane point-reads the WHOLE
+        // Attestation index, so the bytes are served on it only when they are
+        // a row of the plane's own family. Without this, `Key` (a #402
+        // bootstrap plane, served public) would hand out any attestation by
+        // hash, past every Attestation-plane gate.
+        if let Some(family) = kind.key_plane_family() {
+            if key_plane_rows::key_plane_row_of_bytes(&bytes).map(|(f, _)| f) != Some(family) {
+                return None;
+            }
         }
-        // CIRISEdge#396 item 3 — `Revocation` is the ONE kind persist does not
-        // content-hash-index; it rides the `persist_row_hash` wire. Resolve it
-        // with NO cache: this retires the last in-memory fetch cache, so every
-        // plane's fetch is now a direct persist read.
-        if kind.is_row_hash_served() {
-            return self.fetch_revocation_bytes(envelope_hash).await;
-        }
-        None
+        Some(bytes)
     }
 
     /// CIRISEdge#379 — recipient-aware listing: the Attestation plane routes
@@ -4771,28 +4622,18 @@ impl FederationDirectoryReplicationBridge {
     ) {
         use sha2::{Digest as _, Sha256};
         match outcome.retry_disposition() {
-            None if outcome.is_admitted()
-                && matches!(
-                    kind,
-                    EnvelopeKind::Attestation | EnvelopeKind::IdentityOccurrence
-                ) =>
-            {
-                if let Some(signer) = newly_bound_signer_of(kind, envelope_bytes) {
-                    self.release_and_kick(&signer, ReleaseCause::SignerBound);
+            // persist v59.0.0 — a key's record and an occurrence arrive as
+            // ROWS, on their own session plane or on the Attestation plane, so
+            // both releases read the row on either.
+            None => {
+                if outcome.is_admitted() {
+                    if let Some(signer) = newly_bound_signer_of(kind, envelope_bytes) {
+                        self.release_and_kick(&signer, ReleaseCause::SignerBound);
+                    }
                 }
-            }
-            None if kind == EnvelopeKind::Key => {
-                // The admitted (or already-held) key's id sits on the wrapper's
-                // `record` or at the top level (the legacy wire).
-                if let Some(key_id) = serde_json::from_slice::<serde_json::Value>(envelope_bytes)
-                    .ok()
-                    .and_then(|v| {
-                        v.pointer("/record/key_id")
-                            .or_else(|| v.get("key_id"))
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-                {
+                // The admitted (or already-held) key record releases the rows
+                // parked on its key.
+                if let Some(key_id) = key_of_record_row(kind, envelope_bytes) {
                     self.release_and_kick(&key_id, ReleaseCause::KeyAdmitted);
                 }
             }
@@ -4814,11 +4655,21 @@ impl FederationDirectoryReplicationBridge {
                     // on a typed one it catches a Key that landed between the
                     // refusal and this read, which leaves the row on the short
                     // window.
-                    outcome.awaits_signer().map(str::to_owned).or_else(|| {
+                    outcome
+                        .awaits_signer()
+                        .map(str::to_owned)
+                        .or_else(|| {
                             crate::replication::missing_signer::missing_signer_of(
                                 kind,
                                 envelope_bytes,
                             )
+                        })
+                        // persist v59.0.0 — a `key:record:v1` row's attester
+                        // is its own key, which is never the missing
+                        // dependency: parked on itself, only its own
+                        // admission could release it (the #858 fix 7 shape).
+                        .filter(|signer| {
+                            key_of_record_row(kind, envelope_bytes).as_deref() != Some(signer)
                         })
                 {
                     // The store lookup the apply loop could not afford: is the
@@ -4967,20 +4818,21 @@ impl FederationDirectoryReplicationBridge {
             // TransportDestination project SelfOwn (publish-own); Attestation is
             // per-record (`attestation_is_advertised`); IdentityOccurrenceRevocation
             // is a tombstone → Global (anti-rollback).
-            EnvelopeKind::Key => self.list_keys(window).await,
-            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrences(window).await,
+            //
+            // persist v59.0.0 (sealed-transport floor) — the three key-plane
+            // session planes advertise their ROWS (`key:record:v1`,
+            // `identity:occurrence:v1`, `key:revocation:v1`), read per subject:
+            // persist serves no framed key-plane listing any more. The publish
+            // set is the node's own keys (SelfOwn) or own ∪ cohort (Global), so
+            // there is no corpus-wide page to keep a watermark on; the width
+            // permit is taken per subject read. The occurrence-revocation plane
+            // is retired and offers nothing: an occurrence is revoked by a
+            // `withdraws` on its row, which the Attestation plane carries.
+            EnvelopeKind::Key => self.list_key_record_rows(None).await,
+            EnvelopeKind::IdentityOccurrence => self.list_occurrence_rows(None).await,
             EnvelopeKind::TransportDestination => self.list_transport_destinations(window).await,
-            EnvelopeKind::IdentityOccurrenceRevocation => {
-                self.list_identity_occurrence_revocations(window).await
-            }
             EnvelopeKind::Attestation => self.list_attestations(None, window).await,
-            // CIRISEdge#531 DEPTH — `Revocation` is the one plane persist does
-            // not expose a `_since` cursor for: it fans out per cohort member
-            // (`revocations_for`). There is no page to keep a watermark on, so
-            // the window is not consulted; the width bound moved INSIDE the
-            // fan-out (one permit per member read) so its materialisation stays
-            // one member's rows rather than the whole cohort's.
-            EnvelopeKind::Revocation => self.list_revocations().await,
+            EnvelopeKind::Revocation => self.list_revocation_rows().await,
             EnvelopeKind::Family => self.list_families(window).await,
             EnvelopeKind::Community => self.list_communities(window).await,
             EnvelopeKind::Organization => self.list_organizations(window).await,
@@ -5018,7 +4870,11 @@ impl FederationDirectoryReplicationBridge {
             // #848 — a key_grant set is an attestation row and is advertised
             // by the Attestation arm above; listing it under its own kind
             // would offer every row twice.
-            EnvelopeKind::AccordQuorumEvidence | EnvelopeKind::KeyGrant => Vec::new(),
+            // persist v59.0.0 — the retired occurrence-revocation plane offers
+            // nothing (see the key-plane arms above).
+            EnvelopeKind::AccordQuorumEvidence
+            | EnvelopeKind::KeyGrant
+            | EnvelopeKind::IdentityOccurrenceRevocation => Vec::new(),
         }
     }
 
@@ -5127,46 +4983,40 @@ impl FederationDirectoryReplicationBridge {
             );
         };
         match kind {
+            // persist v59.0.0 — the subject's `key:record:v1` row(s), hashed
+            // as the attestation each is (the Attestation index's key).
             EnvelopeKind::Key => {
-                match self.directory.lookup_public_key(subject_key_id).await {
-                    Ok(Some(record)) => {
-                        let seq = Self::ms_seq(record.valid_from);
-                        match content_hash_of(&SignedKeyRecord { record }) {
-                            Some((hash, _)) => push(hash, seq),
-                            None => book_unhashable("subject_holdings/key: content_hash_of failed"),
-                        }
-                    }
-                    Ok(None) => {} // no key row for the subject — a normal absence
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            subject = %subject_key_id,
-                            "subject-Pull key lookup FAILED — serving an EMPTY axis \
-                             this round (transient, NOT 'no testimony') \
-                             (CIRISEdge#462/#429)"
-                        );
+                for row in subject_read!(
+                    key_plane_rows::key_record_rows(&*self.directory, subject_key_id),
+                    "key-record row"
+                ) {
+                    let seq = Self::ms_seq(row.asserted_at);
+                    match content_hash_of(&row) {
+                        Some((hash, _)) => push(hash, seq),
+                        None => book_unhashable("subject_holdings/key: content_hash_of failed"),
                     }
                 }
             }
+            // persist v59.0.0 — the `identity:occurrence:v1` rows about the
+            // subject (the identity).
             EnvelopeKind::IdentityOccurrence => {
                 for row in subject_read!(
-                    self.directory
-                        .list_signed_identity_occurrences_for(subject_key_id),
-                    "identity-occurrence"
+                    key_plane_rows::occurrence_rows_about(&*self.directory, subject_key_id),
+                    "identity-occurrence row"
                 ) {
                     // CIRISEdge#682 — the subject-Pull twin of the announce gate:
                     // a named lookup never lists an unannounced node's
                     // occurrence to a peer outside its owner's nodes.
+                    let Some(occurrence) = key_plane_rows::occurrence_key_of(&row) else {
+                        continue;
+                    };
                     if self
-                        .identity_row_pull_withholds(
-                            &row.identity_occurrence.occurrence_key_id,
-                            peer_key_id,
-                        )
+                        .identity_row_pull_withholds(&occurrence, peer_key_id)
                         .await
                     {
                         continue;
                     }
-                    let seq = Self::ms_seq(row.identity_occurrence.asserted_at);
+                    let seq = Self::ms_seq(row.asserted_at);
                     match content_hash_of(&row) {
                         Some((hash, _)) => push(hash, seq),
                         None => book_unhashable("subject_holdings/idocc: content_hash_of failed"),
@@ -5196,21 +5046,6 @@ impl FederationDirectoryReplicationBridge {
                         Some((hash, _)) => push(hash, seq),
                         None => {
                             book_unhashable("subject_holdings/transport: content_hash_of failed");
-                        }
-                    }
-                }
-            }
-            EnvelopeKind::IdentityOccurrenceRevocation => {
-                for row in subject_read!(
-                    self.directory
-                        .list_signed_identity_occurrence_revocations_for(subject_key_id),
-                    "identity-occurrence-revocation"
-                ) {
-                    let seq = Self::ms_seq(row.identity_occurrence_revocation.revoked_at);
-                    match content_hash_of(&row) {
-                        Some((hash, _)) => push(hash, seq),
-                        None => {
-                            book_unhashable("subject_holdings/idocc-rev: content_hash_of failed");
                         }
                     }
                 }
@@ -5302,7 +5137,8 @@ impl FederationDirectoryReplicationBridge {
                     }
                 }
             }
-            // Revocation (key-level), the cohort planes (Family/Community/
+            // Revocation (key-level), the retired occurrence-revocation plane
+            // (persist v59.0.0), the cohort planes (Family/Community/
             // LocationProof), the membership-revocation planes, and the
             // operational trio are not subject-scoped-pullable via this axis.
             _ => {}
@@ -5487,6 +5323,9 @@ impl FederationDirectoryReplicationBridge {
         if let Some(outcome) = signature_refusal(plane, content_hash, err) {
             return outcome;
         }
+        // persist v59.0.0 — a retired framed kind refused at a persist door
+        // books the retired ledger too.
+        self.book_envelope_kind_retired(err);
         // persist v54.1.0 — a typed verdict about the bytes (`typed_terminal_verdict`).
         if typed_terminal_verdict(err).is_some() {
             return ApplyOutcome::refused_terminal(apply_refusal_reason(plane, content_hash, err));
@@ -5598,6 +5437,123 @@ impl FederationDirectoryReplicationBridge {
         self.refusal_backoff.len()
     }
 
+    /// CIRISEdge#430 — an ADMITTED key revocation is the event-driven
+    /// invalidation signal for cached trust verdicts (the transit gate's hop
+    /// cache). Fired only on admit (a refused/duplicate revocation changed no
+    /// trust state). TTLs remain the backstop when no observer is installed.
+    /// persist v59.0.0 — the revocation is the one its `key:revocation:v1` row
+    /// carries, whichever plane the row arrived on.
+    fn on_revocation_admitted(&self, revocation: &ciris_persist::federation::types::Revocation) {
+        // persist v52.0.0 (CIRISPersist#784) — the SUBJECT is
+        // `revoked_key_sha256_ed25519_raw`; `revoked_key_id` is optional (a
+        // revoker may withhold the cleartext label).
+        if let Some(revoked) = revocation.revoked_key_id.as_deref() {
+            if let Some(observer) = &self.revocation_observer {
+                observer(revoked);
+            }
+            // Workstream F — a revoked key can be a seated accord holder or
+            // the root itself; either way its cached relay verdict is now
+            // false.
+            self.invalidate_accord_relay(&[revoked]);
+            // CIRISEdge#523 — and it can be either SIDE of an owner-binding:
+            // the node whose owner is memoized, or the owner key itself (which
+            // stops conferring membership on every node it owns). `invalidate`
+            // drops both directions.
+            self.invalidate_owner_memo(revoked);
+        } else {
+            // A digest-only revocation names no key_id, and every cache here
+            // is keyed by key_id. Choosing invalidation keys is a cache
+            // concern, never a trust rule: over-broad costs a re-resolve,
+            // too-narrow serves a falsified verdict — so drop the whole of
+            // each memo. The key_id-keyed observer has nothing to name; its
+            // TTL-free consumer (`DirectoryCache`) is not wired in production
+            // (see `directory_cache.rs`).
+            if let Some(gate) = self.accord_relay_gate.as_ref() {
+                gate.invalidate_all();
+            }
+            self.invalidate_owner_memo_all();
+        }
+    }
+
+    /// persist v59.0.0 (sealed-transport floor) — the apply door of the four
+    /// retired framed kinds.
+    ///
+    /// A key-plane session plane ([`EnvelopeKind::key_plane_family`]) admits
+    /// exactly its own family's attestation row, through
+    /// [`Self::apply_attestation`] (persist's `ApplyReplicatedAttestation`:
+    /// the key-plane door verifies proof of possession, the revoker or the
+    /// occurrence signer). A row of another family is refused TERMINAL and
+    /// never applied: `Key` and `IdentityOccurrence` are the #402 bootstrap
+    /// planes an un-attributed link may carry, and they must not become a path
+    /// for general attestations.
+    ///
+    /// Every other body is the framed object persist retired (or anything on
+    /// the retired occurrence-revocation plane): refused TERMINAL with
+    /// persist's own typed refusal, booked once on the
+    /// `federation_envelope_kind_retired` ledger under the kind's label, and
+    /// never routed to an authoring door. Terminal by persist's ruling: "the
+    /// same bytes are never admitted on this door", so re-asking cannot help.
+    async fn apply_key_plane(
+        &self,
+        kind: EnvelopeKind,
+        bytes: &[u8],
+        source_peer: Option<&str>,
+    ) -> ApplyOutcome {
+        if let Some(family) = kind.key_plane_family() {
+            if let Some((found, row)) = key_plane_rows::key_plane_row_of_bytes(bytes) {
+                if found == family {
+                    return self.apply_attestation(bytes, source_peer).await;
+                }
+                return ApplyOutcome::refused_terminal(format!(
+                    "{kind:?}: a {} row (attestation_id={}) on the {} plane — refused, never \
+                     applied: each key-plane session plane carries its own family only \
+                     (persist v59.0.0)",
+                    found.dimension(),
+                    row.attestation_id,
+                    family.dimension(),
+                ));
+            }
+        }
+        self.refuse_retired_framed(kind, bytes)
+    }
+
+    /// persist v59.0.0 — refuse a framed object of a retired kind, TERMINAL,
+    /// with persist's typed [`EnvelopeKindRetired`](ciris_persist::federation::Error::EnvelopeKindRetired)
+    /// (stable `kind()` token `federation_envelope_kind_retired`; persist
+    /// exports no separate const for it), and book it on the retired ledger.
+    /// Bytes that are not JSON at all are a `Deserialize` drop, as on every
+    /// other plane.
+    fn refuse_retired_framed(&self, kind: EnvelopeKind, bytes: &[u8]) -> ApplyOutcome {
+        use sha2::{Digest as _, Sha256};
+        if let Err(e) = serde_json::from_slice::<serde::de::IgnoredAny>(bytes) {
+            return ApplyOutcome::Deserialize(apply_deser_reason(kind.as_wire_str(), bytes, &e));
+        }
+        let Some(err) = key_plane_rows::retired_framed_refusal(kind) else {
+            // Unreachable: only a retired kind is dispatched here.
+            return ApplyOutcome::refused_terminal(format!(
+                "{kind:?}: not a key-plane row and not a retired kind (persist v59.0.0)"
+            ));
+        };
+        self.book_envelope_kind_retired(&err);
+        ApplyOutcome::refused_terminal(apply_refusal_reason(
+            kind.as_wire_str(),
+            &hex::encode(Sha256::digest(bytes)),
+            &err,
+        ))
+    }
+
+    /// persist v59.0.0 — one refusal on the `federation_envelope_kind_retired`
+    /// ledger, labelled by persist's `retired_detail` of the kind it names.
+    fn book_envelope_kind_retired(&self, err: &ciris_persist::federation::Error) {
+        if let ciris_persist::federation::Error::EnvelopeKindRetired { kind } = err {
+            if let Some(m) = &self.metrics {
+                m.inc_envelope_kind_retired(
+                    &ciris_persist::federation::replication_policy::retired_detail(*kind),
+                );
+            }
+        }
+    }
+
     /// The per-kind apply dispatch behind the #425 choke —
     /// [`StateApplier::apply_envelope_bytes`] wraps this with the #426
     /// source-peer trace and the #565 refusal counter.
@@ -5614,64 +5570,40 @@ impl FederationDirectoryReplicationBridge {
         source_peer: Option<&str>,
     ) -> ApplyOutcome {
         match kind {
-            EnvelopeKind::Key => self.apply_key(envelope_bytes).await,
+            // persist v59.0.0 (sealed-transport floor) — the four key-plane
+            // kinds no longer carry their framed objects. Three session planes
+            // carry their family's attestation ROW to the attestation door; any
+            // other body (the framed object, the retired plane's every body) is
+            // refused TERMINAL under `federation_envelope_kind_retired` and
+            // never reaches an authoring door (`put_revocation` /
+            // `put_identity_occurrence` stay local-only).
+            EnvelopeKind::Key
+            | EnvelopeKind::Revocation
+            | EnvelopeKind::IdentityOccurrence
+            | EnvelopeKind::IdentityOccurrenceRevocation => {
+                let outcome = self
+                    .apply_key_plane(kind, envelope_bytes, source_peer)
+                    .await;
+                if outcome.is_admitted() {
+                    if let Some(revocation) = revocation_of_row_bytes(kind, envelope_bytes) {
+                        self.on_revocation_admitted(&revocation);
+                    }
+                }
+                outcome
+            }
             // #848 — a key_grant set framed under its own tag lands on the same
             // door; the `key_grant:` prefix router inside decides.
             EnvelopeKind::Attestation | EnvelopeKind::KeyGrant => {
                 let outcome = self.apply_attestation(envelope_bytes, source_peer).await;
                 if outcome.is_admitted() {
                     self.widen_on_admitted_acceptance(envelope_bytes).await;
-                }
-                outcome
-            }
-            EnvelopeKind::Revocation => {
-                let outcome = self.apply_revocation(envelope_bytes).await;
-                // CIRISEdge#430 — an ADMITTED revocation is the event-driven
-                // invalidation signal for cached trust verdicts (the transit
-                // gate's hop cache). Fired only on admit (a refused/duplicate
-                // revocation changed no trust state); the re-deserialize is
-                // once per admitted revocation, a rare event. TTLs remain the
-                // backstop when no observer is installed.
-                if outcome.is_admitted() {
-                    if let Ok(r) = serde_json::from_slice::<SignedRevocation>(envelope_bytes) {
-                        // persist v52.0.0 (CIRISPersist#784) — the SUBJECT is
-                        // `revoked_key_sha256_ed25519_raw`; `revoked_key_id` is
-                        // optional (a revoker may withhold the cleartext label).
-                        if let Some(revoked) = r.revocation.revoked_key_id.as_deref() {
-                            if let Some(observer) = &self.revocation_observer {
-                                observer(revoked);
-                            }
-                            // Workstream F — a revoked key can be a seated
-                            // accord holder or the root itself; either way
-                            // its cached relay verdict is now false.
-                            self.invalidate_accord_relay(&[revoked]);
-                            // CIRISEdge#523 — and it can be either SIDE of
-                            // an owner-binding: the node whose owner is
-                            // memoized, or the owner key itself (which
-                            // stops conferring membership on every node it
-                            // owns). `invalidate` drops both directions.
-                            self.invalidate_owner_memo(revoked);
-                        } else {
-                            // A digest-only revocation names no key_id, and
-                            // every cache here is keyed by key_id. Choosing
-                            // invalidation keys is a cache concern, never a
-                            // trust rule: over-broad costs a re-resolve,
-                            // too-narrow serves a falsified verdict — so
-                            // drop the whole of each memo. The key_id-keyed
-                            // observer has nothing to name; its TTL-free
-                            // consumer (`DirectoryCache`) is not wired in
-                            // production (see `directory_cache.rs`).
-                            if let Some(gate) = self.accord_relay_gate.as_ref() {
-                                gate.invalidate_all();
-                            }
-                            self.invalidate_owner_memo_all();
-                        }
+                    // persist v59.0.0 — a `key:revocation:v1` row rides this
+                    // plane too.
+                    if let Some(revocation) = revocation_of_row_bytes(kind, envelope_bytes) {
+                        self.on_revocation_admitted(&revocation);
                     }
                 }
                 outcome
-            }
-            EnvelopeKind::IdentityOccurrence => {
-                self.apply_identity_occurrence(envelope_bytes).await
             }
             EnvelopeKind::Family => {
                 let outcome = self.apply_family(envelope_bytes).await;
@@ -5690,10 +5622,6 @@ impl FederationDirectoryReplicationBridge {
             EnvelopeKind::Organization => self.apply_organization(envelope_bytes).await,
             EnvelopeKind::OrgMembership => self.apply_org_membership(envelope_bytes).await,
             EnvelopeKind::PartnerRecord => self.apply_partner_record(envelope_bytes).await,
-            EnvelopeKind::IdentityOccurrenceRevocation => {
-                self.apply_identity_occurrence_revocation(envelope_bytes)
-                    .await
-            }
             EnvelopeKind::FamilyMembershipRevocation => {
                 let outcome = self
                     .apply_family_membership_revocation(envelope_bytes)
@@ -5889,83 +5817,71 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// Key plane — `SelfOwn` (publish-own): the node's OWN establishment records.
-    /// Scope filter is the `SelfOwn` publish set.
+    /// persist v59.0.0 — the Key plane: the `key:record:v1` ROW of each key in
+    /// the publish set (`SelfOwn`, or the host's per-kind answer, #678),
+    /// hashed as the attestation it is ([`content_hash_of`] over the bare row,
+    /// the value persist's Attestation index keys on), so the advertised hash
+    /// resolves through the content-hash point-read. A key held without a row
+    /// (it verifies under neither of persist's rules) is not on the plane and
+    /// is not offered: persist v59 carries no framed `SignedKeyRecord`.
     ///
-    /// persist v32 (CIRISPersist#682) wraps each served key in
-    /// `ServedKeyRecord { record, admitted_at }` — `admitted_at` is the node-local
-    /// admission instant (monotonic, out of the content hash) that fixes the
-    /// late-replication cursor bug (a record signed in January, admitted here in
-    /// February, must not sort under January and become permanently invisible).
-    /// Two consequences edge MUST honor, both invisible to the compiler:
-    ///   1. the wire content hash is over the SIGNED record ONLY — the v31
-    ///      `SignedKeyRecord{record}` shape — so `admitted_at` must stay OUT of it.
-    ///      [`KeyAdvertiseRow`]'s `#[serde(skip)]` reproduces that exact byte shape
-    ///      (pinned by `key_advertise_row_hashes_identically_to_signed_key_record`),
-    ///      so the advertised hash still resolves through the content-hash fetch —
-    ///      hashing the bare `ServedKeyRecord` would fold `admitted_at` in and make
-    ///      every ref listed-then-unfetchable (the LIST-vs-FETCH class);
-    ///   2. the resume `seq` moves from the producer's `valid_from` to the
-    ///      node-local `admitted_at` — the #682 fix, so a late-admitted key sorts
-    ///      by when THIS node saw it, not by a stale producer clock.
-    async fn list_keys(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
-        let subjects = self.self_own_subjects(EnvelopeKind::Key);
-        self.list_keys_page(Some(&subjects), window).await
+    /// `subjects` overrides the publish set (`None` = the plane's own). seq is
+    /// the row's signed `asserted_at`.
+    async fn list_key_record_rows(&self, subjects: Option<HashSet<String>>) -> Vec<EnvelopeRef> {
+        let subjects = subjects.unwrap_or_else(|| self.self_own_subjects(EnvelopeKind::Key));
+        let mut rows: Vec<Attestation> = Vec::new();
+        for subject in subjects {
+            let _permit = self.sweep_gate.enter().await;
+            match key_plane_rows::key_record_rows(&*self.directory, &subject).await {
+                Ok(found) => rows.extend(found),
+                Err(e) => Self::key_plane_read_failed(EnvelopeKind::Key, &subject, &e),
+            }
+        }
+        self.key_plane_refs(rows, "list_key_record_rows")
     }
 
-    /// The Key plane's since-cursor page, with the `SelfOwn` publish filter as
-    /// a PARAMETER: `Some(subjects)` is the advertise view ([`Self::list_keys`]),
-    /// `None` is the raw holdings view ([`Self::list_key_holdings`], #416 — the
-    /// filter belongs to advertise only).
-    async fn list_keys_page(
-        &self,
-        subjects: Option<&HashSet<String>>,
-        window: SweepWindow<'_>,
-    ) -> Vec<EnvelopeRef> {
-        // CIRISEdge#531 DEPTH — the row carries persist's `(pos, id)` resume
-        // pair BESIDE the advertise row, because the advertise row is a
-        // reshaped `KeyAdvertiseRow` (the `#[serde(skip)]` that keeps
-        // `admitted_at` out of the wire hash) and so no longer HAS the served
-        // wrapper's `resume_pair()`.
-        self.sweep_paged(
-            EnvelopeKind::Key,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_key_records_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|served| {
-                        (
-                            served.resume_pair(),
-                            KeyAdvertiseRow {
-                                record: served.record,
-                                admitted_at: served.admitted_at,
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            },
-            |row: &(ResumeCursor, KeyAdvertiseRow)| row.0.clone(),
-            // (`map_or(true, ..)`, not `is_none_or` — MSRV 1.75.)
-            |row| subjects.map_or(true, |s| s.contains(&row.1.record.key_id)),
-            |row| Self::ms_seq(row.1.admitted_at),
-            // Already hash-correct: `KeyAdvertiseRow` #[serde(skip)]s admitted_at.
-            |row| &row.1,
-        )
-        .await
+    /// persist v59.0.0 — a key-plane row read that persist did not serve: the
+    /// plane offers nothing for that subject THIS round (the next round reads
+    /// again), named, never read as "no rows".
+    fn key_plane_read_failed(
+        kind: EnvelopeKind,
+        subject: &str,
+        e: &ciris_persist::federation::Error,
+    ) {
+        tracing::warn!(
+            kind = ?kind,
+            subject,
+            error = %e,
+            "key-plane row read FAILED — this subject's rows are not offered this \
+             round (a read error, NOT a statement it has none) (persist v59.0.0)"
+        );
     }
 
-    /// CIRISEdge#416 (v18 sweep) — the RAW Key holdings: every key row in local
-    /// state, UNFILTERED. See [`Self::list_holdings`] for why the SelfOwn
-    /// publish filter must not shape the receive-diff view, and
-    /// [`Self::list_attestation_holdings`] for why the page limit is the RAW
-    /// configured one (relief bounds offers, never self-knowledge).
-    async fn list_key_holdings(&self) -> Vec<EnvelopeRef> {
-        self.list_keys_page(None, SweepWindow::Full).await
+    /// persist v59.0.0 — the refs of key-plane rows: each row's content hash
+    /// over the bare [`Attestation`], deduped, seq its `asserted_at`. A row
+    /// that will not hash is booked [`RowNotSerializable`](crate::observability::WithholdReason::RowNotSerializable),
+    /// as every advertise does (#433).
+    fn key_plane_refs(&self, rows: Vec<Attestation>, site: &str) -> Vec<EnvelopeRef> {
+        let mut refs = Vec::new();
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        for row in rows {
+            let Some((hash, _)) = content_hash_of(&row) else {
+                self.withhold(
+                    crate::observability::WithholdReason::RowNotSerializable,
+                    "<unattributed>",
+                    &format!("{site}: content_hash_of failed"),
+                );
+                continue;
+            };
+            if seen.insert(hash) {
+                refs.push(EnvelopeRef {
+                    envelope_hash: hash,
+                    seq: Self::ms_seq(row.asserted_at),
+                });
+            }
+        }
+        refs
     }
-
     /// CIRISEdge#682 — the announce-gated advertise of the two identity planes.
     /// The `SelfOwn` publish set is narrowed per peer by
     /// [`Self::identity_rows_withheld_from`] (one reach walk per subject, not
@@ -5988,10 +5904,9 @@ impl FederationDirectoryReplicationBridge {
             );
         }
         match kind {
-            EnvelopeKind::IdentityOccurrence => {
-                self.list_identity_occurrences_page(Some(&subjects), window)
-                    .await
-            }
+            // persist v59.0.0 — the occurrence ROWS (no since-cursor: the
+            // publish set is this node's own keys).
+            EnvelopeKind::IdentityOccurrence => self.list_occurrence_rows(Some(subjects)).await,
             _ => {
                 self.list_transport_destinations_page(Some(&subjects), window)
                     .await
@@ -5999,48 +5914,26 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    /// IdentityOccurrence plane — `SelfOwn` (publish-own): the node's OWN KEX
-    /// occurrences. Scope filter is the `SelfOwn` publish set (keyed by the
-    /// occurrence key_id); seq is `asserted_at`.
-    async fn list_identity_occurrences(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
-        let subjects = self.self_own_subjects(EnvelopeKind::IdentityOccurrence);
-        self.list_identity_occurrences_page(Some(&subjects), window)
-            .await
-    }
-
-    /// The IdentityOccurrence plane's since-cursor page — the `SelfOwn` filter
-    /// as a parameter, mirroring [`Self::list_keys_page`] (#416 sweep).
-    async fn list_identity_occurrences_page(
-        &self,
-        subjects: Option<&HashSet<String>>,
-        window: SweepWindow<'_>,
-    ) -> Vec<EnvelopeRef> {
-        self.sweep_paged(
-            EnvelopeKind::IdentityOccurrence,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_identity_occurrences_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedIdentityOccurrence::resume_pair,
-            |row| {
-                subjects.map_or(true, |s| {
-                    s.contains(&row.occurrence.identity_occurrence.occurrence_key_id)
-                })
-            },
-            |row| Self::ms_seq(row.occurrence.identity_occurrence.asserted_at),
-            |row| &row.occurrence,
-        )
-        .await
-    }
-
-    /// CIRISEdge#416 (v18 sweep) — the RAW IdentityOccurrence holdings,
-    /// unfiltered. See [`Self::list_holdings`].
-    async fn list_identity_occurrence_holdings(&self) -> Vec<EnvelopeRef> {
-        self.list_identity_occurrences_page(None, SweepWindow::Full)
-            .await
+    /// persist v59.0.0 — the IdentityOccurrence plane: the
+    /// `identity:occurrence:v1` ROWS binding each occurrence key in the publish
+    /// set (`SelfOwn`, keyed by the occurrence key_id, or the host's per-kind
+    /// answer), under any identity the key is bound to. Hashed as the
+    /// attestation it is; seq is the row's `asserted_at`. `subjects`
+    /// overrides the publish set (the per-peer #682 narrowing passes it).
+    async fn list_occurrence_rows(&self, subjects: Option<HashSet<String>>) -> Vec<EnvelopeRef> {
+        let subjects =
+            subjects.unwrap_or_else(|| self.self_own_subjects(EnvelopeKind::IdentityOccurrence));
+        let mut rows: Vec<Attestation> = Vec::new();
+        for subject in subjects {
+            let _permit = self.sweep_gate.enter().await;
+            match key_plane_rows::occurrence_rows_binding(&*self.directory, &subject).await {
+                Ok(found) => rows.extend(found),
+                Err(e) => {
+                    Self::key_plane_read_failed(EnvelopeKind::IdentityOccurrence, &subject, &e);
+                }
+            }
+        }
+        self.key_plane_refs(rows, "list_occurrence_rows")
     }
 
     /// TransportDestination plane — `SelfOwn` (publish-own): the node's OWN
@@ -6093,133 +5986,6 @@ impl FederationDirectoryReplicationBridge {
     async fn list_transport_destination_holdings(&self) -> Vec<EnvelopeRef> {
         self.list_transport_destinations_page(None, SweepWindow::Full)
             .await
-    }
-
-    /// IdentityOccurrenceRevocation plane — tombstone → `Global` (anti-rollback,
-    /// never out-run by the stale occurrence it retracts). Scope filter is the
-    /// widest own∪cohort set (keyed by the occurrence key_id); seq is
-    /// `revoked_at`.
-    async fn list_identity_occurrence_revocations(
-        &self,
-        window: SweepWindow<'_>,
-    ) -> Vec<EnvelopeRef> {
-        let subjects: HashSet<String> = self
-            .subjects_for_projection(Projection::Global)
-            .into_iter()
-            .collect();
-        self.sweep_paged(
-            EnvelopeKind::IdentityOccurrenceRevocation,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_identity_occurrence_revocations_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedIdentityOccurrenceRevocation::resume_pair,
-            |row| {
-                subjects.contains(
-                    &row.revocation
-                        .identity_occurrence_revocation
-                        .occurrence_key_id,
-                )
-            },
-            |row| Self::ms_seq(row.revocation.identity_occurrence_revocation.revoked_at),
-            |row| &row.revocation,
-        )
-        .await
-    }
-
-    // ─── v6.2.0 (#179, CIRISPersist#249 Cut D) — generic cohort fan-out ──
-    //
-    // The 9 per-kind blocks below collapsed into a single
-    // [`Self::fan_out_for_member`] combinator + 9 call sites. The
-    // structural pattern is uniform across kinds (cohort iterate → per-key
-    // `list_*_for` → `persist_row_hash` decode → HashSet dedupe → wrap in
-    // `Signed*` → cache + emit `EnvelopeRef`); only the per-row
-    // projections (timestamp accessor, hash accessor) and the wrapper
-    // differ. Persist v9.3.0 keeps the `list_*_for_member` surface
-    // uniform across kinds, so one parameterized combinator replaces the
-    // hand-unrolled cases without changing wire-format behavior.
-    //
-    // `Row`-generic by inference: the closures fix the row type per call
-    // site without requiring dyn-compatibility on the directory trait.
-    // Async via boxed future on the per-key fetch (the directory trait is
-    // already `async_trait`-boxed).
-    async fn fan_out_for_member<Row, FetchFut, F, H>(
-        &self,
-        subjects: Vec<String>,
-        mut fetch: F,
-        timestamp: impl Fn(&Row) -> chrono::DateTime<chrono::Utc>,
-        hash: H,
-    ) -> Vec<EnvelopeRef>
-    where
-        F: FnMut(String) -> FetchFut,
-        FetchFut: std::future::Future<Output = Vec<Row>>,
-        H: Fn(&Row) -> &str,
-    {
-        let mut refs = Vec::new();
-        let mut seen: HashSet<[u8; 32]> = HashSet::new();
-        for key_id in subjects {
-            // #433 — keep the subject for the withhold attribution below; `fetch`
-            // consumes the owned `String`.
-            let subject = key_id.clone();
-            // CIRISEdge#531 — the width permit, taken PER MEMBER READ. This is
-            // the one plane with no `_since` cursor (persist exposes only
-            // `revocations_for`), so there is no page to bound and no watermark
-            // to keep; what bounds it instead is that the acquire is here, so
-            // the gate holds one member's rows rather than the whole cohort's,
-            // and a long cohort releases between members instead of parking the
-            // FIFO queue for its whole fan-out.
-            let _permit = self.sweep_gate.enter().await;
-            let rows = fetch(key_id).await;
-            for row in rows {
-                let Some(envelope_hash) = Self::decode_hash(hash(&row)) else {
-                    // CIRISEdge#433 — the row exists but its `persist_row_hash` is
-                    // not 32 hex bytes, so it is absent from the advertise set and
-                    // will never replicate. Was a bare `continue`; now countable.
-                    // Distinct from `RowNotSerializable`: the row serializes fine,
-                    // its persist-side hash is the wrong shape.
-                    self.withhold(
-                        crate::observability::WithholdReason::RowHashUndecodable,
-                        &subject,
-                        "fan_out_for_member: persist_row_hash not 32 hex bytes",
-                    );
-                    continue;
-                };
-                if !seen.insert(envelope_hash) {
-                    continue;
-                }
-                refs.push(EnvelopeRef {
-                    envelope_hash,
-                    seq: Self::ms_seq(timestamp(&row)),
-                });
-            }
-        }
-        refs
-    }
-
-    /// CIRISEdge#396 item 3 — resolve a `Revocation` tombstone's wire bytes
-    /// without a cache: scan the same `Global` subject set the advertise
-    /// ([`Self::list_revocations`]) walks, match on `persist_row_hash`, and
-    /// re-serialize the `SignedRevocation` exactly as [`Self::fan_out_for_member`]
-    /// did on the advertise. A revocation is an immutable tombstone, so the
-    /// re-read can never drift from what was advertised — the byte-exactness the
-    /// point-read gives the indexed planes, achieved here by re-derivation.
-    async fn fetch_revocation_bytes(&self, envelope_hash: &[u8; 32]) -> Option<Vec<u8>> {
-        for subject in self.subjects_for_projection(Projection::Global) {
-            let rows = self
-                .directory
-                .revocations_for(&subject)
-                .await
-                .unwrap_or_default();
-            for row in rows {
-                if Self::decode_hash(row.persist_row_hash.as_str()) == Some(*envelope_hash) {
-                    return serde_json::to_vec(&SignedRevocation { revocation: row }).ok();
-                }
-            }
-        }
-        None
     }
 
     /// v10 — resolve ONE attestation's replication policy dynamically from its
@@ -6287,9 +6053,14 @@ impl FederationDirectoryReplicationBridge {
         // recreated by the memory fix. `SweepWindow::Full` is the type-level
         // statement of that: pages for memory, complete in result.
         match kind {
-            EnvelopeKind::Attestation => self.list_attestation_holdings().await,
-            EnvelopeKind::Key => self.list_key_holdings().await,
-            EnvelopeKind::IdentityOccurrence => self.list_identity_occurrence_holdings().await,
+            // persist v59.0.0 — the three key-plane session planes carry
+            // attestation rows, so what this node holds for them is what it
+            // holds on the attestation plane. A superset is exact for
+            // `want = remote ∖ holdings`: a peer only offers these planes rows.
+            EnvelopeKind::Attestation
+            | EnvelopeKind::Key
+            | EnvelopeKind::IdentityOccurrence
+            | EnvelopeKind::Revocation => self.list_attestation_holdings().await,
             EnvelopeKind::TransportDestination => self.list_transport_destination_holdings().await,
             _ => {
                 self.list_envelope_refs_unbounded(kind, SweepWindow::Full)
@@ -8583,22 +8354,24 @@ impl FederationDirectoryReplicationBridge {
         (served, last)
     }
 
-    async fn list_revocations(&self) -> Vec<EnvelopeRef> {
-        // #311 tombstone fix — key revocations project `Global` (own ∪ cohort),
-        // not cohort-only RELAY, so a revocation is never out-run by the stale
-        // record it retracts even after the subject exits the cohort.
-        self.fan_out_for_member(
-            self.subjects_for_projection(Projection::Global),
-            |key_id| async move {
-                self.directory
-                    .revocations_for(&key_id)
-                    .await
-                    .unwrap_or_default()
-            },
-            |row| row.revoked_at,
-            |row| row.persist_row_hash.as_str(),
-        )
-        .await
+    /// persist v59.0.0 — the Revocation plane: the `key:revocation:v1` ROW of
+    /// every revocation this node holds of a key in the widest own ∪ cohort
+    /// set (`Projection::Global`, the #311 tombstone rule: a revocation is
+    /// never out-run by the stale record it retracts, even after its subject
+    /// leaves the cohort). Read per subject, as persist's own
+    /// `wire_refs_for_subject` reads it (`revocations_for`, then the row
+    /// persist minted); a revocation held without its row is not offered.
+    async fn list_revocation_rows(&self) -> Vec<EnvelopeRef> {
+        let mut rows: Vec<Attestation> = Vec::new();
+        for subject in self.subjects_for_projection(Projection::Global) {
+            // CIRISEdge#531 — the width permit, per member read.
+            let _permit = self.sweep_gate.enter().await;
+            match key_plane_rows::revocation_rows_of(&*self.directory, &subject).await {
+                Ok(found) => rows.extend(found),
+                Err(e) => Self::key_plane_read_failed(EnvelopeKind::Revocation, &subject, &e),
+            }
+        }
+        self.key_plane_refs(rows, "list_revocation_rows")
     }
 
     // ── CIRISEdge#504 — the 5 E4 keyless-declaration planes advertise via
@@ -9127,14 +8900,12 @@ impl FederationDirectoryReplicationBridge {
 
     /// CIRISEdge#682 — the occurrence key an identity-plane wire row is about
     /// (the key its reach is decided for). `None` for bytes that do not decode
-    /// as the plane's signed container.
+    /// as the plane's container (persist v59.0.0: the occurrence plane carries
+    /// the `identity:occurrence:v1` row).
     fn identity_row_subject(kind: EnvelopeKind, bytes: &[u8]) -> Option<String> {
         match kind {
-            EnvelopeKind::IdentityOccurrence => {
-                serde_json::from_slice::<SignedIdentityOccurrence>(bytes)
-                    .ok()
-                    .map(|s| s.identity_occurrence.occurrence_key_id)
-            }
+            EnvelopeKind::IdentityOccurrence => key_plane_rows::row_of_bytes(bytes)
+                .and_then(|row| key_plane_rows::occurrence_key_of(&row)),
             EnvelopeKind::TransportDestination => serde_json::from_slice::<
                 ciris_persist::federation::self_at_login::SignedTransportDestination,
             >(bytes)
@@ -9848,50 +9619,6 @@ impl FederationDirectoryReplicationBridge {
 // ─── apply_envelope_bytes — per-kind dispatch ───────────────────────
 
 impl FederationDirectoryReplicationBridge {
-    async fn apply_key(&self, bytes: &[u8]) -> ApplyOutcome {
-        // #277 — route the replicated Key plane through persist's
-        // upgrade-aware `apply_replicated_key_record` (CIRISPersist#375,
-        // dyn-reachable on `FederationDirectory` since v13.0.1) instead of
-        // the `ON CONFLICT DO NOTHING` `put_public_key`. An anchor-scrubbed
-        // record now *upgrades* a stale self-signed row over anti-entropy
-        // (owner_of-gated, monotonic, fail-closed) rather than being
-        // silently dropped — so the KERI publish-own Key plane rides
-        // replication end-to-end (retires CIRISServer#150's adopt-scrubbed
-        // endpoint once the owner-cohort Key plane lands).
-        //
-        // CIRISEdge#425 — the typed `ReplicatedKeyOutcome` maps cleanly to
-        // `ApplyOutcome`: `Inserted`/`Upgraded`/`Superseded` changed local state
-        // (progress); `Unchanged` is a byte-identical duplicate (routine, quiet).
-        //
-        // persist v24.2.0 (CIRISPersist#565) — `Refused { reason }` now NAMES the
-        // branch that fired (a closed, append-only 9-token enum), so the message
-        // carries the verdict's evidence instead of the whole five-cause
-        // disjunction we used to print. We key on the enum constant, never the
-        // message string (the two-lists-that-disagree rule). A persist `Err` /
-        // deserialize failure carry their reason. The choke point (`on_deliver`)
-        // logs every non-`Admitted`; the receive-plane mirror of the #433 withhold
-        // ledger counts every refusal by its token.
-        match serde_json::from_slice::<SignedKeyRecord>(bytes) {
-            Ok(record) => {
-                let content_hash =
-                    content_hash_of(&record).map_or_else(String::new, |(h, _)| hex::encode(h));
-                let scrubber = record.record.scrub_key_id.clone();
-                let (outcome, refusal_token) = key_outcome_to_apply(
-                    self.directory.apply_replicated_key_record(record).await,
-                    &content_hash,
-                    &scrubber,
-                );
-                if let Some(token) = refusal_token {
-                    if let Some(m) = &self.metrics {
-                        m.inc_key_apply_refusal(token);
-                    }
-                }
-                outcome
-            }
-            Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Key", bytes, &e)),
-        }
-    }
-
     /// persist v41.0.0 (CIRISPersist#804) — `source_peer` selects the write
     /// door. See the `put_attestation*` call below for why it is safe to pass.
     /// CIRISPersist#848 / CIRISEdge#601 — the key-grant door.
@@ -10223,20 +9950,6 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
-    async fn apply_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(self, "Revocation", bytes, SignedRevocation, put_revocation)
-    }
-
-    async fn apply_identity_occurrence(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(
-            self,
-            "IdentityOccurrence",
-            bytes,
-            SignedIdentityOccurrence,
-            put_identity_occurrence
-        )
-    }
-
     // ── CIRISEdge#394 (E4 lockstep verdict) — edge is PASS-THROUGH on the
     // five authority-signed declaration planes ──────────────────────────
     //
@@ -10358,16 +10071,6 @@ impl FederationDirectoryReplicationBridge {
             ),
             Err(e) => self.refuse("Community", &content_hash, &e),
         }
-    }
-
-    async fn apply_identity_occurrence_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
-        apply_signed_plane!(
-            self,
-            "IdentityOccurrenceRevocation",
-            bytes,
-            SignedIdentityOccurrenceRevocation,
-            put_identity_occurrence_revocation
-        )
     }
 
     async fn apply_family_membership_revocation(&self, bytes: &[u8]) -> ApplyOutcome {
@@ -10823,24 +10526,6 @@ fn content_hash_of<T: serde::Serialize>(value: &T) -> Option<([u8; 32], Vec<u8>)
     Some((hash, bytes))
 }
 
-/// CIRISEdge#474-adjacent (persist v32/#682) — the Key plane's advertise row.
-///
-/// persist v32's `list_signed_key_records_since` returns
-/// `ServedKeyRecord { record, admitted_at }`; edge advertises the content hash of
-/// the SIGNED record only (the v31 `SignedKeyRecord { record }` shape). This
-/// carries `admitted_at` for the resume seq but `#[serde(skip)]`s it, so
-/// [`content_hash_of`] of this row is byte-identical to
-/// `content_hash_of(&SignedKeyRecord { record })` — the exact hash persist's
-/// `signed_wire_index` keys on. The identity is pinned by a test
-/// (`key_advertise_row_hashes_identically_to_signed_key_record`); if serde field
-/// order or naming ever drifted, that test reds before the wire does.
-#[derive(serde::Serialize)]
-struct KeyAdvertiseRow {
-    record: KeyRecord,
-    #[serde(skip)]
-    admitted_at: chrono::DateTime<chrono::Utc>,
-}
-
 /// CIRISEdge#531 DEPTH — the test-side spelling of the production advertise
 /// call. `list_envelope_refs_for_peer` picks the window from whether a peer is
 /// bound; tests that reach the Attestation builder directly must make the SAME
@@ -10908,6 +10593,8 @@ pub(crate) mod tests {
     };
     use ciris_persist::store::MemoryBackend;
     use sha2::{Digest as _, Sha256};
+
+    use crate::replication::summary::AwaitedSigner;
 
     // ── Test fixture helpers ────────────────────────────────────────
 
@@ -11163,41 +10850,28 @@ pub(crate) mod tests {
         .expect("the minted record exists")
     }
 
-    /// persist v32/#682 belt: the Key-plane advertise row must hash byte-identically
-    /// to the v31 `SignedKeyRecord { record }` shape (persist's `signed_wire_index`
-    /// basis), and the node-local `admitted_at` must NOT enter that hash. If serde
-    /// field order/naming ever drifted, this reds BEFORE the wire does — the silent
-    /// LIST-vs-FETCH break `cargo check` cannot see.
-    #[test]
-    fn key_advertise_row_hashes_identically_to_signed_key_record() {
-        let record = fixture_key_record("agent-alice", identity_type::AGENT);
-        // The exact wire hash edge must reproduce.
-        let (want, _) = content_hash_of(&SignedKeyRecord {
-            record: record.clone(),
-        })
-        .expect("signed key hashes");
-        // Two DIFFERENT admission instants → the advertise hash is unchanged.
-        let t1 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-        let t2 = chrono::DateTime::<chrono::Utc>::from_timestamp(1_800_000_123, 456).unwrap();
-        let (h1, _) = content_hash_of(&KeyAdvertiseRow {
-            record: record.clone(),
-            admitted_at: t1,
-        })
-        .expect("advertise row hashes");
-        let (h2, _) = content_hash_of(&KeyAdvertiseRow {
-            record,
-            admitted_at: t2,
-        })
-        .expect("advertise row hashes");
-        assert_eq!(
-            h1, want,
-            "KeyAdvertiseRow must hash as SignedKeyRecord{{record}} — the content-hash \
-             fetch keys on it; folding admitted_at in makes every ref unfetchable"
-        );
-        assert_eq!(
-            h1, h2,
-            "the wire hash is INVARIANT to admitted_at (node-local, never serialized)"
-        );
+    /// persist v59.0.0 — a key that TRAVELS: a minted hybrid self-scrubbed
+    /// record seeded through the local door, which mints its `key:record:v1`
+    /// row (a fixture record verifies under neither of persist's rules, so it
+    /// is held without a row and the Key plane never offers it). Returns the
+    /// key id persist derived.
+    async fn seed_row_key(backend: &MemoryBackend, alias: &str, seed: u8) -> String {
+        let record = minted_key_record(alias, identity_type::AGENT, seed).await;
+        let key_id = record.key_id.clone();
+        backend
+            .put_public_key(SignedKeyRecord { record })
+            .await
+            .expect("seed key");
+        key_id
+    }
+
+    /// persist v59.0.0 — a key as it travels: its `key:record:v1` ROW (the
+    /// producer side mints it with persist's own pure fn). `record` must be
+    /// self-scrubbed and verify (a [`minted_key_record`]).
+    pub(crate) fn key_row_bytes(record: &KeyRecord) -> Vec<u8> {
+        let row = ciris_persist::federation::key_plane::plan_key_record_row(record, &None)
+            .expect("a self-scrubbed hybrid record has its row");
+        serde_json::to_vec(&row).expect("serialize key row")
     }
 
     // ── Construction smoke ───────────────────────────────────────────
@@ -11263,17 +10937,17 @@ pub(crate) mod tests {
             .await
             .expect("bytes cached during list");
 
-        // The bytes round-trip through serde back to SignedKeyRecord.
-        let decoded: SignedKeyRecord =
-            serde_json::from_slice(&bytes).expect("canonical bytes decode");
-        assert_eq!(decoded.record.key_id, key_id);
+        // persist v59.0.0 — the bytes are the key's `key:record:v1` ROW, which
+        // carries the record.
+        let decoded: Attestation = serde_json::from_slice(&bytes).expect("the row decodes");
+        let carried = ciris_persist::federation::key_plane::key_record_of_row(&decoded)
+            .expect("the row carries the record");
+        assert_eq!(carried.key_id, key_id);
 
-        // apply_envelope_bytes routes the Key plane through
-        // apply_replicated_key_record (#277). Since persist v44.7.0 (#864)
-        // the memory backend runs the same key plan sqlite does, so a
-        // byte-identical re-apply of a row this node already holds is
-        // `Unchanged` ⇒ `Duplicate` — the honest verdict (before v44.7.0 the
-        // plan-less default reported it as a first-seen Inserted).
+        // apply_envelope_bytes routes the Key plane's row through the
+        // attestation door (persist's key-plane door). A byte-identical
+        // re-apply of a row this node already holds is `Unchanged` ⇒
+        // `Duplicate`.
         let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::Key, &bytes, None)
             .await;
@@ -11290,18 +10964,23 @@ pub(crate) mod tests {
     /// mesh-seed blocker (a verifier can't root a key it never received).
     #[tokio::test]
     async fn self_provider_publishes_own_and_anchored_not_cohort() {
-        let cohort_member = "peer-in-cohort";
-        let own_key = "this-node-own";
-        let anchored = "third-party-anchored";
+        // persist v59.0.0 — keys that travel (minted, with their rows).
+        let seed_backend = Arc::new(MemoryBackend::new());
+        let cohort_member = seed_row_key(&seed_backend, "peer-in-cohort", 0x21).await;
+        let own_key = seed_row_key(&seed_backend, "this-node-own", 0x22).await;
+        let anchored = seed_row_key(&seed_backend, "third-party-anchored", 0x23).await;
 
         // Cohort contains ONLY the peer — never own / anchored (a node is
         // not in its own consent cohort).
-        let (backend, bridge) = make_bridge(&[cohort_member.to_string()]);
-        for k in [cohort_member, own_key, anchored] {
+        let (backend, bridge) = make_bridge(std::slice::from_ref(&cohort_member));
+        for k in [&cohort_member, &own_key, &anchored] {
+            let record = seed_backend
+                .lookup_public_key(k)
+                .await
+                .expect("lookup")
+                .expect("minted");
             backend
-                .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(k, identity_type::AGENT),
-                })
+                .put_public_key(SignedKeyRecord { record })
                 .await
                 .expect("seed key");
         }
@@ -11316,7 +10995,7 @@ pub(crate) mod tests {
 
         // Install the SELF publish set {own, anchored}: publish-own. #311 — one
         // `self_provider` drives every SelfOwn kind (here: Key) via the engine.
-        let publish_set = vec![own_key.to_string(), anchored.to_string()];
+        let publish_set = vec![own_key.clone(), anchored.clone()];
         let selector: CohortProvider = Arc::new(move || publish_set.clone());
         let bridge = bridge.with_self_provider(Some(selector));
         let refs = bridge.list_envelope_refs(EnvelopeKind::Key).await;
@@ -11583,19 +11262,24 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn held_but_unpublished_key_leaves_want_on_the_second_round() {
         use crate::replication::summary::diff_refs;
-        let this_node = "this-node";
-        let foreign = "foreign-subject";
-        let (backend, bridge) = make_bridge(&[foreign.to_string()]);
-        for k in [this_node, foreign] {
+        // persist v59.0.0 — keys that travel (minted, with their rows).
+        let seed = Arc::new(MemoryBackend::new());
+        let this_node = seed_row_key(&seed, "this-node", 0x31).await;
+        let foreign = seed_row_key(&seed, "foreign-subject", 0x32).await;
+        let (backend, bridge) = make_bridge(std::slice::from_ref(&foreign));
+        for k in [&this_node, &foreign] {
+            let record = seed
+                .lookup_public_key(k)
+                .await
+                .expect("lookup")
+                .expect("minted");
             backend
-                .put_public_key(SignedKeyRecord {
-                    record: fixture_key_record(k, identity_type::AGENT),
-                })
+                .put_public_key(SignedKeyRecord { record })
                 .await
                 .expect("seed key");
         }
         // This node publishes only its OWN key.
-        let publish_set = vec![this_node.to_string()];
+        let publish_set = vec![this_node.clone()];
         let selector: CohortProvider = Arc::new(move || publish_set.clone());
         let bridge = bridge.with_self_provider(Some(selector));
 
@@ -11604,7 +11288,7 @@ pub(crate) mod tests {
         // replicated it here.
         let remote_dir: Arc<dyn FederationDirectory> = backend.clone();
         let remote_cohort: CohortProvider = Arc::new(Vec::new);
-        let foreign_set = vec![foreign.to_string()];
+        let foreign_set = vec![foreign.clone()];
         let remote_selector: CohortProvider = Arc::new(move || foreign_set.clone());
         let remote = FederationDirectoryReplicationBridge::new(remote_dir, remote_cohort)
             .with_self_provider(Some(remote_selector));
@@ -11836,10 +11520,9 @@ pub(crate) mod tests {
     /// once).
     #[tokio::test]
     async fn key_dedupes_across_cohort() {
-        let key_id = "agent-bob";
-        let (backend, bridge) =
-            make_bridge(&[key_id.to_string(), key_id.to_string(), key_id.to_string()]);
-        let record = fixture_key_record(key_id, identity_type::AGENT);
+        let record = minted_key_record("agent-bob", identity_type::AGENT, 0x41).await;
+        let key_id = record.key_id.clone();
+        let (backend, bridge) = make_bridge(&[key_id.clone(), key_id.clone(), key_id]);
         backend
             .put_public_key(SignedKeyRecord { record })
             .await
@@ -11850,126 +11533,6 @@ pub(crate) mod tests {
     }
 
     // ── apply_envelope_bytes refuses garbage ────────────────────────
-
-    /// persist v24.2.0 / CIRISPersist#565 — the pure outcome mapping, exhaustive
-    /// over `KeyRefusalReason::ALL`: both duplicate halves (`Unchanged` AND
-    /// `already_anchored_identical`) map to `Duplicate` with NO ledger token
-    /// (mapping only the new variant would leave the common baked-seed re-offer
-    /// path misreported); every other reason maps to `Refused` whose message
-    /// carries the stable token, which is also returned for the receive-plane
-    /// mirror to count.
-    #[test]
-    fn key_outcome_mapping_is_exhaustive_and_names_the_branch() {
-        // The progress outcomes admit, no token.
-        for o in [
-            ReplicatedKeyOutcome::Inserted,
-            ReplicatedKeyOutcome::Upgraded,
-            ReplicatedKeyOutcome::Rebound,
-            ReplicatedKeyOutcome::Superseded,
-            ReplicatedKeyOutcome::ScrubsRehydrated,
-            ReplicatedKeyOutcome::InvalidReplaced,
-        ] {
-            let (a, t) = key_outcome_to_apply(Ok(o), "h", "s");
-            assert!(matches!(a, ApplyOutcome::Admitted), "{a:?}");
-            assert!(t.is_none());
-        }
-        // Both duplicate halves: Duplicate, never counted as a refusal.
-        let (a, t) = key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Unchanged), "h", "s");
-        assert!(matches!(a, ApplyOutcome::Duplicate), "{a:?}");
-        assert!(t.is_none());
-        let (a, t) = key_outcome_to_apply(
-            Ok(ReplicatedKeyOutcome::Refused {
-                reason: KeyRefusalReason::AlreadyAnchoredIdentical,
-            }),
-            "h",
-            "s",
-        );
-        assert!(
-            matches!(a, ApplyOutcome::Duplicate),
-            "already_anchored_identical is the receiver ALREADY HOLDING what was \
-             offered (a re-encoding of an anchored record) — Duplicate, not a \
-             security-shaped refusal; got {a:?}"
-        );
-        assert!(t.is_none());
-        // Every OTHER reason: Refused carrying the stable token, token returned.
-        for &reason in KeyRefusalReason::ALL {
-            if matches!(reason, KeyRefusalReason::AlreadyAnchoredIdentical) {
-                continue;
-            }
-            let (a, t) =
-                key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Refused { reason }), "h", "s");
-            let ApplyOutcome::Refused { reason: msg, .. } = &a else {
-                panic!("{} must map to Refused, got {a:?}", reason.as_str());
-            };
-            assert!(
-                msg.contains(reason.as_str()),
-                "the refusal message must carry the branch token {}: {msg}",
-                reason.as_str()
-            );
-            assert_eq!(t, Some(reason.as_str()), "the mirror counts the token");
-        }
-    }
-
-    /// CIRISEdge#544 — the classification the issue turns on, asserted through
-    /// the EXACT value persist hands the field: `ReplicatedKeyOutcome::Refused
-    /// { reason }`, one per closed-set variant, not a hand-written message.
-    ///
-    /// `conflicting_version` is the measured row (55 re-offers in 30 minutes of
-    /// byte-identical bytes); it and the two other first-seen/monotonic verdicts
-    /// are TERMINAL. Every reason whose token fuses a recoverable arm with an
-    /// unrecoverable one stays TRANSIENT — mislabelling a permanent refusal
-    /// transient costs a decaying trickle, mislabelling a recoverable one
-    /// terminal withholds state.
-    #[test]
-    fn conflicting_version_is_terminal_and_the_ambiguous_key_reasons_stay_transient() {
-        let terminal = [
-            KeyRefusalReason::PubkeySwap,
-            KeyRefusalReason::Downgrade,
-            KeyRefusalReason::ConflictingVersion,
-            // v44.7.0 — a rebind-shaped offer whose claim moved: the same
-            // fixed-bytes-vs-stored-claim argument as `ConflictingVersion`.
-            KeyRefusalReason::RebindChangesRecord,
-            // v50.0.0 (CC 3.4.7.3 Clause A) — `node` is fixed at mint; a fused
-            // or node-changing offer is refused in every successor state.
-            KeyRefusalReason::NodeIdentityFused,
-            KeyRefusalReason::NodeIdentityChanged,
-            // v54.1.0 (CIRISPersist#1042) — the unregistered-scrubber arm left
-            // this token for `attester_key_unknown`; what remains is a
-            // signature refused against a scrubber this node holds.
-            KeyRefusalReason::UnverifiableSignature,
-        ];
-        for &reason in KeyRefusalReason::ALL {
-            // Drive the mapping the field drives, not the private fn alone.
-            let (outcome, _) =
-                key_outcome_to_apply(Ok(ReplicatedKeyOutcome::Refused { reason }), "h", "s");
-            let want = if terminal.contains(&reason) {
-                RetryDisposition::Terminal
-            } else {
-                RetryDisposition::Transient
-            };
-            // `already_anchored_identical` never reaches a refusal at all — it is
-            // the receiver already holding what was offered.
-            if matches!(reason, KeyRefusalReason::AlreadyAnchoredIdentical) {
-                assert_eq!(outcome.retry_disposition(), None, "{}", reason.as_str());
-                continue;
-            }
-            assert_eq!(
-                outcome.retry_disposition(),
-                Some(want),
-                "{} must be {} — see key_refusal_retry for the per-variant reasoning",
-                reason.as_str(),
-                want.as_str()
-            );
-            let ApplyOutcome::Refused { reason: msg, .. } = &outcome else {
-                panic!("{} must map to Refused, got {outcome:?}", reason.as_str());
-            };
-            assert!(
-                msg.contains(want.as_str()),
-                "an operator reading ONE line must be able to tell wait-for-state \
-                 from supersede-it: {msg}"
-            );
-        }
-    }
 
     /// persist v54.1.0 — the two typed verdicts (`LicensureDelegatorNotAuthority`
     /// under the four reasons no later row repairs, `AccordProposalNonceReused`)
@@ -12388,7 +11951,7 @@ pub(crate) mod tests {
         );
         assert!(bridge.retry_suppressed(EnvelopeKind::Attestation, &parked));
 
-        let key_bytes = serde_json::to_vec(&SignedKeyRecord { record }).expect("serialize key");
+        let key_bytes = key_row_bytes(&record);
         let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::Key, &key_bytes, Some("peer-x"))
             .await;
@@ -12416,7 +11979,7 @@ pub(crate) mod tests {
     async fn a_suppressed_row_is_still_applied_when_a_peer_pushes_it_anyway() {
         let record = minted_key_record("k1", identity_type::NODE, 0x21).await;
         let (_backend, bridge) = make_bridge(std::slice::from_ref(&record.key_id));
-        let bytes = serde_json::to_vec(&SignedKeyRecord { record }).expect("serialize offer");
+        let bytes = key_row_bytes(&record);
         let hash: [u8; 32] = Sha256::digest(&bytes).into();
         // Pre-load the memory as if a previous round had refused these bytes.
         bridge.refusal_backoff.record_at(
@@ -12633,63 +12196,187 @@ pub(crate) mod tests {
         );
     }
 
-    /// persist v24.2.0 / #565 — the wire drive: a pubkey swap offered through
-    /// the real apply choke books on BOTH receive-plane mirror axes (kind +
-    /// stable token) and surfaces the branch in the refusal message.
+    /// persist v59.0.0 (sealed-transport floor) — **a peer's FRAMED key-plane
+    /// object is refused TERMINAL through the real apply choke, booked once
+    /// under `federation_envelope_kind_retired` labelled per kind, and never
+    /// applied.** One per retired kind: a framed key record (here the hijack
+    /// shape, k1 under another key's pubkeys — the bytes would have been a
+    /// `pubkey_swap` before v59), a framed key revocation, a framed identity
+    /// occurrence and a framed occurrence revocation. "Never applied": k1's
+    /// held pubkeys are unchanged and no revocation or occurrence lands.
     #[tokio::test]
-    async fn a_pubkey_swap_books_on_both_receive_mirror_axes() {
+    #[allow(clippy::too_many_lines)] // four framed kinds, each booked and never applied
+    async fn a_framed_key_plane_object_is_refused_terminal_under_the_retired_token_v59() {
         let (backend, bridge, metrics) = make_metered_bridge(&[]);
-        // The node already holds k1 at its canonical pubkeys...
+        let held = fixture_key_record("k1", identity_type::NODE);
         backend
             .put_public_key(SignedKeyRecord {
-                record: fixture_key_record("k1", identity_type::NODE),
+                record: held.clone(),
             })
             .await
             .expect("seed k1");
-        // ...and a peer offers k1 under DIFFERENT pubkeys (the hijack shape).
         let mut swapped = fixture_key_record("k1", identity_type::NODE);
         let (other_ed, other_mldsa) = hybrid_pubkeys("attacker-keys");
         swapped.pubkey_ed25519_base64 = other_ed;
         swapped.pubkey_ml_dsa_65_base64 = other_mldsa;
-        let bytes =
-            serde_json::to_vec(&SignedKeyRecord { record: swapped }).expect("serialize offer");
-
-        let outcome = bridge
-            .apply_envelope_bytes(EnvelopeKind::Key, &bytes, Some("peer-x"))
-            .await;
-        let ApplyOutcome::Refused { reason: msg, .. } = &outcome else {
-            panic!("a pubkey swap must be Refused, got {outcome:?}");
-        };
-        // WHICH branch classifies is persist's unit (certified upstream; on the
-        // MemoryBackend this shape currently books `store_conflict` — its
-        // plan-free write site — where the planned sqlite/postgres paths name
-        // `pubkey_swap`). EDGE's unit is coherence: the message carries exactly
-        // one stable token from the closed set, and BOTH mirror axes book it.
+        let framed = [
+            (
+                EnvelopeKind::Key,
+                serde_json::to_vec(&SignedKeyRecord { record: swapped }).expect("key"),
+            ),
+            (
+                EnvelopeKind::Revocation,
+                serde_json::to_vec(&serde_json::json!({
+                    "revocation": {"revocation_id": "rev-v59", "revoked_key_id": "k1",
+                                   "revoking_key_id": "k1"}
+                }))
+                .expect("revocation"),
+            ),
+            (
+                EnvelopeKind::IdentityOccurrence,
+                serde_json::to_vec(&serde_json::json!({
+                    "identity_occurrence": {"identity_key_id": "k1",
+                                            "occurrence_key_id": "k1-device"},
+                    "attesting_key_id": "k1"
+                }))
+                .expect("occurrence"),
+            ),
+            (
+                EnvelopeKind::IdentityOccurrenceRevocation,
+                serde_json::to_vec(&serde_json::json!({
+                    "identity_occurrence_revocation": {"identity_key_id": "k1",
+                                                       "occurrence_key_id": "k1-device"}
+                }))
+                .expect("occurrence revocation"),
+            ),
+        ];
+        for (kind, bytes) in &framed {
+            let outcome = bridge
+                .apply_envelope_bytes(*kind, bytes, Some("peer-x"))
+                .await;
+            let ApplyOutcome::Refused {
+                reason: msg, retry, ..
+            } = &outcome
+            else {
+                panic!("{kind:?}: a framed object must be Refused, got {outcome:?}");
+            };
+            assert_eq!(
+                *retry,
+                RetryDisposition::Terminal,
+                "{kind:?}: persist rules the retired refusal terminal"
+            );
+            assert!(
+                msg.contains("federation_envelope_kind_retired"),
+                "{kind:?}: the message carries persist's token: {msg}"
+            );
+        }
         let snap = metrics.snapshot();
-        let booked: Vec<&str> = snap
-            .key_apply_refusals_by_reason
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(booked.len(), 1, "exactly one token booked: {booked:?}");
-        let token = booked[0];
+        for (kind, _) in &framed {
+            assert_eq!(
+                snap.envelope_kind_retired_refusals
+                    .get(kind.as_wire_str())
+                    .copied(),
+                Some(1),
+                "{kind:?}: booked once under its kind label: {:?}",
+                snap.envelope_kind_retired_refusals
+            );
+            assert_eq!(
+                snap.apply_refusals_by_kind.get(kind).copied(),
+                Some(1),
+                "{kind:?}: the kind axis books at the #425 choke"
+            );
+        }
         assert!(
-            KeyRefusalReason::ALL.iter().any(|r| r.as_str() == token),
-            "the booked token is from the closed contract set: {token}"
+            snap.key_apply_refusals_by_reason.is_empty(),
+            "no framed key reached a key door: {:?}",
+            snap.key_apply_refusals_by_reason
         );
-        assert!(
-            msg.contains(token),
-            "the message names the SAME branch the ledger booked ({token}): {msg}"
-        );
+        // Never applied.
+        let stored = backend
+            .lookup_public_key("k1")
+            .await
+            .expect("lookup")
+            .expect("k1 held");
+        assert_eq!(stored.pubkey_ed25519_base64, held.pubkey_ed25519_base64);
+        assert!(backend
+            .revocations_for("k1")
+            .await
+            .expect("revocations")
+            .is_empty());
+        assert!(backend
+            .list_identity_occurrences_by_occurrence_key("k1-device")
+            .await
+            .expect("occurrences")
+            .is_empty());
+        // And the round's want stops asking for those bytes (terminal window).
+        for (kind, bytes) in &framed {
+            let hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(bytes).into();
+            assert!(
+                bridge.retry_suppressed(*kind, &hash),
+                "{kind:?}: a terminal refusal suppresses the re-ask"
+            );
+        }
+    }
+
+    /// persist v59.0.0 — the new typed refusals reach the apply-door choke
+    /// (`refuse`) with the disposition persist's docs give them:
+    /// `federation_envelope_kind_retired` TERMINAL and booked on the retired
+    /// ledger under its kind label; `asserted_at_stale` (persist's const leads
+    /// the `InvalidArgument`) TERMINAL; a `SelfRosterNotLanded` TERMINAL for a
+    /// two-path refusal token and TRANSIENT while `pending`.
+    #[tokio::test]
+    async fn the_v59_refusals_map_to_their_dispositions_v59() {
+        use ciris_persist::federation::replication_policy::EnvelopeKind as PersistKind;
+        use ciris_persist::federation::self_roster::ASSERTED_AT_STALE;
+        use ciris_persist::federation::Error as E;
+        let (_backend, bridge, metrics) = make_metered_bridge(&[]);
+        let roster = |decision: &'static str| E::SelfRosterNotLanded {
+            identity_key_id: "fed-u".to_owned(),
+            target_key_id: "dev-2".to_owned(),
+            kind: "add",
+            proposal_id: "proposal-1".to_owned(),
+            decision,
+            earliest_lone_at: None,
+            needs: 1,
+        };
+        for (err, want) in [
+            (
+                E::EnvelopeKindRetired {
+                    kind: PersistKind::IdentityOccurrence,
+                },
+                RetryDisposition::Terminal,
+            ),
+            (
+                E::InvalidArgument(format!(
+                    "{ASSERTED_AT_STALE}: k signs as f's roster key more than W ago"
+                )),
+                RetryDisposition::Terminal,
+            ),
+            (roster("proposer_not_on_roster"), RetryDisposition::Terminal),
+            (roster("pending"), RetryDisposition::Transient),
+            // An unrelated InvalidArgument keeps the conservative transient.
+            (
+                E::InvalidArgument("something else".to_owned()),
+                RetryDisposition::Transient,
+            ),
+        ] {
+            let outcome = bridge.refuse("Attestation", "h", &err);
+            assert_eq!(
+                outcome.retry_disposition(),
+                Some(want),
+                "{} must be {}",
+                err,
+                want.as_str()
+            );
+        }
         assert_eq!(
-            snap.apply_refusals_by_kind.get(&EnvelopeKind::Key).copied(),
+            metrics
+                .snapshot()
+                .envelope_kind_retired_refusals
+                .get("identity_occurrence")
+                .copied(),
             Some(1),
-            "the kind axis books at the #425 choke"
-        );
-        assert_eq!(
-            snap.key_apply_refusals_by_reason.get(token).copied(),
-            Some(1),
-            "the token axis books the typed branch once"
+            "a retired refusal from a persist door books the retired ledger"
         );
     }
 
@@ -12824,8 +12511,11 @@ pub(crate) mod tests {
         rev.original_content_hash = hash;
         rev.scrub_signature_classical = ed_sig;
         rev.scrub_signature_pqc = pqc_sig;
-        let bytes =
-            serde_json::to_vec(&SignedRevocation { revocation: rev }).expect("serialize rev");
+        // persist v59.0.0 — the revocation travels as its `key:revocation:v1`
+        // row (the producer side mints it with persist's own pure fn).
+        let row = ciris_persist::federation::key_plane::revocation_row(&rev)
+            .expect("the revocation's row");
+        let bytes = serde_json::to_vec(&row).expect("serialize rev row");
         let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::Revocation, &bytes, None)
             .await;
@@ -12868,10 +12558,7 @@ pub(crate) mod tests {
         );
         // (b) Apply a FRESH (never-seeded) Key row → Admitted → applied_total.
         let rec = minted_key_record("fresh-457", identity_type::NODE, 0x31).await;
-        let bytes = serde_json::to_vec(&SignedKeyRecord {
-            record: rec.clone(),
-        })
-        .expect("serialize key");
+        let bytes = key_row_bytes(&rec);
         let outcome = bridge
             .apply_envelope_bytes(EnvelopeKind::Key, &bytes, Some("peer-457"))
             .await;
@@ -14422,9 +14109,20 @@ pub(crate) mod tests {
     async fn advertise_hash_equals_sha256_of_fetched_bytes() {
         let key_id = "agent-roundtrip";
         let attester = "agent-attester";
-        let (backend, bridge) = make_bridge(&[key_id.to_string(), attester.to_string()]);
+        // persist v59.0.0 — the Key plane offers a key's `key:record:v1` row,
+        // which only a verifiable (minted) record has.
+        let traveller = minted_key_record("agent-roundtrip-row", identity_type::AGENT, 0x51).await;
+        let (backend, bridge) = make_bridge(&[
+            key_id.to_string(),
+            attester.to_string(),
+            traveller.key_id.clone(),
+        ]);
+        backend
+            .put_public_key(SignedKeyRecord { record: traveller })
+            .await
+            .expect("seed the travelling key");
 
-        // A signed KeyRecord via the signed put path (indexes under "Key").
+        // A signed KeyRecord via the signed put path.
         backend
             .put_public_key(SignedKeyRecord {
                 record: fixture_key_record(key_id, identity_type::AGENT),
@@ -15674,8 +15372,12 @@ pub(crate) mod tests {
         let local = "local-A";
         let third_party = "subject-S";
         let stranger = "stranger-X";
-        let (_backend, bridge) =
+        let (backend, bridge) =
             test_fixtures::make_bridge_with_keys(&[local, third_party, stranger]).await;
+        // persist v59.0.0 — the public plane these lookups read is the route
+        // plane: a fixture key travels only as a row it does not have, so the
+        // Key plane would answer empty for the wrong reason.
+        seed_routes(&backend, &[local, third_party, stranger]).await;
         let bridge = bridge
             .with_local_key_id(Some(local.to_string()))
             // Canonical: the tier that HOLDS BODIES and therefore answers
@@ -15688,12 +15390,20 @@ pub(crate) mod tests {
         let budget = FederationDirectoryReplicationBridge::IDENTIFIER_LOOKUPS_PER_WINDOW;
         for _ in 0..budget {
             let _ = bridge
-                .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
+                .subject_holdings(
+                    EnvelopeKind::TransportDestination,
+                    third_party,
+                    Some(stranger),
+                )
                 .await;
         }
         assert!(
             bridge
-                .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
+                .subject_holdings(
+                    EnvelopeKind::TransportDestination,
+                    third_party,
+                    Some(stranger)
+                )
                 .await
                 .is_empty(),
             "past its budget a peer gets nothing — walking a fedID dictionary \
@@ -15703,7 +15413,7 @@ pub(crate) mod tests {
         // The SUBJECT asking about itself is unaffected by that flood.
         assert!(
             !bridge
-                .subject_holdings(EnvelopeKind::Key, stranger, Some(stranger))
+                .subject_holdings(EnvelopeKind::TransportDestination, stranger, Some(stranger))
                 .await
                 .is_empty(),
             "a data subject's access right is not a harvesting budget"
@@ -15711,7 +15421,7 @@ pub(crate) mod tests {
         // And so is a request for this node's OWN record.
         assert!(
             !bridge
-                .subject_holdings(EnvelopeKind::Key, local, Some(stranger))
+                .subject_holdings(EnvelopeKind::TransportDestination, local, Some(stranger))
                 .await
                 .is_empty(),
             "the own record is what self_own already advertises to everyone"
@@ -15745,14 +15455,19 @@ pub(crate) mod tests {
             crate::replication::serve_tier::ServeTier::MeshServer,
             crate::replication::serve_tier::ServeTier::Canonical,
         ] {
-            let (_b, bridge) =
+            let (b, bridge) =
                 test_fixtures::make_bridge_with_keys(&[local, third_party, stranger, root]).await;
+            seed_routes(&b, &[local, third_party, stranger]).await;
             let bridge = bridge
                 .with_local_key_id(Some(local.to_string()))
                 .with_serve_tier_for_test(tier);
             assert!(
                 bridge
-                    .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
+                    .subject_holdings(
+                        EnvelopeKind::TransportDestination,
+                        third_party,
+                        Some(stranger)
+                    )
                     .await
                     .is_empty(),
                 "{tier:?}: no mutual root ⇒ nothing composes, whatever the tier"
@@ -15766,6 +15481,7 @@ pub(crate) mod tests {
         ] {
             let (backend, bridge) =
                 test_fixtures::make_bridge_with_keys(&[local, third_party, stranger, root]).await;
+            seed_routes(&backend, &[local, third_party, stranger]).await;
             // Both hang their trust off the same root (CC 4's shape).
             seed_acceptance_edge(&backend, local, root, &scope).await;
             seed_acceptance_edge(&backend, stranger, root, &scope).await;
@@ -15775,7 +15491,11 @@ pub(crate) mod tests {
 
             assert!(
                 !bridge
-                    .subject_holdings(EnvelopeKind::Key, third_party, Some(stranger))
+                    .subject_holdings(
+                        EnvelopeKind::TransportDestination,
+                        third_party,
+                        Some(stranger)
+                    )
                     .await
                     .is_empty(),
                 "{tier:?}: a shared root entitles the lookup — a storage helper \
@@ -15784,14 +15504,14 @@ pub(crate) mod tests {
             // The two arms that never depended on any of this.
             assert!(
                 !bridge
-                    .subject_holdings(EnvelopeKind::Key, stranger, Some(stranger))
+                    .subject_holdings(EnvelopeKind::TransportDestination, stranger, Some(stranger))
                     .await
                     .is_empty(),
                 "{tier:?}: a data subject's own access is unconditional"
             );
             assert!(
                 bridge
-                    .subject_holdings(EnvelopeKind::Key, third_party, None)
+                    .subject_holdings(EnvelopeKind::TransportDestination, third_party, None)
                     .await
                     .is_empty(),
                 "{tier:?}: unattributed still serves nothing"
@@ -15803,6 +15523,20 @@ pub(crate) mod tests {
                     .is_empty(),
                 "{tier:?}: Attestation entitlement stays per ROW"
             );
+        }
+    }
+
+    /// persist v59.0.0 — a signed route for each key (the public subject-pull
+    /// plane a fixture key can still carry).
+    async fn seed_routes(backend: &MemoryBackend, keys: &[&str]) {
+        let now = Utc::now().trunc_subsecs(6);
+        for key in keys {
+            backend
+                .put_signed_transport_destination(&sign_transport_destination_fixture(
+                    key, "aa00", 1, now,
+                ))
+                .await
+                .expect("seed route");
         }
     }
 
@@ -16204,7 +15938,8 @@ pub(crate) mod tests {
     /// If the pull's struct-hashing (`content_hash_of` on the `_for`-read struct)
     /// ever diverged from what the index keys on, this would surface as
     /// advertised-then-unfetchable and a Pull would deliver nothing. Proven across
-    /// the Key plane (lookup + `SignedKeyRecord` wrap) and the Attestation plane.
+    /// the Key plane (the subject's `key:record:v1` row, persist v59.0.0) and the
+    /// Attestation plane.
     #[tokio::test]
     async fn subject_pull_refs_resolve_through_fetch() {
         let subject = "eric-moore-v2-portable";
@@ -16227,8 +15962,20 @@ pub(crate) mod tests {
         )
         .await;
 
-        for kind in [EnvelopeKind::Key, EnvelopeKind::Attestation] {
-            let refs = bridge.subject_holdings(kind, subject, Some(subject)).await;
+        // persist v59.0.0 — the Key plane answers with the subject's
+        // `key:record:v1` row, which only a verifiable (minted) record has.
+        let traveller = minted_key_record("eric-moore-v2-row", "user", 0x61).await;
+        let traveller_id = traveller.key_id.clone();
+        backend
+            .put_public_key(SignedKeyRecord { record: traveller })
+            .await
+            .expect("register the travelling key");
+
+        for (kind, who) in [
+            (EnvelopeKind::Key, traveller_id.as_str()),
+            (EnvelopeKind::Attestation, subject),
+        ] {
+            let refs = bridge.subject_holdings(kind, who, Some(who)).await;
             assert!(
                 !refs.is_empty(),
                 "{kind:?}: a subject Pull must surface at least one ref"
@@ -16362,16 +16109,15 @@ pub(crate) mod tests {
         revocation.scrub_signature_classical = ed_sig;
         revocation.scrub_signature_pqc = pqc_sig;
         backend
-            .put_revocation(SignedRevocation { revocation })
+            .put_revocation(ciris_persist::federation::types::SignedRevocation { revocation })
             .await
             .expect("seed revocation");
     }
 
-    /// CIRISEdge#396 item 3 — the Revocation plane (the one kind persist does
-    /// not content-hash-index) fetches with NO cache: `fetch_envelope_bytes`
-    /// re-derives the tombstone's bytes by scanning the same `Global` subject
-    /// set the advertise walked. A revocation advertised by `list_revocations`
-    /// must therefore fetch back byte-for-byte through the point-read surface.
+    /// CIRISEdge#396 item 3, persist v59.0.0 — the Revocation plane advertises
+    /// each revocation's `key:revocation:v1` ROW (the framed object is
+    /// retired), and the advertised hash fetches back through the Attestation
+    /// content-hash point-read as that row, which carries the revocation.
     #[tokio::test]
     async fn revocation_fetch_is_cache_free_round_trip() {
         let revoking = "revoker-node";
@@ -16396,19 +16142,21 @@ pub(crate) mod tests {
         // is what this asserts.
         seed_revocation(&backend, revoked, revoked).await;
 
-        let refs = bridge.list_revocations().await;
+        let refs = bridge.list_revocation_rows().await;
         assert!(!refs.is_empty(), "the seeded revocation is advertised");
         for r in &refs {
             let bytes = bridge
                 .fetch_envelope_bytes(EnvelopeKind::Revocation, &r.envelope_hash)
                 .await
-                .expect("cache-free revocation fetch resolves the advertised hash");
-            let parsed: SignedRevocation =
-                serde_json::from_slice(&bytes).expect("fetched bytes are a SignedRevocation");
+                .expect("the revocation row fetch resolves the advertised hash");
+            let row: Attestation =
+                serde_json::from_slice(&bytes).expect("fetched bytes are the row");
+            let parsed = ciris_persist::federation::key_plane::revocation_of_row(&row)
+                .expect("the row carries the revocation");
             assert_eq!(
-                parsed.revocation.revoked_key_id.as_deref(),
+                parsed.revoked_key_id.as_deref(),
                 Some(revoked),
-                "the re-derived bytes are the advertised revocation"
+                "the fetched row is the advertised revocation"
             );
         }
     }
@@ -19710,8 +19458,9 @@ pub(crate) mod tests {
     }
 
     /// FIELD PROVENANCE, end to end — a root-authored
-    /// `antientropy.page_limit` relief bounds the bridge's since-page: the Key
-    /// plane's ADVERTISE shrinks to the relieved limit.
+    /// `antientropy.page_limit` relief bounds the bridge's since-page: the
+    /// TransportDestination plane's ADVERTISE shrinks to the relieved limit
+    /// (the Key plane until persist v59.0.0, whose rows are read per subject).
     ///
     /// CIRISEdge#531 DEPTH sharpened both halves of this, and the second half
     /// was a latent bug:
@@ -19750,19 +19499,28 @@ pub(crate) mod tests {
                 .await
                 .expect("seed key");
         }
+        // persist v59.0.0 — the Key plane is read per subject (no since-page
+        // to bound), so the paged SelfOwn plane this relief bounds is the
+        // route plane: one signed route per key.
+        let mut keys = vec![local];
+        keys.extend(producers);
+        seed_routes(&backend, &keys).await;
         seed_mesh_config_root(&backend, local, "mc-root").await;
         let bridge = bridge.with_mesh_config(Some(mesh_reader_over(&backend, local)));
 
         assert_eq!(
             bridge
-                .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-x"))
+                .list_envelope_refs_for_peer(EnvelopeKind::TransportDestination, Some("peer-x"))
                 .await
                 .len(),
             4,
             "no relief: the full page (local + the three producers; mc-root is \
              outside the cohort projection)"
         );
-        let holdings_unrelieved = bridge.list_holdings(EnvelopeKind::Key).await.len();
+        let holdings_unrelieved = bridge
+            .list_holdings(EnvelopeKind::TransportDestination)
+            .await
+            .len();
 
         seed_mesh_config_relief(
             &backend,
@@ -19773,7 +19531,7 @@ pub(crate) mod tests {
         .await;
         assert_eq!(
             bridge
-                .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-y"))
+                .list_envelope_refs_for_peer(EnvelopeKind::TransportDestination, Some("peer-y"))
                 .await
                 .len(),
             2,
@@ -19781,7 +19539,10 @@ pub(crate) mod tests {
              so this is its first page; its watermark carries the rest)"
         );
         assert_eq!(
-            bridge.list_holdings(EnvelopeKind::Key).await.len(),
+            bridge
+                .list_holdings(EnvelopeKind::TransportDestination)
+                .await
+                .len(),
             holdings_unrelieved,
             "relieved: the RECEIVE-axis holdings view is UNCHANGED — relief bounds \
              what we offer, never what we know we hold, or the node re-wants rows \
@@ -20528,20 +20289,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_kind_publish_selector_narrows_only_the_named_kinds_678() {
         let backend = Arc::new(MemoryBackend::new());
-        register_fixture_keys(
-            &backend,
-            &[
-                ("me", identity_type::AGENT),
-                ("anchored", identity_type::AGENT),
-                ("third-party", identity_type::AGENT),
-            ],
-        )
-        .await;
-        let publish = vec![
-            "me".to_string(),
-            "anchored".to_string(),
-            "third-party".to_string(),
-        ];
+        // persist v59.0.0 — keys that travel (minted, with their rows).
+        let me = seed_row_key(&backend, "me", 0x71).await;
+        let anchored = seed_row_key(&backend, "anchored", 0x72).await;
+        let third = seed_row_key(&backend, "third-party", 0x73).await;
+        let publish = vec![me.clone(), anchored.clone(), third];
         let base =
             bridge_over(&backend, &[]).with_self_provider(Some(Arc::new(move || publish.clone())));
         let self_set = base.self_own_subjects(EnvelopeKind::IdentityOccurrence);
@@ -20553,11 +20305,7 @@ pub(crate) mod tests {
         assert_eq!(base.list_envelope_refs(EnvelopeKind::Key).await.len(), 3);
 
         let bridge = base.with_kind_publish_selector(Some(KindPublishSelector::from_sets(
-            [(
-                EnvelopeKind::Key,
-                vec!["me".to_string(), "anchored".to_string()],
-            )]
-            .into(),
+            [(EnvelopeKind::Key, vec![me, anchored])].into(),
         )));
         assert_eq!(
             bridge.list_envelope_refs(EnvelopeKind::Key).await.len(),
@@ -23896,7 +23644,12 @@ pub(crate) mod tests {
             (backend, bridge)
         }
 
-        /// Seed `n` key records and return the cohort naming them.
+        /// Seed a key record and a signed route for each id.
+        ///
+        /// persist v59.0.0 — the paged `SelfOwn` plane these witnesses drive is
+        /// the route plane: the Key plane is read per subject now (its rows
+        /// have no since-page), so the watermark/page machinery is exercised
+        /// where it still runs.
         async fn seed_keys(backend: &Arc<MemoryBackend>, ids: &[String]) {
             for id in ids {
                 backend
@@ -23906,6 +23659,8 @@ pub(crate) mod tests {
                     .await
                     .expect("seed key");
             }
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            seed_routes(backend, &ids).await;
         }
 
         fn hashes(refs: &[EnvelopeRef]) -> BTreeSet<[u8; 32]> {
@@ -24075,13 +23830,17 @@ pub(crate) mod tests {
             let (backend, bridge) = paged_bridge(&ids, 2);
             seed_keys(&backend, &ids).await;
 
-            let whole = hashes(&bridge.list_envelope_refs(EnvelopeKind::Key).await);
+            let whole = hashes(
+                &bridge
+                    .list_envelope_refs(EnvelopeKind::TransportDestination)
+                    .await,
+            );
             assert_eq!(whole.len(), 7, "the complete advertise set");
 
             let mut offered: BTreeSet<[u8; 32]> = BTreeSet::new();
             for round in 0..6 {
                 let refs = bridge
-                    .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-a"))
+                    .list_envelope_refs_for_peer(EnvelopeKind::TransportDestination, Some("peer-a"))
                     .await;
                 assert!(
                     refs.len() <= 4,
@@ -24189,7 +23948,7 @@ pub(crate) mod tests {
             // Round 1 offers the first page. Pick a row from it — the watermark
             // is now past it by construction.
             let first = bridge
-                .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-b"))
+                .list_envelope_refs_for_peer(EnvelopeKind::TransportDestination, Some("peer-b"))
                 .await;
             assert!(!first.is_empty(), "round one offers a page");
             let passed = first[0].envelope_hash;
@@ -24207,7 +23966,7 @@ pub(crate) mod tests {
             let mut re_offers = 0usize;
             for _ in 0..16 {
                 let refs = bridge
-                    .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-b"))
+                    .list_envelope_refs_for_peer(EnvelopeKind::TransportDestination, Some("peer-b"))
                     .await;
                 if refs.iter().any(|r| r.envelope_hash == passed) {
                     re_offers += 1;
@@ -24241,23 +24000,31 @@ pub(crate) mod tests {
             // Sweep until this peer has caught up with the plane as it stands.
             for _ in 0..5 {
                 let _ = bridge
-                    .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-c"))
+                    .list_envelope_refs_for_peer(EnvelopeKind::TransportDestination, Some("peer-c"))
                     .await;
             }
             // The late row's hash, taken from the plane itself rather than
             // recomputed: `fixture_key_record` stamps `Utc::now()`, so a
             // rebuilt record would hash to something the plane never held —
             // a test that then passes or fails for the wrong reason.
-            let before = hashes(&bridge.list_envelope_refs(EnvelopeKind::Key).await);
+            let before = hashes(
+                &bridge
+                    .list_envelope_refs(EnvelopeKind::TransportDestination)
+                    .await,
+            );
             seed_keys(&backend, std::slice::from_ref(&late)).await;
-            let after = hashes(&bridge.list_envelope_refs(EnvelopeKind::Key).await);
+            let after = hashes(
+                &bridge
+                    .list_envelope_refs(EnvelopeKind::TransportDestination)
+                    .await,
+            );
             let late_hash = *after
                 .difference(&before)
                 .next()
                 .expect("the late row entered the advertise set");
 
             let refs = bridge
-                .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-c"))
+                .list_envelope_refs_for_peer(EnvelopeKind::TransportDestination, Some("peer-c"))
                 .await;
             assert!(
                 refs.iter().any(|r| r.envelope_hash == late_hash),
@@ -24278,14 +24045,24 @@ pub(crate) mod tests {
             // An established peer has already swept the plane.
             for _ in 0..6 {
                 let _ = bridge
-                    .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-old"))
+                    .list_envelope_refs_for_peer(
+                        EnvelopeKind::TransportDestination,
+                        Some("peer-old"),
+                    )
                     .await;
             }
-            let whole = hashes(&bridge.list_envelope_refs(EnvelopeKind::Key).await);
+            let whole = hashes(
+                &bridge
+                    .list_envelope_refs(EnvelopeKind::TransportDestination)
+                    .await,
+            );
             let mut offered: BTreeSet<[u8; 32]> = BTreeSet::new();
             for _ in 0..6 {
                 let refs = bridge
-                    .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-new"))
+                    .list_envelope_refs_for_peer(
+                        EnvelopeKind::TransportDestination,
+                        Some("peer-new"),
+                    )
                     .await;
                 offered.extend(refs.iter().map(|r| r.envelope_hash));
             }
@@ -24310,7 +24087,10 @@ pub(crate) mod tests {
             for _ in 0..6 {
                 before.extend(
                     bridge
-                        .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-r"))
+                        .list_envelope_refs_for_peer(
+                            EnvelopeKind::TransportDestination,
+                            Some("peer-r"),
+                        )
                         .await
                         .iter()
                         .map(|r| r.envelope_hash),
@@ -24332,7 +24112,10 @@ pub(crate) mod tests {
             for _ in 0..6 {
                 after.extend(
                     restarted
-                        .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-r"))
+                        .list_envelope_refs_for_peer(
+                            EnvelopeKind::TransportDestination,
+                            Some("peer-r"),
+                        )
                         .await
                         .iter()
                         .map(|r| r.envelope_hash),
@@ -24362,11 +24145,19 @@ pub(crate) mod tests {
             let (backend, bridge) = paged_bridge(&ids, 2);
             seed_keys(&backend, &ids).await;
 
-            let first = hashes(&bridge.list_holdings(EnvelopeKind::Key).await);
+            let first = hashes(
+                &bridge
+                    .list_holdings(EnvelopeKind::TransportDestination)
+                    .await,
+            );
             assert_eq!(first.len(), 7, "every held row, in ONE call");
             for _ in 0..4 {
                 assert_eq!(
-                    hashes(&bridge.list_holdings(EnvelopeKind::Key).await),
+                    hashes(
+                        &bridge
+                            .list_holdings(EnvelopeKind::TransportDestination)
+                            .await
+                    ),
                     first,
                     "the holdings view is the same COMPLETE set every round — it \
                      carries no position and must never converge over rounds"
@@ -24391,7 +24182,9 @@ pub(crate) mod tests {
             seed_keys(&backend, &ids).await;
 
             let before = bridge.sweep_permits_taken();
-            let refs = bridge.list_holdings(EnvelopeKind::Key).await;
+            let refs = bridge
+                .list_holdings(EnvelopeKind::TransportDestination)
+                .await;
             let taken = bridge.sweep_permits_taken() - before;
             assert_eq!(refs.len(), 7);
             assert_eq!(
@@ -24416,7 +24209,7 @@ pub(crate) mod tests {
             let (backend, bridge) = paged_bridge(&ids, 0);
             seed_keys(&backend, &ids).await;
             let refs = bridge
-                .list_envelope_refs_for_peer(EnvelopeKind::Key, Some("peer-z"))
+                .list_envelope_refs_for_peer(EnvelopeKind::TransportDestination, Some("peer-z"))
                 .await;
             assert_eq!(hashes(&refs).len(), 5, "the whole plane in one page");
             assert_eq!(
@@ -24845,6 +24638,21 @@ mod sweep_width_tests {
 const DELEGATES_TO_BYTES: &[u8] =
     ciris_persist::federation::types::attestation_type::DELEGATES_TO.as_bytes();
 
+/// persist v59.0.0 — the dimension an occurrence row names, for the same
+/// pre-parse scan.
+const IDENTITY_OCCURRENCE_DIMENSION_BYTES: &[u8] =
+    ciris_persist::federation::key_plane::IDENTITY_OCCURRENCE_DIMENSION.as_bytes();
+
+/// persist v59.0.0 — the dimension a key-record row names, for the same
+/// pre-parse scan (the park release on a key's admission).
+const KEY_RECORD_DIMENSION_BYTES: &[u8] =
+    ciris_persist::federation::key_plane::KEY_RECORD_DIMENSION.as_bytes();
+
+/// persist v59.0.0 — the dimension a key-revocation row names, for the same
+/// pre-parse scan (the revocation invalidations, #430).
+const KEY_REVOCATION_DIMENSION_BYTES: &[u8] =
+    ciris_persist::federation::key_plane::KEY_REVOCATION_DIMENSION.as_bytes();
+
 /// CIRISEdge#858 — why a park was released (the release line's wording).
 #[derive(Debug, Clone, Copy)]
 enum ReleaseCause {
@@ -24871,37 +24679,66 @@ fn park_log_throttle() -> crate::log_throttle::LogThrottle {
 /// an owner binding's bound node (`delegates_to` with an owner-binding
 /// envelope → `attested_key_id`) or an identity occurrence's
 /// `occurrence_key_id`. `None` for any other row.
+///
+/// persist v59.0.0 — an occurrence arrives as its `identity:occurrence:v1`
+/// ROW, on its own session plane or on the Attestation plane alike, so both
+/// planes read it here.
 fn newly_bound_signer_of(kind: EnvelopeKind, envelope_bytes: &[u8]) -> Option<String> {
-    match kind {
-        EnvelopeKind::Attestation => {
-            // The bulk plane: a substring scan before any parse, so an ordinary
-            // admitted row pays no second deserialization.
-            if !envelope_bytes
-                .windows(DELEGATES_TO_BYTES.len())
-                .any(|w| w == DELEGATES_TO_BYTES)
-            {
-                return None;
-            }
-            let row = serde_json::from_slice::<Attestation>(envelope_bytes)
-                .ok()
-                .or_else(|| {
-                    serde_json::from_slice::<SignedAttestation>(envelope_bytes)
-                        .ok()
-                        .map(|s| s.attestation)
-                })?;
-            (row.attestation_type
-                == ciris_persist::federation::types::attestation_type::DELEGATES_TO
-                && ciris_persist::federation::admission::is_owner_binding_envelope(
-                    &row.attestation_envelope,
-                )
-                && !row.attested_key_id.is_empty())
-            .then_some(row.attested_key_id)
-        }
-        EnvelopeKind::IdentityOccurrence => serde_json::from_slice::<
-            ciris_persist::federation::SignedIdentityOccurrence,
-        >(envelope_bytes)
-        .ok()
-        .map(|o| o.identity_occurrence.occurrence_key_id),
-        _ => None,
+    if !matches!(
+        kind,
+        EnvelopeKind::Attestation | EnvelopeKind::IdentityOccurrence
+    ) {
+        return None;
     }
+    // A substring scan before any parse, so an ordinary admitted row pays no
+    // second deserialization.
+    let names = |needle: &[u8]| envelope_bytes.windows(needle.len()).any(|w| w == needle);
+    let occurrence = names(IDENTITY_OCCURRENCE_DIMENSION_BYTES);
+    if !occurrence && !names(DELEGATES_TO_BYTES) {
+        return None;
+    }
+    let row = key_plane_rows::row_of_bytes(envelope_bytes)?;
+    if occurrence {
+        if let Some(key) = key_plane_rows::occurrence_key_of(&row) {
+            return Some(key);
+        }
+    }
+    (row.attestation_type == ciris_persist::federation::types::attestation_type::DELEGATES_TO
+        && ciris_persist::federation::admission::is_owner_binding_envelope(
+            &row.attestation_envelope,
+        )
+        && !row.attested_key_id.is_empty())
+    .then_some(row.attested_key_id)
+}
+
+/// persist v59.0.0 — the key a `key:record:v1` row on the Key or Attestation
+/// plane carries the record of (CIRISEdge#679: its admission releases the rows
+/// parked on that key). `None` for any other body.
+fn key_of_record_row(kind: EnvelopeKind, envelope_bytes: &[u8]) -> Option<String> {
+    if !matches!(kind, EnvelopeKind::Attestation | EnvelopeKind::Key)
+        || !envelope_bytes
+            .windows(KEY_RECORD_DIMENSION_BYTES.len())
+            .any(|w| w == KEY_RECORD_DIMENSION_BYTES)
+    {
+        return None;
+    }
+    let row = key_plane_rows::row_of_bytes(envelope_bytes)?;
+    ciris_persist::federation::key_plane::key_record_of_row(&row).map(|r| r.key_id)
+}
+
+/// persist v59.0.0 (CIRISEdge#430) — the revocation a `key:revocation:v1` row
+/// on the Revocation or Attestation plane carries. `None` for any other body.
+fn revocation_of_row_bytes(
+    kind: EnvelopeKind,
+    envelope_bytes: &[u8],
+) -> Option<ciris_persist::federation::types::Revocation> {
+    if !matches!(kind, EnvelopeKind::Attestation | EnvelopeKind::Revocation)
+        || !envelope_bytes
+            .windows(KEY_REVOCATION_DIMENSION_BYTES.len())
+            .any(|w| w == KEY_REVOCATION_DIMENSION_BYTES)
+    {
+        return None;
+    }
+    let row = key_plane_rows::row_of_bytes(envelope_bytes)?;
+    ciris_persist::federation::key_plane::revocation_of_row(&row)
 }

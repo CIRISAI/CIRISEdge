@@ -316,22 +316,24 @@ async fn federate(from: &Node, to: &Node) {
                 .expect("carry the far node's owner binding");
         }
     }
-    let occ = from
-        .dir
-        .list_signed_identity_occurrences_since(None, 64)
+    // persist v59.0.0 — the occurrence travels as its `identity:occurrence:v1`
+    // row through the attestation apply door; the framed object is retired.
+    let occ = FederationDirectory::list_attestations_since(&*from.dir, None, 256)
         .await
-        .expect("list the signed occurrence plane")
+        .expect("list the attestation plane")
         .into_iter()
-        .map(|s| s.occurrence)
-        .find(|o| {
-            o.identity_occurrence.occurrence_key_id == from.me
-                && o.identity_occurrence.identity_key_id == from.identity
+        .map(|row| row.attestation)
+        .find(|att| {
+            ciris_persist::federation::key_plane::occurrence_of_row(att).is_some_and(|o| {
+                o.identity_occurrence.occurrence_key_id == from.me
+                    && o.identity_occurrence.identity_key_id == from.identity
+            })
         })
-        .expect("the engine occurrence is on the signed plane");
+        .expect("the engine occurrence is on the row plane");
     to.dir
-        .put_identity_occurrence(occ)
+        .apply_replicated_attestation(SignedAttestation { attestation: occ })
         .await
-        .expect("admit the far node's occurrence");
+        .expect("admit the far node's occurrence row");
 }
 
 /// The far node's hybrid-signed reticulum route, through persist's gate.

@@ -2057,19 +2057,26 @@ async fn carry_identity(from: &Peer, to: &Peer) {
                 .expect("carry the owner binding");
         }
     }
-    let occ = from
-        .dir
-        .list_signed_identity_occurrences_since(None, 64)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|s| s.occurrence)
-        .find(|o| o.identity_occurrence.occurrence_key_id == from.me)
-        .expect("the occurrence is ON the signed plane (CIRISPersist#851)");
+    // persist v59.0.0 — the occurrence travels as its `identity:occurrence:v1`
+    // row through the attestation apply door; the framed object is retired.
+    let occ = ciris_persist::federation::FederationDirectory::list_attestations_since(
+        &*from.dir, None, 4096,
+    )
+    .await
+    .expect("list the attestation plane")
+    .into_iter()
+    .map(|row| row.attestation)
+    .find(|att| {
+        ciris_persist::federation::key_plane::occurrence_of_row(att)
+            .is_some_and(|o| o.identity_occurrence.occurrence_key_id == from.me)
+    })
+    .expect("the engine occurrence is on the row plane");
     to.dir
-        .put_identity_occurrence(occ)
+        .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: occ,
+        })
         .await
-        .expect("admit the occurrence through the gated door");
+        .expect("admit the far node's occurrence row");
 }
 
 /// What the Attestation cursor carries after a seal: every `key_grant:*`

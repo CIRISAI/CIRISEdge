@@ -2889,29 +2889,34 @@ impl Edge {
         payload: Vec<u8>,
         timeout_ms: u64,
     ) -> Result<crate::first_contact::OpaqueExchange, EdgeError> {
-        let own = self.own_key_record().await?;
+        let own = self.own_key_record_row().await?;
         self.send_opaque_request_inner(destination_key_id, kind, payload, Some(own), timeout_ms)
             .await
     }
 
-    /// CIRISEdge#683 — this node's own key record, as its directory holds it.
-    async fn own_key_record(
+    /// CIRISEdge#683 — this node's own key record, as the `key:record:v1` ROW
+    /// its directory holds (persist v59.0.0: the framed record is refused at
+    /// every door, so the row is the one carriage a stranger can admit). A
+    /// key held without a row (it verifies under neither of persist's rules)
+    /// cannot introduce itself.
+    async fn own_key_record_row(
         &self,
-    ) -> Result<ciris_persist::federation::SignedKeyRecord, EdgeError> {
+    ) -> Result<ciris_persist::federation::Attestation, EdgeError> {
         let directory = self.federation_directory.as_ref().ok_or_else(|| {
             EdgeError::Config("first contact needs a federation directory (CIRISEdge#683)".into())
         })?;
-        let record = directory
-            .lookup_public_key(&self.signer.key_id)
+        crate::replication::key_plane_rows::key_record_rows(&**directory, &self.signer.key_id)
             .await
-            .map_err(|e| EdgeError::Persist(format!("own key record: {e}")))?
+            .map_err(|e| EdgeError::Persist(format!("own key record row: {e}")))?
+            .into_iter()
+            .next()
             .ok_or_else(|| {
                 EdgeError::Config(format!(
-                    "no key record for this node's own key {} (CIRISEdge#683)",
+                    "no key:record:v1 row for this node's own key {} — the key is held \
+                     without one, so it cannot introduce itself (CIRISEdge#683, persist v59.0.0)",
                     self.signer.key_id
                 ))
-            })?;
-        Ok(ciris_persist::federation::SignedKeyRecord { record })
+            })
     }
 
     async fn send_opaque_request_inner(
@@ -2919,7 +2924,7 @@ impl Edge {
         destination_key_id: &str,
         kind: u32,
         payload: Vec<u8>,
-        key_record: Option<ciris_persist::federation::SignedKeyRecord>,
+        key_record_row: Option<ciris_persist::federation::Attestation>,
         timeout_ms: u64,
     ) -> Result<crate::first_contact::OpaqueExchange, EdgeError> {
         use crate::messages::{OpaqueRequest, OpaqueRequestWire};
@@ -2928,7 +2933,7 @@ impl Edge {
         // CIRISEdge#683 review — a request that can be answered with
         // introductions carries a fresh challenge, so its correlation (the body
         // hash) cannot be computed by anyone who did not see it.
-        let challenge = key_record.as_ref().map(|_| {
+        let challenge = key_record_row.as_ref().map(|_| {
             use rand::RngCore as _;
             let mut bytes = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -2937,7 +2942,8 @@ impl Edge {
         let msg = OpaqueRequestWire {
             kind,
             payload,
-            key_record,
+            key_record: None,
+            key_record_row,
             challenge,
         };
         // Build + sign the request envelope up front so we can key the
@@ -5918,22 +5924,26 @@ async fn dispatch_inbound(
             );
         } else if let Some(doors) = first_contact.doors.as_ref() {
             let mut report = crate::first_contact::IntroductionReport::default();
-            crate::first_contact::admit_introduced_keys(doors, &intro.keys, &mut report).await;
+            crate::first_contact::admit_introduced_keys(doors, &intro, &mut report).await;
             introductions = Some((report, intro));
         } else {
             let mut report = crate::first_contact::IntroductionReport::default();
+            let no_directory = crate::first_contact::FirstContactRefusal::NoDirectory.as_str();
             for k in &intro.keys {
-                report.refused.push((
-                    k.record.key_id.clone(),
-                    crate::first_contact::FirstContactRefusal::NoDirectory
-                        .as_str()
-                        .to_string(),
-                ));
+                report
+                    .refused
+                    .push((k.record.key_id.clone(), no_directory.to_string()));
+            }
+            for row in &intro.key_rows {
+                report
+                    .refused
+                    .push((row.attested_key_id.clone(), no_directory.to_string()));
             }
             introductions = Some((
                 report,
                 crate::messages::Introductions {
                     keys: Vec::new(),
+                    key_rows: Vec::new(),
                     attestations: intro.attestations,
                 },
             ));
@@ -7387,23 +7397,28 @@ async fn dispatch_inbound(
                 // CIRISEdge#683 — a device that has never seen this node needs
                 // its key to verify the answer; edge adds it, the host adds
                 // the bindings (FIRST_CONTACT.md §2.2, I14).
+                // persist v59.0.0 — as its `key:record:v1` ROW, the one
+                // carriage persist admits.
                 if first {
                     if let Some(doors) = first_contact.doors.as_ref() {
-                        let already = answer
-                            .introductions
-                            .keys
-                            .iter()
-                            .any(|k| k.record.key_id == signer.key_id);
+                        let already = answer.introductions.key_rows.iter().any(|row| {
+                            ciris_persist::federation::key_plane::key_record_of_row(row)
+                                .is_some_and(|r| r.key_id == signer.key_id)
+                        });
                         if !already {
-                            match doors.directory.lookup_public_key(&signer.key_id).await {
-                                Ok(Some(record)) => answer.introductions.keys.insert(
-                                    0,
-                                    ciris_persist::federation::SignedKeyRecord { record },
-                                ),
+                            match crate::replication::key_plane_rows::key_record_rows(
+                                &*doors.directory,
+                                &signer.key_id,
+                            )
+                            .await
+                            .map(|rows| rows.into_iter().next())
+                            {
+                                Ok(Some(row)) => answer.introductions.key_rows.insert(0, row),
                                 Ok(None) => tracing::warn!(
                                     key_id = %signer.key_id,
-                                    "first-contact answer: no key record for this node's own \
-                                     key; the requester may not be able to verify it (CIRISEdge#683)"
+                                    "first-contact answer: no key:record:v1 row for this node's \
+                                     own key; the requester may not be able to verify it \
+                                     (CIRISEdge#683, persist v59.0.0)"
                                 ),
                                 Err(e) => tracing::warn!(
                                     error = %e,

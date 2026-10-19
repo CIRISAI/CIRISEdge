@@ -66,13 +66,13 @@ use serde::{Deserialize, Serialize};
 ///
 /// | Variant                          | Persist put_*                                       | Substrate ship |
 /// |----------------------------------|------------------------------------------------------|----------------|
-/// | `Key`                            | `put_public_key(SignedKeyRecord)`                   | v1.0+          |
+/// | `Key`                            | the `key:record:v1` row → `put_attestation_synced` / `apply_replicated_attestation` (framed retired v59) | v1.0+          |
 /// | `Attestation`                    | `put_attestation(SignedAttestation)`                | v1.0+          |
-/// | `Revocation`                     | `put_revocation(SignedRevocation)`                  | v1.0+          |
-/// | `IdentityOccurrence`             | `put_identity_occurrence(SignedIdentityOccurrence)` | CEG 0.7        |
+/// | `Revocation`                     | the `key:revocation:v1` row → the attestation door (framed retired v59) | v1.0+          |
+/// | `IdentityOccurrence`             | the `identity:occurrence:v1` row → the attestation door (framed retired v59) | CEG 0.7        |
 /// | `Family`                         | `put_family(SignedFamily)`                          | CEG 0.7        |
 /// | `Community`                      | `put_community(SignedCommunity)`                    | CEG 0.8        |
-/// | `IdentityOccurrenceRevocation`   | `put_identity_occurrence_revocation(...)`           | v4.8.0 (#161)  |
+/// | `IdentityOccurrenceRevocation`   | retired (v59): a `withdraws` on the occurrence row, Attestation plane | v4.8.0 (#161)  |
 /// | `FamilyMembershipRevocation`     | `put_family_membership_revocation(...)`             | v4.8.0 (#161)  |
 /// | `CommunityMembershipRevocation`  | `put_community_membership_revocation(...)`          | v4.8.0 (#161)  |
 /// | `LocationProof`                  | `put_location_proof(SignedLocationProof)`           | v4.10.0 (#154) |
@@ -80,6 +80,21 @@ use serde::{Deserialize, Serialize};
 /// | `CommunityMembershipWidening`    | `put_community_membership_widening(SignedCommunityMembershipWidening)` — the roster's append-plane mirror of the revocation | v48.0.0 (#860) |
 /// | `FamilyMembershipWidening`       | `put_family_membership_widening(SignedFamilyMembershipWidening)` — the family twin | v49.0.0 (#910) |
 /// | `CommunityMembershipListing`     | `put_community_membership_listing(SignedCommunityMembershipListing)` — CC 2 `listed`, the member's own | v49.0.0 (#912) |
+///
+/// **persist v59.0.0 (sealed-transport floor, operator ruling 2026-10-19).**
+/// The four key-plane kinds `Key`, `Revocation`, `IdentityOccurrence` and
+/// `IdentityOccurrenceRevocation` no longer carry their FRAMED objects
+/// (`SignedKeyRecord`, `SignedRevocation`, `SignedIdentityOccurrence`, the
+/// framed occurrence revocation): persist refuses those at every door with
+/// `federation_envelope_kind_retired`. The key plane replicates only as
+/// attestation rows (`key:record:v1`, `key:revocation:v1`,
+/// `identity:occurrence:v1`), applied through the attestation door. Edge keeps
+/// three of the tags as SESSION planes over those rows
+/// ([`EnvelopeKind::key_plane_family`]) because `Key` and `IdentityOccurrence`
+/// are the #402 bootstrap planes an un-attributed link may carry, and
+/// `Revocation` is the plane a revocation reaches every peer on. The
+/// `IdentityOccurrenceRevocation` plane carries nothing: an occurrence is
+/// revoked by a `withdraws` on its row, which rides the Attestation plane.
 ///
 /// Adding a variant going forward bumps `WIRE_PROTOCOL_VERSION` (see
 /// `wire_frame.rs`). Anticipated v2 additions (operational-data CEG
@@ -258,6 +273,52 @@ impl EnvelopeKind {
         Self::CommunityMembershipListing,
     ];
 
+    /// persist's own name for this kind: the
+    /// [`replication_policy::EnvelopeKind`](ciris_persist::federation::replication_policy::EnvelopeKind)
+    /// at the same position of the two `ALL` arrays (the same names in the same
+    /// order, both hashed — pinned by `group_plane`'s
+    /// `every_membership_plane_kind_has_a_reader`).
+    #[must_use]
+    pub fn persist_kind(self) -> ciris_persist::federation::replication_policy::EnvelopeKind {
+        let i = Self::ALL
+            .iter()
+            .position(|k| *k == self)
+            .expect("every kind is in ALL");
+        ciris_persist::federation::replication_policy::EnvelopeKind::ALL[i]
+    }
+
+    /// persist v59.0.0 — is this kind's FRAMED carriage retired? Read from
+    /// persist's [`RETIRED_FRAMED`](ciris_persist::federation::replication_policy::RETIRED_FRAMED),
+    /// never restated here, so a kind persist retires later is retired on edge
+    /// by the same pin.
+    #[must_use]
+    pub fn is_framed_retired(self) -> bool {
+        ciris_persist::federation::replication_policy::RETIRED_FRAMED.contains(&self.persist_kind())
+    }
+
+    /// persist v59.0.0 — the key-plane row family this SESSION plane carries,
+    /// or `None` for a plane that carries no key-plane row.
+    ///
+    /// Edge's routing, not persist's: the rows are ordinary attestation rows
+    /// (they also ride the Attestation plane under its own gates), and these
+    /// three planes carry the one family each so the #402 bootstrap carve-out
+    /// (`Key`, `IdentityOccurrence`) and the global revocation reach
+    /// (`Revocation`) survive the retirement of the framed objects. A row of
+    /// any other family arriving on one of them is refused, never applied, so
+    /// the carve-out cannot become a path for general attestations.
+    /// `IdentityOccurrenceRevocation` carries none: an occurrence is revoked by
+    /// a `withdraws` on its `identity:occurrence:v1` row (Attestation plane).
+    #[must_use]
+    pub fn key_plane_family(self) -> Option<ciris_persist::federation::key_plane::KeyPlaneFamily> {
+        use ciris_persist::federation::key_plane::KeyPlaneFamily;
+        match self {
+            Self::Key => Some(KeyPlaneFamily::KeyRecord),
+            Self::Revocation => Some(KeyPlaneFamily::KeyRevocation),
+            Self::IdentityOccurrence => Some(KeyPlaneFamily::IdentityOccurrence),
+            _ => None,
+        }
+    }
+
     /// CIRISEdge#402/#406 — the finite, self-authenticating **bootstrap** kinds a
     /// fresh peer must deliver to introduce itself into the trust graph AND make
     /// itself attributable:
@@ -314,21 +375,19 @@ impl EnvelopeKind {
     ];
 
     /// CIRISEdge#462 — is this kind answerable by a subject-scoped `Pull` (the
-    /// RECEIVE axis)? EXACTLY the five replicated kinds — the persist
-    /// `ReplicatedKind` set the bridge's `subject_holdings` sweeps. This is the
+    /// RECEIVE axis)? The four replicated kinds the bridge's `subject_holdings`
+    /// sweeps (persist v59.0.0 retired `IdentityOccurrenceRevocation`, the
+    /// fifth: an occurrence revocation is a `withdraws` on the Attestation
+    /// axis). This is the
     /// single source of truth the initiation loop iterates; it MUST agree with
     /// the `receive` column of
     /// [`crate::replication::serve_policy::serve_advertise_manifest`] (asserted in
-    /// that module's `only_the_five_replicated_kinds_answer_a_subject_pull`).
+    /// that module's `only_the_four_replicated_kinds_answer_a_subject_pull`).
     #[must_use]
     pub fn is_subject_pullable(self) -> bool {
         matches!(
             self,
-            Self::Key
-                | Self::IdentityOccurrence
-                | Self::TransportDestination
-                | Self::IdentityOccurrenceRevocation
-                | Self::Attestation
+            Self::Key | Self::IdentityOccurrence | Self::TransportDestination | Self::Attestation
         )
     }
 
@@ -355,19 +414,16 @@ impl EnvelopeKind {
     pub fn is_public_subject_pull(self) -> bool {
         matches!(
             self,
-            Self::Key
-                | Self::IdentityOccurrence
-                | Self::TransportDestination
-                | Self::IdentityOccurrenceRevocation
+            Self::Key | Self::IdentityOccurrence | Self::TransportDestination
         )
     }
 
     /// CIRISEdge#474 — is this kind served over the dedicated CURSOR path
     /// (`CursorPull` → `Deliver`, resume on `evidence_at`) rather than the
     /// content-hash Summary/Diff/Fetch flow? EXACTLY the kinds with no
-    /// `signed_wire_index` entry ([`Self::persist_index_kind`] → None) that are
-    /// not [`Self::is_row_hash_served`] (Revocation is index-less but rides
-    /// `persist_row_hash` on the content-hash flow). Currently only
+    /// `signed_wire_index` entry ([`Self::persist_index_kind`] → None) that
+    /// still carry something (persist v59.0.0: `IdentityOccurrenceRevocation`
+    /// is index-less because it is retired and carries nothing). Currently only
     /// [`Self::AccordQuorumEvidence`]; checked over `ALL` in a test — and the
     /// serve/advertise manifest's `advertise`/`receive` cursor cells are DERIVED
     /// from this predicate in `serve_policy`'s tests, so a future cursor kind
@@ -377,21 +433,6 @@ impl EnvelopeKind {
     #[must_use]
     pub fn is_cursor_served(self) -> bool {
         matches!(self, Self::AccordQuorumEvidence)
-    }
-
-    /// CIRISEdge#396 item 3 — is this kind index-less in persist's
-    /// `signed_wire_index` yet still served on the content-hash
-    /// Summary/Diff/Fetch flow, riding `persist_row_hash` as its envelope hash?
-    /// EXACTLY [`Self::Revocation`]. This is the THIRD serve basis alongside
-    /// content-hash-indexed ([`Self::persist_index_kind`] → Some) and
-    /// cursor-served ([`Self::is_cursor_served`]); every kind has exactly one
-    /// of the three (pinned over `ALL` in
-    /// `every_kind_has_exactly_one_serve_basis`). The bridge's fetch path
-    /// resolves these kinds via their dedicated `persist_row_hash` read, never
-    /// the content-hash point-read.
-    #[must_use]
-    pub fn is_row_hash_served(self) -> bool {
-        matches!(self, Self::Revocation)
     }
 
     /// The kinds a subject sweep issues a `Pull` for — the
@@ -437,28 +478,35 @@ impl EnvelopeKind {
     /// ([`ciris_persist::federation::FederationDirectory::lookup_signed_record_by_content_hash`]).
     /// This is persist's `replication_policy::EnvelopeKind::as_str` PascalCase
     /// token (`"Key"`, `"Attestation"`, …) — NOT [`Self::as_wire_str`]'s
-    /// snake_case. `None` for the two kinds persist deliberately does not index:
-    /// [`Self::Revocation`] (its fetch stays on the local cache) and
-    /// [`Self::AccordQuorumEvidence`] (a vote-aggregating bundle whose hash moves
-    /// as participations land — served by cursor, never by content-hash point-read;
-    /// CIRISEdge#474).
+    /// snake_case. `None` for [`Self::AccordQuorumEvidence`] (a vote-aggregating
+    /// bundle whose hash moves as participations land — served by cursor, never
+    /// by content-hash point-read; CIRISEdge#474) and for the retired
+    /// [`Self::IdentityOccurrenceRevocation`], which carries nothing.
+    ///
+    /// persist v59.0.0 — the three key-plane SESSION planes
+    /// ([`Self::key_plane_family`]) carry attestation rows, so they point-read
+    /// through the `"Attestation"` index exactly as `KeyGrant` does; persist
+    /// indexes no framed key-plane object any more. The serve twin re-checks
+    /// the row's family, so the point-read never serves another family's row
+    /// on these planes.
     #[must_use]
     pub fn persist_index_kind(self) -> Option<&'static str> {
         Some(match self {
-            Self::Key => "Key",
             // #848 — a key_grant set IS an attestation row: it is point-read
             // through persist's Attestation content-hash index, never one of
             // its own. Declared so the kind has exactly one serve basis.
-            Self::Attestation | Self::KeyGrant => "Attestation",
-            // Both are absent from persist's content-hash `signed_wire_index`:
-            // Revocation rides `persist_row_hash` (`is_row_hash_served`);
+            // persist v59.0.0 — likewise the three key-plane session planes.
+            Self::Attestation
+            | Self::KeyGrant
+            | Self::Key
+            | Self::Revocation
+            | Self::IdentityOccurrence => "Attestation",
             // AccordQuorumEvidence rides the cursor path (`is_cursor_served`,
-            // #474). Neither has a content-hash point-read.
-            Self::Revocation | Self::AccordQuorumEvidence => return None,
-            Self::IdentityOccurrence => "IdentityOccurrence",
+            // #474); IdentityOccurrenceRevocation is retired and carries
+            // nothing (persist v59.0.0). Neither has a content-hash point-read.
+            Self::AccordQuorumEvidence | Self::IdentityOccurrenceRevocation => return None,
             Self::Family => "Family",
             Self::Community => "Community",
-            Self::IdentityOccurrenceRevocation => "IdentityOccurrenceRevocation",
             Self::FamilyMembershipRevocation => "FamilyMembershipRevocation",
             Self::CommunityMembershipRevocation => "CommunityMembershipRevocation",
             // #860 — indexed like the revocation (`record_key{community, member, effective_at}`).
@@ -881,8 +929,8 @@ mod tests {
     /// CIRISEdge#474 — `is_cursor_served` is EXACTLY `AccordQuorumEvidence`,
     /// checked over ALL so a future cursor kind is a deliberate widening. It agrees
     /// with `persist_index_kind() == None` (no content-hash index) — but NOT with
-    /// `Revocation`, which is also index-less yet rides `persist_row_hash`, not the
-    /// cursor path.
+    /// the retired `IdentityOccurrenceRevocation`, which is index-less because it
+    /// carries nothing at all (persist v59.0.0).
     #[test]
     fn is_cursor_served_is_exactly_accord_quorum_evidence() {
         for kind in EnvelopeKind::ALL {
@@ -901,39 +949,73 @@ mod tests {
             EnvelopeKind::AccordQuorumEvidence.as_wire_str(),
             "accord_quorum_evidence"
         );
-        // Revocation is index-less but is NOT cursor-served — it is the one
-        // row-hash-served kind (a different wire basis).
-        assert!(EnvelopeKind::Revocation.persist_index_kind().is_none());
-        assert!(!EnvelopeKind::Revocation.is_cursor_served());
-        assert!(EnvelopeKind::Revocation.is_row_hash_served());
+        // persist v59.0.0 — Revocation carries its `key:revocation:v1` row and
+        // point-reads through the Attestation index; the retired occurrence
+        // revocation plane is index-less and NOT cursor-served.
+        assert_eq!(
+            EnvelopeKind::Revocation.persist_index_kind(),
+            Some("Attestation")
+        );
+        assert!(EnvelopeKind::IdentityOccurrenceRevocation
+            .persist_index_kind()
+            .is_none());
+        assert!(!EnvelopeKind::IdentityOccurrenceRevocation.is_cursor_served());
     }
 
-    /// The three serve bases partition `ALL`: every kind is EXACTLY ONE of
-    /// content-hash-indexed (`persist_index_kind` → Some), row-hash-served
-    /// (`is_row_hash_served` — Revocation), or cursor-served
-    /// (`is_cursor_served` — AccordQuorumEvidence). A new kind that lands in
-    /// zero or two bases is a taxonomy bug this test refuses; the Revocation
-    /// partition previously lived only in prose (3 doc sites + a bridge
-    /// `== Revocation` literal), which is how prose drifts.
+    /// The serve bases partition `ALL`: every kind that carries anything is
+    /// EXACTLY ONE of content-hash-indexed (`persist_index_kind` → Some) or
+    /// cursor-served (`is_cursor_served` — AccordQuorumEvidence). persist
+    /// v59.0.0 retired the row-hash basis with the framed `Revocation`, and the
+    /// one kind with NO basis is the retired plane that carries nothing
+    /// (`is_framed_retired` with no `key_plane_family`). A new kind that lands
+    /// in zero or two bases is a taxonomy bug this test refuses.
     #[test]
     fn every_kind_has_exactly_one_serve_basis() {
         for kind in EnvelopeKind::ALL {
-            let bases = [
-                kind.persist_index_kind().is_some(),
-                kind.is_row_hash_served(),
-                kind.is_cursor_served(),
-            ];
+            let bases = [kind.persist_index_kind().is_some(), kind.is_cursor_served()];
+            let carries_nothing = kind.is_framed_retired() && kind.key_plane_family().is_none();
             assert_eq!(
                 bases.iter().filter(|b| **b).count(),
-                1,
-                "{kind:?}: must be exactly one of content-hash-indexed / \
-                 row-hash-served / cursor-served, got {bases:?}"
+                usize::from(!carries_nothing),
+                "{kind:?}: must be exactly one of content-hash-indexed / cursor-served \
+                 (none when retired and carrying nothing), got {bases:?}"
             );
-            // Membership pin: row-hash-served is EXACTLY Revocation.
+        }
+    }
+
+    /// persist v59.0.0 — the retired framed kinds are persist's
+    /// `RETIRED_FRAMED`, read through `persist_kind`, and each names the kind
+    /// persist's `retired_detail` names it (the label edge's retired ledger
+    /// books under). Three of them carry a key-plane row family; the fourth
+    /// carries nothing.
+    #[test]
+    fn the_retired_framed_kinds_are_persists_four_v59() {
+        use ciris_persist::federation::replication_policy::{retired_detail, RETIRED_FRAMED};
+        let retired: Vec<EnvelopeKind> = EnvelopeKind::ALL
+            .into_iter()
+            .filter(|k| k.is_framed_retired())
+            .collect();
+        assert_eq!(
+            retired,
+            vec![
+                EnvelopeKind::Key,
+                EnvelopeKind::Revocation,
+                EnvelopeKind::IdentityOccurrence,
+                EnvelopeKind::IdentityOccurrenceRevocation,
+            ]
+        );
+        assert_eq!(retired.len(), RETIRED_FRAMED.len());
+        for k in &retired {
+            assert_eq!(retired_detail(k.persist_kind()), k.as_wire_str());
+        }
+        assert!(EnvelopeKind::IdentityOccurrenceRevocation
+            .key_plane_family()
+            .is_none());
+        for k in EnvelopeKind::ALL {
             assert_eq!(
-                kind.is_row_hash_served(),
-                matches!(kind, EnvelopeKind::Revocation),
-                "{kind:?}: row-hash-served iff it is Revocation"
+                k.key_plane_family().is_some(),
+                k.is_framed_retired() && k != EnvelopeKind::IdentityOccurrenceRevocation,
+                "{k:?}: only a retired kind carries a key-plane row family"
             );
         }
     }
@@ -962,8 +1044,8 @@ mod tests {
         }
     }
 
-    /// CIRISEdge#462 — `is_subject_pullable` is EXACTLY the five replicated kinds
-    /// (the persist `ReplicatedKind` set), checked over ALL 14 so a new pullable
+    /// CIRISEdge#462 — `is_subject_pullable` is EXACTLY the four replicated kinds
+    /// (persist v59.0.0 retired the fifth), checked over ALL so a new pullable
     /// kind must be a deliberate edit here. MUST agree with the serve-policy
     /// `receive` witness.
     /// CIRISEdge#552 — the public-Pull set is a strict SUBSET of the
@@ -999,26 +1081,26 @@ mod tests {
     }
 
     #[test]
-    fn is_subject_pullable_is_exactly_the_five_replicated_kinds() {
+    fn is_subject_pullable_is_exactly_the_four_replicated_kinds() {
         for kind in EnvelopeKind::ALL {
             let expected = matches!(
                 kind,
                 EnvelopeKind::Key
                     | EnvelopeKind::IdentityOccurrence
                     | EnvelopeKind::TransportDestination
-                    | EnvelopeKind::IdentityOccurrenceRevocation
                     | EnvelopeKind::Attestation
             );
             assert_eq!(
                 kind.is_subject_pullable(),
                 expected,
-                "{kind:?}: pullable iff it is one of the five replicated kinds"
+                "{kind:?}: pullable iff it is one of the four replicated kinds"
             );
         }
-        assert_eq!(EnvelopeKind::subject_pullable().len(), 5);
-        // The key-level Revocation plane is NOT subject-pullable (not a
-        // ReplicatedKind — it rides the persist_row_hash wire, no subject index).
+        assert_eq!(EnvelopeKind::subject_pullable().len(), 4);
+        // The key-level Revocation plane is NOT subject-pullable (no subject
+        // index), and the retired occurrence-revocation plane answers nothing.
         assert!(!EnvelopeKind::Revocation.is_subject_pullable());
+        assert!(!EnvelopeKind::IdentityOccurrenceRevocation.is_subject_pullable());
     }
 
     /// Unknown tag refused — wire-stability guarantee.

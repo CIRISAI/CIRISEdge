@@ -1467,6 +1467,15 @@ pub struct EdgeMetrics {
     /// Booked at the bridge's single `refuse` site, alongside — never instead
     /// of — the kind axis, so a class-carrying refusal appears on both.
     pub apply_refusals_by_class: Arc<RwLock<HashMap<String, u64>>>,
+    /// persist v59.0.0 (sealed-transport floor) — the receive plane's ONE
+    /// entry for persist's `federation_envelope_kind_retired`: a framed
+    /// key-plane object (a key record, a key revocation, an identity
+    /// occurrence, an occurrence revocation) a peer offered, refused TERMINAL
+    /// and never applied, counted by persist's `retired_detail` label of the
+    /// kind (`key`, `revocation`, `identity_occurrence`,
+    /// `identity_occurrence_revocation`). Bounded by persist's retired set.
+    /// Non-zero means a peer still speaks the pre-v59 key plane.
+    pub envelope_kind_retired_refusals: Arc<RwLock<HashMap<String, u64>>>,
     /// CIRISEdge#858 — the refusal memory's park ledger (the bridge kept
     /// these as accessors only, so no scrape could see a park hold or fail):
     /// rows PARKED on a signer, per plane, since start (an absent `Key`, or an
@@ -2204,6 +2213,14 @@ impl EdgeMetrics {
         *guard.entry(token.to_string()).or_insert(0) += 1;
     }
 
+    /// persist v59.0.0 — count one framed object of a retired kind, by
+    /// persist's `retired_detail` label (see
+    /// [`Self::envelope_kind_retired_refusals`]).
+    pub fn inc_envelope_kind_retired(&self, kind_label: &str) {
+        let mut guard = self.envelope_kind_retired_refusals.write();
+        *guard.entry(kind_label.to_string()).or_insert(0) += 1;
+    }
+
     /// CIRISEdge#858 — count one row parked on a signer on `kind`.
     pub fn inc_rows_parked_on_signer(&self, kind: EnvelopeKind) {
         *self.rows_parked_on_signer.write().entry(kind).or_insert(0) += 1;
@@ -2537,6 +2554,7 @@ impl EdgeMetrics {
                 .read()
                 .clone(),
             apply_refusals_by_class: self.apply_refusals_by_class.read().clone(),
+            envelope_kind_retired_refusals: self.envelope_kind_retired_refusals.read().clone(),
             rows_parked_on_signer: self.rows_parked_on_signer.read().clone(),
             signer_releases: self.signer_releases(),
             retry_suppressions: self.retry_suppressions(),
@@ -2840,6 +2858,10 @@ pub struct EdgeMetricsBundle {
     /// [`EdgeMetrics::apply_refusals_by_class`]: the three v38.2.0 apply-door
     /// classes by their stable tokens.
     pub apply_refusals_by_class: HashMap<String, u64>,
+    /// persist v59.0.0 — snapshot of
+    /// [`EdgeMetrics::envelope_kind_retired_refusals`]: framed key-plane
+    /// objects refused `federation_envelope_kind_retired`, per kind label.
+    pub envelope_kind_retired_refusals: HashMap<String, u64>,
     /// CIRISEdge#858 — rows parked on a signer since start, per plane.
     pub rows_parked_on_signer: HashMap<EnvelopeKind, u64>,
     /// CIRISEdge#858 — rows released from a park since start.
@@ -3137,6 +3159,10 @@ impl EdgeMetricsBundle {
             &self.attestation_apply_refusals_by_reason,
         );
         f.family("apply_refusals_by_class", &self.apply_refusals_by_class);
+        f.family(
+            "envelope_kind_retired_refusals",
+            &self.envelope_kind_retired_refusals,
+        );
         let (mut offered, mut acked, mut unacked) = (0u64, 0u64, 0u64);
         for row in &self.removal_delivery {
             offered = offered.saturating_add(row.offered as u64);
@@ -3289,6 +3315,7 @@ edge_metrics_bundle_fields!(
     key_apply_refusals_by_reason,
     attestation_apply_refusals_by_reason,
     apply_refusals_by_class,
+    envelope_kind_retired_refusals,
     rows_parked_on_signer,
     signer_releases,
     retry_suppressions,
