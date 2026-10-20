@@ -1600,18 +1600,31 @@ mod tests {
             .is_some_and(|r| r.starts_with(['(', '<', ' ', ':', ';', '{']))
     }
 
-    /// Whether `body` defines `symbol`: `Type::method` needs an `impl … Type`
-    /// block and a `fn method`; a bare name is a fn, struct, enum, const or
+    /// Whether `body` defines `symbol`: `Type::method` needs a `fn method`
+    /// inside an `impl … Type` block (from the `impl` line to its closing
+    /// `}` at the same indent); a bare name is a fn, struct, enum, const or
     /// impl target.
     fn defines_symbol(body: &str, symbol: &str) -> bool {
+        let names = |l: &str, ty: &str| {
+            l.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|w| w == ty)
+        };
         if let Some((ty, method)) = symbol.split_once("::") {
-            let has_impl = body.lines().any(|l| {
-                let l = l.trim_start();
-                l.starts_with("impl")
-                    && l.split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|w| w == ty)
-            });
-            return has_impl && body.lines().any(|l| opens_item(l, "fn", method));
+            let mut open: Option<String> = None;
+            for l in body.lines() {
+                match &open {
+                    Some(close) if l == close.as_str() => open = None,
+                    Some(_) if opens_item(l, "fn", method) => return true,
+                    Some(_) => {}
+                    None => {
+                        let t = l.trim_start();
+                        if t.starts_with("impl") && names(t, ty) && t.ends_with('{') {
+                            open = Some(format!("{}}}", &l[..l.len() - t.len()]));
+                        }
+                    }
+                }
+            }
+            return false;
         }
         body.lines().any(|l| {
             ["fn", "struct", "enum", "const"]
