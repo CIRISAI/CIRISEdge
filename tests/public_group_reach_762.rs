@@ -339,6 +339,27 @@ async fn start_runtime(
     runtime
 }
 
+/// CC 5.3.3.5 E1 — `to` holds `from`'s signed route, which carries `from`'s
+/// transit pair, before anyone dials: a link is keyed by the dialled node's
+/// Rooted pair or never made. In the field the row crosses on the
+/// TransportDestination plane from a node both already reach (or a seated
+/// serve node's comes in the genesis bundle); here it is put through the same
+/// ordinary door, before the rounds this witness drives.
+async fn seed_route(from: &Node, to: &Node) {
+    for r in from
+        .dir
+        .list_signed_transport_destinations_for(&from.key.key_id)
+        .await
+        .expect("own routes")
+    {
+        ciris_persist::federation::FederationDirectory::put_signed_transport_destination(
+            &*to.dir, &r,
+        )
+        .await
+        .expect("seed the route");
+    }
+}
+
 async fn wait_for_own_route(node: &Node, budget: Duration) {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
@@ -598,6 +619,8 @@ async fn a_public_group_resolves_on_a_non_member_762() {
     for n in [&a, &x] {
         wait_for_own_route(n, Duration::from_secs(150)).await;
     }
+    seed_route(&a, &x).await;
+    seed_route(&x, &a).await;
     let all = [&rt_a, &rt_x];
 
     // P founds the four groups on A, alone.

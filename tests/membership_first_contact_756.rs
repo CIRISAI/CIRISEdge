@@ -350,6 +350,27 @@ async fn start_runtime(
     runtime
 }
 
+/// CC 5.3.3.5 E1 — `to` holds `from`'s signed route, which carries `from`'s
+/// transit pair, before anyone dials: a link is keyed by the dialled node's
+/// Rooted pair or never made. In the field the row crosses on the
+/// TransportDestination plane from a node both already reach (or a seated
+/// serve node's comes in the genesis bundle); here it is put through the same
+/// ordinary door, before the rounds this witness drives.
+async fn seed_route(from: &Node, to: &Node) {
+    for r in from
+        .dir
+        .list_signed_transport_destinations_for(&from.key.key_id)
+        .await
+        .expect("own routes")
+    {
+        ciris_persist::federation::FederationDirectory::put_signed_transport_destination(
+            &*to.dir, &r,
+        )
+        .await
+        .expect("seed the route");
+    }
+}
+
 async fn wait_for_own_route(node: &Node, budget: Duration) {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
@@ -600,6 +621,10 @@ async fn fixture(tag: u8) -> Fixture {
     for n in [&a, &b, &c] {
         wait_for_own_route(n, Duration::from_secs(150)).await;
     }
+    seed_route(&a, &b).await;
+    seed_route(&b, &a).await;
+    seed_route(&a, &c).await;
+    seed_route(&c, &a).await;
     Fixture {
         a,
         b,

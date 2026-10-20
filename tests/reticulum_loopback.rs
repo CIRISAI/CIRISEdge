@@ -565,6 +565,22 @@ async fn a_never_peered_device_is_answered_on_the_link_it_opened_683() {
     transport_b
         .inject_rooted_peer_for_test(&a.0, transport_a.local_dest_hash(), a_ed)
         .await;
+    // CC 5.3.3.5 E1 — and its signed route, which carries the first device's
+    // transit pair: the device dials it sealed, keyed by that Rooted pair. In
+    // the field this row comes over the TransportDestination plane (or the
+    // genesis bundle for a seated serve node); here it is put through the
+    // same ordinary door.
+    for r in dir_a
+        .list_signed_transport_destinations_for(&a.0)
+        .await
+        .expect("A's routes")
+    {
+        ciris_persist::federation::FederationDirectory::put_signed_transport_destination(
+            &*dir_b, &r,
+        )
+        .await
+        .expect("seed A's route at the device");
+    }
 
     let build = |me: &(String, ciris_persist::prelude::KeyRecord, Arc<LocalSigner>),
                  dir: &Arc<ciris_persist::store::sqlite::SqliteBackend>,
