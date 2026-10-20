@@ -251,7 +251,40 @@ async fn staggered_joins_grow_the_attendee_set_and_a_leaver_stays() {
     for row in &rows {
         assert_eq!(row.subject_key_ids, vec![row.attesting_key_id.clone()]);
         assert_eq!(chat::call_id_of(row), Some(call_id_hex(call).as_str()));
+        // The ACTOR (the human) attends: attester and subject are the
+        // human's key, never the node's.
+        assert!(
+            row.attesting_key_id.ends_with("-fed"),
+            "{}",
+            row.attesting_key_id
+        );
     }
+    // The node only co-signs: its scrub rides the authored row, appended.
+    let authored = r
+        .dir
+        .list_attestations_by("alice-fed")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|a| {
+            a.cohort_scope == "self"
+                && ciris_persist::federation::admission::envelope_dimension(&a.attestation_envelope)
+                    == Some(chat::CALL_DIMENSION)
+        })
+        .expect("alice's authored call row");
+    assert_eq!(authored.subject_key_ids, vec!["alice-fed".to_owned()]);
+    assert_eq!(
+        authored.scrub_key_id, "alice-fed",
+        "signed by the actor at write"
+    );
+    assert!(
+        authored
+            .additional_scrubs
+            .iter()
+            .any(|c| c.scrub_key_id == "alice-node"),
+        "the node co-scrubs the crossing: {:?}",
+        authored.additional_scrubs
+    );
     // Bob leaves: leaving writes nothing, and his row stands.
     let a = door(&r, &r.carol)
         .attendance(&r.room, call)
@@ -428,4 +461,51 @@ async fn the_attendee_set_is_the_union_of_every_row() {
         .expect("rows");
     let a = attendance_of(&rows, &call_id_hex(call));
     assert_eq!(a.attendees.len(), 3, "{a:?}");
+}
+
+/// **(e)** Attendance is by the CALL, never by who is in the room now: A, B
+/// and C attend; B is then REMOVED from the room (persist's roster
+/// revocation, signed by the founder). The call's attendees at A and at C
+/// still include B — the data-subject record lists everyone who attended.
+#[tokio::test]
+async fn an_attendee_removed_from_the_room_stays_an_attendee() {
+    let r = room().await;
+    let call = call_id_for_room(&r.room);
+    let at = chrono::Utc::now() - chrono::Duration::seconds(20);
+    for m in [&r.alice, &r.bob, &r.carol] {
+        door(&r, m)
+            .record_join(&r.room, call, at)
+            .await
+            .expect("row");
+    }
+    ciris_edge::community_roster::revoke_community_member(
+        &*r.dir,
+        &r.room,
+        "bob-fed",
+        chrono::Utc::now() - chrono::Duration::seconds(1),
+        Some("removed for the witness"),
+        &["alice-fed"],
+        &r.alice.human,
+    )
+    .await
+    .expect("alice removes bob from the room");
+    assert!(
+        !ciris_persist::federation::is_active_community_member(&*r.dir, &r.room, "bob-fed")
+            .await
+            .unwrap(),
+        "bob is no longer an active member of the room"
+    );
+    for m in [&r.alice, &r.carol] {
+        let a = door(&r, m).attendance(&r.room, call).await.expect("read");
+        assert_eq!(
+            a.attendees,
+            vec![
+                "alice-fed".to_owned(),
+                "bob-fed".to_owned(),
+                "carol-fed".to_owned()
+            ],
+            "at {}: bob attended, and stays",
+            m.human.key_id
+        );
+    }
 }

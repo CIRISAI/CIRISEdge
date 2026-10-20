@@ -431,8 +431,10 @@ pub trait CallRecord: Send + Sync {
 
 /// The call-row door over persist: the attendee's row is authored `self` by
 /// `actor` and shared to the room (two rows, like any chat row), so it
-/// reaches exactly the room's members. The read is bounded: per active room
-/// member, its rows of `chat:call:v1` (`chat::rows_in_room`), then this call's.
+/// reaches exactly the room's members. The read is by the CALL: the room's
+/// `community`-placed `chat:call:v1` rows (persist's `(cohort_scope,
+/// cohort_target)` index), then this call's, folding withdrawals. Never by
+/// current membership, so an attendee who left the room stays a subject.
 pub struct PersistCallRecord {
     /// The node's directory.
     pub directory: Arc<dyn ciris_persist::federation::FederationDirectory>,
@@ -488,22 +490,50 @@ impl CallRecord for PersistCallRecord {
     }
 
     async fn attendance(&self, room: &str, call: CallId) -> Result<CallAttendance, String> {
-        let members: Vec<String> = self
+        use ciris_persist::federation::attestation_query::{AttestationQuery, FOLD_PAGE};
+        use ciris_persist::federation::types::{attestation_type as ty, cohort_scope};
+        // By the CALL, never by who is in the room now: the room's
+        // federation-tier rows placed at `community` for this room under
+        // `chat:call:v1` (persist's `(cohort_scope, cohort_target)` index),
+        // then this call's. An attendee who later LEFT THE ROOM is still read.
+        let rows = self
             .directory
-            .active_community_members(room)
+            .list_targeted_by_dimension_prefix(
+                &[cohort_scope::COMMUNITY],
+                room,
+                crate::chat::CALL_DIMENSION,
+            )
             .await
-            .map_err(|e| format!("active roster of {room}: {e}"))?
+            .map_err(|e| format!("call rows of {room}: {e}"))?;
+        let call_hex = call_id_hex(call);
+        let mut of_call: Vec<ciris_persist::federation::Attestation> = rows
             .into_iter()
-            .map(|m| m.key_id)
+            .filter(|r| crate::chat::call_id_of(r) == Some(call_hex.as_str()))
             .collect();
-        let rows = crate::chat::rows_in_room(
-            self.directory.as_ref(),
-            &members,
-            room,
-            crate::chat::CALL_DIMENSION,
-        )
-        .await?;
-        Ok(attendance_of(&rows, &call_id_hex(call)))
+        // An attendee may withdraw its OWN row (CC 1c): fold each attester's
+        // withdrawals, bounded to the call's own attesters.
+        let attesters: std::collections::BTreeSet<String> =
+            of_call.iter().map(|r| r.attesting_key_id.clone()).collect();
+        let mut withdrawn = std::collections::BTreeSet::new();
+        for who in &attesters {
+            let mut pages = AttestationQuery::by(who, FOLD_PAGE)
+                .types(&[ty::WITHDRAWS, ty::RECANTS])
+                .pages();
+            while let Some(page) = pages
+                .next(self.directory.as_ref())
+                .await
+                .map_err(|e| format!("withdrawals by {who}: {e}"))?
+            {
+                withdrawn.extend(page.into_iter().filter_map(|a| {
+                    a.attestation_envelope
+                        .get(ciris_persist::federation::envelope::paths::REFERENCES_ATTESTATION_ID)
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                }));
+            }
+        }
+        of_call.retain(|r| !withdrawn.contains(&r.attestation_id));
+        Ok(attendance_of(&of_call, &call_hex))
     }
 }
 
