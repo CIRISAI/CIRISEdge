@@ -34,7 +34,6 @@ use ciris_edge::verify::RootingDirectory;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::self_at_login::SignedTransportDestination;
 use ciris_persist::federation::FederationDirectory;
-use ciris_persist::store::sqlite::SqliteBackend;
 use common::directory_with;
 use sha2::Digest as _;
 
@@ -115,7 +114,6 @@ async fn record(
 /// out), its directory, and the row it self-emitted at construction.
 struct Running {
     signer: LocalSigner,
-    dir: Arc<SqliteBackend>,
     row: SignedTransportDestination,
     _transport: Arc<ReticulumTransport>,
 }
@@ -172,7 +170,6 @@ async fn running_node(label: &str, state_dir: &Path) -> Running {
         .expect("the running node self-emitted its route");
     Running {
         signer,
-        dir,
         row,
         _transport: transport,
     }
