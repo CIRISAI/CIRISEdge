@@ -11460,7 +11460,6 @@ mod envelope_authorship_tests {
 mod builder_peer_remove_988_tests {
     use super::*;
     use crate::transport::NullTransport;
-    use base64::Engine as _;
     use ciris_crypto::ClassicalSigner as _;
 
     #[tokio::test]
