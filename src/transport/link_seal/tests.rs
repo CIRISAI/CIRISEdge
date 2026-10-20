@@ -384,3 +384,67 @@ fn the_identity_hold_is_bounded_and_replays_in_order_e1() {
     b.forget(&LINK);
     assert!(b.take_held(LINK).is_empty(), "a closed link holds nothing");
 }
+
+#[test]
+fn the_attribution_hold_keeps_order_and_refuses_at_its_budget_e1() {
+    let b = seals(0x22, DIALLED);
+    assert!(!b.any_awaiting_attribution());
+    assert!(b.hold(LINK, true, b"before-identify".to_vec()));
+    assert!(
+        !b.awaits_attribution(LINK),
+        "an identity hold is not an attribution hold"
+    );
+    assert!(b
+        .hold_for_attribution(LINK, b"one".to_vec(), SealRefusal::FirstContactOnly)
+        .is_ok());
+    assert!(b
+        .hold_for_attribution(LINK, b"two".to_vec(), SealRefusal::OpenFailed)
+        .is_ok());
+    assert!(b.awaits_attribution(LINK) && b.any_awaiting_attribution());
+    assert_eq!(b.awaiting_attribution(), vec![LINK]);
+    let now = std::time::Instant::now();
+    assert!(
+        b.attribution_expired(LINK, now).is_none(),
+        "budget left: still waiting"
+    );
+    assert_eq!(
+        b.take_held(LINK),
+        vec![
+            (true, b"before-identify".to_vec()),
+            (false, b"one".to_vec()),
+            (false, b"two".to_vec())
+        ],
+        "released oldest first"
+    );
+    assert!(!b.awaits_attribution(LINK), "released: nothing waits");
+    assert!(b
+        .hold_for_attribution(LINK, b"three".to_vec(), SealRefusal::FirstContactOnly)
+        .is_ok());
+    assert!(b
+        .hold_for_attribution(LINK, b"four".to_vec(), SealRefusal::OpenFailed)
+        .is_ok());
+    let spent = std::time::Instant::now() + ATTRIBUTION_HOLD_BUDGET;
+    assert!(
+        matches!(
+            b.attribution_expired(LINK, spent),
+            Some(SealRefusal::FirstContactOnly)
+        ),
+        "the first frame's refusal, once the budget is spent"
+    );
+    assert!(
+        b.take_held(LINK).is_empty(),
+        "an expired wait discards its frames"
+    );
+    for _ in 0..HELD_FRAMES_MAX {
+        assert!(b
+            .hold_for_attribution(LINK, b"x".to_vec(), SealRefusal::FirstContactOnly)
+            .is_ok());
+    }
+    assert!(
+        matches!(
+            b.hold_for_attribution(LINK, b"x".to_vec(), SealRefusal::OpenFailed),
+            Err(SealRefusal::FirstContactOnly)
+        ),
+        "past the bound: refused now, with the first refusal"
+    );
+}

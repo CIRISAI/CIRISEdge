@@ -77,6 +77,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ciris_crypto::transit_kex::TransitRole;
 use ciris_persist::federation::self_at_login::TransitKexPair;
@@ -120,12 +121,20 @@ pub const HELD_FRAMES_MAX: usize = 32;
 /// Most opened bytes held on one link while its identity is unproven.
 pub const HELD_BYTES_MAX: usize = 256 * 1024;
 
-/// Opened frames waiting for their link's identity: `(is_resource, plaintext)`
-/// in arrival order, and their total size.
+/// How long an ordinary frame on a peer-dialled link waits for the link's
+/// attribution before the first-contact carve-out judges the link as
+/// unattributed ([`LinkSeals::hold_for_attribution`]).
+pub const ATTRIBUTION_HOLD_BUDGET: Duration = Duration::from_secs(5);
+
+/// Opened frames waiting for their link's identity or attribution:
+/// `(is_resource, plaintext)` in arrival order, and their total size.
 #[derive(Debug, Default)]
 struct Held {
     frames: Vec<(bool, Vec<u8>)>,
     bytes: usize,
+    /// Set while the frames wait for the link's ATTRIBUTION: when the wait
+    /// began, and the refusal the carve-out gives if it runs out.
+    awaiting: Option<(Instant, SealRefusal)>,
 }
 
 /// Which of a link's carriers a frame rides. Each has its own counter and
@@ -450,7 +459,8 @@ pub struct LinkSeals {
     /// Test seam: every frame handed to leviculum on any link, as sent.
     tap: Mutex<Option<WireTap>>,
     /// Opened frames on peer-dialled links whose identity is not yet proven
-    /// ([`Self::hold`]).
+    /// ([`Self::hold`]) or whose attribution has not landed yet
+    /// ([`Self::hold_for_attribution`]).
     held: Mutex<HashMap<[u8; 16], Held>>,
 }
 
@@ -836,6 +846,90 @@ impl LinkSeals {
             .remove(&link)
             .map(|h| h.frames)
             .unwrap_or_default()
+    }
+
+    /// Hold one frame the first-contact carve-out would refuse (`refusal`)
+    /// on a peer-dialled link whose identity is proven but which no peer
+    /// binding names YET. Attribution lags the identify whenever the
+    /// dialler's binding lands after its link does (its announce is still in
+    /// the cold-start worker, or its on-link announce refreshed a binding the
+    /// identify had already missed), and an unattributed link is judged as
+    /// first contact. So the frame waits, at most [`ATTRIBUTION_HOLD_BUDGET`]
+    /// from the first such frame and within the hold's bounds, for the link to
+    /// attribute; it is replayed then ([`Self::take_held`]), or the link is
+    /// refused with the first `refusal` once the budget is spent
+    /// ([`Self::attribution_expired`]).
+    ///
+    /// # Errors
+    /// The link's first refusal (else `refusal`) when the frame does not
+    /// fit: everything held is discarded and the caller refuses the link now.
+    pub fn hold_for_attribution(
+        &self,
+        link: [u8; 16],
+        plaintext: Vec<u8>,
+        refusal: SealRefusal,
+    ) -> Result<(), SealRefusal> {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let h = held.entry(link).or_default();
+        if h.frames.len() >= HELD_FRAMES_MAX || h.bytes + plaintext.len() > HELD_BYTES_MAX {
+            let first = h.awaiting.take().map(|(_, first)| first);
+            held.remove(&link);
+            return Err(first.unwrap_or(refusal));
+        }
+        h.bytes += plaintext.len();
+        h.frames.push((false, plaintext));
+        h.awaiting.get_or_insert_with(|| (Instant::now(), refusal));
+        Ok(())
+    }
+
+    /// Whether any link's held frames wait for attribution.
+    #[must_use]
+    pub fn any_awaiting_attribution(&self) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .any(|h| h.awaiting.is_some())
+    }
+
+    /// The links whose held frames wait for attribution.
+    #[must_use]
+    pub fn awaiting_attribution(&self) -> Vec<[u8; 16]> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, h)| h.awaiting.is_some())
+            .map(|(link, _)| *link)
+            .collect()
+    }
+
+    /// Whether `link`'s held frames wait for attribution.
+    #[must_use]
+    pub fn awaits_attribution(&self, link: [u8; 16]) -> bool {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&link)
+            .is_some_and(|h| h.awaiting.is_some())
+    }
+
+    /// `link`'s carve-out refusal once its attribution wait has run past
+    /// [`ATTRIBUTION_HOLD_BUDGET`] at `now`; its held frames are discarded.
+    /// `None` while the wait has budget left, or when nothing waits.
+    pub fn attribution_expired(&self, link: [u8; 16], now: Instant) -> Option<SealRefusal> {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let since = held.get(&link)?.awaiting.as_ref()?.0;
+        if now.saturating_duration_since(since) < ATTRIBUTION_HOLD_BUDGET {
+            return None;
+        }
+        held.remove(&link)?.awaiting.map(|(_, refusal)| refusal)
     }
 
     /// Test seam: start (or stop and clear) recording every frame handed to

@@ -968,6 +968,11 @@ pub const LINK_SEAL_REFUSED_PIN: &str = "link_seal_refused_pin";
 /// `HELD_BYTES_MAX`): dropped, the link kept; the sender's retry finds the
 /// identity proven.
 pub const LINK_SEAL_DROPPED_HELD_OVERFLOW: &str = "link_seal_dropped_held_overflow";
+/// A frame the first-contact carve-out would refuse, on a peer-dialled link
+/// whose identity is proven but whose attribution has not landed yet: held
+/// (`link_seal::ATTRIBUTION_HOLD_BUDGET`) and replayed once the link
+/// attributes, or the link refused when the budget is spent.
+pub const LINK_SEAL_HELD_FOR_ATTRIBUTION: &str = "link_seal_held_for_attribution";
 /// This node tried to send on a link with no keys: refused, nothing sent.
 pub const LINK_SEAL_REFUSED_UNSEALED_SEND: &str = "link_seal_refused_unsealed_send";
 /// A sealed frame whose counter was already seen, or is older than the

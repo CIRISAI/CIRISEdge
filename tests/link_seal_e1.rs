@@ -1134,3 +1134,48 @@ async fn frames_that_beat_the_identify_are_held_and_delivered_e1() {
     assert_eq!(t.a.seal("link_seal_refused_first_contact_only"), 0);
     assert_eq!(t.a.seal("link_seal_dropped_held_overflow"), 0);
 }
+
+/// **CC 5.3.3.5 E1** — an unattributed link is not yet a first-contact link.
+/// The release CI's `reticulum_loopback` and `inbound_reap_853` caught a known
+/// peer's link judged as first contact: its identify missed (the responder
+/// held a stale binding for it), and the binding that names it landed AFTER
+/// the identify, healed in the cold-start worker from the dialler's own
+/// announce, which raises no link event. The link stayed unattributed for its
+/// lifetime and the carve-out refused its first ordinary frame. Here A holds a
+/// stale binding for B before B dials: the link attributes by the same match
+/// the identify makes, re-run once the binding lands (a frame that arrives
+/// first waits for it, `link_seal_held_for_attribution`), the frame is
+/// delivered attributed to B, and nothing is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_known_peer_whose_binding_lands_after_its_identify_is_not_first_contact_e1() {
+    let t = trio("bindlate", true, false, false).await;
+    t.a.transport
+        .inject_rooted_peer_for_test(&t.b.key.key_id, [0x5a; 16], [0u8; 32])
+        .await;
+    let row = marked(b"E1-LATE-BINDING-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B -> A on a fresh link");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "A delivered B's frame once the link attributed: {:?}",
+        t.a.metrics.link_seal()
+    );
+    {
+        let seen = t.a.seen.lock().await;
+        let f = seen
+            .iter()
+            .find(|f| f.envelope_bytes == row)
+            .expect("the row");
+        assert_eq!(
+            f.link_key_id.as_deref(),
+            Some(t.b.key.key_id.as_str()),
+            "attributed to B"
+        );
+    }
+    assert_eq!(t.a.seal("link_seal_refused_first_contact_only"), 0);
+}
