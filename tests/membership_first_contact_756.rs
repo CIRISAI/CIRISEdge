@@ -806,11 +806,19 @@ async fn a_stranger_is_invited_accepts_and_joins(scope: GroupScope, tag: u8) {
 /// I22, community: FAILS on the pre-#756 gate (B never holds the proposal).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stranger_is_invited_accepts_and_joins_over_first_contact_756() {
-    a_stranger_is_invited_accepts_and_joins(GroupScope::Community, 0x00).await;
+    Box::pin(a_stranger_is_invited_accepts_and_joins(
+        GroupScope::Community,
+        0x00,
+    ))
+    .await;
 }
 
 /// I22, family: the same ceremony at a family target.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stranger_is_invited_accepts_and_joins_a_family_over_first_contact_756() {
-    a_stranger_is_invited_accepts_and_joins(GroupScope::Family, 0x20).await;
+    Box::pin(a_stranger_is_invited_accepts_and_joins(
+        GroupScope::Family,
+        0x20,
+    ))
+    .await;
 }
