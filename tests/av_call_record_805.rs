@@ -10,7 +10,11 @@
 //!   leaver (who writes nothing) stays;
 //! - (b) two simultaneous joins: two rows, the union is right;
 //! - (c) an outsider to the room is never a recipient of a call row, a member
-//!   is (persist's `may_receive`), and the share routes to the room's members.
+//!   is (persist's `may_receive`), and the share routes to the room's members;
+//! - (d) the row is the ACTOR's own: a row whose attester or subjects are not
+//!   the actor is `CallError::ActorIsNotTheSubject` (what `Edge::join_call_as`
+//!   asserts before a call starts, and the door before it writes);
+//! - (e) a member removed from the room after joining stays an attendee.
 //!
 //! Requires `transport-reticulum` (the call module is Reticulum-gated):
 //! `cargo test --features "transport-http transport-reticulum" --test av_call_record_805`
@@ -22,7 +26,8 @@ use std::sync::Arc;
 use ciris_edge::chat;
 use ciris_edge::identity::LocalSigner;
 use ciris_edge::transport::av_call::{
-    attendance_of, call_id_for_room, call_id_hex, CallRecord, PersistCallRecord,
+    attendance_of, call_id_for_room, call_id_hex, ensure_actor_is_subject, CallError, CallRecord,
+    PersistCallRecord,
 };
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::{FederationDirectory, SignedKeyRecord};
@@ -508,4 +513,40 @@ async fn an_attendee_removed_from_the_room_stays_an_attendee() {
             m.human.key_id
         );
     }
+}
+
+/// **(d)** The call row is the actor's OWN: its attester and its only subject.
+/// `ensure_actor_is_subject` is the guard `Edge::join_call_as` runs before a
+/// call starts and `PersistCallRecord::record_join` runs before it writes;
+/// each mismatch is refused by name.
+#[tokio::test]
+async fn a_call_row_that_is_not_the_actors_own_is_refused_by_name() {
+    let r = room().await;
+    let call = call_id_hex(call_id_for_room(&r.room));
+    let row = chat::call_attestation_in(&r.alice.human, &r.room, &call, ts())
+        .await
+        .expect("alice's row");
+    ensure_actor_is_subject("alice-fed", &row).expect("alice's row is alice's own");
+
+    // Another actor attending on alice's row.
+    let err = ensure_actor_is_subject("bob-fed", &row).expect_err("bob is not its subject");
+    assert!(
+        matches!(&err, CallError::ActorIsNotTheSubject { actor, attester, subjects }
+            if actor == "bob-fed" && attester == "alice-fed" && subjects == &vec!["alice-fed".to_owned()]),
+        "{err:?}"
+    );
+    // A row naming a second subject is no longer one attendee's row.
+    let mut widened = row.clone();
+    widened.subject_key_ids.push("bob-fed".to_owned());
+    assert!(matches!(
+        ensure_actor_is_subject("alice-fed", &widened),
+        Err(CallError::ActorIsNotTheSubject { .. })
+    ));
+    // A row whose subject is the actor but whose attester is the NODE.
+    let mut node_attested = row.clone();
+    node_attested.attesting_key_id = "alice-node".to_owned();
+    assert!(matches!(
+        ensure_actor_is_subject("alice-fed", &node_attested),
+        Err(CallError::ActorIsNotTheSubject { .. })
+    ));
 }

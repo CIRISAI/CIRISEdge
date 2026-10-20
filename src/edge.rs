@@ -4267,9 +4267,23 @@ impl Edge {
                 as Arc<dyn crate::transport::av_keep::StreamDekRegistrar>
         });
         let own = transport.occurrence_key_id().to_owned();
+        let actor = actor.unwrap_or_else(|| Arc::clone(&self.signer));
+        // Item 6 — the row this join writes is the ACTOR's own (attester =
+        // only subject): refused by name before the call starts.
+        let probe = crate::chat::call_attestation_in(
+            &actor,
+            room,
+            &crate::transport::av_call::call_id_hex(crate::transport::av_call::call_id_for_room(
+                room,
+            )),
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(CallError::Plumbing)?;
+        crate::transport::av_call::ensure_actor_is_subject(&actor.key_id, &probe)?;
         let record = Arc::new(crate::transport::av_call::PersistCallRecord {
             directory: Arc::clone(&directory),
-            actor: actor.unwrap_or_else(|| Arc::clone(&self.signer)),
+            actor,
             node: Arc::clone(&self.signer),
         }) as Arc<dyn crate::transport::av_call::CallRecord>;
         Call::join(

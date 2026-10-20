@@ -349,9 +349,46 @@ pub enum CallError {
     /// The call ended.
     #[error("the call ended ({0:?})")]
     CallEnded(EndCause),
+    /// The attendee's call row would not name the actor as its attester and
+    /// ONLY subject (item 6: one row per attendee, attester = subject). The
+    /// join is refused before anything starts; no row is written.
+    #[error(
+        "the call row is not the actor's own: actor {actor}, attester {attester}, subjects \
+         {subjects:?} (CIRISEdge#805 item 6)"
+    )]
+    ActorIsNotTheSubject {
+        /// The key the call attends as.
+        actor: String,
+        /// The row's attester.
+        attester: String,
+        /// The row's subjects.
+        subjects: Vec<String>,
+    },
     /// The transport, the addressing plane or the media runtime refused.
     #[error("call plumbing: {0}")]
     Plumbing(String),
+}
+
+/// Item 6 — a call row is its attendee's own: `actor` is its attester and its
+/// ONLY subject. Anything else is [`CallError::ActorIsNotTheSubject`].
+///
+/// # Errors
+/// [`CallError::ActorIsNotTheSubject`].
+pub fn ensure_actor_is_subject(
+    actor: &str,
+    row: &ciris_persist::federation::Attestation,
+) -> Result<(), CallError> {
+    if row.attesting_key_id == actor
+        && row.subject_key_ids.len() == 1
+        && row.subject_key_ids[0] == actor
+    {
+        return Ok(());
+    }
+    Err(CallError::ActorIsNotTheSubject {
+        actor: actor.to_owned(),
+        attester: row.attesting_key_id.clone(),
+        subjects: row.subject_key_ids.clone(),
+    })
 }
 
 /// What a call did, returned by [`Call::leave`].
@@ -468,6 +505,7 @@ impl CallRecord for PersistCallRecord {
         use crate::replication::attestation_bind::{share, CrossingBasis, Signers, With};
         let row =
             crate::chat::call_attestation_in(&self.actor, room, &call_id_hex(call), at).await?;
+        ensure_actor_is_subject(&self.actor.key_id, &row).map_err(|e| e.to_string())?;
         self.directory
             .put_attestation(ciris_persist::federation::SignedAttestation {
                 attestation: row.clone(),
