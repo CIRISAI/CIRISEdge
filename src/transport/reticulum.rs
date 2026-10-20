@@ -5367,10 +5367,12 @@ impl ReticulumTransport {
             .await
             .get(peer_key_id)
             .map(|rp| rp.transport_pubkey64);
-        let other_keys: Vec<&[u8]> = transport_keys
-            .as_ref()
-            .map(|k| vec![&k[0..32], &k[32..64]])
-            .unwrap_or_default();
+        let other_keys = ciris_persist::federation::self_at_login::TransitKexOtherKeys {
+            transport_identity: transport_keys
+                .map(|k| vec![k[0..32].to_vec(), k[32..64].to_vec()])
+                .unwrap_or_default(),
+            ..Default::default()
+        };
         let pair = pin
             .pair_for(peer_key_id, &other_keys)
             .map_err(|r| refused(&r))?;

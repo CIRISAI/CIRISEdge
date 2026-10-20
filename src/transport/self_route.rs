@@ -578,30 +578,20 @@ pub async fn sign_route_offline(
         .public_key()
         .await
         .map_err(|e| OfflineEmitError::Sign(format!("federation ML-DSA-65 pubkey: {e}")))?;
-    // TODO(persist v59): replace with
-    // `ciris_persist::federation::self_at_login::check_transit_kex_pair(transit, &other_keys)`
-    // (CC 3.3.6.2 in-row key separation) once the #1106 head lands, passing
-    // persist's other_keys groups:
-    //   (a) the node's federation signing keys: Ed25519 + ML-DSA-65  [passed below]
-    //   (b) its transport identity, RNS x25519 + Ed25519 halves        [passed below]
-    //   (c) its occurrence's encryption_pubkeys (x25519, ML-KEM-768)    [NOT in edge's
-    //       custody: the occurrence row is persist's; add when the emitter reads it]
-    let others: [&[u8]; 4] = [
-        &federation_ed25519,
-        &federation_ml_dsa_65,
-        &transport_pubkey[0..32],
-        &transport_pubkey[32..64],
-    ];
-    if others.contains(&transit.x25519.as_slice()) {
-        return Err(OfflineEmitError::KeySeparation(
-            "the transit x25519 key is one of the node's transport or federation keys",
-        ));
-    }
-    if others.contains(&&transit.ml_kem_768[..]) {
-        return Err(OfflineEmitError::KeySeparation(
-            "the transit ML-KEM-768 key is one of the node's transport or federation keys",
-        ));
-    }
+    // CC 3.3.6.2 in-row key separation, persist's rule (CIRISPersist#1106):
+    // (a) the node's federation signing keys and (b) its transport identity.
+    // (c) the occurrence's encryption_pubkeys are persist's occurrence row, not
+    // edge's custody; (d) does not apply to the node's own row.
+    let other_keys = ciris_persist::federation::self_at_login::TransitKexOtherKeys {
+        federation_signing: vec![federation_ed25519, federation_ml_dsa_65],
+        transport_identity: vec![
+            transport_pubkey[0..32].to_vec(),
+            transport_pubkey[32..64].to_vec(),
+        ],
+        ..Default::default()
+    };
+    ciris_persist::federation::self_at_login::check_transit_kex_pair(transit, &other_keys)
+        .map_err(|r| OfflineEmitError::KeySeparation(r.as_str()))?;
     let asserted_at =
         ciris_persist::federation::admission::truncate_to_substrate_resolution(asserted_at);
     build_and_sign_self_route(

@@ -5,8 +5,9 @@
 //! - the offline row equals the row the running node self-emits, except for
 //!   `asserted_at` and `last_seen_at` (and is byte-equal when `asserted_at`
 //!   is pinned to the live row's);
-//! - the offline row, seeded into a fresh directory, resolves the node's
-//!   transit pair as Rooted;
+//! - (the offline row resolving a Rooted pair once a v4 genesis bundle pins
+//!   it lives in `sealed_cut_bundle_e1`, which arms the test anchor in its
+//!   own process);
 //! - a node with no transit pair gets no row: a named error and a non-zero
 //!   exit.
 //!
@@ -288,55 +289,6 @@ async fn an_offline_emitted_row_equals_the_runtime_self_emitted_row_e1() {
                 .expect("jcs"),
         );
     }
-}
-
-/// **CC 5.3.4** — the offline row, seeded into a directory that holds only the
-/// node's key, resolves the node's transit pair as ROOTED
-/// (`transit_kex_pair_for`). Seeded today through persist's authenticated
-/// `put_signed_transport_destination`; when persist v59 lands, switch this to
-/// the genesis bundle's `serve_transport_destinations` seeding.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_offline_emitted_row_resolves_a_rooted_transit_pair_when_seeded_e1() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let label = "offline-emit-rooted";
-    let live = running_node(label, tmp.path()).await;
-    let material = offline_route_material(&tmp.path().join("transport.id")).expect("custody");
-    let offline = sign_route_offline(
-        &live.signer,
-        material.named_dest_hash,
-        &material.transport_pubkey,
-        material.transit.as_ref(),
-        0,
-        chrono::Utc::now(),
-    )
-    .await
-    .expect("offline row");
-    // A fresh directory: the node's key, and nothing else about it.
-    let (_, ed_pub, pqc_and_id) = node_signer(label).await;
-    let pqc_b64 = pqc_and_id.split('|').next().expect("pqc").to_owned();
-    let fresh = directory_with(vec![record(&live.signer, &ed_pub, &pqc_b64).await]).await;
-    assert!(
-        ciris_persist::federation::self_at_login::transit_kex_pair_for(
-            &*fresh,
-            &live.signer.key_id
-        )
-        .await
-        .expect("directory")
-        .is_none(),
-        "precondition: no pair before the seed"
-    );
-    FederationDirectory::put_signed_transport_destination(&*fresh, &offline)
-        .await
-        .expect("the offline row admits");
-    let pair = ciris_persist::federation::self_at_login::transit_kex_pair_for(
-        &*fresh,
-        &live.signer.key_id,
-    )
-    .await
-    .expect("directory")
-    .expect("Rooted pair resolves from the seeded row");
-    assert_eq!(Some(pair), material.transit, "the node's own custody pair");
-    let _ = &live.dir;
 }
 
 /// **CC 5.3.4** — a node with no transit pair gets NO row: the producer refuses
