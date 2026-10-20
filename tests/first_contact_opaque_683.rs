@@ -216,7 +216,8 @@ fn answer_joins(edge: &Edge, introduce: Vec<SignedKeyRecord>) -> Seen {
             status: 200,
             payload: b"welcome".to_vec(),
         });
-        answer.introductions.keys.clone_from(&introduce);
+        // persist v59 — introduced keys travel as their key:record:v1 rows.
+        answer.introductions.key_rows = introduce.iter().map(|k| row_of(&k.record)).collect();
         answer
     });
     seen
@@ -355,7 +356,14 @@ async fn an_unknown_key_without_a_record_is_dropped_as_before_683() {
 struct CarriedReq {
     kind: u32,
     payload: Vec<u8>,
-    key_record: SignedKeyRecord,
+    /// persist v59 — the sender's key travels as its `key:record:v1` row.
+    key_record_row: ciris_persist::federation::Attestation,
+}
+
+/// persist v59 — `record` as the `key:record:v1` row a v59 sender carries.
+fn row_of(record: &KeyRecord) -> ciris_persist::federation::Attestation {
+    ciris_persist::federation::key_plane::plan_key_record_row(record, &None)
+        .expect("key:record:v1 row")
 }
 
 impl Message for CarriedReq {
@@ -364,7 +372,7 @@ impl Message for CarriedReq {
     type Response = OpaqueResponse;
 }
 
-async fn carry(p: &Pair, record: KeyRecord) -> Sent {
+async fn carry(p: &Pair, row: ciris_persist::federation::Attestation) -> Sent {
     let (edge_b, a_id) = (Arc::clone(&p.edge_b), p.a.key_id.clone());
     tokio::spawn(async move {
         let _ = edge_b
@@ -373,7 +381,7 @@ async fn carry(p: &Pair, record: KeyRecord) -> Sent {
                 CarriedReq {
                     kind: JOIN,
                     payload: b"join".to_vec(),
-                    key_record: SignedKeyRecord { record },
+                    key_record_row: row,
                 },
             )
             .await;
@@ -381,12 +389,31 @@ async fn carry(p: &Pair, record: KeyRecord) -> Sent {
     wait_sent(&p.t_b).await
 }
 
-fn forged(mut record: KeyRecord) -> KeyRecord {
-    // Same key, same pubkeys, a signature over nothing it names.
-    let mut sig = record.scrub_signature_classical.into_bytes();
-    sig[4] = if sig[4] == b'A' { b'B' } else { b'A' };
-    record.scrub_signature_classical = String::from_utf8(sig).unwrap();
-    record
+/// The sender's own valid row with the record's self-signature corrupted
+/// inside it: same key, same pubkeys, a signature over nothing it names.
+fn forged(record: &KeyRecord) -> ciris_persist::federation::Attestation {
+    fn flip(v: &mut serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(o) => {
+                if let Some(serde_json::Value::String(sig)) = o.get_mut("scrub_signature_classical")
+                {
+                    let mut b = std::mem::take(sig).into_bytes();
+                    b[4] = if b[4] == b'A' { b'B' } else { b'A' };
+                    *sig = String::from_utf8(b).unwrap();
+                    return true;
+                }
+                o.values_mut().any(flip)
+            }
+            serde_json::Value::Array(a) => a.iter_mut().any(flip),
+            _ => false,
+        }
+    }
+    let mut row = row_of(record);
+    assert!(
+        flip(&mut row.attestation_envelope),
+        "the row carries the record"
+    );
+    row
 }
 
 /// I15 — a record that fails proof of possession is refused by name and
@@ -395,7 +422,7 @@ fn forged(mut record: KeyRecord) -> KeyRecord {
 async fn a_forged_record_is_refused_and_nothing_is_admitted_683() {
     let p = pair(true).await;
     let seen = answer_joins(&p.edge_a, Vec::new());
-    let request = carry(&p, forged(p.b.record.clone())).await;
+    let request = carry(&p, forged(&p.b.record)).await;
     p.edge_a
         .dispatch_inbound_for_test(frame(request.bytes, Some(ReplyPath::new(TID, LINK))))
         .await;
@@ -415,7 +442,7 @@ async fn a_record_naming_another_key_is_refused_683() {
     let p = pair(true).await;
     let seen = answer_joins(&p.edge_a, Vec::new());
     let other = mint("someone-else", 0x3c).await;
-    let request = carry(&p, other.record.clone()).await;
+    let request = carry(&p, row_of(&other.record)).await;
     p.edge_a
         .dispatch_inbound_for_test(frame(request.bytes, Some(ReplyPath::new(TID, LINK))))
         .await;
@@ -441,7 +468,7 @@ async fn the_first_contact_budget_trips_by_name_683() {
     let p = pair(true).await;
     let _seen = answer_joins(&p.edge_a, Vec::new());
     for _ in 0..4 {
-        let request = carry(&p, forged(p.b.record.clone())).await;
+        let request = carry(&p, forged(&p.b.record)).await;
         p.edge_a
             .dispatch_inbound_for_test(frame(request.bytes, Some(ReplyPath::new(TID, LINK))))
             .await;
@@ -596,9 +623,7 @@ async fn a_forged_answer_built_from_public_material_introduces_nothing_683() {
         &CarriedReq {
             kind: JOIN,
             payload: b"join".to_vec(),
-            key_record: SignedKeyRecord {
-                record: p.b.record.clone(),
-            },
+            key_record_row: row_of(&p.b.record),
         },
         None,
     )
@@ -613,7 +638,7 @@ async fn a_forged_answer_built_from_public_material_introduces_nothing_683() {
         status: 200,
         payload: b"welcome".to_vec(),
     });
-    answer.introductions.keys = vec![SignedKeyRecord { record: forged }];
+    answer.introductions.key_rows = vec![row_of(&forged)];
     let body = serde_json::json!({
         "kind": JOIN,
         "status": 200,
