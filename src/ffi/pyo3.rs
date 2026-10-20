@@ -524,6 +524,46 @@ impl PyEdge {
             .map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    /// CIRISEdge#805 items 5–6, A11 — **join `room`'s call**
+    /// (`Edge::join_call`, `FSD/AV_CALL_API.md` §4): start this node's stream;
+    /// an in-room call needs no ring. The call row (`chat:call:v1`) is the
+    /// edge signer's own. `keep` is `"unkept"` (default) or `"kept"` (refused
+    /// today as the `KeepRefused` event; the call goes on unkept). Returns a
+    /// `Call`.
+    ///
+    /// Raises `ValueError` on a bad argument or a join refused by the room
+    /// (`not_a_room_member`, `consent_missing`, `actor_is_not_the_subject`),
+    /// `RuntimeError` on plumbing (no Reticulum transport, no room groups...).
+    /// Every message starts with the refusal's token.
+    #[cfg(feature = "_reticulum-module")]
+    #[pyo3(signature = (room, keep="unkept", relay=false))]
+    fn join_call(&self, py: Python<'_>, room: &str, keep: &str, relay: bool) -> PyResult<PyCall> {
+        let room = call_room_arg(room)?;
+        let keep = call_keep_arg(keep)?;
+        let opts = crate::transport::av_call::CallOptions {
+            keep,
+            relay,
+            ..crate::transport::av_call::CallOptions::default()
+        };
+        let edge = Arc::clone(&self.inner);
+        let joined = py.detach(|| {
+            run_async(
+                &self.executor,
+                async move { edge.join_call(&room, opts).await },
+            )
+        });
+        let mut call = joined.map_err(|e| call_err_to_py(&e))?;
+        Ok(PyCall {
+            id_hex: crate::transport::av_call::call_id_hex(call.id()),
+            room: call.room().to_owned(),
+            stream_id: call.stream().0,
+            frames: Arc::new(Mutex::new(call.frames())),
+            events: Arc::new(Mutex::new(call.events())),
+            call: Arc::new(Mutex::new(Some(call))),
+            executor: Arc::clone(&self.executor),
+        })
+    }
+
     /// v2.4.0 (CIRISEdge#103) — graceful close. Idempotent; safe to
     /// call from `__del__`, `atexit` hooks, FastAPI shutdown handlers,
     /// `try/finally` blocks, etc.
@@ -3819,6 +3859,456 @@ impl PyNetworkEventSubscription {
                         "network event subscription lagged by {n} events"
                     )))
                 }
+            }
+        })
+    }
+}
+
+// ─── PyCall (CIRISEdge#805 items 5–6, A11) ─────────────────────────
+
+/// A call's room argument: non-empty, no NUL, bounded.
+#[cfg(feature = "_reticulum-module")]
+fn call_room_arg(room: &str) -> PyResult<String> {
+    const ROOM_MAX: usize = 512;
+    if room.is_empty() || room.len() > ROOM_MAX || room.contains('\0') {
+        return Err(PyValueError::new_err(format!(
+            "invalid_room: a room is a community key id of 1..={ROOM_MAX} bytes with no NUL \
+             (got {} bytes)",
+            room.len()
+        )));
+    }
+    Ok(room.to_owned())
+}
+
+/// A call's `keep` argument: `"unkept"` or `"kept"`.
+#[cfg(feature = "_reticulum-module")]
+fn call_keep_arg(keep: &str) -> PyResult<crate::transport::av_keep::AvKeep> {
+    use crate::transport::av_keep::AvKeep;
+    match keep {
+        "unkept" => Ok(AvKeep::Unkept),
+        "kept" => Ok(AvKeep::Kept),
+        other => Err(PyValueError::new_err(format!(
+            "invalid_keep: keep is \"unkept\" or \"kept\", not {other:?}"
+        ))),
+    }
+}
+
+/// The token a [`CallError`](crate::transport::av_call::CallError) is named
+/// by on the Python surface: the message starts with it.
+#[cfg(feature = "_reticulum-module")]
+fn call_err_token(e: &crate::transport::av_call::CallError) -> &'static str {
+    use crate::transport::av_call::CallError as E;
+    match e {
+        E::NotARoomMember { .. } => "not_a_room_member",
+        E::ConsentMissing { .. } => "consent_missing",
+        E::RoomGroupUnavailable { .. } => "room_group_unavailable",
+        E::FrameTooLarge { .. } => "frame_too_large",
+        E::NoBudget => "no_budget",
+        E::Stranded { .. } => "stranded",
+        E::CallEnded(_) => "call_ended",
+        E::ActorIsNotTheSubject { .. } => "actor_is_not_the_subject",
+        E::Plumbing(_) => "plumbing",
+    }
+}
+
+/// A refusal the caller can act on is a `ValueError`; the rest are
+/// `RuntimeError`. Both start with [`call_err_token`].
+#[cfg(feature = "_reticulum-module")]
+fn call_err_to_py(e: &crate::transport::av_call::CallError) -> PyErr {
+    use crate::transport::av_call::CallError as E;
+    let msg = format!("{}: {e}", call_err_token(e));
+    match e {
+        E::NotARoomMember { .. }
+        | E::ConsentMissing { .. }
+        | E::FrameTooLarge { .. }
+        | E::ActorIsNotTheSubject { .. } => PyValueError::new_err(msg),
+        _ => PyRuntimeError::new_err(msg),
+    }
+}
+
+/// A [`CallEvent`](crate::transport::av_call::CallEvent) as a Python dict:
+/// `{"kind": <token>, ...the variant's fields}`.
+#[cfg(feature = "_reticulum-module")]
+fn call_event_to_pydict<'py>(
+    py: Python<'py>,
+    ev: &crate::transport::av_call::CallEvent,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    use crate::transport::av_call::CallEvent as V;
+    let d = pyo3::types::PyDict::new(py);
+    match ev {
+        V::KeepRefused { epoch, reason } => {
+            d.set_item("kind", "keep_refused")?;
+            d.set_item("epoch", *epoch)?;
+            d.set_item("reason", *reason)?;
+        }
+        V::EpochRolled { from, to } => {
+            d.set_item("kind", "epoch_rolled")?;
+            d.set_item("from", *from)?;
+            d.set_item("to", *to)?;
+        }
+        V::MemberJoined { key_id } => {
+            d.set_item("kind", "member_joined")?;
+            d.set_item("key_id", key_id)?;
+        }
+        V::MemberLeft { key_id } => {
+            d.set_item("kind", "member_left")?;
+            d.set_item("key_id", key_id)?;
+        }
+        V::Stranded { epoch, reason } => {
+            d.set_item("kind", "stranded")?;
+            d.set_item("epoch", *epoch)?;
+            d.set_item("reason", reason)?;
+        }
+        V::AttendeeJoined { key_id } => {
+            d.set_item("kind", "attendee_joined")?;
+            d.set_item("key_id", key_id)?;
+        }
+        V::RecordRefused { reason } => {
+            d.set_item("kind", "record_refused")?;
+            d.set_item("reason", reason)?;
+        }
+    }
+    Ok(d)
+}
+
+/// A [`ReceivedFrame`](crate::transport::av_call::ReceivedFrame) as a Python
+/// dict.
+#[cfg(feature = "_reticulum-module")]
+fn call_frame_to_pydict<'py>(
+    py: Python<'py>,
+    f: &crate::transport::av_call::ReceivedFrame,
+) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("publisher", &f.publisher)?;
+    d.set_item("stream_id", pyo3::types::PyBytes::new(py, &f.stream.0))?;
+    d.set_item("epoch", f.epoch.0)?;
+    d.set_item("chunk_seq", f.chunk_seq.0)?;
+    d.set_item("codec_id", f.codec_id)?;
+    d.set_item(
+        "layer",
+        (f.layer.spatial, f.layer.temporal, f.layer.quality),
+    )?;
+    d.set_item("bytes", pyo3::types::PyBytes::new(py, &f.bytes))?;
+    Ok(d)
+}
+
+/// The token of a [`CallState`](crate::transport::av_call::CallState).
+#[cfg(feature = "_reticulum-module")]
+fn call_state_token(s: &crate::transport::av_call::CallState) -> String {
+    use crate::transport::av_call::{CallState, EndCause};
+    match s {
+        CallState::Live => "live".to_owned(),
+        CallState::Degraded { epoch, .. } => format!("degraded:{epoch}"),
+        CallState::Ended(EndCause::HungUp) => "ended:hung_up".to_owned(),
+        CallState::Ended(EndCause::Revoked) => "ended:revoked".to_owned(),
+        CallState::Ended(EndCause::Expired) => "ended:expired".to_owned(),
+    }
+}
+
+/// CIRISEdge#805 A11 — the Python twin of
+/// [`Call`](crate::transport::av_call::Call), returned by
+/// `Edge.join_call`. Every Rust verb has a method here
+/// ([`PY_CALL_VERBS`]); after `leave()` every verb raises `call_ended`.
+#[cfg(feature = "_reticulum-module")]
+#[pyclass(name = "Call", module = "ciris_edge")]
+pub struct PyCall {
+    id_hex: String,
+    room: String,
+    stream_id: [u8; 32],
+    call: Arc<Mutex<Option<crate::transport::av_call::Call>>>,
+    frames:
+        Arc<Mutex<Option<tokio::sync::mpsc::Receiver<crate::transport::av_call::ReceivedFrame>>>>,
+    events: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<crate::transport::av_call::CallEvent>>>>,
+    executor: Arc<ciris_persist::ffi::executor_capsule::AsyncExecutor>,
+}
+
+/// A11's verb list: every `Call` verb and its Python twin's name. The parity
+/// test walks it against the class.
+#[cfg(feature = "_reticulum-module")]
+pub const PY_CALL_VERBS: &[&str] = &[
+    "id",
+    "room",
+    "stream_id",
+    "epoch",
+    "chunk_plaintext_budget",
+    "legs",
+    "publish",
+    "frames",
+    "events",
+    "set_layer_policy",
+    "attendees",
+    "attendance",
+    "state",
+    "leave",
+];
+
+#[cfg(feature = "_reticulum-module")]
+impl PyCall {
+    /// Run `f` over the live call on the edge executor; `call_ended` once it
+    /// left.
+    fn with_call<T, F>(&self, py: Python<'_>, f: F) -> PyResult<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(
+                &'a mut crate::transport::av_call::Call,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<T, crate::transport::av_call::CallError>,
+                        > + Send
+                        + 'a,
+                >,
+            > + Send
+            + 'static,
+    {
+        let call = Arc::clone(&self.call);
+        py.detach(|| {
+            run_async(&self.executor, async move {
+                let mut guard = call.lock().await;
+                let Some(c) = guard.as_mut() else {
+                    return Err(crate::transport::av_call::CallError::CallEnded(
+                        crate::transport::av_call::EndCause::HungUp,
+                    ));
+                };
+                f(c).await
+            })
+        })
+        .map_err(|e| call_err_to_py(&e))
+    }
+}
+
+#[cfg(feature = "_reticulum-module")]
+#[pymethods]
+impl PyCall {
+    /// The call's handle (lowercase hex; it names the room, never key input).
+    fn id(&self) -> String {
+        self.id_hex.clone()
+    }
+
+    /// The room.
+    fn room(&self) -> String {
+        self.room.clone()
+    }
+
+    /// This node's stream id (32 bytes).
+    fn stream_id(&self) -> [u8; 32] {
+        self.stream_id
+    }
+
+    /// The call's epoch (the room's MLS epoch).
+    fn epoch(&self, py: Python<'_>) -> PyResult<u64> {
+        self.with_call(py, |c| Box::pin(async move { Ok(c.epoch().await.0) }))
+    }
+
+    /// The largest frame plaintext every member leg carries, or `None`
+    /// before any leg is up.
+    fn chunk_plaintext_budget(&self, py: Python<'_>) -> PyResult<Option<usize>> {
+        self.with_call(py, |c| {
+            Box::pin(async move { Ok(c.chunk_plaintext_budget()) })
+        })
+    }
+
+    /// The members this node has a leg to, sorted.
+    fn legs(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        self.with_call(py, |c| Box::pin(async move { Ok(c.legs()) }))
+    }
+
+    /// Seal once and fan out. Returns `{"epoch", "chunk_seq", "delivered",
+    /// "legs": [(member, outcome), ...]}`. A frame over the budget raises
+    /// `frame_too_large` (`ValueError`) before anything is sealed.
+    #[pyo3(signature = (frame, codec_id=PY_CODEC_OPAQUE, layer=(0, 0, 0)))]
+    fn publish(
+        &self,
+        py: Python<'_>,
+        frame: Vec<u8>,
+        codec_id: u8,
+        layer: (u8, u8, u8),
+    ) -> PyResult<Py<PyAny>> {
+        let frame = crate::transport::av_call::Frame {
+            codec_id,
+            layer: chunk_layer_from_tuple(layer),
+            bytes: frame,
+        };
+        let report =
+            self.with_call(py, move |c| Box::pin(async move { c.publish(frame).await }))?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("epoch", report.epoch.0)?;
+        d.set_item("chunk_seq", report.chunk_seq.0)?;
+        d.set_item("delivered", report.delivered())?;
+        let legs: Vec<(String, String)> = report
+            .legs
+            .iter()
+            .map(|(m, o)| (m.clone(), format!("{o:?}")))
+            .collect();
+        d.set_item("legs", legs)?;
+        Ok(d.unbind().into_any())
+    }
+
+    /// The other publishers' frames, in chunk order per stream: an async
+    /// iterator of dicts. Taken once.
+    fn frames(&self, py: Python<'_>) -> PyResult<PyCallFrames> {
+        let holder = Arc::clone(&self.frames);
+        let rx = py.detach(|| run_async(&self.executor, async move { holder.lock().await.take() }));
+        rx.map(|rx| PyCallFrames {
+            rx: Arc::new(Mutex::new(Some(rx))),
+        })
+        .ok_or_else(|| PyRuntimeError::new_err("frames_taken: this call's frames were taken"))
+    }
+
+    /// The call's typed events (`{"kind": ..., ...}`): an async iterator.
+    /// Taken once.
+    fn events(&self, py: Python<'_>) -> PyResult<PyCallEvents> {
+        let holder = Arc::clone(&self.events);
+        let rx = py.detach(|| run_async(&self.executor, async move { holder.lock().await.take() }));
+        rx.map(|rx| PyCallEvents {
+            rx: Arc::new(Mutex::new(Some(rx))),
+        })
+        .ok_or_else(|| PyRuntimeError::new_err("events_taken: this call's events were taken"))
+    }
+
+    /// Cap what `subscriber`'s leg carries at `(max_spatial, max_temporal,
+    /// max_quality)`.
+    fn set_layer_policy(
+        &self,
+        py: Python<'_>,
+        subscriber: &str,
+        policy: (u8, u8, u8),
+    ) -> PyResult<()> {
+        if subscriber.is_empty() || subscriber.contains('\0') {
+            return Err(PyValueError::new_err(
+                "invalid_subscriber: a subscriber is a non-empty key id with no NUL",
+            ));
+        }
+        let subscriber = subscriber.to_owned();
+        let policy = receiver_policy_from_tuple(policy);
+        self.with_call(py, move |c| {
+            Box::pin(async move { c.set_layer_policy(&subscriber, policy).await })
+        })
+    }
+
+    /// Every key that attended, by the call's rows (a leaver stays).
+    fn attendees(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        self.with_call(py, |c| Box::pin(async move { Ok(c.attendees().await) }))
+    }
+
+    /// `{"attendees": [...], "started_at": rfc3339 | None, "rows": int}`.
+    fn attendance(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let a = self.with_call(py, |c| Box::pin(async move { Ok(c.attendance().await) }))?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("attendees", a.attendees)?;
+        d.set_item("started_at", a.started_at.map(|t| t.to_rfc3339()))?;
+        d.set_item("rows", a.rows)?;
+        Ok(d.unbind().into_any())
+    }
+
+    /// `"live"`, `"degraded:<epoch>"` or `"ended:<cause>"`.
+    fn state(&self, py: Python<'_>) -> PyResult<String> {
+        let call = Arc::clone(&self.call);
+        Ok(py.detach(|| {
+            run_async(&self.executor, async move {
+                call.lock().await.as_ref().map_or_else(
+                    || "ended:hung_up".to_owned(),
+                    |c| call_state_token(&c.state()),
+                )
+            })
+        }))
+    }
+
+    /// Hang up (an in-room hang-up writes nothing). Returns the summary
+    /// dict; a second `leave()` raises `call_ended`.
+    fn leave(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let call = Arc::clone(&self.call);
+        let left = py.detach(|| {
+            run_async(&self.executor, async move {
+                let Some(c) = call.lock().await.take() else {
+                    return Err(crate::transport::av_call::CallError::CallEnded(
+                        crate::transport::av_call::EndCause::HungUp,
+                    ));
+                };
+                c.leave().await
+            })
+        });
+        let s = left.map_err(|e| call_err_to_py(&e))?;
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("id", crate::transport::av_call::call_id_hex(s.id))?;
+        d.set_item("stream_id", pyo3::types::PyBytes::new(py, &s.stream.0))?;
+        d.set_item("epochs", s.epochs)?;
+        d.set_item("frames_published", s.frames_published)?;
+        d.set_item("frames_received", s.frames_received)?;
+        d.set_item("frames_skipped", s.frames_skipped)?;
+        d.set_item("duplicates", s.duplicates)?;
+        Ok(d.unbind().into_any())
+    }
+}
+
+/// A call's frames as a Python async iterator (`Call.frames()`).
+#[cfg(feature = "_reticulum-module")]
+#[pyclass(name = "CallFrames", module = "ciris_edge")]
+pub struct PyCallFrames {
+    rx: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<crate::transport::av_call::ReceivedFrame>>>>,
+}
+
+#[cfg(feature = "_reticulum-module")]
+#[pymethods]
+impl PyCallFrames {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// The next frame as a dict (`publisher`, `stream_id`, `epoch`,
+    /// `chunk_seq`, `codec_id`, `layer`, `bytes`); `StopAsyncIteration` once
+    /// the call ended.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx_holder = self.rx.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let next = {
+                let mut guard = rx_holder.lock().await;
+                let Some(rx) = guard.as_mut() else {
+                    return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+                };
+                rx.recv().await
+            };
+            match next {
+                Some(f) => {
+                    Python::attach(|py| Ok(call_frame_to_pydict(py, &f)?.unbind().into_any()))
+                }
+                None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
+            }
+        })
+    }
+}
+
+/// A call's typed events as a Python async iterator (`Call.events()`).
+#[cfg(feature = "_reticulum-module")]
+#[pyclass(name = "CallEvents", module = "ciris_edge")]
+pub struct PyCallEvents {
+    rx: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<crate::transport::av_call::CallEvent>>>>,
+}
+
+#[cfg(feature = "_reticulum-module")]
+#[pymethods]
+impl PyCallEvents {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// The next event as a dict (`{"kind": ..., ...}`, see
+    /// [`call_event_to_pydict`]); `StopAsyncIteration` once the call ended.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx_holder = self.rx.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let next = {
+                let mut guard = rx_holder.lock().await;
+                let Some(rx) = guard.as_mut() else {
+                    return Err(pyo3::exceptions::PyStopAsyncIteration::new_err(()));
+                };
+                rx.recv().await
+            };
+            match next {
+                Some(ev) => {
+                    Python::attach(|py| Ok(call_event_to_pydict(py, &ev)?.unbind().into_any()))
+                }
+                None => Err(pyo3::exceptions::PyStopAsyncIteration::new_err(())),
             }
         })
     }
@@ -9948,6 +10438,15 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // pyclass returned by every `PyEdge::subscribe_*` pymethod.
     m.add_class::<PyNetworkEventSubscription>()?;
 
+    // CIRISEdge#805 A11 — the host call API: `Edge.join_call` returns a
+    // `Call`, whose `frames()` / `events()` are async iterators.
+    #[cfg(feature = "_reticulum-module")]
+    {
+        m.add_class::<PyCall>()?;
+        m.add_class::<PyCallFrames>()?;
+        m.add_class::<PyCallEvents>()?;
+    }
+
     // CIRISEdge#65 v1 (v1.6.3) — replication runtime handle. Returned
     // by `PyEdge::start_replication`; the operator holds it for the
     // lifetime of their peer set and calls `register_peer` / `stop`.
@@ -12608,6 +13107,168 @@ mod pyo3_tier2_tests {
             Ok(())
         })
         .expect("link readbacks");
+    }
+
+    /// CIRISEdge#805 A11 — `Edge.join_call` validates its arguments at the
+    /// boundary (`ValueError`, never a panic) BEFORE any plumbing runs, and a
+    /// node with no Reticulum transport is refused by name (`plumbing`).
+    #[test]
+    fn join_call_validates_at_the_boundary_and_names_its_refusals() {
+        init_python();
+        let (py_edge, _queue, _runtime) = build_sync_cohab_fixture();
+        Python::attach(|py| {
+            let value_err = |r: PyResult<PyCall>, token: &str| {
+                let Err(e) = r else {
+                    panic!("{token}: expected a refusal")
+                };
+                assert!(e.is_instance_of::<PyValueError>(py), "{token}: {e}");
+                assert!(e.to_string().contains(token), "{token}: {e}");
+            };
+            value_err(py_edge.join_call(py, "", "unkept", false), "invalid_room");
+            value_err(
+                py_edge.join_call(py, "chat:room:v1:a\0b", "unkept", false),
+                "invalid_room",
+            );
+            value_err(
+                py_edge.join_call(py, &"r".repeat(513), "unkept", false),
+                "invalid_room",
+            );
+            value_err(
+                py_edge.join_call(py, "chat:room:v1:a", "recorded", false),
+                "invalid_keep",
+            );
+            // Valid arguments reach the call API, which names what is missing.
+            let Err(e) = py_edge.join_call(py, "chat:room:v1:a", "unkept", false) else {
+                panic!("a node with no Reticulum transport cannot join a call")
+            };
+            assert!(e.is_instance_of::<PyRuntimeError>(py), "{e}");
+            let msg = e.to_string();
+            assert!(
+                msg.contains("plumbing: ") && msg.contains("Reticulum transport"),
+                "{msg}"
+            );
+        });
+    }
+
+    /// CIRISEdge#805 A11 — every `Call` verb has its Python twin: the parity
+    /// test walks `PY_CALL_VERBS` against the `Call` class, and the
+    /// iterators are async iterators.
+    #[test]
+    fn every_call_verb_has_its_python_twin() {
+        init_python();
+        Python::attach(|py| {
+            let call = py.get_type::<PyCall>();
+            for verb in PY_CALL_VERBS {
+                assert!(
+                    call.hasattr(*verb).expect("hasattr"),
+                    "Call.{verb} is missing on the Python surface"
+                );
+            }
+            for it in [py.get_type::<PyCallFrames>(), py.get_type::<PyCallEvents>()] {
+                assert!(it.hasattr("__aiter__").expect("hasattr"));
+                assert!(it.hasattr("__anext__").expect("hasattr"));
+            }
+            assert!(py
+                .get_type::<PyEdge>()
+                .hasattr("join_call")
+                .expect("hasattr"));
+        });
+    }
+
+    /// CIRISEdge#805 A11 — every `CallEvent` projects to a dict under its own
+    /// token, and a refusal is a `ValueError` or `RuntimeError` that starts
+    /// with its token.
+    #[test]
+    fn call_events_and_refusals_project_by_token() {
+        use crate::transport::av_call::{CallError, CallEvent, EndCause};
+        init_python();
+        Python::attach(|py| {
+            let events = [
+                (
+                    CallEvent::KeepRefused {
+                        epoch: 3,
+                        reason: "keep_deferred",
+                    },
+                    "keep_refused",
+                ),
+                (CallEvent::EpochRolled { from: 1, to: 2 }, "epoch_rolled"),
+                (
+                    CallEvent::MemberJoined {
+                        key_id: "b".to_owned(),
+                    },
+                    "member_joined",
+                ),
+                (
+                    CallEvent::MemberLeft {
+                        key_id: "b".to_owned(),
+                    },
+                    "member_left",
+                ),
+                (
+                    CallEvent::Stranded {
+                        epoch: 4,
+                        reason: "x".to_owned(),
+                    },
+                    "stranded",
+                ),
+                (
+                    CallEvent::AttendeeJoined {
+                        key_id: "c".to_owned(),
+                    },
+                    "attendee_joined",
+                ),
+                (
+                    CallEvent::RecordRefused {
+                        reason: "r".to_owned(),
+                    },
+                    "record_refused",
+                ),
+            ];
+            for (ev, kind) in &events {
+                let d = call_event_to_pydict(py, ev).expect("project");
+                let got: String = d
+                    .get_item("kind")
+                    .expect("get")
+                    .expect("kind")
+                    .extract()
+                    .expect("str");
+                assert_eq!(&got, kind);
+            }
+            let value = [
+                CallError::NotARoomMember {
+                    key_id: "k".to_owned(),
+                    room: "r".to_owned(),
+                },
+                CallError::ConsentMissing {
+                    key_id: "k".to_owned(),
+                    room: "r".to_owned(),
+                },
+                CallError::FrameTooLarge {
+                    bytes: 10,
+                    budget: 5,
+                },
+                CallError::ActorIsNotTheSubject {
+                    actor: "a".to_owned(),
+                    attester: "b".to_owned(),
+                    subjects: vec!["b".to_owned()],
+                },
+            ];
+            for e in &value {
+                let p = call_err_to_py(e);
+                assert!(p.is_instance_of::<PyValueError>(py), "{e}");
+                assert!(p.to_string().contains(call_err_token(e)), "{p}");
+            }
+            let runtime = [
+                CallError::NoBudget,
+                CallError::CallEnded(EndCause::HungUp),
+                CallError::Plumbing("x".to_owned()),
+            ];
+            for e in &runtime {
+                let p = call_err_to_py(e);
+                assert!(p.is_instance_of::<PyRuntimeError>(py), "{e}");
+                assert!(p.to_string().contains(call_err_token(e)), "{p}");
+            }
+        });
     }
 
     /// CIRISEdge#858 — `metrics_snapshot()` carries the park ledger, read
