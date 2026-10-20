@@ -53,10 +53,20 @@ struct FedKey {
 }
 
 impl FedKey {
-    fn new(key_id: &str, seed_byte: u8) -> Self {
+    /// persist #1103 (CC 2.6.8) — the `key_id` is DERIVED from the key's own
+    /// Ed25519 pubkey (`derive_key_id(label, pubkey)`), never hand-written:
+    /// `put_public_key` refuses a `-<fp>` suffix that is not its key's
+    /// fingerprint. Tests reference `key_id`, never the label.
+    fn new(label: &str, seed_byte: u8) -> Self {
+        use ciris_crypto::ClassicalSigner as _;
+        let seed = [seed_byte; 32];
+        let pubkey = ciris_crypto::Ed25519Signer::from_seed(&seed)
+            .expect("ed25519 from seed")
+            .public_key()
+            .expect("pubkey");
         Self {
-            key_id: key_id.to_string(),
-            seed: [seed_byte; 32],
+            key_id: ciris_verify_core::fedcode::derive_key_id(label, &pubkey),
+            seed,
         }
     }
 
@@ -158,6 +168,24 @@ async fn build_edge_with_canonical(
 ) -> Edge {
     let me = FedKey::new("edge-self-canon-ffi", 0x01);
     let signer = me.local_signer(tmp).await;
+    // CIRISPersist#988 — a peer removal is an attributed act: this test is
+    // the backend's host, so it registers the node's key and names it as the
+    // node (`set_node_key_id`), exactly as `EdgeBuilder::from_keyring_seed_dir`
+    // does for a backend it opens.
+    if backend
+        .lookup_public_key(&me.key_id)
+        .await
+        .expect("lookup self")
+        .is_none()
+    {
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: signed_record(&me, &me, "node"),
+            })
+            .await
+            .expect("register the node's own key");
+    }
+    backend.set_node_key_id(me.key_id.clone());
     let config = EdgeConfig {
         hybrid_policy: HybridPolicy::Ed25519Fallback,
         ..EdgeConfig::default()

@@ -375,7 +375,14 @@ async fn r6_third_party_pull_keys_on_tier() {
                 "stranger-X",
             ])
             .await;
-        let _ = backend;
+        // persist v59.0.0 — the public plane these lookups read is the route
+        // plane: a fixture key travels only as a key:record:v1 row it does
+        // not have, so the Key plane would answer empty for the wrong reason.
+        crate::replication::bridge::tests::seed_routes(
+            &backend,
+            &["local-A", "subject-S", "stranger-X"],
+        )
+        .await;
         let bridge = bridge
             .with_local_key_id(Some("local-A".to_string()))
             .with_serve_tier_for_test(tier);
@@ -383,7 +390,11 @@ async fn r6_third_party_pull_keys_on_tier() {
         // Third party: conferred servers only.
         assert!(
             bridge
-                .subject_holdings(EnvelopeKind::Key, "subject-S", Some("stranger-X"))
+                .subject_holdings(
+                    EnvelopeKind::TransportDestination,
+                    "subject-S",
+                    Some("stranger-X")
+                )
                 .await
                 .is_empty(),
             "{tier:?}: with NO mutual trust root, no tier answers a third-party \
@@ -395,7 +406,11 @@ async fn r6_third_party_pull_keys_on_tier() {
         // R7 — the data-subject path: EVERY tier answers the subject itself.
         assert!(
             !bridge
-                .subject_holdings(EnvelopeKind::Key, "subject-S", Some("subject-S"))
+                .subject_holdings(
+                    EnvelopeKind::TransportDestination,
+                    "subject-S",
+                    Some("subject-S")
+                )
                 .await
                 .is_empty(),
             "{tier:?}: subject access (#462) does not depend on serving tier"
@@ -403,7 +418,11 @@ async fn r6_third_party_pull_keys_on_tier() {
         // R8 — the own-record path: every tier serves its own record.
         assert!(
             !bridge
-                .subject_holdings(EnvelopeKind::Key, "local-A", Some("stranger-X"))
+                .subject_holdings(
+                    EnvelopeKind::TransportDestination,
+                    "local-A",
+                    Some("stranger-X")
+                )
                 .await
                 .is_empty(),
             "{tier:?}: a node's own record is what self_own already advertises"
@@ -411,7 +430,7 @@ async fn r6_third_party_pull_keys_on_tier() {
         // Unattributed is refused at every tier.
         assert!(
             bridge
-                .subject_holdings(EnvelopeKind::Key, "subject-S", None)
+                .subject_holdings(EnvelopeKind::TransportDestination, "subject-S", None)
                 .await
                 .is_empty(),
             "{tier:?}: an unattributed Pull serves nothing, tier or no tier"

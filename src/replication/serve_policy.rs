@@ -44,14 +44,21 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
         // may replace the self set for any of the three; the projection is
         // still `self_own` (the host names what it speaks for), so the cell
         // does not move.
-        EnvelopeKind::Key => ("self_own", "public"),
+        // persist v59.0.0 (sealed-transport floor) — the three key-plane
+        // session planes carry their family's attestation ROW, never the
+        // retired framed object, and serve only that family's rows.
+        EnvelopeKind::Key => ("self_own; rides:attestation key:record:v1 rows", "public"),
         // CIRISEdge#682 (CC 5.4.6, CIRISServer#655) — announce is per node. An
         // OWNED node's occurrence and route are served (advertise, direct
         // fetch, subject Pull) to every peer only when the node is announced
         // (a live owner-binding at `cohort_scope: federation`); otherwise only
         // to its owner's own nodes, booked `identity_row_node_not_announced`.
         // An unowned node is its own trust subject and serves as before.
-        EnvelopeKind::IdentityOccurrence | EnvelopeKind::TransportDestination => (
+        EnvelopeKind::IdentityOccurrence => (
+            "self_own; rides:attestation identity:occurrence:v1 rows",
+            "owned node: announced → public; unannounced → owner's nodes only",
+        ),
+        EnvelopeKind::TransportDestination => (
             "self_own",
             "owned node: announced → public; unannounced → owner's nodes only",
         ),
@@ -95,11 +102,17 @@ fn policy_for(kind: EnvelopeKind) -> serde_json::Value {
             "membership_plane: persist may_receive_group_plane(peer, scope, group, None)",
         ),
         EnvelopeKind::LocationProof => ("cohort", "public"),
-        // The two tombstone planes keep the hardcoded widest own∪cohort set
-        // (`Projection::Global`, the #311 rule) and serve public.
-        EnvelopeKind::IdentityOccurrenceRevocation | EnvelopeKind::Revocation => {
-            ("global", "public")
-        }
+        // The key revocation plane keeps the hardcoded widest own∪cohort set
+        // (`Projection::Global`, the #311 rule) and serves public — its
+        // `key:revocation:v1` rows since persist v59.0.0.
+        EnvelopeKind::Revocation => ("global; rides:attestation key:revocation:v1 rows", "public"),
+        // persist v59.0.0 — the occurrence's tombstone plane keeps the same
+        // widest set and public serve, carrying the `withdraws` rows whose
+        // target is an `identity:occurrence:v1` row.
+        EnvelopeKind::IdentityOccurrenceRevocation => (
+            "global; rides:attestation withdraws of identity:occurrence:v1 rows",
+            "public",
+        ),
         // The membership planes keep the `Global` advertise projection (every
         // node that holds the group's record must fold the same events, #860)
         // and are gated per peer: the revocation names the removed member, the
@@ -324,8 +337,15 @@ pub fn serve_advertise_policy_sha256() -> String {
 // edge's own invitee/proposer checks are gone, and first contact carries a
 // ceremony row exactly when persist admits it as refers-to. **CIRISServer must
 // mirror this pin.**
+//
+// persist v59.0.0 (sealed-transport floor) — RE-PINNED, 68c5298b… → ead63aac…:
+// the Key, IdentityOccurrence and Revocation cells state that the planes carry
+// their family's attestation ROWS (`key:record:v1`, `identity:occurrence:v1`,
+// `key:revocation:v1`, and for IdentityOccurrenceRevocation the `withdraws`
+// of an `identity:occurrence:v1` row), the framed objects being retired. Reach,
+// serve and receive are unchanged. **CIRISServer must mirror this pin.**
 pub const SERVE_ADVERTISE_POLICY_HASH: &str =
-    "68c5298b4bb48bbf8ffdb7ef881b71386b3db6ba8c6026b8bb61ec454ebe3850";
+    "ead63aac63f6736b12084a07278557b7b273e6a98c9d52b77504f512d9fc5439";
 
 #[cfg(test)]
 mod tests {

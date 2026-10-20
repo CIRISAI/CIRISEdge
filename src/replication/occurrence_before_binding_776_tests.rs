@@ -50,13 +50,18 @@ struct Ident {
 
 impl Ident {
     fn new(key_id: &str, seed: u8) -> Self {
-        let mut ed = Ed25519SoftwareSigner::new(key_id);
+        // The alias is `<label>-engine`, so a device's engine-derived id
+        // (`derive_key_id(alias, pk)`) stays apart from this identity's own
+        // derived id over the same key (CIRISPersist#1103).
+        let mut ed = Ed25519SoftwareSigner::new(format!("{key_id}-engine"));
         ed.import_key(&[seed; 32]).expect("import ed key");
         let pqc =
             MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{key_id}-pqc"))
                 .expect("ml-dsa from seed");
         Self {
-            key_id: key_id.to_owned(),
+            // CIRISPersist#1103 — registered under the id derived from its own
+            // key.
+            key_id: crate::identity::derived_fixture_key_id(key_id, &[seed; 32]),
             seed,
             ed,
             pqc,
@@ -215,18 +220,17 @@ async fn device_rows(from: &Node) -> (KeyRecord, Vec<u8>, Vec<u8>) {
                 )
         })
         .expect("the node's owner binding");
-    let occ = from
-        .dir
-        .list_signed_identity_occurrences_since(None, 64)
+    // persist v59.0.0 — the occurrence travels as its `identity:occurrence:v1`
+    // row; the framed object is retired.
+    let occ = crate::replication::key_plane_rows::occurrence_rows_about(&*from.dir, &from.owner)
         .await
-        .expect("list the signed occurrence plane")
+        .expect("list the occurrence rows")
         .into_iter()
-        .map(|s| s.occurrence)
-        .find(|o| {
-            o.identity_occurrence.occurrence_key_id == from.me
-                && o.identity_occurrence.identity_key_id == from.owner
+        .find(|row| {
+            crate::replication::key_plane_rows::occurrence_key_of(row).as_deref()
+                == Some(from.me.as_str())
         })
-        .expect("the engine occurrence is on the signed plane");
+        .expect("the engine occurrence is on the row plane");
     (
         rec,
         serde_json::to_vec(&binding).expect("encode binding"),
@@ -510,9 +514,10 @@ async fn a_refusal_whose_signer_is_bound_parks_terminally_and_no_duplicate_relea
         .await;
     assert!(bound.is_admitted());
     // A tampered occurrence from D: refused for its envelope, not its binding.
+    // persist v59.0.0 — inside the occurrence its row carries.
     let mut v: serde_json::Value = serde_json::from_slice(&d_occ).expect("occurrence json");
     let env = v
-        .get_mut("signed_envelope")
+        .pointer_mut("/attestation_envelope/identity_occurrence/signed_envelope")
         .and_then(serde_json::Value::as_object_mut)
         .expect("signed_envelope");
     env.insert("device_class".to_owned(), serde_json::json!("tampered"));

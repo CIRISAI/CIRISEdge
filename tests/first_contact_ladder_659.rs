@@ -543,6 +543,27 @@ async fn wait_for_own_route(node: &Node, budget: Duration) {
     }
 }
 
+/// CC 5.3.3.5 E1 — each node holds the other's signed route, which carries
+/// its transit pair, before either dials: a link is keyed by the dialled
+/// node's Rooted pair or never made. In the field the row crosses on the
+/// TransportDestination plane from a node both already reach (or a seated
+/// serve node's comes in the genesis bundle); here it is put through the same
+/// ordinary door, so the rung under test still starts from first contact.
+async fn exchange_routes(a: &Node, b: &Node) {
+    for (from, to) in [(a, b), (b, a)] {
+        for r in from
+            .dir
+            .list_signed_transport_destinations_for(&from.key.key_id)
+            .await
+            .expect("own routes")
+        {
+            FederationDirectory::put_signed_transport_destination(&*to.dir, &r)
+                .await
+                .expect("seed the route");
+        }
+    }
+}
+
 /// What each side holds on the TransportDestination plane, beside what the
 /// other side's item 2 will ask for — printed when delivery does not happen,
 /// so a red rung names the missing row instead of a timeout.
@@ -676,6 +697,7 @@ async fn a_self_signed_owned_peer_under_a_shared_root_is_attributed_and_served()
     let rt_b = start_runtime(&b, tb, &a.key).await;
     wait_for_own_route(&a, Duration::from_secs(150)).await;
     wait_for_own_route(&b, Duration::from_secs(150)).await;
+    exchange_routes(&a, &b).await;
 
     // DELIVERY (Attributed): B's allegiance rows land on A — the frames the old
     // gate dropped for five days.
@@ -780,6 +802,7 @@ async fn under_different_roots_a_peer_delivers_but_is_served_nothing_until_the_r
     let rt_b = start_runtime(&b, tb, &a.key).await;
     wait_for_own_route(&a, Duration::from_secs(150)).await;
     wait_for_own_route(&b, Duration::from_secs(150)).await;
+    exchange_routes(&a, &b).await;
 
     // Attributed: B's rows land on A regardless of roots.
     let delivered = drive_until(&[&rt_b, &rt_a], Duration::from_secs(180), || async {

@@ -616,7 +616,12 @@ mod tests {
             MlDsa65SoftwareSigner::from_seed_bytes(&pqc_seed, format!("{key_id}-pqc"))
                 .expect("ml_dsa_65 from_seed_bytes"),
         );
-        Arc::new(LocalSigner::new(key_id, classical, Some(pqc)))
+        Arc::new(LocalSigner::new(
+            // CIRISPersist#1103 — the id derived from its own key.
+            crate::identity::derived_fixture_key_id(key_id, &ed_seed),
+            classical,
+            Some(pqc),
+        ))
     }
 
     /// Register `signer`'s hybrid pubkeys as a federation key so its touch
@@ -686,8 +691,8 @@ mod tests {
         // The stored envelope IS the typed projection's signing_envelope,
         // byte-for-byte (authority-is-the-envelope discipline).
         assert_eq!(claim.signed_envelope, claim.signing_envelope());
-        assert_eq!(claim.attesting_key_id, "rt-self");
-        assert_eq!(claim.target_key_id, "rt-self");
+        assert_eq!(claim.attesting_key_id, signer.key_id);
+        assert_eq!(claim.target_key_id, signer.key_id);
         assert!(claim.signature.mldsa65_signature_base64.is_some(), "hybrid");
 
         // A successful put proves the hybrid signature verifies at persist's
@@ -772,7 +777,7 @@ mod tests {
         )
         .await
         .expect("build primary leg");
-        assert_eq!(leg.attesting_key_id, "nofm-primary");
+        assert_eq!(leg.attesting_key_id, primary.key_id);
         assert_ne!(leg.attesting_key_id, leg.target_key_id, "independent");
 
         // (a) the bare primary leg (no co-sig set) MUST be refused — this is
@@ -802,7 +807,7 @@ mod tests {
         let forged = attach_cosignatures(
             leg,
             &[ThresholdSignature {
-                member_id: "nofm-cosigner".to_owned(),
+                member_id: cosigner.key_id.clone(),
                 ed25519_signature_base64: "AA".to_owned(),
                 mldsa65_signature_base64: None,
             }],

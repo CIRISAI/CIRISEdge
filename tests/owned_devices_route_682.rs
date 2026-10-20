@@ -455,6 +455,29 @@ async fn pair_with(tag: &str, scope: &str, d2: D2Starts) -> Pair {
     )
     .await;
 
+    // CC 5.3.3.5 E1 — a link is keyed by the dialled node's Rooted transit
+    // pair or never made, and that pair rides the node's signed route. So the
+    // first dial needs one route held up front: D2 (the claimed device, or the
+    // wiped one re-paired) holds its sibling D1's, as a claim or pairing hands
+    // it over in the field. D1 still EARNS D2's route over the sealed link D2
+    // opens, which is the crossing these witnesses assert; both directions
+    // cannot be earned, since neither side could dial first.
+    if matches!(d2, D2Starts::Wiped) {
+        dir2.put_public_key(ciris_persist::federation::SignedKeyRecord {
+            record: k1.record("node").await,
+        })
+        .await
+        .expect("the re-paired device holds its sibling's key");
+    }
+    for r in dir1
+        .list_signed_transport_destinations_for(&k1.key_id)
+        .await
+        .expect("D1's own route")
+    {
+        FederationDirectory::put_signed_transport_destination(&*dir2, &r)
+            .await
+            .expect("seed D1's route at D2");
+    }
     let d1 = device(Arc::clone(&k1), dir1, t1, m1, &owner, &k2).await;
     let d2 = device(Arc::clone(&k2), dir2, t2, m2, &owner, &k1).await;
     Pair {
@@ -759,11 +782,18 @@ async fn unannounced_devices_of_one_owner_exchange_routes_and_admit_682() {
                 .await,
             "{who} must hold its sibling's owner-binding"
         );
-        assert!(
-            dev.ledger(OWNER_BINDING_ADMITTED) >= 1,
-            "{who} must have admitted a binding on the owner-binding rung, ledger={:?}",
-            dev.owner_binding_ledger()
-        );
+        // CC 5.3.3.5 E1 — D2 holds D1's route from the start (see
+        // `pair_with`), so D1 is ATTRIBUTED at D2 from its first frame and its
+        // binding lands through the ordinary attributed door; the rung exists
+        // for a sibling that is not yet attributed, which here is only D2 at
+        // D1. D2's holding the binding is asserted above.
+        if who == "D1" {
+            assert!(
+                dev.ledger(OWNER_BINDING_ADMITTED) >= 1,
+                "{who} must have admitted a binding on the owner-binding rung, ledger={:?}",
+                dev.owner_binding_ledger()
+            );
+        }
         // I-b: each side SENT its own binding — on a link it dialed, or as
         // the answer to its sibling's newly admitted binding (which of the two
         // depends on who dialed first and whether the other's sends reused

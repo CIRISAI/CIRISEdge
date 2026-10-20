@@ -351,14 +351,18 @@ async fn pair(tag: &str, seed_route_at_b: bool) -> Pair {
     .await;
     assert!(known, "A and B must learn each other from their announces");
 
-    // B dials A (the round-open): this is the link A answers on.
-    transport_b
-        .send(&key_a.key_id, b"round-open-722")
-        .await
-        .expect("B -> A");
-    tokio::time::timeout(Duration::from_secs(60), a_first.notified())
-        .await
-        .expect("A receives B's round-open within 60s");
+    // B dials A (the round-open): this is the link A answers on. CC 5.3.3.5
+    // E1 — B can only dial A holding A's route, which carries A's transit
+    // pair: without it there is no link at all (the negative control).
+    if seed_route_at_b {
+        transport_b
+            .send(&key_a.key_id, b"round-open-722")
+            .await
+            .expect("B -> A");
+        tokio::time::timeout(Duration::from_secs(60), a_first.notified())
+            .await
+            .expect("A receives B's round-open within 60s");
+    }
 
     Pair {
         a: transport_a,
@@ -385,12 +389,13 @@ fn deliver_frame(att: &Attestation) -> Vec<u8> {
 }
 
 /// TCP interfaces negotiate a 16384-byte link MTU (leviculum `TCP_HW_MTU`), so
-/// the link-Channel MDU on loopback is 16297 and eight `CFRG` fragments carry
-/// 8 × (16297 − 16) = 130 248 bytes. A frame above that skips Channel-first and
+/// the link-Channel MDU on loopback is 16297, 16272 of it plaintext under the
+/// 25-byte CC 5.3.3.5 E1 seal, and eight `CFRG` fragments carry
+/// 8 × (16272 − 16) = 130 048 bytes. A frame above that skips Channel-first and
 /// goes Resource-first — the arm this witness exists for. (At the field's
-/// 500-byte base MTU the same threshold is 8 × (425 − 16) = 3272 bytes, which
+/// 500-byte base MTU the same threshold is 8 × (400 − 16) = 3072 bytes, which
 /// every hybrid-signed row exceeds on its own.)
-const RESOURCE_FRAME_MIN: usize = 8 * (16_297 - 16);
+const RESOURCE_FRAME_MIN: usize = 8 * (16_297 - 25 - 16);
 
 /// One Deliver of eight consent rows A → peer_i — above [`RESOURCE_FRAME_MIN`],
 /// so it rides a Resource. Returns the frame and the row ids it carries.
@@ -445,9 +450,10 @@ async fn holds(dir: &SqliteBackend, attestation_id: &str) -> bool {
 }
 
 /// How many link-Channel fragments this frame cuts to at the 500-byte-MTU
-/// loopback link (link MDU 431, Channel MDU 425, `CFRG` payload 409).
+/// loopback link (link MDU 431, Channel MDU 425, 400 of it plaintext under the
+/// E1 seal, `CFRG` payload 384).
 fn fragments_at_field_mdu(frame: &[u8]) -> usize {
-    ciris_edge::transport::frame_fragment::fragment(frame, 425).map_or(0, |f| f.len())
+    ciris_edge::transport::frame_fragment::fragment(frame, 400).map_or(0, |f| f.len())
 }
 
 async fn dump(p: &Pair, label: &str) {
@@ -564,8 +570,10 @@ async fn resource_and_channel_rows_on_a_reverse_link_both_admit_722() {
 }
 
 /// Negative control — the gate's rule is untouched: with NO hybrid-verified
-/// route for A at B, a Resource on the same link is still refused at item 2
-/// (un-attributed ⇒ `SkippedNoSourceKeyId`, the row never lands).
+/// route for A at B, nothing of A's lands at B. Under CC 5.3.3.5 E1 the route
+/// is also what carries A's transit pair, so B cannot open the link A would
+/// answer on, and A (holding no route for B either) cannot dial B: A's send is
+/// refused by name before any link exists, and the row never lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resource_from_a_peer_with_no_verified_route_is_still_refused_722() {
     let _ = tracing_subscriber::fmt()
@@ -574,31 +582,22 @@ async fn resource_from_a_peer_with_no_verified_route_is_still_refused_722() {
         .try_init();
     let p = pair("refuse", false).await;
     let (frame, ids) = resource_deliver(&p).await;
-    p.a.send(&p.key_b.key_id, &frame)
-        .await
-        .expect("A -> B delivers (delivery is not attribution)");
-    // The frame arrives — and is un-attributed.
-    let seen = wait_until(Duration::from_secs(90), || async {
-        p.b_seen.lock().await.iter().any(|s| s.bytes == frame.len())
-    })
-    .await;
-    assert!(seen, "B must receive the Resource frame at the transport");
+    match p.a.send(&p.key_b.key_id, &frame).await {
+        Err(ciris_edge::transport::TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_no_pair");
+        }
+        other => panic!("no route, no pair, no link: {other:?}"),
+    }
     let landed = wait_until(Duration::from_secs(10), || async {
         holds_any(&p.b_dir, &ids).await
     })
     .await;
     assert!(
         !landed,
-        "no verified SignedTransportDestination for A at B ⇒ item 2 refuses ⇒ the row must \
-         NOT land (the gate's rule is unchanged, CIRISEdge#393)"
+        "no verified SignedTransportDestination for A at B ⇒ the row must NOT land"
     );
-    let seen = p.b_seen.lock().await.clone();
-    let s = seen
-        .iter()
-        .find(|s| s.bytes == frame.len())
-        .expect("frame seen");
-    assert_eq!(
-        s.source_key_id, None,
-        "un-attributed at the transport (item 2 failed): {seen:?}"
+    assert!(
+        !p.b_seen.lock().await.iter().any(|s| s.bytes == frame.len()),
+        "nothing crossed"
     );
 }

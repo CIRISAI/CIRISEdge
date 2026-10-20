@@ -28,6 +28,10 @@
 //! - `O4` = O1 with its typed `asserted_at` diverging from the signed envelope;
 //! - `O5` = O1 naming no signer at all.
 //!
+//! Since persist v59.0.0 the occurrences travel as their
+//! `identity:occurrence:v1` rows, and O4/O5 are those rows carrying the
+//! tampered object: a row that is not the one its own object plans to.
+//!
 //! Since persist v55.0.0 both are refused at the source as typed
 //! `Error::MalformedRow` (`federation_malformed_row`), which edge holds
 //! TERMINAL from the first refusal: neither parks, and neither is re-asked
@@ -128,11 +132,13 @@ impl Ident {
         ))
     }
 
+    /// persist v59.0.0 — the key as it travels: its `key:record:v1` ROW (the
+    /// producer side mints it with persist's own pure fn; the framed record
+    /// is retired).
     pub(super) fn signed_key_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(&SignedKeyRecord {
-            record: self.record.clone(),
-        })
-        .expect("encode key")
+        let row = ciris_persist::federation::key_plane::plan_key_record_row(&self.record, &None)
+            .expect("a self-scrubbed hybrid record has its row");
+        serde_json::to_vec(&row).expect("encode key row")
     }
 }
 
@@ -184,6 +190,15 @@ pub(super) async fn occurrence(
             mldsa65_signature_base64: pqc,
         },
     }
+}
+
+/// persist v59.0.0 — an occurrence as it travels: its `identity:occurrence:v1`
+/// ROW (the producer side mints it with persist's own pure fn; the framed
+/// object is retired).
+pub(super) fn occurrence_row_bytes(occ: &SignedIdentityOccurrence) -> Vec<u8> {
+    let row = ciris_persist::federation::key_plane::occurrence_row(occ)
+        .expect("a hybrid-signed occurrence has its row");
+    serde_json::to_vec(&row).expect("encode occurrence row")
 }
 
 pub(super) async fn substrate() -> Arc<SqliteBackend> {
@@ -258,24 +273,26 @@ impl World {
             Arc::new(Vec::new),
             BridgeConfig::default(),
         ));
-        let stored = r_dir
-            .list_signed_identity_occurrences_since(None, 64)
-            .await
-            .expect("list R's occurrences");
+        // persist v59.0.0 — R serves each occurrence as its
+        // `identity:occurrence:v1` row.
         let mut served = Vec::new();
         for o in [&o1, &o2, &o3] {
-            let row = stored
-                .iter()
-                .map(|s| &s.occurrence)
-                .find(|s| {
+            let row = crate::replication::key_plane_rows::occurrence_rows_about(
+                &*r_dir,
+                &o.identity_occurrence.identity_key_id,
+            )
+            .await
+            .expect("list R's occurrence rows")
+            .into_iter()
+            .find(|row| {
+                ciris_persist::federation::key_plane::occurrence_of_row(row).is_some_and(|s| {
                     s.attesting_key_id == o.attesting_key_id
-                        && s.identity_occurrence.identity_key_id
-                            == o.identity_occurrence.identity_key_id
                         && s.identity_occurrence.occurrence_key_id
                             == o.identity_occurrence.occurrence_key_id
                 })
-                .expect("R holds the occurrence");
-            let bytes = serde_json::to_vec(row).expect("encode");
+            })
+            .expect("R holds the occurrence row");
+            let bytes = serde_json::to_vec(&row).expect("encode");
             assert_eq!(
                 r_bridge.fetch_envelope_bytes(KIND, &sha(&bytes)).await,
                 Some(bytes.clone()),
@@ -283,14 +300,19 @@ impl World {
             );
             served.push(bytes);
         }
-        // O4: O1 with a typed asserted_at that diverges from the envelope.
+        // O4: O1 with a typed asserted_at that diverges from the envelope
+        // (persist v59.0.0: inside the occurrence the row carries).
         let mut o4: serde_json::Value = serde_json::from_slice(&served[0]).expect("O1 json");
         let shifted = o1.identity_occurrence.asserted_at + chrono::Duration::seconds(1);
-        o4["identity_occurrence"]["asserted_at"] = serde_json::to_value(shifted).expect("ts");
+        o4["attestation_envelope"]["identity_occurrence"]["identity_occurrence"]["asserted_at"] =
+            serde_json::to_value(shifted).expect("ts");
         // O5: O1 naming no signer.
         let mut o5: serde_json::Value = serde_json::from_slice(&served[0]).expect("O1 json");
         o5["attesting_key_id"] = serde_json::json!("");
-        o5["signed_envelope"]["attesting_key_id"] = serde_json::json!("");
+        o5["attestation_envelope"]["identity_occurrence"]["attesting_key_id"] =
+            serde_json::json!("");
+        o5["attestation_envelope"]["identity_occurrence"]["signed_envelope"]["attesting_key_id"] =
+            serde_json::json!("");
         served.push(serde_json::to_vec(&o4).expect("encode O4"));
         served.push(serde_json::to_vec(&o5).expect("encode O5"));
 
@@ -509,8 +531,10 @@ async fn a_fresh_node_parks_round_one_and_escalates_what_cannot_move_858() {
     // memory): persist v55 refuses both as a typed malformed row, which edge
     // holds terminal and parks on no signer.
     for (name, row, why) in [
-        ("O4", &w.rows[3], "asserted_at"),
-        ("O5", &w.rows[4], "names no signer"),
+        // persist v59.0.0 — a carried object that diverges is a row that is
+        // not the one its own object plans to (CIRISPersist#991).
+        ("O4", &w.rows[3], "a pure function of the object it carries"),
+        ("O5", &w.rows[4], "a pure function of the object it carries"),
     ] {
         let out = w
             .bridge(None)

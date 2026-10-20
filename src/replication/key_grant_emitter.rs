@@ -78,9 +78,10 @@ impl KeyGrantEmitterConfig {
 
 /// Does admitting this row give persist a reason to re-wrap an epoch to a
 /// device (CIRISPersist#916)? Exactly the two receive doors that call
-/// `rewrap_after_admission`: a signed identity occurrence, and an owner
-/// binding (`delegates_to` carrying an owner-binding envelope). Pure, so the
-/// rule is a test.
+/// `rewrap_after_admission`: a signed identity occurrence (persist v59.0.0:
+/// its `identity:occurrence:v1` row, on the occurrence plane or the
+/// Attestation plane), and an owner binding (`delegates_to` carrying an
+/// owner-binding envelope). Pure, so the rule is a test.
 #[must_use]
 pub fn wakes_key_grant_emitter(kind: EnvelopeKind, envelope_bytes: &[u8]) -> bool {
     match kind {
@@ -98,12 +99,18 @@ pub fn wakes_key_grant_emitter(kind: EnvelopeKind, envelope_bytes: &[u8]) -> boo
                         .ok()
                         .map(|s| s.attestation)
                     });
+            // persist v59.0.0 — an occurrence also arrives as its
+            // `identity:occurrence:v1` row on this plane.
             row.is_some_and(|a| {
-                a.attestation_type
+                (a.attestation_type
                     == ciris_persist::federation::types::attestation_type::DELEGATES_TO
                     && ciris_persist::federation::admission::is_owner_binding_envelope(
                         &a.attestation_envelope,
-                    )
+                    ))
+                    || ciris_persist::federation::key_plane::KeyPlaneFamily::of_row(&a)
+                        == Some(
+                            ciris_persist::federation::key_plane::KeyPlaneFamily::IdentityOccurrence,
+                        )
             })
         }
         _ => false,

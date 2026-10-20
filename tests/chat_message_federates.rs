@@ -50,7 +50,27 @@ fn ts() -> chrono::DateTime<chrono::Utc> {
         .into()
 }
 
-fn signer(key_id: &str, seed: u8) -> ciris_edge::identity::LocalSigner {
+/// One identity from a seed. persist #1103 (CC 2.6.8): its `key_id` is
+/// DERIVED from its own Ed25519 pubkey, `derive_key_id(label, pubkey)`, never
+/// hand-written. The classical half is aliased `<label>-engine`, so the key
+/// an ENGINE over this signer derives (`derive_key_id(alias, pubkey)`) stays a
+/// distinct row from the identity's own — the person/node split these worlds
+/// model — and both are fingerprint-bound.
+fn signer(label: &str, seed: u8) -> ciris_edge::identity::LocalSigner {
+    let classical: Arc<dyn HardwareSigner> = Arc::new(
+        Ed25519SoftwareSigner::from_bytes(&[seed; 32], format!("{label}-engine")).unwrap(),
+    );
+    let pqc: Arc<dyn PqcSigner> = Arc::new(
+        MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{label}-pqc")).unwrap(),
+    );
+    let pubkey = futures::executor::block_on(classical.public_key()).unwrap();
+    let key_id = ciris_verify_core::fedcode::derive_key_id(label, &pubkey);
+    ciris_edge::identity::LocalSigner::new(key_id, classical, Some(pqc))
+}
+
+/// A signer under `key_id` verbatim — for a ROOM id, which persist's fixture
+/// convention registers as a key (a group id, exempt from #1103's derivation).
+fn room_signer(key_id: &str, seed: u8) -> ciris_edge::identity::LocalSigner {
     let classical: Arc<dyn HardwareSigner> =
         Arc::new(Ed25519SoftwareSigner::from_bytes(&[seed; 32], key_id).unwrap());
     let pqc: Arc<dyn PqcSigner> = Arc::new(
@@ -58,6 +78,20 @@ fn signer(key_id: &str, seed: u8) -> ciris_edge::identity::LocalSigner {
             .unwrap(),
     );
     ciris_edge::identity::LocalSigner::new(key_id, classical, Some(pqc))
+}
+
+/// The world's identities' DERIVED key ids (persist #1103).
+fn alice_fed() -> String {
+    signer("alice-fed", 1).key_id
+}
+fn bob_fed() -> String {
+    signer("bob-fed", 3).key_id
+}
+fn carol_fed() -> String {
+    signer("carol-fed", 5).key_id
+}
+fn alice_node() -> String {
+    signer("alice-node", 2).key_id
 }
 
 fn store(seed: &str) -> ScopeStateProvider {
@@ -157,14 +191,14 @@ async fn world() -> World {
     let alice_node = signer("alice-node", 2);
     let bob = signer("bob-fed", 3);
     let bob_node = signer("bob-node", 4);
-    for (subject, s, scrub, ity) in [
-        ("alice-fed", &alice, &alice, "user"),
-        ("alice-node", &alice_node, &alice, "node"),
-        ("bob-fed", &bob, &bob, "user"),
-        ("bob-node", &bob_node, &bob, "node"),
+    for (s, scrub, ity) in [
+        (&alice, &alice, "user"),
+        (&alice_node, &alice, "node"),
+        (&bob, &bob, "user"),
+        (&bob_node, &bob, "node"),
     ] {
         dir.put_public_key(SignedKeyRecord {
-            record: record(subject, s, scrub, ity).await,
+            record: record(&s.key_id, s, scrub, ity).await,
         })
         .await
         .expect("seed record");
@@ -177,8 +211,8 @@ async fn world() -> World {
     // bob accepts; alice's side widens — the real flow, on one substrate.
     let opened = chat::open_pair_room(
         &*dir,
-        "alice-fed",
-        "bob-fed",
+        &alice.key_id,
+        &bob.key_id,
         ts(),
         chrono::Utc::now() + chrono::Duration::days(7),
         &alice,
@@ -221,9 +255,10 @@ async fn world() -> World {
 /// at write — and store the row.
 async fn authored(w: &World, body: &str) -> ciris_persist::federation::Attestation {
     let store = content_store(w).await;
-    let (msg, sealed) = chat::chat_message_attestation(&w.alice, "bob-fed", body, ts(), &store)
-        .await
-        .unwrap();
+    let (msg, sealed) =
+        chat::chat_message_attestation(&w.alice, bob_fed().as_str(), body, ts(), &store)
+            .await
+            .unwrap();
     assert!(
         sealed.fully_readable(),
         "a room member was excluded at write and could never read this: {:?}",
@@ -268,13 +303,14 @@ fn both_ends_derive_the_same_room_and_opposite_roles() {
 async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
     let w = world().await;
     let store = content_store(&w).await;
-    let (msg, _) = chat::chat_message_attestation(&w.alice, "bob-fed", BODY, ts(), &store)
+    let (msg, _) = chat::chat_message_attestation(&w.alice, bob_fed().as_str(), BODY, ts(), &store)
         .await
         .expect("build message");
 
-    assert_eq!(msg.attesting_key_id, "alice-fed", "the ACTOR is the sender");
+    assert_eq!(msg.attesting_key_id, alice_fed(), "the ACTOR is the sender");
     assert_eq!(
-        msg.scrub_key_id, "alice-fed",
+        msg.scrub_key_id,
+        alice_fed(),
         "signed at write by the actor"
     );
     assert!(!msg.scrub_signature_classical.is_empty());
@@ -363,7 +399,7 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
 
     // The ORIGINAL, as stored: byte-identical, actor's base scrub intact, the
     // node's co-scrub appended with a canonical `cosigned_at`.
-    let original = w.stored("alice-fed", &msg.attestation_id).await;
+    let original = w.stored(alice_fed().as_str(), &msg.attestation_id).await;
     assert_eq!(original.tier, "federation");
     assert_eq!(
         original.cohort_scope, "self",
@@ -375,7 +411,8 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
         "same bytes"
     );
     assert_eq!(
-        original.scrub_key_id, "alice-fed",
+        original.scrub_key_id,
+        alice_fed(),
         "the fabric never replaced the actor"
     );
     assert_eq!(
@@ -389,7 +426,7 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
         original.additional_scrubs
     );
     let co = &original.additional_scrubs[0];
-    assert_eq!(co.scrub_key_id, "alice-node");
+    assert_eq!(co.scrub_key_id, alice_node());
     assert!(
         is_canonical_instant(co.cosigned_at.as_deref().unwrap()),
         "cosigned_at is CC 2.6.2 canonical: {:?}",
@@ -397,11 +434,13 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
     );
 
     // The WIDENING, as stored: by the actor, referencing the original.
-    let stored_widening = w.stored("alice-fed", &widened.attestation_id).await;
+    let stored_widening = w
+        .stored(alice_fed().as_str(), &widened.attestation_id)
+        .await;
     assert_eq!(stored_widening.attestation_type, "supersedes");
     assert_eq!(stored_widening.cohort_scope, "community");
-    assert_eq!(stored_widening.attesting_key_id, "alice-fed");
-    assert_eq!(stored_widening.scrub_key_id, "alice-fed");
+    assert_eq!(stored_widening.attesting_key_id, alice_fed());
+    assert_eq!(stored_widening.scrub_key_id, alice_fed());
     assert_eq!(
         stored_widening.attestation_envelope["references_attestation_id"],
         serde_json::json!(msg.attestation_id)
@@ -411,7 +450,7 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
     // key — ONE message, the widening; the `self` copy is folded away.
     let seen = chat::messages_in_room(
         &*w.dir,
-        &["alice-fed".to_string()],
+        &[alice_fed()],
         &w.room,
         &content_store(&w).await,
         &me_of(&w).await,
@@ -425,8 +464,8 @@ async fn the_author_signs_at_write_and_the_signature_survives_the_crossing() {
         Body::Text(BODY.to_owned()),
         "opened with the far end's copy of the room key"
     );
-    assert_eq!(m.author_key_id, "alice-fed", "WHOSE WORDS — the attester");
-    assert_eq!(m.attesting_key_id, "alice-fed");
+    assert_eq!(m.author_key_id, alice_fed(), "WHOSE WORDS — the attester");
+    assert_eq!(m.attesting_key_id, alice_fed());
     assert_eq!(
         m.attestation_id, widened.attestation_id,
         "the row on the wire"
@@ -449,12 +488,12 @@ async fn the_mls_handshake_rides_the_room_as_signed_rows() {
     let room = w.room.clone();
 
     // Bob (the joiner) mints and shares his KeyPackage.
-    let (material, kp) = mint_cohort_key_material("bob-fed").unwrap();
+    let (material, kp) = mint_cohort_key_material(bob_fed().as_str()).unwrap();
     let kp_bytes = key_package_to_bytes(kp).unwrap();
-    let kp_row = chat::key_package_attestation(&w.bob, "alice-fed", &kp_bytes, ts())
+    let kp_row = chat::key_package_attestation(&w.bob, alice_fed().as_str(), &kp_bytes, ts())
         .await
         .unwrap();
-    assert_eq!(kp_row.attesting_key_id, "bob-fed");
+    assert_eq!(kp_row.attesting_key_id, bob_fed());
     assert!(kp_row.scrub_signature_pqc.is_some(), "full hybrid");
     w.dir
         .put_attestation(SignedAttestation {
@@ -474,22 +513,23 @@ async fn the_mls_handshake_rides_the_room_as_signed_rows() {
     assert!(matches!(placed.shared, Shared::Placed { .. }), "{placed:?}");
 
     // Alice (the creator) reads it off the room, admits Bob, shares the Welcome.
-    let got = chat::key_package_from(&*w.dir, "bob-fed", &room)
+    let got = chat::key_package_from(&*w.dir, bob_fed().as_str(), &room)
         .await
         .unwrap()
         .expect("the KeyPackage row is in the room");
     assert_eq!(got, kp_bytes, "byte-exact through the row");
-    let a = CohortGroup::create(store("alice-wire"), &room, "alice-fed", 16)
+    let a = CohortGroup::create(store("alice-wire"), &room, alice_fed().as_str(), 16)
         .await
         .unwrap();
     let commit = a
-        .add_member("bob-fed", key_package_from_bytes(&got).unwrap())
+        .add_member(bob_fed().as_str(), key_package_from_bytes(&got).unwrap())
         .await
         .unwrap();
     let welcome = commit.welcome().unwrap().to_vec();
-    let w_row = chat::welcome_attestation(&w.alice, "bob-fed", &welcome, commit.epoch(), ts())
-        .await
-        .unwrap();
+    let w_row =
+        chat::welcome_attestation(&w.alice, bob_fed().as_str(), &welcome, commit.epoch(), ts())
+            .await
+            .unwrap();
     w.dir
         .put_attestation(SignedAttestation {
             attestation: w_row.clone(),
@@ -507,7 +547,7 @@ async fn the_mls_handshake_rides_the_room_as_signed_rows() {
     .unwrap();
 
     // Bob reads the Welcome off the room and joins.
-    let (got_welcome, epoch) = chat::welcome_from(&*w.dir, "alice-fed", &room)
+    let (got_welcome, epoch) = chat::welcome_from(&*w.dir, alice_fed().as_str(), &room)
         .await
         .unwrap()
         .expect("the Welcome row is in the room");
@@ -516,7 +556,7 @@ async fn the_mls_handshake_rides_the_room_as_signed_rows() {
     // CIRISEdge#696 / FSD §7 S13 — the addressed read carries the ROW's
     // instant beside the bytes and epoch, so a restarted creator can tell
     // whether a member was welcomed for its current add.
-    let placed = chat::welcome_for_row(&*w.dir, "alice-fed", &room, "bob-fed")
+    let placed = chat::welcome_for_row(&*w.dir, alice_fed().as_str(), &room, bob_fed().as_str())
         .await
         .unwrap()
         .expect("the Welcome addressed to bob is in the room");
@@ -592,11 +632,11 @@ async fn carry_commit(
 async fn concurrent_rotates_converge_through_the_rows() {
     let w = world().await;
     let room = w.room.clone();
-    let (material, kp) = mint_cohort_key_material("bob-fed").unwrap();
-    let a = CohortGroup::create(store("alice-conv"), &room, "alice-fed", 16)
+    let (material, kp) = mint_cohort_key_material(bob_fed().as_str()).unwrap();
+    let a = CohortGroup::create(store("alice-conv"), &room, alice_fed().as_str(), 16)
         .await
         .unwrap();
-    let add = a.add_member("bob-fed", kp).await.unwrap();
+    let add = a.add_member(bob_fed().as_str(), kp).await.unwrap();
     let b = CohortGroup::join(
         store("bob-conv"),
         &room,
@@ -628,7 +668,7 @@ async fn concurrent_rotates_converge_through_the_rows() {
     );
 
     // Bob reads Alice's row off the room: he lost, rolls back, re-proposes.
-    let bobs = chat::apply_room_commits(&b, &*w.dir, "alice-fed", &room)
+    let bobs = chat::apply_room_commits(&b, &*w.dir, alice_fed().as_str(), &room)
         .await
         .unwrap();
     assert_eq!(
@@ -645,7 +685,7 @@ async fn concurrent_rotates_converge_through_the_rows() {
     }
 
     // Alice reads Bob's rows: his original is discarded, his re-proposal applies.
-    let alices = chat::apply_room_commits(&a, &*w.dir, "bob-fed", &room)
+    let alices = chat::apply_room_commits(&a, &*w.dir, bob_fed().as_str(), &room)
         .await
         .unwrap();
     assert_eq!(
@@ -664,7 +704,7 @@ async fn concurrent_rotates_converge_through_the_rows() {
     );
 
     // Idempotent: a second read of the same rows moves nothing.
-    let again = chat::apply_room_commits(&a, &*w.dir, "bob-fed", &room)
+    let again = chat::apply_room_commits(&a, &*w.dir, bob_fed().as_str(), &room)
         .await
         .unwrap();
     assert_eq!((again.applied, again.reproposed.len()), (0, 0));
@@ -693,8 +733,8 @@ async fn a_widening_carries_the_claims_instant_and_records_its_own() {
     let Shared::Placed { attestation_id } = &crossing.shared else {
         panic!("{:?}", crossing.shared)
     };
-    let prior = w.stored("alice-fed", &msg.attestation_id).await;
-    let widening = w.stored("alice-fed", attestation_id).await;
+    let prior = w.stored(alice_fed().as_str(), &msg.attestation_id).await;
+    let widening = w.stored(alice_fed().as_str(), attestation_id).await;
 
     let claim_at = prior.attestation_envelope["asserted_at"].as_str().unwrap();
     assert_eq!(
@@ -718,7 +758,7 @@ async fn a_widening_carries_the_claims_instant_and_records_its_own() {
     // Which is exactly what lets the far end open the row it actually gets.
     let seen = chat::messages_in_room(
         &*w.dir,
-        &["alice-fed".to_string()],
+        &[alice_fed()],
         &w.room,
         &content_store(&w).await,
         &me_of(&w).await,
@@ -741,10 +781,16 @@ async fn a_forged_on_behalf_of_claim_projects_the_attester() {
     // Bob emits into the room, claiming to speak for Alice.
     let mut row = {
         let store = content_store(&w).await;
-        chat::chat_message_attestation(&w.bob, "alice-fed", "not alice's words", ts(), &store)
-            .await
-            .unwrap()
-            .0
+        chat::chat_message_attestation(
+            &w.bob,
+            alice_fed().as_str(),
+            "not alice's words",
+            ts(),
+            &store,
+        )
+        .await
+        .unwrap()
+        .0
     };
     // A real forger signs the lie: the claim goes INSIDE the envelope and the
     // row is re-signed, so it is byte-consistent and persist admits it.
@@ -752,7 +798,7 @@ async fn a_forged_on_behalf_of_claim_projects_the_attester() {
     // that is the substrate working, not the attack under test.)
     row.attestation_envelope.as_object_mut().unwrap().insert(
         chat::FIELD_ON_BEHALF_OF.to_owned(),
-        serde_json::json!("alice-fed"),
+        serde_json::json!(alice_fed()),
     );
     let canonical =
         ciris_persist::prelude::ceg_produce_canonicalize(&row.attestation_envelope).unwrap();
@@ -765,14 +811,15 @@ async fn a_forged_on_behalf_of_claim_projects_the_attester() {
 
     let m = chat::ChatMessage::from_row(&row, &w.room).expect("a chat row");
     assert_eq!(
-        m.author_key_id, "bob-fed",
+        m.author_key_id,
+        bob_fed(),
         "attribution is the ATTESTER — a producer-asserted member cannot outrank the \
          key persist verified the signature against"
     );
-    assert_eq!(m.attesting_key_id, "bob-fed");
+    assert_eq!(m.attesting_key_id, bob_fed());
     assert_eq!(
         m.on_behalf_of_claim.as_deref(),
-        Some("alice-fed"),
+        Some(alice_fed().as_str()),
         "the claim is surfaced, clearly as a claim"
     );
 
@@ -795,7 +842,7 @@ async fn a_forged_on_behalf_of_claim_projects_the_attester() {
     .unwrap();
     let seen = chat::messages_in_room(
         &*w.dir,
-        &["bob-fed".to_string()],
+        &[bob_fed()],
         &w.room,
         &content_store(&w).await,
         &me_of(&w).await,
@@ -804,10 +851,14 @@ async fn a_forged_on_behalf_of_claim_projects_the_attester() {
     .unwrap();
     assert_eq!(seen.len(), 1, "{seen:?}");
     assert_eq!(
-        seen[0].author_key_id, "bob-fed",
+        seen[0].author_key_id,
+        bob_fed(),
         "an unbacked claim promotes nothing"
     );
-    assert_eq!(seen[0].on_behalf_of_claim.as_deref(), Some("alice-fed"));
+    assert_eq!(
+        seen[0].on_behalf_of_claim.as_deref(),
+        Some(alice_fed().as_str())
+    );
 }
 
 /// A message for a DIFFERENT room is not in this one. The room filter is on
@@ -828,10 +879,10 @@ async fn a_message_for_another_room_does_not_appear_here() {
     .await
     .unwrap();
 
-    let other_room = chat::pair_community_key_id("alice-fed", "carol-fed");
+    let other_room = chat::pair_community_key_id(&alice_fed(), &carol_fed());
     let seen = chat::messages_in_room(
         &*w.dir,
-        &["alice-fed".to_string()],
+        &[alice_fed()],
         &other_room,
         &content_store(&w).await,
         &me_of(&w).await,
@@ -972,7 +1023,7 @@ async fn share_places_then_reports_already_there() {
         panic!("{:?}", first.shared)
     };
 
-    let wide = w.stored("alice-fed", wide_id).await;
+    let wide = w.stored(alice_fed().as_str(), wide_id).await;
     assert_eq!(
         (wide.tier.as_str(), wide.cohort_scope.as_str()),
         ("federation", "community")
@@ -994,7 +1045,7 @@ async fn share_places_then_reports_already_there() {
     );
     assert_eq!(again.widened, None);
 
-    let original = w.stored("alice-fed", &msg.attestation_id).await;
+    let original = w.stored(alice_fed().as_str(), &msg.attestation_id).await;
     let third = share(
         &*w.dir,
         &original,
@@ -1018,7 +1069,11 @@ async fn share_places_then_reports_already_there() {
         "{:?}",
         third.widened
     );
-    let rows = w.dir.list_attestations_by("alice-fed").await.unwrap();
+    let rows = w
+        .dir
+        .list_attestations_by(alice_fed().as_str())
+        .await
+        .unwrap();
     assert_eq!(
         rows.iter()
             .filter(|a| a.attestation_type == "supersedes")
@@ -1036,7 +1091,7 @@ async fn the_share_plan_is_decided_before_any_directory_and_refuses_a_narrowing(
     let w = world().await;
     let msg = {
         let store = content_store(&w).await;
-        chat::chat_message_attestation(&w.alice, "bob-fed", "x", ts(), &store)
+        chat::chat_message_attestation(&w.alice, bob_fed().as_str(), "x", ts(), &store)
             .await
             .unwrap()
             .0
@@ -1097,7 +1152,7 @@ async fn the_share_plan_is_decided_before_any_directory_and_refuses_a_narrowing(
     let Shared::Placed { attestation_id } = placed.shared else {
         panic!()
     };
-    let stored_wide = w.stored("alice-fed", &attestation_id).await;
+    let stored_wide = w.stored(alice_fed().as_str(), &attestation_id).await;
     let err = share(
         &*w.dir,
         &stored_wide,
@@ -1124,7 +1179,7 @@ async fn keep_local_is_a_true_statement_or_an_error() {
 
     let mut revocation = msg.clone();
     revocation.attestation_type = "withdraws".to_owned();
-    revocation.subject_key_ids = vec!["bob-fed".to_owned()];
+    revocation.subject_key_ids = vec![bob_fed()];
     let err = keep_local(&revocation).unwrap_err();
     assert!(err.contains("CC 5.3.2.2"), "{err}");
 }
@@ -1143,10 +1198,10 @@ async fn publish_places_at_the_public_tier() {
     assert_eq!(crossing.ci.recipient_see, Audience::Federation);
     assert_eq!(crossing.routes_to, RoutesTo::Everyone);
     assert!(crossing.discoverable);
-    let wide = w.stored("alice-fed", attestation_id).await;
+    let wide = w.stored(alice_fed().as_str(), attestation_id).await;
     assert_eq!(wide.cohort_scope, "federation");
     assert_eq!(wide.tier, "federation");
-    let original = w.stored("alice-fed", &msg.attestation_id).await;
+    let original = w.stored(alice_fed().as_str(), &msg.attestation_id).await;
     assert_eq!(
         (original.tier.as_str(), original.cohort_scope.as_str()),
         ("federation", "self")
@@ -1211,18 +1266,18 @@ async fn the_nine_axes_are_stated_and_verified_at_the_crossing() {
     .await
     .unwrap();
     let ci = &crossing.ci;
-    assert_eq!(ci.sender, "alice-fed", "the sender IS the attester");
+    assert_eq!(ci.sender, alice_fed(), "the sender IS the attester");
     assert_eq!(
         ci.data_subject,
         DataSubject::Keys {
-            key_ids: vec!["alice-fed".into()]
+            key_ids: vec![alice_fed()]
         }
     );
     assert_eq!(ci.recipient_see, w.room_with().audience());
     assert_eq!(
         ci.recipient_revoke,
         RevocationAuthority::Subjects {
-            key_ids: vec!["alice-fed".into()]
+            key_ids: vec![alice_fed()]
         }
     );
     assert_eq!(ci.recipient_receive, direct.recipient_receive);
@@ -1245,7 +1300,7 @@ async fn custody_is_the_actors_or_it_waits() {
     let w = world().await;
     let signed = {
         let store = content_store(&w).await;
-        chat::chat_message_attestation(&w.alice, "bob-fed", "c", ts(), &store)
+        chat::chat_message_attestation(&w.alice, bob_fed().as_str(), "c", ts(), &store)
             .await
             .unwrap()
             .0
@@ -1269,7 +1324,7 @@ async fn custody_is_the_actors_or_it_waits() {
         let TierPromotionCustody::NodeCoScrub(scrub) = custody else {
             panic!("{custody:?}")
         };
-        assert_eq!(scrub.scrub_key_id, "alice-node");
+        assert_eq!(scrub.scrub_key_id, alice_node());
         assert!(is_canonical_instant(scrub.cosigned_at.as_deref().unwrap()));
     }
     assert!(custody_for(
@@ -1286,7 +1341,7 @@ async fn custody_is_the_actors_or_it_waits() {
     let TierPromotionCustody::ActorSigned(reseal) = custody else {
         panic!("{custody:?}")
     };
-    assert_eq!(reseal.scrub_key_id, "alice-fed");
+    assert_eq!(reseal.scrub_key_id, alice_fed());
     assert_eq!(reseal.original_content_hash, signed.original_content_hash);
     let err = custody_for(
         &deferred,
@@ -1326,7 +1381,7 @@ async fn without_the_actor_the_row_enters_but_the_widening_waits() {
     assert!(
         matches!(crossing.shared, Shared::AwaitingActor { ref attestation_id, .. } if *attestation_id == msg.attestation_id)
     );
-    let original = w.stored("alice-fed", &msg.attestation_id).await;
+    let original = w.stored(alice_fed().as_str(), &msg.attestation_id).await;
     assert_eq!(
         (original.tier.as_str(), original.cohort_scope.as_str()),
         ("federation", "self")
@@ -1379,7 +1434,7 @@ async fn signed_instants_are_canonical() {
     let Shared::Placed { attestation_id } = &crossing.shared else {
         panic!()
     };
-    let wide = w.stored("alice-fed", attestation_id).await;
+    let wide = w.stored(alice_fed().as_str(), attestation_id).await;
     let at = wide.attestation_envelope["asserted_at"].as_str().unwrap();
     assert!(is_canonical_instant(at), "{at}");
     let parsed: chrono::DateTime<chrono::Utc> =
@@ -1402,8 +1457,8 @@ async fn both_members_of_the_pair_room_are_moderators() {
     let mods = ciris_persist::federation::admission::moderators_of(&*w.dir, &w.room, "moderate")
         .await
         .expect("moderators_of");
-    for who in ["alice-fed", "bob-fed"] {
-        assert!(mods.iter().any(|m| m == who), "{who} moderates: {mods:?}");
+    for who in [alice_fed(), bob_fed()] {
+        assert!(mods.contains(&who), "{who} moderates: {mods:?}");
     }
 }
 
@@ -1430,9 +1485,9 @@ async fn a_classical_only_signer_is_refused_not_downgraded() {
     let w = world().await;
     let store = content_store(&w).await;
     let alice_classical: Arc<dyn HardwareSigner> =
-        Arc::new(Ed25519SoftwareSigner::from_bytes(&[1u8; 32], "alice-fed").unwrap());
-    let alice_half = ciris_edge::identity::LocalSigner::new("alice-fed", alice_classical, None);
-    let err = chat::chat_message_attestation(&alice_half, "bob-fed", "x", ts(), &store)
+        Arc::new(Ed25519SoftwareSigner::from_bytes(&[1u8; 32], "alice-fed-engine").unwrap());
+    let alice_half = ciris_edge::identity::LocalSigner::new(alice_fed(), alice_classical, None);
+    let err = chat::chat_message_attestation(&alice_half, bob_fed().as_str(), "x", ts(), &store)
         .await
         .unwrap_err();
     assert!(
@@ -1710,10 +1765,15 @@ async fn a_chat_message_stores_its_content_as_a_group_blob_and_reads_back() {
     let store = content_store(&w).await;
     let text = "the delivery model, proven";
 
-    let (row, sealed) =
-        ciris_edge::chat::chat_message_attestation(&w.alice, "bob-fed", text, ts(), &store)
-            .await
-            .expect("author a blob-backed chat message");
+    let (row, sealed) = ciris_edge::chat::chat_message_attestation(
+        &w.alice,
+        bob_fed().as_str(),
+        text,
+        ts(),
+        &store,
+    )
+    .await
+    .expect("author a blob-backed chat message");
 
     // The row carries a pointer and NO inline body.
     let env = &row.attestation_envelope;
@@ -1769,7 +1829,7 @@ async fn a_pointer_copied_onto_another_authors_row_does_not_open() {
 
     let (alice_row, _) = ciris_edge::chat::chat_message_attestation(
         &w.alice,
-        "bob-fed",
+        bob_fed().as_str(),
         "alice's words",
         ts(),
         &store,
@@ -1839,7 +1899,7 @@ async fn a_message_no_key_could_open_is_refused_before_it_is_sent() {
 
     let err = ciris_edge::chat::chat_message_attestation(
         &w.alice,
-        "bob-fed",
+        bob_fed().as_str(),
         "words nobody could read",
         ts(),
         &store,
@@ -1873,7 +1933,7 @@ async fn the_same_message_sends_once_the_occurrences_are_provisioned() {
 
     let (_row, sealed) = ciris_edge::chat::chat_message_attestation(
         &w.alice,
-        "bob-fed",
+        bob_fed().as_str(),
         "words nobody could read",
         ts(),
         &store,
@@ -1989,7 +2049,10 @@ async fn peer(humans: &[&ciris_edge::identity::LocalSigner], mine: (&str, u8)) -
     }
     let human = signer(human_id, seed);
     let ed_pub = human.classical.public_key().await.unwrap();
-    let derived = ciris_verify_core::fedcode::derive_key_id(human_id, &ed_pub);
+    // The ENGINE's key: derived from the signer's alias, as persist derives
+    // it (`derive_key_id(alias, pubkey)`), distinct from the person's own.
+    let derived =
+        ciris_verify_core::fedcode::derive_key_id(human.classical.current_alias(), &ed_pub);
     let mut rec = record(&derived, &human, &human, "node").await;
     rec.identity_ref = derived.clone();
     dir.put_public_key(SignedKeyRecord { record: rec })
@@ -2002,7 +2065,7 @@ async fn peer(humans: &[&ciris_edge::identity::LocalSigner], mine: (&str, u8)) -
         human.pqc.clone(),
     );
     let binding = ciris_edge::replication::attestation_bind::owner_binding_attestation(
-        human_id,
+        &human.key_id,
         &derived,
         ts(),
         &human,
@@ -2025,7 +2088,7 @@ async fn peer(humans: &[&ciris_edge::identity::LocalSigner], mine: (&str, u8)) -
     let (me, _) = ciris_edge::content_occurrence::provision_engine_occurrence(
         store.engine(),
         &*dir,
-        human_id,
+        &human.key_id,
         "server",
     )
     .await
@@ -2057,19 +2120,26 @@ async fn carry_identity(from: &Peer, to: &Peer) {
                 .expect("carry the owner binding");
         }
     }
-    let occ = from
-        .dir
-        .list_signed_identity_occurrences_since(None, 64)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|s| s.occurrence)
-        .find(|o| o.identity_occurrence.occurrence_key_id == from.me)
-        .expect("the occurrence is ON the signed plane (CIRISPersist#851)");
+    // persist v59.0.0 — the occurrence travels as its `identity:occurrence:v1`
+    // row through the attestation apply door; the framed object is retired.
+    let occ = ciris_persist::federation::FederationDirectory::list_attestations_since(
+        &*from.dir, None, 4096,
+    )
+    .await
+    .expect("list the attestation plane")
+    .into_iter()
+    .map(|row| row.attestation)
+    .find(|att| {
+        ciris_persist::federation::key_plane::occurrence_of_row(att)
+            .is_some_and(|o| o.identity_occurrence.occurrence_key_id == from.me)
+    })
+    .expect("the engine occurrence is on the row plane");
     to.dir
-        .put_identity_occurrence(occ)
+        .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: occ,
+        })
         .await
-        .expect("admit the occurrence through the gated door");
+        .expect("admit the far node's occurrence row");
 }
 
 /// What the Attestation cursor carries after a seal: every `key_grant:*`
@@ -2215,7 +2285,7 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
     let roster = chat::community(
         &room,
         "the trio",
-        &[("alice-fed", Some(MEMBER_ROLE_FOUNDER))],
+        &[(alice_fed().as_str(), Some(MEMBER_ROLE_FOUNDER))],
         consensus_protocol::FOUNDER_ONLY,
         ts(),
     )
@@ -2232,14 +2302,20 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
         // this one. Throwaway material — nothing signs AS the room.
         p.dir
             .put_public_key(SignedKeyRecord {
-                record: record(&room, &signer(&room, 9), &signer(&room, 9), "user").await,
+                record: record(
+                    &room,
+                    &room_signer(&room, 9),
+                    &room_signer(&room, 9),
+                    "user",
+                )
+                .await,
             })
             .await
             .expect("register the room id as a key (persist fixture convention)");
     }
     // ── Bob and carol join by consent: alice proposes, each accepts, alice
     //    widens — on alice's node, then the rows cross to the other two ──
-    for (member, who) in [(&bob, "bob-fed"), (&carol, "carol-fed")] {
+    for (member, who) in [(&bob, bob_fed().as_str()), (&carol, carol_fed().as_str())] {
         let proposal = ciris_edge::membership::propose(
             &*a.dir,
             ciris_edge::membership::GroupScope::Community,
@@ -2313,7 +2389,7 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
     );
     for to in [&b, &c] {
         carry_key_grants(&a, to).await;
-        carry_bytes(&a, to, &room, "alice-fed", &sealed1, t1)
+        carry_bytes(&a, to, &room, alice_fed().as_str(), &sealed1, t1)
             .await
             .expect("a member's node adopts the bytes");
     }
@@ -2337,7 +2413,7 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
     ciris_edge::community_roster::revoke_community_member(
         &*a.dir,
         &room,
-        "carol-fed",
+        carol_fed().as_str(),
         chrono::Utc::now(),
         Some("asked to leave"),
         &[],
@@ -2376,7 +2452,7 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
         sealed2.granted,
     );
     carry_key_grants(&a, &b).await;
-    carry_bytes(&a, &b, &room, "alice-fed", &sealed2, t2)
+    carry_bytes(&a, &b, &room, alice_fed().as_str(), &sealed2, t2)
         .await
         .expect("bob's node adopts the bytes");
     assert_eq!(
@@ -2389,7 +2465,7 @@ async fn a_three_member_room_opens_for_every_member_and_rotates_on_removal() {
     // to (persist #846 §4, `NotPartyTo`), and she is no longer party to the
     // room. Stronger than "cannot open": nothing lands.
     carry_key_grants(&a, &c).await;
-    let refused = carry_bytes(&a, &c, &room, "alice-fed", &sealed2, t2).await;
+    let refused = carry_bytes(&a, &c, &room, alice_fed().as_str(), &sealed2, t2).await;
     assert!(
         matches!(
             refused,
@@ -2430,7 +2506,7 @@ async fn a_chat_message_cites_its_blob_in_evidence_refs_and_keeps_the_pointer() 
     let roster = chat::community(
         &room,
         "solo",
-        &[("alice-fed", Some(MEMBER_ROLE_FOUNDER))],
+        &[(alice_fed().as_str(), Some(MEMBER_ROLE_FOUNDER))],
         consensus_protocol::FOUNDER_ONLY,
         ts(),
     )
@@ -2442,7 +2518,13 @@ async fn a_chat_message_cites_its_blob_in_evidence_refs_and_keeps_the_pointer() 
         .expect("the node admits the room");
     a.dir
         .put_public_key(SignedKeyRecord {
-            record: record(&room, &signer(&room, 9), &signer(&room, 9), "user").await,
+            record: record(
+                &room,
+                &room_signer(&room, 9),
+                &room_signer(&room, 9),
+                "user",
+            )
+            .await,
         })
         .await
         .expect("register the room id as a key (persist fixture convention)");

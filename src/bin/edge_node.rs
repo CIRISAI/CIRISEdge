@@ -1459,13 +1459,28 @@ fn spawn_inbound(
     // the publisher opens to this node arrives here (attributed through the
     // #393 gate), and its frames feed the SAME media mailbox the receive loop
     // reads. Nothing from an A/V link ever reaches the listener above.
+    //
+    // Each link opens with the dialler's transit KEX handshake (CIRISEdge#805,
+    // CC 5.3.3.5 E1), answered here before any media is read: a refused
+    // handshake (no handshake, or a claim that is not the link's peer) closes
+    // the link. The harness's media still rides its own room-wide outer key
+    // (`epoch_keys`): see that function on why it has not moved yet.
     if let Some(mut arrivals) = transport.take_av_arrivals() {
+        let transport = Arc::clone(transport);
         tokio::spawn(async move {
             while let Some(arrival) = arrivals.recv().await {
                 let med_tx = av_med_tx.clone();
                 let peer = arrival.peer.as_str().to_owned();
                 tracing::info!(peer = %peer, "A/V call link arrived (CIRISEdge#805)");
+                let transport = Arc::clone(&transport);
                 tokio::spawn(async move {
+                    let arrival = match transport.accept_av_arrival(arrival).await {
+                        Ok(accepted) => accepted.arrival,
+                        Err(e) => {
+                            tracing::warn!(peer = %peer, error = %e, "A/V call link refused");
+                            return;
+                        }
+                    };
                     while let Ok(bytes) = arrival.inbound.recv().await {
                         if let Some((KIND_MEDIA, header, payload)) = decode_frame(&bytes) {
                             let _ = med_tx.send((Some(peer.clone()), header, payload.to_vec()));
@@ -3017,11 +3032,21 @@ fn open_sealed_kv(state_dir: &Path, fed_seed_path: &Path) -> Result<XChaChaKvSto
 /// The media DEK and the per-link transit key for an epoch.
 ///
 /// **Labelled, harness-only derivation.** Production takes the A/V DEK
-/// from an `AvSession`'s own MLS group and the transit key from a
-/// `FederationSession` hybrid KEX. Neither is reachable across process
-/// boundaries today: the A/V session join rides on the in-flight spine,
-/// and `SessionHandshakeMsg` has no serde wire form, so a cross-process
-/// KEX would need a hand-rolled codec.
+/// from an `AvSession`'s own MLS group and the transit key from the per-link
+/// transit KEX the A/V dial runs (CIRISEdge#805, `av_transit_handshake`).
+///
+/// The harness's transit key has not moved to that KEX in the #805 cut, and
+/// cannot by a substitution: it seals each chunk ONCE per member before
+/// choosing a mechanism (`MediaLink` has a Resource path besides the A/V
+/// plane), uses the member's key id as the nonce's `link_id` and the frame
+/// sequence as its counter, and the receiver opens by EPOCH from a key ring
+/// (`open_media`). Per-link keys need per-link seal state on the sender,
+/// per-link open state on the receiver, and a new shape for the observer
+/// refusal leg (an observer has no A/V link, so no handshake key). The A/V
+/// links themselves DO run the handshake (dial and `accept_av_arrival`); only
+/// the harness's own outer layer is still this one. The DEK likewise: the
+/// A/V session join rides on the in-flight spine, so the harness does not
+/// hold an `AvSession` across processes.
 ///
 /// What is used instead is still a *real* MLS exporter — the cohort's
 /// record-plane secret, which every member derives identically and which
@@ -6222,7 +6247,98 @@ async fn run_nonmember(occ: Occurrence) -> Result<(), String> {
 // main
 // ═══════════════════════════════════════════════════════════════════
 
+/// CC 5.3.4 (rc9 0d9e7f0) — `edge_node emit-transport-destination`: the
+/// OFFLINE emit of this node's hybrid-signed `transport_destination` row WITH
+/// its transit KEX pair, for the bundle re-mint. No network: it opens the
+/// node's own custody as a boot does (the federation seeds under
+/// `<state-dir>/fed`, the transport identity and its transit seed at
+/// `<state-dir>/transport.id`), never minting any of them, and signs through
+/// the runtime's own producer (`self_route::sign_route_offline`). The row is
+/// written as JSON to `--out`. Production hosts call the same function
+/// (`reticulum::emit_route_from_custody`) through PyO3
+/// `emit_transport_destination`.
+///
+/// ```text
+/// edge_node emit-transport-destination --state-dir <dir> --node-name <name> \
+///     --out <file> [--epoch <n>] [--asserted-at <rfc3339>]
+/// ```
+///
+/// Exit 0 with the row written; exit 2 with a named error on stderr
+/// (`{"error":"<label>","detail":...}`) and nothing written otherwise —
+/// a row without a transit pair among them (`offline_emit_no_transit_pair`).
+fn emit_transport_destination(args: &[String]) -> std::process::ExitCode {
+    fn fail(label: &str, detail: &str) -> std::process::ExitCode {
+        eprintln!("{}", serde_json::json!({"error": label, "detail": detail}));
+        std::process::ExitCode::from(2)
+    }
+    let arg = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let (Some(state_dir), Some(node_name), Some(out)) =
+        (arg("--state-dir"), arg("--node-name"), arg("--out"))
+    else {
+        return fail(
+            "offline_emit_usage",
+            "emit-transport-destination --state-dir <dir> --node-name <name> --out <file> \
+             [--epoch <n>] [--asserted-at <rfc3339>]",
+        );
+    };
+    let epoch = match arg("--epoch").map(|e| e.parse::<u64>()) {
+        None => 0,
+        Some(Ok(e)) => e,
+        Some(Err(e)) => return fail("offline_emit_usage", &format!("--epoch: {e}")),
+    };
+    let asserted_at = match arg("--asserted-at").map(|t| chrono::DateTime::parse_from_rfc3339(&t)) {
+        None => chrono::Utc::now(),
+        Some(Ok(t)) => t.with_timezone(&chrono::Utc),
+        Some(Err(e)) => return fail("offline_emit_usage", &format!("--asserted-at: {e}")),
+    };
+    let state_dir = PathBuf::from(state_dir);
+    let fed_dir = state_dir.join("fed");
+    if !fed_dir.join("ed25519.seed").exists() || !fed_dir.join("mldsa65.seed").exists() {
+        return fail(
+            "offline_emit_no_federation_key",
+            &format!("no federation seeds under {}", fed_dir.display()),
+        );
+    }
+    let signer = match FedKey::load_or_create(&node_name, &fed_dir)
+        .and_then(|fed| fed.identity_signer(&node_name))
+    {
+        Ok(s) => s,
+        Err(e) => return fail("offline_emit_no_federation_key", &e),
+    };
+    let rt = match tokio::runtime::Builder::new_current_thread().build() {
+        Ok(rt) => rt,
+        Err(e) => return fail("offline_emit_runtime", &e.to_string()),
+    };
+    let row = rt.block_on(ciris_edge::transport::reticulum::emit_route_from_custody(
+        &signer,
+        &state_dir.join("transport.id"),
+        epoch,
+        asserted_at,
+    ));
+    let row = match row {
+        Ok(r) => r,
+        Err(e) => return fail(e.label(), &e.to_string()),
+    };
+    let json = match serde_json::to_vec_pretty(&row) {
+        Ok(j) => j,
+        Err(e) => return fail("offline_emit_serialize", &e.to_string()),
+    };
+    if let Err(e) = std::fs::write(&out, json) {
+        return fail("offline_emit_write", &e.to_string());
+    }
+    std::process::ExitCode::SUCCESS
+}
+
 fn main() -> std::process::ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("emit-transport-destination") {
+        return emit_transport_destination(&args[2..]);
+    }
     // Logs to STDERR (the JSONL owns stdout, and mixing them would corrupt the
     // census's input). Default `info`, overridable with `RUST_LOG`.
     //

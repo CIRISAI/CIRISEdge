@@ -128,10 +128,10 @@ pub struct ClaimConformance {
 /// at an old version, published here against the live symbol. Withheld from
 /// that list, each because edge does not meet the section yet: `CLM-holder`
 /// (5.3.2.1 — edge still emits `Withdraws` on `ContentMiss`),
-/// `CLM-consent-counter` (3.4.7.2 — no OQ-3 review window),
-/// `CLM-registry-wire` (5.3.3.2.3 — `from_bytes` refuses the header-only
-/// wire the section says MUST read as opaque) and `CLM-transport-edge`
-/// (5.3.3.5 — E1's CIR2 sentence is open as CIRISConstitution#172).
+/// `CLM-consent-counter` (3.4.7.2 — no OQ-3 review window) and
+/// `CLM-transport-edge` (5.3.3.5 — E1's CIR2 sentence is open as
+/// CIRISConstitution#172). `CLM-registry-wire` was withheld until
+/// CIRISConstitution#173 withdrew the 48-byte compatibility read.
 pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[
     ClaimConformance {
         cc: "5.4.6",
@@ -152,6 +152,17 @@ pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[
                    touching the seal",
         check: check_namespace_realtime,
         evidence: "src/transport/realtime_av.rs#CODEC_AV1_SVC",
+    },
+    ClaimConformance {
+        cc: "5.3.3.2.3",
+        clm: "CLM-registry-wire",
+        property: "to_bytes lays out stream_id(32) | epoch u64 BE | chunk_seq u64 BE | codec_id | \
+                   spatial | temporal | quality | ciphertext and from_bytes reads it back; a wire \
+                   shorter than the 52-byte header, or whose ciphertext cannot carry the outer \
+                   and inner AEAD tags, is refused at parse; a relay refuses an inner ciphertext \
+                   too short for its tag at the outer open; a tag-less ciphertext never opens",
+        check: check_registry_wire,
+        evidence: "src/transport/realtime_av.rs#SealedAvChunk::to_bytes",
     },
     ClaimConformance {
         cc: "5.3.3.2.4",
@@ -500,6 +511,117 @@ fn check_namespace_realtime() -> Result<(), String> {
              changed the open: {other:?}"
         )),
     }
+}
+
+/// CIRISEdge#872 / CIRISConstitution#173 — `CLM-registry-wire` (CC 5.3.3.2.3
+/// at `acacce4`): the 52-byte header is always present.
+///
+/// Each refusal is checked at its own layer: the header and the two AEAD tags
+/// at parse, a tag-less inner ciphertext at the relay's outer open, and the
+/// AEAD for a truncated ciphertext that never went through the parser.
+fn check_registry_wire() -> Result<(), String> {
+    use crate::transport::realtime_av::{
+        inner_sealed_from_parts, open_av_chunk, open_av_outer, seal_av_chunk, seal_av_outer,
+        ChunkLayer, ChunkSeq, Epoch, EpochDek, RealtimeAvError, SealedAvChunk, StreamId,
+        AEAD_TAG_LEN, CHUNK_CODEC_LAYER_LEN, CHUNK_HEADER_LEN, CODEC_AV1_SVC,
+        MIN_DOUBLE_SEALED_LEN,
+    };
+
+    if (CHUNK_HEADER_LEN, CHUNK_CODEC_LAYER_LEN) != (48, 4) {
+        return Err("the header is 48 bytes plus the 4-byte codec+layer block".into());
+    }
+    let dek = EpochDek::from_bytes([0x3C; 32]);
+    let transit = [0xC3; 32];
+    let stream = [0x11; 32];
+    let layer = ChunkLayer {
+        spatial: 1,
+        temporal: 2,
+        quality: 3,
+    };
+    let sealed = seal_av_chunk(
+        b"chunk",
+        &transit,
+        b"link-173",
+        9,
+        &dek,
+        StreamId(stream),
+        Epoch(0x0102_0304_0506_0708),
+        ChunkSeq(0x1112_1314_1516_1718),
+        CODEC_AV1_SVC,
+        layer,
+    )
+    .map_err(|e| format!("seal: {e}"))?;
+    let wire = sealed.to_bytes();
+
+    let mut want = stream.to_vec();
+    want.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+    want.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
+    want.extend_from_slice(&[CODEC_AV1_SVC, 1, 2, 3]);
+    want.extend_from_slice(&sealed.double_sealed_ciphertext);
+    if wire != want {
+        return Err("to_bytes must lay the chunk out exactly as the section's table".into());
+    }
+    let back = SealedAvChunk::from_bytes(&wire).map_err(|e| format!("parse: {e}"))?;
+    if back.to_bytes() != wire
+        || back.stream_id != StreamId(stream)
+        || back.codec_id != CODEC_AV1_SVC
+        || back.layer != layer
+    {
+        return Err("from_bytes must read back what to_bytes wrote".into());
+    }
+
+    // Shorter than the 52-byte header: malformed, refused at parse.
+    for len in [0, 1, 47, 48, 51] {
+        if SealedAvChunk::from_bytes(&wire[..len]).is_ok() {
+            return Err(format!(
+                "a {len}-byte wire is shorter than the 52-byte header and must be refused"
+            ));
+        }
+    }
+    // A ciphertext too short for the outer + inner tags is malformed:
+    // refused at parse (CIRISConstitution#173), not left to the AEAD.
+    for extra in [0, 1, AEAD_TAG_LEN - 1, MIN_DOUBLE_SEALED_LEN - 1] {
+        if !matches!(
+            SealedAvChunk::from_bytes(&wire[..52 + extra]),
+            Err(RealtimeAvError::WireTooShort { .. })
+        ) {
+            return Err(format!(
+                "a wire with {extra} ciphertext bytes cannot carry both AEAD tags and must be \
+                 refused at parse"
+            ));
+        }
+        // Built in-process, past the parser, it still never opens — at the
+        // subscriber or at a relay — even under the right keys and counter.
+        let short = SealedAvChunk {
+            double_sealed_ciphertext: sealed.double_sealed_ciphertext[..extra].to_vec(),
+            ..sealed.clone()
+        };
+        if open_av_chunk(&short, &transit, b"link-173", 9, &dek).is_ok()
+            || open_av_outer(&short, &transit, b"link-173", 9).is_ok()
+        {
+            return Err(format!(
+                "a ciphertext of {extra} bytes carries no complete seal and must not open"
+            ));
+        }
+    }
+    // A relay's outer open refuses an inner ciphertext shorter than its tag,
+    // so a tag-less inner chunk is never forwarded.
+    let tagless = inner_sealed_from_parts(
+        StreamId(stream),
+        Epoch(1),
+        ChunkSeq(1),
+        CODEC_AV1_SVC,
+        layer,
+        vec![0u8; AEAD_TAG_LEN - 1],
+    );
+    let outer = seal_av_outer(&tagless, &transit, b"link-173", 10).map_err(|e| e.to_string())?;
+    if !matches!(
+        open_av_outer(&outer, &transit, b"link-173", 10),
+        Err(RealtimeAvError::InnerTooShort { .. })
+    ) {
+        return Err("a relay must refuse an inner ciphertext too short for its tag".into());
+    }
+    Ok(())
 }
 
 /// CIRISEdge#872 — `CLM-chunklayer` (CC 5.3.3.2.4): `admits` is the per-axis
@@ -1321,7 +1443,7 @@ mod tests {
 
     /// CIRISEdge#706 item 1 — **replay the CC vectors against edge's matcher.**
     ///
-    /// All 1103 published `(dimension, family, refusal)` triples (CC rc7), exact: a
+    /// All 1147 published `(dimension, family, refusal)` triples (CC rc8.1), exact: a
     /// matcher that answers differently from the reference on any one fails
     /// the build, every mismatch named. Edge's matcher is persist's — the
     /// full-match, refusal-bearing `namespace::matcher::match_family` of

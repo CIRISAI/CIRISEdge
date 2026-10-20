@@ -105,7 +105,7 @@ async fn no_path_send_fails_fast_and_loud_not_a_silent_30s_timeout() {
         let base = tmp.path().to_path_buf();
         async move {
             let mut c =
-                ReticulumTransportConfig::new(base.join("s/transport.id"), "edge-key-sender");
+                ReticulumTransportConfig::new(base.join("s/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.announce_interval = Duration::from_secs(30);
             let auth = auth_for(key, dir, &base).await;
@@ -215,7 +215,8 @@ async fn identified_link_from_an_advisory_key_owning_peer_is_attributed_659() {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), "edge-key-aaaa");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("a/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.announce_interval = Duration::from_secs(30);
             let auth = auth_for(key, dir, &base).await;
@@ -231,7 +232,8 @@ async fn identified_link_from_an_advisory_key_owning_peer_is_attributed_659() {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), "edge-key-bbbb");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("b/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
             c.announce_interval = Duration::from_secs(30);
@@ -252,7 +254,7 @@ async fn identified_link_from_an_advisory_key_owning_peer_is_attributed_659() {
     // provenance the test actually claims.
     transport_a
         .inject_advisory_peer_with_transport_identity_for_test(
-            "edge-key-bbbb",
+            key_b.key_id.as_str(),
             transport_b.local_dest_hash(),
             transport_b.local_transport_pubkey(),
         )
@@ -260,7 +262,7 @@ async fn identified_link_from_an_advisory_key_owning_peer_is_attributed_659() {
     let mut a_ed = [0u8; 32];
     a_ed.copy_from_slice(&transport_a.local_transport_pubkey()[32..64]);
     transport_b
-        .inject_rooted_peer_for_test("edge-key-aaaa", transport_a.local_dest_hash(), a_ed)
+        .inject_rooted_peer_for_test(key_a.key_id.as_str(), transport_a.local_dest_hash(), a_ed)
         .await;
 
     let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(16);
@@ -272,7 +274,7 @@ async fn identified_link_from_an_advisory_key_owning_peer_is_attributed_659() {
 
     // B → A. The send identifies the link before shipping the resource.
     transport_b
-        .send("edge-key-aaaa", b"attributed-inbound-frame")
+        .send(key_a.key_id.as_str(), b"attributed-inbound-frame")
         .await
         .expect("send B -> A");
 
@@ -302,7 +304,7 @@ async fn identified_link_from_an_advisory_key_owning_peer_is_attributed_659() {
             .source_key_id
             .as_ref()
             .map(ciris_edge::transport::SourceKeyId::as_str),
-        Some("edge-key-bbbb"),
+        Some(key_b.key_id.as_str()),
         "CIRISEdge#659 — an Advisory peer that owns its key and has a hybrid \
          transport binding is ATTRIBUTED; attribution is not trust",
     );
@@ -349,7 +351,8 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), "edge-key-aaaa");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("a/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.announce_interval = Duration::from_secs(30);
             let auth = auth_for(key, dir, &base).await;
@@ -366,7 +369,8 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), "edge-key-bbbb");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("b/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
             c.announce_interval = Duration::from_secs(30);
@@ -382,7 +386,7 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
     // #393 witness above for why this is no longer injected as Rooted).
     transport_a
         .inject_advisory_peer_with_transport_identity_for_test(
-            "edge-key-bbbb",
+            key_b.key_id.as_str(),
             [0xab; 16],
             transport_b.local_transport_pubkey(),
         )
@@ -391,7 +395,7 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
     let mut a_ed = [0u8; 32];
     a_ed.copy_from_slice(&transport_a.local_transport_pubkey()[32..64]);
     transport_b
-        .inject_rooted_peer_for_test("edge-key-aaaa", transport_a.local_dest_hash(), a_ed)
+        .inject_rooted_peer_for_test(key_a.key_id.as_str(), transport_a.local_dest_hash(), a_ed)
         .await;
 
     let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(16);
@@ -403,7 +407,7 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
 
     // Leg 1 — the "round-open": B dials + identifies + ships to A.
     transport_b
-        .send("edge-key-aaaa", b"round-open-from-the-phone")
+        .send(key_a.key_id.as_str(), b"round-open-from-the-phone")
         .await
         .expect("B -> A send (the phone's outbound leg) must deliver");
     let inbound_at_a = tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
@@ -420,14 +424,14 @@ async fn reply_to_a_nat_d_initiator_rides_the_live_inbound_link() {
             .source_key_id
             .as_ref()
             .map(ciris_edge::transport::SourceKeyId::as_str),
-        Some("edge-key-bbbb"),
+        Some(key_b.key_id.as_str()),
         "CIRISEdge#659: an advisory-admitted, key-owning inbound source IS attributed",
     );
 
     // Leg 2 — the REPLY: A -> B must ride B's live inbound link. Before the
     // fix this fast-failed NoRouteToPeer (phantom dest, no path).
     transport_a
-        .send("edge-key-bbbb", b"reply-over-the-reverse-path")
+        .send(key_b.key_id.as_str(), b"reply-over-the-reverse-path")
         .await
         .expect(
             "A -> B reply MUST deliver over B's live inbound link (CIRISEdge#353) — \
@@ -494,7 +498,8 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), "edge-key-aaaa");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("a/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.announce_interval = Duration::from_secs(30);
             (c, auth_for(key, dir, &base).await)
@@ -508,7 +513,8 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), "edge-key-bbbb");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("b/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
             c.announce_interval = Duration::from_secs(30);
@@ -521,7 +527,7 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
     // the NAT model — if the reverse path falls back to a dial, it CANNOT reach B.
     transport_a
         .inject_rooted_peer_with_transport_identity_for_test(
-            "edge-key-bbbb",
+            key_b.key_id.as_str(),
             [0xab; 16],
             transport_b.local_transport_pubkey(),
         )
@@ -529,7 +535,7 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
     let mut a_ed = [0u8; 32];
     a_ed.copy_from_slice(&transport_a.local_transport_pubkey()[32..64]);
     transport_b
-        .inject_rooted_peer_for_test("edge-key-aaaa", transport_a.local_dest_hash(), a_ed)
+        .inject_rooted_peer_for_test(key_a.key_id.as_str(), transport_a.local_dest_hash(), a_ed)
         .await;
 
     let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(16);
@@ -541,7 +547,7 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
 
     // B dials + identifies its inbound link at A (the round-open).
     transport_b
-        .send("edge-key-aaaa", b"round-open")
+        .send(key_a.key_id.as_str(), b"round-open")
         .await
         .expect("B -> A");
     tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
@@ -553,7 +559,7 @@ async fn busy_reverse_path_delivers_a_packet_reply_interleaving_the_transfer() {
     // on retry #3, NOT dial B's phantom dest.
     transport_a.force_next_sends_busy_for_test(2);
     transport_a
-        .send("edge-key-bbbb", b"reply-over-a-busy-link-as-a-packet")
+        .send(key_b.key_id.as_str(), b"reply-over-a-busy-link-as-a-packet")
         .await
         .expect(
             "reply MUST interleave the BUSY reverse-path link as a packet and deliver, not fall back to the \

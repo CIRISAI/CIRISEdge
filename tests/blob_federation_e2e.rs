@@ -93,14 +93,22 @@ struct Ident {
 }
 
 impl Ident {
-    fn new(key_id: &str, seed: u8) -> Self {
-        let mut ed = Ed25519SoftwareSigner::new(key_id);
+    /// persist #1103 (CC 2.6.8) — the `key_id` is DERIVED from the key's own
+    /// Ed25519 pubkey (`derive_key_id(label, pubkey)`), never
+    /// hand-written: `put_public_key` refuses a `-<fp>` suffix that is not its
+    /// key's fingerprint.
+    fn new(label: &str, seed: u8) -> Self {
+        // Aliased `<label>-engine`: an engine over this signer derives
+        // `derive_key_id(alias, pubkey)`, a row distinct from the identity's
+        // own (the person/node split these worlds model).
+        let mut ed = Ed25519SoftwareSigner::new(format!("{label}-engine"));
         ed.import_key(&[seed; 32]).expect("import ed key");
         let pqc =
-            MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{key_id}-pqc"))
+            MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{label}-pqc"))
                 .expect("ml-dsa from seed");
+        let pubkey = futures::executor::block_on(ed.public_key()).expect("ed pubkey");
         Self {
-            key_id: key_id.to_owned(),
+            key_id: ciris_verify_core::fedcode::derive_key_id(label, &pubkey),
             seed,
             ed,
             pqc,
@@ -843,31 +851,35 @@ async fn federate(from: &Node, to: &Node) {
     // key_grant admission needs on the FAR node had no replicable form and
     // every receiving node refused every set with `signer_not_active_member`.
     //
-    // Reading it off `list_signed_identity_occurrences_since` and admitting it
-    // through the GATED `put_identity_occurrence` is therefore the assertion,
-    // not the plumbing: it passes only because the occurrence was PUBLISHED
+    // Reading its `identity:occurrence:v1` ROW off the attestation plane and
+    // admitting it through the attestation apply door (persist v59.0.0: the
+    // row is the occurrence's only carriage) is therefore the assertion, not
+    // the plumbing: a row exists only because the occurrence was PUBLISHED
     // (`Engine::publish_self_occurrence`, via `provision_engine_occurrence`).
     // Revert edge to the local door and this line finds nothing to carry.
-    let served = from
-        .dir
-        .list_signed_identity_occurrences_since(None, 64)
-        .await
-        .expect("list the signed occurrence plane");
-    let occ = served
-        .into_iter()
-        .map(|s| s.occurrence)
-        .find(|o| {
+    let occ = ciris_persist::federation::FederationDirectory::list_attestations_since(
+        &*from.dir, None, 4096,
+    )
+    .await
+    .expect("list the attestation plane")
+    .into_iter()
+    .map(|row| row.attestation)
+    .find(|att| {
+        ciris_persist::federation::key_plane::occurrence_of_row(att).is_some_and(|o| {
             o.identity_occurrence.occurrence_key_id == from.me
                 && o.identity_occurrence.identity_key_id == from.identity
         })
-        .expect(
-            "the engine occurrence is ON the signed plane — if this is None the node wrote it \
-             through the trusted-local door and CIRISPersist#851 is back",
-        );
+    })
+    .expect(
+        "the engine occurrence is ON the row plane — if this is None the node wrote it \
+         through the trusted-local door and CIRISPersist#851 is back",
+    );
     to.dir
-        .put_identity_occurrence(occ)
+        .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: occ,
+        })
         .await
-        .expect("admit the far node's published occurrence through the gated door");
+        .expect("admit the far node's published occurrence row");
 }
 
 // ─── #851 / PR #607 review: what a republish is allowed to overwrite ──
@@ -895,17 +907,19 @@ async fn a_legacy_occurrence_is_healed_onto_the_plane_and_keeps_its_expiry() {
     use ciris_persist::federation::{EncryptionPubkeys, FederationDirectory as _};
 
     // The plane membership question, asked the way a peer asks it.
+    // persist v59.0.0 — the occurrence's `identity:occurrence:v1` row.
     async fn on_plane(dir: &Arc<SqliteBackend>, identity: &str, occ: &str) -> bool {
-        ciris_persist::federation::FederationDirectory::list_signed_identity_occurrences_since(
-            &**dir, None, 256,
-        )
-        .await
-        .expect("list the signed plane")
-        .into_iter()
-        .any(|s| {
-            let o = &s.occurrence.identity_occurrence;
-            o.identity_key_id == identity && o.occurrence_key_id == occ
-        })
+        ciris_persist::federation::FederationDirectory::list_attestations_since(&**dir, None, 4096)
+            .await
+            .expect("list the attestation plane")
+            .into_iter()
+            .any(|row| {
+                ciris_persist::federation::key_plane::occurrence_of_row(&row.attestation)
+                    .is_some_and(|s| {
+                        let o = &s.identity_occurrence;
+                        o.identity_key_id == identity && o.occurrence_key_id == occ
+                    })
+            })
     }
 
     async fn enc_of(dir: &Arc<SqliteBackend>) -> EncryptionPubkeys {
@@ -7408,5 +7422,257 @@ async fn a_pull_under_disk_pressure_books_its_store_refusal_by_name() {
         2,
         "the chunk door's refusal is booked by name, ONCE for the refused pull — however \
          many chunks or adopt batches the walk had in flight when it stopped"
+    );
+}
+
+/// **CIRISEdge#847 (#805 item 2; CC 5.1 rc7/rc8) — one DEK per `(stream,
+/// epoch)`, two distributors.** alice publishes a live stream into a room
+/// through [`KeptAvPublisher`](ciris_edge::transport::av_keep::KeptAvPublisher);
+/// carol is in the room's audience but NOT in the live MLS group (the group
+/// is alice and bob). Kept: each epoch's DEK is registered with persist,
+/// the chunks alice writes at that epoch are sealed under it, and carol's
+/// node — given only the stream's `key_grant:stream:v1` rows and the sealed
+/// chunks — opens them; before the rows cross, it cannot. After a rekey
+/// (bob leaves) the new epoch is registered and carol opens its chunk too.
+/// Unkept: the door is never called — alice holds no stream DEK row and no
+/// key-grant row for that stream.
+///
+/// Fails with the kept path not registering: alice's chunk door then mints a
+/// DEK of its own, which carol can still open, so the witness asserts the
+/// DEK records are `supplied` (the live one), never minted. Fails with the
+/// unkept path registering (a stream DEK row appears).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "kept streams deferred behind CIRISPersist#1067"]
+#[allow(clippy::too_many_lines)] // two epochs and the unkept leg, in order, on purpose
+async fn an_audience_member_outside_the_live_group_opens_a_kept_streams_chunks_847() {
+    use ciris_edge::transport::av_keep::{
+        persist_stream_id, AvKeep, AvKeepTarget, KeepOutcome, KeptAvPublisher,
+    };
+    use ciris_edge::transport::federation_session::PeerKexPubkeys;
+    use ciris_edge::transport::realtime_av::StreamId;
+    use ciris_edge::transport::realtime_av_mls::Member;
+    use ciris_edge::transport::realtime_av_session::RosterDelta;
+    use ciris_persist::federation::blobs::BlobStorage as _;
+    use ciris_persist::federation::key_grant::{KeyGrantAxis, KeyGrantRow, SignedKeyGrantRow};
+    use ciris_persist::federation::types::cohort_scope::{CryptoTier, COMMUNITY};
+    use ciris_persist::federation::{AdoptChunkItem, BlobProvenance};
+    const ROOM: &str = "room-847";
+    init_tracing();
+    let alice = Ident::new("alice-fed", 0x11);
+    let carol = Ident::new("carol-fed", 0x44);
+    let room_key = Ident::new(ROOM, 0x99);
+    let idents = [&alice, &carol, &room_key];
+    let node_a = node(&idents, &alice).await;
+    let node_c = node(&idents, &carol).await;
+    for n in [&node_a, &node_c] {
+        seed_room(n, ROOM, &[&alice, &carol]).await;
+    }
+    federate(&node_a, &node_c).await;
+    federate(&node_c, &node_a).await;
+    let bob_live_only = || Member {
+        key_id: "bob-live-only".into(),
+        kex_pubkeys: PeerKexPubkeys {
+            x25519_pub: [1u8; 32],
+            mlkem768_pub: vec![0xAB; 1184],
+        },
+    };
+    let target = AvKeepTarget {
+        cohort_scope: COMMUNITY.into(),
+        group_key_id: ROOM.into(),
+    };
+    // The stream's key-grant rows alice holds, for one stream.
+    let stream_rows = |stream: String| {
+        let dir = node_a.dir.clone();
+        async move {
+            dir.list_attestations_since(None, 1000)
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|a| a.attestation)
+                .filter(ciris_persist::federation::key_grant::is_key_grant_row)
+                .filter(|r| {
+                    matches!(
+                        KeyGrantRow::from_attestation(r).expect("a row").axis,
+                        KeyGrantAxis::Stream { ref stream_id, .. } if *stream_id == stream
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let chunk_provenance = BlobProvenance {
+        author_key_id: node_a.me.clone(),
+        cohort_scope: COMMUNITY.into(),
+        community_key_id: Some(ROOM.into()),
+        epoch: None,
+        tier: CryptoTier::CommunityDek,
+        minter_key_id: None,
+    };
+
+    // ── Kept ──
+    let sid = StreamId([0x84; 32]);
+    let stream = persist_stream_id(sid);
+    let (mut kept, created) = KeptAvPublisher::create(
+        sid,
+        &node_a.me,
+        vec![bob_live_only()],
+        Vec::new(),
+        AvKeep::Kept,
+        target.clone(),
+        node_a.store.engine().clone(),
+        None,
+    )
+    .await
+    .expect("the live stream is created");
+    let e0 = kept.epoch().0;
+    assert_eq!(created, KeepOutcome::Registered { epoch: e0 });
+
+    // alice writes the call's chunks at the registered epoch, then each
+    // reaches carol's node as sealed bytes, adopted stream-keyed.
+    let write_and_carry = |seq: u64, epoch: u64, body: Vec<u8>| {
+        let (a, c) = (node_a.store.engine().clone(), node_c.store.engine().clone());
+        let (stream, prov) = (stream.clone(), chunk_provenance.clone());
+        let a_dir = node_a.dir.clone();
+        async move {
+            let put = a
+                .put_blob_chunk_scoped(COMMUNITY, Some(ROOM), &stream, seq, &body, epoch, None)
+                .await
+                .expect("alice writes a chunk at the registered epoch");
+            let envelope = match a_dir.get_blob(&put.chunk_sha256).await.expect("read") {
+                Some(ciris_persist::federation::blobs::BlobBody::Inline(b)) => b,
+                other => panic!("the sealed chunk is inline: {other:?}"),
+            };
+            let adopted = c
+                .adopt_sealed_chunks(
+                    &stream,
+                    &[AdoptChunkItem {
+                        seq,
+                        envelope: &envelope,
+                        plaintext_size: body.len() as u64,
+                    }],
+                    epoch,
+                    prov,
+                )
+                .await
+                .expect("the door answers");
+            assert!(
+                matches!(&adopted[..], [Ok(_)]),
+                "carol's node adopts: {adopted:?}"
+            );
+        }
+    };
+    let cross_rows = |rows: Vec<ciris_persist::federation::Attestation>| {
+        let c = node_c.store.engine().clone();
+        async move {
+            for r in rows {
+                c.apply_replicated_key_grant(SignedKeyGrantRow { attestation: r })
+                    .await
+                    .expect("carol's node admits the stream row");
+            }
+        }
+    };
+    let body0 = b"frame zero of a kept call".to_vec();
+    write_and_carry(0, e0, body0.clone()).await;
+    assert!(
+        node_c
+            .store
+            .engine()
+            .read_stream_chunk_as(&stream, 0, &node_c.me, None)
+            .await
+            .is_err(),
+        "before the key rows cross, carol cannot open the chunk"
+    );
+    let rows0 = stream_rows(stream.clone()).await;
+    assert!(
+        rows0.iter().any(|r| KeyGrantRow::from_attestation(r)
+            .expect("a row")
+            .wrap
+            .recipient_key_id
+            == node_c.me),
+        "the kept epoch is wrapped to carol, who is not in the live group"
+    );
+    cross_rows(rows0).await;
+    assert_eq!(
+        node_c
+            .store
+            .engine()
+            .read_stream_chunk_as(&stream, 0, &node_c.me, None)
+            .await
+            .expect("carol opens the kept call's chunk through the key_grant plane"),
+        body0
+    );
+
+    // A rekey: bob leaves the live group; the new epoch is kept too.
+    let (_, rekeyed) = kept
+        .advance_epoch(RosterDelta::Leave("bob-live-only".into()))
+        .await
+        .expect("rekey");
+    let e1 = kept.epoch().0;
+    assert_eq!(rekeyed, KeepOutcome::Registered { epoch: e1 });
+    let body1 = b"frame one, after the rekey".to_vec();
+    write_and_carry(1, e1, body1.clone()).await;
+    cross_rows(stream_rows(stream.clone()).await).await;
+    assert_eq!(
+        node_c
+            .store
+            .engine()
+            .read_stream_chunk_as(&stream, 1, &node_c.me, None)
+            .await
+            .expect("carol opens the rekeyed epoch's chunk"),
+        body1
+    );
+
+    // The stored chunks are sealed under the DEK the live publisher supplied
+    // for each epoch, never one persist minted for itself: both epochs'
+    // records are `supplied`. (That the supplied bytes are the publisher's
+    // own per-epoch DEK is the av_keep unit witness.)
+    let records = node_a
+        .dir
+        .stream_dek_list(&stream)
+        .await
+        .expect("stream deks");
+    for e in [e0, e1] {
+        assert!(
+            records.iter().any(|r| r.epoch == e && r.supplied),
+            "epoch {e}'s DEK is the one the live publisher supplied: {records:?}"
+        );
+    }
+    assert!(
+        records.iter().all(|r| r.supplied),
+        "persist minted no DEK of its own for a kept live stream: {records:?}"
+    );
+
+    // ── Unkept ──
+    let unkept_sid = StreamId([0x85; 32]);
+    let unkept_stream = persist_stream_id(unkept_sid);
+    let (mut unkept, created) = KeptAvPublisher::create(
+        unkept_sid,
+        &node_a.me,
+        vec![bob_live_only()],
+        Vec::new(),
+        AvKeep::Unkept,
+        target,
+        node_a.store.engine().clone(),
+        None,
+    )
+    .await
+    .expect("an ordinary call is created");
+    assert_eq!(created, KeepOutcome::NotKept);
+    let (_, rekeyed) = unkept
+        .advance_epoch(RosterDelta::Leave("bob-live-only".into()))
+        .await
+        .expect("rekey");
+    assert_eq!(rekeyed, KeepOutcome::NotKept);
+    assert!(
+        node_a
+            .dir
+            .stream_dek_list(&unkept_stream)
+            .await
+            .expect("stream deks")
+            .is_empty(),
+        "an unkept call leaves no stream DEK row"
+    );
+    assert!(
+        stream_rows(unkept_stream).await.is_empty(),
+        "an unkept call leaves no key_grant row"
     );
 }

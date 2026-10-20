@@ -253,6 +253,23 @@ pub struct Session {
     awaiting_remote_diff: bool,
     /// The applied `Deliver_R`'s report, held until `Diff_R` arrives.
     held_report: Option<HeldReport>,
+    /// CIRISEdge#876 — this INITIATOR's own `Diff` asked for bodies and a
+    /// `Deliver` carrying at least one envelope has been applied this round.
+    ///
+    /// The `Deliver` that answers our Diff is the round's largest frame, so
+    /// over a WAN it routinely lands AFTER a small EMPTY `Deliver` from the
+    /// same responder. Completing on the empty one closed the round, and the
+    /// answer was then dropped at reply routing (`no_round_in_flight`), round
+    /// after round: a fresh node never held the canonical's signed route, so
+    /// key exchange never completed.
+    ///
+    /// Keyed on "carried an envelope", not on matching hashes: a responder
+    /// emits a `Deliver` only to answer a Diff, and `envelope_hash` is the
+    /// canonical-bytes / JCS basis (protocol.rs), which is not always the
+    /// SHA-256 of the delivered bytes. A budget-bounded answer (#414/#932)
+    /// counts, since its remainder is deferred to the next round by design.
+    /// Per-round, cleared by [`Self::reset`].
+    own_diff_answered: bool,
 }
 
 /// A `Deliver` already applied by an initiator that is still waiting for the
@@ -295,6 +312,7 @@ impl Session {
             awaiting_cursor_deliver: false,
             awaiting_remote_diff: false,
             held_report: None,
+            own_diff_answered: false,
         }
     }
 
@@ -337,6 +355,7 @@ impl Session {
         self.awaiting_cursor_deliver = false;
         self.awaiting_remote_diff = false;
         self.held_report = None;
+        self.own_diff_answered = false;
         // CIRISEdge#552 — DECREMENT, never clear. A Pull issued during an
         // ordinary scheduled round must not have its exemption killed by THAT
         // round completing: the subject-scoped reply had not arrived yet, and
@@ -408,6 +427,7 @@ impl Session {
         // never sets this.
         self.awaiting_remote_diff = true;
         self.held_report = None;
+        self.own_diff_answered = false;
         let mut outbound = vec![ReplicationMessage::Summary(summary)];
         // CIRISEdge#927 — initiator-first push. A carrier-NAT'd initiator's round
         // can't complete responder-reply-first: the responder's Diff can't
@@ -816,6 +836,8 @@ impl Session {
         // "did we ask for this", covering the on-demand and ordinary paths alike.
         self.expect_bodies_for_rounds(want.iter().copied(), Self::DEFAULT_EXPECTATION_ROUNDS);
         self.diff_want_count = Some(want.len());
+        // CIRISEdge#876 — a new Diff: its answer has not arrived yet.
+        self.own_diff_answered = false;
         outbound.push(ReplicationMessage::Diff(DiffMessage {
             kind: self.kind,
             want,
@@ -922,6 +944,12 @@ impl Session {
         });
         if self.role == SessionRole::Initiator && self.awaiting_remote_diff {
             self.awaiting_remote_diff = false;
+            // CIRISEdge#876 — the peer's wants are served now, but if OUR Diff
+            // has not been answered yet the round stays open for that answer;
+            // the held report travels on to the Deliver that brings it.
+            if self.awaits_own_diff_answer() {
+                return ReplicationOutcome::Send(vec![deliver]);
+            }
             if let Some(held) = self.held_report.take() {
                 // Deliver_R overtook Diff_R across pooled links (#634 §5.1):
                 // the bodies are applied, the peer's wants are served now,
@@ -1075,6 +1103,10 @@ impl Session {
                      (CIRISEdge#426)"
                 );
             }
+        }
+        // CIRISEdge#876 — a Deliver that carries an envelope answers our Diff.
+        if !deliver.envelopes.is_empty() {
+            self.own_diff_answered = true;
         }
         let mut admitted = 0usize;
         let mut refused = 0usize;
@@ -1234,6 +1266,12 @@ impl Session {
                 }
             }
         }
+        // CIRISEdge#876 — a round can now apply several Delivers before it
+        // completes; its report covers all of them.
+        if let Some(prior) = self.held_report.take() {
+            admitted += prior.admitted;
+            refused += prior.refused;
+        }
         // Compute staleness from what we asked for vs what we admitted.
         // This is provider-storage-agnostic (the production wiring will
         // have provider + applier share a FederationDirectory backing,
@@ -1270,6 +1308,26 @@ impl Session {
             );
             return ReplicationOutcome::Send(Vec::new());
         }
+        if self.awaits_own_diff_answer() {
+            // CIRISEdge#876 — an empty Deliver overtook the one answering our
+            // Diff. The round stays open for the answer, or until the
+            // scheduler's round timeout abandons it (bodies already applied
+            // stay applied).
+            self.held_report = Some(HeldReport {
+                admitted,
+                refused,
+                staleness,
+            });
+            tracing::debug!(
+                kind = ?self.kind,
+                admitted,
+                refused,
+                wanted = self.diff_want_count.unwrap_or(0),
+                "an EMPTY Deliver arrived before the one answering our Diff — holding the round \
+                 open for the answer (CIRISEdge#876)"
+            );
+            return ReplicationOutcome::Send(Vec::new());
+        }
         self.completed = true;
         ReplicationOutcome::Applied {
             kind: self.kind,
@@ -1282,6 +1340,14 @@ impl Session {
     /// Whether this session has completed its half of the round.
     pub fn is_complete(&self) -> bool {
         self.completed
+    }
+
+    /// CIRISEdge#876 — an INITIATOR whose own Diff asked for bodies and has
+    /// not yet seen a Deliver carrying any envelope.
+    fn awaits_own_diff_answer(&self) -> bool {
+        self.role == SessionRole::Initiator
+            && self.diff_want_count.unwrap_or(0) > 0
+            && !self.own_diff_answered
     }
 }
 
@@ -3505,6 +3571,168 @@ mod tests {
             !body.contains("matches!"),
             "on_deliver must not re-inline a kind list — the inline matches! \
              drifted from is_bootstrap once already (TransportDestination)"
+        );
+    }
+
+    /// CIRISEdge#876 — the WAN ordering that broke key exchange with the
+    /// canonical: the responder's Summary, its Diff, a small EMPTY Deliver,
+    /// and only then the (large) Deliver answering OUR Diff. Completing on the
+    /// empty one closed the round, and the answer was dropped at reply routing
+    /// as `no_round_in_flight`. The round must stay open for the answer, and
+    /// its report must cover every Deliver of the round. Both placements of
+    /// the empty Deliver (after and before the peer's Diff).
+    #[tokio::test]
+    async fn an_empty_deliver_does_not_close_a_round_whose_diff_is_unanswered_876() {
+        let provider = provider_with(&[(EnvelopeKind::Key, h(9), b"e9".to_vec(), 9)]);
+        let summary_r = || {
+            ReplicationMessage::Summary(SummaryMessage {
+                kind: EnvelopeKind::Key,
+                refs: vec![super::super::protocol::EnvelopeRef {
+                    envelope_hash: h(1),
+                    seq: 1,
+                }],
+            })
+        };
+        let diff_r = || {
+            ReplicationMessage::Diff(DiffMessage {
+                kind: EnvelopeKind::Key,
+                want: vec![h(9)],
+            })
+        };
+        let empty = || {
+            ReplicationMessage::Deliver(DeliverMessage {
+                kind: EnvelopeKind::Key,
+                envelopes: Vec::new(),
+            })
+        };
+        let answer = || {
+            ReplicationMessage::Deliver(DeliverMessage {
+                kind: EnvelopeKind::Key,
+                envelopes: vec![b"e1".to_vec()],
+            })
+        };
+
+        // (1) Summary_R, Diff_R, EMPTY Deliver, answering Deliver.
+        let applier = applier_for(&[(h(1), b"e1".to_vec())]);
+        let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        alice.start_round(&provider).await;
+        match alice
+            .on_message(summary_r(), &provider, &applier, None)
+            .await
+        {
+            ReplicationOutcome::Send(msgs) => assert!(
+                msgs.iter()
+                    .any(|m| matches!(m, ReplicationMessage::Diff(d) if d.want == vec![h(1)])),
+                "our Diff asks for h(1): {msgs:?}"
+            ),
+            o => panic!("{o:?}"),
+        }
+        match alice.on_message(diff_r(), &provider, &applier, None).await {
+            ReplicationOutcome::Send(msgs) => {
+                assert!(
+                    matches!(msgs[0], ReplicationMessage::Deliver(_)),
+                    "serves the peer's want"
+                );
+            }
+            o => panic!("the peer's Diff is served but the round stays open for our answer: {o:?}"),
+        }
+        assert!(!alice.is_complete());
+        match alice.on_message(empty(), &provider, &applier, None).await {
+            ReplicationOutcome::Send(msgs) => assert!(msgs.is_empty()),
+            o => panic!("an empty Deliver must not close the round: {o:?}"),
+        }
+        assert!(
+            !alice.is_complete(),
+            "the answer to our Diff has not arrived"
+        );
+        match alice.on_message(answer(), &provider, &applier, None).await {
+            ReplicationOutcome::Applied {
+                admitted,
+                refused,
+                staleness,
+                ..
+            } => {
+                assert_eq!((admitted, refused), (1, 0));
+                assert_eq!(staleness, StalenessSignal::InSync);
+            }
+            o => panic!("the answering Deliver completes the round: {o:?}"),
+        }
+        assert!(alice.is_complete());
+
+        // (2) Summary_R, EMPTY Deliver, Diff_R, answering Deliver.
+        let applier = applier_for(&[(h(1), b"e1".to_vec())]);
+        let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        alice.start_round(&provider).await;
+        let _ = alice
+            .on_message(summary_r(), &provider, &applier, None)
+            .await;
+        match alice.on_message(empty(), &provider, &applier, None).await {
+            ReplicationOutcome::Send(msgs) => assert!(msgs.is_empty()),
+            o => panic!("{o:?}"),
+        }
+        match alice.on_message(diff_r(), &provider, &applier, None).await {
+            ReplicationOutcome::Send(msgs) => {
+                assert!(matches!(msgs[0], ReplicationMessage::Deliver(_)));
+            }
+            o => panic!("serving the peer's Diff must not complete a round whose own Diff is unanswered: {o:?}"),
+        }
+        assert!(!alice.is_complete());
+        match alice.on_message(answer(), &provider, &applier, None).await {
+            ReplicationOutcome::Applied { admitted, .. } => assert_eq!(admitted, 1),
+            o => panic!("{o:?}"),
+        }
+        assert!(alice.is_complete());
+    }
+
+    /// CIRISEdge#876 — an initiator that asked for NOTHING (in sync, or a
+    /// hash-first plane) still completes on an empty Deliver: the hold is only
+    /// for an unanswered ask.
+    #[tokio::test]
+    async fn an_empty_deliver_still_completes_a_round_that_asked_for_nothing_876() {
+        let provider = provider_with(&[(EnvelopeKind::Key, h(9), b"e9".to_vec(), 9)]);
+        let applier = applier_for(&[]);
+        let mut alice = Session::new(SessionRole::Initiator, EnvelopeKind::Key);
+        alice.start_round(&provider).await;
+        // The peer holds exactly what we hold: our Diff wants nothing.
+        let _ = alice
+            .on_message(
+                ReplicationMessage::Summary(SummaryMessage {
+                    kind: EnvelopeKind::Key,
+                    refs: vec![super::super::protocol::EnvelopeRef {
+                        envelope_hash: h(9),
+                        seq: 9,
+                    }],
+                }),
+                &provider,
+                &applier,
+                None,
+            )
+            .await;
+        let _ = alice
+            .on_message(
+                ReplicationMessage::Diff(DiffMessage {
+                    kind: EnvelopeKind::Key,
+                    want: Vec::new(),
+                }),
+                &provider,
+                &applier,
+                None,
+            )
+            .await;
+        let out = alice
+            .on_message(
+                ReplicationMessage::Deliver(DeliverMessage {
+                    kind: EnvelopeKind::Key,
+                    envelopes: Vec::new(),
+                }),
+                &provider,
+                &applier,
+                None,
+            )
+            .await;
+        assert!(
+            alice.is_complete(),
+            "nothing was asked, so nothing is awaited: {out:?}"
         );
     }
 }

@@ -2501,6 +2501,9 @@ impl PyEdge {
     ///   # roster applies), "third_party_row" (AV-84 verdict about the row),
     ///   # "community_roster_fork" (two authorities, one community id).
     ///   "apply_refusals_by_class": {"retry_after_roster": 4, ...},
+    ///   # persist v59.0.0 — framed key-plane objects refused
+    ///   # `federation_envelope_kind_retired`, per kind label.
+    ///   "envelope_kind_retired_refusals": {"key": 1, ...},
     ///   # CIRISEdge#858 — the refusal memory's park ledger.
     ///   "rows_parked_on_signer": {"identity_occurrence": 52, ...},
     ///   "signer_releases": 3, "retry_suppressions": 410,
@@ -2790,6 +2793,10 @@ fn metrics_bundle_to_pydict<'py>(
         "known_destination_evictions",
         bundle.known_destination_evictions,
     )?;
+    root.set_item(
+        "transport_signer_id_mismatch",
+        bundle.transport_signer_id_mismatch,
+    )?;
 
     let reachability = pyo3::types::PyDict::new(py);
     for ((peer, medium), v) in &bundle.peer_reachability_ratio {
@@ -2857,6 +2864,20 @@ fn metrics_bundle_to_pydict<'py>(
         av_plane.set_item(label.as_str(), *n)?;
     }
     root.set_item("av_plane", av_plane)?;
+    // CC 5.3.3.5 E1 — the per-link seal ledger.
+    let link_seal = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.link_seal {
+        link_seal.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("link_seal", link_seal)?;
+    // CIRISEdge#805 item 8 — direct links by label, and the peers with a
+    // direct path now.
+    let direct_link = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.direct_link {
+        direct_link.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("direct_link", direct_link)?;
+    root.set_item("direct_links_active", bundle.direct_links_active)?;
     // CIRISEdge#640 — blob holders dropped from a pull, by refusal branch:
     // a missing install and a membership refusal are two numbers.
     let route_refusals = pyo3::types::PyDict::new(py);
@@ -2978,6 +2999,13 @@ fn metrics_bundle_to_pydict<'py>(
         refusals_class.set_item(token.as_str(), *v)?;
     }
     root.set_item("apply_refusals_by_class", refusals_class)?;
+    // persist v59.0.0 — framed key-plane objects refused
+    // `federation_envelope_kind_retired`, per kind label.
+    let retired = pyo3::types::PyDict::new(py);
+    for (kind, v) in &bundle.envelope_kind_retired_refusals {
+        retired.set_item(kind.as_str(), *v)?;
+    }
+    root.set_item("envelope_kind_retired_refusals", retired)?;
 
     // CIRISEdge#858 — the refusal memory's park ledger: rows parked on a
     // signer per plane (since start), rows released, wanted hashes the
@@ -7972,6 +8000,82 @@ fn federation_session_respond(
     Ok(out)
 }
 
+/// CC 5.3.4 (rc9 0d9e7f0) — **the production offline emit** of this node's
+/// hybrid-signed `transport_destination` row WITH its transit KEX pair, for
+/// the bundle re-mint. The host (CIRISServer) wraps it in its own ceremony
+/// CLI; edge's `edge_node emit-transport-destination` is the harness twin.
+/// Both call ONE function, `reticulum::emit_route_from_custody`, which signs
+/// through the runtime's own producer (`self_route::sign_route_offline`).
+///
+/// No network and no running node: `engine` supplies the node's own hybrid
+/// federation signer (`local_signer_capsule()`, the same identity
+/// `init_edge_runtime` hands the transport), `identity_path` is the node's
+/// FILE-backed transport identity (its transit seed sits beside it as
+/// `<identity_path>.transit-kex`), and `node_key_id` is the occurrence key id
+/// the node is dialled by (`init_edge_runtime`'s local key id). Nothing is
+/// minted: a missing identity or seed is a refusal.
+///
+/// Returns the `SignedTransportDestination` as JSON. Raises `ValueError`
+/// carrying the refusal label (`offline_emit_no_transit_pair`,
+/// `offline_emit_no_pqc`, `offline_emit_key_separation`,
+/// `offline_emit_custody`, `offline_emit_sign`, `offline_emit_no_signer`,
+/// `offline_emit_usage`) as `"<label>: <detail>"`.
+#[cfg(feature = "transport-reticulum")]
+#[pyfunction]
+#[pyo3(signature = (engine, identity_path, node_key_id, epoch = None, asserted_at = None))]
+#[allow(clippy::needless_pass_by_value)] // pyo3 surface takes owned values
+fn emit_transport_destination(
+    py: Python<'_>,
+    engine: &Bound<'_, PyAny>,
+    identity_path: std::path::PathBuf,
+    node_key_id: String,
+    epoch: Option<u64>,
+    asserted_at: Option<String>,
+) -> PyResult<String> {
+    let refuse = |label: &str, detail: String| PyValueError::new_err(format!("{label}: {detail}"));
+    let asserted_at = match asserted_at {
+        None => chrono::Utc::now(),
+        Some(t) => chrono::DateTime::parse_from_rfc3339(&t)
+            .map_err(|e| refuse("offline_emit_usage", format!("asserted_at: {e}")))?
+            .with_timezone(&chrono::Utc),
+    };
+    let persist_signer = extract_local_signer(engine).map_err(|e| {
+        refuse(
+            "offline_emit_no_signer",
+            match e {
+                LocalSignerCapsuleError::MethodAbsent => {
+                    "engine exposes no local_signer_capsule()".to_owned()
+                }
+                LocalSignerCapsuleError::Unavailable => {
+                    "engine has no local signer (local_signer_unavailable)".to_owned()
+                }
+                LocalSignerCapsuleError::Other(err) => err.to_string(),
+            },
+        )
+    })?;
+    // The same adaptation `init_edge_runtime` applies to the capsule: the
+    // classical half through persist's adapter, the ML-DSA-65 half forwarded.
+    let pqc = persist_signer.pqc_signer();
+    let classical: Arc<dyn ciris_keyring::HardwareSigner> = Arc::new(
+        ciris_persist::signing::LocalSignerHardwareAdapter::new(persist_signer),
+    );
+    let signer = LocalSigner::new(node_key_id, classical, pqc);
+    let row = py.detach(|| {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(|e| ("offline_emit_runtime", e.to_string()))?;
+        rt.block_on(crate::transport::reticulum::emit_route_from_custody(
+            &signer,
+            &identity_path,
+            epoch.unwrap_or(0),
+            asserted_at,
+        ))
+        .map_err(|e| (e.label(), e.to_string()))
+    });
+    let row = row.map_err(|(label, detail)| refuse(label, detail))?;
+    serde_json::to_string(&row).map_err(|e| refuse("offline_emit_serialize", e.to_string()))
+}
+
 /// CEG §5.6.8.8.1.1 — RC6-pinned two-stage RNS destination-hash recompute.
 /// Lets a conformance verifier independently derive an arbitrary peer's
 /// `destination_hash` from its advertised `(x25519_pub, ed25519_pub)`
@@ -8076,6 +8180,12 @@ fn assemble_tier_meta_v3(
         return Err(PyValueError::new_err(
             "tier fan-in exceeds the u32 wire range",
         ));
+    }
+    // CC 6.1.2.1.1 — a repeated leaf is refused before hashing.
+    if let Some(id) = crate::holonomic::aggregation::first_repeated_source_id(&source_member_ids) {
+        return Err(PyValueError::new_err(format!(
+            "source_member_ids repeats {id:?}: a member_commitment leaf list must be unique"
+        )));
     }
     let meta = crate::holonomic::aggregation::assemble_tier_meta_v3(
         content_id,
@@ -8481,16 +8591,17 @@ impl PyAvSession {
 // ─── PyRelayNode (CIRISEdge#66 / L2-C) ──────────────────────────────
 
 /// Map a `RelayError` to the appropriate `PyErr`. `StreamNotFound` /
-/// `SubscriberNotFound` are caller-input issues (PyValueError);
+/// `SubscriberNotFound` / `TransitPairInUse` (a reused transit key,
+/// CIRISEdge#866) are caller-input issues (PyValueError);
 /// `TransitKeyMissing` (internal invariant) + `OuterSealFailed`
 /// (crypto operation failed) map to PyRuntimeError.
 #[cfg(feature = "transport-reticulum")]
 fn map_relay_err(e: &crate::transport::realtime_av_relay::RelayError) -> PyErr {
     use crate::transport::realtime_av_relay::RelayError;
     match e {
-        RelayError::StreamNotFound(_) | RelayError::SubscriberNotFound { .. } => {
-            PyValueError::new_err(format!("{e}"))
-        }
+        RelayError::StreamNotFound(_)
+        | RelayError::SubscriberNotFound { .. }
+        | RelayError::TransitPairInUse { .. } => PyValueError::new_err(format!("{e}")),
         RelayError::TransitKeyMissing { .. } | RelayError::OuterSealFailed(_) => {
             PyRuntimeError::new_err(format!("{e}"))
         }
@@ -9870,6 +9981,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(federation_session_respond, m)?)?;
     #[cfg(feature = "transport-reticulum")]
     m.add_function(wrap_pyfunction!(rns_destination_hash, m)?)?;
+    // CC 5.3.4 — the production offline emit of the node's signed route.
+    #[cfg(feature = "transport-reticulum")]
+    m.add_function(wrap_pyfunction!(emit_transport_destination, m)?)?;
 
     // CIRISEdge#328 — the §19.7.1.3 v3 producer. Persist >= 16 fail-closes
     // pre-v3 tiers (CIRISVerify#191 flag-day), and edge is the only point
@@ -10899,6 +11013,19 @@ mod pyo3_tier2_tests {
     /// durable enqueues pass the FK check.
     // Test fixture: seeds both key records (hybrid, v19.0.0) and builds the edge.
     #[allow(clippy::too_many_lines)]
+    /// CIRISPersist#1103 — the fixture edge's key id, derived from its own
+    /// key (seed `[0x77; 32]`).
+    fn tier2_edge_id() -> String {
+        crate::identity::derived_fixture_key_id("py-tier2-edge", &[0x77; 32])
+    }
+
+    /// CIRISPersist#1103 — the fixture recipient's key id, derived from its
+    /// own key (seed `[0x99; 32]`).
+    fn recipient_key_id() -> String {
+        crate::identity::derived_fixture_key_id("recipient-key", &[0x99; 32])
+    }
+
+    #[allow(clippy::too_many_lines)] // two fixture rows + the edge they serve
     async fn build_test_edge() -> (Arc<Edge>, Arc<dyn OutboundHandle>) {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -10916,7 +11043,7 @@ mod pyo3_tier2_tests {
         let seed: [u8; 32] = [0x77; 32];
         std::fs::write(&seed_path, seed).expect("write seed");
         let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
-            key_id: "py-tier2-edge".into(),
+            key_id: tier2_edge_id(),
             key_path: seed_path,
             pqc_key_id: None,
             pqc_key_path: None,
@@ -10942,8 +11069,8 @@ mod pyo3_tier2_tests {
             .expect("ts")
             .with_timezone(&chrono::Utc);
         for (key_id, key_seed) in [
-            ("py-tier2-edge", [0x77u8; 32]),
-            ("recipient-key", [0x99u8; 32]),
+            (tier2_edge_id(), [0x77u8; 32]),
+            (recipient_key_id(), [0x99u8; 32]),
         ] {
             let pubkey_b64 = B64.encode(
                 Ed25519Signer::from_seed(&key_seed)
@@ -10961,7 +11088,7 @@ mod pyo3_tier2_tests {
                 .sign(digest.as_slice())
                 .expect("scrub-sign");
             let record = KeyRecord {
-                key_id: key_id.to_string(),
+                key_id: key_id.clone(),
                 pubkey_ed25519_base64: pubkey_b64,
                 // v19.0.0 — every fixture row carries the ML-DSA-65 pubkey:
                 // every signature is the FULL hybrid, both-or-neither.
@@ -10980,14 +11107,14 @@ mod pyo3_tier2_tests {
                 })),
                 algorithm: "hybrid".to_string(),
                 identity_type: "steward".to_string(),
-                identity_ref: key_id.to_string(),
+                identity_ref: key_id.clone(),
                 valid_from: ts,
                 valid_until: None,
                 registration_envelope: envelope,
                 original_content_hash: hex::encode(digest),
                 scrub_signature_classical: B64.encode(sig),
                 scrub_signature_pqc: None,
-                scrub_key_id: key_id.to_string(),
+                scrub_key_id: key_id.clone(),
                 scrub_timestamp: ts,
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
@@ -11012,7 +11139,7 @@ mod pyo3_tier2_tests {
             ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&pqc_seed, "py-tier2-edge-pqc")
                 .expect("ml_dsa_65 from seed")
         });
-        let signer = Arc::new(LocalSigner::new("py-tier2-edge", classical, Some(pqc)));
+        let signer = Arc::new(LocalSigner::new(tier2_edge_id(), classical, Some(pqc)));
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let edge = Edge::builder()
             .directory(backend.clone() as Arc<dyn VerifyDirectory>)
@@ -11687,6 +11814,98 @@ mod pyo3_tier2_tests {
     /// does NOT contain "32 bytes, got 65" (the v0.13.0 blocker shape)
     /// and does NOT contain "local_signer_capsule" (capsule extraction
     /// failure).
+    /// CC 5.3.4 — the production offline emit, through PyO3: an engine with a
+    /// hybrid local signer and a file-backed node custody give a row carrying
+    /// the custody's transit pair, signed under `node_key_id`; with no transit
+    /// seed beside the identity the call raises `ValueError` naming
+    /// `offline_emit_no_transit_pair`, and mints no seed.
+    #[cfg(feature = "transport-reticulum")]
+    #[test]
+    fn py_emit_transport_destination_signs_from_custody_and_refuses_without_a_pair_e1() {
+        init_python();
+        let _engine_guard = engine_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let local_seed_path = tmp.path().join("local.seed");
+        std::fs::write(&local_seed_path, [0x43_u8; 32]).expect("write local seed");
+        let pqc_seed_path = tmp.path().join("ml_dsa_65.seed");
+        std::fs::write(&pqc_seed_path, [0x78_u8; 32]).expect("write ml_dsa_65 seed");
+        // A node with a transit seed, and one without.
+        let with_pair = tmp.path().join("with/transport.id");
+        let without_pair = tmp.path().join("without/transport.id");
+        for p in [&with_pair, &without_pair] {
+            std::fs::create_dir_all(p.parent().expect("dir")).expect("mkdir");
+            std::fs::write(
+                p,
+                leviculum_std::generate_identity()
+                    .private_key_bytes()
+                    .expect("identity bytes"),
+            )
+            .expect("identity");
+        }
+        let custody =
+            crate::transport::transit_kex_custody::TransitKexSecret::load_or_generate_file(
+                &with_pair,
+            )
+            .expect("transit seed");
+
+        let outcome: PyResult<(String, String)> = Python::attach(|py| {
+            install_ciris_persist_module(py)?;
+            let engine_cls = py.import("ciris_persist")?.getattr("Engine")?;
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("dsn", "sqlite::memory:")?;
+            kwargs.set_item("signing_key_id", "edge-offline-emit-signer")?;
+            kwargs.set_item("local_key_id", "edge-offline-emit-local")?;
+            kwargs.set_item("local_key_path", local_seed_path.to_string_lossy().as_ref())?;
+            kwargs.set_item("local_pqc_key_id", "edge-offline-emit-local-pqc")?;
+            kwargs.set_item(
+                "local_pqc_key_path",
+                pqc_seed_path.to_string_lossy().as_ref(),
+            )?;
+            kwargs.set_item("pqc_sweep_on_init", false)?;
+            let engine = engine_cls.call((), Some(&kwargs))?;
+            let row = emit_transport_destination(
+                py,
+                &engine,
+                with_pair.clone(),
+                "node-offline-emit".to_owned(),
+                Some(3),
+                Some("2026-10-01T00:00:00Z".to_owned()),
+            )?;
+            let refused = emit_transport_destination(
+                py,
+                &engine,
+                without_pair.clone(),
+                "node-offline-emit".to_owned(),
+                None,
+                None,
+            )
+            .expect_err("a pair-less node must not emit");
+            Ok((row, refused.value(py).to_string()))
+        });
+        let (row, refused) = outcome.expect("python side");
+        let row: ciris_persist::federation::self_at_login::SignedTransportDestination =
+            serde_json::from_str(&row).expect("row json");
+        assert_eq!(row.attesting_key_id, "node-offline-emit");
+        assert_eq!(row.transport_destination.epoch, 3);
+        assert!(
+            row.signature.mldsa65_signature_base64.is_some(),
+            "hybrid-signed"
+        );
+        assert_eq!(
+            row.transit_kex_pair().expect("pair parses"),
+            Some(custody.pair().clone()),
+            "the custody's own transit pair"
+        );
+        assert!(
+            refused.starts_with("offline_emit_no_transit_pair"),
+            "{refused}"
+        );
+        assert!(
+            !crate::transport::transit_kex_custody::seed_path(&without_pair).exists(),
+            "the emit never mints a transit seed"
+        );
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)] // verbose 30-arg init call + #458 PQC provisioning
     fn py_init_edge_runtime_local_signer_capsule_supplies_reticulum_identity() {
@@ -12211,7 +12430,7 @@ mod pyo3_tier2_tests {
         let handle = Python::attach(|py| -> PyResult<PyDurableHandle> {
             py_edge.send_opaque_event(
                 py,
-                "recipient-key",
+                &recipient_key_id(),
                 1,
                 b"hello".to_vec(),
                 None,
@@ -12238,7 +12457,7 @@ mod pyo3_tier2_tests {
         let queue_id = Python::attach(|py| -> PyResult<String> {
             let h = py_edge.send_opaque_event(
                 py,
-                "recipient-key",
+                &recipient_key_id(),
                 1,
                 b"visible-row".to_vec(),
                 None,
@@ -12256,7 +12475,7 @@ mod pyo3_tier2_tests {
                 .list_outbound(
                     OutboundFilter {
                         status: Some(OutboundStatus::Pending),
-                        destination_key_id: Some("recipient-key".to_string()),
+                        destination_key_id: Some(recipient_key_id()),
                         ..Default::default()
                     },
                     16,
@@ -12466,7 +12685,7 @@ mod pyo3_tier2_tests {
         let queue_id = Python::attach(|py| -> PyResult<String> {
             let h = py_edge.send_opaque_event(
                 py,
-                "recipient-key",
+                &recipient_key_id(),
                 1,
                 b"metric-bump".to_vec(),
                 None,

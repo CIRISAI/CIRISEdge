@@ -86,6 +86,16 @@ pub mod realtime_av_dispatcher;
 /// behind `_reticulum-module` (their only leviculum dependency).
 pub mod realtime_av_runtime;
 
+/// CIRISEdge#805 item 8, cut 2 — a subscriber's choice of leg (direct or
+/// relay), make-before-break, deduped above the per-leg opens; and the relay's
+/// admission rule for a subscriber that dials it.
+pub mod av_leg_choice;
+
+/// CIRISEdge#847 (#805 item 2) — one DEK per `(stream, epoch)`: a KEPT live
+/// stream registers each epoch's per-(stream, epoch) DEK with persist as the
+/// stored DEK, wrapped to the audience; an unkept call registers nothing.
+pub mod av_keep;
+
 /// CIRISEdge#805 item 4 — the A/V plane on the live node: the Reticulum
 /// transport's A/V sink, fed from the same event loop replication uses.
 #[cfg(feature = "_reticulum-module")]
@@ -101,6 +111,11 @@ pub mod av_sink;
 /// owns a [`realtime_av_relay::RelayNode`].
 #[cfg(feature = "_reticulum-module")]
 pub mod av_spine;
+/// CIRISEdge#805 item 8 — a direct path between two call members behind NAT
+/// (leviculum v0.30 direct links): the knob, the per-peer state machine, its
+/// retry policy and the A/V-leg liveness decision.
+#[cfg(feature = "_reticulum-module")]
+pub mod direct_path;
 
 /// Application-Layer Multicast (ALM) — mesh-tree video built on the
 /// per-peer [`realtime_av_relay::RelayNode`] primitive (CIRISEdge#131 +
@@ -177,6 +192,30 @@ pub mod reticulum;
 /// its only consumer.
 #[cfg(feature = "_reticulum-module")]
 pub mod self_route;
+
+/// CIRISEdge#805 (CC 3.3.6.2) — custody of this node's static transit KEX
+/// pair: one 64-byte root seed, both keys HKDF-derived from it, stored beside
+/// the transport identity. Published on the signed route by [`self_route`].
+#[cfg(feature = "_reticulum-module")]
+pub mod transit_kex_custody;
+
+/// CIRISEdge#805 (CC 3.3.6.2) — a peer's transit KEX pair, Rooted only, via
+/// persist's `transit_kex_pair_for`. `None` = the peer cannot relay.
+#[cfg(feature = "_reticulum-module")]
+pub mod transit_kex_peer;
+
+/// CC 5.3.3.5 E1 — the hybrid transit KEX every RNS link runs as its first
+/// frame: the dialler initiates against the dialled node's published pair, the
+/// dialled end responds and checks the claim, and each end gets its role's
+/// seal and open keys. (Named for where it began, the A/V hop, CIRISEdge#805.)
+#[cfg(feature = "_reticulum-module")]
+pub mod av_transit_handshake;
+
+/// CC 5.3.3.5 E1 — the per-link seal: every edge frame on every RNS link,
+/// both directions and every lane, under the keys of that link's transit KEX.
+/// No classical fallback, no caller-supplied key, no compat path.
+#[cfg(feature = "_reticulum-module")]
+pub mod link_seal;
 
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
 /// edges (CIRISEdge#169). CEG-native (the Scope-B queue: byte-exact
@@ -320,6 +359,21 @@ pub enum TransportError {
         /// very peer typically appears here, making the explicit-vs-named
         /// mismatch obvious.
         paths: String,
+    },
+    /// CC 5.3.3.5 E1 — a link's transit KEX or seal was refused: the dialled
+    /// node publishes no usable transit pair (the dial is never made), the
+    /// handshake was malformed, too large, of the wrong suite or never came,
+    /// its claimed initiator is not the link's attributed peer, or the KEX
+    /// failed. The link is closed and no key was installed; there is no
+    /// fallback key and nothing is sent in the clear.
+    #[error("link transit seal refused ({reason}) for {peer}: {detail}")]
+    LinkSealRefused {
+        /// The peer on the other end of the link.
+        peer: String,
+        /// The stable refusal name (the `link_seal` metric label).
+        reason: &'static str,
+        /// What happened.
+        detail: String,
     },
 }
 

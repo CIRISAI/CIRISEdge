@@ -55,10 +55,20 @@ struct FedKey {
 }
 
 impl FedKey {
-    fn new(key_id: &str, seed_byte: u8) -> Self {
+    /// persist #1103 (CC 2.6.8) — the `key_id` is DERIVED from the key's own
+    /// Ed25519 pubkey (`derive_key_id(label, pubkey)`), never hand-written:
+    /// `put_public_key` refuses a `-<fp>` suffix that is not its key's
+    /// fingerprint. Tests reference `key_id`, never the label.
+    fn new(label: &str, seed_byte: u8) -> Self {
+        use ciris_crypto::ClassicalSigner as _;
+        let seed = [seed_byte; 32];
+        let pubkey = ciris_crypto::Ed25519Signer::from_seed(&seed)
+            .expect("ed25519 from seed")
+            .public_key()
+            .expect("pubkey");
         Self {
-            key_id: key_id.to_string(),
-            seed: [seed_byte; 32],
+            key_id: ciris_verify_core::fedcode::derive_key_id(label, &pubkey),
+            seed,
         }
     }
 
@@ -381,13 +391,13 @@ async fn send_mandatory_enqueues_one_row_per_peer_in_directory() {
     assert_eq!(rows.len(), 3, "one outbound row per non-self peer");
     let destinations: std::collections::BTreeSet<String> =
         rows.iter().map(|r| r.destination_key_id.clone()).collect();
-    let expected: std::collections::BTreeSet<String> = ["peer-b", "peer-c", "peer-d"]
+    let expected: std::collections::BTreeSet<String> = [&peer_b, &peer_c, &peer_d]
         .iter()
-        .map(|s| (*s).to_string())
+        .map(|k| k.key_id.clone())
         .collect();
     assert_eq!(destinations, expected);
     assert!(
-        !destinations.contains("edge-self"),
+        !destinations.contains(&me.key_id),
         "self-loopback must be filtered out of the Mandatory fan-out"
     );
 }
@@ -436,18 +446,18 @@ async fn send_mandatory_bypasses_subscription_filter() {
     // dropped.
     assert!(
         !edge
-            .would_subscription_accept("peer-b", &MessageType::FederationAnnouncement)
+            .would_subscription_accept(&peer_b.key_id, &MessageType::FederationAnnouncement)
             .await
     );
     assert!(
         !edge
-            .would_subscription_accept("peer-c", &MessageType::FederationAnnouncement)
+            .would_subscription_accept(&peer_c.key_id, &MessageType::FederationAnnouncement)
             .await
     );
     // The filter still accepts OTHER message types — proves the
     // filter is wired and selectively vetoes FederationAnnouncement.
     assert!(
-        edge.would_subscription_accept("peer-b", &MessageType::AttestationGossip)
+        edge.would_subscription_accept(&peer_b.key_id, &MessageType::AttestationGossip)
             .await
     );
 

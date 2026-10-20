@@ -313,6 +313,18 @@ pub const CHUNK_HEADER_LEN: usize = 48;
 /// when only the 48-byte header is present.
 pub const CHUNK_CODEC_LAYER_LEN: usize = 4;
 
+/// AES-256-GCM tag length: the 16 bytes `ciris_crypto::aes_gcm` appends to
+/// every seal (`ciphertext || tag`). `ciris_crypto` names a tag length only
+/// for XChaCha20-Poly1305 (`xchacha::TAG_LEN`), not for its AES-GCM module,
+/// so it is named here and pinned against a live seal in the tests.
+pub const AEAD_TAG_LEN: usize = 16;
+
+/// The shortest `double_sealed_ciphertext` there is: the outer tag over an
+/// inner ciphertext carrying its own tag (an empty plaintext). CC 5.3.3.2.3
+/// (CIRISConstitution#173): a wire whose ciphertext cannot carry its tags is
+/// malformed, and [`SealedAvChunk::from_bytes`] refuses it.
+pub const MIN_DOUBLE_SEALED_LEN: usize = 2 * AEAD_TAG_LEN;
+
 impl SealedAvChunk {
     /// Concrete wire encoding — fixed-shape header, codec + layer
     /// metadata, then ciphertext.
@@ -348,7 +360,9 @@ impl SealedAvChunk {
     }
 
     /// Inverse of [`Self::to_bytes`]. Returns `Err` if the input is
-    /// shorter than the 52-byte header + codec+layer block.
+    /// shorter than the 52-byte header + codec+layer block, or if the
+    /// ciphertext after it is shorter than [`MIN_DOUBLE_SEALED_LEN`] (too
+    /// short for the outer and inner AEAD tags, CIRISConstitution#173).
     ///
     /// **v4.6.1 (Codex P1 fix)** — drops the prior length-only v3.7.0
     /// "backward-compat" branch. The branch was structurally unreachable
@@ -382,6 +396,14 @@ impl SealedAvChunk {
 
         // CIRISEdge#128 — codec+layer block at bytes 48..52, locked
         // since v3.8.0. Ciphertext is bytes 52..end.
+        // CIRISConstitution#173 — a ciphertext too short for the outer and
+        // inner tags is malformed: refused here, not left to the AEAD.
+        if b.len() < WIRE_HEADER_LEN + MIN_DOUBLE_SEALED_LEN {
+            return Err(RealtimeAvError::WireTooShort {
+                got: b.len(),
+                need: WIRE_HEADER_LEN + MIN_DOUBLE_SEALED_LEN,
+            });
+        }
         let codec_id = b[48];
         let layer = ChunkLayer {
             spatial: b[49],
@@ -409,6 +431,11 @@ pub enum RealtimeAvError {
     OuterAead(ciris_crypto::CryptoError),
     #[error("sealed wire too short: got {got} bytes, need at least {need}")]
     WireTooShort { got: usize, need: usize },
+    /// The outer seal opened, but the inner ciphertext under it is too short
+    /// to carry its own AEAD tag (CIRISConstitution#173). A relay refuses it
+    /// rather than forwarding a chunk no subscriber can open.
+    #[error("inner ciphertext too short for its AEAD tag: got {got} bytes, need at least {need}")]
+    InnerTooShort { got: usize, need: usize },
 }
 
 /// Derive the inner-AEAD nonce deterministically from `(stream_id,
@@ -580,6 +607,79 @@ pub fn inner_sealed_from_parts(
     }
 }
 
+/// CIRISEdge#866 — where each `(transit key, link_id)` pair's outer-seal
+/// counter stopped, so a re-admission resumes it instead of restarting it.
+///
+/// The outer nonce is a function of `(link_id, link_seq)` alone
+/// ([`derive_outer_nonce`]), and it is used under the transit key with
+/// AES-256-GCM. Restarting `link_seq` at 0 for a pair that already sealed
+/// repeats `(key, nonce)`, which leaks the XOR of the two plaintexts and
+/// GCM's authentication key. It also lands below the receiver's replay
+/// window on a live link. So the sender's counter belongs to the PAIR, not
+/// to one admission of it: dropping a subscriber and admitting it again
+/// with the same key and link continues from where it stopped.
+///
+/// The ledger keys on a domain-separated SHA-256 of the pair and never
+/// holds the key. It grows by one entry per distinct pair retired over the
+/// owner's life (one stream's dispatcher, one relay), so it is bounded by
+/// admissions, not by traffic. Use [`Self::resume`] when a pair is
+/// admitted, [`Self::retire`] when it stops sealing, and
+/// [`Self::live_conflict`] to refuse a pair already live under another
+/// admission.
+#[derive(Debug, Default)]
+pub struct LinkSeqLedger {
+    retired: std::collections::HashMap<[u8; 32], u64>,
+}
+
+impl LinkSeqLedger {
+    /// The ledger's key for a pair: SHA-256 over a domain tag, the
+    /// length-prefixed `link_id`, and the transit key.
+    #[must_use]
+    pub fn pair_id(transit_key: &[u8; 32], link_id: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"CIRIS-AV-LINKSEQ-PAIR-V1");
+        h.update(
+            u64::try_from(link_id.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        h.update(link_id);
+        h.update(transit_key);
+        h.finalize().into()
+    }
+
+    /// The first `link_seq` a new admission of this pair may seal with:
+    /// where the pair stopped, or 0 for a pair never retired here.
+    pub fn resume(&mut self, transit_key: &[u8; 32], link_id: &[u8]) -> u64 {
+        self.retired
+            .remove(&Self::pair_id(transit_key, link_id))
+            .unwrap_or(0)
+    }
+
+    /// Record that this pair stopped sealing with `next_link_seq` unused.
+    /// Keeps the higher mark if the pair was retired before.
+    pub fn retire(&mut self, transit_key: &[u8; 32], link_id: &[u8], next_link_seq: u64) {
+        let mark = self
+            .retired
+            .entry(Self::pair_id(transit_key, link_id))
+            .or_insert(0);
+        *mark = (*mark).max(next_link_seq);
+    }
+
+    /// Whether admitting `(transit_key, link_id)` would run two live
+    /// counters under one pair: true if any of `live` is the same pair.
+    #[must_use]
+    pub fn live_conflict<'a>(
+        transit_key: &[u8; 32],
+        link_id: &[u8],
+        mut live: impl Iterator<Item = (&'a [u8; 32], &'a [u8])>,
+    ) -> bool {
+        let id = Self::pair_id(transit_key, link_id);
+        live.any(|(k, l)| Self::pair_id(k, l) == id)
+    }
+}
+
 /// Seal the **outer** AEAD layer for one Link, given a pre-computed
 /// [`InnerSealed`]. The companion to [`seal_av_inner`].
 ///
@@ -708,6 +808,12 @@ pub fn open_av_outer(
     let inner_ciphertext =
         aes_gcm::decrypt(transit_key, &outer_nonce, &sealed.double_sealed_ciphertext)
             .map_err(RealtimeAvError::OuterAead)?;
+    if inner_ciphertext.len() < AEAD_TAG_LEN {
+        return Err(RealtimeAvError::InnerTooShort {
+            got: inner_ciphertext.len(),
+            need: AEAD_TAG_LEN,
+        });
+    }
     Ok(InnerSealed {
         stream_id: sealed.stream_id,
         epoch: sealed.epoch,
@@ -1056,6 +1162,62 @@ mod tests {
         // And the parsed form opens identically.
         let opened = open_av_chunk(&parsed, &dummy_transit(), b"link", 7, &dek).expect("open");
         assert_eq!(opened, b"hello, mesh");
+    }
+
+    /// `AEAD_TAG_LEN` is what `ciris_crypto::aes_gcm` actually appends: an
+    /// empty plaintext seals to exactly one tag, and a double seal of it to
+    /// exactly `MIN_DOUBLE_SEALED_LEN`.
+    #[test]
+    fn aead_tag_len_matches_the_live_seal() {
+        let inner = aes_gcm::encrypt(&[1u8; 32], &[2u8; 12], b"").expect("seal");
+        assert_eq!(inner.len(), AEAD_TAG_LEN);
+        let sealed = seal_av_chunk(
+            b"",
+            &dummy_transit(),
+            b"link",
+            0,
+            &dummy_dek(),
+            dummy_stream(),
+            Epoch(0),
+            ChunkSeq(0),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
+        )
+        .expect("seal");
+        assert_eq!(sealed.double_sealed_ciphertext.len(), MIN_DOUBLE_SEALED_LEN);
+        // The shortest genuine chunk parses and opens.
+        let parsed = SealedAvChunk::from_bytes(&sealed.to_bytes()).expect("parse");
+        assert!(open_av_chunk(&parsed, &dummy_transit(), b"link", 0, &dummy_dek()).is_ok());
+    }
+
+    /// CIRISConstitution#173 — a ciphertext shorter than the two tags is
+    /// refused at parse, and a relay refuses an inner ciphertext shorter than
+    /// one tag instead of forwarding it.
+    #[test]
+    fn tagless_ciphertext_refused_at_its_layer() {
+        let header = CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN;
+        for extra in [0, 1, MIN_DOUBLE_SEALED_LEN - 1] {
+            let wire = vec![0u8; header + extra];
+            assert!(matches!(
+                SealedAvChunk::from_bytes(&wire),
+                Err(RealtimeAvError::WireTooShort { need, .. })
+                    if need == header + MIN_DOUBLE_SEALED_LEN
+            ));
+        }
+        let short_inner = inner_sealed_from_parts(
+            dummy_stream(),
+            Epoch(0),
+            ChunkSeq(0),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
+            vec![0u8; AEAD_TAG_LEN - 1],
+        );
+        let sealed = seal_av_outer(&short_inner, &dummy_transit(), b"link", 0).expect("outer");
+        assert!(matches!(
+            open_av_outer(&sealed, &dummy_transit(), b"link", 0),
+            Err(RealtimeAvError::InnerTooShort { got, need: AEAD_TAG_LEN })
+                if got == AEAD_TAG_LEN - 1
+        ));
     }
 
     /// Truncated wire input refused cleanly. v4.6.1 (Codex P1)

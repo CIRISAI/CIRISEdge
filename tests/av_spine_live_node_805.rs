@@ -766,16 +766,70 @@ async fn av_chunks_ride_the_replicating_node_805() {
             .any(|(id, plane, dialed)| *id == av_link_id && *plane == LinkPlane::Av && *dialed),
         "A's link is on the A/V plane: {a_planes:?}"
     );
-    let transit = [0x5c; 32];
-    let hop_link_id = p.b.key.key_id.as_bytes().to_vec();
+    // CIRISEdge#805 / CC 5.3.3.5 E1 — the dial sent A's transit KEX handshake
+    // as the link's first message(s); everything A sends after it is sealed.
+    assert!(
+        p.a.metrics
+            .link_seal()
+            .get("link_seal_initiated")
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "A keyed the link it dialled"
+    );
+    // B answered the handshake at the link layer and handed the keyed link to
+    // its consumer: the hop's keys come from the link's KEX, A sealing
+    // (initiator) what B opens (responder). The outer nonce binds the RNS link
+    // id, as the KEX does.
+    let Ok(arrival) = tokio::time::timeout(Duration::from_secs(20), arrivals.recv()).await else {
+        panic!(
+            "the A/V link never arrived at B's A/V consumer; av_plane={:?}",
+            p.b.metrics.av_plane()
+        );
+    };
+    let arrival: AvArrival = arrival.expect("arrivals open");
+    assert_eq!(
+        arrival.peer.as_str(),
+        p.a.key.key_id,
+        "attributed to A (#393)"
+    );
+    assert_eq!(arrival.link_id, av_link_id, "the link A dialled");
+    let address = arrival.address.as_ref().expect("B's call address");
+    assert_eq!(address.group().group_id(), group);
+    assert_eq!(address.member_key_id(), p.b.key.key_id);
+    let accepted =
+        p.b.transport
+            .accept_av_arrival(arrival)
+            .await
+            .expect("B answers A's transit KEX");
+    assert!(
+        p.b.metrics
+            .link_seal()
+            .get("link_seal_accepted")
+            .copied()
+            .unwrap_or(0)
+            >= 1
+    );
+    let hop_link_id = av_link_id.to_vec();
     call.spine
         .attach_downstream(AvSubscriberLink {
             subscriber: p.b.key.key_id.clone(),
-            transit_key: transit,
+            transit_key: link.transit.seal_key(),
             link_id: hop_link_id.clone(),
             outbound_send: Box::new(link.sender),
         })
         .expect("attach the hop");
+    let mut rx = AvSubscriber::subscribe(
+        call.stream,
+        &call.sub_dek,
+        &p.a.key.key_id,
+        AvInboundLink {
+            transit_key: accepted.transit.open_key(),
+            link_id: hop_link_id.clone(),
+            inbound_recv: Box::new(accepted.arrival.inbound),
+        },
+    )
+    .expect("subscribe");
 
     // Replication, concurrently: an identity-plane Deliver and driven rounds
     // between the same two transports.
@@ -800,7 +854,6 @@ async fn av_chunks_ride_the_replicating_node_805() {
     let body_len = (channel_limit - overhead).min(1200);
     let forced = small_bootstrap_frame(b'v');
     let mut sent = Vec::with_capacity(CHUNKS + 1);
-    let mut b_sub = None;
     for i in 0..CHUNKS {
         let body = chunk_body(i, body_len);
         let fanout = call
@@ -814,48 +867,6 @@ async fn av_chunks_ride_the_replicating_node_805() {
             "chunk {i} went out on the A/V link"
         );
         sent.push((fanout.chunk_seq, body));
-        if i == 0 {
-            // B's consumer receives the link on its first frame.
-            let Ok(arrival) = tokio::time::timeout(Duration::from_secs(20), arrivals.recv()).await
-            else {
-                let stream_prefix = &call.stream.0[..];
-                let leaked =
-                    p.b.seen
-                        .lock()
-                        .await
-                        .iter()
-                        .filter(|s| s.bytes.starts_with(stream_prefix))
-                        .count();
-                panic!(
-                    "the A/V link never arrived at B's A/V consumer; {leaked} A/V chunk(s) \
-                     reached B's REPLICATION listener instead; av_plane={:?}",
-                    p.b.metrics.av_plane()
-                );
-            };
-            let arrival: AvArrival = arrival.expect("arrivals open");
-            assert_eq!(
-                arrival.peer.as_str(),
-                p.a.key.key_id,
-                "attributed to A (#393)"
-            );
-            assert_eq!(arrival.link_id, av_link_id, "the link A dialled");
-            let address = arrival.address.as_ref().expect("B's call address");
-            assert_eq!(address.group().group_id(), group);
-            assert_eq!(address.member_key_id(), p.b.key.key_id);
-            b_sub = Some(
-                AvSubscriber::subscribe(
-                    call.stream,
-                    &call.sub_dek,
-                    &p.a.key.key_id,
-                    AvInboundLink {
-                        transit_key: transit,
-                        link_id: hop_link_id.clone(),
-                        inbound_recv: Box::new(arrival.inbound),
-                    },
-                )
-                .expect("subscribe"),
-            );
-        }
         if i == CHUNKS / 2 {
             p.a.transport
                 .send_on_reply_path_only(
@@ -898,7 +909,6 @@ async fn av_chunks_ride_the_replicating_node_805() {
     sent.push((fanout.chunk_seq, after));
 
     // B's consumer: every chunk, in order, byte-identical.
-    let mut rx = b_sub.expect("subscribed");
     for (seq, body) in &sent {
         let got = tokio::time::timeout(Duration::from_secs(20), rx.recv())
             .await
@@ -955,7 +965,9 @@ async fn av_chunks_ride_the_replicating_node_805() {
 
     // The A/V sink delivered exactly what rode the A/V link: CHUNKS + 1
     // chunks and the one forced frame — no replication frame from the
-    // identity link, nothing dropped.
+    // identity link, nothing dropped. (The link's transit KEX handshake is
+    // consumed by the link layer before the A/V plane sees a frame, CC 5.3.3.5
+    // E1, so it is in neither count.)
     let sent_on_av = u64::try_from(sent.len()).expect("small") + 1;
     assert_eq!(
         av(&p.b.metrics, "av_inbound_delivered"),

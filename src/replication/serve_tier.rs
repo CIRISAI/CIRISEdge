@@ -65,11 +65,11 @@ impl ServeTier {
     /// before it is policy.
     ///
     /// Answering requires the BODY: `subject_holdings_inner` resolves a subject
-    /// through `lookup_public_key`, and persist's own subject-scoped reads are
-    /// built from the held records — `wire_refs_for_subject` reads
-    /// `list_signed_key_records_since`, and the Key plane has no subject-indexed
-    /// signed read at all. There is no body-free identifier path anywhere in
-    /// the stack. So a hash-first node CANNOT answer, whatever it is entitled
+    /// through the rows it holds about it (persist v59.0.0: the subject's
+    /// `key:record:v1` / `identity:occurrence:v1` rows), and persist's own
+    /// subject-scoped reads are built from the held records —
+    /// `wire_refs_for_subject` walks the attestation slice about the subject.
+    /// There is no body-free identifier path anywhere in the stack. So a hash-first node CANNOT answer, whatever it is entitled
     /// to, and pretending otherwise is what made the earlier
     /// "≥ mesh server" rule unsatisfiable.
     ///

@@ -139,6 +139,16 @@ pub enum RelayError {
     /// failure encountered during fan-out.
     #[error("outer seal failed: {0}")]
     OuterSealFailed(#[from] RealtimeAvError),
+    /// CIRISEdge#866 — the `(transit key, link_id)` pair is already live
+    /// under another `(subscriber, stream)`. The relay's `link_id` is the
+    /// subscriber's key id, so one key on two streams is one pair, and
+    /// two live counters under it would repeat outer nonces. Refused;
+    /// nothing changes.
+    #[error("transit key + link_id for {subscriber} already live on another stream; refused (CIRISEdge#866)")]
+    TransitPairInUse {
+        stream: StreamId,
+        subscriber: PeerKeyId,
+    },
 }
 
 /// The per-(subscriber, stream) state the relay carries for one
@@ -263,6 +273,9 @@ pub struct RelayNode {
     /// `unsubscribe` (or a `RelayNode` drop) flushes the key
     /// material.
     states: HashMap<(PeerKeyId, StreamId), SubscriberState>,
+    /// CIRISEdge#866 — where each retired `(transit key, link_id)` pair's
+    /// counter stopped; a re-subscribe resumes it, never restarts it.
+    link_seqs: super::realtime_av::LinkSeqLedger,
 }
 
 impl RelayNode {
@@ -279,6 +292,7 @@ impl RelayNode {
             superseded_address: None,
             subscribers: HashMap::new(),
             states: HashMap::new(),
+            link_seqs: super::realtime_av::LinkSeqLedger::default(),
         }
     }
 
@@ -374,6 +388,18 @@ impl RelayNode {
     /// Idempotent on `subscriber`: re-subscribing replaces the
     /// transit key AND the layer policy (the new state wins; the
     /// old `SubscriberState` drops, zeroizing the old transit key).
+    ///
+    /// CIRISEdge#866 — the `link_seq` counter belongs to the
+    /// `(transit key, link_id)` pair. Re-subscribing with a key this relay
+    /// already sealed under for this subscriber (after an unsubscribe, a
+    /// heal, or a replace) resumes the counter where it stopped. A new key
+    /// starts at 0. A restart would repeat outer nonces under one GCM key.
+    ///
+    /// # Errors
+    ///
+    /// [`RelayError::TransitPairInUse`] if the same key is live for this
+    /// subscriber on ANOTHER stream (the `link_id` is the subscriber's key
+    /// id, so that is the same pair); nothing changes.
     pub fn subscribe(
         &mut self,
         stream_id: StreamId,
@@ -382,19 +408,41 @@ impl RelayNode {
         layer_policy: ReceiverLayerPolicy,
     ) -> Result<(), RelayError> {
         let link_id = subscriber.as_bytes().to_vec();
+        // CIRISEdge#866 — refuse a pair already live under another
+        // (subscriber, stream): two counters under one pair repeat nonces.
+        let this = (subscriber.clone(), stream_id);
+        if super::realtime_av::LinkSeqLedger::live_conflict(
+            &transit_key,
+            &link_id,
+            self.states
+                .iter()
+                .filter(|(at, _)| **at != this)
+                .map(|(_, st)| (&st.transit_key, st.link_id.as_slice())),
+        ) {
+            return Err(RelayError::TransitPairInUse {
+                stream: stream_id,
+                subscriber,
+            });
+        }
         self.subscribers
             .entry(stream_id)
             .or_default()
             .insert(subscriber.clone());
-        // Insert (or replace) the per-subscriber state. Replacing
-        // drops the previous SubscriberState which zeroizes the
-        // previous transit key.
+        // Replace the per-subscriber state. The previous SubscriberState
+        // zeroizes its transit key on drop; where its pair's counter
+        // stopped is kept (as a hash), so this admission resumes it if it
+        // is the same pair, and starts at 0 only for a new one.
+        if let Some(old) = self.states.remove(&this) {
+            self.link_seqs
+                .retire(&old.transit_key, &old.link_id, old.next_link_seq);
+        }
+        let next_link_seq = self.link_seqs.resume(&transit_key, &link_id);
         self.states.insert(
-            (subscriber, stream_id),
+            this,
             SubscriberState {
                 transit_key,
                 link_id,
-                next_link_seq: 0,
+                next_link_seq,
                 layer_policy,
             },
         );
@@ -452,8 +500,12 @@ impl RelayNode {
                 subscriber: subscriber.clone(),
             });
         }
-        // Drop the SubscriberState — zeroizes the transit key.
-        self.states.remove(&(subscriber.clone(), stream_id));
+        // Drop the SubscriberState — zeroizes the transit key — keeping
+        // where its pair's counter stopped (CIRISEdge#866).
+        if let Some(old) = self.states.remove(&(subscriber.clone(), stream_id)) {
+            self.link_seqs
+                .retire(&old.transit_key, &old.link_id, old.next_link_seq);
+        }
         // If the stream is now empty, prune the roster entry too —
         // keeps the subscriber map from accumulating empty sets.
         if roster.is_empty() {
@@ -959,9 +1011,9 @@ mod tests {
         let outs = relay.forward(s, &inner).expect("forward");
         assert_eq!(outs.len(), 1);
         let sealed = &outs[0].sealed;
-        // The new key opens it (link_seq is 0 again — a fresh
-        // subscribe resets the counter, by design: the new
-        // transit key is a different keystream).
+        // The new key opens it (link_seq is 0: a NEW key is a new
+        // pair, so its counter starts fresh; the same key would resume,
+        // CIRISEdge#866).
         let opened = open_av_chunk(sealed, &key_new, sub.as_bytes(), 0, &dek).expect("open new");
         assert_eq!(opened, b"after resubscribe");
         // The old key does NOT open it.
@@ -1375,5 +1427,77 @@ mod tests {
         let other = stream(0x15);
         let r3 = relay.set_policy(other, &"alice".into(), ReceiverLayerPolicy::BLINKING_DOT);
         assert!(matches!(r3, Err(RelayError::SubscriberNotFound { .. })));
+    }
+
+    /// CIRISEdge#866 — re-subscribing with the same transit key (after an
+    /// unsubscribe, and by a replacing subscribe) resumes the outer
+    /// counter: no `(key, link_id, link_seq)` is sealed twice, and the
+    /// subscriber's sequence stays dense.
+    #[test]
+    fn resubscribing_with_the_same_key_never_repeats_an_outer_nonce_866() {
+        let mut relay = RelayNode::new(test_node(), test_address());
+        let s = stream(0x86);
+        let dek = epoch_dek();
+        let sub: PeerKeyId = "sub-0".into();
+        let key = transit_key(5);
+        let mut seen = std::collections::BTreeSet::new();
+        for round in 0..3 {
+            relay
+                .subscribe(s, sub.clone(), key, ReceiverLayerPolicy::UNCAPPED)
+                .expect("subscribe");
+            for _ in 0..3 {
+                let outs = relay
+                    .forward(s, &make_inner(&dek, s, b"x"))
+                    .expect("forward");
+                let at = (0..64)
+                    .find(|c| {
+                        open_av_chunk(&outs[0].sealed, &key, sub.as_bytes(), *c, &dek).is_ok()
+                    })
+                    .expect("opens at some link_seq");
+                assert!(
+                    seen.insert(at),
+                    "round {round}: link_seq {at} sealed twice under one key and link"
+                );
+            }
+            if round == 0 {
+                relay.unsubscribe(s, &sub).expect("unsubscribe");
+            }
+        }
+        assert_eq!(seen, (0..9).collect(), "dense across re-subscribes");
+    }
+
+    /// CIRISEdge#866 — the relay's `link_id` is the subscriber's key id, so
+    /// one key for one subscriber on two streams is one pair: refused. A
+    /// different key on the second stream is fine.
+    #[test]
+    fn one_key_for_one_subscriber_on_two_streams_is_refused_866() {
+        let mut relay = RelayNode::new(test_node(), test_address());
+        let sub: PeerKeyId = "sub-0".into();
+        relay
+            .subscribe(
+                stream(1),
+                sub.clone(),
+                transit_key(1),
+                ReceiverLayerPolicy::UNCAPPED,
+            )
+            .expect("first stream");
+        assert!(matches!(
+            relay.subscribe(
+                stream(2),
+                sub.clone(),
+                transit_key(1),
+                ReceiverLayerPolicy::UNCAPPED
+            ),
+            Err(RelayError::TransitPairInUse { .. })
+        ));
+        assert!(!relay.is_subscribed(stream(2), &sub), "nothing changed");
+        relay
+            .subscribe(
+                stream(2),
+                sub.clone(),
+                transit_key(2),
+                ReceiverLayerPolicy::UNCAPPED,
+            )
+            .expect("a different key is a different pair");
     }
 }

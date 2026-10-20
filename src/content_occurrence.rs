@@ -374,16 +374,15 @@ pub async fn provision_from_seed(
 /// This is the only discriminator edge has between a row published through
 /// the gated door and one written through the trusted-local door: both read
 /// back from `list_identity_occurrences_active` as a bare
-/// [`IdentityOccurrence`] with no signature, but only signed-put rows are
-/// SERVED (`list_signed_identity_occurrences_since` — "signed-put rows
-/// only"). A node whose row is absent here is invisible to every peer's
-/// `key_grant` membership fold, which is CIRISPersist#851.
+/// [`IdentityOccurrence`] with no signature, but only a signed-put occurrence
+/// has an `identity:occurrence:v1` ROW, and since persist v59.0.0 the row is
+/// the only form the occurrence travels in (the framed listing is retired). A
+/// node whose row is absent is invisible to every peer's `key_grant`
+/// membership fold, which is CIRISPersist#851.
 ///
-/// Walks the cursor to exhaustion rather than reading one page: the plane
-/// carries every identity's occurrences on this node, and this node's own row
-/// is not necessarily in the first page. Bounded by `MAX_PAGES` so a large or
-/// adversarial plane cannot turn node start-up into an unbounded scan — the
-/// bound failing closed means "republish", which is idempotent, not harmful.
+/// Reads the rows attested about the identity through persist's bounded
+/// attestation query and persist's own projection of each
+/// (`key_plane::occurrence_of_row`); walked to exhaustion, page by page.
 ///
 /// # Errors
 /// Directory failure.
@@ -395,37 +394,35 @@ async fn occurrence_is_on_signed_plane<B>(
 where
     B: FederationDirectory + ?Sized,
 {
-    const PAGE: u32 = 256;
-    const MAX_PAGES: usize = 64;
+    Ok(
+        signed_occurrence_row(backend, identity_key_id, occurrence_key_id)
+            .await?
+            .is_some(),
+    )
+}
 
-    let mut cursor: Option<(chrono::DateTime<chrono::Utc>, String)> = None;
-    for _ in 0..MAX_PAGES {
-        let page = backend
-            .list_signed_identity_occurrences_since(cursor.clone(), PAGE)
-            .await
-            .map_err(|e| format!("list the signed occurrence plane: {e}"))?;
-        if page.is_empty() {
-            return Ok(false);
-        }
-        if page.iter().any(|served| {
-            let o = &served.occurrence.identity_occurrence;
-            o.identity_key_id == identity_key_id && o.occurrence_key_id == occurrence_key_id
-        }) {
-            return Ok(true);
-        }
-        let next = page
-            .last()
-            .map(ciris_persist::federation::ServedIdentityOccurrence::resume_pair);
-        if next == cursor {
-            // The cursor stopped advancing — stop rather than spin.
-            return Ok(false);
-        }
-        cursor = next;
-        if page.len() < PAGE as usize {
-            return Ok(false);
-        }
-    }
-    Ok(false)
+/// The occurrence `(identity_key_id, occurrence_key_id)`'s
+/// `identity:occurrence:v1` row carries, when this node holds one (persist
+/// v59.0.0: the row IS the signed occurrence on the wire).
+///
+/// # Errors
+/// Directory failure.
+pub(crate) async fn signed_occurrence_row<B>(
+    backend: &B,
+    identity_key_id: &str,
+    occurrence_key_id: &str,
+) -> Result<Option<IdentityOccurrence>, String>
+where
+    B: FederationDirectory + ?Sized,
+{
+    let rows = crate::replication::key_plane_rows::occurrence_rows_about(backend, identity_key_id)
+        .await
+        .map_err(|e| format!("read the occurrence rows about {identity_key_id}: {e}"))?;
+    Ok(rows
+        .iter()
+        .filter_map(ciris_persist::federation::key_plane::occurrence_of_row)
+        .map(|s| s.identity_occurrence)
+        .find(|o| o.occurrence_key_id == occurrence_key_id))
 }
 
 /// **The node class.** Register this engine's own signing key as a
@@ -499,8 +496,9 @@ where
 
     // #851 / persist v44.4.0 §20.3 — the occurrence is PUBLISHED, not written
     // through the trusted-local door. A local-door row stores its signature
-    // columns NULL and `list_signed_identity_occurrences_since` serves
-    // signed-put rows only, so the row this node needs a far peer to hold —
+    // columns NULL and only a signed put gets an `identity:occurrence:v1`
+    // row (persist v59.0.0: the row is the only carriage), so the row this
+    // node needs a far peer to hold —
     // the one `key_grant` admission folds the minter's membership over — had
     // no replicable form at all. `publish_self_occurrence` signs the
     // content-only envelope with this node's LocalSigner and admits it through
@@ -641,14 +639,9 @@ mod tests {
             .expect("list")
             .into_iter()
             .find(|o| o.occurrence_key_id == occurrence);
-        let signed = node
-            .dir
-            .list_signed_identity_occurrences_since(None, 256)
+        let signed = signed_occurrence_row(&*node.dir, identity, occurrence)
             .await
-            .expect("plane")
-            .into_iter()
-            .map(|s| s.occurrence.identity_occurrence)
-            .find(|o| o.identity_key_id == identity && o.occurrence_key_id == occurrence);
+            .expect("plane");
         (active, signed)
     }
 

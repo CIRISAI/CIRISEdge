@@ -890,6 +890,135 @@ pub const AV_INBOUND_DROPPED_ARRIVALS_FULL: &str = "av_inbound_dropped_arrivals_
 pub const AV_INBOUND_DROPPED_CONSUMER_GONE: &str = "av_inbound_dropped_consumer_gone";
 /// Dropped: a Resource completed on an A/V link (A/V rides the Channel only).
 pub const AV_INBOUND_DROPPED_RESOURCE: &str = "av_inbound_dropped_resource";
+/// CIRISEdge#805 item 8, cut 2 — a chunk already delivered from the
+/// subscriber's other leg (the make-before-break overlap), dropped by the
+/// dedupe above the per-leg opens. Not a loss.
+pub const AV_INBOUND_DUPLICATE_LEG: &str = "av_inbound_duplicate_leg";
+/// CIRISEdge#867 — an inbound A/V link that never opened a frame in
+/// `LINK_ID_MISMATCH_FRAMES` tries was ended as a `link_id` mismatch
+/// (leviculum#86) so it is re-dialled.
+pub const AV_LINK_ID_MISMATCH: &str = "av_link_id_mismatch";
+/// CIRISEdge#805 item 8, cut 2 — a subscriber that dialled this relay was not
+/// entitled (not a live member of the dialled stream's group): refused, sent
+/// nothing, link closed.
+pub const AV_RELAY_DIALLER_REFUSED: &str = "av_relay_dialler_refused";
+/// CIRISEdge#805 item 8, cut 2 — a subscriber that dialled this relay was
+/// entitled and admitted to its fan-out.
+pub const AV_RELAY_DIALLER_ADMITTED: &str = "av_relay_dialler_admitted";
+// ─── CC 5.3.3.5 E1 — `EdgeMetrics::link_seal` labels ─────────────────
+//
+// Every RNS link carries the CC 3.3.6.2 hybrid transit KEX as its first frame
+// and every edge frame after it under the per-link seal
+// (`crate::transport::link_seal`). Each refusal is named; every
+// `link_seal_refused_*` label closed the link (or never dialled it), and
+// every `link_seal_dropped_*` label dropped one frame and kept the link.
+
+/// This node dialled a link and sent its transit KEX handshake; the link's
+/// keys are installed.
+pub const LINK_SEAL_INITIATED: &str = "link_seal_initiated";
+/// A dialler's handshake was answered; the link's keys are installed.
+pub const LINK_SEAL_ACCEPTED: &str = "link_seal_accepted";
+/// The dialled node publishes no usable transit KEX pair (CC 3.3.6.2: it
+/// cannot relay or receive): the dial is refused and never made.
+pub const LINK_SEAL_REFUSED_NO_PAIR: &str = "link_seal_refused_no_pair";
+/// The dialled node's pair could not be read (no directory, or a directory
+/// fault): the dial is refused and never made.
+pub const LINK_SEAL_REFUSED_LOOKUP: &str = "link_seal_refused_lookup";
+/// The handshake's claimed initiator is not the peer the link is attributed
+/// to.
+pub const LINK_SEAL_REFUSED_CLAIM_MISMATCH: &str = "link_seal_refused_claim_mismatch";
+/// The handshake was addressed to another responder key.
+pub const LINK_SEAL_REFUSED_RESPONDER_MISMATCH: &str = "link_seal_refused_responder_mismatch";
+/// The link's first frame is not a transit KEX handshake frame (a peer that
+/// skipped the KEX, or sent plaintext).
+pub const LINK_SEAL_REFUSED_NOT_A_HANDSHAKE: &str = "link_seal_refused_not_a_handshake";
+/// The handshake framing is wrong (unknown version, a continuation first, a
+/// part past the declared length, ...).
+pub const LINK_SEAL_REFUSED_MALFORMED: &str = "link_seal_refused_malformed";
+/// The handshake declared more bytes than the reassembly bound admits.
+pub const LINK_SEAL_REFUSED_TOO_LARGE: &str = "link_seal_refused_too_large";
+/// The handshake names a construction other than the hybrid suite (a
+/// classical-only or unknown suite).
+pub const LINK_SEAL_REFUSED_SUITE: &str = "link_seal_refused_suite";
+/// The KEX itself failed (a crypto refusal from `ciris_crypto::transit_kex`
+/// other than a suite or responder mismatch).
+pub const LINK_SEAL_REFUSED_KEX: &str = "link_seal_refused_kex";
+/// The responder saw no complete handshake within the budget.
+pub const LINK_SEAL_REFUSED_TIMEOUT: &str = "link_seal_refused_timeout";
+/// The dialler could not send its handshake.
+pub const LINK_SEAL_REFUSED_SEND: &str = "link_seal_refused_send";
+/// A frame arrived on a link this node dialled before its own handshake had
+/// gone out: the responder spoke first.
+pub const LINK_SEAL_REFUSED_FRAME_BEFORE_KEYS: &str = "link_seal_refused_frame_before_keys";
+/// A sealed frame failed to open (wrong key, wrong link, tampered or
+/// truncated).
+pub const LINK_SEAL_REFUSED_OPEN_FAILED: &str = "link_seal_refused_open_failed";
+/// A frame other than first contact arrived on a sealed link whose
+/// initiator is not attributed (the first-contact carve-out).
+pub const LINK_SEAL_REFUSED_FIRST_CONTACT_ONLY: &str = "link_seal_refused_first_contact_only";
+/// CLM-first-contact-seal-key-bound — a first-contact request on an
+/// unattributed sealed link was signed by (or introduced) a key other than
+/// the handshake's initiator key.
+pub const LINK_SEAL_REFUSED_FIRST_CONTACT_SIGNER: &str = "link_seal_refused_first_contact_signer";
+/// CC 3.2 (f) — a pairing-pinned transit pair was refused before any dial
+/// (bound to another node, or the wrong key lengths).
+pub const LINK_SEAL_REFUSED_PIN: &str = "link_seal_refused_pin";
+/// An opened frame on a peer-dialled link whose identity was not proven yet
+/// did not fit the bounded hold (`link_seal::HELD_FRAMES_MAX` /
+/// `HELD_BYTES_MAX`): dropped, the link kept; the sender's retry finds the
+/// identity proven.
+pub const LINK_SEAL_DROPPED_HELD_OVERFLOW: &str = "link_seal_dropped_held_overflow";
+/// A frame the first-contact carve-out would refuse, on a peer-dialled link
+/// whose identity is proven but whose attribution has not landed yet: held
+/// (`link_seal::ATTRIBUTION_HOLD_BUDGET`) and replayed once the link
+/// attributes, or the link refused when the budget is spent.
+pub const LINK_SEAL_HELD_FOR_ATTRIBUTION: &str = "link_seal_held_for_attribution";
+/// This node tried to send on a link with no keys: refused, nothing sent.
+pub const LINK_SEAL_REFUSED_UNSEALED_SEND: &str = "link_seal_refused_unsealed_send";
+/// A sealed frame whose counter was already seen, or is older than the
+/// replay window: dropped, the link kept.
+pub const LINK_SEAL_DROPPED_REPLAY: &str = "link_seal_dropped_replay";
+/// A Resource, request or response that completed on a link a peer dialled
+/// before the event loop had answered its handshake (the two ride different
+/// event planes, so a fast dialler's first Resource can overtake its last
+/// handshake part): dropped, the link kept. The budget still closes a link
+/// whose handshake never comes.
+pub const LINK_SEAL_DROPPED_BEFORE_KEYS: &str = "link_seal_dropped_before_keys";
+
+// ─── CIRISEdge#805 item 8 — `EdgeMetrics::direct_link` labels ─────────
+
+/// A direct-link upgrade proposed on the identity link to a call member.
+pub const DIRECT_LINK_PROPOSED: &str = "direct_link_proposed";
+/// leviculum refused to start a proposal (cooldown, already upgrading, busy
+/// channel, no active link).
+pub const DIRECT_LINK_PROPOSE_REFUSED: &str = "direct_link_propose_refused";
+/// No proposal: the member is already a one-hop neighbour.
+pub const DIRECT_LINK_SKIPPED_NEIGHBOUR: &str = "direct_link_skipped_neighbour";
+/// No proposal: the member's last proposal failed and is backing off (or was
+/// refused on this link).
+pub const DIRECT_LINK_SKIPPED_BACKOFF: &str = "direct_link_skipped_backoff";
+/// No proposal: no identity link to the member could be had.
+pub const DIRECT_LINK_SKIPPED_NO_LINK: &str = "direct_link_skipped_no_link";
+/// A peer's direct-link request, accepted: it shares a room with this node.
+pub const DIRECT_LINK_REQUEST_ACCEPTED: &str = "direct_link_request_accepted";
+/// A peer's direct-link request, refused: not a room peer, unattributed, or
+/// accepting turned off. Nothing about this node's address was sent.
+pub const DIRECT_LINK_REQUEST_REFUSED: &str = "direct_link_request_refused";
+/// A link moved onto a punched interface (either side).
+pub const DIRECT_LINK_ESTABLISHED: &str = "direct_link_established";
+/// The peer refused the upgrade.
+pub const DIRECT_LINK_FAILED_REJECTED: &str = "direct_link_failed_rejected";
+/// The facilitator did not answer this node's probe.
+pub const DIRECT_LINK_FAILED_PROBE: &str = "direct_link_failed_probe";
+/// The peer stopped answering partway through.
+pub const DIRECT_LINK_FAILED_TIMEOUT: &str = "direct_link_failed_timeout";
+/// No punch got through (symmetric NAT, a firewall, no route).
+pub const DIRECT_LINK_FAILED_PUNCH: &str = "direct_link_failed_punch";
+/// A punched interface went down; its link is back on its relayed path.
+pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
+/// A direct A/V leg's path was judged gone and the leg fell back
+/// (`direct_path::direct_leg_stalled`).
+pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
 
 /// The live counter/gauge bag every [`crate::Edge`] owns.
 ///
@@ -1198,6 +1327,19 @@ pub struct EdgeMetrics {
     /// (`av_inbound_dropped_queue_full` is the never-block overflow policy).
     /// Every `av_inbound_dropped_*` label is a drop.
     pub av_plane: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CC 5.3.3.5 E1 — the per-link transit seal, by label (`LINK_SEAL_*`
+    /// constants in this module): links keyed (`link_seal_initiated` /
+    /// `link_seal_accepted`), each named refusal, and each dropped frame.
+    pub link_seal: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#805 item 8 — direct links (leviculum#70) by label
+    /// (`DIRECT_LINK_*` constants in this module): proposals made, skipped
+    /// and refused, and each outcome. Every `direct_link_failed_*` label is a
+    /// proposal that ended without a direct path, the link untouched.
+    pub direct_link: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CIRISEdge#805 item 8 — peers with a direct path now, per reporting
+    /// transport (keyed by its metrics source id, like `link_pool_sizes`).
+    /// Read as [`Self::direct_links_active`] (the sum).
+    pub direct_links_active: Arc<RwLock<HashMap<u64, u64>>>,
     /// CIRISEdge#640 — blob holders dropped from a pull's candidate set, by the
     /// router's refusal BRANCH (`ScopeRouteRefusal::reason_tag`):
     /// `blob_group_not_installed` (the host's lifecycle never installed the
@@ -1324,6 +1466,14 @@ pub struct EdgeMetrics {
     /// refresh overwrite the others and move the total backward (Codex,
     /// #810).
     pub known_destination_evictions: Arc<RwLock<HashMap<u64, u64>>>,
+    /// CIRISEdge#541/#805 — Reticulum transports whose federation signer is
+    /// NOT the identity they advertise: 1 per such transport (keyed by its
+    /// metrics source id, as `known_destination_evictions` is), summed on
+    /// read. Such a node publishes its signed route and transit KEX pair
+    /// under the signer's id while peers know it by the advertised one, so
+    /// peers cannot root it or key an A/V hop to it. Zero on a correctly
+    /// wired host; the fix is the host's (pass the advertised id's signer).
+    pub transport_signer_id_mismatch: Arc<RwLock<HashMap<u64, u64>>>,
     /// CIRISEdge#819 — the Reticulum dial pools' size, ONE entry PER
     /// TRANSPORT INSTANCE (keyed by its metrics source id, as
     /// `known_destination_evictions` is): `(total pooled links, the most
@@ -1467,6 +1617,15 @@ pub struct EdgeMetrics {
     /// Booked at the bridge's single `refuse` site, alongside — never instead
     /// of — the kind axis, so a class-carrying refusal appears on both.
     pub apply_refusals_by_class: Arc<RwLock<HashMap<String, u64>>>,
+    /// persist v59.0.0 (sealed-transport floor) — the receive plane's ONE
+    /// entry for persist's `federation_envelope_kind_retired`: a framed
+    /// key-plane object (a key record, a key revocation, an identity
+    /// occurrence, an occurrence revocation) a peer offered, refused TERMINAL
+    /// and never applied, counted by persist's `retired_detail` label of the
+    /// kind (`key`, `revocation`, `identity_occurrence`,
+    /// `identity_occurrence_revocation`). Bounded by persist's retired set.
+    /// Non-zero means a peer still speaks the pre-v59 key plane.
+    pub envelope_kind_retired_refusals: Arc<RwLock<HashMap<String, u64>>>,
     /// CIRISEdge#858 — the refusal memory's park ledger (the bridge kept
     /// these as accessors only, so no scrape could see a park hold or fail):
     /// rows PARKED on a signer, per plane, since start (an absent `Key`, or an
@@ -1823,6 +1982,54 @@ impl EdgeMetrics {
             .collect()
     }
 
+    /// CC 5.3.3.5 E1 — count one per-link seal event by its `LINK_SEAL_*`
+    /// label.
+    pub fn inc_link_seal(&self, label: &'static str) {
+        *self.link_seal.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CC 5.3.3.5 E1 — the per-link seal ledger by label (tests + the
+    /// operator readback).
+    #[must_use]
+    pub fn link_seal(&self) -> HashMap<String, u64> {
+        self.link_seal
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#805 item 8 — count one direct-link event by its
+    /// `DIRECT_LINK_*` label.
+    pub fn inc_direct_link(&self, label: &'static str) {
+        *self.direct_link.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// CIRISEdge#805 item 8 — the direct-link ledger by label.
+    #[must_use]
+    pub fn direct_link(&self) -> HashMap<String, u64> {
+        self.direct_link
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// CIRISEdge#805 item 8 — `source`'s count of peers with a direct path.
+    pub fn set_direct_links_active(&self, source: u64, active: u64) {
+        self.direct_links_active.write().insert(source, active);
+    }
+
+    /// CIRISEdge#805 item 8 — peers with a direct path, over every transport
+    /// that has reported.
+    #[must_use]
+    pub fn direct_links_active(&self) -> u64 {
+        self.direct_links_active
+            .read()
+            .values()
+            .fold(0u64, |acc, n| acc.saturating_add(*n))
+    }
+
     /// CIRISEdge#683 — count one first-contact door outcome by its label.
     pub fn inc_first_contact(&self, label: &'static str) {
         *self
@@ -1872,6 +2079,24 @@ impl EdgeMetrics {
         self.known_destination_evictions
             .write()
             .insert(source, evictions);
+    }
+
+    /// CIRISEdge#541/#805 — record whether transport `source`'s signer is
+    /// not the identity it advertises (1) or is (0).
+    pub fn set_transport_signer_id_mismatch(&self, source: u64, mismatched: bool) {
+        self.transport_signer_id_mismatch
+            .write()
+            .insert(source, u64::from(mismatched));
+    }
+
+    /// CIRISEdge#541/#805 — transports whose signer is not the identity they
+    /// advertise. Zero on a correctly wired host.
+    #[must_use]
+    pub fn transport_signer_id_mismatch(&self) -> u64 {
+        self.transport_signer_id_mismatch
+            .read()
+            .values()
+            .fold(0u64, |acc, v| acc.saturating_add(*v))
     }
 
     /// CIRISEdge#809 — known-destination evictions across every transport
@@ -2204,6 +2429,14 @@ impl EdgeMetrics {
         *guard.entry(token.to_string()).or_insert(0) += 1;
     }
 
+    /// persist v59.0.0 — count one framed object of a retired kind, by
+    /// persist's `retired_detail` label (see
+    /// [`Self::envelope_kind_retired_refusals`]).
+    pub fn inc_envelope_kind_retired(&self, kind_label: &str) {
+        let mut guard = self.envelope_kind_retired_refusals.write();
+        *guard.entry(kind_label.to_string()).or_insert(0) += 1;
+    }
+
     /// CIRISEdge#858 — count one row parked on a signer on `kind`.
     pub fn inc_rows_parked_on_signer(&self, kind: EnvelopeKind) {
         *self.rows_parked_on_signer.write().entry(kind).or_insert(0) += 1;
@@ -2501,6 +2734,9 @@ impl EdgeMetrics {
                 .collect(),
             transport_inbound_drops: self.transport_inbound_drops(),
             av_plane: self.av_plane(),
+            link_seal: self.link_seal(),
+            direct_link: self.direct_link(),
+            direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
                 .read()
@@ -2513,6 +2749,7 @@ impl EdgeMetrics {
             announce_intake_evictions: self.announce_intake_evictions(),
             transport_packets_dropped: self.transport_packets_dropped(),
             known_destination_evictions: self.known_destination_evictions(),
+            transport_signer_id_mismatch: self.transport_signer_id_mismatch(),
             link_pool_links: self.link_pool_links(),
             link_pool_max_per_destination: self.link_pool_max_per_destination(),
             link_pool_closed_by_reason: self.link_pool_closed_by_reason(),
@@ -2537,6 +2774,7 @@ impl EdgeMetrics {
                 .read()
                 .clone(),
             apply_refusals_by_class: self.apply_refusals_by_class.read().clone(),
+            envelope_kind_retired_refusals: self.envelope_kind_retired_refusals.read().clone(),
             rows_parked_on_signer: self.rows_parked_on_signer.read().clone(),
             signer_releases: self.signer_releases(),
             retry_suppressions: self.retry_suppressions(),
@@ -2771,6 +3009,12 @@ pub struct EdgeMetricsBundle {
     pub first_contact_outcomes: HashMap<String, u64>,
     /// CIRISEdge#805 — the A/V plane on the live node by `AV_*` label.
     pub av_plane: HashMap<String, u64>,
+    /// CC 5.3.3.5 E1 — the per-link transit seal by `LINK_SEAL_*` label.
+    pub link_seal: HashMap<String, u64>,
+    /// CIRISEdge#805 item 8 — direct links by `DIRECT_LINK_*` label.
+    pub direct_link: HashMap<String, u64>,
+    /// CIRISEdge#805 item 8 — peers with a direct path now.
+    pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
     pub replication_routed_to_responder_total: u64,
     /// CIRISEdge#634 — replies routed into an initiator's round inbox.
@@ -2789,6 +3033,10 @@ pub struct EdgeMetricsBundle {
     /// known-destinations store, mirrored at the last transport readback.
     /// Zero with room; climbing = at cap, unretained LRU destinations going.
     pub known_destination_evictions: u64,
+    /// CIRISEdge#541/#805 — transports whose federation signer is not the
+    /// identity they advertise (peers cannot root them or key an A/V hop to
+    /// them). Zero on a correctly wired host.
+    pub transport_signer_id_mismatch: u64,
     /// CIRISEdge#819 — pooled Reticulum links (identity + scoped), at the
     /// transport's last pool-reaper pass.
     pub link_pool_links: u64,
@@ -2840,6 +3088,10 @@ pub struct EdgeMetricsBundle {
     /// [`EdgeMetrics::apply_refusals_by_class`]: the three v38.2.0 apply-door
     /// classes by their stable tokens.
     pub apply_refusals_by_class: HashMap<String, u64>,
+    /// persist v59.0.0 — snapshot of
+    /// [`EdgeMetrics::envelope_kind_retired_refusals`]: framed key-plane
+    /// objects refused `federation_envelope_kind_retired`, per kind label.
+    pub envelope_kind_retired_refusals: HashMap<String, u64>,
     /// CIRISEdge#858 — rows parked on a signer since start, per plane.
     pub rows_parked_on_signer: HashMap<EnvelopeKind, u64>,
     /// CIRISEdge#858 — rows released from a park since start.
@@ -3068,6 +3320,16 @@ impl EdgeMetricsBundle {
         f.family("first_contact_outcomes", &self.first_contact_outcomes);
         // CIRISEdge#805 — the A/V plane ledger, `av_plane.<label>`.
         f.family("av_plane", &self.av_plane);
+        // CC 5.3.3.5 E1 — the per-link seal ledger, `link_seal.<label>`.
+        f.family("link_seal", &self.link_seal);
+        // CIRISEdge#805 item 8 — direct links, `direct_link.<label>`, and the
+        // gauge of peers with a direct path now.
+        f.family("direct_link", &self.direct_link);
+        #[allow(clippy::cast_precision_loss)] // a peer count
+        f.gauges.insert(
+            "direct_links_active".to_string(),
+            self.direct_links_active as f64,
+        );
         for (name, v) in [
             (
                 "replication_routed_to_responder_total",
@@ -3087,6 +3349,10 @@ impl EdgeMetricsBundle {
             (
                 "known_destination_evictions",
                 self.known_destination_evictions,
+            ),
+            (
+                "transport_signer_id_mismatch",
+                self.transport_signer_id_mismatch,
             ),
             ("link_before_binding", self.link_before_binding),
             (
@@ -3137,6 +3403,10 @@ impl EdgeMetricsBundle {
             &self.attestation_apply_refusals_by_reason,
         );
         f.family("apply_refusals_by_class", &self.apply_refusals_by_class);
+        f.family(
+            "envelope_kind_retired_refusals",
+            &self.envelope_kind_retired_refusals,
+        );
         let (mut offered, mut acked, mut unacked) = (0u64, 0u64, 0u64);
         for row in &self.removal_delivery {
             offered = offered.saturating_add(row.offered as u64);
@@ -3265,12 +3535,16 @@ edge_metrics_bundle_fields!(
     transport_inbound_drops,
     first_contact_outcomes,
     av_plane,
+    link_seal,
+    direct_link,
+    direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,
     replication_reply_dropped_total,
     announce_intake_evictions,
     transport_packets_dropped,
     known_destination_evictions,
+    transport_signer_id_mismatch,
     link_pool_links,
     link_pool_max_per_destination,
     link_pool_closed_by_reason,
@@ -3289,6 +3563,7 @@ edge_metrics_bundle_fields!(
     key_apply_refusals_by_reason,
     attestation_apply_refusals_by_reason,
     apply_refusals_by_class,
+    envelope_kind_retired_refusals,
     rows_parked_on_signer,
     signer_releases,
     retry_suppressions,

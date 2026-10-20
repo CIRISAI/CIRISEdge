@@ -66,7 +66,8 @@ pub type PeerKeyId = String;
 /// CIRISEdge#720 — an A/V wire frame larger than the link Channel will carry.
 ///
 /// A link-Channel send accepts `link_mdu − CHANNEL_ENVELOPE_HEADER_SIZE`
-/// bytes (the #716 six-byte margin: 425 on a base-MTU 500 link). Anything
+/// bytes (the #716 six-byte margin: 425 on a base-MTU 500 link), and the
+/// CC 5.3.3.5 E1 seal takes 25 of them, so a frame may carry 400. Anything
 /// larger is refused by leviculum as `TooLarge` and folded into a generic
 /// `LinkFailed` on the way out, which is how an oversized chunk used to
 /// read as [`AvDispatcherError::SendFailed`]. A sender that knows its
@@ -133,6 +134,14 @@ pub enum AvDispatcherError {
     /// A caller-supplied [`AvLinkReceiver::recv`] failed.
     #[error("transport recv failed: {0}")]
     RecvFailed(String),
+    /// CIRISEdge#866 — the `(transit key, link_id)` pair is already live
+    /// under another subscriber. Two live counters under one pair would
+    /// repeat outer nonces, so the admission is refused and nothing
+    /// changes. See [`crate::transport::realtime_av::LinkSeqLedger`].
+    #[error(
+        "transit key + link_id already live for another subscriber ({0}); refused (CIRISEdge#866)"
+    )]
+    TransitPairInUse(PeerKeyId),
     /// An AEAD open failed — either the inbound outer layer (relay /
     /// subscriber) or the inner layer (subscriber). Most commonly a
     /// wrong transit key or a `link_seq` desync.
@@ -141,6 +150,13 @@ pub enum AvDispatcherError {
     /// The outer re-seal failed during fan-out.
     #[error("relay forward failed: {0}")]
     ForwardFailed(String),
+    /// CIRISEdge#805 item 8 — the link is gone (closed by its peer or
+    /// reaped): nothing was sent and nothing ever will be on it. Distinct from
+    /// [`Self::SendFailed`] so a fan-out can PRUNE the subscriber rather than
+    /// fail every later chunk on it (a subscriber that dropped its relay leg
+    /// closes the link on purpose).
+    #[error("the link is gone: {0}")]
+    LinkGone(String),
     /// An endpoint role (publisher or subscriber) was constructed
     /// without an `epoch_dek`. Structural guard for the relay-vs-
     /// endpoint role split: endpoints inner-seal / inner-open under
@@ -154,6 +170,77 @@ pub enum AvDispatcherError {
     /// has no downstream link for.
     #[error("subscriber not found: {0:?}")]
     SubscriberNotFound(PeerKeyId),
+}
+
+/// CIRISEdge#867 — how many frames a link may fail to open, from its FIRST
+/// frame on, before it is judged to run under a different `link_id` than
+/// the one this end seals and opens with.
+pub const LINK_ID_MISMATCH_FRAMES: u32 = 8;
+
+/// CIRISEdge#867 — tells a link sealed under another `link_id` from a link
+/// with a bad frame or two.
+///
+/// leviculum (Codeberg #66, CIRISAI/leviculum#86) can report a stale
+/// `link_id` on the initiator after a link-establishment retry: the wire id
+/// changed, the handle kept the original. The outer nonce, and the coming
+/// per-hop transit key, are bound to `link_id`, so every frame on such a
+/// link fails its tag. Without this guard that is silent, unbounded media
+/// loss. The signature is exact: a link that has NEVER opened a frame and
+/// has now failed [`LINK_ID_MISMATCH_FRAMES`] in a row. A link that opened
+/// even one frame shares this end's `link_id`, and a later failure there
+/// is a bad frame, never a mismatch.
+///
+/// The receive loop ends the link's subscription on a mismatch. On the
+/// leg path, that is the relay leg ending, and leg choice asks the host to
+/// rejoin (re-dial), which gets a new link and a new id. The real fix
+/// reads the WIRE id from leviculum (`wire_link_id`, leviculum v0.32).
+#[derive(Debug, Default)]
+pub struct LinkIdGuard {
+    opened: bool,
+    unopened: u32,
+}
+
+impl LinkIdGuard {
+    /// A frame opened: this link shares our `link_id` for good.
+    pub fn opened(&mut self) {
+        self.opened = true;
+    }
+
+    /// A frame failed to open at every candidate counter. Returns `true`
+    /// when that makes the link a `link_id` mismatch.
+    pub fn unopened(&mut self) -> bool {
+        if self.opened {
+            return false;
+        }
+        self.unopened = self.unopened.saturating_add(1);
+        self.unopened >= LINK_ID_MISMATCH_FRAMES
+    }
+
+    /// Frames failed so far without a single open.
+    #[must_use]
+    pub fn unopened_count(&self) -> u32 {
+        self.unopened
+    }
+
+    /// Log (and count, where `metrics` is in reach) the end of a link judged
+    /// a `link_id` mismatch. `role` names the loop that ended it.
+    pub(crate) fn report_mismatch(
+        &self,
+        role: &str,
+        link_id: &[u8],
+        metrics: Option<&crate::observability::EdgeMetrics>,
+    ) {
+        if let Some(m) = metrics {
+            m.inc_av_plane(crate::observability::AV_LINK_ID_MISMATCH);
+        }
+        tracing::error!(
+            role,
+            link = %hex::encode(link_id),
+            unopened = self.unopened,
+            "AV: no frame on this link has ever opened — link_id mismatch \
+             (leviculum#86); the link is ENDED so it is re-dialled (CIRISEdge#867)"
+        );
+    }
 }
 
 /// Open a hop's outer AEAD at the first counter in
@@ -326,8 +413,10 @@ pub fn open_at_first_counter<T>(
 
 /// One downstream subscriber link the dispatcher fans out onto. The
 /// `transit_key` + `link_id` are the per-(subscriber, stream) outer-AEAD
-/// state established out-of-band via the hybrid PQC KEX; the dispatcher
-/// owns the monotonic `link_seq` counter internally.
+/// state; on the live node `transit_key` is this end's SEAL key from the
+/// link's transit KEX (`av_transit_handshake::LinkTransit::seal_key`,
+/// CIRISEdge#805). The dispatcher owns the monotonic `link_seq` counter
+/// internally.
 pub struct AvSubscriberLink {
     /// Federation `key_id` of the subscriber — same identifier space as
     /// [`super::realtime_av_relay::PeerKeyId`].
@@ -345,7 +434,9 @@ pub struct AvSubscriberLink {
 /// One inbound link the dispatcher pulls from. The `transit_key` +
 /// `link_id` are the per-link outer-AEAD state for THIS hop — for a
 /// relay, the upstream transit key; for a subscriber, the
-/// relay→subscriber (or publisher→subscriber) transit key.
+/// relay→subscriber (or publisher→subscriber) transit key. On the live node
+/// it is this end's OPEN key from the link's transit KEX
+/// (`av_transit_handshake::LinkTransit::open_key`, CIRISEdge#805).
 pub struct AvInboundLink {
     /// Per-link inbound outer-AEAD transit key (32B).
     pub transit_key: [u8; 32],
@@ -417,6 +508,9 @@ pub struct AvDispatcher {
     subscribers: HashMap<PeerKeyId, OutboundState>,
     /// Inbound links, consumed by [`Self::spawn_subscriber_loop`].
     inbound_links: Vec<AvInboundLink>,
+    /// CIRISEdge#866 — where each retired `(transit key, link_id)` pair's
+    /// counter stopped; a re-admission resumes it, never restarts it.
+    link_seqs: crate::transport::realtime_av::LinkSeqLedger,
 }
 
 impl AvDispatcher {
@@ -452,8 +546,21 @@ impl AvDispatcher {
             AvRole::Publisher | AvRole::Subscriber => config.epoch_dek.map(EpochDek::from_bytes),
         };
 
-        let mut subscribers = HashMap::with_capacity(config.initial_subscribers.len());
+        let mut subscribers: HashMap<PeerKeyId, OutboundState> =
+            HashMap::with_capacity(config.initial_subscribers.len());
         for link in config.initial_subscribers {
+            // CIRISEdge#866 — two initial subscribers on one pair would run
+            // two counters from 0 under one key.
+            if crate::transport::realtime_av::LinkSeqLedger::live_conflict(
+                &link.transit_key,
+                &link.link_id,
+                subscribers
+                    .iter()
+                    .filter(|(who, _)| **who != link.subscriber)
+                    .map(|(_, st)| (&st.transit_key, st.link_id.as_slice())),
+            ) {
+                return Err(AvDispatcherError::TransitPairInUse(link.subscriber));
+            }
             subscribers.insert(
                 link.subscriber,
                 OutboundState {
@@ -471,6 +578,7 @@ impl AvDispatcher {
             epoch_dek,
             subscribers,
             inbound_links: config.inbound_links,
+            link_seqs: crate::transport::realtime_av::LinkSeqLedger::default(),
         })
     }
 
@@ -513,10 +621,11 @@ impl AvDispatcher {
     ///
     /// - [`AvDispatcherError::ForwardFailed`] if [`seal_av_outer`]
     ///   fails for any subscriber.
-    /// - [`AvDispatcherError::SendFailed`] (propagated) if the
-    ///   transport send fails. The fan-out stops at the first send
-    ///   error — callers wanting best-effort fan-out across a flaky
-    ///   roster should drive subscribers one at a time.
+    /// - [`AvDispatcherError::SendFailed`] (propagated) if a transport
+    ///   send fails. Every subscriber is attempted first; the first
+    ///   error is returned after the whole roster (CIRISEdge#805 item 8).
+    ///   A subscriber whose link is gone ([`AvDispatcherError::LinkGone`])
+    ///   is pruned from the roster, not reported.
     pub async fn publish_inner(&mut self, inner: InnerSealed) -> Result<(), AvDispatcherError> {
         self.fan_out(&inner).await
     }
@@ -576,7 +685,14 @@ impl AvDispatcher {
     /// relay paths. Visits every downstream subscriber, seals with its
     /// per-link state, advances its `link_seq`, and sends.
     async fn fan_out(&mut self, inner: &InnerSealed) -> Result<(), AvDispatcherError> {
-        for state in self.subscribers.values_mut() {
+        // CIRISEdge#805 item 8 — EVERY subscriber is attempted. This
+        // loop used to return on the first refusal, so one congested or closed
+        // downstream link starved every subscriber after it in (random)
+        // HashMap order. The first error is still returned, after the loop;
+        // a subscriber whose link is GONE is pruned, not reported.
+        let mut first_err: Option<AvDispatcherError> = None;
+        let mut gone: Vec<PeerKeyId> = Vec::new();
+        for (subscriber, state) in &mut self.subscribers {
             let link_seq = state.next_link_seq;
             let sealed = seal_av_outer(inner, &state.transit_key, &state.link_id, link_seq)
                 .map_err(|e| AvDispatcherError::ForwardFailed(e.to_string()))?;
@@ -592,16 +708,27 @@ impl AvDispatcher {
             // never used twice.
             match state.sender.send(&sealed.to_bytes()).await {
                 Ok(()) => state.next_link_seq = state.next_link_seq.wrapping_add(1),
+                Err(AvDispatcherError::LinkGone(why)) => {
+                    tracing::info!(
+                        subscriber = %subscriber,
+                        why = %why,
+                        "AV fan-out: a subscriber's link is gone — pruned (CIRISEdge#805 item 8)"
+                    );
+                    gone.push(subscriber.clone());
+                }
                 Err(e @ (AvDispatcherError::Congested | AvDispatcherError::ChunkTooLarge(_))) => {
-                    return Err(e);
+                    first_err.get_or_insert(e);
                 }
                 Err(e) => {
                     state.next_link_seq = state.next_link_seq.wrapping_add(1);
-                    return Err(e);
+                    first_err.get_or_insert(e);
                 }
             }
         }
-        Ok(())
+        for subscriber in &gone {
+            self.subscribers.remove(subscriber);
+        }
+        first_err.map_or(Ok(()), Err)
     }
 
     /// Subscriber-side receive loop. Spawns an async task per inbound
@@ -627,6 +754,15 @@ impl AvDispatcher {
     /// the spawned tasks are still created but every frame fails to open
     /// and is skipped.
     pub fn spawn_subscriber_loop(&mut self) -> mpsc::Receiver<ReconstructedChunk> {
+        self.spawn_subscriber_loop_counted(None)
+    }
+
+    /// [`Self::spawn_subscriber_loop`], counting a `link_id` mismatch
+    /// ([`LinkIdGuard`], CIRISEdge#867) on `metrics`.
+    pub(crate) fn spawn_subscriber_loop_counted(
+        &mut self,
+        metrics: Option<&crate::observability::EdgeMetrics>,
+    ) -> mpsc::Receiver<ReconstructedChunk> {
         let (tx, rx) = mpsc::channel::<ReconstructedChunk>(64);
         // Take ownership of the inbound links — the loop consumes them.
         let inbound = std::mem::take(&mut self.inbound_links);
@@ -634,10 +770,12 @@ impl AvDispatcher {
 
         for link in inbound {
             let tx = tx.clone();
+            let metrics = metrics.cloned();
             tokio::spawn(async move {
                 let dek = dek_bytes.map(EpochDek::from_bytes);
                 let mut next_link_seq: u64 = 0;
                 let mut gap = HopGap::default();
+                let mut guard = LinkIdGuard::default();
                 loop {
                     // A permanently-closed link surfaces as a recv error;
                     // exit the loop. A transient error also lands here —
@@ -670,8 +808,16 @@ impl AvDispatcher {
                             open_av_chunk(&sealed, &link.transit_key, &link.link_id, c, dek).ok()
                         })
                     else {
+                        if guard.unopened() {
+                            // CIRISEdge#867 — never opened a frame: this
+                            // link runs under another link_id. End it so
+                            // the leg is re-dialled instead of starving.
+                            guard.report_mismatch("subscriber", &link.link_id, metrics.as_ref());
+                            break;
+                        }
                         continue;
                     };
+                    guard.opened();
                     next_link_seq = used.wrapping_add(1);
                     gap.resolved();
                     let chunk = ReconstructedChunk {
@@ -692,23 +838,41 @@ impl AvDispatcher {
         rx
     }
 
-    /// Add a new downstream subscriber mid-stream. Its `link_seq`
-    /// counter starts at 0 — a fresh transit key is a fresh keystream.
-    /// Idempotent on `subscriber`: re-adding replaces the outbound state
-    /// (and resets the counter).
+    /// Add a downstream subscriber mid-stream. Idempotent on `subscriber`:
+    /// re-adding replaces the outbound state.
+    ///
+    /// CIRISEdge#866 — the `link_seq` counter belongs to the
+    /// `(transit key, link_id)` pair, not to this admission. A pair this
+    /// dispatcher sealed under before (dropped, or replaced, and admitted
+    /// again) resumes where it stopped. A new pair starts at 0. Restarting
+    /// a used pair at 0 would repeat outer nonces under one GCM key.
     ///
     /// # Errors
     ///
-    /// Infallible today; returns `Result` for forward-compat with a
-    /// future validation pass (e.g. rejecting a relay-role add). Never
-    /// returns `Err` in this cut.
+    /// [`AvDispatcherError::TransitPairInUse`] if the pair is already live
+    /// under ANOTHER subscriber; nothing changes.
     pub fn add_subscriber(&mut self, link: AvSubscriberLink) -> Result<(), AvDispatcherError> {
+        if crate::transport::realtime_av::LinkSeqLedger::live_conflict(
+            &link.transit_key,
+            &link.link_id,
+            self.subscribers
+                .iter()
+                .filter(|(who, _)| **who != link.subscriber)
+                .map(|(_, st)| (&st.transit_key, st.link_id.as_slice())),
+        ) {
+            return Err(AvDispatcherError::TransitPairInUse(link.subscriber));
+        }
+        if let Some(old) = self.subscribers.remove(&link.subscriber) {
+            self.link_seqs
+                .retire(&old.transit_key, &old.link_id, old.next_link_seq);
+        }
+        let next_link_seq = self.link_seqs.resume(&link.transit_key, &link.link_id);
         self.subscribers.insert(
             link.subscriber,
             OutboundState {
                 transit_key: link.transit_key,
                 link_id: link.link_id,
-                next_link_seq: 0,
+                next_link_seq,
                 sender: link.outbound_send,
             },
         );
@@ -716,10 +880,15 @@ impl AvDispatcher {
     }
 
     /// Remove a downstream subscriber mid-stream. Drops its outbound
-    /// state (transit key + sender). No-op if the subscriber was not
-    /// registered.
+    /// state (transit key + sender) and keeps only where its pair's
+    /// counter stopped, as a hash (CIRISEdge#866). No-op if the subscriber
+    /// was not registered.
     pub fn remove_subscriber(&mut self, subscriber: &PeerKeyId) {
-        self.subscribers.remove(subscriber);
+        if let Some(old) = self.subscribers.remove(subscriber) {
+            // CIRISEdge#866 — remember where the pair stopped.
+            self.link_seqs
+                .retire(&old.transit_key, &old.link_id, old.next_link_seq);
+        }
     }
 }
 
@@ -860,6 +1029,95 @@ mod tests {
             open_av_chunk(&sealed, &transit, b"sub", 0, &dek).is_ok(),
             "the first frame that went out is link_seq 0"
         );
+    }
+
+    /// A sender that always refuses with `err`.
+    struct RefusingSender {
+        err: fn() -> AvDispatcherError,
+    }
+
+    #[async_trait::async_trait]
+    impl AvLinkSender for RefusingSender {
+        async fn send(&self, _bytes: &[u8]) -> Result<(), AvDispatcherError> {
+            Err((self.err)())
+        }
+    }
+
+    fn publisher_over(subscribers: Vec<AvSubscriberLink>) -> AvDispatcher {
+        AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(8),
+            local_role: AvRole::Publisher,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: subscribers,
+            inbound_links: vec![],
+        })
+        .expect("publisher")
+    }
+
+    fn healthy(name: &str, tx: mpsc::UnboundedSender<Vec<u8>>) -> AvSubscriberLink {
+        AvSubscriberLink {
+            subscriber: name.to_owned(),
+            transit_key: [0x31; 32],
+            link_id: name.as_bytes().to_vec(),
+            outbound_send: Box::new(LimitedSender { limit: 4096, tx }),
+        }
+    }
+
+    fn refusing(name: &str, err: fn() -> AvDispatcherError) -> AvSubscriberLink {
+        AvSubscriberLink {
+            subscriber: name.to_owned(),
+            transit_key: [0x32; 32],
+            link_id: name.as_bytes().to_vec(),
+            outbound_send: Box::new(RefusingSender { err }),
+        }
+    }
+
+    /// CIRISEdge#805 item 8 — a subscriber whose link is gone is
+    /// pruned, and the others still get every chunk, in any roster order.
+    #[tokio::test]
+    async fn a_gone_link_is_pruned_and_starves_nobody() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut d = publisher_over(vec![
+            refusing("gone", || AvDispatcherError::LinkGone("closed".to_owned())),
+            healthy("ok", tx),
+        ]);
+        d.publish_inner(inner(&dek, 0, 64))
+            .await
+            .expect("a pruned link is no error");
+        assert!(rx.try_recv().is_ok(), "the healthy subscriber got it");
+        assert_eq!(d.subscriber_count(), 1, "the gone one was pruned");
+        d.publish_inner(inner(&dek, 1, 64)).await.expect("again");
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// CIRISEdge#805 item 8 — one congested subscriber does not stop the
+    /// fan-out: every other subscriber gets the chunk, and the refusal is
+    /// still reported. Order-proof: the roster is a HashMap, so a regression
+    /// to return-on-first-error is caught only when the congested one is not
+    /// iterated last; sixteen fresh rosters of eight healthy subscribers each
+    /// (each with its own hash seed) make a lucky green negligible.
+    #[tokio::test]
+    async fn one_congested_subscriber_does_not_starve_the_rest() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        for _ in 0..16 {
+            let mut receivers = Vec::new();
+            let mut roster = vec![refusing("busy", || AvDispatcherError::Congested)];
+            for i in 0..8 {
+                let (tx, rx) = mpsc::unbounded_channel();
+                roster.push(healthy(&format!("ok-{i}"), tx));
+                receivers.push(rx);
+            }
+            let mut d = publisher_over(roster);
+            assert!(matches!(
+                d.publish_inner(inner(&dek, 0, 64)).await,
+                Err(AvDispatcherError::Congested)
+            ));
+            for rx in &mut receivers {
+                assert!(rx.try_recv().is_ok(), "every healthy subscriber got it");
+            }
+            assert_eq!(d.subscriber_count(), 9, "congestion prunes nobody");
+        }
     }
 
     #[test]
@@ -1059,5 +1317,212 @@ mod tests {
             inbound_links: vec![],
         });
         assert!(r.is_ok());
+    }
+
+    /// The `link_seq` a wire frame was sealed under, found by opening it.
+    fn sealed_at(wire: &[u8], key: &[u8; 32], link_id: &[u8], dek: &EpochDek) -> u64 {
+        let sealed = SealedAvChunk::from_bytes(wire).expect("parse");
+        (0..64)
+            .find(|c| open_av_chunk(&sealed, key, link_id, *c, dek).is_ok())
+            .expect("the frame opens at some link_seq under its key and link")
+    }
+
+    /// CIRISEdge#866 — re-admitting a subscriber with the same transit key
+    /// and link (after a remove, and by a replacing add) resumes its outer
+    /// counter: across three admissions no `(key, link_id, link_seq)` is
+    /// ever sealed twice, and the sequence the receiver sees stays dense.
+    #[tokio::test]
+    async fn readmission_on_the_same_pair_never_repeats_an_outer_nonce_866() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut d = publisher_over(vec![healthy("sub", tx.clone())]);
+        let key = [0x31u8; 32];
+        let mut seen = std::collections::BTreeSet::new();
+        let mut chunk = 0u64;
+        for round in 0..3 {
+            match round {
+                1 => {
+                    d.remove_subscriber(&"sub".to_owned());
+                    d.add_subscriber(healthy("sub", tx.clone()))
+                        .expect("re-admit after a remove");
+                }
+                2 => d
+                    .add_subscriber(healthy("sub", tx.clone()))
+                    .expect("re-admit by a replacing add"),
+                _ => {}
+            }
+            for _ in 0..3 {
+                d.publish_inner(inner(&dek, chunk, 64))
+                    .await
+                    .expect("publish");
+                chunk += 1;
+                let wire = rx.try_recv().expect("sent");
+                let at = sealed_at(&wire, &key, b"sub", &dek);
+                assert!(
+                    seen.insert(at),
+                    "round {round}: link_seq {at} sealed twice under one key and link"
+                );
+            }
+        }
+        assert_eq!(seen, (0..9).collect(), "dense across re-admissions");
+    }
+
+    /// CIRISEdge#866 — a NEW transit key on the same link is a new pair and
+    /// starts at 0.
+    #[tokio::test]
+    async fn a_new_key_on_the_same_link_starts_its_own_counter_866() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut d = publisher_over(vec![healthy("sub", tx.clone())]);
+        d.publish_inner(inner(&dek, 0, 64)).await.expect("publish");
+        let _ = rx.try_recv().expect("sent");
+        d.remove_subscriber(&"sub".to_owned());
+        let mut fresh = healthy("sub", tx);
+        fresh.transit_key = [0x55; 32];
+        d.add_subscriber(fresh).expect("a new key");
+        d.publish_inner(inner(&dek, 1, 64)).await.expect("publish");
+        let wire = rx.try_recv().expect("sent");
+        assert_eq!(sealed_at(&wire, &[0x55; 32], b"sub", &dek), 0);
+    }
+
+    /// CIRISEdge#866 — the same pair live under two subscribers is refused,
+    /// at an add and at construction, and the roster is unchanged.
+    #[test]
+    fn a_pair_live_under_another_subscriber_is_refused_866() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let twin = |tx: mpsc::UnboundedSender<Vec<u8>>| {
+            let mut l = healthy("b", tx);
+            l.link_id = b"a".to_vec();
+            l
+        };
+        let mut d = publisher_over(vec![healthy("a", tx.clone())]);
+        assert!(matches!(
+            d.add_subscriber(twin(tx.clone())),
+            Err(AvDispatcherError::TransitPairInUse(who)) if who == "b"
+        ));
+        assert_eq!(d.subscriber_count(), 1, "nothing changed");
+        let built = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(8),
+            local_role: AvRole::Publisher,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: vec![healthy("a", tx.clone()), twin(tx)],
+            inbound_links: vec![],
+        });
+        assert!(matches!(built, Err(AvDispatcherError::TransitPairInUse(_))));
+    }
+
+    /// A subscriber loop over one scripted link that opens with `link_id`.
+    fn scripted_subscriber(
+        link_id: &[u8],
+    ) -> (
+        mpsc::UnboundedSender<InboundWireFrame>,
+        mpsc::Receiver<ReconstructedChunk>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut d = AvDispatcher::new(AvDispatcherConfig {
+            stream_id: stream(7),
+            local_role: AvRole::Subscriber,
+            epoch_dek: Some(dek_bytes()),
+            initial_subscribers: vec![],
+            inbound_links: vec![AvInboundLink {
+                transit_key: [0x31; 32],
+                link_id: link_id.to_vec(),
+                inbound_recv: Box::new(Scripted {
+                    rx: tokio::sync::Mutex::new(rx),
+                }),
+            }],
+        })
+        .expect("subscriber");
+        (tx, d.spawn_subscriber_loop())
+    }
+
+    fn frame_on(link_id: &[u8], chunk_seq: u64, link_seq: u64) -> InboundWireFrame {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        InboundWireFrame {
+            dropped_before: 0,
+            bytes: seal_av_outer(&inner(&dek, chunk_seq, 32), &[0x31; 32], link_id, link_seq)
+                .expect("outer")
+                .to_bytes(),
+        }
+    }
+
+    /// CIRISEdge#867 — the guard: a link that never opened is a mismatch at
+    /// exactly `LINK_ID_MISMATCH_FRAMES` failures; a link that opened once
+    /// never is.
+    #[test]
+    fn a_link_that_never_opens_is_a_link_id_mismatch_867() {
+        let mut g = LinkIdGuard::default();
+        for _ in 1..LINK_ID_MISMATCH_FRAMES {
+            assert!(!g.unopened());
+        }
+        assert!(
+            g.unopened(),
+            "the Nth unopened frame from the first is a mismatch"
+        );
+        let mut g = LinkIdGuard::default();
+        g.opened();
+        for _ in 0..10 * LINK_ID_MISMATCH_FRAMES {
+            assert!(!g.unopened(), "a link that opened once shares our link_id");
+        }
+    }
+
+    /// CIRISEdge#867 — the peer seals under the WIRE link_id while this end
+    /// holds a stale one (leviculum#86): no frame opens, and the loop ENDS
+    /// the link after `LINK_ID_MISMATCH_FRAMES` instead of starving forever.
+    #[tokio::test]
+    async fn a_stale_link_id_ends_the_link_instead_of_starving_867() {
+        let (tx, mut out) = scripted_subscriber(b"stale");
+        for i in 0..u64::from(LINK_ID_MISMATCH_FRAMES) {
+            tx.send(frame_on(b"wire", i, i)).expect("feed");
+        }
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+            .await
+            .expect("the loop answers in time");
+        assert!(ended.is_none(), "the link is ended, not left silent");
+    }
+
+    /// CIRISEdge#867 — a link that opened a frame shares our link_id: any
+    /// number of foreign frames after that are dropped one by one, and the
+    /// link keeps delivering.
+    #[tokio::test]
+    async fn junk_after_a_good_frame_never_ends_the_link_867() {
+        let (tx, mut out) = scripted_subscriber(b"me");
+        tx.send(frame_on(b"me", 0, 0)).expect("feed");
+        for i in 0..4 * u64::from(LINK_ID_MISMATCH_FRAMES) {
+            tx.send(frame_on(b"other", 100 + i, i)).expect("feed");
+        }
+        tx.send(frame_on(b"me", 1, 1)).expect("feed");
+        for want in [0u64, 1] {
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv())
+                .await
+                .expect("in time")
+                .expect("still open");
+            assert_eq!(got.chunk_seq, ChunkSeq(want));
+        }
+    }
+
+    /// CIRISEdge#867 item 3 — `link_seq` is edge's own u64 per direction,
+    /// never a Channel u16 sequence: the counter runs past 65535 and the
+    /// frames open there.
+    #[tokio::test]
+    async fn link_seq_is_a_u64_past_the_u16_boundary_867() {
+        let dek = EpochDek::from_bytes(dek_bytes());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut d = publisher_over(vec![healthy("sub", tx)]);
+        d.subscribers.get_mut("sub").expect("sub").next_link_seq = u64::from(u16::MAX);
+        for chunk in 0..2 {
+            d.publish_inner(inner(&dek, chunk, 64))
+                .await
+                .expect("publish");
+        }
+        let key = [0x31u8; 32];
+        let first = SealedAvChunk::from_bytes(&rx.try_recv().expect("sent")).expect("parse");
+        let second = SealedAvChunk::from_bytes(&rx.try_recv().expect("sent")).expect("parse");
+        assert!(open_av_chunk(&first, &key, b"sub", u64::from(u16::MAX), &dek).is_ok());
+        assert!(
+            open_av_chunk(&second, &key, b"sub", u64::from(u16::MAX) + 1, &dek).is_ok(),
+            "65536, not a wrap to 0"
+        );
+        assert!(open_av_chunk(&second, &key, b"sub", 0, &dek).is_err());
     }
 }

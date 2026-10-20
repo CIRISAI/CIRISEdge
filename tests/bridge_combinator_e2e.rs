@@ -48,7 +48,7 @@
 
 use std::sync::Arc;
 
-use ciris_persist::federation::types::{algorithm, identity_type, KeyRecord, SignedKeyRecord};
+use ciris_persist::federation::types::{identity_type, KeyRecord, SignedKeyRecord};
 use ciris_persist::federation::FederationDirectory;
 use ciris_persist::store::MemoryBackend;
 
@@ -65,40 +65,45 @@ fn fresh_bridge(cohort: Vec<String>) -> (Arc<MemoryBackend>, FederationDirectory
     (backend, bridge)
 }
 
-fn fixture_key_record(key_id: &str, identity_type_: &str) -> KeyRecord {
-    let now = chrono::Utc::now();
-    KeyRecord {
-        key_id: key_id.to_string(),
-        // CIRISPersist v22 (#543) rejects a pubkey that doesn't decode to a 32-byte
-        // Ed25519 key. `"0".repeat(44)` was 44 base64 chars → 33 bytes; encode
-        // exactly 32 bytes instead (the round-trip under test doesn't depend on the
-        // key's value, only that it is a well-formed 32-byte key).
-        pubkey_ed25519_base64: {
-            use base64::Engine as _;
-            base64::engine::general_purpose::STANDARD.encode([0u8; 32])
-        },
-        pubkey_ml_dsa_65_base64: None,
-        algorithm: algorithm::HYBRID.to_string(),
-        identity_type: identity_type_.to_string(),
-        identity_ref: format!("{identity_type_}-ref-{key_id}"),
-        valid_from: now,
-        valid_until: None,
-        registration_envelope: serde_json::json!({
-            "key_id": key_id,
-            "identity_type": identity_type_,
-        }),
-        original_content_hash: "0".repeat(64),
-        scrub_signature_classical: "x".repeat(88),
-        scrub_signature_pqc: None,
-        scrub_key_id: key_id.to_string(),
-        scrub_timestamp: now,
-        pqc_completed_at: None,
-        persist_row_hash: String::new(),
-        capability_roles: Vec::new(),
-        attestation_evidence: None,
-        consent_role: None,
-        additional_scrubs: Vec::new(),
-    }
+/// A persist-minted, self-scrubbed hybrid key record (proof of possession
+/// over its own registration envelope). persist #1103 (CC 2.6.8): its
+/// `key_id` is DERIVED by persist's engine from the signer's own Ed25519
+/// pubkey (`derive_key_id(label, pubkey)`), never hand-written; and since
+/// persist v59 only a verifiable record has the `key:record:v1` row the Key
+/// plane carries. Tests reference the returned record's `key_id`.
+async fn minted_key_record(label: &str, identity_type_: &str, seed: u8) -> KeyRecord {
+    use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
+    let classical: Arc<dyn HardwareSigner> =
+        Arc::new(Ed25519SoftwareSigner::from_bytes(&[seed; 32], label).expect("ed25519 from seed"));
+    let pqc: Arc<dyn PqcSigner> = Arc::new(
+        MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{label}-pqc"))
+            .expect("ml-dsa-65 from seed"),
+    );
+    let signer = ciris_persist::prelude::LocalSigner::from_hardware_parts(
+        classical,
+        label.to_owned(),
+        Some(pqc),
+        Some(format!("{label}-pqc")),
+    )
+    .await
+    .expect("hybrid local signer");
+    let engine = ciris_persist::Engine::with_signer(Arc::new(signer), "sqlite::memory:")
+        .await
+        .expect("throwaway engine");
+    let key_id = engine
+        .register_self_federation_key(
+            identity_type_,
+            label,
+            None,
+            serde_json::json!({}),
+            Vec::new(),
+        )
+        .await
+        .expect("mint a self-signed, subject-bound key record");
+    FederationDirectory::lookup_public_key(&*engine.federation_directory(), &key_id)
+        .await
+        .expect("read back")
+        .expect("the minted record exists")
 }
 
 /// Every `EnvelopeKind` variant — both the 9 base kinds the v6.2.0
@@ -164,16 +169,11 @@ async fn empty_cohort_yields_empty_refs_across_all_kinds() {
 /// ref surfaces.
 #[tokio::test]
 async fn cohort_duplicates_dedupe_to_single_ref() {
-    let key_id = "agent-bravo";
-    let (backend, bridge) = fresh_bridge(vec![
-        key_id.to_string(),
-        key_id.to_string(),
-        key_id.to_string(),
-    ]);
+    let record = minted_key_record("agent-bravo", identity_type::AGENT, 0x2b).await;
+    let key_id = record.key_id.clone();
+    let (backend, bridge) = fresh_bridge(vec![key_id.clone(), key_id.clone(), key_id]);
     backend
-        .put_public_key(SignedKeyRecord {
-            record: fixture_key_record(key_id, identity_type::AGENT),
-        })
+        .put_public_key(SignedKeyRecord { record })
         .await
         .expect("seed key");
 
@@ -193,12 +193,11 @@ async fn cohort_duplicates_dedupe_to_single_ref() {
 /// cache + dispatch surface still composes correctly post-refactor.
 #[tokio::test]
 async fn key_round_trips_across_combinator_refactor() {
-    let key_id = "agent-charlie";
-    let (backend, bridge) = fresh_bridge(vec![key_id.to_string()]);
+    let record = minted_key_record("agent-charlie", identity_type::AGENT, 0x2c).await;
+    let key_id = record.key_id.clone();
+    let (backend, bridge) = fresh_bridge(vec![key_id.clone()]);
     backend
-        .put_public_key(SignedKeyRecord {
-            record: fixture_key_record(key_id, identity_type::AGENT),
-        })
+        .put_public_key(SignedKeyRecord { record })
         .await
         .expect("seed key");
 
@@ -213,9 +212,13 @@ async fn key_round_trips_across_combinator_refactor() {
         .await
         .expect("bytes cached during list");
 
-    // 3. Bytes decode to the same record.
-    let decoded: SignedKeyRecord = serde_json::from_slice(&bytes).expect("decode");
-    assert_eq!(decoded.record.key_id, key_id);
+    // 3. Bytes decode to the same record — persist v59: the bytes are the
+    //    key's `key:record:v1` row, which carries the record.
+    let row: ciris_persist::federation::Attestation =
+        serde_json::from_slice(&bytes).expect("decode row");
+    let decoded =
+        ciris_persist::federation::key_plane::key_record_of_row(&row).expect("the row's record");
+    assert_eq!(decoded.key_id, key_id);
 
     // 4. apply_envelope_bytes is idempotent on matching content: a
     //    byte-identical re-apply of a row this node already holds is the

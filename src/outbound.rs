@@ -659,6 +659,9 @@ async fn dispatch_one(
                 // heals it on the next verified announce, so the dispatcher's
                 // retry will find the routable named dest.
                 TransportError::NoRouteToPeer { .. } => "no_route_to_peer",
+                // CC 5.3.3.5 E1 — the link's transit seal was refused (the
+                // peer publishes no Rooted pair, or its handshake failed).
+                TransportError::LinkSealRefused { .. } => "link_seal_refused",
             };
             if let Some(t) = reachability {
                 t.record_attempt(

@@ -1,5 +1,73 @@
 # CIRISEdge Release Notes
 
+# v43.0.0 — the sealed transport: every RNS frame under a hybrid transit seal; persist v59.0.0
+
+**2026-10-20.** **MAJOR** from v42.0.0. **Fleet break, all or nothing (CC 5.3.3.5 E1, rc9):** a
+node on v43 exchanges nothing with a node that does not run the seal. Old nodes cannot talk to the
+mesh until they upgrade. CIRISManager carries the fleet upgrade with the new agent release.
+
+## The seal (CC 5.3.3.5 E1, CIRISConstitution#172)
+
+- **One hybrid KEX per RNS link, as its first frame.** The CC 3.3.6.2 transit KEX (X25519 +
+  ML-KEM-768, bound to the link's `link_id`) runs before any edge frame. Every frame after it, on
+  the Channel, Resource, request and response lanes in both directions, is sealed (AES-256-GCM,
+  a key per direction, a counter per lane, a 128-frame replay window). The RNS link itself stays
+  classical and is not relied on for post-quantum confidentiality. There is no classical fallback
+  and no caller-supplied key. A/V's outer seal uses the link's keys, so a link runs one KEX.
+- **Dialler:** resolves the dialled node's transit pair (Rooted only) before connecting. With none,
+  the dial is refused by name and never made. A target with no path is `NoRouteToPeer`.
+- **Responder:** serves nothing until the handshake completes, then seals. Each failure is a named
+  refusal that closes the link: no handshake, a non-handshake first frame, an oversize or malformed
+  handshake, a classical-only suite, a claim mismatch, or a frame that fails to open. All are
+  counted on the new `link_seal` metric family (PyO3 and UniFFI snapshots).
+- **First contact is unowned but never anonymous (CC 3.2 adding-a-device (e)).** An unattributed
+  initiator may complete the seal. That link carries only the first-contact plane, and the
+  request's signer, its carried key record and the handshake's initiator key must be one key.
+  `first_contact_matching_code` derives the six-digit code from that key; hosts should use it.
+- **Pairing-code pin (CC 3.2 (f)).** For offline or LAN-only first contact, the owner's pairing
+  payload carries the owner node's transit pair as `PairingTransitPin`. It keys that one link only,
+  and is never stored or resolved as Rooted. **CIRISServer must carry `PairingTransitPin` in its
+  device-join pairing payload** (~1.6 KB base64: a large QR or a LAN hand-off).
+- **Bootstrap (CC 5.3.4):** the genesis bundle v4 (`serve_transport_destinations`, persist v59)
+  seeds the seated serve nodes' transit pairs Rooted at first open. A quorum `canonical_rebind`
+  supersedes a seeded pair; a unilateral rotation is refused.
+- **Offline emit for the bundle re-mint:** `ciris_edge.emit_transport_destination(engine,
+  identity_path, node_key_id, …)` (and the harness `edge_node emit-transport-destination`) signs a
+  node's transport_destination row, transit pair included, from its own custody with no network.
+  It refuses a row without a pair. **Ceremony order:** canonical operators emit, the 3-of-3 final
+  genesis re-mints the v4 bundle, then releases carrying that bundle ship with the seal.
+- **Standard LXMF clients (Sideband and similar) get nothing.** There is no public classical lane.
+- MTU: the seal costs 25 bytes per frame (the base-MTU Channel payload goes from 425 to 400).
+
+## persist v58.0.0 → v59.0.0
+
+- **Key plane as rows.** Keys, revocations, identity occurrences and occurrence revocations travel
+  only as their `key:record:v1` / `key:revocation:v1` / `identity:occurrence:v1` / withdraws /
+  `identity:occurrence_revocation:v1` rows, on their own planes (bootstrap and global reach kept,
+  family checked on serve and apply). Framed objects are refused, terminally, as
+  `federation_envelope_kind_retired`, and booked per kind. First contact carries `key_record_row`.
+- **Steward gate (#1099):** a roster key of the same user may act as steward. New typed refusals
+  carry retry dispositions: `self_roster_pending` retries; `key_plane_refused`,
+  `asserted_at_stale` and `genesis_evicted` stop.
+- **#1103:** key registration doors refuse a key id that is not `<label>-<fp>`. Edge's production
+  paths already derive every id.
+- **peer_remove** sets the backend's node key as the attester (persist v57 #988 contract).
+  `EdgeBuilder::from_keyring_seed_dir` declares it; the host must register it before removing peers.
+- `DIRECTORY_ABI_VERSION` 10. **`SERVE_ADVERTISE_POLICY_HASH` moves `68c5298b…` →
+  `ead63aac63f6736b12084a07278557b7b273e6a98c9d52b77504f512d9fc5439`; CIRISServer mirrors it.**
+- CC v1.0-rc8.1 vendored (157039d). Six advisories on verify 20.2.0's transitive zip / zbus are
+  waived with reasons (deny.toml).
+
+## Also
+
+- **#876:** an initiator round is no longer closed by an empty Deliver while its own Diff is
+  unanswered (forward-port of v41.1.1).
+- **CC 6.1.1:** a repeated leaf is refused before hashing a witness root or `member_commitment`
+  (`unique_merkle_root`, `first_repeated_source_id`).
+- **A/V transport (#805):** direct links, the relay-leg reaper fix (#863), the link-sequence and
+  link-id guards (#866/#867 interims), tag-less chunk refusal, one occurrence key id for both KEX
+  halves (#541). The host call API is NOT in this release; it follows.
+
 # v42.0.0 — persist v56.0.0: bounded reads, the transit-KEX pair on the wire, and seven CC evidence rows
 
 **2026-10-14.** **MAJOR** from v41.1.0. Edge adopts persist v56.0.0. **No fleet floor:** a v55
@@ -235,6 +303,54 @@ Ladder triple: **edge v41.0.0 · persist v55.0.0 · verify v20.1.0** (leviculum 
   `put_custody_ack` at the row's scope). Same claim, same scope; adopting the allowance is a
   separate decision.
 - `durability_custody` needs its catalogue spec when this branch meets #820 (above).
+
+# Unreleased — CIRISEdge#805 item 8: call members behind NAT reach each other directly
+
+**Branch `local/805-8-direct-links`** (from `local/main-next`; leviculum v0.30.0+ciris.1, no pin change).
+Additive API: `ReticulumTransportConfig::direct_links` / `with_direct_links`
+(`transport::direct_path::{DirectLinksConfig, DirectAccept}`), `ReticulumTransport::{
+subscribe_direct_path_events, direct_path_state, direct_link_interface, fall_back_from_direct}`,
+`LeviculumAvSender::is_direct`, two new `EdgeMetricsBundle` fields. No wire change of edge's own.
+
+- **What it does.** An A/V leg dials a member's derived address, which answers only a one-hop
+  neighbour, so two members behind NAT could never link directly (#805 item 8). `open_av_link` now
+  first proposes a leviculum direct-link upgrade (leviculum#70) on the IDENTITY link to that member;
+  on success the two nodes share a punched UDP interface and the A/V dial reaches the member over
+  it. CC 5.4.6 makes the direct path a MUST wherever the endpoints can bring it direct.
+- **The peer's replication goes direct too.** The upgraded link is the member's identity-plane
+  link, so after a punch everything that rides it (replication rounds, Delivers, the scoped-body
+  carrier) runs over the punched interface, not through the transport node. That is what CC 5.4.6
+  asks for: the forwarder drops out wherever the endpoints can go direct.
+- **Bounded.** One deadline (`DIRECT_PATH_BUDGET`, 20 s) covers the identity-link dial, the
+  proposal and its outcome; past it, or on any failure, the A/V dial proceeds exactly as today. A
+  failed punch costs a facilitator round trip and leviculum's 60 s per-link cooldown, nothing else.
+  The A/V leg born on a punched interface runs at the base MTU (Channel 425, chunk budget 341).
+- **Defaults.** Proposing needs a facilitator (none by default; a configured one means "propose",
+  no second switch). Accepting is ON for ROOM PEERS ONLY (`DirectAccept::RoomPeers`): a direct
+  path is the more private one (no relay member sees the call's traffic, timing or volume), and
+  the only party that learns this node's address is someone it shares a room with
+  (`ReticulumTransport::should_accept_direct`). `DirectAccept::Off` is the operator override.
+  `DirectAccept::IdentifiedOnly` (leviculum's node-wide policy, which discloses the address to ANY
+  identified link peer) exists for tests and an explicit operator choice only. `RoomPeers` rides
+  leviculum's host-decided accept (`AskHost`, leviculum#82): each request is held, nothing probed
+  or sent, until edge answers by the room rule; an unattributed link is refused.
+- **leviculum pinned by rev** `a1d75799` (CIRISAI/leviculum `ciris/82-83-direct-host`, on
+  v0.30.0+ciris.1): adds #82 (`AskHost`, `DirectLinkRequested`, `accept_direct_link` /
+  `reject_direct_link`) and #83 (`retire_direct_link`). Additive; a tag pin at the fork's next
+  release.
+- **MTU.** leviculum lowers a link moved onto a punched interface to MTU 1400 (Channel 1321) and
+  never raises it; `DirectPathEvent::Established` carries the Channel limit before and after, which
+  item 5's `CallEvent::BudgetChanged` reads (#720).
+- **New metric family `direct_link`** (`EdgeMetricsBundle`, the UniFFI counters as
+  `direct_link.<label>`, the PyO3 `metrics_snapshot()` dict): `direct_link_proposed`,
+  `_propose_refused`, `_skipped_neighbour`, `_skipped_backoff`, `_skipped_no_link`, `_established`,
+  `_failed_rejected`, `_failed_probe`, `_failed_timeout`, `_failed_punch`, `_lost`,
+  `_leg_fell_back`, `_request_accepted`, `_request_refused`; and the gauge `direct_links_active`
+  (both projected by `EdgeMetricsBundle::flatten`: `direct_link.<label>` counters and the
+  `direct_links_active` gauge).
+  **Merge note for #820 (local/820-p1c):** the catalogue completeness gate needs specs for this
+  family — a counter with a closed `outcome` label drawn from an enum of the fourteen tags above,
+  and a gauge with no labels.
 
 # v40.1.0 — leviculum v0.29: known-destinations backpressure, off-lock resource assembly, and the two pressure signals in the metrics snapshot
 
