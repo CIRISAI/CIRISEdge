@@ -1,5 +1,48 @@
 # CIRISEdge Release Notes
 
+# v43.1.0 — A/V calls: the host call API on the sealed transport
+
+**2026-10-20.** **MINOR** from v43.0.0. Additive API on the v43 sealed transport. Persist v59.0.0 is unchanged.
+
+## The host call API (#805 items 5–6, A11)
+
+- **`Edge::join_call(room, …)` → `Call`.** A call is a room's stream set. It publishes the caller's
+  stream, subscribes to the other attendees' streams, and has frames, events, layer policy,
+  attendance and leave. Every call leg rides a v43 sealed link and uses the link's transit keys; the
+  call holds no key of its own.
+- **The call record is a CEG attestation.** Each attendee authors ONE `chat:call:v1` row (attester =
+  subject = that attendee), placed at room scope like a chat row. Attendees are the union of
+  subjects over the call's rows. **Attendance is read by `call_id`, never by current membership**, so
+  a member removed from the room stays an attendee. An attendee's own withdrawal folds.
+  `join_call_as` refuses a row that is not the actor's own (`CallError::ActorIsNotTheSubject`).
+- **Python:** `Edge.join_call(room, keep="unkept", relay=False)` returns a `Call` with every Rust
+  verb. `frames()` and `events()` are async iterators of dicts. Arguments are validated at the
+  boundary (ValueError), and refusals carry a stable token prefix.
+- **A/V stream keying:** one DEK per (stream, room epoch) from the room's MLS group
+  (`STREAM_DEK_LABEL = "ciris-stream-dek/v1"`, CC 5.1 rc8). The stream label is spelled
+  `"av-" + lowercase hex`. **The chunk seq is the epoch-local stream counter (#846 part 1): reset at
+  every epoch roll, refused past u32.** That is an A/V wire change from v43.0.0, which had no host
+  call API, so no deployed caller is affected.
+- **Not in this release:** A9, the in-band signed tree head (CIRISEdge#878).
+
+## Evidence (CIRISConstitution#172)
+
+The CC claims now have generated manifest rows (`EDGE_CC_TEST_EVIDENCE`, guarded by
+`every_test_evidence_anchor_names_a_test`):
+- CLM-first-contact-seal-key-bound and CLM-pairing-payload-transit-pin (3.2);
+- **CLM-transport-edge (5.3.3.5)**: the #872 withhold is lifted, because an audit found no unsealed
+  edge send on an RNS link;
+- CLM-wholeness-witness and CLM-member-commitment-unique (6.1.1);
+- CLM-bundle-seeds-transit-pairs (5.3.4) and CLM-serve-seat-announced (5.3), as supporting rows.
+
+## Also
+
+- A fresh device reaches its owner's node in two hops through a bundle-seeded canonical (new
+  witness). The bundle alone seeds only the seated serve nodes.
+- E4: a room call between two members behind a facilitator runs over a punched interface (loopback
+  witness; traversal of a real NAT is not exercised).
+- The CLM-registry-wire layout witness now seals a chunk_seq within u32.
+
 # v43.0.0 — the sealed transport: every RNS frame under a hybrid transit seal; persist v59.0.0
 
 **2026-10-20.** **MAJOR** from v42.0.0. **Fleet break, all or nothing (CC 5.3.3.5 E1, rc9):** a
