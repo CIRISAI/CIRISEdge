@@ -345,7 +345,11 @@ impl Ident {
     /// (CIRISPersist#1103) refuses a registered id that is not.
     fn new(label: &str, seed: u8) -> Self {
         use ciris_crypto::ClassicalSigner as _;
-        let mut ed = Ed25519SoftwareSigner::new(label);
+        // The alias is `<label>-engine`, so the device's engine-derived id
+        // (`derive_key_id(alias, pk)`) is a separate row from this
+        // identity's own derived id over the same key (as in
+        // family_files_wire_736).
+        let mut ed = Ed25519SoftwareSigner::new(format!("{label}-engine"));
         ed.import_key(&[seed; 32]).expect("import ed key");
         let pqc =
             MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{label}-pqc"))
@@ -366,7 +370,10 @@ impl Ident {
         let ed_pub = self.ed.public_key().await.expect("ed pubkey");
         assert_eq!(
             self.key_id,
-            ciris_verify_core::fedcode::derive_key_id(self.ed.current_alias(), &ed_pub),
+            ciris_verify_core::fedcode::derive_key_id(
+                self.ed.current_alias().trim_end_matches("-engine"),
+                &ed_pub
+            ),
             "the registered key id is derived from its own key (CIRISPersist#1103)"
         );
         let pqc_pub = self.pqc.public_key().await.expect("pqc pubkey");
