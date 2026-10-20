@@ -7918,6 +7918,16 @@ impl EdgeBuilder {
     /// `ml_dsa_65.seed`); the constructor reads both and produces
     /// `Arc<dyn HardwareSigner>` + optional `Arc<dyn PqcSigner>` via
     /// the keyring loader.
+    ///
+    /// This builder opens the directory, so it is that backend's HOST: it
+    /// tells the backend `key_id` is this node's key (`set_node_key_id`),
+    /// the attester persist's node-relative ACTS read (CIRISPersist#988:
+    /// a peer removal is an attributed act). The host must register this
+    /// key (a key record under `key_id`) before `peer_remove`; otherwise
+    /// removal is refused `HardCaseAttesterUnavailable`
+    /// (`node_key_not_held`), per persist's #988 contract. The builder does
+    /// not mint that record itself: it could only register under an id
+    /// persist derives, which need not be the caller's `key_id`.
     pub async fn from_keyring_seed_dir(
         key_id: impl Into<String>,
         seed_dir: PathBuf,
@@ -7934,6 +7944,9 @@ impl EdgeBuilder {
         let directory = ciris_persist::prelude::FederationDirectorySqlite::open(&db_path)
             .await
             .map_err(|e| EdgeError::Persist(format!("FederationDirectorySqlite::open: {e}")))?;
+        // CIRISPersist#988 — this node's key, the attester of its acts (see
+        // the doc above). Single-key: no actor/node split on this path.
+        directory.set_node_key_id(signer.key_id.clone());
         let queue = ciris_persist::prelude::EdgeOutboundQueueSqlite::open(&db_path)
             .await
             .map_err(|e| EdgeError::Persist(format!("EdgeOutboundQueueSqlite::open: {e}")))?;
@@ -11436,5 +11449,113 @@ mod envelope_authorship_tests {
             "the split is only meaningful when the ids differ"
         );
         assert!(!Edge::local_signer_authors_envelopes(node, actor));
+    }
+}
+
+/// CIRISPersist#988 on the PRODUCTION builder path — a peer removal is an
+/// attributed act whose attester is the node key the backend's host declares.
+/// [`EdgeBuilder::from_keyring_seed_dir`] opens its own directory, so it is
+/// that host: it names the key; the embedder registers it.
+#[cfg(test)]
+mod builder_peer_remove_988_tests {
+    use super::*;
+    use crate::transport::NullTransport;
+    use base64::Engine as _;
+    use ciris_crypto::ClassicalSigner as _;
+
+    #[tokio::test]
+    async fn peer_remove_works_on_a_builder_opened_node() {
+        use ciris_persist::federation::hard_case::refusal::NODE_KEY_NOT_HELD;
+        use ciris_persist::federation::Error as E;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seeds = tmp.path().join("seeds");
+        std::fs::create_dir_all(&seeds).expect("seed dir");
+        let seed = [0x5au8; 32];
+        std::fs::write(seeds.join("ed25519.seed"), seed).expect("write seed");
+        let mut pqc_seed = seed;
+        pqc_seed[0] ^= 0x55;
+        std::fs::write(seeds.join("ml_dsa_65.seed"), pqc_seed).expect("write pqc seed");
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let pubkey = ciris_crypto::Ed25519Signer::from_seed(&seed)
+            .expect("seed")
+            .public_key()
+            .expect("pubkey");
+        let key_id = ciris_verify_core::fedcode::derive_key_id("builder-node-988", &pubkey);
+        let edge = EdgeBuilder::from_keyring_seed_dir(
+            key_id.clone(),
+            seeds,
+            tmp.path().join("edge.sqlite"),
+        )
+        .await
+        .expect("builder")
+        .transport(Arc::new(NullTransport))
+        .build()
+        .expect("build edge");
+        let dir = edge
+            .federation_directory()
+            .expect("the builder wires its directory");
+        assert_eq!(
+            dir.node_key_id().as_deref(),
+            Some(key_id.as_str()),
+            "the builder names its signer's key as the node's"
+        );
+
+        let peer_pk = ciris_crypto::Ed25519Signer::from_seed(&[0x6b; 32])
+            .expect("seed")
+            .public_key()
+            .expect("pubkey");
+        let peer = ciris_verify_core::fedcode::derive_key_id("builder-peer-988", &peer_pk);
+        dir.add_peer_record(&peer, &b64.encode(&peer_pk), "agent", None)
+            .await
+            .expect("add the peer");
+
+        // The node key is named but not registered: refused by its typed
+        // reason, before anything moves.
+        let err = dir
+            .remove_peer_record(&peer, false, "operator soft-remove", None)
+            .await
+            .expect_err("no attester held");
+        assert!(
+            matches!(
+                err,
+                E::HardCaseAttesterUnavailable {
+                    reason: NODE_KEY_NOT_HELD,
+                    ..
+                }
+            ),
+            "refused node_key_not_held, not a generic error: {err:?}"
+        );
+
+        // The host registers the node's key; the removal is now attributed.
+        let now = chrono::Utc::now();
+        dir.put_public_key(ciris_persist::federation::SignedKeyRecord {
+            record: ciris_persist::federation::KeyRecord {
+                key_id: key_id.clone(),
+                pubkey_ed25519_base64: b64.encode(&pubkey),
+                pubkey_ml_dsa_65_base64: None,
+                algorithm: "hybrid".to_owned(),
+                identity_type: "node".to_owned(),
+                identity_ref: key_id.clone(),
+                valid_from: now,
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "key_id": key_id }),
+                original_content_hash: "0".repeat(64),
+                scrub_signature_classical: "x".repeat(88),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("the host registers the node's key");
+        dir.remove_peer_record(&peer, false, "operator soft-remove", None)
+            .await
+            .expect("an attributed soft-remove");
     }
 }

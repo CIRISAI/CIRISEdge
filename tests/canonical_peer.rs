@@ -168,6 +168,24 @@ async fn build_edge_with_canonical(
 ) -> Edge {
     let me = FedKey::new("edge-self-canon-ffi", 0x01);
     let signer = me.local_signer(tmp).await;
+    // CIRISPersist#988 — a peer removal is an attributed act: this test is
+    // the backend's host, so it registers the node's key and names it as the
+    // node (`set_node_key_id`), exactly as `EdgeBuilder::from_keyring_seed_dir`
+    // does for a backend it opens.
+    if backend
+        .lookup_public_key(&me.key_id)
+        .await
+        .expect("lookup self")
+        .is_none()
+    {
+        backend
+            .put_public_key(SignedKeyRecord {
+                record: signed_record(&me, &me, "node"),
+            })
+            .await
+            .expect("register the node's own key");
+    }
+    backend.set_node_key_id(me.key_id.clone());
     let config = EdgeConfig {
         hybrid_policy: HybridPolicy::Ed25519Fallback,
         ..EdgeConfig::default()
