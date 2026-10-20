@@ -4202,16 +4202,16 @@ impl PyCall {
     }
 
     /// `"live"`, `"degraded:<epoch>"` or `"ended:<cause>"`.
-    fn state(&self, py: Python<'_>) -> PyResult<String> {
+    fn state(&self, py: Python<'_>) -> String {
         let call = Arc::clone(&self.call);
-        Ok(py.detach(|| {
+        py.detach(|| {
             run_async(&self.executor, async move {
                 call.lock().await.as_ref().map_or_else(
                     || "ended:hung_up".to_owned(),
                     |c| call_state_token(&c.state()),
                 )
             })
-        }))
+        })
     }
 
     /// Hang up (an in-room hang-up writes nothing). Returns the summary

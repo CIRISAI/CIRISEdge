@@ -1098,6 +1098,7 @@ impl Call {
     /// # Errors
     /// [`CallError::NotARoomMember`], [`CallError::ConsentMissing`],
     /// [`CallError::RoomGroupUnavailable`], [`CallError::Plumbing`].
+    #[allow(clippy::too_many_lines)] // one linear join sequence; `Shared` is built in place
     pub async fn join(
         room: &str,
         own_key_id: &str,

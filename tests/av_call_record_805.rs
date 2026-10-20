@@ -106,7 +106,7 @@ struct Member {
     node: Arc<LocalSigner>,
 }
 
-struct Room {
+struct RoomFixture {
     dir: Arc<SqliteBackend>,
     room: String,
     alice: Member,
@@ -117,7 +117,7 @@ struct Room {
 
 /// A room of alice (founder), bob and carol, joined by consent (#955) on one
 /// substrate; dave is registered and outside it.
-async fn room() -> Room {
+async fn room() -> RoomFixture {
     use ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER;
     use ciris_persist::federation::types::consensus_protocol;
     let dir = FederationDirectorySqlite::open(":memory:").await.unwrap();
@@ -202,7 +202,7 @@ async fn room() -> Room {
         .await
         .expect("alice widens"));
     }
-    Room {
+    RoomFixture {
         dir,
         room,
         alice,
@@ -212,7 +212,7 @@ async fn room() -> Room {
     }
 }
 
-fn door(r: &Room, m: &Member) -> PersistCallRecord {
+fn door(r: &RoomFixture, m: &Member) -> PersistCallRecord {
     PersistCallRecord {
         directory: Arc::clone(&r.dir) as Arc<dyn FederationDirectory>,
         actor: Arc::clone(&m.human),
