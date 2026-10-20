@@ -369,6 +369,22 @@ pub enum TransportError {
         /// mismatch obvious.
         paths: String,
     },
+    /// The dialled destination answered the link request, but its proof did
+    /// not verify against the key this node dialled with (leviculum closed
+    /// the link `InvalidProof`). The binding for `key_id` names a key that is
+    /// not the destination's: a fault in what this node holds for the peer,
+    /// not a slow or dead link, so it is named rather than reported as a
+    /// [`Self::Timeout`]. Counted as `peer_binding_link_proof_refused`.
+    #[error(
+        "link proof refused: key_id={key_id} target_dest={target_dest} — the destination's \
+         proof does not verify against the key this node holds for the peer"
+    )]
+    LinkProofRefused {
+        /// The federation key_id the dial was for.
+        key_id: String,
+        /// The destination dialled, lowercase hex.
+        target_dest: String,
+    },
     /// CC 5.3.3.5 E1 — a link's transit KEX or seal was refused: the dialled
     /// node publishes no usable transit pair (the dial is never made), the
     /// handshake was malformed, too large, of the wrong suite or never came,

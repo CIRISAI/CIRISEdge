@@ -25,6 +25,33 @@
   call API, so no deployed caller is affected.
 - **Not in this release:** A9, the in-band signed tree head (CIRISEdge#878).
 
+## Peer bindings: a key that is not the destination's (v43 InvalidProof)
+
+A dial checks the link proof against the Ed25519 that this node holds for the peer. CIRISServer's
+canonical boot prime stored the canonical's FEDERATION key at its named destination. When it won
+its boot race against the trusted-peer prime, every dial to the canonical failed with leviculum's
+`InvalidProof`, and nothing healed it. That is the one joiner out of two that never completed first
+contact. A named destination hash commits to the one transport identity that can prove a link to
+it, so edge now catches the wrong key in four places, each counted on the new `peer_binding`
+metric family (PyO3 and UniFFI snapshots):
+
+- **Heal:** when the owner's announce for the SAME named destination carries a transport identity
+  that reproduces the destination and the stored key does not, the stored key is replaced. Trust is
+  kept (`peer_binding_transport_key_healed`). The route-supersession decision now takes both keys as
+  inputs. A key that could itself be the destination's is never touched, and a non-owner is still
+  refused first.
+- **Dial:** if leviculum holds an announce-learned identity for the destination that reproduces it
+  and differs from the binding, the dial uses leviculum's key (`peer_binding_dial_key_from_announce`).
+- **Named:** a proof that fails against the binding is `TransportError::LinkProofRefused
+  { key_id, target_dest }` (`peer_binding_link_proof_refused`; error class `link_proof_refused`). It
+  was reported as `Timeout(30s)`, returned at once.
+- **`ReticulumTransport::prime_peer(key_id, dest_hash, transport_pubkey64)`:** the production prime.
+  It takes the full 64-byte transport identity (`x25519 ‖ ed25519`, as the announce and the signed
+  `transport_destination` row carry it) and refuses one that does not reproduce `dest_hash`
+  (`peer_binding_prime_refused`). **CIRISServer must move both boot primes to it.**
+  `inject_rooted_peer_for_test` stays for tests only. PyO3's `prime_peer` (32-byte Ed25519) is
+  unchanged.
+
 ## Evidence (CIRISConstitution#172)
 
 The CC claims now have generated manifest rows (`EDGE_CC_TEST_EVIDENCE`, guarded by

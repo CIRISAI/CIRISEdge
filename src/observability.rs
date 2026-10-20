@@ -1031,6 +1031,31 @@ pub const DIRECT_LINK_LOST: &str = "direct_link_lost";
 /// (`direct_path::direct_leg_stalled`).
 pub const DIRECT_LINK_LEG_FELL_BACK: &str = "direct_link_leg_fell_back";
 
+// ─── v43 InvalidProof triage — `EdgeMetrics::peer_binding` labels ──────
+//
+// A peer's binding is the key a dial hands leviculum to check the link
+// proof against. A wrong key fails every dial to that peer with
+// `InvalidProof`; each way edge now catches, corrects or refuses one is
+// named here.
+
+/// An owner's announce for the SAME named destination carried a different
+/// transport key, and only the announced key reproduces that destination:
+/// the stored key was provably wrong and was replaced (trust kept).
+pub const PEER_BINDING_TRANSPORT_KEY_HEALED: &str = "peer_binding_transport_key_healed";
+/// A dial found leviculum holding an announce-learned identity for the
+/// destination whose Ed25519 is not the binding's: it dialled with
+/// leviculum's (the destination hash commits to that identity).
+pub const PEER_BINDING_DIAL_KEY_FROM_ANNOUNCE: &str = "peer_binding_dial_key_from_announce";
+/// A dial's link closed `InvalidProof` before it established: the key it
+/// checked the proof against is not the destination's.
+pub const PEER_BINDING_LINK_PROOF_REFUSED: &str = "peer_binding_link_proof_refused";
+/// [`crate::transport::reticulum::ReticulumTransport::prime_peer`] installed
+/// a binding.
+pub const PEER_BINDING_PRIMED: &str = "peer_binding_primed";
+/// `prime_peer` refused a transport identity that does not reproduce the
+/// named destination it was primed at.
+pub const PEER_BINDING_PRIME_REFUSED: &str = "peer_binding_prime_refused";
+
 /// The live counter/gauge bag every [`crate::Edge`] owns.
 ///
 /// # Concurrency
@@ -1347,6 +1372,10 @@ pub struct EdgeMetrics {
     /// and refused, and each outcome. Every `direct_link_failed_*` label is a
     /// proposal that ended without a direct path, the link untouched.
     pub direct_link: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// The peer bindings a dial checks link proofs against, by label
+    /// (`PEER_BINDING_*` constants in this module): wrong keys healed,
+    /// corrected at dial, refused at prime, and proofs that failed.
+    pub peer_binding: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — peers with a direct path now, per reporting
     /// transport (keyed by its metrics source id, like `link_pool_sizes`).
     /// Read as [`Self::direct_links_active`] (the sum).
@@ -2020,6 +2049,21 @@ impl EdgeMetrics {
     #[must_use]
     pub fn direct_link(&self) -> HashMap<String, u64> {
         self.direct_link
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
+    }
+
+    /// Count one peer-binding event by its `PEER_BINDING_*` label.
+    pub fn inc_peer_binding(&self, label: &'static str) {
+        *self.peer_binding.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// The peer-binding ledger by label (tests + the operator readback).
+    #[must_use]
+    pub fn peer_binding(&self) -> HashMap<String, u64> {
+        self.peer_binding
             .read()
             .iter()
             .map(|(k, v)| ((*k).to_string(), *v))
@@ -2747,6 +2791,7 @@ impl EdgeMetrics {
             av_plane: self.av_plane(),
             link_seal: self.link_seal(),
             direct_link: self.direct_link(),
+            peer_binding: self.peer_binding(),
             direct_links_active: self.direct_links_active(),
             first_contact_outcomes: self
                 .first_contact_outcomes
@@ -3024,6 +3069,9 @@ pub struct EdgeMetricsBundle {
     pub link_seal: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — direct links by `DIRECT_LINK_*` label.
     pub direct_link: HashMap<String, u64>,
+    /// The peer bindings dials check link proofs against, by
+    /// `PEER_BINDING_*` label.
+    pub peer_binding: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — peers with a direct path now.
     pub direct_links_active: u64,
     /// CIRISEdge#634 — inbound frames routed to a responder (the peer's round).
@@ -3336,6 +3384,8 @@ impl EdgeMetricsBundle {
         // CIRISEdge#805 item 8 — direct links, `direct_link.<label>`, and the
         // gauge of peers with a direct path now.
         f.family("direct_link", &self.direct_link);
+        // The peer-binding ledger, `peer_binding.<label>`.
+        f.family("peer_binding", &self.peer_binding);
         #[allow(clippy::cast_precision_loss)] // a peer count
         f.gauges.insert(
             "direct_links_active".to_string(),
@@ -3548,6 +3598,7 @@ edge_metrics_bundle_fields!(
     av_plane,
     link_seal,
     direct_link,
+    peer_binding,
     direct_links_active,
     replication_routed_to_responder_total,
     replication_routed_to_initiator_total,

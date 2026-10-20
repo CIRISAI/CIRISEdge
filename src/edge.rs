@@ -8796,6 +8796,8 @@ fn transport_error_class(e: &TransportError) -> &'static str {
         TransportError::NoRouteToPeer { .. } => "no_route_to_peer",
         // CC 5.3.3.5 E1 — a link's transit seal refused by name.
         TransportError::LinkSealRefused { .. } => "link_seal_refused",
+        // The peer's proof did not verify against the key held for it.
+        TransportError::LinkProofRefused { .. } => "link_proof_refused",
     }
 }
 

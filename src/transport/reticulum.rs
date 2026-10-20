@@ -2375,6 +2375,10 @@ pub struct ReticulumTransport {
     /// CC 5.3.3.5 E1 test seam — the next identity dial identifies its link
     /// only after its first sealed frames have gone out. `false` in production.
     test_identify_last: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — dials check the link proof against the binding's key
+    /// alone, never leviculum's announce-learned one
+    /// (`DialCtx::dial_signing_key`). `false` in production.
+    test_binding_key_only: Arc<std::sync::atomic::AtomicBool>,
     /// The node's single `NodeEvent` receiver. `listen` takes it
     /// exactly once; a second `listen` call is a config error.
     /// Leviculum PR #9 switched this to an unbounded channel so node
@@ -3029,6 +3033,7 @@ impl ReticulumTransport {
             handshake_override: Arc::clone(&self.handshake_override),
             test_unannounced: Arc::clone(&self.test_unannounced),
             test_identify_last: Arc::clone(&self.test_identify_last),
+            test_binding_key_only: Arc::clone(&self.test_binding_key_only),
         }
     }
 
@@ -3668,6 +3673,7 @@ impl ReticulumTransport {
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             av_call_router: std::sync::OnceLock::new(),
             test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            test_binding_key_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
@@ -5466,6 +5472,14 @@ impl ReticulumTransport {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Test seam — dials check the link proof against the peer binding's key
+    /// alone, so a wrong binding reaches leviculum's `InvalidProof`.
+    #[doc(hidden)]
+    pub fn binding_key_only_for_test(&self, on: bool) {
+        self.test_binding_key_only
+            .store(on, std::sync::atomic::Ordering::Release);
+    }
+
     /// CC 5.3.3.5 E1 test seam — whether `link` carries transit keys.
     #[doc(hidden)]
     pub fn link_is_sealed_for_test(&self, link: [u8; 16]) -> bool {
@@ -6475,6 +6489,82 @@ impl ReticulumTransport {
             .store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Prime a peer's binding out of band: `destination_key_id` at
+    /// `dest_hash`, whose transport identity is `transport_pubkey64`
+    /// (`x25519 ‖ ed25519`, the 64 bytes the peer's announce and its signed
+    /// `transport_destination` row carry). The production prime; a host
+    /// (CIRISServer's trusted-peer and canonical boot primes) MUST use this,
+    /// not [`Self::inject_rooted_peer_for_test`], which stores only an
+    /// Ed25519 and accepts any.
+    ///
+    /// The identity must REPRODUCE `dest_hash` as its named destination: a
+    /// named destination hash commits to the one transport identity that can
+    /// prove a link to it, so any other key — the peer's federation key among
+    /// them, the v43 canonical-prime fault — would fail every dial with
+    /// `InvalidProof`, and is refused here instead
+    /// (`peer_binding_prime_refused`). The binding installed is an
+    /// operator-asserted one: `Rooted`, owning its key, with the full
+    /// identity, so a link the peer identifies on attributes to it and the
+    /// peer's own announces refresh it in place.
+    ///
+    /// # Errors
+    /// [`TransportError::Config`] when `transport_pubkey64` is not an
+    /// identity or does not reproduce `dest_hash`.
+    pub async fn prime_peer(
+        &self,
+        destination_key_id: &str,
+        dest_hash: [u8; 16],
+        transport_pubkey64: [u8; 64],
+    ) -> Result<(), TransportError> {
+        if named_dest_of_transport(&transport_pubkey64) != Some(dest_hash) {
+            if let Some(m) = self.metrics.get() {
+                m.inc_peer_binding(crate::observability::PEER_BINDING_PRIME_REFUSED);
+            }
+            let detail = format!(
+                "prime_peer refused for {destination_key_id}: the transport identity does not \
+                 reproduce destination {} as its named destination, so no link to it could \
+                 prove against that key (peer_binding_prime_refused)",
+                hex::encode(dest_hash)
+            );
+            tracing::warn!(key_id = %destination_key_id, "{detail}");
+            return Err(TransportError::Config(detail));
+        }
+        let x25519: [u8; 32] = transport_pubkey64[..32].try_into().unwrap_or([0u8; 32]);
+        let ed25519: [u8; 32] = transport_pubkey64[32..].try_into().unwrap_or([0u8; 32]);
+        let transport_identity_hash =
+            Identity::from_public_keys(&x25519, &ed25519).map_or([0u8; 16], |id| *id.hash());
+        self.peers.lock().await.insert(
+            destination_key_id.to_string(),
+            RootedPeer {
+                peer: ResolvedPeer {
+                    dest_hash: DestinationHash::new(dest_hash),
+                    transport_ed25519: ed25519,
+                },
+                epoch: 0,
+                chain: None,
+                provenance: ciris_persist::federation::self_at_login::BindingProvenance::Rooted,
+                transport_identity_hash,
+                owns_key: true,
+                transport_pubkey64,
+                last_seen: std::time::Instant::now(),
+                manifest_commitment: None,
+            },
+        );
+        if let Some(m) = self.metrics.get() {
+            m.inc_peer_binding(crate::observability::PEER_BINDING_PRIMED);
+        }
+        tracing::debug!(
+            key_id = %destination_key_id,
+            dest = %hex::encode(dest_hash),
+            "prime_peer: binding installed with the peer's full transport identity"
+        );
+        Ok(())
+    }
+
+    /// TEST seam — stores `transport_ed25519` with no X25519 half and checks
+    /// nothing. Production hosts use [`Self::prime_peer`]: a key that is not
+    /// the destination's (CIRISServer's v43 canonical prime stored the peer's
+    /// FEDERATION Ed25519) fails every dial with `InvalidProof`.
     pub async fn inject_rooted_peer_for_test(
         &self,
         destination_key_id: &str,
@@ -6787,9 +6877,10 @@ impl ReticulumTransport {
         // #342/#66 alias the old 50 ms `link_is_established` poll resolved (a re-key on
         // a lossy path). The future takes NO node lock and resolves `Err(LinkClosed)`
         // if the link dies first, so it never hangs; the caller owns the timeout.
+        let signing_key = ctx.dial_signing_key(&peer_key_id, &dest_hash, &transport_ed25519);
         let (link, established) = self
             .node
-            .connect_awaited(&dest_hash, &transport_ed25519)
+            .connect_awaited(&dest_hash, &signing_key)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
@@ -6810,7 +6901,11 @@ impl ReticulumTransport {
         // Runtime-agnostic bound (CIRISEdge#217): `established` resolves `Ok(())` on
         // establishment / `Err(LinkClosed)` on link death; anything else — or the
         // timeout — is a failed dial.
-        if !matches!(with_timeout(timeout, established).await, Some(Ok(()))) {
+        let outcome = with_timeout(timeout, established).await;
+        if let Some(refused) = ctx.link_proof_refused(&peer_key_id, &dest_hash, outcome.as_ref()) {
+            return Err(refused);
+        }
+        if !matches!(outcome, Some(Ok(()))) {
             return Err(TransportError::Timeout(timeout));
         }
         // CIRISEdge#340 — identify the link so the responder can attribute what
@@ -9724,6 +9819,8 @@ struct DialCtx {
     test_unannounced: Arc<std::sync::atomic::AtomicBool>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_identify_last`.
     test_identify_last: Arc<std::sync::atomic::AtomicBool>,
+    /// Test seam — see `ReticulumTransport::test_binding_key_only`.
+    test_binding_key_only: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DialCtx {
@@ -9783,9 +9880,10 @@ impl DialCtx {
         keying: (&TransitKexPair, &str),
         before_establish: impl FnOnce(LinkId) + Send,
     ) -> Result<LinkId, TransportError> {
+        let signing_key = self.dial_signing_key(destination_key_id, &dest_hash, transport_ed25519);
         let (link, established) = self
             .node
-            .connect_awaited(&dest_hash, transport_ed25519)
+            .connect_awaited(&dest_hash, &signing_key)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect (scoped): {e}")))?;
         let link_id = *link.link_id();
@@ -9807,10 +9905,13 @@ impl DialCtx {
         // Explicit-hash destinations are never pathed (see the routability note
         // on `send_to_scoped_destination`), so this is always the
         // bootstrap-broadcast budget.
-        if !matches!(
-            with_timeout(NO_PATH_ESTABLISH_TIMEOUT, established).await,
-            Some(Ok(()))
-        ) {
+        let outcome = with_timeout(NO_PATH_ESTABLISH_TIMEOUT, established).await;
+        if let Some(refused) =
+            self.link_proof_refused(destination_key_id, &dest_hash, outcome.as_ref())
+        {
+            return Err(refused);
+        }
+        if !matches!(outcome, Some(Ok(()))) {
             tracing::error!(
                 key_id = %destination_key_id,
                 target_dest = %hex::encode(dest_hash.into_bytes()),
@@ -10180,6 +10281,85 @@ impl DialCtx {
         Ok(claim)
     }
 
+    /// The Ed25519 to check `dest`'s link proof against. The binding's
+    /// (`binding_ed25519`), unless leviculum holds an announce-learned identity
+    /// for `dest` that IS the destination's — its named destination hash
+    /// reproduces `dest`, which commits to that one identity — and whose
+    /// Ed25519 differs: then the binding is wrong (every proof would fail
+    /// `InvalidProof`), and the dial uses leviculum's, named and counted
+    /// (`peer_binding_dial_key_from_announce`). A derived or explicit-hash
+    /// destination, which no identity announces on, keeps the binding's key.
+    fn dial_signing_key(
+        &self,
+        destination_key_id: &str,
+        dest: &DestinationHash,
+        binding_ed25519: &[u8; 32],
+    ) -> [u8; 32] {
+        if self
+            .test_binding_key_only
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return *binding_ed25519;
+        }
+        let Some(known) = self.node.get_identity(dest) else {
+            return *binding_ed25519;
+        };
+        let Ok(known64) = <[u8; 64]>::try_from(&known.public_key_bytes()[..64]) else {
+            return *binding_ed25519;
+        };
+        let mut known_ed25519 = [0u8; 32];
+        known_ed25519.copy_from_slice(&known64[32..]);
+        if known_ed25519 == *binding_ed25519
+            || named_dest_of_transport(&known64) != Some(dest.into_bytes())
+        {
+            return *binding_ed25519;
+        }
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_peer_binding(crate::observability::PEER_BINDING_DIAL_KEY_FROM_ANNOUNCE);
+        }
+        tracing::warn!(
+            key_id = %destination_key_id,
+            dest = %hex::encode(dest.into_bytes()),
+            "dial: the peer binding's transport key is not the destination's — leviculum \
+             holds the identity that announces on this destination and it differs; \
+             dialling with that one, since the binding's would fail InvalidProof \
+             (peer_binding_dial_key_from_announce)"
+        );
+        known_ed25519
+    }
+
+    /// A dial whose link closed `InvalidProof` before it established, as the
+    /// named error (`peer_binding_link_proof_refused`); `None` for any other
+    /// outcome, which the caller handles as before.
+    fn link_proof_refused(
+        &self,
+        destination_key_id: &str,
+        dest: &DestinationHash,
+        outcome: Option<&Result<(), CompletionError>>,
+    ) -> Option<TransportError> {
+        let Some(Err(CompletionError::LinkClosed {
+            reason: leviculum_core::link::LinkCloseReason::InvalidProof,
+        })) = outcome
+        else {
+            return None;
+        };
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_peer_binding(crate::observability::PEER_BINDING_LINK_PROOF_REFUSED);
+        }
+        let target_dest = hex::encode(dest.into_bytes());
+        tracing::warn!(
+            key_id = %destination_key_id,
+            target_dest = %target_dest,
+            "dial REFUSED by the link proof — the destination answered but its proof does \
+             not verify against the key this node holds for the peer; the binding is wrong, \
+             not the link slow (peer_binding_link_proof_refused)"
+        );
+        Some(TransportError::LinkProofRefused {
+            key_id: destination_key_id.to_owned(),
+            target_dest,
+        })
+    }
+
     /// The dial itself, shared by an ordinary identity dial and a
     /// pairing-pinned first contact: connect, record the dialled dest (#424)
     /// and the plane (#728), await establishment, identify (#340), and key the
@@ -10194,9 +10374,11 @@ impl DialCtx {
         pair: &TransitKexPair,
         claim: &str,
     ) -> Result<LinkId, TransportError> {
+        let signing_key =
+            self.dial_signing_key(destination_key_id, &peer.dest_hash, &peer.transport_ed25519);
         let (link, established) = self
             .node
-            .connect_awaited(&peer.dest_hash, &peer.transport_ed25519)
+            .connect_awaited(&peer.dest_hash, &signing_key)
             .await
             .map_err(|e| TransportError::Io(format!("reticulum connect: {e}")))?;
         let link_id = *link.link_id();
@@ -10223,10 +10405,13 @@ impl DialCtx {
         // LINK_REQUEST or a resource transfer cannot start. `established` resolves
         // `Ok(())` on establishment, `Err(LinkClosed)` if the peer refused / the link
         // died first; a timeout means no route or a stalled dial.
-        let established_ok = matches!(
-            with_timeout(establish_timeout, established).await,
-            Some(Ok(()))
-        );
+        let outcome = with_timeout(establish_timeout, established).await;
+        if let Some(refused) =
+            self.link_proof_refused(destination_key_id, &peer.dest_hash, outcome.as_ref())
+        {
+            return Err(refused);
+        }
+        let established_ok = matches!(outcome, Some(Ok(())));
         if !established_ok {
             // CIRISEdge#336 — a no-path target that never established is
             // un-routable, not slow: fail fast with the self-diagnosing error
@@ -13502,7 +13687,10 @@ fn owns_key_from_rooting_rejection(rejection: &RootingRejection) -> bool {
 ///
 /// Order is load-bearing: the hijack gate is checked FIRST, before any epoch
 /// comparison, so a `u64::MAX`-epoch spoof cannot poison a rooted route.
-fn route_supersession_decision(
+///
+/// This is the ROUTE half: dest and epoch. [`route_supersession_decision`]
+/// adds the transport key.
+fn route_supersession_by_route(
     existing: Option<(
         ciris_persist::federation::self_at_login::BindingProvenance,
         u64,
@@ -13572,6 +13760,107 @@ fn route_supersession_decision(
     }
     // Lower epoch, or equal epoch with no upgrade/heal → stale.
     RouteSupersession::IgnoreStale
+}
+
+/// The named destination a 64-byte transport identity (`x25519 ‖ ed25519`)
+/// announces on: `truncated_hash(name_hash("ciris","edge") ‖ identity_hash)`.
+/// `None` for bytes that are not an identity.
+fn named_dest_of_transport(transport_pubkey64: &[u8; 64]) -> Option<[u8; 16]> {
+    let x25519: [u8; 32] = transport_pubkey64[..32].try_into().ok()?;
+    let ed25519: [u8; 32] = transport_pubkey64[32..].try_into().ok()?;
+    let identity = Identity::from_public_keys(&x25519, &ed25519).ok()?;
+    let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
+    Some(Destination::compute_destination_hash(&name_hash, identity.hash()).into_bytes())
+}
+
+/// Name and count a provably wrong stored transport key replaced by its
+/// owner's announce ([`stored_transport_key_is_provably_wrong`]).
+fn note_transport_key_healed(
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    key_id: &str,
+    dest16: [u8; 16],
+) {
+    if let Some(m) = metrics {
+        m.inc_peer_binding(crate::observability::PEER_BINDING_TRANSPORT_KEY_HEALED);
+    }
+    tracing::warn!(
+        key_id = %key_id,
+        dest = %hex::encode(dest16),
+        "peer binding's transport key HEALED — the stored key does not reproduce the \
+         named destination and the owner's announced one does, so every dial with the \
+         stored key would have failed InvalidProof; replaced, trust kept \
+         (peer_binding_transport_key_healed)"
+    );
+}
+
+/// Whether a stored binding's transport key is PROVABLY wrong for `dest16`:
+/// the incoming key differs, reproduces `dest16` as its named destination,
+/// and the stored key does not. A named destination hash commits to the one
+/// transport identity that announces on it, so only that identity can prove
+/// a link to it; a stored key that does not hash to the destination fails
+/// every dial with `InvalidProof` (the v43 canonical prime, which stored the
+/// FEDERATION Ed25519 at the canonical's named destination).
+fn stored_transport_key_is_provably_wrong(
+    stored_transport64: &[u8; 64],
+    incoming_transport64: &[u8; 64],
+    dest16: [u8; 16],
+) -> bool {
+    stored_transport64 != incoming_transport64
+        && named_dest_of_transport(incoming_transport64) == Some(dest16)
+        && named_dest_of_transport(stored_transport64) != Some(dest16)
+}
+
+/// Decide whether an incoming announce supersedes the cached route for its
+/// key_id: [`route_supersession_by_route`] over dest and epoch, then the
+/// TRANSPORT KEY. `existing` is `(provenance, epoch, dest16,
+/// transport_pubkey64)` of the cached entry; `incoming_transport64` is the
+/// announce's verified transport identity.
+///
+/// Where the route alone reads stale (same dest, not-older epoch), an
+/// owner's announce (`incoming_owns_key`; the hijack gate has already
+/// refused a non-owner over a Rooted route) whose identity reproduces the
+/// destination while the stored key does not
+/// ([`stored_transport_key_is_provably_wrong`]) heals the key: trust is
+/// kept on a Rooted binding (`AdmitRouteKeepTrust`), an Advisory one is
+/// rewritten (`Admit`). A stored key that is merely different but could
+/// itself be the destination's is never touched.
+fn route_supersession_decision(
+    existing: Option<(
+        ciris_persist::federation::self_at_login::BindingProvenance,
+        u64,
+        [u8; 16],
+        [u8; 64],
+    )>,
+    incoming_provenance: ciris_persist::federation::self_at_login::BindingProvenance,
+    incoming_owns_key: bool,
+    incoming_epoch: u64,
+    incoming_dest16: [u8; 16],
+    incoming_transport64: &[u8; 64],
+) -> RouteSupersession {
+    use ciris_persist::federation::self_at_login::BindingProvenance::Rooted;
+    let by_route = route_supersession_by_route(
+        existing.map(|(p, e, d, _)| (p, e, d)),
+        incoming_provenance,
+        incoming_owns_key,
+        incoming_epoch,
+        incoming_dest16,
+    );
+    let Some((ex_prov, ex_epoch, ex_dest16, ex_transport64)) = existing else {
+        return by_route;
+    };
+    if by_route == RouteSupersession::IgnoreStale
+        && incoming_owns_key
+        && incoming_dest16 == ex_dest16
+        && incoming_epoch >= ex_epoch
+        && stored_transport_key_is_provably_wrong(&ex_transport64, incoming_transport64, ex_dest16)
+    {
+        return if matches!(ex_prov, Rooted) {
+            RouteSupersession::AdmitRouteKeepTrust
+        } else {
+            RouteSupersession::Admit
+        };
+    }
+    by_route
 }
 
 /// CIRISEdge#432 — the pure heal decision: should the live entry be upgraded
@@ -15131,15 +15420,27 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
         // Snapshot the existing entry's decision-relevant fields (all Copy), so
         // the pure supersession decision runs without holding a borrow across
         // the admit side effects (which re-borrow `peers` mutably to insert).
-        let existing_snapshot = peers
-            .get(&key_id)
-            .map(|e| (e.provenance, e.epoch, e.peer.dest_hash.into_bytes()));
+        let existing_snapshot = peers.get(&key_id).map(|e| {
+            (
+                e.provenance,
+                e.epoch,
+                e.peer.dest_hash.into_bytes(),
+                e.transport_pubkey64,
+            )
+        });
+        // The heal this decision may make for a provably wrong stored key,
+        // named in the log and counted below.
+        let key_heal = existing_snapshot.is_some_and(|(_, _, d, k)| {
+            d == announced_dest16
+                && stored_transport_key_is_provably_wrong(&k, &binding_pubkey64, d)
+        });
         match route_supersession_decision(
             existing_snapshot,
             provenance,
             owns_key,
             attestation.epoch,
             announced_dest16,
+            &binding_pubkey64,
         ) {
             // CIRISEdge#337 CRITICAL-1 — an Advisory announce cannot override a
             // Rooted route (route-hijack refused). Attacker-floodable, so the
@@ -15148,7 +15449,7 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                 if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
                     route_supersession_log().check("hijack_refused")
                 {
-                    let (_, ex_epoch, _) = existing_snapshot.unwrap_or_default();
+                    let ex_epoch = existing_snapshot.map_or(0, |(_, e, _, _)| e);
                     tracing::warn!(
                         av = "AV-42",
                         key_id = %key_id,
@@ -15206,6 +15507,9 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
             // stand. This is the fix for the epoch-0-churn de-attribution that
             // stalled the ladder at `4.ship=0`.
             RouteSupersession::AdmitRouteKeepTrust => {
+                if key_heal {
+                    note_transport_key_healed(ctx.metrics.as_ref(), &key_id, announced_dest16);
+                }
                 if let Some(existing) = peers.get_mut(&key_id) {
                     existing.peer = resolved;
                     existing.epoch = attestation.epoch;
@@ -15241,7 +15545,10 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
             RouteSupersession::Admit => {
                 // CIRISEdge#336 — surface a reroute-heal distinctly from a fresh
                 // admit so the explicit→named transition is visible in the log.
-                if let Some((_, _, ex_dest16)) = existing_snapshot {
+                if key_heal {
+                    note_transport_key_healed(ctx.metrics.as_ref(), &key_id, announced_dest16);
+                }
+                if let Some((_, _, ex_dest16, _)) = existing_snapshot {
                     if ex_dest16 != announced_dest16
                         && matches!(provenance, BindingProvenance::Rooted)
                     {
@@ -18096,7 +18403,7 @@ mod tests {
         const EXPLICIT: [u8; 16] = [0x1f; 16]; // stand-in for the un-routable explicit-hash
         const NAMED: [u8; 16] = [0x81; 16]; // stand-in for the routable named dest
 
-        // Signature: route_supersession_decision(existing, incoming_provenance,
+        // Signature: route_supersession_by_route(existing, incoming_provenance,
         // incoming_owns_key, incoming_epoch, incoming_dest16).
         //
         // `owns_key` is the load-bearing signal (CIRISEdge#336 belt-heal fix): it
@@ -18110,11 +18417,11 @@ mod tests {
         #[test]
         fn fresh_peer_is_admitted() {
             assert_eq!(
-                route_supersession_decision(None, Rooted, true, 0, NAMED),
+                route_supersession_by_route(None, Rooted, true, 0, NAMED),
                 RouteSupersession::Admit
             );
             assert_eq!(
-                route_supersession_decision(None, Advisory, false, 7, NAMED),
+                route_supersession_by_route(None, Advisory, false, 7, NAMED),
                 RouteSupersession::Admit
             );
         }
@@ -18139,7 +18446,7 @@ mod tests {
         #[test]
         fn belt_heals_the_owners_advisory_reroute_explicit_to_named() {
             assert_eq!(
-                route_supersession_decision(
+                route_supersession_by_route(
                     Some((Rooted, 0, EXPLICIT)),
                     Advisory, // the field provenance — NOT Rooted
                     true,     // …but the owner proved key control
@@ -18161,24 +18468,24 @@ mod tests {
         fn owner_advisory_never_downgrades_a_rooted_binding() {
             // Equal-epoch reroute (the churn case) → heal route, keep trust.
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Advisory, true, 0, NAMED),
+                route_supersession_by_route(Some((Rooted, 0, EXPLICIT)), Advisory, true, 0, NAMED),
                 RouteSupersession::AdmitRouteKeepTrust,
             );
             // Higher-epoch (transport rotation) whose walk fell to Advisory →
             // heal route, keep trust (the key_id is still rooted in the directory).
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 2, NAMED)), Advisory, true, 3, EXPLICIT),
+                route_supersession_by_route(Some((Rooted, 2, NAMED)), Advisory, true, 3, EXPLICIT),
                 RouteSupersession::AdmitRouteKeepTrust,
             );
             // SAME dest, same epoch → nothing to heal; a plain stale re-announce
             // that must NOT rewrite (and must NOT downgrade) the Rooted binding.
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 4, NAMED)), Advisory, true, 4, NAMED),
+                route_supersession_by_route(Some((Rooted, 4, NAMED)), Advisory, true, 4, NAMED),
                 RouteSupersession::IgnoreStale,
             );
             // The razor still holds: WITHOUT ownership it is a hijack, refused.
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Advisory, false, 0, NAMED),
+                route_supersession_by_route(Some((Rooted, 0, EXPLICIT)), Advisory, false, 0, NAMED),
                 RouteSupersession::HijackRefused,
             );
         }
@@ -18191,7 +18498,7 @@ mod tests {
         fn spoof_without_key_ownership_cannot_override_rooted() {
             // Higher epoch, different dest — the u64::MAX poison attempt.
             assert_eq!(
-                route_supersession_decision(
+                route_supersession_by_route(
                     Some((Rooted, 5, NAMED)),
                     Advisory,
                     false,
@@ -18202,13 +18509,13 @@ mod tests {
             );
             // Equal epoch, same dest — still refused.
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 5, NAMED)), Advisory, false, 5, NAMED),
+                route_supersession_by_route(Some((Rooted, 5, NAMED)), Advisory, false, 5, NAMED),
                 RouteSupersession::HijackRefused,
             );
             // The exact belt-shaped inputs but WITHOUT ownership → refused. This
             // is the razor: owns_key alone separates the heal from the hijack.
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Advisory, false, 0, NAMED),
+                route_supersession_by_route(Some((Rooted, 0, EXPLICIT)), Advisory, false, 0, NAMED),
                 RouteSupersession::HijackRefused,
             );
         }
@@ -18273,7 +18580,7 @@ mod tests {
         #[test]
         fn equal_epoch_rooted_owner_reroute_heals() {
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 0, EXPLICIT)), Rooted, true, 0, NAMED),
+                route_supersession_by_route(Some((Rooted, 0, EXPLICIT)), Rooted, true, 0, NAMED),
                 RouteSupersession::Admit,
             );
         }
@@ -18285,11 +18592,11 @@ mod tests {
         #[test]
         fn higher_epoch_owner_supersedes() {
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 2, NAMED)), Rooted, true, 3, EXPLICIT),
+                route_supersession_by_route(Some((Rooted, 2, NAMED)), Rooted, true, 3, EXPLICIT),
                 RouteSupersession::Admit,
             );
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 2, NAMED)), Advisory, true, 3, EXPLICIT),
+                route_supersession_by_route(Some((Rooted, 2, NAMED)), Advisory, true, 3, EXPLICIT),
                 RouteSupersession::AdmitRouteKeepTrust,
             );
         }
@@ -18299,7 +18606,7 @@ mod tests {
         #[test]
         fn equal_epoch_advisory_to_rooted_upgrades() {
             assert_eq!(
-                route_supersession_decision(Some((Advisory, 3, NAMED)), Rooted, true, 3, NAMED),
+                route_supersession_by_route(Some((Advisory, 3, NAMED)), Rooted, true, 3, NAMED),
                 RouteSupersession::Admit,
             );
         }
@@ -18309,11 +18616,11 @@ mod tests {
         #[test]
         fn equal_epoch_same_dest_is_stale() {
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 4, NAMED)), Rooted, true, 4, NAMED),
+                route_supersession_by_route(Some((Rooted, 4, NAMED)), Rooted, true, 4, NAMED),
                 RouteSupersession::IgnoreStale,
             );
             assert_eq!(
-                route_supersession_decision(Some((Advisory, 4, NAMED)), Advisory, true, 4, NAMED),
+                route_supersession_by_route(Some((Advisory, 4, NAMED)), Advisory, true, 4, NAMED),
                 RouteSupersession::IgnoreStale,
             );
         }
@@ -18324,7 +18631,7 @@ mod tests {
         #[test]
         fn lower_epoch_is_stale_even_from_owner_with_new_dest() {
             assert_eq!(
-                route_supersession_decision(Some((Rooted, 9, NAMED)), Rooted, true, 2, EXPLICIT),
+                route_supersession_by_route(Some((Rooted, 9, NAMED)), Rooted, true, 2, EXPLICIT),
                 RouteSupersession::IgnoreStale,
             );
         }
@@ -18336,7 +18643,7 @@ mod tests {
         #[test]
         fn equal_epoch_non_owner_advisory_over_advisory_is_stale() {
             assert_eq!(
-                route_supersession_decision(
+                route_supersession_by_route(
                     Some((Advisory, 1, NAMED)),
                     Advisory,
                     false,
@@ -20657,5 +20964,168 @@ mod scoped_path_shape_tests {
             scoped_path_shape_from_paths(&[(2, None)]),
             ScopedPathShape::Unknown
         );
+    }
+}
+
+/// v43 InvalidProof triage — the transport key half of
+/// [`route_supersession_decision`], fed the exact field shapes: the
+/// CIRISServer canonical prime stores `0x00×32 ‖ federation Ed25519` at the
+/// canonical's NAMED destination (`inject_rooted_peer_for_test`), then the
+/// canonical's own announce arrives for that destination at the same epoch.
+#[cfg(test)]
+mod transport_key_heal_tests {
+    use super::*;
+    use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
+
+    fn pub64(seed: u8) -> [u8; 64] {
+        let id = Identity::from_private_key_bytes(&[seed; 64]).expect("identity");
+        id.public_key_bytes()[..64].try_into().expect("64")
+    }
+
+    /// The prime's stored shape: no X25519 half, `ed25519` as given.
+    fn primed(ed25519: &[u8]) -> [u8; 64] {
+        let mut k = [0u8; 64];
+        k[32..].copy_from_slice(ed25519);
+        k
+    }
+
+    struct Field {
+        transport: [u8; 64],
+        dest: [u8; 16],
+        fed_primed: [u8; 64],
+    }
+
+    fn field() -> Field {
+        let transport = pub64(0x07);
+        let dest = named_dest_of_transport(&transport).expect("named dest");
+        // The canonical's federation key: an Ed25519 that is not its
+        // transport identity's.
+        let fed_primed = primed(&pub64(0x09)[32..]);
+        Field {
+            transport,
+            dest,
+            fed_primed,
+        }
+    }
+
+    #[test]
+    fn an_owners_announce_heals_a_primed_federation_key_at_its_named_dest() {
+        let f = field();
+        assert!(stored_transport_key_is_provably_wrong(
+            &f.fed_primed,
+            &f.transport,
+            f.dest
+        ));
+        for incoming in [Advisory, Rooted] {
+            assert_eq!(
+                route_supersession_decision(
+                    Some((Rooted, 0, f.dest, f.fed_primed)),
+                    incoming,
+                    true,
+                    0,
+                    f.dest,
+                    &f.transport,
+                ),
+                RouteSupersession::AdmitRouteKeepTrust,
+                "{incoming:?}: the stored key is replaced, Rooted trust kept"
+            );
+        }
+        assert_eq!(
+            route_supersession_decision(
+                Some((Advisory, 0, f.dest, f.fed_primed)),
+                Advisory,
+                true,
+                0,
+                f.dest,
+                &f.transport,
+            ),
+            RouteSupersession::Admit,
+            "an Advisory binding is rewritten whole"
+        );
+        // The route-only decision this replaces left the key in place.
+        assert_eq!(
+            route_supersession_by_route(Some((Rooted, 0, f.dest)), Advisory, true, 0, f.dest),
+            RouteSupersession::IgnoreStale
+        );
+    }
+
+    #[test]
+    fn the_trusted_prime_shape_is_completed_by_the_owners_announce() {
+        // `prime_trusted_peers` stores the RIGHT Ed25519 with no X25519 half:
+        // it cannot reproduce the destination either, so the announce fills
+        // the identity in.
+        let f = field();
+        assert_eq!(
+            route_supersession_decision(
+                Some((Rooted, 0, f.dest, primed(&f.transport[32..]))),
+                Advisory,
+                true,
+                0,
+                f.dest,
+                &f.transport,
+            ),
+            RouteSupersession::AdmitRouteKeepTrust
+        );
+    }
+
+    #[test]
+    fn a_key_is_never_healed_without_proof() {
+        let f = field();
+        // Not the owner: the hijack gate still refuses first.
+        assert_eq!(
+            route_supersession_decision(
+                Some((Rooted, 0, f.dest, f.fed_primed)),
+                Advisory,
+                false,
+                0,
+                f.dest,
+                &f.transport,
+            ),
+            RouteSupersession::HijackRefused
+        );
+        // The stored key already reproduces the destination: untouched,
+        // whatever the announce carries.
+        let other = pub64(0x0b);
+        assert_eq!(
+            route_supersession_decision(
+                Some((Rooted, 0, f.dest, f.transport)),
+                Advisory,
+                true,
+                0,
+                f.dest,
+                &other,
+            ),
+            RouteSupersession::IgnoreStale
+        );
+        // The incoming key does not reproduce the destination: no proof.
+        assert_eq!(
+            route_supersession_decision(
+                Some((Rooted, 0, f.dest, f.fed_primed)),
+                Advisory,
+                true,
+                0,
+                f.dest,
+                &other,
+            ),
+            RouteSupersession::IgnoreStale
+        );
+        // An older epoch heals nothing.
+        assert_eq!(
+            route_supersession_decision(
+                Some((Rooted, 3, f.dest, f.fed_primed)),
+                Advisory,
+                true,
+                2,
+                f.dest,
+                &f.transport,
+            ),
+            RouteSupersession::IgnoreStale
+        );
+        // The same key: nothing to heal.
+        assert!(!stored_transport_key_is_provably_wrong(
+            &f.transport,
+            &f.transport,
+            f.dest
+        ));
     }
 }
