@@ -495,6 +495,40 @@ fn seal_refused(
     }
 }
 
+/// CC 5.3.3.5 E1 — a dial refused because the peer publishes no transit
+/// pair YET (`link_seal_refused_no_pair`): counted every time, as
+/// [`seal_refused`] counts, but said once per peer at INFO (`first`) and at
+/// DEBUG after ([`crate::transport::transit_kex_peer::no_pair_refusal_level`]).
+/// During bootstrap two people learn each other's pair through the canonical
+/// only after their routes arrive, so every round until then repeats it;
+/// at WARN that was ~18 lines per peer of normal operation.
+fn no_pair_refused(
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    peer: &str,
+    first: bool,
+    refusal: &crate::transport::link_seal::SealRefusal,
+) -> TransportError {
+    let reason = refusal.label();
+    if let Some(m) = metrics {
+        m.inc_link_seal(reason);
+    }
+    if crate::transport::transit_kex_peer::no_pair_refusal_level(first) == tracing::Level::INFO {
+        tracing::info!(
+            peer = %peer,
+            reason,
+            "no transit pair yet for {peer}; will dial once its route arrives \
+             (CC 5.3.3.5 E1; repeats at DEBUG until its pair resolves)"
+        );
+    } else {
+        tracing::debug!(peer = %peer, reason, "no transit pair yet for {peer} (repeat)");
+    }
+    TransportError::LinkSealRefused {
+        peer: peer.to_owned(),
+        reason,
+        detail: refusal.to_string(),
+    }
+}
+
 /// What [`send_fragments_on_channel`] achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FragmentSendOutcome {
@@ -9965,6 +9999,16 @@ impl DialCtx {
     async fn resolve_transit_pair(&self, peer: &str) -> Result<TransitKexPair, TransportError> {
         match self.seals.resolve_pair(self.rooting.as_deref(), peer).await {
             Ok(pair) => Ok(pair),
+            Err(
+                e @ crate::transport::av_transit_handshake::AvHandshakeError::NoTransitPair {
+                    ..
+                },
+            ) => Err(no_pair_refused(
+                self.metrics.as_ref(),
+                peer,
+                self.seals.note_no_pair_refusal(peer),
+                &crate::transport::link_seal::SealRefusal::Handshake(e),
+            )),
             Err(e) => Err(seal_refused(
                 self.metrics.as_ref(),
                 peer,

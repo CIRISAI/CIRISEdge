@@ -2,7 +2,23 @@
 
 # v43.1.0 — A/V calls: the host call API on the sealed transport
 
-**2026-10-20.** **MINOR** from v43.0.0. Additive API on the v43 sealed transport. Persist v59.0.0 is unchanged.
+**2026-10-20.** **MINOR** from v43.0.0. Additive API on the v43 sealed transport. **Persist v59.0.0 → v59.1.0**
+(bundle only: the baked genesis bundle is the v4 amend, so a fresh production node opens with the
+canonical's transit pair Rooted; no code, ABI or digest change).
+
+## Also in this release
+
+- **`TransportError` gains `LinkProofRefused`**; exhaustive downstream matches need an arm.
+- **Bootstrap logging:** a dial refused for want of a peer's transit pair (`link_seal_refused_no_pair`,
+  the normal state until two people learn each other's pair through the canonical) is said once per
+  peer at INFO, then at DEBUG, and is re-armed when the pair resolves. It was ~18 WARN lines per peer.
+  The metric still counts every refusal.
+- **Security updates:** `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382, distrusted intermediates
+  accepted in certificate verification) and `webpki-roots` 1.0.10 (RUSTSEC-2026-0381). The 0.26.11
+  webpki-roots shim that verify still pulls forwards to 1.0.10 and is waived by name; `basic-toml`
+  (uniffi build tool, unmaintained) is waived.
+- **CI:** the darwin-aarch64 wheel build gets 75 min per attempt (v43.0.0's tag published no
+  assets: the build of persist v59 outran 30 min).
 
 ## The host call API (#805 items 5–6, A11)
 
