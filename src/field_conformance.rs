@@ -1443,7 +1443,7 @@ mod tests {
 
     /// CIRISEdge#706 item 1 — **replay the CC vectors against edge's matcher.**
     ///
-    /// All 1103 published `(dimension, family, refusal)` triples (CC rc7), exact: a
+    /// All 1147 published `(dimension, family, refusal)` triples (CC rc8.1), exact: a
     /// matcher that answers differently from the reference on any one fails
     /// the build, every mismatch named. Edge's matcher is persist's — the
     /// full-match, refusal-bearing `namespace::matcher::match_family` of

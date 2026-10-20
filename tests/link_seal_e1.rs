@@ -364,7 +364,10 @@ fn first_contact_request(
         "body": {
             "kind": 2,
             "payload": [1, 2, 3],
-            "key_record": {"record": record},
+            // persist v59 — the sender's own `key:record:v1` row, the one
+            // carriage of its key persist admits.
+            "key_record_row": ciris_persist::federation::key_plane::plan_key_record_row(record, &None)
+                .expect("key:record:v1 row"),
             "challenge": "00".repeat(32),
         },
         "signature": "unchecked-at-the-transport",

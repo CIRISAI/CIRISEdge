@@ -502,10 +502,19 @@ impl Message for OpaqueRequest {
 /// replication uses, and only from a solicited answer.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct Introductions {
-    /// Key records, admitted by proof of possession before the answer is
-    /// verified (the answerer's own record may be among them).
+    /// persist v59.0.0 — RETIRED. Framed key records, which persist refuses
+    /// at every door (`federation_envelope_kind_retired: key`). Kept only so a
+    /// pre-v59 answer still decodes and each record it carries is refused BY
+    /// NAME in the requester's report rather than dropped unseen. Edge never
+    /// sends one; a host that puts a record here sees it refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<ciris_persist::federation::SignedKeyRecord>,
+    /// persist v59.0.0 — key records as their `key:record:v1` ROWS (the one
+    /// carriage persist admits), admitted through the Key plane's row door
+    /// before the answer is verified (the answerer's own row may be among
+    /// them). Persist verifies proof of possession over the row.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_rows: Vec<ciris_persist::federation::Attestation>,
     /// Attestations, admitted through the replication apply door after the
     /// answer is verified.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -516,7 +525,7 @@ impl Introductions {
     /// Nothing to introduce.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty() && self.attestations.is_empty()
+        self.keys.is_empty() && self.key_rows.is_empty() && self.attestations.is_empty()
     }
 }
 
@@ -529,16 +538,42 @@ impl Introductions {
 pub(crate) struct OpaqueRequestWire {
     pub kind: u32,
     pub payload: Vec<u8>,
+    /// persist v59.0.0 — RETIRED: the framed self-signed record, refused at
+    /// every persist door. Decoded only so a pre-v59 sender's first contact
+    /// is refused by name (`first_contact_framed_key_retired`); never sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_record: Option<ciris_persist::federation::SignedKeyRecord>,
+    /// persist v59.0.0 — the sender's own `key:record:v1` row: the one
+    /// carriage of its key persist admits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_record_row: Option<ciris_persist::federation::Attestation>,
     /// CIRISEdge#683 review — 32 fresh random bytes (hex), present exactly
-    /// when `key_record` is. The answer's correlation is this body's hash, and
+    /// when `key_record_row` is. The answer's correlation is this body's hash, and
     /// without the challenge every other field of a first-contact request is
     /// public or guessable (the join kind, a deterministic payload, the
     /// sender's published record), so anyone could compute it and forge a
     /// "solicited" answer. With it, only a party that SAW the request can.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge: Option<String>,
+}
+
+impl OpaqueRequestWire {
+    /// persist v59.0.0 — THE key id this first-contact request introduces: the
+    /// key its `key_record_row` carries (persist's own projection of the
+    /// `key:record:v1` row). `None` without a row: a framed `key_record` is
+    /// retired and introduces nothing. The one accessor every key-bound check
+    /// reads (the first-contact door; the per-link seal's handshake binding),
+    /// so they cannot read two different fields. The row is admitted only
+    /// through persist's key-plane door, which verifies the record's proof of
+    /// possession, so binding a check to this id still binds it to a proven
+    /// key.
+    #[must_use]
+    pub(crate) fn carried_key_id(&self) -> Option<String> {
+        self.key_record_row
+            .as_ref()
+            .and_then(ciris_persist::federation::key_plane::key_record_of_row)
+            .map(|record| record.key_id)
+    }
 }
 
 impl Message for OpaqueRequestWire {

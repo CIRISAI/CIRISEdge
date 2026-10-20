@@ -18293,7 +18293,8 @@ mod tests {
         use ciris_persist::store::MemoryBackend;
 
         let backend = MemoryBackend::new();
-        let key_id = "peer-roundtrip";
+        // CIRISPersist#1103 — derived from the key the fixture row carries.
+        let key_id: &str = &ciris_verify_core::fedcode::derive_key_id("peer-roundtrip", &[7u8; 32]);
         let dest_hash = [7u8; 16];
         let mut pubkey = [0u8; 64];
         for (i, b) in pubkey.iter_mut().enumerate() {
@@ -18515,7 +18516,8 @@ mod tests {
         use ciris_persist::store::MemoryBackend;
 
         let backend = MemoryBackend::new();
-        let key_id = "peer-heal-read";
+        // CIRISPersist#1103 — derived from the key the fixture row carries.
+        let key_id: &str = &ciris_verify_core::fedcode::derive_key_id("peer-heal-read", &[7u8; 32]);
         // FK gate: the occurrence's federation_keys row must exist.
         let mut record = fixture_key_record_for_transport_tests(key_id);
         record.key_id = key_id.to_string();

@@ -175,7 +175,8 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), "edge-key-aaaa");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("a/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.announce_interval = Duration::from_secs(2);
             let auth = auth_for(key, dir, &base).await;
@@ -191,7 +192,8 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), "edge-key-bbbb");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("b/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
             c.announce_interval = Duration::from_secs(2);
@@ -207,7 +209,13 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
     // `(dest_hash, transport-tier ed25519)` binding both directions —
     // production peers learn the same binding via the v6.0.0 directory-
     // cache anti-entropy path (CIRISEdge#175).
-    prime_v7_peer_pair(&transport_a, "edge-key-aaaa", &transport_b, "edge-key-bbbb").await;
+    prime_v7_peer_pair(
+        &transport_a,
+        key_a.key_id.as_str(),
+        &transport_b,
+        key_b.key_id.as_str(),
+    )
+    .await;
 
     // Drive both listeners. A's sink is what we assert on.
     let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(16);
@@ -219,18 +227,18 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
     let listen_b = tokio::spawn(async move { lb.listen(tx_b).await });
 
     // Post-prime sanity — no await on the announce mechanism.
-    let discovered = transport_b.knows_peer("edge-key-aaaa").await;
+    let discovered = transport_b.knows_peer(key_a.key_id.as_str()).await;
     assert!(
         discovered,
         "post-prime `knows_peer` must be true — v7.0.0 explicit-hash discovery is out-of-band",
     );
 
     // Round-trip one envelope B → A.
-    let envelope = sample_envelope("edge-key-bbbb", "edge-key-aaaa");
+    let envelope = sample_envelope(key_b.key_id.as_str(), key_a.key_id.as_str());
     let sent_bytes = serde_json::to_vec(&envelope).expect("serialize envelope");
 
     let outcome = transport_b
-        .send("edge-key-aaaa", &sent_bytes)
+        .send(key_a.key_id.as_str(), &sent_bytes)
         .await
         .expect("send B -> A");
     println!("[loopback] send outcome: {outcome:?}");
@@ -254,8 +262,8 @@ async fn rooted_resolution_round_trips_envelope_byte_exact() {
     // The bytes must still parse back into an equivalent envelope.
     let received: EdgeEnvelope =
         serde_json::from_slice(&frame.envelope_bytes).expect("re-parse received envelope");
-    assert_eq!(received.signing_key_id, "edge-key-bbbb");
-    assert_eq!(received.destination_key_id, "edge-key-aaaa");
+    assert_eq!(received.signing_key_id, key_b.key_id.as_str());
+    assert_eq!(received.destination_key_id, key_a.key_id.as_str());
     assert_eq!(received.nonce, [0x5a; 16]);
     assert_eq!(received.signature, envelope.signature);
 
@@ -303,7 +311,8 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), "edge-bg-aaaa");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("a/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.announce_interval = Duration::from_secs(2);
             let auth = auth_for(key, dir, &base).await;
@@ -317,7 +326,8 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), "edge-bg-bbbb");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("b/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
             c.announce_interval = Duration::from_secs(2);
@@ -326,7 +336,13 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
         }
     })
     .await;
-    prime_v7_peer_pair(&transport_a, "edge-bg-aaaa", &transport_b, "edge-bg-bbbb").await;
+    prime_v7_peer_pair(
+        &transport_a,
+        key_a.key_id.as_str(),
+        &transport_b,
+        key_b.key_id.as_str(),
+    )
+    .await;
 
     // Build an Edge per side — same builder shape `init_edge_runtime`
     // produces, just with the persist directory as the queue stub.
@@ -423,7 +439,7 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
     };
     assert_eq!(OpaqueRequest::TYPE, MessageType::OpaqueRequest);
     let resp = edge_b
-        .send("edge-bg-aaaa", req)
+        .send(key_a.key_id.as_str(), req)
         .await
         .expect("typed opaque round trip B → A → B");
     assert_eq!(resp.kind, 7);
@@ -437,7 +453,7 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
         .await
         .expect("timed out waiting for opaque request on A")
         .expect("opaque channel closed without receive");
-    assert_eq!(sender_key_id, "edge-bg-bbbb");
+    assert_eq!(sender_key_id, key_b.key_id.as_str());
     assert_eq!(payload, b"v8.0.0 opaque hello");
 
     // ── Phase 2 typed round trip: request → Handler<M> → typed reply ──
@@ -449,7 +465,7 @@ async fn spawn_background_listeners_drives_two_node_opaque_request() {
     // time out.
     let typed = edge_b
         .send(
-            "edge-bg-aaaa",
+            key_a.key_id.as_str(),
             EchoReq {
                 text: "over reticulum".to_string(),
             },

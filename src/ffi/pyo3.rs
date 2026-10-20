@@ -2501,6 +2501,9 @@ impl PyEdge {
     ///   # roster applies), "third_party_row" (AV-84 verdict about the row),
     ///   # "community_roster_fork" (two authorities, one community id).
     ///   "apply_refusals_by_class": {"retry_after_roster": 4, ...},
+    ///   # persist v59.0.0 — framed key-plane objects refused
+    ///   # `federation_envelope_kind_retired`, per kind label.
+    ///   "envelope_kind_retired_refusals": {"key": 1, ...},
     ///   # CIRISEdge#858 — the refusal memory's park ledger.
     ///   "rows_parked_on_signer": {"identity_occurrence": 52, ...},
     ///   "signer_releases": 3, "retry_suppressions": 410,
@@ -2996,6 +2999,13 @@ fn metrics_bundle_to_pydict<'py>(
         refusals_class.set_item(token.as_str(), *v)?;
     }
     root.set_item("apply_refusals_by_class", refusals_class)?;
+    // persist v59.0.0 — framed key-plane objects refused
+    // `federation_envelope_kind_retired`, per kind label.
+    let retired = pyo3::types::PyDict::new(py);
+    for (kind, v) in &bundle.envelope_kind_retired_refusals {
+        retired.set_item(kind.as_str(), *v)?;
+    }
+    root.set_item("envelope_kind_retired_refusals", retired)?;
 
     // CIRISEdge#858 — the refusal memory's park ledger: rows parked on a
     // signer per plane (since start), rows released, wanted hashes the
@@ -8171,6 +8181,12 @@ fn assemble_tier_meta_v3(
             "tier fan-in exceeds the u32 wire range",
         ));
     }
+    // CC 6.1.2.1.1 — a repeated leaf is refused before hashing.
+    if let Some(id) = crate::holonomic::aggregation::first_repeated_source_id(&source_member_ids) {
+        return Err(PyValueError::new_err(format!(
+            "source_member_ids repeats {id:?}: a member_commitment leaf list must be unique"
+        )));
+    }
     let meta = crate::holonomic::aggregation::assemble_tier_meta_v3(
         content_id,
         corpus_kind,
@@ -10997,6 +11013,19 @@ mod pyo3_tier2_tests {
     /// durable enqueues pass the FK check.
     // Test fixture: seeds both key records (hybrid, v19.0.0) and builds the edge.
     #[allow(clippy::too_many_lines)]
+    /// CIRISPersist#1103 — the fixture edge's key id, derived from its own
+    /// key (seed `[0x77; 32]`).
+    fn tier2_edge_id() -> String {
+        crate::identity::derived_fixture_key_id("py-tier2-edge", &[0x77; 32])
+    }
+
+    /// CIRISPersist#1103 — the fixture recipient's key id, derived from its
+    /// own key (seed `[0x99; 32]`).
+    fn recipient_key_id() -> String {
+        crate::identity::derived_fixture_key_id("recipient-key", &[0x99; 32])
+    }
+
+    #[allow(clippy::too_many_lines)] // two fixture rows + the edge they serve
     async fn build_test_edge() -> (Arc<Edge>, Arc<dyn OutboundHandle>) {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
@@ -11014,7 +11043,7 @@ mod pyo3_tier2_tests {
         let seed: [u8; 32] = [0x77; 32];
         std::fs::write(&seed_path, seed).expect("write seed");
         let (classical, _pqc) = ciris_keyring::load_local_seed(ciris_keyring::LocalSeedConfig {
-            key_id: "py-tier2-edge".into(),
+            key_id: tier2_edge_id(),
             key_path: seed_path,
             pqc_key_id: None,
             pqc_key_path: None,
@@ -11040,8 +11069,8 @@ mod pyo3_tier2_tests {
             .expect("ts")
             .with_timezone(&chrono::Utc);
         for (key_id, key_seed) in [
-            ("py-tier2-edge", [0x77u8; 32]),
-            ("recipient-key", [0x99u8; 32]),
+            (tier2_edge_id(), [0x77u8; 32]),
+            (recipient_key_id(), [0x99u8; 32]),
         ] {
             let pubkey_b64 = B64.encode(
                 Ed25519Signer::from_seed(&key_seed)
@@ -11059,7 +11088,7 @@ mod pyo3_tier2_tests {
                 .sign(digest.as_slice())
                 .expect("scrub-sign");
             let record = KeyRecord {
-                key_id: key_id.to_string(),
+                key_id: key_id.clone(),
                 pubkey_ed25519_base64: pubkey_b64,
                 // v19.0.0 — every fixture row carries the ML-DSA-65 pubkey:
                 // every signature is the FULL hybrid, both-or-neither.
@@ -11078,14 +11107,14 @@ mod pyo3_tier2_tests {
                 })),
                 algorithm: "hybrid".to_string(),
                 identity_type: "steward".to_string(),
-                identity_ref: key_id.to_string(),
+                identity_ref: key_id.clone(),
                 valid_from: ts,
                 valid_until: None,
                 registration_envelope: envelope,
                 original_content_hash: hex::encode(digest),
                 scrub_signature_classical: B64.encode(sig),
                 scrub_signature_pqc: None,
-                scrub_key_id: key_id.to_string(),
+                scrub_key_id: key_id.clone(),
                 scrub_timestamp: ts,
                 pqc_completed_at: None,
                 persist_row_hash: String::new(),
@@ -11110,7 +11139,7 @@ mod pyo3_tier2_tests {
             ciris_keyring::MlDsa65SoftwareSigner::from_seed_bytes(&pqc_seed, "py-tier2-edge-pqc")
                 .expect("ml_dsa_65 from seed")
         });
-        let signer = Arc::new(LocalSigner::new("py-tier2-edge", classical, Some(pqc)));
+        let signer = Arc::new(LocalSigner::new(tier2_edge_id(), classical, Some(pqc)));
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let edge = Edge::builder()
             .directory(backend.clone() as Arc<dyn VerifyDirectory>)
@@ -12401,7 +12430,7 @@ mod pyo3_tier2_tests {
         let handle = Python::attach(|py| -> PyResult<PyDurableHandle> {
             py_edge.send_opaque_event(
                 py,
-                "recipient-key",
+                &recipient_key_id(),
                 1,
                 b"hello".to_vec(),
                 None,
@@ -12428,7 +12457,7 @@ mod pyo3_tier2_tests {
         let queue_id = Python::attach(|py| -> PyResult<String> {
             let h = py_edge.send_opaque_event(
                 py,
-                "recipient-key",
+                &recipient_key_id(),
                 1,
                 b"visible-row".to_vec(),
                 None,
@@ -12446,7 +12475,7 @@ mod pyo3_tier2_tests {
                 .list_outbound(
                     OutboundFilter {
                         status: Some(OutboundStatus::Pending),
-                        destination_key_id: Some("recipient-key".to_string()),
+                        destination_key_id: Some(recipient_key_id()),
                         ..Default::default()
                     },
                     16,
@@ -12656,7 +12685,7 @@ mod pyo3_tier2_tests {
         let queue_id = Python::attach(|py| -> PyResult<String> {
             let h = py_edge.send_opaque_event(
                 py,
-                "recipient-key",
+                &recipient_key_id(),
                 1,
                 b"metric-bump".to_vec(),
                 None,

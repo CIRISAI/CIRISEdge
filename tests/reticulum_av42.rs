@@ -70,14 +70,14 @@ async fn av42_spoofed_key_id_fails_root_binding_pubkey_mismatch() {
     // The adversary roots the VICTIM's key_id with the ADVERSARY's
     // pubkey — exactly what a spoofed announce attestation carries.
     let verdict = rooting
-        .root_binding("edge-key-victim", &adversary.pubkey_b64())
+        .root_binding(&victim.key_id, &adversary.pubkey_b64())
         .await;
 
     match verdict {
         RootingVerdict::Rejected {
             rejection: RootingRejection::PubkeyMismatch { key_id, .. },
         } => {
-            assert_eq!(key_id, "edge-key-victim");
+            assert_eq!(key_id, victim.key_id);
             println!(
                 "[AV-42] PASS gate 1 — spoofed announce for `edge-key-victim` \
                  paired with the adversary's pubkey rejected: \

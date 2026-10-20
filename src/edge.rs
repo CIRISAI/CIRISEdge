@@ -2889,29 +2889,34 @@ impl Edge {
         payload: Vec<u8>,
         timeout_ms: u64,
     ) -> Result<crate::first_contact::OpaqueExchange, EdgeError> {
-        let own = self.own_key_record().await?;
+        let own = self.own_key_record_row().await?;
         self.send_opaque_request_inner(destination_key_id, kind, payload, Some(own), timeout_ms)
             .await
     }
 
-    /// CIRISEdge#683 — this node's own key record, as its directory holds it.
-    async fn own_key_record(
+    /// CIRISEdge#683 — this node's own key record, as the `key:record:v1` ROW
+    /// its directory holds (persist v59.0.0: the framed record is refused at
+    /// every door, so the row is the one carriage a stranger can admit). A
+    /// key held without a row (it verifies under neither of persist's rules)
+    /// cannot introduce itself.
+    async fn own_key_record_row(
         &self,
-    ) -> Result<ciris_persist::federation::SignedKeyRecord, EdgeError> {
+    ) -> Result<ciris_persist::federation::Attestation, EdgeError> {
         let directory = self.federation_directory.as_ref().ok_or_else(|| {
             EdgeError::Config("first contact needs a federation directory (CIRISEdge#683)".into())
         })?;
-        let record = directory
-            .lookup_public_key(&self.signer.key_id)
+        crate::replication::key_plane_rows::key_record_rows(&**directory, &self.signer.key_id)
             .await
-            .map_err(|e| EdgeError::Persist(format!("own key record: {e}")))?
+            .map_err(|e| EdgeError::Persist(format!("own key record row: {e}")))?
+            .into_iter()
+            .next()
             .ok_or_else(|| {
                 EdgeError::Config(format!(
-                    "no key record for this node's own key {} (CIRISEdge#683)",
+                    "no key:record:v1 row for this node's own key {} — the key is held \
+                     without one, so it cannot introduce itself (CIRISEdge#683, persist v59.0.0)",
                     self.signer.key_id
                 ))
-            })?;
-        Ok(ciris_persist::federation::SignedKeyRecord { record })
+            })
     }
 
     async fn send_opaque_request_inner(
@@ -2919,7 +2924,7 @@ impl Edge {
         destination_key_id: &str,
         kind: u32,
         payload: Vec<u8>,
-        key_record: Option<ciris_persist::federation::SignedKeyRecord>,
+        key_record_row: Option<ciris_persist::federation::Attestation>,
         timeout_ms: u64,
     ) -> Result<crate::first_contact::OpaqueExchange, EdgeError> {
         use crate::messages::{OpaqueRequest, OpaqueRequestWire};
@@ -2928,7 +2933,7 @@ impl Edge {
         // CIRISEdge#683 review — a request that can be answered with
         // introductions carries a fresh challenge, so its correlation (the body
         // hash) cannot be computed by anyone who did not see it.
-        let challenge = key_record.as_ref().map(|_| {
+        let challenge = key_record_row.as_ref().map(|_| {
             use rand::RngCore as _;
             let mut bytes = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut bytes);
@@ -2937,7 +2942,8 @@ impl Edge {
         let msg = OpaqueRequestWire {
             kind,
             payload,
-            key_record,
+            key_record: None,
+            key_record_row,
             challenge,
         };
         // Build + sign the request envelope up front so we can key the
@@ -5918,22 +5924,26 @@ async fn dispatch_inbound(
             );
         } else if let Some(doors) = first_contact.doors.as_ref() {
             let mut report = crate::first_contact::IntroductionReport::default();
-            crate::first_contact::admit_introduced_keys(doors, &intro.keys, &mut report).await;
+            crate::first_contact::admit_introduced_keys(doors, &intro, &mut report).await;
             introductions = Some((report, intro));
         } else {
             let mut report = crate::first_contact::IntroductionReport::default();
+            let no_directory = crate::first_contact::FirstContactRefusal::NoDirectory.as_str();
             for k in &intro.keys {
-                report.refused.push((
-                    k.record.key_id.clone(),
-                    crate::first_contact::FirstContactRefusal::NoDirectory
-                        .as_str()
-                        .to_string(),
-                ));
+                report
+                    .refused
+                    .push((k.record.key_id.clone(), no_directory.to_string()));
+            }
+            for row in &intro.key_rows {
+                report
+                    .refused
+                    .push((row.attested_key_id.clone(), no_directory.to_string()));
             }
             introductions = Some((
                 report,
                 crate::messages::Introductions {
                     keys: Vec::new(),
+                    key_rows: Vec::new(),
                     attestations: intro.attestations,
                 },
             ));
@@ -7387,23 +7397,28 @@ async fn dispatch_inbound(
                 // CIRISEdge#683 — a device that has never seen this node needs
                 // its key to verify the answer; edge adds it, the host adds
                 // the bindings (FIRST_CONTACT.md §2.2, I14).
+                // persist v59.0.0 — as its `key:record:v1` ROW, the one
+                // carriage persist admits.
                 if first {
                     if let Some(doors) = first_contact.doors.as_ref() {
-                        let already = answer
-                            .introductions
-                            .keys
-                            .iter()
-                            .any(|k| k.record.key_id == signer.key_id);
+                        let already = answer.introductions.key_rows.iter().any(|row| {
+                            ciris_persist::federation::key_plane::key_record_of_row(row)
+                                .is_some_and(|r| r.key_id == signer.key_id)
+                        });
                         if !already {
-                            match doors.directory.lookup_public_key(&signer.key_id).await {
-                                Ok(Some(record)) => answer.introductions.keys.insert(
-                                    0,
-                                    ciris_persist::federation::SignedKeyRecord { record },
-                                ),
+                            match crate::replication::key_plane_rows::key_record_rows(
+                                &*doors.directory,
+                                &signer.key_id,
+                            )
+                            .await
+                            .map(|rows| rows.into_iter().next())
+                            {
+                                Ok(Some(row)) => answer.introductions.key_rows.insert(0, row),
                                 Ok(None) => tracing::warn!(
                                     key_id = %signer.key_id,
-                                    "first-contact answer: no key record for this node's own \
-                                     key; the requester may not be able to verify it (CIRISEdge#683)"
+                                    "first-contact answer: no key:record:v1 row for this node's \
+                                     own key; the requester may not be able to verify it \
+                                     (CIRISEdge#683, persist v59.0.0)"
                                 ),
                                 Err(e) => tracing::warn!(
                                     error = %e,
@@ -7903,6 +7918,16 @@ impl EdgeBuilder {
     /// `ml_dsa_65.seed`); the constructor reads both and produces
     /// `Arc<dyn HardwareSigner>` + optional `Arc<dyn PqcSigner>` via
     /// the keyring loader.
+    ///
+    /// This builder opens the directory, so it is that backend's HOST: it
+    /// tells the backend `key_id` is this node's key (`set_node_key_id`),
+    /// the attester persist's node-relative ACTS read (CIRISPersist#988:
+    /// a peer removal is an attributed act). The host must register this
+    /// key (a key record under `key_id`) before `peer_remove`; otherwise
+    /// removal is refused `HardCaseAttesterUnavailable`
+    /// (`node_key_not_held`), per persist's #988 contract. The builder does
+    /// not mint that record itself: it could only register under an id
+    /// persist derives, which need not be the caller's `key_id`.
     pub async fn from_keyring_seed_dir(
         key_id: impl Into<String>,
         seed_dir: PathBuf,
@@ -7919,6 +7944,9 @@ impl EdgeBuilder {
         let directory = ciris_persist::prelude::FederationDirectorySqlite::open(&db_path)
             .await
             .map_err(|e| EdgeError::Persist(format!("FederationDirectorySqlite::open: {e}")))?;
+        // CIRISPersist#988 — this node's key, the attester of its acts (see
+        // the doc above). Single-key: no actor/node split on this path.
+        directory.set_node_key_id(signer.key_id.clone());
         let queue = ciris_persist::prelude::EdgeOutboundQueueSqlite::open(&db_path)
             .await
             .map_err(|e| EdgeError::Persist(format!("EdgeOutboundQueueSqlite::open: {e}")))?;
@@ -9647,8 +9675,13 @@ mod delegation_gate_tests {
     /// of the key_id over a `0x11` fill. Same shape persist uses for
     /// its own tier-ingest fixtures, so corpora stay coherent.
     fn seed_for(key_id: &str) -> [u8; 32] {
+        // CIRISPersist#1103 — from the id's LABEL, the bridge fixtures' rule.
         let mut seed = [0x11u8; 32];
-        for (i, b) in key_id.bytes().take(32).enumerate() {
+        for (i, b) in crate::replication::bridge::tests::fixture_label(key_id)
+            .bytes()
+            .take(32)
+            .enumerate()
+        {
             seed[i] = b;
         }
         seed
@@ -11418,5 +11451,112 @@ mod envelope_authorship_tests {
             "the split is only meaningful when the ids differ"
         );
         assert!(!Edge::local_signer_authors_envelopes(node, actor));
+    }
+}
+
+/// CIRISPersist#988 on the PRODUCTION builder path — a peer removal is an
+/// attributed act whose attester is the node key the backend's host declares.
+/// [`EdgeBuilder::from_keyring_seed_dir`] opens its own directory, so it is
+/// that host: it names the key; the embedder registers it.
+#[cfg(test)]
+mod builder_peer_remove_988_tests {
+    use super::*;
+    use crate::transport::NullTransport;
+    use ciris_crypto::ClassicalSigner as _;
+
+    #[tokio::test]
+    async fn peer_remove_works_on_a_builder_opened_node() {
+        use ciris_persist::federation::hard_case::refusal::NODE_KEY_NOT_HELD;
+        use ciris_persist::federation::Error as E;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let seeds = tmp.path().join("seeds");
+        std::fs::create_dir_all(&seeds).expect("seed dir");
+        let seed = [0x5au8; 32];
+        std::fs::write(seeds.join("ed25519.seed"), seed).expect("write seed");
+        let mut pqc_seed = seed;
+        pqc_seed[0] ^= 0x55;
+        std::fs::write(seeds.join("ml_dsa_65.seed"), pqc_seed).expect("write pqc seed");
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let pubkey = ciris_crypto::Ed25519Signer::from_seed(&seed)
+            .expect("seed")
+            .public_key()
+            .expect("pubkey");
+        let key_id = ciris_verify_core::fedcode::derive_key_id("builder-node-988", &pubkey);
+        let edge = EdgeBuilder::from_keyring_seed_dir(
+            key_id.clone(),
+            seeds,
+            tmp.path().join("edge.sqlite"),
+        )
+        .await
+        .expect("builder")
+        .transport(Arc::new(NullTransport))
+        .build()
+        .expect("build edge");
+        let dir = edge
+            .federation_directory()
+            .expect("the builder wires its directory");
+        assert_eq!(
+            dir.node_key_id().as_deref(),
+            Some(key_id.as_str()),
+            "the builder names its signer's key as the node's"
+        );
+
+        let peer_pk = ciris_crypto::Ed25519Signer::from_seed(&[0x6b; 32])
+            .expect("seed")
+            .public_key()
+            .expect("pubkey");
+        let peer = ciris_verify_core::fedcode::derive_key_id("builder-peer-988", &peer_pk);
+        dir.add_peer_record(&peer, &b64.encode(&peer_pk), "agent", None)
+            .await
+            .expect("add the peer");
+
+        // The node key is named but not registered: refused by its typed
+        // reason, before anything moves.
+        let err = dir
+            .remove_peer_record(&peer, false, "operator soft-remove", None)
+            .await
+            .expect_err("no attester held");
+        assert!(
+            matches!(
+                err,
+                E::HardCaseAttesterUnavailable {
+                    reason: NODE_KEY_NOT_HELD,
+                    ..
+                }
+            ),
+            "refused node_key_not_held, not a generic error: {err:?}"
+        );
+
+        // The host registers the node's key; the removal is now attributed.
+        let now = chrono::Utc::now();
+        dir.put_public_key(ciris_persist::federation::SignedKeyRecord {
+            record: ciris_persist::federation::KeyRecord {
+                key_id: key_id.clone(),
+                pubkey_ed25519_base64: b64.encode(&pubkey),
+                pubkey_ml_dsa_65_base64: None,
+                algorithm: "hybrid".to_owned(),
+                identity_type: "node".to_owned(),
+                identity_ref: key_id.clone(),
+                valid_from: now,
+                valid_until: None,
+                registration_envelope: serde_json::json!({ "key_id": key_id }),
+                original_content_hash: "0".repeat(64),
+                scrub_signature_classical: "x".repeat(88),
+                scrub_signature_pqc: None,
+                scrub_key_id: key_id.clone(),
+                scrub_timestamp: now,
+                pqc_completed_at: None,
+                persist_row_hash: String::new(),
+                capability_roles: Vec::new(),
+                attestation_evidence: None,
+                consent_role: None,
+                additional_scrubs: Vec::new(),
+            },
+        })
+        .await
+        .expect("the host registers the node's key");
+        dir.remove_peer_record(&peer, false, "operator soft-remove", None)
+            .await
+            .expect("an attributed soft-remove");
     }
 }

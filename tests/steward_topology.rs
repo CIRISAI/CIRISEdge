@@ -48,10 +48,20 @@ struct FedKey {
 }
 
 impl FedKey {
-    fn new(key_id: &str, seed_byte: u8) -> Self {
+    /// persist #1103 (CC 2.6.8) — the `key_id` is DERIVED from the key's own
+    /// Ed25519 pubkey (`derive_key_id(label, pubkey)`), never hand-written:
+    /// `put_public_key` refuses a `-<fp>` suffix that is not its key's
+    /// fingerprint. Tests reference `key_id`, never the label.
+    fn new(label: &str, seed_byte: u8) -> Self {
+        use ciris_crypto::ClassicalSigner as _;
+        let seed = [seed_byte; 32];
+        let pubkey = ciris_crypto::Ed25519Signer::from_seed(&seed)
+            .expect("ed25519 from seed")
+            .public_key()
+            .expect("pubkey");
         Self {
-            key_id: key_id.to_string(),
-            seed: [seed_byte; 32],
+            key_id: ciris_verify_core::fedcode::derive_key_id(label, &pubkey),
+            seed,
         }
     }
 
@@ -334,22 +344,18 @@ async fn send_federation_fans_out_to_seeded_stewards() {
 
     let destinations: std::collections::BTreeSet<String> =
         rows.iter().map(|r| r.destination_key_id.clone()).collect();
-    let expected: std::collections::BTreeSet<String> = [
-        "bootstrap-steward",
-        "steward-us",
-        "steward-eu",
-        "steward-apac",
-    ]
-    .iter()
-    .map(|s| (*s).to_string())
-    .collect();
+    let expected: std::collections::BTreeSet<String> =
+        [&bootstrap, &steward_us, &steward_eu, &steward_apac]
+            .iter()
+            .map(|k| k.key_id.clone())
+            .collect();
     assert_eq!(destinations, expected);
     assert!(
-        !destinations.contains("agent-peer"),
+        !destinations.contains(&agent_peer.key_id),
         "non-steward agent must NOT receive a Federation fan-out"
     );
     assert!(
-        !destinations.contains("edge-self"),
+        !destinations.contains(&me.key_id),
         "self (an agent here) is structurally excluded from the steward set"
     );
 }
@@ -427,7 +433,7 @@ async fn send_federation_resolves_set_dynamically_on_each_call() {
     assert_eq!(rows.len(), 7);
     let apac_count = rows
         .iter()
-        .filter(|r| r.destination_key_id == "steward-apac")
+        .filter(|r| r.destination_key_id == steward_apac.key_id)
         .count();
     assert_eq!(
         apac_count, 1,
@@ -715,18 +721,18 @@ async fn federation_class_distinct_from_mandatory_class_no_subscription_bypass()
     // Sanity — the filter rejects StewardDirective for every peer.
     assert!(
         !edge
-            .would_subscription_accept("steward-us", &MessageType::StewardDirective)
+            .would_subscription_accept(&steward_us.key_id, &MessageType::StewardDirective)
             .await
     );
     assert!(
         !edge
-            .would_subscription_accept("steward-eu", &MessageType::StewardDirective)
+            .would_subscription_accept(&steward_eu.key_id, &MessageType::StewardDirective)
             .await
     );
     // Other message types still go through — proves the filter is
     // wired and selectively gates StewardDirective.
     assert!(
-        edge.would_subscription_accept("steward-us", &MessageType::AttestationGossip)
+        edge.would_subscription_accept(&steward_us.key_id, &MessageType::AttestationGossip)
             .await
     );
 

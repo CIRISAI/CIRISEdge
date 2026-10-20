@@ -122,14 +122,22 @@ struct Ident {
 }
 
 impl Ident {
-    fn new(key_id: &str, seed: u8) -> Self {
-        let mut ed = Ed25519SoftwareSigner::new(key_id);
+    /// persist #1103 (CC 2.6.8) — the `key_id` is DERIVED from the key's own
+    /// Ed25519 pubkey (`derive_key_id(label, pubkey)`), never
+    /// hand-written: `put_public_key` refuses a `-<fp>` suffix that is not its
+    /// key's fingerprint.
+    fn new(label: &str, seed: u8) -> Self {
+        // Aliased `<label>-engine`: an engine over this signer derives
+        // `derive_key_id(alias, pubkey)`, a row distinct from the identity's
+        // own (the person/node split these worlds model).
+        let mut ed = Ed25519SoftwareSigner::new(format!("{label}-engine"));
         ed.import_key(&[seed; 32]).expect("import ed key");
         let pqc =
-            MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{key_id}-pqc"))
+            MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{label}-pqc"))
                 .expect("ml-dsa from seed");
+        let pubkey = futures::executor::block_on(ed.public_key()).expect("ed pubkey");
         Self {
-            key_id: key_id.to_owned(),
+            key_id: ciris_verify_core::fedcode::derive_key_id(label, &pubkey),
             seed,
             ed,
             pqc,
@@ -320,23 +328,28 @@ async fn federate(from: &Node, to: &Node) {
                 .expect("carry the far node's owner binding");
         }
     }
-    let served = from
-        .dir
-        .list_signed_identity_occurrences_since(None, 64)
-        .await
-        .expect("list the signed occurrence plane");
-    let occ = served
-        .into_iter()
-        .map(|s| s.occurrence)
-        .find(|o| {
+    // persist v59.0.0 — the occurrence travels as its `identity:occurrence:v1`
+    // row through the attestation apply door; the framed object is retired.
+    let occ = ciris_persist::federation::FederationDirectory::list_attestations_since(
+        &*from.dir, None, 4096,
+    )
+    .await
+    .expect("list the attestation plane")
+    .into_iter()
+    .map(|row| row.attestation)
+    .find(|att| {
+        ciris_persist::federation::key_plane::occurrence_of_row(att).is_some_and(|o| {
             o.identity_occurrence.occurrence_key_id == from.me
                 && o.identity_occurrence.identity_key_id == from.identity
         })
-        .expect("the engine occurrence is ON the signed plane");
+    })
+    .expect("the engine occurrence is on the row plane");
     to.dir
-        .put_identity_occurrence(occ)
+        .apply_replicated_attestation(ciris_persist::federation::SignedAttestation {
+            attestation: occ,
+        })
         .await
-        .expect("admit the far node's published occurrence through the gated door");
+        .expect("admit the far node's occurrence row");
 }
 
 /// One end of an in-process wire between two `Edge`s.

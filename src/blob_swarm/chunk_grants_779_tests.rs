@@ -79,13 +79,18 @@ pub(crate) struct Ident {
 
 impl Ident {
     pub(crate) fn new(key_id: &str, seed: u8) -> Self {
-        let mut ed = Ed25519SoftwareSigner::new(key_id);
+        // The alias is `<label>-engine`, so a device's engine-derived id
+        // (`derive_key_id(alias, pk)`) stays apart from this identity's own
+        // derived id over the same key (CIRISPersist#1103).
+        let mut ed = Ed25519SoftwareSigner::new(format!("{key_id}-engine"));
         ed.import_key(&[seed; 32]).expect("import ed key");
         let pqc =
             MlDsa65SoftwareSigner::from_seed_bytes(&[seed ^ 0x55; 32], format!("{key_id}-pqc"))
                 .expect("ml-dsa from seed");
         Self {
-            key_id: key_id.to_owned(),
+            // CIRISPersist#1103 — registered under the id derived from its own
+            // key.
+            key_id: crate::identity::derived_fixture_key_id(key_id, &[seed; 32]),
             seed,
             ed,
             pqc,
@@ -255,22 +260,7 @@ pub(crate) async fn federate(from: &Node, to: &Node) {
                 .expect("carry the far node's owner binding");
         }
     }
-    let occ = from
-        .dir
-        .list_signed_identity_occurrences_since(None, 64)
-        .await
-        .expect("list occurrences")
-        .into_iter()
-        .map(|s| s.occurrence)
-        .find(|o| {
-            o.identity_occurrence.occurrence_key_id == from.me
-                && o.identity_occurrence.identity_key_id == from.identity
-        })
-        .expect("the engine occurrence is on the signed plane");
-    to.dir
-        .put_identity_occurrence(occ)
-        .await
-        .expect("admit the far node's occurrence");
+    carry_occurrence(from, to).await;
 }
 
 struct NoWire;
@@ -1095,24 +1085,25 @@ async fn a_wrong_aad_read_of_a_v4_dag_is_seal_mismatch_whole_and_by_range_797() 
 /// Hand `from`'s current signed engine occurrence to `to` (the row a peer
 /// replicates after a reclass: same keys, the new class, a newer
 /// `asserted_at`).
+///
+/// persist v59.0.0 — the occurrence travels as its `identity:occurrence:v1`
+/// ROW through the attestation apply door; the framed object is retired and
+/// `put_identity_occurrence` is a local authoring door only.
 pub(crate) async fn carry_occurrence(from: &Node, to: &Node) {
-    let occ = from
-        .dir
-        .list_signed_identity_occurrences_since(None, 64)
+    let row = crate::replication::key_plane_rows::occurrence_rows_about(&*from.dir, &from.identity)
         .await
-        .expect("list occurrences")
+        .expect("list occurrence rows")
         .into_iter()
-        .map(|s| s.occurrence)
-        .filter(|o| {
-            o.identity_occurrence.occurrence_key_id == from.me
-                && o.identity_occurrence.identity_key_id == from.identity
+        .filter(|row| {
+            crate::replication::key_plane_rows::occurrence_key_of(row).as_deref()
+                == Some(from.me.as_str())
         })
-        .max_by_key(|o| o.identity_occurrence.asserted_at)
-        .expect("the engine occurrence is on the signed plane");
+        .max_by_key(|row| row.asserted_at)
+        .expect("the engine occurrence is on the row plane");
     to.dir
-        .put_identity_occurrence(occ)
+        .apply_replicated_attestation(SignedAttestation { attestation: row })
         .await
-        .expect("admit the far node's occurrence");
+        .expect("admit the far node's occurrence row");
 }
 
 /// **CIRISEdge#799 under persist v53 S1 (CC 3.3.7) — a device its owner

@@ -559,3 +559,17 @@ pub async fn sign_hybrid_raw(
         mode: SignatureMode::HybridRequired,
     })
 }
+
+/// CIRISPersist#1103 (v59.0.0) test support — the `key_id` a fixture key
+/// registers under: `derive_key_id(label, its own Ed25519 pubkey)`, the only
+/// shape persist's registration door admits. One helper, so every fixture
+/// identity derives the same way.
+#[cfg(test)]
+pub(crate) fn derived_fixture_key_id(label: &str, ed25519_seed: &[u8; 32]) -> String {
+    use ciris_crypto::ClassicalSigner as _;
+    let pubkey = ciris_crypto::Ed25519Signer::from_seed(ed25519_seed)
+        .expect("ed25519 from seed")
+        .public_key()
+        .expect("ed25519 pubkey");
+    ciris_verify_core::fedcode::derive_key_id(label, &pubkey)
+}

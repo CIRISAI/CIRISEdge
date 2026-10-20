@@ -106,6 +106,45 @@ use serde::{Deserialize, Serialize};
 /// [`ciris_verify_core::holonomic::wholeness_witness::compute_merkle_root`].
 pub use ciris_verify_core::holonomic::wholeness_witness::compute_merkle_root;
 
+/// CC 6.1.1 (rc9 b3bc620) — a witness leaf list carried a leaf more than once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepeatedLeaf {
+    /// The repeated leaf's bytes.
+    pub leaf: Vec<u8>,
+}
+
+impl std::fmt::Display for RepeatedLeaf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "witness leaf list repeats a {}-byte leaf: the list must be unique (CC 6.1.1)",
+            self.leaf.len()
+        )
+    }
+}
+
+impl std::error::Error for RepeatedLeaf {}
+
+/// CC 6.1.1 (rc9 b3bc620) — the witness root, refusing a repeated leaf BEFORE
+/// hashing. Under odd-node duplication `[a,b,c]` and `[a,b,c,c]` share a root,
+/// and neither the hybrid signature nor a full-list recomputation tells them
+/// apart, so the list must be sorted AND unique. The sort is
+/// [`compute_merkle_root`]'s; this door adds the uniqueness check the shared
+/// owner does not make. Build and re-derive a root through here, never by
+/// calling [`compute_merkle_root`] on an unchecked list.
+///
+/// # Errors
+///
+/// [`RepeatedLeaf`] when any leaf appears more than once.
+pub fn unique_merkle_root(leaves: &[Vec<u8>]) -> Result<[u8; 32], RepeatedLeaf> {
+    let mut sorted: Vec<&Vec<u8>> = leaves.iter().collect();
+    sorted.sort_unstable();
+    if let Some(w) = sorted.windows(2).find(|w| w[0] == w[1]) {
+        return Err(RepeatedLeaf { leaf: w[0].clone() });
+    }
+    Ok(compute_merkle_root(leaves))
+}
+
 /// Locked v1 domain-separation tag for [`EquivocationProof`] signed
 /// bytes. This is a NEW CEG-shape claim (the `hard_case:*` namespace)
 /// distinct from the witnesses it wraps — changing it is a coordinated
@@ -383,8 +422,8 @@ struct CanonicalRepr<'a> {
 /// than silently published.
 ///
 /// Returns the surviving leaves as owned `Vec<u8>` in their input
-/// order (the caller passes the result straight to
-/// [`compute_merkle_root`], which lex-sorts internally).
+/// order; the caller passes the result to [`unique_merkle_root`], which
+/// lex-sorts and refuses a repeated leaf (CC 6.1.1).
 #[must_use]
 pub fn filter_witness_leaves<L: AsRef<[u8]>>(
     leaves: &[L],
@@ -755,6 +794,30 @@ mod tests {
         }
     }
 
+    /// CC 6.1.1 (rc9 b3bc620) — a repeated leaf is refused before hashing, in
+    /// any order, and a unique list derives exactly the shared owner's root.
+    #[test]
+    fn a_witness_leaf_list_with_a_repeated_leaf_is_refused_611() {
+        let (a, b, c) = (b"a".to_vec(), b"b".to_vec(), b"c".to_vec());
+        let unique = vec![c.clone(), a.clone(), b.clone()];
+        let repeated = vec![a.clone(), b.clone(), c.clone(), c.clone()];
+        // The shape the rule closes: the shared owner gives both lists one root.
+        assert_eq!(compute_merkle_root(&unique), compute_merkle_root(&repeated));
+        assert_eq!(
+            unique_merkle_root(&unique),
+            Ok(compute_merkle_root(&unique))
+        );
+        assert_eq!(
+            unique_merkle_root(&repeated),
+            Err(RepeatedLeaf { leaf: c.clone() })
+        );
+        let scattered = vec![b.clone(), a.clone(), b.clone()];
+        assert_eq!(
+            unique_merkle_root(&scattered),
+            Err(RepeatedLeaf { leaf: b })
+        );
+        assert_eq!(unique_merkle_root(&[]), Ok(compute_merkle_root(&[])));
+    }
     #[test]
     fn merkle_empty_leaves_wire_locked_via_shared_owner() {
         // CIRISEdge#359 F-4: the algorithmic KATs (single/two/odd/order-

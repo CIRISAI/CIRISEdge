@@ -938,7 +938,8 @@ pub fn is_first_contact_plane(bytes: &[u8]) -> bool {
 pub struct FirstContactSender {
     /// The envelope's `signing_key_id`: the key that signed the request.
     pub signer: String,
-    /// `key_record.record.key_id`, when the request introduces its key.
+    /// The key the request introduces (its `key:record:v1` row's key id,
+    /// `OpaqueRequestWire::carried_key_id`), when it introduces one.
     pub record_key_id: Option<String>,
 }
 
@@ -950,31 +951,24 @@ pub struct FirstContactSender {
 #[must_use]
 pub fn first_contact_sender(bytes: &[u8]) -> Option<FirstContactSender> {
     #[derive(serde::Deserialize)]
-    struct RecordPeek {
-        key_id: String,
-    }
-    #[derive(serde::Deserialize)]
-    struct SignedPeek {
-        record: RecordPeek,
-    }
-    #[derive(serde::Deserialize)]
-    struct BodyPeek {
-        #[serde(default)]
-        key_record: Option<SignedPeek>,
-    }
-    #[derive(serde::Deserialize)]
     struct Peek {
         message_type: crate::messages::MessageType,
         signing_key_id: String,
-        body: Option<BodyPeek>,
+        body: Option<Box<serde_json::value::RawValue>>,
     }
     let p = serde_json::from_slice::<Peek>(bytes).ok()?;
     if p.message_type != crate::messages::MessageType::OpaqueRequest {
         return None;
     }
+    // persist v59 — the introduced key is the `key:record:v1` row's, through
+    // the wire type's ONE accessor the first-contact door reads too.
+    let record_key_id = p
+        .body
+        .and_then(|b| serde_json::from_str::<crate::messages::OpaqueRequestWire>(b.get()).ok())
+        .and_then(|w| w.carried_key_id());
     Some(FirstContactSender {
         signer: p.signing_key_id,
-        record_key_id: p.body.and_then(|b| b.key_record).map(|k| k.record.key_id),
+        record_key_id,
     })
 }
 

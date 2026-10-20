@@ -170,19 +170,23 @@ async fn a_node_signed_by_the_test_root_roots_confirmed() {
             Arc::new(Ed25519SoftwareSigner::from_bytes(&seed, "node-x").unwrap());
         let pqc: Arc<dyn PqcSigner> =
             Arc::new(MlDsa65SoftwareSigner::from_seed_bytes(&seed, "node-x-pqc").unwrap());
-        ciris_edge::identity::LocalSigner::new("node-x", classical, Some(pqc))
+        // persist #1103 (CC 2.6.8): the key_id is DERIVED from the key's own
+        // Ed25519 pubkey, never hand-written.
+        let pubkey = classical.public_key().await.unwrap();
+        let key_id = ciris_verify_core::fedcode::derive_key_id("node-x", &pubkey);
+        ciris_edge::identity::LocalSigner::new(key_id, classical, Some(pqc))
     };
     let node_ed = b64().encode(node.classical.public_key().await.unwrap());
     let node_pqc = b64().encode(node.pqc.as_ref().unwrap().public_key().await.unwrap());
     backend
         .put_public_key(SignedKeyRecord {
-            record: signed_record("node-x", &node_ed, &node_pqc, &root, ROOT, "node").await,
+            record: signed_record(&node.key_id, &node_ed, &node_pqc, &root, ROOT, "node").await,
         })
         .await
         .expect("put node record");
 
     let verdict =
-        ciris_persist::federation::rooting::root_binding(backend.as_ref(), "node-x", &node_ed)
+        ciris_persist::federation::rooting::root_binding(backend.as_ref(), &node.key_id, &node_ed)
             .await;
     // Summarise rather than dump: a Confirmed chain prints ~30KB of ML-DSA keys.
     match &verdict {

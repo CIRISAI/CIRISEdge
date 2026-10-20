@@ -263,26 +263,66 @@ fn only_an_opaque_request_is_first_contact_e1() {
     assert!(first_contact_sender(b"CRPL\x01binary").is_none());
 }
 
-#[test]
-fn an_unattributed_link_admits_only_its_initiators_own_request_e1() {
-    let own = br#"{"message_type":"OpaqueRequest","signing_key_id":"dev",
-        "body":{"kind":2,"key_record":{"record":{"key_id":"dev"}}}}"#;
-    assert!(admit_unattributed_frame("dev", own).is_ok());
+/// A first-contact request whose `key:record:v1` row introduces `record`,
+/// signed (as the envelope says) by `signer`.
+fn request_introducing(signer: &str, record: &ciris_persist::federation::KeyRecord) -> Vec<u8> {
+    let row =
+        ciris_persist::federation::key_plane::plan_key_record_row(record, &None).expect("row");
+    let body = crate::messages::OpaqueRequestWire {
+        kind: 2,
+        payload: Vec::new(),
+        key_record: None,
+        key_record_row: Some(row),
+        challenge: None,
+    };
+    serde_json::to_vec(&serde_json::json!({
+        "message_type": "OpaqueRequest",
+        "signing_key_id": signer,
+        "body": body,
+    }))
+    .expect("json")
+}
+
+#[tokio::test]
+async fn an_unattributed_link_admits_only_its_initiators_own_request_e1() {
+    let record = crate::replication::bridge::tests::minted_key_record(
+        "seal-fc-dev",
+        ciris_persist::federation::types::identity_type::NODE,
+        0x61,
+    )
+    .await;
+    let dev = record.key_id.clone();
+    // Signed by, and introducing (through its key:record:v1 row), the
+    // handshake's initiator: admitted.
+    let own = request_introducing(&dev, &record);
+    assert_eq!(
+        first_contact_sender(&own).and_then(|s| s.record_key_id),
+        Some(dev.clone()),
+        "the introduced key is read through carried_key_id"
+    );
+    assert!(admit_unattributed_frame(&dev, &own).is_ok());
+    // Signed by another key.
     let other_signer = br#"{"message_type":"OpaqueRequest","signing_key_id":"mallory","body":{}}"#;
-    let refused = admit_unattributed_frame("dev", other_signer).unwrap_err();
+    let refused = admit_unattributed_frame(&dev, other_signer).unwrap_err();
     assert_eq!(
         refused.label(),
         crate::observability::LINK_SEAL_REFUSED_FIRST_CONTACT_SIGNER
     );
-    let other_record = br#"{"message_type":"OpaqueRequest","signing_key_id":"dev",
-        "body":{"key_record":{"record":{"key_id":"mallory"}}}}"#;
+    // Signed by the initiator but introducing another key.
+    let mallory = crate::replication::bridge::tests::minted_key_record(
+        "seal-fc-mallory",
+        ciris_persist::federation::types::identity_type::NODE,
+        0x62,
+    )
+    .await;
+    let other_record = request_introducing(&dev, &mallory);
     assert!(matches!(
-        admit_unattributed_frame("dev", other_record),
+        admit_unattributed_frame(&dev, &other_record),
         Err(SealRefusal::FirstContactSignerMismatch { .. })
     ));
     assert!(matches!(
         admit_unattributed_frame(
-            "dev",
+            &dev,
             br#"{"message_type":"OpaqueEvent","signing_key_id":"dev","body":{}}"#
         ),
         Err(SealRefusal::FirstContactOnly)

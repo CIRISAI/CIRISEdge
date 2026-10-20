@@ -28,11 +28,20 @@ pub struct TestFedKey {
 }
 
 impl TestFedKey {
+    /// `label`'s identity over `[seed_byte; 32]`. persist v59 (CIRISPersist#1103)
+    /// refuses a registered `key_id` whose `-<fp>` suffix is not its own
+    /// Ed25519 key's fingerprint, so the id is DERIVED
+    /// (`fedcode::derive_key_id(label, pubkey)`), never the bare label.
     #[must_use]
-    pub fn new(key_id: &str, seed_byte: u8) -> Self {
+    pub fn new(label: &str, seed_byte: u8) -> Self {
+        let seed = [seed_byte; 32];
+        let pubkey = ciris_crypto::Ed25519Signer::from_seed(&seed)
+            .expect("ed25519 from seed")
+            .public_key()
+            .expect("pubkey");
         Self {
-            key_id: key_id.to_string(),
-            seed: [seed_byte; 32],
+            key_id: ciris_verify_core::fedcode::derive_key_id(label, &pubkey),
+            seed,
         }
     }
 

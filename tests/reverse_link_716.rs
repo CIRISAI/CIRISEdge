@@ -98,7 +98,8 @@ async fn reverse_pair(tag: &str) -> ReversePair {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("a/transport.id"), "edge-key-aaaa");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("a/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.announce_interval = Duration::from_secs(30);
             (c, auth_for(key, dir, &base).await)
@@ -111,7 +112,8 @@ async fn reverse_pair(tag: &str) -> ReversePair {
         let dir = directory.clone();
         let base = tmp.path().to_path_buf();
         async move {
-            let mut c = ReticulumTransportConfig::new(base.join("b/transport.id"), "edge-key-bbbb");
+            let mut c =
+                ReticulumTransportConfig::new(base.join("b/transport.id"), key.key_id.as_str());
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
             c.announce_interval = Duration::from_secs(30);
@@ -124,7 +126,7 @@ async fn reverse_pair(tag: &str) -> ReversePair {
     // link B opens is attributed to B): an outbound dial cannot reach B.
     transport_a
         .inject_rooted_peer_with_transport_identity_for_test(
-            "edge-key-bbbb",
+            key_b.key_id.as_str(),
             [0xab; 16],
             transport_b.local_transport_pubkey(),
         )
@@ -132,7 +134,7 @@ async fn reverse_pair(tag: &str) -> ReversePair {
     let mut a_ed = [0u8; 32];
     a_ed.copy_from_slice(&transport_a.local_transport_pubkey()[32..64]);
     transport_b
-        .inject_rooted_peer_for_test("edge-key-aaaa", transport_a.local_dest_hash(), a_ed)
+        .inject_rooted_peer_for_test(key_a.key_id.as_str(), transport_a.local_dest_hash(), a_ed)
         .await;
 
     let (tx_a, mut rx_a) = mpsc::channel::<InboundFrame>(16);
@@ -150,7 +152,7 @@ async fn reverse_pair(tag: &str) -> ReversePair {
 
     // B dials A and ships (the round-open) — this is the link A answers on.
     transport_b
-        .send("edge-key-aaaa", b"round-open-716")
+        .send(key_a.key_id.as_str(), b"round-open-716")
         .await
         .expect("B -> A");
     tokio::time::timeout(Duration::from_secs(60), rx_a.recv())
@@ -202,7 +204,7 @@ async fn multi_fragment_frame_rides_the_reverse_link_channel_716() {
     // ~3.4 KB — the issue's "small file row" (8 fragments at the 431 B MDU).
     let frame = payload(3_400);
     p.a.force_next_sends_busy_for_test(1_000);
-    p.a.send("edge-key-bbbb", &frame)
+    p.a.send(&key_b_id(), &frame)
         .await
         .expect("a multi-fragment frame must ride the reverse-path link Channel");
     expect_frame(&mut p.rx_b, &frame, "3.4 KB frame").await;
@@ -222,7 +224,7 @@ async fn small_multi_fragment_frame_channel_first_716() {
     let mut p = reverse_pair("first").await;
 
     let frame = payload(1_200);
-    p.a.send("edge-key-bbbb", &frame)
+    p.a.send(&key_b_id(), &frame)
         .await
         .expect("a 3-fragment frame must deliver over the reverse-path link");
     expect_frame(&mut p.rx_b, &frame, "1.2 KB frame").await;
@@ -240,7 +242,7 @@ async fn large_frame_rides_the_reverse_link_716() {
     let mut p = reverse_pair("large").await;
 
     let frame = payload(194_820);
-    p.a.send("edge-key-bbbb", &frame)
+    p.a.send(&key_b_id(), &frame)
         .await
         .expect("a ~200 KB frame must deliver over the reverse-path link");
     expect_frame(&mut p.rx_b, &frame, "~200 KB frame").await;
@@ -257,8 +259,14 @@ async fn large_frame_rides_the_reverse_link_channel_when_resource_busy_716() {
 
     let frame = payload(194_820);
     p.a.force_next_sends_busy_for_test(1_000);
-    p.a.send("edge-key-bbbb", &frame).await.expect(
+    p.a.send(&key_b_id(), &frame).await.expect(
         "a ~200 KB frame must ride the reverse-path link Channel when the resource slot is busy",
     );
     expect_frame(&mut p.rx_b, &frame, "~200 KB frame (channel)").await;
+}
+
+/// `edge-key-bbbb`'s derived key id (persist v59, CIRISPersist#1103: a registered
+/// key id is `derive_key_id(label, pubkey)`, never the bare label).
+fn key_b_id() -> String {
+    TestFedKey::new("edge-key-bbbb", 0x0b).key_id
 }

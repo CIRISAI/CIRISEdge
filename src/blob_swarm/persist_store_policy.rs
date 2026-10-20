@@ -474,9 +474,17 @@ mod directory_tests {
     use ciris_persist::prelude::{FederationDirectorySqlite, KeyRecord, SignedKeyRecord};
     use ciris_persist::store::backend::Backend as _;
 
-    const PERSON: &str = "person-alice";
-    const NODE: &str = "node-alice";
-    const STRANGER: &str = "node-stranger";
+    // CIRISPersist#1103 — each registers under the id derived from its own
+    // key (the seed `register` gives it).
+    fn person() -> String {
+        crate::identity::derived_fixture_key_id("person-alice", &[0x11; 32])
+    }
+    fn node() -> String {
+        crate::identity::derived_fixture_key_id("node-alice", &[0x22; 32])
+    }
+    fn stranger() -> String {
+        crate::identity::derived_fixture_key_id("node-stranger", &[0x33; 32])
+    }
     const ROOM: &str = "room-1";
 
     fn ts() -> chrono::DateTime<chrono::Utc> {
@@ -571,10 +579,10 @@ mod directory_tests {
             ts(),
             &crate::replication::attestation_bind::AttestationColumns {
                 attestation_id: id,
-                attesting_key_id: PERSON,
+                attesting_key_id: &person(),
                 attestation_type: "delegates_to",
-                attested_key_id: NODE,
-                subject_key_ids: &[NODE.to_owned()],
+                attested_key_id: &node(),
+                subject_key_ids: &[node()],
                 cohort_scope: ciris_persist::federation::types::cohort_scope::FEDERATION,
                 weight: None,
             },
@@ -582,11 +590,11 @@ mod directory_tests {
         let canonical =
             ciris_persist::prelude::ceg_produce_canonicalize(&envelope).expect("canonicalize");
         let digest = <sha2::Sha256 as sha2::Digest>::digest(&canonical);
-        let (sig_b64, pqc_b64) = hybrid_sign(PERSON, 0x11, &canonical).await;
+        let (sig_b64, pqc_b64) = hybrid_sign(&person(), 0x11, &canonical).await;
         let row = Attestation {
             attestation_id: id.to_owned(),
-            attesting_key_id: PERSON.to_owned(),
-            attested_key_id: NODE.to_owned(),
+            attesting_key_id: person(),
+            attested_key_id: node(),
             attestation_type: "delegates_to".to_owned(),
             weight: None,
             asserted_at: ts(),
@@ -595,11 +603,11 @@ mod directory_tests {
             original_content_hash: hex::encode(digest),
             scrub_signature_classical: sig_b64,
             scrub_signature_pqc: Some(pqc_b64),
-            scrub_key_id: PERSON.to_owned(),
+            scrub_key_id: person(),
             scrub_timestamp: ts(),
             pqc_completed_at: None,
             persist_row_hash: String::new(),
-            subject_key_ids: vec![NODE.to_owned()],
+            subject_key_ids: vec![node()],
             withdraws_admission_rule: None,
             cohort_scope: ciris_persist::federation::types::cohort_scope::FEDERATION.to_owned(),
             tier: ciris_persist::federation::types::attestation_tier::FEDERATION.to_owned(),
@@ -617,9 +625,9 @@ mod directory_tests {
             .await
             .expect("open");
         dir.run_migrations().await.expect("migrate");
-        register(&*dir, PERSON, identity_type::USER, 0x11).await;
-        register(&*dir, NODE, identity_type::NODE, 0x22).await;
-        register(&*dir, STRANGER, identity_type::NODE, 0x33).await;
+        register(&*dir, &person(), identity_type::USER, 0x11).await;
+        register(&*dir, &node(), identity_type::NODE, 0x22).await;
+        register(&*dir, &stranger(), identity_type::NODE, 0x33).await;
         register(&*dir, ROOM, identity_type::AGENT, 0x44).await;
         bind_owner(&*dir).await;
         // `role: FOUNDER` is persist's own constant, never a local
@@ -629,7 +637,7 @@ mod directory_tests {
             community_key_id: ROOM.to_owned(),
             community_name: "The Room".to_owned(),
             members: vec![CommunityMember {
-                key_id: PERSON.to_owned(),
+                key_id: person(),
                 joined_at: ts(),
                 role: Some(ciris_persist::federation::admission::MEMBER_ROLE_FOUNDER.to_owned()),
             }],
@@ -643,10 +651,10 @@ mod directory_tests {
         let canonical =
             ciris_persist::prelude::ceg_produce_canonicalize(&community.signing_envelope())
                 .expect("canonicalize the room");
-        let (sig_b64, pqc_b64) = hybrid_sign(PERSON, 0x11, &canonical).await;
+        let (sig_b64, pqc_b64) = hybrid_sign(&person(), 0x11, &canonical).await;
         dir.put_community(SignedCommunity {
             community,
-            authority_key_id: PERSON.to_owned(),
+            authority_key_id: person(),
             scrub_signature_classical: sig_b64,
             scrub_signature_pqc: Some(pqc_b64),
             supersede_proof: None,
@@ -679,9 +687,9 @@ mod directory_tests {
     /// every real community blob.
     #[tokio::test]
     async fn a_members_node_has_standing_and_is_in_the_audience() {
-        let p = policy_at(joined_directory().await, NODE);
+        let p = policy_at(joined_directory().await, &node());
         assert_eq!(
-            p.sender_standing(NODE, &room_content()).await,
+            p.sender_standing(&node(), &room_content()).await,
             SenderStanding::MemberOfJoinedGroup,
             "the roster names the PERSON; the wire key is their NODE",
         );
@@ -695,9 +703,9 @@ mod directory_tests {
     /// test, never in place of it.
     #[tokio::test]
     async fn the_person_themselves_still_has_standing() {
-        let p = policy_at(joined_directory().await, PERSON);
+        let p = policy_at(joined_directory().await, &person());
         assert_eq!(
-            p.sender_standing(PERSON, &room_content()).await,
+            p.sender_standing(&person(), &room_content()).await,
             SenderStanding::MemberOfJoinedGroup,
         );
     }
@@ -706,9 +714,9 @@ mod directory_tests {
     /// has an owner": a node whose owner is on no roster gets nothing.
     #[tokio::test]
     async fn a_stranger_node_gets_no_standing_from_the_hop() {
-        let p = policy_at(joined_directory().await, NODE);
+        let p = policy_at(joined_directory().await, &node());
         assert_eq!(
-            p.sender_standing(STRANGER, &room_content()).await,
+            p.sender_standing(&stranger(), &room_content()).await,
             SenderStanding::VerifiedOnly,
             "the widening must not become 'anyone with a principal'",
         );
@@ -719,9 +727,9 @@ mod directory_tests {
     #[tokio::test]
     async fn a_member_of_a_room_we_have_not_joined_has_no_standing() {
         // This node is the stranger, so `ours` does not contain the room.
-        let p = policy_at(joined_directory().await, STRANGER);
+        let p = policy_at(joined_directory().await, &stranger());
         assert_eq!(
-            p.sender_standing(NODE, &room_content()).await,
+            p.sender_standing(&node(), &room_content()).await,
             SenderStanding::VerifiedOnly,
         );
         assert_eq!(
@@ -740,10 +748,10 @@ mod directory_tests {
     /// which would say edge resolved a principal and found it different.
     #[tokio::test]
     async fn a_self_scoped_placement_by_an_unknown_key_is_undeterminable() {
-        let p = policy_at(joined_directory().await, NODE);
+        let p = policy_at(joined_directory().await, &node());
         let own = ContentScope::Group {
             scope: CohortScope::SelfOnly,
-            group_id: NODE.to_owned(),
+            group_id: node(),
         };
         assert_eq!(
             p.sender_standing("who-even-is-this", &own).await,
@@ -752,6 +760,9 @@ mod directory_tests {
         );
         // …and the owner's own node is still recognised, so the refusal
         // above is the unknown-key arm and not a blanket refusal.
-        assert_eq!(p.sender_standing(NODE, &own).await, SenderStanding::OwnNode,);
+        assert_eq!(
+            p.sender_standing(&node(), &own).await,
+            SenderStanding::OwnNode,
+        );
     }
 }

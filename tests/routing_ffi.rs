@@ -113,7 +113,8 @@ async fn single_transport(
     .await;
 
     let cfg_a = {
-        let mut c = ReticulumTransportConfig::new(tmp.join("a/transport.id"), "edge-routing-aaaa");
+        let mut c =
+            ReticulumTransportConfig::new(tmp.join("a/transport.id"), key_a.key_id.as_str());
         c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
         c.announce_interval = Duration::from_secs(2);
         c
@@ -156,13 +157,15 @@ async fn paired_transports(
 
     let port_a = free_port();
     let cfg_a = {
-        let mut c = ReticulumTransportConfig::new(tmp.join("a/transport.id"), "edge-routing-aaaa");
+        let mut c =
+            ReticulumTransportConfig::new(tmp.join("a/transport.id"), key_a.key_id.as_str());
         c.listen_addr = format!("127.0.0.1:{port_a}").parse().unwrap();
         c.announce_interval = Duration::from_secs(2);
         c
     };
     let cfg_b = {
-        let mut c = ReticulumTransportConfig::new(tmp.join("b/transport.id"), "edge-routing-bbbb");
+        let mut c =
+            ReticulumTransportConfig::new(tmp.join("b/transport.id"), key_b.key_id.as_str());
         c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
         c.bootstrap_peers = vec![format!("127.0.0.1:{port_a}").parse().unwrap()];
         c.announce_interval = Duration::from_secs(2);
@@ -189,9 +192,9 @@ async fn paired_transports(
     // entropy path, CIRISEdge#175).
     prime_v7_peer_pair(
         &transport_a,
-        "edge-routing-aaaa",
+        key_a.key_id.as_str(),
         &transport_b,
-        "edge-routing-bbbb",
+        key_b.key_id.as_str(),
     )
     .await;
 
@@ -204,7 +207,7 @@ async fn paired_transports(
     let listen_b = tokio::spawn(async move { lb.listen(tx_b).await });
 
     // Post-prime sanity — no announce-mechanism dependency.
-    let discovered = transport_b.knows_peer("edge-routing-aaaa").await;
+    let discovered = transport_b.knows_peer(key_a.key_id.as_str()).await;
     assert!(
         discovered,
         "post-prime `knows_peer` must be true — v7.0.0 explicit-hash discovery is out-of-band",
@@ -491,7 +494,7 @@ async fn blackhole_enforcement_returns_peer_blackholed_error() {
 
     // Pull A's dest_hash from B's rooted-peer cache.
     let dest_hash_a = transport_b
-        .peer_dest_hash_for_test("edge-routing-aaaa")
+        .peer_dest_hash_for_test(&routing_a_id())
         .await
         .expect("rooted peer dest_hash")
         .to_vec();
@@ -505,7 +508,7 @@ async fn blackhole_enforcement_returns_peer_blackholed_error() {
     // Attempt to send — must surface the typed PeerBlackholed error.
     let envelope = b"{\"type\":\"acceptance\",\"body\":\"blackhole test\"}";
     let err = transport_b
-        .send("edge-routing-aaaa", envelope)
+        .send(&routing_a_id(), envelope)
         .await
         .expect_err("send to blackholed peer must fail");
     match err {
@@ -536,7 +539,7 @@ async fn blackhole_hits_counter_increments_on_block() {
     let (_transport_a, transport_b, listen_a, listen_b) = paired_transports(tmp.path()).await;
 
     let dest_hash_a = transport_b
-        .peer_dest_hash_for_test("edge-routing-aaaa")
+        .peer_dest_hash_for_test(&routing_a_id())
         .await
         .expect("rooted peer dest_hash")
         .to_vec();
@@ -549,7 +552,7 @@ async fn blackhole_hits_counter_increments_on_block() {
     // Drive 3 attempts.
     for _ in 0..3 {
         let _ = transport_b
-            .send("edge-routing-aaaa", b"acceptance")
+            .send(&routing_a_id(), b"acceptance")
             .await
             .expect_err("blackholed");
     }
@@ -872,7 +875,7 @@ async fn blackhole_durable_round_trip() {
         let cfg = {
             let mut c = ReticulumTransportConfig::new(
                 tmp.path().join("a1/transport.id"),
-                "edge-durable-bh-aaaa",
+                key_a.key_id.as_str(),
             );
             c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
             c.announce_interval = Duration::from_secs(2);
@@ -904,7 +907,7 @@ async fn blackhole_durable_round_trip() {
     let cfg = {
         let mut c = ReticulumTransportConfig::new(
             tmp.path().join("a2/transport.id"),
-            "edge-durable-bh-aaaa",
+            key_a.key_id.as_str(),
         );
         c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
         c.announce_interval = Duration::from_secs(2);
@@ -942,7 +945,7 @@ async fn blackhole_enforcement_records_hit_through_persist() {
     let (_transport_a, transport_b, listen_a, listen_b) = paired_transports(tmp.path()).await;
 
     let dest_hash_a = transport_b
-        .peer_dest_hash_for_test("edge-routing-aaaa")
+        .peer_dest_hash_for_test(&routing_a_id())
         .await
         .expect("rooted peer dest_hash")
         .to_vec();
@@ -953,7 +956,7 @@ async fn blackhole_enforcement_records_hit_through_persist() {
         .expect("blackhole_add");
 
     let _ = transport_b
-        .send("edge-routing-aaaa", b"hit-record-test")
+        .send(&routing_a_id(), b"hit-record-test")
         .await
         .expect_err("blackholed");
 
@@ -1042,7 +1045,7 @@ async fn blackhole_upsert_preserves_hits_on_intent_change() {
     let blackhole: Arc<dyn ciris_persist::federation::BlackholeRules> = directory.clone();
     let cfg = {
         let mut c =
-            ReticulumTransportConfig::new(tmp.path().join("a/transport.id"), "edge-upsert-bh-aaaa");
+            ReticulumTransportConfig::new(tmp.path().join("a/transport.id"), key_a.key_id.as_str());
         c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
         c.announce_interval = Duration::from_secs(2);
         c
@@ -1128,4 +1131,10 @@ async fn blackhole_remove_unknown_silent_ok() {
         .expect("remove of never-added hash returns Ok(())");
 
     listen.abort();
+}
+
+/// `edge-routing-aaaa`'s derived key id (persist v59, CIRISPersist#1103: a registered
+/// key id is `derive_key_id(label, pubkey)`, never the bare label).
+fn routing_a_id() -> String {
+    TestFedKey::new("edge-routing-aaaa", 0x3a).key_id
 }

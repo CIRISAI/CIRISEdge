@@ -16,7 +16,7 @@
 //! |---|---|---|
 //! | (1) | `AttesterKeyUnknown` ⇒ park on `attesting_key_id` | the bytes name the held attester, so nothing parks on the absent co-signer |
 //! | (2) | `FederationTierUnverified` ⇒ terminal | a forged signature rides the transient ladder |
-//! | (3) | key plane `unverifiable_signature` ⇒ terminal | the invalid self-scrubbed Key parks on itself |
+//! | (3) | a key row whose proof of possession fails (`SignatureInvalid`, persist v59.0.0) ⇒ terminal | the invalid self-scrubbed Key parks on itself |
 //! | (4) | `ReplicatedKeyOutcome::InvalidReplaced` ⇒ admitted | the replacement does not count as an admit |
 //! | (5) | `SignatureInvalid` ⇒ terminal | a forged occurrence rides the transient ladder |
 //! | (6) | `SignerDoesNotActFor` ⇒ indexed on the held signer | the row is never indexed, so its binding releases nothing |
@@ -42,7 +42,7 @@ use ciris_persist::prelude::SignedKeyRecord;
 use ciris_persist::store::sqlite::SqliteBackend;
 use sha2::Digest as _;
 
-use super::park_fresh_858_tests::{hold, occurrence, substrate, Ident};
+use super::park_fresh_858_tests::{hold, occurrence, occurrence_row_bytes, substrate, Ident};
 use crate::replication::refusal_backoff::TRANSIENT_CAP;
 use crate::replication::summary::ApplyOutcome;
 use crate::replication::{
@@ -221,14 +221,18 @@ async fn an_invalid_self_scrubbed_key_is_terminal_not_parked_on_itself() {
     let (ed, pqc) = crate::identity::sign_bound_hybrid(&k.signer(), b"other bytes", "other")
         .await
         .expect("sign other bytes");
-    let mut record = k.record.clone();
+    let record = k.record.clone();
     assert_eq!(
         record.scrub_key_id, record.key_id,
         "precondition: self-scrubbed"
     );
-    record.scrub_signature_classical = ed;
-    record.scrub_signature_pqc = pqc;
-    let bytes = serde_json::to_vec(&SignedKeyRecord { record }).expect("encode");
+    // persist v59.0.0 — the key travels as its row: the valid record's row,
+    // carrying a record whose scrub signatures cover other bytes.
+    let mut row = ciris_persist::federation::key_plane::plan_key_record_row(&record, &None)
+        .expect("the valid record's row");
+    row.attestation_envelope["key_record"]["scrub_signature_classical"] = serde_json::json!(ed);
+    row.attestation_envelope["key_record"]["scrub_signature_pqc"] = serde_json::json!(pqc);
+    let bytes = serde_json::to_vec(&row).expect("encode");
     let f = substrate().await;
     let b = bridge(&f);
 
@@ -238,9 +242,12 @@ async fn an_invalid_self_scrubbed_key_is_terminal_not_parked_on_itself() {
     let ApplyOutcome::Refused { reason, .. } = &outcome else {
         panic!("an invalid Key is refused, got {outcome:?}");
     };
+    // persist v59.0.0 — the row's proof of possession is checked at the
+    // key-plane door, which types a signature checked and refused
+    // `SignatureInvalid` (the framed door's `unverifiable_signature`).
     assert!(
-        reason.contains("unverifiable_signature"),
-        "precondition: persist's token is unverifiable_signature: {reason}"
+        reason.contains("federation_signature_invalid"),
+        "precondition: persist's verdict is SignatureInvalid: {reason}"
     );
     assert_eq!(
         disposition(&outcome),
@@ -327,7 +334,7 @@ async fn a_forged_occurrence_signature_is_terminal() {
     let mut occ = occurrence(p.key_id(), n.key_id(), &p).await;
     let other = occurrence(p.key_id(), n.key_id(), &forger).await;
     occ.signature = other.signature;
-    let bytes = serde_json::to_vec(&occ).expect("encode");
+    let bytes = occurrence_row_bytes(&occ);
     let b = bridge(&f);
 
     let outcome = b
@@ -367,7 +374,7 @@ async fn unbound_occurrence(tag: &str, seed: u8) -> (Ident, Ident, Arc<SqliteBac
     hold(&f, &p).await;
     hold(&f, &u).await;
     let occ = occurrence(p.key_id(), u.key_id(), &u).await;
-    let bytes = serde_json::to_vec(&occ).expect("encode");
+    let bytes = occurrence_row_bytes(&occ);
     (p, u, f, bytes)
 }
 

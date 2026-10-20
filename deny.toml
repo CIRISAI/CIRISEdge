@@ -93,6 +93,22 @@ ignore = [
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard-DNS constraint (no name-constraint certs)
     "RUSTSEC-2026-0104",  # rustls-webpki CRL parse panic (no CRL parsing here)
 
+    # persist v58 / verify 20.2.0 — mirrors persist's v58 rationale (5de50ebc).
+    # zip 7.x extraction: all three advisories are in `ZipArchive::extract` /
+    # `ZipStreamReader::extract`. zip reaches edge only via ciris-verify-core,
+    # whose sole use (`security::wheel::read_wheel_identity`) reads named
+    # dist-info entries into memory under a size cap and never extracts; edge
+    # does not call it. Clears when verify moves zip to >= 9.
+    "RUSTSEC-2026-0367",  # zip extract preserves SUID/SGID bits
+    "RUSTSEC-2026-0368",  # zip extract creates out-of-tree symlinks
+    "RUSTSEC-2026-0369",  # zip extract applies permissions through symlinks
+    # zbus 3.x name/value crates unmaintained (merged into zbus 6). Transitive
+    # via ciris-keyring -> secret-service -> zbus; maintenance gap only, no
+    # vulnerability. Clears when keyring's secret-service moves to zbus >= 6.
+    "RUSTSEC-2026-0370",  # zvariant unmaintained
+    "RUSTSEC-2026-0371",  # zbus_names unmaintained
+    "RUSTSEC-2026-0372",  # zvariant_derive unmaintained
+
     # v0.11.0 — `unic-*` family unmaintained. Transitive via
     # `pyo3-stub-gen` → `askama` → `unic-emoji-char` (Unicode emoji
     # property tables). The crates are read-only Unicode data; the

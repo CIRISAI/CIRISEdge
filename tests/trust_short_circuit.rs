@@ -46,11 +46,27 @@ struct FedKey {
     seed: [u8; 32],
 }
 
+/// The remote peer's DERIVED key id (persist #1103): the label is
+/// `"remote-peer"`, the id is what `FedKey::new` derives from its seed.
+fn remote_key_id() -> String {
+    FedKey::new("remote-peer", 0xAA).key_id
+}
+
 impl FedKey {
-    fn new(key_id: &str, seed_byte: u8) -> Self {
+    /// persist #1103 (CC 2.6.8) — the `key_id` is DERIVED from the key's own
+    /// Ed25519 pubkey (`derive_key_id(label, pubkey)`), never hand-written:
+    /// `put_public_key` refuses a `-<fp>` suffix that is not its key's
+    /// fingerprint. Tests reference `key_id`, never the label.
+    fn new(label: &str, seed_byte: u8) -> Self {
+        use ciris_crypto::ClassicalSigner as _;
+        let seed = [seed_byte; 32];
+        let pubkey = ciris_crypto::Ed25519Signer::from_seed(&seed)
+            .expect("ed25519 from seed")
+            .public_key()
+            .expect("pubkey");
         Self {
-            key_id: key_id.to_string(),
-            seed: [seed_byte; 32],
+            key_id: ciris_verify_core::fedcode::derive_key_id(label, &pubkey),
+            seed,
         }
     }
 
@@ -282,7 +298,7 @@ async fn inbound_below_threshold_dropped() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Threshold 0.5, sender at 0.2 → dropped.
     let (edge, remote_signer, local_key_id) =
-        build_edge(&tmp, 0.5, true, &[("remote-peer", 0.2)]).await;
+        build_edge(&tmp, 0.5, true, &[(remote_key_id().as_str(), 0.2)]).await;
     let mut rx = edge.events().subscribe_resources();
     let m_before = edge.metrics().inbound_dropped_low_trust();
     dispatch(&edge, &remote_signer, &local_key_id)
@@ -300,7 +316,7 @@ async fn inbound_below_threshold_dropped() {
             saw_event = true;
             assert_eq!(
                 ev.peer_key_id.as_deref(),
-                Some("remote-peer"),
+                Some(remote_key_id().as_str()),
                 "moderation signal carries the offender key_id"
             );
             assert_eq!(
@@ -327,7 +343,7 @@ async fn inbound_above_threshold_dispatched() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Threshold 0.5, sender at 0.8 → admitted.
     let (edge, remote_signer, local_key_id) =
-        build_edge(&tmp, 0.5, true, &[("remote-peer", 0.8)]).await;
+        build_edge(&tmp, 0.5, true, &[(remote_key_id().as_str(), 0.8)]).await;
     let m_before = edge.metrics().inbound_dropped_low_trust();
     dispatch(&edge, &remote_signer, &local_key_id)
         .await
@@ -346,7 +362,7 @@ async fn inbound_at_threshold_dispatched() {
     // Threshold 0.5, sender exactly at 0.5 → admitted (the
     // short-circuit condition is `score < threshold`, strict <).
     let (edge, remote_signer, local_key_id) =
-        build_edge(&tmp, 0.5, true, &[("remote-peer", 0.5)]).await;
+        build_edge(&tmp, 0.5, true, &[(remote_key_id().as_str(), 0.5)]).await;
     let m_before = edge.metrics().inbound_dropped_low_trust();
     dispatch(&edge, &remote_signer, &local_key_id)
         .await
@@ -367,7 +383,7 @@ async fn trust_score_default_zero_with_zero_threshold_allows_all() {
     // 0.0 must skip the scoring call entirely.
     let tmp = tempfile::tempdir().expect("tempdir");
     let (edge, remote_signer, local_key_id) =
-        build_edge(&tmp, 0.0, true, &[("remote-peer", 0.0)]).await;
+        build_edge(&tmp, 0.0, true, &[(remote_key_id().as_str(), 0.0)]).await;
     let m_before = edge.metrics().inbound_dropped_low_trust();
     dispatch(&edge, &remote_signer, &local_key_id)
         .await
@@ -386,7 +402,7 @@ async fn disabled_flag_overrides_threshold_check() {
     // `enabled = false` flag must skip the check entirely.
     let tmp = tempfile::tempdir().expect("tempdir");
     let (edge, remote_signer, local_key_id) =
-        build_edge(&tmp, 1.0, false, &[("remote-peer", 0.0)]).await;
+        build_edge(&tmp, 1.0, false, &[(remote_key_id().as_str(), 0.0)]).await;
     let m_before = edge.metrics().inbound_dropped_low_trust();
     dispatch(&edge, &remote_signer, &local_key_id)
         .await
@@ -403,7 +419,7 @@ async fn disabled_flag_overrides_threshold_check() {
 async fn dropped_inbound_emits_moderation_signal_on_event_bus() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (edge, remote_signer, local_key_id) =
-        build_edge(&tmp, 0.5, true, &[("remote-peer", 0.1)]).await;
+        build_edge(&tmp, 0.5, true, &[(remote_key_id().as_str(), 0.1)]).await;
     let mut rx = edge.events().subscribe_resources();
     dispatch(&edge, &remote_signer, &local_key_id)
         .await
@@ -430,7 +446,7 @@ async fn dropped_inbound_emits_moderation_signal_on_event_bus() {
 async fn dropped_inbound_increments_metrics_counter() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (edge, remote_signer, local_key_id) =
-        build_edge(&tmp, 0.5, true, &[("remote-peer", 0.1)]).await;
+        build_edge(&tmp, 0.5, true, &[(remote_key_id().as_str(), 0.1)]).await;
     let snap_before = edge.metrics().snapshot();
     dispatch(&edge, &remote_signer, &local_key_id)
         .await
@@ -501,7 +517,7 @@ async fn override_threshold_drops_envelope_under_zero_default_threshold() {
     // Build with config threshold = 0.0 (bootstrap-permissive default);
     // sender scored at 0.2. Production posture: the envelope is admitted.
     let (edge, remote_signer, local_key_id) =
-        build_edge(&tmp, 0.0, true, &[("remote-peer", 0.2)]).await;
+        build_edge(&tmp, 0.0, true, &[(remote_key_id().as_str(), 0.2)]).await;
     let m_before = edge.metrics().inbound_dropped_low_trust();
 
     // Install a 0.5 override — now the envelope must drop because the
@@ -538,12 +554,12 @@ async fn override_scorer_supersedes_builder_wired_scorer() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // Builder wires a scorer that VOUCHES for the remote at 0.9.
     let (edge, remote_signer, local_key_id) =
-        build_edge(&tmp, 0.5, true, &[("remote-peer", 0.9)]).await;
+        build_edge(&tmp, 0.5, true, &[(remote_key_id().as_str(), 0.9)]).await;
     let m_before = edge.metrics().inbound_dropped_low_trust();
 
     // Override with a scorer that DENIES the remote (0.1).
     let mut overriding = MemoryTrustScoring::new();
-    overriding.set_score("remote-peer", 0.1);
+    overriding.set_score(remote_key_id(), 0.1);
     let overriding_arc: Arc<dyn TrustScoring> = Arc::new(overriding);
     edge.install_trust_scoring_override(Some(overriding_arc));
 
@@ -575,7 +591,7 @@ async fn override_scorer_supersedes_builder_wired_scorer() {
 async fn observed_outcome_returns_verify_failed_for_misrouted_envelope() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (edge, remote_signer, _local_key_id) =
-        build_edge(&tmp, 0.0, true, &[("remote-peer", 0.5)]).await;
+        build_edge(&tmp, 0.0, true, &[(remote_key_id().as_str(), 0.5)]).await;
 
     // Misroute: address an envelope to a key_id that ISN'T the local
     // signer's. The verify pipeline rejects at AV-8 (Misrouted).
@@ -604,7 +620,7 @@ async fn build_signed_envelope_from_software_signer_drives_trust_gate() {
     // `federation_keys` matches the pubkey the software signer derives
     // from this seed.
     let (edge, _ignore_remote_signer, local_key_id) =
-        build_edge(&tmp, 0.5, true, &[("remote-peer", 0.2)]).await;
+        build_edge(&tmp, 0.5, true, &[(remote_key_id().as_str(), 0.2)]).await;
 
     // Re-build the sender via the software-signer path (the harness's
     // path), not the `FedKey::local_signer` path.
@@ -616,7 +632,7 @@ async fn build_signed_envelope_from_software_signer_drives_trust_gate() {
     let pqc: Arc<dyn ciris_keyring::PqcSigner> =
         Arc::new(FedKey::new("remote-peer", 0xAA).pqc_signer());
     let signer = LocalSigner::new(
-        "remote-peer".to_string(),
+        remote_key_id(),
         Arc::new(sw) as Arc<dyn ciris_keyring::HardwareSigner>,
         Some(pqc),
     );
