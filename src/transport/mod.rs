@@ -96,6 +96,10 @@ pub mod av_leg_choice;
 /// stored DEK, wrapped to the audience; an unkept call registers nothing.
 pub mod av_keep;
 
+/// CIRISEdge#805 item 5 — a room call's media keys: the room's MLS group,
+/// one DEK per stream (`FSD/AV_CALL_API.md` §3.2).
+pub mod av_call_key;
+
 /// CIRISEdge#805 item 4 — the A/V plane on the live node: the Reticulum
 /// transport's A/V sink, fed from the same event loop replication uses.
 #[cfg(feature = "_reticulum-module")]
@@ -216,6 +220,11 @@ pub mod av_transit_handshake;
 /// No classical fallback, no caller-supplied key, no compat path.
 #[cfg(feature = "_reticulum-module")]
 pub mod link_seal;
+
+/// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
+/// live streams (`FSD/AV_CALL_API.md`).
+#[cfg(feature = "_reticulum-module")]
+pub mod av_call;
 
 /// §24 NAT-traversal — store-and-forward queue for asleep mobile
 /// edges (CIRISEdge#169). CEG-native (the Scope-B queue: byte-exact
@@ -359,6 +368,22 @@ pub enum TransportError {
         /// very peer typically appears here, making the explicit-vs-named
         /// mismatch obvious.
         paths: String,
+    },
+    /// The dialled destination answered the link request, but its proof did
+    /// not verify against the key this node dialled with (leviculum closed
+    /// the link `InvalidProof`). The binding for `key_id` names a key that is
+    /// not the destination's: a fault in what this node holds for the peer,
+    /// not a slow or dead link, so it is named rather than reported as a
+    /// [`Self::Timeout`]. Counted as `peer_binding_link_proof_refused`.
+    #[error(
+        "link proof refused: key_id={key_id} target_dest={target_dest} — the destination's \
+         proof does not verify against the key this node holds for the peer"
+    )]
+    LinkProofRefused {
+        /// The federation key_id the dial was for.
+        key_id: String,
+        /// The destination dialled, lowercase hex.
+        target_dest: String,
     },
     /// CC 5.3.3.5 E1 — a link's transit KEX or seal was refused: the dialled
     /// node publishes no usable transit pair (the dial is never made), the

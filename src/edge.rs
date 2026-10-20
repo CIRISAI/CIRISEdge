@@ -1358,6 +1358,14 @@ pub struct Edge {
     /// byte-identical to pre-#499 behaviour.
     #[cfg(feature = "_reticulum-module")]
     scope_lifecycle: Option<Arc<crate::scope_lifecycle::ScopeLifecycle>>,
+    /// CIRISEdge#805 item 5 — the node's room MLS groups, for
+    /// [`Edge::join_call`]. Set via [`EdgeBuilder::room_groups`].
+    #[cfg(feature = "_reticulum-module")]
+    room_groups: Option<Arc<crate::mls::CohortGroups>>,
+    /// CIRISEdge#805 item 5 — the keep door a call's stream registers through
+    /// (never reached while kept streams wait on CIRISPersist#1067).
+    #[cfg(feature = "_reticulum-module")]
+    stream_dek_registrar: Option<Arc<dyn crate::transport::av_keep::StreamDekRegistrar>>,
     /// CIRISEdge#26 mutation surface (v0.15.1) — optional
     /// concrete-typed `Arc<dyn FederationDirectory>` retained so the
     /// UniFFI peer-mutation surface (`peer_add` / `peer_remove` /
@@ -1470,6 +1478,10 @@ pub struct EdgeBuilder {
     /// [`ScopedDestinationSink`]: crate::scope_lifecycle::ScopedDestinationSink
     #[cfg(feature = "_reticulum-module")]
     scope_lifecycle: Option<Arc<crate::scope_lifecycle::ScopeLifecycle>>,
+    #[cfg(feature = "_reticulum-module")]
+    room_groups: Option<Arc<crate::mls::CohortGroups>>,
+    #[cfg(feature = "_reticulum-module")]
+    stream_dek_registrar: Option<Arc<dyn crate::transport::av_keep::StreamDekRegistrar>>,
     /// CIRISEdge#34 (v0.14.0 wiring) — optionally pre-built
     /// reachability tracker so a Reticulum transport constructed BEFORE
     /// Edge (the pyo3 cohabitation init order) can share the same
@@ -1804,6 +1816,10 @@ impl Edge {
             scope_native_convergence: None,
             #[cfg(feature = "_reticulum-module")]
             scope_lifecycle: None,
+            #[cfg(feature = "_reticulum-module")]
+            room_groups: None,
+            #[cfg(feature = "_reticulum-module")]
+            stream_dek_registrar: None,
             reachability: None,
             derived_schema: None,
             canonical_bootstrap_peers: Vec::new(),
@@ -4180,6 +4196,112 @@ impl Edge {
     #[must_use]
     pub fn scope_lifecycle(&self) -> Option<&Arc<crate::scope_lifecycle::ScopeLifecycle>> {
         self.scope_lifecycle.as_ref()
+    }
+
+    /// CIRISEdge#805 item 5 — **join `room`'s call** (`FSD/AV_CALL_API.md`
+    /// §4): start this node's stream; an in-room call needs no ring (§7).
+    /// Needs the Reticulum transport, the scope lifecycle, the room groups
+    /// ([`EdgeBuilder::room_groups`]) and the federation directory (the
+    /// room's active roster); each missing one is refused by name.
+    ///
+    /// Not in this release: `ring` (ad-hoc calls), kept streams (refused as
+    /// `CallEvent::KeepRefused`, the call goes on unkept), the author
+    /// adopting its ciphertext (item 3), in-band STHs.
+    ///
+    /// # Errors
+    /// [`crate::transport::av_call::CallError`].
+    #[cfg(feature = "_reticulum-module")]
+    pub async fn join_call(
+        &self,
+        room: &str,
+        opts: crate::transport::av_call::CallOptions,
+    ) -> Result<crate::transport::av_call::Call, crate::transport::av_call::CallError> {
+        self.join_call_as(room, opts, None).await
+    }
+
+    /// CIRISEdge#805 items 5–6 — [`Self::join_call`], attending as `actor`
+    /// (the room member: the human's signer as they join). The call row
+    /// (`chat:call:v1`) is the actor's, with this node co-scrubbing; `None`
+    /// attends as the node itself.
+    ///
+    /// # Errors
+    /// As [`Self::join_call`].
+    #[cfg(feature = "_reticulum-module")]
+    pub async fn join_call_as(
+        &self,
+        room: &str,
+        opts: crate::transport::av_call::CallOptions,
+        actor: Option<Arc<LocalSigner>>,
+    ) -> Result<crate::transport::av_call::Call, crate::transport::av_call::CallError> {
+        use crate::transport::av_call::{Call, CallDeps, CallError};
+        let missing = |what: &str| CallError::Plumbing(format!("join_call needs {what}"));
+        let transport = self
+            .reticulum_transport
+            .clone()
+            .ok_or_else(|| missing("a Reticulum transport"))?;
+        let lifecycle = self
+            .scope_lifecycle
+            .clone()
+            .ok_or_else(|| missing("a scope lifecycle"))?;
+        let groups = self
+            .room_groups
+            .as_ref()
+            .ok_or_else(|| missing("the room groups (EdgeBuilder::room_groups)"))?;
+        let directory = self
+            .federation_directory
+            .clone()
+            .ok_or_else(|| missing("a federation directory (the room's roster)"))?;
+        let room_group = groups
+            .open_existing(room)
+            .await
+            .map_err(|e| CallError::RoomGroupUnavailable {
+                room: room.to_owned(),
+                detail: e.to_string(),
+            })?
+            .ok_or_else(|| CallError::NotARoomMember {
+                key_id: transport.occurrence_key_id().to_owned(),
+                room: room.to_owned(),
+            })?;
+        let registrar = self.stream_dek_registrar.clone().unwrap_or_else(|| {
+            Arc::new(crate::transport::av_keep::UnwiredRegistrar)
+                as Arc<dyn crate::transport::av_keep::StreamDekRegistrar>
+        });
+        let own = transport.occurrence_key_id().to_owned();
+        let actor = actor.unwrap_or_else(|| Arc::clone(&self.signer));
+        // Item 6 — the row this join writes is the ACTOR's own (attester =
+        // only subject): refused by name before the call starts.
+        let probe = crate::chat::call_attestation_in(
+            &actor,
+            room,
+            &crate::transport::av_call::call_id_hex(crate::transport::av_call::call_id_for_room(
+                room,
+            )),
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(CallError::Plumbing)?;
+        crate::transport::av_call::ensure_actor_is_subject(&actor.key_id, &probe)?;
+        let record = Arc::new(crate::transport::av_call::PersistCallRecord {
+            directory: Arc::clone(&directory),
+            actor,
+            node: Arc::clone(&self.signer),
+        }) as Arc<dyn crate::transport::av_call::CallRecord>;
+        Call::join(
+            room,
+            &own,
+            CallDeps {
+                room_group,
+                roster: Arc::new(DirectoryRoster(directory)),
+                transport,
+                lifecycle,
+                registrar,
+                events: Some(Arc::clone(&self.events)),
+                metrics: Some(self.metrics()),
+                record: Some(record),
+            },
+            opts,
+        )
+        .await
     }
 
     #[must_use]
@@ -8105,6 +8227,28 @@ impl EdgeBuilder {
         self
     }
 
+    /// CIRISEdge#805 item 5 — the node's room MLS groups ([`Edge::join_call`]
+    /// keys a call from its room's group, never a group of its own).
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn room_groups(mut self, groups: Arc<crate::mls::CohortGroups>) -> Self {
+        self.room_groups = Some(groups);
+        self
+    }
+
+    /// CIRISEdge#805 item 5 — the keep door a call's stream registers its
+    /// epoch DEKs through when kept (persist's `Engine`). Unset, a kept
+    /// stream is refused by name; an unkept one never touches it.
+    #[cfg(feature = "_reticulum-module")]
+    #[must_use]
+    pub fn stream_dek_registrar(
+        mut self,
+        registrar: Arc<dyn crate::transport::av_keep::StreamDekRegistrar>,
+    ) -> Self {
+        self.stream_dek_registrar = Some(registrar);
+        self
+    }
+
     #[cfg(feature = "_reticulum-module")]
     #[must_use]
     pub fn reticulum_transport(
@@ -8485,6 +8629,10 @@ impl EdgeBuilder {
             reticulum_transport: self.reticulum_transport,
             #[cfg(feature = "_reticulum-module")]
             scope_lifecycle,
+            #[cfg(feature = "_reticulum-module")]
+            room_groups: self.room_groups,
+            #[cfg(feature = "_reticulum-module")]
+            stream_dek_registrar: self.stream_dek_registrar,
             federation_directory: self.federation_directory,
             detector,
             canonical_peers,
@@ -8648,6 +8796,8 @@ fn transport_error_class(e: &TransportError) -> &'static str {
         TransportError::NoRouteToPeer { .. } => "no_route_to_peer",
         // CC 5.3.3.5 E1 — a link's transit seal refused by name.
         TransportError::LinkSealRefused { .. } => "link_seal_refused",
+        // The peer's proof did not verify against the key held for it.
+        TransportError::LinkProofRefused { .. } => "link_proof_refused",
     }
 }
 
@@ -11558,5 +11708,19 @@ mod builder_peer_remove_988_tests {
         dir.remove_peer_record(&peer, false, "operator soft-remove", None)
             .await
             .expect("an attributed soft-remove");
+    }
+}
+
+/// CIRISEdge#805 item 5 — the room's roster through the federation directory.
+#[cfg(feature = "_reticulum-module")]
+struct DirectoryRoster(Arc<dyn ciris_persist::federation::FederationDirectory>);
+
+#[cfg(feature = "_reticulum-module")]
+#[async_trait::async_trait]
+impl crate::transport::av_call::RoomRoster for DirectoryRoster {
+    async fn is_active_member(&self, room: &str, key_id: &str) -> Result<bool, String> {
+        ciris_persist::federation::is_active_community_member(self.0.as_ref(), room, key_id)
+            .await
+            .map_err(|e| e.to_string())
     }
 }

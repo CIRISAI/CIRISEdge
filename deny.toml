@@ -109,6 +109,19 @@ ignore = [
     "RUSTSEC-2026-0371",  # zbus_names unmaintained
     "RUSTSEC-2026-0372",  # zvariant_derive unmaintained
 
+    # v43.1.0 — two advisories published 2026-10-20.
+    # RUSTSEC-2026-0381 (bundled roots trust distrusted emSign intermediates):
+    # webpki-roots 1.x is upgraded to the fixed 1.0.10. The flagged 0.26.11 is
+    # the compatibility shim whose ONLY dependency is webpki-roots 1.0.10, so
+    # the roots it serves are already the fixed set; it is flagged by version
+    # number alone (reached via ciris-verify-core / hickory-proto). Clears when
+    # verify drops the 0.26 shim.
+    "RUSTSEC-2026-0381",  # webpki-roots 0.26 shim; data is 1.0.10 (fixed)
+    # RUSTSEC-2026-0374: basic-toml unmaintained, reached only via
+    # uniffi_bindgen → askama_derive (build-time binding generation, the
+    # ffi-uniffi feature); maintenance gap, no vulnerability.
+    "RUSTSEC-2026-0374",  # basic-toml unmaintained (uniffi_bindgen build tool)
+
     # v0.11.0 — `unic-*` family unmaintained. Transitive via
     # `pyo3-stub-gen` → `askama` → `unic-emoji-char` (Unicode emoji
     # property tables). The crates are read-only Unicode data; the

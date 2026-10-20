@@ -529,6 +529,13 @@ impl LinkSeals {
             })
     }
 
+    /// A dial to `peer` was refused for want of its pair; `true` the first
+    /// time since its pair last resolved
+    /// ([`PeerTransitResolver::note_no_pair_refusal`]).
+    pub fn note_no_pair_refusal(&self, peer: &str) -> bool {
+        self.resolver.note_no_pair_refusal(peer)
+    }
+
     /// Record a link this node dialled, before it can establish: no frame on
     /// it is delivered, and nothing is sent on it, until
     /// [`Self::install_initiator`].

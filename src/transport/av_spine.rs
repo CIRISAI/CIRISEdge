@@ -216,6 +216,11 @@ pub enum AvSpineError {
     /// A relay verb on a node that does not relay this stream.
     #[error("this node does not relay stream {0:?} — open the spine with a relay node")]
     NoRelay(StreamId),
+    /// CIRISEdge#805 item 5 — the spine drives a per-stream MLS session; a
+    /// ROOM-keyed publisher's group is its room's and is addressed by the
+    /// room call (`av_call`), never by a spine.
+    #[error("the spine needs a session-keyed publisher; a room-keyed one belongs to av_call")]
+    RoomKeyedPublisher,
 }
 
 // ─── outcomes ───────────────────────────────────────────────────────
@@ -578,9 +583,12 @@ impl AvSpine {
         publisher: AvPublisher,
         relay_node: Option<Arc<ReticulumNode>>,
     ) -> Result<Self, AvSpineError> {
-        let group_id = av_addressing::session_group_id(publisher.session());
+        let session = publisher
+            .session()
+            .ok_or(AvSpineError::RoomKeyedPublisher)?;
+        let group_id = av_addressing::session_group_id(session);
         let installed = {
-            let snapshot = av_addressing::snapshot(publisher.session())?;
+            let snapshot = av_addressing::snapshot(session)?;
             lifecycle.install(&scope, &snapshot)?
         };
         let relay = relay_node.map(|node| {
@@ -653,9 +661,7 @@ impl AvSpine {
     pub fn is_member(&self, key_id: &str) -> bool {
         self.publisher
             .session()
-            .member_key_ids()
-            .iter()
-            .any(|m| m == key_id)
+            .is_some_and(|s| s.member_key_ids().iter().any(|m| m == key_id))
     }
 
     /// A snapshot of the call, for a health endpoint or an assertion.
@@ -671,7 +677,10 @@ impl AvSpine {
         SpineHealth {
             stream_id,
             epoch: self.publisher.epoch(),
-            members: self.publisher.session().member_key_ids().len(),
+            members: self
+                .publisher
+                .session()
+                .map_or(0, |s| s.member_key_ids().len()),
             relay_subscribers: self
                 .relay
                 .as_ref()
@@ -1195,7 +1204,11 @@ impl AvSpine {
     /// epoch rather than disagreeing across it.
     fn readdress(&mut self, now: Instant) -> Result<Readdressed, AvSpineError> {
         let advanced = {
-            let snapshot = av_addressing::snapshot(self.publisher.session())?;
+            let session = self
+                .publisher
+                .session()
+                .ok_or(AvSpineError::RoomKeyedPublisher)?;
+            let snapshot = av_addressing::snapshot(session)?;
             let epoch = snapshot.epoch;
             match self.lifecycle.advance(&self.scope, &snapshot, now) {
                 Ok(outcome) => outcome,

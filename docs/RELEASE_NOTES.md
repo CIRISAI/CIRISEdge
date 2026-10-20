@@ -1,5 +1,91 @@
 # CIRISEdge Release Notes
 
+# v43.1.0 — A/V calls: the host call API on the sealed transport
+
+**2026-10-20.** **MINOR** from v43.0.0. Additive API on the v43 sealed transport. **Persist v59.0.0 → v59.1.0**
+(bundle only: the baked genesis bundle is the v4 amend, so a fresh production node opens with the
+canonical's transit pair Rooted; no code, ABI or digest change).
+
+## Also in this release
+
+- **`TransportError` gains `LinkProofRefused`**; exhaustive downstream matches need an arm.
+- **Bootstrap logging:** a dial refused for want of a peer's transit pair (`link_seal_refused_no_pair`,
+  the normal state until two people learn each other's pair through the canonical) is said once per
+  peer at INFO, then at DEBUG, and is re-armed when the pair resolves. It was ~18 WARN lines per peer.
+  The metric still counts every refusal.
+- **Security updates:** `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382, distrusted intermediates
+  accepted in certificate verification) and `webpki-roots` 1.0.10 (RUSTSEC-2026-0381). The 0.26.11
+  webpki-roots shim that verify still pulls forwards to 1.0.10 and is waived by name; `basic-toml`
+  (uniffi build tool, unmaintained) is waived.
+- **CI:** the darwin-aarch64 wheel build gets 75 min per attempt (v43.0.0's tag published no
+  assets: the build of persist v59 outran 30 min).
+
+## The host call API (#805 items 5–6, A11)
+
+- **`Edge::join_call(room, …)` → `Call`.** A call is a room's stream set. It publishes the caller's
+  stream, subscribes to the other attendees' streams, and has frames, events, layer policy,
+  attendance and leave. Every call leg rides a v43 sealed link and uses the link's transit keys; the
+  call holds no key of its own.
+- **The call record is a CEG attestation.** Each attendee authors ONE `chat:call:v1` row (attester =
+  subject = that attendee), placed at room scope like a chat row. Attendees are the union of
+  subjects over the call's rows. **Attendance is read by `call_id`, never by current membership**, so
+  a member removed from the room stays an attendee. An attendee's own withdrawal folds.
+  `join_call_as` refuses a row that is not the actor's own (`CallError::ActorIsNotTheSubject`).
+- **Python:** `Edge.join_call(room, keep="unkept", relay=False)` returns a `Call` with every Rust
+  verb. `frames()` and `events()` are async iterators of dicts. Arguments are validated at the
+  boundary (ValueError), and refusals carry a stable token prefix.
+- **A/V stream keying:** one DEK per (stream, room epoch) from the room's MLS group
+  (`STREAM_DEK_LABEL = "ciris-stream-dek/v1"`, CC 5.1 rc8). The stream label is spelled
+  `"av-" + lowercase hex`. **The chunk seq is the epoch-local stream counter (#846 part 1): reset at
+  every epoch roll, refused past u32.** That is an A/V wire change from v43.0.0, which had no host
+  call API, so no deployed caller is affected.
+- **Not in this release:** A9, the in-band signed tree head (CIRISEdge#878).
+
+## Peer bindings: a key that is not the destination's (v43 InvalidProof)
+
+A dial checks the link proof against the Ed25519 that this node holds for the peer. CIRISServer's
+canonical boot prime stored the canonical's FEDERATION key at its named destination. When it won
+its boot race against the trusted-peer prime, every dial to the canonical failed with leviculum's
+`InvalidProof`, and nothing healed it. That is the one joiner out of two that never completed first
+contact. A named destination hash commits to the one transport identity that can prove a link to
+it, so edge now catches the wrong key in four places, each counted on the new `peer_binding`
+metric family (PyO3 and UniFFI snapshots):
+
+- **Heal:** when the owner's announce for the SAME named destination carries a transport identity
+  that reproduces the destination and the stored key does not, the stored key is replaced. Trust is
+  kept (`peer_binding_transport_key_healed`). The route-supersession decision now takes both keys as
+  inputs. A key that could itself be the destination's is never touched, and a non-owner is still
+  refused first.
+- **Dial:** if leviculum holds an announce-learned identity for the destination that reproduces it
+  and differs from the binding, the dial uses leviculum's key (`peer_binding_dial_key_from_announce`).
+- **Named:** a proof that fails against the binding is `TransportError::LinkProofRefused
+  { key_id, target_dest }` (`peer_binding_link_proof_refused`; error class `link_proof_refused`). It
+  was reported as `Timeout(30s)`, returned at once.
+- **`ReticulumTransport::prime_peer(key_id, dest_hash, transport_pubkey64)`:** the production prime.
+  It takes the full 64-byte transport identity (`x25519 ‖ ed25519`, as the announce and the signed
+  `transport_destination` row carry it) and refuses one that does not reproduce `dest_hash`
+  (`peer_binding_prime_refused`). **CIRISServer must move both boot primes to it.**
+  `inject_rooted_peer_for_test` stays for tests only. PyO3's `prime_peer` (32-byte Ed25519) is
+  unchanged.
+
+## Evidence (CIRISConstitution#172)
+
+The CC claims now have generated manifest rows (`EDGE_CC_TEST_EVIDENCE`, guarded by
+`every_test_evidence_anchor_names_a_test`):
+- CLM-first-contact-seal-key-bound and CLM-pairing-payload-transit-pin (3.2);
+- **CLM-transport-edge (5.3.3.5)**: the #872 withhold is lifted, because an audit found no unsealed
+  edge send on an RNS link;
+- CLM-wholeness-witness and CLM-member-commitment-unique (6.1.1);
+- CLM-bundle-seeds-transit-pairs (5.3.4) and CLM-serve-seat-announced (5.3), as supporting rows.
+
+## Also
+
+- A fresh device reaches its owner's node in two hops through a bundle-seeded canonical (new
+  witness). The bundle alone seeds only the seated serve nodes.
+- E4: a room call between two members behind a facilitator runs over a punched interface (loopback
+  witness; traversal of a real NAT is not exercised).
+- The CLM-registry-wire layout witness now seals a chunk_seq within u32.
+
 # v43.0.0 — the sealed transport: every RNS frame under a hybrid transit seal; persist v59.0.0
 
 **2026-10-20.** **MAJOR** from v42.0.0. **Fleet break, all or nothing (CC 5.3.3.5 E1, rc9):** a

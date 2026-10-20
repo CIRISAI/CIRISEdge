@@ -127,10 +127,10 @@ pub struct ClaimConformance {
 /// CIRISEdge#872 — the rows the CIRISServer manifest used to host for edge
 /// at an old version, published here against the live symbol. Withheld from
 /// that list, each because edge does not meet the section yet: `CLM-holder`
-/// (5.3.2.1 — edge still emits `Withdraws` on `ContentMiss`),
-/// `CLM-consent-counter` (3.4.7.2 — no OQ-3 review window) and
-/// `CLM-transport-edge` (5.3.3.5 — E1's CIR2 sentence is open as
-/// CIRISConstitution#172). `CLM-registry-wire` was withheld until
+/// (5.3.2.1 — edge still emits `Withdraws` on `ContentMiss`) and
+/// `CLM-consent-counter` (3.4.7.2 — no OQ-3 review window).
+/// `CLM-transport-edge` (5.3.3.5) is evidenced by tests, in
+/// [`EDGE_CC_TEST_EVIDENCE`]. `CLM-registry-wire` was withheld until
 /// CIRISConstitution#173 withdrew the 48-byte compatibility read.
 pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[
     ClaimConformance {
@@ -219,6 +219,164 @@ pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[
                    self-asserted uplink above the cap does not outscore one at the cap",
         check: check_deterministic_alm,
         evidence: "src/holonomic/deterministic_topology.rs#compute_alm_topology_verified",
+    },
+];
+
+/// A Constitution claim edge evidences with a TEST rather than a pure check:
+/// the property needs live links, a test anchor or a running node, so the
+/// anchor is the test itself (`tests/<file>.rs#<test_name>`, or
+/// `src/<file>.rs#<test_name>` for an in-crate test). Emitted into
+/// `CIRISEdge.cc_impl.tsv` in the same five columns as every other row;
+/// `every_test_evidence_anchor_names_a_test` holds each anchor to a `fn` of
+/// that name in that file.
+pub struct TestEvidence {
+    /// The CC section, exactly as `constitution/claims.tsv` gives the claim's
+    /// `decimal_id` (the register matches a row on section AND symbol).
+    pub cc: &'static str,
+    /// The `CLM-*` claim id, exactly as `constitution/claims.tsv` names it.
+    pub clm: &'static str,
+    /// The `path#test_name` evidence anchor.
+    pub evidence: &'static str,
+    /// The claim is another repository's (persist's): edge's row supports it
+    /// and graduates nothing alone.
+    pub supporting: bool,
+}
+
+/// The claims edge evidences with tests (CIRISEdge#872, the rc9 register).
+///
+/// `CLM-transport-edge` is published here once its precondition held: every
+/// leviculum data send in `src/` goes through `LinkSeals` (the channel
+/// fragment sender, first contact, the Resource ship, `link_request`, the
+/// request handler's response, the A/V sender) and the only unsealed frames
+/// are the transit KEX handshake itself and RNS control (announce, link
+/// identify, path request, direct-link control).
+pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
+    // CC 3.2 (e) — the first-contact seal is key-bound.
+    TestEvidence {
+        cc: "3.2",
+        clm: "CLM-first-contact-seal-key-bound",
+        evidence: "tests/link_seal_e1.rs#a_first_contact_request_signed_by_a_key_other_than_the_handshake_initiator_is_refused_e1",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "3.2",
+        clm: "CLM-first-contact-seal-key-bound",
+        evidence: "tests/link_seal_e1.rs#a_matching_code_is_derived_from_the_handshake_initiator_key_e1",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "3.2",
+        clm: "CLM-first-contact-seal-key-bound",
+        evidence: "tests/link_seal_e1.rs#first_contact_rides_sealed_and_nothing_else_on_an_unattributed_link_e1",
+        supporting: false,
+    },
+    // CC 3.2 (f) — the pairing payload's transit pin.
+    TestEvidence {
+        cc: "3.2",
+        clm: "CLM-pairing-payload-transit-pin",
+        evidence: "tests/link_seal_e1.rs#a_fresh_device_seals_first_contact_with_a_pairing_pinned_pair_e1",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "3.2",
+        clm: "CLM-pairing-payload-transit-pin",
+        evidence: "tests/link_seal_e1.rs#a_pinned_pair_is_never_stored_or_resolved_as_rooted_e1",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "3.2",
+        clm: "CLM-pairing-payload-transit-pin",
+        evidence: "tests/link_seal_e1.rs#a_pinned_pair_link_carries_only_first_contact_e1",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "3.2",
+        clm: "CLM-pairing-payload-transit-pin",
+        evidence: "tests/link_seal_e1.rs#a_pinned_pair_that_is_not_the_nodes_responder_keys_is_refused_e1",
+        supporting: false,
+    },
+    // CC 5.3.3.5 E1 — every RNS frame edge sends rides the per-link seal.
+    TestEvidence {
+        cc: "5.3.3.5",
+        clm: "CLM-transport-edge",
+        evidence: "tests/link_seal_e1.rs#a_sealed_exchange_crosses_and_the_wire_carries_no_plaintext_e1",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.3.3.5",
+        clm: "CLM-transport-edge",
+        evidence: "tests/link_seal_e1.rs#a_peer_that_never_sends_the_handshake_is_refused_and_closed_e1",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.3.3.5",
+        clm: "CLM-transport-edge",
+        evidence: "tests/link_seal_e1.rs#a_non_ctkx_first_frame_is_refused_by_name_e1",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.3.3.5",
+        clm: "CLM-transport-edge",
+        evidence: "tests/link_seal_e1.rs#a_classical_only_suite_is_refused_by_name_e1",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.3.3.5",
+        clm: "CLM-transport-edge",
+        evidence: "tests/link_seal_e1.rs#a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.3.3.5",
+        clm: "CLM-transport-edge",
+        evidence: "tests/sealed_cut_bundle_e1.rs#a_fresh_device_reaches_its_owners_node_through_a_bundle_seeded_canonical_e1",
+        supporting: false,
+    },
+    // CC 5.3.4 — persist's claim; edge's two-hop use of the seeded pair.
+    TestEvidence {
+        cc: "5.3.4",
+        clm: "CLM-bundle-seeds-transit-pairs",
+        evidence: "tests/sealed_cut_bundle_e1.rs#a_fresh_device_reaches_its_owners_node_through_a_bundle_seeded_canonical_e1",
+        supporting: true,
+    },
+    // CC 6.1.1 — the witness leaf list is unique.
+    TestEvidence {
+        cc: "6.1.1",
+        clm: "CLM-wholeness-witness",
+        evidence: "src/holonomic/wholeness_witness.rs#a_witness_leaf_list_with_a_repeated_leaf_is_refused_611",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "6.1.1",
+        clm: "CLM-member-commitment-unique",
+        evidence: "src/holonomic/wholeness_witness.rs#a_witness_leaf_list_with_a_repeated_leaf_is_refused_611",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "6.1.1",
+        clm: "CLM-member-commitment-unique",
+        evidence: "src/holonomic/aggregation.rs#assemble_tier_meta_v2_refuses_a_repeated_source_id_611",
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "6.1.1",
+        clm: "CLM-member-commitment-unique",
+        evidence: "src/holonomic/aggregation.rs#assemble_tier_meta_v3_refuses_a_repeated_source_id_611",
+        supporting: false,
+    },
+    // CC 5.3 — persist's claim (the seating gate); edge serves an announced
+    // node's route to strangers and an unannounced node's only to its owner's.
+    TestEvidence {
+        cc: "5.3",
+        clm: "CLM-serve-seat-announced",
+        evidence: "src/replication/bridge.rs#an_unannounced_nodes_route_reaches_only_its_owners_nodes_682",
+        supporting: true,
+    },
+    TestEvidence {
+        cc: "5.3",
+        clm: "CLM-serve-seat-announced",
+        evidence: "src/replication/bridge.rs#an_announced_nodes_route_reaches_a_stranger_682",
+        supporting: true,
     },
 ];
 
@@ -339,6 +497,16 @@ pub fn edge_evidence_rows() -> Vec<String> {
         }))
         // CIRISEdge#718 — the transport-rule claims, same row shape.
         .chain(EDGE_CC_CLAIM_CONFORMANCE.iter().map(|c| {
+            format!(
+                "{}\t{}\tCIRISEdge\t{}\tciris-edge@v{}",
+                c.cc,
+                c.clm,
+                c.evidence,
+                env!("CARGO_PKG_VERSION"),
+            )
+        }))
+        // CIRISEdge#872 — the test-evidenced claims, same row shape.
+        .chain(EDGE_CC_TEST_EVIDENCE.iter().map(|c| {
             format!(
                 "{}\t{}\tCIRISEdge\t{}\tciris-edge@v{}",
                 c.cc,
@@ -546,7 +714,9 @@ fn check_registry_wire() -> Result<(), String> {
         &dek,
         StreamId(stream),
         Epoch(0x0102_0304_0506_0708),
-        ChunkSeq(0x1112_1314_1516_1718),
+        // Inside the epoch's u32 counter space (#846: a seal past it is
+        // refused and the epoch rolls); the high bytes still read 0 on the wire.
+        ChunkSeq(0x1516_1718),
         CODEC_AV1_SVC,
         layer,
     )
@@ -555,7 +725,7 @@ fn check_registry_wire() -> Result<(), String> {
 
     let mut want = stream.to_vec();
     want.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
-    want.extend_from_slice(&0x1112_1314_1516_1718u64.to_be_bytes());
+    want.extend_from_slice(&0x1516_1718u64.to_be_bytes());
     want.extend_from_slice(&[CODEC_AV1_SVC, 1, 2, 3]);
     want.extend_from_slice(&sealed.double_sealed_ciphertext);
     if wire != want {
@@ -1388,6 +1558,32 @@ mod tests {
             "evidence/CIRISEdge.cc_impl.tsv drifted from EDGE_FIELD_CONFORMANCE — \
              regenerate it from field_conformance::edge_evidence_rows() (CIRISEdge#410 §3)"
         );
+    }
+
+    /// CIRISEdge#872 — every test-evidence anchor names a real test: the file
+    /// exists and defines a `fn` of exactly that name (sync or async), so a
+    /// rename or a deleted witness is a build failure, not a dead row.
+    #[test]
+    fn every_test_evidence_anchor_names_a_test() {
+        for row in EDGE_CC_TEST_EVIDENCE {
+            let (path, name) = row
+                .evidence
+                .split_once('#')
+                .unwrap_or_else(|| panic!("{}: no `#` in {}", row.clm, row.evidence));
+            let body = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path),
+            )
+            .unwrap_or_else(|e| panic!("{}: {path} unreadable: {e}", row.clm));
+            let defines = body.lines().any(|l| {
+                let l = l.trim_start();
+                l.strip_prefix("async fn ")
+                    .or_else(|| l.strip_prefix("fn "))
+                    .and_then(|r| r.strip_prefix(name))
+                    .is_some_and(|r| r.starts_with('('))
+            });
+            assert!(defines, "{}: {path} defines no fn {name}", row.clm);
+            assert!(row.clm.starts_with("CLM-"), "{}", row.clm);
+        }
     }
 
     /// CIRISEdge#410 §4 — the serve-gate/routing completeness witness: the five CI

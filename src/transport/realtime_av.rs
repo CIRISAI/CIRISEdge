@@ -103,6 +103,17 @@ use crate::transport::TransportId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub [u8; 32]);
 
+/// THE spelling of a stream's id as a string: `av-` + the lowercase hex of its
+/// 32 bytes (67 bytes of UTF-8). The one string the persist stream id, the
+/// STREAM nonce (#846) and the per-stream DEK's info
+/// (`av_call_key::stream_dek_info`, CC 5.1 rc8) all bind, so live and stored
+/// never diverge. Not the bare hex: persist's chunk door refuses a bare 64-hex
+/// stream id, which is reserved for an inline blob's one-leaf log (#953).
+#[must_use]
+pub fn stream_label(stream_id: StreamId) -> String {
+    format!("av-{}", hex::encode(stream_id.0))
+}
+
 /// Monotonic epoch counter per stream. Each epoch corresponds to one
 /// `EpochDek`. Rotation cadence is per-stream policy (typical: every
 /// 60s or every Nth chunk, whichever first).
@@ -143,8 +154,10 @@ impl std::fmt::Debug for EpochDek {
     }
 }
 
-/// Newtype around the chunk sequence number per `(stream_id, epoch)`.
-/// Used for deterministic nonce derivation — see [`derive_inner_nonce`].
+/// Newtype around the chunk sequence number per `(stream_id, epoch)`: the
+/// chunk's EPOCH-LOCAL index, which CC 5.3.3.2.5 makes the inner seal's
+/// STREAM counter (CIRISEdge#846). `u64` on the wire; a seal refuses it above
+/// `u32::MAX` (never truncates) and the sender rolls the epoch first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkSeq(pub u64);
 
@@ -436,6 +449,19 @@ pub enum RealtimeAvError {
     /// rather than forwarding a chunk no subscriber can open.
     #[error("inner ciphertext too short for its AEAD tag: got {got} bytes, need at least {need}")]
     InnerTooShort { got: usize, need: usize },
+    /// CIRISEdge#846 — `chunk_seq` is the STREAM counter, a `u32` within an
+    /// epoch (CC 5.3.3.1); the sender rolls the epoch before it would pass
+    /// `u32::MAX`. Refused, never truncated.
+    #[error("chunk_seq {chunk_seq} is past the epoch's u32 counter space; roll the epoch")]
+    ChunkSeqBeyondEpoch { chunk_seq: u64 },
+}
+
+/// CIRISEdge#846 — the STREAM counter for `chunk_seq`: its epoch-local
+/// index as a `u32`, refused above `u32::MAX` (never truncated).
+fn epoch_counter(chunk_seq: ChunkSeq) -> Result<u32, RealtimeAvError> {
+    u32::try_from(chunk_seq.0).map_err(|_| RealtimeAvError::ChunkSeqBeyondEpoch {
+        chunk_seq: chunk_seq.0,
+    })
 }
 
 /// Derive the inner-AEAD nonce deterministically from `(stream_id,
@@ -567,6 +593,7 @@ pub fn seal_av_inner(
     codec_id: u8,
     layer: ChunkLayer,
 ) -> Result<InnerSealed, RealtimeAvError> {
+    epoch_counter(chunk_seq)?;
     let inner_nonce = derive_inner_nonce(stream_id, epoch, chunk_seq);
     let inner_ciphertext = aes_gcm::encrypt(epoch_dek.as_bytes(), &inner_nonce, plaintext)
         .map_err(RealtimeAvError::InnerAead)?;
@@ -772,6 +799,30 @@ pub fn open_av_chunk(
     aes_gcm::decrypt(epoch_dek.as_bytes(), &inner_nonce, &inner_sealed)
         .map_err(RealtimeAvError::InnerAead)
 }
+
+/// CIRISEdge#805 item 5 — open the INNER (E2E) layer of a chunk whose outer
+/// hop was already removed ([`open_av_outer`] / a relay's `open_hop_outer`):
+/// the receiver half of [`seal_av_inner`]. A call's receiver opens the outer
+/// per link and the inner per `(stream, epoch)` DEK, which it resolves from
+/// the chunk's own header.
+///
+/// # Errors
+/// [`RealtimeAvError::InnerAead`] when `epoch_dek` is not the chunk's.
+pub fn open_av_inner(
+    inner: &InnerSealed,
+    epoch_dek: &EpochDek,
+) -> Result<Vec<u8>, RealtimeAvError> {
+    let inner_nonce = derive_inner_nonce(inner.stream_id, inner.epoch, inner.chunk_seq);
+    aes_gcm::decrypt(epoch_dek.as_bytes(), &inner_nonce, &inner.inner_ciphertext)
+        .map_err(RealtimeAvError::InnerAead)
+}
+
+/// CIRISEdge#805 item 5 (#720) — the bytes a chunk adds to its plaintext on
+/// the wire: the clear header and codec/layer block plus the inner and the
+/// outer AEAD tags. A link whose Channel carries `limit` bytes carries a
+/// plaintext of at most `limit - AV_CHUNK_WIRE_OVERHEAD`.
+pub const AV_CHUNK_WIRE_OVERHEAD: usize =
+    CHUNK_HEADER_LEN + CHUNK_CODEC_LAYER_LEN + 2 * AEAD_TAG_LEN;
 
 /// Open ONLY the per-link outer AEAD, recovering the still-E2E-sealed
 /// inner chunk. The relay holds no [`EpochDek`]; the inner layer is
@@ -1132,7 +1183,7 @@ mod tests {
             &dek,
             StreamId([0xAB; 32]),
             Epoch(0x1234_5678_9ABC_DEF0),
-            ChunkSeq(0xFEDC_BA98_7654_3210),
+            ChunkSeq(0x7654_3210),
             CODEC_AV1_SVC,
             ChunkLayer {
                 spatial: 2,
@@ -1251,6 +1302,36 @@ mod tests {
         assert_ne!(n1, n3);
         let n4 = derive_inner_nonce(StreamId([2; 32]), Epoch(5), ChunkSeq(99));
         assert_ne!(n1, n4);
+    }
+
+    /// CIRISEdge#846 — `chunk_seq` past the epoch's `u32` counter space is
+    /// refused, never truncated (the sender rolls the epoch first).
+    #[test]
+    fn chunk_seq_past_u32_is_refused_not_truncated() {
+        let dek = dummy_dek();
+        let past = ChunkSeq(u64::from(u32::MAX) + 1);
+        let r = seal_av_inner(
+            b"x",
+            &dek,
+            dummy_stream(),
+            Epoch(0),
+            past,
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
+        );
+        assert!(
+            matches!(r, Err(RealtimeAvError::ChunkSeqBeyondEpoch { chunk_seq }) if chunk_seq == past.0)
+        );
+        seal_av_inner(
+            b"x",
+            &dek,
+            dummy_stream(),
+            Epoch(0),
+            ChunkSeq(u64::from(u32::MAX)),
+            CODEC_OPAQUE,
+            ChunkLayer::BASE,
+        )
+        .expect("u32::MAX is in range");
     }
 
     /// EpochDek Debug output redacts the bytes — no accidental log leaks.
@@ -1500,7 +1581,7 @@ mod tests {
             &dek,
             StreamId([0x55; 32]),
             Epoch(0x0123_4567_89AB_CDEF),
-            ChunkSeq(0xFEDC_BA98_7654_3210),
+            ChunkSeq(0x7654_3210),
             CODEC_JPEG_XS,
             layer,
         )

@@ -1813,8 +1813,12 @@ jobs:
         # wait. Same shape as the test-lane wrappers.
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 30
-          max_attempts: 3
+          # v43.1.0 — persist v59's release build of ciris-persist alone runs past 30
+          # minutes on the macos-14 runner (v43.0.0 tag: every darwin-aarch64 attempt
+          # timed out compiling that one crate, and sccache saves nothing a timeout
+          # cuts off). 75 min x 2 attempts; the job's 6 h cap still bounds it.
+          timeout_minutes: 75
+          max_attempts: 2
           retry_wait_seconds: 60
           shell: bash
           command: |

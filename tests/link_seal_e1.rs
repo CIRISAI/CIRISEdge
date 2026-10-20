@@ -190,6 +190,9 @@ impl Node {
     fn seal(&self, label: &str) -> u64 {
         self.metrics.link_seal().get(label).copied().unwrap_or(0)
     }
+    fn binding(&self, label: &str) -> u64 {
+        self.metrics.peer_binding().get(label).copied().unwrap_or(0)
+    }
     async fn received(&self, bytes: &[u8]) -> bool {
         self.seen
             .lock()
@@ -785,59 +788,11 @@ async fn a_matching_code_is_derived_from_the_handshake_initiator_key_e1() {
     ));
 }
 
-/// **CLM-first-contact-seal-key-bound (CC 3.2 adding-a-device (e)) / CC 5.3.3.5
-/// E1** — a fresh device that
-/// holds only the baked trust bundle plus the owner node's announce must
-/// resolve the owner node's transit pair as ROOTED (persist's
-/// `transit_kex_pair_for`, never weakened) before it can dial, and then
-/// complete a sealed first contact.
-///
-/// The test records what is true at this pin. If the pair does not resolve,
-/// it asserts the consequence (the dial is refused `link_seal_refused_no_pair`
-/// and never made) and prints `BLOCKER`: the bundle carries no signed
-/// transport destination and an announce carries no transit pair, so the
-/// fresh device has no Rooted source for it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fresh_device_roots_the_owner_nodes_transit_pair_from_bundle_and_announce_e1() {
-    let t = trio("fresh", true, true, true).await;
-    assert!(
-        t.c.transport.knows_peer(&t.a.key.key_id).await,
-        "the fresh device heard the owner node's announce"
-    );
-    let pair =
-        ciris_persist::federation::self_at_login::transit_kex_pair_for(&*t.c.dir, &t.a.key.key_id)
-            .await
-            .expect("the directory answers");
-    let c_record = t.c.key.record().await;
-    let request = first_contact_request(&t.c.key.key_id, &t.a.key.key_id, &c_record);
-    let sent = t.c.transport.send(&t.a.key.key_id, &request).await;
-    if pair.is_none() {
-        eprintln!(
-            "BLOCKER (CLM-first-contact-seal-key-bound): a fresh device holding only the baked \
-             bundle and the owner node's announce cannot resolve the owner node's transit pair \
-             as Rooted, so it cannot open a sealed first contact"
-        );
-        match sent {
-            Err(TransportError::LinkSealRefused { reason, .. }) => {
-                assert_eq!(reason, "link_seal_refused_no_pair");
-            }
-            other => panic!("with no Rooted pair the dial must be refused by name: {other:?}"),
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(t.a.seal("link_seal_accepted"), 0, "no link was made");
-        return;
-    }
-    sent.expect("C -> A, sealed first contact");
-    assert!(
-        wait_until(Duration::from_secs(30), || async {
-            t.a.received(&request).await
-        })
-        .await,
-        "A delivered the fresh device's first contact: {:?}",
-        t.a.metrics.link_seal()
-    );
-    assert!(t.a.seal("link_seal_accepted") >= 1);
-}
+// The fresh device that holds only a v4 bundle and reaches its owner's node
+// in two hops (sealed to the bundle-seeded canonical, the owner node's route
+// replicated from it, then a sealed first contact) is
+// `sealed_cut_bundle_e1::a_fresh_device_reaches_its_owners_node_through_a_bundle_seeded_canonical_e1`:
+// the test anchor it arms is process-wide, so it runs in that binary.
 
 // ─── CC 3.2 adding-a-device (f): the pairing-pinned transit pair ─────
 
@@ -892,7 +847,7 @@ async fn arrival_link(node: &Node, bytes: &[u8]) -> ciris_edge::transport::Reply
 
 /// **CLM-pairing-payload-transit-pin (CC 3.2 adding-a-device (f)); CC
 /// 5.3.3.5 E1** — a fresh device that holds no Rooted route for its owner's
-/// node (the BLOCKER the bundle-only witness records) seals its first contact
+/// node (no bundle row and no replicated route yet) seals its first contact
 /// with the pair the owner's pairing payload pins: the handshake is the first
 /// frame, every frame after it is sealed, A answers it unattributed under
 /// CC 3.2 (e)'s key-bound rules, and A's `OpaqueResponse` comes back on that
@@ -1178,4 +1133,154 @@ async fn a_known_peer_whose_binding_lands_after_its_identify_is_not_first_contac
         );
     }
     assert_eq!(t.a.seal("link_seal_refused_first_contact_only"), 0);
+}
+
+// ─── v43 InvalidProof triage: a peer binding whose key is not the
+// destination's. CIRISServer's canonical boot prime stored the canonical's
+// FEDERATION Ed25519 (`inject_rooted_peer_for_test`, no X25519 half) at its
+// NAMED destination; a joiner that kept that key failed every dial with
+// leviculum's `InvalidProof`, and nothing healed it. ─────────────────────
+
+/// B's binding for A as the Server's canonical prime wrote it: A's named
+/// destination, A's federation key.
+async fn prime_federation_key(t: &Trio) -> [u8; 16] {
+    let dest = t.a.transport.local_named_dest_hash();
+    let fed: [u8; 32] = t.a.key.ed_pub.clone().try_into().expect("32-byte ed25519");
+    t.b.transport
+        .inject_rooted_peer_for_test(&t.a.key.key_id, dest, fed)
+        .await;
+    dest
+}
+
+/// **(a)** A's own announce heals the federation key B holds at A's named
+/// destination (only A's transport identity reproduces it), trust kept; B's
+/// dial then proves with the binding alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owners_announce_heals_a_primed_federation_key_and_the_dial_proves() {
+    let t = trio("keyheal", true, false, false).await;
+    // The binding alone: leviculum's announce-learned key (b) stays out.
+    t.b.transport.binding_key_only_for_test(true);
+    prime_federation_key(&t).await;
+    let healed = wait_until(Duration::from_secs(30), || async {
+        t.b.binding("peer_binding_transport_key_healed") >= 1
+    })
+    .await;
+    assert!(
+        healed,
+        "A's announce healed the key: {:?}",
+        t.b.metrics.peer_binding()
+    );
+    let row = marked(b"KEY-HEALED-ROW-", 600);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B -> A on the healed binding");
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "A delivered B's frame"
+    );
+    assert_eq!(t.b.binding("peer_binding_link_proof_refused"), 0);
+    assert_eq!(t.b.binding("peer_binding_dial_key_from_announce"), 0);
+}
+
+/// **(b)** No announce has healed B's binding yet (A is silent), but B's
+/// leviculum holds A's announce-learned identity, which reproduces A's
+/// destination: the dial proves with that key, named and counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dial_proves_with_the_announce_learned_key_over_a_wrong_binding() {
+    let t = trio("dialkey", true, false, false).await;
+    t.a.transport.set_unannounced_for_test(true);
+    prime_federation_key(&t).await;
+    let row = marked(b"DIAL-KEY-ROW-", 600);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B -> A with the announce-learned key");
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "A delivered B's frame"
+    );
+    assert!(
+        t.b.binding("peer_binding_dial_key_from_announce") >= 1,
+        "{:?}",
+        t.b.metrics.peer_binding()
+    );
+    assert_eq!(t.b.binding("peer_binding_link_proof_refused"), 0);
+}
+
+/// **(c)** A dial whose proof does not verify against the binding is the
+/// named `LinkProofRefused`, counted, never a 30 s `Timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proof_that_fails_against_the_binding_is_named_not_a_timeout() {
+    let t = trio("proofref", true, false, false).await;
+    t.a.transport.set_unannounced_for_test(true);
+    t.b.transport.binding_key_only_for_test(true);
+    let dest = prime_federation_key(&t).await;
+    let started = std::time::Instant::now();
+    match t.b.transport.send(&t.a.key.key_id, b"never-proved").await {
+        Err(TransportError::LinkProofRefused {
+            key_id,
+            target_dest,
+        }) => {
+            assert_eq!(key_id, t.a.key.key_id);
+            assert_eq!(target_dest, hex::encode(dest));
+        }
+        other => panic!("a refused proof must be named: {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "named at once, not at a timeout"
+    );
+    assert!(t.b.binding("peer_binding_link_proof_refused") >= 1);
+}
+
+/// **(d)** `prime_peer` takes the full transport identity and refuses one
+/// that does not reproduce the destination (the federation key, or another
+/// node's identity); A's own identity primes, and B's dial proves with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prime_peer_refuses_a_key_that_is_not_the_destinations_e1() {
+    let t = trio("primepeer", true, false, false).await;
+    t.a.transport.set_unannounced_for_test(true);
+    t.b.transport.binding_key_only_for_test(true);
+    let dest = prime_federation_key(&t).await;
+    let mut fed64 = [0u8; 64];
+    fed64[32..].copy_from_slice(&t.a.key.ed_pub);
+    for wrong in [fed64, t.c.transport.local_transport_pubkey()] {
+        assert!(
+            matches!(
+                t.b.transport.prime_peer(&t.a.key.key_id, dest, wrong).await,
+                Err(TransportError::Config(_))
+            ),
+            "a key that is not the destination's is refused"
+        );
+    }
+    assert_eq!(t.b.binding("peer_binding_prime_refused"), 2);
+    t.b.transport
+        .prime_peer(
+            &t.a.key.key_id,
+            dest,
+            t.a.transport.local_transport_pubkey(),
+        )
+        .await
+        .expect("A's own transport identity primes");
+    assert_eq!(t.b.binding("peer_binding_primed"), 1);
+    let row = marked(b"PRIMED-ROW-", 600);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B -> A on the primed binding");
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "A delivered B's frame"
+    );
+    assert_eq!(t.b.binding("peer_binding_link_proof_refused"), 0);
 }
