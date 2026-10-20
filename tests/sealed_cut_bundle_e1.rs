@@ -539,6 +539,7 @@ fn first_contact_request(
 
 /// The two-hop witness's knobs: `seed_canonical_row` puts the canonical's
 /// route in the v4 bundle (the fail-before drops it).
+#[allow(clippy::too_many_lines)] // one witness, hop by hop
 async fn two_hops(seed_canonical_row: bool) {
     let _serial = SERIAL.lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -695,8 +696,7 @@ async fn two_hops(seed_canonical_row: bool) {
     let held_routes = c_dir
         .list_signed_transport_destinations_for(&o.key_id)
         .await
-        .map(|v| v.len())
-        .unwrap_or(0);
+        .map_or(0, |v| v.len());
     let held_key = FederationDirectory::lookup_public_key(&*c_dir, &o.key_id)
         .await
         .ok()
