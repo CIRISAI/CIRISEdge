@@ -361,3 +361,26 @@ fn request_and_response_lanes_ride_as_one_msgpack_bin_e1() {
         Inbound::Refuse(SealRefusal::OpenFailed)
     ));
 }
+
+#[test]
+fn the_identity_hold_is_bounded_and_replays_in_order_e1() {
+    let b = seals(0x22, DIALLED);
+    assert!(b.hold(LINK, false, b"one".to_vec()));
+    assert!(b.hold(LINK, true, b"two".to_vec()));
+    assert!(
+        !b.hold(LINK, false, vec![0; HELD_BYTES_MAX]),
+        "a frame past the byte bound does not fit"
+    );
+    assert_eq!(
+        b.take_held(LINK),
+        vec![(false, b"one".to_vec()), (true, b"two".to_vec())],
+        "oldest first"
+    );
+    assert!(b.take_held(LINK).is_empty(), "taken once");
+    for _ in 0..HELD_FRAMES_MAX {
+        assert!(b.hold(LINK, false, b"x".to_vec()));
+    }
+    assert!(!b.hold(LINK, false, b"x".to_vec()), "past the frame bound");
+    b.forget(&LINK);
+    assert!(b.take_held(LINK).is_empty(), "a closed link holds nothing");
+}

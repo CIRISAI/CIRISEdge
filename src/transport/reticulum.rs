@@ -2368,6 +2368,9 @@ pub struct ReticulumTransport {
     /// binding, so a peer it dials cannot attribute the link. `false` in
     /// production.
     test_unannounced: Arc<std::sync::atomic::AtomicBool>,
+    /// CC 5.3.3.5 E1 test seam — the next identity dial identifies its link
+    /// only after its first sealed frames have gone out. `false` in production.
+    test_identify_last: Arc<std::sync::atomic::AtomicBool>,
     /// The node's single `NodeEvent` receiver. `listen` takes it
     /// exactly once; a second `listen` call is a config error.
     /// Leviculum PR #9 switched this to an unbounded channel so node
@@ -3021,6 +3024,7 @@ impl ReticulumTransport {
             own_key_id: self.occurrence_key_id().to_owned(),
             handshake_override: Arc::clone(&self.handshake_override),
             test_unannounced: Arc::clone(&self.test_unannounced),
+            test_identify_last: Arc::clone(&self.test_identify_last),
         }
     }
 
@@ -3658,6 +3662,7 @@ impl ReticulumTransport {
             seals,
             handshake_override: Arc::new(std::sync::Mutex::new(None)),
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             established_links: Arc::new(Mutex::new(HashSet::new())),
@@ -5445,6 +5450,15 @@ impl ReticulumTransport {
     #[doc(hidden)]
     pub fn link_is_pinned_for_test(&self, link: [u8; 16]) -> bool {
         self.seals.is_pinned(link)
+    }
+
+    /// CC 5.3.3.5 E1 test seam — the next identity dial sends its LINKIDENTIFY
+    /// only after its handshake, announce and first frames: what leviculum's
+    /// separate carriage of the identify can do on a busy node.
+    #[doc(hidden)]
+    pub fn identify_last_for_test(&self) {
+        self.test_identify_last
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// CC 5.3.3.5 E1 test seam — whether `link` carries transit keys.
@@ -9667,6 +9681,8 @@ struct DialCtx {
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_unannounced`.
     test_unannounced: Arc<std::sync::atomic::AtomicBool>,
+    /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_identify_last`.
+    test_identify_last: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DialCtx {
@@ -10213,10 +10229,24 @@ impl DialCtx {
         // first. A failure here means the responder cannot attribute the frame,
         // so fail the send (the durable dispatcher retries) rather than ship an
         // unattributable resource that will be silently dropped.
-        self.node
-            .identify_link(&link_id, &self.local_identity)
-            .await
-            .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
+        if self
+            .test_identify_last
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            // Test seam: the identify lands AFTER the sealed frames that
+            // follow it, the reordering leviculum's separate carriage allows.
+            let node = Arc::clone(&self.node);
+            let identity = self.local_identity.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let _ = node.identify_link(&link_id, &identity).await;
+            });
+        } else {
+            self.node
+                .identify_link(&link_id, &self.local_identity)
+                .await
+                .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
+        }
         // CC 5.3.3.5 E1 — the transit KEX is the link's first frame; every
         // frame below rides sealed.
         self.key_link(link_id, destination_key_id, pair, claim)
@@ -11807,6 +11837,78 @@ fn select_reply_link(
         .map(|(id, _, _)| id)
 }
 
+/// CC 5.3.3.5 E1 — one OPENED frame (`is_resource`: it came as a Resource,
+/// else on the Channel), routed now, or HELD while the peer-dialled link's
+/// remote identity is unproven. The dialler identifies its link before it
+/// keys it, but leviculum carries the identify apart from the Channel, so its
+/// first sealed frames can arrive first; routed then, its on-link announce is
+/// dropped (`announce_frame_link_unidentified`) and the next frame meets an
+/// "unattributed" link the first-contact carve-out refuses and closes. Held
+/// frames replay in order once the identity is proven (here, on the link's
+/// next frame, or at `LinkIdentified`), so the announce binds first and
+/// attribution and the carve-out judge the link as it is.
+async fn route_opened(ctx: &EventCtx<'_>, link_id: LinkId, is_resource: bool, data: Vec<u8>) {
+    let we_dialled = ctx.dialed_link_dest.lock().await.contains_key(&link_id);
+    if !we_dialled {
+        if ctx.node.get_remote_identity(&link_id).is_none() {
+            if !ctx.seals.hold(link_id.into_bytes(), is_resource, data) {
+                if let Some(m) = ctx.metrics {
+                    m.inc_link_seal(crate::observability::LINK_SEAL_DROPPED_HELD_OVERFLOW);
+                }
+                drop_inbound(
+                    Some(link_id),
+                    crate::observability::LINK_SEAL_DROPPED_HELD_OVERFLOW,
+                    "a frame on a link whose identity is not proven yet did not fit the \
+                     bounded hold; dropped, the link kept (CC 5.3.3.5 E1)",
+                );
+            }
+            return;
+        }
+        replay_held(ctx, link_id).await;
+    }
+    route_now(ctx, link_id, is_resource, data).await;
+}
+
+/// CC 5.3.3.5 E1 — route every frame held for `link_id`, oldest first.
+async fn replay_held(ctx: &EventCtx<'_>, link_id: LinkId) {
+    for (is_resource, data) in ctx.seals.take_held(link_id.into_bytes()) {
+        route_now(ctx, link_id, is_resource, data).await;
+    }
+}
+
+/// Route one opened frame by its link's PLANE (CIRISEdge#805): picked once,
+/// before anything reads the bytes. An A/V link's Channel frame goes to the
+/// A/V sink and nowhere else, every other link's frame to the envelope path;
+/// a Resource on an A/V link (A/V rides the Channel only) is neither.
+async fn route_now(ctx: &EventCtx<'_>, link_id: LinkId, is_resource: bool, data: Vec<u8>) {
+    let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
+    match plane.route() {
+        InboundPlaneRoute::Envelope(plane) => {
+            tracing::debug!(
+                link = ?link_id,
+                bytes = data.len(),
+                is_resource,
+                "inbound link frame received (CIRISEdge#353 ask #2)",
+            );
+            attribute_and_deliver(ctx, link_id, dest, plane, data).await;
+        }
+        InboundPlaneRoute::Av if !is_resource => {
+            deliver_av_frame(ctx, link_id, dest, Some(data)).await;
+        }
+        InboundPlaneRoute::Av => {
+            if let Some(m) = ctx.metrics {
+                m.inc_av_plane(crate::observability::AV_INBOUND_DROPPED_RESOURCE);
+            }
+            drop_inbound(
+                Some(link_id),
+                crate::observability::AV_INBOUND_DROPPED_RESOURCE,
+                "a Resource completed on an A/V link — A/V rides the link Channel only; not \
+                 routed to replication nor to the A/V sink (CIRISEdge#805)",
+            );
+        }
+    }
+}
+
 /// CC 5.3.3.5 E1 — record a link a PEER dialled as awaiting its handshake
 /// (once), and start its budget: no complete handshake within
 /// [`HANDSHAKE_BUDGET`](crate::transport::av_transit_handshake::HANDSHAKE_BUDGET)
@@ -12254,6 +12356,14 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                     }
                 }
             }
+            // CC 5.3.3.5 E1 — the identity is proven: replay, in order, the
+            // opened frames that arrived before it (`route_opened`). A link the
+            // claim check just refused delivers none of them.
+            if ctx.seals.is_sealed(link_id.into_bytes()) {
+                replay_held(ctx, link_id).await;
+            } else {
+                let _ = ctx.seals.take_held(link_id.into_bytes());
+            }
         }
         // leviculum#25 (v0.9.3+ciris.1) — the driver DESTROYED frames because
         // their interface died: it cannot re-home them (a frame is bound to its
@@ -12544,26 +12654,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 // does not deliver (a refusal also closes the link).
                 return;
             };
-            let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
-            match plane.route() {
-                InboundPlaneRoute::Envelope(plane) => {
-                    attribute_and_deliver(ctx, link_id, dest, plane, data).await;
-                }
-                // CIRISEdge#805 — A/V rides the Channel only (the link refuses
-                // Resources at the advertisement); a Resource that completed on
-                // an A/V link anyway is neither an envelope nor a chunk.
-                InboundPlaneRoute::Av => {
-                    if let Some(m) = ctx.metrics {
-                        m.inc_av_plane(crate::observability::AV_INBOUND_DROPPED_RESOURCE);
-                    }
-                    drop_inbound(
-                        Some(link_id),
-                        crate::observability::AV_INBOUND_DROPPED_RESOURCE,
-                        "a Resource completed on an A/V link — A/V rides the link Channel \
-                         only; not routed to replication nor to the A/V sink (CIRISEdge#805)",
-                    );
-                }
-            }
+            route_opened(ctx, link_id, true, data).await;
         }
         // CIRISEdge#353 ask #2 / #363 — a reverse-path reply that arrived as a
         // link PACKET (a link-Channel send, `LinkHandle::try_send` since
@@ -12611,21 +12702,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                 // closes the link).
                 return;
             };
-            // CIRISEdge#805 — the link's PLANE picks the route, once, before
-            // anything reads the bytes: an A/V link's frame goes to the A/V
-            // sink and nowhere else; every other link's to the envelope path.
-            let (dest, plane) = resolve_inbound_link(ctx, &link_id).await;
-            match plane.route() {
-                InboundPlaneRoute::Envelope(plane) => {
-                    tracing::debug!(
-                        link = ?link_id,
-                        bytes = data.len(),
-                        "inbound link packet received (reverse-path reply, CIRISEdge#353 ask #2)",
-                    );
-                    attribute_and_deliver(ctx, link_id, dest, plane, data).await;
-                }
-                InboundPlaneRoute::Av => deliver_av_frame(ctx, link_id, dest, Some(data)).await,
-            }
+            route_opened(ctx, link_id, false, data).await;
         }
         NodeEvent::LinkClosed {
             link_id, reason, ..

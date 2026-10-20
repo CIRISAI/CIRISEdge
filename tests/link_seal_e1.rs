@@ -1093,3 +1093,44 @@ async fn a_pinned_pair_that_is_not_the_nodes_responder_keys_is_refused_e1() {
         other => panic!("a malformed pin must be refused by name: {other:?}"),
     }
 }
+
+/// **CC 5.3.3.5 E1** — a dialler's sealed frames can reach the responder
+/// before leviculum has processed the link's identify (the two ride apart; the
+/// release CI's `inbound_reap_853` and `opaque_conformance` caught it). Judged
+/// then, the link reads as unattributed: the on-link announce cannot bind it
+/// and the first-contact carve-out refuses the next frame and closes it. The
+/// responder HOLDS opened frames until the identity is proven and replays
+/// them in order, so the announce binds first and the frame is delivered,
+/// attributed. Here B sends its identify only after its first frames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn frames_that_beat_the_identify_are_held_and_delivered_e1() {
+    let t = trio("idlast", true, false, false).await;
+    t.b.transport.identify_last_for_test();
+    let row = marked(b"E1-EARLY-ROW-", 2_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B -> A, identify last");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "A delivered the frame that beat the identify: {:?}",
+        t.a.metrics.link_seal()
+    );
+    {
+        let seen = t.a.seen.lock().await;
+        let f = seen
+            .iter()
+            .find(|f| f.envelope_bytes == row)
+            .expect("the row");
+        assert_eq!(
+            f.link_key_id.as_deref(),
+            Some(t.b.key.key_id.as_str()),
+            "attributed to B once its identity is proven"
+        );
+    }
+    assert_eq!(t.a.seal("link_seal_refused_first_contact_only"), 0);
+    assert_eq!(t.a.seal("link_seal_dropped_held_overflow"), 0);
+}

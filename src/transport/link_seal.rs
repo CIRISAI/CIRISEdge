@@ -114,6 +114,20 @@ const TAP_CAP: usize = 4096;
 /// The test wire tap: `(link, frame as sent)`, oldest first.
 type WireTap = Vec<([u8; 16], Vec<u8>)>;
 
+/// Most opened frames held on one link while its identity is unproven.
+pub const HELD_FRAMES_MAX: usize = 32;
+
+/// Most opened bytes held on one link while its identity is unproven.
+pub const HELD_BYTES_MAX: usize = 256 * 1024;
+
+/// Opened frames waiting for their link's identity: `(is_resource, plaintext)`
+/// in arrival order, and their total size.
+#[derive(Debug, Default)]
+struct Held {
+    frames: Vec<(bool, Vec<u8>)>,
+    bytes: usize,
+}
+
 /// Which of a link's carriers a frame rides. Each has its own counter and
 /// replay window, because they are not ordered with each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,6 +449,9 @@ pub struct LinkSeals {
     resolver: PeerTransitResolver,
     /// Test seam: every frame handed to leviculum on any link, as sent.
     tap: Mutex<Option<WireTap>>,
+    /// Opened frames on peer-dialled links whose identity is not yet proven
+    /// ([`Self::hold`]).
+    held: Mutex<HashMap<[u8; 16], Held>>,
 }
 
 impl std::fmt::Debug for LinkSeals {
@@ -457,6 +474,7 @@ impl LinkSeals {
             local_key_id: local_key_id.into(),
             resolver: PeerTransitResolver::new(),
             tap: Mutex::new(None),
+            held: Mutex::new(HashMap::new()),
         }
     }
 
@@ -778,9 +796,46 @@ impl LinkSeals {
         self.links().insert(link, State::Refused);
     }
 
-    /// Forget a closed link.
+    /// Forget a closed link (its keys and anything held for it).
     pub fn forget(&self, link: &[u8; 16]) {
         self.links().remove(link);
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(link);
+    }
+
+    /// Hold one OPENED frame on a link a peer dialled whose remote identity
+    /// leviculum has not proven yet. The dialler identifies the link before it
+    /// keys it, but the identify and the Channel ride separately, so its first
+    /// sealed frames (its on-link announce, then data) can reach this end
+    /// first; judged then, the link would read as unattributed and the
+    /// first-contact carve-out would refuse a frame that is not. Held frames
+    /// are replayed in order once the identity is proven ([`Self::take_held`]).
+    /// Bounded by [`HELD_FRAMES_MAX`] / [`HELD_BYTES_MAX`] per link: `false`
+    /// when this frame does not fit (the caller drops it by name).
+    pub fn hold(&self, link: [u8; 16], is_resource: bool, plaintext: Vec<u8>) -> bool {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let h = held.entry(link).or_default();
+        if h.frames.len() >= HELD_FRAMES_MAX || h.bytes + plaintext.len() > HELD_BYTES_MAX {
+            return false;
+        }
+        h.bytes += plaintext.len();
+        h.frames.push((is_resource, plaintext));
+        true
+    }
+
+    /// Everything held for `link`, oldest first, and nothing held after.
+    pub fn take_held(&self, link: [u8; 16]) -> Vec<(bool, Vec<u8>)> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&link)
+            .map(|h| h.frames)
+            .unwrap_or_default()
     }
 
     /// Test seam: start (or stop and clear) recording every frame handed to
