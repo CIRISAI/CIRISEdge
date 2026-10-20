@@ -785,59 +785,11 @@ async fn a_matching_code_is_derived_from_the_handshake_initiator_key_e1() {
     ));
 }
 
-/// **CLM-first-contact-seal-key-bound (CC 3.2 adding-a-device (e)) / CC 5.3.3.5
-/// E1** — a fresh device that
-/// holds only the baked trust bundle plus the owner node's announce must
-/// resolve the owner node's transit pair as ROOTED (persist's
-/// `transit_kex_pair_for`, never weakened) before it can dial, and then
-/// complete a sealed first contact.
-///
-/// The test records what is true at this pin. If the pair does not resolve,
-/// it asserts the consequence (the dial is refused `link_seal_refused_no_pair`
-/// and never made) and prints `BLOCKER`: the bundle carries no signed
-/// transport destination and an announce carries no transit pair, so the
-/// fresh device has no Rooted source for it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fresh_device_roots_the_owner_nodes_transit_pair_from_bundle_and_announce_e1() {
-    let t = trio("fresh", true, true, true).await;
-    assert!(
-        t.c.transport.knows_peer(&t.a.key.key_id).await,
-        "the fresh device heard the owner node's announce"
-    );
-    let pair =
-        ciris_persist::federation::self_at_login::transit_kex_pair_for(&*t.c.dir, &t.a.key.key_id)
-            .await
-            .expect("the directory answers");
-    let c_record = t.c.key.record().await;
-    let request = first_contact_request(&t.c.key.key_id, &t.a.key.key_id, &c_record);
-    let sent = t.c.transport.send(&t.a.key.key_id, &request).await;
-    if pair.is_none() {
-        eprintln!(
-            "BLOCKER (CLM-first-contact-seal-key-bound): a fresh device holding only the baked \
-             bundle and the owner node's announce cannot resolve the owner node's transit pair \
-             as Rooted, so it cannot open a sealed first contact"
-        );
-        match sent {
-            Err(TransportError::LinkSealRefused { reason, .. }) => {
-                assert_eq!(reason, "link_seal_refused_no_pair");
-            }
-            other => panic!("with no Rooted pair the dial must be refused by name: {other:?}"),
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(t.a.seal("link_seal_accepted"), 0, "no link was made");
-        return;
-    }
-    sent.expect("C -> A, sealed first contact");
-    assert!(
-        wait_until(Duration::from_secs(30), || async {
-            t.a.received(&request).await
-        })
-        .await,
-        "A delivered the fresh device's first contact: {:?}",
-        t.a.metrics.link_seal()
-    );
-    assert!(t.a.seal("link_seal_accepted") >= 1);
-}
+// The fresh device that holds only a v4 bundle and reaches its owner's node
+// in two hops (sealed to the bundle-seeded canonical, the owner node's route
+// replicated from it, then a sealed first contact) is
+// `sealed_cut_bundle_e1::a_fresh_device_reaches_its_owners_node_through_a_bundle_seeded_canonical_e1`:
+// the test anchor it arms is process-wide, so it runs in that binary.
 
 // ─── CC 3.2 adding-a-device (f): the pairing-pinned transit pair ─────
 
@@ -892,7 +844,7 @@ async fn arrival_link(node: &Node, bytes: &[u8]) -> ciris_edge::transport::Reply
 
 /// **CLM-pairing-payload-transit-pin (CC 3.2 adding-a-device (f)); CC
 /// 5.3.3.5 E1** — a fresh device that holds no Rooted route for its owner's
-/// node (the BLOCKER the bundle-only witness records) seals its first contact
+/// node (no bundle row and no replicated route yet) seals its first contact
 /// with the pair the owner's pairing payload pins: the handshake is the first
 /// frame, every frame after it is sealed, A answers it unattributed under
 /// CC 3.2 (e)'s key-bound rules, and A's `OpaqueResponse` comes back on that
