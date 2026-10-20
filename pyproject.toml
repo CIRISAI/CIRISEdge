@@ -104,7 +104,7 @@ classifiers = [
 # v56.0.0 (CIRISPersist#1001/#1077/#1089) moves none of the four (and
 # DIRECTORY_ABI_VERSION stays 7); the floor moves with the MAJOR.
 dependencies = [
-    "ciris-persist>=58,<59",
+    "ciris-persist>=59,<60",
 ]
 dynamic = ["version"]
 
