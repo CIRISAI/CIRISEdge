@@ -1,5 +1,18 @@
 # CIRISEdge Release Notes
 
+# v43.1.1 — evidence rows name the implementing src symbol
+
+**2026-10-20.** **PATCH** from v43.1.0. No code change outside the evidence manifest.
+
+- **Evidence rows name the implementing `src/` symbol; tests are witnesses** (CIRISEdge#410 §3,
+  CIRISConformance `test_583_field_conformance_manifest.py`). v43.1.0's test-evidenced rows
+  (`EDGE_CC_TEST_EVIDENCE`) named `tests/…#test`, which test_583 refuses. Each row now carries the
+  function or type that enforces its claim (`impl_anchor`, the one emitted into
+  `evidence/CIRISEdge.cc_impl.tsv`) and its witness tests (`witness`, recorded in Rust, not
+  emitted), one row per (claim, implementing symbol). New guards: every impl anchor is a `src/`
+  item that exists (`every_evidence_impl_anchor_names_a_src_symbol`), and every emitted row passes
+  test_583's shape rule (`every_emitted_evidence_row_names_a_src_symbol_583`).
+
 # v43.1.0 — A/V calls: the host call API on the sealed transport
 
 **2026-10-20.** **MINOR** from v43.0.0. Additive API on the v43 sealed transport. **Persist v59.0.0 → v59.1.0**
