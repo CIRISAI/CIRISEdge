@@ -905,6 +905,17 @@ pub const AV_RELAY_DIALLER_REFUSED: &str = "av_relay_dialler_refused";
 /// CIRISEdge#805 item 8, cut 2 — a subscriber that dialled this relay was
 /// entitled and admitted to its fan-out.
 pub const AV_RELAY_DIALLER_ADMITTED: &str = "av_relay_dialler_admitted";
+/// CIRISEdge#805 item 5 — a call frame that did not open (outer or inner),
+/// dropped; the call carries on.
+pub const AV_CALL_FRAME_UNOPENED: &str = "av_call_frame_unopened";
+/// CIRISEdge#805 item 5 — a call frame for a `(stream, epoch)` this node holds
+/// no key for (an epoch it was never in, or one long gone): dropped.
+pub const AV_CALL_FRAME_NO_KEY: &str = "av_call_frame_no_key";
+/// CIRISEdge#805 item 5 — a call frame this node relayed to a member.
+pub const AV_CALL_RELAYED: &str = "av_call_relayed";
+/// CIRISEdge#805 item 6 — this attendee's call row was refused; the call
+/// stays live.
+pub const AV_CALL_RECORD_REFUSED: &str = "av_call_record_refused";
 // ─── CC 5.3.3.5 E1 — `EdgeMetrics::link_seal` labels ─────────────────
 //
 // Every RNS link carries the CC 3.3.6.2 hybrid transit KEX as its first frame

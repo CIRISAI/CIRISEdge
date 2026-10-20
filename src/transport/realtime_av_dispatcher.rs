@@ -52,7 +52,7 @@ use tokio::sync::mpsc;
 
 use super::realtime_av::{
     open_av_chunk, open_av_outer, seal_av_outer, ChunkSeq, Epoch, EpochDek, InnerSealed,
-    SealedAvChunk, StreamId,
+    ReceiverLayerPolicy, SealedAvChunk, StreamId,
 };
 
 /// Federation-key identifier for a subscriber — the same identifier
@@ -480,6 +480,22 @@ struct OutboundState {
     link_id: Vec<u8>,
     next_link_seq: u64,
     sender: Box<dyn AvLinkSender>,
+    /// CIRISEdge#805 item 5 — the subscriber's layer cap: a chunk above it is
+    /// not sent on this leg (and consumes no counter).
+    policy: ReceiverLayerPolicy,
+}
+
+/// CIRISEdge#805 item 5 — what one fan-out did on one downstream leg.
+#[derive(Debug)]
+pub enum LegSend {
+    /// The link's Channel accepted the frame.
+    Sent,
+    /// The chunk's layer is above this subscriber's policy: not sent.
+    FilteredByPolicy,
+    /// The link was gone; the subscriber was pruned.
+    Gone,
+    /// The send failed (`Congested`, `ChunkTooLarge`, or a send error).
+    Failed(AvDispatcherError),
 }
 
 /// Wire-driver for realtime A/V publisher / relay / subscriber paths.
@@ -568,6 +584,7 @@ impl AvDispatcher {
                     link_id: link.link_id,
                     next_link_seq: 0,
                     sender: link.outbound_send,
+                    policy: ReceiverLayerPolicy::UNCAPPED,
                 },
             );
         }
@@ -685,14 +702,89 @@ impl AvDispatcher {
     /// relay paths. Visits every downstream subscriber, seals with its
     /// per-link state, advances its `link_seq`, and sends.
     async fn fan_out(&mut self, inner: &InnerSealed) -> Result<(), AvDispatcherError> {
+        let mut first_err: Option<AvDispatcherError> = None;
+        for (_, leg) in self.fan_out_report(inner, &[]).await? {
+            if let LegSend::Failed(e) = leg {
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    }
+
+    /// CIRISEdge#805 item 5 — [`Self::publish_inner`], reporting what
+    /// happened on EVERY downstream leg (a `Call`'s `PublishReport`).
+    ///
+    /// # Errors
+    /// [`AvDispatcherError::ForwardFailed`] when the outer seal itself fails.
+    pub async fn publish_inner_report(
+        &mut self,
+        inner: &InnerSealed,
+    ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
+        self.fan_out_report(inner, &[]).await
+    }
+
+    /// CIRISEdge#805 item 5 — fan a chunk this node RELAYS out to every
+    /// downstream leg except `except` (the publisher it came from), with the
+    /// per-leg report. The inner layer is never opened here.
+    ///
+    /// # Errors
+    /// As [`Self::publish_inner_report`].
+    pub async fn relay_inner_report(
+        &mut self,
+        inner: &InnerSealed,
+        except: &[PeerKeyId],
+    ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
+        self.fan_out_report(inner, except).await
+    }
+
+    /// CIRISEdge#805 item 5 — cap `subscriber`'s leg at `policy`: chunks
+    /// whose layer is above it are not sent to it (the relay-side layer
+    /// policy). Returns whether the subscriber is on the roster.
+    pub fn set_layer_policy(
+        &mut self,
+        subscriber: &PeerKeyId,
+        policy: ReceiverLayerPolicy,
+    ) -> bool {
+        match self.subscribers.get_mut(subscriber) {
+            Some(state) => {
+                state.policy = policy;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `subscriber` has a downstream leg.
+    #[must_use]
+    pub fn has_subscriber(&self, subscriber: &PeerKeyId) -> bool {
+        self.subscribers.contains_key(subscriber)
+    }
+
+    /// The downstream subscribers' ids.
+    #[must_use]
+    pub fn subscriber_ids(&self) -> Vec<PeerKeyId> {
+        self.subscribers.keys().cloned().collect()
+    }
+
+    async fn fan_out_report(
+        &mut self,
+        inner: &InnerSealed,
+        except: &[PeerKeyId],
+    ) -> Result<Vec<(PeerKeyId, LegSend)>, AvDispatcherError> {
         // CIRISEdge#805 item 8 — EVERY subscriber is attempted. This
         // loop used to return on the first refusal, so one congested or closed
         // downstream link starved every subscriber after it in (random)
-        // HashMap order. The first error is still returned, after the loop;
-        // a subscriber whose link is GONE is pruned, not reported.
-        let mut first_err: Option<AvDispatcherError> = None;
+        // HashMap order. A subscriber whose link is GONE is pruned.
+        let mut report: Vec<(PeerKeyId, LegSend)> = Vec::with_capacity(self.subscribers.len());
         let mut gone: Vec<PeerKeyId> = Vec::new();
         for (subscriber, state) in &mut self.subscribers {
+            if except.contains(subscriber) {
+                continue;
+            }
+            if !state.policy.admits(inner.layer()) {
+                report.push((subscriber.clone(), LegSend::FilteredByPolicy));
+                continue;
+            }
             let link_seq = state.next_link_seq;
             let sealed = seal_av_outer(inner, &state.transit_key, &state.link_id, link_seq)
                 .map_err(|e| AvDispatcherError::ForwardFailed(e.to_string()))?;
@@ -706,8 +798,11 @@ impl AvDispatcher {
             // failed any other way is ambiguous (the bytes may be out), so
             // its counter is spent — a nonce that might have been emitted is
             // never used twice.
-            match state.sender.send(&sealed.to_bytes()).await {
-                Ok(()) => state.next_link_seq = state.next_link_seq.wrapping_add(1),
+            let leg = match state.sender.send(&sealed.to_bytes()).await {
+                Ok(()) => {
+                    state.next_link_seq = state.next_link_seq.wrapping_add(1);
+                    LegSend::Sent
+                }
                 Err(AvDispatcherError::LinkGone(why)) => {
                     tracing::info!(
                         subscriber = %subscriber,
@@ -715,20 +810,22 @@ impl AvDispatcher {
                         "AV fan-out: a subscriber's link is gone — pruned (CIRISEdge#805 item 8)"
                     );
                     gone.push(subscriber.clone());
+                    LegSend::Gone
                 }
                 Err(e @ (AvDispatcherError::Congested | AvDispatcherError::ChunkTooLarge(_))) => {
-                    first_err.get_or_insert(e);
+                    LegSend::Failed(e)
                 }
                 Err(e) => {
                     state.next_link_seq = state.next_link_seq.wrapping_add(1);
-                    first_err.get_or_insert(e);
+                    LegSend::Failed(e)
                 }
-            }
+            };
+            report.push((subscriber.clone(), leg));
         }
         for subscriber in &gone {
             self.subscribers.remove(subscriber);
         }
-        first_err.map_or(Ok(()), Err)
+        Ok(report)
     }
 
     /// Subscriber-side receive loop. Spawns an async task per inbound
@@ -874,6 +971,7 @@ impl AvDispatcher {
                 link_id: link.link_id,
                 next_link_seq,
                 sender: link.outbound_send,
+                policy: ReceiverLayerPolicy::UNCAPPED,
             },
         );
         Ok(())

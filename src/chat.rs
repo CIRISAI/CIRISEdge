@@ -136,6 +136,23 @@ pub const WELCOME_DIMENSION: &str = "chat:welcome:v1";
 /// peer adjudicates the same tuple.
 pub const COMMIT_DIMENSION: &str = "chat:commit:v1";
 
+/// CIRISEdge#805 item 6 — **a call is a CEG attestation whose data subjects
+/// are its attendees** (CIRISPersist#1095: the final name; `chat:*` is an
+/// open family in persist's vendored registry, so v57 admits it by pattern).
+///
+/// One row PER ATTENDEE: on joining, an attendee writes its OWN row, naming
+/// the call ([`FIELD_CALL_ID`]) and the room, with itself as attester and as
+/// the only subject (CC 2.4.1: a `supersedes` replaces only its own
+/// attester's row, so nobody rewrites another's). The attendee set is the
+/// UNION of the subjects over every row of the call, so concurrent joins are
+/// two rows, never a fork, and a leaver's row stands: it attended. Leaving
+/// writes nothing; erasure is the attendee withdrawing its OWN row (CC 1c),
+/// through the existing withdraws door.
+pub const CALL_DIMENSION: &str = "chat:call:v1";
+
+/// The call row member naming the call: the lowercase hex of its `CallId`.
+pub const FIELD_CALL_ID: &str = "call_id";
+
 /// The replication-consent prefix a grant MUST cover for chat to federate.
 ///
 /// Omit it and messages are authored, admitted locally, and never offered to
@@ -943,6 +960,39 @@ pub async fn chat_message_attestation_in(
     // persist: "a caller that ignores this is ignoring who cannot read what
     // it just wrote."
     Ok((row, sealed))
+}
+
+/// CIRISEdge#805 item 6 — **the attendee's own call row**: `author` attended
+/// call `call_id_hex` in room `community_key_id` from `asserted_at`. Authored
+/// `self` like every chat row and shared to the room by the caller (it
+/// reaches exactly the room's members); attester = subject = `author`.
+///
+/// # Errors
+/// Canonicalization or signing failure.
+pub async fn call_attestation_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    call_id_hex: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Attestation, String> {
+    let mut members = serde_json::Map::new();
+    members.insert(FIELD_CALL_ID.to_owned(), serde_json::json!(call_id_hex));
+    chat_row(
+        author,
+        community_key_id,
+        CALL_DIMENSION,
+        members,
+        asserted_at,
+    )
+    .await
+}
+
+/// The call a [`CALL_DIMENSION`] row names, if it names one.
+#[must_use]
+pub fn call_id_of(row: &Attestation) -> Option<&str> {
+    row.attestation_envelope
+        .get(FIELD_CALL_ID)
+        .and_then(serde_json::Value::as_str)
 }
 
 /// Step 1 of the handshake: the JOINER's KeyPackage for the room, as a row

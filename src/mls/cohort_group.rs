@@ -167,6 +167,18 @@ pub(crate) const CIPHERSUITE: Ciphersuite =
 // would put two owners on it. This module previously defined its own
 // `COHORT_SECRET_LABEL`; it was retired when verify settled the family.
 
+/// CIRISEdge#805 item 5 — `L`, the label of a stream's epoch DEK (CC 5.1, rc8,
+/// CIRISConstitution#169): ONE label serves as the room group's exporter label
+/// AND the HKDF info tag of `transport::av_call_key::stream_epoch_dek`. A
+/// `&str` because the MLS exporter takes one; the info tag is its bytes.
+/// Distinct from both scope-privacy labels and from the per-stream A/V DEK-seed
+/// label.
+///
+/// TODO(CIRISVerify#308): labels are CIRISVerify's. When verify lands its
+/// `stream_dek` fn and vectors, import the label (and the derivation) from
+/// there and run its KATs; that is what graduates the claim.
+pub const STREAM_DEK_LABEL: &str = "ciris-stream-dek/v1";
+
 /// Length of a [`CohortSecret`], in bytes.
 pub const COHORT_SECRET_LEN: usize = 32;
 
@@ -2136,6 +2148,22 @@ impl CohortGroup {
             .scope_secret(crate::scope_privacy::RECORD_EXPORTER_LABEL)
     }
 
+    /// CIRISEdge#805 item 5 — the room's STREAM key seed: the current epoch's
+    /// MLS exporter secret under [`STREAM_DEK_LABEL`] (with the same
+    /// empty exporter context every other cohort secret uses), and the epoch it
+    /// was exported at, read under ONE lock so the pair cannot straddle a
+    /// commit. Each stream's epoch DEK is derived from this seed
+    /// (`transport::av_call_key::stream_epoch_dek`); a room call never mints an
+    /// MLS group of its own.
+    ///
+    /// # Errors
+    /// [`CohortGroupError::ExportFailed`] on a corrupted group state.
+    pub async fn stream_key_seed(&self) -> Result<(u64, CohortSecret), CohortGroupError> {
+        let inner = self.inner.lock().await;
+        let seed = inner.scope_secret(STREAM_DEK_LABEL)?;
+        Ok((inner.epoch(), seed))
+    }
+
     /// Add a member from a KeyPackage that member published, advance
     /// the epoch, persist, and *then* return the wire artifacts.
     ///
@@ -2661,6 +2689,26 @@ impl CohortGroups {
             retained_epochs: retained_epochs.max(1),
             live: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// CIRISEdge#805 item 5 — [`Self::open`] without the create: `None` when
+    /// this node holds no state for `community_id` (it is not in the room). A
+    /// call must never stand up a fresh group for a room it was not admitted to.
+    pub async fn open_existing(
+        &self,
+        community_id: &str,
+    ) -> Result<Option<CohortGroup>, CohortGroupError> {
+        let mut live = self.live.lock().await;
+        if let Some(existing) = live.get(community_id) {
+            return Ok(Some(existing.clone()));
+        }
+        let Some(handle) =
+            CohortGroup::load(self.store.clone(), community_id, self.retained_epochs).await?
+        else {
+            return Ok(None);
+        };
+        live.insert(community_id.to_string(), handle.clone());
+        Ok(Some(handle))
     }
 
     /// Get the live handle for `community_id`, reloading it from the
