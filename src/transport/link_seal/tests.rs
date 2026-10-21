@@ -108,22 +108,76 @@ fn a_non_ctkx_first_frame_is_refused_and_the_link_stays_refused_e1() {
 }
 
 #[test]
-fn a_resource_before_the_handshake_is_dropped_e1() {
+fn a_resource_before_the_handshake_is_held_and_opens_once_keyed_e1() {
+    let a = seals(0x11, DIALLER);
     let b = seals(0x22, DIALLED);
-    b.begin_responder(LINK);
-    // Dropped, not refused: another event plane may overtake the handshake.
-    match b.open(LINK, Lane::Resource, b"anything") {
+    a.begin_initiator(LINK);
+    assert!(b.begin_responder(LINK));
+    let (frames, transit) = a
+        .initiate(LINK, DIALLER, DIALLED, b.secret().pair(), LIMIT)
+        .expect("initiate");
+    a.install_initiator(LINK, transit);
+    let (last, first) = frames.split_last().expect("a handshake");
+    for f in first {
+        assert!(matches!(
+            b.inbound(LINK, Lane::Channel, f, false),
+            Inbound::Pending
+        ));
+    }
+    // The dialler's Resource overtakes its last handshake part (another
+    // event plane): held sealed, not dropped.
+    let row = a.seal(LINK, Lane::Resource, b"resource row").expect("seal");
+    assert!(matches!(
+        b.open(LINK, Lane::Resource, &row),
+        Inbound::HeldBeforeKeys
+    ));
+    match b.inbound(LINK, Lane::Channel, last, false) {
+        Inbound::Keyed { claimed } => assert_eq!(claimed, DIALLER),
+        other => panic!("{other:?}"),
+    }
+    let held = b.take_before_keys(LINK);
+    assert_eq!(held, vec![row], "the held Resource, once, in order");
+    match b.open(LINK, Lane::Resource, &held[0]) {
+        Inbound::Open(p) => assert_eq!(p, b"resource row"),
+        other => panic!("{other:?}"),
+    }
+    assert!(b.take_before_keys(LINK).is_empty(), "nothing held after");
+
+    // Past the hold's bound: dropped by name.
+    let c = seals(0x33, DIALLED);
+    assert!(c.begin_responder(LINK));
+    let big = vec![0u8; HELD_BYTES_MAX + 1];
+    match c.open(LINK, Lane::Resource, &big) {
         Inbound::Drop(label) => {
             assert_eq!(label, crate::observability::LINK_SEAL_DROPPED_BEFORE_KEYS);
         }
         other => panic!("{other:?}"),
     }
+    // Other lanes before keys are still dropped (a request needs its
+    // request context to be answered).
+    match c.open(LINK, Lane::Request, b"anything") {
+        Inbound::Drop(label) => {
+            assert_eq!(label, crate::observability::LINK_SEAL_DROPPED_BEFORE_KEYS);
+        }
+        other => panic!("{other:?}"),
+    }
+    // A budget that runs out discards the hold.
+    assert!(matches!(
+        c.open(LINK, Lane::Resource, b"held"),
+        Inbound::HeldBeforeKeys
+    ));
+    assert!(c.expire(LINK));
+    assert!(
+        c.take_before_keys(LINK).is_empty(),
+        "the expired link holds nothing"
+    );
+
     // On a link this node dialled and has not keyed, the responder spoke
     // first: refused.
-    let a = seals(0x11, DIALLER);
-    a.begin_initiator(LINK);
+    let d = seals(0x11, DIALLER);
+    d.begin_initiator(LINK);
     assert!(matches!(
-        a.open(LINK, Lane::Resource, b"anything"),
+        d.open(LINK, Lane::Resource, b"anything"),
         Inbound::Refuse(SealRefusal::Unsealed)
     ));
 }

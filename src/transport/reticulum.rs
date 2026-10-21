@@ -464,6 +464,11 @@ pub enum HandshakeOverride {
     FirstFrame(Vec<u8>),
     /// Run the real handshake, but CLAIM this initiator id.
     Claim(String),
+    /// Run the real handshake, but hold its LAST part back until this link's
+    /// first Resource has completed: the responder sees that Resource while
+    /// it still awaits the handshake (the order a loaded event loop can
+    /// produce, since the two ride different event planes).
+    DeferLastPart,
 }
 
 /// CC 5.3.3.5 E1 — count, log and type one seal refusal (on `link_id`, or
@@ -2409,6 +2414,9 @@ pub struct ReticulumTransport {
     /// CC 5.3.3.5 E1 test seam — the next identity dial identifies its link
     /// only after its first sealed frames have gone out. `false` in production.
     test_identify_last: Arc<std::sync::atomic::AtomicBool>,
+    /// CC 5.3.3.5 E1 test seam ([`HandshakeOverride::DeferLastPart`]): the
+    /// handshake part held back per link, sent after its first Resource.
+    deferred_handshake_part: Arc<std::sync::Mutex<HashMap<LinkId, Vec<u8>>>>,
     /// Test seam — dials check the link proof against the binding's key
     /// alone, never leviculum's announce-learned one
     /// (`DialCtx::dial_signing_key`). `false` in production.
@@ -3067,6 +3075,7 @@ impl ReticulumTransport {
             handshake_override: Arc::clone(&self.handshake_override),
             test_unannounced: Arc::clone(&self.test_unannounced),
             test_identify_last: Arc::clone(&self.test_identify_last),
+            deferred_handshake_part: Arc::clone(&self.deferred_handshake_part),
             test_binding_key_only: Arc::clone(&self.test_binding_key_only),
         }
     }
@@ -3707,6 +3716,7 @@ impl ReticulumTransport {
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             av_call_router: std::sync::OnceLock::new(),
             test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_handshake_part: Arc::new(std::sync::Mutex::new(HashMap::new())),
             test_binding_key_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             events: Mutex::new(Some(events)),
             peers: Arc::new(Mutex::new(HashMap::new())),
@@ -8517,6 +8527,16 @@ impl ReticulumTransport {
                             // CIRISEdge#853 (Codex on #854) — a completed
                             // send is a use of the link.
                             note_outbound_use(&self.link_last_outbound_at, *link_id);
+                            // CC 5.3.3.5 E1 test seam (`DeferLastPart`): the
+                            // handshake's last part, after this Resource.
+                            let deferred = self
+                                .deferred_handshake_part
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(link_id);
+                            if let Some(part) = deferred {
+                                let _ = self.node.link_handle(link_id).send(&part).await;
+                            }
                             Ok(())
                         }
                         Err(CompletionError::LinkClosed { .. }) => {
@@ -9853,6 +9873,9 @@ struct DialCtx {
     test_unannounced: Arc<std::sync::atomic::AtomicBool>,
     /// CC 5.3.3.5 E1 test seam — see `ReticulumTransport::test_identify_last`.
     test_identify_last: Arc<std::sync::atomic::AtomicBool>,
+    /// CC 5.3.3.5 E1 test seam ([`HandshakeOverride::DeferLastPart`]): the
+    /// handshake part held back per link, sent after its first Resource.
+    deferred_handshake_part: Arc<std::sync::Mutex<HashMap<LinkId, Vec<u8>>>>,
     /// Test seam — see `ReticulumTransport::test_binding_key_only`.
     test_binding_key_only: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -10074,6 +10097,18 @@ impl DialCtx {
             // Test seam: a peer whose first frame is not a well-formed
             // hybrid handshake.
             Some(HandshakeOverride::FirstFrame(raw)) => vec![raw],
+            // Test seam: the last part goes out after the link's first
+            // Resource (`ship_resource_on_link`).
+            Some(HandshakeOverride::DeferLastPart) => {
+                let mut frames = frames;
+                if let Some(last) = frames.pop() {
+                    self.deferred_handshake_part
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(link_id, last);
+                }
+                frames
+            }
             _ => frames,
         };
         // Keys go in BEFORE the parts go out: the responder may answer (its
@@ -12412,6 +12447,16 @@ async fn seal_inbound(
         Inbound::Pending | Inbound::Closed => None,
         Inbound::Keyed { claimed } => {
             link_keyed(ctx, link_id, claimed).await;
+            replay_before_keys(ctx, link_id).await;
+            None
+        }
+        Inbound::HeldBeforeKeys => {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_seal(crate::observability::LINK_SEAL_HELD_BEFORE_KEYS);
+            }
+            // choke-ok: held, not dropped — opened and routed by
+            // `replay_before_keys` once the handshake keys the link; the
+            // budget (and `forget`) discards it if that never happens.
             None
         }
         Inbound::Drop(label) => {
@@ -12431,6 +12476,46 @@ async fn seal_inbound(
         Inbound::Refuse(r) => {
             seal_teardown(ctx, link_id, &r).await;
             None
+        }
+    }
+}
+
+/// CC 5.3.3.5 E1 — the Resources that completed on `link_id` before its
+/// handshake was answered ([`LinkSeals::take_before_keys`]), opened on the
+/// Resource lane and routed in arrival order now that the link is keyed. A
+/// link the keying refused opens nothing (its holds were discarded).
+///
+/// [`LinkSeals::take_before_keys`]: crate::transport::link_seal::LinkSeals::take_before_keys
+async fn replay_before_keys(ctx: &EventCtx<'_>, link_id: LinkId) {
+    use crate::transport::link_seal::{Inbound, Lane};
+    for sealed in ctx.seals.take_before_keys(link_id.into_bytes()) {
+        match ctx
+            .seals
+            .open(link_id.into_bytes(), Lane::Resource, &sealed)
+        {
+            Inbound::Open(plain) => route_opened(ctx, link_id, true, plain).await,
+            Inbound::Refuse(r) => {
+                seal_teardown(ctx, link_id, &r).await;
+                return;
+            }
+            Inbound::Drop(label) => {
+                if let Some(m) = ctx.metrics {
+                    m.inc_link_seal(label);
+                }
+                drop_inbound(
+                    Some(link_id),
+                    label,
+                    "a Resource held before the link's handshake did not open once it was \
+                     keyed (CC 5.3.3.5 E1)",
+                );
+            }
+            // choke-ok: the link closed (or was refused) under the hold.
+            Inbound::Closed
+            | Inbound::Pending
+            | Inbound::Keyed { .. }
+            | Inbound::HeldBeforeKeys => {
+                return;
+            }
         }
     }
 }

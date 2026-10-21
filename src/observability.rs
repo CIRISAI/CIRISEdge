@@ -989,12 +989,16 @@ pub const LINK_SEAL_REFUSED_UNSEALED_SEND: &str = "link_seal_refused_unsealed_se
 /// A sealed frame whose counter was already seen, or is older than the
 /// replay window: dropped, the link kept.
 pub const LINK_SEAL_DROPPED_REPLAY: &str = "link_seal_dropped_replay";
-/// A Resource, request or response that completed on a link a peer dialled
-/// before the event loop had answered its handshake (the two ride different
-/// event planes, so a fast dialler's first Resource can overtake its last
-/// handshake part): dropped, the link kept. The budget still closes a link
-/// whose handshake never comes.
+/// A request or response that completed on a link a peer dialled before the
+/// event loop had answered its handshake (the two ride different event planes,
+/// so a fast dialler's first frame can overtake its last handshake part), or a
+/// Resource past the before-keys hold's bound: dropped, the link kept. The
+/// budget still closes a link whose handshake never comes.
 pub const LINK_SEAL_DROPPED_BEFORE_KEYS: &str = "link_seal_dropped_before_keys";
+/// A Resource that completed on a link a peer dialled before the event loop
+/// had answered its handshake, HELD sealed and opened once the link is keyed
+/// (bounded; past the bound it is `link_seal_dropped_before_keys`).
+pub const LINK_SEAL_HELD_BEFORE_KEYS: &str = "link_seal_held_before_keys";
 
 // ─── CIRISEdge#805 item 8 — `EdgeMetrics::direct_link` labels ─────────
 

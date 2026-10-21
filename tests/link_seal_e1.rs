@@ -492,6 +492,46 @@ async fn a_sealed_exchange_crosses_and_the_wire_carries_no_plaintext_e1() {
     }
 }
 
+/// **Witness 1b** — a Resource that beats the handshake is HELD, not lost.
+/// The Resource and the Channel ride different event planes, so on a loaded
+/// node a dialler's first Resource can complete at the responder before its
+/// last handshake part (seen on the v43.1.0 tag CI, `link_seal_dropped_before_keys`).
+/// The sender's Resource had completed, so dropping it lost a frame the
+/// sender counts as delivered. Here B holds its handshake's last part back
+/// until its Resource completes (`HandshakeOverride::DeferLastPart`): A holds
+/// the sealed Resource (`link_seal_held_before_keys`), opens it once the link
+/// is keyed, and delivers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resource_that_beats_the_handshake_is_held_and_delivered_e1() {
+    let t = trio("resfirst", true, false, false).await;
+    // No on-link announce from B (A already holds B's binding from its RNS
+    // announce): the Channel then carries only the handshake, so holding its
+    // last part back reorders nothing on the Channel itself.
+    t.b.transport.set_unannounced_for_test(true);
+    t.b.transport
+        .set_handshake_override_for_test(HandshakeOverride::DeferLastPart);
+    // Resource-sized: over eight fragments at the loopback MTU.
+    let big = marked(b"E1-RESOURCE-FIRST-", 200_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &big)
+        .await
+        .expect("B -> A, its Resource ahead of its last handshake part");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&big).await
+        })
+        .await,
+        "A delivered the Resource that beat the handshake: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(
+        t.a.seal("link_seal_held_before_keys") >= 1,
+        "the Resource arrived before the keys and was held: {:?}",
+        t.a.metrics.link_seal()
+    );
+    assert_eq!(t.a.seal("link_seal_dropped_before_keys"), 0);
+}
+
 /// **Witness 2** — a peer that never sends the handshake: the responder
 /// delivers nothing and sends nothing, then refuses it by name
 /// (`link_seal_refused_timeout`) and closes the link.
