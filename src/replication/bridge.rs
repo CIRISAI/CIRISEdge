@@ -1240,12 +1240,11 @@ struct PlaneWatermark {
     /// Has [`Self::high_water`] reached the end of the plane at least once?
     caught_up: bool,
     /// The EARLIEST read position just before a row this peer's sweep skipped
-    /// as not advertisable (the projection / `in_scope` filter): `Some(None)`
-    /// is "from the beginning". The watermark tracks the READ, so it passes a
+    /// as not advertisable (the projection / `in_scope` filter). The watermark tracks the READ, so it passes a
     /// skipped row; when an advertise input changes the skip may clear, and
     /// [`SweepCursors::rewind_skipped`] moves [`Self::high_water`] back here so
     /// the next round re-reads it instead of waiting out a re-sweep cycle.
-    skip_mark: Option<Option<ResumeCursor>>,
+    skip_mark: Option<SkipMark>,
     /// Monotonic touch tick, for the cap's least-recently-used eviction.
     touched: u64,
 }
@@ -1372,6 +1371,37 @@ fn cursor_label(c: Option<&ResumeCursor>) -> String {
     )
 }
 
+/// Where a skipped row sits: the read position just before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkipMark {
+    /// The skipped row was the first of the plane.
+    Beginning,
+    /// The skipped row follows this position.
+    After(ResumeCursor),
+}
+
+impl SkipMark {
+    fn before(position: Option<ResumeCursor>) -> Self {
+        position.map_or(Self::Beginning, Self::After)
+    }
+
+    /// The `since` that re-reads the skipped row.
+    fn into_since(self) -> Option<ResumeCursor> {
+        match self {
+            Self::Beginning => None,
+            Self::After(c) => Some(c),
+        }
+    }
+
+    /// The earlier of two marks.
+    fn earliest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Beginning, _) | (_, Self::Beginning) => Self::Beginning,
+            (Self::After(a), Self::After(b)) => Self::After(if a <= b { a } else { b }),
+        }
+    }
+}
+
 /// CIRISEdge#531 DEPTH — the second page of a round, when the new-rows read
 /// left budget for one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1469,16 +1499,11 @@ impl SweepCursors {
 
     /// A row read from `before` (exclusive) was skipped as not advertisable:
     /// keep the EARLIEST such position for this peer and plane.
-    fn note_skip(&mut self, key: &(String, EnvelopeKind), before: Option<ResumeCursor>) {
+    fn note_skip(&mut self, key: &(String, EnvelopeKind), mark: SkipMark) {
         let wm = self.touch(key);
         wm.skip_mark = Some(match wm.skip_mark.take() {
-            None => before,
-            // `None` (the beginning) is the earliest position there is.
-            Some(None) => None,
-            Some(Some(old)) => match before {
-                None => None,
-                Some(new) => Some(if new < old { new } else { old }),
-            },
+            None => mark,
+            Some(old) => old.earliest(mark),
         });
     }
 
@@ -1489,7 +1514,7 @@ impl SweepCursors {
         let mut moved = 0;
         for wm in self.by_peer_plane.values_mut() {
             if let Some(mark) = wm.skip_mark.take() {
-                wm.high_water = mark;
+                wm.high_water = mark.into_since();
                 moved += 1;
             }
         }
@@ -3158,7 +3183,7 @@ impl FederationDirectoryReplicationBridge {
     /// `key`'s sweep.
     fn note_sweep_skip(&self, key: &(String, EnvelopeKind), before: Option<ResumeCursor>) {
         if let Ok(mut c) = self.sweep_cursors.lock() {
-            c.note_skip(key, before);
+            c.note_skip(key, SkipMark::before(before));
         }
     }
 
@@ -3360,7 +3385,7 @@ impl FederationDirectoryReplicationBridge {
     /// the admitted ones are offered. The cursor still advances over every
     /// row read (the watermark tracks what this node LOOKED AT, not what it
     /// offered; see [`Self::attestation_page`]).
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn sweep_paged_gated<S, Read, Fut, T, IN, RS, TS, C, PO>(
         &self,
         kind: EnvelopeKind,
@@ -3444,24 +3469,25 @@ impl FederationDirectoryReplicationBridge {
         self.check_advertise_inputs();
         // The earliest position before a row this page's `in_scope` skipped:
         // the watermark passes it, and a later input change rewinds to it.
-        let first_skip =
-            |since: &Option<ResumeCursor>, rows: &[S]| -> Option<Option<ResumeCursor>> {
-                let mut before = since.clone();
-                for r in rows {
-                    if !in_scope(r) {
-                        return Some(before);
-                    }
-                    before = Some(resume(r));
+        let first_skip = |since: &Option<ResumeCursor>, rows: &[S]| -> Option<SkipMark> {
+            let mut before = since.clone();
+            for r in rows {
+                if !in_scope(r) {
+                    return Some(SkipMark::before(before));
                 }
-                None
-            };
+                before = Some(resume(r));
+            }
+            None
+        };
         let head = self.sweep_head(&key);
         let (served, last) = {
             let _permit = self.sweep_gate.enter().await;
             let rows = read(head.clone(), budget).await;
             self.record_page(rows.len());
-            if let Some(before) = first_skip(&head, &rows) {
-                self.note_sweep_skip(&key, before);
+            if let Some(mark) = first_skip(&head, &rows) {
+                if let Ok(mut c) = self.sweep_cursors.lock() {
+                    c.note_skip(&key, mark);
+                }
             }
             let mask = self.page_mask(kind, &rows, &in_scope, &mut gate).await;
             self.advertise_page_into(
@@ -3480,8 +3506,10 @@ impl FederationDirectoryReplicationBridge {
                 let _permit = self.sweep_gate.enter().await;
                 let rows = read(plan.since.clone(), plan.budget).await;
                 self.record_page(rows.len());
-                if let Some(before) = first_skip(&plan.since, &rows) {
-                    self.note_sweep_skip(&key, before);
+                if let Some(mark) = first_skip(&plan.since, &rows) {
+                    if let Ok(mut c) = self.sweep_cursors.lock() {
+                        c.note_skip(&key, mark);
+                    }
                 }
                 let mask = self.page_mask(kind, &rows, &in_scope, &mut gate).await;
                 self.advertise_page_into(
@@ -8433,6 +8461,7 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // the round: its pages, then its one summary line
     async fn list_attestations(
         &self,
         recipient: Option<&str>,
@@ -8596,7 +8625,7 @@ impl FederationDirectoryReplicationBridge {
             withheld_by_reason.insert("unbooked", unbooked);
         }
         let summary = AdvertiseRoundSummary {
-            peer: peer_label.to_owned(),
+            peer: key.0.clone(),
             listed,
             not_advertisable: counts.not_advertisable,
             withheld,
@@ -8605,7 +8634,7 @@ impl FederationDirectoryReplicationBridge {
             offered: counts.offered,
             reoffered_after_skip: counts.reoffered_after_skip,
         };
-        self.log_advertise_round(
+        Self::log_advertise_round(
             &summary,
             generation,
             (wm_before.as_ref(), wm_after.as_ref()),
@@ -8622,7 +8651,6 @@ impl FederationDirectoryReplicationBridge {
     /// (throttled per peer) when anything was skipped or withheld. The counts
     /// add up: `listed = not_advertisable + withheld + duplicate + offered`.
     fn log_advertise_round(
-        &self,
         r: &AdvertiseRoundSummary,
         generation: u64,
         (wm_before, wm_after): (Option<&ResumeCursor>, Option<&ResumeCursor>),
@@ -8784,12 +8812,9 @@ impl FederationDirectoryReplicationBridge {
             .map(ciris_persist::federation::ServedAttestation::resume_pair);
         for att in &attestations {
             // The read position just before this row (the skip mark's value).
-            let before = std::mem::replace(
-                &mut prev,
-                Some(ciris_persist::federation::ServedAttestation::resume_pair(
-                    att,
-                )),
-            );
+            let before = prev.replace(ciris_persist::federation::ServedAttestation::resume_pair(
+                att,
+            ));
             // CIRISEdge#531, SECOND HALF — the gates below read exactly FOUR
             // strings, and this used to hand them a full `serde_json::to_value`
             // of the whole row: ~19 fields serialised AND a deep clone of the
