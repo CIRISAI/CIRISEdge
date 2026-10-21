@@ -358,6 +358,50 @@ impl Node {
         Self::with_owner(key, owner, peers, roots, chartered).await
     }
 
+    /// A node whose owner has NOT claimed it yet: the owner's key is known,
+    /// but no owner-binding is written ([`Self::claim`] writes it later).
+    async fn unclaimed(
+        name: &str,
+        key: Arc<Ident>,
+        seed: u8,
+        peers: &[&Ident],
+        roots: &[&Root],
+        chartered: &[&Root],
+    ) -> Self {
+        let owner = Arc::new(Ident::new(&format!("owner-{name}"), seed.wrapping_add(0x40)).await);
+        let mut records = vec![key.record("node").await, owner.record("user").await];
+        for p in peers {
+            records.push(p.record("node").await);
+        }
+        for r in roots {
+            records.extend(r.records().await);
+        }
+        let dir = directory_with(records).await;
+        for r in chartered {
+            put(&dir, r.charter().await).await;
+        }
+        Self {
+            signer: key.signer(),
+            key,
+            owner,
+            dir,
+            metrics: EdgeMetrics::new(),
+        }
+    }
+
+    /// The owner claims this node: its CC 3.2 owner-binding at `federation`.
+    async fn claim(&self) -> String {
+        let binding = owner_binding_attestation(
+            &self.owner.key_id,
+            &self.key.key_id,
+            chrono::Utc::now(),
+            &self.owner.signer(),
+        )
+        .await
+        .expect("owner binding");
+        put(&self.dir, binding).await
+    }
+
     /// A device of `owner` — the same person's pen on every node it claims,
     /// so each directory holds the SAME owner record bytes.
     async fn with_owner(
@@ -438,6 +482,18 @@ async fn start_runtime(
     transport: Arc<ReticulumTransport>,
     peer: &Ident,
 ) -> Arc<ReplicationRuntime> {
+    let own = [node.key.key_id.as_str(), node.owner.key_id.as_str()];
+    start_runtime_publishing(node, transport, peer, &own).await
+}
+
+/// [`start_runtime`] with the host's self-publish set given explicitly: the
+/// set a host captures when replication starts.
+async fn start_runtime_publishing(
+    node: &Node,
+    transport: Arc<ReticulumTransport>,
+    peer: &Ident,
+    self_set: &[&str],
+) -> Arc<ReplicationRuntime> {
     let peers = [
         EnvelopeKind::Key,
         EnvelopeKind::IdentityOccurrence,
@@ -465,10 +521,7 @@ async fn start_runtime(
                 metrics: Some(node.metrics.clone()),
                 ..Default::default()
             },
-            Some(self_publish_set([
-                node.key.key_id.as_str(),
-                node.owner.key_id.as_str(),
-            ])),
+            Some(self_publish_set(self_set.iter().copied())),
         )
         .await,
     );
@@ -909,5 +962,91 @@ async fn two_devices_of_one_owner_root_each_other_through_the_owners_acceptance_
              (RecipientNotRooted={floor})"
         );
     }
+    std::mem::forget(tmp);
+}
+
+/// The field's T2 root cause (CIRISServer native mesh, attestation-id
+/// logging): the host captures its self-publish set when replication STARTS,
+/// and the server starts replication before the person claims the node. So
+/// the owner is not in that set, and the owner's own allegiance rows (its
+/// federation owner-binding of the node, its `trust:accepts`) are never even
+/// OFFERED: the SelfOwn advertise keeps a row only when its attester is in the
+/// set. Here bob's runtime starts with a self set of bob's NODE key alone;
+/// then bob claims the node (owner-binding + acceptance at `federation`) and
+/// consents alice. Alice must receive bob's acceptance and binding (the bridge
+/// joins the node's live owner to the self set) and the pair must read Rooted
+/// both ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_claimed_after_replication_starts_publishes_its_acceptance_659() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = Root::new("root-r", 0x70).await;
+    let root_q = Root::new("root-q", 0x74).await;
+    let root_s = Root::new("root-s", 0x78).await;
+    let key_a = Arc::new(Ident::new("node-alice-late", 0x1a).await);
+    let key_b = Arc::new(Ident::new("node-bob-late", 0x1b).await);
+    let a = Node::new(
+        "alice-late",
+        Arc::clone(&key_a),
+        0x1a,
+        &[&key_b],
+        &[&root, &root_q, &root_s],
+        &[&root, &root_s],
+    )
+    .await;
+    let b = Node::unclaimed(
+        "bob-late",
+        Arc::clone(&key_b),
+        0x1b,
+        &[&key_a],
+        &[&root, &root_q, &root_s],
+        &[&root, &root_q],
+    )
+    .await;
+    let charter_q = root_q.charter().await.attestation_id;
+    let charter_s = root_s.charter().await.attestation_id;
+    let a_accepts = a.accept(&root).await;
+    a.consent_as_owner(&b.key).await;
+
+    let (ta, tb) = transports(&a, &b, tmp.path()).await;
+    let rt_a = start_runtime(&a, ta, &b.key).await;
+    // Bob's host captured its self set before the claim: the node key alone.
+    let rt_b = start_runtime_publishing(&b, tb, &a.key, &[b.key.key_id.as_str()]).await;
+    wait_for_own_route(&a, Duration::from_secs(150)).await;
+    wait_for_own_route(&b, Duration::from_secs(150)).await;
+    exchange_routes(&a, &b).await;
+
+    // THE CLAIM, after replication started.
+    let b_binding = b.claim().await;
+    let b_accepts = b.accept(&root).await;
+    b.consent_as_owner(&a.key).await;
+
+    let crossed = drive_until(&[&rt_a, &rt_b], Duration::from_secs(240), || async {
+        a.holds(&b_binding).await && a.holds(&b_accepts).await && b.holds(&a_accepts).await
+    })
+    .await;
+    if !crossed {
+        print_ledgers(&[(&a, "alice"), (&b, "bob")]);
+    }
+    assert!(
+        crossed,
+        "the owner claimed after replication started: its owner-binding and acceptance must be \
+         offered and reach alice (alice holds bob's binding={}, acceptance={})",
+        a.holds(&b_binding).await,
+        a.holds(&b_accepts).await
+    );
+
+    // Rooted both ways, measured by what it unlocks.
+    let served = drive_until(&[&rt_a, &rt_b], Duration::from_secs(180), || async {
+        a.holds(&charter_q).await && b.holds(&charter_s).await
+    })
+    .await;
+    assert!(
+        served,
+        "the pair reads Rooted both ways once bob's owner rows crossed (alice holds Q's \
+         charter={}, bob holds S's charter={})",
+        a.holds(&charter_q).await,
+        b.holds(&charter_s).await
+    );
     std::mem::forget(tmp);
 }
