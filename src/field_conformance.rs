@@ -222,27 +222,35 @@ pub const EDGE_CC_CLAIM_CONFORMANCE: &[ClaimConformance] = &[
     },
 ];
 
-/// A Constitution claim edge evidences with a TEST rather than a pure check:
-/// the property needs live links, a test anchor or a running node, so the
-/// anchor is the test itself (`tests/<file>.rs#<test_name>`, or
-/// `src/<file>.rs#<test_name>` for an in-crate test). Emitted into
-/// `CIRISEdge.cc_impl.tsv` in the same five columns as every other row;
-/// `every_test_evidence_anchor_names_a_test` holds each anchor to a `fn` of
-/// that name in that file.
+/// A Constitution claim edge evidences with a TEST rather than a pure check
+/// (the property needs live links, a test anchor or a running node).
+/// CIRISEdge#410 §3: the emitted row names the IMPLEMENTATION
+/// ([`Self::impl_anchor`], `src/<file>.rs#<symbol>`), the function or type
+/// that enforces the claim; the tests are its witnesses ([`Self::witness`]),
+/// recorded here and never emitted. `every_evidence_impl_anchor_names_a_src_symbol`
+/// holds each anchor to an item of that name in that file;
+/// `every_test_evidence_anchor_names_a_test` holds each witness to a test.
 pub struct TestEvidence {
     /// The CC section, exactly as `constitution/claims.tsv` gives the claim's
     /// `decimal_id` (the register matches a row on section AND symbol).
     pub cc: &'static str,
     /// The `CLM-*` claim id, exactly as `constitution/claims.tsv` names it.
     pub clm: &'static str,
-    /// The `path#test_name` evidence anchor.
-    pub evidence: &'static str,
+    /// What the anchor enforces.
+    pub property: &'static str,
+    /// The implementing symbol, `src/<file>.rs#<item>` (`Type::method` for a
+    /// method). The one emitted into the TSV.
+    pub impl_anchor: &'static str,
+    /// The witness tests, `tests/<file>.rs#<test>` (or `src/…#<test>` for an
+    /// in-crate test). Not emitted.
+    pub witness: &'static [&'static str],
     /// The claim is another repository's (persist's): edge's row supports it
     /// and graduates nothing alone.
     pub supporting: bool,
 }
 
-/// The claims edge evidences with tests (CIRISEdge#872, the rc9 register).
+/// The claims edge evidences with tests (CIRISEdge#872, the rc9 register),
+/// one row per (claim, implementing symbol).
 ///
 /// `CLM-transport-edge` is published here once its precondition held: every
 /// leviculum data send in `src/` goes through `LinkSeals` (the channel
@@ -251,131 +259,162 @@ pub struct TestEvidence {
 /// are the transit KEX handshake itself and RNS control (announce, link
 /// identify, path request, direct-link control).
 pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
-    // CC 3.2 (e) — the first-contact seal is key-bound.
     TestEvidence {
         cc: "3.2",
         clm: "CLM-first-contact-seal-key-bound",
-        evidence: "tests/link_seal_e1.rs#a_first_contact_request_signed_by_a_key_other_than_the_handshake_initiator_is_refused_e1",
-        supporting: false,
-    },
-    TestEvidence {
-        cc: "3.2",
-        clm: "CLM-first-contact-seal-key-bound",
-        evidence: "tests/link_seal_e1.rs#a_matching_code_is_derived_from_the_handshake_initiator_key_e1",
+        property: "an unattributed link carries only first contact, signed by (and introducing) the handshake's initiator key",
+        impl_anchor: "src/transport/link_seal.rs#admit_unattributed_frame",
+        witness: &[
+            "tests/link_seal_e1.rs#a_first_contact_request_signed_by_a_key_other_than_the_handshake_initiator_is_refused_e1",
+            "tests/link_seal_e1.rs#first_contact_rides_sealed_and_nothing_else_on_an_unattributed_link_e1",
+        ],
         supporting: false,
     },
     TestEvidence {
         cc: "3.2",
         clm: "CLM-first-contact-seal-key-bound",
-        evidence: "tests/link_seal_e1.rs#first_contact_rides_sealed_and_nothing_else_on_an_unattributed_link_e1",
-        supporting: false,
-    },
-    // CC 3.2 (f) — the pairing payload's transit pin.
-    TestEvidence {
-        cc: "3.2",
-        clm: "CLM-pairing-payload-transit-pin",
-        evidence: "tests/link_seal_e1.rs#a_fresh_device_seals_first_contact_with_a_pairing_pinned_pair_e1",
+        property: "the owner's matching code is derived from the handshake initiator's own key",
+        impl_anchor: "src/first_contact.rs#first_contact_matching_code",
+        witness: &[
+            "tests/link_seal_e1.rs#a_matching_code_is_derived_from_the_handshake_initiator_key_e1",
+        ],
         supporting: false,
     },
     TestEvidence {
         cc: "3.2",
         clm: "CLM-pairing-payload-transit-pin",
-        evidence: "tests/link_seal_e1.rs#a_pinned_pair_is_never_stored_or_resolved_as_rooted_e1",
+        property: "a pin yields its pair only for the node it names, never stored Rooted",
+        impl_anchor: "src/transport/link_seal.rs#PairingTransitPin::pair_for",
+        witness: &[
+            "tests/link_seal_e1.rs#a_pinned_pair_is_never_stored_or_resolved_as_rooted_e1",
+            "tests/link_seal_e1.rs#a_pinned_pair_that_is_not_the_nodes_responder_keys_is_refused_e1",
+        ],
         supporting: false,
     },
     TestEvidence {
         cc: "3.2",
         clm: "CLM-pairing-payload-transit-pin",
-        evidence: "tests/link_seal_e1.rs#a_pinned_pair_link_carries_only_first_contact_e1",
-        supporting: false,
-    },
-    TestEvidence {
-        cc: "3.2",
-        clm: "CLM-pairing-payload-transit-pin",
-        evidence: "tests/link_seal_e1.rs#a_pinned_pair_that_is_not_the_nodes_responder_keys_is_refused_e1",
-        supporting: false,
-    },
-    // CC 5.3.3.5 E1 — every RNS frame edge sends rides the per-link seal.
-    TestEvidence {
-        cc: "5.3.3.5",
-        clm: "CLM-transport-edge",
-        evidence: "tests/link_seal_e1.rs#a_sealed_exchange_crosses_and_the_wire_carries_no_plaintext_e1",
+        property: "the pinned pair keys one first-contact link, which carries first contact only",
+        impl_anchor: "src/transport/reticulum.rs#ReticulumTransport::send_first_contact_pinned",
+        witness: &[
+            "tests/link_seal_e1.rs#a_fresh_device_seals_first_contact_with_a_pairing_pinned_pair_e1",
+            "tests/link_seal_e1.rs#a_pinned_pair_link_carries_only_first_contact_e1",
+        ],
         supporting: false,
     },
     TestEvidence {
         cc: "5.3.3.5",
         clm: "CLM-transport-edge",
-        evidence: "tests/link_seal_e1.rs#a_peer_that_never_sends_the_handshake_is_refused_and_closed_e1",
+        property: "every frame edge sends on a link is sealed under that link's keys, or not sent",
+        impl_anchor: "src/transport/link_seal.rs#LinkSeals::seal",
+        witness: &[
+            "tests/link_seal_e1.rs#a_sealed_exchange_crosses_and_the_wire_carries_no_plaintext_e1",
+        ],
         supporting: false,
     },
     TestEvidence {
         cc: "5.3.3.5",
         clm: "CLM-transport-edge",
-        evidence: "tests/link_seal_e1.rs#a_non_ctkx_first_frame_is_refused_by_name_e1",
+        property: "the responder gate: a link's first frame is the transit KEX handshake or the link is refused",
+        impl_anchor: "src/transport/link_seal.rs#LinkSeals::inbound",
+        witness: &[
+            "tests/link_seal_e1.rs#a_peer_that_never_sends_the_handshake_is_refused_and_closed_e1",
+            "tests/link_seal_e1.rs#a_non_ctkx_first_frame_is_refused_by_name_e1",
+        ],
         supporting: false,
     },
     TestEvidence {
         cc: "5.3.3.5",
         clm: "CLM-transport-edge",
-        evidence: "tests/link_seal_e1.rs#a_classical_only_suite_is_refused_by_name_e1",
+        property: "the responder answers only the hybrid suite",
+        impl_anchor: "src/transport/av_transit_handshake.rs#respond",
+        witness: &[
+            "tests/link_seal_e1.rs#a_classical_only_suite_is_refused_by_name_e1",
+        ],
         supporting: false,
     },
     TestEvidence {
         cc: "5.3.3.5",
         clm: "CLM-transport-edge",
-        evidence: "tests/link_seal_e1.rs#a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1",
+        property: "a dial is keyed by a pair authenticated to the dialled node (a Rooted binding, its own signed route row, or a pairing pin) or never made",
+        impl_anchor: "src/transport/reticulum.rs#DialCtx::dial_transit_pair",
+        witness: &[
+            "tests/link_seal_e1.rs#a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1",
+            "tests/sealed_cut_bundle_e1.rs#a_fresh_device_reaches_its_owners_node_through_a_bundle_seeded_canonical_e1",
+        ],
         supporting: false,
     },
     TestEvidence {
-        cc: "5.3.3.5",
-        clm: "CLM-transport-edge",
-        evidence: "tests/sealed_cut_bundle_e1.rs#a_fresh_device_reaches_its_owners_node_through_a_bundle_seeded_canonical_e1",
+        cc: "3.3.6.2",
+        clm: "CLM-seal-authenticated-pair",
+        property: "the pair a dial seals to is authenticated to the dialled identity: a live Rooted binding, else the node's own hybrid-signed route row (signer = the dialled key, the #1103 fingerprint, the in-row separation, the signature re-verified at use); a bare announce never supplies one",
+        impl_anchor: "src/transport/transit_kex_peer.rs#PeerTransitResolver::resolve_authenticated",
+        witness: &[
+            "src/transport/transit_kex_peer.rs#a_rooted_binding_is_tried_before_the_nodes_own_signed_row_and_a_bare_announce_supplies_nothing",
+            "tests/link_seal_e1.rs#a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1",
+        ],
         supporting: false,
     },
-    // CC 5.3.4 — persist's claim; edge's two-hop use of the seeded pair.
+    TestEvidence {
+        cc: "3.3.6.2",
+        clm: "CLM-seal-authenticated-pair",
+        property: "the node's own hybrid-signed route row is the one row that carries its transit pair, so a node relays every such row it holds; a canonical is one source of route rows, never a required party",
+        impl_anchor: "src/replication/bridge.rs#FederationDirectoryReplicationBridge::relayable_signed_route",
+        witness: &[
+            "tests/attributed_allegiance_659.rs#two_persons_nodes_root_through_a_mutual_peer_that_relays_their_signed_routes_e1",
+        ],
+        supporting: false,
+    },
     TestEvidence {
         cc: "5.3.4",
         clm: "CLM-bundle-seeds-transit-pairs",
-        evidence: "tests/sealed_cut_bundle_e1.rs#a_fresh_device_reaches_its_owners_node_through_a_bundle_seeded_canonical_e1",
+        property: "edge resolves a dialled node's pair through persist's Rooted read, which the bundle seeds",
+        impl_anchor: "src/transport/transit_kex_peer.rs#PeerTransitResolver::resolve",
+        witness: &[
+            "tests/sealed_cut_bundle_e1.rs#a_fresh_device_reaches_its_owners_node_through_a_bundle_seeded_canonical_e1",
+        ],
         supporting: true,
     },
-    // CC 6.1.1 — the witness leaf list is unique.
     TestEvidence {
         cc: "6.1.1",
         clm: "CLM-wholeness-witness",
-        evidence: "src/holonomic/wholeness_witness.rs#a_witness_leaf_list_with_a_repeated_leaf_is_refused_611",
+        property: "a witness leaf list with a repeated leaf is refused before hashing",
+        impl_anchor: "src/holonomic/wholeness_witness.rs#unique_merkle_root",
+        witness: &[
+            "src/holonomic/wholeness_witness.rs#a_witness_leaf_list_with_a_repeated_leaf_is_refused_611",
+        ],
         supporting: false,
     },
     TestEvidence {
         cc: "6.1.1",
         clm: "CLM-member-commitment-unique",
-        evidence: "src/holonomic/wholeness_witness.rs#a_witness_leaf_list_with_a_repeated_leaf_is_refused_611",
+        property: "a leaf list with a repeated leaf is refused before hashing",
+        impl_anchor: "src/holonomic/wholeness_witness.rs#unique_merkle_root",
+        witness: &[
+            "src/holonomic/wholeness_witness.rs#a_witness_leaf_list_with_a_repeated_leaf_is_refused_611",
+        ],
         supporting: false,
     },
     TestEvidence {
         cc: "6.1.1",
         clm: "CLM-member-commitment-unique",
-        evidence: "src/holonomic/aggregation.rs#assemble_tier_meta_v2_refuses_a_repeated_source_id_611",
+        property: "a tier meta with a repeated source id is refused",
+        impl_anchor: "src/holonomic/aggregation.rs#first_repeated_source_id",
+        witness: &[
+            "src/holonomic/aggregation.rs#assemble_tier_meta_v2_refuses_a_repeated_source_id_611",
+            "src/holonomic/aggregation.rs#assemble_tier_meta_v3_refuses_a_repeated_source_id_611",
+        ],
         supporting: false,
     },
-    TestEvidence {
-        cc: "6.1.1",
-        clm: "CLM-member-commitment-unique",
-        evidence: "src/holonomic/aggregation.rs#assemble_tier_meta_v3_refuses_a_repeated_source_id_611",
-        supporting: false,
-    },
-    // CC 5.3 — persist's claim (the seating gate); edge serves an announced
-    // node's route to strangers and an unannounced node's only to its owner's.
     TestEvidence {
         cc: "5.3",
         clm: "CLM-serve-seat-announced",
-        evidence: "src/replication/bridge.rs#an_unannounced_nodes_route_reaches_only_its_owners_nodes_682",
-        supporting: true,
-    },
-    TestEvidence {
-        cc: "5.3",
-        clm: "CLM-serve-seat-announced",
-        evidence: "src/replication/bridge.rs#an_announced_nodes_route_reaches_a_stranger_682",
+        property: "an unannounced owned node's identity rows reach only its owner's nodes (#682)",
+        impl_anchor: "src/replication/bridge.rs#IdentityRowReach::withholds",
+        witness: &[
+            "src/replication/bridge.rs#an_unannounced_nodes_route_reaches_only_its_owners_nodes_682",
+            "src/replication/bridge.rs#an_announced_nodes_route_reaches_a_stranger_682",
+        ],
         supporting: true,
     },
 ];
@@ -505,13 +544,14 @@ pub fn edge_evidence_rows() -> Vec<String> {
                 env!("CARGO_PKG_VERSION"),
             )
         }))
-        // CIRISEdge#872 — the test-evidenced claims, same row shape.
+        // CIRISEdge#872 — the test-evidenced claims, same row shape; the row
+        // names the implementing symbol (#410 §3), never the witness.
         .chain(EDGE_CC_TEST_EVIDENCE.iter().map(|c| {
             format!(
                 "{}\t{}\tCIRISEdge\t{}\tciris-edge@v{}",
                 c.cc,
                 c.clm,
-                c.evidence,
+                c.impl_anchor,
                 env!("CARGO_PKG_VERSION"),
             )
         }))
@@ -1540,6 +1580,18 @@ mod tests {
         );
     }
 
+    /// The regeneration step `evidence_tsv_matches_emitted` names: prints the
+    /// rows the live tables emit. `cargo test --lib -- regenerate_evidence_tsv_stdout
+    /// --ignored --nocapture`, then replace everything after the TSV's `#`
+    /// header comment with the output.
+    #[test]
+    #[ignore = "a generator, not a check: run with --ignored --nocapture to regenerate the TSV"]
+    fn regenerate_evidence_tsv_stdout() {
+        for row in edge_evidence_rows() {
+            println!("{row}");
+        }
+    }
+
     /// CIRISEdge#410 §3 — the vendored `evidence/CIRISEdge.cc_impl.tsv` (what the
     /// Constitution's `check_evidence.py` consumes) is EXACTLY what the live code
     /// emits from `EDGE_FIELD_CONFORMANCE`. A processor rename, a version bump, or
@@ -1560,29 +1612,159 @@ mod tests {
         );
     }
 
-    /// CIRISEdge#872 — every test-evidence anchor names a real test: the file
-    /// exists and defines a `fn` of exactly that name (sync or async), so a
-    /// rename or a deleted witness is a build failure, not a dead row.
+    /// The text of `path` under the crate root.
+    fn crate_file(path: &str) -> String {
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
+            .unwrap_or_else(|e| panic!("{path} unreadable: {e}"))
+    }
+
+    /// Whether a line, trimmed and stripped of `pub`/`pub(crate)`/`async`,
+    /// opens the item `kw name` (`fn`, `struct`, ...).
+    fn opens_item(line: &str, kw: &str, name: &str) -> bool {
+        let mut l = line.trim_start();
+        for p in ["pub(crate) ", "pub(super) ", "pub ", "async ", "const "] {
+            if kw != "const" {
+                l = l.strip_prefix(p).unwrap_or(l);
+            }
+        }
+        l.strip_prefix(kw)
+            .and_then(|r| r.strip_prefix(' '))
+            .and_then(|r| r.strip_prefix(name))
+            .is_some_and(|r| r.starts_with(['(', '<', ' ', ':', ';', '{']))
+    }
+
+    /// Whether `body` defines `symbol`: `Type::method` needs a `fn method`
+    /// inside an `impl … Type` block (from the `impl` line to its closing
+    /// `}` at the same indent); a bare name is a fn, struct, enum, const or
+    /// impl target.
+    fn defines_symbol(body: &str, symbol: &str) -> bool {
+        let names = |l: &str, ty: &str| {
+            l.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|w| w == ty)
+        };
+        if let Some((ty, method)) = symbol.split_once("::") {
+            let mut open: Option<String> = None;
+            for l in body.lines() {
+                match &open {
+                    Some(close) if l == close.as_str() => open = None,
+                    Some(_) if opens_item(l, "fn", method) => return true,
+                    Some(_) => {}
+                    None => {
+                        let t = l.trim_start();
+                        if t.starts_with("impl") && names(t, ty) && t.ends_with('{') {
+                            open = Some(format!("{}}}", &l[..l.len() - t.len()]));
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        body.lines().any(|l| {
+            ["fn", "struct", "enum", "const"]
+                .iter()
+                .any(|kw| opens_item(l, kw, symbol))
+                || {
+                    let t = l.trim_start();
+                    t.starts_with("impl")
+                        && t.split(|c: char| !c.is_alphanumeric() && c != '_')
+                            .any(|w| w == symbol)
+                }
+        })
+    }
+
+    /// CIRISEdge#872 — every witness names a real test: the file exists and
+    /// defines a `fn` of exactly that name (sync or async), so a rename or a
+    /// deleted witness is a build failure, not a dead row.
     #[test]
     fn every_test_evidence_anchor_names_a_test() {
         for row in EDGE_CC_TEST_EVIDENCE {
-            let (path, name) = row
-                .evidence
-                .split_once('#')
-                .unwrap_or_else(|| panic!("{}: no `#` in {}", row.clm, row.evidence));
-            let body = std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path),
-            )
-            .unwrap_or_else(|e| panic!("{}: {path} unreadable: {e}", row.clm));
-            let defines = body.lines().any(|l| {
-                let l = l.trim_start();
-                l.strip_prefix("async fn ")
-                    .or_else(|| l.strip_prefix("fn "))
-                    .and_then(|r| r.strip_prefix(name))
-                    .is_some_and(|r| r.starts_with('('))
-            });
-            assert!(defines, "{}: {path} defines no fn {name}", row.clm);
+            assert!(!row.witness.is_empty(), "{}: no witness", row.clm);
+            for w in row.witness {
+                let (path, name) = w
+                    .split_once('#')
+                    .unwrap_or_else(|| panic!("{}: no `#` in {w}", row.clm));
+                let body = crate_file(path);
+                assert!(
+                    body.lines().any(|l| opens_item(l, "fn", name)),
+                    "{}: {path} defines no fn {name}",
+                    row.clm
+                );
+            }
             assert!(row.clm.starts_with("CLM-"), "{}", row.clm);
+        }
+    }
+
+    /// CIRISEdge#410 §3 — every emitted anchor names the IMPLEMENTATION: it
+    /// starts with `src/`, the file exists, and it defines that item.
+    #[test]
+    fn every_evidence_impl_anchor_names_a_src_symbol() {
+        let mut seen = HashSet::new();
+        for row in EDGE_CC_TEST_EVIDENCE {
+            let (path, symbol) = row
+                .impl_anchor
+                .split_once('#')
+                .unwrap_or_else(|| panic!("{}: no `#` in {}", row.clm, row.impl_anchor));
+            assert!(
+                path.starts_with("src/"),
+                "{}: {} names no src/ implementation",
+                row.clm,
+                row.impl_anchor
+            );
+            assert!(
+                defines_symbol(&crate_file(path), symbol),
+                "{}: {path} defines no item {symbol}",
+                row.clm
+            );
+            assert!(
+                seen.insert((row.clm, row.impl_anchor)),
+                "{}: {} listed twice",
+                row.clm,
+                row.impl_anchor
+            );
+        }
+    }
+
+    /// CIRISConformance `test_583_field_conformance_manifest.py::
+    /// test_edge_evidence_rows_name_the_wheel_under_test`, replicated: every
+    /// emitted row is five columns, a dotted section, a `CLM-*` claim,
+    /// `CIRISEdge`, a `src/…#symbol` and `ciris-edge@vX.Y.Z`.
+    #[test]
+    fn every_emitted_evidence_row_names_a_src_symbol_583() {
+        let rows = edge_evidence_rows();
+        assert_eq!(
+            rows[0].split('\t').collect::<Vec<_>>(),
+            [
+                "decimal_id",
+                "claim_id",
+                "repo",
+                "path#symbol",
+                "crate@version"
+            ]
+        );
+        assert!(rows.len() > 1, "the evidence table is empty");
+        for row in &rows[1..] {
+            let cols: Vec<&str> = row.split('\t').collect();
+            assert_eq!(cols.len(), 5, "{row}");
+            let (decimal, claim, repo, sym, krate) = (cols[0], cols[1], cols[2], cols[3], cols[4]);
+            assert!(
+                !decimal.is_empty()
+                    && decimal
+                        .split('.')
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+                "{row}"
+            );
+            assert!(claim.starts_with("CLM-"), "{row}");
+            assert_eq!(repo, "CIRISEdge", "{row}");
+            assert!(sym.contains('#') && sym.starts_with("src/"), "{row}");
+            let v = krate
+                .strip_prefix("ciris-edge@v")
+                .unwrap_or_else(|| panic!("{row}"));
+            assert!(
+                v.split('.').count() == 3
+                    && v.split('.')
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+                "{row}"
+            );
         }
     }
 

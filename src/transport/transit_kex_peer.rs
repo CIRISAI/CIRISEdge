@@ -12,6 +12,14 @@
 //! not a hop key).
 //!
 //! `None` means the peer cannot relay (CC 3.3.6.2).
+//!
+//! CC rc9 (`c8f0d12`, 3.3.6.2 + E1 + 5.3.4, I1–I6) — a DIALLER may also seal
+//! to a node that is not Rooted here, on a pair authenticated to that node:
+//! its OWN hybrid-signed route row ([`PeerTransitResolver::resolve_authenticated`],
+//! source (a), [`crate::verify::authenticated_self_signed_transit_pair`]).
+//! Rooted governs what a peer is SERVED (#659), not whether two keys may
+//! speak. The pairing pin (3.2 (f)) is the third source, keyed on its own
+//! path. A bare announce never supplies a pair.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -19,6 +27,29 @@ use std::sync::Mutex;
 use ciris_persist::federation::self_at_login::TransitKexPair;
 
 use crate::verify::RootingDirectory;
+
+/// Which CC 3.3.6.2 source authenticated a dialled node's transit pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PairSource {
+    /// (b) A live Rooted binding (persist `transit_kex_pair_for`).
+    Rooted,
+    /// (a) The node's own hybrid-signed route row.
+    SelfSignedRow,
+    /// (c) The owner's pairing payload pin (3.2 (f)).
+    Pin,
+}
+
+impl PairSource {
+    /// The stable token (log field and metric label).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rooted => crate::observability::LINK_SEAL_PAIR_ROOTED,
+            Self::SelfSignedRow => crate::observability::LINK_SEAL_PAIR_SELF_SIGNED_ROW,
+            Self::Pin => crate::observability::LINK_SEAL_PAIR_PIN,
+        }
+    }
+}
 
 /// Per-peer transit pair resolution with a say-once log for peers that
 /// cannot relay. Holds no pair: every call re-reads the directory, so a
@@ -30,6 +61,8 @@ pub struct PeerTransitResolver {
     /// Peers whose refused dial (`link_seal_refused_no_pair`) has been said
     /// at INFO since their pair last resolved ([`Self::note_no_pair_refusal`]).
     said_no_pair_refusal: Mutex<HashSet<String>>,
+    /// `(peer, source)` pairs already said at INFO ([`Self::note_source`]).
+    said_source: Mutex<HashSet<(String, PairSource)>>,
 }
 
 impl PeerTransitResolver {
@@ -73,6 +106,38 @@ impl PeerTransitResolver {
             }
         }
         Ok(pair)
+    }
+
+    /// CC 3.3.6.2 (rc9, I1–I6) — the pair to seal a dial to `key_id` with,
+    /// and which source authenticated it: (b) a live Rooted binding first,
+    /// then (a) the node's own hybrid-signed route row
+    /// ([`RootingDirectory::self_signed_transit_pair_for`]). `None` when
+    /// neither supplies one.
+    ///
+    /// # Errors
+    /// As [`Self::resolve`].
+    pub async fn resolve_authenticated<D: RootingDirectory + ?Sized>(
+        &self,
+        dir: &D,
+        key_id: &str,
+    ) -> Result<Option<(TransitKexPair, PairSource)>, String> {
+        if let Some(pair) = self.resolve(dir, key_id).await? {
+            return Ok(Some((pair, PairSource::Rooted)));
+        }
+        let pair = dir.self_signed_transit_pair_for(key_id).await?;
+        if pair.is_some() {
+            self.rearm(key_id);
+        }
+        Ok(pair.map(|p| (p, PairSource::SelfSignedRow)))
+    }
+
+    /// `true` the first time `source` keyed a link to `peer` (said at INFO
+    /// then, at DEBUG after).
+    pub fn note_source(&self, peer: &str, source: PairSource) -> bool {
+        self.said_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((peer.to_owned(), source))
     }
 
     /// A dial to `peer` was refused for want of its pair. `true` the first
@@ -141,5 +206,118 @@ mod tests {
                 "never WARN"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod authenticated_source_tests {
+    use super::*;
+    use crate::verify::{ProvenanceChain, RootingRejection, RootingVerdict};
+    use async_trait::async_trait;
+
+    /// A directory that answers only the two pair sources: what persist's
+    /// Rooted resolver would say, and what the node's own signed row would.
+    struct Sources {
+        rooted: Option<TransitKexPair>,
+        own_row: Option<TransitKexPair>,
+    }
+
+    fn pair(tag: u8) -> TransitKexPair {
+        TransitKexPair {
+            x25519: [tag; 32],
+            ml_kem_768: Box::new([tag; 1184]),
+        }
+    }
+
+    #[async_trait]
+    impl RootingDirectory for Sources {
+        async fn root_binding(&self, key_id: &str, _claimed: &str) -> RootingVerdict {
+            RootingVerdict::Rejected {
+                rejection: RootingRejection::UnknownKeyId {
+                    key_id: key_id.to_owned(),
+                },
+            }
+        }
+        async fn provenance_chain(
+            &self,
+            key_id: &str,
+        ) -> Result<ProvenanceChain, RootingRejection> {
+            Err(RootingRejection::UnknownKeyId {
+                key_id: key_id.to_owned(),
+            })
+        }
+        async fn transit_kex_pair_for(
+            &self,
+            _key_id: &str,
+        ) -> Result<Option<TransitKexPair>, String> {
+            Ok(self.rooted.clone())
+        }
+        async fn self_signed_transit_pair_for(
+            &self,
+            _key_id: &str,
+        ) -> Result<Option<TransitKexPair>, String> {
+            Ok(self.own_row.clone())
+        }
+    }
+
+    /// CC 3.3.6.2 (rc9 `c8f0d12`, I2) — the dial's pair comes from a source
+    /// authenticated to the dialled identity, tried in order: a live Rooted
+    /// binding, then the node's own hybrid-signed route row. A peer known only
+    /// by a bare announce has neither and gets no pair.
+    #[tokio::test]
+    async fn a_rooted_binding_is_tried_before_the_nodes_own_signed_row_and_a_bare_announce_supplies_nothing(
+    ) {
+        let r = PeerTransitResolver::new();
+        let both = Sources {
+            rooted: Some(pair(1)),
+            own_row: Some(pair(2)),
+        };
+        let (p, source) = r
+            .resolve_authenticated(&both, "peer")
+            .await
+            .expect("read")
+            .expect("a pair");
+        assert_eq!((p, source), (pair(1), PairSource::Rooted), "Rooted first");
+
+        let own_only = Sources {
+            rooted: None,
+            own_row: Some(pair(2)),
+        };
+        let (p, source) = r
+            .resolve_authenticated(&own_only, "peer")
+            .await
+            .expect("read")
+            .expect("a pair");
+        assert_eq!(
+            (p, source),
+            (pair(2), PairSource::SelfSignedRow),
+            "a node not Rooted here still keys from its own signed row"
+        );
+
+        let announce_only = Sources {
+            rooted: None,
+            own_row: None,
+        };
+        assert_eq!(
+            r.resolve_authenticated(&announce_only, "peer")
+                .await
+                .expect("read"),
+            None,
+            "a bare announce never supplies a pair"
+        );
+
+        assert!(
+            r.note_source("peer", PairSource::Rooted),
+            "said at INFO once"
+        );
+        assert!(!r.note_source("peer", PairSource::Rooted), "then at DEBUG");
+        assert!(
+            r.note_source("peer", PairSource::SelfSignedRow),
+            "per source"
+        );
+        assert_eq!(
+            PairSource::Pin.as_str(),
+            crate::observability::LINK_SEAL_PAIR_PIN
+        );
     }
 }

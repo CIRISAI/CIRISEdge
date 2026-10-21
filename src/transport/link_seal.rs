@@ -279,6 +279,10 @@ pub enum Inbound {
     Open(Vec<u8>),
     /// Dropped by name; the link stays.
     Drop(&'static str),
+    /// A Resource on a peer-dialled link still awaiting its handshake, held
+    /// SEALED until the handshake keys the link ([`LinkSeals::take_before_keys`]);
+    /// nothing to deliver yet.
+    HeldBeforeKeys,
     /// Refused by name; the caller closes the link.
     Refuse(SealRefusal),
     /// The link was already refused and is closing: dropped without a
@@ -450,6 +454,9 @@ enum State {
     Refused,
 }
 
+/// Per link: the sealed Resources held before its handshake, and their bytes.
+type BeforeKeys = HashMap<[u8; 16], (Vec<Vec<u8>>, usize)>;
+
 /// The Reticulum transport's per-link seal table. See the module docs.
 pub struct LinkSeals {
     links: Mutex<HashMap<[u8; 16], State>>,
@@ -462,6 +469,10 @@ pub struct LinkSeals {
     /// ([`Self::hold`]) or whose attribution has not landed yet
     /// ([`Self::hold_for_attribution`]).
     held: Mutex<HashMap<[u8; 16], Held>>,
+    /// SEALED Resources that completed on a peer-dialled link before its
+    /// handshake was answered ([`Self::open`]), replayed in order once it is
+    /// ([`Self::take_before_keys`]). Bounded like [`Self::held`].
+    before_keys: Mutex<BeforeKeys>,
 }
 
 impl std::fmt::Debug for LinkSeals {
@@ -483,6 +494,7 @@ impl LinkSeals {
             secret,
             local_key_id: local_key_id.into(),
             resolver: PeerTransitResolver::new(),
+            before_keys: Mutex::new(HashMap::new()),
             tap: Mutex::new(None),
             held: Mutex::new(HashMap::new()),
         }
@@ -500,8 +512,11 @@ impl LinkSeals {
         &self.secret
     }
 
-    /// The dialled node's transit pair (Rooted only), read BEFORE the dial:
-    /// a node that publishes none cannot be keyed, so it is never dialled.
+    /// The dialled node's transit pair, read BEFORE the dial, and the CC
+    /// 3.3.6.2 source that authenticated it (rc9 I1–I6): a live Rooted
+    /// binding, else the node's own hybrid-signed route row. A node with
+    /// neither cannot be keyed, so it is never dialled. The source is counted
+    /// (`link_seal_pair_*`) and said at INFO the first time per peer.
     ///
     /// # Errors
     /// [`AvHandshakeError::PairLookup`] (no directory, or a directory fault)
@@ -510,6 +525,7 @@ impl LinkSeals {
         &self,
         rooting: Option<&dyn RootingDirectory>,
         peer: &str,
+        metrics: Option<&crate::observability::EdgeMetrics>,
     ) -> Result<TransitKexPair, AvHandshakeError> {
         let Some(rooting) = rooting else {
             return Err(AvHandshakeError::PairLookup {
@@ -517,8 +533,9 @@ impl LinkSeals {
                 detail: "no rooting directory is wired".to_owned(),
             });
         };
-        self.resolver
-            .resolve(rooting, peer)
+        let (pair, source) = self
+            .resolver
+            .resolve_authenticated(rooting, peer)
             .await
             .map_err(|detail| AvHandshakeError::PairLookup {
                 peer: peer.to_owned(),
@@ -526,7 +543,21 @@ impl LinkSeals {
             })?
             .ok_or_else(|| AvHandshakeError::NoTransitPair {
                 peer: peer.to_owned(),
-            })
+            })?;
+        if let Some(m) = metrics {
+            m.inc_link_seal(source.as_str());
+        }
+        if self.resolver.note_source(peer, source) {
+            tracing::info!(
+                peer = %peer,
+                source = source.as_str(),
+                "transit pair authenticated for a dial (CC 3.3.6.2: rooted binding, the node's own \
+                 signed route row, or a pairing pin)"
+            );
+        } else {
+            tracing::debug!(peer = %peer, source = source.as_str(), "transit pair for a dial");
+        }
+        Ok(pair)
     }
 
     /// A dial to `peer` was refused for want of its pair; `true` the first
@@ -736,6 +767,14 @@ impl LinkSeals {
                 Some(State::Sealed(s)) => Arc::clone(s),
                 Some(State::Refused) => return Inbound::Closed,
                 Some(State::Awaiting(_)) => {
+                    // A Resource can overtake the last handshake part (they
+                    // ride different event planes): hold it sealed and open
+                    // it once the link is keyed, within the hold's bounds.
+                    // The sender saw its Resource complete; dropping it here
+                    // would lose a frame the sender counts as delivered.
+                    if lane == Lane::Resource && self.hold_before_keys(link, frame) {
+                        return Inbound::HeldBeforeKeys;
+                    }
                     return Inbound::Drop(crate::observability::LINK_SEAL_DROPPED_BEFORE_KEYS);
                 }
                 _ => {
@@ -802,6 +841,8 @@ impl LinkSeals {
         match links.get_mut(&link) {
             Some(s @ State::Awaiting(_)) => {
                 *s = State::Refused;
+                drop(links);
+                self.before_keys().remove(&link);
                 true
             }
             _ => false,
@@ -811,6 +852,7 @@ impl LinkSeals {
     /// Mark `link` refused: nothing more is sealed for it or opened on it.
     pub fn refuse(&self, link: [u8; 16]) {
         self.links().insert(link, State::Refused);
+        self.before_keys().remove(&link);
     }
 
     /// Forget a closed link (its keys and anything held for it).
@@ -820,6 +862,36 @@ impl LinkSeals {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(link);
+        self.before_keys().remove(link);
+    }
+
+    fn before_keys(&self) -> std::sync::MutexGuard<'_, BeforeKeys> {
+        self.before_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hold one SEALED Resource on a link awaiting its handshake; `false`
+    /// when it does not fit [`HELD_FRAMES_MAX`] / [`HELD_BYTES_MAX`].
+    fn hold_before_keys(&self, link: [u8; 16], sealed: &[u8]) -> bool {
+        let mut held = self.before_keys();
+        let (frames, bytes) = held.entry(link).or_default();
+        if frames.len() >= HELD_FRAMES_MAX || *bytes + sealed.len() > HELD_BYTES_MAX {
+            return false;
+        }
+        *bytes += sealed.len();
+        frames.push(sealed.to_vec());
+        true
+    }
+
+    /// The sealed Resources held while `link` awaited its handshake, oldest
+    /// first, and nothing held after. The caller opens each on the Resource
+    /// lane ([`Self::open`]) once the link is keyed.
+    pub fn take_before_keys(&self, link: [u8; 16]) -> Vec<Vec<u8>> {
+        self.before_keys()
+            .remove(&link)
+            .map(|(frames, _)| frames)
+            .unwrap_or_default()
     }
 
     /// Hold one OPENED frame on a link a peer dialled whose remote identity
