@@ -454,6 +454,9 @@ enum State {
     Refused,
 }
 
+/// Per link: the sealed Resources held before its handshake, and their bytes.
+type BeforeKeys = HashMap<[u8; 16], (Vec<Vec<u8>>, usize)>;
+
 /// The Reticulum transport's per-link seal table. See the module docs.
 pub struct LinkSeals {
     links: Mutex<HashMap<[u8; 16], State>>,
@@ -469,7 +472,7 @@ pub struct LinkSeals {
     /// SEALED Resources that completed on a peer-dialled link before its
     /// handshake was answered ([`Self::open`]), replayed in order once it is
     /// ([`Self::take_before_keys`]). Bounded like [`Self::held`].
-    before_keys: Mutex<HashMap<[u8; 16], (Vec<Vec<u8>>, usize)>>,
+    before_keys: Mutex<BeforeKeys>,
 }
 
 impl std::fmt::Debug for LinkSeals {
@@ -843,7 +846,7 @@ impl LinkSeals {
         self.before_keys().remove(link);
     }
 
-    fn before_keys(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], (Vec<Vec<u8>>, usize)>> {
+    fn before_keys(&self) -> std::sync::MutexGuard<'_, BeforeKeys> {
         self.before_keys
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
