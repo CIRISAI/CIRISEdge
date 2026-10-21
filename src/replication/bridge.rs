@@ -87,7 +87,7 @@
 //! Three tests at the bottom of this module fence that invariant per
 //! FSD §7.1 acceptance criteria.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1239,8 +1239,137 @@ struct PlaneWatermark {
     backfill: Option<ResumeCursor>,
     /// Has [`Self::high_water`] reached the end of the plane at least once?
     caught_up: bool,
+    /// The EARLIEST read position just before a row this peer's sweep skipped
+    /// as not advertisable (the projection / `in_scope` filter): `Some(None)`
+    /// is "from the beginning". The watermark tracks the READ, so it passes a
+    /// skipped row; when an advertise input changes the skip may clear, and
+    /// [`SweepCursors::rewind_skipped`] moves [`Self::high_water`] back here so
+    /// the next round re-reads it instead of waiting out a re-sweep cycle.
+    skip_mark: Option<Option<ResumeCursor>>,
     /// Monotonic touch tick, for the cap's least-recently-used eviction.
     touched: u64,
+}
+
+/// What the advertise predicate reads besides the row: the self-publish set,
+/// the per-kind publish selector's answers, and the cohort. A change in any of
+/// them can make a row skipped earlier advertisable now.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct AdvertiseFingerprint {
+    self_set: BTreeSet<String>,
+    selector: BTreeMap<&'static str, BTreeSet<String>>,
+    cohort: BTreeSet<String>,
+}
+
+/// The advertise inputs as last seen, and how many times they have changed.
+#[derive(Debug, Default)]
+struct AdvertiseInputs {
+    generation: u64,
+    last: Option<AdvertiseFingerprint>,
+}
+
+/// One row skipped as not advertisable: when, and why.
+#[derive(Debug, Clone)]
+struct SkippedRow {
+    at: chrono::DateTime<chrono::Utc>,
+    reason: &'static str,
+}
+
+/// One rolling re-sweep cycle in progress for a `(peer, plane)`.
+#[derive(Debug, Clone)]
+struct ResweepCycle {
+    started: Instant,
+    rounds: u32,
+    reoffered: u64,
+    overdue_warned: bool,
+}
+
+/// How many skipped rows the advertise ledger remembers across all peers.
+/// Past it the oldest is forgotten: its re-offer is then not NAMED in the log,
+/// but the row is still re-read (the watermark rewind and the re-sweep do not
+/// depend on this ledger).
+const MAX_SKIPPED_ROWS_REMEMBERED: usize = 4096;
+
+/// A re-sweep cycle running longer than this is said at WARN, once.
+const RESWEEP_CYCLE_BOUND: Duration = Duration::from_secs(15 * 60);
+
+/// The Attestation advertise's memory of what it skipped and of its re-sweep
+/// cycles. Diagnostic: nothing here decides what is offered.
+#[derive(Debug, Default)]
+struct AdvertiseLedger {
+    skipped: HashMap<(String, String), SkippedRow>,
+    cycles: HashMap<(String, EnvelopeKind), ResweepCycle>,
+}
+
+impl AdvertiseLedger {
+    fn note_skipped(&mut self, peer: &str, attestation_id: &str, reason: &'static str) {
+        let key = (peer.to_owned(), attestation_id.to_owned());
+        if self.skipped.contains_key(&key) {
+            return;
+        }
+        if self.skipped.len() >= MAX_SKIPPED_ROWS_REMEMBERED {
+            if let Some(oldest) = self
+                .skipped
+                .iter()
+                .min_by_key(|(_, r)| r.at)
+                .map(|(k, _)| k.clone())
+            {
+                self.skipped.remove(&oldest);
+            }
+        }
+        self.skipped.insert(
+            key,
+            SkippedRow {
+                at: chrono::Utc::now(),
+                reason,
+            },
+        );
+    }
+
+    fn take_skipped(&mut self, peer: &str, attestation_id: &str) -> Option<SkippedRow> {
+        self.skipped
+            .remove(&(peer.to_owned(), attestation_id.to_owned()))
+    }
+}
+
+/// One Attestation advertise round for one peer: the counts add up,
+/// `listed == not_advertisable + withheld + duplicate + offered`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AdvertiseRoundSummary {
+    peer: String,
+    listed: usize,
+    not_advertisable: usize,
+    withheld: usize,
+    withheld_by_reason: BTreeMap<&'static str, u64>,
+    duplicate: usize,
+    offered: usize,
+    reoffered_after_skip: usize,
+}
+
+/// The per-page counts of [`FederationDirectoryReplicationBridge::attestation_page`].
+#[derive(Debug, Default, Clone, Copy)]
+struct PageCounts {
+    not_advertisable: usize,
+    duplicate: usize,
+    offered: usize,
+    reoffered_after_skip: usize,
+}
+
+fn advertise_summary_log() -> &'static crate::log_throttle::LogThrottle {
+    static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(120), 1024))
+}
+
+fn resweep_cycle_log() -> &'static crate::log_throttle::LogThrottle {
+    static LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| crate::log_throttle::LogThrottle::new(2, Duration::from_secs(600), 1024))
+}
+
+/// A short, stable spelling of a resume position for a log line.
+fn cursor_label(c: Option<&ResumeCursor>) -> String {
+    c.map_or_else(
+        || "start".to_owned(),
+        |(at, id)| format!("{}/{}", at.to_rfc3339(), id),
+    )
 }
 
 /// CIRISEdge#531 DEPTH — the second page of a round, when the new-rows read
@@ -1336,6 +1465,46 @@ impl SweepCursors {
         } else if let Some(c) = last {
             wm.backfill = Some(c);
         }
+    }
+
+    /// A row read from `before` (exclusive) was skipped as not advertisable:
+    /// keep the EARLIEST such position for this peer and plane.
+    fn note_skip(&mut self, key: &(String, EnvelopeKind), before: Option<ResumeCursor>) {
+        let wm = self.touch(key);
+        wm.skip_mark = Some(match wm.skip_mark.take() {
+            None => before,
+            // `None` (the beginning) is the earliest position there is.
+            Some(None) => None,
+            Some(Some(old)) => match before {
+                None => None,
+                Some(new) => Some(if new < old { new } else { old }),
+            },
+        });
+    }
+
+    /// An advertise input changed: every watermark that passed a skipped row
+    /// rewinds its new-rows cursor to the earliest skip, so the next round
+    /// re-reads from there. Returns how many `(peer, plane)` watermarks moved.
+    fn rewind_skipped(&mut self) -> usize {
+        let mut moved = 0;
+        for wm in self.by_peer_plane.values_mut() {
+            if let Some(mark) = wm.skip_mark.take() {
+                wm.high_water = mark;
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// The new-rows and re-sweep positions for `key` (the round summary).
+    fn positions(
+        &self,
+        key: &(String, EnvelopeKind),
+    ) -> (Option<ResumeCursor>, Option<ResumeCursor>) {
+        self.by_peer_plane
+            .get(key)
+            .map(|wm| (wm.high_water.clone(), wm.backfill.clone()))
+            .unwrap_or_default()
     }
 
     /// Fetch-or-create, stamping the LRU tick and enforcing the cap.
@@ -1950,6 +2119,18 @@ pub struct FederationDirectoryReplicationBridge {
     /// `std::sync::Mutex`, never held across an `.await`: the lock is taken to
     /// read a cursor, dropped, the page is read, then taken again to record it.
     sweep_cursors: Mutex<SweepCursors>,
+    /// The advertise predicate's inputs as last seen, and their generation
+    /// ([`Self::check_advertise_inputs`]).
+    advertise_inputs: Mutex<AdvertiseInputs>,
+    /// Rows the Attestation advertise skipped as not advertisable, per peer,
+    /// with when and why, and the running re-sweep cycles
+    /// ([`AdvertiseLedger`]).
+    advertise_ledger: Mutex<AdvertiseLedger>,
+    /// Per peer, the withholds booked during that peer's open Attestation
+    /// advertise round, by reason (the round summary's breakdown).
+    round_withholds: Mutex<HashMap<String, BTreeMap<&'static str, u64>>>,
+    /// The last Attestation advertise round's summary (tests + diagnostics).
+    last_advertise_round: Mutex<Option<AdvertiseRoundSummary>>,
     /// CIRISEdge#552 — hashes learned without their bodies, and who advertised
     /// them. In-memory: CIRISPersist#785 is where this becomes durable, and the
     /// advertise re-sweep re-learns anything lost to a restart.
@@ -2251,6 +2432,10 @@ impl FederationDirectoryReplicationBridge {
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
+            advertise_inputs: Mutex::new(AdvertiseInputs::default()),
+            advertise_ledger: Mutex::new(AdvertiseLedger::default()),
+            round_withholds: Mutex::new(HashMap::new()),
+            last_advertise_round: Mutex::new(None),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
             // this node just refused, not a policy, so there is no configuration
@@ -2345,6 +2530,10 @@ impl FederationDirectoryReplicationBridge {
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
+            advertise_inputs: Mutex::new(AdvertiseInputs::default()),
+            advertise_ledger: Mutex::new(AdvertiseLedger::default()),
+            round_withholds: Mutex::new(HashMap::new()),
+            last_advertise_round: Mutex::new(None),
             sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
             // CIRISEdge#544 — always on. It is a rate limiter on asking for what
             // this node just refused, not a policy, so there is no configuration
@@ -2872,6 +3061,107 @@ impl FederationDirectoryReplicationBridge {
         }
     }
 
+    /// The advertise predicate's inputs NOW: the self-publish set, the
+    /// per-kind publish selector's answers, and the cohort.
+    fn advertise_fingerprint(&self) -> AdvertiseFingerprint {
+        let self_set = self
+            .self_provider
+            .as_ref()
+            .map(|p| p())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let selector = self
+            .kind_publish_selector
+            .as_ref()
+            .map(|sel| {
+                [
+                    EnvelopeKind::Key,
+                    EnvelopeKind::IdentityOccurrence,
+                    EnvelopeKind::TransportDestination,
+                ]
+                .into_iter()
+                .filter_map(|k| {
+                    sel.select(k)
+                        .map(|set| (k.as_wire_str(), set.into_iter().collect()))
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+        let cohort = (self.cohort)().into_iter().collect();
+        AdvertiseFingerprint {
+            self_set,
+            selector,
+            cohort,
+        }
+    }
+
+    /// The class fix for rows stranded behind a watermark: the watermark
+    /// tracks the READ, so it passes a row the advertise predicate skipped,
+    /// and only the rolling re-sweep (one page per round) would come back to
+    /// it. When an input of that predicate changes (the self-publish set, the
+    /// per-kind publish selector, the cohort), a skipped row may now be
+    /// advertisable: every watermark that passed one rewinds to its earliest
+    /// skip, so the next round re-reads it. Run at the start of every
+    /// watermarked sweep; says what changed and what edge did about it.
+    /// Returns the current generation.
+    fn check_advertise_inputs(&self) -> u64 {
+        let now = self.advertise_fingerprint();
+        let Ok(mut inputs) = self.advertise_inputs.lock() else {
+            return 0;
+        };
+        let Some(last) = inputs.last.clone() else {
+            tracing::debug!(
+                self_set = now.self_set.len(),
+                selector_kinds = now.selector.len(),
+                cohort = now.cohort.len(),
+                "advertise inputs first seen (generation 0)"
+            );
+            inputs.last = Some(now);
+            return 0;
+        };
+        if last == now {
+            return inputs.generation;
+        }
+        let added: Vec<String> = now.self_set.difference(&last.self_set).cloned().collect();
+        let removed: Vec<String> = last.self_set.difference(&now.self_set).cloned().collect();
+        let selector_changed = last.selector != now.selector;
+        let cohort_changed = last.cohort != now.cohort;
+        inputs.generation += 1;
+        let generation = inputs.generation;
+        let rewound = self
+            .sweep_cursors
+            .lock()
+            .map_or(0, |mut c| c.rewind_skipped());
+        if let Some(m) = &self.metrics {
+            for _ in 0..rewound {
+                m.inc_advertise(crate::observability::ADVERTISE_WATERMARK_REWOUND);
+            }
+        }
+        tracing::info!(
+            generation,
+            added = ?added,
+            removed = ?removed,
+            self_set = now.self_set.len(),
+            selector_changed,
+            cohort_changed,
+            watermarks_rewound = rewound,
+            "self-publish set changed: +{added:?} -{removed:?} (generation {generation}); \
+             watermark rewound to the earliest skipped row for {rewound} peer/plane(s), so rows \
+             skipped as not advertisable are re-read next round"
+        );
+        inputs.last = Some(now);
+        generation
+    }
+
+    /// Note that a row read after `before` was skipped as not advertisable on
+    /// `key`'s sweep.
+    fn note_sweep_skip(&self, key: &(String, EnvelopeKind), before: Option<ResumeCursor>) {
+        if let Ok(mut c) = self.sweep_cursors.lock() {
+            c.note_skip(key, before);
+        }
+    }
+
     /// CIRISEdge#531 DEPTH — this round's NEW-ROWS `since` for `key`.
     fn sweep_head(&self, key: &(String, EnvelopeKind)) -> Option<ResumeCursor> {
         self.sweep_cursors.lock().ok().and_then(|mut c| c.head(key))
@@ -3151,11 +3441,28 @@ impl FederationDirectoryReplicationBridge {
         };
 
         // ── WATERMARK: new rows first, then the rolling re-sweep. ──
+        self.check_advertise_inputs();
+        // The earliest position before a row this page's `in_scope` skipped:
+        // the watermark passes it, and a later input change rewinds to it.
+        let first_skip =
+            |since: &Option<ResumeCursor>, rows: &[S]| -> Option<Option<ResumeCursor>> {
+                let mut before = since.clone();
+                for r in rows {
+                    if !in_scope(r) {
+                        return Some(before);
+                    }
+                    before = Some(resume(r));
+                }
+                None
+            };
         let head = self.sweep_head(&key);
         let (served, last) = {
             let _permit = self.sweep_gate.enter().await;
-            let rows = read(head, budget).await;
+            let rows = read(head.clone(), budget).await;
             self.record_page(rows.len());
+            if let Some(before) = first_skip(&head, &rows) {
+                self.note_sweep_skip(&key, before);
+            }
             let mask = self.page_mask(kind, &rows, &in_scope, &mut gate).await;
             self.advertise_page_into(
                 &rows,
@@ -3171,8 +3478,11 @@ impl FederationDirectoryReplicationBridge {
         if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
             let (b_served, b_last) = {
                 let _permit = self.sweep_gate.enter().await;
-                let rows = read(plan.since, plan.budget).await;
+                let rows = read(plan.since.clone(), plan.budget).await;
                 self.record_page(rows.len());
+                if let Some(before) = first_skip(&plan.since, &rows) {
+                    self.note_sweep_skip(&key, before);
+                }
                 let mask = self.page_mask(kind, &rows, &in_scope, &mut gate).await;
                 self.advertise_page_into(
                     &rows,
@@ -3255,6 +3565,11 @@ impl FederationDirectoryReplicationBridge {
     fn withhold(&self, reason: crate::observability::WithholdReason, peer: &str, detail: &str) {
         if let Some(m) = self.metrics.as_ref() {
             m.inc_withhold(reason, peer, detail);
+        }
+        if let Ok(mut open) = self.round_withholds.lock() {
+            if let Some(tally) = open.get_mut(peer) {
+                *tally.entry(reason.as_str()).or_insert(0) += 1;
+            }
         }
     }
 
@@ -8190,12 +8505,13 @@ impl FederationDirectoryReplicationBridge {
             //    drained a page at a time. No peer ⇒ no watermark to keep.
             let mut since: Option<ResumeCursor> = None;
             for _ in 0..MAX_FULL_DRAIN_PAGES {
-                let (served, last) = self
+                let (served, last, _counts) = self
                     .attestation_page(
                         since.clone(),
                         budget,
                         &mut ctx,
                         peer_label,
+                        None,
                         &mut refs,
                         &mut seen,
                     )
@@ -8210,24 +8526,221 @@ impl FederationDirectoryReplicationBridge {
 
         // ── The WATERMARKED advertise: this peer's new rows first, then a
         //    page of the rolling re-sweep with whatever budget is left.
+        let generation = self.check_advertise_inputs();
+        if let Ok(mut open) = self.round_withholds.lock() {
+            open.insert(peer_label.to_owned(), BTreeMap::new());
+        }
+        let (wm_before, resweep_before) = self
+            .sweep_cursors
+            .lock()
+            .map(|c| c.positions(&key))
+            .unwrap_or_default();
         let head = self.sweep_head(&key);
-        let (served, last) = self
-            .attestation_page(head, budget, &mut ctx, peer_label, &mut refs, &mut seen)
+        let (served, last, head_counts) = self
+            .attestation_page(
+                head,
+                budget,
+                &mut ctx,
+                peer_label,
+                Some(&key),
+                &mut refs,
+                &mut seen,
+            )
             .await;
+        let mut listed = served;
+        let mut counts = head_counts;
+        let mut resweep: Option<(Option<ResumeCursor>, usize, bool)> = None;
         if let Some(plan) = self.sweep_after_head(&key, served, budget, last) {
-            let (b_served, b_last) = self
+            if plan.since.is_none() {
+                self.resweep_cycle_started(&key);
+            }
+            let (b_served, b_last, b_counts) = self
                 .attestation_page(
-                    plan.since,
+                    plan.since.clone(),
                     plan.budget,
                     &mut ctx,
                     peer_label,
+                    Some(&key),
                     &mut refs,
                     &mut seen,
                 )
                 .await;
             self.sweep_after_backfill(&key, b_served, plan.budget, b_last);
+            let wrapped = b_served < plan.budget as usize;
+            self.resweep_cycle_step(&key, wrapped);
+            listed += b_served;
+            counts.not_advertisable += b_counts.not_advertisable;
+            counts.duplicate += b_counts.duplicate;
+            counts.offered += b_counts.offered;
+            counts.reoffered_after_skip += b_counts.reoffered_after_skip;
+            resweep = Some((plan.since, b_served, wrapped));
+        }
+        let (wm_after, _) = self
+            .sweep_cursors
+            .lock()
+            .map(|c| c.positions(&key))
+            .unwrap_or_default();
+        let mut withheld_by_reason = self
+            .round_withholds
+            .lock()
+            .ok()
+            .and_then(|mut open| open.remove(peer_label))
+            .unwrap_or_default();
+        let withheld = listed
+            .saturating_sub(counts.not_advertisable)
+            .saturating_sub(counts.duplicate)
+            .saturating_sub(counts.offered);
+        let booked: u64 = withheld_by_reason.values().sum();
+        let unbooked = (withheld as u64).saturating_sub(booked);
+        if unbooked > 0 {
+            withheld_by_reason.insert("unbooked", unbooked);
+        }
+        let summary = AdvertiseRoundSummary {
+            peer: peer_label.to_owned(),
+            listed,
+            not_advertisable: counts.not_advertisable,
+            withheld,
+            withheld_by_reason,
+            duplicate: counts.duplicate,
+            offered: counts.offered,
+            reoffered_after_skip: counts.reoffered_after_skip,
+        };
+        self.log_advertise_round(
+            &summary,
+            generation,
+            (wm_before.as_ref(), wm_after.as_ref()),
+            resweep_before.as_ref(),
+            resweep.as_ref(),
+        );
+        if let Ok(mut last) = self.last_advertise_round.lock() {
+            *last = Some(summary);
         }
         refs
+    }
+
+    /// Say one Attestation advertise round for one peer: DEBUG always, INFO
+    /// (throttled per peer) when anything was skipped or withheld. The counts
+    /// add up: `listed = not_advertisable + withheld + duplicate + offered`.
+    fn log_advertise_round(
+        &self,
+        r: &AdvertiseRoundSummary,
+        generation: u64,
+        (wm_before, wm_after): (Option<&ResumeCursor>, Option<&ResumeCursor>),
+        resweep_before: Option<&ResumeCursor>,
+        resweep: Option<&(Option<ResumeCursor>, usize, bool)>,
+    ) {
+        let pass = match resweep {
+            None => "new-rows".to_owned(),
+            Some((from, read, wrapped)) => format!(
+                "new-rows + re-sweep from {} ({read} read{})",
+                cursor_label(from.as_ref()),
+                if *wrapped { ", cycle complete" } else { "" }
+            ),
+        };
+        let line = format!(
+            "attestation advertise round: listed={} not_advertisable={} withheld={} {:?} \
+             duplicate={} offered={} (re-offered after skip: {}); watermark {} -> {}; {pass}; \
+             re-sweep position before {}; inputs generation {generation}",
+            r.listed,
+            r.not_advertisable,
+            r.withheld,
+            r.withheld_by_reason,
+            r.duplicate,
+            r.offered,
+            r.reoffered_after_skip,
+            cursor_label(wm_before),
+            cursor_label(wm_after),
+            cursor_label(resweep_before),
+        );
+        tracing::debug!(peer = %r.peer, "{line}");
+        if r.not_advertisable + r.withheld > 0 {
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                advertise_summary_log().check(&r.peer)
+            {
+                tracing::info!(peer = %r.peer, suppressed_prev, "{line}");
+            }
+        }
+    }
+
+    /// A rolling re-sweep cycle starts for `key` (its backfill reads from the
+    /// beginning).
+    fn resweep_cycle_started(&self, key: &(String, EnvelopeKind)) {
+        if let Ok(mut l) = self.advertise_ledger.lock() {
+            l.cycles.insert(
+                key.clone(),
+                ResweepCycle {
+                    started: Instant::now(),
+                    rounds: 0,
+                    reoffered: 0,
+                    overdue_warned: false,
+                },
+            );
+        }
+        if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+            resweep_cycle_log().check(&format!("start:{}:{:?}", key.0, key.1))
+        {
+            tracing::info!(
+                peer = %key.0,
+                kind = ?key.1,
+                suppressed_prev,
+                "re-sweep cycle started (the rolling re-read of the whole plane, one page per \
+                 round; CIRISEdge#531)"
+            );
+        }
+    }
+
+    /// One re-sweep page read for `key`: complete the cycle when it wrapped,
+    /// else count the round and say once when it is past its bound.
+    fn resweep_cycle_step(&self, key: &(String, EnvelopeKind), wrapped: bool) {
+        let Ok(mut l) = self.advertise_ledger.lock() else {
+            return;
+        };
+        if wrapped {
+            let Some(c) = l.cycles.remove(key) else {
+                return;
+            };
+            drop(l);
+            if let Some(m) = &self.metrics {
+                m.inc_advertise(crate::observability::ADVERTISE_RESWEEP_CYCLE_COMPLETED);
+            }
+            if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                resweep_cycle_log().check(&format!("done:{}:{:?}", key.0, key.1))
+            {
+                tracing::info!(
+                    peer = %key.0,
+                    kind = ?key.1,
+                    elapsed_secs = c.started.elapsed().as_secs(),
+                    rounds = c.rounds + 1,
+                    reoffered = c.reoffered,
+                    suppressed_prev,
+                    "re-sweep cycle completed; re-offered {} previously skipped row(s)",
+                    c.reoffered
+                );
+            }
+            return;
+        }
+        let Some(c) = l.cycles.get_mut(key) else {
+            return;
+        };
+        c.rounds += 1;
+        if !c.overdue_warned && c.started.elapsed() > RESWEEP_CYCLE_BOUND {
+            c.overdue_warned = true;
+            let (elapsed, rounds) = (c.started.elapsed().as_secs(), c.rounds);
+            drop(l);
+            if let Some(m) = &self.metrics {
+                m.inc_advertise(crate::observability::ADVERTISE_RESWEEP_CYCLE_OVERDUE);
+            }
+            tracing::warn!(
+                peer = %key.0,
+                kind = ?key.1,
+                elapsed_secs = elapsed,
+                rounds,
+                bound_secs = RESWEEP_CYCLE_BOUND.as_secs(),
+                "re-sweep cycle has NOT completed within its bound: a row this node passed \
+                 (skipped, or offered and lost) waits this long to be re-offered; the plane is \
+                 large for the page budget, or new rows keep the re-sweep starved (CIRISEdge#531)"
+            );
+        }
     }
 
     /// CIRISEdge#531 DEPTH — read ONE Attestation page and run the full
@@ -8245,15 +8758,19 @@ impl FederationDirectoryReplicationBridge {
     /// before returning: the loop is where the `serde_json::Value` per row is
     /// built, so it is part of the materialisation the width bound is about.
     #[allow(clippy::too_many_lines)] // one gate loop; every gate is a named helper already
+    #[allow(clippy::too_many_arguments)] // the round's accumulators plus the watermark key
     async fn attestation_page(
         &self,
         since: Option<ResumeCursor>,
         budget: u32,
         ctx: &mut AttestationSweepCtx,
         peer_label: &str,
+        mark_key: Option<&(String, EnvelopeKind)>,
         refs: &mut Vec<EnvelopeRef>,
         seen: &mut HashSet<[u8; 32]>,
-    ) -> (usize, Option<ResumeCursor>) {
+    ) -> (usize, Option<ResumeCursor>, PageCounts) {
+        let mut counts = PageCounts::default();
+        let mut prev = since.clone();
         let _permit = self.sweep_gate.enter().await;
         let attestations = self
             .directory
@@ -8266,6 +8783,13 @@ impl FederationDirectoryReplicationBridge {
             .last()
             .map(ciris_persist::federation::ServedAttestation::resume_pair);
         for att in &attestations {
+            // The read position just before this row (the skip mark's value).
+            let before = std::mem::replace(
+                &mut prev,
+                Some(ciris_persist::federation::ServedAttestation::resume_pair(
+                    att,
+                )),
+            );
             // CIRISEdge#531, SECOND HALF — the gates below read exactly FOUR
             // strings, and this used to hand them a full `serde_json::to_value`
             // of the whole row: ~19 fields serialised AND a deep clone of the
@@ -8295,6 +8819,33 @@ impl FederationDirectoryReplicationBridge {
             // sweep and bury the gates that ARE decisions. The audit trail for
             // projection lives in `namespace::projection_for`, not here.
             if !Self::attestation_is_advertised(&canonical_json, &ctx.self_set) {
+                // Not a withhold (above), but no longer SILENT: a row passed
+                // here is passed by the watermark too, so it is named, and its
+                // position marked for the rewind an input change triggers
+                // (`check_advertise_inputs`).
+                counts.not_advertisable += 1;
+                let reason = Self::not_advertisable_reason(&canonical_json);
+                tracing::debug!(
+                    peer = %mark_key.map_or(peer_label, |k| k.0.as_str()),
+                    attestation_id = %att.attestation.attestation_id,
+                    dimension = %canonical_json
+                        .pointer("/attestation_envelope/dimension")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                    attester = %att.attestation.attesting_key_id,
+                    self_set = ctx.self_set.len(),
+                    "attestation not advertisable: {reason} (self-publish set of {})",
+                    ctx.self_set.len()
+                );
+                if let Some(m) = &self.metrics {
+                    m.inc_advertise(crate::observability::ADVERTISE_NOT_ADVERTISABLE);
+                }
+                if let Some(k) = mark_key {
+                    if let Ok(mut l) = self.advertise_ledger.lock() {
+                        l.note_skipped(&k.0, &att.attestation.attestation_id, reason);
+                    }
+                    self.note_sweep_skip(k, before);
+                }
                 continue;
             }
             // CIRISEdge#738 — a chunked file this peer has receipted in full
@@ -8431,14 +8982,51 @@ impl FederationDirectoryReplicationBridge {
                 continue;
             };
             if !seen.insert(hash) {
+                counts.duplicate += 1;
                 continue;
             }
             refs.push(EnvelopeRef {
                 envelope_hash: hash,
                 seq: Self::ms_seq(att.admitted_at),
             });
+            counts.offered += 1;
+            if let Some(k) = mark_key {
+                let skipped = self.advertise_ledger.lock().ok().and_then(|mut l| {
+                    let s = l.take_skipped(&k.0, &att.attestation.attestation_id);
+                    if s.is_some() {
+                        if let Some(c) = l.cycles.get_mut(k) {
+                            c.reoffered += 1;
+                        }
+                    }
+                    s
+                });
+                if let Some(skipped) = skipped {
+                    counts.reoffered_after_skip += 1;
+                    if let Some(m) = &self.metrics {
+                        m.inc_advertise(crate::observability::ADVERTISE_REOFFERED_AFTER_SKIP);
+                    }
+                    tracing::debug!(
+                        peer = %k.0,
+                        attestation_id = %att.attestation.attestation_id,
+                        "row {} offered after being skipped at {} (reason now cleared: {})",
+                        att.attestation.attestation_id,
+                        skipped.at.to_rfc3339(),
+                        skipped.reason
+                    );
+                }
+            }
         }
-        (served, last)
+        (served, last, counts)
+    }
+
+    /// Why [`Self::attestation_is_advertised`] refused a row (the only two
+    /// refusals it has).
+    fn not_advertisable_reason(canonical_json: &serde_json::Value) -> &'static str {
+        if Self::attestation_cohort_scope(canonical_json).is_empty() {
+            "cohort_scope present but empty (malformed)"
+        } else {
+            "SelfOwn row: attester not in this node's self-publish set"
+        }
     }
 
     /// persist v59.0.0 — the Revocation plane: the `key:revocation:v1` ROW of
@@ -24473,6 +25061,217 @@ pub(crate) mod tests {
     // CIRISEdge#817 — the sweep-bound witnesses: single-flight memos and the
     // permit around the membership-plane and send-set reads.
     mod sweep_bounds_817;
+
+    // CIRISServer native T2 — rows stranded behind the advertise watermark
+    // when an advertise input changes, and the round summary's arithmetic.
+    mod advertise_inputs_659 {
+        use super::*;
+
+        /// A federation-tier, `self`-scoped attestation by `producer`, asserted
+        /// `secs` after a fixed instant: it projects `SelfOwn`, so it is
+        /// advertisable here only while `producer` is in the self-publish set.
+        async fn seed_self_row(backend: &Arc<MemoryBackend>, producer: &str, secs: i64) -> String {
+            let at = (chrono::DateTime::from_timestamp(1_760_000_000, 0).expect("instant")
+                + chrono::Duration::seconds(secs))
+            .trunc_subsecs(6);
+            let attestation_id = format!("row-{producer}-{secs:04}");
+            let mut envelope = serde_json::json!({
+                "attesting_key_id": producer,
+                "attested_key_id": producer,
+                "attestation_type": "scores",
+                "dimension": "identity:example:v1",
+                "cohort_scope": "self",
+            });
+            bind_attestation_envelope(
+                &mut envelope,
+                at,
+                &attestation_id,
+                producer,
+                "scores",
+                producer,
+                &[producer],
+                "self",
+            );
+            let (hash_hex, ed_sig, pqc_sig) = sign_attestation_envelope(producer, &envelope);
+            backend
+                .put_attestation(SignedAttestation {
+                    attestation: Attestation {
+                        attestation_id: attestation_id.clone(),
+                        attesting_key_id: producer.to_string(),
+                        attested_key_id: producer.to_string(),
+                        attestation_type: "scores".to_string(),
+                        weight: None,
+                        asserted_at: at,
+                        expires_at: None,
+                        attestation_envelope: envelope,
+                        original_content_hash: hash_hex,
+                        scrub_signature_classical: ed_sig,
+                        scrub_signature_pqc: pqc_sig,
+                        scrub_key_id: producer.to_string(),
+                        scrub_timestamp: at,
+                        pqc_completed_at: None,
+                        persist_row_hash: String::new(),
+                        subject_key_ids: vec![producer.to_string()],
+                        withdraws_admission_rule: None,
+                        additional_scrubs: Vec::new(),
+                        cohort_scope: "self".to_string(),
+                        tier: "federation".to_string(),
+                        promoted_at: None,
+                    },
+                })
+                .await
+                .expect("seed self-scoped attestation");
+            attestation_id
+        }
+
+        async fn hash_of(backend: &Arc<MemoryBackend>, attestation_id: &str) -> [u8; 32] {
+            let rows = backend
+                .list_attestations_since(None, 1024)
+                .await
+                .expect("list");
+            let row = rows
+                .iter()
+                .find(|r| r.attestation.attestation_id == attestation_id)
+                .expect("the row");
+            content_hash_of(&row.attestation).expect("hash").0
+        }
+
+        /// A bridge over `backend` paging `page` rows, whose self-publish set
+        /// is the LIVE `set` (as a host's is).
+        fn live_bridge(
+            backend: &Arc<MemoryBackend>,
+            page: u32,
+            set: &Arc<std::sync::RwLock<Vec<String>>>,
+        ) -> FederationDirectoryReplicationBridge {
+            let dir: Arc<dyn FederationDirectory> = backend.clone();
+            let cohort_cb: CohortProvider = Arc::new(Vec::new);
+            let live = Arc::clone(set);
+            let provider: CohortProvider =
+                Arc::new(move || live.read().map(|v| v.clone()).unwrap_or_default());
+            FederationDirectoryReplicationBridge::with_config(
+                dir,
+                cohort_cb,
+                BridgeConfig {
+                    sweep_page_rows: page,
+                    ..BridgeConfig::default()
+                },
+            )
+            .with_self_provider(Some(provider))
+        }
+
+        /// The field's T2 shape: bob's acceptance was admitted while bob was
+        /// not yet in the node's self-publish set, so the watermark passed it
+        /// (it tracks the READ). Bob then joins the set. The row must be
+        /// offered to the peer in the very next round, not one rolling
+        /// re-sweep cycle later: the plane here is larger than a page and the
+        /// row sits past the re-sweep's first page.
+        #[tokio::test]
+        async fn a_row_skipped_before_its_author_joined_the_self_set_is_offered_once_it_does_659() {
+            let backend = Arc::new(MemoryBackend::new());
+            for k in ["this-node", "bob"] {
+                backend
+                    .put_public_key(SignedKeyRecord {
+                        record: fixture_key_record(k, identity_type::AGENT),
+                    })
+                    .await
+                    .expect("seed key");
+            }
+            // Six rows, page of two: this node's own, with bob's in the middle.
+            for secs in [1, 2, 3] {
+                seed_self_row(&backend, "this-node", secs).await;
+            }
+            let bobs = seed_self_row(&backend, "bob", 4).await;
+            for secs in [5, 6] {
+                seed_self_row(&backend, "this-node", secs).await;
+            }
+            let bobs_hash = hash_of(&backend, &bobs).await;
+            let set = Arc::new(std::sync::RwLock::new(vec!["this-node".to_string()]));
+            let bridge = live_bridge(&backend, 2, &set);
+            let window = SweepWindow::Watermark("peer-a");
+
+            // Catch up through the whole plane: bob's row is read and skipped.
+            let mut offered: Vec<[u8; 32]> = Vec::new();
+            for _ in 0..4 {
+                offered.extend(
+                    bridge
+                        .list_attestations(None, window)
+                        .await
+                        .into_iter()
+                        .map(|r| r.envelope_hash),
+                );
+            }
+            assert!(
+                !offered.contains(&bobs_hash),
+                "bob's row is not advertisable while bob is outside the set"
+            );
+
+            // Bob joins the live set (the claim).
+            set.write().expect("set").push("bob".to_string());
+
+            let next: Vec<[u8; 32]> = bridge
+                .list_attestations(None, window)
+                .await
+                .into_iter()
+                .map(|r| r.envelope_hash)
+                .collect();
+            assert!(
+                next.contains(&bobs_hash),
+                "the row skipped before its author joined the self set is offered in the next \
+                 round, not stranded behind the watermark"
+            );
+            let summary = bridge
+                .last_advertise_round
+                .lock()
+                .expect("summary")
+                .clone()
+                .expect("a round ran");
+            assert!(
+                summary.reoffered_after_skip >= 1,
+                "the round names the re-offer: {summary:?}"
+            );
+        }
+
+        /// One simple round's summary adds up:
+        /// `listed = not_advertisable + withheld + duplicate + offered`.
+        #[tokio::test]
+        async fn the_advertise_round_summary_counts_add_up_659() {
+            let backend = Arc::new(MemoryBackend::new());
+            for k in ["this-node", "other"] {
+                backend
+                    .put_public_key(SignedKeyRecord {
+                        record: fixture_key_record(k, identity_type::AGENT),
+                    })
+                    .await
+                    .expect("seed key");
+            }
+            seed_self_row(&backend, "this-node", 1).await;
+            seed_self_row(&backend, "this-node", 2).await;
+            seed_self_row(&backend, "other", 3).await;
+            let set = Arc::new(std::sync::RwLock::new(vec!["this-node".to_string()]));
+            let bridge = live_bridge(&backend, 16, &set);
+            let refs = bridge
+                .list_attestations(None, SweepWindow::Watermark("peer-a"))
+                .await;
+            let s = bridge
+                .last_advertise_round
+                .lock()
+                .expect("summary")
+                .clone()
+                .expect("a round ran");
+            assert_eq!(s.listed, 3, "{s:?}");
+            assert_eq!(
+                s.not_advertisable, 1,
+                "the other producer's self row: {s:?}"
+            );
+            assert_eq!(s.offered, 2, "{s:?}");
+            assert_eq!(s.offered, refs.len());
+            assert_eq!(
+                s.listed,
+                s.not_advertisable + s.withheld + s.duplicate + s.offered,
+                "the counts add up: {s:?}"
+            );
+        }
+    }
 }
 
 // ─── CIRISEdge#531 — the advertise-sweep WIDTH bound ─────────────────

@@ -989,6 +989,21 @@ pub const LINK_SEAL_REFUSED_UNSEALED_SEND: &str = "link_seal_refused_unsealed_se
 /// A sealed frame whose counter was already seen, or is older than the
 /// replay window: dropped, the link kept.
 pub const LINK_SEAL_DROPPED_REPLAY: &str = "link_seal_dropped_replay";
+/// A row the Attestation advertise's projection filter skipped (a `SelfOwn`
+/// row whose attester is not in this node's self-publish set, ...). Not a
+/// withhold: the row was not this node's to publish when it was read.
+pub const ADVERTISE_NOT_ADVERTISABLE: &str = "advertise_not_advertisable";
+/// A row offered after an earlier round skipped it as not advertisable (its
+/// reason has since cleared).
+pub const ADVERTISE_REOFFERED_AFTER_SKIP: &str = "advertise_reoffered_after_skip";
+/// A `(peer, plane)` watermark rewound to its earliest skipped row because an
+/// advertise input (the self-publish set, the per-kind publish selector, the
+/// cohort) changed.
+pub const ADVERTISE_WATERMARK_REWOUND: &str = "advertise_watermark_rewound";
+/// A rolling re-sweep cycle that walked its plane to the end.
+pub const ADVERTISE_RESWEEP_CYCLE_COMPLETED: &str = "advertise_resweep_cycle_completed";
+/// A rolling re-sweep cycle still running past its bound.
+pub const ADVERTISE_RESWEEP_CYCLE_OVERDUE: &str = "advertise_resweep_cycle_overdue";
 /// A request or response that completed on a link a peer dialled before the
 /// event loop had answered its handshake (the two ride different event planes,
 /// so a fast dialler's first frame can overtake its last handshake part), or a
@@ -1371,6 +1386,11 @@ pub struct EdgeMetrics {
     /// constants in this module): links keyed (`link_seal_initiated` /
     /// `link_seal_accepted`), each named refusal, and each dropped frame.
     pub link_seal: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// The Attestation advertise's own ledger, by label (`ADVERTISE_*`
+    /// constants in this module): rows the projection filter skipped, rows
+    /// re-offered after being skipped, watermark rewinds on an advertise
+    /// input change, and re-sweep cycles completed / overdue.
+    pub advertise: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// CIRISEdge#805 item 8 — direct links (leviculum#70) by label
     /// (`DIRECT_LINK_*` constants in this module): proposals made, skipped
     /// and refused, and each outcome. Every `direct_link_failed_*` label is a
@@ -2030,6 +2050,21 @@ impl EdgeMetrics {
     /// label.
     pub fn inc_link_seal(&self, label: &'static str) {
         *self.link_seal.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// Count one advertise event by its `ADVERTISE_*` label.
+    pub fn inc_advertise(&self, label: &'static str) {
+        *self.advertise.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// The advertise ledger by label (tests + the operator readback).
+    #[must_use]
+    pub fn advertise(&self) -> HashMap<String, u64> {
+        self.advertise
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
     }
 
     /// CC 5.3.3.5 E1 — the per-link seal ledger by label (tests + the
