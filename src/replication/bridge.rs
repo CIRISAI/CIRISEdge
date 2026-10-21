@@ -1884,14 +1884,6 @@ pub struct FederationDirectoryReplicationBridge {
     /// CIRISEdge#523 — the resolved owner-binding memo backing the Cohort-scoped
     /// advertise widening (`node_key_id → owner`). See [`OwnerCache`].
     owner_cache: Mutex<OwnerCache>,
-    /// This node's CURRENT owner (`owner_of` the node's own key), derived
-    /// live and joined to every resolution of the self-publish set
-    /// ([`Self::self_set`]). The host's set is captured once at runtime start,
-    /// which is before a person claims the node; without this the owner's
-    /// allegiance rows (its federation owner-binding, its `trust:accepts`) are
-    /// never offered. Refreshed once per round ([`Self::refresh_live_owner`])
-    /// through the owner memo; `None` for an unowned node.
-    live_owner: std::sync::RwLock<Option<String>>,
     /// CIRISEdge#817 — the owner memo's miss is SINGLE-FLIGHT per node, as
     /// [`Self::consent_flight`] is for the send-set. The instant is `None` for
     /// a re-checked hit and for an unresolved answer (never cached).
@@ -2225,7 +2217,6 @@ impl FederationDirectoryReplicationBridge {
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
-            live_owner: std::sync::RwLock::new(None),
             owner_flight: SingleFlight::default(),
             announce_cache: Mutex::new(HashMap::new()),
             announce_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -2320,7 +2311,6 @@ impl FederationDirectoryReplicationBridge {
             mesh_config: None,
             accord_relay_gate: None,
             owner_cache: Mutex::new(OwnerCache::default()),
-            live_owner: std::sync::RwLock::new(None),
             owner_flight: SingleFlight::default(),
             announce_cache: Mutex::new(HashMap::new()),
             announce_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -3627,7 +3617,6 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // even a canonical would use `Bodies` and discard every advertised
         // hash — the feature inert exactly where it matters.
         self.refresh_serve_tier().await;
-        self.refresh_live_owner().await;
         // CIRISEdge#531 DEPTH — this is THE advertise axis, and the only one
         // that carries a watermark: a bound peer gets one page budget per
         // round (new rows first, then a page of the rolling re-sweep), so the
@@ -3704,7 +3693,6 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         // Refreshing HERE rather than inside `retention()` keeps the sync
         // readers sync: this is the async call that already precedes them.
         self.refresh_serve_tier().await;
-        self.refresh_live_owner().await;
         // CIRISEdge#547 / CIRISPersist#780 — READ THE INDEX, NOT THE ROWS.
         //
         // Everything below is correct and was killing production. `holdings`
@@ -3956,7 +3944,6 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 }
             }
             self.refresh_serve_tier().await;
-            self.refresh_live_owner().await;
         }
         match peer_key_id {
             // Three entitled cases, in the order they were established:
@@ -4228,9 +4215,13 @@ impl FederationDirectoryReplicationBridge {
                     None => false,
                 };
                 if !first_party {
-                    self.refresh_live_owner().await;
-                    let self_set: HashSet<String> =
-                        self.self_set().unwrap_or_default().into_iter().collect();
+                    let self_set: HashSet<String> = self
+                        .self_provider
+                        .as_ref()
+                        .map(|p| p())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .collect();
                     if !Self::attestation_is_advertised(inner, &self_set) {
                         self.withhold(
                             crate::observability::WithholdReason::RecipientNotInSendSet,
@@ -5785,7 +5776,10 @@ impl FederationDirectoryReplicationBridge {
 
     fn subjects_for_projection(&self, projection: Projection) -> Vec<String> {
         match projection {
-            Projection::SelfOwn => self.self_set().unwrap_or_else(|| (self.cohort)()),
+            Projection::SelfOwn => {
+                let set = self.self_provider.as_ref().unwrap_or(&self.cohort);
+                set()
+            }
             // v36 (CIRISPersist#713 decomposition) — role-keyed (`Capability`)
             // and subject-keyed (`Subject`) audiences are NOT enumerable from a
             // roster: the narrowing happens PER RECIPIENT at send/fetch time
@@ -5795,7 +5789,8 @@ impl FederationDirectoryReplicationBridge {
             // gates are fail-closed.
             Projection::Cohort | Projection::Capability(_) | Projection::Subject => (self.cohort)(),
             Projection::Global => {
-                let mut subjects: Vec<String> = self.self_set().unwrap_or_default();
+                let mut subjects: Vec<String> =
+                    self.self_provider.as_ref().map(|p| p()).unwrap_or_default();
                 subjects.extend((self.cohort)());
                 subjects
             }
@@ -7169,8 +7164,9 @@ impl FederationDirectoryReplicationBridge {
             return false;
         };
         let self_authored = self
-            .self_set()
-            .is_some_and(|set| set.iter().any(|id| id == attester));
+            .self_provider
+            .as_ref()
+            .is_some_and(|p| p().iter().any(|id| id == attester));
         if !self_authored
             || field("attestation_type")
                 != Some(ciris_persist::federation::types::attestation_type::DELEGATES_TO)
@@ -7463,8 +7459,9 @@ impl FederationDirectoryReplicationBridge {
         // bootstrap kinds, and cross to an Attributed peer. Everything this node
         // holds ABOUT OTHERS stays behind the floor.
         let self_authored = self
-            .self_set()
-            .is_some_and(|set| set.iter().any(|id| id == attester));
+            .self_provider
+            .as_ref()
+            .is_some_and(|p| p().iter().any(|id| id == attester));
         // CIRISEdge#756 — and the membership ceremony addressed to the peer's
         // own person (§2.4): the invitation names the peer's person as its data
         // subject and the answer replies to the peer's person's own proposal, so
@@ -8170,7 +8167,13 @@ impl FederationDirectoryReplicationBridge {
         // lookups — the CIRISEdge#400 shape the memos exist to prevent.
         let mut ctx = AttestationSweepCtx {
             resolved_recipient,
-            self_set: self.self_set().unwrap_or_default().into_iter().collect(),
+            self_set: self
+                .self_provider
+                .as_ref()
+                .map(|p| p())
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             serve_allowed: None,
             grant_cache: HashMap::new(),
             trace_paused: self.trace_plane_paused().await,
@@ -8670,57 +8673,6 @@ impl FederationDirectoryReplicationBridge {
             )
             .await
             .0
-    }
-
-    /// Re-derive [`Self::live_owner`]: the owner of this node's own key (the
-    /// advertised identity, else `local_key_id`; a person key has no owner,
-    /// so each is asked and the first owned answer wins). Through the owner
-    /// memo, so a round costs at most one `owner_of` per subject per TTL. An
-    /// unresolved read keeps the last answer rather than dropping the owner.
-    async fn refresh_live_owner(&self) {
-        let mut subjects: Vec<&str> = Vec::with_capacity(2);
-        for s in [
-            self.serve_tier_subject.as_deref(),
-            self.local_key_id.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !subjects.contains(&s) {
-                subjects.push(s);
-            }
-        }
-        if subjects.is_empty() {
-            return;
-        }
-        let mut owner = None;
-        for subject in subjects {
-            match self.owner_of_cached(subject).await {
-                OwnerLookup::Owner(o) => {
-                    owner = Some(o);
-                    break;
-                }
-                OwnerLookup::Unowned => {}
-                OwnerLookup::Unresolved => return,
-            }
-        }
-        if let Ok(mut live) = self.live_owner.write() {
-            *live = owner;
-        }
-    }
-
-    /// The node's self-publish set as it stands NOW: the host's set
-    /// ([`Self::self_provider`]) joined with the node's current owner
-    /// ([`Self::live_owner`]). Nothing wider: not the owner's other nodes,
-    /// not its family. `None` when the host installed no self set.
-    fn self_set(&self) -> Option<Vec<String>> {
-        let mut set = self.self_provider.as_ref().map(|p| p())?;
-        if let Some(owner) = self.live_owner.read().ok().and_then(|o| o.clone()) {
-            if !set.contains(&owner) {
-                set.push(owner);
-            }
-        }
-        Some(set)
     }
 
     /// The owner memo's answer for `node_key_id` iff it is still fresh.
@@ -9398,8 +9350,8 @@ impl FederationDirectoryReplicationBridge {
         // nodes and its live invitees' nodes, or every peer for a public
         // group. The invitee's node needs the record to admit the proposal and
         // to fold the widening that follows (#736).
-        if let Some(own) = self.self_set() {
-            cohort.extend(own);
+        if let Some(own) = self.self_provider.as_ref() {
+            cohort.extend(own());
         }
         self.sweep_paged_gated(
             EnvelopeKind::Family,
@@ -9451,8 +9403,8 @@ impl FederationDirectoryReplicationBridge {
         // persist's `may_receive_group_plane` — the room's members' nodes and
         // its live invitees' nodes (the record travels with the invitation),
         // or every peer for a public group.
-        if let Some(own) = self.self_set() {
-            cohort.extend(own);
+        if let Some(own) = self.self_provider.as_ref() {
+            cohort.extend(own());
         }
         self.sweep_paged_gated(
             EnvelopeKind::Community,
