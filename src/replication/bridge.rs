@@ -4231,6 +4231,8 @@ impl FederationDirectoryReplicationBridge {
                         tracing::debug!(
                             peer = peer_label,
                             envelope_hash = %hex::encode(&envelope_hash[..8]),
+                            attestation_id = Self::row_attestation_id(inner),
+                            dimension = Self::row_dimension(inner),
                             "attestation withheld from direct fetch — the projection \
                              structurally hides this row from third parties (SelfOwn \
                              publish-own; only a first party may fetch it) (v18 \
@@ -7115,6 +7117,22 @@ impl FederationDirectoryReplicationBridge {
         .map_err(|e| e.to_string())
     }
 
+    /// The row's `attestation_id`, for a withhold line: the advertise gate
+    /// view and the wire row both carry it at the top level. Empty when absent.
+    fn row_attestation_id(row: &serde_json::Value) -> &str {
+        row.get("attestation_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    }
+
+    /// The row's envelope `dimension`, for a withhold line — read where both
+    /// the advertise gate view and the wire row keep it. Empty when absent.
+    fn row_dimension(row: &serde_json::Value) -> &str {
+        row.pointer("/attestation_envelope/dimension")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    }
+
     /// CIRISEdge#671 — is `row` one of THIS node's **allegiance facts**
     /// (`FSD/FIRST_CONTACT.md` §0)? Authored by a self-publish identity (the
     /// node key or its owner), a `delegates_to`, and one of exactly three
@@ -7281,6 +7299,8 @@ impl FederationDirectoryReplicationBridge {
             tracing::debug!(
                 peer,
                 attester,
+                attestation_id = Self::row_attestation_id(row),
+                dimension = Self::row_dimension(row),
                 audience = audience.cohort_scope(),
                 reach = reach.tag(),
                 site,
@@ -7319,6 +7339,8 @@ impl FederationDirectoryReplicationBridge {
             tracing::debug!(
                 peer,
                 attester,
+                attestation_id = Self::row_attestation_id(row),
+                dimension = Self::row_dimension(row),
                 site,
                 "attestation withheld — the recipient is an Attributed stranger (first \
                  contact) and this row is neither one of this node's allegiance facts nor \
@@ -7407,6 +7429,8 @@ impl FederationDirectoryReplicationBridge {
             tracing::debug!(
                 peer,
                 attester,
+                attestation_id = Self::row_attestation_id(row),
+                dimension = Self::row_dimension(row),
                 audience = audience.cohort_scope(),
                 site,
                 "attestation withheld — the recipient is not in the row's audience \
@@ -7454,6 +7478,8 @@ impl FederationDirectoryReplicationBridge {
             tracing::debug!(
                 peer,
                 attester,
+                attestation_id = Self::row_attestation_id(row),
+                dimension = Self::row_dimension(row),
                 site,
                 "attestation withheld — the recipient is Attributed but not Rooted: no valid \
                  trust root in common through the owner-bindings (CIRISEdge#659)"
