@@ -653,6 +653,18 @@ async fn a_classical_only_suite_is_refused_by_name_e1() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1() {
     let t = trio("nopair", false, false, false).await;
+    // CC 3.3.6.2 (rc9, I2) — B knows A ONLY by A's announce: the transport
+    // identity crossed, no signed route row did, so no pair is authenticated
+    // to A from any source. A bare announce never supplies a pair.
+    assert!(t.b.transport.knows_peer(&t.a.key.key_id).await);
+    assert!(
+        t.b.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list")
+            .is_empty(),
+        "B holds no signed route row of A"
+    );
     match t.b.transport.send(&t.a.key.key_id, b"never-sent").await {
         Err(TransportError::LinkSealRefused { peer, reason, .. }) => {
             assert_eq!(peer, t.a.key.key_id);

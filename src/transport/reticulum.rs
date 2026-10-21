@@ -5436,6 +5436,14 @@ impl ReticulumTransport {
         let pair = pin
             .pair_for(peer_key_id, &other_keys)
             .map_err(|r| refused(&r))?;
+        if let Some(m) = self.metrics.get() {
+            m.inc_link_seal(crate::observability::LINK_SEAL_PAIR_PIN);
+        }
+        tracing::info!(
+            peer = %peer_key_id,
+            source = crate::observability::LINK_SEAL_PAIR_PIN,
+            "transit pair authenticated for a first contact by the pairing pin (CC 3.2 (f))"
+        );
         admit_unattributed_frame(self.occurrence_key_id(), request).map_err(|r| refused(&r))?;
         let candidates = self.resolve_dial_candidates(peer_key_id).await;
         for c in &candidates {
@@ -10020,7 +10028,11 @@ impl DialCtx {
     /// BEFORE the dial: a node that publishes none cannot be keyed, so it is
     /// never dialled. A refusal is counted and logged by name.
     async fn resolve_transit_pair(&self, peer: &str) -> Result<TransitKexPair, TransportError> {
-        match self.seals.resolve_pair(self.rooting.as_deref(), peer).await {
+        match self
+            .seals
+            .resolve_pair(self.rooting.as_deref(), peer, self.metrics.as_ref())
+            .await
+        {
             Ok(pair) => Ok(pair),
             Err(
                 e @ crate::transport::av_transit_handshake::AvHandshakeError::NoTransitPair {
@@ -10173,7 +10185,11 @@ impl DialCtx {
         } else {
             match self
                 .seals
-                .resolve_pair(self.rooting.as_deref(), destination_key_id)
+                .resolve_pair(
+                    self.rooting.as_deref(),
+                    destination_key_id,
+                    self.metrics.as_ref(),
+                )
                 .await
             {
                 Ok(pair) => Ok(pair),

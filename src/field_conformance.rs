@@ -336,11 +336,32 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
     TestEvidence {
         cc: "5.3.3.5",
         clm: "CLM-transport-edge",
-        property: "a dial is keyed by the dialled node's Rooted pair or never made",
+        property: "a dial is keyed by a pair authenticated to the dialled node (a Rooted binding, its own signed route row, or a pairing pin) or never made",
         impl_anchor: "src/transport/reticulum.rs#DialCtx::dial_transit_pair",
         witness: &[
             "tests/link_seal_e1.rs#a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1",
             "tests/sealed_cut_bundle_e1.rs#a_fresh_device_reaches_its_owners_node_through_a_bundle_seeded_canonical_e1",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "3.3.6.2",
+        clm: "CLM-seal-authenticated-pair",
+        property: "the pair a dial seals to is authenticated to the dialled identity: a live Rooted binding, else the node's own hybrid-signed route row (signer = the dialled key, the #1103 fingerprint, the in-row separation, the signature re-verified at use); a bare announce never supplies one",
+        impl_anchor: "src/transport/transit_kex_peer.rs#PeerTransitResolver::resolve_authenticated",
+        witness: &[
+            "src/transport/transit_kex_peer.rs#a_rooted_binding_is_tried_before_the_nodes_own_signed_row_and_a_bare_announce_supplies_nothing",
+            "tests/link_seal_e1.rs#a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "3.3.6.2",
+        clm: "CLM-seal-authenticated-pair",
+        property: "the node's own hybrid-signed route row is the one row that carries its transit pair, so a node relays every such row it holds; a canonical is one source of route rows, never a required party",
+        impl_anchor: "src/replication/bridge.rs#FederationDirectoryReplicationBridge::relayable_signed_route",
+        witness: &[
+            "tests/attributed_allegiance_659.rs#two_persons_nodes_root_through_a_mutual_peer_that_relays_their_signed_routes_e1",
         ],
         supporting: false,
     },
@@ -1557,6 +1578,18 @@ mod tests {
              (carried-but-unprocessed, #315) — add each to EDGE_FIELD_CONFORMANCE or \
              DEFERRED_PENDING_PLANE with a reason: {gaps:#?}"
         );
+    }
+
+    /// The regeneration step `evidence_tsv_matches_emitted` names: prints the
+    /// rows the live tables emit. `cargo test --lib -- regenerate_evidence_tsv_stdout
+    /// --ignored --nocapture`, then replace everything after the TSV's `#`
+    /// header comment with the output.
+    #[test]
+    #[ignore = "a generator, not a check: run with --ignored --nocapture to regenerate the TSV"]
+    fn regenerate_evidence_tsv_stdout() {
+        for row in edge_evidence_rows() {
+            println!("{row}");
+        }
     }
 
     /// CIRISEdge#410 §3 — the vendored `evidence/CIRISEdge.cc_impl.tsv` (what the

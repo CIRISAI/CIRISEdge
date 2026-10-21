@@ -379,6 +379,18 @@ pub trait RootingDirectory: Send + Sync + 'static {
         Err("no federation directory wired (RootingDirectory default)".to_string())
     }
 
+    /// CC 3.3.6.2 / E1 (rc9, I1–I6) source (a) — the transit pair from the
+    /// dialled node's OWN hybrid-signed `transport_destination` row, held from
+    /// any source, authenticated to that node ([`authenticated_self_signed_transit_pair`]).
+    /// For a node not (yet) Rooted here. Default `Ok(None)`: a double with no
+    /// directory has no rows.
+    async fn self_signed_transit_pair_for(
+        &self,
+        _key_id: &str,
+    ) -> Result<Option<ciris_persist::federation::self_at_login::TransitKexPair>, String> {
+        Ok(None)
+    }
+
     /// CIRISEdge#406 — submit a signed route through persist's authenticated
     /// admission (`put_signed_transport_destination`: hybrid 1-of-1 over
     /// `JCS(signed_envelope)` against the attesting key's PINNED federation
@@ -510,6 +522,163 @@ mod hybrid_transport_binding_tests {
     }
 }
 
+/// Why one of a node's own signed route rows did not supply a transit pair
+/// under CC 3.3.6.2 source (a). Each is a refusal of THAT row; the dial is
+/// refused `link_seal_refused_no_pair` when no row (and no Rooted binding,
+/// and no pin) supplies one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfSignedPairRefusal {
+    /// The row is signed by, or names, a key other than the dialled one: a
+    /// relayed row signed by someone else never supplies a pair.
+    SignedByAnotherKey,
+    /// The dialled key is not registered here (no pinned pubkeys to verify).
+    UnknownKey,
+    /// The dialled `key_id`'s `-<fp>` suffix is not its Ed25519 key's
+    /// fingerprint (CIRISPersist#1103).
+    FingerprintMismatch,
+    /// The hybrid signature (or the row's envelope) does not verify.
+    SignatureInvalid,
+    /// The pair reuses one of the node's federation or transport keys.
+    Separation,
+    /// Two live self-signed rows carry different pairs.
+    Ambiguous,
+}
+
+impl SelfSignedPairRefusal {
+    /// The stable token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SignedByAnotherKey => "self_signed_row_signed_by_another_key",
+            Self::UnknownKey => "self_signed_row_key_unknown",
+            Self::FingerprintMismatch => "self_signed_row_fingerprint_mismatch",
+            Self::SignatureInvalid => "self_signed_row_signature_invalid",
+            Self::Separation => "self_signed_row_pair_not_separated",
+            Self::Ambiguous => "self_signed_rows_disagree",
+        }
+    }
+}
+
+/// **CC 3.3.6.2 + E1 + 5.3.4 (rc9 `c8f0d12`, I1–I6), source (a)** — the
+/// transit pair a dialler may seal to from the dialled node's OWN
+/// hybrid-signed `transport_destination` row, however that row reached this
+/// node (a peer that is not Rooted here has no Rooted binding; Rooted governs
+/// what a peer is SERVED, #659, not whether two keys may speak). Every live
+/// `reticulum` row for `key_id` is checked, each fail-closed:
+///
+/// 1. the row's signer IS `key_id` and the row is FOR `key_id` (never a key
+///    bound as an occurrence of it, never a relayed row signed by another);
+/// 2. `key_id` is registered here and its `-<fp>` suffix is the fingerprint
+///    of its Ed25519 key (CIRISPersist#1103,
+///    `register::key_id_fingerprint`);
+/// 3. the detached hybrid signature over the row's envelope verifies against
+///    `key_id`'s pinned pubkeys (persist's own gate,
+///    `admission::verify_signed_transport_destination`, re-run here: a row
+///    admitted once is re-checked at use);
+/// 4. the pair is separated from the node's federation signing keys and the
+///    row's transport identity (`self_at_login::check_transit_kex_pair`).
+///
+/// Two live rows that pass with different pairs supply none. A bare announce
+/// is never read here: it is not a signed row.
+///
+/// # Errors
+/// A directory read error. A row that fails a check is not an error: it
+/// supplies no pair, and the reason is logged at DEBUG.
+pub async fn authenticated_self_signed_transit_pair<F>(
+    dir: &F,
+    key_id: &str,
+) -> Result<Option<ciris_persist::federation::self_at_login::TransitKexPair>, String>
+where
+    F: FederationDirectory + ?Sized,
+{
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use ciris_persist::federation::self_at_login::{check_transit_kex_pair, TransitKexOtherKeys};
+    let rows = FederationDirectory::list_signed_transport_destinations_for(dir, key_id)
+        .await
+        .map_err(|e| format!("list_signed_transport_destinations_for: {e}"))?;
+    let refuse = |r: SelfSignedPairRefusal| {
+        tracing::debug!(
+            peer = %key_id,
+            reason = r.as_str(),
+            "a signed route row supplies no transit pair (CC 3.3.6.2 source (a))"
+        );
+    };
+    let mut found: Option<ciris_persist::federation::self_at_login::TransitKexPair> = None;
+    for row in rows.iter().filter(|r| {
+        r.transport_destination.transport_kind == "reticulum"
+            && r.transport_destination.retired_at.is_none()
+    }) {
+        if row.attesting_key_id != key_id || row.transport_destination.occurrence_key_id != key_id {
+            refuse(SelfSignedPairRefusal::SignedByAnotherKey);
+            continue;
+        }
+        let Some(record) = FederationDirectory::lookup_public_key(dir, key_id)
+            .await
+            .map_err(|e| format!("lookup_public_key: {e}"))?
+        else {
+            refuse(SelfSignedPairRefusal::UnknownKey);
+            continue;
+        };
+        let fingerprint_ok =
+            ciris_persist::federation::register::key_id_fingerprint(&record.pubkey_ed25519_base64)
+                .is_some_and(|fp| key_id.ends_with(&format!("-{fp}")));
+        if !fingerprint_ok {
+            refuse(SelfSignedPairRefusal::FingerprintMismatch);
+            continue;
+        }
+        if ciris_persist::federation::admission::verify_signed_transport_destination(
+            dir.as_dyn_directory(),
+            row,
+        )
+        .await
+        .is_err()
+        {
+            refuse(SelfSignedPairRefusal::SignatureInvalid);
+            continue;
+        }
+        let Ok(Some(pair)) = row.transit_kex_pair() else {
+            continue;
+        };
+        let dec = |b64: Option<&str>| b64.and_then(|s| B64.decode(s).ok());
+        let others = TransitKexOtherKeys {
+            federation_signing: [
+                dec(Some(record.pubkey_ed25519_base64.as_str())),
+                dec(record.pubkey_ml_dsa_65_base64.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            transport_identity: [
+                dec(row
+                    .transport_destination
+                    .transport_x25519_pubkey_base64
+                    .as_deref()),
+                dec(row
+                    .transport_destination
+                    .transport_ed25519_pubkey_base64
+                    .as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            ..TransitKexOtherKeys::default()
+        };
+        if check_transit_kex_pair(&pair, &others).is_err() {
+            refuse(SelfSignedPairRefusal::Separation);
+            continue;
+        }
+        match &found {
+            None => found = Some(pair),
+            Some(p) if *p == pair => {}
+            Some(_) => {
+                refuse(SelfSignedPairRefusal::Ambiguous);
+                return Ok(None);
+            }
+        }
+    }
+    Ok(found)
+}
+
 #[async_trait]
 impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
     async fn root_binding(
@@ -562,6 +731,13 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         ciris_persist::federation::self_at_login::transit_kex_pair_for(self, occurrence_key_id)
             .await
             .map_err(|e| format!("transit_kex_pair_for: {e}"))
+    }
+
+    async fn self_signed_transit_pair_for(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<ciris_persist::federation::self_at_login::TransitKexPair>, String> {
+        authenticated_self_signed_transit_pair(self, key_id).await
     }
 
     async fn put_signed_transport_destination(

@@ -1,8 +1,64 @@
 # CIRISEdge Release Notes
 
-# v43.1.1 — evidence rows name the implementing src symbol
+# v43.1.1 — two peers connect with no canonical; a skipped row is never stranded; evidence rows name their code
 
-**2026-10-20.** **PATCH** from v43.1.0. No code change outside the evidence manifest.
+**2026-10-21.** **PATCH** from v43.1.0 (persist v59.1.0 unchanged). Three field findings from
+CIRISServer's v43 adoption, and the conformance fix.
+
+## Two peers connect with no canonical (CC 3.3.6.2 + E1 + 5.3.4, rc9 `c8f0d12`)
+
+Under the per-link seal a dial is keyed from the dialled node's transit pair, and that pair
+travels on exactly one row: the node's own hybrid-signed `transport_destination`. An RNS announce
+carries the transport identity, never the pair. v43.1.0 resolved the pair only from a *Rooted*
+binding, and nobody relayed signed route rows, so two persons' nodes that heard each other's
+announces could never seal, never exchange their allegiance facts, and never root (CIRISServer's
+T2). The CC never required Rooted for the pair; it requires a pair **authenticated to the identity
+dialled**:
+
+- **Pair sources, in order** (`PeerTransitResolver::resolve_authenticated`): a live Rooted binding;
+  else the dialled node's **own hybrid-signed route row** (signer = the dialled key, the #1103
+  fingerprint, the in-row separation, the signature re-verified at use); else, for first contact,
+  the pairing pin (CC 3.2 (f)). A bare or unsigned announce never supplies a pair. The source is
+  logged once per peer at INFO and counted (`link_seal_pair_rooted` / `_self_signed_row` / `_pin`).
+- **A held signed route is relayed.** The TransportDestination plane now offers every held route
+  that is a node's own signed statement and carries a pair, not only this node's own. The #682
+  reach gate still withholds an unannounced node's row from everyone but its owner's nodes. Any
+  mutual peer therefore hands two nodes each other's pair; a canonical is one source of route rows,
+  never a required party.
+- Rooted governs what a peer is *served* (#659), not whether two keys may speak. Until a peer is
+  Rooted, only the bootstrap kinds, the allegiance facts and the first-contact plane cross.
+- **Not in this release:** two nodes with *no* mutual peer and no contact code hold only each
+  other's announce, which cannot carry the pair. The CC ruled (E1 rc9 `64a1d1c`) that such a
+  dialler's first frame is a route request and the responder answers with its own signed route
+  row, the one public thing besides the handshake that crosses unsealed, with the pairing pin as
+  the failover. That frame ships in 43.2 (CLM-pre-seal-route-fetch). Until then two strangers on
+  a bare mesh reach each other through any mutual peer or a pairing code.
+## Replication
+
+- **A row skipped as not advertisable is never stranded behind the advertise watermark.** The
+  per-(peer, plane) watermark tracked the *read*, so it passed a row the projection filter
+  rejected and only the rolling re-sweep came back to it. Each watermark now records the earliest
+  position before a skipped row, and when an advertise input changes (the self-publish set, the
+  per-kind publish selector, the cohort) every watermark that passed a skipped row rewinds, so
+  the next round re-reads it.
+- **The advertise says what it did.** Per round, per peer, one summary line
+  (`listed = not_advertisable + withheld + duplicate + offered`, the watermark before and after,
+  the pass); each skipped row at DEBUG with its id, dimension, attester and reason; self-publish
+  set changes at INFO; re-sweep cycles at INFO (WARN once past 15 min); a previously skipped row
+  finally offered at DEBUG. Counters: `EdgeMetrics::advertise`.
+- **Allegiance witnesses** (`tests/attributed_allegiance_659.rs`): two persons' nodes, and one
+  owner's two devices, root through their own allegiance facts over real sealed links. Every
+  "attestation withheld" line now names the row (`attestation_id`, `dimension`).
+
+## Transport
+
+- **A Resource that beats the handshake is held sealed and delivered once the link is keyed.**
+  A Resource and the Channel ride different event planes, so under load a dialler's first
+  Resource could complete at the responder before its last handshake part and was dropped
+  (`link_seal_dropped_before_keys`), with the far end waiting out its timer. It is now held
+  (bounded) and opened in order (`link_seal_held_before_keys`).
+
+## Evidence
 
 - **Evidence rows name the implementing `src/` symbol; tests are witnesses** (CIRISEdge#410 §3,
   CIRISConformance `test_583_field_conformance_manifest.py`). v43.1.0's test-evidenced rows
@@ -18,6 +74,7 @@
 **2026-10-20.** **MINOR** from v43.0.0. Additive API on the v43 sealed transport. **Persist v59.0.0 → v59.1.0**
 (bundle only: the baked genesis bundle is the v4 amend, so a fresh production node opens with the
 canonical's transit pair Rooted; no code, ABI or digest change).
+
 
 ## Also in this release
 

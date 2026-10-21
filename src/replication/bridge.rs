@@ -6346,10 +6346,40 @@ impl FederationDirectoryReplicationBridge {
     /// the occurrence key_id); seq is the durable supersession `epoch`
     /// (CIRISPersist#443), falling back to `asserted_at` for a pre-#443
     /// producer whose projection reads epoch 0.
+    ///
+    /// **CC 5.3.4 / 3.3.6.2 (rc9 `c8f0d12`, I5) — a held signed route is
+    /// relayed.** Under the per-link seal (E1) a dialler keys a link only from
+    /// the dialled node's transit pair, and that pair travels on exactly one
+    /// row: the node's own hybrid-signed `transport_destination`. An RNS
+    /// announce carries the transport identity, never the pair. So two nodes
+    /// that only hear each other's announces can never seal, unless a node
+    /// they both reach hands each the other's signed row (CIRISServer's T2:
+    /// a canonical held both rows and relayed neither). The enumeration
+    /// therefore also offers every held route that is the node's OWN signed
+    /// statement and carries a pair ([`Self::relayable_signed_route`]); the
+    /// CIRISEdge#682 reach gate on this plane still withholds an unannounced
+    /// node's row from everyone but its owner's nodes, so nothing darknet is
+    /// widened. A canonical is one source of route rows, never a required
+    /// party: any mutual peer relays.
     async fn list_transport_destinations(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
         let subjects = self.self_own_subjects(EnvelopeKind::TransportDestination);
         self.list_transport_destinations_page(Some(&subjects), window)
             .await
+    }
+
+    /// CC 3.3.6.2 (rc9, I5) — is this held route a row a node may relay:
+    /// LIVE, `reticulum`, the node's OWN signed statement (the signer is the
+    /// route's occurrence key: a relayed row signed by another never
+    /// qualifies), and carrying a transit pair (a row without one keys no
+    /// link, so relaying it helps no dialler). Pure over the row.
+    fn relayable_signed_route(
+        row: &ciris_persist::federation::self_at_login::SignedTransportDestination,
+    ) -> bool {
+        let td = &row.transport_destination;
+        td.retired_at.is_none()
+            && td.transport_kind == "reticulum"
+            && row.attesting_key_id == td.occurrence_key_id
+            && matches!(row.transit_kex_pair(), Ok(Some(_)))
     }
 
     /// The TransportDestination plane's since-cursor page — the `SelfOwn`
@@ -6372,6 +6402,7 @@ impl FederationDirectoryReplicationBridge {
             |row| {
                 subjects.map_or(true, |s| {
                     s.contains(&row.destination.transport_destination.occurrence_key_id)
+                        || Self::relayable_signed_route(&row.destination)
                 })
             },
             |row| {

@@ -512,8 +512,11 @@ impl LinkSeals {
         &self.secret
     }
 
-    /// The dialled node's transit pair (Rooted only), read BEFORE the dial:
-    /// a node that publishes none cannot be keyed, so it is never dialled.
+    /// The dialled node's transit pair, read BEFORE the dial, and the CC
+    /// 3.3.6.2 source that authenticated it (rc9 I1–I6): a live Rooted
+    /// binding, else the node's own hybrid-signed route row. A node with
+    /// neither cannot be keyed, so it is never dialled. The source is counted
+    /// (`link_seal_pair_*`) and said at INFO the first time per peer.
     ///
     /// # Errors
     /// [`AvHandshakeError::PairLookup`] (no directory, or a directory fault)
@@ -522,6 +525,7 @@ impl LinkSeals {
         &self,
         rooting: Option<&dyn RootingDirectory>,
         peer: &str,
+        metrics: Option<&crate::observability::EdgeMetrics>,
     ) -> Result<TransitKexPair, AvHandshakeError> {
         let Some(rooting) = rooting else {
             return Err(AvHandshakeError::PairLookup {
@@ -529,8 +533,9 @@ impl LinkSeals {
                 detail: "no rooting directory is wired".to_owned(),
             });
         };
-        self.resolver
-            .resolve(rooting, peer)
+        let (pair, source) = self
+            .resolver
+            .resolve_authenticated(rooting, peer)
             .await
             .map_err(|detail| AvHandshakeError::PairLookup {
                 peer: peer.to_owned(),
@@ -538,7 +543,21 @@ impl LinkSeals {
             })?
             .ok_or_else(|| AvHandshakeError::NoTransitPair {
                 peer: peer.to_owned(),
-            })
+            })?;
+        if let Some(m) = metrics {
+            m.inc_link_seal(source.as_str());
+        }
+        if self.resolver.note_source(peer, source) {
+            tracing::info!(
+                peer = %peer,
+                source = source.as_str(),
+                "transit pair authenticated for a dial (CC 3.3.6.2: rooted binding, the node's own \
+                 signed route row, or a pairing pin)"
+            );
+        } else {
+            tracing::debug!(peer = %peer, source = source.as_str(), "transit pair for a dial");
+        }
+        Ok(pair)
     }
 
     /// A dial to `peer` was refused for want of its pair; `true` the first

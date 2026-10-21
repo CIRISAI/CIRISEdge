@@ -989,6 +989,13 @@ pub const LINK_SEAL_REFUSED_UNSEALED_SEND: &str = "link_seal_refused_unsealed_se
 /// A sealed frame whose counter was already seen, or is older than the
 /// replay window: dropped, the link kept.
 pub const LINK_SEAL_DROPPED_REPLAY: &str = "link_seal_dropped_replay";
+/// CC 3.3.6.2 (rc9) — a dial keyed on a pair from a live Rooted binding.
+pub const LINK_SEAL_PAIR_ROOTED: &str = "link_seal_pair_rooted";
+/// CC 3.3.6.2 (rc9) source (a) — a dial keyed on a pair from the dialled
+/// node's own hybrid-signed route row (the node is not Rooted here).
+pub const LINK_SEAL_PAIR_SELF_SIGNED_ROW: &str = "link_seal_pair_self_signed_row";
+/// CC 3.2 (f) — a first contact keyed on the pairing payload's pinned pair.
+pub const LINK_SEAL_PAIR_PIN: &str = "link_seal_pair_pin";
 /// A row the Attestation advertise's projection filter skipped (a `SelfOwn`
 /// row whose attester is not in this node's self-publish set, ...). Not a
 /// withhold: the row was not this node's to publish when it was read.

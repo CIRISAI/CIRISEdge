@@ -510,6 +510,116 @@ async fn transports(
     (ta, tb)
 }
 
+/// One more transport on the same loopback RNS network: `bootstrap` is A's
+/// listen port (every other node bootstraps to A, so all hear all announces).
+async fn transport_for(
+    node: &Node,
+    base: &std::path::Path,
+    name: &str,
+    bootstrap: Option<u16>,
+) -> (Arc<ReticulumTransport>, u16) {
+    let (t, addr) = build_reticulum_with_retry(|| async {
+        let mut c = ReticulumTransportConfig::new(
+            base.join(format!("{name}/transport.id")),
+            &node.key.key_id,
+        );
+        c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        if let Some(port) = bootstrap {
+            c.bootstrap_peers = vec![format!("127.0.0.1:{port}").parse().unwrap()];
+        }
+        c.announce_interval = Duration::from_secs(5);
+        (c, node.auth())
+    })
+    .await;
+    (t, addr.port())
+}
+
+/// [`start_runtime`] with several peers, each on the four planes.
+async fn start_runtime_with(
+    node: &Node,
+    transport: Arc<ReticulumTransport>,
+    peers: &[&Ident],
+) -> Arc<ReplicationRuntime> {
+    let peers: Vec<ReplicationPeer> = peers
+        .iter()
+        .flat_map(|p| {
+            [
+                EnvelopeKind::Key,
+                EnvelopeKind::IdentityOccurrence,
+                EnvelopeKind::TransportDestination,
+                EnvelopeKind::Attestation,
+            ]
+            .into_iter()
+            .map(|kind| ReplicationPeer {
+                peer_key_id: p.key_id.clone(),
+                kind,
+            })
+        })
+        .collect();
+    let runtime = Arc::new(
+        ReplicationRuntime::start(
+            Arc::clone(&node.dir) as Arc<dyn FederationDirectory>,
+            Arc::clone(&transport) as Arc<dyn Transport>,
+            peers,
+            ReplicationRuntimeConfig {
+                scheduler: SchedulerConfig {
+                    cadence: Duration::from_secs(3),
+                    round_timeout: Duration::from_secs(15),
+                    ..SchedulerConfig::default()
+                },
+                local_key_id: Some(node.key.key_id.clone()),
+                metrics: Some(node.metrics.clone()),
+                ..Default::default()
+            },
+            Some(self_publish_set([
+                node.key.key_id.as_str(),
+                node.owner.key_id.as_str(),
+            ])),
+        )
+        .await,
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<InboundFrame>(1024);
+    let t = Arc::clone(&transport);
+    tokio::spawn(async move {
+        let _ = t.listen(tx).await;
+    });
+    let router = InboundRouter::new(runtime.registry());
+    tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            let _ = router.try_route(&frame).await;
+        }
+    });
+    runtime
+}
+
+/// `from`'s signed routes, put at `to` through the ordinary door (one way).
+async fn seed_route(from: &Node, to: &Node) {
+    for r in from
+        .dir
+        .list_signed_transport_destinations_for(&from.key.key_id)
+        .await
+        .expect("own routes")
+    {
+        FederationDirectory::put_signed_transport_destination(&*to.dir, &r)
+            .await
+            .expect("seed the route");
+    }
+}
+
+/// Does `holder` hold `node`'s OWN signed route row (the row that carries its
+/// transit pair), as against the unsigned row an RNS announce writes?
+async fn holds_signed_route_of(holder: &Node, node: &Node) -> bool {
+    holder
+        .dir
+        .list_signed_transport_destinations_for(&node.key.key_id)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|r| {
+            r.attesting_key_id == node.key.key_id && matches!(r.transit_kex_pair(), Ok(Some(_)))
+        })
+}
+
 /// #406 — a node's own hybrid-signed reticulum route is what a PEER reads for
 /// item 2 once it crosses on the TransportDestination plane. The producer emits
 /// it after the transport settles; the ladder starts its clock only once both
@@ -909,5 +1019,146 @@ async fn two_devices_of_one_owner_root_each_other_through_the_owners_acceptance_
              (RecipientNotRooted={floor})"
         );
     }
+    std::mem::forget(tmp);
+}
+
+/// **CC 3.3.6.2 + 5.3.4 (rc9 `c8f0d12`, I2 + I5) — the field's T2, with no
+/// canonical.** Two persons' nodes A and B hear each other's RNS announce
+/// (the transport identity, never the transit pair) and share one ordinary
+/// peer K that both reach and that consents to nobody. Under E1 a dial is
+/// keyed only from the dialled node's own hybrid-signed route row, which
+/// neither holds of the other, so without a relay they would never seal and
+/// never root. K holds both rows: it relays them (a held signed route is a
+/// bootstrap row of an announced node), each learns the other's pair, seals,
+/// exchanges allegiance facts and roots. A canonical is one source of route
+/// rows, never a required party.
+///
+/// Fail-before: with the relay narrowed back to a node's own routes, A never
+/// holds B's signed row and the first wait expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)] // one ladder, three nodes, read top to bottom
+async fn two_persons_nodes_root_through_a_mutual_peer_that_relays_their_signed_routes_e1() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = Root::new("root-r", 0x70).await;
+    let root_q = Root::new("root-q", 0x74).await;
+    let root_s = Root::new("root-s", 0x78).await;
+    let key_a = Arc::new(Ident::new("node-alice-r", 0x1a).await);
+    let key_b = Arc::new(Ident::new("node-bob-r", 0x1b).await);
+    let key_k = Arc::new(Ident::new("node-kay-r", 0x1c).await);
+    let a = Node::new(
+        "alice-r",
+        Arc::clone(&key_a),
+        0x1a,
+        &[&key_b, &key_k],
+        &[&root, &root_q, &root_s],
+        &[&root, &root_s],
+    )
+    .await;
+    let b = Node::new(
+        "bob-r",
+        Arc::clone(&key_b),
+        0x1b,
+        &[&key_a, &key_k],
+        &[&root, &root_q, &root_s],
+        &[&root, &root_q],
+    )
+    .await;
+    let k = Node::new(
+        "kay-r",
+        Arc::clone(&key_k),
+        0x1c,
+        &[&key_a, &key_b],
+        &[&root, &root_q, &root_s],
+        &[&root],
+    )
+    .await;
+    assert_not_rooted_at_steward(&a.dir, &b.key).await;
+    assert_not_rooted_at_steward(&b.dir, &a.key).await;
+    let charter_q = root_q.charter().await.attestation_id;
+    let charter_s = root_s.charter().await.attestation_id;
+    let a_binding = format!("owner-binding-{}", a.key.key_id);
+    let b_binding = format!("owner-binding-{}", b.key.key_id);
+    let a_accepts = a.accept(&root).await;
+    let b_accepts = b.accept(&root).await;
+    k.accept(&root).await;
+    // Peered: each person consents the other's node, exactly as the field.
+    // Nobody consents K, and K consents nobody.
+    a.consent_as_owner(&b.key).await;
+    b.consent_as_owner(&a.key).await;
+
+    let (ta, port_a) = transport_for(&a, tmp.path(), "a", None).await;
+    let (tb, _) = transport_for(&b, tmp.path(), "b", Some(port_a)).await;
+    let (tk, _) = transport_for(&k, tmp.path(), "k", Some(port_a)).await;
+    let rt_a = start_runtime_with(&a, ta, &[&b.key, &k.key]).await;
+    let rt_b = start_runtime_with(&b, tb, &[&a.key, &k.key]).await;
+    let rt_k = start_runtime_with(&k, tk, &[&a.key, &b.key]).await;
+    for n in [&a, &b, &k] {
+        wait_for_own_route(n, Duration::from_secs(150)).await;
+    }
+    // Everyone reaches K and K reaches everyone; A and B hold NOTHING signed
+    // of each other, only what the announce carried.
+    for n in [&a, &b] {
+        seed_route(n, &k).await;
+        seed_route(&k, n).await;
+    }
+    assert!(
+        !holds_signed_route_of(&a, &b).await,
+        "precondition: A holds no signed row of B"
+    );
+    assert!(
+        !holds_signed_route_of(&b, &a).await,
+        "precondition: B holds no signed row of A"
+    );
+    assert!(holds_signed_route_of(&k, &a).await && holds_signed_route_of(&k, &b).await);
+
+    // THE RELAY: K hands each the other's signed row, so each resolves the
+    // other's transit pair from a source authenticated to it.
+    let relayed = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_secs(240), || async {
+        holds_signed_route_of(&a, &b).await && holds_signed_route_of(&b, &a).await
+    })
+    .await;
+    if !relayed {
+        print_ledgers(&[(&a, "alice"), (&b, "bob"), (&k, "kay")]);
+    }
+    assert!(
+        relayed,
+        "a mutual peer must relay each node's own signed route (its transit pair) to the other \
+         (CC 5.3.4 I5): alice holds bob's={}, bob holds alice's={}",
+        holds_signed_route_of(&a, &b).await,
+        holds_signed_route_of(&b, &a).await
+    );
+
+    // Now the pair seals and the allegiance facts cross both ways.
+    let rooted_facts = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_secs(240), || async {
+        a.holds(&b_binding).await
+            && a.holds(&b_accepts).await
+            && b.holds(&a_binding).await
+            && b.holds(&a_accepts).await
+    })
+    .await;
+    if !rooted_facts {
+        print_ledgers(&[(&a, "alice"), (&b, "bob")]);
+    }
+    assert!(
+        rooted_facts,
+        "the allegiance facts cross over the sealed A<->B links"
+    );
+
+    // ROOTED BOTH WAYS: a row about another flows in each direction.
+    let served = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_secs(180), || async {
+        a.holds(&charter_q).await && b.holds(&charter_s).await
+    })
+    .await;
+    assert!(
+        served,
+        "Rooted both ways with no canonical present (alice holds Q's charter={}, bob holds \
+         S's charter={})",
+        a.holds(&charter_q).await,
+        b.holds(&charter_s).await
+    );
+    // The pair each sealed with came from the relay, not a pre-seeded Rooted
+    // binding: the row A holds of B is B's own signed statement, and vice versa.
+    assert!(holds_signed_route_of(&a, &b).await && holds_signed_route_of(&b, &a).await);
     std::mem::forget(tmp);
 }

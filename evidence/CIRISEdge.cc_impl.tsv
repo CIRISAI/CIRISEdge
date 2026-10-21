@@ -36,6 +36,8 @@ decimal_id	claim_id	repo	path#symbol	crate@version
 5.3.3.5	CLM-transport-edge	CIRISEdge	src/transport/link_seal.rs#LinkSeals::inbound	ciris-edge@v43.1.1
 5.3.3.5	CLM-transport-edge	CIRISEdge	src/transport/av_transit_handshake.rs#respond	ciris-edge@v43.1.1
 5.3.3.5	CLM-transport-edge	CIRISEdge	src/transport/reticulum.rs#DialCtx::dial_transit_pair	ciris-edge@v43.1.1
+3.3.6.2	CLM-seal-authenticated-pair	CIRISEdge	src/transport/transit_kex_peer.rs#PeerTransitResolver::resolve_authenticated	ciris-edge@v43.1.1
+3.3.6.2	CLM-seal-authenticated-pair	CIRISEdge	src/replication/bridge.rs#FederationDirectoryReplicationBridge::relayable_signed_route	ciris-edge@v43.1.1
 5.3.4	CLM-bundle-seeds-transit-pairs	CIRISEdge	src/transport/transit_kex_peer.rs#PeerTransitResolver::resolve	ciris-edge@v43.1.1
 6.1.1	CLM-wholeness-witness	CIRISEdge	src/holonomic/wholeness_witness.rs#unique_merkle_root	ciris-edge@v43.1.1
 6.1.1	CLM-member-commitment-unique	CIRISEdge	src/holonomic/wholeness_witness.rs#unique_merkle_root	ciris-edge@v43.1.1
