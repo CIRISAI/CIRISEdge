@@ -233,6 +233,10 @@ pub mod route_fetch;
 #[cfg(feature = "_reticulum-module")]
 pub mod link_shaping;
 
+/// CC 5.4.6 item 4 — the onion layer deal (`CLM-onion-layer-deal`): relay
+/// membership for a period and the three layers, a pure function of the fold.
+pub mod onion_layers;
+
 /// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
 /// live streams (`FSD/AV_CALL_API.md`).
 #[cfg(feature = "_reticulum-module")]
