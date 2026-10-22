@@ -996,6 +996,44 @@ pub const LINK_SEAL_PAIR_ROOTED: &str = "link_seal_pair_rooted";
 pub const LINK_SEAL_PAIR_SELF_SIGNED_ROW: &str = "link_seal_pair_self_signed_row";
 /// CC 3.2 (f) — a first contact keyed on the pairing payload's pinned pair.
 pub const LINK_SEAL_PAIR_PIN: &str = "link_seal_pair_pin";
+/// CC 5.3.3.5 E1 (`CLM-pre-seal-route-fetch`) — a dial keyed on a pair
+/// fetched over the link itself: the dialled node's own signed route row,
+/// asked for as the link's first frame and verified before the handshake.
+pub const LINK_SEAL_PAIR_ROUTE_FETCH: &str = "link_seal_pair_route_fetch";
+/// Pre-seal route fetch, dialler side — a route request went out as a
+/// link's first frame (no pair was held for the dialled node).
+pub const LINK_SEAL_ROUTE_REQUEST_SENT: &str = "link_seal_route_request_sent";
+/// Pre-seal route fetch, responder side — a route request passed the
+/// receiver order (per link once, node-wide rate) and named this node.
+pub const LINK_SEAL_ROUTE_REQUESTED: &str = "link_seal_route_requested";
+/// Pre-seal route fetch, responder side — this node's own signed route row
+/// went out as the answer (the one unsealed frame set besides the handshake).
+pub const LINK_SEAL_ROUTE_ANSWERED: &str = "link_seal_route_answered";
+/// Refused: a route request that does not parse.
+pub const LINK_SEAL_REFUSED_ROUTE_REQUEST: &str = "link_seal_refused_route_request";
+/// Refused by the receiver order, before anything was read: a second request
+/// on one link, or one over the node-wide rate.
+pub const LINK_SEAL_REFUSED_ROUTE_RATE_LIMITED: &str = "link_seal_refused_route_rate_limited";
+/// Refused: the request named a key that is not this node's.
+pub const LINK_SEAL_REFUSED_ROUTE_NOT_OURS: &str = "link_seal_refused_route_not_ours";
+/// Refused: this node holds no live signed route row of its own with a pair.
+pub const LINK_SEAL_REFUSED_ROUTE_UNAVAILABLE: &str = "link_seal_refused_route_unavailable";
+/// Refused at the dialler: the answer's framing, size, or shape.
+pub const LINK_SEAL_REFUSED_ROUTE_ANSWER: &str = "link_seal_refused_route_answer";
+/// Refused at the dialler: the answer's row is signed by, or about, a key
+/// other than the dialled one; never stored.
+pub const LINK_SEAL_REFUSED_ROUTE_ANSWER_SIGNER: &str = "link_seal_refused_route_answer_signer";
+/// Refused at the dialler: the row (or its key record) failed persist's
+/// authenticated admission or the `CLM-seal-authenticated-pair` checks.
+pub const LINK_SEAL_REFUSED_ROUTE_ANSWER_UNVERIFIED: &str =
+    "link_seal_refused_route_answer_unverified";
+/// Refused at the dialler: no answer within the route-fetch budget.
+pub const LINK_SEAL_REFUSED_ROUTE_TIMEOUT: &str = "link_seal_refused_route_timeout";
+/// Refused at the dialler: the link closed before an answer (the responder
+/// refused the request by its receiver order, or could not answer).
+pub const LINK_SEAL_REFUSED_ROUTE_CLOSED: &str = "link_seal_refused_route_closed";
+/// Refused: a request or answer frame could not be sent.
+pub const LINK_SEAL_REFUSED_ROUTE_SEND: &str = "link_seal_refused_route_send";
 /// A row the Attestation advertise's projection filter skipped (a `SelfOwn`
 /// row whose attester is not in this node's self-publish set, ...). Not a
 /// withhold: the row was not this node's to publish when it was read.

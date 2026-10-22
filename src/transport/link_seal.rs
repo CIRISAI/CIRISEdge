@@ -15,22 +15,32 @@
 //! There is no advisory mode, no flag and no compat path: a peer that does
 //! not run the seal gets nothing.
 //!
-//! - **Dialler (initiator).** Resolves the dialled node's pair (Rooted only)
-//!   BEFORE dialling; no pair means no dial. Once the link is up it sends
-//!   the handshake as the first frame ([`LinkSeals::initiate`]) and installs
-//!   its keys only after the last part is out
-//!   ([`LinkSeals::install_initiator`]); [`LinkSeals::seal`] refuses every
-//!   send before that. A frame that arrives before its own handshake went
-//!   out is refused ([`SealRefusal::FrameBeforeKeys`]): the responder may not
-//!   speak first.
+//! - **Dialler (initiator).** Resolves a pair AUTHENTICATED to the dialled
+//!   node BEFORE dialling ([`LinkSeals::resolve_pair`]: a Rooted binding,
+//!   else the node's own hybrid-signed route row, else a pairing pin). With
+//!   none and a path, the **pre-seal route fetch** runs first
+//!   ([`crate::transport::route_fetch`], `CLM-pre-seal-route-fetch`): a
+//!   route request is the link's first frame ([`LinkSeals::begin_route_fetch`]),
+//!   the answer is the dialled node's own signed row, verified exactly as a
+//!   held copy would be, and only then is the handshake sent. Once keyed it
+//!   sends the handshake as the first sealed-plane frame
+//!   ([`LinkSeals::initiate`]) and installs its keys only after the last part
+//!   is out ([`LinkSeals::install_initiator`]); [`LinkSeals::seal`] refuses
+//!   every send before that. A frame that arrives before its own handshake
+//!   went out, other than the awaited route answer, is refused
+//!   ([`SealRefusal::FrameBeforeKeys`]): the responder may not speak first.
 //! - **Responder.** A link a peer dialled is [`LinkSeals::begin_responder`]
 //!   at establishment (or at its first frame, when the establishment event
 //!   was lost). Until a valid handshake completes it delivers NOTHING upward
-//!   and the seal refuses every send. A non-`CTKX` first frame, a missing
-//!   handshake (budget expiry, [`LinkSeals::expire`]), an oversize
-//!   declaration, a bad or classical-only suite, and a failed respond are
-//!   each a named refusal ([`SealRefusal::label`]), after which the link is
-//!   closed. There is never a plaintext edge frame in either direction.
+//!   and the seal refuses every send. A route request as the first frame
+//!   passes the receiver order (once per link, the node-wide rate) BEFORE
+//!   it is read, and is answered only with this node's own signed row,
+//!   unsealed, the one thing besides the handshake that is. A non-`CTKX`,
+//!   non-`CTKR` first frame, a missing handshake (budget expiry,
+//!   [`LinkSeals::expire`]), an oversize declaration, a bad or
+//!   classical-only suite, and a failed respond are each a named refusal
+//!   ([`SealRefusal::label`]), after which the link is closed. There is
+//!   never a plaintext edge frame in either direction.
 //!
 //! # The claim and the first-contact carve-out
 //!
@@ -84,6 +94,7 @@ use ciris_persist::federation::self_at_login::TransitKexPair;
 use zeroize::Zeroizing;
 
 use crate::transport::av_transit_handshake::{self, AvHandshakeError, LinkTransit, Reassembler};
+use crate::transport::route_fetch::{self, RouteFetchError, RouteRequestLimiter};
 use crate::transport::transit_kex_custody::TransitKexSecret;
 use crate::transport::transit_kex_peer::PeerTransitResolver;
 use crate::verify::RootingDirectory;
@@ -244,6 +255,10 @@ pub enum SealRefusal {
         /// The carried key record's `key_id`, if any.
         record: Option<String>,
     },
+    /// CC 5.3.3.5 E1 — the pre-seal route fetch was refused, on either end
+    /// ([`crate::transport::route_fetch`]).
+    #[error("pre-seal route fetch: {0}")]
+    RouteFetch(RouteFetchError),
 }
 
 impl SealRefusal {
@@ -259,6 +274,7 @@ impl SealRefusal {
             Self::Unsealed => o::LINK_SEAL_REFUSED_UNSEALED_SEND,
             Self::FirstContactOnly => o::LINK_SEAL_REFUSED_FIRST_CONTACT_ONLY,
             Self::FirstContactSignerMismatch { .. } => o::LINK_SEAL_REFUSED_FIRST_CONTACT_SIGNER,
+            Self::RouteFetch(e) => e.label(),
         }
     }
 }
@@ -288,6 +304,21 @@ pub enum Inbound {
     /// The link was already refused and is closing: dropped without a
     /// second count.
     Closed,
+    /// CC 5.3.3.5 E1 pre-seal route fetch — a peer-dialled link's first
+    /// frame was a route request that passed the receiver order (per link
+    /// once, node-wide rate) BEFORE anything was read. The caller answers
+    /// with this node's own signed route row, or refuses by name. Nothing
+    /// to deliver.
+    RouteRequested {
+        /// The key the request named.
+        key_id: String,
+        /// Whether the dialler said it holds that key's record already.
+        holds_key_record: bool,
+    },
+    /// A route answer completed on a link this node dialled and was handed
+    /// to the waiting dial ([`LinkSeals::begin_route_fetch`]). Nothing to
+    /// deliver.
+    RouteAnswered,
 }
 
 /// Highest counter seen plus a bitmap of the [`REPLAY_WINDOW`] below it.
@@ -445,8 +476,17 @@ impl SealedLink {
 enum State {
     /// This node dialled; its handshake has not gone out yet.
     Initiating,
+    /// This node dialled holding no pair; its route request went out and
+    /// the answer (`CTKA` parts) is being reassembled. Any other frame
+    /// refuses the link.
+    FetchingRoute(Reassembler),
     /// A peer dialled; its handshake has not completed.
-    Awaiting(Reassembler),
+    Awaiting {
+        reasm: Reassembler,
+        /// When this link's one route request was admitted: a second is
+        /// refused, and the handshake budget runs from here for the fetch.
+        route_requested_at: Option<Instant>,
+    },
     /// Keys installed.
     Sealed(Arc<SealedLink>),
     /// Refused; the link is closing. Kept so a frame still in flight is not
@@ -456,6 +496,11 @@ enum State {
 
 /// Per link: the sealed Resources held before its handshake, and their bytes.
 type BeforeKeys = HashMap<[u8; 16], (Vec<Vec<u8>>, usize)>;
+
+/// The dial's end of a route fetch: the answer's bytes, or the refusal a
+/// frame that was not an answer earned.
+pub type RouteAnswerRx = tokio::sync::oneshot::Receiver<Result<Vec<u8>, RouteFetchError>>;
+type RouteAnswerTx = tokio::sync::oneshot::Sender<Result<Vec<u8>, RouteFetchError>>;
 
 /// The Reticulum transport's per-link seal table. See the module docs.
 pub struct LinkSeals {
@@ -473,6 +518,11 @@ pub struct LinkSeals {
     /// handshake was answered ([`Self::open`]), replayed in order once it is
     /// ([`Self::take_before_keys`]). Bounded like [`Self::held`].
     before_keys: Mutex<BeforeKeys>,
+    /// Per link this node dialled without a pair: the dial waiting for the
+    /// route answer ([`Self::begin_route_fetch`]).
+    route_answers: Mutex<HashMap<[u8; 16], RouteAnswerTx>>,
+    /// The node-wide receiver order for route requests.
+    route_limiter: RouteRequestLimiter,
 }
 
 impl std::fmt::Debug for LinkSeals {
@@ -497,7 +547,62 @@ impl LinkSeals {
             before_keys: Mutex::new(HashMap::new()),
             tap: Mutex::new(None),
             held: Mutex::new(HashMap::new()),
+            route_answers: Mutex::new(HashMap::new()),
+            route_limiter: RouteRequestLimiter::default(),
         }
+    }
+
+    fn route_answers(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], RouteAnswerTx>> {
+        self.route_answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// CC 5.3.3.5 E1 pre-seal route fetch — the dialler holds no pair for
+    /// the dialled node and is about to send a route request as the link's
+    /// first frame: the link now reassembles the answer (`CTKA` parts) and
+    /// refuses anything else. The receiver resolves with the answer's bytes,
+    /// or with the refusal a frame that is not an answer earned (the dial
+    /// counts it and closes the link); it is dropped (closed) if the link is
+    /// refused or forgotten first.
+    pub fn begin_route_fetch(&self, link: [u8; 16]) -> RouteAnswerRx {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.links().insert(
+            link,
+            State::FetchingRoute(route_fetch::answer_reassembler()),
+        );
+        self.route_answers().insert(link, tx);
+        rx
+    }
+
+    /// Which CC 3.3.6.2 source authenticated `peer`'s pair; `true` the first
+    /// time this `(peer, source)` is said ([`PeerTransitResolver::note_source`]).
+    pub fn note_pair_source(
+        &self,
+        peer: &str,
+        source: crate::transport::transit_kex_peer::PairSource,
+    ) -> bool {
+        self.resolver.note_source(peer, source)
+    }
+
+    /// Pre-seal route fetch — the budget still left on a peer-dialled link
+    /// whose route request this node answered: the dialler's handshake is
+    /// expected within [`route_fetch::ROUTE_FETCH_BUDGET`] of the request.
+    /// `None` when the link awaits no handshake or asked for no route.
+    #[must_use]
+    pub fn route_budget_left(&self, link: [u8; 16]) -> Option<Duration> {
+        match self.links().get(&link) {
+            Some(State::Awaiting {
+                route_requested_at: Some(at),
+                ..
+            }) => Some(route_fetch::ROUTE_FETCH_BUDGET.saturating_sub(at.elapsed())),
+            _ => None,
+        }
+    }
+
+    /// Test knob: the node-wide route-request cap per window.
+    pub fn set_route_request_cap(&self, cap: u32) {
+        self.route_limiter.set_cap(cap);
     }
 
     fn links(&self) -> std::sync::MutexGuard<'_, HashMap<[u8; 16], State>> {
@@ -627,7 +732,13 @@ impl LinkSeals {
         if links.contains_key(&link) {
             return false;
         }
-        links.insert(link, State::Awaiting(Reassembler::new()));
+        links.insert(
+            link,
+            State::Awaiting {
+                reasm: Reassembler::new(),
+                route_requested_at: None,
+            },
+        );
         true
     }
 
@@ -646,15 +757,23 @@ impl LinkSeals {
                 links.insert(link, State::Refused);
                 return Inbound::Refuse(SealRefusal::FrameBeforeKeys);
             }
-            None => links
-                .entry(link)
-                .or_insert_with(|| State::Awaiting(Reassembler::new())),
+            None => links.entry(link).or_insert_with(|| State::Awaiting {
+                reasm: Reassembler::new(),
+                route_requested_at: None,
+            }),
         };
         match state {
             State::Refused => Inbound::Closed,
             State::Initiating => {
                 *state = State::Refused;
                 Inbound::Refuse(SealRefusal::FrameBeforeKeys)
+            }
+            State::FetchingRoute(reasm) => {
+                let (next, out) = self.route_answer_part(link, reasm.push(bytes));
+                if let Some(next) = next {
+                    *state = next;
+                }
+                out
             }
             State::Sealed(sealed) => {
                 let sealed = Arc::clone(sealed);
@@ -665,7 +784,23 @@ impl LinkSeals {
                 }
                 out
             }
-            State::Awaiting(reasm) => {
+            State::Awaiting {
+                reasm,
+                route_requested_at,
+            } => {
+                if route_fetch::is_route_request(bytes) {
+                    return match self.admit_route_request(
+                        reasm.started(),
+                        route_requested_at,
+                        bytes,
+                    ) {
+                        Ok(out) => out,
+                        Err(refusal) => {
+                            *state = State::Refused;
+                            Inbound::Refuse(refusal)
+                        }
+                    };
+                }
                 let answered = match reasm.push(bytes) {
                     Ok(None) => return Inbound::Pending,
                     Ok(Some(hs)) => {
@@ -689,6 +824,60 @@ impl LinkSeals {
                 }
             }
         }
+    }
+
+    /// Pre-seal route fetch, the dialler's link: one `CTKA` part pushed.
+    /// Returns the state to move to (if any) and what to tell the caller. A
+    /// complete answer, or a frame that is not an answer, is handed to the
+    /// waiting dial, which counts and names the outcome once; with no dial
+    /// waiting the refusal is the caller's.
+    fn route_answer_part(
+        &self,
+        link: [u8; 16],
+        pushed: Result<Option<Vec<u8>>, AvHandshakeError>,
+    ) -> (Option<State>, Inbound) {
+        match pushed {
+            Ok(None) => (None, Inbound::Pending),
+            Ok(Some(answer)) => {
+                if let Some(tx) = self.route_answers().remove(&link) {
+                    // choke-ok: a dial that stopped waiting closes the link.
+                    let _ = tx.send(Ok(answer));
+                }
+                (Some(State::Initiating), Inbound::RouteAnswered)
+            }
+            Err(e) => match self.route_answers().remove(&link) {
+                Some(tx) => {
+                    // choke-ok: a dial that stopped waiting closes the link.
+                    let _ = tx.send(Err(RouteFetchError::Answer(e)));
+                    (Some(State::Refused), Inbound::RouteAnswered)
+                }
+                None => (
+                    Some(State::Refused),
+                    Inbound::Refuse(SealRefusal::RouteFetch(RouteFetchError::Answer(e))),
+                ),
+            },
+        }
+    }
+
+    /// Pre-seal route fetch, a peer-dialled link: a route request as the
+    /// first frame. The receiver order runs BEFORE the request is read past
+    /// its tag: once per link (`requested_at` unset, no handshake part held),
+    /// then the node-wide rate. On `Err` the caller refuses the link.
+    fn admit_route_request(
+        &self,
+        handshake_started: bool,
+        requested_at: &mut Option<Instant>,
+        bytes: &[u8],
+    ) -> Result<Inbound, SealRefusal> {
+        if requested_at.is_some() || handshake_started || !self.route_limiter.admit() {
+            return Err(SealRefusal::RouteFetch(RouteFetchError::RateLimited));
+        }
+        let req = route_fetch::decode_request(bytes).map_err(SealRefusal::RouteFetch)?;
+        *requested_at = Some(Instant::now());
+        Ok(Inbound::RouteRequested {
+            key_id: req.key_id,
+            holds_key_record: req.holds_key_record,
+        })
     }
 
     /// Seal one frame for `link` on `lane`.
@@ -766,7 +955,7 @@ impl LinkSeals {
             match links.get(&link) {
                 Some(State::Sealed(s)) => Arc::clone(s),
                 Some(State::Refused) => return Inbound::Closed,
-                Some(State::Awaiting(_)) => {
+                Some(State::Awaiting { .. }) => {
                     // A Resource can overtake the last handshake part (they
                     // ride different event planes): hold it sealed and open
                     // it once the link is keyed, within the hold's bounds.
@@ -839,7 +1028,7 @@ impl LinkSeals {
     pub fn expire(&self, link: [u8; 16]) -> bool {
         let mut links = self.links();
         match links.get_mut(&link) {
-            Some(s @ State::Awaiting(_)) => {
+            Some(s @ State::Awaiting { .. }) => {
                 *s = State::Refused;
                 drop(links);
                 self.before_keys().remove(&link);
@@ -853,11 +1042,13 @@ impl LinkSeals {
     pub fn refuse(&self, link: [u8; 16]) {
         self.links().insert(link, State::Refused);
         self.before_keys().remove(&link);
+        self.route_answers().remove(&link);
     }
 
     /// Forget a closed link (its keys and anything held for it).
     pub fn forget(&self, link: &[u8; 16]) {
         self.links().remove(link);
+        self.route_answers().remove(link);
         self.held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -1,5 +1,53 @@
 # CIRISEdge Release Notes
 
+# v43.2.0 — two strangers connect: the pre-seal route fetch; reciprocal link shaping
+
+**2026-10-22.** **MINOR** from v43.1.1 (persist v59.1.0 unchanged). CC 1.0-rc9 → rc10 text: the
+pre-seal route fetch (5.3.3.5 E1, CIRISConstitution#172, `CLM-pre-seal-route-fetch`) and link
+shaping (5.4.3, `CLM-link-shaping`).
+
+## The pre-seal route fetch (CC 5.3.3.5 E1; CLM-pre-seal-route-fetch)
+
+v43.1.1 let two peers seal with no canonical when each HOLDS the other's own hybrid-signed route
+row (from any source). Two strangers on a bare mesh hold only each other's announce, and an
+announce cannot carry a post-quantum transit pair, so v43.1.1 refused that dial by name
+(`link_seal_refused_no_pair`). Now:
+
+- **The dialler**, holding no pair authenticated to the node it means to reach (no Rooted
+  binding, no copy of its signed row, no pairing pin) and a path to it, opens the link and sends a
+  **route request** (`CTKR`: the dialled key id, and whether it holds that key's record) as the
+  link's first frame. It waits for the answer, checks BEFORE any write that the row is signed by
+  and about the dialled key, admits the carried key record (when it asked for one) through
+  persist's key door, puts the row through persist's authenticated admission, and resolves the
+  pair exactly as a held copy is resolved (CLM-seal-authenticated-pair: signer, #1103
+  fingerprint, in-row separation, signature re-verified). Only then does its `CTKX` handshake go
+  out. A row signed by or about another key, a non-answer, a timeout, or a refusal from the
+  responder is a named refusal (`link_seal_refused_route_*`); the link closes and nothing is
+  stored. A successful fetch is counted `link_seal_pair_route_fetch` and said once per peer.
+- **The responder** answers only for its own occurrence key, only with its own live
+  hybrid-signed `transport_destination` row carrying a pair (`CTKA` frames, the one unsealed
+  frame set besides the handshake), plus its own `key:record:v1` row when the dialler said it
+  holds none (a stranger cannot verify a hybrid signature without the signer's public record;
+  that row is the same public, self-signed row the key plane replicates to everyone). The
+  receiver order runs before the request is read past its tag: once per link, then node-wide
+  (32 per 10 s). It serves nothing and buffers nothing until the handshake seals the link; its
+  announce and bundle follow sealed, as before. The handshake budget runs from the request
+  (30 s) so the answer and the dialler's handshake both fit.
+- A no-path target with no pair is still `NoRouteToPeer`; A/V leg dials still need a held pair
+  (the identity link exists by then). The pairing pin (CC 3.2 (f)) stays the failover for two
+  nodes that cannot exchange a single public frame.
+- Witnesses (`tests/link_seal_e1.rs`): two strangers seal after the fetch; a fresh stranger
+  fetches the key record with the route; a non-answer refuses the link; an answer signed by
+  another key is refused and never stored; nothing is served before the seal; a request over
+  the receiver order is refused before it is read and a bare announce supplies no pair. The
+  v43.1.1 witness that a pair-less dial is refused became the receiver-order witness; the
+  pairing-pin and #722 negative-control witnesses were re-pointed at the new behaviour (the
+  pin still writes nothing; the #393 item-2 gate still refuses a row from a peer with no
+  verified route, even though the transport now delivers it).
+- New `link_seal` labels: `link_seal_route_request_sent`, `link_seal_route_requested`,
+  `link_seal_route_answered`, `link_seal_pair_route_fetch`, and the refusals
+  `link_seal_refused_route_{request,rate_limited,not_ours,unavailable,answer,answer_signer,answer_unverified,timeout,closed,send}`.
+
 # v43.1.1 — two peers connect with no canonical; a skipped row is never stranded; evidence rows name their code
 
 **2026-10-21.** **PATCH** from v43.1.0 (persist v59.1.0 unchanged). Three field findings from

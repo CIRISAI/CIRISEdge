@@ -391,6 +391,29 @@ pub trait RootingDirectory: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// CC 5.3.3.5 E1 pre-seal route fetch — this node's own `key:record:v1`
+    /// row for `key_id` (persist's projection of the key as a row), carried
+    /// in a route answer to a dialler that does not hold the key. Default
+    /// `Ok(None)` (no directory ⇒ no row to carry).
+    async fn own_key_record_row(
+        &self,
+        _key_id: &str,
+    ) -> Result<Option<ciris_persist::federation::Attestation>, String> {
+        Ok(None)
+    }
+
+    /// CC 5.3.3.5 E1 pre-seal route fetch — admit a `key:record:v1` row a
+    /// route answer carried, through persist's key door
+    /// (`apply_replicated_attestation`: proof of possession, the #1103
+    /// fingerprint, the plane's admission). `Ok` for an inserted or already
+    /// held row. Default `Err` (no directory ⇒ nothing is admitted).
+    async fn admit_key_record_row(
+        &self,
+        _row: &ciris_persist::federation::Attestation,
+    ) -> Result<(), String> {
+        Err("no federation directory wired (RootingDirectory default)".to_string())
+    }
+
     /// CIRISEdge#406 — submit a signed route through persist's authenticated
     /// admission (`put_signed_transport_destination`: hybrid 1-of-1 over
     /// `JCS(signed_envelope)` against the attesting key's PINNED federation
@@ -738,6 +761,47 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         key_id: &str,
     ) -> Result<Option<ciris_persist::federation::self_at_login::TransitKexPair>, String> {
         authenticated_self_signed_transit_pair(self, key_id).await
+    }
+
+    async fn own_key_record_row(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<ciris_persist::federation::Attestation>, String> {
+        let held = crate::replication::key_plane_rows::key_record_rows(self, key_id)
+            .await
+            .map_err(|e| format!("key_record_rows: {e}"))?;
+        if let Some(row) = held.into_iter().next() {
+            return Ok(Some(row));
+        }
+        // A key registered before it travelled as a row (or seeded straight
+        // into the key table): its row is persist's pure projection of the
+        // self-scrubbed record, the same bytes the key plane would send.
+        let Some(record) = FederationDirectory::lookup_public_key(self, key_id)
+            .await
+            .map_err(|e| format!("lookup_public_key: {e}"))?
+        else {
+            return Ok(None);
+        };
+        Ok(ciris_persist::federation::key_plane::plan_key_record_row(&record, &None).ok())
+    }
+
+    async fn admit_key_record_row(
+        &self,
+        row: &ciris_persist::federation::Attestation,
+    ) -> Result<(), String> {
+        use ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome as Outcome;
+        match FederationDirectory::apply_replicated_attestation(
+            self,
+            ciris_persist::federation::SignedAttestation {
+                attestation: row.clone(),
+            },
+        )
+        .await
+        {
+            Ok(Outcome::Inserted | Outcome::Unchanged | Outcome::Deduplicated) => Ok(()),
+            Ok(other) => Err(format!("{other:?}")),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     async fn put_signed_transport_destination(

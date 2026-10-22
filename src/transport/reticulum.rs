@@ -451,6 +451,18 @@ pub(crate) fn link_channel_message_limit(node: &ReticulumNode, link_id: &LinkId)
     node.link_mdu(link_id).map(channel_payload_mdu)
 }
 
+/// CC 5.3.3.5 E1 pre-seal route fetch test seam — what this node's NEXT
+/// route answer carries instead of its own signed route row.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub enum RouteAnswerOverride {
+    /// One frame that is not a route answer at all.
+    Garbage,
+    /// The signed route row of this OTHER key (one this node holds): an
+    /// answer signed by, and about, a key other than the dialled one.
+    RowOf(String),
+}
+
 /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead of
 /// the real one. Taken (once) by the next link this node keys.
 #[doc(hidden)]
@@ -2402,6 +2414,9 @@ pub struct ReticulumTransport {
     /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead
     /// of the real one (see [`HandshakeOverride`]). `None` in production.
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
+    /// Pre-seal route fetch test seam — see [`RouteAnswerOverride`]. `None`
+    /// in production.
+    route_answer_override: Arc<std::sync::Mutex<Option<RouteAnswerOverride>>>,
     /// CC 5.3.3.5 E1 test seam — model an UNANNOUNCED node (an unowned fresh
     /// device): no RNS announce and no on-link announce, bundle or owner
     /// binding, so a peer it dials cannot attribute the link. `false` in
@@ -3713,6 +3728,7 @@ impl ReticulumTransport {
             self_route,
             seals,
             handshake_override: Arc::new(std::sync::Mutex::new(None)),
+            route_answer_override: Arc::new(std::sync::Mutex::new(None)),
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             av_call_router: std::sync::OnceLock::new(),
             test_identify_last: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5335,6 +5351,23 @@ impl ReticulumTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seam);
     }
 
+    /// Pre-seal route fetch test seam — the next route request this node
+    /// answers carries `seam` instead of its own row ([`RouteAnswerOverride`]).
+    #[doc(hidden)]
+    pub fn set_route_answer_override_for_test(&self, seam: RouteAnswerOverride) {
+        *self
+            .route_answer_override
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seam);
+    }
+
+    /// Pre-seal route fetch test seam — the node-wide route-request cap per
+    /// window (the receiver order), `0` refusing every request.
+    #[doc(hidden)]
+    pub fn set_route_request_cap_for_test(&self, cap: u32) {
+        self.seals.set_route_request_cap(cap);
+    }
+
     /// CC 5.3.3.5 E1 test seam — start (or stop and clear) recording every
     /// frame this node hands leviculum on any link, exactly as sent: the
     /// handshake parts and every sealed frame.
@@ -5476,7 +5509,7 @@ impl ReticulumTransport {
                 &peer,
                 has_path,
                 timeout,
-                &pair,
+                Some(&pair),
                 self.occurrence_key_id(),
             )
             .await?;
@@ -9012,6 +9045,7 @@ impl Transport for ReticulumTransport {
         let ctx = EventCtx {
             node: &self.node,
             local_key_id: self.occurrence_key_id(),
+            route_answer_override: &self.route_answer_override,
             peers: &self.peers,
             established_links: &self.established_links,
             sent_resource_progress: &self.sent_resource_progress,
@@ -10179,39 +10213,56 @@ impl DialCtx {
         destination_key_id: &str,
         peer: &ResolvedPeer,
         has_path: bool,
-    ) -> Result<TransitKexPair, TransportError> {
-        if has_path {
-            self.resolve_transit_pair(destination_key_id).await
-        } else {
-            match self
-                .seals
-                .resolve_pair(
-                    self.rooting.as_deref(),
-                    destination_key_id,
-                    self.metrics.as_ref(),
-                )
-                .await
-            {
-                Ok(pair) => Ok(pair),
-                Err(e) => {
-                    let target_dest = hex::encode(peer.dest_hash.into_bytes());
-                    let paths = self.path_table_snapshot();
-                    tracing::error!(
-                        key_id = %destination_key_id,
-                        target_dest = %target_dest,
-                        known_paths = %paths,
-                        seal = %e,
-                        "dial target has no route and no Rooted transit pair — un-routable \
-                         dest, never dialled (CIRISEdge#336, CC 5.3.3.5 E1)"
-                    );
-                    Err(TransportError::NoRouteToPeer {
-                        key_id: destination_key_id.to_string(),
-                        target_dest,
-                        has_path,
-                        paths,
-                    })
-                }
+    ) -> Result<Option<TransitKexPair>, TransportError> {
+        use crate::transport::av_transit_handshake::AvHandshakeError;
+        let resolved = self
+            .seals
+            .resolve_pair(
+                self.rooting.as_deref(),
+                destination_key_id,
+                self.metrics.as_ref(),
+            )
+            .await;
+        match resolved {
+            Ok(pair) => Ok(Some(pair)),
+            // CC 5.3.3.5 E1 pre-seal route fetch (CLM-pre-seal-route-fetch):
+            // a pathed node whose pair no source authenticates is asked for
+            // its own signed route row as the link's first frame; the dial
+            // keys on that row once it verifies, or refuses by name.
+            Err(AvHandshakeError::NoTransitPair { .. }) if has_path => {
+                tracing::info!(
+                    peer = %destination_key_id,
+                    "no transit pair held for the dialled node (no Rooted binding, no copy of \
+                     its signed route row): the route is fetched over the link before the \
+                     handshake (CC 5.3.3.5 E1 pre-seal route fetch)"
+                );
+                Ok(None)
             }
+            Err(e @ AvHandshakeError::NoTransitPair { .. }) => {
+                let target_dest = hex::encode(peer.dest_hash.into_bytes());
+                let paths = self.path_table_snapshot();
+                tracing::error!(
+                    key_id = %destination_key_id,
+                    target_dest = %target_dest,
+                    known_paths = %paths,
+                    seal = %e,
+                    "dial target has no route and no authenticated transit pair — un-routable \
+                     dest, never dialled (CIRISEdge#336, CC 5.3.3.5 E1)"
+                );
+                Err(TransportError::NoRouteToPeer {
+                    key_id: destination_key_id.to_string(),
+                    target_dest,
+                    has_path,
+                    paths,
+                })
+            }
+            Err(e) => Err(seal_refused(
+                self.metrics.as_ref(),
+                destination_key_id,
+                None,
+                &crate::transport::link_seal::SealRefusal::Handshake(e),
+                "dial",
+            )),
         }
     }
 
@@ -10312,7 +10363,7 @@ impl DialCtx {
                 peer,
                 has_path,
                 establish_timeout,
-                &pair,
+                pair.as_ref(),
                 &self.own_key_id,
             )
             .await?;
@@ -10466,7 +10517,7 @@ impl DialCtx {
         peer: &ResolvedPeer,
         has_path: bool,
         establish_timeout: Duration,
-        pair: &TransitKexPair,
+        pair: Option<&TransitKexPair>,
         claim: &str,
     ) -> Result<LinkId, TransportError> {
         let signing_key =
@@ -10569,10 +10620,102 @@ impl DialCtx {
                 .map_err(|e| TransportError::Io(format!("reticulum identify_link: {e}")))?;
         }
         // CC 5.3.3.5 E1 — the transit KEX is the link's first frame; every
-        // frame below rides sealed.
+        // frame below rides sealed. With no pair held, the pre-seal route
+        // fetch comes first: the request is the first frame, the verified
+        // row keys the handshake that follows.
+        let fetched;
+        let pair = if let Some(p) = pair {
+            p
+        } else {
+            fetched = self
+                .fetch_route_over_link(link_id, destination_key_id)
+                .await?;
+            &fetched
+        };
         self.key_link(link_id, destination_key_id, pair, claim)
             .await?;
         Ok(link_id)
+    }
+
+    /// CC 5.3.3.5 E1 pre-seal route fetch (CLM-pre-seal-route-fetch) — the
+    /// dialler's half. On a link just established to a node whose pair no
+    /// source authenticates: send a route request naming the dialled key as
+    /// the link's first frame, wait for the answer (the node's own
+    /// hybrid-signed route row, with its key record when this node lacks
+    /// it), verify it exactly as a held copy would be
+    /// ([`verify_route_answer`]), and return the pair the handshake keys on.
+    /// Any failure refuses the link, by name, before anything is stored.
+    async fn fetch_route_over_link(
+        &self,
+        link_id: LinkId,
+        peer: &str,
+    ) -> Result<TransitKexPair, TransportError> {
+        use crate::transport::link_seal::SealRefusal;
+        use crate::transport::route_fetch::{
+            decode_answer, encode_request, RouteFetchError, RouteRequest, ROUTE_FETCH_BUDGET,
+        };
+        use crate::transport::transit_kex_peer::PairSource;
+        let link = link_id.into_bytes();
+        let outcome: Result<TransitKexPair, RouteFetchError> = async {
+            let rooting = self.rooting.as_deref().ok_or_else(|| {
+                RouteFetchError::Unverified("no rooting directory is wired".to_owned())
+            })?;
+            let holds_key_record = rooting
+                .registered_pubkey_ed25519_base64(peer)
+                .await
+                .is_some();
+            let answer = self.seals.begin_route_fetch(link);
+            let request = encode_request(&RouteRequest {
+                key_id: peer.to_owned(),
+                holds_key_record,
+            });
+            tokio::time::timeout(
+                CHANNEL_FRAGMENT_SEND_TIMEOUT,
+                self.node.link_handle(&link_id).send(&request),
+            )
+            .await
+            .map_err(|_| RouteFetchError::Send("request send timed out".to_owned()))?
+            .map_err(|e| RouteFetchError::Send(e.to_string()))?;
+            self.seals.tap_frame(link, &request);
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_link_seal(crate::observability::LINK_SEAL_ROUTE_REQUEST_SENT);
+            }
+            let bytes = tokio::time::timeout(ROUTE_FETCH_BUDGET, answer)
+                .await
+                .map_err(|_| RouteFetchError::Timeout(ROUTE_FETCH_BUDGET))?
+                .map_err(|_| RouteFetchError::LinkClosed)??;
+            verify_route_answer(rooting, peer, decode_answer(&bytes)?).await
+        }
+        .await;
+        match outcome {
+            Ok(pair) => {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.inc_link_seal(PairSource::RouteFetch.as_str());
+                }
+                if self.seals.note_pair_source(peer, PairSource::RouteFetch) {
+                    tracing::info!(
+                        peer = %peer,
+                        link = %hex::encode(link),
+                        source = PairSource::RouteFetch.as_str(),
+                        "transit pair fetched over the link and verified: the dialled node's own \
+                         signed route row, asked for as the first frame (CC 5.3.3.5 E1 pre-seal \
+                         route fetch)"
+                    );
+                }
+                Ok(pair)
+            }
+            Err(e) => {
+                let err = seal_refused(
+                    self.metrics.as_ref(),
+                    peer,
+                    Some(link_id),
+                    &SealRefusal::RouteFetch(e),
+                    "dial",
+                );
+                self.close_refused(link_id).await;
+                Err(err)
+            }
+        }
     }
 
     /// CIRISEdge#532 — the live, identified link we already hold to this dest,
@@ -10660,6 +10803,8 @@ struct EventCtx<'a> {
     /// refuse to resolve a link to ourselves regardless of what the peers map
     /// holds (see [`LinkAttribution::ResolvedToSelf`]).
     local_key_id: &'a str,
+    /// Pre-seal route fetch test seam — see `ReticulumTransport::route_answer_override`.
+    route_answer_override: &'a std::sync::Mutex<Option<RouteAnswerOverride>>,
     peers: &'a Mutex<HashMap<String, RootedPeer>>,
     established_links: &'a Mutex<HashSet<LinkId>>,
     /// CIRISEdge#353b/v13.6.1 — sender-side resource transfer progress (see the
@@ -12356,6 +12501,217 @@ async fn route_now(ctx: &EventCtx<'_>, link_id: LinkId, is_resource: bool, data:
 /// is a named refusal (`link_seal_refused_timeout`) and the link is closed.
 /// Called at `LinkEstablished` and again at a link's first frame, because a
 /// full control plane can drop the establishment event (#853).
+/// CC 5.3.3.5 E1 pre-seal route fetch — the dialler's verification of a
+/// route answer, in this order and with nothing stored before the first
+/// check passes: the row's signer and subject are the dialled key; a
+/// carried `key:record:v1` row is that key's and is admitted through
+/// persist's key door; the row goes through persist's authenticated
+/// admission; then the pair is read exactly as a held copy is
+/// ([`RootingDirectory::self_signed_transit_pair_for`]: the #1103
+/// fingerprint, the in-row separation, the signature re-verified).
+///
+/// # Errors
+/// The named [`RouteFetchError`]; a row signed by or about another key is
+/// [`RouteFetchError::SignedByAnotherKey`] and is never written.
+async fn verify_route_answer(
+    rooting: &dyn RootingDirectory,
+    peer: &str,
+    answer: crate::transport::route_fetch::RouteAnswer,
+) -> Result<TransitKexPair, crate::transport::route_fetch::RouteFetchError> {
+    use crate::transport::route_fetch::RouteFetchError;
+    let signer = answer.route.attesting_key_id.as_str();
+    let subject = answer
+        .route
+        .transport_destination
+        .occurrence_key_id
+        .as_str();
+    if signer != peer || subject != peer {
+        return Err(RouteFetchError::SignedByAnotherKey {
+            signer: signer.to_owned(),
+            subject: subject.to_owned(),
+            dialled: peer.to_owned(),
+        });
+    }
+    if let Some(row) = &answer.key_record_row {
+        let record_key =
+            ciris_persist::federation::key_plane::key_record_of_row(row).map(|r| r.key_id);
+        if record_key.as_deref() != Some(peer) {
+            return Err(RouteFetchError::SignedByAnotherKey {
+                signer: record_key.unwrap_or_else(|| "<not a key record row>".to_owned()),
+                subject: subject.to_owned(),
+                dialled: peer.to_owned(),
+            });
+        }
+        rooting
+            .admit_key_record_row(row)
+            .await
+            .map_err(RouteFetchError::KeyRecordRefused)?;
+    }
+    rooting
+        .put_signed_transport_destination(&answer.route)
+        .await
+        .map_err(RouteFetchError::Unverified)?;
+    rooting
+        .self_signed_transit_pair_for(peer)
+        .await
+        .map_err(RouteFetchError::Unverified)?
+        .ok_or_else(|| {
+            RouteFetchError::Unverified(
+                "the fetched row authenticates no transit pair for the dialled key".to_owned(),
+            )
+        })
+}
+
+/// CC 5.3.3.5 E1 pre-seal route fetch (CLM-pre-seal-route-fetch) — the
+/// responder's half. A peer-dialled link's first frame was a route request
+/// that already passed the receiver order ([`LinkSeals::inbound`]: once per
+/// link, the node-wide rate, both before the request was read). This node
+/// answers ONLY for its own occurrence key, ONLY with its own live
+/// hybrid-signed route row carrying a transit pair (and its `key:record:v1`
+/// row when the dialler said it lacks the key), as `CTKA` frames on the
+/// Channel: the one unsealed frame set besides the handshake. Anything that
+/// cannot be answered that way refuses and closes the link by name. Nothing
+/// else is served or buffered until the dialler's handshake seals the link.
+///
+/// [`LinkSeals::inbound`]: crate::transport::link_seal::LinkSeals::inbound
+async fn answer_route_request(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    key_id: &str,
+    holds_key_record: bool,
+) {
+    use crate::transport::link_seal::SealRefusal;
+    use crate::transport::route_fetch::{encode_answer, RouteAnswer, RouteFetchError};
+    let seam = ctx
+        .route_answer_override
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    let built: Result<Vec<Vec<u8>>, RouteFetchError> = async {
+        if key_id != ctx.local_key_id {
+            return Err(RouteFetchError::NotOurs {
+                asked: key_id.to_owned(),
+                ours: ctx.local_key_id.to_owned(),
+            });
+        }
+        let frame_limit = link_channel_message_limit(ctx.node, &link_id)
+            .ok_or_else(|| RouteFetchError::Send("the link is no longer held".to_owned()))?;
+        // Test seam: a responder whose answer is not an answer.
+        if matches!(seam, Some(RouteAnswerOverride::Garbage)) {
+            return Ok(vec![b"not-a-route-answer".to_vec()]);
+        }
+        let rooting = ctx
+            .rooting
+            .ok_or_else(|| RouteFetchError::Unavailable("no rooting directory".to_owned()))?;
+        // Test seam: a responder that answers with ANOTHER node's row.
+        let subject = match &seam {
+            Some(RouteAnswerOverride::RowOf(other)) => other.as_str(),
+            _ => ctx.local_key_id,
+        };
+        let route = rooting
+            .signed_reticulum_route(subject)
+            .await
+            .map_err(RouteFetchError::Unavailable)?
+            .filter(|r| r.transport_destination.retired_at.is_none())
+            .filter(|r| matches!(r.transit_kex_pair(), Ok(Some(_))))
+            .ok_or_else(|| {
+                RouteFetchError::Unavailable(
+                    "this node holds no live signed route row of its own carrying a transit pair"
+                        .to_owned(),
+                )
+            })?;
+        let key_record_row = if holds_key_record {
+            None
+        } else {
+            rooting
+                .own_key_record_row(subject)
+                .await
+                .map_err(RouteFetchError::Unavailable)?
+        };
+        if let Some(m) = ctx.metrics {
+            m.inc_link_seal(crate::observability::LINK_SEAL_ROUTE_REQUESTED);
+        }
+        encode_answer(
+            &RouteAnswer {
+                route,
+                key_record_row,
+            },
+            frame_limit,
+        )
+    }
+    .await;
+    let frames = match built {
+        Ok(f) => f,
+        Err(e) => {
+            seal_teardown(ctx, link_id, &SealRefusal::RouteFetch(e)).await;
+            return;
+        }
+    };
+    // The answer can be many Channel frames; they go out off the event loop
+    // so the loop keeps draining (the same reason the announce offload exists,
+    // #482 item 3). The link is still awaiting its handshake meanwhile.
+    spawn_route_answer_send(
+        Arc::clone(ctx.av_node),
+        Arc::clone(ctx.seals),
+        ctx.metrics.cloned(),
+        link_id,
+        frames,
+    );
+}
+
+/// Pre-seal route fetch — send the `CTKA` parts of an answer on `link_id`'s
+/// Channel, in order, off the event loop. A part that cannot be sent refuses
+/// and closes the link by name; the whole answer out is counted
+/// `link_seal_route_answered`.
+fn spawn_route_answer_send(
+    node: Arc<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+    link_id: LinkId,
+    frames: Vec<Vec<u8>>,
+) {
+    use crate::transport::link_seal::SealRefusal;
+    use crate::transport::route_fetch::RouteFetchError;
+    tokio::spawn(async move {
+        let link = link_id.into_bytes();
+        let parts = frames.len();
+        for frame in &frames {
+            let sent = tokio::time::timeout(
+                CHANNEL_FRAGMENT_SEND_TIMEOUT,
+                node.link_handle(&link_id).send(frame),
+            )
+            .await;
+            let failure = match sent {
+                Ok(Ok(())) => {
+                    seals.tap_frame(link, frame);
+                    continue;
+                }
+                Ok(Err(e)) => e.to_string(),
+                Err(_elapsed) => "answer send timed out".to_owned(),
+            };
+            let _ = seal_refused(
+                metrics.as_ref(),
+                "-",
+                Some(link_id),
+                &SealRefusal::RouteFetch(RouteFetchError::Send(failure)),
+                "accept",
+            );
+            seals.refuse(link);
+            let _ = node.close_link(&link_id).await;
+            return;
+        }
+        if let Some(m) = metrics.as_ref() {
+            m.inc_link_seal(crate::observability::LINK_SEAL_ROUTE_ANSWERED);
+        }
+        tracing::info!(
+            link = %hex::encode(link),
+            parts,
+            "route request answered with this node's own signed route row; the link awaits \
+             the dialler's handshake (CC 5.3.3.5 E1 pre-seal route fetch)"
+        );
+    });
+}
+
 fn note_responder_link(ctx: &EventCtx<'_>, link_id: LinkId, we_dialled: bool) {
     if we_dialled || !ctx.seals.begin_responder(link_id.into_bytes()) {
         return;
@@ -12366,6 +12722,12 @@ fn note_responder_link(ctx: &EventCtx<'_>, link_id: LinkId, we_dialled: bool) {
     tokio::spawn(async move {
         use crate::transport::av_transit_handshake::{AvHandshakeError, HANDSHAKE_BUDGET};
         tokio::time::sleep(HANDSHAKE_BUDGET).await;
+        // CC 5.3.3.5 E1 pre-seal route fetch — a link whose route request
+        // this node answered gets the fetch budget from that request: the
+        // answer crosses, then the dialler's handshake.
+        if let Some(left) = seals.route_budget_left(link_id.into_bytes()) {
+            tokio::time::sleep(left).await;
+        }
         if seals.expire(link_id.into_bytes()) {
             let _ = seal_refused(
                 metrics.as_ref(),
@@ -12460,10 +12822,17 @@ async fn seal_inbound(
     };
     match outcome {
         Inbound::Open(plain) => Some(plain),
-        Inbound::Pending | Inbound::Closed => None,
+        Inbound::Pending | Inbound::Closed | Inbound::RouteAnswered => None,
         Inbound::Keyed { claimed } => {
             link_keyed(ctx, link_id, claimed).await;
             replay_before_keys(ctx, link_id).await;
+            None
+        }
+        Inbound::RouteRequested {
+            key_id,
+            holds_key_record,
+        } => {
+            answer_route_request(ctx, link_id, &key_id, holds_key_record).await;
             None
         }
         Inbound::HeldBeforeKeys => {
@@ -12529,6 +12898,8 @@ async fn replay_before_keys(ctx: &EventCtx<'_>, link_id: LinkId) {
             Inbound::Closed
             | Inbound::Pending
             | Inbound::Keyed { .. }
+            | Inbound::RouteRequested { .. }
+            | Inbound::RouteAnswered
             | Inbound::HeldBeforeKeys => {
                 return;
             }
