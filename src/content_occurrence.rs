@@ -252,7 +252,7 @@ pub async fn ensure_content_occurrence(
                     to = %to,
                     "content occurrence is SIGNED under another device_class — left as it is; \
                      only its signer (the owner) can re-issue it under the new class, so the \
-                     replication audience follows the old class until then (CIRISEdge#799)"
+                     replication audience follows the old class until then (history: CIRISEdge#799)"
                 );
             }
             return Ok(Provisioned::ReclassNeedsSigner { from, to });
@@ -362,7 +362,7 @@ pub async fn provision_from_seed(
             "content occurrence exists with DIFFERENT encryption pubkeys — the \
              derivation is deterministic from the identity seed, so the seed \
              changed. NOT overwritten: every grant already wrapped to the old \
-             keys would be orphaned. Operator decision (CIRISEdge#599)"
+             keys would be orphaned. Operator decision (history: CIRISEdge#599)"
         ),
     }
     Ok(out)
@@ -613,7 +613,7 @@ where
             occurrence = %me,
             "engine occurrence exists with DIFFERENT pubkeys than this node's content-KEM \
              identity — reads for it will be NotGranted. NOT overwritten: an operator decides \
-             (CIRISPersist#848)"
+             (history: CIRISPersist#848)"
         ),
     }
     Ok((me, outcome))

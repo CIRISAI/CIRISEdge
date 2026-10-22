@@ -1216,7 +1216,7 @@ impl MlsSession {
                     target: "ciris_edge::realtime_av_mls",
                     inviter_key_id = %id,
                     "CC 5.4.4: realtime MLS Welcome REFUSED — inviter not directory-resolvable; \
-                     fail-closed with no inline-key TOFU fallback (CIRISEdge#331)",
+                     fail-closed with no inline-key TOFU fallback (history: CIRISEdge#331)",
                 );
                 return Err(MlsError::InviterUnknown(id));
             }
@@ -1226,7 +1226,7 @@ impl MlsSession {
                     inviter_key_id = %wrapped.inviter_pk_id,
                     "CC 5.4.4: realtime MLS Welcome REFUSED — inviter ML-DSA-65 signature failed \
                      to verify against the directory key (unsigned / forged / re-signed by a \
-                     non-inviter); membership NOT accepted (CIRISEdge#331)",
+                     non-inviter); membership NOT accepted (history: CIRISEdge#331)",
                 );
                 return Err(MlsError::WelcomeSignatureRejected);
             }
@@ -1236,7 +1236,7 @@ impl MlsSession {
                     inviter_key_id = %wrapped.inviter_pk_id,
                     error = %e,
                     "CC 5.4.4: realtime MLS Welcome REFUSED — HPKE open of the wrapped Welcome \
-                     failed (CIRISEdge#331)",
+                     failed (history: CIRISEdge#331)",
                 );
                 return Err(MlsError::WelcomeWrapFailed(format!("{e}")));
             }

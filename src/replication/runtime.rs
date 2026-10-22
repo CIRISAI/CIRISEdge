@@ -287,7 +287,7 @@ fn resolve_sweep_permits(mut config: BridgeConfig) -> BridgeConfig {
             env = BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV,
             keeping = config.advertise_sweep_permits,
             "advertise-sweep width bound override exceeds the semaphore maximum \
-             — IGNORED, keeping the configured value (CIRISEdge#531)"
+             — IGNORED, keeping the configured value (history: CIRISEdge#531)"
         ),
         Ok(n) => {
             tracing::info!(
@@ -305,7 +305,7 @@ fn resolve_sweep_permits(mut config: BridgeConfig) -> BridgeConfig {
             env = BridgeConfig::ADVERTISE_SWEEP_PERMITS_ENV,
             keeping = config.advertise_sweep_permits,
             "advertise-sweep width bound override is not a usize — IGNORED, \
-             keeping the configured value (CIRISEdge#531)"
+             keeping the configured value (history: CIRISEdge#531)"
         ),
     }
     config
@@ -341,7 +341,7 @@ fn resolve_sweep_page_rows(mut config: BridgeConfig) -> BridgeConfig {
             env = BridgeConfig::SWEEP_PAGE_ROWS_ENV,
             keeping = config.sweep_page_rows,
             "sweep page size override is not a u32 — IGNORED, keeping the \
-             configured value (CIRISEdge#531)"
+             configured value (history: CIRISEdge#531)"
         ),
     }
     config
@@ -607,7 +607,7 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                                 tracing::warn!(
                                     peer = %peer, ?kind, error = %e,
                                     link = %coord.last_inbound_link_hex(),
-                                    "responder reply send failed — round will not complete (CIRISEdge#348)"
+                                    "responder reply send failed — round will not complete (history: CIRISEdge#348)"
                                 );
                                 count(obs::RESPONDER_ROUND_REPLY_SEND_FAILED);
                                 round_began = None;
@@ -621,7 +621,7 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                                     link = %coord.last_inbound_link_hex(),
                                     timeout_secs = RESPONDER_REPLY_SEND_TIMEOUT.as_secs(),
                                     "responder reply send TIMED OUT — abandoning it so the inbound \
-                                     drain resumes and the peer's trace is not dropped (CIRISEdge#373); \
+                                     drain resumes and the peer's trace is not dropped (history: CIRISEdge#373); \
                                      the next round rides the peer's fresh link"
                                 );
                                 break;
@@ -639,7 +639,7 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                             tracing::warn!(
                                 peer = %peer, ?kind, error = %e,
                                 link = %coord.last_inbound_link_hex(),
-                                "responder SendThenComplete send failed (CIRISEdge#380)"
+                                "responder SendThenComplete send failed (history: CIRISEdge#380)"
                             );
                             count(obs::RESPONDER_ROUND_SEND_THEN_COMPLETE_FAILED);
                             failed = true;
@@ -671,7 +671,7 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                     tracing::warn!(
                         peer = %peer, ?kind,
                         "responder REFUSED an inbound replication message (unexpected role/phase) \
-                         — dropped, NOT silently (CIRISEdge#348)"
+                         — dropped, NOT silently (history: CIRISEdge#348)"
                     );
                 }
                 // CIRISEdge#662 — a step error ends the ROUND, never the driver.
@@ -684,7 +684,7 @@ pub(crate) fn spawn_responder_drive(coord: Arc<ReplicationCoordinator>) {
                     tracing::warn!(
                         peer = %peer, ?kind, error = %e,
                         "responder drive_round_step failed; the frame is dropped and the \
-                         driver keeps draining (CIRISEdge#348 / #662)"
+                         driver keeps draining (history: CIRISEdge#348 / history: CIRISEdge#662)"
                     );
                 }
             }
@@ -795,14 +795,18 @@ pub struct ReplicationRuntimeConfig {
     /// cannot evaluate its own trust. The server supplies the same
     /// `node_key_id` it already threads into consent-peer resolution.
     pub local_key_id: Option<String>,
-    /// CIRISEdge#881 — do NOT add the baked bundle's seated serve nodes as
-    /// initiator peers on the bootstrap planes. Default `false`: an unclaimed
-    /// node (no consent-derived peers) still rounds with the canonicals the
-    /// bundle seeds, on the planes that already have everyone-reach for
-    /// announced nodes (#682) and admit unattributed receipt (#402), so it
-    /// receives its owner's announced route row with no host-side Pull.
-    /// Never applied under a test trust root (`test_trust_root_override_active`).
-    pub disable_bundle_bootstrap_peers: bool,
+    /// CIRISEdge#881 — add the baked bundle's seated serve nodes as initiator
+    /// peers on the bootstrap planes, so an unclaimed node (no consent-derived
+    /// peers) rounds with the canonicals the bundle seeds, on the planes that
+    /// already have everyone-reach for announced nodes (#682) and admit
+    /// unattributed receipt (#402), and receives its owner's announced route
+    /// row with no host-side Pull. **Opt-in** (`false` by default): the host
+    /// sets it for device nodes; a runtime built for tests or for a node that
+    /// deliberately runs outside the production mesh then never rounds
+    /// against a production canonical it cannot reach (the v43.2 PR run
+    /// showed every integration runtime doing so). Never applied under a
+    /// test trust root (`test_trust_root_override_active`) either way.
+    pub enable_bundle_bootstrap_peers: bool,
     /// CIRISEdge#541/#552 — the subject whose SERVING TIER is resolved.
     ///
     /// Distinct from `local_key_id` on purpose. `local_key_id` is the truster
@@ -1041,7 +1045,7 @@ impl ReplicationRuntime {
         // common path.
         // CIRISEdge#881 — the bundle's seated serve nodes round with this node
         // on the bootstrap planes whether or not consent names any peer.
-        let bundle_peers = if config.disable_bundle_bootstrap_peers
+        let bundle_peers = if !config.enable_bundle_bootstrap_peers
             || crate::edge::test_trust_root_override_active()
         {
             Vec::new()
@@ -1087,7 +1091,7 @@ impl ReplicationRuntime {
         if self_provider.is_none() {
             tracing::warn!(
                 local_key_id = ?config.local_key_id,
-                "replication started with NO self-publish set: this node will advertise                  none of its own Key / IdentityOccurrence / TransportDestination rows, so                  peers cannot satisfy CIRISEdge#393 item 2 for it and will DROP its                  frames unattributed. Pass `Some(self_publish_set(..))` unless this node                  is deliberately publishing nothing about itself"
+                "replication started with NO self-publish set: this node will advertise                  none of its own Key / IdentityOccurrence / TransportDestination rows, so                  peers cannot satisfy history: CIRISEdge#393 item 2 for it and will DROP its                  frames unattributed. Pass `Some(self_publish_set(..))` unless this node                  is deliberately publishing nothing about itself"
             );
         }
 
@@ -1545,7 +1549,7 @@ impl ReplicationRuntime {
                         subject = %subject_key_id,
                         kind = ?kind,
                         error = %e,
-                        "subject Pull send failed — surfacing to the caller for retry (#462)"
+                        "subject Pull send failed — surfacing to the caller for retry (history: CIRISEdge#462)"
                     );
                     failures.push(format!("{kind:?}: {e}"));
                 }
@@ -1750,11 +1754,11 @@ impl ReplicationRuntime {
 
 #[cfg(test)]
 mod tests {
-    /// CIRISEdge#881 — the unit runtimes assert their exact peer sets, so the
-    /// baked bundle's canonicals are kept out of them.
+    /// CIRISEdge#881 — the unit runtimes assert their exact peer sets; the
+    /// bundle's canonicals are opt-in and stay out of them.
     fn unit_config() -> ReplicationRuntimeConfig {
         ReplicationRuntimeConfig {
-            disable_bundle_bootstrap_peers: true,
+            enable_bundle_bootstrap_peers: false,
             ..ReplicationRuntimeConfig::default()
         }
     }
@@ -2216,7 +2220,7 @@ mod tests {
             });
             let metrics = EdgeMetrics::new();
             let config = ReplicationRuntimeConfig {
-                disable_bundle_bootstrap_peers: true,
+                enable_bundle_bootstrap_peers: false,
                 scheduler: SchedulerConfig {
                     cadence: std::time::Duration::from_secs(3600),
                     round_timeout: std::time::Duration::from_secs(5),

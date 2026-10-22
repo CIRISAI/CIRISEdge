@@ -480,6 +480,38 @@ async fn a_sealed_exchange_crosses_and_the_wire_carries_no_plaintext_e1() {
     assert_wire_is_sealed(&a_wire, back_marker);
     assert!(t.b.seal("link_seal_initiated") >= 1);
     assert!(t.a.seal("link_seal_accepted") >= 1);
+    // CIRISEdge#879 — the on-link announce binds in BOTH directions on a clean
+    // dial: the responder's (A's) announce at the dialler (B), which never
+    // receives a LINKIDENTIFY, binds to the destination B dialled; B's at A
+    // binds to B's identify. No `announce_frame_link_unidentified` drop.
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            t.b.binding("announce_frame_bound") >= 1 && t.a.binding("announce_frame_bound") >= 1
+        })
+        .await,
+        "both ends bind the other's on-link announce: A {:?} B {:?}",
+        t.a.metrics.peer_binding(),
+        t.b.metrics.peer_binding()
+    );
+    for (n, side) in [(&t.a, "A"), (&t.b, "B")] {
+        let drops = n.metrics.transport_inbound_drops();
+        assert_eq!(
+            drops
+                .get("announce_frame_link_unidentified")
+                .copied()
+                .unwrap_or(0),
+            0,
+            "{side} dropped no on-link announce as unidentified: {drops:?}"
+        );
+        assert_eq!(
+            drops
+                .get("announce_frame_identity_mismatch")
+                .copied()
+                .unwrap_or(0),
+            0,
+            "{side}: {drops:?}"
+        );
+    }
     for (n, side) in [(&t.a, "A"), (&t.b, "B")] {
         let refused: Vec<_> = n
             .metrics

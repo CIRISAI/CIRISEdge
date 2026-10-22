@@ -2625,7 +2625,8 @@ impl PyEdge {
     ///   transport was registered at init.
     /// - `ValueError("unknown EnvelopeKind: {token}")` if a kind
     ///   string in `peers` doesn't match the 10 wire tokens.
-    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None, publish_sets_by_kind = None))]
+    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None, publish_sets_by_kind = None, bundle_bootstrap_peers = false))]
+    #[allow(clippy::too_many_arguments)] // Python keyword arguments, one per knob
     fn start_replication(
         &self,
         py: Python<'_>,
@@ -2656,6 +2657,9 @@ impl PyEdge {
         // third party's anchored key while withholding that party's
         // occurrences and routes. `None` = unchanged behaviour.
         publish_sets_by_kind: Option<std::collections::HashMap<String, Vec<String>>>,
+        // CIRISEdge#881 — opt the bundle's seated serve nodes in as bootstrap-plane
+        // initiator peers (an unclaimed device; see `enable_bundle_bootstrap_peers`).
+        bundle_bootstrap_peers: bool,
     ) -> PyResult<PyReplicationHandle> {
         let directory = self
             .inner
@@ -2690,6 +2694,7 @@ impl PyEdge {
         // inert through the shipped host path — the same silent-default failure
         // as the mode above, in the same function.
         config.local_key_id = Some(self.inner.signer_key_id().to_string());
+        config.enable_bundle_bootstrap_peers = bundle_bootstrap_peers;
         // CIRISEdge#541 — and the TIER subject separately: the conferral is
         // granted against the identity peers know this node as. These coincide
         // unless `use_node_identity` split them, and where they differ, using
@@ -6790,7 +6795,7 @@ pub fn init_edge_runtime(
                     self_key_id = %advertised_key_id,
                     readback = ?readback,
                     "engine.set_self_key_id did NOT read back — in-band de-admission may be \
-                     DORMANT; a peer sanction will not enforce (CIRISEdge#427 §3)"
+                     DORMANT; a peer sanction will not enforce (history: CIRISEdge#427 §3)"
                 );
             }
         }
@@ -6799,7 +6804,7 @@ pub fn init_edge_runtime(
                 error = %e,
                 "engine.set_self_key_id unavailable (pre-v22 persist Engine?) — in-band \
                  de-admission is DORMANT (fail-open); an abusive peer has no in-band \
-                 response beyond the accord kill-switch (CIRISEdge#427 §3)"
+                 response beyond the accord kill-switch (history: CIRISEdge#427 §3)"
             );
         }
     }
@@ -6945,7 +6950,7 @@ pub fn init_edge_runtime(
                  must be 32 bytes, got 65'. Upgrade the agent's cohab-init \
                  path to construct ciris_persist.Engine with local_key_id + \
                  local_key_path (Engine.from_shared_with_local, persist \
-                 v2.12.0+ / #112), or set require_local_signer=True to fail \
+                 v2.12.0+ / history: CIRISEdge#112), or set require_local_signer=True to fail \
                  loud instead of announcing un-attested."
                 );
                 signer.clone()
@@ -7135,7 +7140,7 @@ pub fn init_edge_runtime(
             },
             Err(e) => tracing::warn!(
                 "init_edge_runtime: engine.canonical_bootstrap_hints() unavailable (persist < \
-                 v13.6.0 / #402?) — falling back to the baked genesis dial set: {e}"
+                 v13.6.0 / history: CIRISEdge#402?) — falling back to the baked genesis dial set: {e}"
             ),
         }
         // CIRISEdge#281 — the STATIC half of the zero-config dial plane:
@@ -7163,7 +7168,7 @@ pub fn init_edge_runtime(
                 test_trust_root_override = test_anchor,
                 "init_edge_runtime: baked PRODUCTION canonical dials NOT seeded — a test trust \
                  root is active (or the caller said no). A node under a test anchor must not \
-                 open TCP to a production address (CIRISEdge#661). This MUST NOT appear in \
+                 open TCP to a production address (history: CIRISEdge#661). This MUST NOT appear in \
                  production."
             );
         }
@@ -7431,7 +7436,7 @@ pub fn init_edge_runtime(
                         }
                         _ => tracing::warn!(
                             key_id = %row.occurrence_key_id,
-                            "CIRISEdge#299: persisted transport binding has malformed pubkey \
+                            "history: CIRISEdge#299: persisted transport binding has malformed pubkey \
                              base64 — skipping (peer must re-announce to root)"
                         ),
                     }
@@ -7459,7 +7464,7 @@ pub fn init_edge_runtime(
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "CIRISEdge#299: boot-load of persisted transport bindings failed — peers \
+                    "history: CIRISEdge#299: boot-load of persisted transport bindings failed — peers \
                      must re-announce to root this session"
                 );
                 None

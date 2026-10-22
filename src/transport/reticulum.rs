@@ -436,6 +436,79 @@ fn channel_payload_mdu(link_mdu: usize) -> usize {
 
 /// [`channel_payload_mdu`] for a live link; 0 when leviculum no longer holds it
 /// (the fragmenter then refuses, exactly as a missing `link_mdu` did).
+/// CIRISEdge#863 item 7 — the distinct transport Ed25519 keys a peer's dial
+/// candidates carry, in candidate order. A derived or scoped address is not
+/// announced, so nothing tells the dialler which of a peer's transport
+/// identities answers on it (a peer that rotated its transport identity has
+/// two live bindings); the dial tries each until a link proof verifies.
+fn distinct_transport_keys(candidates: &[DialCandidate]) -> Vec<[u8; 32]> {
+    let mut keys: Vec<[u8; 32]> = Vec::new();
+    for c in candidates {
+        if !keys.contains(&c.transport_ed25519) {
+            keys.push(c.transport_ed25519);
+        }
+    }
+    keys
+}
+
+/// CIRISEdge#867 (leviculum#86) — move edge's own per-link state for a link
+/// this node dialled from the id `connect` returned to the link's WIRE id. An
+/// establishment retry (Codeberg #66) re-keys the link under a fresh id; the
+/// peer and every later event see that id, and under CC 5.3.3.5 E1 the seal's
+/// keys are bound to it, so the dialler must bind the handshake to it too.
+/// Pure over its inputs; [`rekey_dialled_link_to_wire_id`] reads the wire id.
+async fn migrate_dialled_link_state(
+    seals: &crate::transport::link_seal::LinkSeals,
+    dialed_link_dest: &Mutex<HashMap<LinkId, DestinationHash>>,
+    link_plane: &Mutex<HashMap<LinkId, LinkPlane>>,
+    connect_id: LinkId,
+    wire_id: LinkId,
+) {
+    if connect_id == wire_id {
+        return;
+    }
+    seals.forget(&connect_id.into_bytes());
+    seals.begin_initiator(wire_id.into_bytes());
+    {
+        let mut dests = dialed_link_dest.lock().await;
+        if let Some(d) = dests.remove(&connect_id) {
+            dests.insert(wire_id, d);
+        }
+    }
+    let mut planes = link_plane.lock().await;
+    if let Some(p) = planes.remove(&connect_id) {
+        planes.insert(wire_id, p);
+    }
+}
+
+/// CIRISEdge#867 — the wire id of a link this node dialled, once it has
+/// established, with edge's per-link state moved onto it. Returns the id every
+/// later call must use. Counted (`link_rekeyed_to_wire_id`) and said when the
+/// ids differ.
+async fn rekey_dialled_link_to_wire_id(
+    node: &ReticulumNode,
+    seals: &crate::transport::link_seal::LinkSeals,
+    dialed_link_dest: &Mutex<HashMap<LinkId, DestinationHash>>,
+    link_plane: &Mutex<HashMap<LinkId, LinkPlane>>,
+    metrics: Option<&crate::observability::EdgeMetrics>,
+    connect_id: LinkId,
+) -> LinkId {
+    let wire_id = node.wire_link_id(&connect_id).unwrap_or(connect_id);
+    if wire_id != connect_id {
+        migrate_dialled_link_state(seals, dialed_link_dest, link_plane, connect_id, wire_id).await;
+        if let Some(m) = metrics {
+            m.inc_link_seal(crate::observability::LINK_REKEYED_TO_WIRE_ID);
+        }
+        tracing::info!(
+            connect_id = %hex::encode(connect_id.into_bytes()),
+            wire_id = %hex::encode(wire_id.into_bytes()),
+            "a dialled link established through an establishment retry under a fresh id; \
+             edge's link state and the seal now use the wire id (history: CIRISEdge#867)"
+        );
+    }
+    wire_id
+}
+
 fn link_channel_mdu(node: &ReticulumNode, link_id: &LinkId) -> usize {
     node.link_mdu(link_id).map_or(0, channel_payload_mdu)
 }
@@ -1054,6 +1127,17 @@ static INBOUND_DROP_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
 
 /// CIRISEdge#425 — throttle backing [`drop_inbound`]. Keyed on the low-cardinality
 /// reason TAG (a fixed set), a floor per window (periodic repeat), never silence.
+/// CIRISEdge#875 — the per-peer throttle for "dial target has no route": a peer
+/// that is simply offline is retried every round, and that is a working gate,
+/// not a storm. Once per peer per ten minutes, with the suppressed count.
+static NO_ROUTE_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+
+fn no_route_log() -> &'static crate::log_throttle::LogThrottle {
+    NO_ROUTE_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_secs(600), 1024))
+}
+
 fn inbound_drop_log() -> &'static crate::log_throttle::LogThrottle {
     INBOUND_DROP_LOG
         .get_or_init(|| crate::log_throttle::LogThrottle::new(3, Duration::from_secs(60), 64))
@@ -1076,7 +1160,7 @@ fn drop_inbound(link_id: Option<LinkId>, reason_tag: &str, detail: &str) {
             reason = reason_tag,
             detail,
             suppressed_prev,
-            "inbound frame DROPPED — not delivered (CIRISEdge#425 receive-side choke point)"
+            "inbound frame DROPPED — not delivered (history: CIRISEdge#425 receive-side choke point)"
         );
     }
 }
@@ -1162,7 +1246,7 @@ fn log_nat_topology_diagnosis(destination_key_id: &str, establish_timeout: Durat
             "outbound dial had a path but never established, and the peer has NO \
              live inbound link to ride — if this peer is NAT'd / initiator-only \
              it is structurally unreachable outbound; delivery will succeed over \
-             the peer's NEXT inbound link (reverse path, CIRISEdge#353)"
+             the peer's NEXT inbound link (reverse path, history: CIRISEdge#353)"
         );
     }
 }
@@ -3322,7 +3406,7 @@ impl ReticulumTransport {
                 signer = %local_signer.key_id,
                 "this node's signed route and transit KEX pair are published under {} but it \
                  advertises {}; peers cannot root it or key an A/V hop to it. Pass the signer \
-                 for the advertised id (CIRISEdge#541)",
+                 for the advertised id (history: CIRISEdge#541)",
                 local_signer.key_id,
                 config.local_key_id,
             );
@@ -3457,7 +3541,7 @@ impl ReticulumTransport {
                     raw = env_capacity.as_deref().unwrap_or(""),
                     ?source,
                     "control-channel capacity env var did not parse as usize — \
-                     IGNORED, leviculum default (256) applies (CIRISEdge#508 item d)"
+                     IGNORED, leviculum default (256) applies (history: CIRISEdge#508 item d)"
                 );
             }
             (None, _) => {
@@ -3768,7 +3852,7 @@ impl ReticulumTransport {
                         dest = %hex::encode(named16),
                         epoch = config.local_epoch,
                         outcome = ?other,
-                        "CIRISEdge#406: transport hint NOT published. No peer can                          satisfy #393 item 2 for this node, so every frame it sends                          will be dropped at the attribution gate"
+                        "history: CIRISEdge#406: transport hint NOT published. No peer can                          satisfy history: CIRISEdge#393 item 2 for this node, so every frame it sends                          will be dropped at the attribution gate"
                     );
                 }
             }
@@ -4202,7 +4286,7 @@ impl ReticulumTransport {
             tracing::warn!(
                 vanished = vanished.len(),
                 "links the node no longer holds left without a LinkClosed edge processed \
-                 (CIRISEdge#853: a control-plane overflow drops it); pruned and counted as \
+                 (history: CIRISEdge#853: a control-plane overflow drops it); pruned and counted as \
                  `vanished`"
             );
         }
@@ -5159,22 +5243,19 @@ impl ReticulumTransport {
         // bypassable by addressing the peer in one of its scopes.
         self.check_blackhole(&dest_hash.into_bytes()).await?;
 
-        // The peer's transport-tier Ed25519, for the link proof. Any candidate
-        // carries it (they differ in ROUTING hash, not in signing key), so take
-        // the first. The candidate's own dest_hash is deliberately discarded:
-        // routing here is the derived address, never a federation one.
-        let Some(transport_ed25519) = self
-            .resolve_dial_candidates(destination_key_id)
-            .await
-            .first()
-            .map(|c| c.transport_ed25519)
-        else {
+        // The peer's transport-tier Ed25519 keys, for the link proof. The
+        // candidates' own dest_hashes are deliberately discarded: routing here is
+        // the derived address, never a federation one. A peer that rotated its
+        // transport identity has more than one; the dial tries each (#863 item 7).
+        let transport_keys =
+            distinct_transport_keys(&self.resolve_dial_candidates(destination_key_id).await);
+        if transport_keys.is_empty() {
             return Err(TransportError::Unreachable(format!(
                 "scope-native send: no transport identity resolved for \
                  destination_key_id={destination_key_id} — cannot prove a link to its \
                  derived address (CIRISEdge#499)"
             )));
-        };
+        }
 
         // REUSE BEFORE DIALING (CIRISEdge#532, the scoped pool — #739).
         let bypass = self
@@ -5183,7 +5264,7 @@ impl ReticulumTransport {
         if bypass {
             let link_id = self
                 .dial_ctx()
-                .dial_scoped_link(destination_key_id, dest_hash, &transport_ed25519)
+                .dial_scoped_link_any(destination_key_id, dest_hash, &transport_keys)
                 .await?;
             return Ok(ScopedLinkLease::claim(link_id, &self.scoped_link_leased));
         }
@@ -5236,7 +5317,7 @@ impl ReticulumTransport {
                 return Ok(lease);
             }
             let link_id = ctx
-                .dial_scoped_link(&dkid, dest_hash, &transport_ed25519)
+                .dial_scoped_link_any(&dkid, dest_hash, &transport_keys)
                 .await?;
             // Claim BEFORE publishing, so no concurrent lease can take the
             // lane between the publish and this caller's first send.
@@ -5313,7 +5394,7 @@ impl ReticulumTransport {
             }
             tracing::warn!(
                 link = %hex::encode(link_id.as_bytes()),
-                "refusing to ship on a lane another transfer holds (CIRISEdge#853); \
+                "refusing to ship on a lane another transfer holds (history: CIRISEdge#853); \
                  this path should be unreachable"
             );
             return Err(TransportError::Io(
@@ -5655,13 +5736,14 @@ impl ReticulumTransport {
         self.seals.is_sealed(link)
     }
 
+    #[allow(clippy::too_many_lines)] // one dial: target, direct path, per-key attempts, cleanup
     async fn open_av_link_claiming(
         &self,
         destination_key_id: &str,
         address: &MemberAddress,
         initiator_key_id: &str,
     ) -> Result<crate::transport::av_sink::AvLink, TransportError> {
-        let (dest_hash, transport_ed25519, pair) =
+        let (dest_hash, transport_keys, pair) =
             self.av_dial_target(destination_key_id, address).await?;
         // CIRISEdge#805 item 8 — a derived address answers only a one-hop
         // neighbour, so a member behind NAT is reachable here only once the two
@@ -5693,34 +5775,55 @@ impl ReticulumTransport {
         // registering its consumer can be torn down (Codex on #813).
         let dispatched: Arc<std::sync::Mutex<Option<LinkId>>> =
             Arc::new(std::sync::Mutex::new(None));
+        // CIRISEdge#863 item 7 — each of the peer's distinct transport keys in
+        // turn: a derived A/V address is not announced, so only the link proof
+        // says which key answers on it. A refused proof undoes that attempt's
+        // records before the next key; any other outcome is the dial's answer.
         let link_id = {
-            let sink = Arc::clone(&self.av_sink);
-            let dialed = Arc::clone(&self.av_dialed_peer);
-            let slot = Arc::clone(&inbound);
-            let dispatched = Arc::clone(&dispatched);
-            let peer = destination_key_id.to_owned();
-            self.dial_ctx()
-                .dial_derived_link(
-                    destination_key_id,
-                    dest_hash,
-                    &transport_ed25519,
-                    LinkPlane::Av,
-                    (&pair, initiator_key_id),
-                    move |link_id| {
-                        *dispatched
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(link_id);
-                        dialed
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(link_id, peer);
-                        *slot
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(sink.claim(link_id));
-                    },
-                )
-                .await
+            let mut result: Result<LinkId, TransportError> = Err(TransportError::Unreachable(
+                format!("open_av_link: no transport key for {destination_key_id}"),
+            ));
+            for transport_ed25519 in &transport_keys {
+                let sink = Arc::clone(&self.av_sink);
+                let dialed = Arc::clone(&self.av_dialed_peer);
+                let slot = Arc::clone(&inbound);
+                let dispatched_on_dial = Arc::clone(&dispatched);
+                let peer = destination_key_id.to_owned();
+                result = self
+                    .dial_ctx()
+                    .dial_derived_link(
+                        destination_key_id,
+                        dest_hash,
+                        transport_ed25519,
+                        LinkPlane::Av,
+                        (&pair, initiator_key_id),
+                        move |link_id| {
+                            *dispatched_on_dial
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(link_id);
+                            dialed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(link_id, peer);
+                            *slot
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(sink.claim(link_id));
+                        },
+                    )
+                    .await;
+                if !matches!(result, Err(TransportError::LinkProofRefused { .. })) {
+                    break;
+                }
+                let partial = dispatched
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let (Some(id), Err(e)) = (partial, result.as_ref()) {
+                    self.undo_partial_av_dial(id, e).await;
+                }
+            }
+            result
         };
         let link_id = match link_id {
             Ok(id) => id,
@@ -5859,7 +5962,7 @@ impl ReticulumTransport {
     ) -> Result<
         (
             DestinationHash,
-            [u8; 32],
+            Vec<[u8; 32]>,
             ciris_persist::federation::self_at_login::TransitKexPair,
         ),
         TransportError,
@@ -5913,14 +6016,15 @@ impl ReticulumTransport {
             self.check_blackhole(&candidate.dest_hash.into_bytes())
                 .await?;
         }
-        let Some(transport_ed25519) = candidates.first().map(|c| c.transport_ed25519) else {
+        let transport_keys = distinct_transport_keys(&candidates);
+        if transport_keys.is_empty() {
             return Err(TransportError::Unreachable(format!(
                 "open_av_link: no transport identity resolved for \
                  destination_key_id={destination_key_id} — cannot prove a link to its A/V \
                  address (CIRISEdge#805)"
             )));
-        };
-        Ok((dest_hash, transport_ed25519, pair))
+        }
+        Ok((dest_hash, transport_keys, pair))
     }
 
     /// CIRISEdge#805 item 8 — bring the path to call member
@@ -7077,6 +7181,16 @@ impl ReticulumTransport {
         if !matches!(outcome, Some(Ok(()))) {
             return Err(TransportError::Timeout(timeout));
         }
+        // CIRISEdge#867 — bind everything below to the link's wire id.
+        let link_id = rekey_dialled_link_to_wire_id(
+            &self.node,
+            &self.seals,
+            &self.dialed_link_dest,
+            &self.link_plane,
+            self.metrics.get(),
+            link_id,
+        )
+        .await;
         // CIRISEdge#340 — identify the link so the responder can attribute what
         // arrives on it (same rationale as `send`: an anonymous link yields
         // `source_key_id=None` → dropped). The FFI Links surface establishes
@@ -8270,7 +8384,7 @@ impl ReticulumTransport {
     /// Returns `true` iff the envelope was DELIVERED over the reverse path;
     /// `false` means fall through to the outbound dial (each stage logged
     /// distinctly + throttled so the RCA classifier can tell them apart).
-    // CIRISEdge#414/#932 — grew past clippy's 100-line cap when the Busy arm's
+    // CIRISEdge#414, CIRISAgent#932 — grew past clippy's 100-line cap when the Busy arm's
     // single-packet interleave became the fragment-aware interleave (fragment the
     // oversized reply onto the packet path + the two loud fallback logs). The body
     // is one linear retry loop with a single match; extracting the Busy arm would
@@ -8317,7 +8431,7 @@ impl ReticulumTransport {
                             attempts,
                             suppressed_prev,
                             "reverse-path link died during busy-retry and no fresh inbound \
-                             link exists; falling back to an outbound dial (CIRISEdge#353)"
+                             link exists; falling back to an outbound dial (history: CIRISEdge#353)"
                         );
                     }
                 }
@@ -8463,7 +8577,7 @@ impl ReticulumTransport {
                                 fragments = total,
                                 "delivered as {total} link PACKET(s), interleaving the busy \
                                  resource transfer (CIRISEdge#353 ask #2 / leviculum#27, \
-                                 fragmented per CIRISEdge#414/#932)"
+                                 fragmented per CIRISEdge#414, CIRISAgent#932)"
                             );
                             return true;
                         }
@@ -8485,8 +8599,8 @@ impl ReticulumTransport {
                                 stalled = outcome.stalled.unwrap_or("-"),
                                 suppressed_prev,
                                 "reverse-path link Channel send stalled mid-frame ({sent}/{total} \
-                                 landed after absorbing pacing, CIRISEdge#636); frame will \
-                                 re-fragment next round (CIRISEdge#414/#932) — falling back to \
+                                 landed after absorbing pacing, history: CIRISEdge#636); frame will \
+                                 re-fragment next round (history: CIRISEdge#414, history: CIRISAgent#932) — falling back to \
                                  resource busy-retry"
                             );
                         }
@@ -8506,7 +8620,7 @@ impl ReticulumTransport {
                                 suppressed_prev,
                                 "reverse-path link MDU too small to fragment \
                                  (< MIN_FRAGMENTABLE_MDU); cannot use the packet path \
-                                 (CIRISEdge#414/#932) — falling back to resource busy-retry"
+                                 (history: CIRISEdge#414, history: CIRISAgent#932) — falling back to resource busy-retry"
                             );
                         }
                     }
@@ -8523,7 +8637,7 @@ impl ReticulumTransport {
                                 "reverse-path link stayed BUSY and the reply did not fit a \
                                  link packet (too large / channel backpressured) through the \
                                  whole retry window; falling back to an outbound dial as LAST \
-                                 resort (CIRISEdge#353)"
+                                 resort (history: CIRISEdge#353)"
                             );
                         }
                         return false;
@@ -8541,7 +8655,7 @@ impl ReticulumTransport {
                             attempts,
                             suppressed_prev,
                             "reverse-path send over the peer's inbound link failed \
-                             (non-busy); falling back to an outbound dial (CIRISEdge#353)"
+                             (non-busy); falling back to an outbound dial (history: CIRISEdge#353)"
                         );
                     }
                     return false;
@@ -8752,7 +8866,7 @@ impl ReticulumTransport {
                                 resource = %hex::encode(&resource_hash[..8]),
                                 max_secs = max_transfer.as_secs(),
                                 "reverse-path resource still transferring at the hard cap; abandoning \
-                                 so the responder drain is not parked forever (CIRISEdge#353b/#373)"
+                                 so the responder drain is not parked forever (CIRISEdge#353b/history: CIRISEdge#373)"
                             );
                             return Err(ShipError::Other(TransportError::Timeout(max_transfer)));
                         }
@@ -9632,7 +9746,7 @@ fn note_starved_pool_close(reason: leviculum_core::link::LinkCloseReason, link_i
             pooled_closed_stale = POOL_CLOSED_STALE.load(std::sync::atomic::Ordering::Relaxed),
             suppressed_prev,
             "a pooled lane closed {tag} — the far end stopped answering on it; sustained, \
-             this is a starved responder (CIRISEdge#853)"
+             this is a starved responder (history: CIRISEdge#853)"
         );
     }
 }
@@ -10056,6 +10170,33 @@ impl DialCtx {
     /// dest (#424), tag the plane `Scoped` before establishment (#728), the
     /// bootstrap-broadcast establish budget (a derived address is never
     /// pathed), then `identify_link` (#340). Returns the link ready to carry.
+    /// CIRISEdge#863 item 7 — [`Self::dial_scoped_link`] with each of the
+    /// peer's distinct transport keys in turn, moving on only when the link
+    /// proof is refused (the key is not the one answering on this address);
+    /// any other failure is the dial's answer.
+    async fn dial_scoped_link_any(
+        &self,
+        destination_key_id: &str,
+        dest_hash: DestinationHash,
+        transport_keys: &[[u8; 32]],
+    ) -> Result<LinkId, TransportError> {
+        let mut refused = None;
+        for key in transport_keys {
+            match self
+                .dial_scoped_link(destination_key_id, dest_hash, key)
+                .await
+            {
+                Err(e @ TransportError::LinkProofRefused { .. }) => refused = Some(e),
+                other => return other,
+            }
+        }
+        Err(refused.unwrap_or_else(|| {
+            TransportError::Unreachable(format!(
+                "no transport identity to dial {destination_key_id} with"
+            ))
+        }))
+    }
+
     async fn dial_scoped_link(
         &self,
         destination_key_id: &str,
@@ -10134,7 +10275,7 @@ impl DialCtx {
                  address is announce-suppressed by design (CC 5.4), so it is \
                  broadcast-only — only a directly-attached neighbour answers. Making a \
                  scoped address relay-routable without re-publishing the reachability \
-                 fact is unspecified upstream (CIRISEdge#499). NOT retried on the \
+                 fact is unspecified upstream (tracked: CIRISEdge#499). NOT retried on the \
                  federation address: that would collapse the very context this \
                  address exists to separate."
             );
@@ -10145,6 +10286,16 @@ impl DialCtx {
                 paths: self.path_table_snapshot(),
             });
         }
+        // CIRISEdge#867 — bind everything below to the link's wire id.
+        let link_id = rekey_dialled_link_to_wire_id(
+            &self.node,
+            &self.seals,
+            &self.dialed_link_dest,
+            &self.link_plane,
+            self.metrics.as_ref(),
+            link_id,
+        )
+        .await;
 
         // CIRISEdge#805 test seam: fail identify on an ESTABLISHED link, the
         // partial-open arm a caller must clean up after.
@@ -10357,14 +10508,19 @@ impl DialCtx {
             Err(e @ AvHandshakeError::NoTransitPair { .. }) => {
                 let target_dest = hex::encode(peer.dest_hash.into_bytes());
                 let paths = self.path_table_snapshot();
-                tracing::error!(
-                    key_id = %destination_key_id,
-                    target_dest = %target_dest,
-                    known_paths = %paths,
-                    seal = %e,
-                    "dial target has no route and no authenticated transit pair — un-routable \
-                     dest, never dialled (CIRISEdge#336, CC 5.3.3.5 E1)"
-                );
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    no_route_log().check(destination_key_id)
+                {
+                    tracing::warn!(
+                        suppressed_prev,
+                        key_id = %destination_key_id,
+                        target_dest = %target_dest,
+                        known_paths = %paths,
+                        seal = %e,
+                        "dial target has no route and no authenticated transit pair — un-routable \
+                         dest, never dialled (history: CIRISEdge#336, CC 5.3.3.5 E1)"
+                    );
+                }
                 Err(TransportError::NoRouteToPeer {
                     key_id: destination_key_id.to_string(),
                     target_dest,
@@ -10685,16 +10841,21 @@ impl DialCtx {
             if !has_path {
                 let target_dest = hex::encode(peer.dest_hash.into_bytes());
                 let paths = self.path_table_snapshot();
-                tracing::error!(
-                    key_id = %destination_key_id,
-                    target_dest = %target_dest,
-                    has_path,
-                    known_paths = %paths,
-                    "link_request target has no route — un-routable dest (CIRISEdge#336). \
-                     A no-path dest is broadcast-only and no directly-attached neighbor \
-                     answered; if the peer is relay-reachable it must be addressed on its \
-                     announced (named) dest, which appears in known_paths."
-                );
+                if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+                    no_route_log().check(destination_key_id)
+                {
+                    tracing::warn!(
+                        suppressed_prev,
+                        key_id = %destination_key_id,
+                        target_dest = %target_dest,
+                        has_path,
+                        known_paths = %paths,
+                        "link_request target has no route — un-routable dest (history: CIRISEdge#336). \
+                         A no-path dest is broadcast-only and no directly-attached neighbor \
+                         answered; if the peer is relay-reachable it must be addressed on its \
+                         announced (named) dest, which appears in known_paths."
+                    );
+                }
                 return Err(TransportError::NoRouteToPeer {
                     key_id: destination_key_id.to_string(),
                     target_dest,
@@ -10705,6 +10866,17 @@ impl DialCtx {
             log_nat_topology_diagnosis(destination_key_id, establish_timeout);
             return Err(TransportError::Timeout(establish_timeout));
         }
+        // CIRISEdge#867 — bind the identify, the route fetch, the handshake and
+        // the seal to the link's wire id (an establishment retry re-keys it).
+        let link_id = rekey_dialled_link_to_wire_id(
+            &self.node,
+            &self.seals,
+            &self.dialed_link_dest,
+            &self.link_plane,
+            self.metrics.as_ref(),
+            link_id,
+        )
+        .await;
 
         // CIRISEdge#340 — IDENTIFY the link before sending. A Reticulum link is
         // anonymous by default; only the initiator may identify it, and the
@@ -11089,7 +11261,7 @@ struct EventCtx<'a> {
     /// liveness signal); stamped in `attribute_and_deliver`, consumed by
     /// `live_attributed_link_to` to reply over the peer's freshest live link.
     link_last_inbound_at: &'a Mutex<HashMap<LinkId, u64>>,
-    /// CIRISEdge#414/#932 — inbound fragment reassembler (see the field of the
+    /// CIRISEdge#414, CIRISAgent#932 — inbound fragment reassembler (see the field of the
     /// same name on [`ReticulumTransport`]). `attribute_and_deliver` feeds every
     /// inbound frame through it; a fragment that does not yet complete its frame
     /// buffers here and produces no `InboundFrame`.
@@ -11277,7 +11449,9 @@ enum InboundPlaneRoute {
 /// [`crate::av_addressing::AV_STREAM_GROUP_PREFIX`] namespace) is `Av`: same
 /// table, same reverse index, one more fact read from the entry it returns.
 fn classify_link_plane(table: Option<&ScopeAddressTable>, dest: &DestinationHash) -> LinkPlane {
-    match table.and_then(|t| t.accepts_inbound(dest.as_bytes())) {
+    // CIRISEdge#863 item 4 — `plane_of`, not `accepts_inbound`: a link that
+    // establishes just after its address's epoch was sealed keeps its plane.
+    match table.and_then(|t| t.plane_of(dest.as_bytes())) {
         Some(a) if crate::av_addressing::is_av_stream_group(a.group().group_id()) => LinkPlane::Av,
         Some(_) => LinkPlane::Scoped,
         None => LinkPlane::Identity,
@@ -11653,7 +11827,7 @@ async fn attribute_and_deliver(
             tracing::trace!(
                 link = ?link_id,
                 bytes = data.len(),
-                "inbound fragment buffered; frame not yet complete (CIRISEdge#414/#932)"
+                "inbound fragment buffered; frame not yet complete (CIRISEdge#414, CIRISAgent#932)"
             );
             return;
         };
@@ -11793,9 +11967,9 @@ async fn attribute_and_deliver(
                         "inbound frame's link has NO known destination — not \
                          LinkIdentified (no peer dialed us) and no dialed-dest record \
                          (leviculum `link_destination`=None for own-dialed links). The \
-                         #353 initiator arm cannot resolve a source; the frame is \
+                         history: CIRISEdge#353 initiator arm cannot resolve a source; the frame is \
                          unattributed — a self-authenticating bootstrap kind may still \
-                         route on the link's proven identity (CIRISEdge#424/#624)"
+                         route on the link's proven identity (history: CIRISEdge#424, history: CIRISEdge#624)"
                     );
                 }
                 None
@@ -11833,7 +12007,7 @@ async fn attribute_and_deliver(
                          rooted peer (dest resolved, peers-map lookup missed; peer not yet \
                          rooted, or rooted under a different dest). A non-bootstrap kind \
                          drops; a self-authenticating Key/IdentityOccurrence may still route \
-                         on the link's proven identity (CIRISEdge#425/#624)"
+                         on the link's proven identity (history: CIRISEdge#425, history: CIRISEdge#624)"
                     );
                 }
                 None
@@ -12264,11 +12438,11 @@ async fn gate_attribution(
                     suppressed_prev,
                     "inbound frame DROPPED — item 1 PASSED (owns_key) but \
                      item 2 FAILED: no hybrid-verified SignedTransportDestination \
-                     binds this (peer, dest) pair (CIRISEdge#393 item 2). This is \
+                     binds this (peer, dest) pair (history: CIRISEdge#393 item 2). This is \
                      the ONLY failing conjunct. `held_signed_route=none` ⇒ the \
                      peer's TransportDestination row has not reached this node; a \
                      held dest ≠ `dest` ⇒ the peer announces on a destination its \
-                     signed route does not name (CIRISEdge#722)"
+                     signed route does not name (history: CIRISEdge#722)"
                 );
                 None
             } else {
@@ -12289,7 +12463,7 @@ async fn gate_attribution(
                     "inbound frame DROPPED — NO ROOTING DIRECTORY wired on this \
                      transport, so item 2 can never be evaluated (fail-closed). This \
                      nulls EVERY attribution regardless of kind or path — check the \
-                     Edge builder wires a RootingDirectory (CIRISEdge#393 item 2)"
+                     Edge builder wires a RootingDirectory (history: CIRISEdge#393 item 2)"
                 );
             }
             None
@@ -12710,7 +12884,7 @@ async fn route_now(ctx: &EventCtx<'_>, link_id: LinkId, is_resource: bool, data:
                 Some(link_id),
                 crate::observability::AV_INBOUND_DROPPED_RESOURCE,
                 "a Resource completed on an A/V link — A/V rides the link Channel only; not \
-                 routed to replication nor to the A/V sink (CIRISEdge#805)",
+                 routed to replication nor to the A/V sink (tracked: CIRISEdge#805)",
             );
         }
     }
@@ -13603,7 +13777,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                         "link_attribution_miss — inbound frames from this link cannot be \
                          attributed to a peer key_id (source_key_id will be None); rounds \
                          dropped. Both Branch A (identity) and Branch B (dest) missed \
-                         (CIRISEdge#317)"
+                         (history: CIRISEdge#317)"
                     );
                 }
             }
@@ -14188,7 +14362,7 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
                      means the event consumer is stalling (leviculum#58) or the channel \
                      is undersized for this deployment — raise it via \
                      ReticulumTransportConfig::control_channel_capacity or \
-                     CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY (CIRISEdge#508)"
+                     CIRIS_EDGE_RETICULUM_CONTROL_CHANNEL_CAPACITY (history: CIRISEdge#508)"
                 );
             }
         }
@@ -14980,7 +15154,7 @@ async fn heal_or_report_attribution_miss(
                      link-proven transport identity). This peer was admitted at Advisory \
                      on first contact and rooted through a writer that never updated the \
                      live map; pre-heal the plane stayed dark until a restart \
-                     (CIRISEdge#432)"
+                     (history: CIRISEdge#432)"
                 );
                 // Item 2 still applies — the heal upgrades item 1 only.
                 if let (Some(d), Some(rooting)) = (dest16, ctx.rooting) {
@@ -14994,9 +15168,9 @@ async fn heal_or_report_attribution_miss(
                         link = ?link_id,
                         peer = %key_id,
                         dest = %hex::encode(d),
-                        "CIRISEdge#432 heal upgraded item 1, but item 2 still FAILS: no \
+                        "history: CIRISEdge#432 heal upgraded item 1, but item 2 still FAILS: no \
                          hybrid-verified SignedTransportDestination binds this (peer, dest) \
-                         pair — see CIRISEdge#406 (the signed transport-dest producer gap)"
+                         pair — see history: CIRISEdge#406 (the signed transport-dest producer gap)"
                     );
                 }
                 return None;
@@ -15011,7 +15185,7 @@ async fn heal_or_report_attribution_miss(
                     "divergence detected but NOT healed — the durable store roots a \
                      DIFFERENT transport identity than this link proved (stale rotation, \
                      or an identity-squat attempt); trust is never laundered across \
-                     identities (CIRISEdge#432)"
+                     identities (history: CIRISEdge#432)"
                 );
                 return None;
             }
@@ -15026,7 +15200,7 @@ async fn heal_or_report_attribution_miss(
                     "durable store holds `Rooted` for this peer but its provenance chain \
                      does NOT root against this node's anchor — a replicated self-claim \
                      (a peer's own SignedTransportDestination), not this node's verdict; \
-                     NOT laundered into attribution (CIRISEdge#393, v19.0.0)"
+                     NOT laundered into attribution (history: CIRISEdge#393, v19.0.0)"
                 );
                 return None;
             }
@@ -15096,7 +15270,7 @@ fn report_attribution_miss(
             stored_provenance = ?stored_provenance,
             suppressed_prev,
             "inbound frame NOT attributed — these are the ACTUAL operands \
-             (CIRISEdge#404). {hint}"
+             (history: CIRISEdge#404). {hint}"
         );
     } else {
         tracing::warn!(
@@ -15105,11 +15279,11 @@ fn report_attribution_miss(
             stored_provenance = ?stored_provenance,
             suppressed_prev,
             "inbound frame DROPPED — item 1 has NO binding in the peers map for this \
-             link's key_id (candidate resolved, peers-map miss) (CIRISEdge#404 \
+             link's key_id (candidate resolved, peers-map miss) (history: CIRISEdge#404 \
              link-resolution miss). A stored_provenance=Rooted here means the durable \
              store knows this peer but the live map lost it (cap eviction / restart \
              ordering) — divergence detected, not auto-installed (no link-proven \
-             identity in the map to bind against) (CIRISEdge#432)"
+             identity in the map to bind against) (history: CIRISEdge#432)"
         );
     }
 }
@@ -15143,7 +15317,7 @@ async fn push_own_announce_frame(
                 bytes = frame.len(),
                 suppressed_prev,
                 "own announce push skipped — link MDU too small to fragment; the peer must \
-                 bind us from the RNS announce instead (CIRISEdge#627)"
+                 bind us from the RNS announce instead (history: CIRISEdge#627)"
             );
         }
         return;
@@ -15164,7 +15338,7 @@ async fn push_own_announce_frame(
             suppressed_prev,
             "own announce push incomplete ({sent}/{total} fragments) — link Channel \
              stalled past its pacing budget; the peer binds us from the RNS announce or \
-             the next link-up (CIRISEdge#627/#636)"
+             the next link-up (history: CIRISEdge#627, history: CIRISEdge#636)"
         );
     }
 }
@@ -15199,7 +15373,7 @@ async fn push_own_owner_binding(
                 mdu,
                 bytes = frame.len(),
                 suppressed_prev,
-                "own owner-binding push skipped — link MDU too small to fragment (CIRISEdge#727)"
+                "own owner-binding push skipped — link MDU too small to fragment (history: CIRISEdge#727)"
             );
         }
         return;
@@ -15229,7 +15403,7 @@ async fn push_own_owner_binding(
                 stalled = outcome.stalled.unwrap_or("-"),
                 suppressed_prev,
                 "own owner-binding push incomplete — link Channel stalled; the peer \
-                 re-receives on the next dial (CIRISEdge#727)"
+                 re-receives on the next dial (history: CIRISEdge#727)"
             );
         }
     }
@@ -15253,7 +15427,7 @@ async fn push_own_bundle_frames(
                 bytes = own.frame.len(),
                 suppressed_prev,
                 "own build-bundle push skipped — link MDU too small to fragment; the peer \
-                 cannot root us at first contact over this link (CIRISEdge#436)"
+                 cannot root us at first contact over this link (history: CIRISEdge#436)"
             );
         }
         return;
@@ -15278,7 +15452,7 @@ async fn push_own_bundle_frames(
             suppressed_prev,
             "own build-bundle push incomplete ({sent}/{total} fragments) — link Channel \
              stalled past its pacing budget; the peer re-receives on the next link-up \
-             (CIRISEdge#436/#636)"
+             (history: CIRISEdge#436, history: CIRISEdge#636)"
         );
     }
 }
@@ -15626,32 +15800,60 @@ async fn handle_announce_frame(ctx: &EventCtx<'_>, link_id: LinkId, frame: &[u8]
         drop_inbound(
             Some(link_id),
             "announce_frame_malformed",
-            "CANN frame did not decode (magic/version/length) — dropped (CIRISEdge#627)",
+            "CANN frame did not decode (magic/version/length) — dropped (history: CIRISEdge#627)",
         );
         return;
     };
-    let Some(remote) = ctx.node.get_remote_identity(&link_id) else {
+    // The identity the link proved. A RESPONDER learns its dialler's identity
+    // from the dialler's LINKIDENTIFY. A DIALLER never receives one (a
+    // responder does not identify to its dialler), but the RNS link proof
+    // already authenticated the responder as the destination this node
+    // dialled: the announce binds iff its transport key names that
+    // destination (CIRISEdge#879).
+    let link_pubkey: Option<[u8; 64]> = if let Some(remote) = ctx.node.get_remote_identity(&link_id)
+    {
+        remote.public_key_bytes()[..64].try_into().ok()
+    } else {
+        let dialled = ctx.dialed_link_dest.lock().await.get(&link_id).copied();
+        dialled.and_then(|dest| {
+            (named_dest_of_transport(decoded.transport_public_key) == Some(dest.into_bytes()))
+                .then_some(*decoded.transport_public_key)
+        })
+    };
+    let Some(link_pubkey) = link_pubkey else {
+        if let Some(m) = ctx.metrics {
+            m.inc_transport_inbound_drop(
+                crate::observability::DROP_ANNOUNCE_FRAME_LINK_UNIDENTIFIED,
+            );
+        }
         drop_inbound(
             Some(link_id),
             "announce_frame_link_unidentified",
-            "CANN frame on a link with no proven remote identity — dropped; an announce \
-             binds only the identity the link proved (CIRISEdge#627)",
+            "CANN frame on a link with no proven remote identity (a peer-dialled link \
+             before its LINKIDENTIFY, or a dialled link whose announce names another \
+             destination) — dropped; an announce binds only the identity the link proved \
+             (history: CIRISEdge#627, history: CIRISEdge#879)",
         );
         return;
     };
-    let link_pubkey: [u8; 64] = remote.public_key_bytes()[..64]
-        .try_into()
-        .unwrap_or([0u8; 64]);
     let Some(view) = announce_view_bound_to_link(&decoded, &link_pubkey) else {
+        if let Some(m) = ctx.metrics {
+            m.inc_transport_inbound_drop(
+                crate::observability::DROP_ANNOUNCE_FRAME_IDENTITY_MISMATCH,
+            );
+        }
         drop_inbound(
             Some(link_id),
             "announce_frame_identity_mismatch",
             "CANN frame's transport key is not this link's proven remote identity — \
              dropped by name (a relayed/replayed announce cannot bind a link it did not \
-             come from; CIRISEdge#627)",
+             come from; history: CIRISEdge#627)",
         );
         return;
     };
+    if let Some(m) = ctx.metrics {
+        m.inc_peer_binding(crate::observability::ANNOUNCE_FRAME_BOUND);
+    }
     receive_announce(ctx, view, Some(link_id)).await;
 }
 
@@ -15750,20 +15952,20 @@ async fn receive_announce(ctx: &EventCtx<'_>, view: AnnounceView, link: Option<L
                     ?carrier,
                     "announce Stage 2 DROPPED for a FIRST-SEEN peer — priority lane full. \
                      The peer is attributable (Stage 1 bound it) but will not root until its \
-                     next announce (CIRISEdge#627)"
+                     next announce (history: CIRISEdge#627)"
                 );
             } else {
                 tracing::warn!(
                     key_id = ?key_id,
                     "announce Stage 2 shed — re-announce of a bound peer, worker queue full \
-                     (backpressure); RNS re-announce will retry (CIRISEdge#482 item 3)"
+                     (backpressure); RNS re-announce will retry (tracked: CIRISEdge#482 item 3)"
                 );
             }
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             tracing::error!(
                 "announce Stage 2 DROPPED — cold-start worker is GONE (channel closed: the \
-                 worker task exited); rooting is no longer being processed (CIRISEdge#482 \
+                 worker task exited); rooting is no longer being processed (tracked: CIRISEdge#482 \
                  item 3)"
             );
         }
@@ -15782,7 +15984,7 @@ async fn handle_peer_bundle_frame(
             "bundle-unattributed-link",
             "a CBND bundle frame arrived on a link attributed to no peer key_id — there \
              is no announced commitment to bind it to; the peer's announce (or our dial \
-             record) must land first (CIRISEdge#436)",
+             record) must land first (history: CIRISEdge#436)",
         );
         return;
     };
@@ -15791,7 +15993,7 @@ async fn handle_peer_bundle_frame(
             Some(link_id),
             "bundle-no-rooting-directory",
             "a CBND bundle frame arrived but no rooting directory is wired — nothing can \
-             verify, nothing can root (fail-closed) (CIRISEdge#436)",
+             verify, nothing can root (fail-closed) (history: CIRISEdge#436)",
         );
         return;
     };
@@ -15850,7 +16052,7 @@ async fn handle_peer_bundle_frame(
                     suppressed_prev,
                     "link-borne build-attestation bundle REFUSED — no store slot taken \
                      beyond shape-registration, no live-map change, no durable write \
-                     (fail-closed; the peer stays exactly as admitted) (CIRISEdge#436)"
+                     (fail-closed; the peer stays exactly as admitted) (history: CIRISEdge#436)"
                 );
             }
         }
@@ -16119,7 +16321,7 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                 suppressed_prev,
                 "announce DROPPED — no rooting directory configured on this transport, so \
                  NO peer can ever root (the mesh cannot form). Wire a RootingDirectory on \
-                 the Edge builder (CIRISEdge#425)"
+                 the Edge builder (history: CIRISEdge#425)"
             );
         }
         return;
@@ -16315,7 +16517,7 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                     owns_key,
                     suppressed_prev,
                     "peer admitted ADVISORY — not conferred at this node. owns_key=true \
-                     means it is still ATTRIBUTABLE (CIRISEdge#659: attribution is not \
+                     means it is still ATTRIBUTABLE (history: CIRISEdge#659: attribution is not \
                      trust); whether it is SERVED is decided by a valid root in common \
                      (FSD §5.3). owns_key=false means its frames are dropped"
                 );
@@ -16411,7 +16613,7 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                         suppressed_prev,
                         "route supersession REFUSED — an advisory (self-signed, not \
                          directory-rooted) announce cannot override a rooted route \
-                         (CIRISEdge#337 verified-only supersession)"
+                         (history: CIRISEdge#337 verified-only supersession)"
                     );
                 }
                 None
@@ -16649,7 +16851,7 @@ async fn resolve_announce_cold_start(announce: AnnounceView, ctx: &AnnounceCtx) 
                                 suppressed_prev,
                                 "announce intake at CAPACITY — evicted the \
                                  least-recently-confirmed ADVISORY binding \
-                                 (CIRISEdge#530; Rooted bindings are pinned)"
+                                 (history: CIRISEdge#530; Rooted bindings are pinned)"
                             );
                         }
                     }
@@ -18056,7 +18258,7 @@ mod tests {
         }
         assert!(
             violations.is_empty(),
-            "CIRISEdge#425 — un-instrumented inbound exit(s); route through `drop_inbound(...)` \
+            "history: CIRISEdge#425 — un-instrumented inbound exit(s); route through `drop_inbound(...)` \
              or a `tracing::` log, or annotate `// choke-ok: <why it is not a silent drop>`:\n{}",
             violations.join("\n")
         );
@@ -18507,7 +18709,7 @@ mod tests {
             assert!(
                 crate::transport::SourceKeyId::from_attributed_binding(&key_id, rp.owns_key)
                     .is_some(),
-                "CIRISEdge#659: a Stage-1 binding that owns its key passes item 1 — it is \
+                "history: CIRISEdge#659: a Stage-1 binding that owns its key passes item 1 — it is \
                  ATTRIBUTABLE; item 2 (the hybrid transport binding) and the bridge's \
                  `rooted_with` (what it may be served) are separate questions"
             );
@@ -19409,7 +19611,7 @@ mod tests {
                 RouteSupersession::AdmitRouteKeepTrust,
                 "the owner's genuine Advisory announce MUST heal a boot-primed \
                  explicit-hash route to its named dest WITHOUT downgrading the \
-                 Rooted trust (#336 heal + #404 keep-trust)",
+                 Rooted trust (history: CIRISEdge#336 heal + history: CIRISEdge#404 keep-trust)",
             );
         }
 
@@ -20194,7 +20396,7 @@ mod tests {
                 .expect("durable row");
             assert_eq!(
                 stored.provenance, Rooted,
-                "gate ON: the just-verified bundle satisfies the #437 choke — \
+                "gate ON: the just-verified bundle satisfies the history: CIRISEdge#437 choke — \
                  the durable save stays Rooted, not downgraded"
             );
         }
@@ -21128,7 +21330,7 @@ mod scope_native_addressing_tests {
         assert!(
             Arc::ptr_eq(&ctx.dialed_link_dest, &t.dialed_link_dest),
             "link→destination attribution must be shared, or a detached dial's \
-             link arrives unattributable (#424)"
+             link arrives unattributable (history: CIRISEdge#424)"
         );
         assert!(
             Arc::ptr_eq(&ctx.link_in_flight, &t.link_in_flight),
@@ -21138,7 +21340,7 @@ mod scope_native_addressing_tests {
         assert!(
             Arc::ptr_eq(&ctx.link_plane, &t.link_plane),
             "the plane a detached dial TAGS its link with must be the map the \
-             selectors READ, or an identity link is never selectable (#728)"
+             selectors READ, or an identity link is never selectable (history: CIRISEdge#728)"
         );
         assert!(
             Arc::ptr_eq(&ctx.node, &t.node),
@@ -21165,7 +21367,7 @@ mod scope_native_addressing_tests {
         assert!(
             SchedulerConfig::DEFAULT_ROUND_TIMEOUT < LINK_ESTABLISH_TIMEOUT,
             "round_timeout {:?} vs establish {:?} — if this ever inverts, \
-             re-read CIRISEdge#568 before deleting the detach: the detach is \
+             re-read history: CIRISEdge#568 before deleting the detach: the detach is \
              not a workaround for the inequality, it is what stops an \
              abandoned round destroying a half-built link",
             SchedulerConfig::DEFAULT_ROUND_TIMEOUT,
@@ -21233,7 +21435,7 @@ mod scope_native_addressing_tests {
         assert_eq!(
             classify_link_plane(None, &DestinationHash::new(*mine.as_bytes())),
             LinkPlane::Identity,
-            "no table ⇒ no scoped links: the pre-#499 world"
+            "no table ⇒ no scoped links: the pre-tracked: CIRISEdge#499 world"
         );
     }
 
@@ -21682,12 +21884,12 @@ const MAX_CONCURRENT_DIALS_PER_DEST: usize = 4;
 // runtime test of a constant proves nothing about the build that ships.
 const _: () = assert!(
     MAX_CONCURRENT_DIALS_PER_DEST > 1,
-    "CIRISEdge#532: a per-destination dial cap of 1 serialises the peer's \
+    "history: CIRISEdge#532: a per-destination dial cap of 1 serialises the peer's \
      parallel resource lanes — that is the M=4 timeout regression, not a fix"
 );
 const _: () = assert!(
     MAX_CONCURRENT_DIALS_PER_DEST < 29,
-    "CIRISEdge#532: the cap must stay far below the 29 establishes/minute this \
+    "history: CIRISEdge#532: the cap must stay far below the 29 establishes/minute this \
      bounds, or it stops bounding anything"
 );
 
@@ -21718,7 +21920,7 @@ const _: () = assert!(
 // edge never submits a body that can reach that state.
 const _: () = assert!(
     MAX_BODY_BYTES <= leviculum_std::driver::DEFAULT_MAX_ASSEMBLED_RESOURCE_SIZE,
-    "CIRISEdge#537: edge admits a body larger than the transport will assemble — \
+    "history: CIRISEdge#537: edge admits a body larger than the transport will assemble — \
      bodies between the two limits degrade to per-segment delivery, whose final \
      slice routes as if whole and fails verification at the receiver"
 );
@@ -22094,5 +22296,69 @@ mod link_shaping_plane_tests {
         assert!(shaping_applies_to(LinkPlane::Identity));
         assert!(!shaping_applies_to(LinkPlane::Av));
         assert!(!shaping_applies_to(LinkPlane::Scoped));
+    }
+}
+
+#[cfg(test)]
+mod wire_link_id_tests {
+    use super::{
+        distinct_transport_keys, migrate_dialled_link_state, DestinationHash, DialCandidate,
+        DialSource, LinkId, LinkPlane,
+    };
+
+    /// CIRISEdge#863 item 7 — a peer with two transport identities (a rotation)
+    /// yields both keys, in candidate order, each once; a derived dial tries
+    /// them in that order.
+    #[test]
+    fn every_distinct_transport_key_is_tried_once_in_order_863() {
+        let c = |d: u8, k: u8| DialCandidate {
+            dest_hash: DestinationHash::new([d; 16]),
+            transport_ed25519: [k; 32],
+            source: DialSource::Cached,
+        };
+        assert_eq!(
+            distinct_transport_keys(&[c(1, 0xA), c(2, 0xA), c(3, 0xB), c(4, 0xA)]),
+            vec![[0xA; 32], [0xB; 32]]
+        );
+        assert!(distinct_transport_keys(&[]).is_empty());
+    }
+    use std::collections::HashMap;
+    use tokio::sync::Mutex;
+
+    /// CIRISEdge#867 — a dialled link re-keyed by an establishment retry moves
+    /// its seal state, its dialled-destination record and its plane onto the
+    /// wire id, and the connect id is forgotten; an unchanged id moves nothing.
+    #[tokio::test]
+    async fn a_retried_dial_moves_its_state_to_the_wire_id_867() {
+        let seals = crate::transport::link_seal::LinkSeals::new(
+            crate::transport::transit_kex_custody::TransitKexSecret::from_root_seed(&[7; 64])
+                .expect("transit secret"),
+            "node-x",
+        );
+        let dests = Mutex::new(HashMap::new());
+        let planes = Mutex::new(HashMap::new());
+        let connect_id = LinkId::new([1u8; 16]);
+        let wire_id = LinkId::new([2u8; 16]);
+        let dest = DestinationHash::new([9u8; 16]);
+        seals.begin_initiator(connect_id.into_bytes());
+        dests.lock().await.insert(connect_id, dest);
+        planes.lock().await.insert(connect_id, LinkPlane::Identity);
+
+        migrate_dialled_link_state(&seals, &dests, &planes, connect_id, connect_id).await;
+        assert!(
+            seals.knows(connect_id.into_bytes()),
+            "an unchanged id moves nothing"
+        );
+
+        migrate_dialled_link_state(&seals, &dests, &planes, connect_id, wire_id).await;
+        assert!(!seals.knows(connect_id.into_bytes()));
+        assert!(seals.knows(wire_id.into_bytes()));
+        assert_eq!(dests.lock().await.get(&wire_id), Some(&dest));
+        assert!(!dests.lock().await.contains_key(&connect_id));
+        assert!(matches!(
+            planes.lock().await.get(&wire_id),
+            Some(LinkPlane::Identity)
+        ));
+        assert!(!planes.lock().await.contains_key(&connect_id));
     }
 }

@@ -771,7 +771,7 @@ fn warn_store_gate_unarmed() {
         tracing::warn!(
             "blob STORE gate UNARMED — no BlobStorePolicy is installed, so this \
              node accepts whatever it fetches without checking provenance, \
-             audience or operator consent (CIRISEdge#581). The three projection \
+             audience or operator consent (history: CIRISEdge#581). The three projection \
              rules are not enforced on this node. Arming is an OPERATOR OPT-IN: \
              install a policy via SwarmScheduler::with_store_policy. Warned once \
              per process."
@@ -890,7 +890,7 @@ pub(crate) async fn store_admission_with(
                  one default this stack must never adopt. Call \
                  `fetch_blob_scoped` with the BlobMeaning projected from that \
                  row (`BlobMeaning::project`) instead of `fetch_blob` \
-                 (CIRISEdge#581/#586)"
+                 (history: CIRISEdge#581, history: CIRISEdge#586)"
             );
             return Err(SwarmError::StoreRefused {
                 blob_sha: hex::encode(blob_sha256),
@@ -1337,7 +1337,7 @@ impl SwarmScheduler {
                                 strikes = state.error_strikes,
                                 %reason,
                                 "swarm: holder retired for this fetch after repeated \
-                                 dispatch errors (CIRISEdge#616)"
+                                 dispatch errors (history: CIRISEdge#616)"
                             );
                         }
                     }
@@ -1405,7 +1405,7 @@ impl SwarmScheduler {
             tracing::error!(
                 holder = %peer,
                 "swarm dispatch reached an UNROUTED holder — refusing to fall back to \
-                 the federation address (CIRISEdge#499)",
+                 the federation address (tracked: CIRISEdge#499)",
             );
             return;
         };

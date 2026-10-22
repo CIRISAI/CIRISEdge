@@ -979,7 +979,7 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
                 error = %e,
                 provenance = ?provenance,
                 epoch,
-                "CIRISEdge#299/#301: write-through of transport binding failed (peer still \
+                "history: CIRISEdge#299, history: CIRISEdge#301: write-through of transport binding failed (peer still \
                  admitted in-memory this session, but will not survive a restart)"
             ),
         }
@@ -1015,7 +1015,7 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             ),
             Err(ciris_persist::federation::Error::Conflict { .. }) => tracing::warn!(
                 key_id,
-                "CIRISEdge#362: announced-peer bookmark REJECTED — a different pubkey is \
+                "history: CIRISEdge#362: announced-peer bookmark REJECTED — a different pubkey is \
                  already recorded for this key_id (identity conflict, not a refresh)"
             ),
             Err(e) => tracing::debug!(

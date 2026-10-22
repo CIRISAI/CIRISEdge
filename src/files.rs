@@ -987,7 +987,7 @@ fn warn_unresolved(room: &ScopeRoom, attestation_id: &str, unresolved: &[String]
             unresolved = ?unresolved,
             "family file written with members no device of whom it reaches — their owner \
              binding is not held here; the row reaches them when a device of theirs is bound \
-             (FSD/CONTENT_TRANSFER.md §6.4.1, CIRISEdge#736)"
+             (FSD/CONTENT_TRANSFER.md §6.4.1, history: CIRISEdge#736)"
         );
     }
 }
@@ -1372,7 +1372,7 @@ impl FileRow {
                 tracing::warn!(
                     attestation_id = %row.attestation_id,
                     refusal = %refused,
-                    "file row refused by the reader (CIRISEdge#698)"
+                    "file row refused by the reader (history: CIRISEdge#698)"
                 );
                 None
             }

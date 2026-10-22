@@ -834,7 +834,7 @@ pub async fn on_file_pulled<B>(
                 stream_id = %stream_id,
                 file = %row.attestation_id,
                 reason = ?not,
-                "file pulled and NOT receipted (CIRISEdge#738)"
+                "file pulled and NOT receipted (history: CIRISEdge#738)"
             );
         }
     }
@@ -1119,7 +1119,7 @@ pub async fn admit_and_count(
                 attestation_id = %row.attestation_id,
                 attester = %row.attesting_key_id,
                 %refusal,
-                "delivery receipt refused (CIRISEdge#738)"
+                "delivery receipt refused (history: CIRISEdge#738)"
             );
             refusal.tag()
         }

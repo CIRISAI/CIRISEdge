@@ -731,7 +731,7 @@ impl AvSpine {
                 group = %self.group_id,
                 "AV spine seal: the table refused this group's seal, so the relay's \
                  answerable window is deliberately left OPEN too — both planes stay at \
-                 the superseded epoch rather than disagreeing (CIRISEdge#499)"
+                 the superseded epoch rather than disagreeing (tracked: CIRISEdge#499)"
             );
             return SpineSeal {
                 sealed: false,
@@ -857,7 +857,7 @@ impl AvSpine {
                 stream = ?self.publisher.stream_id(),
                 peer = %subscriber,
                 "AV spine SUBSCRIBE refused: not in the call's MLS roster — it holds no \
-                 epoch DEK, so every forwarded chunk would be unopenable (CIRISEdge#425)"
+                 epoch DEK, so every forwarded chunk would be unopenable (history: CIRISEdge#425)"
             );
             return Err(AvSpineError::NotAMember(subscriber.clone()));
         }
@@ -971,7 +971,7 @@ impl AvSpine {
                         channel_limit = refusal.channel_limit,
                         suppressed_prev,
                         "AV spine publish: chunk REFUSED — larger than the link Channel \
-                         carries (CIRISEdge#720); cut chunks to fit"
+                         carries (tracked: CIRISEdge#720); cut chunks to fit"
                     );
                 }
                 LegOutcome::Oversized { refusal }
@@ -995,7 +995,7 @@ impl AvSpine {
                     chunk_seq = chunk_seq.0,
                     error = %e,
                     "AV spine publish: the publisher's own links FAILED — the relay leg's \
-                     result stands (CIRISEdge#425)"
+                     result stands (history: CIRISEdge#425)"
                 );
                 LegOutcome::Failed {
                     reached: 0,
@@ -1056,7 +1056,7 @@ impl AvSpine {
                     chunk_seq = inner.chunk_seq().0,
                     error = %e,
                     "AV spine relay: fan-out FAILED — no downstream subscriber received this \
-                     chunk (CIRISEdge#425)"
+                     chunk (history: CIRISEdge#425)"
                 );
                 (
                     Vec::new(),
@@ -1145,7 +1145,7 @@ impl AvSpine {
                     stream = ?stream_id,
                     peer = %drop.subscriber,
                     ?reason,
-                    "AV spine HEAL: subscriber PRUNED from the relay roster (CIRISEdge#425)"
+                    "AV spine HEAL: subscriber PRUNED from the relay roster (history: CIRISEdge#425)"
                 );
                 Ok(HealOutcome::RosterPruned {
                     subscriber: drop.subscriber,
@@ -1159,7 +1159,7 @@ impl AvSpine {
                         stream = ?stream_id,
                         peer = %drop.subscriber,
                         "AV spine HEAL: departure of a peer already out of the MLS roster — \
-                         relay roster pruned, no epoch move (CIRISEdge#425)"
+                         relay roster pruned, no epoch move (history: CIRISEdge#425)"
                     );
                     return Ok(HealOutcome::RosterPruned {
                         subscriber: drop.subscriber,
@@ -1225,7 +1225,7 @@ impl AvSpine {
                         "AV spine: the MLS epoch advanced and its scoped addresses did NOT. \
                          The relay's answerable window is deliberately left where it is, so \
                          both planes still agree; live links keep running and the call \
-                         refuses to grow until this is resolved (CIRISEdge#499/#425)"
+                         refuses to grow until this is resolved (tracked: CIRISEdge#499, history: CIRISEdge#425)"
                     );
                     self.stranded = Some(stranded.clone());
                     return Err(AvSpineError::AddressStranded(stranded));

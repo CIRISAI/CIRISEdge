@@ -45,26 +45,54 @@ universal 1.4 KB envelope rule.
 
 ## Also in this release
 
-- **#881 — an unclaimed node rounds with the bundle's serve nodes by itself.** The replication
-  runtime adds the baked bundle's seated serve nodes as initiator peers on the bootstrap planes
-  (Key, IdentityOccurrence, TransportDestination and their two revocation planes), merged into
-  every peer set the host gives it (`start`, `set_peers`), independent of consent. Those planes
-  already have everyone-reach for announced nodes (#682) and admit unattributed receipt (#402),
-  so nothing new is exposed; a fresh device now receives its owner's announced route row from a
-  canonical with no host-side Pull. Off under a test trust root; `disable_bundle_bootstrap_peers`
-  turns it off. The host's explicit subject Pull stays correct and may remain.
+- **#881 — an unclaimed node rounds with the bundle's serve nodes by itself (opt-in).** With
+  `bundle_bootstrap_peers=True` on `init_edge_runtime` (Rust: `ReplicationRuntimeConfig::
+  enable_bundle_bootstrap_peers`) the replication runtime adds the baked bundle's seated serve
+  nodes as initiator peers on the bootstrap planes (Key, IdentityOccurrence, TransportDestination
+  and their two revocation planes), merged into every peer set the host gives it (`start`,
+  `set_peers`), independent of consent. Those planes already have everyone-reach for announced
+  nodes (#682) and admit unattributed receipt (#402), so nothing new is exposed; a fresh device
+  then receives its owner's announced route row from a canonical with no host-side Pull. Off by
+  default and off under a test trust root, so a runtime outside the production mesh never rounds
+  against a canonical it cannot reach. The host's explicit subject Pull stays correct and may remain.
 - **#882 (CC rc9 I3) — the #659 floor's exemption is narrowed.** Before Rooted, a self-authored
   row crosses to an Attributed peer only if it is one of this node's allegiance facts
-  (owner-binding, acceptance, self-charter) or its data subject is that peer itself (its
-  consent grant, a row addressed to it); a self-authored consent grant, score or content row
-  about a third party stays behind the floor (`recipient_not_rooted`) until Rooted. Pair rooms
-  are unchanged on the rows they send to the peer; the Server's chat ladder on this tag decides
-  whether the subject carve tightens further.
+  (owner-binding, acceptance, self-charter), or its data subject is that peer itself (its
+  consent grant, a row addressed to it), or it is cohort-delivered (persist resolved its audience
+  to the content's own nodes and the peer is one: a self/family holding claim reaches the owner's
+  other device, CC 6.1.5.3); a self-authored consent grant, score or content row about a third
+  party at federation scope stays behind the floor (`recipient_not_rooted`) until Rooted. Pair
+  rooms are unchanged on the rows they send to the peer; the Server's chat ladder on this tag
+  decides whether the subject carve tightens further.
 - **CC vendoring stays at rc8.1 (`157039d`).** Edge's namespace matcher is persist's
   (CIRISPersist#924), and persist v59.1.0 vendors rc8.1; re-vendoring rc9 here alone diverges on
   the two rc9 families (`identity:occurrence_revocation`, `transport:canonical_rebind`). The
   move to rc9 rides persist's rc9 adoption.
 - UniFFI hosts: the shaping knobs are not yet on the UniFFI builder (Python only); follows.
+
+## Field fixes
+
+- **#867 — a dialled link binds the seal to its wire id.** After an establishment retry leviculum
+  re-keys the dialler's link under a fresh id while `connect` returned the original; under E1 the
+  handshake bound the stale id and the responder the wire id, so the link was refused at its first
+  sealed frame. Edge now moves its per-link state onto the wire id once a dial establishes, on the
+  identity, scoped and A/V dial paths (`link_rekeyed_to_wire_id`). Needs leviculum
+  `v0.31.1+ciris.1` (`ReticulumNode::wire_link_id`, CIRISAI/leviculum#86).
+- **#879 — the dialler binds the responder's on-link announce.** A responder never identifies to
+  its dialler, so the dialler dropped every on-link announce as `announce_frame_link_unidentified`.
+  It now binds the announce when its transport key names the destination it dialled (the link proof
+  already authenticated that). Both directions are counted (`peer_binding.announce_frame_bound`) and
+  witnessed on the sealed exchange.
+- **#875 — operator log lines say whether a cited issue is history or open work.** Every issue
+  citation in a WARN, ERROR or `drop_inbound` string now reads `history: CIRISEdge#N` (closed) or
+  `tracked: CIRISEdge#N` (open), 283 in all, enforced by `tests/log_citations.rs` over
+  `tools/log_citations.py`. The no-route dial lines are WARN, once per peer per ten minutes with the
+  suppressed count.
+- **#863 items 4 and 7 (A/V spine).** A link dialled to a scoped address that establishes just after
+  its epoch is sealed keeps its plane (the scope table remembers retracted addresses for
+  classification only; a sealed epoch still receives nothing). A derived dial (scoped or A/V) tries
+  each of the peer's distinct transport keys when a link proof is refused, so a peer that rotated
+  its transport identity stays reachable.
 
 ## The pre-seal route fetch (CC 5.3.3.5 E1; CLM-pre-seal-route-fetch)
 

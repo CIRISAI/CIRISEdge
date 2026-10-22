@@ -127,7 +127,7 @@ impl PullSink {
                     dropped_total = n,
                     "pull queue FULL — an admitted row that references a blob was not \
                      queued for fetch. The row is held; the bytes will not be pulled \
-                     until it is offered again (CIRISEdge#601)"
+                     until it is offered again (history: CIRISEdge#601)"
                 );
                 PullOffer::Dropped
             }
@@ -135,7 +135,7 @@ impl PullSink {
                 tracing::error!(
                     attestation_id = %req.row.attestation_id,
                     "pull queue CLOSED — the BlobPuller has exited; blob pulls are dark \
-                     on this node (CIRISEdge#601)"
+                     on this node (history: CIRISEdge#601)"
                 );
                 PullOffer::Dropped
             }
@@ -424,7 +424,7 @@ fn epoch_refusal(
         attestation_id = %row.attestation_id,
         "pull refused: a community_dek pointer with no sealed-under epoch — the \
          row predates the epoch-bearing pointer, and a guessed epoch is a blob \
-         that reads NotGranted forever (CIRISEdge#601)"
+         that reads NotGranted forever (history: CIRISEdge#601)"
     );
     Some(PullOutcome::NoEpoch)
 }
@@ -1762,7 +1762,7 @@ where
                 retries.remove(&oldest);
                 tracing::warn!(
                     dropped = %hex::encode(oldest),
-                    "pull retry ledger FULL — dropped the oldest pending retry (CIRISEdge#601)"
+                    "pull retry ledger FULL — dropped the oldest pending retry (history: CIRISEdge#601)"
                 );
             }
         }
@@ -2266,7 +2266,7 @@ where
                     stall = ?stall,
                     remedy = %stall.remedy(),
                     "self/family pull REFUSED at the holder rung: the row's author does not \
-                     resolve to any node and no amount of waiting changes that (CIRISEdge#646)"
+                     resolve to any node and no amount of waiting changes that (history: CIRISEdge#646)"
                 );
                 return Err(PullOutcome::NoOtherNode {
                     attempts,
@@ -2509,7 +2509,7 @@ where
                 blob = %hex::encode(sha),
                 attestation_id = %row.attestation_id,
                 error = %e,
-                "custody `here` NOT filed for a pulled file (CIRISEdge#763)"
+                "custody `here` NOT filed for a pulled file (history: CIRISEdge#763)"
             ),
         }
     }
@@ -2838,7 +2838,7 @@ where
             blob = %blob_hex,
             attestation_id = %row.attestation_id,
             refusal = ?refusal,
-            "DAG pull refused (CIRISEdge#717, FSD/CONTENT_TRANSFER.md §6.7)"
+            "DAG pull refused (history: CIRISEdge#717, FSD/CONTENT_TRANSFER.md §6.7)"
         );
         PullOutcome::DagRefused(refusal)
     }
@@ -3455,7 +3455,7 @@ where
                                 error = %e,
                                 "DAG pull: persist refused a stream-keyed room chunk's \
                                  provenance for naming a community epoch — an EDGE BUG \
-                                 (CIRISPersist#977)"
+                                 (history: CIRISPersist#977)"
                             );
                             if stop.is_none() {
                                 stop = Some(self.dag_refused(
@@ -3619,7 +3619,7 @@ where
                         stream_id = %view.stream_id,
                         error = %e,
                         "DAG pull: a stream-keyed room chunk is bound to a community epoch — \
-                         evicting and re-adopting every bound chunk, once (CIRISPersist#977)"
+                         evicting and re-adopting every bound chunk, once (history: CIRISPersist#977)"
                     );
                     if let Err(outcome) = self
                         .remediate_community_bound_chunks(
@@ -3643,7 +3643,7 @@ where
                         remediated,
                         error = %e,
                         "DAG pull: the promote still finds a stream-keyed room chunk under a \
-                         community epoch — an EDGE BUG (CIRISPersist#977)"
+                         community epoch — an EDGE BUG (history: CIRISPersist#977)"
                     );
                     return self.dag_refused(
                         row,

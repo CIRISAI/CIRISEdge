@@ -5234,7 +5234,7 @@ impl Edge {
                     enforcement = %CohortScopeEnforcement::WarnOnly.as_str(),
                     cohort_scope = ?scope,
                     federation_variant,
-                    "cohort_scope locality refusal bypassed (WarnOnly mode); CIRISEdge#48-A",
+                    "cohort_scope locality refusal bypassed (WarnOnly mode); history: CIRISEdge#48-A",
                 );
                 Ok(())
             }
@@ -5303,7 +5303,7 @@ impl Edge {
                     enforcement = %CohortScopeEnforcement::WarnOnly.as_str(),
                     cohort_scope = ?scope,
                     recipient_key_id,
-                    "cohort_scope recipient refusal bypassed (WarnOnly mode); CIRISEdge#48-A",
+                    "cohort_scope recipient refusal bypassed (WarnOnly mode); history: CIRISEdge#48-A",
                 );
                 Ok(())
             }
@@ -5571,7 +5571,7 @@ async fn route_replication_frame(
                     suppressed_prev,
                     "inbound CRPL replication frame with source_key_id=None and not a \
                      self-authenticating bootstrap kind — transport could not attribute \
-                     the sending link to a peer; dropping (CIRISEdge#317/#402)"
+                     the sending link to a peer; dropping (history: CIRISEdge#317, history: CIRISEdge#402)"
                 );
             }
             return true;
@@ -5622,7 +5622,7 @@ fn note_reply_dropped(
             detail = ?reason,
             suppressed_prev,
             "CRPL reply DROPPED — answers no round this node is driving; counted in \
-             EdgeMetrics.replication_reply_dropped_total (CIRISEdge#634)"
+             EdgeMetrics.replication_reply_dropped_total (history: CIRISEdge#634)"
         );
     }
 }
@@ -5688,7 +5688,7 @@ async fn note_backpressure_drop(
             "replication inbound frame DROPPED — {role:?} inbox full while its driver \
              was `{driver_phase}` for {driver_phase_for_ms} ms; counted in \
              EdgeMetrics.replication_inbound_backpressure_drops[_by_role] \
-             (CIRISEdge#373 / #634 / #662)"
+             (history: CIRISEdge#373 / history: CIRISEdge#634 / history: CIRISEdge#662)"
         );
     }
 }
@@ -5754,7 +5754,7 @@ async fn route_attributed_frame(
                 peer = %source,
                 ?kind,
                 "CRPL frame DROPPED — no coordinator and no responder factory for (peer, kind); \
-                 the ReplicationRuntime is not wired (CIRISEdge#348)"
+                 the ReplicationRuntime is not wired (history: CIRISEdge#348)"
             );
             true
         }
@@ -5766,7 +5766,7 @@ async fn route_attributed_frame(
             tracing::warn!(
                 peer = %source,
                 error = %e,
-                "replication route_inbound_bytes failed; dropping frame (CIRISEdge#348)"
+                "replication route_inbound_bytes failed; dropping frame (history: CIRISEdge#348)"
             );
             true
         }
@@ -6012,7 +6012,7 @@ async fn dispatch_inbound(
                 outcome = first_contact_outcome.label().unwrap_or("-"),
                 suppressed_prev,
                 "first-contact opaque request refused before verify; dropped, no answer \
-                 (CIRISEdge#683, FIRST_CONTACT.md §2.2)"
+                 (history: CIRISEdge#683, FIRST_CONTACT.md §2.2)"
             );
         }
         return;
@@ -6105,7 +6105,7 @@ async fn dispatch_inbound(
                     first_bytes_hex = %first_bytes_hex(&frame.envelope_bytes),
                     suppressed_prev,
                     error = %e,
-                    "verify rejected (CIRISEdge#317)",
+                    "verify rejected (history: CIRISEdge#317)",
                 );
             }
             return;
@@ -6225,7 +6225,7 @@ async fn dispatch_inbound(
                             sender_key_id = %envelope.signing_key_id,
                             claimed_scope = ?claimed,
                             directory_scope = ?recorded_scope,
-                            "consumer-side cohort_scope violation bypassed (WarnOnly mode); CIRISEdge#48-A",
+                            "consumer-side cohort_scope violation bypassed (WarnOnly mode); history: CIRISEdge#48-A",
                         );
                     }
                     CohortScopeEnforcement::Strict => {
@@ -6235,7 +6235,7 @@ async fn dispatch_inbound(
                             sender_key_id = %envelope.signing_key_id,
                             claimed_scope = ?claimed,
                             directory_scope = ?recorded_scope,
-                            "consumer-side cohort_scope violation REJECTED (CIRISEdge#48-A)",
+                            "consumer-side cohort_scope violation REJECTED (history: CIRISEdge#48-A)",
                         );
                         // CIRISEdge#48-A — moderation-signal event on
                         // the EventBus so lens-core can downweight the
@@ -6302,7 +6302,7 @@ async fn dispatch_inbound(
                     sender_key_id = %envelope.signing_key_id,
                     score = observed,
                     threshold = trust_threshold,
-                    "inbound envelope dropped — sender trust below threshold (CIRISEdge#48-B)",
+                    "inbound envelope dropped — sender trust below threshold (history: CIRISEdge#48-B)",
                 );
                 metrics.inc_inbound_dropped_low_trust();
                 // Moderation signal — `TrustShortCircuited` event with
@@ -6588,7 +6588,7 @@ async fn dispatch_inbound(
                                     .map_or("federation", |a| a.group().scope().kind_token()),
                                 suppressed_prev,
                                 "BlobChunkFetch WITHHELD on scope admission — {reason} \
-                                 (CIRISEdge#499)",
+                                 (tracked: CIRISEdge#499)",
                             );
                         }
                         Some(reason)
@@ -6765,7 +6765,7 @@ async fn dispatch_inbound(
                                         suppressed_prev,
                                         "BlobChunkFetch WITHHELD — the chunk is not one of the \
                                          named DAG's chunks in this store; the scope gate \
-                                         judged the named file, not this chunk (CIRISEdge#717)",
+                                         judged the named file, not this chunk (history: CIRISEdge#717)",
                                     );
                                 }
                             }
@@ -6904,7 +6904,7 @@ async fn dispatch_inbound(
                     error = ?err,
                     "BlobChunkFetch responder: a validly-delivered but MALFORMED \
                      BlobChunkFetch body was dropped with no reply — the requester will \
-                     time out (CIRISEdge#425)"
+                     time out (history: CIRISEdge#425)"
                 );
             }
         } else {
@@ -6917,7 +6917,7 @@ async fn dispatch_inbound(
                 transport = ?transport,
                 signing_key_id = %envelope.signing_key_id,
                 "BlobChunkFetch received but no BlobChunkSource wired; dropping unanswered — \
-                 wire EdgeBuilder::blob_chunk_source (CIRISEdge#55/#640)",
+                 wire EdgeBuilder::blob_chunk_source (history: CIRISEdge#55, history: CIRISEdge#640)",
             );
         }
     }
@@ -6951,7 +6951,7 @@ async fn dispatch_inbound(
                         tracing::warn!(
                             announcement_id = ?derive_announcement_id_from_body_hash(&body_sha256),
                             ?reason,
-                            "AccordCarrier FederationAnnouncement REFUSED at wire-layer multi-sig gate (CIRISEdge#19)",
+                            "AccordCarrier FederationAnnouncement REFUSED at wire-layer multi-sig gate (history: CIRISEdge#19)",
                         );
                         // CIRISEdge#34 v0.19.0 — refusal IS a path-lost
                         // signal: edge-substrate declined to propagate
@@ -6977,7 +6977,7 @@ async fn dispatch_inbound(
                         {
                             tracing::warn!(
                                 error = %e,
-                                "DeliveryRefusalAttestation emission failed (CIRISEdge#19)",
+                                "DeliveryRefusalAttestation emission failed (history: CIRISEdge#19)",
                             );
                         }
                         // Drop the announcement from edge's downstream
@@ -7083,7 +7083,7 @@ async fn dispatch_inbound(
                     holder_key_id = %envelope.signing_key_id,
                     reason = ?miss.reason,
                     error = %e,
-                    "Withdraws emission failed (CIRISEdge#42, CEG §10.1.2)",
+                    "Withdraws emission failed (history: CIRISEdge#42, CEG §10.1.2)",
                 );
             }
         }
@@ -7207,7 +7207,7 @@ async fn dispatch_inbound(
                             message_type = ?envelope.message_type,
                             required_scope = required_scope,
                             ?sub_reason,
-                            "envelope REFUSED at delegation authority gate (CIRISEdge#108 part 2)",
+                            "envelope REFUSED at delegation authority gate (history: CIRISEdge#108 part 2)",
                         );
                         let refusal_reason = RefusalReason::DelegationNotAuthorized {
                             required_scope: required_scope.to_owned(),
@@ -7225,7 +7225,7 @@ async fn dispatch_inbound(
                         {
                             tracing::warn!(
                                 error = %e,
-                                "DeliveryRefusalAttestation emission failed (CIRISEdge#108 part 2)",
+                                "DeliveryRefusalAttestation emission failed (history: CIRISEdge#108 part 2)",
                             );
                         }
                         return;
@@ -7239,7 +7239,7 @@ async fn dispatch_inbound(
                 // otherwise refuse every envelope.)
                 tracing::warn!(
                     event = "edge.delegation_gate.bypassed_no_directory",
-                    "delegation_authority_gate_enabled but no federation_directory wired; bypassing gate (CIRISEdge#108 part 2)",
+                    "delegation_authority_gate_enabled but no federation_directory wired; bypassing gate (history: CIRISEdge#108 part 2)",
                 );
             }
         }
@@ -7319,7 +7319,7 @@ async fn dispatch_inbound(
                     error = %e,
                     transport = ?transport,
                     sender_key_id = %envelope.signing_key_id,
-                    "FountainHoldingClaim body parse failed at dispatch (CIRISEdge#184)",
+                    "FountainHoldingClaim body parse failed at dispatch (history: CIRISEdge#184)",
                 );
             }
         }
@@ -7540,11 +7540,11 @@ async fn dispatch_inbound(
                                     key_id = %signer.key_id,
                                     "first-contact answer: no key:record:v1 row for this node's \
                                      own key; the requester may not be able to verify it \
-                                     (CIRISEdge#683, persist v59.0.0)"
+                                     (history: CIRISEdge#683, persist v59.0.0)"
                                 ),
                                 Err(e) => tracing::warn!(
                                     error = %e,
-                                    "first-contact answer: own key lookup failed (CIRISEdge#683)"
+                                    "first-contact answer: own key lookup failed (history: CIRISEdge#683)"
                                 ),
                             }
                         }

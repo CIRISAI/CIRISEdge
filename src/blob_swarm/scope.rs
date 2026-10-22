@@ -84,11 +84,11 @@ fn warn_blob_scope_gate_unarmed() {
     if !BLOB_SCOPE_GATE_UNARMED_WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             "blob serve scope gate UNARMED — scope-native addressing is not \
-             installed, so this node rides the pre-#499 staged state: every \
+             installed, so this node rides the pre-tracked: CIRISEdge#499 staged state: every \
              arrival is treated as the federation address and every blob request \
              is admitted without a scope check. This is the deliberate default; \
              arming is an OPERATOR OPT-IN — install the MLS ScopeAddressTable via \
-             EdgeBuilder::scope_native_addressing (the CIRISVerify#259 \
+             EdgeBuilder::scope_native_addressing (the history: CIRISVerify#259 \
              ScopePrivacyDeriver is shipped). Warned once per process."
         );
     }

@@ -994,6 +994,9 @@ pub const LINK_SEAL_PAIR_ROOTED: &str = "link_seal_pair_rooted";
 /// CC 3.3.6.2 (rc9) source (a) — a dial keyed on a pair from the dialled
 /// node's own hybrid-signed route row (the node is not Rooted here).
 pub const LINK_SEAL_PAIR_SELF_SIGNED_ROW: &str = "link_seal_pair_self_signed_row";
+/// CIRISEdge#867 — a dialled link established through an establishment retry
+/// under a fresh wire id; edge moved its state and the seal onto that id.
+pub const LINK_REKEYED_TO_WIRE_ID: &str = "link_rekeyed_to_wire_id";
 /// CC 3.2 (f) — a first contact keyed on the pairing payload's pinned pair.
 pub const LINK_SEAL_PAIR_PIN: &str = "link_seal_pair_pin";
 /// CC 5.3.3.5 E1 (`CLM-pre-seal-route-fetch`) — a dial keyed on a pair
@@ -1034,6 +1037,18 @@ pub const LINK_SEAL_REFUSED_ROUTE_TIMEOUT: &str = "link_seal_refused_route_timeo
 pub const LINK_SEAL_REFUSED_ROUTE_CLOSED: &str = "link_seal_refused_route_closed";
 /// Refused: a request or answer frame could not be sent.
 pub const LINK_SEAL_REFUSED_ROUTE_SEND: &str = "link_seal_refused_route_send";
+
+// ─── CIRISEdge#627/#879 — on-link announce (`CANN`) receipt ──────────────
+/// `transport_inbound_drops` tag: a `CANN` frame on a link with no proven
+/// remote identity (a peer-dialled link before its LINKIDENTIFY, or a dialled
+/// link whose announce names another destination).
+pub const DROP_ANNOUNCE_FRAME_LINK_UNIDENTIFIED: &str = "announce_frame_link_unidentified";
+/// `transport_inbound_drops` tag: a `CANN` frame whose transport key is not
+/// the link's proven remote identity.
+pub const DROP_ANNOUNCE_FRAME_IDENTITY_MISMATCH: &str = "announce_frame_identity_mismatch";
+/// `peer_binding` label: a `CANN` frame bound to its link and received as an
+/// announce (both directions: the responder's on the dialler, #879).
+pub const ANNOUNCE_FRAME_BOUND: &str = "announce_frame_bound";
 
 // ─── CC 5.4.3 — `EdgeMetrics::link_shaping` labels (CLM-link-shaping) ──────
 /// A shaping offer went out on a link (this node's class is not `off`).

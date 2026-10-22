@@ -311,7 +311,7 @@ impl RevocationRegister {
                 cap = self.pending_cap,
                 "revocation register: pending-withdraws cap reached — this withdrawal is \
                  DROPPED and will not be replayed when its target lands (retention direction, \
-                 CIRISEdge#606)"
+                 history: CIRISEdge#606)"
             );
             return;
         }
@@ -403,7 +403,7 @@ pub async fn apply_observation(
                         row = %row_id,
                         cap = register.cap,
                         "revocation register: cap reached — this blob is NOT indexed and will \
-                         read Unknown (served, never evicted here) (CIRISEdge#606)"
+                         read Unknown (served, never evicted here) (history: CIRISEdge#606)"
                     );
                 }
             }
@@ -525,7 +525,7 @@ async fn authorized_rule(
                 target = target_id,
                 issuer = %row.attesting_key_id,
                 "revocation register: withdraws authority is UNRESOLVED against the local \
-                 target — INERT, no bytes touched (CIRISEdge#606 / CIRISPersist#853)"
+                 target — INERT, no bytes touched (history: CIRISEdge#606 / history: CIRISPersist#853)"
             );
             None
         }
@@ -537,7 +537,7 @@ async fn authorized_rule(
                 error = %e,
                 "revocation register: withdraws REFUSED on recompute — INERT, no bytes touched. \
                  A replicated withdrawal that persist stored with rule=None is not an \
-                 authority; this node just declined to treat it as one (CIRISEdge#606)"
+                 authority; this node just declined to treat it as one (history: CIRISEdge#606)"
             );
             None
         }

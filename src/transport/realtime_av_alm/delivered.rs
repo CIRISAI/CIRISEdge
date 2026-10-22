@@ -511,7 +511,7 @@ pub async fn emit_delivered_observation(
             tracing::warn!(
                 relay = %observation.key.advertiser_key_id,
                 error = %e,
-                "capacity-delivery emission: consent unresolvable — withholding (fail-closed, #439)"
+                "capacity-delivery emission: consent unresolvable — withholding (fail-closed, history: CIRISEdge#439)"
             );
             return Ok(DeliveryEmitOutcome::Withheld {
                 reason: DeliveryWithholdReason::ConsentUnresolvable {
