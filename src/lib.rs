@@ -68,6 +68,8 @@ pub mod first_contact;
 pub mod group_content;
 /// CIRISEdge#554 — the receiver-side budget on unsolicited contact requests.
 pub mod invite_gate;
+/// CC 5.4.6 — the Anonymous Tier's packet codec (FSD/ONION_ROUTING.md).
+pub mod onion;
 pub mod rate_limit;
 #[cfg(test)]
 mod role_matrix_gauntlet;
