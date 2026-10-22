@@ -1034,6 +1034,34 @@ pub const LINK_SEAL_REFUSED_ROUTE_TIMEOUT: &str = "link_seal_refused_route_timeo
 pub const LINK_SEAL_REFUSED_ROUTE_CLOSED: &str = "link_seal_refused_route_closed";
 /// Refused: a request or answer frame could not be sent.
 pub const LINK_SEAL_REFUSED_ROUTE_SEND: &str = "link_seal_refused_route_send";
+
+// ─── CC 5.4.3 — `EdgeMetrics::link_shaping` labels (CLM-link-shaping) ──────
+/// A shaping offer went out on a link (this node's class is not `off`).
+pub const LINK_SHAPING_OFFERED: &str = "link_shaping_offered";
+/// Both offers were non-off: the link is shaped from here, both ways.
+pub const LINK_SHAPING_AGREED: &str = "link_shaping_agreed";
+/// One side offered `off` (or the peer never answered): the link runs
+/// unshaped, by both sides' agreement.
+pub const LINK_SHAPING_UNSHAPED: &str = "link_shaping_unshaped";
+/// Refused: the peer offers no shaping and this node requires shaped links;
+/// the link closed.
+pub const LINK_SHAPING_REFUSED_UNSHAPED_PEER: &str = "link_shaping_refused_unshaped_peer";
+/// Refused: a malformed offer or shaped frame; the link closed.
+pub const LINK_SHAPING_REFUSED_MALFORMED: &str = "link_shaping_refused_malformed";
+/// Dropped and the link closed: a bare frame on a shaped link, a shaped
+/// frame on an unshaped one, or a Resource on a shaped link.
+pub const LINK_SHAPING_DROPPED_WRONG_KIND: &str = "link_shaping_dropped_wrong_kind";
+/// A real frame emitted on a shaped link.
+pub const LINK_SHAPING_FRAMES_REAL: &str = "link_shaping_frames_real";
+/// A cover frame emitted on a shaped link.
+pub const LINK_SHAPING_FRAMES_COVER: &str = "link_shaping_frames_cover";
+/// A cover frame received on a shaped link (dropped, as designed).
+pub const LINK_SHAPING_COVER_RECEIVED: &str = "link_shaping_cover_received";
+/// A send deferred because the shaped link's queue was full (the caller
+/// retries; nothing dropped).
+pub const LINK_SHAPING_QUEUE_DEFERRED: &str = "link_shaping_queue_deferred";
+/// A shaped frame could not be sent; the link closed.
+pub const LINK_SHAPING_SEND_FAILED: &str = "link_shaping_send_failed";
 /// A row the Attestation advertise's projection filter skipped (a `SelfOwn`
 /// row whose attester is not in this node's self-publish set, ...). Not a
 /// withhold: the row was not this node's to publish when it was read.
@@ -1431,6 +1459,9 @@ pub struct EdgeMetrics {
     /// constants in this module): links keyed (`link_seal_initiated` /
     /// `link_seal_accepted`), each named refusal, and each dropped frame.
     pub link_seal: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CC 5.4.3 — link shaping, by label (`LINK_SHAPING_*` constants in
+    /// this module): offers, agreements, refusals, real and cover frames.
+    pub link_shaping: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// The Attestation advertise's own ledger, by label (`ADVERTISE_*`
     /// constants in this module): rows the projection filter skipped, rows
     /// re-offered after being skipped, watermark rewinds on an advertise
@@ -2095,6 +2126,21 @@ impl EdgeMetrics {
     /// label.
     pub fn inc_link_seal(&self, label: &'static str) {
         *self.link_seal.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// Count one link-shaping event by its `LINK_SHAPING_*` label.
+    pub fn inc_link_shaping(&self, label: &'static str) {
+        *self.link_shaping.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// The link-shaping ledger by label (tests + the operator readback).
+    #[must_use]
+    pub fn link_shaping(&self) -> HashMap<String, u64> {
+        self.link_shaping
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
     }
 
     /// Count one advertise event by its `ADVERTISE_*` label.
@@ -2874,6 +2920,7 @@ impl EdgeMetrics {
             transport_inbound_drops: self.transport_inbound_drops(),
             av_plane: self.av_plane(),
             link_seal: self.link_seal(),
+            link_shaping: self.link_shaping(),
             direct_link: self.direct_link(),
             peer_binding: self.peer_binding(),
             direct_links_active: self.direct_links_active(),
@@ -3151,6 +3198,8 @@ pub struct EdgeMetricsBundle {
     pub av_plane: HashMap<String, u64>,
     /// CC 5.3.3.5 E1 — the per-link transit seal by `LINK_SEAL_*` label.
     pub link_seal: HashMap<String, u64>,
+    /// CC 5.4.3 — link shaping by `LINK_SHAPING_*` label.
+    pub link_shaping: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — direct links by `DIRECT_LINK_*` label.
     pub direct_link: HashMap<String, u64>,
     /// The peer bindings dials check link proofs against, by
@@ -3465,6 +3514,8 @@ impl EdgeMetricsBundle {
         f.family("av_plane", &self.av_plane);
         // CC 5.3.3.5 E1 — the per-link seal ledger, `link_seal.<label>`.
         f.family("link_seal", &self.link_seal);
+        // CC 5.4.3 — link shaping, `link_shaping.<label>`.
+        f.family("link_shaping", &self.link_shaping);
         // CIRISEdge#805 item 8 — direct links, `direct_link.<label>`, and the
         // gauge of peers with a direct path now.
         f.family("direct_link", &self.direct_link);
@@ -3681,6 +3732,7 @@ edge_metrics_bundle_fields!(
     first_contact_outcomes,
     av_plane,
     link_seal,
+    link_shaping,
     direct_link,
     peer_binding,
     direct_links_active,

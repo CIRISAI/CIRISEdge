@@ -6,6 +6,66 @@
 pre-seal route fetch (5.3.3.5 E1, CIRISConstitution#172, `CLM-pre-seal-route-fetch`) and link
 shaping (5.4.3, `CLM-link-shaping`).
 
+## Link shaping (CC 5.4.3 rc10; CLM-link-shaping) — off by default
+
+Reciprocal per-link traffic shaping, negotiated right after the transit KEX. A shaped link
+carries constant-size frames (the link's channel payload MDU) at Poisson times in BOTH
+directions, whatever either end has to say: real frames when the per-link budget admits one
+and the queue holds one, cover frames otherwise. A wire observer sees the same stream idle or
+busy; link existence and setup stay visible (the CC says so). It replaces the never-built
+universal 1.4 KB envelope rule.
+
+- **Negotiation.** With a non-`off` class the dialler sends a `SHAP` offer as the link's first
+  SEALED frame (class, its frame size, the frames/s it can afford on this link under its
+  node-wide cap, ρ, W) and waits for the peer's offer (10 s). The responder answers with its own
+  offer, bare, then both resolve the two offers by one pure function: the lower byte rate at the
+  smaller frame, the smaller ρ, the longer W. Either side `off` ⇒ the link runs unshaped, by
+  agreement (`link_shaping_unshaped`); a node with `require_shaped_links` closes it by name
+  instead (`link_shaping_refused_unshaped_peer`). There is never a half-shaped link: a bare
+  frame on a shaped link, a shaped frame on an unshaped one, or a Resource on a shaped link is
+  refused and the link closed (`link_shaping_dropped_wrong_kind`). A 43.1 peer never sees an
+  offer unless this node's class is on; its silence leaves the link unshaped.
+- **Budget classes** (per-link bytes/s, steward knobs): `server` 7000, `home` 2800,
+  `phone-wifi` 1400, `phone-cellular` 350, `off`. The node-wide cap (default eight links' worth)
+  bounds the sum of agreed rates; below one frame per 10 s an offer is `off`, never a trickle.
+- **Data path.** Only identity-plane links; A/V and scoped links never enter the shaper. On a
+  shaped link every outbound frame is cut to shaped-frame bodies and queued on the link's
+  shaper (bounded, 4096 bodies; a full queue defers the send, nothing is dropped); the Resource
+  lane is not used. Each frame is `SHPF` ‖ kind ‖ length ‖ body ‖ random pad, sealed. The
+  receiver drops cover (`link_shaping_cover_received`) and routes a real body as the frame it
+  carries.
+- **Knobs.** `init_edge_runtime(shaping_class=..., shaping_rho=0.5, shaping_window_seconds=600,
+  shaping_node_cap_bytes_per_s=..., require_shaped_links=False)`; Rust
+  `ReticulumTransportConfig::with_shaping`. UniFFI hosts get the knobs in a follow-up.
+- **Metrics.** New `link_shaping` family: `offered`, `agreed`, `unshaped`, `frames_real`,
+  `frames_cover`, `cover_received`, `queue_deferred`, `send_failed`, and the refusals above.
+- The ρ / W defaults per class (ρ 0.5; W 600 s, 3600 s for `phone-cellular`) come from the
+  measured grid in `docs/SHAPING_RHO_W_2026-10-22.md` (288 cells on edge's production Poisson
+  scheduler and budget meter, real T2 row sizes).
+
+## Also in this release
+
+- **#881 — an unclaimed node rounds with the bundle's serve nodes by itself.** The replication
+  runtime adds the baked bundle's seated serve nodes as initiator peers on the bootstrap planes
+  (Key, IdentityOccurrence, TransportDestination and their two revocation planes), merged into
+  every peer set the host gives it (`start`, `set_peers`), independent of consent. Those planes
+  already have everyone-reach for announced nodes (#682) and admit unattributed receipt (#402),
+  so nothing new is exposed; a fresh device now receives its owner's announced route row from a
+  canonical with no host-side Pull. Off under a test trust root; `disable_bundle_bootstrap_peers`
+  turns it off. The host's explicit subject Pull stays correct and may remain.
+- **#882 (CC rc9 I3) — the #659 floor's exemption is narrowed.** Before Rooted, a self-authored
+  row crosses to an Attributed peer only if it is one of this node's allegiance facts
+  (owner-binding, acceptance, self-charter) or its data subject is that peer itself (its
+  consent grant, a row addressed to it); a self-authored consent grant, score or content row
+  about a third party stays behind the floor (`recipient_not_rooted`) until Rooted. Pair rooms
+  are unchanged on the rows they send to the peer; the Server's chat ladder on this tag decides
+  whether the subject carve tightens further.
+- **CC vendoring stays at rc8.1 (`157039d`).** Edge's namespace matcher is persist's
+  (CIRISPersist#924), and persist v59.1.0 vendors rc8.1; re-vendoring rc9 here alone diverges on
+  the two rc9 families (`identity:occurrence_revocation`, `transport:canonical_rebind`). The
+  move to rc9 rides persist's rc9 adoption.
+- UniFFI hosts: the shaping knobs are not yet on the UniFFI builder (Python only); follows.
+
 ## The pre-seal route fetch (CC 5.3.3.5 E1; CLM-pre-seal-route-fetch)
 
 v43.1.1 let two peers seal with no canonical when each HOLDS the other's own hybrid-signed route

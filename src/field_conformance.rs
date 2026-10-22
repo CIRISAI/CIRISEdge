@@ -369,6 +369,32 @@ pub const EDGE_CC_TEST_EVIDENCE: &[TestEvidence] = &[
         supporting: false,
     },
     TestEvidence {
+        cc: "5.4.3",
+        clm: "CLM-link-shaping",
+        property: "a shaped link carries constant MDU-sized frames at Poisson times in both directions, real or cover; the shaping is negotiated right after the transit KEX by the two offers' conservative resolution; either side off leaves the link unshaped and a node requiring shaped links refuses it by name; there is never a half-shaped link",
+        impl_anchor: "src/transport/link_shaping.rs#agree",
+        witness: &[
+            "tests/link_shaping_e1.rs#a_shaped_link_carries_one_frame_size_at_poisson_times_both_ways",
+            "tests/link_shaping_e1.rs#a_half_shaped_offer_leaves_the_link_unshaped_or_refused_by_policy",
+            "src/transport/link_shaping.rs#agreement_is_the_conservative_of_the_two_and_symmetric",
+            "src/transport/link_shaping.rs#a_half_shaped_link_is_unshaped_or_refused_by_policy",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
+        cc: "5.4.3",
+        clm: "CLM-link-shaping",
+        property: "on a shaped link every outbound frame leaves through the link's shaper at its Poisson fires under the budget (ρ over W), cover fills the rest; audio and video never enter the shaper; ρ and W move the real share and the delivery delay",
+        impl_anchor: "src/transport/link_shaping.rs#LinkShaper::next_emission",
+        witness: &[
+            "tests/link_shaping_e1.rs#rho_and_the_window_move_the_real_share_and_the_delay",
+            "src/transport/reticulum.rs#shaping_applies_only_to_identity_links",
+            "src/transport/link_shaping.rs#the_shaper_emits_real_under_budget_then_cover_and_stops",
+            "src/transport/link_shaping.rs#the_node_cap_bounds_the_sum_of_agreed_rates",
+        ],
+        supporting: false,
+    },
+    TestEvidence {
         cc: "5.3.3.5",
         clm: "CLM-pre-seal-route-fetch",
         property: "the receiver order (once per link, the node-wide rate) runs before a route request is read; a refused request keys nothing and a bare announce supplies no pair; a link whose first frame is neither a handshake nor a request is refused and closed",

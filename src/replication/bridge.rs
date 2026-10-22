@@ -7832,10 +7832,22 @@ impl FederationDirectoryReplicationBridge {
         // node's own self-authenticating facts, the Attestation-plane twins of the
         // bootstrap kinds, and cross to an Attributed peer. Everything this node
         // holds ABOUT OTHERS stays behind the floor.
+        // CIRISEdge#882 (CC rc9 I3) — the exemption is the node's ALLEGIANCE
+        // FACTS (owner-binding, acceptances, self-charter: the rows that
+        // establish Rooted), never "anything self-authored": a self-authored
+        // consent grant, score or content row ABOUT A THIRD PARTY stays behind
+        // the floor until Rooted. A self-authored row whose data subject is
+        // the peer itself (its consent grant, a row addressed to it) is not
+        // "about others" to that peer and crosses, as #756's carve reasons.
         let self_authored = self
             .self_provider
             .as_ref()
-            .is_some_and(|p| p().iter().any(|id| id == attester));
+            .is_some_and(|p| p().iter().any(|id| id == attester))
+            && (row
+                .get("attested_key_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(peer)
+                || self.attestation_is_allegiance_fact(row, memo).await);
         // CIRISEdge#756 — and the membership ceremony addressed to the peer's
         // own person (§2.4): the invitation names the peer's person as its data
         // subject and the answer replies to the peer's person's own proposal, so
@@ -23544,13 +23556,29 @@ pub(crate) mod tests {
         let publish = vec![local.to_string()];
         let bridge = bridge.with_self_provider(Some(Arc::new(move || publish.clone())));
         seed_advertised_attestation(&backend, local).await;
+        // CIRISEdge#882 (CC rc9 I3) — a self-authored row that is NOT an
+        // allegiance fact and is about a THIRD PARTY (`local`'s consent grant
+        // to `producer`) is content to the peer: it stays behind the floor.
+        seed_consent_membership_unrooted(&backend, local, producer).await;
         let served = bridge.list_attestations_for_peer(Some(peer)).await;
         assert_eq!(
             served.len(),
             2,
-            "exactly the self-authored rows cross to an Attributed peer — the row `local` \
-             just authored AND the consent row `local` authored about the peer; the third \
-             party's stays behind the floor: {served:?}"
+            "exactly the self-authored ALLEGIANCE rows and the rows about the peer itself \
+             cross to an Attributed peer — the self-charter `local` just authored AND the \
+             consent row `local` authored about the peer; `local`'s score of a third party \
+             and the third party's own row stay behind the floor (CIRISEdge#659, #882): \
+             {served:?}"
+        );
+        assert!(
+            metrics
+                .snapshot()
+                .withholds_by_reason
+                .get(&WithholdReason::RecipientNotRooted)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "the self-authored third-party grant is booked under the floor, not served (#882)"
         );
 
         // Both subjects accept one valid root: the third party's row now reaches the peer too.

@@ -795,6 +795,14 @@ pub struct ReplicationRuntimeConfig {
     /// cannot evaluate its own trust. The server supplies the same
     /// `node_key_id` it already threads into consent-peer resolution.
     pub local_key_id: Option<String>,
+    /// CIRISEdge#881 — do NOT add the baked bundle's seated serve nodes as
+    /// initiator peers on the bootstrap planes. Default `false`: an unclaimed
+    /// node (no consent-derived peers) still rounds with the canonicals the
+    /// bundle seeds, on the planes that already have everyone-reach for
+    /// announced nodes (#682) and admit unattributed receipt (#402), so it
+    /// receives its owner's announced route row with no host-side Pull.
+    /// Never applied under a test trust root (`test_trust_root_override_active`).
+    pub disable_bundle_bootstrap_peers: bool,
     /// CIRISEdge#541/#552 — the subject whose SERVING TIER is resolved.
     ///
     /// Distinct from `local_key_id` on purpose. `local_key_id` is the truster
@@ -868,6 +876,55 @@ pub struct ReplicationRuntimeConfig {
 /// shutdown handle. Construct via [`Self::start`]; hold the returned
 /// handle for the lifetime of the application; call
 /// [`Self::shutdown`] to stop the background scheduler.
+/// CIRISEdge#881 — the planes an unclaimed node rounds with the bundle's
+/// seated serve nodes on: the bootstrap kinds and their revocations. All have
+/// everyone-reach for announced nodes (#682) and admit unattributed receipt
+/// (#402); nothing new is exposed by rounding on them without consent.
+pub const BOOTSTRAP_ROUND_PLANES: [EnvelopeKind; 5] = [
+    EnvelopeKind::Key,
+    EnvelopeKind::IdentityOccurrence,
+    EnvelopeKind::TransportDestination,
+    EnvelopeKind::Revocation,
+    EnvelopeKind::IdentityOccurrenceRevocation,
+];
+
+/// CIRISEdge#881 — the initiator peers the bundle's seated serve nodes
+/// (`serve_nodes`, the baked canonical ids) add: each on every
+/// [`BOOTSTRAP_ROUND_PLANES`] plane, never this node itself.
+#[must_use]
+pub fn bundle_bootstrap_peers(serve_nodes: &[String], local: Option<&str>) -> Vec<ReplicationPeer> {
+    serve_nodes
+        .iter()
+        .filter(|id| Some(id.as_str()) != local)
+        .flat_map(|id| {
+            BOOTSTRAP_ROUND_PLANES
+                .iter()
+                .map(move |kind| ReplicationPeer {
+                    peer_key_id: id.clone(),
+                    kind: *kind,
+                })
+        })
+        .collect()
+}
+
+/// CIRISEdge#881 — `peers` plus every `extra` not already in it, order kept.
+#[must_use]
+pub fn merge_peers(
+    mut peers: Vec<ReplicationPeer>,
+    extra: &[ReplicationPeer],
+) -> Vec<ReplicationPeer> {
+    let mut seen: HashSet<(String, EnvelopeKind)> = peers
+        .iter()
+        .map(|p| (p.peer_key_id.clone(), p.kind))
+        .collect();
+    for p in extra {
+        if seen.insert((p.peer_key_id.clone(), p.kind)) {
+            peers.push(p.clone());
+        }
+    }
+    peers
+}
+
 pub struct ReplicationRuntime {
     transport: Arc<dyn Transport>,
     registry: Arc<ReplicationRegistry>,
@@ -901,6 +958,9 @@ pub struct ReplicationRuntime {
     /// live coordinator tasks. Drives [`Self::set_peers`]'s diff.
     /// Pre-v5.1 entries (passed to `start`) populate this on init.
     current_initiators: Arc<Mutex<HashSet<(String, EnvelopeKind)>>>,
+    /// CIRISEdge#881 — the bundle-seeded bootstrap peers merged into every
+    /// peer set this runtime is given (`start`, `set_peers`).
+    bundle_peers: Vec<ReplicationPeer>,
     /// CIRISEdge#927 — whether this node's Initiator rounds proactively deliver
     /// their publish set (set iff `start` got a `self_provider`). Applied to
     /// every Initiator coordinator this runtime builds, including hot-adds.
@@ -979,6 +1039,27 @@ impl ReplicationRuntime {
         // hot-add is uncommon; a follow-up patch can swap in a
         // shared Arc<RwLock<Vec<String>>> if dynamism becomes the
         // common path.
+        // CIRISEdge#881 — the bundle's seated serve nodes round with this node
+        // on the bootstrap planes whether or not consent names any peer.
+        let bundle_peers = if config.disable_bundle_bootstrap_peers
+            || crate::edge::test_trust_root_override_active()
+        {
+            Vec::new()
+        } else {
+            bundle_bootstrap_peers(
+                &crate::edge::baked_canonical_genesis_ids(),
+                config.local_key_id.as_deref(),
+            )
+        };
+        let peers = merge_peers(peers, &bundle_peers);
+        if !bundle_peers.is_empty() {
+            tracing::info!(
+                serve_nodes = bundle_peers.len() / BOOTSTRAP_ROUND_PLANES.len(),
+                planes = ?BOOTSTRAP_ROUND_PLANES,
+                "replication rounds with the bundle's seated serve nodes on the bootstrap \
+                 planes, consent or not (CIRISEdge#881)"
+            );
+        }
         let cohort_snapshot: Vec<String> = peers.iter().map(|p| p.peer_key_id.clone()).collect();
         let cohort: CohortProvider = Arc::new(move || cohort_snapshot.clone());
 
@@ -1162,6 +1243,7 @@ impl ReplicationRuntime {
             config,
             scheduler_handle,
             current_initiators: Arc::new(Mutex::new(initial_initiator_set)),
+            bundle_peers,
             proactive_publish,
             mesh_config,
         }
@@ -1539,6 +1621,8 @@ impl ReplicationRuntime {
         &self,
         desired: Vec<ReplicationPeer>,
     ) -> Result<(), ReplicationRuntimeError> {
+        // CIRISEdge#881 — the bundle's bootstrap peers ride every peer set.
+        let desired = merge_peers(desired, &self.bundle_peers);
         let desired_set: HashSet<(String, EnvelopeKind)> = desired
             .iter()
             .map(|p| (p.peer_key_id.clone(), p.kind))
@@ -1666,6 +1750,58 @@ impl ReplicationRuntime {
 
 #[cfg(test)]
 mod tests {
+    /// CIRISEdge#881 — the unit runtimes assert their exact peer sets, so the
+    /// baked bundle's canonicals are kept out of them.
+    fn unit_config() -> ReplicationRuntimeConfig {
+        ReplicationRuntimeConfig {
+            disable_bundle_bootstrap_peers: true,
+            ..ReplicationRuntimeConfig::default()
+        }
+    }
+
+    /// CIRISEdge#881 — the bundle's serve nodes join every peer set on the
+    /// bootstrap planes only, never this node itself, never twice.
+    #[test]
+    fn bundle_serve_nodes_round_on_the_bootstrap_planes_only() {
+        use super::{bundle_bootstrap_peers, merge_peers, ReplicationPeer, BOOTSTRAP_ROUND_PLANES};
+        let serve = vec![
+            "canon-a".to_string(),
+            "me".to_string(),
+            "canon-b".to_string(),
+        ];
+        let extra = bundle_bootstrap_peers(&serve, Some("me"));
+        assert_eq!(extra.len(), 2 * BOOTSTRAP_ROUND_PLANES.len());
+        assert!(extra.iter().all(|p| p.peer_key_id != "me"));
+        assert!(extra
+            .iter()
+            .all(|p| BOOTSTRAP_ROUND_PLANES.contains(&p.kind)));
+        assert!(
+            !extra
+                .iter()
+                .any(|p| p.kind == super::EnvelopeKind::Attestation),
+            "no content plane"
+        );
+        let host = vec![
+            ReplicationPeer {
+                peer_key_id: "canon-a".into(),
+                kind: super::EnvelopeKind::Key,
+            },
+            ReplicationPeer {
+                peer_key_id: "friend".into(),
+                kind: super::EnvelopeKind::Attestation,
+            },
+        ];
+        let merged = merge_peers(host.clone(), &extra);
+        assert_eq!(
+            merged.len(),
+            host.len() + extra.len() - 1,
+            "the duplicate (canon-a, Key) once"
+        );
+        assert_eq!(merged[0].peer_key_id, "canon-a", "host order kept");
+        assert_eq!(merged[1].peer_key_id, "friend");
+        assert!(bundle_bootstrap_peers(&[], None).is_empty());
+    }
+
     use super::*;
     use ciris_persist::store::MemoryBackend;
     use std::sync::Arc;
@@ -1779,14 +1915,8 @@ mod tests {
         // No Initiator peers — a PURE responder node (the canonical's shape: the
         // agent pulls from it). The ONLY way it serves a round is the #312
         // factory spinning up a Responder AND the #348 drive running it.
-        let mut rt = ReplicationRuntime::start(
-            directory,
-            transport,
-            Vec::new(),
-            ReplicationRuntimeConfig::default(),
-            None,
-        )
-        .await;
+        let mut rt =
+            ReplicationRuntime::start(directory, transport, Vec::new(), unit_config(), None).await;
 
         let round_open =
             super::super::wire_frame::wrap(&ReplicationMessage::Summary(SummaryMessage {
@@ -1834,14 +1964,8 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
-        let mut rt = ReplicationRuntime::start(
-            directory,
-            transport,
-            Vec::new(),
-            ReplicationRuntimeConfig::default(),
-            None,
-        )
-        .await;
+        let mut rt =
+            ReplicationRuntime::start(directory, transport, Vec::new(), unit_config(), None).await;
         assert!(rt.registry().is_empty().await);
         rt.shutdown().await;
     }
@@ -1857,14 +1981,8 @@ mod tests {
             peer_key_id: "agent-alice".to_string(),
             kind: EnvelopeKind::Key,
         }];
-        let mut rt = ReplicationRuntime::start(
-            directory,
-            transport,
-            peers,
-            ReplicationRuntimeConfig::default(),
-            None,
-        )
-        .await;
+        let mut rt =
+            ReplicationRuntime::start(directory, transport, peers, unit_config(), None).await;
         let registry = rt.registry();
         assert_eq!(registry.len().await, 1);
         let coord = registry
@@ -1882,14 +2000,8 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
-        let mut rt = ReplicationRuntime::start(
-            directory,
-            transport,
-            Vec::new(),
-            ReplicationRuntimeConfig::default(),
-            None,
-        )
-        .await;
+        let mut rt =
+            ReplicationRuntime::start(directory, transport, Vec::new(), unit_config(), None).await;
         rt.register_peer("agent-bob", EnvelopeKind::Attestation)
             .await
             .expect("register_peer succeeds on a live runtime");
@@ -1905,14 +2017,8 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
-        let mut rt = ReplicationRuntime::start(
-            directory,
-            transport,
-            Vec::new(),
-            ReplicationRuntimeConfig::default(),
-            None,
-        )
-        .await;
+        let mut rt =
+            ReplicationRuntime::start(directory, transport, Vec::new(), unit_config(), None).await;
         rt.register_initiator_peer("agent-carol", EnvelopeKind::Key)
             .await
             .expect("hot-add succeeds while runtime is live");
@@ -1939,14 +2045,8 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
-        let mut rt = ReplicationRuntime::start(
-            directory,
-            transport,
-            Vec::new(),
-            ReplicationRuntimeConfig::default(),
-            None,
-        )
-        .await;
+        let mut rt =
+            ReplicationRuntime::start(directory, transport, Vec::new(), unit_config(), None).await;
         rt.register_initiator_peer("agent-dave", EnvelopeKind::Attestation)
             .await
             .unwrap();
@@ -1981,14 +2081,8 @@ mod tests {
                 kind: EnvelopeKind::Key,
             },
         ];
-        let mut rt = ReplicationRuntime::start(
-            directory,
-            transport,
-            initial,
-            ReplicationRuntimeConfig::default(),
-            None,
-        )
-        .await;
+        let mut rt =
+            ReplicationRuntime::start(directory, transport, initial, unit_config(), None).await;
         assert_eq!(rt.registry().len().await, 2);
 
         let desired = vec![
@@ -2028,14 +2122,8 @@ mod tests {
         let backend = Arc::new(MemoryBackend::new());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
-        let mut rt = ReplicationRuntime::start(
-            directory,
-            transport,
-            Vec::new(),
-            ReplicationRuntimeConfig::default(),
-            None,
-        )
-        .await;
+        let mut rt =
+            ReplicationRuntime::start(directory, transport, Vec::new(), unit_config(), None).await;
         rt.shutdown().await;
         rt.shutdown().await; // no panic, no hang
     }
@@ -2128,6 +2216,7 @@ mod tests {
             });
             let metrics = EdgeMetrics::new();
             let config = ReplicationRuntimeConfig {
+                disable_bundle_bootstrap_peers: true,
                 scheduler: SchedulerConfig {
                     cadence: std::time::Duration::from_secs(3600),
                     round_timeout: std::time::Duration::from_secs(5),

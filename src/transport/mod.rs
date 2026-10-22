@@ -227,6 +227,12 @@ pub mod link_seal;
 #[cfg(feature = "_reticulum-module")]
 pub mod route_fetch;
 
+/// CC 5.4.3 — link shaping (`CLM-link-shaping`): constant MDU-sized frames at
+/// Poisson times on a shaped identity link, both ways, negotiated right after
+/// the transit KEX; budget classes, ρ and W as steward knobs; A/V excluded.
+#[cfg(feature = "_reticulum-module")]
+pub mod link_shaping;
+
 /// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
 /// live streams (`FSD/AV_CALL_API.md`).
 #[cfg(feature = "_reticulum-module")]

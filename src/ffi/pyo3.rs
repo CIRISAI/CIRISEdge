@@ -2910,6 +2910,11 @@ fn metrics_bundle_to_pydict<'py>(
         link_seal.set_item(label.as_str(), *n)?;
     }
     root.set_item("link_seal", link_seal)?;
+    let link_shaping = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.link_shaping {
+        link_shaping.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("link_shaping", link_shaping)?;
     // CIRISEdge#805 item 8 — direct links by label, and the peers with a
     // direct path now.
     let direct_link = pyo3::types::PyDict::new(py);
@@ -5954,6 +5959,11 @@ enum LocalInstanceRole {
     disk_budget_bytes = None,
     trust_recursion_depth = None,
     local_instance_name = None,
+    shaping_class = None,
+    shaping_rho = None,
+    shaping_window_seconds = None,
+    shaping_node_cap_bytes_per_s = None,
+    require_shaped_links = false,
     local_instance_role = "auto",
     agent_occurrence_key_id = None,
     transport_identity_keyring_dir = None,
@@ -6040,6 +6050,15 @@ pub fn init_edge_runtime(
     // When `local_instance_name` is `None`, neither parameter has
     // any effect — v2.2.x behavior is preserved exactly.
     local_instance_name: Option<&str>,
+    // CC 5.4.3 (CLM-link-shaping) — this node's link-shaping policy. `None`
+    // / `off` (the default) offers nothing. `shaping_class` is one of
+    // `server`, `home`, `phone-wifi`, `phone-cellular`, `off`; ρ and W default
+    // to the modelled values (0.5, 600 s); the node cap to eight links' worth.
+    shaping_class: Option<String>,
+    shaping_rho: Option<f64>,
+    shaping_window_seconds: Option<u64>,
+    shaping_node_cap_bytes_per_s: Option<u32>,
+    require_shaped_links: bool,
     local_instance_role: &str,
     // v3.1.0 (CIRISEdge#108 / CIRISPersist#183, CEG §5.6.8.8.1) —
     // self-at-login transport_destination registration. When
@@ -7158,6 +7177,33 @@ pub fn init_edge_runtime(
     }
     transport_config.announce_interval = Duration::from_secs(announce_interval_seconds);
     transport_config.local_epoch = local_epoch;
+    // CC 5.4.3 — link shaping policy.
+    if let Some(class) = shaping_class.as_deref() {
+        use crate::transport::link_shaping::{BudgetClass, ShapingPolicy};
+        let class = BudgetClass::parse(class).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "init_edge_runtime: shaping_class {class:?} is not one of server, home, \
+                 phone-wifi, phone-cellular, off"
+            ))
+        })?;
+        let mut policy = ShapingPolicy::for_class(class);
+        if let Some(rho) = shaping_rho {
+            if !(0.01..=1.0).contains(&rho) {
+                return Err(PyValueError::new_err(
+                    "init_edge_runtime: shaping_rho must be within (0, 1]",
+                ));
+            }
+            policy.rho = rho;
+        }
+        if let Some(w) = shaping_window_seconds {
+            policy.window = Duration::from_secs(w.max(1));
+        }
+        if let Some(cap) = shaping_node_cap_bytes_per_s {
+            policy.node_cap_bytes_per_s = cap;
+        }
+        policy.require_shaped_links = require_shaped_links;
+        transport_config = transport_config.with_shaping(policy);
+    }
     // CIRISEdge#168 (v5.0) — Transport-node mode (§24 NAT-traversal).
     transport_config.enable_transport = enable_transport;
     // CIRISEdge#492 — node-wide scoped-transit posture for the legacy interface
@@ -11813,6 +11859,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
@@ -11936,6 +11987,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
@@ -12098,6 +12154,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
@@ -12213,6 +12274,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
@@ -12486,6 +12552,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
@@ -12655,6 +12726,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes
                 None,       // trust_recursion_depth
                 None,       // local_instance_name
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id
                 None,       // transport_identity_keyring_dir
@@ -12726,6 +12802,7 @@ mod pyo3_tier2_tests {
     /// local signer" branch — `self.local_signer` ends up `None`,
     /// which is exactly what `local_signer_capsule_py` checks.
     #[test]
+    #[allow(clippy::too_many_lines)] // the init call lists every kwarg; one more knob set
     fn py_init_edge_runtime_local_signer_unavailable_falls_back_cleanly() {
         init_python();
         let _engine_guard = engine_lock();
@@ -12783,6 +12860,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)

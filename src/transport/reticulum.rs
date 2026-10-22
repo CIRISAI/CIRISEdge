@@ -440,6 +440,31 @@ fn link_channel_mdu(node: &ReticulumNode, link_id: &LinkId) -> usize {
     node.link_mdu(link_id).map_or(0, channel_payload_mdu)
 }
 
+/// CC 5.4.3 — which links are offered shaping: the identity plane only. An
+/// A/V link is a burst a GPA can see regardless (CC 5.3.3.2) and would pay
+/// seconds of jitter for nothing; a scoped link is one hop of scoped content
+/// (CC 5.4.6). Neither ever enters the shaper, on either end: the dialler
+/// offers nothing on them, and a responder only ever answers an offer.
+const fn shaping_applies_to(plane: LinkPlane) -> bool {
+    matches!(plane, LinkPlane::Identity)
+}
+
+/// CC 5.4.3 — the most plaintext one outbound frame on `link_id` carries:
+/// on a shaped link the shaped frame's body ([`link_shaping::body_capacity`]
+/// of the agreed frame), else the link's Channel MDU.
+///
+/// [`link_shaping::body_capacity`]: crate::transport::link_shaping::body_capacity
+fn send_mdu(
+    node: &ReticulumNode,
+    shapers: &crate::transport::link_shaping::LinkShapers,
+    link_id: &LinkId,
+) -> usize {
+    shapers.get(link_id.into_bytes()).map_or_else(
+        || link_channel_mdu(node, link_id),
+        |s| crate::transport::link_shaping::body_capacity(s.agreement().frame_bytes),
+    )
+}
+
 /// CIRISEdge#720 — the most plaintext ONE Channel message on `link_id`
 /// carries: the link's [`channel_payload_mdu`] (capped at the Channel
 /// envelope's `u16` length field, leviculum#39's own
@@ -574,10 +599,36 @@ impl FragmentSendOutcome {
 async fn send_fragments_on_channel(
     node: &ReticulumNode,
     seals: &crate::transport::link_seal::LinkSeals,
+    shapers: &crate::transport::link_shaping::LinkShapers,
     link_id: &LinkId,
     fragments: &[Vec<u8>],
 ) -> FragmentSendOutcome {
     let total = fragments.len();
+    // CC 5.4.3 — on a shaped link every fragment goes to the link's shaper
+    // and leaves at the next Poisson fires (the fragments were cut to the
+    // shaped body size by `send_mdu`). Queued is sent, for this outcome: the
+    // Channel still sequences and retransmits each frame.
+    if let Some(shaper) = shapers.get(link_id.into_bytes()) {
+        return match shaper.enqueue(fragments.to_vec()) {
+            Ok(()) => FragmentSendOutcome {
+                sent: total,
+                total,
+                stalled: None,
+            },
+            Err(crate::transport::link_shaping::ShapingError::QueueFull(_)) => {
+                FragmentSendOutcome {
+                    sent: 0,
+                    total,
+                    stalled: Some("shaping_queue_full"),
+                }
+            }
+            Err(_) => FragmentSendOutcome {
+                sent: 0,
+                total,
+                stalled: Some("shaping_body_too_large"),
+            },
+        };
+    }
     let started = tokio::time::Instant::now();
     let mut sent = 0usize;
     for frag in fragments {
@@ -1861,6 +1912,9 @@ pub struct ReticulumTransportConfig {
     /// default is inert: no facilitator (never proposes), none served, every
     /// peer's request refused. See [`crate::transport::direct_path`].
     pub direct_links: crate::transport::direct_path::DirectLinksConfig,
+    /// CC 5.4.3 — this node's link-shaping policy (`CLM-link-shaping`).
+    /// Default `off`: nothing is offered and no link is shaped.
+    pub shaping: crate::transport::link_shaping::ShapingPolicy,
 }
 
 impl ReticulumTransportConfig {
@@ -1887,7 +1941,15 @@ impl ReticulumTransportConfig {
             transit: None,
             ifac: None,
             direct_links: crate::transport::direct_path::DirectLinksConfig::default(),
+            shaping: crate::transport::link_shaping::ShapingPolicy::default(),
         }
+    }
+
+    /// CC 5.4.3 — set the link-shaping policy. Builder-style.
+    #[must_use]
+    pub fn with_shaping(mut self, shaping: crate::transport::link_shaping::ShapingPolicy) -> Self {
+        self.shaping = shaping;
+        self
     }
 
     /// CIRISEdge#805 item 8 — set this node's direct-link posture
@@ -2411,6 +2473,9 @@ pub struct ReticulumTransport {
     /// node's pair, and every link's keys. Every frame on every link is sealed
     /// and opened here.
     seals: Arc<crate::transport::link_seal::LinkSeals>,
+    /// CC 5.4.3 — the shaped links and this node's shaping policy
+    /// ([`crate::transport::link_shaping`]).
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
     /// CC 5.3.3.5 E1 test seam — what the next dial's handshake does instead
     /// of the real one (see [`HandshakeOverride`]). `None` in production.
     handshake_override: Arc<std::sync::Mutex<Option<HandshakeOverride>>>,
@@ -3085,6 +3150,7 @@ impl ReticulumTransport {
             test_publish_delay_ms: Arc::clone(&self.test_publish_delay_ms),
             fail_derived_identify: Arc::clone(&self.fail_derived_identify),
             seals: Arc::clone(&self.seals),
+            shapers: Arc::clone(&self.shapers),
             rooting: self.rooting.clone(),
             own_key_id: self.occurrence_key_id().to_owned(),
             handshake_override: Arc::clone(&self.handshake_override),
@@ -3185,6 +3251,22 @@ impl ReticulumTransport {
             transit_kex,
             config.local_key_id.clone(),
         ));
+        // CC 5.4.3 — the shaped-link table under this node's policy.
+        let shapers = Arc::new(crate::transport::link_shaping::LinkShapers::new(
+            config.shaping.clone(),
+        ));
+        if shapers.policy().enabled() {
+            tracing::info!(
+                class = shapers.policy().class.as_str(),
+                bytes_per_s = shapers.policy().bytes_per_s,
+                rho = shapers.policy().rho,
+                window_s = shapers.policy().window.as_secs(),
+                node_cap_bytes_per_s = shapers.policy().node_cap_bytes_per_s,
+                require_shaped_links = shapers.policy().require_shaped_links,
+                "link shaping ON: every identity link is offered shaping (CC 5.4.3, \
+                 CLM-link-shaping)"
+            );
+        }
 
         // v2.1.0 (CIRISPersist LocalIdentityAggregate RET-transport
         // role) — copy the 64-byte dual-key public material to a
@@ -3727,6 +3809,7 @@ impl ReticulumTransport {
             local_signer,
             self_route,
             seals,
+            shapers,
             handshake_override: Arc::new(std::sync::Mutex::new(None)),
             route_answer_override: Arc::new(std::sync::Mutex::new(None)),
             test_unannounced: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4146,6 +4229,7 @@ impl ReticulumTransport {
             av_sink: &self.av_sink,
             av_dialed_peer: &self.av_dialed_peer,
             seals: &self.seals,
+            shapers: &self.shapers,
         }
     }
 
@@ -5195,7 +5279,7 @@ impl ReticulumTransport {
             });
         }
         let link_id = lease.link_id;
-        let mdu = link_channel_mdu(&self.node, &link_id);
+        let mdu = send_mdu(&self.node, &self.shapers, &link_id);
         if let Some(fragments) = crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
             .filter(|f| f.len() <= CHANNEL_FIRST_MAX_FRAGMENTS)
         {
@@ -5517,7 +5601,7 @@ impl ReticulumTransport {
         // Nothing else has this link: it was never published. From here no
         // other send path can seal on it.
         self.seals.pin_first_contact_only(link_id.into_bytes());
-        let mdu = link_channel_mdu(&self.node, &link_id);
+        let mdu = send_mdu(&self.node, &self.shapers, &link_id);
         let fragments = crate::transport::frame_fragment::fragment(request, mdu)
             .ok_or_else(|| TransportError::Io("first contact: link MDU too small".to_owned()))?;
         for frag in &fragments {
@@ -7012,12 +7096,12 @@ impl ReticulumTransport {
             .test_unannounced
             .load(std::sync::atomic::Ordering::Relaxed);
         if let Some(frame) = self.own_announce_frame.as_deref().filter(|_| announced) {
-            push_own_announce_frame(&self.node, &self.seals, frame, &link_id).await;
+            push_own_announce_frame(&self.node, &self.seals, &self.shapers, frame, &link_id).await;
         }
         // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
         // LINKIDENTIFY so the responder can attribute the frame.
         if let Some(own) = self.own_bundle.as_ref().filter(|_| announced) {
-            push_own_bundle_frames(&self.node, &self.seals, own, &link_id).await;
+            push_own_bundle_frames(&self.node, &self.seals, &self.shapers, own, &link_id).await;
         }
         // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
         // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle.
@@ -7025,6 +7109,7 @@ impl ReticulumTransport {
             push_own_owner_binding(
                 &self.node,
                 &self.seals,
+                &self.shapers,
                 src.as_ref(),
                 &link_id,
                 self.metrics.get(),
@@ -7934,7 +8019,7 @@ impl ReticulumTransport {
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        send_fragments_on_channel(&self.node, &self.seals, &link_id, fragments).await
+        send_fragments_on_channel(&self.node, &self.seals, &self.shapers, &link_id, fragments).await
     }
 
     /// CIRISEdge#853 — wrap a claimed lane in a [`LinkClaim`], so the claim is
@@ -8243,7 +8328,7 @@ impl ReticulumTransport {
             // `CHANNEL_FIRST_MAX_FRAGMENTS`). A stall falls through to the
             // Resource path below exactly as before.
             if attempts == 1 {
-                let mdu = link_channel_mdu(&self.node, &link_id);
+                let mdu = send_mdu(&self.node, &self.shapers, &link_id);
                 let fragments = crate::transport::frame_fragment::fragment(envelope_bytes, mdu);
                 // CIRISEdge#722 — the over-cap decision SPEAKS. It used to be a
                 // bare `filter`, so a frame that went Resource-first left no
@@ -8358,7 +8443,7 @@ impl ReticulumTransport {
                     // `attribute_and_deliver`. A best-effort lost fragment just means
                     // the frame re-fragments next round — the same whole-frame retry
                     // unit anti-entropy already relies on.
-                    let mdu = link_channel_mdu(&self.node, &link_id);
+                    let mdu = send_mdu(&self.node, &self.shapers, &link_id);
                     if let Some(fragments) =
                         crate::transport::frame_fragment::fragment(envelope_bytes, mdu)
                     {
@@ -8508,6 +8593,29 @@ impl ReticulumTransport {
             .load(std::sync::atomic::Ordering::Relaxed);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        // CC 5.4.3 — a shaped link has no Resource lane: the envelope is cut
+        // to shaped-frame bodies and queued on the link's shaper, which emits
+        // them at Poisson times on the Channel.
+        if let Some(shaper) = self.shapers.get(link_id.into_bytes()) {
+            let body =
+                crate::transport::link_shaping::body_capacity(shaper.agreement().frame_bytes);
+            let fragments = crate::transport::frame_fragment::fragment(envelope_bytes, body)
+                .ok_or_else(|| {
+                    ShipError::Other(TransportError::Io(
+                        "shaped link: frame body too small to fragment".to_owned(),
+                    ))
+                })?;
+            return match shaper.enqueue(fragments) {
+                Ok(()) => Ok(()),
+                Err(crate::transport::link_shaping::ShapingError::QueueFull(_)) => {
+                    if let Some(m) = self.metrics.get() {
+                        m.inc_link_shaping(crate::observability::LINK_SHAPING_QUEUE_DEFERRED);
+                    }
+                    Err(ShipError::Busy)
+                }
+                Err(e) => Err(ShipError::Other(TransportError::Io(e.to_string()))),
+            };
         }
         // CC 5.3.3.5 E1 — the Resource carries the SEALED envelope; a link
         // with no keys ships nothing (and opens no Resource lane).
@@ -9091,6 +9199,7 @@ impl Transport for ReticulumTransport {
             av_dialed_peer: &self.av_dialed_peer,
             direct_paths: &self.direct_paths,
             seals: &self.seals,
+            shapers: &self.shapers,
         };
         loop {
             tokio::select! {
@@ -9628,6 +9737,8 @@ struct LinkBook<'a> {
     av_dialed_peer: &'a std::sync::Mutex<HashMap<LinkId, String>>,
     /// CC 5.3.3.5 E1 — the link's keys go with it.
     seals: &'a crate::transport::link_seal::LinkSeals,
+    /// CC 5.4.3 — its shaper, stopped with it.
+    shapers: &'a crate::transport::link_shaping::LinkShapers,
 }
 
 impl LinkBook<'_> {
@@ -9656,6 +9767,8 @@ impl LinkBook<'_> {
         self.link_to_peer_key_id.lock().await.remove(&link_id);
         // CC 5.3.3.5 E1 — its transit keys.
         self.seals.forget(&link_id.into_bytes());
+        // CC 5.4.3 — its shaper, if any.
+        self.shapers.forget(&link_id.into_bytes());
         // CIRISEdge#805 — an A/V link's consumer sees the close as the end of
         // its receiver, and its dial record goes with it. Here, not in the
         // `LinkClosed` arm, so every way a link leaves (the event, this node's
@@ -9905,6 +10018,9 @@ struct DialCtx {
     fail_derived_identify: Arc<std::sync::atomic::AtomicU32>,
     /// CC 5.3.3.5 E1 — see `ReticulumTransport::seals`.
     seals: Arc<crate::transport::link_seal::LinkSeals>,
+    /// CC 5.4.3 — the shaped links and this node's shaping policy
+    /// ([`crate::transport::link_shaping`]).
+    shapers: Arc<crate::transport::link_shaping::LinkShapers>,
     /// CC 5.3.3.5 E1 — where a dialled node's transit pair is resolved.
     rooting: Option<Arc<dyn RootingDirectory>>,
     /// CC 5.3.3.5 E1 — the occurrence key id this node's handshakes claim.
@@ -10373,14 +10489,14 @@ impl DialCtx {
             .load(std::sync::atomic::Ordering::Relaxed);
         // CIRISEdge#627 — announce FIRST (see `link_open`).
         if let Some(frame) = self.own_announce_frame.as_deref().filter(|_| announced) {
-            push_own_announce_frame(&self.node, &self.seals, frame, &link_id).await;
+            push_own_announce_frame(&self.node, &self.seals, &self.shapers, frame, &link_id).await;
         }
         // CIRISEdge#436 — initiator-side bundle serve, ordered AFTER the
         // LINKIDENTIFY (so the responder attributes it) and BEFORE the
         // resource ship (the fragments ride the link Channel, which never
         // contends with the resource lane — leviculum#27).
         if let Some(own) = self.own_bundle.as_ref().filter(|_| announced) {
-            push_own_bundle_frames(&self.node, &self.seals, own, &link_id).await;
+            push_own_bundle_frames(&self.node, &self.seals, &self.shapers, own, &link_id).await;
         }
         // CIRISEdge#727 — our own owner-binding, on a link WE dialed only
         // (`FSD/FIRST_CONTACT.md` §2.1.1 rule 2), after announce + bundle and
@@ -10389,6 +10505,7 @@ impl DialCtx {
             push_own_owner_binding(
                 &self.node,
                 &self.seals,
+                &self.shapers,
                 src.as_ref(),
                 &link_id,
                 self.metrics.as_ref(),
@@ -10634,7 +10751,108 @@ impl DialCtx {
         };
         self.key_link(link_id, destination_key_id, pair, claim)
             .await?;
+        // CC 5.4.3 — the shaping offer is the link's first sealed frame; the
+        // dial waits for the peer's offer before anything else rides the link.
+        self.offer_shaping(link_id, destination_key_id).await?;
         Ok(link_id)
+    }
+
+    /// CC 5.4.3 (CLM-link-shaping) — the dialler's half of the shaping
+    /// negotiation: with a non-`off` policy, send this node's offer as the
+    /// link's first sealed frame and wait for the peer's offer to resolve
+    /// against it ([`LinkShapers::peer_offer`], run by the event loop when
+    /// the answer lands). No answer within [`OFFER_ANSWER_BUDGET`] leaves the
+    /// link unshaped for good (or closes it under `require_shaped_links`).
+    /// With an `off` policy nothing is sent and the link runs unshaped; a
+    /// peer that requires shaping closes it on its side.
+    ///
+    /// [`LinkShapers::peer_offer`]: crate::transport::link_shaping::LinkShapers::peer_offer
+    /// [`OFFER_ANSWER_BUDGET`]: crate::transport::link_shaping::OFFER_ANSWER_BUDGET
+    async fn offer_shaping(&self, link_id: LinkId, peer: &str) -> Result<(), TransportError> {
+        use crate::transport::link_shaping::{ShapingError, OFFER_ANSWER_BUDGET};
+        if !self.shapers.policy().enabled() {
+            return Ok(());
+        }
+        if !self
+            .link_plane
+            .lock()
+            .await
+            .get(&link_id)
+            .is_some_and(|p| shaping_applies_to(*p))
+        {
+            return Ok(());
+        }
+        let link = link_id.into_bytes();
+        let answer = self.shapers.begin_offer(link);
+        let offer = self
+            .shapers
+            .offer_for(link, link_channel_mdu(&self.node, &link_id));
+        let out = send_fragments_on_channel(
+            &self.node,
+            &self.seals,
+            &self.shapers,
+            &link_id,
+            &[offer.encode()],
+        )
+        .await;
+        if !out.complete() {
+            self.close_refused(link_id).await;
+            return Err(TransportError::Io(format!(
+                "shaping offer not sent on the link: {}",
+                out.stalled.unwrap_or("-")
+            )));
+        }
+        if let Some(m) = self.metrics.as_ref() {
+            m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
+        }
+        let refuse = |e: ShapingError| {
+            if let Some(m) = self.metrics.as_ref() {
+                m.inc_link_shaping(e.label());
+            }
+            tracing::warn!(
+                peer = %peer,
+                link = %hex::encode(link),
+                reason = e.label(),
+                "link shaping refused on a dial; the link is closed (CC 5.4.3)"
+            );
+            TransportError::LinkSealRefused {
+                peer: peer.to_owned(),
+                reason: e.label(),
+                detail: e.to_string(),
+            }
+        };
+        match tokio::time::timeout(OFFER_ANSWER_BUDGET, answer).await {
+            Ok(Ok(Ok(shaped))) => {
+                tracing::debug!(peer = %peer, link = %hex::encode(link), shaped, "shaping offer answered");
+                Ok(())
+            }
+            Ok(Ok(Err(e))) => {
+                let err = refuse(e);
+                self.close_refused(link_id).await;
+                Err(err)
+            }
+            Ok(Err(_closed)) => Err(TransportError::Io(
+                "the link closed before the shaping offer was answered".to_owned(),
+            )),
+            Err(_elapsed) => {
+                self.shapers.offer_unanswered(link);
+                if self.shapers.policy().require_shaped_links {
+                    let err = refuse(ShapingError::UnshapedPeer);
+                    self.close_refused(link_id).await;
+                    return Err(err);
+                }
+                if let Some(m) = self.metrics.as_ref() {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_UNSHAPED);
+                }
+                tracing::info!(
+                    peer = %peer,
+                    link = %hex::encode(link),
+                    "shaping offer unanswered within the budget (a peer without shaping); \
+                     the link runs unshaped (CC 5.4.3)"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// CC 5.3.3.5 E1 pre-seal route fetch (CLM-pre-seal-route-fetch) — the
@@ -10938,6 +11156,8 @@ struct EventCtx<'a> {
     /// CC 5.3.3.5 E1 — see `ReticulumTransport::seals`. An `Arc` so a link's
     /// handshake budget can outlive the event that armed it.
     seals: &'a Arc<crate::transport::link_seal::LinkSeals>,
+    /// CC 5.4.3 — see `ReticulumTransport::shapers`.
+    shapers: &'a Arc<crate::transport::link_shaping::LinkShapers>,
 }
 
 impl EventCtx<'_> {
@@ -10960,6 +11180,7 @@ impl EventCtx<'_> {
             av_sink: self.av_sink,
             av_dialed_peer: self.av_dialed_peer,
             seals: self.seals,
+            shapers: self.shapers,
         }
     }
 }
@@ -12821,7 +13042,7 @@ async fn seal_inbound(
         ctx.seals.open(link, lane, data)
     };
     match outcome {
-        Inbound::Open(plain) => Some(plain),
+        Inbound::Open(plain) => shaped_inbound(ctx, link_id, lane, plain).await,
         Inbound::Pending | Inbound::Closed | Inbound::RouteAnswered => None,
         Inbound::Keyed { claimed } => {
             link_keyed(ctx, link_id, claimed).await;
@@ -12863,6 +13084,219 @@ async fn seal_inbound(
             None
         }
     }
+}
+
+/// CC 5.4.3 — the shaping layer under the seal, on the way in: a shaping
+/// offer is answered and resolved ([`handle_shaping_offer`]); on a shaped
+/// link a Channel frame is a shaped frame (cover dropped and counted, a real
+/// body routed as the frame it carries) and any other lane is refused; on an
+/// unshaped link a shaped frame is refused. Every refusal is named, counted
+/// under `link_shaping`, and closes the link: there is no half-shaped link.
+async fn shaped_inbound(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    lane: crate::transport::link_seal::Lane,
+    plain: Vec<u8>,
+) -> Option<Vec<u8>> {
+    use crate::transport::link_seal::Lane;
+    use crate::transport::link_shaping::{
+        is_offer, is_shaped_frame, unwrap, ShapedFrame, ShapingError,
+    };
+    let link = link_id.into_bytes();
+    if lane == Lane::Channel && is_offer(&plain) {
+        handle_shaping_offer(ctx, link_id, &plain).await;
+        return None;
+    }
+    match ctx.shapers.get(link) {
+        Some(_) if lane != Lane::Channel => {
+            shaping_teardown(
+                ctx,
+                link_id,
+                &ShapingError::WrongKind("a frame off the Channel on a shaped link"),
+            )
+            .await;
+            None
+        }
+        Some(_) => match unwrap(&plain) {
+            Ok(ShapedFrame::Cover) => {
+                if let Some(m) = ctx.metrics {
+                    m.inc_link_shaping(crate::observability::LINK_SHAPING_COVER_RECEIVED);
+                }
+                None
+            }
+            Ok(ShapedFrame::Real(body)) => Some(body),
+            Err(e) => {
+                shaping_teardown(ctx, link_id, &e).await;
+                None
+            }
+        },
+        None if lane == Lane::Channel && is_shaped_frame(&plain) => {
+            shaping_teardown(
+                ctx,
+                link_id,
+                &ShapingError::WrongKind("a shaped frame on an unshaped link"),
+            )
+            .await;
+            None
+        }
+        None => Some(plain),
+    }
+}
+
+/// CC 5.4.3 — a peer's shaping offer landed on `link_id`. A link this node
+/// has not offered on yet (the responder side) answers with its own offer
+/// first, bare; then both offers resolve to the one agreement
+/// ([`LinkShapers::peer_offer`]) and, when shaped, the link's emission task
+/// starts. A peer that offers `off` to a node requiring shaped links is
+/// refused by name.
+///
+/// [`LinkShapers::peer_offer`]: crate::transport::link_shaping::LinkShapers::peer_offer
+async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8]) {
+    use crate::transport::link_shaping::{BudgetClass, ShapingError, ShapingOffer};
+    let link = link_id.into_bytes();
+    let theirs = match ShapingOffer::decode(bytes) {
+        Ok(o) => o,
+        Err(e) => {
+            shaping_teardown(ctx, link_id, &e).await;
+            return;
+        }
+    };
+    if !ctx.shapers.has_offered(link) {
+        let ours = ctx
+            .shapers
+            .offer_for(link, link_channel_mdu(ctx.node, &link_id));
+        let out =
+            send_fragments_on_channel(ctx.node, ctx.seals, ctx.shapers, &link_id, &[ours.encode()])
+                .await;
+        if !out.complete() {
+            shaping_teardown(
+                ctx,
+                link_id,
+                &ShapingError::WrongKind("the answer was not sent"),
+            )
+            .await;
+            return;
+        }
+        if ours.class != BudgetClass::Off {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_OFFERED);
+            }
+        }
+    }
+    match ctx.shapers.peer_offer(link, &theirs) {
+        Ok(Some(shaper)) => {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_AGREED);
+            }
+            let a = *shaper.agreement();
+            tracing::info!(
+                link = %hex::encode(link),
+                lambda = a.lambda,
+                frame_bytes = a.frame_bytes,
+                rho = a.rho,
+                window_s = a.window.as_secs(),
+                bytes_per_s = a.bytes_per_s(),
+                peer_class = theirs.class.as_str(),
+                "link SHAPED both ways: constant-size frames at Poisson times from here \
+                 (CC 5.4.3, CLM-link-shaping)"
+            );
+            spawn_shaper_task(
+                Arc::clone(ctx.av_node),
+                Arc::clone(ctx.seals),
+                ctx.metrics.cloned(),
+                link_id,
+                shaper,
+            );
+        }
+        Ok(None) => {
+            if let Some(m) = ctx.metrics {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_UNSHAPED);
+            }
+            tracing::debug!(
+                link = %hex::encode(link),
+                peer_class = theirs.class.as_str(),
+                "shaping offers resolved to UNSHAPED (one side is off); the link runs bare \
+                 (CC 5.4.3)"
+            );
+        }
+        Err(e) => shaping_teardown(ctx, link_id, &e).await,
+    }
+}
+
+/// CC 5.4.3 — a shaping refusal: counted under `link_shaping` by name, said,
+/// and the link closed.
+async fn shaping_teardown(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    e: &crate::transport::link_shaping::ShapingError,
+) {
+    if let Some(m) = ctx.metrics {
+        m.inc_link_shaping(e.label());
+    }
+    tracing::warn!(
+        link = ?link_id,
+        reason = e.label(),
+        detail = %e,
+        "link shaping refused; the link is closed (CC 5.4.3, no half-shaped link)"
+    );
+    ctx.seals.refuse(link_id.into_bytes());
+    let _ = ctx.node.close_link(&link_id).await;
+}
+
+/// CC 5.4.3 — one shaped link's emission task: at every Poisson fire the
+/// shaper yields one frame (real or cover), sealed and sent on the Channel.
+/// A send that fails closes the link; the task ends when the shaper stops.
+fn spawn_shaper_task(
+    node: Arc<ReticulumNode>,
+    seals: Arc<crate::transport::link_seal::LinkSeals>,
+    metrics: Option<crate::observability::EdgeMetrics>,
+    link_id: LinkId,
+    shaper: Arc<crate::transport::link_shaping::LinkShaper>,
+) {
+    use crate::transport::link_seal::Lane;
+    use crate::transport::link_shaping::Emission;
+    tokio::spawn(async move {
+        let link = link_id.into_bytes();
+        loop {
+            let (bytes, real) = match shaper.next_emission().await {
+                Emission::Frame { bytes, real } => (bytes, real),
+                Emission::Stopped => break,
+            };
+            let Ok(sealed) = seals.seal(link, Lane::Channel, &bytes) else {
+                // The link lost its keys (refused or closed): the shaper ends
+                // with it.
+                shaper.stop();
+                break;
+            };
+            let sent = tokio::time::timeout(
+                CHANNEL_FRAGMENT_SEND_TIMEOUT,
+                node.link_handle(&link_id).send(&sealed),
+            )
+            .await;
+            if let Ok(Ok(())) = sent {
+                seals.tap_frame(link, &sealed);
+                if let Some(m) = metrics.as_ref() {
+                    m.inc_link_shaping(if real {
+                        crate::observability::LINK_SHAPING_FRAMES_REAL
+                    } else {
+                        crate::observability::LINK_SHAPING_FRAMES_COVER
+                    });
+                }
+                continue;
+            }
+            if let Some(m) = metrics.as_ref() {
+                m.inc_link_shaping(crate::observability::LINK_SHAPING_SEND_FAILED);
+            }
+            tracing::warn!(
+                link = %hex::encode(link),
+                "a shaped frame could not be sent; the link is closed (CC 5.4.3)"
+            );
+            shaper.stop();
+            seals.refuse(link);
+            let _ = node.close_link(&link_id).await;
+            break;
+        }
+    });
 }
 
 /// CC 5.3.3.5 E1 — the Resources that completed on `link_id` before its
@@ -12941,10 +13375,10 @@ async fn link_keyed(ctx: &EventCtx<'_>, link_id: LinkId, claimed: String) {
             // peer's link back to it, FIRST, then the bundle. Not on a scoped
             // link: those are identity-plane control frames (#728).
             if let Some(frame) = ctx.own_announce_frame {
-                push_own_announce_frame(ctx.node, ctx.seals, frame, &link_id).await;
+                push_own_announce_frame(ctx.node, ctx.seals, ctx.shapers, frame, &link_id).await;
             }
             if let Some(own) = ctx.own_bundle {
-                push_own_bundle_frames(ctx.node, ctx.seals, own, &link_id).await;
+                push_own_bundle_frames(ctx.node, ctx.seals, ctx.shapers, own, &link_id).await;
             }
         }
         LinkPlane::Av => deliver_av_frame(ctx, link_id, dest, None).await,
@@ -14694,10 +15128,11 @@ fn report_attribution_miss(
 async fn push_own_announce_frame(
     node: &ReticulumNode,
     seals: &crate::transport::link_seal::LinkSeals,
+    shapers: &crate::transport::link_shaping::LinkShapers,
     frame: &[u8],
     link_id: &LinkId,
 ) {
-    let mdu = link_channel_mdu(node, link_id);
+    let mdu = send_mdu(node, shapers, link_id);
     let Some(fragments) = crate::transport::frame_fragment::fragment(frame, mdu) else {
         if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
             own_bundle_push_log().check("announce-degenerate-mdu")
@@ -14713,7 +15148,7 @@ async fn push_own_announce_frame(
         }
         return;
     };
-    let outcome = send_fragments_on_channel(node, seals, link_id, &fragments).await;
+    let outcome = send_fragments_on_channel(node, seals, shapers, link_id, &fragments).await;
     let (sent, total) = (outcome.sent, outcome.total);
     if outcome.complete() {
         tracing::debug!(link = ?link_id, bytes = frame.len(), fragments = total,
@@ -14746,6 +15181,7 @@ async fn push_own_announce_frame(
 async fn push_own_owner_binding(
     node: &ReticulumNode,
     seals: &crate::transport::link_seal::LinkSeals,
+    shapers: &crate::transport::link_shaping::LinkShapers,
     source: &dyn crate::first_contact::OwnOwnerBindingSource,
     link_id: &LinkId,
     metrics: Option<&crate::observability::EdgeMetrics>,
@@ -14753,7 +15189,7 @@ async fn push_own_owner_binding(
     let Some(frame) = source.own_owner_binding_frame().await else {
         return; // unowned, ambiguous, or no live binding: nothing to say
     };
-    let mdu = link_channel_mdu(node, link_id);
+    let mdu = send_mdu(node, shapers, link_id);
     let Some(fragments) = crate::transport::frame_fragment::fragment(&frame, mdu) else {
         if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
             own_bundle_push_log().check("owner-binding-degenerate-mdu")
@@ -14768,7 +15204,7 @@ async fn push_own_owner_binding(
         }
         return;
     };
-    let outcome = send_fragments_on_channel(node, seals, link_id, &fragments).await;
+    let outcome = send_fragments_on_channel(node, seals, shapers, link_id, &fragments).await;
     if outcome.complete() {
         if let Some(m) = metrics {
             m.inc_first_contact(crate::first_contact::OWNER_BINDING_PUSHED);
@@ -14802,10 +15238,11 @@ async fn push_own_owner_binding(
 async fn push_own_bundle_frames(
     node: &ReticulumNode,
     seals: &crate::transport::link_seal::LinkSeals,
+    shapers: &crate::transport::link_shaping::LinkShapers,
     own: &OwnBuildBundle,
     link_id: &LinkId,
 ) {
-    let mdu = link_channel_mdu(node, link_id);
+    let mdu = send_mdu(node, shapers, link_id);
     let Some(fragments) = crate::transport::frame_fragment::fragment(&own.frame, mdu) else {
         if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
             own_bundle_push_log().check("degenerate-mdu")
@@ -14821,7 +15258,7 @@ async fn push_own_bundle_frames(
         }
         return;
     };
-    let outcome = send_fragments_on_channel(node, seals, link_id, &fragments).await;
+    let outcome = send_fragments_on_channel(node, seals, shapers, link_id, &fragments).await;
     let (sent, total) = (outcome.sent, outcome.total);
     if outcome.complete() {
         tracing::debug!(
@@ -21643,5 +22080,19 @@ mod transport_key_heal_tests {
             &f.transport,
             f.dest
         ));
+    }
+}
+
+#[cfg(test)]
+mod link_shaping_plane_tests {
+    use super::{shaping_applies_to, LinkPlane};
+
+    /// CLM-link-shaping — audio, video and scoped links never enter the
+    /// shaper: only the identity plane is offered shaping.
+    #[test]
+    fn shaping_applies_only_to_identity_links() {
+        assert!(shaping_applies_to(LinkPlane::Identity));
+        assert!(!shaping_applies_to(LinkPlane::Av));
+        assert!(!shaping_applies_to(LinkPlane::Scoped));
     }
 }
