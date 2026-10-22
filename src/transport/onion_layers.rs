@@ -42,6 +42,12 @@ pub struct RelayCandidate {
     pub key_id: String,
     /// The node holds a serve seat in the genesis bundle (a canonical).
     pub is_seat: bool,
+    /// CC 5.4.6 item 4 (steward, 2026-10-22) — the identity carries a
+    /// steward-conferred `infra:relay` standing (an accord-plane role on an
+    /// owner-bound, bundle-rooted identity): seat-like in the cap's
+    /// denominator, so the steward grows the layers by conferring. Not a
+    /// seat: it is dealt among the others and owes no seat conformance.
+    pub relay_standing: bool,
     /// Its current signed `transport_destination` row is live (not retired).
     pub row_live: bool,
     /// The node is announced (CC 5.3; an unannounced relay is unreachable).
@@ -53,6 +59,14 @@ pub struct RelayCandidate {
     pub opted_out: bool,
     /// The identity is owner-bound under a trust root in the bundle's charter set.
     pub owner_bound_under_bundle_root: bool,
+}
+
+impl RelayCandidate {
+    /// Seat-like for the cap: a serve seat or a conferred relay standing.
+    #[must_use]
+    pub const fn seat_like(&self) -> bool {
+        self.is_seat || self.relay_standing
+    }
 }
 
 /// The rendezvous period of a unix time.
@@ -152,9 +166,10 @@ impl LayerDeal {
 }
 
 /// CC 5.4.6 item 4 — **the deal**, once per period: the relays
-/// ([`is_relay`]) sorted by `H(key_id ‖ period)`, serve seats first and then
-/// the others, dealt round-robin across the three layers, seats first; in
-/// each layer the non-seat relays are capped at `⌈cap_factor × seats_in_layer⌉`
+/// ([`is_relay`]) sorted by `H(key_id ‖ period)`, the seat-like first (serve
+/// seats and conferred `infra:relay` standings, [`RelayCandidate::seat_like`])
+/// and then the others, dealt round-robin across the three layers, seat-like
+/// first; in each layer the others are capped at `⌈cap_factor × seat_like_in_layer⌉`
 /// (relays past the cap wait for the next period); a layer with fewer than
 /// [`LAYER_FLOOR`] members makes the deal unavailable. A pure function of its
 /// inputs: `candidates` may come in any order, with duplicates by key id
@@ -169,14 +184,20 @@ pub fn deal_layers(candidates: &[RelayCandidate], period: u64, cap_factor: u32) 
         .collect();
     // Seats first, then by the hash; the key id breaks a (practically
     // impossible) hash tie so the order is total.
-    relays.sort_by_cached_key(|c| (!c.is_seat, deal_hash(&c.key_id, period), c.key_id.clone()));
+    relays.sort_by_cached_key(|c| {
+        (
+            !c.seat_like(),
+            deal_hash(&c.key_id, period),
+            c.key_id.clone(),
+        )
+    });
     let mut layers: [Vec<String>; LAYERS] = Default::default();
     let mut seats_in: [usize; LAYERS] = [0; LAYERS];
     let mut non_seats_in: [usize; LAYERS] = [0; LAYERS];
     let mut capped = Vec::new();
     let mut next = 0usize;
     for c in &relays {
-        if c.is_seat {
+        if c.seat_like() {
             layers[next].push(c.key_id.clone());
             seats_in[next] += 1;
             next = (next + 1) % LAYERS;
@@ -185,7 +206,7 @@ pub fn deal_layers(candidates: &[RelayCandidate], period: u64, cap_factor: u32) 
     // Non-seats continue the round-robin from where the seats left off, so a
     // layer with fewer seats is not systematically favoured or starved.
     for c in &relays {
-        if c.is_seat {
+        if c.seat_like() {
             continue;
         }
         // Find the next layer (round-robin) with cap room; none ⇒ capped.
@@ -224,6 +245,7 @@ mod tests {
         RelayCandidate {
             key_id: id.to_owned(),
             is_seat: seat,
+            relay_standing: false,
             row_live: true,
             announced: true,
             hop_key_valid: true,
@@ -348,6 +370,35 @@ mod tests {
         // c = 1 halves the room; c = 3 widens it.
         assert_eq!(deal_layers(&v, 100, 1).sizes(), [2, 2, 2]);
         assert_eq!(deal_layers(&v, 100, 3).sizes(), [4, 4, 4]);
+    }
+
+    /// CC 5.4.6 item 4 (steward 2026-10-22) — a conferred `infra:relay`
+    /// standing counts in the cap's denominator: three seats and three
+    /// standings deal [6, 6, 6] at c = 2 where three seats alone deal [3, 3, 3];
+    /// a standing is dealt as seat-like but is not a seat (no seat violation).
+    #[test]
+    fn a_conferred_relay_standing_counts_in_the_caps_denominator() {
+        let mut v: Vec<_> = (0..3).map(|i| node(&format!("seat{i}"), true)).collect();
+        v.extend((0..30).map(|i| node(&format!("n{i}"), false)));
+        assert_eq!(deal_layers(&v, 5, 2).sizes(), [3, 3, 3]);
+        for i in 0..3 {
+            let mut st = node(&format!("standing{i}"), false);
+            st.relay_standing = true;
+            assert_eq!(seat_violation(&st), None);
+            v.push(st);
+        }
+        let d = deal_layers(&v, 5, 2);
+        assert_eq!(d.sizes(), [6, 6, 6], "{:?}", d.sizes());
+        assert_eq!(d.capped.len(), 30 - 12);
+        // Seat-like members land on both passes' first slots: each layer has
+        // exactly two seat-like members (round-robin over six).
+        for l in &d.layers {
+            let seat_like = l
+                .iter()
+                .filter(|k| k.starts_with("seat") || k.starts_with("standing"))
+                .count();
+            assert_eq!(seat_like, 2);
+        }
     }
 
     /// Membership: each predicate leg excludes on its own; a seat's violations

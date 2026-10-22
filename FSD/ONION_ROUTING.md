@@ -1,6 +1,8 @@
 # FSD: The Anonymous Tier — onion routing over the shaped mesh (CC 5.4.6)
 
-**Status:** DESIGN, locked to CC 1.0-rc10 at `89e6915` (2026-10-22). Nothing here is built; the one
+**Status:** DESIGN, locked to CC 1.0-rc10 at `89e6915` and the steward's rulings of 2026-10-22
+("yes to all": the `infra:relay` standing in the cap, availability = floor ∧ liveness, the rendezvous
+node a seat, mailbox v1 single-seat, RaptorQ out of the durability path). Nothing here is built; the one
 piece of code is the layer deal (`src/transport/onion_layers.rs`), written first because its witness is
 the determinism the CC requires. Edge vendors CC rc8.1 today (its namespace matcher is persist's); the
 rc10 families arrive with persist's rc10 adoption.
@@ -92,7 +94,11 @@ that matters, and the cap and floor are enforced at the sender's route selection
 "available / unavailable" answer.
 
 **Membership:** `is_relay = row_live ∧ announced ∧ hop_key_valid ∧ ¬opted_out ∧ owner_bound_under_bundle_root`.
-Shaped layer links are checked at use (§6), not here.
+Shaped layer links are checked at use (§6), not here. **Seat-like** (`RelayCandidate::seat_like`) = a serve
+seat OR a steward-conferred `infra:relay` standing (`delegation_scope::INFRA_RELAY`, CIRISPersist#1119) on
+an owner-bound, bundle-rooted identity; seat-like relays are dealt first and count in the cap's denominator,
+so the steward grows the layers by conferring. A standing owes no seat conformance (`seat_opted_out` /
+`seat_without_hop_key` are for serve seats only).
 
 **Period:** the rendezvous period, `period = floor(unix_seconds / 3600)` on the global clock (CC 3.1.4).
 A deal is computed for the period of the send; a packet in flight across a period boundary is unaffected
@@ -101,17 +107,29 @@ A deal is computed for the period of the send; a packet in flight across a perio
 **H:** `SHA-256("ciris:onion:layer-deal:v1" ‖ UTF-8(key_id) ‖ BE64(period))` (edge's instantiation of the
 CC's `H(key_id ‖ period)`; the domain tag keeps it apart from every other hash of a key id).
 
-**The deal:** sort relays by `(¬is_seat, H, key_id)`; deal seats round-robin over layers 0, 1, 2; continue
-the round-robin with non-seats, each into the next layer with cap room (`non_seats_in_layer <
-c × seats_in_layer`), else into `capped` (they wait for the next period; rotation by period gives them
-turns). `c` is a steward setting, default 2. **Floor:** every layer ≥ 3 members, else `available = false`
-and the client says the tier is unavailable this period; the tier never runs a thin layer.
+**The deal:** sort relays by `(¬seat_like, H, key_id)`; deal the seat-like round-robin over layers 0, 1, 2;
+continue the round-robin with the others, each into the next layer with cap room (`others_in_layer <
+c × seat_like_in_layer`), else into `capped` (they wait for the next period; rotation by period gives them
+turns). `c` is a steward setting, default 2 (relievable: `onion.cap_factor`, CIRISPersist#1118).
+**Floor:** every layer ≥ 3 members, else the deal is unavailable; the tier never runs a thin layer.
 
-**Finding (model §b):** the cap bounds a layer to (1 + c) × its seats, so with three seats every layer is
-three nodes and nearly every other relay waits every period; the Sybil bound this buys is c/(1 + c) per
-layer with all strangers hostile. Capacity and anonymity set grow with seats, not with volunteers. Edge
-keeps the rule as ruled and flags it; an additive `k₀` is the one-line relaxation if the steward wants
-larger layers at a stated Sybil cost.
+**Availability (steward 2026-10-22):** `available = the deal's floor ∧ this node's liveness fold`
+(`src/transport/onion_liveness.rs#LivenessFold::availability_at`): per layer, ≥ 3 dealt relays with
+verified evidence of answering younger than the window (a completed shaped-link handshake, a route answer,
+a forwarded packet acknowledged by the next hop, a self-addressed probe). The deal is identical on every
+node; the liveness answer is this node's own and may differ between nodes. Counts only, never an
+identity; unknown is never zero. Refusal names: `onion_tier_unavailable_floor`,
+`onion_tier_unavailable_liveness`.
+
+**Formal model:** `formal/onion_layers/` (TLA+ `OnionLayers.tla` over every ranking and every hostile
+placement at small N; Lean `OnionLayersCount.lean` for the counting bounds at any N), to be vendored into
+CIRISConstitution/formal/.
+
+**Finding (model §b) and the ruling on it:** the cap bounds a layer to (1 + c) × its seat-like members, so
+with three seats every layer is three nodes and nearly every other relay waits every period; the Sybil
+bound this buys is c/(1 + c) per layer with all strangers hostile. Capacity and the anonymity set grow with
+seat-like members. The steward kept c = 2 and made conferred `infra:relay` standings seat-like (above), so
+capacity grows by conferral rather than by seats alone; the `k₀` relaxation was not adopted.
 
 ## 5. The packet — `outfox-xwing-v1` (CC 5.4.6 item 3 normative in principle; layout edge's own)
 
@@ -211,8 +229,10 @@ through its own fresh safety route, a `fetch` packet whose body carries a signed
 rendezvous key's hybrid signature over `period ‖ nonce ‖ its own current private route`), and the seat
 answers each stored body as a packet along that route; stored bodies are deleted on fetch or at expiry.
 The seat learns the rendezvous key, counts, sizes and times; never the receiver's identity (the fetch
-arrives through three hops) and never the publisher. **Why a seat:** the model's §d — a route reused for an
-hour must survive the hour, and seats do not churn.
+arrives through three hops) and never the publisher. **Why a seat (ruled 2026-10-22: the rendezvous node MUST be a seat; mailbox v1 single-seat):** the model's
+§d — a route reused for an hour must survive the hour, and seats do not churn. A multi-seat mailbox is the
+v2 item and, since RaptorQ left the durability path, it is **chunk replication of the mailbox across seats
+with a target-holder count**, not fountain symbols (see `docs/DURABILITY_TIER_ASSESSMENT_2026-10-22.md`).
 
 ## 9. Rotation (CC 5.4.6 item 7 — normative)
 
@@ -227,8 +247,9 @@ Never on group events.
 |---|---|---|
 | `onion_relay` | on | relay for others; `off` ⇒ next row carries the marker, no hop key (a seat cannot set `off`: edge refuses the setting on a seat and names `seat_opted_out`) |
 | device policy (client) | phone-class: relay on Wi-Fi while charging only; off on battery or metered; servers and home nodes: on | the client maps device state to `onion_relay` and states the cost: at the eight-link node cap a phone-wifi relay spends ≈ 29 GB/month and keeps the radio awake; cellular ≈ 7 GB/month metered |
-| `onion_cap_factor` (c) | 2 | CC's steward setting |
-| `onion_mix_mean_delay_ms` (μ) | 2000 | sender-chosen per-hop delay |
+| `onion_cap_factor` (c) | 2 | CC's steward setting; relievable from the plane as `onion.cap_factor` |
+| `onion_mix_mean_delay_ms` (μ) | 2000 | sender-chosen per-hop delay; relievable as `onion.mix_mean_delay_ms` (the inverted key: relief raises it) |
+| liveness window | 3600 s | evidence younger than this counts a relay as answering (`onion_liveness.rs#DEFAULT_LIVENESS_WINDOW`) |
 | `onion_hold_max`, `rendezvous_mailbox_max` | 256, 64 | relay hold and mailbox bounds |
 | `onion_hop_key_rotation` | 7 days | hop-key cadence |
 | `onion_route_retries` | 3 | per publication per period |
@@ -239,8 +260,8 @@ Edge's `ShapingPolicy` is a prerequisite: a relay's links to its layer neighbour
 
 `seat_opted_out`, `seat_without_hop_key` (CC); `onion_unshaped_link`, `onion_hdr_open_failed`,
 `onion_period_mismatch`, `onion_replay`, `onion_next_hop_unroutable`, `onion_hold_deferred`,
-`onion_no_valid_hop_key` (use-time: the cross-row rule), `onion_tier_unavailable` (the floor, said to the
-client with the layer sizes), `onion_route_failed` (sender, after retries), `rendezvous_route_stale`
+`onion_no_valid_hop_key` (use-time: the cross-row rule), `onion_tier_unavailable_floor` and
+`onion_tier_unavailable_liveness` (said to the client with the layer sizes and the answering counts), `onion_route_failed` (sender, after retries), `rendezvous_route_stale`
 (a row past `valid_until`), `rendezvous_mailbox_full`, `rendezvous_fetch_unsigned`. Metric families
 `onion_relay`, `onion_send`, `rendezvous`.
 
@@ -251,17 +272,30 @@ client with the layer sizes), `onion_route_failed` (sender, after retries), `ren
 | opt-in to use / default-on relaying / seats cannot opt out / device policy | 5.4.6 item 1, 1.13.3.1 | the knob names, the cost figures |
 | hop key member, shape, separation, "no valid hop key cannot relay" | 3.3.6.2 | custody, rotation cadence |
 | opt-out marker, `seat_opted_out`, `seat_without_hop_key` | 3.3.6.2, 5.4.6 item 1 | counting them |
-| membership predicate, deal order, cap c (default 2), floor 3, pure function of the fold | 5.4.6 item 4 | H's instantiation, round-robin continuation, the `capped` list, the `k₀` option (proposed, not adopted) |
+| membership predicate, deal order, cap c (default 2), floor 3, pure function of the fold; `infra:relay` standings seat-like; availability = floor ∧ ≥ 3 answering per layer | 5.4.6 item 4 (as ruled 2026-10-22) | H's instantiation, round-robin continuation, the `capped` list, the liveness fold's evidence kinds and window |
 | three hops, one per layer; post-quantum every hop; one ciphertext per hop | 5.4.6 items 3–4 | slot layout, sizes, KDF labels, identifier string, body size, flags, replay rule |
 | carried as shaped-frame bodies; unshaped links carry none | 5.4.6 items 4–5 | the `CONP` tag, hold bound, per-hop delay distribution and μ |
 | rendezvous row family, payload, reach, retention, one-hour period, multi-use route | 3.1.4, 5.4.6 item 6 | the mailbox, fetch protocol, bounds |
 | rotation on global clocks | 5.4.6 item 7 | cadences |
 | the count leak and the small-set caveat | 5.4.6 item 8 | the model's numbers |
 
+## 12a. Holonomic references (as ruled 2026-10-22)
+
+- The durability tier is **chunked replication to a per-item target-holder count over the blob swarm**,
+  rarest-first, repaired when the holonomic view shows holders falling toward a floor; RaptorQ is out of
+  that path (the codec stays for realtime A/V). The holding claim is persist's `custody:ack:v1` (holders
+  per item). The onion tier's mailbox follows the same rule in v2.
+- The holonomic view (room size, shelf length, witness roots) changes behaviour only through
+  `mesh_config`, relieve-never-expand: the tier's `c` and μ are relievable keys; nothing a node measures
+  widens any node's flow. The liveness fold (§4) is such a measurement: it narrows the availability answer
+  and never the deal.
+- Loop-closing work is CIRISEdge#886; CLM-holonomic-view stages there.
+
 ## 13. Build plan (not in 43.2; the cut after)
 
 1. persist: hop-key and marker readers, in-row separation refusals, identity_type `rendezvous`, the
-   `rendezvous:route:v1` family admission (CIRISPersist follow-up).
+   `rendezvous:route:v1` family admission; `delegation_scope::INFRA_RELAY` (CIRISPersist#1119); the five
+   plane keys (CIRISPersist#1118).
 2. ciris-crypto: `onion_xwing_hkdf_sha256_aes256_gcm` — slot build/open, KATs.
 3. edge: custody + producer (§3); layer deal wiring (§4, done as a function); relay hop and shaped-link
    gate (§6); sender (§7); rendezvous row producer/consumer and the seat mailbox (§8); knobs (§10);

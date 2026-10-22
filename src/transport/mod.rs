@@ -237,6 +237,10 @@ pub mod link_shaping;
 /// membership for a period and the three layers, a pure function of the fold.
 pub mod onion_layers;
 
+/// CC 5.4.6 item 4 (steward 2026-10-22) — the per-node liveness fold beside
+/// the deal: availability = the floor ∧ ≥ 3 answering relays per layer.
+pub mod onion_liveness;
+
 /// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
 /// live streams (`FSD/AV_CALL_API.md`).
 #[cfg(feature = "_reticulum-module")]
