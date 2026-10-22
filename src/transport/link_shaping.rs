@@ -53,6 +53,10 @@ const KIND_REAL: u8 = 0x01;
 /// Below one frame per this many seconds an offer is `off`: a slower stream
 /// shapes nothing worth the link.
 pub const MIN_FRAME_INTERVAL: Duration = Duration::from_secs(10);
+/// The longest budget window an offer may name (one day). `agree` takes the
+/// longer of the two windows, so an unbounded one would let a peer switch the
+/// budget off on its own link.
+pub const MAX_WINDOW_S: u32 = 86_400;
 /// The smallest frame worth shaping (a `CFRG` header and some body).
 pub const MIN_FRAME_BYTES: u16 = 96;
 
@@ -285,7 +289,8 @@ impl ShapingOffer {
                 || offer.frame_bytes < MIN_FRAME_BYTES
                 || offer.rho_milli == 0
                 || offer.rho_milli > 1000
-                || offer.window_s == 0)
+                || offer.window_s == 0
+                || offer.window_s > MAX_WINDOW_S)
         {
             return Err(ShapingError::Malformed("offer values"));
         }
@@ -746,6 +751,14 @@ impl LinkShapers {
         offer
     }
 
+    /// Record this node's `off` offer for `link` (a link that is never shaped,
+    /// whatever the policy: a scoped or A/V link).
+    pub fn offer_off_for(&self, link: [u8; 16]) -> ShapingOffer {
+        let off = ShapingOffer::off();
+        self.offered().insert(link, off);
+        off
+    }
+
     /// The peer's offer arrived for `link`: resolve it against ours. `Ok(Some)`
     /// installs the shaper; `Ok(None)` leaves the link unshaped; `Err` is a
     /// refusal the caller closes the link for.
@@ -856,6 +869,12 @@ mod tests {
             ShapingOffer::decode(&bad),
             Err(ShapingError::Malformed(_))
         ));
+        let mut long = o.encode();
+        long[14..18].copy_from_slice(&(MAX_WINDOW_S + 1).to_be_bytes());
+        assert!(
+            matches!(ShapingOffer::decode(&long), Err(ShapingError::Malformed(_))),
+            "a window past one day is refused"
+        );
     }
 
     #[test]

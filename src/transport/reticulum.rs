@@ -12982,7 +12982,22 @@ async fn answer_route_request(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
+    // The fetch is identity-plane only, checked BEFORE the key: a scoped or
+    // A/V link is to a derived address, and answering "not ours" versus a
+    // signed row there would tell a prober which identity owns it.
+    let (_, plane) = resolve_inbound_link(ctx, &link_id).await;
+    let sender = ctx
+        .node
+        .get_remote_identity(&link_id)
+        .map(|id| hex::encode(id.hash()));
     let built: Result<Vec<Vec<u8>>, RouteFetchError> = async {
+        crate::transport::route_fetch::route_request_plane_allowed(matches!(
+            plane,
+            LinkPlane::Identity
+        ))?;
+        if !ctx.seals.admit_route_sender(sender.as_deref()) {
+            return Err(RouteFetchError::RateLimited);
+        }
         if key_id != ctx.local_key_id {
             return Err(RouteFetchError::NotOurs {
                 asked: key_id.to_owned(),
@@ -13336,9 +13351,15 @@ async fn handle_shaping_offer(ctx: &EventCtx<'_>, link_id: LinkId, bytes: &[u8])
         }
     };
     if !ctx.shapers.has_offered(link) {
-        let ours = ctx
-            .shapers
-            .offer_for(link, link_channel_mdu(ctx.node, &link_id));
+        // Only identity links are shaped (CC 5.4.6; `shaping_applies_to`):
+        // on a scoped or A/V link this node answers `off`, whatever its class.
+        let (_, plane) = resolve_inbound_link(ctx, &link_id).await;
+        let ours = if shaping_applies_to(plane) {
+            ctx.shapers
+                .offer_for(link, link_channel_mdu(ctx.node, &link_id))
+        } else {
+            ctx.shapers.offer_off_for(link)
+        };
         let out =
             send_fragments_on_channel(ctx.node, ctx.seals, ctx.shapers, &link_id, &[ours.encode()])
                 .await;

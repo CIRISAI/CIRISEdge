@@ -523,6 +523,8 @@ pub struct LinkSeals {
     route_answers: Mutex<HashMap<[u8; 16], RouteAnswerTx>>,
     /// The node-wide receiver order for route requests.
     route_limiter: RouteRequestLimiter,
+    /// The per-sender receiver order for route requests.
+    route_sender_limiter: route_fetch::SenderRouteLimiter,
 }
 
 impl std::fmt::Debug for LinkSeals {
@@ -549,6 +551,7 @@ impl LinkSeals {
             held: Mutex::new(HashMap::new()),
             route_answers: Mutex::new(HashMap::new()),
             route_limiter: RouteRequestLimiter::default(),
+            route_sender_limiter: route_fetch::SenderRouteLimiter::default(),
         }
     }
 
@@ -598,6 +601,13 @@ impl LinkSeals {
             }) => Some(route_fetch::ROUTE_FETCH_BUDGET.saturating_sub(at.elapsed())),
             _ => None,
         }
+    }
+
+    /// Pre-seal route fetch — the per-sender receiver order (`sender` = the
+    /// link's proven identity, `None` before its LINKIDENTIFY). `false` means
+    /// refuse, before anything is read from the directory.
+    pub fn admit_route_sender(&self, sender: Option<&str>) -> bool {
+        self.route_sender_limiter.admit(sender)
     }
 
     /// Test knob: the node-wide route-request cap per window.

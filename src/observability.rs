@@ -1017,6 +1017,10 @@ pub const LINK_SEAL_REFUSED_ROUTE_REQUEST: &str = "link_seal_refused_route_reque
 /// Refused by the receiver order, before anything was read: a second request
 /// on one link, or one over the node-wide rate.
 pub const LINK_SEAL_REFUSED_ROUTE_RATE_LIMITED: &str = "link_seal_refused_route_rate_limited";
+/// Refused before the key is compared: a route request on a scoped or A/V
+/// link (a derived address must not answer "are you key X?").
+pub const LINK_SEAL_REFUSED_ROUTE_OFF_IDENTITY_PLANE: &str =
+    "link_seal_refused_route_off_identity_plane";
 /// Refused: the request named a key that is not this node's.
 pub const LINK_SEAL_REFUSED_ROUTE_NOT_OURS: &str = "link_seal_refused_route_not_ours";
 /// Refused: this node holds no live signed route row of its own with a pair.

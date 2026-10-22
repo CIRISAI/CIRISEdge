@@ -7845,14 +7845,20 @@ impl FederationDirectoryReplicationBridge {
         // to that peer by CC 6.1.5.3 and CC 5.2 — a self-scope holding claim
         // reaches the owner's other device whether or not the two devices
         // are Rooted at each other (the v43.2 PR run's blob_federation_e2e
-        // finding). Cohort-delivered = a `self` or `family` placement, the
-        // tiers whose bytes are delivered to their own nodes; persist's
-        // audience check above already put the peer among them. The floor
-        // is for strangers.
+        // finding). Cohort-delivered = a targeted placement (`self`,
+        // `family`, `community`, `affiliations`): membership is the
+        // authority there and persist's audience check above already put the
+        // peer among its members — an invited stranger who joined a community
+        // receives its rows without sharing a trust root with the author (CC
+        // 3.1.3.2; `membership_first_contact_756`, the second PR run's
+        // finding). The floor narrows the federation-scope planes, which is
+        // what CC rc9 I3 is about.
         let cohort_delivered = matches!(
             audience,
             ciris_persist::federation::Audience::SelfOnly
                 | ciris_persist::federation::Audience::Family { .. }
+                | ciris_persist::federation::Audience::Community { .. }
+                | ciris_persist::federation::Audience::Affiliations { .. }
         );
         let self_authored = self
             .self_provider

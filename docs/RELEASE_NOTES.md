@@ -58,10 +58,11 @@ universal 1.4 KB envelope rule.
 - **#882 (CC rc9 I3) — the #659 floor's exemption is narrowed.** Before Rooted, a self-authored
   row crosses to an Attributed peer only if it is one of this node's allegiance facts
   (owner-binding, acceptance, self-charter), or its data subject is that peer itself (its
-  consent grant, a row addressed to it), or it is cohort-delivered (persist resolved its audience
-  to the content's own nodes and the peer is one: a self/family holding claim reaches the owner's
-  other device, CC 6.1.5.3); a self-authored consent grant, score or content row about a third
-  party at federation scope stays behind the floor (`recipient_not_rooted`) until Rooted. Pair
+  consent grant, a row addressed to it), or it is placed in a cohort (self, family, community,
+  affiliations) whose membership audience the peer already passed: a self holding claim reaches the
+  owner's other device (CC 6.1.5.3) and an invited stranger who joined a community receives its
+  rows (CC 3.1.3.2); a self-authored consent grant, score or content row about a third party at
+  federation scope stays behind the floor (`recipient_not_rooted`) until Rooted. Pair
   rooms are unchanged on the rows they send to the peer; the Server's chat ladder on this tag
   decides whether the subject carve tightens further.
 - **CC vendoring stays at rc8.1 (`157039d`).** Edge's namespace matcher is persist's

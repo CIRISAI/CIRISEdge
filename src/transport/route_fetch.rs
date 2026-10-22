@@ -65,6 +65,74 @@ const FLAG_HOLDS_KEY_RECORD: u8 = 0x01;
 pub const ROUTE_REQUESTS_PER_WINDOW: u32 = 32;
 /// The node-wide rate window.
 pub const ROUTE_REQUEST_WINDOW: Duration = Duration::from_secs(10);
+/// Per sender (the link's proven transport identity): at most this many route
+/// requests per [`ROUTE_REQUEST_WINDOW`], so one prober cannot spend the
+/// node-wide budget honest strangers need (CC 5.3.3.5 E1 "per-sender").
+pub const ROUTE_REQUESTS_PER_SENDER: usize = 4;
+/// Links with no proven identity yet share ONE sender slot with this cap: an
+/// unidentified flood cannot take more than this of the node-wide budget.
+pub const ROUTE_REQUESTS_UNIDENTIFIED: usize = 8;
+/// Senders tracked at once (oldest-idle first out past the bound).
+pub const ROUTE_SENDERS_TRACKED: usize = 1024;
+
+/// CC 5.3.3.5 E1 — the route fetch runs on identity-plane links only. A
+/// scoped or A/V link is to a derived address; answering there would let a
+/// prober ask a private address "are you key X?". Checked before the key.
+///
+/// # Errors
+/// [`RouteFetchError::OffIdentityPlane`].
+pub fn route_request_plane_allowed(identity_plane: bool) -> Result<(), RouteFetchError> {
+    if identity_plane {
+        Ok(())
+    } else {
+        Err(RouteFetchError::OffIdentityPlane)
+    }
+}
+
+/// The per-sender receiver order: a sliding window per sender key, bounded.
+#[derive(Debug, Default)]
+pub struct SenderRouteLimiter {
+    recent: Mutex<std::collections::HashMap<String, VecDeque<Instant>>>,
+}
+
+impl SenderRouteLimiter {
+    /// Admit one request from `sender` (`None` = an unidentified link) now.
+    pub fn admit(&self, sender: Option<&str>) -> bool {
+        self.admit_at(sender, Instant::now())
+    }
+
+    fn admit_at(&self, sender: Option<&str>, now: Instant) -> bool {
+        let (key, cap) = match sender {
+            Some(s) => (s.to_owned(), ROUTE_REQUESTS_PER_SENDER),
+            None => ("\u{0}unidentified".to_owned(), ROUTE_REQUESTS_UNIDENTIFIED),
+        };
+        let mut map = self
+            .recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !map.contains_key(&key) && map.len() >= ROUTE_SENDERS_TRACKED {
+            map.retain(|_, q| {
+                q.back()
+                    .is_some_and(|t| now.duration_since(*t) < ROUTE_REQUEST_WINDOW)
+            });
+            if map.len() >= ROUTE_SENDERS_TRACKED {
+                return false;
+            }
+        }
+        let q = map.entry(key).or_default();
+        while q
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= ROUTE_REQUEST_WINDOW)
+        {
+            q.pop_front();
+        }
+        if q.len() >= cap {
+            return false;
+        }
+        q.push_back(now);
+        true
+    }
+}
 
 /// The dialler's first frame: which key it means to reach, and whether it
 /// already holds that key's record.
@@ -101,6 +169,11 @@ pub enum RouteFetchError {
     /// before anything is read.
     #[error("route request refused by the receiver order (per link once; node-wide rate)")]
     RateLimited,
+    /// A route request on a link that is not an identity-plane link (a scoped
+    /// or A/V link to a derived address). Refused BEFORE the key is compared,
+    /// so a derived address can never be asked "are you key X?".
+    #[error("route request on a non-identity link; the fetch is identity-plane only")]
+    OffIdentityPlane,
     /// The request names a key that is not this node's.
     #[error("route request names {asked}; this node answers only for {ours}")]
     NotOurs {
@@ -157,6 +230,7 @@ impl RouteFetchError {
             }
             Self::RateLimited => o::LINK_SEAL_REFUSED_ROUTE_RATE_LIMITED,
             Self::NotOurs { .. } => o::LINK_SEAL_REFUSED_ROUTE_NOT_OURS,
+            Self::OffIdentityPlane => o::LINK_SEAL_REFUSED_ROUTE_OFF_IDENTITY_PLANE,
             Self::Unavailable(_) => o::LINK_SEAL_REFUSED_ROUTE_UNAVAILABLE,
             Self::Answer(_) | Self::AnswerNotARow => o::LINK_SEAL_REFUSED_ROUTE_ANSWER,
             Self::SignedByAnotherKey { .. } => o::LINK_SEAL_REFUSED_ROUTE_ANSWER_SIGNER,
@@ -400,6 +474,29 @@ mod tests {
         assert!(matches!(
             fragment_tagged(ROUTE_ANSWER_MAGIC, MAX_ROUTE_ANSWER_BYTES, &body, 400),
             Err(AvHandshakeError::TooLarge { .. })
+        ));
+    }
+
+    /// One sender cannot take more than its share; unidentified links share
+    /// one small pool; the plane gate refuses before anything else.
+    #[test]
+    fn a_sender_is_capped_and_unidentified_links_share_one_pool() {
+        let l = SenderRouteLimiter::default();
+        let t0 = Instant::now();
+        for _ in 0..ROUTE_REQUESTS_PER_SENDER {
+            assert!(l.admit_at(Some("a"), t0));
+        }
+        assert!(!l.admit_at(Some("a"), t0), "a is capped");
+        assert!(l.admit_at(Some("b"), t0), "b is not");
+        for _ in 0..ROUTE_REQUESTS_UNIDENTIFIED {
+            assert!(l.admit_at(None, t0));
+        }
+        assert!(!l.admit_at(None, t0));
+        assert!(l.admit_at(Some("a"), t0 + ROUTE_REQUEST_WINDOW));
+        assert!(route_request_plane_allowed(true).is_ok());
+        assert!(matches!(
+            route_request_plane_allowed(false),
+            Err(RouteFetchError::OffIdentityPlane)
         ));
     }
 
