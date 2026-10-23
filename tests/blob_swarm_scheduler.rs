@@ -682,3 +682,138 @@ async fn the_store_verdict_reaches_every_chunk_write() {
         "an unarmed gate must report Announce (pre-#581 behaviour), got {seen:?}",
     );
 }
+
+/// CIRISEdge#887 — the bigfile resume failure, at the scheduler. One holder
+/// serves every lane; a stall delays ALL its answers past the per-request
+/// timeout at once, then it recovers. Before the fix each lane's timeout was
+/// an error strike, so the first wave retired the only holder and the fetch
+/// ended `ChunkUnreachable` ("no holders left"). Overlapping timeouts are one
+/// silence now, shorter than the silence limit, and the blob assembles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_holder_that_stalls_past_the_timeout_on_every_lane_is_kept_887() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let me = FedKey::new("edge-self-swarm-stall", 0x05);
+    let holder = FedKey::new("holder-stalled", 0xE5);
+    let edge = build_edge(&tmp, &me, &[&holder]).await;
+
+    let blob_sha = [0x87u8; 32];
+    let (manifest, chunks) = make_chunks(8, 64);
+    let chunks_by_sha: std::collections::HashMap<[u8; 32], Vec<u8>> = manifest
+        .chunks
+        .iter()
+        .zip(chunks.iter())
+        .map(|((sha, _), bytes)| (*sha, bytes.clone()))
+        .collect();
+
+    let timeout = Duration::from_millis(400);
+    let config = SwarmConfig {
+        per_request_timeout: timeout,
+        ..SwarmConfig::default()
+    };
+    // The stall: longer than one timeout (every lane times out), shorter
+    // than the silence limit (three timeouts of wall-clock silence).
+    let stall = timeout + timeout / 2;
+    assert!(config.max_in_flight_per_peer >= config.error_strike_limit);
+    assert!(stall < config.silence_limit());
+
+    let scheduler = SwarmScheduler::new(edge.clone(), Arc::new(TestVerifier::new()), config);
+    let holders = vec![holder.key_id.clone()];
+    let manifest_for_scheduler = manifest.clone();
+    let scheduler_handle = tokio::spawn(async move {
+        scheduler
+            .fetch_blob(blob_sha, manifest_for_scheduler, holders)
+            .await
+    });
+
+    let recover_at = std::time::Instant::now() + stall;
+    let edge_pump = edge.clone();
+    let manifest_pump = manifest.clone();
+    let pump_handle = tokio::spawn(async move {
+        pump_responses(
+            &edge_pump,
+            blob_sha,
+            &manifest_pump,
+            std::time::Instant::now() + Duration::from_secs(20),
+            move |_, chunk_sha| {
+                if std::time::Instant::now() < recover_at {
+                    return None; // stalled: nothing comes back
+                }
+                let bytes = chunks_by_sha.get(&chunk_sha).cloned()?;
+                Some((ChunkResult::Bytes(bytes), Box::new(|| ())))
+            },
+        )
+        .await;
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(20), scheduler_handle)
+        .await
+        .expect("the scheduler reaches a verdict")
+        .expect("scheduler task");
+    pump_handle.abort();
+    let assembled = result.expect(
+        "one stall on every lane is one silence: the only holder is kept and the blob \
+         assembles (before #887 the first timeout wave retired it: no holders left)",
+    );
+    assert_eq!(assembled, chunks.concat());
+}
+
+/// CIRISEdge#887 — a chunk answer that lands after its fetch timed out is
+/// kept, and the next fetch of that chunk takes it without asking again.
+/// Before the fix the dispatcher dropped it (no waiter) after its whole
+/// transfer had been paid, and the retry re-requested the same bytes.
+/// The timeout is the TYPED transport timeout the swarm reads as silence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_chunk_answer_is_kept_for_the_retry_887() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let me = FedKey::new("edge-self-swarm-late", 0x06);
+    let holder = FedKey::new("holder-late", 0xE6);
+    let edge = build_edge(&tmp, &me, &[&holder]).await;
+    let blob_sha = [0x88u8; 32];
+    let (manifest, chunks) = make_chunks(1, 64);
+    let chunk_sha = manifest.chunks[0].0;
+    let timeout = Duration::from_millis(200);
+
+    let first = edge
+        .fetch_blob_chunk(&holder.key_id, blob_sha, chunk_sha, timeout)
+        .await;
+    assert!(
+        matches!(
+            first,
+            Err(ciris_edge::EdgeError::Transport(
+                ciris_edge::TransportError::Timeout(_)
+            ))
+        ),
+        "an unanswered fetch ends in the typed timeout, got {first:?}"
+    );
+
+    assert_eq!(
+        edge.deliver_chunk_answer_for_test(
+            blob_sha,
+            chunk_sha,
+            ChunkResult::Bytes(chunks[0].clone())
+        ),
+        "kept",
+        "the late answer is kept, not dropped"
+    );
+    let retry = tokio::time::timeout(
+        Duration::from_millis(50),
+        edge.fetch_blob_chunk(&holder.key_id, blob_sha, chunk_sha, timeout),
+    )
+    .await
+    .expect("the retry returns at once: the answer is already here")
+    .expect("the kept answer");
+    match retry {
+        ChunkResult::Bytes(b) => assert_eq!(b, chunks[0]),
+        ChunkResult::ChunkMiss { reason } => panic!("expected bytes, got a miss: {reason}"),
+    }
+    let ledger = edge.metrics().snapshot().blob_dag_chunks;
+    assert_eq!(ledger.get("answer_timed_out").copied(), Some(1));
+    assert_eq!(ledger.get("late_answer_kept").copied(), Some(1));
+    assert_eq!(ledger.get("late_answer_used").copied(), Some(1));
+
+    assert_eq!(
+        edge.deliver_chunk_answer_for_test(blob_sha, [0x99; 32], ChunkResult::Bytes(vec![0; 8])),
+        "unsolicited",
+        "an answer nobody asked for is still dropped"
+    );
+}

@@ -39,6 +39,16 @@ connected. A restart did not help, because the stale row is in the store.
   `_by_node`. One WARN per identity per ten minutes names every bound key, the choice and the
   rule.
 
+## Also: a slow holder is no longer retired by one stall (#887, backported from 43.2)
+
+This patch's own CI hit #887: the bigfile resume witness failed with "no holders left". It is a
+production bug on this line too, so the 43.2 fix is backported unchanged.
+- A chunk timeout no longer counts as an error strike; a holder is retired only after answering
+  nothing for 90 s, so one stall across a pull's eight lanes can no longer retire the only holder.
+- An answer that lands after its fetch timed out is kept for the retry.
+- A holder sends one body per (requester, chunk) at a time, so retries no longer pile duplicate
+  ~1 MB transfers onto a congested link.
+
 **Advisories (published 2026-10-24).** Lockfile patch bumps fix RUSTSEC-2026-0385 (ctutils 0.4.5),
 RUSTSEC-2026-0386 (tokio 1.53.3) and RUSTSEC-2026-0387 for crypto-bigint 0.7 (0.7.7). RUSTSEC-2026-0387
 for crypto-bigint 0.5.5 is ignored with its reason: it is reached only through elliptic-curve 0.13 in
