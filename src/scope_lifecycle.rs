@@ -700,7 +700,7 @@ impl ScopeLifecycle {
                         error = %e,
                         "LEAVING a group but its destination could NOT be retired — this \
                          node keeps answering on an address for a group it has left \
-                         (CIRISEdge#499)"
+                         (tracked: CIRISEdge#499)"
                     );
                 }
             }
@@ -773,7 +773,7 @@ impl ScopeLifecycle {
                     group = %group_id,
                     error = %e,
                     "scope address seal FAILED — the superseded epoch stays live \
-                     (CIRISEdge#499)"
+                     (tracked: CIRISEdge#499)"
                 );
                 return out;
             }

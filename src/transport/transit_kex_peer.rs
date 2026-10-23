@@ -37,6 +37,10 @@ pub enum PairSource {
     SelfSignedRow,
     /// (c) The owner's pairing payload pin (3.2 (f)).
     Pin,
+    /// (a), fetched: the node's own hybrid-signed route row, asked for over
+    /// the link as its first frame (CC 5.3.3.5 E1 pre-seal route fetch) and
+    /// verified exactly as a held copy would be.
+    RouteFetch,
 }
 
 impl PairSource {
@@ -47,6 +51,7 @@ impl PairSource {
             Self::Rooted => crate::observability::LINK_SEAL_PAIR_ROOTED,
             Self::SelfSignedRow => crate::observability::LINK_SEAL_PAIR_SELF_SIGNED_ROW,
             Self::Pin => crate::observability::LINK_SEAL_PAIR_PIN,
+            Self::RouteFetch => crate::observability::LINK_SEAL_PAIR_ROUTE_FETCH,
         }
     }
 }

@@ -34,6 +34,7 @@ use std::time::Duration;
 use ciris_edge::identity::{sign_bound_hybrid, LocalSigner};
 use ciris_edge::transport::reticulum::{
     HandshakeOverride, ReticulumAuth, ReticulumTransport, ReticulumTransportConfig,
+    RouteAnswerOverride,
 };
 use ciris_edge::transport::{InboundFrame, Transport, TransportError};
 use ciris_edge::verify::RootingDirectory;
@@ -479,6 +480,38 @@ async fn a_sealed_exchange_crosses_and_the_wire_carries_no_plaintext_e1() {
     assert_wire_is_sealed(&a_wire, back_marker);
     assert!(t.b.seal("link_seal_initiated") >= 1);
     assert!(t.a.seal("link_seal_accepted") >= 1);
+    // CIRISEdge#879 — the on-link announce binds in BOTH directions on a clean
+    // dial: the responder's (A's) announce at the dialler (B), which never
+    // receives a LINKIDENTIFY, binds to the destination B dialled; B's at A
+    // binds to B's identify. No `announce_frame_link_unidentified` drop.
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            t.b.binding("announce_frame_bound") >= 1 && t.a.binding("announce_frame_bound") >= 1
+        })
+        .await,
+        "both ends bind the other's on-link announce: A {:?} B {:?}",
+        t.a.metrics.peer_binding(),
+        t.b.metrics.peer_binding()
+    );
+    for (n, side) in [(&t.a, "A"), (&t.b, "B")] {
+        let drops = n.metrics.transport_inbound_drops();
+        assert_eq!(
+            drops
+                .get("announce_frame_link_unidentified")
+                .copied()
+                .unwrap_or(0),
+            0,
+            "{side} dropped no on-link announce as unidentified: {drops:?}"
+        );
+        assert_eq!(
+            drops
+                .get("announce_frame_identity_mismatch")
+                .copied()
+                .unwrap_or(0),
+            0,
+            "{side}: {drops:?}"
+        );
+    }
     for (n, side) in [(&t.a, "A"), (&t.b, "B")] {
         let refused: Vec<_> = n
             .metrics
@@ -648,14 +681,17 @@ async fn a_classical_only_suite_is_refused_by_name_e1() {
     );
 }
 
-/// **Witness 4** — a dial to a node with no Rooted transit pair (B never got
-/// A's route) is refused by name and never made.
+/// **Witness 4** — B knows A ONLY by A's announce: no signed route row of
+/// A's crossed, so no pair is authenticated to A from any held source. A
+/// bare announce never supplies a pair (CC 3.3.6.2, rc9 I2): the dial does
+/// not key on the announce, it FETCHES A's own signed route row over the
+/// link as its first frame and keys on that (CC 5.3.3.5 E1 pre-seal route
+/// fetch, `CLM-pre-seal-route-fetch`). Here A's receiver order refuses the
+/// request (cap 0), so nothing is keyed, nothing is stored and nothing is
+/// delivered; with the order open again the same dial seals.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1() {
+async fn a_bare_announce_supplies_no_pair_and_a_refused_fetch_keys_nothing_e1() {
     let t = trio("nopair", false, false, false).await;
-    // CC 3.3.6.2 (rc9, I2) — B knows A ONLY by A's announce: the transport
-    // identity crossed, no signed route row did, so no pair is authenticated
-    // to A from any source. A bare announce never supplies a pair.
     assert!(t.b.transport.knows_peer(&t.a.key.key_id).await);
     assert!(
         t.b.dir
@@ -665,18 +701,345 @@ async fn a_dial_to_a_peer_with_no_rooted_pair_is_refused_and_never_made_e1() {
             .is_empty(),
         "B holds no signed route row of A"
     );
+    // The receiver order runs BEFORE the request is read: at cap 0 every
+    // request is refused, counted, and nothing of it is looked up.
+    t.a.transport.set_route_request_cap_for_test(0);
     match t.b.transport.send(&t.a.key.key_id, b"never-sent").await {
         Err(TransportError::LinkSealRefused { peer, reason, .. }) => {
             assert_eq!(peer, t.a.key.key_id);
-            assert_eq!(reason, "link_seal_refused_no_pair");
+            assert!(
+                reason == "link_seal_refused_route_closed"
+                    || reason == "link_seal_refused_route_timeout",
+                "B's fetch is refused by name, not keyed another way: {reason}"
+            );
         }
-        other => panic!("a dial to a pair-less node must be refused by name: {other:?}"),
+        other => panic!("a dial whose fetch is refused must be refused by name: {other:?}"),
     }
-    assert!(t.b.seal("link_seal_refused_no_pair") >= 1);
-    assert_eq!(t.b.seal("link_seal_initiated"), 0, "nothing was keyed");
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    assert_eq!(t.a.transport.link_count().await, 0, "no link was ever made");
+    assert_eq!(
+        t.a.seal("link_seal_refused_route_rate_limited"),
+        1,
+        "{:?}",
+        t.a.metrics.link_seal()
+    );
+    assert_eq!(
+        t.a.seal("link_seal_route_requested"),
+        0,
+        "refused before it was read"
+    );
+    assert_eq!(t.a.seal("link_seal_route_answered"), 0);
     assert_eq!(t.a.seal("link_seal_accepted"), 0);
+    assert_eq!(t.b.seal("link_seal_initiated"), 0, "nothing was keyed");
+    assert!(
+        t.b.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list")
+            .is_empty(),
+        "the announce supplied no row and the refused fetch stored none"
+    );
+    assert!(
+        t.a.seen.lock().await.is_empty(),
+        "A delivered nothing upward"
+    );
+
+    // The order open again: the same dial fetches, verifies and seals.
+    t.a.transport.set_route_request_cap_for_test(32);
+    t.b.transport
+        .send(&t.a.key.key_id, b"after-the-fetch")
+        .await
+        .expect("B -> A seals after the route fetch");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(b"after-the-fetch").await
+        })
+        .await,
+        "A delivered B's frame once the link was sealed"
+    );
+    assert!(
+        t.b.seal("link_seal_pair_route_fetch") >= 1,
+        "{:?}",
+        t.b.metrics.link_seal()
+    );
+}
+
+/// Every frame a node handed leviculum on `link`, in order.
+fn frames_on(tapped: &[([u8; 16], Vec<u8>)], link: [u8; 16]) -> Vec<Vec<u8>> {
+    tapped
+        .iter()
+        .filter(|(l, _)| *l == link)
+        .map(|(_, f)| f.clone())
+        .collect()
+}
+
+/// **Route fetch 1** — two strangers seal after the pre-seal route fetch:
+/// B holds nothing of A but its announce. B's first frame on the link is the
+/// route request (`CTKR`), A's only unsealed frames are the answer (`CTKA`,
+/// its own signed route row), B verifies the row, stores it, and its
+/// handshake follows; then the exchange crosses sealed both ways. A second
+/// send reuses the keyed link: no second request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_strangers_seal_after_the_pre_seal_route_fetch_e1() {
+    let t = trio("fetch", false, false, false).await;
+    t.b.transport.set_link_wire_tap_for_test(true);
+    t.a.transport.set_link_wire_tap_for_test(true);
+    assert!(
+        t.b.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list")
+            .is_empty(),
+        "B holds no signed route row of A before the dial"
+    );
+    let marker = b"E1-FETCH-MARKER-";
+    let row = marked(marker, 3_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &row)
+        .await
+        .expect("B -> A, fetched then sealed");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(&row).await
+        })
+        .await,
+        "A delivered B's frame"
+    );
+    // B now holds A's own signed row, obtained over the link and admitted
+    // through persist's authenticated door.
+    let held =
+        t.b.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list");
+    assert_eq!(held.len(), 1, "B holds A's fetched route row");
+    assert_eq!(held[0].attesting_key_id, t.a.key.key_id);
+    assert!(
+        t.b.seal("link_seal_route_request_sent") >= 1,
+        "{:?}",
+        t.b.metrics.link_seal()
+    );
+    assert!(t.b.seal("link_seal_pair_route_fetch") >= 1);
+    assert!(t.b.seal("link_seal_initiated") >= 1);
+    assert!(
+        t.a.seal("link_seal_route_requested") >= 1,
+        "{:?}",
+        t.a.metrics.link_seal()
+    );
+    assert!(t.a.seal("link_seal_route_answered") >= 1);
+    assert!(t.a.seal("link_seal_accepted") >= 1);
+
+    // The wire: B's first frame is the request, then its handshake, then
+    // sealed frames; nothing carries the marker.
+    let b_wire = t.b.transport.link_wire_tapped_for_test();
+    let first_link = b_wire.first().expect("B sent on a link").0;
+    let b_frames = frames_on(&b_wire, first_link);
+    assert!(
+        b_frames[0].starts_with(b"CTKR"),
+        "B's first frame is the route request"
+    );
+    assert!(
+        b_frames[1].starts_with(b"CTKX"),
+        "B's handshake follows the answer"
+    );
+    let parts = 1 + b_frames[1..]
+        .iter()
+        .take_while(|f| f.starts_with(b"CTKX"))
+        .count();
+    for (i, f) in b_frames.iter().enumerate().skip(parts) {
+        assert_eq!(f[0], 0x01, "B frame {i} is sealed");
+    }
+    assert!(
+        b_frames.iter().all(|f| !contains(f, marker)),
+        "no plaintext marker on B's wire"
+    );
+
+    // A sealed answer back on B's link, and the same link reused without a
+    // second request.
+    let reply = marked(b"E1-FETCH-REPLY-", 2_000);
+    t.a.transport
+        .send(&t.b.key.key_id, &reply)
+        .await
+        .expect("A -> B on B's link");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.b.received(&reply).await
+        })
+        .await,
+        "B delivered A's reply"
+    );
+    let sent_before = t.b.seal("link_seal_route_request_sent");
+    t.b.transport
+        .send(&t.a.key.key_id, b"second-send")
+        .await
+        .expect("B -> A again");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(b"second-send").await
+        })
+        .await
+    );
+    assert_eq!(
+        t.b.seal("link_seal_route_request_sent"),
+        sent_before,
+        "the keyed link is reused; a held row is not fetched again"
+    );
+}
+
+/// **Route fetch 1b** — a FRESH stranger (its directory holds the baked
+/// bundle and its own key, nothing of A) fetches A's key record WITH the
+/// route: the answer carries A's `key:record:v1` row, admitted through
+/// persist's key door before the route row is verified against it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_stranger_fetches_the_key_record_with_the_route_e1() {
+    let t = trio("fetchfresh", false, false, true).await;
+    assert!(
+        t.c.dir
+            .lookup_public_key(&t.a.key.key_id)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "C holds no key record of A before the dial"
+    );
+    t.c.transport
+        .send(&t.a.key.key_id, b"from-a-fresh-stranger")
+        .await
+        .expect("C -> A, key record and route fetched, then sealed");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(b"from-a-fresh-stranger").await
+        })
+        .await,
+        "A delivered C's frame"
+    );
+    assert!(
+        t.c.dir
+            .lookup_public_key(&t.a.key.key_id)
+            .await
+            .expect("lookup")
+            .is_some(),
+        "C admitted A's key record from the answer"
+    );
+    assert_eq!(
+        t.c.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list")
+            .len(),
+        1,
+        "C holds A's fetched route row"
+    );
+    assert!(
+        t.c.seal("link_seal_pair_route_fetch") >= 1,
+        "{:?}",
+        t.c.metrics.link_seal()
+    );
+}
+
+/// **Route fetch 2** — a responder whose first frames are not a route
+/// answer: the dialler refuses the link by name, keys nothing, stores
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_route_answer_that_is_not_an_answer_refuses_the_link_e1() {
+    let t = trio("fetchgarbage", false, false, false).await;
+    t.a.transport
+        .set_route_answer_override_for_test(RouteAnswerOverride::Garbage);
+    match t.b.transport.send(&t.a.key.key_id, b"never-sent").await {
+        Err(TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_route_answer");
+        }
+        other => panic!("refused by name: {other:?}"),
+    }
+    assert_eq!(
+        t.b.seal("link_seal_refused_route_answer"),
+        1,
+        "{:?}",
+        t.b.metrics.link_seal()
+    );
+    assert_eq!(t.b.seal("link_seal_initiated"), 0, "nothing was keyed");
+    assert!(
+        t.b.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list")
+            .is_empty(),
+        "nothing was stored"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(t.a.seal("link_seal_accepted"), 0);
+    assert!(t.a.seen.lock().await.is_empty());
+}
+
+/// **Route fetch 3** — an answer whose row is signed by, and about, ANOTHER
+/// key (A answers with B's own row, which it holds) is refused by name and
+/// never stored: the dialler keys only on the dialled key's own row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_route_answer_signed_by_another_key_is_refused_and_never_stored_e1() {
+    let t = trio("fetchsigner", false, false, false).await;
+    t.a.transport
+        .set_route_answer_override_for_test(RouteAnswerOverride::RowOf(t.b.key.key_id.clone()));
+    match t.b.transport.send(&t.a.key.key_id, b"never-sent").await {
+        Err(TransportError::LinkSealRefused { reason, .. }) => {
+            assert_eq!(reason, "link_seal_refused_route_answer_signer");
+        }
+        other => panic!("refused by name: {other:?}"),
+    }
+    assert_eq!(
+        t.b.seal("link_seal_refused_route_answer_signer"),
+        1,
+        "{:?}",
+        t.b.metrics.link_seal()
+    );
+    assert_eq!(t.b.seal("link_seal_initiated"), 0, "nothing was keyed");
+    assert!(
+        t.b.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list")
+            .is_empty(),
+        "a row about another key was never stored under A"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(t.a.seal("link_seal_accepted"), 0);
+}
+
+/// **Route fetch 4** — nothing is served before the seal on a fetched link:
+/// A's unsealed frames on B's link are the answer parts and nothing else;
+/// every frame after them (A's announce, its bundle, its replies) is sealed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_is_served_before_the_seal_on_a_fetched_link_e1() {
+    let t = trio("fetchquiet", false, false, false).await;
+    t.a.transport.set_link_wire_tap_for_test(true);
+    t.b.transport
+        .send(&t.a.key.key_id, b"quiet-until-sealed")
+        .await
+        .expect("B -> A");
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.received(b"quiet-until-sealed").await
+        })
+        .await
+    );
+    // A speaks on the link (sealed) once keyed: wait for its announce to go
+    // out, then read the wire.
+    assert!(
+        wait_until(Duration::from_secs(20), || async {
+            !t.a.transport.link_wire_tapped_for_test().is_empty()
+        })
+        .await
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let a_wire = t.a.transport.link_wire_tapped_for_test();
+    let link = a_wire.first().expect("A sent on B's link").0;
+    let frames = frames_on(&a_wire, link);
+    let answer_parts = frames.iter().take_while(|f| f.starts_with(b"CTKA")).count();
+    assert!(answer_parts >= 1, "A's first frames are the route answer");
+    assert!(
+        frames.len() > answer_parts,
+        "A spoke on the link once it was sealed (its announce rides it)"
+    );
+    for (i, f) in frames.iter().enumerate().skip(answer_parts) {
+        assert_eq!(f[0], 0x01, "A frame {i} after the answer is sealed");
+        assert!(!f.starts_with(b"CTKA"), "no answer part after the seal");
+    }
 }
 
 /// **Witness 5** — B's handshake claims C while the link proves B: refused at
@@ -954,10 +1317,11 @@ async fn a_fresh_device_seals_first_contact_with_a_pairing_pinned_pair_e1() {
 
 /// **CLM-pairing-payload-transit-pin (CC 3.2 adding-a-device (f))** — the pin
 /// keys that one link and is never a route: after the pinned first contact the
-/// fresh device's directory holds no signed route for A,
-/// `transit_kex_pair_for` still answers `None`, and an ordinary send to A is
-/// refused `link_seal_refused_no_pair` rather than riding (or re-keying from)
-/// the pinned link.
+/// fresh device's directory holds no signed route for A and
+/// `transit_kex_pair_for` still answers `None`. An ordinary send to A neither
+/// rides nor re-keys from the pinned link: it opens a fresh link and keys it
+/// on A's own signed row fetched over that link (the pre-seal route fetch),
+/// a row that is held as A's own, never as Rooted and never as the pin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_pinned_pair_is_never_stored_or_resolved_as_rooted_e1() {
     let t = trio("pinroot", true, true, true).await;
@@ -979,23 +1343,54 @@ async fn a_pinned_pair_is_never_stored_or_resolved_as_rooted_e1() {
         "the pin never resolves as Rooted"
     );
     let keyed = t.c.seal("link_seal_initiated");
-    match t
-        .c
-        .transport
-        .send(&t.a.key.key_id, b"an-ordinary-row")
-        .await
-    {
-        Err(TransportError::LinkSealRefused { reason, .. }) => {
-            assert_eq!(reason, "link_seal_refused_no_pair");
-        }
-        other => panic!("an ordinary send must not ride or reuse the pin: {other:?}"),
-    }
-    assert_eq!(
-        t.c.seal("link_seal_initiated"),
-        keyed,
-        "nothing else was keyed"
+    let pinned = t.c.seal("link_seal_pair_pin");
+    // The send keys a fresh link on A's fetched row. C is UNANNOUNCED here
+    // (an unowned fresh device), so A cannot attribute that link and the
+    // ordinary row is refused at A by the first-contact carve-out: only the
+    // first-contact plane rides an unattributed link (CC 3.2 (e)).
+    let _ =
+        t.c.transport
+            .send(&t.a.key.key_id, b"an-ordinary-row")
+            .await;
+    assert!(
+        wait_until(Duration::from_secs(30), || async {
+            t.a.seal("link_seal_refused_first_contact_only") >= 1
+        })
+        .await,
+        "A refused the ordinary row on the unattributed link: {:?}",
+        t.a.metrics.link_seal()
     );
     assert!(!t.a.received(b"an-ordinary-row").await);
+    assert_eq!(
+        t.c.seal("link_seal_initiated"),
+        keyed + 1,
+        "a fresh link was keyed; the pinned one was not reused"
+    );
+    assert_eq!(
+        t.c.seal("link_seal_pair_pin"),
+        pinned,
+        "the pin keyed nothing else"
+    );
+    assert_eq!(
+        t.c.seal("link_seal_pair_route_fetch"),
+        1,
+        "{:?}",
+        t.c.metrics.link_seal()
+    );
+    let routes =
+        t.c.dir
+            .list_signed_transport_destinations_for(&t.a.key.key_id)
+            .await
+            .expect("list");
+    assert_eq!(
+        routes.len(),
+        1,
+        "the fetched row, A's own, is what C now holds"
+    );
+    assert_eq!(
+        routes[0].attesting_key_id, t.a.key.key_id,
+        "held because it was fetched and verified as A's own, not because of the pin"
+    );
 }
 
 /// **CLM-pairing-payload-transit-pin (CC 3.2 adding-a-device (f));

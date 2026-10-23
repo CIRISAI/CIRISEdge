@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "43.1.1"
+version = "43.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3591,7 +3591,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 [[package]]
 name = "leviculum-announce-policy"
 version = "0.1.0"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "leviculum-telemetry-policy",
 ]
@@ -3599,7 +3599,7 @@ dependencies = [
 [[package]]
 name = "leviculum-ble-tx"
 version = "0.1.0"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "embassy-sync",
  "leviculum-core",
@@ -3608,15 +3608,15 @@ dependencies = [
 [[package]]
 name = "leviculum-channel-access"
 version = "0.1.0"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "leviculum-core",
 ]
 
 [[package]]
 name = "leviculum-core"
-version = "0.31.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+version = "0.31.1+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "aes 0.8.4",
  "cbc",
@@ -3633,8 +3633,8 @@ dependencies = [
 
 [[package]]
 name = "leviculum-lxmf"
-version = "0.31.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+version = "0.31.1+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "leviculum-core",
  "rand_core 0.6.4",
@@ -3644,8 +3644,8 @@ dependencies = [
 
 [[package]]
 name = "leviculum-std"
-version = "0.31.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+version = "0.31.1+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "bluer",
  "clap",
@@ -3681,7 +3681,7 @@ dependencies = [
 [[package]]
 name = "leviculum-telemetry-policy"
 version = "0.1.0"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 
 [[package]]
 name = "libbz2-rs-sys"

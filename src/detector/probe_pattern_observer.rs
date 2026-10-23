@@ -683,7 +683,7 @@ impl ProbePatternObserver {
                 shape_entropy = verdict.shape_entropy,
                 rate_zscore = verdict.rate_zscore,
                 ks_pvalue = verdict.ks_pvalue,
-                "ProbePatternObserver detection verdict (CIRISEdge#39); no derived-schema handle wired — verdict logged only",
+                "ProbePatternObserver detection verdict (history: CIRISEdge#39); no derived-schema handle wired — verdict logged only",
             );
         }
     }

@@ -1296,7 +1296,7 @@ impl CohortGroupInner {
                 epoch = victim,
                 error = %e,
                 "cohort MLS snapshot prune failed; retained epochs will exceed the window \
-                 (CIRISEdge#499). The current epoch IS durable — this is a storage-growth \
+                 (tracked: CIRISEdge#499). The current epoch IS durable — this is a storage-growth \
                  concern, not a correctness one."
             );
         }
@@ -1967,7 +1967,7 @@ impl CohortGroup {
                 dropped = ?dropped.keys().collect::<Vec<_>>(),
                 "cohort MLS outbox held commits above the durable head (a crash between the \
                  ledger write and the head move); dropped — the group will re-commit \
-                 (CIRISEdge#697)"
+                 (history: CIRISEdge#697)"
             );
         }
         let member_joins = if let Some(joins) = store.member_joins_get(community_id).await? {
@@ -1982,7 +1982,7 @@ impl CohortGroup {
                     community_id,
                     error = %e,
                     "backfilled member-join map could not be written; kept in memory, the \
-                     next commit persists it (CIRISEdge#695)"
+                     next commit persists it (history: CIRISEdge#695)"
                 );
             }
             joins

@@ -195,7 +195,7 @@ impl PersistBlobChunkSource {
                     blob = %dag_hex,
                     error = %e,
                     "PersistBlobChunkSource: the named DAG's binding state could not be read — \
-                     not a member (fail-closed, CIRISEdge#771)"
+                     not a member (fail-closed, history: CIRISEdge#771)"
                 );
                 return DagMembership::NotMember;
             }
@@ -208,7 +208,7 @@ impl PersistBlobChunkSource {
                     blob = %dag_hex,
                     error = %e,
                     "PersistBlobChunkSource: persist's chunk→manifest link could not be read — \
-                     not a member (fail-closed, CIRISEdge#771)"
+                     not a member (fail-closed, history: CIRISEdge#771)"
                 );
                 return DagMembership::NotMember;
             }
@@ -223,7 +223,7 @@ impl PersistBlobChunkSource {
                     blob = %dag_hex,
                     error = %e,
                     "PersistBlobChunkSource: persist's chunk→manifest link could not be read — \
-                     not a member (fail-closed, CIRISEdge#771)"
+                     not a member (fail-closed, history: CIRISEdge#771)"
                 );
                 return DagMembership::NotMember;
             }
@@ -277,7 +277,7 @@ impl PersistBlobChunkSource {
                     blob = %hex::encode(sha),
                     error = %e,
                     "PersistBlobChunkSource: the named DAG's head could not be read — not a \
-                     member (fail-closed, CIRISEdge#771)"
+                     member (fail-closed, history: CIRISEdge#771)"
                 );
                 None
             }
@@ -325,7 +325,7 @@ impl PersistBlobChunkSource {
                     blob = %dag_hex,
                     error = %e,
                     "PersistBlobChunkSource: the rows referencing the named DAG could not be \
-                     read — its stream is unknown (CIRISEdge#717)"
+                     read — its stream is unknown (history: CIRISEdge#717)"
                 );
                 return DagMembership::NotMember;
             }
@@ -369,7 +369,7 @@ impl PersistBlobChunkSource {
                             row = %row.attestation_id,
                             "PersistBlobChunkSource: a row names a stream whose own cohort or \
                              community disagrees with it — not counted as the DAG's stream \
-                             (CIRISEdge#717)"
+                             (history: CIRISEdge#717)"
                         );
                         continue;
                     }

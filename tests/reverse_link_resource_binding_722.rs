@@ -247,6 +247,14 @@ async fn pair(tag: &str, seed_route_at_b: bool) -> Pair {
     })
     .await;
     let port_a = addr_a.port();
+    // CC 5.3.3.5 E1 pre-seal route fetch — the negative control needs B to
+    // hold NO verified route for A for the whole run. B's rounds dial A and
+    // would fetch A's own signed row over the link (the 43.2 behaviour), so
+    // A refuses every route request here (receiver order, cap 0): B can seal
+    // nothing to A and holds nothing of A's but its announce.
+    if !seed_route_at_b {
+        transport_a.set_route_request_cap_for_test(0);
+    }
     let (transport_b, _addr_b) = build_reticulum_with_retry(|| {
         let base = tmp.path().to_path_buf();
         let signer = key_b.signer();
@@ -572,8 +580,11 @@ async fn resource_and_channel_rows_on_a_reverse_link_both_admit_722() {
 /// Negative control — the gate's rule is untouched: with NO hybrid-verified
 /// route for A at B, nothing of A's lands at B. Under CC 5.3.3.5 E1 the route
 /// is also what carries A's transit pair, so B cannot open the link A would
-/// answer on, and A (holding no route for B either) cannot dial B: A's send is
-/// refused by name before any link exists, and the row never lands.
+/// answer on. A, holding no route for B either, dials B through the pre-seal
+/// route fetch (B's own signed row, asked for as the link's first frame) and
+/// may deliver at the transport layer; the #393 item-2 gate at B still holds:
+/// no verified route for A at B (A refuses B's route requests in this
+/// harness, so B cannot fetch one), so the row never lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resource_from_a_peer_with_no_verified_route_is_still_refused_722() {
     let _ = tracing_subscriber::fmt()
@@ -582,12 +593,13 @@ async fn resource_from_a_peer_with_no_verified_route_is_still_refused_722() {
         .try_init();
     let p = pair("refuse", false).await;
     let (frame, ids) = resource_deliver(&p).await;
-    match p.a.send(&p.key_b.key_id, &frame).await {
-        Err(ciris_edge::transport::TransportError::LinkSealRefused { reason, .. }) => {
-            assert_eq!(reason, "link_seal_refused_no_pair");
-        }
-        other => panic!("no route, no pair, no link: {other:?}"),
-    }
+    // Whatever the transport says (delivered on a link keyed by B's fetched
+    // row, or refused), the gate below is what decides whether the row lands.
+    let outcome = p.a.send(&p.key_b.key_id, &frame).await;
+    tracing::info!(
+        ?outcome,
+        "A's send to a B that holds no verified route for A (722)"
+    );
     let landed = wait_until(Duration::from_secs(10), || async {
         holds_any(&p.b_dir, &ids).await
     })
@@ -596,8 +608,14 @@ async fn resource_from_a_peer_with_no_verified_route_is_still_refused_722() {
         !landed,
         "no verified SignedTransportDestination for A at B ⇒ the row must NOT land"
     );
+    // The transport may hand the frame upward UNATTRIBUTED (`source_key_id`
+    // None, which the replication registry refuses, #317); it never
+    // attributes it to A.
+    let seen = p.b_seen.lock().await.clone();
     assert!(
-        !p.b_seen.lock().await.iter().any(|s| s.bytes == frame.len()),
-        "nothing crossed"
+        seen.iter()
+            .filter(|s| s.bytes == frame.len())
+            .all(|s| s.source_key_id.is_none()),
+        "nothing of A's crossed attributed: {seen:?}"
     );
 }

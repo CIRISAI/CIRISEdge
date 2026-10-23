@@ -151,7 +151,7 @@ pub async fn snapshot_for_nodes(
             unresolved = ?unresolved,
             "cohort roster: some members resolve to no node yet — they are NOT in this \
              epoch's address set and become addressable on the next advance after their \
-             announce lands (CIRISEdge#640)"
+             announce lands (history: CIRISEdge#640)"
         );
     }
     snap.members = nodes;

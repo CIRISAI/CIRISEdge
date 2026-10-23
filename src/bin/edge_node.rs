@@ -1587,7 +1587,7 @@ impl Mailbox {
                         kind = dropped.kind(),
                         cap = MAILBOX_DEFERRED_CAP,
                         "control frame DROPPED — the deferred queue is full of frames no \
-                         phase asked for (CIRISEdge#782)"
+                         phase asked for (history: CIRISEdge#782)"
                     );
                 }
             }
@@ -3495,7 +3495,7 @@ async fn run_chat_legs(occ: &Occurrence) {
                 got = ?resolved,
                 elapsed_ms,
                 "owner binding never converged — every fedID lookup against this \
-                 peer stops at owner_of => None (CIRISEdge#568)"
+                 peer stops at owner_of => None (history: CIRISEdge#568)"
             );
         }
         // CIRISEdge#568 — the retry-queue gauges alongside the stopwatch
@@ -4545,7 +4545,7 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
             None => Err(format!("no call address for {m} in the table")),
         };
         if let Err(e) = opened {
-            tracing::warn!(peer = %m, error = %e, "A/V link did not open (CIRISEdge#805)");
+            tracing::warn!(peer = %m, error = %e, "A/V link did not open (tracked: CIRISEdge#805)");
             av_open_failures.push(e);
         }
     }
@@ -4703,7 +4703,7 @@ async fn run_publisher(occ: Occurrence) -> Result<(), String> {
                     None => Err(format!("no call address for {j} in the table")),
                 };
                 if let Err(e) = opened {
-                    tracing::warn!(peer = %j, error = %e, "A/V link did not open (CIRISEdge#805)");
+                    tracing::warn!(peer = %j, error = %e, "A/V link did not open (tracked: CIRISEdge#805)");
                     av_open_failures.push(e);
                 }
             }

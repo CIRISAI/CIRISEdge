@@ -224,7 +224,7 @@ impl TransitGate {
                 tracing::warn!(
                     peer,
                     error = %e,
-                    "transit eligibility resolve failed — refusing hop (fail-closed, #430)"
+                    "transit eligibility resolve failed — refusing hop (fail-closed, history: CIRISEdge#430)"
                 );
                 return false;
             }

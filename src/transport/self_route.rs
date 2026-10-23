@@ -209,9 +209,9 @@ impl SelfSignedRouteProducer {
             if !self.warned_no_pqc.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     key_id = %signer.key_id,
-                    "CIRISEdge#406: cannot emit the hybrid-signed SignedTransportDestination \
+                    "history: CIRISEdge#406: cannot emit the hybrid-signed SignedTransportDestination \
                      — signer has NO ML-DSA-65 (PQC) half. This node is Ed25519-only, so \
-                     CIRISEdge#393 item 2 (hybrid transport binding) is UNSATISFIABLE for it: \
+                     history: CIRISEdge#393 item 2 (hybrid transport binding) is UNSATISFIABLE for it: \
                      peers will drop its frames unattributed at the E3 gate. Provision the \
                      PQC signer half to become attributable (warned once; not per tick)"
                 );
@@ -248,7 +248,7 @@ impl SelfSignedRouteProducer {
                         tracing::warn!(
                             key_id = %signed_row.transport_destination.occurrence_key_id,
                             reason = %reason,
-                            "CIRISEdge#406: own signed route emission REFUSED by the \
+                            "history: CIRISEdge#406: own signed route emission REFUSED by the \
                              monotonic guard — the store holds a newer signed row \
                              (stale local_epoch?)"
                         );
@@ -274,7 +274,7 @@ impl SelfSignedRouteProducer {
                 tracing::warn!(
                     key_id = %signed_row.transport_destination.occurrence_key_id,
                     error = %e,
-                    "CIRISEdge#406: own signed route emission failed at persist's \
+                    "history: CIRISEdge#406: own signed route emission failed at persist's \
                      authenticated admission — item 2 stays unsatisfiable for this node \
                      until it succeeds (will retry on the next announce tick)"
                 );
@@ -313,7 +313,7 @@ impl SelfSignedRouteProducer {
                 tracing::warn!(
                     key_id = %signer.key_id,
                     error = %e,
-                    "CIRISEdge#406: cannot read own signed transport-destination state — \
+                    "history: CIRISEdge#406: cannot read own signed transport-destination state — \
                      bootstrap deferred (will retry on the next announce tick)"
                 );
                 return ControlFlow::Break(SelfRouteOutcome::Deferred(e));
@@ -331,7 +331,7 @@ impl SelfSignedRouteProducer {
                         dest = %want,
                         stored_epoch = td.epoch,
                         config_epoch = epoch,
-                        "CIRISEdge#406: own reticulum route is RETIRED (signed tombstone) \
+                        "history: CIRISEdge#406: own reticulum route is RETIRED (signed tombstone) \
                          at epoch >= this config — NOT auto-resurrecting; bump local_epoch \
                          to assert a new binding"
                     );
@@ -354,7 +354,7 @@ impl SelfSignedRouteProducer {
                     config_epoch = epoch,
                     stored_dest = %td.destination,
                     dest = %want,
-                    "CIRISEdge#406: stored signed route carries a NEWER epoch than this \
+                    "history: CIRISEdge#406: stored signed route carries a NEWER epoch than this \
                      config (config stale — a later emission superseded it); not emitting"
                 );
             }
@@ -467,7 +467,7 @@ async fn build_and_sign_self_route(
     let mut envelope = serde_json::to_value(&row).map_err(|e| {
         // Structural — a typed row always serializes; keep the arm loud
         // rather than unwrap in prod code.
-        tracing::warn!(error = %e, "CIRISEdge#406: route envelope serialize failed");
+        tracing::warn!(error = %e, "history: CIRISEdge#406: route envelope serialize failed");
         SelfRouteOutcome::Deferred(format!("envelope serialize: {e}"))
     })?;
     if let Some(pair) = transit {
@@ -479,17 +479,17 @@ async fn build_and_sign_self_route(
         obj.insert(TRANSIT_KEX_PUBKEYS_MEMBER.into(), transit_kex_member(pair));
     }
     let bytes = ceg_produce_canonicalize(&envelope).map_err(|e| {
-        tracing::warn!(error = %e, "CIRISEdge#406: route envelope JCS canonicalize failed");
+        tracing::warn!(error = %e, "history: CIRISEdge#406: route envelope JCS canonicalize failed");
         SelfRouteOutcome::Deferred(format!("canonicalize: {e}"))
     })?;
     let ed = signer.classical.sign(&bytes).await.map_err(|e| {
-        tracing::warn!(error = %e, "CIRISEdge#406: ed25519 sign failed");
+        tracing::warn!(error = %e, "history: CIRISEdge#406: ed25519 sign failed");
         SelfRouteOutcome::Deferred(format!("ed25519 sign: {e}"))
     })?;
     let mut bound = bytes;
     bound.extend_from_slice(&ed);
     let mldsa = pqc.sign(&bound).await.map_err(|e| {
-        tracing::warn!(error = %e, "CIRISEdge#406: ml-dsa-65 sign failed");
+        tracing::warn!(error = %e, "history: CIRISEdge#406: ml-dsa-65 sign failed");
         SelfRouteOutcome::Deferred(format!("ml-dsa-65 sign: {e}"))
     })?;
     Ok(SignedTransportDestination {

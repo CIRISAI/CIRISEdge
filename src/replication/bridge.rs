@@ -3009,7 +3009,7 @@ impl FederationDirectoryReplicationBridge {
                  JUDGE, which is not `signer_not_seated`; `unresolved` means the verdict \
                  was never resolved rather than refused on its merits; and \
                  `object_root_unnamed` means the row's SIGNED bytes name no accord, so \
-                 there is nothing to judge it against — CIRISPersist#731)"
+                 there is nothing to judge it against — history: CIRISPersist#731)"
             );
         }
         true
@@ -3248,7 +3248,7 @@ impl FederationDirectoryReplicationBridge {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "accord-quorum-evidence cursor serve read failed (CIRISEdge#474)"
+                    "accord-quorum-evidence cursor serve read failed (history: CIRISEdge#474)"
                 );
                 return (Vec::new(), 0, None);
             }
@@ -3275,7 +3275,7 @@ impl FederationDirectoryReplicationBridge {
                         error = %e,
                         "accord-quorum-evidence bundle could not be serialized for \
                          the wire — OMITTED from this cursor page; it will not \
-                         replicate from this node (CIRISEdge#474/#433)"
+                         replicate from this node (history: CIRISEdge#474, history: CIRISEdge#433)"
                     );
                     self.withhold(
                         crate::observability::WithholdReason::RowNotSerializable,
@@ -3444,7 +3444,7 @@ impl FederationDirectoryReplicationBridge {
                         "holdings drain CANNOT ADVANCE — a full page came back with \
                          no new resume cursor, so this round's holdings view is \
                          truncated and rows past it are re-wanted from peers even \
-                         though they are held (CIRISEdge#531)"
+                         though they are held (history: CIRISEdge#531)"
                     );
                     break;
                 }
@@ -3458,7 +3458,7 @@ impl FederationDirectoryReplicationBridge {
                          TRUNCATED, so rows past the cap are re-wanted from peers even \
                          though they are held (wasteful, self-correcting). Raise \
                          `sweep_page_rows` or investigate a plane this large \
-                         (CIRISEdge#531)"
+                         (history: CIRISEdge#531)"
                     );
                 }
             }
@@ -3578,7 +3578,7 @@ impl FederationDirectoryReplicationBridge {
                 site,
                 "trace plane PAUSED by mesh config — a trust root relieved \
                  `feature.trace_replication` to 0, so `trace:*` rows are withheld \
-                 until the relief expires or is superseded (CIRISEdge#440)"
+                 until the relief expires or is superseded (history: CIRISEdge#440)"
             );
         }
     }
@@ -3802,7 +3802,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                         signer = %signer_key_id,
                         cap = MISSING_SIGNER_CAP,
                         "missing-signer set at cap with no source hoarding — \
-                         DROPPING this name (CIRISEdge#552)"
+                         DROPPING this name (history: CIRISEdge#552)"
                     );
                     return;
                 }
@@ -4317,8 +4317,8 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     requester = ?other,
                     kind = ?kind,
                     "subject Pull refused: requester is not the subject and this kind \
-                     is not publicly pullable — serving nothing (#462 fail-closed; \
-                     #552 widened only the unconditionally-public planes)"
+                     is not publicly pullable — serving nothing (history: CIRISEdge#462 fail-closed; \
+                     history: CIRISEdge#552 widened only the unconditionally-public planes)"
                 );
                 Vec::new()
             }
@@ -4852,7 +4852,7 @@ impl FederationDirectoryReplicationBridge {
                 suppressed_prev,
                 "the park capacity is full: evicted the oldest parked row(s); each will be \
                  asked for once more and re-parked if its signer is still absent \
-                 (CIRISEdge#858)"
+                 (tracked: CIRISEdge#858)"
             );
         }
     }
@@ -5259,7 +5259,7 @@ impl FederationDirectoryReplicationBridge {
                 "subject-Pull attestation read REFUSED by this directory: serving an \
                  EMPTY axis. This is permanent on this directory (a proxy that does \
                  not serve the read), NOT a statement the subject has no testimony, \
-                 and a re-pull will not change it (persist #1001, CIRISEdge#462)"
+                 and a re-pull will not change it (history: CIRISPersist#1001, history: CIRISEdge#462)"
             );
         } else {
             tracing::warn!(
@@ -5269,7 +5269,7 @@ impl FederationDirectoryReplicationBridge {
                 "subject-Pull attestation read FAILED: serving an EMPTY axis this \
                  round (a transient backend fault, NOT a statement the subject has \
                  no testimony; the requester re-pulls next round) \
-                 (CIRISEdge#462/#429, persist #1001)"
+                 (history: CIRISEdge#462, history: CIRISEdge#429, history: CIRISPersist#1001)"
             );
         }
     }
@@ -5309,7 +5309,7 @@ impl FederationDirectoryReplicationBridge {
                                 "subject-Pull ", $what, " read FAILED — serving an \
                                  EMPTY axis this round (a transient read error, NOT \
                                  a statement the subject has no testimony; the \
-                                 requester re-pulls next round) (CIRISEdge#462/#429)"
+                                 requester re-pulls next round) (history: CIRISEdge#462, history: CIRISEdge#429)"
                             )
                         );
                         Vec::new()
@@ -6199,7 +6199,7 @@ impl FederationDirectoryReplicationBridge {
                 tracing::warn!(
                     "advertise_since: a row could not be serialized to its content \
                      hash and is OMITTED from the advertise set — it will not replicate \
-                     (CIRISEdge#425)"
+                     (history: CIRISEdge#425)"
                 );
                 // CIRISEdge#433 — and it COUNTS. This is what took `&self`: a plane
                 // going dark for a non-policy reason is the one withhold an
@@ -6551,8 +6551,8 @@ impl FederationDirectoryReplicationBridge {
                         kind = index_kind,
                         error = %e,
                         "wire-hash holdings read failed — falling back to the ROW \
-                         scan (correct, but this is the O(corpus) read CIRISEdge#547 \
-                         is about). A backend predating CIRISPersist#780 reports \
+                         scan (correct, but this is the O(corpus) read history: CIRISEdge#547 \
+                         is about). A backend predating history: CIRISPersist#780 reports \
                          Unsupported here."
                     );
                     return None;
@@ -6569,7 +6569,7 @@ impl FederationDirectoryReplicationBridge {
                         hash = %hex_hash,
                         "wire-hash index returned an undecodable content hash — \
                          refusing the index read rather than returning a SHORT \
-                         holdings set (CIRISEdge#547)"
+                         holdings set (history: CIRISEdge#547)"
                     );
                     return None;
                 };
@@ -6593,7 +6593,7 @@ impl FederationDirectoryReplicationBridge {
             kind = index_kind,
             pages = MAX_FULL_DRAIN_PAGES,
             "wire-hash holdings drain hit the page cap — refusing rather than \
-             returning a truncated holdings set (CIRISEdge#547)"
+             returning a truncated holdings set (history: CIRISEdge#547)"
         );
         None
     }
@@ -6672,7 +6672,7 @@ impl FederationDirectoryReplicationBridge {
                 "attestation DECLINED from the advertise set — `cohort_scope` is \
                  present but EMPTY (malformed: the column is a closed set). A \
                  missing key means `federation` by persist's serde contract; an \
-                 empty one means the row is bad (CIRISEdge v17.7.0 / CIRISPersist#713)"
+                 empty one means the row is bad (CIRISEdge v17.7.0 / history: CIRISPersist#713)"
             );
             return false;
         }
@@ -7333,7 +7333,7 @@ impl FederationDirectoryReplicationBridge {
                             error = %e,
                             "quarantine consult FAILED for a row's author — withholding \
                              the author's rows from the offer (fail-closed; a transient \
-                             read error, NOT a quarantine verdict; CIRISEdge#440)"
+                             read error, NOT a quarantine verdict; history: CIRISEdge#440)"
                         );
                     }
                     QuarantineConsult::ReadError
@@ -7832,10 +7832,44 @@ impl FederationDirectoryReplicationBridge {
         // node's own self-authenticating facts, the Attestation-plane twins of the
         // bootstrap kinds, and cross to an Attributed peer. Everything this node
         // holds ABOUT OTHERS stays behind the floor.
+        // CIRISEdge#882 (CC rc9 I3) — the exemption is the node's ALLEGIANCE
+        // FACTS (owner-binding, acceptances, self-charter: the rows that
+        // establish Rooted), never "anything self-authored": a self-authored
+        // consent grant, score or content row ABOUT A THIRD PARTY at
+        // federation scope stays behind the floor until Rooted. Two
+        // self-authored shapes still cross: a row whose data subject is the
+        // peer itself (its consent grant, a row addressed to it) is not
+        // "about others" to that peer, as #756's carve reasons; and a
+        // COHORT-DELIVERED row (a `self` or `family` placement whose audience
+        // check the peer already passed) is owed
+        // to that peer by CC 6.1.5.3 and CC 5.2 — a self-scope holding claim
+        // reaches the owner's other device whether or not the two devices
+        // are Rooted at each other (the v43.2 PR run's blob_federation_e2e
+        // finding). Cohort-delivered = a targeted placement (`self`,
+        // `family`, `community`, `affiliations`): membership is the
+        // authority there and persist's audience check above already put the
+        // peer among its members — an invited stranger who joined a community
+        // receives its rows without sharing a trust root with the author (CC
+        // 3.1.3.2; `membership_first_contact_756`, the second PR run's
+        // finding). The floor narrows the federation-scope planes, which is
+        // what CC rc9 I3 is about.
+        let cohort_delivered = matches!(
+            audience,
+            ciris_persist::federation::Audience::SelfOnly
+                | ciris_persist::federation::Audience::Family { .. }
+                | ciris_persist::federation::Audience::Community { .. }
+                | ciris_persist::federation::Audience::Affiliations { .. }
+        );
         let self_authored = self
             .self_provider
             .as_ref()
-            .is_some_and(|p| p().iter().any(|id| id == attester));
+            .is_some_and(|p| p().iter().any(|id| id == attester))
+            && (cohort_delivered
+                || row
+                    .get("attested_key_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(peer)
+                || self.attestation_is_allegiance_fact(row, memo).await);
         // CIRISEdge#756 — and the membership ceremony addressed to the peer's
         // own person (§2.4): the invitation names the peer's person as its data
         // subject and the answer replies to the peer's person's own proposal, so
@@ -7935,7 +7969,7 @@ impl FederationDirectoryReplicationBridge {
         let Some(local) = self.local_key_id.as_deref() else {
             tracing::warn!(
                 peer = peer_label,
-                "attestation plane withheld — no `local_key_id` to resolve the CIRISEdge#396 \
+                "attestation plane withheld — no `local_key_id` to resolve the history: CIRISEdge#396 \
                  consent send-set; wire ReplicationRuntimeConfig::local_key_id"
             );
             self.withhold(
@@ -8093,7 +8127,7 @@ impl FederationDirectoryReplicationBridge {
                 "attestation plane withheld — the inbound round is attributed to an EMPTY \
                  peer key_id, so no consent:replication grant can ever match it. This is a \
                  WIRING fault in the host's listen loop (the peer id handed to \
-                 `route_inbound_bytes`), not a consent decision (CIRISEdge#524)"
+                 `route_inbound_bytes`), not a consent decision (history: CIRISEdge#524)"
             );
             return;
         }
@@ -8126,15 +8160,15 @@ impl FederationDirectoryReplicationBridge {
                 suppressed_prev,
                 "attestation plane withheld — the live consent:replication send-set does NOT \
                  name this peer, but DOES name its OWNER, and the reverse owner-binding walk \
-                 (persist `nodes_owned_by`, CIRISPersist#764) did NOT return this peer. Since \
+                 (persist `nodes_owned_by`, history: CIRISPersist#764) did NOT return this peer. Since \
                  v18.5.0 a person-named grant IS routed to that person's bound nodes, so the \
                  two walks disagreeing means one of: the node carries more than one live \
                  owner (`AmbiguousNodeOwner` — the reverse walk skips it, and an ambiguous \
                  owner is not a resolvable recipient), or the owner-binding landed inside the \
                  send-set memo window and routes next round, or `owner_walk_complete=false` \
                  (this subject's walk errored and its nodes are fail-closed OUT this round). \
-                 A grant naming the peer NODE (CIRISServer#472) sidesteps all three \
-                 (CIRISEdge#524, CIRISEdge#396 item 1)"
+                 A grant naming the peer NODE (history: CIRISServer#472) sidesteps all three \
+                 (history: CIRISEdge#524, history: CIRISEdge#396 item 1)"
             );
         }
     }
@@ -8441,7 +8475,7 @@ impl FederationDirectoryReplicationBridge {
                     budget,
                     "Attestation holdings drain CANNOT ADVANCE — a full page came \
                      back with no new resume cursor; this round's holdings view is \
-                     truncated (CIRISEdge#531)"
+                     truncated (history: CIRISEdge#531)"
                 );
                 break;
             }
@@ -8452,7 +8486,7 @@ impl FederationDirectoryReplicationBridge {
                     budget,
                     "Attestation holdings drain hit the page CAP — this round's holdings \
                      view is TRUNCATED, so held rows past the cap are re-wanted from peers \
-                     (wasteful, self-correcting). Raise `sweep_page_rows` (CIRISEdge#531)"
+                     (wasteful, self-correcting). Raise `sweep_page_rows` (history: CIRISEdge#531)"
                 );
             }
         }
@@ -8797,7 +8831,7 @@ impl FederationDirectoryReplicationBridge {
                 bound_secs = RESWEEP_CYCLE_BOUND.as_secs(),
                 "re-sweep cycle has NOT completed within its bound: a row this node passed \
                  (skipped, or offered and lost) waits this long to be re-offered; the plane is \
-                 large for the page budget, or new rows keep the re-sweep starved (CIRISEdge#531)"
+                 large for the page budget, or new rows keep the re-sweep starved (history: CIRISEdge#531)"
             );
         }
     }
@@ -9448,7 +9482,7 @@ impl FederationDirectoryReplicationBridge {
                 rule = e.rule().unwrap_or("-"),
                 retryable = e.is_retryable(),
                 error = %e,
-                "membership widening on acceptance refused (CIRISPersist#955)"
+                "membership widening on acceptance refused (history: CIRISPersist#955)"
             ),
         }
     }
@@ -10532,7 +10566,7 @@ impl FederationDirectoryReplicationBridge {
                          Install `ReplicationRuntimeConfig::engine` (an \
                          `Engine::from_shared_with_local` view over this substrate; \
                          `PersistGroupContentStore::from_shared_hybrid` builds it) and the \
-                         next re-apply projects it (CIRISPersist#848 / CIRISEdge#601)"
+                         next re-apply projects it (history: CIRISPersist#848 / history: CIRISEdge#601)"
                     );
                 }
                 // Hash the BARE attestation — the value persist's content-hash
@@ -11064,7 +11098,7 @@ impl FederationDirectoryReplicationBridge {
                                 classified = stored_clock.is_some(),
                                 "replicated route CONTENT CONFLICT at same (epoch, \
                                  asserted_at) — split-truth signal, not applied \
-                                 (CIRISEdge#338/#425; `classified=false` = the stored row \
+                                 (history: CIRISEdge#338, history: CIRISEdge#425; `classified=false` = the stored row \
                                  could not be re-read, refusing loud rather than laundering)"
                             );
                             // CIRISEdge#544 — the two sub-arms this branch fuses
@@ -23544,13 +23578,29 @@ pub(crate) mod tests {
         let publish = vec![local.to_string()];
         let bridge = bridge.with_self_provider(Some(Arc::new(move || publish.clone())));
         seed_advertised_attestation(&backend, local).await;
+        // CIRISEdge#882 (CC rc9 I3) — a self-authored row that is NOT an
+        // allegiance fact and is about a THIRD PARTY (`local`'s consent grant
+        // to `producer`) is content to the peer: it stays behind the floor.
+        seed_consent_membership_unrooted(&backend, local, producer).await;
         let served = bridge.list_attestations_for_peer(Some(peer)).await;
         assert_eq!(
             served.len(),
             2,
-            "exactly the self-authored rows cross to an Attributed peer — the row `local` \
-             just authored AND the consent row `local` authored about the peer; the third \
-             party's stays behind the floor: {served:?}"
+            "exactly the self-authored ALLEGIANCE rows and the rows about the peer itself \
+             cross to an Attributed peer — the self-charter `local` just authored AND the \
+             consent row `local` authored about the peer; `local`'s score of a third party \
+             and the third party's own row stay behind the floor (CIRISEdge#659, #882): \
+             {served:?}"
+        );
+        assert!(
+            metrics
+                .snapshot()
+                .withholds_by_reason
+                .get(&WithholdReason::RecipientNotRooted)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "the self-authored third-party grant is booked under the floor, not served (#882)"
         );
 
         // Both subjects accept one valid root: the third party's row now reaches the peer too.

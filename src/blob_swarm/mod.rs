@@ -114,8 +114,22 @@ pub struct SwarmConfig {
     pub error_strike_limit: u32,
     /// Per-request timeout. A holder that doesn't respond in this
     /// window is penalized via EWMA but not demoted (could be
-    /// transient network) — chunk is re-queued elsewhere.
+    /// transient network) — chunk is re-queued elsewhere. A timeout is
+    /// SILENCE, not an error strike (CIRISEdge#887): the holder is retired
+    /// only once it has been silent for `error_strike_limit` windows of
+    /// wall-clock time ([`PeerState::record_timeout`]), however many
+    /// requests timed out inside them.
     pub per_request_timeout: Duration,
+}
+
+impl SwarmConfig {
+    /// CIRISEdge#887 — how long a holder may stay silent before it is retired
+    /// for the session: `error_strike_limit` per-request windows.
+    #[must_use]
+    pub fn silence_limit(&self) -> Duration {
+        self.per_request_timeout
+            .saturating_mul(self.error_strike_limit.max(1))
+    }
 }
 
 impl Default for SwarmConfig {
@@ -163,6 +177,10 @@ pub struct PeerState {
     /// CIRISEdge#616 — transport errors from this peer this session.
     pub error_strikes: u32,
     pub demoted: bool,
+    /// CIRISEdge#887 — when the earliest request still unanswered by this
+    /// peer was sent, if any of its requests has timed out since the peer
+    /// last answered. Cleared by any answer ([`Self::record_answer`]).
+    pub silent_since: Option<Instant>,
 }
 
 impl PeerState {
@@ -195,6 +213,40 @@ impl PeerState {
         if self.error_strikes >= limit {
             self.demoted = true;
         }
+    }
+
+    /// CIRISEdge#887 — a request sent at `sent_at` timed out at `now`.
+    ///
+    /// A timeout is SILENCE, not a refusal: the answer is often still on the
+    /// way (a ~1 MB chunk behind a congested link). Counting each timeout as
+    /// an error strike retired a single holder after ONE stall, because the
+    /// K lanes it served all timed out inside the same window — three
+    /// strikes from one event, and every later chunk of the pull failed with
+    /// "no holders left". Silence is measured in wall-clock time instead:
+    /// the peer is retired once nothing has come back from it for
+    /// `silence_limit` since the earliest request still unanswered. Timeouts
+    /// that overlap in one stall share one silence, so K lanes cannot
+    /// multiply it, and a holder that never answers is still retired, never
+    /// re-dispatched forever (#616's bound, kept).
+    pub fn record_timeout(
+        &mut self,
+        sent_at: Instant,
+        now: Instant,
+        timeout: Duration,
+        alpha: f64,
+        silence_limit: Duration,
+    ) {
+        self.record_rtt(timeout, alpha);
+        let since = self.silent_since.map_or(sent_at, |s| s.min(sent_at));
+        self.silent_since = Some(since);
+        if now.saturating_duration_since(since) >= silence_limit {
+            self.demoted = true;
+        }
+    }
+
+    /// CIRISEdge#887 — the peer answered (bytes or a miss): it is not silent.
+    pub fn record_answer(&mut self) {
+        self.silent_since = None;
     }
 
     /// True when the peer is both not-demoted AND has capacity for
@@ -353,6 +405,7 @@ pub mod meaning;
 pub use meaning::{BlobMeaning, MeaningRefusal};
 #[cfg(test)]
 pub(crate) mod chunk_grants_779_tests;
+pub(crate) mod chunk_waits;
 #[cfg(test)]
 mod dag_gone_terminal_tests;
 pub mod durability;
@@ -750,8 +803,11 @@ enum FetchResultBody {
     ChunkMiss {
         reason: String,
     },
-    /// Transport / timeout. The string is for logging surface.
+    /// Transport error. The string is for logging surface.
     Error(#[allow(dead_code)] String),
+    /// CIRISEdge#887 — no answer within the per-request timeout: silence,
+    /// not a refusal ([`PeerState::record_timeout`]).
+    Timeout,
 }
 
 /// CIRISEdge#581 — one process-lifetime WARN when the store gate is not
@@ -771,7 +827,7 @@ fn warn_store_gate_unarmed() {
         tracing::warn!(
             "blob STORE gate UNARMED — no BlobStorePolicy is installed, so this \
              node accepts whatever it fetches without checking provenance, \
-             audience or operator consent (CIRISEdge#581). The three projection \
+             audience or operator consent (history: CIRISEdge#581). The three projection \
              rules are not enforced on this node. Arming is an OPERATOR OPT-IN: \
              install a policy via SwarmScheduler::with_store_policy. Warned once \
              per process."
@@ -890,7 +946,7 @@ pub(crate) async fn store_admission_with(
                  one default this stack must never adopt. Call \
                  `fetch_blob_scoped` with the BlobMeaning projected from that \
                  row (`BlobMeaning::project`) instead of `fetch_blob` \
-                 (CIRISEdge#581/#586)"
+                 (history: CIRISEdge#581, history: CIRISEdge#586)"
             );
             return Err(SwarmError::StoreRefused {
                 blob_sha: hex::encode(blob_sha256),
@@ -1258,6 +1314,7 @@ impl SwarmScheduler {
                     let rtt = outcome.started_at.elapsed();
                     if let Some(state) = peers.get_mut(&outcome.peer_key_id) {
                         state.record_rtt(rtt, self.config.ewma_alpha);
+                        state.record_answer();
                     }
 
                     // Endgame duplicate: another holder may have
@@ -1296,6 +1353,9 @@ impl SwarmScheduler {
                     // (Body of `ChunkResult::ChunkMiss` is formatted via
                     // `format!("{:?}", miss.reason)` so the variants
                     // match `MissReason`'s Debug repr.)
+                    if let Some(state) = peers.get_mut(&outcome.peer_key_id) {
+                        state.record_answer();
+                    }
                     let r = reason.as_str();
                     if r.contains("Withdrawn") || r.contains("Revoked") {
                         return Err(SwarmError::GoneFederationWide(blob_hex));
@@ -1321,8 +1381,34 @@ impl SwarmScheduler {
                         pending.push_back(outcome.chunk_sha);
                     }
                 }
+                FetchResultBody::Timeout => {
+                    // CIRISEdge#887 — silence, measured in wall-clock time:
+                    // overlapping timeouts from one stall do not add up.
+                    if let Some(state) = peers.get_mut(&outcome.peer_key_id) {
+                        state.record_timeout(
+                            outcome.started_at,
+                            Instant::now(),
+                            self.config.per_request_timeout,
+                            self.config.ewma_alpha,
+                            self.config.silence_limit(),
+                        );
+                        if state.demoted {
+                            tracing::warn!(
+                                holder = %outcome.peer_key_id,
+                                silent_for_secs = state
+                                    .silent_since
+                                    .map_or(0, |s| s.elapsed().as_secs()),
+                                "swarm: holder retired for this fetch after answering nothing \
+                                 for the silence limit (history: CIRISEdge#887)"
+                            );
+                        }
+                    }
+                    if !chunk_bytes.contains_key(&outcome.chunk_sha) {
+                        pending.push_back(outcome.chunk_sha);
+                    }
+                }
                 FetchResultBody::Error(reason) => {
-                    // Transport/timeout — penalize via a synthetic
+                    // Transport error — penalize via a synthetic
                     // RTT sample of the configured per-request timeout
                     // (worst plausible), then re-queue.
                     if let Some(state) = peers.get_mut(&outcome.peer_key_id) {
@@ -1337,7 +1423,7 @@ impl SwarmScheduler {
                                 strikes = state.error_strikes,
                                 %reason,
                                 "swarm: holder retired for this fetch after repeated \
-                                 dispatch errors (CIRISEdge#616)"
+                                 dispatch errors (history: CIRISEdge#616)"
                             );
                         }
                     }
@@ -1405,7 +1491,7 @@ impl SwarmScheduler {
             tracing::error!(
                 holder = %peer,
                 "swarm dispatch reached an UNROUTED holder — refusing to fall back to \
-                 the federation address (CIRISEdge#499)",
+                 the federation address (tracked: CIRISEdge#499)",
             );
             return;
         };
@@ -1423,6 +1509,9 @@ impl SwarmScheduler {
                 Ok(crate::ChunkResult::Bytes(bytes)) => FetchResultBody::Bytes(bytes),
                 Ok(crate::ChunkResult::ChunkMiss { reason }) => {
                     FetchResultBody::ChunkMiss { reason }
+                }
+                Err(crate::EdgeError::Transport(crate::TransportError::Timeout(_))) => {
+                    FetchResultBody::Timeout
                 }
                 Err(e) => FetchResultBody::Error(e.to_string()),
             };
@@ -1761,6 +1850,54 @@ mod tests {
         assert!(p.demoted, "third strike: retired for the session");
         assert!(!p.can_accept(4));
         assert_eq!(SwarmConfig::default().error_strike_limit, 3);
+    }
+
+    /// CIRISEdge#887 — the field failure: one stall times out every lane the
+    /// single holder serves at once. Those timeouts share ONE silence, so the
+    /// holder stays a candidate; before the fix each was an error strike and
+    /// three lanes retired the only holder, failing every later chunk.
+    #[test]
+    fn overlapping_timeouts_of_one_stall_do_not_retire_the_holder_887() {
+        let cfg = SwarmConfig::default();
+        let t = cfg.per_request_timeout;
+        let mut p = PeerState::default();
+        let sent = Instant::now();
+        for lane in 0..8u64 {
+            // Eight lanes, sent within a second, all timing out together.
+            let sent_at = sent + Duration::from_millis(lane * 100);
+            p.record_timeout(sent_at, sent_at + t, t, cfg.ewma_alpha, cfg.silence_limit());
+        }
+        assert!(!p.demoted, "one stall is one silence, not eight strikes");
+        assert_eq!(p.error_strikes, 0, "a timeout is never an error strike");
+        // An answer ends the silence; a second stall starts a fresh one.
+        p.record_answer();
+        let later = sent + Duration::from_secs(120);
+        p.record_timeout(later, later + t, t, cfg.ewma_alpha, cfg.silence_limit());
+        assert!(!p.demoted);
+    }
+
+    /// CIRISEdge#887 keeps #616's bound: a holder that answers NOTHING is
+    /// retired once its silence reaches the limit, so a pull still ends.
+    #[test]
+    fn a_holder_silent_for_the_limit_is_retired_887() {
+        let cfg = SwarmConfig::default();
+        let t = cfg.per_request_timeout;
+        assert_eq!(cfg.silence_limit(), t * cfg.error_strike_limit);
+        let mut p = PeerState::default();
+        let t0 = Instant::now();
+        // Back-to-back retries of one chunk, never answered.
+        p.record_timeout(t0, t0 + t, t, cfg.ewma_alpha, cfg.silence_limit());
+        p.record_timeout(t0 + t, t0 + t * 2, t, cfg.ewma_alpha, cfg.silence_limit());
+        assert!(!p.demoted, "60 s of silence: still a candidate");
+        p.record_timeout(
+            t0 + t * 2,
+            t0 + t * 3,
+            t,
+            cfg.ewma_alpha,
+            cfg.silence_limit(),
+        );
+        assert!(p.demoted, "90 s of silence: retired for the session");
+        assert!(!p.can_accept(4));
     }
 
     // ── CIRISEdge#499: holder routing ────────────────────────────────

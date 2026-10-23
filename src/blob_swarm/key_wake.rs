@@ -123,7 +123,7 @@ impl KeyWaits {
                     tracing::warn!(
                         dropped = %hex::encode(oldest),
                         "parked-DAG key register FULL — dropped the oldest; a grant for it \
-                         no longer wakes its pull (CIRISEdge#779)"
+                         no longer wakes its pull (history: CIRISEdge#779)"
                     );
                 }
             }
