@@ -119,6 +119,10 @@ without double counting. That is the correlated-source discount solved by constr
 Any node may also fold the composites it receives into its own fleet estimate. That estimate is local and is
 never published as a composite.
 
+> **Superseded by section 10** (steward ruling, 2026-10-22): v1 is secret-shared across two seats. Sections
+> 3.1–3.4 record the single-seat design the ruling replaced. Persist's door rules in 3.1 carry over to the
+> share rows in section 10.
+
 ### 3.3 The anonymity boundary, stated honestly
 
 The seat that receives a return learns that a node sent it. There are two ways to handle this:
@@ -405,3 +409,116 @@ source, under four constraints.
 
 The census does not replace persist's quorum math. It supplies the one input that is missing, the base, and
 carries the tally in a shape outsiders cannot see.
+
+---
+
+## 10. v1: secret-shared returns and ballots (steward ruling, 2026-10-22)
+
+The steward locked v1 as **secret-shared**, following DAP/Prio and Tor's secret-shared counters. Each value
+is split into two additive shares and each share goes to a different aggregator. Neither aggregator sees any
+node's return or any member's vote. Participation stays visible. Sharing is information-theoretic, so value
+privacy needs no post-quantum assumption, and section 3.3's v2 credential path is no longer needed for it.
+Accepted numbers: k = 10 owners per cell (now a backstop), a base fall of at most 10% per period, the 50%
+stable-composite floor, and the partition freeze. Differential-privacy noise on small cells is an optional
+layer, not v1.
+
+### 10.1 The report: one-hot histograms with a validity proof
+
+The range check cannot be a clamp at the seat. A seat holds a uniformly random share and cannot tell a
+legitimate value from an inflated one, so a node could send shares that sum to any value at all. v1 uses a
+**proof**:
+
+- Every field of a return is a **one-hot vector over its log2 buckets**: bucket b of B carries 1, every other
+  bucket 0. A count of 2,000 rows is a 1 in bucket 11.
+- The node secret-shares the vector over a prime field and attaches a **fully linear validity proof**, as in
+  Prio3's histogram type (draft-irtf-cfrg-vdaf, `Prio3Histogram`). The two seats jointly check that every
+  entry is 0 or 1 and the entries sum to 1, exchanging one verifier message per report, without either
+  learning the vector. The proof uses only symmetric primitives, so no public-key assumption enters here
+  either.
+- A valid report therefore adds **exactly one count to exactly one bucket** per field. That is the AV-90
+  bucket ceiling, enforced cryptographically rather than trusted.
+- A composite is a **histogram per field per cell**. Any reader computes the median bucket and the trimmed
+  statistics from it. A count field such as "node present" is the histogram's total.
+- Candidate implementation: the `prio` crate (divviup), which implements the draft's histogram type. Its
+  version and fit are to be checked before any code is written.
+
+Because every accepted report from one owner contributes mass 1, the dominance gate holds by construction:
+`n_eff` equals `source_count`. The gate stays on as a check on the seats.
+
+### 10.2 The two aggregators
+
+- **For census returns: two seats per period**, the same pair for every node, chosen by
+  `H(period ‖ class)` from the signed seat order. Persist proposes the canonical community's `group:roster`
+  as that order. One pair per period gives one composite per class, and the k floor is never split across
+  pairs. The pair rotates every period.
+- **Until the seat order is a signed row**, the pair is the sender's choice among seats, and the door checks
+  only that each recipient is a seat. For **value privacy** this costs nothing: a node that sends both
+  shares to colluding seats exposes only its own return. It does cost the load-balance check of AV-95.
+- **For ballots and the expected-active base: two community members, not federation seats.** A community
+  cell sent to an outside seat would tell that seat which nodes share a community, and when. That is a
+  co-membership leak the shares cannot hide. The two tally aggregators are drawn from the MLS roster by
+  `H(group_exporter_secret ‖ period)`, and the shares ride the community's sealed member plane. Nothing
+  leaves the community. **This is edge's recommendation against the ruling's "two seats" for ballots. The
+  steward should confirm it.**
+
+### 10.3 What an aggregator stores for a period
+
+| Held | Lifetime |
+|---|---|
+| Per report: its share and its proof share, until both aggregators have verified it | deleted at verification |
+| Per (class, cell, field): the running sum of accepted shares, a vector of B field elements | until the partial is published |
+| The accepted token set: one `H(node_secret ‖ period)` per accepted report (per owner for community cells), for de-duplication and the commitment | until the partial is published |
+| The partial itself | published, then kept per the retention rule |
+
+A rejected report is dropped. Its token is recorded so a resend in the same period is refused.
+
+### 10.4 Rows
+
+| Row | Placement | Signer and door rules |
+|---|---|---|
+| `census:share:v1` | `addressed` (persist's new class), one per node per period **per aggregator**, so two rows | the node (hybrid). `for_key_id` is one of the period's two seats (`census_share_recipient_not_seat`). Members: `period`, `class`, `return_token`, `share_index` (0 or 1). Body: the share and proof share, seed-compressed for one of the two. `expires_at` is the period end (`census_return_expired`). |
+| `census:partial:{class}:v1` | Commons, federation scope | one of the period's two seats (`census_partial_signer_not_period_seat`). Members: `period`, `share_index`, `source_count`, `member_commitment_hex` over the accepted token set, the partial vectors. One per (seat, class, period), a later one only as `supersedes`. |
+| `census:composite:{class}:v1` | Commons, federation scope | the period's first seat. Members: both partials' row hashes, the summed histograms, `source_count`, `n_eff`, `mass_total`, `member_commitment_hex`, `aggregation_algorithm_id`, `version = 3`. `source_count < k` refused per cell (`census_composite_below_k`). |
+| `census:ballot:share:v1` and the expected-active cell | `addressed` inside the community's member plane, scope community | the member (hybrid). `for_key_id` is one of the period's two tally members, drawn from the roster. Emitted every period at fixed size, with a ballot field that is a one-hot over the ballot's options plus "none". |
+| `census:tally:partial:v1` and `census:tally:v1` | Targeted(Room) | the two tally members, then the first of them. Same shape as the census partial and composite, never leaving the room. |
+
+### 10.5 Sum verification, by anyone holding the rows
+
+1. Both partials carry the **same** `member_commitment_hex` and `source_count`. Both aggregators accepted the
+   same set of reports, which the proof exchange forces them to agree on.
+2. `composite = partial_0 + partial_1` element-wise in the field. Each partial alone is uniformly
+   distributed over the field, so publishing partials reveals nothing.
+3. In every field's histogram, the bucket counts sum to `source_count`, and `mass_total = source_count`.
+   Persist checks this at the door.
+4. Every published cell has `source_count ≥ k`. Smaller cells are withheld as "below the floor".
+5. A contributor fetches its token's Merkle path against `member_commitment_hex` (`verify_member_commitment`).
+
+### 10.6 What changes in the threat rows
+
+- **AV-90, stuffer**: a Sybil's report adds exactly one count to one bucket. The influence bound becomes
+  the number of rooted owners held, and the robust statistics read from the histogram.
+- **AV-92, subpoena**: a compelled aggregator yields shares, which are uniformly random, and its partial,
+  which is public anyway. Values are exposed only if **both** aggregators of a period are compelled or
+  collude.
+- **AV-95, poisoned aggregator**: an aggregator cannot change the result without the other noticing. The
+  partials must sum to histograms whose totals equal the shared `source_count`, and a dropped report is
+  visible to its sender through the Merkle path. Two colluding aggregators can drop reports or invent tokens.
+  The load-balance check bounds that once the seat order is signed.
+- **Ballot secrecy among members is claimed** (two non-colluding tally members). **Coercion resistance is
+  not claimed**: a member can still prove how they voted by revealing their shares.
+
+### 10.7 Invariants for the formal model (`formal/census_ballot`)
+
+1. **Share privacy.** For every report, each aggregator's view (its share and its partial) is independent of
+   the report's value.
+2. **Correctness.** `partial_0 + partial_1` equals the sum of the accepted reports' values.
+3. **Validity.** Every accepted report is one-hot: entries in {0, 1}, summing to 1.
+4. **Agreement.** Both aggregators accept the same report set: equal token sets and equal `source_count`.
+5. **One per owner per period.** No two accepted reports in a period share an owner, which makes
+   `n_eff = source_count`.
+6. **k floor.** No published cell has `source_count < k`.
+7. **Base ratchet.** `base_t ≥ max(floor_t, 0.9 · base_{t−1})`, and `base_t = base_{t−1}` while the partition
+   freeze holds.
+8. **Occurrence invisibility.** Every eligible member emits exactly one fixed-size cell in every period. The
+   sequence of emitted cell sizes and times is identical whether or not a ballot is open.
+9. **Tally threshold.** A ballot passes only when its count meets the governance threshold against `base_t`.
