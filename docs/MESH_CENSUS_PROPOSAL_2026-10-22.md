@@ -90,12 +90,25 @@ small exact number.
 
 ### 3.1 Names
 
-- `census:return:v1` — one per node per period. **Not replicated.** It travels to exactly one aggregator
-  and is deleted at the end of the next period.
-- `census:composite:{class}:v1` — one per aggregator per period per composite class (`fleet`, `relay`,
-  `holdings`, `traffic`, `room`). Published at federation scope. Carrier: `AggregationMetaV1` at
-  version 3 (signed `n_eff` and mass commitment), with the bucketed cells as the body. Retention: the 19.7
-  descent applies, so old composites fold into coarser tiers rather than being deleted.
+- `census:return:v1` — one per node per period, in a **new placement class, `addressed`** (persist,
+  2026-10-22; persist has three placements today and none fits). The row names one recipient in
+  `for_key_id`, its audience is {author, recipient}, it is never widened and no third node may hold it.
+  Door rules persist will enforce: `attested_key_id` is the node's own key (hybrid-signed); scope
+  `federation`, placement `addressed`; `for_key_id` MUST be a serve seat (`serve_seat_owner_announced`,
+  refusal `census_return_recipient_not_seat`); `period` and `return_token` are envelope members;
+  `expires_at` is the period end (refusal `census_return_expired` after it), reaped by
+  `reap_expired_attestations`. Persist does not parse the bucketed body.
+- `census:composite:{class}:v1` — one per seat per period per class (`fleet`, `relay`, `holdings`,
+  `traffic`, `room`), at federation scope (Commons placement). The aggregation check values ride as
+  **envelope members**, bound by the row's own hybrid signature with no inner signature: `version = 3`,
+  `source_count`, `n_eff`, `max_source_multiplicity`, `mass_commitment_hex`, `member_commitment_hex`,
+  `aggregation_algorithm_id`, `noise_floor_descriptor`, and a signed **`mass_total`**. Persist runs the
+  dominance and multiplicity gates at federation admission (refusals `aggregation_meta_dominated` and
+  `aggregation_meta_multiplicity`) and checks that the cells sum to `mass_total`. The Merkle root commits
+  the per-member split. Further door rules: the signer MUST be a serve seat
+  (`census_composite_signer_not_seat`); `source_count < k` is refused (`census_composite_below_k`); one
+  composite per (seat, class, period), a later one only as `supersedes`. Retention: the last N periods per
+  class, older rows reaped by `expires_at`. The 19.7 descent is for the fountain tier, not for these rows.
 
 ### 3.2 Who aggregates
 
@@ -126,7 +139,7 @@ The seat that receives a return learns that a node sent it. There are two ways t
   fresh each period, so tokens cannot be linked across periods, and a node id cannot be tested against the
   commitment.
 - **Any reader** checks the seat's hybrid signature and the dominance gate over the signed `n_eff`. It also
-  checks that the cells sum to the mass commitment.
+  checks that the cells sum to the signed `mass_total` (persist checks the same at the door).
 - **A contributing node** can ask its seat for the Merkle path of its own token, and so prove its return was
   counted. Nobody else learns the token list.
 - **Seats cross-check each other.** The sum of the seats' source counts should track the directory's count
@@ -319,12 +332,14 @@ derived from the census, falls.
 **Mitigation**:
 - **Only seats aggregate.** They are announced, accountable, and their number is public.
 - **Readers check** the hybrid signature, the dominance gate over the signed `n_eff`, and that cells sum to
-  the mass commitment.
+  the signed `mass_total`.
 - **Contributors check inclusion.** A node asks its seat for its token's Merkle path. A missing path is
   evidence against the seat.
 - **Seats check each other.** Seat choice is `H(token ‖ period) mod seats`, so each seat should carry about
   1/seats of the returns. A seat whose share departs from that, period after period, is visible to every
-  reader.
+  reader. **This check needs the seat order as a signed row** (the canonical community's `group:roster`
+  would do). Until it exists, the door checks only that the recipient is a seat, and a sender may choose a
+  colluding seat. The share check is then statistical, not enforced.
 
 **What it does not bound**: a seat can invent returns from tokens it made up, up to the share it is expected
 to carry. The cross-check against the directory's bucketed count of live announced nodes bounds this to the
