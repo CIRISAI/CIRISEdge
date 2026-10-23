@@ -94,6 +94,25 @@ universal 1.4 KB envelope rule.
   classification only; a sealed epoch still receives nothing). A derived dial (scoped or A/V) tries
   each of the peer's distinct transport keys when a link proof is refused, so a peer that rotated
   its transport identity stays reachable.
+- **#887 — a slow holder is no longer retired by one stall.** A chunk fetch that timed out counted
+  as a transport error strike, and a pull runs eight lanes against a strike limit of three. One
+  stall on a single holder (a restarted requester, a congested reverse path) timed out three lanes
+  together, retired the only holder for the whole pull, and every later chunk failed with "no holders
+  left". This is what failed the bigfile resume witness on the 43.0, 43.1 and 43.2 branches. A
+  timeout is now silence, measured in wall-clock time: the holder is retired only after it has
+  answered nothing for `error_strike_limit` per-request windows (90 s by default), so overlapping
+  timeouts of one stall count once and a holder that never answers is still retired (#616's bound).
+  Refusals and other transport errors still strike. The chunk timeout is the typed
+  `TransportError::Timeout`, and an answer that lands after its fetch timed out is kept for one more
+  window: the retry takes it without asking the holder again, where before it was discarded after
+  its whole transfer was paid (`blob_dag_chunks` counts `answer_timed_out`, `late_answer_kept` and
+  `late_answer_used`). On the holder, a repeat request for a chunk whose answer is still being sent
+  to the same requester starts no second transfer (`serve:coalesced_in_flight`). Without that, each
+  requester timeout added another full ~1 MB send of a chunk already in flight, and a restarted
+  requester (same key) doubled the load again on top of the answers still headed to its dead
+  process. On two cores the transfers then outlasted the reverse path's 45 s cap, were abandoned and
+  restarted, and the resume stalled. The witness now passes pinned to two cores, slower than any
+  failing CI run.
 
 ## The pre-seal route fetch (CC 5.3.3.5 E1; CLM-pre-seal-route-fetch)
 

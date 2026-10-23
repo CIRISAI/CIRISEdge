@@ -2168,12 +2168,26 @@ mod tests {
                 destination_key_id: &str,
                 envelope_bytes: &[u8],
             ) -> Result<TransportSendOutcome, TransportError> {
-                let dest = self
-                    .registries
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(destination_key_id)
-                    .cloned();
+                // Each runtime's first round fires the moment it starts, so
+                // alice's start-up round can reach the transport before bob's
+                // node has registered (a host under load builds bob slowly).
+                // The peer EXISTS in this fixture; wait for it, as a real
+                // transport would reach a listener that is still coming up,
+                // rather than failing the round with "no such node" — the
+                // `{Completed: 2, Error: 1}` this test once reported.
+                let mut dest = None;
+                for _ in 0..250 {
+                    dest = self
+                        .registries
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(destination_key_id)
+                        .cloned();
+                    if dest.is_some() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
                 let Some(dest) = dest else {
                     return Err(TransportError::Io(format!(
                         "no such node {destination_key_id}"
@@ -2261,6 +2275,9 @@ mod tests {
             let registries: Registries = Arc::new(StdMutex::new(HashMap::new()));
             let ledger: Ledger = Arc::new(StdMutex::new(Vec::new()));
             let (mut alice, alice_m) = node("alice", "bob", &registries, &ledger).await;
+            // Bob comes up after alice's start-up round has already fired
+            // toward him: the ordering a loaded host produced at random.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let (mut bob, bob_m) = node("bob", "alice", &registries, &ledger).await;
 
             // Both sides are initiators toward each other; neither has a

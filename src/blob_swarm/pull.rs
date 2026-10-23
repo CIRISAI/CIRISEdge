@@ -1011,6 +1011,7 @@ impl DagByteFetch for SwarmFetch {
         let alpha = self.swarm.ewma_alpha;
         let strike_limit = self.swarm.error_strike_limit;
         let timeout = self.swarm.per_request_timeout;
+        let silence_limit = self.swarm.silence_limit();
         // Bounded: every holder may be struck to its limit and no further.
         let max_attempts = routes.len().max(1) * (strike_limit.max(1) as usize + 1);
         let mut last = String::from("no holder accepted the request");
@@ -1034,7 +1035,10 @@ impl DagByteFetch for SwarmFetch {
                 .await
             {
                 Ok(crate::ChunkResult::Bytes(bytes)) => {
-                    self.settle(&peer, |s| s.record_rtt(started.elapsed(), alpha));
+                    self.settle(&peer, |s| {
+                        s.record_rtt(started.elapsed(), alpha);
+                        s.record_answer();
+                    });
                     return Ok(bytes);
                 }
                 Ok(crate::ChunkResult::ChunkMiss { reason }) => {
@@ -1043,6 +1047,7 @@ impl DagByteFetch for SwarmFetch {
                     let gone = reason.contains("Withdrawn") || reason.contains("Revoked");
                     let hard = reason.contains("PolicyDenied") || reason.contains("DiskPressure");
                     self.settle(&peer, |s| {
+                        s.record_answer();
                         if hard {
                             s.demoted = true;
                         } else {
@@ -1053,6 +1058,27 @@ impl DagByteFetch for SwarmFetch {
                         return Err(DagFetchError::Gone(reason));
                     }
                     last = format!("{peer}: chunk miss {reason}");
+                }
+                // CIRISEdge#887 — no answer in the window is SILENCE, not a
+                // refusal: the K lanes of one stall share one silence, and
+                // the holder is retired only after `silence_limit` of it.
+                Err(e @ crate::EdgeError::Transport(crate::TransportError::Timeout(_))) => {
+                    let mut retired = None;
+                    self.settle(&peer, |s| {
+                        s.record_timeout(started, Instant::now(), timeout, alpha, silence_limit);
+                        if s.demoted {
+                            retired = s.silent_since.map(|t| t.elapsed());
+                        }
+                    });
+                    if let Some(silent_for) = retired {
+                        tracing::warn!(
+                            holder = %peer,
+                            silent_for_secs = silent_for.as_secs(),
+                            "DAG pull: holder retired for this pull after answering nothing \
+                             for the silence limit (history: CIRISEdge#887)"
+                        );
+                    }
+                    last = format!("{peer}: {e}");
                 }
                 Err(e) => {
                     self.settle(&peer, |s| {
