@@ -231,6 +231,14 @@ pub trait RootingDirectory: Send + Sync + 'static {
         None
     }
 
+    /// CIRISEdge#888 — `key_id`'s registered `identity_type` (persist
+    /// `federation_keys`), read only to break a tie between keys bound to one
+    /// transport identity: a `node` key is the transport identity, an actor
+    /// key never is. Default `None` (no directory ⇒ no preference).
+    async fn registered_identity_type(&self, _key_id: &str) -> Option<String> {
+        None
+    }
+
     /// CIRISEdge#299 — **write-through** a peer's rooted transport
     /// identity so it survives a restart (reloaded via
     /// `list_all_transport_destinations` on boot) and a KNOWN peer is
@@ -698,6 +706,14 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             .ok()
             .flatten()
             .map(|record| record.pubkey_ed25519_base64)
+    }
+
+    async fn registered_identity_type(&self, key_id: &str) -> Option<String> {
+        FederationDirectory::lookup_public_key(self, key_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.identity_type)
     }
 
     async fn hybrid_transport_binding_exists(&self, key_id: &str, dest_hash: [u8; 16]) -> bool {
