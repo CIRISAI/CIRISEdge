@@ -39,6 +39,11 @@ connected. A restart did not help, because the stale row is in the store.
   `_by_node`. One WARN per identity per ten minutes names every bound key, the choice and the
   rule.
 
+**Advisories (published 2026-10-24).** Lockfile patch bumps fix RUSTSEC-2026-0385 (ctutils 0.4.5),
+RUSTSEC-2026-0386 (tokio 1.53.3) and RUSTSEC-2026-0387 for crypto-bigint 0.7 (0.7.7). RUSTSEC-2026-0387
+for crypto-bigint 0.5.5 is ignored with its reason: it is reached only through elliptic-curve 0.13 in
+CIRISVerify's crates and openmls, has no 0.5 fix, and shipped unchanged in v43.1.1 (#890).
+
 The data-plane side, where a newer route retires the older one at admission, is CIRISPersist#1122.
 Until it lands, the stale agent row stays in stores and this rule keeps it from taking the link.
 
