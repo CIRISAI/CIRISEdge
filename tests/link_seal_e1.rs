@@ -103,11 +103,15 @@ impl Ident {
         Arc::new(LocalSigner::new(self.key_id.clone(), classical, Some(pqc)))
     }
     async fn record(&self) -> ciris_persist::federation::KeyRecord {
+        self.record_as("node").await
+    }
+    /// [`Self::record`] registered under `kind` (CIRISEdge#888: an agent key).
+    async fn record_as(&self, kind: &str) -> ciris_persist::federation::KeyRecord {
         let mut envelope = serde_json::json!({});
         ciris_persist::federation::admission::bind_subject_into_envelope(
             &mut envelope,
             &self.key_id,
-            "node",
+            kind,
             &self.ed_pub_b64(),
             Some(&self.pqc_pub_b64),
             None,
@@ -127,7 +131,7 @@ impl Ident {
             pubkey_ed25519_base64: self.ed_pub_b64(),
             pubkey_ml_dsa_65_base64: Some(self.pqc_pub_b64.clone()),
             algorithm: "hybrid".to_string(),
-            identity_type: "node".to_string(),
+            identity_type: kind.to_string(),
             identity_ref: self.key_id.clone(),
             valid_from: now,
             valid_until: None,
@@ -1335,4 +1339,84 @@ async fn prime_peer_refuses_a_key_that_is_not_the_destinations_e1() {
         "A delivered B's frame"
     );
     assert_eq!(t.b.binding("peer_binding_link_proof_refused"), 0);
+}
+
+/// CIRISEdge#888 — the field case. A holds a SECOND binding to B's transport
+/// identity, under a key that sorts first: an install's pre-split actor key
+/// whose route was never retired. B's KEX claims its own node key. Before, A
+/// attributed the link to whichever key a `HashMap` walk met first and, when
+/// it was the other one, refused every handshake as a claim mismatch. Now the
+/// claim, corroborated by B's own binding to the identity, decides.
+/// `extra_kind` is how A's directory registers the extra key: `agent` (the
+/// field case, decided by the node rule) or `node` (two node keys, which only
+/// the corroborated claim can decide).
+async fn shared_identity_witness(tag: &str, extra_kind: &str) {
+    let t = trio(tag, true, false, false).await;
+    let extra = Ident::new(&format!("aaa-pre-split-actor-{tag}"), 0x2e).await;
+    assert!(extra.key_id < t.b.key.key_id, "the extra key sorts first");
+    FederationDirectory::put_public_key(
+        &*t.a.dir,
+        ciris_persist::prelude::SignedKeyRecord {
+            record: extra.record_as(extra_kind).await,
+        },
+    )
+    .await
+    .expect("register the extra key at A");
+    t.a.transport
+        .prime_peer(
+            &extra.key_id,
+            t.b.transport.local_named_dest_hash(),
+            t.b.transport.local_transport_pubkey(),
+        )
+        .await
+        .expect("A binds the extra key to B's transport identity");
+
+    let frame = marked(b"E1-SHARED-IDENTITY-", 3_000);
+    t.b.transport
+        .send(&t.a.key.key_id, &frame)
+        .await
+        .expect("B -> A, sealed");
+    let landed = wait_until(Duration::from_secs(30), || async {
+        t.a.seen.lock().await.iter().any(|f| {
+            f.envelope_bytes == frame
+                && f.source_key_id
+                    .as_ref()
+                    .map(ciris_edge::transport::SourceKeyId::as_str)
+                    == Some(t.b.key.key_id.as_str())
+        })
+    })
+    .await;
+    assert!(
+        landed,
+        "A delivered B's frame attributed to B's node key; seals {:?}, bindings {:?}",
+        t.a.metrics.link_seal(),
+        t.a.metrics.peer_binding()
+    );
+    assert_eq!(t.a.seal("link_seal_refused_claim_mismatch"), 0);
+    assert!(
+        t.a.binding("peer_binding_attribution_shared") >= 1,
+        "the tie was met, not avoided: {:?}",
+        t.a.metrics.peer_binding()
+    );
+    let rule = if extra_kind == "node" {
+        // Two node keys: only the claim can pick B over the lower key id.
+        "peer_binding_attribution_by_claim"
+    } else {
+        "peer_binding_attribution_by_node"
+    };
+    assert!(
+        t.a.binding(rule) >= 1,
+        "{rule}: {:?}",
+        t.a.metrics.peer_binding()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_node_key_on_the_dialler_identity_yields_to_the_corroborated_claim_888() {
+    shared_identity_witness("shared-claim", "node").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_key_on_the_dialler_identity_never_takes_the_node_s_link_888() {
+    shared_identity_witness("shared-agent", "agent").await;
 }

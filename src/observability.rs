@@ -1081,6 +1081,18 @@ pub const PEER_BINDING_PRIMED: &str = "peer_binding_primed";
 /// `prime_peer` refused a transport identity that does not reproduce the
 /// named destination it was primed at.
 pub const PEER_BINDING_PRIME_REFUSED: &str = "peer_binding_prime_refused";
+/// CIRISEdge#888 — a link's proven transport identity is bound to MORE THAN
+/// ONE key (an install's pre-split agent key and its node key both hold a
+/// route for one destination). Counted once per attribution that had to
+/// choose.
+pub const PEER_BINDING_ATTRIBUTION_SHARED: &str = "peer_binding_attribution_shared";
+/// CIRISEdge#888 — the shared identity was attributed to the key the
+/// dialler's transit KEX claims: the claim is corroborated by that key's own
+/// binding to this identity, not contradicted.
+pub const PEER_BINDING_ATTRIBUTION_BY_CLAIM: &str = "peer_binding_attribution_by_claim";
+/// CIRISEdge#888 — the shared identity was attributed to its `node`-typed key
+/// (a node key is the transport identity; an actor key never is).
+pub const PEER_BINDING_ATTRIBUTION_BY_NODE: &str = "peer_binding_attribution_by_node";
 
 /// The live counter/gauge bag every [`crate::Edge`] owns.
 ///
