@@ -118,6 +118,8 @@ pub struct SelfSignedRouteProducer {
     warned_no_pqc: AtomicBool,
     /// "Say so once": the stale-epoch / retired-tombstone warn has fired.
     warned_store_conflict: AtomicBool,
+    /// CIRISEdge#888 — "say so once": the actor-key refusal has fired.
+    warned_actor_key: AtomicBool,
     /// Memo: the fingerprint of the inputs (dest, transport keys, epoch,
     /// transit pair) the store was last observed current for, or that we
     /// emitted. A call with the SAME inputs short-circuits without a
@@ -150,6 +152,39 @@ impl SelfSignedRouteProducer {
         Self::default()
     }
 
+    /// CIRISEdge#888 — the steward's ruling: an AGENT does not announce at a
+    /// transit key; it is reached through its node's binding. A transport
+    /// running under an `agent`-registered key is named once, loudly. It is
+    /// NOT refused in this patch line: agent-typed transport keys were the
+    /// model before the actor/node split (#541), so nodes still running that
+    /// way would drop off the mesh. Attribution already makes an agent row
+    /// lose every tie to a node key (`reticulum::pick_attribution`), which is
+    /// the #888 fix; refusing the publish is a dated fleet-floor change.
+    async fn warn_if_actor_key(
+        &self,
+        signer: &LocalSigner,
+        rooting: &dyn RootingDirectory,
+        dest_hash: &[u8; 16],
+    ) {
+        if rooting
+            .registered_identity_type(&signer.key_id)
+            .await
+            .as_deref()
+            == Some(ciris_persist::federation::types::identity_type::AGENT)
+            && !self.warned_actor_key.swap(true, Ordering::Relaxed)
+        {
+            tracing::error!(
+                key_id = %signer.key_id,
+                dest = %hex::encode(dest_hash),
+                "self route under an AGENT-typed federation key: an agent does not announce \
+                 at a transit key (it is reached through its node's binding). Run the \
+                 transport under the node key (use_node_identity). The route is still \
+                 published on this line; a node key bound to the same destination wins every \
+                 attribution tie (history: CIRISEdge#888)"
+            );
+        }
+    }
+
     /// Ensure the durable store carries OUR hybrid-signed reticulum route:
     /// emit if absent or stale (dest/epoch change), skip otherwise. Called
     /// at transport construction (bootstrap) and re-armed by the periodic
@@ -177,6 +212,10 @@ impl SelfSignedRouteProducer {
         if self.memo() == Some(fingerprint) {
             return SelfRouteOutcome::AlreadyCurrent;
         }
+
+        // CIRISEdge#888 — the steward's ruling: an agent does not announce at a
+        // transit key. Named loudly here; NOT yet refused (see the helper).
+        self.warn_if_actor_key(signer, rooting, &dest_hash).await;
 
         let want = hex::encode(dest_hash);
 
@@ -667,6 +706,11 @@ mod tests {
     /// Register `signer`'s pubkeys as a federation key so its signatures
     /// verify against the PINNED directory entry at admission.
     async fn register(backend: &Arc<MemoryBackend>, signer: &LocalSigner) {
+        register_as(backend, signer, identity_type::NODE).await;
+    }
+
+    /// [`register`] under a chosen `identity_type` (CIRISEdge#888).
+    async fn register_as(backend: &Arc<MemoryBackend>, signer: &LocalSigner, kind: &str) {
         let ed_pub = HardwareSigner::public_key(signer.classical.as_ref())
             .await
             .expect("ed25519 pubkey");
@@ -680,13 +724,13 @@ mod tests {
             pubkey_ed25519_base64: B64.encode(&ed_pub),
             pubkey_ml_dsa_65_base64: pqc_pub.map(|p| B64.encode(&p)),
             algorithm: algorithm::HYBRID.into(),
-            identity_type: identity_type::NODE.into(),
+            identity_type: kind.into(),
             identity_ref: format!("node-ref-{}", signer.key_id),
             valid_from: now,
             valid_until: None,
             registration_envelope: serde_json::json!({
                 "key_id": signer.key_id,
-                "identity_type": identity_type::NODE,
+                "identity_type": kind,
             }),
             original_content_hash: "0".repeat(64),
             scrub_signature_classical: "x".repeat(88),
@@ -763,6 +807,32 @@ mod tests {
         // A different dest still fails — the row binds THIS dest only.
         assert!(
             !dir.hybrid_transport_binding_exists(&signer.key_id, OTHER_DEST)
+                .await
+        );
+    }
+
+    /// CIRISEdge#888 — a transport under an agent-typed key is named (once)
+    /// but still publishes on this line: refusing would drop pre-split nodes
+    /// off the mesh. The #888 fix is attribution, where an agent row loses
+    /// every tie to a node key.
+    #[tokio::test]
+    async fn an_agent_typed_key_is_named_and_still_publishes_888() {
+        let backend = backend();
+        let signer = hybrid_signer("self-route-agent");
+        register_as(&backend, &signer, identity_type::AGENT).await;
+        let dir: &dyn RootingDirectory = backend.as_ref();
+        let producer = SelfSignedRouteProducer::new();
+        let out = producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await;
+        assert_eq!(
+            out,
+            SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Inserted)
+        );
+        assert!(
+            producer.warned_actor_key.load(Ordering::Relaxed),
+            "named once"
+        );
+        assert!(
+            dir.hybrid_transport_binding_exists(&signer.key_id, DEST)
                 .await
         );
     }

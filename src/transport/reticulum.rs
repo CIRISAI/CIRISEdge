@@ -11917,22 +11917,36 @@ async fn attribute_and_deliver(
     // (ours) from an un-identified peer-dialled scoped link (a real miss).
     let we_dialled =
         plane == LinkPlane::Scoped && ctx.dialed_link_dest.lock().await.contains_key(&link_id);
+    // CIRISEdge#888 — the dialled-dest basis, chosen by the same rule as an
+    // identified link (minus the claim, which a link we dialled does not
+    // carry): every key bound to the destination, then node key, then lowest
+    // key id. Before, the first hit of a `HashMap` walk.
+    let dest_pick = match dest {
+        Some(d) if identified.is_none() => {
+            let mut by_dest: Vec<(String, &'static str)> = ctx
+                .peers
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, rooted)| rooted.peer.dest_hash == d)
+                .map(|(key_id, _)| (key_id.clone(), "dest"))
+                .collect();
+            by_dest.sort_by(|a, b| a.0.cmp(&b.0));
+            choose_attribution(ctx, &d.into_bytes(), by_dest, None)
+                .await
+                .map(|(k, _)| k)
+        }
+        _ => None,
+    };
     let candidate_key_id = {
-        let peers = ctx.peers.lock().await;
         let outcome = resolve_link_attribution_on_plane(
             plane,
             we_dialled,
             identified,
             dest,
             ctx.local_key_id,
-            |d| {
-                peers
-                    .iter()
-                    .find(|(_, rooted)| rooted.peer.dest_hash == d)
-                    .map(|(key_id, _)| key_id.clone())
-            },
+            |_| dest_pick,
         );
-        drop(peers);
         match outcome {
             // CIRISEdge#621 — never our own key. A frame attributed to
             // ourselves cannot be delivered even unattributed: its
@@ -12023,6 +12037,9 @@ async fn attribute_and_deliver(
         // `drop_inbound` and closes the link.
         return;
     }
+    // CIRISEdge#888 — the claim check may have re-attributed the link to the
+    // corroborated claim; this frame is attributed as the link now is.
+    let candidate_key_id = attribution_after_claim(ctx, link_id, candidate_key_id).await;
     // CIRISEdge#436 — a link-borne build-attestation-bundle frame (`CBND`) is
     // a TRANSPORT-level control frame, consumed here exactly like a `CFRG`
     // fragment — never an envelope, never an `InboundFrame`. Intercepted with
@@ -12194,6 +12211,9 @@ async fn attribute_and_deliver(
         // `drop_inbound` and closes the link.
         return;
     }
+    // CIRISEdge#888 — the claim check may have re-attributed the link to the
+    // corroborated claim; this frame is attributed as the link now is.
+    let candidate_key_id = attribution_after_claim(ctx, link_id, candidate_key_id).await;
     // CLM-first-contact-seal-key-bound — unowned but never anonymous: the
     // request must be signed by, and introduce, the handshake's initiator.
     let unattributed_claim = candidate_key_id
@@ -12821,7 +12841,10 @@ async fn link_attribution_now(ctx: &EventCtx<'_>, link_id: LinkId) -> Option<Str
         return Some(key_id);
     }
     let identity_hash = *ctx.node.get_remote_identity(&link_id)?.hash();
-    let (key_id, branch) = match_identified_peer(&*ctx.peers.lock().await, &identity_hash)?;
+    let candidates = identified_candidates(&*ctx.peers.lock().await, &identity_hash);
+    let claimed = ctx.seals.claimed_initiator(link_id.into_bytes());
+    let (key_id, branch) =
+        choose_attribution(ctx, &identity_hash, candidates, claimed.as_deref()).await?;
     tracing::debug!(
         link = ?link_id,
         key_id = %key_id,
@@ -12836,25 +12859,170 @@ async fn link_attribution_now(ctx: &EventCtx<'_>, link_id: LinkId) -> Option<Str
     Some(key_id)
 }
 
-/// CIRISEdge#314 — the peer a link's PROVEN transport identity names: by the
-/// stored transport identity (Branch A, form-agnostic), else by the named
-/// destination that identity derives (Branch B). The one match both
-/// `LinkIdentified` and [`link_attribution_now`] make.
-fn match_identified_peer(
+/// CIRISEdge#314 — every peer a link's PROVEN transport identity names: by the
+/// stored transport identity (Branch A, form-agnostic), or by the named
+/// destination that identity derives (Branch B). Sorted by key id.
+///
+/// CIRISEdge#888 — more than one key can hold a binding for one identity (an
+/// install's pre-split agent key and its node key both signed a route for the
+/// same destination). The old matcher took the FIRST hit of a `HashMap`
+/// walk, so the link was attributed to an arbitrary one of them, and when it
+/// was not the key the dialler's transit KEX runs as, every handshake was
+/// refused as a claim mismatch. [`choose_attribution`] picks among these.
+fn identified_candidates(
     peers: &HashMap<String, RootedPeer>,
     identity_hash: &[u8; 16],
-) -> Option<(String, &'static str)> {
+) -> Vec<(String, &'static str)> {
     let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
     let expected_dest_hash = Destination::compute_destination_hash(&name_hash, identity_hash);
-    peers.iter().find_map(|(k, rp)| {
-        if rp.transport_identity_hash == *identity_hash {
-            Some((k.clone(), "identity"))
-        } else if rp.peer.dest_hash == expected_dest_hash {
-            Some((k.clone(), "dest"))
-        } else {
-            None
+    let mut out: Vec<(String, &'static str)> = peers
+        .iter()
+        .filter_map(|(k, rp)| {
+            if rp.transport_identity_hash == *identity_hash {
+                Some((k.clone(), "identity"))
+            } else if rp.peer.dest_hash == expected_dest_hash {
+                Some((k.clone(), "dest"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+static LINK_ATTRIBUTION_SHARED_LOG: std::sync::OnceLock<crate::log_throttle::LogThrottle> =
+    std::sync::OnceLock::new();
+fn link_attribution_shared_log() -> &'static crate::log_throttle::LogThrottle {
+    LINK_ATTRIBUTION_SHARED_LOG
+        .get_or_init(|| crate::log_throttle::LogThrottle::new(1, Duration::from_secs(600), 1024))
+}
+
+/// CIRISEdge#888 — the rule among [`identified_candidates`], pure so it is a
+/// test: the key the dialler's transit KEX CLAIMS when that key is itself
+/// bound to the identity (the directory corroborates the claim); else the
+/// one `node`-typed key (a node key is the transport identity, an actor key
+/// never is — the steward's ruling that agents do not announce at a transit
+/// key); else the lowest key id, so the choice is at least the same on every
+/// pass instead of a `HashMap` order. Every candidate is a binding this node
+/// already accepted: the rule never admits a key the old matcher would not
+/// have picked, it only stops the pick being arbitrary.
+fn pick_attribution<'c>(
+    candidates: &'c [(String, &'static str)],
+    claimed: Option<&str>,
+    node_typed: &[bool],
+) -> Option<(&'c (String, &'static str), &'static str)> {
+    if candidates.len() <= 1 {
+        return candidates.first().map(|c| (c, "only"));
+    }
+    if let Some(c) = claimed.and_then(|cl| candidates.iter().find(|(k, _)| k == cl)) {
+        return Some((c, "claim"));
+    }
+    let nodes: Vec<&(String, &'static str)> = candidates
+        .iter()
+        .zip(node_typed)
+        .filter_map(|(c, is_node)| is_node.then_some(c))
+        .collect();
+    if nodes.len() == 1 {
+        return Some((nodes[0], "node"));
+    }
+    candidates.first().map(|c| (c, "lowest_key_id"))
+}
+
+/// CIRISEdge#888 — choose the attribution for a link whose proven identity
+/// names `candidates`, reading each candidate's registered identity type only
+/// when there is a tie to break. Counted and logged (once per identity per
+/// ten minutes, by name) whenever more than one key was bound.
+async fn choose_attribution(
+    ctx: &EventCtx<'_>,
+    identity_hash: &[u8; 16],
+    candidates: Vec<(String, &'static str)>,
+    claimed: Option<&str>,
+) -> Option<(String, &'static str)> {
+    if candidates.len() <= 1 {
+        return candidates.into_iter().next();
+    }
+    let mut node_typed = Vec::with_capacity(candidates.len());
+    for (k, _) in &candidates {
+        let t = match ctx.rooting {
+            Some(dir) => dir.registered_identity_type(k).await,
+            None => None,
+        };
+        node_typed
+            .push(t.as_deref() == Some(ciris_persist::federation::types::identity_type::NODE));
+    }
+    let (chosen, rule) = pick_attribution(&candidates, claimed, &node_typed)?;
+    let chosen = chosen.clone();
+    if let Some(m) = ctx.metrics {
+        m.inc_peer_binding(crate::observability::PEER_BINDING_ATTRIBUTION_SHARED);
+        match rule {
+            "claim" => m.inc_peer_binding(crate::observability::PEER_BINDING_ATTRIBUTION_BY_CLAIM),
+            "node" => m.inc_peer_binding(crate::observability::PEER_BINDING_ATTRIBUTION_BY_NODE),
+            _ => {}
         }
-    })
+    }
+    let identity = hex::encode(identity_hash);
+    if let crate::log_throttle::ThrottleDecision::Emit { suppressed_prev } =
+        link_attribution_shared_log().check(&identity)
+    {
+        let keys: Vec<&str> = candidates.iter().map(|(k, _)| k.as_str()).collect();
+        tracing::warn!(
+            link_identity = %identity,
+            keys = %keys.join(", "),
+            chosen = %chosen.0,
+            rule,
+            suppressed_prev,
+            "link attribution: more than one key is bound to this transport identity; \
+             attributed by rule (claim > node key > lowest key id). The extra binding is a \
+             stale or actor-typed route that should be retired (history: CIRISEdge#888)"
+        );
+    }
+    Some(chosen)
+}
+
+/// CIRISEdge#888 — the frame's attribution after the claim check: when the
+/// check re-attributed the link to its corroborated claim
+/// ([`reattribute_to_corroborated_claim`]), the link's recorded key; otherwise
+/// the candidate as it was.
+async fn attribution_after_claim(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    candidate: Option<String>,
+) -> Option<String> {
+    let current = candidate?;
+    match ctx.link_to_peer_key_id.lock().await.get(&link_id) {
+        Some(now) if *now != current => Some(now.clone()),
+        _ => Some(current),
+    }
+}
+
+/// CIRISEdge#888 — the claim check's rescue: a link attributed to one key
+/// whose dialler's KEX claims ANOTHER key that is itself bound to the link's
+/// proven identity is re-attributed to the claimed key, not refused. `true`
+/// when it was (the caller then holds the claim to the new attribution).
+async fn reattribute_to_corroborated_claim(
+    ctx: &EventCtx<'_>,
+    link_id: LinkId,
+    claimed: &str,
+) -> bool {
+    let Some(identity) = ctx.node.get_remote_identity(&link_id) else {
+        return false;
+    };
+    let identity_hash = *identity.hash();
+    let candidates = identified_candidates(&*ctx.peers.lock().await, &identity_hash);
+    if candidates.len() < 2 || !candidates.iter().any(|(k, _)| k == claimed) {
+        return false;
+    }
+    let Some((key_id, _)) =
+        choose_attribution(ctx, &identity_hash, candidates, Some(claimed)).await
+    else {
+        return false;
+    };
+    if key_id != claimed {
+        return false;
+    }
+    ctx.link_to_peer_key_id.lock().await.insert(link_id, key_id);
+    true
 }
 
 /// Route one opened frame by its link's PLANE (CIRISEdge#805): picked once,
@@ -13170,6 +13338,9 @@ async fn claim_contradicted(ctx: &EventCtx<'_>, link_id: LinkId, proven: Option<
     let Err(e) = crate::transport::av_transit_handshake::check_claim(&claimed, proven) else {
         return false;
     };
+    if reattribute_to_corroborated_claim(ctx, link_id, &claimed).await {
+        return false;
+    }
     let refusal = crate::transport::link_seal::SealRefusal::Handshake(e);
     drop_inbound(Some(link_id), refusal.label(), &refusal.to_string());
     seal_teardown(ctx, link_id, &refusal).await;
@@ -13551,8 +13722,10 @@ async fn link_keyed(ctx: &EventCtx<'_>, link_id: LinkId, claimed: String) {
     let attributed = link_attribution_now(ctx, link_id).await;
     if let Some(proven) = attributed {
         if let Err(e) = check_claim(&claimed, &proven) {
-            seal_teardown(ctx, link_id, &SealRefusal::Handshake(e)).await;
-            return;
+            if !reattribute_to_corroborated_claim(ctx, link_id, &claimed).await {
+                seal_teardown(ctx, link_id, &SealRefusal::Handshake(e)).await;
+                return;
+            }
         }
     }
     if let Some(m) = ctx.metrics {
@@ -13746,8 +13919,13 @@ async fn handle_event(event: NodeEvent, ctx: &EventCtx<'_>) {
             let name_hash = Destination::compute_name_hash(EDGE_APP_NAME, &[EDGE_APP_ASPECT]);
             let expected_dest_hash =
                 Destination::compute_destination_hash(&name_hash, &identity_hash);
+            // CIRISEdge#888 — the candidates under a guard that ends with this
+            // statement: choosing may read the directory, never under the lock.
+            let candidates = identified_candidates(&*ctx.peers.lock().await, &identity_hash);
+            let claimed = ctx.seals.claimed_initiator(link_id.into_bytes());
+            let matched =
+                choose_attribution(ctx, &identity_hash, candidates, claimed.as_deref()).await;
             let peers_guard = ctx.peers.lock().await;
-            let matched = match_identified_peer(&peers_guard, &identity_hash);
             // CIRISEdge#317 observability point 2 — the line that localizes the
             // bug in one run. A MATCH is DEBUG (success is not an incident). A
             // MISS is the RCA-critical signal, kept at WARN but THROTTLED
@@ -17858,6 +18036,104 @@ mod tests {
     /// a decision function tested on convenient inputs is a green test on the
     /// wrong path). Every arm below is a property the leviculum#49 house
     /// pattern names explicitly.
+    /// CIRISEdge#888 — two keys bound to one transport identity (an install's
+    /// pre-split agent key and its node key). Attribution is no longer the
+    /// first hit of a `HashMap` walk: the corroborated claim, then the node
+    /// key, then the lowest key id.
+    mod shared_identity_attribution_888 {
+        use super::*;
+        use ciris_persist::federation::self_at_login::BindingProvenance;
+        use std::time::Instant;
+
+        const ID: [u8; 16] = [0x4d; 16];
+        const AGENT: &str = "ciris-agent-bootstrap-n7zblo5hrl";
+        const NODE: &str = "ciris-node-bootstrap-gjqjv2jpfd";
+
+        fn bound(identity: [u8; 16]) -> RootedPeer {
+            RootedPeer {
+                peer: ResolvedPeer {
+                    dest_hash: DestinationHash::new([7u8; 16]),
+                    transport_ed25519: [9u8; 32],
+                },
+                epoch: 0,
+                chain: None,
+                provenance: BindingProvenance::Rooted,
+                transport_identity_hash: identity,
+                owns_key: true,
+                transport_pubkey64: [0u8; 64],
+                last_seen: Instant::now(),
+                manifest_commitment: None,
+            }
+        }
+
+        fn shared() -> HashMap<String, RootedPeer> {
+            let mut peers = HashMap::new();
+            peers.insert(AGENT.to_owned(), bound(ID));
+            peers.insert(NODE.to_owned(), bound(ID));
+            peers.insert("someone-else".to_owned(), bound([0x11; 16]));
+            peers
+        }
+
+        #[test]
+        fn every_key_bound_to_the_identity_is_a_candidate_in_key_order() {
+            let c = identified_candidates(&shared(), &ID);
+            let keys: Vec<&str> = c.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(
+                keys,
+                vec![AGENT, NODE],
+                "both bindings, sorted, the stranger excluded"
+            );
+        }
+
+        /// The field case: the dialler's KEX runs as the node key. Before, the
+        /// link could be attributed to the agent key and every handshake was
+        /// refused as `link_seal_refused_claim_mismatch`.
+        #[test]
+        fn the_corroborated_claim_wins() {
+            let c = identified_candidates(&shared(), &ID);
+            let (chosen, rule) = pick_attribution(&c, Some(NODE), &[false, true]).unwrap();
+            assert_eq!((chosen.0.as_str(), rule), (NODE, "claim"));
+            // The claim decides even when the types are unknown.
+            let (chosen, _) = pick_attribution(&c, Some(NODE), &[false, false]).unwrap();
+            assert_eq!(chosen.0, NODE);
+        }
+
+        #[test]
+        fn without_a_claim_the_node_key_wins_over_the_agent_key() {
+            let c = identified_candidates(&shared(), &ID);
+            let (chosen, rule) = pick_attribution(&c, None, &[false, true]).unwrap();
+            assert_eq!((chosen.0.as_str(), rule), (NODE, "node"));
+        }
+
+        /// A claim naming a key NOT bound to the identity corroborates nothing:
+        /// it never becomes the attribution (the claim check then refuses it).
+        #[test]
+        fn an_unbound_claim_is_never_chosen() {
+            let c = identified_candidates(&shared(), &ID);
+            let (chosen, rule) = pick_attribution(&c, Some("an-impostor"), &[false, true]).unwrap();
+            assert_eq!((chosen.0.as_str(), rule), (NODE, "node"));
+        }
+
+        #[test]
+        fn with_no_tie_breaker_the_choice_is_the_lowest_key_id_every_time() {
+            let c = identified_candidates(&shared(), &ID);
+            for _ in 0..16 {
+                let (chosen, rule) = pick_attribution(&c, None, &[false, false]).unwrap();
+                assert_eq!((chosen.0.as_str(), rule), (AGENT, "lowest_key_id"));
+            }
+        }
+
+        #[test]
+        fn a_single_binding_is_attributed_as_before() {
+            let mut peers = HashMap::new();
+            peers.insert(NODE.to_owned(), bound(ID));
+            let c = identified_candidates(&peers, &ID);
+            let (chosen, rule) = pick_attribution(&c, Some(AGENT), &[true]).unwrap();
+            assert_eq!((chosen.0.as_str(), rule), (NODE, "only"));
+            assert!(pick_attribution(&[], None, &[]).is_none());
+        }
+    }
+
     mod announce_intake_capacity_bound {
         use super::*;
         use ciris_persist::federation::self_at_login::BindingProvenance;

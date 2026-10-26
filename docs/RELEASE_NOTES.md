@@ -6,6 +6,9 @@
 pre-seal route fetch (5.3.3.5 E1, CIRISConstitution#172, `CLM-pre-seal-route-fetch`) and link
 shaping (5.4.3, `CLM-link-shaping`).
 
+It also carries everything in the v43.1.2 hot patch (below): attribution when two keys claim one
+transport destination (#888), the chunk-pull stall fix (#887), and the 2026-10-24 advisory bumps (#890).
+
 ## Link shaping (CC 5.4.3 rc10; CLM-link-shaping) — off by default
 
 Reciprocal per-link traffic shaping, negotiated right after the transit KEX. A shaped link
@@ -155,6 +158,69 @@ announce cannot carry a post-quantum transit pair, so v43.1.1 refused that dial 
 - New `link_seal` labels: `link_seal_route_request_sent`, `link_seal_route_requested`,
   `link_seal_route_answered`, `link_seal_pair_route_fetch`, and the refusals
   `link_seal_refused_route_{request,rate_limited,not_ours,unavailable,answer,answer_signer,answer_unverified,timeout,closed,send}`.
+
+# v43.1.2 — a link whose identity two keys claim is attributed to the key its handshake names
+
+**2026-10-24.** **PATCH** from v43.1.1 (persist v59.1.0 unchanged). Hot patch for CIRISEdge#888,
+seen in production between two people's nodes on ciris-server 0.5.235.
+
+## The fault
+
+An install that split its pre-split agent key from its node key left both keys holding a live,
+signed, rooted `transport_destination` row for one Reticulum destination. Edge attributed an
+inbound link to the first matching key of a `HashMap` walk. When that was the agent key, the
+dialler's transit KEX, which runs as the node key, was refused on every handshake as
+`link_seal_refused_claim_mismatch`. No sealed link formed, rounds timed out, and chat never
+connected. A restart did not help, because the stale row is in the store.
+
+## The fix
+
+- **Attribution is chosen, not stumbled on.** Every key bound to a link's proven transport
+  identity is a candidate. The link is attributed to the key the dialler's KEX claims when that
+  key is itself bound to the identity: the directory corroborates the claim instead of
+  contradicting it. Otherwise it goes to the one `node`-typed key, since a node key is the
+  transport identity and an actor key never is. Otherwise it goes to the lowest key id, so the
+  choice is the same on every pass. The rule never admits a key the old matcher would not have
+  picked; it only stops the pick being arbitrary.
+- **A link attributed before its claim arrived is re-attributed, not refused.** When the claim
+  check finds the claimed key among the identity's bindings, the link moves to it, and the frame
+  in hand is attributed as the link now is. A claim naming a key that is not bound to the identity
+  is still refused (`a_claim_that_is_not_the_links_peer_is_refused_e1`).
+- **Links this node dialled** choose by destination with the same rule, minus the claim.
+- **An agent-typed transport key is named, not yet refused.** The steward's ruling: an agent does
+  not announce at a transit key; it is reached through its node's binding. A transport running
+  under an `agent`-registered key logs one ERROR naming it. Its route is still published on this
+  line. Agent-typed transport keys were the model before the actor/node split (#541), so refusing
+  them would drop nodes still running that way off the mesh. Attribution already makes an agent row
+  lose every tie to a node key, which is the #888 fix. Refusing the publish is a dated fleet-floor
+  change.
+- **Observable.** `peer_binding` counts `peer_binding_attribution_shared`, `_by_claim` and
+  `_by_node`. One WARN per identity per ten minutes names every bound key, the choice and the
+  rule.
+
+## Also: a slow holder is no longer retired by one stall (#887, backported from 43.2)
+
+This patch's own CI hit #887: the bigfile resume witness failed with "no holders left". It is a
+production bug on this line too, so the 43.2 fix is backported unchanged.
+- A chunk timeout no longer counts as an error strike; a holder is retired only after answering
+  nothing for 90 s, so one stall across a pull's eight lanes can no longer retire the only holder.
+- An answer that lands after its fetch timed out is kept for the retry.
+- A holder sends one body per (requester, chunk) at a time, so retries no longer pile duplicate
+  ~1 MB transfers onto a congested link.
+
+**Advisories (published 2026-10-24).** Lockfile patch bumps fix RUSTSEC-2026-0385 (ctutils 0.4.5),
+RUSTSEC-2026-0386 (tokio 1.53.3) and RUSTSEC-2026-0387 for crypto-bigint 0.7 (0.7.7). RUSTSEC-2026-0387
+for crypto-bigint 0.5.5 is ignored with its reason: it is reached only through elliptic-curve 0.13 in
+CIRISVerify's crates and openmls, has no 0.5 fix, and shipped unchanged in v43.1.1 (#890).
+
+The data-plane side, where a newer route retires the older one at admission, is CIRISPersist#1122.
+Until it lands, the stale agent row stays in stores and this rule keeps it from taking the link.
+
+Witnesses: `tests/link_seal_e1.rs` binds a second key to the dialler's transport identity at the
+responder, once agent-typed and once as a second node key. Both deliver the dialler's frame
+attributed to its node key with no claim mismatch. Against v43.1.1's attribution both fail on
+every run: the dialler's send is refused. Unit tests cover the rule and the agent-key route
+refusal.
 
 # v43.1.1 — two peers connect with no canonical; a skipped row is never stranded; evidence rows name their code
 
