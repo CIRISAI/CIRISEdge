@@ -15,7 +15,6 @@ use base64::Engine as _;
 use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
 use ciris_persist::federation::{FederationDirectory, SignedKeyRecord};
 use ciris_persist::prelude::KeyRecord;
-use ciris_persist::store::MemoryBackend;
 use sha2::Digest as _;
 use std::sync::Arc;
 
@@ -154,7 +153,7 @@ async fn a_node_signed_by_the_test_root_roots_confirmed() {
         );
     }
 
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     for h in &holders {
         backend
             .put_public_key(h.clone())

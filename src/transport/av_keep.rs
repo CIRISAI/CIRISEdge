@@ -501,7 +501,7 @@ impl<R: StreamDekRegistrar> KeptAvPublisher<R> {
             kind = refused.kind,
             error = %refused.detail,
             "AV keep: persist refused this epoch's DEK — the call stays live, later epochs \
-             are NOT kept, earlier ones stay kept (CIRISEdge#847)"
+             are NOT kept, earlier ones stay kept (tracked: CIRISEdge#847)"
         );
         if let Some(events) = &self.events {
             #[allow(clippy::cast_precision_loss)] // an epoch counter, reported as a measurement

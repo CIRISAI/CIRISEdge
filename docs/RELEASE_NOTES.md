@@ -1,5 +1,271 @@
 # CIRISEdge Release Notes
 
+# v44.0.0 — persist v60: the operational planes retire, goals are rows, the memory backend is gone
+
+**2026-10-26.** **MAJOR** from v43.2.0. Pins CIRISPersist **v60.0.0** (8dec0dea); verify v20.2.0
+and leviculum unchanged. Python requires `ciris-persist>=60,<61`. Persist's CHANGELOG `## [60.0.0]`
+§16 "Adoption" is the complete break list; this entry is what edge does with it.
+
+## Wire and API removals (why this is MAJOR)
+
+- **The operational planes are retired (persist §8).** An organisation is an affiliation, carried
+  on the attestation plane. `EnvelopeKind::{Organization, OrgMembership, PartnerRecord}` are in
+  persist's `RETIRED_FRAMED`: edge advertises nothing on them, and an inbound object is refused
+  TERMINAL as `federation_envelope_kind_retired` and booked on the retired ledger, exactly as v59's
+  key-plane kinds. Their positions are kept, so the manifest hash does not move. Edge's operational
+  admission is removed, with its public `OperationalProviders` / `KeyDirectoryProvider` /
+  `RootStewardsProvider` / `StewardRosterProvider` and
+  `FederationDirectoryReplicationBridge::{with_operational, with_config_and_operational}`.
+- **Goals are rows (persist §2).** A Goal is a signed `goal:{scale}:v1` row. Edge's
+  `GoalDeclaration` / `GoalRetirement` message types (and their responses and domain tags) are
+  retired; a peer's goal message no longer decodes and is dropped.
+
+## Refusals
+
+- `not_authority_at_receipt` is gone from persist's licensure tokens (#1036 item 2). A stale
+  licence is `AssertedAtStale` on the licensure plane, and edge books it TERMINAL there too (the
+  producer's remedy is a fresh row, never a retry; confirmed with persist). `AssertedAtStale`'s
+  `steward` field is `standing_for`, plus `plane`.
+
+## Tests
+
+- Persist's memory backend is removed (§5): edge's tests run on `store::test_backend::test_backend()`.
+- Fixtures follow persist's v60 rules: key ids are lowercase (#854); the durability takedown files a
+  `takedown_notice:dmca512:v1` row; the federation-announcement fixture holds a real
+  `contribution:federation_announcement:v1` row, signed through `Engine::emit_attestation`.
+- **The mutual-peer relay witness now relays** (`attributed_allegiance_659`). Its hub ran in leaf
+  mode, so the relay never reached one side, and since 43.2's pre-seal route fetch its precondition
+  raced a direct A<->B dial. That failed the v43.2.0 tag run on macOS (no release assets for
+  v43.2.0). The hub now forwards, as a ciris-server node does by default, and A and B peer each
+  other only after the relay.
+
+## Known
+
+- CIRISEdge#905: link shaping's real-frame budget is nominal (ρ·λ·W), so a starved timer lets the
+  real share exceed ρ. Shaping is off by default.
+
+# v43.2.0 — two strangers connect: the pre-seal route fetch; reciprocal link shaping
+
+**2026-10-22.** **MINOR** from v43.1.1 (persist v59.1.0 unchanged). CC 1.0-rc9 → rc10 text: the
+pre-seal route fetch (5.3.3.5 E1, CIRISConstitution#172, `CLM-pre-seal-route-fetch`) and link
+shaping (5.4.3, `CLM-link-shaping`).
+
+It also carries everything in the v43.1.2 hot patch (below): attribution when two keys claim one
+transport destination (#888), the chunk-pull stall fix (#887), and the 2026-10-24 advisory bumps (#890).
+
+## Link shaping (CC 5.4.3 rc10; CLM-link-shaping) — off by default
+
+Reciprocal per-link traffic shaping, negotiated right after the transit KEX. A shaped link
+carries constant-size frames (the link's channel payload MDU) at Poisson times in BOTH
+directions, whatever either end has to say: real frames when the per-link budget admits one
+and the queue holds one, cover frames otherwise. A wire observer sees the same stream idle or
+busy; link existence and setup stay visible (the CC says so). It replaces the never-built
+universal 1.4 KB envelope rule.
+
+- **Negotiation.** With a non-`off` class the dialler sends a `SHAP` offer as the link's first
+  SEALED frame (class, its frame size, the frames/s it can afford on this link under its
+  node-wide cap, ρ, W) and waits for the peer's offer (10 s). The responder answers with its own
+  offer, bare, then both resolve the two offers by one pure function: the lower byte rate at the
+  smaller frame, the smaller ρ, the longer W. Either side `off` ⇒ the link runs unshaped, by
+  agreement (`link_shaping_unshaped`); a node with `require_shaped_links` closes it by name
+  instead (`link_shaping_refused_unshaped_peer`). There is never a half-shaped link: a bare
+  frame on a shaped link, a shaped frame on an unshaped one, or a Resource on a shaped link is
+  refused and the link closed (`link_shaping_dropped_wrong_kind`). A 43.1 peer never sees an
+  offer unless this node's class is on; its silence leaves the link unshaped.
+- **Budget classes** (per-link bytes/s, steward knobs): `server` 7000, `home` 2800,
+  `phone-wifi` 1400, `phone-cellular` 350, `off`. The node-wide cap (default eight links' worth)
+  bounds the sum of agreed rates; below one frame per 10 s an offer is `off`, never a trickle.
+- **Data path.** Only identity-plane links; A/V and scoped links never enter the shaper. On a
+  shaped link every outbound frame is cut to shaped-frame bodies and queued on the link's
+  shaper (bounded, 4096 bodies; a full queue defers the send, nothing is dropped); the Resource
+  lane is not used. Each frame is `SHPF` ‖ kind ‖ length ‖ body ‖ random pad, sealed. The
+  receiver drops cover (`link_shaping_cover_received`) and routes a real body as the frame it
+  carries.
+- **Knobs.** `init_edge_runtime(shaping_class=..., shaping_rho=0.5, shaping_window_seconds=600,
+  shaping_node_cap_bytes_per_s=..., require_shaped_links=False)`; Rust
+  `ReticulumTransportConfig::with_shaping`. UniFFI hosts get the knobs in a follow-up.
+- **Metrics.** New `link_shaping` family: `offered`, `agreed`, `unshaped`, `frames_real`,
+  `frames_cover`, `cover_received`, `queue_deferred`, `send_failed`, and the refusals above.
+- The ρ / W defaults per class (ρ 0.5; W 600 s, 3600 s for `phone-cellular`) come from the
+  measured grid in `docs/SHAPING_RHO_W_2026-10-22.md` (288 cells on edge's production Poisson
+  scheduler and budget meter, real T2 row sizes).
+
+## Also in this release
+
+- **#881 — an unclaimed node rounds with the bundle's serve nodes by itself (opt-in).** With
+  `bundle_bootstrap_peers=True` on `init_edge_runtime` (Rust: `ReplicationRuntimeConfig::
+  enable_bundle_bootstrap_peers`) the replication runtime adds the baked bundle's seated serve
+  nodes as initiator peers on the bootstrap planes (Key, IdentityOccurrence, TransportDestination
+  and their two revocation planes), merged into every peer set the host gives it (`start`,
+  `set_peers`), independent of consent. Those planes already have everyone-reach for announced
+  nodes (#682) and admit unattributed receipt (#402), so nothing new is exposed; a fresh device
+  then receives its owner's announced route row from a canonical with no host-side Pull. Off by
+  default and off under a test trust root, so a runtime outside the production mesh never rounds
+  against a canonical it cannot reach. The host's explicit subject Pull stays correct and may remain.
+- **#882 (CC rc9 I3) — the #659 floor's exemption is narrowed.** Before Rooted, a self-authored
+  row crosses to an Attributed peer only if it is one of this node's allegiance facts
+  (owner-binding, acceptance, self-charter), or its data subject is that peer itself (its
+  consent grant, a row addressed to it), or it is placed in a cohort (self, family, community,
+  affiliations) whose membership audience the peer already passed: a self holding claim reaches the
+  owner's other device (CC 6.1.5.3) and an invited stranger who joined a community receives its
+  rows (CC 3.1.3.2); a self-authored consent grant, score or content row about a third party at
+  federation scope stays behind the floor (`recipient_not_rooted`) until Rooted. Pair
+  rooms are unchanged on the rows they send to the peer; the Server's chat ladder on this tag
+  decides whether the subject carve tightens further.
+- **CC vendoring stays at rc8.1 (`157039d`).** Edge's namespace matcher is persist's
+  (CIRISPersist#924), and persist v59.1.0 vendors rc8.1; re-vendoring rc9 here alone diverges on
+  the two rc9 families (`identity:occurrence_revocation`, `transport:canonical_rebind`). The
+  move to rc9 rides persist's rc9 adoption.
+- UniFFI hosts: the shaping knobs are not yet on the UniFFI builder (Python only); follows.
+
+## Field fixes
+
+- **#867 — a dialled link binds the seal to its wire id.** After an establishment retry leviculum
+  re-keys the dialler's link under a fresh id while `connect` returned the original; under E1 the
+  handshake bound the stale id and the responder the wire id, so the link was refused at its first
+  sealed frame. Edge now moves its per-link state onto the wire id once a dial establishes, on the
+  identity, scoped and A/V dial paths (`link_rekeyed_to_wire_id`). Needs leviculum
+  `v0.31.1+ciris.1` (`ReticulumNode::wire_link_id`, CIRISAI/leviculum#86).
+- **#879 — the dialler binds the responder's on-link announce.** A responder never identifies to
+  its dialler, so the dialler dropped every on-link announce as `announce_frame_link_unidentified`.
+  It now binds the announce when its transport key names the destination it dialled (the link proof
+  already authenticated that). Both directions are counted (`peer_binding.announce_frame_bound`) and
+  witnessed on the sealed exchange.
+- **#875 — operator log lines say whether a cited issue is history or open work.** Every issue
+  citation in a WARN, ERROR or `drop_inbound` string now reads `history: CIRISEdge#N` (closed) or
+  `tracked: CIRISEdge#N` (open), 283 in all, enforced by `tests/log_citations.rs` over
+  `tools/log_citations.py`. The no-route dial lines are WARN, once per peer per ten minutes with the
+  suppressed count.
+- **#863 items 4 and 7 (A/V spine).** A link dialled to a scoped address that establishes just after
+  its epoch is sealed keeps its plane (the scope table remembers retracted addresses for
+  classification only; a sealed epoch still receives nothing). A derived dial (scoped or A/V) tries
+  each of the peer's distinct transport keys when a link proof is refused, so a peer that rotated
+  its transport identity stays reachable.
+- **#887 — a slow holder is no longer retired by one stall.** A chunk fetch that timed out counted
+  as a transport error strike, and a pull runs eight lanes against a strike limit of three. One
+  stall on a single holder (a restarted requester, a congested reverse path) timed out three lanes
+  together, retired the only holder for the whole pull, and every later chunk failed with "no holders
+  left". This is what failed the bigfile resume witness on the 43.0, 43.1 and 43.2 branches. A
+  timeout is now silence, measured in wall-clock time: the holder is retired only after it has
+  answered nothing for `error_strike_limit` per-request windows (90 s by default), so overlapping
+  timeouts of one stall count once and a holder that never answers is still retired (#616's bound).
+  Refusals and other transport errors still strike. The chunk timeout is the typed
+  `TransportError::Timeout`, and an answer that lands after its fetch timed out is kept for one more
+  window: the retry takes it without asking the holder again, where before it was discarded after
+  its whole transfer was paid (`blob_dag_chunks` counts `answer_timed_out`, `late_answer_kept` and
+  `late_answer_used`). On the holder, a repeat request for a chunk whose answer is still being sent
+  to the same requester starts no second transfer (`serve:coalesced_in_flight`). Without that, each
+  requester timeout added another full ~1 MB send of a chunk already in flight, and a restarted
+  requester (same key) doubled the load again on top of the answers still headed to its dead
+  process. On two cores the transfers then outlasted the reverse path's 45 s cap, were abandoned and
+  restarted, and the resume stalled. The witness now passes pinned to two cores, slower than any
+  failing CI run.
+
+## The pre-seal route fetch (CC 5.3.3.5 E1; CLM-pre-seal-route-fetch)
+
+v43.1.1 let two peers seal with no canonical when each HOLDS the other's own hybrid-signed route
+row (from any source). Two strangers on a bare mesh hold only each other's announce, and an
+announce cannot carry a post-quantum transit pair, so v43.1.1 refused that dial by name
+(`link_seal_refused_no_pair`). Now:
+
+- **The dialler**, holding no pair authenticated to the node it means to reach (no Rooted
+  binding, no copy of its signed row, no pairing pin) and a path to it, opens the link and sends a
+  **route request** (`CTKR`: the dialled key id, and whether it holds that key's record) as the
+  link's first frame. It waits for the answer, checks BEFORE any write that the row is signed by
+  and about the dialled key, admits the carried key record (when it asked for one) through
+  persist's key door, puts the row through persist's authenticated admission, and resolves the
+  pair exactly as a held copy is resolved (CLM-seal-authenticated-pair: signer, #1103
+  fingerprint, in-row separation, signature re-verified). Only then does its `CTKX` handshake go
+  out. A row signed by or about another key, a non-answer, a timeout, or a refusal from the
+  responder is a named refusal (`link_seal_refused_route_*`); the link closes and nothing is
+  stored. A successful fetch is counted `link_seal_pair_route_fetch` and said once per peer.
+- **The responder** answers only for its own occurrence key, only with its own live
+  hybrid-signed `transport_destination` row carrying a pair (`CTKA` frames, the one unsealed
+  frame set besides the handshake), plus its own `key:record:v1` row when the dialler said it
+  holds none (a stranger cannot verify a hybrid signature without the signer's public record;
+  that row is the same public, self-signed row the key plane replicates to everyone). The
+  receiver order runs before the request is read past its tag: once per link, then node-wide
+  (32 per 10 s). It serves nothing and buffers nothing until the handshake seals the link; its
+  announce and bundle follow sealed, as before. The handshake budget runs from the request
+  (30 s) so the answer and the dialler's handshake both fit.
+- A no-path target with no pair is still `NoRouteToPeer`; A/V leg dials still need a held pair
+  (the identity link exists by then). The pairing pin (CC 3.2 (f)) stays the failover for two
+  nodes that cannot exchange a single public frame.
+- Witnesses (`tests/link_seal_e1.rs`): two strangers seal after the fetch; a fresh stranger
+  fetches the key record with the route; a non-answer refuses the link; an answer signed by
+  another key is refused and never stored; nothing is served before the seal; a request over
+  the receiver order is refused before it is read and a bare announce supplies no pair. The
+  v43.1.1 witness that a pair-less dial is refused became the receiver-order witness; the
+  pairing-pin and #722 negative-control witnesses were re-pointed at the new behaviour (the
+  pin still writes nothing; the #393 item-2 gate still refuses a row from a peer with no
+  verified route, even though the transport now delivers it).
+- New `link_seal` labels: `link_seal_route_request_sent`, `link_seal_route_requested`,
+  `link_seal_route_answered`, `link_seal_pair_route_fetch`, and the refusals
+  `link_seal_refused_route_{request,rate_limited,not_ours,unavailable,answer,answer_signer,answer_unverified,timeout,closed,send}`.
+
+# v43.1.2 — a link whose identity two keys claim is attributed to the key its handshake names
+
+**2026-10-24.** **PATCH** from v43.1.1 (persist v59.1.0 unchanged). Hot patch for CIRISEdge#888,
+seen in production between two people's nodes on ciris-server 0.5.235.
+
+## The fault
+
+An install that split its pre-split agent key from its node key left both keys holding a live,
+signed, rooted `transport_destination` row for one Reticulum destination. Edge attributed an
+inbound link to the first matching key of a `HashMap` walk. When that was the agent key, the
+dialler's transit KEX, which runs as the node key, was refused on every handshake as
+`link_seal_refused_claim_mismatch`. No sealed link formed, rounds timed out, and chat never
+connected. A restart did not help, because the stale row is in the store.
+
+## The fix
+
+- **Attribution is chosen, not stumbled on.** Every key bound to a link's proven transport
+  identity is a candidate. The link is attributed to the key the dialler's KEX claims when that
+  key is itself bound to the identity: the directory corroborates the claim instead of
+  contradicting it. Otherwise it goes to the one `node`-typed key, since a node key is the
+  transport identity and an actor key never is. Otherwise it goes to the lowest key id, so the
+  choice is the same on every pass. The rule never admits a key the old matcher would not have
+  picked; it only stops the pick being arbitrary.
+- **A link attributed before its claim arrived is re-attributed, not refused.** When the claim
+  check finds the claimed key among the identity's bindings, the link moves to it, and the frame
+  in hand is attributed as the link now is. A claim naming a key that is not bound to the identity
+  is still refused (`a_claim_that_is_not_the_links_peer_is_refused_e1`).
+- **Links this node dialled** choose by destination with the same rule, minus the claim.
+- **An agent-typed transport key is named, not yet refused.** The steward's ruling: an agent does
+  not announce at a transit key; it is reached through its node's binding. A transport running
+  under an `agent`-registered key logs one ERROR naming it. Its route is still published on this
+  line. Agent-typed transport keys were the model before the actor/node split (#541), so refusing
+  them would drop nodes still running that way off the mesh. Attribution already makes an agent row
+  lose every tie to a node key, which is the #888 fix. Refusing the publish is a dated fleet-floor
+  change.
+- **Observable.** `peer_binding` counts `peer_binding_attribution_shared`, `_by_claim` and
+  `_by_node`. One WARN per identity per ten minutes names every bound key, the choice and the
+  rule.
+
+## Also: a slow holder is no longer retired by one stall (#887, backported from 43.2)
+
+This patch's own CI hit #887: the bigfile resume witness failed with "no holders left". It is a
+production bug on this line too, so the 43.2 fix is backported unchanged.
+- A chunk timeout no longer counts as an error strike; a holder is retired only after answering
+  nothing for 90 s, so one stall across a pull's eight lanes can no longer retire the only holder.
+- An answer that lands after its fetch timed out is kept for the retry.
+- A holder sends one body per (requester, chunk) at a time, so retries no longer pile duplicate
+  ~1 MB transfers onto a congested link.
+
+**Advisories (published 2026-10-24).** Lockfile patch bumps fix RUSTSEC-2026-0385 (ctutils 0.4.5),
+RUSTSEC-2026-0386 (tokio 1.53.3) and RUSTSEC-2026-0387 for crypto-bigint 0.7 (0.7.7). RUSTSEC-2026-0387
+for crypto-bigint 0.5.5 is ignored with its reason: it is reached only through elliptic-curve 0.13 in
+CIRISVerify's crates and openmls, has no 0.5 fix, and shipped unchanged in v43.1.1 (#890).
+
+The data-plane side, where a newer route retires the older one at admission, is CIRISPersist#1122.
+Until it lands, the stale agent row stays in stores and this rule keeps it from taking the link.
+
+Witnesses: `tests/link_seal_e1.rs` binds a second key to the dialler's transport identity at the
+responder, once agent-typed and once as a second node key. Both deliver the dialler's frame
+attributed to its node key with no claim mismatch. Against v43.1.1's attribution both fail on
+every run: the dialler's send is refused. Unit tests cover the rule and the agent-key route
+refusal.
+
 # v43.1.1 — two peers connect with no canonical; a skipped row is never stranded; evidence rows name their code
 
 **2026-10-21.** **PATCH** from v43.1.0 (persist v59.1.0 unchanged). Three field findings from

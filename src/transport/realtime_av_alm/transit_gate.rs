@@ -224,7 +224,7 @@ impl TransitGate {
                 tracing::warn!(
                     peer,
                     error = %e,
-                    "transit eligibility resolve failed — refusing hop (fail-closed, #430)"
+                    "transit eligibility resolve failed — refusing hop (fail-closed, history: CIRISEdge#430)"
                 );
                 return false;
             }
@@ -375,10 +375,10 @@ mod tests {
 
     #[tokio::test]
     async fn no_local_identity_refuses_every_hop() {
-        use ciris_persist::store::MemoryBackend;
         // With no "us" to anchor conjunct (D), the gate refuses before any walk —
         // the empty directory here is never consulted (the `else` returns first).
-        let dir: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> =
+            Arc::new(ciris_persist::store::test_backend::test_backend());
         let gate = TransitGate::new(dir, None);
         assert!(
             !gate.is_eligible_hop("any-peer", t(0)).await,
@@ -407,7 +407,6 @@ mod tests {
     async fn transit_gate_allows_shared_root_peer_and_refuses_self_claimed() {
         use ciris_persist::federation::accord_test_support::exercise_transit_eligibility;
         use ciris_persist::federation::trust_root::{INFRA_SERVE_SCOPE, TRUST_ACCEPTS_DIMENSION};
-        use ciris_persist::store::MemoryBackend;
 
         /// Verbatim replication of persist's `tier_ingest::test_support::
         /// sign_envelope` (which is `pub(crate)`) from its public pieces: the
@@ -439,7 +438,7 @@ mod tests {
             (och, b64.encode(&ed_sig), Some(b64.encode(&pqc_sig)))
         }
 
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         exercise_transit_eligibility(&*backend, "gate")
             .await
             .expect("persist's transit-eligibility exercise holds on the pinned build");
@@ -570,10 +569,10 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_peer_is_ineligible_and_the_denial_caches_briefly() {
-        use ciris_persist::store::MemoryBackend;
         // Peer absent from the directory → conjunct (A) fails → persist denies →
         // gate refuses. Exercises the real resolve_transit_eligibility path.
-        let dir: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
+        let dir: Arc<dyn FederationDirectory> =
+            Arc::new(ciris_persist::store::test_backend::test_backend());
         let gate = TransitGate::new(dir, Some("us".to_string()));
         assert!(
             !gate.is_eligible_hop("ghost-peer", t(0)).await,

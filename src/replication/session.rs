@@ -926,7 +926,7 @@ impl Session {
                     envelope_hash = %hex::encode(h),
                     peer,
                     "Deliver packing: advertised want is unfetchable — skipped \
-                     (#429 advertised-then-unfetchable: stale wire-index / pruned row / hash skew)"
+                     (history: CIRISEdge#429 advertised-then-unfetchable: stale wire-index / pruned row / hash skew)"
                 );
             }
             tracing::warn!(
@@ -935,7 +935,7 @@ impl Session {
                 packed = envelopes.len(),
                 dropped = dropped.len(),
                 peer,
-                "Deliver ships short — the requester's want was only partially served (#429)"
+                "Deliver ships short — the requester's want was only partially served (history: CIRISEdge#429)"
             );
         }
         let deliver = ReplicationMessage::Deliver(DeliverMessage {
@@ -1100,7 +1100,7 @@ impl Session {
                     "UNSOLICITED Deliver on a non-bootstrap plane (no in-flight round) — \
                      admitted subject to persist v22 put-gates + AV-76 per-peer quota; the \
                      per-peer receive decision is now expressible via source_peer \
-                     (CIRISEdge#426)"
+                     (history: CIRISEdge#426)"
                 );
             }
         }
@@ -1236,9 +1236,9 @@ impl Session {
                             reason = %reason,
                             retry = retry.as_str(),
                             suppressed_prev,
-                            "delivered envelope REFUSED — not applied (CIRISEdge#425 apply choke \
+                            "delivered envelope REFUSED — not applied (history: CIRISEdge#425 apply choke \
                              point); further refusals naming this signer on this plane log at \
-                             DEBUG for the next 30 min (CIRISEdge#858)"
+                             DEBUG for the next 30 min (tracked: CIRISEdge#858)"
                         ),
                         ThrottleDecision::Suppress => tracing::debug!(
                             kind = ?self.kind,
@@ -1261,7 +1261,7 @@ impl Session {
                         retry = crate::replication::refusal_backoff::RetryDisposition::Terminal
                             .as_str(),
                         "delivered envelope failed to DESERIALIZE — dropped, not applied \
-                         (CIRISEdge#425 apply choke point)"
+                         (history: CIRISEdge#425 apply choke point)"
                     );
                 }
             }

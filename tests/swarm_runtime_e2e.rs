@@ -30,7 +30,6 @@ use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
 use ciris_persist::federation::FederationDirectory;
-use ciris_persist::store::MemoryBackend;
 
 #[derive(Default)]
 struct RecordingTransport {
@@ -82,10 +81,11 @@ async fn two_peer_publish_and_observe_roundtrip() {
     let alice_tx = Arc::new(RecordingTransport::default());
     // v7.0.0 (CIRISEdge#194): the v5.2.0 `FountainTierEvict` +
     // `FountainEvictHardDelete` adapter args collapse onto persist
-    // v10.0.0's `FederationDirectory` (#270). MemoryBackend's evict
+    // v10.0.0's `FederationDirectory` (#270). SqliteBackend's evict
     // methods are no-ops on unknown content (`Ok(0)`), exactly the
     // shape this smoke test needs.
-    let alice_directory: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
+    let alice_directory: Arc<dyn FederationDirectory> =
+        Arc::new(ciris_persist::store::test_backend::test_backend());
     let alice_cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
         Arc::new(|| vec!["bob".to_string()]);
     let mut alice = FountainSwarmRuntime::start(
@@ -106,7 +106,8 @@ async fn two_peer_publish_and_observe_roundtrip() {
     // empty (bob is the listener, not the publisher).
     let bob_holdings: Arc<dyn FountainHoldingsSource> = Arc::new(NoopFountainHoldingsSource);
     let bob_tx: Arc<dyn Transport> = Arc::new(RecordingTransport::default());
-    let bob_directory: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
+    let bob_directory: Arc<dyn FederationDirectory> =
+        Arc::new(ciris_persist::store::test_backend::test_backend());
     let bob_cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
     let mut bob = FountainSwarmRuntime::start(
         SwarmRuntimeConfig {

@@ -118,6 +118,8 @@ pub struct SelfSignedRouteProducer {
     warned_no_pqc: AtomicBool,
     /// "Say so once": the stale-epoch / retired-tombstone warn has fired.
     warned_store_conflict: AtomicBool,
+    /// CIRISEdge#888 — "say so once": the actor-key refusal has fired.
+    warned_actor_key: AtomicBool,
     /// Memo: the fingerprint of the inputs (dest, transport keys, epoch,
     /// transit pair) the store was last observed current for, or that we
     /// emitted. A call with the SAME inputs short-circuits without a
@@ -150,6 +152,39 @@ impl SelfSignedRouteProducer {
         Self::default()
     }
 
+    /// CIRISEdge#888 — the steward's ruling: an AGENT does not announce at a
+    /// transit key; it is reached through its node's binding. A transport
+    /// running under an `agent`-registered key is named once, loudly. It is
+    /// NOT refused in this patch line: agent-typed transport keys were the
+    /// model before the actor/node split (#541), so nodes still running that
+    /// way would drop off the mesh. Attribution already makes an agent row
+    /// lose every tie to a node key (`reticulum::pick_attribution`), which is
+    /// the #888 fix; refusing the publish is a dated fleet-floor change.
+    async fn warn_if_actor_key(
+        &self,
+        signer: &LocalSigner,
+        rooting: &dyn RootingDirectory,
+        dest_hash: &[u8; 16],
+    ) {
+        if rooting
+            .registered_identity_type(&signer.key_id)
+            .await
+            .as_deref()
+            == Some(ciris_persist::federation::types::identity_type::AGENT)
+            && !self.warned_actor_key.swap(true, Ordering::Relaxed)
+        {
+            tracing::error!(
+                key_id = %signer.key_id,
+                dest = %hex::encode(dest_hash),
+                "self route under an AGENT-typed federation key: an agent does not announce \
+                 at a transit key (it is reached through its node's binding). Run the \
+                 transport under the node key (use_node_identity). The route is still \
+                 published on this line; a node key bound to the same destination wins every \
+                 attribution tie (history: CIRISEdge#888)"
+            );
+        }
+    }
+
     /// Ensure the durable store carries OUR hybrid-signed reticulum route:
     /// emit if absent or stale (dest/epoch change), skip otherwise. Called
     /// at transport construction (bootstrap) and re-armed by the periodic
@@ -177,6 +212,10 @@ impl SelfSignedRouteProducer {
         if self.memo() == Some(fingerprint) {
             return SelfRouteOutcome::AlreadyCurrent;
         }
+
+        // CIRISEdge#888 — the steward's ruling: an agent does not announce at a
+        // transit key. Named loudly here; NOT yet refused (see the helper).
+        self.warn_if_actor_key(signer, rooting, &dest_hash).await;
 
         let want = hex::encode(dest_hash);
 
@@ -209,9 +248,9 @@ impl SelfSignedRouteProducer {
             if !self.warned_no_pqc.swap(true, Ordering::Relaxed) {
                 tracing::warn!(
                     key_id = %signer.key_id,
-                    "CIRISEdge#406: cannot emit the hybrid-signed SignedTransportDestination \
+                    "history: CIRISEdge#406: cannot emit the hybrid-signed SignedTransportDestination \
                      — signer has NO ML-DSA-65 (PQC) half. This node is Ed25519-only, so \
-                     CIRISEdge#393 item 2 (hybrid transport binding) is UNSATISFIABLE for it: \
+                     history: CIRISEdge#393 item 2 (hybrid transport binding) is UNSATISFIABLE for it: \
                      peers will drop its frames unattributed at the E3 gate. Provision the \
                      PQC signer half to become attributable (warned once; not per tick)"
                 );
@@ -248,7 +287,7 @@ impl SelfSignedRouteProducer {
                         tracing::warn!(
                             key_id = %signed_row.transport_destination.occurrence_key_id,
                             reason = %reason,
-                            "CIRISEdge#406: own signed route emission REFUSED by the \
+                            "history: CIRISEdge#406: own signed route emission REFUSED by the \
                              monotonic guard — the store holds a newer signed row \
                              (stale local_epoch?)"
                         );
@@ -274,7 +313,7 @@ impl SelfSignedRouteProducer {
                 tracing::warn!(
                     key_id = %signed_row.transport_destination.occurrence_key_id,
                     error = %e,
-                    "CIRISEdge#406: own signed route emission failed at persist's \
+                    "history: CIRISEdge#406: own signed route emission failed at persist's \
                      authenticated admission — item 2 stays unsatisfiable for this node \
                      until it succeeds (will retry on the next announce tick)"
                 );
@@ -313,7 +352,7 @@ impl SelfSignedRouteProducer {
                 tracing::warn!(
                     key_id = %signer.key_id,
                     error = %e,
-                    "CIRISEdge#406: cannot read own signed transport-destination state — \
+                    "history: CIRISEdge#406: cannot read own signed transport-destination state — \
                      bootstrap deferred (will retry on the next announce tick)"
                 );
                 return ControlFlow::Break(SelfRouteOutcome::Deferred(e));
@@ -331,7 +370,7 @@ impl SelfSignedRouteProducer {
                         dest = %want,
                         stored_epoch = td.epoch,
                         config_epoch = epoch,
-                        "CIRISEdge#406: own reticulum route is RETIRED (signed tombstone) \
+                        "history: CIRISEdge#406: own reticulum route is RETIRED (signed tombstone) \
                          at epoch >= this config — NOT auto-resurrecting; bump local_epoch \
                          to assert a new binding"
                     );
@@ -354,7 +393,7 @@ impl SelfSignedRouteProducer {
                     config_epoch = epoch,
                     stored_dest = %td.destination,
                     dest = %want,
-                    "CIRISEdge#406: stored signed route carries a NEWER epoch than this \
+                    "history: CIRISEdge#406: stored signed route carries a NEWER epoch than this \
                      config (config stale — a later emission superseded it); not emitting"
                 );
             }
@@ -467,7 +506,7 @@ async fn build_and_sign_self_route(
     let mut envelope = serde_json::to_value(&row).map_err(|e| {
         // Structural — a typed row always serializes; keep the arm loud
         // rather than unwrap in prod code.
-        tracing::warn!(error = %e, "CIRISEdge#406: route envelope serialize failed");
+        tracing::warn!(error = %e, "history: CIRISEdge#406: route envelope serialize failed");
         SelfRouteOutcome::Deferred(format!("envelope serialize: {e}"))
     })?;
     if let Some(pair) = transit {
@@ -479,17 +518,17 @@ async fn build_and_sign_self_route(
         obj.insert(TRANSIT_KEX_PUBKEYS_MEMBER.into(), transit_kex_member(pair));
     }
     let bytes = ceg_produce_canonicalize(&envelope).map_err(|e| {
-        tracing::warn!(error = %e, "CIRISEdge#406: route envelope JCS canonicalize failed");
+        tracing::warn!(error = %e, "history: CIRISEdge#406: route envelope JCS canonicalize failed");
         SelfRouteOutcome::Deferred(format!("canonicalize: {e}"))
     })?;
     let ed = signer.classical.sign(&bytes).await.map_err(|e| {
-        tracing::warn!(error = %e, "CIRISEdge#406: ed25519 sign failed");
+        tracing::warn!(error = %e, "history: CIRISEdge#406: ed25519 sign failed");
         SelfRouteOutcome::Deferred(format!("ed25519 sign: {e}"))
     })?;
     let mut bound = bytes;
     bound.extend_from_slice(&ed);
     let mldsa = pqc.sign(&bound).await.map_err(|e| {
-        tracing::warn!(error = %e, "CIRISEdge#406: ml-dsa-65 sign failed");
+        tracing::warn!(error = %e, "history: CIRISEdge#406: ml-dsa-65 sign failed");
         SelfRouteOutcome::Deferred(format!("ml-dsa-65 sign: {e}"))
     })?;
     Ok(SignedTransportDestination {
@@ -615,7 +654,7 @@ mod tests {
     use ciris_keyring::{Ed25519SoftwareSigner, HardwareSigner, MlDsa65SoftwareSigner, PqcSigner};
     use ciris_persist::federation::types::{algorithm, identity_type, KeyRecord, SignedKeyRecord};
     use ciris_persist::federation::FederationDirectory;
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
 
     const DEST: [u8; 16] = [0xab; 16];
     const OTHER_DEST: [u8; 16] = [0xcd; 16];
@@ -666,7 +705,12 @@ mod tests {
 
     /// Register `signer`'s pubkeys as a federation key so its signatures
     /// verify against the PINNED directory entry at admission.
-    async fn register(backend: &Arc<MemoryBackend>, signer: &LocalSigner) {
+    async fn register(backend: &Arc<SqliteBackend>, signer: &LocalSigner) {
+        register_as(backend, signer, identity_type::NODE).await;
+    }
+
+    /// [`register`] under a chosen `identity_type` (CIRISEdge#888).
+    async fn register_as(backend: &Arc<SqliteBackend>, signer: &LocalSigner, kind: &str) {
         let ed_pub = HardwareSigner::public_key(signer.classical.as_ref())
             .await
             .expect("ed25519 pubkey");
@@ -680,13 +724,13 @@ mod tests {
             pubkey_ed25519_base64: B64.encode(&ed_pub),
             pubkey_ml_dsa_65_base64: pqc_pub.map(|p| B64.encode(&p)),
             algorithm: algorithm::HYBRID.into(),
-            identity_type: identity_type::NODE.into(),
+            identity_type: kind.into(),
             identity_ref: format!("node-ref-{}", signer.key_id),
             valid_from: now,
             valid_until: None,
             registration_envelope: serde_json::json!({
                 "key_id": signer.key_id,
-                "identity_type": identity_type::NODE,
+                "identity_type": kind,
             }),
             original_content_hash: "0".repeat(64),
             scrub_signature_classical: "x".repeat(88),
@@ -714,8 +758,8 @@ mod tests {
             .clone()
     }
 
-    fn backend() -> Arc<MemoryBackend> {
-        Arc::new(MemoryBackend::new())
+    fn backend() -> Arc<SqliteBackend> {
+        Arc::new(ciris_persist::store::test_backend::test_backend())
     }
 
     /// The headline field-provenance test: the producer emits through
@@ -763,6 +807,32 @@ mod tests {
         // A different dest still fails — the row binds THIS dest only.
         assert!(
             !dir.hybrid_transport_binding_exists(&signer.key_id, OTHER_DEST)
+                .await
+        );
+    }
+
+    /// CIRISEdge#888 — a transport under an agent-typed key is named (once)
+    /// but still publishes on this line: refusing would drop pre-split nodes
+    /// off the mesh. The #888 fix is attribution, where an agent row loses
+    /// every tie to a node key.
+    #[tokio::test]
+    async fn an_agent_typed_key_is_named_and_still_publishes_888() {
+        let backend = backend();
+        let signer = hybrid_signer("self-route-agent");
+        register_as(&backend, &signer, identity_type::AGENT).await;
+        let dir: &dyn RootingDirectory = backend.as_ref();
+        let producer = SelfSignedRouteProducer::new();
+        let out = producer.ensure(&signer, dir, DEST, TPK, &pair(), 0).await;
+        assert_eq!(
+            out,
+            SelfRouteOutcome::Emitted(TransportDestinationApplyOutcome::Inserted)
+        );
+        assert!(
+            producer.warned_actor_key.load(Ordering::Relaxed),
+            "named once"
+        );
+        assert!(
+            dir.hybrid_transport_binding_exists(&signer.key_id, DEST)
                 .await
         );
     }
@@ -1065,7 +1135,7 @@ mod tests {
         }
     }
 
-    async fn backend_with(signer: &LocalSigner) -> Arc<MemoryBackend> {
+    async fn backend_with(signer: &LocalSigner) -> Arc<SqliteBackend> {
         let b = backend();
         register(&b, signer).await;
         b

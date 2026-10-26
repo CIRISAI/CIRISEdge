@@ -238,7 +238,7 @@ impl LinkIdGuard {
             link = %hex::encode(link_id),
             unopened = self.unopened,
             "AV: no frame on this link has ever opened — link_id mismatch \
-             (leviculum#86); the link is ENDED so it is re-dialled (CIRISEdge#867)"
+             (leviculum#86); the link is ENDED so it is re-dialled (tracked: CIRISEdge#867)"
         );
     }
 }

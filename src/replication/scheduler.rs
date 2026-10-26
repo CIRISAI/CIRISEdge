@@ -559,7 +559,7 @@ impl ReplicationScheduler {
         if config.max_concurrent_rounds == 0 {
             tracing::warn!(
                 "scheduler: max_concurrent_rounds(0) would never run a round; using 1 \
-                 (CIRISEdge#740)"
+                 (history: CIRISEdge#740)"
             );
         }
         Self {
@@ -2215,7 +2215,7 @@ mod tests {
         use crate::replication::mesh_config::{MeshConfigReader, MeshConfigRelief};
         use ciris_persist::federation::FederationDirectory;
         let dir: Arc<dyn FederationDirectory> =
-            Arc::new(ciris_persist::store::MemoryBackend::new());
+            Arc::new(ciris_persist::store::test_backend::test_backend());
 
         let config = SchedulerConfig {
             cadence: Duration::from_millis(20),

@@ -243,7 +243,7 @@ async fn emitter_loop<F, Fut>(
                 error = %e,
                 ?pass,
                 "pending KeyGrant emission failed; the dirty epochs stay dirty and the \
-                 next wake or backstop tick retries (CIRISEdge#768)"
+                 next wake or backstop tick retries (history: CIRISEdge#768)"
             ),
         }
         pass = tokio::select! {

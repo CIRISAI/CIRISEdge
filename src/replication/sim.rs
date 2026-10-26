@@ -425,7 +425,7 @@ impl Scenario {
                 requester,
                 requested = indices.len(),
                 served,
-                "CIRISEdge#422 retransmit SHORTFALL — sender cannot serve all NAK'd \
+                "history: CIRISEdge#422 retransmit SHORTFALL — sender cannot serve all NAK'd \
                  fragments; remainder falls to whole-frame re-diff"
             );
         }
@@ -519,7 +519,7 @@ impl Scenario {
                         peer,
                         missing = miss.len(),
                         mdu = self.faults.mdu,
-                        "CIRISEdge#422 cannot NAK — MDU too small for a CNAK packet; \
+                        "history: CIRISEdge#422 cannot NAK — MDU too small for a CNAK packet; \
                          falling back to whole-frame re-diff"
                     );
                     continue;
@@ -539,7 +539,7 @@ impl Scenario {
                     peer,
                     missing = miss.len(),
                     naks = naks.len(),
-                    "CIRISEdge#422 selective NAK — missing fragment(s) requested from peer"
+                    "history: CIRISEdge#422 selective NAK — missing fragment(s) requested from peer"
                 );
                 metrics.naks_sent += naks.len();
                 for nak in naks {
@@ -591,7 +591,7 @@ impl Scenario {
                             msg_id = %hex8(msg_id),
                             to,
                             fragments = packets.len(),
-                            "CIRISEdge#422 WHOLE-FRAME RE-SEND — the frame was re-fragmented \
+                            "history: CIRISEdge#422 WHOLE-FRAME RE-SEND — the frame was re-fragmented \
                              and re-emitted in full (fragment-ARQ did not carry it in-round)"
                         );
                     }

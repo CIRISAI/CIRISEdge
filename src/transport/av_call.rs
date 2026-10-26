@@ -1998,7 +1998,7 @@ async fn write_call_row(shared: &Arc<Shared>) {
             tracing::warn!(
                 room = %shared.room,
                 reason = %reason,
-                "call row REFUSED — the call stays live; no row is faked (CIRISEdge#805 item 6)"
+                "call row REFUSED — the call stays live; no row is faked (tracked: CIRISEdge#805 item 6)"
             );
             shared.emit(CallEvent::RecordRefused { reason });
         }

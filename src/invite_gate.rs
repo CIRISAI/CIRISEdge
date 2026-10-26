@@ -198,7 +198,7 @@ impl InviteGate {
                 tracked = self.limiter.tracked(),
                 cap = Self::SENDER_CAP,
                 "accepted contact could NOT be promoted — the sender map is at \
-                 capacity; they remain on the stranger budget (CIRISEdge#554)"
+                 capacity; they remain on the stranger budget (history: CIRISEdge#554)"
             );
         }
         promoted

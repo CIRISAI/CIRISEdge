@@ -54,7 +54,7 @@ use crate::transport::TransportId;
 /// can hold an `Arc<dyn VerifyDirectory>` — `FederationDirectory`
 /// itself uses `impl Future` returns (RPIT in trait) which makes it
 /// non-dyn-compatible. Blanket-implemented for any
-/// `FederationDirectory`, so hosts can pass `Arc::new(MemoryBackend)`
+/// `FederationDirectory`, so hosts can pass `Arc::new(SqliteBackend)`
 /// or `Arc::new(PostgresBackend)` without picking edge's generics.
 #[async_trait]
 pub trait VerifyDirectory: Send + Sync + 'static {
@@ -231,6 +231,14 @@ pub trait RootingDirectory: Send + Sync + 'static {
         None
     }
 
+    /// CIRISEdge#888 — `key_id`'s registered `identity_type` (persist
+    /// `federation_keys`), read only to break a tie between keys bound to one
+    /// transport identity: a `node` key is the transport identity, an actor
+    /// key never is. Default `None` (no directory ⇒ no preference).
+    async fn registered_identity_type(&self, _key_id: &str) -> Option<String> {
+        None
+    }
+
     /// CIRISEdge#299 — **write-through** a peer's rooted transport
     /// identity so it survives a restart (reloaded via
     /// `list_all_transport_destinations` on boot) and a KNOWN peer is
@@ -389,6 +397,29 @@ pub trait RootingDirectory: Send + Sync + 'static {
         _key_id: &str,
     ) -> Result<Option<ciris_persist::federation::self_at_login::TransitKexPair>, String> {
         Ok(None)
+    }
+
+    /// CC 5.3.3.5 E1 pre-seal route fetch — this node's own `key:record:v1`
+    /// row for `key_id` (persist's projection of the key as a row), carried
+    /// in a route answer to a dialler that does not hold the key. Default
+    /// `Ok(None)` (no directory ⇒ no row to carry).
+    async fn own_key_record_row(
+        &self,
+        _key_id: &str,
+    ) -> Result<Option<ciris_persist::federation::Attestation>, String> {
+        Ok(None)
+    }
+
+    /// CC 5.3.3.5 E1 pre-seal route fetch — admit a `key:record:v1` row a
+    /// route answer carried, through persist's key door
+    /// (`apply_replicated_attestation`: proof of possession, the #1103
+    /// fingerprint, the plane's admission). `Ok` for an inserted or already
+    /// held row. Default `Err` (no directory ⇒ nothing is admitted).
+    async fn admit_key_record_row(
+        &self,
+        _row: &ciris_persist::federation::Attestation,
+    ) -> Result<(), String> {
+        Err("no federation directory wired (RootingDirectory default)".to_string())
     }
 
     /// CIRISEdge#406 — submit a signed route through persist's authenticated
@@ -700,6 +731,14 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             .map(|record| record.pubkey_ed25519_base64)
     }
 
+    async fn registered_identity_type(&self, key_id: &str) -> Option<String> {
+        FederationDirectory::lookup_public_key(self, key_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|record| record.identity_type)
+    }
+
     async fn hybrid_transport_binding_exists(&self, key_id: &str, dest_hash: [u8; 16]) -> bool {
         // Fail-closed on a backend read error: no VERIFIABLE hybrid route ⇒ not
         // PQ-attributable (a directory hiccup must never widen attribution).
@@ -738,6 +777,47 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
         key_id: &str,
     ) -> Result<Option<ciris_persist::federation::self_at_login::TransitKexPair>, String> {
         authenticated_self_signed_transit_pair(self, key_id).await
+    }
+
+    async fn own_key_record_row(
+        &self,
+        key_id: &str,
+    ) -> Result<Option<ciris_persist::federation::Attestation>, String> {
+        let held = crate::replication::key_plane_rows::key_record_rows(self, key_id)
+            .await
+            .map_err(|e| format!("key_record_rows: {e}"))?;
+        if let Some(row) = held.into_iter().next() {
+            return Ok(Some(row));
+        }
+        // A key registered before it travelled as a row (or seeded straight
+        // into the key table): its row is persist's pure projection of the
+        // self-scrubbed record, the same bytes the key plane would send.
+        let Some(record) = FederationDirectory::lookup_public_key(self, key_id)
+            .await
+            .map_err(|e| format!("lookup_public_key: {e}"))?
+        else {
+            return Ok(None);
+        };
+        Ok(ciris_persist::federation::key_plane::plan_key_record_row(&record, &None).ok())
+    }
+
+    async fn admit_key_record_row(
+        &self,
+        row: &ciris_persist::federation::Attestation,
+    ) -> Result<(), String> {
+        use ciris_persist::federation::attestation_apply::ReplicatedAttestationOutcome as Outcome;
+        match FederationDirectory::apply_replicated_attestation(
+            self,
+            ciris_persist::federation::SignedAttestation {
+                attestation: row.clone(),
+            },
+        )
+        .await
+        {
+            Ok(Outcome::Inserted | Outcome::Unchanged | Outcome::Deduplicated) => Ok(()),
+            Ok(other) => Err(format!("{other:?}")),
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     async fn put_signed_transport_destination(
@@ -915,7 +995,7 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
                 error = %e,
                 provenance = ?provenance,
                 epoch,
-                "CIRISEdge#299/#301: write-through of transport binding failed (peer still \
+                "history: CIRISEdge#299, history: CIRISEdge#301: write-through of transport binding failed (peer still \
                  admitted in-memory this session, but will not survive a restart)"
             ),
         }
@@ -951,7 +1031,7 @@ impl<F: FederationDirectory + Send + Sync + 'static> RootingDirectory for F {
             ),
             Err(ciris_persist::federation::Error::Conflict { .. }) => tracing::warn!(
                 key_id,
-                "CIRISEdge#362: announced-peer bookmark REJECTED — a different pubkey is \
+                "history: CIRISEdge#362: announced-peer bookmark REJECTED — a different pubkey is \
                  already recorded for this key_id (identity conflict, not a refresh)"
             ),
             Err(e) => tracing::debug!(

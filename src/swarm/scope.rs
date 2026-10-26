@@ -1009,7 +1009,7 @@ impl HoldingsPublishGate {
                 content_id = %content_id,
                 reason = refusal.reason_tag(),
                 "swarm_runtime: inbound holding claim REFUSED — the claimant is outside the \
-                 content's cohort audience (CIRISEdge#763): {refusal}",
+                 content's cohort audience (history: CIRISEdge#763): {refusal}",
             );
         }
         verdict
@@ -1038,11 +1038,11 @@ fn warn_holdings_scope_gate_unarmed() {
     if !HOLDINGS_SCOPE_GATE_UNARMED_WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             "fountain holdings scope gate UNARMED — scope-native addressing is not \
-             installed, so this node rides the pre-#499 staged state: every held \
+             installed, so this node rides the pre-tracked: CIRISEdge#499 staged state: every held \
              content is announced to every cohort peer, with no scope filter. This \
              is the deliberate default; arming is an OPERATOR OPT-IN — install the \
              MLS ScopeAddressTable via EdgeBuilder::scope_native_addressing (the \
-             CIRISVerify#259 ScopePrivacyDeriver is shipped). Warned once per process."
+             history: CIRISVerify#259 ScopePrivacyDeriver is shipped). Warned once per process."
         );
     }
 }
@@ -1784,13 +1784,13 @@ pub(crate) mod tests {
     /// alice (a person) with a personal phone and a server-class node she
     /// claimed, her family `fam-763` (alice alone), and mallory with a phone
     /// of her own. Real persist rows, so the audience is persist's.
-    pub(crate) async fn cohort_directory_763() -> Arc<ciris_persist::store::MemoryBackend> {
+    pub(crate) async fn cohort_directory_763() -> Arc<ciris_persist::store::SqliteBackend> {
         use crate::replication::bridge::tests::{
             fixture_family_founded, register_fixture_keys, seed_device_occurrence,
             seed_owner_binding, sign_family_fixture,
         };
         use ciris_persist::federation::types::{device_class, identity_type};
-        let backend = Arc::new(ciris_persist::store::MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[

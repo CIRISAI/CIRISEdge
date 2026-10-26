@@ -505,21 +505,6 @@ async fn https_round_trip_ephemeral_response() {
 }
 
 #[tokio::test]
-async fn https_round_trip_goal_declaration() {
-    https_envelope_round_trip(0x18, "GoalDeclaration", br#"{"goal_id":"g"}"#).await;
-}
-
-#[tokio::test]
-async fn https_round_trip_goal_retirement() {
-    https_envelope_round_trip(
-        0x19,
-        "GoalRetirement",
-        br#"{"goal_id":"g","retired_at":"2026-05-29T00:00:00Z"}"#,
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn https_round_trip_withdraws() {
     https_envelope_round_trip(
         0x1a,
@@ -683,8 +668,6 @@ fn all_message_types_have_https_round_trip_test() {
             MessageType::BlobChunkBody => "BlobChunkBody",
             MessageType::BlobChunkMiss => "BlobChunkMiss",
             MessageType::StewardDirective => "StewardDirective",
-            MessageType::GoalDeclaration => "GoalDeclaration",
-            MessageType::GoalRetirement => "GoalRetirement",
             MessageType::Withdraws => "Withdraws",
             MessageType::FountainHoldingClaim => "FountainHoldingClaim",
         }
@@ -742,8 +725,6 @@ fn all_message_types_have_https_round_trip_test() {
         (MessageType::BlobChunkBody, "BlobChunkBody"),
         (MessageType::BlobChunkMiss, "BlobChunkMiss"),
         (MessageType::StewardDirective, "StewardDirective"),
-        (MessageType::GoalDeclaration, "GoalDeclaration"),
-        (MessageType::GoalRetirement, "GoalRetirement"),
         (MessageType::Withdraws, "Withdraws"),
         (MessageType::FountainHoldingClaim, "FountainHoldingClaim"),
     ] {

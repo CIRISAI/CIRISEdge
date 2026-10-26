@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "43.1.1"
+version = "44.0.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1191,8 +1191,8 @@ dependencies = [
 
 [[package]]
 name = "ciris-persist"
-version = "59.1.0"
-source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v59.1.0#32512f52766ce2261869a0df1ac6fade75c08662"
+version = "60.0.0"
+source = "git+https://github.com/CIRISAI/CIRISPersist?tag=v60.0.0#8dec0deaac107e6a43241e7865b81db06edff0c2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1577,9 +1577,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.5"
+version = "0.7.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
+checksum = "cc907c45bb7e9ef8fc3778defd0f3cd8c81288f1b4e748eba064948f20c47122"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -1632,9 +1632,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
  "subtle",
@@ -2049,7 +2049,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d65aa39b3a5c1c9c1b745c9a019234bb7a21b77abcb4f4d266d706e2d577d65"
 dependencies = [
  "base16ct 1.0.0",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.7",
  "crypto-common 0.2.2",
  "digest 0.11.3",
  "ff 0.14.0",
@@ -3591,7 +3591,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 [[package]]
 name = "leviculum-announce-policy"
 version = "0.1.0"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "leviculum-telemetry-policy",
 ]
@@ -3599,7 +3599,7 @@ dependencies = [
 [[package]]
 name = "leviculum-ble-tx"
 version = "0.1.0"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "embassy-sync",
  "leviculum-core",
@@ -3608,15 +3608,15 @@ dependencies = [
 [[package]]
 name = "leviculum-channel-access"
 version = "0.1.0"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "leviculum-core",
 ]
 
 [[package]]
 name = "leviculum-core"
-version = "0.31.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+version = "0.31.1+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "aes 0.8.4",
  "cbc",
@@ -3633,8 +3633,8 @@ dependencies = [
 
 [[package]]
 name = "leviculum-lxmf"
-version = "0.31.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+version = "0.31.1+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "leviculum-core",
  "rand_core 0.6.4",
@@ -3644,8 +3644,8 @@ dependencies = [
 
 [[package]]
 name = "leviculum-std"
-version = "0.31.0+ciris.1"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+version = "0.31.1+ciris.1"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 dependencies = [
  "bluer",
  "clap",
@@ -3681,7 +3681,7 @@ dependencies = [
 [[package]]
 name = "leviculum-telemetry-policy"
 version = "0.1.0"
-source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.0+ciris.1#4cf116afdb3dc754293c461c9eceef4315387f9c"
+source = "git+https://github.com/CIRISAI/leviculum?tag=v0.31.1+ciris.1#2d8710a53d6fedc660eb9de0d33d54d105c124b5"
 
 [[package]]
 name = "libbz2-rs-sys"
@@ -5026,7 +5026,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.7",
  "crypto-common 0.2.2",
  "ff 0.14.0",
  "rand_core 0.10.1",
@@ -6499,7 +6499,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.5.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -6685,9 +6685,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",

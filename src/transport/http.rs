@@ -741,7 +741,7 @@ async fn serve_https(
         tracing::warn!(
             cert = %config.tls_cert.display(),
             "DEV_ONLY: HTTPS transport configured with self-signed certificate — \
-             MUST NOT be used in production (CIRISEdge#23 §1.0)"
+             MUST NOT be used in production (history: CIRISEdge#23 §1.0)"
         );
     }
 

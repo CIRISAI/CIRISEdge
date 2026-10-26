@@ -538,6 +538,38 @@ struct Inner {
     /// epoch. Covers every live slot, which is what makes the accept
     /// set a superset of the send set.
     reverse: HashMap<[u8; 16], InboundAddress>,
+    /// CIRISEdge#863 item 4 — addresses retracted by a seal or a group
+    /// removal, remembered (bounded, oldest first out) ONLY so a link that
+    /// was dialled to one and establishes after the retraction is still
+    /// classified on its own plane. Never consulted for receive acceptance.
+    retired: HashMap<[u8; 16], InboundAddress>,
+    retired_order: std::collections::VecDeque<[u8; 16]>,
+}
+
+/// CIRISEdge#863 item 4 — how many retracted addresses the plane memory keeps.
+/// A link establishes within seconds of its dial; this covers many rotations
+/// of many groups.
+pub const RETIRED_PLANE_MEMORY: usize = 4096;
+
+/// Move a retracted slot's reverse entries into the bounded plane memory.
+fn retire_slot(
+    inner_reverse: &mut HashMap<[u8; 16], InboundAddress>,
+    retired: &mut HashMap<[u8; 16], InboundAddress>,
+    order: &mut std::collections::VecDeque<[u8; 16]>,
+    slot: &EpochSlot,
+) {
+    for addr in slot.members.values() {
+        if let Some(entry) = inner_reverse.remove(&addr.0) {
+            if retired.insert(addr.0, entry).is_none() {
+                order.push_back(addr.0);
+            }
+        }
+    }
+    while order.len() > RETIRED_PLANE_MEMORY {
+        if let Some(old) = order.pop_front() {
+            retired.remove(&old);
+        }
+    }
 }
 
 // ─── The table ──────────────────────────────────────────────────────
@@ -663,7 +695,9 @@ impl ScopeAddressTable {
             return Err(ScopeAddressError::EmptyMembership { epoch });
         }
         let mut guard = self.inner.write();
-        let Inner { groups, reverse } = &mut *guard;
+        let Inner {
+            groups, reverse, ..
+        } = &mut *guard;
         let group_state = lookup_group_mut(groups, scope, group_id)
             .ok_or_else(|| unknown_group(scope, group_id))?;
         let current = group_state.current.epoch;
@@ -763,7 +797,9 @@ impl ScopeAddressTable {
         // reverse index is read (validation) and then written (commit),
         // so the whole install is one uninterruptible critical section
         // with no window where the two indexes disagree.
-        let Inner { groups, reverse } = &mut *guard;
+        let Inner {
+            groups, reverse, ..
+        } = &mut *guard;
 
         let group_state = lookup_group_mut(groups, scope, group_id)
             .ok_or_else(|| unknown_group(scope, group_id))?;
@@ -802,6 +838,8 @@ impl ScopeAddressTable {
         let mut guard = self.inner.write();
         let inner = &mut *guard;
         let reverse = &mut inner.reverse;
+        let retired = &mut inner.retired;
+        let retired_order = &mut inner.retired_order;
 
         let group_state = lookup_group_mut(&mut inner.groups, scope, group_id)
             .ok_or_else(|| unknown_group(scope, group_id))?;
@@ -814,7 +852,7 @@ impl ScopeAddressTable {
         // An unsealed older epoch shifts out of the accept window here.
         // Reported in the outcome, never silent.
         let evicted = group_state.previous.take().map(|stale| {
-            retract_slot(reverse, &stale);
+            retire_slot(reverse, retired, retired_order, &stale);
             stale.epoch
         });
 
@@ -844,12 +882,14 @@ impl ScopeAddressTable {
         let mut guard = self.inner.write();
         let inner = &mut *guard;
         let reverse = &mut inner.reverse;
+        let retired = &mut inner.retired;
+        let retired_order = &mut inner.retired_order;
 
         let group_state = lookup_group_mut(&mut inner.groups, scope, group_id)
             .ok_or_else(|| unknown_group(scope, group_id))?;
 
         Ok(group_state.previous.take().map(|sealed| {
-            retract_slot(reverse, &sealed);
+            retire_slot(reverse, retired, retired_order, &sealed);
             group_state.last_sealed = Some(SealedEpoch {
                 epoch: sealed.epoch,
                 members: sealed.members.keys().cloned().collect(),
@@ -878,7 +918,7 @@ impl ScopeAddressTable {
         let mut removed = 0;
         for slot in group_state.slots_mut() {
             removed += slot.members.len();
-            retract_slot(reverse, slot);
+            retire_slot(reverse, &mut inner.retired, &mut inner.retired_order, slot);
         }
         removed
     }
@@ -958,6 +998,23 @@ impl ScopeAddressTable {
     #[must_use]
     pub fn accepts_inbound(&self, dest_hash: &[u8; 16]) -> Option<InboundAddress> {
         self.inner.read().reverse.get(dest_hash).cloned()
+    }
+
+    /// CIRISEdge#863 item 4 — **plane classification only**: the address a
+    /// link was dialled to, live ([`Self::accepts_inbound`]) or retracted by a
+    /// seal or a group removal within the last [`RETIRED_PLANE_MEMORY`]
+    /// retractions. A link dialled to a scoped address that establishes after
+    /// its epoch was sealed is still a scoped link; classifying it Identity
+    /// would route its frames onto the identity plane for its lifetime
+    /// (CIRISEdge#728). Never use this to ACCEPT a frame: a sealed epoch
+    /// receives nothing.
+    #[must_use]
+    pub fn plane_of(&self, dest_hash: &[u8; 16]) -> Option<InboundAddress> {
+        let g = self.inner.read();
+        g.reverse
+            .get(dest_hash)
+            .or_else(|| g.retired.get(dest_hash))
+            .cloned()
     }
 
     // ── Introspection ────────────────────────────────────────────────
@@ -1174,13 +1231,6 @@ fn commit_slot(
     }
 }
 
-/// Withdraw a slot's addresses from the receive accept set.
-fn retract_slot(reverse: &mut HashMap<[u8; 16], InboundAddress>, slot: &EpochSlot) {
-    for addr in slot.members.values() {
-        reverse.remove(&addr.0);
-    }
-}
-
 /// Re-label a slot's accept-set entries after a phase transition. The
 /// role lives on the reverse entry (rather than being recomputed per
 /// packet) so the receive path stays one probe; relabelling is a cold
@@ -1323,6 +1373,46 @@ mod tests {
         t.install_group(&family(), "g-1", 7, &secret(0xA1), &MEMBERS)
             .expect("seed install");
         t
+    }
+
+    // ── CIRISEdge#863 item 4 — plane memory across a seal ──
+
+    /// A link dialled to Bob's epoch-7 address that establishes after the
+    /// rotation sealed epoch 7 is still classified on the group's plane
+    /// (`plane_of`), while receive acceptance refuses the sealed address
+    /// (`accepts_inbound`), and a never-installed hash is neither.
+    #[test]
+    fn a_sealed_address_keeps_its_plane_but_is_no_longer_accepted_863() {
+        let t = seeded();
+        let bob7 = t.address_at(&family(), "g-1", 7, MEMBERS[1]).unwrap();
+        t.install_next(
+            &family(),
+            "g-1",
+            8,
+            &secret(0xB2),
+            &[MEMBERS[0], MEMBERS[2]],
+        )
+        .expect("install next");
+        t.activate_next(&family(), "g-1").expect("activate");
+        assert!(
+            t.accepts_inbound(&bob7.0).is_some(),
+            "live at the previous epoch"
+        );
+        t.seal_rotation(&family(), "g-1").expect("seal");
+        assert!(
+            t.accepts_inbound(&bob7.0).is_none(),
+            "a sealed epoch receives nothing"
+        );
+        let plane = t
+            .plane_of(&bob7.0)
+            .expect("the plane memory keeps the sealed address");
+        assert_eq!(plane.group().group_id(), "g-1");
+        assert!(t.plane_of(&[0xEE; 16]).is_none());
+        // remove_group retires every live address the same way.
+        let carol8 = t.address_at(&family(), "g-1", 8, MEMBERS[2]).unwrap();
+        t.remove_group(&family(), "g-1");
+        assert!(t.accepts_inbound(&carol8.0).is_none());
+        assert!(t.plane_of(&carol8.0).is_some());
     }
 
     // ── CIRISEdge#805 item 8 — shares_group_with ──

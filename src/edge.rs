@@ -923,8 +923,68 @@ pub struct VerifiedEnvelopeSnapshot {
 /// chunk fetches in parallel across multiple blobs, and chunk-SHA
 /// alone can't disambiguate. Lifted to a type to keep
 /// `clippy::type_complexity` happy at the dispatcher signature.
-type BlobChunkPendingMap =
-    std::sync::Mutex<HashMap<([u8; 32], [u8; 32]), oneshot::Sender<ChunkResult>>>;
+/// CIRISEdge#887 — the waits, plus the late answers kept for a retry
+/// ([`crate::blob_swarm::chunk_waits`]).
+type BlobChunkPendingMap = std::sync::Mutex<crate::blob_swarm::chunk_waits::ChunkWaits>;
+
+/// CIRISEdge#887 — an inbound chunk answer (`BlobChunkBody` or
+/// `BlobChunkMiss`) meets the waits: it completes its fetch, or is kept for
+/// the retry when the fetch already timed out, or is dropped as unsolicited.
+fn record_chunk_answer(
+    waits: &BlobChunkPendingMap,
+    metrics: &crate::observability::EdgeMetrics,
+    key: ([u8; 32], [u8; 32]),
+    result: ChunkResult,
+) -> crate::blob_swarm::chunk_waits::Answered {
+    let answered = waits
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .answer(key, result, std::time::Instant::now());
+    if answered == crate::blob_swarm::chunk_waits::Answered::Kept {
+        metrics.add_blob_dag_chunks("late_answer_kept", 1);
+    }
+    answered
+}
+
+/// CIRISEdge#887 — the holder's mark that an answer for one chunk to one
+/// requester is in flight; cleared when the serve ends, however it ends.
+struct ServeInFlight<'a> {
+    waits: &'a BlobChunkPendingMap,
+    requester: String,
+    key: ([u8; 32], [u8; 32]),
+}
+
+impl<'a> ServeInFlight<'a> {
+    fn begin(
+        waits: &'a BlobChunkPendingMap,
+        requester: &str,
+        key: ([u8; 32], [u8; 32]),
+    ) -> Option<Self> {
+        let started = waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .begin_serve(
+                requester,
+                key,
+                std::time::Instant::now(),
+                crate::blob_swarm::chunk_waits::SERVE_IN_FLIGHT_MAX,
+            );
+        started.then(|| Self {
+            waits,
+            requester: requester.to_owned(),
+            key,
+        })
+    }
+}
+
+impl Drop for ServeInFlight<'_> {
+    fn drop(&mut self) {
+        self.waits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .end_serve(&self.requester, self.key);
+    }
+}
 
 /// CIRISEdge#55 — result of a single [`Edge::fetch_blob_chunk`] call.
 ///
@@ -3723,9 +3783,11 @@ impl Edge {
     /// # Timeout
     ///
     /// Caller-supplied. Returns
-    /// `EdgeError::Config("fetch_blob_chunk timeout")` if no matching
-    /// response arrives within `timeout`. The swarm scheduler's
-    /// per-request cap pairs with this.
+    /// `EdgeError::Transport(TransportError::Timeout(timeout))` if no
+    /// matching response arrives within `timeout` — typed, so the swarm
+    /// reads a slow holder as silence and not as a refusal (CIRISEdge#887).
+    /// An answer that lands after the timeout is kept for one more
+    /// `timeout`, and the next fetch of the chunk takes it without a send.
     ///
     /// # Concurrent fetches
     ///
@@ -3742,14 +3804,10 @@ impl Edge {
         timeout: std::time::Duration,
     ) -> Result<ChunkResult, EdgeError> {
         let key = (blob_sha256, chunk_sha256);
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self
-                .blob_chunk_fetch_pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.insert(key, tx);
-        }
+        let rx = match self.register_chunk_wait(key) {
+            crate::blob_swarm::chunk_waits::Wait::Pending(rx) => rx,
+            crate::blob_swarm::chunk_waits::Wait::AlreadyLanded(result) => return Ok(result),
+        };
 
         let fetch = crate::messages::BlobChunkFetch {
             blob_sha256,
@@ -3764,11 +3822,7 @@ impl Edge {
         // pending map because any holder may answer with either
         // BlobChunkBody or BlobChunkMiss).
         if let Err(e) = self.send(peer_key_id, fetch).await {
-            let mut pending = self
-                .blob_chunk_fetch_pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.remove(&key);
+            self.chunk_waits().forget(&key);
             return Err(e);
         }
 
@@ -3777,17 +3831,42 @@ impl Edge {
             Ok(Err(_)) => Err(EdgeError::Config(
                 "fetch_blob_chunk channel closed before response".into(),
             )),
-            Err(_) => {
-                let mut pending = self
-                    .blob_chunk_fetch_pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                pending.remove(&key);
-                Err(EdgeError::Config(format!(
-                    "fetch_blob_chunk timeout after {timeout:?}"
-                )))
-            }
+            Err(_) => Err(self.chunk_wait_timed_out(key, timeout)),
         }
+    }
+
+    /// CIRISEdge#887 — the chunk waits, locked.
+    fn chunk_waits(&self) -> std::sync::MutexGuard<'_, crate::blob_swarm::chunk_waits::ChunkWaits> {
+        self.blob_chunk_fetch_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// CIRISEdge#887 — register a chunk fetch; a late answer already kept for
+    /// this chunk is taken instead of sending again.
+    fn register_chunk_wait(
+        &self,
+        key: ([u8; 32], [u8; 32]),
+    ) -> crate::blob_swarm::chunk_waits::Wait {
+        let wait = self.chunk_waits().wait(key, std::time::Instant::now());
+        if matches!(wait, crate::blob_swarm::chunk_waits::Wait::AlreadyLanded(_)) {
+            self.metrics.add_blob_dag_chunks("late_answer_used", 1);
+        }
+        wait
+    }
+
+    /// CIRISEdge#887 — a chunk wait ran out. The mark it leaves keeps a late
+    /// answer for one more `timeout`; the error is the TYPED timeout, which
+    /// the swarm reads as silence, not as a refusal.
+    fn chunk_wait_timed_out(
+        &self,
+        key: ([u8; 32], [u8; 32]),
+        timeout: std::time::Duration,
+    ) -> EdgeError {
+        self.chunk_waits()
+            .expire(key, std::time::Instant::now(), timeout);
+        self.metrics.add_blob_dag_chunks("answer_timed_out", 1);
+        EdgeError::Transport(crate::TransportError::Timeout(timeout))
     }
 
     /// CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) — choose the
@@ -3927,22 +4006,12 @@ impl Edge {
         };
 
         let key = (blob_sha256, chunk_sha256);
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self
-                .blob_chunk_fetch_pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.insert(key, tx);
-        }
-
-        let forget = |edge: &Self| {
-            let mut pending = edge
-                .blob_chunk_fetch_pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.remove(&key);
+        let rx = match self.register_chunk_wait(key) {
+            crate::blob_swarm::chunk_waits::Wait::Pending(rx) => rx,
+            crate::blob_swarm::chunk_waits::Wait::AlreadyLanded(result) => return Ok(result),
         };
+
+        let forget = |edge: &Self| edge.chunk_waits().forget(&key);
 
         // CIRISEdge#718 (CC 5.4.6 at `4fd2e9e`, CIRISConstitution#132) — the
         // CARRIER, chosen ONCE, from the path table, BEFORE any dial (see
@@ -4029,12 +4098,7 @@ impl Edge {
             Ok(Err(_)) => Err(EdgeError::Config(
                 "fetch_blob_chunk_scoped channel closed before response".into(),
             )),
-            Err(_) => {
-                forget(self);
-                Err(EdgeError::Config(format!(
-                    "fetch_blob_chunk_scoped timeout after {timeout:?}"
-                )))
-            }
+            Err(_) => Err(self.chunk_wait_timed_out(key, timeout)),
         }
     }
 
@@ -4050,15 +4114,31 @@ impl Edge {
         chunk_sha256: [u8; 32],
         result: ChunkResult,
     ) -> bool {
-        let mut pending = self
-            .blob_chunk_fetch_pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(tx) = pending.remove(&(blob_sha256, chunk_sha256)) {
-            let _ = tx.send(result);
-            true
-        } else {
-            false
+        self.chunk_waits()
+            .complete_waiting(&(blob_sha256, chunk_sha256), result)
+    }
+
+    /// CIRISEdge#887 — test-only: deliver a chunk answer exactly as the
+    /// inbound dispatcher does, late answers included. Returns `"delivered"`,
+    /// `"kept"` (its fetch had timed out; the retry takes it) or
+    /// `"unsolicited"`.
+    #[doc(hidden)]
+    pub fn deliver_chunk_answer_for_test(
+        &self,
+        blob_sha256: [u8; 32],
+        chunk_sha256: [u8; 32],
+        result: ChunkResult,
+    ) -> &'static str {
+        use crate::blob_swarm::chunk_waits::Answered;
+        match record_chunk_answer(
+            &self.blob_chunk_fetch_pending,
+            &self.metrics,
+            (blob_sha256, chunk_sha256),
+            result,
+        ) {
+            Answered::Delivered => "delivered",
+            Answered::Kept => "kept",
+            Answered::Unsolicited => "unsolicited",
         }
     }
 
@@ -5234,7 +5314,7 @@ impl Edge {
                     enforcement = %CohortScopeEnforcement::WarnOnly.as_str(),
                     cohort_scope = ?scope,
                     federation_variant,
-                    "cohort_scope locality refusal bypassed (WarnOnly mode); CIRISEdge#48-A",
+                    "cohort_scope locality refusal bypassed (WarnOnly mode); history: CIRISEdge#48-A",
                 );
                 Ok(())
             }
@@ -5303,7 +5383,7 @@ impl Edge {
                     enforcement = %CohortScopeEnforcement::WarnOnly.as_str(),
                     cohort_scope = ?scope,
                     recipient_key_id,
-                    "cohort_scope recipient refusal bypassed (WarnOnly mode); CIRISEdge#48-A",
+                    "cohort_scope recipient refusal bypassed (WarnOnly mode); history: CIRISEdge#48-A",
                 );
                 Ok(())
             }
@@ -5571,7 +5651,7 @@ async fn route_replication_frame(
                     suppressed_prev,
                     "inbound CRPL replication frame with source_key_id=None and not a \
                      self-authenticating bootstrap kind — transport could not attribute \
-                     the sending link to a peer; dropping (CIRISEdge#317/#402)"
+                     the sending link to a peer; dropping (history: CIRISEdge#317, history: CIRISEdge#402)"
                 );
             }
             return true;
@@ -5622,7 +5702,7 @@ fn note_reply_dropped(
             detail = ?reason,
             suppressed_prev,
             "CRPL reply DROPPED — answers no round this node is driving; counted in \
-             EdgeMetrics.replication_reply_dropped_total (CIRISEdge#634)"
+             EdgeMetrics.replication_reply_dropped_total (history: CIRISEdge#634)"
         );
     }
 }
@@ -5688,7 +5768,7 @@ async fn note_backpressure_drop(
             "replication inbound frame DROPPED — {role:?} inbox full while its driver \
              was `{driver_phase}` for {driver_phase_for_ms} ms; counted in \
              EdgeMetrics.replication_inbound_backpressure_drops[_by_role] \
-             (CIRISEdge#373 / #634 / #662)"
+             (history: CIRISEdge#373 / history: CIRISEdge#634 / history: CIRISEdge#662)"
         );
     }
 }
@@ -5754,7 +5834,7 @@ async fn route_attributed_frame(
                 peer = %source,
                 ?kind,
                 "CRPL frame DROPPED — no coordinator and no responder factory for (peer, kind); \
-                 the ReplicationRuntime is not wired (CIRISEdge#348)"
+                 the ReplicationRuntime is not wired (history: CIRISEdge#348)"
             );
             true
         }
@@ -5766,7 +5846,7 @@ async fn route_attributed_frame(
             tracing::warn!(
                 peer = %source,
                 error = %e,
-                "replication route_inbound_bytes failed; dropping frame (CIRISEdge#348)"
+                "replication route_inbound_bytes failed; dropping frame (history: CIRISEdge#348)"
             );
             true
         }
@@ -6012,7 +6092,7 @@ async fn dispatch_inbound(
                 outcome = first_contact_outcome.label().unwrap_or("-"),
                 suppressed_prev,
                 "first-contact opaque request refused before verify; dropped, no answer \
-                 (CIRISEdge#683, FIRST_CONTACT.md §2.2)"
+                 (history: CIRISEdge#683, FIRST_CONTACT.md §2.2)"
             );
         }
         return;
@@ -6105,7 +6185,7 @@ async fn dispatch_inbound(
                     first_bytes_hex = %first_bytes_hex(&frame.envelope_bytes),
                     suppressed_prev,
                     error = %e,
-                    "verify rejected (CIRISEdge#317)",
+                    "verify rejected (history: CIRISEdge#317)",
                 );
             }
             return;
@@ -6225,7 +6305,7 @@ async fn dispatch_inbound(
                             sender_key_id = %envelope.signing_key_id,
                             claimed_scope = ?claimed,
                             directory_scope = ?recorded_scope,
-                            "consumer-side cohort_scope violation bypassed (WarnOnly mode); CIRISEdge#48-A",
+                            "consumer-side cohort_scope violation bypassed (WarnOnly mode); history: CIRISEdge#48-A",
                         );
                     }
                     CohortScopeEnforcement::Strict => {
@@ -6235,7 +6315,7 @@ async fn dispatch_inbound(
                             sender_key_id = %envelope.signing_key_id,
                             claimed_scope = ?claimed,
                             directory_scope = ?recorded_scope,
-                            "consumer-side cohort_scope violation REJECTED (CIRISEdge#48-A)",
+                            "consumer-side cohort_scope violation REJECTED (history: CIRISEdge#48-A)",
                         );
                         // CIRISEdge#48-A — moderation-signal event on
                         // the EventBus so lens-core can downweight the
@@ -6302,7 +6382,7 @@ async fn dispatch_inbound(
                     sender_key_id = %envelope.signing_key_id,
                     score = observed,
                     threshold = trust_threshold,
-                    "inbound envelope dropped — sender trust below threshold (CIRISEdge#48-B)",
+                    "inbound envelope dropped — sender trust below threshold (history: CIRISEdge#48-B)",
                 );
                 metrics.inc_inbound_dropped_low_trust();
                 // Moderation signal — `TrustShortCircuited` event with
@@ -6448,12 +6528,14 @@ async fn dispatch_inbound(
         let parsed = serde_json::from_str::<crate::messages::BlobChunkBody>(envelope.body.get());
         metrics.add_blob_dag_phase("inbound_parse_chunk_body", parse_started.elapsed());
         if let Ok(body) = parsed {
-            let mut pending = blob_chunk_fetch_pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(tx) = pending.remove(&(body.blob_sha256, body.chunk_sha256)) {
-                let _ = tx.send(ChunkResult::Bytes(body.bytes));
-            }
+            // CIRISEdge#887 — an answer whose fetch already timed out is kept
+            // for the retry, not discarded after its whole transfer was paid.
+            record_chunk_answer(
+                blob_chunk_fetch_pending,
+                metrics,
+                (body.blob_sha256, body.chunk_sha256),
+                ChunkResult::Bytes(body.bytes),
+            );
         }
     }
 
@@ -6461,13 +6543,13 @@ async fn dispatch_inbound(
         if let Ok(miss) =
             serde_json::from_str::<crate::messages::BlobChunkMiss>(envelope.body.get())
         {
-            let mut pending = blob_chunk_fetch_pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(tx) = pending.remove(&(miss.blob_sha256, miss.chunk_sha256)) {
-                let reason = format!("{:?}", miss.reason);
-                let _ = tx.send(ChunkResult::ChunkMiss { reason });
-            }
+            let reason = format!("{:?}", miss.reason);
+            record_chunk_answer(
+                blob_chunk_fetch_pending,
+                metrics,
+                (miss.blob_sha256, miss.chunk_sha256),
+                ChunkResult::ChunkMiss { reason },
+            );
         }
     }
 
@@ -6490,6 +6572,10 @@ async fn dispatch_inbound(
                 // CIRISEdge#739 — the serve clock: gate, store read, signed
                 // reply, shipped.
                 let serve_started = std::time::Instant::now();
+
+                // CIRISEdge#887 — held across the read and the send below once
+                // the request is ADMITTED (see the admitted arm).
+                let in_flight: Option<ServeInFlight<'_>>;
 
                 // CIRISEdge#499 — SCOPE ADMISSION, ahead of the read.
                 //
@@ -6588,7 +6674,7 @@ async fn dispatch_inbound(
                                     .map_or("federation", |a| a.group().scope().kind_token()),
                                 suppressed_prev,
                                 "BlobChunkFetch WITHHELD on scope admission — {reason} \
-                                 (CIRISEdge#499)",
+                                 (tracked: CIRISEdge#499)",
                             );
                         }
                         Some(reason)
@@ -6627,6 +6713,25 @@ async fn dispatch_inbound(
                         }
                     }
                 } else {
+                    // CIRISEdge#887 — one BODY in flight per (requester, chunk).
+                    // An admitted repeat request while this node is still
+                    // sending that requester the same chunk starts no second
+                    // ~1 MB transfer: the body in flight reaches the
+                    // requester's retry (or its kept late answer) by the
+                    // chunk's key. A restarted requester has the same key, so
+                    // its requests also merge with the bodies still headed to
+                    // its dead predecessor. Taken AFTER admission: every
+                    // request is still judged, and every refusal booked and
+                    // answered, on its own.
+                    in_flight = ServeInFlight::begin(
+                        blob_chunk_fetch_pending,
+                        &envelope.signing_key_id,
+                        (req.blob_sha256, req.chunk_sha256),
+                    );
+                    if in_flight.is_none() {
+                        metrics.inc_blob_scoped_carrier("serve:coalesced_in_flight");
+                        return;
+                    }
                     // CIRISEdge#587 — the verified envelope's signer IS the
                     // requesting peer; hand it to the source so a
                     // persist-backed impl can name the requester at
@@ -6765,7 +6870,7 @@ async fn dispatch_inbound(
                                         suppressed_prev,
                                         "BlobChunkFetch WITHHELD — the chunk is not one of the \
                                          named DAG's chunks in this store; the scope gate \
-                                         judged the named file, not this chunk (CIRISEdge#717)",
+                                         judged the named file, not this chunk (history: CIRISEdge#717)",
                                     );
                                 }
                             }
@@ -6904,7 +7009,7 @@ async fn dispatch_inbound(
                     error = ?err,
                     "BlobChunkFetch responder: a validly-delivered but MALFORMED \
                      BlobChunkFetch body was dropped with no reply — the requester will \
-                     time out (CIRISEdge#425)"
+                     time out (history: CIRISEdge#425)"
                 );
             }
         } else {
@@ -6917,7 +7022,7 @@ async fn dispatch_inbound(
                 transport = ?transport,
                 signing_key_id = %envelope.signing_key_id,
                 "BlobChunkFetch received but no BlobChunkSource wired; dropping unanswered — \
-                 wire EdgeBuilder::blob_chunk_source (CIRISEdge#55/#640)",
+                 wire EdgeBuilder::blob_chunk_source (history: CIRISEdge#55, history: CIRISEdge#640)",
             );
         }
     }
@@ -6951,7 +7056,7 @@ async fn dispatch_inbound(
                         tracing::warn!(
                             announcement_id = ?derive_announcement_id_from_body_hash(&body_sha256),
                             ?reason,
-                            "AccordCarrier FederationAnnouncement REFUSED at wire-layer multi-sig gate (CIRISEdge#19)",
+                            "AccordCarrier FederationAnnouncement REFUSED at wire-layer multi-sig gate (history: CIRISEdge#19)",
                         );
                         // CIRISEdge#34 v0.19.0 — refusal IS a path-lost
                         // signal: edge-substrate declined to propagate
@@ -6977,7 +7082,7 @@ async fn dispatch_inbound(
                         {
                             tracing::warn!(
                                 error = %e,
-                                "DeliveryRefusalAttestation emission failed (CIRISEdge#19)",
+                                "DeliveryRefusalAttestation emission failed (history: CIRISEdge#19)",
                             );
                         }
                         // Drop the announcement from edge's downstream
@@ -7083,7 +7188,7 @@ async fn dispatch_inbound(
                     holder_key_id = %envelope.signing_key_id,
                     reason = ?miss.reason,
                     error = %e,
-                    "Withdraws emission failed (CIRISEdge#42, CEG §10.1.2)",
+                    "Withdraws emission failed (history: CIRISEdge#42, CEG §10.1.2)",
                 );
             }
         }
@@ -7207,7 +7312,7 @@ async fn dispatch_inbound(
                             message_type = ?envelope.message_type,
                             required_scope = required_scope,
                             ?sub_reason,
-                            "envelope REFUSED at delegation authority gate (CIRISEdge#108 part 2)",
+                            "envelope REFUSED at delegation authority gate (history: CIRISEdge#108 part 2)",
                         );
                         let refusal_reason = RefusalReason::DelegationNotAuthorized {
                             required_scope: required_scope.to_owned(),
@@ -7225,7 +7330,7 @@ async fn dispatch_inbound(
                         {
                             tracing::warn!(
                                 error = %e,
-                                "DeliveryRefusalAttestation emission failed (CIRISEdge#108 part 2)",
+                                "DeliveryRefusalAttestation emission failed (history: CIRISEdge#108 part 2)",
                             );
                         }
                         return;
@@ -7239,7 +7344,7 @@ async fn dispatch_inbound(
                 // otherwise refuse every envelope.)
                 tracing::warn!(
                     event = "edge.delegation_gate.bypassed_no_directory",
-                    "delegation_authority_gate_enabled but no federation_directory wired; bypassing gate (CIRISEdge#108 part 2)",
+                    "delegation_authority_gate_enabled but no federation_directory wired; bypassing gate (history: CIRISEdge#108 part 2)",
                 );
             }
         }
@@ -7319,7 +7424,7 @@ async fn dispatch_inbound(
                     error = %e,
                     transport = ?transport,
                     sender_key_id = %envelope.signing_key_id,
-                    "FountainHoldingClaim body parse failed at dispatch (CIRISEdge#184)",
+                    "FountainHoldingClaim body parse failed at dispatch (history: CIRISEdge#184)",
                 );
             }
         }
@@ -7540,11 +7645,11 @@ async fn dispatch_inbound(
                                     key_id = %signer.key_id,
                                     "first-contact answer: no key:record:v1 row for this node's \
                                      own key; the requester may not be able to verify it \
-                                     (CIRISEdge#683, persist v59.0.0)"
+                                     (history: CIRISEdge#683, persist v59.0.0)"
                                 ),
                                 Err(e) => tracing::warn!(
                                     error = %e,
-                                    "first-contact answer: own key lookup failed (CIRISEdge#683)"
+                                    "first-contact answer: own key lookup failed (history: CIRISEdge#683)"
                                 ),
                             }
                         }
@@ -8517,7 +8622,9 @@ impl EdgeBuilder {
 
         let content_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
         // CIRISEdge#55 — sibling pending-map for chunk fetches.
-        let blob_chunk_fetch_pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let blob_chunk_fetch_pending = Arc::new(std::sync::Mutex::new(
+            crate::blob_swarm::chunk_waits::ChunkWaits::default(),
+        ));
 
         // CIRISEdge#46 (v0.18.0) — populate the in-memory canonical
         // bootstrap-peer set. The persist reseed is the COHAB INIT
@@ -9239,7 +9346,7 @@ async fn emit_withdraws(
 
     // Wrap in a typed envelope addressed to the holder. The envelope's
     // hybrid signature IS the proof-of-authority — no body-internal
-    // signature (same shape as GoalRetirement, CIRISEdge#41).
+    // signature (the durable single-signer shape).
     let envelope_bytes = {
         let mut env = build_envelope(
             MessageType::Withdraws,
@@ -9801,7 +9908,7 @@ mod delegation_gate_tests {
         algorithm, attestation_type as att_type, identity_type, Attestation, KeyRecord,
         SignedAttestation, SignedKeyRecord,
     };
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
     use sha2::{Digest as _, Sha256};
 
     // ── v6.3.2 fixture-signature helpers ────────────────────────────
@@ -9951,6 +10058,10 @@ mod delegation_gate_tests {
                 obj.insert("sub_delegation".to_owned(), serde_json::json!(true));
             }
         }
+        // persist v60.0.0 (#1048): a term-bearing edge (`sub_delegation` here)
+        // must carry a bounded `delegation_valid_until`; persist's fixture helper
+        // adds one only when the edge is term-bearing.
+        ciris_persist::federation::admission::with_test_term(&mut envelope, now);
         // #598: bind the signed `asserted_at` into the envelope BEFORE signing.
         if let Some(obj) = envelope.as_object_mut() {
             obj.insert(
@@ -10043,7 +10154,7 @@ mod delegation_gate_tests {
         att
     }
 
-    async fn seed_keys(backend: &Arc<MemoryBackend>, keys: &[(&str, &str)]) {
+    async fn seed_keys(backend: &Arc<SqliteBackend>, keys: &[(&str, &str)]) {
         use ciris_persist::federation::FederationDirectory;
         for (kid, itype) in keys {
             backend
@@ -10055,7 +10166,7 @@ mod delegation_gate_tests {
         }
     }
 
-    async fn seed_attestation(backend: &Arc<MemoryBackend>, att: Attestation) {
+    async fn seed_attestation(backend: &Arc<SqliteBackend>, att: Attestation) {
         use ciris_persist::federation::FederationDirectory;
         backend
             .put_attestation(SignedAttestation { attestation: att })
@@ -10112,7 +10223,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn empty_trust_roots_refuses_with_no_trust_roots() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(&backend, &[("agent", identity_type::AGENT)]).await;
         let dir: Arc<dyn ciris_persist::federation::FederationDirectory> = backend;
         let out = verify_self_at_login_delegation(
@@ -10136,7 +10247,7 @@ mod delegation_gate_tests {
     // placeholder-signature fixture pattern.
     #[tokio::test]
     async fn happy_path_admits_signer_reached_via_in_scope_chain() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10166,7 +10277,7 @@ mod delegation_gate_tests {
     /// six-hop chain `user-root → d1 → … → d5 → agent`, every hop carrying the
     /// scope and `sub_delegation`. Built once, walked at two depths below.
     async fn six_hop_chain() -> Arc<dyn ciris_persist::federation::FederationDirectory> {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let keys = ["user-root", "d1", "d2", "d3", "d4", "d5", "agent"];
         let mut seeded = vec![("user-root", identity_type::USER)];
         for k in &keys[1..] {
@@ -10226,7 +10337,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn missing_delegation_refuses_with_signer_unreached() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10254,7 +10365,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn retracted_delegation_refuses_with_retracted_at_root() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10289,7 +10400,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn delegation_without_required_scope_refuses_with_missing_scope() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10329,7 +10440,7 @@ mod delegation_gate_tests {
     // signal across the union.
     #[tokio::test]
     async fn multi_root_fold_prefers_missing_scope_over_retracted() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[

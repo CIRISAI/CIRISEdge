@@ -1248,21 +1248,25 @@ async fn the_pass_files_here_when_the_claim_is_retracted_stale_or_lapsed_763() {
     assert!(lapsed.repairs.is_empty() && refiled.repairs.is_empty());
 }
 
-/// Tombstone `sha` on `node` with a counter-notice takedown (`dmca_512`: the
+/// Tombstone `sha` on `node` with a counter-notice takedown (`dmca512`: the
 /// bytes stay on disk through its window, withheld), as persist's own I778
 /// does: a claimant who is the signed subject of the content's establishing
-/// row files a signed `takedown_notice`, and the node records it.
+/// row files a signed takedown notice, and the node records it.
+///
+/// persist v60.0.0 (CIRISPersist#803, #854) — the notice is a
+/// `takedown_notice:{basis}:v1` ROW the claimant signs, so the claimant is a
+/// lowercase federation key id, not a raw base64 pubkey; the basis is CC
+/// 3.3.2's spelling (`dmca512`).
 async fn take_down(node: &Node, sha: &[u8; 32]) -> String {
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine as _;
-    use ciris_crypto::{ClassicalSigner as _, Ed25519Signer};
-    use ciris_persist::federation::takedown_tombstone::{takedown_tombstone, TakedownNotice};
+    use ciris_persist::federation::takedown_tombstone::{
+        notice_dimension, takedown_tombstone, TakedownNotice,
+    };
     use ciris_persist::federation::tier_ingest::test_support as ts;
+    use ciris_persist::federation::types::attestation_type;
     use ciris_persist::federation::FederationDirectory;
     let dir: &dyn FederationDirectory = &*node.dir;
     let sha_hex = hex::encode(sha);
-    let claimant = Ed25519Signer::from_seed(&[0xa1; 32]).expect("claimant seed");
-    let claimant_id = B64.encode(claimant.public_key().expect("claimant pk"));
+    let claimant_id = "takedown-claimant-a1".to_owned();
     let producer = "takedown-producer";
     for k in [producer, claimant_id.as_str()] {
         if dir.lookup_public_key(k).await.expect("lookup").is_none() {
@@ -1276,7 +1280,7 @@ async fn take_down(node: &Node, sha: &[u8; 32]) -> String {
             attestation_id: uuid::Uuid::new_v4().to_string(),
             attesting_key_id: producer.into(),
             attested_key_id: producer.into(),
-            attestation_type: ciris_persist::federation::types::attestation_type::SCORES.into(),
+            attestation_type: attestation_type::SCORES.into(),
             weight: None,
             asserted_at: now,
             expires_at: None,
@@ -1304,31 +1308,32 @@ async fn take_down(node: &Node, sha: &[u8; 32]) -> String {
     })
     .await
     .expect("the establishing row");
-    let ts_of = |t: chrono::DateTime<chrono::Utc>| serde_json::to_value(t).expect("ts");
-    let mut envelope = serde_json::json!({
-        "contribution_id": uuid::Uuid::new_v4().to_string(),
-        "contribution_type": "proposal",
-        "author_id": claimant_id,
-        "subject": {"domain": "media", "language": "en", "subject": "takedown_notice"},
-        "payload": {
-            "content_sha256": sha_hex,
-            "claimant_key_id": claimant_id,
-            "legal_basis": "dmca_512",
-            "jurisdiction": "US",
-            "good_faith_statement": "good faith",
-            "claim_text": "claim",
-            "asserted_at": ts_of(now),
-            "expires_at": ts_of(now + chrono::Duration::days(30)),
-        },
-        "witness_set": null,
-        "signature": {"ed25519": "", "ml_dsa_65": null, "signed_at": ts_of(now)},
-        "submitted_at": ts_of(now),
+    let basis = "dmca512";
+    let envelope = serde_json::json!({
+        "dimension": notice_dimension(basis),
+        "score": -1.0,
+        "confidence": 1.0,
+        "subject_kind": "takedown_notice",
+        "content_sha256": sha_hex,
+        "claimant_key_id": claimant_id,
+        "legal_basis": basis,
+        "jurisdiction": "US",
+        "good_faith_statement": "good faith",
+        "claim_text": "claim",
     });
-    let canonical = ciris_persist::verify::canonical::canonicalize_envelope_for_signing(&envelope)
-        .expect("canonical");
-    envelope["signature"]["ed25519"] =
-        serde_json::json!(B64.encode(claimant.sign(&canonical).expect("sign")));
-    let report = takedown_tombstone(dir, &TakedownNotice { envelope }, "takedown-node")
+    let mut row = ts::bare_attestation(
+        &uuid::Uuid::new_v4().to_string(),
+        &claimant_id,
+        &claimant_id,
+        &envelope,
+    );
+    row.attestation_type = attestation_type::SCORES.into();
+    row.weight = None;
+    row.asserted_at = now;
+    row.scrub_timestamp = now;
+    row.expires_at = Some(now + chrono::Duration::days(30));
+    let notice = TakedownNotice::of_row(&ts::seal_row(&claimant_id, row)).expect("notice row");
+    let report = takedown_tombstone(dir, &notice, "takedown-node")
         .await
         .expect("the takedown");
     assert!(report.tombstoned, "tombstoned: {report:?}");

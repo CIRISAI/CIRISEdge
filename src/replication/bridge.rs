@@ -99,9 +99,6 @@ use super::single_flight::SingleFlight;
 use ciris_persist::federation::admission::has_accord_conferred_role;
 use ciris_persist::federation::consent_grammar::{self, ConsentTransferPolicy};
 use ciris_persist::federation::namespace::{self, Projection};
-use ciris_persist::federation::operational::{
-    OrgMembership, Organization, SignedOrgMembership, SignedOrganization, SignedPartnerRecord,
-};
 use ciris_persist::federation::trust_root::capability_roots_to_trusted_root;
 use ciris_persist::federation::types::delegation_scope;
 use ciris_persist::federation::types::{
@@ -110,7 +107,6 @@ use ciris_persist::federation::types::{
     SignedFamilyMembershipRevocation, SignedFamilyMembershipWidening, SignedLocationProof,
 };
 use ciris_persist::federation::FederationDirectory;
-use ciris_verify_core::threshold::ThresholdMember;
 
 use super::directory::ReplicationDirectory;
 use super::group_plane::{is_membership_plane, GroupPlane};
@@ -535,7 +531,6 @@ pub(crate) fn typed_terminal_verdict(
             licensure_refusal::NAMED_EDGE_NOT_LICENSE,
             licensure_refusal::NAMED_EDGE_NOT_ONTO_EMITTER,
             licensure_refusal::AUTHORITY_ACTS_BY_QUORUM,
-            licensure_refusal::NOT_AUTHORITY_AT_RECEIPT,
         ]
         .into_iter()
         .find(|terminal| *reason == *terminal),
@@ -592,6 +587,8 @@ pub(crate) fn typed_terminal_verdict(
         // not-live stands. So the same row is never admitted again — terminal.
         // persist v59.0.0 types it `Error::AssertedAtStale` (its `kind()` stays
         // `federation_invalid_argument`); the token booked is persist's const.
+        // v60.0.0 widens it to the licensure, key_grant and consent planes
+        // (`plane`), on the same one-way legs, so it stays terminal there too.
         E::AssertedAtStale { .. } => {
             Some(ciris_persist::federation::self_roster::ASSERTED_AT_STALE)
         }
@@ -1844,51 +1841,6 @@ impl IdentityRowReach {
     }
 }
 
-/// Type alias for the v2 key-directory provider — an operator-configured
-/// callback yielding the current federation key_directory
-/// (`Vec<ThresholdMember>`). Re-invoked on each operational admit so
-/// admission sees the live directory. Used by persist's
-/// `put_organization` / `put_org_membership` admit surfaces for the
-/// single-signer role-chain authority check (Verify v5.1.0's
-/// `resolve_role_authority`). When `None`, the bridge refuses to admit
-/// operational-kind envelopes (returns `false` from `apply_*`) —
-/// fail-closed.
-pub type KeyDirectoryProvider = Arc<dyn Fn() -> Vec<ThresholdMember> + Send + Sync>;
-
-/// Type alias for the v2 root-stewards provider — an operator-configured
-/// callback yielding the federation's bootstrap steward `member_id`s.
-/// Used by persist's `put_organization` / `put_org_membership` admit
-/// surfaces to anchor the role-chain at trust root (the founder set
-/// per CEG §9.1). When `None`, the bridge refuses to admit operational-
-/// kind envelopes — fail-closed.
-pub type RootStewardsProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
-
-/// Type alias for the v2 steward-roster provider — an operator-configured
-/// callback yielding the current federation steward roster
-/// (`Vec<ThresholdMember>`). Used by persist's `put_partner_record`
-/// admit surface for the M-of-N steward quorum verification. When
-/// `None`, the bridge refuses to admit `partner_record` envelopes —
-/// fail-closed.
-pub type StewardRosterProvider = Arc<dyn Fn() -> Vec<ThresholdMember> + Send + Sync>;
-
-/// v2 (CEG 1.0-RC2 §5.6.8.13 / FSD §5.2) — operational-data admission
-/// providers bundle. Operators set this at bridge construction time to
-/// enable v2 operational-kind admission; leaving it `None` keeps the
-/// bridge v1-only (operational `apply_*` returns `false`, gracefully
-/// declining to admit).
-#[derive(Clone)]
-pub struct OperationalProviders {
-    /// The federation key_directory — `Vec<ThresholdMember>`. See
-    /// [`KeyDirectoryProvider`].
-    pub key_directory: KeyDirectoryProvider,
-    /// The federation bootstrap stewards' `member_id`s. See
-    /// [`RootStewardsProvider`].
-    pub root_stewards: RootStewardsProvider,
-    /// The federation steward roster — `Vec<ThresholdMember>`. See
-    /// [`StewardRosterProvider`].
-    pub steward_roster: StewardRosterProvider,
-}
-
 /// CIRISEdge#440 ask 3 — one author's memoized quarantine consult within a
 /// single sweep/fetch. A tri-state on purpose: `Withheld` and `ReadError` both
 /// withhold, but they are DIFFERENT facts booking DIFFERENT
@@ -1975,11 +1927,6 @@ pub struct FederationDirectoryReplicationBridge {
     /// policy is resolved by persist's `namespace::projection_for`.
     self_provider: Option<CohortProvider>,
     config: BridgeConfig,
-    /// v2 operational-data admission providers. `None` = v2 admission
-    /// fail-closed; operational kinds' `apply_*` returns `false` without
-    /// touching persist. Set via [`Self::with_operational`] or
-    /// [`Self::with_config_and_operational`].
-    operational: Option<OperationalProviders>,
     /// CIRISEdge#386 — this node's OWN federation key_id: the `user` half of
     /// the trust-root walk ("does the recipient's capability root to a root
     /// *I* trust?"). `None` fail-closes the trace serve gate — without a local
@@ -2407,105 +2354,6 @@ impl FederationDirectoryReplicationBridge {
             self_provider: None,
             local_key_id: None,
             config,
-            operational: None,
-            consent_memo: Mutex::new(None),
-            consent_flight: SingleFlight::default(),
-            consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
-            rooted_walks: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            read_probe: ReadProbe::default(),
-            metrics: None,
-            convergence: None,
-            revocation_observer: None,
-            membership_widener: None,
-            key_grant_wake: None,
-            release_kick: std::sync::OnceLock::new(),
-            mesh_config: None,
-            accord_relay_gate: None,
-            owner_cache: Mutex::new(OwnerCache::default()),
-            owner_flight: SingleFlight::default(),
-            announce_cache: Mutex::new(HashMap::new()),
-            announce_reads: std::sync::atomic::AtomicUsize::new(0),
-            kind_publish_selector: None,
-            owner_reads: std::sync::atomic::AtomicUsize::new(0),
-            owner_route_walks: std::sync::atomic::AtomicUsize::new(0),
-            owner_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
-            collective_routed_recipients: std::sync::atomic::AtomicUsize::new(0),
-            first_contact_recipients: std::sync::atomic::AtomicUsize::new(0),
-            sweep_gate: SweepGate::new(config.advertise_sweep_permits),
-            known_hashes: Mutex::new(crate::replication::known_hashes::KnownHashes::new()),
-            lookup_limiter: Mutex::new(crate::rate_limit::RateLimiter::new(
-                crate::rate_limit::Policy::quota(
-                    Self::IDENTIFIER_LOOKUPS_PER_WINDOW,
-                    Self::IDENTIFIER_LOOKUP_WINDOW_SECS,
-                    Self::IDENTIFIER_LOOKUP_MAX_PEERS,
-                )
-                .with_long_windows([
-                    Some(crate::rate_limit::Quota::new(
-                        Self::IDENTIFIER_LOOKUPS_PER_HOUR,
-                        3_600,
-                    )),
-                    Some(crate::rate_limit::Quota::new(
-                        Self::IDENTIFIER_LOOKUPS_PER_DAY,
-                        86_400,
-                    )),
-                ]),
-            )),
-            serve_tier: crate::replication::serve_tier::CachedServeTier::new(),
-            serve_tier_resolver: None,
-            serve_tier_subject: None,
-            missing_signers: Mutex::new(std::collections::BTreeMap::new()),
-            missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
-            sweep_cursors: Mutex::new(SweepCursors::default()),
-            advertise_inputs: Mutex::new(AdvertiseInputs::default()),
-            advertise_ledger: Mutex::new(AdvertiseLedger::default()),
-            round_withholds: Mutex::new(HashMap::new()),
-            last_advertise_round: Mutex::new(None),
-            sweep_max_page_rows: std::sync::atomic::AtomicUsize::new(0),
-            // CIRISEdge#544 — always on. It is a rate limiter on asking for what
-            // this node just refused, not a policy, so there is no configuration
-            // in which asking flat-out is the right answer.
-            refusal_backoff: RefusalBackoff::new(),
-            retry_suppressions: std::sync::atomic::AtomicUsize::new(0),
-            rows_parked_on_signer: std::sync::atomic::AtomicUsize::new(0),
-            signer_releases: std::sync::atomic::AtomicUsize::new(0),
-            park_log: park_log_throttle(),
-        }
-    }
-
-    /// Construct with default [`BridgeConfig`] **+ v2 operational
-    /// admission enabled**. The operational providers (key_directory /
-    /// root_stewards / steward_roster) are required for the bridge to
-    /// admit `organization` / `org_membership` / `partner_record`
-    /// envelopes; without them, the operational-kind `apply_*` returns
-    /// `false` (fail-closed; v1 kinds remain unaffected).
-    pub fn with_operational(
-        directory: Arc<dyn FederationDirectory>,
-        cohort: CohortProvider,
-        operational: OperationalProviders,
-    ) -> Self {
-        Self::with_config_and_operational(directory, cohort, BridgeConfig::default(), operational)
-    }
-
-    /// Construct with explicit configuration **+ v2 operational
-    /// admission enabled**.
-    pub fn with_config_and_operational(
-        directory: Arc<dyn FederationDirectory>,
-        cohort: CohortProvider,
-        config: BridgeConfig,
-        operational: OperationalProviders,
-    ) -> Self {
-        Self {
-            directory,
-            cohort,
-            engine: None,
-            revocations: None,
-            pull_sink: None,
-            receipts: Arc::new(crate::receipts::ReceiptLedger::new()),
-            self_provider: None,
-            local_key_id: None,
-            config,
-            operational: Some(operational),
             consent_memo: Mutex::new(None),
             consent_flight: SingleFlight::default(),
             consent_set_reads: std::sync::atomic::AtomicUsize::new(0),
@@ -3009,7 +2857,7 @@ impl FederationDirectoryReplicationBridge {
                  JUDGE, which is not `signer_not_seated`; `unresolved` means the verdict \
                  was never resolved rather than refused on its merits; and \
                  `object_root_unnamed` means the row's SIGNED bytes name no accord, so \
-                 there is nothing to judge it against — CIRISPersist#731)"
+                 there is nothing to judge it against — history: CIRISPersist#731)"
             );
         }
         true
@@ -3248,7 +3096,7 @@ impl FederationDirectoryReplicationBridge {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "accord-quorum-evidence cursor serve read failed (CIRISEdge#474)"
+                    "accord-quorum-evidence cursor serve read failed (history: CIRISEdge#474)"
                 );
                 return (Vec::new(), 0, None);
             }
@@ -3275,7 +3123,7 @@ impl FederationDirectoryReplicationBridge {
                         error = %e,
                         "accord-quorum-evidence bundle could not be serialized for \
                          the wire — OMITTED from this cursor page; it will not \
-                         replicate from this node (CIRISEdge#474/#433)"
+                         replicate from this node (history: CIRISEdge#474, history: CIRISEdge#433)"
                     );
                     self.withhold(
                         crate::observability::WithholdReason::RowNotSerializable,
@@ -3444,7 +3292,7 @@ impl FederationDirectoryReplicationBridge {
                         "holdings drain CANNOT ADVANCE — a full page came back with \
                          no new resume cursor, so this round's holdings view is \
                          truncated and rows past it are re-wanted from peers even \
-                         though they are held (CIRISEdge#531)"
+                         though they are held (history: CIRISEdge#531)"
                     );
                     break;
                 }
@@ -3458,7 +3306,7 @@ impl FederationDirectoryReplicationBridge {
                          TRUNCATED, so rows past the cap are re-wanted from peers even \
                          though they are held (wasteful, self-correcting). Raise \
                          `sweep_page_rows` or investigate a plane this large \
-                         (CIRISEdge#531)"
+                         (history: CIRISEdge#531)"
                     );
                 }
             }
@@ -3578,7 +3426,7 @@ impl FederationDirectoryReplicationBridge {
                 site,
                 "trace plane PAUSED by mesh config — a trust root relieved \
                  `feature.trace_replication` to 0, so `trace:*` rows are withheld \
-                 until the relief expires or is superseded (CIRISEdge#440)"
+                 until the relief expires or is superseded (history: CIRISEdge#440)"
             );
         }
     }
@@ -3802,7 +3650,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                         signer = %signer_key_id,
                         cap = MISSING_SIGNER_CAP,
                         "missing-signer set at cap with no source hoarding — \
-                         DROPPING this name (CIRISEdge#552)"
+                         DROPPING this name (history: CIRISEdge#552)"
                     );
                     return;
                 }
@@ -4317,8 +4165,8 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                     requester = ?other,
                     kind = ?kind,
                     "subject Pull refused: requester is not the subject and this kind \
-                     is not publicly pullable — serving nothing (#462 fail-closed; \
-                     #552 widened only the unconditionally-public planes)"
+                     is not publicly pullable — serving nothing (history: CIRISEdge#462 fail-closed; \
+                     history: CIRISEdge#552 widened only the unconditionally-public planes)"
                 );
                 Vec::new()
             }
@@ -4852,7 +4700,7 @@ impl FederationDirectoryReplicationBridge {
                 suppressed_prev,
                 "the park capacity is full: evicted the oldest parked row(s); each will be \
                  asked for once more and re-parked if its signer is still absent \
-                 (CIRISEdge#858)"
+                 (tracked: CIRISEdge#858)"
             );
         }
     }
@@ -5185,9 +5033,6 @@ impl FederationDirectoryReplicationBridge {
             }
             EnvelopeKind::Family => self.list_families(window).await,
             EnvelopeKind::Community => self.list_communities(window).await,
-            EnvelopeKind::Organization => self.list_organizations(window).await,
-            EnvelopeKind::OrgMembership => self.list_org_memberships(window).await,
-            EnvelopeKind::PartnerRecord => self.list_partner_records(window).await,
             EnvelopeKind::FamilyMembershipRevocation => {
                 self.list_family_membership_revocations(window, None).await
             }
@@ -5220,7 +5065,15 @@ impl FederationDirectoryReplicationBridge {
             // #848 — a key_grant set is an attestation row and is advertised
             // by the Attestation arm above; listing it under its own kind
             // would offer every row twice.
-            EnvelopeKind::AccordQuorumEvidence | EnvelopeKind::KeyGrant => Vec::new(),
+            // persist v60.0.0 (§8) — the operational planes are retired: an
+            // organisation is an affiliation, carried on the attestation plane.
+            // Nothing is advertised on them; an inbound object is refused
+            // `federation_envelope_kind_retired` (`refuse_retired_framed`).
+            EnvelopeKind::AccordQuorumEvidence
+            | EnvelopeKind::KeyGrant
+            | EnvelopeKind::Organization
+            | EnvelopeKind::OrgMembership
+            | EnvelopeKind::PartnerRecord => Vec::new(),
         }
     }
 
@@ -5259,7 +5112,7 @@ impl FederationDirectoryReplicationBridge {
                 "subject-Pull attestation read REFUSED by this directory: serving an \
                  EMPTY axis. This is permanent on this directory (a proxy that does \
                  not serve the read), NOT a statement the subject has no testimony, \
-                 and a re-pull will not change it (persist #1001, CIRISEdge#462)"
+                 and a re-pull will not change it (history: CIRISPersist#1001, history: CIRISEdge#462)"
             );
         } else {
             tracing::warn!(
@@ -5269,7 +5122,7 @@ impl FederationDirectoryReplicationBridge {
                 "subject-Pull attestation read FAILED: serving an EMPTY axis this \
                  round (a transient backend fault, NOT a statement the subject has \
                  no testimony; the requester re-pulls next round) \
-                 (CIRISEdge#462/#429, persist #1001)"
+                 (history: CIRISEdge#462, history: CIRISEdge#429, history: CIRISPersist#1001)"
             );
         }
     }
@@ -5309,7 +5162,7 @@ impl FederationDirectoryReplicationBridge {
                                 "subject-Pull ", $what, " read FAILED — serving an \
                                  EMPTY axis this round (a transient read error, NOT \
                                  a statement the subject has no testimony; the \
-                                 requester re-pulls next round) (CIRISEdge#462/#429)"
+                                 requester re-pulls next round) (history: CIRISEdge#462, history: CIRISEdge#429)"
                             )
                         );
                         Vec::new()
@@ -6024,9 +5877,9 @@ impl FederationDirectoryReplicationBridge {
                 outcome
             }
             EnvelopeKind::Community => self.apply_community(envelope_bytes).await,
-            EnvelopeKind::Organization => self.apply_organization(envelope_bytes).await,
-            EnvelopeKind::OrgMembership => self.apply_org_membership(envelope_bytes).await,
-            EnvelopeKind::PartnerRecord => self.apply_partner_record(envelope_bytes).await,
+            EnvelopeKind::Organization
+            | EnvelopeKind::OrgMembership
+            | EnvelopeKind::PartnerRecord => self.refuse_retired_framed(kind, envelope_bytes),
             EnvelopeKind::FamilyMembershipRevocation => {
                 let outcome = self
                     .apply_family_membership_revocation(envelope_bytes)
@@ -6199,7 +6052,7 @@ impl FederationDirectoryReplicationBridge {
                 tracing::warn!(
                     "advertise_since: a row could not be serialized to its content \
                      hash and is OMITTED from the advertise set — it will not replicate \
-                     (CIRISEdge#425)"
+                     (history: CIRISEdge#425)"
                 );
                 // CIRISEdge#433 — and it COUNTS. This is what took `&self`: a plane
                 // going dark for a non-policy reason is the one withhold an
@@ -6551,8 +6404,8 @@ impl FederationDirectoryReplicationBridge {
                         kind = index_kind,
                         error = %e,
                         "wire-hash holdings read failed — falling back to the ROW \
-                         scan (correct, but this is the O(corpus) read CIRISEdge#547 \
-                         is about). A backend predating CIRISPersist#780 reports \
+                         scan (correct, but this is the O(corpus) read history: CIRISEdge#547 \
+                         is about). A backend predating history: CIRISPersist#780 reports \
                          Unsupported here."
                     );
                     return None;
@@ -6569,7 +6422,7 @@ impl FederationDirectoryReplicationBridge {
                         hash = %hex_hash,
                         "wire-hash index returned an undecodable content hash — \
                          refusing the index read rather than returning a SHORT \
-                         holdings set (CIRISEdge#547)"
+                         holdings set (history: CIRISEdge#547)"
                     );
                     return None;
                 };
@@ -6593,7 +6446,7 @@ impl FederationDirectoryReplicationBridge {
             kind = index_kind,
             pages = MAX_FULL_DRAIN_PAGES,
             "wire-hash holdings drain hit the page cap — refusing rather than \
-             returning a truncated holdings set (CIRISEdge#547)"
+             returning a truncated holdings set (history: CIRISEdge#547)"
         );
         None
     }
@@ -6672,7 +6525,7 @@ impl FederationDirectoryReplicationBridge {
                 "attestation DECLINED from the advertise set — `cohort_scope` is \
                  present but EMPTY (malformed: the column is a closed set). A \
                  missing key means `federation` by persist's serde contract; an \
-                 empty one means the row is bad (CIRISEdge v17.7.0 / CIRISPersist#713)"
+                 empty one means the row is bad (CIRISEdge v17.7.0 / history: CIRISPersist#713)"
             );
             return false;
         }
@@ -7333,7 +7186,7 @@ impl FederationDirectoryReplicationBridge {
                             error = %e,
                             "quarantine consult FAILED for a row's author — withholding \
                              the author's rows from the offer (fail-closed; a transient \
-                             read error, NOT a quarantine verdict; CIRISEdge#440)"
+                             read error, NOT a quarantine verdict; history: CIRISEdge#440)"
                         );
                     }
                     QuarantineConsult::ReadError
@@ -7832,10 +7685,44 @@ impl FederationDirectoryReplicationBridge {
         // node's own self-authenticating facts, the Attestation-plane twins of the
         // bootstrap kinds, and cross to an Attributed peer. Everything this node
         // holds ABOUT OTHERS stays behind the floor.
+        // CIRISEdge#882 (CC rc9 I3) — the exemption is the node's ALLEGIANCE
+        // FACTS (owner-binding, acceptances, self-charter: the rows that
+        // establish Rooted), never "anything self-authored": a self-authored
+        // consent grant, score or content row ABOUT A THIRD PARTY at
+        // federation scope stays behind the floor until Rooted. Two
+        // self-authored shapes still cross: a row whose data subject is the
+        // peer itself (its consent grant, a row addressed to it) is not
+        // "about others" to that peer, as #756's carve reasons; and a
+        // COHORT-DELIVERED row (a `self` or `family` placement whose audience
+        // check the peer already passed) is owed
+        // to that peer by CC 6.1.5.3 and CC 5.2 — a self-scope holding claim
+        // reaches the owner's other device whether or not the two devices
+        // are Rooted at each other (the v43.2 PR run's blob_federation_e2e
+        // finding). Cohort-delivered = a targeted placement (`self`,
+        // `family`, `community`, `affiliations`): membership is the
+        // authority there and persist's audience check above already put the
+        // peer among its members — an invited stranger who joined a community
+        // receives its rows without sharing a trust root with the author (CC
+        // 3.1.3.2; `membership_first_contact_756`, the second PR run's
+        // finding). The floor narrows the federation-scope planes, which is
+        // what CC rc9 I3 is about.
+        let cohort_delivered = matches!(
+            audience,
+            ciris_persist::federation::Audience::SelfOnly
+                | ciris_persist::federation::Audience::Family { .. }
+                | ciris_persist::federation::Audience::Community { .. }
+                | ciris_persist::federation::Audience::Affiliations { .. }
+        );
         let self_authored = self
             .self_provider
             .as_ref()
-            .is_some_and(|p| p().iter().any(|id| id == attester));
+            .is_some_and(|p| p().iter().any(|id| id == attester))
+            && (cohort_delivered
+                || row
+                    .get("attested_key_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(peer)
+                || self.attestation_is_allegiance_fact(row, memo).await);
         // CIRISEdge#756 — and the membership ceremony addressed to the peer's
         // own person (§2.4): the invitation names the peer's person as its data
         // subject and the answer replies to the peer's person's own proposal, so
@@ -7935,7 +7822,7 @@ impl FederationDirectoryReplicationBridge {
         let Some(local) = self.local_key_id.as_deref() else {
             tracing::warn!(
                 peer = peer_label,
-                "attestation plane withheld — no `local_key_id` to resolve the CIRISEdge#396 \
+                "attestation plane withheld — no `local_key_id` to resolve the history: CIRISEdge#396 \
                  consent send-set; wire ReplicationRuntimeConfig::local_key_id"
             );
             self.withhold(
@@ -8093,7 +7980,7 @@ impl FederationDirectoryReplicationBridge {
                 "attestation plane withheld — the inbound round is attributed to an EMPTY \
                  peer key_id, so no consent:replication grant can ever match it. This is a \
                  WIRING fault in the host's listen loop (the peer id handed to \
-                 `route_inbound_bytes`), not a consent decision (CIRISEdge#524)"
+                 `route_inbound_bytes`), not a consent decision (history: CIRISEdge#524)"
             );
             return;
         }
@@ -8126,15 +8013,15 @@ impl FederationDirectoryReplicationBridge {
                 suppressed_prev,
                 "attestation plane withheld — the live consent:replication send-set does NOT \
                  name this peer, but DOES name its OWNER, and the reverse owner-binding walk \
-                 (persist `nodes_owned_by`, CIRISPersist#764) did NOT return this peer. Since \
+                 (persist `nodes_owned_by`, history: CIRISPersist#764) did NOT return this peer. Since \
                  v18.5.0 a person-named grant IS routed to that person's bound nodes, so the \
                  two walks disagreeing means one of: the node carries more than one live \
                  owner (`AmbiguousNodeOwner` — the reverse walk skips it, and an ambiguous \
                  owner is not a resolvable recipient), or the owner-binding landed inside the \
                  send-set memo window and routes next round, or `owner_walk_complete=false` \
                  (this subject's walk errored and its nodes are fail-closed OUT this round). \
-                 A grant naming the peer NODE (CIRISServer#472) sidesteps all three \
-                 (CIRISEdge#524, CIRISEdge#396 item 1)"
+                 A grant naming the peer NODE (history: CIRISServer#472) sidesteps all three \
+                 (history: CIRISEdge#524, history: CIRISEdge#396 item 1)"
             );
         }
     }
@@ -8441,7 +8328,7 @@ impl FederationDirectoryReplicationBridge {
                     budget,
                     "Attestation holdings drain CANNOT ADVANCE — a full page came \
                      back with no new resume cursor; this round's holdings view is \
-                     truncated (CIRISEdge#531)"
+                     truncated (history: CIRISEdge#531)"
                 );
                 break;
             }
@@ -8452,7 +8339,7 @@ impl FederationDirectoryReplicationBridge {
                     budget,
                     "Attestation holdings drain hit the page CAP — this round's holdings \
                      view is TRUNCATED, so held rows past the cap are re-wanted from peers \
-                     (wasteful, self-correcting). Raise `sweep_page_rows` (CIRISEdge#531)"
+                     (wasteful, self-correcting). Raise `sweep_page_rows` (history: CIRISEdge#531)"
                 );
             }
         }
@@ -8797,7 +8684,7 @@ impl FederationDirectoryReplicationBridge {
                 bound_secs = RESWEEP_CYCLE_BOUND.as_secs(),
                 "re-sweep cycle has NOT completed within its bound: a row this node passed \
                  (skipped, or offered and lost) waits this long to be re-offered; the plane is \
-                 large for the page budget, or new rows keep the re-sweep starved (CIRISEdge#531)"
+                 large for the page budget, or new rows keep the re-sweep starved (history: CIRISEdge#531)"
             );
         }
     }
@@ -9248,7 +9135,7 @@ impl FederationDirectoryReplicationBridge {
     ///
     /// Split out because the fail-closed rule — **`Unresolved` contributes
     /// NOTHING** — is the whole security content of this change, and it is not
-    /// reachable through a `MemoryBackend` fixture (persist's single-owner
+    /// reachable through a `SqliteBackend` fixture (persist's single-owner
     /// admission gate refuses a second owner-binding, so `AmbiguousNodeOwner`
     /// cannot be seeded, and an in-memory directory read does not fail). Pinning
     /// it here tests the branch that decides, with the exact three inputs the
@@ -9448,7 +9335,7 @@ impl FederationDirectoryReplicationBridge {
                 rule = e.rule().unwrap_or("-"),
                 retryable = e.is_retryable(),
                 error = %e,
-                "membership widening on acceptance refused (CIRISPersist#955)"
+                "membership widening on acceptance refused (history: CIRISPersist#955)"
             ),
         }
     }
@@ -10295,78 +10182,6 @@ impl FederationDirectoryReplicationBridge {
     // wire this round; the next round retries. Logging that skip is a
     // v2.0.x follow-up (matches the v1 trust-kinds' silent-skip on
     // decode_hash failure).
-
-    async fn list_organizations(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
-        // CIRISEdge#397 — advertise the BARE `Organization` row's content-hash.
-        // Persist's `signed_wire_index` keys `Organization` on
-        // `content_hash_of(&Organization)` (the bare row `list_organizations_since`
-        // returns — the row carries its own inline single-signer signature, so
-        // there is NO separate signed-since surface), and its point-read reloads +
-        // re-serializes that SAME bare row. Hashing the wrapper here would
-        // advertise a hash the point-read can never resolve. The receiver's
-        // `apply_organization` re-wraps the bare row for `put_organization`.
-        self.sweep_paged(
-            EnvelopeKind::Organization,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_organizations_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedOrganization::resume_pair,
-            |_| true,
-            |row| Self::ms_seq(row.admitted_at),
-            |row| &row.organization,
-        )
-        .await
-    }
-
-    async fn list_org_memberships(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
-        // CIRISEdge#397 — advertise the BARE `OrgMembership` row's content-hash;
-        // same bare-row basis as `list_organizations` (persist indexes + reloads
-        // the bare row). `apply_org_membership` re-wraps on the receive side.
-        self.sweep_paged(
-            EnvelopeKind::OrgMembership,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_org_memberships_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedOrgMembership::resume_pair,
-            |_| true,
-            |row| Self::ms_seq(row.admitted_at),
-            |row| &row.org_membership,
-        )
-        .await
-    }
-
-    async fn list_partner_records(&self, window: SweepWindow<'_>) -> Vec<EnvelopeRef> {
-        // v2.0.1 — `partner_record` is **bidirectional**. CIRISPersist#194's
-        // `list_signed_partner_records_since` returns the full
-        // `SignedPartnerRecord` wrapper (row + steward_signatures + threshold).
-        // CIRISEdge#397 — advertise that wrapper's content-hash
-        // ([`content_hash_of`]); persist's `signed_wire_index` keys `PartnerRecord`
-        // on `content_hash_of(&SignedPartnerRecord)` and its point-read reloads +
-        // re-serializes the SAME wrapper, so advertise-hash == point-read here.
-        self.sweep_paged(
-            EnvelopeKind::PartnerRecord,
-            window,
-            |since, limit| async move {
-                self.directory
-                    .list_signed_partner_records_since(since, limit)
-                    .await
-                    .unwrap_or_default()
-            },
-            ciris_persist::federation::ServedSignedPartnerRecord::resume_pair,
-            |_| true,
-            |s| Self::ms_seq(s.record.partner_record.asserted_at),
-            |s| &s.record,
-        )
-        .await
-    }
 }
 
 // ─── apply_envelope_bytes — per-kind dispatch ───────────────────────
@@ -10532,7 +10347,7 @@ impl FederationDirectoryReplicationBridge {
                          Install `ReplicationRuntimeConfig::engine` (an \
                          `Engine::from_shared_with_local` view over this substrate; \
                          `PersistGroupContentStore::from_shared_hybrid` builds it) and the \
-                         next re-apply projects it (CIRISPersist#848 / CIRISEdge#601)"
+                         next re-apply projects it (history: CIRISPersist#848 / history: CIRISEdge#601)"
                     );
                 }
                 // Hash the BARE attestation — the value persist's content-hash
@@ -11064,7 +10879,7 @@ impl FederationDirectoryReplicationBridge {
                                 classified = stored_clock.is_some(),
                                 "replicated route CONTENT CONFLICT at same (epoch, \
                                  asserted_at) — split-truth signal, not applied \
-                                 (CIRISEdge#338/#425; `classified=false` = the stored row \
+                                 (history: CIRISEdge#338, history: CIRISEdge#425; `classified=false` = the stored row \
                                  could not be re-read, refusing loud rather than laundering)"
                             );
                             // CIRISEdge#544 — the two sub-arms this branch fuses
@@ -11138,130 +10953,6 @@ impl FederationDirectoryReplicationBridge {
             }
         }
     }
-
-    // ── v2 operational-data apply_* ────────────────────────────────
-    //
-    // The 3 v2 operational kinds (CEG 1.0-RC2 §5.6.8.13) gate on the
-    // [`OperationalProviders`] callbacks being set at bridge
-    // construction. Without them, admission fail-closes (returns
-    // `false`); persist is not touched. With them, the bridge resolves
-    // the live `key_directory` / `root_stewards` / `steward_roster` via
-    // the operator-supplied closures and passes them to persist's
-    // `put_*` admit surface. Persist + verify perform the 4-check
-    // admission pipeline (skew-bound, no-payment-processor identifiers,
-    // authority, set-semantics) — edge stays agnostic per the FSD §5.2
-    // commitment "merge policy stays persist-side per §10.1.6 declared
-    // intents."
-
-    // CIRISEdge#504 / persist v21 #502 E9 — persist now resolves the steward
-    // roster from its OWN registered directory (never a caller-passed roster:
-    // that was itself a classical FK-existence edge). So `put_organization` /
-    // `put_org_membership` / `put_partner_record` no longer take
-    // key_directory/root_stewards/steward_roster args. The `operational` gate
-    // stays the opt-in for whether THIS edge participates in operational-kind
-    // admission at all — admission SCOPE is unchanged, only the (now
-    // persist-internal) roster plumbing is dropped. The `OperationalProviders`
-    // roster fields are vestigial post-E9; the server drops computing them when
-    // it adopts v14.
-    async fn apply_organization(&self, bytes: &[u8]) -> ApplyOutcome {
-        // CIRISEdge#425 Exhibit B — this early return was one of the THREE sites
-        // #423 missed because it sits ABOVE the loud helpers. An edge built without
-        // `OperationalProviders` silently declined every delivered Organization,
-        // while the round reported healthy. Now it yields a reason the choke logs.
-        if self.operational.is_none() {
-            // CIRISEdge#544 — TERMINAL. `operational` is fixed at bridge
-            // construction (`with_operational`), so within this process no
-            // amount of re-asking makes an opted-out node admit the plane. Left
-            // transient, an edge without operational providers re-pulls every
-            // Organization/OrgMembership/PartnerRecord row its peers hold, every
-            // round, forever — the #544 pattern with a whole plane in it rather
-            // than one row. Wiring the providers is a restart, which empties the
-            // memory.
-            return ApplyOutcome::refused_terminal(
-                "Organization: operational providers not configured on this edge — \
-                 operational-kind admission is opted out",
-            );
-        }
-        // CIRISEdge#397 — the content-hash point-read serves the BARE
-        // `Organization` row (the shape `list_organizations_since` returns + the
-        // `signed_wire_index` keys on); deserialize that and re-wrap for
-        // `put_organization`, falling back to the pre-v14.1 `SignedOrganization`
-        // `{"organization": …}` wrap for a peer still on the old wire.
-        let signed = serde_json::from_slice::<Organization>(bytes)
-            .map(|organization| SignedOrganization { organization })
-            .or_else(|_| serde_json::from_slice::<SignedOrganization>(bytes));
-        match signed {
-            Ok(s) => {
-                let content_hash = content_hash_of(&s.organization)
-                    .map_or_else(String::new, |(h, _)| hex::encode(h));
-                match self.directory.put_organization(s).await {
-                    Ok(()) => ApplyOutcome::Admitted,
-                    Err(e) => self.refuse("Organization", &content_hash, &e),
-                }
-            }
-            Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("Organization", bytes, &e)),
-        }
-    }
-
-    async fn apply_org_membership(&self, bytes: &[u8]) -> ApplyOutcome {
-        // CIRISEdge#425 Exhibit B — the second escaped early return.
-        if self.operational.is_none() {
-            // CIRISEdge#544 — TERMINAL. `operational` is fixed at bridge
-            // construction (`with_operational`), so within this process no
-            // amount of re-asking makes an opted-out node admit the plane. Left
-            // transient, an edge without operational providers re-pulls every
-            // Organization/OrgMembership/PartnerRecord row its peers hold, every
-            // round, forever — the #544 pattern with a whole plane in it rather
-            // than one row. Wiring the providers is a restart, which empties the
-            // memory.
-            return ApplyOutcome::refused_terminal(
-                "OrgMembership: operational providers not configured on this edge — \
-                 operational-kind admission is opted out",
-            );
-        }
-        // CIRISEdge#397 — same bare-row wire as `apply_organization`: deserialize
-        // the BARE `OrgMembership` and re-wrap, falling back to the pre-v14.1
-        // `SignedOrgMembership` wrap.
-        let signed = serde_json::from_slice::<OrgMembership>(bytes)
-            .map(|org_membership| SignedOrgMembership { org_membership })
-            .or_else(|_| serde_json::from_slice::<SignedOrgMembership>(bytes));
-        match signed {
-            Ok(s) => {
-                let content_hash = content_hash_of(&s.org_membership)
-                    .map_or_else(String::new, |(h, _)| hex::encode(h));
-                match self.directory.put_org_membership(s).await {
-                    Ok(()) => ApplyOutcome::Admitted,
-                    Err(e) => self.refuse("OrgMembership", &content_hash, &e),
-                }
-            }
-            Err(e) => ApplyOutcome::Deserialize(apply_deser_reason("OrgMembership", bytes, &e)),
-        }
-    }
-
-    async fn apply_partner_record(&self, bytes: &[u8]) -> ApplyOutcome {
-        // CIRISEdge#425 Exhibit B — the third escaped early return.
-        if self.operational.is_none() {
-            // CIRISEdge#544 — TERMINAL. `operational` is fixed at bridge
-            // construction (`with_operational`), so within this process no
-            // amount of re-asking makes an opted-out node admit the plane. Left
-            // transient, an edge without operational providers re-pulls every
-            // Organization/OrgMembership/PartnerRecord row its peers hold, every
-            // round, forever — the #544 pattern with a whole plane in it rather
-            // than one row. Wiring the providers is a restart, which empties the
-            // memory.
-            return ApplyOutcome::refused_terminal(
-                "PartnerRecord: operational providers not configured on this edge — \
-                 operational-kind admission is opted out",
-            );
-        }
-        apply_signed_plane!(
-            self,
-            "PartnerRecord",
-            bytes,
-            SignedPartnerRecord,
-            put_partner_record
-        )
-    }
 }
 
 /// CIRISEdge#397 / persist v21.2.0 (#507) — the content-hash contract: return
@@ -11300,13 +10991,13 @@ pub(crate) mod test_fixtures {
     //! bridge the unit tests do.
     use super::{CohortProvider, FederationDirectoryReplicationBridge};
     use ciris_persist::federation::{identity_type, FederationDirectory};
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
     use std::sync::Arc;
 
     pub(crate) fn make_bridge(
         cohort: &[String],
-    ) -> (Arc<MemoryBackend>, FederationDirectoryReplicationBridge) {
-        let backend = Arc::new(MemoryBackend::new());
+    ) -> (Arc<SqliteBackend>, FederationDirectoryReplicationBridge) {
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend.clone();
         let cohort_clone = cohort.to_vec();
         let cohort_cb: CohortProvider = Arc::new(move || cohort_clone.clone());
@@ -11317,7 +11008,7 @@ pub(crate) mod test_fixtures {
     /// A bridge whose backend already holds AGENT key rows for `key_ids`.
     pub(crate) async fn make_bridge_with_keys(
         key_ids: &[&str],
-    ) -> (Arc<MemoryBackend>, FederationDirectoryReplicationBridge) {
+    ) -> (Arc<SqliteBackend>, FederationDirectoryReplicationBridge) {
         let (backend, bridge) = make_bridge(&[]);
         for kid in key_ids {
             backend
@@ -11344,20 +11035,20 @@ pub(crate) mod tests {
         CommunityMembershipRevocation, Family, FamilyMember, FamilyMembershipRevocation, KeyRecord,
         LocationProof, Revocation, SignedAttestation, SignedKeyRecord,
     };
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
     use sha2::{Digest as _, Sha256};
 
     use crate::replication::summary::AwaitedSigner;
 
     // ── Test fixture helpers ────────────────────────────────────────
 
-    /// Construct a bridge over a fresh `MemoryBackend` with the
+    /// Construct a bridge over a fresh `SqliteBackend` with the
     /// supplied cohort. Returns the backend (so the test can seed
     /// data via persist's put_*) plus the bridge.
     fn make_bridge(
         cohort: &[String],
-    ) -> (Arc<MemoryBackend>, FederationDirectoryReplicationBridge) {
-        let backend = Arc::new(MemoryBackend::new());
+    ) -> (Arc<SqliteBackend>, FederationDirectoryReplicationBridge) {
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend.clone();
         let cohort_clone = cohort.to_vec();
         let cohort_cb: CohortProvider = Arc::new(move || cohort_clone.clone());
@@ -11635,7 +11326,7 @@ pub(crate) mod tests {
     /// row (a fixture record verifies under neither of persist's rules, so it
     /// is held without a row and the Key plane never offers it). Returns the
     /// key id persist derived.
-    async fn seed_row_key(backend: &MemoryBackend, alias: &str, seed: u8) -> String {
+    async fn seed_row_key(backend: &SqliteBackend, alias: &str, seed: u8) -> String {
         let record = minted_key_record(alias, identity_type::AGENT, seed).await;
         let key_id = record.key_id.clone();
         backend
@@ -11745,7 +11436,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn self_provider_publishes_own_and_anchored_not_cohort() {
         // persist v59.0.0 — keys that travel (minted, with their rows).
-        let seed_backend = Arc::new(MemoryBackend::new());
+        let seed_backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let cohort_member = seed_row_key(&seed_backend, "peer-in-cohort", 0x21).await;
         let own_key = seed_row_key(&seed_backend, "this-node-own", 0x22).await;
         let anchored = seed_row_key(&seed_backend, "third-party-anchored", 0x23).await;
@@ -12043,7 +11734,7 @@ pub(crate) mod tests {
     async fn held_but_unpublished_key_leaves_want_on_the_second_round() {
         use crate::replication::summary::diff_refs;
         // persist v59.0.0 — keys that travel (minted, with their rows).
-        let seed = Arc::new(MemoryBackend::new());
+        let seed = Arc::new(ciris_persist::store::test_backend::test_backend());
         let this_node = seed_row_key(&seed, "this-node", 0x31).await;
         let foreign = seed_row_key(&seed, "foreign-subject", 0x32).await;
         let (backend, bridge) = make_bridge(std::slice::from_ref(&foreign));
@@ -12358,8 +12049,17 @@ pub(crate) mod tests {
                 licence(R::NAMED_EDGE_NOT_ONTO_EMITTER),
                 RetryDisposition::Terminal,
             ),
+            // persist v60.0.0 (CIRISPersist#1036 item 2) — a stale licence is
+            // judged at its signed instant: `asserted_at_stale` on the
+            // licensure plane (was `not_authority_at_receipt`).
             (
-                licence(R::NOT_AUTHORITY_AT_RECEIPT),
+                E::AssertedAtStale {
+                    author: "aff-mj-steward".to_owned(),
+                    standing_for: "aff-mj".to_owned(),
+                    plane: "licensure",
+                    asserted_at: chrono::Utc::now() - chrono::Duration::days(4),
+                    w_secs: ciris_persist::federation::self_roster::PAST_FRESHNESS_W_SECS,
+                },
                 RetryDisposition::Terminal,
             ),
             (nonce, RetryDisposition::Terminal),
@@ -12629,7 +12329,7 @@ pub(crate) mod tests {
     /// structural rather than backend-dependent (an edge built without
     /// `OperationalProviders` cannot admit the plane in this process, whatever
     /// the store does), so the assertion is about edge's decision and not about
-    /// which branch `MemoryBackend` happens to take. The suppression key is
+    /// which branch `SqliteBackend` happens to take. The suppression key is
     /// `sha256(delivered bytes)` — the same value the peer advertised and the
     /// same value `diff_refs` puts in `want`.
     #[tokio::test]
@@ -13183,7 +12883,8 @@ pub(crate) mod tests {
             (
                 E::AssertedAtStale {
                     author: "k".to_owned(),
-                    steward: "f".to_owned(),
+                    standing_for: "f".to_owned(),
+                    plane: "roster",
                     asserted_at: chrono::Utc::now() - chrono::Duration::days(4),
                     w_secs: ciris_persist::federation::self_roster::PAST_FRESHNESS_W_SECS,
                 },
@@ -13537,7 +13238,7 @@ pub(crate) mod tests {
     /// an `agent`-role member must be steward-bound (CC 3.2 / CC 3.4.7.1),
     /// while a `user`-role member self-anchors — the fixtures register
     /// community members as `user`.
-    pub(crate) async fn register_fixture_keys(backend: &MemoryBackend, keys: &[(&str, &str)]) {
+    pub(crate) async fn register_fixture_keys(backend: &SqliteBackend, keys: &[(&str, &str)]) {
         for (k, ty) in keys {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -14939,7 +14640,7 @@ pub(crate) mod tests {
     /// **The wire-critical proof.** For the Key and Attestation planes, the
     /// `envelope_hash` `list_envelope_refs` advertises MUST equal `sha256` of the
     /// exact bytes `fetch_envelope_bytes` returns for it — end-to-end, over the
-    /// same `MemoryBackend` the other bridge tests use (which self-indexes the
+    /// same `SqliteBackend` the other bridge tests use (which self-indexes the
     /// `signed_wire_index` on put, so no rebuild is needed). This closes the
     /// advertise-hash == served-bytes == point-read loop CIRISEdge#397 establishes.
     #[tokio::test]
@@ -15046,7 +14747,7 @@ pub(crate) mod tests {
     /// Seed one `delegates_to(attester → subject)` carrying `scope`, and
     /// return its `attestation_id` (so a test can tombstone that exact edge).
     pub(crate) async fn seed_delegates_to(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         attester: &str,
         subject: &str,
         scope: &serde_json::Value,
@@ -15072,7 +14773,7 @@ pub(crate) mod tests {
     /// lineage root for (none for a key root). Grants (root → delegate) stay on
     /// [`seed_delegates_to`]: an unlabelled grant still confers.
     async fn seed_acceptance_edge(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         attester: &str,
         root: &str,
         scope: &serde_json::Value,
@@ -15091,7 +14792,7 @@ pub(crate) mod tests {
 
     /// The labelled acceptance envelope [`seed_acceptance_edge`] signs.
     async fn acceptance_envelope(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         id: &str,
         attester: &str,
         root: &str,
@@ -15124,7 +14825,7 @@ pub(crate) mod tests {
     /// Built with persist's own `pre_rotation_commitment` helper rather than a
     /// hand-rolled digest, so the fixture cannot drift from the verifier.
     async fn seed_root_charter(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         root: &str,
         successor_keys: &[String],
     ) -> String {
@@ -15173,7 +14874,7 @@ pub(crate) mod tests {
     /// accord and no signed `accord_root` key is required — persist v37.0.0's
     /// write door accepts this shape unchanged
     /// (`AccordRootClaim::Named { source: HeartbeatDimensionRule }`).
-    async fn seed_accord_lifecycle(backend: &MemoryBackend, attester: &str, root: &str) {
+    async fn seed_accord_lifecycle(backend: &SqliteBackend, attester: &str, root: &str) {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = serde_json::json!({
             "id": id,
@@ -15198,7 +14899,7 @@ pub(crate) mod tests {
     /// producer that omits it is refused at admission, and edge's fixtures are
     /// producers in exactly that sense.
     async fn seed_accord_scored(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         attester: &str,
         scored: &str,
         accord_root: &str,
@@ -15230,7 +14931,7 @@ pub(crate) mod tests {
     /// be `accord_holder` (CC 3.4.1) plus the signed root
     /// (`check_accord_root_binding`) — the fixture goes through the REAL write
     /// door, so it carries what the field must carry.
-    async fn seed_accord_invoke(backend: &MemoryBackend, holder: &str, accord_root: &str) {
+    async fn seed_accord_invoke(backend: &SqliteBackend, holder: &str, accord_root: &str) {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = serde_json::json!({
             "id": id,
@@ -15259,7 +14960,7 @@ pub(crate) mod tests {
     /// (Un-`cfg`d for CIRISEdge#659: the `rooted_with` witness withdraws an
     /// acceptance on the default feature set, as `seed_trace_attestation` was
     /// un-`cfg`d for #433.)
-    async fn seed_withdraws(backend: &MemoryBackend, attester: &str, target_id: &str) {
+    async fn seed_withdraws(backend: &SqliteBackend, attester: &str, target_id: &str) {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = serde_json::json!({
             "id": id,
@@ -15276,7 +14977,7 @@ pub(crate) mod tests {
     /// Information-Type validator admits (trace_id + agent_id_hash + trace).
     /// (Un-`cfg`d for CIRISEdge#433: the withhold-ledger tests below seed the same
     /// gated row on the default feature set, so this is no longer test-anchor-only.)
-    async fn seed_trace_attestation(backend: &MemoryBackend, producer: &str) {
+    async fn seed_trace_attestation(backend: &SqliteBackend, producer: &str) {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = serde_json::json!({
             "id": id,
@@ -15310,7 +15011,7 @@ pub(crate) mod tests {
     }
 
     async fn seed_raw_attestation(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         id: &str,
         attester: &str,
         subject: &str,
@@ -15332,7 +15033,7 @@ pub(crate) mod tests {
     /// CIRISEdge#352 — [`seed_raw_attestation`] with an explicit
     /// `cohort_scope`, for tests exercising the advertise projection across
     /// the audience axis. `self` / `affiliations` / `federation` are the
-    /// membership-free scopes MemoryBackend's write gate admits without
+    /// membership-free scopes SqliteBackend's write gate admits without
     /// family/community rows (`family`/`community` require seeded
     /// membership).
     /// CIRISPersist#598 + #643 (v31.0.0) — stamp the SIGNED bindings an attestation
@@ -15353,6 +15054,12 @@ pub(crate) mod tests {
         subject_key_ids: &[&str],
         cohort_scope: &str,
     ) {
+        // persist v60.0.0 (#1048): a term-bearing `delegates_to` must carry a
+        // bounded `delegation_valid_until`; persist's fixture helper adds one
+        // only when the edge bears a term.
+        if attestation_type == "delegates_to" {
+            ciris_persist::federation::admission::with_test_term(envelope, asserted_at);
+        }
         let Some(obj) = envelope.as_object_mut() else {
             return;
         };
@@ -15372,7 +15079,7 @@ pub(crate) mod tests {
     }
 
     async fn seed_scoped_attestation(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         id: &str,
         attester: &str,
         subject: &str,
@@ -15398,7 +15105,7 @@ pub(crate) mod tests {
     /// `seed_common_root` signs with the deterministic fixture signer, and a
     /// subject registered under other keys cannot be signed for).
     async fn try_seed_scoped_attestation(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         id: &str,
         attester: &str,
         subject: &str,
@@ -15655,15 +15362,15 @@ pub(crate) mod tests {
     fn attestation_is_first_party_to_matches_author_and_subject() {
         use FederationDirectoryReplicationBridge as B;
         let att = serde_json::json!({
-            "attesting_key_id": "author-A",
-            "attested_key_id": "subject-S",
-            "subject_key_ids": ["subject-S", "co-subject-C"],
+            "attesting_key_id": "author-a",
+            "attested_key_id": "subject-s",
+            "subject_key_ids": ["subject-s", "co-subject-C"],
             "dimension": "x",
         });
-        assert!(B::attestation_is_first_party_to(&att, "author-A")); // sender axis
-        assert!(B::attestation_is_first_party_to(&att, "subject-S")); // primary subject
+        assert!(B::attestation_is_first_party_to(&att, "author-a")); // sender axis
+        assert!(B::attestation_is_first_party_to(&att, "subject-s")); // primary subject
         assert!(B::attestation_is_first_party_to(&att, "co-subject-C")); // data-subject set
-        assert!(!B::attestation_is_first_party_to(&att, "stranger-X")); // still #396-gated
+        assert!(!B::attestation_is_first_party_to(&att, "stranger-x")); // still #396-gated
                                                                         // Missing fields must not false-positive into a first-party bypass.
         assert!(!B::attestation_is_first_party_to(
             &serde_json::json!({}),
@@ -15679,9 +15386,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn first_party_fetch_overrides_producer_advertise_consent() {
         let local = "this-node";
-        let producer = "author-A";
-        let subject = "subject-S";
-        let stranger = "stranger-X";
+        let producer = "author-a";
+        let subject = "subject-s";
+        let stranger = "stranger-x";
         let (backend, bridge) = make_bridge(&[
             local.to_string(),
             producer.to_string(),
@@ -16172,16 +15879,16 @@ pub(crate) mod tests {
         let bridge =
             bridge.with_serve_tier_for_test(crate::replication::serve_tier::ServeTier::MeshServer);
 
-        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-C", None);
+        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-c", None);
         assert_eq!(
             bridge.take_missing_signer_for("any-peer").as_deref(),
-            Some("wanted-C"),
+            Some("wanted-c"),
             "an unrouted name is available to whichever coordinator asks — that \
              is how a contact lookup reaches a conferred server"
         );
 
-        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-D", Some("peer-9"));
-        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-D", None);
+        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-d", Some("peer-9"));
+        bridge.note_missing_signer(EnvelopeKind::Key, "wanted-d", None);
         assert_eq!(
             bridge.take_missing_signer_for("someone-else"),
             None,
@@ -16190,7 +15897,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             bridge.take_missing_signer_for("peer-9").as_deref(),
-            Some("wanted-D")
+            Some("wanted-d")
         );
     }
 
@@ -16206,9 +15913,9 @@ pub(crate) mod tests {
     /// cannot harvest anything.
     #[tokio::test]
     async fn identifier_lookups_are_rate_limited_but_subject_access_is_not() {
-        let local = "local-A";
-        let third_party = "subject-S";
-        let stranger = "stranger-X";
+        let local = "local-a";
+        let third_party = "subject-s";
+        let stranger = "stranger-x";
         let (backend, bridge) =
             test_fixtures::make_bridge_with_keys(&[local, third_party, stranger]).await;
         // persist v59.0.0 — the public plane these lookups read is the route
@@ -16281,10 +15988,10 @@ pub(crate) mod tests {
     /// by HOW MUCH one peer may extract, not by who may answer.
     #[tokio::test]
     async fn identifier_lookups_are_entitled_by_a_mutual_trust_root() {
-        let local = "local-A";
-        let third_party = "subject-S";
-        let stranger = "stranger-X";
-        let root = "root-R";
+        let local = "local-a";
+        let third_party = "subject-s";
+        let stranger = "stranger-x";
+        let root = "root-r";
         let scope = serde_json::json!(["infra:serve"]);
 
         // ── No shared root: refused, whatever tier this node holds.
@@ -16365,7 +16072,7 @@ pub(crate) mod tests {
 
     /// persist v59.0.0 — a signed route for each key (the public subject-pull
     /// plane a fixture key can still carry).
-    pub(crate) async fn seed_routes(backend: &MemoryBackend, keys: &[&str]) {
+    pub(crate) async fn seed_routes(backend: &SqliteBackend, keys: &[&str]) {
         let now = Utc::now().trunc_subsecs(6);
         for key in keys {
             backend
@@ -16383,7 +16090,7 @@ pub(crate) mod tests {
     /// (`resolve_scoped_consent(attester, subject, "analyze") == Granted`). Lets
     /// the G2 test admit REAL capacity data rather than assert on a synthetic
     /// struct.
-    async fn seed_analyze_consent(backend: &MemoryBackend, subject: &str, covers: &str) {
+    async fn seed_analyze_consent(backend: &SqliteBackend, subject: &str, covers: &str) {
         let id = uuid::Uuid::new_v4().to_string();
         seed_scoped_attestation(
             backend,
@@ -16642,14 +16349,14 @@ pub(crate) mod tests {
         // CONTROL: the honestly-bound revocation PASSES the binding gate. Every
         // store's admit path (memory / sqlite / postgres / tier_ingest) runs
         // exactly this check, so it is the real gate, not a stand-in.
-        let honest = build("rev-honest", "victim-A");
+        let honest = build("rev-honest", "victim-a");
         ciris_persist::federation::admission::check_revocation_envelope_binding(&honest)
             .expect("an honestly-bound revocation satisfies the column-to-envelope binding");
 
         // ATTACK: sign a revocation of victim-A, then repaint the target column to
         // victim-B. The signed envelope still pins victim-A.
-        let mut pasted = build("rev-spoof", "victim-A");
-        pasted.revoked_key_id = Some("victim-B".to_string());
+        let mut pasted = build("rev-spoof", "victim-a");
+        pasted.revoked_key_id = Some("victim-b".to_string());
 
         let err = ciris_persist::federation::admission::check_revocation_envelope_binding(&pasted)
             .expect_err(
@@ -16676,7 +16383,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn v31_conferral_paste_cannot_lift_authority_onto_another_key() {
         let (backend, _bridge) = make_bridge(&[]);
-        for kid in ["root", "grantee-A", "grantee-B"] {
+        for kid in ["root", "grantee-a", "grantee-b"] {
             backend
                 .put_public_key(SignedKeyRecord {
                     record: fixture_key_record(kid, "user"),
@@ -16734,16 +16441,16 @@ pub(crate) mod tests {
         // CONTROL: the honest conferral onto grantee-A ADMITS.
         backend
             .put_attestation(SignedAttestation {
-                attestation: build("att-honest", "grantee-A"),
+                attestation: build("att-honest", "grantee-a"),
             })
             .await
             .expect("an honestly-bound conferral admits");
 
         // ATTACK: sign a conferral onto grantee-A, then repaint BOTH target columns
         // to grantee-B. The signed `row` mirror still pins grantee-A.
-        let mut pasted = build("att-spoof", "grantee-A");
-        pasted.attested_key_id = "grantee-B".to_string();
-        pasted.subject_key_ids = vec!["grantee-B".to_string()];
+        let mut pasted = build("att-spoof", "grantee-a");
+        pasted.attested_key_id = "grantee-b".to_string();
+        pasted.subject_key_ids = vec!["grantee-b".to_string()];
 
         let err = backend
             .put_attestation(SignedAttestation {
@@ -16836,7 +16543,7 @@ pub(crate) mod tests {
     /// the consented peer — so persist's E7 projection sources a live row from
     /// it and [`FederationDirectory::list_live_consent_grants_by`] returns it.
     async fn seed_consent_grant(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         producer: &str,
         recipient: &str,
         prefix: &str,
@@ -16866,7 +16573,7 @@ pub(crate) mod tests {
     /// membership bound WITHOUT a `recipient_capability` that would separately
     /// trip item 6. Use when a test needs a peer to be consent-included but is
     /// exercising a DIFFERENT gate.
-    async fn seed_consent_membership(backend: &MemoryBackend, granter: &str, peer: &str) {
+    async fn seed_consent_membership(backend: &SqliteBackend, granter: &str, peer: &str) {
         // CIRISEdge#659 — a consented peer in these fixtures is also ROOTED with
         // the granter: in the field the two hold a valid root in common, and the
         // serve floor (`rooted_with`) is evaluated after the send set. A test
@@ -16877,7 +16584,7 @@ pub(crate) mod tests {
 
     /// The consent membership row alone — a peer in the send set that holds
     /// NO root in common with the granter. Attributed at most.
-    async fn seed_consent_membership_unrooted(backend: &MemoryBackend, granter: &str, peer: &str) {
+    async fn seed_consent_membership_unrooted(backend: &SqliteBackend, granter: &str, peer: &str) {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = serde_json::json!({
             "id": id,
@@ -16896,7 +16603,7 @@ pub(crate) mod tests {
     /// persist v52.0.0 (CIRISPersist#784) — a revocation's SUBJECT: the
     /// `sha256_ed25519_raw` digest of the held key's raw Ed25519 pubkey. A
     /// `revoked_key_id` beside it must name a held key with this digest.
-    async fn revoked_digest_of(backend: &MemoryBackend, key_id: &str) -> String {
+    async fn revoked_digest_of(backend: &SqliteBackend, key_id: &str) -> String {
         let key = backend
             .lookup_public_key(key_id)
             .await
@@ -16912,7 +16619,7 @@ pub(crate) mod tests {
     /// Seed a hybrid-signed `Revocation` of `revoked` by `revoking` (both must
     /// be registered keys). persist computes `persist_row_hash` on put — the
     /// value the Revocation plane advertises + the cache-free fetch scan matches.
-    async fn seed_revocation(backend: &MemoryBackend, revoking: &str, revoked: &str) {
+    async fn seed_revocation(backend: &SqliteBackend, revoking: &str, revoked: &str) {
         let now = Utc::now().trunc_subsecs(6); // #598 microsecond floor
         let id = uuid::Uuid::new_v4().to_string();
         let mut revocation = Revocation {
@@ -17241,7 +16948,7 @@ pub(crate) mod tests {
     /// `dimension` at all (so no consent grant's `covers` can trip item 6),
     /// leaving item 1 (consent membership) as the ONLY differentiator. Returns
     /// the attestation id.
-    async fn seed_advertised_attestation(backend: &MemoryBackend, producer: &str) -> String {
+    async fn seed_advertised_attestation(backend: &SqliteBackend, producer: &str) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let envelope = serde_json::json!({
             "id": id,
@@ -17874,89 +17581,27 @@ pub(crate) mod tests {
         assert_ne!(hb, hc);
     }
 
-    /// Without `OperationalProviders` configured, `apply_organization`
-    /// fail-closes (returns `false`) — v2 admission requires the
-    /// operator to wire up `key_directory` + `root_stewards`. Verifies
-    /// the v1-bridge constructors don't accidentally admit v2 envelopes.
+    /// persist v60.0.0 (§8) — the three operational kinds are retired framed
+    /// objects: an inbound one is refused TERMINAL with persist's
+    /// `federation_envelope_kind_retired` (CIRISEdge#544: re-asking can never
+    /// succeed), booked on the retired ledger, and never reaches a door.
     #[tokio::test]
-    async fn apply_organization_fail_closes_without_operational_providers() {
+    async fn an_operational_kind_is_refused_as_retired_v60() {
         let (_backend, bridge) = make_bridge(&["k1".into()]);
-        // Bridge constructed via `new` (no operational providers).
-        // Even if the bytes happen to deserialize cleanly, admission
-        // must refuse.
-        let bytes = br#"{"organization": {
-            "attestation_id": "att-1",
-            "org_id": "org-acme",
-            "name": "ACME",
-            "org_type": "internal",
-            "status": "active",
-            "asserted_at": "2026-06-10T20:00:00Z",
-            "attesting_key_id": "k1",
-            "signed_envelope": {},
-            "ed25519_signature_base64": ""
-        }}"#;
-        let outcome = bridge
-            .apply_envelope_bytes(EnvelopeKind::Organization, bytes, None)
-            .await;
-        // CIRISEdge#425 — fail-closed AND named: the escaped early return now yields
-        // a `Refused` reason the choke point logs, not a silent `false`.
-        assert!(
-            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry, .. } if r.contains("operational providers") && retry.is_terminal()),
-            "v2 operational admission MUST fail-close with a NAMED refusal without \
-             OperationalProviders — and TERMINAL (CIRISEdge#544): the providers are \
-             fixed at construction, so re-asking every round for a plane this node \
-             opted out of admitting can never succeed. Got {outcome:?}"
-        );
-    }
-
-    /// Same fail-closed invariant for `org_membership`.
-    #[tokio::test]
-    async fn apply_org_membership_fail_closes_without_operational_providers() {
-        let (_backend, bridge) = make_bridge(&["k1".into()]);
-        let bytes = br#"{"org_membership": {
-            "attestation_id": "att-1",
-            "user_id": "u1",
-            "org_id": "org-acme",
-            "role": "viewer",
-            "status": "active",
-            "asserted_at": "2026-06-10T20:00:00Z",
-            "attesting_key_id": "k1",
-            "signed_envelope": {},
-            "ed25519_signature_base64": ""
-        }}"#;
-        let outcome = bridge
-            .apply_envelope_bytes(EnvelopeKind::OrgMembership, bytes, None)
-            .await;
-        assert!(
-            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry, .. } if r.contains("operational providers") && retry.is_terminal()),
-            "org_membership must fail-close with a named TERMINAL refusal \
-             (CIRISEdge#544), got {outcome:?}"
-        );
-    }
-
-    /// Same fail-closed invariant for `partner_record`.
-    #[tokio::test]
-    async fn apply_partner_record_fail_closes_without_operational_providers() {
-        let (_backend, bridge) = make_bridge(&["k1".into()]);
-        let bytes = br#"{
-            "partner_record": {
-                "attestation_id":"att-1","license_id":"lic-1","partner_id":"p-1","org_id":"org-1",
-                "license_type":"community","max_autonomy_tier":"A0","requires_supervisor":false,
-                "deployment_limit":1,"offline_grace_hours":24,"status":"active","revision":1,
-                "issued_at":"2026-06-10T20:00:00Z","expires_at":"2027-06-10T20:00:00Z",
-                "asserted_at":"2026-06-10T20:00:00Z","signed_envelope":{}
-            },
-            "steward_signatures": [],
-            "threshold": 0
-        }"#;
-        let outcome = bridge
-            .apply_envelope_bytes(EnvelopeKind::PartnerRecord, bytes, None)
-            .await;
-        assert!(
-            matches!(&outcome, ApplyOutcome::Refused { reason: r, retry, .. } if r.contains("operational providers") && retry.is_terminal()),
-            "partner_record must fail-close with a named TERMINAL refusal \
-             (CIRISEdge#544), got {outcome:?}"
-        );
+        let bytes = br#"{"organization": {"org_id": "org-acme", "attesting_key_id": "k1"}}"#;
+        for kind in [
+            EnvelopeKind::Organization,
+            EnvelopeKind::OrgMembership,
+            EnvelopeKind::PartnerRecord,
+        ] {
+            let outcome = bridge.apply_envelope_bytes(kind, bytes, None).await;
+            assert!(
+                matches!(&outcome, ApplyOutcome::Refused { reason: r, retry, .. }
+                    if r.contains(ciris_persist::federation::replication_policy::ENVELOPE_KIND_RETIRED)
+                        && retry.is_terminal()),
+                "{kind:?}: refused TERMINAL as federation_envelope_kind_retired, got {outcome:?}"
+            );
+        }
     }
 
     /// v2.0.1 — bidirectional `partner_record` replication lights up.
@@ -18372,13 +18017,13 @@ pub(crate) mod tests {
     // (The single exception is the ring-buffer bound smoke test in
     // `observability.rs`, where the bound itself is the unit under test.)
 
-    /// A bridge over a fresh `MemoryBackend` with a LIVE metrics handle attached
+    /// A bridge over a fresh `SqliteBackend` with a LIVE metrics handle attached
     /// — the production shape (`ReplicationRuntime::start` threads `Edge`'s
     /// handle in). Returns the handle so a test can read the ledger back.
     fn make_metered_bridge(
         cohort: &[String],
     ) -> (
-        Arc<MemoryBackend>,
+        Arc<SqliteBackend>,
         FederationDirectoryReplicationBridge,
         crate::observability::EdgeMetrics,
     ) {
@@ -18393,7 +18038,7 @@ pub(crate) mod tests {
     /// means the ONLY difference between "idle" and "withholding" is whether a
     /// gated row exists — which is exactly the distinction #433 exists to make
     /// visible.
-    async fn seed_serve_scaffold(backend: &MemoryBackend, local: &str, producer: &str, peer: &str) {
+    async fn seed_serve_scaffold(backend: &SqliteBackend, local: &str, producer: &str, peer: &str) {
         for key_id in [local, producer, peer] {
             backend
                 .put_public_key(SignedKeyRecord {
@@ -18662,7 +18307,7 @@ pub(crate) mod tests {
     /// #513), so the fixture carries the exact fresh Android/Strongbox blob
     /// persist's `fresh_accord_holder_evidence` emits (inlined so this does not
     /// gate on `test-anchor` — same inline the #386 trust-graph test uses).
-    async fn seed_accord_holder_key(backend: &MemoryBackend, key_id: &str) {
+    async fn seed_accord_holder_key(backend: &SqliteBackend, key_id: &str) {
         let mut record = fixture_key_record(key_id, identity_type::ACCORD_HOLDER);
         record.attestation_evidence = Some(serde_json::json!({
             "platform_attestation": {
@@ -19895,7 +19540,7 @@ pub(crate) mod tests {
     /// projection-irrelevant — `authority_for` only picks Global-vs-Cohort,
     /// both advertised).
     async fn seed_projection_matrix(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         node: &str,
         other: &str,
     ) -> [&'static str; 5] {
@@ -20120,7 +19765,7 @@ pub(crate) mod tests {
     /// Seed the mesh-config plane's trust scaffolding for `node`: the root's
     /// key record + the node's `delegates_to(node → root)` subscription edge
     /// ("the trust edge is the subscription", persist's `trusted_roots_of`).
-    async fn seed_mesh_config_root(backend: &MemoryBackend, node: &str, root: &str) {
+    async fn seed_mesh_config_root(backend: &SqliteBackend, node: &str, root: &str) {
         backend
             .put_public_key(SignedKeyRecord {
                 record: fixture_key_record(root, identity_type::NODE),
@@ -20146,7 +19791,7 @@ pub(crate) mod tests {
     /// replication plane"). Built with persist's own `mesh_config_envelope`
     /// so the shape cannot drift from the fold's `parse_row`.
     async fn seed_mesh_config_relief(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         root: &str,
         key: ciris_persist::federation::MeshConfigKey,
         value: i64,
@@ -20169,7 +19814,7 @@ pub(crate) mod tests {
     /// for `node` with the production default baseline shape and TTL zero
     /// (every consult re-folds, so a just-seeded row is visible immediately).
     fn mesh_reader_over(
-        backend: &Arc<MemoryBackend>,
+        backend: &Arc<SqliteBackend>,
         node: &str,
     ) -> Arc<crate::replication::mesh_config::MeshConfigReader> {
         let dir: Arc<dyn FederationDirectory> = Arc::clone(backend) as _;
@@ -20624,7 +20269,7 @@ pub(crate) mod tests {
     /// fixtures call this so the peers they mean to be SERVED are Rooted with
     /// the local node's owner; whoever is left out (`node-stranger`, an unowned
     /// node with no acceptance) is Attributed at most and served nothing.
-    pub(crate) async fn seed_common_root(backend: &MemoryBackend, subjects: &[&str]) {
+    pub(crate) async fn seed_common_root(backend: &SqliteBackend, subjects: &[&str]) {
         // Idempotent: the consent helpers call this per pair, so the root's
         // key record is registered once (a re-register is a `Conflict`, which
         // is the expected answer here) and acceptances accumulate. A second
@@ -20678,7 +20323,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn seed_owner_binding(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         owner: &str,
         node: &str,
     ) -> String {
@@ -20695,7 +20340,7 @@ pub(crate) mod tests {
     /// and the class decides `self` / `family` reach (personal = phone |
     /// laptop; server class gets the owner's rooms only).
     pub(crate) async fn seed_device_occurrence(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         owner: &str,
         node: &str,
         class: &str,
@@ -20719,8 +20364,8 @@ pub(crate) mod tests {
     /// The #523 fixture in one place: a PERSON (`user`), a NODE (`node`) owned
     /// by that person, and an unrelated node owned by nobody. Returns a backend
     /// whose keys are registered and (when `bind`) whose owner-binding is live.
-    async fn owner_axis_backend(bind: bool) -> Arc<MemoryBackend> {
-        let backend = Arc::new(MemoryBackend::new());
+    async fn owner_axis_backend(bind: bool) -> Arc<SqliteBackend> {
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[
@@ -20760,13 +20405,13 @@ pub(crate) mod tests {
     async fn announce_fixture(
         announced: bool,
     ) -> (
-        Arc<MemoryBackend>,
+        Arc<SqliteBackend>,
         FederationDirectoryReplicationBridge,
         crate::observability::EdgeMetrics,
         [u8; 32],
     ) {
         use sha2::{Digest as _, Sha256};
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[
@@ -20975,12 +20620,12 @@ pub(crate) mod tests {
     /// its route held, and `node-bob-2`'s key held but NOT its owner-binding
     /// (the state of a new device that has only just reached its first one).
     async fn first_contact_fixture() -> (
-        Arc<MemoryBackend>,
+        Arc<SqliteBackend>,
         Arc<FederationDirectoryReplicationBridge>,
         [u8; 32],
     ) {
         use sha2::{Digest as _, Sha256};
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[
@@ -21125,7 +20770,7 @@ pub(crate) mod tests {
     /// self-publish set; unset, every plane is the self set.
     #[tokio::test]
     async fn a_kind_publish_selector_narrows_only_the_named_kinds_678() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         // persist v59.0.0 — keys that travel (minted, with their rows).
         let me = seed_row_key(&backend, "me", 0x71).await;
         let anchored = seed_row_key(&backend, "anchored", 0x72).await;
@@ -21189,7 +20834,7 @@ pub(crate) mod tests {
 
     /// Build a bridge over an existing backend with `cohort`.
     fn bridge_over(
-        backend: &Arc<MemoryBackend>,
+        backend: &Arc<SqliteBackend>,
         cohort: &[&str],
     ) -> FederationDirectoryReplicationBridge {
         let dir: Arc<dyn FederationDirectory> = backend.clone();
@@ -21199,7 +20844,7 @@ pub(crate) mod tests {
     }
 
     /// Seed a Community whose SOLE member is `member` (a person, in the field).
-    async fn seed_community_with_member(backend: &MemoryBackend, member: &str) {
+    async fn seed_community_with_member(backend: &SqliteBackend, member: &str) {
         backend
             .put_community(sign_community_fixture(
                 "room-authority",
@@ -21364,8 +21009,8 @@ pub(crate) mod tests {
     /// nobody owns. `node-alice-a` is the local node; every other node is
     /// consent-included by it, so a withhold below can only be the audience
     /// gate, never the #396 item-1 bound.
-    async fn audience_backend() -> Arc<MemoryBackend> {
-        let backend = Arc::new(MemoryBackend::new());
+    async fn audience_backend() -> Arc<SqliteBackend> {
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[
@@ -21410,7 +21055,7 @@ pub(crate) mod tests {
     /// The local node's bridge: its publish set is itself AND its owner, the
     /// three-key shape the mesh harness runs (a person-attested row is
     /// "produced here" because the person is this node's owner).
-    fn audience_bridge(backend: &Arc<MemoryBackend>) -> FederationDirectoryReplicationBridge {
+    fn audience_bridge(backend: &Arc<SqliteBackend>) -> FederationDirectoryReplicationBridge {
         let publish: Vec<String> = vec!["node-alice-a".into(), "person-alice".into()];
         let selector: CohortProvider = Arc::new(move || publish.clone());
         bridge_over(
@@ -21421,7 +21066,7 @@ pub(crate) mod tests {
         .with_self_provider(Some(selector))
     }
 
-    async fn hash_of(backend: &MemoryBackend, id: &str) -> [u8; 32] {
+    async fn hash_of(backend: &SqliteBackend, id: &str) -> [u8; 32] {
         let row = backend
             .get_attestation(id)
             .await
@@ -21664,8 +21309,8 @@ pub(crate) mod tests {
     #[allow(clippy::too_many_lines)]
     async fn first_contact_serves_the_membership_ceremony_to_its_parties_and_nothing_else_756() {
         use crate::membership::GroupScope;
-        async fn side() -> Arc<MemoryBackend> {
-            let backend = Arc::new(MemoryBackend::new());
+        async fn side() -> Arc<SqliteBackend> {
+            let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
             register_fixture_keys(
                 &backend,
                 &[
@@ -21687,7 +21332,7 @@ pub(crate) mod tests {
             backend
         }
         fn stranger_bridge(
-            backend: &Arc<MemoryBackend>,
+            backend: &Arc<SqliteBackend>,
             node: &str,
             person: &str,
         ) -> FederationDirectoryReplicationBridge {
@@ -21902,7 +21547,7 @@ pub(crate) mod tests {
     async fn a_group_record_is_served_only_to_members_and_live_invitees_758() {
         use crate::membership::GroupScope;
         use crate::observability::WithholdReason;
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[
@@ -22074,14 +21719,14 @@ pub(crate) mod tests {
 
     /// The pair room "chat-room" in its #955 end state (alice and bob both
     /// founders), seeded into `backend`.
-    async fn seed_alice_bob_room(backend: &MemoryBackend) {
+    async fn seed_alice_bob_room(backend: &SqliteBackend) {
         seed_alice_bob_room_declared(backend, None).await;
     }
 
     /// [`seed_alice_bob_room`] with an explicit `policy_blob`, so a test can
     /// found the room as a declared affiliation (persist v54, #1034).
     async fn seed_alice_bob_room_declared(
-        backend: &MemoryBackend,
+        backend: &SqliteBackend,
         policy_blob: Option<serde_json::Value>,
     ) {
         let mut room = crate::chat::pair_community("person-alice", "person-bob", Utc::now());
@@ -22395,7 +22040,7 @@ pub(crate) mod tests {
         use ciris_persist::federation::types::RosterCosignature;
         const FOUNDERS: [&str; 3] = ["us-steward", "eu-steward", "ap-steward"];
         const SERVE_NODE: &str = "cc1-serve-node";
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let holders = register_genesis_accord_roster(&*backend)
             .await
             .expect("genesis accord roster");
@@ -22583,7 +22228,7 @@ pub(crate) mod tests {
     #[allow(clippy::too_many_lines)]
     async fn a_public_group_record_is_served_to_every_peer_762() {
         use crate::observability::WithholdReason;
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[
@@ -22909,7 +22554,7 @@ pub(crate) mod tests {
     /// the node is handed back for booking.
     ///
     /// Pinned at `widen_cohort_by_owners` rather than end-to-end because the
-    /// error is not reachable through a `MemoryBackend` fixture: persist's
+    /// error is not reachable through a `SqliteBackend` fixture: persist's
     /// single-owner ADMISSION gate refuses a second owner-binding (so
     /// `AmbiguousNodeOwner` cannot be seeded), and an in-memory directory read
     /// does not fail. Testing the branch that decides, with the three inputs the
@@ -23544,13 +23189,29 @@ pub(crate) mod tests {
         let publish = vec![local.to_string()];
         let bridge = bridge.with_self_provider(Some(Arc::new(move || publish.clone())));
         seed_advertised_attestation(&backend, local).await;
+        // CIRISEdge#882 (CC rc9 I3) — a self-authored row that is NOT an
+        // allegiance fact and is about a THIRD PARTY (`local`'s consent grant
+        // to `producer`) is content to the peer: it stays behind the floor.
+        seed_consent_membership_unrooted(&backend, local, producer).await;
         let served = bridge.list_attestations_for_peer(Some(peer)).await;
         assert_eq!(
             served.len(),
             2,
-            "exactly the self-authored rows cross to an Attributed peer — the row `local` \
-             just authored AND the consent row `local` authored about the peer; the third \
-             party's stays behind the floor: {served:?}"
+            "exactly the self-authored ALLEGIANCE rows and the rows about the peer itself \
+             cross to an Attributed peer — the self-charter `local` just authored AND the \
+             consent row `local` authored about the peer; `local`'s score of a third party \
+             and the third party's own row stay behind the floor (CIRISEdge#659, #882): \
+             {served:?}"
+        );
+        assert!(
+            metrics
+                .snapshot()
+                .withholds_by_reason
+                .get(&WithholdReason::RecipientNotRooted)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "the self-authored third-party grant is booked under the floor, not served (#882)"
         );
 
         // Both subjects accept one valid root: the third party's row now reaches the peer too.
@@ -23581,7 +23242,7 @@ pub(crate) mod tests {
     async fn rooted_with_holds_only_for_a_valid_root_in_common_through_the_owners() {
         // A backend of its own: the shared fixtures seed a common root on
         // purpose, and this witness is about NOT having one.
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[
@@ -23650,7 +23311,7 @@ pub(crate) mod tests {
     /// Rooted now.
     #[tokio::test]
     async fn a_common_root_whose_holder_is_unattested_is_not_rooted_901() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         register_fixture_keys(
             &backend,
             &[
@@ -23700,7 +23361,7 @@ pub(crate) mod tests {
 
     /// The wire hash a stored row advertises under (`put_attestation` stamps
     /// `persist_row_hash`, so the hash is taken from the row as READ BACK).
-    async fn wire_hash_of(backend: &MemoryBackend, attestation_id: &str) -> [u8; 32] {
+    async fn wire_hash_of(backend: &SqliteBackend, attestation_id: &str) -> [u8; 32] {
         let rows = backend
             .list_attestations_since(None, 4096)
             .await
@@ -23723,7 +23384,7 @@ pub(crate) mod tests {
     #[allow(clippy::too_many_lines)]
     async fn a_peer_outside_the_send_set_is_served_exactly_this_nodes_allegiance_facts_671() {
         use crate::observability::WithholdReason;
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let (local, owner, peer, peer_owner) =
             ("node-local", "person-local", "node-peer", "person-peer");
         register_fixture_keys(
@@ -23870,7 +23531,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn a_relay_serves_a_published_nodes_announced_binding_at_first_contact_752() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let (relay, peer, peer_owner) = ("node-relay", "node-peer", "person-peer");
         let (o, d, e, u) = ("person-o", "node-d", "node-e", "node-u");
         register_fixture_keys(
@@ -24418,7 +24079,7 @@ pub(crate) mod tests {
 
     /// The fail-closed rule, on the set itself: a walk that could not answer
     /// NARROWS and says so. Pure, because the branch is not reachable through a
-    /// `MemoryBackend` fixture (an in-memory directory read does not fail) —
+    /// `SqliteBackend` fixture (an in-memory directory read does not fail) —
     /// the same reason `widen_cohort_by_owners` is pinned pure, and the same
     /// discipline: pin the value that decides, with the shape the field
     /// produces.
@@ -24465,8 +24126,8 @@ pub(crate) mod tests {
         fn paged_bridge(
             cohort: &[String],
             page: u32,
-        ) -> (Arc<MemoryBackend>, FederationDirectoryReplicationBridge) {
-            let backend = Arc::new(MemoryBackend::new());
+        ) -> (Arc<SqliteBackend>, FederationDirectoryReplicationBridge) {
+            let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
             let dir: Arc<dyn FederationDirectory> = backend.clone();
             let cohort_clone = cohort.to_vec();
             let cohort_cb: CohortProvider = Arc::new(move || cohort_clone.clone());
@@ -24487,7 +24148,7 @@ pub(crate) mod tests {
         /// the route plane: the Key plane is read per subject now (its rows
         /// have no since-page), so the watermark/page machinery is exercised
         /// where it still runs.
-        async fn seed_keys(backend: &Arc<MemoryBackend>, ids: &[String]) {
+        async fn seed_keys(backend: &Arc<SqliteBackend>, ids: &[String]) {
             for id in ids {
                 backend
                     .put_public_key(SignedKeyRecord {
@@ -25081,7 +24742,7 @@ pub(crate) mod tests {
         /// the worst possible way to break it.
         #[tokio::test]
         async fn an_absurd_permit_count_clamps_instead_of_panicking() {
-            let backend = Arc::new(MemoryBackend::new());
+            let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
             let dir: Arc<dyn FederationDirectory> = backend.clone();
             let bridge = FederationDirectoryReplicationBridge::with_config(
                 dir,
@@ -25126,7 +24787,7 @@ pub(crate) mod tests {
         /// A federation-tier, `self`-scoped attestation by `producer`, asserted
         /// `secs` after a fixed instant: it projects `SelfOwn`, so it is
         /// advertisable here only while `producer` is in the self-publish set.
-        async fn seed_self_row(backend: &Arc<MemoryBackend>, producer: &str, secs: i64) -> String {
+        async fn seed_self_row(backend: &Arc<SqliteBackend>, producer: &str, secs: i64) -> String {
             let at = (chrono::DateTime::from_timestamp(1_760_000_000, 0).expect("instant")
                 + chrono::Duration::seconds(secs))
             .trunc_subsecs(6);
@@ -25180,7 +24841,7 @@ pub(crate) mod tests {
             attestation_id
         }
 
-        async fn hash_of(backend: &Arc<MemoryBackend>, attestation_id: &str) -> [u8; 32] {
+        async fn hash_of(backend: &Arc<SqliteBackend>, attestation_id: &str) -> [u8; 32] {
             let rows = backend
                 .list_attestations_since(None, 1024)
                 .await
@@ -25195,7 +24856,7 @@ pub(crate) mod tests {
         /// A bridge over `backend` paging `page` rows, whose self-publish set
         /// is the LIVE `set` (as a host's is).
         fn live_bridge(
-            backend: &Arc<MemoryBackend>,
+            backend: &Arc<SqliteBackend>,
             page: u32,
             set: &Arc<std::sync::RwLock<Vec<String>>>,
         ) -> FederationDirectoryReplicationBridge {
@@ -25223,7 +24884,7 @@ pub(crate) mod tests {
         /// row sits past the re-sweep's first page.
         #[tokio::test]
         async fn a_row_skipped_before_its_author_joined_the_self_set_is_offered_once_it_does_659() {
-            let backend = Arc::new(MemoryBackend::new());
+            let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
             for k in ["this-node", "bob"] {
                 backend
                     .put_public_key(SignedKeyRecord {
@@ -25291,7 +24952,7 @@ pub(crate) mod tests {
         /// `listed = not_advertisable + withheld + duplicate + offered`.
         #[tokio::test]
         async fn the_advertise_round_summary_counts_add_up_659() {
-            let backend = Arc::new(MemoryBackend::new());
+            let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
             for k in ["this-node", "other"] {
                 backend
                     .put_public_key(SignedKeyRecord {
@@ -25338,7 +24999,7 @@ pub(crate) mod tests {
 //     (including off the error and panic paths), and the anti-starvation
 //     property. These hold the permit across a `sleep`, so the bound is
 //     actually exercised rather than trivially satisfied by a fast sweep.
-//   * the REAL bridge over a real `MemoryBackend` — that the gate is entered
+//   * the REAL bridge over a real `SqliteBackend` — that the gate is entered
 //     at exactly ONE layer, so the `list_holdings` /
 //     `list_envelope_refs_for_peer` fall-through into the shared advertise
 //     builder cannot self-deadlock at `permits == 1`. That is the failure mode
@@ -25347,14 +25008,14 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod sweep_width_tests {
     use super::*;
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration as StdDuration;
 
     fn make_bridge_with_permits(
         permits: usize,
-    ) -> (Arc<MemoryBackend>, FederationDirectoryReplicationBridge) {
-        let backend = Arc::new(MemoryBackend::new());
+    ) -> (Arc<SqliteBackend>, FederationDirectoryReplicationBridge) {
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let dir: Arc<dyn FederationDirectory> = backend.clone();
         let cohort: CohortProvider = Arc::new(Vec::new);
         let bridge = FederationDirectoryReplicationBridge::with_config(

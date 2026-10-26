@@ -161,14 +161,14 @@ mod tests {
     use ciris_persist::federation::{
         FamilyMembershipRevocation, FamilyMembershipWidening, FederationDirectory,
     };
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
 
     const FAMILY: &str = "household";
 
     /// Family `household` founded by alice with bob; alice owns two nodes,
     /// bob one, carol one (not yet a member), a stranger's node owned by nobody.
-    async fn backend() -> MemoryBackend {
-        let b = MemoryBackend::new();
+    async fn backend() -> SqliteBackend {
+        let b = ciris_persist::store::test_backend::test_backend();
         register_fixture_keys(
             &b,
             &[

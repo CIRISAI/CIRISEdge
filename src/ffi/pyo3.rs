@@ -2625,7 +2625,8 @@ impl PyEdge {
     ///   transport was registered at init.
     /// - `ValueError("unknown EnvelopeKind: {token}")` if a kind
     ///   string in `peers` doesn't match the 10 wire tokens.
-    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None, publish_sets_by_kind = None))]
+    #[pyo3(signature = (peers, cadence_seconds = None, key_publish_set = None, occurrence_publish_set = None, publish_sets_by_kind = None, bundle_bootstrap_peers = false))]
+    #[allow(clippy::too_many_arguments)] // Python keyword arguments, one per knob
     fn start_replication(
         &self,
         py: Python<'_>,
@@ -2656,6 +2657,9 @@ impl PyEdge {
         // third party's anchored key while withholding that party's
         // occurrences and routes. `None` = unchanged behaviour.
         publish_sets_by_kind: Option<std::collections::HashMap<String, Vec<String>>>,
+        // CIRISEdge#881 — opt the bundle's seated serve nodes in as bootstrap-plane
+        // initiator peers (an unclaimed device; see `enable_bundle_bootstrap_peers`).
+        bundle_bootstrap_peers: bool,
     ) -> PyResult<PyReplicationHandle> {
         let directory = self
             .inner
@@ -2690,6 +2694,7 @@ impl PyEdge {
         // inert through the shipped host path — the same silent-default failure
         // as the mode above, in the same function.
         config.local_key_id = Some(self.inner.signer_key_id().to_string());
+        config.enable_bundle_bootstrap_peers = bundle_bootstrap_peers;
         // CIRISEdge#541 — and the TIER subject separately: the conferral is
         // granted against the identity peers know this node as. These coincide
         // unless `use_node_identity` split them, and where they differ, using
@@ -2910,6 +2915,11 @@ fn metrics_bundle_to_pydict<'py>(
         link_seal.set_item(label.as_str(), *n)?;
     }
     root.set_item("link_seal", link_seal)?;
+    let link_shaping = pyo3::types::PyDict::new(py);
+    for (label, n) in &bundle.link_shaping {
+        link_shaping.set_item(label.as_str(), *n)?;
+    }
+    root.set_item("link_shaping", link_shaping)?;
     // CIRISEdge#805 item 8 — direct links by label, and the peers with a
     // direct path now.
     let direct_link = pyo3::types::PyDict::new(py);
@@ -5954,6 +5964,11 @@ enum LocalInstanceRole {
     disk_budget_bytes = None,
     trust_recursion_depth = None,
     local_instance_name = None,
+    shaping_class = None,
+    shaping_rho = None,
+    shaping_window_seconds = None,
+    shaping_node_cap_bytes_per_s = None,
+    require_shaped_links = false,
     local_instance_role = "auto",
     agent_occurrence_key_id = None,
     transport_identity_keyring_dir = None,
@@ -6040,6 +6055,15 @@ pub fn init_edge_runtime(
     // When `local_instance_name` is `None`, neither parameter has
     // any effect — v2.2.x behavior is preserved exactly.
     local_instance_name: Option<&str>,
+    // CC 5.4.3 (CLM-link-shaping) — this node's link-shaping policy. `None`
+    // / `off` (the default) offers nothing. `shaping_class` is one of
+    // `server`, `home`, `phone-wifi`, `phone-cellular`, `off`; ρ and W default
+    // to the modelled values (0.5, 600 s); the node cap to eight links' worth.
+    shaping_class: Option<String>,
+    shaping_rho: Option<f64>,
+    shaping_window_seconds: Option<u64>,
+    shaping_node_cap_bytes_per_s: Option<u32>,
+    require_shaped_links: bool,
     local_instance_role: &str,
     // v3.1.0 (CIRISEdge#108 / CIRISPersist#183, CEG §5.6.8.8.1) —
     // self-at-login transport_destination registration. When
@@ -6771,7 +6795,7 @@ pub fn init_edge_runtime(
                     self_key_id = %advertised_key_id,
                     readback = ?readback,
                     "engine.set_self_key_id did NOT read back — in-band de-admission may be \
-                     DORMANT; a peer sanction will not enforce (CIRISEdge#427 §3)"
+                     DORMANT; a peer sanction will not enforce (history: CIRISEdge#427 §3)"
                 );
             }
         }
@@ -6780,7 +6804,7 @@ pub fn init_edge_runtime(
                 error = %e,
                 "engine.set_self_key_id unavailable (pre-v22 persist Engine?) — in-band \
                  de-admission is DORMANT (fail-open); an abusive peer has no in-band \
-                 response beyond the accord kill-switch (CIRISEdge#427 §3)"
+                 response beyond the accord kill-switch (history: CIRISEdge#427 §3)"
             );
         }
     }
@@ -6926,7 +6950,7 @@ pub fn init_edge_runtime(
                  must be 32 bytes, got 65'. Upgrade the agent's cohab-init \
                  path to construct ciris_persist.Engine with local_key_id + \
                  local_key_path (Engine.from_shared_with_local, persist \
-                 v2.12.0+ / #112), or set require_local_signer=True to fail \
+                 v2.12.0+ / history: CIRISEdge#112), or set require_local_signer=True to fail \
                  loud instead of announcing un-attested."
                 );
                 signer.clone()
@@ -7116,7 +7140,7 @@ pub fn init_edge_runtime(
             },
             Err(e) => tracing::warn!(
                 "init_edge_runtime: engine.canonical_bootstrap_hints() unavailable (persist < \
-                 v13.6.0 / #402?) — falling back to the baked genesis dial set: {e}"
+                 v13.6.0 / history: CIRISEdge#402?) — falling back to the baked genesis dial set: {e}"
             ),
         }
         // CIRISEdge#281 — the STATIC half of the zero-config dial plane:
@@ -7144,7 +7168,7 @@ pub fn init_edge_runtime(
                 test_trust_root_override = test_anchor,
                 "init_edge_runtime: baked PRODUCTION canonical dials NOT seeded — a test trust \
                  root is active (or the caller said no). A node under a test anchor must not \
-                 open TCP to a production address (CIRISEdge#661). This MUST NOT appear in \
+                 open TCP to a production address (history: CIRISEdge#661). This MUST NOT appear in \
                  production."
             );
         }
@@ -7158,6 +7182,33 @@ pub fn init_edge_runtime(
     }
     transport_config.announce_interval = Duration::from_secs(announce_interval_seconds);
     transport_config.local_epoch = local_epoch;
+    // CC 5.4.3 — link shaping policy.
+    if let Some(class) = shaping_class.as_deref() {
+        use crate::transport::link_shaping::{BudgetClass, ShapingPolicy};
+        let class = BudgetClass::parse(class).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "init_edge_runtime: shaping_class {class:?} is not one of server, home, \
+                 phone-wifi, phone-cellular, off"
+            ))
+        })?;
+        let mut policy = ShapingPolicy::for_class(class);
+        if let Some(rho) = shaping_rho {
+            if !(0.01..=1.0).contains(&rho) {
+                return Err(PyValueError::new_err(
+                    "init_edge_runtime: shaping_rho must be within (0, 1]",
+                ));
+            }
+            policy.rho = rho;
+        }
+        if let Some(w) = shaping_window_seconds {
+            policy.window = Duration::from_secs(w.max(1));
+        }
+        if let Some(cap) = shaping_node_cap_bytes_per_s {
+            policy.node_cap_bytes_per_s = cap;
+        }
+        policy.require_shaped_links = require_shaped_links;
+        transport_config = transport_config.with_shaping(policy);
+    }
     // CIRISEdge#168 (v5.0) — Transport-node mode (§24 NAT-traversal).
     transport_config.enable_transport = enable_transport;
     // CIRISEdge#492 — node-wide scoped-transit posture for the legacy interface
@@ -7385,7 +7436,7 @@ pub fn init_edge_runtime(
                         }
                         _ => tracing::warn!(
                             key_id = %row.occurrence_key_id,
-                            "CIRISEdge#299: persisted transport binding has malformed pubkey \
+                            "history: CIRISEdge#299: persisted transport binding has malformed pubkey \
                              base64 — skipping (peer must re-announce to root)"
                         ),
                     }
@@ -7413,7 +7464,7 @@ pub fn init_edge_runtime(
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "CIRISEdge#299: boot-load of persisted transport bindings failed — peers \
+                    "history: CIRISEdge#299: boot-load of persisted transport bindings failed — peers \
                      must re-announce to root this session"
                 );
                 None
@@ -11813,6 +11864,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
@@ -11936,6 +11992,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
@@ -12098,6 +12159,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
@@ -12213,6 +12279,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
@@ -12486,6 +12557,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)
@@ -12655,6 +12731,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes
                 None,       // trust_recursion_depth
                 None,       // local_instance_name
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id
                 None,       // transport_identity_keyring_dir
@@ -12726,6 +12807,7 @@ mod pyo3_tier2_tests {
     /// local signer" branch — `self.local_signer` ends up `None`,
     /// which is exactly what `local_signer_capsule_py` checks.
     #[test]
+    #[allow(clippy::too_many_lines)] // the init call lists every kwarg; one more knob set
     fn py_init_edge_runtime_local_signer_unavailable_falls_back_cleanly() {
         init_python();
         let _engine_guard = engine_lock();
@@ -12783,6 +12865,11 @@ mod pyo3_tier2_tests {
                 None,       // disk_budget_bytes (v0.20.0 RC1 — use AgentMode default)
                 None,       // trust_recursion_depth (v0.20.0 RC1 — use AgentMode default)
                 None,       // local_instance_name (v2.3.0 — shared-instance disabled in this test)
+                None,       // shaping_class (CC 5.4.3 — off)
+                None,       // shaping_rho
+                None,       // shaping_window_seconds
+                None,       // shaping_node_cap_bytes_per_s
+                false,      // require_shaped_links
                 "auto",     // local_instance_role
                 None,       // agent_occurrence_key_id (v3.1.0 — self-at-login opt-out)
                 None,       // transport_identity_keyring_dir (v3.1.0 — file-only)

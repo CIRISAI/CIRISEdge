@@ -293,7 +293,6 @@ use ciris_edge::transport::{
     InboundFrame, Transport, TransportError, TransportId, TransportSendOutcome,
 };
 use ciris_persist::federation::FederationDirectory;
-use ciris_persist::store::MemoryBackend;
 
 #[derive(Default)]
 struct RecordingTransport {
@@ -333,11 +332,12 @@ async fn runtime_round_trip_with_published_claim_via_register_observed_claim() {
     //
     // v7.0.0 (CIRISEdge#194): persist v10.0.0 promoted the evict
     // surfaces to `FederationDirectory`; the runtime now takes a
-    // single `Arc<dyn FederationDirectory>` for both. `MemoryBackend`
+    // single `Arc<dyn FederationDirectory>` for both. `SqliteBackend`
     // is the in-tree directory test stand-in.
     let alice_holdings: Arc<dyn FountainHoldingsSource> = Arc::new(NoopFountainHoldingsSource);
     let alice_tx = Arc::new(RecordingTransport::default());
-    let alice_directory: Arc<dyn FederationDirectory> = Arc::new(MemoryBackend::new());
+    let alice_directory: Arc<dyn FederationDirectory> =
+        Arc::new(ciris_persist::store::test_backend::test_backend());
     let alice_cohort: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
     let rt = FountainSwarmRuntime::start(
         SwarmRuntimeConfig {

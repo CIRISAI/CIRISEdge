@@ -766,7 +766,7 @@ impl AvRelay {
                         inbound_link_seq,
                         dropped_before,
                         "AV relay: inbound outer open FAILED at every candidate counter — \
-                         frame not forwarded (CIRISEdge#425)"
+                         frame not forwarded (history: CIRISEdge#425)"
                     );
                     if guard.unopened() {
                         guard.report_mismatch("relay pump", &inbound_link_id, None);
@@ -968,7 +968,7 @@ impl AvSubscriber {
             tracing::warn!(
                 offered = candidates.len(),
                 "AV subscriber: admission REFUSED — a trust root paused AV stream \
-                 replication via mesh config (feature.av_streams=0, CIRISEdge#440); \
+                 replication via mesh config (feature.av_streams=0, history: CIRISEdge#440); \
                  the pause expires on the relief row's TTL or a superseding row"
             );
             return Err(AlmJoinError::AvStreamsPaused);
@@ -982,7 +982,7 @@ impl AvSubscriber {
                     offered,
                     filtered,
                     "AV subscriber: transit gate refused EVERY offered hop — the pool is \
-                     empty because of eligibility, not capacity (CIRISEdge#430). Peers \
+                     empty because of eligibility, not capacity (history: CIRISEdge#430). Peers \
                      must be directory-present nodes offering infra:transport under a \
                      shared trust root"
                 );
@@ -1750,7 +1750,7 @@ mod tests {
         use ciris_persist::federation::FederationDirectory;
         use std::sync::Arc;
         let dir: Arc<dyn FederationDirectory> =
-            Arc::new(ciris_persist::store::MemoryBackend::new());
+            Arc::new(ciris_persist::store::test_backend::test_backend());
 
         let paused_gate = TransitGate::new(Arc::clone(&dir), Some("us".to_string()))
             .with_mesh_config(Some(Arc::new(MeshConfigReader::fixed_for_test(
