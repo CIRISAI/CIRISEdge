@@ -1,5 +1,49 @@
 # CIRISEdge Release Notes
 
+# v44.0.0 — persist v60: the operational planes retire, goals are rows, the memory backend is gone
+
+**2026-10-26.** **MAJOR** from v43.2.0. Pins CIRISPersist **v60.0.0** (8dec0dea); verify v20.2.0
+and leviculum unchanged. Python requires `ciris-persist>=60,<61`. Persist's CHANGELOG `## [60.0.0]`
+§16 "Adoption" is the complete break list; this entry is what edge does with it.
+
+## Wire and API removals (why this is MAJOR)
+
+- **The operational planes are retired (persist §8).** An organisation is an affiliation, carried
+  on the attestation plane. `EnvelopeKind::{Organization, OrgMembership, PartnerRecord}` are in
+  persist's `RETIRED_FRAMED`: edge advertises nothing on them, and an inbound object is refused
+  TERMINAL as `federation_envelope_kind_retired` and booked on the retired ledger, exactly as v59's
+  key-plane kinds. Their positions are kept, so the manifest hash does not move. Edge's operational
+  admission is removed, with its public `OperationalProviders` / `KeyDirectoryProvider` /
+  `RootStewardsProvider` / `StewardRosterProvider` and
+  `FederationDirectoryReplicationBridge::{with_operational, with_config_and_operational}`.
+- **Goals are rows (persist §2).** A Goal is a signed `goal:{scale}:v1` row. Edge's
+  `GoalDeclaration` / `GoalRetirement` message types (and their responses and domain tags) are
+  retired; a peer's goal message no longer decodes and is dropped.
+
+## Refusals
+
+- `not_authority_at_receipt` is gone from persist's licensure tokens (#1036 item 2). A stale
+  licence is `AssertedAtStale` on the licensure plane, and edge books it TERMINAL there too (the
+  producer's remedy is a fresh row, never a retry; confirmed with persist). `AssertedAtStale`'s
+  `steward` field is `standing_for`, plus `plane`.
+
+## Tests
+
+- Persist's memory backend is removed (§5): edge's tests run on `store::test_backend::test_backend()`.
+- Fixtures follow persist's v60 rules: key ids are lowercase (#854); the durability takedown files a
+  `takedown_notice:dmca512:v1` row; the federation-announcement fixture holds a real
+  `contribution:federation_announcement:v1` row, signed through `Engine::emit_attestation`.
+- **The mutual-peer relay witness now relays** (`attributed_allegiance_659`). Its hub ran in leaf
+  mode, so the relay never reached one side, and since 43.2's pre-seal route fetch its precondition
+  raced a direct A<->B dial. That failed the v43.2.0 tag run on macOS (no release assets for
+  v43.2.0). The hub now forwards, as a ciris-server node does by default, and A and B peer each
+  other only after the relay.
+
+## Known
+
+- CIRISEdge#905: link shaping's real-frame budget is nominal (ρ·λ·W), so a starved timer lets the
+  real share exceed ρ. Shaping is off by default.
+
 # v43.2.0 — two strangers connect: the pre-seal route fetch; reciprocal link shaping
 
 **2026-10-22.** **MINOR** from v43.1.1 (persist v59.1.0 unchanged). CC 1.0-rc9 → rc10 text: the
