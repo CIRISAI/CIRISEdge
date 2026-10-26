@@ -527,6 +527,11 @@ async fn transport_for(
         if let Some(port) = bootstrap {
             c.bootstrap_peers = vec![format!("127.0.0.1:{port}").parse().unwrap()];
         }
+        // The node the others bootstrap to is the hub, and a hub forwards:
+        // without it its TCP clients cannot reach each other (leaf mode is
+        // the default), so a client-to-client path, the mutual peer's relay
+        // included, never exists.
+        c.enable_transport = bootstrap.is_none();
         c.announce_interval = Duration::from_secs(5);
         (c, node.auth())
     })
@@ -1090,9 +1095,6 @@ async fn two_persons_nodes_root_through_a_mutual_peer_that_relays_their_signed_r
     let (ta, port_a) = transport_for(&a, tmp.path(), "a", None).await;
     let (tb, _) = transport_for(&b, tmp.path(), "b", Some(port_a)).await;
     let (tk, _) = transport_for(&k, tmp.path(), "k", Some(port_a)).await;
-    let rt_a = start_runtime_with(&a, ta, &[&b.key, &k.key]).await;
-    let rt_b = start_runtime_with(&b, tb, &[&a.key, &k.key]).await;
-    let rt_k = start_runtime_with(&k, tk, &[&a.key, &b.key]).await;
     for n in [&a, &b, &k] {
         wait_for_own_route(n, Duration::from_secs(150)).await;
     }
@@ -1112,6 +1114,19 @@ async fn two_persons_nodes_root_through_a_mutual_peer_that_relays_their_signed_r
     );
     assert!(holds_signed_route_of(&k, &a).await && holds_signed_route_of(&k, &b).await);
 
+    // No replication runtime has started yet (each node's own route is the
+    // transport's producer), so the precondition above holds by construction.
+    // A and B then start peered with K ONLY: since 43.2 a dial that holds no
+    // authenticated pair fetches the dialled node's own signed route before
+    // the handshake (CC 5.3.3.5 E1 pre-seal route fetch), so an A<->B round
+    // before the relay would hand each the other's row directly and this would
+    // no longer witness the relay (on macOS CI the precondition lost that race
+    // on every attempt, and K, a live responder, could already have relayed).
+    // They peer each other only once K has relayed both rows.
+    let rt_a = start_runtime_with(&a, ta, &[&k.key]).await;
+    let rt_b = start_runtime_with(&b, tb, &[&k.key]).await;
+    let rt_k = start_runtime_with(&k, tk, &[&a.key, &b.key]).await;
+
     // THE RELAY: K hands each the other's signed row, so each resolves the
     // other's transit pair from a source authenticated to it.
     let relayed = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_secs(240), || async {
@@ -1128,6 +1143,21 @@ async fn two_persons_nodes_root_through_a_mutual_peer_that_relays_their_signed_r
         holds_signed_route_of(&a, &b).await,
         holds_signed_route_of(&b, &a).await
     );
+
+    // Each now holds the other's own signed row from the relay, so the first
+    // A<->B dial seals on it and fetches nothing.
+    for (rt, peer) in [(&rt_a, &b.key), (&rt_b, &a.key)] {
+        for kind in [
+            EnvelopeKind::Key,
+            EnvelopeKind::IdentityOccurrence,
+            EnvelopeKind::TransportDestination,
+            EnvelopeKind::Attestation,
+        ] {
+            rt.register_peer(peer.key_id.clone(), kind)
+                .await
+                .expect("peer A and B after the relay");
+        }
+    }
 
     // Now the pair seals and the allegiance facts cross both ways.
     let rooted_facts = drive_until(&[&rt_a, &rt_b, &rt_k], Duration::from_secs(240), || async {
