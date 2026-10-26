@@ -51,6 +51,7 @@ use tokio::sync::mpsc;
 /// derived from it.
 struct FedKey {
     key_id: String,
+    label: String,
     seed: [u8; 32],
 }
 
@@ -68,6 +69,7 @@ impl FedKey {
             .expect("pubkey");
         Self {
             key_id: ciris_verify_core::fedcode::derive_key_id(label, &pubkey),
+            label: label.to_owned(),
             seed,
         }
     }
@@ -116,6 +118,38 @@ impl FedKey {
         // rejects at admission — the shape that reddened this file.
         let pqc: Arc<dyn ciris_keyring::PqcSigner> = Arc::new(self.pqc_signer());
         Arc::new(LocalSigner::new(self.key_id.clone(), classical, Some(pqc)))
+    }
+}
+
+impl FedKey {
+    /// persist v60.0.0 — the signer `Engine::emit_attestation` takes. Its
+    /// `derived_key_id()` is `derive_key_id(label, pubkey)`, so it is built
+    /// from the LABEL (deriving from the derived id would re-suffix it).
+    async fn emit_signer(&self, base: &std::path::Path) -> ciris_persist::signing::LocalSigner {
+        let seed_dir = self.write_seed_dir(base);
+        let mut pqc_seed = self.seed;
+        pqc_seed[0] ^= 0x55;
+        std::fs::write(seed_dir.join("ml_dsa_65.seed"), pqc_seed).expect("write pqc seed");
+        let signer = ciris_persist::signing::LocalSigner::from_config(
+            &ciris_persist::signing::LocalSignerConfig {
+                key_id: self.label.clone(),
+                key_path: seed_dir.join("ed25519.seed"),
+                pqc_key_id: Some(format!("{}-pqc", self.key_id)),
+                pqc_key_path: Some(seed_dir.join("ml_dsa_65.seed")),
+            },
+        )
+        .expect("persist LocalSigner");
+        assert_eq!(
+            signer.derived_key_id(),
+            self.key_id,
+            "emit signer derives the key_id"
+        );
+        assert_eq!(
+            signer.pqc_public_key_b64().await.expect("pqc pubkey"),
+            Some(self.pqc_pubkey_b64()),
+            "emit signer carries the registered ML-DSA-65 half"
+        );
+        signer
     }
 }
 
@@ -185,24 +219,21 @@ fn node_core(directory: &Arc<SqliteBackend>) -> SqliteNodeCoreBackend {
     SqliteNodeCoreBackend::new(directory.conn_handle())
 }
 
-/// Insert a real `federation_announcement` Contribution into persist
-/// so the `federation_delivery_attestations.announcement_id` FK
-/// resolves. Returns the contribution_id.
+/// Hold a real `contribution:federation_announcement:v1` row, signed by
+/// `author`, so persist's delivery-attestation door finds the announcement it
+/// names (persist v60.0.0: a Contribution is a `scores` row on the attestation
+/// plane; the delivery door checks the row is held). Returns its
+/// `attestation_id`, the Contribution's id.
 async fn put_test_announcement(
-    nc: &SqliteNodeCoreBackend,
+    directory: &Arc<SqliteBackend>,
     author: &FedKey,
+    base: &std::path::Path,
     priority: ciris_persist::cirisnode::AnnouncementPriority,
     authority_class: ciris_persist::cirisnode::AuthorityClass,
     kind: ciris_persist::cirisnode::AnnouncementKind,
 ) -> String {
-    use ciris_persist::cirisnode::types::{
-        Cell, ContributionEnvelope, ContributionType, HybridSignature,
-    };
-    use ciris_persist::cirisnode::verify::canonical_bytes_for_envelope;
+    use ciris_persist::cirisnode::types::{Cell, ContributionType};
 
-    // Persist's ContributionEnvelope.author_id is base64-Ed25519
-    // pubkey (SCHEMA §2.2 — pubkey IS the contributor_id). Wire
-    // shape matches `FedKey::pubkey_b64`.
     let payload = ciris_persist::cirisnode::FederationAnnouncementPayload {
         priority,
         kind,
@@ -214,10 +245,8 @@ async fn put_test_announcement(
         expires_at: Utc::now() + chrono::Duration::days(1),
         evidence_refs: vec![],
     };
-    let mut env = ContributionEnvelope {
-        contribution_id: uuid::Uuid::new_v4().to_string(),
+    let input = ciris_persist::cirisnode::ContributionInput {
         contribution_type: ContributionType::Proposal,
-        author_id: author.pubkey_b64(),
         subject: Cell {
             domain: "federation".into(),
             language: "en".into(),
@@ -225,19 +254,22 @@ async fn put_test_announcement(
         },
         payload: serde_json::to_value(&payload).expect("payload to_value"),
         witness_set: None,
-        signature: HybridSignature {
-            ed25519: String::new(),
-            ml_dsa_65: None,
-            signed_at: Utc::now(),
-        },
-        submitted_at: Utc::now(),
     };
-    let canonical = canonical_bytes_for_envelope(&env).expect("canonical");
-    let sig = author.signer().sign(&canonical).expect("sign");
-    env.signature.ed25519 = B64.encode(sig);
-    let id = env.contribution_id.clone();
-    nc.put_contribution(env).await.expect("put_contribution");
-    id
+    let row = ciris_persist::cirisnode::rows::plan_any_contribution(&input, &author.key_id)
+        .expect("plan the announcement row");
+    // A view over the shared directory; its own composed signer is unused
+    // (the row is signed by `author` through `emit_attestation`).
+    let engine = ciris_persist::Engine::from_shared(
+        ciris_persist::BackendDispatch::Sqlite(directory.clone()),
+        Arc::new(ciris_keyring::Ed25519SoftwareSigner::new(
+            "announcement-view",
+        )),
+    );
+    let signer = author.emit_signer(base).await;
+    engine
+        .emit_attestation(&signer, row)
+        .await
+        .expect("announcement row admitted")
 }
 
 /// A `PeerDirectory` backed by a static `Vec` — the fan-out target
@@ -499,11 +531,13 @@ async fn av_spoofed_attestation_rejected_at_persist_admission() {
     let steward = FedKey::new("steward-fed", 0x01);
     let peer = FedKey::new("peer-honest", 0xBB);
     let attacker = FedKey::new("attacker", 0xEE);
+    let author = FedKey::new("announcement-author", 0xC1);
 
     let directory = directory_with(vec![
         signed_record(&steward, &steward, "steward"),
         signed_record(&peer, &steward, "agent"),
         signed_record(&attacker, &steward, "agent"),
+        signed_record(&author, &steward, "steward"),
     ])
     .await;
 
@@ -514,7 +548,20 @@ async fn av_spoofed_attestation_rejected_at_persist_admission() {
     // Persist routes verify through `federation_keys[peer_key_id]`
     // and checks the signature against the rooted pubkey; the
     // attacker's signature won't verify.
-    let announcement_id = uuid::Uuid::new_v4().to_string();
+    // persist v60.0.0 — the door checks the announcement is a HELD
+    // `contribution:federation_announcement:v1` row before the signature, so
+    // the spoof is filed against a real announcement (otherwise it is refused
+    // for the missing row and the signature is never reached).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let announcement_id = put_test_announcement(
+        &directory,
+        &author,
+        tmp.path(),
+        ciris_persist::cirisnode::AnnouncementPriority::Advisory,
+        ciris_persist::cirisnode::AuthorityClass::RootWa,
+        ciris_persist::cirisnode::AnnouncementKind::ThreatAdvisory,
+    )
+    .await;
     let hash = [0xCD; 32];
     let mut att = ciris_persist::cirisnode::DeliveryAttestation {
         announcement_id,
@@ -559,10 +606,12 @@ async fn av_replayed_attestation_is_idempotent() {
     ])
     .await;
 
+    let tmp = tempfile::tempdir().expect("tempdir");
     let nc = node_core(&directory);
     let announcement_id = put_test_announcement(
-        &nc,
+        &directory,
         &author,
+        tmp.path(),
         ciris_persist::cirisnode::AnnouncementPriority::Advisory,
         ciris_persist::cirisnode::AuthorityClass::RootWa,
         ciris_persist::cirisnode::AnnouncementKind::ThreatAdvisory,
@@ -640,8 +689,9 @@ async fn edge_emitted_attestation_passes_persist_admission() {
     let nc = node_core(&directory);
 
     let announcement_id = put_test_announcement(
-        &nc,
+        &directory,
         &author,
+        tmp.path(),
         ciris_persist::cirisnode::AnnouncementPriority::Advisory,
         ciris_persist::cirisnode::AuthorityClass::RootWa,
         ciris_persist::cirisnode::AnnouncementKind::ThreatAdvisory,

@@ -1807,7 +1807,6 @@ mod tests {
     }
 
     use super::*;
-    use ciris_persist::store::MemoryBackend;
     use std::sync::Arc;
 
     /// CIRISEdge#853 (Codex round two on #854) — a frame naming a NEW round
@@ -1910,7 +1909,7 @@ mod tests {
         use super::super::protocol::{ReplicationMessage, SummaryMessage};
         use super::super::registry::RouteOutcome;
 
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let sent = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let transport: Arc<dyn Transport> = Arc::new(RecordingTransport {
@@ -1965,7 +1964,7 @@ mod tests {
     /// the scheduler task; `shutdown` exits cleanly.
     #[tokio::test]
     async fn empty_peer_set_starts_and_shuts_down_cleanly() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -1978,7 +1977,7 @@ mod tests {
     /// registry handle the listen loop would use.
     #[tokio::test]
     async fn one_initiator_peer_registered_at_start() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let peers = vec![ReplicationPeer {
@@ -2001,7 +2000,7 @@ mod tests {
     /// no longer defaults to a passive Responder).
     #[tokio::test]
     async fn register_peer_hot_adds() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2018,7 +2017,7 @@ mod tests {
     /// registry. Distinct from `register_peer` (Responder-only).
     #[tokio::test]
     async fn register_initiator_peer_hot_adds_initiator_role() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2046,7 +2045,7 @@ mod tests {
     /// registry. Idempotent.
     #[tokio::test]
     async fn remove_peer_drops_initiator_and_deregisters() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2072,7 +2071,7 @@ mod tests {
     /// a non-empty pre-existing set.
     #[tokio::test]
     async fn set_peers_diff_converges() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let initial = vec![
@@ -2123,7 +2122,7 @@ mod tests {
     /// `shutdown` is idempotent.
     #[tokio::test]
     async fn shutdown_is_idempotent() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let directory: Arc<dyn FederationDirectory> = backend;
         let transport: Arc<dyn Transport> = Arc::new(NoopTransport);
         let mut rt =
@@ -2225,7 +2224,7 @@ mod tests {
             registries: &Registries,
             ledger: &Ledger,
         ) -> (ReplicationRuntime, EdgeMetrics) {
-            let backend = Arc::new(MemoryBackend::new());
+            let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
             let directory: Arc<dyn FederationDirectory> = backend;
             let transport: Arc<dyn Transport> = Arc::new(Loopback {
                 me: name.to_string(),

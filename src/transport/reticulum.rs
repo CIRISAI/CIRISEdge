@@ -15801,7 +15801,7 @@ fn peer_bundle_link_binding_ok(
 /// [`gated_save_provenance`]: crate::bundle_gate::gated_save_provenance
 // The parameter list IS the test seam: exactly the operands the wrapper reads
 // off the EventCtx, split out so the field-provenance tests can drive the full
-// chain against a real `MemoryBackend` + peers map without a live node
+// chain against a real `SqliteBackend` + peers map without a live node
 // (the #424 "the layer the loopback harness cannot reach" lesson).
 #[allow(clippy::too_many_arguments)]
 async fn process_peer_bundle_frame(
@@ -20272,7 +20272,7 @@ mod tests {
 
     /// CIRISEdge#299 — the full write-through → persist → boot-load →
     /// resolve round-trip through a real `FederationDirectory`
-    /// (`MemoryBackend`): a rooted transport identity persisted via
+    /// (`SqliteBackend`): a rooted transport identity persisted via
     /// `RootingDirectory::persist_transport_binding` is read back by
     /// `list_all_transport_destinations` and reconstructed into the same
     /// 64-byte `(x25519 ‖ ed25519)` a `PersistedBindingResolver` serves.
@@ -20281,9 +20281,8 @@ mod tests {
         use crate::verify::RootingDirectory;
         use base64::Engine as _;
         use ciris_persist::federation::FederationDirectory;
-        use ciris_persist::store::MemoryBackend;
 
-        let backend = MemoryBackend::new();
+        let backend = ciris_persist::store::test_backend::test_backend();
         // CIRISPersist#1103 — derived from the key the fixture row carries.
         let key_id: &str = &ciris_verify_core::fedcode::derive_key_id("peer-roundtrip", &[7u8; 32]);
         let dest_hash = [7u8; 16];
@@ -20504,9 +20503,8 @@ mod tests {
     async fn stored_reticulum_binding_returns_the_best_live_row() {
         use crate::verify::RootingDirectory;
         use ciris_persist::federation::self_at_login::BindingProvenance::{Advisory, Rooted};
-        use ciris_persist::store::MemoryBackend;
 
-        let backend = MemoryBackend::new();
+        let backend = ciris_persist::store::test_backend::test_backend();
         // CIRISPersist#1103 — derived from the key the fixture row carries.
         let key_id: &str = &ciris_verify_core::fedcode::derive_key_id("peer-heal-read", &[7u8; 32]);
         // FK gate: the occurrence's federation_keys row must exist.

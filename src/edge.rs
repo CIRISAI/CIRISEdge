@@ -9346,7 +9346,7 @@ async fn emit_withdraws(
 
     // Wrap in a typed envelope addressed to the holder. The envelope's
     // hybrid signature IS the proof-of-authority — no body-internal
-    // signature (same shape as GoalRetirement, CIRISEdge#41).
+    // signature (the durable single-signer shape).
     let envelope_bytes = {
         let mut env = build_envelope(
             MessageType::Withdraws,
@@ -9908,7 +9908,7 @@ mod delegation_gate_tests {
         algorithm, attestation_type as att_type, identity_type, Attestation, KeyRecord,
         SignedAttestation, SignedKeyRecord,
     };
-    use ciris_persist::store::MemoryBackend;
+    use ciris_persist::store::SqliteBackend;
     use sha2::{Digest as _, Sha256};
 
     // ── v6.3.2 fixture-signature helpers ────────────────────────────
@@ -10150,7 +10150,7 @@ mod delegation_gate_tests {
         att
     }
 
-    async fn seed_keys(backend: &Arc<MemoryBackend>, keys: &[(&str, &str)]) {
+    async fn seed_keys(backend: &Arc<SqliteBackend>, keys: &[(&str, &str)]) {
         use ciris_persist::federation::FederationDirectory;
         for (kid, itype) in keys {
             backend
@@ -10162,7 +10162,7 @@ mod delegation_gate_tests {
         }
     }
 
-    async fn seed_attestation(backend: &Arc<MemoryBackend>, att: Attestation) {
+    async fn seed_attestation(backend: &Arc<SqliteBackend>, att: Attestation) {
         use ciris_persist::federation::FederationDirectory;
         backend
             .put_attestation(SignedAttestation { attestation: att })
@@ -10219,7 +10219,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn empty_trust_roots_refuses_with_no_trust_roots() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(&backend, &[("agent", identity_type::AGENT)]).await;
         let dir: Arc<dyn ciris_persist::federation::FederationDirectory> = backend;
         let out = verify_self_at_login_delegation(
@@ -10243,7 +10243,7 @@ mod delegation_gate_tests {
     // placeholder-signature fixture pattern.
     #[tokio::test]
     async fn happy_path_admits_signer_reached_via_in_scope_chain() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10273,7 +10273,7 @@ mod delegation_gate_tests {
     /// six-hop chain `user-root → d1 → … → d5 → agent`, every hop carrying the
     /// scope and `sub_delegation`. Built once, walked at two depths below.
     async fn six_hop_chain() -> Arc<dyn ciris_persist::federation::FederationDirectory> {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         let keys = ["user-root", "d1", "d2", "d3", "d4", "d5", "agent"];
         let mut seeded = vec![("user-root", identity_type::USER)];
         for k in &keys[1..] {
@@ -10333,7 +10333,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn missing_delegation_refuses_with_signer_unreached() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10361,7 +10361,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn retracted_delegation_refuses_with_retracted_at_root() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10396,7 +10396,7 @@ mod delegation_gate_tests {
 
     #[tokio::test]
     async fn delegation_without_required_scope_refuses_with_missing_scope() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[
@@ -10436,7 +10436,7 @@ mod delegation_gate_tests {
     // signal across the union.
     #[tokio::test]
     async fn multi_root_fold_prefers_missing_scope_over_retracted() {
-        let backend = Arc::new(MemoryBackend::new());
+        let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
         seed_keys(
             &backend,
             &[

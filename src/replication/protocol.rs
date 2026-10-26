@@ -997,9 +997,11 @@ mod tests {
     /// `RETIRED_FRAMED`, read through `persist_kind`, and each names the kind
     /// persist's `retired_detail` names it (the label edge's retired ledger
     /// books under). Three of them carry a key-plane row family; the fourth
-    /// carries the occurrence `withdraws`.
+    /// carries the occurrence `withdraws`. persist v60.0.0 (§8) adds the three
+    /// operational kinds, which carry nothing (an organisation is an
+    /// affiliation, on the attestation plane).
     #[test]
-    fn the_retired_framed_kinds_are_persists_four_v59() {
+    fn the_retired_framed_kinds_are_persists_seven_v60() {
         use ciris_persist::federation::replication_policy::{retired_detail, RETIRED_FRAMED};
         let retired: Vec<EnvelopeKind> = EnvelopeKind::ALL
             .into_iter()
@@ -1012,6 +1014,9 @@ mod tests {
                 EnvelopeKind::Revocation,
                 EnvelopeKind::IdentityOccurrence,
                 EnvelopeKind::IdentityOccurrenceRevocation,
+                EnvelopeKind::Organization,
+                EnvelopeKind::OrgMembership,
+                EnvelopeKind::PartnerRecord,
             ]
         );
         assert_eq!(retired.len(), RETIRED_FRAMED.len());
@@ -1028,8 +1033,11 @@ mod tests {
             );
             assert_eq!(
                 k.key_plane_family().is_some(),
-                k.is_framed_retired() && k != EnvelopeKind::IdentityOccurrenceRevocation,
-                "{k:?}: only a retired kind carries a key-plane row family"
+                matches!(
+                    k,
+                    EnvelopeKind::Key | EnvelopeKind::Revocation | EnvelopeKind::IdentityOccurrence
+                ),
+                "{k:?}: exactly the three retired key-plane kinds carry a row family"
             );
         }
     }

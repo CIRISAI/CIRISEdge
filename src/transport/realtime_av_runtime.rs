@@ -1750,7 +1750,7 @@ mod tests {
         use ciris_persist::federation::FederationDirectory;
         use std::sync::Arc;
         let dir: Arc<dyn FederationDirectory> =
-            Arc::new(ciris_persist::store::MemoryBackend::new());
+            Arc::new(ciris_persist::store::test_backend::test_backend());
 
         let paused_gate = TransitGate::new(Arc::clone(&dir), Some("us".to_string()))
             .with_mesh_config(Some(Arc::new(MeshConfigReader::fixed_for_test(

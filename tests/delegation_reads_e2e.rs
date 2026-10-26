@@ -74,7 +74,6 @@ use std::sync::Arc;
 
 use ciris_persist::federation::admission;
 use ciris_persist::federation::FederationDirectory;
-use ciris_persist::store::MemoryBackend;
 
 // ─── Assertion 1 — reachable through `&dyn FederationDirectory` ─────
 
@@ -83,7 +82,7 @@ use ciris_persist::store::MemoryBackend;
 /// actually holds via `Arc<dyn FederationDirectory>`.
 #[tokio::test]
 async fn v9_3_0_delegation_reads_callable_through_dyn_trait() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let dir: Arc<dyn FederationDirectory> = backend.clone();
 
     // reachable_under_scope — empty graph → not reachable.
@@ -150,7 +149,7 @@ async fn v9_3_0_delegation_reads_callable_through_dyn_trait() {
 /// adoption boundary.
 #[tokio::test]
 async fn reachable_under_scope_self_pair_is_false_on_empty_graph() {
-    let backend = Arc::new(MemoryBackend::new());
+    let backend = Arc::new(ciris_persist::store::test_backend::test_backend());
     let dir: Arc<dyn FederationDirectory> = backend.clone();
 
     let self_reachable =
