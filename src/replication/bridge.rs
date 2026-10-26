@@ -15054,6 +15054,12 @@ pub(crate) mod tests {
         subject_key_ids: &[&str],
         cohort_scope: &str,
     ) {
+        // persist v60.0.0 (#1048): a term-bearing `delegates_to` must carry a
+        // bounded `delegation_valid_until`; persist's fixture helper adds one
+        // only when the edge bears a term.
+        if attestation_type == "delegates_to" {
+            ciris_persist::federation::admission::with_test_term(envelope, asserted_at);
+        }
         let Some(obj) = envelope.as_object_mut() else {
             return;
         };
