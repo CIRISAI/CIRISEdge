@@ -10058,6 +10058,10 @@ mod delegation_gate_tests {
                 obj.insert("sub_delegation".to_owned(), serde_json::json!(true));
             }
         }
+        // persist v60.0.0 (#1048): a term-bearing edge (`sub_delegation` here)
+        // must carry a bounded `delegation_valid_until`; persist's fixture helper
+        // adds one only when the edge is term-bearing.
+        ciris_persist::federation::admission::with_test_term(&mut envelope, now);
         // #598: bind the signed `asserted_at` into the envelope BEFORE signing.
         if let Some(obj) = envelope.as_object_mut() {
             obj.insert(
