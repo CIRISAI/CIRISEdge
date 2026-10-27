@@ -1935,6 +1935,11 @@ fn unix_now_secs() -> crate::rate_limit::Ts {
 /// drains as pulls land.
 const MISSING_SIGNER_CAP: usize = 1024;
 
+/// CIRISEdge#904 — cap on names a person asked for. A contact list is pasted
+/// one name at a time; past this, a new request waits in the repair queue like
+/// any other name.
+const REQUESTED_SIGNER_CAP: usize = 64;
+
 /// Production-grade [`ReplicationDirectory`] implementation over
 /// persist's `FederationDirectory`.
 pub struct FederationDirectoryReplicationBridge {
@@ -2188,6 +2193,13 @@ pub struct FederationDirectoryReplicationBridge {
     /// than evicting older ones — the older names are the ones with rows already
     /// waiting on them.
     missing_signers: Mutex<std::collections::BTreeMap<String, Option<String>>>,
+    /// CIRISEdge#904 — names a PERSON is waiting on (a contact paste,
+    /// [`ReplicationDirectory::request_signer`]). Taken before any
+    /// background-repair name, by whichever peer's round comes next, so a
+    /// third party's signer can never queue ahead of the key a person asked for.
+    /// Bounded and held apart from `missing_signers`, so repair traffic cannot
+    /// evict it.
+    requested_signers: Mutex<std::collections::BTreeSet<String>>,
     /// Source accounting for `missing_signers`, maintained incrementally.
     ///
     /// FOURTH appearance of the O(cap)-per-rejection class: this map rebuilt a
@@ -2455,6 +2467,7 @@ impl FederationDirectoryReplicationBridge {
             serve_tier_resolver: None,
             serve_tier_subject: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
+            requested_signers: Mutex::new(std::collections::BTreeSet::new()),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             advertise_inputs: Mutex::new(AdvertiseInputs::default()),
@@ -2553,6 +2566,7 @@ impl FederationDirectoryReplicationBridge {
             serve_tier_resolver: None,
             serve_tier_subject: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
+            requested_signers: Mutex::new(std::collections::BTreeSet::new()),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             advertise_inputs: Mutex::new(AdvertiseInputs::default()),
@@ -3842,7 +3856,43 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
     }
 
+    fn request_signer(&self, kind: EnvelopeKind, signer_key_id: &str) {
+        let queued = self.requested_signers.lock().is_ok_and(|mut requested| {
+            requested.contains(signer_key_id)
+                || (requested.len() < REQUESTED_SIGNER_CAP
+                    && requested.insert(signer_key_id.to_owned()))
+        });
+        if !queued {
+            // Over the cap: the name still goes to the repair queue, unrouted.
+            self.note_missing_signer(kind, signer_key_id, None);
+        }
+    }
+
     fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
+        // CIRISEdge#904 — a name a person is waiting on goes first, to
+        // whichever peer's round comes next; it also leaves the repair queue
+        // if it was there, so it is not asked twice.
+        let requested = self
+            .requested_signers
+            .lock()
+            .ok()
+            .and_then(|mut requested| requested.pop_first());
+        if let Some(name) = requested {
+            if let Ok(mut pending) = self.missing_signers.lock() {
+                if let Some(src) = pending.remove(&name) {
+                    if let Ok(mut sources) = self.missing_signer_sources.lock() {
+                        sources.forget(src.as_deref());
+                    }
+                }
+            }
+            tracing::info!(
+                signer = %name,
+                peer = peer_key_id,
+                "recovery round: asking this peer for a key a person is waiting on, ahead of \
+                 background repair (CIRISEdge#904)"
+            );
+            return Some(name);
+        }
         let mut pending = self.missing_signers.lock().ok()?;
         // Prefer a name this peer actually delivered (best holder guess), then
         // fall back to an unrouted one so successive rounds try successive
@@ -16237,6 +16287,54 @@ pub(crate) mod tests {
             None,
             "and taking it removes it — the pull is not re-sent every tick"
         );
+    }
+
+    /// CIRISEdge#904 — a key a person is waiting on is asked before background
+    /// repair. The canonical delivers rows from hundreds of unmet signers, so
+    /// the queue is full of names ROUTED to it; the contact paste is unrouted
+    /// and, before #904, was never taken while a routed name remained (270
+    /// queued names in the field). Now the next round toward any peer asks for
+    /// it first, repair resumes after, and a name both requested and queued is
+    /// asked once.
+    #[tokio::test]
+    async fn a_requested_key_is_asked_before_background_repair_904() {
+        let (_backend, bridge) = test_fixtures::make_bridge(&[]);
+        for i in 0..270 {
+            bridge.note_missing_signer(
+                EnvelopeKind::Key,
+                &format!("repair-signer-{i:03}"),
+                Some("canonical"),
+            );
+        }
+        // Also queued as repair, so the take must not ask for it twice.
+        bridge.note_missing_signer(EnvelopeKind::Key, "contact-key", None);
+        bridge.request_signer(EnvelopeKind::Key, "contact-key");
+        assert_eq!(
+            bridge.take_missing_signer_for("canonical").as_deref(),
+            Some("contact-key"),
+            "the requested key goes first, ahead of 270 routed repair names"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("canonical").as_deref(),
+            Some("repair-signer-000"),
+            "repair resumes in its own order"
+        );
+        let mut rest = 0;
+        while let Some(name) = bridge.take_missing_signer_for("canonical") {
+            assert_ne!(name, "contact-key", "a requested name is asked once");
+            rest += 1;
+        }
+        assert_eq!(rest, 269);
+
+        // Past the requested cap, a request still reaches the repair queue.
+        for i in 0..=REQUESTED_SIGNER_CAP {
+            bridge.request_signer(EnvelopeKind::Key, &format!("asked-{i:03}"));
+        }
+        let mut asked = 0;
+        while bridge.take_missing_signer_for("any-peer").is_some() {
+            asked += 1;
+        }
+        assert_eq!(asked, REQUESTED_SIGNER_CAP + 1, "none is dropped");
     }
 
     /// CIRISEdge#552 — a third-party signer IS queued (a conferred server will
