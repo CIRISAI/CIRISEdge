@@ -1,5 +1,24 @@
 # CIRISEdge Release Notes
 
+# v43.2.1 — a contact's announced device arrives on request, not twenty minutes later
+
+**2026-10-27.** **PATCH** from v43.2.0 (persist v59.1.0, verify v20.2.0 unchanged). Unblocks
+CIRISAgent 2.17.0 (live chat between two fresh nodes whose only shared peer is the canonical).
+
+- **A conferred server answers a stranger's Attestation subject Pull with the subject's announced
+  testimony (#907).** After a contact add, a fresh node held the contact's owner key but not their
+  announced `delegates_to(owner → node)` binding, so a directed consent grant had no recipient node.
+  The canonical held the binding but refused the Pull ("not publicly pullable"), and its oldest-first
+  advertise reached today's rows about twenty minutes later. A requester that is not the subject now
+  passes the same gate as a public-plane identifier lookup (a shared trust root, the per-requester
+  lookup limiter) and is answered with the subject's own owner-bindings and root acceptances at
+  `cohort_scope: federation`, keeping only the rows the fetch gate would serve that requester. The
+  fetch gate stays the whole disclosure decision (#752's rule: a live announced binding of a node the
+  server publishes), so this changes timing, never reach, and every listed ref is fetchable.
+  Takes effect where the canonical runs it. Witness
+  `a_strangers_subject_pull_gets_the_announced_binding_only_907`; the server's
+  `a_contacts_announced_owner_binding_arrives_on_a_subject_pull` passes on it and fails on v43.2.0.
+
 # v43.2.0 — two strangers connect: the pre-seal route fetch; reciprocal link shaping
 
 **2026-10-22.** **MINOR** from v43.1.1 (persist v59.1.0 unchanged). CC 1.0-rc9 → rc10 text: the

@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "ciris-edge"
-version = "43.2.0"
+version = "43.2.1"
 dependencies = [
  "async-trait",
  "axum",
