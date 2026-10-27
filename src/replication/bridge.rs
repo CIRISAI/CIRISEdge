@@ -4243,8 +4243,19 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         //
         // What bounds abuse is not WHO answers but HOW MUCH any one peer may
         // extract, across layered windows — see the drain ceilings above.
+        // CIRISEdge#907 — the Attestation plane is not publicly pullable, but a
+        // subject's ANNOUNCED testimony is public by design (CC 5.4.6: an
+        // announced device roster is public; #752 already relays it at first
+        // contact). A requester that is not the subject is answered with that
+        // testimony alone ([`Self::announced_testimony_holdings`]), through the
+        // same conferred-server gate as a public plane: a shared trust root,
+        // then the per-requester lookup limiter.
+        let announced_testimony = kind == EnvelopeKind::Attestation && !entitled_without_tier;
         let mut cohort_entitled = false;
-        if !entitled_without_tier && peer_key_id.is_some() && kind.is_public_subject_pull() {
+        if !entitled_without_tier
+            && peer_key_id.is_some()
+            && (kind.is_public_subject_pull() || announced_testimony)
+        {
             if let Some(requester) = peer_key_id {
                 cohort_entitled = self.shares_a_trust_root_with(requester).await;
                 if !cohort_entitled {
@@ -4310,6 +4321,13 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 let _permit = self.sweep_gate.enter().await;
                 self.subject_holdings_inner(kind, subject_key_id, peer_key_id)
                     .await
+            }
+            // 4. CIRISEdge#907 — a stranger to the subject, on the Attestation
+            //    plane, from a conferred server: the subject's announced
+            //    testimony only, each ref one the fetch twin would serve.
+            Some(p) if announced_testimony && cohort_entitled => {
+                let _permit = self.sweep_gate.enter().await;
+                self.announced_testimony_holdings(subject_key_id, p).await
             }
             other => {
                 tracing::warn!(
@@ -5272,6 +5290,76 @@ impl FederationDirectoryReplicationBridge {
                  (history: CIRISEdge#462, history: CIRISEdge#429, history: CIRISPersist#1001)"
             );
         }
+    }
+
+    /// CIRISEdge#907 — what a conferred server hands a requester that is NOT
+    /// the subject on an Attestation subject Pull: the subject's own
+    /// `delegates_to` / `supersedes` rows at `cohort_scope: federation` that are
+    /// owner-bindings (CC 2.4.1.2) or root acceptances (`trust:accepts:v1`, CC
+    /// 4.4.3.8 item 3), and of those ONLY the ones the fetch twin would serve
+    /// this requester ([`Self::fetch_envelope_bytes_for_peer`]). The fetch gate
+    /// is the whole disclosure decision, so the Pull widens timing, never reach:
+    /// a live announced binding of a published node rides (#752's rule), and a
+    /// row the requester could not fetch is never listed (#429).
+    async fn announced_testimony_holdings(
+        &self,
+        subject_key_id: &str,
+        requester: &str,
+    ) -> Vec<EnvelopeRef> {
+        use ciris_persist::federation::admission::is_owner_binding_envelope;
+        use ciris_persist::federation::types::{attestation_type, cohort_scope};
+        const ACCEPTANCE_DIMENSION: &str = "trust:accepts:v1";
+        let mut authored: Vec<Attestation> = Vec::new();
+        let mut pages = ciris_persist::federation::attestation_query::AttestationQuery::by(
+            subject_key_id,
+            ciris_persist::federation::attestation_query::FOLD_PAGE,
+        )
+        .pages();
+        while let Some(page) = match pages.next(&*self.directory).await {
+            Ok(page) => page,
+            Err(e) => {
+                Self::subject_read_not_served(subject_key_id, "announced-testimony", &e);
+                return Vec::new();
+            }
+        } {
+            authored.extend(page);
+        }
+        let mut refs = Vec::new();
+        for att in authored {
+            let ty = att.attestation_type.as_str();
+            if (ty != attestation_type::DELEGATES_TO && ty != attestation_type::SUPERSEDES)
+                || att.cohort_scope != cohort_scope::FEDERATION
+            {
+                continue;
+            }
+            let env = &att.attestation_envelope;
+            let acceptance = env.get("dimension").and_then(serde_json::Value::as_str)
+                == Some(ACCEPTANCE_DIMENSION);
+            if !is_owner_binding_envelope(env) && !acceptance {
+                continue;
+            }
+            let Some((hash, _)) = content_hash_of(&att) else {
+                continue;
+            };
+            if self
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some(requester))
+                .await
+                .is_some()
+            {
+                refs.push(EnvelopeRef {
+                    envelope_hash: hash,
+                    seq: Self::ms_seq(att.asserted_at),
+                });
+            }
+        }
+        tracing::debug!(
+            subject = %subject_key_id,
+            requester,
+            served = refs.len(),
+            "subject Pull from a stranger to the subject: announced testimony only \
+             (CIRISEdge#907)"
+        );
+        refs
     }
 
     #[allow(clippy::too_many_lines)] // five per-plane arms + the v18 loud-read/booking mirrors
@@ -24067,6 +24155,143 @@ pub(crate) mod tests {
             "the unpublished binding and the consent row are withheld under the unchanged \
              token: {:?}",
             metrics.snapshot().withholds_by_reason
+        );
+    }
+
+    /// CIRISEdge#907 — a first-contact requester's SUBJECT Pull of a third
+    /// party's testimony on the Attestation plane. The relay (a conferred
+    /// server Rooted with the requester) answers with exactly the subject's
+    /// announced binding of a node it publishes, which the fetch twin also
+    /// serves: never the binding of an unpublished node, the `self`-scoped
+    /// binding, or the consent row. A requester sharing no root gets nothing,
+    /// and the subject's own Pull is unchanged. Before #907 the stranger's
+    /// Pull was refused outright ("not publicly pullable"), so a fresh node
+    /// learned a contact's node only when the oldest-first advertise reached it.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_strangers_subject_pull_gets_the_announced_binding_only_907() {
+        let backend = Arc::new(MemoryBackend::new());
+        let (relay, peer, peer_owner, rootless) =
+            ("node-relay", "node-peer", "person-peer", "node-rootless");
+        let (o, d, e, u) = ("person-o", "node-d", "node-e", "node-u");
+        register_fixture_keys(
+            &backend,
+            &[
+                (relay, identity_type::NODE),
+                (peer, identity_type::NODE),
+                (peer_owner, identity_type::USER),
+                (rootless, identity_type::NODE),
+                (o, identity_type::USER),
+                (d, identity_type::NODE),
+                (e, identity_type::NODE),
+                (u, identity_type::NODE),
+            ],
+        )
+        .await;
+        seed_owner_binding(&backend, peer_owner, peer).await;
+        // The requester's node accepts the root as well as its owner, as a
+        // production node does (FIRST_CONTACT §2: `delegates_to(node → R)`):
+        // the conferred-server lookup asks the requester's own roots.
+        seed_common_root(&backend, &[relay, peer_owner, peer]).await;
+        let announced = seed_owner_binding(&backend, o, d).await;
+        let unpublished = seed_owner_binding(&backend, o, e).await;
+        let unannounced = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &unannounced,
+            o,
+            u,
+            "delegates_to",
+            "self",
+            owner_binding_envelope(&unannounced, o, u),
+        )
+        .await;
+        let consent = uuid::Uuid::new_v4().to_string();
+        seed_raw_attestation(
+            &backend,
+            &consent,
+            o,
+            d,
+            "scores",
+            serde_json::json!({
+                "id": consent,
+                "attesting_key_id": o,
+                "attested_key_id": d,
+                "attestation_type": "scores",
+                "dimension": "consent:replication:v1",
+                "payload": { "grants": "transfer", "attestation_prefixes": ["trace:"] },
+            }),
+        )
+        .await;
+        let publish = vec![relay.to_string()];
+        let relay_bridge = || {
+            let publish = publish.clone();
+            bridge_over(&backend, &[])
+                .with_local_key_id(Some(relay.to_string()))
+                .with_self_provider(Some(Arc::new(move || publish.clone())))
+                .with_kind_publish_selector(Some(KindPublishSelector::from_sets(HashMap::from([
+                    (
+                        EnvelopeKind::Key,
+                        vec![
+                            relay.to_string(),
+                            d.to_string(),
+                            u.to_string(),
+                            o.to_string(),
+                        ],
+                    ),
+                    (
+                        EnvelopeKind::IdentityOccurrence,
+                        vec![relay.to_string(), d.to_string(), u.to_string()],
+                    ),
+                ]))))
+        };
+        let pulled = |requester: &'static str| {
+            let bridge = relay_bridge();
+            async move {
+                bridge
+                    .subject_holdings(EnvelopeKind::Attestation, o, Some(requester))
+                    .await
+                    .into_iter()
+                    .map(|r| r.envelope_hash)
+                    .collect::<std::collections::BTreeSet<[u8; 32]>>()
+            }
+        };
+
+        let announced_hash = wire_hash_of(&backend, &announced).await;
+        let got = pulled(peer).await;
+        assert_eq!(
+            got,
+            std::collections::BTreeSet::from([announced_hash]),
+            "a stranger's Pull gets exactly the announced binding of the published node"
+        );
+        assert!(
+            relay_bridge()
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &announced_hash,
+                    Some(peer)
+                )
+                .await
+                .is_some(),
+            "every ref the Pull lists is fetchable by the same requester (#429)"
+        );
+        for (id, why) in [
+            (&unpublished, "a node the relay does not publish"),
+            (&unannounced, "a binding at `self` (not announced)"),
+            (&consent, "a consent row about a published node"),
+        ] {
+            let hash = wire_hash_of(&backend, id).await;
+            assert!(!got.contains(&hash), "not served on the Pull: {why}");
+        }
+        assert!(
+            pulled(rootless).await.is_empty(),
+            "a requester sharing no trust root with the relay gets nothing (CC 4)"
+        );
+        let own = pulled(o).await;
+        assert!(
+            own.contains(&wire_hash_of(&backend, &consent).await)
+                && own.contains(&wire_hash_of(&backend, &unannounced).await),
+            "the subject's own Pull is the data-subject axis, unchanged"
         );
     }
 
