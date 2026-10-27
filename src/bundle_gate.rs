@@ -579,7 +579,7 @@ pub async fn gated_save_provenance(
             key_id,
             gate = mode.as_str(),
             refusal = "no_bundle_registered",
-            "CIRISEdge#437 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — no \
+            "history: CIRISEdge#437 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — no \
              build-attestation bundle registered for this peer (in-memory routing untouched; \
              register the peer's bundle or hold the gate flip until the fleet floor is met)"
         );
@@ -608,7 +608,7 @@ pub async fn gated_save_provenance(
                     gate = mode.as_str(),
                     pipeline = %cached.pipeline_key_id,
                     refusal = "pipeline_without_standing",
-                    "CIRISEdge#793 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — the \
+                    "history: CIRISEdge#793 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — the \
                      cached bundle's pipeline no longer holds infra:attest on either standing \
                      plane from this node (withdrawn, or its root is no longer accepted)"
                 );
@@ -619,7 +619,7 @@ pub async fn gated_save_provenance(
                     key_id,
                     gate = mode.as_str(),
                     refusal = %refusal,
-                    "CIRISEdge#793 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — the \
+                    "history: CIRISEdge#793 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — the \
                      cached bundle's standing could not be re-checked (refusals are not cached; \
                      the next Rooted save asks again)"
                 );
@@ -650,7 +650,7 @@ pub async fn gated_save_provenance(
                 key_id,
                 gate = mode.as_str(),
                 refusal = %refusal,
-                "CIRISEdge#437 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — the \
+                "history: CIRISEdge#437 bundle_gate: Rooted DURABLE save DOWNGRADED to Advisory — the \
                  registered bundle did not verify (in-memory routing untouched; refusals are \
                  not cached, the next Rooted save re-checks)"
             );

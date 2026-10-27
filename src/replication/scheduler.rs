@@ -559,7 +559,7 @@ impl ReplicationScheduler {
         if config.max_concurrent_rounds == 0 {
             tracing::warn!(
                 "scheduler: max_concurrent_rounds(0) would never run a round; using 1 \
-                 (CIRISEdge#740)"
+                 (history: CIRISEdge#740)"
             );
         }
         Self {

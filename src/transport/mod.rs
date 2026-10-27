@@ -220,6 +220,18 @@ pub mod av_transit_handshake;
 /// No classical fallback, no caller-supplied key, no compat path.
 #[cfg(feature = "_reticulum-module")]
 pub mod link_seal;
+/// CC 5.3.3.5 E1 — the pre-seal route fetch (`CTKR` / `CTKA`): a dialler
+/// with no pair for the dialled node asks for its signed route row as the
+/// link's first frame, verifies it, then runs the handshake
+/// (`CLM-pre-seal-route-fetch`).
+#[cfg(feature = "_reticulum-module")]
+pub mod route_fetch;
+
+/// CC 5.4.3 — link shaping (`CLM-link-shaping`): constant MDU-sized frames at
+/// Poisson times on a shaped identity link, both ways, negotiated right after
+/// the transit KEX; budget classes, ρ and W as steward knobs; A/V excluded.
+#[cfg(feature = "_reticulum-module")]
+pub mod link_shaping;
 
 /// CIRISEdge#805 items 5–6 — the host call API: a call is a room's set of
 /// live streams (`FSD/AV_CALL_API.md`).

@@ -266,7 +266,7 @@ impl MeshConfigReader {
                         unreadable_roots = ?fold.unreadable_roots,
                         "mesh-config fold could not read some subscribed roots — on a \
                          restrict-only plane this node may be running under FEWER \
-                         restrictions than it consented to (CIRISPersist#601 / CIRISEdge#440)"
+                         restrictions than it consented to (history: CIRISPersist#601 / history: CIRISEdge#440)"
                     );
                 }
                 MeshConfigRelief::from_fold(&fold)
@@ -277,7 +277,7 @@ impl MeshConfigReader {
                     error = %e,
                     "mesh-config resolve FAILED — failing OPEN to the configured baseline \
                      (relief, not a gate: an unreadable plane must not change behavior; \
-                     CIRISEdge#440)"
+                     history: CIRISEdge#440)"
                 );
                 MeshConfigRelief::NONE
             }

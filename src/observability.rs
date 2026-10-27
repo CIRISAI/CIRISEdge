@@ -994,8 +994,93 @@ pub const LINK_SEAL_PAIR_ROOTED: &str = "link_seal_pair_rooted";
 /// CC 3.3.6.2 (rc9) source (a) — a dial keyed on a pair from the dialled
 /// node's own hybrid-signed route row (the node is not Rooted here).
 pub const LINK_SEAL_PAIR_SELF_SIGNED_ROW: &str = "link_seal_pair_self_signed_row";
+/// CIRISEdge#867 — a dialled link established through an establishment retry
+/// under a fresh wire id; edge moved its state and the seal onto that id.
+pub const LINK_REKEYED_TO_WIRE_ID: &str = "link_rekeyed_to_wire_id";
 /// CC 3.2 (f) — a first contact keyed on the pairing payload's pinned pair.
 pub const LINK_SEAL_PAIR_PIN: &str = "link_seal_pair_pin";
+/// CC 5.3.3.5 E1 (`CLM-pre-seal-route-fetch`) — a dial keyed on a pair
+/// fetched over the link itself: the dialled node's own signed route row,
+/// asked for as the link's first frame and verified before the handshake.
+pub const LINK_SEAL_PAIR_ROUTE_FETCH: &str = "link_seal_pair_route_fetch";
+/// Pre-seal route fetch, dialler side — a route request went out as a
+/// link's first frame (no pair was held for the dialled node).
+pub const LINK_SEAL_ROUTE_REQUEST_SENT: &str = "link_seal_route_request_sent";
+/// Pre-seal route fetch, responder side — a route request passed the
+/// receiver order (per link once, node-wide rate) and named this node.
+pub const LINK_SEAL_ROUTE_REQUESTED: &str = "link_seal_route_requested";
+/// Pre-seal route fetch, responder side — this node's own signed route row
+/// went out as the answer (the one unsealed frame set besides the handshake).
+pub const LINK_SEAL_ROUTE_ANSWERED: &str = "link_seal_route_answered";
+/// Refused: a route request that does not parse.
+pub const LINK_SEAL_REFUSED_ROUTE_REQUEST: &str = "link_seal_refused_route_request";
+/// Refused by the receiver order, before anything was read: a second request
+/// on one link, or one over the node-wide rate.
+pub const LINK_SEAL_REFUSED_ROUTE_RATE_LIMITED: &str = "link_seal_refused_route_rate_limited";
+/// Refused before the key is compared: a route request on a scoped or A/V
+/// link (a derived address must not answer "are you key X?").
+pub const LINK_SEAL_REFUSED_ROUTE_OFF_IDENTITY_PLANE: &str =
+    "link_seal_refused_route_off_identity_plane";
+/// Refused: the request named a key that is not this node's.
+pub const LINK_SEAL_REFUSED_ROUTE_NOT_OURS: &str = "link_seal_refused_route_not_ours";
+/// Refused: this node holds no live signed route row of its own with a pair.
+pub const LINK_SEAL_REFUSED_ROUTE_UNAVAILABLE: &str = "link_seal_refused_route_unavailable";
+/// Refused at the dialler: the answer's framing, size, or shape.
+pub const LINK_SEAL_REFUSED_ROUTE_ANSWER: &str = "link_seal_refused_route_answer";
+/// Refused at the dialler: the answer's row is signed by, or about, a key
+/// other than the dialled one; never stored.
+pub const LINK_SEAL_REFUSED_ROUTE_ANSWER_SIGNER: &str = "link_seal_refused_route_answer_signer";
+/// Refused at the dialler: the row (or its key record) failed persist's
+/// authenticated admission or the `CLM-seal-authenticated-pair` checks.
+pub const LINK_SEAL_REFUSED_ROUTE_ANSWER_UNVERIFIED: &str =
+    "link_seal_refused_route_answer_unverified";
+/// Refused at the dialler: no answer within the route-fetch budget.
+pub const LINK_SEAL_REFUSED_ROUTE_TIMEOUT: &str = "link_seal_refused_route_timeout";
+/// Refused at the dialler: the link closed before an answer (the responder
+/// refused the request by its receiver order, or could not answer).
+pub const LINK_SEAL_REFUSED_ROUTE_CLOSED: &str = "link_seal_refused_route_closed";
+/// Refused: a request or answer frame could not be sent.
+pub const LINK_SEAL_REFUSED_ROUTE_SEND: &str = "link_seal_refused_route_send";
+
+// ─── CIRISEdge#627/#879 — on-link announce (`CANN`) receipt ──────────────
+/// `transport_inbound_drops` tag: a `CANN` frame on a link with no proven
+/// remote identity (a peer-dialled link before its LINKIDENTIFY, or a dialled
+/// link whose announce names another destination).
+pub const DROP_ANNOUNCE_FRAME_LINK_UNIDENTIFIED: &str = "announce_frame_link_unidentified";
+/// `transport_inbound_drops` tag: a `CANN` frame whose transport key is not
+/// the link's proven remote identity.
+pub const DROP_ANNOUNCE_FRAME_IDENTITY_MISMATCH: &str = "announce_frame_identity_mismatch";
+/// `peer_binding` label: a `CANN` frame bound to its link and received as an
+/// announce (both directions: the responder's on the dialler, #879).
+pub const ANNOUNCE_FRAME_BOUND: &str = "announce_frame_bound";
+
+// ─── CC 5.4.3 — `EdgeMetrics::link_shaping` labels (CLM-link-shaping) ──────
+/// A shaping offer went out on a link (this node's class is not `off`).
+pub const LINK_SHAPING_OFFERED: &str = "link_shaping_offered";
+/// Both offers were non-off: the link is shaped from here, both ways.
+pub const LINK_SHAPING_AGREED: &str = "link_shaping_agreed";
+/// One side offered `off` (or the peer never answered): the link runs
+/// unshaped, by both sides' agreement.
+pub const LINK_SHAPING_UNSHAPED: &str = "link_shaping_unshaped";
+/// Refused: the peer offers no shaping and this node requires shaped links;
+/// the link closed.
+pub const LINK_SHAPING_REFUSED_UNSHAPED_PEER: &str = "link_shaping_refused_unshaped_peer";
+/// Refused: a malformed offer or shaped frame; the link closed.
+pub const LINK_SHAPING_REFUSED_MALFORMED: &str = "link_shaping_refused_malformed";
+/// Dropped and the link closed: a bare frame on a shaped link, a shaped
+/// frame on an unshaped one, or a Resource on a shaped link.
+pub const LINK_SHAPING_DROPPED_WRONG_KIND: &str = "link_shaping_dropped_wrong_kind";
+/// A real frame emitted on a shaped link.
+pub const LINK_SHAPING_FRAMES_REAL: &str = "link_shaping_frames_real";
+/// A cover frame emitted on a shaped link.
+pub const LINK_SHAPING_FRAMES_COVER: &str = "link_shaping_frames_cover";
+/// A cover frame received on a shaped link (dropped, as designed).
+pub const LINK_SHAPING_COVER_RECEIVED: &str = "link_shaping_cover_received";
+/// A send deferred because the shaped link's queue was full (the caller
+/// retries; nothing dropped).
+pub const LINK_SHAPING_QUEUE_DEFERRED: &str = "link_shaping_queue_deferred";
+/// A shaped frame could not be sent; the link closed.
+pub const LINK_SHAPING_SEND_FAILED: &str = "link_shaping_send_failed";
 /// A row the Attestation advertise's projection filter skipped (a `SelfOwn`
 /// row whose attester is not in this node's self-publish set, ...). Not a
 /// withhold: the row was not this node's to publish when it was read.
@@ -1081,6 +1166,18 @@ pub const PEER_BINDING_PRIMED: &str = "peer_binding_primed";
 /// `prime_peer` refused a transport identity that does not reproduce the
 /// named destination it was primed at.
 pub const PEER_BINDING_PRIME_REFUSED: &str = "peer_binding_prime_refused";
+/// CIRISEdge#888 — a link's proven transport identity is bound to MORE THAN
+/// ONE key (an install's pre-split agent key and its node key both hold a
+/// route for one destination). Counted once per attribution that had to
+/// choose.
+pub const PEER_BINDING_ATTRIBUTION_SHARED: &str = "peer_binding_attribution_shared";
+/// CIRISEdge#888 — the shared identity was attributed to the key the
+/// dialler's transit KEX claims: the claim is corroborated by that key's own
+/// binding to this identity, not contradicted.
+pub const PEER_BINDING_ATTRIBUTION_BY_CLAIM: &str = "peer_binding_attribution_by_claim";
+/// CIRISEdge#888 — the shared identity was attributed to its `node`-typed key
+/// (a node key is the transport identity; an actor key never is).
+pub const PEER_BINDING_ATTRIBUTION_BY_NODE: &str = "peer_binding_attribution_by_node";
 
 /// The live counter/gauge bag every [`crate::Edge`] owns.
 ///
@@ -1393,6 +1490,9 @@ pub struct EdgeMetrics {
     /// constants in this module): links keyed (`link_seal_initiated` /
     /// `link_seal_accepted`), each named refusal, and each dropped frame.
     pub link_seal: Arc<RwLock<HashMap<&'static str, u64>>>,
+    /// CC 5.4.3 — link shaping, by label (`LINK_SHAPING_*` constants in
+    /// this module): offers, agreements, refusals, real and cover frames.
+    pub link_shaping: Arc<RwLock<HashMap<&'static str, u64>>>,
     /// The Attestation advertise's own ledger, by label (`ADVERTISE_*`
     /// constants in this module): rows the projection filter skipped, rows
     /// re-offered after being skipped, watermark rewinds on an advertise
@@ -2057,6 +2157,21 @@ impl EdgeMetrics {
     /// label.
     pub fn inc_link_seal(&self, label: &'static str) {
         *self.link_seal.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// Count one link-shaping event by its `LINK_SHAPING_*` label.
+    pub fn inc_link_shaping(&self, label: &'static str) {
+        *self.link_shaping.write().entry(label).or_insert(0) += 1;
+    }
+
+    /// The link-shaping ledger by label (tests + the operator readback).
+    #[must_use]
+    pub fn link_shaping(&self) -> HashMap<String, u64> {
+        self.link_shaping
+            .read()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect()
     }
 
     /// Count one advertise event by its `ADVERTISE_*` label.
@@ -2836,6 +2951,7 @@ impl EdgeMetrics {
             transport_inbound_drops: self.transport_inbound_drops(),
             av_plane: self.av_plane(),
             link_seal: self.link_seal(),
+            link_shaping: self.link_shaping(),
             direct_link: self.direct_link(),
             peer_binding: self.peer_binding(),
             direct_links_active: self.direct_links_active(),
@@ -3113,6 +3229,8 @@ pub struct EdgeMetricsBundle {
     pub av_plane: HashMap<String, u64>,
     /// CC 5.3.3.5 E1 — the per-link transit seal by `LINK_SEAL_*` label.
     pub link_seal: HashMap<String, u64>,
+    /// CC 5.4.3 — link shaping by `LINK_SHAPING_*` label.
+    pub link_shaping: HashMap<String, u64>,
     /// CIRISEdge#805 item 8 — direct links by `DIRECT_LINK_*` label.
     pub direct_link: HashMap<String, u64>,
     /// The peer bindings dials check link proofs against, by
@@ -3427,6 +3545,8 @@ impl EdgeMetricsBundle {
         f.family("av_plane", &self.av_plane);
         // CC 5.3.3.5 E1 — the per-link seal ledger, `link_seal.<label>`.
         f.family("link_seal", &self.link_seal);
+        // CC 5.4.3 — link shaping, `link_shaping.<label>`.
+        f.family("link_shaping", &self.link_shaping);
         // CIRISEdge#805 item 8 — direct links, `direct_link.<label>`, and the
         // gauge of peers with a direct path now.
         f.family("direct_link", &self.direct_link);
@@ -3643,6 +3763,7 @@ edge_metrics_bundle_fields!(
     first_contact_outcomes,
     av_plane,
     link_seal,
+    link_shaping,
     direct_link,
     peer_binding,
     direct_links_active,

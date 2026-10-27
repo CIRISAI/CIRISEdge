@@ -1009,7 +1009,7 @@ impl HoldingsPublishGate {
                 content_id = %content_id,
                 reason = refusal.reason_tag(),
                 "swarm_runtime: inbound holding claim REFUSED — the claimant is outside the \
-                 content's cohort audience (CIRISEdge#763): {refusal}",
+                 content's cohort audience (history: CIRISEdge#763): {refusal}",
             );
         }
         verdict
@@ -1038,11 +1038,11 @@ fn warn_holdings_scope_gate_unarmed() {
     if !HOLDINGS_SCOPE_GATE_UNARMED_WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
             "fountain holdings scope gate UNARMED — scope-native addressing is not \
-             installed, so this node rides the pre-#499 staged state: every held \
+             installed, so this node rides the pre-tracked: CIRISEdge#499 staged state: every held \
              content is announced to every cohort peer, with no scope filter. This \
              is the deliberate default; arming is an OPERATOR OPT-IN — install the \
              MLS ScopeAddressTable via EdgeBuilder::scope_native_addressing (the \
-             CIRISVerify#259 ScopePrivacyDeriver is shipped). Warned once per process."
+             history: CIRISVerify#259 ScopePrivacyDeriver is shipped). Warned once per process."
         );
     }
 }

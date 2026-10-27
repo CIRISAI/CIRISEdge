@@ -102,7 +102,7 @@ pub(crate) fn catch_crypto_panic<T>(op: impl FnOnce() -> T) -> Result<T, String>
         let message = panic_message(payload.as_ref());
         tracing::error!(
             panic = %message,
-            "openmls crypto panicked; contained and refused (CIRISEdge#822, \
+            "openmls crypto panicked; contained and refused (history: CIRISEdge#822, \
              RUSTSEC-2026-0330/0331)"
         );
         message
@@ -167,7 +167,7 @@ pub(crate) fn guard_group_op<T>(
                 panic = %message,
                 epoch = group.epoch().as_u64(),
                 "openmls crypto panicked; contained, group restored to its pre-operation \
-                 state (CIRISEdge#822, RUSTSEC-2026-0330/0331)"
+                 state (history: CIRISEdge#822, RUSTSEC-2026-0330/0331)"
             );
             Err(format!(
                 "{message} (group restored to its pre-operation state)"
@@ -182,7 +182,7 @@ pub(crate) fn guard_group_op<T>(
                 panic = %message,
                 restore_error = %why,
                 "openmls crypto panicked and the group could NOT be restored; it is left as \
-                 the panic left it (CIRISEdge#822)"
+                 the panic left it (history: CIRISEdge#822)"
             );
             Err(format!("{message} (group restore FAILED: {why})"))
         }

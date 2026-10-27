@@ -1935,6 +1935,11 @@ fn unix_now_secs() -> crate::rate_limit::Ts {
 /// drains as pulls land.
 const MISSING_SIGNER_CAP: usize = 1024;
 
+/// CIRISEdge#904 — cap on names a person asked for. A contact list is pasted
+/// one name at a time; past this, a new request waits in the repair queue like
+/// any other name.
+const REQUESTED_SIGNER_CAP: usize = 64;
+
 /// Production-grade [`ReplicationDirectory`] implementation over
 /// persist's `FederationDirectory`.
 pub struct FederationDirectoryReplicationBridge {
@@ -2188,6 +2193,13 @@ pub struct FederationDirectoryReplicationBridge {
     /// than evicting older ones — the older names are the ones with rows already
     /// waiting on them.
     missing_signers: Mutex<std::collections::BTreeMap<String, Option<String>>>,
+    /// CIRISEdge#904 — names a PERSON is waiting on (a contact paste,
+    /// [`ReplicationDirectory::request_signer`]). Taken before any
+    /// background-repair name, by whichever peer's round comes next, so a
+    /// third party's signer can never queue ahead of the key a person asked for.
+    /// Bounded and held apart from `missing_signers`, so repair traffic cannot
+    /// evict it.
+    requested_signers: Mutex<std::collections::BTreeSet<String>>,
     /// Source accounting for `missing_signers`, maintained incrementally.
     ///
     /// FOURTH appearance of the O(cap)-per-rejection class: this map rebuilt a
@@ -2455,6 +2467,7 @@ impl FederationDirectoryReplicationBridge {
             serve_tier_resolver: None,
             serve_tier_subject: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
+            requested_signers: Mutex::new(std::collections::BTreeSet::new()),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             advertise_inputs: Mutex::new(AdvertiseInputs::default()),
@@ -2553,6 +2566,7 @@ impl FederationDirectoryReplicationBridge {
             serve_tier_resolver: None,
             serve_tier_subject: None,
             missing_signers: Mutex::new(std::collections::BTreeMap::new()),
+            requested_signers: Mutex::new(std::collections::BTreeSet::new()),
             missing_signer_sources: Mutex::new(crate::rate_limit::SourceLedger::new()),
             sweep_cursors: Mutex::new(SweepCursors::default()),
             advertise_inputs: Mutex::new(AdvertiseInputs::default()),
@@ -3009,7 +3023,7 @@ impl FederationDirectoryReplicationBridge {
                  JUDGE, which is not `signer_not_seated`; `unresolved` means the verdict \
                  was never resolved rather than refused on its merits; and \
                  `object_root_unnamed` means the row's SIGNED bytes name no accord, so \
-                 there is nothing to judge it against — CIRISPersist#731)"
+                 there is nothing to judge it against — history: CIRISPersist#731)"
             );
         }
         true
@@ -3248,7 +3262,7 @@ impl FederationDirectoryReplicationBridge {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "accord-quorum-evidence cursor serve read failed (CIRISEdge#474)"
+                    "accord-quorum-evidence cursor serve read failed (history: CIRISEdge#474)"
                 );
                 return (Vec::new(), 0, None);
             }
@@ -3275,7 +3289,7 @@ impl FederationDirectoryReplicationBridge {
                         error = %e,
                         "accord-quorum-evidence bundle could not be serialized for \
                          the wire — OMITTED from this cursor page; it will not \
-                         replicate from this node (CIRISEdge#474/#433)"
+                         replicate from this node (history: CIRISEdge#474, history: CIRISEdge#433)"
                     );
                     self.withhold(
                         crate::observability::WithholdReason::RowNotSerializable,
@@ -3444,7 +3458,7 @@ impl FederationDirectoryReplicationBridge {
                         "holdings drain CANNOT ADVANCE — a full page came back with \
                          no new resume cursor, so this round's holdings view is \
                          truncated and rows past it are re-wanted from peers even \
-                         though they are held (CIRISEdge#531)"
+                         though they are held (history: CIRISEdge#531)"
                     );
                     break;
                 }
@@ -3458,7 +3472,7 @@ impl FederationDirectoryReplicationBridge {
                          TRUNCATED, so rows past the cap are re-wanted from peers even \
                          though they are held (wasteful, self-correcting). Raise \
                          `sweep_page_rows` or investigate a plane this large \
-                         (CIRISEdge#531)"
+                         (history: CIRISEdge#531)"
                     );
                 }
             }
@@ -3578,7 +3592,7 @@ impl FederationDirectoryReplicationBridge {
                 site,
                 "trace plane PAUSED by mesh config — a trust root relieved \
                  `feature.trace_replication` to 0, so `trace:*` rows are withheld \
-                 until the relief expires or is superseded (CIRISEdge#440)"
+                 until the relief expires or is superseded (history: CIRISEdge#440)"
             );
         }
     }
@@ -3802,7 +3816,7 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                         signer = %signer_key_id,
                         cap = MISSING_SIGNER_CAP,
                         "missing-signer set at cap with no source hoarding — \
-                         DROPPING this name (CIRISEdge#552)"
+                         DROPPING this name (history: CIRISEdge#552)"
                     );
                     return;
                 }
@@ -3842,7 +3856,43 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         }
     }
 
+    fn request_signer(&self, kind: EnvelopeKind, signer_key_id: &str) {
+        let queued = self.requested_signers.lock().is_ok_and(|mut requested| {
+            requested.contains(signer_key_id)
+                || (requested.len() < REQUESTED_SIGNER_CAP
+                    && requested.insert(signer_key_id.to_owned()))
+        });
+        if !queued {
+            // Over the cap: the name still goes to the repair queue, unrouted.
+            self.note_missing_signer(kind, signer_key_id, None);
+        }
+    }
+
     fn take_missing_signer_for(&self, peer_key_id: &str) -> Option<String> {
+        // CIRISEdge#904 — a name a person is waiting on goes first, to
+        // whichever peer's round comes next; it also leaves the repair queue
+        // if it was there, so it is not asked twice.
+        let requested = self
+            .requested_signers
+            .lock()
+            .ok()
+            .and_then(|mut requested| requested.pop_first());
+        if let Some(name) = requested {
+            if let Ok(mut pending) = self.missing_signers.lock() {
+                if let Some(src) = pending.remove(&name) {
+                    if let Ok(mut sources) = self.missing_signer_sources.lock() {
+                        sources.forget(src.as_deref());
+                    }
+                }
+            }
+            tracing::info!(
+                signer = %name,
+                peer = peer_key_id,
+                "recovery round: asking this peer for a key a person is waiting on, ahead of \
+                 background repair (CIRISEdge#904)"
+            );
+            return Some(name);
+        }
         let mut pending = self.missing_signers.lock().ok()?;
         // Prefer a name this peer actually delivered (best holder guess), then
         // fall back to an unrouted one so successive rounds try successive
@@ -4243,8 +4293,19 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
         //
         // What bounds abuse is not WHO answers but HOW MUCH any one peer may
         // extract, across layered windows — see the drain ceilings above.
+        // CIRISEdge#907 — the Attestation plane is not publicly pullable, but a
+        // subject's ANNOUNCED testimony is public by design (CC 5.4.6: an
+        // announced device roster is public; #752 already relays it at first
+        // contact). A requester that is not the subject is answered with that
+        // testimony alone ([`Self::announced_testimony_holdings`]), through the
+        // same conferred-server gate as a public plane: a shared trust root,
+        // then the per-requester lookup limiter.
+        let announced_testimony = kind == EnvelopeKind::Attestation && !entitled_without_tier;
         let mut cohort_entitled = false;
-        if !entitled_without_tier && peer_key_id.is_some() && kind.is_public_subject_pull() {
+        if !entitled_without_tier
+            && peer_key_id.is_some()
+            && (kind.is_public_subject_pull() || announced_testimony)
+        {
             if let Some(requester) = peer_key_id {
                 cohort_entitled = self.shares_a_trust_root_with(requester).await;
                 if !cohort_entitled {
@@ -4311,14 +4372,21 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
                 self.subject_holdings_inner(kind, subject_key_id, peer_key_id)
                     .await
             }
+            // 4. CIRISEdge#907 — a stranger to the subject, on the Attestation
+            //    plane, from a conferred server: the subject's announced
+            //    testimony only, each ref one the fetch twin would serve.
+            Some(p) if announced_testimony && cohort_entitled => {
+                let _permit = self.sweep_gate.enter().await;
+                self.announced_testimony_holdings(subject_key_id, p).await
+            }
             other => {
                 tracing::warn!(
                     subject = %subject_key_id,
                     requester = ?other,
                     kind = ?kind,
                     "subject Pull refused: requester is not the subject and this kind \
-                     is not publicly pullable — serving nothing (#462 fail-closed; \
-                     #552 widened only the unconditionally-public planes)"
+                     is not publicly pullable — serving nothing (history: CIRISEdge#462 fail-closed; \
+                     history: CIRISEdge#552 widened only the unconditionally-public planes)"
                 );
                 Vec::new()
             }
@@ -4852,7 +4920,7 @@ impl FederationDirectoryReplicationBridge {
                 suppressed_prev,
                 "the park capacity is full: evicted the oldest parked row(s); each will be \
                  asked for once more and re-parked if its signer is still absent \
-                 (CIRISEdge#858)"
+                 (tracked: CIRISEdge#858)"
             );
         }
     }
@@ -5259,7 +5327,7 @@ impl FederationDirectoryReplicationBridge {
                 "subject-Pull attestation read REFUSED by this directory: serving an \
                  EMPTY axis. This is permanent on this directory (a proxy that does \
                  not serve the read), NOT a statement the subject has no testimony, \
-                 and a re-pull will not change it (persist #1001, CIRISEdge#462)"
+                 and a re-pull will not change it (history: CIRISPersist#1001, history: CIRISEdge#462)"
             );
         } else {
             tracing::warn!(
@@ -5269,9 +5337,79 @@ impl FederationDirectoryReplicationBridge {
                 "subject-Pull attestation read FAILED: serving an EMPTY axis this \
                  round (a transient backend fault, NOT a statement the subject has \
                  no testimony; the requester re-pulls next round) \
-                 (CIRISEdge#462/#429, persist #1001)"
+                 (history: CIRISEdge#462, history: CIRISEdge#429, history: CIRISPersist#1001)"
             );
         }
+    }
+
+    /// CIRISEdge#907 — what a conferred server hands a requester that is NOT
+    /// the subject on an Attestation subject Pull: the subject's own
+    /// `delegates_to` / `supersedes` rows at `cohort_scope: federation` that are
+    /// owner-bindings (CC 2.4.1.2) or root acceptances (`trust:accepts:v1`, CC
+    /// 4.4.3.8 item 3), and of those ONLY the ones the fetch twin would serve
+    /// this requester ([`Self::fetch_envelope_bytes_for_peer`]). The fetch gate
+    /// is the whole disclosure decision, so the Pull widens timing, never reach:
+    /// a live announced binding of a published node rides (#752's rule), and a
+    /// row the requester could not fetch is never listed (#429).
+    async fn announced_testimony_holdings(
+        &self,
+        subject_key_id: &str,
+        requester: &str,
+    ) -> Vec<EnvelopeRef> {
+        use ciris_persist::federation::admission::is_owner_binding_envelope;
+        use ciris_persist::federation::types::{attestation_type, cohort_scope};
+        const ACCEPTANCE_DIMENSION: &str = "trust:accepts:v1";
+        let mut authored: Vec<Attestation> = Vec::new();
+        let mut pages = ciris_persist::federation::attestation_query::AttestationQuery::by(
+            subject_key_id,
+            ciris_persist::federation::attestation_query::FOLD_PAGE,
+        )
+        .pages();
+        while let Some(page) = match pages.next(&*self.directory).await {
+            Ok(page) => page,
+            Err(e) => {
+                Self::subject_read_not_served(subject_key_id, "announced-testimony", &e);
+                return Vec::new();
+            }
+        } {
+            authored.extend(page);
+        }
+        let mut refs = Vec::new();
+        for att in authored {
+            let ty = att.attestation_type.as_str();
+            if (ty != attestation_type::DELEGATES_TO && ty != attestation_type::SUPERSEDES)
+                || att.cohort_scope != cohort_scope::FEDERATION
+            {
+                continue;
+            }
+            let env = &att.attestation_envelope;
+            let acceptance = env.get("dimension").and_then(serde_json::Value::as_str)
+                == Some(ACCEPTANCE_DIMENSION);
+            if !is_owner_binding_envelope(env) && !acceptance {
+                continue;
+            }
+            let Some((hash, _)) = content_hash_of(&att) else {
+                continue;
+            };
+            if self
+                .fetch_envelope_bytes_for_peer(EnvelopeKind::Attestation, &hash, Some(requester))
+                .await
+                .is_some()
+            {
+                refs.push(EnvelopeRef {
+                    envelope_hash: hash,
+                    seq: Self::ms_seq(att.asserted_at),
+                });
+            }
+        }
+        tracing::debug!(
+            subject = %subject_key_id,
+            requester,
+            served = refs.len(),
+            "subject Pull from a stranger to the subject: announced testimony only \
+             (CIRISEdge#907)"
+        );
+        refs
     }
 
     #[allow(clippy::too_many_lines)] // five per-plane arms + the v18 loud-read/booking mirrors
@@ -5309,7 +5447,7 @@ impl FederationDirectoryReplicationBridge {
                                 "subject-Pull ", $what, " read FAILED — serving an \
                                  EMPTY axis this round (a transient read error, NOT \
                                  a statement the subject has no testimony; the \
-                                 requester re-pulls next round) (CIRISEdge#462/#429)"
+                                 requester re-pulls next round) (history: CIRISEdge#462, history: CIRISEdge#429)"
                             )
                         );
                         Vec::new()
@@ -6199,7 +6337,7 @@ impl FederationDirectoryReplicationBridge {
                 tracing::warn!(
                     "advertise_since: a row could not be serialized to its content \
                      hash and is OMITTED from the advertise set — it will not replicate \
-                     (CIRISEdge#425)"
+                     (history: CIRISEdge#425)"
                 );
                 // CIRISEdge#433 — and it COUNTS. This is what took `&self`: a plane
                 // going dark for a non-policy reason is the one withhold an
@@ -6551,8 +6689,8 @@ impl FederationDirectoryReplicationBridge {
                         kind = index_kind,
                         error = %e,
                         "wire-hash holdings read failed — falling back to the ROW \
-                         scan (correct, but this is the O(corpus) read CIRISEdge#547 \
-                         is about). A backend predating CIRISPersist#780 reports \
+                         scan (correct, but this is the O(corpus) read history: CIRISEdge#547 \
+                         is about). A backend predating history: CIRISPersist#780 reports \
                          Unsupported here."
                     );
                     return None;
@@ -6569,7 +6707,7 @@ impl FederationDirectoryReplicationBridge {
                         hash = %hex_hash,
                         "wire-hash index returned an undecodable content hash — \
                          refusing the index read rather than returning a SHORT \
-                         holdings set (CIRISEdge#547)"
+                         holdings set (history: CIRISEdge#547)"
                     );
                     return None;
                 };
@@ -6593,7 +6731,7 @@ impl FederationDirectoryReplicationBridge {
             kind = index_kind,
             pages = MAX_FULL_DRAIN_PAGES,
             "wire-hash holdings drain hit the page cap — refusing rather than \
-             returning a truncated holdings set (CIRISEdge#547)"
+             returning a truncated holdings set (history: CIRISEdge#547)"
         );
         None
     }
@@ -6672,7 +6810,7 @@ impl FederationDirectoryReplicationBridge {
                 "attestation DECLINED from the advertise set — `cohort_scope` is \
                  present but EMPTY (malformed: the column is a closed set). A \
                  missing key means `federation` by persist's serde contract; an \
-                 empty one means the row is bad (CIRISEdge v17.7.0 / CIRISPersist#713)"
+                 empty one means the row is bad (CIRISEdge v17.7.0 / history: CIRISPersist#713)"
             );
             return false;
         }
@@ -7333,7 +7471,7 @@ impl FederationDirectoryReplicationBridge {
                             error = %e,
                             "quarantine consult FAILED for a row's author — withholding \
                              the author's rows from the offer (fail-closed; a transient \
-                             read error, NOT a quarantine verdict; CIRISEdge#440)"
+                             read error, NOT a quarantine verdict; history: CIRISEdge#440)"
                         );
                     }
                     QuarantineConsult::ReadError
@@ -7832,10 +7970,44 @@ impl FederationDirectoryReplicationBridge {
         // node's own self-authenticating facts, the Attestation-plane twins of the
         // bootstrap kinds, and cross to an Attributed peer. Everything this node
         // holds ABOUT OTHERS stays behind the floor.
+        // CIRISEdge#882 (CC rc9 I3) — the exemption is the node's ALLEGIANCE
+        // FACTS (owner-binding, acceptances, self-charter: the rows that
+        // establish Rooted), never "anything self-authored": a self-authored
+        // consent grant, score or content row ABOUT A THIRD PARTY at
+        // federation scope stays behind the floor until Rooted. Two
+        // self-authored shapes still cross: a row whose data subject is the
+        // peer itself (its consent grant, a row addressed to it) is not
+        // "about others" to that peer, as #756's carve reasons; and a
+        // COHORT-DELIVERED row (a `self` or `family` placement whose audience
+        // check the peer already passed) is owed
+        // to that peer by CC 6.1.5.3 and CC 5.2 — a self-scope holding claim
+        // reaches the owner's other device whether or not the two devices
+        // are Rooted at each other (the v43.2 PR run's blob_federation_e2e
+        // finding). Cohort-delivered = a targeted placement (`self`,
+        // `family`, `community`, `affiliations`): membership is the
+        // authority there and persist's audience check above already put the
+        // peer among its members — an invited stranger who joined a community
+        // receives its rows without sharing a trust root with the author (CC
+        // 3.1.3.2; `membership_first_contact_756`, the second PR run's
+        // finding). The floor narrows the federation-scope planes, which is
+        // what CC rc9 I3 is about.
+        let cohort_delivered = matches!(
+            audience,
+            ciris_persist::federation::Audience::SelfOnly
+                | ciris_persist::federation::Audience::Family { .. }
+                | ciris_persist::federation::Audience::Community { .. }
+                | ciris_persist::federation::Audience::Affiliations { .. }
+        );
         let self_authored = self
             .self_provider
             .as_ref()
-            .is_some_and(|p| p().iter().any(|id| id == attester));
+            .is_some_and(|p| p().iter().any(|id| id == attester))
+            && (cohort_delivered
+                || row
+                    .get("attested_key_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(peer)
+                || self.attestation_is_allegiance_fact(row, memo).await);
         // CIRISEdge#756 — and the membership ceremony addressed to the peer's
         // own person (§2.4): the invitation names the peer's person as its data
         // subject and the answer replies to the peer's person's own proposal, so
@@ -7935,7 +8107,7 @@ impl FederationDirectoryReplicationBridge {
         let Some(local) = self.local_key_id.as_deref() else {
             tracing::warn!(
                 peer = peer_label,
-                "attestation plane withheld — no `local_key_id` to resolve the CIRISEdge#396 \
+                "attestation plane withheld — no `local_key_id` to resolve the history: CIRISEdge#396 \
                  consent send-set; wire ReplicationRuntimeConfig::local_key_id"
             );
             self.withhold(
@@ -8093,7 +8265,7 @@ impl FederationDirectoryReplicationBridge {
                 "attestation plane withheld — the inbound round is attributed to an EMPTY \
                  peer key_id, so no consent:replication grant can ever match it. This is a \
                  WIRING fault in the host's listen loop (the peer id handed to \
-                 `route_inbound_bytes`), not a consent decision (CIRISEdge#524)"
+                 `route_inbound_bytes`), not a consent decision (history: CIRISEdge#524)"
             );
             return;
         }
@@ -8126,15 +8298,15 @@ impl FederationDirectoryReplicationBridge {
                 suppressed_prev,
                 "attestation plane withheld — the live consent:replication send-set does NOT \
                  name this peer, but DOES name its OWNER, and the reverse owner-binding walk \
-                 (persist `nodes_owned_by`, CIRISPersist#764) did NOT return this peer. Since \
+                 (persist `nodes_owned_by`, history: CIRISPersist#764) did NOT return this peer. Since \
                  v18.5.0 a person-named grant IS routed to that person's bound nodes, so the \
                  two walks disagreeing means one of: the node carries more than one live \
                  owner (`AmbiguousNodeOwner` — the reverse walk skips it, and an ambiguous \
                  owner is not a resolvable recipient), or the owner-binding landed inside the \
                  send-set memo window and routes next round, or `owner_walk_complete=false` \
                  (this subject's walk errored and its nodes are fail-closed OUT this round). \
-                 A grant naming the peer NODE (CIRISServer#472) sidesteps all three \
-                 (CIRISEdge#524, CIRISEdge#396 item 1)"
+                 A grant naming the peer NODE (history: CIRISServer#472) sidesteps all three \
+                 (history: CIRISEdge#524, history: CIRISEdge#396 item 1)"
             );
         }
     }
@@ -8441,7 +8613,7 @@ impl FederationDirectoryReplicationBridge {
                     budget,
                     "Attestation holdings drain CANNOT ADVANCE — a full page came \
                      back with no new resume cursor; this round's holdings view is \
-                     truncated (CIRISEdge#531)"
+                     truncated (history: CIRISEdge#531)"
                 );
                 break;
             }
@@ -8452,7 +8624,7 @@ impl FederationDirectoryReplicationBridge {
                     budget,
                     "Attestation holdings drain hit the page CAP — this round's holdings \
                      view is TRUNCATED, so held rows past the cap are re-wanted from peers \
-                     (wasteful, self-correcting). Raise `sweep_page_rows` (CIRISEdge#531)"
+                     (wasteful, self-correcting). Raise `sweep_page_rows` (history: CIRISEdge#531)"
                 );
             }
         }
@@ -8797,7 +8969,7 @@ impl FederationDirectoryReplicationBridge {
                 bound_secs = RESWEEP_CYCLE_BOUND.as_secs(),
                 "re-sweep cycle has NOT completed within its bound: a row this node passed \
                  (skipped, or offered and lost) waits this long to be re-offered; the plane is \
-                 large for the page budget, or new rows keep the re-sweep starved (CIRISEdge#531)"
+                 large for the page budget, or new rows keep the re-sweep starved (history: CIRISEdge#531)"
             );
         }
     }
@@ -9448,7 +9620,7 @@ impl FederationDirectoryReplicationBridge {
                 rule = e.rule().unwrap_or("-"),
                 retryable = e.is_retryable(),
                 error = %e,
-                "membership widening on acceptance refused (CIRISPersist#955)"
+                "membership widening on acceptance refused (history: CIRISPersist#955)"
             ),
         }
     }
@@ -10532,7 +10704,7 @@ impl FederationDirectoryReplicationBridge {
                          Install `ReplicationRuntimeConfig::engine` (an \
                          `Engine::from_shared_with_local` view over this substrate; \
                          `PersistGroupContentStore::from_shared_hybrid` builds it) and the \
-                         next re-apply projects it (CIRISPersist#848 / CIRISEdge#601)"
+                         next re-apply projects it (history: CIRISPersist#848 / history: CIRISEdge#601)"
                     );
                 }
                 // Hash the BARE attestation — the value persist's content-hash
@@ -11064,7 +11236,7 @@ impl FederationDirectoryReplicationBridge {
                                 classified = stored_clock.is_some(),
                                 "replicated route CONTENT CONFLICT at same (epoch, \
                                  asserted_at) — split-truth signal, not applied \
-                                 (CIRISEdge#338/#425; `classified=false` = the stored row \
+                                 (history: CIRISEdge#338, history: CIRISEdge#425; `classified=false` = the stored row \
                                  could not be re-read, refusing loud rather than laundering)"
                             );
                             // CIRISEdge#544 — the two sub-arms this branch fuses
@@ -16115,6 +16287,54 @@ pub(crate) mod tests {
             None,
             "and taking it removes it — the pull is not re-sent every tick"
         );
+    }
+
+    /// CIRISEdge#904 — a key a person is waiting on is asked before background
+    /// repair. The canonical delivers rows from hundreds of unmet signers, so
+    /// the queue is full of names ROUTED to it; the contact paste is unrouted
+    /// and, before #904, was never taken while a routed name remained (270
+    /// queued names in the field). Now the next round toward any peer asks for
+    /// it first, repair resumes after, and a name both requested and queued is
+    /// asked once.
+    #[tokio::test]
+    async fn a_requested_key_is_asked_before_background_repair_904() {
+        let (_backend, bridge) = test_fixtures::make_bridge(&[]);
+        for i in 0..270 {
+            bridge.note_missing_signer(
+                EnvelopeKind::Key,
+                &format!("repair-signer-{i:03}"),
+                Some("canonical"),
+            );
+        }
+        // Also queued as repair, so the take must not ask for it twice.
+        bridge.note_missing_signer(EnvelopeKind::Key, "contact-key", None);
+        bridge.request_signer(EnvelopeKind::Key, "contact-key");
+        assert_eq!(
+            bridge.take_missing_signer_for("canonical").as_deref(),
+            Some("contact-key"),
+            "the requested key goes first, ahead of 270 routed repair names"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("canonical").as_deref(),
+            Some("repair-signer-000"),
+            "repair resumes in its own order"
+        );
+        let mut rest = 0;
+        while let Some(name) = bridge.take_missing_signer_for("canonical") {
+            assert_ne!(name, "contact-key", "a requested name is asked once");
+            rest += 1;
+        }
+        assert_eq!(rest, 269);
+
+        // Past the requested cap, a request still reaches the repair queue.
+        for i in 0..=REQUESTED_SIGNER_CAP {
+            bridge.request_signer(EnvelopeKind::Key, &format!("asked-{i:03}"));
+        }
+        let mut asked = 0;
+        while bridge.take_missing_signer_for("any-peer").is_some() {
+            asked += 1;
+        }
+        assert_eq!(asked, REQUESTED_SIGNER_CAP + 1, "none is dropped");
     }
 
     /// CIRISEdge#552 — a third-party signer IS queued (a conferred server will
@@ -23544,13 +23764,29 @@ pub(crate) mod tests {
         let publish = vec![local.to_string()];
         let bridge = bridge.with_self_provider(Some(Arc::new(move || publish.clone())));
         seed_advertised_attestation(&backend, local).await;
+        // CIRISEdge#882 (CC rc9 I3) — a self-authored row that is NOT an
+        // allegiance fact and is about a THIRD PARTY (`local`'s consent grant
+        // to `producer`) is content to the peer: it stays behind the floor.
+        seed_consent_membership_unrooted(&backend, local, producer).await;
         let served = bridge.list_attestations_for_peer(Some(peer)).await;
         assert_eq!(
             served.len(),
             2,
-            "exactly the self-authored rows cross to an Attributed peer — the row `local` \
-             just authored AND the consent row `local` authored about the peer; the third \
-             party's stays behind the floor: {served:?}"
+            "exactly the self-authored ALLEGIANCE rows and the rows about the peer itself \
+             cross to an Attributed peer — the self-charter `local` just authored AND the \
+             consent row `local` authored about the peer; `local`'s score of a third party \
+             and the third party's own row stay behind the floor (CIRISEdge#659, #882): \
+             {served:?}"
+        );
+        assert!(
+            metrics
+                .snapshot()
+                .withholds_by_reason
+                .get(&WithholdReason::RecipientNotRooted)
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "the self-authored third-party grant is booked under the floor, not served (#882)"
         );
 
         // Both subjects accept one valid root: the third party's row now reaches the peer too.
@@ -24017,6 +24253,143 @@ pub(crate) mod tests {
             "the unpublished binding and the consent row are withheld under the unchanged \
              token: {:?}",
             metrics.snapshot().withholds_by_reason
+        );
+    }
+
+    /// CIRISEdge#907 — a first-contact requester's SUBJECT Pull of a third
+    /// party's testimony on the Attestation plane. The relay (a conferred
+    /// server Rooted with the requester) answers with exactly the subject's
+    /// announced binding of a node it publishes, which the fetch twin also
+    /// serves: never the binding of an unpublished node, the `self`-scoped
+    /// binding, or the consent row. A requester sharing no root gets nothing,
+    /// and the subject's own Pull is unchanged. Before #907 the stranger's
+    /// Pull was refused outright ("not publicly pullable"), so a fresh node
+    /// learned a contact's node only when the oldest-first advertise reached it.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_strangers_subject_pull_gets_the_announced_binding_only_907() {
+        let backend = Arc::new(MemoryBackend::new());
+        let (relay, peer, peer_owner, rootless) =
+            ("node-relay", "node-peer", "person-peer", "node-rootless");
+        let (o, d, e, u) = ("person-o", "node-d", "node-e", "node-u");
+        register_fixture_keys(
+            &backend,
+            &[
+                (relay, identity_type::NODE),
+                (peer, identity_type::NODE),
+                (peer_owner, identity_type::USER),
+                (rootless, identity_type::NODE),
+                (o, identity_type::USER),
+                (d, identity_type::NODE),
+                (e, identity_type::NODE),
+                (u, identity_type::NODE),
+            ],
+        )
+        .await;
+        seed_owner_binding(&backend, peer_owner, peer).await;
+        // The requester's node accepts the root as well as its owner, as a
+        // production node does (FIRST_CONTACT §2: `delegates_to(node → R)`):
+        // the conferred-server lookup asks the requester's own roots.
+        seed_common_root(&backend, &[relay, peer_owner, peer]).await;
+        let announced = seed_owner_binding(&backend, o, d).await;
+        let unpublished = seed_owner_binding(&backend, o, e).await;
+        let unannounced = uuid::Uuid::new_v4().to_string();
+        seed_scoped_attestation(
+            &backend,
+            &unannounced,
+            o,
+            u,
+            "delegates_to",
+            "self",
+            owner_binding_envelope(&unannounced, o, u),
+        )
+        .await;
+        let consent = uuid::Uuid::new_v4().to_string();
+        seed_raw_attestation(
+            &backend,
+            &consent,
+            o,
+            d,
+            "scores",
+            serde_json::json!({
+                "id": consent,
+                "attesting_key_id": o,
+                "attested_key_id": d,
+                "attestation_type": "scores",
+                "dimension": "consent:replication:v1",
+                "payload": { "grants": "transfer", "attestation_prefixes": ["trace:"] },
+            }),
+        )
+        .await;
+        let publish = vec![relay.to_string()];
+        let relay_bridge = || {
+            let publish = publish.clone();
+            bridge_over(&backend, &[])
+                .with_local_key_id(Some(relay.to_string()))
+                .with_self_provider(Some(Arc::new(move || publish.clone())))
+                .with_kind_publish_selector(Some(KindPublishSelector::from_sets(HashMap::from([
+                    (
+                        EnvelopeKind::Key,
+                        vec![
+                            relay.to_string(),
+                            d.to_string(),
+                            u.to_string(),
+                            o.to_string(),
+                        ],
+                    ),
+                    (
+                        EnvelopeKind::IdentityOccurrence,
+                        vec![relay.to_string(), d.to_string(), u.to_string()],
+                    ),
+                ]))))
+        };
+        let pulled = |requester: &'static str| {
+            let bridge = relay_bridge();
+            async move {
+                bridge
+                    .subject_holdings(EnvelopeKind::Attestation, o, Some(requester))
+                    .await
+                    .into_iter()
+                    .map(|r| r.envelope_hash)
+                    .collect::<std::collections::BTreeSet<[u8; 32]>>()
+            }
+        };
+
+        let announced_hash = wire_hash_of(&backend, &announced).await;
+        let got = pulled(peer).await;
+        assert_eq!(
+            got,
+            std::collections::BTreeSet::from([announced_hash]),
+            "a stranger's Pull gets exactly the announced binding of the published node"
+        );
+        assert!(
+            relay_bridge()
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &announced_hash,
+                    Some(peer)
+                )
+                .await
+                .is_some(),
+            "every ref the Pull lists is fetchable by the same requester (#429)"
+        );
+        for (id, why) in [
+            (&unpublished, "a node the relay does not publish"),
+            (&unannounced, "a binding at `self` (not announced)"),
+            (&consent, "a consent row about a published node"),
+        ] {
+            let hash = wire_hash_of(&backend, id).await;
+            assert!(!got.contains(&hash), "not served on the Pull: {why}");
+        }
+        assert!(
+            pulled(rootless).await.is_empty(),
+            "a requester sharing no trust root with the relay gets nothing (CC 4)"
+        );
+        let own = pulled(o).await;
+        assert!(
+            own.contains(&wire_hash_of(&backend, &consent).await)
+                && own.contains(&wire_hash_of(&backend, &unannounced).await),
+            "the subject's own Pull is the data-subject axis, unchanged"
         );
     }
 

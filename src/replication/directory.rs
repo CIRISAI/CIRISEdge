@@ -233,6 +233,13 @@ pub trait ReplicationDirectory: Send + Sync {
     ) {
     }
 
+    /// CIRISEdge#904 — a key a PERSON is waiting on (a contact paste), not a
+    /// background repair: the implementation asks for it ahead of every
+    /// repair name. The default records it like any unrouted missing signer.
+    fn request_signer(&self, kind: EnvelopeKind, signer_key_id: &str) {
+        self.note_missing_signer(kind, signer_key_id, None);
+    }
+
     /// CIRISEdge#552 (B) — see [`StateProvider::take_missing_signers`].
     ///
     /// [`StateProvider::take_missing_signers`]:

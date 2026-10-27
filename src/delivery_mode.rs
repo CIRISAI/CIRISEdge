@@ -72,7 +72,7 @@ pub fn requirement_of(envelope: &serde_json::Value) -> DeliveryRequirement {
             tracing::warn!(
                 delivery_mode = %other,
                 "unrecognized `delivery_mode` value — NOT in the ratified vocabulary \
-                 {{absent, \"mandatory\"}} (CIRISEdge#428). Treating as BestEffort (MAY DROP): \
+                 {{absent, \"mandatory\"}} (history: CIRISEdge#428). Treating as BestEffort (MAY DROP): \
                  a typo of \"mandatory\" silently loses the delivery guarantee — fix the \
                  producer. persist v22 refuses this value at the wire, so this row is \
                  locally-minted / legacy."

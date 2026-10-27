@@ -318,7 +318,7 @@ impl AdmissionDoors {
                 tracing::warn!(
                     key_id,
                     error = %e,
-                    "first contact: key lookup failed (CIRISEdge#683)"
+                    "first contact: key lookup failed (history: CIRISEdge#683)"
                 );
                 FirstContactRefusal::DirectoryUnreadable
             })
@@ -344,7 +344,7 @@ impl AdmissionDoors {
             tracing::warn!(
                 key_id = %record.key_id,
                 error = %e,
-                "first contact: proof of possession refused (CIRISEdge#683)"
+                "first contact: proof of possession refused (history: CIRISEdge#683)"
             );
             return Err(FirstContactRefusal::ProofOfPossessionFailed);
         }
@@ -380,7 +380,7 @@ impl AdmissionDoors {
                 tracing::warn!(
                     key_id = %record.key_id,
                     outcome = ?other,
-                    "first contact: the Key door refused a proven record (CIRISEdge#683)"
+                    "first contact: the Key door refused a proven record (history: CIRISEdge#683)"
                 );
                 Err(FirstContactRefusal::KeyRefused)
             }
@@ -669,7 +669,7 @@ impl OwnerBindingCarveOut {
                     sibling,
                     error = %e,
                     "own owner-binding answer failed — the sibling re-pushes on its next dial \
-                     (CIRISEdge#727)"
+                     (history: CIRISEdge#727)"
                 );
             }
         }
@@ -694,7 +694,7 @@ impl OwnerBindingCarveOut {
                 refusal = r.as_str(),
                 detail,
                 envelopes = deliver.envelopes.len(),
-                "owner-binding push REFUSED — nothing stored (CIRISEdge#727)"
+                "owner-binding push REFUSED — nothing stored (history: CIRISEdge#727)"
             );
             OwnerBindingOutcome::Consumed {
                 admitted: 0,
@@ -780,7 +780,7 @@ impl OwnerBindingCarveOut {
                 attestation_id = %row.attestation_id,
                 error = %e,
                 "owner-binding push refused: the signature does not verify against the held \
-                 owner key (CIRISEdge#727)"
+                 owner key (history: CIRISEdge#727)"
             );
             return Err(OwnerBindingRefusal::SignatureInvalid);
         }
@@ -805,7 +805,7 @@ impl OwnerBindingCarveOut {
                     local = %self.local_key_id,
                     attestation_id = %row.attestation_id,
                     reason,
-                    "owner-binding push refused by persist's door (CIRISEdge#727)"
+                    "owner-binding push refused by persist's door (history: CIRISEdge#727)"
                 );
                 Err(OwnerBindingRefusal::DoorRefused)
             }
@@ -903,7 +903,7 @@ impl DirectoryOwnerBinding {
                         error = %e,
                         "own owner-binding: the directory did not serve the read, so \
                          this node's owner binding is not pushed on dial \
-                         (CIRISEdge#727, persist #1001)"
+                         (history: CIRISEdge#727, history: CIRISPersist#1001)"
                     );
                 });
                 tracing::debug!(
@@ -1216,7 +1216,7 @@ pub(crate) async fn admit_introduced_attestations(
                 tracing::warn!(
                     attestation_id = %id,
                     reason = %reason,
-                    "first contact: an introduced attestation was refused (CIRISEdge#683)"
+                    "first contact: an introduced attestation was refused (history: CIRISEdge#683)"
                 );
                 report.refused.push((id, reason));
             }

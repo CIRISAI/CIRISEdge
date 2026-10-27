@@ -241,7 +241,7 @@ impl ReplicationRegistry {
         if self.owner_binding_carve_out.set(gate).is_err() {
             tracing::warn!(
                 "ReplicationRegistry::install_owner_binding_carve_out called twice; keeping \
-                 the first (CIRISEdge#727)"
+                 the first (history: CIRISEdge#727)"
             );
         }
     }
@@ -282,7 +282,7 @@ impl ReplicationRegistry {
                     held = ?self.local_key_id.get(),
                     offered = %unset,
                     "ReplicationRegistry::set_local_key_id called twice with different ids; \
-                     keeping the first (CIRISEdge#621)"
+                     keeping the first (history: CIRISEdge#621)"
                 );
             }
         }
@@ -463,7 +463,7 @@ impl ReplicationRegistry {
             tracing::warn!(
                 peer = %peer_key_id,
                 "CRPL frame REFUSED — attributed to THIS node's own key; no responder is \
-                 built for ourselves (CIRISEdge#621 / CIRISServer#607)"
+                 built for ourselves (history: CIRISEdge#621 / history: CIRISServer#607)"
             );
             return Ok(RouteOutcome::RefusedSelf);
         }

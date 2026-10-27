@@ -275,10 +275,25 @@ pub fn kex_link_id(link_id: &[u8]) -> Result<[u8; LINK_ID_LEN], AvHandshakeError
 /// [`MAX_HANDSHAKE_BYTES`]; [`AvHandshakeError::Send`] when `frame_limit`
 /// leaves no room for a byte after the START header.
 pub fn fragment(handshake: &[u8], frame_limit: usize) -> Result<Vec<Vec<u8>>, AvHandshakeError> {
-    if handshake.is_empty() || handshake.len() > MAX_HANDSHAKE_BYTES {
+    fragment_tagged(HANDSHAKE_MAGIC, MAX_HANDSHAKE_BYTES, handshake, frame_limit)
+}
+
+/// The START/CONTINUATION framing under another 4-byte tag and size cap:
+/// the pre-seal route answer (`CTKA`, [`crate::transport::route_fetch`])
+/// rides the same layout as the handshake, so one reassembler serves both.
+///
+/// # Errors
+/// As [`fragment`], with `max` in place of [`MAX_HANDSHAKE_BYTES`].
+pub fn fragment_tagged(
+    magic: [u8; 4],
+    max: usize,
+    payload: &[u8],
+    frame_limit: usize,
+) -> Result<Vec<Vec<u8>>, AvHandshakeError> {
+    if payload.is_empty() || payload.len() > max {
         return Err(AvHandshakeError::TooLarge {
-            declared: handshake.len(),
-            max: MAX_HANDSHAKE_BYTES,
+            declared: payload.len(),
+            max,
         });
     }
     if frame_limit <= START_HEADER_LEN {
@@ -286,22 +301,22 @@ pub fn fragment(handshake: &[u8], frame_limit: usize) -> Result<Vec<Vec<u8>>, Av
             "the link's Channel carries {frame_limit} B, too few for a handshake frame"
         )));
     }
-    let total = u32::try_from(handshake.len()).map_err(|_| AvHandshakeError::TooLarge {
-        declared: handshake.len(),
-        max: MAX_HANDSHAKE_BYTES,
+    let total = u32::try_from(payload.len()).map_err(|_| AvHandshakeError::TooLarge {
+        declared: payload.len(),
+        max,
     })?;
-    let first = handshake.len().min(frame_limit - START_HEADER_LEN);
+    let first = payload.len().min(frame_limit - START_HEADER_LEN);
     let mut frames = Vec::new();
     let mut start = Vec::with_capacity(START_HEADER_LEN + first);
-    start.extend_from_slice(&HANDSHAKE_MAGIC);
+    start.extend_from_slice(&magic);
     start.push(HANDSHAKE_FRAME_VERSION);
     start.push(KIND_START);
     start.extend_from_slice(&total.to_be_bytes());
-    start.extend_from_slice(&handshake[..first]);
+    start.extend_from_slice(&payload[..first]);
     frames.push(start);
-    for part in handshake[first..].chunks(frame_limit - CONTINUATION_HEADER_LEN) {
+    for part in payload[first..].chunks(frame_limit - CONTINUATION_HEADER_LEN) {
         let mut f = Vec::with_capacity(CONTINUATION_HEADER_LEN + part.len());
-        f.extend_from_slice(&HANDSHAKE_MAGIC);
+        f.extend_from_slice(&magic);
         f.push(HANDSHAKE_FRAME_VERSION);
         f.push(KIND_CONTINUATION);
         f.extend_from_slice(part);
@@ -311,18 +326,39 @@ pub fn fragment(handshake: &[u8], frame_limit: usize) -> Result<Vec<Vec<u8>>, Av
 }
 
 /// Reassembles one handshake from its frames, holding at most the declared
-/// length, which is at most [`MAX_HANDSHAKE_BYTES`].
-#[derive(Debug, Default)]
+/// length, which is at most [`MAX_HANDSHAKE_BYTES`] (or the cap a
+/// [`Reassembler::tagged`] reassembler was given).
+#[derive(Debug)]
 pub struct Reassembler {
+    magic: [u8; 4],
+    max: usize,
     expected: Option<usize>,
     buf: Vec<u8>,
 }
 
+impl Default for Reassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Reassembler {
-    /// A reassembler waiting for a START frame.
+    /// A reassembler waiting for a `CTKX` START frame.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::tagged(HANDSHAKE_MAGIC, MAX_HANDSHAKE_BYTES)
+    }
+
+    /// A reassembler for the same framing under another tag and size cap
+    /// ([`fragment_tagged`]).
+    #[must_use]
+    pub fn tagged(magic: [u8; 4], max: usize) -> Self {
+        Self {
+            magic,
+            max,
+            expected: None,
+            buf: Vec::new(),
+        }
     }
 
     /// Bytes held so far.
@@ -331,13 +367,20 @@ impl Reassembler {
         self.buf.len()
     }
 
+    /// Whether a START frame has been taken (a part of the payload is held
+    /// or expected).
+    #[must_use]
+    pub fn started(&self) -> bool {
+        self.expected.is_some()
+    }
+
     /// Take one frame. `Ok(Some(bytes))` is the complete handshake.
     ///
     /// # Errors
     /// Every [`AvHandshakeError`] framing refusal; after one, the
     /// reassembler is spent.
     pub fn push(&mut self, b: &[u8]) -> Result<Option<Vec<u8>>, AvHandshakeError> {
-        if b.len() < CONTINUATION_HEADER_LEN || b[..4] != HANDSHAKE_MAGIC {
+        if b.len() < CONTINUATION_HEADER_LEN || b[..4] != self.magic {
             return Err(AvHandshakeError::NotAHandshake);
         }
         if b[4] != HANDSHAKE_FRAME_VERSION {
@@ -353,10 +396,10 @@ impl Reassembler {
                 let mut be = [0u8; 4];
                 be.copy_from_slice(len);
                 let declared = usize::try_from(u32::from_be_bytes(be)).unwrap_or(usize::MAX);
-                if declared == 0 || declared > MAX_HANDSHAKE_BYTES {
+                if declared == 0 || declared > self.max {
                     return Err(AvHandshakeError::TooLarge {
                         declared,
-                        max: MAX_HANDSHAKE_BYTES,
+                        max: self.max,
                     });
                 }
                 self.expected = Some(declared);

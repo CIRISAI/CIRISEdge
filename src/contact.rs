@@ -1317,11 +1317,9 @@ impl DirectoryLens for PersistLens<'_> {
         // Pull for any subject on a public plane, which is exactly what
         // carrying the directory means. Before that widening this had to return
         // `false`, because no peer would have answered.
-        replication.note_missing_signer(
-            crate::replication::protocol::EnvelopeKind::Key,
-            key_id,
-            None,
-        );
+        // CIRISEdge#904 — and it is a PERSON waiting, so the name is asked
+        // ahead of background repair, not behind every routed repair name.
+        replication.request_signer(crate::replication::protocol::EnvelopeKind::Key, key_id);
         true
     }
 }
