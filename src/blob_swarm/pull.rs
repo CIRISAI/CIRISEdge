@@ -1804,6 +1804,40 @@ where
         true
     }
 
+    /// The store gate refused. Axes 1 and 2 (who may hand us these bytes,
+    /// and whether we are in their audience) are read off directory rows
+    /// that can still land — an owner binding, a room roster, a widening —
+    /// so they are booked for retry like any fetch that may clear; the first
+    /// cut ended them `Refused` with nothing booked, and a joiner that
+    /// pulled before its room's roster converged never asked again (the
+    /// linux↔android pair room, CIRISServer live chat). Axis 3 (the
+    /// operator declined) and axis 0 (no scope to judge) do not change by
+    /// asking again and stay terminal. `attempts` is `None` for a
+    /// caller-driven fetch, which has no retry ledger: it reports the
+    /// refusal as transient and the caller asks again.
+    fn gate_refused(
+        &self,
+        row: &Attestation,
+        sha: [u8; 32],
+        attempts: Option<u32>,
+        axis: u8,
+        refusal: &super::store_gate::StoreRefusal,
+    ) -> PullOutcome {
+        let reason = format!("axis {axis}: {refusal:?}");
+        if !matches!(axis, 1 | 2) {
+            return PullOutcome::Refused(reason);
+        }
+        let retrying = attempts.is_some_and(|a| self.book_retry(row, sha, a));
+        tracing::info!(
+            blob = %hex::encode(sha),
+            attestation_id = %row.attestation_id,
+            reason = %reason,
+            retrying,
+            "store gate refused on a directory fact that can still land — booked for retry"
+        );
+        PullOutcome::FetchFailed { reason, retrying }
+    }
+
     /// CIRISEdge#817 — how many device custody histories the last
     /// [`Self::durability_sweep`] read: the audience devices it met, once each.
     #[must_use]
@@ -2422,7 +2456,7 @@ where
         {
             Ok(ok) => ok,
             Err(SwarmError::StoreRefused { refusal, axis, .. }) => {
-                return PullOutcome::Refused(format!("axis {axis}: {refusal:?}"));
+                return self.gate_refused(row, sha, Some(attempts), axis, &refusal);
             }
             Err(SwarmError::GoneFederationWide(_)) => {
                 return PullOutcome::Refused("withdrawn or revoked federation-wide".into());
@@ -2605,7 +2639,7 @@ where
         {
             Ok(d) => d,
             Err(SwarmError::StoreRefused { refusal, axis, .. }) => {
-                return PullOutcome::Refused(format!("axis {axis}: {refusal:?}"));
+                return self.gate_refused(row, sha, None, axis, &refusal);
             }
             Err(e) => return PullOutcome::Refused(e.to_string()),
         };
@@ -2804,7 +2838,7 @@ where
         {
             Ok(d) => d,
             Err(SwarmError::StoreRefused { refusal, axis, .. }) => {
-                return PullOutcome::Refused(format!("axis {axis}: {refusal:?}"));
+                return self.gate_refused(row, sha, Some(attempts), axis, &refusal);
             }
             Err(e) => return PullOutcome::Refused(e.to_string()),
         };
