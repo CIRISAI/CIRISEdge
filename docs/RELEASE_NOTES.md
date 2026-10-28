@@ -1,5 +1,20 @@
 # CIRISEdge Release Notes
 
+# v43.2.2 — an invitation reaches the invitee's node; a key a person asked for goes first
+
+**2026-10-27.** **PATCH** from v43.2.1. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
+
+- **persist v59.1.1: `principals_of` keeps a peer node's owner.** A node lost its owner whenever the
+  room's creator held an unagreed, identity-signed occurrence row for it (a #932 H1 mistaken for a
+  #889 revocation). A pair-room invitation was then `NotInAudience` for the invitee's node, and edge's
+  bridge withheld it on every round (`attestation withheld — the recipient is not in the row's
+  audience … membership:proposal:v1`). Edge carries the fix by pin; no edge code changes.
+- **A key a person is waiting on is asked before background repair (#904).** A contact paste
+  (`request_key_body`) is asked in the next recovery round, ahead of routed repair names, through
+  `ReplicationDirectory::request_signer` (a bounded priority set apart from the repair queue).
+- **The mutual-peer relay witness is deterministic** (`attributed_allegiance_659`): its macOS race
+  failed the v43.2.0 and v43.2.1 tag runs, so neither published release assets.
+
 # v43.2.1 — a contact's announced device arrives on request, not twenty minutes later
 
 **2026-10-27.** **PATCH** from v43.2.0 (persist v59.1.0, verify v20.2.0 unchanged). Unblocks
