@@ -1319,6 +1319,27 @@ enum DagFetchStop {
     HashMismatch { got: [u8; 32] },
 }
 
+/// The puller's "me" is the NODE that holds the bytes — the identity peers
+/// know (`Edge::advertised_key_id`). Under `use_node_identity` the actor's
+/// signer id is a different key with no node of its own; handed in as `me`,
+/// the store gate resolved the actor's principal, found no room, and refused
+/// every room blob `VerifiedOnly` (CIRISServer passed `signer_key_id()` on a
+/// split home: the android pair-room pull, live chat). The actor id is
+/// corrected to the node's, loudly; any other id is the caller's to choose.
+pub(super) fn wire_self(edge: &crate::Edge, given: String) -> String {
+    let node = edge.advertised_key_id();
+    if given != node && given == edge.signer_key_id() {
+        tracing::warn!(
+            given = %given,
+            node = %node,
+            "blob puller handed the ACTOR's key id as this node's on a split home — \
+             using the node's (the store gate's \"me\" is the node that holds the bytes)"
+        );
+        return node;
+    }
+    given
+}
+
 /// A DAG fetch a holder answered withdrawn, purged or revoked: the pull
 /// ends [`PullOutcome::Refused`] with NO retry booked, the disposition the
 /// whole-blob scheduler gives `GoneFederationWide`. Re-asking cannot help:
@@ -1526,7 +1547,7 @@ where
         local_key_id: impl Into<String>,
         config: PullConfig,
     ) -> Arc<Self> {
-        let local_key_id = local_key_id.into();
+        let local_key_id = wire_self(&edge, local_key_id.into());
         let retry_capacity = config.retry_capacity;
         let policy: Arc<dyn BlobStorePolicy> = Arc::new(
             PersistBlobStorePolicy::new(directory, local_key_id.clone())

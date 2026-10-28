@@ -198,3 +198,48 @@ async fn an_axis_one_refusal_books_a_retry() {
         "from a holder with standing the DAG pulls"
     );
 }
+
+/// **The puller's "me" is the node, even when a caller hands it the actor.**
+///
+/// CIRISServer passed `signer_key_id()` on a split home (`use_node_identity`):
+/// the gate resolved the actor's principal, found no room, and refused every
+/// room blob `VerifiedOnly`. `wire_self` corrects exactly that id to the
+/// node's and leaves every other choice to the caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_split_homes_actor_id_is_corrected_to_the_node() {
+    use ciris_persist::federation::FederationDirectory;
+    let (_alice, node_a, _node_b) = two_devices().await;
+    let split = |advertised: Option<&str>| {
+        let mut config = crate::EdgeConfig::default();
+        config.advertised_key_id = advertised.map(str::to_owned);
+        crate::Edge::builder()
+            .directory(node_a.dir.clone() as std::sync::Arc<dyn crate::verify::VerifyDirectory>)
+            .federation_directory(node_a.dir.clone() as std::sync::Arc<dyn FederationDirectory>)
+            .queue(node_a.dir.clone())
+            .signer(node_a.signer.clone())
+            .transport(std::sync::Arc::new(super::chunk_grants_779_tests::NoWire)
+                as std::sync::Arc<dyn crate::transport::Transport>)
+            .config(config)
+            .build()
+            .expect("build edge")
+    };
+    let actor = node_a.signer.key_id.clone();
+
+    let home = split(Some("the-node-key"));
+    assert_eq!(
+        super::pull::wire_self(&home, actor.clone()),
+        "the-node-key",
+        "the actor's id is the node's on a split home"
+    );
+    assert_eq!(
+        super::pull::wire_self(&home, "another-key".to_owned()),
+        "another-key",
+        "any other id is the caller's to choose"
+    );
+    let unsplit = split(None);
+    assert_eq!(
+        super::pull::wire_self(&unsplit, actor.clone()),
+        actor,
+        "when the two coincide nothing changes"
+    );
+}

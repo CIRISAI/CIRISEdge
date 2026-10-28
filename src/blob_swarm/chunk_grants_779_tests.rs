@@ -263,7 +263,7 @@ pub(crate) async fn federate(from: &Node, to: &Node) {
     carry_occurrence(from, to).await;
 }
 
-struct NoWire;
+pub(crate) struct NoWire;
 
 #[async_trait::async_trait]
 impl crate::transport::Transport for NoWire {
