@@ -281,6 +281,38 @@ struct HeldReport {
     staleness: StalenessSignal,
 }
 
+/// The identity of a refused wire row, for the log line naming it. Read
+/// best-effort from the bytes: an Attestation-plane row is the bare
+/// `Attestation` or its `{"attestation": …}` wrap; another plane's row has
+/// none of these fields, and each reads `-`.
+struct RefusedRow {
+    attestation_id: String,
+    attestation_type: String,
+    dimension: String,
+    cohort_scope: String,
+}
+
+impl RefusedRow {
+    fn of(bytes: &[u8]) -> Self {
+        let value: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
+        let row = value.get("attestation").unwrap_or(&value);
+        let text = |v: Option<&serde_json::Value>| {
+            v.and_then(serde_json::Value::as_str)
+                .unwrap_or("-")
+                .to_owned()
+        };
+        Self {
+            attestation_id: text(row.get("attestation_id")),
+            attestation_type: text(row.get("attestation_type")),
+            dimension: text(
+                row.get("attestation_envelope")
+                    .and_then(|e| e.get("dimension")),
+            ),
+            cohort_scope: text(row.get("cohort_scope")),
+        }
+    }
+}
+
 /// CIRISEdge#380 — per-round byte budget for the proactive Deliver. The
 /// v13.7.0 push was UNBOUNDED (full `local_refs(kind)` every round), which was
 /// tolerable for the small `SelfOwn` publish sets it was built for but breaks
@@ -1166,6 +1198,27 @@ impl Session {
                     awaits_signer,
                 } => {
                     refused += 1;
+                    // An UNSOLICITED Deliver (a peer's proactive push) is rare, and
+                    // each refused row is a row this node will not hold until the
+                    // peer pushes it again. Name every one at INFO with the row's
+                    // identity and persist's verdict, so a refusal never shows
+                    // only as a round's `refused: N` count. The per-signer
+                    // throttled WARN below stays for solicited anti-entropy.
+                    if !solicited {
+                        let row = RefusedRow::of(env_bytes);
+                        tracing::info!(
+                            kind = ?self.kind,
+                            peer = source_peer.unwrap_or("<unattributed>"),
+                            attestation_id = row.attestation_id,
+                            attestation_type = row.attestation_type,
+                            dimension = row.dimension,
+                            cohort_scope = row.cohort_scope,
+                            retry = retry.as_str(),
+                            reason = %reason,
+                            "unsolicited Deliver: row REFUSED — not applied; `reason` carries \
+                             persist's refusal kind and text"
+                        );
+                    }
                     // CIRISEdge#552 — an explicitly requested body that refuses
                     // TRANSIENTLY must stay expected. The expectation is the only
                     // thing that lets its bytes through this gate: hash-first
@@ -1356,6 +1409,35 @@ mod tests {
     use super::*;
     use crate::replication::summary::{LocalState, StateApplier, StateProvider};
     use std::collections::HashMap;
+
+    /// The INFO line for a refused unsolicited row names the row: its id, type,
+    /// dimension and scope, from a bare `Attestation` or its wrap, and `-` for a
+    /// body that carries none (another plane's row, or bytes that do not parse).
+    #[test]
+    fn a_refused_rows_identity_reads_from_the_bytes() {
+        let bare = br#"{"attestation_id":"chat-1","attestation_type":"scores","cohort_scope":"self","attestation_envelope":{"dimension":"chat:welcome:v1"}}"#;
+        let row = RefusedRow::of(bare);
+        assert_eq!(
+            (row.attestation_id.as_str(), row.attestation_type.as_str()),
+            ("chat-1", "scores")
+        );
+        assert_eq!(
+            (row.dimension.as_str(), row.cohort_scope.as_str()),
+            ("chat:welcome:v1", "self")
+        );
+        let wrapped = br#"{"attestation":{"attestation_id":"w-1","attestation_type":"supersedes","cohort_scope":"community"}}"#;
+        let row = RefusedRow::of(wrapped);
+        assert_eq!(
+            (row.attestation_id.as_str(), row.cohort_scope.as_str()),
+            ("w-1", "community")
+        );
+        assert_eq!(row.dimension, "-");
+        let other = RefusedRow::of(b"not json");
+        assert_eq!(
+            (other.attestation_id.as_str(), other.dimension.as_str()),
+            ("-", "-")
+        );
+    }
 
     fn h(seed: u8) -> [u8; 32] {
         let mut a = [0u8; 32];
