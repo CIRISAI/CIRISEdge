@@ -8621,14 +8621,19 @@ impl EdgeBuilder {
             return Err(EdgeError::Config("no transport configured".into()));
         }
 
-        let verify = Arc::new(VerifyPipeline::new(
-            directory,
-            self.config.hybrid_policy,
-            signer.key_id.clone(),
-            self.config.max_body_bytes,
-            self.config.replay_window_seconds,
-            self.config.max_replay_entries,
-        ));
+        // A split home is addressed at the node it advertises and signs as
+        // the actor: both are this node (AV-8).
+        let verify = Arc::new(
+            VerifyPipeline::new(
+                directory,
+                self.config.hybrid_policy,
+                signer.key_id.clone(),
+                self.config.max_body_bytes,
+                self.config.replay_window_seconds,
+                self.config.max_replay_entries,
+            )
+            .accepting_advertised(self.config.advertised_key_id.clone()),
+        );
 
         let events = self.events.unwrap_or_else(|| {
             Arc::new(crate::events::EventBus::with_capacity(

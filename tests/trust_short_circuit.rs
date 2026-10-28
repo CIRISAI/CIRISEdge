@@ -713,3 +713,51 @@ async fn build_outcome(edge: &Edge, sender: &LocalSigner, destination: &str) -> 
     };
     edge.dispatch_inbound_observed_outcome_for_test(frame).await
 }
+
+/// **A split home accepts envelopes addressed to the node it advertises.**
+///
+/// The agent-embedded fold signs as the agent and advertises the node; peers
+/// address the node (a blob holder is named by its node key). AV-8 compared
+/// the destination with the signer's key only, so every such fetch was
+/// refused `Misrouted` at the holder (live chat build 11). Both keys are this
+/// node: either is accepted, and a third is still misrouted.
+#[tokio::test]
+async fn a_split_home_accepts_envelopes_addressed_to_its_advertised_node() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let steward = FedKey::new("steward-fed", 0x01);
+    let local = FedKey::new("local-self", 0xBB);
+    let remote = FedKey::new("remote-peer", 0xAA);
+    let directory = directory_with(vec![
+        signed_record(&steward, &steward, "steward"),
+        signed_record(&local, &steward, "agent"),
+        signed_record(&remote, &steward, "agent"),
+    ])
+    .await;
+    let edge = Edge::builder()
+        .directory(directory.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+        .queue(directory.clone())
+        .signer(local.local_signer(tmp.path()).await)
+        .transport(Arc::new(NopTransport) as Arc<dyn Transport>)
+        .config(EdgeConfig {
+            advertised_key_id: Some("the-advertised-node".to_owned()),
+            ..config_with_trust(0.0, false)
+        })
+        .build()
+        .expect("build edge");
+    let remote_signer = remote.local_signer(tmp.path()).await;
+    assert_eq!(
+        build_outcome(&edge, &remote_signer, "the-advertised-node").await,
+        "received",
+        "an envelope addressed to the advertised node is this node's"
+    );
+    assert_eq!(
+        build_outcome(&edge, &remote_signer, &local.key_id).await,
+        "received",
+        "the signer's own key is still accepted"
+    );
+    assert_eq!(
+        build_outcome(&edge, &remote_signer, "not-this-node").await,
+        "verify_failed",
+        "any other destination is still misrouted"
+    );
+}
