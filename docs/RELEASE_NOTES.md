@@ -18,6 +18,19 @@
 - **A key a person is waiting on is asked before background repair (#904).** A contact paste
   (`request_key_body`) is asked in the next recovery round, ahead of routed repair names, through
   `ReplicationDirectory::request_signer` (a bounded priority set apart from the repair queue).
+- **A host that reuses a running Edge can arm its blob plane: `Edge::arm_fold_host`.** An
+  agent-embedded server node reuses the Edge the pyo3 runtime built, which arms neither the scope
+  address table nor a chunk source. Every room blob pull then refused `NoAddressTable`, no peer could
+  fetch a body from the node, and room address installs did nothing. `arm_fold_host(chunk_source,
+  scope_native)` arms both, set-once, on the built (or running) Edge; the inbound loop reads the
+  chunk source per frame. Witness `a_running_edge_armed_late_serves_and_pulls_the_room_body`.
+- **A store-gate refusal on axis 1 or 2 is retried.** Who may hand this node bytes, and whether it
+  is in their audience, read directory facts that can still land, so these refusals now book a retry
+  instead of ending the pull. Axis 3 (the operator declined) stays terminal. The axis-1 refusal logs
+  which side lacked the room.
+- **The blob puller's "me" is the node.** Handed the actor's key id on a split home
+  (`use_node_identity`), the puller uses `Edge::advertised_key_id` instead, with a warning; the store
+  gate had been resolving the actor's principal and refusing every room blob.
 - **The mutual-peer relay witness is deterministic** (`attributed_allegiance_659`): its macOS race
   failed the v43.2.0 and v43.2.1 tag runs, so neither published release assets.
 

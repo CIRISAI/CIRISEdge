@@ -1290,7 +1290,11 @@ pub struct Edge {
     /// `ContentFetch`, which also has no in-core responder; consumer
     /// crates (lens-core / agent) wrap their persist `BlobStorage`
     /// handle in a `BlobChunkSource` impl.
-    blob_chunk_source: Option<Arc<dyn crate::blob_swarm::BlobChunkSource>>,
+    ///
+    /// Set once: at build, or by [`Edge::arm_fold_host`] on an Edge another
+    /// layer built. The inbound loop reads the cell per frame, so a source
+    /// set after `run` starts answers the next fetch.
+    blob_chunk_source: Arc<std::sync::OnceLock<Arc<dyn crate::blob_swarm::BlobChunkSource>>>,
     /// v3.5.1 (CIRISEdge#119) — opt-in replication routing hook.
     /// Headless composition roots (CIRISServer) call
     /// [`Edge::install_replication_routing`] to register the
@@ -1415,9 +1419,10 @@ pub struct Edge {
     /// CIRISEdge#499 — the scope-address lifecycle, present only when the
     /// operator opted in via [`EdgeBuilder::scope_native_addressing`] AND a
     /// Reticulum transport is wired. `None` is the default and is
-    /// byte-identical to pre-#499 behaviour.
+    /// byte-identical to pre-#499 behaviour. Set once: at build, or by
+    /// [`Edge::arm_fold_host`].
     #[cfg(feature = "_reticulum-module")]
-    scope_lifecycle: Option<Arc<crate::scope_lifecycle::ScopeLifecycle>>,
+    scope_lifecycle: std::sync::OnceLock<Arc<crate::scope_lifecycle::ScopeLifecycle>>,
     /// CIRISEdge#805 item 5 — the node's room MLS groups, for
     /// [`Edge::join_call`]. Set via [`EdgeBuilder::room_groups`].
     #[cfg(feature = "_reticulum-module")]
@@ -4231,7 +4236,7 @@ impl Edge {
             self.config.delegation_authority_gate_enabled,
             self.config.delegation_graph_max_depth,
             self.canonical_peers.clone(),
-            self.blob_chunk_source.as_ref(),
+            self.blob_chunk_source.get(),
             self.swarm_runtime.get().as_ref(),
             &self.converged_claims,
             &self.blob_scope_router(),
@@ -4275,7 +4280,76 @@ impl Edge {
     #[cfg(feature = "_reticulum-module")]
     #[must_use]
     pub fn scope_lifecycle(&self) -> Option<&Arc<crate::scope_lifecycle::ScopeLifecycle>> {
-        self.scope_lifecycle.as_ref()
+        self.scope_lifecycle.get()
+    }
+
+    /// Arm the blob plane on an Edge another layer built: the chunk source
+    /// that answers peers' `BlobChunkFetch`, and (with `scope_native`) the
+    /// scope address table and its [`ScopeLifecycle`], exactly as
+    /// [`EdgeBuilder::blob_chunk_source`] and
+    /// [`EdgeBuilder::scope_native_addressing`] arm them at build.
+    ///
+    /// For a host that reuses a running Edge rather than building its own
+    /// (CIRISServer's agent-embedded node reuses the Edge the pyo3
+    /// `init_edge_runtime` built, which arms neither). Without this, such a
+    /// node has no address table — every room blob pull refuses
+    /// `NoAddressTable` — and no chunk source, so no peer can fetch a body
+    /// from it, and `scope_lifecycle()` is `None`, so room installs do
+    /// nothing.
+    ///
+    /// Safe on a running Edge: the inbound loop reads the chunk source and
+    /// the transport's table per frame. Set once — refused, with nothing
+    /// changed, if the source, the lifecycle or the transport's table is
+    /// already set, or if `scope_native` is asked for with no Reticulum
+    /// transport or with a source whose `chunk_scope` does not answer.
+    ///
+    /// # Errors
+    /// [`EdgeError::Config`] naming what refused.
+    ///
+    /// [`ScopeLifecycle`]: crate::scope_lifecycle::ScopeLifecycle
+    #[cfg(feature = "_reticulum-module")]
+    pub fn arm_fold_host(
+        &self,
+        chunk_source: Arc<dyn crate::blob_swarm::BlobChunkSource>,
+        scope_native: Option<std::time::Duration>,
+    ) -> Result<(), EdgeError> {
+        if self.blob_chunk_source.get().is_some() {
+            return Err(EdgeError::Config(
+                "arm_fold_host: a blob chunk source is already set".into(),
+            ));
+        }
+        if scope_native.is_some() {
+            if self.scope_lifecycle.get().is_some()
+                || self
+                    .reticulum_transport
+                    .as_ref()
+                    .is_some_and(|t| t.scope_address_table().is_some())
+            {
+                return Err(EdgeError::Config(
+                    "arm_fold_host: scope-native addressing is already armed".into(),
+                ));
+            }
+            scope_native_chunk_source_gate(true, Some(chunk_source.as_ref()))?;
+        }
+        let lifecycle = EdgeBuilder::arm_scope_native(
+            scope_native,
+            self.reticulum_transport.as_ref(),
+            &self.signer.key_id,
+        )?;
+        chunk_source.attach_metrics(self.metrics());
+        if self.blob_chunk_source.set(chunk_source).is_err() {
+            return Err(EdgeError::Config(
+                "arm_fold_host: a blob chunk source was set concurrently".into(),
+            ));
+        }
+        if let Some(lifecycle) = lifecycle {
+            if self.scope_lifecycle.set(lifecycle).is_err() {
+                return Err(EdgeError::Config(
+                    "arm_fold_host: a scope lifecycle was set concurrently".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// CIRISEdge#805 item 5 — **join `room`'s call** (`FSD/AV_CALL_API.md`
@@ -4321,7 +4395,8 @@ impl Edge {
             .ok_or_else(|| missing("a Reticulum transport"))?;
         let lifecycle = self
             .scope_lifecycle
-            .clone()
+            .get()
+            .cloned()
             .ok_or_else(|| missing("a scope lifecycle"))?;
         let groups = self
             .room_groups
@@ -4397,7 +4472,7 @@ impl Edge {
                 self.reticulum_transport
                     .as_ref()
                     .and_then(|t| t.scope_address_table().cloned())
-                    .or_else(|| self.scope_lifecycle.as_ref().map(|l| Arc::clone(l.table()))),
+                    .or_else(|| self.scope_lifecycle.get().map(|l| Arc::clone(l.table()))),
             )
         }
         #[cfg(not(feature = "_reticulum-module"))]
@@ -5075,7 +5150,7 @@ impl Edge {
         let delegation_graph_max_depth = self.config.delegation_graph_max_depth;
         let delegation_trust_roots = self.canonical_peers.clone();
         // CIRISEdge#55 v3.4.0-pre1 — server-side responder hook.
-        let blob_chunk_source = self.blob_chunk_source.clone();
+        let blob_chunk_source = Arc::clone(&self.blob_chunk_source);
         // CIRISEdge#184 (v6.3.0) — swarm-runtime inbound hook for
         // verified `MessageType::FountainHoldingClaim` envelopes.
         // Clone of the `Arc<OnceLock<Arc<FountainSwarmRuntime>>>`; the
@@ -5152,7 +5227,8 @@ impl Edge {
                     let trust_scoring_clone = trust_scoring.clone();
                     let l1_cdn_edge_external_uri_base_clone = l1_cdn_edge_external_uri_base.clone();
                     let delegation_trust_roots_clone = delegation_trust_roots.clone();
-                    let blob_chunk_source_clone = blob_chunk_source.clone();
+                    // Per frame: `Edge::arm_fold_host` may set it after `run`.
+                    let blob_chunk_source_clone = blob_chunk_source.get().cloned();
                     let swarm_runtime_clone = swarm_runtime.clone();
                     let converged_claims_clone = converged_claims.clone();
                     // CIRISEdge#683 — per frame, like the registry: the bridge
@@ -8717,7 +8793,10 @@ impl EdgeBuilder {
             blob_chunk_fetch_pending,
             peer_directory: self.peer_directory,
             steward_directory: self.steward_directory,
-            blob_chunk_source: self.blob_chunk_source,
+            blob_chunk_source: Arc::new(match self.blob_chunk_source {
+                Some(source) => std::sync::OnceLock::from(source),
+                None => std::sync::OnceLock::new(),
+            }),
             replication_registry: Arc::new(ReinstallableCell::new("replication_registry")),
             swarm_runtime: Arc::new(ReinstallableCell::new("swarm_runtime")),
             // CIRISEdge#545 — constructed UNARMED. Until `run` (or
@@ -8735,7 +8814,10 @@ impl EdgeBuilder {
             #[cfg(feature = "_reticulum-module")]
             reticulum_transport: self.reticulum_transport,
             #[cfg(feature = "_reticulum-module")]
-            scope_lifecycle,
+            scope_lifecycle: match scope_lifecycle {
+                Some(lifecycle) => std::sync::OnceLock::from(lifecycle),
+                None => std::sync::OnceLock::new(),
+            },
             #[cfg(feature = "_reticulum-module")]
             room_groups: self.room_groups,
             #[cfg(feature = "_reticulum-module")]

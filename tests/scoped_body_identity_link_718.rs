@@ -545,36 +545,60 @@ struct Mesh {
     _tmp: tempfile::TempDir,
 }
 
-async fn spawn_member(node: Node, rt: Arc<ReticulumTransport>) -> Member {
-    let edge = Edge::builder()
-        .directory(node.dir.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
-        .federation_directory(node.dir.clone() as Arc<dyn FederationDirectory>)
-        .queue(node.dir.clone())
-        .signer(node.signer.clone())
-        .reticulum_transport(Arc::clone(&rt))
-        .blob_chunk_source(Arc::new(RoomScopedSource {
+/// How a member's blob plane is armed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arming {
+    /// At build (`EdgeBuilder::blob_chunk_source` + `scope_native_addressing`).
+    AtBuild,
+    /// After `run` starts, on the built Edge (`Edge::arm_fold_host`) — the
+    /// agent-embedded host, which reuses an Edge another layer built.
+    AfterRun,
+}
+
+async fn spawn_member(node: Node, rt: Arc<ReticulumTransport>, arming: Arming) -> Member {
+    let source = || {
+        Arc::new(RoomScopedSource {
             inner: ciris_edge::blob_swarm::PersistBlobChunkSource::new(node.store.engine().clone()),
             scope: ContentScope::Group {
                 scope: scope_for(ROOM),
                 group_id: ROOM.to_owned(),
             },
-        }))
-        // The transport owns the table and registers the derived addresses
-        // as real explicit-hash destinations (announce-suppressed).
-        .scope_native_addressing(Duration::from_secs(300))
+        })
+    };
+    let mut builder = Edge::builder()
+        .directory(node.dir.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+        .federation_directory(node.dir.clone() as Arc<dyn FederationDirectory>)
+        .queue(node.dir.clone())
+        .signer(node.signer.clone())
+        .reticulum_transport(Arc::clone(&rt))
         .config(EdgeConfig {
             hybrid_policy: HybridPolicy::Ed25519Fallback,
             ..EdgeConfig::default()
-        })
-        .build()
-        .expect("build edge");
-    let edge = Arc::new(edge);
+        });
+    if arming == Arming::AtBuild {
+        // The transport owns the table and registers the derived addresses
+        // as real explicit-hash destinations (announce-suppressed).
+        builder = builder
+            .blob_chunk_source(source())
+            .scope_native_addressing(Duration::from_secs(300));
+    }
+    let edge = Arc::new(builder.build().expect("build edge"));
     let (stop, shutdown_rx) = tokio::sync::watch::channel(false);
     let runner = Arc::clone(&edge);
     tokio::spawn(async move {
         let _ = runner.run(shutdown_rx).await;
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
+    if arming == Arming::AfterRun {
+        assert!(edge.scope_lifecycle().is_none(), "nothing armed at build");
+        edge.arm_fold_host(source(), Some(Duration::from_secs(300)))
+            .expect("arm the running Edge");
+        assert!(
+            edge.arm_fold_host(source(), Some(Duration::from_secs(300)))
+                .is_err(),
+            "arming is set-once"
+        );
+    }
     Member {
         node,
         rt,
@@ -585,8 +609,12 @@ async fn spawn_member(node: Node, rt: Arc<ReticulumTransport>) -> Member {
 
 /// Stand the mesh up. A and B dial C; with `direct_ab`, B also dials A (the
 /// direct-preferred negative control).
-#[allow(clippy::too_many_lines)] // three transports, one room, one group: the topology in one place on purpose
 async fn mesh(tag: &str, direct_ab: bool) -> Mesh {
+    mesh_armed(tag, direct_ab, Arming::AtBuild).await
+}
+
+#[allow(clippy::too_many_lines)] // three transports, one room, one group: the topology in one place on purpose
+async fn mesh_armed(tag: &str, direct_ab: bool, arming: Arming) -> Mesh {
     init_tracing();
     let tmp = tempfile::tempdir().expect("tempdir");
     let base = tmp.path().to_path_buf();
@@ -689,8 +717,8 @@ async fn mesh(tag: &str, direct_ab: bool) -> Mesh {
     .await
     .expect("B joins from the Welcome");
 
-    let a = spawn_member(node_a, rt_a).await;
-    let b = spawn_member(node_b, rt_b).await;
+    let a = spawn_member(node_a, rt_a, arming).await;
+    let b = spawn_member(node_b, rt_b, arming).await;
     for (member, group) in [(&a, &group_a), (&b, &group_b)] {
         member
             .edge
@@ -986,6 +1014,29 @@ async fn assert_relay_directory_is_blind(m: &Mesh) {
 }
 
 // ─── the witnesses ────────────────────────────────────────────────────
+
+/// **A host that reuses a running Edge arms the blob plane after `run`.**
+///
+/// CIRISServer's agent-embedded node reuses the Edge the pyo3 runtime built,
+/// which arms neither the address table nor a chunk source: every room blob
+/// pull refused `NoAddressTable` in both directions, and no peer could fetch
+/// a body from the node. `Edge::arm_fold_host` arms both on the running
+/// Edge; the room's body then crosses exactly as on a build-armed node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_running_edge_armed_late_serves_and_pulls_the_room_body() {
+    let m = mesh_armed("late", true, Arming::AfterRun).await;
+    wait_for_path(&m.b, &m.a, true, Duration::from_secs(60)).await;
+    wait_for_path(&m.a, &m.b, true, Duration::from_secs(60)).await;
+    let chat = b"a message for the room, from an Edge armed after run".to_vec();
+    let (chat_row, chat_sha, chat_ptr) = author_body(&m, &chat, "chat body").await;
+    let p = puller(&m);
+    pull_and_open(&m, &p, &chat_row, chat_sha, &chat_ptr, &chat, "chat body").await;
+    assert!(
+        m.a.edge.metrics().snapshot().blob_serve_refusals.is_empty(),
+        "A refused nothing: {:?}",
+        m.a.edge.metrics().snapshot().blob_serve_refusals
+    );
+}
 
 /// **The positive.** A and B each dial C, never each other. The chat body and
 /// the attachment cross over C's forwarded identity-plane link, discriminated
