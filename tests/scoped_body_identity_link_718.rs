@@ -1222,3 +1222,75 @@ async fn a_forged_discriminator_is_refused_by_name_718() {
         "B was served nothing on a forged discriminator"
     );
 }
+
+/// **On a split home the lifecycle's "this node" is the NODE, not the actor.**
+///
+/// The agent-embedded fold signs as the agent and advertises the node
+/// (`EdgeConfig::advertised_key_id`); the room's MLS roster names node keys.
+/// `arm_fold_host` built the lifecycle over the signer's key, so every room
+/// install refused "this node (<agent>) is not in the roster" (live chat
+/// build 10). Here the Edge signs as a different key than the node it
+/// advertises, and the room install must succeed for the node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_split_home_arms_its_lifecycle_for_the_node_not_the_actor() {
+    init_tracing();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let base = tmp.path().to_path_buf();
+    let alice = Ident::new("alice-split", 0x11);
+    let agent = Ident::new("agent-split", 0x44);
+    let node_a = node(&[&alice], &alice).await;
+    let actor = node(&[&agent], &agent).await;
+    let (rt, _addr) = build_reticulum_with_retry(|| {
+        let base = base.clone();
+        let auth = auth_for(&node_a);
+        let key = node_a.me.clone();
+        async move {
+            let mut c = ReticulumTransportConfig::new(base.join("a/t.id"), &key);
+            c.listen_addr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+            (c, auth)
+        }
+    })
+    .await;
+    let edge = Edge::builder()
+        .directory(node_a.dir.clone() as Arc<dyn ciris_edge::verify::VerifyDirectory>)
+        .federation_directory(node_a.dir.clone() as Arc<dyn FederationDirectory>)
+        .queue(node_a.dir.clone())
+        // The actor signs; the node is what peers (and the roster) know.
+        .signer(actor.signer.clone())
+        .reticulum_transport(Arc::clone(&rt))
+        .config(EdgeConfig {
+            hybrid_policy: HybridPolicy::Ed25519Fallback,
+            advertised_key_id: Some(node_a.me.clone()),
+            ..EdgeConfig::default()
+        })
+        .build()
+        .expect("build edge");
+    assert_ne!(edge.signer_key_id(), node_a.me, "fixture: a split home");
+    edge.arm_fold_host(
+        Arc::new(RoomScopedSource {
+            inner: ciris_edge::blob_swarm::PersistBlobChunkSource::new(
+                node_a.store.engine().clone(),
+            ),
+            scope: ContentScope::Group {
+                scope: scope_for(ROOM),
+                group_id: ROOM.to_owned(),
+            },
+        }),
+        Some(Duration::from_secs(300)),
+    )
+    .expect("arm the split home");
+    let life = edge.scope_lifecycle().expect("armed");
+    assert_eq!(life.own_key_id(), node_a.me, "the lifecycle is the node's");
+    let group = CohortGroup::create(
+        ScopeStateProvider::new(Arc::new(
+            XChaChaKvStore::open_in_memory(b"split").expect("in-memory scope state"),
+        )),
+        ROOM,
+        &node_a.me,
+        16,
+    )
+    .await
+    .expect("the node's room group");
+    life.install(&scope_for(ROOM), &snapshot(&group).await.expect("snapshot"))
+        .expect("the room's addresses install for the node");
+}

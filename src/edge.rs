@@ -4211,6 +4211,7 @@ impl Edge {
             &self.handlers,
             &self.queue,
             &self.signer,
+            &self.advertised_key_id(),
             &self.opaque_subscribers,
             &self.opaque_handlers,
             &self.opaque_request_pending,
@@ -4331,10 +4332,13 @@ impl Edge {
             }
             scope_native_chunk_source_gate(true, Some(chunk_source.as_ref()))?;
         }
+        // The lifecycle's "this node" is the ADVERTISED key — the node on a
+        // split home, never the signer (the agent there): the scope roster
+        // is node keys, and naming the agent refused every install.
         let lifecycle = EdgeBuilder::arm_scope_native(
             scope_native,
             self.reticulum_transport.as_ref(),
-            &self.signer.key_id,
+            &self.advertised_key_id(),
         )?;
         chunk_source.attach_metrics(self.metrics());
         if self.blob_chunk_source.set(chunk_source).is_err() {
@@ -5110,6 +5114,7 @@ impl Edge {
         let handlers = self.handlers.clone();
         let queue = self.queue.clone();
         let signer = self.signer.clone();
+        let own_node_key_id = self.advertised_key_id();
         let opaque_subs = self.opaque_subscribers.clone();
         let opaque_handlers = self.opaque_handlers.clone();
         let opaque_request_pending = self.opaque_request_pending.clone();
@@ -5210,6 +5215,7 @@ impl Edge {
                     let handlers_clone = handlers.clone();
                     let queue_clone = queue.clone();
                     let signer_clone = signer.clone();
+                    let own_node_key_id_clone = own_node_key_id.clone();
                     let opaque_subs_clone = opaque_subs.clone();
                     let opaque_handlers_clone = opaque_handlers.clone();
                     let opaque_request_pending_clone = opaque_request_pending.clone();
@@ -5255,6 +5261,7 @@ impl Edge {
                             &handlers_clone,
                             &queue_clone,
                             &signer_clone,
+                            &own_node_key_id_clone,
                             &opaque_subs_clone,
                             &opaque_handlers_clone,
                             &opaque_request_pending_clone,
@@ -5995,6 +6002,7 @@ fn select_reply_transport(
         handlers,
         queue,
         signer,
+        own_node_key_id,
         opaque_subscribers,
         opaque_handlers,
         opaque_request_pending,
@@ -6031,6 +6039,9 @@ async fn dispatch_inbound(
     handlers: &Mutex<HashMap<MessageType, RegisteredHandler>>,
     queue: &Arc<dyn OutboundHandle>,
     signer: &Arc<LocalSigner>,
+    // The key peers know this node as (`Edge::advertised_key_id`): the NODE
+    // on a split home, where `signer` is the actor. Scope rosters name nodes.
+    own_node_key_id: &str,
     opaque_subscribers: &std::sync::Mutex<HashMap<u64, OpaqueSubscriber>>,
     // CC 0.7 (CIRISEdge#241) — opaque-request handler registry (keyed by
     // `kind`) + request→response correlation map + the transport used to
@@ -6691,7 +6702,7 @@ async fn dispatch_inbound(
                 let scoped_arrival = blob_scope_router.scoped_arrival(
                     arrival_scope.clone(),
                     req.scope_discriminator.as_ref(),
-                    &signer.key_id,
+                    own_node_key_id,
                 );
                 let arrival_scope = match &scoped_arrival {
                     Ok(a) => a.clone(),
@@ -8681,10 +8692,15 @@ impl EdgeBuilder {
             // CIRISEdge#616 — a caller-built lifecycle wins; it already
             // owns a table and a sink.
             Some(lifecycle) => Some(lifecycle),
+            // "This node" is the advertised (node) key, as
+            // `Edge::advertised_key_id` spells it.
             None => Self::arm_scope_native(
                 self.scope_native_convergence,
                 self.reticulum_transport.as_ref(),
-                &signer.key_id,
+                self.config
+                    .advertised_key_id
+                    .as_deref()
+                    .unwrap_or(&signer.key_id),
             )?,
         };
         // CIRISEdge#640 — a scope-native node MUST be able to say what scope
