@@ -9,6 +9,12 @@
   #889 revocation). A pair-room invitation was then `NotInAudience` for the invitee's node, and edge's
   bridge withheld it on every round (`attestation withheld — the recipient is not in the row's
   audience … membership:proposal:v1`). Edge carries the fix by pin; no edge code changes.
+- **A relay also hands a published owner's live root acceptance to a first-contact peer (#907).**
+  v43.2.1's subject Pull relayed a contact's announced owner-binding but not their root
+  acceptance, so a node that met a person only through the canonical could resolve their node but
+  never a root in common with it, and the pair room was never keyed. The relay now also admits
+  `delegates_to(owner → R)` at federation scope (`trust:accepts:v1`) when the acceptor is an owner it
+  publishes and the acceptance is live.
 - **A key a person is waiting on is asked before background repair (#904).** A contact paste
   (`request_key_body`) is asked in the next recovery round, ahead of routed repair names, through
   `ReplicationDirectory::request_signer` (a bounded priority set apart from the repair queue).
