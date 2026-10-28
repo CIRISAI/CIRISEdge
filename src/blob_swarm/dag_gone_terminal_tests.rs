@@ -210,8 +210,10 @@ async fn a_split_homes_actor_id_is_corrected_to_the_node() {
     use ciris_persist::federation::FederationDirectory;
     let (_alice, node_a, _node_b) = two_devices().await;
     let split = |advertised: Option<&str>| {
-        let mut config = crate::EdgeConfig::default();
-        config.advertised_key_id = advertised.map(str::to_owned);
+        let config = crate::EdgeConfig {
+            advertised_key_id: advertised.map(str::to_owned),
+            ..crate::EdgeConfig::default()
+        };
         crate::Edge::builder()
             .directory(node_a.dir.clone() as std::sync::Arc<dyn crate::verify::VerifyDirectory>)
             .federation_directory(node_a.dir.clone() as std::sync::Arc<dyn FederationDirectory>)
