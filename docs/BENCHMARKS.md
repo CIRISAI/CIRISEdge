@@ -231,6 +231,28 @@ cargo bench --features "codec-fountain" --bench fountain_reconstruction
 | `transport_http_loopback` | ciris-edge | Round-trip over the HTTP transport. End-to-end wall clock; same size sweep — comparison anchor for the Reticulum curve. |
 | `fountain_reconstruction` | ciris-edge | CIRISEdge#438 — real-RaptorQ half of the fountain survival-floor oracle. Prints the measured decode-success curve `d(m)` (m ∈ 18..=26 distinct symbols, 1000 subsets each) + the `Σ_m P(X=m)·d(m)` composite next to `fountain_defaults`' availability table; times decode at m ∈ {20, 23, 26} + encode at the recommended tuple. `required-features = ["codec-fountain"]`; not yet wired into bench.yml/ci.yml lanes. |
 
+## Startup
+
+Two instruments, for the two places a startup can be slow.
+
+- **In the field: one INFO line per start.** `init_edge_runtime` logs
+  `startup phases` with each phase's duration and the total (`substrate`,
+  `directory`, `signer`, `transport_config`, `reticulum_transport`,
+  `https_transport`, `edge_build_and_listeners`). A report that a node starts
+  slower then names its phase from the operator's own log, with no extra
+  files to collect.
+- **In CI: the startup probe** (`tests/startup_probe.rs`, `#[ignore]`d). It
+  times a fresh database open and migration, a reopen, the Reticulum
+  transport's cold and warm build, and the wait for the node's own signed route
+  row. The Bench workflow runs it seven times in the release profile and
+  publishes the median of each phase as `startup/<phase>`, un-normalized (the
+  phases are I/O and key loading more than CPU).
+
+Read a startup number only as a median of several runs in an optimized build.
+A single run, or a debug build, measures the host's load as much as edge: two
+restarts of the same edge build on the same machine differed by 0.36 s, more
+than the difference between two edge versions.
+
 ## Reading the curves
 
 Every swept curve has an expected shape. A point that deviates from

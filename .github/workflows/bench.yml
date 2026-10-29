@@ -382,6 +382,30 @@ jobs:
           fi
           echo "Sim metric lines captured: $(wc -l < sim-metrics.txt)"
 
+      # Startup phases (DB open/migrate, transport cold/warm build, own route
+      # row): wall-clock, but dominated by I/O and key loading rather than CPU,
+      # so published UN-normalized. Seven runs in the release profile, and the
+      # MEDIAN per phase is the trend point — a single run reads the runner's
+      # load as much as edge.
+      - name: Run startup probe (un-normalized lane)
+        run: |
+          set -o pipefail
+          STARTUP_PROBE_RUNS=7 cargo test --release --features transport-reticulum \
+            --test startup_probe -- --ignored --nocapture --test-threads=1 | tee startup-raw.txt
+          python3 - <<'EOF' > startup-metrics.txt
+          import json, re, statistics
+          runs = [json.loads(m.group(1)) for line in open("startup-raw.txt")
+                  for m in [re.search(r"STARTUP_PROBE (\{.*\})", line)] if m]
+          if not runs:
+              raise SystemExit("no STARTUP_PROBE lines captured")
+          for key in sorted(k for k in runs[0] if k != "run"):
+              values = [r[key] for r in runs if r.get(key) is not None]
+              if values:
+                  ns = int(statistics.median(values) * 1_000_000)
+                  print(f"test startup/{key.removesuffix('_ms')} ... bench: {ns} ns/iter (+/- 0)")
+          EOF
+          cat startup-metrics.txt
+
       # Publish input for the ALERT + trend: NORMALIZED wall-clock criterion +
       # deterministic SIM metrics. The raw calibration anchor is DELIBERATELY
       # EXCLUDED here — it is the normalization REFERENCE, not an alert subject.
@@ -394,7 +418,7 @@ jobs:
       # what answers "was that alert a real regression or a slow runner?".
       - name: Assemble bench-output.txt
         run: |
-          cat bench-output-normalized.txt sim-metrics.txt > bench-output.txt
+          cat bench-output-normalized.txt sim-metrics.txt startup-metrics.txt > bench-output.txt
           {
             echo "## Bench top-line (published series)"
             echo '```'

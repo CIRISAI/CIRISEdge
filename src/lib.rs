@@ -139,6 +139,7 @@ pub mod files;
 pub mod scope_privacy;
 pub mod scope_room;
 pub mod self_room;
+pub mod startup_timing;
 pub mod swarm;
 pub mod touch_claim;
 pub mod transport;
