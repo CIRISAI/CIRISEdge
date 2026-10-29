@@ -6209,6 +6209,7 @@ pub fn init_edge_runtime(
     node_keystore_alias: Option<&str>,
     baked_canonical_dials: Option<bool>,
 ) -> PyResult<PyEdge> {
+    let mut startup = crate::startup_timing::StartupPhases::start("init_edge_runtime");
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
     // paths) and the cert+key-pair check both surface as typed
@@ -6550,6 +6551,7 @@ pub fn init_edge_runtime(
         )?
     };
 
+    startup.mark("substrate");
     // ── Step 2: directory + BackendDispatch → edge adapter Arcs.
     //
     // edge's `VerifyDirectory` / `RootingDirectory` traits have blanket
@@ -6681,6 +6683,7 @@ pub fn init_edge_runtime(
         BackendDispatch::Sqlite(b) => b,
     };
 
+    startup.mark("directory");
     // ── Step 3: keyring signer parts → edge's hot-path LocalSigner.
     //
     // persist's `KeyringSignerHandle` already contains the cloned
@@ -7000,6 +7003,7 @@ pub fn init_edge_runtime(
     let reticulum_identity_signer: Arc<LocalSigner> =
         node_transport_identity.unwrap_or_else(|| Arc::clone(&actor_local_signer));
 
+    startup.mark("signer");
     // ── Step 4: parse the Reticulum transport config.
     let listen_addr = listen_addr
         .parse()
@@ -7513,6 +7517,7 @@ pub fn init_edge_runtime(
         ))),
     };
 
+    startup.mark("transport_config");
     // ── Step 5: build the transport + Edge under the host runtime.
     //
     // The tokio runtime handle was extracted in Step 1 via the v2.8.0
@@ -7867,6 +7872,7 @@ pub fn init_edge_runtime(
             None
         };
 
+    startup.mark("reticulum_transport");
     // ── Step 5.5 (v0.19.3 / CIRISEdge#49) — HTTPS transport build.
     //
     // When `https_init_params` resolves to `Some`, mint the dev cert
@@ -7981,6 +7987,7 @@ pub fn init_edge_runtime(
         (None, None)
     };
 
+    startup.mark("https_transport");
     // ── Step 6: assemble the Edge. The pre-built EventBus +
     // ReachabilityTracker are shared with the Reticulum transport
     // (auth above) so #34 link / announce / interface emissions reach
@@ -8191,6 +8198,8 @@ pub fn init_edge_runtime(
         (Vec::new(), None)
     };
 
+    startup.mark("edge_build_and_listeners");
+    startup.log();
     Ok(PyEdge {
         inner: edge_arc,
         executor,
