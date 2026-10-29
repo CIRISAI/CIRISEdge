@@ -1,5 +1,21 @@
 # CIRISEdge Release Notes
 
+# v43.2.3 — release assets publish again
+
+**2026-10-29.** **PATCH** from v43.2.2. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
+No wire or API changes.
+
+- **Link shaping keeps absolute deadlines (#905).** The Poisson cover timer slept a fresh interval
+  from each wake, so on a loaded host every late wake thinned the window and the real share drifted
+  above ρ. Each emission is now due at the previous deadline plus the drawn wait (or now plus the
+  wait, if the previous deadline is more than one window old).
+- **The owner-binding witness accepts either bounded path** (`owned_devices_route_682`): the
+  binding reaches the dark pair either admitted by the receiver or pushed to it, and macOS takes
+  the second path. The receiver-side rung now has its own deterministic witness,
+  `the_receivers_own_owner_admits_a_sibling_binding_on_the_rung_727`.
+- These two tests failed the macOS lanes of the v43.2.0, v43.2.1 and v43.2.2 tag runs, so none of
+  those published release assets.
+
 # v43.2.2 — live chat between two people's nodes, end to end
 
 **2026-10-28.** **PATCH** from v43.2.1. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
