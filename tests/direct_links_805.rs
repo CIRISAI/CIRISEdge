@@ -1837,3 +1837,68 @@ async fn a_host_signing_as_another_id_builds_and_is_refused_by_name() {
         "nothing was dialled, so nothing arrived"
     );
 }
+
+// ─── CIRISEdge#915: a room peer's identity link is brought direct ───────
+
+/// **#915** — a send to a ROOM peer reached through `T` proposes on the link it
+/// shipped over, without an A/V call: the link moves onto a punched interface
+/// and the room's later traffic rides it, with `T` gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_to_a_room_peer_brings_the_link_direct_915() {
+    let mut p = trio("r915", proposer(), DirectLinksConfig::default()).await;
+    // The room is shared both ways; no A/V leg is dialled.
+    let (_spine, _b_addr) = open_call(&p).await;
+    assert!(p.b.transport.should_accept_direct(&p.a.key.key_id));
+
+    p.a.transport
+        .send(&p.b.key.key_id, b"room-915-1")
+        .await
+        .expect("A's send to B ships through T");
+    let up = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("the send's link comes up direct");
+    let DirectPathEvent::Established {
+        peer,
+        link_id,
+        proposed,
+        ..
+    } = up
+    else {
+        unreachable!()
+    };
+    assert!(proposed, "A proposed");
+    assert_eq!(peer.as_deref(), Some(p.b.key.key_id.as_str()));
+    assert!(p.a.transport.direct_link_interface(link_id).is_some());
+    assert_eq!(dl(&p.a.metrics, "direct_link_proposed"), 1);
+
+    // A second send proposes nothing more: the peer is already direct.
+    p.a.transport
+        .send(&p.b.key.key_id, b"room-915-2")
+        .await
+        .expect("the second send");
+    assert_eq!(dl(&p.a.metrics, "direct_link_proposed"), 1);
+
+    // With T gone, the room's traffic still crosses.
+    p.t.stop().await.expect("stop T");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    p.a.transport
+        .send(&p.b.key.key_id, b"room-915-3")
+        .await
+        .expect("a send with T gone rides the punched interface");
+}
+
+/// **#915** — a send to a peer this node shares NO room with proposes
+/// nothing: a proposal reveals this node's public address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_send_outside_every_room_proposes_nothing_915() {
+    let p = trio("n915", proposer(), DirectLinksConfig::default()).await;
+    p.a.transport
+        .send(&p.b.key.key_id, b"no-room-915")
+        .await
+        .expect("A's send to B ships through T");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(dl(&p.a.metrics, "direct_link_proposed"), 0);
+    assert_eq!(p.a.transport.direct_path_state(&p.b.key.key_id), None);
+}

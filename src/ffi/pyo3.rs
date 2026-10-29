@@ -5991,6 +5991,11 @@ enum LocalInstanceRole {
     // production dials while a test trust root is active); an explicit
     // bool is the caller's word.
     baked_canonical_dials = None,
+    // CIRISEdge#915 — direct links. Absent: no facilitator, none served,
+    // upgrades accepted from room peers only (today's behaviour).
+    direct_link_facilitator = None,
+    direct_link_serve_port = None,
+    direct_link_accept = "room_peers",
 ))]
 #[allow(
     clippy::too_many_arguments,
@@ -6208,6 +6213,15 @@ pub fn init_edge_runtime(
     // `node_alias(host_keystore_alias)` and existing deployments are unaffected.
     node_keystore_alias: Option<&str>,
     baked_canonical_dials: Option<bool>,
+    // CIRISEdge#915 — `"host:port"` of the facilitator this node probes when
+    // it proposes a direct link (the server it links to). `None`: it never
+    // proposes.
+    direct_link_facilitator: Option<String>,
+    // CIRISEdge#915 — run a facilitator on this UDP port (a node with a
+    // public address).
+    direct_link_serve_port: Option<u16>,
+    // CIRISEdge#915 — `room_peers` (default), `identified_only` or `off`.
+    direct_link_accept: &str,
 ) -> PyResult<PyEdge> {
     // v0.19.3 (CIRISEdge#49) — validate the HTTPS init params BEFORE
     // any I/O. The mutual-exclusivity check (dev_self_signed vs cert
@@ -7182,6 +7196,20 @@ pub fn init_edge_runtime(
     }
     transport_config.announce_interval = Duration::from_secs(announce_interval_seconds);
     transport_config.local_epoch = local_epoch;
+    // CIRISEdge#915 — direct links. leviculum fixes these at node build, so
+    // they are set here, before the transport is built, or never.
+    transport_config.direct_links = crate::transport::direct_path::DirectLinksConfig {
+        facilitator: direct_link_facilitator,
+        serve_facilitator: direct_link_serve_port,
+        accept: crate::transport::direct_path::DirectAccept::parse(direct_link_accept).ok_or_else(
+            || {
+                PyValueError::new_err(format!(
+                    "init_edge_runtime: direct_link_accept {direct_link_accept:?} is not one of \
+                     room_peers, identified_only, off"
+                ))
+            },
+        )?,
+    };
     // CC 5.4.3 — link shaping policy.
     if let Some(class) = shaping_class.as_deref() {
         use crate::transport::link_shaping::{BudgetClass, ShapingPolicy};
@@ -11883,9 +11911,12 @@ mod pyo3_tier2_tests {
                 None,  // ifac_size
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
-                None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
-                None, // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // node_identity_dir
+                None,         // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None,         // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // CIRISEdge#915 direct_link_facilitator
+                None,         // direct_link_serve_port
+                "room_peers", // direct_link_accept
             )?;
             Ok(edge.signer_key_id())
         });
@@ -12011,9 +12042,12 @@ mod pyo3_tier2_tests {
                 None,  // ifac_size
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
-                None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
-                None, // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // node_identity_dir
+                None,         // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None,         // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // CIRISEdge#915 direct_link_facilitator
+                None,         // direct_link_serve_port
+                "room_peers", // direct_link_accept
             )
             .err()
             .expect("init_edge_runtime must reject non-engine object")
@@ -12178,9 +12212,12 @@ mod pyo3_tier2_tests {
                 None,  // ifac_size
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
-                None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
-                None, // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // node_identity_dir
+                None,         // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None,         // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // CIRISEdge#915 direct_link_facilitator
+                None,         // direct_link_serve_port
+                "room_peers", // direct_link_accept
             )?;
             Ok(())
         });
@@ -12298,9 +12335,12 @@ mod pyo3_tier2_tests {
                 None,  // ifac_size
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
-                None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
-                None, // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // node_identity_dir
+                None,         // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None,         // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // CIRISEdge#915 direct_link_facilitator
+                None,         // direct_link_serve_port
+                "room_peers", // direct_link_accept
             )
             .err()
             .expect("init_edge_runtime must reject pre-v2.8.0-shaped engine")
@@ -12576,9 +12616,12 @@ mod pyo3_tier2_tests {
                 None,  // ifac_size
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
-                None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
-                None, // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // node_identity_dir
+                None,         // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None,         // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // CIRISEdge#915 direct_link_facilitator
+                None,         // direct_link_serve_port
+                "room_peers", // direct_link_accept
             )?;
             Ok(edge.signer_key_id())
         });
@@ -12721,37 +12764,40 @@ mod pyo3_tier2_tests {
                 60,
                 "proxy",
                 None,
-                None,       // https_listen_addr
-                None,       // https_tls_cert_path
-                None,       // https_tls_key_path
-                false,      // https_mtls_required
-                None,       // https_bearer_secret
-                false,      // https_dev_self_signed
-                false,      // disable_reticulum — MUST build the transport to reach the gate
-                None,       // disk_budget_bytes
-                None,       // trust_recursion_depth
-                None,       // local_instance_name
-                None,       // shaping_class (CC 5.4.3 — off)
-                None,       // shaping_rho
-                None,       // shaping_window_seconds
-                None,       // shaping_node_cap_bytes_per_s
-                false,      // require_shaped_links
-                "auto",     // local_instance_role
-                None,       // agent_occurrence_key_id
-                None,       // transport_identity_keyring_dir
-                false,      // enable_transport
-                "advisory", // transport_binding_enforcement
-                false,      // require_local_signer
-                "off",      // bundle_save_gate
-                None,       // own_build_bundle
-                None,       // transit (CIRISEdge#492)
-                None,       // ifac_netname
-                None,       // ifac_passphrase
-                None,       // ifac_size
-                false,      // use_node_identity (CIRISEdge#541 — default)
-                None,       // node_identity_dir
-                None,       // node_keystore_alias (CIRISEdge#548),
-                None,       // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // https_listen_addr
+                None,         // https_tls_cert_path
+                None,         // https_tls_key_path
+                false,        // https_mtls_required
+                None,         // https_bearer_secret
+                false,        // https_dev_self_signed
+                false,        // disable_reticulum — MUST build the transport to reach the gate
+                None,         // disk_budget_bytes
+                None,         // trust_recursion_depth
+                None,         // local_instance_name
+                None,         // shaping_class (CC 5.4.3 — off)
+                None,         // shaping_rho
+                None,         // shaping_window_seconds
+                None,         // shaping_node_cap_bytes_per_s
+                false,        // require_shaped_links
+                "auto",       // local_instance_role
+                None,         // agent_occurrence_key_id
+                None,         // transport_identity_keyring_dir
+                false,        // enable_transport
+                "advisory",   // transport_binding_enforcement
+                false,        // require_local_signer
+                "off",        // bundle_save_gate
+                None,         // own_build_bundle
+                None,         // transit (CIRISEdge#492)
+                None,         // ifac_netname
+                None,         // ifac_passphrase
+                None,         // ifac_size
+                false,        // use_node_identity (CIRISEdge#541 — default)
+                None,         // node_identity_dir
+                None,         // node_keystore_alias (CIRISEdge#548),
+                None,         // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // CIRISEdge#915 direct_link_facilitator
+                None,         // direct_link_serve_port
+                "room_peers", // direct_link_accept
             );
             // Cleanup: drop OUR engine from the singleton so the next real-engine
             // sibling test constructs cleanly (one persist engine per process).
@@ -12884,9 +12930,12 @@ mod pyo3_tier2_tests {
                 None,  // ifac_size
                 false, // use_node_identity (CIRISEdge#541 — default preserves
                 // the engine-derived transport identity byte-for-byte)
-                None, // node_identity_dir
-                None, // node_keystore_alias (CIRISEdge#548 — legacy derivation),
-                None, // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // node_identity_dir
+                None,         // node_keystore_alias (CIRISEdge#548 — legacy derivation),
+                None,         // CIRISEdge#661 baked_canonical_dials: auto
+                None,         // CIRISEdge#915 direct_link_facilitator
+                None,         // direct_link_serve_port
+                "room_peers", // direct_link_accept
             )?;
             Ok(edge.signer_key_id())
         });
