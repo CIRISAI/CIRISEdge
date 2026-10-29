@@ -129,8 +129,20 @@ type WireTap = Vec<([u8; 16], Vec<u8>)>;
 /// Most opened frames held on one link while its identity is unproven.
 pub const HELD_FRAMES_MAX: usize = 32;
 
-/// Most opened bytes held on one link while its identity is unproven.
-pub const HELD_BYTES_MAX: usize = 256 * 1024;
+/// Most bytes held on one link while it awaits its keys or its identity:
+/// room for one frame of the largest size edge carries. A link carries one
+/// Resource at a time and its dialler waits for that Resource's proof before
+/// the next, so the frame that overtakes the handshake can be a whole
+/// envelope. A smaller bound dropped exactly that frame, after its sender had
+/// counted it delivered (a 256 KiB bound lost every first Resource over
+/// 256 KiB that reached the event loop ahead of its link's last handshake
+/// part).
+pub const HELD_BYTES_MAX: usize = crate::transport::frame_fragment::MAX_BODY_BYTES + SEAL_OVERHEAD;
+
+/// Most bytes held across ALL links in one hold, so links that never finish
+/// their handshake cannot pin unbounded memory: a few links' worth of
+/// largest frames. A frame past it is dropped by name.
+pub const HELD_BYTES_NODE_MAX: usize = 8 * HELD_BYTES_MAX;
 
 /// How long an ordinary frame on a peer-dialled link waits for the link's
 /// attribution before the first-contact carve-out judges the link as
@@ -1073,9 +1085,14 @@ impl LinkSeals {
     }
 
     /// Hold one SEALED Resource on a link awaiting its handshake; `false`
-    /// when it does not fit [`HELD_FRAMES_MAX`] / [`HELD_BYTES_MAX`].
+    /// when it does not fit [`HELD_FRAMES_MAX`] / [`HELD_BYTES_MAX`] /
+    /// [`HELD_BYTES_NODE_MAX`].
     fn hold_before_keys(&self, link: [u8; 16], sealed: &[u8]) -> bool {
         let mut held = self.before_keys();
+        let node_bytes: usize = held.values().map(|(_, b)| *b).sum();
+        if node_bytes + sealed.len() > HELD_BYTES_NODE_MAX {
+            return false;
+        }
         let (frames, bytes) = held.entry(link).or_default();
         if frames.len() >= HELD_FRAMES_MAX || *bytes + sealed.len() > HELD_BYTES_MAX {
             return false;
@@ -1102,13 +1119,18 @@ impl LinkSeals {
     /// first; judged then, the link would read as unattributed and the
     /// first-contact carve-out would refuse a frame that is not. Held frames
     /// are replayed in order once the identity is proven ([`Self::take_held`]).
-    /// Bounded by [`HELD_FRAMES_MAX`] / [`HELD_BYTES_MAX`] per link: `false`
+    /// Bounded by [`HELD_FRAMES_MAX`] / [`HELD_BYTES_MAX`] per link and
+    /// [`HELD_BYTES_NODE_MAX`] across links: `false`
     /// when this frame does not fit (the caller drops it by name).
     pub fn hold(&self, link: [u8; 16], is_resource: bool, plaintext: Vec<u8>) -> bool {
         let mut held = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let node_bytes: usize = held.values().map(|h| h.bytes).sum();
+        if node_bytes + plaintext.len() > HELD_BYTES_NODE_MAX {
+            return false;
+        }
         let h = held.entry(link).or_default();
         if h.frames.len() >= HELD_FRAMES_MAX || h.bytes + plaintext.len() > HELD_BYTES_MAX {
             return false;
@@ -1153,8 +1175,12 @@ impl LinkSeals {
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let node_bytes: usize = held.values().map(|h| h.bytes).sum();
         let h = held.entry(link).or_default();
-        if h.frames.len() >= HELD_FRAMES_MAX || h.bytes + plaintext.len() > HELD_BYTES_MAX {
+        if h.frames.len() >= HELD_FRAMES_MAX
+            || h.bytes + plaintext.len() > HELD_BYTES_MAX
+            || node_bytes + plaintext.len() > HELD_BYTES_NODE_MAX
+        {
             let first = h.awaiting.take().map(|(_, first)| first);
             held.remove(&link);
             return Err(first.unwrap_or(refusal));

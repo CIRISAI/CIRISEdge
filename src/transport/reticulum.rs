@@ -6130,6 +6130,50 @@ impl ReticulumTransport {
         }
     }
 
+    /// CIRISEdge#915 — after a send to `destination_key_id` shipped on its
+    /// identity `link`, propose bringing that link direct when the peer shares
+    /// a room with this node and the link crosses a transport node (CC 5.4.6:
+    /// where the endpoints can bring the link direct, it MUST be).
+    ///
+    /// Never waits on the outcome and never fails the send: the proposal is
+    /// two channel signals, and its outcome reaches the tracker, which backs a
+    /// failed peer off. Only room peers, because a proposal reveals this
+    /// node's public address to the peer.
+    async fn propose_direct_to_room_peer(
+        &self,
+        destination_key_id: &str,
+        link: LinkId,
+        candidates: &[DialCandidate],
+    ) {
+        if !self.direct_paths.config.proposes() {
+            return;
+        }
+        let shares_room = self
+            .scope_addresses
+            .get()
+            .is_some_and(|table| table.shares_group_with(destination_key_id));
+        if !shares_room {
+            return;
+        }
+        // A one-hop neighbour (a shared interface) is already direct.
+        if candidates
+            .iter()
+            .any(|c| self.node.hops_to(&c.dest_hash) == Some(1))
+        {
+            return;
+        }
+        if self
+            .direct_paths
+            .tracker()
+            .admit(destination_key_id, link, std::time::Instant::now())
+            .is_err()
+        {
+            return;
+        }
+        // The outcome is the tracker's; nothing here waits on it.
+        let _ = self.start_or_join_proposal(destination_key_id, link).await;
+    }
+
     /// CIRISEdge#805 item 8 — the proposal half of [`Self::ensure_direct_path`]:
     /// start a proposal to `destination_key_id` on its identity `link`, or join
     /// the one already running. `Ok` is the link whose outcome to await and the
@@ -6215,8 +6259,8 @@ impl ReticulumTransport {
                     key_id = %destination_key_id,
                     link = %hex::encode(link.as_bytes()),
                     channel_limit_before = ?before,
-                    "direct path: PROPOSED on the identity link to a call member \
-                     (CIRISEdge#805 item 8)"
+                    "direct path: PROPOSED on the identity link to a call member or room \
+                     peer (CIRISEdge#805 item 8, #915)"
                 );
                 Ok((link, rx))
             }
@@ -9033,6 +9077,10 @@ impl Transport for ReticulumTransport {
             .await;
         claim.release().await;
         shipped.map_err(ShipError::into_transport)?;
+        // CIRISEdge#915 — a room peer reached through a transport node: try
+        // to bring this link direct for the room's later traffic.
+        self.propose_direct_to_room_peer(destination_key_id, link_id, &candidates)
+            .await;
 
         Ok(TransportSendOutcome::Delivered)
     }

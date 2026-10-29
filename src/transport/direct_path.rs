@@ -39,9 +39,16 @@
 //! # Scope of a proposal
 //!
 //! Proposing reveals this node's public address to the peer, so edge proposes
-//! ONLY when it dials an A/V leg to a member of the call's group
-//! ([`crate::transport::reticulum::ReticulumTransport::open_av_link`]) and only
-//! on the identity link to that member. Nothing else proposes.
+//! only to a peer it shares a room with, and only on the identity link to it:
+//!
+//! - when it dials an A/V leg to a member of the call's group
+//!   ([`crate::transport::reticulum::ReticulumTransport::open_av_link`]),
+//!   waiting up to [`DIRECT_PATH_BUDGET`] for the outcome;
+//! - after a send to a room peer ships over a link that crosses a transport
+//!   node (CIRISEdge#915), without waiting: the room's later traffic rides
+//!   the direct link once it is up.
+//!
+//! Nothing else proposes.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -126,6 +133,19 @@ pub struct DirectLinksConfig {
     /// Who this node accepts an upgrade from ([`DirectAccept`]; default room
     /// peers only).
     pub accept: DirectAccept,
+}
+
+impl DirectAccept {
+    /// Parse an operator's setting: `room_peers`, `identified_only` or `off`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "room_peers" => Some(Self::RoomPeers),
+            "identified_only" => Some(Self::IdentifiedOnly),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
 }
 
 impl DirectLinksConfig {
@@ -673,6 +693,19 @@ mod tests {
         );
         assert!(s.facilitator.is_none());
         assert!(s.facilitator_port.is_none());
+    }
+
+    #[test]
+    fn every_accept_setting_parses_and_nothing_else_does() {
+        for (s, want) in [
+            ("room_peers", DirectAccept::RoomPeers),
+            ("identified_only", DirectAccept::IdentifiedOnly),
+            ("off", DirectAccept::Off),
+        ] {
+            assert_eq!(DirectAccept::parse(s), Some(want));
+        }
+        assert_eq!(DirectAccept::parse("on"), None);
+        assert_eq!(DirectAccept::parse(""), None);
     }
 
     #[test]

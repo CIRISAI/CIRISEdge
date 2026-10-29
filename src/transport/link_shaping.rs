@@ -507,6 +507,9 @@ pub struct LinkShaper {
     real: AtomicU64,
     cover: AtomicU64,
     stopped: std::sync::atomic::AtomicBool,
+    /// When the next frame is due, as an absolute instant (see
+    /// [`Self::next_emission`]).
+    next_due: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl std::fmt::Debug for LinkShaper {
@@ -542,7 +545,34 @@ impl LinkShaper {
             real: AtomicU64::new(0),
             cover: AtomicU64::new(0),
             stopped: std::sync::atomic::AtomicBool::new(false),
+            next_due: Mutex::new(None),
         }
+    }
+
+    /// The instant the next frame is due: the previous frame's due instant
+    /// plus one Poisson interval.
+    ///
+    /// The timer used to sleep each interval relative to the moment it woke.
+    /// A late wake (a starved runtime, a busy phone) then delayed every later
+    /// frame too, so a window emitted fewer than λ·W frames while the real
+    /// budget stayed the nominal `ceil(ρ·λ·W)`, and the real share on the wire
+    /// rose above ρ: 0.35–0.39 at ρ = 0.25 on one core (CIRISEdge#905).
+    /// Deadlines on the Poisson process's own arrival times catch up after a
+    /// late wake, so the window emits its λ·W frames and the budget's share
+    /// holds. A stall longer than one window is not repaid with a burst of
+    /// cover: the schedule restarts from `now`.
+    fn schedule_next(&self, wait: Duration, now: tokio::time::Instant) -> tokio::time::Instant {
+        let mut next = self
+            .next_due
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let from = match *next {
+            Some(prev) if now.saturating_duration_since(prev) <= self.agreement.window => prev,
+            _ => now,
+        };
+        let due = from + wait;
+        *next = Some(due);
+        due
     }
 
     /// The agreement in force.
@@ -611,15 +641,16 @@ impl LinkShaper {
             .poisson
             .next_interval(&self.scope)
             .unwrap_or(Duration::from_secs(1));
+        let due = self.schedule_next(wait, tokio::time::Instant::now());
         tokio::select! {
-            () = tokio::time::sleep(wait) => {}
+            () = tokio::time::sleep_until(due) => {}
             () = self.notify.notified() => {
                 if self.stopped.load(Ordering::Relaxed) {
                     return Emission::Stopped;
                 }
                 // A new body changes nothing about WHEN the next frame goes:
                 // the timer is the timer. Finish the interval.
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep_until(due).await;
             }
         }
         if self.stopped.load(Ordering::Relaxed) {

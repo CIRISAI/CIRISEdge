@@ -416,6 +416,84 @@ fn request_and_response_lanes_ride_as_one_msgpack_bin_e1() {
     ));
 }
 
+/// The burst that failed `link_pool_819` on macOS: a 256 KiB Resource on a
+/// fresh lane overtook the lane's last handshake part. Sealed, it is 256 KiB
+/// plus the seal, and the old 256 KiB bound dropped it after its sender had
+/// counted it delivered. One frame of the largest size edge carries fits.
+#[test]
+fn a_whole_envelope_that_overtakes_the_handshake_is_held_and_opens() {
+    let a = seals(0x11, DIALLER);
+    let b = seals(0x22, DIALLED);
+    a.begin_initiator(LINK);
+    assert!(b.begin_responder(LINK));
+    let (frames, transit) = a
+        .initiate(LINK, DIALLER, DIALLED, b.secret().pair(), LIMIT)
+        .expect("initiate");
+    a.install_initiator(LINK, transit);
+    let (last, first) = frames.split_last().expect("a handshake");
+    for f in first {
+        assert!(matches!(
+            b.inbound(LINK, Lane::Channel, f, false),
+            Inbound::Pending
+        ));
+    }
+    let body = vec![0x5a_u8; 256 * 1024];
+    let row = a.seal(LINK, Lane::Resource, &body).expect("seal");
+    assert!(
+        matches!(b.open(LINK, Lane::Resource, &row), Inbound::HeldBeforeKeys),
+        "a {}-byte sealed Resource is held, not dropped",
+        row.len()
+    );
+    assert!(matches!(
+        b.inbound(LINK, Lane::Channel, last, false),
+        Inbound::Keyed { .. }
+    ));
+    let held = b.take_before_keys(LINK);
+    match b.open(LINK, Lane::Resource, &held[0]) {
+        Inbound::Open(p) => assert_eq!(p, body),
+        other => panic!("{other:?}"),
+    }
+
+    // The largest frame edge carries fits one link's hold, too.
+    let c = seals(0x33, DIALLED);
+    assert!(c.begin_responder(LINK));
+    assert!(matches!(
+        c.open(LINK, Lane::Resource, &vec![0u8; HELD_BYTES_MAX]),
+        Inbound::HeldBeforeKeys
+    ));
+    assert!(
+        c.hold(LINK, true, vec![0; HELD_BYTES_MAX]),
+        "the identity hold takes one largest frame too"
+    );
+}
+
+/// Links that never finish their handshake cannot pin unbounded memory:
+/// past [`HELD_BYTES_NODE_MAX`] across links, a frame is dropped by name.
+#[test]
+fn the_holds_are_bounded_across_links() {
+    let c = seals(0x33, DIALLED);
+    let fit = HELD_BYTES_NODE_MAX / HELD_BYTES_MAX;
+    for i in 0..=fit {
+        let link = [u8::try_from(i).expect("few links"); 16];
+        assert!(c.begin_responder(link));
+        let out = c.open(link, Lane::Resource, &vec![0u8; HELD_BYTES_MAX]);
+        if i < fit {
+            assert!(matches!(out, Inbound::HeldBeforeKeys), "link {i}: {out:?}");
+        } else {
+            assert!(
+                matches!(out, Inbound::Drop(l) if l == crate::observability::LINK_SEAL_DROPPED_BEFORE_KEYS),
+                "past the node bound: {out:?}"
+            );
+        }
+    }
+    let d = seals(0x44, DIALLED);
+    for i in 0..fit {
+        let link = [u8::try_from(i).expect("few links"); 16];
+        assert!(d.hold(link, false, vec![0; HELD_BYTES_MAX]), "link {i}");
+    }
+    assert!(!d.hold([0xee; 16], false, vec![0; HELD_BYTES_MAX]));
+}
+
 #[test]
 fn the_identity_hold_is_bounded_and_replays_in_order_e1() {
     let b = seals(0x22, DIALLED);

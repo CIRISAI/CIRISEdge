@@ -758,18 +758,67 @@ async fn chat_row_raw(
     members: serde_json::Map<String, serde_json::Value>,
     asserted_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<Attestation, String> {
+    chat_row_shaped(
+        author,
+        room,
+        dimension,
+        members,
+        asserted_at,
+        RowShape::SAID,
+    )
+    .await
+}
+
+/// What kind of row a chat producer writes, and at which audience.
+#[derive(Clone, Copy)]
+struct RowShape {
+    attestation_type: &'static str,
+    cohort_scope: &'static str,
+    tier: &'static str,
+}
+
+impl RowShape {
+    /// A thing said: a `scores` row at `self`, shared to the room by a
+    /// widening.
+    const SAID: Self = Self {
+        attestation_type: ciris_persist::federation::types::attestation_type::SCORES,
+        cohort_scope: ciris_persist::federation::types::cohort_scope::SELF,
+        tier: ciris_persist::federation::types::attestation_tier::LOCAL,
+    };
+
+    /// A composer over a message already in the room, born AT the room and
+    /// at federation tier (CIRISPersist#1155). Born `self`, it would reach the
+    /// room only through a widening, and a widening is a `supersedes` OF the
+    /// composer: its own type and target would reach nobody else.
+    const fn composer(attestation_type: &'static str) -> Self {
+        Self {
+            attestation_type,
+            cohort_scope: ciris_persist::federation::types::cohort_scope::COMMUNITY,
+            tier: ciris_persist::federation::types::attestation_tier::FEDERATION,
+        }
+    }
+}
+
+async fn chat_row_shaped(
+    author: &crate::identity::LocalSigner,
+    room: Option<&str>,
+    dimension: &str,
+    members: serde_json::Map<String, serde_json::Value>,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    shape: RowShape,
+) -> Result<Attestation, String> {
     use crate::replication::attestation_bind::{
         bind_attestation_envelope, render_signed_instant, truncate_to_substrate_resolution,
         AttestationColumns,
     };
     let author_key_id = author.key_id.as_str();
     let asserted_at = truncate_to_substrate_resolution(asserted_at);
-    let mut envelope = serde_json::json!({
-        "dimension": dimension,
+    let mut envelope = serde_json::json!({ "dimension": dimension });
+    if shape.attestation_type == ciris_persist::federation::types::attestation_type::SCORES {
         // A `scores` row carries a score; the magnitude is not load-bearing
         // for chat, and a positive constant is the honest "this was said".
-        "score": 1.0,
-    });
+        envelope["score"] = serde_json::json!(1.0);
+    }
     if let Some(room) = room {
         // Inserted rather than written as `Option`, so an absent room leaves
         // the member OUT — `serde_json` would have serialized `None` as an
@@ -819,10 +868,10 @@ async fn chat_row_raw(
         &AttestationColumns {
             attestation_id: &attestation_id,
             attesting_key_id: author_key_id,
-            attestation_type: "scores",
+            attestation_type: shape.attestation_type,
             attested_key_id: author_key_id,
             subject_key_ids: &subjects,
-            cohort_scope: ciris_persist::federation::types::cohort_scope::SELF,
+            cohort_scope: shape.cohort_scope,
             weight: None,
         },
     );
@@ -835,7 +884,7 @@ async fn chat_row_raw(
         attestation_id,
         attesting_key_id: author_key_id.to_owned(),
         attested_key_id: author_key_id.to_owned(),
-        attestation_type: "scores".to_owned(),
+        attestation_type: shape.attestation_type.to_owned(),
         weight: None,
         asserted_at,
         expires_at: None,
@@ -849,10 +898,11 @@ async fn chat_row_raw(
         persist_row_hash: String::new(),
         subject_key_ids: subjects,
         withdraws_admission_rule: None,
-        cohort_scope: ciris_persist::federation::types::cohort_scope::SELF.to_owned(),
-        // LOCAL tier: tier is REPLICABILITY, cohort_scope is VISIBILITY. The
-        // share is what enters the mesh and widens to the room.
-        tier: ciris_persist::federation::types::attestation_tier::LOCAL.to_owned(),
+        cohort_scope: shape.cohort_scope.to_owned(),
+        // Tier is REPLICABILITY, cohort_scope is VISIBILITY. A thing said is
+        // LOCAL until the share enters it into the mesh and widens it to the
+        // room; a composer is born in the room at federation tier.
+        tier: shape.tier.to_owned(),
         promoted_at: None,
         additional_scrubs: Vec::new(),
     })
@@ -897,7 +947,33 @@ pub async fn chat_message_attestation_in(
     // One truncation, feeding both the row's column and the AAD. Deriving
     // them separately is how they drift.
     let at = truncate_to_substrate_resolution(asserted_at);
+    let (members, sealed) = sealed_body_members(author, room, body, at, store).await?;
+    let row = chat_row(author, room, CHAT_MESSAGE_DIMENSION, members, at).await?;
+    // `sealed` is returned rather than dropped so the caller can see
+    // `excluded` — who, of this room, cannot read what was just written.
+    // persist: "a caller that ignores this is ignoring who cannot read what
+    // it just wrote."
+    Ok((row, sealed))
+}
 
+/// Seal `body` under `room`'s DEK for `author` at `at` (already truncated to
+/// the substrate's resolution) and return the row members that carry it.
+///
+/// # Errors
+/// Seal failure, or a seal nobody could open (CIRISEdge#599).
+async fn sealed_body_members(
+    author: &crate::identity::LocalSigner,
+    room: &str,
+    body: &str,
+    at: chrono::DateTime<chrono::Utc>,
+    store: &dyn crate::group_content::GroupContentStore,
+) -> Result<
+    (
+        serde_json::Map<String, serde_json::Value>,
+        crate::group_content::SealedContent,
+    ),
+    String,
+> {
     let sealed = store
         .seal(crate::group_content::SealRequest {
             cohort_scope: ciris_persist::federation::types::cohort_scope::COMMUNITY,
@@ -953,13 +1029,255 @@ pub async fn chat_message_attestation_in(
         FIELD_CONTENT_TYPE.to_owned(),
         serde_json::json!("text/plain"),
     );
+    Ok((members, sealed))
+}
 
-    let row = chat_row(author, room, CHAT_MESSAGE_DIMENSION, members, at).await?;
-    // `sealed` is returned rather than dropped so the caller can see
-    // `excluded` — who, of this room, cannot read what was just written.
-    // persist: "a caller that ignores this is ignoring who cannot read what
-    // it just wrote."
+/// The member a chat `withdraws` / `recants` carries its reason code under.
+/// A composer sits at the room's scope, where its members are plaintext to
+/// every holder, so the reason is a code from [`ComposerReason`], never free
+/// text.
+pub const FIELD_REASON_CODE: &str = "reason_code";
+
+/// Why an author withdrew or recanted a message: a closed set, because the
+/// row it rides is plaintext to every holder of the room.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComposerReason {
+    /// No reason given. Valid on both composers.
+    Unspecified,
+    /// Withdraw: sent by mistake.
+    SentInError,
+    /// Withdraw: the author no longer wants it held.
+    Privacy,
+    /// Withdraw: no longer current.
+    Outdated,
+    /// Recant: the author says it was false.
+    Incorrect,
+    /// A code this build does not know, as read off a row from a newer one.
+    /// Never produced.
+    Unknown(String),
+}
+
+impl ComposerReason {
+    /// The code as written on the row.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::SentInError => "sent_in_error",
+            Self::Privacy => "privacy",
+            Self::Outdated => "outdated",
+            Self::Incorrect => "incorrect",
+            Self::Unknown(code) => code,
+        }
+    }
+
+    /// Read a code off a row. An unknown code is kept, not refused, so a
+    /// newer client's code does not fail an older reader.
+    #[must_use]
+    pub fn parse(code: &str) -> Self {
+        match code {
+            "unspecified" => Self::Unspecified,
+            "sent_in_error" => Self::SentInError,
+            "privacy" => Self::Privacy,
+            "outdated" => Self::Outdated,
+            "incorrect" => Self::Incorrect,
+            other => Self::Unknown(other.to_owned()),
+        }
+    }
+
+    /// Whether this code may ride a composer of `attestation_type`.
+    #[must_use]
+    pub fn allowed_on(&self, attestation_type: &str) -> bool {
+        use ciris_persist::federation::types::attestation_type as ty;
+        match self {
+            Self::Unspecified => true,
+            Self::SentInError | Self::Privacy | Self::Outdated => attestation_type == ty::WITHDRAWS,
+            Self::Incorrect => attestation_type == ty::RECANTS,
+            Self::Unknown(_) => false,
+        }
+    }
+}
+
+/// **Whether `composer` is the author's own act over `target`**: the same
+/// attester, the same room, and the composer names `target`. The one rule
+/// both [`rows_in_room`] and a caller deciding what a viewer may do apply.
+///
+/// The attester is the author: from v19.0.0 every chat row, and every
+/// widening of one, is signed by the person who said it. A composer by anyone
+/// else changes nothing, in a room of two or of twenty.
+#[must_use]
+pub fn composer_is_authors(composer: &Attestation, target: &Attestation) -> bool {
+    composer.attesting_key_id == target.attesting_key_id
+        && room_of(composer).is_some()
+        && room_of(composer) == room_of(target)
+        && ciris_persist::federation::precedence::references_attestation_id_from_envelope(
+            &composer.attestation_envelope,
+        ) == Some(target.attestation_id.as_str())
+}
+
+/// Refuse a composer `author` may not write over `target` in `room`.
+fn check_composer_target(
+    author: &crate::identity::LocalSigner,
+    room: &str,
+    target: &Attestation,
+) -> Result<(), String> {
+    if dimension_of(target) != Some(CHAT_MESSAGE_DIMENSION) {
+        return Err(format!(
+            "row {} is not a chat message ({:?})",
+            target.attestation_id,
+            dimension_of(target)
+        ));
+    }
+    if room_of(target).as_deref() != Some(room) {
+        return Err(format!(
+            "row {} is not in room {room} ({:?})",
+            target.attestation_id,
+            room_of(target)
+        ));
+    }
+    if target.attesting_key_id != author.key_id {
+        return Err(format!(
+            "row {} was said by {}, not {}: only its author revises or retracts a message",
+            target.attestation_id, target.attesting_key_id, author.key_id
+        ));
+    }
+    Ok(())
+}
+
+/// **The author revises a message**: a `supersedes` naming `target`, with
+/// `new_body` sealed exactly as [`chat_message_attestation_in`] seals a body.
+///
+/// `target` is the current head of the message: the placed row readers hold
+/// ([`ChatMessage::attestation_id`]), or the latest revision of it. Two
+/// composers by one author naming the same row are one composer to persist's
+/// replay dedup, so a second revision naming the original is dropped.
+///
+/// The row is born in the room at federation tier (CIRISPersist#1155):
+/// written with `put_attestation`, not shared. Sharing a `self` row widens
+/// it, and the widening would carry neither this row's type nor its target.
+///
+/// # Errors
+/// `target` is not `author`'s chat message in `room`; seal failure, a seal
+/// nobody could open, canonicalization or signing failure.
+pub async fn chat_message_supersede_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    target: &Attestation,
+    new_body: &str,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    store: &dyn crate::group_content::GroupContentStore,
+) -> Result<(Attestation, crate::group_content::SealedContent), String> {
+    use crate::replication::attestation_bind::truncate_to_substrate_resolution;
+    use ciris_persist::federation::envelope::paths;
+    use ciris_persist::federation::types::attestation_type as ty;
+    let room = community_key_id;
+    check_composer_target(author, room, target)?;
+    let at = truncate_to_substrate_resolution(asserted_at);
+    let (mut members, sealed) = sealed_body_members(author, room, new_body, at, store).await?;
+    members.insert(
+        paths::REFERENCES_ATTESTATION_ID.to_owned(),
+        serde_json::json!(target.attestation_id),
+    );
+    let row = chat_row_shaped(
+        author,
+        Some(room),
+        CHAT_MESSAGE_DIMENSION,
+        members,
+        at,
+        RowShape::composer(ty::SUPERSEDES),
+    )
+    .await?;
     Ok((row, sealed))
+}
+
+/// **The author withdraws a message**: a `withdraws` naming `target` (the
+/// current head, as for [`chat_message_supersede_in`]), retracting it
+/// without saying it was false. Born in the room at federation tier.
+///
+/// # Errors
+/// `target` is not `author`'s chat message in `room`; `reason` is not a
+/// withdraw code; canonicalization or signing failure.
+pub async fn chat_message_withdraw_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    target: &Attestation,
+    reason: &ComposerReason,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Attestation, String> {
+    retraction_in(
+        author,
+        community_key_id,
+        target,
+        reason,
+        asserted_at,
+        ciris_persist::federation::types::attestation_type::WITHDRAWS,
+    )
+    .await
+}
+
+/// **The author recants a message**: a `recants` naming `target` (the
+/// current head), saying it was false. Outranks a withdraw and a revision of
+/// the same row (CEG §6.1). Born in the room at federation tier.
+///
+/// # Errors
+/// As [`chat_message_withdraw_in`], with recant codes.
+pub async fn chat_message_recant_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    target: &Attestation,
+    reason: &ComposerReason,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Attestation, String> {
+    retraction_in(
+        author,
+        community_key_id,
+        target,
+        reason,
+        asserted_at,
+        ciris_persist::federation::types::attestation_type::RECANTS,
+    )
+    .await
+}
+
+async fn retraction_in(
+    author: &crate::identity::LocalSigner,
+    room: &str,
+    target: &Attestation,
+    reason: &ComposerReason,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    attestation_type: &'static str,
+) -> Result<Attestation, String> {
+    check_composer_target(author, room, target)?;
+    if !reason.allowed_on(attestation_type) {
+        return Err(format!(
+            "reason `{}` is not a `{attestation_type}` code",
+            reason.as_str()
+        ));
+    }
+    // persist's own composer shape, so the members its precedence fold joins
+    // on are spelled by the authority; a recant differs only in `kind`.
+    let serde_json::Value::Object(mut members) =
+        ciris_persist::federation::replication::withdraws_attestation_envelope(
+            &target.attestation_id,
+            &target.attestation_type,
+        )
+    else {
+        return Err("persist's composer envelope is not an object".to_owned());
+    };
+    members.insert("kind".to_owned(), serde_json::json!(attestation_type));
+    members.insert(
+        FIELD_REASON_CODE.to_owned(),
+        serde_json::json!(reason.as_str()),
+    );
+    chat_row_shaped(
+        author,
+        Some(room),
+        CHAT_MESSAGE_DIMENSION,
+        members,
+        asserted_at,
+        RowShape::composer(attestation_type),
+    )
+    .await
 }
 
 /// CIRISEdge#805 item 6 — **the attendee's own call row**: `author` attended
@@ -1167,6 +1485,13 @@ fn room_of(a: &Attestation) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// A `withdraws` or `recants`: it retracts a row and is never itself a
+/// thing said.
+fn is_retraction(a: &Attestation) -> bool {
+    use ciris_persist::federation::types::attestation_type as ty;
+    a.attestation_type == ty::WITHDRAWS || a.attestation_type == ty::RECANTS
+}
+
 fn dimension_of(a: &Attestation) -> Option<&str> {
     a.attestation_envelope
         .get(ciris_persist::federation::envelope::paths::DIMENSION)
@@ -1229,18 +1554,48 @@ pub async fn rows_in_room(
             rows.extend(page);
         }
     }
-    let superseded: std::collections::BTreeSet<String> = rows
+    // A row is folded out when its author's own composer names it: a
+    // widening or a revision (`supersedes`) replaces it, a `withdraws` or
+    // `recants` retracts it. A chain folds to its head, since each link names
+    // the one before. A composer by anyone else names nothing here
+    // ([`composer_is_authors`]), and one whose target this node does not hold
+    // waits for it.
+    let by_id: std::collections::BTreeMap<&str, &Attestation> = rows
         .iter()
-        .filter_map(|a| {
-            a.attestation_envelope
-                .get(ciris_persist::federation::envelope::paths::REFERENCES_ATTESTATION_ID)
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-        })
+        .map(|a| (a.attestation_id.as_str(), a))
         .collect();
+    let mut folded = std::collections::BTreeSet::<String>::new();
+    let mut foreign = std::collections::BTreeSet::<String>::new();
+    for c in &rows {
+        let Some(target) =
+            ciris_persist::federation::precedence::references_attestation_id_from_envelope(
+                &c.attestation_envelope,
+            )
+        else {
+            continue;
+        };
+        let Some(t) = by_id.get(target) else {
+            continue;
+        };
+        if composer_is_authors(c, t) {
+            folded.insert(target.to_owned());
+        } else {
+            // Someone else's composer over this message is not a thing said
+            // either: it is dropped, not shown as an empty message.
+            tracing::debug!(
+                composer = %c.attestation_id,
+                by = %c.attesting_key_id,
+                target,
+                author = %t.attesting_key_id,
+                "a composer over another author's message is ignored"
+            );
+            foreign.insert(c.attestation_id.clone());
+        }
+    }
     let mut out: Vec<Attestation> = rows
         .into_iter()
-        .filter(|a| !superseded.contains(&a.attestation_id))
+        .filter(|a| !folded.contains(&a.attestation_id) && !foreign.contains(&a.attestation_id))
+        .filter(|a| !is_retraction(a))
         .filter(|a| room_of(a).as_deref() == Some(room))
         .filter(|a| dimension_of(a) == Some(dimension))
         .collect();
@@ -1790,11 +2145,14 @@ pub struct ChatMessage {
     /// The `self` row this widening supersedes, when it is one. Present on
     /// every row a peer receives; absent on the author's own `self` copy.
     pub widens: Option<String>,
+    /// The message this row revises, when it is an author's revision
+    /// ([`chat_message_supersede_in`]): the row it replaced in the room.
+    pub edits: Option<String>,
 }
 
 impl ChatMessage {
     /// Recognise a chat row in `room`, or `None` if the row is not a chat
-    /// message there.
+    /// message there. A `withdraws` or `recants` in the room is not one.
     ///
     /// **Takes no room key.** Content lives in the group's blob store, so
     /// recognising a row needs no key and touches no store — a caller
@@ -1807,7 +2165,10 @@ impl ChatMessage {
     /// from a room with no record anywhere of why.
     #[must_use]
     pub fn from_row(a: &Attestation, room: &str) -> Option<Self> {
-        if dimension_of(a) != Some(CHAT_MESSAGE_DIMENSION) || room_of(a).as_deref() != Some(room) {
+        if dimension_of(a) != Some(CHAT_MESSAGE_DIMENSION)
+            || room_of(a).as_deref() != Some(room)
+            || is_retraction(a)
+        {
             return None;
         }
         let env = &a.attestation_envelope;
@@ -1841,6 +2202,11 @@ impl ChatMessage {
     /// here that has already been got wrong once (CIRISEdge#564).
     fn from_parts(a: &Attestation, env: &serde_json::Value, body: Body) -> Self {
         use ciris_persist::federation::envelope::paths;
+        let references = env
+            .get(paths::REFERENCES_ATTESTATION_ID)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let widening = env.get(paths::WIDENED_AT).is_some();
         Self {
             attestation_id: a.attestation_id.clone(),
             // CIRISEdge#564 — the ATTESTER, always. persist established this
@@ -1856,10 +2222,14 @@ impl ChatMessage {
                 .map(str::to_owned),
             body,
             asserted_at: a.asserted_at,
-            widens: env
-                .get(paths::REFERENCES_ATTESTATION_ID)
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned),
+            // Both are `supersedes`; a widening carries `widened_at` and a
+            // revision does not.
+            widens: references.clone().filter(|_| widening),
+            edits: references.filter(|_| {
+                !widening
+                    && a.attestation_type
+                        == ciris_persist::federation::types::attestation_type::SUPERSEDES
+            }),
         }
     }
 

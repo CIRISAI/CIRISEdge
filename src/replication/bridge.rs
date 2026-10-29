@@ -7748,9 +7748,45 @@ impl FederationDirectoryReplicationBridge {
         let env = row
             .get("attestation_envelope")
             .unwrap_or(&serde_json::Value::Null);
-        if !is_owner_binding_envelope(env)
-            || Self::attestation_cohort_scope(row) != cohort_scope::FEDERATION
+        if Self::attestation_cohort_scope(row) != cohort_scope::FEDERATION {
+            return false;
+        }
+        // CIRISEdge#907 — the other half of a published person's public
+        // allegiance: their ROOT ACCEPTANCE (`delegates_to(owner → R)`,
+        // `trust:accepts:v1`, CC 4.4.3.8 item 3). Without it a peer that met
+        // the person only through this relay can resolve their node but never
+        // a root in common with it ("no mutual trust root"). Relayed when the
+        // acceptor is an owner this relay publishes on the Key plane, and only
+        // while the acceptance is live: its root is one persist's
+        // `trusted_roots_of` still counts for that owner.
+        if ty == Some(attestation_type::DELEGATES_TO)
+            && env.get("dimension").and_then(serde_json::Value::as_str)
+                == Some(ciris_persist::federation::trust_root::TRUST_ACCEPTS_DIMENSION)
         {
+            if !self.self_own_subjects(EnvelopeKind::Key).contains(owner) {
+                return false;
+            }
+            if let Some(hit) = memo.relayed_announce.get(id) {
+                return *hit;
+            }
+            if !memo.roots.contains_key(owner) {
+                let roots = ciris_persist::federation::trust_root::trusted_roots_of(
+                    &*self.directory,
+                    owner,
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap_or_default();
+                memo.roots.insert(owner.to_owned(), roots);
+            }
+            let live = memo
+                .roots
+                .get(owner)
+                .is_some_and(|roots| roots.iter().any(|r| r == node));
+            memo.relayed_announce.insert(id.to_owned(), live);
+            return live;
+        }
+        if !is_owner_binding_envelope(env) {
             return false;
         }
         if !self.self_own_subjects(EnvelopeKind::Key).contains(node)
@@ -24290,7 +24326,7 @@ pub(crate) mod tests {
         // The requester's node accepts the root as well as its owner, as a
         // production node does (FIRST_CONTACT §2: `delegates_to(node → R)`):
         // the conferred-server lookup asks the requester's own roots.
-        seed_common_root(&backend, &[relay, peer_owner, peer]).await;
+        seed_common_root(&backend, &[relay, peer_owner, peer, o]).await;
         let announced = seed_owner_binding(&backend, o, d).await;
         let unpublished = seed_owner_binding(&backend, o, e).await;
         let unannounced = uuid::Uuid::new_v4().to_string();
@@ -24356,11 +24392,39 @@ pub(crate) mod tests {
         };
 
         let announced_hash = wire_hash_of(&backend, &announced).await;
+        // `o`'s root acceptance (seed_common_root): `delegates_to(o → root-r)`.
+        let acceptance_hash = {
+            let rows = backend
+                .list_attestations_since(None, 4096)
+                .await
+                .expect("list");
+            let acc = rows
+                .iter()
+                .find(|r| {
+                    r.attestation.attesting_key_id == o
+                        && r.attestation.attested_key_id == "root-r"
+                        && r.attestation.attestation_type == "delegates_to"
+                })
+                .expect("o's acceptance was seeded");
+            content_hash_of(&acc.attestation).expect("hashable").0
+        };
         let got = pulled(peer).await;
         assert_eq!(
             got,
-            std::collections::BTreeSet::from([announced_hash]),
-            "a stranger's Pull gets exactly the announced binding of the published node"
+            std::collections::BTreeSet::from([announced_hash, acceptance_hash]),
+            "a stranger's Pull gets exactly the announced binding of the published node and \
+             its owner's live root acceptance"
+        );
+        assert!(
+            relay_bridge()
+                .fetch_envelope_bytes_for_peer(
+                    EnvelopeKind::Attestation,
+                    &acceptance_hash,
+                    Some(peer)
+                )
+                .await
+                .is_some(),
+            "the acceptance is fetchable by the same requester (#429)"
         );
         assert!(
             relay_bridge()

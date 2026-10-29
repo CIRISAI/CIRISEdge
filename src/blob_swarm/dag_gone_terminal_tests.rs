@@ -125,3 +125,123 @@ async fn a_gone_manifest_or_chunk_ends_the_dag_pull_with_no_retry() {
         "with nothing gone the DAG pulls"
     );
 }
+
+/// Serves from the author's store, but names `holders` as who it fetches from.
+struct NamedHolders {
+    inner: StoreFetch,
+    holders: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl DagByteFetch for NamedHolders {
+    fn holders(&self) -> &[String] {
+        &self.holders
+    }
+
+    async fn fetch(&self, sha: [u8; 32]) -> Result<Vec<u8>, String> {
+        self.inner.fetch(sha).await
+    }
+}
+
+/// **The mirror image: a store-gate refusal on axis 1 or 2 is NOT terminal.**
+///
+/// Those axes read directory facts that can still land on this node — the
+/// holder's owner binding, the room roster, a widening — so the pull books a
+/// retry like any fetch that may clear. The first cut ended them `Refused`
+/// with nothing booked, and a joiner whose first pull ran before its room's
+/// standing converged never asked again (the linux↔android pair room,
+/// CIRISServer live chat: `axis 1: SenderNotApprovedForTier`, one attempt).
+/// Reverting `gate_refused` to `Refused` turns this RED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_axis_one_refusal_books_a_retry() {
+    let (alice, node_a, node_b) = two_devices().await;
+    let edge_b = edge_of(&node_b);
+    let file = publish_self_file(&node_a, &alice).await;
+    node_b
+        .dir
+        .apply_replicated_attestation(SignedAttestation {
+            attestation: file.row.clone(),
+        })
+        .await
+        .expect("B admits the crossed row");
+    assert!(cross_keys_except(&node_a, &node_b, &Withhold::none(), None).await > 0);
+    let puller = puller_of(&node_b, &edge_b);
+
+    // A holder this node cannot place in the owner's self-collective (yet).
+    let refused = puller
+        .pull_dag_with(
+            &file.row,
+            file.sha,
+            &NamedHolders {
+                inner: fetch_from(&node_a, &node_b),
+                holders: vec!["a-key-this-node-has-not-met".to_owned()],
+            },
+        )
+        .await;
+    match &refused {
+        PullOutcome::FetchFailed { reason, retrying } => {
+            assert!(reason.starts_with("axis 1"), "axis 1 refused: {reason}");
+            assert!(*retrying, "the refusal is booked for retry");
+        }
+        other => panic!("an axis-1 refusal is retried, not terminal: {other:?}"),
+    }
+    assert!(puller.retry_booked(file.sha), "the retry is on the ledger");
+
+    // Control: from the owner's real node the same pull completes.
+    assert!(
+        matches!(
+            puller
+                .pull_dag_with(&file.row, file.sha, &fetch_from(&node_a, &node_b))
+                .await,
+            PullOutcome::Stored { .. }
+        ),
+        "from a holder with standing the DAG pulls"
+    );
+}
+
+/// **The puller's "me" is the node, even when a caller hands it the actor.**
+///
+/// CIRISServer passed `signer_key_id()` on a split home (`use_node_identity`):
+/// the gate resolved the actor's principal, found no room, and refused every
+/// room blob `VerifiedOnly`. `wire_self` corrects exactly that id to the
+/// node's and leaves every other choice to the caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_split_homes_actor_id_is_corrected_to_the_node() {
+    use ciris_persist::federation::FederationDirectory;
+    let (_alice, node_a, _node_b) = two_devices().await;
+    let split = |advertised: Option<&str>| {
+        let config = crate::EdgeConfig {
+            advertised_key_id: advertised.map(str::to_owned),
+            ..crate::EdgeConfig::default()
+        };
+        crate::Edge::builder()
+            .directory(node_a.dir.clone() as std::sync::Arc<dyn crate::verify::VerifyDirectory>)
+            .federation_directory(node_a.dir.clone() as std::sync::Arc<dyn FederationDirectory>)
+            .queue(node_a.dir.clone())
+            .signer(node_a.signer.clone())
+            .transport(std::sync::Arc::new(super::chunk_grants_779_tests::NoWire)
+                as std::sync::Arc<dyn crate::transport::Transport>)
+            .config(config)
+            .build()
+            .expect("build edge")
+    };
+    let actor = node_a.signer.key_id.clone();
+
+    let home = split(Some("the-node-key"));
+    assert_eq!(
+        super::pull::wire_self(&home, actor.clone()),
+        "the-node-key",
+        "the actor's id is the node's on a split home"
+    );
+    assert_eq!(
+        super::pull::wire_self(&home, "another-key".to_owned()),
+        "another-key",
+        "any other id is the caller's to choose"
+    );
+    let unsplit = split(None);
+    assert_eq!(
+        super::pull::wire_self(&unsplit, actor.clone()),
+        actor,
+        "when the two coincide nothing changes"
+    );
+}
