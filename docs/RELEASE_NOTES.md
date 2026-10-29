@@ -9,6 +9,11 @@
   #889 revocation). A pair-room invitation was then `NotInAudience` for the invitee's node, and edge's
   bridge withheld it on every round (`attestation withheld — the recipient is not in the row's
   audience … membership:proposal:v1`). Edge carries the fix by pin; no edge code changes.
+- **persist v59.1.1: a pair room's later messages open.** Both nodes of a pair room mint epoch 0, so
+  a blob fetched after its grants met two granting minters and was bound to its author (a person
+  key, holding no DEK): every later conversation turn read `not_granted`. persist's
+  `epoch_minter::resolve` now keeps the granting minter whose principals include the author. Edge
+  carries the fix by pin.
 - **A relay also hands a published owner's live root acceptance to a first-contact peer (#907).**
   v43.2.1's subject Pull relayed a contact's announced owner-binding but not their root
   acceptance, so a node that met a person only through the canonical could resolve their node but
