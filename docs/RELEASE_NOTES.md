@@ -1,5 +1,34 @@
 # CIRISEdge Release Notes
 
+# v43.3.0 — chat revisions, direct links for room peers, and no lost first Resource
+
+**2026-10-29.** **MINOR** from v43.2.3. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
+Carries v43.2.2 and v43.2.3 forward to main.
+
+- **A whole envelope that overtakes its link's handshake is held, not lost.** A Resource on a fresh
+  link can reach the receiver ahead of the link's last handshake part. It was held until the link was
+  keyed, but only up to 256 KiB, so any first Resource over 256 KiB was dropped
+  (`link_seal_dropped_before_keys`) after its sender had counted it delivered. The identity hold had
+  the same bound. Both now fit one frame of the largest size edge carries per link, and a node-wide
+  bound (`HELD_BYTES_NODE_MAX`) keeps links that never finish their handshake from pinning memory.
+  This was the macOS failure in `link_pool_819` on the v43.2.3 tag run.
+- **An author revises, withdraws or recants a chat message (CIRISPersist#1155).**
+  - `chat_message_supersede_in`, `chat_message_withdraw_in` and `chat_message_recant_in` each name
+    the message's current head. They are born in the room at federation tier and written with
+    `put_attestation`, not shared.
+  - Withdraw and recant carry a closed `ComposerReason` code, since a room-scope row is plaintext
+    to every holder.
+  - `rows_in_room` folds a message out only on its author's own composer (`composer_is_authors`)
+    and drops another member's. Before, any participant's composer hid the row it named.
+  - `ChatMessage.edits` names a revision's predecessor; `widens` is now set only on a widening.
+- **A room peer reached through a server is brought direct (#915).** After a send to a peer this
+  node shares a room with ships over a link that crosses a transport node, edge proposes bringing
+  that link direct, without waiting on the outcome. It proposes only to room peers, because a proposal
+  reveals this node's public address.
+- **`init_edge_runtime` takes direct-link settings.** The new kwargs are `direct_link_facilitator`
+  (`"host:port"`), `direct_link_serve_port` (UDP) and `direct_link_accept` (`"room_peers"` |
+  `"identified_only"` | `"off"`). They default to the previous behaviour.
+
 # v43.2.3 — release assets publish again
 
 **2026-10-29.** **PATCH** from v43.2.2. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
