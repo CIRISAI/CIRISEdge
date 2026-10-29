@@ -1,8 +1,8 @@
 # CIRISEdge Release Notes
 
-# v43.2.2 — an invitation reaches the invitee's node; a key a person asked for goes first
+# v43.2.2 — live chat between two people's nodes, end to end
 
-**2026-10-27.** **PATCH** from v43.2.1. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
+**2026-10-28.** **PATCH** from v43.2.1. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
 
 - **persist v59.1.1: `principals_of` keeps a peer node's owner.** A node lost its owner whenever the
   room's creator held an unagreed, identity-signed occurrence row for it (a #932 H1 mistaken for a
