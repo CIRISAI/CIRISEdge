@@ -2664,3 +2664,283 @@ async fn a_handshake_row_is_placed_in_the_room_it_names_not_a_derived_pair() {
         .expect("pair key package");
     assert_eq!(room_of(&legacy).as_deref(), Some(pair.as_str()));
 }
+
+/// A message shared into the room, as every reader holds it: the widening.
+async fn placed(w: &World, body: &str) -> ciris_persist::federation::Attestation {
+    let msg = authored(w, body).await;
+    share_encrypted_privately(
+        &*w.dir,
+        &msg,
+        EncryptedCohort::Community {
+            community_key_id: w.room.clone(),
+        },
+        CrossingBasis::ProducerAuthority,
+        w.signers(),
+    )
+    .await
+    .expect("share the message into the room");
+    let seen = room_messages(w).await;
+    assert_eq!(seen.len(), 1, "one message placed: {seen:?}");
+    w.stored(&alice_fed(), &seen[0].attestation_id).await
+}
+
+async fn room_messages(w: &World) -> Vec<chat::ChatMessage> {
+    chat::messages_in_room(
+        &*w.dir,
+        &[alice_fed(), bob_fed()],
+        &w.room,
+        &content_store(w).await,
+        &me_of(w).await,
+    )
+    .await
+    .expect("read the room")
+}
+
+async fn put(w: &World, row: &ciris_persist::federation::Attestation) {
+    w.dir
+        .put_attestation(SignedAttestation {
+            attestation: row.clone(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("persist admits {}: {e}", row.attestation_type));
+}
+
+fn later(minutes: i64) -> chrono::DateTime<chrono::Utc> {
+    ts() + chrono::Duration::minutes(minutes)
+}
+
+/// **An author revises a message, then revises the revision; the room shows
+/// the latest text once, born in the room at federation tier.**
+#[tokio::test]
+async fn an_authors_revision_replaces_the_message_and_a_revision_of_it_replaces_that() {
+    let w = world().await;
+    let store = content_store(&w).await;
+    let original = placed(&w, "see you at 6").await;
+
+    let (first, _) = chat::chat_message_supersede_in(
+        &w.alice,
+        &w.room,
+        &original,
+        "see you at 7",
+        later(1),
+        &store,
+    )
+    .await
+    .expect("revise");
+    assert_eq!(first.attestation_type, "supersedes");
+    assert_eq!(
+        first.cohort_scope, "community",
+        "born in the room, not at self"
+    );
+    assert_eq!(first.tier, "federation");
+    put(&w, &first).await;
+
+    let seen = room_messages(&w).await;
+    assert_eq!(seen.len(), 1, "the revision replaces the message: {seen:?}");
+    assert_eq!(seen[0].attestation_id, first.attestation_id);
+    assert_eq!(seen[0].body, Body::Text("see you at 7".to_owned()));
+    assert_eq!(
+        seen[0].edits.as_deref(),
+        Some(original.attestation_id.as_str())
+    );
+    assert_eq!(seen[0].widens, None, "a revision is not a widening");
+
+    let (second, _) = chat::chat_message_supersede_in(
+        &w.alice,
+        &w.room,
+        &first,
+        "see you at 8",
+        later(2),
+        &store,
+    )
+    .await
+    .expect("revise the revision");
+    put(&w, &second).await;
+    let seen = room_messages(&w).await;
+    assert_eq!(seen.len(), 1, "the chain folds to its head: {seen:?}");
+    assert_eq!(seen[0].body, Body::Text("see you at 8".to_owned()));
+    assert_eq!(
+        seen[0].edits.as_deref(),
+        Some(first.attestation_id.as_str())
+    );
+}
+
+/// **Withdrawing the head removes the message; the retraction is not itself
+/// a message.**
+#[tokio::test]
+async fn withdrawing_the_head_removes_the_message() {
+    let w = world().await;
+    let store = content_store(&w).await;
+    let original = placed(&w, "wrong chat").await;
+    let (revised, _) = chat::chat_message_supersede_in(
+        &w.alice,
+        &w.room,
+        &original,
+        "still wrong",
+        later(1),
+        &store,
+    )
+    .await
+    .unwrap();
+    put(&w, &revised).await;
+
+    let withdraw = chat::chat_message_withdraw_in(
+        &w.alice,
+        &w.room,
+        &revised,
+        &chat::ComposerReason::SentInError,
+        later(2),
+    )
+    .await
+    .expect("withdraw");
+    assert_eq!(withdraw.attestation_type, "withdraws");
+    assert_eq!(withdraw.cohort_scope, "community");
+    assert_eq!(
+        withdraw.attestation_envelope[chat::FIELD_REASON_CODE],
+        "sent_in_error"
+    );
+    put(&w, &withdraw).await;
+
+    assert!(
+        chat::ChatMessage::from_row(&withdraw, &w.room).is_none(),
+        "a withdraws is not a message"
+    );
+    let seen = room_messages(&w).await;
+    assert!(seen.is_empty(), "withdrawn, nothing left to show: {seen:?}");
+}
+
+/// **A recant removes the message; a reason code must belong to its
+/// composer.**
+#[tokio::test]
+async fn a_recant_removes_the_message_and_carries_only_a_recant_code() {
+    let w = world().await;
+    let original = placed(&w, "the build is green").await;
+
+    let refused = chat::chat_message_recant_in(
+        &w.alice,
+        &w.room,
+        &original,
+        &chat::ComposerReason::Privacy,
+        later(1),
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "`privacy` is a withdraw code: {refused:?}"
+    );
+
+    let recant = chat::chat_message_recant_in(
+        &w.alice,
+        &w.room,
+        &original,
+        &chat::ComposerReason::Incorrect,
+        later(1),
+    )
+    .await
+    .expect("recant");
+    assert_eq!(recant.attestation_type, "recants");
+    put(&w, &recant).await;
+    assert!(room_messages(&w).await.is_empty());
+}
+
+/// **Only the author revises or retracts a message.** The producer refuses
+/// another member, and the fold ignores another member's composer even if
+/// one is held.
+#[tokio::test]
+async fn another_members_composer_changes_nothing() {
+    let w = world().await;
+    let store = content_store(&w).await;
+    let original = placed(&w, "mine").await;
+
+    let refused = chat::chat_message_withdraw_in(
+        &w.bob,
+        &w.room,
+        &original,
+        &chat::ComposerReason::Unspecified,
+        later(1),
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "bob cannot withdraw alice's message: {refused:?}"
+    );
+    let refused =
+        chat::chat_message_supersede_in(&w.bob, &w.room, &original, "theirs", later(1), &store)
+            .await;
+    assert!(refused.is_err(), "bob cannot revise alice's message");
+
+    // A foreign composer built some other way: bob's own signed
+    // `supersedes`, in the room, naming alice's message. persist screens a
+    // retraction for entitlement at its door but not a `supersedes` (it ranks
+    // below both retractions), so this one is admitted and only the fold
+    // stands between it and alice's message.
+    let foreign = forged_supersede_by(&w.bob, &original, &w.room, later(1)).await;
+    assert!(!chat::composer_is_authors(&foreign, &original));
+    put(&w, &foreign).await;
+    let seen = room_messages(&w).await;
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].attestation_id, original.attestation_id);
+}
+
+/// `by`'s own signed `supersedes` in `room` naming `target`, built by hand
+/// the way a producer that skipped [`chat::chat_message_supersede_in`]'s
+/// author check would.
+async fn forged_supersede_by(
+    by: &ciris_edge::identity::LocalSigner,
+    target: &ciris_persist::federation::Attestation,
+    room: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> ciris_persist::federation::Attestation {
+    use ciris_edge::replication::attestation_bind::{
+        bind_attestation_envelope, AttestationColumns,
+    };
+    let id = format!("chat-forged-{}", target.attestation_id);
+    let subjects = vec![by.key_id.clone()];
+    let mut envelope = serde_json::json!({
+        "dimension": chat::CHAT_MESSAGE_DIMENSION,
+        chat::FIELD_COMMUNITY_ID: room,
+        "references_attestation_id": target.attestation_id,
+    });
+    bind_attestation_envelope(
+        &mut envelope,
+        at,
+        &AttestationColumns {
+            attestation_id: &id,
+            attesting_key_id: &by.key_id,
+            attestation_type: "supersedes",
+            attested_key_id: &by.key_id,
+            subject_key_ids: &subjects,
+            cohort_scope: "community",
+            weight: None,
+        },
+    );
+    let at = ciris_edge::replication::attestation_bind::truncate_to_substrate_resolution(at);
+    let canonical = ciris_persist::prelude::ceg_produce_canonicalize(&envelope).unwrap();
+    let (sig_classical, sig_pqc) =
+        ciris_edge::identity::sign_bound_hybrid(by, &canonical, chat::CHAT_MESSAGE_DIMENSION)
+            .await
+            .unwrap();
+    ciris_persist::federation::Attestation {
+        attestation_id: id,
+        attesting_key_id: by.key_id.clone(),
+        attested_key_id: by.key_id.clone(),
+        attestation_type: "supersedes".to_owned(),
+        weight: None,
+        asserted_at: at,
+        expires_at: None,
+        attestation_envelope: envelope,
+        original_content_hash: hex::encode(sha2::Sha256::digest(&canonical)),
+        scrub_signature_classical: sig_classical,
+        scrub_signature_pqc: sig_pqc,
+        scrub_key_id: by.key_id.clone(),
+        scrub_timestamp: at,
+        pqc_completed_at: None,
+        persist_row_hash: String::new(),
+        subject_key_ids: subjects,
+        withdraws_admission_rule: None,
+        cohort_scope: "community".to_owned(),
+        tier: "federation".to_owned(),
+        promoted_at: None,
+        additional_scrubs: Vec::new(),
+    }
+}
