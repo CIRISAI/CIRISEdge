@@ -6,6 +6,7 @@
 //! each phase boundary and logs every phase's duration and the total once,
 //! so the next such report reads the phase off the operator's own log.
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 /// Phase boundaries of one startup, in order.
@@ -42,9 +43,9 @@ impl StartupPhases {
     pub fn summary(&self) -> String {
         let mut out = String::new();
         for (name, d) in &self.phases {
-            out.push_str(&format!("{name}={:.1}ms ", ms(*d)));
+            let _ = write!(out, "{name}={:.1}ms ", ms(*d));
         }
-        out.push_str(&format!("total={:.1}ms", ms(self.last - self.started)));
+        let _ = write!(out, "total={:.1}ms", ms(self.last - self.started));
         out
     }
 

@@ -69,9 +69,9 @@ async fn one_run(run: usize) {
     let t = Instant::now();
     let fresh = SqliteBackend::open(db_path.clone()).await.expect("open");
     let db_open = t.elapsed();
+    let t = Instant::now();
     fresh.run_migrations().await.expect("migrate");
-    let db_fresh = t.elapsed();
-    let db_migrate = db_fresh - db_open;
+    let db_migrate = t.elapsed();
     drop(fresh);
 
     let t = Instant::now();
@@ -140,7 +140,7 @@ async fn one_run(run: usize) {
          \"transport_cold_ms\":{:.1},\"self_route_ms\":{},\"transport_warm_ms\":{:.1}}}",
         ms(db_open),
         ms(db_migrate),
-        ms(db_fresh),
+        ms(db_open + db_migrate),
         ms(db_reopen),
         ms(transport_cold),
         self_route.map_or("null".to_owned(), |d| format!("{:.1}", ms(d))),
