@@ -301,6 +301,20 @@ impl BlobStorePolicy for PersistBlobStorePolicy {
                 if theirs.contains(cohort_id) && ours.contains(cohort_id) {
                     SenderStanding::MemberOfJoinedGroup
                 } else {
+                    // Which half failed, and through which principal: the
+                    // refusal names only the standing, and a holder whose
+                    // owner binding has not reached this node and a node
+                    // whose own seat has not are different repairs.
+                    let holder_principal = self.principal_of(holder_key_id).await;
+                    tracing::info!(
+                        holder = holder_key_id,
+                        holder_principal = ?holder_principal.get(),
+                        holder_in_room = theirs.contains(cohort_id),
+                        local = %self.local_key_id,
+                        local_in_room = ours.contains(cohort_id),
+                        room = %cohort_id,
+                        "store gate axis 1: holder lacks room standing here (CIRISEdge#581)"
+                    );
                     SenderStanding::VerifiedOnly
                 }
             }

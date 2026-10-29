@@ -6654,9 +6654,12 @@ async fn a_community_chunk_dag_is_pulled_holder_to_holder_under_the_rooms_dek() 
     // ── 5. D is not a member: refused at the gate, before a byte moves. ──
     let fetch_d = MeshFetch::new(&node_d.me, vec![node_b.me.clone()], &[&node_b]);
     match puller_d.pull_dag_with(&row, sha, &fetch_d).await {
-        PullOutcome::Refused(reason) => {
+        // Axes 1 and 2 read directory facts that can still land (a roster
+        // widening, an owner binding), so the refusal is booked for retry
+        // rather than ended — and still moves no byte.
+        PullOutcome::FetchFailed { reason, .. } => {
             assert!(
-                reason.contains("axis"),
+                reason.contains("axis 1") || reason.contains("axis 2"),
                 "the store gate names its axis: {reason}"
             );
         }

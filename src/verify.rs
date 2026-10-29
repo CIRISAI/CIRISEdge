@@ -1135,6 +1135,10 @@ pub struct VerifyPipeline {
     directory: Arc<dyn VerifyDirectory>,
     policy: HybridPolicy,
     self_steward_key_id: String,
+    /// The node key this Edge ADVERTISES, when it differs from the signer's
+    /// (a split home: the agent-embedded fold signs as the agent and peers
+    /// address the node). Both are this node, so AV-8 accepts either.
+    advertised_key_id: Option<String>,
     max_body_bytes: usize,
     replay_window: Mutex<ReplayWindow>,
 }
@@ -1154,9 +1158,21 @@ impl VerifyPipeline {
             directory,
             policy,
             self_steward_key_id,
+            advertised_key_id: None,
             max_body_bytes,
             replay_window: Mutex::new(ReplayWindow::new(replay_window_seconds, max_replay_entries)),
         }
+    }
+
+    /// Also accept envelopes addressed to `advertised` — the node key a
+    /// split home advertises while it signs as the actor. Peers address the
+    /// node (a blob holder is named by its node key), so without this every
+    /// such envelope was refused `Misrouted` on arrival. `None`, or the
+    /// signer's own key, changes nothing.
+    #[must_use]
+    pub fn accepting_advertised(mut self, advertised: Option<String>) -> Self {
+        self.advertised_key_id = advertised.filter(|a| *a != self.self_steward_key_id);
+        self
     }
 
     /// CIRISEdge#19 — expose a clone of the directory `Arc` so
@@ -1199,7 +1215,9 @@ impl VerifyPipeline {
         }
 
         // Step 4 — destination check (AV-8).
-        if envelope.destination_key_id != self.self_steward_key_id {
+        if envelope.destination_key_id != self.self_steward_key_id
+            && self.advertised_key_id.as_deref() != Some(envelope.destination_key_id.as_str())
+        {
             return Err(VerifyError::Misrouted);
         }
 

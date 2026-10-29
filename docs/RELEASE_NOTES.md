@@ -1,5 +1,60 @@
 # CIRISEdge Release Notes
 
+# v43.2.3 — release assets publish again
+
+**2026-10-29.** **PATCH** from v43.2.2. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
+No wire or API changes.
+
+- **Link shaping keeps absolute deadlines (#905).** The Poisson cover timer slept a fresh interval
+  from each wake, so on a loaded host every late wake thinned the window and the real share drifted
+  above ρ. Each emission is now due at the previous deadline plus the drawn wait (or now plus the
+  wait, if the previous deadline is more than one window old).
+- **The owner-binding witness accepts either bounded path** (`owned_devices_route_682`): the
+  binding reaches the dark pair either admitted by the receiver or pushed to it, and macOS takes
+  the second path. The receiver-side rung now has its own deterministic witness,
+  `the_receivers_own_owner_admits_a_sibling_binding_on_the_rung_727`.
+- These two tests failed the macOS lanes of the v43.2.0, v43.2.1 and v43.2.2 tag runs, so none of
+  those published release assets.
+
+# v43.2.2 — live chat between two people's nodes, end to end
+
+**2026-10-28.** **PATCH** from v43.2.1. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
+
+- **persist v59.1.1: `principals_of` keeps a peer node's owner.** A node lost its owner whenever the
+  room's creator held an unagreed, identity-signed occurrence row for it (a #932 H1 mistaken for a
+  #889 revocation). A pair-room invitation was then `NotInAudience` for the invitee's node, and edge's
+  bridge withheld it on every round (`attestation withheld — the recipient is not in the row's
+  audience … membership:proposal:v1`). Edge carries the fix by pin; no edge code changes.
+- **persist v59.1.1: a pair room's later messages open.** Both nodes of a pair room mint epoch 0, so
+  a blob fetched after its grants met two granting minters and was bound to its author (a person
+  key, holding no DEK): every later conversation turn read `not_granted`. persist's
+  `epoch_minter::resolve` now keeps the granting minter whose principals include the author. Edge
+  carries the fix by pin.
+- **A relay also hands a published owner's live root acceptance to a first-contact peer (#907).**
+  v43.2.1's subject Pull relayed a contact's announced owner-binding but not their root
+  acceptance, so a node that met a person only through the canonical could resolve their node but
+  never a root in common with it, and the pair room was never keyed. The relay now also admits
+  `delegates_to(owner → R)` at federation scope (`trust:accepts:v1`) when the acceptor is an owner it
+  publishes and the acceptance is live.
+- **A key a person is waiting on is asked before background repair (#904).** A contact paste
+  (`request_key_body`) is asked in the next recovery round, ahead of routed repair names, through
+  `ReplicationDirectory::request_signer` (a bounded priority set apart from the repair queue).
+- **A host that reuses a running Edge can arm its blob plane: `Edge::arm_fold_host`.** An
+  agent-embedded server node reuses the Edge the pyo3 runtime built, which arms neither the scope
+  address table nor a chunk source. Every room blob pull then refused `NoAddressTable`, no peer could
+  fetch a body from the node, and room address installs did nothing. `arm_fold_host(chunk_source,
+  scope_native)` arms both, set-once, on the built (or running) Edge; the inbound loop reads the
+  chunk source per frame. Witness `a_running_edge_armed_late_serves_and_pulls_the_room_body`.
+- **A store-gate refusal on axis 1 or 2 is retried.** Who may hand this node bytes, and whether it
+  is in their audience, read directory facts that can still land, so these refusals now book a retry
+  instead of ending the pull. Axis 3 (the operator declined) stays terminal. The axis-1 refusal logs
+  which side lacked the room.
+- **The blob puller's "me" is the node.** Handed the actor's key id on a split home
+  (`use_node_identity`), the puller uses `Edge::advertised_key_id` instead, with a warning; the store
+  gate had been resolving the actor's principal and refusing every room blob.
+- **The mutual-peer relay witness is deterministic** (`attributed_allegiance_659`): its macOS race
+  failed the v43.2.0 and v43.2.1 tag runs, so neither published release assets.
+
 # v43.2.1 — a contact's announced device arrives on request, not twenty minutes later
 
 **2026-10-27.** **PATCH** from v43.2.0 (persist v59.1.0, verify v20.2.0 unchanged). Unblocks

@@ -787,10 +787,21 @@ async fn unannounced_devices_of_one_owner_exchange_routes_and_admit_682() {
         // binding lands through the ordinary attributed door; the rung exists
         // for a sibling that is not yet attributed, which here is only D2 at
         // D1. D2's holding the binding is asserted above.
+        //
+        // The rung is not the only bounded path here. On the first-contact
+        // Attestation plane each node also serves its own allegiance facts
+        // (its owner-binding among them) to an Attributed stranger, so when
+        // D2's round reaches D1 before D2's push does, D1 admits the binding
+        // on the ordinary door and the push then meets an attributed link
+        // (the darwin tag run of v43.2.2 took that order: D1's ledger was
+        // only `owner_binding_pushed`). Either path is bounded in rounds,
+        // which the sweep bound above asserts; the rung's own admission is
+        // witnessed deterministically by
+        // `the_receivers_own_owner_admits_a_sibling_binding_on_the_rung_727`.
         if who == "D1" {
             assert!(
-                dev.ledger(OWNER_BINDING_ADMITTED) >= 1,
-                "{who} must have admitted a binding on the owner-binding rung, ledger={:?}",
+                dev.ledger(OWNER_BINDING_ADMITTED) >= 1 || dev.ledger(OWNER_BINDING_PUSHED) >= 1,
+                "{who} must have taken part in the owner-binding exchange, ledger={:?}",
                 dev.owner_binding_ledger()
             );
         }
@@ -828,6 +839,50 @@ fn owner_binding_deliver(rows: &[Attestation]) -> DeliverMessage {
             })
             .collect(),
     }
+}
+
+/// The rung's positive case, deterministic: R's own owner signs `O → Y`, and
+/// the rung admits it, books `owner_binding_admitted`, and stores it, so Y is
+/// one of O's nodes at R.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_receivers_own_owner_admits_a_sibling_binding_on_the_rung_727() {
+    let owner = Ident::new("owner-727p", 0x61).await;
+    let r = Ident::new("r-727p", 0x62).await;
+    let y = Ident::new("y-727p", 0x63).await;
+    let dir = directory_with(vec![
+        owner.record("user").await,
+        r.record("node").await,
+        y.record("node").await,
+    ])
+    .await;
+    dir.put_attestation(SignedAttestation {
+        attestation: owner_binding_at(&owner, &r.key_id, "self").await,
+    })
+    .await
+    .expect("R's own binding");
+    let metrics = EdgeMetrics::new();
+    let gate = OwnerBindingCarveOut::new(
+        r.key_id.clone(),
+        Arc::clone(&dir) as Arc<dyn FederationDirectory>,
+        None,
+        Some(metrics.clone()),
+    );
+    let siblings = owner_binding_at(&owner, &y.key_id, "self").await;
+    let out = gate
+        .admit_deliver(&owner_binding_deliver(std::slice::from_ref(&siblings)))
+        .await;
+    assert!(
+        matches!(out, OwnerBindingOutcome::Consumed { admitted: 1, .. }),
+        "the receiver's own owner's binding of a sibling is admitted: {out:?}"
+    );
+    assert_eq!(ledger(&metrics, OWNER_BINDING_ADMITTED), 1);
+    let mut nodes = ciris_persist::federation::admission::nodes_owned_by(&*dir, &owner.key_id)
+        .await
+        .expect("nodes_owned_by");
+    nodes.sort();
+    let mut want = vec![r.key_id.clone(), y.key_id.clone()];
+    want.sort();
+    assert_eq!(nodes, want, "Y is now one of O's nodes at R");
 }
 
 /// (a) `O → Y` signed by a key that is not R's owner is refused BY NAME, both
