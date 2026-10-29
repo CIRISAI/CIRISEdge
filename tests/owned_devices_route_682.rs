@@ -876,13 +876,13 @@ async fn the_receivers_own_owner_admits_a_sibling_binding_on_the_rung_727() {
         "the receiver's own owner's binding of a sibling is admitted: {out:?}"
     );
     assert_eq!(ledger(&metrics, OWNER_BINDING_ADMITTED), 1);
-    let mut owned = ciris_persist::federation::admission::nodes_owned_by(&*dir, &owner.key_id)
+    let mut nodes = ciris_persist::federation::admission::nodes_owned_by(&*dir, &owner.key_id)
         .await
         .expect("nodes_owned_by");
-    owned.sort();
+    nodes.sort();
     let mut want = vec![r.key_id.clone(), y.key_id.clone()];
     want.sort();
-    assert_eq!(owned, want, "Y is now one of O's nodes at R");
+    assert_eq!(nodes, want, "Y is now one of O's nodes at R");
 }
 
 /// (a) `O → Y` signed by a key that is not R's owner is refused BY NAME, both
