@@ -2193,6 +2193,10 @@ pub struct FederationDirectoryReplicationBridge {
     /// `consent:replication` grant names the agent, while `local_key_id` is
     /// the node.
     consent_subject_key_ids: Vec<String>,
+    /// The send-set membership last logged per peer, so a change logs once at
+    /// INFO ([`Self::note_send_set_membership`]). Bounded: cleared past
+    /// [`SEND_SET_MEMBERSHIP_CAP`] peers.
+    send_set_membership: std::sync::Mutex<HashMap<String, &'static str>>,
     /// CIRISEdge#552 (B) — signers a transient refusal named that this node may
     /// not hold. Bounded: a peer that offers unadmittable rows must not be able
     /// to grow this without limit, so past the cap new names are DROPPED rather
@@ -2342,6 +2346,9 @@ pub type RevocationObserver = Arc<dyn Fn(&str) + Send + Sync>;
 /// default 30 s cadence, so the item-1 bound still re-resolves every round.
 const CONSENT_SEND_SET_MEMO_TTL: Duration = Duration::from_secs(10);
 
+/// Peers whose send-set membership is remembered for change logging.
+const SEND_SET_MEMBERSHIP_CAP: usize = 4096;
+
 /// CIRISEdge#523 — how long a resolved owner-binding stays fresh.
 ///
 /// Sized at the default anti-entropy cadence, so the widened cohort is resolved
@@ -2425,6 +2432,7 @@ impl FederationDirectoryReplicationBridge {
             self_provider: None,
             local_key_id: None,
             consent_subject_key_ids: Vec::new(),
+            send_set_membership: std::sync::Mutex::new(HashMap::new()),
             config,
             operational: None,
             consent_memo: Mutex::new(None),
@@ -2525,6 +2533,7 @@ impl FederationDirectoryReplicationBridge {
             self_provider: None,
             local_key_id: None,
             consent_subject_key_ids: Vec::new(),
+            send_set_membership: std::sync::Mutex::new(HashMap::new()),
             config,
             operational: Some(operational),
             consent_memo: Mutex::new(None),
@@ -8232,9 +8241,13 @@ impl FederationDirectoryReplicationBridge {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(
                     peer = peer_label,
+                    local,
+                    consent_subjects = %self.consent_subjects_label(local),
                     send_set_size = set.len(),
                     "attestation plane narrowed to FIRST CONTACT — no consent:replication \
-                     grant names this peer; only this node's own allegiance facts \
+                     grant names this peer: looked for a live grant whose for_key_id is one of \
+                     consent_subjects, authored by a steward of it, naming this peer or a \
+                     person it is bound to. Only this node's own allegiance facts \
                      (owner-binding, acceptances, charter) may follow, so the peer can \
                      judge us under Policy A (CIRISEdge#671, FSD/FIRST_CONTACT.md §2)"
                 );
@@ -8250,10 +8263,70 @@ impl FederationDirectoryReplicationBridge {
                 );
             }
         }
+        let membership = if set.names(peer) {
+            "consent"
+        } else if resolved.is_some() && set.routes_by_owner_binding(peer) {
+            "owner_routed"
+        } else if resolved.is_some() && set.routes_by_self_collective(peer).is_some() {
+            "self_collective"
+        } else if peer != local && !peer.is_empty() {
+            "first_contact"
+        } else {
+            "none"
+        };
+        self.note_send_set_membership(peer, local, membership, &set);
         resolved.or_else(|| {
             (peer != local && !peer.is_empty())
                 .then(|| ResolvedPeerSet::first_contact_recipient(peer))
         })
+    }
+
+    /// The keys whose consent the send set reads, for a log line.
+    fn consent_subjects_label(&self, local: &str) -> String {
+        if self.consent_subject_key_ids.is_empty() {
+            format!("[{local}] (local_key_id)")
+        } else {
+            format!("{:?}", self.consent_subject_key_ids)
+        }
+    }
+
+    /// **SEND SET** — log at INFO when the axis that puts `peer` in this
+    /// node's attestation send set changes (`consent`, `owner_routed`,
+    /// `self_collective`, `first_contact`), naming whose consent was read, so
+    /// "why does this peer get nothing" is one line, not a debug-level search.
+    fn note_send_set_membership(
+        &self,
+        peer: &str,
+        local: &str,
+        membership: &'static str,
+        set: &ResolvedPeerSet,
+    ) {
+        let previous = {
+            let Ok(mut seen) = self.send_set_membership.lock() else {
+                return;
+            };
+            if seen.len() >= SEND_SET_MEMBERSHIP_CAP && !seen.contains_key(peer) {
+                seen.clear();
+            }
+            seen.insert(peer.to_owned(), membership)
+        };
+        if previous == Some(membership) {
+            return;
+        }
+        tracing::info!(
+            peer = Self::peer_label(peer),
+            was = previous.unwrap_or("-"),
+            now = membership,
+            local,
+            consent_subjects = %self.consent_subjects_label(local),
+            consent = set.len(),
+            owner_routed = set.owner_routed_len(),
+            collective_routed = set.collective_routed_len(),
+            "SEND SET: the axis that puts this peer in the attestation send set changed \
+             (consent: a grant from consent_subjects names it; owner_routed: a grant names \
+             its owner; self_collective: one of the owner's or a family member's nodes; \
+             first_contact: none of these, only allegiance facts follow)"
+        );
     }
 
     /// **CIRISEdge#524 — a withhold that can name its peer.**
