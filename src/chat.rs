@@ -198,6 +198,10 @@ pub const FIELD_CONTENT_TYPE: &str = "content_type";
 /// the point content is actually backfilled (`FSD/GROUP_CONTENT_ON_BLOBS.md`
 /// §8).
 pub const FIELD_CONTENT: &str = "content";
+
+/// The member a chat message names an attached file by: the file row's
+/// attestation id ([`chat_message_attachment_in`]).
+pub const FIELD_ATTACHMENT: &str = "attachment_attestation_id";
 /// The MLS handshake payload on a KeyPackage / Welcome row: base64 bytes.
 /// Crate-private since v25.0.0 (CIRISEdge#604): the member is wire contract
 /// for the two handshake rows, read and written only by the producers and
@@ -1032,6 +1036,46 @@ async fn sealed_body_members(
     Ok((members, sealed))
 }
 
+/// **A message that carries a file**: an ordinary `chat:message:v1` row,
+/// sealed and shared exactly like [`chat_message_attestation_in`] (born `self`,
+/// widened to the room by `share`), naming `file` by
+/// [`FIELD_ATTACHMENT`]. `caption` is sealed as the body (empty when `None`).
+///
+/// The file must already be in `room`: its cohort target is the room, so every
+/// member who can read the message can fetch the file. A revision
+/// ([`chat_message_supersede_in`]) keeps the attachment; a withdraw or recant
+/// retracts the message, not the file.
+///
+/// # Errors
+/// `file` is not in `room`; as [`chat_message_attestation_in`] otherwise.
+pub async fn chat_message_attachment_in(
+    author: &crate::identity::LocalSigner,
+    community_key_id: &str,
+    file: &Attestation,
+    caption: Option<&str>,
+    asserted_at: chrono::DateTime<chrono::Utc>,
+    store: &dyn crate::group_content::GroupContentStore,
+) -> Result<(Attestation, crate::group_content::SealedContent), String> {
+    use crate::replication::attestation_bind::truncate_to_substrate_resolution;
+    let room = community_key_id;
+    if room_of(file).as_deref() != Some(room) {
+        return Err(format!(
+            "file {} is not in room {room} ({:?}): attach a file shared into the room",
+            file.attestation_id,
+            room_of(file)
+        ));
+    }
+    let at = truncate_to_substrate_resolution(asserted_at);
+    let (mut members, sealed) =
+        sealed_body_members(author, room, caption.unwrap_or_default(), at, store).await?;
+    members.insert(
+        FIELD_ATTACHMENT.to_owned(),
+        serde_json::json!(file.attestation_id),
+    );
+    let row = chat_row(author, room, CHAT_MESSAGE_DIMENSION, members, at).await?;
+    Ok((row, sealed))
+}
+
 /// The member a chat `withdraws` / `recants` carries its reason code under.
 /// A composer sits at the room's scope, where its members are plaintext to
 /// every holder, so the reason is a code from [`ComposerReason`], never free
@@ -1178,6 +1222,10 @@ pub async fn chat_message_supersede_in(
         paths::REFERENCES_ATTESTATION_ID.to_owned(),
         serde_json::json!(target.attestation_id),
     );
+    // A revision changes the words, not what the message carries.
+    if let Some(file) = target.attestation_envelope.get(FIELD_ATTACHMENT) {
+        members.insert(FIELD_ATTACHMENT.to_owned(), file.clone());
+    }
     let row = chat_row_shaped(
         author,
         Some(room),
@@ -2148,6 +2196,9 @@ pub struct ChatMessage {
     /// The message this row revises, when it is an author's revision
     /// ([`chat_message_supersede_in`]): the row it replaced in the room.
     pub edits: Option<String>,
+    /// The file this message carries, by its attestation id
+    /// ([`chat_message_attachment_in`]).
+    pub attachment: Option<String>,
 }
 
 impl ChatMessage {
@@ -2230,6 +2281,10 @@ impl ChatMessage {
                     && a.attestation_type
                         == ciris_persist::federation::types::attestation_type::SUPERSEDES
             }),
+            attachment: env
+                .get(FIELD_ATTACHMENT)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
         }
     }
 
