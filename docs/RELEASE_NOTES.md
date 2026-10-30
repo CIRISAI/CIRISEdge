@@ -1,5 +1,29 @@
 # CIRISEdge Release Notes
 
+# v43.4.0 — direct links that recover, traces that ship, files in chats
+
+**2026-10-30.** **MINOR** from v43.3.0. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
+
+- **A room peer that refused before it joined the room is asked again (#920).** On the live mesh, the
+  room's creator proposed a direct link while the joiner was not yet in the room, and the joiner
+  refused. Two bugs then kept the pair room relayed for good:
+  - the refusal was pinned to that link forever;
+  - the joiner's replies went back over the creator's link (the reverse path), which never proposed.
+
+  Now a refusal backs the peer off like a timeout, with leviculum's 60 s per-link proposal cooldown
+  as the base, and a reverse-path send proposes too. The link comes up direct on the first send after
+  the cooldown once both nodes share the room.
+- **The trace send set reads the agent's consent on a split home.** The owner's
+  `consent:replication` grant names the agent, but the bridge read consent by the node's wire key,
+  whose set is empty. Every round narrowed to first contact, and no `trace:*` row ever shipped.
+  `ReplicationRuntimeConfig::consent_subject_key_ids` names whose consent the send set reads. Empty
+  falls back to `local_key_id`.
+- **A chat message carries a file in the room.**
+  - `chat_message_attachment_in` names a file already shared into the room
+    (`FIELD_ATTACHMENT`), with an optional sealed caption.
+  - `ChatMessage.attachment` reads it back.
+  - A revision keeps the attachment.
+
 # v43.3.0 — chat revisions, direct links for room peers, and no lost first Resource
 
 **2026-10-29.** **MINOR** from v43.2.3. Pins CIRISPersist **v59.1.1** (verify v20.2.0 unchanged).
