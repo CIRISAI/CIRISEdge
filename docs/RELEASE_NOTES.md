@@ -13,6 +13,11 @@
   Now a refusal backs the peer off like a timeout, with leviculum's 60 s per-link proposal cooldown
   as the base, and a reverse-path send proposes too. The link comes up direct on the first send after
   the cooldown once both nodes share the room.
+- **Two nodes behind one NAT come up direct.** The agent's local mesh then showed both nodes
+  reporting the same public IP, and both punches failing: a home router that doesn't hairpin never
+  delivers a punch sent to its own public address. leviculum (CIRISAI fork c6d0a224) now exchanges each
+  side's host candidate in the upgrade signals (an optional `"l"` key, byte-identical to rns-rs when
+  absent). When both public IPs match, each side punches the other's host candidate as well.
 - **The trace send set reads the agent's consent on a split home.** The owner's
   `consent:replication` grant names the agent, but the bridge read consent by the node's wire key,
   whose set is empty. Every round narrowed to first contact, and no `trace:*` row ever shipped.
