@@ -6214,7 +6214,7 @@ impl ReticulumTransport {
                 };
                 Ok((running, self.direct_paths.wait_for(running)))
             }
-            Err(skip @ (ProposeSkip::BackingOff | ProposeSkip::RejectedOnThisLink)) => {
+            Err(skip @ ProposeSkip::BackingOff) => {
                 count(crate::observability::DIRECT_LINK_SKIPPED_BACKOFF);
                 tracing::debug!(
                     key_id = %destination_key_id,
@@ -9042,6 +9042,16 @@ impl Transport for ReticulumTransport {
             .send_via_reverse_path(destination_key_id, envelope_bytes, None)
             .await
         {
+            // CIRISEdge#920 — the peer's own link to us is the identity link
+            // between the two nodes too: a room peer that only ever replies
+            // must still bring it direct.
+            if let Some(link) = self
+                .live_link_to(destination_key_id, LinkPlane::Identity)
+                .await
+            {
+                self.propose_direct_to_room_peer(destination_key_id, link, &candidates)
+                    .await;
+            }
             return Ok(TransportSendOutcome::Delivered);
         }
 

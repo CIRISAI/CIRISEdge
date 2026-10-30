@@ -455,6 +455,25 @@ async fn open_call(p: &Trio) -> (AvSpine, MemberAddress) {
 /// [`open_call`], with B installing the call (`b_joins`) or not: a B that
 /// never installs it shares no room with A.
 async fn open_call_with(p: &Trio, b_joins: bool) -> (AvSpine, MemberAddress) {
+    let (spine, b_addr, b_snapshot) = open_call_deferring_b(p).await;
+    if b_joins {
+        let _ =
+            p.b.lifecycle
+                .install(&scope(), &b_snapshot)
+                .expect("B installs the call");
+    }
+    (spine, b_addr)
+}
+
+/// [`open_call_with`], with B's install left to the caller: the room exists on
+/// A, and B joins it whenever it installs the returned snapshot.
+async fn open_call_deferring_b(
+    p: &Trio,
+) -> (
+    AvSpine,
+    MemberAddress,
+    ciris_edge::scope_lifecycle::ScopeGroupSnapshot,
+) {
     let stream = StreamId(sha2::Sha256::digest(b"av-stream-805-direct").into());
     let (mut session, _dek0) = AvSession::create(
         stream,
@@ -500,19 +519,13 @@ async fn open_call_with(p: &Trio, b_joins: bool) -> (AvSpine, MemberAddress) {
     let publisher = AvPublisher::from_session(stream, session, pub_dek, vec![]).expect("publisher");
     let spine =
         AvSpine::open(scope(), Arc::clone(&p.a.lifecycle), publisher, None).expect("open the call");
-    if b_joins {
-        let snap = av_addressing::snapshot(&sub_session).expect("B's snapshot");
-        let _ =
-            p.b.lifecycle
-                .install(&scope(), &snap)
-                .expect("B installs the call");
-    }
+    let b_snapshot = av_addressing::snapshot(&sub_session).expect("B's snapshot");
     let group = av_addressing::stream_group_id(stream);
     let b_addr =
         p.a.table
             .send_address(&scope(), &group, &p.b.key.key_id)
             .expect("A derives B's call address");
-    (spine, b_addr)
+    (spine, b_addr, b_snapshot)
 }
 
 fn dl(m: &EdgeMetrics, label: &str) -> u64 {
@@ -1901,4 +1914,62 @@ async fn a_send_outside_every_room_proposes_nothing_915() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(dl(&p.a.metrics, "direct_link_proposed"), 0);
     assert_eq!(p.a.transport.direct_path_state(&p.b.key.key_id), None);
+}
+
+/// **#920** — the live mesh's sequence: A, the room's creator, sends to B
+/// before B has joined, so B refuses A's proposal. B then joins and replies
+/// over A's own link (the reverse path), past leviculum's per-link proposal
+/// cooldown. That reply proposes, B now shares the room, and the link comes up
+/// direct. Before #920 the refusal was pinned to
+/// the link and B's reverse-path sends never proposed, so the pair room
+/// stayed relayed for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_that_refused_before_joining_the_room_comes_up_direct_once_it_joins_920() {
+    let mut p = trio("j920", proposer(), proposer()).await;
+    let (_spine, _b_addr, b_snapshot) = open_call_deferring_b(&p).await;
+    assert!(!p.b.transport.should_accept_direct(&p.a.key.key_id));
+
+    p.a.transport
+        .send(&p.b.key.key_id, b"before-b-joins")
+        .await
+        .expect("A's send to B ships through T");
+    let refused = next_event(&mut p.a.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Failed { .. })
+    })
+    .await
+    .expect("B refuses: it does not share the room yet");
+    assert!(
+        matches!(&refused, DirectPathEvent::Failed { reason, .. }
+            if *reason == "direct_link_failed_rejected"),
+        "{refused:?}"
+    );
+
+    let _ =
+        p.b.lifecycle
+            .install(&scope(), &b_snapshot)
+            .expect("B joins the room");
+    assert!(p.b.transport.should_accept_direct(&p.a.key.key_id));
+
+    // leviculum binds both ends of a link to a cooldown after any proposal on
+    // it (A's refused one included): inside it, B's proposal is refused BUSY
+    // by A's node. Edge's retry base is that cooldown, so the next send after
+    // it proposes; here that send is B's reply.
+    tokio::time::sleep(
+        ciris_edge::transport::direct_path::DIRECT_RETRY_BASE + Duration::from_secs(1),
+    )
+    .await;
+    p.b.transport
+        .send(&p.a.key.key_id, b"b-replies")
+        .await
+        .expect("B's reply rides A's link");
+    let up = next_event(&mut p.b.events, Duration::from_secs(20), |e| {
+        matches!(e, DirectPathEvent::Established { .. })
+    })
+    .await
+    .expect("B's reply brings the link direct");
+    assert!(
+        matches!(&up, DirectPathEvent::Established { proposed: true, peer, .. }
+            if peer.as_deref() == Some(p.a.key.key_id.as_str())),
+        "B proposed, to A: {up:?}"
+    );
 }
