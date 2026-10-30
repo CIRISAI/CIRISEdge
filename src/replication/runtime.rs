@@ -186,6 +186,7 @@ fn build_bridge(
                 .and_then(|w| w.pull_sink.clone()),
         )
         .with_serve_tier_subject(config.serve_tier_subject_key_id.clone())
+        .with_consent_subjects(config.consent_subject_key_ids.clone())
         // ROLE_MATRIX Axis 3 — the production serve-tier resolver: canonical
         // legs live (leg A ∧ leg B against this node's own trust base), the
         // owner-conferred rung fail-closed pending CIRISPersist#788. Installed
@@ -819,6 +820,19 @@ pub struct ReplicationRuntimeConfig {
     /// Falls back to `local_key_id` when unset — correct for every deployment
     /// where the two identities coincide.
     pub serve_tier_subject_key_id: Option<String>,
+    /// Whose consent the attestation send set reads: the union of
+    /// `consent_peers_by_principals(k)` over these keys.
+    ///
+    /// Distinct from `local_key_id` on purpose, like
+    /// [`Self::serve_tier_subject_key_id`]. Consent is the agent's: the
+    /// owner's `consent:replication` grant names the AGENT (`for_key_id`),
+    /// while on a split home `local_key_id` is the node's wire identity, whose
+    /// consent set is empty. Read by the node, the send set was empty and no
+    /// `trace:*` row ever shipped.
+    ///
+    /// Empty (the default) falls back to `local_key_id`: correct wherever the
+    /// agent and the node are one key.
+    pub consent_subject_key_ids: Vec<String>,
     /// CIRISEdge#640 — everything a node needs to OPEN sealed content it did
     /// not seal, wired as ONE value (see [`SealedContentWiring`]): the engine
     /// that projects key-grant wraps into grants for this node's occurrences,

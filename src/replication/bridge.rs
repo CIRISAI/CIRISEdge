@@ -2187,6 +2187,12 @@ pub struct FederationDirectoryReplicationBridge {
     /// the E3 truster and the own-record Pull subject. `None` falls back to
     /// `local_key_id`, correct wherever the two coincide.
     serve_tier_subject: Option<String>,
+    /// Whose consent the attestation send set reads: the union of
+    /// `consent_peers_by_principals(k)` over these keys. Empty falls back to
+    /// `local_key_id`. Consent is the agent's: on a split home the owner's
+    /// `consent:replication` grant names the agent, while `local_key_id` is
+    /// the node.
+    consent_subject_key_ids: Vec<String>,
     /// CIRISEdge#552 (B) — signers a transient refusal named that this node may
     /// not hold. Bounded: a peer that offers unadmittable rows must not be able
     /// to grow this without limit, so past the cap new names are DROPPED rather
@@ -2418,6 +2424,7 @@ impl FederationDirectoryReplicationBridge {
             receipts: Arc::new(crate::receipts::ReceiptLedger::new()),
             self_provider: None,
             local_key_id: None,
+            consent_subject_key_ids: Vec::new(),
             config,
             operational: None,
             consent_memo: Mutex::new(None),
@@ -2517,6 +2524,7 @@ impl FederationDirectoryReplicationBridge {
             receipts: Arc::new(crate::receipts::ReceiptLedger::new()),
             self_provider: None,
             local_key_id: None,
+            consent_subject_key_ids: Vec::new(),
             config,
             operational: Some(operational),
             consent_memo: Mutex::new(None),
@@ -2715,6 +2723,14 @@ impl FederationDirectoryReplicationBridge {
     #[must_use]
     pub fn with_serve_tier_subject(mut self, subject: Option<String>) -> Self {
         self.serve_tier_subject = subject;
+        self
+    }
+
+    /// Whose consent the attestation send set reads (builder). Empty falls
+    /// back to `local_key_id`.
+    #[must_use]
+    pub fn with_consent_subjects(mut self, keys: Vec<String>) -> Self {
+        self.consent_subject_key_ids = keys;
         self
     }
 
@@ -8459,18 +8475,38 @@ impl FederationDirectoryReplicationBridge {
         // blanket form — the human names the machine. The pre-#609
         // machine-authored rows keep working through the first half of the
         // union until the server's migration re-signs them.
-        let peers = match ciris_persist::federation::consent_by_humans::consent_peers_by_principals(
-            &*self.directory,
-            local,
-        )
-        .await
-        {
-            Ok(peers) => peers,
-            Err(e) => {
-                tracing::debug!(error = %e, "consent send-set read failed (fail-closed)");
-                return None;
-            }
+        //
+        // The keys whose consent is read are `consent_subject_key_ids` when
+        // the host named them (the agent, on a split home), else `local`.
+        let subjects: Vec<&str> = if self.consent_subject_key_ids.is_empty() {
+            vec![local]
+        } else {
+            self.consent_subject_key_ids
+                .iter()
+                .map(String::as_str)
+                .collect()
         };
+        let mut peers: Vec<String> = Vec::new();
+        for subject in subjects {
+            match ciris_persist::federation::consent_by_humans::consent_peers_by_principals(
+                &*self.directory,
+                subject,
+            )
+            .await
+            {
+                Ok(p) => peers.extend(p),
+                Err(e) => {
+                    tracing::debug!(
+                        subject,
+                        error = %e,
+                        "consent send-set read failed (fail-closed)"
+                    );
+                    return None;
+                }
+            }
+        }
+        peers.sort();
+        peers.dedup();
         // CIRISEdge#524 — resolve the grant subjects' bound nodes BEFORE the
         // set is minted, so `recipient` stays the one door and stays pure.
         let (owned_nodes, complete) = self.nodes_owned_by_grant_subjects(&peers).await;
@@ -17640,6 +17676,47 @@ pub(crate) mod tests {
         assert!(
             set1.recipient(peer).is_some(),
             "the memoized set resolves the consent-included peer"
+        );
+    }
+
+    /// Consent is the agent's. On a split home the bridge's `local_key_id` is
+    /// the node's wire identity, but the consent names the AGENT: read by the
+    /// node, the send set was empty and no `trace:*` row ever shipped (agent
+    /// CI run 41114034170: `recipient_not_in_send_set` 1559). With the agent
+    /// named as a consent subject, the consented peer is in the send set.
+    #[tokio::test]
+    async fn the_send_set_reads_the_agents_consent_on_a_split_home() {
+        let node = "this-node";
+        let agent = "this-agent";
+        let canonical = "the-canonical";
+        let keys = [node.to_string(), agent.to_string(), canonical.to_string()];
+        let (backend, by_node) = make_bridge(&keys);
+        for key_id in [node, agent, canonical] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_consent_membership(&backend, agent, canonical).await;
+
+        let by_node = by_node.with_local_key_id(Some(node.to_string()));
+        let set = by_node.resolved_peer_set(node).await.expect("resolve");
+        assert!(
+            set.recipient(canonical).is_none(),
+            "the node's own consent names nobody"
+        );
+
+        let dir: Arc<dyn FederationDirectory> = backend.clone();
+        let cohort: CohortProvider = Arc::new(move || keys.to_vec());
+        let by_agent = FederationDirectoryReplicationBridge::new(dir, cohort)
+            .with_local_key_id(Some(node.to_string()))
+            .with_consent_subjects(vec![agent.to_string()]);
+        let set = by_agent.resolved_peer_set(node).await.expect("resolve");
+        assert!(
+            set.recipient(canonical).is_some(),
+            "the agent's consent puts the canonical in the send set"
         );
     }
 
