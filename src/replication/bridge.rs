@@ -3821,10 +3821,19 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// durable.
     fn note_missing_signer(
         &self,
-        _kind: EnvelopeKind,
+        kind: EnvelopeKind,
         signer_key_id: &str,
         source_peer: Option<&str>,
     ) {
+        // A route a peer merely RELAYED is asked about only when its node is
+        // one this node sends to (consent, owner-routed or its own devices:
+        // a contact's node once the grant names it). Every other relayed route
+        // is held on its absent Key and costs no round (`is_relayed_route`).
+        if crate::replication::missing_signer::is_relayed_route(kind, signer_key_id, source_peer)
+            && !self.sends_to(signer_key_id)
+        {
+            return;
+        }
         // CIRISEdge#568 — NOT gated on the Key plane's retention any more.
         //
         // This used to record only under `HashFirst`, on the reasoning that
@@ -5207,9 +5216,7 @@ impl FederationDirectoryReplicationBridge {
         // gate-peer keys no peer serves) starved the one key the contact
         // needed and even spent the offering peer's own rounds on junk
         // (2026-10-31, run 41204695676: the owner key was never asked).
-        if !crate::replication::missing_signer::is_relayed_route(kind, signer, source_peer) {
-            self.note_missing_signer(EnvelopeKind::Key, signer, source_peer);
-        }
+        self.note_missing_signer(kind, signer, source_peer);
         tracing::debug!(
             kind = ?kind,
             envelope_hash = %hex::encode(&hash[..8]),
@@ -8605,6 +8612,14 @@ impl FederationDirectoryReplicationBridge {
             )
             .await;
         set
+    }
+
+    /// Whether `node` is in this node's last resolved attestation send set
+    /// (the consent memo, refreshed every round). `false` while no set has
+    /// been resolved yet.
+    fn sends_to(&self, node: &str) -> bool {
+        self.fresh_consent_memo()
+            .is_some_and(|set| set.recipient(node).is_some())
     }
 
     /// The consent memo's value iff it is younger than
@@ -16707,6 +16722,44 @@ pub(crate) mod tests {
             bridge.take_missing_signer_for("node-d").as_deref(),
             Some("node-d")
         );
+        // A relayed route whose node this node SENDS to (a contact's node,
+        // named by the contact grant) is asked about: that route is how a
+        // contact's node becomes dialable.
+        let local = "node-c";
+        let (backend, contact_bridge) = test_fixtures::make_bridge(&[local.to_string()]);
+        for key_id in [local, "node-home"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_consent_membership(&backend, local, "node-home").await;
+        let contact_bridge = contact_bridge.with_local_key_id(Some(local.to_string()));
+        let set = contact_bridge
+            .resolved_peer_set(local)
+            .await
+            .expect("send set");
+        assert!(set.recipient("node-home").is_some());
+        for (i, node) in ["ciris-gate-peer-x", "node-home"].iter().enumerate() {
+            contact_bridge
+                .park_on_absent_key(
+                    EnvelopeKind::TransportDestination,
+                    [u8::try_from(i).unwrap(); 32],
+                    node,
+                    Some("canonical"),
+                )
+                .await;
+        }
+        assert_eq!(
+            contact_bridge
+                .take_missing_signer_for("canonical")
+                .as_deref(),
+            Some("node-home"),
+            "the contact's relayed route is asked about; the gate peer's is not"
+        );
+        assert_eq!(contact_bridge.take_missing_signer_for("canonical"), None);
     }
 
     #[tokio::test]

@@ -97,9 +97,9 @@ pub fn missing_signer_of(_kind: EnvelopeKind, envelope_bytes: &[u8]) -> Option<S
 /// I5), so a node parks hundreds of routes for nodes it will never reach, and
 /// an ask replaces that peer's whole replication round: 778 such parks on the
 /// cross-NAT harness (2026-10-31) would spend 778 rounds on keys nobody
-/// needs. A route this node needs belongs to a node whose own rows it also
-/// receives (a contact, a room peer), and those park and ask that node, whose
-/// Key releases the route too. A route offered by its own node still asks.
+/// needs. The bridge still asks about a relayed route whose node it sends to
+/// (a contact's node, once the contact grant names it), and a route offered by
+/// its own node always asks.
 #[must_use]
 pub fn is_relayed_route(kind: EnvelopeKind, signer: &str, source_peer: Option<&str>) -> bool {
     kind == EnvelopeKind::TransportDestination && source_peer != Some(signer)
