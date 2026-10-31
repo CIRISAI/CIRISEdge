@@ -3821,10 +3821,19 @@ impl ReplicationDirectory for FederationDirectoryReplicationBridge {
     /// durable.
     fn note_missing_signer(
         &self,
-        _kind: EnvelopeKind,
+        kind: EnvelopeKind,
         signer_key_id: &str,
         source_peer: Option<&str>,
     ) {
+        // A route a peer merely RELAYED is asked about only when its node is
+        // one this node sends to (consent, owner-routed or its own devices:
+        // a contact's node once the grant names it). Every other relayed route
+        // is held on its absent Key and costs no round (`is_relayed_route`).
+        if crate::replication::missing_signer::is_relayed_route(kind, signer_key_id, source_peer)
+            && !self.sends_to(signer_key_id)
+        {
+            return;
+        }
         // CIRISEdge#568 — NOT gated on the Key plane's retention any more.
         //
         // This used to record only under `HashFirst`, on the reasoning that
@@ -5198,13 +5207,16 @@ impl FederationDirectoryReplicationBridge {
                 .park_booked_at(kind, hash, signer, source_peer, Instant::now());
         self.book_park(kind);
         self.note_park_evictions(evictions);
-        // The park waits on the Key; ask for it NOW, ahead of background
-        // repair (the #904 priority set), not whenever the repair queue gets
-        // to it. A new contact's rows parked behind a starved queue were dead
-        // on arrival for the whole window (the cross-NAT harness, 2026-10-30:
-        // `backoff_secs=1800 parked=3479`); the Key's arrival releases the
-        // park and re-asks the rows at once.
-        self.request_signer(EnvelopeKind::Key, signer);
+        // The park waits on the Key: route the ask to the peer that OFFERED
+        // the row, which is the one most likely to hold the Key (node-c
+        // offering its own occurrence holds its owner's Key), so that peer's
+        // next round asks it. NOT the #904 person-priority set: that is for
+        // keys a person is waiting on, capped and drained in name order, and
+        // filling it with every park (778 on the cross-NAT harness, mostly
+        // gate-peer keys no peer serves) starved the one key the contact
+        // needed and even spent the offering peer's own rounds on junk
+        // (2026-10-31, run 41204695676: the owner key was never asked).
+        self.note_missing_signer(kind, signer, source_peer);
         tracing::debug!(
             kind = ?kind,
             envelope_hash = %hex::encode(&hash[..8]),
@@ -8600,6 +8612,14 @@ impl FederationDirectoryReplicationBridge {
             )
             .await;
         set
+    }
+
+    /// Whether `node` is in this node's last resolved attestation send set
+    /// (the consent memo, refreshed every round). `false` while no set has
+    /// been resolved yet.
+    fn sends_to(&self, node: &str) -> bool {
+        self.fresh_consent_memo()
+            .is_some_and(|set| set.recipient(node).is_some())
     }
 
     /// The consent memo's value iff it is younger than
@@ -16640,33 +16660,106 @@ pub(crate) mod tests {
     /// queued names in the field). Now the next round toward any peer asks for
     /// it first, repair resumes after, and a name both requested and queued is
     /// asked once.
-    /// A row parked on an ABSENT signer Key asks for that Key on the next
-    /// round, ahead of background repair, instead of waiting for the repair
-    /// queue to reach it (the cross-NAT harness, 2026-10-30: a new contact's
-    /// rows parked `backoff_secs=1800 parked=3479` behind a starved queue).
+    /// A row parked on an ABSENT signer Key is asked of the peer that OFFERED
+    /// it, on that peer's next round; a route merely RELAYED by a peer is held
+    /// but never asked about, so a flood of them spends no rounds and displaces
+    /// neither that ask nor a key a person is waiting on (cross-NAT harness,
+    /// 2026-10-31: 778 parks, mostly relayed gate-peer routes, filled the
+    /// person-priority set and node-c's owner key was never asked).
     #[tokio::test]
-    async fn a_parked_rows_absent_key_is_asked_before_background_repair() {
+    async fn a_parked_rows_absent_key_is_asked_of_the_peer_that_offered_it() {
         let (_backend, bridge) = test_fixtures::make_bridge(&[]);
-        for i in 0..270 {
-            bridge.note_missing_signer(
-                EnvelopeKind::Key,
-                &format!("repair-signer-{i:03}"),
-                Some("canonical"),
-            );
+        // The flood: rows from the canonical parked on keys nobody serves.
+        for i in 0..300u32 {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&i.to_be_bytes());
+            bridge
+                .park_on_absent_key(
+                    EnvelopeKind::TransportDestination,
+                    hash,
+                    &format!("ciris-gate-peer-{i:03}"),
+                    Some("canonical"),
+                )
+                .await;
         }
+        // The one that matters: node-c offers a row signed by its owner.
         bridge
             .park_on_absent_key(
                 EnvelopeKind::IdentityOccurrence,
-                [7u8; 32],
-                "new-contact-node",
-                Some("canonical"),
+                [0xee; 32],
+                "qa-node-owner-of-c",
+                Some("node-c"),
+            )
+            .await;
+        // A key a person pasted still goes first, ahead of every park.
+        bridge.request_signer(EnvelopeKind::Key, "pasted-contact-key");
+        assert_eq!(
+            bridge.take_missing_signer_for("node-c").as_deref(),
+            Some("pasted-contact-key"),
+            "the person-requested key is not displaced by parks"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("node-c").as_deref(),
+            Some("qa-node-owner-of-c"),
+            "node-c's round asks node-c for the key of the row it offered"
+        );
+        assert_eq!(
+            bridge.take_missing_signer_for("canonical"),
+            None,
+            "the canonical's rounds are not spent asking for the keys of 300 routes it \
+             merely relayed, and the owner key is asked once"
+        );
+        // A route offered by its OWN node still asks that node.
+        bridge
+            .park_on_absent_key(
+                EnvelopeKind::TransportDestination,
+                [0xdd; 32],
+                "node-d",
+                Some("node-d"),
             )
             .await;
         assert_eq!(
-            bridge.take_missing_signer_for("canonical").as_deref(),
-            Some("new-contact-node"),
-            "the parked row's Key is asked first"
+            bridge.take_missing_signer_for("node-d").as_deref(),
+            Some("node-d")
         );
+        // A relayed route whose node this node SENDS to (a contact's node,
+        // named by the contact grant) is asked about: that route is how a
+        // contact's node becomes dialable.
+        let local = "node-c";
+        let (backend, contact_bridge) = test_fixtures::make_bridge(&[local.to_string()]);
+        for key_id in [local, "node-home"] {
+            backend
+                .put_public_key(SignedKeyRecord {
+                    record: fixture_key_record(key_id, identity_type::AGENT),
+                })
+                .await
+                .expect("seed key");
+        }
+        seed_consent_membership(&backend, local, "node-home").await;
+        let contact_bridge = contact_bridge.with_local_key_id(Some(local.to_string()));
+        let set = contact_bridge
+            .resolved_peer_set(local)
+            .await
+            .expect("send set");
+        assert!(set.recipient("node-home").is_some());
+        for (i, node) in ["ciris-gate-peer-x", "node-home"].iter().enumerate() {
+            contact_bridge
+                .park_on_absent_key(
+                    EnvelopeKind::TransportDestination,
+                    [u8::try_from(i).unwrap(); 32],
+                    node,
+                    Some("canonical"),
+                )
+                .await;
+        }
+        assert_eq!(
+            contact_bridge
+                .take_missing_signer_for("canonical")
+                .as_deref(),
+            Some("node-home"),
+            "the contact's relayed route is asked about; the gate peer's is not"
+        );
+        assert_eq!(contact_bridge.take_missing_signer_for("canonical"), None);
     }
 
     #[tokio::test]
